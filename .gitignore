@@ -1,0 +1,16 @@
+# Build outputs
+/build/
+/out/
+cmake-build-*/
+*.o
+*.a
+*.so
+
+# Local infrastructure (Jetson-derived sysroot and friends)
+.local/sysroots/
+
+# Local agent planning/evidence - never tracked
+.omo/
+
+# Local codegraph index symlink
+.codegraph
