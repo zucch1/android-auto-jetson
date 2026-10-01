@@ -1,0 +1,41 @@
+// Android Auto Protocol Buffer Definitions
+// https://github.com/mrmees/open-android-auto
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+/*
+ * RadioChannelConfig — radio channel SDP configuration for ServiceDiscovery.
+ *
+ * REWRITTEN for 16.2: Old RadioStation/RadioBand hierarchy (16.1: way/wax/wbe)
+ * completely replaced by RadioChannelConfig/RadioBands/RadioBandGroup (wap/wab/waa).
+ *
+ * RadioCodecType and RadioRegion enums are NOT used in SDP anymore (only in GAL messages).
+ */
+
+syntax = "proto2";
+
+import "oaa/radio/RadioBandTypeEnum.proto";
+
+package oaa.proto.data;
+
+// APK class: wap (16.2) — radio channel config container
+// Replaces RadioChannel(way) from 16.1
+// confidence: silver [apk_static, cross_version]
+message RadioChannelConfig {
+    // Field 1 is absent in 17.3.
+    optional RadioBands bands = 2; // 17.3: xkx.c -> xkj  // confidence: silver [apk_static, cross_version]
+}
+
+// APK class: wab (16.2) — radio bands container
+// confidence: silver [apk_static, cross_version]
+message RadioBands {
+    repeated RadioBandGroup groups = 1;  // confidence: silver [apk_static, cross_version]
+}
+
+// APK class: waa (16.2) — radio band group
+// confidence: silver [apk_static, cross_version]
+message RadioBandGroup {
+    repeated enums.RadioBandType.Enum band_types = 1; // AM=1, FM=2, DAB=3  // confidence: silver [apk_static, cross_version]
+    optional bool hide_empty_group = 2;  // confidence: silver [apk_static, cross_version]
+    optional string band_scan_action = 3;  // confidence: silver [apk_static, cross_version]
+    optional bool unknown_flag_4 = 4; // 17.3: xki.g; semantics not exposed by current consumers  // confidence: silver [apk_static, cross_version]
+}

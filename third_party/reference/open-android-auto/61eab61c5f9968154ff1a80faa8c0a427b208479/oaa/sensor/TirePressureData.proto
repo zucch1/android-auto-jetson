@@ -1,0 +1,14 @@
+// Android Auto Protocol Buffer Definitions
+// https://github.com/mrmees/open-android-auto
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+syntax="proto2";
+
+package oaa.proto.data;
+
+// APK class: wcg (AA v16.1), wbw (AA v16.2) — 1 repeated int32 field
+// confidence: silver [apk_static, cross_version]
+message TirePressure
+{
+    repeated int32 tire_pressures = 1;  // confidence: silver [apk_static, cross_version]
+}

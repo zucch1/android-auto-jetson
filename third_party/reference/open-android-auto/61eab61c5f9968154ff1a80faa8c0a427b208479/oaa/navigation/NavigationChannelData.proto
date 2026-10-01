@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2024-2026 Open Android Auto contributors
+// Based on works by: f1x.studio (aasdk), opencardev (crankshaft), aa-proxy (aa-proxy-rs)
+syntax="proto2";
+
+import "oaa/navigation/NavigationImageOptionsData.proto";
+import "oaa/navigation/NavigationTypeEnum.proto";
+
+package oaa.proto.data;
+
+// APK class: vzd (16.2), vzr (16.1)
+// confidence: silver [apk_static, cross_version]
+message NavigationChannel
+{
+    required int32 minimum_interval_ms = 1; // 17.3: xjk.c, required  // confidence: silver [apk_static, cross_version]
+    required enums.NavigationType.Enum type = 2; // 17.3: xjk.d, required enum via xjj.a/wni.s  // confidence: silver [apk_static, cross_version]
+    optional NavigationImageOptions image_options = 3; // 17.3: xjk.e -> xji  // confidence: silver [apk_static, cross_version]
+}

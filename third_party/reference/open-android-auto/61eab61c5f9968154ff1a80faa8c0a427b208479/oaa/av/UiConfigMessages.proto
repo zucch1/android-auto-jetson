@@ -1,0 +1,67 @@
+// Android Auto Protocol Buffer Definitions
+// https://github.com/mrmees/open-android-auto
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+/*
+ * UI Config messages (AV channels — Video/Audio)
+ * Flows on video channel alongside media data.
+ *
+ * Controls display margins, content insets, and theme (light/dark/auto)
+ * for the projected AA UI.
+ *
+ * Message IDs (on AV channel):
+ *   0x8009 = UpdateUiConfigRequest        (HU->Phone)
+ *   0x800A = UpdateUiConfigRequest        (Phone->HU)
+ *   0x8012 = UpdateHuUiConfigResponse     (HU->Phone)
+ *
+ * The same UpdateUiConfigRequest payload is used in opposite directions at
+ * 0x8009 and 0x800A. No reply is implied. The theming-token response at
+ * 0x8012 has its canonical definition under oaa/video/.
+ *
+ * Related: VideoConfigData.proto field 11 (additional_config) is likely
+ * a UiConfig sub-message in the service discovery video config.
+ *
+ * Source: aa-proxy-rs protos, confirmed against AVChannelMessageIdsEnum.
+ * Proto2 per APK class wcs (UpdateUiConfigRequest).
+ *
+ * APK: AA v16.1
+ */
+
+syntax = "proto2";
+
+package oaa.proto.messages;
+
+// UI theme mode
+// confidence: gold [apk_deep_trace, apk_static, cross_version]
+enum UiTheme {
+    UI_THEME_AUTOMATIC = 0;
+    UI_THEME_LIGHT = 1;
+    UI_THEME_DARK = 2;
+}
+
+// Display area insets (pixels from edge)
+// confidence: gold [apk_deep_trace, apk_static, cross_version]
+message Insets {
+    optional uint32 top = 1;  // confidence: gold [apk_deep_trace, apk_static, cross_version]
+    optional uint32 bottom = 2;  // confidence: gold [apk_deep_trace, apk_static, cross_version]
+    optional uint32 left = 3;  // confidence: gold [apk_deep_trace, apk_static, cross_version]
+    optional uint32 right = 4;  // confidence: gold [apk_deep_trace, apk_static, cross_version]
+}
+
+// UI configuration — margins, content area, theme
+// confidence: gold [apk_deep_trace, apk_static, cross_version]
+message UiConfig {
+    optional Insets margins = 1;  // confidence: gold [apk_deep_trace, apk_static, cross_version]
+    optional Insets content_insets = 2;  // confidence: gold [apk_deep_trace, apk_static, cross_version]
+    optional Insets stable_content_insets = 3;  // confidence: gold [apk_deep_trace, apk_static, cross_version]
+    optional UiTheme ui_theme = 4;  // confidence: gold [apk_deep_trace, apk_static, cross_version]
+}
+
+// 0x8009: UpdateUiConfigRequest (HU->Phone)
+// 0x800A: UpdateUiConfigRequest (Phone->HU)
+// Canonical definition moved to oaa/video/UpdateUiConfigRequestMessage.proto (Gold confidence).
+// Field 1 is AdditionalVideoConfig, NOT UiConfig (deep trace verified).
+
+// 0x8012: UpdateHuUiConfigResponse (HU->Phone)
+// Canonical definition moved to oaa/video/UpdateHuUiConfigResponse.proto (Gold confidence).
+// Field 1 is ThemingTokensStatus, NOT UiConfig (deep trace verified).
