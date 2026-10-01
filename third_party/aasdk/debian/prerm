@@ -1,0 +1,25 @@
+#!/bin/sh
+# prerm script for libaasdk
+
+set -e
+export DEBIAN_FRONTEND=noninteractive
+
+case "$1" in
+    remove|deconfigure)
+        # Library removal - nothing specific to do
+        ;;
+    
+    upgrade)
+        # During upgrade, nothing to do for a library package
+        ;;
+
+    failed-upgrade)
+        ;;
+
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
