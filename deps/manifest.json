@@ -1,0 +1,71 @@
+{
+  "schema": "aa-dependencies-1",
+  "sources": {
+    "aasdk": {
+      "url": "https://github.com/opencardev/aasdk.git",
+      "commit": "9bf6adf933665dee26532201719fac14a047ccf1",
+      "archive_format": "git archive --format=tar COMMIT (complete tree, no prefix)",
+      "archive_sha256": "78f570189bf504e7323b28cbfa5159b6f16d722a3c547ad3a0f9bdc12a9ca111",
+      "role": "build-source"
+    },
+    "oaa": {
+      "url": "https://github.com/mrmees/open-android-auto.git",
+      "commit": "61eab61c5f9968154ff1a80faa8c0a427b208479",
+      "archive_format": "git archive --format=tar COMMIT (complete tree, no prefix)",
+      "archive_sha256": "c4ed2e8234c872b3764ba8ca83502e75d9961f388797ba285d2ee65811da8ef2",
+      "role": "reference-only; retained subset governed by task-2 provenance"
+    },
+    "googletest": {
+      "url": "https://github.com/google/googletest.git",
+      "commit": "b514bdc898e2951020cbdca1304b75f5950d1f59",
+      "release": "v1.15.2",
+      "archive_format": "https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.15.2",
+      "archive_sha256": "7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926",
+      "role": "explicitly pre-staged test dependency"
+    }
+  },
+  "host_binding": "dpkg-query installed version+architecture; apt-cache policy candidate is availability only, never an installed/build pin",
+  "host_packages": [
+    {"name":"protobuf-compiler","component":"protoc","status":"installed","installed_version":"3.21.12-8.2ubuntu0.3","architecture":"amd64","candidate_version":"3.21.12-8.2ubuntu0.3"},
+    {"name":"libprotobuf-dev","component":"protobuf","status":"missing","installed_version":null,"architecture":null,"candidate_version":"3.21.12-8.2ubuntu0.3"},
+    {"name":"libprotobuf32t64","component":"protobuf-runtime","status":"installed","installed_version":"3.21.12-8.2ubuntu0.3","architecture":"amd64","candidate_version":"3.21.12-8.2ubuntu0.3"},
+    {"name":"libboost-dev","component":"Boost-headers","status":"missing","installed_version":null,"architecture":null,"candidate_version":"1.83.0.1ubuntu2"},
+    {"name":"libboost-system-dev","component":"Boost-system","status":"missing","installed_version":null,"architecture":null,"candidate_version":"1.83.0.1ubuntu2"},
+    {"name":"libboost-log-dev","component":"Boost-log/log_setup","status":"missing","installed_version":null,"architecture":null,"candidate_version":"1.83.0.1ubuntu2"},
+    {"name":"libssl-dev","component":"OpenSSL","status":"missing","installed_version":null,"architecture":null,"candidate_version":"3.0.13-0ubuntu3.15"},
+    {"name":"libssl3t64","component":"OpenSSL-runtime","status":"installed","installed_version":"3.0.13-0ubuntu3.15","architecture":"amd64","candidate_version":"3.0.13-0ubuntu3.15"},
+    {"name":"libusb-1.0-0-dev","component":"libusb","status":"missing","installed_version":null,"architecture":null,"candidate_version":"2:1.0.27-1"},
+    {"name":"libusb-1.0-0","component":"libusb-runtime","status":"installed","installed_version":"2:1.0.27-1","architecture":"amd64","candidate_version":"2:1.0.27-1"},
+    {"name":"libgstreamer1.0-dev","component":"GStreamer-core","status":"missing","installed_version":null,"architecture":null,"candidate_version":"1.24.2-1ubuntu0.1"},
+    {"name":"libgstreamer-plugins-base1.0-dev","component":"GStreamer-app/video/audio/GL","status":"missing","installed_version":null,"architecture":null,"candidate_version":"1.24.2-1ubuntu0.5"},
+    {"name":"libgstreamer1.0-0","component":"GStreamer-runtime","status":"installed","installed_version":"1.24.2-1ubuntu0.1","architecture":"amd64","candidate_version":"1.24.2-1ubuntu0.1"},
+    {"name":"libgstreamer-plugins-base1.0-0","component":"GStreamer-base-runtime","status":"installed","installed_version":"1.24.2-1ubuntu0.5","architecture":"amd64","candidate_version":"1.24.2-1ubuntu0.5"},
+    {"name":"gstreamer1.0-plugins-good","component":"GStreamer-good","status":"installed","installed_version":"1.24.2-1ubuntu1.7","architecture":"amd64","candidate_version":"1.24.2-1ubuntu1.7"},
+    {"name":"gstreamer1.0-plugins-bad","component":"GStreamer-bad","status":"installed","installed_version":"1.24.2-1ubuntu4","architecture":"amd64","candidate_version":"1.24.2-1ubuntu4"},
+    {"name":"gstreamer1.0-libav","component":"software-H264-candidate","status":"missing","installed_version":null,"architecture":null,"candidate_version":"1.24.1-1build1"},
+    {"name":"gstreamer1.0-qt6","component":"qml6glsink-candidate","status":"missing","installed_version":null,"architecture":null,"candidate_version":"1.24.2-1ubuntu1.7"},
+    {"name":"qt6-base-dev","component":"Qt6-Core/Gui/Widgets/OpenGL","status":"installed","installed_version":"6.4.2+dfsg-21.1build5","architecture":"amd64","candidate_version":"6.4.2+dfsg-21.1build5"},
+    {"name":"qt6-declarative-dev","component":"Qt6-Qml/Quick","status":"installed","installed_version":"6.4.2+dfsg-4build3","architecture":"amd64","candidate_version":"6.4.2+dfsg-4build3"},
+    {"name":"nvidia-l4t-gstreamer","component":"optional-NVIDIA-decode","status":"unavailable-optional","installed_version":null,"architecture":null,"candidate_version":null},
+    {"name":"cmake","component":"configure-tool","status":"installed","installed_version":"3.28.3-1build7","architecture":"amd64","candidate_version":"3.28.3-1build7"},
+    {"name":"ninja-build","component":"build-tool","status":"installed","installed_version":"1.11.1-2","architecture":"amd64","candidate_version":"1.11.1-2"},
+    {"name":"pkg-config","component":"package-discovery","status":"installed","installed_version":"1.8.1-2build1","architecture":"amd64","candidate_version":"1.8.1-2build1"},
+    {"name":"libabsl-dev","component":"Abseil-not-required-with-system-protobuf","status":"missing","installed_version":null,"architecture":null,"candidate_version":"20220623.1-3.1ubuntu3.2"}
+  ],
+  "target_binding": {
+    "status": "pending-task5-extraction",
+    "architecture": "arm64",
+    "sysroot_manifest": "toolchains/jetson-sysroot-manifest.json",
+    "sysroot_manifest_sha256": null,
+    "package_versions": [],
+    "required_components": ["protobuf", "Boost", "OpenSSL", "libusb", "GStreamer", "Qt6"],
+    "optional_packages": ["nvidia-l4t-gstreamer"],
+    "binding_rule": "Task5 must replace pending state with immutable sysroot manifest SHA256; every installed target package version/architecture/source and copied input SHA256 is authoritative there. No host version is a target observation."
+  },
+  "build_policy": {
+    "network_fetch": false,
+    "protobuf": "system-package; SKIP_BUILD_PROTOBUF=ON and SKIP_BUILD_ABSL=ON on Linux; protoc and runtime must match; upstream v30.0 message is not a version binding",
+    "aasdk_abi": "pending-task7",
+    "host_full_build": "blocked-missing-development-packages"
+  }
+}
