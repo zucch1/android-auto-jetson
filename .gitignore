@@ -5,12 +5,18 @@ cmake-build-*/
 *.o
 *.a
 *.so
+tests/build/cross/build/
 
 # Local infrastructure (Jetson-derived sysroot and friends)
-.local/sysroots/
+.local/
+CMakeUserPresets.json
 
 # Local agent planning/evidence - never tracked
 .omo/
 
 # Local codegraph index symlink
 .codegraph
+
+# Python tooling caches (not source artifacts)
+__pycache__/
+*.pyc
