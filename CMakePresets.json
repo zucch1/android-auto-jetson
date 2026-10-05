@@ -14,16 +14,34 @@
     },
     {"name": "host-dev", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}},
     {"name": "host-release", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
-    {"name": "host-asan", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "AA_ENABLE_ASAN": "ON"}}
+    {"name": "host-asan", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "AA_ENABLE_ASAN": "ON"}},
+    {
+      "name": "jetson-aarch64",
+      "displayName": "Jetson aarch64 cross-build (task 5): --sysroot toolchain + pre-compile hash gate",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/toolchains/jetson-aarch64.cmake",
+        "AA_SYSROOT_ROOTFS": "$env{AA_SYSROOT_ROOTFS}",
+        "AA_SYSROOT_MANIFEST": "$env{AA_SYSROOT_MANIFEST}",
+        "AA_SYSROOT_PAYLOAD": "$env{AA_SYSROOT_PAYLOAD}",
+        "AA_SYSROOT_CACHE": "$env{AA_SYSROOT_CACHE}",
+        "AA_SYSROOT_REQUIRE_OBSERVED": "$env{AA_SYSROOT_REQUIRE_OBSERVED}"
+      }
+    }
   ],
   "buildPresets": [
     {"name": "host-dev", "configurePreset": "host-dev", "jobs": 2},
     {"name": "host-release", "configurePreset": "host-release", "jobs": 2},
-    {"name": "host-asan", "configurePreset": "host-asan", "jobs": 2}
+    {"name": "host-asan", "configurePreset": "host-asan", "jobs": 2},
+    {"name": "jetson-aarch64", "configurePreset": "jetson-aarch64", "jobs": 2}
   ],
   "testPresets": [
     {"name": "host-dev", "configurePreset": "host-dev", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
     {"name": "host-release", "configurePreset": "host-release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
-    {"name": "host-asan", "configurePreset": "host-asan", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}}
+    {"name": "host-asan", "configurePreset": "host-asan", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "jetson-aarch64", "configurePreset": "jetson-aarch64", "output": {"outputOnFailure": true}}
   ]
 }
