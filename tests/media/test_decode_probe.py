@@ -6,7 +6,7 @@ import sys
 import tempfile
 
 def run_cmd(cmd, env=None):
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, timeout=15)
     return res.returncode, res.stdout, res.stderr
 
 def main():
@@ -35,11 +35,17 @@ def main():
         print("PASS: Test 1 (--help)")
 
     # Test 2: Valid smoke run (duration 2s) with host software decoder
-    code, stdout, _ = run_cmd([binary, "--profile", "1280x720@30", "--bitrate", "10M", "--duration", "2", "--fixture", fixture])
+    code, stdout, _ = run_cmd([binary, "--decoder", "openh264dec", "--profile", "1280x720@30", "--bitrate", "10M", "--duration", "2", "--fixture", fixture])
     try:
         report = json.loads(stdout)
-        if report.get("pass") is not True or report.get("status") != "PASS":
+        if report.get("smoke_pass") is not True:
             failures.append(f"Test 2: smoke run did not pass: {report.get('failure_reason')}")
+        elif code != 2 or report.get("pass") is not False or report.get("requested_workload_met") is not False:
+            failures.append("Test 2: tiny fixture falsely satisfied requested 10Mbps workload")
+        elif report.get("target_qualified") is not False or not (0 < report.get("observed_bitrate_bps", 0) < 100000):
+            failures.append("Test 2: fixture bitrate/qualification incorrectly reported")
+        elif report.get("latency_samples") != report.get("frames_decoded") or report.get("unmatched_frames") != 0:
+            failures.append("Test 2: incomplete PTS/frame correlation")
         elif report.get("dropped_frames") != 0:
             failures.append(f"Test 2: frame drops observed: {report.get('dropped_frames')}")
         elif report.get("p95_latency_ms", 999.0) > 33.0:

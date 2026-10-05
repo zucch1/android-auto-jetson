@@ -6,6 +6,18 @@
 
 namespace aa::decode_probe {
 
+bool FrameCorrelation::record(uint64_t pts, Time sent) {
+    return pending.emplace(pts, sent).second;
+}
+
+std::optional<FrameCorrelation::Time> FrameCorrelation::take(uint64_t pts) {
+    const auto match = pending.find(pts);
+    if (match == pending.end()) return std::nullopt;
+    const auto sent = match->second;
+    pending.erase(match);
+    return sent;
+}
+
 void CpuSampler::start() {
     clock_gettime(CLOCK_MONOTONIC, &last_wall);
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &last_cpu);
@@ -22,10 +34,10 @@ double CpuSampler::sample_core_percent() {
     clock_gettime(CLOCK_MONOTONIC, &now_wall);
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now_cpu);
 
-    double wall_diff = (now_wall.tv_sec - last_wall.tv_sec) +
-                       (now_wall.tv_nsec - last_wall.tv_nsec) * 1e-9;
-    double cpu_diff = (now_cpu.tv_sec - last_cpu.tv_sec) +
-                      (now_cpu.tv_nsec - last_cpu.tv_nsec) * 1e-9;
+    double wall_diff = static_cast<double>(now_wall.tv_sec - last_wall.tv_sec) +
+                       static_cast<double>(now_wall.tv_nsec - last_wall.tv_nsec) * 1e-9;
+    double cpu_diff = static_cast<double>(now_cpu.tv_sec - last_cpu.tv_sec) +
+                      static_cast<double>(now_cpu.tv_nsec - last_cpu.tv_nsec) * 1e-9;
 
     last_wall = now_wall;
     last_cpu = now_cpu;
@@ -49,7 +61,7 @@ void LatencyStats::calculate() {
     std::vector<double> sorted = latencies_ms;
     std::sort(sorted.begin(), sorted.end());
 
-    size_t idx = static_cast<size_t>(std::ceil(0.95 * sorted.size()));
+    size_t idx = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(sorted.size()))) - 1;
     if (idx >= sorted.size()) {
         idx = sorted.size() - 1;
     }
@@ -57,7 +69,7 @@ void LatencyStats::calculate() {
     max_ms = sorted.back();
 
     double sum = std::accumulate(sorted.begin(), sorted.end(), 0.0);
-    avg_ms = sum / sorted.size();
+    avg_ms = sum / static_cast<double>(sorted.size());
 }
 
 } // namespace aa::decode_probe
