@@ -41,14 +41,19 @@ DiscoveryResult discover_decoders(const std::string& forced_decoder) {
         {"nvv4l2decoder", true},
         {"openh264dec",   false},
         {"avdec_h264",    false},
-        {"nvh264dec",     false}
+        {"nvh264dec",     true}
     };
 
     if (!forced_decoder.empty()) {
         DecoderCandidate cand;
         cand.element_name = forced_decoder;
-        cand.is_hardware = (forced_decoder.find("nv") != std::string::npos);
-        cand.available = (gst_element_factory_find(forced_decoder.c_str()) != nullptr);
+        cand.is_hardware = false;
+        for (const auto& [name, is_hw] : known_candidates) {
+            if (forced_decoder == name) cand.is_hardware = is_hw;
+        }
+        GstElementFactory* factory = gst_element_factory_find(forced_decoder.c_str());
+        cand.available = factory != nullptr;
+        if (factory) gst_object_unref(factory);
         std::string note;
         cand.viable = cand.available && test_decoder_viable(forced_decoder, note);
         cand.notes = note;
