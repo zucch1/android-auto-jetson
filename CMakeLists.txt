@@ -82,3 +82,18 @@ foreach(case reuse effective-tamper gtest-tamper extra missing-staging)
     add_test(NAME deps_stage_${case} COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/deps/staging.py" "${CMAKE_SOURCE_DIR}" "${case}" "${AA_GOOGLETEST_ARCHIVE}")
 endforeach()
+
+# Task 9: Decode capability probe integration
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(GST_DECODE_PROBE QUIET gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+    if(GST_DECODE_PROBE_FOUND)
+        add_subdirectory(tools/aa-decode-probe)
+        add_test(NAME media_decode_probe_suite
+            COMMAND "${Python3_EXECUTABLE}" -B
+                    "${CMAKE_SOURCE_DIR}/tests/media/test_decode_probe.py"
+                    "$<TARGET_FILE:aa-decode-probe>"
+                    "${CMAKE_SOURCE_DIR}/tests/fixtures/media/h264_720p30_baseline_90f.h264")
+        set_tests_properties(media_decode_probe_suite PROPERTIES TIMEOUT 120)
+    endif()
+endif()
