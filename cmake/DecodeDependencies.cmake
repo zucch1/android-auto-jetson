@@ -1,15 +1,25 @@
 # Decode probe target development metadata (task 9).
 # Native builds: host GStreamer development metadata is mandatory; discovery fails closed (REQUIRED).
 # Cross builds (jetson-aarch64): target GStreamer development metadata must come from the
-# hash-validated sysroot payload (or, later, an explicitly configured overlay root). When the
-# validated payload provides no target GStreamer module metadata, the probe is EXPLICITLY
-# UNAVAILABLE: configure succeeds (AA_DECODE_PROBE_CROSS=UNAVAILABLE, aa-decode-probe: UNAVAILABLE
-# status line) and the probe CMakeLists registers no probe targets or tests. Incomplete metadata
-# (some but not all of the three modules) fails closed and never marks the probe available.
+# hash-validated sysroot payload or the explicitly configured AA_DECODE_GST_OVERLAY capture root
+# (dev files captured read-only from the target, same layout as the target filesystem). Exactly one
+# of these roots is the metadata provider; pkg-config is bound to it (F3 isolation). When no root
+# provides any target GStreamer module metadata, the probe is EXPLICITLY UNAVAILABLE: configure
+# succeeds (AA_DECODE_PROBE_CROSS=UNAVAILABLE, aa-decode-probe: UNAVAILABLE status line) and the
+# probe CMakeLists registers no probe targets or tests. Incomplete metadata (some but not all of
+# the three modules, from any root combination) fails closed and never marks the probe available.
 #
 # FindPkgConfig has its own search policy; CMAKE_FIND_ROOT_PATH does not isolate it.
 
+# Declare the cache knob only when nothing (preset -D or caller) has defined it; a plain
+# set(... CACHE ...) here would clear a caller-set binding under the 3.20 policy defaults.
+if(NOT DEFINED AA_DECODE_GST_OVERLAY)
+    set(AA_DECODE_GST_OVERLAY "" CACHE PATH "Cross-only rootfs fragment with target GStreamer dev metadata (.pc/headers/libs) captured read-only from the target")
+endif()
 set(AA_DECODE_PROBE_READY FALSE)
+if(NOT CMAKE_CROSSCOMPILING AND AA_DECODE_GST_OVERLAY)
+    message(FATAL_ERROR "AA_DECODE_GST_OVERLAY: cross-only extension; native builds discover mandatory host GStreamer development metadata directly")
+endif()
 
 if(CMAKE_CROSSCOMPILING)
     if(NOT TARGET aa_sysroot_hash_gate OR NOT AA_SYSROOT_PAYLOAD OR NOT CMAKE_SYSROOT)
@@ -23,44 +33,100 @@ if(CMAKE_CROSSCOMPILING)
     if(NOT "$ENV{PKG_CONFIG_PATH}" STREQUAL "")
         message(FATAL_ERROR "AA_DECODE_PKG_ENV: clear PKG_CONFIG_PATH; host metadata is forbidden")
     endif()
-    set(_aa_decode_pc_dirs)
-    foreach(_aa_pc_suffix usr/lib/aarch64-linux-gnu/pkgconfig usr/lib/pkgconfig usr/share/pkgconfig)
-        set(_aa_pc_dir "${_aa_decode_root}/${_aa_pc_suffix}")
-        if(EXISTS "${_aa_pc_dir}")
-            file(GLOB _aa_pc_files "${_aa_pc_dir}/*.pc")
-            foreach(_aa_pc_path "${_aa_pc_dir}" ${_aa_pc_files})
-                get_filename_component(_aa_pc_real "${_aa_pc_path}" REALPATH)
-                string(FIND "${_aa_pc_real}" "${_aa_decode_root}/" _aa_pc_inside)
-                if(NOT _aa_pc_inside EQUAL 0)
-                    message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: ${_aa_pc_path}")
+    # Overlay inputs: digest-record every .pc/header/lib input at configure time and reject any
+    # path whose realpath escapes the overlay root (same escape rejection as the sysroot).
+    set(_aa_decode_overlay "")
+    if(AA_DECODE_GST_OVERLAY)
+        if(NOT IS_DIRECTORY "${AA_DECODE_GST_OVERLAY}")
+            message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: AA_DECODE_GST_OVERLAY is not a directory: ${AA_DECODE_GST_OVERLAY}")
+        endif()
+        get_filename_component(_aa_decode_overlay "${AA_DECODE_GST_OVERLAY}" REALPATH)
+        file(GLOB_RECURSE _aa_overlay_entries LIST_DIRECTORIES true RELATIVE "${_aa_decode_overlay}" "${_aa_decode_overlay}/*")
+        list(SORT _aa_overlay_entries)
+        set(_aa_overlay_records "")
+        foreach(_aa_overlay_rel IN LISTS _aa_overlay_entries)
+            set(_aa_overlay_path "${_aa_decode_overlay}/${_aa_overlay_rel}")
+            get_filename_component(_aa_overlay_real "${_aa_overlay_path}" REALPATH)
+            string(FIND "${_aa_overlay_real}" "${_aa_decode_overlay}/" _aa_overlay_inside)
+            if(NOT _aa_overlay_inside EQUAL 0)
+                message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: overlay input ${_aa_overlay_path}")
+            endif()
+            if(IS_DIRECTORY "${_aa_overlay_path}")
+                continue()
+            endif()
+            file(SHA256 "${_aa_overlay_path}" _aa_overlay_hash)
+            string(APPEND _aa_overlay_records "${_aa_overlay_hash}  ${_aa_overlay_rel}\n")
+        endforeach()
+        string(SHA256 _aa_overlay_digest "${_aa_overlay_records}")
+        set(AA_DECODE_GST_OVERLAY_DIGEST "${_aa_overlay_digest}" CACHE STRING "sha256 over configure-time digest-recorded overlay .pc/header/lib inputs" FORCE)
+        message(STATUS "aa-decode-probe: overlay inputs digest-recorded ${_aa_overlay_digest}")
+    endif()
+    # Sanctioned metadata roots: validated sysroot payload first, then the overlay extension.
+    # Each root's pkg-config inputs are escape-checked against that root alone.
+    set(_aa_decode_candidates "${_aa_decode_root}")
+    if(_aa_decode_overlay)
+        list(APPEND _aa_decode_candidates "${_aa_decode_overlay}")
+    endif()
+    set(_aa_decode_found_0 0)
+    set(_aa_decode_found_1 0)
+    set(_aa_decode_idx 0)
+    foreach(_aa_decode_candidate IN LISTS _aa_decode_candidates)
+        set(_aa_pc_dirs)
+        foreach(_aa_pc_suffix usr/lib/aarch64-linux-gnu/pkgconfig usr/lib/pkgconfig usr/share/pkgconfig)
+            set(_aa_pc_dir "${_aa_decode_candidate}/${_aa_pc_suffix}")
+            if(EXISTS "${_aa_pc_dir}")
+                file(GLOB _aa_pc_files "${_aa_pc_dir}/*.pc")
+                foreach(_aa_pc_path "${_aa_pc_dir}" ${_aa_pc_files})
+                    get_filename_component(_aa_pc_real "${_aa_pc_path}" REALPATH)
+                    string(FIND "${_aa_pc_real}" "${_aa_decode_candidate}/" _aa_pc_inside)
+                    if(NOT _aa_pc_inside EQUAL 0)
+                        message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: ${_aa_pc_path}")
+                    endif()
+                endforeach()
+            endif()
+            list(APPEND _aa_pc_dirs "${_aa_pc_dir}")
+        endforeach()
+        set(_aa_decode_pc_dirs_${_aa_decode_idx} ${_aa_pc_dirs})
+        foreach(_aa_decode_module gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+            set(_aa_decode_module_found FALSE)
+            foreach(_aa_pc_dir IN LISTS _aa_pc_dirs)
+                if(EXISTS "${_aa_pc_dir}/${_aa_decode_module}.pc")
+                    set(_aa_decode_module_found TRUE)
                 endif()
             endforeach()
-        endif()
-        list(APPEND _aa_decode_pc_dirs "${_aa_pc_dir}")
-    endforeach()
-    # Presence gate on target metadata, never on host fallbacks: the three probe modules must all
-    # resolve from the validated payload or the probe is explicitly unavailable (F3 sanctioned).
-    set(_aa_decode_found 0)
-    foreach(_aa_decode_module gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
-        set(_aa_decode_module_found FALSE)
-        foreach(_aa_pc_dir IN LISTS _aa_decode_pc_dirs)
-            if(EXISTS "${_aa_pc_dir}/${_aa_decode_module}.pc")
-                set(_aa_decode_module_found TRUE)
+            if(_aa_decode_module_found)
+                math(EXPR _aa_decode_found_${_aa_decode_idx} "${_aa_decode_found_${_aa_decode_idx}}+1")
             endif()
         endforeach()
-        if(_aa_decode_module_found)
-            math(EXPR _aa_decode_found "${_aa_decode_found}+1")
-        endif()
+        math(EXPR _aa_decode_idx "${_aa_decode_idx}+1")
     endforeach()
-    if(_aa_decode_found EQUAL 0)
-        message(STATUS "aa-decode-probe: UNAVAILABLE (target GStreamer dev metadata absent from frozen sysroot)")
+    # Availability gate on target metadata, never on host fallbacks (F3 sanctioned outcome:
+    # explicitly mark the probe unavailable when target dev metadata is absent). Incomplete
+    # metadata is a fail-closed error, not an unavailable probe.
+    set(_aa_sysroot_modules ${_aa_decode_found_0})
+    set(_aa_overlay_modules ${_aa_decode_found_1})
+    if(_aa_sysroot_modules EQUAL 3)
+        set(_aa_decode_provider "${_aa_decode_root}")
+        set(_aa_decode_provider_pc_dirs ${_aa_decode_pc_dirs_0})
+        if(_aa_overlay_modules GREATER 0)
+            message(STATUS "aa-decode-probe: overlay metadata present but incomplete; validated sysroot payload takes precedence")
+        endif()
+    elseif(_aa_overlay_modules EQUAL 3)
+        set(_aa_decode_provider "${_aa_decode_overlay}")
+        set(_aa_decode_provider_pc_dirs ${_aa_decode_pc_dirs_1})
+        message(STATUS "aa-decode-probe: cross metadata source AA_DECODE_GST_OVERLAY")
+    elseif(_aa_sysroot_modules GREATER 0 OR _aa_overlay_modules GREATER 0)
+        message(FATAL_ERROR "AA_DECODE_PKG_METADATA: incomplete target GStreamer dev metadata (sysroot ${_aa_sysroot_modules}/3, overlay ${_aa_overlay_modules}/3)")
+    else()
+        if(_aa_decode_overlay)
+            message(STATUS "aa-decode-probe: UNAVAILABLE (target GStreamer dev metadata absent from frozen sysroot and overlay)")
+        else()
+            message(STATUS "aa-decode-probe: UNAVAILABLE (target GStreamer dev metadata absent from frozen sysroot)")
+        endif()
         set(AA_DECODE_PROBE_CROSS "UNAVAILABLE" CACHE STRING "Cross decode probe target metadata state" FORCE)
         return()
-    elseif(NOT _aa_decode_found EQUAL 3)
-        message(FATAL_ERROR "AA_DECODE_PKG_METADATA: incomplete target GStreamer dev metadata (${_aa_decode_found}/3 modules in validated sysroot payload)")
     endif()
-    set(_aa_decode_provider "${_aa_decode_root}")
-    list(JOIN _aa_decode_pc_dirs ":" _aa_decode_pc_libdir)
+    list(JOIN _aa_decode_provider_pc_dirs ":" _aa_decode_pc_libdir)
     set(ENV{PKG_CONFIG_SYSROOT_DIR} "${_aa_decode_provider}")
     set(ENV{PKG_CONFIG_LIBDIR} "${_aa_decode_pc_libdir}")
     # Ignore ambient wrappers/arguments and CMake prefixes as additional search roots.
