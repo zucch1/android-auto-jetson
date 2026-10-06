@@ -1,8 +1,10 @@
 {
   "schema": "aa-dependency-lock-1",
-  "manifest_sha256": "52b1bc3fce2159d1de1cff8a10e535eb0a4a9f3a0779d531e853b89a177cb33e",
+  "manifest_sha256": "2239c9a41b4745ada6ea72fbb8aaf2ba4d99c3a4723cd37123eef16a31fe2c25",
   "patch_path": "patches/aasdk-googletest.patch",
   "patch_sha256": "d27b1c7099041042ad255c2cd16b7d61588b6b6aaa93b4c7d1b0c0ffb35b7091",
+  "tls_patch_path": "patches/aasdk-tls-credentials.patch",
+  "tls_patch_sha256": "cbe5c72d48290482c5f77628477f2d4150231e5e27ceeee7853dae99caa42c93",
   "source_commits": {
     "aasdk": "9bf6adf933665dee26532201719fac14a047ccf1",
     "oaa": "61eab61c5f9968154ff1a80faa8c0a427b208479",

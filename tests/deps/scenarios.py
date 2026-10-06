@@ -59,6 +59,15 @@ def main() -> int:
             with (fixture / 'deps/patches/aasdk-googletest.patch').open('ab') as stream:
                 stream.write(b'tamper')
             expected = 'PATCH_MISMATCH'
+        case 'tls-patch':
+            with (fixture / 'deps/patches/aasdk-tls-credentials.patch').open('ab') as stream:
+                stream.write(b'tamper')
+            expected = 'PATCH_MISMATCH'
+        case 'tls-lock':
+            record = json.loads(lock.read_text())
+            record['tls_patch_sha256'] = '0' * 64
+            lock.write_text(json.dumps(record))
+            expected = 'LOCK_MISMATCH'
         case 'manifest-digest':
             with manifest.open('ab') as stream:
                 stream.write(b' ')

@@ -66,6 +66,7 @@
     "network_fetch": false,
     "protobuf": "system-package; SKIP_BUILD_PROTOBUF=ON and SKIP_BUILD_ABSL=ON on Linux; protoc and runtime must match; upstream v30.0 message is not a version binding",
     "aasdk_abi": "pending-task7",
+    "aasdk_tls": "locked effective-stage patch; explicit HU_KEY_PATH; encryption-only compatibility plus independent approved-phone predicate",
     "host_full_build": "blocked-missing-development-packages"
   }
 }
