@@ -11,6 +11,9 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
     list(APPEND _ipc_targets ipc-framing)
     include(GoogleTest)
     gtest_discover_tests(ipc-framing TEST_PREFIX ipc- PROPERTIES TIMEOUT 20)
+    # The happy benchmark runs the full 600 s acceptance profile (~10 minutes). It is
+    # intentionally registered without a fast-only label so the unfiltered host-dev CI
+    # run keeps it as a visible mandatory gate; CI budget accounts for it explicitly.
     add_test(NAME ipc-bench-happy-600 COMMAND aa-ipc-bench --profile 1280x720@30 --duration 600)
     set_tests_properties(ipc-bench-happy-600 PROPERTIES TIMEOUT 630 LABELS "ipc;long")
     add_test(NAME ipc-bench-slow-consumer COMMAND aa-ipc-bench --failure-scenario)
