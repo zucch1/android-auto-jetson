@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <poll.h>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -105,14 +106,30 @@ SocketPair::SocketPair() {
 }
 SocketPair::~SocketPair() { ::close(fds_[0]); ::close(fds_[1]); }
 Receive receive(int fd, Packet& packet, Reassembler& assembler, bool& eof) {
+    eof = false;
     iovec vector{packet.data(), packet.size()}; msghdr message{};
     message.msg_iov = &vector; message.msg_iovlen = 1;
     ssize_t size;
     do { size = ::recvmsg(fd, &message, 0); } while (size < 0 && errno == EINTR);
-    eof = size == 0;
     if (size < 0) throw std::runtime_error("recvmsg failed");
-    if (eof) return Receive::waiting;
-    if (message.msg_flags & MSG_TRUNC) { ++assembler.rejected; assembler.loss(); return Receive::rejected; }
-    return assembler.accept({packet.data(), static_cast<std::size_t>(size)});
+    if (size > 0) {
+        if (message.msg_flags & MSG_TRUNC) { ++assembler.rejected; assembler.loss(); return Receive::rejected; }
+        return assembler.accept({packet.data(), static_cast<std::size_t>(size)});
+    }
+    // size == 0 is either a zero-length live record or an orderly peer shutdown.
+    // Per the transport contract (transport.hpp) a framed record always carries a
+    // header, so a zero-length record is malformed and must enter the rejection/loss
+    // path; end of stream is signalled by shutdown(SHUT_WR) and detected at the socket
+    // level via POLLRDHUP. This never mistakes a live empty record for EOF and never
+    // spins on a genuine shutdown (POLLRDHUP stays set while recvmsg keeps returning 0).
+    pollfd ready{fd, POLLRDHUP, 0};
+    int status;
+    do { status = ::poll(&ready, 1, 0); } while (status < 0 && errno == EINTR);
+    if (status < 0) throw std::runtime_error("poll failed");
+    if (ready.revents & (POLLRDHUP | POLLHUP)) {
+        eof = true;
+        return Receive::waiting;
+    }
+    ++assembler.rejected; assembler.loss(); return Receive::rejected;
 }
 }

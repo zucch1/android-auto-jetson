@@ -61,6 +61,15 @@ private:
     int fds_[2]{-1, -1};
     int send_buffer_{};
 };
-// recvmsg reports MSG_TRUNC; oversized packets are rejected, never resized.
+// Transport contract:
+//  - Every accepted record carries the fixed header above; malformed headers, wrong
+//    lengths, inconsistent fragments and oversize records are rejected and drive
+//    loss()/resync.
+//  - A zero-length record carries no header and is therefore malformed: receive()
+//    counts it as rejected and calls loss(). It is never treated as end-of-stream.
+//  - End of stream is signalled by the producer shutting down its write side
+//    (shutdown(SHUT_WR)). receive() detects it at the socket level via POLLRDHUP and
+//    sets eof, so a genuine shutdown terminates the consumer instead of spinning.
+//  - recvmsg reports MSG_TRUNC; oversized packets are rejected, never resized.
 Receive receive(int fd, Packet& packet, Reassembler& assembler, bool& eof);
 }
