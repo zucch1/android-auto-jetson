@@ -8,9 +8,11 @@
 import argparse
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import re
 import shlex
+import stat
 import subprocess
 import sys
 
@@ -24,6 +26,25 @@ from wireless_target import Report
 def invoke(args: list[str], payload: str | None = None) -> str:
     return subprocess.run(args, input=payload, capture_output=True, text=True,
                           timeout=900, check=True).stdout
+
+
+class InvalidPsk(OSError):
+    """Redacted credential-boundary failure; never carries file content."""
+
+
+def private_psk(path: Path | None) -> str:
+    """Open once, check the opened inode, then read a bounded private credential."""
+    if path is None:
+        raise InvalidPsk()
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC), 'rb') as source:
+        metadata = os.fstat(source.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or
+                metadata.st_mode & 0o077 or metadata.st_nlink != 1):
+            raise InvalidPsk()
+        content = source.read(65)
+    if not re.fullmatch(rb'[!-~][ -~]{6,61}[!-~]\n?', content):
+        raise InvalidPsk()
+    return content.removesuffix(b'\n').decode('ascii')
 
 
 def main() -> int:
@@ -50,6 +71,12 @@ def main() -> int:
         report['blockers'].append('authorized-inventory-window-required')
         print(json.dumps(report))
         return 1
+    try:
+        psk = private_psk(args.ap_psk_file) if args.active or args.ap_psk_file else ''
+    except OSError:
+        report['blockers'].append('private-psk-input-required')
+        print(json.dumps(report))
+        return 1
     hook = [str(args.window_hook.resolve()), args.window_id, args.jetson]
     before: Path | None = None
     inventory: dict[str, str] = {}
@@ -69,21 +96,21 @@ def main() -> int:
         ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                '-o', 'StrictHostKeyChecking=yes', args.jetson]
         invoke(ssh + ['true'])
-        psk = args.ap_psk_file.read_text().strip() if args.ap_psk_file else ''
-        if args.active and not 8 <= len(psk) <= 63:
-            raise OSError('active-phase-requires-8-to-63-character-psk-file')
         argv = ['wireless_target', '--target', args.jetson, '--interface', args.interface,
                 '--jurisdiction-confirm', args.jurisdiction_confirm, '--duration', str(args.duration)]
         if args.active:
-            argv += ['--active', '--ap-psk', psk]
+            argv += ['--active']
         here = Path(__file__).parent
         # Sources and PSK travel through SSH stdin; no target source files or PSK argv.
         payload = ('import sys, types\n'
                    "module = types.ModuleType('wireless_bluez')\n"
                    "sys.modules['wireless_bluez'] = module\n"
-                   f'exec({(here / "wireless_bluez.py").read_text()!r}, module.__dict__)\n'
-                   f'sys.argv = {argv!r}\n'
-                   f'exec({(here / "wireless_target.py").read_text()!r})\n')
+                    f'exec({(here / "wireless_bluez.py").read_text()!r}, module.__dict__)\n'
+                    f'sys.argv = {argv!r}\n'
+                    "module = types.ModuleType('wireless_target')\n"
+                    "sys.modules['wireless_target'] = module\n"
+                    f'exec({(here / "wireless_target.py").read_text()!r}, module.__dict__)\n'
+                    f'sys.exit(module.main({psk!r}))\n')
         result = subprocess.run(ssh + [shlex.join(['python3', '-B', '-'])], input=payload,
                                 capture_output=True, text=True, timeout=args.duration + 600, check=False)
         observed = json.loads(result.stdout)

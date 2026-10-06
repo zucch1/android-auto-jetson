@@ -44,8 +44,8 @@ class Report:
     protected_inventory: dict[str, str] = field(default_factory=dict)
 
 
-def command(args: list[str]) -> str:
-    result = subprocess.run(args, capture_output=True, text=True, timeout=30, check=True)
+def command(args: list[str], payload: str | None = None) -> str:
+    result = subprocess.run(args, input=payload, capture_output=True, text=True, timeout=30, check=True)
     return result.stdout
 
 
@@ -157,11 +157,12 @@ def active(report: Report, args: argparse.Namespace) -> None:
                  'ifname', args.interface, 'con-name', 'aa-task12-' + connection,
                  'connection.uuid', connection, 'connection.autoconnect', 'no',
                  'ssid', 'aa-task12-isolated', '802-11-wireless.mode', 'ap',
-                 '802-11-wireless.band', 'a', '802-11-wireless.channel', '36',
-                 '802-11-wireless-security.key-mgmt', 'wpa-psk',
-                 '802-11-wireless-security.psk', args.ap_psk,
-                 'ipv4.method', 'disabled', 'ipv6.method', 'disabled'])
-        command(['nmcli', '--wait', '20', 'connection', 'up', 'uuid', connection])
+                  '802-11-wireless.band', 'a', '802-11-wireless.channel', '36',
+                  '802-11-wireless-security.key-mgmt', 'wpa-psk',
+                  '802-11-wireless-security.psk-flags', '2',
+                  'ipv4.method', 'disabled', 'ipv6.method', 'disabled'])
+        command(['nmcli', '--wait', '20', 'connection', 'up', 'uuid', connection,
+                 'passwd-file', '/dev/stdin'], '802-11-wireless-security.psk:' + args.ap_psk + '\n')
         report.raw['iw_operation'] = command(['iw', 'dev', args.interface, 'info'])
         report.channel_36_operation = bool(re.search(
             r'channel 36 \(5180 MHz\)', report.raw['iw_operation'])) and 'type AP' in report.raw['iw_operation']
@@ -186,10 +187,10 @@ def active(report: Report, args: argparse.Namespace) -> None:
             command(['nmcli', 'connection', 'delete', 'uuid', connection])
         except (subprocess.SubprocessError, OSError) as error:
             report.blockers.append('ap-cleanup-failed')
-            report.raw['cleanup_error'] = str(error)
+            report.raw['cleanup_error_type'] = type(error).__name__
 
 
-def main() -> int:
+def main(ap_psk: str = '') -> int:
     def interrupted(signum: int, frame) -> None:
         raise InterruptedError(signum)
     for signum in (signal.SIGTERM, signal.SIGHUP):
@@ -200,8 +201,8 @@ def main() -> int:
     parser.add_argument('--jurisdiction-confirm', default='')
     parser.add_argument('--active', action='store_true')
     parser.add_argument('--duration', type=int, default=30)
-    parser.add_argument('--ap-psk', default='')
     args = parser.parse_args()
+    args.ap_psk = ap_psk
     report = Report(target=args.target, confirmed_jurisdiction=args.jurisdiction_confirm)
     try:
         discover(report, args.interface)

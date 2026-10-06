@@ -118,7 +118,7 @@ class Active(unittest.TestCase):
     def exercise(self, failure=False, authorized=True):
         report = target.Report(raw={'nm': 'GENERAL.STATE:30 (disconnected)'})
         calls = []
-        def run(argv):
+        def run(argv, payload=None):
             calls.append(argv)
             if 'up' in argv and failure:
                 raise subprocess.CalledProcessError(1, argv)
