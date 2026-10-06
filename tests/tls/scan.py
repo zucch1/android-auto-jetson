@@ -21,6 +21,7 @@ def main() -> int:
         fixture = Path(directory)
         shutil.copytree(root / 'third_party', fixture / 'third_party')
         for name in ('planted.pem', 'tools/build/planted.pem', 'src/build/planted.pem',
+                     '__pycache__/planted.pem', 'src/__pycache__/planted.pem',
                      'third_party/compat-credentials/injected.key',
                      'third_party/aasdk/src/Messenger/Cryptor.cpp'):
             target = fixture / name

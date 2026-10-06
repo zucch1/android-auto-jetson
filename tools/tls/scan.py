@@ -23,7 +23,7 @@ PINNED: Final = {
 CERT_PATH: Final = 'third_party/compat-credentials/headunit.crt'
 CERT_DIGEST: Final = '85b5043a09b1ba9464f745e6917bdbaa2bc582fe48cb727a7787c1a832a773e4'
 MARKER: Final = re.compile(rb'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----')
-EXCLUDED: Final = frozenset(('.git', '.omo', 'build', '.local', '__pycache__'))
+EXCLUDED: Final = frozenset(('.git', '.omo', 'build', '.local'))
 
 
 def forbidden(root: Path) -> bool:
@@ -36,7 +36,6 @@ def forbidden(root: Path) -> bool:
         if directory == root:
             subdirectories[:] = [name for name in subdirectories if name not in EXCLUDED]
             files = [name for name in files if name not in EXCLUDED]
-        subdirectories[:] = [name for name in subdirectories if name != '__pycache__']
         for name in files:
             path = directory / name
             relative = path.relative_to(root)
