@@ -76,6 +76,26 @@ elseif(CASE MATCHES "^overlay")
         set(_project_kind "subdir")
         set(_expected 1)
         set(_diagnostic "AA_DECODE_PKG_ESCAPE")
+    elseif(CASE STREQUAL "overlay-semicolon")
+        # Deep-escaped pkg-config semicolon survives discovery as one directory, then list-splits link options.
+        _aa_overlay_fixture("${_overlay}" gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+        file(MAKE_DIRECTORY "${_overlay}/usr/lib/x;-L/usr/lib")
+        file(WRITE "${_overlay}/usr/lib/x;-L/usr/lib/libov.so" "")
+        # The overlay digest walk is itself list-valued; materialize the fragments
+        # produced by splitting this adversarial relative path so it reaches discovery.
+        file(MAKE_DIRECTORY "${_overlay}/-L/usr/lib" "${_overlay}/usr/lib/x")
+        file(WRITE "${_overlay}/-L/usr/lib/libov.so" "")
+        set(_pc_semicolon_escape "\\")
+        string(REPEAT "${_pc_semicolon_escape}" 4 _pc_semicolon_escape)
+        string(REPLACE "Libs: -L\${libdir} -lov"
+            "Libs: -L\${libdir}/x${_pc_semicolon_escape};-L/usr/lib -lov"
+            _semicolon_pc "${_ov_pc}")
+        foreach(_module gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+            file(WRITE "${_overlay}/usr/lib/pkgconfig/${_module}.pc" "${_semicolon_pc}")
+        endforeach()
+        set(_project_kind "subdir")
+        set(_expected 1)
+        set(_diagnostic "AA_DECODE_PKG_ESCAPE")
     elseif(CASE STREQUAL "overlay")
         # Well-formed capture over a frozen payload: probe AVAILABLE from the overlay root.
         _aa_overlay_fixture("${_overlay}" gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
