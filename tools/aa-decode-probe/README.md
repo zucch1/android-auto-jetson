@@ -44,12 +44,24 @@ reconfigure records a new snapshot; callers must keep the capture read-only
 during a build. Hash gates detect drift at these boundaries, not concurrent
 adversarial writes between a check and a compiler read.
 
-The cross contamination checks require the same root, manifest, and digest,
+Header evidence is scoped to each binary's linker `LOAD` objects and project
+archives, not every target in the build. Archive members must match exactly one
+compiled object in the compilation database by both name and bytes; missing
+object dependency files or ambiguous archive binding fail closed. All members
+of each loaded project archive are conservatively checked. Unrelated binaries
+such as `aa_host_smoke` neither consume nor claim the probe's overlay digest.
+
+The probe cross contamination checks require the same root, manifest, and digest,
 verify their binding to the binary, and classify recorded overlay inputs
 separately from sysroot inputs. A digest proves exact captured content, not
 observed target origin, ABI compatibility, decoder availability, or performance.
 The public synthetic overlay cross smoke builds an AArch64 ELF without running
 it; its result is build-policy evidence only, never Jetson qualification.
+The `decode-cross-root-overlay` host regression additionally builds the root
+project with a synthetic overlay outside source/build, requires all five
+contamination checks plus `cross_runtime_regressions`, and rejects missing or
+wrong overlay/ELF binding. It requires the public AArch64 cross compiler and
+binutils. CI exercises both the minimal probe wrapper and this root integration.
 
 ## Requested versus observed
 
