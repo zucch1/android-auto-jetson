@@ -54,18 +54,24 @@ if(TARGET aa_sysroot_hash_gate)
     foreach(_aa_decode_target IN LISTS _aa_decode_targets)
         # Ninja completes the gate's custom command before any source compilation.
         add_dependencies(${_aa_decode_target} aa_sysroot_hash_gate)
+        if(TARGET aa_decode_overlay_hash_gate)
+            add_dependencies(${_aa_decode_target} aa_decode_overlay_hash_gate)
+            target_sources(${_aa_decode_target} PRIVATE "${AA_DECODE_OVERLAY_RECORD_SOURCE}")
+            add_custom_command(TARGET ${_aa_decode_target} PRE_LINK
+                COMMAND ${AA_DECODE_OVERLAY_VERIFY_COMMAND} VERBATIM)
+        endif()
         target_link_options(${_aa_decode_target} PRIVATE "-Wl,-Map,$<TARGET_FILE:${_aa_decode_target}>.map")
         add_test(NAME cross_contamination_${_aa_decode_target}
             COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/../build/contamination.py"
                 --binary "$<TARGET_FILE:${_aa_decode_target}>" --sysroot "${CMAKE_SYSROOT}"
                 --build "${CMAKE_BINARY_DIR}" --source "${CMAKE_SOURCE_DIR}"
-                --compiler "${CMAKE_CXX_COMPILER}" ${AA_SYSROOT_PROVENANCE_ARGS}
+                --compiler "${CMAKE_CXX_COMPILER}" ${AA_SYSROOT_PROVENANCE_ARGS} ${AA_DECODE_OVERLAY_PROVENANCE_ARGS}
                 --output "$<TARGET_FILE:${_aa_decode_target}>.inputs.json")
         set_tests_properties(cross_contamination_${_aa_decode_target} PROPERTIES TIMEOUT 60)
     endforeach()
 endif()
 if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
-    foreach(_aa_policy_case isolated host-path missing escape symlink unbound ordering partial overlay overlay-escape overlay-poison overlay-partial overlay-comma overlay-semicolon)
+    foreach(_aa_policy_case isolated host-path missing escape symlink unbound ordering partial overlay overlay-escape overlay-poison overlay-partial overlay-comma overlay-semicolon overlay-mismatch overlay-extra overlay-available)
         add_test(NAME decode-build-policy-${_aa_policy_case}
             COMMAND "${CMAKE_COMMAND}" "-DROOT=${CMAKE_CURRENT_SOURCE_DIR}/../.."
                 "-DSCRATCH=${CMAKE_CURRENT_BINARY_DIR}/policy-${_aa_policy_case}"

@@ -33,32 +33,39 @@ if(CMAKE_CROSSCOMPILING)
     if(NOT "$ENV{PKG_CONFIG_PATH}" STREQUAL "")
         message(FATAL_ERROR "AA_DECODE_PKG_ENV: clear PKG_CONFIG_PATH; host metadata is forbidden")
     endif()
-    # Overlay inputs: digest-record every .pc/header/lib input at configure time and reject any
-    # path whose realpath escapes the overlay root (same escape rejection as the sysroot).
+    # Snapshot the complete overlay tree, then reverify before compilation and linking.
+    # The digest records content, not an observed-target origin or runtime qualification.
     set(_aa_decode_overlay "")
+    set(AA_DECODE_OVERLAY_PROVENANCE_ARGS)
     if(AA_DECODE_GST_OVERLAY)
         if(NOT IS_DIRECTORY "${AA_DECODE_GST_OVERLAY}")
             message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: AA_DECODE_GST_OVERLAY is not a directory: ${AA_DECODE_GST_OVERLAY}")
         endif()
         get_filename_component(_aa_decode_overlay "${AA_DECODE_GST_OVERLAY}" REALPATH)
-        file(GLOB_RECURSE _aa_overlay_entries LIST_DIRECTORIES true RELATIVE "${_aa_decode_overlay}" "${_aa_decode_overlay}/*")
-        list(SORT _aa_overlay_entries)
-        set(_aa_overlay_records "")
-        foreach(_aa_overlay_rel IN LISTS _aa_overlay_entries)
-            set(_aa_overlay_path "${_aa_decode_overlay}/${_aa_overlay_rel}")
-            get_filename_component(_aa_overlay_real "${_aa_overlay_path}" REALPATH)
-            string(FIND "${_aa_overlay_real}" "${_aa_decode_overlay}/" _aa_overlay_inside)
-            if(NOT _aa_overlay_inside EQUAL 0)
-                message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: overlay input ${_aa_overlay_path}")
-            endif()
-            if(IS_DIRECTORY "${_aa_overlay_path}")
-                continue()
-            endif()
-            file(SHA256 "${_aa_overlay_path}" _aa_overlay_hash)
-            string(APPEND _aa_overlay_records "${_aa_overlay_hash}  ${_aa_overlay_rel}\n")
-        endforeach()
-        string(SHA256 _aa_overlay_digest "${_aa_overlay_records}")
-        set(AA_DECODE_GST_OVERLAY_DIGEST "${_aa_overlay_digest}" CACHE STRING "sha256 over configure-time digest-recorded overlay .pc/header/lib inputs" FORCE)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        set(_aa_overlay_tool "${CMAKE_CURRENT_LIST_DIR}/../tools/build/decode_overlay.py")
+        set(AA_DECODE_GST_OVERLAY_MANIFEST "${CMAKE_BINARY_DIR}/aa-decode-overlay.sha256")
+        execute_process(COMMAND "${Python3_EXECUTABLE}" -B "${_aa_overlay_tool}"
+            --root "${_aa_decode_overlay}" --manifest "${AA_DECODE_GST_OVERLAY_MANIFEST}"
+            RESULT_VARIABLE _aa_overlay_result OUTPUT_VARIABLE _aa_overlay_digest
+            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_VARIABLE _aa_overlay_error)
+        if(NOT _aa_overlay_result EQUAL 0)
+            message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: ${_aa_overlay_error}")
+        endif()
+        set(AA_DECODE_GST_OVERLAY_DIGEST "${_aa_overlay_digest}" CACHE STRING "sha256 of complete overlay input manifest" FORCE)
+        set(AA_DECODE_OVERLAY_VERIFY_COMMAND "${Python3_EXECUTABLE}" -B "${_aa_overlay_tool}"
+            --root "${_aa_decode_overlay}" --manifest "${AA_DECODE_GST_OVERLAY_MANIFEST}"
+            --digest "${_aa_overlay_digest}")
+        set(AA_DECODE_OVERLAY_PROVENANCE_ARGS --overlay "${_aa_decode_overlay}"
+            --overlay-manifest "${AA_DECODE_GST_OVERLAY_MANIFEST}" --overlay-digest "${_aa_overlay_digest}")
+        if(NOT TARGET aa_decode_overlay_hash_gate)
+            add_custom_target(aa_decode_overlay_hash_gate
+                COMMAND ${AA_DECODE_OVERLAY_VERIFY_COMMAND}
+                COMMENT "AA_DECODE overlay hash validation before compile" VERBATIM)
+        endif()
+        set(AA_DECODE_OVERLAY_RECORD_SOURCE "${CMAKE_BINARY_DIR}/aa-decode-overlay-record.cpp")
+        file(WRITE "${AA_DECODE_OVERLAY_RECORD_SOURCE}"
+            "[[gnu::used, gnu::section(\".aa_decode_overlay\")]] static const char aa_decode_overlay_digest[] = \"${_aa_overlay_digest}\";\n")
         message(STATUS "aa-decode-probe: overlay inputs digest-recorded ${_aa_overlay_digest}")
     endif()
     # Sanctioned metadata roots: validated sysroot payload first, then the overlay extension.

@@ -29,6 +29,9 @@ EXPECTED: Final = frozenset({
     'decode-build-policy-overlay-partial',
     'decode-build-policy-overlay-comma',
     'decode-build-policy-overlay-semicolon',
+    'decode-build-policy-overlay-mismatch',
+    'decode-build-policy-overlay-extra',
+    'decode-build-policy-overlay-available',
     'decode-probe-smoke',
     'decode-probe-corrections',
 })
