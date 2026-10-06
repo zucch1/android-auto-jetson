@@ -7,6 +7,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/DecodeDependencies.cmake")
+if(NOT AA_DECODE_PROBE_READY)
+    # Cross configure where target GStreamer dev metadata is absent: the probe is explicitly
+    # UNAVAILABLE (status already reported by DecodeDependencies.cmake). Register nothing:
+    # no probe targets, no probe tests. Target qualification builds run in the Jetson window.
+    message(STATUS "aa-decode-probe: no probe targets or tests registered")
+    return()
+endif()
 
 add_executable(aa-decode-probe
     src/main.cpp

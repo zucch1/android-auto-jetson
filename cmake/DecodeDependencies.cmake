@@ -1,4 +1,16 @@
+# Decode probe target development metadata (task 9).
+# Native builds: host GStreamer development metadata is mandatory; discovery fails closed (REQUIRED).
+# Cross builds (jetson-aarch64): target GStreamer development metadata must come from the
+# hash-validated sysroot payload (or, later, an explicitly configured overlay root). When the
+# validated payload provides no target GStreamer module metadata, the probe is EXPLICITLY
+# UNAVAILABLE: configure succeeds (AA_DECODE_PROBE_CROSS=UNAVAILABLE, aa-decode-probe: UNAVAILABLE
+# status line) and the probe CMakeLists registers no probe targets or tests. Incomplete metadata
+# (some but not all of the three modules) fails closed and never marks the probe available.
+#
 # FindPkgConfig has its own search policy; CMAKE_FIND_ROOT_PATH does not isolate it.
+
+set(AA_DECODE_PROBE_READY FALSE)
+
 if(CMAKE_CROSSCOMPILING)
     if(NOT TARGET aa_sysroot_hash_gate OR NOT AA_SYSROOT_PAYLOAD OR NOT CMAKE_SYSROOT)
         message(FATAL_ERROR "AA_DECODE_SYSROOT: require a hash-gated payload bound to CMAKE_SYSROOT")
@@ -26,8 +38,30 @@ if(CMAKE_CROSSCOMPILING)
         endif()
         list(APPEND _aa_decode_pc_dirs "${_aa_pc_dir}")
     endforeach()
+    # Presence gate on target metadata, never on host fallbacks: the three probe modules must all
+    # resolve from the validated payload or the probe is explicitly unavailable (F3 sanctioned).
+    set(_aa_decode_found 0)
+    foreach(_aa_decode_module gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+        set(_aa_decode_module_found FALSE)
+        foreach(_aa_pc_dir IN LISTS _aa_decode_pc_dirs)
+            if(EXISTS "${_aa_pc_dir}/${_aa_decode_module}.pc")
+                set(_aa_decode_module_found TRUE)
+            endif()
+        endforeach()
+        if(_aa_decode_module_found)
+            math(EXPR _aa_decode_found "${_aa_decode_found}+1")
+        endif()
+    endforeach()
+    if(_aa_decode_found EQUAL 0)
+        message(STATUS "aa-decode-probe: UNAVAILABLE (target GStreamer dev metadata absent from frozen sysroot)")
+        set(AA_DECODE_PROBE_CROSS "UNAVAILABLE" CACHE STRING "Cross decode probe target metadata state" FORCE)
+        return()
+    elseif(NOT _aa_decode_found EQUAL 3)
+        message(FATAL_ERROR "AA_DECODE_PKG_METADATA: incomplete target GStreamer dev metadata (${_aa_decode_found}/3 modules in validated sysroot payload)")
+    endif()
+    set(_aa_decode_provider "${_aa_decode_root}")
     list(JOIN _aa_decode_pc_dirs ":" _aa_decode_pc_libdir)
-    set(ENV{PKG_CONFIG_SYSROOT_DIR} "${_aa_decode_root}")
+    set(ENV{PKG_CONFIG_SYSROOT_DIR} "${_aa_decode_provider}")
     set(ENV{PKG_CONFIG_LIBDIR} "${_aa_decode_pc_libdir}")
     # Ignore ambient wrappers/arguments and CMake prefixes as additional search roots.
     find_program(AA_DECODE_HOST_PKG_CONFIG NAMES pkg-config REQUIRED)
@@ -56,9 +90,9 @@ if(CMAKE_CROSSCOMPILING)
             message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: unresolved input ${_aa_decode_path}")
         endif()
         get_filename_component(_aa_decode_real "${_aa_decode_path}" REALPATH)
-        string(FIND "${_aa_decode_real}" "${_aa_decode_root}/" _aa_decode_inside)
+        string(FIND "${_aa_decode_real}" "${_aa_decode_provider}/" _aa_decode_inside)
         if(NOT _aa_decode_inside EQUAL 0)
-            message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: input outside validated sysroot ${_aa_decode_path}")
+            message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: input outside validated metadata root ${_aa_decode_path}")
         endif()
     endforeach()
     # GStreamer needs only -pthread beyond include/library flags. Refuse opaque path flags.
@@ -67,4 +101,6 @@ if(CMAKE_CROSSCOMPILING)
             message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: unsupported metadata flag ${_aa_decode_flag}")
         endif()
     endforeach()
+    set(AA_DECODE_PROBE_CROSS "AVAILABLE" CACHE STRING "Cross decode probe target metadata state" FORCE)
 endif()
+set(AA_DECODE_PROBE_READY TRUE)
