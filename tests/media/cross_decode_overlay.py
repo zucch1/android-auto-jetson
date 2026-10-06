@@ -27,6 +27,9 @@ def main() -> int:
     parser.add_argument('--scratch', type=Path, required=True)
     parser.add_argument('--sysroot', type=Path)
     parser.add_argument('--manifest', type=Path)
+    parser.add_argument('--root-project', action='store_true')
+    parser.add_argument('--archive', type=Path)
+    parser.add_argument('--build', type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     scratch = args.scratch.resolve()
@@ -42,19 +45,32 @@ def main() -> int:
     records = ''.join(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(overlay).as_posix()}\n'
                       for path in sorted(overlay.rglob('*')) if path.is_file())
     expected = hashlib.sha256(records.encode('ascii')).hexdigest()
-    build = scratch / 'build'
+    build = args.build.resolve() if args.build is not None else (
+        root / 'build' / scratch.name if args.root_project else scratch / 'build')
+    assert not build.exists(), 'fresh cross build required'
+    if args.root_project:
+        assert not overlay.is_relative_to(root) and not overlay.is_relative_to(build), 'overlay must be external'
+        if args.archive is None:
+            parser.error('--root-project requires --archive')
     environment = {**os.environ, 'GIT_MASTER': '1', 'PKG_CONFIG_PATH': ''}
+    configure_source = root if args.root_project else root / 'tests/media/cross'
+    configure_extra = [f'-DAA_GOOGLETEST_ARCHIVE={args.archive.resolve(strict=True)}'] if args.root_project else []
+    targets = ['aa_host_smoke', 'aa-decode-probe', 'decode-probe-inputs',
+               'decode-probe-metrics', 'decode-probe-discovery'] if args.root_project else []
     commands = (
-        ['cmake', '-S', str(root / 'tests/media/cross'), '-B', str(build), '-G', 'Ninja',
+        ['cmake', '-S', str(configure_source), '-B', str(build), '-G', 'Ninja',
          f'-DCMAKE_TOOLCHAIN_FILE={root}/toolchains/jetson-aarch64.cmake',
          f'-DAA_SYSROOT_ROOTFS={sysroot}', f'-DAA_SYSROOT_PAYLOAD={sysroot}',
-         f'-DAA_SYSROOT_MANIFEST={manifest}', f'-DAA_DECODE_GST_OVERLAY={overlay}', '-DBUILD_TESTING=ON'],
-        ['cmake', '--build', str(build), '--parallel', '4'],
-        ['ctest', '--test-dir', str(build), '-R', '^cross_contamination_', '--output-on-failure'],
+         f'-DAA_SYSROOT_MANIFEST={manifest}', f'-DAA_DECODE_GST_OVERLAY={overlay}', '-DBUILD_TESTING=ON',
+         *configure_extra],
+        ['cmake', '--build', str(build), '--parallel', '4', *(['--target', *targets] if targets else [])],
+        ['ctest', '--test-dir', str(build), '-R', '^cross_(contamination.*|runtime_regressions)$',
+         '--output-on-failure'],
     )
     # When configuring and building actual probe sources with the real cross toolchain.
     for index, command in enumerate(commands):
         log = scratch / f'step-{index}.log'
+        print(f'decode-overlay-cross: step={index} log={log}', flush=True)
         with log.open('w') as stream:
             result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
                                     env=environment, check=False, timeout=180)
@@ -66,13 +82,17 @@ def main() -> int:
         ['ctest', '--test-dir', str(build), '--show-only=json-v1'], text=True))
     expected_tests = {f'cross_contamination_{name}' for name in
                       ('aa-decode-probe', 'decode-probe-inputs', 'decode-probe-metrics', 'decode-probe-discovery')}
-    assert {test['name'] for test in inventory['tests']} == expected_tests, 'cross coverage mismatch'
+    if args.root_project:
+        expected_tests.update(('cross_contamination', 'cross_runtime_regressions'))
+    registered = {test['name'] for test in inventory['tests']
+                  if not args.root_project or test['name'].startswith('cross_')}
+    assert registered == expected_tests, 'cross coverage mismatch'
     assert 'AA_DECODE_PROBE_CROSS:STRING=AVAILABLE' in cache, 'AA_DECODE_AVAILABLE_REQUIRED'
     assert f'AA_DECODE_GST_OVERLAY_DIGEST:STRING={expected}' in cache, 'fixture digest mismatch'
     overlay_record = Overlay(overlay, build / 'aa-decode-overlay.sha256', expected)
     compiler = Path('/usr/bin/aarch64-linux-gnu-g++')
     inputs = Inputs(sysroot, build, root, compiler, manifest, sysroot, overlay_record)
-    binary = build / 'probe/aa-decode-probe'
+    binary = build / ('tools/aa-decode-probe/aa-decode-probe' if args.root_project else 'probe/aa-decode-probe')
     header = subprocess.check_output(['readelf', '-h', str(binary)], text=True)
     assert 'AArch64' in header, 'probe is not an AArch64 ELF'
     report = check_inputs(binary, inputs)
@@ -91,10 +111,34 @@ def main() -> int:
             assert error.field == expected_field, error
         else:
             raise AssertionError('unbound overlay provenance accepted')
+    # Given a valid overlay tuple but a different digest carried by the ELF.
+    section = scratch / 'wrong-overlay-section'
+    section.write_bytes(b'0' * 64 + b'\0')
+    wrong_binary = scratch / 'wrong-binding-probe'
+    subprocess.run(['aarch64-linux-gnu-objcopy', '--update-section', f'.aa_decode_overlay={section}',
+                    str(binary), str(wrong_binary)], check=True)
+    # When checking the altered binary, binding must fail before classifying inputs.
+    try:
+        check_inputs(wrong_binary, inputs)
+    except SysrootError as error:
+        assert error.field == 'provenance.overlay-binary-binding', error
+    else:
+        raise AssertionError('wrong ELF overlay binding accepted')
+    if args.root_project:
+        smoke = check_inputs(build / 'aa_host_smoke', replace(inputs, overlay=None))
+        assert not smoke.contamination, smoke.contamination
+        assert smoke.overlay is None
+        assert not any(Path(item.path).is_relative_to(overlay) for item in smoke.selected)
+        assert any(item.path.endswith('/googletest/src/gtest.cc') for item in smoke.selected), 'archive headers omitted'
     receipt = {'state': 'AVAILABLE', 'machine': 'AArch64', 'overlay_digest': expected,
                'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-               'overlay_selected_inputs': len(selected), 'cross_contamination_tests': len(expected_tests),
-               'runtime_executed': False, 'acceptance': report.acceptance}
+               'overlay_selected_inputs': len(selected),
+               'cross_contamination_tests': sum(name.startswith('cross_contamination') for name in expected_tests),
+               'cross_tests': len(expected_tests), 'runtime_regressions': args.root_project,
+               'runtime_executed': False, 'acceptance': report.acceptance,
+               'root_project': args.root_project, 'overlay_root': str(overlay),
+               'source_root': str(root), 'build_root': str(build),
+               'binding_negatives': ['missing-overlay', 'wrong-overlay-digest', 'wrong-elf-digest']}
     (scratch / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print('decode-overlay-cross: PASS ' + json.dumps(receipt))
     return 0

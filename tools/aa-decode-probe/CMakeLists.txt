@@ -79,6 +79,12 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
         set_tests_properties(decode-build-policy-${_aa_policy_case} PROPERTIES TIMEOUT 60)
     endforeach()
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    if(AA_GOOGLETEST_ARCHIVE)
+        add_test(NAME decode-cross-root-overlay COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/media/root_cross_decode_overlay.py
+            ${CMAKE_CURRENT_BINARY_DIR}/root-cross-logs ${AA_GOOGLETEST_ARCHIVE})
+        set_tests_properties(decode-cross-root-overlay PROPERTIES TIMEOUT 300)
+    endif()
     add_test(NAME decode-probe-smoke COMMAND ${Python3_EXECUTABLE} -B
         ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/media/test_decode_probe.py
         $<TARGET_FILE:aa-decode-probe>

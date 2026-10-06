@@ -32,6 +32,7 @@ EXPECTED: Final = frozenset({
     'decode-build-policy-overlay-mismatch',
     'decode-build-policy-overlay-extra',
     'decode-build-policy-overlay-available',
+    'decode-cross-root-overlay',
     'decode-probe-smoke',
     'decode-probe-corrections',
 })
