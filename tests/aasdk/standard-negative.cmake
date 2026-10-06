@@ -4,7 +4,7 @@ set(fixture "${BUILD}/aasdk-standard-${fixture_id}")
 file(MAKE_DIRECTORY "${fixture}")
 configure_file("${ROOT}/tests/aasdk/consumer.cpp" "${fixture}/main.cpp" COPYONLY)
 get_filename_component(library_dir "${SDK}" DIRECTORY)
-file(WRITE "${fixture}/CMakeLists.txt" "cmake_minimum_required(VERSION 3.20)\nproject(standard_fixture LANGUAGES CXX)\nfind_package(Protobuf REQUIRED)\nadd_executable(probe main.cpp)\ntarget_include_directories(probe PRIVATE \"${INCLUDE}\" \"${GENERATED}\")\ntarget_link_libraries(probe PRIVATE \"${SDK}\" \"${PROTO}\" protobuf::libprotobuf)\nset_target_properties(probe PROPERTIES CXX_STANDARD \${STANDARD} CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)\n")
+file(WRITE "${fixture}/CMakeLists.txt" "cmake_minimum_required(VERSION 3.20)\nproject(standard_fixture LANGUAGES CXX)\nfind_package(Protobuf REQUIRED)\nadd_executable(probe main.cpp)\ntarget_include_directories(probe PRIVATE \"${INCLUDE}\" \"${GENERATED}\" \"${ROOT}/include\")\ntarget_link_libraries(probe PRIVATE \"${SDK}\" \"${PROTO}\" protobuf::libprotobuf)\nset_target_properties(probe PROPERTIES CXX_STANDARD \${STANDARD} CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)\n")
 foreach(standard 20 17)
     execute_process(COMMAND "${CMAKE_COMMAND}" -S "${fixture}" -B "${fixture}/build-${standard}"
         "-DCMAKE_CXX_COMPILER=${CXX}" "-DCMAKE_BUILD_RPATH=${library_dir}" "-DSTANDARD=${standard}"

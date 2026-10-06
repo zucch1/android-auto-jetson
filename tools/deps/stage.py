@@ -20,7 +20,8 @@ import sys
 import tarfile
 import tempfile
 
-from check_manifest import PATCH_PATH, PATCH_SHA256, SOURCES, ManifestError, check
+from check_manifest import PATCH_PATH, PATCH_SHA256, TLS_PATCH_SHA256, SOURCES, ManifestError, check
+from tls_patch import apply as apply_tls
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,10 +132,18 @@ def stage(root: Path, cache: Path, archive_path: Path) -> Path:
             content = effective if name == 'aasdk/CMakeLists.txt' else path.read_bytes()
             expected[name] = File(content, stat.S_IMODE(path.stat().st_mode))
     expected['googletest-declaration.cmake'] = File(block.group(), 0o644)
+    for patched_file in apply_tls(root, effective):
+        name = 'aasdk/' + patched_file.path
+        if patched_file.contents is None:
+            del expected[name]
+        else:
+            expected[name] = File(patched_file.contents, expected[name].mode)
+    effective = expected['aasdk/CMakeLists.txt'].data
     identity = {
         'schema': 'aa-effective-dependencies-1',
         'original_cmake_blob': blob(original_data), 'original_cmake_sha256': sha256(original_data),
         'patch_sha256': PATCH_SHA256,
+        'tls_patch_sha256': TLS_PATCH_SHA256,
         'effective_cmake_blob': blob(effective), 'effective_cmake_sha256': sha256(effective),
         'googletest_archive_sha256': sha256(data),
         'effective_googletest_git_tag': tags[0].decode('ascii'),

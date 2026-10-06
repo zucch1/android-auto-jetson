@@ -20,6 +20,8 @@ add_subdirectory("${AA_DEPENDENCY_STAGE}/aasdk" "${CMAKE_BINARY_DIR}/aasdk" EXCL
 set_target_properties(aasdk aap_protobuf PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 target_include_directories(aasdk PUBLIC "$<BUILD_INTERFACE:${AA_DEPENDENCY_STAGE}/aasdk/include>")
+target_include_directories(aasdk PUBLIC "$<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>")
+target_link_libraries(aasdk PRIVATE aa_tls)
 target_link_options(aasdk PRIVATE -Wl,--no-undefined)
 target_link_options(aap_protobuf PRIVATE -Wl,--no-undefined)
 
@@ -44,3 +46,13 @@ add_test(NAME aasdk_abi_compile_flags COMMAND "${CMAKE_COMMAND}"
     -P "${CMAKE_SOURCE_DIR}/tests/aasdk/compile-flags.cmake")
 set_tests_properties(aasdk_abi_consumer aasdk_abi_symbols aasdk_abi_standard_negative aasdk_abi_compile_flags
     PROPERTIES TIMEOUT 60)
+foreach(case tls tls-tamper)
+    add_test(NAME tls_posture_stage_${case} COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/deps/staging.py" "${CMAKE_SOURCE_DIR}" "${case}" "${AA_GOOGLETEST_ARCHIVE}")
+endforeach()
+foreach(case tls-patch tls-lock)
+    add_test(NAME tls_posture_manifest_${case} COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/deps/scenarios.py" "${CMAKE_SOURCE_DIR}" "${case}" "${AA_GOOGLETEST_ARCHIVE}")
+endforeach()
+add_test(NAME tls_posture_effective_stage COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_SOURCE_DIR}/tests/tls/effective.py" "${AA_DEPENDENCY_STAGE}" "${CMAKE_BINARY_DIR}")
