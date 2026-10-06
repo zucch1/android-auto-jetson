@@ -83,6 +83,8 @@ foreach(case reuse effective-tamper gtest-tamper extra missing-staging)
         "${CMAKE_SOURCE_DIR}/tests/deps/staging.py" "${CMAKE_SOURCE_DIR}" "${case}" "${AA_GOOGLETEST_ARCHIVE}")
 endforeach()
 
+add_subdirectory(tools/aa-ipc-bench)
+
 # Task 9 is mandatory: missing development inputs must not turn CI green by omission.
 add_subdirectory(tools/aa-decode-probe)
 if(NOT CMAKE_CROSSCOMPILING)
