@@ -3,7 +3,7 @@ if(CMAKE_CROSSCOMPILING)
     return()
 endif()
 find_package(OpenSSL REQUIRED)
-add_library(aa_tls STATIC src/tls/Credentials.cpp)
+add_library(aa_tls STATIC src/tls/Credentials.cpp src/tls/Policy.cpp)
 set_target_properties(aa_tls PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO
     POSITION_INDEPENDENT_CODE ON)
@@ -26,3 +26,11 @@ add_test(NAME tls_posture_key_scan COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tests/tls/scan.py" "${CMAKE_SOURCE_DIR}")
 add_test(NAME tls_posture_key_scan_negative COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tests/tls/scan.py" "${CMAKE_SOURCE_DIR}" --negative)
+add_executable(aa_tls_policy tests/tls/policy.cpp)
+target_link_libraries(aa_tls_policy PRIVATE aa_tls)
+set_target_properties(aa_tls_policy PROPERTIES
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_options(aa_tls_policy PRIVATE -Wall -Wextra -Wpedantic -Werror)
+foreach(case approved unknown absent throwing verified)
+    add_test(NAME tls_posture_policy_${case} COMMAND aa_tls_policy "${case}")
+endforeach()
