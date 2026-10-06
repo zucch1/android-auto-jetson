@@ -18,6 +18,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.build.input_provenance import Inputs, check_inputs
+from tools.sysroot.models import SysrootError
 from fixtures import CONTENT, TAMPERED, build_manifest, write_manifest, write_payload
 
 
@@ -35,11 +36,16 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix='runtime-provenance-') as temporary:
         scratch = Path(temporary)
         shutil.copyfile(binary, scratch / binary.name)
-        dep = scratch / 'injected.headers.d'
+        obj = scratch / 'smoke.cpp.o'
+        shutil.copyfile(build / 'CMakeFiles/aa_host_smoke.dir/tests/host/smoke.cpp.o', obj)
+        dep = scratch / 'smoke.cpp.o.headers.d'
+        shutil.copyfile(build / 'compile_commands.json', scratch / 'compile_commands.json')
         link_map = scratch / 'aa_host_smoke.map'
         baseline_map = binary.with_name(binary.name + '.map').read_text()
         baseline_map = baseline_map.replace('LOAD CMakeFiles/', f'LOAD {build}/CMakeFiles/')
         baseline_map = baseline_map.replace('LOAD lib/', f'LOAD {build}/lib/')
+        baseline_map = baseline_map.replace(
+            f'LOAD {build}/CMakeFiles/aa_host_smoke.dir/tests/host/smoke.cpp.o', f'LOAD {obj}')
         # Given retained evidence containing a host-installed ARM64 libc header.
         dep.write_text('object: /usr/aarch64-linux-gnu/include/stdc-predef.h\n')
         link_map.write_text(baseline_map)
@@ -56,6 +62,35 @@ def main() -> int:
         # Then the target-runtime library outside sysroot is rejected.
         assert any('libstdc++.so.6' in value for value in leaked.contamination)
         print('PASS host ARM64 runtime rejected')
+        # Given other valid retained dependencies but none for the linked smoke object.
+        saved_dep = dep.read_bytes()
+        dep.unlink()
+        try:
+            # When checking that binary, unrelated dependency files cannot fill the gap.
+            try:
+                check_inputs(scratch / binary.name, replace(inputs, build=scratch))
+            except SysrootError as error:
+                assert error.field == 'provenance.missing-dependencies-or-link-map', error
+            else:
+                raise AssertionError('missing linked-object dependencies accepted')
+        finally:
+            dep.write_bytes(saved_dep)
+        print('PASS missing linked-object dependency evidence rejected')
+        # Given loaded project archives without a matching compiled-object record.
+        database = scratch / 'compile_commands.json'
+        saved_database = database.read_bytes()
+        database.write_text('[]\n')
+        try:
+            # When checking that binary, project archive headers cannot be omitted.
+            try:
+                check_inputs(scratch / binary.name, replace(inputs, build=scratch))
+            except SysrootError as error:
+                assert error.field == 'provenance.archive-object-binding', error
+            else:
+                raise AssertionError('unbound archive object accepted')
+        finally:
+            database.write_bytes(saved_database)
+        print('PASS missing archive object binding rejected')
         commands = json.loads((build / 'compile_commands.json').read_text())
         command = next(item for item in commands if item['file'].endswith('/tests/host/smoke.cpp'))
         flags = shlex.split(command['command'])

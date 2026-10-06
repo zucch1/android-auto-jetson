@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -92,9 +93,37 @@ def check_inputs(binary: Path, inputs: Inputs) -> InputReport:
                 acceptance = 'fixture-link-sysroot-not-target'
             case unreachable:
                 assert_never(unreachable)
-    dependencies = tuple(build.rglob('*.headers.d'))
     link_map = binary.with_name(binary.name + '.map')
-    if not dependencies or not link_map.is_file():
+    if not link_map.is_file():
+        raise SysrootError(Code.ARTIFACT_MISMATCH, 'provenance.missing-dependencies-or-link-map')
+    map_text = link_map.read_text()
+    loads = tuple(Path(token) if Path(token).is_absolute() else build / token
+                  for token in re.findall(r'^LOAD (.+)$', map_text, re.MULTILINE)
+                  if token != 'linker stubs')
+    # Select only this link's project objects, including objects packed into its
+    # project archives. Match archive bytes, not just basenames shared by targets.
+    objects = {path for path in loads if path.suffix == '.o'
+               and (path.is_relative_to(build) or path.is_relative_to(source))}
+    archives = tuple(path for path in loads if path.suffix == '.a'
+                     and (path.is_relative_to(build) or path.is_relative_to(source)))
+    if archives:
+        commands = json.loads((build / 'compile_commands.json').read_text())
+        candidates: set[Path] = set()
+        for command in commands:
+            flags = shlex.split(command['command'])
+            output = Path(flags[flags.index('-o') + 1])
+            candidates.add(output if output.is_absolute() else Path(command['directory']) / output)
+        for archive in archives:
+            members = subprocess.check_output(['ar', 't', str(archive)], text=True, timeout=30).splitlines()
+            for member in members:
+                packed = subprocess.check_output(['ar', 'p', str(archive), member], timeout=30)
+                matches = {path for path in candidates if path.name == member and path.is_file()
+                           and path.read_bytes() == packed}
+                if len(matches) != 1:
+                    raise SysrootError(Code.ARTIFACT_MISMATCH, 'provenance.archive-object-binding')
+                objects.update(matches)
+    dependencies = tuple(path.with_name(path.name + '.headers.d') for path in sorted(objects))
+    if not dependencies or any(not path.is_file() for path in dependencies):
         raise SysrootError(Code.ARTIFACT_MISMATCH, 'provenance.missing-dependencies-or-link-map')
     paths: set[Path] = set(executables)
     for dependency in dependencies:
@@ -103,11 +132,7 @@ def check_inputs(binary: Path, inputs: Inputs) -> InputReport:
             path = Path(token)
             paths.add(path if path.is_absolute() else build / path)
     # LOAD records include scripts, archives and their resolved shared-object members.
-    for token in re.findall(r'^LOAD (.+)$', link_map.read_text(), re.MULTILINE):
-        if token == 'linker stubs':
-            continue
-        path = Path(token)
-        paths.add(path if path.is_absolute() else build / path)
+    paths.update(loads)
     selected: list[SelectedInput] = []
     contamination: list[str] = []
     target_headers = False
