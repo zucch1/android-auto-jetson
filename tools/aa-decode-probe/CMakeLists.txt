@@ -6,12 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(GST REQUIRED IMPORTED_TARGET
-    gstreamer-1.0
-    gstreamer-app-1.0
-    gstreamer-video-1.0
-)
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/DecodeDependencies.cmake")
 
 add_executable(aa-decode-probe
     src/main.cpp
@@ -32,16 +27,43 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
 endif()
 
 include(CTest)
+set(_aa_decode_targets aa-decode-probe)
 if(BUILD_TESTING)
     add_executable(decode-probe-inputs ../../tests/media/decode_probe_inputs.cpp src/options.cpp src/json_report.cpp)
     add_executable(decode-probe-metrics ../../tests/media/decode_probe_metrics.cpp src/metrics.cpp)
     add_executable(decode-probe-discovery ../../tests/media/decode_probe_discovery.cpp src/discovery.cpp)
     target_link_libraries(decode-probe-discovery PRIVATE PkgConfig::GST)
     foreach(test_target decode-probe-inputs decode-probe-metrics decode-probe-discovery)
+        list(APPEND _aa_decode_targets ${test_target})
         target_include_directories(${test_target} PRIVATE include)
         target_compile_options(${test_target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
-        add_test(NAME ${test_target} COMMAND ${test_target})
-        set_tests_properties(${test_target} PROPERTIES TIMEOUT 10)
+        if(NOT CMAKE_CROSSCOMPILING)
+            add_test(NAME ${test_target} COMMAND ${test_target})
+            set_tests_properties(${test_target} PROPERTIES TIMEOUT 10)
+        endif()
+    endforeach()
+endif()
+if(TARGET aa_sysroot_hash_gate)
+    foreach(_aa_decode_target IN LISTS _aa_decode_targets)
+        # Ninja completes the gate's custom command before any source compilation.
+        add_dependencies(${_aa_decode_target} aa_sysroot_hash_gate)
+        target_link_options(${_aa_decode_target} PRIVATE "-Wl,-Map,$<TARGET_FILE:${_aa_decode_target}>.map")
+        add_test(NAME cross_contamination_${_aa_decode_target}
+            COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/../build/contamination.py"
+                --binary "$<TARGET_FILE:${_aa_decode_target}>" --sysroot "${CMAKE_SYSROOT}"
+                --build "${CMAKE_BINARY_DIR}" --source "${CMAKE_SOURCE_DIR}"
+                --compiler "${CMAKE_CXX_COMPILER}" ${AA_SYSROOT_PROVENANCE_ARGS}
+                --output "$<TARGET_FILE:${_aa_decode_target}>.inputs.json")
+        set_tests_properties(cross_contamination_${_aa_decode_target} PROPERTIES TIMEOUT 60)
+    endforeach()
+endif()
+if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
+    foreach(_aa_policy_case isolated host-path missing escape symlink unbound ordering)
+        add_test(NAME decode-build-policy-${_aa_policy_case}
+            COMMAND "${CMAKE_COMMAND}" "-DROOT=${CMAKE_CURRENT_SOURCE_DIR}/../.."
+                "-DSCRATCH=${CMAKE_CURRENT_BINARY_DIR}/policy-${_aa_policy_case}"
+                "-DCASE=${_aa_policy_case}" -P "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/media/decode_build_policy.cmake")
+        set_tests_properties(decode-build-policy-${_aa_policy_case} PROPERTIES TIMEOUT 60)
     endforeach()
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME decode-probe-smoke COMMAND ${Python3_EXECUTABLE} -B
