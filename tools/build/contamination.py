@@ -20,6 +20,7 @@ if __package__ in (None, ''):
 
 from tools.sysroot.models import Code, SysrootError
 from tools.build.input_provenance import Inputs, check_inputs
+from tools.build.decode_overlay import Overlay
 
 AARCH64_INTERP = '/lib/ld-linux-aarch64.so.1'
 BANNED_HOST = (
@@ -91,12 +92,20 @@ def arguments() -> argparse.Namespace:
     parser.add_argument('--manifest', type=Path)
     parser.add_argument('--payload', type=Path)
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--overlay', type=Path)
+    parser.add_argument('--overlay-manifest', type=Path)
+    parser.add_argument('--overlay-digest')
     return parser.parse_args()
 
 
 def main() -> int:
     args = arguments()
     try:
+        overlay = None
+        if any(value is not None for value in (args.overlay, args.overlay_manifest, args.overlay_digest)):
+            if args.overlay is None or args.overlay_manifest is None or args.overlay_digest is None or args.sysroot is None:
+                raise SysrootError(Code.ARTIFACT_MISMATCH, 'provenance.overlay-arguments')
+            overlay = Overlay(args.overlay.resolve(strict=True), args.overlay_manifest, args.overlay_digest)
         report = check(args.binary)
         document = asdict(report)
         document['acceptance'] = 'elf-only-not-input-provenance'
@@ -104,9 +113,15 @@ def main() -> int:
             if args.build is None or args.source is None or args.compiler is None:
                 raise SysrootError(Code.ARTIFACT_MISMATCH, 'provenance.arguments')
             inputs = Inputs(args.sysroot, args.build, args.source, args.compiler,
-                            args.manifest, args.payload)
+                            args.manifest, args.payload, overlay)
             provenance = check_inputs(args.binary, inputs)
             document['inputs'] = asdict(provenance)
+            if provenance.overlay is not None:
+                document['inputs']['overlay'] = {
+                    'root': str(provenance.overlay.root),
+                    'manifest': str(provenance.overlay.manifest),
+                    'digest': provenance.overlay.digest,
+                }
             document['acceptance'] = provenance.acceptance
             document['clean'] = report.clean and not provenance.contamination
     except SysrootError as error:

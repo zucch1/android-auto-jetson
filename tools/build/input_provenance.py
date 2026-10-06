@@ -17,6 +17,7 @@ import subprocess
 from typing import assert_never
 
 from tools.build.validate_sysroot import validate_payload
+from tools.build.decode_overlay import Overlay, verify
 from tools.sysroot.models import Code, Provenance, SysrootError
 
 
@@ -28,6 +29,7 @@ class Inputs:
     compiler: Path
     manifest: Path | None
     payload: Path | None
+    overlay: Overlay | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +45,7 @@ class InputReport:
     acceptance: str
     selected: tuple[SelectedInput, ...]
     contamination: tuple[str, ...]
+    overlay: Overlay | None = None
 
 
 def compiler_path(compiler: Path, option: str) -> Path:
@@ -56,6 +59,16 @@ def check_inputs(binary: Path, inputs: Inputs) -> InputReport:
     sysroot = inputs.sysroot.resolve(strict=True)
     build = inputs.build.resolve(strict=True)
     source = inputs.source.resolve(strict=True)
+    overlay_paths: frozenset[Path] = frozenset()
+    record = subprocess.run(['readelf', '-p', '.aa_decode_overlay', str(binary)],
+                            capture_output=True, text=True, check=True, timeout=30)
+    digests = re.findall(r'\[\s*[0-9a-f]+\]\s+([0-9a-f]{64})\s*$', record.stdout, re.MULTILINE)
+    if "String dump of section '.aa_decode_overlay':" in record.stdout and inputs.overlay is None:
+        raise SysrootError(Code.ARTIFACT_MISMATCH, 'provenance.overlay-arguments')
+    if inputs.overlay is not None:
+        overlay_paths = verify(inputs.overlay)
+        if digests != [inputs.overlay.digest]:
+            raise SysrootError(Code.ARTIFACT_MISMATCH, 'provenance.overlay-binary-binding')
     builtin = compiler_path(inputs.compiler, '-print-file-name=include')
     support = compiler_path(inputs.compiler, '-print-libgcc-file-name').parent
     allowed_support = {support / name for name in
@@ -113,6 +126,10 @@ def check_inputs(binary: Path, inputs: Inputs) -> InputReport:
             target_libraries |= resolved.suffix in ('.o', '.a') or '.so' in resolved.name
             if observed and (path not in validated or resolved not in validated):
                 contamination.append(f'unrecorded-target-input:{path}')
+        elif inputs.overlay is not None and resolved.is_relative_to(inputs.overlay.root):
+            category = 'digest-recorded-decode-overlay'
+            if path not in overlay_paths or resolved not in overlay_paths:
+                contamination.append(f'unrecorded-overlay-input:{path}')
         elif resolved.is_relative_to(source) or resolved.is_relative_to(build):
             category = 'project-or-staged-dependency'
         else:
@@ -122,4 +139,6 @@ def check_inputs(binary: Path, inputs: Inputs) -> InputReport:
         selected.append(SelectedInput(str(path), str(resolved), digest, category))
     if not target_headers or not target_libraries:
         contamination.append('missing-target-header-or-library-evidence')
-    return InputReport(acceptance, tuple(selected), tuple(contamination))
+    if inputs.overlay is not None:
+        acceptance += '-with-digest-recorded-overlay-not-target-qualified'
+    return InputReport(acceptance, tuple(selected), tuple(contamination), inputs.overlay)

@@ -11,6 +11,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,7 @@ def main() -> int:
     print('PASS real fixture selected-input provenance (NOT TARGET ACCEPTANCE)')
     with tempfile.TemporaryDirectory(prefix='runtime-provenance-') as temporary:
         scratch = Path(temporary)
+        shutil.copyfile(binary, scratch / binary.name)
         dep = scratch / 'injected.headers.d'
         link_map = scratch / 'aa_host_smoke.map'
         baseline_map = binary.with_name(binary.name + '.map').read_text()
