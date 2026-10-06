@@ -1,8 +1,11 @@
 # Wireless capability probe (task 12)
 
 This phase is host implementation only. No Jetson or phone has been contacted.
-Run host fixtures with `python3 -B tests/wireless/test_probe.py`; CTest registers
-six scenario groups, and CI requires all six. Reports use `aa-wireless-probe/1`.
+Run host fixtures with `python3 -B tests/wireless/test_probe.py`,
+`python3 -B tests/wireless/test_regulatory.py`, and
+`python3 -B tests/wireless/test_psk.py`. CTest registers six original scenario groups
+and ten individually named correction regressions; CI requires all sixteen names.
+Reports use `aa-wireless-probe/1`.
 Discovery does not imply AP operation or BlueZ registration. Failed capabilities
 are blockers, never pairing, trust, projection, phone-hosted AP, or P2P claims.
 
@@ -50,6 +53,11 @@ sets the regulatory domain. Missing confirmation still permits read-only discove
 but never AP startup. Channel 36 must be enabled for AP initiation in the selected
 phy and effective regulatory rules; unknown, disabled, no-IR, radar/DFS, or insufficient
 20 MHz range is conservatively rejected. A self-managed phy supersedes global rules.
+All regulatory sections must parse completely before selection: duplicate sections
+or countries, malformed or overlapping rules, and ambiguous numeric phy aliases
+block startup rather than falling back to global permission. ASCII case and ordinary
+whitespace are normalized. Unknown rule flags cannot grant permission, and only a
+complete unflagged channel power annotation is accepted as channel evidence.
 
 The window requires RTL8822CE identity, `iw`, NetworkManager/nmcli, busctl, BlueZ,
 existing target Python dbus/GLib bindings, and already-authorized NM/D-Bus permissions
@@ -57,8 +65,17 @@ existing target Python dbus/GLib bindings, and already-authorized NM/D-Bus permi
 not carrying management connectivity. NetworkManager creates an in-memory profile
 (`save no`, autoconnect off), channel 36/5 GHz, WPA-PSK, with IPv4/IPv6 disabled;
 no DHCP, NAT, forwarding, persistent profile, or regulatory changes are made.
-The UUID-specific profile is deleted in a finally block. PSK travels via SSH stdin
-and is excluded from JSON; it is an ephemeral fixture credential, not a production key.
+The UUID-specific profile is deleted in a finally block. Before any window-hook or
+SSH invocation, the host opens the PSK with `O_NOFOLLOW` and validates the opened
+inode with `fstat`: a regular file owned by the current effective user, one hard link,
+and no group/other permissions. Symlink inputs, FIFOs, missing files, invalid owner
+or permissions, and invalid content are rejected without contact. Reads are bounded
+and use that same descriptor, not a later reopening of the path. Supported input is
+8..63 printable ASCII characters, no leading/trailing spaces, with one optional final
+LF. PSK travels via SSH stdin and then NetworkManager's `connection up passwd-file
+/dev/stdin` input; it never enters subprocess argv or JSON. The in-memory profile
+sets PSK flags to `not-saved` (2); diagnostics record error types, not credential-bearing
+exception messages. It is an ephemeral fixture credential, not a production key.
 
 An owner-approved **non-phone test client** must associate during the observation
 interval. The probe records station association, not IP connectivity, pairing, or
