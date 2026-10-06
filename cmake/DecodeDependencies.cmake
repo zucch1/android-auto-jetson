@@ -186,13 +186,20 @@ if(CMAKE_CROSSCOMPILING)
     endforeach()
     if(_aa_decode_provider STREQUAL _aa_decode_overlay)
         # Cross ld needs the captured DT_NEEDED closure, including /lib SONAME
-        # symlinks. These directories were escape-checked and digest-recorded above.
+        # symlinks. Containment and digest checks above do not protect -Wl encoding;
+        # reject commas in each directory below before the driver can split it.
         foreach(_aa_decode_runtime_dir IN LISTS GST_LIBRARY_DIRS)
+            if(_aa_decode_runtime_dir MATCHES ",")
+                message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: comma in rpath-link directory ${_aa_decode_runtime_dir}")
+            endif()
             set_property(TARGET PkgConfig::GST APPEND PROPERTY INTERFACE_LINK_OPTIONS
                 "-Wl,-rpath-link,${_aa_decode_runtime_dir}")
         endforeach()
         foreach(_aa_decode_runtime_suffix lib/aarch64-linux-gnu lib)
             if(IS_DIRECTORY "${_aa_decode_overlay}/${_aa_decode_runtime_suffix}")
+                if("${_aa_decode_overlay}/${_aa_decode_runtime_suffix}" MATCHES ",")
+                    message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: comma in rpath-link directory ${_aa_decode_overlay}/${_aa_decode_runtime_suffix}")
+                endif()
                 set_property(TARGET PkgConfig::GST APPEND PROPERTY INTERFACE_LINK_OPTIONS
                     "-Wl,-rpath-link,${_aa_decode_overlay}/${_aa_decode_runtime_suffix}")
             endif()
