@@ -25,15 +25,16 @@ class Regulatory(unittest.TestCase):
         with patch.object(Path, 'resolve', side_effect=[Path('/sys/phy0'), Path('/drivers/rtw_8822ce')]), \
                 patch.object(target, 'command', side_effect=[info, reg, 'GENERAL.STATE:30 (disconnected)', BUS]):
             target.discover(report, 'wlan0')
-        with patch.object(target, 'command') as mutation:
-            target.active(report, argparse.Namespace())
-        self.assertIn('channel-36-ineligible', report.blockers)
+        with patch.object(target, 'command', return_value='') as mutation:
+            target.active(report, argparse.Namespace(interface='wlan0', ap_psk='synthetic-only-secret', duration=1))
         mutation.assert_not_called()
+        self.assertIn('channel-36-ineligible', report.blockers)
 
     def test_sections_fail_closed(self):
         restricted = REG.replace('global', 'phy#0 (self-managed)').replace('US', '00').replace('AUTO-BW', 'NO-IR')
         for reg in (REG + ' ' + restricted, REG + restricted.upper(), REG + REG,
                     REG + restricted + restricted, REG + 'phy#0 nonsense\n',
+                    REG + restricted.replace('phy#0', 'phy#00'), REG.replace('US', 'U\u017f'),
                     REG + 'phy#0 (self-managed)\n', 'garbage\n' + REG):
             with self.subTest(reg=reg):
                 self.assert_blocked(reg)

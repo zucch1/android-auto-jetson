@@ -51,13 +51,15 @@ def command(args: list[str], payload: str | None = None) -> str:
 
 def regulatory_section(reg: str, phy: str) -> str:
     """Validate every section before selecting a phy override or global rules."""
+    if not reg.isascii():
+        return ''
     sections: dict[str, list[str]] = {}
     name = ''
     for raw in reg.splitlines():
         line = ' '.join(raw.upper().split())
         if not line:
             continue
-        header = re.fullmatch(r'(GLOBAL|PHY#\d+)(?: \(SELF-MANAGED\))?', line)
+        header = re.fullmatch(r'(GLOBAL|PHY#(?:0|[1-9]\d*))(?: \(SELF-MANAGED\))?', line)
         if header:
             name = header[1]
             if name in sections or (name == 'GLOBAL' and line != 'GLOBAL'):
@@ -98,6 +100,8 @@ def regulatory_rules(section: str) -> list[tuple[int, int, int, bool]]:
 
 def eligible(info: str, reg: str, jurisdiction: str) -> bool:
     """Conservatively require an explicitly permitted 20 MHz AP channel."""
+    if not info.isascii() or not reg.isascii():
+        return False
     # Only a complete, unflagged power annotation is explicit channel permission.
     channel = [line.strip() for line in info.splitlines() if re.search(r'5180|\[36\]', line)]
     country = re.match(r'COUNTRY ([A-Z0-9]{2}):', ' '.join(reg.upper().split()))
@@ -157,10 +161,10 @@ def active(report: Report, args: argparse.Namespace) -> None:
                  'ifname', args.interface, 'con-name', 'aa-task12-' + connection,
                  'connection.uuid', connection, 'connection.autoconnect', 'no',
                  'ssid', 'aa-task12-isolated', '802-11-wireless.mode', 'ap',
-                  '802-11-wireless.band', 'a', '802-11-wireless.channel', '36',
-                  '802-11-wireless-security.key-mgmt', 'wpa-psk',
-                  '802-11-wireless-security.psk-flags', '2',
-                  'ipv4.method', 'disabled', 'ipv6.method', 'disabled'])
+                 '802-11-wireless.band', 'a', '802-11-wireless.channel', '36',
+                 '802-11-wireless-security.key-mgmt', 'wpa-psk',
+                 '802-11-wireless-security.psk-flags', '2',
+                 'ipv4.method', 'disabled', 'ipv6.method', 'disabled'])
         command(['nmcli', '--wait', '20', 'connection', 'up', 'uuid', connection,
                  'passwd-file', '/dev/stdin'], '802-11-wireless-security.psk:' + args.ap_psk + '\n')
         report.raw['iw_operation'] = command(['iw', 'dev', args.interface, 'info'])
