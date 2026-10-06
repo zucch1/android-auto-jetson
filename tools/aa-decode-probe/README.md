@@ -1,8 +1,13 @@
 # Local decode probe: limits and reproduction
 
-Task9 remains local-only and unaccepted. This tool does not establish Jetson,
-phone, display, or target/hardware qualification. `target_qualified` is always
-false. No Task8 integration is implied.
+The probe report itself does not establish Jetson, phone, display, or target
+qualification: `target_qualified` is always false. Separately, the owner accepted
+Task 9 at reduced scope at `a0a2049e137e6b505b84b3aa1edc9a125819dbed`:
+600 seconds of NVIDIA H.264 decode at 1280x720@30 and approximately 10 Mbps,
+18000/18000 frames, zero drops, and 3.83% CPU of one core. The measured p95 was
+36.09 ms, so the <=33 ms latency-budget claim was withdrawn. The software
+fallback remains unqualified. These build-system corrections do not extend that
+sign-off to a new runtime qualification, phone/display coverage, or Task8 integration.
 
 From the repository root of this worktree:
 
@@ -18,6 +23,33 @@ software smoke scenario. Unit tests cover strict numeric parsing, JSON escaping,
 nearest-rank p95, exact PTS correlation, and explicit decoder classification.
 The CLI regressions include a Linux `/proc`/SIGSTOP fault-injection test that
 stops the isolated worker; the parent must kill and reap it at the deadline.
+
+## Cross overlay integrity and provenance
+
+`AA_DECODE_GST_OVERLAY` is a cross-only target-layout development fragment.
+One complete metadata provider is selected: the hash-validated frozen sysroot
+first, otherwise the overlay. Missing metadata explicitly yields
+`AA_DECODE_PROBE_CROSS=UNAVAILABLE`; incomplete or escaping inputs fail configure.
+An overlay-path validation must require `AVAILABLE`, not merely configure success.
+
+Configure writes `aa-decode-overlay.sha256` in the build directory: sorted
+`sha256  relpath` records for every file, including dotfiles, headers, libraries,
+and metadata. Contained file symlinks are hashed through their targets;
+directory symlinks, nonregular files, escaping paths, and non-simple ASCII
+relative paths are refused. The manifest's SHA-256 is embedded in each probe
+binary's `.aa_decode_overlay` ELF section. Every direct build runs a complete
+manifest verification before source compilation; linking rechecks it. Changed,
+missing, or extra files and altered manifest bytes fail the build. An explicit
+reconfigure records a new snapshot; callers must keep the capture read-only
+during a build. Hash gates detect drift at these boundaries, not concurrent
+adversarial writes between a check and a compiler read.
+
+The cross contamination checks require the same root, manifest, and digest,
+verify their binding to the binary, and classify recorded overlay inputs
+separately from sysroot inputs. A digest proves exact captured content, not
+observed target origin, ABI compatibility, decoder availability, or performance.
+The public synthetic overlay cross smoke builds an AArch64 ELF without running
+it; its result is build-policy evidence only, never Jetson qualification.
 
 ## Requested versus observed
 
