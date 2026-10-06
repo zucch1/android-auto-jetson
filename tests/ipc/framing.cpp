@@ -1,11 +1,36 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "transport.hpp"
 #include <gtest/gtest.h>
+#include <atomic>
+#include <cstdlib>
 #include <memory>
+#include <new>
 #include <vector>
 #include <sys/socket.h>
 
 using namespace aa::ipc;
+namespace {
+// Count heap allocations so the malformed-flood regression enforces bounded, non-retained
+// storage instead of only checking rejection counters. The counters/delete are harmless for
+// every other test in this binary.
+std::atomic<long long> allocations{0};
+long long allocation_count() { return allocations.load(std::memory_order_relaxed); }
+}
+void* operator new(std::size_t size) {
+    allocations.fetch_add(1, std::memory_order_relaxed);
+    void* pointer = std::malloc(size ? size : 1);
+    if (!pointer) throw std::bad_alloc();
+    return pointer;
+}
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept { return ::operator new(size); }
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept { return ::operator new(size); }
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete[](void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete(void* pointer, const std::nothrow_t&) noexcept { std::free(pointer); }
+void operator delete[](void* pointer, const std::nothrow_t&) noexcept { std::free(pointer); }
 namespace {
 Packet make_packet(Header h) {
     Packet packet{}; encode(packet, h);
@@ -98,9 +123,60 @@ TEST(IpcFraming, RejectInconsistentFragmentsAndReplay) {
 TEST(IpcFraming, MalformedFloodKeepsFixedStorage) {
     auto receiver = std::make_unique<Reassembler>();
     Packet packet{};
-    for (unsigned i = 0; i < 10000; ++i) EXPECT_EQ(receiver->accept(packet), Receive::rejected);
+    const auto before = allocation_count();
+    unsigned rejected = 0;
+    for (unsigned i = 0; i < 10000; ++i) rejected += receiver->accept(packet) == Receive::rejected;
+    const auto allocated = allocation_count() - before;
+    EXPECT_EQ(rejected, 10000);
+    EXPECT_EQ(allocated, 0) << "malformed flood retained dynamic allocation";
     EXPECT_EQ(receiver->rejected, 10000); EXPECT_TRUE(receiver->frame().empty());
     EXPECT_EQ(feed(*receiver, {1, 0, 42, 0, 1, 4, 4, true}), Receive::complete);
+}
+TEST(IpcFraming, EmptyRecordIsMalformedNotEof) {
+    SocketPair sockets; Sender sender(sockets.producer());
+    auto receiver = std::make_unique<Reassembler>(); Packet packet{}; bool eof = false;
+    std::array<std::uint8_t, 4> idr{{1, 2, 3, 4}};
+    ASSERT_EQ(sender.send_frame(idr, 1, true, 7), Send::sent);
+    ASSERT_EQ(receive(sockets.consumer(), packet, *receiver, eof), Receive::complete);
+    ASSERT_FALSE(eof);
+    // A still-connected peer sends a zero-length record; it must be rejected with loss,
+    // never mistaken for end-of-stream.
+    ASSERT_EQ(::send(sockets.producer(), nullptr, 0, MSG_NOSIGNAL), 0);
+    Header p{2, 100000, 9, 0, 1, 4, 4, false};
+    encode(packet, p);
+    ASSERT_EQ(::send(sockets.producer(), packet.data(), header_size + 4, MSG_NOSIGNAL),
+              static_cast<ssize_t>(header_size + 4));
+    EXPECT_EQ(receive(sockets.consumer(), packet, *receiver, eof), Receive::rejected);
+    EXPECT_FALSE(eof);
+    EXPECT_EQ(receiver->rejected, 1);
+    EXPECT_TRUE(receiver->waiting_idr());
+    EXPECT_TRUE(receiver->frame().empty());
+    // The queued P frame must stay suppressed until a complete IDR arrives.
+    EXPECT_EQ(receive(sockets.consumer(), packet, *receiver, eof), Receive::waiting);
+    EXPECT_FALSE(eof);
+    const auto baseline = receiver->resyncs;
+    std::array<std::uint8_t, 4> recovery{{5, 6, 7, 8}};
+    ASSERT_EQ(sender.send_frame(recovery, 3, true, 11), Send::sent);
+    EXPECT_EQ(receive(sockets.consumer(), packet, *receiver, eof), Receive::complete);
+    EXPECT_FALSE(eof);
+    EXPECT_TRUE(receiver->header().idr);
+    EXPECT_EQ(receiver->frame().size(), recovery.size());
+    EXPECT_EQ(receiver->resyncs, baseline + 1);
+}
+TEST(IpcFraming, GenuineShutdownTerminatesConsumer) {
+    SocketPair sockets; Sender sender(sockets.producer());
+    auto receiver = std::make_unique<Reassembler>(); Packet packet{}; bool eof = false;
+    std::array<std::uint8_t, 4> idr{{9, 9, 9, 9}};
+    ASSERT_EQ(sender.send_frame(idr, 1, true, 3), Send::sent);
+    ASSERT_EQ(receive(sockets.consumer(), packet, *receiver, eof), Receive::complete);
+    ASSERT_FALSE(eof);
+    ::shutdown(sockets.producer(), SHUT_WR);
+    EXPECT_EQ(receive(sockets.consumer(), packet, *receiver, eof), Receive::waiting);
+    EXPECT_TRUE(eof);
+    // An orderly EOF stays EOF and keeps delivering nothing; it is not counted as malformed.
+    EXPECT_EQ(receive(sockets.consumer(), packet, *receiver, eof), Receive::waiting);
+    EXPECT_TRUE(eof);
+    EXPECT_EQ(receiver->rejected, 0);
 }
 TEST(IpcFraming, SocketFragmentationAndTruncation) {
     SocketPair sockets; Sender sender(sockets.producer());

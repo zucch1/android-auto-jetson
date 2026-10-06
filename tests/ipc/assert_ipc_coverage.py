@@ -11,6 +11,8 @@ EXPECTED = frozenset({
     'ipc-IpcFraming.LossRequiresCompleteIdr',
     'ipc-IpcFraming.RejectInconsistentFragmentsAndReplay',
     'ipc-IpcFraming.MalformedFloodKeepsFixedStorage',
+    'ipc-IpcFraming.EmptyRecordIsMalformedNotEof',
+    'ipc-IpcFraming.GenuineShutdownTerminatesConsumer',
     'ipc-IpcFraming.SocketFragmentationAndTruncation',
     'ipc-bench-happy-600', 'ipc-bench-slow-consumer', 'ipc-bench-cli',
 })
