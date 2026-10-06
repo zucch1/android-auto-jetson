@@ -22,6 +22,11 @@ EXPECTED: Final = frozenset({
     'decode-build-policy-symlink',
     'decode-build-policy-unbound',
     'decode-build-policy-ordering',
+    'decode-build-policy-partial',
+    'decode-build-policy-overlay',
+    'decode-build-policy-overlay-escape',
+    'decode-build-policy-overlay-poison',
+    'decode-build-policy-overlay-partial',
     'decode-probe-smoke',
     'decode-probe-corrections',
 })

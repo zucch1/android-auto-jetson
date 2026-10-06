@@ -65,7 +65,7 @@ if(TARGET aa_sysroot_hash_gate)
     endforeach()
 endif()
 if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
-    foreach(_aa_policy_case isolated host-path missing escape symlink unbound ordering)
+    foreach(_aa_policy_case isolated host-path missing escape symlink unbound ordering partial overlay overlay-escape overlay-poison overlay-partial)
         add_test(NAME decode-build-policy-${_aa_policy_case}
             COMMAND "${CMAKE_COMMAND}" "-DROOT=${CMAKE_CURRENT_SOURCE_DIR}/../.."
                 "-DSCRATCH=${CMAKE_CURRENT_BINARY_DIR}/policy-${_aa_policy_case}"
