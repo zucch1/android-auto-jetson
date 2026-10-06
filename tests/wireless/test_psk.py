@@ -122,7 +122,7 @@ class Psk(unittest.TestCase):
         args = argparse.Namespace(interface='wlan0', duration=1, ap_psk=SECRET)
         def run(argv, **kwargs):
             if 'up' in argv:
-                self.assertEqual(kwargs['input'], '802-11-wireless-security.psk:' + SECRET + '\n')
+                self.assertEqual(kwargs.get('input'), '802-11-wireless-security.psk:' + SECRET + '\n')
                 self.assertEqual(argv[-2:], ['passwd-file', '/dev/stdin'])
                 raise subprocess.CalledProcessError(1, argv, stderr=SECRET)
             if 'delete' in argv:
@@ -144,7 +144,7 @@ class Psk(unittest.TestCase):
             yield SimpleNamespace(iteration=lambda block: None)
         def run(argv, **kwargs):
             if 'up' in argv:
-                self.assertEqual(kwargs['input'], '802-11-wireless-security.psk:' + SECRET + '\n')
+                self.assertEqual(kwargs.get('input'), '802-11-wireless-security.psk:' + SECRET + '\n')
             if argv[:2] == ['iw', 'dev']:
                 return SimpleNamespace(stdout='type AP\nchannel 36 (5180 MHz)' if argv[-1] == 'info' else
                                        'Station aa:bb:cc:dd:ee:ff (on wlan0)\n authorized: yes\n')
