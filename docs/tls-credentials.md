@@ -62,9 +62,10 @@ all bytes, modes and paths. Effective Cryptor contains no embedded credential
 symbols; bundled certificate/key files, install rules and Debian migration are
 removed. Checked OpenSSL buffer-length conversions reject oversized lengths.
 
-The repository marker scanner excludes only root operational caches/builds and
-Python bytecode caches, not source directories named `build`. Exact reference
-path/digest bindings and two separately labeled immutable upstream exceptions
+The repository marker scanner excludes only the root operational paths `.git`,
+`.omo`, `build` and `.local`. All other content, including `__pycache__`
+directories at every depth and source directories named `build`, is scanned.
+Exact reference path/digest bindings and two separately labeled immutable upstream exceptions
 implement the parent ruling. No broad vendor or compatibility-directory PEM
 exemption exists. Effective-stage scanning has no exceptions.
 
