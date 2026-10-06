@@ -145,9 +145,26 @@ if(CMAKE_CROSSCOMPILING)
 endif()
 
 find_package(PkgConfig REQUIRED)
+if(CMAKE_CROSSCOMPILING AND _aa_decode_overlay)
+    # FindPkgConfig resolves -L inputs through find_library. Sanction only the
+    # validated roots here so root-only toolchains do not re-root the overlay.
+    set(_aa_decode_find_roots_defined FALSE)
+    if(DEFINED CMAKE_FIND_ROOT_PATH)
+        set(_aa_decode_find_roots_defined TRUE)
+        set(_aa_decode_saved_find_roots "${CMAKE_FIND_ROOT_PATH}")
+    endif()
+    set(CMAKE_FIND_ROOT_PATH "${_aa_decode_overlay};${_aa_decode_root}")
+endif()
 pkg_check_modules(GST REQUIRED IMPORTED_TARGET
     NO_CMAKE_PATH NO_CMAKE_ENVIRONMENT_PATH
     gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+if(CMAKE_CROSSCOMPILING AND _aa_decode_overlay)
+    if(_aa_decode_find_roots_defined)
+        set(CMAKE_FIND_ROOT_PATH "${_aa_decode_saved_find_roots}")
+    else()
+        unset(CMAKE_FIND_ROOT_PATH)
+    endif()
+endif()
 
 if(CMAKE_CROSSCOMPILING)
     get_target_property(_aa_decode_links PkgConfig::GST INTERFACE_LINK_LIBRARIES)
@@ -167,6 +184,20 @@ if(CMAKE_CROSSCOMPILING)
             message(FATAL_ERROR "AA_DECODE_PKG_ESCAPE: unsupported metadata flag ${_aa_decode_flag}")
         endif()
     endforeach()
+    if(_aa_decode_provider STREQUAL _aa_decode_overlay)
+        # Cross ld needs the captured DT_NEEDED closure, including /lib SONAME
+        # symlinks. These directories were escape-checked and digest-recorded above.
+        foreach(_aa_decode_runtime_dir IN LISTS GST_LIBRARY_DIRS)
+            set_property(TARGET PkgConfig::GST APPEND PROPERTY INTERFACE_LINK_OPTIONS
+                "-Wl,-rpath-link,${_aa_decode_runtime_dir}")
+        endforeach()
+        foreach(_aa_decode_runtime_suffix lib/aarch64-linux-gnu lib)
+            if(IS_DIRECTORY "${_aa_decode_overlay}/${_aa_decode_runtime_suffix}")
+                set_property(TARGET PkgConfig::GST APPEND PROPERTY INTERFACE_LINK_OPTIONS
+                    "-Wl,-rpath-link,${_aa_decode_overlay}/${_aa_decode_runtime_suffix}")
+            endif()
+        endforeach()
+    endif()
     set(AA_DECODE_PROBE_CROSS "AVAILABLE" CACHE STRING "Cross decode probe target metadata state" FORCE)
 endif()
 set(AA_DECODE_PROBE_READY TRUE)
