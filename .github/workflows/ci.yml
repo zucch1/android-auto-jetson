@@ -30,7 +30,8 @@ jobs:
           sudo apt-get install --no-install-recommends -y ninja-build cmake g++ \
             libprotobuf-dev protobuf-compiler libboost-system-dev libboost-log-dev \
             libssl-dev libusb-1.0-0-dev pkg-config libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
+            g++-aarch64-linux-gnu binutils
           protoc --version
           dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \
             libboost-log-dev libssl-dev libusb-1.0-0-dev libgstreamer1.0-dev \
@@ -76,6 +77,20 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B tests/media/cross_decode_overlay.py --scratch "$RUNNER_TEMP/decode-overlay-cross"
+      - name: Fetch and verify locked GoogleTest archive for root integration
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/googletest-v1.15.2.tar.gz"
+          curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' \
+            https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.15.2 \
+            --output "$archive"
+          python3 -B tools/deps/check_manifest.py --lock deps/manifest.lock --archive "$archive"
+      - name: Require full root cross provenance with an external overlay
+        run: |
+          set -euo pipefail
+          python3 -B tests/media/cross_decode_overlay.py --root-project \
+            --archive "$RUNNER_TEMP/googletest-v1.15.2.tar.gz" \
+            --scratch "$RUNNER_TEMP/decode-root-cross"
 
   provenance-lint:
     name: ci/provenance-lint
