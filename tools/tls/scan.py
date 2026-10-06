@@ -32,13 +32,16 @@ def forbidden(root: Path) -> bool:
     if (certificate.is_symlink() or not certificate.is_file() or
             hashlib.sha256(certificate.read_bytes()).hexdigest() != CERT_DIGEST):
         return True
-    for path in root.rglob('*'):
-        relative = path.relative_to(root)
-        if any(part in EXCLUDED for part in relative.parts):
-            continue
-        if path.is_symlink():
-            return True
-        if path.is_file():
+    for directory, subdirectories, files in root.walk():
+        if directory == root:
+            subdirectories[:] = [name for name in subdirectories if name not in EXCLUDED]
+            files = [name for name in files if name not in EXCLUDED]
+        subdirectories[:] = [name for name in subdirectories if name != '__pycache__']
+        for name in files:
+            path = directory / name
+            relative = path.relative_to(root)
+            if path.is_symlink():
+                return True
             data = path.read_bytes()
             pinned = PINNED.get(relative.as_posix())
             digest = hashlib.sha256(data).hexdigest()

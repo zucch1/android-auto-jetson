@@ -20,9 +20,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix='tls-scan-') as directory:
         fixture = Path(directory)
         shutil.copytree(root / 'third_party', fixture / 'third_party')
-        for name in ('planted.pem', 'third_party/compat-credentials/injected.key',
+        for name in ('planted.pem', 'tools/build/planted.pem', 'src/build/planted.pem',
+                     'third_party/compat-credentials/injected.key',
                      'third_party/aasdk/src/Messenger/Cryptor.cpp'):
             target = fixture / name
+            target.parent.mkdir(parents=True, exist_ok=True)
             original = target.read_bytes() if target.exists() else None
             target.write_bytes((root / 'third_party/compat-credentials/headunit.key').read_bytes())
             # When: scan a planted key or a changed pinned exception.
