@@ -50,32 +50,63 @@ def command(args: list[str]) -> str:
 
 
 def regulatory_section(reg: str, phy: str) -> str:
-    """A self-managed phy overrides global rules; never combine other phys."""
-    sections = re.split(r'(?m)^(global|phy#\d+[^\n]*)\n', reg)
-    selected = ''
-    for index in range(1, len(sections), 2):
-        name, body = sections[index:index + 2]
-        if name.split()[0] == 'phy#' + phy.removeprefix('phy'):
-            return body
-        if name == 'global':
-            selected = body
-    return selected
+    """Validate every section before selecting a phy override or global rules."""
+    sections: dict[str, list[str]] = {}
+    name = ''
+    for raw in reg.splitlines():
+        line = ' '.join(raw.upper().split())
+        if not line:
+            continue
+        header = re.fullmatch(r'(GLOBAL|PHY#\d+)(?: \(SELF-MANAGED\))?', line)
+        if header:
+            name = header[1]
+            if name in sections or (name == 'GLOBAL' and line != 'GLOBAL'):
+                return ''
+            sections[name] = []
+            continue
+        if not name:
+            return ''
+        sections[name].append(line)
+    if not sections or any(not regulatory_rules('\n'.join(body)) for body in sections.values()):
+        return ''
+    selected = sections.get('PHY#' + phy.removeprefix('phy'), sections.get('GLOBAL', []))
+    return '\n'.join(selected)
+
+
+def regulatory_rules(section: str) -> list[tuple[int, int, int, bool]]:
+    """Parse complete rules; unknown flags deny permission, invalid syntax denies all."""
+    lines = [' '.join(line.upper().split()) for line in section.splitlines() if line.strip()]
+    if not lines or not re.fullmatch(r'COUNTRY [A-Z0-9]{2}:(?: DFS-(?:FCC|ETSI|JP|UNSET))?', lines[0]):
+        return []
+    rules: list[tuple[int, int, int, bool]] = []
+    number = r'(?:N/A|-?\d+(?:\.\d+)?)'
+    pattern = (r'\((\d+)\s*-\s*(\d+)\s*@\s*(\d+)\), '
+               rf'\({number}, {number}\), \({number}\)((?:, [A-Z0-9][A-Z0-9 _-]*)*)')
+    for line in lines[1:]:
+        rule = re.fullmatch(pattern, line)
+        if not rule:
+            return []
+        lower, upper, bandwidth = map(int, rule.group(1, 2, 3))
+        if lower >= upper or bandwidth <= 0 or any(lower < end and upper > start for start, end, _, _ in rules):
+            return []
+        flags = [re.sub(r'[\s_-]+', '-', flag) for flag in rule[4].split(', ')[1:]]
+        if len(flags) != len(set(flags)):
+            return []
+        rules.append((lower, upper, bandwidth, all(flag == 'AUTO-BW' for flag in flags)))
+    return rules
 
 
 def eligible(info: str, reg: str, jurisdiction: str) -> bool:
     """Conservatively require an explicitly permitted 20 MHz AP channel."""
-    channel = re.findall(r'(?m)^\s*\* 5180 MHz \[36\]([^\n]*)$', info)
-    country = re.search(r'(?m)^country ([A-Z0-9]{2}):', reg)
+    # Only a complete, unflagged power annotation is explicit channel permission.
+    channel = [line.strip() for line in info.splitlines() if re.search(r'5180|\[36\]', line)]
+    country = re.match(r'COUNTRY ([A-Z0-9]{2}):', ' '.join(reg.upper().split()))
     if (len(channel) != 1 or country is None or not jurisdiction or
             country.group(1) != jurisdiction or
-            re.search(r'disabled|no[ -]IR|passive|radar|DFS|no 20MHz|no OFDM', channel[0], re.I)):
+            not re.fullmatch(r'\*\s+5180\s+MHz\s+\[36\]\s+\(\d+(?:\.\d+)?\s+dBm\)', channel[0], re.I)):
         return False
-    for line in reg.splitlines():
-        rule = re.search(r'\((\d+)\s*-\s*(\d+)\s*@\s*(\d+)\)', line)
-        if rule and int(rule[1]) <= 5170 and int(rule[2]) >= 5190 and int(rule[3]) >= 20:
-            if not re.search(r'NO.IR|DFS|PASSIVE|NO.OUTDOOR|NO.20MHZ|NO.OFDM', line, re.I):
-                return True
-    return False
+    return any(lower <= 5170 and upper >= 5190 and bandwidth >= 20 and permitted
+               for lower, upper, bandwidth, permitted in regulatory_rules(reg))
 
 
 def discover(report: Report, interface: str) -> str:
@@ -90,7 +121,7 @@ def discover(report: Report, interface: str) -> str:
                                 'device', 'show', interface])
     report.raw['bluez'] = command(['busctl', '--system', 'introspect', 'org.bluez', '/org/bluez'])
     section = regulatory_section(report.raw['iw_reg'], phy)
-    country = re.search(r'(?m)^country ([A-Z0-9]{2}):', section)
+    country = re.search(r'(?m)^COUNTRY ([A-Z0-9]{2}):', section)
     report.effective_regulatory_domain = country[1] if country else 'unknown'
     report.ap_mode = bool(re.search(r'(?m)^\s*\* AP\s*$', report.raw['iw_phy']))
     report.channel_36_eligible = eligible(report.raw['iw_phy'], section,

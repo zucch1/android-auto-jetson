@@ -61,7 +61,7 @@ class Policy(unittest.TestCase):
         self.assertFalse(target.eligible(INFO, target.regulatory_section(reg, 'phy0'), 'US'))
 
     def test_other_phy_does_not_override(self):
-        self.assertIn('country US:', target.regulatory_section(REG + 'phy#1\ncountry CA:\n', 'phy0'))
+        self.assertIn('COUNTRY US:', target.regulatory_section(REG + REG.replace('global', 'phy#1').replace('US', 'CA'), 'phy0'))
 
 
 class Discovery(unittest.TestCase):
