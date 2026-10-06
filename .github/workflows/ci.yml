@@ -56,6 +56,27 @@ jobs:
           ctest --test-dir build/host-dev -R aasdk_abi --output-on-failure -V
           ctest --preset host-dev --output-on-failure
 
+  decode-overlay-cross:
+    name: ci/decode-overlay-cross
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Provision public synthetic cross fixture dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ninja-build cmake \
+            g++-aarch64-linux-gnu pkg-config binutils libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
+      - name: Require AVAILABLE probe, AArch64 ELF and bound overlay provenance
+        run: |
+          set -euo pipefail
+          python3 -B tests/media/cross_decode_overlay.py --scratch "$RUNNER_TEMP/decode-overlay-cross"
+
   provenance-lint:
     name: ci/provenance-lint
     runs-on: ubuntu-24.04

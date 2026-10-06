@@ -64,7 +64,7 @@ if(TARGET aa_sysroot_hash_gate)
         add_test(NAME cross_contamination_${_aa_decode_target}
             COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/../build/contamination.py"
                 --binary "$<TARGET_FILE:${_aa_decode_target}>" --sysroot "${CMAKE_SYSROOT}"
-                --build "${CMAKE_BINARY_DIR}" --source "${CMAKE_SOURCE_DIR}"
+                --build "${CMAKE_BINARY_DIR}" --source "${CMAKE_CURRENT_SOURCE_DIR}/../.."
                 --compiler "${CMAKE_CXX_COMPILER}" ${AA_SYSROOT_PROVENANCE_ARGS} ${AA_DECODE_OVERLAY_PROVENANCE_ARGS}
                 --output "$<TARGET_FILE:${_aa_decode_target}>.inputs.json")
         set_tests_properties(cross_contamination_${_aa_decode_target} PROPERTIES TIMEOUT 60)
