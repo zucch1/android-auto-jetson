@@ -26,11 +26,11 @@ The planned merge gate consists of three exact, stable contexts:
 
 | Context | Implementation in this change |
 |---|---|
-| `ci/host-build-test` | Ubuntu 24.04 host foundation configure/build/CTest (public job) |
+| `ci/host-build-test` | Ubuntu 24.04 host foundation configure/build/CTest including the task-5 target-safety suite (public job) |
 | `ci/provenance-lint` | Source/notice and dependency-lock checks plus scratch mutation tests (public job) |
 | `ci/arm64-cross-build` | Provisioned private companion workflow; not a public job (see below) |
 
-`.github/workflows/ci.yml` runs the two independent nonmatrix host jobs on pull
+`.github/workflows/ci.yml` runs the three independent nonmatrix public jobs on pull
 requests targeting `main` or `aa/**`, and pushes to those branches. There are no
 path filters that could silently omit a required context. Both jobs use only
 `contents: read`, a full-commit-pinned checkout with credential persistence
@@ -66,8 +66,8 @@ public SHA, run attempt, and completed build/test logs, then POSTs the
 `ci/arm64-cross-build` status through the existing authorized local `gh`
 channel. A passing local reproduction is not a substitute for that reviewed
 live run. There is no fake public ARM64 job: the public workflow still exposes
-only the two host jobs above, and no placeholder is registered as a required
-check. Two green host jobs are not full task-6 acceptance or authorization to
+only the three public jobs above, and no placeholder is registered as a required
+check. Green public jobs are not full task-6 acceptance or authorization to
 merge; a ruleset change to require these contexts is a separate, explicitly
 authorized step. Hardware evidence is not replaced by host smoke tests.
 
@@ -79,11 +79,16 @@ the host job from the repository root:
 
 ```bash
 set -euo pipefail
+mkdir -p /tmp/opencode
 python3 -B tools/deps/check_manifest.py --lock deps/manifest.lock --archive "$AA_GOOGLETEST_ARCHIVE"
 cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE"
 cmake --build --preset host-dev
 ctest --preset host-dev --output-on-failure
 ```
+
+The target-safety suites retain scratch fixtures under `/tmp/opencode` and are
+exercised by `ctest` as `target_safety_*`; the subset that is not registered is
+enumerated with a per-suite reason in `tests/target_safety/assert_coverage.py`.
 
 Reproduce the independent provenance job without a sysroot or source download:
 
