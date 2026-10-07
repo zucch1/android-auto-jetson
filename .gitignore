@@ -7,7 +7,7 @@ cmake-build-*/
 *.so
 
 # Local infrastructure (Jetson-derived sysroot and friends)
-.local/sysroots/
+.local/
 
 # Local agent planning/evidence - never tracked
 .omo/
