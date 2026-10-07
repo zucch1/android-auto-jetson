@@ -53,14 +53,31 @@
     {"name":"libabsl-dev","component":"Abseil-not-required-with-system-protobuf","status":"missing","installed_version":null,"architecture":null,"candidate_version":"20220623.1-3.1ubuntu3.2"}
   ],
   "target_binding": {
-    "status": "pending-task5-extraction",
+    "status": "bound-task5-observed",
     "architecture": "arm64",
     "sysroot_manifest": "toolchains/jetson-sysroot-manifest.json",
-    "sysroot_manifest_sha256": null,
-    "package_versions": [],
+    "sysroot_manifest_sha256": "aa57014c31017139b63b917878a77ee16968aa64b30a10a624f0ba5f68d8d3d9",
+    "package_versions": [
+      {"name":"libasan8:arm64","version":"14.2.0-4ubuntu2~24.04.1","architecture":"arm64","source":"gcc-14"},
+      {"name":"libatomic1","version":"14.2.0-4ubuntu2~24.04.1","architecture":"arm64","source":"gcc-14"},
+      {"name":"libc6","version":"2.39-0ubuntu8.9","architecture":"arm64","source":"glibc"},
+      {"name":"libc6-dev","version":"2.39-0ubuntu8.9","architecture":"arm64","source":"glibc"},
+      {"name":"libgcc-13-dev","version":"13.3.0-6ubuntu2~24.04.1","architecture":"arm64","source":"gcc-13"},
+      {"name":"libgcc-s1","version":"14.2.0-4ubuntu2~24.04.1","architecture":"arm64","source":"gcc-14"},
+      {"name":"libgomp1","version":"14.2.0-4ubuntu2~24.04.1","architecture":"arm64","source":"gcc-14"},
+      {"name":"libhwasan0:arm64","version":"14.2.0-4ubuntu2~24.04.1","architecture":"arm64","source":"gcc-14"},
+      {"name":"libitm1:arm64","version":"14.2.0-4ubuntu2~24.04.1","architecture":"arm64","source":"gcc-14"},
+      {"name":"liblsan0:arm64","version":"14.2.0-4ubuntu2~24.04.1","architecture":"arm64","source":"gcc-14"},
+      {"name":"libstdc++-13-dev","version":"13.3.0-6ubuntu2~24.04.1","architecture":"arm64","source":"gcc-13"},
+      {"name":"libstdc++6","version":"14.2.0-4ubuntu2~24.04.1","architecture":"arm64","source":"gcc-14"},
+      {"name":"libtsan2:arm64","version":"14.2.0-4ubuntu2~24.04.1","architecture":"arm64","source":"gcc-14"},
+      {"name":"libubsan1:arm64","version":"14.2.0-4ubuntu2~24.04.1","architecture":"arm64","source":"gcc-14"},
+      {"name":"linux-libc-dev","version":"6.8.0-146.146","architecture":"arm64","source":"linux"}
+    ],
     "required_components": ["protobuf", "Boost", "OpenSSL", "libusb", "GStreamer", "Qt6"],
+    "required_components_binding": "unbound-no-target-observations",
     "optional_packages": ["nvidia-l4t-gstreamer"],
-    "binding_rule": "Task5 must replace pending state with immutable sysroot manifest SHA256; every installed target package version/architecture/source and copied input SHA256 is authoritative there. No host version is a target observation."
+    "binding_rule": "package_versions is bound to the immutable observed sysroot manifest SHA256 and is validated against the committed toolchain manifest. The 15 records are the complete observed target package set: cross-toolchain runtime only. required_components have no target package observations and remain unbound; no host version is a target observation."
   },
   "build_policy": {
     "network_fetch": false,
