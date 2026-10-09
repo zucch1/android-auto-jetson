@@ -1,0 +1,29 @@
+{
+  "version": 2,
+  "cmakeMinimumRequired": {"major": 3, "minor": 20, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "host-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "AA_ENABLE_ASAN": "OFF"
+      }
+    },
+    {"name": "host-dev", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}},
+    {"name": "host-release", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
+    {"name": "host-asan", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "AA_ENABLE_ASAN": "ON"}}
+  ],
+  "buildPresets": [
+    {"name": "host-dev", "configurePreset": "host-dev", "jobs": 2},
+    {"name": "host-release", "configurePreset": "host-release", "jobs": 2},
+    {"name": "host-asan", "configurePreset": "host-asan", "jobs": 2}
+  ],
+  "testPresets": [
+    {"name": "host-dev", "configurePreset": "host-dev", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "host-release", "configurePreset": "host-release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "host-asan", "configurePreset": "host-asan", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}}
+  ]
+}

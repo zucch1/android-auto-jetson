@@ -1,11 +1,3 @@
-# Task-3 delivery wiring: dependency pinning and offline staging on top of the
-# task-2 provenance gate. 29 CTest registrations (13 provenance + 1 manifest
-# check + 10 manifest mutations + 5 staging cases).
-# Delivery-derived file (written for this task-3 delivery snapshot); the
-# historical task-3 CMake bytes are unavailable and were not recovered. It is
-# not original upstream history content. Host smoke/preset wiring is owned by
-# task 4 and intentionally excluded (no include(cmake/HostSmoke.cmake), no host
-# preset fallback bits).
 cmake_minimum_required(VERSION 3.20)
 project(android_auto_provenance LANGUAGES NONE)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -51,6 +43,7 @@ foreach(case baseline overlay content header extra generated license gpl invento
     set_tests_properties(provenance_isolation_${case} PROPERTIES
         ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}" TIMEOUT 60)
 endforeach()
+include(cmake/HostSmoke.cmake)
 add_test(NAME deps_check COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tools/deps/check_manifest.py"
     --lock "${CMAKE_SOURCE_DIR}/deps/manifest.lock" --archive "${AA_GOOGLETEST_ARCHIVE}")

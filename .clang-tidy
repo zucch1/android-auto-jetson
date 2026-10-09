@@ -1,0 +1,4 @@
+Checks: '-*,clang-analyzer-*,bugprone-*,performance-*,modernize-use-nullptr,modernize-use-override'
+WarningsAsErrors: '*'
+HeaderFilterRegex: '(^|/)(tests/host|src|include)/'
+FormatStyle: file

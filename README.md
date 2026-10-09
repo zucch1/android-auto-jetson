@@ -1,4 +1,4 @@
-# android-auto-receiver
+# android-auto-jetson
 
 Public, GPL-3.0-or-later Android Auto receiver targeting NVIDIA Jetson.
 
