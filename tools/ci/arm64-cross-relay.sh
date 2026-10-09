@@ -2,7 +2,7 @@
 # arm64-cross-relay.sh — owner-machine relay for the private observed-sysroot cross smoke.
 #
 # Just-in-time usage: run this BEFORE each squash merge of the delivery chain. After a
-# post-squash sync the head SHA changes, so the smoke must be re-run and its check-run
+# post-squash sync the head SHA changes, so the smoke must be re-run and its status
 # re-posted for the new exact SHA — never relay a stale SHA.
 #
 # What it does at <head-sha>:
@@ -10,8 +10,12 @@
 #   2. runs the OBSERVED-sysroot smoke (AA_SYSROOT_REQUIRE_OBSERVED=ON; payload bound to
 #      the link sysroot) via `cmake --preset jetson-aarch64 && cmake --build --preset
 #      jetson-aarch64`, capturing logs,
-#   3. posts the `ci/arm64-cross-build` check-run for that exact SHA through the owner's
-#      local gh channel, with real started/completed timestamps and sha256 of every log.
+#   3. posts the `ci/arm64-cross-build` COMMIT STATUS for that exact SHA through the
+#      owner's local gh channel, with sysroot identity and short sha256s of every log.
+# GitHub check-run creation requires GitHub App auth (HTTP 403 for user tokens). This
+# helper therefore posts a commit status — the same task-7 relay mechanism recorded in
+# delivery-arm64-relay.json. Ruleset 24193601 accepts it by context name; arm64 has no
+# integration_id bound to the required check.
 #
 # The public `ci/arm64-cross-build` job auto-reports on every head in FIXTURE mode only
 # (fixture-not-target). The observed smoke relayed here is the acceptance evidence
@@ -117,55 +121,34 @@ else
     title="Observed-sysroot exact-SHA cross smoke FAIL (sysroot jetson-r39.2.1)"
 fi
 
-# Post the check-run with real timestamps and per-log sha256s; gh carries the credentials.
-export RELAY_HEAD_SHA=$head_sha RELAY_PR_NUMBER=$pr_number RELAY_CONCLUSION=$conclusion
-export RELAY_STARTED_AT=$started_at RELAY_COMPLETED_AT=$completed_at RELAY_TITLE=$title
-export RELAY_LOGS=$logs RELAY_OVERALL_RC=$overall_rc
-python3 -B - <<'PY' | gh api repos/zucch1/android-auto-jetson/check-runs --input -
-import datetime
+# Commit statuses have a short description limit, so include compact sha256 prefixes
+# while the full per-log sha256 values remain recorded above in step_shas.
+description="$(python3 -B - "$logs" "$conclusion" <<'PY'
 import hashlib
-import json
-import os
+import sys
 from pathlib import Path
 
-logs = Path(os.environ['RELAY_LOGS'])
-steps = []
-text_parts = []
-for log in sorted(logs.glob('*.log')):
-    raw = log.read_bytes()
-    steps.append(f'- `{log.name}` sha256 `{hashlib.sha256(raw).hexdigest()}` ({len(raw)} bytes)')
-    tail = raw.decode('utf-8', 'replace').splitlines()[-20:]
-    text_parts.append(f'### {log.name} (tail)\n```\n' + '\n'.join(tail) + '\n```')
-pr = os.environ.get('RELAY_PR_NUMBER') or ''
-summary = [
-    f"Head `{os.environ['RELAY_HEAD_SHA']}` — observed-sysroot exact-SHA smoke "
-    '(sysroot jetson-r39.2.1, AA_SYSROOT_REQUIRE_OBSERVED=ON).',
-    'This is the acceptance evidence; the public ci/arm64-cross-build job is fixture '
-    'mode (fixture-not-target) only (task 5 receipts / F3 later).',
-    f"Relay run started {os.environ['RELAY_STARTED_AT']} / completed {os.environ['RELAY_COMPLETED_AT']} "
-    f"({datetime.datetime.now(datetime.timezone.utc).isoformat()} relayed).",
-]
-if pr:
-    summary.append(f'Pull request: https://github.com/zucch1/android-auto-jetson/pull/{pr}')
-summary.append('Log sha256s:')
-summary.extend(steps)
-payload = {
-    'name': 'ci/arm64-cross-build',
-    'head_sha': os.environ['RELAY_HEAD_SHA'],
-    'status': 'completed',
-    'conclusion': os.environ['RELAY_CONCLUSION'],
-    'started_at': os.environ['RELAY_STARTED_AT'],
-    'completed_at': os.environ['RELAY_COMPLETED_AT'],
-    'output': {
-        'title': os.environ['RELAY_TITLE'],
-        'summary': '\n'.join(summary),
-        'text': '\n\n'.join(text_parts),
-    },
-}
-if pr:
-    payload['details_url'] = f'https://github.com/zucch1/android-auto-jetson/pull/{pr}'
-print(json.dumps(payload))
+logs = Path(sys.argv[1])
+outcome = sys.argv[2].upper()
+hashes = []
+for path in sorted(logs.glob('*.log')):
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    print(f'relay: log sha256 {path.name}={digest}', file=sys.stderr)
+    hashes.append(digest[:8])
+print(f'private exact-SHA ARM64 cross-smoke {outcome}; sysroot jetson-r39.2.1; log sha256 {hashes}')
 PY
+)"
+if [ -n "$pr_number" ]; then
+    target_url="https://github.com/zucch1/android-auto-jetson/pull/$pr_number"
+else
+    target_url="https://github.com/zucch1/android-auto-jetson/commit/$head_sha"
+fi
+gh api -X POST "repos/zucch1/android-auto-jetson/statuses/$head_sha" \
+    -f "state=$conclusion" \
+    -f context=ci/arm64-cross-build \
+    -f "description=$description" \
+    -f "target_url=$target_url"
 
-echo "relay: posted ci/arm64-cross-build for $head_sha conclusion=$conclusion" >&2
+echo "relay: observed smoke started=$started_at completed=$completed_at" >&2
+echo "relay: posted ci/arm64-cross-build commit status for $head_sha state=$conclusion" >&2
 exit "$overall_rc"
