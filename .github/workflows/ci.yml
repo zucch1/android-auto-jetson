@@ -23,16 +23,21 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Provision native AASDK development dependencies
+      - name: Provision host-only AASDK and decode smoke dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y ninja-build cmake g++ \
             libprotobuf-dev protobuf-compiler libboost-system-dev libboost-log-dev \
-            libssl-dev libusb-1.0-0-dev
+            libssl-dev libusb-1.0-0-dev pkg-config libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
+            g++-aarch64-linux-gnu binutils
           protoc --version
           dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \
-            libboost-log-dev libssl-dev libusb-1.0-0-dev
+            libboost-log-dev libssl-dev libusb-1.0-0-dev libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad
+          gst-inspect-1.0 openh264dec
+          gst-inspect-1.0 h264parse
       - name: Fetch and verify locked GoogleTest archive
         run: |
           set -euo pipefail
@@ -46,10 +51,46 @@ jobs:
           AA_GOOGLETEST_ARCHIVE: ${{ runner.temp }}/googletest-v1.15.2.tar.gz
         run: |
           set -euo pipefail
-          cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE"
+          cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE" -DBUILD_TESTING=ON
           cmake --build --preset host-dev
+          python3 -B tests/media/assert_decode_coverage.py build/host-dev
           ctest --test-dir build/host-dev -R aasdk_abi --output-on-failure -V
           ctest --preset host-dev --output-on-failure
+
+  decode-overlay-cross:
+    name: ci/decode-overlay-cross
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Provision public synthetic cross fixture dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ninja-build cmake \
+            g++-aarch64-linux-gnu pkg-config binutils libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
+      - name: Require AVAILABLE probe, AArch64 ELF and bound overlay provenance
+        run: |
+          set -euo pipefail
+          python3 -B tests/media/cross_decode_overlay.py --scratch "$RUNNER_TEMP/decode-overlay-cross"
+      - name: Fetch and verify locked GoogleTest archive for root integration
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/googletest-v1.15.2.tar.gz"
+          curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' \
+            https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.15.2 \
+            --output "$archive"
+          python3 -B tools/deps/check_manifest.py --lock deps/manifest.lock --archive "$archive"
+      - name: Require full root cross provenance with an external overlay
+        run: |
+          set -euo pipefail
+          python3 -B tests/media/cross_decode_overlay.py --root-project \
+            --archive "$RUNNER_TEMP/googletest-v1.15.2.tar.gz" \
+            --scratch "$RUNNER_TEMP/decode-root-cross"
 
   provenance-lint:
     name: ci/provenance-lint

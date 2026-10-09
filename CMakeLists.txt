@@ -82,3 +82,17 @@ foreach(case reuse effective-tamper gtest-tamper extra missing-staging)
     add_test(NAME deps_stage_${case} COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/deps/staging.py" "${CMAKE_SOURCE_DIR}" "${case}" "${AA_GOOGLETEST_ARCHIVE}")
 endforeach()
+
+# Task 9 is mandatory: missing development inputs must not turn CI green by omission.
+add_subdirectory(tools/aa-decode-probe)
+if(NOT CMAKE_CROSSCOMPILING)
+    if(NOT BUILD_TESTING)
+        message(FATAL_ERROR "AA_DECODE_COVERAGE: native builds require BUILD_TESTING=ON")
+    endif()
+    add_test(NAME media_decode_probe_suite
+        COMMAND "${Python3_EXECUTABLE}" -B
+                "${CMAKE_SOURCE_DIR}/tests/media/test_decode_probe.py"
+                "$<TARGET_FILE:aa-decode-probe>"
+                "${CMAKE_SOURCE_DIR}/tests/fixtures/media/h264_720p30_baseline_90f.h264")
+    set_tests_properties(media_decode_probe_suite PROPERTIES TIMEOUT 120)
+endif()
