@@ -54,7 +54,10 @@ jobs:
           cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE" -DBUILD_TESTING=ON
           cmake --build --preset host-dev
           python3 -B tests/media/assert_decode_coverage.py build/host-dev
+          python3 -B tests/ipc/assert_ipc_coverage.py build/host-dev
           ctest --test-dir build/host-dev -R aasdk_abi --output-on-failure -V
+          # Unfiltered host-dev run intentionally includes the ipc-bench-happy-600 gate,
+          # which adds ~10 minutes; the job timeout above accounts for this explicitly.
           ctest --preset host-dev --output-on-failure
 
   decode-overlay-cross:
