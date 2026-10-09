@@ -1,0 +1,117 @@
+{
+  "schema": "aa-capability-gate/1",
+  "generated_at_utc": "2026-10-08T20:00:19Z",
+  "report_stage": "continuation",
+  "target": {
+    "architecture": "aarch64",
+    "l4t_release": "R39.2.1",
+    "kernel_release": "6.8.12-1021-tegra",
+    "gstreamer_version": "1.24.2"
+  },
+  "phone": {
+    "model": "TEST-PHONE",
+    "android_version": "16",
+    "android_auto_version": "17.7.000000-release",
+    "source": "synthetic fixture; no real device identifiers"
+  },
+  "areas": [
+    {
+      "id": "dependencies",
+      "classification": "full-pass",
+      "summary": "Fixture: dependency lock check passes with pinned sources.",
+      "evidence": [{"name": "fixture-dependencies.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000001"}],
+      "measurements": {"manifest_check_exit_status": 0, "source_pins": 3},
+      "budgets": [],
+      "owner_signoff": null
+    },
+    {
+      "id": "target_identity",
+      "classification": "probe-pass-provisional",
+      "summary": "Fixture: target identity observed.",
+      "evidence": [{"name": "fixture-target.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000002"}],
+      "measurements": {"architecture": "aarch64", "l4t_release": "R39.2.1"},
+      "budgets": [],
+      "owner_signoff": null
+    },
+    {
+      "id": "abi",
+      "classification": "probe-pass-provisional",
+      "summary": "Fixture: AASDK C++20 ABI tests pass.",
+      "evidence": [{"name": "fixture-abi.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000003"}],
+      "measurements": {"decision": "aasdk-cpp20", "abi_tests_passed": 4},
+      "budgets": [],
+      "owner_signoff": null
+    },
+    {
+      "id": "tls",
+      "classification": "probe-pass-provisional",
+      "summary": "Fixture: TLS posture tests pass.",
+      "evidence": [{"name": "fixture-tls.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000004"}],
+      "measurements": {"tls_posture_tests_passed": 32, "production_key_markers": 0},
+      "budgets": [],
+      "owner_signoff": null
+    },
+    {
+      "id": "decode",
+      "classification": "fallback-probe-pass",
+      "summary": "Fixture: software fallback decode meets every probe-stage budget.",
+      "evidence": [{"name": "fixture-decode.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000005"}],
+      "measurements": {"decoder": "openh264dec", "hardware_decoder": false, "duration_s": 600.0, "frames_decoded": 18000, "dropped_frames": 0, "observed_fps": 30.0, "p95_latency_ms": 30.0, "cpu_percent_one_core": 3.83},
+      "budgets": [
+        {"id": "decode.duration_s", "kind": "min", "limit": 600.0, "unit": "s", "available_at": "probe", "measured": 600.0, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "decode.fps_error_percent", "kind": "max", "limit": 5.0, "unit": "percent", "available_at": "probe", "measured": 0.0, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "decode.bitrate_error_percent", "kind": "max", "limit": 5.0, "unit": "percent", "available_at": "probe", "measured": 0.2, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "decode.dropped_frames", "kind": "max", "limit": 0.0, "unit": "frames", "available_at": "probe", "measured": 0.0, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "decode.p95_latency_ms", "kind": "max", "limit": 33.0, "unit": "ms", "available_at": "probe", "measured": 30.0, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "decode.cpu_percent_one_core", "kind": "max", "limit": 50.0, "unit": "percent", "available_at": "probe", "measured": 3.83, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "audio.path_latency_ms", "kind": "max", "limit": 200.0, "unit": "ms", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "media.avsync_ms", "kind": "max", "limit": 50.0, "unit": "ms", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null}
+      ],
+      "owner_signoff": null
+    },
+    {
+      "id": "ipc",
+      "classification": "probe-pass-provisional",
+      "summary": "Fixture: host-only IPC benchmark meets probe budgets.",
+      "evidence": [{"name": "fixture-ipc.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000006"}],
+      "measurements": {"host_only": true, "duration_s": 600.0, "throughput_mbps": 12.189683, "p95_added_latency_ms": 0.2, "happy_drops": 0},
+      "budgets": [
+        {"id": "ipc.duration_s", "kind": "min", "limit": 600.0, "unit": "s", "available_at": "probe", "measured": 600.0, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "ipc.throughput_mbps", "kind": "min", "limit": 10.0, "unit": "Mbps", "available_at": "probe", "measured": 12.189683, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "ipc.p95_added_latency_ms", "kind": "max", "limit": 33.0, "unit": "ms", "available_at": "probe", "measured": 0.2, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "ipc.happy_drops", "kind": "max", "limit": 0.0, "unit": "frames", "available_at": "probe", "measured": 0.0, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "session.projection_recovery_s", "kind": "max", "limit": 60.0, "unit": "s", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "soak.duration_h", "kind": "min", "limit": 4.0, "unit": "h", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "soak.crashes", "kind": "max", "limit": 0.0, "unit": "events", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "soak.rss_growth_percent", "kind": "max", "limit": 10.0, "unit": "percent", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "rss.receiver_mb", "kind": "max", "limit": 250.0, "unit": "MB", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "rss.helper_mb", "kind": "max", "limit": 32.0, "unit": "MB", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "receiver.cpu_sustained_percent_one_core", "kind": "max", "limit": 50.0, "unit": "percent", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null}
+      ],
+      "owner_signoff": null
+    },
+    {
+      "id": "usb",
+      "classification": "probe-pass-provisional",
+      "summary": "Fixture: AOA2 capability probe only; not projection.",
+      "evidence": [{"name": "fixture-usb.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000007"}],
+      "measurements": {"aoa_protocol_version": 2, "max_packet_size_bytes": 512, "android_auto_session_claimed": false, "projection_capability_claimed": false},
+      "budgets": [
+        {"id": "usb.session_reconnect_s", "kind": "max", "limit": 5.0, "unit": "s", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null}
+      ],
+      "owner_signoff": null
+    },
+    {
+      "id": "wireless",
+      "classification": "probe-pass-provisional",
+      "summary": "Fixture: BlueZ registration probe only; AP/client deferred.",
+      "evidence": [{"name": "fixture-wireless.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000008"}],
+      "measurements": {"bluez_profile_registration_succeeded": true, "strict_three_second_deadline_pass": false, "ap_operation_qualified": false},
+      "budgets": [
+        {"id": "wireless.session_reconnect_s", "kind": "max", "limit": 15.0, "unit": "s", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "wireless.ap_startup_s", "kind": "max", "limit": 5.0, "unit": "s", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null}
+      ],
+      "owner_signoff": null
+    }
+  ]
+}
