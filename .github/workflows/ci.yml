@@ -23,6 +23,16 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Provision native AASDK development dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ninja-build cmake g++ \
+            libprotobuf-dev protobuf-compiler libboost-system-dev libboost-log-dev \
+            libssl-dev libusb-1.0-0-dev
+          protoc --version
+          dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \
+            libboost-log-dev libssl-dev libusb-1.0-0-dev
       - name: Fetch and verify locked GoogleTest archive
         run: |
           set -euo pipefail
@@ -31,13 +41,14 @@ jobs:
             https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.15.2 \
             --output "$archive"
           python3 -B tools/deps/check_manifest.py --lock deps/manifest.lock --archive "$archive"
-      - name: Configure, build and test host foundation
+      - name: Configure, build and qualify native AASDK and host foundation
         env:
           AA_GOOGLETEST_ARCHIVE: ${{ runner.temp }}/googletest-v1.15.2.tar.gz
         run: |
           set -euo pipefail
           cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE"
           cmake --build --preset host-dev
+          ctest --test-dir build/host-dev -R aasdk_abi --output-on-failure -V
           ctest --preset host-dev --output-on-failure
 
   provenance-lint:

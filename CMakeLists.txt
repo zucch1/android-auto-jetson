@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(android_auto_provenance LANGUAGES NONE)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Dependency-only configure: full AASDK ABI qualification belongs to task 7.
+# Verify original provenance and stage immutable effective dependency sources.
 find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
 set(AA_GOOGLETEST_ARCHIVE "$ENV{AA_GOOGLETEST_ARCHIVE}" CACHE FILEPATH "Explicit pre-staged GoogleTest v1.15.2 archive")
 if(NOT AA_GOOGLETEST_ARCHIVE)
@@ -45,6 +45,7 @@ foreach(case baseline overlay content header extra generated license gpl invento
         ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}" TIMEOUT 60)
 endforeach()
 include(cmake/HostSmoke.cmake)
+include(cmake/AasdkAbi.cmake)
 if(TARGET aa_sysroot_hash_gate)
     # Build-time hash gate: aa_host_smoke (and staged gtest) cannot compile after a post-configure
     # sysroot tamper. Only present for jetson-aarch64 cross builds that configure a sysroot.
