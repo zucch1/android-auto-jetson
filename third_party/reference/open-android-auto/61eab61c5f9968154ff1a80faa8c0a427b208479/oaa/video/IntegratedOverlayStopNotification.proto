@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2024-2026 Open Android Auto contributors
+// Based on works by: f1x.studio (aasdk), opencardev (crankshaft), aa-proxy (aa-proxy-rs)
+syntax="proto2";
+
+package oaa.proto.messages;
+
+// Wire msg 0x800F, HU->Phone (video channel)
+// vdp internal name: MEDIA_MESSAGE_INTEGRATED_OVERLAY_STOP_NOTIFICATION
+// Empty message — no deserialization in ied.java.
+// Triggers the phone-side display-stopped callback.
+// Companion to IntegratedOverlayStartNotification (0x800E).
+// confidence: bronze [apk_deep_trace]
+message IntegratedOverlayStopNotification
+{
+    // Empty — no fields
+}

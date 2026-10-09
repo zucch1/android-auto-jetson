@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2024-2026 Open Android Auto contributors
+// Based on works by: f1x.studio (aasdk), opencardev (crankshaft), aa-proxy (aa-proxy-rs)
+syntax="proto2";
+
+package oaa.proto.messages;
+
+// Wire format verified against WirelessAndroidAutoDongle (nisargjhaveri).
+// Field numbers MUST match what the phone expects — the original aasdk had
+// them wrong (key=1, security_mode=2, ssid=3, no bssid).
+// Correct order: ssid=1, key=2, bssid=3, security_mode=4, access_point_type=5.
+// confidence: silver [apk_deep_trace, dhu_observation]
+message WifiSecurityResponse {
+    optional string ssid = 1;  // confidence: silver [apk_deep_trace, dhu_observation]
+    optional string key = 2;  // confidence: silver [apk_deep_trace, dhu_observation]
+    optional string bssid = 3;  // confidence: silver [apk_deep_trace, dhu_observation]
+    optional SecurityMode security_mode = 4;  // confidence: silver [apk_deep_trace, dhu_observation]
+    optional AccessPointType access_point_type = 5;  // confidence: silver [apk_deep_trace, dhu_observation]
+
+    // Fields 6-13 were previously copied from the unrelated waf/wss radio
+    // metadata lineage and are intentionally absent. Current wire captures use
+    // only fields 1-5.
+
+    // confidence: silver [apk_deep_trace, dhu_observation]
+    enum SecurityMode {
+        UNKNOWN_SECURITY_MODE = 0;
+        OPEN = 1;
+        WEP_64 = 2;  // confidence: silver [apk_deep_trace, dhu_observation]
+        WEP_128 = 3;  // confidence: silver [apk_deep_trace, dhu_observation]
+        WPA_PERSONAL = 4;
+        WPA2_PERSONAL = 8;  // confidence: silver [apk_deep_trace, dhu_observation]
+        WPA_WPA2_PERSONAL = 12;  // confidence: silver [apk_deep_trace, dhu_observation]
+        WPA_ENTERPRISE = 20;
+        WPA2_ENTERPRISE = 24;  // confidence: silver [apk_deep_trace, dhu_observation]
+        WPA_WPA2_ENTERPRISE = 28;  // confidence: silver [apk_deep_trace, dhu_observation]
+    }
+
+    // confidence: silver [apk_deep_trace, dhu_observation]
+    enum AccessPointType {
+        STATIC = 0;
+        DYNAMIC = 1;
+    }
+}

@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2024-2026 Open Android Auto contributors
+// Based on works by: f1x.studio (aasdk), opencardev (crankshaft), aa-proxy (aa-proxy-rs)
+
+/*
+ * AVChannelMediaOptions — wire message 0x8014, Phone->HU.
+ *
+ * Android Auto 17.3 class xig proves the exact 13-field wire shape below.
+ * Message-typed fields reference abmh, the 17.3 class already represented by
+ * oaa.proto.data.PingConfiguration. No application meaning is assigned to any
+ * field: names encode only the proven wire type and tag, and field semantics
+ * remain unresolved.
+ */
+
+// Field semantics remain unresolved; only tags, labels, and wire types are published.
+
+syntax="proto2";
+
+import "oaa/common/PingConfigurationData.proto";
+
+package oaa.proto.messages;
+
+// confidence: bronze [apk_deep_trace]
+message AVChannelMediaOptions {
+    optional oaa.proto.data.PingConfiguration ping_configuration_1 = 1;  // confidence: bronze [apk_deep_trace]
+    optional bool bool_value_2 = 2;  // confidence: bronze [apk_deep_trace]
+    optional oaa.proto.data.PingConfiguration ping_configuration_3 = 3;  // confidence: bronze [apk_deep_trace]
+    optional oaa.proto.data.PingConfiguration ping_configuration_4 = 4;  // confidence: bronze [apk_deep_trace]
+    optional oaa.proto.data.PingConfiguration ping_configuration_5 = 5;  // confidence: bronze [apk_deep_trace]
+    optional oaa.proto.data.PingConfiguration ping_configuration_6 = 6;  // confidence: bronze [apk_deep_trace]
+    optional uint32 uint32_value_7 = 7;  // confidence: bronze [apk_deep_trace]
+    optional oaa.proto.data.PingConfiguration ping_configuration_8 = 8;  // confidence: bronze [apk_deep_trace]
+    optional bool bool_value_9 = 9;  // confidence: bronze [apk_deep_trace]
+    optional oaa.proto.data.PingConfiguration ping_configuration_10 = 10;  // confidence: bronze [apk_deep_trace]
+    optional bool bool_value_11 = 11;  // confidence: bronze [apk_deep_trace]
+    optional oaa.proto.data.PingConfiguration ping_configuration_12 = 12;  // confidence: bronze [apk_deep_trace]
+    optional oaa.proto.data.PingConfiguration ping_configuration_13 = 13;  // confidence: bronze [apk_deep_trace]
+}

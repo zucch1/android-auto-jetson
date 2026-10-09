@@ -1,0 +1,47 @@
+// Android Auto Protocol Buffer Definitions
+// https://github.com/mrmees/open-android-auto
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+/*
+ * WifiSetupInfo — WiFi setup metadata exchanged during BT negotiation.
+ *
+ * APK class: wds.java (AA v16.1)
+ * BT RFCOMM message type: ordinal 10 (MESSAGE_WIFI_SETUP_INFO_BT)
+ *
+ * Contains network configuration details and feature flags.
+ * Sub-message wdi has SSID/BSSID/passphrase with SecurityMode enum.
+ */
+
+syntax="proto2";
+
+import "oaa/wifi/WifiSecurityModeEnum.proto";
+
+package oaa.proto.messages;
+
+// APK class: wdi — WiFi network credentials with security mode
+// confidence: silver [apk_static, cross_version]
+message WifiNetworkInfo {
+    optional string ssid = 1; // APK: b (String)  // confidence: silver [apk_static, cross_version]
+    optional string bssid = 2; // APK: c (String)  // confidence: silver [apk_static, cross_version]
+    optional string passphrase = 3; // APK: d (String)  // confidence: silver [apk_static, cross_version]
+    optional enums.WifiSecurityMode.Enum security_mode = 4; // APK: e (enum via wck.s/wdr)  // confidence: silver [apk_static, cross_version]
+    // field 5: gap (not in APK)
+    repeated int32 supported_channels = 6; // APK: f (repeated int32, zzb)  // confidence: silver [apk_static, cross_version]
+}
+
+// Wireless projection endpoint supplied by the HU.
+// 17.3: xnq, consumed as WPP IP/port by peu.java.
+// confidence: silver [apk_static, cross_version]
+message WifiProjectionEndpoint {
+    optional string ip_address = 1; // 17.3: xnq.c  // confidence: silver [apk_static, cross_version]
+    optional int32 port = 2; // 17.3: xnq.d  // confidence: silver [apk_static, cross_version]
+}
+
+// confidence: silver [apk_static, cross_version]
+message WifiSetupInfo {
+    optional int32 major_version = 1; // 17.3: xns.b  // confidence: silver [apk_static, cross_version]
+    optional int32 minor_version = 2; // 17.3: xns.c  // confidence: silver [apk_static, cross_version]
+    optional bytes setup_token = 3; // 17.3: xns.d, logged as token  // confidence: silver [apk_static, cross_version]
+    optional WifiProjectionEndpoint wpp_endpoint = 4; // 17.3: xns.e -> xnq  // confidence: silver [apk_static, cross_version]
+    optional WifiNetworkInfo access_point_info = 5; // 17.3: xns.f -> xni  // confidence: silver [apk_static, cross_version]
+}
