@@ -1,4 +1,4 @@
-This new build routine provides for installing the ProtoBuffer as a separate library.
+This new build routine provides for installing the ProtoBuffeX as a separate library.
 
 ```
 mkdir protobuf/build
