@@ -49,6 +49,8 @@ SOURCES: Final = (
 )
 PATCH_SHA256: Final = 'd27b1c7099041042ad255c2cd16b7d61588b6b6aaa93b4c7d1b0c0ffb35b7091'
 PATCH_PATH: Final = 'patches/aasdk-googletest.patch'
+TLS_PATCH_PATH: Final = 'patches/aasdk-tls-credentials.patch'
+TLS_PATCH_SHA256: Final = 'cbe5c72d48290482c5f77628477f2d4150231e5e27ceeee7853dae99caa42c93'
 PACKAGES: Final = frozenset((
     'protobuf-compiler', 'libprotobuf-dev', 'libprotobuf32t64', 'libboost-dev',
     'libboost-system-dev', 'libboost-log-dev', 'libssl-dev', 'libssl3t64',
@@ -194,6 +196,12 @@ def check(manifest: Path, lock: Path, archive: Path | None) -> None:
     patch = manifest.parent / PATCH_PATH
     if hashlib.sha256(patch.read_bytes()).hexdigest() != PATCH_SHA256:
         raise ManifestError('PATCH_MISMATCH', str(patch))
+    if (binding.get('tls_patch_path') != TLS_PATCH_PATH or
+            binding.get('tls_patch_sha256') != TLS_PATCH_SHA256):
+        raise ManifestError('LOCK_MISMATCH', 'tls_patch_binding')
+    tls_patch = manifest.parent / TLS_PATCH_PATH
+    if hashlib.sha256(tls_patch.read_bytes()).hexdigest() != TLS_PATCH_SHA256:
+        raise ManifestError('PATCH_MISMATCH', str(tls_patch))
     if archive is not None and hashlib.sha256(archive.read_bytes()).hexdigest() != SOURCES[2].archive_sha256:
         raise ManifestError('ARCHIVE_MISMATCH', str(archive))
 

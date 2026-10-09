@@ -6,6 +6,8 @@
 """Drive staging and the effective dependency CMake block through their real CLIs."""
 from pathlib import Path
 from enum import StrEnum
+import hashlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,12 +20,16 @@ class Case(StrEnum):
     GTEST_TAMPER = 'gtest-tamper'
     EXTRA = 'extra'
     MISSING_STAGING = 'missing-staging'
+    TLS = 'tls'
+    TLS_TAMPER = 'tls-tamper'
 
 
 def main() -> int:
     root = Path(sys.argv[1]).resolve()
     case = Case(sys.argv[2])
     archive = Path(sys.argv[3]).resolve()
+    original = root / 'third_party/aasdk/src/Messenger/Cryptor.cpp'
+    original_digest = hashlib.sha256(original.read_bytes()).hexdigest()
     # Given: a unique cache beneath ignored build/, retained for diagnosis.
     cache = Path(tempfile.mkdtemp(prefix='stage-test-', dir=root / 'build'))
     command = [sys.executable, '-B', str(root / 'tools/deps/stage.py'),
@@ -35,6 +41,24 @@ def main() -> int:
     match case:
         case Case.REUSE:
             pass
+        case Case.TLS:
+            effective = stage / 'aasdk'
+            marker = re.compile(rb'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----')
+            for path in effective.rglob('*'):
+                if path.is_file():
+                    assert not marker.search(path.read_bytes()), path
+            cryptor = (effective / 'src/Messenger/Cryptor.cpp').read_text()
+            assert 'cCertificate' not in cryptor and 'cPrivateKey' not in cryptor
+            assert 'aa::tls::load_credentials()' in cryptor
+            assert 'policy_.require_approved()' in cryptor
+            assert not (effective / 'cert/headunit.key').exists()
+            assert '/etc/aasdk' not in (effective / 'CMakeLists.txt').read_text()
+            assert 'headunit.key' not in (effective / 'debian/postinst').read_text()
+            assert hashlib.sha256(original.read_bytes()).hexdigest() == original_digest
+        case Case.TLS_TAMPER:
+            with (stage / 'aasdk/src/Messenger/Cryptor.cpp').open('ab') as stream:
+                stream.write(b'\n// tamper\n')
+            expected = 'STAGE_MISMATCH'
         case Case.EFFECTIVE_TAMPER:
             with (stage / 'aasdk/CMakeLists.txt').open('ab') as stream:
                 stream.write(b'\n# tamper\n')

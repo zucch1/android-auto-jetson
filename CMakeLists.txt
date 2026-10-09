@@ -45,7 +45,9 @@ foreach(case baseline overlay content header extra generated license gpl invento
         ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}" TIMEOUT 60)
 endforeach()
 include(cmake/HostSmoke.cmake)
+include(cmake/TlsCredentials.cmake)
 include(cmake/AasdkAbi.cmake)
+include(cmake/TlsHandshake.cmake)
 if(TARGET aa_sysroot_hash_gate)
     # Build-time hash gate: aa_host_smoke (and staged gtest) cannot compile after a post-configure
     # sysroot tamper. Only present for jetson-aarch64 cross builds that configure a sysroot.
