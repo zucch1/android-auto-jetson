@@ -3,6 +3,7 @@
 // capability defaults, IPC single-consumer admission and wire names, trust
 // fail-closed admission, config boundary validation and the framed transport
 // interface are usable exactly as documented.
+#include <aa/channels/Services.hpp>
 #include <aa/config/Config.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/ipc/Control.hpp>
@@ -19,6 +20,14 @@
 #include <gtest/gtest.h>
 
 namespace {
+
+struct CountingSink final : aa::protocol::MessageSink {
+    int calls{0};
+    aa::core::Result<void> on_message(const aa::protocol::MessageView&) override {
+        ++calls;
+        return {};
+    }
+};
 
 struct LoopbackTransport final : aa::transport::Transport {
     aa::transport::Kind kind() const noexcept override { return aa::transport::Kind::tcp; }
@@ -65,6 +74,39 @@ TEST(SessionState, RejectsIllegalTransitionWithTypedError) {
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().code(), aa::ErrorCode::session_illegal_transition);
     EXPECT_EQ(machine.state(), aa::session::State::disconnected);
+}
+
+TEST(Channels, BenchDefaultsOmitUnsupportedCapabilities) {
+    // Given: the capability profile advertised on the bench.
+    const auto profile = aa::channels::CapabilityProfile::bench_defaults();
+    // When/Then: no backend has been supplied, so nothing is advertised.
+    EXPECT_FALSE(profile.advertises(aa::protocol::ChannelRole::video));
+    EXPECT_FALSE(profile.advertises(aa::protocol::ChannelRole::media_audio));
+    EXPECT_FALSE(profile.advertises(aa::protocol::ChannelRole::input));
+    EXPECT_FALSE(profile.advertises(aa::protocol::ChannelRole::microphone));
+    EXPECT_FALSE(profile.advertises(aa::protocol::ChannelRole::sensors));
+    EXPECT_EQ(profile.primary, (aa::protocol::VideoProfile{1280, 720, 30}));
+    EXPECT_EQ(profile.fallback, (aa::protocol::VideoProfile{800, 480, 30}));
+}
+
+TEST(Channels, LocalDiagnosticsRoutesWithoutExposingWireDispatch) {
+    // Given: a registry with one registered local diagnostics sink.
+    aa::channels::ServiceRegistry registry;
+    CountingSink sink;
+    ASSERT_TRUE(registry.register_sink(aa::protocol::ChannelRole::diagnostics, sink).has_value());
+    const std::array<std::byte, 2> payload{std::byte{0x01}, std::byte{0x02}};
+    const aa::protocol::MessageView message{
+        {aa::protocol::ChannelRole::diagnostics, 3, aa::core::Nanoseconds{125}}, payload};
+    // When: the message is dispatched and then an unregistered channel is used.
+    const auto delivered = registry.dispatch_local(message);
+    const auto missing = registry.dispatch_local({{aa::protocol::ChannelRole::input, 0,
+                                             aa::core::Nanoseconds{}},
+                                            {}});
+    // Then: the sink saw it and the unregistered channel is a typed error.
+    ASSERT_TRUE(delivered.has_value());
+    EXPECT_EQ(sink.calls, 1);
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error().code(), aa::ErrorCode::protocol_unsupported_channel);
 }
 
 TEST(Ipc, SingleConsumerRuleFailsClosedForEveryWrongShape) {
