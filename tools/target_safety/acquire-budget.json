@@ -1,0 +1,64 @@
+{
+  "schema": "aa-acquire-budget/1",
+  "receipt": "task-5-acquisition-budget",
+  "operation": "one bounded task-5 target acquisition window",
+  "policy": "snapshot-diff amendment: before/after protected-path inventory + exact manifest equivalence",
+  "total_budget_seconds": 2400,
+  "transports": 1,
+  "attempts": 1,
+  "retry_policy": "none",
+  "no_retry_honored": true,
+  "local_envelope_seconds": 2400,
+  "remote_deadline_seconds": 2280,
+  "snapshot_deadline_seconds_each": 900,
+  "sizing_rationale": "two ~337s SHA-256 inventory traversals (task-5-traversal-measurement-outcome-2) plus read-only extraction, hashing and a one-shot bounded transfer, with fixed headroom; no retries.",
+  "components": {
+    "before_snapshot_seconds": 337,
+    "after_snapshot_seconds": 337,
+    "acquisition_copy_hash_identity_seconds": 600,
+    "transfer_out_seconds": 600,
+    "equivalence_receipt_manifest_seconds": 60,
+    "headroom_seconds": 466
+  },
+  "roots": [
+    "/home/zucchi/Desktop/infotainment-plan",
+    "/home/zucchi/.omo/codegraph/projects/infotainment-plan-68328f6064505b10"
+  ],
+  "link_exceptions": [
+    {
+      "path": "/home/zucchi/Desktop/infotainment-plan/.local_env/aqt-venv/bin/python3",
+      "expected_target": "/usr/bin/python3"
+    },
+    {
+      "path": "/home/zucchi/Desktop/infotainment-plan/.venv/bin/python3",
+      "expected_target": "/usr/bin/python3"
+    }
+  ],
+  "writes_on_target": [
+    "/tmp only: acquisition scratch (copied input tree, before/after manifests, diff, receipt, acquisition record, extracted payload)"
+  ],
+  "scratch": "/tmp only",
+  "transfers": {
+    "direction": "target -> local, one-shot, bounded, streamed",
+    "rootfs_bytes_bound": 2147483648,
+    "evidence_bytes_bound": 536870912,
+    "evidence_bytes_bound_rationale": "512 MiB >= two measured ppic manifests (270867 entries) totaling 269293938 bytes plus receipts; the old 256 MiB bound was smaller than the measured pair",
+    "return_archive_bytes_bound": 2684354560,
+    "streaming_enforced_by": "tools.target_safety.acquire_transport (fail-closed while streaming, not after whole read)",
+    "content_byte_limit_per_snapshot": 68719476736,
+    "content_byte_limit_source": "tools.target_safety.snapshot_models.CONTENT_BYTE_LIMIT (64 GiB, in the reviewed bundle)"
+  },
+  "transport": {
+    "kind": "ssh",
+    "batch_mode": true,
+    "retry": "none (ConnectionAttempts=1)",
+    "outer_timeout_seconds": 2400,
+    "remote_timeout_seconds": 2280,
+    "stdin": "deterministic source tar of the route + frozen input policy",
+    "stdout": "one bounded tar archive: before/after/diff/receipt/acquisition + rootfs",
+    "durable_records": "stderr + exit status retained locally per window"
+  },
+  "quiet_boundary": "proportionate before/after process+cwd observations; status=unproven-activity admitted when activity prevents a serialized window; never a claim that a clean inventory proves absence of writers",
+  "provenance_contract": "target evidence observed, never fixture",
+  "consumer": "tools.sysroot.stage.materialize consumes (rootfs + aa-sysroot-1 manifest)"
+}

@@ -28,6 +28,7 @@ if(NOT stage_result EQUAL 0)
     message(FATAL_ERROR "Dependency staging failed: ${stage_error}")
 endif()
 # Execute the actual dependency block extracted from patched effective AASDK.
+include(cmake/SysrootGate.cmake)
 enable_language(C CXX)
 set(FETCHCONTENT_SOURCE_DIR_GOOGLETEST "${AA_DEPENDENCY_STAGE}/googletest" CACHE PATH "Verified source" FORCE)
 set(AASDK_TEST ON)
@@ -44,6 +45,29 @@ foreach(case baseline overlay content header extra generated license gpl invento
         ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}" TIMEOUT 60)
 endforeach()
 include(cmake/HostSmoke.cmake)
+if(TARGET aa_sysroot_hash_gate)
+    # Build-time hash gate: aa_host_smoke (and staged gtest) cannot compile after a post-configure
+    # sysroot tamper. Only present for jetson-aarch64 cross builds that configure a sysroot.
+    add_dependencies(aa_host_smoke aa_sysroot_hash_gate)
+    foreach(_aa_gtest_target gtest gtest_main gmock gmock_main)
+        if(TARGET ${_aa_gtest_target})
+            add_dependencies(${_aa_gtest_target} aa_sysroot_hash_gate)
+        endif()
+    endforeach()
+    add_test(NAME cross_contamination
+        COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tools/build/contamination.py"
+                --binary "$<TARGET_FILE:aa_host_smoke>" --sysroot "${CMAKE_SYSROOT}"
+                --build "${CMAKE_BINARY_DIR}" --source "${CMAKE_SOURCE_DIR}"
+                --compiler "${CMAKE_CXX_COMPILER}" ${AA_SYSROOT_PROVENANCE_ARGS}
+                --output "$<TARGET_FILE:aa_host_smoke>.inputs.json")
+    target_link_options(aa_host_smoke PRIVATE "-Wl,-Map,$<TARGET_FILE:aa_host_smoke>.map")
+    set_tests_properties(cross_contamination PROPERTIES TIMEOUT 60)
+    add_test(NAME cross_runtime_regressions
+        COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tests/build/runtime_provenance.py"
+                "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}" "${CMAKE_SYSROOT}")
+    set_tests_properties(cross_runtime_regressions PROPERTIES TIMEOUT 120)
+    unset(_aa_gtest_target)
+endif()
 add_test(NAME deps_check COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tools/deps/check_manifest.py"
     --lock "${CMAKE_SOURCE_DIR}/deps/manifest.lock" --archive "${AA_GOOGLETEST_ARCHIVE}")

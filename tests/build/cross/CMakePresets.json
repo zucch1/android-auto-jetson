@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "cmakeMinimumRequired": {"major": 3, "minor": 20, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "jetson-aarch64",
+      "displayName": "Jetson aarch64 cross-build smoke (task 5, fixture-not-target)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/jetson-aarch64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../../../toolchains/jetson-aarch64.cmake",
+        "AA_SYSROOT_ROOTFS": "$env{AA_SYSROOT_ROOTFS}",
+        "AA_SYSROOT_MANIFEST": "$env{AA_SYSROOT_MANIFEST}",
+        "AA_SYSROOT_PAYLOAD": "$env{AA_SYSROOT_PAYLOAD}",
+        "AA_SYSROOT_CACHE": "$env{AA_SYSROOT_CACHE}",
+        "AA_SYSROOT_REQUIRE_OBSERVED": "$env{AA_SYSROOT_REQUIRE_OBSERVED}"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "jetson-aarch64", "configurePreset": "jetson-aarch64", "jobs": 2}
+  ],
+  "testPresets": [
+    {"name": "jetson-aarch64", "configurePreset": "jetson-aarch64", "output": {"outputOnFailure": true}}
+  ]
+}
