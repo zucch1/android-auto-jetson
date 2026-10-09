@@ -7,6 +7,7 @@
 #include <aa/core/Result.hpp>
 #include <aa/ipc/Control.hpp>
 #include <aa/trust/Trust.hpp>
+#include <aa/transport/Transport.hpp>
 
 #include <array>
 #include <cstddef>
@@ -17,6 +18,31 @@
 #include <gtest/gtest.h>
 
 namespace {
+
+struct LoopbackTransport final : aa::transport::Transport {
+    aa::transport::Kind kind() const noexcept override { return aa::transport::Kind::tcp; }
+    aa::core::Result<void> open(aa::core::CancellationToken) override {
+        open_ = true;
+        return {};
+    }
+    aa::core::Result<void> send(std::span<const std::byte> frame) override {
+        if (!open_) {
+            return aa::Error{aa::ErrorCode::transport_closed};
+        }
+        stored_.assign(frame.begin(), frame.end());
+        return {};
+    }
+    aa::core::Result<std::vector<std::byte>> receive() override {
+        if (!open_) {
+            return aa::Error{aa::ErrorCode::transport_closed};
+        }
+        return stored_;
+    }
+    void close() noexcept override { open_ = false; }
+
+    bool open_{false};
+    std::vector<std::byte> stored_{};
+};
 
 TEST(Ipc, SingleConsumerRuleFailsClosedForEveryWrongShape) {
     // Given: an active consumer that owns the registered name.
@@ -72,6 +98,23 @@ TEST(Config, ConfirmedBenchConfigValidates) {
     EXPECT_EQ(result.value().wireless.channel, 36);
     EXPECT_FALSE(result.value().microphone_enabled);
     EXPECT_FALSE(result.value().sensors_enabled);
+}
+
+TEST(Transport, FramedInterfaceIsImplementableAndTyped) {
+    // Given: a loopback implementation of the framed-message contract.
+    LoopbackTransport transport;
+    const std::array<std::byte, 3> frame{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}};
+    // When: a frame round-trips and the channel is then closed.
+    ASSERT_TRUE(transport.open({}).has_value());
+    ASSERT_TRUE(transport.send(frame).has_value());
+    const auto received = transport.receive();
+    ASSERT_TRUE(received.has_value());
+    EXPECT_EQ(received.value().size(), std::size_t{3});
+    transport.close();
+    // Then: a closed channel reports the typed error instead of data.
+    const auto closed = transport.receive();
+    ASSERT_FALSE(closed.has_value());
+    EXPECT_EQ(closed.error().code(), aa::ErrorCode::transport_closed);
 }
 
 } // namespace
