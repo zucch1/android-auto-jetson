@@ -6,6 +6,7 @@
 #include <aa/config/Config.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/ipc/Control.hpp>
+#include <aa/session/Session.hpp>
 #include <aa/trust/Trust.hpp>
 #include <aa/transport/Transport.hpp>
 
@@ -43,6 +44,28 @@ struct LoopbackTransport final : aa::transport::Transport {
     bool open_{false};
     std::vector<std::byte> stored_{};
 };
+
+TEST(SessionState, AcceptsLegalTransition) {
+    // Given: a fresh state machine.
+    aa::session::StateMachine machine;
+    // When: a table-legal edge is applied.
+    const auto result = machine.transition(aa::session::State::discovering);
+    // Then: the state moves and is reported.
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), aa::session::State::discovering);
+    EXPECT_EQ(machine.state(), aa::session::State::discovering);
+}
+
+TEST(SessionState, RejectsIllegalTransitionWithTypedError) {
+    // Given: a machine still disconnected.
+    aa::session::StateMachine machine;
+    // When: a direct jump to active is attempted.
+    const auto result = machine.transition(aa::session::State::active);
+    // Then: the typed error names the illegal transition and state is unchanged.
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::session_illegal_transition);
+    EXPECT_EQ(machine.state(), aa::session::State::disconnected);
+}
 
 TEST(Ipc, SingleConsumerRuleFailsClosedForEveryWrongShape) {
     // Given: an active consumer that owns the registered name.
