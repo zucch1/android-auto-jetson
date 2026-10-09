@@ -1,0 +1,12 @@
+{
+  "schema": "aa-dependency-lock-1",
+  "manifest_sha256": "52b1bc3fce2159d1de1cff8a10e535eb0a4a9f3a0779d531e853b89a177cb33e",
+  "patch_path": "patches/aasdk-googletest.patch",
+  "patch_sha256": "d27b1c7099041042ad255c2cd16b7d61588b6b6aaa93b4c7d1b0c0ffb35b7091",
+  "source_commits": {
+    "aasdk": "9bf6adf933665dee26532201719fac14a047ccf1",
+    "oaa": "61eab61c5f9968154ff1a80faa8c0a427b208479",
+    "googletest": "b514bdc898e2951020cbdca1304b75f5950d1f59"
+  },
+  "googletest_archive_sha256": "7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926"
+}
