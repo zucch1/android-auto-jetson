@@ -58,7 +58,10 @@ include(cmake/Diagnostics.cmake)
 include(cmake/Transport.cmake)
 include(cmake/Session.cmake)
 include(cmake/Replay.cmake)
+include(cmake/VideoSocket.cmake)
 include(cmake/Conformance.cmake)
+include(cmake/DbusContract.cmake)
+include(cmake/ConsumerDecode.cmake)
 if(TARGET aa_sysroot_hash_gate)
     # Build-time hash gate: aa_host_smoke (and staged gtest) cannot compile after a post-configure
     # sysroot tamper. Only present for jetson-aarch64 cross builds that configure a sysroot.

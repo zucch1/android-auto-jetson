@@ -31,6 +31,9 @@ std::string_view Error::message() const noexcept {
     case ErrorCode::channel_not_registered: return "channel service not registered";
     case ErrorCode::channel_unsupported_capability: return "unsupported channel capability";
     case ErrorCode::channel_dispatch_failed: return "channel dispatch failed";
+    case ErrorCode::channel_caps_unsupported: return "unsupported decode caps";
+    case ErrorCode::channel_decode_unavailable: return "decode backend unavailable";
+    case ErrorCode::channel_decode_failed: return "decode pipeline failure";
 
     case ErrorCode::ipc_consumer_rejected: return "ipc consumer rejected";
     case ErrorCode::ipc_peer_unauthorized: return "ipc peer unauthorized";
@@ -85,6 +88,9 @@ std::string_view to_string(ErrorCode code) noexcept {
     case ErrorCode::channel_not_registered: return "channel_not_registered";
     case ErrorCode::channel_unsupported_capability: return "channel_unsupported_capability";
     case ErrorCode::channel_dispatch_failed: return "channel_dispatch_failed";
+    case ErrorCode::channel_caps_unsupported: return "channel_caps_unsupported";
+    case ErrorCode::channel_decode_unavailable: return "channel_decode_unavailable";
+    case ErrorCode::channel_decode_failed: return "channel_decode_failed";
 
     case ErrorCode::ipc_consumer_rejected: return "ipc_consumer_rejected";
     case ErrorCode::ipc_peer_unauthorized: return "ipc_peer_unauthorized";
