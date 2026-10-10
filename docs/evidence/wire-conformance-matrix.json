@@ -463,11 +463,11 @@
         {"tag": 2, "name": "max_unacked", "wire_type": "VARINT", "type": "uint32 flow-control window (>0; forced 24 in ackless GAL 5.0 mode)", "required": false, "default": null, "version_condition": "ackless behavior GAL 5.0 - OFF", "oaa_evidence": "oaa/av/AVChannelSetupResponseMessage.proto:24"},
         {"tag": 3, "name": "configs / configuration_indices", "wire_type": "VARINT (repeated unpacked)", "type": "uint32 accepted config indices", "required": false, "default": null, "version_condition": "all", "oaa_evidence": "oaa/av/AVChannelSetupResponseMessage.proto:25"}
       ],
-      "direction": "hu_to_phone",
+      "direction": "hu_to_phone_on_audio_channels; phone_to_hu_on_video_channels",
       "required_default_behavior": "HU accepts/rejects the codec setup; our future emit MUST use status=2 (the only value both rulebooks read as success/ready)",
       "version_condition": "all",
       "oaa_confidence": "silver [apk_static, cross_version]",
-      "oaa_evidence": ["oaa/av/AVChannelSetupResponseMessage.proto:20-25", "oaa/av/AVChannelSetupStatusEnum.proto:12-19"],
+      "oaa_evidence": ["oaa/av/AVChannelSetupResponseMessage.proto:11-16,20-25", "oaa/av/AVChannelSetupStatusEnum.proto:12-19", "docs/interactions/04-channel-lifecycle.md:168-182 (conflicting older single-direction view; see channel-dependent proto claim)"],
       "ours_status": "absent (next-needed task 28)",
       "ours_evidence": ["(none)"],
       "discrepancy_flags": ["D4-SETUP-STATUS"],
