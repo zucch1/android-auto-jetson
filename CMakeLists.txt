@@ -51,6 +51,7 @@ include(cmake/TlsHandshake.cmake)
 include(cmake/WirelessProbe.cmake)
 include(cmake/UsbAoaProbe.cmake)
 include(cmake/CapabilityGate.cmake)
+include(cmake/CoreArchitecture.cmake)
 if(TARGET aa_sysroot_hash_gate)
     # Build-time hash gate: aa_host_smoke (and staged gtest) cannot compile after a post-configure
     # sysroot tamper. Only present for jetson-aarch64 cross builds that configure a sysroot.
