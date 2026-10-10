@@ -42,7 +42,9 @@ set(AA_IPC_DBUS_SOURCES
     src/ipc/dbus_adapter/BusConnection.cpp
     src/ipc/dbus_adapter/BusCalls.cpp
     src/ipc/dbus_adapter/BusPeerLookup.cpp
-    src/ipc/dbus_adapter/ControlDispatcher.cpp)
+    src/ipc/dbus_adapter/ControlDispatcher.cpp
+    src/ipc/dbus_adapter/ControlBusService.cpp
+    src/ipc/dbus_adapter/ControlBusClient.cpp)
 set(AA_DBUS_TEST_SOURCES
     tests/dbus/control_service_test.cpp
     tests/dbus/pairing_gate_test.cpp

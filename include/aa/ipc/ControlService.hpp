@@ -140,6 +140,18 @@ public:
                                                                    const BusName& consumer_name);
     [[nodiscard]] core::Result<void> unregister_consumer(const BusName& caller);
 
+    // Lookup-on-use owner reconciliation (the minimal POSIX bus client has no
+    // event loop, so there is no NameOwnerChanged monitoring): if a consumer is
+    // registered, re-resolve its owned name through the credential lookup and
+    // compare against the stored UNIQUE connection. Absent, different or
+    // unverifiable ownership all revoke authority and tear the registration
+    // down (lookup failures close conservatively - the production lookup
+    // collapses every bus failure to ipc_peer_unauthorized, so unverifiable
+    // == revoked). With no registration this is a no-op. The runtime (task 24)
+    // MUST call this while idle: lookup-on-use cannot detect an idle
+    // disconnect on its own.
+    void refresh_consumer_owner();
+
     // StartProjection / StopProjection.
     [[nodiscard]] core::Result<void> start_projection(const BusName& caller);
     [[nodiscard]] core::Result<void> stop_projection(const BusName& caller);
@@ -152,16 +164,21 @@ public:
                                                           core::PairingRequestId request);
     [[nodiscard]] core::Result<void> forget_phone(const BusName& caller, core::PhoneId phone);
 
-    // GetState / GetCapabilities / Ping (open to every caller).
-    [[nodiscard]] StateSnapshot state() const noexcept;
+    // GetState / GetCapabilities / Ping (open to every caller). state()
+    // reconciles the incumbent owner before snapshotting and can emit the
+    // teardown events, so it is not const or noexcept.
+    [[nodiscard]] StateSnapshot state();
     [[nodiscard]] std::map<std::string, std::string> capabilities() const;
     [[nodiscard]] std::uint64_t ping() const noexcept;
 
     // SetDisplayViewport (consumer-only).
     [[nodiscard]] core::Result<void> set_display_viewport(const BusName& caller, Viewport viewport);
+    // Cached projection viewport: the value set by the consumer-owned
+    // SetDisplayViewport call; cleared when the consumer registration ends.
     [[nodiscard]] std::optional<Viewport> viewport() const { return viewport_; }
 
-    // Pairing-window observability (the todo-27 machinery hooks this).
+    // Pairing-window observability (the todo-27 machinery hooks this). Cached:
+    // reflects the gate state as of the last control call.
     [[nodiscard]] bool pairing_window_open() const noexcept { return gate_.window_open(); }
 
 private:
@@ -172,8 +189,17 @@ private:
         std::uint32_t unix_uid{};
     };
 
-    [[nodiscard]] core::Result<Registered> require_consumer() const;
-    [[nodiscard]] core::Result<void> admit(const BusName& caller, const Registered& active) const;
+    // Shared teardown for unregister and observed owner loss: projection goes
+    // stopped (preserving that stopped event for the old consumer), every
+    // pending/open pairing request closes exactly once, then registration and
+    // the consumer-owned viewport clear behind a final cleared StateChanged and
+    // the reason diagnostic ("consumer_unregistered" or "consumer_owner_lost").
+    // The PairingGate instance and its issued-id history are PRESERVED: a
+    // cycling id source can never reissue a spent id after teardown.
+    void teardown(std::string_view reason, DiagnosticSeverity severity);
+
+    [[nodiscard]] core::Result<Registered> require_consumer();
+    [[nodiscard]] core::Result<void> admit(const BusName& caller, const Registered& active);
 
     ControlServiceConfig config_{};
     PeerCredentialLookup& credentials_;

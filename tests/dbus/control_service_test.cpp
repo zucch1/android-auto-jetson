@@ -311,4 +311,132 @@ TEST(AccessControl, UnknownConnectionFailsClosed) {
     EXPECT_EQ(denied.error().code(), ErrorCode::ipc_peer_unauthorized);
 }
 
+TEST(ControlService, OwnerLossStopsProjectionClosesAllRequestsAndClearsRegistration) {
+    // Given: a projecting consumer holding a viewport, with one confirmed
+    // pairing window and one pending pairing request.
+    Fixture fixture;
+    const BusName connection{":1.100"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(connection, kSessionUid);
+    fixture.credentials.set_owner(consumer_name, connection);
+    ASSERT_TRUE(fixture.service.register_consumer(connection, consumer_name).has_value());
+    ASSERT_TRUE(fixture.service.start_projection(connection).has_value());
+    ASSERT_TRUE(
+        fixture.service.set_display_viewport(connection, Viewport{1280, 720, 160}).has_value());
+    const auto pending = fixture.service.request_add_phone(connection);
+    const auto confirmed = fixture.service.request_add_phone(connection);
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_TRUE(confirmed.has_value());
+    ASSERT_TRUE(fixture.service.confirm_phone_pairing(connection, confirmed.value()).has_value());
+    ASSERT_TRUE(fixture.service.pairing_window_open());
+
+    // When: the consumer name loses its owner and lookup-on-use reconciles.
+    fixture.credentials.remove_owner(consumer_name);
+    fixture.service.refresh_consumer_owner();
+
+    // Then: projection stops for the old consumer, registration and viewport
+    // clear, the window closes, and each request id closes exactly once.
+    const auto snapshot = fixture.service.state();
+    EXPECT_EQ(snapshot.projection, ProjectionState::stopped);
+    EXPECT_EQ(snapshot.consumer, aa::core::ConsumerId{});
+    EXPECT_FALSE(fixture.service.viewport().has_value());
+    EXPECT_FALSE(fixture.service.pairing_window_open());
+    std::size_t pending_closes = 0;
+    std::size_t confirmed_closes = 0;
+    bool saw_stopped_for_old = false;
+    bool saw_cleared_state = false;
+    std::size_t owner_lost_diagnostics = 0;
+    for (const auto& event : fixture.events.events) {
+        if (const auto* closed = std::get_if<aa::ipc::PairingClosed>(&event)) {
+            if (closed->request == pending.value()) {
+                ++pending_closes;
+            }
+            if (closed->request == confirmed.value()) {
+                ++confirmed_closes;
+            }
+        }
+        if (const auto* changed = std::get_if<aa::ipc::StateChanged>(&event)) {
+            if (changed->projection == ProjectionState::stopped &&
+                changed->consumer == aa::core::ConsumerId{}) {
+                saw_cleared_state = true;
+            }
+            if (changed->projection == ProjectionState::stopped &&
+                changed->consumer != aa::core::ConsumerId{}) {
+                saw_stopped_for_old = true;
+            }
+        }
+        if (const auto* diagnostic = std::get_if<aa::ipc::DiagnosticEmitted>(&event)) {
+            if (diagnostic->event == "consumer_owner_lost") {
+                ++owner_lost_diagnostics;
+                EXPECT_EQ(diagnostic->severity, aa::ipc::DiagnosticSeverity::warning);
+            }
+        }
+    }
+    EXPECT_EQ(pending_closes, 1U);
+    EXPECT_EQ(confirmed_closes, 1U);
+    EXPECT_TRUE(saw_stopped_for_old);
+    EXPECT_TRUE(saw_cleared_state);
+    EXPECT_EQ(owner_lost_diagnostics, 1U);
+}
+
+TEST(ControlService, OwnerRefreshIsIdempotent) {
+    // Given: a registered consumer whose name just lost its owner.
+    Fixture fixture;
+    const BusName connection{":1.101"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(connection, kSessionUid);
+    fixture.credentials.set_owner(consumer_name, connection);
+    ASSERT_TRUE(fixture.service.register_consumer(connection, consumer_name).has_value());
+    fixture.credentials.remove_owner(consumer_name);
+
+    // When: reconciliation runs repeatedly and again with no registration.
+    fixture.service.refresh_consumer_owner();
+    const auto after_first = fixture.events.events.size();
+    fixture.service.refresh_consumer_owner();
+    fixture.service.refresh_consumer_owner();
+
+    // Then: the teardown happened exactly once and later refreshes are no-ops.
+    EXPECT_EQ(fixture.events.events.size(), after_first);
+    std::size_t owner_lost_diagnostics = 0;
+    for (const auto& event : fixture.events.events) {
+        if (const auto* diagnostic = std::get_if<aa::ipc::DiagnosticEmitted>(&event)) {
+            if (diagnostic->event == "consumer_owner_lost") {
+                ++owner_lost_diagnostics;
+            }
+        }
+    }
+    EXPECT_EQ(owner_lost_diagnostics, 1U);
+    EXPECT_EQ(fixture.service.state().consumer, aa::core::ConsumerId{});
+}
+
+TEST(ControlService, ReplacementRegistrationReconcilesAbandonedOwner) {
+    // Given: an incumbent that abandoned its consumer name (abrupt loss).
+    Fixture fixture;
+    const BusName incumbent{":1.102"};
+    const BusName replacement{":1.103"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(incumbent, kSessionUid);
+    fixture.credentials.add_connection(replacement, kSessionUid);
+    fixture.credentials.set_owner(consumer_name, incumbent);
+    ASSERT_TRUE(fixture.service.register_consumer(incumbent, consumer_name).has_value());
+    fixture.credentials.set_owner(consumer_name, replacement);
+
+    // When: a replacement connection registers the same consumer name.
+    const auto registered = fixture.service.register_consumer(replacement, consumer_name);
+
+    // Then: the abandoned incumbent is torn down and the replacement registers
+    // under a fresh consumer id.
+    ASSERT_TRUE(registered.has_value());
+    EXPECT_EQ(fixture.service.state().consumer, registered.value());
+    std::size_t owner_lost_diagnostics = 0;
+    for (const auto& event : fixture.events.events) {
+        if (const auto* diagnostic = std::get_if<aa::ipc::DiagnosticEmitted>(&event)) {
+            if (diagnostic->event == "consumer_owner_lost") {
+                ++owner_lost_diagnostics;
+            }
+        }
+    }
+    EXPECT_EQ(owner_lost_diagnostics, 1U);
+}
+
 } // namespace

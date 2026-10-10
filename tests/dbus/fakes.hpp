@@ -23,6 +23,7 @@ public:
     void set_owner(const BusName& name, const BusName& owner) {
         owners_[name.value] = owner.value;
     }
+    void remove_owner(const BusName& name) { owners_.erase(name.value); }
 
     [[nodiscard]] core::Result<std::uint32_t> unix_uid(const BusName& name) const override {
         const auto found = uids_.find(name.value);

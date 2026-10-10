@@ -139,6 +139,19 @@ core::Result<void> BusConnection::release_name(const BusName& name) {
     return outcome.has_value() ? core::Result<void>{} : core::Result<void>{outcome.error()};
 }
 
+core::Result<void> BusConnection::add_match(std::string_view rule) {
+    MessageWriter body;
+    body.put_string(rule);
+    const auto reply = call("AddMatch", "s", body);
+    if (!reply.has_value()) {
+        return reply.error();
+    }
+    if (reply.value().type != MessageType::method_return || !reply.value().body.empty()) {
+        return Error{ErrorCode::transport_io};
+    }
+    return {};
+}
+
 core::Result<BusName> BusConnection::get_name_owner(const BusName& name) {
     MessageWriter body;
     body.put_string(name.value);
