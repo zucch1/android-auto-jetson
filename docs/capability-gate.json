@@ -1,0 +1,250 @@
+{
+  "schema": "aa-capability-gate/1",
+  "generated_at_utc": "2026-10-08T20:00:19Z",
+  "report_stage": "continuation",
+  "target": {
+    "architecture": "aarch64",
+    "l4t_release": "R39.2.1",
+    "kernel_release": "6.8.12-1021-tegra",
+    "gstreamer_version": "1.24.2"
+  },
+  "phone": {
+    "model": "Samsung Galaxy S24 Ultra",
+    "android_version": "16",
+    "android_auto_version": "17.7.663654-release",
+    "source": "owner-reported; not read through ADB"
+  },
+  "areas": [
+    {
+      "id": "dependencies",
+      "classification": "probe-pass-provisional",
+      "summary": "Offline dependency-lock check passes (source-pins=3); the immutable ARM64 sysroot archive and manifest digests were accepted by the task-5 final acceptance gate with package-version and same-version-content drift rejected. Host development packages are observed availability, not all installed; target runtime capability is not claimed.",
+      "evidence": [
+        {"name": "task-3-dependencies.json", "sha256": "eeac38143d9ed9f44b10abbd189bb9c5f117c0868c8fd023ab4d73f212454475"},
+        {"name": "task-5-final-acceptance-gate.json", "sha256": "f2cfdb961b97e1e2db3d17d8703fa30c209b26f4d9e02759901cd26a08d958e7"},
+        {"name": "task-5-sysroot.json", "sha256": "ad7780659ea4aa2914312ec1a2b68a189263a88ef29f2596d289b86abb7bdd54"}
+      ],
+      "measurements": {
+        "manifest_check_exit_status": 0,
+        "source_pins": 3,
+        "host_inventory_packages": 25,
+        "sysroot_packages": 15,
+        "sysroot_copied_inputs": 2651,
+        "sysroot_archive_sha256": "8b76a9989118ec803957ad25bee16d3ebb7cdbdf3c1abfd3e75e52b1ade724d8",
+        "sysroot_manifest_sha256": "aa57014c31017139b63b917878a77ee16968aa64b30a10a624f0ba5f68d8d3d9",
+        "package_version_drift_rejected": true,
+        "same_version_content_drift_rejected": true,
+        "target_contact_in_task5_gate": false
+      },
+      "budgets": [],
+      "owner_signoff": null
+    },
+    {
+      "id": "target_identity",
+      "classification": "probe-pass-provisional",
+      "summary": "Target identity observed across the decode and USB probes: aarch64, L4T R39.2.1, kernel 6.8.12-1021-tegra, GStreamer 1.24.2. Phone versions are owner-reported. No independent attestation and no phone identifiers are recorded here.",
+      "evidence": [
+        {"name": "task-5-sysroot.json", "sha256": "ad7780659ea4aa2914312ec1a2b68a189263a88ef29f2596d289b86abb7bdd54"},
+        {"name": "task-9-decode-probe.json", "sha256": "c182f2b66f30dd0269ac48e75645d70a74e62e783371f81f8832264c94034fa2"},
+        {"name": "task-11-usb-probe.json", "sha256": "ef22a431b433e1fece7fd0e0720a1ade5b6f2800cb24a7c6402c10ad93ed9e36"}
+      ],
+      "measurements": {
+        "architecture": "aarch64",
+        "l4t_release": "R39.2.1",
+        "kernel_release": "6.8.12-1021-tegra",
+        "gstreamer_version": "1.24.2",
+        "phone_versions_owner_reported": true,
+        "adb_available_on_target": false,
+        "usb_reenumeration_elapsed_ms": 762
+      },
+      "budgets": [],
+      "owner_signoff": null
+    },
+    {
+      "id": "abi",
+      "classification": "probe-pass-provisional",
+      "summary": "Vendored AASDK builds as C++20 (decision aasdk-cpp20); 4/4 ABI tests pass with nm/ldd-resolved boundary symbols and a proven C++17 consumer rejection. Vendor warnings remain visible; this is compatibility evidence, not exhaustive SDK qualification.",
+      "evidence": [
+        {"name": "task-7-final-acceptance-gate.json", "sha256": "7ffffdf7e68cd73873054379a76302eaf795fdcf6f4241513bf99c592a0533b5"}
+      ],
+      "measurements": {
+        "decision": "aasdk-cpp20",
+        "abi_tests_passed": 4,
+        "abi_tests_failed": 0,
+        "unresolved_boundary_symbols": 0,
+        "cxx17_consumer_rejected": true,
+        "compile_commands_production_targets": 59,
+        "compile_commands_generated_targets": 254
+      },
+      "budgets": [],
+      "owner_signoff": null
+    },
+    {
+      "id": "tls",
+      "classification": "probe-pass-provisional",
+      "summary": "TLS posture suite passes 32/32 on the host: encryption-only-compatibility is the labeled default gated by approved-phone callbacks, verified-peer test-only rejects unknown credentials, the credential loader enforces explicit HU_KEY_PATH with 0600 regular-file checks, and the tree scan finds no production key markers. Not real-phone or production TLS qualification.",
+      "evidence": [
+        {"name": "task-8-final-acceptance-gate.json", "sha256": "b8da735b2b6097fe1d028ac9ac6541b62b95012d8c3ffc720b3891d15dc1ab7c"}
+      ],
+      "measurements": {
+        "tls_posture_tests_passed": 32,
+        "tls_posture_tests_failed": 0,
+        "production_key_markers": 0,
+        "default_mode": "encryption-only-compatibility",
+        "verified_peer_unknown_rejected": true,
+        "credential_file_mode_enforced": "0600"
+      },
+      "budgets": [],
+      "owner_signoff": null
+    },
+    {
+      "id": "decode",
+      "classification": "owner-signed-reduced-scope",
+      "summary": "600 s NVIDIA hardware H.264 decode at 1280x720@30/10 Mbps delivered 18000/18000 frames with zero drops, 30.00 fps, 10.02 Mbps and 3.83% of one core. Measured p95 latency 36.09 ms exceeds the fixed 33 ms budget and the software fallback path is unqualified; both claims are withdrawn by owner sign-off and never count as full compliance.",
+      "evidence": [
+        {"name": "task-9-decode-probe.json", "sha256": "c182f2b66f30dd0269ac48e75645d70a74e62e783371f81f8832264c94034fa2"},
+        {"name": "task-9-owner-signoff.json", "sha256": "b5cb0f2f28ca03e16c3a9fe4bf1583ef207021d230583be2510b33e760875d46"}
+      ],
+      "measurements": {
+        "decoder": "nvv4l2decoder",
+        "hardware_decoder": true,
+        "duration_s": 600.0,
+        "frames_fed": 18000,
+        "frames_decoded": 18000,
+        "dropped_frames": 0,
+        "unmatched_frames": 0,
+        "observed_fps": 30.0,
+        "fps_error_percent": 0.0,
+        "observed_bitrate_mbps": 10.02049768,
+        "bitrate_error_percent": 0.2049768,
+        "cpu_percent_one_core": 3.83,
+        "p95_latency_ms": 36.09,
+        "avg_latency_ms": 34.66,
+        "max_latency_ms": 106.45,
+        "software_fallback_qualified": false
+      },
+      "budgets": [
+        {"id": "decode.duration_s", "kind": "min", "limit": 600.0, "unit": "s", "available_at": "probe", "measured": 600.0, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "decode.fps_error_percent", "kind": "max", "limit": 5.0, "unit": "percent", "available_at": "probe", "measured": 0.0, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "decode.bitrate_error_percent", "kind": "max", "limit": 5.0, "unit": "percent", "available_at": "probe", "measured": 0.2049768, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "decode.dropped_frames", "kind": "max", "limit": 0.0, "unit": "frames", "available_at": "probe", "measured": 0.0, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "decode.p95_latency_ms", "kind": "max", "limit": 33.0, "unit": "ms", "available_at": "probe", "measured": 36.09, "passed": false, "withdrawn": true, "withdrawn_claim": "decode p95 latency at most 33 ms at 1280x720@30"},
+        {"id": "decode.cpu_percent_one_core", "kind": "max", "limit": 50.0, "unit": "percent", "available_at": "probe", "measured": 3.83, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "audio.path_latency_ms", "kind": "max", "limit": 200.0, "unit": "ms", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "media.avsync_ms", "kind": "max", "limit": 50.0, "unit": "ms", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null}
+      ],
+      "owner_signoff": {
+        "owner": "Newton",
+        "statement": "Task 9 decode probe is accepted at reduced scope. The 600s Jetson qualification at approved SHA a0a2049 proved 1280x720@30 H.264 NVIDIA-hardware decode with 18000/18000 frames, zero drops, 30.00 fps, 10.02 Mbps (within 5%), and 3.83% CPU. I withdraw the p95 decode latency <=33 ms budget claim (measured p95 36.09 ms, avg 34.66 ms, consistent with one-frame decoder buffering per task-9-latency-analysis.md) and the software-fallback qualification claim (openh264dec run exceeded its deadline; path remains unqualified). Downstream tasks must not claim the 33 ms decode latency budget or a qualified software fallback; final release gate must label this reduced-scope.",
+        "withdrawn_claims": [
+          "decode p95 latency at most 33 ms at 1280x720@30",
+          "software H.264 fallback path qualification"
+        ],
+        "evidence_ref": ".omo/evidence/jetson-android-auto-receiver/task-9-decode-probe.json",
+        "timestamp": "2026-10-06T15:57:52Z"
+      }
+    },
+    {
+      "id": "ipc",
+      "classification": "probe-pass-provisional",
+      "summary": "Host-only synthetic encoded-access-unit AF_UNIX SOCK_SEQPACKET transport over the recorded 600 s workload: 18000/18000 frames and 600 fragmented 96 KiB IDRs with zero happy-path drops or corruption, 12.189683 Mbps throughput and 0.2 ms p95 added IPC latency. Synthetic bytes only: not ARM64 runtime, valid-H.264 decode, real-phone projection, reconnect, A/V sync or release qualification.",
+      "evidence": [
+        {"name": "task-10-final-acceptance-gate.json", "sha256": "ea7194adbf74c02d4010c318c702fec83ed2e29ce019ffcb0fe65e50b6b4d1c7"}
+      ],
+      "measurements": {
+        "host_only": true,
+        "synthetic_payload": true,
+        "duration_s": 600.000652,
+        "frames_delivered": 18000,
+        "frames_expected": 18000,
+        "fragmented_idrs": 600,
+        "happy_drops": 0,
+        "corrupt_frames": 0,
+        "throughput_mbps": 12.189683,
+        "p95_added_latency_ms": 0.2,
+        "arm64_runtime_qualified": false
+      },
+      "budgets": [
+        {"id": "ipc.duration_s", "kind": "min", "limit": 600.0, "unit": "s", "available_at": "probe", "measured": 600.000652, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "ipc.throughput_mbps", "kind": "min", "limit": 10.0, "unit": "Mbps", "available_at": "probe", "measured": 12.189683, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "ipc.p95_added_latency_ms", "kind": "max", "limit": 33.0, "unit": "ms", "available_at": "probe", "measured": 0.2, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "ipc.happy_drops", "kind": "max", "limit": 0.0, "unit": "frames", "available_at": "probe", "measured": 0.0, "passed": true, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "session.projection_recovery_s", "kind": "max", "limit": 60.0, "unit": "s", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "soak.duration_h", "kind": "min", "limit": 4.0, "unit": "h", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "soak.crashes", "kind": "max", "limit": 0.0, "unit": "events", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "soak.rss_growth_percent", "kind": "max", "limit": 10.0, "unit": "percent", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "rss.receiver_mb", "kind": "max", "limit": 250.0, "unit": "MB", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "rss.helper_mb", "kind": "max", "limit": 32.0, "unit": "MB", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "receiver.cpu_sustained_percent_one_core", "kind": "max", "limit": 50.0, "unit": "percent", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null}
+      ],
+      "owner_signoff": null
+    },
+    {
+      "id": "usb",
+      "classification": "probe-pass-provisional",
+      "summary": "AOA2 capability only: protocol version 2, accessory bulk IN 0x81 / OUT 0x01 with 512-byte max packet, 3/3 software resets with AOA observed after each, stable 30 s presence (31 samples) and same-port re-enumeration. No Android Auto session, no bulk transfer: this is not projection, not a session-reconnect pass and not release qualification.",
+      "evidence": [
+        {"name": "task-11-usb-probe.json", "sha256": "ef22a431b433e1fece7fd0e0720a1ade5b6f2800cb24a7c6402c10ad93ed9e36"}
+      ],
+      "measurements": {
+        "aoa_protocol_version": 2,
+        "bulk_in_endpoint": "0x81",
+        "bulk_out_endpoint": "0x01",
+        "max_packet_size_bytes": 512,
+        "software_resets_requested": 3,
+        "software_resets_successful": 3,
+        "aoa_observed_after_each_reset": true,
+        "presence_duration_s": 30,
+        "presence_samples": 31,
+        "presence_stable": true,
+        "android_auto_session_claimed": false,
+        "bulk_data_transferred": false,
+        "projection_capability_claimed": false,
+        "session_reconnect_budget_claimed": false
+      },
+      "budgets": [
+        {"id": "usb.session_reconnect_s", "kind": "max", "limit": 5.0, "unit": "s", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null}
+      ],
+      "owner_signoff": null
+    },
+    {
+      "id": "wireless",
+      "classification": "owner-signed-reduced-scope",
+      "summary": "AP/channel-36/client qualification is deferred by owner sign-off; wireless-dependent work stays deferred and is not silently marked passed. BlueZ ProfileManager/Agent registration succeeded with clean unregister and unchanged adapter state. The 3.009 s event-loop observation is NOT a strict 3 s deadline pass. AP mode advertisement is not AP operation.",
+      "evidence": [
+        {"name": "task-12-bluez-lightweight.json", "sha256": "0531997c28ab8b013c51973b9179aa15029d837f49f58d28f0612ae267704f53"},
+        {"name": "task-12-owner-signoff.json", "sha256": "48221d944788cc11939b05d7af2b523b912d3cbf255dcba54d4932a6e4535519"}
+      ],
+      "measurements": {
+        "bluez_profile_registration_succeeded": true,
+        "bluez_agent_registration_succeeded": true,
+        "bluez_unregister_completed": true,
+        "adapter_state_unchanged": true,
+        "event_loop_observed_s": 3.009,
+        "strict_three_second_deadline_pass": false,
+        "ap_mode_advertised": true,
+        "ap_operation_qualified": false,
+        "client_association_qualified": false,
+        "pairing_or_trust_claimed": false,
+        "effective_regdom": "00",
+        "driver_country_parameter": "US",
+        "supported_runtime_country_fix_found": false
+      },
+      "budgets": [
+        {"id": "wireless.session_reconnect_s", "kind": "max", "limit": 15.0, "unit": "s", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null},
+        {"id": "wireless.ap_startup_s", "kind": "max", "limit": 5.0, "unit": "s", "available_at": "release", "measured": null, "passed": false, "withdrawn": false, "withdrawn_claim": null}
+      ],
+      "owner_signoff": {
+        "owner": "Newton",
+        "statement": "do not let that block us. find a command maybe. if not, we skip.",
+        "withdrawn_claims": [
+          "Completed onboard RTL8822CE channel-36 AP qualification at the early capability gate",
+          "Completed isolated AP client-association qualification at the early capability gate",
+          "Full wireless capability acceptance as a prerequisite for continuing independent wired implementation"
+        ],
+        "evidence_ref": ".omo/evidence/jetson-android-auto-receiver/task-12-lightweight-preflight.json",
+        "timestamp": "2026-10-08T17:28:33Z"
+      }
+    }
+  ]
+}
