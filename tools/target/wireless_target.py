@@ -82,8 +82,9 @@ def regulatory_rules(section: str) -> list[tuple[int, int, int, bool]]:
         return []
     rules: list[tuple[int, int, int, bool]] = []
     number = r'(?:N/A|-?\d+(?:\.\d+)?)'
+    cac = rf'(?:{number}|\d+ MS)'
     pattern = (r'\((\d+)\s*-\s*(\d+)\s*@\s*(\d+)\), '
-               rf'\({number}, {number}\), \({number}\)((?:, [A-Z0-9][A-Z0-9 _-]*)*)')
+               rf'\({number}, {number}\), \({cac}\)((?:, [A-Z0-9][A-Z0-9 _-]*)*)')
     for line in lines[1:]:
         rule = re.fullmatch(pattern, line)
         if not rule:
@@ -107,7 +108,7 @@ def eligible(info: str, reg: str, jurisdiction: str) -> bool:
     country = re.match(r'COUNTRY ([A-Z0-9]{2}):', ' '.join(reg.upper().split()))
     if (len(channel) != 1 or country is None or not jurisdiction or
             country.group(1) != jurisdiction or
-            not re.fullmatch(r'\*\s+5180\s+MHz\s+\[36\]\s+\(\d+(?:\.\d+)?\s+dBm\)', channel[0], re.I)):
+            not re.fullmatch(r'\*\s+5180(?:\.0+)?\s+MHz\s+\[36\]\s+\(\d+(?:\.\d+)?\s+dBm\)', channel[0], re.I)):
         return False
     return any(lower <= 5170 and upper >= 5190 and bandwidth >= 20 and permitted
                for lower, upper, bandwidth, permitted in regulatory_rules(reg))
