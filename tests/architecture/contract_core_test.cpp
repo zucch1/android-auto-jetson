@@ -8,6 +8,7 @@
 #include <aa/core/Result.hpp>
 #include <aa/core/SessionThread.hpp>
 #include <aa/core/Time.hpp>
+#include <aa/diagnostics/Diagnostics.hpp>
 
 #include <array>
 #include <atomic>
@@ -157,6 +158,19 @@ TEST(Logging, FiltersBelowMinimumAndDeliversRedactedFields) {
     ASSERT_EQ(sink.events[0].fields.size(), std::size_t{1});
     EXPECT_EQ(sink.events[0].fields[0].key, "session");
     EXPECT_EQ(sink.events[0].fields[0].value, "s-1");
+}
+
+TEST(Diagnostics, RedactionHidesRawIdentifierBehindStablePseudonym) {
+    // Given: a raw identifier that must never reach logs or events.
+    const std::string raw{"AA:BB:CC:DD:EE:FF"};
+    // When: the privacy boundary redacts it twice in one process.
+    const auto first = aa::diagnostics::redact_identifier(raw);
+    const auto second = aa::diagnostics::redact_identifier(raw);
+    // Then: the pseudonym is stable within the run and hides the raw value.
+    EXPECT_EQ(first, second);
+    EXPECT_TRUE(first.rfind("id-", 0) == 0);
+    EXPECT_EQ(first.find(raw), std::string::npos);
+    EXPECT_TRUE(aa::diagnostics::redact_identifier(std::string_view{}).empty());
 }
 
 } // namespace
