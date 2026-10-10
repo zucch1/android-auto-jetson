@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "MediaConfiguration.hpp"
 #include "Framing.hpp"
+#include "UnknownFields.hpp"
 
 #include <aap_protobuf/service/media/shared/message/MediaCodecType.pb.h>
 #include <aap_protobuf/service/media/sink/message/AudioStreamType.pb.h>
@@ -10,19 +11,44 @@ namespace media = aap_protobuf::service::media;
 namespace sink = media::sink::message;
 namespace shared = media::shared::message;
 
+namespace {
+
+// Pinned-schema tag sets for the unknown-field separation (pre-28 conformance):
+// entries carrying a tag from these sets could not be interpreted (unknown
+// enum value or wire-type mismatch) and are malformed; entries with any other
+// tag are extension fields (see UnknownFields.hpp). The strict profile rejects
+// both classes - today's behavior - so this split is behavior-preserving until
+// the extension policy is explicitly flipped on phone evidence.
+constexpr int kServiceTags[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+constexpr int kMediaSinkServiceTags[] = {1, 2, 3, 4, 5, 6, 7, 8};
+constexpr int kInputSourceServiceTags[] = {1, 2, 3, 4, 5};
+constexpr int kVideoConfigurationTags[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+constexpr int kAudioConfigurationTags[] = {1, 2, 3};
+
+[[nodiscard]] bool rejects_unknown(const google::protobuf::Message& message,
+                                  std::span<const int> known_tags) {
+    return classify_unknown_fields(message, known_tags)
+        .rejected_under(kStrictExtensionPolicy);
+}
+
+} // namespace
+
 core::Result<ServiceConfiguration>
 read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role) {
     // Proto2 stores unknown optional enums as unknown fields and returns the
-    // default enum value. Reject that fallback at this pinned-schema boundary.
-    if (entry.unknown_fields().field_count() != 0
+    // default enum value. That silent-default fallback is the malformed class
+    // and is rejected here; unseen tags are the extension class and follow the
+    // explicit strict policy (UnknownFields.hpp). Both rejections are the
+    // pre-28 behavior, now typed instead of conflated.
+    if (rejects_unknown(entry, kServiceTags)
         || (entry.has_media_sink_service()
-            && entry.media_sink_service().unknown_fields().field_count() != 0)) {
+            && rejects_unknown(entry.media_sink_service(), kMediaSinkServiceTags))) {
         return malformed();
     }
     switch (role) {
     case ChannelRole::input: {
         const auto& input = entry.input_source_service();
-        if (input.unknown_fields().field_count() != 0
+        if (rejects_unknown(input, kInputSourceServiceTags)
             || input.touchscreen_size() != 0 || input.touchpad_size() != 0
             || input.keycodes_supported_size() > static_cast<int>(kMaxButtonKeycodes)) {
             return malformed();
@@ -40,7 +66,7 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
         }
         VideoConfiguration config;
         for (const auto& video : wire.video_configs()) {
-            if (video.unknown_fields().field_count() != 0
+            if (rejects_unknown(video, kVideoConfigurationTags)
                 || !video.has_codec_resolution() || !video.has_frame_rate()
                 || !video.has_video_codec_type()
                 || video.video_codec_type() != shared::MEDIA_CODEC_VIDEO_H264_BP
@@ -68,7 +94,7 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
         }
         AudioConfiguration config;
         for (const auto& audio : wire.audio_configs()) {
-            if (audio.unknown_fields().field_count() != 0
+            if (rejects_unknown(audio, kAudioConfigurationTags)
                 || audio.number_of_bits() > 255 || audio.number_of_channels() > 255) {
                 return malformed();
             }
