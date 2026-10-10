@@ -163,6 +163,25 @@ the 5 removed/edited paths. Header retention is gated by exact original raw
 Git blob identity (`BLOB_MISMATCH`) in the checker; changing any header byte
 fails even if the inventory is edited too.
 
+## Test fixture provenance and limitations
+
+- `tests/fixtures/media/h264_720p30_baseline_90f.h264` (22,158 bytes, 90
+  frames, 1280x720 Baseline H.264; SHA-256
+  `0b34e280254d1b7d4832a2e8b2bb4325e3de24f228127cf6ac03e600749f2265`,
+  enforced by `tests/replay/test_fixture_qa.py`) was introduced by commit
+  `5e105d847008749887328228deb2563b51036fc2` ("test(media): add reproducible
+  synthetic H264 decode fixture", author Newton, 2026-10-05).
+- **Limitation (c6): origin asserted synthetic; generator not recorded.**
+  The commit added only the bitstream (no generator, no body text); searches
+  of the tree, the full git history and prior work sessions recover no
+  generating command or toolchain. Synthetic/project-authored origin is
+  asserted by the introducing commit and is not independently reproducible
+  from repository evidence. This is recorded as a known limitation; no
+  third-party media source is claimed or known.
+- H.264 bitstreams implicate patent pools rather than copyright; a 90-frame
+  synthetic fixture in a public source repository is treated as de minimis.
+  If the generator is ever recovered, record it here and retire this entry.
+
 ## Combined work licensing
 
 Project-owned code is GPL-3.0-or-later (root `LICENSE`). AASDK's headered
