@@ -126,7 +126,7 @@ notice), stated below.
 
 | Component | Version scope | Evidence path | Header coverage (2026-10-10 scan) |
 |---|---|---|---|
-| Project-owned code (`src/`, `include/`, `tools/`, `tests/`, `cmake/`) | GPL-3.0-or-later | root `LICENSE`; per-file `SPDX-License-Identifier: GPL-3.0-or-later` | 398 of 398 code files carry the header (209 backfilled 2026-10-10, r3) |
+| Project-owned code (`src/`, `include/`, `tools/`, `tests/`, `cmake/`) | GPL-3.0-or-later | root `LICENSE`; per-file `SPDX-License-Identifier: GPL-3.0-or-later` | 399 of 399 code files carry the header (count re-verified 2026-10-10: 209 backfilled in r3; 399 includes the 2026-10-10 credential-generator test tooling) |
 | AASDK per-file grant set | GPL-3.0-or-later ("either version 3 … or any later version") | e.g. `third_party/aasdk/src/Channel/Bluetooth/BluetoothService.cpp:1-16` | 200 of 566 tracked files (include/ 119, src/ 73, aasdk_proto/ 5, plus `Dockerfile`, `.github` script, `cmake_modules/DebPackageFilename.cmake`) |
 | AASDK in-file BSD modules | BSD-3-Clause (GPL-3-compatible, build-only) | `third_party/aasdk/cmake_modules/{Findlibusb-1.0.cmake,CodeCoverage.cmake}` and `cmake_modules_old/` copies, in-file text | 4 of 566 |
 | AASDK headerless material | no per-file grant; covered under upstream project-level `Readme.md` "GNU GPLv3" statement on current interpretation; later-version permission **not established** | `third_party/aasdk/protobuf/aap_protobuf/**/*.proto` (254, all compiled via `protobuf_generate_cpp`), `unit_test/` (24), build/meta/docs/scripts (84) | 362 of 566 |
