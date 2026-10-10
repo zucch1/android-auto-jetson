@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-License-Identifier: GPL-3.0-or-later
+
+  Android Auto receiver session D-Bus control contract, major version 1.
+
+  This file is the contract authority for org.custom.AndroidAutoReceiver1.
+  tools/ipc/dbus_contract.py validates it against the checked schema rules and
+  embeds it into the build as the runtime introspection; malformed or drifted
+  XML fails the build with a named diagnostic.
+
+  Service:  org.custom.AndroidAutoReceiver (owned by the receiver)
+  Object:   /org/custom/AndroidAutoReceiver
+  Surface:  control and status only. Audio/video payloads and every other
+            high-rate stream stay off D-Bus (the encoded-video channel is the
+            AF_UNIX contract in include/aa/ipc/VideoSocket.hpp, todo 22), and
+            this surface grants no receiver UI authority. One registered
+            session consumer holds projection control; authorization is by
+            D-Bus connection Unix UID plus consumer-name ownership
+            (include/aa/ipc/PeerCredentials.hpp).
+-->
+<node name="/org/custom/AndroidAutoReceiver">
+  <interface name="org.custom.AndroidAutoReceiver1">
+    <annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.0.0"/>
+
+    <!-- Registers caller as THE session consumer. Caller must own
+         consumer_name and match the active session user; only one consumer
+         may be registered at a time. -->
+    <method name="RegisterConsumer">
+      <arg name="consumer_name" type="s" direction="in"/>
+      <arg name="consumer_id" type="t" direction="out"/>
+    </method>
+
+    <!-- Drops the caller's registration (stopping projection first). -->
+    <method name="UnregisterConsumer">
+    </method>
+
+    <!-- Opens projection control for the registered consumer. -->
+    <method name="StartProjection">
+    </method>
+
+    <!-- Closes projection control. -->
+    <method name="StopProjection">
+    </method>
+
+    <!-- Requests the add-phone flow. Only the registered consumer may call
+         it. Returns a one-time request id and emits PairingRequest with that
+         id; no pairing window opens before ConfirmPhonePairing. -->
+    <method name="RequestAddPhone">
+      <arg name="request_id" type="t" direction="out"/>
+    </method>
+
+    <!-- Opens the pairing window for a pending request id. Only the same
+         consumer that requested it, for the same id. -->
+    <method name="ConfirmPhonePairing">
+      <arg name="request_id" type="t" direction="in"/>
+    </method>
+
+    <!-- Cancels a pending request or closes an open pairing window. -->
+    <method name="CancelPhonePairing">
+      <arg name="request_id" type="t" direction="in"/>
+    </method>
+
+    <!-- Forgets a previously paired phone (trust-store binding is todo 27). -->
+    <method name="ForgetPhone">
+      <arg name="phone_id" type="t" direction="in"/>
+    </method>
+
+    <!-- Contract state snapshot: projection state and active consumer. -->
+    <method name="GetState">
+      <arg name="projection_state" type="s" direction="out"/>
+      <arg name="consumer_id" type="t" direction="out"/>
+    </method>
+
+    <!-- Static capability map (name/value strings, low-rate). -->
+    <method name="GetCapabilities">
+      <arg name="capabilities" type="a{ss}" direction="out"/>
+    </method>
+
+    <!-- Consumer-reported display geometry (bounded, scalar only). -->
+    <method name="SetDisplayViewport">
+      <arg name="width" type="u" direction="in"/>
+      <arg name="height" type="u" direction="in"/>
+      <arg name="dpi" type="u" direction="in"/>
+    </method>
+
+    <!-- Liveness probe; returns the receiver monotonic clock in ns. -->
+    <method name="Ping">
+      <arg name="monotonic_ns" type="t" direction="out"/>
+    </method>
+
+    <!-- One-time pairing request id awaiting ConfirmPhonePairing. -->
+    <signal name="PairingRequest">
+      <arg name="request_id" type="t"/>
+    </signal>
+
+    <!-- The pairing window opened for this request id. -->
+    <signal name="PairingOpened">
+      <arg name="request_id" type="t"/>
+    </signal>
+
+    <!-- A pending request or open window closed for this request id. -->
+    <signal name="PairingClosed">
+      <arg name="request_id" type="t"/>
+    </signal>
+
+    <!-- Contract state changed; mirrors GetState. -->
+    <signal name="StateChanged">
+      <arg name="projection_state" type="s"/>
+      <arg name="consumer_id" type="t"/>
+    </signal>
+
+    <!-- Structured diagnostics surface: one low-rate event carrying stable
+         severity/event names and a numeric subject id (never raw phone,
+         Bluetooth, location or credential data; redaction contract is
+         task 19). -->
+    <signal name="DiagnosticEvent">
+      <arg name="severity" type="s"/>
+      <arg name="event" type="s"/>
+      <arg name="subject_id" type="t"/>
+    </signal>
+
+    <!-- SemVer contract metadata; major must equal the interface-name major. -->
+    <property name="ContractSemVer" type="s" access="read"/>
+  </interface>
+</node>
