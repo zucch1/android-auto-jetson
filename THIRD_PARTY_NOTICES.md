@@ -1,7 +1,13 @@
 # Third-Party Notices
 
-This repository vendors two upstream projects as pinned, unmodified source
-snapshots. This file is the license gate record consumed by
+This repository vendors two upstream projects. The ORIGINS are pinned,
+unmodified upstream commits; the downstream snapshots kept in this tree are a
+separate thing and are not uniformly unmodified -- they are explicitly
+modified where the sections below record it and are otherwise byte-identical
+(AASDK: the 2026-10-10 credential sanitization, recorded in
+`third_party/provenance/inventory.json` (`downstream_patches`) and
+`PROVENANCE.md`; OAA: an audited reference subset whose retained files are
+byte-identical to upstream). This file is the license gate record consumed by
 `tools/provenance/check.sh`; the `provenance-fact:` tokens below are
 machine-checked structural facts, not prose.
 
