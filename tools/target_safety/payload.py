@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Deterministic stdlib-only in-memory loader and remote payload assembly.
 
 Payload bytes are built from local source text and executed from stdin memory

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Failure-mode tests for the capability gate CLI."""
 from __future__ import annotations
 

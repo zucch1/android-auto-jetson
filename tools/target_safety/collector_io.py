@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Selector and original-pipe lifetime ownership for bounded collection.
 
 Owns the child's original stdout/stderr/stdin pipes independently of selector

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Protected metadata/content inventories with bounded no-follow reads."""
 from __future__ import annotations
 

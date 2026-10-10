@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # /// script
 # requires-python = ">=3.12"
 # dependencies = []
@@ -67,6 +68,15 @@ def main() -> int:
         case 'missing':
             (aasdk / 'Readme.md').rename(fixture / 'preserved-Readme.md')
             expected = 'MISSING_VENDORED_FILE'
+        case 'credential':
+            restored = aasdk / 'cert/headunit.key'
+            restored.parent.mkdir(parents=True, exist_ok=True)
+            restored.write_bytes(b'not the real bytes but a restored credential name\n')
+            expected = 'SANITIZED_FILE_RESTORED'
+        case 'sanitized-edit':
+            with (aasdk / 'src/Messenger/Cryptor.cpp').open('ab') as output:
+                output.write(b'\nmutation\n')
+            expected = 'SANITIZATION_MISMATCH'
         case 'mode':
             path = aasdk / 'Readme.md'
             path.chmod(path.stat().st_mode ^ 0o100)

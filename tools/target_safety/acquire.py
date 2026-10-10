@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """One inventoried, quiet-gated task-5 acquisition window in /tmp-only scratch.
 
 Selection, identity and input reads are bracketed by protected-path inventories.

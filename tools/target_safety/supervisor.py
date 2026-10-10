@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Unprivileged in-memory ceiling supervisor: reversible window around a guard child.
 
 The stdin entrypoint main() runs the window against the single exact setting and

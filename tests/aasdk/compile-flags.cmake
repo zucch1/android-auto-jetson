@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 file(READ "${BUILD}/compile_commands.json" commands)
 string(JSON count LENGTH "${commands}")
 math(EXPR last "${count} - 1")

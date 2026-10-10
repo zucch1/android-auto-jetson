@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 set -euo pipefail
 # Offline only. Invoke with bash; all three paths are explicit CLI arguments.
 script_dir="$(dirname -- "${BASH_SOURCE[0]}")"

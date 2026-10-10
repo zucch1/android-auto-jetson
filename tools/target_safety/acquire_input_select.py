@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Frozen package-selection policy: complete C++/GoogleTest ARM64 build input closure.
 
 Applies the frozen acquire-input-policy.json on the target: enumerate each

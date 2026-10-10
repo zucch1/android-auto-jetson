@@ -1,6 +1,6 @@
 # android-auto-jetson
 
-Public, GPL-3.0-or-later Android Auto receiver targeting NVIDIA Jetson.
+Public Android Auto receiver targeting NVIDIA Jetson.
 
 **Status: repository bootstrap scaffold.** No implementation exists yet; the
 files in this commit are governance and documentation skeletons only.
@@ -37,6 +37,13 @@ files in this commit are governance and documentation skeletons only.
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE) for the full GNU General Public
-License v3 text; project-owned code will carry "or any later version"
-notices as it lands.
+Project-owned code is **GPL-3.0-or-later**; see [LICENSE](LICENSE) for the
+full GNU General Public License v3 text, and the per-file "or any later
+version" notices that land with it. Third-party components are licensed as
+documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): AASDK carries
+per-file GPL-3.0-or-later grants (upstream ships no root LICENSE), and the
+OAA reference subset has unresolved version scope (explicit per-file SPDX
+headers say GPL-3.0-or-later; the upstream aggregate reads as GPL version 3).
+No blanket "or any later version" assertion is made for third-party material
+with unresolved version scope. The receiver combination is distributed under
+**GPL version 3**, a version permitted by every reading.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """No-follow iterative traversal producing the physical snapshot inventory.
 
 The walk records every physical entry below each root -- the root itself,

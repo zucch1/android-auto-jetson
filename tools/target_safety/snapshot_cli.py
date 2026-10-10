@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """CLI driver for the ppic/1 protected-path snapshot producer (measurement entry point).
 
 The producer (snapshot.py) had no command surface; this driver binds its typed

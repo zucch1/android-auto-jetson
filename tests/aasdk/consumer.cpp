@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include <aasdk/Messenger/Cryptor.hpp>
 #include <aasdk/Transport/SSLWrapper.hpp>
 #include <aap_protobuf/service/control/message/VersionResponseOptions.pb.h>

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Fail-closed interpretation of a deliberately narrow sudo -ll policy grammar.
 
 Two fully consumed shapes only: the explicit root passwordless command pair,

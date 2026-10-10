@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Frozen record types for the protected-path snapshot producer.
 
 Every record is immutable and slots-based; serialization to canonical

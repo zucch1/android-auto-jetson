@@ -1,12 +1,15 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # /// script
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
 # Run: python3 -B tests/transport/tls_run.py ROOT BINARY
-"""Run the task-16 TLS integration binary under a real HU credential (task 8).
+"""Run the task-16 TLS integration binary under a generated HU credential.
 
-Provisions HU_KEY_PATH from the pinned public reference, runs the gtest binary
-(real TLS handshake + encrypted round trip + unknown-peer), and checks that no
+Provisions HU_KEY_PATH from a synthetic neutral-DN self-signed credential
+(generated fresh per run by tools/tls/synthetic_credential.py; no third-party
+credential material exists in the tree), runs the gtest binary (real TLS
+handshake + encrypted round trip + unknown-peer), and checks that no
 credential material leaks into the output.
 """
 from pathlib import Path
@@ -18,15 +21,18 @@ import tempfile
 
 def main() -> int:
     root, binary = Path(sys.argv[1]), sys.argv[2]
-    reference = root / 'third_party' / 'compat-credentials'
     environment = dict(os.environ)
     with tempfile.TemporaryDirectory(prefix='transport-tls-') as directory:
-        bundle = Path(directory) / 'sensitive-credential.pem'
-        bundle.write_bytes((reference / 'headunit.crt').read_bytes() +
-                           (reference / 'headunit.key').read_bytes())
+        work = Path(directory)
+        subprocess.run([sys.executable, '-B', str(root / 'tools/tls/synthetic_credential.py'),
+                        str(work / 'generated')], capture_output=True, text=True, check=True)
+        generated = work / 'generated'
+        bundle = work / 'sensitive-credential.pem'
+        bundle.write_bytes((generated / 'synthetic-hu.crt').read_bytes() +
+                           (generated / 'synthetic-hu.key').read_bytes())
         bundle.chmod(0o600)
         environment['HU_KEY_PATH'] = str(bundle)
-        # Given: the pinned credential in a secure bundle. When: run the suite.
+        # Given: a generated synthetic credential in a secure bundle. When: run the suite.
         result = subprocess.run([binary], env=environment, capture_output=True,
                                 text=True, timeout=60, check=False)
         combined = result.stdout + result.stderr

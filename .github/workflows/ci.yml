@@ -23,6 +23,10 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          # Full history: tls_posture_key_scan_reencodings re-derives the known
+          # historical credential (read-only) from blob OIDs pinned in
+          # third_party/provenance/inventory.json to plant re-encodings.
+          fetch-depth: 0
       - name: Provision host-only AASDK and decode smoke dependencies
         run: |
           set -euo pipefail

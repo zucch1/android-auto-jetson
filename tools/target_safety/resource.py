@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Fail-closed resource readings, child address-space limit and abort triggers.
 
 Readiness readings gate the ceiling raise; runtime readings are abort triggers,

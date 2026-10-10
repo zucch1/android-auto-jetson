@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Every remote diagnostic write through one bounded nonblocking fd discipline.
 
 deliver() is the proven deadline-bound writer: nonblocking fd writes with an

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Protected-path snapshot producer: lossless no-follow tree inventory for before/after diff.
 
 This is the public entry point of the snapshot producer. It replaces

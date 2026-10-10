@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Conditional restoration independent of guard-stop failure; shared absolute budget.
 
 Also the home of the phase-aware diagnostic deadline algebra: every synchronous

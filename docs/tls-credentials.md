@@ -42,19 +42,28 @@ No full path, phone identifier or PEM material enters the new diagnostics.
 Parsed objects are RAII-owned until handed to Cryptor; its destructor releases
 TLS resources, including after failed initialization.
 
-The only committed credential is the existing public upstream compatibility
-reference. See [its label and scan ruling](../third_party/compat-credentials/README.md).
-It is not a production secret and is never installed or automatically loaded.
-Provisioning production identity and validating it on a phone remain out of scope.
+No credential is committed in this repository. The historical public
+compatibility reference (and every copy of it) was removed on 2026-10-10; see
+[the disposition note](../third_party/compat-credentials/README.md). Test
+material is generated fresh per run by `tools/tls/synthetic_credential.py`
+(a clearly labeled synthetic, neutral-DN, self-signed credential) and is never
+committed. It is not a production secret and is never installed or
+automatically loaded. Provisioning production identity and validating it on a
+phone remain out of scope.
 
 ## Immutable vendor and locked effective patch
 
-All 566 original AASDK files remain pinned by task-2 provenance. Staging first
+All 566 original AASDK files remain pinned by task-2 provenance: 564 are
+retained byte-identical and 2 credential files were deleted by the 2026-10-10
+sanitization record (`third_party/provenance/inventory.json`
+`downstream_patches`), which also records the credential-stripping edit to
+`src/Messenger/Cryptor.cpp`. Staging first
 verifies that gate and both patch digests. The existing GoogleTest patch remains
 a unified diff. `deps/patches/aasdk-tls-credentials.patch` is a reviewed JSON
 text-edit recipe (`aa-locked-source-patch/1`) rather than a unified diff: this
 avoids retaining removed private-key PEM markers in diff artifacts. Each file
-has a pinned original SHA-256; removals use unique delimiters, replacements must
+has a pinned original SHA-256 (the sanitized vendored bytes, post-credential);
+removals use unique delimiters, replacements must
 match exactly once, and deletes are digest-anchored. `tools/deps/tls_patch.py`
 applies it to memory, never to pristine sources. The effective stage identity
 includes the TLS patch SHA-256 and every resulting file/mode digest. Reuse checks
@@ -65,9 +74,11 @@ removed. Checked OpenSSL buffer-length conversions reject oversized lengths.
 The repository marker scanner excludes only the root operational paths `.git`,
 `.omo`, `build` and `.local`. All other content, including `__pycache__`
 directories at every depth and source directories named `build`, is scanned.
-Exact reference path/digest bindings and two separately labeled immutable upstream exceptions
-implement the parent ruling. No broad vendor or compatibility-directory PEM
-exemption exists. Effective-stage scanning has no exceptions.
+The scanner allowlists nothing: any private-key or certificate PEM block, any
+file named `headunit.key`/`headunit.crt`, and any byte-identical copy of the
+removed credential (digest denylist bound to the provenance sanitization
+record) fail the scan, which must prove absence. Effective-stage scanning has
+no exceptions.
 
 ## Executed host tests, not target acceptance
 
@@ -81,15 +92,16 @@ ctest --preset host-dev --output-on-failure
 ```
 
 The memory-BIO harness uses the built, patched AASDK Cryptor, not a mock. Its
-server pins the receiver reference certificate, requests client authentication,
+server pins the receiver test certificate, requests client authentication,
 checks the actual presented certificate and decrypts a test application record.
 Compatibility succeeds only with the approved predicate. Unknown, absent and
 revoked approval deny, as do inactive/deinitialized I/O. Verified-peer mode
-rejects both the untrusted reference peer and a self-signed peer certificate
-re-signed **in memory using the existing public reference key**; no new private
-key is generated. Credential mismatch tests mutate only a temporary public
-certificate modulus. Marker tests plant the existing reference PEM outside the
-allowlist and mutate digest-pinned exceptions.
+rejects both the untrusted test peer and a self-signed peer certificate
+re-signed **in memory using the generated synthetic test key**. Credential
+mismatch tests cross-pair two freshly generated synthetic credentials.
+Marker tests plant generated synthetic material under source-like paths and
+under the historical credential names; the scan must reject every plant and
+prove absence on the real tree.
 
 These tests establish host API/build behavior only. They do not qualify a real
 phone, Jetson, deployment installation, pairing store, production credentials,

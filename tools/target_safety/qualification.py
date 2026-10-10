@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Local-only source audit; shared receipt shape for stage1 qualification capture."""
 from __future__ import annotations
 

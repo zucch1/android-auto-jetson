@@ -22,7 +22,7 @@ sizes for excluded files. Their SHA-256 digests are anchored in
 Git's raw `blob <size>\0<bytes>` identity and checks its mode and size against
 these original listings. Thus upstream identity is independent of the
 self-written `inventory.json`. Every byte, including all upstream headers,
-must match. An invented AASDK root LICENSE, symlink, omitted file, extra file,
+must match except at the sanctioned sanitization paths recorded below. An invented AASDK root LICENSE, symlink, omitted file, extra file,
 OAA overlay or generated output in either source tree fails the gate.
 
 `inventory.json` is a deterministic derived report: original blob IDs, SHA-256
@@ -59,14 +59,53 @@ the retained AASDK snapshot is independently verified against original blobs.
 Fresh Git-listing reproduction and command exits are recorded in root task-2
 evidence. Private mutation fixtures are retained with unique temporary paths.
 
-## Downstream patch seam (task 3, not applied)
+## Downstream patch seam and sanitization record
 
-Both retained snapshots are unmodified; `downstream_patches` is empty. Task 3
-must keep original blob/listing identities and record any GoogleTest CMake
-pinning patch as a separately reviewable patch with path, original blob ID,
-patch SHA-256, resulting blob ID and resulting SHA-256. The task-2 checker
-currently rejects all changed upstream bytes; do not regenerate the original
-listing or silently bless downstream hashes to bypass it.
+### Effective-stage patches (applied to a staged copy, never to these trees)
+
+`deps/patches/aasdk-googletest.patch` (unified diff) and
+`deps/patches/aasdk-tls-credentials.patch` (`aa-locked-source-patch/1`
+digest-anchored JSON recipe) are applied only to the content-addressed
+effective build stage (`tools/deps/stage.py`); pristine vendored sources are
+never edited in place. Both patches keep original blob/listing identities and
+are recorded as separately reviewable artifacts with path, original SHA-256
+and patch SHA-256 bound in `deps/manifest.lock`.
+
+### Sanitization transformation (2026-10-10) — the vendored tree no longer byte-matches upstream
+
+The owner-approved license remediation removed every published copy of the
+historical head-unit credential from the shipped tree. The upstream ls-tree
+listings stay untouched as the authority for original identities; the
+sanctioned downstream transformation is recorded in
+`third_party/provenance/inventory.json` (`downstream_patches`) and enforced by
+`tools/provenance/check.py`. Format: path, original blob ID, original
+SHA-256, transformation ID, resulting blob ID and resulting SHA-256 (or
+`deleted`). Do not regenerate the original listing and do not bless further
+downstream hashes without a new sanctioned record.
+
+| Path | Original blob / sha256 | Transformation | Result |
+|---|---|---|---|
+| `third_party/aasdk/cert/headunit.crt` | `45ad6cc4fd9f…` / `85b5043a09b1…` | `delete-credential-copy-2026-10-10` | deleted |
+| `third_party/aasdk/cert/headunit.key` | `c2b2666a8021…` / `9e837a172a1e…` | `delete-credential-copy-2026-10-10` | deleted |
+| `third_party/aasdk/src/Messenger/Cryptor.cpp` | `71c679ff32e1…` / `af6d9f58d135…` | `strip-embedded-credential-2026-10-10` | blob `cce822d47b7e…`, sha256 `6c895a8ea672…` |
+| `third_party/compat-credentials/headunit.crt` | `45ad6cc4fd9f…` / `85b5043a09b1…` | `delete-credential-copy-2026-10-10` | deleted |
+| `third_party/compat-credentials/headunit.key` | `c2b2666a8021…` / `9e837a172a1e…` | `delete-credential-copy-2026-10-10` | deleted |
+
+`src/Messenger/Cryptor.cpp` keeps its upstream GPL-3.0-or-later header
+unchanged; the edit strips the embedded `cCertificate`/`cPrivateKey` string
+literals and replaces the credential-acquisition block with a fail-closed,
+`HU_KEY_PATH`-only loading path (`aa::tls::load_credentials()`), loader
+semantics otherwise unchanged. This is a documented downstream modification
+of an upstream GPL-3.0-or-later work (see the §5(a) dated notices in
+`deps/patches/`); it is **not** claimed to be upstream-identical. The two
+compat-credentials deletions cover project-added duplicate copies of the same
+bytes (not upstream-tracked). Historical copies remain in Git history up to
+`57f4045ebf2a…` (known exposure, open counsel question; see
+`third_party/compat-credentials/README.md`).
+
+The checker rejects any other divergence (`BLOB_MISMATCH`), any restored
+sanitized path (`SANITIZED_FILE_RESTORED`) and any altered resulting identity
+(`SANITIZATION_MISMATCH`).
 
 ## License gate and limits
 
