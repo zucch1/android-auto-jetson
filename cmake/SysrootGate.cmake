@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Cross-build gate (task 5). Configure-time: validate every manifest input hash before compiling,
 # bind the immutable cache to the manifest digest, and (observed mode only) enforce that the
 # hash-validated payload IS the link sysroot CMAKE_SYSROOT. Build-time: define aa_sysroot_hash_gate

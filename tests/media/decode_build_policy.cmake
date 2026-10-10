@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Hardware-free fixtures: metadata and generated build graph, never a private sysroot.
 cmake_minimum_required(VERSION 3.20)
 if(NOT ROOT OR NOT SCRATCH OR NOT CASE)

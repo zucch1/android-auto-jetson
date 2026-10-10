@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "discovery.hpp"
 #include "json_report.hpp"
 #include "metrics.hpp"

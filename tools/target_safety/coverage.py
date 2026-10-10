@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Establish complete two-root topology coverage before inventory reads."""
 from __future__ import annotations
 

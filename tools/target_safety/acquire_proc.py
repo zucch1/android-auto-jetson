@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Unprivileged bounded adapter for the owner-approved isolated proc helper."""
 from __future__ import annotations
 

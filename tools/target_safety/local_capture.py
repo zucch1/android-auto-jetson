@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Exclusive local transport bytes and fsynced lifecycle, not remote durability.
 
 The parent directory is trusted and already exists. Reservations survive failure;

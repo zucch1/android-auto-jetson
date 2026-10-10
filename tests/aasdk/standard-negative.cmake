@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Given: a real temporary target exercising the consumer's C++20 standard seam.
 string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef fixture_id)
 set(fixture "${BUILD}/aasdk-standard-${fixture_id}")

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Typed wire and record models shared by sizing evidence validation.
 
 Pure data definitions with no sibling imports: the strict sizing child

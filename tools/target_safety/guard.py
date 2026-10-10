@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Guard child process-group lifecycle: spawn, monotonic deadline, TERM/KILL/reap.
 
 The guard runs in its own session/process group so the supervisor can terminate

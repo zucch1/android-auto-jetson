@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Value types for the task-5 target acquisition route and its observation parse.
 
 Pure immutable record types (acquisition record, copied entries, observed

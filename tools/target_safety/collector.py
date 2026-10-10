@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Bounded multiplexed child stdin/stdout/stderr collection with hard caps.
 
 One pump replaces unbounded communicate() accumulation. Combined child output

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Child-limit ready handshake held before the ceiling raise.
 
 A bounded probe child installs the exact child-only RLIMIT_AS ceiling and

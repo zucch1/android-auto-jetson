@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Local Python executable adapter for deterministic proc/dpkg fixture readers."""
 from __future__ import annotations
 

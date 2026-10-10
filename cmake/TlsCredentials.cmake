@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 if(CMAKE_CROSSCOMPILING)
     message(STATUS "TLS posture qualification unavailable in cross-smoke mode")
     return()

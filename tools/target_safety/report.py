@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Guard-event parsing and the window receipt outcomes for independent review.
 
 Two strict, mode-bound acceptors exist: ceiling acceptance for prerequisite

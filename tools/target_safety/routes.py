@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Fixed receipt-name routes for the local stage1 driver; never a remote module.
 
 One table maps the exact `--receipt <path>` spelling onto one fixed route kind.

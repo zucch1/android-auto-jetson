@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Record-level discipline of the sizing child transcript.
 
 One well-formed typed record of the known sizing vocabulary and the hardened

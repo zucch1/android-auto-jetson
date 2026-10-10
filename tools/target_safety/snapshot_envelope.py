@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Canonical manifest envelope and exact equivalence for snapshot evidence.
 
 The manifest records schema version "ppic/1", task/window id, target

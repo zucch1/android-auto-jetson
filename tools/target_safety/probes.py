@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Enumerated read-only Jetson prerequisite observations inside a guard window."""
 from __future__ import annotations
 

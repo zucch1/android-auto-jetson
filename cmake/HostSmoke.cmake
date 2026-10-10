@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Explicit project-owned inventory; no vendor source globbing or ABI build.
 set(AA_HOST_SMOKE_SOURCES tests/host/smoke.cpp)
 foreach(source IN LISTS AA_HOST_SMOKE_SOURCES)
