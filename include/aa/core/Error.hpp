@@ -49,6 +49,9 @@ enum class ErrorCode : std::uint16_t {
     channel_not_registered = 400,
     channel_unsupported_capability = 401,
     channel_dispatch_failed = 402,
+    channel_caps_unsupported = 403,
+    channel_decode_unavailable = 404,
+    channel_decode_failed = 405,
 
     // ipc
     ipc_consumer_rejected = 500,
