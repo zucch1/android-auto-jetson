@@ -121,8 +121,17 @@ fails even if the inventory is edited too.
 
 ## Combined work licensing
 
-Project-owned code is GPL-3.0-or-later (root `LICENSE`). AASDK is
-GPL-3.0-or-later; the OAA reference material remains GPL-3.0-only. Distribution
-containing both can use GPL version 3, a version permitted by both licenses.
-The reference material is not relicensed to permit later GPL versions. The
-sources and original notices of both vendored components are provided in-tree.
+Project-owned code is GPL-3.0-or-later (root `LICENSE`). AASDK's headered
+files carry per-file GPL-3.0-or-later grants; the headerless AASDK material
+(including the compiled protobuf schemas) is covered under the upstream
+project-level "GNU GPLv3" Readme statement on the current interpretation,
+and a later-version permission for it is **not established**. The OAA
+reference material is dual-noted: the explicit upstream per-file later-version
+grants (**240 files carry `SPDX-License-Identifier: GPL-3.0-or-later`**) are
+preserved and not relicensed, while the upstream aggregate (`README.md`
+"GPLv3" plus the bare GPL-3.0 `LICENSE`) reads as GPL version 3 without
+later-version wording. Because version scope is unresolved for parts of the
+collection, **this distribution selects GPL version 3**, a version permitted
+by every reading; no blanket "or any later version" assertion is made for
+third-party material with unresolved version scope. The sources and original
+notices of both vendored components are provided in-tree.
