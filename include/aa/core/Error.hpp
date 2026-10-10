@@ -63,6 +63,8 @@ enum class ErrorCode : std::uint16_t {
     audio_sink_unavailable = 600,
     audio_format_unsupported = 601,
     audio_underrun = 602,
+    audio_decode_failed = 603,
+    audio_mic_disabled = 604,
 
     // trust
     trust_store_io = 700,
