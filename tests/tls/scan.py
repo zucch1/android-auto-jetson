@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
-# Run: python3 -B tests/tls/scan.py ROOT [--negative]
+# Run: python3 -B tests/tls/scan.py ROOT [--negative | --invalid-root CASE]
 """Assert ZERO credential copies remain and that the scanner still detects plants.
 
 Positive mode runs the shipped no-allowlist marker/digest/name scan against the
@@ -12,6 +12,10 @@ to the sanitization record in third_party/provenance/inventory.json. Negative
 mode plants credential-shaped material in a private fixture and requires
 rejection: private-key PEM blocks, certificate PEM blocks, the historical
 credential file names and planted copies under source-like directories.
+Invalid-root mode feeds the scanner broken scan inputs -- a nonexistent root,
+a regular-file root and a tree with an unreadable descendant directory -- and
+requires nonzero exit with no PASS proof for any of them: invalid inputs must
+never produce a false absence proof.
 """
 from pathlib import Path
 import hashlib
@@ -83,6 +87,37 @@ def plant_rejections(root: Path) -> None:
         marker.unlink()
 
 
+def invalid_root(root: Path, case: str) -> None:
+    scanner = root / 'tools/tls/scan.py'
+    with tempfile.TemporaryDirectory(prefix='tls-scan-input-') as directory:
+        fixture = Path(directory)
+        match case:
+            case 'nonexistent-root':
+                target = fixture / 'absent-root'
+                expected = 'tls-key-scan: FAIL invalid-root\n'
+            case 'regular-file-root':
+                target = fixture / 'regular-file'
+                target.write_bytes(b'not a scan root\n')
+                expected = 'tls-key-scan: FAIL invalid-root\n'
+            case 'unreadable-descendant':
+                target = fixture / 'tree'
+                (target / 'locked').mkdir(parents=True)
+                (target / 'locked' / 'hidden.txt').write_text('unscannable\n')
+                (target / 'visible.txt').write_text('visible\n')
+                (target / 'locked').chmod(0)
+                expected = 'tls-key-scan: FAIL unreadable-source\n'
+            case unknown:
+                raise AssertionError(f'unknown invalid-root case: {unknown}')
+        try:
+            result = run(scanner, target)
+        finally:
+            if case == 'unreadable-descendant':
+                (target / 'locked').chmod(0o700)
+        assert result.returncode != 0, (case, result)
+        assert result.stdout == expected, (case, result)
+        assert 'PASS' not in result.stdout and 'PASS' not in result.stderr, (case, result)
+
+
 def denied_digests(scanner: Path) -> set[str]:
     result = subprocess.run([sys.executable, '-B', str(scanner), '--print-denylist'],
                             capture_output=True, text=True, check=True)
@@ -94,6 +129,11 @@ def main() -> int:
     if '--negative' in sys.argv:
         plant_rejections(root)
         print('tls-key-scan-negative: PASS planted-marker-name-cert-rejected')
+        return 0
+    if '--invalid-root' in sys.argv:
+        case = sys.argv[sys.argv.index('--invalid-root') + 1]
+        invalid_root(root, case)
+        print(f'tls-key-scan-invalid-root: PASS {case}-rejected')
         return 0
     prove_absence(root)
     print('tls-key-scan-absence: PASS zero-credential-copies denylist-bound-to-provenance-record')

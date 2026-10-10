@@ -18,6 +18,10 @@ published in three copies each (original SHA-256 identities, recorded as the
 originals of the sanitization record in third_party/provenance/inventory.json).
 --print-denylist exposes those digests so tests can bind this gate to the
 provenance record.
+
+Inputs fail closed: the scan root must exist and be a directory, and any
+traversal or read error fails the scan. Absence is never reported for a
+missing, non-directory or incompletely traversed root.
 """
 from pathlib import Path
 import hashlib
@@ -36,7 +40,19 @@ EXCLUDED: Final = frozenset(('.git', '.omo', 'build', '.local'))
 
 
 def forbidden(root: Path) -> bool:
-    for directory, subdirectories, files in root.walk():
+    """Return True on forbidden material; fail closed on invalid or partial scans.
+
+    Raises ValueError when root is missing or is not a directory, and
+    propagates OSError from any traversal or read failure, so neither an
+    invalid root nor an incomplete traversal can be reported as clean.
+    """
+    if not root.is_dir():
+        raise ValueError(f'scan root is not a directory: {root}')
+
+    def raise_error(error: OSError) -> None:
+        raise error
+
+    for directory, subdirectories, files in root.walk(on_error=raise_error):
         if directory == root:
             subdirectories[:] = [name for name in subdirectories if name not in EXCLUDED]
             files = [name for name in files if name not in EXCLUDED]
@@ -65,6 +81,9 @@ def main() -> int:
         return 1
     try:
         rejected = forbidden(Path(arguments[0]).resolve())
+    except ValueError:
+        print('tls-key-scan: FAIL invalid-root')
+        return 1
     except OSError:
         print('tls-key-scan: FAIL unreadable-source')
         return 1

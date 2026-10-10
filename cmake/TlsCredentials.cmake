@@ -28,6 +28,10 @@ add_test(NAME tls_posture_key_scan COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tests/tls/scan.py" "${CMAKE_SOURCE_DIR}")
 add_test(NAME tls_posture_key_scan_negative COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tests/tls/scan.py" "${CMAKE_SOURCE_DIR}" --negative)
+foreach(case nonexistent-root regular-file-root unreadable-descendant)
+    add_test(NAME tls_posture_key_scan_input_${case} COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/tls/scan.py" "${CMAKE_SOURCE_DIR}" --invalid-root ${case})
+endforeach()
 add_executable(aa_tls_policy tests/tls/policy.cpp)
 target_link_libraries(aa_tls_policy PRIVATE aa_tls)
 set_target_properties(aa_tls_policy PROPERTIES
