@@ -57,8 +57,23 @@ namespace conformancewire {
 // ---------------------------------------------------------------------------
 inline const std::vector<std::byte> F_A_version_request_v1_1_payload =
     bytes({0x00, 0x01, 0x00, 0x01, 0x00, 0x01});
-// Frame: channel 0, flags 0x07 (PLAIN|CONTROL|BULK), size BE16 = 6.
+// CANONICAL frame: channel 0, flags 0x03 (PLAIN|SPECIFIC|BULK), size BE16 = 6.
+// Frame kind is SPECIFIC, not CONTROL (discrepancy D19, corrected 2026-10-10):
+// pinned aasdk ControlServiceChannel::sendVersionRequest constructs
+// MessageType::SPECIFIC (third_party/aasdk/src/Channel/Control/
+// ControlServiceChannel.cpp:37-48); the OAA 02 doc's "MessageType CONTROL"
+// annotation means control-CHANNEL message, not the frame-kind M bit. Live
+// S24 probe (SM-S928B / AA 17.7.663654, .omo/evidence/jetson-android-auto-
+// receiver/s24-probe-summary-2026-10-10.{json,md}): this form draws
+// VERSION_RESPONSE 1.7 STATUS_SUCCESS in 3-5 ms.
 inline const std::vector<std::byte> F_A_version_request_v1_1_frame =
+    bytes({0x00, 0x03, 0x00, 0x06, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01});
+// F-A2: the misannotation-derived CONTROL (0x07) variant of the SAME payload,
+// pinned so the wrong form cannot silently return (D24 dual-form discipline).
+// S24 probe evidence (same receipt, captures/arm-b): this phone's framer
+// IGNORES the 0x07 form - 8 frames at 1 s cadence, zero response bytes, zero
+// gearhead log lines - while the 0x03 form above is answered in 3-5 ms.
+inline const std::vector<std::byte> F_A2_version_request_v1_1_frame_control_variant =
     bytes({0x00, 0x07, 0x00, 0x06, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01});
 
 // ---------------------------------------------------------------------------
