@@ -108,6 +108,50 @@ machine-checked structural facts, not prose.
   (`OAA_OVERLAY_IN_AASDK`, `GENERATED_OUTPUT_IN_AASDK`) and
   `tests/provenance/isolation.sh` proves the guard on a disposable fixture.
 
+## Per-component license evidence
+
+Header-coverage counts were re-verified by a full file scan of the pinned
+trees on 2026-10-10. The earlier distribution-gate arithmetic
+("200 + 278 = 478 of 566") double-cast the headerless set as only the 254
+compiled schema files plus the 24 unit-test files and left 88 files
+unclassified; the true, complete classification of all 566 upstream-tracked
+AASDK files is **200 + 4 + 362 = 566** (per-file grant + in-file BSD + no
+notice), stated below.
+
+| Component | Version scope | Evidence path | Header coverage (2026-10-10 scan) |
+|---|---|---|---|
+| Project-owned code (`src/`, `include/`, `tools/`, `tests/`, `cmake/`) | GPL-3.0-or-later | root `LICENSE`; per-file `SPDX-License-Identifier: GPL-3.0-or-later` | 189 of 397 code files carry the header; remainder covered by the root README/License statement (per-file backfill tracked as r3) |
+| AASDK per-file grant set | GPL-3.0-or-later ("either version 3 … or any later version") | e.g. `third_party/aasdk/src/Channel/Bluetooth/BluetoothService.cpp:1-16` | 200 of 566 tracked files (include/ 119, src/ 73, aasdk_proto/ 5, plus `Dockerfile`, `.github` script, `cmake_modules/DebPackageFilename.cmake`) |
+| AASDK in-file BSD modules | BSD-3-Clause (GPL-3-compatible, build-only) | `third_party/aasdk/cmake_modules/{Findlibusb-1.0.cmake,CodeCoverage.cmake}` and `cmake_modules_old/` copies, in-file text | 4 of 566 |
+| AASDK headerless material | no per-file grant; covered under upstream project-level `Readme.md` "GNU GPLv3" statement on current interpretation; later-version permission **not established** | `third_party/aasdk/protobuf/aap_protobuf/**/*.proto` (254, all compiled via `protobuf_generate_cpp`), `unit_test/` (24), build/meta/docs/scripts (84) | 362 of 566 |
+| OAA reference subset | dual-noted (see Combined work licensing): per-file SPDX GPL-3.0-or-later preserved; aggregate "GPLv3" unresolved; distribution selects GPL version 3 | `oaa/**/*.proto:1` SPDX lines; vendored `LICENSE` (sha256 `3972dc97…`); vendored `README.md:239-243` | 240 of 248 `.proto` carry SPDX; 8 carry none (4 `RETRACTED` `oaa/input/` stubs, 3 `RETRACTED` `oaa/control/` stubs, `ChannelDescriptorData.proto`); + `LICENSE` + `README.md` = 250 files |
+| Canonical GPL-3.0 text | FSF GPL-3.0, 29 June 2007 | root `LICENSE`; `third_party/LICENSES/GPL-3.0.txt` (both sha256 `3972dc97…`) | n/a |
+| GoogleTest v1.15.2 (build/test, fetched not vendored) | BSD-3-Clause | `deps/manifest.json` pin (`b514bdc`, archive sha `7b42b4d6…`); upstream `LICENSE` at the pinned commit | n/a (test binaries link it statically) |
+| Sanitized credential paths (removed 2026-10-10) | no third-party grant ever existed (finding c3) | `third_party/provenance/inventory.json` `downstream_patches`; `third_party/compat-credentials/README.md` | 0 copies retained (scanner-enforced) |
+
+## Binary-distribution attribution (stub)
+
+Attributions that apply when binaries or packages are distributed (host or
+Jetson image; task 46 packaging). This is a stub with the verified component
+set from `deps/manifest.json` and `toolchains/jetson-sysroot-manifest.json`;
+it must be completed as a shipped `NOTICE`/attribution file before any binary
+release:
+
+| Component | License (as published upstream) | Where it attaches |
+|---|---|---|
+| GoogleTest v1.15.2 | BSD-3-Clause | test binaries (static) |
+| OpenSSL | Apache-2.0 | linked (TLS) |
+| Boost (system, log) | BSL-1.0 | linked |
+| libusb-1.0 | LGPL-2.1-or-later | linked |
+| GStreamer (+ plugins) | LGPL-2.1-or-later | linked/runtime |
+| Qt6 | LGPL/GPL (per module) | optional runtime |
+| protobuf | BSD-3-Clause | linked (generated + runtime) |
+| glibc | LGPL-2.1-or-later | runtime (sysroot) |
+| libstdc++ / GCC runtime | GPL-3.0-or-later with GCC Runtime Library Exception | runtime (sysroot) |
+| nvidia-l4t-gstreamer | proprietary (NVIDIA license; optional) | optional runtime, not redistributed by this repo |
+
+
+
 ## Aggregate copyright inventory
 
 Per-file retained upstream notice lines and SHA-256 / git-blob-oid content
