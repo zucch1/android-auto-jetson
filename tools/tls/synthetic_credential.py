@@ -7,7 +7,9 @@
 """Generate the synthetic, neutral-DN, self-signed head-unit test credential.
 
 Test material only. The output is generated fresh into OUTDIR (never into the
-source tree) and is clearly labeled synthetic: a neutral subject with no
+source tree, enforced: OUTDIR is resolved and any destination inside this
+repository is rejected before a single file is created or deleted) and is
+clearly labeled synthetic: a neutral subject with no
 third-party identity, self-signed, valid for the test window. It is NOT the
 historical public compatibility credential and must never be described as one.
 No credential bytes are committed anywhere in this repository; this script is
@@ -28,13 +30,22 @@ SUBJECT = ('/CN=android-auto-jetson-synthetic-hu'
            '/O=android-auto-jetson')
 CERT_NAME = 'synthetic-hu.crt'
 KEY_NAME = 'synthetic-hu.key'
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
 
 
 def generate(out_directory: Path) -> tuple[Path, Path]:
-    """Write a labeled synthetic certificate and private key; return paths."""
-    out_directory.mkdir(parents=True, exist_ok=True)
-    certificate = out_directory / CERT_NAME
-    key = out_directory / KEY_NAME
+    """Write a labeled synthetic certificate and private key; return paths.
+
+    Resolves the destination first and rejects any source-tree destination
+    before directory creation or deletion, so the never-into-the-source-tree
+    rule holds through symlinks and .. traversal too.
+    """
+    destination = out_directory.resolve()
+    if destination.is_relative_to(SOURCE_ROOT):
+        raise RuntimeError('synthetic-credential-source-tree-destination')
+    destination.mkdir(parents=True, exist_ok=True)
+    certificate = destination / CERT_NAME
+    key = destination / KEY_NAME
     for path in (certificate, key):
         if path.exists():
             path.unlink()
