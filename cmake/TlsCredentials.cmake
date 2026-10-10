@@ -28,6 +28,8 @@ add_test(NAME tls_posture_key_scan COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tests/tls/scan.py" "${CMAKE_SOURCE_DIR}")
 add_test(NAME tls_posture_key_scan_negative COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tests/tls/scan.py" "${CMAKE_SOURCE_DIR}" --negative)
+add_test(NAME tls_posture_key_scan_reencodings COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_SOURCE_DIR}/tests/tls/scan.py" "${CMAKE_SOURCE_DIR}" --reencodings)
 foreach(case nonexistent-root regular-file-root unreadable-descendant)
     add_test(NAME tls_posture_key_scan_input_${case} COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/tls/scan.py" "${CMAKE_SOURCE_DIR}" --invalid-root ${case})

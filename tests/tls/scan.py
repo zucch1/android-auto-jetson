@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
-# Run: python3 -B tests/tls/scan.py ROOT [--negative | --invalid-root CASE]
+# Run: python3 -B tests/tls/scan.py ROOT [--negative | --reencodings | --invalid-root CASE]
 """Assert ZERO credential copies remain and that the scanner still detects plants.
 
 Positive mode runs the shipped no-allowlist marker/digest/name scan against the
@@ -12,12 +12,22 @@ to the sanitization record in third_party/provenance/inventory.json. Negative
 mode plants credential-shaped material in a private fixture and requires
 rejection: private-key PEM blocks, certificate PEM blocks, the historical
 credential file names and planted copies under source-like directories.
+Reencodings mode is the adversarial bypass regression: it re-derives the
+recorded historical certificate/private key from the git blobs pinned in the
+sanitization record (read-only; the bytes match the recorded original_sha256
+identities and are never written into the source tree), then plants each
+recognized re-encoding -- openssl x509 -trustout TRUSTED CERTIFICATE PEM, raw
+DER, base64 of the original PEM, base64 of the historical key PEM, hex of the
+certificate DER, and the PKCS#1/PKCS#8 key DER shapes -- under unrelated
+filenames in a private fixture, and requires rejection (exit nonzero, no PASS)
+for every one of them. A benign control plant must still scan clean.
 Invalid-root mode feeds the scanner broken scan inputs -- a nonexistent root,
 a regular-file root and a tree with an unreadable descendant directory -- and
 requires nonzero exit with no PASS proof for any of them: invalid inputs must
 never produce a false absence proof.
 """
 from pathlib import Path
+import base64
 import hashlib
 import json
 import subprocess
@@ -124,11 +134,100 @@ def denied_digests(scanner: Path) -> set[str]:
     return set(result.stdout.split())
 
 
+def historical_identity(root: Path) -> tuple[bytes, bytes]:
+    """Re-derive the recorded historical certificate and key bytes read-only.
+
+    The sanitization record pins each removed copy's original git blob OID and
+    original_sha256; those blobs remain in repository history (the documented
+    known exposure). This reads them with git cat-file, proves the bytes match
+    the recorded identities, and never writes them into the source tree. A
+    shallow clone without the blobs fails closed here rather than skipping.
+    """
+    inventory = json.loads((root / 'third_party/provenance/inventory.json').read_bytes())
+    identities: dict[str, bytes] = {}
+    for record in inventory['downstream_patches']:
+        if record['resulting'] != 'deleted' or record['original_sha256'] in identities:
+            continue
+        blob = subprocess.run(
+            ['git', '-C', str(root), 'cat-file', 'blob', record['original_git_blob_oid']],
+            capture_output=True, check=False)
+        assert blob.returncode == 0, (
+            'historical blob unavailable (full history required): '
+            f"{record['original_git_blob_oid']}", blob.stderr)
+        data = blob.stdout
+        assert hashlib.sha256(data).hexdigest() == record['original_sha256'], record
+        identities[record['original_sha256']] = data
+    assert len(identities) == 2, identities.keys()
+    certificate = next(body for body in identities.values()
+                       if body.startswith(b'-----BEGIN CERTIFICATE'))
+    key = next(body for body in identities.values() if body not in (certificate,))
+    return certificate, key
+
+
+def reencoding_rejections(root: Path) -> None:
+    scanner = root / 'tools/tls/scan.py'
+    certificate, key = historical_identity(root)
+    with tempfile.TemporaryDirectory(prefix='tls-reenc-') as directory:
+        base = Path(directory)
+        material = base / 'material'
+        fixture = base / 'fixture'
+        material.mkdir()
+        fixture.mkdir()
+        cert_pem = material / 'input.crt'
+        key_pem = material / 'input.key'
+        cert_pem.write_bytes(certificate)
+        key_pem.write_bytes(key)
+        trusted = subprocess.run(['openssl', 'x509', '-trustout', '-in', str(cert_pem)],
+                                 capture_output=True, check=True).stdout
+        cert_der = subprocess.run(['openssl', 'x509', '-outform', 'DER', '-in', str(cert_pem)],
+                                  capture_output=True, check=True).stdout
+        key_der = subprocess.run(['openssl', 'pkey', '-outform', 'DER', '-in', str(key_pem)],
+                                 capture_output=True, check=True).stdout
+        key_der_pkcs1 = subprocess.run(['openssl', 'rsa', '-outform', 'DER', '-in', str(key_pem)],
+                                       capture_output=True, check=True).stdout
+        denied_der = set(subprocess.run(
+            [sys.executable, '-B', str(scanner), '--print-der-denylist'],
+            capture_output=True, text=True, check=True).stdout.split())
+        expected_der = {hashlib.sha256(body).hexdigest()
+                        for body in (cert_der, key_der, key_der_pkcs1)}
+        assert denied_der == expected_der, (denied_der, expected_der)
+        cases = {
+            'docs/retro-notes.md': trusted,
+            'assets/level-map.bin': cert_der,
+            'src/aux/lookup-table.inc': base64.b64encode(certificate),
+            'include/aux/defaults.dat': base64.b64encode(key),
+            'tests/data/sample.hexdump': cert_der.hex().encode(),
+            'third_party/aasdk/docs/misc.txt': base64.b64encode(key_der_pkcs1),
+            'config/local-cache.b64': base64.b64encode(cert_der),
+            'notes/todo.txt': key_der.hex().encode(),
+        }
+        control = fixture / 'docs' / 'retro-notes.md'
+        control.parent.mkdir(parents=True, exist_ok=True)
+        control.write_text('benign planning notes; no credential material\n')
+        clean = run(scanner, fixture)
+        assert clean.returncode == 0, clean
+        assert 'PASS' in clean.stdout, clean
+        control.unlink()
+        for name, payload in cases.items():
+            target = fixture / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+            result = run(scanner, fixture)
+            assert result.returncode != 0, (name, result)
+            assert result.stdout == 'tls-key-scan: FAIL credential-material-present\n', (name, result)
+            assert 'PASS' not in result.stdout and 'PASS' not in result.stderr, (name, result)
+            target.unlink()
+
+
 def main() -> int:
     root = Path(sys.argv[1]).resolve()
     if '--negative' in sys.argv:
         plant_rejections(root)
         print('tls-key-scan-negative: PASS planted-marker-name-cert-rejected')
+        return 0
+    if '--reencodings' in sys.argv:
+        reencoding_rejections(root)
+        print('tls-key-scan-reencodings: PASS historical-reencodings-rejected-under-unrelated-names')
         return 0
     if '--invalid-root' in sys.argv:
         case = sys.argv[sys.argv.index('--invalid-root') + 1]
