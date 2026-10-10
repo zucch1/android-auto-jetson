@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Authoritative remote deadline envelope: one allocation inside the GNU timeout.
 
 The GNU client timeout (stage1.SSH_TIMEOUT_SECONDS, 960 s) starts LOCALLY,

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Live target readers for the acquisition route: dpkg/kernel/JetPack identity.
 
 Only invoked in a real target window; the route and selection tests fake this seam.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # /// script
 # requires-python = ">=3.12"
 # dependencies = []
@@ -50,7 +51,7 @@ SOURCES: Final = (
 PATCH_SHA256: Final = 'd27b1c7099041042ad255c2cd16b7d61588b6b6aaa93b4c7d1b0c0ffb35b7091'
 PATCH_PATH: Final = 'patches/aasdk-googletest.patch'
 TLS_PATCH_PATH: Final = 'patches/aasdk-tls-credentials.patch'
-TLS_PATCH_SHA256: Final = 'cbe5c72d48290482c5f77628477f2d4150231e5e27ceeee7853dae99caa42c93'
+TLS_PATCH_SHA256: Final = 'b5b3751f405aca3a4d2d90833253f23655bed6316197c8a82b9eda36218695da'
 PACKAGES: Final = frozenset((
     'protobuf-compiler', 'libprotobuf-dev', 'libprotobuf32t64', 'libboost-dev',
     'libboost-system-dev', 'libboost-log-dev', 'libssl-dev', 'libssl3t64',

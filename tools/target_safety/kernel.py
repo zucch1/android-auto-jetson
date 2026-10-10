@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Bounded Linux inotify ownership and fail-closed event parsing."""
 from __future__ import annotations
 

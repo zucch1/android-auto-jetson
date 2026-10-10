@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Local driver for the task-5 target acquisition route (never runs on target).
 
 Freezes the acquisition payload as a deterministic source tar of the

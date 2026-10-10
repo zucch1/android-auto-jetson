@@ -37,7 +37,7 @@ enable_testing()
 add_test(NAME provenance_check
     COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tools/provenance/check.py"
             --root "${CMAKE_SOURCE_DIR}")
-foreach(case baseline overlay content header extra generated license gpl inventory listing symlink missing)
+foreach(case baseline overlay content header extra generated license gpl inventory listing symlink missing credential sanitized-edit)
     add_test(NAME provenance_isolation_${case}
         COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tests/provenance/scenarios.py"
                 "${CMAKE_SOURCE_DIR}" "${case}")

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Per-root capability probe and small filesystem helpers for snapshots.
 
 Filesystem support for xattrs/ACLs/inode flags is probed once per root and

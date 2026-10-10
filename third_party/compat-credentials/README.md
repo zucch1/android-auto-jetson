@@ -1,39 +1,52 @@
-# Public upstream Android Auto compatibility reference
+# Credential disposition note (2026-10-10)
 
-`headunit.crt` and `headunit.key` are the verbatim runtime PEM bytes from
-Cryptor.cpp at AASDK 9bf6adf933665dee26532201719fac14a047ccf1. This is a
-**public compatibility reference, not a production secret**. No runtime default
-loads these files and no install target deploys them. Tests explicitly copy and
-combine them into an owner-only file. Production credential provisioning is out
-of scope; never commit a production private key.
+**The compatibility credential previously kept here was removed from this
+distribution.** No certificate or private key bytes are committed in this
+repository anymore, in this directory or anywhere else.
 
-HU_KEY_PATH must explicitly name a regular, effective-user-owned, single-link
-0600 file containing the certificate followed by the unencrypted private key.
-The final path component must not be a symlink. Provision parent directories
-under operator control. Missing, unreadable, malformed, insecure or mismatched
-credentials fail closed; diagnostics report only a failure class, never paths
-or PEM contents.
+## What was removed
 
-TLS presents the receiver/head-unit credential to the phone and encrypts the
-session; it does not establish phone approval. The real-phone mode is explicitly
-`encryption-only-compatibility`. Phones are not assumed to present verifiable
-peer certificates. A session requires the injected approved-phone predicate;
-the absent predicate denies. Task 27 will supply its approved-phone store and
-pairing policy. There is no permissive environment-variable approval switch.
-`verified-peer-test-only` is an explicit API configuration for hermetic tests,
-not a requirement or mode change for approved-phone qualification.
+On 2026-10-10 the owner-approved license remediation deleted every published
+copy of the historical public Android Auto head-unit credential:
 
-## Marker-scan ruling
+- `third_party/compat-credentials/headunit.crt` and `headunit.key` (this
+  directory),
+- `third_party/aasdk/cert/headunit.crt` and `headunit.key`,
+- the embedded `cCertificate` / `cPrivateKey` string literals in
+  `third_party/aasdk/src/Messenger/Cryptor.cpp` (replaced with a fail-closed,
+  `HU_KEY_PATH`-only loading path).
 
-The reference allowlist uses exact paths and SHA-256 digests. Exactly two
-immutable upstream artifacts are separately excepted by exact path and digest:
-`third_party/aasdk/src/Messenger/Cryptor.cpp` and
-`third_party/aasdk/cert/headunit.key`. Task 2 pins all 566 vendor files byte for
-byte. Any modification fails both provenance and the scan's digest exception;
-these are not credentials consumed by the effective build. The locked TLS patch
-removes the embedded literals, bundled credential files, and automatic install
-behavior from the content-addressed effective stage. An effective-stage scan
-has no upstream exceptions. Everything else with a private-key PEM marker is
-rejected, including planted files and modified allowlisted references.
+Exact removal identities (original Git blob IDs and SHA-256 digests) are
+recorded in `third_party/provenance/inventory.json` under
+`downstream_patches`, and the transformation is described in `PROVENANCE.md`.
+`tools/tls/scan.py` now enforces zero credential copies with no allowlist.
 
-Upstream copyright and GPL-3.0-or-later terms apply; see THIRD_PARTY_NOTICES.md.
+## Why it was removed
+
+The certificate was issued to a third-party identity (JVC Kenwood, under
+Google Automotive Link) and no standalone redistribution grant from the
+certificate subject or issuer exists. The distribution-gate audit of
+2026-10-10 recorded this as finding c3 (terms technically unclear) and the
+owner chose staged removal over continued redistribution. A responsible
+disclosure draft recommending key rotation/denylist is filed with the
+remediation receipt (`.omo/evidence/jetson-android-auto-receiver/`).
+
+## Known historical exposure (open counsel item)
+
+The same bytes remain in this repository's Git history at commits up to and
+including `57f4045ebf2a74064a27cbfab8441154c170b26f`, and in upstream
+`opencardev/aasdk@9bf6adf` (`src/Messenger/Cryptor.cpp` literals and
+`cert/`). Per the owner decision of 2026-10-09 ("forward-only + counsel
+review") history is not rewritten; the exposure is documented as a known
+exposure with an open counsel question on whether historical remediation is
+required before any public release or tag.
+
+## Current posture
+
+- Production identity is operator-supplied through `HU_KEY_PATH` only; the
+  loader fails closed (see `docs/tls-credentials.md`).
+- Test material is a generated synthetic, neutral-DN, self-signed credential
+  (`tools/tls/synthetic_credential.py`); it is never committed and is not a
+  third-party identity.
+- Upstream copyright and GPL-3.0-or-later terms apply to the remaining
+  upstream content; see `THIRD_PARTY_NOTICES.md`.

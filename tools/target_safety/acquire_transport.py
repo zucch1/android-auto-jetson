@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Runnable finite local driver: prepare -> transport -> retrieve -> verify.
 
 One bounded target window over a single SSH connection (BatchMode, no retry,

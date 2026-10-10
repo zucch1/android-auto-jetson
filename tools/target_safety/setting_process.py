@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Five-second total setting subprocess boundary, including failure recovery."""
 from __future__ import annotations
 

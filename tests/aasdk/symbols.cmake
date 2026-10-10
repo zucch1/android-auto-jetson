@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 foreach(binary "${CONSUMER}" "${SDK}" "${PROTO}")
     execute_process(COMMAND "${NM}" -C --defined-only "${binary}"
         RESULT_VARIABLE result OUTPUT_VARIABLE defined ERROR_VARIABLE error)

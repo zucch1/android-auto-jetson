@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Lossless filename-byte codec and compared-identity helpers for snapshots.
 
 Encoding scheme (manifest schema "ppic/1"): every filename-bearing value

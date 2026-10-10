@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Bounded content hashing and persistent-metadata capture for snapshot entries.
 
 Reads are no-follow and bounded: every regular file is hashed from its

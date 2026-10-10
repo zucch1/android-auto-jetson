@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Finite acquisition transport lifecycle and concurrent pipe capture."""
 from __future__ import annotations
 

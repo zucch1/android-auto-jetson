@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Shared helpers for capability gate CLI tests."""
 from __future__ import annotations
 

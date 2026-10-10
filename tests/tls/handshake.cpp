@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/tls/Credentials.hpp>
 #include <aa/tls/Policy.hpp>
 #include <aasdk/Messenger/Cryptor.hpp>

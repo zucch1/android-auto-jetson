@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # /// script
 # requires-python = ">=3.12"
 # dependencies = []
@@ -10,7 +11,8 @@ import re
 import stat
 from typing import Final
 
-from inventory import SOURCES, Entry, ProvenanceError, Source, blob_oid, entries, render, sha256
+from inventory import (SOURCES, UPSTREAM_SANITIZED, Entry, ProvenanceError, Source,
+                       blob_oid, entries, render, sha256)
 
 GPL_SHA256: Final = '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986'
 GENERATED: Final = re.compile(
@@ -21,8 +23,13 @@ GENERATED: Final = re.compile(
 NOTICE_FACTS: Final = (
     'aasdk-root-license-missing',
     'fallback-f1xpl-aasdk-9ee5283245a630afce3a441696b9dde484ecbcd9',
-    'headunit-credential-public-reference',
+    'headunit-credential-removed-2026-10-10',
     'oaa-reference-only',
+)
+# Project-added credential copies: must stay absent (sanitization record).
+PROJECT_CREDENTIAL_PATHS: Final = (
+    'third_party/compat-credentials/headunit.crt',
+    'third_party/compat-credentials/headunit.key',
 )
 
 
@@ -59,6 +66,20 @@ def source_gate(root: Path, source: Source, original: tuple[Entry, ...]) -> list
         data = path.read_bytes()
         oid = blob_oid(data)
         entry = expected.get(relative)
+        sanitization = UPSTREAM_SANITIZED.get(relative)
+        if sanitization is not None:
+            if entry is None or entry.oid != sanitization.original_git_blob_oid:
+                failures.append(ProvenanceError('SANITIZATION_MISMATCH', diagnostic_path))
+                continue
+            if sanitization.resulting_sha256 is None:
+                failures.append(ProvenanceError('SANITIZED_FILE_RESTORED', diagnostic_path))
+                continue
+            if (sha256(data) != sanitization.resulting_sha256
+                    or oid != sanitization.resulting_git_blob_oid):
+                failures.append(ProvenanceError('SANITIZATION_MISMATCH', diagnostic_path))
+                continue
+            actual.add(relative)
+            continue
         if entry is None:
             code = 'EXTRA_VENDORED_FILE'
             if source.name == 'aasdk' and (relative in oaa_paths or oid in oaa_oids):
@@ -74,7 +95,9 @@ def source_gate(root: Path, source: Source, original: tuple[Entry, ...]) -> list
         git_mode = '100755' if mode & stat.S_IXUSR else '100644'
         if git_mode != entry.mode:
             failures.append(ProvenanceError('MODE_MISMATCH', diagnostic_path))
-    for relative in sorted(expected.keys() - actual):
+    missing = expected.keys() - actual - {
+        path for path, item in UPSTREAM_SANITIZED.items() if item.resulting_sha256 is None}
+    for relative in sorted(missing):
         failures.append(ProvenanceError('MISSING_VENDORED_FILE', f'{source.destination}/{relative}'))
     return failures
 
@@ -89,6 +112,10 @@ def check(root: Path) -> list[ProvenanceError]:
     invented = root / 'third_party/aasdk/LICENSE'
     if invented.exists() or invented.is_symlink():
         failures.append(ProvenanceError('INVENTED_LICENSE_PRESENT', 'third_party/aasdk/LICENSE'))
+    for relative in PROJECT_CREDENTIAL_PATHS:
+        target = root / relative
+        if target.exists() or target.is_symlink():
+            failures.append(ProvenanceError('SANITIZED_FILE_RESTORED', relative))
     gpl = root / 'third_party/LICENSES/GPL-3.0.txt'
     if gpl.is_symlink():
         failures.append(ProvenanceError('SYMLINK_REJECTED', str(gpl.relative_to(root))))
@@ -133,7 +160,7 @@ def main() -> int:
     if failures:
         print(f'provenance-check: FAIL violations={len(failures)}')
         return 1
-    print('provenance-check: PASS aasdk=566 oaa=250 original-blobs=headers-retained')
+    print('provenance-check: PASS aasdk=564 sanitized=3 oaa=250 credential-copies=0')
     return 0
 
 

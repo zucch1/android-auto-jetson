@@ -94,6 +94,10 @@ The existing public synthetic fixture is retained, not replaced:
 - SHA-256 `0b34e280254d1b7d4832a2e8b2bb4325e3de24f228127cf6ac03e600749f2265`
 - 22,158 bytes, 90 frames, 1280x720 Baseline H.264
 
+Provenance limitation: origin asserted synthetic; generator not recorded
+(no generating command exists in the tree, history or work-session record;
+see the limitations register in `THIRD_PARTY_NOTICES.md`).
+
 Its nominal 30 fps filename describes intended replay pacing, not negotiated
 frame rate (the existing stream decodes with `framerate=0/1`). One complete
 90-frame replay at 30 fps has about 59,088 encoded bits/s; shorter replay

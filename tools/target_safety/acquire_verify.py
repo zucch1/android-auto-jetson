@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Local validation of complete returned acquisition evidence and copied bytes."""
 from __future__ import annotations
 

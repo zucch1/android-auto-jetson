@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Topology-only sizing guard: complete protect, rechecks, drain and close only.
 
 No inventory, content open, Git, package, prerequisite or acquisition call

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Supplemental read-only git evidence for discovered repositories.
 
 The physical inventory stays authoritative; git output is supplemental.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Strict topology-sizing evidence validation: child transcript and wire sections.
 
 Every nonblank child stdout line must be a well-formed typed record of the

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Reversible inotify ceiling setting boundary with reconciliation.
 
 No atomic sysctl CAS exists. The boundary reads/writes only the exact approved

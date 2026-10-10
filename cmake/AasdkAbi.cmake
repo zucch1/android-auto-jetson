@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Native qualification only: the frozen cross sysroot has no AASDK development inputs.
 if(CMAKE_CROSSCOMPILING)
     message(STATUS "AASDK ABI qualification unavailable in cross-smoke mode")

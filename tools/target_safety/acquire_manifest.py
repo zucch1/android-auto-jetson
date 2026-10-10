@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Assemble the `aa-sysroot-1` manifest from an observed acquisition record.
 
 Local-only driver step (never bundled into the target payload): it reuses the

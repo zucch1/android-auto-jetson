@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Consumer-side manifest validation and before/after protected-path diff.
 
 Validates "ppic/1" snapshot manifests written by the producer

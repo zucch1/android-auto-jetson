@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Decode probe target development metadata (task 9).
 # Native builds: host GStreamer development metadata is mandatory; discovery fails closed (REQUIRED).
 # Cross builds (jetson-aarch64): target GStreamer development metadata must come from the

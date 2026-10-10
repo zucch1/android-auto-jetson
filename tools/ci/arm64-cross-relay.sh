@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # arm64-cross-relay.sh — owner-machine relay for the private observed-sysroot cross smoke.
 #
 # Just-in-time usage: run this BEFORE each squash merge of the delivery chain. After a

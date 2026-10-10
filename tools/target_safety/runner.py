@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Local transport: a bounded subprocess in its own process group.
 
 Owns the child process group (SSH when wired remotely) and preserves partial
