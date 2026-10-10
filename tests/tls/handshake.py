@@ -3,7 +3,11 @@
 # dependencies = []
 # ///
 # Run: python3 -B tests/tls/handshake.py ROOT BINARY CASE
-"""Check real Cryptor process exits, TLS mode labeling and redacted denials."""
+"""Check real Cryptor process exits, TLS mode labeling and redacted denials.
+
+Test identity is generated fresh per run by tools/tls/synthetic_credential.py
+(a clearly labeled synthetic, neutral-DN, self-signed credential).
+"""
 from pathlib import Path
 import os
 import subprocess
@@ -23,12 +27,16 @@ EXPECTED: Final = {
 
 def main() -> int:
     root, binary, case = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-    # Given: only the pinned public reference, explicitly copied to a secure bundle.
-    reference = root / 'third_party/compat-credentials'
+    # Given: only generated synthetic test material, explicitly copied to a secure bundle.
     environment = dict(os.environ)
     with tempfile.TemporaryDirectory(prefix='tls-handshake-') as directory:
-        bundle = Path(directory) / 'sensitive-credential.pem'
-        bundle.write_bytes((reference / 'headunit.crt').read_bytes() + (reference / 'headunit.key').read_bytes())
+        work = Path(directory)
+        subprocess.run([sys.executable, '-B', str(root / 'tools/tls/synthetic_credential.py'),
+                        str(work / 'generated')], capture_output=True, text=True, check=True)
+        generated = work / 'generated'
+        bundle = work / 'sensitive-credential.pem'
+        bundle.write_bytes((generated / 'synthetic-hu.crt').read_bytes() +
+                           (generated / 'synthetic-hu.key').read_bytes())
         bundle.chmod(0o600)
         environment['HU_KEY_PATH'] = str(bundle)
         # When: drive the production Cryptor against a memory-BIO server.

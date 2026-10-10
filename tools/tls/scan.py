@@ -3,64 +3,74 @@
 # dependencies = []
 # ///
 # Run: python3 -B tools/tls/scan.py ROOT
-"""Reject private-key PEM markers except exact public-reference/upstream blobs."""
+#     python3 -B tools/tls/scan.py --print-denylist
+"""Prove absence of head-unit credential copies: no allowlist, zero tolerance.
+
+Rejects (with no exceptions anywhere in the scanned tree):
+- any private-key or certificate PEM block (no credential material is committed),
+- any file named headunit.key or headunit.crt (the historical credential names),
+- any byte-identical copy of the removed 2026-10-10 credential (digest denylist),
+- any symlink.
+
+The digest denylist pins the two distinct historical byte strings that were
+published in three copies each (original SHA-256 identities, recorded as the
+originals of the sanitization record in third_party/provenance/inventory.json).
+--print-denylist exposes those digests so tests can bind this gate to the
+provenance record.
+"""
 from pathlib import Path
 import hashlib
 import re
 import sys
 from typing import Final
 
-# These two upstream exceptions cannot smuggle changes: the task-2 566-file
-# provenance gate and these SHA-256 identities both require the original bytes.
-PINNED: Final = {
-    'third_party/compat-credentials/headunit.key':
-        '9e837a172a1eef5b05cda9df9d086753639648a17f76c2c939bcbd094aa972f2',
-    'third_party/aasdk/cert/headunit.key':
-        '9e837a172a1eef5b05cda9df9d086753639648a17f76c2c939bcbd094aa972f2',
-    'third_party/aasdk/src/Messenger/Cryptor.cpp':
-        'af6d9f58d135229a0ef1de3a09caf59b32a3cf064c0198d4a82626ca2fc2be9d',
-}
-CERT_PATH: Final = 'third_party/compat-credentials/headunit.crt'
-CERT_DIGEST: Final = '85b5043a09b1ba9464f745e6917bdbaa2bc582fe48cb727a7787c1a832a773e4'
-MARKER: Final = re.compile(rb'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----')
+FORBIDDEN_DIGESTS: Final = frozenset((
+    '9e837a172a1eef5b05cda9df9d086753639648a17f76c2c939bcbd094aa972f2',
+    '85b5043a09b1ba9464f745e6917bdbaa2bc582fe48cb727a7787c1a832a773e4',
+))
+FORBIDDEN_NAMES: Final = frozenset(('headunit.key', 'headunit.crt'))
+MARKER: Final = re.compile(
+    rb'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----|-----BEGIN[ ]CERTIFICATE-----')
 EXCLUDED: Final = frozenset(('.git', '.omo', 'build', '.local'))
 
 
 def forbidden(root: Path) -> bool:
-    """Scan source files; generated build/test fixtures are a separate stage gate."""
-    certificate = root / CERT_PATH
-    if (certificate.is_symlink() or not certificate.is_file() or
-            hashlib.sha256(certificate.read_bytes()).hexdigest() != CERT_DIGEST):
-        return True
     for directory, subdirectories, files in root.walk():
         if directory == root:
             subdirectories[:] = [name for name in subdirectories if name not in EXCLUDED]
             files = [name for name in files if name not in EXCLUDED]
         for name in files:
             path = directory / name
-            relative = path.relative_to(root)
             if path.is_symlink():
                 return True
-            data = path.read_bytes()
-            pinned = PINNED.get(relative.as_posix())
-            digest = hashlib.sha256(data).hexdigest()
-            if pinned is not None and digest != pinned:
+            if name in FORBIDDEN_NAMES:
                 return True
-            if MARKER.search(data) and digest != pinned:
+            data = path.read_bytes()
+            if hashlib.sha256(data).hexdigest() in FORBIDDEN_DIGESTS:
+                return True
+            if MARKER.search(data):
                 return True
     return False
 
 
 def main() -> int:
+    arguments = sys.argv[1:]
+    if arguments == ['--print-denylist']:
+        for digest in sorted(FORBIDDEN_DIGESTS):
+            print(digest)
+        return 0
+    if len(arguments) != 1:
+        print('tls-key-scan: FAIL usage', file=sys.stderr)
+        return 1
     try:
-        rejected = forbidden(Path(sys.argv[1]).resolve())
+        rejected = forbidden(Path(arguments[0]).resolve())
     except OSError:
         print('tls-key-scan: FAIL unreadable-source')
         return 1
     if rejected:
-        print('tls-key-scan: FAIL forbidden-private-key-marker')
+        print('tls-key-scan: FAIL credential-material-present')
         return 1
-    print('tls-key-scan: PASS digest-pinned-public-reference-only')
+    print('tls-key-scan: PASS zero-credential-copies no-allowlist')
     return 0
 
 

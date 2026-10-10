@@ -3,10 +3,14 @@
 # dependencies = []
 # ///
 # Run: python3 -B tests/tls/credentials.py ROOT PROBE CASE
-"""Drive HU_KEY_PATH failures through a real credential-loading process."""
+"""Drive HU_KEY_PATH failures through a real credential-loading process.
+
+Test identity is generated fresh per run by tools/tls/synthetic_credential.py
+(a clearly labeled synthetic, neutral-DN, self-signed credential); no
+third-party credential material exists in the tree to load.
+"""
 from enum import StrEnum
 from pathlib import Path
-import base64
 import os
 import subprocess
 import sys
@@ -27,15 +31,21 @@ class Case(StrEnum):
     TRAILING = 'trailing'
 
 
+def synthetic(root: Path, directory: Path) -> tuple[bytes, bytes]:
+    subprocess.run([sys.executable, '-B', str(root / 'tools/tls/synthetic_credential.py'),
+                    str(directory)], capture_output=True, text=True, check=True)
+    return ((directory / 'synthetic-hu.crt').read_bytes(),
+            (directory / 'synthetic-hu.key').read_bytes())
+
+
 def main() -> int:
     root, probe, case = Path(sys.argv[1]), sys.argv[2], Case(sys.argv[3])
-    # Given: only the existing public reference private key; no key generation.
-    reference = root / 'third_party/compat-credentials'
-    certificate = (reference / 'headunit.crt').read_bytes()
-    key = (reference / 'headunit.key').read_bytes()
     environment = dict(os.environ)
     with tempfile.TemporaryDirectory(prefix='tls-credential-') as directory:
-        bundle = Path(directory) / 'sensitive-name.pem'
+        work = Path(directory)
+        credential = work / 'generated-a'
+        certificate, key = synthetic(root, credential)
+        bundle = work / 'sensitive-name.pem'
         bundle.write_bytes(certificate + key)
         bundle.chmod(0o600)
         environment['HU_KEY_PATH'] = str(bundle)
@@ -59,15 +69,8 @@ def main() -> int:
                 bundle.write_bytes(b'not PEM\n')
                 expected = 'malformed'
             case Case.MISMATCH:
-                # Mutate only the public modulus in the reference certificate DER.
-                lines = certificate.splitlines()
-                der = bytearray(base64.b64decode(b''.join(lines[1:-1])))
-                modulus = bytes.fromhex('cf75d6636751fc7e589b71ba4d3a18ee')
-                offset = der.index(modulus)
-                der[offset + 8] ^= 1
-                encoded = base64.b64encode(der)
-                pem = b'\n'.join([lines[0], *(encoded[i:i + 64] for i in range(0, len(encoded), 64)), lines[-1]]) + b'\n'
-                bundle.write_bytes(pem + key)
+                other_certificate, _ = synthetic(root, work / 'generated-b')
+                bundle.write_bytes(other_certificate + key)
                 expected = 'mismatch'
             case Case.SYMLINK:
                 link = bundle.with_name('link.pem')

@@ -8,7 +8,7 @@
       "upstream_tree": "19fbb172a1f7390e4f6618018029de8b7f10c3b0",
       "destination": "third_party/aasdk",
       "upstream_ls_tree_sha256": "9327631eeae914a72eee8aa59aa639d07ec655b7b2e1fd90a4aafd367fd4521a",
-      "vendored_count": 566,
+      "vendored_count": 564,
       "excluded_count": 0,
       "files": [
         {
@@ -585,26 +585,6 @@
           "original_object_type": "blob",
           "original_git_blob_oid": "429467a2d8b89609dd1e9029d24672832bc51a01",
           "sha256": "73f7d67eadd4619276d655a4597529e14c9be79d27994bfb2d2f67b27e3c3bcd",
-          "notice_lines": []
-        },
-        {
-          "path": "cert/headunit.crt",
-          "mode": "100644",
-          "size": 1159,
-          "original_git_object_oid": "45ad6cc4fd9fe202fa4e83c98bcc214f11b7332e",
-          "original_object_type": "blob",
-          "original_git_blob_oid": "45ad6cc4fd9fe202fa4e83c98bcc214f11b7332e",
-          "sha256": "85b5043a09b1ba9464f745e6917bdbaa2bc582fe48cb727a7787c1a832a773e4",
-          "notice_lines": []
-        },
-        {
-          "path": "cert/headunit.key",
-          "mode": "100644",
-          "size": 1675,
-          "original_git_object_oid": "c2b2666a80217d4c1d64d8a9fe85ac39a62016ce",
-          "original_object_type": "blob",
-          "original_git_blob_oid": "c2b2666a80217d4c1d64d8a9fe85ac39a62016ce",
-          "sha256": "9e837a172a1eef5b05cda9df9d086753639648a17f76c2c939bcbd094aa972f2",
           "notice_lines": []
         },
         {
@@ -5832,7 +5812,8 @@
           "original_git_object_oid": "71c679ff32e1c457925a201beb4a17fd96d05bd2",
           "original_object_type": "blob",
           "original_git_blob_oid": "71c679ff32e1c457925a201beb4a17fd96d05bd2",
-          "sha256": "af6d9f58d135229a0ef1de3a09caf59b32a3cf064c0198d4a82626ca2fc2be9d",
+          "sha256": "6c895a8ea672225bb750ee6cc2d19add84fdc66f5f5fbe3393ef271372f7b4b7",
+          "sanitization": "strip-embedded-credential-2026-10-10",
           "notice_lines": [
             "// Copyright (C) 2018 f1x.studio (Michal Szwaj)",
             "// Copyright (C) 2024 CubeOne (Simon Dean - simon.dean@cubeone.co.uk)",
@@ -29258,5 +29239,67 @@
     "the \"copyright\" line and a pointer to where the full notice is found.": 1,
     "your copyrighted material outside their relationship with you.": 1
   },
-  "downstream_patches": []
+  "downstream_patches": [
+    {
+      "path": "cert/headunit.crt",
+      "component": "aasdk",
+      "upstream_tracked": true,
+      "transformation": "delete-credential-copy-2026-10-10",
+      "original_git_blob_oid": "45ad6cc4fd9fe202fa4e83c98bcc214f11b7332e",
+      "original_sha256": "85b5043a09b1ba9464f745e6917bdbaa2bc582fe48cb727a7787c1a832a773e4",
+      "resulting": "deleted",
+      "resulting_git_blob_oid": null,
+      "resulting_sha256": null,
+      "note": "Published head-unit credential copy removed; see third_party/compat-credentials/README.md."
+    },
+    {
+      "path": "cert/headunit.key",
+      "component": "aasdk",
+      "upstream_tracked": true,
+      "transformation": "delete-credential-copy-2026-10-10",
+      "original_git_blob_oid": "c2b2666a80217d4c1d64d8a9fe85ac39a62016ce",
+      "original_sha256": "9e837a172a1eef5b05cda9df9d086753639648a17f76c2c939bcbd094aa972f2",
+      "resulting": "deleted",
+      "resulting_git_blob_oid": null,
+      "resulting_sha256": null,
+      "note": "Published head-unit credential copy removed; see third_party/compat-credentials/README.md."
+    },
+    {
+      "path": "src/Messenger/Cryptor.cpp",
+      "component": "aasdk",
+      "upstream_tracked": true,
+      "transformation": "strip-embedded-credential-2026-10-10",
+      "original_git_blob_oid": "71c679ff32e1c457925a201beb4a17fd96d05bd2",
+      "original_sha256": "af6d9f58d135229a0ef1de3a09caf59b32a3cf064c0198d4a82626ca2fc2be9d",
+      "resulting": "sanitized",
+      "resulting_git_blob_oid": "cce822d47b7ee11e8806478d7f10cd01aa3ee1b9",
+      "resulting_sha256": "6c895a8ea672225bb750ee6cc2d19add84fdc66f5f5fbe3393ef271372f7b4b7",
+      "note": "Embedded head-unit credential literals removed and replaced with a fail-closed HU_KEY_PATH-only loading path (aa::tls::load_credentials()); loader semantics unchanged. License header retained."
+    },
+    {
+      "path": "third_party/compat-credentials/headunit.crt",
+      "component": "project",
+      "upstream_tracked": false,
+      "transformation": "delete-credential-copy-2026-10-10",
+      "original_git_blob_oid": "45ad6cc4fd9fe202fa4e83c98bcc214f11b7332e",
+      "original_sha256": "85b5043a09b1ba9464f745e6917bdbaa2bc582fe48cb727a7787c1a832a773e4",
+      "resulting": "deleted",
+      "resulting_git_blob_oid": null,
+      "resulting_sha256": null,
+      "note": "Published head-unit credential copy removed (project-added duplicate of the upstream cert/headunit.crt bytes)."
+    },
+    {
+      "path": "third_party/compat-credentials/headunit.key",
+      "component": "project",
+      "upstream_tracked": false,
+      "transformation": "delete-credential-copy-2026-10-10",
+      "original_git_blob_oid": "c2b2666a80217d4c1d64d8a9fe85ac39a62016ce",
+      "original_sha256": "9e837a172a1eef5b05cda9df9d086753639648a17f76c2c939bcbd094aa972f2",
+      "resulting": "deleted",
+      "resulting_git_blob_oid": null,
+      "resulting_sha256": null,
+      "note": "Published head-unit credential copy removed (project-added duplicate of the upstream cert/headunit.key bytes)."
+    }
+  ],
+  "downstream_patches_note": "Sanctioned downstream sanitization of 2026-10-10: the vendored tree no longer byte-matches upstream at these paths. Original identities are anchored by the untouched upstream ls-tree listings; resulting identities are pinned in tools/provenance/inventory.py and enforced by tools/provenance/check.py. Every other vendored byte still matches upstream exactly. See PROVENANCE.md and .omo/evidence/jetson-android-auto-receiver/license-remediation-2026-10-10.json."
 }

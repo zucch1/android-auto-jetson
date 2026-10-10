@@ -48,6 +48,68 @@ NOTICE: Final = re.compile(r'copyright|spdx|general public license|licensed unde
 
 
 @dataclass(frozen=True, slots=True)
+class Sanitization:
+    """Sanctioned downstream transformation of a vendored path (2026-10-10).
+
+    The head-unit credential copies were removed from the distribution by the
+    owner-approved license remediation. The vendored tree therefore no longer
+    byte-matches upstream at these paths; the original upstream identities stay
+    anchored in the untouched ls-tree listings and are echoed here together
+    with the exact resulting identities. This record is the authority the
+    checker enforces: no other divergence from upstream is permitted.
+    """
+    path: str
+    upstream_tracked: bool
+    transformation: str
+    original_git_blob_oid: str
+    original_sha256: str
+    resulting_git_blob_oid: str | None  # None = file deleted
+    resulting_sha256: str | None
+    note: str
+
+
+SANITIZATIONS: Final = (
+    Sanitization(
+        'cert/headunit.crt', True, 'delete-credential-copy-2026-10-10',
+        '45ad6cc4fd9fe202fa4e83c98bcc214f11b7332e',
+        '85b5043a09b1ba9464f745e6917bdbaa2bc582fe48cb727a7787c1a832a773e4',
+        None, None,
+        'Published head-unit credential copy removed; see third_party/compat-credentials/README.md.'),
+    Sanitization(
+        'cert/headunit.key', True, 'delete-credential-copy-2026-10-10',
+        'c2b2666a80217d4c1d64d8a9fe85ac39a62016ce',
+        '9e837a172a1eef5b05cda9df9d086753639648a17f76c2c939bcbd094aa972f2',
+        None, None,
+        'Published head-unit credential copy removed; see third_party/compat-credentials/README.md.'),
+    Sanitization(
+        'src/Messenger/Cryptor.cpp', True, 'strip-embedded-credential-2026-10-10',
+        '71c679ff32e1c457925a201beb4a17fd96d05bd2',
+        'af6d9f58d135229a0ef1de3a09caf59b32a3cf064c0198d4a82626ca2fc2be9d',
+        'cce822d47b7ee11e8806478d7f10cd01aa3ee1b9',
+        '6c895a8ea672225bb750ee6cc2d19add84fdc66f5f5fbe3393ef271372f7b4b7',
+        'Embedded head-unit credential literals removed and replaced with a '
+        'fail-closed HU_KEY_PATH-only loading path (aa::tls::load_credentials()); '
+        'loader semantics unchanged. License header retained.'),
+    Sanitization(
+        'third_party/compat-credentials/headunit.crt', False, 'delete-credential-copy-2026-10-10',
+        '45ad6cc4fd9fe202fa4e83c98bcc214f11b7332e',
+        '85b5043a09b1ba9464f745e6917bdbaa2bc582fe48cb727a7787c1a832a773e4',
+        None, None,
+        'Published head-unit credential copy removed (project-added duplicate of '
+        'the upstream cert/headunit.crt bytes).'),
+    Sanitization(
+        'third_party/compat-credentials/headunit.key', False, 'delete-credential-copy-2026-10-10',
+        'c2b2666a80217d4c1d64d8a9fe85ac39a62016ce',
+        '9e837a172a1eef5b05cda9df9d086753639648a17f76c2c939bcbd094aa972f2',
+        None, None,
+        'Published head-unit credential copy removed (project-added duplicate of '
+        'the upstream cert/headunit.key bytes).'),
+)
+UPSTREAM_SANITIZED: Final = {item.path: item for item in SANITIZATIONS if item.upstream_tracked}
+PROJECT_SANITIZED: Final = {item.path: item for item in SANITIZATIONS if not item.upstream_tracked}
+
+
+@dataclass(frozen=True, slots=True)
 class Entry:
     mode: str
     oid: str
@@ -108,6 +170,27 @@ def render(root: Path) -> str:
             }
             if source.includes(entry.path):
                 record['original_git_blob_oid'] = entry.oid
+                sanitization = UPSTREAM_SANITIZED.get(entry.path)
+                if sanitization is not None:
+                    if entry.oid != sanitization.original_git_blob_oid:
+                        raise ProvenanceError('SANITIZATION_MISMATCH', entry.path)
+                    target = root / source.destination / entry.path
+                    if sanitization.resulting_sha256 is None:
+                        if target.exists() or target.is_symlink():
+                            raise ProvenanceError('SANITIZED_FILE_RESTORED', entry.path)
+                        continue
+                    data = target.read_bytes()
+                    if (sha256(data) != sanitization.resulting_sha256
+                            or blob_oid(data) != sanitization.resulting_git_blob_oid):
+                        raise ProvenanceError('SANITIZATION_MISMATCH', entry.path)
+                    notices = [line.strip() for line in data.decode('utf-8', errors='replace').splitlines()
+                               if NOTICE.search(line)]
+                    record['sha256'] = sanitization.resulting_sha256
+                    record['sanitization'] = sanitization.transformation
+                    record['notice_lines'] = list(notices)
+                    copyright_lines.update(line for line in notices if 'copyright' in line.casefold())
+                    files.append(record)
+                    continue
                 data = (root / source.destination / entry.path).read_bytes()
                 if blob_oid(data) != entry.oid:
                     raise ProvenanceError('BLOB_MISMATCH', entry.path)
@@ -127,10 +210,35 @@ def render(root: Path) -> str:
             'vendored_count': len(files), 'excluded_count': len(excluded),
             'files': files, 'excluded': excluded,
         })
+    downstream_patches: list[JsonValue] = []
+    for sanitization in sorted(SANITIZATIONS, key=lambda item: item.path):
+        if not sanitization.upstream_tracked:
+            target = root / sanitization.path
+            if target.exists() or target.is_symlink():
+                raise ProvenanceError('SANITIZED_FILE_RESTORED', sanitization.path)
+        downstream_patches.append({
+            'path': sanitization.path,
+            'component': 'aasdk' if sanitization.upstream_tracked else 'project',
+            'upstream_tracked': sanitization.upstream_tracked,
+            'transformation': sanitization.transformation,
+            'original_git_blob_oid': sanitization.original_git_blob_oid,
+            'original_sha256': sanitization.original_sha256,
+            'resulting': 'deleted' if sanitization.resulting_sha256 is None else 'sanitized',
+            'resulting_git_blob_oid': sanitization.resulting_git_blob_oid,
+            'resulting_sha256': sanitization.resulting_sha256,
+            'note': sanitization.note,
+        })
     document: JsonValue = {
         'schema': 'aa-provenance-2', 'components': components,
         'copyright_lines': dict(sorted(copyright_lines.items())),
-        'downstream_patches': [],
+        'downstream_patches': downstream_patches,
+        'downstream_patches_note': (
+            'Sanctioned downstream sanitization of 2026-10-10: the vendored tree no longer '
+            'byte-matches upstream at these paths. Original identities are anchored by the '
+            'untouched upstream ls-tree listings; resulting identities are pinned in '
+            'tools/provenance/inventory.py and enforced by tools/provenance/check.py. '
+            'Every other vendored byte still matches upstream exactly. See PROVENANCE.md '
+            'and .omo/evidence/jetson-android-auto-receiver/license-remediation-2026-10-10.json.'),
     }
     return json.dumps(document, indent=2, ensure_ascii=True) + '\n'
 

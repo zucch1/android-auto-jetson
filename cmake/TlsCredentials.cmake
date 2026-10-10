@@ -21,7 +21,8 @@ foreach(case valid unset empty unreadable insecure malformed mismatch symlink ha
                 "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:aa_credential_probe>" "${case}")
 endforeach()
 add_test(NAME tls_posture_reference COMMAND "${Python3_EXECUTABLE}" -B
-    "${CMAKE_SOURCE_DIR}/tests/tls/reference.py" "${CMAKE_SOURCE_DIR}")
+    "${CMAKE_SOURCE_DIR}/tests/tls/reference.py" "${CMAKE_SOURCE_DIR}"
+    "$<TARGET_FILE:aa_credential_probe>" "$<TARGET_FILE:aa_tls_policy>")
 add_test(NAME tls_posture_key_scan COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tests/tls/scan.py" "${CMAKE_SOURCE_DIR}")
 add_test(NAME tls_posture_key_scan_negative COMMAND "${Python3_EXECUTABLE}" -B
