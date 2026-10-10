@@ -7,6 +7,7 @@ set(AA_CORE_SOURCES
     src/core/Logging.cpp
     src/core/SessionThread.cpp
     src/session/StateMachine.cpp
+    src/channels/Services.cpp
     src/protocol/ServiceValidation.cpp
     src/config/Validate.cpp)
 set(AA_CORE_TEST_SOURCES
