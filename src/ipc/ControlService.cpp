@@ -79,6 +79,7 @@ core::Result<void> ControlService::unregister_consumer(const BusName& caller) {
         events_.emit(StateChanged{ProjectionState::stopped, consumer});
     }
     for (const auto request : gate_.close_all()) {
+        phones_.pairing_cancelled(request);
         events_.emit(PairingClosed{request});
     }
     registered_.reset();
@@ -135,10 +136,26 @@ core::Result<core::PairingRequestId> ControlService::request_add_phone(const Bus
     if (!admitted.has_value()) {
         return admitted.error();
     }
+    // Expiry reap + gate release PRECEDE gate allocation: an expired request
+    // must give its one-time gate slot back (and emit exactly one
+    // PairingClosed) before a new request can be admitted, or dead pairings
+    // would hold the admission budget hostage until restart.
+    for (const auto expired : phones_.reap_expired()) {
+        (void)gate_.cancel({active.value().consumer, active.value().name}, expired);
+        events_.emit(PairingClosed{expired});
+    }
     const auto request = gate_.request({active.value().consumer, active.value().name});
     if (!request.has_value()) {
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", 0});
         return request.error();
+    }
+    const auto bound = phones_.pairing_requested(request.value());
+    if (!bound.has_value()) {
+        // No presented phone identity: the one-time id dies with the request
+        // and the trust store is untouched (fail closed).
+        (void)gate_.cancel({active.value().consumer, active.value().name}, request.value());
+        events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", 0});
+        return bound.error();
     }
     events_.emit(PairingRequested{request.value()});
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_requested",
@@ -163,6 +180,16 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller,
             DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return opened.error();
     }
+    const auto approved = phones_.pairing_confirmed(request);
+    if (!approved.has_value()) {
+        // Expired or unbound confirm: roll the gate back so a dead pairing
+        // request can never reopen, and persist nothing.
+        (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+        events_.emit(PairingClosed{request});
+        events_.emit(
+            DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
+        return approved.error();
+    }
     events_.emit(PairingOpened{request});
     events_.emit(
         DiagnosticEmitted{DiagnosticSeverity::info, "pairing_opened", request.value});
@@ -185,6 +212,7 @@ core::Result<void> ControlService::cancel_phone_pairing(const BusName& caller,
             DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return closed.error();
     }
+    phones_.pairing_cancelled(request);
     events_.emit(PairingClosed{request});
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_closed", request.value});
     return {};

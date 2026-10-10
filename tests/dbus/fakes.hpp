@@ -101,7 +101,38 @@ public:
         return {};
     }
 
+    [[nodiscard]] core::Result<void> pairing_requested(core::PairingRequestId request) override {
+        requested.push_back(request);
+        return request_binding;
+    }
+
+    [[nodiscard]] core::Result<core::PhoneId> pairing_confirmed(
+        core::PairingRequestId request) override {
+        confirmed.push_back(request);
+        if (!confirm_result.has_value()) {
+            return confirm_result.error();
+        }
+        return core::PhoneId{next_phone_id++};
+    }
+
+    void pairing_cancelled(core::PairingRequestId request) override {
+        cancelled.push_back(request);
+    }
+
+    [[nodiscard]] std::vector<core::PairingRequestId> reap_expired() override {
+        const std::vector<core::PairingRequestId> expired = reapable;
+        reapable.clear();
+        return expired;
+    }
+
     std::vector<core::PhoneId> forgotten{};
+    std::vector<core::PairingRequestId> requested{};
+    std::vector<core::PairingRequestId> confirmed{};
+    std::vector<core::PairingRequestId> cancelled{};
+    std::vector<core::PairingRequestId> reapable{};
+    core::Result<void> request_binding{};
+    core::Result<core::PhoneId> confirm_result{core::PhoneId{1}};
+    std::uint64_t next_phone_id{1};
 };
 
 // Minimal dummy consumer client: one connection identity driving the control

@@ -87,9 +87,23 @@ public:
     virtual void emit(const ControlEvent& event) = 0;
 };
 
-// ForgetPhone seam: the trust-store binding (phone id -> identity erase) is
-// todo 27 and plugs in here; the control surface owns only the authorization
-// gate and typed id validation around it.
+// Trust-store seam (task 21 forget path, task 27 approval flow). The control
+// surface owns only the authorization gate, the one-time request-id gate and
+// typed id validation; every trust-store mutation is forwarded here so the
+// store changes ONLY after ConfirmPhonePairing for the SAME one-time request
+// id. Typed minimal extension over the task-21 forget-only seam (task 27):
+//   - pairing_requested  : a request id was issued; bind the presented phone
+//     identity and start the pairing window. Rejects (and nothing is written)
+//     when no phone identity is presenting itself.
+//   - pairing_confirmed  : the same request id was confirmed within the
+//     window; approve-once and persist. Late confirms are rejected and NOT
+//     persisted.
+//   - pairing_cancelled  : request/window closed without any store change.
+//   - reap_expired       : return (and drop) request ids whose pairing window
+//     just expired WITHOUT persisting anything. The caller must release the
+//     gate entries for the returned ids and emit exactly one PairingClosed
+//     each; expired ids are propagated here so the one-time gate can never
+//     keep a dead pairing request consuming admission capacity.
 class PhoneDirectory {
 public:
     virtual ~PhoneDirectory() = default;
@@ -100,6 +114,12 @@ public:
     PhoneDirectory& operator=(PhoneDirectory&&) = delete;
 
     [[nodiscard]] virtual core::Result<void> forget(core::PhoneId phone) = 0;
+    [[nodiscard]] virtual core::Result<void> pairing_requested(
+        core::PairingRequestId request) = 0;
+    [[nodiscard]] virtual core::Result<core::PhoneId> pairing_confirmed(
+        core::PairingRequestId request) = 0;
+    virtual void pairing_cancelled(core::PairingRequestId request) = 0;
+    [[nodiscard]] virtual std::vector<core::PairingRequestId> reap_expired() = 0;
 };
 
 // The active session user the caller's Unix UID must equal. Production fills
