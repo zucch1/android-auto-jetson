@@ -20,6 +20,7 @@ def main() -> int:
     # Given: private fixtures are retained, never shared or deleted.
     fixture = Path(tempfile.mkdtemp(prefix=f'deps-{case}-'))
     shutil.copytree(root / 'deps', fixture / 'deps')
+    shutil.copytree(root / 'toolchains', fixture / 'toolchains')
     manifest = fixture / 'deps/manifest.json'
     lock = fixture / 'deps/manifest.lock'
     data = json.loads(manifest.read_text())
@@ -72,9 +73,19 @@ def main() -> int:
             with manifest.open('ab') as stream:
                 stream.write(b' ')
             expected = 'LOCK_MISMATCH'
+        case 'target-digest':
+            data['target_binding']['sysroot_manifest_sha256'] = '0' * 64
+            expected = 'TARGET_BINDING\ttarget_binding.sysroot_manifest_sha256'
+        case 'target-packages':
+            data['target_binding']['package_versions'][0]['version'] = '0.0-0'
+            expected = 'TARGET_BINDING\ttarget_binding.package_versions'
+        case 'target-status':
+            data['target_binding']['status'] = 'pending-task5-extraction'
+            expected = 'MALFORMED_VALUE\ttarget_binding.status'
         case _:
             raise AssertionError(f'Unknown scenario: {case}')
-    if case in ('missing-source', 'source-sha', 'malformed-sha', 'version', 'missing-package'):
+    if case in ('missing-source', 'source-sha', 'malformed-sha', 'version', 'missing-package',
+                'target-digest', 'target-packages', 'target-status'):
         manifest.write_text(json.dumps(data))
         # Rebind only the fixture lock: schema/pin validation must still reject it.
         record = json.loads(lock.read_text())

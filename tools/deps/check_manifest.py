@@ -61,6 +61,9 @@ PACKAGES: Final = frozenset((
     'qt6-base-dev', 'qt6-declarative-dev', 'nvidia-l4t-gstreamer',
     'cmake', 'ninja-build', 'pkg-config', 'libabsl-dev',
 ))
+TARGET_SYSROOT_MANIFEST: Final = 'toolchains/jetson-sysroot-manifest.json'
+TARGET_SYSROOT_SHA256: Final = 'aa57014c31017139b63b917878a77ee16968aa64b30a10a624f0ba5f68d8d3d9'
+REQUIRED_COMPONENTS: Final = ['protobuf', 'Boost', 'OpenSSL', 'libusb', 'GStreamer', 'Qt6']
 VERSION: Final = re.compile(r'(?:[0-9]+:)?[0-9][0-9A-Za-z.+~]*(?:-[0-9A-Za-z.+~]+)*')
 
 
@@ -142,7 +145,47 @@ def load(path: Path) -> Mapping[str, JsonValue]:
     return mapping(value, str(path))
 
 
-def validate_manifest(document: Mapping[str, JsonValue]) -> None:
+def target_identity(value: JsonValue) -> tuple[str, str, str, str]:
+    record = mapping(value, 'package_versions[]')
+    return (text(record.get('name'), 'package.name'),
+            text(record.get('version'), 'package.version'),
+            text(record.get('architecture'), 'package.architecture'),
+            text(record.get('source'), 'package.source'))
+
+
+def validate_target_binding(document: Mapping[str, JsonValue], root: Path) -> None:
+    """Bind the declared target state to the committed sysroot manifest bytes."""
+    target = mapping(document.get('target_binding'), 'target_binding')
+    for field, expected_value in (
+        ('status', 'bound-task5-observed'), ('architecture', 'arm64'),
+        ('sysroot_manifest', TARGET_SYSROOT_MANIFEST),
+        ('required_components', REQUIRED_COMPONENTS),
+        ('required_components_binding', 'unbound-no-target-observations'),
+        ('optional_packages', ['nvidia-l4t-gstreamer']),
+    ):
+        if field not in target or target[field] != expected_value:
+            raise ManifestError('MALFORMED_VALUE', f'target_binding.{field}')
+    bound = digest(target.get('sysroot_manifest_sha256'), 64,
+                   'target_binding.sysroot_manifest_sha256')
+    if bound != TARGET_SYSROOT_SHA256:
+        raise ManifestError('TARGET_BINDING', 'target_binding.sysroot_manifest_sha256')
+    sysroot_path = root / TARGET_SYSROOT_MANIFEST
+    try:
+        raw = sysroot_path.read_bytes()
+    except OSError as error:
+        raise ManifestError('TARGET_BINDING', str(sysroot_path)) from error
+    if hashlib.sha256(raw).hexdigest() != bound:
+        raise ManifestError('TARGET_BINDING', str(sysroot_path))
+    packages = mapping(json.loads(raw), str(sysroot_path)).get('packages')
+    declared = target.get('package_versions')
+    if not isinstance(packages, list) or not isinstance(declared, list) or not declared:
+        raise ManifestError('TARGET_BINDING', 'target_binding.package_versions')
+    if sorted(target_identity(p) for p in declared) != sorted(
+            target_identity(p) for p in packages):
+        raise ManifestError('TARGET_BINDING', 'target_binding.package_versions')
+
+
+def validate_manifest(document: Mapping[str, JsonValue], root: Path) -> None:
     """Reject missing inventories and identities independently of the lock."""
     if document.get('schema') != 'aa-dependencies-1':
         raise ManifestError('MALFORMED_VALUE', 'schema')
@@ -162,16 +205,7 @@ def validate_manifest(document: Mapping[str, JsonValue]) -> None:
     parsed = tuple(parse_package(package) for package in packages)
     if len(parsed) != len(PACKAGES) or {package.name for package in parsed} != PACKAGES:
         raise ManifestError('PACKAGE_SET', 'host_packages')
-    target = mapping(document.get('target_binding'), 'target_binding')
-    for field, expected_value in (
-        ('status', 'pending-task5-extraction'), ('architecture', 'arm64'),
-        ('sysroot_manifest', 'toolchains/jetson-sysroot-manifest.json'),
-        ('sysroot_manifest_sha256', None), ('package_versions', []),
-        ('required_components', ['protobuf', 'Boost', 'OpenSSL', 'libusb', 'GStreamer', 'Qt6']),
-        ('optional_packages', ['nvidia-l4t-gstreamer']),
-    ):
-        if field not in target or target[field] != expected_value:
-            raise ManifestError('MALFORMED_VALUE', f'target_binding.{field}')
+    validate_target_binding(document, root)
     policy = mapping(document.get('build_policy'), 'build_policy')
     if policy.get('network_fetch') is not False or policy.get('host_full_build') != 'blocked-missing-development-packages':
         raise ManifestError('MALFORMED_VALUE', 'build_policy')
@@ -179,7 +213,7 @@ def validate_manifest(document: Mapping[str, JsonValue]) -> None:
 
 def check(manifest: Path, lock: Path, archive: Path | None) -> None:
     document = load(manifest)
-    validate_manifest(document)
+    validate_manifest(document, manifest.parent.parent)
     binding = load(lock)
     if binding.get('schema') != 'aa-dependency-lock-1':
         raise ManifestError('LOCK_MISMATCH', 'schema')
@@ -224,7 +258,7 @@ def main() -> int:
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
         print(f'MALFORMED_VALUE\t{error}')
         return 1
-    print('dependency-check: PASS source-pins=3 host-inventory=25 target=pending-task5 full-build=blocked')
+    print('dependency-check: PASS source-pins=3 host-inventory=25 target=bound-task5-observed full-build=blocked')
     return 0
 
 

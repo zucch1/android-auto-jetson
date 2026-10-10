@@ -4,7 +4,7 @@
 # ///
 # --- How to run ---
 # python3 -B tools/build/drift.py --baseline toolchains/jetson-sysroot-manifest.json --candidate other.json
-"""Detect package-version and same-version content drift; require a new sysroot version on change."""
+"""Detect package identity and same-version content drift; require a new sysroot version on change."""
 from __future__ import annotations
 
 import argparse
@@ -40,8 +40,8 @@ def acceptance(provenance: Provenance) -> str:
 
 
 def compare(baseline: Manifest, candidate: Manifest) -> DriftReport:
-    base_packages = {p.name: p.version for p in baseline.packages}
-    cand_packages = {p.name: p.version for p in candidate.packages}
+    base_packages = {p.name: p for p in baseline.packages}
+    cand_packages = {p.name: p for p in candidate.packages}
     changed_packages = tuple(sorted(
         name for name in base_packages.keys() | cand_packages.keys()
         if base_packages.get(name) != cand_packages.get(name)))

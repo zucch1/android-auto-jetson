@@ -1,6 +1,6 @@
 {
   "schema": "aa-dependency-lock-1",
-  "manifest_sha256": "2239c9a41b4745ada6ea72fbb8aaf2ba4d99c3a4723cd37123eef16a31fe2c25",
+  "manifest_sha256": "abf4086c619711a19b7347044d205fad7d6c6be56265675de7c112bd92b0509a",
   "patch_path": "patches/aasdk-googletest.patch",
   "patch_sha256": "d27b1c7099041042ad255c2cd16b7d61588b6b6aaa93b4c7d1b0c0ffb35b7091",
   "tls_patch_path": "patches/aasdk-tls-credentials.patch",

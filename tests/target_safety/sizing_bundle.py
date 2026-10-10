@@ -62,9 +62,6 @@ def payloads(root: Path, *, entry_limit: int | None = None,
              mem_available: int | None = None) -> bytes:
     repo, external, namespaces = fixture_roots(root)
     setting, state = fake_setting(root)
-    (root / "policy.txt").write_text(json.loads(
-        (stage1.EVIDENCE / "task-5-ssh-key-and-policy-inspection.json").read_text()
-    )["read_only_policy_query"]["observed_stdout"])
     guard = sizing_guard_bundle()
     guard_prefix = guard.rsplit(b"raise SystemExit", 1)[0]
     limit = f"_C.PROTECTED_ENTRY_LIMIT = {entry_limit}\n" if entry_limit is not None else ""

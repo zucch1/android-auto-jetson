@@ -8,10 +8,10 @@ describe the implemented offline boundary.
 Current task-6 handoff: task 5's final acceptance is PASS. The prerequisite
 failure and outstanding-gate notes below are historical, not a current block
 on the independent host CI jobs. They remain preserved and are not evidence
-of present target reachability. Private ARM64 CI runner/storage architecture
-is still pending design review; no ARM64 CI job is implemented here. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the two implemented host contexts and
-the planned ARM64 integration context. This status update performs no target
+of present target reachability. Private ARM64 CI runs as a companion workflow
+outside this repository; no ARM64 CI job is implemented here. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the public contexts and the companion
+ARM64 integration context. This status update performs no target
 access and grants no live-acquisition authority.
 
 ## CLI
@@ -135,8 +135,11 @@ verify package origins, establish authenticity, or qualify target compatibility.
 The manifest's capability remains pending in all cases. Do not interpret a
 successful CLI result or an `observed` label as task-5 acceptance.
 
-The production dependency binding remains pending, including the sysroot manifest
-digest and target package versions. There is no qualified ARM64 CMake preset,
+The production dependency binding carries the immutable observed sysroot
+manifest digest and the authoritative toolchain package records; the required
+receiver components (protobuf, Boost, OpenSSL, libusb, GStreamer, Qt6) have no
+target package observations and remain explicitly unbound. There is no
+qualified ARM64 CMake preset,
 validated complete cross-build input closure, cross-build result, or immutable
 private-cache qualification established by this offline CLI. Synthetic/local
 validation is not evidence of working ARM64 binaries or a target integration

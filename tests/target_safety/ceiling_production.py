@@ -37,7 +37,6 @@ def main() -> int:
         namespace.parent.mkdir(parents=True)
         namespace.symlink_to("/usr/bin/python3")
     setting, state = fake_setting(root)
-    (root / "policy.txt").write_text(json.loads((stage1.EVIDENCE / "task-5-ssh-key-and-policy-inspection.json").read_text())["read_only_policy_query"]["observed_stdout"])
     guard = stage1.bundle()
     guard_prefix = guard.rsplit(b"raise SystemExit", 1)[0]
     seams = f"""

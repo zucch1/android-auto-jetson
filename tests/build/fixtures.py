@@ -29,9 +29,12 @@ CONTENT = b'synthetic bytes\n'
 TAMPERED = b'tampered bytes\n'
 
 
-def build_manifest(version: str, package_version: str, content: bytes) -> Manifest:
-    package = Package(PackageName('fixture-data'), package_version, Architecture.ARM64,
-                      'synthetic-local', None)
+def build_manifest(version: str, package_version: str, content: bytes,
+                   source: str = 'synthetic-local',
+                   architecture: Architecture = Architecture.ARM64,
+                   all_justification: str | None = None) -> Manifest:
+    package = Package(PackageName('fixture-data'), package_version, architecture,
+                      source, all_justification)
     entries = (
         RegularFile(InputPath('/' + REGULAR_PATH), RelativePath(REGULAR_PATH),
                     PackageName('fixture-data'), Digest(hashlib.sha256(content).hexdigest())),

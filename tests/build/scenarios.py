@@ -17,6 +17,7 @@ if __package__ in (None, ''):
 
 from fixtures import (CONTENT, TAMPERED, build_manifest, compile_binary, frozen_artifact,
                       run_tool, write_manifest, write_payload)
+from tools.sysroot.models import Architecture
 
 SMOKE = Path(__file__).resolve().parent / 'cross' / 'smoke.cpp'
 
@@ -66,6 +67,27 @@ def main() -> int:
                 report = json.loads(result.stdout)
                 assert result.returncode == 1 and report['new_version_required'], report
                 assert report['content_drift'] and report['same_version_content_drift'], report
+            case 'drift-package-identity':
+                candidate = fixture / 'candidate.json'
+                write_manifest(candidate, build_manifest('v1', '1.0-1', CONTENT,
+                                                         source='synthetic-alternate'))
+                result = run_tool(root, 'drift.py', '--baseline', str(baseline_path),
+                                  '--candidate', str(candidate))
+                report = json.loads(result.stdout)
+                assert result.returncode == 1 and report['new_version_required'], report
+                assert report['package_version_drift'], report
+                assert 'fixture-data' in report['changed_packages'], report
+            case 'drift-package-architecture':
+                candidate = fixture / 'candidate.json'
+                write_manifest(candidate, build_manifest('v1', '1.0-1', CONTENT,
+                                                         architecture=Architecture.ALL,
+                                                         all_justification='arch-independent fixture data'))
+                result = run_tool(root, 'drift.py', '--baseline', str(baseline_path),
+                                  '--candidate', str(candidate))
+                report = json.loads(result.stdout)
+                assert result.returncode == 1 and report['new_version_required'], report
+                assert report['package_version_drift'], report
+                assert 'fixture-data' in report['changed_packages'], report
             case 'cache-bind':
                 cache = fixture / 'cache'
                 result = run_tool(root, 'cache_binding.py', '--cache-root', str(cache),
@@ -141,6 +163,82 @@ def main() -> int:
                                   '--cache-root', str(cache))
                 assert result.returncode == 1, result
                 assert 'NEW_VERSION_REQUIRED' in result.stdout + result.stderr, result
+            case 'cache-publish-verify-binding-mismatch':
+                artifact = frozen_artifact(fixture / 'src', 'v1', CONTENT)
+                cache = fixture / 'cache'
+                report = json.loads(run_tool(root, 'cache_publish.py', 'publish', '--artifact',
+                                             str(artifact), '--cache-root', str(cache)).stdout)
+                binding = cache / 'bindings' / f"{report['manifest_digest']}.json"
+                binding.chmod(0o644)
+                record = json.loads(binding.read_text())
+                record['manifest_digest'] = '0' * 64
+                binding.write_text(json.dumps(record, sort_keys=True))
+                result = run_tool(root, 'cache_publish.py', 'verify', '--cache-root', str(cache),
+                                  '--manifest-sha256', report['manifest_digest'])
+                assert result.returncode == 1, result
+                assert 'ARTIFACT_MISMATCH' in result.stdout + result.stderr, result
+            case 'cache-publish-verify-provenance-tamper':
+                artifact = frozen_artifact(fixture / 'src', 'v1', CONTENT)
+                cache = fixture / 'cache'
+                report = json.loads(run_tool(root, 'cache_publish.py', 'publish', '--artifact',
+                                             str(artifact), '--cache-root', str(cache)).stdout)
+                binding = cache / 'bindings' / f"{report['manifest_digest']}.json"
+                binding.chmod(0o644)
+                record = json.loads(binding.read_text())
+                record['provenance'] = 'observed'
+                record['acceptance'] = 'target-observed'
+                binding.write_text(json.dumps(record, sort_keys=True))
+                result = run_tool(root, 'cache_publish.py', 'verify', '--cache-root', str(cache),
+                                  '--manifest-sha256', report['manifest_digest'])
+                assert result.returncode == 1, result
+                assert 'ARTIFACT_MISMATCH' in result.stdout + result.stderr, result
+                observed = run_tool(root, 'cache_publish.py', 'verify', '--cache-root', str(cache),
+                                    '--manifest-sha256', report['manifest_digest'],
+                                    '--require-observed')
+                assert observed.returncode == 1, observed
+                assert 'FIXTURE_PROVENANCE' in observed.stdout + observed.stderr, observed
+            case 'cache-publish-verify-version-tamper':
+                artifact = frozen_artifact(fixture / 'src', 'v1', CONTENT)
+                cache = fixture / 'cache'
+                report = json.loads(run_tool(root, 'cache_publish.py', 'publish', '--artifact',
+                                             str(artifact), '--cache-root', str(cache)).stdout)
+                binding = cache / 'bindings' / f"{report['manifest_digest']}.json"
+                binding.chmod(0o644)
+                record = json.loads(binding.read_text())
+                record['version'] = 'tampered-version'
+                binding.write_text(json.dumps(record, sort_keys=True))
+                result = run_tool(root, 'cache_publish.py', 'verify', '--cache-root', str(cache),
+                                  '--manifest-sha256', report['manifest_digest'])
+                assert result.returncode == 1, result
+                assert 'ARTIFACT_MISMATCH' in result.stdout + result.stderr, result
+            case 'cache-bind-current-field-mismatch':
+                cache = fixture / 'cache'
+                run_tool(root, 'cache_binding.py', '--cache-root', str(cache),
+                         '--manifest', str(baseline_path))
+                current = cache / 'current.json'
+                record = json.loads(current.read_text())
+                record['version'] = 'tampered-version'
+                current.write_text(json.dumps(record, sort_keys=True))
+                result = run_tool(root, 'cache_binding.py', '--cache-root', str(cache),
+                                  '--manifest', str(baseline_path))
+                assert result.returncode == 1, result
+                assert 'ARTIFACT_MISMATCH' in result.stdout + result.stderr, result
+            case 'cache-bind-rebound-prior-mismatch':
+                cache = fixture / 'cache'
+                run_tool(root, 'cache_binding.py', '--cache-root', str(cache),
+                         '--manifest', str(baseline_path))
+                namespace = cache / json.loads((cache / 'current.json').read_text())['manifest_digest']
+                prior_path = namespace / 'binding.json'
+                prior_path.chmod(0o644)
+                prior = json.loads(prior_path.read_text())
+                prior['version'] = 'tampered-prior'
+                prior_path.write_text(json.dumps(prior, sort_keys=True))
+                candidate = fixture / 'candidate.json'
+                write_manifest(candidate, build_manifest('v2', '2.0-1', CONTENT))
+                result = run_tool(root, 'cache_binding.py', '--cache-root', str(cache),
+                                  '--manifest', str(candidate))
+                assert result.returncode == 1, result
+                assert 'ARTIFACT_MISMATCH' in result.stdout + result.stderr, result
             case 'contamination-clean':
                 binary = fixture / 'aa_clean'
                 assert compile_binary('aarch64-linux-gnu-g++', binary, SMOKE).returncode == 0
