@@ -76,6 +76,7 @@ TEST(VideoMalformed, MalformedRecordsAreTypedAndKeepFixedStorage) {
         }
     }
     EXPECT_EQ(rejected, 4);
+    EXPECT_EQ(consumer.rejected(), 4U);
     EXPECT_LE(allocation_count() - before, 2) << "malformed flood grew dynamic storage";
     EXPECT_TRUE(consumer.waiting_idr());
 
@@ -85,6 +86,8 @@ TEST(VideoMalformed, MalformedRecordsAreTypedAndKeepFixedStorage) {
         const auto step = consumer.receive(aa::core::Milliseconds{500});
         if (step && step.value() == ReceiveStatus::complete) {
             EXPECT_EQ(consumer.access_unit().frame, 9U);
+            EXPECT_EQ(consumer.resyncs(), 1U);
+            EXPECT_EQ(consumer.rejected(), 4U);
             return;
         }
     }
@@ -127,5 +130,35 @@ TEST(VideoMalformed, InconsistentFragmentIsRejectedWithLoss) {
     const auto rejected = consumer.receive(aa::core::Milliseconds{500});
     ASSERT_FALSE(rejected);
     EXPECT_EQ(rejected.error().code(), aa::ErrorCode::transport_malformed_frame);
+    EXPECT_EQ(consumer.rejected(), 1U);
     EXPECT_TRUE(consumer.waiting_idr());
+}
+
+TEST(VideoMalformed, RejectedCounterCoversHeaderDecodeFailures) {
+    NegotiatedLimits limits{};
+    auto pair = videotest::make_pair(limits);
+    ASSERT_TRUE(pair);
+    auto& consumer = pair.value().consumer;
+    const auto producer_fd = pair.value().producer.native_handle();
+
+    std::vector<std::uint8_t> bad_version = good_record();
+    bad_version[4] ^= 0xff;
+    raw_send(producer_fd, bad_version);
+    const auto step = consumer.receive(aa::core::Milliseconds{500});
+    ASSERT_FALSE(step);
+    EXPECT_EQ(step.error().code(), aa::ErrorCode::protocol_version_mismatch);
+    EXPECT_EQ(consumer.rejected(), 1U);
+    EXPECT_TRUE(consumer.waiting_idr());
+
+    const std::vector<std::uint8_t> recovery{0x01, 0x02};
+    ASSERT_TRUE(pair.value().producer.send_access_unit({9, 9, true, recovery}));
+    for (int i = 0; i < 8; ++i) {
+        const auto done = consumer.receive(aa::core::Milliseconds{500});
+        if (done && done.value() == ReceiveStatus::complete) {
+            EXPECT_EQ(consumer.resyncs(), 1U);
+            EXPECT_EQ(consumer.rejected(), 1U);
+            return;
+        }
+    }
+    FAIL() << "consumer did not resync on the next IDR";
 }

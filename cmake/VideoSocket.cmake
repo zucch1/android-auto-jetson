@@ -4,15 +4,13 @@
 # limits, bounded queues, drop-to-IDR resync and replayable capture. Tests
 # register as video_socket_* for `ctest -R video_socket`.
 #
-# aa_video is production code and compiles in every configuration (the
-# cross-build IPC inventory requires its sources in compile_commands.json).
-# The task-20 replay recorder (aa_replay) is part of the host qualification
-# stack and is not built in cross-smoke: the archive compiles against its
-# headers either way and cross-smoke consumes no video executable. Only the
-# test executable and its registrations stay behind if(NOT CMAKE_CROSSCOMPILING).
-#
 # Integration contract: include AFTER cmake/CoreArchitecture.cmake (aa_core),
-# cmake/Replay.cmake (aa_replay) and the googletest declaration.
+# cmake/Replay.cmake (aa_replay) and the googletest declaration. Cross builds
+# compile aa_video WITHOUT the replay chain: the frozen cross sysroot carries no
+# AASDK development inputs, so aa_replay -> aa_protocol_adapter is native-only
+# (same boundary as cmake/ProtocolAdapter.cmake). aa_video's sources use project
+# headers only and no cross executable links the archive (the test executable
+# is native-only below).
 
 if(NOT TARGET aa_core)
     message(FATAL_ERROR
@@ -49,6 +47,9 @@ set_target_properties(aa_video PROPERTIES
 target_include_directories(aa_video PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aa_video PUBLIC aa_core)
 if(TARGET aa_replay)
+    # Replayable capture resolves replay::Recorder. When the replay chain is
+    # native-only the cross archive compiles without this link item; nothing
+    # links aa_video into a cross executable, so no symbol is ever unresolved.
     target_link_libraries(aa_video PUBLIC aa_replay)
 endif()
 

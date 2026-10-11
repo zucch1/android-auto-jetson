@@ -55,12 +55,12 @@ const char* bench_report_path() {
     return (from_env != nullptr && from_env[0] != '\0') ? from_env : "video_bench_report.json";
 }
 
-void write_bench_report() {
-    std::FILE* out = std::fopen(bench_report_path(), "w");
+bool write_bench_report(const char* path = nullptr) {
+    std::FILE* out = std::fopen(path != nullptr ? path : bench_report_path(), "w");
     if (out == nullptr) {
-        return;
+        return false;
     }
-    std::fprintf(out,
+    const int written = std::fprintf(out,
                  "{\n"
                  "  \"schema\": \"aa-video-bench-report-1\",\n"
                  "  \"qualification\": \"production AF_UNIX video channel (task 22), not the "
@@ -105,9 +105,14 @@ void write_bench_report() {
                  static_cast<unsigned long long>(loss.resyncs),
                  static_cast<unsigned long long>(loss.recovered_frame),
                  loss.recovered_idr ? "true" : "false");
-    std::fclose(out);
+    const int closed = std::fclose(out);
+    return written >= 0 && closed == 0;
 }
 } // namespace
+
+TEST(VideoBench, UnwritableReportPathIsReported) {
+    EXPECT_FALSE(write_bench_report("/nonexistent-directory/video_bench_report.json"));
+}
 
 TEST(VideoBench, PacedStreamMeetsTask10Budgets) {
     paced = PacedReport{};
@@ -181,7 +186,7 @@ TEST(VideoBench, PacedStreamMeetsTask10Budgets) {
     paced.drops = producer.dropped();
     paced.backpressure = producer.backpressure_events();
     paced.limits = producer.limits();
-    write_bench_report();
+    ASSERT_TRUE(write_bench_report()) << "failed to write benchmark report";
 
     ASSERT_FALSE(consumer_error.load());
     EXPECT_EQ(paced.frames_delivered, kFrames);
@@ -225,7 +230,7 @@ TEST(VideoBench, InducedLossResyncsAtNextIdr) {
             loss.resyncs = consumer.resyncs();
             loss.recovered_frame = consumer.access_unit().frame;
             loss.recovered_idr = consumer.access_unit().idr;
-            write_bench_report();
+            ASSERT_TRUE(write_bench_report()) << "failed to write benchmark report";
             EXPECT_TRUE(consumer.access_unit().idr);
             EXPECT_EQ(consumer.access_unit().frame, 3U);
             EXPECT_EQ(consumer.resyncs(), 2U);
@@ -233,6 +238,6 @@ TEST(VideoBench, InducedLossResyncsAtNextIdr) {
         }
     }
     loss.observed = true;
-    write_bench_report();
+    ASSERT_TRUE(write_bench_report()) << "failed to write benchmark report";
     FAIL() << "no clean IDR resync after induced loss";
 }
