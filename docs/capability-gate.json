@@ -446,7 +446,7 @@
     {
       "id": "wireless",
       "classification": "owner-signed-reduced-scope",
-      "summary": "Regd fixed (rtl8822ce-regd-shim + watchdog; US domain live and persistent). UNII-1 5 GHz AP qualification (ch 44, 20 MHz) demonstrated with receipts; isolated AP client-association demonstrated. Claim 1 re-scoped from the channel-36 wording per owner sign-off 2026-10-11 (the vendor driver forces a CSA 36->44 for AP operation; see qual-ht20-test receipt). BlueZ ProfileManager/Agent registration succeeded with clean unregister and unchanged adapter state. The 3.009 s event-loop observation is NOT a strict 3 s deadline pass. Full wireless capability acceptance remains deferred: release budgets unmeasured.",
+      "summary": "UNII-1 5 GHz AP (ch 44, 20 MHz), isolated client-association and the AP-startup release budget are demonstrated (qual-run-1/5/6, qual-client-assoc, qual-ht20-test receipts); the session-reconnect release budget stays unmeasured (the 2026-10-11 window exercised infrastructure-STA recovery, not the receiver-hosted AA session transport). Channel-36 wording is a 2026-10-11 owner-signed re-scope (the vendor driver forces a CSA 36->44) and is not silently passed. BlueZ ProfileManager/Agent registration succeeded with clean unregister and unchanged adapter state. The 3.009 s event-loop observation is NOT a strict 3 s deadline pass. AP mode advertisement is not AP operation.",
       "evidence": [
         {
           "name": "task-12-bluez-lightweight.json",
@@ -487,6 +487,22 @@
         {
           "name": "claim-rescope-signoff-2026-10-11.md",
           "sha256": "6c4a75b073b1f3c64e9b36efa3dfbf17553731f1ea9a7b22e0438bc527d2fc34"
+        },
+        {
+          "name": "task-12-fix/qual-run-6/qual-receipt-run-6.md",
+          "sha256": "2a4f8b5a898812ab9840b24599befdebc0b8b5554c58a187d692f653e07c9bd5"
+        },
+        {
+          "name": "task-12-fix/qual-run-6/qual-receipt-run-6.json",
+          "sha256": "c6a96b464a3bb3b19b8d5b3c177ef0651c12acb6f0a9b7bb716b4470bdf7f435"
+        },
+        {
+          "name": "task-12-fix/qual-run-6/journal-raw-run-6.txt",
+          "sha256": "b8934ad272915adbf9f9ee34f7d7667584894390cd7dcaeed998a4230a364b45"
+        },
+        {
+          "name": "task-12-fix/qual-run-6/claim3-qual-v2.sh",
+          "sha256": "c931250c5cfd8d34265beb7083b2ed1b4847ad95c3fd4d6ca6f683b27baa2053"
         }
       ],
       "measurements": {
@@ -508,7 +524,9 @@
         "claim_1_text": "Completed onboard RTL8822CE UNII-1 5 GHz AP qualification (ch 44, 20 MHz) at the early capability gate",
         "claim_1_status": "demonstrated (qual-run-1, qual-run-5, qual-ht20-test)",
         "claim_2_status": "demonstrated (qual-client-assoc)",
-        "claim_3_status": "open: budgets unmeasured"
+        "claim_3_status": "open (withdrawn): ap_startup_s measured 4.223 s <= 5.0 s at its stated trigger (modprobe-start -> AP-ENABLED, receiver-hosted aa-qual-44 AP); session_reconnect_s NOT measured - the 2026-10-11 window exercised infrastructure-STA RF-kill recovery (4.139 s, recorded separately), which is not the receiver-hosted AA session transport",
+        "ap_startup_s": 4.223,
+        "infra_sta_rfkill_reconnect_s": 4.139
       },
       "budgets": [
         {
@@ -528,8 +546,8 @@
           "limit": 5.0,
           "unit": "s",
           "available_at": "release",
-          "measured": null,
-          "passed": false,
+          "measured": 4.223,
+          "passed": true,
           "withdrawn": false,
           "withdrawn_claim": null
         }
