@@ -7,8 +7,10 @@
 # and physically contains no fixture enablement or synthetic emission. The
 # test-only simulated sensor fixture lives in aa_input_sensor_fixtures, which
 # is linked ONLY into the test binary (regression: input_sensors_isolation).
-# Memory-checked coverage (gate r1): input_sensors_memory runs the suite under
-# valgrind/memcheck with --error-exitcode=99.
+# Memory-checked coverage (gate r1): input_sensors_memory is MANDATORY and
+# always registered natively - the suite runs under valgrind/memcheck with
+# --error-exitcode=99, or the run fails via the sentinel when valgrind is
+# absent (fail, never skip).
 #
 # Cross contract (cmake/DbusContract.cmake pattern): the module libraries are
 # compiled unconditionally so cross builds cover them; ONLY the test binary,
@@ -71,7 +73,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     find_program(AA_VALGRIND_EXECUTABLE NAMES valgrind)
     if(NOT AA_VALGRIND_EXECUTABLE)
         message(STATUS
-            "AA_INPUT_SENSORS_MEMCHECK_UNAVAILABLE: valgrind not found, input_sensors_memory is not registered (gate r1)")
+            "AA_INPUT_SENSORS_MEMCHECK_UNAVAILABLE: valgrind not found, input_sensors_memory runs the failing sentinel (gate r1)")
     endif()
 
     add_executable(aa_input_sensors_test ${AA_INPUT_SERVICE_TEST_SOURCES})
@@ -105,12 +107,26 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME input_sensors_capability COMMAND aa_input_sensors_test --gtest_filter=InputSensorsCapability.*)
     add_test(NAME input_sensors_input COMMAND aa_input_sensors_test --gtest_filter=InputSensorsInput.*)
     add_test(NAME input_sensors_sensors COMMAND aa_input_sensors_test --gtest_filter=InputSensorsSensor.*)
-    if(AA_VALGRIND_EXECUTABLE)
+    # Mandatory memcheck qualification (gate r1): input_sensors_memory is
+    # ALWAYS registered natively. With valgrind it is the real memcheck run;
+    # without it (or with a nonexistent AA_VALGRIND_EXECUTABLE path) the same
+    # test name runs the sentinel, whose FATAL_ERROR fails the run - configure
+    # may succeed without the tool, but qualification visibly FAILS, never
+    # skips or warns. FAIL_REGULAR_EXPRESSION additionally fails any run whose
+    # output claims SKIPPED or names the sentinel, so a zero-exit skip
+    # harness cannot masquerade as a pass. No SKIP_RETURN_CODE, no DISABLED,
+    # no WILL_FAIL: failure is the only non-pass outcome.
+    if(AA_VALGRIND_EXECUTABLE AND EXISTS "${AA_VALGRIND_EXECUTABLE}")
         add_test(NAME input_sensors_memory COMMAND "${AA_VALGRIND_EXECUTABLE}"
             --tool=memcheck --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite
             --track-origins=yes $<TARGET_FILE:aa_input_sensors_test>)
-        set_tests_properties(input_sensors_memory PROPERTIES TIMEOUT 600)
+    else()
+        add_test(NAME input_sensors_memory COMMAND "${CMAKE_COMMAND}"
+            -P "${CMAKE_SOURCE_DIR}/tests/input_sensors/memcheck_unavailable.cmake")
     endif()
+    set_tests_properties(input_sensors_memory PROPERTIES
+        TIMEOUT 600
+        FAIL_REGULAR_EXPRESSION "\\[ *SKIPPED *\\]|AA_INPUT_SENSORS_MEMCHECK_UNAVAILABLE")
     add_test(NAME input_sensors_isolation COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/input_sensors/production_isolation_test.py"
         "${CMAKE_CXX_COMPILER}"

@@ -36,14 +36,15 @@ jobs:
             libssl-dev libusb-1.0-0-dev pkg-config libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
-            pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev \
+            pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev valgrind \
             g++-aarch64-linux-gnu binutils
           protoc --version
+          valgrind --version
           dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \
             libboost-log-dev libssl-dev libusb-1.0-0-dev libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
-            pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev
+            pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev valgrind
           gst-inspect-1.0 openh264dec
           gst-inspect-1.0 h264parse
           gst-inspect-1.0 pipewiresink
@@ -136,9 +137,17 @@ jobs:
           python3 -B tests/ipc/assert_ipc_coverage.py build/host-dev
           python3 -B tests/wireless/assert_coverage.py build/host-dev
           ctest --test-dir build/host-dev -R aasdk_abi --output-on-failure -V
+          # Mandatory input-sensor memcheck qualification (gate r1): run the
+          # dedicated memcheck gate first, verbose and serial (memcheck must
+          # not race its own leak scan). It FAILS (never skips) when valgrind
+          # is missing or a run claims SKIPPED.
+          ctest --test-dir build/host-dev --error-on-no-tests --output-on-failure -V \
+            -R '^input_sensors_memory$' -j 1
           # Unfiltered host-dev run intentionally includes the ipc-bench-happy-600 gate,
           # which adds ~10 minutes; the job timeout above accounts for this explicitly.
-          ctest --preset host-dev --output-on-failure
+          # input_sensors_memory is excluded here: it already ran above (avoid a double
+          # memcheck pass), and its sentinel semantics are qualified by that step.
+          ctest --preset host-dev --output-on-failure -E '^input_sensors_memory$'
 
   decode-overlay-cross:
     name: ci/decode-overlay-cross
