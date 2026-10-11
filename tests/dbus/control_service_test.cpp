@@ -442,6 +442,38 @@ TEST(ControlService, ReplacementRegistrationReconcilesAbandonedOwner) {
     EXPECT_EQ(owner_lost_diagnostics, 1U);
 }
 
+TEST(ControlService, SameNameReplacementReconcilesAbandonedOwner) {
+    // Given: an incumbent whose consumer name is taken over by a replacement
+    // connection (same-name ownership transfer, distinct from the removed-owner
+    // variant above).
+    Fixture fixture;
+    const BusName incumbent{":1.120"};
+    const BusName replacement{":1.121"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(incumbent, kSessionUid);
+    fixture.credentials.add_connection(replacement, kSessionUid);
+    fixture.credentials.set_owner(consumer_name, incumbent);
+    ASSERT_TRUE(fixture.service.register_consumer(incumbent, consumer_name).has_value());
+    fixture.credentials.set_owner(consumer_name, replacement);
+
+    // When: the replacement registers the same consumer name.
+    const auto registered = fixture.service.register_consumer(replacement, consumer_name);
+
+    // Then: the abandoned incumbent is torn down and the replacement registers
+    // under a fresh consumer id.
+    ASSERT_TRUE(registered.has_value());
+    EXPECT_EQ(fixture.service.state().consumer, registered.value());
+    std::size_t owner_lost_diagnostics = 0;
+    for (const auto& event : fixture.events.events) {
+        if (const auto* diagnostic = std::get_if<aa::ipc::DiagnosticEmitted>(&event)) {
+            if (diagnostic->event == "consumer_owner_lost") {
+                ++owner_lost_diagnostics;
+            }
+        }
+    }
+    EXPECT_EQ(owner_lost_diagnostics, 1U);
+}
+
 TEST(ControlService, LiveOwnerStillBlocksReplacement) {
     // Given: a live incumbent that still owns its registered name.
     Fixture fixture;
