@@ -36,13 +36,14 @@ jobs:
             libssl-dev libusb-1.0-0-dev pkg-config libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
-            pipewire-pulse dbus-daemon qt6-base-dev g++-aarch64-linux-gnu binutils
+            pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev \
+            g++-aarch64-linux-gnu binutils
           protoc --version
           dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \
             libboost-log-dev libssl-dev libusb-1.0-0-dev libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
-            pipewire-pulse dbus-daemon qt6-base-dev
+            pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev
           gst-inspect-1.0 openh264dec
           gst-inspect-1.0 h264parse
           gst-inspect-1.0 pipewiresink
@@ -87,17 +88,24 @@ jobs:
           test -S "$XDG_RUNTIME_DIR/pipewire-0"
           nohup wireplumber >"$RUNNER_TEMP/wireplumber.log" 2>&1 &
           nohup pipewire-pulse >"$RUNNER_TEMP/pipewire-pulse.log" 2>&1 &
-          # Bounded wait: wall-clock deadline of 30 s (probe execution time
-          # counts against the budget) with every wpctl invocation wrapped in
-          # `timeout 5s`, so a stalled PipeWire connection cannot hang the
-          # step. The routes need a DEFAULT Audio/Sink (wpctl marks it with
-          # `*`) - the fallback auto_null / Dummy Output once wireplumber
-          # adopts it. Never wait forever.
+          # Bounded two-gate readiness: wall-clock deadline of 30 s (probe
+          # execution time counts against the budget), every wpctl/pactl call
+          # wrapped in `timeout 5s`, so a stalled connection cannot hang the
+          # step. Both gates must pass:
+          #   1. default-sink-resolves - `wpctl inspect '@DEFAULT_AUDIO_SINK@'`
+          #      resolves the default Audio/Sink directly (non-zero until
+          #      wireplumber adopts the auto_null / Dummy Output fallback);
+          #      no `wpctl status` section parsing, so a stray `*` outside
+          #      Sinks cannot satisfy the gate;
+          #   2. pulse-round-trip - `pactl info` proves pipewire-pulse still
+          #      accepts Pulse connections. wpctl alone can pass while
+          #      pipewire-pulse is dead, but the explicit-pulse route drives
+          #      pulsesink against that server. Never wait forever.
           ready=""
           deadline=$((SECONDS + 30))
           while [ "$SECONDS" -lt "$deadline" ]; do
-            if timeout 5s wpctl status 2>/dev/null | sed -n '/Sinks:/,/Sink endpoints:/p' \
-                | grep -F '*' >/dev/null 2>&1; then
+            if timeout 5s wpctl inspect '@DEFAULT_AUDIO_SINK@' >/dev/null 2>&1 \
+                && timeout 5s pactl info >/dev/null 2>&1; then
               ready=1
               break
             fi
@@ -105,13 +113,17 @@ jobs:
             sleep 0.5
           done
           if [ -z "$ready" ]; then
-            echo "::error::no default Audio/Sink appeared within the bounded wait" >&2
+            echo "::error::audio runtime not ready within the bounded wait (default Audio/Sink + Pulse connection)" >&2
             tail -n 20 "$RUNNER_TEMP"/pipewire.log "$RUNNER_TEMP"/wireplumber.log \
               "$RUNNER_TEMP"/pipewire-pulse.log || true
+            timeout 5s wpctl inspect '@DEFAULT_AUDIO_SINK@' || true
             timeout 5s wpctl status || true
+            timeout 5s pactl info || true
             exit 1
           fi
           timeout 5s wpctl status
+          timeout 5s wpctl inspect '@DEFAULT_AUDIO_SINK@' >/dev/null
+          timeout 5s pactl info
       - name: Configure, build and qualify native AASDK and host foundation
         env:
           AA_GOOGLETEST_ARCHIVE: ${{ runner.temp }}/googletest-v1.15.2.tar.gz
