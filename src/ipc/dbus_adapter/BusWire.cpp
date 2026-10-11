@@ -134,6 +134,32 @@ MessageWriter& MessageWriter::put_string_map(const std::map<std::string, std::st
     return *this;
 }
 
+MessageWriter& MessageWriter::put_string_variant(std::string_view value) {
+    push_signature(body_, "s");
+    push_string(body_, value);
+    return *this;
+}
+
+MessageWriter& MessageWriter::put_property_dict(const std::map<std::string, std::string>& entries) {
+    pad_to(body_, 4);
+    const std::size_t length_at = body_.size();
+    push_u32(body_, 0);
+    pad_to(body_, 8);
+    const std::size_t elements_at = body_.size();
+    for (const auto& entry : entries) {
+        pad_to(body_, 8);
+        push_string(body_, entry.first);
+        push_signature(body_, "s");
+        push_string(body_, entry.second);
+    }
+    const auto length = static_cast<std::uint32_t>(body_.size() - elements_at);
+    for (int shift = 0; shift < 32; shift += 8) {
+        body_[length_at + static_cast<std::size_t>(shift / 8)] =
+            static_cast<std::uint8_t>((length >> shift) & 0xFFU);
+    }
+    return *this;
+}
+
 std::vector<std::uint8_t> MessageWriter::build(MessageType type, std::uint32_t serial) const {
     std::vector<std::uint8_t> out;
     out.reserve(kFixedHeaderBytes + fields_.size() + 8 + body_.size());

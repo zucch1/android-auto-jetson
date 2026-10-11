@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -142,6 +143,47 @@ TEST(BusSpoof, ForgedOnlyReplySprayFailsClosedTyped) {
     // typed error — the forged UID is never returned.
     ASSERT_FALSE(uid.has_value());
     EXPECT_EQ(uid.error().code(), ErrorCode::ipc_peer_unauthorized);
+}
+
+// Variant value bytes: `levels` nested "v" signatures closing on a "u" value.
+// The chain is 4-aligned at its u32 for the levels used below.
+[[nodiscard]] std::vector<std::uint8_t> nested_variant_bytes(int levels) {
+    std::vector<std::uint8_t> bytes;
+    for (int level = 0; level < levels; ++level) {
+        bytes.insert(bytes.end(), {0x01, 0x76, 0x00});
+    }
+    bytes.insert(bytes.end(), {0x01, 0x75, 0x00});
+    bytes.insert(bytes.end(), {0x2a, 0x00, 0x00, 0x00});
+    return bytes;
+}
+
+TEST(BusSpoof, NestedVariantRecursionIsRejectedByDepthBudget) {
+    // Given: a variant whose contained variants nest past the parser depth
+    // budget (32 nested levels where 16 is the ceiling).
+    const auto bytes = nested_variant_bytes(31);
+    bus::Cursor cursor(bytes);
+
+    // When: the parser skips the outermost variant.
+    const auto skipped = cursor.skip_value("v");
+
+    // Then: the runtime-nested chain fails closed instead of recursing past
+    // kMaxTypeDepth.
+    ASSERT_FALSE(skipped.has_value());
+    EXPECT_EQ(skipped.error().code(), ErrorCode::transport_malformed_frame);
+}
+
+TEST(BusSpoof, ShallowVariantChainIsSkipped) {
+    // Given: a variant nested within the parser depth budget.
+    const auto bytes = nested_variant_bytes(3);
+    bus::Cursor cursor(bytes);
+
+    // When: the parser skips the outermost variant.
+    const auto skipped = cursor.skip_value("v");
+
+    // Then: the bounded chain is skipped exactly and the buffer is fully
+    // consumed.
+    ASSERT_TRUE(skipped.has_value());
+    EXPECT_TRUE(cursor.done());
 }
 
 } // namespace

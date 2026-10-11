@@ -5,6 +5,8 @@
 #include <aa/ipc/dbus_contract.generated.hpp>
 
 #include "BusWire.hpp"
+#include "DispatchReply.hpp"
+#include "PropertiesDispatch.hpp"
 
 #include <cstddef>
 
@@ -13,26 +15,7 @@ namespace aa::ipc {
 namespace {
 
 constexpr std::string_view kIntrospectableInterface = "org.freedesktop.DBus.Introspectable";
-constexpr std::string_view kContractNamePrefix = "org.custom.AndroidAutoReceiver";
-constexpr std::string_view kUnsupportedMajorError =
-    "org.custom.AndroidAutoReceiver1.Error.UnsupportedContractMajor";
-constexpr std::string_view kPeerUnauthorizedError =
-    "org.custom.AndroidAutoReceiver1.Error.PeerUnauthorized";
-constexpr std::string_view kConsumerRejectedError =
-    "org.custom.AndroidAutoReceiver1.Error.ConsumerRejected";
-constexpr std::string_view kMalformedRequestError =
-    "org.custom.AndroidAutoReceiver1.Error.MalformedRequest";
-constexpr std::string_view kQueueFullError = "org.custom.AndroidAutoReceiver1.Error.QueueFull";
-constexpr std::string_view kIllegalTransitionError =
-    "org.custom.AndroidAutoReceiver1.Error.IllegalTransition";
-
-[[nodiscard]] OutboundReply error_reply(std::string_view name, std::string_view message) {
-    return OutboundReply{true, std::string{name}, std::string{message}};
-}
-
-[[nodiscard]] OutboundReply ok(ReplyBody body) {
-    return OutboundReply{false, {}, std::move(body)};
-}
+constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properties";
 
 [[nodiscard]] std::string_view error_name_for(ErrorCode code) {
     switch (code) {
@@ -67,10 +50,6 @@ constexpr std::string_view kIllegalTransitionError =
         has_digit = true;
     }
     return has_digit;
-}
-
-[[nodiscard]] bool body_consumed(const dbus_adapter::Cursor& cursor) {
-    return cursor.done();
 }
 
 [[nodiscard]] OutboundReply dispatch_member(ControlService& service, const BusName& sender,
@@ -191,6 +170,9 @@ std::optional<OutboundReply> ControlDispatcher::handle(const IncomingCall& call)
             return error_reply("org.freedesktop.DBus.Error.UnknownMethod", "unknown member");
         }
         return ok(std::string{introspection_xml()});
+    }
+    if (call.interface_name == kPropertiesInterface) {
+        return dispatch_properties(call);
     }
     if (call.interface_name != kContractInterface) {
         if (call.interface_name.compare(0, kContractNamePrefix.size(), kContractNamePrefix) == 0) {

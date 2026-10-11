@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -301,6 +302,101 @@ TEST(BusBoundary, WrongPathMethodCallCannotChangeState) {
     EXPECT_EQ(answer.value().type, bus::MessageType::error_reply);
     EXPECT_EQ(answer.value().error_name, "org.freedesktop.DBus.Error.UnknownObject");
     EXPECT_EQ(bus_state.service->state().projection, ProjectionState::stopped);
+}
+
+TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
+    // Given: a running receiver boundary and a real Properties.Get call.
+    BoundaryBus bus_state;
+    bus_state.start();
+    bus::MessageWriter get_body;
+    get_body.body_signature("ss")
+        .put_string("org.custom.AndroidAutoReceiver1")
+        .put_string("ContractSemVer");
+
+    // When: the call crosses the real bus and the reply comes back.
+    const auto reply =
+        round_trip(bus_state, "org.freedesktop.DBus.Properties", "Get", get_body);
+
+    // Then: the reply marshals as "v" containing "s" with the SemVer value,
+    // byte-for-byte the spec layout (independent of the project writer).
+    ASSERT_TRUE(reply.has_value());
+    ASSERT_EQ(reply.value().type, bus::MessageType::method_return);
+    ASSERT_EQ(reply.value().signature, "v");
+    const std::vector<std::uint8_t> expected{0x01, 0x73, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+                                             0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00};
+    EXPECT_EQ(reply.value().body, expected);
+    bus::Cursor cursor(reply.value().body);
+    const auto contained = cursor.read_signature();
+    const auto value = cursor.read_string();
+    ASSERT_TRUE(contained.has_value());
+    EXPECT_EQ(contained.value(), "s");
+    ASSERT_TRUE(value.has_value());
+    EXPECT_EQ(value.value(), "1.0.0");
+    EXPECT_TRUE(cursor.done());
+}
+
+TEST(BusBoundary, PropertiesGetAllUsesVariantDictionaryEncoding) {
+    // Given: a running receiver boundary and a real Properties.GetAll call.
+    BoundaryBus bus_state;
+    bus_state.start();
+    bus::MessageWriter get_all_body;
+    get_all_body.body_signature("s").put_string("org.custom.AndroidAutoReceiver1");
+
+    // When: the call crosses the real bus and the reply comes back.
+    const auto reply =
+        round_trip(bus_state, "org.freedesktop.DBus.Properties", "GetAll", get_all_body);
+
+    // Then: the reply marshals as a{sv} with the exact array length (excluding
+    // the gap before the first entry), 8-aligned dict entry, string key and
+    // string-variant value — byte-for-byte the spec layout.
+    ASSERT_TRUE(reply.has_value());
+    ASSERT_EQ(reply.value().type, bus::MessageType::method_return);
+    ASSERT_EQ(reply.value().signature, "a{sv}");
+    const std::vector<std::uint8_t> expected{
+        0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x43,
+        0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x53, 0x65, 0x6d, 0x56, 0x65, 0x72,
+        0x00, 0x01, 0x73, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x31, 0x2e, 0x30,
+        0x2e, 0x30, 0x00};
+    EXPECT_EQ(reply.value().body, expected);
+    bus::Cursor cursor(reply.value().body);
+    const auto array_length = cursor.read_u32();
+    ASSERT_TRUE(array_length.has_value());
+    EXPECT_EQ(array_length.value(), 34U);
+    EXPECT_EQ(cursor.position(), 4U);
+    ASSERT_TRUE(cursor.align(8).has_value());
+    EXPECT_EQ(cursor.position(), 8U);
+    const auto key = cursor.read_string();
+    ASSERT_TRUE(key.has_value());
+    EXPECT_EQ(key.value(), "ContractSemVer");
+    const auto contained = cursor.read_signature();
+    ASSERT_TRUE(contained.has_value());
+    EXPECT_EQ(contained.value(), "s");
+    const auto value = cursor.read_string();
+    ASSERT_TRUE(value.has_value());
+    EXPECT_EQ(value.value(), "1.0.0");
+    EXPECT_TRUE(cursor.done());
+}
+
+TEST(BusBoundary, PropertiesSetReturnsPropertyReadOnly) {
+    // Given: a running receiver boundary and a well-formed Properties.Set call.
+    BoundaryBus bus_state;
+    bus_state.start();
+    bus::MessageWriter set_body;
+    set_body.body_signature("ssv")
+        .put_string("org.custom.AndroidAutoReceiver1")
+        .put_string("ContractSemVer")
+        .put_string_variant("2.0.0");
+
+    // When: the set attempt crosses the real bus.
+    const auto reply =
+        round_trip(bus_state, "org.freedesktop.DBus.Properties", "Set", set_body);
+
+    // Then: the reply is an actual error message with the exact read-only
+    // error name.
+    ASSERT_TRUE(reply.has_value());
+    EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
+    EXPECT_EQ(reply.value().error_name, "org.freedesktop.DBus.Error.PropertyReadOnly");
+    EXPECT_EQ(bus_state.service->capabilities().at("contract.semver"), "1.0.0");
 }
 
 } // namespace

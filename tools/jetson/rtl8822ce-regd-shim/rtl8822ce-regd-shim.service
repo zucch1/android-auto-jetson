@@ -1,0 +1,16 @@
+# STAGED — not installed. Owner decision. See ap-qual-runbook-2026-10-10.md Part A2.
+# Install with:
+#   sudo install -m 0644 rtl8822ce-regd-shim.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now rtl8822ce-regd-shim.service
+[Unit]
+Description=Register US regdomain on rtl8822ce self-managed wiphy (NVIDIA driver omits it)
+After=sys-subsystem-net-devices-wlP1p1s0.device
+Wants=sys-subsystem-net-devices-wlP1p1s0.device
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/modprobe rtl8822ce_regd_shim
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
