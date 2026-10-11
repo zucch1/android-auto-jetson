@@ -35,14 +35,18 @@ jobs:
             libprotobuf-dev protobuf-compiler libboost-system-dev libboost-log-dev \
             libssl-dev libusb-1.0-0-dev pkg-config libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
-            qt6-base-dev g++-aarch64-linux-gnu binutils
+            gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
+            pipewire-pulse dbus-daemon qt6-base-dev g++-aarch64-linux-gnu binutils
           protoc --version
           dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \
             libboost-log-dev libssl-dev libusb-1.0-0-dev libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
-            qt6-base-dev
+            gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
+            pipewire-pulse dbus-daemon qt6-base-dev
           gst-inspect-1.0 openh264dec
           gst-inspect-1.0 h264parse
+          gst-inspect-1.0 pipewiresink
+          gst-inspect-1.0 pulsesink
       - name: Fetch and verify locked GoogleTest archive
         run: |
           set -euo pipefail
@@ -51,6 +55,63 @@ jobs:
             https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.15.2 \
             --output "$archive"
           python3 -B tools/deps/check_manifest.py --lock deps/manifest.lock --archive "$archive"
+      - name: Start user-session audio runtime for the audio pipeline tests
+        run: |
+          set -euo pipefail
+          # The audio pipeline route tests open the DEFAULT output of the user
+          # session: pipewiresink streams are auto-linked by the session
+          # manager and the explicit-pulse route drives pulsesink against a
+          # Pulse server. The bare runner has no audio runtime and no
+          # Audio/Sink at all, so start one here and leave the daemons running
+          # for the test step; pipewire-pulse also provides the auto_null /
+          # Dummy Output fallback sink the routes land on. The isolated
+          # backend tests spawn their own daemons but need the same packages
+          # (pipewire binary + /usr/share/pipewire/pipewire.conf template,
+          # wireplumber, dbus-daemon) installed here.
+          if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ]; then
+            XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg-runtime"
+            mkdir -p "$XDG_RUNTIME_DIR"
+          fi
+          chmod 700 "$XDG_RUNTIME_DIR"
+          export XDG_RUNTIME_DIR
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          # wireplumber exits immediately without a session bus, so give the
+          # daemons a private one (same shape as the isolation harness).
+          export DBUS_SESSION_BUS_ADDRESS="$(dbus-daemon --session --fork --print-address)"
+          nohup pipewire >"$RUNNER_TEMP/pipewire.log" 2>&1 &
+          deadline=$((SECONDS + 15))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            if [ -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then break; fi
+            sleep 0.2
+          done
+          test -S "$XDG_RUNTIME_DIR/pipewire-0"
+          nohup wireplumber >"$RUNNER_TEMP/wireplumber.log" 2>&1 &
+          nohup pipewire-pulse >"$RUNNER_TEMP/pipewire-pulse.log" 2>&1 &
+          # Bounded wait: wall-clock deadline of 30 s (probe execution time
+          # counts against the budget) with every wpctl invocation wrapped in
+          # `timeout 5s`, so a stalled PipeWire connection cannot hang the
+          # step. The routes need a DEFAULT Audio/Sink (wpctl marks it with
+          # `*`) - the fallback auto_null / Dummy Output once wireplumber
+          # adopts it. Never wait forever.
+          ready=""
+          deadline=$((SECONDS + 30))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            if timeout 5s wpctl status 2>/dev/null | sed -n '/Sinks:/,/Sink endpoints:/p' \
+                | grep -F '*' >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then break; fi
+            sleep 0.5
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::no default Audio/Sink appeared within the bounded wait" >&2
+            tail -n 20 "$RUNNER_TEMP"/pipewire.log "$RUNNER_TEMP"/wireplumber.log \
+              "$RUNNER_TEMP"/pipewire-pulse.log || true
+            timeout 5s wpctl status || true
+            exit 1
+          fi
+          timeout 5s wpctl status
       - name: Configure, build and qualify native AASDK and host foundation
         env:
           AA_GOOGLETEST_ARCHIVE: ${{ runner.temp }}/googletest-v1.15.2.tar.gz
