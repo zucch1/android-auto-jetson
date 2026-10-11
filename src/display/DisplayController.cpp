@@ -9,8 +9,13 @@ namespace {
 
 using aa::core::Milliseconds;
 
+#if AA_DISPLAY_HAS_CONSUMER
 // Production decode session: the real todo-23 consumer helper behind the
 // DecodeSession seam (GStreamer stays in aareceiver-consumer's adapter).
+// Compiled ONLY when aareceiver-consumer exists in this configuration
+// (AA_DISPLAY_HAS_CONSUMER, set PRIVATE from that target): HelperSession
+// references the helper's submit/pump/close/destruction, so guarding open()
+// alone would still leave undefined symbols for every downstream link.
 class HelperSession final : public DecodeSession {
 public:
     explicit HelperSession(consumer::DecodeHelper helper) : helper_(std::move(helper)) {}
@@ -27,12 +32,14 @@ public:
 private:
     consumer::DecodeHelper helper_;
 };
+#endif
 
 constexpr std::size_t kReceiveBudget = 16;
 
 } // namespace
 
 DecodeSessionFactory helper_decode_sessions() {
+#if AA_DISPLAY_HAS_CONSUMER
     return [](const consumer::DecodeConfig& config)
                -> core::Result<std::unique_ptr<DecodeSession>> {
         auto opened = consumer::DecodeHelper::open(config);
@@ -42,6 +49,16 @@ DecodeSessionFactory helper_decode_sessions() {
         return std::unique_ptr<DecodeSession>(
             std::make_unique<HelperSession>(std::move(opened.value())));
     };
+#else
+    // Typed-unavailable factory (the rejecting_factory() convention): with no
+    // aareceiver-consumer target in this configuration there is no decoder
+    // backend to open, so every request fails channel_decode_unavailable -
+    // the toolkit-free session logic still compiles AND links everywhere.
+    return [](const consumer::DecodeConfig&)
+               -> core::Result<std::unique_ptr<DecodeSession>> {
+        return Error{ErrorCode::channel_decode_unavailable};
+    };
+#endif
 }
 
 struct DisplayController::Impl final {

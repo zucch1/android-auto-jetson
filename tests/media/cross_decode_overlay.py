@@ -57,7 +57,8 @@ def main() -> int:
     configure_source = root if args.root_project else root / 'tests/media/cross'
     configure_extra = [f'-DAA_GOOGLETEST_ARCHIVE={args.archive.resolve(strict=True)}'] if args.root_project else []
     targets = ['aa_host_smoke', 'aa-decode-probe', 'decode-probe-inputs',
-               'decode-probe-metrics', 'decode-probe-discovery'] if args.root_project else []
+               'decode-probe-metrics', 'decode-probe-discovery',
+               'aa_display_link_check'] if args.root_project else []
     commands = (
         ['cmake', '-S', str(configure_source), '-B', str(build), '-G', 'Ninja',
          f'-DCMAKE_TOOLCHAIN_FILE={root}/toolchains/jetson-aarch64.cmake',

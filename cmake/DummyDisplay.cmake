@@ -57,6 +57,9 @@ endif()
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tools/dummy-display/test_control.hpp")
     message(FATAL_ERROR "AA_DUMMY_DISPLAY_SOURCE_MISSING: tools/dummy-display/test_control.hpp")
 endif()
+if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tests/display/downstream_link_check.cpp")
+    message(FATAL_ERROR "AA_DUMMY_DISPLAY_SOURCE_MISSING: tests/display/downstream_link_check.cpp")
+endif()
 
 add_library(aareceiver-display STATIC ${AA_DISPLAY_SOURCES})
 set_target_properties(aareceiver-display PROPERTIES
@@ -67,6 +70,16 @@ target_link_libraries(aareceiver-display PUBLIC aa_ipc_dbus aa_video aa_input aa
 if(TARGET aareceiver-consumer)
     target_link_libraries(aareceiver-display PUBLIC aareceiver-consumer)
 endif()
+# Typed-unavailable decoder factory selection: AA_DISPLAY_HAS_CONSUMER is set
+# PRIVATE, based SOLELY on the presence of TARGET aareceiver-consumer (a
+# metadata fact of this configuration - never a bypass option). Without the
+# consumer the guarded factory rejects channel_decode_unavailable instead of
+# referencing helper symbols nothing can resolve.
+if(TARGET aareceiver-consumer)
+    target_compile_definitions(aareceiver-display PRIVATE AA_DISPLAY_HAS_CONSUMER=1)
+else()
+    target_compile_definitions(aareceiver-display PRIVATE AA_DISPLAY_HAS_CONSUMER=0)
+endif()
 
 if(TARGET aa_sysroot_hash_gate)
     # Root hash-gate convention: this library cannot compile after a
@@ -75,6 +88,25 @@ if(TARGET aa_sysroot_hash_gate)
 endif()
 
 set(AA_DISPLAY_WARN_TARGETS aareceiver-display)
+if(CMAKE_CROSSCOMPILING)
+    # Build-only downstream link check (PR #36 fix round): a consumer-less
+    # cross configuration previously linked aareceiver-display fine but left
+    # helper_decode_sessions() referencing symbols no archive could resolve -
+    # the failure only surfaced at the NEXT project's link. This target links
+    # ONLY through aareceiver-display (the controller API and the factory pull
+    # the archive objects in) and is built by default in cross configs so the
+    # no-overlay build catches the undefined references. It is never executed
+    # (AArch64) and deliberately adds NO CTest entry - the cross test
+    # inventory stays exact.
+    add_executable(aa_display_link_check tests/display/downstream_link_check.cpp)
+    target_link_libraries(aa_display_link_check PRIVATE aareceiver-display)
+    set_target_properties(aa_display_link_check PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    list(APPEND AA_DISPLAY_WARN_TARGETS aa_display_link_check)
+    if(TARGET aa_sysroot_hash_gate)
+        add_dependencies(aa_display_link_check aa_sysroot_hash_gate)
+    endif()
+endif()
 if(NOT CMAKE_CROSSCOMPILING)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(AA_QT6 REQUIRED IMPORTED_TARGET
@@ -153,9 +185,14 @@ if(NOT CMAKE_CROSSCOMPILING)
     # read timeouts, recording decode session, real video socket).
     add_test(NAME dummy_display_stop_recovery COMMAND "${AA_DBUS_RUN_SESSION}" --
         "$<TARGET_FILE:aa_dummy_display_test>" --gtest_filter=DummyDisplayStopRecovery.*)
+    # Registration-lifecycle regressions (PR #36 fix round): failed
+    # registrations unwind their real-bus name acquisition, duplicates keep
+    # the existing name and unregister releases it (real daemon queueing).
+    add_test(NAME dummy_display_registration COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "$<TARGET_FILE:aa_dummy_display_test>" --gtest_filter=DummyDisplayRegistration.*)
     set_tests_properties(dummy_display_contract_control dummy_display_contract_render
         dummy_display_contract_input dummy_display_contract_absent dummy_display_contract_idle
-        dummy_display_contract_autostart dummy_display_stop_recovery
+        dummy_display_contract_autostart dummy_display_stop_recovery dummy_display_registration
         PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
             TIMEOUT 180)
