@@ -21,8 +21,8 @@ namespace {
     case Qt::Key_Left: return 21;
     case Qt::Key_Right: return 22;
     case Qt::Key_Return:
-    case Qt::Key_Enter: return 23;
-    case Qt::Key_Backspace: return 4;
+    case Qt::Key_Enter: return 66;
+    case Qt::Key_Backspace: return 67;
     case Qt::Key_Escape: return 111;
     case Qt::Key_Space: return 62;
     default: break;

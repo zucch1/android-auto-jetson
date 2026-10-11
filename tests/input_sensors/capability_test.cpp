@@ -17,11 +17,11 @@ TEST(InputSensorsCapability, BenchDescriptorMatchesExpectedExactly) {
     // Given: the exact descriptor this receiver advertises (written out
     // literally here - never derived from the implementation under test).
     const std::vector<std::int32_t> bench_keycodes{
-        4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-        19, 20, 21, 22, 23,
+        7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        19, 20, 21, 22,
         29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
         43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
-        62, 111};
+        62, 66, 67, 111};
     const CapabilityDescriptor expected{
         {InputSource::keyboard_dpad, InputSource::mouse_to_touch},
         bench_keycodes,

@@ -519,6 +519,58 @@ TEST(DummyDisplayContractInput, KeyboardAndMouseNormalizeToSeamEvents) {
     EXPECT_EQ(widget.status_text(), QStringLiteral("projecting"));
 }
 
+TEST(DummyDisplayContractInput, BackspaceReturnAndKeypadEnterMapToDelAndEnter) {
+    // Given: a registered display consumer with its Qt surface active.
+    auto service = ServiceHarness::start();
+    ASSERT_NE(service, nullptr);
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+    qt_app();
+    CountingInputSink sink;
+    aa::display::qt_adapter::ProjectionWidget widget(sink, kCaps);
+    widget.set_status(DisplayState::projecting);
+    RecordingFrameTarget frames{};
+    auto controller = DisplayController::attach(
+        DisplayController::Deps{client.value(), rejecting_factory(), frames},
+        test_config("Keys"));
+    ASSERT_TRUE(controller.has_value());
+
+    // When: Backspace, Return, keypad Enter and the arrow keys hit the Qt
+    // surface as press + release pairs.
+    QKeyEvent backspace_press(QEvent::KeyPress, Qt::Key_Backspace, Qt::NoModifier);
+    QKeyEvent backspace_release(QEvent::KeyRelease, Qt::Key_Backspace, Qt::NoModifier);
+    QKeyEvent return_press(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+    QKeyEvent return_release(QEvent::KeyRelease, Qt::Key_Return, Qt::NoModifier);
+    QKeyEvent keypad_press(QEvent::KeyPress, Qt::Key_Enter, Qt::NoModifier);
+    QKeyEvent keypad_release(QEvent::KeyRelease, Qt::Key_Enter, Qt::NoModifier);
+    QKeyEvent down_press(QEvent::KeyPress, Qt::Key_Down, Qt::NoModifier);
+    QKeyEvent down_release(QEvent::KeyRelease, Qt::Key_Down, Qt::NoModifier);
+    QKeyEvent left_press(QEvent::KeyPress, Qt::Key_Left, Qt::NoModifier);
+    QKeyEvent left_release(QEvent::KeyRelease, Qt::Key_Left, Qt::NoModifier);
+    QKeyEvent right_press(QEvent::KeyPress, Qt::Key_Right, Qt::NoModifier);
+    QKeyEvent right_release(QEvent::KeyRelease, Qt::Key_Right, Qt::NoModifier);
+    for (QKeyEvent* event : {&backspace_press, &backspace_release, &return_press, &return_release,
+                            &keypad_press, &keypad_release, &down_press, &down_release,
+                            &left_press, &left_release, &right_press, &right_release}) {
+        QApplication::sendEvent(&widget, event);
+    }
+
+    // Then: Backspace is Android DEL (67), Return and keypad Enter are both
+    // Android ENTER (66) - never BACK (4) or DPAD_CENTER (23) - and the
+    // arrows keep their unchanged 19-22 codes.
+    ASSERT_EQ(sink.events.size(), 12U);
+    const std::vector<KeyEvent> expected{
+        KeyEvent{67, true},  KeyEvent{67, false}, KeyEvent{66, true},  KeyEvent{66, false},
+        KeyEvent{66, true},  KeyEvent{66, false}, KeyEvent{20, true},  KeyEvent{20, false},
+        KeyEvent{21, true},  KeyEvent{21, false}, KeyEvent{22, true},  KeyEvent{22, false},
+    };
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const auto* key = std::get_if<KeyEvent>(&sink.events[index]);
+        ASSERT_NE(key, nullptr) << "event " << index << " is not a key";
+        EXPECT_EQ(*key, expected[index]) << "event " << index;
+    }
+}
+
 TEST(DummyDisplayContractAbsent, ReceiverAbsentShowsUnavailableWithoutStartingHelper) {
     // Given: a bus with NO receiver owning the contract name.
     qt_app();

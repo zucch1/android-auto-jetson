@@ -190,4 +190,49 @@ TEST(InputSensorsInput, AdvertisedKeyWithoutKeyboardSourceIsRefusedTypedAndNever
     EXPECT_EQ(service.rejected(), 1U);
 }
 
+TEST(InputSensorsInput, BenchDefaultsAcceptDelAndEnterKeycodes) {
+    // Given: the bench service (the advertised set now carries 66 ENTER and
+    // 67 DEL, the corrected Backspace/Return semantics).
+    PhoneFixture phone;
+    InputService service(CapabilityDescriptor::bench_defaults(), phone);
+
+    // When: DEL (67) and ENTER (66) press/release pairs are submitted.
+    ASSERT_TRUE(service.submit(ipc::InputEvent{ipc::KeyEvent{67, true}}));
+    ASSERT_TRUE(service.submit(ipc::InputEvent{ipc::KeyEvent{67, false}}));
+    ASSERT_TRUE(service.submit(ipc::InputEvent{ipc::KeyEvent{66, true}}));
+    ASSERT_TRUE(service.submit(ipc::InputEvent{ipc::KeyEvent{66, false}}));
+
+    // Then: all four reach the phone fixture normalized.
+    const std::vector<NormalizedInput> expected{
+        NormalizedKey{67, true},
+        NormalizedKey{67, false},
+        NormalizedKey{66, true},
+        NormalizedKey{66, false},
+    };
+    EXPECT_EQ(phone.input, expected);
+    EXPECT_EQ(service.forwarded(), 4U);
+    EXPECT_EQ(service.rejected(), 0U);
+}
+
+TEST(InputSensorsInput, BenchDefaultsRejectBackAndDpadCenterKeycodes) {
+    // Given: the bench service (no remaining widget mapping produces BACK 4
+    // or DPAD_CENTER 23, so neither is advertised).
+    PhoneFixture phone;
+    InputService service(CapabilityDescriptor::bench_defaults(), phone);
+
+    // When: keycode 4 and keycode 23 are submitted.
+    const auto refused_back = service.submit(ipc::InputEvent{ipc::KeyEvent{4, true}});
+    const auto refused_center = service.submit(ipc::InputEvent{ipc::KeyEvent{23, true}});
+
+    // Then: the capability gate refuses both typed and the phone fixture sees
+    // nothing.
+    ASSERT_FALSE(refused_back);
+    EXPECT_EQ(refused_back.error().code(), aa::ErrorCode::channel_unsupported_capability);
+    ASSERT_FALSE(refused_center);
+    EXPECT_EQ(refused_center.error().code(), aa::ErrorCode::channel_unsupported_capability);
+    EXPECT_TRUE(phone.input.empty());
+    EXPECT_EQ(service.forwarded(), 0U);
+    EXPECT_EQ(service.rejected(), 2U);
+}
+
 } // namespace
