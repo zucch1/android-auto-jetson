@@ -128,7 +128,8 @@ core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingReques
         return Error{ErrorCode::session_pairing_timeout};
     }
     // The identity bound at request time is what gets approved; the candidate
-    // slot may have changed since and is never consulted here (no TOCTOU).
+    // slot may have changed since and is never consulted here (no TOCTOU;
+    // SNAPSHOT-ONLY PAIRING CONTRACT in PairingPolicy.hpp).
     const TransportIdentity identity = std::move(pending_[index].identity);
     drop_at(index);
     return store_.approve(identity);

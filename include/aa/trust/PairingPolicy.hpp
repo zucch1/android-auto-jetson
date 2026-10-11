@@ -20,6 +20,13 @@
 // NOT cryptographic proof; USB identifier spoofing is a known, documented
 // limitation of the wired trust boundary.
 //
+// SNAPSHOT-ONLY PAIRING CONTRACT: approval is bound to the canonical identity
+// captured when RequestAddPhone succeeds, not to the currently connected
+// transport. A candidate swap after the request cannot change what the
+// matching confirm approves. ForgetPhone invalidates outstanding requests for
+// the forgotten identity. This snapshot-only behavior requires explicit owner
+// acceptance.
+//
 // Time: the policy reads an injected Clock so window expiry is deterministic
 // and testable without sleeps. The clock seam lives here (not in aa::session)
 // because trust is the lower module.
@@ -85,7 +92,7 @@ public:
     // Transport/session side: record the phone identity currently presenting
     // itself for approval (the discovered-but-unapproved phone). The identity
     // is bound at pairing_requested time so a later swap cannot change what an
-    // in-flight confirm approves.
+    // in-flight confirm approves (SNAPSHOT-ONLY PAIRING CONTRACT above).
     void note_candidate(TransportIdentity identity);
 
     [[nodiscard]] const std::optional<TransportIdentity>& candidate() const noexcept {
