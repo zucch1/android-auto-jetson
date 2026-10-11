@@ -14,21 +14,52 @@ constexpr std::uint32_t kMaxViewportDpi = 2000;
 
 } // namespace
 
-core::Result<ControlService::Registered> ControlService::require_consumer() const {
+core::Result<ControlService::Registered> ControlService::require_consumer() {
+    refresh_consumer_owner();
     if (!registered_.has_value()) {
         return Error{ErrorCode::ipc_consumer_rejected};
     }
     return *registered_;
 }
 
-core::Result<void> ControlService::admit(const BusName& caller, const Registered& active) const {
+void ControlService::teardown(std::string_view reason, DiagnosticSeverity severity) {
+    const auto consumer = registered_->consumer;
+    if (projection_ == ProjectionState::projecting) {
+        projection_ = ProjectionState::stopped;
+        events_.emit(StateChanged{ProjectionState::stopped, consumer});
+    }
+    for (const auto request : gate_.close_all()) {
+        phones_.pairing_cancelled(request);
+        events_.emit(PairingClosed{request});
+    }
+    registered_.reset();
+    viewport_.reset();
+    events_.emit(StateChanged{ProjectionState::stopped, core::ConsumerId{}});
+    events_.emit(DiagnosticEmitted{severity, reason, consumer.value});
+}
+
+void ControlService::refresh_consumer_owner() {
+    if (!registered_.has_value()) {
+        return;
+    }
+    const auto owner = credentials_.name_owner(registered_->name);
+    if (!owner.has_value() || !(owner.value() == registered_->connection)) {
+        teardown("consumer_owner_lost", DiagnosticSeverity::warning);
+    }
+}
+
+core::Result<void> ControlService::admit(const BusName& caller, const Registered& active) {
     const auto uid = credentials_.unix_uid(caller);
     if (!uid.has_value()) {
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "access_denied", 0});
         return Error{ErrorCode::ipc_peer_unauthorized};
     }
     const auto owner = credentials_.name_owner(active.name);
-    const bool owns_name = owner.has_value() && owner.value() == caller;
+    if (!owner.has_value() || !(owner.value() == active.connection)) {
+        teardown("consumer_owner_lost", DiagnosticSeverity::warning);
+        return Error{ErrorCode::ipc_peer_unauthorized};
+    }
+    const bool owns_name = owner.value() == caller;
     const ConsumerIdentity caller_identity{
         owns_name && caller == active.connection ? active.consumer : core::ConsumerId{},
         uid.value()};
@@ -53,6 +84,7 @@ core::Result<core::ConsumerId> ControlService::register_consumer(const BusName& 
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "access_denied", 0});
         return Error{ErrorCode::ipc_peer_unauthorized};
     }
+    refresh_consumer_owner();
     if (registered_.has_value()) {
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "consumer_rejected", 0});
         return Error{ErrorCode::ipc_consumer_rejected};
@@ -73,19 +105,7 @@ core::Result<void> ControlService::unregister_consumer(const BusName& caller) {
     if (!admitted.has_value()) {
         return admitted.error();
     }
-    const auto consumer = active.value().consumer;
-    if (projection_ == ProjectionState::projecting) {
-        projection_ = ProjectionState::stopped;
-        events_.emit(StateChanged{ProjectionState::stopped, consumer});
-    }
-    for (const auto request : gate_.close_all()) {
-        phones_.pairing_cancelled(request);
-        events_.emit(PairingClosed{request});
-    }
-    registered_.reset();
-    events_.emit(StateChanged{ProjectionState::stopped, core::ConsumerId{}});
-    events_.emit(
-        DiagnosticEmitted{DiagnosticSeverity::info, "consumer_unregistered", consumer.value});
+    teardown("consumer_unregistered", DiagnosticSeverity::info);
     return {};
 }
 
@@ -238,7 +258,8 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
     return {};
 }
 
-StateSnapshot ControlService::state() const noexcept {
+StateSnapshot ControlService::state() {
+    refresh_consumer_owner();
     return StateSnapshot{projection_,
                          registered_.has_value() ? registered_->consumer : core::ConsumerId{}};
 }

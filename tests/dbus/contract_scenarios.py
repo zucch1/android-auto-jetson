@@ -4,7 +4,7 @@
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
-# Run: python3 -B tests/dbus/contract_scenarios.py ROOT CASE
+# Run: python3 -B tests/dbus/contract_scenarios.py ROOT CASE [CXX]
 """D-Bus contract schema/codegen scenarios (task 21, gate round 1 fixes).
 
 The happy cases run the shipped tool over the real checked contract XML. Every
@@ -13,6 +13,12 @@ and overflowing major versions, a high-rate video payload method, duplicate
 members, invalid argument directions, masked bulk signatures and SemVer
 mismatches) and requires the generate step to fail closed with its named
 DBUS_CONTRACT_* diagnostics while writing NO output header.
+
+Embedding verification (round 3) compiles a tiny probe against the generated
+header with the native compiler (passed from CMake as CXX), executes it, and
+byte-compares what the COMPILED kIntrospectionXml actually contains against the
+fixture bytes — adversarial raw-string delimiters, quotes, backslashes,
+non-ASCII UTF-8 and CRLF input must all round-trip exactly.
 """
 from __future__ import annotations
 
@@ -31,6 +37,26 @@ METHOD_NAMES: Final[tuple[str, ...]] = (
     "RequestAddPhone", "ConfirmPhonePairing", "CancelPhonePairing", "ForgetPhone",
     "GetState", "GetCapabilities", "SetDisplayViewport", "Ping",
 )
+PROBE_SOURCE: Final[str] = """#include <aa/ipc/dbus_contract.generated.hpp>
+#include <cstdio>
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        return 2;
+    }
+    std::FILE* out = std::fopen(argv[1], "wb");
+    if (out == nullptr) {
+        return 3;
+    }
+    const auto written = std::fwrite(aa::ipc::dbus_contract::kIntrospectionXml.data(), 1,
+                                     aa::ipc::dbus_contract::kIntrospectionXml.size(), out);
+    if (std::fclose(out) != 0) {
+        return 4;
+    }
+    return written == aa::ipc::dbus_contract::kIntrospectionXml.size() ? 0 : 5;
+}
+"""
+
+CXX: str | None = None
 
 
 def run_tool(*, mode: str, xml: Path, out: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -58,6 +84,9 @@ def expect_failure(result: subprocess.CompletedProcess[str], markers: tuple[str,
 
 def reject(root: Path, transform: Callable[[str], str], case: str,
            markers: tuple[str, ...]) -> int:
+    """Runs a mutated fixture through BOTH tool modes: `check` and `generate`
+    must each fail closed with the named diagnostics, and `generate` must not
+    write a header."""
     text = (root / CONTRACT).read_text(encoding="utf-8")
     changed = transform(text)
     if changed == text:
@@ -66,9 +95,64 @@ def reject(root: Path, transform: Callable[[str], str], case: str,
     scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-"))
     fixture = scratch / "mutated.xml"
     fixture.write_text(changed, encoding="utf-8")
+    verdict = expect_failure(run_tool(mode="check", xml=fixture), markers,
+                             f"{case}[check]", None)
     out = scratch / "should_not_exist.generated.hpp"
     result = run_tool(mode="generate", xml=fixture, out=out)
-    return expect_failure(result, markers, case, out)
+    return verdict | expect_failure(result, markers, f"{case}[generate]", out)
+
+
+def generated_path(scratch: Path) -> Path:
+    return scratch / "gen" / "aa" / "ipc" / "dbus_contract.generated.hpp"
+
+
+def compile_and_compare(generated: Path, expected_bytes: bytes, case: str) -> int:
+    """Compiles the probe against the generated header with the native
+    compiler, runs it, and byte-compares the COMPILED embedding value against
+    the fixture bytes (independent of any source-text assumptions)."""
+    if CXX is None:
+        print(f"{case}: native compiler argument (CXX) is required for embedding verification")
+        return 1
+    scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-probe-"))
+    probe = scratch / "probe.cpp"
+    probe.write_text(PROBE_SOURCE, encoding="utf-8")
+    binary = scratch / "probe"
+    build = subprocess.run(
+        [CXX, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-I", str(generated.parents[2]),
+         str(probe), "-o", str(binary)],
+        capture_output=True, text=True, check=False)
+    if build.returncode != 0:
+        print(f"{case}: probe failed to compile\n{build.stdout}{build.stderr}")
+        return 1
+    embedded = scratch / "embedded.bin"
+    run = subprocess.run([str(binary), str(embedded)], capture_output=True, text=True, check=False)
+    if run.returncode != 0:
+        print(f"{case}: probe failed to run (exit {run.returncode})\n{run.stdout}{run.stderr}")
+        return 1
+    actual = embedded.read_bytes()
+    if actual != expected_bytes:
+        print(f"{case}: compiled embedding differs from the fixture "
+              f"({len(actual)} vs {len(expected_bytes)} bytes)")
+        return 1
+    return 0
+
+
+def round_trip(root: Path, transform: Callable[[bytes], bytes], case: str) -> int:
+    original = (root / CONTRACT).read_bytes()
+    changed = transform(original)
+    if changed == original:
+        print(f"{case}: fixture transform did not change the contract")
+        return 1
+    scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-"))
+    fixture = scratch / "mutated.xml"
+    fixture.write_bytes(changed)
+    out = generated_path(scratch)
+    result = run_tool(mode="generate", xml=fixture, out=out)
+    if result.returncode != 0 or not out.is_file():
+        print(f"{case}: expected successful generation for adversarial input\n"
+              f"{result.stdout}{result.stderr}")
+        return 1
+    return compile_and_compare(out, changed, case)
 
 
 def case_real_check(root: Path) -> int:
@@ -84,16 +168,12 @@ def case_real_check(root: Path) -> int:
 
 def case_real_generate(root: Path) -> int:
     scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-"))
-    out = scratch / "dbus_contract.generated.hpp"
+    out = generated_path(scratch)
     result = run_tool(mode="generate", xml=root / CONTRACT, out=out)
     if result.returncode != 0 or not out.is_file():
         print(f"real-generate: expected generated header\n{result.stdout}{result.stderr}")
         return 1
     generated = out.read_text(encoding="utf-8")
-    checked = (root / CONTRACT).read_text(encoding="utf-8")
-    if checked not in generated:
-        print("real-generate: generated header does not embed the checked schema bytes")
-        return 1
     if 'kInterfaceName = "org.custom.AndroidAutoReceiver1"' not in generated:
         print("real-generate: missing interface metadata")
         return 1
@@ -107,16 +187,19 @@ def case_real_generate(root: Path) -> int:
         if f'"{name}"' not in generated:
             print(f"real-generate: missing method name {name}")
             return 1
-    return 0
+    return compile_and_compare(out, (root / CONTRACT).read_bytes(), "real-generate")
 
 
 def case_neg_malformed_xml(root: Path) -> int:
     scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-"))
     fixture = scratch / "malformed.xml"
     fixture.write_text("<node name=\"/org/custom/AndroidAutoReceiver\"><interface", encoding="utf-8")
+    markers = ("DBUS_CONTRACT_MALFORMED_XML",)
+    verdict = expect_failure(run_tool(mode="check", xml=fixture), markers,
+                             "neg-malformed-xml[check]", None)
     out = scratch / "should_not_exist.generated.hpp"
     result = run_tool(mode="generate", xml=fixture, out=out)
-    return expect_failure(result, ("DBUS_CONTRACT_MALFORMED_XML",), "neg-malformed-xml", out)
+    return verdict | expect_failure(result, markers, "neg-malformed-xml[generate]", out)
 
 
 def case_neg_unsupported_major(root: Path) -> int:
@@ -243,6 +326,267 @@ def case_neg_multi_type_signal(root: Path) -> int:
         "neg-multi-type-signal", ("DBUS_CONTRACT_BAD_SIGNATURE",))
 
 
+def case_neg_raw_delimiter_injection(root: Path) -> int:
+    # Adversarial-input regression (NOT a rejection expectation): a valid XML
+    # comment carrying the old raw-string closing delimiter must survive
+    # validation and embed byte-exactly.
+    return round_trip(
+        root,
+        lambda data: data.replace(b'<interface name=',
+                                  b'<!-- )aa_dbus_xml" -->\n  <interface name=', 1),
+        "neg-raw-delimiter-injection")
+
+
+def case_embedding_special_bytes(root: Path) -> int:
+    comment = ('<!-- "quoted" back\\slash \u00e9\u65e5 )aa_dbus_xml" '
+               'R"aa_dbus_xml( tail -->').encode("utf-8")
+    return round_trip(
+        root,
+        lambda data: data.replace(b'<interface name=', comment + b'\n  <interface name=', 1),
+        "embedding-special-bytes")
+
+
+def case_embedding_crlf(root: Path) -> int:
+    return round_trip(root, lambda data: data.replace(b"\n", b"\r\n"), "embedding-crlf")
+
+
+
+# --- structural-allowlist regressions (round 3 review) ------------------------
+
+ANNOTATION_TAG = '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.0.0"/>'
+PROPERTY_TAG = '<property name="ContractSemVer" type="s" access="read"/>'
+NODE_OPEN = '<node name="/org/custom/AndroidAutoReceiver">'
+INTERFACE_OPEN = '<interface name="org.custom.AndroidAutoReceiver1">'
+
+
+def case_neg_unexpected_root_child(root: Path) -> int:
+    for label, injected in (
+            ("stray", '<method name="Stray"/>'),
+            ("nested-node", '<node name="/org/custom/Other"/>')):
+        verdict = reject(
+            root,
+            lambda text, injected=injected: text.replace(
+                NODE_OPEN, f"{NODE_OPEN}\n  {injected}", 1),
+            f"neg-unexpected-root-child[{label}]", ("DBUS_CONTRACT_UNEXPECTED_ELEMENT",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_unexpected_nested_element(root: Path) -> int:
+    containers = (
+        ('<method name="StartProjection">\n    </method>',
+         '<method name="StartProjection"><bogus/></method>'),
+        ('<signal name="PairingRequest">', '<signal name="PairingRequest">\n      <bogus/>'),
+        (PROPERTY_TAG, '<property name="ContractSemVer" type="s" access="read"><bogus/></property>'),
+        ('<arg name="consumer_name" type="s" direction="in"/>',
+         '<arg name="consumer_name" type="s" direction="in"><bogus/></arg>'),
+        (ANNOTATION_TAG,
+         '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
+         ' value="1.0.0"><bogus/></annotation>'),
+    )
+    for label, (original, replaced) in zip(
+            ("method", "signal", "property", "arg", "annotation"), containers, strict=True):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-unexpected-nested-element[{label}]",
+            ("DBUS_CONTRACT_UNEXPECTED_ELEMENT",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_unexpected_attribute(root: Path) -> int:
+    targets = (
+        (NODE_OPEN, '<node name="/org/custom/AndroidAutoReceiver" role="x">'),
+        (INTERFACE_OPEN, '<interface name="org.custom.AndroidAutoReceiver1" role="x">'),
+        ('<method name="Ping">', '<method name="Ping" role="x">'),
+        ('<signal name="PairingRequest">', '<signal name="PairingRequest" role="x">'),
+        (PROPERTY_TAG, '<property name="ContractSemVer" type="s" access="read" role="x"/>'),
+        ('<arg name="consumer_name" type="s" direction="in"/>',
+         '<arg name="consumer_name" type="s" direction="in" role="x"/>'),
+        (ANNOTATION_TAG,
+         '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
+         ' value="1.0.0" role="x"/>'),
+    )
+    for label, (original, replaced) in zip(
+            ("node", "interface", "method", "signal", "property", "arg", "annotation"),
+            targets, strict=True):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-unexpected-attribute[{label}]",
+            ("DBUS_CONTRACT_UNEXPECTED_ATTRIBUTE",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_missing_attribute(root: Path) -> int:
+    targets = (
+        ("method-name", '<method name="Ping">', '<method>'),
+        ("arg-type", '<arg name="consumer_name" type="s" direction="in"/>',
+         '<arg name="consumer_name" direction="in"/>'),
+        ("property-access", PROPERTY_TAG, '<property name="ContractSemVer" type="s"/>'),
+        ("annotation-value", ANNOTATION_TAG,
+         '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"/>'),
+    )
+    for label, original, replaced in targets:
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-missing-attribute[{label}]",
+            ("DBUS_CONTRACT_MISSING_ATTRIBUTE",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_unexpected_text(root: Path) -> int:
+    for label, original, replaced in (
+            ("text", '<method name="Ping">', '<method name="Ping">oops'),
+            ("tail", '<arg name="monotonic_ns" type="t" direction="out"/>',
+             '<arg name="monotonic_ns" type="t" direction="out"/>oops')):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-unexpected-text[{label}]", ("DBUS_CONTRACT_UNEXPECTED_TEXT",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_duplicate_annotation(root: Path) -> int:
+    conflicting = ANNOTATION_TAG.replace('value="1.0.0"', 'value="2.0.0"')
+    for label, replacements in (
+            ("identical", ANNOTATION_TAG + "\n    " + ANNOTATION_TAG),
+            ("conflicting", ANNOTATION_TAG + "\n    " + conflicting),
+            ("conflicting-reversed", conflicting + "\n    " + ANNOTATION_TAG)):
+        verdict = reject(
+            root,
+            lambda text, replacements=replacements: text.replace(
+                ANNOTATION_TAG, replacements, 1),
+            f"neg-duplicate-annotation[{label}]",
+            ("DBUS_CONTRACT_DUPLICATE_ANNOTATION",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_unexpected_annotation(root: Path) -> int:
+    for label, original, replaced in (
+            ("renamed", ANNOTATION_TAG,
+             '<annotation name="org.freedesktop.DBus.GLib.CSymbol" value="1.0.0"/>'),
+            ("nested", '<method name="Ping">',
+             '<method name="Ping">\n      ' + ANNOTATION_TAG)):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-unexpected-annotation[{label}]",
+            ("DBUS_CONTRACT_UNEXPECTED_ANNOTATION",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_doctype(root: Path) -> int:
+    return reject(
+        root,
+        lambda text: text.replace(
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE node [<!ELEMENT node ANY>]>', 1),
+        "neg-doctype", ("DBUS_CONTRACT_UNEXPECTED_DOCTYPE",))
+
+
+def case_neg_processing_instruction(root: Path) -> int:
+    return reject(
+        root,
+        lambda text: text.replace(
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<?xml version="1.0" encoding="UTF-8"?>\n<?work target?>', 1),
+        "neg-processing-instruction",
+        ("DBUS_CONTRACT_UNEXPECTED_PROCESSING_INSTRUCTION",))
+
+
+def case_neg_namespace(root: Path) -> int:
+    for label, original, replaced in (
+            ("decl", INTERFACE_OPEN,
+             '<interface name="org.custom.AndroidAutoReceiver1" xmlns:foo="urn:foo">'),
+            ("name", INTERFACE_OPEN,
+             '<interface name="org.custom.AndroidAutoReceiver1"'
+             ' xmlns:foo="urn:foo" foo:role="x">')):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-namespace[{label}]", ("DBUS_CONTRACT_UNEXPECTED_NAMESPACE",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+
+def case_neg_lexical_replay_bypass(root: Path) -> int:
+    # Round-3 review regression: a namespace URI containing the old replay
+    # separator aborted the lexical replay (swallowed ExpatError), hiding both
+    # the declaration and a following processing instruction from validation.
+    for label, opened in (
+            ("pipe-uri",
+             '<node name="/org/custom/AndroidAutoReceiver" xmlns:unused="urn:test|bypass">'),
+            ("pipe-uri-pi",
+             '<node name="/org/custom/AndroidAutoReceiver"'
+             ' xmlns:unused="urn:test|bypass"><?review bypass?>')):
+        markers = ["DBUS_CONTRACT_UNEXPECTED_NAMESPACE"]
+        if label == "pipe-uri-pi":
+            markers.append("DBUS_CONTRACT_UNEXPECTED_PROCESSING_INSTRUCTION")
+        verdict = reject(
+            root,
+            lambda text, opened=opened: text.replace(NODE_OPEN, opened, 1),
+            f"neg-lexical-replay-bypass[{label}]", tuple(markers))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_invalid_preserves_existing_header(root: Path) -> int:
+    # Fail-closed write discipline: codegen must not clobber an existing
+    # header when the schema is invalid.
+    base = (root / CONTRACT).read_text(encoding="utf-8")
+    fixtures = (
+        ("extra-attribute",
+         base.replace(ANNOTATION_TAG,
+                      '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
+                      ' value="1.0.0" role="x"/>', 1),
+         ("DBUS_CONTRACT_UNEXPECTED_ATTRIBUTE",)),
+        ("lexical-bypass",
+         base.replace(NODE_OPEN,
+                      '<node name="/org/custom/AndroidAutoReceiver"'
+                      ' xmlns:unused="urn:test|bypass">', 1),
+         ("DBUS_CONTRACT_UNEXPECTED_NAMESPACE",)),
+    )
+    verdict = 0
+    for label, changed, markers in fixtures:
+        scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-"))
+        fixture = scratch / "mutated.xml"
+        fixture.write_text(changed, encoding="utf-8")
+        out = scratch / "existing.generated.hpp"
+        sentinel = b"\x00\x01 sentinel-not-a-header \xfe\xff"
+        out.write_bytes(sentinel)
+        result = run_tool(mode="generate", xml=fixture, out=out)
+        verdict |= expect_failure(result, markers,
+                                  f"neg-invalid-preserves-existing-header[{label}]", None)
+        if out.read_bytes() != sentinel:
+            print(f"neg-invalid-preserves-existing-header[{label}]: existing header was clobbered")
+            verdict = 1
+    return verdict
+
+
 CASES: dict[str, Callable[[Path], int]] = {
     "real-check": case_real_check,
     "real-generate": case_real_generate,
@@ -259,15 +603,32 @@ CASES: dict[str, Callable[[Path], int]] = {
     "neg-masking-duplicate": case_neg_masking_duplicate,
     "neg-multi-type-method": case_neg_multi_type_method,
     "neg-multi-type-signal": case_neg_multi_type_signal,
+    "neg-raw-delimiter-injection": case_neg_raw_delimiter_injection,
+    "embedding-special-bytes": case_embedding_special_bytes,
+    "embedding-crlf": case_embedding_crlf,
+    "neg-unexpected-root-child": case_neg_unexpected_root_child,
+    "neg-unexpected-nested-element": case_neg_unexpected_nested_element,
+    "neg-unexpected-attribute": case_neg_unexpected_attribute,
+    "neg-missing-attribute": case_neg_missing_attribute,
+    "neg-unexpected-text": case_neg_unexpected_text,
+    "neg-duplicate-annotation": case_neg_duplicate_annotation,
+    "neg-unexpected-annotation": case_neg_unexpected_annotation,
+    "neg-doctype": case_neg_doctype,
+    "neg-processing-instruction": case_neg_processing_instruction,
+    "neg-namespace": case_neg_namespace,
+    "neg-lexical-replay-bypass": case_neg_lexical_replay_bypass,
+    "neg-invalid-preserves-existing-header": case_neg_invalid_preserves_existing_header,
 }
 
 
 def main() -> int:
-    if len(sys.argv) != 3 or sys.argv[2] not in CASES:
-        print(f"usage: {sys.argv[0]} ROOT {'|'.join(CASES)}")
+    if len(sys.argv) not in (3, 4) or sys.argv[2] not in CASES:
+        print(f"usage: {sys.argv[0]} ROOT {'|'.join(CASES)} [CXX]")
         return 2
     root = Path(sys.argv[1])
     case = sys.argv[2]
+    global CXX
+    CXX = sys.argv[3] if len(sys.argv) == 4 else None
     verdict = CASES[case](root)
     print(f"{case}: {'PASS' if verdict == 0 else 'FAIL'}")
     return verdict

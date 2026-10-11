@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -22,7 +23,15 @@ public:
     void add_connection(const BusName& name, std::uint32_t uid) { uids_[name.value] = uid; }
     void set_owner(const BusName& name, const BusName& owner) {
         owners_[name.value] = owner.value;
+        failing_.erase(name.value);
     }
+    // Owner-removal double: the bus daemon reports the name as unowned.
+    void remove_owner(const BusName& name) { owners_.erase(name.value); }
+    // Controllable lookup-failure double: name_owner fails with a transport
+    // error (distinct from the production ipc_peer_unauthorized collapse) so
+    // regressions prove that ANY unverifiable lookup revokes authority.
+    void fail_owner_lookup(const BusName& name) { failing_.insert(name.value); }
+    void restore_owner_lookup(const BusName& name) { failing_.erase(name.value); }
 
     [[nodiscard]] core::Result<std::uint32_t> unix_uid(const BusName& name) const override {
         const auto found = uids_.find(name.value);
@@ -33,6 +42,9 @@ public:
     }
 
     [[nodiscard]] core::Result<BusName> name_owner(const BusName& name) const override {
+        if (failing_.contains(name.value)) {
+            return Error{ErrorCode::transport_io};
+        }
         const auto found = owners_.find(name.value);
         if (found == owners_.end()) {
             return Error{ErrorCode::ipc_peer_unauthorized};
@@ -43,6 +55,7 @@ public:
 private:
     std::map<std::string, std::uint32_t> uids_{};
     std::map<std::string, std::string> owners_{};
+    std::set<std::string> failing_{};
 };
 
 class RecordingEventSink final : public ControlEventSink {
@@ -92,6 +105,21 @@ public:
 
 private:
     std::uint64_t next_;
+};
+
+// Adversarial id source: wraps around its period, so an unremembered id would
+// be reissued. The gate's issued history must refuse every reissue.
+class CyclingPairingIds final : public PairingIdSource {
+public:
+    explicit CyclingPairingIds(std::uint64_t period) : period_(period) {}
+
+    [[nodiscard]] core::PairingRequestId next() override {
+        return core::PairingRequestId{(next_++ % period_) + 1};
+    }
+
+private:
+    std::uint64_t period_;
+    std::uint64_t next_{0};
 };
 
 class RecordingPhoneDirectory final : public PhoneDirectory {

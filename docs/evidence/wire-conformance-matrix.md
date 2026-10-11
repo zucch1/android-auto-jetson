@@ -130,7 +130,7 @@ theming request (0x8011) **only** via 0x8012. Never treat 0x800A as a reply.
 | **D16-SDP-ORDER** | high | PROPOSED | OAA: HU sends SDP response FIRST; aasdk/ours: request→response. **Probe question #1** |
 | D17-OPEN-DIR-CLAIM | medium | PROPOSED | ChannelOpenRequest: OAA proto Phone→HU vs OAA docs HU→Phone. **Probe question #2** |
 | D18-CHANNELMAP-CTRL | low | RESOLVED | channel-map control table inverted/wrong content — don't cite it |
-| D19-OAA-02-FLAGS | low | RESOLVED | 02-version doc flags 0x00 typo; ours matches architecture table (0x07) |
+| D19-OAA-02-FLAGS | low | RESOLVED | 02-version doc flags 0x00 typo AND misannotated "MessageType CONTROL" (means control-CHANNEL, not the M bit): canonical version-request frame kind is **0x03 (SPECIFIC)** per pinned aasdk `sendVersionRequest` + live S24 probe (2026-10-10); the 0x07 (CONTROL) form is a misannotation-derived variant this phone's framer ignores (8 frames, zero response). Record-only fix (encoder already matched); F-A re-pinned 0x03 canonical, 0x07 kept as variant F-A2 |
 | D20-VIDFOCUS-OAA-DOCS | low-med | RESOLVED | interactions/04 swaps 0x8007/0x8008; 17.3 ledger + gold protos anchor Phone→HU / HU→phone |
 | D21-AUDIOFOCUS-NAME | low | PROPOSED | 0x0012/0x0013 request/response naming |
 | D22-VOICE-NAME | low | PROPOSED | 0x0011 request-vs-notification naming |

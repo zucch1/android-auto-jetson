@@ -1,0 +1,14 @@
+# STAGED + INSTALLED (same night, post drift-discovery). Companion to rtl8822ce-regd-shim.service.
+[Unit]
+Description=Re-assert US regd on rtl8822ce self-managed wiphy (vendor driver clobbers shim on mode transitions)
+After=rtl8822ce-regd-shim.service
+Wants=rtl8822ce-regd-shim.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/rtl8822ce-regd-watchdog
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
