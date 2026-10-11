@@ -5,7 +5,11 @@
 
 #include <aa/ipc/VideoChannel.hpp>
 
+#include <array>
+#include <atomic>
+#include <barrier>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -15,7 +19,10 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <optional>
+#include <signal.h>
 #include <string>
+#include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -51,19 +58,6 @@ int open_fd_count() {
     return count - 2;
 }
 
-bool leave_stale_socket_node(const std::string& path) {
-    const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        return false;
-    }
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
-    const bool bound = ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
-    ::close(fd);
-    return bound;
-}
-
 bool write_file(const std::string& path, const char* body) {
     std::FILE* file = std::fopen(path.c_str(), "wb");
     if (file == nullptr) {
@@ -75,31 +69,13 @@ bool write_file(const std::string& path, const char* body) {
     return written;
 }
 
-bool streams_one_unit(VideoServer& server, const VideoSocketPath& path) {
-    aa::core::Result<VideoConsumer> client{VideoConsumer{}};
-    std::thread connector([&] {
-        client = connect_video_consumer(
-            path, VideoClientOptions{{}, current_uid(), aa::core::Milliseconds{kTimeoutMs}});
-    });
-    auto producer = server.accept_consumer(aa::core::Milliseconds{kTimeoutMs});
-    connector.join();
-    if (!producer || !client) {
-        return false;
-    }
-    const std::vector<std::uint8_t> payload{0x5a};
-    if (!producer.value().send_access_unit({1, 1, true, payload})) {
-        return false;
-    }
-    const auto step = client.value().receive(aa::core::Milliseconds{kTimeoutMs});
-    return step && step.value() == ReceiveStatus::complete;
-}
-
 std::string directory_of(const VideoSocketPath& path) {
     return path.value.substr(0, path.value.find_last_of('/'));
 }
 
 void cleanup_runtime(const std::string& runtime, const std::string& leaf) {
     ::unlink(leaf.c_str());
+    videotest::remove_startup_lock(leaf);
     ::rmdir((runtime + "/android-auto-receiver").c_str());
     ::rmdir(runtime.c_str());
 }
@@ -258,7 +234,7 @@ TEST(VideoOwnership, PrepareRefusesLiveEndpointAndLeavesItIntact) {
     ASSERT_FALSE(refused);
     EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unavailable);
     EXPECT_TRUE(node_exists(path.value));
-    EXPECT_TRUE(streams_one_unit(server.value(), path));
+    EXPECT_TRUE(videotest::streams_one_unit(server.value(), path));
 
     server.value().close();
     cleanup_runtime(runtime, path.value);
@@ -320,7 +296,7 @@ TEST(VideoOwnership, ServerTeardownKeepsReplacementEndpoint) {
 
     first.value().close();
     EXPECT_TRUE(node_exists(path.value));
-    EXPECT_TRUE(streams_one_unit(second.value(), path));
+    EXPECT_TRUE(videotest::streams_one_unit(second.value(), path));
 
     second.value().close();
     EXPECT_FALSE(node_exists(path.value));
@@ -332,7 +308,7 @@ TEST(VideoOwnership, PrepareRemovesVerifiedStaleSocketNode) {
     ASSERT_FALSE(runtime.empty());
     const auto path = video_socket_path_in(runtime);
     ASSERT_EQ(::mkdir(directory_of(path).c_str(), 0700), 0);
-    ASSERT_TRUE(leave_stale_socket_node(path.value));
+    ASSERT_TRUE(videotest::leave_stale_socket_node(path.value));
     ASSERT_TRUE(node_exists(path.value));
 
     const auto prepared = prepare_video_socket_path(path);
@@ -340,7 +316,7 @@ TEST(VideoOwnership, PrepareRemovesVerifiedStaleSocketNode) {
     EXPECT_FALSE(node_exists(path.value));
     auto server = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
     ASSERT_TRUE(server);
-    EXPECT_TRUE(streams_one_unit(server.value(), path));
+    EXPECT_TRUE(videotest::streams_one_unit(server.value(), path));
 
     server.value().close();
     cleanup_runtime(runtime, path.value);
@@ -359,4 +335,265 @@ TEST(VideoOwnership, ChmodFailureFailsClosed) {
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0) << "chmod failure child step " << WEXITSTATUS(status);
     cleanup_runtime(runtime, video_socket_path_in(runtime).value);
+}
+
+TEST(VideoOwnership, ConcurrentListenHasExactlyOneWinner) {
+    for (int round = 0; round < 20; ++round) {
+        SCOPED_TRACE("round " + std::to_string(round));
+        const std::string runtime = videotest::private_runtime_dir();
+        ASSERT_FALSE(runtime.empty());
+        const auto path = video_socket_path_in(runtime);
+        const bool stale = (round % 2) == 1;
+        if (stale) {
+            ASSERT_EQ(::mkdir(directory_of(path).c_str(), 0700), 0);
+            ASSERT_TRUE(videotest::leave_stale_socket_node(path.value));
+        }
+
+        std::array<std::optional<VideoServer>, 4> winners;
+        std::array<aa::ErrorCode, 4> failures{};
+        std::barrier<> gate(4);
+        std::vector<std::thread> threads;
+        threads.reserve(4);
+        for (int i = 0; i < 4; ++i) {
+            threads.emplace_back([&, i] {
+                gate.arrive_and_wait();
+                auto server = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+                if (server) {
+                    winners[static_cast<std::size_t>(i)] = std::move(server.value());
+                } else {
+                    failures[static_cast<std::size_t>(i)] = server.error().code();
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        int wins = 0;
+        std::size_t winner = 0;
+        for (std::size_t i = 0; i < winners.size(); ++i) {
+            if (winners[i].has_value()) {
+                ++wins;
+                winner = i;
+            } else {
+                EXPECT_EQ(failures[i], aa::ErrorCode::transport_unavailable);
+            }
+        }
+        EXPECT_EQ(wins, 1);
+        if (wins != 1) {
+            cleanup_runtime(runtime, path.value);
+            continue;
+        }
+        EXPECT_TRUE(node_exists(path.value));
+        EXPECT_TRUE(videotest::streams_one_unit(*winners[winner], path));
+        winners[winner]->close();
+        EXPECT_FALSE(node_exists(path.value));
+        cleanup_runtime(runtime, path.value);
+    }
+}
+
+TEST(VideoOwnership, ListenRejectsWrongModeDirectoryWithoutCreatingLock) {
+    const std::string runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    const std::string directory = directory_of(path);
+    ASSERT_EQ(::mkdir(directory.c_str(), 0700), 0);
+    ASSERT_EQ(::chmod(directory.c_str(), 0755), 0);
+
+    const auto refused = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unavailable);
+    EXPECT_FALSE(node_exists(path.value + ".lock")) << "no lock in an unvalidated directory";
+    EXPECT_FALSE(node_exists(path.value));
+
+    cleanup_runtime(runtime, path.value);
+}
+
+TEST(VideoOwnership, ListenRejectsSymlinkedDirectoryWithoutCreatingLock) {
+    const std::string runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    const std::string directory = directory_of(path);
+    const std::string target = runtime + "/victim";
+    ASSERT_EQ(::mkdir(target.c_str(), 0700), 0);
+    ASSERT_EQ(::symlink(target.c_str(), directory.c_str()), 0);
+
+    const auto refused = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unavailable);
+    EXPECT_FALSE(node_exists(target + "/video.sock.lock"))
+        << "no lock created through the symlinked directory";
+    EXPECT_FALSE(node_exists(target + "/video.sock"));
+
+    ::unlink(directory.c_str());
+    ::rmdir(target.c_str());
+    ::rmdir(runtime.c_str());
+}
+
+// A child holds flock(LOCK_EX) on the lock path inside a wrong-mode
+// directory and keeps it for a bounded window: listen must refuse at the
+// directory checks without ever waiting on that flock. If validation ever
+// slips behind the flock again, listen unblocks only when the child exits
+// and the elapsed bound fails deterministically instead of hanging.
+TEST(VideoOwnership, ListenRejectsHeldLockInInvalidDirectoryWithoutBlocking) {
+    const std::string runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    const std::string directory = directory_of(path);
+    ASSERT_EQ(::mkdir(directory.c_str(), 0700), 0);
+    ASSERT_EQ(::chmod(directory.c_str(), 0755), 0);
+    const std::string lock_path = path.value + ".lock";
+
+    int ready[2] = {-1, -1};
+    ASSERT_EQ(::pipe(ready), 0);
+    const pid_t child = ::fork();
+    ASSERT_NE(child, -1);
+    if (child == 0) {
+        ::close(ready[0]);
+        const int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            ::_exit(1);
+        }
+        if (::flock(fd, LOCK_EX) != 0) {
+            ::_exit(2);
+        }
+        (void)::write(ready[1], "x", 1);
+        ::sleep(5);
+        ::_exit(0);
+    }
+    ::close(ready[1]);
+    char held = 0;
+    const bool child_holds = ::read(ready[0], &held, 1) == 1;
+    ::close(ready[0]);
+    int status = 0;
+    if (!child_holds) {
+        (void)::kill(child, SIGKILL);
+        (void)::waitpid(child, &status, 0);
+        FAIL() << "child never reported holding the flock";
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto refused = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    (void)::kill(child, SIGKILL);
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unavailable);
+    EXPECT_LT(elapsed.count(), 1000);
+
+    cleanup_runtime(runtime, path.value);
+}
+
+// Controlled lock-exclusion: teardown must reacquire the per-path startup
+// lock before closing the listener and unlinking the endpoint, so an
+// external flock holder blocks close(). A barrier-only race cannot observe
+// this - catching teardown that ignores the lock needs the lock held.
+TEST(VideoOwnership, ServerTeardownWaitsForStartupLock) {
+    const std::string runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+    ASSERT_TRUE(server);
+    const int listener = server.value().native_handle();
+    ASSERT_GE(listener, 0);
+    ASSERT_TRUE(videotest::streams_one_unit(server.value(), path));
+
+    const std::string lock_path = path.value + ".lock";
+    const int lock_fd = ::open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
+    ASSERT_GE(lock_fd, 0);
+    if (::flock(lock_fd, LOCK_EX) != 0) {
+        ::close(lock_fd);
+        FAIL() << "external flock(LOCK_EX) on the startup lock failed";
+    }
+
+    std::atomic<bool> entered{false};
+    std::atomic<bool> done{false};
+    std::thread closer([&] {
+        entered.store(true, std::memory_order_release);
+        server.value().close();
+        done.store(true, std::memory_order_release);
+    });
+    while (!entered.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+
+    // Nonfatal by construction: the external flock is still held here and a
+    // fatal assert would skip both the unlock and the join.
+    EXPECT_FALSE(done.load(std::memory_order_acquire))
+        << "close() completed while an external flock was held";
+    EXPECT_NE(::fcntl(listener, F_GETFD), -1) << "listener closed before the lock dropped";
+
+    (void)::flock(lock_fd, LOCK_UN);
+    ::close(lock_fd);
+    closer.join();
+
+    ASSERT_TRUE(done.load(std::memory_order_acquire));
+    errno = 0;
+    const int probed = ::fcntl(listener, F_GETFD);
+    const int failure = errno;
+    EXPECT_EQ(probed, -1);
+    EXPECT_EQ(failure, EBADF);
+    EXPECT_FALSE(node_exists(path.value));
+    cleanup_runtime(runtime, path.value);
+}
+
+// Close-vs-restart race: the unlocked lstat/unlink teardown let a starter
+// classify the endpoint stale, replace it, and lose the replacement to the
+// closer's previously-validated unlink. Teardown now runs under the startup
+// lock, so the raced replacement survives every round with its node intact.
+TEST(VideoOwnership, ConcurrentCloseRestartPreservesReplacementEndpoint) {
+    for (int round = 0; round < 20; ++round) {
+        SCOPED_TRACE("round " + std::to_string(round));
+        const std::string runtime = videotest::private_runtime_dir();
+        ASSERT_FALSE(runtime.empty());
+        const auto path = video_socket_path_in(runtime);
+        auto original = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+        ASSERT_TRUE(original);
+
+        std::optional<VideoServer> replacement;
+        aa::ErrorCode starter_failure{};
+        std::barrier gate(2);
+        std::thread closer([&] {
+            gate.arrive_and_wait();
+            original.value().close();
+        });
+        std::thread starter([&] {
+            gate.arrive_and_wait();
+            auto attempt = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+            if (attempt) {
+                replacement = std::move(attempt.value());
+            } else {
+                starter_failure = attempt.error().code();
+            }
+        });
+        closer.join();
+        starter.join();
+
+        if (!replacement.has_value()) {
+            // The starter may legitimately lose the lock race to the
+            // still-live original and see transport_unavailable: retry only
+            // that refusal, exactly once. Any other refusal is a failure.
+            ASSERT_EQ(starter_failure, aa::ErrorCode::transport_unavailable);
+            auto retry = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+            ASSERT_TRUE(retry);
+            replacement = std::move(retry.value());
+        }
+
+        ASSERT_TRUE(replacement.has_value());
+        EXPECT_TRUE(node_exists(path.value));
+        // The raced replacement stays ALIVE through the reachability checks:
+        // recreating it first would mask a node stolen by the closer.
+        EXPECT_TRUE(videotest::streams_one_unit(*replacement, path));
+        const auto refused = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+        ASSERT_FALSE(refused);
+        EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unavailable);
+        replacement->close();
+        EXPECT_FALSE(node_exists(path.value));
+        replacement.reset();
+        cleanup_runtime(runtime, path.value);
+    }
 }
