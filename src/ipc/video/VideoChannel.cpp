@@ -230,35 +230,48 @@ core::Result<void> connect_path(int fd, const std::string& path,
     const auto bounded = timeout.count > 60000 ? 60000 : timeout.count;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{bounded};
     const auto attempt = [&]() noexcept -> core::Result<void> {
+        int failure = 0;
         for (;;) {
+            if (failure != 0) {
+                // Every retry - after a backlog refusal, a signal-interrupted
+                // connect or a signal-interrupted sleep - passes through this
+                // absolute-deadline gate first, so a signal storm cannot keep
+                // the loop alive past the bound.
+                const auto remaining = deadline - std::chrono::steady_clock::now();
+                if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                    return Error{ErrorCode::timeout};
+                }
+                if (failure != EINTR) {
+                    // Saturated-backlog backoff: sleep at most the remaining
+                    // budget (min(10 ms, remaining)); an interrupted sleep
+                    // re-enters through the deadline gate instead of
+                    // restarting a full slice.
+                    const auto slice =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+                    const int status =
+                        ::poll(nullptr, 0, static_cast<int>(slice > 10 ? 10 : slice));
+                    if (status < 0 && errno != EINTR) {
+                        return io_error();
+                    }
+                    if (status < 0) {
+                        continue;
+                    }
+                }
+            }
             if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
                 return {};
             }
-            const int failure = errno;
+            failure = errno;
             // AF_UNIX SOCK_SEQPACKET connect is synchronous (v6.8 unix_stream_connect):
             // a saturated backlog answers EAGAIN (never EINPROGRESS), completion never
             // writes sk_err (SO_ERROR stays 0), and a fresh fd polls POLLHUP|POLLOUT -
             // so deadline-retry here; never "restore" the TCP poll(POLLOUT)+SO_ERROR idiom.
-            if (failure == EINTR) {
-                continue;
-            }
-            if (failure == EAGAIN || failure == EWOULDBLOCK) {
-                if (std::chrono::steady_clock::now() >= deadline) {
-                    return Error{ErrorCode::timeout};
-                }
-                int status;
-                do {
-                    status = ::poll(nullptr, 0, 10);
-                } while (status < 0 && errno == EINTR);
-                if (status < 0) {
-                    return io_error();
-                }
-                continue;
-            }
             if (failure == EISCONN) {
                 return {};
             }
-            return Error{ErrorCode::transport_unavailable};
+            if (failure != EINTR && failure != EAGAIN && failure != EWOULDBLOCK) {
+                return Error{ErrorCode::transport_unavailable};
+            }
         }
     };
     const auto result = attempt();

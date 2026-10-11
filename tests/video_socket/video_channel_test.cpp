@@ -4,11 +4,14 @@
 #include <aa/ipc/VideoChannel.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <string>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -56,6 +59,43 @@ void reap_queued_connections(VideoServer& server) {
             ::close(fd);
         }
     }
+}
+
+struct BacklogSaturation final {
+    std::vector<int> fillers{};
+    bool queue_refused{false};
+    int unexpected_errno{0};
+};
+
+// Saturate the listen backlog with raw nonblocking connects until the kernel
+// refuses to queue another. The admitted count is a kernel backlog detail
+// (listen(fd,1) still admits more than one), so the loop discovers the bound
+// instead of hardcoding how many connects fit.
+BacklogSaturation saturate_backlog(const VideoSocketPath& path) {
+    BacklogSaturation out;
+    for (int attempt = 0; attempt < 8 && !out.queue_refused; ++attempt) {
+        const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        if (fd < 0) {
+            out.unexpected_errno = errno;
+            return out;
+        }
+        sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        std::memcpy(address.sun_path, path.value.c_str(), path.value.size() + 1);
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+            out.fillers.push_back(fd);
+            continue;
+        }
+        const int failure = errno;
+        ::close(fd);
+        if (failure == EAGAIN || failure == EWOULDBLOCK) {
+            out.queue_refused = true;
+        } else {
+            out.unexpected_errno = failure;
+            return out;
+        }
+    }
+    return out;
 }
 } // namespace
 
@@ -183,32 +223,10 @@ TEST(VideoStream, ConnectDeadlineIsEnforcedOnSaturatedBacklog) {
     auto server = VideoServer::listen(path, VideoServerOptions{limits, current_uid()});
     ASSERT_TRUE(server);
 
-    // Saturate the backlog with raw nonblocking connects until the kernel
-    // refuses to queue another. The admitted count is a kernel backlog detail
-    // (listen(fd,1) still admits more than one), so the loop discovers the
-    // bound instead of hardcoding how many connects fit.
-    std::vector<int> fillers;
-    bool queue_refused = false;
-    for (int attempt = 0; attempt < 8 && !queue_refused; ++attempt) {
-        const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-        ASSERT_NE(fd, -1);
-        sockaddr_un address{};
-        address.sun_family = AF_UNIX;
-        std::memcpy(address.sun_path, path.value.c_str(), path.value.size() + 1);
-        if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
-            fillers.push_back(fd);
-            continue;
-        }
-        const int failure = errno;
-        ::close(fd);
-        if (failure == EAGAIN || failure == EWOULDBLOCK) {
-            queue_refused = true;
-            break;
-        }
-        FAIL() << "unexpected filler connect failure " << failure;
-    }
-    EXPECT_FALSE(fillers.empty()) << "backlog admitted no connection";
-    ASSERT_TRUE(queue_refused) << "backlog never saturated";
+    const auto backlog = saturate_backlog(path);
+    EXPECT_EQ(backlog.unexpected_errno, 0) << "unexpected filler connect failure";
+    EXPECT_FALSE(backlog.fillers.empty()) << "backlog admitted no connection";
+    ASSERT_TRUE(backlog.queue_refused) << "backlog never saturated";
 
     const auto start = std::chrono::steady_clock::now();
     const auto client = connect_video_consumer(
@@ -220,11 +238,64 @@ TEST(VideoStream, ConnectDeadlineIsEnforcedOnSaturatedBacklog) {
     EXPECT_GE(elapsed.count(), 250);
     EXPECT_LT(elapsed.count(), 1500);
 
-    for (const int fd : fillers) {
+    for (const int fd : backlog.fillers) {
         ::close(fd);
     }
     reap_queued_connections(server.value());
     EXPECT_TRUE(videotest::streams_one_unit(server.value(), path));
+
+    server.value().close();
+    ::unlink(path.value.c_str());
+    ::rmdir((runtime + "/android-auto-receiver").c_str());
+    ::rmdir(runtime.c_str());
+}
+
+TEST(VideoStream, ConnectDeadlineIsEnforcedDuringSignalStorm) {
+    NegotiatedLimits limits{};
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{limits, current_uid()});
+    ASSERT_TRUE(server);
+
+    const auto backlog = saturate_backlog(path);
+    EXPECT_EQ(backlog.unexpected_errno, 0) << "unexpected filler connect failure";
+    EXPECT_FALSE(backlog.fillers.empty()) << "backlog admitted no connection";
+    ASSERT_TRUE(backlog.queue_refused) << "backlog never saturated";
+
+    struct sigaction action {};
+    struct sigaction previous {};
+    action.sa_handler = +[](int) {};
+    ::sigemptyset(&action.sa_mask);
+    ASSERT_EQ(::sigaction(SIGUSR1, &action, &previous), 0);
+    const pthread_t waiter = ::pthread_self();
+    std::atomic<bool> storming{true};
+    std::thread storm([waiter, &storming] {
+        while (storming.load(std::memory_order_relaxed)) {
+            (void)::pthread_kill(waiter, SIGUSR1);
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto client = connect_video_consumer(
+        path, VideoClientOptions{limits, current_uid(), aa::core::Milliseconds{300}});
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    storming.store(false, std::memory_order_relaxed);
+    storm.join();
+    (void)::sigaction(SIGUSR1, &previous, nullptr);
+
+    ASSERT_FALSE(client);
+    EXPECT_EQ(client.error().code(), aa::ErrorCode::timeout);
+    EXPECT_GE(elapsed.count(), 250);
+    EXPECT_LT(elapsed.count(), 2000);
+
+    for (const int fd : backlog.fillers) {
+        ::close(fd);
+    }
+    reap_queued_connections(server.value());
 
     server.value().close();
     ::unlink(path.value.c_str());
