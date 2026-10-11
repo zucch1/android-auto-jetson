@@ -125,4 +125,69 @@ TEST(InputSensorsInput, UnadvertisedKeycodeIsRefusedTypedAndNeverForwarded) {
     EXPECT_EQ(service.rejected(), 1U);
 }
 
+TEST(InputSensorsInput, TouchWithoutMouseSourceIsRefusedTypedAndNeverForwarded) {
+    // Given: a service whose descriptor advertises keyboard_dpad ONLY (no
+    // mouse_to_touch source), even though its keycodes and viewport are set.
+    PhoneFixture phone;
+    const CapabilityDescriptor keyboard_only{{InputSource::keyboard_dpad},
+                                            {19},
+                                            TouchViewport{1280, 720},
+                                            {},
+                                            NightModePolicy::manual};
+    InputService service(keyboard_only, phone);
+
+    // When: a valid touch event is submitted from the unadvertised source.
+    const auto refused =
+        service.submit(ipc::InputEvent{ipc::TouchEvent{10, 20, ipc::TouchAction::down}});
+
+    // Then: the capability gate refuses it typed and the phone fixture sees
+    // nothing.
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::channel_unsupported_capability);
+    EXPECT_TRUE(phone.input.empty());
+    EXPECT_EQ(service.forwarded(), 0U);
+    EXPECT_EQ(service.rejected(), 1U);
+
+    // And: an event from the advertised source forwards WITHOUT resetting the
+    // rejection count.
+    ASSERT_TRUE(service.submit(ipc::InputEvent{ipc::KeyEvent{19, true}}));
+    ASSERT_EQ(phone.input.size(), 1U);
+    EXPECT_EQ(phone.input.front(), (NormalizedInput{NormalizedKey{19, true}}));
+    EXPECT_EQ(service.forwarded(), 1U);
+    EXPECT_EQ(service.rejected(), 1U);
+}
+
+TEST(InputSensorsInput, AdvertisedKeyWithoutKeyboardSourceIsRefusedTypedAndNeverForwarded) {
+    // Given: a service whose descriptor advertises mouse_to_touch ONLY (no
+    // keyboard_dpad source), even though keycode 19 IS in its keycode set.
+    PhoneFixture phone;
+    const CapabilityDescriptor touch_only{{InputSource::mouse_to_touch},
+                                         {19},
+                                         TouchViewport{1280, 720},
+                                         {},
+                                         NightModePolicy::manual};
+    InputService service(touch_only, phone);
+
+    // When: an advertised keycode is submitted from the unadvertised source.
+    const auto refused = service.submit(ipc::InputEvent{ipc::KeyEvent{19, true}});
+
+    // Then: the capability gate refuses it typed and the phone fixture sees
+    // nothing.
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::channel_unsupported_capability);
+    EXPECT_TRUE(phone.input.empty());
+    EXPECT_EQ(service.forwarded(), 0U);
+    EXPECT_EQ(service.rejected(), 1U);
+
+    // And: an event from the advertised source forwards WITHOUT resetting the
+    // rejection count.
+    ASSERT_TRUE(service.submit(
+        ipc::InputEvent{ipc::TouchEvent{10, 20, ipc::TouchAction::down}}));
+    ASSERT_EQ(phone.input.size(), 1U);
+    EXPECT_EQ(phone.input.front(),
+              (NormalizedInput{NormalizedTouch{10, 20, 0, ipc::TouchAction::down}}));
+    EXPECT_EQ(service.forwarded(), 1U);
+    EXPECT_EQ(service.rejected(), 1U);
+}
+
 } // namespace

@@ -19,12 +19,17 @@ namespace aa::input {
 // seam), forwarding each normalized event toward the session/phone fixture.
 //
 // Receiver-side normalization contract (defined here, consumed here):
-//  - keyboard/D-pad: the Android keycode must be advertised in the capability
-//    descriptor's bench keycode set. An advertised key becomes the channel's
-//    normalized key event; anything else is refused typed
-//    (channel_unsupported_capability), counted, and NEVER forwarded - the
-//    descriptor is the single source of truth for what the phone was told.
-//  - mouse-to-touch: the action passes through and the absolute pixel
+//  - keyboard/D-pad: the event source (keyboard_dpad) must be advertised in
+//    the capability descriptor's bench sources AND the Android keycode must be
+//    advertised in the descriptor's bench keycode set. An advertised key from
+//    an advertised source becomes the channel's normalized key event; anything
+//    else is refused typed (channel_unsupported_capability), counted, and
+//    NEVER forwarded - the descriptor is the single source of truth for what
+//    the phone was told.
+//  - mouse-to-touch: the event source (mouse_to_touch) must be advertised in
+//    the descriptor's bench sources; an unadvertised source is refused typed
+//    (channel_unsupported_capability), counted, and NEVER forwarded. For an
+//    advertised source the action passes through and the absolute pixel
 //    coordinates are normalized into the advertised touch viewport (clamped
 //    into [0, width-1] x [0, height-1]). The result is a single-pointer
 //    (pointer_id 0) channel touch event - synthesized touch, never a
@@ -84,10 +89,12 @@ public:
     // owner-ruled AF_UNIX input socket) and forwards the normalized event to
     // the input channel seam.
     //
-    // Error contract: a keycode outside the advertised bench set is refused
-    // channel_unsupported_capability (the capability gate), counted in
-    // rejected() and never forwarded. Touch coordinates are normalized
-    // (clamped), never refused.
+    // Error contract: an event whose source is not advertised in the
+    // descriptor's bench sources, or a key whose keycode is outside the
+    // advertised bench set, is refused channel_unsupported_capability (the
+    // capability gate), counted in rejected() and never forwarded. Touch
+    // coordinates from an advertised mouse_to_touch source are normalized
+    // (clamped), not refused.
     [[nodiscard]] core::Result<void> submit(const ipc::InputEvent& event);
 
     [[nodiscard]] const CapabilityDescriptor& descriptor() const noexcept { return descriptor_; }
