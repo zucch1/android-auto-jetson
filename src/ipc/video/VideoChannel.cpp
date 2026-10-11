@@ -7,9 +7,12 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <poll.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -59,22 +62,74 @@ core::Result<void> write_record(int fd, std::span<const std::uint8_t> record) no
     return {};
 }
 
+// Deadline-aware single-descriptor poll shared by the data and accept
+// waits. A negative timeout polls with -1 and retries EINTR indefinitely
+// without ever constructing a deadline. A nonnegative timeout is clamped
+// to the 60 s per-phase bound BEFORE the deadline is built; the remaining
+// budget is recomputed before every poll - including every EINTR retry -
+// so a signal storm cannot restart a full slice and starve the deadline.
+// Zero keeps exactly one poll(..., 0): a deadline check must not turn
+// currently-ready data into an unconditional timeout. A positive
+// remaining budget polls with a millisecond CEILING (bounded by 60 s) so
+// a sub-millisecond remainder neither busy-spins nor times out early
+// (<1 ms rounding overrun is acceptable). Status mapping: negative
+// non-EINTR -> transport_io, zero -> timeout, positive -> readiness.
+core::Result<void> poll_one(int fd, short events, core::Milliseconds timeout) noexcept {
+    pollfd ready{fd, events, 0};
+    if (timeout.count < 0) {
+        for (;;) {
+            const int status = ::poll(&ready, 1, -1);
+            if (status < 0 && errno == EINTR) {
+                continue;
+            }
+            if (status < 0) {
+                return io_error();
+            }
+            return {};
+        }
+    }
+    const auto bounded = timeout.count > 60000 ? 60000 : timeout.count;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{bounded};
+    for (bool initial = true;; initial = false) {
+        if (!initial) {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                return Error{ErrorCode::timeout};
+            }
+        }
+        int wait = 0;
+        if (bounded > 0) {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            const auto nanos =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count();
+            std::int64_t millis = (nanos + 999'999) / 1'000'000;
+            if (millis < 1) {
+                millis = 1;
+            }
+            if (millis > 60'000) {
+                millis = 60'000;
+            }
+            wait = static_cast<int>(millis);
+        }
+        const int status = ::poll(&ready, 1, wait);
+        if (status < 0 && errno == EINTR) {
+            continue;
+        }
+        if (status < 0) {
+            return io_error();
+        }
+        if (status == 0) {
+            return Error{ErrorCode::timeout};
+        }
+        return {};
+    }
+}
+
 core::Result<void> await_readable(int fd, core::Milliseconds timeout) noexcept {
-    pollfd ready{fd, POLLIN | POLLRDHUP, 0};
-    int status;
-    const int millis = timeout.count < 0
-                           ? -1
-                           : static_cast<int>(timeout.count > 60000 ? 60000 : timeout.count);
-    do {
-        status = ::poll(&ready, 1, millis);
-    } while (status < 0 && errno == EINTR);
-    if (status < 0) {
-        return io_error();
-    }
-    if (status == 0) {
-        return Error{ErrorCode::timeout};
-    }
-    return {};
+    // Readiness only: EOF -> transport_closed is decided AFTER recvmsg() in
+    // VideoConsumer::receive(), because queued final records and RDHUP can
+    // coexist and a premature closed would discard them.
+    return poll_one(fd, static_cast<short>(POLLIN | POLLRDHUP), timeout);
 }
 
 core::Result<std::size_t> read_record(int fd, std::span<std::uint8_t> buffer,
@@ -138,6 +193,132 @@ void unlink_owned_endpoint(const std::string& path, const EndpointIdentity& iden
     }
     ::unlink(path.c_str());
 }
+
+// Directory-boundary validation shared by StartupLock::acquire and
+// prepare_video_socket_path (idempotent, runs on both paths): lstat so a
+// symlinked directory is refused rather than followed, a real directory,
+// owned by the caller, exact 0700 mode. StartupLock runs this BEFORE the
+// lock file is opened or flocked, so an unvalidated directory can never
+// host the lock or wedge a starter behind a flock held there.
+core::Result<void> validate_runtime_directory(const std::string& directory) noexcept {
+    struct stat info {};
+    if (::lstat(directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) {
+        return Error{ErrorCode::transport_unavailable};
+    }
+    if (info.st_uid != ::getuid() || (info.st_mode & 0777) != 0700) {
+        return Error{ErrorCode::transport_unavailable};
+    }
+    return {};
+}
+
+// Per-path startup lock for VideoServer::listen: cooperating same-path
+// starters serialize on flock(LOCK_EX) over a stable lock inode beside the
+// socket (<path>.lock), so the prepare/probe/unlink/bind sequence can never
+// interleave between them and exactly one of them binds. The lock file is
+// created O_CREAT and never deleted - the stable inode IS the lock identity
+// (recreating it would let racers lock different inodes). It is a regular
+// file at its own name: the stale-node probe and close() only ever touch the
+// socket path, so it confuses neither. flock releases on close even if the
+// holder dies, so a crash cannot wedge later starters.
+//
+// Descriptor lifetime and exclusive-lock lifetime are distinct: listen()
+// unlocks the descriptor and transfers it (still open) into the live server,
+// so teardown can reacquire LOCK_EX around the close+unlink pair and
+// serialize endpoint removal against a cooperating starter. The lock/unlock
+// operations never allocate and retry EINTR, so they are usable from
+// noexcept cleanup.
+class StartupLock final {
+public:
+    StartupLock() = default;
+    StartupLock(const StartupLock&) = delete;
+    StartupLock& operator=(const StartupLock&) = delete;
+    StartupLock(StartupLock&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+    StartupLock& operator=(StartupLock&& other) noexcept {
+        if (this != &other) {
+            release();
+            fd_ = other.fd_;
+            other.fd_ = -1;
+        }
+        return *this;
+    }
+    ~StartupLock() { release(); }
+
+    static core::Result<StartupLock> acquire(const std::string& socket_path) noexcept {
+        const auto slash = socket_path.find_last_of('/');
+        if (slash == std::string::npos) {
+            return Error{ErrorCode::invalid_argument};
+        }
+        // The lock lives beside the socket, so its directory must exist
+        // before prepare_video_socket_path has run; create it exactly as
+        // prepare does. The directory boundary is validated BEFORE the lock
+        // file is opened or flocked: an unvalidated directory (foreign
+        // owner, wrong mode, or a symlink) must fail transport_unavailable
+        // without creating a lock in it and without ever waiting on a flock
+        // that may be held there.
+        const std::string directory = socket_path.substr(0, slash);
+        if (::mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) {
+            return Error{ErrorCode::transport_unavailable};
+        }
+        if (auto validated = validate_runtime_directory(directory); !validated) {
+            return validated.error();
+        }
+        const std::string lock_path = socket_path + ".lock";
+        const int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            return io_error();
+        }
+        int status;
+        do {
+            status = ::flock(fd, LOCK_EX);
+        } while (status != 0 && errno == EINTR);
+        if (status != 0) {
+            ::close(fd);
+            return io_error();
+        }
+        StartupLock lock;
+        lock.fd_ = fd;
+        return lock;
+    }
+
+    [[nodiscard]] core::Result<void> lock_ex() noexcept {
+        if (fd_ < 0) {
+            return io_error();
+        }
+        int status;
+        do {
+            status = ::flock(fd_, LOCK_EX);
+        } while (status != 0 && errno == EINTR);
+        if (status != 0) {
+            return io_error();
+        }
+        return {};
+    }
+
+    [[nodiscard]] core::Result<void> unlock() noexcept {
+        if (fd_ < 0) {
+            return io_error();
+        }
+        int status;
+        do {
+            status = ::flock(fd_, LOCK_UN);
+        } while (status != 0 && errno == EINTR);
+        if (status != 0) {
+            return io_error();
+        }
+        return {};
+    }
+
+    void release() noexcept {
+        if (fd_ >= 0) {
+            ::flock(fd_, LOCK_UN);
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+private:
+    int fd_{-1};
+};
 
 enum class EndpointState : std::uint8_t { missing, stale, occupied };
 
@@ -205,11 +386,78 @@ core::Result<void> connect_path(int fd, const std::string& path,
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-        (void)timeout;
-        return Error{ErrorCode::transport_unavailable};
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return io_error();
     }
-    return {};
+    if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return io_error();
+    }
+    if (timeout.count < 0) {
+        // Documented "blocks": no deadline. Restore blocking mode and connect
+        // once, unchanged semantics.
+        if (::fcntl(fd, F_SETFL, flags) != 0) {
+            return io_error();
+        }
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+            return Error{ErrorCode::transport_unavailable};
+        }
+        return {};
+    }
+    // Deadline-bounded connect. The effective bound mirrors the 60 s
+    // per-phase clamp in await_readable()/accept_consumer().
+    const auto bounded = timeout.count > 60000 ? 60000 : timeout.count;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{bounded};
+    const auto attempt = [&]() noexcept -> core::Result<void> {
+        int failure = 0;
+        for (;;) {
+            if (failure != 0) {
+                // Every retry - after a backlog refusal, a signal-interrupted
+                // connect or a signal-interrupted sleep - passes through this
+                // absolute-deadline gate first, so a signal storm cannot keep
+                // the loop alive past the bound.
+                const auto remaining = deadline - std::chrono::steady_clock::now();
+                if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                    return Error{ErrorCode::timeout};
+                }
+                if (failure != EINTR) {
+                    // Saturated-backlog backoff: sleep at most the remaining
+                    // budget (min(10 ms, remaining)); an interrupted sleep
+                    // re-enters through the deadline gate instead of
+                    // restarting a full slice.
+                    const auto slice =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+                    const int status =
+                        ::poll(nullptr, 0, static_cast<int>(slice > 10 ? 10 : slice));
+                    if (status < 0 && errno != EINTR) {
+                        return io_error();
+                    }
+                    if (status < 0) {
+                        continue;
+                    }
+                }
+            }
+            if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+                return {};
+            }
+            failure = errno;
+            // AF_UNIX SOCK_SEQPACKET connect is synchronous (v6.8 unix_stream_connect):
+            // a saturated backlog answers EAGAIN (never EINPROGRESS), completion never
+            // writes sk_err (SO_ERROR stays 0), and a fresh fd polls POLLHUP|POLLOUT -
+            // so deadline-retry here; never "restore" the TCP poll(POLLOUT)+SO_ERROR idiom.
+            if (failure == EISCONN) {
+                return {};
+            }
+            if (failure != EINTR && failure != EAGAIN && failure != EWOULDBLOCK) {
+                return Error{ErrorCode::transport_unavailable};
+            }
+        }
+    };
+    const auto result = attempt();
+    if (::fcntl(fd, F_SETFL, flags) != 0) {
+        return io_error();
+    }
+    return result;
 }
 
 } // namespace
@@ -244,12 +492,8 @@ core::Result<void> prepare_video_socket_path(const VideoSocketPath& path) {
     if (::mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) {
         return Error{ErrorCode::transport_unavailable};
     }
-    struct stat info {};
-    if (::lstat(directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) {
-        return Error{ErrorCode::transport_unavailable};
-    }
-    if (info.st_uid != ::getuid() || (info.st_mode & 0777) != 0700) {
-        return Error{ErrorCode::transport_unavailable};
+    if (auto validated = validate_runtime_directory(directory); !validated) {
+        return validated.error();
     }
     struct stat node {};
     if (::lstat(path.value.c_str(), &node) != 0) {
@@ -259,6 +503,7 @@ core::Result<void> prepare_video_socket_path(const VideoSocketPath& path) {
     if (!S_ISSOCK(node.st_mode)) {
         return Error{ErrorCode::transport_unavailable};
     }
+    const EndpointIdentity identity{node.st_dev, node.st_ino};
     auto state = probe_endpoint(path.value);
     if (!state) {
         return state.error();
@@ -271,9 +516,12 @@ core::Result<void> prepare_video_socket_path(const VideoSocketPath& path) {
     case EndpointState::occupied:
         return Error{ErrorCode::transport_unavailable};
     }
-    if (::unlink(path.value.c_str()) != 0 && errno != ENOENT) {
-        return Error{ErrorCode::transport_unavailable};
-    }
+    // Identity-checked unlink keeps stale cleanup bound to the probed
+    // endpoint and stays inside the startup-lock critical section as defense.
+    // Residual: noncooperating same-UID mutation of the lock/socket is out of
+    // scope (0700 dir + peer-cred admission); cooperating concurrent starts
+    // serialize on the per-path startup lock.
+    unlink_owned_endpoint(path.value, identity);
     return {};
 }
 
@@ -444,7 +692,7 @@ core::Result<ReceiveStatus> VideoConsumer::receive(core::Milliseconds timeout) {
         return io_error();
     }
     if ((message.msg_flags & MSG_TRUNC) != 0) {
-        impl_->assembler->loss();
+        impl_->assembler->reject();
         return Error{ErrorCode::transport_oversize_frame};
     }
     const auto received = static_cast<std::size_t>(size);
@@ -458,13 +706,13 @@ core::Result<ReceiveStatus> VideoConsumer::receive(core::Milliseconds timeout) {
             impl_->eof = true;
             return closed_error();
         }
-        impl_->assembler->loss();
+        impl_->assembler->reject();
         return Error{ErrorCode::transport_malformed_frame};
     }
     const auto header =
         decode_frame_header(std::span<const std::uint8_t>{scratch.data(), received}, impl_->limits);
     if (!header) {
-        impl_->assembler->loss();
+        impl_->assembler->reject();
         return header.error();
     }
     const auto step = impl_->assembler->accept(
@@ -509,6 +757,7 @@ struct VideoServer::Impl final {
     VideoSocketPath path{};
     EndpointIdentity identity{};
     VideoServerOptions options{};
+    StartupLock lock{};
     std::uint64_t unauthorized{};
     bool closed{false};
 
@@ -524,11 +773,25 @@ struct VideoServer::Impl final {
             return;
         }
         closed = true;
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
+        if (fd < 0) {
+            // Uninitialized: listen() failed before adopting the listener,
+            // so there is no endpoint to clean up and no lock to reacquire.
+            return;
         }
-        unlink_owned_endpoint(path.value, identity);
+        // Reacquire the startup lock while the listener is still live so a
+        // cooperating starter can neither classify the endpoint stale nor
+        // replace it inside the close+unlink window (the unlocked
+        // lstat/unlink pair let a previously-validated unlink delete a
+        // concurrently bound replacement). If reacquisition fails, close the
+        // descriptors but skip the unlink: a stale node is recoverable by
+        // the next startup, an unlocked unlink is not.
+        const bool held = static_cast<bool>(lock.lock_ex());
+        ::close(fd);
+        fd = -1;
+        if (held) {
+            unlink_owned_endpoint(path.value, identity);
+        }
+        lock.release();
     }
 };
 
@@ -546,9 +809,25 @@ VideoServer::~VideoServer() { close(); }
 
 core::Result<VideoServer> VideoServer::listen(const VideoSocketPath& path,
                                               const VideoServerOptions& options) {
+    // The startup lock is held across the whole prepare/bind/listen section
+    // and released when this function returns: cooperating same-path starters
+    // serialize here, so the kernel bind race is impossible among them and
+    // exactly one of them wins. The descriptor is retained (unlocked) in the
+    // returned server so teardown can reacquire it.
+    auto startup = StartupLock::acquire(path.value);
+    if (!startup) {
+        return startup.error();
+    }
     if (auto prepared = prepare_video_socket_path(path); !prepared) {
         return prepared.error();
     }
+    // Allocate the Impl and copy path/options BEFORE the socket exists: a
+    // failure below then destroys only an uninitialized Impl (fd == -1),
+    // which must not attempt endpoint cleanup or lock acquisition while the
+    // local critical section still owns both.
+    auto impl = std::make_unique<Impl>();
+    impl->path = path;
+    impl->options = options;
     const int fd = make_seqpacket();
     if (fd < 0) {
         return io_error();
@@ -563,11 +842,17 @@ core::Result<VideoServer> VideoServer::listen(const VideoSocketPath& path,
         unlink_owned_endpoint(path.value, bound.value());
         return io_error();
     }
-    auto impl = std::make_unique<Impl>();
-    impl->fd = fd;
-    impl->path = path;
     impl->identity = bound.value();
-    impl->options = options;
+    if (auto unlocked = startup.value().unlock(); !unlocked) {
+        // Never return a live server with an accidentally retained exclusive
+        // lock: clean up the fresh listener/endpoint while the local critical
+        // section still owns cleanup.
+        ::close(fd);
+        unlink_owned_endpoint(path.value, bound.value());
+        return unlocked.error();
+    }
+    impl->lock = std::move(startup.value());
+    impl->fd = fd;
     return VideoServer{std::move(impl)};
 }
 
@@ -575,19 +860,8 @@ core::Result<VideoProducer> VideoServer::accept_consumer(core::Milliseconds time
     if (!impl_ || impl_->closed) {
         return closed_error();
     }
-    pollfd ready{impl_->fd, POLLIN, 0};
-    const int millis = timeout.count < 0 ? -1
-                                         : static_cast<int>(timeout.count > 60000 ? 60000
-                                                                                  : timeout.count);
-    int status;
-    do {
-        status = ::poll(&ready, 1, millis);
-    } while (status < 0 && errno == EINTR);
-    if (status < 0) {
-        return io_error();
-    }
-    if (status == 0) {
-        return Error{ErrorCode::timeout};
+    if (auto ready = poll_one(impl_->fd, static_cast<short>(POLLIN), timeout); !ready) {
+        return ready.error();
     }
     int fd;
     do {

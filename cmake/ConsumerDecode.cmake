@@ -10,20 +10,30 @@
 # (<=33 ms) and the software-fallback qualification are WITHDRAWN claims; this
 # helper and its tests record measured budgets and never claim them.
 #
-# Integration contract: include AFTER cmake/CoreArchitecture.cmake (aa_core)
-# and the googletest declaration. GStreamer code lives only under
-# src/consumer/gstreamer_adapter/ (architecture_boundary adapter zone).
-# Production builds need TARGET GStreamer development metadata: native builds
-# require the host metadata (fail closed), cross builds resolve it through
-# cmake/DecodeDependencies.cmake (hash-validated sysroot payload or the
-# AA_DECODE_GST_OVERLAY capture root, F3 isolation). With no target metadata the
-# production library is explicitly UNAVAILABLE — the same input boundary as
-# aa-decode-probe — and never falls back to host metadata.
+# Integration contract: include AFTER cmake/CoreArchitecture.cmake (aa_core),
+# the googletest declaration AND add_subdirectory(tools/aa-decode-probe).
+# GStreamer code lives only under src/consumer/gstreamer_adapter/
+# (architecture_boundary adapter zone).
+#
+# Cross builds compile the production library whenever target GStreamer
+# development metadata is available: cmake/DecodeDependencies.cmake (loaded by
+# the decode-probe subproject) binds pkg-config to the hash-validated sysroot
+# payload or the explicit AA_DECODE_GST_OVERLAY capture root and never consults
+# host metadata. With no target metadata the helper is explicitly UNAVAILABLE
+# and no library is compiled. Only test executables, registrations and the
+# aa-decode-probe tooling references are host-side.
 
-include("${CMAKE_CURRENT_LIST_DIR}/DecodeDependencies.cmake")
-if(CMAKE_CROSSCOMPILING AND NOT AA_DECODE_PROBE_READY)
-    message(STATUS "Consumer decode helper: production library unavailable in cross-smoke mode (no target GStreamer dev metadata)")
-    return()
+if(CMAKE_CROSSCOMPILING)
+    # AA_DECODE_PROBE_CROSS is set for every cross configuration by
+    # cmake/DecodeDependencies.cmake: AVAILABLE (sanctioned target metadata
+    # bound to pkg-config) or UNAVAILABLE (no target GStreamer dev metadata in
+    # the frozen sysroot or the overlay). The library cannot compile without
+    # target headers, so absent metadata is an explicit unavailability, never a
+    # silent skip.
+    if(NOT AA_DECODE_PROBE_CROSS STREQUAL "AVAILABLE")
+        message(STATUS "Consumer decode helper unavailable in cross-smoke mode (no target GStreamer dev metadata)")
+        return()
+    endif()
 endif()
 if(NOT TARGET aa_core)
     message(FATAL_ERROR
@@ -52,15 +62,6 @@ set_target_properties(aareceiver-consumer PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 target_include_directories(aareceiver-consumer PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aareceiver-consumer PUBLIC aa_core PRIVATE PkgConfig::AA_CONSUMER_GST)
-
-if(TARGET aa_sysroot_hash_gate)
-    # Root hash-gate convention: this library cannot compile after a
-    # post-configure sysroot tamper (present for jetson-aarch64 cross builds).
-    add_dependencies(aareceiver-consumer aa_sysroot_hash_gate)
-    if(TARGET aa_decode_overlay_hash_gate)
-        add_dependencies(aareceiver-consumer aa_decode_overlay_hash_gate)
-    endif()
-endif()
 
 set(AA_CONSUMER_WARN_TARGETS aareceiver-consumer)
 if(NOT CMAKE_CROSSCOMPILING)
@@ -110,3 +111,4 @@ endif()
 
 unset(AA_CONSUMER_SOURCES)
 unset(AA_CONSUMER_TEST_SOURCES)
+unset(AA_CONSUMER_WARN_TARGETS)
