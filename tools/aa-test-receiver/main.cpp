@@ -63,6 +63,19 @@ public:
     [[nodiscard]] aa::core::Result<void> forget(aa::core::PhoneId) override {
         return aa::Error{aa::ErrorCode::invalid_argument};
     }
+
+    [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId) override {
+        return aa::Error{aa::ErrorCode::invalid_argument};
+    }
+
+    [[nodiscard]] aa::core::Result<aa::core::PhoneId> pairing_confirmed(
+        aa::core::PairingRequestId) override {
+        return aa::Error{aa::ErrorCode::invalid_argument};
+    }
+
+    void pairing_cancelled(aa::core::PairingRequestId) override {}
+
+    [[nodiscard]] std::vector<aa::core::PairingRequestId> reap_expired() override { return {}; }
 };
 
 std::string event_input(const aa::ipc::InputEvent& event) {
