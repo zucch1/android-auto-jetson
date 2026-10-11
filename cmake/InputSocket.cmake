@@ -6,13 +6,14 @@
 # control-only - this socket is the input transport. Tests register as
 # input_socket_* for `ctest -R input_socket`.
 #
+# aa_input is production code and compiles in every configuration (the
+# cross-build IPC inventory requires its sources in compile_commands.json);
+# only the test executable and its registrations stay behind
+# if(NOT CMAKE_CROSSCOMPILING).
+#
 # Integration contract: include AFTER cmake/CoreArchitecture.cmake (aa_core),
 # cmake/VideoSocket.cmake (aa_video) and the googletest declaration.
 
-if(CMAKE_CROSSCOMPILING)
-    message(STATUS "Display input socket qualification unavailable in cross-smoke mode")
-    return()
-endif()
 if(NOT TARGET aa_video)
     message(FATAL_ERROR
         "AA_INPUT_SOCKET_REQUIRES_AA_VIDEO: include cmake/VideoSocket.cmake before cmake/InputSocket.cmake")
@@ -38,12 +39,22 @@ set_target_properties(aa_input PROPERTIES
 target_include_directories(aa_input PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aa_input PUBLIC aa_core aa_video)
 
-add_executable(aa_input_socket_test ${AA_INPUT_TEST_SOURCES})
-target_link_libraries(aa_input_socket_test PRIVATE aa_input aa_video aa_core GTest::gtest_main)
-set_target_properties(aa_input_socket_test PROPERTIES
-    CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+if(TARGET aa_sysroot_hash_gate)
+    # Root hash-gate convention: this library cannot compile after a
+    # post-configure sysroot tamper (present for jetson-aarch64 cross builds).
+    add_dependencies(aa_input aa_sysroot_hash_gate)
+endif()
 
-foreach(target aa_input aa_input_socket_test)
+set(AA_INPUT_WARN_TARGETS aa_input)
+if(NOT CMAKE_CROSSCOMPILING)
+    add_executable(aa_input_socket_test ${AA_INPUT_TEST_SOURCES})
+    target_link_libraries(aa_input_socket_test PRIVATE aa_input aa_video aa_core GTest::gtest_main)
+    set_target_properties(aa_input_socket_test PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    list(APPEND AA_INPUT_WARN_TARGETS aa_input_socket_test)
+endif()
+
+foreach(target IN LISTS AA_INPUT_WARN_TARGETS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
         target_compile_options(${target} PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
@@ -54,7 +65,7 @@ if(AA_ENABLE_ASAN)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
         message(FATAL_ERROR "AA_INPUT_ASAN_UNSUPPORTED: requires GNU or Clang")
     endif()
-    foreach(_aa_input_asan_target aa_input aa_input_socket_test)
+    foreach(_aa_input_asan_target IN LISTS AA_INPUT_WARN_TARGETS)
         target_compile_options(${_aa_input_asan_target} PRIVATE
             -fsanitize=address -fno-omit-frame-pointer)
         target_link_options(${_aa_input_asan_target} PRIVATE -fsanitize=address)
@@ -62,11 +73,14 @@ if(AA_ENABLE_ASAN)
     unset(_aa_input_asan_target)
 endif()
 
-add_test(NAME input_socket_channel COMMAND aa_input_socket_test --gtest_filter=InputChannel.*)
-add_test(NAME input_socket_peer COMMAND aa_input_socket_test --gtest_filter=InputPeer.*)
-add_test(NAME input_socket_malformed COMMAND aa_input_socket_test --gtest_filter=InputMalformed.*)
-set_tests_properties(input_socket_channel input_socket_peer input_socket_malformed
-    PROPERTIES TIMEOUT 120)
+if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME input_socket_channel COMMAND aa_input_socket_test --gtest_filter=InputChannel.*)
+    add_test(NAME input_socket_peer COMMAND aa_input_socket_test --gtest_filter=InputPeer.*)
+    add_test(NAME input_socket_malformed COMMAND aa_input_socket_test --gtest_filter=InputMalformed.*)
+    set_tests_properties(input_socket_channel input_socket_peer input_socket_malformed
+        PROPERTIES TIMEOUT 120)
+endif()
 
 unset(AA_INPUT_SOURCES)
 unset(AA_INPUT_TEST_SOURCES)
+unset(AA_INPUT_WARN_TARGETS)
