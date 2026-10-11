@@ -13,9 +13,16 @@
 # Integration contract: include AFTER cmake/CoreArchitecture.cmake (aa_core)
 # and the googletest declaration. GStreamer code lives only under
 # src/consumer/gstreamer_adapter/ (architecture_boundary adapter zone).
+# Production builds need TARGET GStreamer development metadata: native builds
+# require the host metadata (fail closed), cross builds resolve it through
+# cmake/DecodeDependencies.cmake (hash-validated sysroot payload or the
+# AA_DECODE_GST_OVERLAY capture root, F3 isolation). With no target metadata the
+# production library is explicitly UNAVAILABLE — the same input boundary as
+# aa-decode-probe — and never falls back to host metadata.
 
-if(CMAKE_CROSSCOMPILING)
-    message(STATUS "Consumer decode helper unavailable in cross-smoke mode")
+include("${CMAKE_CURRENT_LIST_DIR}/DecodeDependencies.cmake")
+if(CMAKE_CROSSCOMPILING AND NOT AA_DECODE_PROBE_READY)
+    message(STATUS "Consumer decode helper: production library unavailable in cross-smoke mode (no target GStreamer dev metadata)")
     return()
 endif()
 if(NOT TARGET aa_core)
@@ -46,20 +53,33 @@ set_target_properties(aareceiver-consumer PROPERTIES
 target_include_directories(aareceiver-consumer PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aareceiver-consumer PUBLIC aa_core PRIVATE PkgConfig::AA_CONSUMER_GST)
 
-add_executable(aa_consumer_decode_test ${AA_CONSUMER_TEST_SOURCES})
-target_link_libraries(aa_consumer_decode_test PRIVATE
-    aareceiver-consumer aa_core PkgConfig::AA_CONSUMER_GST pthread GTest::gtest_main)
-set_target_properties(aa_consumer_decode_test PROPERTIES
-    CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-# The tests cross-check runtime detection against the existing aa-decode-probe
-# tooling (its discovery policy is linked in and its binary is smoke-run).
-target_include_directories(aa_consumer_decode_test PRIVATE
-    "${CMAKE_SOURCE_DIR}/tools/aa-decode-probe/include")
-target_compile_definitions(aa_consumer_decode_test PRIVATE
-    AA_CONSUMER_DECODE_FIXTURE="${CMAKE_SOURCE_DIR}/tests/fixtures/media/h264_720p30_baseline_90f.h264"
-    AA_CONSUMER_DECODE_PROBE="$<TARGET_FILE:aa-decode-probe>")
+if(TARGET aa_sysroot_hash_gate)
+    # Root hash-gate convention: this library cannot compile after a
+    # post-configure sysroot tamper (present for jetson-aarch64 cross builds).
+    add_dependencies(aareceiver-consumer aa_sysroot_hash_gate)
+    if(TARGET aa_decode_overlay_hash_gate)
+        add_dependencies(aareceiver-consumer aa_decode_overlay_hash_gate)
+    endif()
+endif()
 
-foreach(target aareceiver-consumer aa_consumer_decode_test)
+set(AA_CONSUMER_WARN_TARGETS aareceiver-consumer)
+if(NOT CMAKE_CROSSCOMPILING)
+    add_executable(aa_consumer_decode_test ${AA_CONSUMER_TEST_SOURCES})
+    target_link_libraries(aa_consumer_decode_test PRIVATE
+        aareceiver-consumer aa_core PkgConfig::AA_CONSUMER_GST pthread GTest::gtest_main)
+    set_target_properties(aa_consumer_decode_test PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    # The tests cross-check runtime detection against the existing aa-decode-probe
+    # tooling (its discovery policy is linked in and its binary is smoke-run).
+    target_include_directories(aa_consumer_decode_test PRIVATE
+        "${CMAKE_SOURCE_DIR}/tools/aa-decode-probe/include")
+    target_compile_definitions(aa_consumer_decode_test PRIVATE
+        AA_CONSUMER_DECODE_FIXTURE="${CMAKE_SOURCE_DIR}/tests/fixtures/media/h264_720p30_baseline_90f.h264"
+        AA_CONSUMER_DECODE_PROBE="$<TARGET_FILE:aa-decode-probe>")
+    list(APPEND AA_CONSUMER_WARN_TARGETS aa_consumer_decode_test)
+endif()
+
+foreach(target IN LISTS AA_CONSUMER_WARN_TARGETS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
         target_compile_options(${target} PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
@@ -70,7 +90,7 @@ if(AA_ENABLE_ASAN)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
         message(FATAL_ERROR "AA_CONSUMER_DECODE_ASAN_UNSUPPORTED: requires GNU or Clang")
     endif()
-    foreach(_aa_consumer_asan_target aareceiver-consumer aa_consumer_decode_test)
+    foreach(_aa_consumer_asan_target IN LISTS AA_CONSUMER_WARN_TARGETS)
         target_compile_options(${_aa_consumer_asan_target} PRIVATE
             -fsanitize=address -fno-omit-frame-pointer)
         target_link_options(${_aa_consumer_asan_target} PRIVATE -fsanitize=address)
@@ -78,13 +98,15 @@ if(AA_ENABLE_ASAN)
     unset(_aa_consumer_asan_target)
 endif()
 
-add_test(NAME consumer_decode_caps COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeCaps.*)
-add_test(NAME consumer_decode_fixture COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeFixture.*)
-add_test(NAME consumer_decode_backend COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeBackend.*)
-add_test(NAME consumer_decode_probe COMMAND aa_consumer_decode_test --gtest_filter=ConsumerProbeIntegration.*)
-set_tests_properties(consumer_decode_caps consumer_decode_fixture consumer_decode_backend
-    consumer_decode_probe
-    PROPERTIES TIMEOUT 120)
+if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME consumer_decode_caps COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeCaps.*)
+    add_test(NAME consumer_decode_fixture COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeFixture.*)
+    add_test(NAME consumer_decode_backend COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeBackend.*)
+    add_test(NAME consumer_decode_probe COMMAND aa_consumer_decode_test --gtest_filter=ConsumerProbeIntegration.*)
+    set_tests_properties(consumer_decode_caps consumer_decode_fixture consumer_decode_backend
+        consumer_decode_probe
+        PROPERTIES TIMEOUT 120)
+endif()
 
 unset(AA_CONSUMER_SOURCES)
 unset(AA_CONSUMER_TEST_SOURCES)
