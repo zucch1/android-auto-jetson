@@ -13,17 +13,12 @@
 # the googletest declaration (GTest::gtest_main) and Python3. The parent adds
 # `include(cmake/DbusContract.cmake)` in its own root edit.
 
-if(CMAKE_CROSSCOMPILING)
-    message(STATUS "D-Bus control contract qualification unavailable in cross-smoke mode")
-    return()
-endif()
 if(NOT TARGET aa_core)
     message(FATAL_ERROR
         "AA_DBUS_CONTRACT_REQUIRES_AA_CORE: include cmake/CoreArchitecture.cmake before cmake/DbusContract.cmake")
 endif()
 
 find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
-find_program(AA_DBUS_RUN_SESSION NAMES dbus-run-session REQUIRED)
 
 set(AA_DBUS_CONTRACT_XML "${CMAKE_SOURCE_DIR}/docs/dbus/org.custom.AndroidAutoReceiver1.xml")
 set(AA_DBUS_CONTRACT_TOOL "${CMAKE_SOURCE_DIR}/tools/ipc/dbus_contract.py")
@@ -43,6 +38,7 @@ set(AA_IPC_DBUS_SOURCES
     src/ipc/dbus_adapter/BusCalls.cpp
     src/ipc/dbus_adapter/BusPeerLookup.cpp
     src/ipc/dbus_adapter/ControlDispatcher.cpp
+    src/ipc/dbus_adapter/PropertiesDispatch.cpp
     src/ipc/dbus_adapter/ControlBusService.cpp
     src/ipc/dbus_adapter/ControlBusClient.cpp)
 set(AA_DBUS_TEST_SOURCES
@@ -89,14 +85,26 @@ set_target_properties(aa_ipc_dbus PROPERTIES
 target_include_directories(aa_ipc_dbus PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aa_ipc_dbus PUBLIC aa_ipc_control)
 
-add_executable(aa_dbus_contract_test ${AA_DBUS_TEST_SOURCES})
-target_link_libraries(aa_dbus_contract_test PRIVATE aa_ipc_dbus GTest::gtest_main)
-set_target_properties(aa_dbus_contract_test PROPERTIES
-    CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-target_compile_definitions(aa_dbus_contract_test PRIVATE
-    AA_DBUS_CONTRACT_XML="${AA_DBUS_CONTRACT_XML}")
+if(TARGET aa_sysroot_hash_gate)
+    # Root hash-gate convention: these libraries cannot compile after a
+    # post-configure sysroot tamper (present for jetson-aarch64 cross builds).
+    add_dependencies(aa_ipc_control aa_sysroot_hash_gate)
+    add_dependencies(aa_ipc_dbus aa_sysroot_hash_gate)
+endif()
 
-foreach(target aa_ipc_control aa_ipc_dbus aa_dbus_contract_test)
+set(AA_DBUS_WARN_TARGETS aa_ipc_control aa_ipc_dbus)
+if(NOT CMAKE_CROSSCOMPILING)
+    find_program(AA_DBUS_RUN_SESSION NAMES dbus-run-session REQUIRED)
+    add_executable(aa_dbus_contract_test ${AA_DBUS_TEST_SOURCES})
+    target_link_libraries(aa_dbus_contract_test PRIVATE aa_ipc_dbus GTest::gtest_main)
+    set_target_properties(aa_dbus_contract_test PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_definitions(aa_dbus_contract_test PRIVATE
+        AA_DBUS_CONTRACT_XML="${AA_DBUS_CONTRACT_XML}")
+    list(APPEND AA_DBUS_WARN_TARGETS aa_dbus_contract_test)
+endif()
+
+foreach(target IN LISTS AA_DBUS_WARN_TARGETS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
         target_compile_options(${target} PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
@@ -107,7 +115,7 @@ if(AA_ENABLE_ASAN)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
         message(FATAL_ERROR "AA_DBUS_CONTRACT_ASAN_UNSUPPORTED: requires GNU or Clang")
     endif()
-    foreach(_aa_dbus_asan_target aa_ipc_control aa_ipc_dbus aa_dbus_contract_test)
+    foreach(_aa_dbus_asan_target IN LISTS AA_DBUS_WARN_TARGETS)
         target_compile_options(${_aa_dbus_asan_target} PRIVATE
             -fsanitize=address -fno-omit-frame-pointer)
         target_link_options(${_aa_dbus_asan_target} PRIVATE -fsanitize=address)
@@ -115,46 +123,56 @@ if(AA_ENABLE_ASAN)
     unset(_aa_dbus_asan_target)
 endif()
 
-add_test(NAME dbus_contract_control COMMAND aa_dbus_contract_test --gtest_filter=ControlService.*)
-add_test(NAME dbus_contract_access COMMAND aa_dbus_contract_test --gtest_filter=AccessControl.*)
-add_test(NAME dbus_contract_pairing COMMAND aa_dbus_contract_test
-    --gtest_filter=PairingGate.*:PairingFlow.*)
-add_test(NAME dbus_contract_introspection COMMAND aa_dbus_contract_test --gtest_filter=Introspection.*)
-add_test(NAME dbus_contract_dispatch COMMAND aa_dbus_contract_test --gtest_filter=CallBoundary.*)
-add_test(NAME dbus_contract_bus COMMAND "${AA_DBUS_RUN_SESSION}" --
-    "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusLookup.*:BusFlow.*)
-add_test(NAME dbus_contract_boundary COMMAND "${AA_DBUS_RUN_SESSION}" --
-    "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusBoundary.*)
-add_test(NAME dbus_contract_spoof COMMAND "${AA_DBUS_RUN_SESSION}" --
-    "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusSpoof.*)
-set_tests_properties(dbus_contract_control dbus_contract_access dbus_contract_pairing
-    dbus_contract_introspection dbus_contract_dispatch dbus_contract_bus dbus_contract_boundary
-    dbus_contract_spoof PROPERTIES TIMEOUT 60)
+if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME dbus_contract_control COMMAND aa_dbus_contract_test --gtest_filter=ControlService.*)
+    add_test(NAME dbus_contract_access COMMAND aa_dbus_contract_test --gtest_filter=AccessControl.*)
+    add_test(NAME dbus_contract_pairing COMMAND aa_dbus_contract_test
+        --gtest_filter=PairingGate.*:PairingFlow.*)
+    add_test(NAME dbus_contract_introspection COMMAND aa_dbus_contract_test --gtest_filter=Introspection.*)
+    add_test(NAME dbus_contract_dispatch COMMAND aa_dbus_contract_test --gtest_filter=CallBoundary.*)
+    add_test(NAME dbus_contract_bus COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusLookup.*:BusFlow.*)
+    add_test(NAME dbus_contract_boundary COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusBoundary.*)
+    add_test(NAME dbus_contract_spoof COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusSpoof.*)
+    set_tests_properties(dbus_contract_control dbus_contract_access dbus_contract_pairing
+        dbus_contract_introspection dbus_contract_dispatch dbus_contract_bus dbus_contract_boundary
+        dbus_contract_spoof PROPERTIES TIMEOUT 60)
+endif()
 
 set(AA_DBUS_SCHEMA_CASES
     real-check real-generate
     neg-malformed-xml neg-unsupported-major neg-overflow-major neg-high-rate-payload
     neg-missing-method neg-bad-signature neg-semver-mismatch neg-unexpected-method
     neg-duplicate-method neg-bogus-direction neg-masking-duplicate
-    neg-multi-type-method neg-multi-type-signal)
-foreach(case IN LISTS AA_DBUS_SCHEMA_CASES)
-    string(REPLACE "-" "_" test_suffix "${case}")
-    add_test(NAME dbus_contract_schema_${test_suffix}
-        COMMAND "${Python3_EXECUTABLE}" -B
-                "${CMAKE_SOURCE_DIR}/tests/dbus/contract_scenarios.py"
-                "${CMAKE_SOURCE_DIR}" "${case}")
-    set_tests_properties(dbus_contract_schema_${test_suffix} PROPERTIES TIMEOUT 60)
-endforeach()
-unset(case)
-unset(test_suffix)
+    neg-multi-type-method neg-multi-type-signal
+    neg-raw-delimiter-injection embedding-special-bytes embedding-crlf
+    neg-unexpected-root-child neg-unexpected-nested-element neg-unexpected-attribute
+    neg-missing-attribute neg-unexpected-text neg-duplicate-annotation
+    neg-unexpected-annotation neg-doctype neg-processing-instruction neg-namespace
+    neg-lexical-replay-bypass neg-invalid-preserves-existing-header)
+if(NOT CMAKE_CROSSCOMPILING)
+    foreach(case IN LISTS AA_DBUS_SCHEMA_CASES)
+        string(REPLACE "-" "_" test_suffix "${case}")
+        add_test(NAME dbus_contract_schema_${test_suffix}
+            COMMAND "${Python3_EXECUTABLE}" -B
+                    "${CMAKE_SOURCE_DIR}/tests/dbus/contract_scenarios.py"
+                    "${CMAKE_SOURCE_DIR}" "${case}" "${CMAKE_CXX_COMPILER}")
+        set_tests_properties(dbus_contract_schema_${test_suffix} PROPERTIES TIMEOUT 60)
+    endforeach()
+    unset(case)
+    unset(test_suffix)
 
-add_test(NAME dbus_contract_coverage
-    COMMAND "${Python3_EXECUTABLE}" -B
-            "${CMAKE_SOURCE_DIR}/tests/dbus/assert_dbus_coverage.py"
-            "${CMAKE_BINARY_DIR}")
-set_tests_properties(dbus_contract_coverage PROPERTIES TIMEOUT 60)
+    add_test(NAME dbus_contract_coverage
+        COMMAND "${Python3_EXECUTABLE}" -B
+                "${CMAKE_SOURCE_DIR}/tests/dbus/assert_dbus_coverage.py"
+                "${CMAKE_BINARY_DIR}")
+    set_tests_properties(dbus_contract_coverage PROPERTIES TIMEOUT 60)
+endif()
 
 unset(AA_IPC_CONTROL_SOURCES)
 unset(AA_IPC_DBUS_SOURCES)
 unset(AA_DBUS_TEST_SOURCES)
 unset(AA_DBUS_SCHEMA_CASES)
+unset(AA_DBUS_WARN_TARGETS)

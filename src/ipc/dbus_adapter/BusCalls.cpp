@@ -83,6 +83,12 @@ core::Result<void> BusConnection::send_reply(std::uint32_t reply_serial, const B
     case 4:
         writer.body_signature("a{ss}").put_string_map(std::get<std::map<std::string, std::string>>(reply.body));
         break;
+    case 5:
+        writer.body_signature("v").put_string_variant(std::get<StringPropertyValue>(reply.body).value);
+        break;
+    case 6:
+        writer.body_signature("a{sv}").put_property_dict(std::get<PropertyDictionary>(reply.body).entries);
+        break;
     default:
         break;
     }

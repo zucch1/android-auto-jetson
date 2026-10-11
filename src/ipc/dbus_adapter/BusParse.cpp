@@ -131,6 +131,13 @@ core::Result<std::string> Cursor::read_signature() {
 }
 
 core::Result<void> Cursor::skip_value(std::string_view type) {
+    return skip_value_at(type, 0);
+}
+
+core::Result<void> Cursor::skip_value_at(std::string_view type, int depth) {
+    if (depth > kMaxTypeDepth) {
+        return Error{ErrorCode::transport_malformed_frame};
+    }
     const std::size_t end = complete_type_end(type, 0, 0);
     if (end == 0 || end != type.size()) {
         return Error{ErrorCode::transport_malformed_frame};
@@ -178,7 +185,7 @@ core::Result<void> Cursor::skip_value(std::string_view type) {
         if (!sig.has_value()) {
             return sig.error();
         }
-        return skip_value(sig.value());
+        return skip_value_at(sig.value(), depth + 1);
     }
     case 'a': {
         const auto length = read_u32();
@@ -208,7 +215,7 @@ core::Result<void> Cursor::skip_value(std::string_view type) {
             return Error{ErrorCode::transport_malformed_frame};
         }
         while (pos_ < stop) {
-            const auto skipped = skip_value(element);
+            const auto skipped = skip_value_at(element, depth + 1);
             if (!skipped.has_value()) {
                 return skipped.error();
             }
@@ -229,7 +236,7 @@ core::Result<void> Cursor::skip_value(std::string_view type) {
             if (member_end == 0 || member_end > type.size()) {
                 return Error{ErrorCode::transport_malformed_frame};
             }
-            const auto skipped = skip_value(type.substr(cursor, member_end - cursor));
+            const auto skipped = skip_value_at(type.substr(cursor, member_end - cursor), depth + 1);
             if (!skipped.has_value()) {
                 return skipped.error();
             }
@@ -246,11 +253,11 @@ core::Result<void> Cursor::skip_value(std::string_view type) {
         if (key_end == 0 || key_end + 1 >= type.size() || type[type.size() - 1] != '}') {
             return Error{ErrorCode::transport_malformed_frame};
         }
-        const auto skipped_key = skip_value(type.substr(1, key_end - 1));
+        const auto skipped_key = skip_value_at(type.substr(1, key_end - 1), depth + 1);
         if (!skipped_key.has_value()) {
             return skipped_key.error();
         }
-        return skip_value(type.substr(key_end, type.size() - key_end - 1));
+        return skip_value_at(type.substr(key_end, type.size() - key_end - 1), depth + 1);
     }
     default:
         return Error{ErrorCode::transport_malformed_frame};
