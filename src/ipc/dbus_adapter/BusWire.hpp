@@ -60,6 +60,13 @@ public:
     MessageWriter& put_u64(std::uint64_t value);
     MessageWriter& put_string(std::string_view value);
     MessageWriter& put_string_map(const std::map<std::string, std::string>& entries);
+    // Marshals `value` as a D-Bus variant holding a string: contained signature
+    // "s" as a signature value, then the 4-aligned string ("v" on the wire).
+    MessageWriter& put_string_variant(std::string_view value);
+    // Marshals `entries` as a D-Bus a{sv}: 4-aligned array length EXCLUDING the
+    // gap before the first entry, 8-aligned dict entries of string key and
+    // string-variant value.
+    MessageWriter& put_property_dict(const std::map<std::string, std::string>& entries);
 
     [[nodiscard]] std::vector<std::uint8_t> build(MessageType type, std::uint32_t serial) const;
 
@@ -103,6 +110,11 @@ public:
     [[nodiscard]] bool done() const noexcept { return pos_ == data_.size(); }
 
 private:
+    // Recursion entry for skip_value: the depth budget propagates through
+    // variant values, array elements and struct members so runtime-nested
+    // variants cannot bypass kMaxTypeDepth.
+    [[nodiscard]] core::Result<void> skip_value_at(std::string_view type, int depth);
+
     std::span<const std::uint8_t> data_;
     std::size_t pos_{0};
 };

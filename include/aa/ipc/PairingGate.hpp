@@ -83,6 +83,13 @@ public:
     [[nodiscard]] bool window_open() const noexcept { return open_.has_value(); }
     [[nodiscard]] std::optional<core::PairingRequestId> open_request() const { return open_; }
 
+    // kMaxPending bounds concurrent live requests; kIssuedBudget bounds ids
+    // admitted over the whole gate lifetime. The two are independent: a
+    // rejected request spends neither. Recovery from an exhausted budget is
+    // per gate/service lifetime only (construction of a fresh PairingGate or
+    // service) — there is no auto-reset, and cancel()/close_all() never refund
+    // a spent issued id. Exhaustion therefore fails closed until restart, so
+    // request ids must NOT be claimed unique across receiver lifetimes.
     static constexpr std::size_t kMaxPending = 8;
     static constexpr std::size_t kIssuedBudget = 64;
 
