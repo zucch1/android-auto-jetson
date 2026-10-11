@@ -198,7 +198,7 @@ def check_members(interface: ET.Element) -> list[Violation]:
         if child.tag is ET.Comment or child.tag is ET.PI:
             continue
         if child.tag not in {"method", "signal", "property", "annotation"}:
-            record("DBUS_CONTRACT_UNEXPECTED_ELEMENT", f"interface child <{child.tag}>")
+            record("DBUS_CONTRACT_UNEXPECTED_INTERFACE_CHILD", f"interface child <{child.tag}>")
     return violations
 
 
@@ -311,7 +311,17 @@ def check_structure(root: ET.Element) -> list[Violation]:
                     record("DBUS_CONTRACT_UNEXPECTED_ANNOTATION",
                            f"{context} annotation '{child.get('name', '')}'")
             elif child.tag not in allowed:
-                record("DBUS_CONTRACT_UNEXPECTED_ELEMENT", f"{context} child <{child.tag}>")
+                if node.tag == "node":
+                    record("DBUS_CONTRACT_UNEXPECTED_ROOT_CHILD",
+                           f"{context} child <{child.tag}>")
+                elif node.tag == "interface":
+                    record("DBUS_CONTRACT_UNEXPECTED_INTERFACE_CHILD",
+                           f"{context} child <{child.tag}>")
+                elif node.tag in {"method", "signal", "property"} and child.tag != "arg":
+                    record("DBUS_CONTRACT_UNEXPECTED_MEMBER_CHILD",
+                           f"{context} child <{child.tag}>")
+                else:
+                    record("DBUS_CONTRACT_UNEXPECTED_ELEMENT", f"{context} child <{child.tag}>")
             check_text(child.tail, child_context, "tail")
             walk(child, trail + (segment(node),))
 

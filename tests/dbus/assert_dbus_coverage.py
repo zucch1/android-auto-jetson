@@ -52,6 +52,8 @@ EXPECTED = frozenset({
     'dbus_contract_schema_embedding_special_bytes',
     'dbus_contract_schema_embedding_crlf',
     'dbus_contract_schema_neg_unexpected_root_child',
+    'dbus_contract_schema_neg_unexpected_interface_child',
+    'dbus_contract_schema_neg_unexpected_member_child',
     'dbus_contract_schema_neg_unexpected_nested_element',
     'dbus_contract_schema_neg_unexpected_attribute',
     'dbus_contract_schema_neg_missing_attribute',
