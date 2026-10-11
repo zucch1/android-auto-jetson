@@ -5,13 +5,14 @@
 # register as video_socket_* for `ctest -R video_socket`.
 #
 # Integration contract: include AFTER cmake/CoreArchitecture.cmake (aa_core),
-# cmake/Replay.cmake (aa_replay) and the googletest declaration.
-#
-# Cross builds compile the production library (aa_video sources are inventoried
-# in compile_commands.json and aa_input depends on it); only the test executable
-# and registrations are host-side.
+# cmake/Replay.cmake (aa_replay) and the googletest declaration. Cross builds
+# compile aa_video WITHOUT the replay chain: the frozen cross sysroot carries no
+# AASDK development inputs, so aa_replay -> aa_protocol_adapter is native-only
+# (same boundary as cmake/ProtocolAdapter.cmake). aa_video's sources use project
+# headers only and no cross executable links the archive (the test executable
+# is native-only below).
 
-if(NOT TARGET aa_replay)
+if(NOT CMAKE_CROSSCOMPILING AND NOT TARGET aa_replay)
     message(FATAL_ERROR
         "AA_VIDEO_SOCKET_REQUIRES_AA_REPLAY: include cmake/Replay.cmake before cmake/VideoSocket.cmake")
 endif()
@@ -40,7 +41,19 @@ set_target_properties(aa_video PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO
     POSITION_INDEPENDENT_CODE ON)
 target_include_directories(aa_video PUBLIC "${CMAKE_SOURCE_DIR}/include")
-target_link_libraries(aa_video PUBLIC aa_core aa_replay)
+target_link_libraries(aa_video PUBLIC aa_core)
+if(TARGET aa_replay)
+    # Replayable capture resolves replay::Recorder. When the replay chain is
+    # native-only the cross archive compiles without this link item; nothing
+    # links aa_video into a cross executable, so no symbol is ever unresolved.
+    target_link_libraries(aa_video PUBLIC aa_replay)
+endif()
+
+if(TARGET aa_sysroot_hash_gate)
+    # Root hash-gate convention: this library cannot compile after a
+    # post-configure sysroot tamper (present for jetson-aarch64 cross builds).
+    add_dependencies(aa_video aa_sysroot_hash_gate)
+endif()
 
 set(AA_VIDEO_WARN_TARGETS aa_video)
 if(NOT CMAKE_CROSSCOMPILING)
@@ -87,4 +100,3 @@ endif()
 
 unset(AA_VIDEO_SOURCES)
 unset(AA_VIDEO_TEST_SOURCES)
-unset(AA_VIDEO_WARN_TARGETS)

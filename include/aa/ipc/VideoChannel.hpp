@@ -15,13 +15,23 @@ namespace aa::ipc {
 // framing served from /run/user/$UID/android-auto-receiver/video.sock with
 // peer-credential admission, a negotiated-limits exchange, bounded queues,
 // drop-to-IDR resync and disconnect cleanup. Server = producer (receiver
-// media path), client = consumer (decode helper); one consumer at a time.
+// media path), client = consumer (decode helper); consumer multiplicity is
+// owned by the caller (serve one consumer, close it, accept the next) — the
+// channel enforces per-connection admission and cleanup, not
+// cross-connection exclusivity.
 //
 // Ownership: every descriptor and (for the server) its endpoint node are
 // released by an idempotent cleanup shared by close() and the Impl
 // destructor, so replacing a live channel by move assignment releases what it
-// held instead of leaking it. A server unlinks its endpoint only while the
-// path still names the exact node it bound (device+inode captured at bind).
+// held instead of leaking it. Descriptor lifetime and exclusive-lock lifetime
+// are distinct: the server keeps the per-path startup lock's descriptor open
+// (unlocked) for its whole life while the flock is held only across startup
+// and teardown, so close serializes the close+unlink pair against a
+// cooperating starter. A server unlinks its endpoint only while the path
+// still names the exact node it bound (device+inode captured at bind) and
+// only while holding that lock; noncooperating same-UID mutation of the
+// lock/socket is out of scope (0700 dir + peer-cred admission). None of
+// these APIs are async-signal-safe: signal-handler re-entry is unsupported.
 //
 // Error contract: unauthorized peer -> transport_unauthorized_peer; malformed
 // record -> transport_malformed_frame; oversize record or access unit ->
@@ -30,6 +40,15 @@ namespace aa::ipc {
 // protocol_negotiation_failed; timeout -> timeout; closed/EOF ->
 // transport_closed. Every rejection drives loss (drop-to-IDR) except the
 // handshake failures, which close the connection.
+//
+// Telemetry: `rejected()` counts every data-plane record the consumer refuses
+// — pre-reassembly (truncated/oversize record, zero-length record, undecodable
+// header including version mismatch) and reassembly (non-monotonic frame id,
+// inconsistent fragment, oversize accumulation). Each rejection also drives
+// loss (drop-to-IDR). Sequence gaps drive loss only and are counted by neither
+// `rejected()` nor `resyncs()`; `resyncs()` counts completed access units that
+// resume the stream after loss. Handshake failures close the connection and
+// are not record rejections; unauthorized peers count in `unauthorized_peers()`.
 
 struct VideoSocketPath final {
     std::string value{};
@@ -149,6 +168,9 @@ struct VideoServerOptions final {
     std::uint32_t expected_peer_uid{};
 };
 
+// `timeout` bounds each phase independently: the connect attempt (backlog
+// wait) and the limits-exchange read; expiry is typed `timeout`; a
+// missing/refused endpoint fails immediately `transport_unavailable`.
 struct VideoClientOptions final {
     NegotiatedLimits local_limits{};
     std::uint32_t expected_server_uid{};
@@ -167,16 +189,31 @@ public:
     // Binds and listens after prepare_video_socket_path; a path held by a
     // live endpoint or a non-socket node is refused transport_unavailable and
     // a failure to secure the new node to 0600 is transport_io with the node
-    // removed again (fail closed).
+    // removed again (fail closed). Cooperating concurrent starts serialize
+    // on a per-path startup lock (flock on a stable <path>.lock inode beside
+    // the socket, never deleted) held across prepare, bind and listen, so
+    // exactly one of them binds; the lock's descriptor is retained unlocked
+    // for close() to reacquire. noncooperating same-UID mutation of the
+    // lock/socket is out of scope (0700 dir + peer-cred admission).
     [[nodiscard]] static core::Result<VideoServer> listen(const VideoSocketPath& path,
                                                           const VideoServerOptions& options);
 
     // Peer-credential gate then limits exchange. Rejected peers are counted
     // and never returned; the listener stays up. timeout.count < 0 blocks.
+    // Multiplicity is caller-owned: each call may return a live producer
+    // while an earlier one is still open; callers serialize consumers.
+    // listen(fd,1) bounds pending (backlog) connections only, not
+    // established ones.
     [[nodiscard]] core::Result<VideoProducer> accept_consumer(core::Milliseconds timeout);
 
     // Closes the listener and unlinks the endpoint node only while it is
-    // still the node bound at listen() time; idempotent.
+    // still the node bound at listen() time and only while holding the
+    // per-path startup lock, so teardown cannot delete a concurrently bound
+    // replacement; idempotent. Close/destruction may wait for another
+    // cooperating path operation - it is not a bounded-close guarantee. If
+    // the lock cannot be reacquired the listener and lock descriptors are
+    // closed but the endpoint node is left in place (a stale node is
+    // recoverable by the next startup).
     void close() noexcept;
 
     [[nodiscard]] bool closed() const noexcept;
