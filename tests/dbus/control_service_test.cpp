@@ -412,22 +412,25 @@ TEST(ControlService, OwnerRefreshIsIdempotent) {
 TEST(ControlService, ReplacementRegistrationReconcilesAbandonedOwner) {
     // Given: an incumbent that abandoned its consumer name (abrupt loss).
     Fixture fixture;
-    const BusName incumbent{":1.102"};
-    const BusName replacement{":1.103"};
-    const BusName consumer_name{"org.custom.ConsumerA"};
-    fixture.credentials.add_connection(incumbent, kSessionUid);
-    fixture.credentials.add_connection(replacement, kSessionUid);
-    fixture.credentials.set_owner(consumer_name, incumbent);
-    ASSERT_TRUE(fixture.service.register_consumer(incumbent, consumer_name).has_value());
-    fixture.credentials.set_owner(consumer_name, replacement);
+    const BusName first{":1.102"};
+    const BusName first_name{"org.custom.ConsumerA"};
+    const BusName second{":1.103"};
+    const BusName second_name{"org.custom.ConsumerB"};
+    fixture.credentials.add_connection(first, kSessionUid);
+    fixture.credentials.add_connection(second, kSessionUid);
+    fixture.credentials.set_owner(first_name, first);
+    fixture.credentials.set_owner(second_name, second);
+    ASSERT_TRUE(fixture.service.register_consumer(first, first_name).has_value());
+    fixture.credentials.remove_owner(first_name);
 
-    // When: a replacement connection registers the same consumer name.
-    const auto registered = fixture.service.register_consumer(replacement, consumer_name);
+    // When: a replacement registers without any prior status read or refresh.
+    const auto replacement = fixture.service.register_consumer(second, second_name);
 
-    // Then: the abandoned incumbent is torn down and the replacement registers
-    // under a fresh consumer id.
-    ASSERT_TRUE(registered.has_value());
-    EXPECT_EQ(fixture.service.state().consumer, registered.value());
+    // Then: the abandoned owner is reconciled and the replacement gets a new
+    // consumer id; nothing of the incumbent is inherited.
+    ASSERT_TRUE(replacement.has_value());
+    EXPECT_EQ(replacement.value(), aa::core::ConsumerId{2});
+    EXPECT_EQ(fixture.service.state().consumer, replacement.value());
     std::size_t owner_lost_diagnostics = 0;
     for (const auto& event : fixture.events.events) {
         if (const auto* diagnostic = std::get_if<aa::ipc::DiagnosticEmitted>(&event)) {
@@ -437,6 +440,103 @@ TEST(ControlService, ReplacementRegistrationReconcilesAbandonedOwner) {
         }
     }
     EXPECT_EQ(owner_lost_diagnostics, 1U);
+}
+
+TEST(ControlService, LiveOwnerStillBlocksReplacement) {
+    // Given: a live incumbent that still owns its registered name.
+    Fixture fixture;
+    const BusName first{":1.104"};
+    const BusName first_name{"org.custom.ConsumerA"};
+    const BusName second{":1.105"};
+    const BusName second_name{"org.custom.ConsumerB"};
+    fixture.credentials.add_connection(first, kSessionUid);
+    fixture.credentials.add_connection(second, kSessionUid);
+    fixture.credentials.set_owner(first_name, first);
+    fixture.credentials.set_owner(second_name, second);
+    ASSERT_TRUE(fixture.service.register_consumer(first, first_name).has_value());
+
+    // When: a second same-UID consumer tries to replace it.
+    const auto denied = fixture.service.register_consumer(second, second_name);
+
+    // Then: exclusivity still holds and the incumbent keeps its registration.
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(denied.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(fixture.service.state().consumer, aa::core::ConsumerId{1});
+}
+
+TEST(ControlService, OwnerLookupFailureRevokesAuthority) {
+    // Given: a registered consumer holding a viewport.
+    Fixture fixture;
+    const BusName connection{":1.106"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(connection, kSessionUid);
+    fixture.credentials.set_owner(consumer_name, connection);
+    ASSERT_TRUE(fixture.service.register_consumer(connection, consumer_name).has_value());
+    ASSERT_TRUE(
+        fixture.service.set_display_viewport(connection, Viewport{1280, 720, 160}).has_value());
+
+    // When: the ownership lookup turns unverifiable and reconciliation runs.
+    fixture.credentials.fail_owner_lookup(consumer_name);
+    fixture.service.refresh_consumer_owner();
+
+    // Then: authority is revoked closed, and even a recovered lookup never
+    // auto-restores the old registration.
+    EXPECT_EQ(fixture.service.state().consumer, aa::core::ConsumerId{});
+    EXPECT_FALSE(fixture.service.viewport().has_value());
+    fixture.credentials.restore_owner_lookup(consumer_name);
+    fixture.credentials.set_owner(consumer_name, connection);
+    fixture.service.refresh_consumer_owner();
+    const auto denied = fixture.service.start_projection(connection);
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(denied.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(fixture.service.state().consumer, aa::core::ConsumerId{});
+    std::size_t owner_lost_diagnostics = 0;
+    for (const auto& event : fixture.events.events) {
+        if (const auto* diagnostic = std::get_if<aa::ipc::DiagnosticEmitted>(&event)) {
+            if (diagnostic->event == "consumer_owner_lost") {
+                ++owner_lost_diagnostics;
+            }
+        }
+    }
+    EXPECT_EQ(owner_lost_diagnostics, 1U);
+}
+
+TEST(ControlService, OwnerLossDoesNotResetPairingIdHistory) {
+    // Given: a consumer pairing through an id source that always reissues id
+    // 1, with that id pending when the owner vanishes.
+    aa::ipc::test::FakePeerCredentials credentials{};
+    aa::ipc::test::RecordingEventSink events{};
+    aa::ipc::test::CyclingPairingIds ids{1};
+    aa::ipc::test::RecordingPhoneDirectory phones{};
+    ControlService service{ControlServiceConfig{kSessionUid},
+                           ControlServiceDeps{credentials, events, ids, phones}};
+    const BusName first{":1.107"};
+    const BusName first_name{"org.custom.ConsumerA"};
+    const BusName second{":1.108"};
+    const BusName second_name{"org.custom.ConsumerB"};
+    credentials.add_connection(first, kSessionUid);
+    credentials.add_connection(second, kSessionUid);
+    credentials.set_owner(first_name, first);
+    credentials.set_owner(second_name, second);
+    ASSERT_TRUE(service.register_consumer(first, first_name).has_value());
+    const auto request = service.request_add_phone(first);
+    ASSERT_TRUE(request.has_value());
+    ASSERT_EQ(request.value(), aa::core::PairingRequestId{1});
+    credentials.remove_owner(first_name);
+    service.refresh_consumer_owner();
+    ASSERT_TRUE(service.register_consumer(second, second_name).has_value());
+
+    // When: the new consumer confirms the spent id and then requests again
+    // from the repeating id source.
+    const auto confirmed = service.confirm_phone_pairing(second, request.value());
+    const auto reissued = service.request_add_phone(second);
+
+    // Then: the spent id stays spent (typed rejection, never a fresh unknown-id
+    // parse) and the cycling source cannot reissue it after teardown.
+    ASSERT_FALSE(confirmed.has_value());
+    EXPECT_EQ(confirmed.error().code(), ErrorCode::ipc_consumer_rejected);
+    ASSERT_FALSE(reissued.has_value());
+    EXPECT_EQ(reissued.error().code(), ErrorCode::internal);
 }
 
 } // namespace

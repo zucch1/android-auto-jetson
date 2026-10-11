@@ -145,10 +145,10 @@ public:
     // registered, re-resolve its owned name through the credential lookup and
     // compare against the stored UNIQUE connection. Absent, different or
     // unverifiable ownership all revoke authority and tear the registration
-    // down (lookup failures close conservatively - the production lookup
+    // down (lookup failures close conservatively — the production lookup
     // collapses every bus failure to ipc_peer_unauthorized, so unverifiable
-    // == revoked). With no registration this is a no-op. The runtime (task 24)
-    // MUST call this while idle: lookup-on-use cannot detect an idle
+    // == revoked). With no registration this is a no-op. The future runtime
+    // (task 24) MUST call this while idle: lookup-on-use cannot detect an idle
     // disconnect on its own.
     void refresh_consumer_owner();
 

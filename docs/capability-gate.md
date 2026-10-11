@@ -45,7 +45,7 @@ budget (audio, reconnect, recovery, soak, RSS) to be measured.
 | decode | **owner-signed-reduced-scope** | 600 s hardware decode 18000/18000 frames, zero drops, 30 fps, 10.02 Mbps, 3.83% CPU; p95 36.09 ms **exceeds** the 33 ms budget (withdrawn); software fallback unqualified (withdrawn) | `task-9-decode-probe.json`, `task-9-owner-signoff.json` |
 | IPC | probe-pass-provisional | host-only 600 s synthetic AF_UNIX benchmark: 12.189683 Mbps, p95 0.2 ms, zero happy-path drops | `task-10-final-acceptance-gate.json` |
 | USB | probe-pass-provisional | AOA2 capability only: IN 0x81 / OUT 0x01, MPS 512, 3/3 resets, 30 s / 31 samples stable — **not projection** | `task-11-usb-probe.json` |
-| wireless | **owner-signed-reduced-scope** | AP/client deferred; BlueZ registration + clean unregister succeeded; 3.009 s event loop is **not** a strict 3 s deadline pass | `task-12-bluez-lightweight.json`, `task-12-owner-signoff.json` |
+| wireless | **owner-signed-reduced-scope** | Regd fixed (shim+watchdog, US live); UNII-1 5 GHz AP (ch 44, 20 MHz) + client-association **demonstrated** (2026-10-10/11 receipts); claim 1 re-scoped from channel-36 per 2026-10-11 sign-off; 3.009 s event loop still **not** a strict 3 s pass; release budgets unmeasured | `claim-rescope-signoff-2026-10-11.md`, `task-12-bluez-lightweight.json` |
 
 All six `probe-pass-provisional` entries are interim: before final release
 approval they must resolve to `full-pass` or `owner-signed-reduced-scope`;
@@ -73,18 +73,29 @@ approval they must resolve to `full-pass` or `owner-signed-reduced-scope`;
 
 ### wireless (`owner-signed-reduced-scope`)
 
+Current sign-off (claim resolution, 2026-10-11):
+- owner: `Newton`
+- timestamp: `2026-10-11T06:41:02Z`
+- evidence_ref: `.omo/evidence/jetson-android-auto-receiver/claim-rescope-signoff-2026-10-11.md`
+- statement: "sign."
+- resolved_claims:
+  1. `Completed onboard RTL8822CE UNII-1 5 GHz AP qualification (ch 44, 20 MHz) at the early capability gate` — re-scoped from the channel-36 wording (the vendor driver forces a CSA 36→44); **demonstrated** (qual-run-1, qual-run-5, qual-ht20-test receipts)
+  2. `Completed isolated AP client-association qualification at the early capability gate` — **demonstrated** (qual-client-assoc receipt)
+- withdrawn_claims (remaining):
+  1. `Full wireless capability acceptance as a prerequisite for continuing independent wired implementation`
+
+Historical sign-off (2026-10-08, original withdrawal — preserved verbatim):
 - owner: `Newton`
 - timestamp: `2026-10-08T17:28:33Z`
 - evidence_ref: `.omo/evidence/jetson-android-auto-receiver/task-12-lightweight-preflight.json`
 - statement: "do not let that block us. find a command maybe. if not, we skip."
-- withdrawn_claims:
+- withdrawn_claims (at that time):
   1. `Completed onboard RTL8822CE channel-36 AP qualification at the early capability gate`
   2. `Completed isolated AP client-association qualification at the early capability gate`
   3. `Full wireless capability acceptance as a prerequisite for continuing independent wired implementation`
 
-These sign-offs never count as full compliance. The wireless withdrawn claims
-are capability-level: the wireless release budgets below stay unmeasured and
-unclaimed rather than withdrawn.
+These sign-offs never count as full compliance. The wireless release budgets
+below stay unmeasured and unclaimed rather than withdrawn.
 
 ## Budgets
 
@@ -130,10 +141,13 @@ area or availability stage.
   probe result claims them as passed.
 - USB: AOA2 capability only. No Android Auto session and no bulk transfer were
   exercised; this is **not** projection and not a session-reconnect pass.
-- Wireless: AP/channel-36/client qualification deferred (owner-signed). The
-  BlueZ event loop observed 3.009 s against a 3 s deadline — **not** a strict
-  wall-bound pass. AP mode advertisement is not AP operation. No pairing or
-  trust claims. Wireless-dependent work stays deferred, not silently passed.
+- Wireless: UNII-1 5 GHz AP (ch 44, 20 MHz) and isolated client-association are
+  **demonstrated** (2026-10-10/11 receipts); the channel-36 wording was re-scoped
+  per the 2026-10-11 sign-off (the driver forces a CSA 36→44 — evidence kept, not
+  silently passed). The BlueZ event loop observed 3.009 s against a 3 s deadline —
+  **not** a strict wall-bound pass. AP mode advertisement is not AP operation. No
+  pairing or trust claims. Release budgets (session_reconnect_s, ap_startup_s) stay
+  unmeasured; full wireless capability acceptance stays deferred.
 - Decode: the 33 ms p95 latency budget is **not** met (36.09 ms measured) and
   the software H.264 fallback path is **unqualified**; both claims are
   withdrawn and must not be used downstream or in release compliance claims.

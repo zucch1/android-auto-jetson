@@ -184,6 +184,13 @@ jobs:
           test "${AA_SYSROOT_REQUIRE_OBSERVED:?AA_SYSROOT_REQUIRE_OBSERVED must be set}" = "OFF"
           cmake --preset jetson-aarch64
           cmake --build --preset jetson-aarch64
+      - name: Cross-build IPC libraries explicitly and verify the cross inventory
+        env:
+          AA_GOOGLETEST_ARCHIVE: ${{ runner.temp }}/googletest-v1.15.2.tar.gz
+        run: |
+          set -euo pipefail
+          cmake --build --preset jetson-aarch64 --target aa_ipc_control aa_ipc_dbus
+          python3 -B tests/dbus/assert_dbus_coverage.py --cross build/jetson-aarch64
       - name: State fixture-not-target scope in the step summary
         run: |
           set -euo pipefail
