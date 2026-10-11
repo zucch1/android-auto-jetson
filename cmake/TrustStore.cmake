@@ -40,7 +40,9 @@ set(AA_TRUST_TEST_SOURCES
     tests/trust/pairing_policy_test.cpp
     tests/trust/pairing_expiry_test.cpp
     tests/trust/redaction_test.cpp
-    tests/trust/control_flow_test.cpp)
+    tests/trust/control_flow_test.cpp
+    tests/trust/store_durability_test.cpp
+    tests/trust/syscall_faults.cpp)
 set(AA_TRUST_BUS_TEST_SOURCES
     tests/trust/bus_flow_test.cpp)
 foreach(source IN LISTS AA_TRUST_SOURCES AA_TRUST_TEST_SOURCES AA_TRUST_BUS_TEST_SOURCES)
@@ -62,6 +64,10 @@ target_link_libraries(aa_trust_store_test PRIVATE aa_trust aa_ipc_control GTest:
 set_target_properties(aa_trust_store_test PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 target_include_directories(aa_trust_store_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+# Linker-wrapped syscalls (fault injection): the durability regressions arm
+# scoped fsync/renameat faults (tests/trust/syscall_faults.cpp) against the
+# real replacement protocol; every unwrapped call falls back to the syscall.
+target_link_options(aa_trust_store_test PRIVATE -Wl,--wrap=fsync -Wl,--wrap=renameat)
 
 add_executable(aa_trust_bus_test ${AA_TRUST_BUS_TEST_SOURCES})
 target_link_libraries(aa_trust_bus_test PRIVATE aa_trust aa_ipc_dbus GTest::gtest_main)

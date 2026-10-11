@@ -85,9 +85,24 @@ constexpr mode_t kDirMode = 0700;
     return dirfd;
 }
 
+// fsync with EINTR retry: where a spurious interrupt must not be mistaken
+// for a durability failure (the post-rename directory sync reports the
+// committed-but-not-durable outcome, so a retryable errno must retry first).
+[[nodiscard]] int fsync_interruptible(int fd) {
+    int status;
+    while ((status = ::fsync(fd)) != 0 && errno == EINTR) {
+    }
+    return status;
+}
+
 // Creates every missing ancestor of `parent` at 0700. mkdir applies the
 // ambient umask, so the created mode is re-asserted with a checked fchmod on
 // the opened creation descriptor (never a path-based chmod; fail closed).
+// Each newly created directory entry is made durable before anything is
+// written inside it: the new directory and its containing directory (reached
+// through the new directory's own descriptor, so no path can be redirected)
+// are fsynced. This runs pre-replacement, so a sync failure rolls the
+// creation back and fails closed with nothing else mutated.
 [[nodiscard]] core::Result<void> create_missing_ancestors(const std::filesystem::path& parent) {
     std::filesystem::path current;
     for (const auto& component : parent) {
@@ -110,9 +125,20 @@ constexpr mode_t kDirMode = 0700;
             (void)::rmdir(current.c_str());
             return Error{ErrorCode::trust_store_io};
         }
-        const bool tightened = ::fchmod(fd, kDirMode) == 0;
+        bool durable = ::fchmod(fd, kDirMode) == 0;
+        if (durable) {
+            durable = fsync_interruptible(fd) == 0;
+            const int containing =
+                ::openat(fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (containing < 0) {
+                durable = false;
+            } else {
+                durable = durable && fsync_interruptible(containing) == 0;
+                ::close(containing);
+            }
+        }
         ::close(fd);
-        if (!tightened) {
+        if (!durable) {
             (void)::rmdir(current.c_str());
             return Error{ErrorCode::trust_store_io};
         }
@@ -263,13 +289,24 @@ core::Result<void> write_file_private(const std::filesystem::path& path, std::st
         }
         written += static_cast<std::size_t>(put);
     }
+    // Replacement protocol: fsync the temp file and CHECKED-close it BEFORE
+    // the replacement, then rename over the store and make the rename itself
+    // durable by syncing the containing directory. The verified directory
+    // descriptor opened above is reused for the rename and the final sync —
+    // never reopened by path after the rename.
     if (::fsync(fd) != 0) {
         ::close(fd);
         (void)::unlinkat(dirfd, temp_name.c_str(), 0);
         ::close(dirfd);
         return Error{ErrorCode::trust_store_io};
     }
-    ::close(fd);
+    // close() releases the descriptor even on error and is never retried on
+    // Linux; a checked failure here is still a pre-replacement failure.
+    if (::close(fd) != 0) {
+        (void)::unlinkat(dirfd, temp_name.c_str(), 0);
+        ::close(dirfd);
+        return Error{ErrorCode::trust_store_io};
+    }
     // Atomic replace: rename swaps the verified 0600 regular file over the
     // target inside the verified directory. A pre-existing symlink at the
     // store name is replaced outright (never followed).
@@ -278,7 +315,16 @@ core::Result<void> write_file_private(const std::filesystem::path& path, std::st
         ::close(dirfd);
         return Error{ErrorCode::trust_store_io};
     }
+    // Past the rename the mutation IS the store on disk and cannot roll back
+    // (the previous content is gone). A directory-sync failure reports the
+    // committed-but-not-durable outcome instead of losing the mutation:
+    // trust_store_not_durable keeps the replacement in memory and on disk and
+    // only flags crash durability of the new directory entry as unconfirmed.
+    const int synced = fsync_interruptible(dirfd);
     ::close(dirfd);
+    if (synced != 0) {
+        return Error{ErrorCode::trust_store_not_durable};
+    }
     return {};
 }
 

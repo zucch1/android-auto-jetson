@@ -65,6 +65,11 @@ enum class ErrorCode : std::uint16_t {
     trust_store_io = 700,
     trust_unknown_phone = 701,
     trust_rejected = 702,
+    // 703: the store replacement RENAMED successfully but the containing
+    // directory sync failed. The mutation is applied in memory and on disk
+    // and only crash durability of the new directory entry is unconfirmed.
+    // Append-only band: never renumber or repurpose.
+    trust_store_not_durable = 703,
 
     // config
     config_invalid = 800,
