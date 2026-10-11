@@ -145,7 +145,11 @@ set(AA_DBUS_SCHEMA_CASES
     neg-missing-method neg-bad-signature neg-semver-mismatch neg-unexpected-method
     neg-duplicate-method neg-bogus-direction neg-masking-duplicate
     neg-multi-type-method neg-multi-type-signal
-    neg-raw-delimiter-injection embedding-special-bytes embedding-crlf)
+    neg-raw-delimiter-injection embedding-special-bytes embedding-crlf
+    neg-unexpected-root-child neg-unexpected-nested-element neg-unexpected-attribute
+    neg-missing-attribute neg-unexpected-text neg-duplicate-annotation
+    neg-unexpected-annotation neg-doctype neg-processing-instruction neg-namespace
+    neg-invalid-preserves-existing-header)
 if(NOT CMAKE_CROSSCOMPILING)
     foreach(case IN LISTS AA_DBUS_SCHEMA_CASES)
         string(REPLACE "-" "_" test_suffix "${case}")

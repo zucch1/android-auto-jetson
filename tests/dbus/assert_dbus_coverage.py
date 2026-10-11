@@ -51,6 +51,17 @@ EXPECTED = frozenset({
     'dbus_contract_schema_neg_raw_delimiter_injection',
     'dbus_contract_schema_embedding_special_bytes',
     'dbus_contract_schema_embedding_crlf',
+    'dbus_contract_schema_neg_unexpected_root_child',
+    'dbus_contract_schema_neg_unexpected_nested_element',
+    'dbus_contract_schema_neg_unexpected_attribute',
+    'dbus_contract_schema_neg_missing_attribute',
+    'dbus_contract_schema_neg_unexpected_text',
+    'dbus_contract_schema_neg_duplicate_annotation',
+    'dbus_contract_schema_neg_unexpected_annotation',
+    'dbus_contract_schema_neg_doctype',
+    'dbus_contract_schema_neg_processing_instruction',
+    'dbus_contract_schema_neg_namespace',
+    'dbus_contract_schema_neg_invalid_preserves_existing_header',
     'dbus_contract_coverage',
 })
 

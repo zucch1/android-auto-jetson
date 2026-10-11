@@ -84,6 +84,9 @@ def expect_failure(result: subprocess.CompletedProcess[str], markers: tuple[str,
 
 def reject(root: Path, transform: Callable[[str], str], case: str,
            markers: tuple[str, ...]) -> int:
+    """Runs a mutated fixture through BOTH tool modes: `check` and `generate`
+    must each fail closed with the named diagnostics, and `generate` must not
+    write a header."""
     text = (root / CONTRACT).read_text(encoding="utf-8")
     changed = transform(text)
     if changed == text:
@@ -92,9 +95,11 @@ def reject(root: Path, transform: Callable[[str], str], case: str,
     scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-"))
     fixture = scratch / "mutated.xml"
     fixture.write_text(changed, encoding="utf-8")
+    verdict = expect_failure(run_tool(mode="check", xml=fixture), markers,
+                             f"{case}[check]", None)
     out = scratch / "should_not_exist.generated.hpp"
     result = run_tool(mode="generate", xml=fixture, out=out)
-    return expect_failure(result, markers, case, out)
+    return verdict | expect_failure(result, markers, f"{case}[generate]", out)
 
 
 def generated_path(scratch: Path) -> Path:
@@ -189,9 +194,12 @@ def case_neg_malformed_xml(root: Path) -> int:
     scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-"))
     fixture = scratch / "malformed.xml"
     fixture.write_text("<node name=\"/org/custom/AndroidAutoReceiver\"><interface", encoding="utf-8")
+    markers = ("DBUS_CONTRACT_MALFORMED_XML",)
+    verdict = expect_failure(run_tool(mode="check", xml=fixture), markers,
+                             "neg-malformed-xml[check]", None)
     out = scratch / "should_not_exist.generated.hpp"
     result = run_tool(mode="generate", xml=fixture, out=out)
-    return expect_failure(result, ("DBUS_CONTRACT_MALFORMED_XML",), "neg-malformed-xml", out)
+    return verdict | expect_failure(result, markers, "neg-malformed-xml[generate]", out)
 
 
 def case_neg_unsupported_major(root: Path) -> int:
@@ -342,6 +350,209 @@ def case_embedding_crlf(root: Path) -> int:
     return round_trip(root, lambda data: data.replace(b"\n", b"\r\n"), "embedding-crlf")
 
 
+
+# --- structural-allowlist regressions (round 3 review) ------------------------
+
+ANNOTATION_TAG = '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.0.0"/>'
+PROPERTY_TAG = '<property name="ContractSemVer" type="s" access="read"/>'
+NODE_OPEN = '<node name="/org/custom/AndroidAutoReceiver">'
+INTERFACE_OPEN = '<interface name="org.custom.AndroidAutoReceiver1">'
+
+
+def case_neg_unexpected_root_child(root: Path) -> int:
+    for label, injected in (
+            ("stray", '<method name="Stray"/>'),
+            ("nested-node", '<node name="/org/custom/Other"/>')):
+        verdict = reject(
+            root,
+            lambda text, injected=injected: text.replace(
+                NODE_OPEN, f"{NODE_OPEN}\n  {injected}", 1),
+            f"neg-unexpected-root-child[{label}]", ("DBUS_CONTRACT_UNEXPECTED_ELEMENT",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_unexpected_nested_element(root: Path) -> int:
+    containers = (
+        ('<method name="StartProjection">\n    </method>',
+         '<method name="StartProjection"><bogus/></method>'),
+        ('<signal name="PairingRequest">', '<signal name="PairingRequest">\n      <bogus/>'),
+        (PROPERTY_TAG, '<property name="ContractSemVer" type="s" access="read"><bogus/></property>'),
+        ('<arg name="consumer_name" type="s" direction="in"/>',
+         '<arg name="consumer_name" type="s" direction="in"><bogus/></arg>'),
+        (ANNOTATION_TAG,
+         '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
+         ' value="1.0.0"><bogus/></annotation>'),
+    )
+    for label, (original, replaced) in zip(
+            ("method", "signal", "property", "arg", "annotation"), containers, strict=True):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-unexpected-nested-element[{label}]",
+            ("DBUS_CONTRACT_UNEXPECTED_ELEMENT",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_unexpected_attribute(root: Path) -> int:
+    targets = (
+        (NODE_OPEN, '<node name="/org/custom/AndroidAutoReceiver" role="x">'),
+        (INTERFACE_OPEN, '<interface name="org.custom.AndroidAutoReceiver1" role="x">'),
+        ('<method name="Ping">', '<method name="Ping" role="x">'),
+        ('<signal name="PairingRequest">', '<signal name="PairingRequest" role="x">'),
+        (PROPERTY_TAG, '<property name="ContractSemVer" type="s" access="read" role="x"/>'),
+        ('<arg name="consumer_name" type="s" direction="in"/>',
+         '<arg name="consumer_name" type="s" direction="in" role="x"/>'),
+        (ANNOTATION_TAG,
+         '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
+         ' value="1.0.0" role="x"/>'),
+    )
+    for label, (original, replaced) in zip(
+            ("node", "interface", "method", "signal", "property", "arg", "annotation"),
+            targets, strict=True):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-unexpected-attribute[{label}]",
+            ("DBUS_CONTRACT_UNEXPECTED_ATTRIBUTE",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_missing_attribute(root: Path) -> int:
+    targets = (
+        ("method-name", '<method name="Ping">', '<method>'),
+        ("arg-type", '<arg name="consumer_name" type="s" direction="in"/>',
+         '<arg name="consumer_name" direction="in"/>'),
+        ("property-access", PROPERTY_TAG, '<property name="ContractSemVer" type="s"/>'),
+        ("annotation-value", ANNOTATION_TAG,
+         '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"/>'),
+    )
+    for label, original, replaced in targets:
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-missing-attribute[{label}]",
+            ("DBUS_CONTRACT_MISSING_ATTRIBUTE",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_unexpected_text(root: Path) -> int:
+    for label, original, replaced in (
+            ("text", '<method name="Ping">', '<method name="Ping">oops'),
+            ("tail", '<arg name="monotonic_ns" type="t" direction="out"/>',
+             '<arg name="monotonic_ns" type="t" direction="out"/>oops')):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-unexpected-text[{label}]", ("DBUS_CONTRACT_UNEXPECTED_TEXT",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_duplicate_annotation(root: Path) -> int:
+    conflicting = ANNOTATION_TAG.replace('value="1.0.0"', 'value="2.0.0"')
+    for label, replacements in (
+            ("identical", ANNOTATION_TAG + "\n    " + ANNOTATION_TAG),
+            ("conflicting", ANNOTATION_TAG + "\n    " + conflicting),
+            ("conflicting-reversed", conflicting + "\n    " + ANNOTATION_TAG)):
+        verdict = reject(
+            root,
+            lambda text, replacements=replacements: text.replace(
+                ANNOTATION_TAG, replacements, 1),
+            f"neg-duplicate-annotation[{label}]",
+            ("DBUS_CONTRACT_DUPLICATE_ANNOTATION",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_unexpected_annotation(root: Path) -> int:
+    for label, original, replaced in (
+            ("renamed", ANNOTATION_TAG,
+             '<annotation name="org.freedesktop.DBus.GLib.CSymbol" value="1.0.0"/>'),
+            ("nested", '<method name="Ping">',
+             '<method name="Ping">\n      ' + ANNOTATION_TAG)):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-unexpected-annotation[{label}]",
+            ("DBUS_CONTRACT_UNEXPECTED_ANNOTATION",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_doctype(root: Path) -> int:
+    return reject(
+        root,
+        lambda text: text.replace(
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE node [<!ELEMENT node ANY>]>', 1),
+        "neg-doctype", ("DBUS_CONTRACT_UNEXPECTED_DOCTYPE",))
+
+
+def case_neg_processing_instruction(root: Path) -> int:
+    return reject(
+        root,
+        lambda text: text.replace(
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<?xml version="1.0" encoding="UTF-8"?>\n<?work target?>', 1),
+        "neg-processing-instruction",
+        ("DBUS_CONTRACT_UNEXPECTED_PROCESSING_INSTRUCTION",))
+
+
+def case_neg_namespace(root: Path) -> int:
+    for label, original, replaced in (
+            ("decl", INTERFACE_OPEN,
+             '<interface name="org.custom.AndroidAutoReceiver1" xmlns:foo="urn:foo">'),
+            ("name", INTERFACE_OPEN,
+             '<interface name="org.custom.AndroidAutoReceiver1"'
+             ' xmlns:foo="urn:foo" foo:role="x">')):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-namespace[{label}]", ("DBUS_CONTRACT_UNEXPECTED_NAMESPACE",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_invalid_preserves_existing_header(root: Path) -> int:
+    # Fail-closed write discipline: codegen must not clobber an existing
+    # header when the schema is invalid.
+    scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-"))
+    fixture = scratch / "mutated.xml"
+    changed = (root / CONTRACT).read_text(encoding="utf-8").replace(
+        ANNOTATION_TAG,
+        '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
+        ' value="1.0.0" role="x"/>', 1)
+    fixture.write_text(changed, encoding="utf-8")
+    out = scratch / "existing.generated.hpp"
+    sentinel = b"\x00\x01 sentinel-not-a-header \xfe\xff"
+    out.write_bytes(sentinel)
+    result = run_tool(mode="generate", xml=fixture, out=out)
+    verdict = expect_failure(result, ("DBUS_CONTRACT_UNEXPECTED_ATTRIBUTE",),
+                             "neg-invalid-preserves-existing-header", None)
+    if out.read_bytes() != sentinel:
+        print("neg-invalid-preserves-existing-header: existing header was clobbered")
+        verdict = 1
+    return verdict
+
+
 CASES: dict[str, Callable[[Path], int]] = {
     "real-check": case_real_check,
     "real-generate": case_real_generate,
@@ -361,6 +572,17 @@ CASES: dict[str, Callable[[Path], int]] = {
     "neg-raw-delimiter-injection": case_neg_raw_delimiter_injection,
     "embedding-special-bytes": case_embedding_special_bytes,
     "embedding-crlf": case_embedding_crlf,
+    "neg-unexpected-root-child": case_neg_unexpected_root_child,
+    "neg-unexpected-nested-element": case_neg_unexpected_nested_element,
+    "neg-unexpected-attribute": case_neg_unexpected_attribute,
+    "neg-missing-attribute": case_neg_missing_attribute,
+    "neg-unexpected-text": case_neg_unexpected_text,
+    "neg-duplicate-annotation": case_neg_duplicate_annotation,
+    "neg-unexpected-annotation": case_neg_unexpected_annotation,
+    "neg-doctype": case_neg_doctype,
+    "neg-processing-instruction": case_neg_processing_instruction,
+    "neg-namespace": case_neg_namespace,
+    "neg-invalid-preserves-existing-header": case_neg_invalid_preserves_existing_header,
 }
 
 

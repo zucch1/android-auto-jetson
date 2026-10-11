@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import sys
 import xml.etree.ElementTree as ET
+import xml.parsers.expat as expat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -45,6 +46,25 @@ from dbus_contract_schema import (
 
 # One argument must declare exactly one complete D-Bus type from this set.
 ALLOWED_SINGLE_TYPES: Final[frozenset[str]] = ALLOWED_SCALAR_TYPES | {ALLOWED_MAP_TYPE}
+
+# XML whitespace is the four XML whitespace characters only; str.isspace()
+# would also accept Unicode whitespace the contract does not permit.
+XML_WHITESPACE: Final[frozenset[str]] = frozenset(" \t\r\n")
+
+# Structural allowlist for the contract XML (per-element required attributes,
+# optional attributes and allowed element children). Comments are allowed
+# everywhere with arbitrary content; processing instructions are rejected by
+# check_lexical and skipped here. The grammar is contract-specific: only the
+# shapes the checked schema needs, not the full D-Bus introspection grammar.
+STRUCTURE: Final[dict[str, tuple[tuple[str, ...], tuple[str, ...], frozenset[str]]]] = {
+    "node": (("name",), (), frozenset({"interface"})),
+    "interface": (("name",), (), frozenset({"annotation", "method", "signal", "property"})),
+    "method": (("name",), (), frozenset({"arg"})),
+    "signal": (("name",), (), frozenset({"arg"})),
+    "arg": (("type",), ("name", "direction"), frozenset()),
+    "property": (("name", "type", "access"), (), frozenset()),
+    "annotation": (("name", "value"), (), frozenset()),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,34 +195,148 @@ def check_members(interface: ET.Element) -> list[Violation]:
             record("DBUS_CONTRACT_MISSING_PROPERTY", name)
 
     for child in interface:
+        if child.tag is ET.Comment or child.tag is ET.PI:
+            continue
         if child.tag not in {"method", "signal", "property", "annotation"}:
             record("DBUS_CONTRACT_UNEXPECTED_ELEMENT", f"interface child <{child.tag}>")
     return violations
 
 
+
+def segment_of(node: ET.Element) -> str:
+    name = node.get("name")
+    return f"{node.tag} {name}" if name is not None else str(node.tag)
+
+
+def check_lexical(text: str) -> list[Violation]:
+    """Parser-level rejects that ElementTree silently drops: a DTD, processing
+    instructions (the XML declaration excepted, which expat never reports as
+    one) and namespace declarations must fail closed even though
+    ``ET.fromstring`` never surfaces them. The same input is replayed through
+    expat with explicit handlers so none of these can disappear silently."""
+    violations: list[Violation] = []
+    parser = expat.ParserCreate(namespace_separator="|")
+
+    def doctype(name: str, system_id: str, public_id: str, has_internal: int) -> None:
+        del system_id, public_id, has_internal
+        violations.append(Violation("DBUS_CONTRACT_UNEXPECTED_DOCTYPE", f"doctype {name}"))
+
+    def processing_instruction(target: str, data: str) -> None:
+        del data
+        violations.append(Violation("DBUS_CONTRACT_UNEXPECTED_PROCESSING_INSTRUCTION",
+                                    f"pi {target}"))
+
+    def namespace_decl(prefix: str | None, uri: str) -> None:
+        del uri
+        violations.append(Violation("DBUS_CONTRACT_UNEXPECTED_NAMESPACE",
+                                    f"namespace '{prefix if prefix is not None else 'xmlns'}'"))
+
+    parser.StartDoctypeDeclHandler = doctype
+    parser.ProcessingInstructionHandler = processing_instruction
+    parser.StartNamespaceDeclHandler = namespace_decl
+    try:
+        parser.Parse(text, True)
+    except expat.ExpatError:
+        pass  # malformed XML is already reported as DBUS_CONTRACT_MALFORMED_XML
+    return violations
+
+
+def check_structure(root: ET.Element) -> list[Violation]:
+    """Structural allowlist over the parsed tree: the exact element/attribute
+    grammar of STRUCTURE, no nesting, whitespace-only element text and tails,
+    and annotations only where the checked schema admits them."""
+    violations: list[Violation] = []
+
+    def record(code: str, detail: str) -> None:
+        violations.append(Violation(code, detail))
+
+    def segment(node: ET.Element) -> str:
+        name = node.get("name")
+        return f"{node.tag} {name}" if name is not None else str(node.tag)
+
+    def check_text(text: str | None, context: str, kind: str) -> None:
+        if text and any(character not in XML_WHITESPACE for character in text):
+            record("DBUS_CONTRACT_UNEXPECTED_TEXT", f"{context} {kind}")
+
+    def check_names(node: ET.Element, context: str) -> None:
+        if not isinstance(node.tag, str) or node.tag.startswith("{") or "}" in node.tag:
+            record("DBUS_CONTRACT_UNEXPECTED_NAMESPACE", f"{context} name '{node.tag}'")
+        for key in node.attrib:
+            if key.startswith("{") or "}" in key:
+                record("DBUS_CONTRACT_UNEXPECTED_NAMESPACE", f"{context} name '{key}'")
+
+    def walk(node: ET.Element, trail: tuple[str, ...]) -> None:
+        context = "/".join(trail + (segment(node),))
+        check_names(node, context)
+        check_text(node.text, context, "text")
+        required, optional, allowed = STRUCTURE.get(node.tag, ((), (), frozenset()))
+        for key in required:
+            if key not in node.attrib:
+                record("DBUS_CONTRACT_MISSING_ATTRIBUTE", f"{context} missing attribute '{key}'")
+        for key in node.attrib:
+            if key not in required and key not in optional:
+                record("DBUS_CONTRACT_UNEXPECTED_ATTRIBUTE", f"{context} attribute '{key}'")
+        for child in node:
+            if child.tag is ET.Comment:
+                check_text(child.tail, context, "tail")
+                continue
+            if child.tag is ET.PI:
+                check_text(child.tail, context, "tail")
+                continue
+            child_context = f"{context}/{segment(child)}"
+            if child.tag == "annotation":
+                if node.tag != "interface" or child.get("name") != SEMVER_ANNOTATION:
+                    record("DBUS_CONTRACT_UNEXPECTED_ANNOTATION",
+                           f"{context} annotation '{child.get('name', '')}'")
+            elif child.tag not in allowed:
+                record("DBUS_CONTRACT_UNEXPECTED_ELEMENT", f"{context} child <{child.tag}>")
+            check_text(child.tail, child_context, "tail")
+            walk(child, trail + (segment(node),))
+
+    walk(root, ())
+    return violations
+
+
 def check_semver(interface: ET.Element) -> list[Violation]:
-    annotations = {a.get("name", ""): a.get("value", "") for a in interface.findall("annotation")}
-    value = annotations.get(SEMVER_ANNOTATION)
+    """SemVer metadata, checked on the ORIGINAL annotation list: duplicate
+    names are detected before any value is selected, so a last-write-wins
+    dictionary can never establish validity."""
+    violations: list[Violation] = []
+    seen: dict[str, str] = {}
+    for annotation in interface.findall("annotation"):
+        name = annotation.get("name", "")
+        if name in seen:
+            violations.append(Violation("DBUS_CONTRACT_DUPLICATE_ANNOTATION",
+                                        f"{segment_of(annotation)} duplicate annotation '{name}'"))
+            continue
+        seen[name] = annotation.get("value", "")
+    value = seen.get(SEMVER_ANNOTATION)
     if value is None:
-        return [Violation("DBUS_CONTRACT_MISSING_SEMVER", SEMVER_ANNOTATION)]
+        violations.append(Violation("DBUS_CONTRACT_MISSING_SEMVER", SEMVER_ANNOTATION))
+        return violations
     if value != SEMVER:
-        return [Violation("DBUS_CONTRACT_SEMVER_MISMATCH",
-                          f"{SEMVER_ANNOTATION} expected '{SEMVER}' got '{value}'")]
+        violations.append(Violation("DBUS_CONTRACT_SEMVER_MISMATCH",
+                                    f"{SEMVER_ANNOTATION} expected '{SEMVER}' got '{value}'"))
+        return violations
     parts = value.split(".")
     if len(parts) != 3 or not all(p.isdigit() for p in parts):
-        return [Violation("DBUS_CONTRACT_SEMVER_MISMATCH", f"'{value}' is not MAJOR.MINOR.PATCH")]
+        violations.append(Violation("DBUS_CONTRACT_SEMVER_MISMATCH",
+                                    f"'{value}' is not MAJOR.MINOR.PATCH"))
+        return violations
     if int(parts[0]) != interface_major(interface.get("name", "")):
-        return [Violation("DBUS_CONTRACT_SEMVER_MISMATCH",
-                          f"semver major {parts[0]} != interface-name major")]
-    return []
+        violations.append(Violation("DBUS_CONTRACT_SEMVER_MISMATCH",
+                                    f"semver major {parts[0]} != interface-name major"))
+    return violations
 
 
 def check_document(text: str) -> tuple[list[Violation], ET.Element | None]:
     try:
-        root = ET.fromstring(text)
+        root = ET.fromstring(
+            text, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True,
+                                                            insert_pis=True)))
     except ET.ParseError as exc:
         return [Violation("DBUS_CONTRACT_MALFORMED_XML", str(exc))], None
-    violations: list[Violation] = []
+    violations: list[Violation] = check_lexical(text)
     if root.tag != "node":
         violations.append(Violation("DBUS_CONTRACT_UNEXPECTED_ELEMENT", f"root <{root.tag}>"))
         return violations, None
@@ -224,6 +358,7 @@ def check_document(text: str) -> tuple[list[Violation], ET.Element | None]:
         else:
             violations.append(Violation("DBUS_CONTRACT_WRONG_INTERFACE", name))
         return violations, None
+    violations.extend(check_structure(root))
     violations.extend(check_semver(interface))
     violations.extend(check_members(interface))
     return violations, root
