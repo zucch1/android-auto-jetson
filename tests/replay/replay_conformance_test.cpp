@@ -34,7 +34,7 @@ using namespace conformancewire;
 // file bytes, as written by aa_conformance_fixture_write from the spec).
 // Regenerating the files must reproduce these; a mismatch fails closed.
 inline constexpr std::string_view kControlFixtureSha256 =
-    "afdb66270a72823fee32fa141b76202f6b89ab560fb7fc2101a622bac693ad3e"; // PIN-CONTROL
+    "5142555bafed8c0f6b441b9a5432bafb5b363a05ffd91dd5694ca7777fab464f"; // PIN-CONTROL
 inline constexpr std::string_view kMediaFixtureSha256 =
     "faafeeb072f63c83b5373e2b57c36312272f21fe9dde61c7100cbd2df4b34d13"; // PIN-MEDIA
 inline constexpr std::string_view kUiConfigFixtureSha256 =
@@ -102,24 +102,42 @@ TEST(ReplayConformance, VersionRequestFailsClosedOnResponseAndForeignIds) {
 
 TEST(ReplayConformance, ControlFrameLayoutMatchesArchitectureFlags) {
     // Given: the OAA architecture flags table (PLAIN|CONTROL|BULK = 0x07,
-    // PLAIN|SPECIFIC|BULK = 0x03).
-    // When: the project-owned framer wraps the spec payloads.
-    auto control = transport::encode_message(
-        transport::Message{std::uint8_t{0}, transport::MessageKind::control,
-                           F_A_version_request_v1_1_payload},
-        transport::Encryption::plain, nullptr);
-    ASSERT_TRUE(control.has_value());
-    ASSERT_EQ(control.value().size(), 1u);
-    // Then: the frame bytes equal the hand-derived frame literal.
-    EXPECT_EQ(control.value().front(), F_A_version_request_v1_1_frame);
-
+    // PLAIN|SPECIFIC|BULK = 0x03) and the D19-corrected version-request kind
+    // (SPECIFIC: pinned aasdk sendVersionRequest + S24 probe 2026-10-10).
+    // When: the project-owned framer wraps the encoder's version-request
+    // output with the canonical SPECIFIC kind.
+    const auto request = proto::encode(proto::VersionRequest{1, 1});
+    ASSERT_TRUE(request.has_value());
     auto specific = transport::encode_message(
-        transport::Message{kDynamicVideoServiceByte, transport::MessageKind::specific,
-                           F_N_av_setup_request_8000_payload},
+        transport::Message{std::uint8_t{0}, transport::MessageKind::specific,
+                           request.value()},
         transport::Encryption::plain, nullptr);
     ASSERT_TRUE(specific.has_value());
     ASSERT_EQ(specific.value().size(), 1u);
-    EXPECT_EQ(specific.value().front(), F_N_av_setup_request_8000_frame);
+    // Then: the frame bytes equal the canonical hand-derived frame literal.
+    EXPECT_EQ(specific.value().front(), F_A_version_request_v1_1_frame);
+
+    // And: the misannotation-derived CONTROL (0x07) form stays pinned as a
+    // documented variant (D24 dual-form discipline). The S24 probe showed this
+    // phone's framer ignores it (8 frames, zero response) while the canonical
+    // 0x03 form draws VERSION_RESPONSE 1.7 STATUS_SUCCESS in 3-5 ms.
+    auto control = transport::encode_message(
+        transport::Message{std::uint8_t{0}, transport::MessageKind::control,
+                           request.value()},
+        transport::Encryption::plain, nullptr);
+    ASSERT_TRUE(control.has_value());
+    ASSERT_EQ(control.value().size(), 1u);
+    EXPECT_EQ(control.value().front(), F_A2_version_request_v1_1_frame_control_variant);
+    EXPECT_NE(F_A_version_request_v1_1_frame,
+              F_A2_version_request_v1_1_frame_control_variant);
+
+    auto bulk = transport::encode_message(
+        transport::Message{kDynamicVideoServiceByte, transport::MessageKind::specific,
+                           F_N_av_setup_request_8000_payload},
+        transport::Encryption::plain, nullptr);
+    ASSERT_TRUE(bulk.has_value());
+    ASSERT_EQ(bulk.value().size(), 1u);
+    EXPECT_EQ(bulk.value().front(), F_N_av_setup_request_8000_frame);
 }
 
 TEST(ReplayConformance, ServiceDiscoveryResponseMatchesHandDerivedBytes) {
