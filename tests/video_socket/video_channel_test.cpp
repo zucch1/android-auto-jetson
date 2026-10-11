@@ -260,3 +260,61 @@ TEST(VideoStream, ConnectRefusalFailsBeforeTheDeadline) {
     ::rmdir(directory.c_str());
     ::rmdir(runtime.c_str());
 }
+
+TEST(VideoStream, ConcurrentConsumersAreIndependent) {
+    NegotiatedLimits limits{};
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{limits, current_uid()});
+    ASSERT_TRUE(server);
+
+    const auto handshake = [&](aa::core::Result<VideoConsumer>& client) {
+        std::thread connector([&] {
+            client = connect_video_consumer(
+                path, VideoClientOptions{limits, current_uid(), aa::core::Milliseconds{2000}});
+        });
+        auto producer = server.value().accept_consumer(aa::core::Milliseconds{2000});
+        connector.join();
+        return producer;
+    };
+
+    aa::core::Result<VideoConsumer> client_a{VideoConsumer{}};
+    auto producer_a = handshake(client_a);
+    ASSERT_TRUE(producer_a);
+    ASSERT_TRUE(client_a);
+
+    const std::vector<std::uint8_t> payload_a1{0xa1, 0xa2};
+    ASSERT_TRUE(producer_a.value().send_access_unit({1, 1, true, payload_a1}));
+    ASSERT_TRUE(drain_until_complete(client_a.value(), 4));
+    EXPECT_EQ(client_a.value().access_unit().payload, payload_a1);
+
+    aa::core::Result<VideoConsumer> client_b{VideoConsumer{}};
+    auto producer_b = handshake(client_b);
+    ASSERT_TRUE(producer_b) << "second producer must be returned while the first is live";
+    ASSERT_TRUE(client_b);
+
+    const std::vector<std::uint8_t> payload_a2{0xb1, 0xb2, 0xb3};
+    const std::vector<std::uint8_t> payload_b1{0xc1};
+    ASSERT_TRUE(producer_a.value().send_access_unit({2, 2, true, payload_a2}));
+    ASSERT_TRUE(producer_b.value().send_access_unit({1, 1, true, payload_b1}));
+    ASSERT_TRUE(drain_until_complete(client_a.value(), 4));
+    ASSERT_TRUE(drain_until_complete(client_b.value(), 4));
+    EXPECT_EQ(client_a.value().access_unit().payload, payload_a2);
+    EXPECT_EQ(client_b.value().access_unit().payload, payload_b1);
+
+    producer_b.value().close();
+    client_b.value().close();
+    const std::vector<std::uint8_t> payload_a3{0xd1, 0xd2, 0xd3};
+    ASSERT_TRUE(producer_a.value().send_access_unit({3, 3, true, payload_a3}));
+    ASSERT_TRUE(drain_until_complete(client_a.value(), 4));
+    EXPECT_EQ(client_a.value().access_unit().payload, payload_a3);
+
+    producer_a.value().close();
+    client_a.value().close();
+    server.value().close();
+    struct stat info {};
+    EXPECT_NE(::stat(path.value.c_str(), &info), 0);
+    ::rmdir((runtime + "/android-auto-receiver").c_str());
+    ::rmdir(runtime.c_str());
+}

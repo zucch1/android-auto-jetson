@@ -15,7 +15,10 @@ namespace aa::ipc {
 // framing served from /run/user/$UID/android-auto-receiver/video.sock with
 // peer-credential admission, a negotiated-limits exchange, bounded queues,
 // drop-to-IDR resync and disconnect cleanup. Server = producer (receiver
-// media path), client = consumer (decode helper); one consumer at a time.
+// media path), client = consumer (decode helper); consumer multiplicity is
+// owned by the caller (serve one consumer, close it, accept the next) — the
+// channel enforces per-connection admission and cleanup, not
+// cross-connection exclusivity.
 //
 // Ownership: every descriptor and (for the server) its endpoint node are
 // released by an idempotent cleanup shared by close() and the Impl
@@ -185,6 +188,10 @@ public:
 
     // Peer-credential gate then limits exchange. Rejected peers are counted
     // and never returned; the listener stays up. timeout.count < 0 blocks.
+    // Multiplicity is caller-owned: each call may return a live producer
+    // while an earlier one is still open; callers serialize consumers.
+    // listen(fd,1) bounds pending (backlog) connections only, not
+    // established ones.
     [[nodiscard]] core::Result<VideoProducer> accept_consumer(core::Milliseconds timeout);
 
     // Closes the listener and unlinks the endpoint node only while it is

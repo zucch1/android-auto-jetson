@@ -315,6 +315,7 @@ core::Result<void> prepare_video_socket_path(const VideoSocketPath& path) {
     if (!S_ISSOCK(node.st_mode)) {
         return Error{ErrorCode::transport_unavailable};
     }
+    const EndpointIdentity identity{node.st_dev, node.st_ino};
     auto state = probe_endpoint(path.value);
     if (!state) {
         return state.error();
@@ -327,9 +328,13 @@ core::Result<void> prepare_video_socket_path(const VideoSocketPath& path) {
     case EndpointState::occupied:
         return Error{ErrorCode::transport_unavailable};
     }
-    if (::unlink(path.value.c_str()) != 0 && errno != ENOENT) {
-        return Error{ErrorCode::transport_unavailable};
-    }
+    // Identity-checked unlink: a same-UID racer that rebound the path after
+    // the probe keeps its live node (different inode), so concurrent listen()
+    // resolves to exactly one winner instead of stealing the endpoint. The
+    // stale probe and this unlink are not one atomic step; a racer inside that
+    // window crosses no privilege boundary (0700 directory, same-UID peer
+    // cred) and is out of scope.
+    unlink_owned_endpoint(path.value, identity);
     return {};
 }
 

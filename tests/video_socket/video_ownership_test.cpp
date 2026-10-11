@@ -5,6 +5,8 @@
 
 #include <aa/ipc/VideoChannel.hpp>
 
+#include <array>
+#include <barrier>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +17,7 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <optional>
 #include <string>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -327,4 +330,59 @@ TEST(VideoOwnership, ChmodFailureFailsClosed) {
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0) << "chmod failure child step " << WEXITSTATUS(status);
     cleanup_runtime(runtime, video_socket_path_in(runtime).value);
+}
+
+TEST(VideoOwnership, ConcurrentListenHasExactlyOneWinner) {
+    for (int round = 0; round < 20; ++round) {
+        SCOPED_TRACE("round " + std::to_string(round));
+        const std::string runtime = videotest::private_runtime_dir();
+        ASSERT_FALSE(runtime.empty());
+        const auto path = video_socket_path_in(runtime);
+        const bool stale = (round % 2) == 1;
+        if (stale) {
+            ASSERT_EQ(::mkdir(directory_of(path).c_str(), 0700), 0);
+            ASSERT_TRUE(videotest::leave_stale_socket_node(path.value));
+        }
+
+        std::array<std::optional<VideoServer>, 4> winners;
+        std::array<aa::ErrorCode, 4> failures{};
+        std::barrier<> gate(4);
+        std::vector<std::thread> threads;
+        threads.reserve(4);
+        for (int i = 0; i < 4; ++i) {
+            threads.emplace_back([&, i] {
+                gate.arrive_and_wait();
+                auto server = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+                if (server) {
+                    winners[static_cast<std::size_t>(i)] = std::move(server.value());
+                } else {
+                    failures[static_cast<std::size_t>(i)] = server.error().code();
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        int wins = 0;
+        std::size_t winner = 0;
+        for (std::size_t i = 0; i < winners.size(); ++i) {
+            if (winners[i].has_value()) {
+                ++wins;
+                winner = i;
+            } else {
+                EXPECT_EQ(failures[i], aa::ErrorCode::transport_unavailable);
+            }
+        }
+        EXPECT_EQ(wins, 1);
+        if (wins != 1) {
+            cleanup_runtime(runtime, path.value);
+            continue;
+        }
+        EXPECT_TRUE(node_exists(path.value));
+        EXPECT_TRUE(videotest::streams_one_unit(*winners[winner], path));
+        winners[winner]->close();
+        EXPECT_FALSE(node_exists(path.value));
+        cleanup_runtime(runtime, path.value);
+    }
 }
