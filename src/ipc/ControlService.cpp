@@ -251,6 +251,15 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
         return Error{ErrorCode::invalid_argument};
     }
     const auto forgotten = phones_.forget(phone);
+    // Reconcile BEFORE returning any forget error: when the revocation
+    // landed (durable or committed-but-not-durable) every request it
+    // invalidated gets its gate entry cancelled and exactly one PairingClosed.
+    // Unrelated requests survive (never close_all) and the gate instance is
+    // preserved so its spent-id history keeps rejecting stale confirms.
+    for (const auto request : phones_.take_invalidated_pairings()) {
+        (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+        events_.emit(PairingClosed{request});
+    }
     if (!forgotten.has_value()) {
         return forgotten.error();
     }

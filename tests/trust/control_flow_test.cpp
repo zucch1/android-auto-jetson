@@ -10,6 +10,7 @@
 
 #include "../dbus/fakes.hpp"
 #include "fakes.hpp"
+#include "syscall_faults.hpp"
 
 #include <algorithm>
 #include <vector>
@@ -268,6 +269,146 @@ TEST(ControlFlow, ExpiredRequestsReleaseGateCapacity) {
     }
     EXPECT_TRUE(f.store.phones().empty());
     EXPECT_FALSE(std::filesystem::exists(f.dir.file()));
+}
+
+[[nodiscard]] std::vector<aa::core::PairingRequestId> closed_requests(const Fixture& f) {
+    std::vector<aa::core::PairingRequestId> closed;
+    for (const auto& event : f.events.events) {
+        if (const auto* pair = std::get_if<aa::ipc::PairingClosed>(&event)) {
+            closed.push_back(pair->request);
+        }
+    }
+    std::sort(closed.begin(), closed.end(),
+              [](aa::core::PairingRequestId left, aa::core::PairingRequestId right) {
+                  return left.value < right.value;
+              });
+    return closed;
+}
+
+TEST(ControlFlow, ForgetPhoneInvalidatesPendingClosesGateOnceAndSparesUnrelated) {
+    Fixture f;
+    const BusName connection{":1.20"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    f.credentials.add_connection(connection, kSessionUid);
+    f.credentials.set_owner(consumer_name, connection);
+    ASSERT_TRUE(f.service.register_consumer(connection, consumer_name).has_value());
+
+    const auto approved = f.store.approve(trust::TransportIdentity{test::kWired});
+    ASSERT_TRUE(approved.has_value());
+    const aa::core::PhoneId saved{approved.value()};
+
+    f.policy.note_candidate(trust::TransportIdentity{test::kWired});
+    const auto first = f.service.request_add_phone(connection);
+    const auto second = f.service.request_add_phone(connection);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    f.policy.note_candidate(trust::TransportIdentity{test::kWireless});
+    const auto unrelated = f.service.request_add_phone(connection);
+    ASSERT_TRUE(unrelated.has_value());
+
+    ASSERT_TRUE(f.service.forget_phone(connection, saved).has_value());
+
+    const auto stale_first = f.service.confirm_phone_pairing(connection, first.value());
+    ASSERT_FALSE(stale_first.has_value());
+    const auto stale_second = f.service.confirm_phone_pairing(connection, second.value());
+    ASSERT_FALSE(stale_second.has_value());
+
+    ASSERT_TRUE(f.service.confirm_phone_pairing(connection, unrelated.value()).has_value());
+
+    std::vector<aa::core::PairingRequestId> expected{first.value(), second.value()};
+    std::sort(expected.begin(), expected.end(),
+              [](aa::core::PairingRequestId left, aa::core::PairingRequestId right) {
+                  return left.value < right.value;
+              });
+    EXPECT_EQ(closed_requests(f), expected);
+
+    const auto identity_a = test::identity_of(trust::TransportIdentity{test::kWired});
+    const auto identity_b = test::identity_of(trust::TransportIdentity{test::kWireless});
+    EXPECT_EQ(f.store.lookup(identity_a), trust::Decision::unknown);
+
+    trust::ApprovedPhoneStore reloaded{f.dir.file()};
+    ASSERT_TRUE(reloaded.load().has_value());
+    EXPECT_EQ(reloaded.lookup(identity_a), trust::Decision::unknown);
+    EXPECT_EQ(reloaded.lookup(identity_b), trust::Decision::approved);
+}
+
+TEST(ControlFlow, ForgottenPhoneCanBeRequestedAndApprovedAgain) {
+    Fixture f;
+    const BusName connection{":1.21"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    f.credentials.add_connection(connection, kSessionUid);
+    f.credentials.set_owner(consumer_name, connection);
+    ASSERT_TRUE(f.service.register_consumer(connection, consumer_name).has_value());
+
+    const auto approved = f.store.approve(trust::TransportIdentity{test::kWired});
+    ASSERT_TRUE(approved.has_value());
+    ASSERT_TRUE(f.service.forget_phone(connection, approved.value()).has_value());
+
+    f.policy.note_candidate(trust::TransportIdentity{test::kWired});
+    const auto fresh = f.service.request_add_phone(connection);
+    ASSERT_TRUE(fresh.has_value());
+    ASSERT_TRUE(f.service.confirm_phone_pairing(connection, fresh.value()).has_value());
+
+    ASSERT_EQ(f.store.phones().size(), 1U);
+    EXPECT_EQ(f.store.phones()[0].phone_id, aa::core::PhoneId{2});
+
+    trust::ApprovedPhoneStore reloaded{f.dir.file()};
+    ASSERT_TRUE(reloaded.load().has_value());
+    EXPECT_EQ(reloaded.lookup(test::identity_of(trust::TransportIdentity{test::kWired})),
+              trust::Decision::approved);
+}
+
+TEST(ControlFlow, ForgetUnknownOrZeroPhoneEmitsNoGateClosures) {
+    Fixture f;
+    const BusName connection{":1.22"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    f.credentials.add_connection(connection, kSessionUid);
+    f.credentials.set_owner(consumer_name, connection);
+    ASSERT_TRUE(f.service.register_consumer(connection, consumer_name).has_value());
+
+    f.policy.note_candidate(trust::TransportIdentity{test::kWired});
+    const auto request = f.service.request_add_phone(connection);
+    ASSERT_TRUE(request.has_value());
+
+    const auto unknown = f.service.forget_phone(connection, aa::core::PhoneId{42});
+    ASSERT_FALSE(unknown.has_value());
+    EXPECT_EQ(unknown.error().code(), ErrorCode::trust_unknown_phone);
+    const auto zero = f.service.forget_phone(connection, aa::core::PhoneId{});
+    ASSERT_FALSE(zero.has_value());
+    EXPECT_EQ(zero.error().code(), ErrorCode::invalid_argument);
+
+    EXPECT_TRUE(closed_requests(f).empty());
+    ASSERT_TRUE(f.service.confirm_phone_pairing(connection, request.value()).has_value());
+}
+
+TEST(ControlFlow, ForgetPreReplacementFailureEmitsNoGateClosures) {
+    Fixture f;
+    const BusName connection{":1.23"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    f.credentials.add_connection(connection, kSessionUid);
+    f.credentials.set_owner(consumer_name, connection);
+    ASSERT_TRUE(f.service.register_consumer(connection, consumer_name).has_value());
+
+    const auto approved = f.store.approve(trust::TransportIdentity{test::kWired});
+    ASSERT_TRUE(approved.has_value());
+    const aa::core::PhoneId saved{approved.value()};
+    f.policy.note_candidate(trust::TransportIdentity{test::kWired});
+    const auto request = f.service.request_add_phone(connection);
+    ASSERT_TRUE(request.has_value());
+
+    {
+        const aa::trust::test::faults::ScopedFault fault{
+            aa::trust::test::faults::Fault::renameat};
+        const auto failed = f.service.forget_phone(connection, saved);
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error().code(), ErrorCode::trust_store_io);
+    }
+
+    EXPECT_TRUE(closed_requests(f).empty());
+    EXPECT_EQ(f.policy.pending_count(), 1U);
+    EXPECT_EQ(f.store.lookup(test::identity_of(trust::TransportIdentity{test::kWired})),
+              trust::Decision::approved);
+    ASSERT_TRUE(f.service.confirm_phone_pairing(connection, request.value()).has_value());
 }
 
 } // namespace
