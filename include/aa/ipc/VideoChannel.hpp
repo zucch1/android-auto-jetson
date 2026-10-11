@@ -30,6 +30,15 @@ namespace aa::ipc {
 // protocol_negotiation_failed; timeout -> timeout; closed/EOF ->
 // transport_closed. Every rejection drives loss (drop-to-IDR) except the
 // handshake failures, which close the connection.
+//
+// Telemetry: `rejected()` counts every data-plane record the consumer refuses
+// — pre-reassembly (truncated/oversize record, zero-length record, undecodable
+// header including version mismatch) and reassembly (non-monotonic frame id,
+// inconsistent fragment, oversize accumulation). Each rejection also drives
+// loss (drop-to-IDR). Sequence gaps drive loss only and are counted by neither
+// `rejected()` nor `resyncs()`; `resyncs()` counts completed access units that
+// resume the stream after loss. Handshake failures close the connection and
+// are not record rejections; unauthorized peers count in `unauthorized_peers()`.
 
 struct VideoSocketPath final {
     std::string value{};

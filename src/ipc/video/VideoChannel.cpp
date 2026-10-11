@@ -500,7 +500,7 @@ core::Result<ReceiveStatus> VideoConsumer::receive(core::Milliseconds timeout) {
         return io_error();
     }
     if ((message.msg_flags & MSG_TRUNC) != 0) {
-        impl_->assembler->loss();
+        impl_->assembler->reject();
         return Error{ErrorCode::transport_oversize_frame};
     }
     const auto received = static_cast<std::size_t>(size);
@@ -514,13 +514,13 @@ core::Result<ReceiveStatus> VideoConsumer::receive(core::Milliseconds timeout) {
             impl_->eof = true;
             return closed_error();
         }
-        impl_->assembler->loss();
+        impl_->assembler->reject();
         return Error{ErrorCode::transport_malformed_frame};
     }
     const auto header =
         decode_frame_header(std::span<const std::uint8_t>{scratch.data(), received}, impl_->limits);
     if (!header) {
-        impl_->assembler->loss();
+        impl_->assembler->reject();
         return header.error();
     }
     const auto step = impl_->assembler->accept(
