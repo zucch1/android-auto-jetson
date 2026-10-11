@@ -4,9 +4,16 @@
 #include <aa/ipc/VideoChannel.hpp>
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <poll.h>
 #include <string>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -33,6 +40,22 @@ aa::core::Result<ReceiveStatus> drain_until_complete(VideoConsumer& consumer, in
         }
     }
     return aa::Error{aa::ErrorCode::timeout};
+}
+
+// A closed-but-unaccepted AF_UNIX connection stays in the accept queue and
+// keeps holding a backlog slot (the queue drains only via accept), so reap
+// whatever the raw filler connects left behind before the next handshake.
+void reap_queued_connections(VideoServer& server) {
+    for (;;) {
+        pollfd ready{server.native_handle(), POLLIN, 0};
+        if (::poll(&ready, 1, 100) <= 0 || (ready.revents & POLLIN) == 0) {
+            return;
+        }
+        const int fd = ::accept4(server.native_handle(), nullptr, nullptr, SOCK_CLOEXEC);
+        if (fd >= 0) {
+            ::close(fd);
+        }
+    }
 }
 } // namespace
 
@@ -150,4 +173,90 @@ TEST(VideoStream, RejectsEmptyAndOversizeAccessUnits) {
     const auto oversize = pair.value().producer.send_access_unit({2, 2, true, pattern(1025)});
     ASSERT_FALSE(oversize);
     EXPECT_EQ(oversize.error().code(), aa::ErrorCode::transport_oversize_frame);
+}
+
+TEST(VideoStream, ConnectDeadlineIsEnforcedOnSaturatedBacklog) {
+    NegotiatedLimits limits{};
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{limits, current_uid()});
+    ASSERT_TRUE(server);
+
+    // Saturate the backlog with raw nonblocking connects until the kernel
+    // refuses to queue another. The admitted count is a kernel backlog detail
+    // (listen(fd,1) still admits more than one), so the loop discovers the
+    // bound instead of hardcoding how many connects fit.
+    std::vector<int> fillers;
+    bool queue_refused = false;
+    for (int attempt = 0; attempt < 8 && !queue_refused; ++attempt) {
+        const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        ASSERT_NE(fd, -1);
+        sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        std::memcpy(address.sun_path, path.value.c_str(), path.value.size() + 1);
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+            fillers.push_back(fd);
+            continue;
+        }
+        const int failure = errno;
+        ::close(fd);
+        if (failure == EAGAIN || failure == EWOULDBLOCK) {
+            queue_refused = true;
+            break;
+        }
+        FAIL() << "unexpected filler connect failure " << failure;
+    }
+    EXPECT_FALSE(fillers.empty()) << "backlog admitted no connection";
+    ASSERT_TRUE(queue_refused) << "backlog never saturated";
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto client = connect_video_consumer(
+        path, VideoClientOptions{limits, current_uid(), aa::core::Milliseconds{300}});
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    ASSERT_FALSE(client);
+    EXPECT_EQ(client.error().code(), aa::ErrorCode::timeout);
+    EXPECT_GE(elapsed.count(), 250);
+    EXPECT_LT(elapsed.count(), 1500);
+
+    for (const int fd : fillers) {
+        ::close(fd);
+    }
+    reap_queued_connections(server.value());
+    EXPECT_TRUE(videotest::streams_one_unit(server.value(), path));
+
+    server.value().close();
+    ::unlink(path.value.c_str());
+    ::rmdir((runtime + "/android-auto-receiver").c_str());
+    ::rmdir(runtime.c_str());
+}
+
+TEST(VideoStream, ConnectRefusalFailsBeforeTheDeadline) {
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+
+    const auto measure = [&](const VideoSocketPath& target) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto client = connect_video_consumer(
+            target,
+            VideoClientOptions{{}, current_uid(), aa::core::Milliseconds{5000}});
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        ASSERT_FALSE(client);
+        EXPECT_EQ(client.error().code(), aa::ErrorCode::transport_unavailable);
+        EXPECT_LT(elapsed.count(), 1000);
+    };
+
+    measure(path);
+
+    const std::string directory = path.value.substr(0, path.value.find_last_of('/'));
+    ASSERT_EQ(::mkdir(directory.c_str(), 0700), 0);
+    ASSERT_TRUE(videotest::leave_stale_socket_node(path.value));
+    measure(path);
+
+    ::unlink(path.value.c_str());
+    ::rmdir(directory.c_str());
+    ::rmdir(runtime.c_str());
 }

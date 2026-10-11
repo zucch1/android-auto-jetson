@@ -149,6 +149,9 @@ struct VideoServerOptions final {
     std::uint32_t expected_peer_uid{};
 };
 
+// `timeout` bounds each phase independently: the connect attempt (backlog
+// wait) and the limits-exchange read; expiry is typed `timeout`; a
+// missing/refused endpoint fails immediately `transport_unavailable`.
 struct VideoClientOptions final {
     NegotiatedLimits local_limits{};
     std::uint32_t expected_server_uid{};

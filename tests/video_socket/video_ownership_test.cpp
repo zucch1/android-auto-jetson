@@ -51,19 +51,6 @@ int open_fd_count() {
     return count - 2;
 }
 
-bool leave_stale_socket_node(const std::string& path) {
-    const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        return false;
-    }
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
-    const bool bound = ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
-    ::close(fd);
-    return bound;
-}
-
 bool write_file(const std::string& path, const char* body) {
     std::FILE* file = std::fopen(path.c_str(), "wb");
     if (file == nullptr) {
@@ -73,25 +60,6 @@ bool write_file(const std::string& path, const char* body) {
     const bool written = std::fwrite(body, 1, size, file) == size;
     std::fclose(file);
     return written;
-}
-
-bool streams_one_unit(VideoServer& server, const VideoSocketPath& path) {
-    aa::core::Result<VideoConsumer> client{VideoConsumer{}};
-    std::thread connector([&] {
-        client = connect_video_consumer(
-            path, VideoClientOptions{{}, current_uid(), aa::core::Milliseconds{kTimeoutMs}});
-    });
-    auto producer = server.accept_consumer(aa::core::Milliseconds{kTimeoutMs});
-    connector.join();
-    if (!producer || !client) {
-        return false;
-    }
-    const std::vector<std::uint8_t> payload{0x5a};
-    if (!producer.value().send_access_unit({1, 1, true, payload})) {
-        return false;
-    }
-    const auto step = client.value().receive(aa::core::Milliseconds{kTimeoutMs});
-    return step && step.value() == ReceiveStatus::complete;
 }
 
 std::string directory_of(const VideoSocketPath& path) {
@@ -258,7 +226,7 @@ TEST(VideoOwnership, PrepareRefusesLiveEndpointAndLeavesItIntact) {
     ASSERT_FALSE(refused);
     EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unavailable);
     EXPECT_TRUE(node_exists(path.value));
-    EXPECT_TRUE(streams_one_unit(server.value(), path));
+    EXPECT_TRUE(videotest::streams_one_unit(server.value(), path));
 
     server.value().close();
     cleanup_runtime(runtime, path.value);
@@ -320,7 +288,7 @@ TEST(VideoOwnership, ServerTeardownKeepsReplacementEndpoint) {
 
     first.value().close();
     EXPECT_TRUE(node_exists(path.value));
-    EXPECT_TRUE(streams_one_unit(second.value(), path));
+    EXPECT_TRUE(videotest::streams_one_unit(second.value(), path));
 
     second.value().close();
     EXPECT_FALSE(node_exists(path.value));
@@ -332,7 +300,7 @@ TEST(VideoOwnership, PrepareRemovesVerifiedStaleSocketNode) {
     ASSERT_FALSE(runtime.empty());
     const auto path = video_socket_path_in(runtime);
     ASSERT_EQ(::mkdir(directory_of(path).c_str(), 0700), 0);
-    ASSERT_TRUE(leave_stale_socket_node(path.value));
+    ASSERT_TRUE(videotest::leave_stale_socket_node(path.value));
     ASSERT_TRUE(node_exists(path.value));
 
     const auto prepared = prepare_video_socket_path(path);
@@ -340,7 +308,7 @@ TEST(VideoOwnership, PrepareRemovesVerifiedStaleSocketNode) {
     EXPECT_FALSE(node_exists(path.value));
     auto server = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
     ASSERT_TRUE(server);
-    EXPECT_TRUE(streams_one_unit(server.value(), path));
+    EXPECT_TRUE(videotest::streams_one_unit(server.value(), path));
 
     server.value().close();
     cleanup_runtime(runtime, path.value);

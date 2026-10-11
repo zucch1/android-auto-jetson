@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -205,11 +207,65 @@ core::Result<void> connect_path(int fd, const std::string& path,
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-        (void)timeout;
-        return Error{ErrorCode::transport_unavailable};
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return io_error();
     }
-    return {};
+    if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return io_error();
+    }
+    if (timeout.count < 0) {
+        // Documented "blocks": no deadline. Restore blocking mode and connect
+        // once, unchanged semantics.
+        if (::fcntl(fd, F_SETFL, flags) != 0) {
+            return io_error();
+        }
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+            return Error{ErrorCode::transport_unavailable};
+        }
+        return {};
+    }
+    // Deadline-bounded connect. The effective bound mirrors the 60 s
+    // per-phase clamp in await_readable()/accept_consumer().
+    const auto bounded = timeout.count > 60000 ? 60000 : timeout.count;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{bounded};
+    const auto attempt = [&]() noexcept -> core::Result<void> {
+        for (;;) {
+            if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+                return {};
+            }
+            const int failure = errno;
+            // AF_UNIX SOCK_SEQPACKET connect is synchronous (v6.8 unix_stream_connect):
+            // a saturated backlog answers EAGAIN (never EINPROGRESS), completion never
+            // writes sk_err (SO_ERROR stays 0), and a fresh fd polls POLLHUP|POLLOUT -
+            // so deadline-retry here; never "restore" the TCP poll(POLLOUT)+SO_ERROR idiom.
+            if (failure == EINTR) {
+                continue;
+            }
+            if (failure == EAGAIN || failure == EWOULDBLOCK) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return Error{ErrorCode::timeout};
+                }
+                int status;
+                do {
+                    status = ::poll(nullptr, 0, 10);
+                } while (status < 0 && errno == EINTR);
+                if (status < 0) {
+                    return io_error();
+                }
+                continue;
+            }
+            if (failure == EISCONN) {
+                return {};
+            }
+            return Error{ErrorCode::transport_unavailable};
+        }
+    };
+    const auto result = attempt();
+    if (::fcntl(fd, F_SETFL, flags) != 0) {
+        return io_error();
+    }
+    return result;
 }
 
 } // namespace
