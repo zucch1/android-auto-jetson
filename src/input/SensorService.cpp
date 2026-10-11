@@ -8,11 +8,12 @@ SensorResponse SensorService::submit_request(const SensorRequest& request) const
         && descriptor_.night_mode() == NightModePolicy::manual) {
         return SensorResponse{SensorRequestStatus::accepted};
     }
-    const auto& advertised = descriptor_.vehicle_sensors();
-    const bool served =
-        std::find(advertised.begin(), advertised.end(), request.channel) != advertised.end();
-    return SensorResponse{
-        served ? SensorRequestStatus::accepted : SensorRequestStatus::unsupported};
+    // No vehicle-sensor provider is installed (the production provider set is
+    // empty), so NO vehicle channel can ever deliver a reading. Acceptance
+    // requires an implemented provider; without one the only honest answer is
+    // the typed unsupported response - never an accepted subscription that
+    // can never fire.
+    return SensorResponse{SensorRequestStatus::unsupported};
 }
 
 void SensorService::set_night_mode(bool night) {

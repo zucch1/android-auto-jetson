@@ -39,26 +39,42 @@ TEST(InputSensorsSensor, UnknownSensorRequestReceivesTypedUnsupportedResponse) {
     EXPECT_TRUE(phone.sensors.empty());
 }
 
-TEST(InputSensorsSensor, AdvertisedVehicleSensorsAreServedOthersAreNot) {
-    // Given: a descriptor whose construction-time advertisement names speed.
+TEST(InputSensorsSensor, AdvertisedVehicleSensorsWithoutProvidersAreUnsupported) {
+    // Given: a descriptor whose construction-time advertisement names speed,
+    // location and rpm - but no vehicle-sensor provider is installed behind
+    // any of them.
     PhoneFixture phone;
     const CapabilityDescriptor advertised{
         {InputSource::keyboard_dpad},
         {19},
         TouchViewport{1280, 720},
-        {SensorChannel::speed},
+        {SensorChannel::speed, SensorChannel::location, SensorChannel::rpm},
         NightModePolicy::manual,
     };
     SensorService service(advertised, phone);
 
-    // When: requests name the advertised and an unadvertised channel.
-    const auto served = service.submit_request(SensorRequest{SensorChannel::speed, 100});
-    const auto missing = service.submit_request(SensorRequest{SensorChannel::rpm, 100});
+    // When: requests name every advertised vehicle channel.
+    const auto speed = service.submit_request(SensorRequest{SensorChannel::speed, 100});
+    const auto location = service.submit_request(SensorRequest{SensorChannel::location, 1000});
+    const auto rpm = service.submit_request(SensorRequest{SensorChannel::rpm, 100});
 
-    // Then: the capability descriptor decides - accepted for the advertised
-    // channel, typed unsupported for the unknown one.
-    EXPECT_EQ(served, (SensorResponse{SensorRequestStatus::accepted}));
-    EXPECT_EQ(missing, (SensorResponse{SensorRequestStatus::unsupported}));
+    // Then: advertising alone is not acceptance - without a provider every
+    // channel is typed unsupported, no events flow, and nothing is emitted.
+    EXPECT_EQ(speed, (SensorResponse{SensorRequestStatus::unsupported}));
+    EXPECT_EQ(location, (SensorResponse{SensorRequestStatus::unsupported}));
+    EXPECT_EQ(rpm, (SensorResponse{SensorRequestStatus::unsupported}));
+    EXPECT_TRUE(phone.sensors.empty());
+    EXPECT_EQ(service.emitted(), 0U);
+
+    // And: the manual night-mode channel still accepts and emits - its
+    // provider IS implemented (the manual toggle).
+    const auto night = service.submit_request(SensorRequest{SensorChannel::night_mode, 0});
+    EXPECT_EQ(night, (SensorResponse{SensorRequestStatus::accepted}));
+    service.set_night_mode(true);
+    ASSERT_EQ(phone.sensors.size(), 1U);
+    EXPECT_EQ(phone.sensors.front(),
+              (SensorEvent{SensorChannel::night_mode, 1, SensorOrigin::manual}));
+    EXPECT_EQ(service.emitted(), 1U);
 }
 
 TEST(InputSensorsSensor, NightModeIsAManualToggleOnly) {

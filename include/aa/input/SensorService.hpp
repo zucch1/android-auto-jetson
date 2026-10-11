@@ -4,7 +4,6 @@
 #include <aa/core/Result.hpp>
 #include <aa/input/Capability.hpp>
 
-#include <algorithm>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -84,10 +83,14 @@ public:
     SensorService(CapabilityDescriptor descriptor, SensorChannelTarget& channel)
         : descriptor_(std::move(descriptor)), channel_(channel) {}
 
-    // Request path (the AASDK SensorRequest -> SensorResponse seam), gated by
-    // the capability descriptor: accepted for the manual night-mode channel
-    // and for advertised vehicle sensors, the typed unsupported response for
-    // everything else (the bench descriptor advertises no vehicle sensors,
+    // Request path (the AASDK SensorRequest -> SensorResponse seam). Accepted
+    // ONLY for the manual night-mode channel under the manual policy - night
+    // mode is a manual toggle, not a provider. Every other channel answers
+    // with the typed unsupported response: acceptance requires an implemented
+    // vehicle-sensor provider, and the installed provider set is empty. An
+    // advertised vehicle-sensor channel is therefore NOT served until a real
+    // provider exists behind it - advertising alone never makes a channel
+    // deliverable (the bench descriptor advertises no vehicle sensors at all,
     // so every vehicle-sensor request is unsupported).
     [[nodiscard]] SensorResponse submit_request(const SensorRequest& request) const noexcept;
 
