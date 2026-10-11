@@ -13,8 +13,9 @@ module `rtl8822ce` v5.14.0.4-261-g3e7be62b5 COEX).
    reads `00` even with `rtw_country_code=US` set.
 2. The driver marks the wiphy **self-managed** but never calls
    `regulatory_set_wiphy_regd*()`, so cfg80211's per-wiphy domain stays
-   `country 00` with a crippled table (5 GHz at 6 dBm / NO-IR), which blocks
-   AP beaconing on UNII-1/UNII-3.
+   `country 00` with a crippled table (5 GHz capped at 20 dBm EIRP
+   with 6 dBi antenna gain, NO-IR), which blocks AP beaconing on
+   UNII-1/UNII-3.
 3. A one-shot registration is not durable: the driver's AP/STA mode transitions
    re-assert the world domain (observed drift after qual runs).
 
@@ -31,8 +32,9 @@ module `rtl8822ce` v5.14.0.4-261-g3e7be62b5 COEX).
 ## Install (on the target)
 
 ```bash
+cd tools/jetson/rtl8822ce-regd-shim
 make -C /lib/modules/$(uname -r)/build M=$PWD modules
-sudo install -m 0644 rtl8822ce-regd-shim.ko /lib/modules/$(uname -r)/extra/
+sudo install -D -m 0644 rtl8822ce-regd-shim.ko /lib/modules/$(uname -r)/extra/rtl8822ce-regd-shim.ko
 sudo depmod -a
 echo rtl8822ce_regd_shim | sudo tee /etc/modules-load.d/rtl8822ce-regd-shim.conf
 sudo install -m 0755 rtl8822ce-regd-watchdog.sh /usr/local/sbin/rtl8822ce-regd-watchdog
@@ -52,6 +54,11 @@ systemctl is-active rtl8822ce-regd-watchdog   # holds the domain after mode tran
 
 ## Rollback
 
+Note: **unloading the shim leaves the US domain applied** — module exit is
+intentionally empty (cfg80211 keeps the previous wiphy regd private; there is
+no restore entry point short of re-registering the wiphy). A **reboot** resets
+the regd to the driver's own world default.
+
 ```bash
 sudo systemctl disable --now rtl8822ce-regd-watchdog rtl8822ce-regd-shim
 sudo rmmod rtl8822ce_regd_shim
@@ -59,6 +66,7 @@ sudo rm -f /etc/modules-load.d/rtl8822ce-regd-shim.conf \
            /lib/modules/$(uname -r)/extra/rtl8822ce-regd-shim.ko \
            /usr/local/sbin/rtl8822ce-regd-watchdog
 sudo depmod -a
+sudo reboot   # regd returns to the driver's default (world)
 ```
 
 ## Scope and honesty notes
@@ -73,9 +81,12 @@ sudo depmod -a
 
 ## License
 
-Kernel module: **GPL-2.0-or-later** (component-scoped — it uses GPL-only exports
-`regulatory_set_wiphy_regd_sync`/`regulatory_set_wiphy_regd`). This component's
-license does not extend to the repository's other components.
+Kernel module and supporting files: **GPL-2.0-or-later**, as marked by the
+SPDX identifiers in each source file. This is a **component-scoped** license:
+the repository's "GPL version 3" selection for the receiver components does
+**not** apply to this kernel module. GPL licensing is the conventional choice
+for Linux kernel modules; the regulatory setters used here are regular kernel
+exports (`EXPORT_SYMBOL` in Linux v6.8).
 
 ## Evidence
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * rtl8822ce-regd-shim - register the US regulatory domain on the
  * self-managed wiphy of NVIDIA's rtl8822ce vendor driver.
@@ -9,8 +9,9 @@
  * country_code return rc=0 but every non-0x7F plan is rejected by
  * table validation, and the self-managed wiphy never receives a
  * regulatory_set_wiphy_regd() call. phy#0 is therefore stuck on
- * country 00 / DFS-UNSET with a crippled rule table (5 GHz 6 dBm,
- * NO-IR), which is what blocks 5 GHz AP/client qualification.
+ * country 00 / DFS-UNSET with a crippled rule table (5 GHz limited
+ * to 20 dBm EIRP / 6 dBi gain, NO-IR), which is what blocks 5 GHz
+ * AP/client qualification.
  *
  * This shim performs exactly the call the vendor driver never makes:
  * it registers the US (DFS-FCC) regulatory domain on the wiphy of the
@@ -19,7 +20,9 @@
  *
  * API contract followed (include/net/cfg80211.h, 6.8.12-1021-tegra):
  *  - regulatory_set_wiphy_regd_sync() requires RTNL *and* the wiphy
- *    mutex held and applies the domain synchronously.
+ *    mutex held and applies the domain synchronously. RTNL is taken
+ *    before netdev/wiphy resolution so the whole lookup-and-set
+ *    sequence runs under the required protection.
  *  - Its @rd parameter is a non-const "struct ieee80211_regdomain *".
  *    cfg80211 copies it (reg_copy_regd()) and stores the copy as
  *    wiphy->regd; the caller keeps ownership of the original and must
@@ -91,16 +94,26 @@ static int __init rtl8822ce_regd_shim_init(void)
 	struct wiphy *wiphy;
 	int ret;
 
+	/*
+	 * RTNL is taken first: dev_get_by_name(), the ieee80211_ptr
+	 * dereference, the self-managed check, the setter call and the
+	 * final wiphy_name() logging all run inside the protected
+	 * lifetime. Every exit path balances dev_put() and the single
+	 * rtnl_unlock() at out_unlock.
+	 */
+	rtnl_lock();
+
 	dev = dev_get_by_name(&init_net, ifname);
 	if (!dev) {
 		pr_err("netdev %s not found\n", ifname);
+		rtnl_unlock();
 		return -ENODEV;
 	}
 
 	if (!dev->ieee80211_ptr || !dev->ieee80211_ptr->wiphy) {
 		pr_err("%s has no wiphy\n", ifname);
 		ret = -ENODEV;
-		goto out_dev_put;
+		goto out_unlock;
 	}
 	wiphy = dev->ieee80211_ptr->wiphy;
 
@@ -112,21 +125,19 @@ static int __init rtl8822ce_regd_shim_init(void)
 	if (!(wiphy->regulatory_flags & REGULATORY_WIPHY_SELF_MANAGED)) {
 		pr_err("%s wiphy is not self-managed\n", ifname);
 		ret = -EINVAL;
-		goto out_dev_put;
+		goto out_unlock;
 	}
 
 	rd = alloc_us_regd();
 	if (!rd) {
 		pr_err("cannot allocate regdomain\n");
-		ret = -EINVAL;
-		goto out_dev_put;
+		ret = -ENOMEM;
+		goto out_unlock;
 	}
 
-	rtnl_lock();
 	wiphy_lock(wiphy);
 	ret = regulatory_set_wiphy_regd_sync(wiphy, rd);
 	wiphy_unlock(wiphy);
-	rtnl_unlock();
 
 	/* cfg80211 stored its own copy; rd stays ours to free. */
 	kfree(rd);
@@ -134,15 +145,16 @@ static int __init rtl8822ce_regd_shim_init(void)
 	if (ret) {
 		pr_err("regulatory_set_wiphy_regd_sync failed: %d\n", ret);
 		ret = -EINVAL;
-		goto out_dev_put;
+		goto out_unlock;
 	}
 
 	pr_info("US regdomain registered on %s (wiphy %s)\n",
 		ifname, wiphy_name(wiphy));
 	ret = 0;
 
-out_dev_put:
+out_unlock:
 	dev_put(dev);
+	rtnl_unlock();
 	return ret;
 }
 
@@ -153,7 +165,8 @@ static void __exit rtl8822ce_regd_shim_exit(void)
 	 * the owner can inspect it after rmmod. Restoring the previous
 	 * domain is not trivially possible - cfg80211 keeps the previous
 	 * wiphy->regd private and a self-managed wiphy has no restore
-	 * entry point short of re-registering the wiphy.
+	 * entry point short of re-registering the wiphy. A reboot resets
+	 * the regd to the driver's own default.
 	 */
 }
 
