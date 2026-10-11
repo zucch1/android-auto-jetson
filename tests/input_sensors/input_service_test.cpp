@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Task 26 receiver-side input normalization: key/mouse events traverse the
+// real owner-ruled AF_UNIX input socket and reach the phone fixture
+// normalized, through the todo-18 input channel seam. Plus the capability
+// gate: unadvertised keycodes are refused typed and never forwarded.
+#include "phone_fixture.hpp"
+
+#include "../input_socket/pair.hpp"
+
+#include <aa/input/InputService.hpp>
+
+#include <cstdint>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+namespace {
+using namespace aa::input;
+
+namespace ipc = aa::ipc;
+
+using inputsensorstest::PhoneFixture;
+
+TEST(InputSensorsInput, KeyAndMouseEventsReachPhoneFixtureNormalizedThroughSocket) {
+    // Given: the real task-24 input socket pair and a receiver-side service
+    // consuming its endpoint toward the phone fixture.
+    auto pair = inputtest::make_pair();
+    ASSERT_TRUE(pair);
+    PhoneFixture phone;
+    InputService service(CapabilityDescriptor::bench_defaults(), phone);
+
+    // When: a key press/release and a mouse-to-touch sequence cross the socket
+    // (the sender connects lazily on its first send).
+    ASSERT_TRUE(pair.value().sender.send(ipc::InputEvent{ipc::KeyEvent{19, true}}));
+    ASSERT_TRUE(pair.value().sender.send(ipc::InputEvent{ipc::KeyEvent{19, false}}));
+    ASSERT_TRUE(pair.value().sender.send(
+        ipc::InputEvent{ipc::TouchEvent{10, 20, ipc::TouchAction::down}}));
+    ASSERT_TRUE(pair.value().sender.send(
+        ipc::InputEvent{ipc::TouchEvent{40, 50, ipc::TouchAction::move}}));
+    ASSERT_TRUE(pair.value().sender.send(
+        ipc::InputEvent{ipc::TouchEvent{40, 50, ipc::TouchAction::up}}));
+    auto endpoint = pair.value().server.accept_sender(aa::core::Milliseconds{2000});
+    ASSERT_TRUE(endpoint);
+    for (int index = 0; index < 5; ++index) {
+        auto event = endpoint.value().receive(aa::core::Milliseconds{2000});
+        ASSERT_TRUE(event);
+        ASSERT_TRUE(service.submit(event.value()));
+    }
+
+    // Then: the phone fixture received the channel-normalized events through
+    // the input channel seam.
+    const std::vector<NormalizedInput> expected{
+        NormalizedKey{19, true},
+        NormalizedKey{19, false},
+        NormalizedTouch{10, 20, 0, ipc::TouchAction::down},
+        NormalizedTouch{40, 50, 0, ipc::TouchAction::move},
+        NormalizedTouch{40, 50, 0, ipc::TouchAction::up},
+    };
+    EXPECT_EQ(phone.input, expected);
+    EXPECT_EQ(phone.sensors.size(), 0U);
+    EXPECT_EQ(service.forwarded(), 5U);
+    EXPECT_EQ(service.rejected(), 0U);
+    EXPECT_EQ(endpoint.value().rejected(), 0U);
+}
+
+TEST(InputSensorsInput, MouseCoordinatesNormalizeIntoAdvertisedViewport) {
+    // Given: the bench service with its advertised 1280x720 touch viewport.
+    PhoneFixture phone;
+    InputService service(CapabilityDescriptor::bench_defaults(), phone);
+
+    // When: a mouse-to-touch event carries pixels outside the viewport.
+    ASSERT_TRUE(service.submit(
+        ipc::InputEvent{ipc::TouchEvent{2000, 900, ipc::TouchAction::move}}));
+
+    // Then: the coordinates are normalized (clamped) into the advertised
+    // viewport - synthesized single-pointer touch, never a physical claim.
+    ASSERT_EQ(phone.input.size(), 1U);
+    EXPECT_EQ(phone.input.front(),
+              (NormalizedInput{NormalizedTouch{1279, 719, 0, ipc::TouchAction::move}}));
+}
+
+TEST(InputSensorsInput, EveryAdvertisedKeycodePassesTheCapabilityGate) {
+    // Given: the bench service and the descriptor's advertised keycode set.
+    PhoneFixture phone;
+    const auto descriptor = CapabilityDescriptor::bench_defaults();
+    InputService service(descriptor, phone);
+
+    // When: one press event is submitted per advertised keycode.
+    for (const std::int32_t keycode : descriptor.keycodes()) {
+        ASSERT_TRUE(service.submit(ipc::InputEvent{ipc::KeyEvent{keycode, true}}));
+    }
+
+    // Then: every advertised key reached the phone fixture normalized.
+    EXPECT_EQ(phone.input.size(), descriptor.keycodes().size());
+    EXPECT_EQ(service.forwarded(), descriptor.keycodes().size());
+    EXPECT_EQ(service.rejected(), 0U);
+    for (std::size_t index = 0; index < descriptor.keycodes().size(); ++index) {
+        EXPECT_EQ(phone.input[index],
+                  (NormalizedInput{NormalizedKey{
+                      static_cast<std::uint32_t>(descriptor.keycodes()[index]), true}}));
+    }
+}
+
+TEST(InputSensorsInput, UnadvertisedKeycodeIsRefusedTypedAndNeverForwarded) {
+    // Given: the bench service (the advertised bench set has no keycode 999).
+    PhoneFixture phone;
+    InputService service(CapabilityDescriptor::bench_defaults(), phone);
+
+    // When: an unadvertised keycode is submitted.
+    const auto refused = service.submit(ipc::InputEvent{ipc::KeyEvent{999, true}});
+
+    // Then: the capability gate refuses it typed and the phone fixture sees
+    // nothing.
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::channel_unsupported_capability);
+    EXPECT_TRUE(phone.input.empty());
+    EXPECT_EQ(service.forwarded(), 0U);
+    EXPECT_EQ(service.rejected(), 1U);
+
+    // And: the service stays usable for the advertised set afterwards.
+    ASSERT_TRUE(service.submit(ipc::InputEvent{ipc::KeyEvent{19, true}}));
+    ASSERT_EQ(phone.input.size(), 1U);
+    EXPECT_EQ(phone.input.front(), (NormalizedInput{NormalizedKey{19, true}}));
+    EXPECT_EQ(service.forwarded(), 1U);
+    EXPECT_EQ(service.rejected(), 1U);
+}
+
+} // namespace
