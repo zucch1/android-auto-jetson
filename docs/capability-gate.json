@@ -461,6 +461,10 @@
           "sha256": "2ba24b64145e2ae4af90d813488ee27cfe907ea0524df9a61d10560fd3b7c949"
         },
         {
+          "name": "task-12-fix/qual-run-1/qual-receipt-run-1.md",
+          "sha256": "8ed45a502837331e88cd1990e9a10bc6b60362b50f5d7fd994e1be40519297d0"
+        },
+        {
           "name": "task-12-fix/qual-run-5/qual-receipt-run-5.md",
           "sha256": "71f9d4261997db8238541b8fae788f8849b21619da55cccc354f33d316e64a34"
         },
