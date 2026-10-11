@@ -62,22 +62,74 @@ core::Result<void> write_record(int fd, std::span<const std::uint8_t> record) no
     return {};
 }
 
+// Deadline-aware single-descriptor poll shared by the data and accept
+// waits. A negative timeout polls with -1 and retries EINTR indefinitely
+// without ever constructing a deadline. A nonnegative timeout is clamped
+// to the 60 s per-phase bound BEFORE the deadline is built; the remaining
+// budget is recomputed before every poll - including every EINTR retry -
+// so a signal storm cannot restart a full slice and starve the deadline.
+// Zero keeps exactly one poll(..., 0): a deadline check must not turn
+// currently-ready data into an unconditional timeout. A positive
+// remaining budget polls with a millisecond CEILING (bounded by 60 s) so
+// a sub-millisecond remainder neither busy-spins nor times out early
+// (<1 ms rounding overrun is acceptable). Status mapping: negative
+// non-EINTR -> transport_io, zero -> timeout, positive -> readiness.
+core::Result<void> poll_one(int fd, short events, core::Milliseconds timeout) noexcept {
+    pollfd ready{fd, events, 0};
+    if (timeout.count < 0) {
+        for (;;) {
+            const int status = ::poll(&ready, 1, -1);
+            if (status < 0 && errno == EINTR) {
+                continue;
+            }
+            if (status < 0) {
+                return io_error();
+            }
+            return {};
+        }
+    }
+    const auto bounded = timeout.count > 60000 ? 60000 : timeout.count;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{bounded};
+    for (bool initial = true;; initial = false) {
+        if (!initial) {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                return Error{ErrorCode::timeout};
+            }
+        }
+        int wait = 0;
+        if (bounded > 0) {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            const auto nanos =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count();
+            std::int64_t millis = (nanos + 999'999) / 1'000'000;
+            if (millis < 1) {
+                millis = 1;
+            }
+            if (millis > 60'000) {
+                millis = 60'000;
+            }
+            wait = static_cast<int>(millis);
+        }
+        const int status = ::poll(&ready, 1, wait);
+        if (status < 0 && errno == EINTR) {
+            continue;
+        }
+        if (status < 0) {
+            return io_error();
+        }
+        if (status == 0) {
+            return Error{ErrorCode::timeout};
+        }
+        return {};
+    }
+}
+
 core::Result<void> await_readable(int fd, core::Milliseconds timeout) noexcept {
-    pollfd ready{fd, POLLIN | POLLRDHUP, 0};
-    int status;
-    const int millis = timeout.count < 0
-                           ? -1
-                           : static_cast<int>(timeout.count > 60000 ? 60000 : timeout.count);
-    do {
-        status = ::poll(&ready, 1, millis);
-    } while (status < 0 && errno == EINTR);
-    if (status < 0) {
-        return io_error();
-    }
-    if (status == 0) {
-        return Error{ErrorCode::timeout};
-    }
-    return {};
+    // Readiness only: EOF -> transport_closed is decided AFTER recvmsg() in
+    // VideoConsumer::receive(), because queued final records and RDHUP can
+    // coexist and a premature closed would discard them.
+    return poll_one(fd, static_cast<short>(POLLIN | POLLRDHUP), timeout);
 }
 
 core::Result<std::size_t> read_record(int fd, std::span<std::uint8_t> buffer,
@@ -808,19 +860,8 @@ core::Result<VideoProducer> VideoServer::accept_consumer(core::Milliseconds time
     if (!impl_ || impl_->closed) {
         return closed_error();
     }
-    pollfd ready{impl_->fd, POLLIN, 0};
-    const int millis = timeout.count < 0 ? -1
-                                         : static_cast<int>(timeout.count > 60000 ? 60000
-                                                                                  : timeout.count);
-    int status;
-    do {
-        status = ::poll(&ready, 1, millis);
-    } while (status < 0 && errno == EINTR);
-    if (status < 0) {
-        return io_error();
-    }
-    if (status == 0) {
-        return Error{ErrorCode::timeout};
+    if (auto ready = poll_one(impl_->fd, static_cast<short>(POLLIN), timeout); !ready) {
+        return ready.error();
     }
     int fd;
     do {

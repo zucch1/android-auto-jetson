@@ -4,18 +4,17 @@
 #include <aa/ipc/VideoChannel.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <poll.h>
 #include <pthread.h>
-#include <signal.h>
 #include <string>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -266,29 +265,17 @@ TEST(VideoStream, ConnectDeadlineIsEnforcedDuringSignalStorm) {
     EXPECT_FALSE(backlog.fillers.empty()) << "backlog admitted no connection";
     ASSERT_TRUE(backlog.queue_refused) << "backlog never saturated";
 
-    struct sigaction action {};
-    struct sigaction previous {};
-    action.sa_handler = +[](int) {};
-    ::sigemptyset(&action.sa_mask);
-    ASSERT_EQ(::sigaction(SIGUSR1, &action, &previous), 0);
-    const pthread_t waiter = ::pthread_self();
-    std::atomic<bool> storming{true};
-    std::thread storm([waiter, &storming] {
-        while (storming.load(std::memory_order_relaxed)) {
-            (void)::pthread_kill(waiter, SIGUSR1);
-            std::this_thread::sleep_for(std::chrono::milliseconds{5});
-        }
-    });
-
-    const auto start = std::chrono::steady_clock::now();
-    const auto client = connect_video_consumer(
-        path, VideoClientOptions{limits, current_uid(), aa::core::Milliseconds{300}});
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start);
-
-    storming.store(false, std::memory_order_relaxed);
-    storm.join();
-    (void)::sigaction(SIGUSR1, &previous, nullptr);
+    aa::core::Result<VideoConsumer> client{VideoConsumer{}};
+    std::chrono::milliseconds elapsed{};
+    {
+        const videotest::SignalStorm storm{::pthread_self()};
+        ASSERT_TRUE(storm.valid());
+        const auto start = std::chrono::steady_clock::now();
+        client = connect_video_consumer(
+            path, VideoClientOptions{limits, current_uid(), aa::core::Milliseconds{300}});
+        elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+    }
 
     ASSERT_FALSE(client);
     EXPECT_EQ(client.error().code(), aa::ErrorCode::timeout);
@@ -300,6 +287,149 @@ TEST(VideoStream, ConnectDeadlineIsEnforcedDuringSignalStorm) {
     }
     reap_queued_connections(server.value());
 
+    server.value().close();
+    ::unlink(path.value.c_str());
+    videotest::remove_startup_lock(path.value);
+    ::rmdir((runtime + "/android-auto-receiver").c_str());
+    ::rmdir(runtime.c_str());
+}
+
+TEST(VideoStream, ReceiveDeadlineIsEnforcedDuringSignalStorm) {
+    NegotiatedLimits limits{};
+    auto pair = videotest::make_pair(limits);
+    ASSERT_TRUE(pair);
+    auto& producer = pair.value().producer;
+    auto& consumer = pair.value().consumer;
+
+    const bool waiting_before = consumer.waiting_idr();
+    const std::uint64_t resyncs_before = consumer.resyncs();
+    const std::uint64_t rejected_before = consumer.rejected();
+    const std::uint64_t suppressed_before = consumer.suppressed();
+
+    aa::core::Result<ReceiveStatus> step{ReceiveStatus::fragment};
+    std::chrono::milliseconds elapsed{};
+    {
+        const videotest::SignalStorm storm{::pthread_self()};
+        ASSERT_TRUE(storm.valid());
+        const auto start = std::chrono::steady_clock::now();
+        step = consumer.receive(aa::core::Milliseconds{300});
+        elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+    }
+
+    ASSERT_FALSE(step);
+    EXPECT_EQ(step.error().code(), aa::ErrorCode::timeout);
+    EXPECT_GE(elapsed.count(), 250);
+    EXPECT_LT(elapsed.count(), 2000);
+    EXPECT_EQ(consumer.waiting_idr(), waiting_before);
+    EXPECT_EQ(consumer.resyncs(), resyncs_before);
+    EXPECT_EQ(consumer.rejected(), rejected_before);
+    EXPECT_EQ(consumer.suppressed(), suppressed_before);
+
+    const std::vector<std::uint8_t> payload{0x5a};
+    ASSERT_TRUE(producer.send_access_unit({1, 1, true, payload}));
+    const auto recovered = consumer.receive(aa::core::Milliseconds{2000});
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(recovered.value(), ReceiveStatus::complete);
+}
+
+TEST(VideoStream, AcceptDeadlineIsEnforcedDuringSignalStorm) {
+    NegotiatedLimits limits{};
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{limits, current_uid()});
+    ASSERT_TRUE(server);
+
+    aa::core::Result<VideoProducer> accepted{VideoProducer{}};
+    std::chrono::milliseconds elapsed{};
+    {
+        const videotest::SignalStorm storm{::pthread_self()};
+        ASSERT_TRUE(storm.valid());
+        const auto start = std::chrono::steady_clock::now();
+        accepted = server.value().accept_consumer(aa::core::Milliseconds{300});
+        elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+    }
+
+    ASSERT_FALSE(accepted);
+    EXPECT_EQ(accepted.error().code(), aa::ErrorCode::timeout);
+    EXPECT_GE(elapsed.count(), 250);
+    EXPECT_LT(elapsed.count(), 2000);
+    EXPECT_TRUE(videotest::streams_one_unit(server.value(), path));
+
+    server.value().close();
+    ::unlink(path.value.c_str());
+    videotest::remove_startup_lock(path.value);
+    ::rmdir((runtime + "/android-auto-receiver").c_str());
+    ::rmdir(runtime.c_str());
+}
+
+TEST(VideoStream, ZeroTimeoutProbesWithoutBlocking) {
+    NegotiatedLimits limits{};
+    auto pair = videotest::make_pair(limits);
+    ASSERT_TRUE(pair);
+
+    const auto idle_start = std::chrono::steady_clock::now();
+    const auto idle = pair.value().consumer.receive(aa::core::Milliseconds{0});
+    const auto idle_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - idle_start);
+    ASSERT_FALSE(idle);
+    EXPECT_EQ(idle.error().code(), aa::ErrorCode::timeout);
+    EXPECT_LT(idle_elapsed.count(), 250);
+
+    const std::vector<std::uint8_t> payload{0x5a};
+    ASSERT_TRUE(pair.value().producer.send_access_unit({1, 1, true, payload}));
+    const auto queued = pair.value().consumer.receive(aa::core::Milliseconds{0});
+    ASSERT_TRUE(queued);
+    EXPECT_EQ(queued.value(), ReceiveStatus::complete);
+
+    const auto accept_start = std::chrono::steady_clock::now();
+    const auto accepted = pair.value().server.accept_consumer(aa::core::Milliseconds{0});
+    const auto accept_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - accept_start);
+    ASSERT_FALSE(accepted);
+    EXPECT_EQ(accepted.error().code(), aa::ErrorCode::timeout);
+    EXPECT_LT(accept_elapsed.count(), 250);
+}
+
+TEST(VideoStream, NegativeTimeoutWaitsForDelayedDataAndConnection) {
+    NegotiatedLimits limits{};
+    auto pair = videotest::make_pair(limits);
+    ASSERT_TRUE(pair);
+    const std::vector<std::uint8_t> payload{0x5a};
+    std::thread sender([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        (void)pair.value().producer.send_access_unit({1, 1, true, payload});
+    });
+    const auto step = pair.value().consumer.receive(aa::core::Milliseconds{-1});
+    sender.join();
+    ASSERT_TRUE(step);
+    EXPECT_EQ(step.value(), ReceiveStatus::complete);
+
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{limits, current_uid()});
+    ASSERT_TRUE(server);
+    aa::core::Result<VideoConsumer> client{VideoConsumer{}};
+    std::thread connector([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        client = connect_video_consumer(
+            path, VideoClientOptions{limits, current_uid(), aa::core::Milliseconds{2000}});
+    });
+    auto producer = server.value().accept_consumer(aa::core::Milliseconds{-1});
+    connector.join();
+    ASSERT_TRUE(producer);
+    ASSERT_TRUE(client);
+    const std::vector<std::uint8_t> late{0x5b};
+    ASSERT_TRUE(producer.value().send_access_unit({1, 1, true, late}));
+    const auto late_step = client.value().receive(aa::core::Milliseconds{2000});
+    ASSERT_TRUE(late_step);
+    EXPECT_EQ(late_step.value(), ReceiveStatus::complete);
+
+    producer.value().close();
+    client.value().close();
     server.value().close();
     ::unlink(path.value.c_str());
     videotest::remove_startup_lock(path.value);

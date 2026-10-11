@@ -3,9 +3,13 @@
 
 #include <aa/ipc/VideoChannel.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <string>
 #include <sys/file.h>
 #include <sys/socket.h>
@@ -53,6 +57,72 @@ inline bool leave_stale_socket_node(const std::string& path) {
     ::close(fd);
     return bound;
 }
+
+// RAII SIGUSR1 storm for the deadline regressions: installs an empty
+// handler WITHOUT SA_RESTART (syscalls must observe EINTR) and
+// pthread_kill()s the waiting thread every 5 ms from a helper thread. The
+// previous disposition and the target thread's signal mask are restored
+// after the helper is stopped and joined, so signal state never leaks
+// between tests. A HARD 2500 ms cutoff stops the storm independently of
+// operation completion: a defective deadline loop that only ends when the
+// signals stop must fail the elapsed bound instead of hanging the binary.
+// Signal disposition is process-global - storm tests run sequentially.
+struct SignalStorm final {
+    static constexpr std::chrono::milliseconds kCutoff{2500};
+
+    explicit SignalStorm(pthread_t target) : target_(target) {
+        ::sigemptyset(&previous_mask_);
+        struct sigaction action {};
+        action.sa_handler = +[](int) {};
+        ::sigemptyset(&action.sa_mask);
+        if (::sigaction(SIGUSR1, &action, &previous_) != 0) {
+            return;
+        }
+        installed_ = true;
+        (void)::pthread_sigmask(SIG_SETMASK, nullptr, &previous_mask_);
+        sigset_t unblock{};
+        ::sigemptyset(&unblock);
+        ::sigaddset(&unblock, SIGUSR1);
+        (void)::pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
+        worker_ = std::thread([this] {
+            const auto start = std::chrono::steady_clock::now();
+            while (storming_.load(std::memory_order_relaxed) &&
+                   std::chrono::steady_clock::now() - start < kCutoff) {
+                (void)::pthread_kill(target_, SIGUSR1);
+                std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            }
+        });
+    }
+
+    ~SignalStorm() { stop(); }
+
+    void stop() noexcept {
+        storming_.store(false, std::memory_order_relaxed);
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        if (installed_) {
+            (void)::sigaction(SIGUSR1, &previous_, nullptr);
+            (void)::pthread_sigmask(SIG_SETMASK, &previous_mask_, nullptr);
+            installed_ = false;
+        }
+    }
+
+    [[nodiscard]] bool valid() const noexcept { return installed_; }
+
+    SignalStorm(const SignalStorm&) = delete;
+    SignalStorm& operator=(const SignalStorm&) = delete;
+    SignalStorm(SignalStorm&&) = delete;
+    SignalStorm& operator=(SignalStorm&&) = delete;
+
+private:
+    pthread_t target_{};
+    struct sigaction previous_ {};
+    sigset_t previous_mask_{};
+    std::atomic<bool> storming_{true};
+    std::thread worker_{};
+    bool installed_{false};
+};
 
 // One full handshake plus a single access unit round trip against a live
 // server; the recovery assertion shared by the channel and ownership suites.
