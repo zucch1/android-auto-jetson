@@ -168,6 +168,13 @@ core::Result<void> validate_runtime_directory(const std::string& directory) noex
 // file at its own name: the stale-node probe and close() only ever touch the
 // socket path, so it confuses neither. flock releases on close even if the
 // holder dies, so a crash cannot wedge later starters.
+//
+// Descriptor lifetime and exclusive-lock lifetime are distinct: listen()
+// unlocks the descriptor and transfers it (still open) into the live server,
+// so teardown can reacquire LOCK_EX around the close+unlink pair and
+// serialize endpoint removal against a cooperating starter. The lock/unlock
+// operations never allocate and retry EINTR, so they are usable from
+// noexcept cleanup.
 class StartupLock final {
 public:
     StartupLock() = default;
@@ -221,7 +228,34 @@ public:
         return lock;
     }
 
-private:
+    [[nodiscard]] core::Result<void> lock_ex() noexcept {
+        if (fd_ < 0) {
+            return io_error();
+        }
+        int status;
+        do {
+            status = ::flock(fd_, LOCK_EX);
+        } while (status != 0 && errno == EINTR);
+        if (status != 0) {
+            return io_error();
+        }
+        return {};
+    }
+
+    [[nodiscard]] core::Result<void> unlock() noexcept {
+        if (fd_ < 0) {
+            return io_error();
+        }
+        int status;
+        do {
+            status = ::flock(fd_, LOCK_UN);
+        } while (status != 0 && errno == EINTR);
+        if (status != 0) {
+            return io_error();
+        }
+        return {};
+    }
+
     void release() noexcept {
         if (fd_ >= 0) {
             ::flock(fd_, LOCK_UN);
@@ -230,6 +264,7 @@ private:
         }
     }
 
+private:
     int fd_{-1};
 };
 
@@ -670,6 +705,7 @@ struct VideoServer::Impl final {
     VideoSocketPath path{};
     EndpointIdentity identity{};
     VideoServerOptions options{};
+    StartupLock lock{};
     std::uint64_t unauthorized{};
     bool closed{false};
 
@@ -685,11 +721,25 @@ struct VideoServer::Impl final {
             return;
         }
         closed = true;
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
+        if (fd < 0) {
+            // Uninitialized: listen() failed before adopting the listener,
+            // so there is no endpoint to clean up and no lock to reacquire.
+            return;
         }
-        unlink_owned_endpoint(path.value, identity);
+        // Reacquire the startup lock while the listener is still live so a
+        // cooperating starter can neither classify the endpoint stale nor
+        // replace it inside the close+unlink window (the unlocked
+        // lstat/unlink pair let a previously-validated unlink delete a
+        // concurrently bound replacement). If reacquisition fails, close the
+        // descriptors but skip the unlink: a stale node is recoverable by
+        // the next startup, an unlocked unlink is not.
+        const bool held = static_cast<bool>(lock.lock_ex());
+        ::close(fd);
+        fd = -1;
+        if (held) {
+            unlink_owned_endpoint(path.value, identity);
+        }
+        lock.release();
     }
 };
 
@@ -710,7 +760,8 @@ core::Result<VideoServer> VideoServer::listen(const VideoSocketPath& path,
     // The startup lock is held across the whole prepare/bind/listen section
     // and released when this function returns: cooperating same-path starters
     // serialize here, so the kernel bind race is impossible among them and
-    // exactly one of them wins.
+    // exactly one of them wins. The descriptor is retained (unlocked) in the
+    // returned server so teardown can reacquire it.
     auto startup = StartupLock::acquire(path.value);
     if (!startup) {
         return startup.error();
@@ -718,6 +769,13 @@ core::Result<VideoServer> VideoServer::listen(const VideoSocketPath& path,
     if (auto prepared = prepare_video_socket_path(path); !prepared) {
         return prepared.error();
     }
+    // Allocate the Impl and copy path/options BEFORE the socket exists: a
+    // failure below then destroys only an uninitialized Impl (fd == -1),
+    // which must not attempt endpoint cleanup or lock acquisition while the
+    // local critical section still owns both.
+    auto impl = std::make_unique<Impl>();
+    impl->path = path;
+    impl->options = options;
     const int fd = make_seqpacket();
     if (fd < 0) {
         return io_error();
@@ -732,11 +790,17 @@ core::Result<VideoServer> VideoServer::listen(const VideoSocketPath& path,
         unlink_owned_endpoint(path.value, bound.value());
         return io_error();
     }
-    auto impl = std::make_unique<Impl>();
-    impl->fd = fd;
-    impl->path = path;
     impl->identity = bound.value();
-    impl->options = options;
+    if (auto unlocked = startup.value().unlock(); !unlocked) {
+        // Never return a live server with an accidentally retained exclusive
+        // lock: clean up the fresh listener/endpoint while the local critical
+        // section still owns cleanup.
+        ::close(fd);
+        unlink_owned_endpoint(path.value, bound.value());
+        return unlocked.error();
+    }
+    impl->lock = std::move(startup.value());
+    impl->fd = fd;
     return VideoServer{std::move(impl)};
 }
 

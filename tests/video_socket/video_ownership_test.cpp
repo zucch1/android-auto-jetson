@@ -6,6 +6,7 @@
 #include <aa/ipc/VideoChannel.hpp>
 
 #include <array>
+#include <atomic>
 #include <barrier>
 #include <cerrno>
 #include <chrono>
@@ -484,4 +485,115 @@ TEST(VideoOwnership, ListenRejectsHeldLockInInvalidDirectoryWithoutBlocking) {
     EXPECT_LT(elapsed.count(), 1000);
 
     cleanup_runtime(runtime, path.value);
+}
+
+// Controlled lock-exclusion: teardown must reacquire the per-path startup
+// lock before closing the listener and unlinking the endpoint, so an
+// external flock holder blocks close(). A barrier-only race cannot observe
+// this - catching teardown that ignores the lock needs the lock held.
+TEST(VideoOwnership, ServerTeardownWaitsForStartupLock) {
+    const std::string runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+    ASSERT_TRUE(server);
+    const int listener = server.value().native_handle();
+    ASSERT_GE(listener, 0);
+    ASSERT_TRUE(videotest::streams_one_unit(server.value(), path));
+
+    const std::string lock_path = path.value + ".lock";
+    const int lock_fd = ::open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
+    ASSERT_GE(lock_fd, 0);
+    if (::flock(lock_fd, LOCK_EX) != 0) {
+        ::close(lock_fd);
+        FAIL() << "external flock(LOCK_EX) on the startup lock failed";
+    }
+
+    std::atomic<bool> entered{false};
+    std::atomic<bool> done{false};
+    std::thread closer([&] {
+        entered.store(true, std::memory_order_release);
+        server.value().close();
+        done.store(true, std::memory_order_release);
+    });
+    while (!entered.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+
+    // Nonfatal by construction: the external flock is still held here and a
+    // fatal assert would skip both the unlock and the join.
+    EXPECT_FALSE(done.load(std::memory_order_acquire))
+        << "close() completed while an external flock was held";
+    EXPECT_NE(::fcntl(listener, F_GETFD), -1) << "listener closed before the lock dropped";
+
+    (void)::flock(lock_fd, LOCK_UN);
+    ::close(lock_fd);
+    closer.join();
+
+    ASSERT_TRUE(done.load(std::memory_order_acquire));
+    errno = 0;
+    const int probed = ::fcntl(listener, F_GETFD);
+    const int failure = errno;
+    EXPECT_EQ(probed, -1);
+    EXPECT_EQ(failure, EBADF);
+    EXPECT_FALSE(node_exists(path.value));
+    cleanup_runtime(runtime, path.value);
+}
+
+// Close-vs-restart race: the unlocked lstat/unlink teardown let a starter
+// classify the endpoint stale, replace it, and lose the replacement to the
+// closer's previously-validated unlink. Teardown now runs under the startup
+// lock, so the raced replacement survives every round with its node intact.
+TEST(VideoOwnership, ConcurrentCloseRestartPreservesReplacementEndpoint) {
+    for (int round = 0; round < 20; ++round) {
+        SCOPED_TRACE("round " + std::to_string(round));
+        const std::string runtime = videotest::private_runtime_dir();
+        ASSERT_FALSE(runtime.empty());
+        const auto path = video_socket_path_in(runtime);
+        auto original = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+        ASSERT_TRUE(original);
+
+        std::optional<VideoServer> replacement;
+        aa::ErrorCode starter_failure{};
+        std::barrier gate(2);
+        std::thread closer([&] {
+            gate.arrive_and_wait();
+            original.value().close();
+        });
+        std::thread starter([&] {
+            gate.arrive_and_wait();
+            auto attempt = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+            if (attempt) {
+                replacement = std::move(attempt.value());
+            } else {
+                starter_failure = attempt.error().code();
+            }
+        });
+        closer.join();
+        starter.join();
+
+        if (!replacement.has_value()) {
+            // The starter may legitimately lose the lock race to the
+            // still-live original and see transport_unavailable: retry only
+            // that refusal, exactly once. Any other refusal is a failure.
+            ASSERT_EQ(starter_failure, aa::ErrorCode::transport_unavailable);
+            auto retry = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+            ASSERT_TRUE(retry);
+            replacement = std::move(retry.value());
+        }
+
+        ASSERT_TRUE(replacement.has_value());
+        EXPECT_TRUE(node_exists(path.value));
+        // The raced replacement stays ALIVE through the reachability checks:
+        // recreating it first would mask a node stolen by the closer.
+        EXPECT_TRUE(videotest::streams_one_unit(*replacement, path));
+        const auto refused = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+        ASSERT_FALSE(refused);
+        EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unavailable);
+        replacement->close();
+        EXPECT_FALSE(node_exists(path.value));
+        replacement.reset();
+        cleanup_runtime(runtime, path.value);
+    }
 }

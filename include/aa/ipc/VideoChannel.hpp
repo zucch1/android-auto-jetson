@@ -23,8 +23,15 @@ namespace aa::ipc {
 // Ownership: every descriptor and (for the server) its endpoint node are
 // released by an idempotent cleanup shared by close() and the Impl
 // destructor, so replacing a live channel by move assignment releases what it
-// held instead of leaking it. A server unlinks its endpoint only while the
-// path still names the exact node it bound (device+inode captured at bind).
+// held instead of leaking it. Descriptor lifetime and exclusive-lock lifetime
+// are distinct: the server keeps the per-path startup lock's descriptor open
+// (unlocked) for its whole life while the flock is held only across startup
+// and teardown, so close serializes the close+unlink pair against a
+// cooperating starter. A server unlinks its endpoint only while the path
+// still names the exact node it bound (device+inode captured at bind) and
+// only while holding that lock; noncooperating same-UID mutation of the
+// lock/socket is out of scope (0700 dir + peer-cred admission). None of
+// these APIs are async-signal-safe: signal-handler re-entry is unsupported.
 //
 // Error contract: unauthorized peer -> transport_unauthorized_peer; malformed
 // record -> transport_malformed_frame; oversize record or access unit ->
@@ -185,7 +192,8 @@ public:
     // removed again (fail closed). Cooperating concurrent starts serialize
     // on a per-path startup lock (flock on a stable <path>.lock inode beside
     // the socket, never deleted) held across prepare, bind and listen, so
-    // exactly one of them binds; noncooperating same-UID mutation of the
+    // exactly one of them binds; the lock's descriptor is retained unlocked
+    // for close() to reacquire. noncooperating same-UID mutation of the
     // lock/socket is out of scope (0700 dir + peer-cred admission).
     [[nodiscard]] static core::Result<VideoServer> listen(const VideoSocketPath& path,
                                                           const VideoServerOptions& options);
@@ -199,7 +207,13 @@ public:
     [[nodiscard]] core::Result<VideoProducer> accept_consumer(core::Milliseconds timeout);
 
     // Closes the listener and unlinks the endpoint node only while it is
-    // still the node bound at listen() time; idempotent.
+    // still the node bound at listen() time and only while holding the
+    // per-path startup lock, so teardown cannot delete a concurrently bound
+    // replacement; idempotent. Close/destruction may wait for another
+    // cooperating path operation - it is not a bounded-close guarantee. If
+    // the lock cannot be reacquired the listener and lock descriptors are
+    // closed but the endpoint node is left in place (a stale node is
+    // recoverable by the next startup).
     void close() noexcept;
 
     [[nodiscard]] bool closed() const noexcept;
