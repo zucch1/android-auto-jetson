@@ -1,6 +1,6 @@
 {
   "schema": "aa-capability-gate/1",
-  "generated_at_utc": "2026-10-11T06:41:02Z",
+  "generated_at_utc": "2026-10-11T09:31:37Z",
   "report_stage": "continuation",
   "target": {
     "architecture": "aarch64",

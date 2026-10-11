@@ -93,10 +93,11 @@ window produced two bounded observations, neither of which resolves claim 3:
   modprobe-start → `AP-ENABLED` = 4.223 s worst of 3 journal-valid cycles, on the
   receiver-hosted `aa-qual-44` AP (ch 44, 20 MHz). This is not a boot-to-AP number.
 - `wireless.session_reconnect_s` (≤ 15 s) **remains unmeasured**: the window exercised
-  **infrastructure-STA** RF-kill recovery (Jetson as client of the venue router, SSID
-  Renzo) at 4.139 s worst of 3 journal-valid cycles — a different topology from the
-  receiver-hosted AA transport (ARCHITECTURE.md, "Transport order") and not an AA
-  session. The 30 s ping sample (30/30, 0 % loss) is likewise infrastructure-STA only.
+  **infrastructure-STA** RF-kill recovery (Jetson as client of the venue
+  infrastructure router) at 4.139 s worst of 3 journal-valid cycles — a different
+  topology from the receiver-hosted AA transport (ARCHITECTURE.md, "Transport
+  order") and not an AA session. The 30 s ping sample (30/30, 0 % loss) is likewise
+  infrastructure-STA only.
 
 Measuring the session budget requires an exercised receiver-hosted AA session (phone
 joins the Jetson-hosted AP; interrupt; time the **session** recovery) — separate work.
