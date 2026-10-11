@@ -2,7 +2,7 @@
 # Out-of-tree kbuild for rtl8822ce-regd-shim.
 #
 # Build (on the Jetson):
-#   make -C /lib/modules/$(uname -r)/build M=$(PWD) modules
+#   make -C /lib/modules/$(uname -r)/build M="$PWD" modules
 obj-m += rtl8822ce-regd-shim.o
 
 ccflags-y += -Wall -Werror
