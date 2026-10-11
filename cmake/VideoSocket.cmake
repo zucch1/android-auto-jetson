@@ -6,11 +6,11 @@
 #
 # Integration contract: include AFTER cmake/CoreArchitecture.cmake (aa_core),
 # cmake/Replay.cmake (aa_replay) and the googletest declaration.
+#
+# Cross builds compile the production library (aa_video sources are inventoried
+# in compile_commands.json and aa_input depends on it); only the test executable
+# and registrations are host-side.
 
-if(CMAKE_CROSSCOMPILING)
-    message(STATUS "Video socket qualification unavailable in cross-smoke mode")
-    return()
-endif()
 if(NOT TARGET aa_replay)
     message(FATAL_ERROR
         "AA_VIDEO_SOCKET_REQUIRES_AA_REPLAY: include cmake/Replay.cmake before cmake/VideoSocket.cmake")
@@ -42,12 +42,16 @@ set_target_properties(aa_video PROPERTIES
 target_include_directories(aa_video PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aa_video PUBLIC aa_core aa_replay)
 
-add_executable(aa_video_socket_test ${AA_VIDEO_TEST_SOURCES})
-target_link_libraries(aa_video_socket_test PRIVATE aa_video aa_replay GTest::gtest_main)
-set_target_properties(aa_video_socket_test PROPERTIES
-    CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+set(AA_VIDEO_WARN_TARGETS aa_video)
+if(NOT CMAKE_CROSSCOMPILING)
+    add_executable(aa_video_socket_test ${AA_VIDEO_TEST_SOURCES})
+    target_link_libraries(aa_video_socket_test PRIVATE aa_video aa_replay GTest::gtest_main)
+    set_target_properties(aa_video_socket_test PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    list(APPEND AA_VIDEO_WARN_TARGETS aa_video_socket_test)
+endif()
 
-foreach(target aa_video aa_video_socket_test)
+foreach(target IN LISTS AA_VIDEO_WARN_TARGETS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
         target_compile_options(${target} PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
@@ -58,7 +62,7 @@ if(AA_ENABLE_ASAN)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
         message(FATAL_ERROR "AA_VIDEO_ASAN_UNSUPPORTED: requires GNU or Clang")
     endif()
-    foreach(_aa_video_asan_target aa_video aa_video_socket_test)
+    foreach(_aa_video_asan_target IN LISTS AA_VIDEO_WARN_TARGETS)
         target_compile_options(${_aa_video_asan_target} PRIVATE
             -fsanitize=address -fno-omit-frame-pointer)
         target_link_options(${_aa_video_asan_target} PRIVATE -fsanitize=address)
@@ -66,18 +70,21 @@ if(AA_ENABLE_ASAN)
     unset(_aa_video_asan_target)
 endif()
 
-add_test(NAME video_socket_codec COMMAND aa_video_socket_test --gtest_filter=VideoCodec.*)
-add_test(NAME video_socket_stream COMMAND aa_video_socket_test --gtest_filter=VideoStream.*)
-add_test(NAME video_socket_peer COMMAND aa_video_socket_test --gtest_filter=VideoPeer.*)
-add_test(NAME video_socket_backpressure COMMAND aa_video_socket_test --gtest_filter=VideoBackpressure.*)
-add_test(NAME video_socket_malformed COMMAND aa_video_socket_test --gtest_filter=VideoMalformed.*)
-add_test(NAME video_socket_replay COMMAND aa_video_socket_test --gtest_filter=VideoReplay.*)
-add_test(NAME video_socket_bench COMMAND aa_video_socket_test --gtest_filter=VideoBench.*)
-add_test(NAME video_socket_ownership COMMAND aa_video_socket_test --gtest_filter=VideoOwnership.*)
-set_tests_properties(video_socket_codec video_socket_stream video_socket_peer
-    video_socket_backpressure video_socket_malformed video_socket_replay video_socket_bench
-    video_socket_ownership
-    PROPERTIES TIMEOUT 120)
+if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME video_socket_codec COMMAND aa_video_socket_test --gtest_filter=VideoCodec.*)
+    add_test(NAME video_socket_stream COMMAND aa_video_socket_test --gtest_filter=VideoStream.*)
+    add_test(NAME video_socket_peer COMMAND aa_video_socket_test --gtest_filter=VideoPeer.*)
+    add_test(NAME video_socket_backpressure COMMAND aa_video_socket_test --gtest_filter=VideoBackpressure.*)
+    add_test(NAME video_socket_malformed COMMAND aa_video_socket_test --gtest_filter=VideoMalformed.*)
+    add_test(NAME video_socket_replay COMMAND aa_video_socket_test --gtest_filter=VideoReplay.*)
+    add_test(NAME video_socket_bench COMMAND aa_video_socket_test --gtest_filter=VideoBench.*)
+    add_test(NAME video_socket_ownership COMMAND aa_video_socket_test --gtest_filter=VideoOwnership.*)
+    set_tests_properties(video_socket_codec video_socket_stream video_socket_peer
+        video_socket_backpressure video_socket_malformed video_socket_replay video_socket_bench
+        video_socket_ownership
+        PROPERTIES TIMEOUT 120)
+endif()
 
 unset(AA_VIDEO_SOURCES)
 unset(AA_VIDEO_TEST_SOURCES)
+unset(AA_VIDEO_WARN_TARGETS)

@@ -10,11 +10,10 @@
 # Integration contract: include AFTER cmake/CoreArchitecture.cmake (aa_core) and
 # the googletest declaration (GTest::gtest_main). The parent adds
 # `include(cmake/Session.cmake)` in its own root edit.
+#
+# Cross builds compile the production library (aa_replay depends on it); only
+# the test executable and registrations are host-side.
 
-if(CMAKE_CROSSCOMPILING)
-    message(STATUS "Session lifecycle qualification unavailable in cross-smoke mode")
-    return()
-endif()
 if(NOT TARGET aa_core)
     message(FATAL_ERROR
         "AA_SESSION_REQUIRES_AA_CORE: include cmake/CoreArchitecture.cmake before cmake/Session.cmake")
@@ -43,25 +42,28 @@ set_target_properties(aa_session PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 target_include_directories(aa_session PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aa_session PUBLIC aa_core)
-if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
-    target_compile_options(aa_session PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
+
+set(AA_SESSION_WARN_TARGETS aa_session)
+if(NOT CMAKE_CROSSCOMPILING)
+    add_executable(aa_session_state_test ${AA_SESSION_TEST_SOURCES})
+    target_link_libraries(aa_session_state_test PRIVATE aa_session aa_transport GTest::gtest_main)
+    set_target_properties(aa_session_state_test PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    list(APPEND AA_SESSION_WARN_TARGETS aa_session_state_test)
 endif()
 
-add_executable(aa_session_state_test ${AA_SESSION_TEST_SOURCES})
-target_link_libraries(aa_session_state_test PRIVATE aa_session aa_transport GTest::gtest_main)
-set_target_properties(aa_session_state_test PROPERTIES
-    CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
-    target_compile_options(aa_session_state_test PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
-endif()
+foreach(target IN LISTS AA_SESSION_WARN_TARGETS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
+        target_compile_options(${target} PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
+    endif()
+endforeach()
 
 if(AA_ENABLE_ASAN)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
         message(FATAL_ERROR "AA_SESSION_ASAN_UNSUPPORTED: requires GNU or Clang")
     endif()
-    foreach(_aa_session_asan_target aa_session aa_session_state_test)
+    foreach(_aa_session_asan_target IN LISTS AA_SESSION_WARN_TARGETS)
         target_compile_options(${_aa_session_asan_target} PRIVATE
             -fsanitize=address -fno-omit-frame-pointer)
         target_link_options(${_aa_session_asan_target} PRIVATE -fsanitize=address)
@@ -69,15 +71,18 @@ if(AA_ENABLE_ASAN)
     unset(_aa_session_asan_target)
 endif()
 
-add_test(NAME session_state_machine COMMAND aa_session_state_test --gtest_filter=StateMachineTable.*)
-add_test(NAME session_state_lifecycle COMMAND aa_session_state_test --gtest_filter=Lifecycle.*)
-add_test(NAME session_state_property COMMAND aa_session_state_test --gtest_filter=PolicyProperty.*)
-add_test(NAME session_state_deadline COMMAND aa_session_state_test --gtest_filter=DeadlineEnforcement.*)
-add_test(NAME session_state_pairing COMMAND aa_session_state_test --gtest_filter=PairingIdentity.*)
-add_test(NAME session_state_transport COMMAND aa_session_state_test --gtest_filter=TransportLifecycle.*)
-set_tests_properties(session_state_machine session_state_lifecycle session_state_property
-    session_state_deadline session_state_pairing session_state_transport
-    PROPERTIES TIMEOUT 60)
+if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME session_state_machine COMMAND aa_session_state_test --gtest_filter=StateMachineTable.*)
+    add_test(NAME session_state_lifecycle COMMAND aa_session_state_test --gtest_filter=Lifecycle.*)
+    add_test(NAME session_state_property COMMAND aa_session_state_test --gtest_filter=PolicyProperty.*)
+    add_test(NAME session_state_deadline COMMAND aa_session_state_test --gtest_filter=DeadlineEnforcement.*)
+    add_test(NAME session_state_pairing COMMAND aa_session_state_test --gtest_filter=PairingIdentity.*)
+    add_test(NAME session_state_transport COMMAND aa_session_state_test --gtest_filter=TransportLifecycle.*)
+    set_tests_properties(session_state_machine session_state_lifecycle session_state_property
+        session_state_deadline session_state_pairing session_state_transport
+        PROPERTIES TIMEOUT 60)
+endif()
 
 unset(AA_SESSION_SOURCES)
 unset(AA_SESSION_TEST_SOURCES)
+unset(AA_SESSION_WARN_TARGETS)
