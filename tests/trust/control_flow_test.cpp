@@ -94,17 +94,34 @@ TEST(ControlFlow, WrongUidCallerAddPhoneLeavesStoreUnmodified) {
 
     const BusName intruder{":1.13"};
     f.credentials.add_connection(intruder, kSessionUid + 1);
+    f.policy.note_candidate(trust::TransportIdentity{test::kWired});
+    const auto denied = f.service.request_add_phone(intruder);
+
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(denied.error().code(), ErrorCode::ipc_peer_unauthorized);
+    EXPECT_TRUE(f.store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(f.dir.file()));
+}
+
+TEST(ControlFlow, StolenConsumerNameTearsDownBeforeUidGate) {
+    // Owner-loss precedence (inherited from the hardened control service): an
+    // intruder who steals the consumer name trips refresh_consumer_owner() ->
+    // teardown() before the UID gate, so the call is rejected as
+    // ipc_consumer_rejected and the store stays unmodified.
+    Fixture f;
+    const BusName connection{":1.15"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    f.credentials.add_connection(connection, kSessionUid);
+    f.credentials.set_owner(consumer_name, connection);
+    ASSERT_TRUE(f.service.register_consumer(connection, consumer_name).has_value());
+
+    const BusName intruder{":1.16"};
+    f.credentials.add_connection(intruder, kSessionUid + 1);
     f.credentials.set_owner(consumer_name, intruder);
     f.policy.note_candidate(trust::TransportIdentity{test::kWired});
     const auto denied = f.service.request_add_phone(intruder);
 
     ASSERT_FALSE(denied.has_value());
-    // Merged-precedence note: the intruder also owns the consumer name, so the
-    // hardened owner-loss reconciliation tears the registration down first
-    // (refresh_consumer_owner -> teardown) and the call is rejected as
-    // ipc_consumer_rejected before the UID gate. The store stays unmodified
-    // either way; a pure wrong-UID caller without name theft is rejected with
-    // ipc_peer_unauthorized.
     EXPECT_EQ(denied.error().code(), ErrorCode::ipc_consumer_rejected);
     EXPECT_TRUE(f.store.phones().empty());
     EXPECT_FALSE(std::filesystem::exists(f.dir.file()));
