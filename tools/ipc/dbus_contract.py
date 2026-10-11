@@ -213,9 +213,17 @@ def check_lexical(text: str) -> list[Violation]:
     instructions (the XML declaration excepted, which expat never reports as
     one) and namespace declarations must fail closed even though
     ``ET.fromstring`` never surfaces them. The same input is replayed through
-    expat with explicit handlers so none of these can disappear silently."""
+    expat with explicit handlers so none of these can disappear silently.
+
+    The replay runs WITHOUT namespace processing: raw element/attribute names
+    keep their prefixes and xmlns declarations arrive as ordinary attributes,
+    so a namespace URI can never abort the replay (a separator-based replay
+    raises on a URI containing the separator and, swallowed, hid both the
+    declaration and any following construct). Every replay failure is itself a
+    named rejection: ElementTree already accepted the input, so incomplete
+    lexical evidence must fail closed."""
     violations: list[Violation] = []
-    parser = expat.ParserCreate(namespace_separator="|")
+    parser = expat.ParserCreate()
 
     def doctype(name: str, system_id: str, public_id: str, has_internal: int) -> None:
         del system_id, public_id, has_internal
@@ -226,18 +234,30 @@ def check_lexical(text: str) -> list[Violation]:
         violations.append(Violation("DBUS_CONTRACT_UNEXPECTED_PROCESSING_INSTRUCTION",
                                     f"pi {target}"))
 
-    def namespace_decl(prefix: str | None, uri: str) -> None:
-        del uri
-        violations.append(Violation("DBUS_CONTRACT_UNEXPECTED_NAMESPACE",
-                                    f"namespace '{prefix if prefix is not None else 'xmlns'}'"))
+    def start_element(name: str, attrs: dict[str, str]) -> None:
+        if name == "xmlns" or name.startswith("xmlns:"):
+            prefix = name.removeprefix("xmlns").removeprefix(":") or "xmlns"
+            violations.append(Violation("DBUS_CONTRACT_UNEXPECTED_NAMESPACE",
+                                        f"namespace '{prefix}'"))
+        elif ":" in name:
+            violations.append(Violation("DBUS_CONTRACT_UNEXPECTED_NAMESPACE",
+                                        f"element name '{name}'"))
+        for key in attrs:
+            if key == "xmlns" or key.startswith("xmlns:"):
+                prefix = key.removeprefix("xmlns").removeprefix(":") or "xmlns"
+                violations.append(Violation("DBUS_CONTRACT_UNEXPECTED_NAMESPACE",
+                                            f"namespace '{prefix}'"))
+            elif ":" in key:
+                violations.append(Violation("DBUS_CONTRACT_UNEXPECTED_NAMESPACE",
+                                            f"attribute name '{key}'"))
 
     parser.StartDoctypeDeclHandler = doctype
     parser.ProcessingInstructionHandler = processing_instruction
-    parser.StartNamespaceDeclHandler = namespace_decl
+    parser.StartElementHandler = start_element
     try:
         parser.Parse(text, True)
-    except expat.ExpatError:
-        pass  # malformed XML is already reported as DBUS_CONTRACT_MALFORMED_XML
+    except expat.ExpatError as exc:
+        violations.append(Violation("DBUS_CONTRACT_MALFORMED_XML", f"lexical replay {exc}"))
     return violations
 
 
@@ -281,6 +301,8 @@ def check_structure(root: ET.Element) -> list[Violation]:
                 check_text(child.tail, context, "tail")
                 continue
             if child.tag is ET.PI:
+                target = (child.text or "").split(" ", 1)[0]
+                record("DBUS_CONTRACT_UNEXPECTED_PROCESSING_INSTRUCTION", f"pi {target}")
                 check_text(child.tail, context, "tail")
                 continue
             child_context = f"{context}/{segment(child)}"

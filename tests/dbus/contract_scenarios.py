@@ -531,25 +531,59 @@ def case_neg_namespace(root: Path) -> int:
     return 0
 
 
+
+def case_neg_lexical_replay_bypass(root: Path) -> int:
+    # Round-3 review regression: a namespace URI containing the old replay
+    # separator aborted the lexical replay (swallowed ExpatError), hiding both
+    # the declaration and a following processing instruction from validation.
+    for label, opened in (
+            ("pipe-uri",
+             '<node name="/org/custom/AndroidAutoReceiver" xmlns:unused="urn:test|bypass">'),
+            ("pipe-uri-pi",
+             '<node name="/org/custom/AndroidAutoReceiver"'
+             ' xmlns:unused="urn:test|bypass"><?review bypass?>')):
+        markers = ["DBUS_CONTRACT_UNEXPECTED_NAMESPACE"]
+        if label == "pipe-uri-pi":
+            markers.append("DBUS_CONTRACT_UNEXPECTED_PROCESSING_INSTRUCTION")
+        verdict = reject(
+            root,
+            lambda text, opened=opened: text.replace(NODE_OPEN, opened, 1),
+            f"neg-lexical-replay-bypass[{label}]", tuple(markers))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
 def case_neg_invalid_preserves_existing_header(root: Path) -> int:
     # Fail-closed write discipline: codegen must not clobber an existing
     # header when the schema is invalid.
-    scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-"))
-    fixture = scratch / "mutated.xml"
-    changed = (root / CONTRACT).read_text(encoding="utf-8").replace(
-        ANNOTATION_TAG,
-        '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
-        ' value="1.0.0" role="x"/>', 1)
-    fixture.write_text(changed, encoding="utf-8")
-    out = scratch / "existing.generated.hpp"
-    sentinel = b"\x00\x01 sentinel-not-a-header \xfe\xff"
-    out.write_bytes(sentinel)
-    result = run_tool(mode="generate", xml=fixture, out=out)
-    verdict = expect_failure(result, ("DBUS_CONTRACT_UNEXPECTED_ATTRIBUTE",),
-                             "neg-invalid-preserves-existing-header", None)
-    if out.read_bytes() != sentinel:
-        print("neg-invalid-preserves-existing-header: existing header was clobbered")
-        verdict = 1
+    base = (root / CONTRACT).read_text(encoding="utf-8")
+    fixtures = (
+        ("extra-attribute",
+         base.replace(ANNOTATION_TAG,
+                      '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
+                      ' value="1.0.0" role="x"/>', 1),
+         ("DBUS_CONTRACT_UNEXPECTED_ATTRIBUTE",)),
+        ("lexical-bypass",
+         base.replace(NODE_OPEN,
+                      '<node name="/org/custom/AndroidAutoReceiver"'
+                      ' xmlns:unused="urn:test|bypass">', 1),
+         ("DBUS_CONTRACT_UNEXPECTED_NAMESPACE",)),
+    )
+    verdict = 0
+    for label, changed, markers in fixtures:
+        scratch = Path(tempfile.mkdtemp(prefix="dbus-contract-"))
+        fixture = scratch / "mutated.xml"
+        fixture.write_text(changed, encoding="utf-8")
+        out = scratch / "existing.generated.hpp"
+        sentinel = b"\x00\x01 sentinel-not-a-header \xfe\xff"
+        out.write_bytes(sentinel)
+        result = run_tool(mode="generate", xml=fixture, out=out)
+        verdict |= expect_failure(result, markers,
+                                  f"neg-invalid-preserves-existing-header[{label}]", None)
+        if out.read_bytes() != sentinel:
+            print(f"neg-invalid-preserves-existing-header[{label}]: existing header was clobbered")
+            verdict = 1
     return verdict
 
 
@@ -582,6 +616,7 @@ CASES: dict[str, Callable[[Path], int]] = {
     "neg-doctype": case_neg_doctype,
     "neg-processing-instruction": case_neg_processing_instruction,
     "neg-namespace": case_neg_namespace,
+    "neg-lexical-replay-bypass": case_neg_lexical_replay_bypass,
     "neg-invalid-preserves-existing-header": case_neg_invalid_preserves_existing_header,
 }
 

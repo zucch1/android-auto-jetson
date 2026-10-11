@@ -61,6 +61,7 @@ EXPECTED = frozenset({
     'dbus_contract_schema_neg_doctype',
     'dbus_contract_schema_neg_processing_instruction',
     'dbus_contract_schema_neg_namespace',
+    'dbus_contract_schema_neg_lexical_replay_bypass',
     'dbus_contract_schema_neg_invalid_preserves_existing_header',
     'dbus_contract_coverage',
 })
