@@ -10,6 +10,7 @@
 #include <aa/input/SensorService.hpp>
 
 #include <array>
+#include <memory>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -191,6 +192,44 @@ TEST(InputSensorsSensor, NightModeToggleNeverChangesTheCapabilityDescriptor) {
     // neither the toggle nor test fixtures are a silent advertisement.
     EXPECT_EQ(service.descriptor(), CapabilityDescriptor::bench_defaults());
     EXPECT_TRUE(service.descriptor().vehicle_sensors().empty());
+}
+
+TEST(InputSensorsSensor, OwnedDescriptorOutlivesCallerHeapDestruction) {
+    // Given: a heap-allocated descriptor handed to the service and FREED
+    // before the service is used again (the phone target stays alive).
+    PhoneFixture phone;
+    std::unique_ptr<CapabilityDescriptor> heap_descriptor = std::make_unique<CapabilityDescriptor>(
+        CapabilityDescriptor{
+            {InputSource::keyboard_dpad},
+            {19},
+            TouchViewport{1280, 720},
+            {SensorChannel::speed},
+            NightModePolicy::manual,
+        });
+    SensorService service(*heap_descriptor, phone);
+    heap_descriptor.reset();
+
+    // When: the service's descriptor and request path are exercised after the
+    // caller's heap block is gone.
+    const CapabilityDescriptor expected{
+        {InputSource::keyboard_dpad},
+        {19},
+        TouchViewport{1280, 720},
+        {SensorChannel::speed},
+        NightModePolicy::manual,
+    };
+    EXPECT_EQ(service.descriptor(), expected);
+    const auto night = service.submit_request(SensorRequest{SensorChannel::night_mode, 0});
+    service.set_night_mode(true);
+
+    // Then: the service read its OWN descriptor copy and keeps working. A
+    // borrowed descriptor would be a definite freed-heap use-after-free under
+    // memcheck here.
+    EXPECT_EQ(night, (SensorResponse{SensorRequestStatus::accepted}));
+    ASSERT_EQ(phone.sensors.size(), 1U);
+    EXPECT_EQ(phone.sensors.front(),
+              (SensorEvent{SensorChannel::night_mode, 1, SensorOrigin::manual}));
+    EXPECT_EQ(service.emitted(), 1U);
 }
 
 } // namespace

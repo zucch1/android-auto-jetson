@@ -10,6 +10,7 @@
 #include <aa/input/InputService.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -233,6 +234,47 @@ TEST(InputSensorsInput, BenchDefaultsRejectBackAndDpadCenterKeycodes) {
     EXPECT_TRUE(phone.input.empty());
     EXPECT_EQ(service.forwarded(), 0U);
     EXPECT_EQ(service.rejected(), 2U);
+}
+
+TEST(InputSensorsInput, OwnedDescriptorOutlivesCallerHeapDestruction) {
+    // Given: a heap-allocated descriptor handed to the service and FREED
+    // before the service is used again (the phone target stays alive).
+    PhoneFixture phone;
+    std::unique_ptr<CapabilityDescriptor> heap_descriptor = std::make_unique<CapabilityDescriptor>(
+        CapabilityDescriptor{
+            {InputSource::keyboard_dpad, InputSource::mouse_to_touch},
+            {19, 67},
+            TouchViewport{640, 480},
+            {},
+            NightModePolicy::manual,
+        });
+    InputService service(*heap_descriptor, phone);
+    heap_descriptor.reset();
+
+    // When: the service's descriptor and API are exercised after the caller's
+    // heap block is gone.
+    const CapabilityDescriptor expected{
+        {InputSource::keyboard_dpad, InputSource::mouse_to_touch},
+        {19, 67},
+        TouchViewport{640, 480},
+        {},
+        NightModePolicy::manual,
+    };
+    EXPECT_EQ(service.descriptor(), expected);
+    ASSERT_TRUE(service.submit(ipc::InputEvent{ipc::KeyEvent{67, true}}));
+    ASSERT_TRUE(service.submit(
+        ipc::InputEvent{ipc::TouchEvent{900, 900, ipc::TouchAction::down}}));
+
+    // Then: the service read its OWN descriptor copy - sources, keycodes and
+    // viewport all resolve after the caller's destruction. A borrowed
+    // descriptor would be a definite freed-heap use-after-free under
+    // memcheck here.
+    ASSERT_EQ(phone.input.size(), 2U);
+    EXPECT_EQ(phone.input[0], (NormalizedInput{NormalizedKey{67, true}}));
+    EXPECT_EQ(phone.input[1],
+              (NormalizedInput{NormalizedTouch{639, 479, 0, ipc::TouchAction::down}}));
+    EXPECT_EQ(service.forwarded(), 2U);
+    EXPECT_EQ(service.rejected(), 0U);
 }
 
 } // namespace
