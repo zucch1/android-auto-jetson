@@ -383,6 +383,17 @@ TEST(DummyDisplayContractControl, SecondConsumerRejectedAndViewportRoundTrips) {
     ASSERT_FALSE(denied.has_value());
     EXPECT_EQ(denied.error().code(), ErrorCode::ipc_consumer_rejected);
     EXPECT_TRUE(second.value().ping().has_value());
+
+    // And: the failed registration UNWOUND its name acquisition - a third
+    // connection can acquire the rejected client's proposed name WHILE the
+    // rejected client is still alive (the old code left the name owned by the
+    // failed registrant, and a queued request would even inherit it later).
+    auto third = aa::ipc::dbus_adapter::BusConnection::connect_session();
+    ASSERT_TRUE(third.has_value());
+    const auto acquired =
+        third.value().request_name(BusName{"org.custom.DummyDisplayTestB2"});
+    EXPECT_TRUE(acquired.has_value())
+        << "rejected registrant must not keep (or queue) its proposed name";
 }
 
 TEST(DummyDisplayContractRender, ReplayFixtureRendersThroughHelperAndChannel) {
@@ -782,8 +793,8 @@ using aa::ipc::StateSnapshot;
 // One scripted answer for a contract member. `ok` carries the member's
 // payload (RegisterConsumer id / GetState snapshot), `error` is a typed error
 // reply, `withhold` reads the call and never answers (the client sees the
-// real BusIo read timeout) and `malformed` returns a method return with
-// trailing bytes past the declared signature.
+// real BusIo read timeout) and `malformed` returns a wire-valid method return
+// with trailing body bytes past the contract's declared reply payload.
 struct ScriptedReply final {
     enum class Kind { ok, error, withhold, malformed } kind{Kind::ok};
     std::string error_name{"org.custom.AndroidAutoReceiver1.Error.IllegalTransition"};
@@ -872,8 +883,12 @@ private:
         case ScriptedReply::Kind::withhold:
             return;
         case ScriptedReply::Kind::malformed: {
+            // Wire-VALID but contract-malformed: the signature covers the
+            // trailing bytes so the daemon relays the reply, while the
+            // client's strict registration parse must reject the trailing
+            // content past the declared "t" payload.
             bus::MessageWriter writer;
-            writer.reply_serial(message.serial).destination(message.sender).body_signature("t");
+            writer.reply_serial(message.serial).destination(message.sender).body_signature("tu");
             writer.put_u64(reply.consumer).put_u32(0x2A2A2A2A);
             static_cast<void>(connection_->send_message(bus::MessageType::method_return, writer));
             return;
@@ -1289,4 +1304,118 @@ TEST(DummyDisplayStopRecovery, StartupRollbackWithStoppedSnapshotLandsIdle) {
     EXPECT_EQ(started.error().code(), ErrorCode::channel_decode_unavailable);
     EXPECT_EQ(fixture->display().state(), DisplayState::idle);
     EXPECT_FALSE(fixture->display().helper_started());
+}
+
+// ---------------------------------------------------------------------------
+// Registration regressions (PR #36 fix round): the ControlBusClient
+// registration lifecycle on the REAL bus against the test-only scripted
+// receiver - failed registrations must unwind their name acquisition
+// (malformed and withheld replies included), duplicate registrations must
+// not disturb the existing name, and a successful unregister must release
+// the name and permit re-registration. The name queueing assertions need the
+// real daemon (fakes do not model daemon queues).
+namespace {
+
+std::unique_ptr<ControlBusClient> connected_client() {
+    auto client = ControlBusClient::connect();
+    if (!client.has_value()) {
+        return nullptr;
+    }
+    return std::make_unique<ControlBusClient>(std::move(client.value()));
+}
+
+// A raw third-party connection used ONLY to probe real name ownership.
+[[nodiscard]] bool third_party_can_own(const std::string& name) {
+    auto probe = aa::ipc::dbus_adapter::BusConnection::connect_session();
+    if (!probe.has_value()) {
+        return false;
+    }
+    return probe.value().request_name(BusName{name}).has_value();
+}
+
+} // namespace
+
+TEST(DummyDisplayRegistration, MalformedRegistrationReplyUnwindsTheName) {
+    // Given: a scripted receiver whose RegisterConsumer reply carries
+    // trailing bytes past the declared signature.
+    ScriptedReceiver::Script script{};
+    script["RegisterConsumer"] = {ScriptedReply{.kind = ScriptedReply::Kind::malformed,
+                                                .consumer = 1}};
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+    auto client = connected_client();
+    ASSERT_NE(client, nullptr);
+
+    // When: the registration is answered with the malformed reply.
+    const auto registered = client->register_consumer(BusName{"org.custom.DummyDisplayTestRegM"});
+
+    // Then: the typed parse failure is reported and the just-acquired name
+    // was unwound - a third party can own it while the failed client lives.
+    ASSERT_FALSE(registered.has_value());
+    EXPECT_EQ(registered.error().code(), ErrorCode::ipc_malformed_request);
+    EXPECT_TRUE(third_party_can_own("org.custom.DummyDisplayTestRegM"));
+}
+
+TEST(DummyDisplayRegistration, WithheldRegistrationReplyUnwindsTheName) {
+    // Given: a scripted receiver that reads RegisterConsumer and never
+    // answers (the client meets the real BusIo read timeout).
+    ScriptedReceiver::Script script{};
+    script["RegisterConsumer"] = {ScriptedReply{.kind = ScriptedReply::Kind::withhold}};
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+    auto client = connected_client();
+    ASSERT_NE(client, nullptr);
+
+    // When: the registration reply never arrives.
+    const auto registered = client->register_consumer(BusName{"org.custom.DummyDisplayTestRegW"});
+
+    // Then: transport_io is reported and the name was unwound all the same.
+    ASSERT_FALSE(registered.has_value());
+    EXPECT_EQ(registered.error().code(), ErrorCode::transport_io);
+    EXPECT_EQ(receiver->count_calls("RegisterConsumer"), 1U);
+    EXPECT_TRUE(third_party_can_own("org.custom.DummyDisplayTestRegW"));
+}
+
+TEST(DummyDisplayRegistration, DuplicateRegistrationKeepsExistingNameAndUnregisterReleasesIt) {
+    // Given: one successful registration holding its name.
+    ScriptedReceiver::Script script{};
+    script["UnregisterConsumer"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok},
+                                    ScriptedReply{.kind = ScriptedReply::Kind::error}};
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+    auto client = connected_client();
+    ASSERT_NE(client, nullptr);
+    const auto registered = client->register_consumer(BusName{"org.custom.DummyDisplayTestRegD"});
+    ASSERT_TRUE(registered.has_value());
+
+    // When: the SAME client attempts a second registration under a new name.
+    const auto duplicate = client->register_consumer(BusName{"org.custom.DummyDisplayTestRegD2"});
+
+    // Then: the duplicate is rejected BEFORE any remote RegisterConsumer or
+    // name request, and the EXISTING name is untouched (still owned).
+    ASSERT_FALSE(duplicate.has_value());
+    EXPECT_EQ(duplicate.error().code(), ErrorCode::session_illegal_transition);
+    EXPECT_EQ(receiver->count_calls("RegisterConsumer"), 1U);
+    EXPECT_FALSE(third_party_can_own("org.custom.DummyDisplayTestRegD"));
+
+    // When: the registration is unregistered successfully.
+    ASSERT_TRUE(client->unregister_consumer().has_value());
+
+    // Then: the tracked name is released (a third party can own it) and a
+    // fresh registration is allowed again.
+    EXPECT_TRUE(third_party_can_own("org.custom.DummyDisplayTestRegD"));
+    const auto again = client->register_consumer(BusName{"org.custom.DummyDisplayTestRegD"});
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(receiver->count_calls("RegisterConsumer"), 2U);
+
+    // When: a later unregister fails.
+    const auto failed = client->unregister_consumer();
+
+    // Then: the tracked name is RETAINED - a duplicate registration stays
+    // rejected and the name stays owned.
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_FALSE(third_party_can_own("org.custom.DummyDisplayTestRegD"));
+    const auto still = client->register_consumer(BusName{"org.custom.DummyDisplayTestRegD3"});
+    ASSERT_FALSE(still.has_value());
+    EXPECT_EQ(still.error().code(), ErrorCode::session_illegal_transition);
 }

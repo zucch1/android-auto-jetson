@@ -124,6 +124,24 @@ TEST(BusLookup, RequestNameBindsTheWellKnownNameToTheConnection) {
     ASSERT_TRUE(owner.has_value());
     EXPECT_EQ(owner.value(), first.value().unique_name());
     ASSERT_FALSE(denied.has_value());
+
+    // When: the owner releases the name while the refused requester stays
+    // connected (the observer syncs on the daemon's own GetNameOwner).
+    ASSERT_TRUE(first.value().release_name(BusName{kConsumerName}).has_value());
+    ASSERT_TRUE(wait_until_unowned(lookup, BusName{kConsumerName}));
+
+    // Then: the refused request left NO pending ownership behind - with the
+    // old flags=0 request the daemon would have QUEUED the second connection
+    // and handed it the name here. The name is genuinely unowned and a third
+    // connection acquires it explicitly.
+    auto third = bus::BusConnection::connect_session();
+    ASSERT_TRUE(third.has_value());
+    const auto acquired = third.value().request_name(BusName{kConsumerName});
+    ASSERT_TRUE(acquired.has_value()) << "refused requester must not inherit the released name";
+    const auto final_owner = lookup.name_owner(BusName{kConsumerName});
+    ASSERT_TRUE(final_owner.has_value());
+    EXPECT_EQ(final_owner.value(), third.value().unique_name());
+    EXPECT_NE(final_owner.value(), second.value().unique_name());
 }
 
 TEST(BusFlow, RealBusHappyStartStopStateFlowWithDummyConsumer) {

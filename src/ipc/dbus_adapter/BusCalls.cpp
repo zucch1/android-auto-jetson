@@ -10,7 +10,13 @@ namespace aa::ipc::dbus_adapter {
 namespace {
 
 constexpr int kMaxSkippedMessages = 32;
-constexpr std::uint32_t kRequestNameOwned = 1;
+// org.freedesktop.DBus.RequestName wire constants, defined locally with the
+// wire's own names (this adapter intentionally links NO external D-Bus
+// library): the request flag and the four DBUS_REQUEST_NAME_REPLY_* outcomes.
+constexpr std::uint32_t DBUS_NAME_FLAG_DO_NOT_QUEUE = 0x4;
+constexpr std::uint32_t kRequestNamePrimaryOwner = 1;
+constexpr std::uint32_t kRequestNameInQueue = 2;
+constexpr std::uint32_t kRequestNameExists = 3;
 constexpr std::uint32_t kRequestNameAlreadyOwner = 4;
 constexpr std::string_view kDaemonName = "org.freedesktop.DBus";
 constexpr std::string_view kDaemonPath = "/org/freedesktop/DBus";
@@ -113,7 +119,11 @@ core::Result<ParsedMessage> BusConnection::call(std::string_view member,
 
 core::Result<void> BusConnection::request_name(const BusName& name) {
     MessageWriter body;
-    body.put_string(name.value).put_u32(0);
+    // DBUS_NAME_FLAG_DO_NOT_QUEUE: a name held by someone else is refused
+    // EXISTS immediately. Without the flag the daemon QUEUES this connection
+    // for the name - the call reports failure but the pending ownership is
+    // never cancelled and this connection silently becomes the owner later.
+    body.put_string(name.value).put_u32(DBUS_NAME_FLAG_DO_NOT_QUEUE);
     const auto reply = call("RequestName", "su", body);
     if (!reply.has_value()) {
         return reply.error();
@@ -125,10 +135,15 @@ core::Result<void> BusConnection::request_name(const BusName& name) {
     if (!outcome.has_value()) {
         return outcome.error();
     }
-    if (outcome.value() != kRequestNameOwned && outcome.value() != kRequestNameAlreadyOwner) {
+    switch (outcome.value()) {
+    case kRequestNamePrimaryOwner:
+    case kRequestNameAlreadyOwner:
+        return {};
+    case kRequestNameInQueue:
+    case kRequestNameExists:
+    default:
         return Error{ErrorCode::transport_unavailable};
     }
-    return {};
 }
 
 core::Result<void> BusConnection::release_name(const BusName& name) {
