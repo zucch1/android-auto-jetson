@@ -9,15 +9,32 @@
 # an ABSENT module is loaded directly; a failed load or a busy unload is retried
 # on later cycles (the loop never gives up). Poll interval: 5 s + command time.
 #
-# Scope note: the drift check reads the first self-managed section of `iw reg get`,
-# matching the single-wiphy target (phy0 / wlP1p1s0).
+# Scope note: the drift check resolves the wiphy from $IFACE (arg 1, default
+# wlP1p1s0) and inspects that phy's section — it does not assume the first
+# self-managed section, so a second self-managed adapter cannot mask drift.
+IFACE="${1:-wlP1p1s0}"
 while true; do
-  if ! iw reg get 2>/dev/null | sed -n '/self-managed/,$p' | head -3 | grep -q "country US"; then
-    logger -t regd-watchdog "drift detected (phy#0 != country US) — re-asserting"
+  WIPHY_IDX=$(iw dev "$IFACE" info 2>/dev/null | sed -n 's/.*wiphy \([0-9][0-9]*\).*/\1/p')
+  if [ -z "$WIPHY_IDX" ]; then
+    logger -t regd-watchdog "WARN: cannot resolve wiphy for $IFACE — retry next cycle"
+    sleep 5
+    continue
+  fi
+  COUNTRY=$(iw reg get 2>/dev/null | awk -v p="phy#${WIPHY_IDX} (self-managed)" '
+    $0 == p { inphy = 1; next }
+    /^phy#/ { inphy = 0 }
+    inphy && /^country/ { print $2; exit }
+  ')
+  if [ "$COUNTRY" != "US:" ]; then
+    logger -t regd-watchdog "drift detected (phy#${WIPHY_IDX} != country US) — re-asserting"
     if lsmod 2>/dev/null | grep -q '^rtl8822ce_regd_shim'; then
       if rmmod rtl8822ce_regd_shim 2>/dev/null; then
         if modprobe rtl8822ce_regd_shim 2>/dev/null; then
-          STATE=$(iw reg get 2>/dev/null | sed -n '/self-managed/,$p' | head -2 | tr '\n' ' ')
+          STATE=$(iw reg get 2>/dev/null | awk -v p="phy#${WIPHY_IDX} (self-managed)" '
+            $0 == p { inphy = 1; next }
+            /^phy#/ { inphy = 0 }
+            inphy && /^country/ { print; exit }
+          ')
           logger -t regd-watchdog "re-assert ok: ${STATE}"
         else
           logger -t regd-watchdog "ERROR: modprobe failed after unload — retry next cycle"
@@ -27,7 +44,11 @@ while true; do
       fi
     else
       if modprobe rtl8822ce_regd_shim 2>/dev/null; then
-        STATE=$(iw reg get 2>/dev/null | sed -n '/self-managed/,$p' | head -2 | tr '\n' ' ')
+        STATE=$(iw reg get 2>/dev/null | awk -v p="phy#${WIPHY_IDX} (self-managed)" '
+          $0 == p { inphy = 1; next }
+          /^phy#/ { inphy = 0 }
+          inphy && /^country/ { print; exit }
+        ')
         logger -t regd-watchdog "load ok (module was absent): ${STATE}"
       else
         logger -t regd-watchdog "ERROR: modprobe failed (module absent) — retry next cycle"

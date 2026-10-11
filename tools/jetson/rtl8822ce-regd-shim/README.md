@@ -36,12 +36,16 @@ cd tools/jetson/rtl8822ce-regd-shim
 make -C /lib/modules/$(uname -r)/build M=$PWD modules
 sudo install -D -m 0644 rtl8822ce-regd-shim.ko /lib/modules/$(uname -r)/extra/rtl8822ce-regd-shim.ko
 sudo depmod -a
-echo rtl8822ce_regd_shim | sudo tee /etc/modules-load.d/rtl8822ce-regd-shim.conf
 sudo install -m 0755 rtl8822ce-regd-watchdog.sh /usr/local/sbin/rtl8822ce-regd-watchdog
 sudo install -m 0644 rtl8822ce-regd-shim.service rtl8822ce-regd-watchdog.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now rtl8822ce-regd-shim.service rtl8822ce-regd-watchdog.service
 ```
+
+The **device-ordered systemd unit is the sole boot loader** (`rtl8822ce-regd-shim.service`
+waits for the `wlP1p1s0` device unit before modprobe). A `/etc/modules-load.d/` entry is
+deliberately NOT used: it can run before the netdev exists and fail with `-ENODEV`,
+producing an avoidable startup failure and relying on the service to recover.
 
 ## Verify
 
