@@ -16,12 +16,18 @@ Cases:
                 GUI - a fresh status reply and F6 stop completion must both
                 land within their deadlines during the burst, with the typed
                 backpressure result and the delivery-failure count asserted.
+  stopfail (PR #36 F5/F6): a rejected/lost stop - the receiver stops answering
+                mid-projection (SIGSTOP fault injection, no production seam
+                touched) - exposes stop_failed plus the TYPED error through
+                the F6 status, and F5 must issue no second remote
+                StartProjection (proven by the receiver's drained call log).
 """
 
 import json
 import os
 import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -232,6 +238,86 @@ def case_absent(args):
         shutil.rmtree(runtime, ignore_errors=True)
 
 
+def case_stopfail(args):
+    """PR #36 F5/F6: F6 exposes stop_failed + typed error; F5 sends no
+    second remote StartProjection.
+
+    The receiver process is frozen with SIGSTOP so the shipped display's real
+    StopProjection/GetState exchanges hit the real read timeout - the exact
+    never-replying-receiver shape, with no production code seam. SIGCONT at
+    the end drains the receiver's queue so its event log proves what did (and
+    did not) reach the remote side.
+    """
+    runtime = tempfile.mkdtemp(prefix="aa-exec-stopfail-")
+    try:
+        receiver, video, input_sock = start_receiver(args, runtime)
+        display = start_display(args, video, input_sock, False, os.environ.copy())
+        idle = display.await_status(lambda s: s.get("state") == "idle")
+        assert idle["helper_started"] is False, idle
+
+        display.send("start")
+        display.await_status(lambda s: s.get("state") == "projecting")
+        render = display.await_status(
+            lambda s: s.get("frames_presented") == 90
+            and s.get("render_ok") is True
+            and s.get("render_width") == 1280, timeout=30)
+        assert render["state"] == "projecting", render
+
+        # Freeze the receiver: from here the display's contract calls get no
+        # reply at all (the BusIo read timeout is the production behavior).
+        os.kill(receiver.proc.pid, signal.SIGSTOP)
+
+        # When: F6 requests a stop the receiver never answers.
+        display.send("stop")
+
+        # Then: the shipped status exposes stop_failed and the TYPED error
+        # (the real read timeout), exactly as the wiring reports it.
+        failed = display.await_status(
+            lambda s: s.get("state") == "stop_failed"
+            and s.get("last_error") == "stop_failed: StopProjection failed (transport_io)",
+            timeout=30)
+        assert failed["helper_started"] is True, failed
+
+        # When: F5 requests a start while inactivity is unconfirmed.
+        display.send("start")
+
+        # Then: the start is rejected LOCALLY (typed illegal-transition, not a
+        # remote timeout) and the state stays stop_failed.
+        rejected = display.await_status(
+            lambda s: s.get("state") == "stop_failed"
+            and s.get("last_error")
+            == "stop_failed: StartProjection failed (session_illegal_transition)",
+            timeout=30)
+        assert rejected["state"] == "stop_failed", rejected
+
+        # When: the receiver is resumed and drains its queue.
+        os.kill(receiver.proc.pid, signal.SIGCONT)
+
+        # Then: the drained log shows the frozen StopProjection landing - and
+        # NEVER a second remote StartProjection (projection is observed
+        # exactly once, at the original F5).
+        receiver.await_output(
+            lambda o: o.get("event") == "state" and o.get("projection") == "stopped",
+            timeout=30)
+        with receiver.lock:
+            states = [o for o in receiver.events if o.get("event") == "state"]
+        projected = [o for o in states if o.get("projection") == "projecting"]
+        assert len(projected) == 1, states
+        assert display.stop() == 0
+        assert receiver.stop(False) == 0
+    finally:
+        # Never leave a SIGSTOPped receiver behind on a failed assertion.
+        if "receiver" in locals() and receiver.proc.poll() is None:
+            try:
+                os.kill(receiver.proc.pid, signal.SIGCONT)
+                receiver.stop(False)
+            except (ProcessLookupError, OSError):
+                pass
+        if "display" in locals():
+            display.stop()
+        shutil.rmtree(runtime, ignore_errors=True)
+
+
 def case_stalled(args):
     """Gate r3 F1: an unpaced 401-key burst never starves status or F6 stop."""
     runtime = tempfile.mkdtemp(prefix="aa-exec-stalled-")
@@ -322,10 +408,10 @@ def main():
     parser.add_argument("--receiver", required=True)
     parser.add_argument("--fixture", required=True)
     parser.add_argument("--case", required=True,
-                        choices=("replay", "flow", "absent", "stalled"))
+                        choices=("replay", "flow", "absent", "stalled", "stopfail"))
     args = parser.parse_args()
     {"replay": case_replay, "flow": case_flow, "absent": case_absent,
-     "stalled": case_stalled}[args.case](args)
+     "stalled": case_stalled, "stopfail": case_stopfail}[args.case](args)
     print(f"PASS: {args.case}")
     return 0
 

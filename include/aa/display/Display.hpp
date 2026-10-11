@@ -51,15 +51,21 @@ public:
 };
 
 // Display lifecycle as the dummy consumer shows it: no receiver -> unavailable
-// (a shown state in which nothing is started), registered -> idle,
-// projecting -> projecting.
-enum class DisplayState { unavailable, idle, projecting };
+// (a shown state in which nothing is started; also the terminal state after a
+// lost registration), registered -> idle, projecting -> projecting, and a
+// failed StopProjection whose inactivity could NOT be confirmed -> stop_failed.
+// stop_failed is a shown, recoverable state: the projection may still be
+// active remotely, so a new start is prohibited (no second remote
+// StartProjection) while a stop retry is allowed; recovery re-runs the stop
+// and only a confirmed stop releases the media path and returns idle.
+enum class DisplayState { unavailable, idle, projecting, stop_failed };
 
 [[nodiscard]] constexpr std::string_view to_string(DisplayState state) noexcept {
     switch (state) {
     case DisplayState::unavailable: return "unavailable";
     case DisplayState::idle: return "idle";
     case DisplayState::projecting: return "projecting";
+    case DisplayState::stop_failed: return "stop_failed";
     }
     return "unknown";
 }
@@ -141,13 +147,27 @@ public:
 
     // StartProjection through the contract, then connect the todo-22 video
     // channel and open the todo-23 decode session. On any failure the
-    // contract projection is rolled back and the typed error returned.
+    // contract projection is rolled back and the typed ORIGINAL error is
+    // returned (a failed rollback stop is reconciled through GetState and may
+    // leave the controller in stop_failed / unavailable, never a false idle).
+    // Only the idle state may start: a stop_failed controller is prohibited
+    // from requesting a new remote StartProjection until a stop is confirmed.
     [[nodiscard]] core::Result<void> start_projection(const ipc::VideoSocketPath& video_socket);
     // StopProjection through the contract and release the video/decode path.
+    // Accepted from projecting and stop_failed (the recovery retry). Success
+    // releases the media and lands idle. Failure keeps the ORIGINAL error for
+    // the caller and reconciles exactly once through get_state(): same
+    // consumer stopped -> release media, idle (the failure is still reported);
+    // still projecting or the reconciliation itself failed -> media retained,
+    // stop_failed; different/zero consumer -> media released, consumer id
+    // cleared, unavailable. The reconciliation bus exchange runs ONLY after a
+    // stop failure (never per pump/tick).
     [[nodiscard]] core::Result<void> stop_projection();
 
     // Drains the video channel into the decode helper and presents decoded
     // frames to the FrameTarget; returns the frames presented this call.
+    // Allowed in projecting and (media retained) stop_failed under the SAME
+    // video/session preconditions; pump never creates a decoder or session.
     [[nodiscard]] core::Result<std::size_t> pump(core::Milliseconds wait);
 
     // Contract teardown (StopProjection + UnregisterConsumer, best effort)

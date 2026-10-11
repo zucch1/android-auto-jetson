@@ -40,6 +40,7 @@ struct Status final {
     std::uint64_t input_sent{};
     std::uint64_t input_dropped{};
     std::string input_last_error{};
+    std::string last_error{};
     bool render_ok{};
     int render_width{};
     int render_height{};
@@ -136,6 +137,7 @@ private:
         out += ",\"input_sent\":" + std::to_string(s.input_sent);
         out += ",\"input_dropped\":" + std::to_string(s.input_dropped);
         out += ",\"input_last_error\":\"" + s.input_last_error + "\"";
+        out += ",\"last_error\":\"" + s.last_error + "\"";
         out += ",\"render_ok\":";
         out += s.render_ok ? "true" : "false";
         out += ",\"render_width\":" + std::to_string(s.render_width);

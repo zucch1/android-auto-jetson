@@ -12,24 +12,32 @@
 // transitions - never screenshot pixels beyond a smoke render check.
 #include <aa/display/Display.hpp>
 #include <aa/ipc/ControlBusService.hpp>
+#include <aa/ipc/Contract.hpp>
 #include <aa/ipc/InputChannel.hpp>
 #include <aa/ipc/InputSocket.hpp>
 
 #include "ProjectionWidget.hpp"
 
+#include "../../src/ipc/dbus_adapter/BusConnection.hpp"
+
 #include <QApplication>
 #include <QKeyEvent>
 #include <QMouseEvent>
 
+#include <poll.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -201,18 +209,16 @@ public:
     }
 
     // Task-27 PhoneDirectory seam (fail-closed): pairing is always rejected,
-    // cancellation is a no-op and nothing ever expires. Declared against the
-    // task-27 signatures so these become the required overrides the moment
-    // that seam lands in this tree; until then the interface is forget-only.
-    [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId) {
+    // cancellation is a no-op and nothing ever expires.
+    [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId) override {
         return aa::Error{ErrorCode::invalid_argument};
     }
     [[nodiscard]] aa::core::Result<aa::core::PhoneId> pairing_confirmed(
-        aa::core::PairingRequestId) {
+        aa::core::PairingRequestId) override {
         return aa::Error{ErrorCode::invalid_argument};
     }
-    void pairing_cancelled(aa::core::PairingRequestId) {}
-    [[nodiscard]] std::vector<aa::core::PairingRequestId> reap_expired() { return {}; }
+    void pairing_cancelled(aa::core::PairingRequestId) override {}
+    [[nodiscard]] std::vector<aa::core::PairingRequestId> reap_expired() override { return {}; }
 };
 
 struct ServiceHarness final {
@@ -756,4 +762,531 @@ TEST(DummyDisplayContractInput, WidgetEventsTraverseInputSocketToEndpointNormali
     EXPECT_EQ(sender.dropped(), 0U);
     server.value().close();
     ::rmdir(runtime.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Stop-recovery regressions (PR #36 fix round). The tests below drive the
+// failed-stop decision table through a TEST-ONLY scripted contract receiver:
+// a raw BusConnection owning the REAL contract name on the private
+// dbus-run-session bus, answering the wire contract via read_message() /
+// send_reply() (daemon-stamped sender/serial preserved, non-call traffic
+// skipped, teardown bounded). Together with a recording DecodeSession and a
+// real video socket this exercises every failure shape - no production mock
+// interface exists or is added.
+namespace {
+
+namespace bus = aa::ipc::dbus_adapter;
+using aa::ipc::OutboundReply;
+using aa::ipc::StateSnapshot;
+
+// One scripted answer for a contract member. `ok` carries the member's
+// payload (RegisterConsumer id / GetState snapshot), `error` is a typed error
+// reply, `withhold` reads the call and never answers (the client sees the
+// real BusIo read timeout) and `malformed` returns a method return with
+// trailing bytes past the declared signature.
+struct ScriptedReply final {
+    enum class Kind { ok, error, withhold, malformed } kind{Kind::ok};
+    std::string error_name{"org.custom.AndroidAutoReceiver1.Error.IllegalTransition"};
+    std::uint64_t consumer{1};
+    bool projecting{true};
+};
+
+// TEST-ONLY scripted receiver: per-member reply scripts (steps are consumed
+// in order, the last step repeats) plus a call log so tests can prove what
+// did and did not reach the receiver.
+class ScriptedReceiver final {
+public:
+    using Script = std::map<std::string, std::vector<ScriptedReply>>;
+
+    static std::unique_ptr<ScriptedReceiver> start(Script script) {
+        auto receiver = std::unique_ptr<ScriptedReceiver>(new ScriptedReceiver(std::move(script)));
+        auto connected = bus::BusConnection::connect_session();
+        if (!connected.has_value()) {
+            return nullptr;
+        }
+        receiver->connection_.emplace(std::move(connected.value()));
+        const auto owned = receiver->connection_->request_name(
+            BusName{std::string{aa::ipc::kContractBusName}});
+        if (!owned.has_value()) {
+            return nullptr;
+        }
+        receiver->worker_ = std::thread([ptr = receiver.get()] { ptr->run(); });
+        return receiver;
+    }
+
+    ~ScriptedReceiver() {
+        running_.store(false);
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        if (connection_.has_value()) {
+            static_cast<void>(
+                connection_->release_name(BusName{std::string{aa::ipc::kContractBusName}}));
+            connection_.reset();
+        }
+    }
+
+    ScriptedReceiver(const ScriptedReceiver&) = delete;
+    ScriptedReceiver& operator=(const ScriptedReceiver&) = delete;
+
+    [[nodiscard]] std::vector<std::string> calls() const {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return calls_;
+    }
+
+    [[nodiscard]] std::size_t count_calls(const std::string& member) const {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<std::size_t>(std::count(calls_.begin(), calls_.end(), member));
+    }
+
+private:
+    explicit ScriptedReceiver(Script script) : script_(std::move(script)) {}
+
+    static ScriptedReply default_reply(const std::string& member) {
+        ScriptedReply reply{};
+        if (member == "RegisterConsumer") {
+            reply.consumer = 1;
+        }
+        return reply;
+    }
+
+    ScriptedReply next_reply(const std::string& member) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = script_.find(member);
+        if (found == script_.end() || found->second.empty()) {
+            return default_reply(member);
+        }
+        auto& steps = found->second;
+        const std::size_t index = std::min(next_[member], steps.size() - 1);
+        ++next_[member];
+        return steps[index];
+    }
+
+    void handle(const bus::ParsedMessage& message) {
+        const ScriptedReply reply = next_reply(message.member);
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            calls_.push_back(message.member);
+        }
+        switch (reply.kind) {
+        case ScriptedReply::Kind::withhold:
+            return;
+        case ScriptedReply::Kind::malformed: {
+            bus::MessageWriter writer;
+            writer.reply_serial(message.serial).destination(message.sender).body_signature("t");
+            writer.put_u64(reply.consumer).put_u32(0x2A2A2A2A);
+            static_cast<void>(connection_->send_message(bus::MessageType::method_return, writer));
+            return;
+        }
+        case ScriptedReply::Kind::error: {
+            OutboundReply out{};
+            out.is_error = true;
+            out.error_name = reply.error_name;
+            out.body = std::string{"scripted rejection"};
+            static_cast<void>(
+                connection_->send_reply(message.serial, BusName{message.sender}, out));
+            return;
+        }
+        case ScriptedReply::Kind::ok: {
+            OutboundReply out{};
+            if (message.member == "RegisterConsumer") {
+                out.body = reply.consumer;
+            } else if (message.member == "GetState") {
+                out.body = StateSnapshot{
+                    reply.projecting ? ProjectionState::projecting : ProjectionState::stopped,
+                    aa::core::ConsumerId{reply.consumer}};
+            }
+            static_cast<void>(
+                connection_->send_reply(message.serial, BusName{message.sender}, out));
+            return;
+        }
+        }
+    }
+
+    void run() {
+        while (running_.load()) {
+            // Fast-wakeup poll: bounded teardown without touching the
+            // production read timeout; read_message() still owns framing.
+            ::pollfd descriptor{connection_->native_handle(), POLLIN, 0};
+            const int ready = ::poll(&descriptor, 1, 100);
+            if (!running_.load()) {
+                break;
+            }
+            if (ready <= 0) {
+                continue;
+            }
+            auto message = connection_->read_message();
+            if (!message.has_value()) {
+                if (message.error().code() == ErrorCode::transport_closed) {
+                    break;
+                }
+                continue;
+            }
+            if (message.value().type != bus::MessageType::method_call) {
+                continue;
+            }
+            handle(message.value());
+        }
+    }
+
+    Script script_{};
+    std::map<std::string, std::size_t> next_{};
+    std::vector<std::string> calls_{};
+    mutable std::mutex mutex_{};
+    std::optional<bus::BusConnection> connection_{};
+    std::atomic<bool> running_{true};
+    std::thread worker_{};
+};
+
+// Recording DecodeSession: counts every seam call so "session not closed" and
+// "closed exactly once" are directly assertable.
+class RecordingSession final : public DecodeSession {
+public:
+    RecordingSession(int* opens, int* closes, int* submits, int* eofs)
+        : opens_(opens), closes_(closes), submits_(submits), eofs_(eofs) {}
+
+    [[nodiscard]] aa::core::Result<void> submit(const aa::ipc::VideoAccessUnit&) override {
+        ++*submits_;
+        return {};
+    }
+    [[nodiscard]] aa::core::Result<void> end_of_stream() override {
+        ++*eofs_;
+        return {};
+    }
+    [[nodiscard]] aa::core::Result<std::size_t> pump(Milliseconds) override {
+        return std::size_t{0};
+    }
+    void close() noexcept override { ++*closes_; }
+
+private:
+    int* opens_;
+    int* closes_;
+    int* submits_;
+    int* eofs_;
+};
+
+// Real video socket endpoint: start_projection() must connect the production
+// video path, so the tests serve a real SOCK_SEQPACKET channel (one consumer).
+class VideoEndpoint final {
+public:
+    VideoEndpoint() {
+        runtime_ = private_runtime_dir();
+        socket_ = aa::ipc::video_socket_path_in(runtime_);
+        auto server = aa::ipc::VideoServer::listen(
+            socket_, aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
+        if (!server.has_value()) {
+            return;
+        }
+        server_.emplace(std::move(server.value()));
+        holder_ = std::thread([this] {
+            while (running_.load()) {
+                auto producer = server_->accept_consumer(Milliseconds{200});
+                if (!producer.has_value()) {
+                    continue;
+                }
+                while (running_.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+                }
+                producer.value().close();
+            }
+        });
+    }
+
+    ~VideoEndpoint() {
+        running_.store(false);
+        if (holder_.joinable()) {
+            holder_.join();
+        }
+        if (server_.has_value()) {
+            server_->close();
+        }
+        if (!runtime_.empty()) {
+            ::rmdir(runtime_.c_str());
+        }
+    }
+
+    VideoEndpoint(const VideoEndpoint&) = delete;
+    VideoEndpoint& operator=(const VideoEndpoint&) = delete;
+
+    [[nodiscard]] bool ready() const { return server_.has_value(); }
+    [[nodiscard]] const aa::ipc::VideoSocketPath& socket() const { return socket_; }
+
+private:
+    std::string runtime_{};
+    aa::ipc::VideoSocketPath socket_{};
+    std::optional<aa::ipc::VideoServer> server_{};
+    std::atomic<bool> running_{true};
+    std::thread holder_{};
+};
+
+// Common bring-up: scripted receiver + real client + real video socket +
+// recording decode factory, attached but not started.
+class StopFixture final {
+public:
+    static std::unique_ptr<StopFixture> bring_up(const ScriptedReceiver::Script& script,
+                                                 const std::string& suffix,
+                                                 bool fail_decode = false) {
+        auto fixture = std::unique_ptr<StopFixture>(new StopFixture());
+        fixture->fail_decode_ = fail_decode;
+        fixture->receiver = ScriptedReceiver::start(script);
+        if (!fixture->receiver) {
+            return nullptr;
+        }
+        auto client = ControlBusClient::connect();
+        if (!client.has_value()) {
+            return nullptr;
+        }
+        fixture->client = std::make_unique<ControlBusClient>(std::move(client.value()));
+        fixture->video = std::make_unique<VideoEndpoint>();
+        if (!fixture->video->ready()) {
+            return nullptr;
+        }
+        DisplayController::Deps deps{*fixture->client, fixture->recording_factory(),
+                                     fixture->frames};
+        auto controller = DisplayController::attach(std::move(deps), test_config(suffix));
+        if (!controller.has_value()) {
+            return nullptr;
+        }
+        fixture->controller.emplace(std::move(controller.value()));
+        return fixture;
+    }
+
+    [[nodiscard]] DisplayController& display() { return controller.value(); }
+    [[nodiscard]] const aa::ipc::VideoSocketPath& socket() const { return video->socket(); }
+
+    std::unique_ptr<ScriptedReceiver> receiver{};
+    std::unique_ptr<ControlBusClient> client{};
+    std::unique_ptr<VideoEndpoint> video{};
+    RecordingFrameTarget frames{};
+    int opens{0};
+    int closes{0};
+    int submits{0};
+    int eofs{0};
+
+private:
+    StopFixture() = default;
+
+    [[nodiscard]] DecodeSessionFactory recording_factory() {
+        if (fail_decode_) {
+            return [opens = &opens](const aa::consumer::DecodeConfig&)
+                       -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+                ++*opens;
+                return aa::Error{ErrorCode::channel_decode_unavailable};
+            };
+        }
+        return [opens = &opens, closes = &closes, submits = &submits, eofs = &eofs](
+                   const aa::consumer::DecodeConfig&)
+                   -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+            ++*opens;
+            return std::unique_ptr<DecodeSession>(
+                std::make_unique<RecordingSession>(opens, closes, submits, eofs));
+        };
+    }
+
+    bool fail_decode_{false};
+    std::optional<DisplayController> controller{};
+};
+
+} // namespace
+
+TEST(DummyDisplayStopRecovery, RejectedStopRetainsMediaThenRetryRecovers) {
+    // (a) the receiver rejects StopProjection and still reports projecting:
+    // the ORIGINAL error is returned, the media is retained in stop_failed,
+    // a new start is rejected before any remote StartProjection, and a
+    // successful retry closes the media exactly once and lands idle.
+    ScriptedReceiver::Script script{};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::error},
+                                ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    script["GetState"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok, .consumer = 1,
+                                        .projecting = true}};
+    auto fixture = StopFixture::bring_up(script, "StopRejected");
+    ASSERT_NE(fixture, nullptr);
+    ASSERT_EQ(fixture->display().state(), DisplayState::idle);
+    ASSERT_TRUE(fixture->display().start_projection(fixture->socket()).has_value());
+    ASSERT_EQ(fixture->display().state(), DisplayState::projecting);
+
+    // When: the stop is rejected and the snapshot still reports projecting.
+    const auto failed = fixture->display().stop_projection();
+
+    // Then: the original typed error is reported and inactivity stays
+    // unconfirmed - media retained, start prohibited, stop retry allowed.
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error().code(), ErrorCode::session_illegal_transition);
+    EXPECT_EQ(fixture->display().state(), DisplayState::stop_failed);
+    EXPECT_EQ(fixture->closes, 0);
+    EXPECT_TRUE(fixture->display().helper_started());
+    ASSERT_TRUE(fixture->display().pump(Milliseconds{0}).has_value());
+
+    // When: a new start is requested while unconfirmed.
+    const auto denied = fixture->display().start_projection(fixture->socket());
+
+    // Then: it is rejected locally, BEFORE any remote StartProjection.
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(denied.error().code(), ErrorCode::session_illegal_transition);
+    EXPECT_EQ(fixture->receiver->count_calls("StartProjection"), 1U);
+
+    // When: the stop retry succeeds.
+    const auto recovered = fixture->display().stop_projection();
+
+    // Then: media closes exactly once and the state recovers to idle.
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ(fixture->display().state(), DisplayState::idle);
+    EXPECT_EQ(fixture->closes, 1);
+    EXPECT_EQ(fixture->receiver->count_calls("StopProjection"), 2U);
+}
+
+TEST(DummyDisplayStopRecovery, NeverReplyingStopTimesOutThenRetryRecovers) {
+    // (b) the receiver never replies to StopProjection: the client sees the
+    // REAL BusIo read timeout (transport_io), the same stop_failed shape as
+    // (a) results, and the retry recovers.
+    ScriptedReceiver::Script script{};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::withhold},
+                                ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    script["GetState"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok, .consumer = 1,
+                                        .projecting = true}};
+    auto fixture = StopFixture::bring_up(script, "StopTimeout");
+    ASSERT_NE(fixture, nullptr);
+    ASSERT_TRUE(fixture->display().start_projection(fixture->socket()).has_value());
+
+    // When: the stop is never answered.
+    const auto failed = fixture->display().stop_projection();
+
+    // Then: the read timeout is the reported original error and the state is
+    // stop_failed with the media retained.
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error().code(), ErrorCode::transport_io);
+    EXPECT_EQ(fixture->display().state(), DisplayState::stop_failed);
+    EXPECT_EQ(fixture->closes, 0);
+    ASSERT_FALSE(fixture->display().start_projection(fixture->socket()).has_value());
+    EXPECT_EQ(fixture->receiver->count_calls("StartProjection"), 1U);
+
+    // When: the retry is answered.
+    const auto recovered = fixture->display().stop_projection();
+
+    // Then: media closes exactly once and idle returns.
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ(fixture->display().state(), DisplayState::idle);
+    EXPECT_EQ(fixture->closes, 1);
+}
+
+TEST(DummyDisplayStopRecovery, WithheldReplyButStoppedSnapshotRecoversToIdle) {
+    // (c) the stop EXECUTED but its reply was withheld: the snapshot confirms
+    // stopped, so the media is closed exactly once and the state recovers to
+    // idle - while the ORIGINAL transport_io is still returned (the failure
+    // is reported even when reality recovered).
+    ScriptedReceiver::Script script{};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::withhold}};
+    script["GetState"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok, .consumer = 1,
+                                        .projecting = false}};
+    auto fixture = StopFixture::bring_up(script, "StopWithheld");
+    ASSERT_NE(fixture, nullptr);
+    ASSERT_TRUE(fixture->display().start_projection(fixture->socket()).has_value());
+
+    // When: the stop executes but its reply never arrives.
+    const auto failed = fixture->display().stop_projection();
+
+    // Then: the original error is returned, the media is released once and
+    // the confirmed reality (stopped) is the shown state.
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error().code(), ErrorCode::transport_io);
+    EXPECT_EQ(fixture->display().state(), DisplayState::idle);
+    EXPECT_EQ(fixture->closes, 1);
+    EXPECT_EQ(fixture->display().consumer(), aa::core::ConsumerId{1});
+}
+
+TEST(DummyDisplayStopRecovery, StopAndReconciliationBothFailRetainStopFailed) {
+    // (d) the stop fails AND the GetState reconciliation fails: inactivity
+    // stays unconfirmed - media retained, stop_failed.
+    ScriptedReceiver::Script script{};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::error}};
+    script["GetState"] = {ScriptedReply{.kind = ScriptedReply::Kind::error,
+                                        .error_name =
+                                            "org.custom.AndroidAutoReceiver1.Error.PeerUnauthorized"}};
+    auto fixture = StopFixture::bring_up(script, "StopBothFail");
+    ASSERT_NE(fixture, nullptr);
+    ASSERT_TRUE(fixture->display().start_projection(fixture->socket()).has_value());
+
+    // When: both the stop and the reconciliation are rejected.
+    const auto failed = fixture->display().stop_projection();
+
+    // Then: the original stop error is returned and the unconfirmed state
+    // retains the media.
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error().code(), ErrorCode::session_illegal_transition);
+    EXPECT_EQ(fixture->display().state(), DisplayState::stop_failed);
+    EXPECT_EQ(fixture->closes, 0);
+}
+
+TEST(DummyDisplayStopRecovery, LostRegistrationReconcilesToUnavailableAndClearsId) {
+    // (e) the reconciliation snapshot no longer names this consumer (zero or
+    // foreign id): the media is released, the consumer id cleared and the
+    // shown state becomes unavailable.
+    for (const std::uint64_t snapshot_consumer : {0ULL, 999ULL}) {
+        ScriptedReceiver::Script script{};
+        script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::error}};
+        script["GetState"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok,
+                                            .consumer = snapshot_consumer, .projecting = true}};
+        auto fixture = StopFixture::bring_up(script, "StopLost" + std::to_string(snapshot_consumer));
+        ASSERT_NE(fixture, nullptr);
+        ASSERT_TRUE(fixture->display().start_projection(fixture->socket()).has_value());
+
+        // When: the snapshot reports a different/zero consumer.
+        const auto failed = fixture->display().stop_projection();
+
+        // Then: lost registration wins - unavailable, cleared id, media
+        // released exactly once, the ORIGINAL stop error still reported.
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error().code(), ErrorCode::session_illegal_transition);
+        EXPECT_EQ(fixture->display().state(), DisplayState::unavailable);
+        EXPECT_EQ(fixture->display().consumer(), aa::core::ConsumerId{});
+        EXPECT_EQ(fixture->closes, 1);
+    }
+}
+
+TEST(DummyDisplayStopRecovery, StartupRollbackFailureIsNotIdleUnlessStoppedConfirmed) {
+    // (f) startup media failure (decode factory) plus a FAILED rollback stop
+    // whose snapshot still reports projecting: the ORIGINAL startup error is
+    // returned and the state is stop_failed - never a false idle.
+    ScriptedReceiver::Script script{};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::error}};
+    script["GetState"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok, .consumer = 1,
+                                        .projecting = true}};
+    auto fixture = StopFixture::bring_up(script, "StopStartupFail", true);
+    ASSERT_NE(fixture, nullptr);
+
+    // When: projection start fails at the decode factory and the rollback
+    // stop is rejected.
+    const auto started = fixture->display().start_projection(fixture->socket());
+
+    // Then: the original startup error is preserved and the state is NOT
+    // idle (inactivity unconfirmed), with no session ever started.
+    ASSERT_FALSE(started.has_value());
+    EXPECT_EQ(started.error().code(), ErrorCode::channel_decode_unavailable);
+    EXPECT_EQ(fixture->display().state(), DisplayState::stop_failed);
+    EXPECT_FALSE(fixture->display().helper_started());
+    EXPECT_EQ(fixture->opens, 1);
+    EXPECT_EQ(fixture->closes, 0);
+}
+
+TEST(DummyDisplayStopRecovery, StartupRollbackWithStoppedSnapshotLandsIdle) {
+    // (f, confirmed variant) the rollback stop is rejected but the snapshot
+    // confirms stopped: the ORIGINAL startup error is still returned while
+    // the state is allowed to land idle (stopped was confirmed).
+    ScriptedReceiver::Script script{};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::error}};
+    script["GetState"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok, .consumer = 1,
+                                        .projecting = false}};
+    auto fixture = StopFixture::bring_up(script, "StopStartupStop", true);
+    ASSERT_NE(fixture, nullptr);
+
+    // When: projection start fails and the rollback stop is rejected while
+    // the snapshot reports stopped.
+    const auto started = fixture->display().start_projection(fixture->socket());
+
+    // Then: the original error is preserved and the confirmed reality (idle)
+    // is the shown state.
+    ASSERT_FALSE(started.has_value());
+    EXPECT_EQ(started.error().code(), ErrorCode::channel_decode_unavailable);
+    EXPECT_EQ(fixture->display().state(), DisplayState::idle);
+    EXPECT_FALSE(fixture->display().helper_started());
 }

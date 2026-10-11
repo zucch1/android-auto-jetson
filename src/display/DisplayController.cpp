@@ -73,6 +73,48 @@ struct DisplayController::Impl final {
         }
         eof = false;
     }
+
+    // Failed-stop reconciliation: exactly ONE GetState exchange, run ONLY
+    // after a failed stop (never per pump/tick). The snapshot decides the
+    // state per the decision table and releases or retains the media to
+    // match: same consumer stopped -> media released, idle; still projecting
+    // or the reconciliation itself failed -> media RETAINED, stop_failed;
+    // different/zero consumer (lost registration) -> media released, consumer
+    // id cleared, unavailable.
+    void reconcile_failed_stop() noexcept {
+        const auto snapshot = control.get_state();
+        if (!snapshot.has_value()) {
+            state = DisplayState::stop_failed;
+            return;
+        }
+        if (snapshot.value().consumer == core::ConsumerId{} ||
+            snapshot.value().consumer != consumer) {
+            release_media();
+            consumer = core::ConsumerId{};
+            state = DisplayState::unavailable;
+            return;
+        }
+        if (snapshot.value().projection == ipc::ProjectionState::stopped) {
+            release_media();
+            state = DisplayState::idle;
+            return;
+        }
+        state = DisplayState::stop_failed;
+    }
+
+    // Startup rollback: unwind the just-started remote projection with a
+    // best-effort stop whose failure is reconciled exactly like an operator
+    // stop failure (media already unwound by the caller); the caller always
+    // preserves the ORIGINAL startup error. A confirmed stop simply keeps the
+    // pre-start idle state.
+    void rollback_projection_start() noexcept {
+        const auto stopped = control.stop_projection();
+        if (!stopped.has_value()) {
+            reconcile_failed_stop();
+            return;
+        }
+        state = DisplayState::idle;
+    }
 };
 
 core::Result<DisplayController> DisplayController::attach(Deps deps, DisplayConfig config) {
@@ -136,7 +178,7 @@ core::Result<void> DisplayController::start_projection(const ipc::VideoSocketPat
     auto connected = ipc::connect_video_consumer(
         video_socket, ipc::VideoClientOptions{{}, ipc::current_uid(), Milliseconds{5000}});
     if (!connected.has_value()) {
-        static_cast<void>(impl_->control.stop_projection());
+        impl_->rollback_projection_start();
         return connected.error();
     }
     consumer::DecodeConfig decode_config{};
@@ -149,9 +191,8 @@ core::Result<void> DisplayController::start_projection(const ipc::VideoSocketPat
     auto session = impl_->decode_sessions(decode_config);
     if (!session.has_value()) {
         impl_->video.emplace(std::move(connected.value()));
-        impl_->video->close();
-        impl_->video.reset();
-        static_cast<void>(impl_->control.stop_projection());
+        impl_->release_media();
+        impl_->rollback_projection_start();
         return session.error();
     }
     impl_->video.emplace(std::move(connected.value()));
@@ -166,21 +207,29 @@ core::Result<void> DisplayController::stop_projection() {
     if (!impl_) {
         return Error{ErrorCode::transport_closed};
     }
-    if (impl_->state != DisplayState::projecting) {
+    if (impl_->state != DisplayState::projecting && impl_->state != DisplayState::stop_failed) {
         return Error{ErrorCode::session_illegal_transition};
     }
     const auto stopped = impl_->control.stop_projection();
-    impl_->release_media();
-    impl_->state = DisplayState::idle;
-    return stopped;
+    if (stopped.has_value()) {
+        impl_->release_media();
+        impl_->state = DisplayState::idle;
+        return {};
+    }
+    // Failure: reconcile once through GetState and still return the ORIGINAL
+    // stop error (the failure is reported even when the snapshot confirms the
+    // stop landed and the state is recovered to idle).
+    impl_->reconcile_failed_stop();
+    return stopped.error();
 }
 
 core::Result<std::size_t> DisplayController::pump(Milliseconds wait) {
     if (!impl_) {
         return Error{ErrorCode::transport_closed};
     }
-    if (impl_->state != DisplayState::projecting || !impl_->video.has_value() ||
-        !impl_->session) {
+    const bool pumpable =
+        impl_->state == DisplayState::projecting || impl_->state == DisplayState::stop_failed;
+    if (!pumpable || !impl_->video.has_value() || !impl_->session) {
         return Error{ErrorCode::session_illegal_transition};
     }
     for (std::size_t step = 0; step < kReceiveBudget; ++step) {
@@ -222,9 +271,16 @@ void DisplayController::shutdown() noexcept {
     if (!impl_) {
         return;
     }
-    if (impl_->state == DisplayState::projecting) {
+    if (impl_->state == DisplayState::projecting || impl_->state == DisplayState::stop_failed) {
+        // Best-effort contract teardown (stop + unregister) then media
+        // release and cleared state - stop_failed is handled DIRECTLY here,
+        // never via a temporary idle, and teardown runs no reconciliation.
         static_cast<void>(impl_->control.stop_projection());
-        impl_->state = DisplayState::idle;
+        static_cast<void>(impl_->control.unregister_consumer());
+        impl_->release_media();
+        impl_->state = DisplayState::unavailable;
+        impl_->consumer = core::ConsumerId{};
+        return;
     }
     impl_->release_media();
     if (impl_->state == DisplayState::idle) {

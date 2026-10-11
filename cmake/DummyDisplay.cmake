@@ -148,9 +148,14 @@ if(NOT CMAKE_CROSSCOMPILING)
         "$<TARGET_FILE:aa_dummy_display_test>" --gtest_filter=DummyDisplayContractIdle.*)
     add_test(NAME dummy_display_contract_autostart COMMAND "${AA_DBUS_RUN_SESSION}" --
         "$<TARGET_FILE:aa_dummy_display_test>" --gtest_filter=DummyDisplayContractAutostart.*)
+    # Stop-recovery regressions (PR #36 fix round): the failed-stop decision
+    # table against a test-only scripted receiver (real contract name, real
+    # read timeouts, recording decode session, real video socket).
+    add_test(NAME dummy_display_stop_recovery COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "$<TARGET_FILE:aa_dummy_display_test>" --gtest_filter=DummyDisplayStopRecovery.*)
     set_tests_properties(dummy_display_contract_control dummy_display_contract_render
         dummy_display_contract_input dummy_display_contract_absent dummy_display_contract_idle
-        dummy_display_contract_autostart
+        dummy_display_contract_autostart dummy_display_stop_recovery
         PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
             TIMEOUT 180)
@@ -162,7 +167,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     # helper process/request and no AP/network change with no receiver (F5);
     # stalled asserts an UNPACED 401-key burst against a same-UID accept-but-
     # don't-read input endpoint never starves status or F6 stop (gate review F1).
-    foreach(case replay flow absent stalled)
+    foreach(case replay flow absent stalled stopfail)
         add_test(NAME dummy_display_exec_${case} COMMAND "${AA_DBUS_RUN_SESSION}" --
             "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/display/executable_display_test.py"
