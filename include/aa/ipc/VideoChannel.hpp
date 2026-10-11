@@ -182,7 +182,11 @@ public:
     // Binds and listens after prepare_video_socket_path; a path held by a
     // live endpoint or a non-socket node is refused transport_unavailable and
     // a failure to secure the new node to 0600 is transport_io with the node
-    // removed again (fail closed).
+    // removed again (fail closed). Cooperating concurrent starts serialize
+    // on a per-path startup lock (flock on a stable <path>.lock inode beside
+    // the socket, never deleted) held across prepare, bind and listen, so
+    // exactly one of them binds; noncooperating same-UID mutation of the
+    // lock/socket is out of scope (0700 dir + peer-cred admission).
     [[nodiscard]] static core::Result<VideoServer> listen(const VideoSocketPath& path,
                                                           const VideoServerOptions& options);
 

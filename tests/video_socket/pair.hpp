@@ -5,7 +5,9 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <string>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <thread>
@@ -19,6 +21,22 @@ inline std::string private_runtime_dir() {
     char pattern[] = "/tmp/aa-video-XXXXXX";
     const char* dir = ::mkdtemp(pattern);
     return dir == nullptr ? std::string{} : std::string{dir};
+}
+
+// Test-only reap of the startup lock file beside `socket_path`. Production
+// never deletes that file (the stable inode is the lock); a test owns its
+// whole runtime dir and may remove it at teardown, but only while holding
+// the flock and only once every starter thread has been joined (callers
+// guarantee no waiter remains).
+inline void remove_startup_lock(const std::string& socket_path) {
+    const std::string lock_path = socket_path + ".lock";
+    const int fd = ::open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    (void)::flock(fd, LOCK_EX);
+    (void)::unlink(lock_path.c_str());
+    ::close(fd);
 }
 
 // Binds (but never listens) a seqpacket socket node at `path` and closes the
@@ -69,6 +87,9 @@ struct Pair final {
         consumer.close();
         server.close();
         if (!runtime_dir.empty()) {
+            const auto path = aa::ipc::video_socket_path_in(runtime_dir);
+            remove_startup_lock(path.value);
+            ::rmdir((runtime_dir + "/android-auto-receiver").c_str());
             ::rmdir(runtime_dir.c_str());
         }
     }

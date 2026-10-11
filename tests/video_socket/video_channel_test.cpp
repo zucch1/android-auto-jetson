@@ -115,6 +115,8 @@ TEST(VideoStream, SocketPathAndDirectoryPreparation) {
     EXPECT_NE(info.st_mode & S_IFSOCK, 0U);
     EXPECT_EQ(info.st_mode & 0777, 0600U);
     server.value().close();
+    videotest::remove_startup_lock(path.value);
+    ::rmdir(directory.c_str());
     ::rmdir(runtime.c_str());
 }
 
@@ -246,6 +248,7 @@ TEST(VideoStream, ConnectDeadlineIsEnforcedOnSaturatedBacklog) {
 
     server.value().close();
     ::unlink(path.value.c_str());
+    videotest::remove_startup_lock(path.value);
     ::rmdir((runtime + "/android-auto-receiver").c_str());
     ::rmdir(runtime.c_str());
 }
@@ -299,6 +302,7 @@ TEST(VideoStream, ConnectDeadlineIsEnforcedDuringSignalStorm) {
 
     server.value().close();
     ::unlink(path.value.c_str());
+    videotest::remove_startup_lock(path.value);
     ::rmdir((runtime + "/android-auto-receiver").c_str());
     ::rmdir(runtime.c_str());
 }
@@ -386,6 +390,7 @@ TEST(VideoStream, ConcurrentConsumersAreIndependent) {
     server.value().close();
     struct stat info {};
     EXPECT_NE(::stat(path.value.c_str(), &info), 0);
+    videotest::remove_startup_lock(path.value);
     ::rmdir((runtime + "/android-auto-receiver").c_str());
     ::rmdir(runtime.c_str());
 }

@@ -71,6 +71,7 @@ std::string directory_of(const VideoSocketPath& path) {
 
 void cleanup_runtime(const std::string& runtime, const std::string& leaf) {
     ::unlink(leaf.c_str());
+    videotest::remove_startup_lock(leaf);
     ::rmdir((runtime + "/android-auto-receiver").c_str());
     ::rmdir(runtime.c_str());
 }

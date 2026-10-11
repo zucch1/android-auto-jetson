@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -140,6 +141,73 @@ void unlink_owned_endpoint(const std::string& path, const EndpointIdentity& iden
     }
     ::unlink(path.c_str());
 }
+
+// Per-path startup lock for VideoServer::listen: cooperating same-path
+// starters serialize on flock(LOCK_EX) over a stable lock inode beside the
+// socket (<path>.lock), so the prepare/probe/unlink/bind sequence can never
+// interleave between them and exactly one of them binds. The lock file is
+// created O_CREAT and never deleted - the stable inode IS the lock identity
+// (recreating it would let racers lock different inodes). It is a regular
+// file at its own name: the stale-node probe and close() only ever touch the
+// socket path, so it confuses neither. flock releases on close even if the
+// holder dies, so a crash cannot wedge later starters.
+class StartupLock final {
+public:
+    StartupLock() = default;
+    StartupLock(const StartupLock&) = delete;
+    StartupLock& operator=(const StartupLock&) = delete;
+    StartupLock(StartupLock&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+    StartupLock& operator=(StartupLock&& other) noexcept {
+        if (this != &other) {
+            release();
+            fd_ = other.fd_;
+            other.fd_ = -1;
+        }
+        return *this;
+    }
+    ~StartupLock() { release(); }
+
+    static core::Result<StartupLock> acquire(const std::string& socket_path) noexcept {
+        const auto slash = socket_path.find_last_of('/');
+        if (slash == std::string::npos) {
+            return Error{ErrorCode::invalid_argument};
+        }
+        // The lock lives beside the socket, so its directory must exist
+        // before prepare_video_socket_path has run; create it exactly as
+        // prepare does and let prepare's own checks validate it afterwards.
+        const std::string directory = socket_path.substr(0, slash);
+        if (::mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) {
+            return Error{ErrorCode::transport_unavailable};
+        }
+        const std::string lock_path = socket_path + ".lock";
+        const int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            return io_error();
+        }
+        int status;
+        do {
+            status = ::flock(fd, LOCK_EX);
+        } while (status != 0 && errno == EINTR);
+        if (status != 0) {
+            ::close(fd);
+            return io_error();
+        }
+        StartupLock lock;
+        lock.fd_ = fd;
+        return lock;
+    }
+
+private:
+    void release() noexcept {
+        if (fd_ >= 0) {
+            ::flock(fd_, LOCK_UN);
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    int fd_{-1};
+};
 
 enum class EndpointState : std::uint8_t { missing, stale, occupied };
 
@@ -341,12 +409,11 @@ core::Result<void> prepare_video_socket_path(const VideoSocketPath& path) {
     case EndpointState::occupied:
         return Error{ErrorCode::transport_unavailable};
     }
-    // Identity-checked unlink: a same-UID racer that rebound the path after
-    // the probe keeps its live node (different inode), so concurrent listen()
-    // resolves to exactly one winner instead of stealing the endpoint. The
-    // stale probe and this unlink are not one atomic step; a racer inside that
-    // window crosses no privilege boundary (0700 directory, same-UID peer
-    // cred) and is out of scope.
+    // Identity-checked unlink keeps stale cleanup bound to the probed
+    // endpoint and stays inside the startup-lock critical section as defense.
+    // Residual: noncooperating same-UID mutation of the lock/socket is out of
+    // scope (0700 dir + peer-cred admission); cooperating concurrent starts
+    // serialize on the per-path startup lock.
     unlink_owned_endpoint(path.value, identity);
     return {};
 }
@@ -620,6 +687,14 @@ VideoServer::~VideoServer() { close(); }
 
 core::Result<VideoServer> VideoServer::listen(const VideoSocketPath& path,
                                               const VideoServerOptions& options) {
+    // The startup lock is held across the whole prepare/bind/listen section
+    // and released when this function returns: cooperating same-path starters
+    // serialize here, so the kernel bind race is impossible among them and
+    // exactly one of them wins.
+    auto startup = StartupLock::acquire(path.value);
+    if (!startup) {
+        return startup.error();
+    }
     if (auto prepared = prepare_video_socket_path(path); !prepared) {
         return prepared.error();
     }
