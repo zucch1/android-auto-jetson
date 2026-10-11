@@ -199,6 +199,20 @@ public:
     [[nodiscard]] aa::core::Result<void> forget(aa::core::PhoneId) override {
         return aa::Error{ErrorCode::invalid_argument};
     }
+
+    // Task-27 PhoneDirectory seam (fail-closed): pairing is always rejected,
+    // cancellation is a no-op and nothing ever expires. Declared against the
+    // task-27 signatures so these become the required overrides the moment
+    // that seam lands in this tree; until then the interface is forget-only.
+    [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId) {
+        return aa::Error{ErrorCode::invalid_argument};
+    }
+    [[nodiscard]] aa::core::Result<aa::core::PhoneId> pairing_confirmed(
+        aa::core::PairingRequestId) {
+        return aa::Error{ErrorCode::invalid_argument};
+    }
+    void pairing_cancelled(aa::core::PairingRequestId) {}
+    [[nodiscard]] std::vector<aa::core::PairingRequestId> reap_expired() { return {}; }
 };
 
 struct ServiceHarness final {
