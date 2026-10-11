@@ -35,11 +35,12 @@ jobs:
             libprotobuf-dev protobuf-compiler libboost-system-dev libboost-log-dev \
             libssl-dev libusb-1.0-0-dev pkg-config libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
-            g++-aarch64-linux-gnu binutils
+            qt6-base-dev g++-aarch64-linux-gnu binutils
           protoc --version
           dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \
             libboost-log-dev libssl-dev libusb-1.0-0-dev libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
+            qt6-base-dev
           gst-inspect-1.0 openh264dec
           gst-inspect-1.0 h264parse
       - name: Fetch and verify locked GoogleTest archive
