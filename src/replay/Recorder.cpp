@@ -194,11 +194,7 @@ core::Result<void> Recorder::record_input(core::Nanoseconds t, const InputRecord
     if (const auto admitted = admit(t, input.payload.size()); !admitted) {
         return admitted.error();
     }
-    Record record;
-    record.kind = RecordKind::input;
-    record.t = t;
-    record.body = input;
-    fixture_.records.push_back(std::move(record));
+    fixture_.records.push_back(Record{.kind = RecordKind::input, .t = t, .body = input});
     return {};
 }
 
