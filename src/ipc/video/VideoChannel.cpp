@@ -142,6 +142,23 @@ void unlink_owned_endpoint(const std::string& path, const EndpointIdentity& iden
     ::unlink(path.c_str());
 }
 
+// Directory-boundary validation shared by StartupLock::acquire and
+// prepare_video_socket_path (idempotent, runs on both paths): lstat so a
+// symlinked directory is refused rather than followed, a real directory,
+// owned by the caller, exact 0700 mode. StartupLock runs this BEFORE the
+// lock file is opened or flocked, so an unvalidated directory can never
+// host the lock or wedge a starter behind a flock held there.
+core::Result<void> validate_runtime_directory(const std::string& directory) noexcept {
+    struct stat info {};
+    if (::lstat(directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) {
+        return Error{ErrorCode::transport_unavailable};
+    }
+    if (info.st_uid != ::getuid() || (info.st_mode & 0777) != 0700) {
+        return Error{ErrorCode::transport_unavailable};
+    }
+    return {};
+}
+
 // Per-path startup lock for VideoServer::listen: cooperating same-path
 // starters serialize on flock(LOCK_EX) over a stable lock inode beside the
 // socket (<path>.lock), so the prepare/probe/unlink/bind sequence can never
@@ -174,10 +191,17 @@ public:
         }
         // The lock lives beside the socket, so its directory must exist
         // before prepare_video_socket_path has run; create it exactly as
-        // prepare does and let prepare's own checks validate it afterwards.
+        // prepare does. The directory boundary is validated BEFORE the lock
+        // file is opened or flocked: an unvalidated directory (foreign
+        // owner, wrong mode, or a symlink) must fail transport_unavailable
+        // without creating a lock in it and without ever waiting on a flock
+        // that may be held there.
         const std::string directory = socket_path.substr(0, slash);
         if (::mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) {
             return Error{ErrorCode::transport_unavailable};
+        }
+        if (auto validated = validate_runtime_directory(directory); !validated) {
+            return validated.error();
         }
         const std::string lock_path = socket_path + ".lock";
         const int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
@@ -381,12 +405,8 @@ core::Result<void> prepare_video_socket_path(const VideoSocketPath& path) {
     if (::mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) {
         return Error{ErrorCode::transport_unavailable};
     }
-    struct stat info {};
-    if (::lstat(directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) {
-        return Error{ErrorCode::transport_unavailable};
-    }
-    if (info.st_uid != ::getuid() || (info.st_mode & 0777) != 0700) {
-        return Error{ErrorCode::transport_unavailable};
+    if (auto validated = validate_runtime_directory(directory); !validated) {
+        return validated.error();
     }
     struct stat node {};
     if (::lstat(path.value.c_str(), &node) != 0) {

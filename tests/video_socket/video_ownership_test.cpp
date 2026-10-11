@@ -8,6 +8,7 @@
 #include <array>
 #include <barrier>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -18,7 +19,9 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <optional>
+#include <signal.h>
 #include <string>
+#include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -386,4 +389,99 @@ TEST(VideoOwnership, ConcurrentListenHasExactlyOneWinner) {
         EXPECT_FALSE(node_exists(path.value));
         cleanup_runtime(runtime, path.value);
     }
+}
+
+TEST(VideoOwnership, ListenRejectsWrongModeDirectoryWithoutCreatingLock) {
+    const std::string runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    const std::string directory = directory_of(path);
+    ASSERT_EQ(::mkdir(directory.c_str(), 0700), 0);
+    ASSERT_EQ(::chmod(directory.c_str(), 0755), 0);
+
+    const auto refused = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unavailable);
+    EXPECT_FALSE(node_exists(path.value + ".lock")) << "no lock in an unvalidated directory";
+    EXPECT_FALSE(node_exists(path.value));
+
+    cleanup_runtime(runtime, path.value);
+}
+
+TEST(VideoOwnership, ListenRejectsSymlinkedDirectoryWithoutCreatingLock) {
+    const std::string runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    const std::string directory = directory_of(path);
+    const std::string target = runtime + "/victim";
+    ASSERT_EQ(::mkdir(target.c_str(), 0700), 0);
+    ASSERT_EQ(::symlink(target.c_str(), directory.c_str()), 0);
+
+    const auto refused = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unavailable);
+    EXPECT_FALSE(node_exists(target + "/video.sock.lock"))
+        << "no lock created through the symlinked directory";
+    EXPECT_FALSE(node_exists(target + "/video.sock"));
+
+    ::unlink(directory.c_str());
+    ::rmdir(target.c_str());
+    ::rmdir(runtime.c_str());
+}
+
+// A child holds flock(LOCK_EX) on the lock path inside a wrong-mode
+// directory and keeps it for a bounded window: listen must refuse at the
+// directory checks without ever waiting on that flock. If validation ever
+// slips behind the flock again, listen unblocks only when the child exits
+// and the elapsed bound fails deterministically instead of hanging.
+TEST(VideoOwnership, ListenRejectsHeldLockInInvalidDirectoryWithoutBlocking) {
+    const std::string runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    const std::string directory = directory_of(path);
+    ASSERT_EQ(::mkdir(directory.c_str(), 0700), 0);
+    ASSERT_EQ(::chmod(directory.c_str(), 0755), 0);
+    const std::string lock_path = path.value + ".lock";
+
+    int ready[2] = {-1, -1};
+    ASSERT_EQ(::pipe(ready), 0);
+    const pid_t child = ::fork();
+    ASSERT_NE(child, -1);
+    if (child == 0) {
+        ::close(ready[0]);
+        const int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            ::_exit(1);
+        }
+        if (::flock(fd, LOCK_EX) != 0) {
+            ::_exit(2);
+        }
+        (void)::write(ready[1], "x", 1);
+        ::sleep(5);
+        ::_exit(0);
+    }
+    ::close(ready[1]);
+    char held = 0;
+    const bool child_holds = ::read(ready[0], &held, 1) == 1;
+    ::close(ready[0]);
+    int status = 0;
+    if (!child_holds) {
+        (void)::kill(child, SIGKILL);
+        (void)::waitpid(child, &status, 0);
+        FAIL() << "child never reported holding the flock";
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto refused = VideoServer::listen(path, VideoServerOptions{{}, current_uid()});
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    (void)::kill(child, SIGKILL);
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unavailable);
+    EXPECT_LT(elapsed.count(), 1000);
+
+    cleanup_runtime(runtime, path.value);
 }
