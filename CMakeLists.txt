@@ -145,6 +145,10 @@ include(cmake/ConsumerDecode.cmake)
 # Task 24 dummy display follows the consumer: its host chain requires
 # TARGET aareceiver-consumer (see the integration contract in the module).
 include(cmake/DummyDisplay.cmake)
+# Task 25 audio pipeline loads cmake/DecodeDependencies.cmake itself (the
+# sanctioned target GStreamer metadata binding) and is placed after the
+# decode-probe subproject, per its integration contract.
+include(cmake/AudioPipeline.cmake)
 if(NOT CMAKE_CROSSCOMPILING)
     if(NOT BUILD_TESTING)
         message(FATAL_ERROR "AA_DECODE_COVERAGE: native builds require BUILD_TESTING=ON")
