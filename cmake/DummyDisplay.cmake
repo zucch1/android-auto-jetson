@@ -203,8 +203,13 @@ if(NOT CMAKE_CROSSCOMPILING)
     # -> input -> stop without the autostart flag (F2/F4); absent asserts no
     # helper process/request and no AP/network change with no receiver (F5);
     # stalled asserts an UNPACED 401-key burst against a same-UID accept-but-
-    # don't-read input endpoint never starves status or F6 stop (gate review F1).
-    foreach(case replay flow absent stalled stopfail)
+    # don't-read input endpoint never starves status or F6 stop (gate review F1);
+    # stopfail covers the never-replying stop (SIGSTOP, transport_io timeout);
+    # stopreject covers the REJECTED stop through the test-only scripted
+    # receiver MODE (aa-test-receiver --mode reject-first-stop) - stop_failed
+    # plus the typed rejection, no second remote StartProjection, and the
+    # accepted retry landing idle with the widget error cleared.
+    foreach(case replay flow absent stalled stopfail stopreject)
         add_test(NAME dummy_display_exec_${case} COMMAND "${AA_DBUS_RUN_SESSION}" --
             "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/display/executable_display_test.py"
