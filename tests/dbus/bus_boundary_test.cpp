@@ -286,6 +286,10 @@ TEST(BusBoundary, SignalWithControlMemberCannotChangeState) {
     ASSERT_TRUE(ping.has_value());
     ASSERT_EQ(ping.value().type, bus::MessageType::method_return);
     ASSERT_EQ(ping.value().signature, "t");
+    bus::Cursor ping_cursor(ping.value().body);
+    const auto ping_payload = ping_cursor.read_u64();
+    ASSERT_TRUE(ping_payload.has_value());
+    EXPECT_TRUE(ping_cursor.done());
 }
 
 TEST(BusBoundary, WrongPathMethodCallCannotChangeState) {
@@ -336,6 +340,10 @@ TEST(BusBoundary, WrongPathMethodCallCannotChangeState) {
     ASSERT_TRUE(ping.has_value());
     ASSERT_EQ(ping.value().type, bus::MessageType::method_return);
     ASSERT_EQ(ping.value().signature, "t");
+    bus::Cursor ping_cursor(ping.value().body);
+    const auto ping_payload = ping_cursor.read_u64();
+    ASSERT_TRUE(ping_payload.has_value());
+    EXPECT_TRUE(ping_cursor.done());
 }
 
 TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
