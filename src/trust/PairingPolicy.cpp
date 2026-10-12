@@ -50,7 +50,46 @@ std::vector<core::PairingRequestId> PairingPolicy::reap_expired() {
 }
 
 core::Result<void> PairingPolicy::forget(core::PhoneId phone) {
-    return store_.forget_phone(phone);
+    // The revocation invalidates every outstanding request bound to the SAME
+    // canonical identity. Matching is by identity_key (never variant equality
+    // or phone id) and is prepared BEFORE persistence: the ids are dropped
+    // and exposed only after the revocation lands (durable success or the
+    // committed-but-not-durable error), so a pre-replacement failure leaves
+    // the pending table and the invalidated buffer untouched.
+    std::optional<std::string> key;
+    for (const auto& entry : store_.phones()) {
+        if (entry.phone_id == phone) {
+            key = identity_key(entry.identity);
+            break;
+        }
+    }
+    std::vector<core::PairingRequestId> doomed;
+    if (key.has_value()) {
+        for (const auto& pending : pending_) {
+            if (identity_key(pending.identity) == key.value()) {
+                doomed.push_back(pending.request);
+            }
+        }
+    }
+    const auto saved = store_.forget_phone(phone);
+    const bool landed = saved.has_value() ||
+                        saved.error().code() == ErrorCode::trust_store_not_durable;
+    if (landed) {
+        for (const auto request : doomed) {
+            const std::size_t index = find(request);
+            if (index < pending_.size()) {
+                drop_at(index);
+            }
+            invalidated_.push_back(request);
+        }
+    }
+    return saved;
+}
+
+std::vector<core::PairingRequestId> PairingPolicy::take_invalidated_pairings() {
+    std::vector<core::PairingRequestId> drained;
+    drained.swap(invalidated_);
+    return drained;
 }
 
 core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId request) {
@@ -89,7 +128,8 @@ core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingReques
         return Error{ErrorCode::session_pairing_timeout};
     }
     // The identity bound at request time is what gets approved; the candidate
-    // slot may have changed since and is never consulted here (no TOCTOU).
+    // slot may have changed since and is never consulted here (no TOCTOU;
+    // SNAPSHOT-ONLY PAIRING CONTRACT in PairingPolicy.hpp).
     const TransportIdentity identity = std::move(pending_[index].identity);
     drop_at(index);
     return store_.approve(identity);

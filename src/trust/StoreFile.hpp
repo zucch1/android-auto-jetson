@@ -46,12 +46,22 @@ inline constexpr std::size_t kMaxStoreBytes = std::size_t{256} * 1024;
 
 // Atomic replace anchored on the verified store-directory descriptor:
 // create missing ancestors at 0700 (checked fchmod on the creation fd, fail
-// closed), open the immediate parent O_DIRECTORY|O_NOFOLLOW (a symlinked
-// parent rejects BEFORE any mutation), validate ownership via fstat and
-// tighten via checked fchmod on that fd to 0700, then exclusively create
-// (O_CREAT|O_EXCL) an unpredictably named 0600 temp file there (fchmod
-// defeats umask), fsync and rename over `<path>`. A pre-existing symlink at
-// the store name is replaced, never followed.
+// closed; each newly created directory and its containing directory are
+// fsynced before anything is written inside), open the immediate parent
+// O_DIRECTORY|O_NOFOLLOW (a symlinked parent rejects BEFORE any mutation),
+// validate ownership via fstat and tighten via checked fchmod on that fd to
+// 0700, then exclusively create (O_CREAT|O_EXCL) an unpredictably named 0600
+// temp file there (fchmod defeats umask), fsync and CHECKED-close the temp
+// file, rename over `<path>`, then fsync the containing directory (EINTR
+// retry) on the SAME directory descriptor. A pre-existing symlink at the
+// store name is replaced, never followed.
+//
+// Outcomes: any failure before the rename (including the temp-file sync and
+// the checked close) is trust_store_io with the temp file removed and the
+// previous store untouched; rename + directory sync is success; a directory
+// sync failure AFTER the rename is trust_store_not_durable (703) with the
+// replacement kept on disk — the mutation landed and only its crash
+// durability is unconfirmed (it cannot be rolled back).
 [[nodiscard]] core::Result<void> write_file_private(const std::filesystem::path& path,
                                                     std::string_view content);
 

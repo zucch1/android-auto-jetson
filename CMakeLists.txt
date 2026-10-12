@@ -63,8 +63,6 @@ include(cmake/InputSocket.cmake)
 include(cmake/Conformance.cmake)
 include(cmake/DbusContract.cmake)
 include(cmake/TrustStore.cmake)
-include(cmake/ConsumerDecode.cmake)
-include(cmake/DummyDisplay.cmake)
 if(TARGET aa_sysroot_hash_gate)
     # Build-time hash gate: aa_host_smoke (and staged gtest) cannot compile after a post-configure
     # sysroot tamper. Only present for jetson-aarch64 cross builds that configure a sysroot.
@@ -140,6 +138,13 @@ add_subdirectory(tools/aa-ipc-bench)
 
 # Task 9 is mandatory: missing development inputs must not turn CI green by omission.
 add_subdirectory(tools/aa-decode-probe)
+# Task 23 consumer decode comes AFTER the decode-probe subproject:
+# cmake/DecodeDependencies.cmake (loaded there) owns the sanctioned target
+# GStreamer metadata binding that aareceiver-consumer consumes in cross builds.
+include(cmake/ConsumerDecode.cmake)
+# Task 24 dummy display follows the consumer: its host chain requires
+# TARGET aareceiver-consumer (see the integration contract in the module).
+include(cmake/DummyDisplay.cmake)
 if(NOT CMAKE_CROSSCOMPILING)
     if(NOT BUILD_TESTING)
         message(FATAL_ERROR "AA_DECODE_COVERAGE: native builds require BUILD_TESTING=ON")

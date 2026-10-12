@@ -15,10 +15,12 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -186,6 +188,76 @@ TEST(TrustBusFlow, UnregisteredAddPhoneOverTheWireLeavesStoreUnmodified) {
               "org.custom.AndroidAutoReceiver1.Error.ConsumerRejected");
     EXPECT_TRUE(bus_state.store.phones().empty());
     EXPECT_FALSE(std::filesystem::exists(bus_state.dir.file()));
+}
+
+TEST(TrustBusFlow, ForgottenPhoneRejectsStaleConfirmOverTheWire) {
+    TrustBus bus_state;
+    bus_state.start();
+    register_consumer(bus_state);
+
+    const auto approved = bus_state.store.approve(trust::TransportIdentity{test::kWired});
+    ASSERT_TRUE(approved.has_value());
+    const aa::core::PhoneId saved{approved.value()};
+
+    bus::MessageWriter empty;
+    empty.body_signature("");
+    bus_state.policy.note_candidate(trust::TransportIdentity{test::kWired});
+    const auto first = round_trip(bus_state, "RequestAddPhone", empty);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_EQ(first.value().type, bus::MessageType::method_return);
+    const std::uint64_t first_id = parse_u64(first.value());
+    const auto second = round_trip(bus_state, "RequestAddPhone", empty);
+    ASSERT_TRUE(second.has_value());
+    ASSERT_EQ(second.value().type, bus::MessageType::method_return);
+    const std::uint64_t second_id = parse_u64(second.value());
+    bus_state.policy.note_candidate(trust::TransportIdentity{test::kWireless});
+    const auto unrelated = round_trip(bus_state, "RequestAddPhone", empty);
+    ASSERT_TRUE(unrelated.has_value());
+    ASSERT_EQ(unrelated.value().type, bus::MessageType::method_return);
+    const std::uint64_t unrelated_id = parse_u64(unrelated.value());
+
+    bus::MessageWriter forget;
+    forget.body_signature("t").put_u64(saved.value);
+    const auto forgotten = round_trip(bus_state, "ForgetPhone", forget);
+    ASSERT_TRUE(forgotten.has_value());
+    ASSERT_EQ(forgotten.value().type, bus::MessageType::method_return);
+
+    bus::MessageWriter stale;
+    stale.body_signature("t").put_u64(first_id);
+    const auto stale_first = round_trip(bus_state, "ConfirmPhonePairing", stale);
+    ASSERT_TRUE(stale_first.has_value());
+    ASSERT_EQ(stale_first.value().type, bus::MessageType::error_reply);
+    EXPECT_EQ(stale_first.value().error_name,
+              "org.custom.AndroidAutoReceiver1.Error.ConsumerRejected");
+    stale = bus::MessageWriter{};
+    stale.body_signature("t").put_u64(second_id);
+    const auto stale_second = round_trip(bus_state, "ConfirmPhonePairing", stale);
+    ASSERT_TRUE(stale_second.has_value());
+    ASSERT_EQ(stale_second.value().type, bus::MessageType::error_reply);
+
+    bus::MessageWriter confirm_b;
+    confirm_b.body_signature("t").put_u64(unrelated_id);
+    const auto confirmed_b = round_trip(bus_state, "ConfirmPhonePairing", confirm_b);
+    ASSERT_TRUE(confirmed_b.has_value());
+    ASSERT_EQ(confirmed_b.value().type, bus::MessageType::method_return);
+
+    std::vector<std::uint64_t> closed;
+    for (const auto& event : bus_state.events.events) {
+        if (const auto* pair = std::get_if<aa::ipc::PairingClosed>(&event)) {
+            closed.push_back(pair->request.value);
+        }
+    }
+    std::sort(closed.begin(), closed.end());
+    EXPECT_EQ(closed, (std::vector<std::uint64_t>{first_id, second_id}));
+
+    const auto identity_a = test::identity_of(trust::TransportIdentity{test::kWired});
+    EXPECT_EQ(bus_state.store.lookup(identity_a), trust::Decision::unknown);
+
+    trust::ApprovedPhoneStore reloaded{bus_state.dir.file()};
+    ASSERT_TRUE(reloaded.load().has_value());
+    EXPECT_EQ(reloaded.lookup(identity_a), trust::Decision::unknown);
+    EXPECT_EQ(reloaded.lookup(test::identity_of(trust::TransportIdentity{test::kWireless})),
+              trust::Decision::approved);
 }
 
 } // namespace

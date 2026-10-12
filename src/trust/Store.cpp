@@ -104,8 +104,13 @@ core::Result<void> ApprovedPhoneStore::approve_once(const PhoneIdentity& identit
     ++next_phone_id_;
     auto saved = persist();
     if (!saved.has_value()) {
-        phones_.pop_back();
-        --next_phone_id_;
+        // trust_store_not_durable (703): the replacement renamed and the
+        // mutation landed on disk — keep phones_ and the advanced
+        // next_phone_id_; every other error is pre-replacement and rolls back.
+        if (saved.error().code() != ErrorCode::trust_store_not_durable) {
+            phones_.pop_back();
+            --next_phone_id_;
+        }
         return saved.error();
     }
     return {};
@@ -130,8 +135,12 @@ core::Result<core::PhoneId> ApprovedPhoneStore::approve(const TransportIdentity&
     ++next_phone_id_;
     auto saved = persist();
     if (!saved.has_value()) {
-        phones_.pop_back();
-        --next_phone_id_;
+        // 703 keeps the committed-but-not-durable mutation (memory == disk);
+        // pre-replacement errors roll the allocation back.
+        if (saved.error().code() != ErrorCode::trust_store_not_durable) {
+            phones_.pop_back();
+            --next_phone_id_;
+        }
         return saved.error();
     }
     return phone;
@@ -174,7 +183,12 @@ core::Result<void> ApprovedPhoneStore::forget_phone(core::PhoneId phone) {
                   phones_.end());
     auto saved = persist();
     if (!saved.has_value()) {
-        phones_ = before;  // roll back: forget only lands when persisted
+        // 703: the revocation renamed and landed on disk — KEEP it in memory
+        // too (no restore of `before`); pre-replacement errors roll back so a
+        // forget only lands when persisted.
+        if (saved.error().code() != ErrorCode::trust_store_not_durable) {
+            phones_ = before;
+        }
         return saved.error();
     }
     return {};

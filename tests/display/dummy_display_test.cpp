@@ -219,6 +219,9 @@ public:
     }
     void pairing_cancelled(aa::core::PairingRequestId) override {}
     [[nodiscard]] std::vector<aa::core::PairingRequestId> reap_expired() override { return {}; }
+    [[nodiscard]] std::vector<aa::core::PairingRequestId> take_invalidated_pairings() override {
+        return {};
+    }
 };
 
 struct ServiceHarness final {

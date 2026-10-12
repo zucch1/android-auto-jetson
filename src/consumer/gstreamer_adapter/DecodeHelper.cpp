@@ -6,6 +6,8 @@
 #include <aa/consumer/Decode.hpp>
 #include <aa/protocol/Messages.hpp> // protocol::valid_video_profile (budget profile)
 
+#include "DecodeSessionState.hpp" // GStreamer-free admission + timestamp state
+
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
@@ -14,7 +16,6 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -48,9 +49,6 @@ constexpr KnownDecoder kKnownDecoders[] = {
 };
 
 constexpr const char* kNvmmConversionElement = "nvvidconv";
-
-constexpr std::size_t kMaxPendingCorrelations = 512;
-constexpr std::uint64_t kMaxFeedBacklogBytes = 4ULL * 1024 * 1024;
 
 [[nodiscard]] BackendCandidate probe_candidate(const KnownDecoder& known) {
     BackendCandidate candidate;
@@ -169,12 +167,9 @@ struct DecodeHelper::Impl final {
     GstElement* appsink{nullptr};
     GstBus* bus{nullptr};
 
-    struct PendingMeta final {
-        std::uint64_t frame{};
-        std::uint64_t sequence{};
-        std::uint64_t timestamp_ns{};
-    };
-    std::map<std::uint64_t, PendingMeta> pending{};
+    // GStreamer-free session state: timestamp/byte admission plus the
+    // bounded-age correlation lifecycle (pending map + awaiting_idr resync).
+    DecodeSessionState session{};
     bool eos_sent{false};
 
     ~Impl() { release(); }
@@ -193,10 +188,15 @@ struct DecodeHelper::Impl final {
         }
         appsrc = nullptr;
         appsink = nullptr;
-        pending.clear();
+        session.clear_correlations();
     }
 
-    [[nodiscard]] core::Result<void> bus_error() const {
+    [[nodiscard]] core::Result<void> fail_terminal(ErrorCode code) noexcept {
+        session.latch_terminal(code);
+        return core::Result<void>{Error{code}};
+    }
+
+    [[nodiscard]] core::Result<void> bus_error() {
         if (bus == nullptr) {
             return core::Result<void>{};
         }
@@ -212,7 +212,7 @@ struct DecodeHelper::Impl final {
         }
         g_free(debug);
         gst_message_unref(message);
-        return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
+        return fail_terminal(ErrorCode::channel_decode_failed);
     }
 
     // appsrc -> h264parse -> decoder [-> nvvidconv when the decoder output is
@@ -414,18 +414,32 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
     if (!impl_ || impl_->pipeline == nullptr) {
         return core::Result<void>{Error{ErrorCode::invalid_argument}};
     }
+    if (impl_->session.terminal()) {
+        return core::Result<void>{Error{impl_->session.terminal_error.value()}};
+    }
     if (impl_->eos_sent) {
         return core::Result<void>{Error{ErrorCode::invalid_argument}};
     }
     if (access_unit.payload.empty()) {
         return core::Result<void>{Error{ErrorCode::invalid_argument}};
     }
-    if (impl_->pending.find(access_unit.timestamp_ns) != impl_->pending.end()) {
-        return core::Result<void>{Error{ErrorCode::invalid_argument}};
-    }
-    if (gst_app_src_get_current_level_bytes(GST_APP_SRC(impl_->appsrc)) > kMaxFeedBacklogBytes
-        || impl_->pending.size() >= kMaxPendingCorrelations) {
-        return core::Result<void>{Error{ErrorCode::ipc_queue_full}};
+    // Pre-push admission (DecodeSessionState): bounded-age correlations expire
+    // at entry and resync at an IDR, a byte-admissible submission meeting a
+    // saturated pending set invalidates it instead of wedging submit() on a
+    // forever ipc_queue_full, non-IDR AUs are discarded with
+    // ipc_consumer_rejected while awaiting_idr ("discard this AU and resume at
+    // an IDR" - NOT retryable queue-full), and only then the unchanged
+    // timestamp + byte admission runs (a recovery IDR is still subject to it).
+    // All checks run before any buffer is allocated or pushed, and a rejected
+    // AU acquires no correlation mapping and does not consume its timestamp
+    // (byte rejections retry with the same timestamp after a drain).
+    const DecodeSessionState::Clock::time_point now = DecodeSessionState::Clock::now();
+    if (auto admitted = impl_->session.admit_submission(
+            FeedLoad{gst_app_src_get_current_level_bytes(GST_APP_SRC(impl_->appsrc)),
+                     access_unit.payload.size()},
+            access_unit.timestamp_ns, access_unit.idr, now);
+        !admitted.has_value()) {
+        return admitted;
     }
     if (auto failed = impl_->bus_error(); !failed.has_value()) {
         return failed;
@@ -433,32 +447,44 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
 
     GstBuffer* buffer = gst_buffer_new_allocate(nullptr, access_unit.payload.size(), nullptr);
     if (buffer == nullptr) {
-        return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
+        return impl_->fail_terminal(ErrorCode::channel_decode_failed);
     }
     gst_buffer_fill(buffer, 0, access_unit.payload.data(), access_unit.payload.size());
     GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(access_unit.timestamp_ns);
     GST_BUFFER_DTS(buffer) = static_cast<GstClockTime>(access_unit.timestamp_ns);
     GST_BUFFER_DURATION(buffer) = static_cast<GstClockTime>(impl_->frame_duration_ns);
+    if (impl_->session.awaiting_idr) {
+        // A recovery AU is discontinuous with everything decoded before the
+        // resync; flag the gap instead of relabeling frames or resetting the
+        // timestamp high-water mark (no backend switch, no pipeline rebuild).
+        GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DISCONT);
+    }
 
     const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(impl_->appsrc), buffer);
     if (flow != GST_FLOW_OK) {
-        return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
+        return impl_->fail_terminal(ErrorCode::channel_decode_failed);
     }
-    impl_->pending.emplace(access_unit.timestamp_ns,
-                           Impl::PendingMeta{access_unit.frame, access_unit.sequence,
-                                            access_unit.timestamp_ns});
+    impl_->session.accept_timestamp(access_unit.timestamp_ns);
+    impl_->session.record_correlation(access_unit.frame, access_unit.sequence,
+                                      access_unit.timestamp_ns, now);
     return core::Result<void>{};
 }
 
 core::Result<void> DecodeHelper::end_of_stream() {
-    if (!impl_ || impl_->pipeline == nullptr || impl_->eos_sent) {
+    if (!impl_ || impl_->pipeline == nullptr) {
+        return core::Result<void>{Error{ErrorCode::invalid_argument}};
+    }
+    if (impl_->session.terminal()) {
+        return core::Result<void>{Error{impl_->session.terminal_error.value()}};
+    }
+    if (impl_->eos_sent) {
         return core::Result<void>{Error{ErrorCode::invalid_argument}};
     }
     if (auto failed = impl_->bus_error(); !failed.has_value()) {
         return failed;
     }
     if (gst_app_src_end_of_stream(GST_APP_SRC(impl_->appsrc)) != GST_FLOW_OK) {
-        return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
+        return impl_->fail_terminal(ErrorCode::channel_decode_failed);
     }
     impl_->eos_sent = true;
     return core::Result<void>{};
@@ -467,6 +493,9 @@ core::Result<void> DecodeHelper::end_of_stream() {
 core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
     if (!impl_ || impl_->pipeline == nullptr) {
         return core::Result<std::size_t>{Error{ErrorCode::invalid_argument}};
+    }
+    if (impl_->session.terminal()) {
+        return core::Result<std::size_t>{Error{impl_->session.terminal_error.value()}};
     }
     std::size_t delivered = 0;
     const std::uint64_t first_timeout =
@@ -477,6 +506,10 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         if (auto failed = impl_->bus_error(); !failed.has_value()) {
             return core::Result<std::size_t>{failed.error()};
         }
+        // Retention-bound evaluation during the pump: stale correlations are
+        // invalidated (and the session armed for an IDR resync) even when this
+        // iteration ends up pulling nothing.
+        impl_->session.expire_stale_correlations(DecodeSessionState::Clock::now());
         const std::uint64_t timeout = first_pull ? first_timeout : 0ULL;
         first_pull = false;
         GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(impl_->appsink), timeout);
@@ -485,8 +518,17 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
             if (auto failed = impl_->bus_error(); !failed.has_value()) {
                 return core::Result<std::size_t>{failed.error()};
             }
+            if (gst_app_sink_is_eos(GST_APP_SINK(impl_->appsink))) {
+                // EOS: undelivered correlations can never be matched now.
+                impl_->session.clear_correlations();
+            }
             break;
         }
+        // The first pull may have blocked up to `wait`: re-evaluate the
+        // retention bound BEFORE correlating this sample, so a long pump(wait)
+        // never delivers expired metadata. Expired/invalidated/late samples
+        // find no mapping and are released without a callback.
+        impl_->session.expire_stale_correlations(DecodeSessionState::Clock::now());
 
         GstCaps* caps = gst_sample_get_caps(sample);
         GstBuffer* buffer = gst_sample_get_buffer(sample);
@@ -498,6 +540,7 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
             && gst_video_frame_map(&video_frame, &info, buffer, GST_MAP_READ);
         if (!mapped) {
             gst_sample_unref(sample);
+            impl_->session.latch_terminal(ErrorCode::channel_decode_failed);
             return core::Result<std::size_t>{Error{ErrorCode::channel_decode_failed}};
         }
 
@@ -505,9 +548,12 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         const std::uint32_t height = static_cast<std::uint32_t>(info.height);
         if (width != impl_->caps.width || height != impl_->caps.height) {
             // No silent fallback to wrong dimensions: negotiated caps were not
-            // honored by the stream, fail typed.
+            // honored by the stream, fail typed - and terminal, per the
+            // post-open contract (the latch preserves channel_caps_unsupported
+            // rather than converting it to channel_decode_failed).
             gst_video_frame_unmap(&video_frame);
             gst_sample_unref(sample);
+            impl_->session.latch_terminal(ErrorCode::channel_caps_unsupported);
             return core::Result<std::size_t>{Error{ErrorCode::channel_caps_unsupported}};
         }
 
@@ -549,14 +595,16 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         gst_video_frame_unmap(&video_frame);
 
         const std::uint64_t pts = static_cast<std::uint64_t>(GST_BUFFER_PTS(buffer));
-        const auto meta = impl_->pending.find(pts);
-        if (meta == impl_->pending.end()) {
+        // Late pre-recovery outputs find no mapping: counted unmatched,
+        // released, and never handed to the callback (frames keep their real
+        // metadata; nothing is relabeled).
+        const auto meta = impl_->session.take_correlation(pts);
+        if (!meta.has_value()) {
             ++impl_->report.frames_unmatched;
         } else {
-            frame.frame = meta->second.frame;
-            frame.sequence = meta->second.sequence;
-            frame.timestamp_ns = meta->second.timestamp_ns;
-            impl_->pending.erase(meta);
+            frame.frame = meta->frame;
+            frame.sequence = meta->sequence;
+            frame.timestamp_ns = meta->timestamp_ns;
             if (impl_->on_frame) {
                 impl_->on_frame(frame);
             }

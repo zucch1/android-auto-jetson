@@ -107,6 +107,11 @@ public:
 //     gate entries for the returned ids and emit exactly one PairingClosed
 //     each; expired ids are propagated here so the one-time gate can never
 //     keep a dead pairing request consuming admission capacity.
+//   - take_invalidated_pairings : drain the request ids whose pending pairing
+//     was invalidated by a successful (or committed-but-not-durable) forget.
+//     The caller must release each id's gate entry and emit exactly one
+//     PairingClosed BEFORE returning the forget result; the drain clears the
+//     buffer. A pre-replacement forget failure invalidates nothing.
 class PhoneDirectory {
 public:
     virtual ~PhoneDirectory() = default;
@@ -123,6 +128,7 @@ public:
         core::PairingRequestId request) = 0;
     virtual void pairing_cancelled(core::PairingRequestId request) = 0;
     [[nodiscard]] virtual std::vector<core::PairingRequestId> reap_expired() = 0;
+    [[nodiscard]] virtual std::vector<core::PairingRequestId> take_invalidated_pairings() = 0;
 };
 
 // The active session user the caller's Unix UID must equal. Production fills

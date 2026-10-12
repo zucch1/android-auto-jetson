@@ -70,18 +70,21 @@ public:
     }
 
     // Task-27 PhoneDirectory seam (fail-closed): pairing is always rejected,
-    // cancellation is a no-op and nothing ever expires. Declared against the
-    // task-27 signatures so these become the required overrides the moment
-    // that seam lands in this tree; until then the interface is forget-only.
-    [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId) {
+    // cancellation is a no-op, nothing ever expires and no pending pairing can
+    // ever be invalidated because none can ever be created. These are the
+    // required overrides now that the seam has landed in this tree.
+    [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId) override {
         return aa::Error{aa::ErrorCode::invalid_argument};
     }
     [[nodiscard]] aa::core::Result<aa::core::PhoneId> pairing_confirmed(
-        aa::core::PairingRequestId) {
+        aa::core::PairingRequestId) override {
         return aa::Error{aa::ErrorCode::invalid_argument};
     }
-    void pairing_cancelled(aa::core::PairingRequestId) {}
-    [[nodiscard]] std::vector<aa::core::PairingRequestId> reap_expired() { return {}; }
+    void pairing_cancelled(aa::core::PairingRequestId) override {}
+    [[nodiscard]] std::vector<aa::core::PairingRequestId> reap_expired() override { return {}; }
+    [[nodiscard]] std::vector<aa::core::PairingRequestId> take_invalidated_pairings() override {
+        return {};
+    }
 };
 
 std::string event_input(const aa::ipc::InputEvent& event) {

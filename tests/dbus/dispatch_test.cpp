@@ -211,14 +211,16 @@ TEST(CallBoundary, DerivesCallerIdentityFromSenderNotArguments) {
 }
 
 TEST(CallBoundary, NonMethodCallMessagesAreDroppedNotDispatched) {
-    // Given: a boundary over a live service with a registered consumer.
+    // Given: a boundary over a live service with the consumer registered
+    // FIRST, so the drops run against an established session.
     BoundaryFixture fixture;
     const BusName name{"org.custom.ConsumerA"};
     fixture.credentials.add_connection(BusName{":1.40"}, kSessionUid);
     fixture.credentials.set_owner(name, BusName{":1.40"});
-    ASSERT_TRUE(fixture.dispatcher
-                    .handle(call_from(":1.40", "RegisterConsumer", "s", marshal_string(name.value)))
-                    .has_value());
+    const auto registered = fixture.dispatcher.handle(
+        call_from(":1.40", "RegisterConsumer", "s", marshal_string(name.value)));
+    ASSERT_TRUE(registered.has_value());
+    ASSERT_FALSE(registered->is_error);
 
     // When: a signal, a method return and an error reply all name the
     // StartProjection member on the contract interface and path.
@@ -231,17 +233,26 @@ TEST(CallBoundary, NonMethodCallMessagesAreDroppedNotDispatched) {
         EXPECT_FALSE(reply.has_value());
     }
     EXPECT_EQ(fixture.service.state().projection, ProjectionState::stopped);
+
+    // And: the drops leave the dispatcher synchronized on the established
+    // session — a subsequent Ping completes normally and does not wedge it.
+    const auto ping = fixture.dispatcher.handle(call_from(":1.40", "Ping"));
+    ASSERT_TRUE(ping.has_value());
+    EXPECT_FALSE(ping->is_error);
+    EXPECT_TRUE(std::holds_alternative<std::uint64_t>(ping->body));
 }
 
 TEST(CallBoundary, RejectsForeignObjectPathsWithoutDispatching) {
-    // Given: a boundary over a live service with a registered consumer.
+    // Given: a boundary over a live service with the consumer registered
+    // FIRST, so the rejection runs against an established session.
     BoundaryFixture fixture;
     const BusName name{"org.custom.ConsumerA"};
     fixture.credentials.add_connection(BusName{":1.41"}, kSessionUid);
     fixture.credentials.set_owner(name, BusName{":1.41"});
-    ASSERT_TRUE(fixture.dispatcher
-                    .handle(call_from(":1.41", "RegisterConsumer", "s", marshal_string(name.value)))
-                    .has_value());
+    const auto registered = fixture.dispatcher.handle(
+        call_from(":1.41", "RegisterConsumer", "s", marshal_string(name.value)));
+    ASSERT_TRUE(registered.has_value());
+    ASSERT_FALSE(registered->is_error);
 
     // When: a real method call targets a foreign object path.
     IncomingCall call{BusName{":1.41"}, WireType::method_call,
@@ -254,6 +265,13 @@ TEST(CallBoundary, RejectsForeignObjectPathsWithoutDispatching) {
     EXPECT_TRUE(reply->is_error);
     EXPECT_EQ(reply->error_name, "org.freedesktop.DBus.Error.UnknownObject");
     EXPECT_EQ(fixture.service.state().projection, ProjectionState::stopped);
+
+    // And: the rejection leaves the dispatcher synchronized on the
+    // established session — a subsequent Ping completes normally.
+    const auto ping = fixture.dispatcher.handle(call_from(":1.41", "Ping"));
+    ASSERT_TRUE(ping.has_value());
+    EXPECT_FALSE(ping->is_error);
+    EXPECT_TRUE(std::holds_alternative<std::uint64_t>(ping->body));
 }
 
 TEST(CallBoundary, PairingFlowRoutesThroughTheBoundary) {

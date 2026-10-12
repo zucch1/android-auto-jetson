@@ -243,9 +243,16 @@ TEST(BusBoundary, UnknownContractMajorIsRejectedThroughTheBoundary) {
 }
 
 TEST(BusBoundary, SignalWithControlMemberCannotChangeState) {
-    // Given: a running receiver boundary.
+    // Given: a running receiver boundary with the consumer registered FIRST,
+    // so the drop runs against an established session.
     BoundaryBus bus_state;
     bus_state.start();
+    bus::MessageWriter register_body;
+    register_body.body_signature("s").put_string(kConsumerName);
+    const auto registered =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "RegisterConsumer", register_body);
+    ASSERT_TRUE(registered.has_value());
+    ASSERT_EQ(registered.value().type, bus::MessageType::method_return);
 
     // When: a SIGNAL (not a method call) carries the StartProjection member on
     // the real contract interface and object path.
@@ -269,12 +276,33 @@ TEST(BusBoundary, SignalWithControlMemberCannotChangeState) {
     EXPECT_FALSE(reply.has_value());
     EXPECT_FALSE(answer.has_value());
     EXPECT_EQ(bus_state.service->state().projection, ProjectionState::stopped);
+
+    // And: the drop leaves the transport synchronized — a subsequent Ping
+    // round-trips to normal completion and does not wedge the connection.
+    bus::MessageWriter ping_body;
+    ping_body.body_signature("");
+    const auto ping =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "Ping", ping_body);
+    ASSERT_TRUE(ping.has_value());
+    ASSERT_EQ(ping.value().type, bus::MessageType::method_return);
+    ASSERT_EQ(ping.value().signature, "t");
+    bus::Cursor ping_cursor(ping.value().body);
+    const auto ping_payload = ping_cursor.read_u64();
+    ASSERT_TRUE(ping_payload.has_value());
+    EXPECT_TRUE(ping_cursor.done());
 }
 
 TEST(BusBoundary, WrongPathMethodCallCannotChangeState) {
-    // Given: a running receiver boundary.
+    // Given: a running receiver boundary with the consumer registered FIRST,
+    // so the rejection runs against an established session.
     BoundaryBus bus_state;
     bus_state.start();
+    bus::MessageWriter register_body;
+    register_body.body_signature("s").put_string(kConsumerName);
+    const auto registered =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "RegisterConsumer", register_body);
+    ASSERT_TRUE(registered.has_value());
+    ASSERT_EQ(registered.value().type, bus::MessageType::method_return);
 
     // When: a real method call names StartProjection on a foreign object path.
     bus::MessageWriter call;
@@ -302,6 +330,20 @@ TEST(BusBoundary, WrongPathMethodCallCannotChangeState) {
     EXPECT_EQ(answer.value().type, bus::MessageType::error_reply);
     EXPECT_EQ(answer.value().error_name, "org.freedesktop.DBus.Error.UnknownObject");
     EXPECT_EQ(bus_state.service->state().projection, ProjectionState::stopped);
+
+    // And: the rejection leaves the transport synchronized — a subsequent
+    // Ping round-trips to normal completion and does not wedge the connection.
+    bus::MessageWriter ping_body;
+    ping_body.body_signature("");
+    const auto ping =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "Ping", ping_body);
+    ASSERT_TRUE(ping.has_value());
+    ASSERT_EQ(ping.value().type, bus::MessageType::method_return);
+    ASSERT_EQ(ping.value().signature, "t");
+    bus::Cursor ping_cursor(ping.value().body);
+    const auto ping_payload = ping_cursor.read_u64();
+    ASSERT_TRUE(ping_payload.has_value());
+    EXPECT_TRUE(ping_cursor.done());
 }
 
 TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {

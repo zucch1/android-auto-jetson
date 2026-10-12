@@ -2,7 +2,8 @@
 // Task 23 consumer decode helper qualification: happy fixture decode with
 // frame callbacks and monotonic A/V timestamp carry-through, typed failure on
 // unsupported caps, NVIDIA backend honesty (runtime detection, recorded
-// disable cause) and aa-decode-probe discovery agreement.
+// disable cause), aa-decode-probe discovery agreement, and the session
+// admission contracts (feed-backlog math + timestamp high-water mark).
 //
 // Task-9 reduced scope (owner-signed 2026-10-06): the decode p95 latency
 // budget (<=33 ms at 1280x720@30) and the software H.264 fallback
@@ -11,7 +12,8 @@
 // carry-through and zero drops on valid fixtures.
 #include <aa/consumer/Decode.hpp>
 
-#include "discovery.hpp" // tools/aa-decode-probe: runtime detection oracle
+#include "DecodeSessionState.hpp" // GStreamer-free admission + timestamp state
+#include "discovery.hpp"          // tools/aa-decode-probe: runtime detection oracle
 
 #include <algorithm>
 #include <chrono>
@@ -758,4 +760,591 @@ TEST(ConsumerProbeIntegration, DiscoveryAgreesWithDecodeProbe) {
     EXPECT_NE(output.find(selected), std::string::npos) << output;
     EXPECT_NE(output.find("nvv4l2decoder"), std::string::npos)
         << "probe discovery must always report nvv4l2decoder: " << output;
+}
+
+// ---------------------------------------------------------------------------
+// Session admission contracts (PR #47 fix round findings 3+4): feed-backlog
+// admission counts the incoming AU (subtraction-based, overflow-free) and the
+// session's timestamps are valid, strictly increasing and session-unique
+// behind a high-water mark that advances only after a successful push. The
+// queue-level cases drive the GStreamer-free DecodeSessionState helper
+// directly so the admission math is deterministic and never races appsrc.
+// ---------------------------------------------------------------------------
+
+TEST(ConsumerDecodeAdmission, OversizedAuRejectedWithEmptyQueue) {
+    DecodeSessionState state;
+    const std::size_t oversized =
+        static_cast<std::size_t>(DecodeSessionState::kMaxFeedBacklogBytes) + 1U;
+    const auto admitted = state.admit(FeedLoad{0, oversized}, kTimestampBaseNs);
+    ASSERT_FALSE(admitted);
+    EXPECT_EQ(admitted.error().code(), ErrorCode::ipc_queue_full);
+    EXPECT_FALSE(state.last_accepted_timestamp_ns.has_value());
+}
+
+TEST(ConsumerDecodeAdmission, ExactRemainingCapacityAccepted) {
+    const std::uint64_t limit = DecodeSessionState::kMaxFeedBacklogBytes;
+    DecodeSessionState at_capacity;
+    EXPECT_TRUE(at_capacity.admit(FeedLoad{limit - 1024, 1024}, kTimestampBaseNs));
+    DecodeSessionState empty;
+    EXPECT_TRUE(empty.admit(FeedLoad{0, static_cast<std::size_t>(limit)}, kTimestampBaseNs));
+}
+
+TEST(ConsumerDecodeAdmission, OneBytePastRemainingCapacityRejected) {
+    const std::uint64_t limit = DecodeSessionState::kMaxFeedBacklogBytes;
+    DecodeSessionState state;
+    const auto admitted = state.admit(FeedLoad{limit - 1024 + 1, 1024}, kTimestampBaseNs);
+    ASSERT_FALSE(admitted);
+    EXPECT_EQ(admitted.error().code(), ErrorCode::ipc_queue_full);
+}
+
+TEST(ConsumerDecodeAdmission, QueueAtLimitRejectsNonemptyAu) {
+    const std::uint64_t limit = DecodeSessionState::kMaxFeedBacklogBytes;
+    DecodeSessionState state;
+    const auto one_byte = state.admit(FeedLoad{limit, 1}, kTimestampBaseNs);
+    ASSERT_FALSE(one_byte);
+    EXPECT_EQ(one_byte.error().code(), ErrorCode::ipc_queue_full);
+    const auto regular = state.admit(FeedLoad{limit, 4096}, kTimestampBaseNs);
+    ASSERT_FALSE(regular);
+    EXPECT_EQ(regular.error().code(), ErrorCode::ipc_queue_full);
+}
+
+TEST(ConsumerDecodeAdmission, HugeQueueLevelCannotOverflowAdmission) {
+    // A saturated byte counter must never wrap the subtraction into acceptance
+    // and an oversized payload must be refused before any subtraction.
+    const std::uint64_t limit = DecodeSessionState::kMaxFeedBacklogBytes;
+    const std::uint64_t huge_levels[] = {DecodeSessionState::kClockTimeNone, limit + 1, limit};
+    const std::size_t payloads[] = {std::size_t{1}, static_cast<std::size_t>(limit),
+                                    static_cast<std::size_t>(limit) + 1U};
+    DecodeSessionState state;
+    for (const std::uint64_t queued : huge_levels) {
+        for (const std::size_t payload : payloads) {
+            const auto admitted = state.admit(FeedLoad{queued, payload}, kTimestampBaseNs);
+            ASSERT_FALSE(admitted) << queued << "/" << payload;
+            EXPECT_EQ(admitted.error().code(), ErrorCode::ipc_queue_full);
+        }
+    }
+}
+
+TEST(ConsumerDecodeAdmission, QueueRejectionDoesNotConsumeTimestamp) {
+    const std::uint64_t limit = DecodeSessionState::kMaxFeedBacklogBytes;
+    DecodeSessionState state;
+    const auto rejected = state.admit(FeedLoad{limit, 1024}, kTimestampBaseNs);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), ErrorCode::ipc_queue_full);
+    EXPECT_FALSE(state.last_accepted_timestamp_ns.has_value());
+    // After the backlog drains the SAME timestamp must be admitted.
+    const auto retried = state.admit(FeedLoad{0, 1024}, kTimestampBaseNs);
+    ASSERT_TRUE(retried) << static_cast<int>(retried.error().code());
+    state.accept_timestamp(kTimestampBaseNs);
+    EXPECT_EQ(state.last_accepted_timestamp_ns, kTimestampBaseNs);
+}
+
+TEST(ConsumerDecodeAdmission, DuplicateDeliveredTimestampRejected) {
+    // The high-water mark is not a live-map artifact: once a timestamp was
+    // accepted it stays consumed even after its correlation would have been
+    // delivered and released (later timestamps accepted below model that).
+    DecodeSessionState state;
+    ASSERT_TRUE(state.admit(FeedLoad{0, 64}, kTimestampBaseNs));
+    state.accept_timestamp(kTimestampBaseNs);
+    const std::uint64_t later = kTimestampBaseNs + kFramePeriodNs;
+    ASSERT_TRUE(state.admit(FeedLoad{0, 64}, later));
+    state.accept_timestamp(later);
+    const auto duplicate_first = state.admit(FeedLoad{0, 64}, kTimestampBaseNs);
+    ASSERT_FALSE(duplicate_first);
+    EXPECT_EQ(duplicate_first.error().code(), ErrorCode::invalid_argument);
+    const auto duplicate_last = state.admit(FeedLoad{0, 64}, later);
+    ASSERT_FALSE(duplicate_last);
+    EXPECT_EQ(duplicate_last.error().code(), ErrorCode::invalid_argument);
+}
+
+TEST(ConsumerDecodeAdmission, RegressingTimestampRejected) {
+    DecodeSessionState state;
+    const std::uint64_t t0 = kTimestampBaseNs;
+    const std::uint64_t t1 = kTimestampBaseNs + kFramePeriodNs;
+    ASSERT_TRUE(state.admit(FeedLoad{0, 64}, t1));
+    state.accept_timestamp(t1);
+    const auto regressing = state.admit(FeedLoad{0, 64}, t0);
+    ASSERT_FALSE(regressing);
+    EXPECT_EQ(regressing.error().code(), ErrorCode::invalid_argument);
+    const auto equal = state.admit(FeedLoad{0, 64}, t1);
+    ASSERT_FALSE(equal);
+    EXPECT_EQ(equal.error().code(), ErrorCode::invalid_argument);
+}
+
+TEST(ConsumerDecodeAdmission, ClockTimeNoneRejected) {
+    // GST_CLOCK_TIME_NONE (UINT64_MAX) is never a valid AU timestamp, not even
+    // as the first one of a session.
+    DecodeSessionState state;
+    const auto first = state.admit(FeedLoad{0, 64}, DecodeSessionState::kClockTimeNone);
+    ASSERT_FALSE(first);
+    EXPECT_EQ(first.error().code(), ErrorCode::invalid_argument);
+    EXPECT_FALSE(state.last_accepted_timestamp_ns.has_value());
+    ASSERT_TRUE(state.admit(FeedLoad{0, 64}, kTimestampBaseNs));
+    state.accept_timestamp(kTimestampBaseNs);
+    const auto later = state.admit(FeedLoad{0, 64}, DecodeSessionState::kClockTimeNone);
+    ASSERT_FALSE(later);
+    EXPECT_EQ(later.error().code(), ErrorCode::invalid_argument);
+}
+
+TEST(ConsumerDecodeAdmission, ZeroFirstTimestampAccepted) {
+    DecodeSessionState state;
+    const auto first = state.admit(FeedLoad{0, 64}, 0);
+    ASSERT_TRUE(first) << static_cast<int>(first.error().code());
+    state.accept_timestamp(0);
+    EXPECT_EQ(state.last_accepted_timestamp_ns, 0U);
+    const auto next = state.admit(FeedLoad{0, 64}, 1);
+    ASSERT_TRUE(next) << static_cast<int>(next.error().code());
+}
+
+TEST(ConsumerDecodeAdmission, RejectedSubmissionDoesNotAdvanceTimestamp) {
+    DecodeSessionState state;
+    ASSERT_TRUE(state.admit(FeedLoad{0, 64}, kTimestampBaseNs));
+    state.accept_timestamp(kTimestampBaseNs);
+    const std::uint64_t next_ts = kTimestampBaseNs + kFramePeriodNs;
+    const std::size_t oversized =
+        static_cast<std::size_t>(DecodeSessionState::kMaxFeedBacklogBytes) + 1U;
+    const auto rejected = state.admit(FeedLoad{0, oversized}, next_ts);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), ErrorCode::ipc_queue_full);
+    ASSERT_TRUE(state.last_accepted_timestamp_ns.has_value());
+    EXPECT_EQ(*state.last_accepted_timestamp_ns, kTimestampBaseNs);
+    const auto retry = state.admit(FeedLoad{0, 64}, next_ts);
+    ASSERT_TRUE(retry) << static_cast<int>(retry.error().code());
+    const auto duplicate = state.admit(FeedLoad{0, 64}, kTimestampBaseNs);
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error().code(), ErrorCode::invalid_argument);
+}
+
+TEST(ConsumerDecodeAdmission, DuplicateLiveTimestampRejected) {
+    // Public-API integration on the forced-software path: a valid fixture
+    // frame is submitted once and its still-live timestamp resubmitted, which
+    // must fail typed. The resubmission acquires no correlation mapping and
+    // consumes no timestamp, so the following strictly-increasing AU is still
+    // admitted.
+    const DecodeReport probe = DecodeHelper::probe_backends();
+    const bool software_viable =
+        std::any_of(probe.backends.begin(), probe.backends.end(),
+                    [](const BackendCandidate& c) { return !c.hardware && c.viable; });
+    if (!software_viable) {
+        GTEST_SKIP() << "no viable host software H.264 decoder on this host";
+    }
+    const auto stream = read_file(fixture_path());
+    ASSERT_FALSE(stream.empty()) << "fixture missing: " << fixture_path();
+    const auto units = parse_annexb_units(stream);
+    ASSERT_GE(units.size(), 2U) << "fixture grammar drift";
+
+    DecodeConfig config;
+    config.caps = kPrimaryCaps;
+    config.backend = DecodeBackend::software;
+    auto helper = DecodeHelper::open(std::move(config));
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+
+    const VideoAccessUnit au{0, 0, kTimestampBaseNs, units[0].idr, units[0].data};
+    const auto first = helper.value().submit(au);
+    ASSERT_TRUE(first) << static_cast<int>(first.error().code());
+
+    const auto duplicate = helper.value().submit(au);
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error().code(), ErrorCode::invalid_argument);
+
+    const VideoAccessUnit following{1, 1, kTimestampBaseNs + kFramePeriodNs, units[1].idr,
+                                    units[1].data};
+    const auto next = helper.value().submit(following);
+    ASSERT_TRUE(next) << static_cast<int>(next.error().code());
+    helper.value().close();
+}
+
+// ---------------------------------------------------------------------------
+// Correlation lifecycle (PR #47 fix round): pending correlations are bounded
+// in age by the fixed five-second retention timeout (an OPERATIONAL RETENTION
+// POLICY, not a latency budget or a qualification claim) and by the 512-entry
+// cap. Any of those bounds INVALIDATES THE ENTIRE pending set and arms an IDR
+// resync (awaiting_idr): non-IDR AUs are then discarded with
+// ipc_consumer_rejected ("discard this AU and resume at an IDR", NOT
+// retryable queue-full) until an IDR passes the unchanged timestamp + byte
+// admission. These cases drive the GStreamer-free DecodeSessionState helper
+// with controlled clocks - the SAME methods DecodeHelper::submit/pump call -
+// so the lifecycle is deterministic and never races the pipeline.
+// ---------------------------------------------------------------------------
+
+TEST(ConsumerDecodeCorrelation, DroppedAuExpiresAndRequiresIdr) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point submitted_at{};
+    DecodeSessionState state;
+
+    // Two AUs admitted at the fixed clock; the first output arrives (its
+    // mapping is taken), the second is dropped inside the decoder and never
+    // produces an output.
+    const std::uint64_t ts_dropped = kTimestampBaseNs + kFramePeriodNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, kTimestampBaseNs, true, submitted_at));
+    state.accept_timestamp(kTimestampBaseNs);
+    state.record_correlation(1, 1, kTimestampBaseNs, submitted_at);
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_dropped, false, submitted_at));
+    state.accept_timestamp(ts_dropped);
+    state.record_correlation(2, 2, ts_dropped, submitted_at);
+    ASSERT_TRUE(state.take_correlation(kTimestampBaseNs).has_value());
+    ASSERT_EQ(state.pending_count(), 1U);
+
+    // Before the retention bound the dropped AU's mapping still exists and a
+    // no-op expiry evaluation leaves everything in place.
+    const Clock::time_point just_before =
+        submitted_at + DecodeSessionState::kCorrelationRetention - std::chrono::nanoseconds{1};
+    EXPECT_NE(state.find_correlation(ts_dropped), nullptr);
+    state.expire_stale_correlations(just_before);
+    EXPECT_EQ(state.pending_count(), 1U);
+    EXPECT_FALSE(state.awaiting_idr);
+
+    // Exactly at the bound the ENTIRE outstanding set is sacrificed and the
+    // session arms an IDR resync.
+    const Clock::time_point at_bound = submitted_at + DecodeSessionState::kCorrelationRetention;
+    state.expire_stale_correlations(at_bound);
+    EXPECT_EQ(state.pending_count(), 0U);
+    EXPECT_TRUE(state.awaiting_idr);
+
+    // While resyncing, a non-IDR AU is discarded: ipc_consumer_rejected, not a
+    // retryable queue-full.
+    const auto rejected =
+        state.admit_submission(FeedLoad{0, 64}, ts_dropped + kFramePeriodNs, false, at_bound);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), ErrorCode::ipc_consumer_rejected);
+}
+
+TEST(ConsumerDecodeCorrelation, PendingCapacityDoesNotBlockRecoveryIdr) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point now{};
+    DecodeSessionState state;
+
+    // 512 tiny AUs with no outputs at a fixed clock fill the pending set.
+    const std::size_t cap = DecodeSessionState::kMaxPendingCorrelations;
+    for (std::size_t i = 0; i < cap; ++i) {
+        const std::uint64_t frame = static_cast<std::uint64_t>(i);
+        const std::uint64_t timestamp_ns = kTimestampBaseNs + frame * kFramePeriodNs;
+        ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, timestamp_ns, i == 0, now)) << i;
+        state.accept_timestamp(timestamp_ns);
+        state.record_correlation(frame, 3 * frame + 1, timestamp_ns, now);
+    }
+    ASSERT_EQ(state.pending_count(), cap);
+
+    // The next non-IDR meets a saturated set: the whole set is invalidated
+    // first (submit() can never wedge on a permanently full map), then the AU
+    // is discarded as a resync rejection.
+    const std::uint64_t frame_next = static_cast<std::uint64_t>(cap);
+    const std::uint64_t ts_next = kTimestampBaseNs + frame_next * kFramePeriodNs;
+    const auto rejected = state.admit_submission(FeedLoad{0, 64}, ts_next, false, now);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_TRUE(state.awaiting_idr);
+    EXPECT_EQ(state.pending_count(), 0U);
+
+    // A valid newer IDR is not blocked by the resync: still subject to the
+    // timestamp + byte admission, accepted, and leaves exactly its own single
+    // pending entry with the resync cleared.
+    const std::uint64_t frame_recovery = frame_next + 1;
+    const std::uint64_t ts_recovery = kTimestampBaseNs + frame_recovery * kFramePeriodNs;
+    const auto recovered =
+        state.admit_submission(FeedLoad{0, 64}, ts_recovery, true, now);
+    ASSERT_TRUE(recovered) << static_cast<int>(recovered.error().code());
+    state.accept_timestamp(ts_recovery);
+    state.record_correlation(frame_recovery, 3 * frame_recovery + 1, ts_recovery, now);
+    EXPECT_EQ(state.pending_count(), 1U);
+    EXPECT_FALSE(state.awaiting_idr);
+    EXPECT_NE(state.find_correlation(ts_recovery), nullptr);
+}
+
+TEST(ConsumerDecodeCorrelation, InvalidTimestampAtCapacityIsSideEffectFree) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point now{};
+    DecodeSessionState state;
+
+    // Fill the pending set to the 512-entry cap with valid, recorded AUs.
+    const std::size_t cap = DecodeSessionState::kMaxPendingCorrelations;
+    for (std::size_t i = 0; i < cap; ++i) {
+        const std::uint64_t frame = static_cast<std::uint64_t>(i);
+        const std::uint64_t timestamp_ns = kTimestampBaseNs + frame * kFramePeriodNs;
+        ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, timestamp_ns, i == 0, now)) << i;
+        state.accept_timestamp(timestamp_ns);
+        state.record_correlation(frame, 3 * frame + 1, timestamp_ns, now);
+    }
+    ASSERT_EQ(state.pending_count(), cap);
+    const std::uint64_t last = kTimestampBaseNs + (cap - 1) * kFramePeriodNs;
+
+    // Rejected INVALID AUs at the cap are side-effect free (re-review P2): a
+    // duplicate, a regressing and the sentinel timestamp must NOT clear the
+    // valid pending mappings and must NOT arm the IDR resync.
+    const std::uint64_t invalids[] = {last, kTimestampBaseNs, DecodeSessionState::kClockTimeNone};
+    for (const std::uint64_t invalid : invalids) {
+        const auto rejected = state.admit_submission(FeedLoad{0, 64}, invalid, true, now);
+        ASSERT_FALSE(rejected) << invalid;
+        EXPECT_EQ(rejected.error().code(), ErrorCode::invalid_argument) << invalid;
+        EXPECT_EQ(state.pending_count(), cap) << invalid;
+        EXPECT_FALSE(state.awaiting_idr) << invalid;
+        EXPECT_NE(state.find_correlation(kTimestampBaseNs), nullptr) << invalid;
+        EXPECT_NE(state.find_correlation(last), nullptr) << invalid;
+    }
+    const auto* oldest = state.find_correlation(kTimestampBaseNs);
+    ASSERT_NE(oldest, nullptr);
+    EXPECT_EQ(oldest->frame, 0U);
+    EXPECT_EQ(oldest->sequence, 1U);
+
+    // Normal capacity recovery remains functional after the rejected
+    // attempts: a VALID newer byte-admissible AU at the cap still invalidates
+    // the set and resyncs (non-IDR discarded, recovery IDR admitted).
+    const std::uint64_t ts_next = last + kFramePeriodNs;
+    const auto discarded = state.admit_submission(FeedLoad{0, 64}, ts_next, false, now);
+    ASSERT_FALSE(discarded);
+    EXPECT_EQ(discarded.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_TRUE(state.awaiting_idr);
+    EXPECT_EQ(state.pending_count(), 0U);
+    const std::uint64_t ts_recovery = ts_next + kFramePeriodNs;
+    const auto recovered = state.admit_submission(FeedLoad{0, 64}, ts_recovery, true, now);
+    ASSERT_TRUE(recovered) << static_cast<int>(recovered.error().code());
+    state.accept_timestamp(ts_recovery);
+    state.record_correlation(cap + 2, 3 * (cap + 2) + 1, ts_recovery, now);
+    EXPECT_EQ(state.pending_count(), 1U);
+    EXPECT_FALSE(state.awaiting_idr);
+}
+
+TEST(ConsumerDecodeCorrelation, LateOutputCannotAcquireRecoveryMetadata) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point t0{};
+    DecodeSessionState state;
+
+    // Pre-recovery AU recorded, then the set is invalidated at the retention
+    // bound and a recovery IDR admitted and recorded.
+    const std::uint64_t ts_old = kTimestampBaseNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_old, true, t0));
+    state.accept_timestamp(ts_old);
+    state.record_correlation(7, 11, ts_old, t0);
+    const Clock::time_point stale = t0 + DecodeSessionState::kCorrelationRetention;
+    state.expire_stale_correlations(stale);
+    ASSERT_TRUE(state.awaiting_idr);
+
+    const std::uint64_t ts_recovery = ts_old + kFramePeriodNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_recovery, true, stale));
+    state.accept_timestamp(ts_recovery);
+    state.record_correlation(8, 12, ts_recovery, stale);
+
+    // A late pre-recovery output finds no mapping: no metadata is handed out.
+    EXPECT_EQ(state.find_correlation(ts_old), nullptr);
+    EXPECT_FALSE(state.take_correlation(ts_old).has_value());
+
+    // The recovery output acquires EXACTLY its own frame/sequence/timestamp.
+    const auto meta = state.take_correlation(ts_recovery);
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(meta->frame, 8U);
+    EXPECT_EQ(meta->sequence, 12U);
+    EXPECT_EQ(meta->timestamp_ns, ts_recovery);
+    EXPECT_EQ(state.pending_count(), 0U);
+}
+
+TEST(ConsumerDecodeCorrelation, NormalIdrPreservesOutstandingCorrelations) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point now{};
+    DecodeSessionState state;
+
+    // IDR, P frame, then an ordinary IDR while NOT recovering.
+    const std::uint64_t ts_first = kTimestampBaseNs;
+    const std::uint64_t ts_middle = kTimestampBaseNs + kFramePeriodNs;
+    const std::uint64_t ts_idr = kTimestampBaseNs + 2 * kFramePeriodNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_first, true, now));
+    state.accept_timestamp(ts_first);
+    state.record_correlation(1, 1, ts_first, now);
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_middle, false, now));
+    state.accept_timestamp(ts_middle);
+    state.record_correlation(2, 2, ts_middle, now);
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_idr, true, now));
+    state.accept_timestamp(ts_idr);
+    state.record_correlation(3, 3, ts_idr, now);
+
+    // An ordinary IDR never invalidates: the prior mappings remain deliverable
+    // with their own metadata.
+    EXPECT_FALSE(state.awaiting_idr);
+    ASSERT_EQ(state.pending_count(), 3U);
+    const auto first = state.take_correlation(ts_first);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->frame, 1U);
+    EXPECT_EQ(first->sequence, 1U);
+    EXPECT_EQ(first->timestamp_ns, ts_first);
+    const auto middle = state.take_correlation(ts_middle);
+    ASSERT_TRUE(middle.has_value());
+    EXPECT_EQ(middle->frame, 2U);
+    EXPECT_EQ(middle->sequence, 2U);
+    EXPECT_EQ(middle->timestamp_ns, ts_middle);
+}
+
+TEST(ConsumerDecodeCorrelation, RejectedRecoveryIdrPreservesResyncState) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point t0{};
+    DecodeSessionState state;
+
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, kTimestampBaseNs, true, t0));
+    state.accept_timestamp(kTimestampBaseNs);
+    state.record_correlation(1, 1, kTimestampBaseNs, t0);
+    const Clock::time_point stale = t0 + DecodeSessionState::kCorrelationRetention;
+    state.expire_stale_correlations(stale);
+    ASSERT_TRUE(state.awaiting_idr);
+
+    // An oversized recovery IDR is byte-rejected with the retryable
+    // ipc_queue_full (timestamp contract passed; it may retry after a drain).
+    const std::uint64_t ts_recovery = kTimestampBaseNs + kFramePeriodNs;
+    const std::size_t oversized =
+        static_cast<std::size_t>(DecodeSessionState::kMaxFeedBacklogBytes) + 1U;
+    const auto rejected = state.admit_submission(FeedLoad{0, oversized}, ts_recovery, true, stale);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), ErrorCode::ipc_queue_full);
+
+    // The rejection preserves the resync state: awaiting_idr stays armed and
+    // the timestamp high-water mark is untouched (no reset at IDR recovery).
+    EXPECT_TRUE(state.awaiting_idr);
+    ASSERT_TRUE(state.last_accepted_timestamp_ns.has_value());
+    EXPECT_EQ(*state.last_accepted_timestamp_ns, kTimestampBaseNs);
+    EXPECT_EQ(state.pending_count(), 0U);
+}
+
+namespace {
+
+// Shared terminal-latch scenario: open forced-software, feed garbage until
+// the asynchronous decoder failure surfaces once, and report the code of that
+// FIRST observed failure. Subsequent operations are expected to be latched.
+std::optional<ErrorCode> surface_first_runtime_failure(DecodeHelper& helper,
+                                                       std::uint64_t& callbacks) {
+    const std::vector<std::uint8_t> garbage{'N', 'O', 'T', '_', 'A', '_', 'V'};
+    std::optional<ErrorCode> first;
+    auto submitted = helper.submit(VideoAccessUnit{0, 0, kTimestampBaseNs, true, garbage});
+    if (!submitted) {
+        first = submitted.error().code();
+    }
+    if (!first.has_value()) {
+        // The parser buffers undecodable trailing bytes silently; the EOS
+        // flush is what forces the decoder error onto the bus (the existing
+        // malformed scenario's mechanism).
+        auto eos = helper.end_of_stream();
+        if (!eos) {
+            first = eos.error().code();
+        }
+    }
+    for (int i = 0; i < 25 && !first.has_value(); ++i) {
+        auto pumped = helper.pump(aa::core::Milliseconds{20});
+        if (!pumped) {
+            first = pumped.error().code();
+        }
+    }
+    (void)callbacks;
+    return first;
+}
+
+} // namespace
+
+TEST(ConsumerDecodeRuntime, TerminalFailureRemainsLatched) {
+    // The private production state: first latch wins and the session reports
+    // terminal from then on.
+    DecodeSessionState state;
+    state.record_correlation(7, 1, 100, DecodeSessionState::Clock::now());
+    state.latch_terminal(ErrorCode::channel_decode_failed);
+    ASSERT_TRUE(state.terminal());
+    EXPECT_EQ(state.terminal_error.value(), ErrorCode::channel_decode_failed);
+    state.latch_terminal(ErrorCode::channel_caps_unsupported);
+    EXPECT_EQ(state.terminal_error.value(), ErrorCode::channel_decode_failed);
+
+    // Public path (the forced-software malformed scenario, extended): after
+    // the first observed decoder error every active-session operation returns
+    // the latched error - no feeding, no pulling, no recovery IDRs.
+    DecodeConfig config;
+    config.caps = kPrimaryCaps;
+    config.backend = DecodeBackend::software;
+    std::uint64_t callbacks = 0;
+    config.on_frame = [&](const auto&) { ++callbacks; };
+    auto helper = DecodeHelper::open(std::move(config));
+    if (!helper) {
+        GTEST_SKIP() << "no software decoder available on this host";
+    }
+    const auto first = surface_first_runtime_failure(helper.value(), callbacks);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(*first, ErrorCode::channel_decode_failed);
+
+    const std::vector<std::uint8_t> idr{0x00, 0x00, 0x00, 0x01, 0x65};
+    const auto recovery = helper.value().submit(VideoAccessUnit{1, 1, kTimestampBaseNs + 33333333LL, true, idr});
+    ASSERT_FALSE(recovery);
+    EXPECT_EQ(recovery.error().code(), ErrorCode::channel_decode_failed);
+    auto pumped = helper.value().pump(aa::core::Milliseconds{0});
+    ASSERT_FALSE(pumped);
+    EXPECT_EQ(pumped.error().code(), ErrorCode::channel_decode_failed);
+    auto eos = helper.value().end_of_stream();
+    ASSERT_FALSE(eos);
+    EXPECT_EQ(eos.error().code(), ErrorCode::channel_decode_failed);
+    EXPECT_EQ(callbacks, 0U);
+
+    helper.value().close();
+    helper.value().close();
+}
+
+TEST(ConsumerDecodeRuntime, TerminalFailureSuppressesCallbacks) {
+    DecodeConfig config;
+    config.caps = kPrimaryCaps;
+    config.backend = DecodeBackend::software;
+    std::uint64_t callbacks = 0;
+    config.on_frame = [&](const auto&) { ++callbacks; };
+    auto helper = DecodeHelper::open(std::move(config));
+    if (!helper) {
+        GTEST_SKIP() << "no software decoder available on this host";
+    }
+    const auto first = surface_first_runtime_failure(helper.value(), callbacks);
+    ASSERT_TRUE(first.has_value());
+
+    const std::vector<std::uint8_t> idr{0x00, 0x00, 0x00, 0x01, 0x65};
+    (void)helper.value().submit(VideoAccessUnit{2, 2, kTimestampBaseNs + 66666666LL, true, idr});
+    (void)helper.value().pump(aa::core::Milliseconds{50});
+    EXPECT_EQ(callbacks, 0U);
+    helper.value().close();
+}
+
+TEST(ConsumerDecodeRuntime, DimensionMismatchLatchesCapsUnsupported) {
+    DecodeConfig config;
+    config.caps = kFallbackCaps;
+    config.backend = DecodeBackend::software;
+    std::uint64_t callbacks = 0;
+    config.on_frame = [&](const auto&) { ++callbacks; };
+    auto helper = DecodeHelper::open(std::move(config));
+    if (!helper) {
+        GTEST_SKIP() << "no software decoder available on this host";
+    }
+    const auto stream = read_file(fixture_path());
+    ASSERT_FALSE(stream.empty());
+    const auto units = parse_annexb_units(stream);
+    ASSERT_FALSE(units.empty());
+
+    std::optional<ErrorCode> first;
+    std::uint64_t frame = 0;
+    std::uint64_t sequence = 0;
+    for (std::size_t i = 0; i < units.size() && !first.has_value(); ++i) {
+        const std::uint64_t timestamp_ns = kTimestampBaseNs + i * 33'333'333ULL;
+        auto submitted = helper.value().submit(
+            VideoAccessUnit{frame, sequence, timestamp_ns, units[i].idr, units[i].data});
+        if (!submitted) {
+            first = submitted.error().code();
+            break;
+        }
+        ++frame;
+        ++sequence;
+        auto pumped = helper.value().pump(aa::core::Milliseconds{200});
+        if (!pumped) {
+            first = pumped.error().code();
+        }
+    }
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(*first, ErrorCode::channel_caps_unsupported);
+
+    const std::vector<std::uint8_t> idr{0x00, 0x00, 0x00, 0x01, 0x65};
+    auto again = helper.value().submit(
+        VideoAccessUnit{frame + 1, sequence + 1, kTimestampBaseNs + 999'999'999ULL, true, idr});
+    ASSERT_FALSE(again);
+    EXPECT_EQ(again.error().code(), ErrorCode::channel_caps_unsupported);
+    auto eos = helper.value().end_of_stream();
+    ASSERT_FALSE(eos);
+    EXPECT_EQ(eos.error().code(), ErrorCode::channel_caps_unsupported);
+    auto pumped = helper.value().pump(aa::core::Milliseconds{0});
+    ASSERT_FALSE(pumped);
+    EXPECT_EQ(pumped.error().code(), ErrorCode::channel_caps_unsupported);
+    EXPECT_EQ(callbacks, 0U);
+    helper.value().close();
 }
