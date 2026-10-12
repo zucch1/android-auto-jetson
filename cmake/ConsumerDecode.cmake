@@ -107,10 +107,12 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME consumer_decode_backend COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeBackend.*)
     add_test(NAME consumer_decode_probe COMMAND aa_consumer_decode_test --gtest_filter=ConsumerProbeIntegration.*)
     add_test(NAME consumer_decode_admission COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeAdmission.*)
-    add_test(NAME consumer_decode_correlation COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeCorrelation.*)
+    add_test(NAME consumer_decode_runtime
+    COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeRuntime.*)
+add_test(NAME consumer_decode_correlation COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeCorrelation.*)
     set_tests_properties(consumer_decode_caps consumer_decode_fixture consumer_decode_backend
         consumer_decode_probe consumer_decode_admission consumer_decode_correlation
-        PROPERTIES TIMEOUT 120)
+        consumer_decode_runtime PROPERTIES TIMEOUT 120)
 endif()
 
 unset(AA_CONSUMER_SOURCES)

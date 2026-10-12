@@ -83,6 +83,21 @@ struct DecodeSessionState final {
     // and no non-IDR submission acquires a mapping.
     bool awaiting_idr{};
 
+    // Terminal runtime failure latch (contract on Decode.hpp): the first
+    // fatal error observed after open() is remembered and every later
+    // active-session operation fails with it without touching the pipeline.
+    // First latch wins; correlation metadata goes with the failed session.
+    std::optional<ErrorCode> terminal_error{};
+
+    void latch_terminal(ErrorCode code) noexcept {
+        if (!terminal_error.has_value()) {
+            terminal_error = code;
+            clear_correlations();
+        }
+    }
+
+    [[nodiscard]] bool terminal() const noexcept { return terminal_error.has_value(); }
+
     // Feed-backlog admission arithmetic, overflow-free by construction: the
     // payload is rejected against the full limit before the subtraction, so
     // kMaxFeedBacklogBytes - payload_size never underflows and a huge

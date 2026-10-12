@@ -191,7 +191,12 @@ struct DecodeHelper::Impl final {
         session.clear_correlations();
     }
 
-    [[nodiscard]] core::Result<void> bus_error() const {
+    [[nodiscard]] core::Result<void> fail_terminal(ErrorCode code) noexcept {
+        session.latch_terminal(code);
+        return core::Result<void>{Error{code}};
+    }
+
+    [[nodiscard]] core::Result<void> bus_error() {
         if (bus == nullptr) {
             return core::Result<void>{};
         }
@@ -207,7 +212,7 @@ struct DecodeHelper::Impl final {
         }
         g_free(debug);
         gst_message_unref(message);
-        return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
+        return fail_terminal(ErrorCode::channel_decode_failed);
     }
 
     // appsrc -> h264parse -> decoder [-> nvvidconv when the decoder output is
@@ -409,6 +414,9 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
     if (!impl_ || impl_->pipeline == nullptr) {
         return core::Result<void>{Error{ErrorCode::invalid_argument}};
     }
+    if (impl_->session.terminal()) {
+        return core::Result<void>{Error{impl_->session.terminal_error.value()}};
+    }
     if (impl_->eos_sent) {
         return core::Result<void>{Error{ErrorCode::invalid_argument}};
     }
@@ -439,7 +447,7 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
 
     GstBuffer* buffer = gst_buffer_new_allocate(nullptr, access_unit.payload.size(), nullptr);
     if (buffer == nullptr) {
-        return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
+        return impl_->fail_terminal(ErrorCode::channel_decode_failed);
     }
     gst_buffer_fill(buffer, 0, access_unit.payload.data(), access_unit.payload.size());
     GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(access_unit.timestamp_ns);
@@ -454,7 +462,7 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
 
     const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(impl_->appsrc), buffer);
     if (flow != GST_FLOW_OK) {
-        return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
+        return impl_->fail_terminal(ErrorCode::channel_decode_failed);
     }
     impl_->session.accept_timestamp(access_unit.timestamp_ns);
     impl_->session.record_correlation(access_unit.frame, access_unit.sequence,
@@ -463,14 +471,20 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
 }
 
 core::Result<void> DecodeHelper::end_of_stream() {
-    if (!impl_ || impl_->pipeline == nullptr || impl_->eos_sent) {
+    if (!impl_ || impl_->pipeline == nullptr) {
+        return core::Result<void>{Error{ErrorCode::invalid_argument}};
+    }
+    if (impl_->session.terminal()) {
+        return core::Result<void>{Error{impl_->session.terminal_error.value()}};
+    }
+    if (impl_->eos_sent) {
         return core::Result<void>{Error{ErrorCode::invalid_argument}};
     }
     if (auto failed = impl_->bus_error(); !failed.has_value()) {
         return failed;
     }
     if (gst_app_src_end_of_stream(GST_APP_SRC(impl_->appsrc)) != GST_FLOW_OK) {
-        return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
+        return impl_->fail_terminal(ErrorCode::channel_decode_failed);
     }
     impl_->eos_sent = true;
     return core::Result<void>{};
@@ -479,6 +493,9 @@ core::Result<void> DecodeHelper::end_of_stream() {
 core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
     if (!impl_ || impl_->pipeline == nullptr) {
         return core::Result<std::size_t>{Error{ErrorCode::invalid_argument}};
+    }
+    if (impl_->session.terminal()) {
+        return core::Result<std::size_t>{Error{impl_->session.terminal_error.value()}};
     }
     std::size_t delivered = 0;
     const std::uint64_t first_timeout =
@@ -523,6 +540,7 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
             && gst_video_frame_map(&video_frame, &info, buffer, GST_MAP_READ);
         if (!mapped) {
             gst_sample_unref(sample);
+            impl_->session.latch_terminal(ErrorCode::channel_decode_failed);
             return core::Result<std::size_t>{Error{ErrorCode::channel_decode_failed}};
         }
 

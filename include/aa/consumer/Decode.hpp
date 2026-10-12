@@ -135,6 +135,15 @@ struct DecodeConfig final {
     FrameCallback on_frame{};
 };
 
+// Automatic backend selection and functional software substitution occur
+// only during open(). Failures observed AFTER open() returns are terminal for
+// that helper: runtime decoder errors return channel_decode_failed (observed
+// dimension mismatch returns channel_caps_unsupported), with no automatic
+// restart or backend switch. The caller must close and reopen externally,
+// then supply a decodable IDR with the necessary parameter sets. An
+// asynchronous startup error first observed later is terminal under the same
+// contract. No runtime recovery guarantee, decode-latency budget claim, or
+// software-fallback qualification is made.
 class DecodeHelper final {
 public:
     // Runtime decoder detection over the probe's known candidate table

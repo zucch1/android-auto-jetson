@@ -1147,3 +1147,100 @@ TEST(ConsumerDecodeCorrelation, RejectedRecoveryIdrPreservesResyncState) {
     EXPECT_EQ(*state.last_accepted_timestamp_ns, kTimestampBaseNs);
     EXPECT_EQ(state.pending_count(), 0U);
 }
+
+namespace {
+
+// Shared terminal-latch scenario: open forced-software, feed garbage until
+// the asynchronous decoder failure surfaces once, and report the code of that
+// FIRST observed failure. Subsequent operations are expected to be latched.
+std::optional<ErrorCode> surface_first_runtime_failure(DecodeHelper& helper,
+                                                       std::uint64_t& callbacks) {
+    const std::vector<std::uint8_t> garbage{'N', 'O', 'T', '_', 'A', '_', 'V'};
+    std::optional<ErrorCode> first;
+    auto submitted = helper.submit(VideoAccessUnit{0, 0, kTimestampBaseNs, true, garbage});
+    if (!submitted) {
+        first = submitted.error().code();
+    }
+    if (!first.has_value()) {
+        // The parser buffers undecodable trailing bytes silently; the EOS
+        // flush is what forces the decoder error onto the bus (the existing
+        // malformed scenario's mechanism).
+        auto eos = helper.end_of_stream();
+        if (!eos) {
+            first = eos.error().code();
+        }
+    }
+    for (int i = 0; i < 25 && !first.has_value(); ++i) {
+        auto pumped = helper.pump(aa::core::Milliseconds{20});
+        if (!pumped) {
+            first = pumped.error().code();
+        }
+    }
+    (void)callbacks;
+    return first;
+}
+
+} // namespace
+
+TEST(ConsumerDecodeRuntime, TerminalFailureRemainsLatched) {
+    // The private production state: first latch wins and the session reports
+    // terminal from then on.
+    DecodeSessionState state;
+    state.record_correlation(7, 1, 100, DecodeSessionState::Clock::now());
+    state.latch_terminal(ErrorCode::channel_decode_failed);
+    ASSERT_TRUE(state.terminal());
+    EXPECT_EQ(state.terminal_error.value(), ErrorCode::channel_decode_failed);
+    state.latch_terminal(ErrorCode::channel_caps_unsupported);
+    EXPECT_EQ(state.terminal_error.value(), ErrorCode::channel_decode_failed);
+
+    // Public path (the forced-software malformed scenario, extended): after
+    // the first observed decoder error every active-session operation returns
+    // the latched error - no feeding, no pulling, no recovery IDRs.
+    DecodeConfig config;
+    config.caps = kPrimaryCaps;
+    config.backend = DecodeBackend::software;
+    std::uint64_t callbacks = 0;
+    config.on_frame = [&](const auto&) { ++callbacks; };
+    auto helper = DecodeHelper::open(std::move(config));
+    if (!helper) {
+        GTEST_SKIP() << "no software decoder available on this host";
+    }
+    const auto first = surface_first_runtime_failure(helper.value(), callbacks);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(*first, ErrorCode::channel_decode_failed);
+
+    const std::vector<std::uint8_t> idr{0x00, 0x00, 0x00, 0x01, 0x65};
+    const auto recovery = helper.value().submit(VideoAccessUnit{1, 1, kTimestampBaseNs + 33333333LL, true, idr});
+    ASSERT_FALSE(recovery);
+    EXPECT_EQ(recovery.error().code(), ErrorCode::channel_decode_failed);
+    auto pumped = helper.value().pump(aa::core::Milliseconds{0});
+    ASSERT_FALSE(pumped);
+    EXPECT_EQ(pumped.error().code(), ErrorCode::channel_decode_failed);
+    auto eos = helper.value().end_of_stream();
+    ASSERT_FALSE(eos);
+    EXPECT_EQ(eos.error().code(), ErrorCode::channel_decode_failed);
+    EXPECT_EQ(callbacks, 0U);
+
+    helper.value().close();
+    helper.value().close();
+}
+
+TEST(ConsumerDecodeRuntime, TerminalFailureSuppressesCallbacks) {
+    DecodeConfig config;
+    config.caps = kPrimaryCaps;
+    config.backend = DecodeBackend::software;
+    std::uint64_t callbacks = 0;
+    config.on_frame = [&](const auto&) { ++callbacks; };
+    auto helper = DecodeHelper::open(std::move(config));
+    if (!helper) {
+        GTEST_SKIP() << "no software decoder available on this host";
+    }
+    const auto first = surface_first_runtime_failure(helper.value(), callbacks);
+    ASSERT_TRUE(first.has_value());
+
+    const std::vector<std::uint8_t> idr{0x00, 0x00, 0x00, 0x01, 0x65};
+    (void)helper.value().submit(VideoAccessUnit{2, 2, kTimestampBaseNs + 66666666LL, true, idr});
+    (void)helper.value().pump(aa::core::Milliseconds{50});
+    EXPECT_EQ(callbacks, 0U);
+    helper.value().close();
+}
