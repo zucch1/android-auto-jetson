@@ -62,6 +62,16 @@ set_target_properties(aareceiver-consumer PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 target_include_directories(aareceiver-consumer PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aareceiver-consumer PUBLIC aa_core PRIVATE PkgConfig::AA_CONSUMER_GST)
+# Build-time provenance gates: a direct target build after a cross configure must
+# revalidate the hash-gated sysroot/overlay inputs before compiling. Each guard
+# is independent - a gate is attached on its own presence, never inferred from the
+# other (mirrors tools/aa-decode-probe/CMakeLists.txt).
+if(TARGET aa_sysroot_hash_gate)
+    add_dependencies(aareceiver-consumer aa_sysroot_hash_gate)
+endif()
+if(TARGET aa_decode_overlay_hash_gate)
+    add_dependencies(aareceiver-consumer aa_decode_overlay_hash_gate)
+endif()
 
 set(AA_CONSUMER_WARN_TARGETS aareceiver-consumer)
 if(NOT CMAKE_CROSSCOMPILING)
@@ -113,6 +123,23 @@ add_test(NAME consumer_decode_correlation COMMAND aa_consumer_decode_test --gtes
     set_tests_properties(consumer_decode_caps consumer_decode_fixture consumer_decode_backend
         consumer_decode_probe consumer_decode_admission consumer_decode_correlation
         consumer_decode_runtime PROPERTIES TIMEOUT 120)
+    # Host-only tamper regression drivers: each configures the actual root project
+    # for cross against the fixture-only hash-gated sysroot/overlay pair, changes a
+    # fixture input AFTER configure, and proves the direct aareceiver-consumer build
+    # re-runs the provenance gates before compiling. Synthetic compile/build-policy
+    # fixtures, not target qualification. Generous timeout: they configure + build.
+    foreach(_aa_consumer_tamper_case sysroot overlay)
+        add_test(NAME consumer_decode_build_${_aa_consumer_tamper_case}_tamper
+            COMMAND "${Python3_EXECUTABLE}" -B
+                "${CMAKE_SOURCE_DIR}/tests/consumer/consumer_decode_build_policy.py"
+                --case "${_aa_consumer_tamper_case}"
+                --root "${CMAKE_SOURCE_DIR}"
+                --archive "${AA_GOOGLETEST_ARCHIVE}"
+                --logs "${CMAKE_CURRENT_BINARY_DIR}/consumer-decode-tamper")
+        set_tests_properties(consumer_decode_build_${_aa_consumer_tamper_case}_tamper
+            PROPERTIES TIMEOUT 600)
+    endforeach()
+    unset(_aa_consumer_tamper_case)
 endif()
 
 unset(AA_CONSUMER_SOURCES)
