@@ -21,6 +21,14 @@
 // malformed, group/world-accessible or future-versioned store file is a typed
 // error and leaves the store unusable — never silently trusted.
 //
+// PARTIAL-EFFECT CONTRACT: a mutation that returns
+// ErrorCode::trust_store_not_durable (703) IS already applied in memory and
+// on disk (the replacement renamed; only crash durability of the new
+// directory entry is unconfirmed) — an approval returning 703 may already
+// exist and a forget returning 703 is already revoked. Every other mutation
+// error is pre-replacement and leaves the store fully unchanged (in memory
+// and on disk).
+//
 // Ownership/threading: one instance owned by the session thread; load() once,
 // then const lookups and the approve/forget mutations.
 
