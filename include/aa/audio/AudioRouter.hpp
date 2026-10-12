@@ -178,13 +178,19 @@ public:
 
     // Channel/session audio path entry (task-18 dispatch shape). Non-audio
     // role -> invalid_argument; over the payload bound -> invalid_argument;
-    // decode failure -> audio_decode_failed / audio_format_unsupported.
+    // decode failure -> audio_decode_failed / audio_format_unsupported;
+    // negative timestamp -> invalid_argument (rejected before decode).
     [[nodiscard]] core::Result<void> submit(const protocol::MessageView& message);
 
     // Mixes and writes every pending frame to the routing element. A write
     // failure (bus error, render-barrier stall, drained route) transitions the
     // router to degraded with the cause recorded and fails typed
-    // audio_sink_unavailable.
+    // audio_sink_unavailable. Runs are scheduled on one persistent sample
+    // timeline across pumps (first nonempty pump anchors the base; split and
+    // batched pumps of one schedule produce identical output); a gap or
+    // late-arrival discontinuity above the 200 ms safety caps is rejected
+    // invalid_argument before any write (the batch is discarded, cursor and
+    // counters unchanged). Output pieces are bounded to 64 KiB whole-frame.
     [[nodiscard]] core::Result<void> pump();
     // Bounded render drain: mixes and writes pending frames, then drains the
     // routed stream to end-of-stream (render completion of everything

@@ -28,6 +28,7 @@ namespace {
 constexpr std::size_t kRoleCount = 4;
 constexpr std::size_t kMaxAudioPayloadBytes = std::size_t{64} * 1024;
 constexpr std::size_t kMaxPendingRunsPerRole = 512;
+constexpr std::size_t kMaxOutputPieceBytes = std::size_t{64} * 1024;
 
 [[nodiscard]] std::optional<Role> role_of(protocol::ChannelRole channel) {
     switch (channel) {
@@ -132,6 +133,14 @@ struct AudioRouter::Impl final {
     std::array<std::deque<Run>, kRoleCount> pending{};
     std::vector<std::byte> silence_scratch{};
 
+    // Persistent sample timeline across pumps: base timestamp anchored at the
+    // FIRST nonempty pump, the playback cursor (frames already committed to
+    // the sink), and each role's committed end. Split and batched pumps of the
+    // same schedule therefore produce identical output.
+    std::optional<core::Nanoseconds> timeline_base{};
+    std::uint64_t playback_cursor_frames{0};
+    std::array<std::uint64_t, kRoleCount> role_end_frames{};
+
     void mark_degraded(std::string cause) {
         report.state = RouterState::degraded;
         report.sink.usable = false;
@@ -142,25 +151,77 @@ struct AudioRouter::Impl final {
     }
 
     [[nodiscard]] core::Nanoseconds frames_to_ns(std::uint64_t frames) const {
-        return core::Nanoseconds{
-            static_cast<std::int64_t>(frames) * 1'000'000'000LL
-            / static_cast<std::int64_t>(config.output_format.sample_rate_hz)};
+        std::int64_t out = 0;
+        if (!frames_to_ns_checked(frames, out)) {
+            return core::Nanoseconds{0};
+        }
+        return core::Nanoseconds{out};
+    }
+
+    // floor(frames * 1e9 / rate) via quotient/remainder (frames * 1e9
+    // overflows int64 on long timelines). False when the result is not
+    // representable.
+    [[nodiscard]] bool frames_to_ns_checked(std::uint64_t frames, std::int64_t& out) const {
+        const auto rate = static_cast<std::uint64_t>(config.output_format.sample_rate_hz);
+        const std::uint64_t q = frames / rate;
+        const std::uint64_t r = frames % rate;
+        if (q > static_cast<std::uint64_t>(INT64_MAX / 1'000'000'000LL)) {
+            return false;
+        }
+        out = static_cast<std::int64_t>(q) * 1'000'000'000LL
+            + static_cast<std::int64_t>((r * 1'000'000'000LL) / rate);
+        return true;
     }
 
     [[nodiscard]] std::uint64_t ns_to_frames(core::Nanoseconds ns) const {
-        return static_cast<std::uint64_t>(
-            (ns.count * static_cast<std::int64_t>(config.output_format.sample_rate_hz))
-            / 1'000'000'000LL);
+        std::int64_t out = 0;
+        if (!ns_to_frames_signed(ns, out) || out < 0) {
+            return 0;
+        }
+        return static_cast<std::uint64_t>(out);
+    }
+
+    // floor(ns * rate / 1e9) with floor semantics for negative displacements
+    // (quotient/remainder; ns * rate overflows int64 at large timestamps).
+    [[nodiscard]] bool ns_to_frames_signed(core::Nanoseconds ns, std::int64_t& out) const {
+        const auto rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
+        std::int64_t q = ns.count / 1'000'000'000LL;
+        std::int64_t r = ns.count % 1'000'000'000LL;
+        if (r < 0) {
+            q -= 1;
+            r += 1'000'000'000LL;
+        }
+        out = q * rate + (r * rate) / 1'000'000'000LL;
+        return true;
+    }
+
+    // Effective scheduled timestamp time(f) = base + floor(f * 1e9 / rate),
+    // computed from the base every time (never accumulated rounded adds).
+    [[nodiscard]] bool frame_time(std::uint64_t frame, std::int64_t base_ns,
+                                  std::int64_t& out) const {
+        std::int64_t delta = 0;
+        if (!frames_to_ns_checked(frame, delta)) {
+            return false;
+        }
+        if (base_ns > INT64_MAX - delta) {
+            return false;
+        }
+        out = base_ns + delta;
+        return true;
     }
 };
 
-core::Result<AudioRouter> AudioRouter::open(const RouterConfig& config) {
+namespace {
+
+core::Result<AudioRouter> open_router_with(const RouterConfig& config,
+                                           std::unique_ptr<detail::ObservedAudioSink> injected) {
     if (config.output_format.bits_per_sample != 16 || config.output_format.channels == 0
-        || config.output_format.sample_rate_hz == 0) {
+        || config.output_format.sample_rate_hz == 0
+        || config.output_format.sample_rate_hz > static_cast<std::uint32_t>(INT32_MAX)) {
         return core::Result<AudioRouter>{Error{ErrorCode::audio_format_unsupported}};
     }
 
-    auto impl = std::make_unique<Impl>();
+    auto impl = std::make_unique<AudioRouter::Impl>();
     impl->config = config;
     impl->mixer = AudioMixer{config.mix};
     impl->report.sink.requested = config.backend;
@@ -177,30 +238,52 @@ core::Result<AudioRouter> AudioRouter::open(const RouterConfig& config) {
         impl->decoders[i] = std::make_unique<AudioDecoder>(std::move(decoder).value());
     }
 
-    detail::SinkOpenRequest request;
-    request.format = config.output_format;
-    request.backend = config.backend;
-    request.target = config.sink_remote;
-    request.start_timeout = config.sink_start_timeout;
-    request.write_timeout = config.sink_write_timeout;
-    request.drop_nonempty_at_ingress = config.drop_nonempty_at_ingress;
-    request.drop_nonempty_after_window = config.drop_nonempty_after_window;
-    detail::SinkOpenOutcome outcome = detail::open_default_sink(request);
-
-    impl->report.sink = outcome.report;
-    if (!outcome.sink) {
-        // No usable route: the router opens DEGRADED with the recorded cause.
-        // Every submit()/pump() then fails typed - never silence pretending
-        // success, never a crash.
-        impl->mark_degraded(outcome.report.cause.empty()
-                                ? "disabled: no PipeWire-capable sink element usable"
-                                : outcome.report.cause);
+    if (injected) {
+        impl->report.sink.usable = true;
+        impl->report.sink.selected_element = "test-recording-sink";
+        impl->report.sink.cause = "enabled: test recording sink";
+        impl->sink = std::move(injected);
     } else {
-        impl->sink = std::move(outcome.sink);
+        detail::SinkOpenRequest request;
+        request.format = config.output_format;
+        request.backend = config.backend;
+        request.target = config.sink_remote;
+        request.start_timeout = config.sink_start_timeout;
+        request.write_timeout = config.sink_write_timeout;
+        request.drop_nonempty_at_ingress = config.drop_nonempty_at_ingress;
+        request.drop_nonempty_after_window = config.drop_nonempty_after_window;
+        detail::SinkOpenOutcome outcome = detail::open_default_sink(request);
+
+        impl->report.sink = outcome.report;
+        if (!outcome.sink) {
+            // No usable route: the router opens DEGRADED with the recorded
+            // cause. Every submit()/pump() then fails typed - never silence
+            // pretending success, never a crash.
+            impl->mark_degraded(outcome.report.cause.empty()
+                                    ? "disabled: no PipeWire-capable sink element usable"
+                                    : outcome.report.cause);
+        } else {
+            impl->sink = std::move(outcome.sink);
+        }
     }
 
     return core::Result<AudioRouter>{AudioRouter{std::move(impl)}};
 }
+
+} // namespace
+
+core::Result<AudioRouter> AudioRouter::open(const RouterConfig& config) {
+    return open_router_with(config, nullptr);
+}
+
+namespace detail {
+
+core::Result<AudioRouter> open_router_with_sink_for_test(const RouterConfig& config,
+                                                         std::unique_ptr<ObservedAudioSink> sink) {
+    return open_router_with(config, std::move(sink));
+}
+
+} // namespace detail
 
 AudioRouter::AudioRouter(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
@@ -225,6 +308,9 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message) {
         return Error{ErrorCode::invalid_argument};
     }
     if (message.payload.empty() || message.payload.size() > kMaxAudioPayloadBytes) {
+        return Error{ErrorCode::invalid_argument};
+    }
+    if (message.header.timestamp.count < 0) {
         return Error{ErrorCode::invalid_argument};
     }
     const std::size_t index = role_index(*role);
@@ -277,42 +363,89 @@ core::Result<void> AudioRouter::pump() {
         return Error{ErrorCode::audio_sink_unavailable};
     }
 
-    // Gate fix F2: mix on a SAMPLE TIMELINE. Every pending run occupies a
-    // frame range on one timeline anchored at the earliest run timestamp;
-    // every run start/end is a boundary; each interval mixes exactly the
-    // frames present in it (staggered starts get a ducked overlap instead of
-    // being sequentialized into separate blocks).
-    std::optional<core::Nanoseconds> timeline_origin;
-    for (const auto& queue : impl_->pending) {
-        for (const Run& run : queue) {
-            if (!timeline_origin.has_value() || run.timestamp < *timeline_origin) {
-                timeline_origin = run.timestamp;
+    // Gate fix F2 + persistent-cursor fix: mix on a PERSISTENT SAMPLE
+    // TIMELINE. The base anchors at the FIRST nonempty pump and the playback
+    // cursor + per-role ends carry across pumps, so split and batched pumps of
+    // one schedule produce identical output. Every run occupies a frame
+    // range; boundaries split the sweep; uncovered intervals ahead of the
+    // cursor become bounded silence; every piece carries its EFFECTIVE
+    // scheduled timestamp time(f) = B + floor(f*1e9/R).
+    std::optional<core::Nanoseconds> base = impl_->timeline_base;
+    if (!base.has_value()) {
+        for (const auto& queue : impl_->pending) {
+            for (const Run& run : queue) {
+                if (!base.has_value() || run.timestamp < *base) {
+                    base = run.timestamp;
+                }
             }
         }
     }
-    if (!timeline_origin.has_value()) {
+    if (!base.has_value()) {
         impl_->report.sink_probe = impl_->sink->probe_stats();
         impl_->report.render_barrier = impl_->sink->render_stats();
         return {};
     }
+    const std::int64_t base_ns = base->count;
+    const std::uint64_t cursor = impl_->playback_cursor_frames;
+
+    // Discontinuity policy: 200 ms safety caps (tied to the receiver latency
+    // budget, NOT negotiated limits) on each uncovered gap, the total
+    // synthesized silence per pump, and late-arrival displacement.
+    std::int64_t cap_signed = 0;
+    if (!impl_->ns_to_frames_signed(core::Nanoseconds{200'000'000LL}, cap_signed)) {
+        return Error{ErrorCode::invalid_argument};
+    }
+    const std::uint64_t cap_frames = static_cast<std::uint64_t>(cap_signed);
+    const std::size_t frame_bytes = static_cast<std::size_t>(
+        impl_->config.output_format.channels * sizeof(std::int16_t));
 
     std::vector<ScheduledRun> scheduled;
+    std::array<std::uint64_t, kRoleCount> new_role_ends = impl_->role_end_frames;
+    bool schedule_ok = true;
     for (std::size_t i = 0; i < kRoleCount; ++i) {
-        std::uint64_t role_end = 0;
+        std::uint64_t role_end = impl_->role_end_frames[i];
         for (const Run& run : impl_->pending[i]) {
+            std::int64_t intended = 0;
+            if (!impl_->ns_to_frames_signed(core::Nanoseconds{run.timestamp.count - base_ns},
+                                            intended)) {
+                schedule_ok = false;
+                continue;
+            }
+            if (intended < static_cast<std::int64_t>(cursor)) {
+                const auto late =
+                    static_cast<std::uint64_t>(static_cast<std::int64_t>(cursor) - intended);
+                if (late > cap_frames) {
+                    schedule_ok = false;
+                }
+            }
             ScheduledRun entry;
             entry.role = i;
-            const core::Nanoseconds offset{run.timestamp.count - timeline_origin->count};
-            // Same-role runs sequentialize in arrival order: a later chunk
-            // starts no earlier than the previous one ends, so overlapping
-            // channel chunks never drop samples or share a mixer slot. Across
-            // roles the recorded timestamps place the runs (stagger included).
-            entry.start_frame = std::max(impl_->ns_to_frames(offset), role_end);
+            const std::int64_t placed = std::max<int64_t>(
+                intended, static_cast<std::int64_t>(std::max(cursor, role_end)));
+            entry.start_frame = static_cast<std::uint64_t>(placed);
+            if (run.frames > UINT64_MAX - entry.start_frame) {
+                schedule_ok = false;
+                continue;
+            }
             entry.end_frame = entry.start_frame + run.frames;
+            std::int64_t end_ns = 0;
+            if (!impl_->frame_time(entry.end_frame, base_ns, end_ns)) {
+                schedule_ok = false;
+                continue;
+            }
             role_end = entry.end_frame;
+            new_role_ends[i] = entry.end_frame;
             entry.run = &run;
             scheduled.push_back(entry);
         }
+    }
+    if (!schedule_ok) {
+        // Rejected discontinuity: the batch is discarded and no timeline
+        // state, mixer state, sink state or counters change.
+        for (auto& queue : impl_->pending) {
+            queue.clear();
+        }
+        return Error{ErrorCode::invalid_argument};
     }
     if (scheduled.empty()) {
         impl_->report.sink_probe = impl_->sink->probe_stats();
@@ -327,8 +460,8 @@ core::Result<void> AudioRouter::pump() {
 
     // Boundaries: every run start and end (frame-accurate, deduplicated).
     std::vector<std::uint64_t> boundaries;
-    boundaries.reserve(scheduled.size() * 2 + 1);
-    boundaries.push_back(0);
+    boundaries.reserve(scheduled.size() * 2 + 2);
+    boundaries.push_back(cursor);
     for (const ScheduledRun& entry : scheduled) {
         boundaries.push_back(entry.start_frame);
         boundaries.push_back(entry.end_frame);
@@ -337,6 +470,41 @@ core::Result<void> AudioRouter::pump() {
     std::sort(boundaries.begin(), boundaries.end());
     boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
 
+    // Preflight the ENTIRE schedule before any mix or write: uncovered
+    // intervals are gaps (another role may cover an apparent gap), each gap
+    // and the pump's total synthesized silence must fit the 200 ms cap.
+    std::uint64_t total_gap = 0;
+    for (std::size_t b = 0; b + 1 < boundaries.size(); ++b) {
+        const std::uint64_t start = boundaries[b];
+        const std::uint64_t end = boundaries[b + 1];
+        if (end <= start) {
+            continue;
+        }
+        bool covered = false;
+        for (const ScheduledRun& entry : scheduled) {
+            if (entry.start_frame < end && entry.end_frame > start) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) {
+            const std::uint64_t gap = end - start;
+            if (gap > cap_frames || total_gap > cap_frames - gap) {
+                schedule_ok = false;
+                break;
+            }
+            total_gap += gap;
+        }
+    }
+    if (!schedule_ok) {
+        // Rejected discontinuity: the batch is discarded and no timeline
+        // state, mixer state, sink state or counters change.
+        for (auto& queue : impl_->pending) {
+            queue.clear();
+        }
+        return Error{ErrorCode::invalid_argument};
+    }
+
     for (std::size_t b = 0; b + 1 < boundaries.size(); ++b) {
         const std::uint64_t start = boundaries[b];
         const std::uint64_t end = boundaries[b + 1];
@@ -344,6 +512,10 @@ core::Result<void> AudioRouter::pump() {
             continue;
         }
         const std::uint64_t frames = end - start;
+        std::int64_t interval_ns = 0;
+        if (!impl_->frame_time(start, base_ns, interval_ns)) {
+            return Error{ErrorCode::invalid_argument};
+        }
 
         std::array<const PcmChunk*, kRoleCount> pieces{};
         std::array<PcmChunk, kRoleCount> materialized{};
@@ -358,15 +530,12 @@ core::Result<void> AudioRouter::pump() {
             // for this role slot (same-role runs do not overlap), so the
             // slice covers the whole interval.
             const std::uint64_t offset_frames = start - entry.start_frame;
-            const std::size_t frame_bytes = static_cast<std::size_t>(
-                impl_->config.output_format.channels * sizeof(std::int16_t));
             const std::size_t byte_offset =
                 static_cast<std::size_t>(offset_frames) * frame_bytes;
             const std::size_t byte_count = static_cast<std::size_t>(frames) * frame_bytes;
             materialized[entry.role].role = static_cast<Role>(entry.role);
             materialized[entry.role].format = impl_->config.output_format;
-            materialized[entry.role].timestamp = core::Nanoseconds{
-                entry.run->timestamp.count + impl_->frames_to_ns(offset_frames).count};
+            materialized[entry.role].timestamp = core::Nanoseconds{interval_ns};
             materialized[entry.role].pcm =
                 std::span<const std::byte>{entry.run->pcm}.subspan(byte_offset, byte_count);
             pieces[entry.role] = &materialized[entry.role];
@@ -376,8 +545,7 @@ core::Result<void> AudioRouter::pump() {
             }
         }
 
-        const core::Nanoseconds interval_timestamp{
-            timeline_origin->count + impl_->frames_to_ns(start).count};
+        const core::Nanoseconds interval_timestamp{interval_ns};
         bool any_input = false;
         for (const PcmChunk* piece : pieces) {
             if (piece != nullptr) {
@@ -386,38 +554,59 @@ core::Result<void> AudioRouter::pump() {
             }
         }
 
-        MixedChunk to_write;
+        MixedChunk mixed_interval;
         if (any_input) {
             const MixFrame frame{interval_timestamp, frames, pieces};
             auto mixed = impl_->mixer.mix(frame);
             if (!mixed.has_value()) {
                 return mixed.error();
             }
-            to_write = mixed.value();
-        } else {
-            // Gap on the timeline (no run covers this interval): emit
-            // correctly sized silence so the output duration stays truthful
-            // and later runs are never blocked by an empty interval.
-            const std::size_t byte_count = static_cast<std::size_t>(frames)
-                * impl_->config.output_format.channels * sizeof(std::int16_t);
-            impl_->silence_scratch.assign(byte_count, std::byte{0});
-            to_write.format = impl_->config.output_format;
-            to_write.timestamp = interval_timestamp;
-            to_write.pcm = std::span<const std::byte>{impl_->silence_scratch};
+            mixed_interval = std::move(mixed.value());
         }
 
-        auto written = impl_->sink->write(to_write);
-        const std::int64_t write_done_ns = steady_now_ns();
-        if (!written.has_value()) {
-            impl_->report.sink_probe = impl_->sink->probe_stats();
-            impl_->report.render_barrier = impl_->sink->render_stats();
-            // Gate fix F3: a routing write failure is an output loss - the
-            // router degrades typed with the recorded cause, never a silent
-            // "active" state with dropped audio.
-            impl_->mark_degraded("disabled: routing write failed ("
-                                 + std::string{to_string(written.error().code())}
-                                 + "); output no longer accepting audio");
-            return Error{ErrorCode::audio_sink_unavailable};
+        // Every write piece is bounded (64 KiB, whole-frame aligned); silence
+        // comes from one reusable bounded zero buffer - never a
+        // gap-proportional allocation.
+        const std::uint64_t max_piece_frames = std::max<std::uint64_t>(
+            1, kMaxOutputPieceBytes / frame_bytes);
+        std::int64_t write_done_ns = 0;
+        for (std::uint64_t piece_start = start; piece_start < end;) {
+            const std::uint64_t piece_frames = std::min(end - piece_start, max_piece_frames);
+            const std::size_t piece_bytes = static_cast<std::size_t>(piece_frames) * frame_bytes;
+            std::int64_t piece_ns = 0;
+            if (!impl_->frame_time(piece_start, base_ns, piece_ns)) {
+                return Error{ErrorCode::invalid_argument};
+            }
+            MixedChunk to_write;
+            to_write.format = impl_->config.output_format;
+            to_write.timestamp = core::Nanoseconds{piece_ns};
+            if (any_input) {
+                const std::size_t slice_offset =
+                    static_cast<std::size_t>(piece_start - start) * frame_bytes;
+                to_write.pcm = std::span<const std::byte>{mixed_interval.pcm}.subspan(
+                    slice_offset, piece_bytes);
+            } else {
+                if (impl_->silence_scratch.size() < piece_bytes) {
+                    impl_->silence_scratch.assign(piece_bytes, std::byte{0});
+                }
+                to_write.pcm =
+                    std::span<const std::byte>{impl_->silence_scratch}.first(piece_bytes);
+            }
+
+            auto written = impl_->sink->write(to_write);
+            write_done_ns = steady_now_ns();
+            if (!written.has_value()) {
+                impl_->report.sink_probe = impl_->sink->probe_stats();
+                impl_->report.render_barrier = impl_->sink->render_stats();
+                // Gate fix F3: a routing write failure is an output loss -
+                // the router degrades typed with the recorded cause, never a
+                // silent "active" state with dropped audio.
+                impl_->mark_degraded("disabled: routing write failed ("
+                                     + std::string{to_string(written.error().code())}
+                                     + "); output no longer accepting audio");
+                return Error{ErrorCode::audio_sink_unavailable};
+            }
+            piece_start += piece_frames;
         }
 
         RouterStats& stats = impl_->report.stats;
@@ -448,7 +637,13 @@ core::Result<void> AudioRouter::pump() {
     }
 
     // The whole timeline is consumed in one sweep (every run's range is
-    // partitioned by the boundary set).
+    // partitioned by the boundary set). The advanced cursor and role ends are
+    // committed only now - after every write succeeded.
+    if (!impl_->timeline_base.has_value()) {
+        impl_->timeline_base = core::Nanoseconds{base_ns};
+    }
+    impl_->playback_cursor_frames = timeline_frames;
+    impl_->role_end_frames = new_role_ends;
     for (auto& queue : impl_->pending) {
         queue.clear();
     }

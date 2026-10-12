@@ -77,6 +77,12 @@ struct SinkOpenOutcome final {
 // report - never a silent misroute.
 [[nodiscard]] SinkOpenOutcome open_default_sink(const SinkOpenRequest& request);
 
+// Test-only opener: builds the router around a caller-supplied sink (e.g. a
+// recording fake) instead of probing/starting the GStreamer routing element.
+// Same private seam - no GStreamer types cross it, no public API.
+[[nodiscard]] core::Result<AudioRouter> open_router_with_sink_for_test(
+    const RouterConfig& config, std::unique_ptr<ObservedAudioSink> sink);
+
 // Test-only (gate r3 F1 regression): runs an UNRELATED in-process
 // `audiotestsrc ! audioconvert ! pipewiresink` pipeline in this process. Its
 // render pushes are real handoff-signature trace lines on their own streaming

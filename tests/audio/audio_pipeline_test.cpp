@@ -13,6 +13,8 @@
 #include <aa/audio/Microphone.hpp>
 #include <aa/protocol/Protocol.hpp>
 
+#include "../../src/audio/AudioSinkFactory.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -1232,7 +1234,14 @@ TEST_F(AudioPipelineRoute, DaemonKillMidStreamDegradesTypedWithRecordedCause) {
     ASSERT_EQ(router.value().state(), aa::audio::RouterState::active);
 
     const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
-    const auto first = make_message(aa::protocol::ChannelRole::media_audio, 0, now_ns(), media);
+    // Contiguous timeline timestamps (960 frames apart): the kill window is
+    // wall-clock time, and a real timestamp gap there would trip the router's
+    // discontinuity policy before the dead sink is ever exercised.
+    const aa::core::Nanoseconds base_ts = now_ns();
+    const aa::core::Nanoseconds contiguous_ts{
+        base_ts.count + 960 * 1'000'000'000LL
+            / static_cast<std::int64_t>(config.output_format.sample_rate_hz)};
+    const auto first = make_message(aa::protocol::ChannelRole::media_audio, 0, base_ts, media);
     ASSERT_TRUE(router.value().submit(first).has_value());
     ASSERT_TRUE(router.value().pump().has_value());
     EXPECT_GE(router.value().report().render_barrier.handoff_events, 1U);
@@ -1240,7 +1249,8 @@ TEST_F(AudioPipelineRoute, DaemonKillMidStreamDegradesTypedWithRecordedCause) {
     daemon.kill_backend();
     usleep(1000000);
 
-    const auto second = make_message(aa::protocol::ChannelRole::media_audio, 1, now_ns(), media);
+    const auto second =
+        make_message(aa::protocol::ChannelRole::media_audio, 1, contiguous_ts, media);
     ASSERT_TRUE(router.value().submit(second).has_value());
     auto pumped = router.value().pump();
     ASSERT_FALSE(pumped.has_value());
@@ -1726,4 +1736,426 @@ TEST_F(AudioPipelineRoute, RestrictedDaemonConfigRetainedForbiddenModuleIsReject
         IsolatedPipeWire::write_restricted_daemon_config(templ, scratch + "/out.conf", false);
     EXPECT_EQ(out.stage, IsolatedPipeWire::ConfigOutcome::Stage::denied_module_verify);
     EXPECT_NE(out.detail.find("libpipewire-module-portal"), std::string::npos);
+}
+
+namespace {
+
+class RecordingAudioSink final : public aa::audio::detail::ObservedAudioSink {
+public:
+    std::vector<std::vector<std::byte>> writes{};
+    std::vector<std::int64_t> write_ns{};
+
+    aa::core::Result<void> write(const aa::audio::MixedChunk& chunk) override {
+        writes.emplace_back(chunk.pcm.begin(), chunk.pcm.end());
+        write_ns.push_back(chunk.timestamp.count);
+        return {};
+    }
+    aa::core::Result<void> drain(aa::core::Milliseconds) override { return {}; }
+    aa::audio::SinkProbeStats probe_stats() const override { return {}; }
+    aa::audio::RenderBarrierStats render_stats() const override { return {}; }
+};
+
+std::vector<std::int16_t> flatten_i16(const std::vector<std::vector<std::byte>>& writes) {
+    std::vector<std::int16_t> out;
+    for (const auto& w : writes) {
+        for (std::size_t i = 0; i + 1 < w.size(); i += 2) {
+            std::int16_t value = 0;
+            std::memcpy(&value, &w[i], sizeof value);
+            out.push_back(value);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_F(AudioPipelineRoute, MultiPumpPreservesTimestampGap) {
+    const auto config = pcm_router_config();
+    const std::int64_t rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
+    const std::size_t ch = config.output_format.channels;
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router =
+        aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{1'000'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    const std::vector<std::byte> guidance = constant_pcm({kGuidanceLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::guidance_audio, 1,
+                                         aa::core::Nanoseconds{base.count + 30'000'000LL},
+                                         guidance))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+
+    const std::int64_t silence_frames = 30'000'000LL * rate / 1'000'000'000LL - 960;
+    ASSERT_GT(silence_frames, 0);
+    const auto flat = flatten_i16(rec->writes);
+    ASSERT_EQ(flat.size(), static_cast<std::size_t>(1920 + silence_frames) * ch);
+    for (std::size_t i = 0; i < 960 * ch; ++i) {
+        ASSERT_EQ(flat[i], kMediaLevel) << i;
+    }
+    for (std::size_t i = 960 * ch; i < static_cast<std::size_t>(960 + silence_frames) * ch; ++i) {
+        ASSERT_EQ(flat[i], 0) << i;
+    }
+    for (std::size_t i = static_cast<std::size_t>(960 + silence_frames) * ch; i < flat.size(); ++i) {
+        ASSERT_EQ(flat[i], kGuidanceLevel) << i;
+    }
+    ASSERT_FALSE(rec->write_ns.empty());
+    EXPECT_EQ(rec->write_ns.back(), base.count + 30'000'000LL);
+}
+
+TEST_F(AudioPipelineRoute, MultiPumpMatchesSinglePumpNonOverlappingTimeline) {
+    const auto config = pcm_router_config();
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    const std::vector<std::byte> guidance = constant_pcm({kGuidanceLevel, 960});
+    const aa::core::Nanoseconds base{2'000'000'000LL};
+    const aa::core::Nanoseconds second{base.count + 30'000'000LL};
+
+    auto sink_a = std::make_unique<RecordingAudioSink>();
+    auto* rec_a = sink_a.get();
+    auto batched =
+        aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_a));
+    ASSERT_TRUE(batched.has_value());
+    ASSERT_TRUE(batched.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(batched.value()
+                    .submit(
+                        make_message(aa::protocol::ChannelRole::guidance_audio, 1, second, guidance))
+                    .has_value());
+    ASSERT_TRUE(batched.value().pump().has_value());
+
+    auto sink_b = std::make_unique<RecordingAudioSink>();
+    auto* rec_b = sink_b.get();
+    auto split = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_b));
+    ASSERT_TRUE(split.has_value());
+    ASSERT_TRUE(split.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(split.value().pump().has_value());
+    ASSERT_TRUE(split.value()
+                    .submit(
+                        make_message(aa::protocol::ChannelRole::guidance_audio, 1, second, guidance))
+                    .has_value());
+    ASSERT_TRUE(split.value().pump().has_value());
+
+    EXPECT_EQ(flatten_i16(rec_a->writes), flatten_i16(rec_b->writes));
+    EXPECT_EQ(rec_a->write_ns, rec_b->write_ns);
+}
+
+TEST_F(AudioPipelineRoute, MultiPumpContiguousRunsDoNotReplayOrInsertSilence) {
+    const auto config = pcm_router_config();
+    const std::int64_t rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
+    const std::size_t ch = config.output_format.channels;
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{3'000'000'000LL};
+    const aa::core::Nanoseconds next{base.count + 960 * 1'000'000'000LL / rate};
+    const std::vector<std::byte> first = constant_pcm({kMediaLevel, 960});
+    const std::vector<std::byte> second = constant_pcm({3000, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, first))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 1, next, second))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+
+    const auto flat = flatten_i16(rec->writes);
+    ASSERT_EQ(flat.size(), 1920U * ch);
+    for (std::size_t i = 0; i < 960 * ch; ++i) {
+        ASSERT_EQ(flat[i], kMediaLevel) << i;
+    }
+    for (std::size_t i = 960 * ch; i < 1920 * ch; ++i) {
+        ASSERT_EQ(flat[i], 3000) << i;
+    }
+}
+
+TEST_F(AudioPipelineRoute, MultiPumpLateRunsSequentializeWithoutDroppingSamples) {
+    const auto config = pcm_router_config();
+    const std::size_t ch = config.output_format.channels;
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{4'000'000'000LL};
+    const std::vector<std::byte> first = constant_pcm({kMediaLevel, 960});
+    const std::vector<std::byte> late = constant_pcm({3000, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, first))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 1, base, late))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+
+    const auto flat = flatten_i16(rec->writes);
+    ASSERT_EQ(flat.size(), 1920U * ch);
+    for (std::size_t i = 0; i < 960 * ch; ++i) {
+        ASSERT_EQ(flat[i], kMediaLevel) << i;
+    }
+    for (std::size_t i = 960 * ch; i < 1920 * ch; ++i) {
+        ASSERT_EQ(flat[i], 3000) << i;
+    }
+    for (std::size_t i = 1; i < rec->write_ns.size(); ++i) {
+        ASSERT_GE(rec->write_ns[i], rec->write_ns[i - 1]) << i;
+    }
+}
+
+TEST_F(AudioPipelineRoute, EmptyPumpDoesNotRebaseTimeline) {
+    const auto config = pcm_router_config();
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{5'000'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    const std::vector<std::byte> guidance = constant_pcm({kGuidanceLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::guidance_audio, 1,
+                                         aa::core::Nanoseconds{base.count + 30'000'000LL},
+                                         guidance))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+
+    ASSERT_FALSE(rec->writes.empty());
+    EXPECT_EQ(rec->write_ns.back(), base.count + 30'000'000LL);
+    const auto flat = flatten_i16(rec->writes);
+    ASSERT_GT(flat.size(), 1920U);
+}
+
+TEST_F(AudioPipelineRoute, LargeTimestampGapRejectedBeforeAnyWrite) {
+    const auto config = pcm_router_config();
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{6'000'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 1,
+                                         aa::core::Nanoseconds{base.count + 3'600'000'000'000LL},
+                                         media))
+                    .has_value());
+    auto pumped = router.value().pump();
+    ASSERT_FALSE(pumped.has_value());
+    EXPECT_EQ(pumped.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_TRUE(rec->writes.empty());
+}
+
+TEST_F(AudioPipelineRoute, MultiPumpLargeGapRejectedWithoutAdvancingCursor) {
+    const auto config = pcm_router_config();
+    const std::int64_t rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
+    const std::size_t ch = config.output_format.channels;
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{7'000'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+    ASSERT_EQ(flatten_i16(rec->writes).size(), 960U * ch);
+
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 1,
+                                         aa::core::Nanoseconds{base.count + 3'600'000'000'000LL},
+                                         media))
+                    .has_value());
+    auto rejected = router.value().pump();
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_EQ(flatten_i16(rec->writes).size(), 960U * ch);
+
+    const std::vector<std::byte> tail = constant_pcm({3000, 960});
+    const aa::core::Nanoseconds contiguous{base.count + 960 * 1'000'000'000LL / rate};
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 2, contiguous, tail))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+    const auto flat = flatten_i16(rec->writes);
+    ASSERT_EQ(flat.size(), 1920U * ch);
+    EXPECT_EQ(flat[1920 * ch - 1], 3000);
+    EXPECT_EQ(rec->write_ns.back(), contiguous.count);
+}
+
+TEST_F(AudioPipelineRoute, GapAtCapAcceptedAndAboveCapRejected) {
+    const auto config = pcm_router_config();
+    const std::int64_t rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
+    const std::size_t ch = config.output_format.channels;
+    const std::int64_t cap_frames = rate / 5;
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    const std::vector<std::byte> guidance = constant_pcm({kGuidanceLevel, 960});
+
+    auto sink_ok = std::make_unique<RecordingAudioSink>();
+    auto* rec_ok = sink_ok.get();
+    auto accepted =
+        aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_ok));
+    ASSERT_TRUE(accepted.has_value());
+    const aa::core::Nanoseconds base{8'000'000'000LL};
+    ASSERT_TRUE(accepted.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(accepted.value().pump().has_value());
+    const aa::core::Nanoseconds at_cap{
+        base.count + (960 + cap_frames) * 1'000'000'000LL / rate};
+    ASSERT_TRUE(accepted.value()
+                    .submit(make_message(aa::protocol::ChannelRole::guidance_audio, 1, at_cap,
+                                         guidance))
+                    .has_value());
+    ASSERT_TRUE(accepted.value().pump().has_value());
+    const std::int64_t at_cap_ns = (960 + cap_frames) * 1'000'000'000LL / rate;
+    const std::int64_t at_cap_frames = at_cap_ns * rate / 1'000'000'000LL;
+    EXPECT_EQ(flatten_i16(rec_ok->writes).size(),
+              static_cast<std::size_t>(960 + (at_cap_frames - 960) + 960) * ch);
+
+    auto sink_bad = std::make_unique<RecordingAudioSink>();
+    auto* rec_bad = sink_bad.get();
+    auto rejected = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_bad));
+    ASSERT_TRUE(rejected.has_value());
+    ASSERT_TRUE(rejected.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(rejected.value().pump().has_value());
+    const aa::core::Nanoseconds past_cap{
+        base.count
+        + ((960 + cap_frames + 1) * 1'000'000'000LL + rate - 1) / rate};
+    ASSERT_TRUE(rejected.value()
+                    .submit(make_message(aa::protocol::ChannelRole::guidance_audio, 1, past_cap,
+                                         guidance))
+                    .has_value());
+    auto over = rejected.value().pump();
+    ASSERT_FALSE(over.has_value());
+    EXPECT_EQ(over.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_EQ(flatten_i16(rec_bad->writes).size(), 960U * ch);
+}
+
+TEST_F(AudioPipelineRoute, TotalGapBudgetPreflightIsAtomic) {
+    const auto config = pcm_router_config();
+    const std::int64_t rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
+    const std::int64_t gap_frames = 3 * rate / 20;
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{9'000'000'000LL};
+    const std::vector<std::byte> chunk = constant_pcm({kMediaLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, chunk))
+                    .has_value());
+    const aa::core::Nanoseconds second{
+        base.count + (960 + gap_frames) * 1'000'000'000LL / rate};
+    ASSERT_TRUE(router.value()
+                    .submit(
+                        make_message(aa::protocol::ChannelRole::guidance_audio, 1, second, chunk))
+                    .has_value());
+    const aa::core::Nanoseconds third{
+        second.count + (960 + gap_frames) * 1'000'000'000LL / rate};
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::speech_audio, 2, third, chunk))
+                    .has_value());
+
+    auto pumped = router.value().pump();
+    ASSERT_FALSE(pumped.has_value());
+    EXPECT_EQ(pumped.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_TRUE(rec->writes.empty());
+}
+
+TEST_F(AudioPipelineRoute, TimestampRangeAndEndOverflowFailTyped) {
+    const auto config = pcm_router_config();
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+
+    auto sink_neg = std::make_unique<RecordingAudioSink>();
+    auto* rec_neg = sink_neg.get();
+    auto negative =
+        aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_neg));
+    ASSERT_TRUE(negative.has_value());
+    auto denied = negative.value().submit(
+        make_message(aa::protocol::ChannelRole::media_audio, 0, aa::core::Nanoseconds{-1}, media));
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(denied.error().code(), aa::ErrorCode::invalid_argument);
+
+    auto sink_end = std::make_unique<RecordingAudioSink>();
+    auto* rec_end = sink_end.get();
+    auto overflow =
+        aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_end));
+    ASSERT_TRUE(overflow.has_value());
+    const aa::core::Nanoseconds near_max{INT64_MAX - 5'000'000LL};
+    ASSERT_TRUE(overflow.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, near_max, media))
+                    .has_value());
+    auto rejected = overflow.value().pump();
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_TRUE(rec_end->writes.empty());
+    EXPECT_TRUE(rec_neg->writes.empty());
+}
+
+TEST_F(AudioPipelineRoute, SilenceWritesRemainBounded) {
+    const auto config = pcm_router_config();
+    const std::size_t ch = config.output_format.channels;
+    const std::int64_t rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
+    const std::size_t frame_bytes =
+        config.output_format.channels * sizeof(std::int16_t);
+    const std::int64_t gap_frames = 3 * rate / 20;
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{10'000'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+    const aa::core::Nanoseconds later{
+        base.count + (960 + gap_frames) * 1'000'000'000LL / rate};
+    const std::vector<std::byte> guidance = constant_pcm({kGuidanceLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(
+                        make_message(aa::protocol::ChannelRole::guidance_audio, 1, later, guidance))
+                    .has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+
+    for (const auto& write : rec->writes) {
+        EXPECT_LE(write.size(), std::size_t{64} * 1024);
+        EXPECT_EQ(write.size() % frame_bytes, 0U);
+    }
+    const auto flat = flatten_i16(rec->writes);
+    ASSERT_EQ(flat.size(), static_cast<std::size_t>(1920 + gap_frames) * ch);
+    std::size_t zeros = 0;
+    for (std::int16_t sample : flat) {
+        if (sample == 0) {
+            ++zeros;
+        }
+    }
+    EXPECT_EQ(zeros, static_cast<std::size_t>(gap_frames) * ch);
 }
