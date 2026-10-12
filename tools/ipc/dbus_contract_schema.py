@@ -51,5 +51,3 @@ ALLOWED_SCALAR_TYPES: Final[frozenset[str]] = frozenset({"s", "b", "u", "t"})
 ALLOWED_MAP_TYPE: Final[str] = "a{ss}"
 MAJOR: Final[re.Pattern[str]] = re.compile(
     rf"^{re.escape(INTERFACE_PREFIX)}(0|[1-9][0-9]*)$")
-
-

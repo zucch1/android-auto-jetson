@@ -21,8 +21,8 @@ namespace {
     case Qt::Key_Left: return 21;
     case Qt::Key_Right: return 22;
     case Qt::Key_Return:
-    case Qt::Key_Enter: return 66;
-    case Qt::Key_Backspace: return 67;
+    case Qt::Key_Enter: return 23;
+    case Qt::Key_Backspace: return 4;
     case Qt::Key_Escape: return 111;
     case Qt::Key_Space: return 62;
     default: break;
@@ -94,6 +94,13 @@ void ProjectionWidget::set_status(DisplayState state) {
     update();
 }
 
+void ProjectionWidget::set_error(std::string_view message) {
+    error_ = QString::fromUtf8(message.data(), static_cast<qsizetype>(message.size()));
+    update();
+}
+
+QString ProjectionWidget::error_text() const { return error_; }
+
 void ProjectionWidget::set_projection_control(ProjectionControl* control) noexcept {
     control_ = control;
 }
@@ -119,6 +126,10 @@ void ProjectionWidget::paintEvent(QPaintEvent*) {
     }
     painter.setPen(Qt::white);
     painter.drawText(rect().adjusted(6, 4, -6, -4), Qt::AlignLeft | Qt::AlignTop, status_);
+    if (!error_.isEmpty()) {
+        painter.setPen(Qt::red);
+        painter.drawText(rect().adjusted(6, 4, -6, -4), Qt::AlignLeft | Qt::AlignBottom, error_);
+    }
 }
 
 bool ProjectionWidget::handle_control_key(QKeyEvent* event) {

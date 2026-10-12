@@ -12,6 +12,10 @@
 # headers only and no cross executable links the archive (the test executable
 # is native-only below).
 
+if(NOT TARGET aa_core)
+    message(FATAL_ERROR
+        "AA_VIDEO_SOCKET_REQUIRES_AA_CORE: include cmake/CoreArchitecture.cmake before cmake/VideoSocket.cmake")
+endif()
 if(NOT CMAKE_CROSSCOMPILING AND NOT TARGET aa_replay)
     message(FATAL_ERROR
         "AA_VIDEO_SOCKET_REQUIRES_AA_REPLAY: include cmake/Replay.cmake before cmake/VideoSocket.cmake")
@@ -100,3 +104,4 @@ endif()
 
 unset(AA_VIDEO_SOURCES)
 unset(AA_VIDEO_TEST_SOURCES)
+unset(AA_VIDEO_WARN_TARGETS)

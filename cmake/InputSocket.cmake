@@ -6,12 +6,13 @@
 # control-only - this socket is the input transport. Tests register as
 # input_socket_* for `ctest -R input_socket`.
 #
+# aa_input is production code and compiles in every configuration (the
+# cross-build IPC inventory requires its sources in compile_commands.json);
+# only the test executable and its registrations stay behind
+# if(NOT CMAKE_CROSSCOMPILING).
+#
 # Integration contract: include AFTER cmake/CoreArchitecture.cmake (aa_core),
 # cmake/VideoSocket.cmake (aa_video) and the googletest declaration.
-#
-# Cross builds compile the production library (aa_input sources are inventoried
-# in compile_commands.json); only the test executable and registrations are
-# host-side.
 
 if(NOT TARGET aa_video)
     message(FATAL_ERROR
@@ -37,6 +38,12 @@ set_target_properties(aa_input PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 target_include_directories(aa_input PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aa_input PUBLIC aa_core aa_video)
+
+if(TARGET aa_sysroot_hash_gate)
+    # Root hash-gate convention: this library cannot compile after a
+    # post-configure sysroot tamper (present for jetson-aarch64 cross builds).
+    add_dependencies(aa_input aa_sysroot_hash_gate)
+endif()
 
 set(AA_INPUT_WARN_TARGETS aa_input)
 if(NOT CMAKE_CROSSCOMPILING)

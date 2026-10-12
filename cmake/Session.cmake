@@ -12,7 +12,7 @@
 # `include(cmake/Session.cmake)` in its own root edit.
 #
 # Cross builds compile the production library (aa_replay depends on it); only
-# the test executable and registrations are host-side.
+# test executables and registrations are host-side.
 
 if(NOT TARGET aa_core)
     message(FATAL_ERROR

@@ -17,6 +17,7 @@
 #include <QTimer>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -40,19 +41,38 @@ public:
         if (!controller_.has_value()) {
             return;
         }
-        static_cast<void>(controller_->start_projection(video_));
-        widget_.set_status(controller_->state());
+        report("StartProjection", controller_->start_projection(video_));
     }
 
     void on_stop_projection() override {
         if (!controller_.has_value()) {
             return;
         }
-        static_cast<void>(controller_->stop_projection());
-        widget_.set_status(controller_->state());
+        report("StopProjection", controller_->stop_projection());
     }
 
 private:
+    // Captures the result, refreshes the state text and reports a typed
+    // failure ("<state>: <Operation> failed (<code>)") on stderr and through
+    // the widget error setter; a successful recovery clears the error while
+    // the success-state text stays owned by set_status().
+    void report(const char* operation, const aa::core::Result<void>& result) {
+        widget_.set_status(controller_->state());
+        if (result.has_value()) {
+            widget_.set_error(std::string_view{});
+            return;
+        }
+        const auto state = aa::display::to_string(controller_->state());
+        const auto code = aa::to_string(result.error().code());
+        std::string message{};
+        message.reserve(state.size() + code.size() + 32);
+        message.append(state).append(": ").append(operation).append(" failed (");
+        message.append(code).append(")");
+        std::fputs(message.c_str(), stderr);
+        std::fputc('\n', stderr);
+        widget_.set_error(message);
+    }
+
     std::optional<aa::display::DisplayController>& controller_;
     aa::ipc::VideoSocketPath video_;
     aa::display::qt_adapter::ProjectionWidget& widget_;
@@ -80,6 +100,8 @@ aa::display::testcontrol::Status probe_status() {
             status.input_last_error.assign(name.data(), name.size());
         }
     }
+    const auto error = g_widget->error_text().toStdString();
+    status.last_error = error;
     const QPixmap probe = g_widget->grab();
     status.render_ok = !probe.isNull();
     status.render_width = probe.width();

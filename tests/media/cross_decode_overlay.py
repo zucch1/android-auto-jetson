@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -21,6 +22,8 @@ from decode_cross_fixture import make_overlay, make_sysroot
 from tools.build.decode_overlay import Overlay
 from tools.build.input_provenance import Inputs, check_inputs
 from tools.sysroot.models import SysrootError
+
+CONSUMER_SOURCE = 'src/consumer/gstreamer_adapter/DecodeHelper.cpp'
 
 
 def main() -> int:
@@ -57,7 +60,8 @@ def main() -> int:
     configure_source = root if args.root_project else root / 'tests/media/cross'
     configure_extra = [f'-DAA_GOOGLETEST_ARCHIVE={args.archive.resolve(strict=True)}'] if args.root_project else []
     targets = ['aa_host_smoke', 'aa-decode-probe', 'decode-probe-inputs',
-               'decode-probe-metrics', 'decode-probe-discovery'] if args.root_project else []
+               'decode-probe-metrics', 'decode-probe-discovery',
+               'aareceiver-consumer', 'aa_display_link_check'] if args.root_project else []
     commands = (
         ['cmake', '-S', str(configure_source), '-B', str(build), '-G', 'Ninja',
          f'-DCMAKE_TOOLCHAIN_FILE={root}/toolchains/jetson-aarch64.cmake',
@@ -88,6 +92,15 @@ def main() -> int:
     registered = {test['name'] for test in inventory['tests']
                   if not args.root_project or test['name'].startswith('cross_')}
     assert registered == expected_tests, 'cross coverage mismatch'
+    native_consumer_tests = {'consumer_decode_caps', 'consumer_decode_fixture', 'consumer_decode_backend',
+                             'consumer_decode_probe', 'consumer_decode_admission', 'consumer_decode_correlation',
+                             'consumer_decode_runtime', 'consumer_decode_build_sysroot_tamper',
+                             'consumer_decode_build_overlay_tamper'}
+    all_tests = {test['name'] for test in inventory['tests']}
+    assert native_consumer_tests.isdisjoint(all_tests), \
+        f'native consumer_decode suites in cross inventory: {sorted(native_consumer_tests & all_tests)}'
+    assert {name for name in all_tests if name.startswith('consumer_decode_')} == set(), \
+        'unlisted consumer_decode suite in cross inventory'
     assert 'AA_DECODE_PROBE_CROSS:STRING=AVAILABLE' in cache, 'AA_DECODE_AVAILABLE_REQUIRED'
     assert f'AA_DECODE_GST_OVERLAY_DIGEST:STRING={expected}' in cache, 'fixture digest mismatch'
     overlay_record = Overlay(overlay, build / 'aa-decode-overlay.sha256', expected)
@@ -131,6 +144,34 @@ def main() -> int:
         assert smoke.overlay is None
         assert not any(Path(item.path).is_relative_to(overlay) for item in smoke.selected)
         assert any(item.path.endswith('/googletest/src/gtest.cc') for item in smoke.selected), 'archive headers omitted'
+        units = json.loads((build / 'compile_commands.json').read_text())
+        consumer_units = [unit for unit in units if unit['file'].endswith(CONSUMER_SOURCE)]
+        assert len(consumer_units) == 1, f'consumer compile unit count: {len(consumer_units)}'
+        consumer_object = Path(consumer_units[0]['directory']) / consumer_units[0]['output']
+        assert 'aareceiver-consumer.dir' in consumer_object.as_posix(), consumer_object
+        archive = build / 'libaareceiver-consumer.a'
+        assert archive.is_file(), f'consumer archive not built: {archive}'
+        listing = subprocess.check_output(['readelf', '-h', str(archive)], text=True)
+        members = re.split(r'^File: ', listing, flags=re.MULTILINE)[1:]
+        assert members, 'readelf inspected no consumer archive member'
+        machines: dict[str, int] = {}
+        member_names: list[str] = []
+        for member in members:
+            member_header, _, member_body = member.partition('\n')
+            name = member_header.rsplit('(', 1)[1].rstrip(')')
+            member_names.append(name)
+            machine = re.search(r'^\s*Machine:\s+(\S.*?)\s*$', member_body, re.MULTILINE)
+            assert machine is not None, f'archive member without ELF machine: {name}'
+            machines[machine.group(1)] = machines.get(machine.group(1), 0) + 1
+        assert set(machines) == {'AArch64'}, f'consumer archive members not AArch64: {machines}'
+        assert consumer_object.name in member_names, \
+            f'consumer object missing from archive inventory: {sorted(member_names)}'
+        consumer_archive_inventory = {
+            'state': 'AVAILABLE', 'verified_compiled_consumer': True,
+            'source': CONSUMER_SOURCE, 'compile_units': len(consumer_units),
+            'archive': str(archive),
+            'archive_sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
+            'members': member_names, 'member_machines': machines, 'runtime_executed': False}
     receipt = {'state': 'AVAILABLE', 'machine': 'AArch64', 'overlay_digest': expected,
                'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                'overlay_selected_inputs': len(selected),
@@ -140,6 +181,13 @@ def main() -> int:
                'root_project': args.root_project, 'overlay_root': str(overlay),
                'source_root': str(root), 'build_root': str(build),
                'binding_negatives': ['missing-overlay', 'wrong-overlay-digest', 'wrong-elf-digest']}
+    # Then the no-target-metadata UNAVAILABLE result is recorded separately and
+    # can never count as verification of a compiled consumer.
+    if args.root_project:
+        receipt['consumer_archive_inventory'] = consumer_archive_inventory
+        receipt['consumer_no_target_metadata'] = {
+            'state': 'UNAVAILABLE', 'verified_compiled_consumer': False,
+            'counts_as_consumer_verification': False}
     (scratch / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print('decode-overlay-cross: PASS ' + json.dumps(receipt))
     return 0

@@ -148,7 +148,8 @@ set(AA_DBUS_SCHEMA_CASES
     neg-duplicate-method neg-bogus-direction neg-masking-duplicate
     neg-multi-type-method neg-multi-type-signal
     neg-raw-delimiter-injection embedding-special-bytes embedding-crlf
-    neg-unexpected-root-child neg-unexpected-nested-element neg-unexpected-attribute
+    neg-unexpected-root-child neg-unexpected-interface-child neg-unexpected-member-child
+    neg-unexpected-nested-element neg-unexpected-attribute
     neg-missing-attribute neg-unexpected-text neg-duplicate-annotation
     neg-unexpected-annotation neg-doctype neg-processing-instruction neg-namespace
     neg-lexical-replay-bypass neg-invalid-preserves-existing-header)

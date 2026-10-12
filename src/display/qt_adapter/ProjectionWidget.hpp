@@ -8,6 +8,7 @@
 #include <QWidget>
 
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 namespace aa::display::qt_adapter {
@@ -26,6 +27,14 @@ public:
     void set_status(DisplayState state);
     [[nodiscard]] QString status_text() const;
     [[nodiscard]] std::uint64_t frames_painted() const noexcept;
+
+    // Small error presentation seam (stop-recovery reporting): the wiring
+    // passes the typed failure line (e.g.
+    // "stop_failed: StopProjection failed (transport_io)") and clears it with
+    // an empty message after successful recovery. The success-state text is
+    // untouched - set_status() keeps owning it.
+    void set_error(std::string_view message);
+    [[nodiscard]] QString error_text() const;
 
     // Test-display controls (task 24 F2): F5 requests projection start and F6
     // requests projection stop through this seam. Null leaves the shortcuts
@@ -51,6 +60,7 @@ private:
     QImage frame_{};
     std::vector<std::uint8_t> pending_{};
     QString status_{QStringLiteral("unavailable")};
+    QString error_{};
     std::uint64_t frames_painted_{0};
     std::uint16_t width_{};
     std::uint16_t height_{};

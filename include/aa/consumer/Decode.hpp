@@ -135,6 +135,15 @@ struct DecodeConfig final {
     FrameCallback on_frame{};
 };
 
+// Automatic backend selection and functional software substitution occur
+// only during open(). Failures observed AFTER open() returns are terminal for
+// that helper: runtime decoder errors return channel_decode_failed (observed
+// dimension mismatch returns channel_caps_unsupported), with no automatic
+// restart or backend switch. The caller must close and reopen externally,
+// then supply a decodable IDR with the necessary parameter sets. An
+// asynchronous startup error first observed later is terminal under the same
+// contract. No runtime recovery guarantee, decode-latency budget claim, or
+// software-fallback qualification is made.
 class DecodeHelper final {
 public:
     // Runtime decoder detection over the probe's known candidate table
@@ -156,10 +165,32 @@ public:
     DecodeHelper& operator=(DecodeHelper&& other) noexcept;
 
     // Feed one encoded access unit (task-22 framing metadata). The unit's
-    // timestamp_ns becomes the buffer PTS and must be unique per open session.
-    // invalid_argument: empty payload, duplicate timestamp, or use after
-    // close/end_of_stream. ipc_queue_full: bounded feed backlog exceeded.
-    // channel_decode_failed: the pipeline rejected the data.
+    // timestamp_ns becomes the buffer PTS and must carry valid, strictly
+    // increasing, session-unique timestamps; no timestamp reset at IDR
+    // recovery (each open() is a fresh session, so its first timestamp may be
+    // zero, but GST_CLOCK_TIME_NONE is never valid and a timestamp is never
+    // reused - not even after its correlation was delivered or invalidated).
+    //
+    // Refusal contract:
+    //  - ipc_queue_full is the BYTE-REJECTION and is RETRYABLE: the feed
+    //    backlog cannot take this AU (payload larger than the whole backlog,
+    //    or remaining capacity smaller than the payload - the incoming AU
+    //    counts against the limit and exactly filling it is accepted). The AU
+    //    acquires no correlation mapping and does not consume its timestamp,
+    //    so the SAME timestamp can be resubmitted after the backlog drains.
+    //  - ipc_consumer_rejected is the RESYNC REJECTION and is NOT a retryable
+    //    queue-full condition: "discard this AU and resume at an IDR". The
+    //    session resyncs after a correlation-set invalidation (an undelivered
+    //    correlation reached the fixed five-second operational retention
+    //    bound - a retention policy, not a latency budget or a qualification
+    //    claim - or the outstanding set saturated) and discards non-IDR AUs
+    //    until an IDR re-arms the stream. The recovery IDR is still subject to
+    //    the timestamp + byte admission; rejected AUs acquire no correlation
+    //    mapping and do not consume their timestamps.
+    //  - invalid_argument is a permanent contract violation (empty payload,
+    //    non-increasing/duplicate timestamp, GST_CLOCK_TIME_NONE, use after
+    //    close/end_of_stream) and is not retryable with the same arguments.
+    //  - channel_decode_failed: the pipeline rejected the data.
     [[nodiscard]] core::Result<void> submit(const ipc::VideoAccessUnit& access_unit);
 
     // Signal end of encoded input (drain is completed by pump()).

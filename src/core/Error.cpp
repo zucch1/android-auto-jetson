@@ -43,10 +43,14 @@ std::string_view Error::message() const noexcept {
     case ErrorCode::audio_sink_unavailable: return "audio sink unavailable";
     case ErrorCode::audio_format_unsupported: return "unsupported audio format";
     case ErrorCode::audio_underrun: return "audio underrun";
+    case ErrorCode::audio_decode_failed: return "audio decode failure";
+    case ErrorCode::audio_mic_disabled: return "audio microphone path disabled";
 
     case ErrorCode::trust_store_io: return "trust store io failure";
     case ErrorCode::trust_unknown_phone: return "unknown phone not trusted";
     case ErrorCode::trust_rejected: return "phone rejected by trust store";
+    case ErrorCode::trust_store_not_durable:
+        return "Trust store replaced; crash durability unconfirmed.";
 
     case ErrorCode::config_invalid: return "invalid configuration";
     case ErrorCode::config_jurisdiction_unconfirmed: return "wireless jurisdiction unconfirmed";
@@ -100,10 +104,13 @@ std::string_view to_string(ErrorCode code) noexcept {
     case ErrorCode::audio_sink_unavailable: return "audio_sink_unavailable";
     case ErrorCode::audio_format_unsupported: return "audio_format_unsupported";
     case ErrorCode::audio_underrun: return "audio_underrun";
+    case ErrorCode::audio_decode_failed: return "audio_decode_failed";
+    case ErrorCode::audio_mic_disabled: return "audio_mic_disabled";
 
     case ErrorCode::trust_store_io: return "trust_store_io";
     case ErrorCode::trust_unknown_phone: return "trust_unknown_phone";
     case ErrorCode::trust_rejected: return "trust_rejected";
+    case ErrorCode::trust_store_not_durable: return "trust_store_not_durable";
 
     case ErrorCode::config_invalid: return "config_invalid";
     case ErrorCode::config_jurisdiction_unconfirmed: return "config_jurisdiction_unconfirmed";

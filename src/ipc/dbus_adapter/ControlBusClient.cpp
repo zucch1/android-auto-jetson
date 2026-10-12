@@ -223,23 +223,38 @@ core::Result<core::ConsumerId> ControlBusClient::register_consumer(const BusName
     if (!impl_) {
         return Error{ErrorCode::transport_closed};
     }
+    if (impl_->consumer_name.has_value()) {
+        // A populated registration is never replaced in place: the duplicate
+        // request is rejected BEFORE another name is requested and the
+        // existing name stays owned and tracked.
+        return Error{ErrorCode::session_illegal_transition};
+    }
     const auto owned = impl_->connection->request_name(consumer_name);
     if (!owned.has_value()) {
         return owned.error();
     }
+    // ONE cleanup helper: after the name acquisition EVERY failure (exchange
+    // / owner-resolution / transport failure, receiver error reply, malformed
+    // registration reply including trailing bytes) best-effort releases the
+    // just-acquired name so no lingering ownership outlives the failed
+    // registration - the ORIGINAL registration error is what the caller sees.
+    const auto unwind = [&](Error error) -> core::Result<core::ConsumerId> {
+        static_cast<void>(impl_->connection->release_name(consumer_name));
+        return error;
+    };
     MessageWriter body;
     body.put_string(consumer_name.value);
     auto reply = impl_->exchange("RegisterConsumer", "s", body);
     if (!reply.has_value()) {
-        return reply.error();
+        return unwind(reply.error());
     }
     if (reply.value().type == MessageType::error_reply) {
-        return Error{error_code_for(reply.value().error_name)};
+        return unwind(Error{error_code_for(reply.value().error_name)});
     }
     Cursor cursor(reply.value().body);
     auto id = cursor.read_u64();
     if (!id.has_value() || !cursor.done()) {
-        return Error{ErrorCode::ipc_malformed_request};
+        return unwind(Error{ErrorCode::ipc_malformed_request});
     }
     impl_->consumer_name = consumer_name;
     return core::ConsumerId{id.value()};
@@ -250,7 +265,19 @@ core::Result<void> ControlBusClient::unregister_consumer() {
         return Error{ErrorCode::transport_closed};
     }
     MessageWriter body;
-    return impl_->exchange_void("UnregisterConsumer", "", body);
+    auto unregistered = impl_->exchange_void("UnregisterConsumer", "", body);
+    if (!unregistered.has_value()) {
+        // Failure retains the tracked name (and its bus ownership): a retry
+        // stays possible and a duplicate register stays rejected.
+        return unregistered.error();
+    }
+    // Success releases the well-known name and resets the tracking so a
+    // fresh registration is allowed.
+    if (impl_->consumer_name.has_value()) {
+        static_cast<void>(impl_->connection->release_name(*impl_->consumer_name));
+        impl_->consumer_name.reset();
+    }
+    return {};
 }
 
 core::Result<void> ControlBusClient::start_projection() {
