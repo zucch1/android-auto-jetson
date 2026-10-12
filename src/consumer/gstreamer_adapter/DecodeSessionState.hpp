@@ -118,11 +118,19 @@ struct DecodeSessionState final {
     // no correlation mapping and does not consume its timestamp, so a
     // byte-rejected AU may be retried with the same timestamp after the
     // backlog drains.
+    // Immutable timestamp contract: the sentinel is never valid and accepted
+    // timestamps are strictly increasing behind the session high-water mark.
+    // Pure - the rejected-AU side-effect freedom of admit_submission() relies
+    // on this being checkable before any state change.
+    [[nodiscard]] bool timestamp_admissible(std::uint64_t timestamp_ns) const noexcept {
+        return timestamp_ns != kClockTimeNone
+            && (!last_accepted_timestamp_ns.has_value()
+                || timestamp_ns > *last_accepted_timestamp_ns);
+    }
+
     [[nodiscard]] core::Result<void> admit(const FeedLoad& load,
                                            std::uint64_t timestamp_ns) const {
-        if (timestamp_ns == kClockTimeNone
-            || (last_accepted_timestamp_ns.has_value()
-                && timestamp_ns <= *last_accepted_timestamp_ns)) {
+        if (!timestamp_admissible(timestamp_ns)) {
             return core::Result<void>{Error{ErrorCode::invalid_argument}};
         }
         if (!feed_admission_allows(load)) {
@@ -177,7 +185,12 @@ struct DecodeSessionState final {
 
     // Full pre-submit correlation gate, mutating, run before the push. Order
     // is policy:
-    //  (a) expire stale correlations at entry;
+    //  (a) expire stale correlations at entry (the retention policy is
+    //      preserved: genuinely expired mappings are still sacrificed);
+    //  (b) the immutable timestamp contract runs BEFORE any state change: a
+    //      duplicate/regressing/sentinel timestamp is a permanent
+    //      invalid_argument and leaves the pending set and the resync state
+    //      untouched - a rejected invalid AU is side-effect free;
     //  (c) a byte-admissible submission meeting a saturated pending set
     //      invalidates the whole set and resyncs BEFORE the admission
     //      decision - the set can never stay wedged at the cap;
@@ -190,6 +203,9 @@ struct DecodeSessionState final {
                                                       std::uint64_t timestamp_ns, bool idr,
                                                       Clock::time_point now) {
         expire_stale_correlations(now);
+        if (!timestamp_admissible(timestamp_ns)) {
+            return core::Result<void>{Error{ErrorCode::invalid_argument}};
+        }
         if (pending.size() >= kMaxPendingCorrelations && feed_admission_allows(load)) {
             invalidate_correlations();
         }

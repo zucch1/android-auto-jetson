@@ -1051,6 +1051,59 @@ TEST(ConsumerDecodeCorrelation, PendingCapacityDoesNotBlockRecoveryIdr) {
     EXPECT_NE(state.find_correlation(ts_recovery), nullptr);
 }
 
+TEST(ConsumerDecodeCorrelation, InvalidTimestampAtCapacityIsSideEffectFree) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point now{};
+    DecodeSessionState state;
+
+    // Fill the pending set to the 512-entry cap with valid, recorded AUs.
+    const std::size_t cap = DecodeSessionState::kMaxPendingCorrelations;
+    for (std::size_t i = 0; i < cap; ++i) {
+        const std::uint64_t frame = static_cast<std::uint64_t>(i);
+        const std::uint64_t timestamp_ns = kTimestampBaseNs + frame * kFramePeriodNs;
+        ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, timestamp_ns, i == 0, now)) << i;
+        state.accept_timestamp(timestamp_ns);
+        state.record_correlation(frame, 3 * frame + 1, timestamp_ns, now);
+    }
+    ASSERT_EQ(state.pending_count(), cap);
+    const std::uint64_t last = kTimestampBaseNs + (cap - 1) * kFramePeriodNs;
+
+    // Rejected INVALID AUs at the cap are side-effect free (re-review P2): a
+    // duplicate, a regressing and the sentinel timestamp must NOT clear the
+    // valid pending mappings and must NOT arm the IDR resync.
+    const std::uint64_t invalids[] = {last, kTimestampBaseNs, DecodeSessionState::kClockTimeNone};
+    for (const std::uint64_t invalid : invalids) {
+        const auto rejected = state.admit_submission(FeedLoad{0, 64}, invalid, true, now);
+        ASSERT_FALSE(rejected) << invalid;
+        EXPECT_EQ(rejected.error().code(), ErrorCode::invalid_argument) << invalid;
+        EXPECT_EQ(state.pending_count(), cap) << invalid;
+        EXPECT_FALSE(state.awaiting_idr) << invalid;
+        EXPECT_NE(state.find_correlation(kTimestampBaseNs), nullptr) << invalid;
+        EXPECT_NE(state.find_correlation(last), nullptr) << invalid;
+    }
+    const auto* oldest = state.find_correlation(kTimestampBaseNs);
+    ASSERT_NE(oldest, nullptr);
+    EXPECT_EQ(oldest->frame, 0U);
+    EXPECT_EQ(oldest->sequence, 1U);
+
+    // Normal capacity recovery remains functional after the rejected
+    // attempts: a VALID newer byte-admissible AU at the cap still invalidates
+    // the set and resyncs (non-IDR discarded, recovery IDR admitted).
+    const std::uint64_t ts_next = last + kFramePeriodNs;
+    const auto discarded = state.admit_submission(FeedLoad{0, 64}, ts_next, false, now);
+    ASSERT_FALSE(discarded);
+    EXPECT_EQ(discarded.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_TRUE(state.awaiting_idr);
+    EXPECT_EQ(state.pending_count(), 0U);
+    const std::uint64_t ts_recovery = ts_next + kFramePeriodNs;
+    const auto recovered = state.admit_submission(FeedLoad{0, 64}, ts_recovery, true, now);
+    ASSERT_TRUE(recovered) << static_cast<int>(recovered.error().code());
+    state.accept_timestamp(ts_recovery);
+    state.record_correlation(cap + 2, 3 * (cap + 2) + 1, ts_recovery, now);
+    EXPECT_EQ(state.pending_count(), 1U);
+    EXPECT_FALSE(state.awaiting_idr);
+}
+
 TEST(ConsumerDecodeCorrelation, LateOutputCannotAcquireRecoveryMetadata) {
     using Clock = DecodeSessionState::Clock;
     const Clock::time_point t0{};
