@@ -20,9 +20,23 @@
 // NOT cryptographic proof; USB identifier spoofing is a known, documented
 // limitation of the wired trust boundary.
 //
+// SNAPSHOT-ONLY PAIRING CONTRACT: approval is bound to the canonical identity
+// captured when RequestAddPhone succeeds, not to the currently connected
+// transport. A candidate swap after the request cannot change what the
+// matching confirm approves. ForgetPhone invalidates outstanding requests for
+// the forgotten identity. This snapshot-only behavior requires explicit owner
+// acceptance.
+//
 // Time: the policy reads an injected Clock so window expiry is deterministic
 // and testable without sleeps. The clock seam lives here (not in aa::session)
 // because trust is the lower module.
+//
+// Ownership/threading: one instance owned by the session thread — the same
+// ownership as the ApprovedPhoneStore it mutates and the ControlService that
+// drives it (Store.hpp, ControlService.hpp). PairingPolicy has NO internal
+// locks: note_candidate(), forget(), pairing_requested/pairing_confirmed/
+// pairing_cancelled, reap_expired() and take_invalidated_pairings() (and
+// therefore gate reconciliation) MUST all run serialized on that thread.
 
 #include <aa/core/Ids.hpp>
 #include <aa/core/Result.hpp>
@@ -78,7 +92,7 @@ public:
     // Transport/session side: record the phone identity currently presenting
     // itself for approval (the discovered-but-unapproved phone). The identity
     // is bound at pairing_requested time so a later swap cannot change what an
-    // in-flight confirm approves.
+    // in-flight confirm approves (SNAPSHOT-ONLY PAIRING CONTRACT above).
     void note_candidate(TransportIdentity identity);
 
     [[nodiscard]] const std::optional<TransportIdentity>& candidate() const noexcept {
@@ -86,6 +100,16 @@ public:
     }
 
     // ipc::PhoneDirectory — driven by ControlService after the task-21 gate.
+    //
+    // Revocation invalidates EVERY outstanding request bound to the forgotten
+    // identity: forget() matches pending entries by canonical identity_key
+    // (never variant equality or phone id — migrated opaque records and
+    // structured records can carry one canonical key), prepares the matching
+    // request ids BEFORE persistence, and drops them only after the
+    // revocation lands (durable success or the committed-but-not-durable
+    // error). A pre-replacement failure leaves the pending table untouched.
+    // Unknown phone ids invalidate nothing; the zero id is invalid_argument.
+    // The candidate slot is never consulted or cleared here.
     [[nodiscard]] core::Result<void> forget(core::PhoneId phone) override;
     [[nodiscard]] core::Result<void> pairing_requested(core::PairingRequestId request) override;
     [[nodiscard]] core::Result<core::PhoneId> pairing_confirmed(
@@ -98,6 +122,9 @@ public:
     // can release each one's PairingGate entry and emit PairingClosed before
     // admitting new requests.
     [[nodiscard]] std::vector<core::PairingRequestId> reap_expired() override;
+
+    // Drains the ids forget() invalidated (drain clears the buffer).
+    [[nodiscard]] std::vector<core::PairingRequestId> take_invalidated_pairings() override;
 
     [[nodiscard]] std::size_t pending_count() const noexcept { return pending_.size(); }
     [[nodiscard]] bool has_pending(core::PairingRequestId request) const;
@@ -118,6 +145,7 @@ private:
     const Clock& clock_;
     std::optional<TransportIdentity> candidate_{};
     std::vector<Pending> pending_{};
+    std::vector<core::PairingRequestId> invalidated_{};
 };
 
 } // namespace aa::trust

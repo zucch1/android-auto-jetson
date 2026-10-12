@@ -367,7 +367,51 @@ def case_neg_unexpected_root_child(root: Path) -> int:
             root,
             lambda text, injected=injected: text.replace(
                 NODE_OPEN, f"{NODE_OPEN}\n  {injected}", 1),
-            f"neg-unexpected-root-child[{label}]", ("DBUS_CONTRACT_UNEXPECTED_ELEMENT",))
+            f"neg-unexpected-root-child[{label}]",
+            ("DBUS_CONTRACT_UNEXPECTED_ROOT_CHILD",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_unexpected_interface_child(root: Path) -> int:
+    for label, injected in (
+            ("bogus", "<bogus/>"),
+            ("stray-arg", '<arg name="stray" type="s"/>')):
+        verdict = reject(
+            root,
+            lambda text, injected=injected: text.replace(
+                INTERFACE_OPEN, f"{INTERFACE_OPEN}\n    {injected}", 1),
+            f"neg-unexpected-interface-child[{label}]",
+            ("DBUS_CONTRACT_UNEXPECTED_INTERFACE_CHILD",))
+        if verdict != 0:
+            return verdict
+    return 0
+
+
+def case_neg_unexpected_member_child(root: Path) -> int:
+    nested = '<node name="/org/custom/Other"/>'
+    stray_arg = '<arg name="stray" type="s"/>'
+    targets = (
+        ('<method name="Ping">', f'<method name="Ping">\n      {nested}'),
+        ('<signal name="StateChanged">', f'<signal name="StateChanged">\n      {nested}'),
+        (PROPERTY_TAG, f'<property name="ContractSemVer" type="s" access="read">\n'
+         f'      {nested}\n    </property>'),
+        # Regression: an <arg> improperly nested in a <property> must be
+        # classified as a member-child violation, not the generic
+        # DBUS_CONTRACT_UNEXPECTED_ELEMENT (the arg exclusion only ever
+        # applied to method/signal, whose allowed set already admits arg).
+        (PROPERTY_TAG, f'<property name="ContractSemVer" type="s" access="read">\n'
+         f'      {stray_arg}\n    </property>'),
+    )
+    for label, (original, replaced) in zip(
+            ("method", "signal", "property", "property-arg"), targets, strict=True):
+        verdict = reject(
+            root,
+            lambda text, original=original, replaced=replaced: text.replace(
+                original, replaced, 1),
+            f"neg-unexpected-member-child[{label}]",
+            ("DBUS_CONTRACT_UNEXPECTED_MEMBER_CHILD",))
         if verdict != 0:
             return verdict
     return 0
@@ -376,23 +420,28 @@ def case_neg_unexpected_root_child(root: Path) -> int:
 def case_neg_unexpected_nested_element(root: Path) -> int:
     containers = (
         ('<method name="StartProjection">\n    </method>',
-         '<method name="StartProjection"><bogus/></method>'),
-        ('<signal name="PairingRequest">', '<signal name="PairingRequest">\n      <bogus/>'),
-        (PROPERTY_TAG, '<property name="ContractSemVer" type="s" access="read"><bogus/></property>'),
+         '<method name="StartProjection"><bogus/></method>',
+         ("DBUS_CONTRACT_UNEXPECTED_MEMBER_CHILD",)),
+        ('<signal name="PairingRequest">', '<signal name="PairingRequest">\n      <bogus/>',
+         ("DBUS_CONTRACT_UNEXPECTED_MEMBER_CHILD",)),
+        (PROPERTY_TAG, '<property name="ContractSemVer" type="s" access="read"><bogus/></property>',
+         ("DBUS_CONTRACT_UNEXPECTED_MEMBER_CHILD",)),
         ('<arg name="consumer_name" type="s" direction="in"/>',
-         '<arg name="consumer_name" type="s" direction="in"><bogus/></arg>'),
+         '<arg name="consumer_name" type="s" direction="in"><bogus/></arg>',
+         ("DBUS_CONTRACT_UNEXPECTED_ELEMENT",)),
         (ANNOTATION_TAG,
          '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
-         ' value="1.0.0"><bogus/></annotation>'),
+         ' value="1.0.0"><bogus/></annotation>',
+         ("DBUS_CONTRACT_UNEXPECTED_ELEMENT",)),
     )
-    for label, (original, replaced) in zip(
+    for label, (original, replaced, markers) in zip(
             ("method", "signal", "property", "arg", "annotation"), containers, strict=True):
         verdict = reject(
             root,
             lambda text, original=original, replaced=replaced: text.replace(
                 original, replaced, 1),
             f"neg-unexpected-nested-element[{label}]",
-            ("DBUS_CONTRACT_UNEXPECTED_ELEMENT",))
+            markers)
         if verdict != 0:
             return verdict
     return 0
@@ -607,6 +656,8 @@ CASES: dict[str, Callable[[Path], int]] = {
     "embedding-special-bytes": case_embedding_special_bytes,
     "embedding-crlf": case_embedding_crlf,
     "neg-unexpected-root-child": case_neg_unexpected_root_child,
+    "neg-unexpected-interface-child": case_neg_unexpected_interface_child,
+    "neg-unexpected-member-child": case_neg_unexpected_member_child,
     "neg-unexpected-nested-element": case_neg_unexpected_nested_element,
     "neg-unexpected-attribute": case_neg_unexpected_attribute,
     "neg-missing-attribute": case_neg_missing_attribute,
