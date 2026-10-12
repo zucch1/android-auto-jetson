@@ -20,6 +20,7 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
 
+#include <algorithm>
 #include <chrono>
 #include <atomic>
 #include <thread>
@@ -356,10 +357,13 @@ public:
         return expected_writes_;
     }
 
-    [[nodiscard]] bool wait_chain_return(core::Milliseconds timeout) {
+    // Waits for this write's zero-length marker at the pad on the SHARED
+    // write deadline (gate fix 3): chain settlement, enqueue admission and the
+    // render handoff all consume one absolute budget, never stacked windows.
+    [[nodiscard]] bool wait_chain_return_until(std::chrono::steady_clock::time_point deadline) {
         std::unique_lock<std::mutex> lock(mutex_);
-        return cv_.wait_for(lock, std::chrono::milliseconds(timeout.count),
-                            [this] { return chain_return_buffers_ >= expected_writes_; });
+        return cv_.wait_until(lock, deadline,
+                              [this] { return chain_return_buffers_ >= expected_writes_; });
     }
 
     void count_drain_completed() {
@@ -429,6 +433,31 @@ private:
     return static_cast<PadProbe*>(user)->on_buffer(buffer);
 }
 
+// Bounded appsrc admission (gate fix 3). The appsrc is configured with these
+// queue limits, and the APPLICATION enforces them on its own pushes: with
+// block=FALSE the queue limits are thresholds only (appsrc keeps accepting
+// buffers past them, see gst_app_src_push_internal), so write admission must
+// stop pushing while the queue cannot hold the COMPLETE data+marker pair.
+constexpr std::uint64_t kAppsrcMaxBytes = 65536;
+constexpr std::uint64_t kAppsrcMaxBuffers = 2;
+// One write enqueues exactly one pair: the nonempty data buffer plus its
+// zero-length chain-return marker. The marker occupies one buffer slot.
+constexpr std::uint64_t kWriteBufferPair = 2;
+// 64 KiB whole-frame bound for one private write (the router splits larger
+// intervals to the same bound); an oversized private write is rejected typed.
+constexpr std::uint64_t kMaxWriteBytes = 65536;
+// Admission polls the queue levels and the bus with naps bounded by this;
+// a nap is never longer than the remaining write budget (gate fix 3).
+constexpr std::chrono::microseconds kAdmissionPollNap{500};
+
+// Per-write outcome (gate fix 3): the typed result plus whether this write's
+// marker reached the element (fully consumed). Startup readiness probes are
+// retried ONLY when the previous probe was consumed without a handoff.
+struct WriteOutcome final {
+    core::Result<void> result{};
+    bool marker_settled{false};
+};
+
 struct SinkElements final {
     GstElement* pipeline{nullptr};
     GstElement* appsrc{nullptr};
@@ -461,36 +490,101 @@ public:
     }
 
     [[nodiscard]] core::Result<void> write(const MixedChunk& chunk) override {
-        return write_with_timeout(chunk, write_timeout_);
+        WriteOutcome outcome = write_with_timeout(chunk, write_timeout_, false);
+        return outcome.result;
     }
 
-    [[nodiscard]] core::Result<void> write_with_timeout(const MixedChunk& chunk,
-                                                        core::Milliseconds timeout) {
+    // Bounded nonblocking enqueue (gate fix 3). ONE absolute deadline is
+    // computed at entry and shared by queue admission, chain settlement and
+    // the render handoff - never two stacked timeout windows. Capacity for the
+    // COMPLETE data+marker pair is reserved BEFORE anything is allocated or
+    // pushed; the pair is pushed nonblocking; a buffer handed to
+    // gst_app_src_push_buffer() is NEVER retried (the push takes ownership
+    // even when it fails). A NORMAL write that times out or loses the route
+    // latches this sink failed - later normal writes fail immediately, so a
+    // late render callback can never resurrect a failed write as success.
+    // Readiness probes never latch; confirm_route's retry rule governs them.
+    [[nodiscard]] WriteOutcome write_with_timeout(const MixedChunk& chunk,
+                                                  core::Milliseconds timeout,
+                                                  bool readiness_probe) {
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(timeout.count);
+        WriteOutcome outcome;
         if (pipeline_ == nullptr || released_) {
-            return Error{ErrorCode::audio_sink_unavailable};
+            return fail_write(outcome, Error{ErrorCode::audio_sink_unavailable},
+                              readiness_probe);
+        }
+        if (!readiness_probe && failed_write_latched_) {
+            outcome.result = Error{ErrorCode::audio_sink_unavailable};
+            return outcome;
         }
         if (!(chunk.format == format_) || chunk.pcm.empty()) {
-            return Error{ErrorCode::audio_format_unsupported};
+            outcome.result = Error{ErrorCode::audio_format_unsupported};
+            return outcome;
         }
         const std::uint64_t frame_bytes =
             static_cast<std::uint64_t>(format_.channels) * sizeof(std::int16_t);
         if (frame_bytes == 0 || chunk.pcm.size() % frame_bytes != 0) {
-            return Error{ErrorCode::audio_format_unsupported};
+            outcome.result = Error{ErrorCode::audio_format_unsupported};
+            return outcome;
+        }
+        // The 64 KiB whole-frame bound for one private write (the router
+        // splits larger intervals to the same bound). An oversized private
+        // write is a format failure, never a partial enqueue.
+        const std::uint64_t data_bytes = chunk.pcm.size();
+        if (data_bytes > kMaxWriteBytes) {
+            outcome.result = Error{ErrorCode::audio_format_unsupported};
+            return outcome;
         }
 
         const auto bus_error = poll_bus_error();
         if (bus_error.has_value()) {
-            return *bus_error;
+            return fail_write(outcome, *bus_error, readiness_probe);
         }
 
+        // Explicit queue admission (gate fix 3). block=FALSE means the appsrc
+        // limits are thresholds only (its push keeps accepting past them), so
+        // the APPLICATION stops pushing while the queue cannot hold the
+        // COMPLETE data+marker pair: queued bytes + this write's bytes fit the
+        // byte limit and the queued buffers + the pair fit the buffer limit.
+        // While there is no capacity the levels and the bus are polled with
+        // naps bounded by the remaining budget - never past the deadline.
+        for (;;) {
+            const std::pair<std::uint64_t, std::uint64_t> levels = appsrc_queue_levels();
+            if (levels.first + data_bytes <= kAppsrcMaxBytes
+                && levels.second + kWriteBufferPair <= kAppsrcMaxBuffers) {
+                break;
+            }
+            const auto full_bus_error = poll_bus_error();
+            if (full_bus_error.has_value()) {
+                return fail_write(outcome, *full_bus_error, readiness_probe);
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                return fail_write(outcome, Error{ErrorCode::timeout}, readiness_probe);
+            }
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+            std::this_thread::sleep_for(remaining < kAdmissionPollNap ? remaining
+                                                                      : kAdmissionPollNap);
+        }
+
+        // Allocation and copy happen only AFTER admission (the queued bytes
+        // and slots are the scarce resource) and the deadline is rechecked so
+        // a slow path can never push past the budget.
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return fail_write(outcome, Error{ErrorCode::timeout}, readiness_probe);
+        }
         GstBuffer* buffer = gst_buffer_new_allocate(nullptr, chunk.pcm.size(), nullptr);
         if (buffer == nullptr) {
-            return Error{ErrorCode::audio_sink_unavailable};
+            return fail_write(outcome, Error{ErrorCode::audio_sink_unavailable},
+                              readiness_probe);
         }
         GstMapInfo map;
         if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
             gst_buffer_unref(buffer);
-            return Error{ErrorCode::audio_sink_unavailable};
+            return fail_write(outcome, Error{ErrorCode::audio_sink_unavailable},
+                              readiness_probe);
         }
         std::memcpy(map.data, chunk.pcm.data(), chunk.pcm.size());
         gst_buffer_unmap(buffer, &map);
@@ -502,18 +596,27 @@ public:
         GstBuffer* marker = gst_buffer_new_allocate(nullptr, 0, nullptr);
         if (marker == nullptr) {
             gst_buffer_unref(buffer);
-            return Error{ErrorCode::audio_sink_unavailable};
+            return fail_write(outcome, Error{ErrorCode::audio_sink_unavailable},
+                              readiness_probe);
         }
         GST_BUFFER_PTS(marker) = GST_BUFFER_PTS(buffer);
 
         const std::uint64_t write_seq = probe_.expect_write();
         GstFlowReturn pushed = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer);
         if (pushed != GST_FLOW_OK) {
-            return Error{ErrorCode::audio_sink_unavailable};
+            // The failed push already consumed the data buffer (ownership
+            // transfers even on failure); the marker was NEVER pushed and
+            // must be released here or it leaks.
+            gst_buffer_unref(marker);
+            return fail_write(outcome, Error{ErrorCode::audio_sink_unavailable},
+                              readiness_probe);
         }
         pushed = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), marker);
         if (pushed != GST_FLOW_OK) {
-            return Error{ErrorCode::audio_sink_unavailable};
+            // Same ownership rule on the marker; nothing is ever retried
+            // after gst_app_src_push_buffer() has taken a buffer.
+            return fail_write(outcome, Error{ErrorCode::audio_sink_unavailable},
+                              readiness_probe);
         }
 
         // The write is acknowledged ONLY at the renderer's handoff (gate r2
@@ -524,24 +627,31 @@ public:
         // Both observations must be settled before the write returns:
         // the marker (chain-return) is pushed after the data buffer, so the
         // handoff alone can fire while the marker is still in flight and a
-        // stats snapshot would race it.
-        const bool chained = probe_.wait_chain_return(timeout);
-        const bool handed = wait_handoff(write_seq, timeout);
+        // stats snapshot would race it. Both waits run against the ONE
+        // deadline computed at entry (gate fix 3): admission, chain
+        // settlement and the handoff share a single budget.
+        const bool chained = probe_.wait_chain_return_until(deadline);
+        const bool handed = wait_handoff_until(write_seq, deadline);
         close_window();
+        outcome.marker_settled = chained;
         if (!handed || !chained) {
             const auto late_error = poll_bus_error();
             if (late_error.has_value()) {
-                return *late_error;
+                return fail_write(outcome, *late_error, readiness_probe);
             }
-            return Error{ErrorCode::timeout};
+            return fail_write(outcome, Error{ErrorCode::timeout}, readiness_probe);
         }
-        return {};
+        return outcome;
     }
 
     // Render-probe round-trip (gate r2 F3): the CHOSEN route must
     // demonstrably accept and hand off a buffer before the sink is returned.
     // Probes are retried within the bound because the element silently drops
-    // buffers until its stream is streaming (link setup latency).
+    // buffers until its stream is streaming (link setup latency). A readiness
+    // probe is retried ONLY when it was fully consumed without a handoff (its
+    // marker settled and the pipeline dropped it); if the marker never
+    // settled the probe is still unresolved and readiness probing stops -
+    // no piling new attempts behind unresolved work (gate fix 3).
     [[nodiscard]] bool confirm_route(core::Milliseconds bound) {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(bound.count);
@@ -568,9 +678,13 @@ public:
             const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - std::chrono::steady_clock::now());
             const auto slice = remaining.count() < 300 ? remaining.count() : 300;
-            if (write_with_timeout(probe_chunk, core::Milliseconds{slice > 0 ? slice : 1})
-                    .has_value()) {
+            const WriteOutcome attempt =
+                write_with_timeout(probe_chunk, core::Milliseconds{slice > 0 ? slice : 1}, true);
+            if (attempt.result.has_value()) {
                 return true;
+            }
+            if (!attempt.marker_settled) {
+                return false;
             }
         }
     }
@@ -652,6 +766,9 @@ public:
     // element's render path gets to finish queued work before teardown. No
     // delivery or device-consumption claim is attached to this.
     void release() noexcept {
+        // Teardown must never stall on a test-only downstream block (gate fix
+        // 3): release it first, the tests also release it on every exit path.
+        disarm_downstream_block();
         if (pipeline_ != nullptr && !released_ && !drained_) {
             (void)drain(core::Milliseconds{2000});
         }
@@ -696,13 +813,136 @@ private:
 
     // Waits for the handoff credit of the SPECIFIC write identified by seq
     // (gate r3 F1): only an event bound to that write's window can advance
-    // acked_seq to it.
-    [[nodiscard]] bool wait_handoff(std::uint64_t seq, core::Milliseconds timeout) {
+    // acked_seq to it. Runs against the write's ONE deadline (gate fix 3) so
+    // chain settlement and this handoff wait share a single budget.
+    [[nodiscard]] bool wait_handoff_until(std::uint64_t seq,
+                                          std::chrono::steady_clock::time_point deadline) {
         std::unique_lock<std::mutex> lock(handoff_.mutex);
-        return handoff_.cv.wait_for(lock, std::chrono::milliseconds(timeout.count),
-                                    [&] { return handoff_.acked_seq >= seq; });
+        return handoff_.cv.wait_until(lock, deadline, [&] { return handoff_.acked_seq >= seq; });
     }
 
+    // Terminal-write bookkeeping (gate fix 3): a NORMAL write failure latches
+    // the sink so every later write fails immediately (a late render callback
+    // can never resurrect it); readiness probes never latch.
+    [[nodiscard]] WriteOutcome fail_write(WriteOutcome outcome, Error error, bool readiness_probe) {
+        if (!readiness_probe) {
+            failed_write_latched_ = true;
+        }
+        outcome.result = error;
+        return outcome;
+    }
+
+    // Queue levels of the appsrc (bytes, buffers): the admission observables.
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> appsrc_queue_levels() const {
+        std::uint64_t bytes = 0;
+        std::uint64_t buffers = 0;
+        if (appsrc_ != nullptr) {
+            bytes = gst_app_src_get_current_level_bytes(GST_APP_SRC(appsrc_));
+            buffers = gst_app_src_get_current_level_buffers(GST_APP_SRC(appsrc_));
+        }
+        return {bytes, buffers};
+    }
+
+public:
+    // ---- Test-only downstream block + appsrc observation (gate fix 3) ----
+    // Driven through the private hooks in AudioSinkFactory.hpp; never used by
+    // production callers. The block is a blocking probe on the routing
+    // element's sink pad: GST_PAD_PROBE_OK from a blocking probe keeps the pad
+    // blocked, so upstream buffers stall in front of the element and the
+    // appsrc queue fills behind them.
+
+    [[nodiscard]] bool arm_downstream_block() {
+        if (pad_ == nullptr || released_) {
+            return false;
+        }
+        if (block_probe_id_ != 0) {
+            return true;
+        }
+        block_entered_ = false;
+        block_probe_id_ = gst_pad_add_probe(pad_, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
+                                            block_probe_trampoline, this, nullptr);
+        return block_probe_id_ != 0;
+    }
+
+    // True once the block has actually HELD a buffer - the stall is engaged
+    // and later pushes can only accumulate in the appsrc queue.
+    [[nodiscard]] bool wait_downstream_block_entered(core::Milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(block_mutex_);
+        return block_cv_.wait_for(lock, std::chrono::milliseconds(timeout.count),
+                                  [this] { return block_entered_; });
+    }
+
+    void disarm_downstream_block() noexcept {
+        if (pad_ != nullptr && block_probe_id_ != 0) {
+            gst_pad_remove_probe(pad_, block_probe_id_);
+        }
+        block_probe_id_ = 0;
+        std::lock_guard<std::mutex> lock(block_mutex_);
+        block_entered_ = false;
+    }
+
+    // Pushes raw zero-filled buffers straight into appsrc (no render barrier,
+    // no handoff acknowledgement) until the queued byte level reaches
+    // target_bytes. Returns the level reached.
+    [[nodiscard]] std::uint64_t prefill_appsrc(std::uint64_t target_bytes) {
+        if (appsrc_ == nullptr || released_) {
+            return 0;
+        }
+        const std::uint64_t chunk_bytes = std::max<std::uint64_t>(
+            1, std::min<std::uint64_t>(target_bytes, kMaxWriteBytes / 2));
+        // One buffer may be held outside the queue (in the blocked chain), so
+        // the push budget is a pair of chunks above the target; never unbounded.
+        const std::uint64_t push_budget = target_bytes + 2 * chunk_bytes;
+        std::uint64_t pushed = 0;
+        while (appsrc_queue_levels().first < target_bytes && pushed < push_budget) {
+            GstBuffer* buffer =
+                gst_buffer_new_allocate(nullptr, static_cast<gsize>(chunk_bytes), nullptr);
+            if (buffer == nullptr) {
+                break;
+            }
+            GstMapInfo map;
+            if (gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+                std::memset(map.data, 0, map.size);
+                gst_buffer_unmap(buffer, &map);
+            }
+            if (gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer) != GST_FLOW_OK) {
+                break;
+            }
+            pushed += chunk_bytes;
+        }
+        return appsrc_queue_levels().first;
+    }
+
+    [[nodiscard]] detail::AppsrcQueueLevel appsrc_queue_level() const {
+        detail::AppsrcQueueLevel level;
+        const std::pair<std::uint64_t, std::uint64_t> levels = appsrc_queue_levels();
+        level.queued_bytes = levels.first;
+        level.queued_buffers = levels.second;
+        if (appsrc_ != nullptr) {
+            level.max_bytes = gst_app_src_get_max_bytes(GST_APP_SRC(appsrc_));
+            level.max_buffers = gst_app_src_get_max_buffers(GST_APP_SRC(appsrc_));
+        }
+        return level;
+    }
+
+    static GstPadProbeReturn block_probe_trampoline(GstPad*, GstPadProbeInfo* info, gpointer user) {
+        return static_cast<GstSink*>(user)->on_downstream_block(info);
+    }
+
+    [[nodiscard]] GstPadProbeReturn on_downstream_block(GstPadProbeInfo* info) {
+        if ((info->type & GST_PAD_PROBE_TYPE_BUFFER) != 0) {
+            {
+                std::lock_guard<std::mutex> lock(block_mutex_);
+                block_entered_ = true;
+            }
+            block_cv_.notify_all();
+        }
+        // Blocking probes block on GST_PAD_PROBE_OK by default: the data item
+        // stays held here until the probe is removed.
+        return GST_PAD_PROBE_OK;
+    }
+
+private:
     // Asynchronous route failures (bus errors) are observed at every write and
     // drain so a mid-stream output loss surfaces typed instead of silent.
     [[nodiscard]] std::optional<Error> poll_bus_error() const {
@@ -744,6 +984,14 @@ private:
     std::int64_t pts_origin_ns_{0};
     bool drained_{false};
     bool released_{false};
+    // Failed-write latch (gate fix 3): set by a normal write that timed out or
+    // lost the route; every later normal write fails immediately.
+    bool failed_write_latched_{false};
+    // Test-only downstream block state (gate fix 3), see arm_downstream_block.
+    gulong block_probe_id_{0};
+    std::mutex block_mutex_{};
+    std::condition_variable block_cv_{};
+    bool block_entered_{false};
 };
 
 // Test-only (gate r3 F1): unrelated in-process traffic source. Its render
@@ -897,6 +1145,43 @@ std::uint64_t handoff_events_seen() noexcept {
     return g_handoff_events_seen.load(std::memory_order_relaxed);
 }
 
+// Test-only queue admission hooks (gate fix 3) - see AudioSinkFactory.hpp for
+// the contract. They resolve the seam's sink to the GStreamer implementation
+// here inside the adapter zone; no GStreamer type ever crosses the seam.
+
+namespace {
+[[nodiscard]] GstSink* gstreamer_sink_of(ObservedAudioSink& sink) noexcept {
+    return dynamic_cast<GstSink*>(&sink);
+}
+} // namespace
+
+bool block_downstream_for_test(ObservedAudioSink& sink) {
+    GstSink* gstreamer_sink = gstreamer_sink_of(sink);
+    return gstreamer_sink != nullptr && gstreamer_sink->arm_downstream_block();
+}
+
+bool wait_downstream_block_entered_for_test(ObservedAudioSink& sink, core::Milliseconds timeout) {
+    GstSink* gstreamer_sink = gstreamer_sink_of(sink);
+    return gstreamer_sink != nullptr && gstreamer_sink->wait_downstream_block_entered(timeout);
+}
+
+void unblock_downstream_for_test(ObservedAudioSink& sink) noexcept {
+    GstSink* gstreamer_sink = gstreamer_sink_of(sink);
+    if (gstreamer_sink != nullptr) {
+        gstreamer_sink->disarm_downstream_block();
+    }
+}
+
+std::uint64_t prefill_appsrc_for_test(ObservedAudioSink& sink, std::uint64_t target_bytes) {
+    GstSink* gstreamer_sink = gstreamer_sink_of(sink);
+    return gstreamer_sink != nullptr ? gstreamer_sink->prefill_appsrc(target_bytes) : 0;
+}
+
+AppsrcQueueLevel appsrc_queue_level_for_test(ObservedAudioSink& sink) {
+    GstSink* gstreamer_sink = gstreamer_sink_of(sink);
+    return gstreamer_sink != nullptr ? gstreamer_sink->appsrc_queue_level() : AppsrcQueueLevel{};
+}
+
 
 SinkOpenOutcome open_default_sink(const SinkOpenRequest& request) {
     ensure_gstreamer_initialized();
@@ -968,11 +1253,22 @@ SinkOpenOutcome open_default_sink(const SinkOpenRequest& request) {
         return outcome;
     }
 
+    // Bounded nonblocking enqueue (gate fix 3): block=FALSE + leaky NONE
+    // makes gst_app_src_push_buffer() never wait and never drop, and the
+    // max-* values below are QUEUE THRESHOLDS ONLY (appsrc keeps accepting
+    // past them). The application therefore enforces admission itself in
+    // GstSink::write_with_timeout: it stops pushing while the queue cannot
+    // hold the complete data+marker pair (64 KiB / 2 buffers).
+    gst_app_src_set_max_bytes(GST_APP_SRC(source), kAppsrcMaxBytes);
+    gst_app_src_set_max_buffers(GST_APP_SRC(source), kAppsrcMaxBuffers);
+    gst_app_src_set_max_time(GST_APP_SRC(source), 0);
+    gst_app_src_set_leaky_type(GST_APP_SRC(source), GST_APP_LEAKY_TYPE_NONE);
+    gst_app_src_set_emit_signals(GST_APP_SRC(source), FALSE);
     g_object_set(source,
                  "caps", caps,
                  "format", GST_FORMAT_TIME,
                  "is-live", FALSE,
-                 "block", TRUE,
+                 "block", FALSE,
                  nullptr);
     g_object_set(filter, "caps", caps, nullptr);
     gst_caps_unref(caps);

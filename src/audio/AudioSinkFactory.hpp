@@ -11,6 +11,7 @@
 #include <aa/core/Result.hpp>
 #include <aa/core/Time.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -26,6 +27,16 @@ namespace aa::audio::detail {
 // acknowledge a write: element-ingress (pad arrival) and chain-return (the
 // zero-length marker after the data's chain). This is still NOT the device
 // write endpoint (samples reaching the hardware), which is unmeasured.
+//
+// Timeout semantics (gate fix 3): the write timeout is ONE absolute deadline
+// for the whole write. Queue admission (the appsrc must hold the complete
+// data+marker pair), chain settlement and the render handoff all share that
+// single budget - a write never waits twice the timeout. A write that times
+// out or loses the route fails typed (timeout / audio_sink_unavailable) and
+// LATCHES: every later write fails immediately, so a late render callback can
+// never resurrect a failed write. Format errors and oversized writes (over
+// 64 KiB, the router splits larger intervals) are audio_format_unsupported
+// and do not latch.
 //
 // drain() is an end-of-stream round-trip: it lets the element's render path
 // finish queued work before teardown. It makes NO device-consumption or
@@ -91,5 +102,40 @@ struct SinkOpenOutcome final {
 [[nodiscard]] bool start_foreign_sink_traffic(std::uint32_t buffers);
 void stop_foreign_sink_traffic() noexcept;
 [[nodiscard]] std::uint64_t handoff_events_seen() noexcept;
+
+// ---- Test-only queue admission hooks (gate fix 3) ----
+// Private test seams only: they let the audio_pipeline tests block the route's
+// downstream AFTER readiness and observe the appsrc queue while the admission
+// contract is exercised. No production caller uses them; no GStreamer type
+// crosses this seam and no production API changes with them.
+
+// The appsrc queue state of the routing sink: what is queued right now and the
+// configured admission limits (bytes / buffers).
+struct AppsrcQueueLevel final {
+    std::uint64_t queued_bytes{};
+    std::uint64_t queued_buffers{};
+    std::uint64_t max_bytes{};
+    std::uint64_t max_buffers{};
+};
+
+// Blocks the routing element's sink pad (a blocking pad probe) so downstream
+// render stalls and pushed buffers accumulate in the appsrc queue. False when
+// the sink has no attachable pad or the block cannot be installed.
+[[nodiscard]] bool block_downstream_for_test(ObservedAudioSink& sink);
+// True once the block has actually HELD a buffer - the stall is engaged and
+// later pushes can only accumulate in the queue.
+[[nodiscard]] bool wait_downstream_block_entered_for_test(ObservedAudioSink& sink,
+                                                          core::Milliseconds timeout);
+// Releases the block (idempotent). Tests must call this on EVERY exit path,
+// including assertion failures, before teardown.
+void unblock_downstream_for_test(ObservedAudioSink& sink) noexcept;
+// Pushes raw zero-filled buffers straight into appsrc (no render barrier and
+// no handoff acknowledgement) until the queue's byte level reaches
+// target_bytes; returns the level reached. Fills the queue to its admission
+// threshold while the downstream block holds it.
+[[nodiscard]] std::uint64_t prefill_appsrc_for_test(ObservedAudioSink& sink,
+                                                    std::uint64_t target_bytes);
+// Reads the appsrc queue levels and the configured limits.
+[[nodiscard]] AppsrcQueueLevel appsrc_queue_level_for_test(ObservedAudioSink& sink);
 
 } // namespace aa::audio::detail

@@ -603,6 +603,95 @@ TEST_F(AudioPipelineRoute, DataDroppedAtIngressNeverAcknowledges) {
     router.value().close();
 }
 
+TEST_F(AudioPipelineRoute, DroppedDataUsesOneWriteDeadline) {
+    // Gate fix 3: the ingress-drop scenario with its write deadline pinned.
+    // The write spends ONE bounded budget (500 ms admission + chain + handoff)
+    // and the pump returns with the typed failure before a second timeout
+    // window could stack on the first (which would measure >= 1 s).
+    auto config = pcm_router_config();
+    config.drop_nonempty_at_ingress = true;
+    config.sink_write_timeout = aa::core::Milliseconds{500};
+    auto router = aa::audio::AudioRouter::open(config);
+    ASSERT_TRUE(router.has_value());
+
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    const auto message =
+        make_message(aa::protocol::ChannelRole::media_audio, 0, now_ns(), media);
+    ASSERT_TRUE(router.value().submit(message).has_value());
+    const auto started = std::chrono::steady_clock::now();
+    auto pumped = router.value().pump();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    ASSERT_FALSE(pumped.has_value());
+    EXPECT_EQ(pumped.error().code(), aa::ErrorCode::audio_sink_unavailable);
+    EXPECT_LT(elapsed, std::chrono::milliseconds{800});
+
+    const auto& report = router.value().report();
+    EXPECT_EQ(router.value().state(), aa::audio::RouterState::degraded);
+    EXPECT_NE(report.sink.cause.find("disabled"), std::string::npos);
+    EXPECT_EQ(report.render_barrier.handoff_events, 0U);
+    EXPECT_GT(report.sink_probe.samples, 0U);
+    router.value().close();
+}
+
+TEST_F(AudioPipelineRoute, BackpressureTimeoutDegradesAndRefusesFurtherSubmit) {
+    // Gate fix 3: the full-appsrc-queue condition seen through the router. The
+    // downstream block stalls the route after readiness and the queue is
+    // prefilled to its byte threshold, so the next mixed write cannot be
+    // admitted; its ONE deadline expires at admission, the pump fails typed,
+    // the router degrades with the cause recording the timeout, and every
+    // later submit is refused.
+    aa::audio::detail::SinkOpenRequest request;
+    request.format = stereo_48k();
+    request.start_timeout = aa::core::Milliseconds{2000};
+    request.write_timeout = aa::core::Milliseconds{200};
+    auto outcome = aa::audio::detail::open_default_sink(request);
+    ASSERT_TRUE(outcome.sink != nullptr);
+
+    // Releases the downstream block on EVERY exit path (including assertion
+    // failures) and only then lets the router release the sink: the harness
+    // is declared after the sink, so it runs first at scope exit.
+    struct Harness final {
+        aa::audio::detail::ObservedAudioSink* sink{nullptr};
+        std::optional<aa::audio::AudioRouter> router{};
+        ~Harness() {
+            if (sink != nullptr) {
+                aa::audio::detail::unblock_downstream_for_test(*sink);
+            }
+            router.reset();
+        }
+    };
+    Harness harness{};
+    harness.sink = outcome.sink.get();
+
+    ASSERT_TRUE(aa::audio::detail::block_downstream_for_test(*harness.sink));
+    (void)aa::audio::detail::prefill_appsrc_for_test(*harness.sink, 4);
+    ASSERT_TRUE(aa::audio::detail::wait_downstream_block_entered_for_test(
+        *harness.sink, aa::core::Milliseconds{2000}));
+    const std::uint64_t filled = aa::audio::detail::prefill_appsrc_for_test(*harness.sink, 65536);
+    EXPECT_GE(filled, 65536U);
+
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(pcm_router_config(),
+                                                                    std::move(outcome.sink));
+    ASSERT_TRUE(opened.has_value());
+    harness.router.emplace(std::move(opened).value());
+
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    const auto message =
+        make_message(aa::protocol::ChannelRole::media_audio, 0, now_ns(), media);
+    ASSERT_TRUE(harness.router->submit(message).has_value());
+    auto pumped = harness.router->pump();
+    ASSERT_FALSE(pumped.has_value());
+    EXPECT_EQ(pumped.error().code(), aa::ErrorCode::audio_sink_unavailable);
+    EXPECT_EQ(harness.router->state(), aa::audio::RouterState::degraded);
+    EXPECT_NE(harness.router->report().sink.cause.find("timeout"), std::string::npos);
+
+    const auto late = make_message(aa::protocol::ChannelRole::media_audio, 1, now_ns(), media);
+    auto refused = harness.router->submit(late);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::audio_sink_unavailable);
+    // The harness releases the downstream block before teardown here.
+}
+
 TEST_F(AudioPipelineRoute, MissingDefaultOutputDegradesTypedWithRecordedCause) {
     auto config = pcm_router_config();
     config.backend = aa::audio::SinkBackend::pipewire;
@@ -1572,6 +1661,77 @@ TEST(AudioPipelineSinkBackend, MissingPipeWireElementsRecordDisabledCause) {
         EXPECT_TRUE(selection.element.empty());
         EXPECT_NE(selection.cause.find("disabled:"), std::string::npos);
     }
+}
+
+TEST(AudioPipelineSinkBackend, FullAppsrcQueueHonorsSingleWriteDeadline) {
+    // Gate fix 3 regression: with the appsrc queue prefilled to its byte
+    // threshold and downstream blocked after readiness, a real write() must
+    // fail at ADMISSION within ONE deadline (~200 ms). It must not hang in the
+    // enqueue (the old blocking appsrc push never returned), must not push
+    // into the full queue (queue levels stay exactly as prefilled), and must
+    // not wait for a handoff that cannot come (no acknowledged handoffs).
+    aa::audio::detail::SinkOpenRequest request;
+    request.format = stereo_48k();
+    request.start_timeout = aa::core::Milliseconds{2000};
+    request.write_timeout = aa::core::Milliseconds{200};
+    auto outcome = aa::audio::detail::open_default_sink(request);
+    ASSERT_TRUE(outcome.sink != nullptr);
+
+    // Releases the downstream block on EVERY exit path, including assertion
+    // failures: the guard is declared after the sink so it runs first.
+    struct UnblockGuard final {
+        aa::audio::detail::ObservedAudioSink* sink{nullptr};
+        ~UnblockGuard() {
+            if (sink != nullptr) {
+                aa::audio::detail::unblock_downstream_for_test(*sink);
+            }
+        }
+    };
+    UnblockGuard unblock{outcome.sink.get()};
+
+    ASSERT_TRUE(aa::audio::detail::block_downstream_for_test(*outcome.sink));
+    // One trigger buffer makes the block hold real data - the stall is
+    // engaged and later pushes can only accumulate in the appsrc queue.
+    (void)aa::audio::detail::prefill_appsrc_for_test(*outcome.sink, 4);
+    ASSERT_TRUE(aa::audio::detail::wait_downstream_block_entered_for_test(
+        *outcome.sink, aa::core::Milliseconds{2000}));
+
+    const aa::audio::detail::AppsrcQueueLevel limits =
+        aa::audio::detail::appsrc_queue_level_for_test(*outcome.sink);
+    EXPECT_EQ(limits.max_bytes, 65536U);
+    EXPECT_EQ(limits.max_buffers, 2U);
+    // Prefill the appsrc to its byte threshold (the block holds the streaming
+    // thread, so the fill behind it is deterministic).
+    const std::uint64_t filled =
+        aa::audio::detail::prefill_appsrc_for_test(*outcome.sink, limits.max_bytes);
+    EXPECT_GE(filled, limits.max_bytes);
+    const aa::audio::detail::AppsrcQueueLevel before =
+        aa::audio::detail::appsrc_queue_level_for_test(*outcome.sink);
+    const auto handoffs_before = outcome.sink->render_stats().handoff_events;
+
+    const std::vector<std::byte> pcm = constant_pcm({kMediaLevel, 960});
+    const aa::audio::MixedChunk chunk{stereo_48k(), now_ns(),
+                                      std::span<const std::byte>{pcm}};
+    const auto started = std::chrono::steady_clock::now();
+    auto written = outcome.sink->write(chunk);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error().code(), aa::ErrorCode::timeout);
+    // ONE deadline of 200 ms shared by admission, chain settlement and the
+    // handoff: bounded below anything that would stack a second timeout
+    // window - and a blocking enqueue would never have returned at all.
+    EXPECT_LT(elapsed, std::chrono::milliseconds{350});
+    EXPECT_GE(elapsed, std::chrono::milliseconds{150});
+    EXPECT_EQ(outcome.sink->render_stats().handoff_events, handoffs_before);
+    const aa::audio::detail::AppsrcQueueLevel after =
+        aa::audio::detail::appsrc_queue_level_for_test(*outcome.sink);
+    // The write never entered the queue: no queue-limit growth at all.
+    EXPECT_EQ(after.queued_bytes, before.queued_bytes);
+    EXPECT_EQ(after.queued_buffers, before.queued_buffers);
+    EXPECT_LE(after.queued_bytes, after.max_bytes);
+    EXPECT_LE(after.queued_buffers, after.max_buffers);
+    // The guard releases the downstream block here on every exit path.
 }
 
 TEST(MicrophoneContract, DisabledByDefaultWithTypedRefusal) {
