@@ -711,14 +711,21 @@ public:
     IsolatedPipeWire& operator=(const IsolatedPipeWire&) = delete;
     IsolatedPipeWire(IsolatedPipeWire&& other) noexcept
         : scratch_(std::move(other.scratch_)), runtime_dir_(std::move(other.runtime_dir_)),
-          env_(std::move(other.env_)), pids_(std::move(other.pids_)) {
+          env_(std::move(other.env_)), pids_(std::move(other.pids_)),
+          had_parent_runtime_dir_(other.had_parent_runtime_dir_),
+          parent_runtime_dir_(std::move(other.parent_runtime_dir_)) {
         other.runtime_dir_.clear();
         other.pids_.clear();
+        other.had_parent_runtime_dir_ = false;
     }
     ~IsolatedPipeWire() {
         kill_backend();
         if (!runtime_dir_.empty()) {
-            unsetenv("PIPEWIRE_RUNTIME_DIR");
+            if (had_parent_runtime_dir_) {
+                setenv("PIPEWIRE_RUNTIME_DIR", parent_runtime_dir_.c_str(), 1);
+            } else {
+                unsetenv("PIPEWIRE_RUNTIME_DIR");
+            }
         }
     }
 
@@ -770,15 +777,24 @@ private:
         return SpawnResult::ok;
     }
 
+public:
+    struct ConfigOutcome {
+        enum class Stage { ok, template_read, denied_module_verify, destination_open, write_close };
+        Stage stage{Stage::ok};
+        std::string detail{};
+    };
+
     // Restricted daemon context derived from the installed default (known-good
     // core setup) with every hardware/D-Bus-dependent module stanza removed by
     // EXACT module name (no prefix collisions) and the bell/jackdbus/access
     // autoloads disabled. A null Audio/Sink is added only when requested.
-    [[nodiscard]] static bool write_restricted_daemon_config(const std::string& path,
-                                                            bool with_null_sink) {
-        std::ifstream input("/usr/share/pipewire/pipewire.conf");
+    // Returns a stage-specific outcome so fixture failures say which stage
+    // broke and with which paths, instead of one boolean.
+    [[nodiscard]] static ConfigOutcome write_restricted_daemon_config(
+        const std::string& template_path, const std::string& dest_path, bool with_null_sink) {
+        std::ifstream input(template_path);
         if (!input) {
-            return false;
+            return {ConfigOutcome::Stage::template_read, "cannot open " + template_path};
         }
         std::string body{std::istreambuf_iterator<char>{input},
                          std::istreambuf_iterator<char>{}};
@@ -794,6 +810,24 @@ private:
                                                "libpipewire-module-avb",
                                                "libpipewire-module-jack-tunnel",
                                                "libpipewire-module-netjack2-manager"};
+
+        // Exact module-token match shared by the stripper and the fail-closed
+        // verify: "libpipewire-module-rtkit" is NOT "libpipewire-module-rt"
+        // (the verify's old prefix compare conflated them).
+        const auto token_after = [](const std::string& line, std::size_t start) {
+            const std::size_t begin = line.find_first_not_of(" \t\"", start);
+            if (begin == std::string::npos) {
+                return std::string{};
+            }
+            const std::size_t stop = line.find_first_not_of(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-", begin);
+            return line.substr(begin,
+                               stop == std::string::npos ? std::string::npos : stop - begin);
+        };
+        const auto denied_token = [&](const std::string& token) {
+            return std::any_of(std::begin(deny), std::end(deny),
+                               [&](const char* bad) { return token == bad; });
+        };
 
         std::istringstream stream{body};
         std::string line;
@@ -811,14 +845,8 @@ private:
             }
             const std::size_t name = line.find("name = libpipewire-module-");
             if (name != std::string::npos) {
-                std::string module = line.substr(name + 7);
-                const std::size_t stop = module.find_first_not_of(
-                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-");
-                module = module.substr(0, stop);
-                const bool denied = std::any_of(
-                    std::begin(deny), std::end(deny),
-                    [&](const char* bad) { return module == bad; });
-                if (denied) {
+                const std::string module = token_after(line, name + 7);
+                if (denied_token(module)) {
                     skip_depth = static_cast<int>(std::count(line.begin(), line.end(), '{'))
                         - static_cast<int>(std::count(line.begin(), line.end(), '}'));
                     skip = true;
@@ -838,7 +866,10 @@ private:
 
         // Fail closed (gate r3 F2 "assert in the test config"): no ACTIVE
         // stanza may reference a denied module (commented examples in the
-        // upstream config are not loaded and are not asserted against).
+        // upstream config are not loaded and are not asserted against). The
+        // verify tokenizes more broadly than the stripper (quotes/spacing
+        // tolerated) so a forbidden reference the stripper missed is caught
+        // here rather than silently kept.
         {
             std::istringstream verify{kept};
             std::string vline;
@@ -847,11 +878,14 @@ private:
                 if (hash != std::string::npos && vline[hash] == '#') {
                     continue;
                 }
-                for (const char* bad : deny) {
-                    const std::size_t ref = vline.find("name = ");
-                    if (ref != std::string::npos && vline.compare(ref + 7, std::strlen(bad), bad) == 0) {
-                        return false;
-                    }
+                const std::size_t ref = vline.find("name = ");
+                if (ref == std::string::npos) {
+                    continue;
+                }
+                const std::string token = token_after(vline, ref + 7);
+                if (!token.empty() && denied_token(token)) {
+                    return {ConfigOutcome::Stage::denied_module_verify,
+                            "retained forbidden module " + token + " in " + dest_path};
                 }
             }
         }
@@ -870,9 +904,9 @@ private:
                 "            monitor.channel-volumes = true\n"
                 "        }\n"
                 "    },\n";
-            std::ofstream output(path);
+            std::ofstream output(dest_path);
             if (!output) {
-                return false;
+                return {ConfigOutcome::Stage::destination_open, "cannot open " + dest_path};
             }
             if (at == std::string::npos) {
                 output << kept << "\ncontext.objects = [\n" << stanza << "]\n";
@@ -880,15 +914,23 @@ private:
                 output << kept.substr(0, at + marker.size()) << "\n" << stanza
                        << kept.substr(at + marker.size());
             }
-            return output.good();
+            if (!output.good()) {
+                return {ConfigOutcome::Stage::write_close, "write failed " + dest_path};
+            }
+            return {};
         }
-        std::ofstream output(path);
+        std::ofstream output(dest_path);
         if (!output) {
-            return false;
+            return {ConfigOutcome::Stage::destination_open, "cannot open " + dest_path};
         }
         output << kept;
-        return output.good();
+        if (!output.good()) {
+            return {ConfigOutcome::Stage::write_close, "write failed " + dest_path};
+        }
+        return {};
     }
+
+private:
 
     // Policy-only session manager: linking without Bluetooth, ALSA/v4l2/
     // libcamera monitors, portal access checks or restore-stream persistence
@@ -958,16 +1000,48 @@ private:
     std::string runtime_dir_{};
     std::vector<std::string> env_{};
     std::vector<pid_t> pids_{};
+    bool had_parent_runtime_dir_{false};
+    std::string parent_runtime_dir_{};
 };
 
 struct IsolatedPipeWire::StartOutcome {
     std::optional<IsolatedPipeWire> backend{};
     std::string error{};
     bool unavailable{false};
+    std::string unavailable_what{};
 };
 
 IsolatedPipeWire::StartOutcome IsolatedPipeWire::start(bool with_null_sink) {
         StartOutcome outcome;
+        // Required executables are checked BEFORE anything spawns or is
+        // created: a missing daemon binary must SKIP locally but must FAIL in
+        // CI, and it must never leave a spawned bus behind. The search path
+        // matches the restricted child PATH below.
+        const auto executable_present = [](const char* name) {
+            for (const char* dir : {"/usr/local/bin", "/usr/bin", "/bin"}) {
+                const std::string candidate = std::string{dir} + "/" + name;
+                if (::access(candidate.c_str(), X_OK) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        std::string missing;
+        for (const char* required : {"dbus-daemon", "pipewire"}) {
+            if (!executable_present(required)) {
+                missing += (missing.empty() ? "" : ", ");
+                missing += required;
+            }
+        }
+        if (with_null_sink && !executable_present("wireplumber")) {
+            missing += (missing.empty() ? "" : ", ");
+            missing += "wireplumber";
+        }
+        if (!missing.empty()) {
+            outcome.unavailable = true;
+            outcome.unavailable_what = missing;
+            return outcome;
+        }
         char templ[] = "/tmp/aa-task25-pw-XXXXXX";
         const char* dir = mkdtemp(templ);
         if (dir == nullptr) {
@@ -1041,6 +1115,11 @@ IsolatedPipeWire::StartOutcome IsolatedPipeWire::start(bool with_null_sink) {
             }
         }
 
+        const char* parent_runtime = std::getenv("PIPEWIRE_RUNTIME_DIR");
+        self.had_parent_runtime_dir_ = parent_runtime != nullptr;
+        if (parent_runtime != nullptr) {
+            self.parent_runtime_dir_ = parent_runtime;
+        }
         setenv("PIPEWIRE_RUNTIME_DIR", self.runtime_dir_.c_str(), 1);
 
         const SpawnResult bus_spawn = self.spawn(
@@ -1058,8 +1137,10 @@ IsolatedPipeWire::StartOutcome IsolatedPipeWire::start(bool with_null_sink) {
         // Restricted daemon config for BOTH variants (null sink only when the
         // route needs an output): hardware and D-Bus modules stripped.
         const std::string daemon_config = self.scratch_ + "/pipewire-restricted.conf";
-        if (!write_restricted_daemon_config(daemon_config, with_null_sink)) {
-            outcome.error = "cannot write the restricted daemon config";
+        const ConfigOutcome config = write_restricted_daemon_config(
+            "/usr/share/pipewire/pipewire.conf", daemon_config, with_null_sink);
+        if (config.stage != ConfigOutcome::Stage::ok) {
+            outcome.error = "cannot write the restricted daemon config: " + config.detail;
             return outcome;
         }
         const SpawnResult daemon_spawn =
@@ -1092,7 +1173,6 @@ IsolatedPipeWire::StartOutcome IsolatedPipeWire::start(bool with_null_sink) {
         usleep(800000);
         outcome.backend.emplace(std::move(self));
         return outcome;
-        return outcome;
 }
 
 
@@ -1106,7 +1186,10 @@ TEST_F(AudioPipelineRoute, IsolatedBackendWithoutSinksNeverOpensActive) {
     auto started = IsolatedPipeWire::start(false);
     ASSERT_TRUE(started.error.empty()) << started.error;
     if (!started.backend.has_value()) {
-        GTEST_SKIP() << "pipewire daemon unavailable on this host";
+        if (std::getenv("CI") != nullptr) {
+            FAIL() << "daemon prerequisites missing in CI (must run): " << started.unavailable_what;
+        }
+        GTEST_SKIP() << "pipewire daemon unavailable on this host: " << started.unavailable_what;
     }
     auto daemon = std::move(*started.backend);
 
@@ -1557,4 +1640,90 @@ TEST(MicrophoneContract, RouterOperationsNeverEnableTheGate) {
     ASSERT_FALSE(mic_submit.has_value());
     EXPECT_EQ(mic_submit.error().code(), aa::ErrorCode::audio_mic_disabled);
     EXPECT_EQ(gate.state(), aa::audio::MicrophoneState::disabled);
+}
+
+namespace {
+
+std::string synthetic_scratch_dir() {
+    char templ[] = "/tmp/aa-task25-cfg-XXXXXX";
+    const char* dir = mkdtemp(templ);
+    return dir == nullptr ? std::string{} : std::string{dir};
+}
+
+std::string read_text_file(const std::string& path) {
+    std::ifstream input{path};
+    return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+}
+
+} // namespace
+
+TEST_F(AudioPipelineRoute, RestrictedDaemonConfigSyntheticTemplateSucceeds) {
+    const std::string scratch = synthetic_scratch_dir();
+    ASSERT_FALSE(scratch.empty());
+    const std::string templ = scratch + "/template.conf";
+    {
+        std::ofstream out{templ};
+        out << "context.modules = [\n"
+               "    { name = libpipewire-module-rtkit\n"
+               "        flags = [ ifexists nofail ]\n"
+               "    }\n"
+               "    { name = libpipewire-module-portal\n"
+               "        args = { }\n"
+               "    }\n"
+               "]\n"
+               "context.objects = [\n"
+               "]\n";
+        ASSERT_TRUE(out.good());
+    }
+    const std::string dest = scratch + "/restricted.conf";
+    const auto written = IsolatedPipeWire::write_restricted_daemon_config(templ, dest, true);
+    EXPECT_EQ(written.stage, IsolatedPipeWire::ConfigOutcome::Stage::ok) << written.detail;
+    const std::string body = read_text_file(dest);
+    EXPECT_NE(body.find("libpipewire-module-rtkit"), std::string::npos);
+    EXPECT_EQ(body.find("libpipewire-module-portal"), std::string::npos);
+    EXPECT_NE(body.find("auto_null"), std::string::npos);
+
+    const std::string bare = scratch + "/bare.conf";
+    const auto no_sink =
+        IsolatedPipeWire::write_restricted_daemon_config(templ, bare, false);
+    EXPECT_EQ(no_sink.stage, IsolatedPipeWire::ConfigOutcome::Stage::ok) << no_sink.detail;
+    EXPECT_EQ(read_text_file(bare).find("auto_null"), std::string::npos);
+}
+
+TEST_F(AudioPipelineRoute, RestrictedDaemonConfigMissingTemplateReportsTemplateRead) {
+    const auto out = IsolatedPipeWire::write_restricted_daemon_config(
+        "/nonexistent/aa-task25-template.conf", "/tmp/aa-task25-unused.conf", false);
+    EXPECT_EQ(out.stage, IsolatedPipeWire::ConfigOutcome::Stage::template_read);
+    EXPECT_NE(out.detail.find("/nonexistent/aa-task25-template.conf"), std::string::npos);
+}
+
+TEST_F(AudioPipelineRoute, RestrictedDaemonConfigUnwritableDestinationReportsDestinationOpen) {
+    const std::string scratch = synthetic_scratch_dir();
+    ASSERT_FALSE(scratch.empty());
+    const std::string templ = scratch + "/template.conf";
+    {
+        std::ofstream out{templ};
+        out << "context.modules = [\n]\n";
+        ASSERT_TRUE(out.good());
+    }
+    const auto out = IsolatedPipeWire::write_restricted_daemon_config(templ, scratch, false);
+    EXPECT_EQ(out.stage, IsolatedPipeWire::ConfigOutcome::Stage::destination_open);
+    EXPECT_NE(out.detail.find(scratch), std::string::npos);
+}
+
+TEST_F(AudioPipelineRoute, RestrictedDaemonConfigRetainedForbiddenModuleIsRejected) {
+    const std::string scratch = synthetic_scratch_dir();
+    ASSERT_FALSE(scratch.empty());
+    const std::string templ = scratch + "/template.conf";
+    {
+        std::ofstream out{templ};
+        out << "context.modules = [\n"
+               "    { name = \"libpipewire-module-portal\" }\n"
+               "]\n";
+        ASSERT_TRUE(out.good());
+    }
+    const auto out =
+        IsolatedPipeWire::write_restricted_daemon_config(templ, scratch + "/out.conf", false);
+    EXPECT_EQ(out.stage, IsolatedPipeWire::ConfigOutcome::Stage::denied_module_verify);
+    EXPECT_NE(out.detail.find("libpipewire-module-portal"), std::string::npos);
 }
