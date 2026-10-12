@@ -548,9 +548,12 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         const std::uint32_t height = static_cast<std::uint32_t>(info.height);
         if (width != impl_->caps.width || height != impl_->caps.height) {
             // No silent fallback to wrong dimensions: negotiated caps were not
-            // honored by the stream, fail typed.
+            // honored by the stream, fail typed - and terminal, per the
+            // post-open contract (the latch preserves channel_caps_unsupported
+            // rather than converting it to channel_decode_failed).
             gst_video_frame_unmap(&video_frame);
             gst_sample_unref(sample);
+            impl_->session.latch_terminal(ErrorCode::channel_caps_unsupported);
             return core::Result<std::size_t>{Error{ErrorCode::channel_caps_unsupported}};
         }
 

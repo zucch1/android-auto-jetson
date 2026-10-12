@@ -1244,3 +1244,54 @@ TEST(ConsumerDecodeRuntime, TerminalFailureSuppressesCallbacks) {
     EXPECT_EQ(callbacks, 0U);
     helper.value().close();
 }
+
+TEST(ConsumerDecodeRuntime, DimensionMismatchLatchesCapsUnsupported) {
+    DecodeConfig config;
+    config.caps = kFallbackCaps;
+    config.backend = DecodeBackend::software;
+    std::uint64_t callbacks = 0;
+    config.on_frame = [&](const auto&) { ++callbacks; };
+    auto helper = DecodeHelper::open(std::move(config));
+    if (!helper) {
+        GTEST_SKIP() << "no software decoder available on this host";
+    }
+    const auto stream = read_file(fixture_path());
+    ASSERT_FALSE(stream.empty());
+    const auto units = parse_annexb_units(stream);
+    ASSERT_FALSE(units.empty());
+
+    std::optional<ErrorCode> first;
+    std::uint64_t frame = 0;
+    std::uint64_t sequence = 0;
+    for (std::size_t i = 0; i < units.size() && !first.has_value(); ++i) {
+        const std::uint64_t timestamp_ns = kTimestampBaseNs + i * 33'333'333ULL;
+        auto submitted = helper.value().submit(
+            VideoAccessUnit{frame, sequence, timestamp_ns, units[i].idr, units[i].data});
+        if (!submitted) {
+            first = submitted.error().code();
+            break;
+        }
+        ++frame;
+        ++sequence;
+        auto pumped = helper.value().pump(aa::core::Milliseconds{200});
+        if (!pumped) {
+            first = pumped.error().code();
+        }
+    }
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(*first, ErrorCode::channel_caps_unsupported);
+
+    const std::vector<std::uint8_t> idr{0x00, 0x00, 0x00, 0x01, 0x65};
+    auto again = helper.value().submit(
+        VideoAccessUnit{frame + 1, sequence + 1, kTimestampBaseNs + 999'999'999ULL, true, idr});
+    ASSERT_FALSE(again);
+    EXPECT_EQ(again.error().code(), ErrorCode::channel_caps_unsupported);
+    auto eos = helper.value().end_of_stream();
+    ASSERT_FALSE(eos);
+    EXPECT_EQ(eos.error().code(), ErrorCode::channel_caps_unsupported);
+    auto pumped = helper.value().pump(aa::core::Milliseconds{0});
+    ASSERT_FALSE(pumped);
+    EXPECT_EQ(pumped.error().code(), ErrorCode::channel_caps_unsupported);
+    EXPECT_EQ(callbacks, 0U);
+    helper.value().close();
+}
