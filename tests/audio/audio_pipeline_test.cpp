@@ -2319,3 +2319,58 @@ TEST_F(AudioPipelineRoute, SilenceWritesRemainBounded) {
     }
     EXPECT_EQ(zeros, static_cast<std::size_t>(gap_frames) * ch);
 }
+
+TEST_F(AudioPipelineRoute, RawAacRoleRejectedAtOpen) {
+    // Gate fix 5 (router codec contract): RoleStreamConfig carries no
+    // AudioSpecificConfig and the decoder requires EncodedChunk::codec_data
+    // for raw AAC-LC, so ANY role configured Codec::aac_lc is rejected at
+    // open with audio_format_unsupported - before any decoder or sink is
+    // opened. The recording-fake opener makes the rejection deterministic
+    // with no live sink: open() itself must fail typed.
+    for (std::size_t role_index = 0; role_index < 4U; ++role_index) {
+        SCOPED_TRACE("role index " + std::to_string(role_index));
+        auto config = pcm_router_config();
+        config.roles[role_index].codec = aa::audio::Codec::aac_lc;
+        auto router = aa::audio::detail::open_router_with_sink_for_test(
+            config, std::make_unique<RecordingAudioSink>());
+        ASSERT_FALSE(router.has_value());
+        EXPECT_EQ(router.error().code(), aa::ErrorCode::audio_format_unsupported);
+    }
+}
+
+TEST_F(AudioPipelineRoute, AacAdtsRoleRemainsSupported) {
+    // Gate fix 5 regression guard: the raw-AAC rejection must NOT touch
+    // AAC-LC ADTS. The existing ADTS fixture routes through the speech role
+    // and the routed output is nonempty and non-silent whenever the decoder
+    // backend is available (the standalone decoder's raw-AAC capability is
+    // unchanged).
+    auto config = pcm_router_config();
+    config.roles[3].codec = aa::audio::Codec::aac_lc_adts;
+    const auto decode_report = aa::audio::AudioDecoder::probe(aa::audio::Codec::aac_lc_adts);
+    if (!decode_report.usable) {
+        GTEST_SKIP() << "no viable AAC decoder: " << decode_report.cause;
+    }
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const std::vector<std::byte> stream =
+        read_file(fixture_path("speech_aac_lc_adts_48k_stereo.aac"));
+    ASSERT_FALSE(stream.empty());
+    const auto message =
+        make_message(aa::protocol::ChannelRole::speech_audio, 0, now_ns(), stream);
+    ASSERT_TRUE(router.value().submit(message).has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+
+    const auto flat = flatten_i16(rec->writes);
+    ASSERT_FALSE(flat.empty());
+    bool non_silent = false;
+    for (std::int16_t sample : flat) {
+        if (sample != 0) {
+            non_silent = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(non_silent);
+}

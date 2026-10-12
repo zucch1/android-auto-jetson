@@ -221,6 +221,18 @@ core::Result<AudioRouter> open_router_with(const RouterConfig& config,
         return core::Result<AudioRouter>{Error{ErrorCode::audio_format_unsupported}};
     }
 
+    // Router codec contract: this router accepts PCM and AAC-LC ADTS; raw
+    // AAC-LC (no ADTS framing) is rejected at open with
+    // audio_format_unsupported. RoleStreamConfig carries no AudioSpecificConfig
+    // and the decoder requires EncodedChunk::codec_data for raw AAC-LC, so a
+    // raw AAC-LC role cannot be honored here - rejected BEFORE any decoder or
+    // sink is opened. The standalone decoder's raw-AAC capability is unchanged.
+    for (const RoleStreamConfig& role : config.roles) {
+        if (role.codec == Codec::aac_lc) {
+            return core::Result<AudioRouter>{Error{ErrorCode::audio_format_unsupported}};
+        }
+    }
+
     auto impl = std::make_unique<AudioRouter::Impl>();
     impl->config = config;
     impl->mixer = AudioMixer{config.mix};

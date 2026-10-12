@@ -63,6 +63,11 @@ struct SinkSelection final {
                                                 SinkBackend request);
 
 // Per-role stream shape as negotiated on the channel/session audio path.
+// Router codec contract: this router accepts PCM and AAC-LC ADTS; raw AAC-LC
+// (no ADTS framing) is rejected at open with audio_format_unsupported.
+// RoleStreamConfig carries no AudioSpecificConfig and the decoder requires
+// EncodedChunk::codec_data for raw AAC-LC - the standalone decoder's raw-AAC
+// capability is unchanged.
 struct RoleStreamConfig final {
     Codec codec{Codec::pcm};
     AudioFormat input_format{};
@@ -170,6 +175,9 @@ struct RouterReport final {
 // audio_sink_unavailable - never silence pretending success.
 class AudioRouter final {
 public:
+    // Opens the router for the configured roles. Router codec contract: this
+    // router accepts PCM and AAC-LC ADTS; raw AAC-LC (no ADTS framing) is
+    // rejected at open with audio_format_unsupported (see RoleStreamConfig).
     [[nodiscard]] static core::Result<AudioRouter> open(const RouterConfig& config);
 
     AudioRouter(AudioRouter&&) noexcept;
