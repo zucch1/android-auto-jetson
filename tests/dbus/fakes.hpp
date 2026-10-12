@@ -153,11 +153,21 @@ public:
         return expired;
     }
 
+    // Drain buffer is test-seeded (like reapable): forget() does not model
+    // identity matching, so a test seeds `invalidated` to exercise the
+    // caller's gate reconciliation. The drain clears the buffer.
+    [[nodiscard]] std::vector<core::PairingRequestId> take_invalidated_pairings() override {
+        const std::vector<core::PairingRequestId> drained = invalidated;
+        invalidated.clear();
+        return drained;
+    }
+
     std::vector<core::PhoneId> forgotten{};
     std::vector<core::PairingRequestId> requested{};
     std::vector<core::PairingRequestId> confirmed{};
     std::vector<core::PairingRequestId> cancelled{};
     std::vector<core::PairingRequestId> reapable{};
+    std::vector<core::PairingRequestId> invalidated{};
     core::Result<void> request_binding{};
     core::Result<core::PhoneId> confirm_result{core::PhoneId{1}};
     std::uint64_t next_phone_id{1};

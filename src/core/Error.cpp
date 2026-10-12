@@ -46,6 +46,8 @@ std::string_view Error::message() const noexcept {
     case ErrorCode::trust_store_io: return "trust store io failure";
     case ErrorCode::trust_unknown_phone: return "unknown phone not trusted";
     case ErrorCode::trust_rejected: return "phone rejected by trust store";
+    case ErrorCode::trust_store_not_durable:
+        return "Trust store replaced; crash durability unconfirmed.";
 
     case ErrorCode::config_invalid: return "invalid configuration";
     case ErrorCode::config_jurisdiction_unconfirmed: return "wireless jurisdiction unconfirmed";
@@ -102,6 +104,7 @@ std::string_view to_string(ErrorCode code) noexcept {
     case ErrorCode::trust_store_io: return "trust_store_io";
     case ErrorCode::trust_unknown_phone: return "trust_unknown_phone";
     case ErrorCode::trust_rejected: return "trust_rejected";
+    case ErrorCode::trust_store_not_durable: return "trust_store_not_durable";
 
     case ErrorCode::config_invalid: return "config_invalid";
     case ErrorCode::config_jurisdiction_unconfirmed: return "config_jurisdiction_unconfirmed";
