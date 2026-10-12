@@ -317,7 +317,7 @@ def check_structure(root: ET.Element) -> list[Violation]:
                 elif node.tag == "interface":
                     record("DBUS_CONTRACT_UNEXPECTED_INTERFACE_CHILD",
                            f"{context} child <{child.tag}>")
-                elif node.tag in {"method", "signal", "property"} and child.tag != "arg":
+                elif node.tag in {"method", "signal", "property"}:
                     record("DBUS_CONTRACT_UNEXPECTED_MEMBER_CHILD",
                            f"{context} child <{child.tag}>")
                 else:

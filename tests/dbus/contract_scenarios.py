@@ -391,14 +391,21 @@ def case_neg_unexpected_interface_child(root: Path) -> int:
 
 def case_neg_unexpected_member_child(root: Path) -> int:
     nested = '<node name="/org/custom/Other"/>'
+    stray_arg = '<arg name="stray" type="s"/>'
     targets = (
         ('<method name="Ping">', f'<method name="Ping">\n      {nested}'),
         ('<signal name="StateChanged">', f'<signal name="StateChanged">\n      {nested}'),
         (PROPERTY_TAG, f'<property name="ContractSemVer" type="s" access="read">\n'
          f'      {nested}\n    </property>'),
+        # Regression: an <arg> improperly nested in a <property> must be
+        # classified as a member-child violation, not the generic
+        # DBUS_CONTRACT_UNEXPECTED_ELEMENT (the arg exclusion only ever
+        # applied to method/signal, whose allowed set already admits arg).
+        (PROPERTY_TAG, f'<property name="ContractSemVer" type="s" access="read">\n'
+         f'      {stray_arg}\n    </property>'),
     )
     for label, (original, replaced) in zip(
-            ("method", "signal", "property"), targets, strict=True):
+            ("method", "signal", "property", "property-arg"), targets, strict=True):
         verdict = reject(
             root,
             lambda text, original=original, replaced=replaced: text.replace(
