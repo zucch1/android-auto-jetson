@@ -128,6 +128,13 @@ struct AudioRouter::Impl final {
     std::unique_ptr<detail::ObservedAudioSink> sink{};
     RouterReport report{};
     bool closed{false};
+    // Terminal route state (gate fix 6): set immediately before flush()
+    // attempts the route's single EOS drain - a successful drain leaves the
+    // route terminal (submit()/pump() fail invalid_argument before decode or
+    // sink access) and a FAILED drain leaves it terminal AND degraded (the
+    // typed audio_sink_unavailable refusal is retained). A pump/preflight
+    // failure before the EOS drain does NOT set it.
+    bool flushed{false};
 
     // Per-role decoded runs pending on the mix timeline.
     std::array<std::deque<Run>, kRoleCount> pending{};
@@ -312,6 +319,9 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message) {
     if (impl_->report.state == RouterState::degraded) {
         return Error{ErrorCode::audio_sink_unavailable};
     }
+    if (impl_->flushed) {
+        return Error{ErrorCode::invalid_argument};
+    }
     const std::optional<Role> role = role_of(message.header.channel);
     if (!role.has_value()) {
         if (message.header.channel == protocol::ChannelRole::microphone) {
@@ -369,6 +379,9 @@ core::Result<void> AudioRouter::pump() {
     }
     if (impl_->report.state == RouterState::degraded) {
         return Error{ErrorCode::audio_sink_unavailable};
+    }
+    if (impl_->flushed) {
+        return Error{ErrorCode::invalid_argument};
     }
     if (!impl_->sink) {
         impl_->mark_degraded("disabled: routing sink missing");
@@ -672,16 +685,25 @@ core::Result<void> AudioRouter::flush() {
     if (impl_->report.state == RouterState::degraded) {
         return Error{ErrorCode::audio_sink_unavailable};
     }
+    if (impl_->flushed) {
+        // Idempotent terminal flush: the route already committed its single
+        // EOS drain - a repeated flush() never sends a second EOS.
+        return {};
+    }
     auto pumped = pump();
     if (!pumped.has_value()) {
+        // Preflight failure BEFORE the EOS drain: the route is not marked
+        // terminal and stays usable.
         return pumped;
     }
     if (!impl_->sink) {
         impl_->mark_degraded("disabled: routing sink missing");
         return Error{ErrorCode::audio_sink_unavailable};
     }
-    // Bounded render drain: everything acknowledged must be confirmed
-    // rendered before the caller tears down (gate fix F1).
+    // Terminal transition happens immediately BEFORE the EOS drain: the
+    // drain is the route's single end-of-stream round-trip (gate fix F1) and
+    // the route is terminal from this point on - even when the drain fails.
+    impl_->flushed = true;
     auto drained = impl_->sink->drain(core::Milliseconds{2000});
     impl_->report.sink_probe = impl_->sink->probe_stats();
     impl_->report.render_barrier = impl_->sink->render_stats();
@@ -718,7 +740,11 @@ void AudioRouter::close() noexcept {
         // Drain BEFORE teardown (gate fix F1): acknowledged audio is
         // confirmed rendered before the pipeline goes away; the final barrier
         // stats are captured after the drain so drains_completed is visible.
-        (void)impl_->sink->drain(core::Milliseconds{2000});
+        // A flushed route already spent its single terminal EOS drain - a
+        // second one is never sent (and never retried after a failed one).
+        if (!impl_->flushed) {
+            (void)impl_->sink->drain(core::Milliseconds{2000});
+        }
         impl_->report.sink_probe = impl_->sink->probe_stats();
         impl_->report.render_barrier = impl_->sink->render_stats();
     }

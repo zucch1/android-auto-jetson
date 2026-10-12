@@ -188,6 +188,11 @@ public:
     // role -> invalid_argument; over the payload bound -> invalid_argument;
     // decode failure -> audio_decode_failed / audio_format_unsupported;
     // negative timestamp -> invalid_argument (rejected before decode).
+    // Terminal flush state: once flush() has committed the route's EOS drain
+    // the route is terminal and submit() fails invalid_argument BEFORE
+    // decoding or sink access. While degraded it fails audio_sink_unavailable
+    // (a failed flush keeps that degraded refusal and its recorded cause); a
+    // closed route fails invalid_argument (closed-state precedence).
     [[nodiscard]] core::Result<void> submit(const protocol::MessageView& message);
 
     // Mixes and writes every pending frame to the routing element. A write
@@ -199,10 +204,20 @@ public:
     // late-arrival discontinuity above the 200 ms safety caps is rejected
     // invalid_argument before any write (the batch is discarded, cursor and
     // counters unchanged). Output pieces are bounded to 64 KiB whole-frame.
+    // Terminal flush state: after flush() has committed the route's EOS
+    // drain, pump() fails invalid_argument before any sink access; while
+    // degraded it fails audio_sink_unavailable.
     [[nodiscard]] core::Result<void> pump();
     // Bounded render drain: mixes and writes pending frames, then drains the
     // routed stream to end-of-stream (render completion of everything
-    // acknowledged). Terminal for the route - further writes fail typed.
+    // acknowledged). Terminal for the route: flush() marks the route
+    // terminal immediately BEFORE its single EOS drain - afterwards
+    // submit()/pump() fail invalid_argument before decode or sink access,
+    // and a drain that cannot complete leaves the route degraded with the
+    // cause recorded and the typed audio_sink_unavailable refusal retained.
+    // Repeated flush() is idempotent - it never sends a second EOS - and
+    // close() never drains again after flush(). A pump/preflight failure
+    // before the EOS drain does NOT mark the route flushed.
     [[nodiscard]] core::Result<void> flush();
 
     void set_muted(bool muted) noexcept;

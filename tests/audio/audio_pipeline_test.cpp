@@ -718,43 +718,6 @@ TEST_F(AudioPipelineRoute, MissingDefaultOutputDegradesTypedWithRecordedCause) {
     EXPECT_EQ(router.value().report().stats.frames_written, 0U);
 }
 
-TEST_F(AudioPipelineRoute, OutputLossMidStreamDegradesTypedWithRecordedCause) {
-    auto router = open_router();
-    ASSERT_TRUE(router.has_value());
-    ASSERT_EQ(router.value().state(), aa::audio::RouterState::active);
-
-    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
-    const auto first = make_message(aa::protocol::ChannelRole::media_audio, 0, now_ns(), media);
-    ASSERT_TRUE(router.value().submit(first).has_value());
-    ASSERT_TRUE(router.value().pump().has_value());
-    EXPECT_EQ(router.value().state(), aa::audio::RouterState::active);
-    EXPECT_EQ(router.value().report().stats.frames_written, 1U);
-
-    // The routed output goes away mid-session: the stream is drained to
-    // end-of-stream (the render drain confirms the output path is finished)
-    // while the router stays open. The next write must surface the loss typed
-    // and degrade the router with a recorded cause - never a silent success.
-    ASSERT_TRUE(router.value().flush().has_value());
-    EXPECT_GE(router.value().report().render_barrier.drains_completed, 1U);
-
-    const auto second = make_message(aa::protocol::ChannelRole::media_audio, 1, now_ns(), media);
-    ASSERT_TRUE(router.value().submit(second).has_value());
-    auto pumped = router.value().pump();
-    ASSERT_FALSE(pumped.has_value());
-    EXPECT_EQ(pumped.error().code(), aa::ErrorCode::audio_sink_unavailable);
-
-    EXPECT_EQ(router.value().state(), aa::audio::RouterState::degraded);
-    const auto& cause = router.value().report().sink.cause;
-    EXPECT_FALSE(cause.empty());
-    EXPECT_NE(cause.find("disabled"), std::string::npos);
-
-    const auto third = make_message(aa::protocol::ChannelRole::media_audio, 2, now_ns(), media);
-    auto late_submit = router.value().submit(third);
-    ASSERT_FALSE(late_submit.has_value());
-    EXPECT_EQ(late_submit.error().code(), aa::ErrorCode::audio_sink_unavailable);
-    router.value().close();
-}
-
 TEST_F(AudioPipelineRoute, PathLatencyIncludesDecodeTime) {
     auto config = pcm_router_config();
     config.roles[3].codec = aa::audio::Codec::aac_lc_adts;
@@ -1352,6 +1315,100 @@ TEST_F(AudioPipelineRoute, DaemonKillMidStreamDegradesTypedWithRecordedCause) {
     router.value().close();
 }
 
+TEST_F(AudioPipelineRoute, OutputLossMidStreamDegradesTypedWithRecordedCause) {
+    auto router = open_router();
+    ASSERT_TRUE(router.has_value());
+    ASSERT_EQ(router.value().state(), aa::audio::RouterState::active);
+
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    const auto first = make_message(aa::protocol::ChannelRole::media_audio, 0, now_ns(), media);
+    ASSERT_TRUE(router.value().submit(first).has_value());
+    ASSERT_TRUE(router.value().pump().has_value());
+    EXPECT_EQ(router.value().state(), aa::audio::RouterState::active);
+    EXPECT_EQ(router.value().report().stats.frames_written, 1U);
+
+    // The routed output goes away mid-session: the stream is drained to
+    // end-of-stream (the render drain confirms the output path is finished)
+    // while the router stays open. The route is now TERMINAL: the intentional
+    // flush refuses every later submission before decode or sink access
+    // (invalid_argument - the terminal flush semantic) - never a silent
+    // success.
+    ASSERT_TRUE(router.value().flush().has_value());
+    EXPECT_GE(router.value().report().render_barrier.drains_completed, 1U);
+
+    const auto second = make_message(aa::protocol::ChannelRole::media_audio, 1, now_ns(), media);
+    auto refused = router.value().submit(second);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::invalid_argument);
+    auto pumped = router.value().pump();
+    ASSERT_FALSE(pumped.has_value());
+    EXPECT_EQ(pumped.error().code(), aa::ErrorCode::invalid_argument);
+
+    const auto third = make_message(aa::protocol::ChannelRole::media_audio, 2, now_ns(), media);
+    auto late_submit = router.value().submit(third);
+    ASSERT_FALSE(late_submit.has_value());
+    EXPECT_EQ(late_submit.error().code(), aa::ErrorCode::invalid_argument);
+    router.value().close();
+
+    // The output-loss assertions themselves (unchanged strength): when the
+    // routed output is gone mid-session, the intentional flush surfaces the
+    // loss typed and degrades the router with a recorded cause - never a
+    // silent success - and every later submission is refused. Uses the
+    // isolated daemon so the output can genuinely go away mid-session.
+    auto started = IsolatedPipeWire::start(true);
+    ASSERT_TRUE(started.error.empty()) << started.error;
+    if (!started.backend.has_value()) {
+        GTEST_SKIP() << "pipewire/wireplumber unavailable on this host";
+    }
+    auto daemon = std::move(*started.backend);
+
+    auto config = pcm_router_config();
+    config.backend = aa::audio::SinkBackend::pipewire;
+    auto lost = aa::audio::AudioRouter::open(config);
+    ASSERT_TRUE(lost.has_value());
+    ASSERT_EQ(lost.value().state(), aa::audio::RouterState::active);
+
+    const std::vector<std::byte> media_lost = constant_pcm({kMediaLevel, 960});
+    const aa::core::Nanoseconds base_ts = now_ns();
+    const aa::core::Nanoseconds contiguous_ts{
+        base_ts.count + 960 * 1'000'000'000LL
+            / static_cast<std::int64_t>(config.output_format.sample_rate_hz)};
+    const auto first_lost =
+        make_message(aa::protocol::ChannelRole::media_audio, 0, base_ts, media_lost);
+    ASSERT_TRUE(lost.value().submit(first_lost).has_value());
+    ASSERT_TRUE(lost.value().pump().has_value());
+    EXPECT_EQ(lost.value().state(), aa::audio::RouterState::active);
+    EXPECT_EQ(lost.value().report().stats.frames_written, 1U);
+    const auto pending_lost =
+        make_message(aa::protocol::ChannelRole::media_audio, 1, contiguous_ts, media_lost);
+    ASSERT_TRUE(lost.value().submit(pending_lost).has_value());
+
+    daemon.kill_backend();
+    usleep(1000000);
+
+    // The intentional flush must now refuse a later submission: its mixed
+    // write surfaces the output loss typed, degrades the router with the
+    // recorded cause, and every later operation keeps the degraded refusal.
+    auto flushed = lost.value().flush();
+    ASSERT_FALSE(flushed.has_value());
+    EXPECT_EQ(flushed.error().code(), aa::ErrorCode::audio_sink_unavailable);
+
+    EXPECT_EQ(lost.value().state(), aa::audio::RouterState::degraded);
+    const auto& cause = lost.value().report().sink.cause;
+    EXPECT_FALSE(cause.empty());
+    EXPECT_NE(cause.find("disabled"), std::string::npos);
+
+    const auto second_lost =
+        make_message(aa::protocol::ChannelRole::media_audio, 2, now_ns(), media_lost);
+    auto refused_late = lost.value().submit(second_lost);
+    ASSERT_FALSE(refused_late.has_value());
+    EXPECT_EQ(refused_late.error().code(), aa::ErrorCode::audio_sink_unavailable);
+    auto pumped_late = lost.value().pump();
+    ASSERT_FALSE(pumped_late.has_value());
+    EXPECT_EQ(pumped_late.error().code(), aa::ErrorCode::audio_sink_unavailable);
+    lost.value().close();
+}
+
 TEST_F(AudioPipelineRoute, UnreachableSinkServerDegradesTypedWithoutSilence) {
     auto config = pcm_router_config();
     config.backend = aa::audio::SinkBackend::pulse;
@@ -1904,15 +1961,29 @@ class RecordingAudioSink final : public aa::audio::detail::ObservedAudioSink {
 public:
     std::vector<std::vector<std::byte>> writes{};
     std::vector<std::int64_t> write_ns{};
+    std::uint64_t drain_calls{0};
+    std::uint64_t drains_completed{0};
+    bool fail_drain{false};
 
     aa::core::Result<void> write(const aa::audio::MixedChunk& chunk) override {
         writes.emplace_back(chunk.pcm.begin(), chunk.pcm.end());
         write_ns.push_back(chunk.timestamp.count);
         return {};
     }
-    aa::core::Result<void> drain(aa::core::Milliseconds) override { return {}; }
+    aa::core::Result<void> drain(aa::core::Milliseconds) override {
+        drain_calls += 1;
+        if (fail_drain) {
+            return aa::Error{aa::ErrorCode::audio_sink_unavailable};
+        }
+        drains_completed += 1;
+        return {};
+    }
     aa::audio::SinkProbeStats probe_stats() const override { return {}; }
-    aa::audio::RenderBarrierStats render_stats() const override { return {}; }
+    aa::audio::RenderBarrierStats render_stats() const override {
+        aa::audio::RenderBarrierStats stats;
+        stats.drains_completed = drains_completed;
+        return stats;
+    }
 };
 
 std::vector<std::int16_t> flatten_i16(const std::vector<std::vector<std::byte>>& writes) {
@@ -2373,4 +2444,152 @@ TEST_F(AudioPipelineRoute, AacAdtsRoleRemainsSupported) {
         }
     }
     EXPECT_TRUE(non_silent);
+}
+
+TEST_F(AudioPipelineRoute, SubmitAfterFlushRejectedBeforeDecode) {
+    // Gate fix 6 (terminal flush state): after the terminal flush every
+    // submit() is refused BEFORE decoding or sink access - no accepted-chunk
+    // count change, no queued audio, no sink write. A one-byte payload that
+    // would pass the gate and fail typed AFTER decode (no whole frame ->
+    // audio_format_unsupported) instead fails at the terminal gate with
+    // invalid_argument, proving the refusal runs before the decode path.
+    const auto config = pcm_router_config();
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{11'000'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(router.value().flush().has_value());
+
+    const std::uint64_t chunks_before = router.value().report().stats.chunks_submitted;
+    const std::uint64_t mixed_before = router.value().report().stats.frames_mixed;
+    const std::uint64_t written_before = router.value().report().stats.frames_written;
+    const std::size_t writes_before = rec->writes.size();
+    ASSERT_EQ(chunks_before, 1U);
+    ASSERT_EQ(writes_before, 1U);
+
+    const std::vector<std::byte> one_byte{std::byte{0x11}};
+    auto undecodable = router.value().submit(
+        make_message(aa::protocol::ChannelRole::media_audio, 1, base, one_byte));
+    ASSERT_FALSE(undecodable.has_value());
+    EXPECT_EQ(undecodable.error().code(), aa::ErrorCode::invalid_argument);
+
+    auto refused = router.value().submit(
+        make_message(aa::protocol::ChannelRole::media_audio, 2, base, media));
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::invalid_argument);
+
+    // No accepted-chunk count change (submit() couples acceptance with
+    // queueing), no queued audio advanced the mix/write path, no sink write.
+    EXPECT_EQ(router.value().report().stats.chunks_submitted, chunks_before);
+    EXPECT_EQ(router.value().report().stats.frames_mixed, mixed_before);
+    EXPECT_EQ(router.value().report().stats.frames_written, written_before);
+    EXPECT_EQ(rec->writes.size(), writes_before);
+    router.value().close();
+}
+
+TEST_F(AudioPipelineRoute, PumpAfterFlushFailsTyped) {
+    // Gate fix 6: after the terminal flush pump() fails typed
+    // (invalid_argument) BEFORE any sink access - no write and no drain are
+    // attempted and the refusal does not degrade the route.
+    const auto config = pcm_router_config();
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{12'000'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(router.value().flush().has_value());
+
+    const std::size_t writes_before = rec->writes.size();
+    const std::uint64_t drains_before = rec->drain_calls;
+    auto pumped = router.value().pump();
+    ASSERT_FALSE(pumped.has_value());
+    EXPECT_EQ(pumped.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_EQ(rec->writes.size(), writes_before);
+    EXPECT_EQ(rec->drain_calls, drains_before);
+    EXPECT_EQ(router.value().state(), aa::audio::RouterState::active);
+    router.value().close();
+}
+
+TEST_F(AudioPipelineRoute, RepeatedFlushDoesNotSendSecondEos) {
+    // Gate fix 6: repeated flush() on a terminal route is idempotent - it
+    // returns success and never sends a second EOS. Exactly one completed
+    // drain for the route, including across close() (teardown never drains a
+    // flushed route again).
+    const auto config = pcm_router_config();
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{13'000'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    ASSERT_TRUE(router.value().flush().has_value());
+    ASSERT_TRUE(router.value().flush().has_value());
+    ASSERT_TRUE(router.value().flush().has_value());
+
+    EXPECT_EQ(rec->drain_calls, 1U);
+    EXPECT_EQ(rec->drains_completed, 1U);
+    EXPECT_EQ(router.value().report().render_barrier.drains_completed, 1U);
+    router.value().close();
+    EXPECT_EQ(rec->drain_calls, 1U);
+    EXPECT_EQ(router.value().report().render_barrier.drains_completed, 1U);
+}
+
+TEST_F(AudioPipelineRoute, FailedFlushLeavesRouteTerminalAndDegraded) {
+    // Gate fix 6: when the terminal EOS drain cannot complete, the route
+    // stays TERMINAL and degrades typed with the recorded cause. Every later
+    // operation keeps the degraded refusal (audio_sink_unavailable), the
+    // recorded cause is preserved, and the spent EOS drain is never retried.
+    const auto config = pcm_router_config();
+    auto sink = std::make_unique<RecordingAudioSink>();
+    sink->fail_drain = true;
+    auto* rec = sink.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{14'000'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    ASSERT_TRUE(router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0, base, media))
+                    .has_value());
+    auto flushed = router.value().flush();
+    ASSERT_FALSE(flushed.has_value());
+    EXPECT_EQ(flushed.error().code(), aa::ErrorCode::audio_sink_unavailable);
+
+    ASSERT_EQ(router.value().state(), aa::audio::RouterState::degraded);
+    const std::string recorded_cause = router.value().report().sink.cause;
+    EXPECT_FALSE(recorded_cause.empty());
+    EXPECT_NE(recorded_cause.find("disabled"), std::string::npos);
+    EXPECT_NE(recorded_cause.find("drain failed"), std::string::npos);
+
+    const auto late =
+        make_message(aa::protocol::ChannelRole::media_audio, 1, base, media);
+    auto refused = router.value().submit(late);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::audio_sink_unavailable);
+    auto pumped = router.value().pump();
+    ASSERT_FALSE(pumped.has_value());
+    EXPECT_EQ(pumped.error().code(), aa::ErrorCode::audio_sink_unavailable);
+    auto reflushed = router.value().flush();
+    ASSERT_FALSE(reflushed.has_value());
+    EXPECT_EQ(reflushed.error().code(), aa::ErrorCode::audio_sink_unavailable);
+
+    EXPECT_EQ(rec->drain_calls, 1U);
+    router.value().close();
+    EXPECT_EQ(rec->drain_calls, 1U);
+    EXPECT_EQ(router.value().report().sink.cause, recorded_cause);
 }
