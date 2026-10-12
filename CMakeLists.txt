@@ -59,6 +59,7 @@ include(cmake/Transport.cmake)
 include(cmake/Session.cmake)
 include(cmake/Replay.cmake)
 include(cmake/VideoSocket.cmake)
+include(cmake/InputSocket.cmake)
 include(cmake/Conformance.cmake)
 include(cmake/DbusContract.cmake)
 include(cmake/TrustStore.cmake)
@@ -141,6 +142,9 @@ add_subdirectory(tools/aa-decode-probe)
 # cmake/DecodeDependencies.cmake (loaded there) owns the sanctioned target
 # GStreamer metadata binding that aareceiver-consumer consumes in cross builds.
 include(cmake/ConsumerDecode.cmake)
+# Task 24 dummy display follows the consumer: its host chain requires
+# TARGET aareceiver-consumer (see the integration contract in the module).
+include(cmake/DummyDisplay.cmake)
 if(NOT CMAKE_CROSSCOMPILING)
     if(NOT BUILD_TESTING)
         message(FATAL_ERROR "AA_DECODE_COVERAGE: native builds require BUILD_TESTING=ON")

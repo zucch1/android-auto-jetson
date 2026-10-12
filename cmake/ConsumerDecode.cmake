@@ -62,6 +62,13 @@ set_target_properties(aareceiver-consumer PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 target_include_directories(aareceiver-consumer PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aareceiver-consumer PUBLIC aa_core PRIVATE PkgConfig::AA_CONSUMER_GST)
+# FindPkgConfig leaves -l inputs as bare names when a root-only toolchain
+# re-roots the overlay libdir out of find_library's reach, and its imported
+# target does not carry the reported -L dirs. Re-attach them so executables
+# linking this static lib can resolve its private GStreamer deps.
+if(AA_CONSUMER_GST_LIBRARY_DIRS)
+    target_link_directories(aareceiver-consumer PUBLIC ${AA_CONSUMER_GST_LIBRARY_DIRS})
+endif()
 # Build-time provenance gates: a direct target build after a cross configure must
 # revalidate the hash-gated sysroot/overlay inputs before compiling. Each guard
 # is independent - a gate is attached on its own presence, never inferred from the
