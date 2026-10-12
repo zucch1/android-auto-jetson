@@ -137,10 +137,9 @@ add_subdirectory(tools/aa-ipc-bench)
 
 # Task 9 is mandatory: missing development inputs must not turn CI green by omission.
 add_subdirectory(tools/aa-decode-probe)
-# Task 23 consumer decode comes AFTER the decode-probe subproject:
-# cmake/DecodeDependencies.cmake (loaded there) owns the sanctioned target
-# GStreamer metadata binding that aareceiver-consumer consumes in cross builds.
-include(cmake/ConsumerDecode.cmake)
+# Task 25 audio pipeline loads cmake/DecodeDependencies.cmake itself (the
+# sanctioned target GStreamer metadata binding) and is placed after the
+# decode-probe subproject, per its integration contract.
 include(cmake/AudioPipeline.cmake)
 if(NOT CMAKE_CROSSCOMPILING)
     if(NOT BUILD_TESTING)
