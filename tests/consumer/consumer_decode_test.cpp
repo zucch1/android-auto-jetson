@@ -953,3 +953,197 @@ TEST(ConsumerDecodeAdmission, DuplicateLiveTimestampRejected) {
     ASSERT_TRUE(next) << static_cast<int>(next.error().code());
     helper.value().close();
 }
+
+// ---------------------------------------------------------------------------
+// Correlation lifecycle (PR #47 fix round): pending correlations are bounded
+// in age by the fixed five-second retention timeout (an OPERATIONAL RETENTION
+// POLICY, not a latency budget or a qualification claim) and by the 512-entry
+// cap. Any of those bounds INVALIDATES THE ENTIRE pending set and arms an IDR
+// resync (awaiting_idr): non-IDR AUs are then discarded with
+// ipc_consumer_rejected ("discard this AU and resume at an IDR", NOT
+// retryable queue-full) until an IDR passes the unchanged timestamp + byte
+// admission. These cases drive the GStreamer-free DecodeSessionState helper
+// with controlled clocks - the SAME methods DecodeHelper::submit/pump call -
+// so the lifecycle is deterministic and never races the pipeline.
+// ---------------------------------------------------------------------------
+
+TEST(ConsumerDecodeCorrelation, DroppedAuExpiresAndRequiresIdr) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point submitted_at{};
+    DecodeSessionState state;
+
+    // Two AUs admitted at the fixed clock; the first output arrives (its
+    // mapping is taken), the second is dropped inside the decoder and never
+    // produces an output.
+    const std::uint64_t ts_dropped = kTimestampBaseNs + kFramePeriodNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, kTimestampBaseNs, true, submitted_at));
+    state.accept_timestamp(kTimestampBaseNs);
+    state.record_correlation(1, 1, kTimestampBaseNs, submitted_at);
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_dropped, false, submitted_at));
+    state.accept_timestamp(ts_dropped);
+    state.record_correlation(2, 2, ts_dropped, submitted_at);
+    ASSERT_TRUE(state.take_correlation(kTimestampBaseNs).has_value());
+    ASSERT_EQ(state.pending_count(), 1U);
+
+    // Before the retention bound the dropped AU's mapping still exists and a
+    // no-op expiry evaluation leaves everything in place.
+    const Clock::time_point just_before =
+        submitted_at + DecodeSessionState::kCorrelationRetention - std::chrono::nanoseconds{1};
+    EXPECT_NE(state.find_correlation(ts_dropped), nullptr);
+    state.expire_stale_correlations(just_before);
+    EXPECT_EQ(state.pending_count(), 1U);
+    EXPECT_FALSE(state.awaiting_idr);
+
+    // Exactly at the bound the ENTIRE outstanding set is sacrificed and the
+    // session arms an IDR resync.
+    const Clock::time_point at_bound = submitted_at + DecodeSessionState::kCorrelationRetention;
+    state.expire_stale_correlations(at_bound);
+    EXPECT_EQ(state.pending_count(), 0U);
+    EXPECT_TRUE(state.awaiting_idr);
+
+    // While resyncing, a non-IDR AU is discarded: ipc_consumer_rejected, not a
+    // retryable queue-full.
+    const auto rejected =
+        state.admit_submission(FeedLoad{0, 64}, ts_dropped + kFramePeriodNs, false, at_bound);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), ErrorCode::ipc_consumer_rejected);
+}
+
+TEST(ConsumerDecodeCorrelation, PendingCapacityDoesNotBlockRecoveryIdr) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point now{};
+    DecodeSessionState state;
+
+    // 512 tiny AUs with no outputs at a fixed clock fill the pending set.
+    const std::size_t cap = DecodeSessionState::kMaxPendingCorrelations;
+    for (std::size_t i = 0; i < cap; ++i) {
+        const std::uint64_t frame = static_cast<std::uint64_t>(i);
+        const std::uint64_t timestamp_ns = kTimestampBaseNs + frame * kFramePeriodNs;
+        ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, timestamp_ns, i == 0, now)) << i;
+        state.accept_timestamp(timestamp_ns);
+        state.record_correlation(frame, 3 * frame + 1, timestamp_ns, now);
+    }
+    ASSERT_EQ(state.pending_count(), cap);
+
+    // The next non-IDR meets a saturated set: the whole set is invalidated
+    // first (submit() can never wedge on a permanently full map), then the AU
+    // is discarded as a resync rejection.
+    const std::uint64_t frame_next = static_cast<std::uint64_t>(cap);
+    const std::uint64_t ts_next = kTimestampBaseNs + frame_next * kFramePeriodNs;
+    const auto rejected = state.admit_submission(FeedLoad{0, 64}, ts_next, false, now);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_TRUE(state.awaiting_idr);
+    EXPECT_EQ(state.pending_count(), 0U);
+
+    // A valid newer IDR is not blocked by the resync: still subject to the
+    // timestamp + byte admission, accepted, and leaves exactly its own single
+    // pending entry with the resync cleared.
+    const std::uint64_t frame_recovery = frame_next + 1;
+    const std::uint64_t ts_recovery = kTimestampBaseNs + frame_recovery * kFramePeriodNs;
+    const auto recovered =
+        state.admit_submission(FeedLoad{0, 64}, ts_recovery, true, now);
+    ASSERT_TRUE(recovered) << static_cast<int>(recovered.error().code());
+    state.accept_timestamp(ts_recovery);
+    state.record_correlation(frame_recovery, 3 * frame_recovery + 1, ts_recovery, now);
+    EXPECT_EQ(state.pending_count(), 1U);
+    EXPECT_FALSE(state.awaiting_idr);
+    EXPECT_NE(state.find_correlation(ts_recovery), nullptr);
+}
+
+TEST(ConsumerDecodeCorrelation, LateOutputCannotAcquireRecoveryMetadata) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point t0{};
+    DecodeSessionState state;
+
+    // Pre-recovery AU recorded, then the set is invalidated at the retention
+    // bound and a recovery IDR admitted and recorded.
+    const std::uint64_t ts_old = kTimestampBaseNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_old, true, t0));
+    state.accept_timestamp(ts_old);
+    state.record_correlation(7, 11, ts_old, t0);
+    const Clock::time_point stale = t0 + DecodeSessionState::kCorrelationRetention;
+    state.expire_stale_correlations(stale);
+    ASSERT_TRUE(state.awaiting_idr);
+
+    const std::uint64_t ts_recovery = ts_old + kFramePeriodNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_recovery, true, stale));
+    state.accept_timestamp(ts_recovery);
+    state.record_correlation(8, 12, ts_recovery, stale);
+
+    // A late pre-recovery output finds no mapping: no metadata is handed out.
+    EXPECT_EQ(state.find_correlation(ts_old), nullptr);
+    EXPECT_FALSE(state.take_correlation(ts_old).has_value());
+
+    // The recovery output acquires EXACTLY its own frame/sequence/timestamp.
+    const auto meta = state.take_correlation(ts_recovery);
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(meta->frame, 8U);
+    EXPECT_EQ(meta->sequence, 12U);
+    EXPECT_EQ(meta->timestamp_ns, ts_recovery);
+    EXPECT_EQ(state.pending_count(), 0U);
+}
+
+TEST(ConsumerDecodeCorrelation, NormalIdrPreservesOutstandingCorrelations) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point now{};
+    DecodeSessionState state;
+
+    // IDR, P frame, then an ordinary IDR while NOT recovering.
+    const std::uint64_t ts_first = kTimestampBaseNs;
+    const std::uint64_t ts_middle = kTimestampBaseNs + kFramePeriodNs;
+    const std::uint64_t ts_idr = kTimestampBaseNs + 2 * kFramePeriodNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_first, true, now));
+    state.accept_timestamp(ts_first);
+    state.record_correlation(1, 1, ts_first, now);
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_middle, false, now));
+    state.accept_timestamp(ts_middle);
+    state.record_correlation(2, 2, ts_middle, now);
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts_idr, true, now));
+    state.accept_timestamp(ts_idr);
+    state.record_correlation(3, 3, ts_idr, now);
+
+    // An ordinary IDR never invalidates: the prior mappings remain deliverable
+    // with their own metadata.
+    EXPECT_FALSE(state.awaiting_idr);
+    ASSERT_EQ(state.pending_count(), 3U);
+    const auto first = state.take_correlation(ts_first);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->frame, 1U);
+    EXPECT_EQ(first->sequence, 1U);
+    EXPECT_EQ(first->timestamp_ns, ts_first);
+    const auto middle = state.take_correlation(ts_middle);
+    ASSERT_TRUE(middle.has_value());
+    EXPECT_EQ(middle->frame, 2U);
+    EXPECT_EQ(middle->sequence, 2U);
+    EXPECT_EQ(middle->timestamp_ns, ts_middle);
+}
+
+TEST(ConsumerDecodeCorrelation, RejectedRecoveryIdrPreservesResyncState) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point t0{};
+    DecodeSessionState state;
+
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, kTimestampBaseNs, true, t0));
+    state.accept_timestamp(kTimestampBaseNs);
+    state.record_correlation(1, 1, kTimestampBaseNs, t0);
+    const Clock::time_point stale = t0 + DecodeSessionState::kCorrelationRetention;
+    state.expire_stale_correlations(stale);
+    ASSERT_TRUE(state.awaiting_idr);
+
+    // An oversized recovery IDR is byte-rejected with the retryable
+    // ipc_queue_full (timestamp contract passed; it may retry after a drain).
+    const std::uint64_t ts_recovery = kTimestampBaseNs + kFramePeriodNs;
+    const std::size_t oversized =
+        static_cast<std::size_t>(DecodeSessionState::kMaxFeedBacklogBytes) + 1U;
+    const auto rejected = state.admit_submission(FeedLoad{0, oversized}, ts_recovery, true, stale);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), ErrorCode::ipc_queue_full);
+
+    // The rejection preserves the resync state: awaiting_idr stays armed and
+    // the timestamp high-water mark is untouched (no reset at IDR recovery).
+    EXPECT_TRUE(state.awaiting_idr);
+    ASSERT_TRUE(state.last_accepted_timestamp_ns.has_value());
+    EXPECT_EQ(*state.last_accepted_timestamp_ns, kTimestampBaseNs);
+    EXPECT_EQ(state.pending_count(), 0U);
+}

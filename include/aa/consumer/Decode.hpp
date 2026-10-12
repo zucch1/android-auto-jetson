@@ -169,6 +169,15 @@ public:
     //    counts against the limit and exactly filling it is accepted). The AU
     //    acquires no correlation mapping and does not consume its timestamp,
     //    so the SAME timestamp can be resubmitted after the backlog drains.
+    //  - ipc_consumer_rejected is the RESYNC REJECTION and is NOT a retryable
+    //    queue-full condition: "discard this AU and resume at an IDR". The
+    //    session resyncs after a correlation-set invalidation (an undelivered
+    //    correlation reached the fixed five-second operational retention
+    //    bound - a retention policy, not a latency budget or a qualification
+    //    claim - or the outstanding set saturated) and discards non-IDR AUs
+    //    until an IDR re-arms the stream. The recovery IDR is still subject to
+    //    the timestamp + byte admission; rejected AUs acquire no correlation
+    //    mapping and do not consume their timestamps.
     //  - invalid_argument is a permanent contract violation (empty payload,
     //    non-increasing/duplicate timestamp, GST_CLOCK_TIME_NONE, use after
     //    close/end_of_stream) and is not retryable with the same arguments.
