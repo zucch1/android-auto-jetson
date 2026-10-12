@@ -38,7 +38,9 @@ set(AA_IPC_DBUS_SOURCES
     src/ipc/dbus_adapter/BusCalls.cpp
     src/ipc/dbus_adapter/BusPeerLookup.cpp
     src/ipc/dbus_adapter/ControlDispatcher.cpp
-    src/ipc/dbus_adapter/PropertiesDispatch.cpp)
+    src/ipc/dbus_adapter/PropertiesDispatch.cpp
+    src/ipc/dbus_adapter/ControlBusService.cpp
+    src/ipc/dbus_adapter/ControlBusClient.cpp)
 set(AA_DBUS_TEST_SOURCES
     tests/dbus/control_service_test.cpp
     tests/dbus/pairing_gate_test.cpp
@@ -146,7 +148,8 @@ set(AA_DBUS_SCHEMA_CASES
     neg-duplicate-method neg-bogus-direction neg-masking-duplicate
     neg-multi-type-method neg-multi-type-signal
     neg-raw-delimiter-injection embedding-special-bytes embedding-crlf
-    neg-unexpected-root-child neg-unexpected-nested-element neg-unexpected-attribute
+    neg-unexpected-root-child neg-unexpected-interface-child neg-unexpected-member-child
+    neg-unexpected-nested-element neg-unexpected-attribute
     neg-missing-attribute neg-unexpected-text neg-duplicate-annotation
     neg-unexpected-annotation neg-doctype neg-processing-instruction neg-namespace
     neg-lexical-replay-bypass neg-invalid-preserves-existing-header)

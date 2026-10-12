@@ -19,6 +19,9 @@ namespace aa::ipc {
 // matching annotation); its major always equals the interface-name major.
 inline constexpr std::string_view kContractInterface = "org.custom.AndroidAutoReceiver1";
 inline constexpr std::string_view kContractObjectPath = "/org/custom/AndroidAutoReceiver";
+// The documented well-known service name (docs/dbus header comment): the
+// receiver owns it, consumers address calls to it.
+inline constexpr std::string_view kContractBusName = "org.custom.AndroidAutoReceiver";
 inline constexpr unsigned kContractMajor = 1;
 
 // Parses the trailing MAJOR version out of a candidate interface name

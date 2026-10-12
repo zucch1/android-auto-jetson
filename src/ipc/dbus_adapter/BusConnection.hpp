@@ -34,11 +34,20 @@ public:
 
     [[nodiscard]] const BusName& unique_name() const noexcept { return unique_name_; }
 
-    // org.freedesktop.DBus.RequestName (no flags); fails when not owned.
+    // org.freedesktop.DBus.RequestName with DBUS_NAME_FLAG_DO_NOT_QUEUE:
+    // binds the name or fails typed - the request is NEVER queued, so a
+    // refused requester can not inherit the name later. Fails when not owned.
     [[nodiscard]] core::Result<void> request_name(const BusName& name);
     [[nodiscard]] core::Result<void> release_name(const BusName& name);
+    // org.freedesktop.DBus.AddMatch: subscribes this connection to the given
+    // match rule (standard daemon interface, required to receive signals).
+    [[nodiscard]] core::Result<void> add_match(std::string_view rule);
     [[nodiscard]] core::Result<BusName> get_name_owner(const BusName& name);
     [[nodiscard]] core::Result<std::uint32_t> get_connection_unix_uid(const BusName& name);
+
+    // Poll handle for caller-driven dispatch loops (same pattern as the video
+    // channel's native_handle()): readable when read_message() will not block.
+    [[nodiscard]] int native_handle() const noexcept { return fd_; }
 
     // Reads the next message off the bus (bounded strict framing).
     [[nodiscard]] core::Result<ParsedMessage> read_message();
