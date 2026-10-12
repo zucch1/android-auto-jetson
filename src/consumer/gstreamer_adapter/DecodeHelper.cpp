@@ -6,6 +6,8 @@
 #include <aa/consumer/Decode.hpp>
 #include <aa/protocol/Messages.hpp> // protocol::valid_video_profile (budget profile)
 
+#include "DecodeSessionState.hpp" // GStreamer-free admission + timestamp state
+
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
@@ -50,7 +52,6 @@ constexpr KnownDecoder kKnownDecoders[] = {
 constexpr const char* kNvmmConversionElement = "nvvidconv";
 
 constexpr std::size_t kMaxPendingCorrelations = 512;
-constexpr std::uint64_t kMaxFeedBacklogBytes = 4ULL * 1024 * 1024;
 
 [[nodiscard]] BackendCandidate probe_candidate(const KnownDecoder& known) {
     BackendCandidate candidate;
@@ -175,6 +176,7 @@ struct DecodeHelper::Impl final {
         std::uint64_t timestamp_ns{};
     };
     std::map<std::uint64_t, PendingMeta> pending{};
+    DecodeSessionState session{};
     bool eos_sent{false};
 
     ~Impl() { release(); }
@@ -420,12 +422,24 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
     if (access_unit.payload.empty()) {
         return core::Result<void>{Error{ErrorCode::invalid_argument}};
     }
-    if (impl_->pending.find(access_unit.timestamp_ns) != impl_->pending.end()) {
-        return core::Result<void>{Error{ErrorCode::invalid_argument}};
-    }
-    if (gst_app_src_get_current_level_bytes(GST_APP_SRC(impl_->appsrc)) > kMaxFeedBacklogBytes
-        || impl_->pending.size() >= kMaxPendingCorrelations) {
+    // The live-map duplicate check is subsumed by the session high-water mark:
+    // every mapping still in `pending` is at or below the last accepted
+    // timestamp, and the mark also keeps delivered timestamps rejected after
+    // their mapping is released.
+    if (impl_->pending.size() >= kMaxPendingCorrelations) {
         return core::Result<void>{Error{ErrorCode::ipc_queue_full}};
+    }
+    // Pre-push admission (DecodeSessionState): strictly increasing
+    // session-unique timestamps and feed-backlog capacity that counts this AU.
+    // Both checks run before any buffer is allocated or pushed, and a rejected
+    // AU acquires no correlation mapping and does not consume its timestamp
+    // (byte rejections retry with the same timestamp after a drain).
+    if (auto admitted = impl_->session.admit(
+            FeedLoad{gst_app_src_get_current_level_bytes(GST_APP_SRC(impl_->appsrc)),
+                     access_unit.payload.size()},
+            access_unit.timestamp_ns);
+        !admitted.has_value()) {
+        return admitted;
     }
     if (auto failed = impl_->bus_error(); !failed.has_value()) {
         return failed;
@@ -444,6 +458,7 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
     if (flow != GST_FLOW_OK) {
         return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
     }
+    impl_->session.accept_timestamp(access_unit.timestamp_ns);
     impl_->pending.emplace(access_unit.timestamp_ns,
                            Impl::PendingMeta{access_unit.frame, access_unit.sequence,
                                             access_unit.timestamp_ns});

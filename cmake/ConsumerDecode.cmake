@@ -71,9 +71,11 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_target_properties(aa_consumer_decode_test PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     # The tests cross-check runtime detection against the existing aa-decode-probe
-    # tooling (its discovery policy is linked in and its binary is smoke-run).
+    # tooling (its discovery policy is linked in and its binary is smoke-run),
+    # and drive the GStreamer-free admission state helper directly.
     target_include_directories(aa_consumer_decode_test PRIVATE
-        "${CMAKE_SOURCE_DIR}/tools/aa-decode-probe/include")
+        "${CMAKE_SOURCE_DIR}/tools/aa-decode-probe/include"
+        "${CMAKE_SOURCE_DIR}/src/consumer/gstreamer_adapter")
     target_compile_definitions(aa_consumer_decode_test PRIVATE
         AA_CONSUMER_DECODE_FIXTURE="${CMAKE_SOURCE_DIR}/tests/fixtures/media/h264_720p30_baseline_90f.h264"
         AA_CONSUMER_DECODE_PROBE="$<TARGET_FILE:aa-decode-probe>")
@@ -104,8 +106,9 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME consumer_decode_fixture COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeFixture.*)
     add_test(NAME consumer_decode_backend COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeBackend.*)
     add_test(NAME consumer_decode_probe COMMAND aa_consumer_decode_test --gtest_filter=ConsumerProbeIntegration.*)
+    add_test(NAME consumer_decode_admission COMMAND aa_consumer_decode_test --gtest_filter=ConsumerDecodeAdmission.*)
     set_tests_properties(consumer_decode_caps consumer_decode_fixture consumer_decode_backend
-        consumer_decode_probe
+        consumer_decode_probe consumer_decode_admission
         PROPERTIES TIMEOUT 120)
 endif()
 
