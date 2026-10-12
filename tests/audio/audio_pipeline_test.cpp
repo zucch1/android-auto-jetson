@@ -968,7 +968,8 @@ public:
                 output << kept.substr(0, at + marker.size()) << "\n" << stanza
                        << kept.substr(at + marker.size());
             }
-            if (!output.good()) {
+            output.close();
+            if (!output) {
                 return {ConfigOutcome::Stage::write_close, "write failed " + dest_path};
             }
             return {};
@@ -978,7 +979,8 @@ public:
             return {ConfigOutcome::Stage::destination_open, "cannot open " + dest_path};
         }
         output << kept;
-        if (!output.good()) {
+        output.close();
+        if (!output) {
             return {ConfigOutcome::Stage::write_close, "write failed " + dest_path};
         }
         return {};
@@ -1275,6 +1277,9 @@ TEST_F(AudioPipelineRoute, DaemonKillMidStreamDegradesTypedWithRecordedCause) {
     auto started = IsolatedPipeWire::start(true);
     ASSERT_TRUE(started.error.empty()) << started.error;
     if (!started.backend.has_value()) {
+        if (std::getenv("CI") != nullptr) {
+            FAIL() << "daemon prerequisites missing in CI (must run): " << started.unavailable_what;
+        }
         GTEST_SKIP() << "pipewire/wireplumber unavailable on this host";
     }
     auto daemon = std::move(*started.backend);
@@ -1358,6 +1363,9 @@ TEST_F(AudioPipelineRoute, OutputLossMidStreamDegradesTypedWithRecordedCause) {
     auto started = IsolatedPipeWire::start(true);
     ASSERT_TRUE(started.error.empty()) << started.error;
     if (!started.backend.has_value()) {
+        if (std::getenv("CI") != nullptr) {
+            FAIL() << "daemon prerequisites missing in CI (must run): " << started.unavailable_what;
+        }
         GTEST_SKIP() << "pipewire/wireplumber unavailable on this host";
     }
     auto daemon = std::move(*started.backend);
@@ -1955,33 +1963,65 @@ TEST_F(AudioPipelineRoute, RestrictedDaemonConfigRetainedForbiddenModuleIsReject
     EXPECT_NE(out.detail.find("libpipewire-module-portal"), std::string::npos);
 }
 
+TEST_F(AudioPipelineRoute, RestrictedDaemonConfigDeferredWriteFailureReportsWriteClose) {
+    // Deferred output failure regression: /dev/full accepts the open and
+    // buffers small writes - the ENOSPC surfaces only at flush/close. BOTH
+    // output branches must close() explicitly and report Stage::write_close;
+    // a pre-close-only stream check (or a destructor-discovered failure)
+    // reports success while the bytes are lost.
+    const std::string scratch = synthetic_scratch_dir();
+    ASSERT_FALSE(scratch.empty());
+    const std::string templ = scratch + "/template.conf";
+    {
+        std::ofstream out{templ};
+        out << "context.modules = [\n]\ncontext.objects = [\n]\n";
+        ASSERT_TRUE(out.good());
+    }
+    const auto with_sink =
+        IsolatedPipeWire::write_restricted_daemon_config(templ, "/dev/full", true);
+    EXPECT_EQ(with_sink.stage, IsolatedPipeWire::ConfigOutcome::Stage::write_close);
+    EXPECT_NE(with_sink.detail.find("/dev/full"), std::string::npos);
+    const auto bare =
+        IsolatedPipeWire::write_restricted_daemon_config(templ, "/dev/full", false);
+    EXPECT_EQ(bare.stage, IsolatedPipeWire::ConfigOutcome::Stage::write_close);
+    EXPECT_NE(bare.detail.find("/dev/full"), std::string::npos);
+}
+
 namespace {
 
-class RecordingAudioSink final : public aa::audio::detail::ObservedAudioSink {
-public:
+// Counters and captured output live in TEST-OWNED state shared with the fake
+// sink (gate round finding: AudioRouter::close() destroys the sink, so every
+// post-close assertion must read state that outlives it). Tests capture it as
+// `auto rec = sink->state;` BEFORE the sink is moved into the router.
+struct RecordingSinkState final {
     std::vector<std::vector<std::byte>> writes{};
     std::vector<std::int64_t> write_ns{};
     std::uint64_t drain_calls{0};
     std::uint64_t drains_completed{0};
     bool fail_drain{false};
+};
+
+class RecordingAudioSink final : public aa::audio::detail::ObservedAudioSink {
+public:
+    std::shared_ptr<RecordingSinkState> state{std::make_shared<RecordingSinkState>()};
 
     aa::core::Result<void> write(const aa::audio::MixedChunk& chunk) override {
-        writes.emplace_back(chunk.pcm.begin(), chunk.pcm.end());
-        write_ns.push_back(chunk.timestamp.count);
+        state->writes.emplace_back(chunk.pcm.begin(), chunk.pcm.end());
+        state->write_ns.push_back(chunk.timestamp.count);
         return {};
     }
     aa::core::Result<void> drain(aa::core::Milliseconds) override {
-        drain_calls += 1;
-        if (fail_drain) {
+        state->drain_calls += 1;
+        if (state->fail_drain) {
             return aa::Error{aa::ErrorCode::audio_sink_unavailable};
         }
-        drains_completed += 1;
+        state->drains_completed += 1;
         return {};
     }
     aa::audio::SinkProbeStats probe_stats() const override { return {}; }
     aa::audio::RenderBarrierStats render_stats() const override {
         aa::audio::RenderBarrierStats stats;
-        stats.drains_completed = drains_completed;
+        stats.drains_completed = state->drains_completed;
         return stats;
     }
 };
@@ -2005,7 +2045,7 @@ TEST_F(AudioPipelineRoute, MultiPumpPreservesTimestampGap) {
     const std::int64_t rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
     const std::size_t ch = config.output_format.channels;
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router =
         aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
@@ -2049,7 +2089,7 @@ TEST_F(AudioPipelineRoute, MultiPumpMatchesSinglePumpNonOverlappingTimeline) {
     const aa::core::Nanoseconds second{base.count + 30'000'000LL};
 
     auto sink_a = std::make_unique<RecordingAudioSink>();
-    auto* rec_a = sink_a.get();
+    auto rec_a = sink_a->state;
     auto batched =
         aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_a));
     ASSERT_TRUE(batched.has_value());
@@ -2063,7 +2103,7 @@ TEST_F(AudioPipelineRoute, MultiPumpMatchesSinglePumpNonOverlappingTimeline) {
     ASSERT_TRUE(batched.value().pump().has_value());
 
     auto sink_b = std::make_unique<RecordingAudioSink>();
-    auto* rec_b = sink_b.get();
+    auto rec_b = sink_b->state;
     auto split = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_b));
     ASSERT_TRUE(split.has_value());
     ASSERT_TRUE(split.value()
@@ -2085,7 +2125,7 @@ TEST_F(AudioPipelineRoute, MultiPumpContiguousRunsDoNotReplayOrInsertSilence) {
     const std::int64_t rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
     const std::size_t ch = config.output_format.channels;
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2116,7 +2156,7 @@ TEST_F(AudioPipelineRoute, MultiPumpLateRunsSequentializeWithoutDroppingSamples)
     const auto config = pcm_router_config();
     const std::size_t ch = config.output_format.channels;
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2148,7 +2188,7 @@ TEST_F(AudioPipelineRoute, MultiPumpLateRunsSequentializeWithoutDroppingSamples)
 TEST_F(AudioPipelineRoute, EmptyPumpDoesNotRebaseTimeline) {
     const auto config = pcm_router_config();
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2177,7 +2217,7 @@ TEST_F(AudioPipelineRoute, EmptyPumpDoesNotRebaseTimeline) {
 TEST_F(AudioPipelineRoute, LargeTimestampGapRejectedBeforeAnyWrite) {
     const auto config = pcm_router_config();
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2202,7 +2242,7 @@ TEST_F(AudioPipelineRoute, MultiPumpLargeGapRejectedWithoutAdvancingCursor) {
     const std::int64_t rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
     const std::size_t ch = config.output_format.channels;
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2245,7 +2285,7 @@ TEST_F(AudioPipelineRoute, GapAtCapAcceptedAndAboveCapRejected) {
     const std::vector<std::byte> guidance = constant_pcm({kGuidanceLevel, 960});
 
     auto sink_ok = std::make_unique<RecordingAudioSink>();
-    auto* rec_ok = sink_ok.get();
+    auto rec_ok = sink_ok->state;
     auto accepted =
         aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_ok));
     ASSERT_TRUE(accepted.has_value());
@@ -2267,7 +2307,7 @@ TEST_F(AudioPipelineRoute, GapAtCapAcceptedAndAboveCapRejected) {
               static_cast<std::size_t>(960 + (at_cap_frames - 960) + 960) * ch);
 
     auto sink_bad = std::make_unique<RecordingAudioSink>();
-    auto* rec_bad = sink_bad.get();
+    auto rec_bad = sink_bad->state;
     auto rejected = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_bad));
     ASSERT_TRUE(rejected.has_value());
     ASSERT_TRUE(rejected.value()
@@ -2292,7 +2332,7 @@ TEST_F(AudioPipelineRoute, TotalGapBudgetPreflightIsAtomic) {
     const std::int64_t rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
     const std::int64_t gap_frames = 3 * rate / 20;
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2324,7 +2364,7 @@ TEST_F(AudioPipelineRoute, TimestampRangeAndEndOverflowFailTyped) {
     const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
 
     auto sink_neg = std::make_unique<RecordingAudioSink>();
-    auto* rec_neg = sink_neg.get();
+    auto rec_neg = sink_neg->state;
     auto negative =
         aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_neg));
     ASSERT_TRUE(negative.has_value());
@@ -2334,7 +2374,7 @@ TEST_F(AudioPipelineRoute, TimestampRangeAndEndOverflowFailTyped) {
     EXPECT_EQ(denied.error().code(), aa::ErrorCode::invalid_argument);
 
     auto sink_end = std::make_unique<RecordingAudioSink>();
-    auto* rec_end = sink_end.get();
+    auto rec_end = sink_end->state;
     auto overflow =
         aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_end));
     ASSERT_TRUE(overflow.has_value());
@@ -2347,6 +2387,31 @@ TEST_F(AudioPipelineRoute, TimestampRangeAndEndOverflowFailTyped) {
     EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
     EXPECT_TRUE(rec_end->writes.empty());
     EXPECT_TRUE(rec_neg->writes.empty());
+
+    // Large-displacement pair at 48 kHz: timestamps 0 and INT64_MAX-1000
+    // reach frame 442721857769989, whose end-frame time conversion overflows
+    // on the remainder ADDITION (the quotient product alone fits). The
+    // conversion must fail instead of wrapping to a large negative delta, and
+    // the whole batch is rejected atomically: not even the leading run at
+    // timestamp 0 is written.
+    auto sink_span = std::make_unique<RecordingAudioSink>();
+    auto rec_span = sink_span->state;
+    auto span_router =
+        aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink_span));
+    ASSERT_TRUE(span_router.has_value());
+    ASSERT_TRUE(span_router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 0,
+                                         aa::core::Nanoseconds{0}, media))
+                    .has_value());
+    ASSERT_TRUE(span_router.value()
+                    .submit(make_message(aa::protocol::ChannelRole::media_audio, 1,
+                                         aa::core::Nanoseconds{INT64_MAX - 1000}, media))
+                    .has_value());
+    auto span_rejected = span_router.value().pump();
+    ASSERT_FALSE(span_rejected.has_value());
+    EXPECT_EQ(span_rejected.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_TRUE(rec_span->writes.empty());
+    EXPECT_EQ(span_router.value().report().stats.frames_written, 0U);
 }
 
 TEST_F(AudioPipelineRoute, SilenceWritesRemainBounded) {
@@ -2357,7 +2422,7 @@ TEST_F(AudioPipelineRoute, SilenceWritesRemainBounded) {
         config.output_format.channels * sizeof(std::int16_t);
     const std::int64_t gap_frames = 3 * rate / 20;
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2422,7 +2487,7 @@ TEST_F(AudioPipelineRoute, AacAdtsRoleRemainsSupported) {
         GTEST_SKIP() << "no viable AAC decoder: " << decode_report.cause;
     }
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2455,7 +2520,7 @@ TEST_F(AudioPipelineRoute, SubmitAfterFlushRejectedBeforeDecode) {
     // invalid_argument, proving the refusal runs before the decode path.
     const auto config = pcm_router_config();
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2499,7 +2564,7 @@ TEST_F(AudioPipelineRoute, PumpAfterFlushFailsTyped) {
     // attempted and the refusal does not degrade the route.
     const auto config = pcm_router_config();
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2528,7 +2593,7 @@ TEST_F(AudioPipelineRoute, RepeatedFlushDoesNotSendSecondEos) {
     // flushed route again).
     const auto config = pcm_router_config();
     auto sink = std::make_unique<RecordingAudioSink>();
-    auto* rec = sink.get();
+    auto rec = sink->state;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 
@@ -2556,8 +2621,8 @@ TEST_F(AudioPipelineRoute, FailedFlushLeavesRouteTerminalAndDegraded) {
     // recorded cause is preserved, and the spent EOS drain is never retried.
     const auto config = pcm_router_config();
     auto sink = std::make_unique<RecordingAudioSink>();
-    sink->fail_drain = true;
-    auto* rec = sink.get();
+    auto rec = sink->state;
+    rec->fail_drain = true;
     auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
     ASSERT_TRUE(router.has_value());
 

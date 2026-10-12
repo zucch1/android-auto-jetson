@@ -167,7 +167,10 @@ struct AudioRouter::Impl final {
 
     // floor(frames * 1e9 / rate) via quotient/remainder (frames * 1e9
     // overflows int64 on long timelines). False when the result is not
-    // representable.
+    // representable. EVERY step is checked BEFORE the overflowing
+    // expression is evaluated: the quotient product, the tail product and
+    // their final sum (gate round: the unchecked remainder addition wrapped
+    // frame 442721857769989 at 48 kHz to a large NEGATIVE delta).
     [[nodiscard]] bool frames_to_ns_checked(std::uint64_t frames, std::int64_t& out) const {
         const auto rate = static_cast<std::uint64_t>(config.output_format.sample_rate_hz);
         const std::uint64_t q = frames / rate;
@@ -175,8 +178,16 @@ struct AudioRouter::Impl final {
         if (q > static_cast<std::uint64_t>(INT64_MAX / 1'000'000'000LL)) {
             return false;
         }
-        out = static_cast<std::int64_t>(q) * 1'000'000'000LL
-            + static_cast<std::int64_t>((r * 1'000'000'000LL) / rate);
+        if (r > static_cast<std::uint64_t>(INT64_MAX / 1'000'000'000LL)) {
+            return false;
+        }
+        const std::int64_t seconds_ns = static_cast<std::int64_t>(q) * 1'000'000'000LL;
+        const std::int64_t tail_ns =
+            static_cast<std::int64_t>((r * 1'000'000'000LL) / rate);
+        if (tail_ns > INT64_MAX - seconds_ns) {
+            return false;
+        }
+        out = seconds_ns + tail_ns;
         return true;
     }
 
@@ -190,15 +201,33 @@ struct AudioRouter::Impl final {
 
     // floor(ns * rate / 1e9) with floor semantics for negative displacements
     // (quotient/remainder; ns * rate overflows int64 at large timestamps).
+    // False when the result is not representable: the quotient product, the
+    // tail product and their final sum are each checked BEFORE evaluation
+    // (gate round: this conversion always returned true through unchecked
+    // signed multiply/add), and callers treat failure as schedule rejection.
     [[nodiscard]] bool ns_to_frames_signed(core::Nanoseconds ns, std::int64_t& out) const {
         const auto rate = static_cast<std::int64_t>(config.output_format.sample_rate_hz);
+        if (rate <= 0) {
+            return false;
+        }
         std::int64_t q = ns.count / 1'000'000'000LL;
         std::int64_t r = ns.count % 1'000'000'000LL;
         if (r < 0) {
             q -= 1;
             r += 1'000'000'000LL;
         }
-        out = q * rate + (r * rate) / 1'000'000'000LL;
+        if (q > INT64_MAX / rate || q < INT64_MIN / rate) {
+            return false;
+        }
+        if (r > INT64_MAX / rate) {
+            return false;
+        }
+        const std::int64_t head_ns = q * rate;
+        const std::int64_t tail_ns = (r * rate) / 1'000'000'000LL;
+        if (tail_ns > 0 && head_ns > INT64_MAX - tail_ns) {
+            return false;
+        }
+        out = head_ns + tail_ns;
         return true;
     }
 

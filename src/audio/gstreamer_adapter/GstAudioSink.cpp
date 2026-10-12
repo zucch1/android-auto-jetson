@@ -601,6 +601,18 @@ public:
         }
         GST_BUFFER_PTS(marker) = GST_BUFFER_PTS(buffer);
 
+        // Design Fix-3 sequence: the SAME absolute deadline is rechecked
+        // after buffer preparation and BEFORE the first push. The
+        // allocate/map/copy above may have consumed the remaining budget; on
+        // expiry BOTH unpushed buffers are released and the latched timeout
+        // is returned - nothing prepared here is ever pushed past the
+        // deadline and neither buffer leaks.
+        if (std::chrono::steady_clock::now() >= deadline) {
+            gst_buffer_unref(buffer);
+            gst_buffer_unref(marker);
+            return fail_write(outcome, Error{ErrorCode::timeout}, readiness_probe);
+        }
+
         const std::uint64_t write_seq = probe_.expect_write();
         GstFlowReturn pushed = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer);
         if (pushed != GST_FLOW_OK) {
@@ -689,6 +701,11 @@ public:
         }
     }
 
+    // Single EOS attempt end-to-end (gate round): the terminal drain may be
+    // attempted EXACTLY once and completion is tracked separately from the
+    // attempt. A completed drain returns success; a spent attempt is never
+    // re-run - no second EOS is ever sent, including from teardown - and its
+    // latched outcome is returned instead.
     [[nodiscard]] core::Result<void> drain(core::Milliseconds timeout) override {
         if (pipeline_ == nullptr || released_) {
             return Error{ErrorCode::audio_sink_unavailable};
@@ -696,6 +713,15 @@ public:
         if (drained_) {
             return {};
         }
+        if (drain_attempted_) {
+            return drain_outcome_;
+        }
+        drain_attempted_ = true;
+        drain_outcome_ = run_terminal_drain(timeout);
+        return drain_outcome_;
+    }
+
+    [[nodiscard]] core::Result<void> run_terminal_drain(core::Milliseconds timeout) {
         const auto bus_error = poll_bus_error();
         if (bus_error.has_value()) {
             return *bus_error;
@@ -769,7 +795,7 @@ public:
         // Teardown must never stall on a test-only downstream block (gate fix
         // 3): release it first, the tests also release it on every exit path.
         disarm_downstream_block();
-        if (pipeline_ != nullptr && !released_ && !drained_) {
+        if (pipeline_ != nullptr && !released_ && !drain_attempted_) {
             (void)drain(core::Milliseconds{2000});
         }
         released_ = true;
@@ -983,6 +1009,8 @@ private:
     bool pts_origin_set_{false};
     std::int64_t pts_origin_ns_{0};
     bool drained_{false};
+    bool drain_attempted_{false};
+    core::Result<void> drain_outcome_{};
     bool released_{false};
     // Failed-write latch (gate fix 3): set by a normal write that timed out or
     // lost the route; every later normal write fails immediately.
