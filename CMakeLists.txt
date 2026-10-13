@@ -156,6 +156,8 @@ include(cmake/AudioPipeline.cmake)
 # it composes transport/session/channels/video/audio/input/diagnostics into one
 # wired path and its test wires the real aa_video channel and aareceiver-audio.
 include(cmake/WiredE2e.cmake)
+# Task 32 wired performance/soak measurement tooling (host-side fixtures).
+include(cmake/WiredPerf.cmake)
 if(NOT CMAKE_CROSSCOMPILING)
     if(NOT BUILD_TESTING)
         message(FATAL_ERROR "AA_DECODE_COVERAGE: native builds require BUILD_TESTING=ON")

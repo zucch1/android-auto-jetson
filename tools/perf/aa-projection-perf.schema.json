@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zucch1/android-auto-jetson/tools/perf/aa-projection-perf.schema.json",
+  "title": "aa-projection-perf result document (task 32)",
+  "description": "Result document emitted by tools/perf/aa-projection-perf.sh for a wired projection performance run or soak. The tool validates every document it writes against this schema before returning its exit code. Contractual budgets are fixed here and must never be weakened or hidden.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "task",
+    "generated_at_utc",
+    "mode",
+    "duration_seconds",
+    "verdict",
+    "crashes",
+    "budgets",
+    "metrics",
+    "thermal_state",
+    "violations",
+    "provenance",
+    "notes"
+  ],
+  "properties": {
+    "schema": { "const": "aa-projection-perf/1" },
+    "task": { "type": "string", "minLength": 1 },
+    "generated_at_utc": { "type": "string", "format": "date-time" },
+    "mode": { "enum": ["wired"] },
+    "duration_requested": { "type": ["string", "null"] },
+    "duration_seconds": { "type": "integer", "minimum": 0 },
+    "verdict": { "enum": ["PASS", "FAIL", "BLOCKED"] },
+    "blocked_on": { "type": ["string", "null"] },
+    "crashes": { "type": "integer", "minimum": 0 },
+    "budgets": { "$ref": "#/$defs/budgets" },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/metric" },
+      "required": [
+        "receiver_rss_peak_mb",
+        "receiver_rss_mean_mb",
+        "receiver_cpu_sustained_pct_one_core",
+        "receiver_cpu_peak_pct_one_core",
+        "rss_growth_pct",
+        "av_sync_ms",
+        "audio_latency_ms",
+        "helper_rss_mb",
+        "frame_drops",
+        "decode_p50_ms",
+        "decode_p95_ms",
+        "decode_fps",
+        "decode_frames",
+        "ipc_throughput_mbps",
+        "ipc_p95_added_latency_ms",
+        "thermal_peak_c"
+      ]
+    },
+    "thermal_state": { "$ref": "#/$defs/thermal_state" },
+    "violations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/violation" }
+    },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "capture": { "$ref": "#/$defs/capture" },
+    "notes": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receiver_rss_mb_max",
+        "receiver_cpu_pct_one_core_max",
+        "av_sync_ms_max",
+        "audio_latency_ms_max",
+        "rss_growth_pct_max",
+        "crashes_max",
+        "helper_rss_mb_max"
+      ],
+      "properties": {
+        "receiver_rss_mb_max": { "const": 250.0 },
+        "receiver_cpu_pct_one_core_max": { "const": 50.0 },
+        "av_sync_ms_max": { "const": 50.0 },
+        "audio_latency_ms_max": { "const": 200.0 },
+        "rss_growth_pct_max": { "const": 10.0 },
+        "crashes_max": { "const": 0 },
+        "helper_rss_mb_max": { "const": 32.0 }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "unit", "gated", "status"],
+      "properties": {
+        "value": { "type": ["number", "null"] },
+        "unit": { "type": "string" },
+        "budget_max": { "type": ["number", "null"] },
+        "op": { "enum": ["le", "lt"] },
+        "gated": { "type": "boolean" },
+        "status": {
+          "enum": ["PASS", "FAIL", "INFORMATIONAL", "NOT_REQUIRED", "UNAVAILABLE"]
+        },
+        "note": { "type": "string" }
+      }
+    },
+    "thermal_state": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["peak_c", "zones"],
+      "properties": {
+        "peak_c": { "type": ["number", "null"] },
+        "zones": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["zone", "temp_c"],
+            "properties": {
+              "zone": { "type": "string" },
+              "temp_c": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "violation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "value", "budget_max", "detail"],
+      "properties": {
+        "metric": { "type": "string" },
+        "value": { "type": ["number", "null"] },
+        "budget_max": { "type": "number" },
+        "detail": { "type": "string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_digest",
+        "build_artifact_digest",
+        "configuration_digest",
+        "service_definitions",
+        "dependency_versions",
+        "target_hardware_state",
+        "package_digest",
+        "equivalence_status"
+      ],
+      "properties": {
+        "source_digest": { "type": ["string", "null"] },
+        "build_artifact_digest": { "type": ["string", "null"] },
+        "configuration_digest": { "type": ["string", "null"] },
+        "service_definitions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "digest"],
+            "properties": {
+              "name": { "type": "string" },
+              "digest": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "dependency_versions": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "target_hardware_state": { "type": "object" },
+        "package_digest": { "const": null },
+        "equivalence_status": { "const": "provisional" }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": ["string", "null"] },
+        "sha256": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

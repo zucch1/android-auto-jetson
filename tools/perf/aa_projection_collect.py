@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""Task-32 wired performance collector.
+
+Stdlib only. Runs where the wired receiver runs (the Jetson, normally invoked
+through ``tools/perf/aa-projection-perf.sh`` over a bounded ssh). It launches
+the receiver (and optionally the dummy display), samples the receiver process
+and the thermal zones for the requested duration, parses the receiver/display
+JSON event stream, and writes ONE capture document to stdout:
+
+  {"schema":"aa-projection-perf-capture/1","mode":"wired",
+   "duration_seconds":N,"crashes":0,"samples":[...],"events":{...},
+   "target_hardware_state":{...}}
+
+The capture is the raw record; budget verdicts are produced by
+``aa_perf_report.py``. A metric the collector cannot observe is emitted as
+``null`` -- never faked. Every subprocess wait is bounded.
+
+This tool does not modify target state (no installs, no udev, no kernel
+changes); it only launches the supplied binaries and reads procfs/sysfs.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import platform
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CAPTURE_SCHEMA = "aa-projection-perf-capture/1"
+_STARTUP_GRACE_SECONDS = 3.0
+_TERMINATE_GRACE_SECONDS = 5.0
+
+# Diagnostic keys the receiver/display event stream may carry (task-19
+# vocabulary). Each maps to one measured metric. Absent keys stay null.
+_DECODE_KEYS = {"p50_latency_ms": "decode_p50_ms", "p95_latency_ms": "decode_p95_ms",
+                "fps": "decode_fps", "frames": "decode_frames"}
+_IPC_KEYS = {"p95_latency_ms": "ipc_p95_added_latency_ms",
+             "throughput_mbps": "ipc_throughput_mbps"}
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip("\x00\n ")
+    except OSError:
+        return None
+
+
+def _rss_mb(pid: int) -> float | None:
+    text = _read_text(f"/proc/{pid}/status")
+    if text is None:
+        return None
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return int(parts[1]) / 1024.0
+                except ValueError:
+                    return None
+    return None
+
+
+def _cpu_ticks(pid: int) -> int | None:
+    text = _read_text(f"/proc/{pid}/stat")
+    if text is None:
+        return None
+    try:
+        rest = text.rsplit(")", 1)[1].split()
+    except IndexError:
+        return None
+    if len(rest) < 13:
+        return None
+    try:
+        return int(rest[11]) + int(rest[12])
+    except ValueError:
+        return None
+
+
+def _thermal_zones() -> list[dict]:
+    zones: list[dict] = []
+    for temp_path in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+        zone_dir = os.path.dirname(temp_path)
+        raw = _read_text(temp_path)
+        if raw is None:
+            continue
+        try:
+            temp_c = float(raw) / 1000.0
+        except ValueError:
+            continue
+        name = _read_text(os.path.join(zone_dir, "type")) or os.path.basename(zone_dir)
+        zones.append({"zone": name, "temp_c": temp_c})
+    return zones
+
+
+def _target_hardware_state() -> dict:
+    model = _read_text("/proc/device-tree/model") or _read_text("/sys/firmware/devicetree/base/model")
+    l4t = None
+    teg = _read_text("/etc/nv_tegra_release")
+    if teg:
+        l4t = teg.splitlines()[0]
+    power_mode = None
+    if shutil.which("nvpmodel"):
+        try:
+            out = subprocess.run(["nvpmodel", "-q"], capture_output=True, text=True, timeout=5)
+            power_mode = out.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            power_mode = None
+    return {
+        "machine": platform.machine(),
+        "kernel_release": platform.release(),
+        "model": model,
+        "l4t_release": l4t,
+        "power_mode": power_mode,
+        "cpufreq_governor": _read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+    }
+
+
+class EventParser:
+    """Incrementally parse newline-delimited JSON events from log files."""
+
+    def __init__(self) -> None:
+        self.offsets: dict[str, int] = {}
+        self.metrics: dict[str, object] = {
+            "frame_drops": None, "decode_p50_ms": None, "decode_p95_ms": None,
+            "decode_fps": None, "decode_frames": None, "ipc_throughput_mbps": None,
+            "ipc_p95_added_latency_ms": None, "av_sync_ms": None, "audio_latency_ms": None,
+        }
+        self.video_units: int | None = None
+        self.audio_chunks: int | None = None
+        self.startup_ms: int | None = None
+
+    def poll(self, path: str) -> None:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        offset = self.offsets.get(path, 0)
+        if size < offset:
+            offset = 0
+        if size == offset:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(offset)
+                for line in handle:
+                    self._consume(line)
+                self.offsets[path] = handle.tell()
+        except OSError:
+            return
+
+    def _consume(self, line: str) -> None:
+        line = line.strip()
+        if not line.startswith("{"):
+            return
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
+            return
+        envelope = event.get("event")
+        # Diagnostics arrive wrapped as {"event":"diag","kind":"<kind>",...};
+        # a bare event line names its kind in "event" itself.
+        inner = event.get("kind")
+        kind = inner if isinstance(inner, str) else envelope
+        if envelope == "video_sent" and isinstance(event.get("units"), int):
+            self.video_units = event["units"]
+        if envelope == "audio_chunks" and isinstance(event.get("count"), int):
+            self.audio_chunks = event["count"]
+        if envelope == "active" and isinstance(event.get("startup_ms"), int):
+            self.startup_ms = event["startup_ms"]
+        if kind == "transport_stats":
+            for key, target in _IPC_KEYS.items():
+                if isinstance(event.get(key), (int, float)):
+                    self.metrics[target] = float(event[key])
+        if kind == "decode_stats":
+            for key, target in _DECODE_KEYS.items():
+                if isinstance(event.get(key), (int, float)):
+                    raw = event[key]
+                    self.metrics[target] = int(raw) if target == "decode_frames" else float(raw)
+            for drops_key in ("dropped", "drops"):
+                if isinstance(event.get(drops_key), int):
+                    self.metrics["frame_drops"] = event[drops_key]
+        if isinstance(event.get("av_sync_ms"), (int, float)):
+            self.metrics["av_sync_ms"] = float(event["av_sync_ms"])
+        if isinstance(event.get("audio_latency_ms"), (int, float)):
+            self.metrics["audio_latency_ms"] = float(event["audio_latency_ms"])
+        if isinstance(event.get("frame_drops"), int):
+            self.metrics["frame_drops"] = event["frame_drops"]
+
+
+def _terminate(proc: subprocess.Popen | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def collect(args: argparse.Namespace) -> dict:
+    state_dir = Path(args.state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    receiver_log = state_dir / "receiver.log"
+    display_log = state_dir / "display.log"
+
+    receiver_cmd = [args.receiver, "--port", args.port,
+                    "--duration-ms", str(args.duration_seconds * 1000)]
+    if args.store:
+        receiver_cmd += ["--store", args.store]
+
+    samples: list[dict] = []
+    parser = EventParser()
+    receiver: subprocess.Popen | None = None
+    display: subprocess.Popen | None = None
+    rec_file = None
+    disp_file = None
+    crashes = 0
+    receiver_exit: int | None = None
+    early_exit = False
+    stopped_by_us = False
+
+    try:
+        rec_file = open(receiver_log, "w", encoding="utf-8")
+        receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        if args.display and not args.no_display:
+            time.sleep(_STARTUP_GRACE_SECONDS)
+            disp_file = open(display_log, "w", encoding="utf-8")
+            display_cmd = [args.display, "--test-only-autostart"]
+            if args.video_socket:
+                display_cmd += ["--video-socket", args.video_socket]
+            if args.input_socket:
+                display_cmd += ["--input-socket", args.input_socket]
+            display = subprocess.Popen(display_cmd, stdout=disp_file, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+
+        clk = os.sysconf("SC_CLK_TCK")
+        start = time.monotonic()
+        prev_ticks = _cpu_ticks(receiver.pid)
+        prev_time = start
+        deadline = start + args.duration_seconds
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            if receiver.poll() is not None:
+                early_exit = True
+                break
+            time.sleep(min(args.interval, max(0.0, deadline - now)))
+            now = time.monotonic()
+            ticks = _cpu_ticks(receiver.pid)
+            cpu = None
+            if ticks is not None and prev_ticks is not None and now > prev_time:
+                cpu = (ticks - prev_ticks) / clk / (now - prev_time) * 100.0
+            rss = _rss_mb(receiver.pid)
+            zones = _thermal_zones()
+            peak = max((z["temp_c"] for z in zones), default=None)
+            parser.poll(str(receiver_log))
+            if display is not None:
+                parser.poll(str(display_log))
+            samples.append({
+                "t_ms": int((now - start) * 1000),
+                "receiver_rss_mb": rss,
+                "receiver_cpu_pct_one_core": cpu,
+                "thermal_peak_c": peak,
+                "thermal_zones": zones,
+            })
+            prev_ticks, prev_time = ticks, now
+
+        parser.poll(str(receiver_log))
+        if receiver.poll() is None:
+            stopped_by_us = True
+            _terminate(receiver)
+        receiver_exit = receiver.returncode
+    except FileNotFoundError as exc:
+        raise SystemExit(f"error: cannot launch receiver: {exc}") from exc
+    finally:
+        _terminate(display)
+        _terminate(receiver)
+        if rec_file is not None:
+            rec_file.close()
+        if disp_file is not None:
+            disp_file.close()
+
+    if receiver_exit is None and receiver is not None:
+        receiver_exit = receiver.returncode
+    if not stopped_by_us and receiver_exit is not None and receiver_exit != 0:
+        crashes = 1
+    if not stopped_by_us and not early_exit and receiver_exit is None:
+        crashes = 1
+
+    events = dict(parser.metrics)
+    events["helper_rss_mb"] = None
+    events["video_units"] = parser.video_units
+    events["audio_chunks"] = parser.audio_chunks
+    events["startup_ms"] = parser.startup_ms
+
+    return {
+        "schema": CAPTURE_SCHEMA,
+        "mode": "wired",
+        "duration_seconds": args.duration_seconds,
+        "crashes": crashes,
+        "early_exit": early_exit,
+        "receiver_exit_code": receiver_exit,
+        "samples": samples,
+        "events": events,
+        "target_hardware_state": _target_hardware_state(),
+    }
+
+
+def _cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--receiver", required=True, help="receiver binary to launch")
+    parser.add_argument("--display", default=None, help="dummy display binary (optional)")
+    parser.add_argument("--port", required=True, help="USB port context passed to the receiver")
+    parser.add_argument("--duration-seconds", required=True, type=int)
+    parser.add_argument("--interval", type=float, default=5.0)
+    parser.add_argument("--store", default=None, help="approved-phone store path passed to receiver")
+    parser.add_argument("--state-dir", default="/tmp/aa-projection-perf")
+    parser.add_argument("--video-socket", default=None)
+    parser.add_argument("--input-socket", default=None)
+    parser.add_argument("--no-display", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.duration_seconds <= 0:
+        print("error: --duration-seconds must be positive", file=sys.stderr)
+        return 2
+    if args.interval <= 0:
+        print("error: --interval must be positive", file=sys.stderr)
+        return 2
+
+    old_handler = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(3))
+    try:
+        capture = collect(args)
+    finally:
+        signal.signal(signal.SIGTERM, old_handler)
+
+    json.dump(capture, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli(sys.argv[1:]))
