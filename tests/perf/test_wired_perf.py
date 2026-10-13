@@ -22,6 +22,12 @@ Runs one case (argv[1]) and exits 0 if all its assertions pass, 1 otherwise:
   collector    the on-target collector against a deterministic fake receiver:
                fresh state, crash detection, RSS growth, and the fail-closed
                BLOCKED verdict when budgeted metrics are unavailable
+  media_timing the task-48 receiver media-timing hook: the collector picks up
+               both av_sync_ms and audio_latency_ms from an emitted event, the
+               captured value tracks the fake receiver's injected measurement
+               (vary it -> the document changes), a landed value gates the
+               budget, a garbage measurement stays null and BLOCKED, and an
+               absent measurement stays null -> BLOCKED, never a fabricated 0
 
 Real measurement runs are phase B (see docs/qualification/wired-perf-runbook.md);
 these tests use fixtures and a fake receiver only.
@@ -356,6 +362,128 @@ def case_collector(tmp: Path) -> None:
     assert second_n <= first_n + 1, (first_n, second_n)
 
 
+def case_media_timing(tmp: Path) -> None:
+    # The task-48 hook: the receiver emits a media_timing event carrying
+    # av_sync_ms and audio_latency_ms. The collector must read both, the
+    # reporter must then treat both gated metrics as measured (no BLOCKED on
+    # them), and the captured value must track the injected measurement.
+    first_env = os.environ.copy()
+    first_env["FAKE_RECEIVER_MEDIA_TIMING"] = "1"
+    first_env["FAKE_RECEIVER_AV_SYNC_MS"] = "12.5"
+    first_env["FAKE_RECEIVER_AUDIO_LATENCY_MS"] = "40.5"
+    first = _collect(tmp, tmp / "state-1", 3, first_env)
+    assert first.returncode == 0, f"collector failed: {first.stderr}"
+    capture = load_from_stdout(first.stdout)
+    assert capture["events"]["av_sync_ms"] == 12.5, capture["events"]
+    assert capture["events"]["audio_latency_ms"] == 40.5, capture["events"]
+
+    capture_path = tmp / "timing-capture.json"
+    capture_path.write_text(first.stdout, encoding="utf-8")
+    out = tmp / "timing-result.json"
+    assert report(capture_path, out).returncode != 3, "gated media metrics stayed unavailable"
+    doc = load(out)
+    assert doc["verdict"] != "BLOCKED" and doc["blocked_on"] is None, doc["blocked_on"]
+    assert doc["metrics"]["av_sync_ms"]["value"] == 12.5
+    assert doc["metrics"]["audio_latency_ms"]["value"] == 40.5
+    assert doc["metrics"]["av_sync_ms"]["status"] == "PASS"
+    assert doc["metrics"]["audio_latency_ms"]["status"] == "PASS"
+
+    # misleading_success_output: vary the injected measurement - the reported
+    # value must change (it is measured, never a hardcoded constant), in the
+    # capture events AND in the result document the phase-B gate consumes.
+    second_env = os.environ.copy()
+    second_env["FAKE_RECEIVER_MEDIA_TIMING"] = "1"
+    second_env["FAKE_RECEIVER_AV_SYNC_MS"] = "45.0"
+    second_env["FAKE_RECEIVER_AUDIO_LATENCY_MS"] = "120.0"
+    second = _collect(tmp, tmp / "state-2", 3, second_env)
+    varied = load_from_stdout(second.stdout)
+    assert varied["events"]["av_sync_ms"] == 45.0, varied["events"]
+    assert varied["events"]["audio_latency_ms"] == 120.0, varied["events"]
+    assert varied["events"]["av_sync_ms"] != capture["events"]["av_sync_ms"]
+    varied_path = tmp / "varied-capture.json"
+    varied_path.write_text(second.stdout, encoding="utf-8")
+    varied_out = tmp / "varied-result.json"
+    assert report(varied_path, varied_out).returncode != 3, "varied capture stayed BLOCKED"
+    varied_doc = load(varied_out)
+    assert varied_doc["metrics"]["av_sync_ms"]["value"] == 45.0
+    assert varied_doc["metrics"]["audio_latency_ms"]["value"] == 120.0
+    assert varied_doc["metrics"]["av_sync_ms"]["value"] != doc["metrics"]["av_sync_ms"]["value"]
+
+    # stale_state: successive emissions carry successive values - the capture
+    # keeps the freshest (last), not the first snapshot.
+    series_env = os.environ.copy()
+    series_env["FAKE_RECEIVER_MEDIA_TIMING"] = "1"
+    series_env["FAKE_RECEIVER_AV_SYNC_MS"] = "5.0,33.0"
+    series_env["FAKE_RECEIVER_AUDIO_LATENCY_MS"] = "7.0,90.0"
+    series = load_from_stdout(_collect(tmp, tmp / "state-series", 4, series_env).stdout)
+    assert series["events"]["av_sync_ms"] == 33.0, series["events"]
+    assert series["events"]["audio_latency_ms"] == 90.0, series["events"]
+
+    # The landed value gates the budget: over the 50 ms ceiling the run FAILs
+    # naming av_sync_ms (never a silent PASS on a measured breach).
+    over_env = os.environ.copy()
+    over_env["FAKE_RECEIVER_MEDIA_TIMING"] = "1"
+    over_env["FAKE_RECEIVER_AV_SYNC_MS"] = "50.01"
+    over_env["FAKE_RECEIVER_AUDIO_LATENCY_MS"] = "10.0"
+    over = _collect(tmp, tmp / "state-over", 3, over_env)
+    over_capture = tmp / "over-capture.json"
+    over_capture.write_text(over.stdout, encoding="utf-8")
+    over_out = tmp / "over-result.json"
+    assert report(over_capture, over_out).returncode == 1, "breaching av_sync must FAIL"
+    over_doc = load(over_out)
+    assert over_doc["verdict"] == "FAIL"
+    assert "av_sync_ms" in {v["metric"] for v in over_doc["violations"]}
+    assert over_doc["metrics"]["av_sync_ms"]["value"] == 50.01
+
+    # A forced BLOCKED must never hide a media-timing budget breach: over a
+    # measured violation --blocked-on stays a contract violation (exit 4) and
+    # no violation-hiding document is written.
+    forced = report(over_capture, tmp / "forced-timing.json", ["--blocked-on", "readiness"])
+    assert forced.returncode == 4, (
+        f"forcing BLOCKED over a media-timing violation must exit 4, got {forced.returncode}"
+    )
+    assert not (tmp / "forced-timing.json").exists(), "violation-hiding document was written"
+
+    # malformed_input: a garbage measurement is a non-number - the collector
+    # must keep the metric null (BLOCKED), never a fabricated 0.
+    garbage_env = os.environ.copy()
+    garbage_env["FAKE_RECEIVER_MEDIA_TIMING"] = "1"
+    garbage_env["FAKE_RECEIVER_AV_SYNC_MS"] = "not-a-number"
+    garbage_env["FAKE_RECEIVER_AUDIO_LATENCY_MS"] = "nan"
+    garbage = load_from_stdout(_collect(tmp, tmp / "state-garbage", 3, garbage_env).stdout)
+    assert garbage["events"]["av_sync_ms"] is None, garbage["events"]
+    assert garbage["events"]["audio_latency_ms"] is None, garbage["events"]
+    garbage_path = tmp / "garbage-capture.json"
+    garbage_path.write_text(json.dumps(garbage), encoding="utf-8")
+    garbage_out = tmp / "garbage-result.json"
+    assert report(garbage_path, garbage_out).returncode == 3, "garbage measurement must BLOCK"
+    garbage_doc = load(garbage_out)
+    assert garbage_doc["verdict"] == "BLOCKED"
+    assert garbage_doc["metrics"]["av_sync_ms"]["value"] is None
+    assert garbage_doc["metrics"]["audio_latency_ms"]["value"] is None
+
+    # malformed_input / fail-closed: without the hook the fields are absent;
+    # they must stay null (never a fabricated 0) and the report must BLOCK.
+    plain = _collect(tmp, tmp / "state-3", 2, os.environ.copy())
+    plain_capture = load_from_stdout(plain.stdout)
+    assert plain_capture["events"]["av_sync_ms"] is None
+    assert plain_capture["events"]["audio_latency_ms"] is None
+    plain_path = tmp / "plain-capture.json"
+    plain_path.write_text(plain.stdout, encoding="utf-8")
+    plain_out = tmp / "plain-result.json"
+    assert report(plain_path, plain_out).returncode == 3
+    assert load(plain_out)["verdict"] == "BLOCKED"
+
+    # Drift guard: the fixture contract must match what the real receiver
+    # actually emits - if tools/wired-receiver/main.cpp stops carrying the
+    # hook this fails instead of silently passing on the fake alone.
+    receiver_source = (ROOT / "tools" / "wired-receiver" / "main.cpp").read_text(
+        encoding="utf-8")
+    for token in ("media_timing", "av_sync_ms", "audio_latency_ms",
+                  "max_completion_skew", "max_path_latency"):
+        assert token in receiver_source, f"receiver hook lost {token!r}"
+
+
 def case_readiness(tmp: Path) -> None:
     out = tmp / "readiness.json"
     res = shell(["--readiness-only", "--host", "127.0.0.1", "--out", str(out)], timeout=45)
@@ -380,6 +508,7 @@ CASES = {
     "duration": case_duration,
     "contract": case_contract,
     "collector": case_collector,
+    "media_timing": case_media_timing,
     "readiness": case_readiness,
 }
 

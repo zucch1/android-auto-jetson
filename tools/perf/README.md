@@ -73,11 +73,17 @@ newline-delimited JSON event stream:
 | audio latency | an event field `audio_latency_ms` |
 | crashes | receiver exit status (non-zero, or death before the window ends) |
 
-A metric with no source in the current build stays `null`. On today's tree the
-receiver emits `video_sent`/`audio_chunks`/`session_state_changed` only, so
-A/V-sync and audio-latency would be `null` and the run would be **BLOCKED** until
-those fields are emitted (the minimal additive diagnostics hook is tracked as a
-phase-B risk, not assumed here). Device-supplied text (thermal zone names) is
+A metric with no source in the current build stays `null`. The wired receiver
+emits a low-rate `media_timing` event carrying `av_sync_ms` (peak
+`RouterStats::max_completion_skew`: handoff-confirmed write completion minus
+the piece's scheduled presentation time on the common monotonic A/V clock - the
+audio-side A/V-sync envelope, not a device-delivery or video-presentation
+comparison) and `audio_latency_ms` (peak `RouterStats::max_path_latency`:
+receiver input before decode to handoff-confirmed write completion at the
+routing element). Both are the cumulative peak (worst observed) because the
+phase-B gate is a run/soak budget. Until an audio chunk is routed the fields
+stay absent and the collector keeps them `null` -> the run is **BLOCKED** (fail
+closed, never a fabricated `0`). Device-supplied text (thermal zone names) is
 JSON-escaped as data and never injected into the document.
 
 ## Result document and provenance
@@ -97,8 +103,10 @@ ctest --preset host-dev -R wired_perf --output-on-failure
 ```
 
 `wired_perf_schema`, `wired_perf_nominal`, `wired_perf_budget_fail`,
-`wired_perf_duration`, `wired_perf_contract` and `wired_perf_collector` cover
-schema validation (valid and malformed documents), the nominal PASS fixture,
-the failing-budget fixture, strict duration parsing, the plan-mandated contracts
-and the collector against a deterministic fake receiver. No live hardware is
-required.
+`wired_perf_duration`, `wired_perf_contract`, `wired_perf_collector`,
+`wired_perf_media_timing` and `wired_perf_readiness` cover schema validation
+(valid and malformed documents), the nominal PASS fixture, the failing-budget
+fixture, strict duration parsing, the plan-mandated contracts, the collector
+against a deterministic fake receiver, and the task-48 media-timing hook (the
+collector picks up both fields, the value tracks the injected measurement, an
+absent measurement stays BLOCKED). No live hardware is required.

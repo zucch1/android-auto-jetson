@@ -15,15 +15,41 @@ exercised on the host without hardware. Accepts (and ignores) the receiver CLI
 Env knobs for the test:
   FAKE_RECEIVER_CRASH=1  exit non-zero before the duration elapses (crash path)
   FAKE_RECEIVER_GROW=1   grow RSS a little each tick (RSS-growth path)
+  FAKE_RECEIVER_MEDIA_TIMING=1  emit a ``media_timing`` event carrying the two
+                         task-48 gated metrics (av_sync_ms / audio_latency_ms);
+                         the values come from FAKE_RECEIVER_AV_SYNC_MS /
+                         FAKE_RECEIVER_AUDIO_LATENCY_MS (defaults 12.5 / 40.5)
+                         so a test can vary the injected measurement and prove
+                         the collector reports the measured value, not a
+                         constant. A comma-separated list emits successive
+                         values across ticks (last value repeats). A
+                         non-numeric or non-finite token is passed through as a
+                         JSON string: the collector must keep the metric null
+                         (BLOCKED), never fabricate a 0. Without the knob the
+                         fields are absent and the collector keeps them null
+                         -> BLOCKED (fail closed).
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
 
 DEFAULT_MS = 2000
+
+
+def _measurement(token: str) -> float | str:
+    try:
+        value = float(token)
+    except ValueError:
+        return token
+    return value if math.isfinite(value) else token
+
+
+def _series(raw: str | None, default: str) -> list[float | str]:
+    return [_measurement(token.strip()) for token in (raw or default).split(",")]
 
 
 def _duration_ms(argv: list[str]) -> int:
@@ -37,6 +63,9 @@ def main() -> int:
     duration_ms = _duration_ms(sys.argv[1:])
     grow = os.environ.get("FAKE_RECEIVER_GROW") == "1"
     crash = os.environ.get("FAKE_RECEIVER_CRASH") == "1"
+    media_timing = os.environ.get("FAKE_RECEIVER_MEDIA_TIMING") == "1"
+    av_series = _series(os.environ.get("FAKE_RECEIVER_AV_SYNC_MS"), "12.5")
+    audio_series = _series(os.environ.get("FAKE_RECEIVER_AUDIO_LATENCY_MS"), "40.5")
     ballast: list[bytes] = []
 
     print(json.dumps({"event": "ready", "state": "negotiating"}), flush=True)
@@ -70,6 +99,20 @@ def main() -> int:
                 ),
                 flush=True,
             )
+            if media_timing:
+                index = tick // 5 - 1
+                print(
+                    json.dumps(
+                        {
+                            "event": "media_timing",
+                            "av_sync_ms": av_series[min(index, len(av_series) - 1)],
+                            "audio_latency_ms": audio_series[
+                                min(index, len(audio_series) - 1)
+                            ],
+                        }
+                    ),
+                    flush=True,
+                )
 
     print(json.dumps({"event": "stopping", "duration_ms": duration_ms}), flush=True)
     return 0

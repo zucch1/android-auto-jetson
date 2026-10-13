@@ -39,7 +39,9 @@
 #include <aa/trust/Store.hpp>
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +52,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -71,6 +74,25 @@ void log_line(const std::string &json) {
 }
 
 void on_signal(int) { g_running.store(false); }
+
+// Task-48 media-timing diagnostics: nanoseconds -> milliseconds as an exact
+// rational (ns / 1e6) carried in a double, with no lossy pre-rounding - the
+// collector and reporter compare the value as-is against the ms budgets.
+// Non-finite input (not producible from an int64 count) degrades to a JSON
+// null, which the collector treats as an absent metric (BLOCKED), never 0.
+std::string format_ms(aa::core::Nanoseconds value) {
+    const double ms = static_cast<double>(value.count) / 1'000'000.0;
+    if (!std::isfinite(ms)) {
+        return "null";
+    }
+    char buffer[32];
+    const auto [end, error] =
+        std::to_chars(buffer, buffer + sizeof(buffer), ms, std::chars_format::general);
+    if (error != std::errc{}) {
+        return "null";
+    }
+    return std::string{buffer, end};
+}
 
 class StdoutDiagnostics final : public aa::diagnostics::DiagnosticSink {
   public:
@@ -184,10 +206,55 @@ class RouterSink final : public aa::protocol::MessageSink {
         if (chunks_ % 50 == 1) {
             log_line("{\"event\":\"audio_chunks\",\"count\":" + std::to_string(chunks_) + "}");
         }
-        return router_.pump();
+        auto pumped = router_.pump();
+        if (!pumped) {
+            return pumped.error();
+        }
+        // Task-48: only after a successful pump do the router's statistics
+        // carry a measured render completion. Emit on the same low-rate
+        // cadence as audio_chunks (the receiver's event stream is documented
+        // low-rate). The router runs entirely on this session thread, so
+        // reading report() here is race-free.
+        if (chunks_ % 50 == 1) {
+            emit_media_timing();
+        }
+        return {};
     }
 
   private:
+    // Task-48 media-timing diagnostics. Both gated phase-B metrics derive from
+    // existing task-25 RouterStats observations on the common monotonic A/V
+    // clock; nothing here invents a value:
+    //   audio_latency_ms = max_path_latency    (submit() BEFORE decode, gate
+    //                       fix F4, to DATA-HANDOFF-CONFIRMED WRITE COMPLETION
+    //                       at the routing element, gate r3 F3; receiver-local
+    //                       steady clock; NOT a device-delivery measurement)
+    //   av_sync_ms       = max_completion_skew  (that write completion minus
+    //                       the piece's SCHEDULED PRESENTATION TIME on the
+    //                       common monotonic A/V clock - the wire message
+    //                       timestamp-anchored sample timeline; the audio-side
+    //                       A/V-sync envelope the task-25 gate binds to the
+    //                       <=50 ms budget; NOT a video-presentation
+    //                       comparison and NOT device delivery)
+    // MAX (cumulative peak), not the last sample: the schema budgets
+    // (av_sync_ms_max / audio_latency_ms_max) are run/soak envelope ceilings,
+    // so the retained figure must be the worst observed - a transient breach
+    // must never hide behind a healed later sample (misleading-success
+    // guard). The maxima are read live from the router report at each
+    // emission (current stats, never a session-start snapshot). Numeric
+    // values only - no identifiers. When no audio has traversed the route
+    // there is no measurement: emit nothing rather than a fabricated 0, so
+    // the collector keeps the metric null and the verdict stays BLOCKED.
+    void emit_media_timing() {
+        const auto &stats = router_.report().stats;
+        if (stats.chunks_submitted == 0) {
+            return;
+        }
+        log_line(
+            "{\"event\":\"media_timing\",\"av_sync_ms\":" + format_ms(stats.max_completion_skew) +
+            ",\"audio_latency_ms\":" + format_ms(stats.max_path_latency) + "}");
+    }
+
     aa::audio::AudioRouter &router_;
     std::uint64_t chunks_{0};
 };
