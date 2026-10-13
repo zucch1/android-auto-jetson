@@ -297,6 +297,152 @@ class Rollback(unittest.TestCase):
         self.assertTrue(self.dst.exists(), "tampered backup must not be installed")
         self.assertTrue((self.state / "manifest").exists())
 
+    def edit_manifest(self, **fields: str | None) -> None:
+        """Rewrite manifest keys in place; a None value removes the key."""
+        manifest = self.state / "manifest"
+        out: list[str] = []
+        seen: set[str] = set()
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            key = line.split("=", 1)[0]
+            if key in fields:
+                seen.add(key)
+                if fields[key] is not None:
+                    out.append(f"{key}={fields[key]}")
+            else:
+                out.append(line)
+        for key, value in fields.items():
+            if key not in seen and value is not None:
+                out.append(f"{key}={value}")
+        manifest.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+    def assert_repair_refused(self, edited: bytes) -> None:
+        self.dst.write_bytes(edited)
+        manifest_before = (self.state / "manifest").read_bytes()
+        run = self.install()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(self.dst.read_bytes(), edited,
+                         "installed policy must not be modified on corrupt saved state")
+        self.assertEqual((self.state / "manifest").read_bytes(), manifest_before,
+                         "corrupt saved state must not be rewritten")
+
+    def test_install_refuses_symlinked_destination(self) -> None:
+        self.dst.parent.mkdir(parents=True)
+        target = self.root / "innocent-bystander.rules"
+        target.write_bytes(b"# innocent bystander\n")
+        target.chmod(0o600)
+        self.dst.symlink_to(target)
+        run = self.install()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("symlink", run.stderr)
+        self.assertEqual(target.read_bytes(), b"# innocent bystander\n",
+                         "cp must not write through a symlinked destination")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600,
+                         "chmod must not follow a symlinked destination")
+        self.assertTrue(self.dst.is_symlink())
+        self.assertEqual(os.readlink(self.dst), str(target))
+        self.assertFalse(self.state.exists(), "no manifest may be written")
+
+    def test_install_refuses_dangling_symlink_destination(self) -> None:
+        self.dst.parent.mkdir(parents=True)
+        missing = self.root / "not-here.rules"
+        self.dst.symlink_to(missing)
+        run = self.install()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("symlink", run.stderr)
+        self.assertTrue(self.dst.is_symlink(), "dangling link must survive untouched")
+        self.assertEqual(os.readlink(self.dst), str(missing))
+        self.assertFalse(missing.exists())
+        self.assertFalse(self.state.exists(), "no manifest may be written")
+
+    def test_install_never_writes_or_chmods_through_null_mask_symlink(self) -> None:
+        # The legitimate udev mask is a symlink to /dev/null; install must
+        # refuse and must never chmod through the link (which would re-mode
+        # /dev/null itself). A fake-root stand-in asserts the same on content,
+        # portably regardless of the test user's privileges.
+        self.dst.parent.mkdir(parents=True)
+        null_mode_before = os.stat("/dev/null").st_mode & 0o777
+        self.dst.symlink_to("/dev/null")
+        run = self.install()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("symlink", run.stderr)
+        self.assertEqual(os.stat("/dev/null").st_mode & 0o777, null_mode_before,
+                         "/dev/null permissions must never change")
+        self.assertFalse(self.state.exists(), "no manifest may be written")
+        self.dst.unlink()
+
+        standin = self.root / "dev/null-standin"
+        standin.parent.mkdir(parents=True)
+        standin.write_bytes(b"")
+        standin.chmod(0o666)
+        self.dst.symlink_to(standin)
+        run = self.install()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("symlink", run.stderr)
+        self.assertEqual(standin.read_bytes(), b"", "no bytes may be written through the link")
+        self.assertEqual(standin.stat().st_mode & 0o777, 0o666,
+                         "chmod must not follow the link")
+        self.assertTrue(self.dst.is_symlink())
+        self.assertFalse(self.state.exists(), "no manifest may be written")
+
+    def test_rollback_refuses_drifted_installed_rule(self) -> None:
+        self.assertEqual(self.install().returncode, 0)
+        edited = b"# someone else's edit\n"
+        self.dst.write_bytes(edited)
+        run = self.rollback()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("drifted", run.stderr)
+        self.assertEqual(self.dst.read_bytes(), edited, "edited file must survive rollback")
+        self.assertTrue((self.state / "manifest").exists(), "state must stay untouched")
+
+    def test_rollback_refuses_drifted_installed_rule_with_prior(self) -> None:
+        self.dst.parent.mkdir(parents=True)
+        self.dst.write_bytes(b"# prior\n")
+        self.assertEqual(self.install().returncode, 0)
+        edited = b"# someone else's edit\n"
+        self.dst.write_bytes(edited)
+        run = self.rollback()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("drifted", run.stderr)
+        self.assertEqual(self.dst.read_bytes(), edited,
+                         "edited file must not be overwritten by the restore")
+        self.assertTrue((self.state / "prior.rules").exists())
+        self.assertTrue((self.state / "manifest").exists())
+
+    def test_install_refuses_manifest_bad_prior_existed(self) -> None:
+        self.assertEqual(self.install().returncode, 0)
+        self.edit_manifest(prior_existed="7")
+        self.assert_repair_refused(b"# post-install drift\n")
+
+    def test_install_refuses_manifest_missing_prior_sha256(self) -> None:
+        self.assertEqual(self.install().returncode, 0)
+        self.edit_manifest(prior_sha256=None)
+        self.assert_repair_refused(b"# post-install drift\n")
+
+    def test_install_refuses_manifest_missing_backup(self) -> None:
+        self.dst.parent.mkdir(parents=True)
+        self.dst.write_bytes(b"# prior\n")
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue((self.state / "prior.rules").is_file())
+        (self.state / "prior.rules").unlink()
+        self.assert_repair_refused(b"# post-install drift\n")
+        self.assertFalse((self.state / "prior.rules").exists())
+
+    def test_install_refuses_manifest_backup_hash_mismatch(self) -> None:
+        self.dst.parent.mkdir(parents=True)
+        self.dst.write_bytes(b"# prior\n")
+        self.assertEqual(self.install().returncode, 0)
+        (self.state / "prior.rules").write_bytes(b"# tampered backup\n")
+        self.assert_repair_refused(b"# post-install drift\n")
+        self.assertEqual((self.state / "prior.rules").read_bytes(), b"# tampered backup\n")
+
+    def test_install_refuses_corrupt_manifest_before_claiming_success(self) -> None:
+        self.assertEqual(self.install().returncode, 0)
+        self.edit_manifest(prior_existed="nope")
+        run = self.install()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertNotIn("already-installed", run.stdout,
+                         "corrupt saved state must not be claimed as a clean install")
+
     def test_install_refuses_malformed_rules(self) -> None:
         # Fail closed: validation happens before ANY system state change.
         with tempfile.TemporaryDirectory(prefix="usb-policy-broken-") as tmp:

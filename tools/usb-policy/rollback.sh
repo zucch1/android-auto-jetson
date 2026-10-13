@@ -12,8 +12,9 @@
 #     as before the install, with no trace of this tooling.
 #
 # Idempotent: a second run with no recorded state is a clean no-op (exit 0).
-# Fail closed: an unknown/corrupt manifest or a backup that does not match its
-# recorded hash aborts WITHOUT deleting anything.
+# Fail closed: an unknown/corrupt manifest, a backup that does not match its
+# recorded hash, a symlinked destination, or an installed file that drifted
+# from the manifest's installed_sha256 aborts WITHOUT deleting anything.
 #
 # Environment:
 #   AA_USB_POLICY_ROOT   Alternate filesystem root (tests). Empty = live
@@ -83,7 +84,23 @@ case "$PRIOR_EXISTED" in
     *) die "manifest prior_existed must be 0 or 1 (got '${PRIOR_EXISTED}')" ;;
 esac
 
+INSTALLED_SHA="$(manifest_get installed_sha256)"
+[ -n "$INSTALLED_SHA" ] || die "manifest lacks installed_sha256; refusing to touch state"
+if [ -L "$DST" ]; then
+    die "destination ${DST} is a symlink (target: $(readlink "$DST")); refusing to roll back through a link"
+fi
+# The present destination must still be the exact artifact install.sh
+# installed: anyone else's edits must never be silently overwritten or
+# deleted by a rollback.
+if [ ! -f "$DST" ]; then
+    die "installed rules file ${DST} is missing (expected sha256 ${INSTALLED_SHA}); refusing to touch state"
+fi
+ACTUAL_DST_SHA="$(sha_of "$DST")"
+[ "$ACTUAL_DST_SHA" = "$INSTALLED_SHA" ] \
+    || die "installed rules file drifted (manifest ${INSTALLED_SHA}, got ${ACTUAL_DST_SHA}); refusing to overwrite/delete someone else's edits"
+
 if [ "$PRIOR_EXISTED" = "1" ]; then
+    [ ! -L "$PRIOR" ] || die "backup ${PRIOR} is a symlink; refusing to restore through a link"
     [ -f "$PRIOR" ] || die "manifest records a prior rules file but ${PRIOR} is missing"
     ACTUAL_PRIOR_SHA="$(sha_of "$PRIOR")"
     [ "$ACTUAL_PRIOR_SHA" = "$PRIOR_SHA" ] \
