@@ -129,9 +129,10 @@ Historical sign-off (2026-10-08, original withdrawal — preserved verbatim):
   3. `Full wireless capability acceptance as a prerequisite for continuing independent wired implementation`
 
 These sign-offs never count as full compliance. The wireless release budgets
-below were left unmeasured and unclaimed rather than withdrawn at signing; both
-are now measured (qual-run-6/7): `ap_startup_s` passes, `session_reconnect_s`
-**misses** its 15 s limit — see the dated observation section above.
+below were left unmeasured and unclaimed rather than withdrawn at signing;
+`ap_startup_s` has since been measured and passes (qual-run-6 — see the dated
+observation section above), while `session_reconnect_s` remains unmeasured (a
+link/ADB proxy exceeds 15 s; see the qual-run-7 note).
 
 ## Budgets
 
@@ -154,7 +155,7 @@ area or availability stage.
 | ipc.p95_added_latency_ms | max | 33 ms | 0.2 ms | pass |
 | ipc.happy_drops | max | 0 | 0 | pass |
 
-### Release-stage budgets (provisional — two now measured, one passing; rest unmeasured, unclaimed)
+### Release-stage budgets (provisional — one now measured; rest unmeasured, unclaimed)
 
 | budget | kind | limit | area |
 |--------|------|-------|------|
@@ -190,8 +191,9 @@ unclaimed.
 ## Explicit non-claims
 
 - Audio, USB-session-reconnect, recovery and soak budgets are **unmeasured**; no
-  early probe result claims them as passed. The wireless session-reconnect budget is
-  **measured and misses** its limit (see below) — it is not claimed as passed either.
+  early probe result claims them as passed. The Wi-Fi/ADB proxy exceeds 15 s
+  (qual-run-7); the formal wireless session-reconnect budget remains **unmeasured**
+  — it is not claimed as passed either.
 - USB: AOA2 capability only. No Android Auto session and no bulk transfer were
   exercised; this is **not** projection and not a session-reconnect pass.
 - Wireless: UNII-1 5 GHz AP (ch 44, 20 MHz) and isolated client-association are
