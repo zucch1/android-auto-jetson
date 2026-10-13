@@ -446,7 +446,7 @@
     {
       "id": "wireless",
       "classification": "owner-signed-reduced-scope",
-      "summary": "UNII-1 5 GHz AP (ch 44, 20 MHz), isolated client-association and the AP-startup release budget are demonstrated (qual-run-1/5/6, qual-client-assoc, qual-ht20-test receipts). The session-reconnect release budget is measured and MISSES: 29.233 s worst of 3 journal-valid cycles vs the 15 s limit on the receiver-hosted AP (qual-run-7; steady-state ~10.3 s, cycle-1 slow first re-association consistent with a full-channel rescan). Claim 3 stays withdrawn/open. Channel-36 wording is a 2026-10-11 owner-signed re-scope (the vendor driver forces a CSA 36->44) and is not silently passed. BlueZ ProfileManager/Agent registration succeeded with clean unregister and unchanged adapter state. The 3.009 s event-loop observation is NOT a strict 3 s deadline pass. AP mode advertisement is not AP operation.",
+      "summary": "UNII-1 5 GHz AP (ch 44, 20 MHz), isolated client-association and the AP-startup release budget are demonstrated (qual-run-1/5/6, qual-client-assoc, qual-ht20-test receipts). The session-reconnect release budget remains UNMEASURED: qual-run-7 captured a WiFi+ADB proxy recovery chain only (31.715 s worst contract-aligned / 29.233 s from radio-on; both exceed 15 s) - the session-contract endpoint (renegotiation to State::active) was not exercised. Claim 3 stays withdrawn/open. Channel-36 wording is a 2026-10-11 owner-signed re-scope (the vendor driver forces a CSA 36->44) and is not silently passed. BlueZ ProfileManager/Agent registration succeeded with clean unregister and unchanged adapter state. The 3.009 s event-loop observation is NOT a strict 3 s deadline pass. AP mode advertisement is not AP operation.",
       "evidence": [
         {
           "name": "task-12-bluez-lightweight.json",
@@ -506,11 +506,11 @@
         },
         {
           "name": "task-12-fix/qual-run-7/qual-receipt-run-7.md",
-          "sha256": "dd25b9e521707c5a0e43734f283f3554b12526a7791948a602879d1a43105dd1"
+          "sha256": "43ec71e6bb35978f2509c4cd201bc0aa5509602ba1057ffc4f0f95cf12d776e3"
         },
         {
           "name": "task-12-fix/qual-run-7/qual-receipt-run-7.json",
-          "sha256": "be4efce9db8f2d8ea6253974900f64e36b573f8b45bebb992a692100a069f01c"
+          "sha256": "f992748e263ab670d7ce6760ac597d850d2ad6b61e3e1cdfea40a16c4a5edbee"
         },
         {
           "name": "task-12-fix/qual-run-7/qual-log-run-7.txt",
@@ -548,10 +548,11 @@
         "claim_1_text": "Completed onboard RTL8822CE UNII-1 5 GHz AP qualification (ch 44, 20 MHz) at the early capability gate",
         "claim_1_status": "demonstrated (qual-run-1, qual-run-5, qual-ht20-test)",
         "claim_2_status": "demonstrated (qual-client-assoc)",
-        "claim_3_status": "open (withdrawn): both release budgets now measured - ap_startup_s 4.223 s <= 5.0 s PASS (qual-run-6); session_reconnect_s 29.233 s > 15.0 s MISS (qual-run-7, 3/3 journal-valid cycles on the receiver-hosted AP; steady-state ~10.3 s but cycle-1 slow first re-association - consistent with a full-channel rescan, scan evidence not separately captured - is the max-kind reading). Claim 3 stays withdrawn/open; closing it needs the recovery engineered under 15 s and re-qualified, or an owner-signed budget withdrawal naming the miss",
+        "claim_3_status": "open (withdrawn): ap_startup_s 4.223 s <= 5.0 s PASS (qual-run-6). session_reconnect_s remains UNMEASURED: the 2026-10-13 window captured only a WiFi-reassociation + adb-over-WiFi PROXY chain (qual-run-7: 31.715 s worst from link-loss-aligned onset; 29.233 s from radio-on - a diagnostic), not the session-contract endpoint (transport restoration + renegotiation to State::active, src/session/Lifecycle.cpp). Both proxy clocks exceed 15 s. Closing claim 3 needs either a real AA session-recovery capture or an owner-signed budget withdrawal naming a miss",
         "ap_startup_s": 4.223,
         "infra_sta_rfkill_reconnect_s": 4.139,
-        "session_reconnect_s": 29.233
+        "wifi_adb_proxy_recovery_s": 31.715,
+        "wifi_adb_proxy_recovery_from_radio_on_s": 29.233
       },
       "budgets": [
         {
@@ -560,7 +561,7 @@
           "limit": 15.0,
           "unit": "s",
           "available_at": "release",
-          "measured": 29.233,
+          "measured": null,
           "passed": false,
           "withdrawn": false,
           "withdrawn_claim": null
