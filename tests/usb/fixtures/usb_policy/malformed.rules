@@ -1,0 +1,10 @@
+# Broken on purpose (malformed_input fixture): every non-comment line must be
+# rejected by rules_check.py and by `udevadm verify`; none of these may ever
+# "match everything".
+SUBSYSTEM=="usb" ATTR{idVendor}=="04e8"          # missing comma between keys
+KERNEL=="1-2.1", ATTR{idVendor}=="04e8           # unbalanced quote
+NONSENSEKEY=="usb", MODE="0666"                  # unknown key
+SUBSYSTEM=="usb", MODE                           # assignment without operator
+, MODE="0666"                                    # leading comma / empty token pair
+KERNEL=="1-2.1", GARBAGE                         # bare garbage token
+SUBSYSTEM=="usb", KERNEL=="1-2.1",               # trailing comma only (no assignment)

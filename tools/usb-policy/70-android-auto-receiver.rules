@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Scoped USB device policy for the Android Auto receiver (task 29).
+#
+# SCOPE - narrow by construction. This file matches ONLY the qualified phone /
+# AOA accessory identities on the qualified physical port path of the
+# qualified host:
+#
+#   port path 1-2.1  (bus 1, root port 2 -> hub port 1; kernel sysfs name)
+#     04e8:6860  Samsung Galaxy S24 Ultra, phone / MTP mode
+#     18d1:2d00  Android Open Accessory (AOA) mode
+#     18d1:2d01  Android Open Accessory mode + ADB (post-switch enumeration)
+#
+# The same ids on ANY OTHER port path do not match. There is no vendor-wide,
+# class-wide or hub-wide rule here, no system-wide ModemManager disable, and
+# no rule for the keyboard/mouse dongle, the Bluetooth radio, hubs or the
+# usb-serial class at large: unrelated devices keep default udev and
+# ModemManager policy.
+#
+# PORT CONSTRAINT: on this kernel (6.8.12-1021-tegra, verified with
+# `udevadm info -a /sys/bus/usb/devices/1-2.1`) the USB device's kernel name
+# IS the stable topology port path ("1-2.1"). KERNEL=="1-2.1" pins the device
+# node exactly; KERNELS=="1-2.1" pins every descendant (interfaces, tty
+# ports) of that one port. The alternative ATTR{devpath}=="2.1" is
+# bus-relative ("2.1" without the bus prefix) and therefore ambiguous across
+# the two USB buses on this target - it is deliberately NOT used.
+#
+# WHAT IS APPLIED (to the matched tree only):
+#   1. ModemManager: ENV{ID_MM_DEVICE_IGNORE}="1" on exactly the matched
+#      device tree (usb device + its interfaces + its tty ports). Without it
+#      ModemManager probes the phone's CDC-ACM ports ("couldn't check support
+#      for device ...: not supported by any plugin"). The id+port form here
+#      follows ModemManager's own 77-mm-*-device-blacklist.rules convention
+#      (ATTRS id match + ID_MM_DEVICE_IGNORE) plus the port constraint.
+#      Every other device stays visible to ModemManager.
+#   2. Receiver session access to the accessory bulk-pipe node
+#      (/dev/bus/usb/BBB/DDD): GROUP="plugdev", MODE="0660",
+#      TAG+="uaccess". plugdev + MODE 0660 + TAG uaccess is the project's
+#      established Android-accessory ACL convention (tools/usb-policy/
+#      README.md "Access control"); uaccess grants the active seat session
+#      user and auto-revokes with the session; 0660 denies everyone else.
+#      Least privilege: no MODE="0666", no world access, no class rules.
+#
+# NUMBERING: 70- runs after 50-udev-default.rules (so MODE/GROUP for these
+# exact device nodes take effect) and before 73-seat-late.rules (so
+# TAG+="uaccess" is registered before the uaccess builtin applies the ACL)
+# and before the 77-/80- ModemManager rules. It cannot override later system
+# rules.
+#
+# ROLLBACK: tools/usb-policy/rollback.sh restores the exact prior state.
+# See tools/usb-policy/README.md ("Rollback").
+#
+# ROLLBACK DOC + ops: tools/usb-policy/README.md
+
+# --- ModemManager: ignore exactly the matched device tree -----------------
+KERNELS=="1-2.1", SUBSYSTEMS=="usb", ATTRS{idVendor}=="04e8", ATTRS{idProduct}=="6860", ENV{ID_MM_DEVICE_IGNORE}="1"
+KERNELS=="1-2.1", SUBSYSTEMS=="usb", ATTRS{idVendor}=="18d1", ATTRS{idProduct}=="2d00", ENV{ID_MM_DEVICE_IGNORE}="1"
+KERNELS=="1-2.1", SUBSYSTEMS=="usb", ATTRS{idVendor}=="18d1", ATTRS{idProduct}=="2d01", ENV{ID_MM_DEVICE_IGNORE}="1"
+
+# --- Receiver session access to the accessory bulk-pipe node -------------
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="1-2.1", ATTR{idVendor}=="04e8", ATTR{idProduct}=="6860", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="1-2.1", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="1-2.1", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d01", GROUP="plugdev", MODE="0660", TAG+="uaccess"
