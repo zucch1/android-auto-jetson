@@ -3,7 +3,9 @@
 
 #include <aa/protocol/InputReport.hpp>
 
+#include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -49,6 +51,7 @@ WiredSession::~WiredSession() = default;
 core::Result<void> WiredSession::apply(session::Event event) {
     auto outcome = lifecycle_.apply(event);
     note_state();
+    note_recovery(event, outcome);
     return outcome;
 }
 
@@ -505,6 +508,55 @@ void WiredSession::note_state(std::string_view identity_key) {
     }
     last_state_ = lifecycle_.state();
     emit(identity_key);
+}
+
+void WiredSession::note_recovery(session::Event event, const core::Result<void> &outcome) {
+    switch (event) {
+    case session::Event::link_lost:
+        if (outcome.has_value()) {
+            emit_recovery("link lost", RecoveryStatus::pending, std::nullopt);
+        }
+        break;
+    case session::Event::reconnect:
+    case session::Event::recover: {
+        ++reconnect_attempts_;
+        const bool recovered = outcome.has_value();
+        if (!recovered) {
+            ++recovery_failures_;
+        }
+        const char *reason = event == session::Event::recover ? "peer disconnected" : "link lost";
+        emit_recovery(reason, recovered ? RecoveryStatus::accepted : RecoveryStatus::failed,
+                      recovered ? std::nullopt
+                                : std::optional<std::int64_t>{
+                                      static_cast<std::int64_t>(outcome.error().code())});
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void WiredSession::emit_recovery(const char *reason, RecoveryStatus status,
+                                 std::optional<std::int64_t> code) {
+    const std::string_view status_text = status == RecoveryStatus::accepted ? "accepted"
+                                         : status == RecoveryStatus::failed ? "failed"
+                                                                            : "pending";
+    diagnostics::Event event{};
+    event.session = session_id_;
+    event.kind = diagnostics::EventKind::reconnect;
+    event.monotonic_time = deps_.clock.now();
+    event.fields.push_back(diagnostics::EventField::text("reason", std::string{reason}));
+    event.fields.push_back(diagnostics::EventField::text("status", std::string{status_text}));
+    event.fields.push_back(
+        diagnostics::EventField::count("retries", static_cast<std::int64_t>(reconnect_attempts_)));
+    event.fields.push_back(
+        diagnostics::EventField::count("errors", static_cast<std::int64_t>(recovery_failures_)));
+    if (code.has_value()) {
+        event.fields.push_back(diagnostics::EventField::count("code", *code));
+    }
+    event.fields.push_back(diagnostics::EventField::text("transport", "usb"));
+    deps_.diagnostics.emit(event);
+    ++diagnostics_emitted_;
 }
 
 } // namespace aa::app

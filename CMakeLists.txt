@@ -156,6 +156,10 @@ include(cmake/AudioPipeline.cmake)
 # it composes transport/session/channels/video/audio/input/diagnostics into one
 # wired path and its test wires the real aa_video channel and aareceiver-audio.
 include(cmake/WiredE2e.cmake)
+# Task 31 wired reconnect/recovery matrix follows the integrator: it exercises
+# link loss/replug, restarts, malformed input and unknown-phone attempts against
+# aa_wired and asserts the task-19 recovery/retry telemetry.
+include(cmake/WiredRecovery.cmake)
 if(NOT CMAKE_CROSSCOMPILING)
     if(NOT BUILD_TESTING)
         message(FATAL_ERROR "AA_DECODE_COVERAGE: native builds require BUILD_TESTING=ON")
