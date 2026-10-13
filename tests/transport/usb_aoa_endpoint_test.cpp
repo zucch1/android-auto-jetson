@@ -2,10 +2,16 @@
 // AOA bulk ByteEndpoint tests (task 28): byte I/O over a scripted bulk pipe,
 // the framed UsbByteTransport composition, malformed peer bytes, and
 // cancellation of in-flight reads/writes with a clean close and a working
-// fresh endpoint afterwards (cancel_resume class).
+// fresh endpoint afterwards (cancel_resume class). Gate P2-4 fixtures: a
+// zero-progress bulk write is bounded to a typed transport_io failure, and
+// cancellation fires WHILE a transfer is blocked mid-operation.
+//
+// All assertions read the test-owned shared observation block (UsbAoaFakes
+// LinkState/PipeState), never fixture objects that the pipeline may destroy.
 
 #include "../src/transport/usb_adapter/UsbAoaEndpoint.hpp"
 
+#include "PendingIo.hpp"
 #include "UsbAoaFakes.hpp"
 
 #include <aa/core/Cancellation.hpp>
@@ -17,12 +23,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <sys/syscall.h>
 
 namespace {
 
@@ -45,11 +51,14 @@ tr::WiredAdmission admit_all() {
 
 struct Connected final {
     std::unique_ptr<ua::UsbAoaEndpoint> endpoint;
-    fx::FakeLinkFactory *factory;
+    std::shared_ptr<fx::LinkState> state;
+    fx::FakeLinkFactory *factory{nullptr};
 };
 
-Connected connect(std::unique_ptr<fx::FakeLinkFactory> factory) {
+Connected connect() {
     Connected out;
+    out.state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(out.state);
     out.factory = factory.get();
     auto endpoint = ua::UsbAoaEndpoint::make(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
                                              tr::AoaAccessoryInfo{}, admit_all());
@@ -65,14 +74,15 @@ Connected connect(std::unique_ptr<fx::FakeLinkFactory> factory) {
 } // namespace
 
 TEST(UsbAoaEndpoint, OpenRunsPipelineAndMovesBytes) {
-    Connected link = connect(std::make_unique<fx::FakeLinkFactory>());
+    Connected link = connect();
     ASSERT_TRUE(link.endpoint != nullptr);
-    ASSERT_TRUE(link.factory->pipe() != nullptr);
+    auto pipe_state = link.state->pipe_state();
+    ASSERT_TRUE(pipe_state != nullptr);
 
     auto written = link.endpoint->write(pattern(64), {});
     ASSERT_TRUE(written.has_value());
     EXPECT_EQ(written.value(), 64u);
-    EXPECT_EQ(link.factory->pipe()->out_size(), 64u);
+    EXPECT_EQ(pipe_state->out_size(), 64u);
 
     link.factory->pipe()->push_in(pattern(32));
     std::array<std::byte, 64> buffer{};
@@ -82,11 +92,11 @@ TEST(UsbAoaEndpoint, OpenRunsPipelineAndMovesBytes) {
 }
 
 TEST(UsbAoaEndpoint, OpenIsIdempotentAndCloseIsTerminal) {
-    Connected link = connect(std::make_unique<fx::FakeLinkFactory>());
+    Connected link = connect();
     ASSERT_TRUE(link.endpoint != nullptr);
     EXPECT_TRUE(link.endpoint->open().has_value());
-    EXPECT_EQ(link.factory->switch_calls, 1);
-    EXPECT_EQ(link.factory->claim_calls, 1);
+    EXPECT_EQ(link.state->switches(), 1);
+    EXPECT_EQ(link.state->claims(), 1);
 
     link.endpoint->close();
     link.endpoint->close();
@@ -103,17 +113,21 @@ TEST(UsbAoaEndpoint, OpenIsIdempotentAndCloseIsTerminal) {
 }
 
 TEST(UsbAoaEndpoint, EmptyBufferReadReturnsZeroWithoutTouchingPipe) {
-    Connected link = connect(std::make_unique<fx::FakeLinkFactory>());
+    Connected link = connect();
     ASSERT_TRUE(link.endpoint != nullptr);
     auto read = link.endpoint->read({}, {});
     ASSERT_TRUE(read.has_value());
     EXPECT_EQ(read.value(), 0u);
-    EXPECT_EQ(link.factory->pipe()->reads(), 0);
+    EXPECT_EQ(link.state->pipe_state()->reads_started.load(), 0);
 }
 
 TEST(UsbAoaEndpoint, FramedRoundTripThroughUsbByteTransport) {
-    Connected link = connect(std::make_unique<fx::FakeLinkFactory>());
+    Connected link = connect();
     ASSERT_TRUE(link.endpoint != nullptr);
+    auto pipe_state = link.state->pipe_state();
+    ASSERT_TRUE(pipe_state != nullptr);
+    // Driving handle grabbed while its owner is alive; observations go to the
+    // shared block below.
     fx::FakeBulkPipe *pipe = link.factory->pipe();
     ASSERT_TRUE(pipe != nullptr);
 
@@ -123,15 +137,13 @@ TEST(UsbAoaEndpoint, FramedRoundTripThroughUsbByteTransport) {
     ASSERT_TRUE(transport.value()->open(source.get_token()).has_value());
     EXPECT_EQ(transport.value()->kind(), tr::Kind::usb_aoa);
 
-    // A framed message traverses the bulk OUT pipe as exactly one frame.
     const tr::FrameHeader header{0x00, tr::FrameType::bulk, tr::MessageKind::control,
                                  tr::Encryption::plain};
     auto frame = tr::encode_frame(header, pattern(6), 0);
     ASSERT_TRUE(frame.has_value());
     ASSERT_TRUE(transport.value()->send(frame.value()).has_value());
-    EXPECT_EQ(pipe->out(), frame.value());
+    EXPECT_EQ(pipe_state->out_bytes(), frame.value());
 
-    // A framed message from the phone is received intact from the bulk IN pipe.
     const tr::FrameHeader reply_header{0x00, tr::FrameType::bulk, tr::MessageKind::control,
                                        tr::Encryption::plain};
     auto reply = tr::encode_frame(reply_header, pattern(4), 0);
@@ -143,7 +155,7 @@ TEST(UsbAoaEndpoint, FramedRoundTripThroughUsbByteTransport) {
 }
 
 TEST(UsbAoaEndpoint, MalformedFrameFromPhoneIsTypedErrorAndCloses) {
-    Connected link = connect(std::make_unique<fx::FakeLinkFactory>());
+    Connected link = connect();
     ASSERT_TRUE(link.endpoint != nullptr);
     fx::FakeBulkPipe *pipe = link.factory->pipe();
     ASSERT_TRUE(pipe != nullptr);
@@ -152,7 +164,6 @@ TEST(UsbAoaEndpoint, MalformedFrameFromPhoneIsTypedErrorAndCloses) {
     aa::core::CancellationSource source;
     ASSERT_TRUE(transport.value()->open(source.get_token()).has_value());
 
-    // Garbage frame bytes: reserved flags in the header.
     pipe->push_in(
         {std::byte{0x01}, std::byte{0xF3}, std::byte{0x00}, std::byte{0x01}, std::byte{0xAA}});
     auto received = transport.value()->receive();
@@ -164,7 +175,7 @@ TEST(UsbAoaEndpoint, MalformedFrameFromPhoneIsTypedErrorAndCloses) {
 }
 
 TEST(UsbAoaEndpoint, ReadIsCancelledInFlightAndFreshEndpointWorks) {
-    Connected link = connect(std::make_unique<fx::FakeLinkFactory>());
+    Connected link = connect();
     ASSERT_TRUE(link.endpoint != nullptr);
     fx::FakeBulkPipe *pipe = link.factory->pipe();
     ASSERT_TRUE(pipe != nullptr);
@@ -181,7 +192,7 @@ TEST(UsbAoaEndpoint, ReadIsCancelledInFlightAndFreshEndpointWorks) {
             code = read.error().code();
         }
     });
-    while (!started.load() || pipe->reads() == 0) {
+    while (!started.load() || link.state->pipe_state()->reads_started.load() == 0) {
         std::this_thread::yield();
     }
     source.request_stop();
@@ -189,11 +200,10 @@ TEST(UsbAoaEndpoint, ReadIsCancelledInFlightAndFreshEndpointWorks) {
     EXPECT_FALSE(had_value);
     EXPECT_EQ(code, aa::ErrorCode::cancelled);
 
-    // The cancelled endpoint is terminal; a fresh endpoint re-opens cleanly.
     auto reopened = link.endpoint->open();
     ASSERT_FALSE(reopened.has_value());
     EXPECT_EQ(reopened.error().code(), ErrorCode::transport_closed);
-    Connected fresh = connect(std::make_unique<fx::FakeLinkFactory>());
+    Connected fresh = connect();
     ASSERT_TRUE(fresh.endpoint != nullptr);
     auto written = fresh.endpoint->write(pattern(4), {});
     ASSERT_TRUE(written.has_value());
@@ -201,7 +211,7 @@ TEST(UsbAoaEndpoint, ReadIsCancelledInFlightAndFreshEndpointWorks) {
 }
 
 TEST(UsbAoaEndpoint, WriteIsCancelledInFlight) {
-    Connected link = connect(std::make_unique<fx::FakeLinkFactory>());
+    Connected link = connect();
     ASSERT_TRUE(link.endpoint != nullptr);
     aa::core::CancellationSource source;
     source.request_stop();
@@ -210,8 +220,87 @@ TEST(UsbAoaEndpoint, WriteIsCancelledInFlight) {
     EXPECT_EQ(written.error().code(), aa::ErrorCode::cancelled);
 }
 
+TEST(UsbAoaEndpoint, ZeroProgressWriteIsBoundedToTypedFailure) {
+    // Gate P2-4: a bulk OUT that makes no progress across bounded timeouts must
+    // end in transport_io after 3 zero-progress attempts - never an endless
+    // retry loop. The endpoint closes terminally on that failure.
+    Connected link = connect();
+    ASSERT_TRUE(link.endpoint != nullptr);
+    link.factory->pipe()->zero_progress_writes = 1000;
+
+    const auto began = std::chrono::steady_clock::now();
+    auto written = link.endpoint->write(pattern(16), {});
+    const auto elapsed = std::chrono::steady_clock::now() - began;
+
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error().code(), ErrorCode::transport_io);
+    EXPECT_LT(elapsed, std::chrono::seconds(5));
+    EXPECT_EQ(link.state->pipe_state()->out_size(), 0u);
+    auto after = link.endpoint->write(pattern(4), {});
+    ASSERT_FALSE(after.has_value());
+    EXPECT_EQ(after.error().code(), ErrorCode::transport_closed);
+}
+
+TEST(UsbAoaEndpoint, CancelFiresWhileTransferIsBlockedMidOperation) {
+    // Gate P2-4: the token fires WHILE the bulk transfer is blocked inside the
+    // pipe (kernel-observed futex wait via PendingIo), not before it starts.
+    Connected link = connect();
+    ASSERT_TRUE(link.endpoint != nullptr);
+    aa::core::CancellationSource source;
+    std::atomic<bool> in_flight{false};
+    bool had_value{true};
+    aa::ErrorCode code{aa::ErrorCode::internal};
+    PendingIo<void> pending([&] {
+        std::array<std::byte, 8> buffer{};
+        in_flight.store(true);
+        auto read = link.endpoint->read(buffer, source.get_token());
+        had_value = read.has_value();
+        if (!had_value) {
+            code = read.error().code();
+        }
+    });
+    // Prove the worker is genuinely inside the blocking wait, then fire.
+    EXPECT_TRUE(pending.blocked(SYS_futex));
+    in_flight.store(true);
+    source.request_stop();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (pending.result.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+    }
+    EXPECT_FALSE(had_value);
+    EXPECT_EQ(code, aa::ErrorCode::cancelled);
+}
+
+TEST(UsbAoaEndpoint, CancelFiresWhileWriteIsBlockedMidOperation) {
+    // Gate P2-4 write-path counterpart to the read fixture above: the token
+    // fires WHILE the OUT transfer is blocked inside the pipe (kernel-observed
+    // futex wait via PendingIo), not before it starts (the old pre-fired
+    // WriteIsCancelledInFlight alone could not prove this).
+    Connected link = connect();
+    ASSERT_TRUE(link.endpoint != nullptr);
+    link.factory->pipe()->block_writes = true;
+    aa::core::CancellationSource source;
+    bool had_value{true};
+    aa::ErrorCode code{aa::ErrorCode::internal};
+    PendingIo<void> pending([&] {
+        auto written = link.endpoint->write(pattern(8), source.get_token());
+        had_value = written.has_value();
+        if (!had_value) {
+            code = written.error().code();
+        }
+    });
+    EXPECT_TRUE(pending.blocked(SYS_futex));
+    source.request_stop();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (pending.result.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+    }
+    EXPECT_FALSE(had_value);
+    EXPECT_EQ(code, aa::ErrorCode::cancelled);
+}
+
 TEST(UsbAoaEndpoint, IdsAreCapturedForTheApprovedRecord) {
-    Connected link = connect(std::make_unique<fx::FakeLinkFactory>());
+    Connected link = connect();
     ASSERT_TRUE(link.endpoint != nullptr);
     EXPECT_EQ(link.endpoint->identity().usb_vendor_id, "04e8");
     EXPECT_EQ(link.endpoint->identity().usb_product_id, "6860");

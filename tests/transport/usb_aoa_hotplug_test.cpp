@@ -4,6 +4,9 @@
 // stale handles are not reused; two detach/attach cycles recover consistently;
 // a read with no peer is genuinely blocked (kernel-observed) and honours the
 // cancellation bound (stale_state / hung_commands / repeated_interrupts).
+//
+// All assertions read the test-owned shared observation block (UsbAoaFakes
+// LinkState/PipeState), never fixture objects that the pipeline may destroy.
 
 #include "../src/transport/usb_adapter/UsbAoaEndpoint.hpp"
 
@@ -37,12 +40,14 @@ tr::WiredAdmission admit_all() {
 
 struct Link final {
     std::unique_ptr<ua::UsbAoaEndpoint> endpoint;
+    std::shared_ptr<fx::LinkState> state;
     fx::FakeLinkFactory *factory{nullptr};
 };
 
 Link open_link() {
     Link link;
-    auto factory = std::make_unique<fx::FakeLinkFactory>();
+    link.state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(link.state);
     link.factory = factory.get();
     auto endpoint = ua::UsbAoaEndpoint::make(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
                                              tr::AoaAccessoryInfo{}, admit_all());
@@ -77,7 +82,7 @@ TEST(UsbAoaHotplug, DetachDuringReadFailsTypedAndTerminal) {
             outcome.code = read.error().code();
         }
     });
-    while (!started.load() || pipe->reads() == 0) {
+    while (!started.load() || link.state->pipe_state()->reads_started.load() == 0) {
         std::this_thread::yield();
     }
     pipe->detach();
@@ -85,13 +90,12 @@ TEST(UsbAoaHotplug, DetachDuringReadFailsTypedAndTerminal) {
     EXPECT_FALSE(outcome.had_value);
     EXPECT_EQ(outcome.code, ErrorCode::transport_closed);
 
-    // The endpoint is terminal after the detach: no further pipe traffic.
-    const auto reads_after = pipe->reads();
+    const auto reads_after = link.state->pipe_state()->reads_started.load();
     std::array<std::byte, 8> buffer{};
     auto read = link.endpoint->read(buffer, {});
     ASSERT_FALSE(read.has_value());
     EXPECT_EQ(read.error().code(), ErrorCode::transport_closed);
-    EXPECT_EQ(pipe->reads(), reads_after);
+    EXPECT_EQ(link.state->pipe_state()->reads_started.load(), reads_after);
 }
 
 TEST(UsbAoaHotplug, DetachDuringWriteFailsTyped) {
@@ -115,14 +119,12 @@ TEST(UsbAoaHotplug, StaleHandleIsNotReusedAfterDetach) {
     std::array<std::byte, 8> buffer{};
     ASSERT_FALSE(link.endpoint->read(buffer, {}).has_value());
 
-    // Fresh discovery hands out a NEW pipe; the stale one is never touched.
     Link fresh = open_link();
     ASSERT_TRUE(fresh.endpoint != nullptr);
-    EXPECT_NE(fresh.factory->pipe(), pipe);
     auto written = fresh.endpoint->write(buffer, {});
     ASSERT_TRUE(written.has_value());
-    EXPECT_EQ(pipe->out_size(), 0u);
-    EXPECT_EQ(fresh.factory->pipe()->out_size(), buffer.size());
+    EXPECT_EQ(link.state->pipe_state()->out_size(), 0u);
+    EXPECT_EQ(fresh.state->pipe_state()->out_size(), buffer.size());
 }
 
 TEST(UsbAoaHotplug, TwoDetachCyclesRecoverConsistently) {
@@ -146,8 +148,6 @@ TEST(UsbAoaHotplug, NoPeerReadIsBlockedAndCancellable) {
     ASSERT_TRUE(link.endpoint != nullptr);
     aa::core::CancellationSource source;
     Outcome outcome;
-    // Kernel-observed blocking: the read is inside the pipe's wait (futex)
-    // before the token fires, and returns cancelled afterwards - no spin.
     PendingIo<void> pending([&] {
         std::array<std::byte, 8> buffer{};
         auto read = link.endpoint->read(buffer, source.get_token());
@@ -167,24 +167,26 @@ TEST(UsbAoaHotplug, NoPeerReadIsBlockedAndCancellable) {
 }
 
 TEST(UsbAoaHotplug, SwitchTimeDetachIsTypedAndTerminal) {
-    auto factory = std::make_unique<fx::FakeLinkFactory>();
+    auto state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(state);
     factory->fail_switch = true;
     factory->switch_error = Error{ErrorCode::transport_closed};
-    fx::FakeLinkFactory *raw = factory.get();
     auto endpoint = ua::UsbAoaEndpoint::make(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
                                              tr::AoaAccessoryInfo{}, admit_all());
     ASSERT_TRUE(endpoint.has_value());
     auto opened = endpoint.value()->open();
     ASSERT_FALSE(opened.has_value());
     EXPECT_EQ(opened.error().code(), ErrorCode::transport_closed);
-    EXPECT_EQ(raw->claim_calls, 0);
+    EXPECT_EQ(state->claims(), 0);
+    EXPECT_EQ(state->switches(), 1);
     auto reopened = endpoint.value()->open();
     ASSERT_FALSE(reopened.has_value());
     EXPECT_EQ(reopened.error().code(), ErrorCode::transport_closed);
 }
 
 TEST(UsbAoaHotplug, MissingAccessoryIsTypedTimeout) {
-    auto factory = std::make_unique<fx::FakeLinkFactory>();
+    auto state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(state);
     factory->fail_claim = true;
     factory->claim_error = Error{ErrorCode::timeout};
     auto endpoint = ua::UsbAoaEndpoint::make(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
@@ -193,4 +195,5 @@ TEST(UsbAoaHotplug, MissingAccessoryIsTypedTimeout) {
     auto opened = endpoint.value()->open();
     ASSERT_FALSE(opened.has_value());
     EXPECT_EQ(opened.error().code(), ErrorCode::timeout);
+    EXPECT_EQ(state->claims(), 1);
 }

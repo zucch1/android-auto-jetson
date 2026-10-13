@@ -35,15 +35,16 @@ TEST(UsbAoaSwitch, HappyPathSwitchesWithFullLengths) {
         EXPECT_EQ(step.observed_bytes, step.expected_bytes);
     }
     EXPECT_EQ(report.requests, 8);
-    ASSERT_EQ(channel.calls.size(), 8u);
-    EXPECT_EQ(channel.calls[0].request, ua::kAoaRequestGetProtocol);
-    EXPECT_EQ(channel.calls[0].length, 2u);
+    const auto calls = channel.state()->calls();
+    ASSERT_EQ(calls.size(), 8u);
+    EXPECT_EQ(calls[0].request, ua::kAoaRequestGetProtocol);
+    EXPECT_EQ(calls[0].length, 2u);
     for (std::uint16_t index = 0; index < 6; ++index) {
-        EXPECT_EQ(channel.calls[1 + index].request, ua::kAoaRequestSendString);
-        EXPECT_EQ(channel.calls[1 + index].index, index);
+        EXPECT_EQ(calls[1 + index].request, ua::kAoaRequestSendString);
+        EXPECT_EQ(calls[1 + index].index, index);
     }
-    EXPECT_EQ(channel.calls[7].request, ua::kAoaRequestStart);
-    EXPECT_EQ(channel.calls[7].length, 0u);
+    EXPECT_EQ(calls[7].request, ua::kAoaRequestStart);
+    EXPECT_EQ(calls[7].length, 0u);
 }
 
 TEST(UsbAoaSwitch, SendStringPayloadIsNulTerminatedAscii) {

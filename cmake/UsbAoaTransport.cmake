@@ -22,7 +22,8 @@ set(AA_USB_AOA_TEST_SOURCES
     tests/transport/usb_aoa_switch_test.cpp
     tests/transport/usb_aoa_endpoint_test.cpp
     tests/transport/usb_aoa_hotplug_test.cpp
-    tests/transport/usb_aoa_identity_test.cpp)
+    tests/transport/usb_aoa_identity_test.cpp
+    tests/transport/usb_aoa_probe_test.cpp)
 foreach(source IN LISTS AA_USB_AOA_SOURCES AA_USB_AOA_PROBE_SOURCES)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/${source}")
         message(FATAL_ERROR "AA_USB_AOA_SOURCE_MISSING: ${source}")
@@ -58,8 +59,15 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME usb_aoa_endpoint COMMAND aa_usb_aoa_test --gtest_filter=UsbAoaEndpoint.*)
     add_test(NAME usb_aoa_hotplug COMMAND aa_usb_aoa_test --gtest_filter=UsbAoaHotplug.*)
     add_test(NAME usb_aoa_identity COMMAND aa_usb_aoa_test --gtest_filter=UsbAoaIdentity.*)
+    add_test(NAME usb_aoa_probe COMMAND aa_usb_aoa_test --gtest_filter=UsbAoaProbe.*)
+    foreach(case absent_json hostile_port timeout_parse)
+        add_test(NAME usb_aoa_probe_${case} COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_SOURCE_DIR}/tests/usb/test_probe_binary.py" ${case}
+            "$<TARGET_FILE:aa-usb-aoa-probe>")
+    endforeach()
     set_tests_properties(usb_aoa_switch usb_aoa_endpoint usb_aoa_hotplug usb_aoa_identity
-        PROPERTIES TIMEOUT 60)
+        usb_aoa_probe usb_aoa_probe_absent_json usb_aoa_probe_hostile_port
+        usb_aoa_probe_timeout_parse PROPERTIES TIMEOUT 60)
 endif()
 
 foreach(target IN LISTS AA_USB_AOA_WARN_TARGETS)

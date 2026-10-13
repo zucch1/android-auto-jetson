@@ -2,9 +2,13 @@
 // Wired identity and trust-gate tests (task 28). AOA enumeration success is
 // NEVER trust: the pipeline captures the phone's pre-switch and accessory-mode
 // descriptor identities and releases an endpoint only for an admitted record.
-// The unknown-device case runs as a synthetic unit fixture (only one physical
-// phone exists; the real-device unknown-phone claim is WITHDRAWN in the task
-// evidence) and must fail closed with transport_unauthorized_peer.
+// The unknown-device case runs as a synthetic unit fixture (the second physical
+// device exists but is not connected; its real-device round is pending) and
+// must fail closed with transport_unauthorized_peer.
+//
+// Gate P1-1: connect_aoa destroys its owned factory when the pipeline fails,
+// so every assertion here reads the test-owned shared LinkState - never a
+// fixture object that the pipeline may have destroyed.
 
 #include "../src/transport/usb_adapter/UsbAoaEndpoint.hpp"
 
@@ -91,13 +95,13 @@ aa::trust::PhoneIdentity phone_of(const aa::trust::WiredIdentity &identity) {
 TEST(UsbAoaIdentity, ApprovedPhoneIsAdmittedAndWiredIntoLifecycle) {
     MapTrustStore store;
     ASSERT_TRUE(store.approve_once(phone_of(approved_record())).has_value());
-    auto factory = std::make_unique<fx::FakeLinkFactory>();
-    fx::FakeLinkFactory *raw = factory.get();
+    auto state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(state);
 
     auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
                                 tr::AoaAccessoryInfo{}, tr::admit_via(store));
     ASSERT_TRUE(link.has_value());
-    EXPECT_EQ(raw->switch_calls, 1);
+    EXPECT_EQ(state->switches(), 1);
     EXPECT_TRUE(link.value().switch_report.started);
     EXPECT_EQ(link.value().pre_switch.vendor_id, 0x04E8);
     EXPECT_EQ(link.value().post_switch.vendor_id, 0x18D1);
@@ -119,19 +123,20 @@ TEST(UsbAoaIdentity, UnknownPhoneIsRejectedAfterSuccessfulAoaSwitch) {
     // Synthetic unapproved device: different USB ids AND different serial.
     MapTrustStore store;
     ASSERT_TRUE(store.approve_once(phone_of(approved_record())).has_value());
-    auto factory = std::make_unique<fx::FakeLinkFactory>();
+    auto state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(state);
     factory->phone.product_id = 0x9999;
     factory->phone.serial = "TEST-SERIAL-OTHER";
     factory->phone.manufacturer = "OTHER";
     factory->phone.product = "OTHER_Model";
-    fx::FakeLinkFactory *raw = factory.get();
 
     auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
                                 tr::AoaAccessoryInfo{}, tr::admit_via(store));
 
-    // The AOA switch still succeeded - success is never trust.
-    EXPECT_EQ(raw->switch_calls, 1);
-    EXPECT_TRUE(raw->control.calls.size() >= 8u);
+    // The AOA switch still succeeded - success is never trust. Observations
+    // come from the test-owned block: the pipeline destroyed its factory here.
+    EXPECT_EQ(state->switches(), 1);
+    EXPECT_GE(state->calls().size(), 8u);
     ASSERT_FALSE(link.has_value());
     EXPECT_EQ(link.error().code(), ErrorCode::transport_unauthorized_peer);
 }
@@ -139,13 +144,16 @@ TEST(UsbAoaIdentity, UnknownPhoneIsRejectedAfterSuccessfulAoaSwitch) {
 TEST(UsbAoaIdentity, RejectedPhoneStaysUntrusted) {
     MapTrustStore store;
     store.set(phone_of(approved_record()), aa::trust::Decision::rejected);
-    auto factory = std::make_unique<fx::FakeLinkFactory>();
+    auto state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(state);
 
     auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
                                 tr::AoaAccessoryInfo{}, tr::admit_via(store));
 
     ASSERT_FALSE(link.has_value());
     EXPECT_EQ(link.error().code(), ErrorCode::transport_unauthorized_peer);
+    EXPECT_EQ(state->switches(), 1);
+    EXPECT_EQ(state->claims(), 1);
 }
 
 TEST(UsbAoaIdentity, ForgettingThePhoneBlocksReconnect) {
@@ -153,13 +161,15 @@ TEST(UsbAoaIdentity, ForgettingThePhoneBlocksReconnect) {
     const auto record = approved_record();
     ASSERT_TRUE(store.approve_once(phone_of(record)).has_value());
     {
-        auto factory = std::make_unique<fx::FakeLinkFactory>();
+        auto state = std::make_shared<fx::LinkState>();
+        auto factory = std::make_unique<fx::FakeLinkFactory>(state);
         ASSERT_TRUE(ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
                                     tr::AoaAccessoryInfo{}, tr::admit_via(store))
                         .has_value());
     }
     ASSERT_TRUE(store.forget(phone_of(record)).has_value());
-    auto factory = std::make_unique<fx::FakeLinkFactory>();
+    auto state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(state);
     auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
                                 tr::AoaAccessoryInfo{}, tr::admit_via(store));
     ASSERT_FALSE(link.has_value());
@@ -170,7 +180,8 @@ TEST(UsbAoaIdentity, OverlongDeviceTextFailsClosed) {
     // Untrusted external text (class untrusted_external_text): a device-supplied
     // field beyond the identity budget must fail closed - no overflow, no admit.
     MapTrustStore store;
-    auto factory = std::make_unique<fx::FakeLinkFactory>();
+    auto state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(state);
     factory->phone.serial = std::string(aa::trust::kMaxIdentityFieldBytes + 1, 'S');
 
     auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
@@ -182,7 +193,8 @@ TEST(UsbAoaIdentity, OverlongDeviceTextFailsClosed) {
 
 TEST(UsbAoaIdentity, NonPrintableDeviceTextFailsClosed) {
     MapTrustStore store;
-    auto factory = std::make_unique<fx::FakeLinkFactory>();
+    auto state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(state);
     factory->accessory.serial = std::string("BAD\x01SERIAL");
 
     auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
@@ -203,7 +215,8 @@ TEST(UsbAoaIdentity, SelectorRejectsTraversalAndHostPaths) {
     for (const std::string &port :
          {std::string{"1-2.1/../../etc"}, std::string{"/dev/bus/usb"}, std::string{""},
           std::string{"1-"}, std::string{"abc"}, std::string{"1-2.1."}, std::string{"1-2.1;"}}) {
-        auto factory = std::make_unique<fx::FakeLinkFactory>();
+        auto state = std::make_shared<fx::LinkState>();
+        auto factory = std::make_unique<fx::FakeLinkFactory>(state);
         auto made = ua::UsbAoaEndpoint::make(std::move(factory), tr::UsbDeviceSelector{port},
                                              tr::AoaAccessoryInfo{}, admit_all());
         ASSERT_TRUE(made.has_value());
@@ -216,9 +229,11 @@ TEST(UsbAoaIdentity, SelectorRejectsTraversalAndHostPaths) {
 }
 
 TEST(UsbAoaIdentity, MissingAdmissionFailsClosed) {
-    auto factory = std::make_unique<fx::FakeLinkFactory>();
+    auto state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(state);
     auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
                                 tr::AoaAccessoryInfo{}, nullptr);
     ASSERT_FALSE(link.has_value());
     EXPECT_EQ(link.error().code(), ErrorCode::transport_unauthorized_peer);
+    EXPECT_EQ(state->switches(), 1);
 }

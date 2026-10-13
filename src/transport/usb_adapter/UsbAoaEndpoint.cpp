@@ -72,6 +72,12 @@ core::Result<std::size_t> UsbAoaEndpoint::read(std::span<std::byte> buffer,
     if (buffer.empty()) {
         return std::size_t{0};
     }
+    // Gate P2-4 read audit: unlike write, a zero-progress IN timeout is the
+    // NORMAL quiet-channel case (waiting for the phone), so it must NOT count
+    // toward a stall bound - a bound here would fail healthy idle channels and
+    // race the cancellation contract. This wait is interruptible and its bound
+    // is the cancellation token (ByteEndpoint.hpp), one kBulkTransferTimeoutMs
+    // slice at a time; write carries the zero-progress stall bound instead.
     for (;;) {
         if (token.stop_requested()) {
             close();
@@ -96,6 +102,12 @@ core::Result<std::size_t> UsbAoaEndpoint::write(std::span<const std::byte> data,
     if (data.empty()) {
         return std::size_t{0};
     }
+    // Bounded stall policy (gate P2-4): each bulk attempt is already bounded by
+    // kBulkTransferTimeoutMs; three consecutive zero-progress attempts mean the
+    // OUT pipe is stuck and end in a typed transport_io failure instead of an
+    // indefinite retry. Any failure terminally closes the endpoint.
+    constexpr int kMaxZeroProgressWrites = 3;
+    int zero_progress = 0;
     for (;;) {
         if (token.stop_requested()) {
             close();
@@ -108,6 +120,10 @@ core::Result<std::size_t> UsbAoaEndpoint::write(std::span<const std::byte> data,
         }
         if (count.value() > 0) {
             return count.value();
+        }
+        if (++zero_progress >= kMaxZeroProgressWrites) {
+            close();
+            return Error{ErrorCode::transport_io};
         }
     }
 }

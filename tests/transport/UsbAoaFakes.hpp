@@ -6,6 +6,13 @@
 // so the real switch algorithm, connection pipeline and endpoint are exercised
 // without hardware: device-supplied text, hotplug detach, timeouts and
 // cancellation are all scriptable.
+//
+// LIFETIME (gate P1-1): every observation an assertion reads lives in a
+// test-owned shared block (LinkState / PipeState) that OUTLIVES the fakes.
+// The connection pipeline owns and may destroy its factory/pipe before
+// returning; assertions after any API call read only the shared block, so no
+// test can dereference freed fixture memory. Pipe/factory objects remain for
+// DRIVING (push_in/detach/knobs) strictly while their owner is alive.
 
 #include "../../src/transport/usb_adapter/UsbAoaDevice.hpp"
 #include "../../src/transport/usb_adapter/UsbAoaSwitch.hpp"
@@ -29,17 +36,74 @@ namespace aa::test::usb_aoa {
 
 namespace ua = aa::transport::usb_adapter;
 
+// One scripted control-channel call record.
+struct ControlCall final {
+    std::uint8_t request{};
+    std::uint16_t value{};
+    std::uint16_t index{};
+    std::size_t length{};
+};
+
+// Test-owned per-pipe observations. Mirrors exactly what an assertion needs
+// after the endpoint (and with it the pipe) may have been destroyed.
+struct PipeState final {
+    mutable std::mutex mutex{};
+    std::vector<std::byte> out{};
+    std::atomic<int> reads_started{0};
+    std::atomic<int> writes_started{0};
+    bool detached{false};
+    bool closed{false};
+
+    [[nodiscard]] std::vector<std::byte> out_bytes() const {
+        std::lock_guard lock(mutex);
+        return out;
+    }
+    [[nodiscard]] std::size_t out_size() const {
+        std::lock_guard lock(mutex);
+        return out.size();
+    }
+};
+
+// Test-owned link observations shared by the control channel and the factory.
+struct LinkState final {
+    mutable std::mutex mutex{};
+    int switch_calls{0};
+    int claim_calls{0};
+    std::string captured_port{};
+    std::vector<ControlCall> control_calls{};
+    std::vector<std::byte> last_control_out{};
+    std::vector<std::shared_ptr<PipeState>> pipes{};
+
+    [[nodiscard]] int switches() const {
+        std::lock_guard lock(mutex);
+        return switch_calls;
+    }
+    [[nodiscard]] int claims() const {
+        std::lock_guard lock(mutex);
+        return claim_calls;
+    }
+    [[nodiscard]] std::string port() const {
+        std::lock_guard lock(mutex);
+        return captured_port;
+    }
+    [[nodiscard]] std::vector<ControlCall> calls() const {
+        std::lock_guard lock(mutex);
+        return control_calls;
+    }
+    [[nodiscard]] std::shared_ptr<PipeState> pipe_state(std::size_t index = 0) const {
+        std::lock_guard lock(mutex);
+        return index < pipes.size() ? pipes[index] : nullptr;
+    }
+};
+
 // Scripted AOA control channel. Defaults reproduce the reference probe's
 // contract: GET_PROTOCOL 2 bytes version 2, every SEND_STRING acked at full
-// length, START returns 0. Each knob corrupts one contract point.
+// length, START returns 0. Each knob corrupts one contract point. Call records
+// land in the shared LinkState.
 class FakeControlChannel final : public ua::AoaControlChannel {
   public:
-    struct Call final {
-        std::uint8_t request{};
-        std::uint16_t value{};
-        std::uint16_t index{};
-        std::size_t length{};
-    };
+    explicit FakeControlChannel(std::shared_ptr<LinkState> state = std::make_shared<LinkState>())
+        : state_(std::move(state)) {}
 
     std::size_t protocol_length{2};
     std::uint16_t protocol_version{2};
@@ -48,13 +112,13 @@ class FakeControlChannel final : public ua::AoaControlChannel {
     bool fail_control_in{false};
     bool fail_control_out{false};
     Error fail_error{ErrorCode::transport_io};
-    std::vector<Call> calls{};
-    std::vector<std::byte> last_out_payload{};
+
+    [[nodiscard]] std::shared_ptr<LinkState> state() const noexcept { return state_; }
 
     core::Result<std::vector<std::byte>> control_in(std::uint8_t request, std::uint16_t value,
                                                     std::uint16_t index,
                                                     std::uint16_t length) override {
-        calls.push_back(Call{request, value, index, length});
+        record(ControlCall{request, value, index, length});
         if (fail_control_in) {
             return fail_error;
         }
@@ -69,8 +133,11 @@ class FakeControlChannel final : public ua::AoaControlChannel {
     core::Result<std::size_t> control_out(std::uint8_t request, std::uint16_t value,
                                           std::uint16_t index,
                                           std::span<const std::byte> payload) override {
-        calls.push_back(Call{request, value, index, payload.size()});
-        last_out_payload.assign(payload.begin(), payload.end());
+        record(ControlCall{request, value, index, payload.size()});
+        {
+            std::lock_guard lock(state_->mutex);
+            state_->last_control_out.assign(payload.begin(), payload.end());
+        }
         if (fail_control_out) {
             return fail_error;
         }
@@ -82,14 +149,36 @@ class FakeControlChannel final : public ua::AoaControlChannel {
         }
         return payload.size() - send_string_short_by;
     }
+
+  private:
+    void record(const ControlCall &call) {
+        std::lock_guard lock(state_->mutex);
+        state_->control_calls.push_back(call);
+    }
+
+    std::shared_ptr<LinkState> state_;
 };
 
-// Scripted accessory bulk pipe. `push_in` plays the phone; `out()` captures what
-// the receiver sent. `detach()` models hotplug: later transfers fail typed.
+// Scripted accessory bulk pipe. `push_in` plays the phone; observed outbound
+// bytes land in the shared PipeState. `detach()` models hotplug: later
+// transfers fail typed. `zero_progress_writes` makes write() report a bounded
+// timeout with no progress (gate P2-4); `zero_progress_reads` does the same
+// for read() so its retry policy can be exercised; `block_writes` holds write()
+// inside the pipe's wait (kernel futex) until release/detach/close or the
+// caller's timeout, so cancellation can be proven IN FLIGHT on the OUT path.
 class FakeBulkPipe final : public ua::UsbBulkPipe {
   public:
+    explicit FakeBulkPipe(std::shared_ptr<PipeState> state = std::make_shared<PipeState>())
+        : state_(std::move(state)) {}
+
+    int zero_progress_writes{0};
+    int zero_progress_reads{0};
+    bool block_writes{false};
+
+    [[nodiscard]] std::shared_ptr<PipeState> state() const noexcept { return state_; }
+
     core::Result<std::size_t> read(std::span<std::byte> buffer, unsigned timeout_ms) override {
-        ++reads_started;
+        ++state_->reads_started;
         std::unique_lock lock(mutex_);
         cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
                      [this] { return !in_.empty() || detached_ || closed_; });
@@ -108,21 +197,51 @@ class FakeBulkPipe final : public ua::UsbBulkPipe {
     }
 
     core::Result<std::size_t> write(std::span<const std::byte> data, unsigned timeout_ms) override {
-        (void)timeout_ms;
-        std::lock_guard lock(mutex_);
+        if (zero_progress_writes > 0) {
+            --zero_progress_writes;
+            std::lock_guard lock(mutex_);
+            if (detached_ || closed_) {
+                return Error{ErrorCode::transport_closed};
+            }
+            return std::size_t{0};
+        }
+        std::unique_lock lock(mutex_);
+        if (block_writes) {
+            cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                         [this] { return !block_writes || detached_ || closed_; });
+            if (detached_ || closed_) {
+                return Error{ErrorCode::transport_closed};
+            }
+            // Still held at the bounded timeout: no progress, as a stalled OUT.
+            return std::size_t{0};
+        }
         if (detached_ || closed_) {
             return Error{ErrorCode::transport_closed};
         }
+        ++state_->writes_started;
         if (data.empty()) {
             return std::size_t{0};
         }
-        out_.insert(out_.end(), data.begin(), data.end());
+        {
+            std::lock_guard observed(state_->mutex);
+            state_->out.insert(state_->out.end(), data.begin(), data.end());
+        }
         return data.size();
+    }
+
+    void release_writes() {
+        std::lock_guard lock(mutex_);
+        block_writes = false;
+        cv_.notify_all();
     }
 
     void close() noexcept override {
         std::lock_guard lock(mutex_);
         closed_ = true;
+        {
+            std::lock_guard observed(state_->mutex);
+            state_->closed = true;
+        }
         cv_.notify_all();
     }
 
@@ -135,58 +254,60 @@ class FakeBulkPipe final : public ua::UsbBulkPipe {
     void detach() {
         std::lock_guard lock(mutex_);
         detached_ = true;
+        {
+            std::lock_guard observed(state_->mutex);
+            state_->detached = true;
+        }
         cv_.notify_all();
     }
 
-    [[nodiscard]] std::vector<std::byte> out() const {
-        std::lock_guard lock(mutex_);
-        return out_;
-    }
-
-    [[nodiscard]] std::size_t out_size() const {
-        std::lock_guard lock(mutex_);
-        return out_.size();
-    }
-
-    [[nodiscard]] int reads() const noexcept { return reads_started.load(); }
-
   private:
-    mutable std::mutex mutex_{};
+    std::shared_ptr<PipeState> state_;
+    std::mutex mutex_{};
     std::condition_variable cv_{};
     std::deque<std::byte> in_{};
-    std::vector<std::byte> out_{};
     bool detached_{false};
     bool closed_{false};
-    std::atomic<int> reads_started{0};
 };
 
 // Device fixture around the connection pipeline: phone-mode and accessory-mode
 // descriptor snapshots, a scripted control channel fed through the REAL switch
-// algorithm, and a fresh bulk pipe per claim (fresh discovery semantics).
+// algorithm, and a fresh bulk pipe per claim (fresh discovery semantics). All
+// observations land in the test-owned `state`.
 class FakeLinkFactory final : public ua::AoaLinkFactory {
   public:
+    explicit FakeLinkFactory(std::shared_ptr<LinkState> state = std::make_shared<LinkState>())
+        : state_(std::move(state)), control_(state_) {}
+
     aa::transport::UsbDeviceSnapshot phone{
         1, 7, 0x04E8, 0x6860, "TEST-SERIAL-001", "SAMSUNG", "SAMSUNG_Android"};
     aa::transport::UsbDeviceSnapshot accessory{
         1, 8, 0x18D1, 0x2D00, "TEST-SERIAL-001", "SAMSUNG", "SAMSUNG_Android"};
-    FakeControlChannel control{};
     bool fail_switch{false};
     Error switch_error{ErrorCode::transport_unavailable};
     bool fail_claim{false};
     Error claim_error{ErrorCode::timeout};
-    int switch_calls{0};
-    int claim_calls{0};
-    // Non-owning observers: each claimed pipe is OWNED by the endpoint; tests
-    // inspect it only while that endpoint is alive.
-    std::vector<FakeBulkPipe *> pipes{};
-    std::string captured_port{};
+    int zero_progress_writes{0};
+    int zero_progress_reads{0};
+
+    FakeControlChannel &control() noexcept { return control_; }
+    [[nodiscard]] std::shared_ptr<LinkState> state() const noexcept { return state_; }
+
+    // Driving access to the most recent pipe while its owner is still alive.
+    [[nodiscard]] FakeBulkPipe *pipe(std::size_t index = 0) const {
+        std::lock_guard lock(driving_mutex_);
+        return index < driving_.size() ? driving_[index] : nullptr;
+    }
 
     core::Result<void> switch_to_accessory(const aa::transport::UsbDeviceSelector &selector,
                                            const aa::transport::AoaAccessoryInfo &info,
                                            aa::transport::UsbDeviceSnapshot &pre_switch,
                                            aa::transport::AoaSwitchReport &switch_report) override {
-        ++switch_calls;
-        captured_port = selector.port_context;
+        {
+            std::lock_guard lock(state_->mutex);
+            ++state_->switch_calls;
+            state_->captured_port = selector.port_context;
+        }
         if (selector.product_id != 0 && selector.product_id != phone.product_id) {
             return Error{ErrorCode::transport_unavailable};
         }
@@ -194,26 +315,41 @@ class FakeLinkFactory final : public ua::AoaLinkFactory {
             return switch_error;
         }
         pre_switch = phone;
-        return ua::run_aoa_switch(control, info, switch_report);
+        return ua::run_aoa_switch(control_, info, switch_report);
     }
 
     core::Result<std::unique_ptr<ua::UsbBulkPipe>>
     claim_accessory(const aa::transport::UsbDeviceSelector &selector,
                     aa::transport::UsbDeviceSnapshot &post_switch) override {
-        ++claim_calls;
         (void)selector;
+        {
+            std::lock_guard lock(state_->mutex);
+            ++state_->claim_calls;
+        }
         if (fail_claim) {
             return claim_error;
         }
         post_switch = accessory;
-        auto pipe = std::make_unique<FakeBulkPipe>();
-        pipes.push_back(pipe.get());
+        auto pipe_state = std::make_shared<PipeState>();
+        {
+            std::lock_guard lock(state_->mutex);
+            state_->pipes.push_back(pipe_state);
+        }
+        auto pipe = std::make_unique<FakeBulkPipe>(pipe_state);
+        pipe->zero_progress_writes = zero_progress_writes;
+        pipe->zero_progress_reads = zero_progress_reads;
+        {
+            std::lock_guard lock(driving_mutex_);
+            driving_.push_back(pipe.get());
+        }
         return std::unique_ptr<ua::UsbBulkPipe>(std::move(pipe));
     }
 
-    [[nodiscard]] FakeBulkPipe *pipe(std::size_t index = 0) const {
-        return index < pipes.size() ? pipes[index] : nullptr;
-    }
+  private:
+    std::shared_ptr<LinkState> state_;
+    FakeControlChannel control_;
+    mutable std::mutex driving_mutex_{};
+    std::vector<FakeBulkPipe *> driving_{};
 };
 
 } // namespace aa::test::usb_aoa
