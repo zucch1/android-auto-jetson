@@ -68,6 +68,11 @@ case "$cmd" in
     *pgrep*aa-wired-receiver*) [ "${FAKE_RECV_ALIVE:-0}" = "1" ] && echo alive || echo gone; exit 0 ;;
     *pgrep*aa-dummy-display*) [ "${FAKE_DISP_ALIVE:-0}" = "1" ] && echo alive || echo gone; exit 0 ;;
     *pkill*) exit 0 ;;
+    *nohup*--test-only-autostart*)
+        case "$cmd" in
+            *--test-only-control-stdin*) echo 4242; exit 0 ;;
+            *) echo "fake-ssh: display started without --test-only-control-stdin" >&2; exit 97 ;;
+        esac ;;
     *nohup*) echo 4242; exit 0 ;;
     *'"event":"status"'*) printf '%s' "${FAKE_DISPLAY_STATUS:-{\"event\":\"status\",\"frames_painted\":0,\"render_ok\":false}}"; exit 0 ;;
     *media_timing*) [ "${FAKE_MEDIA_TIMING:-0}" = "1" ] && exit 0 || exit 1 ;;
@@ -243,6 +248,14 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertEqual(code, 0, doc)
         self.assertIn("UNMEASURED", doc["budget_note"])
         self.assertIn("bounded wait", doc["budget_note"])
+
+    def test_display_started_with_real_test_control_flag(self):
+        status = '{"event":"status","frames_painted":3,"render_ok":true}'
+        code, doc = self.run_qa(
+            ["--only", "consumer_restart"],
+            FAKE_STATE='string "projecting"', FAKE_DISP_ALIVE="0",
+            FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
+        self.assertEqual(code, 0, doc)
 
 
 if __name__ == "__main__":

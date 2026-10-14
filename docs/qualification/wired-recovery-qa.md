@@ -97,6 +97,10 @@ normal operation.
 
 ## Named limitations
 
+- **No outer receiver recovery loop (task 41)**: `tools/wired-receiver` relinks
+  on its session thread but has no supervisor restart loop yet. A full
+  `receiver_restart` cycle (kill the process, come back, re-project) may record
+  `FAILED` against today's binary - the harness fails closed and never masks it.
 - **Single-shot relink** (plan scenarios `usb_unplug_replug`, `phone_aa_restart`
   and `phone_lock_unlock`): each of these scenarios exercises exactly ONE
   relink cycle. The receiver's recovery path (`tools/wired-receiver/main.cpp`,

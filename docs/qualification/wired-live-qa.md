@@ -79,14 +79,19 @@ and audio activity; a green smoke without those observables is never a pass.
 
 - `projection_reached`: `busctl --user call org.custom.AndroidAutoReceiver
   /org/custom/AndroidAutoReceiver org.custom.AndroidAutoReceiver1 GetState`
-  reports `projecting`.
-- `video_present`: the receiver log carries `video_sent` events (units crossed
-  the task-22 channel) and the dummy display presents frames (task-23 decode
-  helper output).
-- `audio_present`: the receiver log carries `audio_chunks` events (task-25
-  router writes to the current HDMI/DP PipeWire sink).
-- `input_evidence`: the receiver log carries `input_forwarded` events (task-26
-  capability-gated display input sent to the phone's input channel).
+  reports `projecting`. This is a consumer-admission signal ONLY - it does not
+  prove phone media delivery, and `projecting` with no observed media is
+  NON-PASS.
+- `video_present`: BOTH the receiver log's `video_sent` events (units crossed
+  the task-22 channel) AND painted frames on the dummy display (`frames_painted`
+  > 0 with `render_ok` from the shipped test-only status channel,
+  `tools/dummy-display/test_control.hpp`). `video_sent` alone only proves units
+  crossed the channel, not that anything painted.
+- `audio_present`: a `media_timing` record from the receiver log - it is
+  emitted ONLY after `router_.pump()` succeeds. The `audio_chunks` event is
+  logged BEFORE the pump call and proves nothing about the sink write.
+- `input_evidence`: an `input_forwarded` record with `"ok":"true"`. The bare
+  event is not proof of delivery (`"ok":"false"` means the send failed).
 - `startup_budget_ms`: the receiver's `active` event value (session start ->
   active projection wall time), compared against the wired reconnect/startup
   budgets.
