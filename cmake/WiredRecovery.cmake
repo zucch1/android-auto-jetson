@@ -64,11 +64,14 @@ if(NOT CMAKE_CROSSCOMPILING)
         COMMAND aa_wired_recovery_test --gtest_filter=WiredRecoveryPhoneLockUnlock.*)
     add_test(NAME wired_recovery_real_clock
         COMMAND aa_wired_recovery_test --gtest_filter=WiredRecoveryRealClock.*)
+    add_test(NAME wired_recovery_qa_gates COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/wired_e2e/test_recovery_qa_gates.py"
+        "${CMAKE_SOURCE_DIR}/tools/wired-qa/run-wired-recovery-qa.sh")
     set_tests_properties(
         wired_recovery_unplug_replug wired_recovery_receiver_restart
         wired_recovery_consumer_restart wired_recovery_malformed
         wired_recovery_unknown_phone wired_recovery_lock_unlock
-        wired_recovery_real_clock
+        wired_recovery_real_clock wired_recovery_qa_gates
         PROPERTIES TIMEOUT 120)
 endif()
 
