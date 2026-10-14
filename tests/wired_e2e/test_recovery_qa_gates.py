@@ -331,6 +331,20 @@ class RecoveryQaGates(unittest.TestCase):
             FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
         self.assertEqual(code, 0, doc)
 
+    def test_receiver_restart_media_window_covers_fresh_log(self):
+        status = '{"event":"status","frames_painted":3,"render_ok":true}'
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            code, doc = self.run_qa(
+                ["--only", "receiver_restart"],
+                FAKE_STATE='string "projecting"', FAKE_RECV_ALIVE="0",
+                FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
+                FAKE_LOG_SIZE="4096", FAKE_SSH_LOG=str(log))
+            self.assertEqual(code, 0, doc)
+            logged = log.read_text(encoding="utf-8")
+            self.assertIn("tail -c +1 /tmp/aa-wired-receiver.log", logged)
+            self.assertNotIn("tail -c +4097", logged)
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

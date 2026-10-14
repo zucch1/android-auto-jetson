@@ -335,8 +335,12 @@ scenario_receiver_restart() {
     fi
     wait_not_projecting 3000 || true
     t0=$(date +%s%3N)
-    offset="$(log_offset)"
     start_receiver || { record receiver_restart FAILED "" "" "" "restart_failed"; return; }
+    # start_receiver launches with `> /tmp/aa-wired-receiver.log` (truncate):
+    # the pre-restart offset points past EOF in the fresh log and would miss
+    # genuine post-recovery media. The evidence window is the fresh log from
+    # byte 0 (N4).
+    offset=0
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
         if ! remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log 2>/dev/null && echo ok" >/dev/null 2>&1; then
