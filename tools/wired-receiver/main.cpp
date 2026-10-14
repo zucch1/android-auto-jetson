@@ -36,6 +36,7 @@
 #include <aa/protocol/Protocol.hpp>
 #include <aa/session/Events.hpp>
 #include <aa/session/Session.hpp>
+#include <aa/transport/TlsTransport.hpp>
 #include <aa/trust/Store.hpp>
 
 #include <atomic>
@@ -362,15 +363,25 @@ int main(int argc, char **argv) {
     selector.port_context = port;
     aa::transport::AoaAccessoryInfo accessory{};
     log_line("{\"event\":\"connecting\",\"port\":\"" + port + "\"}");
-    auto link = aa::app::open_wired_link(selector, accessory, store);
-    if (!link.has_value()) {
+    auto first_link = aa::app::open_wired_link(selector, accessory, store);
+    if (!first_link.has_value()) {
         log_line(std::string{"{\"event\":\"err\",\"detail\":\"link\",\"code\":\""} +
-                 std::string{aa::to_string(link.error().code())} + "\"}");
+                 std::string{aa::to_string(first_link.error().code())} + "\"}");
         return 3;
     }
-    session.attach_transport(link.value().transport.get());
+    std::optional<aa::app::WiredLink> link{std::move(first_link.value())};
+    session.attach_transport(link->transport.get());
+    const auto admitted_phone = link->phone;
+    auto cipher = aa::transport::make_server_handshake_cipher([&store, admitted_phone] {
+        return store.lookup(admitted_phone) == aa::trust::Decision::approved;
+    });
+    if (!cipher) {
+        log_line("{\"event\":\"err\",\"detail\":\"tls_cipher\"}");
+        return 3;
+    }
+    session.attach_cipher(std::move(cipher));
     if (!session.apply(aa::session::Event::start_discovery).has_value() ||
-        !session.phone_discovered(link.value().phone).has_value() ||
+        !session.phone_discovered(link->phone).has_value() ||
         !session.apply(aa::session::Event::transport_ready).has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"lifecycle\"}");
         return 1;
@@ -389,6 +400,7 @@ int main(int argc, char **argv) {
         while (g_running.load()) {
             {
                 std::lock_guard lock(session_mutex);
+                session.tick();
                 while (auto event = input_queue.pop()) {
                     const auto outcome = session.submit_input(*event);
                     log_line(std::string{"{\"event\":\"input_forwarded\",\"ok\":\""} +
@@ -399,8 +411,27 @@ int main(int argc, char **argv) {
             {
                 std::lock_guard lock(session_mutex);
                 if (!polled.has_value()) {
+                    const auto code = polled.error().code();
+                    if (code == aa::ErrorCode::timeout) {
+                        continue;
+                    }
+                    if (code == aa::ErrorCode::cancelled || !g_running.load()) {
+                        break;
+                    }
                     log_line(std::string{"{\"event\":\"err\",\"detail\":\"poll\",\"code\":\""} +
-                             std::string{aa::to_string(polled.error().code())} + "\"}");
+                             std::string{aa::to_string(code)} + "\"}");
+                    (void)session.apply(aa::session::Event::link_lost);
+                    auto relink = aa::app::open_wired_link(selector, accessory, store);
+                    if (relink.has_value()) {
+                        link.emplace(std::move(relink.value()));
+                        session.attach_transport(link->transport.get());
+                        if (session.apply(aa::session::Event::reconnect).has_value() &&
+                            session.apply(aa::session::Event::transport_ready).has_value() &&
+                            session.send_version_request(1, 6).has_value()) {
+                            continue;
+                        }
+                    }
+                    (void)session.fail(aa::Error{aa::ErrorCode::transport_io});
                     break;
                 }
                 if (session.state() == aa::session::State::negotiating &&
@@ -417,6 +448,8 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        std::lock_guard lock(session_mutex);
+        session.tick();
     });
 
     std::thread input_thread([&] {

@@ -92,7 +92,8 @@ fi
 
 # ---- 2. read-only readiness checks ----
 phone_id="$(remote "cat /sys/bus/usb/devices/${PORT}/idVendor 2>/dev/null | tr -d '\n'; echo -n ':'; cat /sys/bus/usb/devices/${PORT}/idProduct 2>/dev/null | tr -d '\n'" || true)"
-display_status="$(remote "for c in /sys/class/drm/card*-DP-1/status /sys/class/drm/card*-HDMI-A-1/status; do [ -f \"\$c\" ] && { basename \"\$(dirname \"\$c\")\"; cat \"\$c\"; }; done | head -2" || true)"
+# DRM connector status tokens only (no card name): one word per connector.
+display_status="$(remote "for c in /sys/class/drm/card*-DP-1/status /sys/class/drm/card*-HDMI-A-1/status; do [ -f \"\$c\" ] && cat \"\$c\"; done" || true)"
 audio_sink="$(remote "command -v pactl >/dev/null 2>&1 && pactl list short sinks 2>/dev/null | head -1 || (command -v pw-cli >/dev/null 2>&1 && pw-cli ls Device 2>/dev/null | head -1)" || true)"
 policy="$(remote "test -f /etc/udev/rules.d/70-android-auto-receiver.rules && echo installed || echo absent" || true)"
 
@@ -108,7 +109,14 @@ if [[ "$policy" != "installed" ]]; then
     write_result "BLOCKED" "udev_policy_not_installed" "false" "false" "false" "false" "null"
     exit 3
 fi
-if [[ "$display_status" != *"connected"* ]]; then
+# Exact-token DRM status match: `disconnected` must NOT read as `connected`.
+display_connected="false"
+for token in $display_status; do
+    if [[ "$token" == "connected" ]]; then
+        display_connected="true"
+    fi
+done
+if [[ "$display_connected" != "true" ]]; then
     write_result "BLOCKED" "display_disconnected" "false" "false" "false" "false" "null"
     exit 3
 fi
@@ -147,8 +155,17 @@ while (( $(date +%s%3N) < deadline )); do
 done
 budget_ms=$(( $(date +%s%3N) - start_ms ))
 
-video="false"; audio="false"; input="false"
+# An ACTIVE phone session is a stronger claim than the D-Bus `projecting`
+# string (the control service can reach `projecting` before a phone session is
+# active). The receiver emits its `active` event only when the session state
+# machine reaches State::active, so that is the session-activation signal.
+session_active="false"
 if [[ "$projection" == "true" ]]; then
+    remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && session_active="true"
+fi
+
+video="false"; audio="false"; input="false"
+if [[ "$session_active" == "true" ]]; then
     remote "grep -q video_sent /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && video="true"
     remote "grep -q audio_chunks /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && audio="true"
     remote "grep -q input_forwarded /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && input="true"
@@ -157,8 +174,15 @@ fi
 # Best-effort bounded teardown.
 remote "kill \$(cat /tmp/aa-disp.pid) 2>/dev/null || true; kill \$(cat /tmp/aa-recv.pid) 2>/dev/null || true" || true
 
-if [[ "$projection" != "true" ]]; then
-    write_result "BLOCKED" "projection_not_reached_within_budget" "false" "$video" "$audio" "$input" "$budget_ms"
+# Verdict taxonomy: a missing prerequisite is BLOCKED; the session running but
+# failing to project / activate / deliver every observable is FAILED. PASS
+# requires an ACTIVE session AND all three delivery paths observed.
+if [[ "$projection" != "true" || "$session_active" != "true" ]]; then
+    write_result "FAILED" "session_not_active" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 4
+fi
+if [[ "$video" != "true" || "$audio" != "true" || "$input" != "true" ]]; then
+    write_result "FAILED" "observable_missing" "$projection" "$video" "$audio" "$input" "$budget_ms"
     exit 4
 fi
 write_result "PASS" "" "$projection" "$video" "$audio" "$input" "$budget_ms"
