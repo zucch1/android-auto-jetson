@@ -7,14 +7,23 @@
 //
 // Scenario driver (env, read per call so one process can switch per test):
 //   AA_FAKE_LIBUSB_SCENARIO  absent (default) | happy | stall |
-//                            claim-fail-pre | claim-fail-always | replacement
+//                            claim-fail-pre | claim-fail-always | replacement |
+//                            stuck-accessory | recovery-swap
 //   AA_FAKE_LIBUSB_LOG       call-log file path (appended), one call per line
 //
 // Device model: one device on port path "1-2.1" (bus 1). Phone mode is
 // 04e8:6860 with fixed strings; the AOA START control request re-enumerates it
 // as accessory 18d1:2d00 whose strings echo the SEND_STRING slots (as real AOA
 // accessory mode does). "replacement" is a non-matching gadget (1234:5678)
-// that must never be touched by a phone-id selector.
+// that must never be touched by a phone-id selector. "stuck-accessory" starts
+// the device already in accessory mode; a software reset returns it to phone
+// mode (the scenario then becomes "happy"). "recovery-swap" shows the
+// accessory-mode device only to the FIRST libusb session (the probe's recovery
+// observation) and becomes a replacement gadget afterwards - the probe's
+// recovery reset must never touch it. Each libusb session is a fresh dlopen,
+// so cross-session device transitions are encoded by REWRITING
+// AA_FAKE_LIBUSB_SCENARIO (process environment, survives dlclose) instead of
+// C++ globals, which would be destroyed with the library.
 
 #include "../../src/transport/usb_adapter/LibusbAbi.hpp"
 
@@ -23,6 +32,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <type_traits>
 
 namespace {
 
@@ -47,7 +57,16 @@ struct FakeHandle final {
     return value == nullptr ? "" : value;
 }
 
-enum class Scenario { absent, happy, stall, claim_fail_pre, claim_fail_always, replacement };
+enum class Scenario {
+    absent,
+    happy,
+    stall,
+    claim_fail_pre,
+    claim_fail_always,
+    replacement,
+    stuck_accessory,
+    recovery_swap
+};
 
 [[nodiscard]] Scenario scenario() {
     const std::string text{scenario_text()};
@@ -66,6 +85,12 @@ enum class Scenario { absent, happy, stall, claim_fail_pre, claim_fail_always, r
     if (text == "replacement") {
         return Scenario::replacement;
     }
+    if (text == "stuck-accessory") {
+        return Scenario::stuck_accessory;
+    }
+    if (text == "recovery-swap") {
+        return Scenario::recovery_swap;
+    }
     return Scenario::absent;
 }
 
@@ -82,6 +107,8 @@ void log_line(const char *line) {
     std::fputc('\n', out);
     std::fclose(out);
 }
+
+void become_scenario(const char *text) { ::setenv("AA_FAKE_LIBUSB_SCENARIO", text, 1); }
 
 void log_control(std::uint8_t request, std::uint16_t index) {
     char line[64] = {};
@@ -130,6 +157,55 @@ constexpr std::uint8_t kReplyFrame[] = {0x00, 0x03, 0x00, 0x06, 0x00, 0x02, 0x00
     return scenario() == Scenario::claim_fail_pre && mode == Mode::phone;
 }
 
+// Typed control-transfer implementation. The strong-enum parameters keep the
+// ABI layout identical to libusb's C signature while making a parameter swap a
+// type error (bugprone-easily-swappable-parameters); the C-ABI export below is
+// a thin, ABI-exact wrapper that forwards here.
+int control_transfer_typed(ua::LibusbDeviceHandle *handle, BmRequestType bm_request_type,
+                           BRequest b_request, WValue w_value, WIndex w_index, std::uint8_t *data,
+                           WLength w_length, TimeoutMs timeout_ms) {
+    const auto request_type = static_cast<std::uint8_t>(bm_request_type);
+    const auto request = static_cast<std::uint8_t>(b_request);
+    const auto value = static_cast<std::uint16_t>(w_value);
+    const auto index = static_cast<std::uint16_t>(w_index);
+    const auto length = static_cast<std::uint16_t>(w_length);
+    const unsigned timeout = static_cast<unsigned>(timeout_ms);
+    (void)handle;
+    (void)value;
+    (void)timeout;
+    log_control(request, index);
+    std::lock_guard lock(g_mutex);
+    if (scenario() == Scenario::replacement || scenario() == Scenario::absent) {
+        return ua::kLibusbErrorNotFound;
+    }
+    if (request_type == (ua::kUsbTypeVendor | ua::kUsbEndpointIn) && request == 51) {
+        if (length < 2) {
+            return ua::kLibusbErrorIo;
+        }
+        data[0] = 0x02;
+        data[1] = 0x00;
+        return 2;
+    }
+    if (request_type == ua::kUsbTypeVendor && request == 52) {
+        if (index < 6) {
+            std::size_t count = static_cast<std::size_t>(length) < 255
+                                    ? static_cast<std::size_t>(length)
+                                    : std::size_t{255};
+            while (count > 0 && data[count - 1] == 0) {
+                --count;
+            }
+            std::memcpy(g_slots[index], data, count);
+            g_slots[index][count] = '\0';
+        }
+        return static_cast<int>(length);
+    }
+    if (request_type == ua::kUsbTypeVendor && request == 53) {
+        g_mode = Mode::accessory;
+        return 0;
+    }
+    return ua::kLibusbErrorNotFound;
+}
+
 } // namespace
 
 extern "C" {
@@ -137,7 +213,9 @@ extern "C" {
 int libusb_init(ua::LibusbContext **ctx) {
     std::lock_guard lock(g_mutex);
     log_line("libusb_init");
-    g_mode = Mode::phone;
+    g_mode = (scenario() == Scenario::stuck_accessory || scenario() == Scenario::recovery_swap)
+                 ? Mode::accessory
+                 : Mode::phone;
     std::memset(g_slots, 0, sizeof(g_slots));
     *ctx = reinterpret_cast<ua::LibusbContext *>(&g_device_storage);
     return ua::kLibusbSuccess;
@@ -146,6 +224,9 @@ int libusb_init(ua::LibusbContext **ctx) {
 void libusb_exit(ua::LibusbContext *ctx) {
     (void)ctx;
     log_line("libusb_exit");
+    if (scenario() == Scenario::recovery_swap) {
+        become_scenario("replacement");
+    }
 }
 
 std::ptrdiff_t libusb_get_device_list(ua::LibusbContext *ctx, ua::LibusbDevice ***list) {
@@ -178,20 +259,15 @@ int libusb_get_device_descriptor(ua::LibusbDevice *dev, ua::LibusbDeviceDescript
     desc->iManufacturer = 1;
     desc->iProduct = 2;
     desc->iSerialNumber = 3;
-    switch (scenario()) {
-    case Scenario::replacement:
+    if (scenario() == Scenario::replacement) {
         desc->idVendor = 0x1234;
         desc->idProduct = 0x5678;
-        break;
-    default:
-        if (g_mode == Mode::accessory) {
-            desc->idVendor = 0x18D1;
-            desc->idProduct = 0x2D00;
-        } else {
-            desc->idVendor = 0x04E8;
-            desc->idProduct = 0x6860;
-        }
-        break;
+    } else if (g_mode == Mode::accessory) {
+        desc->idVendor = 0x18D1;
+        desc->idProduct = 0x2D00;
+    } else {
+        desc->idVendor = 0x04E8;
+        desc->idProduct = 0x6860;
     }
     return ua::kLibusbSuccess;
 }
@@ -318,50 +394,24 @@ int libusb_release_interface(ua::LibusbDeviceHandle *handle, int interface_numbe
     return ua::kLibusbSuccess;
 }
 
-int libusb_control_transfer(ua::LibusbDeviceHandle *handle, BmRequestType bm_request_type,
-                            BRequest b_request, WValue w_value, WIndex w_index, std::uint8_t *data,
-                            WLength w_length, TimeoutMs timeout_ms) {
-    const auto request_type = static_cast<std::uint8_t>(bm_request_type);
-    const auto request = static_cast<std::uint8_t>(b_request);
-    const auto value = static_cast<std::uint16_t>(w_value);
-    const auto index = static_cast<std::uint16_t>(w_index);
-    const auto length = static_cast<std::uint16_t>(w_length);
-    const unsigned timeout = static_cast<unsigned>(timeout_ms);
-    (void)handle;
-    (void)value;
-    (void)timeout;
-    log_control(request, index);
-    std::lock_guard lock(g_mutex);
-    if (scenario() == Scenario::replacement || scenario() == Scenario::absent) {
-        return ua::kLibusbErrorNotFound;
-    }
-    if (request_type == (ua::kUsbTypeVendor | ua::kUsbEndpointIn) && request == 51) {
-        if (length < 2) {
-            return ua::kLibusbErrorIo;
-        }
-        data[0] = 0x02;
-        data[1] = 0x00;
-        return 2;
-    }
-    if (request_type == ua::kUsbTypeVendor && request == 52) {
-        if (index < 6) {
-            std::size_t count = static_cast<std::size_t>(length) < 255
-                                    ? static_cast<std::size_t>(length)
-                                    : std::size_t{255};
-            while (count > 0 && data[count - 1] == 0) {
-                --count;
-            }
-            std::memcpy(g_slots[index], data, count);
-            g_slots[index][count] = '\0';
-        }
-        return static_cast<int>(length);
-    }
-    if (request_type == ua::kUsbTypeVendor && request == 53) {
-        g_mode = Mode::accessory;
-        return 0;
-    }
-    return ua::kLibusbErrorNotFound;
+// ABI-exact export (fix round P2-2): this symbol is dlsym'd into
+// LibusbApi::control_transfer and called THROUGH that function pointer, so the
+// signature must match LibusbAbi.hpp EXACTLY (std::uint8_t params) - a C++
+// function-type mismatch there is UB on every indirect call. The swap-proof
+// strong typing lives in control_transfer_typed above.
+int libusb_control_transfer(ua::LibusbDeviceHandle *handle, std::uint8_t request_type,
+                            std::uint8_t request, std::uint16_t value, std::uint16_t index,
+                            std::uint8_t *data, std::uint16_t length, unsigned timeout_ms) {
+    return control_transfer_typed(handle, BmRequestType{request_type}, BRequest{request},
+                                  WValue{value}, WIndex{index}, data, WLength{length},
+                                  TimeoutMs{timeout_ms});
 }
+
+// Compile-time ABI assignability: the exported symbol IS the exact function
+// type LibusbAbi.hpp resolves and calls through.
+static_assert(
+    std::is_same_v<decltype(&libusb_control_transfer), decltype(ua::LibusbApi::control_transfer)>,
+    "libusb_control_transfer must match the LibusbAbi.hpp function-pointer type");
 
 int libusb_bulk_transfer(ua::LibusbDeviceHandle *handle, std::uint8_t endpoint, std::uint8_t *data,
                          int length, int *transferred, unsigned timeout_ms) {
@@ -392,6 +442,12 @@ int libusb_bulk_transfer(ua::LibusbDeviceHandle *handle, std::uint8_t endpoint, 
 int libusb_reset_device(ua::LibusbDeviceHandle *handle) {
     (void)handle;
     log_line("libusb_reset_device");
+    std::lock_guard lock(g_mutex);
+    // A software reset re-enumerates the device in its default (phone) mode.
+    g_mode = Mode::phone;
+    if (scenario() == Scenario::stuck_accessory) {
+        become_scenario("happy");
+    }
     return ua::kLibusbSuccess;
 }
 

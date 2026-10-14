@@ -11,11 +11,14 @@ Every case runs the real probe binary with bounded time and asserts:
   - hostile port text is rejected at validation and never echoed unescaped,
   - timeout parse violations are controlled usage errors (exit 2), never SIGABRT,
   - connect/setup failures (including a rejected identity) exit 3, never 2,
-  - the read watchdog never delays a completed round-trip and still times out.
+  - the read watchdog never delays a completed round-trip and still times out,
+  - hostile argv BYTES never make the probe's stdout invalid JSON (fix P2-1),
+  - the recovery reset is pinned to the observed device identity (fix P3).
 
-Cases named in the ``setup_exit``/``watchdog`` groups need the fake libusb
-runtime (fake_libusb.cpp) as third argument and drive the probe against it via
-LD_LIBRARY_PATH - the probe's own dlopen path, no production seam involved.
+Cases named in the ``setup_exit``/``watchdog``/``recovery_reset`` groups need
+the fake libusb runtime (fake_libusb.cpp) as third argument and drive the probe
+against it via LD_LIBRARY_PATH - the probe's own dlopen path, no production
+seam involved.
 """
 import json
 import os
@@ -56,13 +59,16 @@ def fake_identity_file(directory: str, serial: str = "TEST-SERIAL-001") -> str:
     return str(path)
 
 
-def run_fake_probe(binary: str, fake: str, args: list[str], scenario: str):
+def run_fake_probe(binary: str, fake: str, args: list[str], scenario: str,
+                   log_path: str | None = None):
     fake_dir = str(Path(fake).parent)
     env = {
         **os.environ,
         "LD_LIBRARY_PATH": fake_dir + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
         "AA_FAKE_LIBUSB_SCENARIO": scenario,
     }
+    if log_path is not None:
+        env["AA_FAKE_LIBUSB_LOG"] = log_path
     start = time.monotonic()
     result = subprocess.run([binary, *args], capture_output=True, text=True,
                             timeout=TIMEOUT_S, env=env)
@@ -214,11 +220,105 @@ class Watchdog(unittest.TestCase):
         self.assertLess(elapsed_ms, 5000.0, f"stalled run took {elapsed_ms:.0f}ms")
 
 
+class HostileArgvBytes(unittest.TestCase):
+    """Fix P2-1: hostile argv bytes must never make the probe's stdout invalid JSON.
+
+    The unknown-argument usage error echoes the raw argv bytes through
+    json_string(); the document on stdout must stay parseable (json.loads)
+    for EVERY byte sequence argv can carry. NUL cannot ride argv (execve is
+    NUL-terminated); the NUL case is covered by the UsbAoaProbe gtest suite.
+    """
+
+    binary = ""
+
+    CASES = {
+        "raw_ff": b"\xff",
+        "raw_80": b"\x80",
+        "stray_continuation_bf": b"\xbf",
+        "truncated_2byte": b"\xe2\x82",
+        "truncated_4byte": b"\xf0\x9f\x98",
+        "overlong_2byte": b"\xc0\xaf",
+        "overlong_3byte": b"\xe0\x80\xaf",
+        "overlong_4byte": b"\xf0\x80\x80\xaf",
+        "surrogate_half": b"\xed\xa0\x80",
+        "past_u10ffff": b"\xf4\x90\x80\x80",
+        "never_lead_fe_ff": b"\xfe\xff",
+        "valid_utf8": "héllo € 日本 \U0001f600".encode(),
+        "quote_and_control": b"x\"y\x01z\\",
+        "mixed_hostile": b"a\xff" + "é".encode() + b"\x80",
+    }
+
+    def test_stdout_is_valid_json_for_every_hostile_argv(self):
+        for name, hostile in self.CASES.items():
+            with self.subTest(name=name):
+                result = subprocess.run([self.binary, hostile], capture_output=True,
+                                        timeout=TIMEOUT_S)
+                self.assertEqual(result.returncode, USAGE_EXIT,
+                                 result.stdout + result.stderr)
+                document = json.loads(result.stdout)
+                self.assertEqual(document["result"], "usage-error", name)
+
+    def test_valid_utf8_argv_round_trips_in_error_message(self):
+        hostile = "héllo € 日本 \U0001f600".encode()
+        result = subprocess.run([self.binary, hostile], capture_output=True, timeout=TIMEOUT_S)
+        self.assertEqual(result.returncode, USAGE_EXIT, result.stdout + result.stderr)
+        document = json.loads(result.stdout)
+        self.assertIn("héllo € 日本 \U0001f600", document["error"])
+
+
+class RecoveryReset(unittest.TestCase):
+    """Fix P3: the recovery reset must be pinned to the OBSERVED device identity.
+
+    Scenario recovery-swap: the probe's recovery observation sees an
+    accessory-mode device on the port; the device then becomes a replacement
+    gadget before the reset runs. The probe must NOT reset the replacement.
+    Scenario stuck-accessory: the observed device itself must still be reset
+    (guards against over-pinning) and the run must continue to a full pass.
+    """
+
+    binary = ""
+    fake = ""
+
+    def test_replacement_device_between_observe_and_reset_is_never_reset(self):
+        with TemporaryDirectory() as directory, TemporaryDirectory() as log_dir:
+            log = str(Path(log_dir) / "fake.log")
+            identity = fake_identity_file(directory)
+            result, elapsed_ms = run_fake_probe(self.binary, self.fake, [
+                "--port", "1-2.1", "--pre-vid", "04e8", "--pre-pid", "6860",
+                "--identity-file", identity, "--read-timeout-ms", "8000"],
+                scenario="recovery-swap", log_path=log)
+            self.assertEqual(result.returncode, SETUP_EXIT, result.stdout + result.stderr)
+            document = json.loads(result.stdout)
+            self.assertEqual(document["result"], "connect-failed")
+            self.assertEqual(document["recovery_reset_status"], "transport_unavailable")
+            log_body = Path(log).read_text()
+            self.assertNotIn("libusb_reset_device", log_body,
+                             "a replacement device must never be reset")
+            self.assertLess(elapsed_ms, 8000.0)
+
+    def test_observed_device_is_reset_and_run_continues(self):
+        with TemporaryDirectory() as directory, TemporaryDirectory() as log_dir:
+            log = str(Path(log_dir) / "fake.log")
+            identity = fake_identity_file(directory)
+            result, _ = run_fake_probe(self.binary, self.fake, [
+                "--port", "1-2.1", "--pre-vid", "04e8", "--pre-pid", "6860",
+                "--identity-file", identity, "--read-timeout-ms", "8000"],
+                scenario="stuck-accessory", log_path=log)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            document = json.loads(result.stdout)
+            self.assertEqual(document["recovery"], "reset-performed")
+            self.assertEqual(document["result"], "framed_transport_ready")
+            log_body = Path(log).read_text()
+            self.assertEqual(log_body.count("libusb_reset_device"), 1,
+                             "exactly the observed device must be reset")
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         raise SystemExit("usage: test_probe_binary.py <case> <probe-binary> [fake-libusb]")
     groups = {"absent_json": AbsentJson, "hostile_port": HostilePort, "timeout_parse": TimeoutParse,
-              "setup_exit": SetupExit, "watchdog": Watchdog}
+              "hostile_argv": HostileArgvBytes, "setup_exit": SetupExit, "watchdog": Watchdog,
+              "recovery_reset": RecoveryReset}
     selected = groups[sys.argv[1]]
     selected.binary = sys.argv[2]
     if len(sys.argv) > 3:

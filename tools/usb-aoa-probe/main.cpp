@@ -252,7 +252,15 @@ int main(int argc, char **argv) {
             return 7;
         }
         recovery_reset = true;
-        auto reset = tr::reset_port_device(port_only);
+        // Pin the reset to the OBSERVED device identity: a replacement device
+        // that appears on the port between this observation and the reset must
+        // never be reset (fix round P3).
+        tr::UsbDeviceSelector pinned = port_only;
+        pinned.bus = observed.value().bus;
+        pinned.address = observed.value().address;
+        pinned.vendor_id = observed.value().vendor_id;
+        pinned.product_id = observed.value().product_id;
+        auto reset = tr::reset_port_device(pinned);
         std::string reset_status = "ok";
         if (!reset) {
             // A software reset re-enumerates the device, so libusb may report

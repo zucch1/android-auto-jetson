@@ -79,19 +79,20 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME usb_aoa_world COMMAND "${CMAKE_COMMAND}" -E env
         "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:aa_fake_libusb>:$ENV{LD_LIBRARY_PATH}"
         "$<TARGET_FILE:aa_usb_aoa_test>" --gtest_filter=UsbAoaWorld.*)
-    foreach(case absent_json hostile_port timeout_parse)
+    foreach(case absent_json hostile_port timeout_parse hostile_argv)
         add_test(NAME usb_aoa_probe_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/usb/test_probe_binary.py" ${case}
             "$<TARGET_FILE:aa-usb-aoa-probe>")
     endforeach()
-    foreach(case setup_exit watchdog)
+    foreach(case setup_exit watchdog recovery_reset)
         add_test(NAME usb_aoa_probe_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/usb/test_probe_binary.py" ${case}
             "$<TARGET_FILE:aa-usb-aoa-probe>" "$<TARGET_FILE:aa_fake_libusb>")
     endforeach()
     set_tests_properties(usb_aoa_switch usb_aoa_endpoint usb_aoa_hotplug usb_aoa_identity
         usb_aoa_probe usb_aoa_world usb_aoa_probe_absent_json usb_aoa_probe_hostile_port
-        usb_aoa_probe_timeout_parse usb_aoa_probe_setup_exit usb_aoa_probe_watchdog
+        usb_aoa_probe_timeout_parse usb_aoa_probe_hostile_argv usb_aoa_probe_setup_exit
+        usb_aoa_probe_watchdog usb_aoa_probe_recovery_reset
         PROPERTIES TIMEOUT 60)
 endif()
 
