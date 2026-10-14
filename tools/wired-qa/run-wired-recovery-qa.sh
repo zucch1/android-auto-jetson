@@ -66,6 +66,9 @@ BUDGET_MS="${BUDGET_MS:-5000}"
 EVIDENCE_WAIT_MS="${EVIDENCE_WAIT_MS:-8000}"
 READINESS_ONLY=0
 ONLY=""
+ONLY_SEEN=0
+SCENARIOS=(usb_unplug_replug receiver_restart consumer_restart
+          phone_lock_unlock phone_aa_restart unknown_phone malformed_input)
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
 RESULTS_DIR="$(mktemp -d)"
 RESULTS_TSV="${RESULTS_DIR}/results.tsv"
@@ -86,7 +89,12 @@ while (($# > 0)); do
         --adb-serial) ADB_SERIAL="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --budget-ms) BUDGET_MS="$2"; shift 2 ;;
-        --only) ONLY="$2"; shift 2 ;;
+        --only)
+            if (($# < 2)); then
+                echo "refusing --only without a value; accepted values: ${SCENARIOS[*]}" >&2
+                exit 2
+            fi
+            ONLY="$2"; ONLY_SEEN=1; shift 2 ;;
         --readiness-only) READINESS_ONLY=1; shift ;;
         -h|--help) usage ;;
         *) echo "unknown argument: $1" >&2; usage ;;
@@ -110,6 +118,31 @@ fi
 if ! [[ "$EVIDENCE_WAIT_MS" =~ ^[0-9]+$ ]]; then
     echo "refusing hostile EVIDENCE_WAIT_MS value: must be a plain integer" >&2
     exit 2
+fi
+
+# --only selection contract (gate N3): an empty value, an unknown name or a
+# malformed list selects ZERO scenarios, and a verdict over zero recorded rows
+# reads PASS - a vacuous pass over no evidence. Refuse at parse time with a
+# usage error naming the accepted values: fail closed, never a PASS.
+if (( ONLY_SEEN )); then
+    only_ok=1
+    if [[ -z "${ONLY}" ]]; then
+        only_ok=0
+    elif [[ ! "${ONLY}" =~ ^[a-z_]+(,[a-z_]+)*$ ]]; then
+        only_ok=0
+    else
+        for token in ${ONLY//,/ }; do
+            token_known=0
+            for scenario in "${SCENARIOS[@]}"; do
+                [[ "${token}" == "${scenario}" ]] && token_known=1
+            done
+            (( token_known )) || only_ok=0
+        done
+    fi
+    if (( ! only_ok )); then
+        echo "refusing --only value: expected a comma-separated list of scenario names; accepted values: ${SCENARIOS[*]}" >&2
+        exit 2
+    fi
 fi
 
 shq() { printf '%q' "$1"; }
@@ -553,12 +586,19 @@ fi
 # ---- 3. run the scenario matrix ----
 trap cleanup_target EXIT
 
-for scenario in usb_unplug_replug receiver_restart consumer_restart \
-                phone_lock_unlock phone_aa_restart unknown_phone malformed_input; do
+for scenario in "${SCENARIOS[@]}"; do
     if scenario_selected "$scenario"; then
         "scenario_${scenario}"
     fi
 done
+
+# Defense in depth (gate N3): a verdict over zero recorded rows reads PASS.
+# Parse-time validation above makes this unreachable, but if the selection
+# logic ever drifts from the matrix list again the run must fail closed.
+if [[ ! -s "${RESULTS_TSV}" ]]; then
+    echo "refusing empty scenario selection: no scenario row recorded; accepted values: ${SCENARIOS[*]}" >&2
+    exit 2
+fi
 
 # ---- 4. verdict: PASS only if every SELECTED scenario passed with evidence ----
 overall="PASS"

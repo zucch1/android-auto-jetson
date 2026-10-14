@@ -22,6 +22,8 @@ device). Each case asserts the exact JSON verdict and exit code:
   P3   a --only subset run records `only` + `subset` and marks the verdict text;
        hostile HOST (leading dash) and PORT (quote break) are neutralized; the
        host is never written raw; the budget claim is labelled unmeasured.
+  N3   an empty, unknown or malformed --only selection is a usage error naming
+       the accepted values - never a vacuous PASS over zero scenarios.
 """
 from __future__ import annotations
 
@@ -117,6 +119,7 @@ class RecoveryQaGates(unittest.TestCase):
             result = subprocess.run(command, capture_output=True, text=True,
                                     timeout=TIMEOUT_S, env=run_env)
             document = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {}
+            self.last_stderr = result.stderr
             return result.returncode, document
 
     # ---- P2-C: exact DRM status matching ----
@@ -254,6 +257,30 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertIn(doc["only"], (None, "null"))
         self.assertFalse(doc["subset"])
         self.assertNotIn("SUBSET", doc["note"])
+
+    # ---- N3: --only must fail closed on empty/unknown/malformed selection ----
+    def assert_only_usage_error(self, args):
+        code, doc = self.run_qa(args)
+        self.assertEqual(code, 2, doc)
+        self.assertEqual(doc, {})
+        self.assertIn("accepted values", self.last_stderr)
+        self.assertIn("usb_unplug_replug", self.last_stderr)
+        self.assertIn("malformed_input", self.last_stderr)
+
+    def test_only_unknown_name_is_usage_error(self):
+        self.assert_only_usage_error(["--only", "bogus"])
+
+    def test_only_empty_value_is_usage_error(self):
+        self.assert_only_usage_error(["--only", ""])
+
+    def test_only_malformed_list_is_usage_error(self):
+        self.assert_only_usage_error(["--only", "usb_unplug_replug "])
+
+    def test_only_trailing_comma_is_usage_error(self):
+        self.assert_only_usage_error(["--only", "usb_unplug_replug,"])
+
+    def test_only_missing_value_is_usage_error(self):
+        self.assert_only_usage_error(["--only"])
 
     def test_hostile_host_leading_dash_is_refused(self):
         code, doc = self.run_qa(["--readiness-only", "--host", "-oProxyCommand=touch /tmp/pwned"])
