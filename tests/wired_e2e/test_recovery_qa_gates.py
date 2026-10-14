@@ -17,7 +17,8 @@ device). Each case asserts the exact JSON verdict and exit code:
        dip is BLOCKED (never PASS), and an unknown phone without an observed
        rejection is BLOCKED (never PASS).
   P2-G a GetState=projecting string with no media (painted frames / successful
-       audio pump / "ok":"true" input) is NON-PASS.
+       audio pump / "ok":"true" input) is NON-PASS, and each of the three
+       media conjuncts is pinned independently (N1).
   P3   a --only subset run records `only` + `subset` and marks the verdict text;
        hostile HOST (leading dash) and PORT (quote break) are neutralized; the
        host is never written raw; the budget claim is labelled unmeasured.
@@ -62,6 +63,17 @@ case "$cmd" in
     *'print $1'*) printf '%s\n' "${FAKE_ADB_LIST:-FAKEDEV1 FAKEDEV2}" | tr ' ' '\n'; exit 0 ;;
     *'adb shell'*) exit 0 ;;
     *'wc -c'*) printf '%s' "${FAKE_LOG_SIZE:-0}"; exit 0 ;;
+    # Media-gate probes (N1): both probe commands contain their evidence token
+    # AND `tail -c +`, so first-match case ordering decides which arm drives
+    # them. The exact-shape arms MUST precede the raw-window tail arm (the
+    # tail arm also serves dip_observed/rejection_observed window reads, which
+    # carry no media tokens). The wrong-marker arms (audio_chunks / bare
+    # input_forwarded) model the pre-P2-G defect shape: a gate that regressed
+    # to presence greps lands there, so the per-conjunct pins can prove it.
+    *'"event":"media_timing"'*) [ "${FAKE_MEDIA_TIMING:-0}" = "1" ] && exit 0 || exit 1 ;;
+    *'"event":"input_forwarded","ok":"true"'*) [ "${FAKE_INPUT_OK:-0}" = "1" ] && exit 0 || exit 1 ;;
+    *audio_chunks*) [ "${FAKE_AUDIO_CHUNKS:-0}" = "1" ] && exit 0 || exit 1 ;;
+    *'input_forwarded'*) [ "${FAKE_INPUT_ANY:-0}" = "1" ] && exit 0 || exit 1 ;;
     *'tail -c +'*) printf '%s' "${FAKE_LOG_WINDOW:-}"; exit 0 ;;
     *'retries'*) printf '%s' "${FAKE_RETRIES:-1}"; exit 0 ;;
     *busctl*) printf '%s' "${FAKE_STATE:-string \"projecting\"}"; exit 0 ;;
@@ -75,8 +87,6 @@ case "$cmd" in
         esac ;;
     *nohup*) echo 4242; exit 0 ;;
     *'"event":"status"'*) printf '%s' "${FAKE_DISPLAY_STATUS:-{\"event\":\"status\",\"frames_painted\":0,\"render_ok\":false}}"; exit 0 ;;
-    *media_timing*) [ "${FAKE_MEDIA_TIMING:-0}" = "1" ] && exit 0 || exit 1 ;;
-    *'input_forwarded'*) [ "${FAKE_INPUT_OK:-0}" = "1" ] && exit 0 || exit 1 ;;
     *'"event":"active"'*) [ "${FAKE_ACTIVE:-1}" = "1" ] && exit 0 || exit 1 ;;
     *unbind*) [ "${FAKE_SYSFS:-1}" = "1" ] && exit 0 || exit 1 ;;
     *bind*) [ "${FAKE_SYSFS:-1}" = "1" ] && exit 0 || exit 1 ;;
@@ -198,6 +208,33 @@ class RecoveryQaGates(unittest.TestCase):
             FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
         self.assertNotEqual(code, 0, doc)
         self.assertEqual(doc["status"], "FAILED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertIn("media_unobserved", rows["consumer_restart"]["evidence"])
+
+    # ---- N1: every media conjunct independently gates the verdict ----
+    def test_audio_pump_missing_is_not_media(self):
+        status = '{"event":"status","frames_painted":7,"render_ok":true}'
+        code, doc = self.run_qa(
+            ["--only", "consumer_restart"],
+            FAKE_STATE='string "projecting"', FAKE_DISP_ALIVE="0",
+            FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="0",
+            FAKE_AUDIO_CHUNKS="1", FAKE_INPUT_OK="1")
+        self.assertNotEqual(code, 0, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertIn("media_unobserved", rows["consumer_restart"]["evidence"])
+
+    def test_input_ok_true_missing_is_not_media(self):
+        status = '{"event":"status","frames_painted":7,"render_ok":true}'
+        code, doc = self.run_qa(
+            ["--only", "consumer_restart"],
+            FAKE_STATE='string "projecting"', FAKE_DISP_ALIVE="0",
+            FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="1",
+            FAKE_INPUT_OK="0", FAKE_INPUT_ANY="1")
+        self.assertNotEqual(code, 0, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertIn("media_unobserved", rows["consumer_restart"]["evidence"])
 
     # ---- P3: subset recording, hostile args, redaction, budget labelling ----
     def test_subset_run_records_only_field_and_verdict(self):
