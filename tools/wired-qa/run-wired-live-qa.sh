@@ -58,12 +58,25 @@ done
 # session bus address (`busctl --user` fails "Failed to get credentials") and
 # the display consumer is a Qt GUI app that aborts under xcb without DISPLAY.
 # Single-quoted so `$(id -u)` expands on the TARGET, never here.
+# XAUTHORITY requirement: DISPLAY alone is not enough for the X client - the
+# remote session must also carry XAUTHORITY pointing at the authority cookie
+# of the target X server (the owning session's cookie file), or the display
+# consumer is refused with an X authentication failure. Set both together.
 REMOTE_SESSION_ENV='export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus; export DISPLAY=:1;'
+
+# Shell-quote one caller-supplied value before it enters a remote command
+# string: remote() runs that string through the TARGET shell, so a
+# metacharacter in PORT/RECEIVER/DISPLAY must arrive literal, never execute.
+shq() { printf '%q' "$1"; }
 
 # Bounded remote command (hung_commands class): 30 s hard ceiling per ssh.
 remote() { timeout 30 ssh "${SSH_OPTS[@]}" "$HOST" "$REMOTE_SESSION_ENV" "$@"; }
 
 json_escape() { printf '%s' "$1" | tr -d '\000' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# Host/IP values are never written raw to a JSON artifact: keep only a
+# truncated digest for run correlation (Privacy: redact/hash before export).
+host_tag="$(printf '%s' "$HOST" | sha256sum | cut -c1-16)"
 
 write_result() {
     local status="$1" blocked_on="$2" projection="$3" video="$4" audio="$5" input="$6" budget_ms="$7"
@@ -72,7 +85,7 @@ write_result() {
 {
   "task": "30. Qualify wired end-to-end projection",
   "phase": "B (live device)",
-  "host": "$(json_escape "$HOST")",
+  "host": "sha256:${host_tag}",
   "port": "$(json_escape "$PORT")",
   "status": "$status",
   "blocked_on": "$(json_escape "$blocked_on")",
@@ -97,7 +110,8 @@ if ! remote "true" >/dev/null 2>&1; then
 fi
 
 # ---- 2. read-only readiness checks ----
-phone_id="$(remote "cat /sys/bus/usb/devices/${PORT}/idVendor 2>/dev/null | tr -d '\n'; echo -n ':'; cat /sys/bus/usb/devices/${PORT}/idProduct 2>/dev/null | tr -d '\n'" || true)"
+PORT_Q="$(shq "$PORT")"
+phone_id="$(remote "cat /sys/bus/usb/devices/${PORT_Q}/idVendor 2>/dev/null | tr -d '\n'; echo -n ':'; cat /sys/bus/usb/devices/${PORT_Q}/idProduct 2>/dev/null | tr -d '\n'" || true)"
 # DRM connector status tokens only (no card name): one word per connector.
 display_status="$(remote "for c in /sys/class/drm/card*-DP-1/status /sys/class/drm/card*-HDMI-A-1/status; do [ -f \"\$c\" ] && cat \"\$c\"; done" || true)"
 audio_sink="$(remote "command -v pactl >/dev/null 2>&1 && pactl list short sinks 2>/dev/null | head -1 || (command -v pw-cli >/dev/null 2>&1 && pw-cli ls Device 2>/dev/null | head -1)" || true)"
@@ -146,8 +160,8 @@ fi
 # and requests projection. Both run under a bounded ssh; logs are captured on the
 # target under /tmp for later retrieval (redaction applied before export).
 start_ms="$(date +%s%3N)"
-remote "nohup ${RECEIVER} --port ${PORT} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!" >/tmp/aa-recv.pid
-remote "nohup ${DISPLAY} --test-only-autostart > /tmp/aa-wired-display.log 2>&1 & echo \$!" >/tmp/aa-disp.pid
+remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!" >/tmp/aa-recv.pid
+remote "nohup $(shq "$DISPLAY") --test-only-autostart > /tmp/aa-wired-display.log 2>&1 & echo \$!" >/tmp/aa-disp.pid
 
 projection="false"
 deadline=$(( $(date +%s%3N) + PROJECTION_TIMEOUT_MS ))

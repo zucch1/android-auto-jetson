@@ -35,7 +35,11 @@ composes the modules above and reimplements none of them.
    AOA switch; `18d1:2d00`/`18d1:2d01` after).
 3. Approved-phone trust store loaded (task 27) for the phone's wired identity.
 4. Display connected (DP-1 or HDMI-A-1 `connected`) and a PipeWire output sink
-   present (`pactl list short sinks` or `pw-cli`).
+   present (`pactl list short sinks` or `pw-cli`). The harness exports
+   `DISPLAY=:1` for the remote display consumer; X11 clients also need
+   `XAUTHORITY` pointing at the authority cookie of the target X server (the
+   owning session's cookie file) - without it the X connection is refused with
+   an authentication failure.
 5. A wired receiver binary on the target: `aa-wired-receiver`
    (`tools/wired-receiver/main.cpp`), which runs `aa::app::WiredSession` over
    the real `aa_transport_usb` endpoint with `transport::admit_via(TrustStore)`
@@ -96,5 +100,8 @@ task 32.
 
 ## Privacy
 
-Device serials/MACs/IPs are never written to committed content or the receipt;
-the harness redacts before export. Raw captures stay under `/tmp` on the host.
+Device serials/MACs/IPs/host names are never written to committed content or
+the receipt; the harness redacts before export (the JSON artifact carries the
+host only as a truncated SHA-256 digest, and remote command arguments are
+shell-quoted so caller-supplied values stay literal). Raw captures stay under
+`/tmp` on the host.

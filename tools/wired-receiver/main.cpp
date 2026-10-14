@@ -40,7 +40,9 @@
 #include <aa/trust/Store.hpp>
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -51,6 +53,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -72,6 +75,25 @@ void log_line(const std::string &json) {
 }
 
 void on_signal(int) { g_running.store(false); }
+
+// Media-timing diagnostics: nanoseconds -> milliseconds as an exact rational
+// (ns / 1e6) carried in a double, no lossy pre-rounding - the collector and
+// reporter compare the value as-is against the ms budgets. Non-finite input
+// (not producible from an int64 count) degrades to a JSON null, which the
+// collector treats as an absent metric (BLOCKED), never 0.
+std::string format_ms(aa::core::Nanoseconds value) {
+    const double ms = static_cast<double>(value.count) / 1'000'000.0;
+    if (!std::isfinite(ms)) {
+        return "null";
+    }
+    char buffer[32];
+    const auto [end, error] =
+        std::to_chars(buffer, buffer + sizeof(buffer), ms, std::chars_format::general);
+    if (error != std::errc{}) {
+        return "null";
+    }
+    return std::string{buffer, end};
+}
 
 class StdoutDiagnostics final : public aa::diagnostics::DiagnosticSink {
   public:
@@ -185,7 +207,43 @@ class RouterSink final : public aa::protocol::MessageSink {
         if (chunks_ % 50 == 1) {
             log_line("{\"event\":\"audio_chunks\",\"count\":" + std::to_string(chunks_) + "}");
         }
-        return router_.pump();
+        auto pumped = router_.pump();
+        if (!pumped) {
+            return pumped.error();
+        }
+        // Only after a successful pump do the router's statistics carry a
+        // measured render completion. Emit on the same low-rate cadence as
+        // audio_chunks (the receiver's event stream is documented low-rate).
+        // The router runs entirely on the session thread, so reading report()
+        // here is race-free.
+        if (chunks_ % 50 == 1) {
+            emit_media_timing();
+        }
+        return {};
+    }
+
+    // Media-timing diagnostics (PR56 gate P2-D emitter half). Both gated
+    // phase-B metrics derive from the existing task-25 RouterStats
+    // observations on the common monotonic A/V clock; nothing invented here:
+    //   audio_latency_ms = max_path_latency (submit() before decode to
+    //     data-handoff-confirmed write completion at the routing element;
+    //     receiver-local steady clock, NOT device delivery)
+    //   av_sync_ms = max_completion_skew (that write completion minus the
+    //     piece's scheduled presentation time on the wire timestamp-anchored
+    //     sample timeline; NOT a video-presentation comparison)
+    // MAX (cumulative peak), not the last sample: the schema budgets are
+    // run/soak envelope ceilings, so a transient breach must never hide
+    // behind a healed later sample. When no audio has traversed the route
+    // there is no measurement: emit nothing rather than a fabricated 0, so
+    // the collector keeps the metric null and the verdict stays BLOCKED.
+    void emit_media_timing() {
+        const auto &stats = router_.report().stats;
+        if (stats.chunks_submitted == 0) {
+            return;
+        }
+        log_line(
+            "{\"event\":\"media_timing\",\"av_sync_ms\":" + format_ms(stats.max_completion_skew) +
+            ",\"audio_latency_ms\":" + format_ms(stats.max_path_latency) + "}");
     }
 
   private:
@@ -370,9 +428,8 @@ int main(int argc, char **argv) {
     // captured trust predicate. The predicate re-checks the store on each
     // handshake step, so a mid-handshake revoke fails closed.
     auto bind_link_cipher = [&session, &store](const aa::trust::PhoneIdentity &phone) -> bool {
-        auto cipher = aa::transport::make_server_handshake_cipher([&store, phone] {
-            return store.lookup(phone) == aa::trust::Decision::approved;
-        });
+        auto cipher = aa::transport::make_server_handshake_cipher(
+            [&store, phone] { return store.lookup(phone) == aa::trust::Decision::approved; });
         if (!cipher) {
             return false;
         }
@@ -508,6 +565,11 @@ int main(int argc, char **argv) {
     session.request_stop();
     session_thread.join();
     input_thread.join();
+
+    // P2-D: one final media-timing export before shutdown so the last audio
+    // tail (routed after the last periodic emission) is not lost. The session
+    // thread is gone, so the router report is final and race-free here.
+    audio_sink.emit_media_timing();
 
     {
         std::lock_guard lock(session_mutex);

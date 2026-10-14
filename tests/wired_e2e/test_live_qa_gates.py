@@ -34,6 +34,9 @@ TIMEOUT_S = 60
 
 FAKE_SSH = r"""#!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${FAKE_SSH_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
+fi
 cmd="${@: -1}"
 # T30 env guard: every harness ssh invocation must carry the target session
 # environment, with $(id -u) left unexpanded for the TARGET shell to resolve.
@@ -166,6 +169,29 @@ class LiveQaGates(unittest.TestCase):
         self.assertEqual(code, 3, doc)
         self.assertEqual(doc["status"], "BLOCKED")
         self.assertEqual(doc["blocked_on"], "ssh_unreachable")
+
+    # ---- P3: remote args escaped, host/IP values never land raw ----
+    def test_remote_args_are_shell_escaped(self):
+        # remote() runs its command string through the TARGET shell: a
+        # metacharacter in --port must arrive escaped (literal), never execute.
+        raw = "1-2.1;echo INJECTED"
+        escaped = r"1-2.1\;echo\ INJECTED"
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            code, doc = self.run_qa(True, FAKE_SSH_LOG=str(log), PORT=raw)
+            self.assertEqual(code, 0, doc)
+            logged = log.read_text(encoding="utf-8")
+            self.assertIn(escaped, logged)
+            self.assertNotIn(raw, logged)
+
+    def test_host_never_written_raw_to_artifact(self):
+        sentinel = "sentinel-host-xyz"
+        code, doc = self.run_qa(True, HOST=sentinel)
+        self.assertEqual(code, 0, doc)
+        dumped = json.dumps(doc)
+        self.assertNotIn(sentinel, dumped)
+        self.assertTrue(doc.get("host"), doc)
+        self.assertNotEqual(doc["host"], sentinel)
 
 
 if __name__ == "__main__":
