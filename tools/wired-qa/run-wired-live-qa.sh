@@ -54,8 +54,14 @@ while (($# > 0)); do
     esac
 done
 
+# Session env for every remote command (single choke point): batch ssh has no
+# session bus address (`busctl --user` fails "Failed to get credentials") and
+# the display consumer is a Qt GUI app that aborts under xcb without DISPLAY.
+# Single-quoted so `$(id -u)` expands on the TARGET, never here.
+REMOTE_SESSION_ENV='export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus; export DISPLAY=:1;'
+
 # Bounded remote command (hung_commands class): 30 s hard ceiling per ssh.
-remote() { timeout 30 ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
+remote() { timeout 30 ssh "${SSH_OPTS[@]}" "$HOST" "$REMOTE_SESSION_ENV" "$@"; }
 
 json_escape() { printf '%s' "$1" | tr -d '\000' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 

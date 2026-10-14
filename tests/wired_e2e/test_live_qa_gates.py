@@ -16,6 +16,9 @@ case asserts the exact JSON verdict and exit code:
   F3  PASS requires an ACTIVE session AND all three observables; a `projecting`
       D-Bus string without an active session, or any missing observable, is
       FAILED (the session ran) while a missing prerequisite is BLOCKED.
+  T30 every remote ssh command must carry the target session environment: an
+      explicit DBUS_SESSION_BUS_ADDRESS with a REMOTELY-expanded $(id -u) plus
+      DISPLAY=:1; without it `busctl --user` fails and Qt picks xcb.
 """
 from __future__ import annotations
 
@@ -32,6 +35,17 @@ TIMEOUT_S = 60
 FAKE_SSH = r"""#!/usr/bin/env bash
 set -euo pipefail
 cmd="${@: -1}"
+# T30 env guard: every harness ssh invocation must carry the target session
+# environment, with $(id -u) left unexpanded for the TARGET shell to resolve.
+all_args="$*"
+case "$all_args" in
+    *'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus'*) ;;
+    *) echo "fake-ssh: remote command missing target bus address: $all_args" >&2; exit 98 ;;
+esac
+case "$all_args" in
+    *'DISPLAY=:1'*) ;;
+    *) echo "fake-ssh: remote command missing DISPLAY=:1: $all_args" >&2; exit 98 ;;
+esac
 if [ "$cmd" = "true" ]; then
     [ "${FAKE_SSH_FAIL:-0}" = "1" ] && exit 255
     exit 0
