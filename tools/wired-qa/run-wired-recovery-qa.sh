@@ -267,13 +267,15 @@ dip_observed() {
 
 # Observed rejection of an untrusted device: admission/link failure telemetry
 # (transport_unauthorized_peer / session_unknown_phone 302 / connect failure).
+# The session diag emits 302 as a NUMERIC JSON value ("code":302, unquoted) -
+# the quoted "code":"302" shape never appears in the real log (N2).
 rejection_observed() {
     local since="${1:-0}"
     local window
     window="$(log_since "${since}")"
     [[ "$window" == *transport_unauthorized_peer* ]] && return 0
     [[ "$window" == *session_unknown_phone* ]] && return 0
-    [[ "$window" == *'"code":"302"'* ]] && return 0
+    [[ "$window" == *'"code":302'* ]] && return 0
     [[ "$window" == *connect-failed* ]] && return 0
     return 1
 }

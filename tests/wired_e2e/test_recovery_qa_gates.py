@@ -158,6 +158,16 @@ class RecoveryQaGates(unittest.TestCase):
         rows = {row["name"]: row for row in doc["scenarios"]}
         self.assertIn("rejection", rows["unknown_phone"]["evidence"])
 
+    def test_unknown_phone_with_numeric_302_rejection_passes(self):
+        window = '{"event":"diag","code":302,"detail":"readmit_refused"}'
+        code, doc = self.run_qa(["--only", "unknown_phone"],
+                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=window,
+                                FAKE_STATE='string "stopped"')
+        self.assertEqual(code, 0, doc)
+        self.assertEqual(doc["status"], "PASS")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertIn("rejection", rows["unknown_phone"]["evidence"])
+
     def test_unknown_phone_absent_is_blocked(self):
         code, doc = self.run_qa(["--only", "unknown_phone"], FAKE_ADB_LIST="FAKEDEV1")
         self.assertEqual(code, 3, doc)
