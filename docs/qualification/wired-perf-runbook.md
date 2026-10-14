@@ -114,13 +114,6 @@ shutdown — are cross-lane work in `tools/wired-receiver` /
 `tools/dummy-display` (lanes 30/31) and land separately; until then phase-B
 runs are expected to end BLOCKED on these named gaps rather than PASS.
 
-Live runs additionally require deployment-bound provenance: without populated
-`source_digest` / `build_artifact_digest` / `configuration_digest` and recorded
-service definitions and dependency versions, the result reports
-`provenance_gaps` and BLOCKS. Synthetic/offline fixtures (whose digests are
-fixture placeholders) are explicitly separate from live claims and report
-`measurement_origin: "offline"` with `qualification_status: "OFFLINE_ONLY"`.
-
 ## Provenance and equivalence
 
 Both result documents carry the provenance block with `package_digest: null` and
@@ -137,26 +130,6 @@ digest per service) and `dependency_versions` are non-empty. Pass them via
 names each missing field. Offline `--capture` documents are labeled
 `measurement_origin: "offline"` / `qualification_status: "OFFLINE_ONLY"` and can
 never claim live qualification.
-
-## Named limitations (task-32 completeness gaps)
-
-The current receiver/display event stream supplies only the two media-timing
-metrics. Seven event-metric slots are **not** supplied by the launched pair and
-are named in every result's `named_gaps` while absent:
-
-1. `frame_drops`
-2. `decode_p50_ms`
-3. `decode_p95_ms`
-4. `decode_fps`
-5. `decode_frames`
-6. `ipc_throughput_mbps`
-7. `ipc_p95_added_latency_ms`
-
-While any of these is absent the result carries
-`qualification_status: "INCOMPLETE"` and the verdict cannot be a complete
-task-32 qualification, even if the in-run budgets pass. Decode p95 stays
-informational (task-9 budget withdrawn); these gaps concern *measurement
-availability*, not the withdrawn budget.
 
 ## Privacy
 
