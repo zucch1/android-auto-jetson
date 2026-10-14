@@ -141,12 +141,12 @@ check_readiness() {
     fi
     local display_status
     display_status="$(remote "for c in /sys/class/drm/card*-DP-1/status /sys/class/drm/card*-HDMI-A-1/status; do [ -f \"\$c\" ] && cat \"\$c\"; done" 2>/dev/null || true)"
-    if [[ "$display_status" != *"connected"* ]]; then
+    if ! grep -Fxq 'connected' <<<"$display_status"; then
         ready_reason="display_disconnected"
         return 1
     fi
     local audio_sink
-    audio_sink="$(remote "command -v pactl >/dev/null 2>&1 && pactl list short sinks 2>/dev/null | head -1 || (command -v pw-cli >/dev/null 2>&1 && pw-cli ls Device 2>/dev/null | head -1)" 2>/dev/null || true)"
+    audio_sink="$(remote "sink=''; if command -v pactl >/dev/null 2>&1; then sink=\$(pactl list short sinks 2>/dev/null) || sink=''; fi; if [ -n \"\$sink\" ]; then printf '%s\\n' \"\$sink\"; elif command -v pw-cli >/dev/null 2>&1; then nodes=\$(pw-cli ls Node 2>/dev/null) || nodes=''; printf '%s\\n' \"\$nodes\" | grep -E '^[[:space:]]*media[.]class[[:space:]]*=[[:space:]]*\"?Audio/Sink\"?[[:space:]]*$'; fi" 2>/dev/null || true)"
     if [[ -z "$audio_sink" ]]; then
         ready_reason="no_audio_sink"
         return 1
@@ -190,7 +190,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
         "events": {"helper_rss_mb": None},
     }, handle)
 PY
-    "$PY" -B "$REPORTER" --capture "$capture" --out "$OUT" \
+    "$PY" -B "$REPORTER" --live --capture "$capture" --out "$OUT" \
         --duration-requested "${DURATION:-}" --now "${NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
         --blocked-on "$reason" >/dev/null 2>&1 || true
     return 3
@@ -293,7 +293,7 @@ if [[ -n "$CAPTURE_OUT" ]]; then
 fi
 capture_sha="$(sha256sum "$capture_file" | cut -d' ' -f1)"
 
-report_args=(--capture "$capture_file" --out "$OUT" --duration-requested "$DURATION"
+report_args=(--live --capture "$capture_file" --out "$OUT" --duration-requested "$DURATION"
     --capture-sha256 "$capture_sha" --now "${NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}")
 if [[ -s "$prov_file" ]]; then
     report_args+=(--provenance "$prov_file")
