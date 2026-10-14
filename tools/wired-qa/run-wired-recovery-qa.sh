@@ -84,7 +84,15 @@ while (($# > 0)); do
 done
 
 # Bounded remote command (hung_commands class): 30 s hard ceiling per ssh.
-remote() { timeout 30 ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
+# A batch ssh has no desktop session, so every remote command exports the
+# session bus + display first: without them `busctl --user` fails with
+# "Failed to get credentials: No such device or address" and the Qt display
+# consumer aborts with no DISPLAY. $(id -u) must expand on the TARGET (escaped
+# here); it is the ssh login user's uid, not this host's.
+remote() {
+    timeout 30 ssh "${SSH_OPTS[@]}" "$HOST" \
+        "export DBUS_SESSION_BUS_ADDRESS=\"unix:path=/run/user/\$(id -u)/bus\"; export DISPLAY=:1; $*"
+}
 
 json_escape() { printf '%s' "$1" | tr -d '\000' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
