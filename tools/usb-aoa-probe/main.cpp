@@ -16,7 +16,8 @@
 //
 // Exit codes: 0 framed transport ready (both observables); 2 usage error
 // (bad arguments, invalid port grammar, missing/unreadable identity file,
-// parse failures); 3 transport setup failed; 5 no framed reply; 6 framed
+// parse failures); 3 transport setup failed (connect/AOA switch/identity
+// admission failures); 5 no framed reply; 6 framed
 // round-trip without re-enumeration; 7 recovery could not restore phone mode.
 
 #include "probe_support.hpp"
@@ -29,6 +30,7 @@
 #include <aa/trust/Identity.hpp>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -36,6 +38,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -278,7 +281,7 @@ int main(int argc, char **argv) {
         std::cout << "\"connect_error\": \"" << aa::to_string(link.error().code()) << "\",\n";
         std::cout << "\"connect_elapsed_ms\": " << connect_elapsed.count() << ",\n";
         std::cout << "\"result\": \"connect-failed\"\n}\n";
-        return 2;
+        return 3;
     }
 
     const tr::UsbAoaLink &record = link.value();
@@ -336,10 +339,19 @@ int main(int argc, char **argv) {
               << (transport.value()->kind() == tr::Kind::usb_aoa ? "usb_aoa" : "other") << "\",\n";
 
     // Gate P2-4: the cancellation watchdog is armed BEFORE the framed send, so
-    // a stalled OUT endpoint cannot hang the probe past the read timeout.
-    std::thread watchdog([&source, &options] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(options.read_timeout_ms));
-        source.request_stop();
+    // a stalled OUT endpoint cannot hang the probe past the read timeout. It
+    // wakes on completion (condition signaled once I/O returns) or on the
+    // deadline, whichever comes first; join() then never waits out the timeout
+    // after a completed round-trip.
+    std::mutex done_mutex;
+    std::condition_variable done_cv;
+    bool done = false;
+    std::thread watchdog([&source, &options, &done_mutex, &done_cv, &done] {
+        std::unique_lock<std::mutex> lock(done_mutex);
+        if (!done_cv.wait_for(lock, std::chrono::milliseconds(options.read_timeout_ms),
+                              [&done] { return done; })) {
+            source.request_stop();
+        }
     });
 
     // AASDK's wire shape for the control-channel VersionRequest (the pinned
@@ -356,6 +368,11 @@ int main(int argc, char **argv) {
     std::cout << "\"framed_send_bytes\": " << (frame ? frame.value().size() : 0) << ",\n";
 
     auto received = transport.value()->receive();
+    {
+        std::lock_guard<std::mutex> lock(done_mutex);
+        done = true;
+    }
+    done_cv.notify_all();
     watchdog.join();
     const bool receive_ok = received.has_value();
     std::cout << "\"framed_receive\": \"" << (receive_ok ? "ok" : "no-reply") << "\",\n";
