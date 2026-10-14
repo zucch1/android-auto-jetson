@@ -28,9 +28,8 @@
 //
 // AAP wire encoding note: control/service frames use the project's own message
 // codec (protocol::encode + transport::encode_message). The phone-bound input
-// payload reuses the project's bounded input record codec
-// (ipc::encode_input_record); the AAP-protobuf input mapping is the AASDK
-// adapter's concern and is NOT reimplemented here.
+// payload is the real AAP InputReport protobuf (protocol::encode_input_report),
+// converted at the input boundary - not the local IPC record.
 
 #include <aa/channels/Negotiator.hpp>
 #include <aa/channels/Services.hpp>
@@ -102,6 +101,17 @@ class WiredSession final {
     void request_stop() noexcept;
     void attach_transport(transport::Transport *transport) noexcept;
 
+    // AAP authentication/TLS handshake (finding F1). Attach the negotiated TLS
+    // cipher seam (the HU-side handshake cipher) before driving the handshake.
+    // The phone-side control progression is: version_response -> exchange
+    // encapsulated_ssl handshake chunks -> auth_complete. Media/input channel
+    // traffic is refused until authenticated(); post-auth outbound frames use
+    // the negotiated cipher (not plaintext).
+    void attach_cipher(std::unique_ptr<transport::HandshakingCipher> cipher) noexcept;
+    [[nodiscard]] bool authenticated() const noexcept {
+        return auth_phase_ == AuthPhase::authenticated;
+    }
+
     [[nodiscard]] session::State state() const noexcept { return lifecycle_.state(); }
     [[nodiscard]] std::optional<Error> failure() const noexcept { return lifecycle_.failure(); }
     [[nodiscard]] core::CancellationToken token() const noexcept { return lifecycle_.token(); }
@@ -151,17 +161,25 @@ class WiredSession final {
     [[nodiscard]] std::uint64_t channel_opens() const noexcept { return channel_opens_; }
     [[nodiscard]] std::uint64_t version_responses() const noexcept { return version_responses_; }
     [[nodiscard]] std::uint64_t pings_answered() const noexcept { return pings_answered_; }
+    [[nodiscard]] std::uint64_t encapsulated_ssls() const noexcept { return encapsulated_ssls_; }
+    [[nodiscard]] std::uint64_t auth_completes() const noexcept { return auth_completes_; }
 
   private:
     class InputForwarder;
 
+    // AAP authentication progression (finding F1).
+    enum class AuthPhase { awaiting_version, ssl_handshake, authenticated };
+
     [[nodiscard]] core::Result<void> route(const transport::Message &message);
     [[nodiscard]] core::Result<void> handle_control(std::span<const std::byte> payload);
+    [[nodiscard]] core::Result<void> drive_ssl_handshake();
     [[nodiscard]] core::Result<std::size_t>
     send_payload(const protocol::ServiceDiscoveryResponse &response);
     [[nodiscard]] core::Result<std::size_t>
     send_payload(const protocol::ChannelOpenResponse &response);
-    [[nodiscard]] core::Result<std::size_t> send_frames(std::vector<std::byte> payload);
+    [[nodiscard]] core::Result<std::size_t> send_encapsulated_ssl(std::vector<std::byte> bytes);
+    [[nodiscard]] core::Result<std::size_t> send_frames(std::vector<std::byte> payload,
+                                                        bool encrypted);
     void forward_input(const input::NormalizedInput &event);
     [[nodiscard]] std::optional<std::uint8_t> input_channel() const noexcept;
 
@@ -180,6 +198,9 @@ class WiredSession final {
     std::unique_ptr<InputForwarder> input_forwarder_{};
     std::optional<input::InputService> input_service_{};
     transport::Transport *transport_{nullptr};
+    std::unique_ptr<transport::HandshakingCipher> cipher_{};
+    AuthPhase auth_phase_{AuthPhase::awaiting_version};
+    bool ssl_active_{false};
     core::SessionId session_id_{core::SessionId{1}};
     session::State last_state_{session::State::disconnected};
     std::uint64_t sequence_{0};
@@ -189,6 +210,8 @@ class WiredSession final {
     std::uint64_t channel_opens_{0};
     std::uint64_t version_responses_{0};
     std::uint64_t pings_answered_{0};
+    std::uint64_t encapsulated_ssls_{0};
+    std::uint64_t auth_completes_{0};
 };
 
 } // namespace aa::app

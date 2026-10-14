@@ -24,6 +24,7 @@ add_library(aa_protocol_adapter STATIC
     src/protocol/aasdk_adapter/ControlAdapter.cpp
     src/protocol/aasdk_adapter/ServiceAdapter.cpp
     src/protocol/aasdk_adapter/MediaConfiguration.cpp
+    src/protocol/aasdk_adapter/InputAdapter.cpp
     src/protocol/aasdk_adapter/ChannelAdapter.cpp)
 set_target_properties(aa_protocol_adapter PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO

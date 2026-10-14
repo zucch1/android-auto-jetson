@@ -27,13 +27,13 @@ namespace aa::transport {
 // record adapter lives under src/**/*_adapter/ and never leaks OpenSSL here.
 
 class PayloadCipher {
-public:
+  public:
     virtual ~PayloadCipher() = default;
     PayloadCipher() = default;
-    PayloadCipher(const PayloadCipher&) = delete;
-    PayloadCipher& operator=(const PayloadCipher&) = delete;
-    PayloadCipher(PayloadCipher&&) = delete;
-    PayloadCipher& operator=(PayloadCipher&&) = delete;
+    PayloadCipher(const PayloadCipher &) = delete;
+    PayloadCipher &operator=(const PayloadCipher &) = delete;
+    PayloadCipher(PayloadCipher &&) = delete;
+    PayloadCipher &operator=(PayloadCipher &&) = delete;
 
     // Seal one plaintext chunk into exactly one TLS record (record overhead
     // included in the returned ciphertext). Rejects an inactive cipher.
@@ -53,13 +53,41 @@ public:
     [[nodiscard]] virtual bool is_active() const noexcept = 0;
 };
 
+// TLS handshake seam (finding F1): a PayloadCipher whose TLS handshake can be
+// driven incrementally over an out-of-band channel (the AAP `encapsulated_ssl`
+// control message carries each handshake chunk). The concrete TLS record codec
+// lives under src/**/*_adapter/ and never leaks OpenSSL here. This is the seam
+// that lets a session exchange the authentication handshake with a phone and
+// then seal payloads with the negotiated cipher.
+class HandshakingCipher : public PayloadCipher {
+  public:
+    ~HandshakingCipher() override = default;
+    HandshakingCipher() = default;
+    HandshakingCipher(const HandshakingCipher &) = delete;
+    HandshakingCipher &operator=(const HandshakingCipher &) = delete;
+    HandshakingCipher(HandshakingCipher &&) = delete;
+    HandshakingCipher &operator=(HandshakingCipher &&) = delete;
+
+    // Drive one handshake step. Returns true once the handshake completes.
+    // Returns a typed error when the peer is rejected (e.g. unapproved).
+    [[nodiscard]] virtual core::Result<bool> step_handshake() = 0;
+
+    // Drain outbound handshake bytes to send to the peer (empty when none are
+    // pending). Valid after step_handshake().
+    [[nodiscard]] virtual std::vector<std::byte> take_handshake() = 0;
+
+    // Feed inbound handshake bytes received from the peer before the next
+    // step_handshake().
+    virtual void give_handshake(std::span<const std::byte> bytes) = 0;
+};
+
 // One logical message: a raw channel byte, its kind and its plaintext payload.
 struct Message final {
     std::uint8_t channel{};
     MessageKind kind{MessageKind::specific};
     std::vector<std::byte> payload{};
 
-    [[nodiscard]] friend bool operator==(const Message&, const Message&) = default;
+    [[nodiscard]] friend bool operator==(const Message &, const Message &) = default;
 };
 
 // Fragment one message into wire-ready frame byte blobs. `encryption` selects
@@ -68,7 +96,7 @@ struct Message final {
 // FIRST total with the plaintext message length. Rejects an oversize message or
 // an inactive cipher with a typed error.
 [[nodiscard]] core::Result<std::vector<std::vector<std::byte>>>
-encode_message(const Message& message, Encryption encryption, PayloadCipher* cipher);
+encode_message(const Message &message, Encryption encryption, PayloadCipher *cipher);
 
 // Per-channel message reassembler. push() consumes one complete frame's bytes,
 // opens its payload when encrypted, and returns the reassembled message when a
@@ -78,20 +106,19 @@ encode_message(const Message& message, Encryption encryption, PayloadCipher* cip
 // deterministic typed errors. Once it fails it is closed and every later push
 // re-returns transport_closed, so a caller can close the transport safely.
 class MessageReassembler final {
-public:
+  public:
     // `cipher` is used to open encrypted frame payloads; pass nullptr only for
     // a plain-only stream (an encrypted frame then fails closed).
-    explicit MessageReassembler(PayloadCipher* cipher = nullptr) : cipher_(cipher) {}
+    explicit MessageReassembler(PayloadCipher *cipher = nullptr) : cipher_(cipher) {}
 
     // Feed one complete frame's bytes. Returns the completed message when a
     // BULK or LAST frame closes it, or std::nullopt while a fragmented message
     // is still accumulating. A typed error closes the reassembler.
-    [[nodiscard]] core::Result<std::optional<Message>>
-    push(std::span<const std::byte> frame_bytes);
+    [[nodiscard]] core::Result<std::optional<Message>> push(std::span<const std::byte> frame_bytes);
 
     [[nodiscard]] bool closed() const noexcept { return closed_; }
 
-private:
+  private:
     struct Pending {
         std::uint8_t channel{};
         MessageKind kind{MessageKind::specific};
@@ -102,7 +129,7 @@ private:
 
     [[nodiscard]] core::Result<std::optional<Message>> fail(Error error);
 
-    PayloadCipher* cipher_;
+    PayloadCipher *cipher_;
     // Per-channel in-progress messages, so fragments from different channels
     // may interleave without corrupting each other. The running total of
     // buffered plaintext across all channels is capped by kMaxQueuedBytes.

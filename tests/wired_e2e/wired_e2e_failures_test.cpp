@@ -27,9 +27,13 @@ using wiredtest::ScriptedTransport;
 const aa::trust::PhoneIdentity kApproved{"phone-approved"};
 
 void drive_to_active(app::WiredSession &session, ScriptedTransport &transport) {
+    auto cipher = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    session.attach_cipher(std::move(cipher));
     ASSERT_TRUE(session.apply(ss::Event::start_discovery).has_value());
     ASSERT_TRUE(session.phone_discovered(kApproved).has_value());
     ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+    wiredtest::walk_auth(session, transport);
+    ASSERT_TRUE(session.authenticated());
     transport.push_inbound(wiredtest::discovery_request_frame());
     auto discovery = session.poll_transport();
     ASSERT_TRUE(discovery.has_value());

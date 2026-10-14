@@ -32,7 +32,9 @@ set(AA_WIRED_TEST_SOURCES
     tests/wired_e2e/wired_e2e_happy_test.cpp
     tests/wired_e2e/wired_e2e_revoke_test.cpp
     tests/wired_e2e/wired_e2e_failures_test.cpp
-    tests/wired_e2e/wired_e2e_trust_link_test.cpp)
+    tests/wired_e2e/wired_e2e_trust_link_test.cpp
+    tests/wired_e2e/wired_e2e_input_wire_test.cpp
+    tests/wired_e2e/wired_e2e_auth_test.cpp)
 foreach(source IN LISTS AA_WIRED_SOURCES AA_WIRED_TEST_SOURCES)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/${source}")
         message(FATAL_ERROR "AA_WIRED_SOURCE_MISSING: ${source} (wired e2e source inventory)")
@@ -75,6 +77,10 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(aa_wired_e2e_test PRIVATE
         aa_wired aa_protocol_adapter aap_protobuf aasdk
         aa_video aa_input aa_input_service aareceiver-audio pthread GTest::gtest_main)
+    target_include_directories(aa_wired_e2e_test PRIVATE
+        "${CMAKE_BINARY_DIR}/aasdk/protobuf"
+        "${AA_DEPENDENCY_STAGE}/aasdk/include"
+        ${Protobuf_INCLUDE_DIRS})
     if(TARGET PkgConfig::AA_AUDIO_GST)
         target_link_libraries(aa_wired_e2e_test PRIVATE PkgConfig::AA_AUDIO_GST)
     endif()
@@ -106,8 +112,10 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_e2e_revoke COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eRevoke.*)
     add_test(NAME wired_e2e_failures COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eFailures.*)
     add_test(NAME wired_e2e_trust_link COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eTrustLink.*)
+    add_test(NAME wired_e2e_input_wire COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eInputWire.*)
+    add_test(NAME wired_e2e_auth COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eAuth.*)
     set_tests_properties(wired_e2e_happy wired_e2e_revoke wired_e2e_failures wired_e2e_trust_link
-        PROPERTIES TIMEOUT 120)
+        wired_e2e_input_wire wired_e2e_auth PROPERTIES TIMEOUT 120)
 endif()
 
 # Phase-B live receiver: the composed USB/AOA -> WiredSession -> video/input/
@@ -129,6 +137,9 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(aa-wired-receiver PRIVATE
         aa_wired aa_protocol_adapter aa_ipc_control aa_ipc_dbus aa_video aa_input
         aareceiver-audio pthread)
+    if(TARGET aa_transport_tls)
+        target_link_libraries(aa-wired-receiver PRIVATE aa_transport_tls)
+    endif()
     if(TARGET aap_protobuf AND TARGET aasdk)
         target_link_libraries(aa-wired-receiver PRIVATE aap_protobuf aasdk)
     endif()

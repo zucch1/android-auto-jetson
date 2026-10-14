@@ -117,6 +117,71 @@ class RecordingSink final : public aa::protocol::MessageSink {
     std::vector<std::vector<std::byte>> payloads{};
 };
 
+// Deterministic HandshakingCipher double (finding F1 test seam): stands in for
+// the real TLS record codec so the session's authentication progression and
+// negotiated-cipher framing can be exercised hermetically. Not a wire-format
+// claim - the real TLS record format is covered by tests/transport/tls_test.cpp.
+// seal/open invert each byte; the handshake becomes active after `handshake_steps`
+// step_handshake() calls, emitting one handshake chunk per step.
+class FakeHandshakeCipher final : public aa::transport::HandshakingCipher {
+  public:
+    explicit FakeHandshakeCipher(int handshake_steps = 2) : handshake_steps_(handshake_steps) {}
+
+    aa::core::Result<bool> step_handshake() override {
+        ++steps_;
+        pending_response_ = true;
+        if (steps_ >= handshake_steps_) {
+            active_ = true;
+        }
+        return active_;
+    }
+    [[nodiscard]] std::vector<std::byte> take_handshake() override {
+        if (!pending_response_) {
+            return {};
+        }
+        pending_response_ = false;
+        return {std::byte{0xEE}};
+    }
+    void give_handshake(std::span<const std::byte> bytes) override {
+        received_ += bytes.size();
+        pending_response_ = true;
+    }
+    [[nodiscard]] aa::core::Result<std::vector<std::byte>>
+    seal(std::span<const std::byte> plaintext) override {
+        if (!active_) {
+            return aa::Error{aa::ErrorCode::transport_closed};
+        }
+        std::vector<std::byte> out;
+        out.reserve(plaintext.size());
+        for (const std::byte b : plaintext) {
+            out.push_back(static_cast<std::byte>(~std::to_integer<std::uint8_t>(b)));
+        }
+        return out;
+    }
+    [[nodiscard]] aa::core::Result<std::vector<std::byte>>
+    open(std::span<const std::byte> record) override {
+        if (!active_) {
+            return aa::Error{aa::ErrorCode::transport_closed};
+        }
+        std::vector<std::byte> out;
+        out.reserve(record.size());
+        for (const std::byte b : record) {
+            out.push_back(static_cast<std::byte>(~std::to_integer<std::uint8_t>(b)));
+        }
+        return out;
+    }
+    [[nodiscard]] std::size_t record_overhead() const noexcept override { return 0; }
+    [[nodiscard]] bool is_active() const noexcept override { return active_; }
+    [[nodiscard]] std::size_t received() const noexcept { return received_; }
+
+  private:
+    int handshake_steps_;
+    int steps_{0};
+    bool active_{false};
+    bool pending_response_{false};
+    std::size_t received_{0};
+};
+
 // ---- frame builders (reuse the project wire codec) ----
 
 inline std::vector<std::byte> control_frame(std::vector<std::byte> payload) {
@@ -142,6 +207,21 @@ inline std::vector<std::byte> service_frame(std::uint8_t channel, std::vector<st
         aa::transport::Message{channel, aa::transport::MessageKind::specific, std::move(payload)},
         aa::transport::Encryption::plain, nullptr);
     return frames.value().front();
+}
+
+// The fake phone's AAP authentication control progression: version_response ->
+// exchange encapsulated_ssl handshake chunks -> auth_complete. Drives the
+// session over the scripted transport exactly as a real phone would.
+inline void walk_auth(aa::app::WiredSession &session, ScriptedTransport &transport) {
+    transport.push_inbound(
+        control_frame(aa::protocol::encode(aa::protocol::VersionResponse{1, 6, 0}).value()));
+    (void)session.poll_transport();
+    transport.push_inbound(control_frame(
+        aa::protocol::encode(aa::protocol::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+    (void)session.poll_transport();
+    transport.push_inbound(
+        control_frame(aa::protocol::encode(aa::protocol::AuthComplete{0}).value()));
+    (void)session.poll_transport();
 }
 
 // ---- service descriptors (video / media audio / input) ----

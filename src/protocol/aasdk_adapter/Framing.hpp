@@ -33,9 +33,8 @@ control_body(std::span<const std::byte> payload, ControlMessageId expected) {
     if (payload.size() < kControlMessageIdBytes) {
         return malformed();
     }
-    const auto raw = static_cast<std::uint16_t>(
-        (static_cast<std::uint16_t>(payload[0]) << 8U) |
-        static_cast<std::uint16_t>(payload[1]));
+    const auto raw = static_cast<std::uint16_t>((static_cast<std::uint16_t>(payload[0]) << 8U) |
+                                                static_cast<std::uint16_t>(payload[1]));
     if (raw != static_cast<std::uint16_t>(expected)) {
         return malformed();
     }
@@ -44,8 +43,8 @@ control_body(std::span<const std::byte> payload, ControlMessageId expected) {
 
 // Parse one protobuf body strictly: reject oversized bodies, bytes that do not
 // parse, and any message missing a proto2 required field.
-[[nodiscard]] inline core::Result<void>
-parse_body(google::protobuf::MessageLite& message, std::span<const std::byte> body) {
+[[nodiscard]] inline core::Result<void> parse_body(google::protobuf::MessageLite &message,
+                                                   std::span<const std::byte> body) {
     if (body.size() > kMaxProtoBodyBytes) {
         return malformed();
     }
@@ -60,20 +59,24 @@ parse_body(google::protobuf::MessageLite& message, std::span<const std::byte> bo
 
 // Serialize one protobuf body and prefix the big-endian discriminator.
 [[nodiscard]] inline core::Result<std::vector<std::byte>>
-framed(ControlMessageId id, const google::protobuf::MessageLite& message) {
+framed_id(std::uint16_t id, const google::protobuf::MessageLite &message) {
     std::string body;
     if (!message.SerializeToString(&body)) {
         return malformed();
     }
     std::vector<std::byte> payload;
     payload.reserve(kControlMessageIdBytes + body.size());
-    const auto raw = static_cast<std::uint16_t>(id);
-    payload.push_back(static_cast<std::byte>((raw >> 8U) & 0xFFU));
-    payload.push_back(static_cast<std::byte>(raw & 0xFFU));
+    payload.push_back(static_cast<std::byte>((id >> 8U) & 0xFFU));
+    payload.push_back(static_cast<std::byte>(id & 0xFFU));
     for (const char byte : body) {
         payload.push_back(static_cast<std::byte>(byte));
     }
     return payload;
+}
+
+[[nodiscard]] inline core::Result<std::vector<std::byte>>
+framed(ControlMessageId id, const google::protobuf::MessageLite &message) {
+    return framed_id(static_cast<std::uint16_t>(id), message);
 }
 
 // Prefix a raw (non-protobuf) body with the big-endian discriminator.

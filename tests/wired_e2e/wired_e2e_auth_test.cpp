@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// AAP authentication/TLS progression (finding F1): a fake phone walks
+// version_response -> exchange encapsulated_ssl handshake chunks ->
+// auth_complete. These tests assert the wire contract: the session reaches the
+// authenticated/active progression only after auth_complete, pre-auth channel
+// and input traffic is refused, and post-auth frames carry the negotiated cipher
+// (encrypted, sealed with the handshake cipher) - never plaintext.
+
+#include "harness.hpp"
+
+#include "../session/Fakes.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+namespace {
+
+namespace app = aa::app;
+namespace proto = aa::protocol;
+namespace ss = aa::session;
+namespace tr = aa::transport;
+using wiredtest::FakeHandshakeCipher;
+using wiredtest::ScriptedTransport;
+
+const aa::trust::PhoneIdentity kApproved{"phone-approved"};
+
+struct AuthFixture {
+    ss::test::MapTrustStore trust;
+    ss::test::ManualClock clock;
+    wiredtest::CaptureSink capture;
+    aa::diagnostics::Diagnostics diagnostics{capture};
+    ScriptedTransport transport;
+    app::WiredSession session;
+    FakeHandshakeCipher *cipher{nullptr};
+
+    AuthFixture()
+        : session(app::WiredSessionDeps{trust, clock, diagnostics}, app::WiredSessionConfig{}) {
+        trust.set(kApproved, aa::trust::Decision::approved);
+        EXPECT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+        auto owned = std::make_unique<FakeHandshakeCipher>();
+        cipher = owned.get();
+        session.attach_cipher(std::move(owned));
+        session.attach_transport(&transport);
+        EXPECT_TRUE(session.apply(ss::Event::start_discovery).has_value());
+        EXPECT_TRUE(session.phone_discovered(kApproved).has_value());
+        EXPECT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+    }
+};
+
+TEST(WiredE2eAuth, AuthenticatedOnlyAfterAuthComplete) {
+    AuthFixture f;
+    EXPECT_FALSE(f.session.authenticated());
+
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    EXPECT_FALSE(f.session.authenticated());
+    EXPECT_EQ(f.session.version_responses(), 1U);
+
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    EXPECT_FALSE(f.session.authenticated());
+    EXPECT_GT(f.session.encapsulated_ssls(), 0U);
+    EXPECT_TRUE(f.cipher->is_active());
+
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::AuthComplete{0}).value()));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    EXPECT_TRUE(f.session.authenticated());
+    EXPECT_EQ(f.session.auth_completes(), 1U);
+
+    // Only now does channel traffic advance the session toward active.
+    f.transport.push_inbound(wiredtest::open_request_frame(99));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    EXPECT_EQ(f.session.channel_opens(), 1U);
+    ASSERT_TRUE(f.session.apply(ss::Event::negotiation_succeeded).has_value());
+    EXPECT_EQ(f.session.state(), ss::State::active);
+}
+
+TEST(WiredE2eAuth, PreAuthChannelTrafficIsRefused) {
+    AuthFixture f;
+    ASSERT_FALSE(f.session.authenticated());
+
+    const auto before = f.transport.sent_count();
+    f.transport.push_inbound(wiredtest::open_request_frame(99));
+    auto refused = f.session.poll_transport();
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_EQ(f.session.channel_opens(), 0U);
+    EXPECT_EQ(f.transport.sent_count(), before);
+}
+
+TEST(WiredE2eAuth, PreAuthServiceDiscoveryIsRefused) {
+    AuthFixture f;
+    ASSERT_FALSE(f.session.authenticated());
+
+    f.transport.push_inbound(wiredtest::discovery_request_frame());
+    auto refused = f.session.poll_transport();
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+}
+
+TEST(WiredE2eAuth, PreAuthInputIsRefused) {
+    AuthFixture f;
+    ASSERT_FALSE(f.session.authenticated());
+
+    const auto before = f.transport.sent_count();
+    (void)f.session.submit_input(aa::ipc::InputEvent{aa::ipc::KeyEvent{66, true}});
+    EXPECT_EQ(f.session.input_sends(), 0U);
+    EXPECT_EQ(f.session.input_send_failures(), 1U);
+    EXPECT_EQ(f.transport.sent_count(), before);
+}
+
+TEST(WiredE2eAuth, PostAuthControlCarriesNegotiatedCipher) {
+    AuthFixture f;
+    wiredtest::walk_auth(f.session, f.transport);
+    ASSERT_TRUE(f.session.authenticated());
+
+    const auto before = f.transport.sent_count();
+    f.transport.push_inbound(wiredtest::discovery_request_frame());
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    ASSERT_GT(f.transport.sent_count(), before);
+
+    auto frame = tr::decode_frame(f.transport.last_sent());
+    ASSERT_TRUE(frame.has_value());
+    EXPECT_EQ(frame.value().header.channel, 0);
+    EXPECT_EQ(frame.value().header.encryption, tr::Encryption::encrypted);
+    auto opened = f.cipher->open(frame.value().payload);
+    ASSERT_TRUE(opened.has_value());
+    // Sealed post-auth control payload decodes back to a ServiceDiscoveryResponse
+    // (control id 0x0006) - proving it travelled under the negotiated cipher.
+    ASSERT_GE(opened.value().size(), 2U);
+    EXPECT_EQ(opened.value()[0], std::byte{0x00});
+    EXPECT_EQ(opened.value()[1], std::byte{0x06});
+    auto response = proto::decode_service_discovery_response(opened.value());
+    ASSERT_TRUE(response.has_value());
+}
+
+TEST(WiredE2eAuth, PostAuthInputCarriesNegotiatedCipher) {
+    AuthFixture f;
+    wiredtest::walk_auth(f.session, f.transport);
+    ASSERT_TRUE(f.session.authenticated());
+
+    const auto before = f.transport.sent_count();
+    (void)f.session.submit_input(aa::ipc::InputEvent{aa::ipc::KeyEvent{66, true}});
+    ASSERT_EQ(f.session.input_sends(), 1U);
+    ASSERT_GT(f.transport.sent_count(), before);
+
+    auto frame = tr::decode_frame(f.transport.last_sent());
+    ASSERT_TRUE(frame.has_value());
+    EXPECT_EQ(frame.value().header.encryption, tr::Encryption::encrypted);
+    auto opened = f.cipher->open(frame.value().payload);
+    ASSERT_TRUE(opened.has_value());
+    EXPECT_EQ(opened.value()[0], std::byte{0x80});
+    EXPECT_EQ(opened.value()[1], std::byte{0x01});
+}
+
+TEST(WiredE2eAuth, AuthCompleteBeforeSslIsRefused) {
+    AuthFixture f;
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::AuthComplete{0}).value()));
+    auto refused = f.session.poll_transport();
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_FALSE(f.session.authenticated());
+}
+
+} // namespace
