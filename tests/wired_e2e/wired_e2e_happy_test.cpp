@@ -98,8 +98,8 @@ TEST(WiredE2eHappy, ApprovedPhoneReachesActiveProjection) {
     ASSERT_TRUE(session.register_sink(proto::ChannelRole::media_audio, audio_sink).has_value());
     auto cipher = std::make_unique<wiredtest::FakeHandshakeCipher>();
     auto *cipher_raw = cipher.get();
-    session.attach_cipher(std::move(cipher));
     session.attach_transport(&transport);
+    session.attach_cipher(std::move(cipher));
 
     // Approved identity -> active session (admission is the TrustStore's call).
     ASSERT_TRUE(session.apply(ss::Event::start_discovery).has_value());

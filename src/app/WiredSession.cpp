@@ -71,22 +71,40 @@ void WiredSession::request_stop() noexcept { lifecycle_.request_stop(); }
 void WiredSession::attach_transport(transport::Transport *transport) noexcept {
     transport_ = transport;
     lifecycle_.attach_transport(transport);
-    // A fresh transport is a fresh link (the lifecycle never reuses a retired
-    // handle): drop every byte of the previous wire stream and all negotiated
-    // channel-open state, so a reconnect cannot resurrect the old session from
-    // cached framing/routing state (channels::Negotiator::reset() contract).
+    reset_link();
+}
+
+// Per-link lifecycle (finding P1-B): a fresh transport is a fresh link (the
+// lifecycle never reuses a retired handle), so every byte of the previous wire
+// stream, all negotiated channel-open state and the previous link's cipher are
+// dropped. Reusing the retired link's cipher would let stale negotiated keys
+// authenticate or seal on the new link without any handshake; sealing stays
+// impossible until attach_cipher() binds a fresh cipher and its handshake
+// completes (channels::Negotiator::reset() contract).
+void WiredSession::reset_link() noexcept {
     parser_ = transport::FrameStreamParser{};
     reassembler_ = transport::MessageReassembler{};
     if (negotiator_.has_value()) {
         negotiator_->reset();
     }
-    // A fresh link restarts the AAP authentication handshake.
     auth_phase_ = AuthPhase::awaiting_version;
     ssl_active_ = false;
+    cipher_.reset();
+    sequence_ = 0;
+    channel_opens_ = 0;
+    version_responses_ = 0;
+    pings_answered_ = 0;
+    encapsulated_ssls_ = 0;
+    auth_completes_ = 0;
 }
 
 void WiredSession::attach_cipher(std::unique_ptr<transport::HandshakingCipher> cipher) noexcept {
     cipher_ = std::move(cipher);
+    // P1-C: the same negotiated cipher opens inbound E=1 records. Bind it into
+    // the reassembler at every cipher attach (initial link and each reconnect);
+    // inbound encrypted frames still fail closed until the handshake completes
+    // (the reassembler requires an active cipher).
+    reassembler_ = transport::MessageReassembler{cipher_.get()};
 }
 
 // ---------------------------------------------------------------------------

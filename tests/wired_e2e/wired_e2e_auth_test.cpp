@@ -41,10 +41,10 @@ struct AuthFixture {
         : session(app::WiredSessionDeps{trust, clock, diagnostics}, app::WiredSessionConfig{}) {
         trust.set(kApproved, aa::trust::Decision::approved);
         EXPECT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+        session.attach_transport(&transport);
         auto owned = std::make_unique<FakeHandshakeCipher>();
         cipher = owned.get();
         session.attach_cipher(std::move(owned));
-        session.attach_transport(&transport);
         EXPECT_TRUE(session.apply(ss::Event::start_discovery).has_value());
         EXPECT_TRUE(session.phone_discovered(kApproved).has_value());
         EXPECT_TRUE(session.apply(ss::Event::transport_ready).has_value());
@@ -305,6 +305,150 @@ TEST(WiredE2eAuth, ControlChannelFramesUseAasdkSpecificKind) {
     f.transport.push_inbound(wiredtest::discovery_request_frame());
     ASSERT_TRUE(f.session.poll_transport().has_value());
     expect_specific_control_frame(f.transport.last_sent(), true);
+}
+
+// ---- P1-B/P1-C per-link cipher lifecycle ----------------------------------
+// attach_transport() starts a fresh link: it must drop the prior link's cipher
+// and its negotiation counters, so nothing from the old link can authenticate
+// or seal on the new one until a fresh handshake completes. The inbound
+// reassembler must open E=1 frames with the link's negotiated cipher.
+
+struct TwoLinkFixture {
+    ss::test::MapTrustStore trust;
+    ss::test::ManualClock clock;
+    wiredtest::CaptureSink capture;
+    aa::diagnostics::Diagnostics diagnostics{capture};
+    ScriptedTransport link1;
+    ScriptedTransport link2;
+    app::WiredSession session;
+
+    TwoLinkFixture()
+        : session(app::WiredSessionDeps{trust, clock, diagnostics}, app::WiredSessionConfig{}) {
+        trust.set(kApproved, aa::trust::Decision::approved);
+        EXPECT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+    }
+
+    void drive_link1_to_authenticated() {
+        session.attach_transport(&link1);
+        session.attach_cipher(std::make_unique<FakeHandshakeCipher>());
+        EXPECT_TRUE(session.apply(ss::Event::start_discovery).has_value());
+        EXPECT_TRUE(session.phone_discovered(kApproved).has_value());
+        EXPECT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+        wiredtest::walk_auth(session, link1);
+        EXPECT_TRUE(session.authenticated());
+        link1.push_inbound(wiredtest::open_request_frame(99));
+        EXPECT_TRUE(session.poll_transport().has_value());
+        EXPECT_TRUE(session.apply(ss::Event::negotiation_succeeded).has_value());
+        EXPECT_EQ(session.state(), ss::State::active);
+    }
+};
+
+TEST(WiredE2eAuth, ReconnectDropsStaleCipherAndLinkCounters) {
+    TwoLinkFixture f;
+    f.drive_link1_to_authenticated();
+    ASSERT_EQ(f.session.channel_opens(), 1U);
+
+    ASSERT_TRUE(f.session.apply(ss::Event::link_lost).has_value());
+    f.session.attach_transport(&f.link2);
+    EXPECT_EQ(f.session.version_responses(), 0U);
+    EXPECT_EQ(f.session.encapsulated_ssls(), 0U);
+    EXPECT_EQ(f.session.auth_completes(), 0U);
+    EXPECT_EQ(f.session.channel_opens(), 0U);
+
+    ASSERT_TRUE(f.session.apply(ss::Event::reconnect).has_value());
+    ASSERT_TRUE(f.session.apply(ss::Event::transport_ready).has_value());
+    ASSERT_TRUE(f.link2.is_open());
+
+    // The retired link's cipher must be gone: any traffic (here the version
+    // response) cannot authenticate and nothing can seal until the new link
+    // completes a full handshake.
+    f.link2.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
+    auto response = f.session.poll_transport();
+    ASSERT_FALSE(response.has_value());
+    EXPECT_FALSE(f.session.authenticated());
+    EXPECT_EQ(f.session.auth_completes(), 0U);
+
+    auto sealed = f.session.announce_services();
+    ASSERT_FALSE(sealed.has_value());
+    EXPECT_EQ(sealed.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_EQ(f.link2.sent_count(), 0U);
+}
+
+TEST(WiredE2eAuth, ReconnectFreshCipherRequiresFullHandshake) {
+    TwoLinkFixture f;
+    f.drive_link1_to_authenticated();
+    ASSERT_TRUE(f.session.apply(ss::Event::link_lost).has_value());
+    f.session.attach_transport(&f.link2);
+    EXPECT_EQ(f.session.version_responses(), 0U);
+    EXPECT_EQ(f.session.encapsulated_ssls(), 0U);
+    EXPECT_EQ(f.session.auth_completes(), 0U);
+    EXPECT_EQ(f.session.channel_opens(), 0U);
+    ASSERT_TRUE(f.session.apply(ss::Event::reconnect).has_value());
+    ASSERT_TRUE(f.session.apply(ss::Event::transport_ready).has_value());
+
+    // Production reconnect flow: a FRESH cipher bound to the re-admitted link.
+    f.session.attach_cipher(std::make_unique<FakeHandshakeCipher>());
+    f.link2.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    EXPECT_FALSE(f.session.authenticated());
+    EXPECT_EQ(f.session.auth_completes(), 0U);
+    auto sealed = f.session.announce_services();
+    ASSERT_FALSE(sealed.has_value());
+    EXPECT_EQ(sealed.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+
+    f.link2.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    EXPECT_TRUE(f.session.authenticated());
+    EXPECT_TRUE(f.session.announce_services().has_value());
+    EXPECT_EQ(f.session.auth_completes(), 1U);
+}
+
+TEST(WiredE2eAuth, InboundEncryptedRoundTripUsesNegotiatedCipher) {
+    AuthFixture f;
+    wiredtest::RecordingSink video_sink;
+    ASSERT_TRUE(f.session.register_sink(proto::ChannelRole::video, video_sink).has_value());
+    wiredtest::walk_auth(f.session, f.transport);
+    ASSERT_TRUE(f.session.authenticated());
+    f.transport.push_inbound(wiredtest::discovery_request_frame());
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    f.transport.push_inbound(wiredtest::open_request_frame(99));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+
+    // Inbound half: the phone seals (E=1) with the negotiated cipher and the
+    // session must reassemble and open the record back to the plaintext
+    // message before routing it to the channel sink.
+    const std::vector<std::byte> payload{std::byte{0x10}, std::byte{0x20}, std::byte{0x30}};
+    auto inbound =
+        tr::encode_message(tr::Message{std::uint8_t{99}, tr::MessageKind::specific, payload},
+                           tr::Encryption::encrypted, f.cipher);
+    ASSERT_TRUE(inbound.has_value());
+    for (const auto &frame : inbound.value()) {
+        f.transport.push_inbound(frame);
+    }
+    auto routed_poll = f.session.poll_transport();
+    if (!routed_poll) {
+        ADD_FAILURE() << "inbound E=1 route failed, code="
+                      << static_cast<int>(routed_poll.error().code());
+    }
+    ASSERT_TRUE(routed_poll.has_value());
+    ASSERT_EQ(video_sink.payloads.size(), 1U);
+    EXPECT_EQ(video_sink.payloads.front(), payload);
+    ASSERT_EQ(video_sink.headers.size(), 1U);
+    EXPECT_EQ(video_sink.headers.front().channel, proto::ChannelRole::video);
+
+    // Outbound half: input frames seal with the same negotiated cipher.
+    ASSERT_TRUE(
+        f.session.submit_input(aa::ipc::InputEvent{aa::ipc::KeyEvent{66, true}}).has_value());
+    auto frame = tr::decode_frame(f.transport.last_sent());
+    ASSERT_TRUE(frame.has_value());
+    EXPECT_EQ(frame.value().header.encryption, tr::Encryption::encrypted);
+    auto opened = f.cipher->open(frame.value().payload);
+    ASSERT_TRUE(opened.has_value());
+    EXPECT_EQ(opened.value()[0], std::byte{0x80});
+    EXPECT_EQ(opened.value()[1], std::byte{0x01});
 }
 
 } // namespace

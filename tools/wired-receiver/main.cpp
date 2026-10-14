@@ -363,6 +363,23 @@ int main(int argc, char **argv) {
     selector.port_context = port;
     aa::transport::AoaAccessoryInfo accessory{};
     log_line("{\"event\":\"connecting\",\"port\":\"" + port + "\"}");
+
+    // Per-link cipher (P1-B/P1-C): the initial attach AND every reconnect build
+    // a FRESH cipher bound to the identity the TrustStore admitted for THIS
+    // link - never the prior link's cipher object and never the initially
+    // captured trust predicate. The predicate re-checks the store on each
+    // handshake step, so a mid-handshake revoke fails closed.
+    auto bind_link_cipher = [&session, &store](const aa::trust::PhoneIdentity &phone) -> bool {
+        auto cipher = aa::transport::make_server_handshake_cipher([&store, phone] {
+            return store.lookup(phone) == aa::trust::Decision::approved;
+        });
+        if (!cipher) {
+            return false;
+        }
+        session.attach_cipher(std::move(cipher));
+        return true;
+    };
+
     auto first_link = aa::app::open_wired_link(selector, accessory, store);
     if (!first_link.has_value()) {
         log_line(std::string{"{\"event\":\"err\",\"detail\":\"link\",\"code\":\""} +
@@ -371,15 +388,10 @@ int main(int argc, char **argv) {
     }
     std::optional<aa::app::WiredLink> link{std::move(first_link.value())};
     session.attach_transport(link->transport.get());
-    const auto admitted_phone = link->phone;
-    auto cipher = aa::transport::make_server_handshake_cipher([&store, admitted_phone] {
-        return store.lookup(admitted_phone) == aa::trust::Decision::approved;
-    });
-    if (!cipher) {
+    if (!bind_link_cipher(link->phone)) {
         log_line("{\"event\":\"err\",\"detail\":\"tls_cipher\"}");
         return 3;
     }
-    session.attach_cipher(std::move(cipher));
     if (!session.apply(aa::session::Event::start_discovery).has_value() ||
         !session.phone_discovered(link->phone).has_value() ||
         !session.apply(aa::session::Event::transport_ready).has_value()) {
@@ -425,7 +437,8 @@ int main(int argc, char **argv) {
                     if (relink.has_value()) {
                         link.emplace(std::move(relink.value()));
                         session.attach_transport(link->transport.get());
-                        if (session.apply(aa::session::Event::reconnect).has_value() &&
+                        if (bind_link_cipher(link->phone) &&
+                            session.apply(aa::session::Event::reconnect).has_value() &&
                             session.apply(aa::session::Event::transport_ready).has_value() &&
                             session.send_version_request(1, 6).has_value()) {
                             continue;

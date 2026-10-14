@@ -99,10 +99,21 @@ class WiredSession final {
     [[nodiscard]] core::Result<void> fail(Error reason);
     void tick();
     void request_stop() noexcept;
+
+    // Per-link lifecycle: attach_transport() begins a FRESH link and drops
+    // every per-link artifact of the previous one - wire parser, reassembler
+    // and its cipher binding, negotiated channel state, the auth phase and the
+    // previous link's cipher. Call order per link is attach_transport() first,
+    // then attach_cipher(); sealing is impossible until the new link's cipher
+    // handshake completes.
     void attach_transport(transport::Transport *transport) noexcept;
 
     // AAP authentication/TLS handshake (finding F1). Attach the negotiated TLS
-    // cipher seam (the HU-side handshake cipher) before driving the handshake.
+    // cipher seam (the HU-side handshake cipher) AFTER attach_transport(); the
+    // same cipher object is bound into the message reassembler so inbound E=1
+    // records open with it once the handshake completes (P1-C). Attach a FRESH
+    // cipher per link (initial attach and every reconnect), bound to the
+    // currently admitted identity - never reuse a prior link's cipher.
     // The phone-side control progression is: version_response -> exchange
     // encapsulated_ssl handshake chunks -> auth_complete. Media/input channel
     // traffic is refused until authenticated(); post-auth outbound frames use
@@ -150,7 +161,11 @@ class WiredSession final {
     // onto the input service channel over the transport.
     [[nodiscard]] core::Result<void> submit_input(const ipc::InputEvent &event);
 
-    // Observed counters (diagnostics/tests).
+    // Observed counters (diagnostics/tests). The negotiation counters
+    // (channel_opens, version_responses, pings_answered, encapsulated_ssls,
+    // auth_completes) are PER-LINK: attach_transport() zeroes them with the
+    // link state. input_sends/input_send_failures/diagnostics_emitted are
+    // run-cumulative telemetry.
     [[nodiscard]] std::uint64_t diagnostics_emitted() const noexcept {
         return diagnostics_emitted_;
     }
@@ -173,6 +188,7 @@ class WiredSession final {
     [[nodiscard]] core::Result<void> route(const transport::Message &message);
     [[nodiscard]] core::Result<void> handle_control(std::span<const std::byte> payload);
     [[nodiscard]] core::Result<void> drive_ssl_handshake();
+    void reset_link() noexcept;
     [[nodiscard]] core::Result<std::size_t>
     send_payload(const protocol::ServiceDiscoveryResponse &response);
     [[nodiscard]] core::Result<std::size_t>
