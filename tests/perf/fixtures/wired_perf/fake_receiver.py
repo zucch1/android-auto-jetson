@@ -70,6 +70,10 @@ def main() -> int:
 
     print(json.dumps({"event": "ready", "state": "negotiating"}), flush=True)
     print(json.dumps({"event": "active", "startup_ms": 120}), flush=True)
+    raw_telemetry = os.environ.get("FAKE_RECEIVER_RAW_TELEMETRY")
+    if raw_telemetry is not None:
+        print('{"event":"media_timing","av_sync_ms":12,"audio_latency_ms":40}', flush=True)
+        print(raw_telemetry, flush=True)
 
     start = time.monotonic()
     tick = 0

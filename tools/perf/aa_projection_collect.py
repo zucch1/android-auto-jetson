@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import platform
 import shutil
@@ -98,6 +99,8 @@ def _thermal_zones() -> list[dict]:
             temp_c = float(raw) / 1000.0
         except ValueError:
             continue
+        if not math.isfinite(temp_c):
+            continue
         name = _read_text(os.path.join(zone_dir, "type")) or os.path.basename(zone_dir)
         zones.append({"zone": name, "temp_c": temp_c})
     return zones
@@ -139,6 +142,29 @@ class EventParser:
         self.video_units: int | None = None
         self.audio_chunks: int | None = None
         self.startup_ms: int | None = None
+        self.invalid_telemetry: list[str] = []
+        self.terminal_errors: list[dict] = []
+
+    def _number(self, event: dict, key: str, target: str, *, integer: bool = False,
+                peak: bool = False) -> None:
+        if key not in event:
+            return
+        raw = event[key]
+        try:
+            valid = (not isinstance(raw, bool) and isinstance(raw, (int, float))
+                     and math.isfinite(raw) and (not integer or isinstance(raw, int)))
+        except OverflowError:
+            valid = False
+        if not valid:
+            self.metrics[target] = None
+            if target not in self.invalid_telemetry:
+                self.invalid_telemetry.append(target)
+            return
+        if target in self.invalid_telemetry:
+            return
+        value = int(raw) if integer else float(raw)
+        prior = self.metrics[target]
+        self.metrics[target] = max(prior, value) if peak and prior is not None else value
 
     def poll(self, path: str) -> None:
         try:
@@ -174,6 +200,8 @@ class EventParser:
         # a bare event line names its kind in "event" itself.
         inner = event.get("kind")
         kind = inner if isinstance(inner, str) else envelope
+        if envelope == "err":
+            self.terminal_errors.append({"event": "err", "code": str(event.get("code", "unknown"))})
         if envelope == "video_sent" and isinstance(event.get("units"), int):
             self.video_units = event["units"]
         if envelope == "audio_chunks" and isinstance(event.get("count"), int):
@@ -182,22 +210,15 @@ class EventParser:
             self.startup_ms = event["startup_ms"]
         if kind == "transport_stats":
             for key, target in _IPC_KEYS.items():
-                if isinstance(event.get(key), (int, float)):
-                    self.metrics[target] = float(event[key])
+                self._number(event, key, target)
         if kind == "decode_stats":
             for key, target in _DECODE_KEYS.items():
-                if isinstance(event.get(key), (int, float)):
-                    raw = event[key]
-                    self.metrics[target] = int(raw) if target == "decode_frames" else float(raw)
+                self._number(event, key, target, integer=target == "decode_frames")
             for drops_key in ("dropped", "drops"):
-                if isinstance(event.get(drops_key), int):
-                    self.metrics["frame_drops"] = event[drops_key]
-        if isinstance(event.get("av_sync_ms"), (int, float)):
-            self.metrics["av_sync_ms"] = float(event["av_sync_ms"])
-        if isinstance(event.get("audio_latency_ms"), (int, float)):
-            self.metrics["audio_latency_ms"] = float(event["audio_latency_ms"])
-        if isinstance(event.get("frame_drops"), int):
-            self.metrics["frame_drops"] = event["frame_drops"]
+                self._number(event, drops_key, "frame_drops", integer=True)
+        self._number(event, "av_sync_ms", "av_sync_ms", peak=True)
+        self._number(event, "audio_latency_ms", "audio_latency_ms", peak=True)
+        self._number(event, "frame_drops", "frame_drops", integer=True)
 
 
 def _terminate(proc: subprocess.Popen | None) -> None:
@@ -235,6 +256,9 @@ def collect(args: argparse.Namespace) -> dict:
     receiver_exit: int | None = None
     early_exit = False
     stopped_by_us = False
+    display_survived: bool | None = None
+    start = time.monotonic()
+    observed_duration = 0.0
 
     try:
         rec_file = open(receiver_log, "w", encoding="utf-8")
@@ -252,9 +276,8 @@ def collect(args: argparse.Namespace) -> dict:
                                        start_new_session=True)
 
         clk = os.sysconf("SC_CLK_TCK")
-        start = time.monotonic()
         prev_ticks = _cpu_ticks(receiver.pid)
-        prev_time = start
+        prev_time = time.monotonic()
         deadline = start + args.duration_seconds
         while True:
             now = time.monotonic()
@@ -262,6 +285,11 @@ def collect(args: argparse.Namespace) -> dict:
                 break
             if receiver.poll() is not None:
                 early_exit = True
+                break
+            if display is not None and display.poll() is not None:
+                display_survived = False
+                break
+            if parser.terminal_errors:
                 break
             time.sleep(min(args.interval, max(0.0, deadline - now)))
             now = time.monotonic()
@@ -284,10 +312,15 @@ def collect(args: argparse.Namespace) -> dict:
             })
             prev_ticks, prev_time = ticks, now
 
-        parser.poll(str(receiver_log))
+        observed_duration = time.monotonic() - start
+        if display is not None and display_survived is None:
+            display_survived = display.poll() is None
         if receiver.poll() is None:
-            stopped_by_us = True
-            _terminate(receiver)
+            try:
+                receiver.wait(timeout=min(args.interval, _TERMINATE_GRACE_SECONDS))
+            except subprocess.TimeoutExpired:
+                stopped_by_us = True
+                _terminate(receiver)
         receiver_exit = receiver.returncode
     except FileNotFoundError as exc:
         raise SystemExit(f"error: cannot launch receiver: {exc}") from exc
@@ -298,6 +331,9 @@ def collect(args: argparse.Namespace) -> dict:
             rec_file.close()
         if disp_file is not None:
             disp_file.close()
+        parser.poll(str(receiver_log))
+        if display is not None:
+            parser.poll(str(display_log))
 
     if receiver_exit is None and receiver is not None:
         receiver_exit = receiver.returncode
@@ -316,9 +352,15 @@ def collect(args: argparse.Namespace) -> dict:
         "schema": CAPTURE_SCHEMA,
         "mode": "wired",
         "duration_seconds": args.duration_seconds,
+        "observed_duration_seconds": observed_duration,
+        "measurement_origin": "live",
         "crashes": crashes,
         "early_exit": early_exit,
         "receiver_exit_code": receiver_exit,
+        "receiver_stopped_by_collector": stopped_by_us,
+        "display_survived": display_survived,
+        "terminal_errors": parser.terminal_errors,
+        "invalid_telemetry": parser.invalid_telemetry,
         "samples": samples,
         "events": events,
         "target_hardware_state": _target_hardware_state(),
@@ -342,7 +384,7 @@ def _cli(argv: list[str]) -> int:
     if args.duration_seconds <= 0:
         print("error: --duration-seconds must be positive", file=sys.stderr)
         return 2
-    if args.interval <= 0:
+    if not math.isfinite(args.interval) or args.interval <= 0:
         print("error: --interval must be positive", file=sys.stderr)
         return 2
 
@@ -353,7 +395,7 @@ def _cli(argv: list[str]) -> int:
     finally:
         signal.signal(signal.SIGTERM, old_handler)
 
-    json.dump(capture, sys.stdout, indent=2, sort_keys=True)
+    json.dump(capture, sys.stdout, indent=2, sort_keys=True, allow_nan=False)
     sys.stdout.write("\n")
     return 0
 

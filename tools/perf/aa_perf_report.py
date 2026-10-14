@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,8 @@ import aa_perf_schema  # noqa: E402
 TASK = "32. Measure wired performance and two-hour soak"
 SCHEMA_VERSION = "aa-projection-perf/1"
 CAPTURE_SCHEMA = "aa-projection-perf-capture/1"
+EVENT_METRICS = ("frame_drops", "decode_p50_ms", "decode_p95_ms", "decode_fps",
+                 "decode_frames", "ipc_throughput_mbps", "ipc_p95_added_latency_ms")
 
 # Contractual budgets (plan "Contract budgets" line + task-32 acceptance).
 # Do NOT edit to make a run pass.
@@ -70,7 +74,11 @@ def _as_float(value: object) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ContractError(f"expected a number or null, got {value!r}")
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _as_int(value: object) -> int | None:
@@ -91,6 +99,8 @@ def _metric(
     status: str | None = None,
     note: str | None = None,
 ) -> dict:
+    if value is not None and not math.isfinite(value):
+        value = None
     if status is None:
         if not gated:
             status = "INFORMATIONAL"
@@ -148,14 +158,16 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                  blocked_on_override: str | None = None) -> dict:
     if not isinstance(capture, dict):
         raise ContractError("capture must be a JSON object")
+    capture, numeric_errors = aa_perf_schema.finite_numbers(capture)
     if capture.get("schema") not in (CAPTURE_SCHEMA, None):
         raise ContractError(f"unexpected capture schema: {capture.get('schema')!r}")
     if capture.get("mode") != "wired":
         raise ContractError(f"capture mode must be 'wired', got {capture.get('mode')!r}")
 
-    duration_seconds = _as_int(capture.get("duration_seconds"))
+    duration_seconds = _as_float(capture.get("observed_duration_seconds",
+                                             capture.get("duration_seconds")))
     if duration_seconds is None or duration_seconds < 0:
-        raise ContractError("capture.duration_seconds must be a non-negative integer")
+        raise ContractError("capture duration must be a finite non-negative number")
     crashes = _as_int(capture.get("crashes"))
 
     samples = capture.get("samples") or []
@@ -248,6 +260,64 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
             }
         )
 
+    origin = capture.get("measurement_origin", "offline")
+    if origin not in ("live", "offline"):
+        raise ContractError("measurement_origin must be live or offline")
+    run_status = {name: capture.get(name) for name in
+                  ("early_exit", "receiver_exit_code", "receiver_stopped_by_collector",
+                   "display_survived", "terminal_errors")}
+    run_status.update({name: events.get(name) for name in
+                       ("startup_ms", "video_units", "audio_chunks")})
+    run_failures = []
+    if run_status["early_exit"]:
+        run_failures.append("early_exit")
+    if run_status["receiver_exit_code"] not in (None, 0):
+        run_failures.append("receiver_exit_code")
+    if run_status["display_survived"] is False:
+        run_failures.append("display_survived")
+    if run_status["terminal_errors"]:
+        run_failures.append("terminal_errors")
+    requested_window = _as_float(capture.get("duration_seconds"))
+    if requested_window is not None and duration_seconds < requested_window:
+        run_failures.append("incomplete_window")
+    for failure in run_failures:
+        violations.append({"metric": failure, "value": None, "budget_max": 0,
+                           "detail": "projection run failed: " + failure})
+    named_gaps = [name for name in EVENT_METRICS if metrics[name]["value"] is None]
+    unavailable.extend(named_gaps)
+    invalid_telemetry = list(capture.get("invalid_telemetry") or []) + numeric_errors
+    if invalid_telemetry:
+        unavailable.append("invalid_telemetry")
+    if origin == "live":
+        for name in ("early_exit", "receiver_exit_code", "startup_ms", "video_units",
+                     "audio_chunks", "display_survived"):
+            value = run_status[name]
+            if value is None or (name in ("video_units", "audio_chunks") and value <= 0):
+                unavailable.append("run_evidence:" + name)
+        if "observed_duration_seconds" not in capture:
+            unavailable.append("run_evidence:observed_duration_seconds")
+
+    provenance_source = provenance_override if provenance_override is not None else capture.get("provenance")
+    provenance_source, provenance_numeric_errors = aa_perf_schema.finite_numbers(provenance_source)
+    invalid_telemetry.extend(provenance_numeric_errors)
+    provenance = _normalise_provenance(provenance_source)
+    if not provenance["target_hardware_state"] and "target_hardware_state" in capture:
+        provenance["target_hardware_state"] = capture["target_hardware_state"]
+    provenance_gaps = []
+    if origin == "live":
+        for name in ("source_digest", "build_artifact_digest", "configuration_digest"):
+            if not _digest(provenance[name]):
+                provenance_gaps.append(name)
+        services = provenance["service_definitions"]
+        if not services or any(not s.get("name") or not _digest(s.get("digest")) for s in services):
+            provenance_gaps.append("service_definitions")
+        deps = provenance["dependency_versions"]
+        if not deps or any(not name or not version for name, version in deps.items()):
+            provenance_gaps.append("dependency_versions")
+    unavailable.extend("provenance:" + name for name in provenance_gaps)
+    if provenance_numeric_errors:
+        unavailable.append("invalid_telemetry")
+
     blocked_on: str | None = None
     if violations:
         verdict = "FAIL"
@@ -278,15 +348,6 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     if not samples:
         notes.append("capture contained no samples; gated metrics are unavailable")
 
-    provenance_source = dict(provenance_override) if provenance_override is not None else {}
-    if not provenance_source:
-        provenance_source = dict(capture.get("provenance") or {})
-    # Target hardware state observed by the on-target collector fills the gap
-    # only if the caller did not already supply one.
-    if "target_hardware_state" not in provenance_source and "target_hardware_state" in capture:
-        provenance_source["target_hardware_state"] = capture["target_hardware_state"]
-    provenance = _normalise_provenance(provenance_source)
-
     result = {
         "schema": SCHEMA_VERSION,
         "task": TASK,
@@ -294,6 +355,13 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         "mode": "wired",
         "duration_requested": duration_requested,
         "duration_seconds": duration_seconds,
+        "measurement_origin": origin,
+        "qualification_status": ("INCOMPLETE" if verdict != "PASS" else
+                                 "COMPLETE_LIVE" if origin == "live" else "OFFLINE_ONLY"),
+        "named_gaps": named_gaps,
+        "provenance_gaps": provenance_gaps,
+        "invalid_telemetry": invalid_telemetry,
+        "run_status": run_status,
         "verdict": verdict,
         "blocked_on": blocked_on,
         "crashes": crashes if crashes is not None else 0,
@@ -312,6 +380,10 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     if errors:
         raise ContractError("internal: produced document is off-schema: " + "; ".join(errors))
     return result
+
+
+def _digest(value: str | None) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", value) is not None
 
 
 def _normalise_provenance(raw: object) -> dict:
@@ -358,7 +430,8 @@ def _cli(argv: list[str]) -> int:
                         help="JSON provenance block computed by the host wrapper")
     parser.add_argument("--now", default=None, help="override generated_at_utc (determinism/tests)")
     parser.add_argument("--blocked-on", default=None,
-                        help="force a BLOCKED verdict with this reason (pre-run prerequisites)")
+                         help="force a BLOCKED verdict with this reason (pre-run prerequisites)")
+    parser.add_argument("--live", action="store_true")
     args = parser.parse_args(argv)
 
     provenance_override: dict | None = None
@@ -385,6 +458,8 @@ def _cli(argv: list[str]) -> int:
         return 2
 
     now = args.now or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if args.live and isinstance(capture, dict):
+        capture["measurement_origin"] = "live"
     try:
         result = build_result(
             capture,
@@ -401,7 +476,7 @@ def _cli(argv: list[str]) -> int:
 
     try:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        args.out.write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
     except OSError as exc:
         print(f"error: cannot write {args.out}: {exc}", file=sys.stderr)
         return 2

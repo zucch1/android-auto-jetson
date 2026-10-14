@@ -18,7 +18,9 @@
     "thermal_state",
     "violations",
     "provenance",
-    "notes"
+    "notes",
+    "measurement_origin", "qualification_status", "named_gaps", "provenance_gaps",
+    "invalid_telemetry", "run_status"
   ],
   "properties": {
     "schema": { "const": "aa-projection-perf/1" },
@@ -26,7 +28,26 @@
     "generated_at_utc": { "type": "string", "format": "date-time" },
     "mode": { "enum": ["wired"] },
     "duration_requested": { "type": ["string", "null"] },
-    "duration_seconds": { "type": "integer", "minimum": 0 },
+    "duration_seconds": { "type": "number", "minimum": 0 },
+    "measurement_origin": { "enum": ["live", "offline"] },
+    "qualification_status": { "enum": ["COMPLETE_LIVE", "OFFLINE_ONLY", "INCOMPLETE"] },
+    "named_gaps": { "type": "array", "items": { "type": "string" } },
+    "provenance_gaps": { "type": "array", "items": { "type": "string" } },
+    "invalid_telemetry": { "type": "array", "items": { "type": "string" } },
+    "run_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "early_exit": { "type": ["boolean", "null"] },
+        "receiver_exit_code": { "type": ["integer", "null"] },
+        "receiver_stopped_by_collector": { "type": ["boolean", "null"] },
+        "display_survived": { "type": ["boolean", "null"] },
+        "terminal_errors": { "type": ["array", "null"], "items": { "type": "object" } },
+        "startup_ms": { "type": ["integer", "null"] },
+        "video_units": { "type": ["integer", "null"] },
+        "audio_chunks": { "type": ["integer", "null"] }
+      }
+    },
     "verdict": { "enum": ["PASS", "FAIL", "BLOCKED"] },
     "blocked_on": { "type": ["string", "null"] },
     "crashes": { "type": "integer", "minimum": 0 },

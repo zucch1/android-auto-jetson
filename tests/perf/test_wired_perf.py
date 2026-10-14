@@ -58,6 +58,7 @@ NOW = "2026-10-13T00:00:00Z"
 sys.path.insert(0, str(TOOL))
 import aa_perf_schema  # noqa: E402
 import aa_perf_report  # noqa: E402
+import test_gate_regressions as gate
 
 
 def run(argv: list[str], env: dict | None = None, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -98,12 +99,14 @@ def make_capture(tmp: Path, name: str, *, rss0: float, rss1: float, cpu: float, 
             {"t_ms": 1800000, "receiver_rss_mb": rss1, "receiver_cpu_pct_one_core": cpu,
              "thermal_peak_c": 46.0},
         ],
-        "events": {"av_sync_ms": av, "audio_latency_ms": audio, "helper_rss_mb": None},
+        "events": {**load(NOMINAL)["events"], "av_sync_ms": av,
+                   "audio_latency_ms": audio, "helper_rss_mb": None},
     })
     return path
 
 
 def case_schema(tmp: Path) -> None:
+    gate.finite(tmp)
     result_path = tmp / "result.json"
     assert report(NOMINAL, result_path).returncode == 0, "nominal fixture must report"
     assert run([sys.executable, "-B", str(VALIDATOR), "validate", str(SCHEMA),
@@ -170,7 +173,8 @@ def case_schema(tmp: Path) -> None:
             {"t_ms": 60000, "receiver_rss_mb": 100.0, "receiver_cpu_pct_one_core": 10.0,
              "thermal_zones": [{"zone": 'cpu"]},"pwned":true', "temp_c": 44.0}]},
         ],
-        "events": {"av_sync_ms": 5.0, "audio_latency_ms": 10.0, "helper_rss_mb": None},
+        "events": {**load(NOMINAL)["events"], "av_sync_ms": 5.0,
+                   "audio_latency_ms": 10.0, "helper_rss_mb": None},
     })
     hostile_out = tmp / "hostile-result.json"
     assert report(hostile, hostile_out).returncode == 0
@@ -260,6 +264,8 @@ def case_duration(tmp: Path) -> None:
 
 
 def case_contract(tmp: Path) -> None:
+    gate.interruption(tmp)
+    gate.completeness(tmp)
     base = load(NOMINAL)
 
     helper = tmp / "helper.json"
@@ -321,6 +327,7 @@ def _collect(tmp: Path, state_dir: Path, seconds: int, env: dict | None = None) 
 
 
 def case_collector(tmp: Path) -> None:
+    gate.shutdown(tmp)
     env = os.environ.copy()
     state = tmp / "state"
     res = _collect(tmp, state, 3, env)
@@ -380,9 +387,9 @@ def case_media_timing(tmp: Path) -> None:
     capture_path = tmp / "timing-capture.json"
     capture_path.write_text(first.stdout, encoding="utf-8")
     out = tmp / "timing-result.json"
-    assert report(capture_path, out).returncode != 3, "gated media metrics stayed unavailable"
+    assert report(capture_path, out).returncode == 3, "incomplete live provenance/IPC must BLOCK"
     doc = load(out)
-    assert doc["verdict"] != "BLOCKED" and doc["blocked_on"] is None, doc["blocked_on"]
+    assert doc["verdict"] == "BLOCKED" and "ipc_throughput_mbps" in doc["named_gaps"]
     assert doc["metrics"]["av_sync_ms"]["value"] == 12.5
     assert doc["metrics"]["audio_latency_ms"]["value"] == 40.5
     assert doc["metrics"]["av_sync_ms"]["status"] == "PASS"
@@ -403,7 +410,7 @@ def case_media_timing(tmp: Path) -> None:
     varied_path = tmp / "varied-capture.json"
     varied_path.write_text(second.stdout, encoding="utf-8")
     varied_out = tmp / "varied-result.json"
-    assert report(varied_path, varied_out).returncode != 3, "varied capture stayed BLOCKED"
+    assert report(varied_path, varied_out).returncode == 3, "incomplete live capture must BLOCK"
     varied_doc = load(varied_out)
     assert varied_doc["metrics"]["av_sync_ms"]["value"] == 45.0
     assert varied_doc["metrics"]["audio_latency_ms"]["value"] == 120.0
@@ -474,17 +481,17 @@ def case_media_timing(tmp: Path) -> None:
     assert report(plain_path, plain_out).returncode == 3
     assert load(plain_out)["verdict"] == "BLOCKED"
 
-    # Drift guard: the fixture contract must match what the real receiver
-    # actually emits - if tools/wired-receiver/main.cpp stops carrying the
-    # hook this fails instead of silently passing on the fake alone.
     receiver_source = (ROOT / "tools" / "wired-receiver" / "main.cpp").read_text(
         encoding="utf-8")
-    for token in ("media_timing", "av_sync_ms", "audio_latency_ms",
-                  "max_completion_skew", "max_path_latency"):
-        assert token in receiver_source, f"receiver hook lost {token!r}"
+    assert gate.receiver_hook_present(receiver_source), "receiver hook/stat read is absent"
+    assert not gate.receiver_hook_present(receiver_source.replace(
+        "emit_media_timing();", "/* emit_media_timing(); */")), "commented call passed guard"
+    assert not gate.receiver_hook_present(receiver_source.replace(
+        "router_.pump()", "/* router_.pump() */")), "missing stat update passed guard"
 
 
 def case_readiness(tmp: Path) -> None:
+    gate.readiness(tmp)
     out = tmp / "readiness.json"
     res = shell(["--readiness-only", "--host", "127.0.0.1", "--out", str(out)], timeout=45)
     assert res.returncode == 3, f"unmet prerequisites must exit 3, got {res.returncode}: {res.stderr}"

@@ -32,6 +32,7 @@ Exit: 0 valid, 1 invalid (errors on stderr), 2 usage or I/O error.
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from datetime import datetime
@@ -257,7 +258,34 @@ def validate(instance: object, schema: dict, root: dict | None = None) -> list[s
     """Return a list of human-readable errors; empty means valid."""
     if not isinstance(schema, dict):
         raise SchemaError("schema must be a JSON object")
-    return _validate(instance, schema, root if root is not None else schema, "$", 0)
+    _, numeric_errors = finite_numbers(instance)
+    return numeric_errors + _validate(instance, schema, root if root is not None else schema, "$", 0)
+
+
+def finite_numbers(instance, path: str = "$") -> tuple:
+    """Copy JSON data, replacing non-finite numbers with null and recording paths."""
+    errors: list[str] = []
+    if isinstance(instance, (int, float)) and not isinstance(instance, bool):
+        try:
+            finite = math.isfinite(instance)
+        except OverflowError:
+            finite = False
+        if not finite:
+            return None, [f"{path}: non-finite number"]
+    if isinstance(instance, dict):
+        clean = {}
+        for key, value in instance.items():
+            clean[key], child_errors = finite_numbers(value, f"{path}.{key}")
+            errors.extend(child_errors)
+        return clean, errors
+    if isinstance(instance, list):
+        clean_list = []
+        for index, value in enumerate(instance):
+            child, child_errors = finite_numbers(value, f"{path}[{index}]")
+            clean_list.append(child)
+            errors.extend(child_errors)
+        return clean_list, errors
+    return instance, errors
 
 
 def load_schema(path: Path) -> dict:
