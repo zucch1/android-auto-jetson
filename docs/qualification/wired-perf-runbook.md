@@ -28,7 +28,7 @@ never weakened.
    AOA switch; `18d1:2d00`/`18d1:2d01` after) with Android Auto / USB debugging
    as needed, and the approved-phone trust store loaded (task 27).
 3. Display connected (DP-1 or HDMI-A-1 `connected`) and a PipeWire output sink
-   present (`pactl list short sinks`) — required for the audio-latency and
+    present (`pactl list short sinks` or `pw-cli`) — required for the audio-latency and
    A/V-sync budgets to be meaningful.
 4. An installed `aa-wired-receiver` (and `aa-dummy-display`) on the target. Until
    the aarch64 receiver/adapter packaging (task 41) lands, the target binary may
