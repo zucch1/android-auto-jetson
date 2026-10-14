@@ -49,6 +49,9 @@ class ScriptedTransport final : public aa::transport::Transport {
         if (!open_) {
             return aa::Error{aa::ErrorCode::transport_closed};
         }
+        if (fail_send_at_ == sent_.size()) {
+            return aa::Error{aa::ErrorCode::transport_io};
+        }
         sent_.emplace_back(frame.begin(), frame.end());
         return {};
     }
@@ -71,6 +74,7 @@ class ScriptedTransport final : public aa::transport::Transport {
     }
 
     void push_inbound(std::vector<std::byte> frame) { inbound_.push_back(std::move(frame)); }
+    void fail_send_at(std::optional<std::size_t> index) { fail_send_at_ = index; }
 
     [[nodiscard]] std::size_t sent_count() const noexcept { return sent_.size(); }
     [[nodiscard]] const std::vector<std::byte> &last_sent() const noexcept { return sent_.back(); }
@@ -81,6 +85,7 @@ class ScriptedTransport final : public aa::transport::Transport {
   private:
     std::vector<std::vector<std::byte>> inbound_{};
     std::vector<std::vector<std::byte>> sent_{};
+    std::optional<std::size_t> fail_send_at_{};
     std::optional<aa::core::CancellationToken> token_{};
     bool open_{false};
     int open_calls_{0};
@@ -210,7 +215,7 @@ inline std::vector<std::byte> service_frame(std::uint8_t channel, std::vector<st
 }
 
 // The fake phone's AAP authentication control progression: version_response ->
-// exchange encapsulated_ssl handshake chunks -> auth_complete. Drives the
+// exchange encapsulated_ssl handshake chunks -> HU sends auth_complete. Drives the
 // session over the scripted transport exactly as a real phone would.
 inline void walk_auth(aa::app::WiredSession &session, ScriptedTransport &transport) {
     transport.push_inbound(
@@ -218,9 +223,6 @@ inline void walk_auth(aa::app::WiredSession &session, ScriptedTransport &transpo
     (void)session.poll_transport();
     transport.push_inbound(control_frame(
         aa::protocol::encode(aa::protocol::EncapsulatedSsl{{std::byte{0x01}}}).value()));
-    (void)session.poll_transport();
-    transport.push_inbound(
-        control_frame(aa::protocol::encode(aa::protocol::AuthComplete{0}).value()));
     (void)session.poll_transport();
 }
 

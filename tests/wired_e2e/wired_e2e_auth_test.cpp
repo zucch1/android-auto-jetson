@@ -2,7 +2,7 @@
 //
 // AAP authentication/TLS progression (finding F1): a fake phone walks
 // version_response -> exchange encapsulated_ssl handshake chunks ->
-// auth_complete. These tests assert the wire contract: the session reaches the
+// HU sends auth_complete. These tests assert the wire contract: the session reaches the
 // authenticated/active progression only after auth_complete, pre-auth channel
 // and input traffic is refused, and post-auth frames carry the negotiated cipher
 // (encrypted, sealed with the handshake cipher) - never plaintext.
@@ -13,8 +13,8 @@
 
 #include <gtest/gtest.h>
 
-#include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -60,17 +60,28 @@ TEST(WiredE2eAuth, AuthenticatedOnlyAfterAuthComplete) {
     ASSERT_TRUE(f.session.poll_transport().has_value());
     EXPECT_FALSE(f.session.authenticated());
     EXPECT_EQ(f.session.version_responses(), 1U);
+    EXPECT_EQ(f.session.auth_completes(), 0U);
+    auto handshake = tr::decode_frame(f.transport.last_sent());
+    ASSERT_TRUE(handshake.has_value());
+    EXPECT_EQ(handshake.value().header.encryption, tr::Encryption::plain);
+    auto ssl = proto::decode_encapsulated_ssl(handshake.value().payload);
+    ASSERT_TRUE(ssl.has_value());
+    EXPECT_EQ(ssl.value().bytes, (std::vector<std::byte>{std::byte{0xEE}}));
 
+    const auto before = f.transport.sent_count();
     f.transport.push_inbound(
         wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
     ASSERT_TRUE(f.session.poll_transport().has_value());
-    EXPECT_FALSE(f.session.authenticated());
     EXPECT_GT(f.session.encapsulated_ssls(), 0U);
     EXPECT_TRUE(f.cipher->is_active());
-
-    f.transport.push_inbound(
-        wiredtest::control_frame(proto::encode(proto::AuthComplete{0}).value()));
-    ASSERT_TRUE(f.session.poll_transport().has_value());
+    ASSERT_EQ(f.transport.sent_count(), before + 2U); // final TLS chunk, then auth
+    auto frame = tr::decode_frame(f.transport.last_sent());
+    ASSERT_TRUE(frame.has_value());
+    EXPECT_EQ(frame.value().header.channel, 0);
+    EXPECT_EQ(frame.value().header.encryption, tr::Encryption::plain);
+    auto complete = proto::decode_auth_complete(frame.value().payload);
+    ASSERT_TRUE(complete.has_value());
+    EXPECT_EQ(complete.value().status, 0); // MessageStatus::STATUS_SUCCESS
     EXPECT_TRUE(f.session.authenticated());
     EXPECT_EQ(f.session.auth_completes(), 1U);
 
@@ -80,6 +91,77 @@ TEST(WiredE2eAuth, AuthenticatedOnlyAfterAuthComplete) {
     EXPECT_EQ(f.session.channel_opens(), 1U);
     ASSERT_TRUE(f.session.apply(ss::Event::negotiation_succeeded).has_value());
     EXPECT_EQ(f.session.state(), ss::State::active);
+}
+
+TEST(WiredE2eAuth, RedrivenHandshakeDoesNotResendAuthComplete) {
+    AuthFixture f;
+    wiredtest::walk_auth(f.session, f.transport);
+    ASSERT_TRUE(f.session.authenticated());
+    const auto before = f.transport.sent_count();
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    EXPECT_EQ(f.session.auth_completes(), 1U);
+    EXPECT_EQ(f.transport.sent_count(), before);
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
+    auto refused = f.session.poll_transport();
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_TRUE(f.session.authenticated());
+    EXPECT_EQ(f.session.auth_completes(), 1U);
+    EXPECT_EQ(f.transport.sent_count(), before);
+}
+
+TEST(WiredE2eAuth, FailedAuthCompleteSendDoesNotAuthenticate) {
+    AuthFixture f;
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    f.transport.fail_send_at(f.transport.sent_count() + 1U);
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+    auto failed = f.session.poll_transport();
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error().code(), aa::ErrorCode::transport_io);
+    EXPECT_TRUE(f.cipher->is_active());
+    EXPECT_FALSE(f.session.authenticated());
+    EXPECT_EQ(f.session.auth_completes(), 0U);
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::AuthComplete{0}).value()));
+    auto refused = f.session.poll_transport();
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_FALSE(f.session.authenticated());
+    EXPECT_EQ(f.session.auth_completes(), 0U);
+    f.transport.fail_send_at(std::nullopt);
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    EXPECT_TRUE(f.session.authenticated());
+    EXPECT_EQ(f.session.auth_completes(), 1U);
+    auto frame = tr::decode_frame(f.transport.last_sent());
+    ASSERT_TRUE(frame.has_value());
+    auto complete = proto::decode_auth_complete(frame.value().payload);
+    ASSERT_TRUE(complete.has_value());
+    EXPECT_EQ(complete.value().status, 0);
+}
+
+TEST(WiredE2eAuth, InboundAuthCompleteAfterSslIsRefusedWithoutStateChange) {
+    AuthFixture f;
+    wiredtest::walk_auth(f.session, f.transport);
+    ASSERT_TRUE(f.session.authenticated());
+    const auto state = f.session.state();
+    const auto before = f.transport.sent_count();
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::AuthComplete{0}).value()));
+    auto refused = f.session.poll_transport();
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_TRUE(f.session.authenticated());
+    EXPECT_EQ(f.session.state(), state);
+    EXPECT_EQ(f.session.auth_completes(), 1U);
+    EXPECT_EQ(f.transport.sent_count(), before);
 }
 
 TEST(WiredE2eAuth, PreAuthChannelTrafficIsRefused) {
@@ -168,6 +250,7 @@ TEST(WiredE2eAuth, AuthCompleteBeforeSslIsRefused) {
     ASSERT_FALSE(refused.has_value());
     EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
     EXPECT_FALSE(f.session.authenticated());
+    EXPECT_EQ(f.session.auth_completes(), 0U);
 }
 
 } // namespace

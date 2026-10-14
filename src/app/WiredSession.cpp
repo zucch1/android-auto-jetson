@@ -213,6 +213,9 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
     const auto id = static_cast<protocol::ControlMessageId>((high << 8U) | low);
     switch (id) {
     case protocol::ControlMessageId::version_response: {
+        if (auth_phase_ != AuthPhase::awaiting_version) {
+            return Error{ErrorCode::transport_unauthorized_peer};
+        }
         auto response = protocol::decode_version_response(payload);
         if (!response) {
             return response.error();
@@ -238,20 +241,8 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         return drive_ssl_handshake();
     }
     case protocol::ControlMessageId::auth_complete: {
-        auto response = protocol::decode_auth_complete(payload);
-        if (!response) {
-            return response.error();
-        }
-        if (auth_phase_ != AuthPhase::ssl_handshake || !ssl_active_) {
-            return Error{ErrorCode::transport_unauthorized_peer};
-        }
-        if (response.value().status != 0) {
-            (void)fail(Error{ErrorCode::transport_unauthorized_peer});
-            return Error{ErrorCode::transport_unauthorized_peer};
-        }
-        auth_phase_ = AuthPhase::authenticated;
-        ++auth_completes_;
-        return {};
+        // AUTH_COMPLETE is HU->Phone, never an inbound authentication signal.
+        return Error{ErrorCode::transport_unauthorized_peer};
     }
     case protocol::ControlMessageId::service_discovery_request: {
         if (!authenticated()) {
@@ -308,6 +299,9 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
 }
 
 core::Result<void> WiredSession::drive_ssl_handshake() {
+    if (auth_phase_ == AuthPhase::authenticated) {
+        return {};
+    }
     if (!cipher_) {
         return Error{ErrorCode::channel_not_registered};
     }
@@ -324,6 +318,16 @@ core::Result<void> WiredSession::drive_ssl_handshake() {
     }
     if (cipher_->is_active()) {
         ssl_active_ = true;
+        // AuthResponse.status is int32; pinned MessageStatus::STATUS_SUCCESS = 0.
+        auto payload = protocol::encode(protocol::AuthComplete{0});
+        if (!payload) {
+            return payload.error();
+        }
+        if (auto sent = send_frames(std::move(payload).value(), false); !sent) {
+            return sent.error();
+        }
+        ++auth_completes_;
+        auth_phase_ = AuthPhase::authenticated;
     }
     return {};
 }
