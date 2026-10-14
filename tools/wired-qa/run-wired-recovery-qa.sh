@@ -272,7 +272,7 @@ start_consumer() {
     # The display runs with the shipped test-only stdin control channel open on
     # a FIFO (<> keeps the open non-blocking): it is the painted-frames and
     # input-stimulation evidence source for the PASS gates.
-    remote "mkfifo /tmp/aa-disp.in 2>/dev/null || true; nohup $(shq "$DISPLAY") --test-only-autostart --test-control-stdin <>/tmp/aa-disp.in > /tmp/aa-wired-display.log 2>&1 & echo \$!" >/dev/null 2>&1
+    remote "mkfifo /tmp/aa-disp.in 2>/dev/null || true; nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>/tmp/aa-disp.in > /tmp/aa-wired-display.log 2>&1 & echo \$!" >/dev/null 2>&1
 }
 
 scenario_selected() {
