@@ -2,11 +2,19 @@
 //
 // Task 31 wired reconnect and recovery matrix (host-side, no hardware). Every
 // scenario from the plan is exercised at the LOGIC level against the task-30
-// integrator (aa::app::WiredSession):
+// integrator (aa::app::WiredSession), REBASED onto the lane-30 AAP auth API:
+// every link (initial attach and every reconnect) walks the full
+// version_response -> encapsulated_ssl -> auth_complete progression on a FRESH
+// per-link cipher before any channel traffic is admitted, exactly as the
+// composed receiver does (bind_link_cipher). A retired link's cipher and
+// counters are dropped with it (reset_link at attach_transport): nothing from
+// the old link can authenticate or seal on the new one.
 //
 //   * USB unplug/replug        -> link_lost + a fresh transport, recovered within
 //                                 the fixed 5 s wired reconnect budget (and a
-//                                 deterministic fail-closed check past the bound).
+//                                 deterministic fail-closed check past the bound);
+//                                 the replugged link re-authenticates from scratch
+//                                 (no stale-cipher resumption, no stale-key sealing).
 //   * receiver restart         -> a fresh receiver has NO stale active session or
 //                                 trust: it always re-admits from the TrustStore.
 //   * dummy consumer restart   -> the degrade/recover cycle returns to active and
@@ -31,6 +39,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -49,12 +58,25 @@ using wiredtest::ScriptedTransport;
 const aa::trust::PhoneIdentity kApproved{"recovery-approved"};
 const aa::trust::PhoneIdentity kUnknown{"recovery-unknown"};
 
-// Drives a fresh session to active over `transport` on the approved identity,
-// answering one discovery and one channel-open request (the task-30 happy path).
-void drive_to_active(app::WiredSession &session, ScriptedTransport &transport) {
+// Drives a fresh session to active over `transport` on the approved identity.
+// Attach order per link (lane-30 API): attach_transport() first (caller), then
+// attach_cipher() here; then the full AAP auth progression is walked before any
+// channel traffic, and one discovery + one channel-open request complete the
+// task-30 happy path. Returns the link's negotiated cipher via `cipher`
+// (optional; nullable) so callers can seal media with it.
+void drive_to_active(app::WiredSession &session, ScriptedTransport &transport,
+                     wiredtest::FakeHandshakeCipher **cipher = nullptr) {
+    auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    auto *bound = owned.get();
+    session.attach_cipher(std::move(owned));
+    if (cipher != nullptr) {
+        *cipher = bound;
+    }
     ASSERT_TRUE(session.apply(ss::Event::start_discovery).has_value());
     ASSERT_TRUE(session.phone_discovered(kApproved).has_value());
     ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+    wiredtest::walk_auth(session, transport);
+    ASSERT_TRUE(session.authenticated());
     transport.push_inbound(wiredtest::discovery_request_frame());
     auto discovery = session.poll_transport();
     ASSERT_TRUE(discovery.has_value());
@@ -66,11 +88,26 @@ void drive_to_active(app::WiredSession &session, ScriptedTransport &transport) {
 }
 
 // Completes a link-restored recovery on the (already attached) fresh transport:
-// reconnect opens it, transport_ready re-admits, negotiation_succeeded -> active.
-void complete_recovery(app::WiredSession &session) {
+// reconnect opens it, transport_ready re-admits, then the NEW link must walk a
+// FULL handshake on a FRESH per-link cipher (the retired link's cipher is gone -
+// reset_link() dropped it with its counters) before negotiation_succeeded ->
+// active. This is the production reconnect flow (bind_link_cipher per link).
+void complete_recovery(app::WiredSession &session, ScriptedTransport &transport,
+                       wiredtest::FakeHandshakeCipher **cipher = nullptr) {
     ASSERT_TRUE(session.apply(ss::Event::reconnect).has_value());
     ASSERT_EQ(session.state(), ss::State::connecting);
     ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+    auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    auto *bound = owned.get();
+    session.attach_cipher(std::move(owned));
+    if (cipher != nullptr) {
+        *cipher = bound;
+    }
+    wiredtest::walk_auth(session, transport);
+    ASSERT_TRUE(session.authenticated());
+    transport.push_inbound(wiredtest::open_request_frame(99));
+    auto opened = session.poll_transport();
+    ASSERT_TRUE(opened.has_value());
     ASSERT_TRUE(session.apply(ss::Event::negotiation_succeeded).has_value());
     ASSERT_EQ(session.state(), ss::State::active);
 }
@@ -122,7 +159,9 @@ TEST(WiredRecoveryUnplugReplug, FreshTransportRecoversToActiveWithinWiredBudget)
     ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
     ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, video_sink).has_value());
     session.attach_transport(&transport);
-    drive_to_active(session, transport);
+    wiredtest::FakeHandshakeCipher *cipher = nullptr;
+    drive_to_active(session, transport, &cipher);
+    ASSERT_NE(cipher, nullptr);
 
     clock.set(aa::core::Nanoseconds{1'000'000'000}); // t = 1 s
     const auto lost_at = clock.now();
@@ -134,7 +173,14 @@ TEST(WiredRecoveryUnplugReplug, FreshTransportRecoversToActiveWithinWiredBudget)
     // The replug supplies a fresh handle and the cycle completes well inside 5 s.
     clock.advance(aa::core::Milliseconds{250});
     session.attach_transport(&fresh);
-    complete_recovery(session);
+    EXPECT_FALSE(session.authenticated()); // the retired link's auth did not survive
+    EXPECT_EQ(session.version_responses(), 0U);
+    EXPECT_EQ(session.encapsulated_ssls(), 0U);
+    EXPECT_EQ(session.auth_completes(), 0U);
+    EXPECT_EQ(session.channel_opens(), 0U);
+    wiredtest::FakeHandshakeCipher *fresh_cipher = nullptr;
+    complete_recovery(session, fresh, &fresh_cipher);
+    EXPECT_NE(fresh_cipher, nullptr);
 
     const auto recovered_ms = (clock.now().count - lost_at.count) / 1'000'000;
     EXPECT_LE(recovered_ms, 5'000);
@@ -147,6 +193,103 @@ TEST(WiredRecoveryUnplugReplug, FreshTransportRecoversToActiveWithinWiredBudget)
     EXPECT_TRUE(capture.contains("\"status\":\"accepted\""));
     EXPECT_TRUE(capture.contains("\"retries\":1"));
     EXPECT_FALSE(capture.contains("recovery-approved"));
+}
+
+// 31b proof (gate P1), part 1: the retired link's cipher and counters are
+// GONE at the replug (reset_link at attach_transport). Against pre-f955401
+// session core this case FAILS: the stale cipher still authenticated and
+// sealed on the new link.
+TEST(WiredRecoveryUnplugReplug, ReconnectDropsStaleCipherAndLinkCounters) {
+    ss::test::MapTrustStore trust;
+    trust.set(kApproved, aa::trust::Decision::approved);
+    ss::test::ManualClock clock;
+    CaptureSink capture;
+    diag::Diagnostics diagnostics{capture};
+    RecordingSink video_sink;
+
+    ScriptedTransport transport;
+    ScriptedTransport fresh;
+    app::WiredSession session{{trust, clock, diagnostics}, app::WiredSessionConfig{}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+    ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, video_sink).has_value());
+    session.attach_transport(&transport);
+    drive_to_active(session, transport);
+    ASSERT_EQ(session.channel_opens(), 1U);
+
+    ASSERT_TRUE(session.apply(ss::Event::link_lost).has_value());
+    session.attach_transport(&fresh);
+    EXPECT_EQ(session.version_responses(), 0U);
+    EXPECT_EQ(session.encapsulated_ssls(), 0U);
+    EXPECT_EQ(session.auth_completes(), 0U);
+    EXPECT_EQ(session.channel_opens(), 0U);
+
+    ASSERT_TRUE(session.apply(ss::Event::reconnect).has_value());
+    ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+    ASSERT_TRUE(fresh.is_open());
+
+    // No cipher is bound to the new link yet: the handshake cannot proceed
+    // and nothing can seal - the stale one is gone, not merely inactive.
+    fresh.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
+    auto response = session.poll_transport();
+    ASSERT_FALSE(response.has_value());
+    EXPECT_FALSE(session.authenticated());
+    EXPECT_EQ(session.auth_completes(), 0U);
+    auto sealed = session.announce_services();
+    ASSERT_FALSE(sealed.has_value());
+    EXPECT_EQ(sealed.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_EQ(fresh.sent_count(), 0U);
+}
+
+// 31b proof (gate P1), part 2: the replugged link needs a FULL handshake on a
+// FRESH per-link cipher - VersionResponse{1,6,0} alone must not authenticate,
+// and nothing may seal until auth_complete has been sent.
+TEST(WiredRecoveryUnplugReplug, ReconnectFreshCipherRequiresFullHandshake) {
+    ss::test::MapTrustStore trust;
+    trust.set(kApproved, aa::trust::Decision::approved);
+    ss::test::ManualClock clock;
+    CaptureSink capture;
+    diag::Diagnostics diagnostics{capture};
+    RecordingSink video_sink;
+
+    ScriptedTransport transport;
+    ScriptedTransport fresh;
+    app::WiredSession session{{trust, clock, diagnostics}, app::WiredSessionConfig{}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+    ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, video_sink).has_value());
+    session.attach_transport(&transport);
+    drive_to_active(session, transport);
+
+    ASSERT_TRUE(session.apply(ss::Event::link_lost).has_value());
+    session.attach_transport(&fresh);
+    ASSERT_TRUE(session.apply(ss::Event::reconnect).has_value());
+    ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+
+    // Production reconnect flow: bind a FRESH per-link cipher.
+    session.attach_cipher(std::make_unique<wiredtest::FakeHandshakeCipher>());
+
+    fresh.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
+    ASSERT_TRUE(session.poll_transport().has_value());
+    EXPECT_FALSE(session.authenticated());
+    EXPECT_EQ(session.auth_completes(), 0U);
+    auto sealed = session.announce_services();
+    ASSERT_FALSE(sealed.has_value());
+    EXPECT_EQ(sealed.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    ASSERT_EQ(fresh.sent_count(), 1U); // exactly the handshake chunk, nothing sealed
+    auto handshake = tr::decode_frame(fresh.last_sent());
+    ASSERT_TRUE(handshake.has_value());
+    EXPECT_EQ(handshake.value().header.encryption, tr::Encryption::plain);
+    EXPECT_TRUE(proto::decode_encapsulated_ssl(handshake.value().payload).has_value());
+
+    fresh.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+    ASSERT_TRUE(session.poll_transport().has_value());
+    EXPECT_TRUE(session.authenticated());
+    EXPECT_EQ(session.auth_completes(), 1U);
+    EXPECT_TRUE(session.announce_services().has_value());
+    EXPECT_TRUE(capture.contains("\"kind\":\"reconnect\""));
+    EXPECT_TRUE(capture.contains("\"retries\":1"));
 }
 
 TEST(WiredRecoveryUnplugReplug, RecoveryPastWiredDeadlineFailsClosedWithTypedTimeout) {
@@ -313,7 +456,9 @@ TEST(WiredRecoveryConsumerRestart, DegradeThenRecoverReturnsToActiveAndKeepsRout
     ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
     ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, video_sink).has_value());
     session.attach_transport(&transport);
-    drive_to_active(session, transport);
+    wiredtest::FakeHandshakeCipher *cipher = nullptr;
+    drive_to_active(session, transport, &cipher);
+    ASSERT_NE(cipher, nullptr);
 
     const std::size_t delivered_before = video_sink.payloads.size();
 
@@ -323,13 +468,22 @@ TEST(WiredRecoveryConsumerRestart, DegradeThenRecoverReturnsToActiveAndKeepsRout
     clock.advance(aa::core::Milliseconds{500}); // inside the consumer grace
     ASSERT_TRUE(session.apply(ss::Event::recover).has_value());
     EXPECT_EQ(session.state(), ss::State::active);
+    EXPECT_TRUE(session.authenticated()); // recovery kept this link's negotiated cipher
 
-    // The channel/session path still routes media after recovery.
-    transport.push_inbound(wiredtest::service_frame(99, wiredtest::kVideoIdr));
+    // The channel/session path still routes media after recovery, and the
+    // inbound record opens with the negotiated cipher (E=1, not plaintext).
+    auto inbound = tr::encode_message(
+        tr::Message{std::uint8_t{99}, tr::MessageKind::specific, wiredtest::kVideoIdr},
+        tr::Encryption::encrypted, cipher);
+    ASSERT_TRUE(inbound.has_value());
+    for (const auto &frame : inbound.value()) {
+        transport.push_inbound(frame);
+    }
     auto routed = session.poll_transport();
     ASSERT_TRUE(routed.has_value());
     EXPECT_TRUE(routed.value());
-    EXPECT_EQ(video_sink.payloads.size(), delivered_before + 1);
+    ASSERT_EQ(video_sink.payloads.size(), delivered_before + 1);
+    EXPECT_EQ(video_sink.payloads.at(delivered_before), wiredtest::kVideoIdr);
 
     EXPECT_EQ(session.reconnect_attempts(), 1U); // the recover ran one admission
     EXPECT_EQ(session.recovery_failures(), 0U);
@@ -429,7 +583,7 @@ TEST(WiredRecoveryMalformed, ReservedFlagFrameIsTypedAndNeverDeliveredThenRecove
     // The closed stream is dropped with the handle on reconnect: recovery works.
     ASSERT_TRUE(session.apply(ss::Event::link_lost).has_value());
     session.attach_transport(&fresh);
-    complete_recovery(session);
+    complete_recovery(session, fresh);
     EXPECT_EQ(session.state(), ss::State::active);
 }
 
@@ -555,7 +709,7 @@ TEST(WiredRecoveryPhoneLockUnlock, LockUnlockAndPhoneSideRestartRecover) {
     ASSERT_TRUE(session.apply(ss::Event::link_lost).has_value());
     EXPECT_EQ(session.state(), ss::State::reconnecting);
     session.attach_transport(&fresh);
-    complete_recovery(session);
+    complete_recovery(session, fresh);
     EXPECT_EQ(session.state(), ss::State::active);
 
     EXPECT_EQ(session.reconnect_attempts(), 2U); // one recover, one reconnect
@@ -588,7 +742,7 @@ TEST(WiredRecoveryRealClock, RecoveryCompletesBoundedWorkOnSteadyClock) {
     const auto start = std::chrono::steady_clock::now();
     ASSERT_TRUE(session.apply(ss::Event::link_lost).has_value());
     session.attach_transport(&fresh);
-    complete_recovery(session);
+    complete_recovery(session, fresh);
     const auto elapsed = std::chrono::steady_clock::now() - start;
 
     EXPECT_EQ(session.state(), ss::State::active);
