@@ -21,6 +21,14 @@ garbage - raises :class:`RuleError`. A malformed file is never partially
 trusted and never "matches everything": :func:`parse_rules` fails closed and
 the caller must treat the file as invalid.
 
+Syntax validity alone is NOT a license to install: the ``verify`` CLI command
+is the installer's gate and additionally enforces the EXACT approved policy
+(:func:`verify_exact_policy`): the six reviewed rules, the three qualified
+ids on port ``1-2.1``, the permitted assignment names/values and zero extra
+rules. Anything else - a weakened value, an appended rule, a dropped rule -
+raises :class:`PolicyError` and the installer must refuse before touching
+any destination or state.
+
 Also provides a small parser for ``udevadm test`` output so recorded fixtures
 can prove that the shipped rules match only the qualified device tree.
 Device-supplied text (manufacturer/product/serial) is never consulted here:
@@ -30,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import re
 import sys
@@ -50,6 +59,10 @@ class RuleError(ValueError):
         self.reason = reason
         self.line_no = line_no
         self.text = text
+
+
+class PolicyError(RuleError):
+    """The file is syntactically valid but is NOT the exact approved policy."""
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +190,50 @@ def parse_rules(text: str) -> list[Rule]:
     if not rules:
         raise RuleError("no rules found")
     return rules
+
+
+# ---------------------------------------------------------------------------
+# Exact approved policy gate
+#
+# The installer must refuse anything that is not the reviewed policy. The
+# approved policy is pinned here as canonical rule text (the six rule lines
+# of 70-android-auto-receiver.rules in order; comments carry no behavior and
+# are ignored by the parser). verify_exact_policy() compares the parsed
+# structures exactly: same rule count, same order, same tokens - so a
+# weakened value (MODE:="0666"), an appended rule (KERNEL=="*"), a dropped
+# rule or a rewritten match is refused before any install/rollback mutation.
+
+_APPROVED_POLICY_TEXT = """\
+KERNELS=="1-2.1", SUBSYSTEMS=="usb", ATTRS{idVendor}=="04e8", ATTRS{idProduct}=="6860", ENV{ID_MM_DEVICE_IGNORE}="1"
+KERNELS=="1-2.1", SUBSYSTEMS=="usb", ATTRS{idVendor}=="18d1", ATTRS{idProduct}=="2d00", ENV{ID_MM_DEVICE_IGNORE}="1"
+KERNELS=="1-2.1", SUBSYSTEMS=="usb", ATTRS{idVendor}=="18d1", ATTRS{idProduct}=="2d01", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="1-2.1", ATTR{idVendor}=="04e8", ATTR{idProduct}=="6860", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="1-2.1", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="1-2.1", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d01", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+"""
+
+_APPROVED_RULES: tuple[Rule, ...] = tuple(parse_rules(_APPROVED_POLICY_TEXT))
+_APPROVED_POLICY_SHA256 = "549be61638a94ca7cca55240bb26069982ffa187bcb448664356980f29c1836a"
+
+
+def verify_exact_policy(rules: list[Rule] | tuple[Rule, ...]) -> None:
+    """Require ``rules`` to be EXACTLY the approved policy; raise PolicyError.
+
+    Structural identity with the approved six rules is required: same count,
+    same order, same match/assignment tokens (comments excluded). This is the
+    install/rollback gate - syntax validity is not sufficient.
+    """
+    if len(rules) != len(_APPROVED_RULES):
+        raise PolicyError(
+            f"policy must contain exactly {len(_APPROVED_RULES)} approved rules, got {len(rules)}"
+        )
+    for got, want in zip(rules, _APPROVED_RULES):
+        if (got.matches, got.assignments) != (want.matches, want.assignments):
+            raise PolicyError(
+                f"rule is not an approved policy rule: {got.describe()}; "
+                f"approved: {want.describe()}",
+                line_no=got.line_no,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +388,9 @@ def parse_udevadm_test(text: str) -> UdevadmRun:
 def _cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    verify = sub.add_parser("verify", help="parse a rules file; exit 0 only if valid")
+    verify = sub.add_parser(
+        "verify", help="require the exact approved policy; exit 0 only if it matches"
+    )
     verify.add_argument("file", type=Path)
     match = sub.add_parser("match", help="apply a rules file to a JSON device description")
     match.add_argument("file", type=Path)
@@ -342,7 +401,8 @@ def _cli(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     try:
-        text = args.file.read_text(encoding="utf-8")
+        content = args.file.read_bytes()
+        text = content.decode("utf-8")
     except OSError as exc:
         print(f"error: cannot read {args.file}: {exc}", file=sys.stderr)
         return 2
@@ -350,7 +410,10 @@ def _cli(argv: list[str]) -> int:
     try:
         if args.command == "verify":
             rules = parse_rules(text)
-            print(f"ok: {len(rules)} rules")
+            verify_exact_policy(rules)
+            if hashlib.sha256(content).hexdigest() != _APPROVED_POLICY_SHA256:
+                raise PolicyError("rules file is not byte-identical to the shipped policy")
+            print(f"ok: {len(rules)} rules (exact approved policy)")
             return 0
         if args.command == "match":
             device = Device.from_json(json.loads(args.device))
