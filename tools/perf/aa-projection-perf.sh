@@ -146,7 +146,7 @@ check_readiness() {
         return 1
     fi
     local audio_sink
-    audio_sink="$(remote "command -v pactl >/dev/null 2>&1 && pactl list short sinks 2>/dev/null | head -1" 2>/dev/null || true)"
+    audio_sink="$(remote "command -v pactl >/dev/null 2>&1 && pactl list short sinks 2>/dev/null | head -1 || (command -v pw-cli >/dev/null 2>&1 && pw-cli ls Device 2>/dev/null | head -1)" 2>/dev/null || true)"
     if [[ -z "$audio_sink" ]]; then
         ready_reason="no_audio_sink"
         return 1
