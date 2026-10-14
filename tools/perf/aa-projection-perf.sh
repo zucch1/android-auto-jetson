@@ -113,13 +113,20 @@ fi
 BUFFER="$(mktemp -d "${TMPDIR:-/tmp}/aa-perf.XXXXXX")"
 trap 'rm -rf "${BUFFER:?}"' EXIT
 
-remote() { timeout 30 ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
+# User-session environment for every remote command: batch ssh carries no
+# session, so `busctl --user` fails ("Failed to get credentials") and Qt
+# consumers abort without DISPLAY. The export prologue (rather than a bare
+# VAR= prefix) keeps compound remote commands working, and $(id -u) must
+# expand on the target, never locally.
+REMOTE_ENV='export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"; export DISPLAY=:1;'
+
+remote() { timeout 30 ssh "${SSH_OPTS[@]}" "$HOST" "${REMOTE_ENV} $*"; }
 
 # Bounded remote command with an explicit timeout (live collection is long).
 remote_long() {
     local seconds="$1"
     shift
-    timeout "$seconds" ssh "${SSH_OPTS[@]}" "$HOST" "$@"
+    timeout "$seconds" ssh "${SSH_OPTS[@]}" "$HOST" "${REMOTE_ENV} $*"
 }
 
 ready_reason=""
