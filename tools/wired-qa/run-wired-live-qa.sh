@@ -9,8 +9,11 @@
 # Fail-closed by construction: every ssh runs under `timeout`; a missing
 # prerequisite (phone absent, udev policy not installed, no audio sink, display
 # disconnected, receiver binary not supplied) writes a BLOCKED result and exits
-# non-zero. Exit 0 means a projection was actually observed via the D-Bus
-# contract - never a green smoke without evidence (misleading_success_output).
+# non-zero. Exit 0 requires REAL media evidence - painted frames on the display,
+# a successful audio pump (post-pump media_timing), and a delivered input event
+# ("ok":"true") - on top of the D-Bus projection contract. `GetState=projecting`
+# with no observed media is NON-PASS (gate P2-G): a green smoke without evidence
+# is never a pass (misleading_success_output).
 #
 # Usage:
 #   run-wired-live-qa.sh --receiver /opt/aa/aa-wired-receiver \
@@ -129,14 +132,9 @@ if [[ "$policy" != "installed" ]]; then
     write_result "BLOCKED" "udev_policy_not_installed" "false" "false" "false" "false" "null"
     exit 3
 fi
-# Exact-token DRM status match: `disconnected` must NOT read as `connected`.
-display_connected="false"
-for token in $display_status; do
-    if [[ "$token" == "connected" ]]; then
-        display_connected="true"
-    fi
-done
-if [[ "$display_connected" != "true" ]]; then
+# Exact-line DRM status record (lane-32 pattern, tools/perf/aa-projection-perf.sh):
+# `disconnected` must NOT read as `connected`; only an exact `connected` line passes.
+if ! printf '%s\n' "$display_status" | grep -Fxq 'connected'; then
     write_result "BLOCKED" "display_disconnected" "false" "false" "false" "false" "null"
     exit 3
 fi
@@ -158,10 +156,13 @@ fi
 
 # The receiver owns the D-Bus contract name; the display registers as a consumer
 # and requests projection. Both run under a bounded ssh; logs are captured on the
-# target under /tmp for later retrieval (redaction applied before export).
+# target under /tmp for later retrieval (redaction applied before export). The
+# display also runs with the shipped TEST-ONLY stdin control channel
+# (--test-only-control-stdin) wired through a FIFO so the harness can request
+# real status (painted frames) and stimulate one input event (gate P2-G).
 start_ms="$(date +%s%3N)"
 remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!" >/tmp/aa-recv.pid
-remote "nohup $(shq "$DISPLAY") --test-only-autostart > /tmp/aa-wired-display.log 2>&1 & echo \$!" >/tmp/aa-disp.pid
+remote "rm -f /tmp/aa-disp.in; mkfifo /tmp/aa-disp.in 2>/dev/null || true; nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>/tmp/aa-disp.in > /tmp/aa-wired-display.log 2>&1 & echo \$!" >/tmp/aa-disp.pid
 
 projection="false"
 deadline=$(( $(date +%s%3N) + PROJECTION_TIMEOUT_MS ))
@@ -184,11 +185,62 @@ if [[ "$projection" == "true" ]]; then
     remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && session_active="true"
 fi
 
+# ---- real-media evidence probes (gate P2-G: PASS requires OBSERVED media) ----
+
+# Painted-frames evidence from the SHIPPED dummy display's test-only status
+# channel (task 24 testcontrol): frames_painted > 0 and render_ok true. A
+# video_sent record alone only proves units crossed the channel, not that
+# anything painted (docs/qualification/wired-live-qa.md observables).
+painted_frames() {
+    local line attempt
+    for attempt in 1 2 3; do
+        line="$(remote "printf 'status\n' > /tmp/aa-disp.in 2>/dev/null; sleep 0.3; grep '\"event\":\"status\"' /tmp/aa-wired-display.log 2>/dev/null | tail -1" || true)"
+        if [[ "$line" =~ \"frames_painted\":([0-9]+) ]] && ((BASH_REMATCH[1] > 0)) \
+            && [[ "$line" == *'"render_ok":true'* ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Successful audio pump evidence: audio_chunks is logged BEFORE router_.pump()
+# runs, so its presence proves nothing about the sink; emit_media_timing is
+# emitted ONLY after pump() succeeds (tools/wired-receiver/main.cpp) and is the
+# pump-success marker.
+audio_pumped() {
+    remote "grep -q '\"event\":\"media_timing\"' /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1
+}
+
+# Input delivery evidence: input_forwarded presence alone is not a delivery
+# claim - only the ok:true record is ("ok":"false" means the send failed).
+input_delivered() {
+    remote "grep -q '\"event\":\"input_forwarded\",\"ok\":\"true\"' /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1
+}
+
+# Stimulate one real display key event through the shipped testcontrol seam so
+# the input path produces an observable input_forwarded record.
+stimulate_input() {
+    remote "printf 'key a press\nkey a release\n' > /tmp/aa-disp.in 2>/dev/null" >/dev/null 2>&1 || true
+}
+
 video="false"; audio="false"; input="false"
 if [[ "$session_active" == "true" ]]; then
-    remote "grep -q video_sent /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && video="true"
-    remote "grep -q audio_chunks /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && audio="true"
-    remote "grep -q input_forwarded /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && input="true"
+    if remote "grep -q video_sent /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && painted_frames; then
+        video="true"
+    fi
+    if audio_pumped; then
+        audio="true"
+    fi
+    stimulate_input
+    input_deadline=$(( $(date +%s%3N) + 5000 ))
+    while (( $(date +%s%3N) < input_deadline )); do
+        if input_delivered; then
+            input="true"
+            break
+        fi
+        sleep 1
+    done
 fi
 
 # Best-effort bounded teardown.
@@ -196,7 +248,10 @@ remote "kill \$(cat /tmp/aa-disp.pid) 2>/dev/null || true; kill \$(cat /tmp/aa-r
 
 # Verdict taxonomy: a missing prerequisite is BLOCKED; the session running but
 # failing to project / activate / deliver every observable is FAILED. PASS
-# requires an ACTIVE session AND all three delivery paths observed.
+# requires an ACTIVE session AND all three delivery paths OBSERVED as real
+# media: painted frames (not just video_sent), a successful audio pump
+# (media_timing), and a delivered input event ("ok":"true"). `GetState=projecting`
+# with no observed media is NON-PASS (gate P2-G).
 if [[ "$projection" != "true" || "$session_active" != "true" ]]; then
     write_result "FAILED" "session_not_active" "$projection" "$video" "$audio" "$input" "$budget_ms"
     exit 4
