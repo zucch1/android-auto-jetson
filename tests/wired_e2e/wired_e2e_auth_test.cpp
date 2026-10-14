@@ -253,4 +253,58 @@ TEST(WiredE2eAuth, AuthCompleteBeforeSslIsRefused) {
     EXPECT_EQ(f.session.auth_completes(), 0U);
 }
 
+// ---- P1-A frame kind (AASDK parity) ---------------------------------------
+// Pinned AASDK `ControlServiceChannel.cpp` sends ALL ten control-channel
+// messages as `MessageType::SPECIFIC` (MessageType.hpp: SPECIFIC = 0,
+// CONTROL = 1 << 2). Frames.hpp maps that to flags bit 2, so a plain BULK
+// control-channel frame is 0x03 (SPECIFIC) and never 0x07 (CONTROL) - D19:
+// the S24 phone framer ignores 0x07 while 0x03 draws responses.
+constexpr std::uint8_t k_bulk_plain_specific = 0x03;
+constexpr std::uint8_t k_bulk_encrypted_specific = 0x0B;
+
+void expect_specific_control_frame(const std::vector<std::byte> &wire, bool encrypted) {
+    ASSERT_GE(wire.size(), 2U);
+    EXPECT_EQ(static_cast<std::uint8_t>(wire[1]),
+              encrypted ? k_bulk_encrypted_specific : k_bulk_plain_specific);
+    auto frame = tr::decode_frame(wire);
+    ASSERT_TRUE(frame.has_value());
+    EXPECT_EQ(frame.value().header.channel, 0);
+    EXPECT_EQ(frame.value().header.type, tr::FrameType::bulk);
+    EXPECT_EQ(frame.value().header.kind, tr::MessageKind::specific);
+    EXPECT_EQ(frame.value().header.encryption,
+              encrypted ? tr::Encryption::encrypted : tr::Encryption::plain);
+}
+
+TEST(WiredE2eAuth, ControlChannelFramesUseAasdkSpecificKind) {
+    AuthFixture f;
+
+    // VersionRequest (HU -> phone): already the pinned SPECIFIC form.
+    ASSERT_TRUE(f.session.send_version_request(1, 6).has_value());
+    expect_specific_control_frame(f.transport.last_sent(), false);
+
+    // Inbound builders must emit the same kind as production (both directions
+    // asserted against the AASDK truth, so neither side can drift to 0x07).
+    expect_specific_control_frame(
+        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()), false);
+    expect_specific_control_frame(wiredtest::discovery_request_frame(), false);
+
+    // Handshake chunk (encapsulated_ssl, HU -> phone).
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    expect_specific_control_frame(f.transport.last_sent(), false);
+
+    // AuthComplete (HU -> phone at handshake completion).
+    f.transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    ASSERT_TRUE(f.session.authenticated());
+    expect_specific_control_frame(f.transport.last_sent(), false);
+
+    // Post-auth encrypted control (ServiceDiscoveryResponse) keeps the kind.
+    f.transport.push_inbound(wiredtest::discovery_request_frame());
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    expect_specific_control_frame(f.transport.last_sent(), true);
+}
+
 } // namespace

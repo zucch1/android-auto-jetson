@@ -189,9 +189,13 @@ class FakeHandshakeCipher final : public aa::transport::HandshakingCipher {
 
 // ---- frame builders (reuse the project wire codec) ----
 
+// Control-CHANNEL frames (channel 0). The frame kind is SPECIFIC exactly as
+// production and pinned AASDK emit it (ControlServiceChannel.cpp sends
+// MessageType::SPECIFIC at every send site; conformance D19: 0x03 canonical,
+// the 0x07 CONTROL-kind form is ignored by real phone framers).
 inline std::vector<std::byte> control_frame(std::vector<std::byte> payload) {
     auto frames = aa::transport::encode_message(
-        aa::transport::Message{std::uint8_t{0}, aa::transport::MessageKind::control,
+        aa::transport::Message{std::uint8_t{0}, aa::transport::MessageKind::specific,
                                std::move(payload)},
         aa::transport::Encryption::plain, nullptr);
     return frames.value().front();

@@ -363,7 +363,12 @@ core::Result<std::size_t> WiredSession::send_frames(std::vector<std::byte> paylo
     if (transport_ == nullptr) {
         return Error{ErrorCode::transport_unavailable};
     }
-    transport::Message message{std::uint8_t{0}, transport::MessageKind::control,
+    // AASDK parity (finding P1-A): every control-channel message goes out as
+    // MessageType::SPECIFIC (pinned ControlServiceChannel.cpp sends SPECIFIC at
+    // all ten send sites; MessageType.hpp: SPECIFIC = 0, CONTROL = 1 << 2), so
+    // the frame kind bit stays clear (conformance D19: 0x03 draws responses
+    // from the S24 phone framer while 0x07 is ignored).
+    transport::Message message{std::uint8_t{0}, transport::MessageKind::specific,
                                std::move(payload)};
     transport::Encryption encryption = transport::Encryption::plain;
     transport::PayloadCipher *cipher = nullptr;
