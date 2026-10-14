@@ -89,12 +89,74 @@ Task 9 is reduced-scope (owner-signed): the decode p95 latency budget
 **withdrawn**. The tool records decode timing informationally and never asserts
 that budget; the receipt must not claim it.
 
+## Named limitations (completeness gaps, do NOT claim complete qualification)
+
+The receiver/display pair launched by this procedure emits only the two
+media-timing fields (`av_sync_ms`, `audio_latency_ms`). The following **7 of the
+9 event-metric slots have no emitter** in that pair and stay `null` in every
+capture it produces:
+
+1. `frame_drops`
+2. `decode_p50_ms`
+3. `decode_p95_ms`
+4. `decode_fps`
+5. `decode_frames`
+6. `ipc_throughput_mbps`
+7. `ipc_p95_added_latency_ms`
+
+The reporter fails closed on this: any absent event-metric slot is listed in the
+result's `named_gaps`, `qualification_status` stays `INCOMPLETE`, and the verdict
+is `BLOCKED` — such a capture is **never** presented as complete task-32
+qualification and never a PASS. (Decode timing remains informational per the
+task-9 caveat above and is not re-claimed here.) The emitter halves —
+decode/IPC/frame-drop stats events and the final `emit_media_timing` flush at
+shutdown — are cross-lane work in `tools/wired-receiver` /
+`tools/dummy-display` (lanes 30/31) and land separately; until then phase-B
+runs are expected to end BLOCKED on these named gaps rather than PASS.
+
+Live runs additionally require deployment-bound provenance: without populated
+`source_digest` / `build_artifact_digest` / `configuration_digest` and recorded
+service definitions and dependency versions, the result reports
+`provenance_gaps` and BLOCKS. Synthetic/offline fixtures (whose digests are
+fixture placeholders) are explicitly separate from live claims and report
+`measurement_origin: "offline"` with `qualification_status: "OFFLINE_ONLY"`.
+
 ## Provenance and equivalence
 
 Both result documents carry the provenance block with `package_digest: null` and
 `equivalence_status: "provisional"`. Post-package equivalence is established in
 todo 43, or the soak is rerun on the installed release. The tool rejects a
 capture that claims otherwise.
+
+**Live runs require populated provenance.** A live invocation (no `--capture`)
+marks the document `measurement_origin: "live"` and will not report PASS unless
+the deployment-bound `source_digest`, `build_artifact_digest` and
+`configuration_digest` are SHA-256 values and `service_definitions` (name +
+digest per service) and `dependency_versions` are non-empty. Pass them via
+`--provenance <file>`; without them the verdict is BLOCKED and `provenance_gaps`
+names each missing field. Offline `--capture` documents are labeled
+`measurement_origin: "offline"` / `qualification_status: "OFFLINE_ONLY"` and can
+never claim live qualification.
+
+## Named limitations (task-32 completeness gaps)
+
+The current receiver/display event stream supplies only the two media-timing
+metrics. Seven event-metric slots are **not** supplied by the launched pair and
+are named in every result's `named_gaps` while absent:
+
+1. `frame_drops`
+2. `decode_p50_ms`
+3. `decode_p95_ms`
+4. `decode_fps`
+5. `decode_frames`
+6. `ipc_throughput_mbps`
+7. `ipc_p95_added_latency_ms`
+
+While any of these is absent the result carries
+`qualification_status: "INCOMPLETE"` and the verdict cannot be a complete
+task-32 qualification, even if the in-run budgets pass. Decode p95 stays
+informational (task-9 budget withdrawn); these gaps concern *measurement
+availability*, not the withdrawn budget.
 
 ## Privacy
 
