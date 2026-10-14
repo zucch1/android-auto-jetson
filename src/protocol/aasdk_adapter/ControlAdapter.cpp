@@ -226,8 +226,11 @@ core::Result<VersionResponse> decode_version_response(std::span<const std::byte>
     if (!body) {
         return body.error();
     }
-    // Fixed-width raw body: three big-endian uint16 fields, nothing else.
-    if (body.value().size() != 6) {
+    // Fixed-width raw body prefix: three big-endian uint16 fields. >= v1.6
+    // appends a WireConfig tail (conformance D15 / fixture F-B2 - a real S24
+    // answered 1.7 with trailing bytes while the receiver requests 1.6), so
+    // only the first six bytes are read and trailing bytes are tolerated.
+    if (body.value().size() < 6) {
         return aasdk_adapter::malformed();
     }
     const auto *raw = body.value().data();

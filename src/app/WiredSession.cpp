@@ -247,14 +247,25 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         return drive_ssl_handshake();
     }
     case protocol::ControlMessageId::encapsulated_ssl: {
+        // P2 phase guard: handshake chunks belong to the ssl_handshake phase
+        // only. Before version_response this path used to reach drive_ssl_handshake
+        // and could authenticate, bypassing version negotiation entirely.
+        // After authentication re-driven chunks are accepted and ignored (they
+        // must never re-send auth_complete).
+        if (auth_phase_ == AuthPhase::awaiting_version) {
+            return Error{ErrorCode::transport_unauthorized_peer};
+        }
+        if (auth_phase_ == AuthPhase::authenticated) {
+            return {};
+        }
         auto chunk = protocol::decode_encapsulated_ssl(payload);
         if (!chunk) {
             return chunk.error();
         }
-        ++encapsulated_ssls_;
         if (!cipher_) {
             return not_configured();
         }
+        ++encapsulated_ssls_;
         cipher_->give_handshake(chunk.value().bytes);
         return drive_ssl_handshake();
     }

@@ -451,4 +451,82 @@ TEST(WiredE2eAuth, InboundEncryptedRoundTripUsesNegotiatedCipher) {
     EXPECT_EQ(opened.value()[1], std::byte{0x01});
 }
 
+// ---- P2 wire robustness (version tail / handshake phase) ------------------
+
+TEST(WiredE2eAuth, VersionResponseToleratesTrailingWireConfig) {
+    AuthFixture f;
+    // F-B2: v1.7 MATCH with a trailing WireConfig tail (>= v1.6 appends it,
+    // conformance D15; a real S24 answered 1.7 with trailing bytes while the
+    // receiver requests 1.6). The parser must read the first six body bytes
+    // and tolerate the tail, or the first message of every real session dies.
+    auto payload = proto::encode(proto::VersionResponse{1, 7, 0}).value();
+    payload.push_back(std::byte{0xDE});
+    payload.push_back(std::byte{0xAD});
+    f.transport.push_inbound(wiredtest::control_frame(std::move(payload)));
+    ASSERT_TRUE(f.session.poll_transport().has_value());
+    EXPECT_EQ(f.session.version_responses(), 1U);
+    EXPECT_FALSE(f.session.authenticated());
+    auto frame = tr::decode_frame(f.transport.last_sent());
+    ASSERT_TRUE(frame.has_value());
+    auto ssl = proto::decode_encapsulated_ssl(frame.value().payload);
+    EXPECT_TRUE(ssl.has_value());
+}
+
+TEST(WiredE2eAuth, EncapsulatedSslBeforeVersionResponseIsRefused) {
+    ss::test::MapTrustStore trust;
+    trust.set(kApproved, aa::trust::Decision::approved);
+    ss::test::ManualClock clock;
+    wiredtest::CaptureSink capture;
+    aa::diagnostics::Diagnostics diagnostics{capture};
+    ScriptedTransport transport;
+    app::WiredSession session{{trust, clock, diagnostics}, app::WiredSessionConfig{}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+    session.attach_transport(&transport);
+    // A one-step cipher completes on the first drive: without the phase guard
+    // a single encapsulated_ssl chunk before version_response authenticated.
+    session.attach_cipher(std::make_unique<FakeHandshakeCipher>(1));
+    ASSERT_TRUE(session.apply(ss::Event::start_discovery).has_value());
+    ASSERT_TRUE(session.phone_discovered(kApproved).has_value());
+    ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+
+    transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+    auto refused = session.poll_transport();
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_FALSE(session.authenticated());
+    EXPECT_EQ(session.encapsulated_ssls(), 0U);
+    EXPECT_EQ(session.auth_completes(), 0U);
+    EXPECT_EQ(transport.sent_count(), 0U);
+}
+
+TEST(WiredE2eAuth, EncapsulatedSslCountedOnlyAfterValidation) {
+    ss::test::MapTrustStore trust;
+    trust.set(kApproved, aa::trust::Decision::approved);
+    ss::test::ManualClock clock;
+    wiredtest::CaptureSink capture;
+    aa::diagnostics::Diagnostics diagnostics{capture};
+    ScriptedTransport transport;
+    app::WiredSession session{{trust, clock, diagnostics}, app::WiredSessionConfig{}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+    session.attach_transport(&transport);
+    ASSERT_TRUE(session.apply(ss::Event::start_discovery).has_value());
+    ASSERT_TRUE(session.phone_discovered(kApproved).has_value());
+    ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+
+    transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
+    auto no_cipher = session.poll_transport();
+    ASSERT_FALSE(no_cipher.has_value());
+    EXPECT_EQ(no_cipher.error().code(), aa::ErrorCode::channel_not_registered);
+    EXPECT_EQ(session.version_responses(), 1U);
+
+    transport.push_inbound(
+        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+    auto refused = session.poll_transport();
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::channel_not_registered);
+    EXPECT_EQ(session.encapsulated_ssls(), 0U);
+}
+
 } // namespace
