@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/app/WiredSession.hpp>
+#include <aa/core/Deadline.hpp>
 
 #include <aa/protocol/InputReport.hpp>
 
@@ -67,6 +68,46 @@ core::Result<void> WiredSession::fail(Error reason) {
 void WiredSession::tick() { lifecycle_.tick(); }
 
 void WiredSession::request_stop() noexcept { lifecycle_.request_stop(); }
+
+core::Deadline WiredSession::io_deadline(bool writing) const noexcept {
+    auto until = writing ? core::Deadline::Clock::now() + std::chrono::seconds{5}
+                         : core::Deadline::Clock::time_point::max();
+    if (const auto left = lifecycle_.remaining_budget()) {
+        until = std::min(until, core::Deadline::Clock::now() +
+                                   std::chrono::nanoseconds{left->count});
+    }
+    return {until, token()};
+}
+
+Error WiredSession::io_error(Error reason, const core::Deadline &deadline) {
+    tick();
+    if (failure()) {
+        return *failure();
+    }
+    if (auto checked = deadline.check(); !checked) {
+        return checked.error();
+    }
+    return reason;
+}
+
+core::Result<void> WiredSession::send_frame(std::span<const std::byte> frame) {
+    if (transport_ == nullptr) {
+        return Error{ErrorCode::transport_unavailable};
+    }
+    const auto deadline = io_deadline(true);
+    if (auto checked = deadline.check(); !checked) {
+        return io_error(checked.error(), deadline);
+    }
+    core::DeadlineCancellation bounded{deadline};
+    transport_->set_io_deadline(deadline.until);
+    if (auto opened = transport_->open(bounded.token()); !opened) {
+        return io_error(opened.error(), deadline);
+    }
+    if (auto sent = transport_->send(frame); !sent) {
+        return io_error(sent.error(), deadline);
+    }
+    return {};
+}
 
 void WiredSession::attach_transport(transport::Transport *transport) noexcept {
     transport_ = transport;
@@ -166,7 +207,7 @@ core::Result<std::size_t> WiredSession::send_version_request(std::uint16_t major
     }
     std::size_t sent = 0;
     for (const auto &frame : frames.value()) {
-        if (auto outcome = transport_->send(frame); !outcome) {
+        if (auto outcome = send_frame(frame); !outcome) {
             return outcome.error();
         }
         ++sent;
@@ -182,9 +223,18 @@ core::Result<bool> WiredSession::poll_transport() {
     if (transport_ == nullptr) {
         return Error{ErrorCode::transport_unavailable};
     }
+    const auto deadline = io_deadline();
+    if (auto checked = deadline.check(); !checked) {
+        return io_error(checked.error(), deadline);
+    }
+    core::DeadlineCancellation bounded{deadline};
+    transport_->set_io_deadline(deadline.until);
+    if (auto opened = transport_->open(bounded.token()); !opened) {
+        return io_error(opened.error(), deadline);
+    }
     auto frame = transport_->receive();
     if (!frame) {
-        return frame.error();
+        return io_error(frame.error(), deadline);
     }
     auto chunks = parser_.feed(frame.value());
     if (!chunks) {
@@ -414,7 +464,7 @@ core::Result<std::size_t> WiredSession::send_frames(std::vector<std::byte> paylo
     }
     std::size_t sent = 0;
     for (const auto &frame : frames.value()) {
-        if (auto outcome = transport_->send(frame); !outcome) {
+        if (auto outcome = send_frame(frame); !outcome) {
             return outcome.error();
         }
         ++sent;
@@ -470,7 +520,7 @@ core::Result<void> WiredSession::forward_input(const input::NormalizedInput &eve
         return frames.error();
     }
     for (const auto &frame : frames.value()) {
-        if (auto outcome = transport_->send(frame); !outcome) {
+        if (auto outcome = send_frame(frame); !outcome) {
             ++input_send_failures_;
             return outcome.error();
         }

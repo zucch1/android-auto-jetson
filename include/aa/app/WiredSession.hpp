@@ -72,7 +72,7 @@ struct WiredSessionDeps final {
 
 struct WiredSessionConfig final {
     // Caller phase budgets plus the wired reconnect budget selection.
-    session::LifecycleConfig lifecycle{};
+    session::LifecycleConfig lifecycle{{{}, {}, core::Milliseconds{15'000}, {}}};
     // task 26 capability-gated input (bench defaults: keyboard/D-pad +
     // mouse-to-touch, no vehicle sensors).
     bool input_enabled{true};
@@ -126,6 +126,7 @@ class WiredSession final {
     [[nodiscard]] session::State state() const noexcept { return lifecycle_.state(); }
     [[nodiscard]] std::optional<Error> failure() const noexcept { return lifecycle_.failure(); }
     [[nodiscard]] core::CancellationToken token() const noexcept { return lifecycle_.token(); }
+    [[nodiscard]] core::Deadline io_deadline(bool writing = false) const noexcept;
 
     // ---- Channel services (task 18) ----
     // Validate the negotiated service descriptors and build the negotiator.
@@ -181,6 +182,8 @@ class WiredSession final {
 
   private:
     class InputForwarder;
+    [[nodiscard]] core::Result<void> send_frame(std::span<const std::byte> frame);
+    [[nodiscard]] Error io_error(Error reason, const core::Deadline &deadline);
 
     // AAP authentication progression (finding F1).
     enum class AuthPhase { awaiting_version, ssl_handshake, authenticated };

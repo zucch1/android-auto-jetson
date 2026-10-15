@@ -2,6 +2,7 @@
 #pragma once
 
 #include <aa/core/Cancellation.hpp>
+#include <aa/core/Deadline.hpp>
 #include <aa/core/Result.hpp>
 
 #include <cstddef>
@@ -21,6 +22,7 @@ namespace aa::transport {
 // handle belongs to the task-28 adapter under src/**/*_adapter/.
 class ByteEndpoint {
 public:
+    virtual void set_io_deadline(core::Deadline::Clock::time_point) noexcept {}
     virtual ~ByteEndpoint() = default;
     ByteEndpoint() = default;
     ByteEndpoint(const ByteEndpoint&) = delete;

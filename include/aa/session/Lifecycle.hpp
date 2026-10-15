@@ -67,6 +67,7 @@ public:
     Lifecycle& operator=(Lifecycle&&) = delete;
 
     [[nodiscard]] State state() const noexcept { return machine_.state(); }
+    [[nodiscard]] std::optional<core::Nanoseconds> remaining_budget() const noexcept;
 
     // The typed reason the session last entered failed (e.g. pairing timeout).
     [[nodiscard]] std::optional<Error> failure() const { return last_failure_; }

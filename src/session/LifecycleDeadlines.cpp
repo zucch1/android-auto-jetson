@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/session/Lifecycle.hpp>
+#include <algorithm>
 
 namespace aa::session {
 namespace {
@@ -10,6 +11,21 @@ namespace {
 }
 
 } // namespace
+
+std::optional<core::Nanoseconds> Lifecycle::remaining_budget() const noexcept {
+    std::optional<core::Nanoseconds> remaining;
+    const auto at = now();
+    for (const auto &deadline : {phase_deadline_, reconnect_deadline_, pairing_deadline_,
+                                 grace_deadline_}) {
+        if (deadline) {
+            const core::Nanoseconds left{std::max<std::int64_t>(0, deadline->count - at.count)};
+            if (!remaining || left.count < remaining->count) {
+                remaining = left;
+            }
+        }
+    }
+    return remaining;
+}
 
 std::optional<ErrorCode> Lifecycle::observe_deadlines() {
     const auto at = now();

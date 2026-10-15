@@ -79,11 +79,16 @@ core::Result<std::size_t> UsbAoaEndpoint::read(std::span<std::byte> buffer,
     // is the cancellation token (ByteEndpoint.hpp), one kBulkTransferTimeoutMs
     // slice at a time; write carries the zero-progress stall bound instead.
     for (;;) {
+        const core::Deadline budget{io_deadline_, token};
+        if (auto checked = budget.check(); !checked) {
+            close();
+            return checked.error();
+        }
         if (token.stop_requested()) {
             close();
             return Error{ErrorCode::cancelled};
         }
-        auto count = pipe_->read(buffer, kBulkTransferTimeoutMs);
+        auto count = pipe_->read(buffer, budget.slice_ms(kBulkTransferTimeoutMs));
         if (!count) {
             close();
             return count.error();
@@ -102,18 +107,23 @@ core::Result<std::size_t> UsbAoaEndpoint::write(std::span<const std::byte> data,
     if (data.empty()) {
         return std::size_t{0};
     }
-    // Bounded stall policy (gate P2-4): each bulk attempt is already bounded by
-    // kBulkTransferTimeoutMs; three consecutive zero-progress attempts mean the
-    // OUT pipe is stuck and end in a typed transport_io failure instead of an
-    // indefinite retry. Any failure terminally closes the endpoint.
+    // Without a caller deadline retain the legacy finite stall bound. With a
+    // deadline, zero progress is retryable; positive progress returns its exact
+    // count so FrameStreamIO advances the offset without replaying any bytes.
     constexpr int kMaxZeroProgressWrites = 3;
     int zero_progress = 0;
+    const core::Deadline budget{
+        std::min(io_deadline_, core::Deadline::Clock::now() + std::chrono::seconds{5}), token};
     for (;;) {
+        if (auto checked = budget.check(); !checked) {
+            close();
+            return checked.error();
+        }
         if (token.stop_requested()) {
             close();
             return Error{ErrorCode::cancelled};
         }
-        auto count = pipe_->write(data, kBulkTransferTimeoutMs);
+        auto count = pipe_->write(data, budget.slice_ms(kBulkTransferTimeoutMs));
         if (!count) {
             close();
             return count.error();
@@ -121,7 +131,8 @@ core::Result<std::size_t> UsbAoaEndpoint::write(std::span<const std::byte> data,
         if (count.value() > 0) {
             return count.value();
         }
-        if (++zero_progress >= kMaxZeroProgressWrites) {
+        if (++zero_progress >= kMaxZeroProgressWrites &&
+            io_deadline_ == core::Deadline::Clock::time_point::max()) {
             close();
             return Error{ErrorCode::transport_io};
         }
