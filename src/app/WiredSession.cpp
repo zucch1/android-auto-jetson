@@ -50,8 +50,11 @@ WiredSession::~WiredSession() = default;
 
 core::Result<void> WiredSession::apply(session::Event event) {
     auto outcome = lifecycle_.apply(event);
-    note_state();
+    // Recovery telemetry resolves BEFORE the state-change record: an event that
+    // both ends a recovery attempt and moves the state (a failed reconnect)
+    // must produce exactly one terminal recovery record, not one per hook.
     note_recovery(event, outcome);
+    note_state();
     return outcome;
 }
 
@@ -67,7 +70,12 @@ core::Result<void> WiredSession::fail(Error reason) {
     return outcome;
 }
 
-void WiredSession::tick() { lifecycle_.tick(); }
+void WiredSession::tick() {
+    lifecycle_.tick();
+    // Deadline expiry is an owner-thread transition like any other: surface the
+    // state change and resolve any open recovery as terminal failed (item 1).
+    note_state();
+}
 
 void WiredSession::request_stop() noexcept { lifecycle_.request_stop(); }
 
@@ -508,32 +516,77 @@ void WiredSession::note_state(std::string_view identity_key) {
     }
     last_state_ = lifecycle_.state();
     emit(identity_key);
+    // A state change is the only place a recovery attempt can RESOLVE outside
+    // its opening event: acceptance is gated on State::active (item 1), and any
+    // terminal exit ends the attempt as failed so it can never be accepted
+    // later (deadline/negotiation failure, or a cancelled teardown).
+    switch (last_state_) {
+    case session::State::active:
+        resolve_recovery(RecoveryStatus::accepted, std::nullopt);
+        break;
+    case session::State::failed: {
+        std::optional<std::int64_t> code;
+        if (lifecycle_.failure().has_value()) {
+            code = static_cast<std::int64_t>(lifecycle_.failure()->code());
+        }
+        resolve_recovery(RecoveryStatus::failed, code);
+        break;
+    }
+    case session::State::stopping:
+    case session::State::disconnected:
+        resolve_recovery(RecoveryStatus::failed,
+                         static_cast<std::int64_t>(ErrorCode::cancelled));
+        break;
+    default:
+        break;
+    }
 }
 
 void WiredSession::note_recovery(session::Event event, const core::Result<void> &outcome) {
     switch (event) {
     case session::Event::link_lost:
         if (outcome.has_value()) {
+            recovery_in_flight_ = true;
+            recovery_reason_ = "link lost";
             emit_recovery("link lost", RecoveryStatus::pending, std::nullopt);
         }
         break;
     case session::Event::reconnect:
     case session::Event::recover: {
         ++reconnect_attempts_;
-        const bool recovered = outcome.has_value();
-        if (!recovered) {
-            ++recovery_failures_;
-        }
         const char *reason = event == session::Event::recover ? "peer disconnected" : "link lost";
-        emit_recovery(reason, recovered ? RecoveryStatus::accepted : RecoveryStatus::failed,
-                      recovered ? std::nullopt
-                                : std::optional<std::int64_t>{
-                                      static_cast<std::int64_t>(outcome.error().code())});
+        recovery_reason_ = reason;
+        recovery_in_flight_ = true;
+        if (!outcome.has_value()) {
+            resolve_recovery(RecoveryStatus::failed,
+                             std::optional<std::int64_t>{
+                                 static_cast<std::int64_t>(outcome.error().code())});
+            break;
+        }
+        // Gate acceptance on active (item 1): a successful reconnect only
+        // CONNECTS, so the attempt stays pending until the state reaches
+        // active; only recover can land straight in active.
+        if (lifecycle_.state() == session::State::active) {
+            resolve_recovery(RecoveryStatus::accepted, std::nullopt);
+        } else {
+            emit_recovery(reason, RecoveryStatus::pending, std::nullopt);
+        }
         break;
     }
     default:
         break;
     }
+}
+
+void WiredSession::resolve_recovery(RecoveryStatus status, std::optional<std::int64_t> code) {
+    if (!recovery_in_flight_) {
+        return;
+    }
+    recovery_in_flight_ = false;
+    if (status == RecoveryStatus::failed) {
+        ++recovery_failures_;
+    }
+    emit_recovery(recovery_reason_, status, code);
 }
 
 void WiredSession::emit_recovery(const char *reason, RecoveryStatus status,

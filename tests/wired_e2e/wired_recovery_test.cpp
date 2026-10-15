@@ -323,6 +323,119 @@ TEST(WiredRecoveryUnplugReplug, RecoveryPastWiredDeadlineFailsClosedWithTypedTim
     EXPECT_EQ(session.failure()->code(), aa::ErrorCode::timeout);
 }
 
+// 31 review fix (item 1): acceptance is GATED on State::active. A successful
+// Event::reconnect only CONNECTS (state connecting); claiming "accepted" there
+// would report a recovery that has not happened yet. The accepted record is
+// emitted when the recovery actually reaches active.
+TEST(WiredRecoveryUnplugReplug, ReconnectEmitsAcceptedOnlyAfterSessionReachesActive) {
+    ss::test::MapTrustStore trust;
+    trust.set(kApproved, aa::trust::Decision::approved);
+    ss::test::ManualClock clock;
+    CaptureSink capture;
+    diag::Diagnostics diagnostics{capture};
+    RecordingSink video_sink;
+
+    ScriptedTransport transport;
+    ScriptedTransport fresh;
+    app::WiredSession session{{trust, clock, diagnostics}, app::WiredSessionConfig{}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+    ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, video_sink).has_value());
+    session.attach_transport(&transport);
+    drive_to_active(session, transport);
+
+    ASSERT_TRUE(session.apply(ss::Event::link_lost).has_value());
+    session.attach_transport(&fresh);
+    ASSERT_TRUE(session.apply(ss::Event::reconnect).has_value());
+    ASSERT_EQ(session.state(), ss::State::connecting);
+    // Only connecting so far: no recovery may be accepted yet.
+    EXPECT_FALSE(capture.contains("\"status\":\"accepted\""));
+    EXPECT_EQ(session.recovery_failures(), 0U);
+
+    ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+    session.attach_cipher(std::make_unique<wiredtest::FakeHandshakeCipher>());
+    wiredtest::walk_auth(session, fresh);
+    ASSERT_TRUE(session.authenticated());
+    fresh.push_inbound(wiredtest::open_request_frame(99));
+    ASSERT_TRUE(session.poll_transport().has_value());
+    ASSERT_TRUE(session.apply(ss::Event::negotiation_succeeded).has_value());
+    EXPECT_EQ(session.state(), ss::State::active);
+    EXPECT_TRUE(capture.contains("\"status\":\"accepted\""));
+}
+
+// 31 review fix (item 1): WiredSession::tick() used to forward deadline expiry
+// without emitting or counting the recovery failure - a recovery killed by the
+// 5 s wired deadline left NO terminal failed telemetry. The terminal failed
+// record (and the failure count) must appear when the deadline ends the cycle.
+TEST(WiredRecoveryUnplugReplug, DeadlineExpiryDuringRecoveryEmitsTerminalFailedTelemetry) {
+    ss::test::MapTrustStore trust;
+    trust.set(kApproved, aa::trust::Decision::approved);
+    ss::test::ManualClock clock;
+    CaptureSink capture;
+    diag::Diagnostics diagnostics{capture};
+    RecordingSink video_sink;
+
+    ScriptedTransport transport;
+    ScriptedTransport fresh;
+    app::WiredSession session{{trust, clock, diagnostics}, app::WiredSessionConfig{}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+    ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, video_sink).has_value());
+    session.attach_transport(&transport);
+    drive_to_active(session, transport);
+
+    clock.set(aa::core::Nanoseconds{0});
+    ASSERT_TRUE(session.apply(ss::Event::link_lost).has_value());
+    session.attach_transport(&fresh);
+    ASSERT_TRUE(session.apply(ss::Event::reconnect).has_value());
+    ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+    ASSERT_NE(session.state(), ss::State::active);
+    EXPECT_EQ(session.recovery_failures(), 0U);
+
+    // The wired reconnect deadline ends the open recovery with a typed timeout.
+    clock.advance(aa::core::Milliseconds{5'000});
+    session.tick();
+    EXPECT_EQ(session.state(), ss::State::failed);
+    ASSERT_TRUE(session.failure().has_value());
+    EXPECT_EQ(session.failure()->code(), aa::ErrorCode::timeout);
+    EXPECT_EQ(session.recovery_failures(), 1U);
+    EXPECT_TRUE(capture.contains("\"kind\":\"reconnect\""));
+    EXPECT_TRUE(capture.contains("\"status\":\"failed\""));
+    EXPECT_TRUE(capture.contains("\"code\":3"));
+}
+
+// 31 review fix (item 1): a negotiation/handshake failure while the recovery is
+// open must end it as a TERMINAL failed record (counted), not leave the attempt
+// silently unresolved.
+TEST(WiredRecoveryUnplugReplug, NegotiationFailureDuringRecoveryEmitsTerminalFailedTelemetry) {
+    ss::test::MapTrustStore trust;
+    trust.set(kApproved, aa::trust::Decision::approved);
+    ss::test::ManualClock clock;
+    CaptureSink capture;
+    diag::Diagnostics diagnostics{capture};
+    RecordingSink video_sink;
+
+    ScriptedTransport transport;
+    ScriptedTransport fresh;
+    app::WiredSession session{{trust, clock, diagnostics}, app::WiredSessionConfig{}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+    ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, video_sink).has_value());
+    session.attach_transport(&transport);
+    drive_to_active(session, transport);
+
+    ASSERT_TRUE(session.apply(ss::Event::link_lost).has_value());
+    session.attach_transport(&fresh);
+    ASSERT_TRUE(session.apply(ss::Event::reconnect).has_value());
+    ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
+    ASSERT_NE(session.state(), ss::State::active);
+
+    // The version/negotiation step fails terminally mid-recovery.
+    ASSERT_TRUE(session.fail(aa::Error{aa::ErrorCode::protocol_version_mismatch}).has_value());
+    EXPECT_EQ(session.state(), ss::State::failed);
+    EXPECT_EQ(session.recovery_failures(), 1U);
+    EXPECT_TRUE(capture.contains("\"status\":\"failed\""));
+    EXPECT_TRUE(capture.contains("\"code\":200"));
+    EXPECT_FALSE(capture.contains("\"status\":\"accepted\""));
+}
+
 TEST(WiredRecoveryUnplugReplug, CancelMidRecoveryTearsDownCleanly) {
     ss::test::MapTrustStore trust;
     trust.set(kApproved, aa::trust::Decision::approved);

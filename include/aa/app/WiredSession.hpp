@@ -213,6 +213,7 @@ class WiredSession final {
     enum class RecoveryStatus : std::uint8_t { pending, accepted, failed };
     void note_recovery(session::Event event, const core::Result<void> &outcome);
     void emit_recovery(const char *reason, RecoveryStatus status, std::optional<std::int64_t> code);
+    void resolve_recovery(RecoveryStatus status, std::optional<std::int64_t> code);
 
     WiredSessionDeps deps_;
     WiredSessionConfig config_;
@@ -242,6 +243,8 @@ class WiredSession final {
     std::uint64_t auth_completes_{0};
     std::uint64_t reconnect_attempts_{0};
     std::uint64_t recovery_failures_{0};
+    bool recovery_in_flight_{false};
+    const char *recovery_reason_{"link lost"};
 };
 
 } // namespace aa::app
