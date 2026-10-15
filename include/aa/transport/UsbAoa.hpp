@@ -127,9 +127,12 @@ struct UsbAoaLink final {
 // pipe. Equivalent to create_usb_aoa_endpoint() + open(), returning the full
 // connection record. An identity `admit` refuses fails closed with
 // transport_unauthorized_peer even when the AOA switch succeeded.
+// `attempted_identity` (optional) receives the captured identity when admission
+// refuses it - the rejected attempt's identity, for log attribution.
 [[nodiscard]] core::Result<UsbAoaLink> connect_usb_aoa(const UsbDeviceSelector &selector,
                                                        const AoaAccessoryInfo &info,
-                                                       const WiredAdmission &admit);
+                                                       const WiredAdmission &admit,
+                                                       trust::WiredIdentity *attempted_identity = nullptr);
 
 // ByteEndpoint seam: the returned endpoint performs device discovery, the AOA
 // switch, identity capture + admission and the bulk claim inside open() (the

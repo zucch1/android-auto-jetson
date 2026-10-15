@@ -177,8 +177,22 @@ core::Result<void> admit_wired_identity(const trust::WiredIdentity &identity,
 
 core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
                                      const UsbDeviceSelector &selector,
-                                     const AoaAccessoryInfo &info, const WiredAdmission &admit) {
-    auto endpoint = UsbAoaEndpoint::make(std::move(factory), selector, info, admit);
+                                     const AoaAccessoryInfo &info, const WiredAdmission &admit,
+                                     trust::WiredIdentity *attempted_identity) {
+    // The admission callback is the one seam that sees the CAPTURED identity of
+    // a refused attempt: record it there so callers can attribute the rejection
+    // (additive out-param; the admission decision itself is unchanged).
+    WiredAdmission observed = admit;
+    if (attempted_identity != nullptr) {
+        observed = [&admit, attempted_identity](const trust::WiredIdentity &identity) {
+            const bool admitted = admit ? admit(identity) : false;
+            if (!admitted) {
+                *attempted_identity = identity;
+            }
+            return admitted;
+        };
+    }
+    auto endpoint = UsbAoaEndpoint::make(std::move(factory), selector, info, std::move(observed));
     if (!endpoint) {
         return endpoint.error();
     }
@@ -209,12 +223,14 @@ WiredAdmission admit_via(const trust::TrustStore &store) {
 
 core::Result<UsbAoaLink> connect_usb_aoa(const UsbDeviceSelector &selector,
                                          const AoaAccessoryInfo &info,
-                                         const WiredAdmission &admit) {
+                                         const WiredAdmission &admit,
+                                         trust::WiredIdentity *attempted_identity) {
     auto world = usb_adapter::make_libusb_link_factory();
     if (!world) {
         return world.error();
     }
-    return usb_adapter::connect_aoa(std::move(world.value()), selector, info, admit);
+    return usb_adapter::connect_aoa(std::move(world.value()), selector, info, admit,
+                                    attempted_identity);
 }
 
 core::Result<std::unique_ptr<ByteEndpoint>>
