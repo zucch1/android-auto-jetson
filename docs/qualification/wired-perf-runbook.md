@@ -40,7 +40,11 @@ never weakened.
    be unavailable; the run is then BLOCKED on `receiver_binary_absent` (see
    `docs/qualification/wired-live-qa.md`, task-30 limitation).
 5. The phone and display must stay connected and undisturbed for the whole run
-   (30 minutes; then 2 hours for the soak). A disconnect invalidates the run.
+    (30 minutes; then 2 hours for the soak). A disconnect invalidates the run.
+   The collector probes DRM/session output connection at every sampling boundary,
+   including the final boundary; loss of all positive evidence latches
+   `display_connected: false` and a `display_disconnected` run violation even if
+   the display process survives. Missing connection evidence blocks live qualification.
 
 ## Exact invocations
 

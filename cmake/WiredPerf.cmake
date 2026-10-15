@@ -16,6 +16,8 @@ if(NOT CMAKE_CROSSCOMPILING)
         "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" av_sync)
     add_test(NAME wired_perf_display_sources COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" display_sources)
+    add_test(NAME wired_perf_display_disconnect COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/perf/test_continuity_regressions.py" disconnected)
     foreach(case schema nominal budget_fail duration contract collector media_timing readiness)
         add_test(NAME wired_perf_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_wired_perf.py" ${case})

@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -106,7 +107,8 @@ time.sleep(0.35)
         grace = aa_projection_collect._STARTUP_GRACE_SECONDS
         aa_projection_collect._STARTUP_GRACE_SECONDS = 0
         try:
-            capture = aa_projection_collect.collect(args)
+            with patch.object(aa_projection_collect, "_display_connected", return_value=True):
+                capture = aa_projection_collect.collect(args)
         finally:
             aa_projection_collect._STARTUP_GRACE_SECONDS = grace
         doc = result(capture)
@@ -137,7 +139,8 @@ def completeness(tmp: Path) -> None:
     assert result(nominal())["qualification_status"] == "OFFLINE_ONLY"
     capture = nominal()
     capture.update(measurement_origin="live", observed_duration_seconds=1800,
-                   early_exit=False, receiver_exit_code=0, display_survived=True)
+                   early_exit=False, receiver_exit_code=0, display_survived=True,
+                   display_connected=True)
     capture["events"].update(startup_ms=10, video_units=100, audio_chunks=100)
     capture["provenance"].update(source_digest="a" * 64, build_artifact_digest="b" * 64,
                                  configuration_digest="c" * 64,

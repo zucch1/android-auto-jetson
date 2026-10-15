@@ -269,7 +269,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         raise ContractError("measurement_origin must be live or offline")
     run_status = {name: capture.get(name) for name in
                   ("early_exit", "receiver_exit_code", "receiver_stopped_by_collector",
-                   "display_survived", "terminal_errors")}
+                   "display_survived", "display_connected", "terminal_errors")}
     run_status.update({name: events.get(name) for name in
                        ("startup_ms", "video_units", "audio_chunks")})
     run_failures = []
@@ -279,6 +279,8 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         run_failures.append("receiver_exit_code")
     if run_status["display_survived"] is False:
         run_failures.append("display_survived")
+    if run_status["display_connected"] is False:
+        run_failures.append("display_disconnected")
     if run_status["terminal_errors"]:
         run_failures.append("terminal_errors")
     requested_window = _as_float(capture.get("duration_seconds"))
@@ -294,7 +296,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         unavailable.append("invalid_telemetry")
     if origin == "live":
         for name in ("early_exit", "receiver_exit_code", "startup_ms", "video_units",
-                     "audio_chunks", "display_survived"):
+                     "audio_chunks", "display_survived", "display_connected"):
             value = run_status[name]
             if value is None or (name in ("video_units", "audio_chunks") and value <= 0):
                 unavailable.append("run_evidence:" + name)

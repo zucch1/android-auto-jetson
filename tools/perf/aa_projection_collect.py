@@ -32,6 +32,7 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -128,6 +129,18 @@ def _target_hardware_state() -> dict:
         "power_mode": power_mode,
         "cpufreq_governor": _read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
     }
+
+
+def _display_connected() -> bool:
+    if any(_read_text(path) == "connected"
+           for path in glob.glob("/sys/class/drm/card*-*/status")):
+        return True
+    try:
+        query = subprocess.run(["xrandr", "--query"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return query.returncode == 0 and re.search(
+        r"^\S+\s+connected(?:\s|$)", query.stdout, re.MULTILINE) is not None
 
 
 class EventParser:
@@ -309,6 +322,7 @@ def collect(args: argparse.Namespace) -> dict:
     early_exit = False
     stopped_by_us = False
     display_survived: bool | None = None
+    display_connected: bool | None = None
     start = time.monotonic()
     observed_duration = 0.0
 
@@ -333,6 +347,10 @@ def collect(args: argparse.Namespace) -> dict:
         deadline = start + args.duration_seconds
         while True:
             now = time.monotonic()
+            if display is not None:
+                display_connected = _display_connected()
+                if not display_connected:
+                    break
             if now >= deadline:
                 break
             if receiver.poll() is not None:
@@ -411,6 +429,7 @@ def collect(args: argparse.Namespace) -> dict:
         "receiver_exit_code": receiver_exit,
         "receiver_stopped_by_collector": stopped_by_us,
         "display_survived": display_survived,
+        "display_connected": display_connected,
         "terminal_errors": parser.terminal_errors,
         "invalid_telemetry": parser.invalid_telemetry,
         "samples": samples,

@@ -42,6 +42,7 @@
         "receiver_exit_code": { "type": ["integer", "null"] },
         "receiver_stopped_by_collector": { "type": ["boolean", "null"] },
         "display_survived": { "type": ["boolean", "null"] },
+        "display_connected": { "type": ["boolean", "null"] },
         "terminal_errors": { "type": ["array", "null"], "items": { "type": "object" } },
         "startup_ms": { "type": ["integer", "null"] },
         "video_units": { "type": ["integer", "null"] },
