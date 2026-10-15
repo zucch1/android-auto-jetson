@@ -297,6 +297,47 @@ class Rollback(unittest.TestCase):
         self.assertIn("installed_sha256=", manifest)
         self.assertFalse((self.state / "prior.rules").exists())
 
+    def test_scripts_reject_fake_roots_resolving_to_live_root(self) -> None:
+        # Given: stop BEFORE destination construction even on vulnerable code;
+        # the regression must never risk writes to the real /etc or /var/lib.
+        guard = self.root / "guard.bash"
+        guard.write_text(
+            "trap 'case \"$BASH_COMMAND\" in DST=*) "
+            "printf \"destination construction reached before rejection\\n\" >&2; "
+            "exit 97;; esac' DEBUG\n", encoding="utf-8")
+        link = self.root / "live-root"
+        link.symlink_to("/", target_is_directory=True)
+        aliases = ("/", "//", "///", "/./", "//./", "/../",
+                   str(link), f"{link}/", f"{link}//", f"{link}/./",
+                   str(self.root) + "/.." * (len(self.root.parts) - 1))
+        for script in ("install.sh", "rollback.sh"):
+            for alias in aliases:
+                with self.subTest(script=script, root=alias):
+                    env = dict(self.env, AA_USB_POLICY_ROOT=alias, BASH_ENV=str(guard))
+                    # When
+                    run = self.run_script(script, env)
+                    # Then
+                    self.assertEqual(run.returncode, 1,
+                                     "live-root alias must be rejected before paths: " + run.stderr)
+                    self.assertIn("live filesystem root", run.stderr)
+                    self.assertNotIn("udev-skip", run.stdout)
+
+    def test_scripts_accept_equivalent_safe_fake_roots(self) -> None:
+        for suffix in ("/", "/./", "//"):
+            with self.subTest(suffix=suffix):
+                # Given
+                env = dict(self.env, AA_USB_POLICY_ROOT=str(self.root) + suffix)
+                # When
+                installed = self.run_script("install.sh", env)
+                rolled_back = self.run_script("rollback.sh", env)
+                # Then
+                self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                self.assertIn("udev-skip", installed.stdout)
+                self.assertEqual(rolled_back.returncode, 0,
+                                 rolled_back.stdout + rolled_back.stderr)
+                self.assertFalse(self.dst.exists())
+                self.assertFalse(self.state.exists())
+
     def test_install_twice_is_idempotent(self) -> None:
         self.assertEqual(self.install().returncode, 0)
         manifest_first = (self.state / "manifest").read_bytes()

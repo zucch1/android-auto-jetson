@@ -36,16 +36,21 @@ QUALIFIED_PORT_SYSNAME="1-2.1"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "${SCRIPT_DIR}/common.sh"
+log() { printf '%s\n' "$*"; }
+die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
+
 ROOT="${AA_USB_POLICY_ROOT:-}"
+if [ -n "$ROOT" ]; then
+    RESOLVED_ROOT="$(readlink -f -- "$ROOT")" || die "cannot resolve AA_USB_POLICY_ROOT: ${ROOT}"
+    [ "$RESOLVED_ROOT" != "/" ] \
+        || die "AA_USB_POLICY_ROOT resolves to the live filesystem root; use an empty value for live mode"
+fi
 SRC="${SCRIPT_DIR}/${RULES_NAME}"
 DST="${ROOT}/etc/udev/rules.d/${RULES_NAME}"
 STATE_DIR="${ROOT}/var/lib/android-auto-receiver/usb-policy"
 MANIFEST="${STATE_DIR}/manifest"
 PRIOR="${STATE_DIR}/prior.rules"
 USER_NAME="${AA_USB_POLICY_USER:-${SUDO_USER:-$(id -un)}}"
-
-log() { printf '%s\n' "$*"; }
-die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
 live() { [ -z "$ROOT" ]; }
 
