@@ -67,8 +67,9 @@ normal operation.
 - `recovery_ms` per scenario: wall time from the stimulus to projection observed
   again, compared against the wired 5 s reconnect budget (see the named
   limitation on budget honesty below).
-- `retries`: the highest `"retries":N` reported by the receiver's redacted
-  `reconnect` diagnostics after the disturbance.
+- `retries` per scenario: the receiver's reconnect-attempt counter as the
+  PER-DISTURBANCE delta (counter after the disturbance minus the counter at
+  it), not the run-cumulative maximum.
 - `evidence` per scenario: what was actually OBSERVED to earn the status. A
   recovery `PASS` requires the disturbance to have been observed (a state/flow
   dip; unobservable stimuli record `BLOCKED` `dip_unobserved`, never `PASS`),
@@ -122,10 +123,11 @@ normal operation.
   deterministic fake clock (recover-to-active inside the bound; fail-closed
   typed `timeout` at exactly 5000 ms). The real-clock case
   (`RecoveryCompletesBoundedWorkOnSteadyClock`) is a self-measured wall-clock
-  smoke ceiling and does NOT certify the budget. The live 5 s budget is
-  **UNMEASURED** until a phase-B PASS record supplies harness bounded-wait
-  evidence (`recovery_ms <= BUDGET_MS` measured by the harness's own deadline
-  waits, never by the code under test).
+  smoke ceiling and does NOT certify the budget. The harness ENFORCES its own
+  wall-clock `recovery_ms` against `BUDGET_MS` on every PASS (a miss records
+  `FAILED` `recovery_exceeded_budget`, never PASS), so a phase-B PASS record
+  carries the harness-measured budget evidence; the bounded waits remain the
+  measurement authority for the observation windows.
 
 ## Budget caveats carried from task 9 (do NOT claim)
 
