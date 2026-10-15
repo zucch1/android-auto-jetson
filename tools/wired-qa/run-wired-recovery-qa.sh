@@ -269,14 +269,37 @@ dip_observed() {
 # (transport_unauthorized_peer / session_unknown_phone 302 / connect failure).
 # The session diag emits 302 as a NUMERIC JSON value ("code":302, unquoted) -
 # the quoted "code":"302" shape never appears in the real log (N2).
-rejection_observed() {
-    local since="${1:-0}"
-    local window
-    window="$(log_since "${since}")"
+rejection_shape() {
+    local window="${1:-}"
     [[ "$window" == *transport_unauthorized_peer* ]] && return 0
     [[ "$window" == *session_unknown_phone* ]] && return 0
     [[ "$window" == *'"code":302'* ]] && return 0
     [[ "$window" == *connect-failed* ]] && return 0
+    return 1
+}
+
+# The ATTRIBUTED rejection (item 2): the receiver's link-error record at
+# admission rejection carries ADDITIVE identity+port fields for the rejected
+# attempt (tools/wired-receiver/main.cpp - "phone_id" + "port"; existing fields
+# unchanged). Prints "phone_id<TAB>port" for the first record that names the
+# link error AND a rejection code AND both attribution fields; fails when the
+# rejection cannot be attributed to a concrete attempt.
+attributed_rejection() {
+    local window="${1:-}" line phone_id port
+    local id_re='"phone_id":"([^"]*)"'
+    local port_re='"port":"([^"]*)"'
+    while IFS= read -r line; do
+        [[ "$line" == *'"event":"err"'* ]] || continue
+        [[ "$line" == *'"detail":"link"'* ]] || continue
+        rejection_shape "$line" || continue
+        [[ "$line" =~ $id_re ]] || continue
+        phone_id="${BASH_REMATCH[1]}"
+        [[ "$line" =~ $port_re ]] || continue
+        port="${BASH_REMATCH[1]}"
+        [[ -n "$phone_id" && -n "$port" ]] || continue
+        printf '%s\t%s\n' "$phone_id" "$port"
+        return 0
+    done <<< "$window"
     return 1
 }
 
@@ -312,6 +335,39 @@ start_consumer() {
 
 scenario_selected() {
     [[ -z "${ONLY}" || ",${ONLY}," == *",$1,"* ]]
+}
+
+# adb `devices -l` maps each device to its USB port through the real
+# `usb:<port>` device-info field: prints "serial<TAB>port" per device.
+adb_port_map() {
+    local listing line serial port tok
+    listing="$(remote "adb devices -l 2>/dev/null" 2>/dev/null || true)"
+    while IFS= read -r line; do
+        serial="${line%%[[:space:]]*}"
+        [[ -z "${serial}" || "${serial}" == List* ]] && continue
+        port=""
+        for tok in ${line}; do
+            [[ "${tok}" == usb:* ]] && port="${tok#usb:}"
+        done
+        [[ -n "${port}" ]] || continue
+        printf '%s\t%s\n' "${serial}" "${port}"
+    done <<< "${listing}"
+}
+
+# One bounded admission attempt against the device on `port`, with the same
+# store: an unapproved device fails admission and the receiver records the
+# link-error event (exit 3). Distinct sockets and --no-bus keep the attempt
+# from contending with the live session's endpoints.
+ATTEMPT_RC=0
+drive_admission_attempt() {
+    local args="--port $(shq "$1")"
+    [[ -n "${STORE}" ]] && args="${args} --store $(shq "$STORE")"
+    ATTEMPT_RC=0
+    remote "$(shq "$RECEIVER") ${args} --no-bus --duration-ms 3000 --video-socket /tmp/aa-attempt-video.sock --input-socket /tmp/aa-attempt-input.sock > /tmp/aa-wired-receiver-attempt.log 2>&1" >/dev/null 2>&1 || ATTEMPT_RC=$?
+}
+
+attempt_window() {
+    remote "tail -c +1 /tmp/aa-wired-receiver-attempt.log 2>/dev/null" || true
 }
 
 # ---- scenario implementations (each records exactly one row) ----
@@ -461,30 +517,72 @@ scenario_phone_aa_restart() {
 }
 
 scenario_unknown_phone() {
-    # A second, unapproved device must never reach projection, and the rejection
-    # must be OBSERVED (admission/link failure telemetry) - a quiet log is not
-    # evidence of a rejection, it is the absence of one.
-    local devices count offset
-    devices="$(remote "adb devices 2>/dev/null | awk 'NR>1 && \$2==\"device\"{print \$1}'" || true)"
-    count="$(printf '%s\n' "${devices}" | grep -c . || true)"
-    if (( count < 2 )); then
+    # A second, unapproved device must drive its OWN admission attempt and the
+    # rejection must be OBSERVED and ATTRIBUTED to that attempt - a quiet log,
+    # or a rejection that cannot be attributed, never proves fail-closed.
+    # (a) map ADB devices to USB ports via `adb devices -l` (usb:<port>): the
+    # second device is selected by port match and must differ from the approved
+    # phone in BOTH identity (serial) and port.
+    local map approved_serial="" d2_serial="" d2_port="" serial port
+    map="$(adb_port_map || true)"
+    while IFS=$'\t' read -r serial port; do
+        [[ -n "${serial}" ]] || continue
+        if [[ "${port}" == "${PORT}" ]] ||
+            { [[ -n "${ADB_SERIAL}" ]] && [[ "${serial}" == "${ADB_SERIAL}" ]]; }; then
+            approved_serial="${serial}"
+        fi
+    done <<< "${map}"
+    while IFS=$'\t' read -r serial port; do
+        [[ -n "${serial}" ]] || continue
+        [[ "${serial}" == "${approved_serial}" ]] && continue
+        [[ "${port}" == "${PORT}" ]] && continue
+        d2_serial="${serial}"
+        d2_port="${port}"
+        break
+    done <<< "${map}"
+    if [[ -z "${d2_serial}" ]]; then
         record unknown_phone BLOCKED "" "" "" "second_device_absent_phase_a_fixture_covers_logic"
         return
     fi
-    offset="$(log_offset)"
-    remote "adb ${ADB_SERIAL:+-s $(shq "$ADB_SERIAL")} shell true" >/dev/null 2>&1 || true
-    local deadline=$(( $(date +%s%3N) + EVIDENCE_WAIT_MS ))
-    while (( $(date +%s%3N) < deadline )); do
-        if rejection_observed "${offset}"; then
-            if projecting; then
-                record unknown_phone FAILED "" "" "rejection+projection" "unknown_device_present_while_projecting"
-            else
-                record unknown_phone PASS "" "" "rejection_observed" "unknown_device_rejected_fail_closed"
-            fi
+    # (b) drive the SECOND device through admission: one bounded receiver run
+    # on ITS port with the same store. The link-error record of that attempt
+    # carries the rejected attempt's identity+port (additive fields).
+    drive_admission_attempt "${d2_port}"
+    local window attribution phone_id attempt_port
+    window="$(attempt_window)"
+    case "${ATTEMPT_RC}" in
+        3) ;;
+        0)
+            record unknown_phone FAILED "" "" "admission_accepted" "unknown_device_admitted"
+            return ;;
+        *)
+            record unknown_phone BLOCKED "" "" "" "admission_attempt_not_observable"
+            return ;;
+    esac
+    # (c) assert the attributed rejection: the identity/port name the second
+    # device's OWN attempt and differ from the approved phone's.
+    if attribution="$(attributed_rejection "${window}")"; then
+        phone_id="${attribution%%$'\t'*}"
+        attempt_port="${attribution#*$'\t'}"
+        if [[ "${attempt_port}" == "${PORT}" ]]; then
+            record unknown_phone FAILED "" "" "rejection+approved_port" "rejection_attributed_to_approved_phone"
             return
         fi
-        sleep 0.5
-    done
+        if [[ "${attempt_port}" != "${d2_port}" ]]; then
+            record unknown_phone FAILED "" "" "rejection+other_port" "rejection_attributed_to_other_device"
+            return
+        fi
+        if [[ "${window}" == *'"event":"active"'* || "${window}" == *'"event":"ready"'* ]]; then
+            record unknown_phone FAILED "" "" "rejection+activation" "unknown_device_reached_active"
+            return
+        fi
+        record unknown_phone PASS "" "" "attributed_rejection" "unknown_device_rejected_fail_closed"
+        return
+    fi
+    if rejection_shape "${window}"; then
+        record unknown_phone BLOCKED "" "" "rejection_unattributed" "rejection_unattributed_cannot_claim_fail_closed"
+        return
+    fi
     record unknown_phone BLOCKED "" "" "rejection_unobserved" "no_rejection_observed_cannot_claim_fail_closed"
 }
 

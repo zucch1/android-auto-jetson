@@ -61,6 +61,8 @@ case "$cmd" in
     *idVendor*|*idProduct*) printf '%s' "${FAKE_PHONE:-04e8:6860}"; exit 0 ;;
     *"/sys/class/drm"*) printf '%s\n' "${FAKE_DISPLAY:-connected}"; exit 0 ;;
     *70-android-auto-receiver.rules*) printf '%s' "${FAKE_POLICY:-installed}"; exit 0 ;;
+    *'adb devices -l'*) printf '%s\n' "${FAKE_ADB_LONG:-FAKEAPPROVED device usb:1-2.1 product:fake model:FakeApproved device:fake transport_id:1
+FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id:2}"; exit 0 ;;
     *'n++'*) printf '%s' "${FAKE_ADB_COUNT:-2}"; exit 0 ;;
     *'print $1'*) printf '%s\n' "${FAKE_ADB_LIST:-FAKEDEV1 FAKEDEV2}" | tr ' ' '\n'; exit 0 ;;
     *'adb shell'*) exit 0 ;;
@@ -76,7 +78,9 @@ case "$cmd" in
     *'"event":"input_forwarded","ok":"true"'*) [ "${FAKE_INPUT_OK:-0}" = "1" ] && exit 0 || exit 1 ;;
     *audio_chunks*) [ "${FAKE_AUDIO_CHUNKS:-0}" = "1" ] && exit 0 || exit 1 ;;
     *'input_forwarded'*) [ "${FAKE_INPUT_ANY:-0}" = "1" ] && exit 0 || exit 1 ;;
+    *'tail -c +'*aa-wired-receiver-attempt.log*) printf '%s' "${FAKE_ATTEMPT_LOG:-}"; exit 0 ;;
     *'tail -c +'*) printf '%s' "${FAKE_LOG_WINDOW:-}"; exit 0 ;;
+    *aa-wired-receiver-attempt.log*) exit "${FAKE_ATTEMPT_RC:-3}" ;;
     *'retries'*) printf '%s' "${FAKE_RETRIES:-1}"; exit 0 ;;
     *busctl*) printf '%s' "${FAKE_STATE:-string \"projecting\"}"; exit 0 ;;
     *pgrep*aa-wired-receiver*) [ "${FAKE_RECV_ALIVE:-0}" = "1" ] && echo alive || echo gone; exit 0 ;;
@@ -149,30 +153,106 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertEqual(rows["unknown_phone"]["evidence"], "rejection_unobserved")
 
     def test_unknown_phone_with_observed_rejection_passes(self):
-        window = '{"event":"err","detail":"link","code":"transport_unauthorized_peer"}'
+        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                      '"phone_id":"id-abc123","port":"1-2.3"}')
         code, doc = self.run_qa(["--only", "unknown_phone"],
-                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=window,
-                                FAKE_STATE='string "stopped"')
+                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=attributed,
+                                FAKE_ATTEMPT_LOG=attributed)
         self.assertEqual(code, 0, doc)
         self.assertEqual(doc["status"], "PASS")
         rows = {row["name"]: row for row in doc["scenarios"]}
         self.assertIn("rejection", rows["unknown_phone"]["evidence"])
 
-    def test_unknown_phone_with_numeric_302_rejection_passes(self):
+    def test_numeric_302_rejection_without_attribution_is_blocked(self):
         window = '{"event":"diag","code":302,"detail":"readmit_refused"}'
         code, doc = self.run_qa(["--only", "unknown_phone"],
                                 FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=window,
-                                FAKE_STATE='string "stopped"')
-        self.assertEqual(code, 0, doc)
-        self.assertEqual(doc["status"], "PASS")
+                                FAKE_ATTEMPT_LOG=window)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
         rows = {row["name"]: row for row in doc["scenarios"]}
-        self.assertIn("rejection", rows["unknown_phone"]["evidence"])
+        self.assertEqual(rows["unknown_phone"]["evidence"], "rejection_unattributed")
+
+    def test_quoted_302_shape_is_not_a_rejection_signal(self):
+        window = '{"event":"diag","code":"302","detail":"readmit_refused"}'
+        code, doc = self.run_qa(["--only", "unknown_phone"],
+                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=window,
+                                FAKE_ATTEMPT_LOG=window)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["unknown_phone"]["evidence"], "rejection_unobserved")
 
     def test_unknown_phone_absent_is_blocked(self):
-        code, doc = self.run_qa(["--only", "unknown_phone"], FAKE_ADB_LIST="FAKEDEV1")
+        alone = "FAKEDEV1 device usb:1-2.1 product:fake model:Fake device:fake"
+        code, doc = self.run_qa(["--only", "unknown_phone"], FAKE_ADB_LONG=alone)
         self.assertEqual(code, 3, doc)
         self.assertEqual(doc["status"], "BLOCKED")
         self.assertIn("second_device_absent", doc["blocked_on"])
+
+    # ---- item 2: the unknown-phone case must prove the SECOND device's OWN
+    #      attempt is rejected, attributed by identity+port (never shim-only) ----
+    def test_unknown_phone_rejection_requires_attribution(self):
+        bare = '{"event":"err","detail":"link","code":"transport_unauthorized_peer"}'
+        code, doc = self.run_qa(["--only", "unknown_phone"],
+                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=bare,
+                                FAKE_ATTEMPT_LOG=bare)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["unknown_phone"]["evidence"], "rejection_unattributed")
+
+    def test_unknown_phone_rejection_on_approved_port_is_failed(self):
+        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                      '"phone_id":"id-abc123","port":"1-2.1"}')
+        code, doc = self.run_qa(["--only", "unknown_phone"],
+                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=attributed,
+                                FAKE_ATTEMPT_LOG=attributed)
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["unknown_phone"]["detail"],
+                         "rejection_attributed_to_approved_phone")
+
+    def test_unknown_phone_drives_second_device_through_admission(self):
+        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                      '"phone_id":"id-abc123","port":"1-2.3"}')
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            code, doc = self.run_qa(["--only", "unknown_phone"],
+                                    FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=attributed,
+                                    FAKE_ATTEMPT_LOG=attributed, FAKE_SSH_LOG=str(log))
+            self.assertEqual(code, 0, doc)
+            logged = log.read_text(encoding="utf-8")
+            attempts = [line for line in logged.splitlines()
+                        if "aa-wired-receiver-attempt.log" in line and "--port" in line]
+            self.assertTrue(attempts, logged)
+            self.assertIn("--port 1-2.3", attempts[0])
+            self.assertNotIn("--port 1-2.1", attempts[0])
+
+    def test_unknown_phone_requires_identity_port_differ_from_approved(self):
+        same_serial = ("FAKEAPPROVED device usb:1-2.1 product:fake model:Fake device:fake\n"
+                       "FAKEAPPROVED device usb:1-2.3 product:fake model:Fake device:fake")
+        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                      '"phone_id":"id-abc123","port":"1-2.3"}')
+        code, doc = self.run_qa(["--only", "unknown_phone"],
+                                FAKE_ADB_LONG=same_serial,
+                                FAKE_LOG_WINDOW=attributed, FAKE_ATTEMPT_LOG=attributed)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        self.assertIn("second_device_absent", doc["blocked_on"])
+
+    def test_unknown_phone_activation_despite_rejection_is_failed(self):
+        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                      '"phone_id":"id-abc123","port":"1-2.3"}')
+        window = attributed + '\n{"event":"active","startup_ms":100}'
+        code, doc = self.run_qa(["--only", "unknown_phone"],
+                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=attributed,
+                                FAKE_ATTEMPT_LOG=window)
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["unknown_phone"]["detail"], "unknown_device_reached_active")
 
     def test_recovery_without_observed_dip_is_blocked(self):
         code, doc = self.run_qa(["--only", "phone_lock_unlock"], FAKE_LOG_WINDOW="")
