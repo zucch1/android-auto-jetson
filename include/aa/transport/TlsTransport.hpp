@@ -95,12 +95,14 @@ struct TlsLoopbackPair final {
 [[nodiscard]] core::Result<TlsLoopbackPair>
 make_tls_loopback(const TlsTransport::ApprovedPredicate &approved, TlsMode mode);
 
-// Create the HU-side TLS handshake cipher (server role) that reuses the hardened
-// task-8 credential and the approved-phone admission predicate. This is the
-// HandshakingCipher a session attaches to drive the AAP authentication handshake
-// over encapsulated_ssl chunks and then seal payloads with the negotiated cipher.
-// Implemented by the TLS record adapter; no OpenSSL type crosses this boundary.
+// Create the HU-side TLS handshake cipher (client role: the HU presents the
+// task-8 credential and emits its handshake flight first - the wire contract in
+// tests/wired_e2e/wired_e2e_auth_test.cpp is version_response -> HU
+// encapsulated_ssl -> phone encapsulated_ssl -> HU final chunk + auth_complete).
+// The approved-phone admission predicate is re-checked on every handshake step,
+// so a mid-handshake revoke fails closed. Implemented by the TLS record
+// adapter; no OpenSSL type crosses this boundary.
 [[nodiscard]] std::unique_ptr<HandshakingCipher>
-make_server_handshake_cipher(const TlsTransport::ApprovedPredicate &approved);
+make_client_handshake_cipher(const TlsTransport::ApprovedPredicate &approved);
 
 } // namespace aa::transport

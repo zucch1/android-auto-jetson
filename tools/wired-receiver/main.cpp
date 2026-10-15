@@ -437,7 +437,7 @@ int main(int argc, char **argv) {
     // captured trust predicate. The predicate re-checks the store on each
     // handshake step, so a mid-handshake revoke fails closed.
     auto bind_link_cipher = [&session, &store](const aa::trust::PhoneIdentity &phone) -> bool {
-        auto cipher = aa::transport::make_server_handshake_cipher(
+        auto cipher = aa::transport::make_client_handshake_cipher(
             [&store, phone] { return store.lookup(phone) == aa::trust::Decision::approved; });
         if (!cipher) {
             return false;
