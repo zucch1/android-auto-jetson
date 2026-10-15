@@ -76,6 +76,24 @@ green smoke.
 
 ## What to record in the receipt
 
+### Active window and continuity
+
+Startup has a bounded 60-second grace (not counted toward qualification).
+The requested 30-minute/2-hour window starts only after `active` and positive
+receiver video/audio counters **and** video paint/audio write completions with
+matched A/V pairs. A capture without that evidence is BLOCKED, not timed as a
+successful projection. `startup_wait_seconds` and `active_projection_seconds`
+are recorded separately from process lifetime (`duration_seconds`).
+
+At least every five seconds the collector samples those cumulative counters.
+Every stream, including the matched-pair counter, must advance within **10
+seconds**. A longer freeze, counter reset, inactive projection, missing progress
+after startup, or sampling gap over 10 seconds invalidates the run; later
+recovery cannot heal it. The reporter independently replays these samples, so
+a long-lived but stalled process cannot qualify. Connection loss also invalidates
+the window. Use a continuously playing audio/video workload for qualification;
+intentional media pauses do not count as verified active projection.
+
 Both runs write a result document (validated against
 `tools/perf/aa-projection-perf.schema.json`) whose gated metrics are compared to
 the contractual budgets:

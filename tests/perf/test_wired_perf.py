@@ -323,6 +323,7 @@ def case_contract(tmp: Path) -> None:
 def _collect(tmp: Path, state_dir: Path, seconds: int, env: dict | None = None) -> subprocess.CompletedProcess:
     return run([sys.executable, "-B", str(COLLECTOR), "--receiver", str(FAKE_RECEIVER),
                 "--port", "1-2.1", "--duration-seconds", str(seconds), "--interval", "1",
+                "--startup-timeout-seconds", "2",
                 "--no-display", "--state-dir", str(state_dir)], env=env, timeout=120)
 
 

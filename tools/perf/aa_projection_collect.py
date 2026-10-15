@@ -43,6 +43,9 @@ from pathlib import Path
 CAPTURE_SCHEMA = "aa-projection-perf-capture/1"
 _STARTUP_GRACE_SECONDS = 3.0
 _TERMINATE_GRACE_SECONDS = 5.0
+_PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
+_MEDIA_STALL_SECONDS = 10
+_PROGRESS_KEYS = ("video_units", "audio_chunks", "video_presentations", "audio_writes", "av_pairs")
 
 # Diagnostic keys the receiver/display event stream may carry (task-19
 # vocabulary). Each maps to one measured metric. Absent keys stay null.
@@ -143,6 +146,54 @@ def _display_connected() -> bool:
         r"^\S+\s+connected(?:\s|$)", query.stdout, re.MULTILINE) is not None
 
 
+class ProjectionProgress:
+    """Accumulate a fail-closed active window from observed, increasing counters."""
+
+    def __init__(self) -> None:
+        self.started_ms: int | None = None
+        self.last_ms = 0
+        self.previous: dict[str, int] = {}
+        self.advanced_ms: dict[str, int] = {}
+        self.failure: str | None = None
+
+    @property
+    def seconds(self) -> float:
+        return (self.last_ms - self.started_ms) / 1000 if self.started_ms is not None else 0.0
+
+    def observe(self, sample: dict) -> None:
+        if self.failure:
+            return
+        stamp = sample.get("t_ms")
+        counters = {key: sample.get(key) for key in _PROGRESS_KEYS}
+        valid = (type(stamp) is int and stamp >= 0
+                 and all(type(value) is int and value >= 0 for value in counters.values()))
+        if not valid:
+            if self.started_ms is not None:
+                self.failure = "missing_progress"
+            return
+        if self.started_ms is None:
+            if sample.get("projection_active") is not True or not all(counters.values()):
+                return
+            self.started_ms = stamp
+            self.previous = counters
+            self.advanced_ms = {key: stamp for key in counters}
+        else:
+            if stamp < self.last_ms or stamp - self.last_ms > _MEDIA_STALL_SECONDS * 1000:
+                self.failure = "sampling_gap"
+            if sample.get("projection_active") is not True:
+                self.failure = "projection_inactive"
+            for key, value in counters.items():
+                if value < self.previous[key]:
+                    self.failure = "counter_reset:" + key
+                # Check age before accepting a resumed stream: a late recovery cannot heal a freeze.
+                if stamp - self.advanced_ms[key] > _MEDIA_STALL_SECONDS * 1000:
+                    self.failure = "media_stalled:" + key
+                if value > self.previous[key]:
+                    self.advanced_ms[key] = stamp
+            self.previous = counters
+        self.last_ms = stamp
+
+
 class EventParser:
     """Incrementally parse newline-delimited JSON events from log files."""
 
@@ -162,6 +213,11 @@ class EventParser:
         self.audio_completions: deque[tuple[int, int, int]] = deque()
         self.video_completions: deque[tuple[int, int]] = deque()
         self.av_pairs = 0
+        self.audio_writes = 0
+        self.video_presentations = 0
+        self.projection_active = False
+        self.last_audio_scheduled = -1
+        self.last_video_scheduled = -1
 
     def _completion(self, event: dict) -> None:
         """Join endpoint events by concurrent scheduled presentation, not log arrival."""
@@ -180,11 +236,21 @@ class EventParser:
                 self.invalid_telemetry.append("av_sync_ms")
                 self.metrics["av_sync_ms"] = None
                 return
+            if scheduled <= self.last_audio_scheduled:
+                return
+            self.last_audio_scheduled = scheduled
+            self.audio_writes += 1
             self.audio_completions.append((scheduled, end, completed))
         else:
+            if scheduled <= self.last_video_scheduled:
+                return
+            self.last_video_scheduled = scheduled
+            self.video_presentations += 1
             self.video_completions.append((scheduled, completed))
         pending: deque[tuple[int, int]] = deque()
         for stamp, video_done in self.video_completions:
+            while self.audio_completions and self.audio_completions[0][1] <= stamp:
+                self.audio_completions.popleft()
             match = next((done for begin, end, done in self.audio_completions
                           if begin <= stamp < end), None)
             if match is None:
@@ -265,6 +331,9 @@ class EventParser:
             self.audio_chunks = event["count"]
         if envelope == "active" and isinstance(event.get("startup_ms"), int):
             self.startup_ms = event["startup_ms"]
+            self.projection_active = True
+        if envelope in ("stopping", "disconnected", "err"):
+            self.projection_active = False
         if kind == "transport_stats":
             for key, target in _IPC_KEYS.items():
                 self._number(event, key, target)
@@ -306,13 +375,15 @@ def collect(args: argparse.Namespace) -> dict:
     receiver_log = state_dir / "receiver.log"
     display_log = state_dir / "display.log"
 
-    receiver_cmd = [args.receiver, "--port", args.port,
-                    "--duration-ms", str(args.duration_seconds * 1000)]
+    startup_timeout = getattr(args, "startup_timeout_seconds", _PROJECTION_STARTUP_TIMEOUT_SECONDS)
+    receiver_cmd = [args.receiver, "--port", args.port, "--duration-ms",
+                    str((args.duration_seconds + startup_timeout + 10) * 1000)]
     if args.store:
         receiver_cmd += ["--store", args.store]
 
     samples: list[dict] = []
     parser = EventParser()
+    progress = ProjectionProgress()
     receiver: subprocess.Popen | None = None
     display: subprocess.Popen | None = None
     rec_file = None
@@ -344,7 +415,7 @@ def collect(args: argparse.Namespace) -> dict:
         clk = os.sysconf("SC_CLK_TCK")
         prev_ticks = _cpu_ticks(receiver.pid)
         prev_time = time.monotonic()
-        deadline = start + args.duration_seconds
+        deadline = start + startup_timeout
         while True:
             now = time.monotonic()
             if display is not None:
@@ -361,7 +432,7 @@ def collect(args: argparse.Namespace) -> dict:
                 break
             if parser.terminal_errors:
                 break
-            time.sleep(min(args.interval, max(0.0, deadline - now)))
+            time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
             now = time.monotonic()
             ticks = _cpu_ticks(receiver.pid)
             cpu = None
@@ -373,13 +444,26 @@ def collect(args: argparse.Namespace) -> dict:
             parser.poll(str(receiver_log))
             if display is not None:
                 parser.poll(str(display_log))
-            samples.append({
+            sample = {
                 "t_ms": int((now - start) * 1000),
                 "receiver_rss_mb": rss,
                 "receiver_cpu_pct_one_core": cpu,
                 "thermal_peak_c": peak,
                 "thermal_zones": zones,
-            })
+                "projection_active": parser.projection_active,
+                "video_units": parser.video_units,
+                "audio_chunks": parser.audio_chunks,
+                "video_presentations": parser.video_presentations,
+                "audio_writes": parser.audio_writes,
+                "av_pairs": parser.av_pairs,
+            }
+            samples.append(sample)
+            was_started = progress.started_ms is not None
+            progress.observe(sample)
+            if not was_started and progress.started_ms is not None:
+                deadline = start + progress.started_ms / 1000 + args.duration_seconds
+            if progress.failure:
+                break
             prev_ticks, prev_time = ticks, now
 
         observed_duration = time.monotonic() - start
@@ -423,6 +507,9 @@ def collect(args: argparse.Namespace) -> dict:
         "mode": "wired",
         "duration_seconds": args.duration_seconds,
         "observed_duration_seconds": observed_duration,
+        "active_projection_seconds": progress.seconds,
+        "startup_wait_seconds": progress.started_ms / 1000 if progress.started_ms is not None else None,
+        "projection_failure": progress.failure,
         "measurement_origin": "live",
         "crashes": crashes,
         "early_exit": early_exit,
@@ -450,10 +537,16 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--video-socket", default=None)
     parser.add_argument("--input-socket", default=None)
     parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--startup-timeout-seconds", type=int,
+                        default=_PROJECTION_STARTUP_TIMEOUT_SECONDS,
+                        help="startup timeout, may only shorten the default 60-second grace")
     args = parser.parse_args(argv)
 
     if args.duration_seconds <= 0:
         print("error: --duration-seconds must be positive", file=sys.stderr)
+        return 2
+    if not 0 < args.startup_timeout_seconds <= _PROJECTION_STARTUP_TIMEOUT_SECONDS:
+        print("error: --startup-timeout-seconds must be in [1, 60]", file=sys.stderr)
         return 2
     if not math.isfinite(args.interval) or args.interval <= 0:
         print("error: --interval must be positive", file=sys.stderr)

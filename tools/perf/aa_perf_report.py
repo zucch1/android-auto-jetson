@@ -40,6 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aa_perf_schema  # noqa: E402
+from aa_projection_collect import ProjectionProgress
 
 TASK = "32. Measure wired performance and two-hour soak"
 SCHEMA_VERSION = "aa-projection-perf/1"
@@ -271,7 +272,15 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                   ("early_exit", "receiver_exit_code", "receiver_stopped_by_collector",
                    "display_survived", "display_connected", "terminal_errors")}
     run_status.update({name: events.get(name) for name in
-                       ("startup_ms", "video_units", "audio_chunks")})
+                        ("startup_ms", "video_units", "audio_chunks")})
+    progress = ProjectionProgress()
+    if origin == "live":
+        for sample in samples:
+            progress.observe(sample)
+    run_status.update(active_projection_seconds=progress.seconds if origin == "live" else None,
+                      startup_wait_seconds=progress.started_ms / 1000
+                      if progress.started_ms is not None else None,
+                      projection_failure=progress.failure)
     run_failures = []
     if run_status["early_exit"]:
         run_failures.append("early_exit")
@@ -284,8 +293,13 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     if run_status["terminal_errors"]:
         run_failures.append("terminal_errors")
     requested_window = _as_float(capture.get("duration_seconds"))
-    if requested_window is not None and duration_seconds < requested_window:
+    if origin != "live" and requested_window is not None and duration_seconds < requested_window:
         run_failures.append("incomplete_window")
+    if origin == "live" and progress.started_ms is not None:
+        if requested_window is None or progress.seconds < requested_window:
+            run_failures.append("incomplete_active_window")
+        if progress.failure:
+            run_failures.append(progress.failure)
     for failure in run_failures:
         violations.append({"metric": failure, "value": None, "budget_max": 0,
                            "detail": "projection run failed: " + failure})
@@ -295,6 +309,8 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     if invalid_telemetry:
         unavailable.append("invalid_telemetry")
     if origin == "live":
+        if progress.started_ms is None:
+            unavailable.append("run_evidence:active_projection_progress")
         for name in ("early_exit", "receiver_exit_code", "startup_ms", "video_units",
                      "audio_chunks", "display_survived", "display_connected"):
             value = run_status[name]

@@ -92,6 +92,16 @@ stay absent and the collector keeps them `null` -> the run is **BLOCKED** (fail
 closed, never a fabricated `0`). Device-supplied text (thermal zone names) is
 JSON-escaped as data and never injected into the document.
 
+Live qualification excludes a bounded 60-second startup grace: the requested
+window begins only with active receiver video/audio progress, consumer paint/
+write completions, and matched A/V pairs. Per-sample counters must keep advancing
+within 10 seconds; freezes, counter resets, connection loss and sampling gaps
+invalidate the run, even if both processes live. DRM connector status and the
+session's `xrandr --query` are positive connection sources (either suffices;
+neither means disconnected). The reporter independently verifies progress over
+the entire window; startup-only evidence never qualifies. See the runbook for
+endpoint limitations and the continuous-workload requirement.
+
 ## Result document and provenance
 
 The result embeds a `provenance` block with the source digest, build-artifact

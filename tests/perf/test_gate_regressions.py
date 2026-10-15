@@ -52,7 +52,8 @@ def finite(tmp: Path) -> None:
                    '{"event":"media_timing","av_sync_ms":' + token + '}')
         proc = subprocess.run([sys.executable, "-B", str(ROOT / "tools/perf/aa_projection_collect.py"),
                                "--receiver", str(ROOT / "tests/perf/fixtures/wired_perf/fake_receiver.py"),
-                               "--port", "fixture", "--no-display", "--duration-seconds", "1",
+                                "--port", "fixture", "--no-display", "--duration-seconds", "1",
+                                "--startup-timeout-seconds", "1",
                                "--interval", "0.1", "--state-dir", str(tmp / ("raw-" + token))],
                               env=env, capture_output=True, text=True, timeout=15)
         assert proc.returncode == 0, proc.stderr
@@ -142,6 +143,11 @@ def completeness(tmp: Path) -> None:
                    early_exit=False, receiver_exit_code=0, display_survived=True,
                    display_connected=True)
     capture["events"].update(startup_ms=10, video_units=100, audio_chunks=100)
+    capture["samples"] = [{**capture["samples"][0], "t_ms": second * 1000,
+                           "projection_active": True, "video_units": second + 1,
+                           "audio_chunks": second + 1, "video_presentations": second + 1,
+                           "audio_writes": second + 1, "av_pairs": second + 1}
+                          for second in range(0, 1801, 5)]
     capture["provenance"].update(source_digest="a" * 64, build_artifact_digest="b" * 64,
                                  configuration_digest="c" * 64,
                                  service_definitions=[{"name": "fixture.service", "digest": "d" * 64}])
@@ -221,6 +227,7 @@ while True: time.sleep(0.01)
     proc = subprocess.run([sys.executable, "-B", str(ROOT / "tools/perf/aa_projection_collect.py"),
                            "--receiver", str(receiver), "--port", "fixture", "--no-display",
                            "--duration-seconds", "1", "--interval", "0.1",
+                           "--startup-timeout-seconds", "1",
                            "--state-dir", str(tmp / "state")], capture_output=True, text=True, timeout=15)
     assert proc.returncode == 0, proc.stderr
     capture = json.loads(proc.stdout)

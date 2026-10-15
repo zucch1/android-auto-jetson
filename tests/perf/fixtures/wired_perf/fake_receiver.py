@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import signal
 import sys
 import time
 
@@ -60,6 +61,7 @@ def _duration_ms(argv: list[str]) -> int:
 
 
 def main() -> int:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     duration_ms = _duration_ms(sys.argv[1:])
     grow = os.environ.get("FAKE_RECEIVER_GROW") == "1"
     crash = os.environ.get("FAKE_RECEIVER_CRASH") == "1"
