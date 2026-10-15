@@ -50,8 +50,11 @@ wired_phone_identity(const trust::WiredIdentity &identity);
 // accessory bulk pipe and wrap it in the framed USB transport. Any
 // connect_usb_aoa failure (including transport_unauthorized_peer for a phone
 // the store does not approve) is returned typed and no transport is produced.
+// `attempted_identity` (optional) receives the captured identity when admission
+// refuses it - the rejected attempt's identity, for log attribution.
 [[nodiscard]] core::Result<WiredLink> open_wired_link(const transport::UsbDeviceSelector &selector,
                                                       const transport::AoaAccessoryInfo &info,
-                                                      const trust::TrustStore &store);
+                                                      const trust::TrustStore &store,
+                                                      trust::WiredIdentity *attempted_identity = nullptr);
 
 } // namespace aa::app
