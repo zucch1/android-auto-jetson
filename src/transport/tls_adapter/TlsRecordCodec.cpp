@@ -256,11 +256,11 @@ void pump_handshake(TlsRecordCodec &a, TlsRecordCodec &b) {
 namespace aa::transport {
 
 std::unique_ptr<HandshakingCipher>
-make_server_handshake_cipher(const TlsTransport::ApprovedPredicate &approved) {
+make_client_handshake_cipher(const TlsTransport::ApprovedPredicate &approved) {
     try {
         aa::tls::Policy policy(approved, aa::tls::Mode::encryption_only_compatibility);
         return std::make_unique<tls_adapter::TlsRecordCodec>(
-            std::move(policy), tls_adapter::TlsRecordCodec::Role::server);
+            std::move(policy), tls_adapter::TlsRecordCodec::Role::client);
     } catch (...) {
         return nullptr;
     }
