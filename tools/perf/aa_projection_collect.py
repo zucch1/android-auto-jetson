@@ -26,6 +26,7 @@ changes); it only launches the supplied binaries and reads procfs/sysfs.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import glob
 import json
 import math
@@ -138,12 +139,55 @@ class EventParser:
             "frame_drops": None, "decode_p50_ms": None, "decode_p95_ms": None,
             "decode_fps": None, "decode_frames": None, "ipc_throughput_mbps": None,
             "ipc_p95_added_latency_ms": None, "av_sync_ms": None, "audio_latency_ms": None,
+            "audio_scheduling_skew_ms": None,
         }
         self.video_units: int | None = None
         self.audio_chunks: int | None = None
         self.startup_ms: int | None = None
         self.invalid_telemetry: list[str] = []
         self.terminal_errors: list[dict] = []
+        self.audio_completions: deque[tuple[int, int, int]] = deque()
+        self.video_completions: deque[tuple[int, int]] = deque()
+        self.av_pairs = 0
+
+    def _completion(self, event: dict) -> None:
+        """Join endpoint events by concurrent scheduled presentation, not log arrival."""
+        audio = event["event"] == "audio_write_completed"
+        keys = ("scheduled_ns", "scheduled_end_ns", "completed_ns") if audio else (
+            "scheduled_ns", "completed_ns")
+        values = [event.get(key) for key in keys]
+        if any(type(value) is not int or value < 0 for value in values):
+            self.invalid_telemetry.append("av_sync_ms")
+            self.metrics["av_sync_ms"] = None
+            return
+        scheduled, completed = event["scheduled_ns"], event["completed_ns"]
+        if audio:
+            end = event["scheduled_end_ns"]
+            if end <= scheduled:
+                self.invalid_telemetry.append("av_sync_ms")
+                self.metrics["av_sync_ms"] = None
+                return
+            self.audio_completions.append((scheduled, end, completed))
+        else:
+            self.video_completions.append((scheduled, completed))
+        pending: deque[tuple[int, int]] = deque()
+        for stamp, video_done in self.video_completions:
+            match = next((done for begin, end, done in self.audio_completions
+                          if begin <= stamp < end), None)
+            if match is None:
+                pending.append((stamp, video_done))
+            else:
+                self._number({"delta": abs(video_done - match) / 1e6}, "delta",
+                             "av_sync_ms", peak=True)
+                self.av_pairs += 1
+        self.video_completions = pending
+        # Bound retention even if a stream disappears. Missing pairs never become zero.
+        while len(self.audio_completions) > 16384:
+            self.audio_completions.popleft()
+        if len(self.video_completions) > 16384:
+            self.video_completions.popleft()
+            self.invalid_telemetry.append("av_sync_ms")
+            self.metrics["av_sync_ms"] = None
 
     def _number(self, event: dict, key: str, target: str, *, integer: bool = False,
                 peak: bool = False) -> None:
@@ -216,7 +260,15 @@ class EventParser:
                 self._number(event, key, target, integer=target == "decode_frames")
             for drops_key in ("dropped", "drops"):
                 self._number(event, drops_key, "frame_drops", integer=True)
-        self._number(event, "av_sync_ms", "av_sync_ms", peak=True)
+        if envelope in ("audio_write_completed", "video_presented"):
+            self._completion(event)
+        # A legacy audio-only av_sync_ms field is not cross-stream evidence.
+        if "av_sync_ms" in event:
+            raw = event["av_sync_ms"]
+            if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not math.isfinite(raw):
+                self.invalid_telemetry.append("av_sync_ms")
+                self.metrics["av_sync_ms"] = None
+        self._number(event, "audio_scheduling_skew_ms", "audio_scheduling_skew_ms", peak=True)
         self._number(event, "audio_latency_ms", "audio_latency_ms", peak=True)
         self._number(event, "frame_drops", "frame_drops", integer=True)
 

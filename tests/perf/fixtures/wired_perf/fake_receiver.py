@@ -105,11 +105,20 @@ def main() -> int:
             )
             if media_timing:
                 index = tick // 5 - 1
+                av = av_series[min(index, len(av_series) - 1)]
+                stamp = tick * 1_000_000_000
+                print(json.dumps({"event": "audio_write_completed", "scheduled_ns": stamp,
+                                  "scheduled_end_ns": stamp + 20_000_000,
+                                  "completed_ns": stamp}), flush=True)
+                print(json.dumps({"event": "video_presented", "frame": tick,
+                                  "scheduled_ns": stamp,
+                                  "completed_ns": stamp + round(av * 1e6)
+                                  if isinstance(av, float) else av}), flush=True)
                 print(
                     json.dumps(
                         {
                             "event": "media_timing",
-                            "av_sync_ms": av_series[min(index, len(av_series) - 1)],
+                            "audio_scheduling_skew_ms": 0,
                             "audio_latency_ms": audio_series[
                                 min(index, len(audio_series) - 1)
                             ],

@@ -69,19 +69,25 @@ newline-delimited JSON event stream:
 | frame drops | `diag`/`decode_stats` `dropped`/`drops` (or a `frame_drops` field) |
 | decode timing | `diag`/`decode_stats` `p50_latency_ms`/`p95_latency_ms`/`fps`/`frames` |
 | IPC | `diag`/`transport_stats` `p95_latency_ms`/`throughput_mbps` |
-| A/V sync | an event field `av_sync_ms` |
+| A/V sync | peak absolute completion delta of concurrent `video_presented` / `audio_write_completed` events |
+| audio scheduling skew (informational) | `media_timing.audio_scheduling_skew_ms` |
 | audio latency | an event field `audio_latency_ms` |
 | crashes | receiver exit status (non-zero, or death before the window ends) |
 
 A metric with no source in the current build stays `null`. The wired receiver
-emits a low-rate `media_timing` event carrying `av_sync_ms` (peak
-`RouterStats::max_completion_skew`: handoff-confirmed write completion minus
-the piece's scheduled presentation time on the common monotonic A/V clock - the
-audio-side A/V-sync envelope, not a device-delivery or video-presentation
-comparison) and `audio_latency_ms` (peak `RouterStats::max_path_latency`:
+emits a low-rate `media_timing` event carrying `audio_scheduling_skew_ms` (peak
+`RouterStats::max_completion_skew`, informational only) and `audio_latency_ms`
+(peak `RouterStats::max_path_latency`:
 receiver input before decode to handoff-confirmed write completion at the
 routing element). Both are the cumulative peak (worst observed) because the
-phase-B gate is a run/soak budget. Until an audio chunk is routed the fields
+phase-B gate is a run/soak budget. A final cumulative event is flushed before
+router teardown, including orderly early exits. `av_sync_ms` is computed only
+from the cross-stream consumer completion events: the video's retained common
+monotonic timestamp must lie in the audio write's half-open scheduled interval.
+The collector retains the maximum absolute paint-completion / stream-write-
+completion delta over the window, regardless of log arrival order. No matched
+pair means `null`, never a proxy or fabricated zero. These endpoints are API
+completion events, not photon/speaker observations. Until an audio chunk is routed the fields
 stay absent and the collector keeps them `null` -> the run is **BLOCKED** (fail
 closed, never a fabricated `0`). Device-supplied text (thermal zone names) is
 JSON-escaped as data and never injected into the document.

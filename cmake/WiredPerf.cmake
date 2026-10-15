@@ -12,6 +12,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     get_target_property(receiver_libraries aa-wired-receiver LINK_LIBRARIES)
     target_link_libraries(aa_receiver_timing_test PRIVATE ${receiver_libraries} GTest::gtest_main)
     add_test(NAME wired_perf_receiver_timing COMMAND aa_receiver_timing_test)
+    add_test(NAME wired_perf_av_sync COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" av_sync)
     foreach(case schema nominal budget_fail duration contract collector media_timing readiness)
         add_test(NAME wired_perf_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_wired_perf.py" ${case})

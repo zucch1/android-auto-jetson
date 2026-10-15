@@ -63,6 +63,7 @@
         "rss_growth_pct",
         "av_sync_ms",
         "audio_latency_ms",
+        "audio_scheduling_skew_ms",
         "helper_rss_mb",
         "frame_drops",
         "decode_p50_ms",

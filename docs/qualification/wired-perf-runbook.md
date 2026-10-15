@@ -91,8 +91,27 @@ that budget; the receipt must not claim it.
 
 ## Named limitations (completeness gaps, do NOT claim complete qualification)
 
-The receiver/display pair launched by this procedure emits only the two
-media-timing fields (`av_sync_ms`, `audio_latency_ms`). The following **7 of the
+### A/V measurement endpoints
+
+`av_sync_ms` is the maximum absolute difference between **video paint completion**
+(after `QPainter::end` in `ProjectionWidget`, once per consumed decoded frame)
+and **audio stream-write completion** (the handoff-confirmed PipeWire routing
+write used by task-25 `RenderBarrierStats`). Both use the common receiver-local
+monotonic A/V clock. Video source/presentation timestamps are retained through
+`VideoOutlet` -> video IPC -> decode correlation -> widget pixel queue. The
+collector matches a video timestamp to the audio write's half-open scheduled
+presentation interval, then compares the two observed completion timestamps.
+Log arrival order does not define concurrency. No matched pair means BLOCKED.
+
+These are **consumer-side completion events**, not photon/speaker observations:
+Qt/compositor/display scanout and downstream PipeWire/device buffering are not
+observed. This is the same stream-write endpoint vocabulary as `audio_latency_ms`.
+The old audio-only completion-versus-schedule maximum is emitted honestly as
+`audio_scheduling_skew_ms` (informational); it never satisfies the 50 ms A/V gate.
+
+The receiver/display pair supplies cross-stream completion events and audio
+timing (`av_sync_ms`, `audio_latency_ms`, plus informational audio scheduling
+skew). The following **7 of the
 9 event-metric slots have no emitter** in that pair and stay `null` in every
 capture it produces:
 
@@ -109,8 +128,7 @@ result's `named_gaps`, `qualification_status` stays `INCOMPLETE`, and the verdic
 is `BLOCKED` — such a capture is **never** presented as complete task-32
 qualification and never a PASS. (Decode timing remains informational per the
 task-9 caveat above and is not re-claimed here.) The emitter halves —
-decode/IPC/frame-drop stats events and the final `emit_media_timing` flush at
-shutdown — are cross-lane work in `tools/wired-receiver` /
+decode/IPC/frame-drop stats events — are cross-lane work in `tools/wired-receiver` /
 `tools/dummy-display` (lanes 30/31) and land separately; until then phase-B
 runs are expected to end BLOCKED on these named gaps rather than PASS.
 

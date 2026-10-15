@@ -87,6 +87,8 @@ import json, time
 print('{"event":"active","startup_ms":5}', flush=True)
 print('{"event":"video_sent","units":10}', flush=True)
 print('{"event":"audio_chunks","count":10}', flush=True)
+print('{"event":"audio_write_completed","scheduled_ns":1000000000,"scheduled_end_ns":1020000000,"completed_ns":1000000000}', flush=True)
+print('{"event":"video_presented","scheduled_ns":1000000000,"completed_ns":1012000000}', flush=True)
 print('{"event":"media_timing","av_sync_ms":12,"audio_latency_ms":40}', flush=True)
 time.sleep(0.35)
 ''' + ("raise SystemExit(0)\n" if scenario == "clean_early" else
@@ -204,6 +206,8 @@ def shutdown(tmp: Path) -> None:
     receiver.write_text('''#!/usr/bin/env python3
 import json, signal, time
 def stop(*args):
+ print('{"event":"audio_write_completed","scheduled_ns":2000000000,"scheduled_end_ns":2020000000,"completed_ns":2000000000}', flush=True)
+ print('{"event":"video_presented","scheduled_ns":2000000000,"completed_ns":2075000000}', flush=True)
  print('{"event":"media_timing","av_sync_ms":75,"audio_latency_ms":90}', flush=True)
  raise SystemExit(0)
 signal.signal(signal.SIGTERM, stop)
@@ -228,7 +232,7 @@ def receiver_hook_present(source: str) -> bool:
     pump = re.search(r"router_\s*\.\s*pump\s*\(\s*\)", code)
     call = re.search(r"\bemit_media_timing\s*\(\s*\)\s*;", code)
     stats = re.search(r"stats\s*=\s*router_\s*\.\s*report\s*\(\s*\)\s*\.\s*stats", code)
-    return bool(pump and call and stats and pump.start() < call.start()
+    return bool(pump and call and stats
                 and re.search(r"format_ms\s*\(\s*stats\.max_completion_skew\s*\)", code)
                 and re.search(r"format_ms\s*\(\s*stats\.max_path_latency\s*\)", code))
 
