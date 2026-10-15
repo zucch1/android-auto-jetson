@@ -15,8 +15,9 @@ struct PhoneFixture final : aa::input::InputChannelTarget, aa::input::SensorChan
     std::vector<aa::input::NormalizedInput> input{};
     std::vector<aa::input::SensorEvent> sensors{};
 
-    void on_normalized(const aa::input::NormalizedInput& event) override {
+    aa::core::Result<void> on_normalized(const aa::input::NormalizedInput& event) override {
         input.push_back(event);
+        return {};
     }
 
     void on_sensor_event(const aa::input::SensorEvent& event) override {

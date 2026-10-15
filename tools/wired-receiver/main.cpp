@@ -200,16 +200,21 @@ class RouterSink final : public aa::protocol::MessageSink {
 
     [[nodiscard]] aa::core::Result<void>
     on_message(const aa::protocol::MessageView &message) override {
+        const auto frames_before = router_.report().stats.frames_written;
         if (auto submitted = router_.submit(message); !submitted) {
             return submitted.error();
-        }
-        ++chunks_;
-        if (chunks_ % 50 == 1) {
-            log_line("{\"event\":\"audio_chunks\",\"count\":" + std::to_string(chunks_) + "}");
         }
         auto pumped = router_.pump();
         if (!pumped) {
             return pumped.error();
+        }
+        // A successful empty pump is not delivery (e.g. a decoder buffered input).
+        if (router_.report().stats.frames_written == frames_before) {
+            return {};
+        }
+        ++chunks_;
+        if (chunks_ % 50 == 1) {
+            log_line("{\"event\":\"audio_chunks\",\"count\":" + std::to_string(chunks_) + "}");
         }
         // Only after a successful pump do the router's statistics carry a
         // measured render completion. Emit on the same low-rate cadence as

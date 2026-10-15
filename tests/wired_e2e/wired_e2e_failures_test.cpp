@@ -122,4 +122,23 @@ TEST(WiredE2eFailures, ShortControlPayloadFailsTyped) {
     EXPECT_EQ(outcome.error().code(), aa::ErrorCode::invalid_argument);
 }
 
+TEST(WiredE2eFailures, RejectedInputSendIsNotSuccessfulDelivery) {
+    ss::test::MapTrustStore trust;
+    trust.set(kApproved, aa::trust::Decision::approved);
+    ss::test::ManualClock clock;
+    CaptureSink capture;
+    diag::Diagnostics diagnostics{capture};
+    ScriptedTransport transport;
+    app::WiredSession session{{trust, clock, diagnostics}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+    session.attach_transport(&transport);
+    drive_to_active(session, transport);
+    transport.fail_send_at(transport.sent_count());
+    const auto result = session.submit_input(aa::ipc::KeyEvent{66, true});
+    ASSERT_FALSE(result.has_value()) << "rejected outbound input was reported delivered";
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::transport_io);
+    EXPECT_EQ(session.input_sends(), 0U);
+    EXPECT_EQ(session.input_send_failures(), 1U);
+}
+
 } // namespace

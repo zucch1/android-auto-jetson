@@ -196,7 +196,7 @@ class WiredSession final {
     [[nodiscard]] core::Result<std::size_t> send_encapsulated_ssl(std::vector<std::byte> bytes);
     [[nodiscard]] core::Result<std::size_t> send_frames(std::vector<std::byte> payload,
                                                         bool encrypted);
-    void forward_input(const input::NormalizedInput &event);
+    [[nodiscard]] core::Result<void> forward_input(const input::NormalizedInput &event);
     [[nodiscard]] std::optional<std::uint8_t> input_channel() const noexcept;
 
     void note_state(std::string_view identity_key = {});

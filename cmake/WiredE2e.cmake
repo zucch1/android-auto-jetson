@@ -32,6 +32,7 @@ set(AA_WIRED_TEST_SOURCES
     tests/wired_e2e/wired_e2e_happy_test.cpp
     tests/wired_e2e/wired_e2e_revoke_test.cpp
     tests/wired_e2e/wired_e2e_failures_test.cpp
+    tests/wired_e2e/receiver_test.cpp
     tests/wired_e2e/wired_e2e_trust_link_test.cpp
     tests/wired_e2e/wired_e2e_input_wire_test.cpp
     tests/wired_e2e/wired_e2e_auth_test.cpp
@@ -77,7 +78,8 @@ if(NOT CMAKE_CROSSCOMPILING)
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_link_libraries(aa_wired_e2e_test PRIVATE
         aa_wired aa_protocol_adapter aap_protobuf aasdk
-        aa_video aa_input aa_input_service aareceiver-audio pthread GTest::gtest_main)
+        aa_video aa_input aa_input_service aa_ipc_control aa_ipc_dbus aa_transport_tls
+        aareceiver-audio pthread GTest::gtest_main)
     target_include_directories(aa_wired_e2e_test PRIVATE
         "${CMAKE_BINARY_DIR}/aasdk/protobuf"
         "${AA_DEPENDENCY_STAGE}/aasdk/include"
@@ -116,6 +118,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_e2e_input_wire COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eInputWire.*)
     add_test(NAME wired_e2e_auth COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eAuth.*)
     add_test(NAME wired_recovery COMMAND aa_wired_e2e_test --gtest_filter=WiredRecovery.*)
+    add_test(NAME wired_receiver COMMAND aa_wired_e2e_test --gtest_filter=WiredReceiver.*)
+    set_tests_properties(wired_receiver PROPERTIES TIMEOUT 120)
     set_tests_properties(wired_e2e_happy wired_e2e_revoke wired_e2e_failures wired_e2e_trust_link
         wired_e2e_input_wire wired_e2e_auth wired_recovery PROPERTIES TIMEOUT 120)
     add_test(NAME wired_e2e_live_qa_gates COMMAND "${Python3_EXECUTABLE}" -B

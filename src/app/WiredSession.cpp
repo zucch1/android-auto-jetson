@@ -22,8 +22,8 @@ constexpr Error bad_argument() { return Error{ErrorCode::invalid_argument}; }
 class WiredSession::InputForwarder final : public input::InputChannelTarget {
   public:
     explicit InputForwarder(WiredSession &owner) noexcept : owner_(owner) {}
-    void on_normalized(const input::NormalizedInput &event) override {
-        owner_.forward_input(event);
+    core::Result<void> on_normalized(const input::NormalizedInput &event) override {
+        return owner_.forward_input(event);
     }
 
   private:
@@ -446,11 +446,11 @@ std::optional<std::uint8_t> WiredSession::input_channel() const noexcept {
     return std::nullopt;
 }
 
-void WiredSession::forward_input(const input::NormalizedInput &event) {
+core::Result<void> WiredSession::forward_input(const input::NormalizedInput &event) {
     const auto channel = input_channel();
     if (!channel.has_value() || transport_ == nullptr || !authenticated()) {
         ++input_send_failures_;
-        return;
+        return Error{ErrorCode::transport_unauthorized_peer};
     }
     // Finding F2: the phone-facing payload is the AAP InputReport protobuf
     // (message id 0x8001 + body), converted at this boundary - not the local
@@ -459,7 +459,7 @@ void WiredSession::forward_input(const input::NormalizedInput &event) {
         protocol::encode_input_report(event, static_cast<std::uint64_t>(deps_.clock.now().count));
     if (!payload) {
         ++input_send_failures_;
-        return;
+        return payload.error();
     }
     transport::Message message{*channel, transport::MessageKind::specific,
                                std::move(payload).value()};
@@ -467,15 +467,16 @@ void WiredSession::forward_input(const input::NormalizedInput &event) {
         transport::encode_message(message, transport::Encryption::encrypted, cipher_.get());
     if (!frames) {
         ++input_send_failures_;
-        return;
+        return frames.error();
     }
     for (const auto &frame : frames.value()) {
         if (auto outcome = transport_->send(frame); !outcome) {
             ++input_send_failures_;
-            return;
+            return outcome.error();
         }
     }
     ++input_sends_;
+    return {};
 }
 
 // ---------------------------------------------------------------------------
