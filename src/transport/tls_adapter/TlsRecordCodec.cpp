@@ -9,6 +9,8 @@
 
 #include "tls_error_map.hpp"
 
+#include <aa/transport/TlsTransport.hpp>
+
 #include <cstring>
 #include <stdexcept>
 
@@ -29,10 +31,10 @@ inline constexpr std::uint16_t kTls12RecordVersion = 0x0303;
 } // namespace
 
 struct TlsRecordCodec::Ssl final {
-    SSL_CTX* ctx{nullptr};
-    SSL* ssl{nullptr};
-    BIO* rbio{nullptr}; // bytes into TLS (peer -> ssl)
-    BIO* wbio{nullptr}; // bytes out of TLS (ssl -> peer)
+    SSL_CTX *ctx{nullptr};
+    SSL *ssl{nullptr};
+    BIO *rbio{nullptr}; // bytes into TLS (peer -> ssl)
+    BIO *wbio{nullptr}; // bytes out of TLS (ssl -> peer)
 
     ~Ssl() {
         // SSL_set_bio transfers BIO ownership to the SSL object; SSL_free
@@ -57,10 +59,8 @@ TlsRecordCodec::TlsRecordCodec(aa::tls::Policy policy, Role role)
     // Pin TLS 1.2 AES-GCM so the record overhead is exactly 29 bytes.
     SSL_CTX_set_min_proto_version(ssl_->ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(ssl_->ctx, TLS1_2_VERSION);
-    SSL_CTX_set_cipher_list(
-        ssl_->ctx,
-        "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:"
-        "AES128-GCM-SHA256:AES256-GCM-SHA384");
+    SSL_CTX_set_cipher_list(ssl_->ctx, "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:"
+                                       "AES128-GCM-SHA256:AES256-GCM-SHA384");
     if (SSL_CTX_use_certificate(ssl_->ctx, credentials.certificate.get()) != 1 ||
         SSL_CTX_use_PrivateKey(ssl_->ctx, credentials.private_key.get()) != 1 ||
         SSL_CTX_check_private_key(ssl_->ctx) != 1) {
@@ -90,8 +90,8 @@ bool TlsRecordCodec::do_handshake() {
     policy_.require_approved();
     const int result = SSL_do_handshake(ssl_->ssl);
     if (result == 1) {
-        const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl_->ssl);
-        const char* name = (cipher != nullptr) ? SSL_CIPHER_get_name(cipher) : "";
+        const SSL_CIPHER *cipher = SSL_get_current_cipher(ssl_->ssl);
+        const char *name = (cipher != nullptr) ? SSL_CIPHER_get_name(cipher) : "";
         if (std::strstr(name, "GCM") == nullptr) {
             // Only AES-GCM is admitted; any other negotiated cipher would make
             // the fixed record overhead unsound.
@@ -125,8 +125,20 @@ void TlsRecordCodec::write_handshake(std::span<const std::byte> bytes) {
     }
 }
 
-core::Result<std::vector<std::byte>>
-TlsRecordCodec::seal(std::span<const std::byte> plaintext) {
+core::Result<bool> TlsRecordCodec::step_handshake() {
+    try {
+        return do_handshake();
+    } catch (const aa::tls::Error &error) {
+        active_ = false;
+        return map_tls_error(error);
+    }
+}
+
+std::vector<std::byte> TlsRecordCodec::take_handshake() { return read_handshake(); }
+
+void TlsRecordCodec::give_handshake(std::span<const std::byte> bytes) { write_handshake(bytes); }
+
+core::Result<std::vector<std::byte>> TlsRecordCodec::seal(std::span<const std::byte> plaintext) {
     if (!active_) {
         return Error{ErrorCode::transport_closed};
     }
@@ -135,7 +147,7 @@ TlsRecordCodec::seal(std::span<const std::byte> plaintext) {
     }
     try {
         policy_.require_approved();
-    } catch (const aa::tls::Error& error) {
+    } catch (const aa::tls::Error &error) {
         active_ = false;
         return map_tls_error(error);
     }
@@ -169,14 +181,13 @@ TlsRecordCodec::seal(std::span<const std::byte> plaintext) {
     return record;
 }
 
-core::Result<std::vector<std::byte>>
-TlsRecordCodec::open(std::span<const std::byte> record) {
+core::Result<std::vector<std::byte>> TlsRecordCodec::open(std::span<const std::byte> record) {
     if (!active_) {
         return Error{ErrorCode::transport_closed};
     }
     try {
         policy_.require_approved();
-    } catch (const aa::tls::Error& error) {
+    } catch (const aa::tls::Error &error) {
         active_ = false;
         return map_tls_error(error);
     }
@@ -187,9 +198,8 @@ TlsRecordCodec::open(std::span<const std::byte> record) {
     if (record.size() < kAesGcmRecordOverhead) {
         return Error{ErrorCode::transport_malformed_frame};
     }
-    const std::uint8_t* header = reinterpret_cast<const std::uint8_t*>(record.data());
-    const std::uint16_t fragment_len =
-        static_cast<std::uint16_t>((header[3] << 8U) | header[4]);
+    const std::uint8_t *header = reinterpret_cast<const std::uint8_t *>(record.data());
+    const std::uint16_t fragment_len = static_cast<std::uint16_t>((header[3] << 8U) | header[4]);
     if (header[0] != kTlsApplicationData ||
         header[1] != static_cast<std::uint8_t>(kTls12RecordVersion >> 8U) ||
         header[2] != static_cast<std::uint8_t>(kTls12RecordVersion & 0xFFU) ||
@@ -206,8 +216,7 @@ TlsRecordCodec::open(std::span<const std::byte> record) {
     std::vector<std::byte> out(plain_len);
     std::size_t got = 0;
     while (got < plain_len) {
-        const int count = SSL_read(ssl_->ssl, out.data() + got,
-                                   static_cast<int>(plain_len - got));
+        const int count = SSL_read(ssl_->ssl, out.data() + got, static_cast<int>(plain_len - got));
         if (count <= 0) {
             // Authenticated decryption failed or the record was truncated.
             active_ = false;
@@ -218,19 +227,13 @@ TlsRecordCodec::open(std::span<const std::byte> record) {
     return out;
 }
 
-std::size_t TlsRecordCodec::record_overhead() const noexcept {
-    return overhead_;
-}
+std::size_t TlsRecordCodec::record_overhead() const noexcept { return overhead_; }
 
-bool TlsRecordCodec::is_active() const noexcept {
-    return active_;
-}
+bool TlsRecordCodec::is_active() const noexcept { return active_; }
 
-const char* TlsRecordCodec::label() const noexcept {
-    return policy_.label();
-}
+const char *TlsRecordCodec::label() const noexcept { return policy_.label(); }
 
-void pump_handshake(TlsRecordCodec& a, TlsRecordCodec& b) {
+void pump_handshake(TlsRecordCodec &a, TlsRecordCodec &b) {
     // Alternate handshake steps, pumping each codec's outbound records into the
     // other's inbound side, until both complete.
     for (int iteration = 0; iteration < 64 && (!a.is_active() || !b.is_active()); ++iteration) {
@@ -249,3 +252,18 @@ void pump_handshake(TlsRecordCodec& a, TlsRecordCodec& b) {
 }
 
 } // namespace aa::transport::tls_adapter
+
+namespace aa::transport {
+
+std::unique_ptr<HandshakingCipher>
+make_server_handshake_cipher(const TlsTransport::ApprovedPredicate &approved) {
+    try {
+        aa::tls::Policy policy(approved, aa::tls::Mode::encryption_only_compatibility);
+        return std::make_unique<tls_adapter::TlsRecordCodec>(
+            std::move(policy), tls_adapter::TlsRecordCodec::Role::server);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+} // namespace aa::transport

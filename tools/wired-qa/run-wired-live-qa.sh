@@ -54,10 +54,29 @@ while (($# > 0)); do
     esac
 done
 
+# Session env for every remote command (single choke point): batch ssh has no
+# session bus address (`busctl --user` fails "Failed to get credentials") and
+# the display consumer is a Qt GUI app that aborts under xcb without DISPLAY.
+# Single-quoted so `$(id -u)` expands on the TARGET, never here.
+# XAUTHORITY requirement: DISPLAY alone is not enough for the X client - the
+# remote session must also carry XAUTHORITY pointing at the authority cookie
+# of the target X server (the owning session's cookie file), or the display
+# consumer is refused with an X authentication failure. Set both together.
+REMOTE_SESSION_ENV='export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus; export DISPLAY=:1;'
+
+# Shell-quote one caller-supplied value before it enters a remote command
+# string: remote() runs that string through the TARGET shell, so a
+# metacharacter in PORT/RECEIVER/DISPLAY must arrive literal, never execute.
+shq() { printf '%q' "$1"; }
+
 # Bounded remote command (hung_commands class): 30 s hard ceiling per ssh.
-remote() { timeout 30 ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
+remote() { timeout 30 ssh "${SSH_OPTS[@]}" "$HOST" "$REMOTE_SESSION_ENV" "$@"; }
 
 json_escape() { printf '%s' "$1" | tr -d '\000' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# Host/IP values are never written raw to a JSON artifact: keep only a
+# truncated digest for run correlation (Privacy: redact/hash before export).
+host_tag="$(printf '%s' "$HOST" | sha256sum | cut -c1-16)"
 
 write_result() {
     local status="$1" blocked_on="$2" projection="$3" video="$4" audio="$5" input="$6" budget_ms="$7"
@@ -66,7 +85,7 @@ write_result() {
 {
   "task": "30. Qualify wired end-to-end projection",
   "phase": "B (live device)",
-  "host": "$(json_escape "$HOST")",
+  "host": "sha256:${host_tag}",
   "port": "$(json_escape "$PORT")",
   "status": "$status",
   "blocked_on": "$(json_escape "$blocked_on")",
@@ -91,8 +110,10 @@ if ! remote "true" >/dev/null 2>&1; then
 fi
 
 # ---- 2. read-only readiness checks ----
-phone_id="$(remote "cat /sys/bus/usb/devices/${PORT}/idVendor 2>/dev/null | tr -d '\n'; echo -n ':'; cat /sys/bus/usb/devices/${PORT}/idProduct 2>/dev/null | tr -d '\n'" || true)"
-display_status="$(remote "for c in /sys/class/drm/card*-DP-1/status /sys/class/drm/card*-HDMI-A-1/status; do [ -f \"\$c\" ] && { basename \"\$(dirname \"\$c\")\"; cat \"\$c\"; }; done | head -2" || true)"
+PORT_Q="$(shq "$PORT")"
+phone_id="$(remote "cat /sys/bus/usb/devices/${PORT_Q}/idVendor 2>/dev/null | tr -d '\n'; echo -n ':'; cat /sys/bus/usb/devices/${PORT_Q}/idProduct 2>/dev/null | tr -d '\n'" || true)"
+# DRM connector status tokens only (no card name): one word per connector.
+display_status="$(remote "for c in /sys/class/drm/card*-DP-1/status /sys/class/drm/card*-HDMI-A-1/status; do [ -f \"\$c\" ] && cat \"\$c\"; done" || true)"
 audio_sink="$(remote "command -v pactl >/dev/null 2>&1 && pactl list short sinks 2>/dev/null | head -1 || (command -v pw-cli >/dev/null 2>&1 && pw-cli ls Device 2>/dev/null | head -1)" || true)"
 policy="$(remote "test -f /etc/udev/rules.d/70-android-auto-receiver.rules && echo installed || echo absent" || true)"
 
@@ -108,7 +129,14 @@ if [[ "$policy" != "installed" ]]; then
     write_result "BLOCKED" "udev_policy_not_installed" "false" "false" "false" "false" "null"
     exit 3
 fi
-if [[ "$display_status" != *"connected"* ]]; then
+# Exact-token DRM status match: `disconnected` must NOT read as `connected`.
+display_connected="false"
+for token in $display_status; do
+    if [[ "$token" == "connected" ]]; then
+        display_connected="true"
+    fi
+done
+if [[ "$display_connected" != "true" ]]; then
     write_result "BLOCKED" "display_disconnected" "false" "false" "false" "false" "null"
     exit 3
 fi
@@ -132,33 +160,72 @@ fi
 # and requests projection. Both run under a bounded ssh; logs are captured on the
 # target under /tmp for later retrieval (redaction applied before export).
 start_ms="$(date +%s%3N)"
-remote "nohup ${RECEIVER} --port ${PORT} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!" >/tmp/aa-recv.pid
-remote "nohup ${DISPLAY} --test-only-autostart > /tmp/aa-wired-display.log 2>&1 & echo \$!" >/tmp/aa-disp.pid
+receiver_pid=""; display_pid=""
+teardown() {
+    local pid
+    for pid in "$display_pid" "$receiver_pid"; do
+        [[ -z "$pid" ]] && continue
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+        remote "kill $pid 2>/dev/null || true; for n in \$(seq 1 20); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; kill -KILL $pid 2>/dev/null || true; sleep 0.1; ! kill -0 $pid 2>/dev/null" || return 1
+    done
+    receiver_pid=""; display_pid=""
+}
+on_exit() {
+    local code=$?
+    trap - EXIT
+    teardown || code=4
+    exit "$code"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+receiver_pid="$(remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!")"
+display_pid="$(remote "nohup $(shq "$DISPLAY") --test-only-autostart > /tmp/aa-wired-display.log 2>&1 & echo \$!")"
 
 projection="false"
-deadline=$(( $(date +%s%3N) + PROJECTION_TIMEOUT_MS ))
+session_active="false"; video="false"; audio="false"; input="false"
+deadline=$(( start_ms + PROJECTION_TIMEOUT_MS ))
+poll_remote() {
+    local remaining=$((deadline - $(date +%s%3N)))
+    ((remaining > 0)) || return 1
+    timeout "$(printf '%d.%03d' "$((remaining / 1000))" "$((remaining % 1000))")" \
+        ssh "${SSH_OPTS[@]}" "$HOST" "$REMOTE_SESSION_ENV" "$@"
+}
 while (( $(date +%s%3N) < deadline )); do
-    state="$(remote "busctl --user call org.custom.AndroidAutoReceiver /org/custom/AndroidAutoReceiver org.custom.AndroidAutoReceiver1 GetState 2>/dev/null" || true)"
+    state="$(poll_remote "busctl --user call org.custom.AndroidAutoReceiver /org/custom/AndroidAutoReceiver org.custom.AndroidAutoReceiver1 GetState 2>/dev/null" || true)"
     if [[ "$state" == *"projecting"* ]]; then
         projection="true"
+    fi
+    poll_remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && session_active="true"
+    poll_remote "grep -q '\"event\":\"video_sent\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && video="true"
+    poll_remote "grep -q '\"event\":\"audio_chunks\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && audio="true"
+    poll_remote "grep -q '\"event\":\"input_forwarded\",\"ok\":\"true\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && input="true"
+    if [[ "$projection" == true && "$session_active" == true && "$video" == true && "$audio" == true && "$input" == true ]]; then
         break
     fi
-    sleep 1
+    sleep 0.05
 done
 budget_ms=$(( $(date +%s%3N) - start_ms ))
 
-video="false"; audio="false"; input="false"
-if [[ "$projection" == "true" ]]; then
-    remote "grep -q video_sent /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && video="true"
-    remote "grep -q audio_chunks /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && audio="true"
-    remote "grep -q input_forwarded /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && input="true"
+# An ACTIVE phone session is a stronger claim than the D-Bus `projecting`
+# string (the control service can reach `projecting` before a phone session is
+# active). The receiver emits its `active` event only when the session state
+# machine reaches State::active, so that is the session-activation signal.
+if ! teardown; then
+    write_result "FAILED" "teardown_failed" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 4
 fi
 
-# Best-effort bounded teardown.
-remote "kill \$(cat /tmp/aa-disp.pid) 2>/dev/null || true; kill \$(cat /tmp/aa-recv.pid) 2>/dev/null || true" || true
-
-if [[ "$projection" != "true" ]]; then
-    write_result "BLOCKED" "projection_not_reached_within_budget" "false" "$video" "$audio" "$input" "$budget_ms"
+# Verdict taxonomy: a missing prerequisite is BLOCKED; the session running but
+# failing to project / activate / deliver every observable is FAILED. PASS
+# requires an ACTIVE session AND all three delivery paths observed.
+if [[ "$projection" != "true" || "$session_active" != "true" ]]; then
+    write_result "FAILED" "session_not_active" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 4
+fi
+if [[ "$video" != "true" || "$audio" != "true" || "$input" != "true" ]]; then
+    write_result "FAILED" "observable_missing" "$projection" "$video" "$audio" "$input" "$budget_ms"
     exit 4
 fi
 write_result "PASS" "" "$projection" "$video" "$audio" "$input" "$budget_ms"

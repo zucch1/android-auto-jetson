@@ -32,6 +32,10 @@ class UsbAoaEndpoint final : public ByteEndpoint {
     ~UsbAoaEndpoint() override;
 
     [[nodiscard]] core::Result<void> open() override;
+    [[nodiscard]] core::Result<void> open(const core::Deadline &deadline);
+    void set_io_deadline(core::Deadline::Clock::time_point until) noexcept override {
+        io_deadline_ = until;
+    }
     [[nodiscard]] core::Result<std::size_t> read(std::span<std::byte> buffer,
                                                  const core::CancellationToken &token) override;
     [[nodiscard]] core::Result<std::size_t> write(std::span<const std::byte> data,
@@ -59,6 +63,7 @@ class UsbAoaEndpoint final : public ByteEndpoint {
     AoaSwitchReport switch_report_{};
     bool opened_{false};
     bool terminal_{false};
+    core::Deadline::Clock::time_point io_deadline_{core::Deadline::Clock::time_point::max()};
 };
 
 // The connection pipeline behind open()/connect_usb_aoa(): discovery + switch
@@ -68,6 +73,7 @@ class UsbAoaEndpoint final : public ByteEndpoint {
 [[nodiscard]] core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
                                                    const UsbDeviceSelector &selector,
                                                    const AoaAccessoryInfo &info,
-                                                   const WiredAdmission &admit);
+                                                    const WiredAdmission &admit,
+                                                    const core::Deadline &deadline = {});
 
 } // namespace aa::transport::usb_adapter

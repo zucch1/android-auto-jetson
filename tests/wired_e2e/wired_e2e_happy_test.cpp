@@ -13,6 +13,9 @@
 #include "../session/Fakes.hpp"
 #include "../video_socket/pair.hpp"
 
+#include <aap_protobuf/service/inputsource/message/InputReport.pb.h>
+#include <aap_protobuf/service/inputsource/message/KeyEvent.pb.h>
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -93,13 +96,20 @@ TEST(WiredE2eHappy, ApprovedPhoneReachesActiveProjection) {
     ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
     ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, video_sink).has_value());
     ASSERT_TRUE(session.register_sink(proto::ChannelRole::media_audio, audio_sink).has_value());
+    auto cipher = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    auto *cipher_raw = cipher.get();
     session.attach_transport(&transport);
+    session.attach_cipher(std::move(cipher));
 
     // Approved identity -> active session (admission is the TrustStore's call).
     ASSERT_TRUE(session.apply(ss::Event::start_discovery).has_value());
     ASSERT_TRUE(session.phone_discovered(kApproved).has_value());
     ASSERT_TRUE(session.apply(ss::Event::transport_ready).has_value());
     EXPECT_TRUE(transport.is_open());
+
+    // AAP authentication: version -> SSL handshake -> auth_complete (finding F1).
+    wiredtest::walk_auth(session, transport);
+    ASSERT_TRUE(session.authenticated());
 
     // Discovery: the phone asks, the session publishes its advertised services.
     transport.push_inbound(wiredtest::discovery_request_frame());
@@ -150,7 +160,21 @@ TEST(WiredE2eHappy, ApprovedPhoneReachesActiveProjection) {
     auto input_frame = tr::decode_frame(transport.last_sent());
     ASSERT_TRUE(input_frame.has_value());
     EXPECT_EQ(input_frame.value().header.channel, 101);
-    EXPECT_EQ(input_frame.value().payload.size(), ipc::kInputRecordBytes);
+    // Post-auth input carries the negotiated cipher (finding F1): the frame is
+    // encrypted and its payload is the sealed AAP InputReport (finding F2) - the
+    // message id 0x8001 + body, not the local 24-byte IPC record. Last event: key 66.
+    EXPECT_EQ(input_frame.value().header.encryption, tr::Encryption::encrypted);
+    auto opened = cipher_raw->open(input_frame.value().payload);
+    ASSERT_TRUE(opened.has_value());
+    const auto &payload = opened.value();
+    ASSERT_GE(payload.size(), 2U);
+    EXPECT_EQ(payload[0], std::byte{0x80});
+    EXPECT_EQ(payload[1], std::byte{0x01});
+    aap_protobuf::service::inputsource::message::InputReport report;
+    ASSERT_TRUE(report.ParseFromArray(payload.data() + 2, static_cast<int>(payload.size() - 2)));
+    ASSERT_TRUE(report.has_key_event());
+    ASSERT_EQ(report.key_event().keys_size(), 1);
+    EXPECT_EQ(report.key_event().keys(0).keycode(), 66U);
 
     // Capability gate: an unadvertised keycode is refused and nothing is sent.
     auto gated = session.submit_input(ipc::InputEvent{ipc::KeyEvent{9999, true}});

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <aa/core/Cancellation.hpp>
+#include <aa/core/Deadline.hpp>
 #include <aa/core/Result.hpp>
 
 #include <cstddef>
@@ -34,6 +35,7 @@ enum class Kind { usb_aoa, tcp, tls };
 
 class Transport {
 public:
+    virtual void set_io_deadline(core::Deadline::Clock::time_point) noexcept {}
     virtual ~Transport() = default;
     Transport() = default;
     Transport(const Transport&) = delete;

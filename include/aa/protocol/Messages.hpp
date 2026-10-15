@@ -83,8 +83,8 @@ struct VersionRequest final {
     std::uint16_t major{};
     std::uint16_t minor{};
 
-    [[nodiscard]] friend constexpr bool operator==(const VersionRequest&,
-                                                   const VersionRequest&) noexcept = default;
+    [[nodiscard]] friend constexpr bool operator==(const VersionRequest &,
+                                                   const VersionRequest &) noexcept = default;
 };
 
 // MESSAGE_PING_REQUEST body: protobuf, `timestamp` required on the wire.
@@ -93,7 +93,7 @@ struct PingRequest final {
     bool bug_report{};
     std::vector<std::byte> data{};
 
-    [[nodiscard]] friend bool operator==(const PingRequest&, const PingRequest&) = default;
+    [[nodiscard]] friend bool operator==(const PingRequest &, const PingRequest &) = default;
 };
 
 // MESSAGE_PING_RESPONSE body: protobuf, `timestamp` required on the wire.
@@ -101,7 +101,7 @@ struct PingResponse final {
     std::int64_t timestamp{};
     std::vector<std::byte> data{};
 
-    [[nodiscard]] friend bool operator==(const PingResponse&, const PingResponse&) = default;
+    [[nodiscard]] friend bool operator==(const PingResponse &, const PingResponse &) = default;
 };
 
 // MESSAGE_CHANNEL_OPEN_REQUEST body: protobuf, `priority` and `service_id`
@@ -111,34 +111,34 @@ struct ChannelOpenRequest final {
     std::int32_t priority{};
     ServiceKey service{};
 
-    [[nodiscard]] friend constexpr bool operator==(const ChannelOpenRequest&,
-                                                   const ChannelOpenRequest&) noexcept = default;
+    [[nodiscard]] friend constexpr bool operator==(const ChannelOpenRequest &,
+                                                   const ChannelOpenRequest &) noexcept = default;
 };
 
 enum class ChannelOpenStatus { success, unsupported };
 struct ChannelOpenResponse final {
     ChannelOpenStatus status{ChannelOpenStatus::unsupported};
-    [[nodiscard]] friend constexpr bool operator==(const ChannelOpenResponse&,
-                                                   const ChannelOpenResponse&) noexcept = default;
+    [[nodiscard]] friend constexpr bool operator==(const ChannelOpenResponse &,
+                                                   const ChannelOpenResponse &) noexcept = default;
 };
 
 struct VideoConfiguration final {
     std::vector<VideoProfile> profiles{}; // ordered backend-supported preference
-    [[nodiscard]] friend bool operator==(const VideoConfiguration&,
-                                        const VideoConfiguration&) = default;
+    [[nodiscard]] friend bool operator==(const VideoConfiguration &,
+                                         const VideoConfiguration &) = default;
 };
 struct AudioConfiguration final {
     std::vector<AudioProfile> profiles{};
-    [[nodiscard]] friend bool operator==(const AudioConfiguration&,
-                                        const AudioConfiguration&) = default;
+    [[nodiscard]] friend bool operator==(const AudioConfiguration &,
+                                         const AudioConfiguration &) = default;
 };
 struct ButtonConfiguration final {
     std::vector<std::int32_t> keycodes{}; // actual non-touch buttons, no defaults
-    [[nodiscard]] friend bool operator==(const ButtonConfiguration&,
-                                        const ButtonConfiguration&) = default;
+    [[nodiscard]] friend bool operator==(const ButtonConfiguration &,
+                                         const ButtonConfiguration &) = default;
 };
-using ServiceConfiguration = std::variant<std::monostate, VideoConfiguration,
-                                          AudioConfiguration, ButtonConfiguration>;
+using ServiceConfiguration =
+    std::variant<std::monostate, VideoConfiguration, AudioConfiguration, ButtonConfiguration>;
 
 // One advertised channel service. `id` is dynamic (ID space 2); `role` is the
 // semantic role resolved by the session router, never an ordinal.
@@ -147,13 +147,13 @@ struct ServiceDescriptor final {
     ChannelRole role{};
     ServiceConfiguration configuration{};
 
-    [[nodiscard]] friend bool operator==(const ServiceDescriptor&,
-                                        const ServiceDescriptor&) = default;
+    [[nodiscard]] friend bool operator==(const ServiceDescriptor &,
+                                         const ServiceDescriptor &) = default;
 };
 
 inline constexpr std::size_t kMaxMediaProfiles = 8;
 inline constexpr std::size_t kMaxButtonKeycodes = 64;
-[[nodiscard]] core::Result<void> validate_service(const ServiceDescriptor& service);
+[[nodiscard]] core::Result<void> validate_service(const ServiceDescriptor &service);
 [[nodiscard]] bool valid_video_profile(VideoProfile profile) noexcept;
 [[nodiscard]] bool valid_audio_profile(AudioProfile profile) noexcept;
 
@@ -162,8 +162,41 @@ inline constexpr std::size_t kMaxButtonKeycodes = 64;
 struct ServiceDiscoveryResponse final {
     std::vector<ServiceDescriptor> services{};
 
-    [[nodiscard]] friend bool operator==(const ServiceDiscoveryResponse&,
-                                         const ServiceDiscoveryResponse&) = default;
+    [[nodiscard]] friend bool operator==(const ServiceDiscoveryResponse &,
+                                         const ServiceDiscoveryResponse &) = default;
+};
+
+// MESSAGE_VERSION_RESPONSE body (raw, NOT protobuf): three big-endian uint16
+// fields - major, minor, status. `status` is the aap shared MessageStatus
+// (0 = success). Pinned to the AASDK ControlServiceChannel::handleVersionResponse
+// layout (6-byte body).
+struct VersionResponse final {
+    std::uint16_t major{};
+    std::uint16_t minor{};
+    std::uint16_t status{};
+
+    [[nodiscard]] friend constexpr bool operator==(const VersionResponse &,
+                                                   const VersionResponse &) noexcept = default;
+};
+
+// MESSAGE_ENCAPSULATED_SSL body (raw, opaque): one chunk of the TLS handshake
+// stream exchanged during the AAP authentication handshake. The bytes are fed
+// to / read from the negotiated TLS record cipher (the handshake seam), never
+// interpreted here.
+struct EncapsulatedSsl final {
+    std::vector<std::byte> bytes{};
+
+    [[nodiscard]] friend bool operator==(const EncapsulatedSsl &,
+                                         const EncapsulatedSsl &) = default;
+};
+
+// MESSAGE_AUTH_COMPLETE body: protobuf AuthResponse{required int32 status}
+// (0 = success). Signals the peer finished the authentication handshake.
+struct AuthComplete final {
+    std::int32_t status{};
+
+    [[nodiscard]] friend constexpr bool operator==(const AuthComplete &,
+                                                   const AuthComplete &) noexcept = default;
 };
 
 // Decode one control payload (2-byte big-endian ControlMessageId + body).
@@ -171,32 +204,32 @@ struct ServiceDiscoveryResponse final {
 // required field and out-of-bound values with protocol_malformed_message.
 [[nodiscard]] core::Result<VersionRequest>
 decode_version_request(std::span<const std::byte> payload);
-[[nodiscard]] core::Result<PingRequest>
-decode_ping_request(std::span<const std::byte> payload);
-[[nodiscard]] core::Result<PingResponse>
-decode_ping_response(std::span<const std::byte> payload);
+[[nodiscard]] core::Result<PingRequest> decode_ping_request(std::span<const std::byte> payload);
+[[nodiscard]] core::Result<PingResponse> decode_ping_response(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<ChannelOpenRequest>
 decode_channel_open_request(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<ChannelOpenResponse>
 decode_channel_open_response(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<ServiceDiscoveryResponse>
 decode_service_discovery_response(std::span<const std::byte> payload);
+[[nodiscard]] core::Result<VersionResponse>
+decode_version_response(std::span<const std::byte> payload);
+[[nodiscard]] core::Result<EncapsulatedSsl>
+decode_encapsulated_ssl(std::span<const std::byte> payload);
+[[nodiscard]] core::Result<AuthComplete> decode_auth_complete(std::span<const std::byte> payload);
 
 // Encode one control payload (discriminator + body). Applies the same
 // semantic bounds as decode; an out-of-bound value is rejected rather than
 // serialized into a payload our own decode would refuse.
-[[nodiscard]] core::Result<std::vector<std::byte>>
-encode(const VersionRequest& message);
-[[nodiscard]] core::Result<std::vector<std::byte>>
-encode(const PingRequest& message);
-[[nodiscard]] core::Result<std::vector<std::byte>>
-encode(const PingResponse& message);
-[[nodiscard]] core::Result<std::vector<std::byte>>
-encode(const ChannelOpenRequest& message);
-[[nodiscard]] core::Result<std::vector<std::byte>>
-encode(const ChannelOpenResponse& message);
-[[nodiscard]] core::Result<std::vector<std::byte>>
-encode(const ServiceDiscoveryResponse& message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const VersionRequest &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const PingRequest &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const PingResponse &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const ChannelOpenRequest &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const ChannelOpenResponse &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const ServiceDiscoveryResponse &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const VersionResponse &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const EncapsulatedSsl &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const AuthComplete &message);
 
 // Static SDK reference mapping (ID space 1), not a session routing API.
 // A role with no static wire channel (diagnostics) and a channel

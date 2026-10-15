@@ -17,9 +17,15 @@ core::Result<trust::PhoneIdentity> wired_phone_identity(const trust::WiredIdenti
 
 core::Result<WiredLink> open_wired_link(const transport::UsbDeviceSelector &selector,
                                         const transport::AoaAccessoryInfo &info,
-                                        const trust::TrustStore &store) {
+                                        const trust::TrustStore &store,
+                                        const core::Deadline &deadline) {
     // Admission is the store's decision (admit_via); nothing is auto-approved.
-    auto link = transport::connect_usb_aoa(selector, info, transport::admit_via(store));
+    core::DeadlineCancellation bounded{deadline};
+    auto link = transport::connect_usb_aoa(selector, info, transport::admit_via(store),
+                                          core::Deadline{deadline.until, bounded.token()});
+    if (auto checked = deadline.check(); !checked) {
+        return checked.error();
+    }
     if (!link) {
         return link.error();
     }

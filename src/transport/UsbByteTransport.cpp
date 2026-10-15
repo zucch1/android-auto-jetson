@@ -51,6 +51,12 @@ core::Result<void> UsbByteTransport::open(core::CancellationToken cancellation) 
     return {};
 }
 
+void UsbByteTransport::set_io_deadline(core::Deadline::Clock::time_point until) noexcept {
+    if (impl_) {
+        impl_->endpoint->set_io_deadline(until);
+    }
+}
+
 core::Result<void> UsbByteTransport::send(std::span<const std::byte> frame) {
     if (!impl_) {
         return Error{ErrorCode::transport_closed};

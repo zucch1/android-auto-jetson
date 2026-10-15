@@ -62,12 +62,17 @@ class AoaLinkFactory {
     AoaLinkFactory(const AoaLinkFactory &) = delete;
     AoaLinkFactory &operator=(const AoaLinkFactory &) = delete;
 
+    virtual void set_connect_deadline(const core::Deadline &deadline) { deadline_ = deadline; }
+
     [[nodiscard]] virtual core::Result<void>
     switch_to_accessory(const UsbDeviceSelector &selector, const AoaAccessoryInfo &info,
                         UsbDeviceSnapshot &pre_switch, AoaSwitchReport &switch_report) = 0;
 
     [[nodiscard]] virtual core::Result<std::unique_ptr<UsbBulkPipe>>
     claim_accessory(const UsbDeviceSelector &selector, UsbDeviceSnapshot &post_switch) = 0;
+
+  protected:
+    core::Deadline deadline_{};
 };
 
 // Port-path syntax gate for every hardware-facing entry point: the kernel's

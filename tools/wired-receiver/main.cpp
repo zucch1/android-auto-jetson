@@ -36,6 +36,7 @@
 #include <aa/protocol/Protocol.hpp>
 #include <aa/session/Events.hpp>
 #include <aa/session/Session.hpp>
+#include <aa/transport/TlsTransport.hpp>
 #include <aa/trust/Store.hpp>
 
 #include <atomic>
@@ -207,22 +208,27 @@ class RouterSink final : public aa::protocol::MessageSink {
 
     [[nodiscard]] aa::core::Result<void>
     on_message(const aa::protocol::MessageView &message) override {
+        const auto frames_before = router_.report().stats.frames_written;
         if (auto submitted = router_.submit(message); !submitted) {
             return submitted.error();
-        }
-        ++chunks_;
-        if (chunks_ % 50 == 1) {
-            log_line("{\"event\":\"audio_chunks\",\"count\":" + std::to_string(chunks_) + "}");
         }
         auto pumped = router_.pump();
         if (!pumped) {
             return pumped.error();
         }
-        // Task-48: only after a successful pump do the router's statistics
-        // carry a measured render completion. Emit on the same low-rate
-        // cadence as audio_chunks (the receiver's event stream is documented
-        // low-rate). The router runs entirely on this session thread, so
-        // reading report() here is race-free.
+        // A successful empty pump is not delivery (e.g. a decoder buffered input).
+        if (router_.report().stats.frames_written == frames_before) {
+            return {};
+        }
+        ++chunks_;
+        if (chunks_ % 50 == 1) {
+            log_line("{\"event\":\"audio_chunks\",\"count\":" + std::to_string(chunks_) + "}");
+        }
+        // Only after a successful pump do the router's statistics carry a
+        // measured render completion. Emit on the same low-rate cadence as
+        // audio_chunks (the receiver's event stream is documented low-rate).
+        // The router runs entirely on the session thread, so reading report()
+        // here is race-free.
         if (chunks_ % 50 == 1) {
             emit_media_timing();
         }
@@ -402,6 +408,7 @@ int main(int argc, char **argv) {
     }
 
     aa::app::WiredSessionConfig session_config{};
+    session_config.lifecycle.phases.negotiate = Milliseconds{15'000};
     session_config.input_enabled = true;
     session_config.input = input;
     aa::app::WiredSession session{{store, clock, diagnostics}, session_config};
@@ -423,15 +430,36 @@ int main(int argc, char **argv) {
     selector.port_context = port;
     aa::transport::AoaAccessoryInfo accessory{};
     log_line("{\"event\":\"connecting\",\"port\":\"" + port + "\"}");
-    auto link = aa::app::open_wired_link(selector, accessory, store);
-    if (!link.has_value()) {
+
+    // Per-link cipher (P1-B/P1-C): the initial attach AND every reconnect build
+    // a FRESH cipher bound to the identity the TrustStore admitted for THIS
+    // link - never the prior link's cipher object and never the initially
+    // captured trust predicate. The predicate re-checks the store on each
+    // handshake step, so a mid-handshake revoke fails closed.
+    auto bind_link_cipher = [&session, &store](const aa::trust::PhoneIdentity &phone) -> bool {
+        auto cipher = aa::transport::make_server_handshake_cipher(
+            [&store, phone] { return store.lookup(phone) == aa::trust::Decision::approved; });
+        if (!cipher) {
+            return false;
+        }
+        session.attach_cipher(std::move(cipher));
+        return true;
+    };
+
+    auto first_link = aa::app::open_wired_link(selector, accessory, store);
+    if (!first_link.has_value()) {
         log_line(std::string{"{\"event\":\"err\",\"detail\":\"link\",\"code\":\""} +
-                 std::string{aa::to_string(link.error().code())} + "\"}");
+                 std::string{aa::to_string(first_link.error().code())} + "\"}");
         return 3;
     }
-    session.attach_transport(link.value().transport.get());
+    std::optional<aa::app::WiredLink> link{std::move(first_link.value())};
+    session.attach_transport(link->transport.get());
+    if (!bind_link_cipher(link->phone)) {
+        log_line("{\"event\":\"err\",\"detail\":\"tls_cipher\"}");
+        return 3;
+    }
     if (!session.apply(aa::session::Event::start_discovery).has_value() ||
-        !session.phone_discovered(link.value().phone).has_value() ||
+        !session.phone_discovered(link->phone).has_value() ||
         !session.apply(aa::session::Event::transport_ready).has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"lifecycle\"}");
         return 1;
@@ -445,11 +473,67 @@ int main(int argc, char **argv) {
     InputQueue input_queue;
     std::mutex session_mutex;
     std::atomic<std::int64_t> active_ms{-1};
+    std::atomic<bool> session_failed{false};
+    bool runtime_failed = false;
+
+    auto reconnect = [&]() -> aa::core::Result<void> {
+        if (auto lost = session.apply(aa::session::Event::link_lost); !lost) {
+            return lost.error();
+        }
+        const auto budget = session.io_deadline();
+        while (g_running.load()) {
+            if (auto checked = budget.check(); !checked) {
+                session.tick();
+                return checked.error();
+            }
+            auto relink = aa::app::open_wired_link(selector, accessory, store, budget);
+            if (relink) {
+                if (relink.value().phone.key != link->phone.key) {
+                    return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
+                }
+                link.emplace(std::move(relink.value()));
+                session.attach_transport(link->transport.get());
+                if (!bind_link_cipher(link->phone)) {
+                    return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
+                }
+                if (auto connected = session.apply(aa::session::Event::reconnect); !connected) {
+                    return connected.error();
+                }
+                if (auto ready = session.apply(aa::session::Event::transport_ready); !ready) {
+                    return ready.error();
+                }
+                const auto sent = session.send_version_request(1, 6);
+                if (sent) {
+                    return {};
+                }
+                return sent.error();
+            } else if (relink.error().code() != aa::ErrorCode::transport_unavailable &&
+                       relink.error().code() != aa::ErrorCode::timeout &&
+                       relink.error().code() != aa::ErrorCode::transport_closed &&
+                       relink.error().code() != aa::ErrorCode::transport_io) {
+                return relink.error();
+            }
+            std::mutex mutex;
+            std::condition_variable_any cv;
+            std::unique_lock lock(mutex);
+            cv.wait_until(lock, budget.cancellation,
+                          std::min(budget.until, std::chrono::steady_clock::now() +
+                                                    std::chrono::milliseconds{50}),
+                          [] { return false; });
+        }
+        return aa::Error{aa::ErrorCode::cancelled};
+    };
 
     std::thread session_thread([&] {
         while (g_running.load()) {
             {
                 std::lock_guard lock(session_mutex);
+                session.tick();
+                if (session.failure()) {
+                    session_failed.store(true);
+                    g_running.store(false);
+                    break;
+                }
                 while (auto event = input_queue.pop()) {
                     const auto outcome = session.submit_input(*event);
                     log_line(std::string{"{\"event\":\"input_forwarded\",\"ok\":\""} +
@@ -460,8 +544,28 @@ int main(int argc, char **argv) {
             {
                 std::lock_guard lock(session_mutex);
                 if (!polled.has_value()) {
+                    const auto code = polled.error().code();
+                    if (!g_running.load()) {
+                        break;
+                    }
                     log_line(std::string{"{\"event\":\"err\",\"detail\":\"poll\",\"code\":\""} +
-                             std::string{aa::to_string(polled.error().code())} + "\"}");
+                             std::string{aa::to_string(code)} + "\"}");
+                    if (!session.failure() &&
+                        (code == aa::ErrorCode::transport_closed ||
+                         code == aa::ErrorCode::transport_io || code == aa::ErrorCode::timeout)) {
+                        const auto recovered = reconnect();
+                        if (recovered) {
+                            continue;
+                        }
+                        if (!g_running.load()) {
+                            break;
+                        }
+                        (void)session.fail(recovered.error());
+                    } else if (!session.failure()) {
+                        (void)session.fail(polled.error());
+                    }
+                    session_failed.store(true);
+                    g_running.store(false);
                     break;
                 }
                 if (session.state() == aa::session::State::negotiating &&
@@ -478,6 +582,8 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        std::lock_guard lock(session_mutex);
+        session.tick();
     });
 
     std::thread input_thread([&] {
@@ -507,6 +613,7 @@ int main(int argc, char **argv) {
         if (bus.has_value()) {
             auto step = bus.value().cycle(Milliseconds{200});
             if (!step.has_value()) {
+                runtime_failed = true;
                 break;
             }
         } else {
@@ -523,6 +630,11 @@ int main(int argc, char **argv) {
     session.request_stop();
     session_thread.join();
     input_thread.join();
+
+    // P2-D: one final media-timing export before shutdown so the last audio
+    // tail (routed after the last periodic emission) is not lost. The session
+    // thread is gone, so the router report is final and race-free here.
+    audio_sink.emit_media_timing();
 
     {
         std::lock_guard lock(session_mutex);
@@ -546,5 +658,5 @@ int main(int argc, char **argv) {
              ",\"input_failures\":" + std::to_string(session.input_send_failures()) +
              ",\"channel_opens\":" + std::to_string(session.channel_opens()) +
              ",\"version_responses\":" + std::to_string(session.version_responses()) + "}");
-    return 0;
+    return runtime_failed || session_failed.load() ? 1 : 0;
 }

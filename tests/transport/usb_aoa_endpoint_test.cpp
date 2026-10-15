@@ -313,3 +313,34 @@ TEST(UsbAoaEndpoint, IdsAreCapturedForTheApprovedRecord) {
     EXPECT_EQ(link.endpoint->post_switch().vendor_id, 0x18D1);
     EXPECT_TRUE(link.endpoint->switch_report().started);
 }
+
+TEST(UsbAoaEndpoint, SlowAccessoryDiscoveryUsesCallerDeadline) {
+    class SlowFactory final : public ua::AoaLinkFactory {
+      public:
+        void set_connect_deadline(const aa::core::Deadline &budget) override { budget_ = budget; }
+        aa::core::Result<void> switch_to_accessory(
+            const tr::UsbDeviceSelector &selector, const tr::AoaAccessoryInfo &info,
+            tr::UsbDeviceSnapshot &pre, tr::AoaSwitchReport &report) override {
+            return fake_.switch_to_accessory(selector, info, pre, report);
+        }
+        aa::core::Result<std::unique_ptr<ua::UsbBulkPipe>> claim_accessory(
+            const tr::UsbDeviceSelector &, tr::UsbDeviceSnapshot &) override {
+            std::this_thread::sleep_until(budget_.until);
+            return aa::Error{aa::ErrorCode::timeout};
+        }
+      private:
+        fx::FakeLinkFactory fake_;
+        aa::core::Deadline budget_{
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{300}, {}};
+    };
+    auto endpoint = ua::UsbAoaEndpoint::make(std::make_unique<SlowFactory>(), {"1-2.1"}, {},
+                                            admit_all());
+    ASSERT_TRUE(endpoint.has_value());
+    const auto began = std::chrono::steady_clock::now();
+    endpoint.value()->set_io_deadline(began + std::chrono::milliseconds{30});
+    const auto result = endpoint.value()->open();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::timeout);
+    EXPECT_LT(std::chrono::steady_clock::now() - began, std::chrono::milliseconds{150})
+        << "accessory discovery ignored the caller deadline";
+}

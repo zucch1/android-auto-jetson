@@ -28,9 +28,8 @@
 //
 // AAP wire encoding note: control/service frames use the project's own message
 // codec (protocol::encode + transport::encode_message). The phone-bound input
-// payload reuses the project's bounded input record codec
-// (ipc::encode_input_record); the AAP-protobuf input mapping is the AASDK
-// adapter's concern and is NOT reimplemented here.
+// payload is the real AAP InputReport protobuf (protocol::encode_input_report),
+// converted at the input boundary - not the local IPC record.
 
 #include <aa/channels/Negotiator.hpp>
 #include <aa/channels/Services.hpp>
@@ -73,7 +72,7 @@ struct WiredSessionDeps final {
 
 struct WiredSessionConfig final {
     // Caller phase budgets plus the wired reconnect budget selection.
-    session::LifecycleConfig lifecycle{};
+    session::LifecycleConfig lifecycle{{{}, {}, core::Milliseconds{15'000}, {}}};
     // task 26 capability-gated input (bench defaults: keyboard/D-pad +
     // mouse-to-touch, no vehicle sensors).
     bool input_enabled{true};
@@ -100,11 +99,34 @@ class WiredSession final {
     [[nodiscard]] core::Result<void> fail(Error reason);
     void tick();
     void request_stop() noexcept;
+
+    // Per-link lifecycle: attach_transport() begins a FRESH link and drops
+    // every per-link artifact of the previous one - wire parser, reassembler
+    // and its cipher binding, negotiated channel state, the auth phase and the
+    // previous link's cipher. Call order per link is attach_transport() first,
+    // then attach_cipher(); sealing is impossible until the new link's cipher
+    // handshake completes.
     void attach_transport(transport::Transport *transport) noexcept;
+
+    // AAP authentication/TLS handshake (finding F1). Attach the negotiated TLS
+    // cipher seam (the HU-side handshake cipher) AFTER attach_transport(); the
+    // same cipher object is bound into the message reassembler so inbound E=1
+    // records open with it once the handshake completes (P1-C). Attach a FRESH
+    // cipher per link (initial attach and every reconnect), bound to the
+    // currently admitted identity - never reuse a prior link's cipher.
+    // The phone-side control progression is: version_response -> exchange
+    // encapsulated_ssl handshake chunks -> auth_complete. Media/input channel
+    // traffic is refused until authenticated(); post-auth outbound frames use
+    // the negotiated cipher (not plaintext).
+    void attach_cipher(std::unique_ptr<transport::HandshakingCipher> cipher) noexcept;
+    [[nodiscard]] bool authenticated() const noexcept {
+        return auth_phase_ == AuthPhase::authenticated;
+    }
 
     [[nodiscard]] session::State state() const noexcept { return lifecycle_.state(); }
     [[nodiscard]] std::optional<Error> failure() const noexcept { return lifecycle_.failure(); }
     [[nodiscard]] core::CancellationToken token() const noexcept { return lifecycle_.token(); }
+    [[nodiscard]] core::Deadline io_deadline(bool writing = false) const noexcept;
 
     // ---- Channel services (task 18) ----
     // Validate the negotiated service descriptors and build the negotiator.
@@ -140,7 +162,11 @@ class WiredSession final {
     // onto the input service channel over the transport.
     [[nodiscard]] core::Result<void> submit_input(const ipc::InputEvent &event);
 
-    // Observed counters (diagnostics/tests).
+    // Observed counters (diagnostics/tests). The negotiation counters
+    // (channel_opens, version_responses, pings_answered, encapsulated_ssls,
+    // auth_completes) are PER-LINK: attach_transport() zeroes them with the
+    // link state. input_sends/input_send_failures/diagnostics_emitted are
+    // run-cumulative telemetry.
     [[nodiscard]] std::uint64_t diagnostics_emitted() const noexcept {
         return diagnostics_emitted_;
     }
@@ -151,18 +177,29 @@ class WiredSession final {
     [[nodiscard]] std::uint64_t channel_opens() const noexcept { return channel_opens_; }
     [[nodiscard]] std::uint64_t version_responses() const noexcept { return version_responses_; }
     [[nodiscard]] std::uint64_t pings_answered() const noexcept { return pings_answered_; }
+    [[nodiscard]] std::uint64_t encapsulated_ssls() const noexcept { return encapsulated_ssls_; }
+    [[nodiscard]] std::uint64_t auth_completes() const noexcept { return auth_completes_; }
 
   private:
     class InputForwarder;
+    [[nodiscard]] core::Result<void> send_frame(std::span<const std::byte> frame);
+    [[nodiscard]] Error io_error(Error reason, const core::Deadline &deadline);
+
+    // AAP authentication progression (finding F1).
+    enum class AuthPhase { awaiting_version, ssl_handshake, authenticated };
 
     [[nodiscard]] core::Result<void> route(const transport::Message &message);
     [[nodiscard]] core::Result<void> handle_control(std::span<const std::byte> payload);
+    [[nodiscard]] core::Result<void> drive_ssl_handshake();
+    void reset_link() noexcept;
     [[nodiscard]] core::Result<std::size_t>
     send_payload(const protocol::ServiceDiscoveryResponse &response);
     [[nodiscard]] core::Result<std::size_t>
     send_payload(const protocol::ChannelOpenResponse &response);
-    [[nodiscard]] core::Result<std::size_t> send_frames(std::vector<std::byte> payload);
-    void forward_input(const input::NormalizedInput &event);
+    [[nodiscard]] core::Result<std::size_t> send_encapsulated_ssl(std::vector<std::byte> bytes);
+    [[nodiscard]] core::Result<std::size_t> send_frames(std::vector<std::byte> payload,
+                                                        bool encrypted);
+    [[nodiscard]] core::Result<void> forward_input(const input::NormalizedInput &event);
     [[nodiscard]] std::optional<std::uint8_t> input_channel() const noexcept;
 
     void note_state(std::string_view identity_key = {});
@@ -180,6 +217,9 @@ class WiredSession final {
     std::unique_ptr<InputForwarder> input_forwarder_{};
     std::optional<input::InputService> input_service_{};
     transport::Transport *transport_{nullptr};
+    std::unique_ptr<transport::HandshakingCipher> cipher_{};
+    AuthPhase auth_phase_{AuthPhase::awaiting_version};
+    bool ssl_active_{false};
     core::SessionId session_id_{core::SessionId{1}};
     session::State last_state_{session::State::disconnected};
     std::uint64_t sequence_{0};
@@ -189,6 +229,8 @@ class WiredSession final {
     std::uint64_t channel_opens_{0};
     std::uint64_t version_responses_{0};
     std::uint64_t pings_answered_{0};
+    std::uint64_t encapsulated_ssls_{0};
+    std::uint64_t auth_completes_{0};
 };
 
 } // namespace aa::app
