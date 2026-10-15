@@ -165,10 +165,13 @@ class Enumeration final {
     return std::string(reinterpret_cast<const char *>(buffer), static_cast<std::size_t>(length));
 }
 
-// Open, fetch descriptor strings and claim accessory interface 0, detaching a
-// kernel driver first when one is bound.
-[[nodiscard]] core::Result<LibusbHandle> open_and_claim(const LibusbApi &api, LibusbDevice *device,
-                                                        UsbDeviceSnapshot &snapshot) {
+// Open the device and fetch its descriptor strings. Deliberately NO interface
+// claim and NO kernel-driver detach: the pre-switch AOA control transfers use
+// endpoint 0 only and must not disturb an existing interface 0 binding (a
+// claim here can disrupt the phone's current configuration or fail an
+// otherwise valid switch).
+[[nodiscard]] core::Result<LibusbHandle>
+open_with_strings(const LibusbApi &api, LibusbDevice *device, UsbDeviceSnapshot &snapshot) {
     LibusbDeviceHandle *raw = nullptr;
     const int rc = api.open(device, &raw);
     if (rc != kLibusbSuccess) {
@@ -181,6 +184,14 @@ class Enumeration final {
         snapshot.product = fetch_string(api, handle.get(), descriptor.iProduct);
         snapshot.serial = fetch_string(api, handle.get(), descriptor.iSerialNumber);
     }
+    return handle;
+}
+
+// Claim accessory interface 0 on the post-switch (re-enumerated) device,
+// detaching a kernel driver first when one is bound. This is the ONLY place an
+// interface claim happens: bulk transfers need it, AOA control transfers do not.
+[[nodiscard]] core::Result<void> claim_accessory_interface(const LibusbApi &api,
+                                                           LibusbHandle &handle) {
     const int active = api.kernel_driver_active(handle.get(), kAccessoryInterface);
     if (active > 0) {
         const int detached = api.detach_kernel_driver(handle.get(), kAccessoryInterface);
@@ -192,7 +203,7 @@ class Enumeration final {
     if (claimed != kLibusbSuccess) {
         return map_libusb_error(claimed);
     }
-    return handle;
+    return {};
 }
 
 class LibusbControlChannel final : public AoaControlChannel {
@@ -313,7 +324,7 @@ class LibusbLinkFactory final : public AoaLinkFactory {
         }
         pre_switch = found->snapshot;
         LibusbDevice *device = found->device;
-        auto handle = open_and_claim(session_.api(), device, pre_switch);
+        auto handle = open_with_strings(session_.api(), device, pre_switch);
         if (!handle) {
             return handle.error();
         }
@@ -351,9 +362,13 @@ class LibusbLinkFactory final : public AoaLinkFactory {
             if (found != nullptr) {
                 post_switch = found->snapshot;
                 LibusbDevice *device = found->device;
-                auto handle = open_and_claim(session_.api(), device, post_switch);
+                auto handle = open_with_strings(session_.api(), device, post_switch);
                 if (!handle) {
                     return handle.error();
+                }
+                auto claimed = claim_accessory_interface(session_.api(), handle.value());
+                if (!claimed) {
+                    return claimed.error();
                 }
                 return std::unique_ptr<UsbBulkPipe>(
                     std::make_unique<LibusbBulkPipe>(session_.api(), std::move(handle.value())));
@@ -461,7 +476,7 @@ core::Result<void> reset_port_device(const UsbDeviceSelector &selector) {
     }
     const Candidate *found = nullptr;
     for (const auto &candidate : enumeration.candidates()) {
-        if (candidate.port_path == selector.port_context) {
+        if (matches(selector, candidate)) {
             found = &candidate;
             break;
         }
