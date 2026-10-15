@@ -62,6 +62,10 @@ private:
     QString status_{QStringLiteral("unavailable")};
     QString error_{};
     std::uint64_t frames_painted_{0};
+    std::uint64_t presentations_{};
+    std::uint64_t pending_frame_{};
+    std::uint64_t pending_timestamp_ns_{};
+    bool presentation_pending_{};
     std::uint16_t width_{};
     std::uint16_t height_{};
 };

@@ -36,6 +36,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -161,6 +162,36 @@ public:
     void on_input(const InputEvent& event) override { events.push_back(event); }
     std::vector<InputEvent> events{};
 };
+
+TEST(DummyDisplayContractRender, PaintCompletionRetainsCorrelationAndIgnoresRepaints) {
+    // Given two queued frames; only the newest can actually be painted.
+    static_cast<void>(qt_app());
+    CountingInputSink input;
+    aa::display::qt_adapter::ProjectionWidget widget(input, VideoProfile{2, 2, 30});
+    aa::consumer::DecodedFrame frame{7, 4, 123456, 2, 2, {80, 80, 80, 80, 128, 128}};
+    testing::internal::CaptureStdout();
+    widget.on_frame(frame);
+    frame.frame = 8;
+    frame.timestamp_ns = 234567;
+    widget.on_frame(frame);
+    const auto before = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    // When painting the queued frame twice (the second is a repaint, not progress).
+    static_cast<void>(widget.grab());
+    static_cast<void>(widget.grab());
+    const auto after = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto output = testing::internal::GetCapturedStdout();
+    std::smatch match;
+    ASSERT_TRUE(std::regex_search(output, match, std::regex{
+        "\"event\":\"video_presented\",\"frame\":8,\"scheduled_ns\":234567,"
+        "\"completed_ns\":([0-9]+)"})) << output;
+    // Then completion is stamped during paint, exactly once, with retained metadata.
+    EXPECT_GE(std::stoll(match[1].str()), before);
+    EXPECT_LE(std::stoll(match[1].str()), after);
+    EXPECT_EQ(output.find("video_presented", output.find("video_presented") + 1),
+              std::string::npos);
+}
 
 struct FrameRecord final {
     std::uint64_t frame{};

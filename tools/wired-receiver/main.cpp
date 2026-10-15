@@ -230,36 +230,15 @@ class RouterSink final : public aa::protocol::MessageSink {
     }
 
   private:
-    // Task-48 media-timing diagnostics. Both gated phase-B metrics derive from
-    // existing task-25 RouterStats observations on the common monotonic A/V
-    // clock; nothing here invents a value:
-    //   audio_latency_ms = max_path_latency    (submit() BEFORE decode, gate
-    //                       fix F4, to DATA-HANDOFF-CONFIRMED WRITE COMPLETION
-    //                       at the routing element, gate r3 F3; receiver-local
-    //                       steady clock; NOT a device-delivery measurement)
-    //   av_sync_ms       = max_completion_skew  (that write completion minus
-    //                       the piece's SCHEDULED PRESENTATION TIME on the
-    //                       common monotonic A/V clock - the wire message
-    //                       timestamp-anchored sample timeline; the audio-side
-    //                       A/V-sync envelope the task-25 gate binds to the
-    //                       <=50 ms budget; NOT a video-presentation
-    //                       comparison and NOT device delivery)
-    // MAX (cumulative peak), not the last sample: the schema budgets
-    // (av_sync_ms_max / audio_latency_ms_max) are run/soak envelope ceilings,
-    // so the retained figure must be the worst observed - a transient breach
-    // must never hide behind a healed later sample (misleading-success
-    // guard). The maxima are read live from the router report at each
-    // emission (current stats, never a session-start snapshot). Numeric
-    // values only - no identifiers. When no audio has traversed the route
-    // there is no measurement: emit nothing rather than a fabricated 0, so
-    // the collector keeps the metric null and the verdict stays BLOCKED.
+    // These are audio-only cumulative maxima. Cross-stream av_sync_ms is
+    // computed by the collector from audio_write_completed + video_presented.
     void emit_media_timing() {
         const auto &stats = router_.report().stats;
-        if (stats.chunks_submitted == 0) {
+        if (stats.frames_written == 0) {
             return;
         }
         log_line(
-            "{\"event\":\"media_timing\",\"av_sync_ms\":" + format_ms(stats.max_completion_skew) +
+            "{\"event\":\"media_timing\",\"audio_scheduling_skew_ms\":" + format_ms(stats.max_completion_skew) +
             ",\"audio_latency_ms\":" + format_ms(stats.max_path_latency) + "}");
     }
 
@@ -299,6 +278,12 @@ aa::audio::RouterConfig pcm_router_config() {
         role.codec = aa::audio::Codec::pcm;
         role.input_format = aa::audio::AudioFormat{48000, 2, 16};
     }
+    config.on_write_completed = [](const aa::audio::WriteCompletion &completion) {
+        log_line("{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
+                 std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
+                 std::to_string(completion.scheduled_end.count) + ",\"completed_ns\":" +
+                 std::to_string(completion.completed.count) + "}");
+    };
     return config;
 }
 

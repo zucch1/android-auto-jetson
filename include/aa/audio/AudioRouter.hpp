@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -73,6 +74,14 @@ struct RoleStreamConfig final {
     AudioFormat input_format{};
 };
 
+// Common monotonic scheduled interval and consumer-side stream-write completion.
+// Completion follows the handoff-confirmed RenderBarrier; not speaker output.
+struct WriteCompletion final {
+    core::Nanoseconds scheduled{};
+    core::Nanoseconds scheduled_end{};
+    core::Nanoseconds completed{};
+};
+
 struct RouterConfig final {
     AudioFormat output_format{48000, 2, 16};
     std::array<RoleStreamConfig, 4> roles{};
@@ -96,6 +105,7 @@ struct RouterConfig final {
     // current default). Used by tests to point the stream at an unreachable
     // remote and prove the degraded typed path against the real element.
     std::string sink_remote{};
+    std::function<void(const WriteCompletion&)> on_write_completed{};
 };
 
 enum class RouterState : std::uint8_t { active, degraded };

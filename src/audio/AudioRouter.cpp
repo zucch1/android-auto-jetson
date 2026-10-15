@@ -233,7 +233,7 @@ struct AudioRouter::Impl final {
 
     // Effective scheduled timestamp time(f) = base + floor(f * 1e9 / rate),
     // computed from the base every time (never accumulated rounded adds).
-    [[nodiscard]] bool frame_time(std::uint64_t frame, std::int64_t base_ns,
+    [[nodiscard]] bool frame_time(std::uint64_t frame, std::int64_t base_ns, // NOLINT(bugprone-easily-swappable-parameters): frame index and signed clock base have distinct units
                                   std::int64_t& out) const {
         std::int64_t delta = 0;
         if (!frames_to_ns_checked(frame, delta)) {
@@ -615,7 +615,7 @@ core::Result<void> AudioRouter::pump() {
             if (!mixed.has_value()) {
                 return mixed.error();
             }
-            mixed_interval = std::move(mixed.value());
+            mixed_interval = mixed.value();
         }
 
         // Every write piece is bounded (64 KiB, whole-frame aligned); silence
@@ -659,6 +659,15 @@ core::Result<void> AudioRouter::pump() {
                                      + std::string{to_string(written.error().code())}
                                      + "); output no longer accepting audio");
                 return Error{ErrorCode::audio_sink_unavailable};
+            }
+            if (any_input && impl_->config.on_write_completed) {
+                std::int64_t end_ns = 0;
+                if (!impl_->frame_time(piece_start + piece_frames, base_ns, end_ns)) {
+                    return Error{ErrorCode::invalid_argument};
+                }
+                impl_->config.on_write_completed(WriteCompletion{
+                    to_write.timestamp, core::Nanoseconds{end_ns},
+                    core::Nanoseconds{write_done_ns}});
             }
             piece_start += piece_frames;
         }
