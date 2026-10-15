@@ -634,7 +634,8 @@ int main(int argc, char **argv) {
     // P2-D: one final media-timing export before shutdown so the last audio
     // tail (routed after the last periodic emission) is not lost. The session
     // thread is gone, so the router report is final and race-free here.
-    audio_sink.emit_media_timing();
+    // finish() is guard-flagged: the destructor's second call is a no-op.
+    audio_sink.finish();
 
     {
         std::lock_guard lock(session_mutex);
