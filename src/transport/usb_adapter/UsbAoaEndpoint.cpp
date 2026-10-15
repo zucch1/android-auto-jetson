@@ -29,23 +29,44 @@ UsbAoaEndpoint::make(std::unique_ptr<AoaLinkFactory> factory, UsbDeviceSelector 
 }
 
 core::Result<void> UsbAoaEndpoint::open() {
+    return open(core::Deadline{std::min(io_deadline_, core::Deadline::Clock::now() +
+                                                       std::chrono::milliseconds{kAccessoryWaitMs.count}), {}});
+}
+
+core::Result<void> UsbAoaEndpoint::open(const core::Deadline &deadline) {
     if (opened_) {
         return {};
     }
     if (terminal_) {
         return Error{ErrorCode::transport_closed};
     }
+    if (auto checked = deadline.check(); !checked) {
+        terminal_ = true;
+        return checked.error();
+    }
+    factory_->set_connect_deadline(deadline);
     auto validated = validate_selector(selector_);
     if (!validated) {
         terminal_ = true;
         return validated.error();
     }
     auto switched = factory_->switch_to_accessory(selector_, info_, pre_switch_, switch_report_);
+    if (auto checked = deadline.check(); !checked) {
+        terminal_ = true;
+        return checked.error();
+    }
     if (!switched) {
         terminal_ = true;
         return switched.error();
     }
     auto pipe = factory_->claim_accessory(selector_, post_switch_);
+    if (auto checked = deadline.check(); !checked) {
+        if (pipe) {
+            pipe.value()->close();
+        }
+        terminal_ = true;
+        return checked.error();
+    }
     if (!pipe) {
         terminal_ = true;
         return pipe.error();
@@ -187,13 +208,14 @@ core::Result<void> admit_wired_identity(const trust::WiredIdentity &identity,
 }
 
 core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
-                                     const UsbDeviceSelector &selector,
-                                     const AoaAccessoryInfo &info, const WiredAdmission &admit) {
+                                      const UsbDeviceSelector &selector,
+                                      const AoaAccessoryInfo &info, const WiredAdmission &admit,
+                                      const core::Deadline &deadline) {
     auto endpoint = UsbAoaEndpoint::make(std::move(factory), selector, info, admit);
     if (!endpoint) {
         return endpoint.error();
     }
-    auto opened = endpoint.value()->open();
+    auto opened = endpoint.value()->open(deadline);
     if (!opened) {
         return opened.error();
     }
@@ -219,13 +241,17 @@ WiredAdmission admit_via(const trust::TrustStore &store) {
 }
 
 core::Result<UsbAoaLink> connect_usb_aoa(const UsbDeviceSelector &selector,
-                                         const AoaAccessoryInfo &info,
-                                         const WiredAdmission &admit) {
+                                          const AoaAccessoryInfo &info,
+                                          const WiredAdmission &admit,
+                                          const core::Deadline &deadline) {
+    if (auto checked = deadline.check(); !checked) {
+        return checked.error();
+    }
     auto world = usb_adapter::make_libusb_link_factory();
     if (!world) {
         return world.error();
     }
-    return usb_adapter::connect_aoa(std::move(world.value()), selector, info, admit);
+    return usb_adapter::connect_aoa(std::move(world.value()), selector, info, admit, deadline);
 }
 
 core::Result<std::unique_ptr<ByteEndpoint>>

@@ -52,6 +52,7 @@ wired_phone_identity(const trust::WiredIdentity &identity);
 // the store does not approve) is returned typed and no transport is produced.
 [[nodiscard]] core::Result<WiredLink> open_wired_link(const transport::UsbDeviceSelector &selector,
                                                       const transport::AoaAccessoryInfo &info,
-                                                      const trust::TrustStore &store);
+                                                      const trust::TrustStore &store,
+                                                      const core::Deadline &deadline = {});
 
 } // namespace aa::app

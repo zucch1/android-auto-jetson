@@ -129,7 +129,8 @@ struct UsbAoaLink final {
 // transport_unauthorized_peer even when the AOA switch succeeded.
 [[nodiscard]] core::Result<UsbAoaLink> connect_usb_aoa(const UsbDeviceSelector &selector,
                                                        const AoaAccessoryInfo &info,
-                                                       const WiredAdmission &admit);
+                                                        const WiredAdmission &admit,
+                                                        const core::Deadline &deadline = {});
 
 // ByteEndpoint seam: the returned endpoint performs device discovery, the AOA
 // switch, identity capture + admission and the bulk claim inside open() (the

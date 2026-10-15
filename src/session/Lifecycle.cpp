@@ -131,7 +131,7 @@ core::Result<State> Lifecycle::enter(State to) {
 
     // Reconnect budget spans reconnecting -> ... -> active: armed once on loss,
     // cleared only on active, never reset by connecting/negotiating.
-    if (to == State::reconnecting) {
+    if (to == State::reconnecting && !reconnect_deadline_) {
         arm_deadline(reconnect_deadline_,
                      config_.link == LinkKind::wired ? kWiredReconnectBudget
                                                      : kWirelessReconnectBudget,

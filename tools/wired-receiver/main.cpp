@@ -405,6 +405,7 @@ int main(int argc, char **argv) {
     }
 
     aa::app::WiredSessionConfig session_config{};
+    session_config.lifecycle.phases.negotiate = Milliseconds{15'000};
     session_config.input_enabled = true;
     session_config.input = input;
     aa::app::WiredSession session{{store, clock, diagnostics}, session_config};
@@ -469,12 +470,67 @@ int main(int argc, char **argv) {
     InputQueue input_queue;
     std::mutex session_mutex;
     std::atomic<std::int64_t> active_ms{-1};
+    std::atomic<bool> session_failed{false};
+    bool runtime_failed = false;
+
+    auto reconnect = [&]() -> aa::core::Result<void> {
+        if (auto lost = session.apply(aa::session::Event::link_lost); !lost) {
+            return lost.error();
+        }
+        const auto budget = session.io_deadline();
+        while (g_running.load()) {
+            if (auto checked = budget.check(); !checked) {
+                session.tick();
+                return checked.error();
+            }
+            auto relink = aa::app::open_wired_link(selector, accessory, store, budget);
+            if (relink) {
+                if (relink.value().phone.key != link->phone.key) {
+                    return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
+                }
+                link.emplace(std::move(relink.value()));
+                session.attach_transport(link->transport.get());
+                if (!bind_link_cipher(link->phone)) {
+                    return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
+                }
+                if (auto connected = session.apply(aa::session::Event::reconnect); !connected) {
+                    return connected.error();
+                }
+                if (auto ready = session.apply(aa::session::Event::transport_ready); !ready) {
+                    return ready.error();
+                }
+                const auto sent = session.send_version_request(1, 6);
+                if (sent) {
+                    return {};
+                }
+                return sent.error();
+            } else if (relink.error().code() != aa::ErrorCode::transport_unavailable &&
+                       relink.error().code() != aa::ErrorCode::timeout &&
+                       relink.error().code() != aa::ErrorCode::transport_closed &&
+                       relink.error().code() != aa::ErrorCode::transport_io) {
+                return relink.error();
+            }
+            std::mutex mutex;
+            std::condition_variable_any cv;
+            std::unique_lock lock(mutex);
+            cv.wait_until(lock, budget.cancellation,
+                          std::min(budget.until, std::chrono::steady_clock::now() +
+                                                    std::chrono::milliseconds{50}),
+                          [] { return false; });
+        }
+        return aa::Error{aa::ErrorCode::cancelled};
+    };
 
     std::thread session_thread([&] {
         while (g_running.load()) {
             {
                 std::lock_guard lock(session_mutex);
                 session.tick();
+                if (session.failure()) {
+                    session_failed.store(true);
+                    g_running.store(false);
+                    break;
+                }
                 while (auto event = input_queue.pop()) {
                     const auto outcome = session.submit_input(*event);
                     log_line(std::string{"{\"event\":\"input_forwarded\",\"ok\":\""} +
@@ -486,27 +542,27 @@ int main(int argc, char **argv) {
                 std::lock_guard lock(session_mutex);
                 if (!polled.has_value()) {
                     const auto code = polled.error().code();
-                    if (code == aa::ErrorCode::timeout) {
-                        continue;
-                    }
-                    if (code == aa::ErrorCode::cancelled || !g_running.load()) {
+                    if (!g_running.load()) {
                         break;
                     }
                     log_line(std::string{"{\"event\":\"err\",\"detail\":\"poll\",\"code\":\""} +
                              std::string{aa::to_string(code)} + "\"}");
-                    (void)session.apply(aa::session::Event::link_lost);
-                    auto relink = aa::app::open_wired_link(selector, accessory, store);
-                    if (relink.has_value()) {
-                        link.emplace(std::move(relink.value()));
-                        session.attach_transport(link->transport.get());
-                        if (bind_link_cipher(link->phone) &&
-                            session.apply(aa::session::Event::reconnect).has_value() &&
-                            session.apply(aa::session::Event::transport_ready).has_value() &&
-                            session.send_version_request(1, 6).has_value()) {
+                    if (!session.failure() &&
+                        (code == aa::ErrorCode::transport_closed ||
+                         code == aa::ErrorCode::transport_io || code == aa::ErrorCode::timeout)) {
+                        const auto recovered = reconnect();
+                        if (recovered) {
                             continue;
                         }
+                        if (!g_running.load()) {
+                            break;
+                        }
+                        (void)session.fail(recovered.error());
+                    } else if (!session.failure()) {
+                        (void)session.fail(polled.error());
                     }
-                    (void)session.fail(aa::Error{aa::ErrorCode::transport_io});
+                    session_failed.store(true);
+                    g_running.store(false);
                     break;
                 }
                 if (session.state() == aa::session::State::negotiating &&
@@ -554,6 +610,7 @@ int main(int argc, char **argv) {
         if (bus.has_value()) {
             auto step = bus.value().cycle(Milliseconds{200});
             if (!step.has_value()) {
+                runtime_failed = true;
                 break;
             }
         } else {
@@ -597,5 +654,5 @@ int main(int argc, char **argv) {
              ",\"input_failures\":" + std::to_string(session.input_send_failures()) +
              ",\"channel_opens\":" + std::to_string(session.channel_opens()) +
              ",\"version_responses\":" + std::to_string(session.version_responses()) + "}");
-    return 0;
+    return runtime_failed || session_failed.load() ? 1 : 0;
 }

@@ -32,6 +32,7 @@ class UsbAoaEndpoint final : public ByteEndpoint {
     ~UsbAoaEndpoint() override;
 
     [[nodiscard]] core::Result<void> open() override;
+    [[nodiscard]] core::Result<void> open(const core::Deadline &deadline);
     void set_io_deadline(core::Deadline::Clock::time_point until) noexcept override {
         io_deadline_ = until;
     }
@@ -72,6 +73,7 @@ class UsbAoaEndpoint final : public ByteEndpoint {
 [[nodiscard]] core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
                                                    const UsbDeviceSelector &selector,
                                                    const AoaAccessoryInfo &info,
-                                                   const WiredAdmission &admit);
+                                                    const WiredAdmission &admit,
+                                                    const core::Deadline &deadline = {});
 
 } // namespace aa::transport::usb_adapter
