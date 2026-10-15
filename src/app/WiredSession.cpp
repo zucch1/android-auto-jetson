@@ -60,6 +60,11 @@ core::Result<void> WiredSession::apply(session::Event event) {
 
 core::Result<void> WiredSession::phone_discovered(const trust::PhoneIdentity &identity) {
     auto outcome = lifecycle_.phone_discovered(identity);
+    if (outcome.has_value()) {
+        // Remember the ADMITTED identity for recovery-telemetry attribution
+        // (item 3): a rejected discovery never re-labels the admitted phone.
+        last_identity_key_ = identity.key;
+    }
     note_state(identity.key);
     return outcome;
 }
@@ -608,6 +613,14 @@ void WiredSession::emit_recovery(const char *reason, RecoveryStatus status,
         event.fields.push_back(diagnostics::EventField::count("code", *code));
     }
     event.fields.push_back(diagnostics::EventField::text("transport", "usb"));
+    // Identity attribution (item 3, same attribution as the link-error event):
+    // the recovery record names the admitted phone so a harness can correlate a
+    // state/flow transition to the intended device. Pseudonymized by the
+    // boundary like every identity that leaves.
+    if (!last_identity_key_.empty()) {
+        event.fields.push_back(
+            diagnostics::EventField::identifier("phone_id", last_identity_key_));
+    }
     deps_.diagnostics.emit(event);
     ++diagnostics_emitted_;
 }

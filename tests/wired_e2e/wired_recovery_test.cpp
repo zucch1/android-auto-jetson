@@ -788,6 +788,42 @@ TEST(WiredRecoveryUnknownPhone, UnknownOnReconnectFailsClosedWithTelemetry) {
     EXPECT_TRUE(capture.contains("\"code\":302"));
 }
 
+TEST(WiredRecoveryUnknownPhone, RecoveryTelemetryCarriesPseudonymizedIdentityAttribution) {
+    ss::test::MapTrustStore trust;
+    trust.set(kApproved, aa::trust::Decision::approved);
+    ss::test::ManualClock clock;
+    CaptureSink capture;
+    diag::Diagnostics diagnostics{capture};
+    RecordingSink video_sink;
+
+    ScriptedTransport transport;
+    app::WiredSession session{{trust, clock, diagnostics}, app::WiredSessionConfig{}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()).has_value());
+    ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, video_sink).has_value());
+    session.attach_transport(&transport);
+    drive_to_active(session, transport);
+
+    ASSERT_TRUE(session.apply(ss::Event::degrade).has_value());
+    ASSERT_TRUE(session.apply(ss::Event::recover).has_value());
+    // Item 3 attribution: the RECOVERY record itself names the ADMITTED phone
+    // so a harness can correlate a state/flow transition to the intended device
+    // (a state-change record carrying phone_id is not enough - the dip record
+    // must carry it). The raw identity key never crosses the redaction boundary.
+    bool reconnect_with_attribution = false;
+    bool raw_key_seen = false;
+    for (const auto &json : capture.jsons) {
+        if (json.find("recovery-approved") != std::string::npos) {
+            raw_key_seen = true;
+        }
+        if (json.find("\"kind\":\"reconnect\"") != std::string::npos &&
+            json.find("\"phone_id\":\"id-") != std::string::npos) {
+            reconnect_with_attribution = true;
+        }
+    }
+    EXPECT_TRUE(reconnect_with_attribution);
+    EXPECT_FALSE(raw_key_seen);
+}
+
 // ---------------------------------------------------------------------------
 // 6. Phone lock/unlock + phone-side Android Auto restart (logic equivalent):
 //    the session-side pause/resume and link restart both recover to active.

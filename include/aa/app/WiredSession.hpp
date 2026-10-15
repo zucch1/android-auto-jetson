@@ -245,6 +245,7 @@ class WiredSession final {
     std::uint64_t recovery_failures_{0};
     bool recovery_in_flight_{false};
     const char *recovery_reason_{"link lost"};
+    std::string last_identity_key_{};
 };
 
 } // namespace aa::app
