@@ -27,9 +27,14 @@ never weakened.
 2. Approved phone connected on port `1-2.1` (phone mode `04e8:6860` before the
    AOA switch; `18d1:2d00`/`18d1:2d01` after) with Android Auto / USB debugging
    as needed, and the approved-phone trust store loaded (task 27).
-3. Display connected (DP-1 or HDMI-A-1 `connected`) and a PipeWire output sink
+3. Display connected (positive `connected` evidence from a DRM connector status
+   **or** a connected output in `xrandr --query` on the session `DISPLAY=:1`)
+   and a PipeWire output sink
     present (`pactl list short sinks` or `pw-cli`) — required for the audio-latency and
    A/V-sync budgets to be meaningful.
+   nvidia-drm may leave sysfs at `disconnected` despite a working session output;
+   xrandr's positive evidence is accepted. Absent/failed probes or all sources
+   disconnected provide no positive evidence and BLOCK on `display_disconnected`.
 4. An installed `aa-wired-receiver` (and `aa-dummy-display`) on the target. Until
    the aarch64 receiver/adapter packaging (task 41) lands, the target binary may
    be unavailable; the run is then BLOCKED on `receiver_binary_absent` (see

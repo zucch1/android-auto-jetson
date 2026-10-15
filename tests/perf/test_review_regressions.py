@@ -8,7 +8,11 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +48,37 @@ def av_sync() -> None:
     unpaired._consume(json.dumps(events[0]))
     unpaired._consume(json.dumps(events[2]))
     assert unpaired.metrics["av_sync_ms"] is None
+
+
+def display_sources() -> None:
+    source = (ROOT / "tools/perf/aa-projection-perf.sh").read_text()
+    command = re.search(r'display_status="\$\(remote "(.*)" 2>/dev/null', source).group(1)
+    with tempfile.TemporaryDirectory(prefix="perf-display-") as tmp:
+        base = Path(tmp)
+        connector = base / "drm/card0-DP-1"
+        connector.mkdir(parents=True)
+        for name in ("cat", "grep"):
+            (base / name).symlink_to(Path("/usr/bin") / name)
+        command = command.replace("/sys/class/drm", str(base / "drm"))
+        script = 'set -euo pipefail; command="' + command + '"; eval "$command"'
+        for drm, randr, ready in (("disconnected", "DP-0 connected 1920x1080+0+0", True),
+                                  ("disconnected", "DP-0 disconnected", False),
+                                  ("connected", None, True),
+                                  ("unknown", "DP-0 disconnected", False)):
+            # Given real shell probes with isolated connector files and session command.
+            (connector / "status").write_text(drm + "\n")
+            xrandr = base / "xrandr"
+            if randr is None:
+                xrandr.unlink(missing_ok=True)
+            else:
+                xrandr.write_text("#!/bin/bash\nset -euo pipefail\nprintf '%s\\n' \"$RANDR\"\n")
+                xrandr.chmod(0o755)
+            # When the readiness expression queries both platform sources.
+            proc = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True,
+                                  env=dict(os.environ, PATH=str(base), RANDR=randr or ""), timeout=5)
+            # Then only positive connected evidence makes it ready.
+            actual = "connected" in proc.stdout.splitlines()
+            assert actual == ready, (drm, randr, proc.stdout, proc.stderr)
 
 
 if __name__ == "__main__":

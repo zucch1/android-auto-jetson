@@ -140,7 +140,7 @@ check_readiness() {
         return 1
     fi
     local display_status
-    display_status="$(remote "for c in /sys/class/drm/card*-DP-1/status /sys/class/drm/card*-HDMI-A-1/status; do [ -f \"\$c\" ] && cat \"\$c\"; done" 2>/dev/null || true)"
+    display_status="$(remote "for c in /sys/class/drm/card*-*/status; do [ -f \"\$c\" ] && cat \"\$c\"; done; if command -v xrandr >/dev/null 2>&1; then if xrandr --query 2>/dev/null | grep -Eq '^[^[:space:]]+[[:space:]]+connected([[:space:]]|$)'; then printf 'connected\\n'; fi; fi" 2>/dev/null || true)"
     if ! grep -Fxq 'connected' <<<"$display_status"; then
         ready_reason="display_disconnected"
         return 1
