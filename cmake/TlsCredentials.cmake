@@ -16,7 +16,7 @@ target_link_libraries(aa_credential_probe PRIVATE aa_tls)
 set_target_properties(aa_credential_probe PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 target_compile_options(aa_credential_probe PRIVATE -Wall -Wextra -Wpedantic -Werror)
-foreach(case valid unset empty unreadable insecure malformed mismatch symlink hardlink trailing)
+foreach(case valid unset empty unreadable insecure malformed mismatch symlink hardlink trailing chain chainorder)
     add_test(NAME tls_posture_credential_${case}
         COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tests/tls/credentials.py"
                 "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:aa_credential_probe>" "${case}")
