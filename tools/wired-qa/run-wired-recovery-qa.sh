@@ -318,11 +318,14 @@ media_evidence() {
     return 1
 }
 
+RECEIVER_PID=""
+CONSUMER_PID=""
 start_receiver() {
     [[ -n "${RECEIVER}" ]] || return 1
     local args="--port ${PORT_Q}"
     [[ -n "${STORE}" ]] && args="${args} --store $(shq "$STORE")"
-    remote "nohup $(shq "$RECEIVER") ${args} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!" >/dev/null 2>&1
+    RECEIVER_PID="$(remote "nohup $(shq "$RECEIVER") ${args} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!" 2>/dev/null | tr -dc '0-9')"
+    [[ -n "${RECEIVER_PID}" ]]
 }
 
 start_consumer() {
@@ -330,7 +333,15 @@ start_consumer() {
     # The display runs with the shipped test-only stdin control channel open on
     # a FIFO (<> keeps the open non-blocking): it is the painted-frames and
     # input-stimulation evidence source for the PASS gates.
-    remote "mkfifo /tmp/aa-disp.in 2>/dev/null || true; nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>/tmp/aa-disp.in > /tmp/aa-wired-display.log 2>&1 & echo \$!" >/dev/null 2>&1
+    CONSUMER_PID="$(remote "mkfifo /tmp/aa-disp.in 2>/dev/null || true; nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>/tmp/aa-disp.in > /tmp/aa-wired-display.log 2>&1 & echo \$!" 2>/dev/null | tr -dc '0-9')"
+    [[ -n "${CONSUMER_PID}" ]]
+}
+
+# Process liveness BY PID (never `pgrep -f`: the remote command line contains
+# the pattern, so pgrep -f self-matches and always reports alive).
+proc_alive() {
+    [[ -n "${1:-}" ]] || return 1
+    remote "kill -0 $1 2>/dev/null && echo alive || echo gone" 2>/dev/null | grep -q alive
 }
 
 scenario_selected() {
@@ -434,7 +445,8 @@ dip_attributed() {
 
 scenario_receiver_restart() {
     local t0 t1 recovery offset
-    start_receiver || { record receiver_restart BLOCKED "" "" "" "receiver_binary_not_supplied"; return; }
+    # The stack is already up and projecting (item 4 setup): this scenario only
+    # disturbs it and restarts the receiver.
     if ! wait_projecting "${BUDGET_MS}"; then
         record receiver_restart FAILED "" "" "" "no_initial_projection"
         return
@@ -472,7 +484,8 @@ scenario_receiver_restart() {
 
 scenario_consumer_restart() {
     local t0 t1 recovery offset
-    start_consumer || { record consumer_restart BLOCKED "" "" "" "display_binary_not_supplied"; return; }
+    # The stack is already up and projecting (item 4 setup): this scenario only
+    # disturbs it and restarts the display.
     wait_projecting "${BUDGET_MS}" || { record consumer_restart FAILED "" "" "" "no_initial_projection"; return; }
     remote "pkill -f 'aa-dummy-display' || true" >/dev/null 2>&1 || true
     sleep 1
@@ -760,9 +773,40 @@ if [[ -z "$RECEIVER" || -z "$DISPLAY" ]]; then
     exit 3
 fi
 
-# ---- 3. run the scenario matrix ----
+# ---- 3. stack startup + initial projection (BEFORE every scenario) ----
+# The receiver and display are started and VALIDATED (spawned PIDs alive) and
+# an initial projecting state is observed before any scenario runs - including
+# --only runs: a scenario must disturb an already-projecting stack, never race
+# the startup (item 4).
 trap cleanup_target EXIT
 
+if ! start_receiver; then
+    record setup BLOCKED "" "" "" "receiver_start_failed"
+    write_result "BLOCKED" "receiver_start_failed"
+    exit 3
+fi
+if ! start_consumer; then
+    record setup BLOCKED "" "" "" "display_start_failed"
+    write_result "BLOCKED" "display_start_failed"
+    exit 3
+fi
+if ! proc_alive "${RECEIVER_PID}"; then
+    record setup BLOCKED "" "" "" "receiver_not_running"
+    write_result "BLOCKED" "receiver_not_running"
+    exit 3
+fi
+if ! proc_alive "${CONSUMER_PID}"; then
+    record setup BLOCKED "" "" "" "display_not_running"
+    write_result "BLOCKED" "display_not_running"
+    exit 3
+fi
+if ! wait_projecting "${BUDGET_MS}"; then
+    record setup FAILED "" "" "" "no_initial_projection"
+    write_result "FAILED" "setup:no_initial_projection"
+    exit 1
+fi
+
+# ---- 4. run the scenario matrix ----
 for scenario in "${SCENARIOS[@]}"; do
     if scenario_selected "$scenario"; then
         "scenario_${scenario}"

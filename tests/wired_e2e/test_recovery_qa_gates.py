@@ -87,12 +87,19 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
     *pgrep*aa-wired-receiver*) [ "${FAKE_RECV_ALIVE:-0}" = "1" ] && echo alive || echo gone; exit 0 ;;
     *pgrep*aa-dummy-display*) [ "${FAKE_DISP_ALIVE:-0}" = "1" ] && echo alive || echo gone; exit 0 ;;
     *pkill*) exit 0 ;;
+    *'kill -0 4242'*) [ "${FAKE_PROC_ALIVE:-1}" = "0" ] && { echo gone; exit 0; }; [ -f "${FAKE_SSH_STATE:-/tmp}/recv" ] && echo alive || echo gone; exit 0 ;;
+    *'kill -0 4243'*) [ "${FAKE_PROC_ALIVE:-1}" = "0" ] && { echo gone; exit 0; }; [ -f "${FAKE_SSH_STATE:-/tmp}/disp" ] && echo alive || echo gone; exit 0 ;;
+    *'kill -0'*) [ "${FAKE_PROC_ALIVE:-1}" = "1" ] && echo alive || echo gone; exit 0 ;;
     *nohup*--test-only-autostart*)
         case "$cmd" in
-            *--test-only-control-stdin*) echo 4242; exit 0 ;;
+            *--test-only-control-stdin*)
+                mkdir -p "${FAKE_SSH_STATE:-/tmp}"; touch "${FAKE_SSH_STATE:-/tmp}/disp"
+                echo 4243; exit 0 ;;
             *) echo "fake-ssh: display started without --test-only-control-stdin" >&2; exit 97 ;;
         esac ;;
-    *nohup*) echo 4242; exit 0 ;;
+    *nohup*)
+        mkdir -p "${FAKE_SSH_STATE:-/tmp}"; touch "${FAKE_SSH_STATE:-/tmp}/recv"
+        echo 4242; exit 0 ;;
     *'"event":"status"'*) printf '%s' "${FAKE_DISPLAY_STATUS:-{\"event\":\"status\",\"frames_painted\":0,\"render_ok\":false}}"; exit 0 ;;
     *'"event":"active"'*) [ "${FAKE_ACTIVE:-1}" = "1" ] && exit 0 || exit 1 ;;
     *unbind*) [ "${FAKE_SYSFS:-1}" = "1" ] && exit 0 || exit 1 ;;
@@ -120,6 +127,7 @@ class RecoveryQaGates(unittest.TestCase):
             run_env = dict(os.environ)
             run_env["PATH"] = f"{directory}:{run_env['PATH']}"
             run_env["EVIDENCE_WAIT_MS"] = "300"
+            run_env["FAKE_SSH_STATE"] = str(root / "state")
             run_env.update(env)
             result = subprocess.run(command, capture_output=True, text=True,
                                     timeout=TIMEOUT_S, env=run_env)
@@ -299,6 +307,46 @@ class RecoveryQaGates(unittest.TestCase):
         rows = {row["name"]: row for row in doc["scenarios"]}
         self.assertEqual(rows["phone_lock_unlock"]["detail"],
                          "dip_not_attributed_to_intended_device")
+
+    # ---- item 4: receiver/display start+validate and an initial projecting
+    #      state BEFORE any scenario, including --only runs ----
+    def test_only_run_starts_stack_before_scenarios(self):
+        window = ('{"event":"diag","kind":"session_state_changed","phone_id":"id-approved"}\n'
+                  '{"kind":"reconnect","reason":"link lost","status":"pending","phone_id":"id-approved"}')
+        status = '{"event":"status","frames_painted":7,"render_ok":true}'
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            code, doc = self.run_qa(["--only", "phone_lock_unlock"],
+                                    FAKE_LOG_WINDOW=window, FAKE_DISPLAY_STATUS=status,
+                                    FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
+                                    FAKE_SSH_LOG=str(log))
+            self.assertEqual(code, 0, doc)
+            lines = log.read_text(encoding="utf-8").splitlines()
+            recv_start = next(i for i, line in enumerate(lines)
+                              if "nohup" in line and "aa-wired-receiver.log" in line)
+            disp_start = next(i for i, line in enumerate(lines)
+                              if "--test-only-autostart" in line)
+            stimulus = next(i for i, line in enumerate(lines) if "keyevent 26" in line)
+            self.assertLess(recv_start, stimulus, lines)
+            self.assertLess(disp_start, stimulus, lines)
+
+    def test_setup_requires_initial_projection(self):
+        code, doc = self.run_qa(["--only", "phone_lock_unlock"],
+                                FAKE_STATE='string "stopped"', BUDGET_MS="300")
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        names = [row["name"] for row in doc["scenarios"]]
+        self.assertNotIn("phone_lock_unlock", names)
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["setup"]["detail"], "no_initial_projection")
+
+    def test_setup_validates_processes(self):
+        code, doc = self.run_qa(["--only", "phone_lock_unlock"],
+                                FAKE_PROC_ALIVE="0", BUDGET_MS="300")
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["setup"]["detail"], "receiver_not_running")
 
     def test_consumer_restart_requires_process_death(self):
         code, doc = self.run_qa(["--only", "consumer_restart"], FAKE_DISP_ALIVE="1")
