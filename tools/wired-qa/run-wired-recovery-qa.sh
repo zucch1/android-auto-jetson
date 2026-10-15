@@ -164,11 +164,13 @@ host_tag="$(printf '%s' "$HOST" | sha256sum | cut -c1-16)"
 PORT_Q="$(shq "$PORT")"
 
 # Append one scenario record: name, status, recovery_ms (or ""), retries (or ""),
-# evidence, detail. '|' (not tab) is the field separator: tab is IFS whitespace
-# and collapses the empty recovery/retries fields, which shifted values into the
-# wrong JSON slots.
+# evidence, detail, frames_painted_baseline (or ""). '|' (not tab) is the field
+# separator: tab is IFS whitespace and collapses the empty recovery/retries
+# fields, which shifted values into the wrong JSON slots.
+FRAMES_BASELINE=""
 record() {
-    printf '%s|%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >> "${RESULTS_TSV}"
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "${FRAMES_BASELINE}" >> "${RESULTS_TSV}"
+    FRAMES_BASELINE=""
 }
 
 # D-Bus projection state (the same contract the task-30 harness uses).
@@ -234,16 +236,29 @@ retry_delta() {
 # ---- observed-evidence probes (gate P2: PASS requires OBSERVED evidence) ----
 
 # Painted-frames evidence from the SHIPPED dummy display's test-only status
-# channel (task 24 testcontrol): frames_painted > 0 and render_ok true. This is
-# the display-side "presents frames" claim - video_sent alone only proves units
-# crossed the channel, not that anything painted.
-painted_frames() {
+# channel (task 24 testcontrol). Item 8: the baseline counter is recorded at
+# the recovery start and post-recovery frames must GROW past it with render_ok
+# - a stuck counter is not post-recovery painting (video_sent alone only proves
+# units crossed the channel, not that anything painted).
+frames_painted_baseline() {
     local line
     remote "printf 'status\n' > /tmp/aa-disp.in 2>/dev/null; sleep 0.3; grep '\"event\":\"status\"' /tmp/aa-wired-display.log 2>/dev/null | tail -1" >/tmp/aa-status.$$ 2>/dev/null || true
     line="$(cat /tmp/aa-status.$$ 2>/dev/null || true)"
     rm -f /tmp/aa-status.$$
+    if [[ "$line" =~ \"frames_painted\":([0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        printf '0\n'
+    fi
+}
+
+painted_frames_grew() {
+    local baseline="${1:-0}" line
+    remote "printf 'status\n' > /tmp/aa-disp.in 2>/dev/null; sleep 0.3; grep '\"event\":\"status\"' /tmp/aa-wired-display.log 2>/dev/null | tail -1" >/tmp/aa-status.$$ 2>/dev/null || true
+    line="$(cat /tmp/aa-status.$$ 2>/dev/null || true)"
+    rm -f /tmp/aa-status.$$
     [[ "$line" =~ \"frames_painted\":([0-9]+) ]] || return 1
-    (( ${BASH_REMATCH[1]} > 0 )) || return 1
+    (( ${BASH_REMATCH[1]} > baseline )) || return 1
     [[ "$line" == *'"render_ok":true'* ]]
 }
 
@@ -319,14 +334,15 @@ attributed_rejection() {
     return 1
 }
 
-# Full media evidence required before any recovery PASS: painted frames AND a
-# successful audio pump AND a delivered input event (stimulated here).
+# Full media evidence required before any recovery PASS: painted frames that
+# GREW past the recorded baseline AND a successful audio pump AND a delivered
+# input event (stimulated here).
 media_evidence() {
-    local since="${1:-0}"
+    local since="${1:-0}" frames_baseline="${2:-0}"
     stimulate_input
     local deadline=$(( $(date +%s%3N) + EVIDENCE_WAIT_MS ))
     while (( $(date +%s%3N) < deadline )); do
-        if painted_frames && audio_pumped "${since}" && input_ok "${since}"; then
+        if painted_frames_grew "${frames_baseline}" && audio_pumped "${since}" && input_ok "${since}"; then
             return 0
         fi
         sleep 0.5
@@ -485,6 +501,7 @@ scenario_receiver_restart() {
     fi
     wait_not_projecting 3000 || true
     t0=$(date +%s%3N)
+    FRAMES_BASELINE="$(frames_painted_baseline)"
     start_receiver || { record receiver_restart FAILED "" "" "" "restart_failed"; return; }
     # start_receiver launches with `> /tmp/aa-wired-receiver.log` (truncate):
     # the pre-restart offset points past EOF in the fresh log and would miss
@@ -502,7 +519,7 @@ scenario_receiver_restart() {
             record receiver_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "session_active_not_observed" "no_active_event"
             return
         fi
-        if media_evidence "${offset}"; then
+        if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
             record receiver_restart PASS "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+active+frames+pump+input" "recovered"
         else
             record receiver_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+media_unobserved" "no_media_evidence_after_recovery"
@@ -529,13 +546,14 @@ scenario_consumer_restart() {
     offset="$(log_offset)"
     retries_before="$(retries_total)"
     start_consumer || { record consumer_restart FAILED "" "" "" "restart_failed"; return; }
+    FRAMES_BASELINE="$(frames_painted_baseline)" 
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
         if (( recovery > BUDGET_MS )); then
             record consumer_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
             return
         fi
-        if media_evidence "${offset}"; then
+        if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
             record consumer_restart PASS "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+frames+pump+input" "recovered"
         else
             record consumer_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+media_unobserved" "no_media_evidence_after_recovery"
@@ -557,6 +575,7 @@ scenario_usb_unplug_replug() {
     UNBOUND_PORT="${PORT}"
     sleep 1
     t0=$(date +%s%3N)
+    FRAMES_BASELINE="$(frames_painted_baseline)"
     if ! remote "sudo -n sh -c 'echo -n ${PORT_Q} > /sys/bus/usb/drivers/usb/bind'" >/dev/null 2>&1; then
         record usb_unplug_replug BLOCKED "" "" "" "sysfs_bind_requires_passwordless_sudo"
         return
@@ -572,7 +591,7 @@ scenario_usb_unplug_replug() {
             record usb_unplug_replug BLOCKED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unobserved" "no_state_or_flow_dip_observed"
             return
         fi
-        if media_evidence "${offset}"; then
+        if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
             record usb_unplug_replug PASS "${recovery}" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_on_replug"
         else
             record usb_unplug_replug FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip+media_unobserved" "no_media_evidence_after_recovery"
@@ -596,6 +615,7 @@ scenario_phone_lock_unlock() {
         { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
     adb_stimulus "${serial}" "shell input swipe 540 1600 540 400" >/dev/null 2>&1 ||
         { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
+    FRAMES_BASELINE="$(frames_painted_baseline)"
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
         if (( recovery > BUDGET_MS )); then
@@ -611,7 +631,7 @@ scenario_phone_lock_unlock() {
             record phone_lock_unlock FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unattributed" "dip_not_attributed_to_intended_device"
             return
         fi
-        if media_evidence "${offset}"; then
+        if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
             record phone_lock_unlock PASS "${recovery}" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_after_unlock"
         else
             record phone_lock_unlock FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip+media_unobserved" "no_media_evidence_after_recovery"
@@ -630,6 +650,7 @@ scenario_phone_aa_restart() {
     t0=$(date +%s%3N)
     adb_stimulus "${serial}" "shell am force-stop com.google.android.projection.gearhead" >/dev/null 2>&1 ||
         { record phone_aa_restart FAILED "" "" "" "stimulus_failed"; return; }
+    FRAMES_BASELINE="$(frames_painted_baseline)"
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
         if (( recovery > BUDGET_MS )); then
@@ -645,7 +666,7 @@ scenario_phone_aa_restart() {
             record phone_aa_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unattributed" "dip_not_attributed_to_intended_device"
             return
         fi
-        if media_evidence "${offset}"; then
+        if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
             record phone_aa_restart PASS "${recovery}" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_after_aa_restart"
         else
             record phone_aa_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip+media_unobserved" "no_media_evidence_after_recovery"
@@ -771,15 +792,16 @@ write_result() {
         printf '  "status": "%s",\n' "$overall_status"
         printf '  "blocked_on": "%s",\n' "$(json_escape "$blocked_on")"
         printf '  "scenarios": [\n'
-        local first=1 name status recovery retries evidence detail
-        while IFS='|' read -r name status recovery retries evidence detail; do
+        local first=1 name status recovery retries evidence detail frames_baseline
+        while IFS='|' read -r name status recovery retries evidence detail frames_baseline; do
             [[ -n "${name}" ]] || continue
             (( first )) || printf ',\n'
             first=0
-            printf '    {"name": "%s", "status": "%s", "recovery_ms": %s, "retries": %s, "evidence": "%s", "detail": "%s"}' \
+            printf '    {"name": "%s", "status": "%s", "recovery_ms": %s, "retries": %s, "evidence": "%s", "detail": "%s", "frames_painted_baseline": %s}' \
                 "$(json_escape "$name")" "$(json_escape "$status")" \
                 "${recovery:-null}" "${retries:-null}" \
-                "$(json_escape "$evidence")" "$(json_escape "$detail")"
+                "$(json_escape "$evidence")" "$(json_escape "$detail")" \
+                "${frames_baseline:-null}"
         done < "${RESULTS_TSV}"
         printf '\n  ],\n'
         printf '  "budget_note": "recovery_ms is harness-measured wall time (disturbance -> observed recovery) and is ENFORCED against the <=%s ms budget on every PASS: a budget miss records FAILED, never PASS; the bounded waits bound the observations",\n' "$BUDGET_MS"

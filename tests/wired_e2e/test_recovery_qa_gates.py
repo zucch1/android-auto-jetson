@@ -109,7 +109,12 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
     *nohup*)
         mkdir -p "${FAKE_SSH_STATE:-/tmp}"; touch "${FAKE_SSH_STATE:-/tmp}/recv"
         echo 4242; exit 0 ;;
-    *'"event":"status"'*) printf '%s' "${FAKE_DISPLAY_STATUS:-{\"event\":\"status\",\"frames_painted\":0,\"render_ok\":false}}"; exit 0 ;;
+    *'"event":"status"'*)
+        if [ -n "${FAKE_DISPLAY_STATUS:-}" ]; then printf '%s' "${FAKE_DISPLAY_STATUS}"; exit 0; fi
+        n="$(cat "${FAKE_SSH_STATE:-/tmp}/frames_n" 2>/dev/null || echo 0)"
+        n=$((n+1)); mkdir -p "${FAKE_SSH_STATE:-/tmp}"; echo "$n" > "${FAKE_SSH_STATE:-/tmp}/frames_n"
+        printf '%s' "{\"event\":\"status\",\"frames_painted\":$(( ${FAKE_FRAMES_BASE:-3} + ${FAKE_FRAMES_STEP:-2} * (n-1) )),\"render_ok\":true}"
+        exit 0 ;;
     *'"event":"active"'*) [ "${FAKE_ACTIVE:-1}" = "1" ] && exit 0 || exit 1 ;;
     *unbind*) exit "${FAKE_UNBIND_RC:-0}" ;;
     *bind*) exit "${FAKE_BIND_RC:-0}" ;;
@@ -294,11 +299,10 @@ class RecoveryQaGates(unittest.TestCase):
     def test_phone_stimulus_targets_port_matched_device(self):
         window = ('{"event":"diag","kind":"session_state_changed","phone_id":"id-approved"}\n'
                   '{"kind":"reconnect","reason":"link lost","status":"pending","phone_id":"id-approved"}')
-        status = '{"event":"status","frames_painted":7,"render_ok":true}'
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "ssh.log"
             code, doc = self.run_qa(["--only", "phone_lock_unlock"],
-                                    FAKE_LOG_WINDOW=window, FAKE_DISPLAY_STATUS=status,
+                                    FAKE_LOG_WINDOW=window,
                                     FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
                                     FAKE_SSH_LOG=str(log))
             self.assertEqual(code, 0, doc)
@@ -322,11 +326,10 @@ class RecoveryQaGates(unittest.TestCase):
     def test_only_run_starts_stack_before_scenarios(self):
         window = ('{"event":"diag","kind":"session_state_changed","phone_id":"id-approved"}\n'
                   '{"kind":"reconnect","reason":"link lost","status":"pending","phone_id":"id-approved"}')
-        status = '{"event":"status","frames_painted":7,"render_ok":true}'
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "ssh.log"
             code, doc = self.run_qa(["--only", "phone_lock_unlock"],
-                                    FAKE_LOG_WINDOW=window, FAKE_DISPLAY_STATUS=status,
+                                    FAKE_LOG_WINDOW=window,
                                     FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
                                     FAKE_SSH_LOG=str(log))
             self.assertEqual(code, 0, doc)
@@ -360,9 +363,7 @@ class RecoveryQaGates(unittest.TestCase):
     # ---- item 5: process-death probes track the child PIDs and verify
     #      termination BY PID - the shim's pgrep -f self-matches by design ----
     def test_process_death_verified_by_pid_not_pgrep(self):
-        status = '{"event":"status","frames_painted":7,"render_ok":true}'
         code, doc = self.run_qa(["--only", "receiver_restart"],
-                                FAKE_DISPLAY_STATUS=status,
                                 FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
         self.assertEqual(code, 0, doc)
         rows = {row["name"]: row for row in doc["scenarios"]}
@@ -370,11 +371,9 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertEqual(rows["receiver_restart"]["detail"], "recovered")
 
     def test_death_probe_kills_the_tracked_child_pid(self):
-        status = '{"event":"status","frames_painted":7,"render_ok":true}'
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "ssh.log"
             code, doc = self.run_qa(["--only", "consumer_restart"],
-                                    FAKE_DISPLAY_STATUS=status,
                                     FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
                                     FAKE_SSH_LOG=str(log))
             self.assertEqual(code, 0, doc)
@@ -414,14 +413,32 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertGreater(rows["consumer_restart"]["recovery_ms"], 300)
 
     def test_retry_count_is_per_disturbance_delta(self):
-        status = '{"event":"status","frames_painted":7,"render_ok":true}'
         code, doc = self.run_qa(["--only", "consumer_restart"],
                                 FAKE_RETRIES_BASE="2", FAKE_RETRIES_STEP="3",
-                                FAKE_DISPLAY_STATUS=status,
                                 FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
         self.assertEqual(code, 0, doc)
         rows = {row["name"]: row for row in doc["scenarios"]}
         self.assertEqual(rows["consumer_restart"]["retries"], 3)
+
+    # ---- item 8: painted frames must GROW past the recorded baseline - a
+    #      stuck counter is not post-recovery painting ----
+    def test_frames_painted_requires_post_recovery_growth(self):
+        stuck = '{"event":"status","frames_painted":7,"render_ok":true}'
+        code, doc = self.run_qa(["--only", "consumer_restart"],
+                                FAKE_DISPLAY_STATUS=stuck,
+                                FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
+        self.assertNotEqual(code, 0, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertIn("media_unobserved", rows["consumer_restart"]["evidence"])
+
+    def test_frames_painted_baseline_is_recorded(self):
+        code, doc = self.run_qa(["--only", "consumer_restart"],
+                                FAKE_FRAMES_BASE="5", FAKE_FRAMES_STEP="2",
+                                FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
+        self.assertEqual(code, 0, doc)
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["consumer_restart"]["frames_painted_baseline"], 5)
 
     def test_consumer_restart_requires_process_death(self):
         code, doc = self.run_qa(["--only", "consumer_restart"], FAKE_DISP_ALIVE="1")
@@ -443,12 +460,11 @@ class RecoveryQaGates(unittest.TestCase):
                          "no_media_evidence_after_recovery")
 
     def test_projecting_with_full_media_evidence_passes(self):
-        status = '{"event":"status","frames_painted":7,"render_ok":true}'
         window = '{"event":"media_timing","av_sync_ms":12,"audio_latency_ms":40}'
         code, doc = self.run_qa(
             ["--only", "consumer_restart"],
             FAKE_STATE='string "projecting"', FAKE_DISP_ALIVE="0",
-            FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
+            FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
             FAKE_LOG_WINDOW=window)
         self.assertEqual(code, 0, doc)
         self.assertEqual(doc["status"], "PASS")
@@ -495,7 +511,6 @@ class RecoveryQaGates(unittest.TestCase):
     def test_subset_run_records_only_field_and_verdict(self):
         code, doc = self.run_qa(["--only", "usb_unplug_replug"],
                                 FAKE_LOG_WINDOW='{"kind":"reconnect"}',
-                                FAKE_DISPLAY_STATUS='{"event":"status","frames_painted":3,"render_ok":true}',
                                 FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
         self.assertEqual(code, 0, doc)
         self.assertEqual(doc["only"], "usb_unplug_replug")
@@ -567,21 +582,19 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertIn("FAILED", doc["budget_note"])
 
     def test_display_started_with_real_test_control_flag(self):
-        status = '{"event":"status","frames_painted":3,"render_ok":true}'
         code, doc = self.run_qa(
             ["--only", "consumer_restart"],
             FAKE_STATE='string "projecting"', FAKE_DISP_ALIVE="0",
-            FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
+            FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
         self.assertEqual(code, 0, doc)
 
     def test_receiver_restart_media_window_covers_fresh_log(self):
-        status = '{"event":"status","frames_painted":3,"render_ok":true}'
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "ssh.log"
             code, doc = self.run_qa(
                 ["--only", "receiver_restart"],
                 FAKE_STATE='string "projecting"', FAKE_RECV_ALIVE="0",
-                FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
+                FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
                 FAKE_LOG_SIZE="4096", FAKE_SSH_LOG=str(log))
             self.assertEqual(code, 0, doc)
             logged = log.read_text(encoding="utf-8")
