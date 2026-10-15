@@ -344,6 +344,12 @@ proc_alive() {
     remote "kill -0 $1 2>/dev/null && echo alive || echo gone" 2>/dev/null | grep -q alive
 }
 
+# Explicit per-PID state: only a literal "gone" observes termination - a probe
+# that failed or reported anything else is NOT death evidence (fail closed).
+proc_state() {
+    remote "kill -0 $1 2>/dev/null && echo alive || echo gone" 2>/dev/null | tr -dc 'a-z'
+}
+
 scenario_selected() {
     [[ -z "${ONLY}" || ",${ONLY}," == *",$1,"* ]]
 }
@@ -451,10 +457,13 @@ scenario_receiver_restart() {
         record receiver_restart FAILED "" "" "" "no_initial_projection"
         return
     fi
-    remote "pkill -f 'aa-wired-receiver' || true" >/dev/null 2>&1 || true
+    # Kill and verify the tracked child BY PID (item 5): pattern kills
+    # (pkill/pgrep -f) self-match on the remote command line and can neither
+    # kill nor observe this specific child's death.
+    remote "kill ${RECEIVER_PID} 2>/dev/null || true" >/dev/null 2>&1 || true
     sleep 1
     # The receiver's process death is the observed state dip (gate P2).
-    if remote "pgrep -f 'aa-wired-receiver' >/dev/null 2>&1 && echo alive || echo gone" 2>/dev/null | grep -q alive; then
+    if [[ "$(proc_state "${RECEIVER_PID}")" != "gone" ]]; then
         record receiver_restart FAILED "" "" "dip_unobserved" "receiver_did_not_stop"
         return
     fi
@@ -487,10 +496,11 @@ scenario_consumer_restart() {
     # The stack is already up and projecting (item 4 setup): this scenario only
     # disturbs it and restarts the display.
     wait_projecting "${BUDGET_MS}" || { record consumer_restart FAILED "" "" "" "no_initial_projection"; return; }
-    remote "pkill -f 'aa-dummy-display' || true" >/dev/null 2>&1 || true
+    # Kill and verify the tracked child BY PID (item 5), never by pattern.
+    remote "kill ${CONSUMER_PID} 2>/dev/null || true" >/dev/null 2>&1 || true
     sleep 1
     # The consumer's process death is the observed state dip (gate P2).
-    if remote "pgrep -f 'aa-dummy-display' >/dev/null 2>&1 && echo alive || echo gone" 2>/dev/null | grep -q alive; then
+    if [[ "$(proc_state "${CONSUMER_PID}")" != "gone" ]]; then
         record consumer_restart FAILED "" "" "dip_unobserved" "display_did_not_stop"
         return
     fi
@@ -677,7 +687,10 @@ scenario_malformed_input() {
 }
 
 cleanup_target() {
-    remote "pkill -f 'aa-dummy-display' || true; pkill -f 'aa-wired-receiver' || true" >/dev/null 2>&1 || true
+    # Teardown by tracked PID (item 5): pattern kills (pkill -f) self-match the
+    # remote wrapper shell and can kill the wrong process.
+    [[ -n "${CONSUMER_PID}" ]] && remote "kill ${CONSUMER_PID} 2>/dev/null || true" >/dev/null 2>&1 || true
+    [[ -n "${RECEIVER_PID}" ]] && remote "kill ${RECEIVER_PID} 2>/dev/null || true" >/dev/null 2>&1 || true
 }
 
 write_result() {

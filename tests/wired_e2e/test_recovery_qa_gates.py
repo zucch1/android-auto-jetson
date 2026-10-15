@@ -84,12 +84,17 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
     *aa-wired-receiver-attempt.log*) exit "${FAKE_ATTEMPT_RC:-3}" ;;
     *'retries'*) printf '%s' "${FAKE_RETRIES:-1}"; exit 0 ;;
     *busctl*) printf '%s' "${FAKE_STATE:-string \"projecting\"}"; exit 0 ;;
-    *pgrep*aa-wired-receiver*) [ "${FAKE_RECV_ALIVE:-0}" = "1" ] && echo alive || echo gone; exit 0 ;;
-    *pgrep*aa-dummy-display*) [ "${FAKE_DISP_ALIVE:-0}" = "1" ] && echo alive || echo gone; exit 0 ;;
+    # pgrep -f REAL matching semantics: the remote command line contains the
+    # pattern (the harness quotes it into the ssh command), so pgrep -f matches
+    # its own wrapper shell and ALWAYS reports alive. Death verification that
+    # trusts pgrep -f is wrong by construction - the regression model below.
+    *pgrep*) echo alive; exit 0 ;;
     *pkill*) exit 0 ;;
     *'kill -0 4242'*) [ "${FAKE_PROC_ALIVE:-1}" = "0" ] && { echo gone; exit 0; }; [ -f "${FAKE_SSH_STATE:-/tmp}/recv" ] && echo alive || echo gone; exit 0 ;;
     *'kill -0 4243'*) [ "${FAKE_PROC_ALIVE:-1}" = "0" ] && { echo gone; exit 0; }; [ -f "${FAKE_SSH_STATE:-/tmp}/disp" ] && echo alive || echo gone; exit 0 ;;
     *'kill -0'*) [ "${FAKE_PROC_ALIVE:-1}" = "1" ] && echo alive || echo gone; exit 0 ;;
+    *'kill 4242'*) [ "${FAKE_RECV_ALIVE:-0}" = "1" ] || rm -f "${FAKE_SSH_STATE:-/tmp}/recv"; exit 0 ;;
+    *'kill 4243'*) [ "${FAKE_DISP_ALIVE:-0}" = "1" ] || rm -f "${FAKE_SSH_STATE:-/tmp}/disp"; exit 0 ;;
     *nohup*--test-only-autostart*)
         case "$cmd" in
             *--test-only-control-stdin*)
@@ -347,6 +352,32 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertEqual(doc["status"], "BLOCKED")
         rows = {row["name"]: row for row in doc["scenarios"]}
         self.assertEqual(rows["setup"]["detail"], "receiver_not_running")
+
+    # ---- item 5: process-death probes track the child PIDs and verify
+    #      termination BY PID - the shim's pgrep -f self-matches by design ----
+    def test_process_death_verified_by_pid_not_pgrep(self):
+        status = '{"event":"status","frames_painted":7,"render_ok":true}'
+        code, doc = self.run_qa(["--only", "receiver_restart"],
+                                FAKE_DISPLAY_STATUS=status,
+                                FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
+        self.assertEqual(code, 0, doc)
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["receiver_restart"]["status"], "PASS")
+        self.assertEqual(rows["receiver_restart"]["detail"], "recovered")
+
+    def test_death_probe_kills_the_tracked_child_pid(self):
+        status = '{"event":"status","frames_painted":7,"render_ok":true}'
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            code, doc = self.run_qa(["--only", "consumer_restart"],
+                                    FAKE_DISPLAY_STATUS=status,
+                                    FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
+                                    FAKE_SSH_LOG=str(log))
+            self.assertEqual(code, 0, doc)
+            logged = log.read_text(encoding="utf-8")
+            self.assertIn("kill 4243", logged)
+            self.assertNotIn("pkill", logged)
+            self.assertNotIn("pgrep", logged)
 
     def test_consumer_restart_requires_process_death(self):
         code, doc = self.run_qa(["--only", "consumer_restart"], FAKE_DISP_ALIVE="1")
