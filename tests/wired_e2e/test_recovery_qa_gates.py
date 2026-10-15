@@ -66,6 +66,7 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
     *'n++'*) printf '%s' "${FAKE_ADB_COUNT:-2}"; exit 0 ;;
     *'print $1'*) printf '%s\n' "${FAKE_ADB_LIST:-FAKEDEV1 FAKEDEV2}" | tr ' ' '\n'; exit 0 ;;
     *'adb shell'*) exit 0 ;;
+    *'shell input keyevent'*|*'shell input swipe'*|*'shell am force-stop'*) exit "${FAKE_ADB_STIMULUS_RC:-0}" ;;
     *'wc -c'*) printf '%s' "${FAKE_LOG_SIZE:-0}"; exit 0 ;;
     # Media-gate probes (N1): both probe commands contain their evidence token
     # AND `tail -c +`, so first-match case ordering decides which arm drives
@@ -260,6 +261,44 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertEqual(doc["status"], "BLOCKED")
         rows = {row["name"]: row for row in doc["scenarios"]}
         self.assertEqual(rows["phone_lock_unlock"]["evidence"], "dip_unobserved")
+
+    # ---- item 3: phone stimuli are fail-closed and the dip must correlate to
+    #      the intended device/event via the same identity attribution ----
+    def test_phone_stimulus_failure_is_fail_closed(self):
+        window = ('{"event":"diag","kind":"session_state_changed","phone_id":"id-approved"}\n'
+                  '{"kind":"reconnect","reason":"link lost","status":"pending","phone_id":"id-approved"}')
+        code, doc = self.run_qa(["--only", "phone_lock_unlock"],
+                                FAKE_ADB_STIMULUS_RC="1", FAKE_LOG_WINDOW=window)
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["phone_lock_unlock"]["detail"], "stimulus_failed")
+
+    def test_phone_stimulus_targets_port_matched_device(self):
+        window = ('{"event":"diag","kind":"session_state_changed","phone_id":"id-approved"}\n'
+                  '{"kind":"reconnect","reason":"link lost","status":"pending","phone_id":"id-approved"}')
+        status = '{"event":"status","frames_painted":7,"render_ok":true}'
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            code, doc = self.run_qa(["--only", "phone_lock_unlock"],
+                                    FAKE_LOG_WINDOW=window, FAKE_DISPLAY_STATUS=status,
+                                    FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1",
+                                    FAKE_SSH_LOG=str(log))
+            self.assertEqual(code, 0, doc)
+            logged = log.read_text(encoding="utf-8")
+            stimuli = [line for line in logged.splitlines() if "keyevent 26" in line]
+            self.assertTrue(stimuli, logged)
+            self.assertIn("adb -s FAKEAPPROVED", stimuli[0])
+
+    def test_phone_dip_must_correlate_to_intended_device(self):
+        window = ('{"event":"diag","kind":"session_state_changed","phone_id":"id-approved"}\n'
+                  '{"kind":"reconnect","reason":"link lost","status":"pending","phone_id":"id-OTHER"}')
+        code, doc = self.run_qa(["--only", "phone_lock_unlock"], FAKE_LOG_WINDOW=window)
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["phone_lock_unlock"]["detail"],
+                         "dip_not_attributed_to_intended_device")
 
     def test_consumer_restart_requires_process_death(self):
         code, doc = self.run_qa(["--only", "consumer_restart"], FAKE_DISP_ALIVE="1")

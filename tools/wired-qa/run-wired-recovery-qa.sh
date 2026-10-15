@@ -370,6 +370,63 @@ attempt_window() {
     remote "tail -c +1 /tmp/aa-wired-receiver-attempt.log 2>/dev/null" || true
 }
 
+# The intended stimulus device: the approved phone selected through the same
+# adb port-match attribution (usb:<PORT>, or the ADB_SERIAL override). Prints
+# its adb serial; fails when no device maps to the approved phone.
+stimulus_serial() {
+    local map serial port
+    map="$(adb_port_map || true)"
+    while IFS=$'\t' read -r serial port; do
+        [[ -n "${serial}" ]] || continue
+        if [[ "${port}" == "${PORT}" ]] ||
+            { [[ -n "${ADB_SERIAL}" ]] && [[ "${serial}" == "${ADB_SERIAL}" ]]; }; then
+            printf '%s\n' "${serial}"
+            return 0
+        fi
+    done <<< "${map}"
+    [[ -n "${ADB_SERIAL}" ]] || return 1
+    printf '%s\n' "${ADB_SERIAL}"
+}
+
+# One stimulus on the INTENDED device (adb -s <serial>, never bare adb): the
+# return code is the claim - a failed stimulus is a FAILED scenario, never
+# swallowed (item 3 fail-closed).
+adb_stimulus() {
+    local serial="$1"
+    shift
+    remote "adb -s $(shq "$serial") $*"
+}
+
+# The intended device's attribution label: the first phone_id the receiver
+# recorded (the admitted phone's pseudonym; raw keys never cross the boundary).
+intended_phone_label() {
+    local window line
+    window="$(log_since 0)"
+    local id_re='"phone_id":"([^"]*)"'
+    while IFS= read -r line; do
+        [[ "$line" =~ $id_re ]] || continue
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    done <<< "$window"
+    return 1
+}
+
+# The observed state/flow dip must correlate to the intended device via the
+# same identity attribution (item 3): the dip record carries phone_id and it
+# must name the intended (admitted) phone - a transition attributed to any
+# other identity is not this device's recovery.
+dip_attributed() {
+    local since="${1:-0}" label="${2:-}"
+    [[ -n "${label}" ]] || return 1
+    local window line
+    window="$(log_since "${since}")"
+    while IFS= read -r line; do
+        [[ "$line" == *'"kind":"reconnect"'* || "$line" == *'peer disconnected'* ]] || continue
+        [[ "$line" == *"\"phone_id\":\"${label}\""* ]] && return 0
+    done <<< "$window"
+    return 1
+}
+
 # ---- scenario implementations (each records exactly one row) ----
 # PASS is earned only with observed evidence: stimulus outcome + disturbance
 # (dip/rejection) + recovery inside the budget window (bounded-wait evidence)
@@ -470,18 +527,27 @@ scenario_usb_unplug_replug() {
 }
 
 scenario_phone_lock_unlock() {
-    local t0 t1 recovery offset
+    local t0 t1 recovery offset serial label
     wait_projecting "${BUDGET_MS}" || { record phone_lock_unlock FAILED "" "" "" "no_initial_projection"; return; }
+    serial="$(stimulus_serial)" || { record phone_lock_unlock BLOCKED "" "" "" "stimulus_device_unattributed"; return; }
     offset="$(log_offset)"
-    remote "adb ${ADB_SERIAL:+-s $(shq "$ADB_SERIAL")} shell input keyevent 26" >/dev/null 2>&1 || true
+    adb_stimulus "${serial}" "shell input keyevent 26" >/dev/null 2>&1 ||
+        { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
     sleep 2
     t0=$(date +%s%3N)
-    remote "adb ${ADB_SERIAL:+-s $(shq "$ADB_SERIAL")} shell input keyevent 224" >/dev/null 2>&1 || true
-    remote "adb ${ADB_SERIAL:+-s $(shq "$ADB_SERIAL")} shell input swipe 540 1600 540 400" >/dev/null 2>&1 || true
+    adb_stimulus "${serial}" "shell input keyevent 224" >/dev/null 2>&1 ||
+        { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
+    adb_stimulus "${serial}" "shell input swipe 540 1600 540 400" >/dev/null 2>&1 ||
+        { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
         if ! dip_observed "${offset}"; then
             record phone_lock_unlock BLOCKED "${recovery}" "$(retry_count)" "dip_unobserved" "no_state_or_flow_dip_observed"
+            return
+        fi
+        label="$(intended_phone_label)" || label=""
+        if ! dip_attributed "${offset}" "${label}"; then
+            record phone_lock_unlock FAILED "${recovery}" "$(retry_count)" "dip_unattributed" "dip_not_attributed_to_intended_device"
             return
         fi
         if media_evidence "${offset}"; then
@@ -495,15 +561,22 @@ scenario_phone_lock_unlock() {
 }
 
 scenario_phone_aa_restart() {
-    local t0 t1 recovery offset
+    local t0 t1 recovery offset serial label
     wait_projecting "${BUDGET_MS}" || { record phone_aa_restart FAILED "" "" "" "no_initial_projection"; return; }
+    serial="$(stimulus_serial)" || { record phone_aa_restart BLOCKED "" "" "" "stimulus_device_unattributed"; return; }
     offset="$(log_offset)"
     t0=$(date +%s%3N)
-    remote "adb ${ADB_SERIAL:+-s $(shq "$ADB_SERIAL")} shell am force-stop com.google.android.projection.gearhead" >/dev/null 2>&1 || true
+    adb_stimulus "${serial}" "shell am force-stop com.google.android.projection.gearhead" >/dev/null 2>&1 ||
+        { record phone_aa_restart FAILED "" "" "" "stimulus_failed"; return; }
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
         if ! dip_observed "${offset}"; then
             record phone_aa_restart BLOCKED "${recovery}" "$(retry_count)" "dip_unobserved" "no_state_or_flow_dip_observed"
+            return
+        fi
+        label="$(intended_phone_label)" || label=""
+        if ! dip_attributed "${offset}" "${label}"; then
+            record phone_aa_restart FAILED "${recovery}" "$(retry_count)" "dip_unattributed" "dip_not_attributed_to_intended_device"
             return
         fi
         if media_evidence "${offset}"; then
