@@ -107,8 +107,8 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
         echo 4242; exit 0 ;;
     *'"event":"status"'*) printf '%s' "${FAKE_DISPLAY_STATUS:-{\"event\":\"status\",\"frames_painted\":0,\"render_ok\":false}}"; exit 0 ;;
     *'"event":"active"'*) [ "${FAKE_ACTIVE:-1}" = "1" ] && exit 0 || exit 1 ;;
-    *unbind*) [ "${FAKE_SYSFS:-1}" = "1" ] && exit 0 || exit 1 ;;
-    *bind*) [ "${FAKE_SYSFS:-1}" = "1" ] && exit 0 || exit 1 ;;
+    *unbind*) exit "${FAKE_UNBIND_RC:-0}" ;;
+    *bind*) exit "${FAKE_BIND_RC:-0}" ;;
     *'printf'*) exit 0 ;;
     *) exit 0 ;;
 esac
@@ -378,6 +378,22 @@ class RecoveryQaGates(unittest.TestCase):
             self.assertIn("kill 4243", logged)
             self.assertNotIn("pkill", logged)
             self.assertNotIn("pgrep", logged)
+
+    # ---- item 6: the cleanup rebinds a port left unbound - the device is
+    #      never left unbound after the run ----
+    def test_cleanup_rebinds_after_unbind_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            code, doc = self.run_qa(["--only", "usb_unplug_replug"],
+                                    FAKE_BIND_RC="1", FAKE_SSH_LOG=str(log))
+            self.assertEqual(code, 3, doc)
+            self.assertEqual(doc["status"], "BLOCKED")
+            rows = {row["name"]: row for row in doc["scenarios"]}
+            self.assertEqual(rows["usb_unplug_replug"]["detail"],
+                             "sysfs_bind_requires_passwordless_sudo")
+            logged = log.read_text(encoding="utf-8")
+            binds = [line for line in logged.splitlines() if "drivers/usb/bind" in line]
+            self.assertGreaterEqual(len(binds), 2, logged)
 
     def test_consumer_restart_requires_process_death(self):
         code, doc = self.run_qa(["--only", "consumer_restart"], FAKE_DISP_ALIVE="1")

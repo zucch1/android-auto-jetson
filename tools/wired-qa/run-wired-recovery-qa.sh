@@ -527,12 +527,14 @@ scenario_usb_unplug_replug() {
         record usb_unplug_replug BLOCKED "" "" "" "sysfs_unbind_requires_passwordless_sudo"
         return
     fi
+    UNBOUND_PORT="${PORT}"
     sleep 1
     t0=$(date +%s%3N)
     if ! remote "sudo -n sh -c 'echo -n ${PORT_Q} > /sys/bus/usb/drivers/usb/bind'" >/dev/null 2>&1; then
         record usb_unplug_replug BLOCKED "" "" "" "sysfs_bind_requires_passwordless_sudo"
         return
     fi
+    UNBOUND_PORT=""
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
         if ! dip_observed "${offset}"; then
@@ -686,7 +688,19 @@ scenario_malformed_input() {
     record malformed_input N/A "" "" "" "host_covered_by_ctest_wired_recovery_no_shell_injector"
 }
 
+# The phone's USB port while it is unbound (item 6): the cleanup must rebind a
+# port left unbound by a failed/aborted scenario - never leave the device
+# unbound after the run.
+UNBOUND_PORT=""
+rebind_unbound() {
+    if [[ -n "${UNBOUND_PORT}" ]]; then
+        remote "sudo -n sh -c 'echo -n $(shq "${UNBOUND_PORT}") > /sys/bus/usb/drivers/usb/bind'" >/dev/null 2>&1 || true
+        UNBOUND_PORT=""
+    fi
+}
+
 cleanup_target() {
+    rebind_unbound
     # Teardown by tracked PID (item 5): pattern kills (pkill -f) self-match the
     # remote wrapper shell and can kill the wrong process.
     [[ -n "${CONSUMER_PID}" ]] && remote "kill ${CONSUMER_PID} 2>/dev/null || true" >/dev/null 2>&1 || true
