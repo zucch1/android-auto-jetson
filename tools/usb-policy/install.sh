@@ -141,6 +141,7 @@ if [ -f "$MANIFEST" ]; then
     DST_SHA="-"
     [ -f "$DST" ] && DST_SHA="$(sha_of "$DST")"
     if [ "$PHASE" = "installed" ] && [ "$DST_SHA" = "$SRC_SHA" ] && [ "$INSTALLED_SHA" = "$SRC_SHA" ]; then
+        check_installed_metadata "$DST"
         log "already-installed: ${RULES_NAME} unchanged (sha256 ${SRC_SHA})"
         check_user_access
         reload_and_trigger

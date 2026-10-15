@@ -69,6 +69,17 @@ check_entry() {
     fi
 }
 
+check_installed_metadata() {
+    local f="$1" owner perms expected_owner=0
+    # Fake roots model root ownership with the test runner's effective uid.
+    [ -z "$ROOT" ] || expected_owner="$(id -u)"
+    check_entry "$f" "installed rules file"
+    owner="$(stat -c %u -- "$f")"
+    perms="$(stat -c %a -- "$f")"
+    [ "$owner" = "$expected_owner" ] && [ "$perms" = "644" ] \
+        || die "installed rules file ${f} has unsafe metadata (uid ${owner}, mode ${perms}; expected uid ${expected_owner}, mode 644); refusing"
+}
+
 check_dir_trusted() {
     local d="$1" label="$2" owner perms
     if [ -L "$d" ]; then

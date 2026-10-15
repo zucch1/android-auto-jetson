@@ -306,6 +306,54 @@ class Rollback(unittest.TestCase):
         self.assertEqual((self.state / "manifest").read_bytes(), manifest_first)
         self.assertEqual(self.dst.read_bytes(), RULES_FILE.read_bytes())
 
+    def test_install_refuses_mode_drift_when_bytes_unchanged(self) -> None:
+        for mode in (0o666, 0o664, 0o600, 0o4644):
+            with self.subTest(mode=oct(mode)):
+                # Given
+                self.assertEqual(self.install().returncode, 0)
+                manifest = (self.state / "manifest").read_bytes()
+                self.dst.chmod(mode)
+                self.addCleanup(self.dst.chmod, 0o644)
+                # When
+                run = self.install()
+                # Then
+                self.assertEqual(run.returncode, 1,
+                                 "unsafe mode must not report success: " + run.stdout + run.stderr)
+                self.assertNotIn("already-installed", run.stdout)
+                self.assertEqual((self.state / "manifest").read_bytes(), manifest)
+                self.assertEqual(self.dst.stat().st_mode & 0o7777, mode)
+                self.dst.chmod(0o644)
+
+    @unittest.skipUnless(shutil.which("fakeroot"), "fakeroot required for foreign uid fixture")
+    def test_install_refuses_owner_drift_when_bytes_unchanged(self) -> None:
+        # Given: fakeroot supplies real stat/chown semantics without host privileges.
+        self.assertEqual(self.install().returncode, 0)
+        manifest = (self.state / "manifest").read_bytes()
+        # When
+        run = subprocess.run(
+            ["fakeroot", "bash", "-c",
+             'set -euo pipefail; chown 12345 "$1"; bash "$2"',
+             "metadata-test", str(self.dst), str(POLICY_DIR / "install.sh")],
+            env=self.env, capture_output=True, text=True, timeout=60)
+        # Then
+        self.assertEqual(run.returncode, 1,
+                         "unsafe owner must not report success: " + run.stdout + run.stderr)
+        self.assertNotIn("already-installed", run.stdout)
+        self.assertEqual((self.state / "manifest").read_bytes(), manifest)
+
+    def test_install_accepts_safe_metadata_when_bytes_unchanged(self) -> None:
+        # Given
+        self.assertEqual(self.install().returncode, 0)
+        original = self.dst.stat()
+        self.assertEqual(original.st_uid, os.geteuid())
+        self.assertEqual(original.st_mode & 0o7777, 0o644)
+        # When
+        run = self.install()
+        # Then
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("already-installed", run.stdout)
+        self.assertEqual(self.dst.stat().st_ino, original.st_ino)
+
     def test_rollback_restores_absent_state_exactly(self) -> None:
         self.assertEqual(self.install().returncode, 0)
         run = self.rollback()
