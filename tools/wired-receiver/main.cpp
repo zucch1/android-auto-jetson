@@ -196,6 +196,14 @@ class VideoOutlet final : public aa::protocol::MessageSink {
 class RouterSink final : public aa::protocol::MessageSink {
   public:
     explicit RouterSink(aa::audio::AudioRouter &router) : router_(router) {}
+    ~RouterSink() override { finish(); }
+
+    void finish() {
+        if (!finished_) {
+            emit_media_timing();
+            finished_ = true;
+        }
+    }
 
     [[nodiscard]] aa::core::Result<void>
     on_message(const aa::protocol::MessageView &message) override {
@@ -257,6 +265,7 @@ class RouterSink final : public aa::protocol::MessageSink {
 
     aa::audio::AudioRouter &router_;
     std::uint64_t chunks_{0};
+    bool finished_{false};
 };
 
 class InputQueue final {
@@ -535,6 +544,7 @@ int main(int argc, char **argv) {
         (void)session.apply(aa::session::Event::cleanup_finished);
     }
     video_outlet.close();
+    audio_sink.finish();
     router.value().close();
     input_server.value().close();
     video.value().close();
