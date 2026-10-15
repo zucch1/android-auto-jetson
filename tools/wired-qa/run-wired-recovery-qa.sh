@@ -210,9 +210,25 @@ log_since() {
     remote "tail -c +$(( $1 + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null" || true
 }
 
-retry_count() {
-    local log="${1:-/tmp/aa-wired-receiver.log}"
-    remote "grep -o '\"retries\":[0-9]*' ${log} 2>/dev/null | grep -o '[0-9]*' | sort -n | tail -1" || true
+# The receiver's run-cumulative reconnect-attempt counter ("retries":N).
+retries_total() {
+    remote "grep -o '\"retries\":[0-9]*' /tmp/aa-wired-receiver.log 2>/dev/null | grep -o '[0-9]*' | sort -n | tail -1" || true
+}
+
+# Per-disturbance retry delta (item 7): the attempts attributed to THIS
+# disturbance (counter after minus counter at the disturbance), never the
+# run-cumulative maximum. A counter that reset with a restarted receiver reads
+# as 0 for the pre-disturbance baseline and the delta counts the fresh log.
+retry_delta() {
+    local before="${1:-0}" after delta
+    after="$(retries_total)"
+    [[ "${before}" =~ ^[0-9]+$ ]] || before=0
+    [[ "${after}" =~ ^[0-9]+$ ]] || after=0
+    delta=$(( after - before ))
+    if (( delta < 0 )); then
+        delta=0
+    fi
+    printf '%s\n' "${delta}"
 }
 
 # ---- observed-evidence probes (gate P2: PASS requires OBSERVED evidence) ----
@@ -450,7 +466,7 @@ dip_attributed() {
 # + real media delivery. Anything unobservable is BLOCKED, never PASS.
 
 scenario_receiver_restart() {
-    local t0 t1 recovery offset
+    local t0 t1 recovery offset retries_before
     # The stack is already up and projecting (item 4 setup): this scenario only
     # disturbs it and restarts the receiver.
     if ! wait_projecting "${BUDGET_MS}"; then
@@ -473,26 +489,31 @@ scenario_receiver_restart() {
     # start_receiver launches with `> /tmp/aa-wired-receiver.log` (truncate):
     # the pre-restart offset points past EOF in the fresh log and would miss
     # genuine post-recovery media. The evidence window is the fresh log from
-    # byte 0 (N4).
+    # byte 0 (N4) and the retry baseline restarts with it (item 7).
     offset=0
+    retries_before="$(retries_total)"
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
+        if (( recovery > BUDGET_MS )); then
+            record receiver_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
+            return
+        fi
         if ! remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log 2>/dev/null && echo ok" >/dev/null 2>&1; then
-            record receiver_restart FAILED "${recovery}" "$(retry_count)" "session_active_not_observed" "no_active_event"
+            record receiver_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "session_active_not_observed" "no_active_event"
             return
         fi
         if media_evidence "${offset}"; then
-            record receiver_restart PASS "${recovery}" "$(retry_count)" "process_dip+active+frames+pump+input" "recovered"
+            record receiver_restart PASS "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+active+frames+pump+input" "recovered"
         else
-            record receiver_restart FAILED "${recovery}" "$(retry_count)" "process_dip+media_unobserved" "no_media_evidence_after_recovery"
+            record receiver_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+media_unobserved" "no_media_evidence_after_recovery"
         fi
     else
-        record receiver_restart FAILED "" "$(retry_count)" "not_recovered" "not_recovered_within_budget"
+        record receiver_restart FAILED "" "$(retry_delta "${retries_before}")" "not_recovered" "not_recovered_within_budget"
     fi
 }
 
 scenario_consumer_restart() {
-    local t0 t1 recovery offset
+    local t0 t1 recovery offset retries_before
     # The stack is already up and projecting (item 4 setup): this scenario only
     # disturbs it and restarts the display.
     wait_projecting "${BUDGET_MS}" || { record consumer_restart FAILED "" "" "" "no_initial_projection"; return; }
@@ -506,23 +527,29 @@ scenario_consumer_restart() {
     fi
     t0=$(date +%s%3N)
     offset="$(log_offset)"
+    retries_before="$(retries_total)"
     start_consumer || { record consumer_restart FAILED "" "" "" "restart_failed"; return; }
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
+        if (( recovery > BUDGET_MS )); then
+            record consumer_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
+            return
+        fi
         if media_evidence "${offset}"; then
-            record consumer_restart PASS "${recovery}" "$(retry_count)" "process_dip+frames+pump+input" "recovered"
+            record consumer_restart PASS "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+frames+pump+input" "recovered"
         else
-            record consumer_restart FAILED "${recovery}" "$(retry_count)" "process_dip+media_unobserved" "no_media_evidence_after_recovery"
+            record consumer_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+media_unobserved" "no_media_evidence_after_recovery"
         fi
     else
-        record consumer_restart FAILED "" "$(retry_count)" "not_recovered" "not_recovered_within_budget"
+        record consumer_restart FAILED "" "$(retry_delta "${retries_before}")" "not_recovered" "not_recovered_within_budget"
     fi
 }
 
 scenario_usb_unplug_replug() {
-    local t0 t1 recovery offset
+    local t0 t1 recovery offset retries_before
     wait_projecting "${BUDGET_MS}" || { record usb_unplug_replug FAILED "" "" "" "no_initial_projection"; return; }
     offset="$(log_offset)"
+    retries_before="$(retries_total)"
     if ! remote "sudo -n sh -c 'echo -n ${PORT_Q} > /sys/bus/usb/drivers/usb/unbind'" >/dev/null 2>&1; then
         record usb_unplug_replug BLOCKED "" "" "" "sysfs_unbind_requires_passwordless_sudo"
         return
@@ -537,25 +564,30 @@ scenario_usb_unplug_replug() {
     UNBOUND_PORT=""
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
+        if (( recovery > BUDGET_MS )); then
+            record usb_unplug_replug FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
+            return
+        fi
         if ! dip_observed "${offset}"; then
-            record usb_unplug_replug BLOCKED "${recovery}" "$(retry_count)" "dip_unobserved" "no_state_or_flow_dip_observed"
+            record usb_unplug_replug BLOCKED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unobserved" "no_state_or_flow_dip_observed"
             return
         fi
         if media_evidence "${offset}"; then
-            record usb_unplug_replug PASS "${recovery}" "$(retry_count)" "dip+frames+pump+input" "recovered_on_replug"
+            record usb_unplug_replug PASS "${recovery}" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_on_replug"
         else
-            record usb_unplug_replug FAILED "${recovery}" "$(retry_count)" "dip+media_unobserved" "no_media_evidence_after_recovery"
+            record usb_unplug_replug FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip+media_unobserved" "no_media_evidence_after_recovery"
         fi
     else
-        record usb_unplug_replug FAILED "" "$(retry_count)" "not_recovered" "not_recovered_within_budget"
+        record usb_unplug_replug FAILED "" "$(retry_delta "${retries_before}")" "not_recovered" "not_recovered_within_budget"
     fi
 }
 
 scenario_phone_lock_unlock() {
-    local t0 t1 recovery offset serial label
+    local t0 t1 recovery offset retries_before serial label
     wait_projecting "${BUDGET_MS}" || { record phone_lock_unlock FAILED "" "" "" "no_initial_projection"; return; }
     serial="$(stimulus_serial)" || { record phone_lock_unlock BLOCKED "" "" "" "stimulus_device_unattributed"; return; }
     offset="$(log_offset)"
+    retries_before="$(retries_total)"
     adb_stimulus "${serial}" "shell input keyevent 26" >/dev/null 2>&1 ||
         { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
     sleep 2
@@ -566,51 +598,60 @@ scenario_phone_lock_unlock() {
         { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
+        if (( recovery > BUDGET_MS )); then
+            record phone_lock_unlock FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
+            return
+        fi
         if ! dip_observed "${offset}"; then
-            record phone_lock_unlock BLOCKED "${recovery}" "$(retry_count)" "dip_unobserved" "no_state_or_flow_dip_observed"
+            record phone_lock_unlock BLOCKED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unobserved" "no_state_or_flow_dip_observed"
             return
         fi
         label="$(intended_phone_label)" || label=""
         if ! dip_attributed "${offset}" "${label}"; then
-            record phone_lock_unlock FAILED "${recovery}" "$(retry_count)" "dip_unattributed" "dip_not_attributed_to_intended_device"
+            record phone_lock_unlock FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unattributed" "dip_not_attributed_to_intended_device"
             return
         fi
         if media_evidence "${offset}"; then
-            record phone_lock_unlock PASS "${recovery}" "$(retry_count)" "dip+frames+pump+input" "recovered_after_unlock"
+            record phone_lock_unlock PASS "${recovery}" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_after_unlock"
         else
-            record phone_lock_unlock FAILED "${recovery}" "$(retry_count)" "dip+media_unobserved" "no_media_evidence_after_recovery"
+            record phone_lock_unlock FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip+media_unobserved" "no_media_evidence_after_recovery"
         fi
     else
-        record phone_lock_unlock FAILED "" "$(retry_count)" "not_recovered" "not_recovered_within_budget"
+        record phone_lock_unlock FAILED "" "$(retry_delta "${retries_before}")" "not_recovered" "not_recovered_within_budget"
     fi
 }
 
 scenario_phone_aa_restart() {
-    local t0 t1 recovery offset serial label
+    local t0 t1 recovery offset retries_before serial label
     wait_projecting "${BUDGET_MS}" || { record phone_aa_restart FAILED "" "" "" "no_initial_projection"; return; }
     serial="$(stimulus_serial)" || { record phone_aa_restart BLOCKED "" "" "" "stimulus_device_unattributed"; return; }
     offset="$(log_offset)"
+    retries_before="$(retries_total)"
     t0=$(date +%s%3N)
     adb_stimulus "${serial}" "shell am force-stop com.google.android.projection.gearhead" >/dev/null 2>&1 ||
         { record phone_aa_restart FAILED "" "" "" "stimulus_failed"; return; }
     if wait_projecting "${BUDGET_MS}"; then
         t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
+        if (( recovery > BUDGET_MS )); then
+            record phone_aa_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
+            return
+        fi
         if ! dip_observed "${offset}"; then
-            record phone_aa_restart BLOCKED "${recovery}" "$(retry_count)" "dip_unobserved" "no_state_or_flow_dip_observed"
+            record phone_aa_restart BLOCKED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unobserved" "no_state_or_flow_dip_observed"
             return
         fi
         label="$(intended_phone_label)" || label=""
         if ! dip_attributed "${offset}" "${label}"; then
-            record phone_aa_restart FAILED "${recovery}" "$(retry_count)" "dip_unattributed" "dip_not_attributed_to_intended_device"
+            record phone_aa_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unattributed" "dip_not_attributed_to_intended_device"
             return
         fi
         if media_evidence "${offset}"; then
-            record phone_aa_restart PASS "${recovery}" "$(retry_count)" "dip+frames+pump+input" "recovered_after_aa_restart"
+            record phone_aa_restart PASS "${recovery}" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_after_aa_restart"
         else
-            record phone_aa_restart FAILED "${recovery}" "$(retry_count)" "dip+media_unobserved" "no_media_evidence_after_recovery"
+            record phone_aa_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip+media_unobserved" "no_media_evidence_after_recovery"
         fi
     else
-        record phone_aa_restart FAILED "" "$(retry_count)" "not_recovered" "not_recovered_within_budget"
+        record phone_aa_restart FAILED "" "$(retry_delta "${retries_before}")" "not_recovered" "not_recovered_within_budget"
     fi
 }
 
@@ -741,7 +782,7 @@ write_result() {
                 "$(json_escape "$evidence")" "$(json_escape "$detail")"
         done < "${RESULTS_TSV}"
         printf '\n  ],\n'
-        printf '  "budget_note": "recovery_ms values are self-measured wall times and are UNMEASURED for budget purposes; the <=%s ms budget claim rests solely on each scenario bounded wait (the harness own timeout evidence)",\n' "$BUDGET_MS"
+        printf '  "budget_note": "recovery_ms is harness-measured wall time (disturbance -> observed recovery) and is ENFORCED against the <=%s ms budget on every PASS: a budget miss records FAILED, never PASS; the bounded waits bound the observations",\n' "$BUDGET_MS"
         printf '  "note": "%s"\n' "$(json_escape "${verdict_note}")"
         printf '}\n'
     } > "$OUT"

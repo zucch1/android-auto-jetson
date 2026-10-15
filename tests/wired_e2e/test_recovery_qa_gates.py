@@ -82,8 +82,12 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
     *'tail -c +'*aa-wired-receiver-attempt.log*) printf '%s' "${FAKE_ATTEMPT_LOG:-}"; exit 0 ;;
     *'tail -c +'*) printf '%s' "${FAKE_LOG_WINDOW:-}"; exit 0 ;;
     *aa-wired-receiver-attempt.log*) exit "${FAKE_ATTEMPT_RC:-3}" ;;
-    *'retries'*) printf '%s' "${FAKE_RETRIES:-1}"; exit 0 ;;
-    *busctl*) printf '%s' "${FAKE_STATE:-string \"projecting\"}"; exit 0 ;;
+    *'retries'*)
+        n="$(cat "${FAKE_SSH_STATE:-/tmp}/retries_n" 2>/dev/null || echo 0)"
+        n=$((n+1)); mkdir -p "${FAKE_SSH_STATE:-/tmp}"; echo "$n" > "${FAKE_SSH_STATE:-/tmp}/retries_n"
+        printf '%s' "$(( ${FAKE_RETRIES_BASE:-${FAKE_RETRIES:-1}} + ${FAKE_RETRIES_STEP:-0} * (n-1) ))"
+        exit 0 ;;
+    *busctl*) [ -n "${FAKE_STATE_DELAY:-}" ] && sleep "${FAKE_STATE_DELAY}"; printf '%s' "${FAKE_STATE:-string \"projecting\"}"; exit 0 ;;
     # pgrep -f REAL matching semantics: the remote command line contains the
     # pattern (the harness quotes it into the ssh command), so pgrep -f matches
     # its own wrapper shell and ALWAYS reports alive. Death verification that
@@ -395,6 +399,30 @@ class RecoveryQaGates(unittest.TestCase):
             binds = [line for line in logged.splitlines() if "drivers/usb/bind" in line]
             self.assertGreaterEqual(len(binds), 2, logged)
 
+    # ---- item 7: recovery_ms is ENFORCED against the budget on PASS and
+    #      retries are the per-disturbance delta, not the cumulative maximum ----
+    def test_recovery_budget_miss_is_failed(self):
+        status = '{"event":"status","frames_painted":7,"render_ok":true}'
+        code, doc = self.run_qa(["--only", "consumer_restart"],
+                                FAKE_STATE_DELAY="1", BUDGET_MS="300",
+                                FAKE_DISPLAY_STATUS=status,
+                                FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["consumer_restart"]["detail"], "recovery_exceeded_budget")
+        self.assertGreater(rows["consumer_restart"]["recovery_ms"], 300)
+
+    def test_retry_count_is_per_disturbance_delta(self):
+        status = '{"event":"status","frames_painted":7,"render_ok":true}'
+        code, doc = self.run_qa(["--only", "consumer_restart"],
+                                FAKE_RETRIES_BASE="2", FAKE_RETRIES_STEP="3",
+                                FAKE_DISPLAY_STATUS=status,
+                                FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
+        self.assertEqual(code, 0, doc)
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["consumer_restart"]["retries"], 3)
+
     def test_consumer_restart_requires_process_death(self):
         code, doc = self.run_qa(["--only", "consumer_restart"], FAKE_DISP_ALIVE="1")
         self.assertNotEqual(code, 0, doc)
@@ -531,11 +559,12 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertTrue(doc.get("host"), doc)
         self.assertTrue(str(doc["host"]).startswith("sha256:"), doc["host"])
 
-    def test_budget_claim_is_labelled_unmeasured(self):
+    def test_budget_claim_is_labelled_enforced(self):
         code, doc = self.run_qa(["--readiness-only"])
         self.assertEqual(code, 0, doc)
-        self.assertIn("UNMEASURED", doc["budget_note"])
-        self.assertIn("bounded wait", doc["budget_note"])
+        self.assertIn("ENFORCED", doc["budget_note"])
+        self.assertIn("5000", doc["budget_note"])
+        self.assertIn("FAILED", doc["budget_note"])
 
     def test_display_started_with_real_test_control_flag(self):
         status = '{"event":"status","frames_painted":3,"render_ok":true}'
