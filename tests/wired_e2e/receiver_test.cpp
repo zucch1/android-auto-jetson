@@ -68,7 +68,7 @@ runtime_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport:
 
 std::unique_ptr<aa::transport::HandshakingCipher>
 runtime_cipher(const std::function<bool()> &)
-    asm("__wrap__ZN2aa9transport28make_server_handshake_cipherERKSt8functionIFbvEE");
+    asm("__wrap__ZN2aa9transport28make_client_handshake_cipherERKSt8functionIFbvEE");
 std::unique_ptr<aa::transport::HandshakingCipher>
 runtime_cipher(const std::function<bool()> &) {
     return std::make_unique<wiredtest::FakeHandshakeCipher>();

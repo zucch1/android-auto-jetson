@@ -91,7 +91,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_compile_definitions(aa_wired_e2e_test PRIVATE AA_WIRED_HAS_AUDIO_ROUTER=1)
     target_link_options(aa_wired_e2e_test PRIVATE
         "-Wl,--wrap=_ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineE"
-        "-Wl,--wrap=_ZN2aa9transport28make_server_handshake_cipherERKSt8functionIFbvEE"
+        "-Wl,--wrap=_ZN2aa9transport28make_client_handshake_cipherERKSt8functionIFbvEE"
         "-Wl,--wrap=_ZN2aa5audio6detail17open_default_sinkERKNS1_15SinkOpenRequestE")
     list(APPEND AA_WIRED_WARN_TARGETS aa_wired_e2e_test)
 endif()
