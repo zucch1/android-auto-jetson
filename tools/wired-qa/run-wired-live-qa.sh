@@ -160,18 +160,51 @@ fi
 # and requests projection. Both run under a bounded ssh; logs are captured on the
 # target under /tmp for later retrieval (redaction applied before export).
 start_ms="$(date +%s%3N)"
-remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!" >/tmp/aa-recv.pid
-remote "nohup $(shq "$DISPLAY") --test-only-autostart > /tmp/aa-wired-display.log 2>&1 & echo \$!" >/tmp/aa-disp.pid
+receiver_pid=""; display_pid=""
+teardown() {
+    local pid
+    for pid in "$display_pid" "$receiver_pid"; do
+        [[ -z "$pid" ]] && continue
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+        remote "kill $pid 2>/dev/null || true; for n in \$(seq 1 20); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; kill -KILL $pid 2>/dev/null || true; sleep 0.1; ! kill -0 $pid 2>/dev/null" || return 1
+    done
+    receiver_pid=""; display_pid=""
+}
+on_exit() {
+    local code=$?
+    trap - EXIT
+    teardown || code=4
+    exit "$code"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+receiver_pid="$(remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!")"
+display_pid="$(remote "nohup $(shq "$DISPLAY") --test-only-autostart > /tmp/aa-wired-display.log 2>&1 & echo \$!")"
 
 projection="false"
-deadline=$(( $(date +%s%3N) + PROJECTION_TIMEOUT_MS ))
+session_active="false"; video="false"; audio="false"; input="false"
+deadline=$(( start_ms + PROJECTION_TIMEOUT_MS ))
+poll_remote() {
+    local remaining=$((deadline - $(date +%s%3N)))
+    ((remaining > 0)) || return 1
+    timeout "$(printf '%d.%03d' "$((remaining / 1000))" "$((remaining % 1000))")" \
+        ssh "${SSH_OPTS[@]}" "$HOST" "$REMOTE_SESSION_ENV" "$@"
+}
 while (( $(date +%s%3N) < deadline )); do
-    state="$(remote "busctl --user call org.custom.AndroidAutoReceiver /org/custom/AndroidAutoReceiver org.custom.AndroidAutoReceiver1 GetState 2>/dev/null" || true)"
+    state="$(poll_remote "busctl --user call org.custom.AndroidAutoReceiver /org/custom/AndroidAutoReceiver org.custom.AndroidAutoReceiver1 GetState 2>/dev/null" || true)"
     if [[ "$state" == *"projecting"* ]]; then
         projection="true"
+    fi
+    poll_remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && session_active="true"
+    poll_remote "grep -q '\"event\":\"video_sent\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && video="true"
+    poll_remote "grep -q '\"event\":\"audio_chunks\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && audio="true"
+    poll_remote "grep -q '\"event\":\"input_forwarded\",\"ok\":\"true\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && input="true"
+    if [[ "$projection" == true && "$session_active" == true && "$video" == true && "$audio" == true && "$input" == true ]]; then
         break
     fi
-    sleep 1
+    sleep 0.05
 done
 budget_ms=$(( $(date +%s%3N) - start_ms ))
 
@@ -179,20 +212,10 @@ budget_ms=$(( $(date +%s%3N) - start_ms ))
 # string (the control service can reach `projecting` before a phone session is
 # active). The receiver emits its `active` event only when the session state
 # machine reaches State::active, so that is the session-activation signal.
-session_active="false"
-if [[ "$projection" == "true" ]]; then
-    remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && session_active="true"
+if ! teardown; then
+    write_result "FAILED" "teardown_failed" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 4
 fi
-
-video="false"; audio="false"; input="false"
-if [[ "$session_active" == "true" ]]; then
-    remote "grep -q video_sent /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && video="true"
-    remote "grep -q audio_chunks /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && audio="true"
-    remote "grep -q input_forwarded /tmp/aa-wired-receiver.log && echo ok" >/dev/null 2>&1 && input="true"
-fi
-
-# Best-effort bounded teardown.
-remote "kill \$(cat /tmp/aa-disp.pid) 2>/dev/null || true; kill \$(cat /tmp/aa-recv.pid) 2>/dev/null || true" || true
 
 # Verdict taxonomy: a missing prerequisite is BLOCKED; the session running but
 # failing to project / activate / deliver every observable is FAILED. PASS
