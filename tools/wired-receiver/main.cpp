@@ -469,7 +469,11 @@ int main(int argc, char **argv) {
     log_line("{\"event\":\"ready\",\"state\":\"negotiating\"}");
 
     InputQueue input_queue;
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+    ObservedSessionMutex session_mutex;
+#else
     std::mutex session_mutex;
+#endif
     std::atomic<std::int64_t> active_ms{-1};
     std::atomic<bool> session_failed{false};
     bool runtime_failed = false;
@@ -626,6 +630,12 @@ int main(int argc, char **argv) {
         session.tick();
         if (session.state() == aa::session::State::stopping) {
             (void)session.apply(aa::session::Event::cleanup_finished);
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+            if (shutdown_observation) {
+                shutdown_observation->reset_finished(
+                    session.state() == aa::session::State::disconnected);
+            }
+#endif
         }
         link->transport->set_io_checkpoint({});
         control.close();
@@ -672,7 +682,25 @@ int main(int argc, char **argv) {
     }
 
     g_running.store(false);
-    session.request_stop();
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+    if (shutdown_observation) {
+        shutdown_observation->published_false();
+    }
+#endif
+    {
+        const std::lock_guard lock(session_mutex);
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+        if (shutdown_observation) {
+            shutdown_observation->main_stop();
+        }
+#endif
+        session.request_stop();
+    }
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+    if (shutdown_observation) {
+        shutdown_observation->main_join();
+    }
+#endif
     session_thread.join();
     input_thread.join();
 

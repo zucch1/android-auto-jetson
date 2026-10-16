@@ -1,14 +1,170 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exercise the actual harness adapters, not copies of their logging logic.
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+// This state is private to the actual-main test inclusion. No callback registry
+// lock is involved, and lock() never waits on the real mutex with state held.
+struct ShutdownObservation {
+    using Clock = std::chrono::steady_clock;
+    struct Event {
+        std::string name;
+        std::thread::id thread;
+    };
+    std::mutex state;
+    std::condition_variable cv;
+    std::vector<Event> trace;
+    std::thread::id owner;
+    std::thread::id dispatcher;
+    std::thread::id reset_owner;
+    Clock::time_point published_at{};
+    bool published = false;
+    bool receive_held = false;
+    bool release_receive = false;
+    bool release_main = false;
+    bool cleanup_held = false;
+    bool release_cleanup = false;
+    bool main_attempt = false;
+    bool unprotected_stop = false;
+    bool unprotected_during_cleanup = false;
+    bool stop_owned = false;
+    bool join_owned = false;
+    bool reset_ok = false;
+    bool gate_failed = false;
+    bool closed = false;
+    int resets = 0;
+    int stops = 0;
+    int joins = 0;
+    int pings = 0;
+    int replies = 0;
+    int final_receives = 0;
+    int post_close_io = 0;
+
+    void record(const char *name) {
+        trace.push_back({name, std::this_thread::get_id()});
+        cv.notify_all();
+    }
+    void release_all() {
+        release_receive = release_main = release_cleanup = true;
+        cv.notify_all();
+    }
+    template <class Predicate>
+    bool wait(std::unique_lock<std::mutex> &lock, Predicate predicate) {
+        if (cv.wait_for(lock, std::chrono::seconds{2}, predicate)) {
+            return true;
+        }
+        gate_failed = true;
+        release_all();
+        return false;
+    }
+    void published_false() {
+        std::unique_lock lock(state);
+        dispatcher = std::this_thread::get_id();
+        published_at = Clock::now();
+        published = true;
+        record("false");
+        (void)wait(lock, [&] { return release_main; });
+    }
+    void main_stop() {
+        std::unique_lock lock(state);
+        ++stops;
+        stop_owned = owner == std::this_thread::get_id();
+        if (!stop_owned) {
+            unprotected_stop = true;
+            unprotected_during_cleanup = cleanup_held && owner == reset_owner;
+            record("MAIN_STOP_WITHOUT_SESSION_MUTEX");
+            // The mutant proves the invariant violation, never a data race.
+            // Release all gates on failure; do not access the source until reset.
+            if (!wait(lock, [&] { return resets == 1; }) &&
+                !wait(lock, [&] { return resets == 1; })) {
+                std::abort();
+            }
+        }
+        record("stop");
+    }
+    void main_join() {
+        const std::lock_guard lock(state);
+        ++joins;
+        join_owned = owner == std::this_thread::get_id();
+        record("join");
+    }
+    void reset_finished(bool ok) {
+        const std::lock_guard lock(state);
+        ++resets;
+        reset_ok = ok && owner == std::this_thread::get_id();
+        record("reset");
+    }
+    void io() {
+        const std::lock_guard lock(state);
+        if (closed) {
+            ++post_close_io;
+        }
+    }
+    void cleanup_close() {
+        std::unique_lock lock(state);
+        closed = true;
+        cleanup_held = true;
+        reset_owner = std::this_thread::get_id();
+        record("close");
+        (void)wait(lock, [&] { return release_cleanup; });
+        cleanup_held = false;
+    }
+};
+ShutdownObservation *shutdown_observation = nullptr;
+
+class ObservedSessionMutex {
+  public:
+    void lock() {
+        if (shutdown_observation) {
+            const std::lock_guard lock(shutdown_observation->state);
+            if (shutdown_observation->published &&
+                shutdown_observation->dispatcher == std::this_thread::get_id()) {
+                shutdown_observation->main_attempt = true;
+            }
+            shutdown_observation->record("attempt");
+        }
+        mutex_.lock();
+        if (shutdown_observation) {
+            const std::lock_guard lock(shutdown_observation->state);
+            shutdown_observation->owner = std::this_thread::get_id();
+            shutdown_observation->record("acquire");
+        }
+    }
+    void unlock() {
+        if (shutdown_observation) {
+            const std::lock_guard lock(shutdown_observation->state);
+            shutdown_observation->record("release");
+            shutdown_observation->owner = {};
+            mutex_.unlock();
+        } else {
+            mutex_.unlock();
+        }
+    }
+  private:
+    std::mutex mutex_;
+};
+} // namespace
+
+#define AA_WIRED_RECEIVER_SHUTDOWN_TEST
 #define main wired_receiver_main
 #include "../../tools/wired-receiver/main.cpp" // NOLINT(bugprone-suspicious-include)
 #undef main
+#undef AA_WIRED_RECEIVER_SHUTDOWN_TEST
 
 #include "harness.hpp"
 #include "../trust/syscall_faults.hpp"
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
 #include <gtest/gtest.h>
 #include <condition_variable>
+#include <fstream>
+#include <iterator>
+#include <pthread.h>
 #include <unistd.h>
 
 namespace {
@@ -33,14 +189,33 @@ class RuntimeTransport final : public aa::transport::Transport {
     }
     aa::transport::Kind kind() const noexcept override { return aa::transport::Kind::usb_aoa; }
     aa::core::Result<void> open(aa::core::CancellationToken token) override {
+        if (shutdown_observation) {
+            shutdown_observation->io();
+        }
         token_ = token;
         return {};
     }
-    aa::core::Result<void> send(std::span<const std::byte>) override { return {}; }
+    aa::core::Result<void> send(std::span<const std::byte> bytes) override {
+        if (shutdown_observation) {
+            shutdown_observation->io();
+            // Pings use plain framing. Match the complete valid response, not
+            // merely an arbitrary send during startup.
+            const auto reply = wiredtest::control_frame(
+                aa::protocol::encode(aa::protocol::PingResponse{1, {}}).value());
+            if (std::equal(bytes.begin(), bytes.end(), reply.begin(), reply.end())) {
+                const std::lock_guard lock(shutdown_observation->state);
+                ++shutdown_observation->replies;
+            }
+        }
+        return {};
+    }
     void set_io_checkpoint(std::function<void()> checkpoint) override {
         checkpoint_ = std::move(checkpoint);
     }
     aa::core::Result<std::vector<std::byte>> receive() override {
+        if (shutdown_observation) {
+            shutdown_observation->io();
+        }
         {
             const std::lock_guard lock(runtime_owner_mutex);
             runtime_io_owner = std::this_thread::get_id();
@@ -50,6 +225,21 @@ class RuntimeTransport final : public aa::transport::Transport {
         }
         if (next_ < frames_.size()) {
             return frames_[next_++];
+        }
+        if (shutdown_observation) {
+            std::unique_lock lock(shutdown_observation->state);
+            if (shutdown_observation->pings == 3) {
+                shutdown_observation->receive_held = true;
+                shutdown_observation->record("receive-held");
+                (void)shutdown_observation->wait(lock, [&] {
+                    return shutdown_observation->release_receive;
+                });
+                ++shutdown_observation->final_receives;
+                shutdown_observation->record("final-receive");
+            }
+            ++shutdown_observation->pings;
+            return wiredtest::control_frame(
+                aa::protocol::encode(aa::protocol::PingRequest{1, {}}).value());
         }
         if (drops_ && !runtime_quiet) {
             return aa::Error{aa::ErrorCode::transport_closed};
@@ -69,7 +259,12 @@ class RuntimeTransport final : public aa::transport::Transport {
         close();
         return aa::Error{aa::ErrorCode::cancelled};
     }
-    void close() noexcept override { runtime_closed.store(true); }
+    void close() noexcept override {
+        if (shutdown_observation) {
+            shutdown_observation->cleanup_close();
+        }
+        runtime_closed.store(true);
+    }
   private:
     bool drops_;
     std::size_t next_{};
@@ -195,6 +390,172 @@ TEST(WiredReceiver, PermanentLinkLossExitsNonzeroWithinWiredRecoveryBudget) {
     EXPECT_GE(runtime_connects.load(), 3);
     EXPECT_EQ(runtime_ciphers.load(), 1);
     EXPECT_LT(result.elapsed, std::chrono::milliseconds{5500});
+}
+
+TEST(WiredReceiver, ActiveFramesShutdownOrdersStopAndReset) {
+    namespace faults = aa::trust::test::faults;
+    for (const int stimulus : {0, SIGINT, SIGTERM}) {
+        SCOPED_TRACE(stimulus == 0 ? "duration" : stimulus == SIGINT ? "SIGINT" : "SIGTERM");
+        char directory[] = "/tmp/wired-shutdown-runtime-XXXXXX";
+        const std::filesystem::path root{::mkdtemp(directory)};
+        const auto path = root / "approved.json";
+        aa::trust::ApprovedPhoneStore initial{path};
+        ASSERT_TRUE(initial.load().has_value());
+        const aa::trust::WiredIdentity identity{
+            "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+        ASSERT_TRUE(initial.approve(aa::trust::TransportIdentity{identity}).has_value());
+        const auto read_store = [&] {
+            std::ifstream file(path);
+            return std::string(std::istreambuf_iterator<char>{file}, {});
+        };
+        const auto store_before = read_store();
+        runtime_phone = aa::app::wired_phone_identity(identity).value();
+        runtime_quiet = false;
+        runtime_recovers = false;
+        runtime_connects.store(0);
+        runtime_ciphers.store(0);
+        runtime_closed.store(false);
+        g_running.store(true);
+        ShutdownObservation observed;
+        shutdown_observation = &observed;
+        std::atomic<int> mutations{0};
+        faults::arm(faults::Fault::none);
+        faults::set_observer([&] { ++mutations; });
+        std::vector<std::string> args{"receiver", "--port", "1-2.1", "--store", path.string(),
+            "--video-socket", (root / "video").string(), "--input-socket", (root / "input").string(),
+            "--duration-ms", stimulus == 0 ? "1000" : "0"};
+        std::vector<char *> argv;
+        argv.reserve(args.size());
+        for (auto &arg : args) {
+            argv.push_back(arg.data());
+        }
+        testing::internal::CaptureStdout();
+        const auto began = ShutdownObservation::Clock::now();
+        int code = -1;
+        std::thread receiver([&] {
+            code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+        });
+        std::atomic<bool> watchdog_fired{false};
+        std::jthread watchdog([&](const std::stop_token &stop) {
+            std::mutex mutex;
+            std::condition_variable_any cv;
+            std::unique_lock lock(mutex);
+            cv.wait_for(lock, stop, std::chrono::seconds{5}, [] { return false; });
+            if (!stop.stop_requested()) {
+                watchdog_fired.store(true);
+                g_running.store(false);
+                const std::lock_guard state_lock(observed.state);
+                observed.release_all();
+            }
+        });
+        bool traffic = false;
+        bool publication = false;
+        bool cleanup = false;
+        bool challenge = false;
+        int signal_result = -1;
+        {
+            std::unique_lock lock(observed.state);
+            traffic = observed.wait(lock, [&] { return observed.receive_held; });
+            if (stimulus != 0 && traffic) {
+                signal_result = ::pthread_kill(receiver.native_handle(), stimulus);
+            }
+            publication = observed.wait(lock, [&] { return observed.published; });
+            observed.release_receive = true;
+            observed.cv.notify_all();
+            cleanup = observed.wait(lock, [&] { return observed.cleanup_held; });
+            observed.release_main = true;
+            observed.cv.notify_all();
+            challenge = observed.wait(lock, [&] {
+                return observed.main_attempt || observed.unprotected_stop;
+            });
+            observed.release_cleanup = true;
+            observed.cv.notify_all();
+        }
+        receiver.join();
+        const auto ended = ShutdownObservation::Clock::now();
+        watchdog.request_stop();
+        watchdog.join();
+        const auto output = testing::internal::GetCapturedStdout();
+        faults::set_observer({});
+        faults::disarm();
+        shutdown_observation = nullptr;
+        EXPECT_TRUE(traffic);
+        EXPECT_TRUE(publication);
+        EXPECT_TRUE(cleanup);
+        EXPECT_TRUE(challenge);
+        EXPECT_FALSE(observed.gate_failed);
+        EXPECT_FALSE(watchdog_fired.load());
+        if (stimulus == 0) {
+            EXPECT_GE(observed.published_at - began, std::chrono::milliseconds{1000});
+        } else {
+            EXPECT_EQ(signal_result, 0);
+        }
+        EXPECT_EQ(observed.pings, 4);
+        EXPECT_EQ(observed.replies, 4);
+        EXPECT_EQ(observed.final_receives, 1);
+        EXPECT_EQ(observed.resets, 1);
+        EXPECT_TRUE(observed.reset_ok);
+        EXPECT_EQ(observed.stops, 1);
+        EXPECT_EQ(observed.joins, 1);
+        EXPECT_NE(observed.reset_owner, observed.dispatcher);
+        EXPECT_FALSE(observed.unprotected_stop) << "MAIN_STOP_WITHOUT_SESSION_MUTEX";
+        if (observed.unprotected_stop) {
+            EXPECT_TRUE(observed.unprotected_during_cleanup);
+        } else {
+            EXPECT_TRUE(observed.stop_owned) << "MAIN_STOP_WITHOUT_SESSION_MUTEX";
+            const auto position = [&](const char *name, std::thread::id thread,
+                                      std::size_t after = 0) {
+                for (auto i = after; i < observed.trace.size(); ++i) {
+                    if (observed.trace[i].name == name && observed.trace[i].thread == thread) {
+                        return i;
+                    }
+                }
+                return observed.trace.size();
+            };
+            const auto reset = position("reset", observed.reset_owner);
+            const auto release = position("release", observed.reset_owner, reset + 1);
+            const auto acquire = position("acquire", observed.dispatcher, release + 1);
+            const auto stop = position("stop", observed.dispatcher, acquire + 1);
+            const auto unlock = position("release", observed.dispatcher, stop + 1);
+            const auto join = position("join", observed.dispatcher, unlock + 1);
+            EXPECT_LT(reset, release);
+            EXPECT_LT(release, acquire);
+            EXPECT_LT(acquire, stop);
+            EXPECT_LT(stop, unlock);
+            EXPECT_LT(unlock, join);
+            EXPECT_LT(join, observed.trace.size());
+        }
+        EXPECT_FALSE(observed.join_owned);
+        EXPECT_LT(ended - observed.published_at, std::chrono::seconds{3});
+        EXPECT_EQ(code, 0) << output;
+        EXPECT_EQ(runtime_connects.load(), 1);
+        EXPECT_EQ(runtime_ciphers.load(), 1);
+        EXPECT_TRUE(runtime_closed.load());
+        EXPECT_EQ(observed.post_close_io, 0);
+        EXPECT_EQ(mutations.load(), 0);
+        EXPECT_EQ(read_store(), store_before);
+        aa::trust::ApprovedPhoneStore persisted{path};
+        EXPECT_TRUE(persisted.load().has_value());
+        EXPECT_EQ(persisted.lookup(runtime_phone), aa::trust::Decision::approved);
+        const auto active = output.find("\"to_state\":\"active\"");
+        const auto stopping = output.find("\"to_state\":\"stopping\"", active);
+        const auto disconnected = output.find("\"to_state\":\"disconnected\"", stopping);
+        EXPECT_NE(active, std::string::npos) << output;
+        EXPECT_NE(stopping, std::string::npos) << output;
+        EXPECT_NE(disconnected, std::string::npos) << output;
+        EXPECT_LT(active, stopping);
+        EXPECT_LT(stopping, disconnected);
+        EXPECT_EQ(output.find("\"to_state\":\"reconnecting\""), std::string::npos) << output;
+        EXPECT_EQ(output.find("\"to_state\":\"failed\""), std::string::npos) << output;
+        EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+        std::printf("G1 stimulus=%s pings=%d replies=%d final_receive=%d resets=%d "
+                    "stop_owned=%d join_owned=%d gate_failed=%d watchdog=%d\n",
+                    stimulus == 0 ? "duration" : stimulus == SIGINT ? "SIGINT" : "SIGTERM",
+                    observed.pings, observed.replies, observed.final_receives, observed.resets,
+                    observed.stop_owned, observed.join_owned, observed.gate_failed,
+                    watchdog_fired.load());
+        std::filesystem::remove_all(root);
+    }
 }
 
 TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
