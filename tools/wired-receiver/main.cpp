@@ -444,10 +444,23 @@ int main(int argc, char **argv) {
         return true;
     };
 
-    auto first_link = aa::app::open_wired_link(selector, accessory, store);
+    aa::trust::WiredIdentity attempted_identity{};
+    auto first_link = aa::app::open_wired_link(selector, accessory, store, {}, &attempted_identity);
     if (!first_link.has_value()) {
-        log_line(std::string{"{\"event\":\"err\",\"detail\":\"link\",\"code\":\""} +
-                 std::string{aa::to_string(first_link.error().code())} + "\"}");
+        // ADDITIVE attribution at admission rejection (item 2): the link-error
+        // record names the rejected attempt's identity+port. The identity is
+        // pseudonymized (trust::redacted_label) and the fields only appear when
+        // admission actually refused a captured identity; the existing fields
+        // (event/detail/code) are unchanged.
+        std::string line = std::string{"{\"event\":\"err\",\"detail\":\"link\",\"code\":\""} +
+                          std::string{aa::to_string(first_link.error().code())} + "\"";
+        if (!attempted_identity.port_context.empty()) {
+            line += ",\"phone_id\":\"" +
+                    aa::trust::redacted_label(aa::trust::TransportIdentity{attempted_identity}) +
+                    "\",\"port\":\"" + attempted_identity.port_context + "\"";
+        }
+        line += "}";
+        log_line(line);
         return 3;
     }
     std::optional<aa::app::WiredLink> link{std::move(first_link.value())};

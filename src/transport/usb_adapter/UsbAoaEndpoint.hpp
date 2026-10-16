@@ -74,10 +74,13 @@ class UsbAoaEndpoint final : public ByteEndpoint {
 // through the owned `factory`, identity capture, admission, bulk claim.
 // Exposed for tests that drive a scripted factory; the returned link carries
 // the full connection record (endpoint + identity + snapshots + switch report).
+// `attempted_identity` (optional) receives the captured identity when admission
+// REFUSES it - the rejected attempt's identity, for log attribution.
 [[nodiscard]] core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
                                                    const UsbDeviceSelector &selector,
                                                    const AoaAccessoryInfo &info,
-                                                    const WiredAdmission &admit,
-                                                    const core::Deadline &deadline = {});
+                                                   const WiredAdmission &admit,
+                                                   const core::Deadline &deadline = {},
+                                                   trust::WiredIdentity *attempted_identity = nullptr);
 
 } // namespace aa::transport::usb_adapter

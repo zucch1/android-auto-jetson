@@ -130,8 +130,9 @@ TEST(UsbAoaIdentity, UnknownPhoneIsRejectedAfterSuccessfulAoaSwitch) {
     factory->phone.manufacturer = "OTHER";
     factory->phone.product = "OTHER_Model";
 
+    aa::trust::WiredIdentity attempted{};
     auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
-                                tr::AoaAccessoryInfo{}, tr::admit_via(store));
+                                tr::AoaAccessoryInfo{}, tr::admit_via(store), &attempted);
 
     // The AOA switch still succeeded - success is never trust. Observations
     // come from the test-owned block: the pipeline destroyed its factory here.
@@ -139,6 +140,31 @@ TEST(UsbAoaIdentity, UnknownPhoneIsRejectedAfterSuccessfulAoaSwitch) {
     EXPECT_GE(state->calls().size(), 8u);
     ASSERT_FALSE(link.has_value());
     EXPECT_EQ(link.error().code(), ErrorCode::transport_unauthorized_peer);
+    // Item 2 attribution: the rejected attempt's identity+port are surfaced at
+    // admission rejection so the receiver can attribute the link-error record.
+    EXPECT_EQ(attempted.port_context, "1-2.1");
+    EXPECT_EQ(attempted.usb_serial, "TEST-SERIAL-OTHER");
+    EXPECT_EQ(attempted.usb_product_id, "9999");
+    const std::string rejected_label =
+        aa::trust::redacted_label(aa::trust::TransportIdentity{attempted});
+    const std::string approved_label =
+        aa::trust::redacted_label(aa::trust::TransportIdentity{approved_record()});
+    EXPECT_NE(rejected_label, approved_label);
+    EXPECT_EQ(rejected_label.find("TEST-SERIAL-OTHER"), std::string::npos);
+}
+
+TEST(UsbAoaIdentity, AdmissionSuccessLeavesAttemptedIdentityEmpty) {
+    MapTrustStore store;
+    ASSERT_TRUE(store.approve_once(phone_of(approved_record())).has_value());
+    auto state = std::make_shared<fx::LinkState>();
+    auto factory = std::make_unique<fx::FakeLinkFactory>(state);
+
+    aa::trust::WiredIdentity attempted{};
+    auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
+                                tr::AoaAccessoryInfo{}, tr::admit_via(store), &attempted);
+    ASSERT_TRUE(link.has_value());
+    EXPECT_TRUE(attempted.port_context.empty());
+    EXPECT_TRUE(attempted.usb_serial.empty());
 }
 
 TEST(UsbAoaIdentity, RejectedPhoneStaysUntrusted) {

@@ -228,10 +228,24 @@ core::Result<void> admit_wired_identity(const trust::WiredIdentity &identity,
 }
 
 core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
-                                      const UsbDeviceSelector &selector,
-                                      const AoaAccessoryInfo &info, const WiredAdmission &admit,
-                                      const core::Deadline &deadline) {
-    auto endpoint = UsbAoaEndpoint::make(std::move(factory), selector, info, admit);
+                                     const UsbDeviceSelector &selector,
+                                     const AoaAccessoryInfo &info, const WiredAdmission &admit,
+                                     const core::Deadline &deadline,
+                                     trust::WiredIdentity *attempted_identity) {
+    // The admission callback is the one seam that sees the CAPTURED identity of
+    // a refused attempt: record it there so callers can attribute the rejection
+    // (additive out-param; the admission decision itself is unchanged).
+    WiredAdmission observed = admit;
+    if (attempted_identity != nullptr) {
+        observed = [&admit, attempted_identity](const trust::WiredIdentity &identity) {
+            const bool admitted = admit ? admit(identity) : false;
+            if (!admitted) {
+                *attempted_identity = identity;
+            }
+            return admitted;
+        };
+    }
+    auto endpoint = UsbAoaEndpoint::make(std::move(factory), selector, info, std::move(observed));
     if (!endpoint) {
         return endpoint.error();
     }
@@ -263,7 +277,8 @@ WiredAdmission admit_via(const trust::TrustStore &store) {
 core::Result<UsbAoaLink> connect_usb_aoa(const UsbDeviceSelector &selector,
                                           const AoaAccessoryInfo &info,
                                           const WiredAdmission &admit,
-                                          const core::Deadline &deadline) {
+                                          const core::Deadline &deadline,
+                                          trust::WiredIdentity *attempted_identity) {
     if (auto checked = deadline.check(); !checked) {
         return checked.error();
     }
@@ -271,7 +286,8 @@ core::Result<UsbAoaLink> connect_usb_aoa(const UsbDeviceSelector &selector,
     if (!world) {
         return world.error();
     }
-    return usb_adapter::connect_aoa(std::move(world.value()), selector, info, admit, deadline);
+    return usb_adapter::connect_aoa(std::move(world.value()), selector, info, admit, deadline,
+                                    attempted_identity);
 }
 
 core::Result<std::unique_ptr<ByteEndpoint>>
