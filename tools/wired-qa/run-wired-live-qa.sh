@@ -199,12 +199,16 @@ while (( $(date +%s%3N) < deadline )); do
         projection="true"
     fi
     poll_remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && session_active="true"
-    status="$(poll_remote "printf 'status\n' > /tmp/aa-disp.in 2>/dev/null; grep '\"event\":\"status\"' /tmp/aa-wired-display.log 2>/dev/null | tail -1" || true)"
-    if [[ "$status" =~ \"frames_painted\":([0-9]+) ]] && ((BASH_REMATCH[1] > 0)) && [[ "$status" == *'"render_ok":true'* ]]; then
-        poll_remote "grep -q '\"event\":\"video_sent\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && video="true"
+    if poll_remote "grep -q '\"event\":\"video_sent\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1; then
+        status="$(poll_remote "printf 'status\n' > /tmp/aa-disp.in 2>/dev/null; grep '\"event\":\"status\"' /tmp/aa-wired-display.log 2>/dev/null | tail -1" || true)"
+        if [[ "$status" =~ \"frames_painted\":([0-9]+) ]] && ((BASH_REMATCH[1] > 0)) && [[ "$status" == *'"render_ok":true'* ]]; then
+            video="true"
+        fi
     fi
     poll_remote "grep -q '\"event\":\"media_timing\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && audio="true"
-    poll_remote "printf 'key a press\nkey a release\n' > /tmp/aa-disp.in 2>/dev/null" >/dev/null 2>&1 || true
+    if [[ "$session_active" == true && "$input" != true ]]; then
+        poll_remote "printf 'key a press\nkey a release\n' > /tmp/aa-disp.in 2>/dev/null" >/dev/null 2>&1 || true
+    fi
     poll_remote "grep -q '\"event\":\"input_forwarded\",\"ok\":\"true\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && input="true"
     if [[ "$projection" == true && "$session_active" == true && "$video" == true && "$audio" == true && "$input" == true ]]; then
         break
