@@ -66,6 +66,13 @@ TlsRecordCodec::TlsRecordCodec(aa::tls::Policy policy, Role role)
         SSL_CTX_check_private_key(ssl_->ctx) != 1) {
         throw std::runtime_error("tls-record-adapter-credential");
     }
+    for (const auto& extra : credentials.chain) {
+        X509* duplicate = X509_dup(extra.get());
+        if (duplicate == nullptr || SSL_CTX_add_extra_chain_cert(ssl_->ctx, duplicate) != 1) {
+            X509_free(duplicate);
+            throw std::runtime_error("tls-record-adapter-chain");
+        }
+    }
 
     ssl_->ssl = SSL_new(ssl_->ctx);
     ssl_->rbio = BIO_new(BIO_s_mem());

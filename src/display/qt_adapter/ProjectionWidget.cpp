@@ -7,6 +7,8 @@
 #include <QPainter>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 
 namespace aa::display::qt_adapter {
 
@@ -84,6 +86,9 @@ void ProjectionWidget::on_frame(const consumer::DecodedFrame& frame) {
         return;
     }
     pending_ = frame.i420;
+    pending_frame_ = frame.frame;
+    pending_timestamp_ns_ = frame.timestamp_ns;
+    presentation_pending_ = true;
     frame_ = QImage{};
     update();
 }
@@ -129,6 +134,20 @@ void ProjectionWidget::paintEvent(QPaintEvent*) {
     if (!error_.isEmpty()) {
         painter.setPen(Qt::red);
         painter.drawText(rect().adjusted(6, 4, -6, -4), Qt::AlignLeft | Qt::AlignBottom, error_);
+    }
+    painter.end();
+    if (!frame_.isNull() && presentation_pending_) {
+        const auto completed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        ++presentations_;
+        std::printf("{\"event\":\"video_presented\",\"frame\":%llu,\"scheduled_ns\":%llu,"
+                    "\"completed_ns\":%lld,\"count\":%llu}\n",
+                    static_cast<unsigned long long>(pending_frame_),
+                    static_cast<unsigned long long>(pending_timestamp_ns_),
+                    static_cast<long long>(completed),
+                    static_cast<unsigned long long>(presentations_));
+        std::fflush(stdout);
+        presentation_pending_ = false;
     }
 }
 

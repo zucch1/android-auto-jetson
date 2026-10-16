@@ -77,11 +77,11 @@ void log_line(const std::string &json) {
 
 void on_signal(int) { g_running.store(false); }
 
-// Media-timing diagnostics: nanoseconds -> milliseconds as an exact rational
-// (ns / 1e6) carried in a double, no lossy pre-rounding - the collector and
-// reporter compare the value as-is against the ms budgets. Non-finite input
-// (not producible from an int64 count) degrades to a JSON null, which the
-// collector treats as an absent metric (BLOCKED), never 0.
+// Task-48 media-timing diagnostics: nanoseconds -> milliseconds as an exact
+// rational (ns / 1e6) carried in a double, with no lossy pre-rounding - the
+// collector and reporter compare the value as-is against the ms budgets.
+// Non-finite input (not producible from an int64 count) degrades to a JSON
+// null, which the collector treats as an absent metric (BLOCKED), never 0.
 std::string format_ms(aa::core::Nanoseconds value) {
     const double ms = static_cast<double>(value.count) / 1'000'000.0;
     if (!std::isfinite(ms)) {
@@ -198,6 +198,14 @@ class VideoOutlet final : public aa::protocol::MessageSink {
 class RouterSink final : public aa::protocol::MessageSink {
   public:
     explicit RouterSink(aa::audio::AudioRouter &router) : router_(router) {}
+    ~RouterSink() override { finish(); }
+
+    void finish() {
+        if (!finished_) {
+            emit_media_timing();
+            finished_ = true;
+        }
+    }
 
     [[nodiscard]] aa::core::Result<void>
     on_message(const aa::protocol::MessageView &message) override {
@@ -228,33 +236,22 @@ class RouterSink final : public aa::protocol::MessageSink {
         return {};
     }
 
-    // Media-timing diagnostics (PR56 gate P2-D emitter half). Both gated
-    // phase-B metrics derive from the existing task-25 RouterStats
-    // observations on the common monotonic A/V clock; nothing invented here:
-    //   audio_latency_ms = max_path_latency (submit() before decode to
-    //     data-handoff-confirmed write completion at the routing element;
-    //     receiver-local steady clock, NOT device delivery)
-    //   av_sync_ms = max_completion_skew (that write completion minus the
-    //     piece's scheduled presentation time on the wire timestamp-anchored
-    //     sample timeline; NOT a video-presentation comparison)
-    // MAX (cumulative peak), not the last sample: the schema budgets are
-    // run/soak envelope ceilings, so a transient breach must never hide
-    // behind a healed later sample. When no audio has traversed the route
-    // there is no measurement: emit nothing rather than a fabricated 0, so
-    // the collector keeps the metric null and the verdict stays BLOCKED.
+  private:
+    // These are audio-only cumulative maxima. Cross-stream av_sync_ms is
+    // computed by the collector from audio_write_completed + video_presented.
     void emit_media_timing() {
         const auto &stats = router_.report().stats;
-        if (stats.chunks_submitted == 0) {
+        if (stats.frames_written == 0) {
             return;
         }
         log_line(
-            "{\"event\":\"media_timing\",\"av_sync_ms\":" + format_ms(stats.max_completion_skew) +
+            "{\"event\":\"media_timing\",\"audio_scheduling_skew_ms\":" + format_ms(stats.max_completion_skew) +
             ",\"audio_latency_ms\":" + format_ms(stats.max_path_latency) + "}");
     }
 
-  private:
     aa::audio::AudioRouter &router_;
     std::uint64_t chunks_{0};
+    bool finished_{false};
 };
 
 class InputQueue final {
@@ -288,6 +285,12 @@ aa::audio::RouterConfig pcm_router_config() {
         role.codec = aa::audio::Codec::pcm;
         role.input_format = aa::audio::AudioFormat{48000, 2, 16};
     }
+    config.on_write_completed = [](const aa::audio::WriteCompletion &completion) {
+        log_line("{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
+                 std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
+                 std::to_string(completion.scheduled_end.count) + ",\"completed_ns\":" +
+                 std::to_string(completion.completed.count) + "}");
+    };
     return config;
 }
 
@@ -720,7 +723,8 @@ int main(int argc, char **argv) {
     // P2-D: one final media-timing export before shutdown so the last audio
     // tail (routed after the last periodic emission) is not lost. The session
     // thread is gone, so the router report is final and race-free here.
-    audio_sink.emit_media_timing();
+    // finish() is guard-flagged: the destructor's second call is a no-op.
+    audio_sink.finish();
 
     video_outlet.close();
     router.value().close();

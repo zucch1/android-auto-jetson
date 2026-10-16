@@ -30,6 +30,8 @@ class Case(StrEnum):
     SYMLINK = 'symlink'
     HARDLINK = 'hardlink'
     TRAILING = 'trailing'
+    CHAIN = 'chain'
+    CHAINORDER = 'chainorder'
 
 
 def synthetic(root: Path, directory: Path) -> tuple[bytes, bytes]:
@@ -51,6 +53,7 @@ def main() -> int:
         bundle.chmod(0o600)
         environment['HU_KEY_PATH'] = str(bundle)
         expected = ''
+        expected_stdout = 'tls-credential-loaded\n'
         match case:
             case Case.VALID:
                 pass
@@ -84,6 +87,14 @@ def main() -> int:
             case Case.TRAILING:
                 bundle.write_bytes(certificate + key + b'unexpected\n')
                 expected = 'malformed'
+            case Case.CHAIN:
+                other_certificate, _ = synthetic(root, work / 'generated-c')
+                bundle.write_bytes(certificate + other_certificate + key)
+                expected = ''
+                expected_stdout = 'tls-credential-loaded chain=1\n'
+            case Case.CHAINORDER:
+                bundle.write_bytes(key + certificate)
+                expected = 'malformed'
             case unreachable:
                 assert_never(unreachable)
         # When: load through the same component used by effective Cryptor.
@@ -94,7 +105,7 @@ def main() -> int:
             assert result.stderr.startswith(f'tls-credential-{expected}'), result
             assert result.stdout == '', result
         else:
-            assert result.stdout == 'tls-credential-loaded\n', result
+            assert result.stdout == expected_stdout, result
         assert directory not in result.stderr and 'sensitive-name' not in result.stderr, result
         assert key.decode() not in result.stderr, result
         print(f'credential-case={case} probe_exit={result.returncode} redacted=yes')
