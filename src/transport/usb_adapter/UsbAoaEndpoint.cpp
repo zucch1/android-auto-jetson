@@ -101,6 +101,9 @@ core::Result<std::size_t> UsbAoaEndpoint::read(std::span<std::byte> buffer,
     // slice at a time; write carries the zero-progress stall bound instead.
     for (;;) {
         const core::Deadline budget{io_deadline_, token};
+        if (checkpoint_) {
+            checkpoint_();
+        }
         if (auto checked = budget.check(); !checked) {
             close();
             return checked.error();
@@ -110,6 +113,13 @@ core::Result<std::size_t> UsbAoaEndpoint::read(std::span<std::byte> buffer,
             return Error{ErrorCode::cancelled};
         }
         auto count = pipe_->read(buffer, budget.slice_ms(kBulkTransferTimeoutMs));
+        if (checkpoint_) {
+            checkpoint_();
+        }
+        if (auto checked = budget.check(); !checked) {
+            close();
+            return checked.error();
+        }
         if (!count) {
             close();
             return count.error();
@@ -136,6 +146,9 @@ core::Result<std::size_t> UsbAoaEndpoint::write(std::span<const std::byte> data,
     const core::Deadline budget{
         std::min(io_deadline_, core::Deadline::Clock::now() + std::chrono::seconds{5}), token};
     for (;;) {
+        if (checkpoint_) {
+            checkpoint_();
+        }
         if (auto checked = budget.check(); !checked) {
             close();
             return checked.error();
@@ -145,6 +158,13 @@ core::Result<std::size_t> UsbAoaEndpoint::write(std::span<const std::byte> data,
             return Error{ErrorCode::cancelled};
         }
         auto count = pipe_->write(data, budget.slice_ms(kBulkTransferTimeoutMs));
+        if (checkpoint_) {
+            checkpoint_();
+        }
+        if (auto checked = budget.check(); !checked) {
+            close();
+            return checked.error();
+        }
         if (!count) {
             close();
             return count.error();
