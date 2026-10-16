@@ -41,11 +41,11 @@
 #   5. passwordless sudo for the sysfs unbind/bind step, adb authorized
 #
 # Usage:
-#   run-wired-recovery-qa.sh --readiness-only [--out /tmp/task-31-wired-recovery.json]
+#   run-wired-recovery-qa.sh --readiness-only --out "$CAPTURE_DIR/task-31-readiness.json"
 #   run-wired-recovery-qa.sh --receiver /opt/aa/aa-wired-receiver \
 #       --display /opt/aa/aa-dummy-display --store /home/zucchi/.local/state/... \
 #       [--only usb_unplug_replug,consumer_restart] \
-#       --out /tmp/task-31-wired-recovery.json
+#       --out "$CAPTURE_DIR/task-31-wired-recovery.json"
 #
 # Environment overrides: HOST (jetson.local), PORT (1-2.1), BUDGET_MS (5000),
 # EVIDENCE_WAIT_MS (8000, per-scenario media/rejection evidence window; the
@@ -70,7 +70,7 @@ RECEIVER=""
 DISPLAY=""
 STORE=""
 ADB_SERIAL=""
-OUT="/tmp/task-31-wired-recovery.json"
+OUT=""
 BUDGET_MS="${BUDGET_MS:-5000}"
 EVIDENCE_WAIT_MS="${EVIDENCE_WAIT_MS:-8000}"
 READINESS_ONLY=0
@@ -79,10 +79,6 @@ ONLY_SEEN=0
 SCENARIOS=(usb_unplug_replug receiver_restart consumer_restart
           phone_lock_unlock phone_aa_restart unknown_phone malformed_input)
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
-RESULTS_DIR="$(mktemp -d)"
-RESULTS_TSV="${RESULTS_DIR}/results.tsv"
-: > "${RESULTS_TSV}"
-
 usage() {
     sed -n '2,55p' "$0"
     exit 2
@@ -96,7 +92,9 @@ while (($# > 0)); do
         --display) DISPLAY="$2"; shift 2 ;;
         --store) STORE="$2"; shift 2 ;;
         --adb-serial) ADB_SERIAL="$2"; shift 2 ;;
-        --out) OUT="$2"; shift 2 ;;
+        --out)
+            (($# >= 2)) || usage
+            OUT="$2"; shift 2 ;;
         --budget-ms) BUDGET_MS="$2"; shift 2 ;;
         --only)
             if (($# < 2)); then
@@ -109,6 +107,14 @@ while (($# > 0)); do
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
 done
+
+if [[ "${BASH_SOURCE[0]}" == "$0" && -z "$OUT" ]]; then
+    echo '--out is required; choose a durable capture directory' >&2
+    usage
+fi
+RESULTS_DIR="$(mktemp -d)"
+RESULTS_TSV="${RESULTS_DIR}/results.tsv"
+: > "${RESULTS_TSV}"
 
 # Hostile-argument neutralization (gate P3): a leading-dash HOST would be read
 # as an ssh OPTION (e.g. -oProxyCommand=...) and a quote-bearing PORT would
@@ -924,6 +930,7 @@ write_result() {
 }
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
+
 
 # ---- 1. reachability (bounded) ----
 if ! remote "true" >/dev/null 2>&1; then
