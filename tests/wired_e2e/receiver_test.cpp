@@ -390,6 +390,7 @@ AdmissionResult run_admission_child(bool pre_admission_failure) {
             store_path.string(), "--video-socket", (root / "video").string(),
             "--input-socket", (root / "input").string(), "--duration-ms", "100"};
         std::vector<char *> argv;
+        argv.reserve(args.size());
         for (auto &arg : args) {
             argv.push_back(arg.data());
         }
