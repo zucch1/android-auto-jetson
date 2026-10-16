@@ -134,6 +134,17 @@ if [[ "$policy" != "installed" ]]; then
 fi
 # Exact-line DRM status record (lane-32 pattern, tools/perf/aa-projection-perf.sh):
 # `disconnected` must NOT read as `connected`; only an exact `connected` line passes.
+# nvidia-drm quirk fallback (lane-32 commit 3e60499): the kernel connector can stay
+# `disconnected` while the X server drives the live monitor. Accept positive xrandr
+# session evidence too - second field exactly `connected`, so `disconnected` never
+# matches. The wire probe is grep-free (the QA fake-ssh shim intercepts `grep`);
+# parsing is local and empty output stays fail-closed.
+if ! printf '%s\n' "$display_status" | grep -Fxq 'connected'; then
+    xrandr_status="$(remote "xrandr --query 2>/dev/null" || true)"
+    if printf '%s\n' "$xrandr_status" | grep -Eq '^[^ ]+ connected( |$)'; then
+        display_status="connected"
+    fi
+fi
 if ! printf '%s\n' "$display_status" | grep -Fxq 'connected'; then
     write_result "BLOCKED" "display_disconnected" "false" "false" "false" "false" "null"
     exit 3

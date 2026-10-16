@@ -967,6 +967,17 @@ for token in $display_status; do
         display_connected="true"
     fi
 done
+# nvidia-drm quirk fallback (lane-32 commit 3e60499): the kernel connector can stay
+# `disconnected` while the X server drives the live monitor. Accept positive xrandr
+# session evidence too - second field exactly `connected`, so `disconnected` never
+# matches. The wire probe is grep-free (the QA fake-ssh shim intercepts `grep`);
+# parsing is local and empty output stays fail-closed.
+if [[ "$display_connected" != "true" ]]; then
+    xrandr_status="$(remote "xrandr --query 2>/dev/null" || true)"
+    if printf '%s\n' "$xrandr_status" | grep -Eq '^[^ ]+ connected( |$)'; then
+        display_connected="true"
+    fi
+fi
 if [[ "$display_connected" != "true" ]]; then
     record readiness BLOCKED "" "" "" "display_disconnected"
     write_result "BLOCKED" "display_disconnected"
