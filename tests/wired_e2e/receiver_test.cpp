@@ -350,10 +350,41 @@ struct AdmissionResult {
     int ciphers = -1;
     int switches = -1;
     int claims = -1;
+    std::string expected_label;
     std::string output;
 };
 
 AdmissionResult run_admission_child(bool pre_admission_failure) {
+    if (const char *child_root = std::getenv("AA_TEST_ADMISSION_ROOT")) {
+        const std::filesystem::path root{child_root};
+        runtime_real_admission = true;
+        runtime_fail_before_admission = std::string{std::getenv("AA_TEST_ADMISSION_FAILURE")} == "1";
+        admission_state = std::make_shared<aa::test::usb_aoa::LinkState>();
+        runtime_connects.store(0);
+        runtime_ciphers.store(0);
+        shutdown_observation = nullptr;
+        g_running.store(true);
+        const aa::trust::WiredIdentity second{
+            "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
+            "SECOND-PRIVATE-AOA", "1-2.2"};
+        const auto label = aa::trust::redacted_label(aa::trust::TransportIdentity{second});
+        std::vector<std::string> args{"receiver", "--port", "1-2.2", "--no-bus", "--store",
+            (root / "approved.json").string(), "--video-socket", (root / "video").string(),
+            "--input-socket", (root / "input").string(), "--duration-ms", "100"};
+        std::vector<char *> argv;
+        argv.reserve(args.size());
+        for (auto &arg : args) {
+            argv.push_back(arg.data());
+        }
+        const int code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+        {
+            std::ofstream metrics(root / "metrics");
+            metrics << runtime_connects.load() << ' ' << runtime_ciphers.load() << ' '
+                    << admission_state->switches() << ' ' << admission_state->claims() << ' ' << label;
+        }
+        std::fflush(stdout);
+        ::_exit(code);
+    }
     AdmissionResult result;
     char directory[] = "/tmp/wired-admission-XXXXXX";
     const char *created = ::mkdtemp(directory);
@@ -370,38 +401,37 @@ AdmissionResult run_admission_child(bool pre_admission_failure) {
         "04e8", "6860", "FIRST-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
         "FIRST-PRIVATE-AOA", "1-2.1"};
     EXPECT_TRUE(initial.approve(aa::trust::TransportIdentity{first}).has_value());
+    std::string root_env = "AA_TEST_ADMISSION_ROOT=" + root.string();
+    std::string failure_env = pre_admission_failure ? "AA_TEST_ADMISSION_FAILURE=1"
+                                                   : "AA_TEST_ADMISSION_FAILURE=0";
+    std::vector<char *> environment;
+    for (char **entry = ::environ; *entry != nullptr; ++entry) {
+        environment.push_back(*entry);
+    }
+    environment.push_back(root_env.data());
+    environment.push_back(failure_env.data());
+    environment.push_back(nullptr);
+    std::string executable = "/proc/self/exe";
+    std::string filter = pre_admission_failure
+        ? "--gtest_filter=WiredReceiver.PreAdmissionFailureEmitsNoAttemptAttribution"
+        : "--gtest_filter=WiredReceiver.RejectedAttemptEmitsCapturedPseudonymAndPort";
+    std::string repeat = "--gtest_repeat=1";
+    char *child_argv[]{executable.data(), filter.data(), repeat.data(), nullptr};
+    const int capture_fd = ::open((root / "stdout").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    EXPECT_GE(capture_fd, 0);
     std::fflush(nullptr);
     const pid_t child = ::fork();
     EXPECT_GE(child, 0);
     if (child == 0) {
-        const int capture = ::open((root / "stdout").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (capture < 0 || ::dup2(capture, STDOUT_FILENO) < 0) {
+        if (capture_fd < 0 || ::dup2(capture_fd, STDOUT_FILENO) < 0) {
             ::_exit(90);
         }
-        ::close(capture);
-        runtime_real_admission = true;
-        runtime_fail_before_admission = pre_admission_failure;
-        admission_state = std::make_shared<aa::test::usb_aoa::LinkState>();
-        runtime_connects.store(0);
-        runtime_ciphers.store(0);
-        shutdown_observation = nullptr;
-        g_running.store(true);
-        std::vector<std::string> args{"receiver", "--port", "1-2.2", "--no-bus", "--store",
-            store_path.string(), "--video-socket", (root / "video").string(),
-            "--input-socket", (root / "input").string(), "--duration-ms", "100"};
-        std::vector<char *> argv;
-        argv.reserve(args.size());
-        for (auto &arg : args) {
-            argv.push_back(arg.data());
-        }
-        const int code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
-        {
-            std::ofstream metrics(root / "metrics");
-            metrics << runtime_connects.load() << ' ' << runtime_ciphers.load() << ' '
-                    << admission_state->switches() << ' ' << admission_state->claims();
-        }
-        std::fflush(stdout);
-        ::_exit(code);
+        ::close(capture_fd);
+        ::execve(executable.c_str(), child_argv, environment.data());
+        ::_exit(91);
+    }
+    if (capture_fd >= 0) {
+        ::close(capture_fd);
     }
     if (child > 0) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
@@ -421,7 +451,8 @@ AdmissionResult run_admission_child(bool pre_admission_failure) {
         std::ifstream capture(root / "stdout");
         result.output.assign(std::istreambuf_iterator<char>{capture}, {});
         std::ifstream metrics(root / "metrics");
-        metrics >> result.connects >> result.ciphers >> result.switches >> result.claims;
+        metrics >> result.connects >> result.ciphers >> result.switches >> result.claims
+                >> result.expected_label;
     }
     std::filesystem::remove_all(root);
     return result;
@@ -455,8 +486,9 @@ TEST(WiredReceiver, RejectedAttemptEmitsCapturedPseudonymAndPort) {
     const aa::trust::WiredIdentity second{
         "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
         "SECOND-PRIVATE-AOA", "1-2.2"};
-    const auto label = aa::trust::redacted_label(aa::trust::TransportIdentity{second});
     const auto result = run_admission_child(false);
+    const auto &label = result.expected_label;
+    ASSERT_FALSE(label.empty());
     expect_admission_exit(result, 1);
     const auto errors = link_errors(result.output);
     ASSERT_EQ(errors.size(), 1U) << result.output;
