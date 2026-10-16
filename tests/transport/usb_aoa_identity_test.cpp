@@ -132,7 +132,7 @@ TEST(UsbAoaIdentity, UnknownPhoneIsRejectedAfterSuccessfulAoaSwitch) {
 
     aa::trust::WiredIdentity attempted{};
     auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
-                                tr::AoaAccessoryInfo{}, tr::admit_via(store), &attempted);
+                                tr::AoaAccessoryInfo{}, tr::admit_via(store), {}, &attempted);
 
     // The AOA switch still succeeded - success is never trust. Observations
     // come from the test-owned block: the pipeline destroyed its factory here.
@@ -161,7 +161,7 @@ TEST(UsbAoaIdentity, AdmissionSuccessLeavesAttemptedIdentityEmpty) {
 
     aa::trust::WiredIdentity attempted{};
     auto link = ua::connect_aoa(std::move(factory), tr::UsbDeviceSelector{"1-2.1"},
-                                tr::AoaAccessoryInfo{}, tr::admit_via(store), &attempted);
+                                tr::AoaAccessoryInfo{}, tr::admit_via(store), {}, &attempted);
     ASSERT_TRUE(link.has_value());
     EXPECT_TRUE(attempted.port_context.empty());
     EXPECT_TRUE(attempted.usb_serial.empty());
