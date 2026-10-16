@@ -7,11 +7,9 @@ This document is the **phase-B procedure**: it drives the REAL approved phone an
 the on-target wired receiver through the plan's recovery scenarios and records
 per-scenario recovery time and retry counts.
 
-> Phase B is owner/orchestrator-controlled and was NOT run during phase A (the
-> Jetson display is DP-1 DISCONNECTED, the on-target receiver binary is not yet
-> installable, and the task-29 udev policy was rolled BACK after its own QA
-> round). No live recovery claim is made until an invocation writes a PASS
-> record.
+> Phase B is owner/orchestrator-controlled and remains BLOCKED/not performed in
+> this local fix round. Historical device-readiness observations are not current
+> device observations. No live recovery or soak claim is made by host tests.
 
 ## Scenario matrix (plan §31)
 
@@ -21,18 +19,18 @@ per-scenario recovery time and retry counts.
 | Receiver restart | bounce the receiver process | `WiredRecoveryReceiverRestart.*` (no stale trust/session; re-admit) | `receiver_restart` |
 | Dummy consumer restart | bounce the display process | `WiredRecoveryConsumerRestart.*` (degrade/recover; media path resumes) | `consumer_restart` |
 | Malformed input | malformed AAP frame | `WiredRecoveryMalformed.*` (`transport_malformed_frame`/`transport_io`, no delivery) | `malformed_input` (N/A: host-covered, no shell injector) |
-| Unknown phone | second unapproved device | `WiredRecoveryUnknownPhone.*` (synthetic identity fails closed) | `unknown_phone` (BLOCKED when the S9 Edge is absent) |
+| Unknown phone | second unapproved device | `WiredRecoveryUnknownPhone.*` (synthetic identity fails closed) | `unknown_phone` (BLOCKED when a distinct second device is absent) |
 | Phone lock/unlock + AA restart | ADB keyevent / `am force-stop` | `WiredRecoveryPhoneLockUnlock.*` (degrade/recover + link restart) | `phone_lock_unlock`, `phone_aa_restart` |
 
 ## Prerequisites (once per target)
 
 1. Task-29 udev policy installed: `sudo -n bash tools/usb-policy/install.sh`
-   (the policy is NOT installed today - it was rolled back after task-29 QA).
+   (verify installation at run time; historical installation state is not proof).
 2. Approved phone on the qualified port (default `1-2.1`), phone mode before the
    AOA switch, and the approved-phone trust store loaded (task 27).
 3. Display connected (DP-1/HDMI-A-1 `connected`) and a PipeWire output sink.
 4. An on-target `aa-wired-receiver` binary (see
-   `docs/qualification/wired-live-qa.md`); it is native-only today (todo 41).
+   `docs/qualification/wired-live-qa.md`); target packaging is task-41 scope.
 5. Passwordless `sudo` for the sysfs `unbind`/`bind` step and an authorized ADB.
 6. The phone actively projecting video and playing audio during the run: the
    media PASS gates observe real delivery (painted frames, a successful audio
@@ -40,17 +38,20 @@ per-scenario recovery time and retry counts.
 
 ## One documented command sequence
 
-From the development checkout (bounded ssh, fail-closed):
+From the development checkout (bounded ssh, fail-closed), first create a private,
+durable evidence directory outside disposable worktrees. Use its absolute path
+as `CAPTURE_DIR`; retain sanitized results and command logs there with SHA-256
+hashes, not only in temporary storage:
 
 ```bash
 tools/wired-qa/run-wired-recovery-qa.sh --readiness-only \
-    --out /tmp/task-31-wired-recovery.json
+    --out "$CAPTURE_DIR/task-31-readiness.json"
 
 tools/wired-qa/run-wired-recovery-qa.sh \
     --receiver /opt/aa/aa-wired-receiver \
     --display  /opt/aa/aa-dummy-display \
     --store    /home/zucchi/.local/state/android-auto-receiver/approved-phones.json \
-    --out      /tmp/task-31-wired-recovery.json
+    --out      "$CAPTURE_DIR/task-31-wired-recovery.json"
 ```
 
 The harness exits non-zero with a `BLOCKED` or `FAILED` result (`blocked_on`)
@@ -64,9 +65,24 @@ normal operation.
 
 ## Observables recorded (fed into the task-31 receipt)
 
-- `recovery_ms` per scenario: wall time from the stimulus to projection observed
-  again, compared against the wired 5 s reconnect budget (see the named
-  limitation on budget honesty below).
+- `recovery_ms` per scenario: invoking-host monotonic time from dispatch of the
+  FIRST disruptive command (or admission attempt) to COMPLETE terminal evidence,
+  sampled after the last required probe is validated. Recovery requires
+  projection plus every scenario-specific predicate and all three media
+  conjuncts below. Rejection requires exit 3 plus retrieved, validated second-
+  attempt attribution/port and no `ready`/`active`. Remote timestamps cannot
+  backdate observation. All six executable scenarios share one absolute
+  deadline: integer nanoseconds must satisfy `0 <= elapsed < budget_ms * 1000000`.
+  Exactly 5000 ms FAILS; environment/CLI budgets must be in `1..5000`.
+- `elapsed_ms`: elapsed scenario observation time, including partial evidence;
+  `recovery_ms` stays null without complete terminal evidence. Complete-but-late
+  evidence has numeric `recovery_ms` but is FAILED `recovery_exceeded_budget`.
+  Pre-stimulus BLOCKED rows have neither timing claim. Clock errors fail closed.
+- `wall_ms`: harness entry through completed cleanup, sampled before JSON
+  serialization. Setup, reporting and independent safety-timeout cleanup are
+  not acceptance evidence; overall wall time can exceed five seconds without
+  invalidating a timely complete observation. The test runner also retains
+  subprocess wall time through exit.
 - `retries` per scenario: the receiver's reconnect-attempt counter as the
   PER-DISTURBANCE delta (counter after the disturbance minus the counter at
   it), not the run-cumulative maximum.
@@ -110,7 +126,8 @@ normal operation.
   session thread exits - when that single relink or its follow-up handshake
   steps fail. Relink storms, retry/backoff, and multi-cycle recovery are NOT
   covered and are not claimed here.
-- **Telemetry evidence coverage**: 6 of the 16 host-side cases assert the
+- **Telemetry evidence coverage**: the current host-side matrix has 20 cases;
+  the original six capture-asserting cases include the
   redacted diagnostics capture (the unplug_replug recovery pair
   `FreshTransportRecoversToActiveWithinWiredBudget` and
   `ReconnectFreshCipherRequiresFullHandshake`, `DegradeThenRecover...KeepsRouting`,
@@ -124,10 +141,15 @@ normal operation.
   typed `timeout` at exactly 5000 ms). The real-clock case
   (`RecoveryCompletesBoundedWorkOnSteadyClock`) is a self-measured wall-clock
   smoke ceiling and does NOT certify the budget. The harness ENFORCES its own
-  wall-clock `recovery_ms` against `BUDGET_MS` on every PASS (a miss records
-  `FAILED` `recovery_exceeded_budget`, never PASS), so a phase-B PASS record
-  carries the harness-measured budget evidence; the bounded waits remain the
-  measurement authority for the observation windows.
+  host-monotonic terminal-observation deadline on every PASS (expiry records
+  `FAILED` `recovery_exceeded_budget`, never PASS). Projection alone is partial
+  evidence. Probe windows, including `EVIDENCE_WAIT_MS`, can shorten but never
+  extend that absolute deadline. This locally tested harness behavior is not
+  a claim of live device acceptance.
+- **Integrated receiver boundary PENDING**: handwritten hermetic rejection
+  records test harness parsing, not production receiver serialization. The
+  actual rejected-attempt and pre-admission-failure child-process tests belong
+  on the integrated task-30/task-31 receiver seam, not this standalone lane.
 
 ## Budget caveats carried from task 9 (do NOT claim)
 
@@ -138,5 +160,10 @@ are measured in task 32.
 
 ## Privacy
 
-Device serials/MACs/IPs are never written to committed content or the receipt;
-the harness redacts before export. Raw captures stay under `/tmp` on the host.
+Device serials/MACs/IPs must not enter committed content or the receipt. The
+harness exports a host hash and pseudonymous identity/port evidence. Keep raw
+captures private, sanitize exported logs, and retain the sanitized evidence in a
+mode-0700 durable directory outside disposable worktrees with a SHA-256 manifest.
+Do not bind receipts solely to `/tmp`: missing historical bytes must be disclosed
+as unavailable, not replaced by their recorded hashes. Local harness coverage,
+integrated receiver-boundary coverage, and live/soak acceptance are separate.
