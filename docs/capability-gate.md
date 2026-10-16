@@ -45,7 +45,7 @@ budget (audio, reconnect, recovery, soak, RSS) to be measured.
 | decode | **owner-signed-reduced-scope** | 600 s hardware decode 18000/18000 frames, zero drops, 30 fps, 10.02 Mbps, 3.83% CPU; p95 36.09 ms **exceeds** the 33 ms budget (withdrawn); software fallback unqualified (withdrawn) | `task-9-decode-probe.json`, `task-9-owner-signoff.json` |
 | IPC | probe-pass-provisional | host-only 600 s synthetic AF_UNIX benchmark: 12.189683 Mbps, p95 0.2 ms, zero happy-path drops | `task-10-final-acceptance-gate.json` |
 | USB | probe-pass-provisional | AOA2 capability only: IN 0x81 / OUT 0x01, MPS 512, 3/3 resets, 30 s / 31 samples stable — **not projection** | `task-11-usb-probe.json` |
-| wireless | **owner-signed-reduced-scope** | Regd fixed (shim+watchdog, US live); UNII-1 5 GHz AP (ch 44, 20 MHz) + client-association **demonstrated** (2026-10-10/11 receipts); claim 1 re-scoped from channel-36 per 2026-10-11 sign-off; `ap_startup_s` **measured/pass** (4.223 s, modprobe→AP-ENABLED) but `session_reconnect_s` **unmeasured** (qual-run-6 exercised infra-STA recovery, not the AA session transport); claim 3 stays withdrawn; 3.009 s event loop still **not** a strict 3 s pass | `claim-rescope-signoff-2026-10-11.md`, `task-12-fix/qual-run-6/qual-receipt-run-6.md`, `task-12-bluez-lightweight.json` |
+| wireless | **owner-signed-reduced-scope** | Regd fixed (shim+watchdog, US live); UNII-1 5 GHz AP (ch 44, 20 MHz) + client-association **demonstrated** (2026-10-10/11 receipts); claim 1 re-scoped from channel-36 per 2026-10-11 sign-off; `ap_startup_s` **pass** (4.223 s) but `session_reconnect_s` **unmeasured** — qual-run-7 captured a WiFi+ADB **proxy** chain only (31.715 s contract-aligned / 29.233 s from radio-on; both > 15 s), not the session-contract endpoint; claim 3 stays withdrawn; 3.009 s event loop still **not** a strict 3 s pass | `claim-rescope-signoff-2026-10-11.md`, `task-12-fix/qual-run-7/qual-receipt-run-7.md`, `task-12-bluez-lightweight.json` |
 
 All six `probe-pass-provisional` entries are interim: before final release
 approval they must resolve to `full-pass` or `owner-signed-reduced-scope`;
@@ -84,23 +84,39 @@ Current sign-off (claim resolution, 2026-10-11):
 - withdrawn_claims (remaining):
   1. `Full wireless capability acceptance as a prerequisite for continuing independent wired implementation`
 
-### Post-sign-off wireless observations (2026-10-11, qual-run-6 — not part of the signature)
+### Post-sign-off wireless observations (2026-10-11/13, qual-run-6/7 — not part of the signature)
 
-The sign-off above is unchanged: claim 3 stays withdrawn/open. A later qualification
-window produced two bounded observations, neither of which resolves claim 3:
+The sign-off above is unchanged: claim 3 stays withdrawn/open. Later qualification
+windows produced bounded observations, none of which resolves claim 3:
 
 - `wireless.ap_startup_s` (≤ 5 s) **measured and passes at its stated trigger**:
   modprobe-start → `AP-ENABLED` = 4.223 s worst of 3 journal-valid cycles, on the
   receiver-hosted `aa-qual-44` AP (ch 44, 20 MHz). This is not a boot-to-AP number.
-- `wireless.session_reconnect_s` (≤ 15 s) **remains unmeasured**: the window exercised
-  **infrastructure-STA** RF-kill recovery (Jetson as client of the venue
-  infrastructure router) at 4.139 s worst of 3 journal-valid cycles — a different
-  topology from the receiver-hosted AA transport (ARCHITECTURE.md, "Transport
-  order") and not an AA session. The 30 s ping sample (30/30, 0 % loss) is likewise
-  infrastructure-STA only.
+- `wireless.session_reconnect_s` (≤ 15 s) **remains unmeasured** — qual-run-7
+  captured only a bounded **link/ADB proxy** (qual-run-7 receipt): the WiFi
+  re-association + adb-over-WiFi chain on the contract topology (receiver-hosted
+  `aa-qual-44` AP, phone as client; task-12 pattern, owner-confirmed 2026-10-11).
+  Proxy readings: **31.715 s** worst from the link-loss-aligned onset (the
+  contract's timer origin, `src/session/Lifecycle.cpp` — armed on entry into
+  `reconnecting`) and 29.233 s from radio-on (a diagnostic). Both exceed 15 s; the
+  proxy is **not** the session-contract endpoint (transport restoration +
+  renegotiation to `State::active`). Steady-state proxy cycles recover in ~10.3 s;
+  cycle 1's slow first re-association (27.8 s; consistent with a full-channel
+  rescan, scan evidence not separately captured) is the max-kind reading.
+  Interrupting via `iw station deauth` proved a driver no-op and was discarded (v1
+  note in the receipt); the run used an AP-side RF-kill toggle with journal-enforced
+  drop+recovery validity gates.
+- `wireless.session_reconnect_s` was **not** measured by qual-run-6: that window
+  exercised **infrastructure-STA** RF-kill recovery (Jetson as client of the venue
+  infrastructure router) at 4.139 s — a different topology (recorded as the separate
+  `infra_sta_rfkill_reconnect_s` observation). The 30 s ping sample (30/30, 0 % loss)
+  is likewise infrastructure-STA only.
 
-Measuring the session budget requires an exercised receiver-hosted AA session (phone
-joins the Jetson-hosted AP; interrupt; time the **session** recovery) — separate work.
+qual-run-7 (2026-10-13) exercised the receiver-hosted window and captured the
+link/ADB **proxy** recovery recorded above — both proxy clocks exceed 15 s. The
+session budget itself stays unmeasured until either a real AA session-recovery
+capture (transport + renegotiation to `State::active`) lands, or an owner-signed
+budget withdrawal names a miss.
 
 Historical sign-off (2026-10-08, original withdrawal — preserved verbatim):
 - owner: `Newton`
@@ -113,9 +129,10 @@ Historical sign-off (2026-10-08, original withdrawal — preserved verbatim):
   3. `Full wireless capability acceptance as a prerequisite for continuing independent wired implementation`
 
 These sign-offs never count as full compliance. The wireless release budgets
-below were left unmeasured and unclaimed rather than withdrawn at signing; one
-(`ap_startup_s`) has since been measured and passes (qual-run-6 — see the dated
-observation section above); `session_reconnect_s` remains unmeasured.
+below were left unmeasured and unclaimed rather than withdrawn at signing;
+`ap_startup_s` has since been measured and passes (qual-run-6 — see the dated
+observation section above), while `session_reconnect_s` remains unmeasured (a
+link/ADB proxy exceeds 15 s; see the qual-run-7 note).
 
 ## Budgets
 
@@ -157,15 +174,26 @@ area or availability stage.
 
 Measured 2026-10-11 (qual-run-6): `wireless.ap_startup_s` = **4.223 s** (pass, ≤ 5 s;
 3/3 journal-valid cycles; trigger = modprobe-start → `AP-ENABLED`, receiver-hosted
-`aa-qual-44` AP — not boot-to-AP). `wireless.session_reconnect_s` remains
-**unmeasured**: the window's 4.139 s figure is infrastructure-STA RF-kill recovery
-(venue-router client), a different topology from the receiver-hosted AA transport.
-All other release budgets remain unmeasured and unclaimed.
+`aa-qual-44` AP — not boot-to-AP).
+
+Proxied 2026-10-13 (qual-run-7): `wireless.session_reconnect_s` **remains unmeasured**
+— the window captured a link/ADB **proxy** (WiFi re-association + adb-over-WiFi on
+the receiver-hosted AP, phone as client), not the session-contract endpoint
+(transport restoration + renegotiation to `State::active`). Proxy readings:
+**31.715 s** worst from the link-loss-aligned onset (the contract's timer origin) and
+29.233 s from radio-on (diagnostic); both exceed 15 s. Steady-state proxy recovery is
+~10.3 s; cycle 1's slow first re-association — consistent with a full-channel rescan,
+scan evidence not separately captured — is the max-kind reading. The 4.139 s figure from
+qual-run-6 is a different topology (infrastructure-STA) and is recorded separately as
+`infra_sta_rfkill_reconnect_s`. All other release budgets remain unmeasured and
+unclaimed.
 
 ## Explicit non-claims
 
 - Audio, USB-session-reconnect, recovery and soak budgets are **unmeasured**; no
-  early probe result claims them as passed.
+  early probe result claims them as passed. The Wi-Fi/ADB proxy exceeds 15 s
+  (qual-run-7); the formal wireless session-reconnect budget remains **unmeasured**
+  — it is not claimed as passed either.
 - USB: AOA2 capability only. No Android Auto session and no bulk transfer were
   exercised; this is **not** projection and not a session-reconnect pass.
 - Wireless: UNII-1 5 GHz AP (ch 44, 20 MHz) and isolated client-association are
@@ -175,8 +203,11 @@ All other release budgets remain unmeasured and unclaimed.
   **not** a strict wall-bound pass. AP mode advertisement is not AP operation. No
   pairing or trust claims. `ap_startup_s` is measured and passes (4.223 s, trigger
   modprobe-start → `AP-ENABLED`); `session_reconnect_s` is **unmeasured** —
+  qual-run-7 captured only a link/ADB proxy chain (31.715 s contract-aligned /
+  29.233 s from radio-on; both > 15 s) and is **not** the session-contract endpoint.
   qual-run-6's 4.139 s figure is infrastructure-STA RF-kill recovery (the Jetson's
-  upstream link to the venue router), **not** the receiver-hosted AA session
+  upstream link to the venue router), **not** the
+  receiver-hosted AA session
   transport and not an AA session; a 30 s ping sample (30/30, 0 % loss) is likewise
   infrastructure-STA only. Full wireless capability acceptance stays deferred
   (claim 3 withdrawn/open); channel-36 AP stays out of the signed scope (B-route
