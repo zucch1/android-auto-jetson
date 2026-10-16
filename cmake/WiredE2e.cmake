@@ -26,9 +26,11 @@ if(NOT TARGET aa_input_service)
 endif()
 
 set(AA_WIRED_SOURCES
+    src/app/WiredPhoneControl.cpp
     src/app/WiredSession.cpp
     src/app/WiredLink.cpp)
 set(AA_WIRED_TEST_SOURCES
+    tests/trust/syscall_faults.cpp
     tests/wired_e2e/wired_e2e_happy_test.cpp
     tests/wired_e2e/wired_e2e_revoke_test.cpp
     tests/wired_e2e/wired_e2e_failures_test.cpp
@@ -90,6 +92,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     endif()
     target_compile_definitions(aa_wired_e2e_test PRIVATE AA_WIRED_HAS_AUDIO_ROUTER=1)
     target_link_options(aa_wired_e2e_test PRIVATE
+        "-Wl,--wrap=fsync" "-Wl,--wrap=renameat"
         "-Wl,--wrap=_ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineE"
         "-Wl,--wrap=_ZN2aa9transport28make_client_handshake_cipherERKSt8functionIFbvEE"
         "-Wl,--wrap=_ZN2aa5audio6detail17open_default_sinkERKNS1_15SinkOpenRequestE")
@@ -123,7 +126,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_e2e_input_wire COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eInputWire.*)
     add_test(NAME wired_e2e_auth COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eAuth.*)
     add_test(NAME wired_recovery COMMAND aa_wired_e2e_test --gtest_filter=WiredRecovery.*)
-    add_test(NAME wired_receiver COMMAND aa_wired_e2e_test --gtest_filter=WiredReceiver.*)
+    add_test(NAME wired_receiver COMMAND dbus-run-session --
+        $<TARGET_FILE:aa_wired_e2e_test> --gtest_filter=WiredReceiver.*)
     add_test(NAME wired_deadline COMMAND aa_wired_e2e_test --gtest_filter=WiredDeadline.*)
     set_tests_properties(wired_deadline PROPERTIES TIMEOUT 30)
     set_tests_properties(wired_receiver PROPERTIES TIMEOUT 120)

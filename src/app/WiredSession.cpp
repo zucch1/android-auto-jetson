@@ -65,7 +65,10 @@ core::Result<void> WiredSession::fail(Error reason) {
     return outcome;
 }
 
-void WiredSession::tick() { lifecycle_.tick(); }
+void WiredSession::tick() {
+    lifecycle_.tick();
+    note_state();
+}
 
 void WiredSession::request_stop() noexcept { lifecycle_.request_stop(); }
 
@@ -105,6 +108,9 @@ core::Result<void> WiredSession::send_frame(std::span<const std::byte> frame) {
     }
     if (auto sent = transport_->send(frame); !sent) {
         return io_error(sent.error(), deadline);
+    }
+    if (auto checked = deadline.check(); !checked) {
+        return io_error(checked.error(), deadline);
     }
     return {};
 }
@@ -235,6 +241,9 @@ core::Result<bool> WiredSession::poll_transport() {
     auto frame = transport_->receive();
     if (!frame) {
         return io_error(frame.error(), deadline);
+    }
+    if (auto checked = deadline.check(); !checked) {
+        return io_error(checked.error(), deadline);
     }
     auto chunks = parser_.feed(frame.value());
     if (!chunks) {
