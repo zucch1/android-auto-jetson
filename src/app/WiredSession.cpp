@@ -152,6 +152,7 @@ void WiredSession::reset_link() noexcept {
     cipher_.reset();
     sequence_ = 0;
     channel_opens_ = 0;
+    unhandled_controls_ = 0;
     channel_closes_ = 0;
     last_reject_.reset();
     version_responses_ = 0;
@@ -276,6 +277,7 @@ core::Result<bool> WiredSession::poll_transport() {
                 return handled.error();
             }
             routed = true;
+            if (token().stop_requested()) { break; }
         }
     }
     return routed;
@@ -425,6 +427,52 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         ++channel_opens_;
         return {};
     }
+    case protocol::ControlMessageId::audio_focus_request: {
+        if (!authenticated()) {
+            return Error{ErrorCode::transport_unauthorized_peer};
+        }
+        const auto request = protocol::decode_audio_focus_request(payload);
+        if (!request) { return request.error(); }
+        const auto state = request.value().type == protocol::AudioFocusRequestType::release
+            ? protocol::AudioFocusState::loss : protocol::AudioFocusState::gain;
+        auto encoded = protocol::encode(protocol::AudioFocusNotification{state, false});
+        if (!encoded) { return encoded.error(); }
+        if (auto sent = send_frames(std::move(encoded).value(), true); !sent) {
+            return sent.error();
+        }
+        return {};
+    }
+    case protocol::ControlMessageId::nav_focus_request: {
+        if (!authenticated()) {
+            return Error{ErrorCode::transport_unauthorized_peer};
+        }
+        const auto request = protocol::decode_nav_focus_request(payload);
+        if (!request) { return request.error(); }
+        // An absent optional selection defaults to projected; native releases focus.
+        auto encoded = protocol::encode(
+            protocol::NavFocusNotification{request.value().type.value_or(protocol::NavFocusType::projected)});
+        if (!encoded) { return encoded.error(); }
+        if (auto sent = send_frames(std::move(encoded).value(), true); !sent) {
+            return sent.error();
+        }
+        return {};
+    }
+    case protocol::ControlMessageId::byebye_request: {
+        if (!authenticated()) {
+            return Error{ErrorCode::transport_unauthorized_peer};
+        }
+        const auto request = protocol::decode_byebye_request(payload);
+        if (!request) { return request.error(); }
+        auto encoded = protocol::encode(protocol::ByeByeResponse{});
+        if (!encoded) { return encoded.error(); }
+        if (auto sent = send_frames(std::move(encoded).value(), true); !sent) {
+            (void)fail(sent.error());
+            return sent.error();
+        }
+        request_stop();
+        tick();
+        return {};
+    }
     case protocol::ControlMessageId::ping_request: {
         auto request = protocol::decode_ping_request(payload);
         if (!request) {
@@ -442,7 +490,22 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         return {};
     }
     default:
-        return bad_argument();
+        // Pinned ControlServiceChannel.cpp:231-234 continues receiving unknown IDs.
+        ++unhandled_controls_;
+        if (unhandled_controls_ <= 8) {
+            diagnostics::Event event{};
+            event.session = session_id_;
+            event.kind = diagnostics::EventKind::transport_stats;
+            event.monotonic_time = deps_.clock.now();
+            event.fields.push_back(diagnostics::EventField::count("msg_id", (high << 8U) | low));
+            event.fields.push_back(diagnostics::EventField::count(
+                "auth_phase", static_cast<std::int64_t>(auth_phase_)));
+            event.fields.push_back(diagnostics::EventField::count(
+                "payload_bytes", static_cast<std::int64_t>(payload.size())));
+            deps_.diagnostics.emit(event);
+            ++diagnostics_emitted_;
+        }
+        return {};
     }
 }
 

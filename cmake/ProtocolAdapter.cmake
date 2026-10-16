@@ -22,6 +22,7 @@ endif()
 
 add_library(aa_protocol_adapter STATIC
     src/protocol/aasdk_adapter/ControlAdapter.cpp
+    src/protocol/aasdk_adapter/FocusAdapter.cpp
     src/protocol/aasdk_adapter/ServiceAdapter.cpp
     src/protocol/aasdk_adapter/MediaConfiguration.cpp
     src/protocol/aasdk_adapter/InputAdapter.cpp

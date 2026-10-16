@@ -174,7 +174,7 @@ class WiredSession final {
 
     // Observed counters (diagnostics/tests). The negotiation counters
     // (channel_opens, version_responses, pings_answered, encapsulated_ssls,
-    // auth_completes) are PER-LINK: attach_transport() zeroes them with the
+    // auth_completes, unhandled_controls) are PER-LINK: attach_transport() zeroes them with the
     // link state. input_sends/input_send_failures/diagnostics_emitted are
     // run-cumulative telemetry.
     [[nodiscard]] std::uint64_t diagnostics_emitted() const noexcept {
@@ -186,6 +186,7 @@ class WiredSession final {
         return input_send_failures_;
     }
     [[nodiscard]] std::uint64_t channel_opens() const noexcept { return channel_opens_; }
+    [[nodiscard]] std::uint64_t unhandled_controls() const noexcept { return unhandled_controls_; }
     [[nodiscard]] std::uint64_t channel_closes() const noexcept { return channel_closes_; }
     [[nodiscard]] std::optional<RejectedFrame> last_reject() const noexcept { return last_reject_; }
     [[nodiscard]] std::uint64_t version_responses() const noexcept { return version_responses_; }
@@ -254,6 +255,7 @@ class WiredSession final {
     std::uint64_t input_sends_{0};
     std::uint64_t input_send_failures_{0};
     std::uint64_t channel_opens_{0};
+    std::uint64_t unhandled_controls_{0};
     std::uint64_t channel_closes_{0};
     std::optional<RejectedFrame> last_reject_{};
     std::uint64_t version_responses_{0};
