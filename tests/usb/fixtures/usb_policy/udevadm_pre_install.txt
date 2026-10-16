@@ -1,0 +1,235 @@
+# udevadm test fixture - task-29 evidence.
+# Source: jetson.local `udevadm test /sys/bus/usb/devices/1-2.1` BEFORE install (task-29 pre-state).
+# Device-supplied strings redacted (TEST-SERIAL-001 style).
+=== udevadm test 1-2.1 ===
+Trying to open "/etc/systemd/hwdb/hwdb.bin"...
+Trying to open "/etc/udev/hwdb.bin"...
+Trying to open "/usr/lib/systemd/hwdb/hwdb.bin"...
+Trying to open "/usr/lib/udev/hwdb.bin"...
+=== trie on-disk ===
+tool version:          255
+file size:        12812287 bytes
+header size             80 bytes
+strings            2589263 bytes
+nodes             10222944 bytes
+Loading kernel module index.
+Failed to read $container of PID 1, ignoring: Permission denied
+Found cgroup2 on /sys/fs/cgroup/, full unified hierarchy
+Found container virtualization none.
+Using default interface naming scheme 'v255'.
+Parsed configuration file "/usr/lib/systemd/network/99-default.link"
+Parsed configuration file "/usr/lib/systemd/network/73-usb-net-by-mac.link"
+Created link configuration context.
+Reading rules file: /etc/udev/rules.d/10-nv-jetson-dm.rules
+Reading rules file: /usr/lib/udev/rules.d/39-usbmuxd.rules
+Reading rules file: /usr/lib/udev/rules.d/40-usb-media-players.rules
+Reading rules file: /usr/lib/udev/rules.d/40-usb_modeswitch.rules
+Reading rules file: /usr/lib/udev/rules.d/40-vm-hotadd.rules
+Reading rules file: /usr/lib/udev/rules.d/50-apport.rules
+Reading rules file: /usr/lib/udev/rules.d/50-firmware.rules
+Reading rules file: /usr/lib/udev/rules.d/50-udev-default.rules
+Reading rules file: /usr/lib/udev/rules.d/51-android.rules
+Reading rules file: /usr/lib/udev/rules.d/55-dm.rules
+Reading rules file: /usr/lib/udev/rules.d/60-autosuspend.rules
+Reading rules file: /usr/lib/udev/rules.d/60-block.rules
+Reading rules file: /usr/lib/udev/rules.d/60-bridge-network-interface.rules
+Reading rules file: /usr/lib/udev/rules.d/60-cdrom_id.rules
+Reading rules file: /usr/lib/udev/rules.d/60-dmi-id.rules
+Reading rules file: /usr/lib/udev/rules.d/60-drm.rules
+Reading rules file: /usr/lib/udev/rules.d/60-evdev.rules
+Reading rules file: /usr/lib/udev/rules.d/60-fido-id.rules
+Reading rules file: /usr/lib/udev/rules.d/60-gpsd.rules
+Reading rules file: /usr/lib/udev/rules.d/60-i2c-tools.rules
+Reading rules file: /usr/lib/udev/rules.d/60-infiniband.rules
+Reading rules file: /usr/lib/udev/rules.d/60-input-id.rules
+Reading rules file: /usr/lib/udev/rules.d/60-inputattach.rules
+Reading rules file: /usr/lib/udev/rules.d/60-jetson-gpio-common.rules
+Reading rules file: /usr/lib/udev/rules.d/60-libgphoto2-6t64.rules
+Reading rules file: /usr/lib/udev/rules.d/60-libopenni2-0.rules
+Reading rules file: /usr/lib/udev/rules.d/60-libsane1.rules
+Reading rules file: /usr/lib/udev/rules.d/60-openobex.rules
+Reading rules file: /usr/lib/udev/rules.d/60-pcmcia.rules
+Reading rules file: /usr/lib/udev/rules.d/60-persistent-alsa.rules
+Reading rules file: /usr/lib/udev/rules.d/60-persistent-input.rules
+Reading rules file: /usr/lib/udev/rules.d/60-persistent-storage-dm.rules
+Reading rules file: /usr/lib/udev/rules.d/60-persistent-storage-mtd.rules
+Reading rules file: /usr/lib/udev/rules.d/60-persistent-storage-tape.rules
+Reading rules file: /usr/lib/udev/rules.d/60-persistent-storage.rules
+Reading rules file: /usr/lib/udev/rules.d/60-persistent-v4l.rules
+Reading rules file: /usr/lib/udev/rules.d/60-sensor.rules
+Reading rules file: /usr/lib/udev/rules.d/60-serial.rules
+Reading rules file: /usr/lib/udev/rules.d/60-tpm-udev.rules
+Reading rules file: /usr/lib/udev/rules.d/61-gdm.rules
+Reading rules file: /usr/lib/udev/rules.d/61-gnome-settings-daemon-rfkill.rules
+Reading rules file: /usr/lib/udev/rules.d/61-mutter.rules
+Reading rules file: /usr/lib/udev/rules.d/61-persistent-storage-android.rules
+Reading rules file: /usr/lib/udev/rules.d/64-btrfs.rules
+Reading rules file: /usr/lib/udev/rules.d/64-xorg-xkb.rules
+Reading rules file: /usr/lib/udev/rules.d/65-libwacom.rules
+Reading rules file: /usr/lib/udev/rules.d/65-persistent-net-nbft.rules
+Reading rules file: /usr/lib/udev/rules.d/66-azure-ephemeral.rules
+Reading rules file: /usr/lib/udev/rules.d/69-cd-sensors.rules
+Reading rules file: /usr/lib/udev/rules.d/69-libmtp.rules
+Reading rules file: /usr/lib/udev/rules.d/69-wacom.rules
+Reading rules file: /usr/lib/udev/rules.d/70-camera.rules
+Reading rules file: /usr/lib/udev/rules.d/70-joystick.rules
+Reading rules file: /usr/lib/udev/rules.d/70-libfprint-2.rules
+Reading rules file: /usr/lib/udev/rules.d/70-memory.rules
+Reading rules file: /usr/lib/udev/rules.d/70-mouse.rules
+Reading rules file: /usr/lib/udev/rules.d/70-nvmf-autoconnect.rules
+Reading rules file: /usr/lib/udev/rules.d/70-power-switch.rules
+Reading rules file: /usr/lib/udev/rules.d/70-printers.rules
+Reading rules file: /etc/udev/rules.d/70-snap.chromium.rules
+Reading rules file: /etc/udev/rules.d/70-snap.cups.rules
+Reading rules file: /etc/udev/rules.d/70-snap.snapd.rules
+Reading rules file: /etc/udev/rules.d/70-snap.typora.rules
+Reading rules file: /usr/lib/udev/rules.d/70-spice-vdagentd.rules
+Reading rules file: /usr/lib/udev/rules.d/70-touchpad.rules
+Reading rules file: /usr/lib/udev/rules.d/70-uaccess.rules
+Reading rules file: /usr/lib/udev/rules.d/71-ipp-usb.rules
+Reading rules file: /usr/lib/udev/rules.d/71-nvmf-netapp.rules
+Reading rules file: /usr/lib/udev/rules.d/71-power-switch-proliant.rules
+Reading rules file: /usr/lib/udev/rules.d/71-seat.rules
+Reading rules file: /usr/lib/udev/rules.d/73-seat-late.rules
+Reading rules file: /usr/lib/udev/rules.d/73-special-net-names.rules
+Reading rules file: /usr/lib/udev/rules.d/75-net-description.rules
+Reading rules file: /usr/lib/udev/rules.d/75-probe_mtd.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-broadmobi-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-cinterion-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-dell-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-dlink-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-ericsson-mbm.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-fibocom-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-foxconn-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-gosuncn-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-haier-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-huawei-net-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-linktop-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-longcheer-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-mtk-legacy-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-mtk-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-nokia-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-qcom-soc.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-qdl-device-blacklist.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-quectel-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-sierra.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-simtech-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-telit-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-tplink-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-ublox-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-x22x-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/77-mm-zte-port-types.rules
+Reading rules file: /usr/lib/udev/rules.d/78-graphics-card.rules
+Reading rules file: /usr/lib/udev/rules.d/78-sound-card.rules
+Reading rules file: /usr/lib/udev/rules.d/80-debian-compat.rules
+Reading rules file: /usr/lib/udev/rules.d/80-drivers.rules
+Reading rules file: /usr/lib/udev/rules.d/80-iio-sensor-proxy.rules
+Reading rules file: /usr/lib/udev/rules.d/80-libinput-device-groups.rules
+Reading rules file: /usr/lib/udev/rules.d/80-mm-candidate.rules
+Reading rules file: /usr/lib/udev/rules.d/80-net-setup-link.rules
+Reading rules file: /usr/lib/udev/rules.d/80-udisks2.rules
+Reading rules file: /usr/lib/udev/rules.d/81-net-dhcp.rules
+Reading rules file: /usr/lib/udev/rules.d/84-nm-drivers.rules
+Reading rules file: /usr/lib/udev/rules.d/85-hplj10xx.rules
+Reading rules file: /usr/lib/udev/rules.d/85-nm-unmanaged.rules
+Reading rules file: /usr/lib/udev/rules.d/90-alsa-restore.rules
+Reading rules file: /usr/lib/udev/rules.d/90-bolt.rules
+Reading rules file: /usr/lib/udev/rules.d/90-console-setup.rules
+Reading rules file: /usr/lib/udev/rules.d/90-iocost.rules
+Reading rules file: /usr/lib/udev/rules.d/90-libgpod.rules
+Reading rules file: /usr/lib/udev/rules.d/90-libinput-fuzz-override.rules
+Failed to open /run/udev/rules.d/90-netplan.rules, ignoring: Permission denied
+Failed to read rules file /run/udev/rules.d/90-netplan.rules, ignoring: Permission denied
+Reading rules file: /usr/lib/udev/rules.d/90-nm-thunderbolt.rules
+Reading rules file: /usr/lib/udev/rules.d/90-pipewire-alsa.rules
+Reading rules file: /etc/udev/rules.d/91-xorg-conf-tegra.rules
+Reading rules file: /usr/lib/udev/rules.d/95-cd-devices.rules
+Reading rules file: /usr/lib/udev/rules.d/95-dm-notify.rules
+Reading rules file: /usr/lib/udev/rules.d/95-upower-hid.rules
+Reading rules file: /usr/lib/udev/rules.d/95-upower-wup.rules
+Reading rules file: /usr/lib/udev/rules.d/96-e2scrub.rules
+Reading rules file: /usr/lib/udev/rules.d/97-hid2hci.rules
+Reading rules file: /usr/lib/udev/rules.d/99-libsane1.rules
+Reading rules file: /etc/udev/rules.d/99-nv-l4t-usb-device-mode.rules
+Reading rules file: /etc/udev/rules.d/99-nv-l4t-usb-host-config.rules
+Reading rules file: /etc/udev/rules.d/99-nv-ufs-mount.rules
+Reading rules file: /usr/lib/udev/rules.d/99-systemd.rules
+Reading rules file: /etc/udev/rules.d/99-tegra-devices.rules
+Reading rules file: /etc/udev/rules.d/99-tegra-mmc-ra.rules
+value '[dmi/id]sys_vendor' is 'NVIDIA'
+value '[dmi/id]sys_vendor' is 'NVIDIA'
+1-2.1: /usr/lib/udev/rules.d/50-udev-default.rules:19 Importing properties from results of builtin command 'usb_id'
+1-2.1: /usr/lib/udev/rules.d/50-udev-default.rules:19 Importing properties from results of builtin command 'hwdb --subsystem=usb'
+1-2.1: hwdb modalias key: "usb:v18D1p2D01:TEST_MODEL"
+1-2.1: /usr/lib/udev/rules.d/50-udev-default.rules:29 Importing properties from results of builtin command 'path_id'
+1-2.1: /usr/lib/udev/rules.d/50-udev-default.rules:72 MODE 0664
+1-2.1: /usr/lib/udev/rules.d/51-android.rules:308 GROUP 46
+1-2.1: /usr/lib/udev/rules.d/51-android.rules:308 MODE 0660
+1-2.1: /usr/lib/udev/rules.d/60-openobex.rules:3 Running PROGRAM '/usr/sbin/obex-check-device 18d1 2d01'
+1-2.1: Starting '/usr/sbin/obex-check-device 18d1 2d01'
+Successfully forked off '(spawn)' as PID 1071303.
+Skipping PR_SET_MM, as we don't have privileges.
+1-2.1: Process '/usr/sbin/obex-check-device 18d1 2d01' failed with exit code 1.
+1-2.1: /usr/lib/udev/rules.d/60-openobex.rules:3 Command "/usr/sbin/obex-check-device 18d1 2d01" returned 1 (error)
+1-2.1: /usr/lib/udev/rules.d/69-libmtp.rules:39 Running PROGRAM '/usr/lib/udev/mtp-probe /sys/devices/platform/bus@0/3610000.usb/usb1/1-2/1-2.1 1 23'
+1-2.1: Starting '/usr/lib/udev/mtp-probe /sys/devices/platform/bus@0/3610000.usb/usb1/1-2/1-2.1 1 23'
+Successfully forked off '(spawn)' as PID 1071305.
+Skipping PR_SET_MM, as we don't have privileges.
+1-2.1: '/usr/lib/udev/mtp-probe /sys/devices/platform/bus@0/3610000.usb/usb1/1-2/1-2.1 1 23'(out) '0'
+1-2.1: Process '/usr/lib/udev/mtp-probe /sys/devices/platform/bus@0/3610000.usb/usb1/1-2/1-2.1 1 23' succeeded.
+1-2.1: /etc/udev/rules.d/70-snap.cups.rules:8 RUN '/usr/lib/snapd/snap-device-helper $env{ACTION} snap_cups_cupsd $devpath $major:$minor'
+1-2.1: /etc/udev/rules.d/70-snap.cups.rules:15 RUN '/usr/lib/snapd/snap-device-helper $env{ACTION} snap_cups_ippeveprinter $devpath $major:$minor'
+1-2.1: /usr/lib/udev/rules.d/73-seat-late.rules:16 RUN 'uaccess'
+1-2.1: Preserve permissions of /dev/bus/usb/001/023, uid=0, gid=46, mode=0660
+1-2.1: Failed to create symlink '/dev/char/189:22' to '/dev/bus/usb/001/023': Permission denied
+1-2.1: Failed to create device symlink '/dev/char/189:22': Permission denied
+Unload kernel module index.
+Unloaded link configuration context.
+This program is for debugging only, it does not run any program
+specified by a RUN key. It may show incorrect results, because
+some values may be different, or not available at a simulation run.
+
+DEVPATH=/devices/platform/bus@0/3610000.usb/usb1/1-2/1-2.1
+DEVNAME=/dev/bus/usb/001/023
+DEVTYPE=usb_device
+DRIVER=usb
+PRODUCT=18d1/2d01/504
+TYPE=0/0/0
+BUSNUM=001
+DEVNUM=023
+MAJOR=189
+MINOR=22
+ACTION=add
+SUBSYSTEM=usb
+TAGS=:seat:snap_cups_cupsd:snap_cups_ippeveprinter:uaccess:
+ID_BUS=usb
+ID_MODEL=TEST_MODEL
+ID_MODEL_ENC=TEST_MODEL
+ID_MODEL_ID=2d01
+ID_SERIAL=TEST_VENDOR_TEST_MODEL_TEST-SERIAL-001
+ID_SERIAL_SHORT=TEST-SERIAL-001
+ID_VENDOR=TEST_VENDOR
+ID_VENDOR_ENC=TEST_VENDOR
+ID_VENDOR_ID=18d1
+ID_REVISION=0504
+ID_USB_MODEL=TEST_MODEL
+ID_USB_MODEL_ENC=TEST_MODEL
+ID_USB_MODEL_ID=2d01
+ID_USB_SERIAL=TEST_VENDOR_TEST_MODEL_TEST-SERIAL-001
+ID_USB_SERIAL_SHORT=TEST-SERIAL-001
+ID_USB_VENDOR=TEST_VENDOR
+ID_USB_VENDOR_ENC=TEST_VENDOR
+ID_USB_VENDOR_ID=18d1
+ID_USB_REVISION=0504
+ID_USB_INTERFACES=:ffff00:ff4201:
+ID_VENDOR_FROM_DATABASE=Google Inc.
+ID_MODEL_FROM_DATABASE=Android Open Accessory device (accessory + ADB)
+ID_PATH_WITH_USB_REVISION=platform-3610000.usb-usbv2-0:2.1
+ID_PATH=platform-3610000.usb-usb-0:2.1
+ID_PATH_TAG=platform-3610000_usb-usb-0_2_1
+adb_user=yes
+CURRENT_TAGS=:snap_cups_cupsd:seat:snap_cups_ippeveprinter:uaccess:
+ID_FOR_SEAT=usb-platform-3610000_usb-usb-0_2_1
+run: '/usr/lib/snapd/snap-device-helper add snap_cups_cupsd /devices/platform/bus@0/3610000.usb/usb1/1-2/1-2.1 189:22'
+run: '/usr/lib/snapd/snap-device-helper add snap_cups_ippeveprinter /devices/platform/bus@0/3610000.usb/usb1/1-2/1-2.1 189:22'
+run: 'uaccess'
