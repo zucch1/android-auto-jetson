@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -39,11 +40,43 @@ TIMEOUT_S = 90
 
 FAKE_SSH = r"""#!/usr/bin/env bash
 set -euo pipefail
+trap 'rc=$?; printf "%s|%s\n" "$rc" "$cmd" >> "$FAKE_OUTCOMES"' EXIT
 if [ -n "${FAKE_SSH_LOG:-}" ]; then
     printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
 fi
 cmd="${@: -1}"
 all_args="$*"
+state="${FAKE_SSH_STATE}"
+mkdir -p "$state"
+stimulus=0
+case "$cmd" in
+    *'kill 4242'*|*'kill 4243'*|*unbind*|*'keyevent 26'*|*'am force-stop'*|*'--no-bus --duration-ms'*) stimulus=1 ;;
+esac
+if (( stimulus )) && [ ! -f "$state/stimulus" ]; then
+    touch "$state/stimulus"
+    [ -z "${FAKE_FIRST_DELAY:-}" ] || sleep "$FAKE_FIRST_DELAY"
+fi
+case "$cmd" in
+    *'kill 4242'*|*'kill 4243'*) [ -z "${FAKE_CLEANUP_DELAY:-}" ] || sleep "$FAKE_CLEANUP_DELAY" ;;
+esac
+if [ -f "$state/stimulus" ]; then
+    case "$cmd" in
+        *busctl*) [ -z "${FAKE_POST_STATE_DELAY:-}" ] || sleep "$FAKE_POST_STATE_DELAY" ;;
+        *'--no-bus --duration-ms'*) [ -z "${FAKE_ATTEMPT_DELAY:-}" ] || sleep "$FAKE_ATTEMPT_DELAY" ;;
+        *'tail -c +1 /tmp/aa-wired-receiver-attempt.log'*) [ -z "${FAKE_ATTEMPT_LOG_DELAY:-}" ] || sleep "$FAKE_ATTEMPT_LOG_DELAY" ;;
+        *'"event":"status"'*)
+            if [ -f "$state/frames_n" ]; then
+                [ -z "${FAKE_MEDIA_DELAY:-}" ] || sleep "$FAKE_MEDIA_DELAY"
+            fi ;;
+    esac
+    [ -z "${FAKE_COMMAND_DELAY:-}" ] || sleep "$FAKE_COMMAND_DELAY"
+fi
+if [ -n "${FAKE_TERMINAL_MS:-}" ]; then
+    case "$cmd" in
+        *'"event":"input_forwarded","ok":"true"'*) printf '3' > "$state/terminal_countdown" ;;
+        *'tail -c +1 /tmp/aa-wired-receiver-attempt.log'*) printf '2' > "$state/terminal_countdown" ;;
+    esac
+fi
 case "$all_args" in
     *'DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"'*|*'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus'*) ;;
     *) echo "fake-ssh: remote command missing target bus address: $all_args" >&2; exit 98 ;;
@@ -87,7 +120,10 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
         n=$((n+1)); mkdir -p "${FAKE_SSH_STATE:-/tmp}"; echo "$n" > "${FAKE_SSH_STATE:-/tmp}/retries_n"
         printf '%s' "$(( ${FAKE_RETRIES_BASE:-${FAKE_RETRIES:-1}} + ${FAKE_RETRIES_STEP:-0} * (n-1) ))"
         exit 0 ;;
-    *busctl*) [ -n "${FAKE_STATE_DELAY:-}" ] && sleep "${FAKE_STATE_DELAY}"; printf '%s' "${FAKE_STATE:-string \"projecting\"}"; exit 0 ;;
+    *busctl*)
+        [ -n "${FAKE_STATE_DELAY:-}" ] && sleep "${FAKE_STATE_DELAY}"
+        if [ -f "$state/stimulus" ] && [ ! -f "$state/recv" ]; then echo 'string "stopped"'; else printf '%s' "${FAKE_STATE:-string \"projecting\"}"; fi
+        exit 0 ;;
     # pgrep -f REAL matching semantics: the remote command line contains the
     # pattern (the harness quotes it into the ssh command), so pgrep -f matches
     # its own wrapper shell and ALWAYS reports alive. Death verification that
@@ -110,10 +146,12 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
         mkdir -p "${FAKE_SSH_STATE:-/tmp}"; touch "${FAKE_SSH_STATE:-/tmp}/recv"
         echo 4242; exit 0 ;;
     *'"event":"status"'*)
-        if [ -n "${FAKE_DISPLAY_STATUS:-}" ]; then printf '%s' "${FAKE_DISPLAY_STATUS}"; exit 0; fi
+        if [ -n "${FAKE_DISPLAY_STATUS:-}" ]; then printf '%s\n' "$FAKE_DISPLAY_STATUS" >> "$state/frames_trace"; printf '%s' "${FAKE_DISPLAY_STATUS}"; exit 0; fi
         n="$(cat "${FAKE_SSH_STATE:-/tmp}/frames_n" 2>/dev/null || echo 0)"
         n=$((n+1)); mkdir -p "${FAKE_SSH_STATE:-/tmp}"; echo "$n" > "${FAKE_SSH_STATE:-/tmp}/frames_n"
-        printf '%s' "{\"event\":\"status\",\"frames_painted\":$(( ${FAKE_FRAMES_BASE:-3} + ${FAKE_FRAMES_STEP:-2} * (n-1) )),\"render_ok\":true}"
+        value="{\"event\":\"status\",\"frames_painted\":$(( ${FAKE_FRAMES_BASE:-3} + ${FAKE_FRAMES_STEP:-2} * (n-1) )),\"render_ok\":true}"
+        printf '%s\n' "$value" >> "$state/frames_trace"
+        printf '%s' "$value"
         exit 0 ;;
     *'"event":"active"'*) [ "${FAKE_ACTIVE:-1}" = "1" ] && exit 0 || exit 1 ;;
     *unbind*) exit "${FAKE_UNBIND_RC:-0}" ;;
@@ -123,9 +161,195 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
 esac
 """
 
+CLOCK_SHIM = r"""#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+if sys.argv[1:] != ['-c', 'import time; print(time.monotonic_ns())']:
+    os.execv(os.environ['REAL_PYTHON'], [os.environ['REAL_PYTHON'], *sys.argv[1:]])
+state = pathlib.Path(os.environ['FAKE_SSH_STATE'])
+state.mkdir(exist_ok=True)
+clock = state / 'clock'
+now = int(clock.read_text()) if clock.exists() else 1000000000
+countdown = state / 'terminal_countdown'
+if countdown.exists():
+    count = int(countdown.read_text()) - 1
+    countdown.write_text(str(count))
+    if count <= 0:
+        now = 1000000000 + int(os.environ['FAKE_TERMINAL_MS']) * 1000000
+        countdown.unlink()
+clock.write_text(str(now))
+print(now)
+"""
+
+SLEEP_SHIM = r"""#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+state = pathlib.Path(os.environ['FAKE_SSH_STATE'])
+clock = state / 'clock'
+now = int(clock.read_text()) if clock.exists() else 1000000000
+if os.environ.get('FAKE_FREEZE_SLEEP') != '1':
+    now += int(float(sys.argv[1]) * 1000000000)
+clock.write_text(str(now))
+"""
+
 
 class RecoveryQaGates(unittest.TestCase):
     script = ""
+    recovery_scenarios = ("receiver_restart", "consumer_restart", "usb_unplug_replug",
+                          "phone_lock_unlock", "phone_aa_restart", "unknown_phone")
+
+    def passing_env(self) -> dict[str, str]:
+        return {
+            "FAKE_FRAMES_BASE": "5", "FAKE_FRAMES_STEP": "2",
+            "FAKE_MEDIA_TIMING": "1", "FAKE_INPUT_OK": "1",
+            "FAKE_LOG_WINDOW": ('{"event":"diag","phone_id":"id-approved"}\n'
+                                '{"kind":"reconnect","phone_id":"id-approved"}'),
+            "FAKE_ATTEMPT_LOG": ('{"event":"err","detail":"link",'
+                                 '"code":"transport_unauthorized_peer",'
+                                 '"phone_id":"id-second","port":"1-2.3"}'),
+        }
+
+    def assert_budget_failure(self, code: int, doc: dict) -> None:
+        self.assertNotEqual(code, 0, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        self.assertEqual(doc["scenarios"][0]["status"], "FAILED")
+        self.assertEqual(doc["scenarios"][0]["detail"], "recovery_exceeded_budget")
+
+    def test_contract_budget_cannot_be_enlarged(self):
+        for budget in ("0", "5001", "8000", "18446744073709551617"):
+            for cli in (False, True):
+                with self.subTest(budget=budget, cli=cli):
+                    args = ["--readiness-only"] + (["--budget-ms", budget] if cli else [])
+                    code, doc = self.run_qa(args, **({} if cli else {"BUDGET_MS": budget}))
+                    self.assertEqual(code, 2, self.last_stderr)
+                    self.assertEqual(doc, {})
+
+    def test_terminal_boundary_all_scenarios(self):
+        for scenario in self.recovery_scenarios:
+            for boundary in (4999, 5000, 5001):
+                with self.subTest(scenario=scenario, boundary=boundary):
+                    env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_FREEZE_SLEEP": "1",
+                                                "FAKE_TERMINAL_MS": str(boundary)}
+                    code, doc = self.run_qa(["--only", scenario], **env)
+                    row = doc["scenarios"][0]
+                    self.assertEqual(row["recovery_ms"], boundary, doc)
+                    if boundary < 5000:
+                        self.assertEqual(code, 0, doc)
+                        self.assertEqual(row["status"], "PASS")
+                    else:
+                        self.assert_budget_failure(code, doc)
+
+    def test_first_stimulus_origin_all_scenarios(self):
+        stimulus_tokens = ("kill 4242", "kill 4243", "drivers/usb/unbind",
+                           "keyevent 26", "am force-stop", "--no-bus --duration-ms")
+        for scenario, token in zip(self.recovery_scenarios, stimulus_tokens, strict=True):
+            with self.subTest(scenario=scenario):
+                env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_FIRST_DELAY": "5"}
+                code, doc = self.run_qa(["--only", scenario], **env)
+                self.assertIn(token, self.last_calls)
+                self.assert_budget_failure(code, doc)
+                self.assertIsNone(doc["scenarios"][0]["recovery_ms"])
+                self.assertGreaterEqual(doc["scenarios"][0]["elapsed_ms"], 5000)
+                if scenario == "usb_unplug_replug":
+                    self.assertIn("drivers/usb/bind", self.last_calls)
+
+    def test_real_late_media_reproduction(self):
+        env = self.passing_env() | {"FAKE_MEDIA_DELAY": "5.2"}
+        code, doc = self.run_qa(["--only", "consumer_restart"], **env)
+        self.assert_budget_failure(code, doc)
+        self.assertIsNone(doc["scenarios"][0]["recovery_ms"])
+
+    def test_real_late_admission_reproduction(self):
+        env = self.passing_env() | {"FAKE_ATTEMPT_DELAY": "5.2"}
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assert_budget_failure(code, doc)
+        self.assertIsNone(doc["scenarios"][0]["recovery_ms"])
+
+    def test_late_rejection_log_retrieval(self):
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_ATTEMPT_LOG_DELAY": "5"}
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assertTrue(any(line.startswith("3|") and "--no-bus" in line for line in self.last_outcomes))
+        self.assertIn("tail -c +1 /tmp/aa-wired-receiver-attempt.log", self.last_calls)
+        self.assert_budget_failure(code, doc)
+
+    def test_cumulative_probe_time(self):
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_COMMAND_DELAY": "0.8",
+                                    "EVIDENCE_WAIT_MS": "8000"}
+        code, doc = self.run_qa(["--only", "consumer_restart"], **env)
+        self.assert_budget_failure(code, doc)
+        self.assertGreater(len(self.last_outcomes), 5)
+        self.assertIsNone(doc["scenarios"][0]["recovery_ms"])
+
+    def test_oversized_evidence_window_cannot_extend_deadline(self):
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_MEDIA_DELAY": "4.1",
+                                    "EVIDENCE_WAIT_MS": "8000"}
+        code, doc = self.run_qa(["--only", "consumer_restart"], **env)
+        self.assert_budget_failure(code, doc)
+
+    def test_finalizer_rejects_invalid_timing(self):
+        cases = {
+            "missing_terminal": ":",
+            "unarmed": 'STIMULUS_NS=""; TERMINAL_NS=1000000100; TERMINAL_SCENARIO=consumer_restart',
+            "wrong_scenario": 'TERMINAL_NS=1000000100; TERMINAL_SCENARIO=unknown_phone',
+            "invalid_order": 'TERMINAL_NS=999999999; TERMINAL_SCENARIO=consumer_restart',
+            "malformed_terminal": 'TERMINAL_NS=broken; TERMINAL_SCENARIO=consumer_restart',
+            "malformed_origin": 'STIMULUS_NS=broken',
+            "malformed_deadline": 'DEADLINE_NS=broken',
+            "extended_deadline": 'DEADLINE_NS=9000000000',
+            "clock_failure": 'monotonic_ns() { return 1; }',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, mutation in cases.items():
+                with self.subTest(case=name):
+                    command = ('set -euo pipefail; set --; source "$SCRIPT"; '
+                               'RESULTS_TSV="$PRIVATE_RESULTS"; TIMING_FAULT="$PRIVATE_FAULT"; '
+                               'reset_scenario consumer_restart; STIMULUS_NS=1000000000; '
+                               'DEADLINE_NS=6000000000; ' + mutation + '; '
+                               'record consumer_restart PASS "" "" full candidate; '
+                               'write_result FAILED test')
+                    env = dict(os.environ, SCRIPT=str(self.script), OUT=str(root / "result.json"),
+                               PRIVATE_RESULTS=str(root / "results"), PRIVATE_FAULT=str(root / "fault"))
+                    command = command.replace('RESULTS_TSV=', 'OUT="$PRIVATE_OUT"; RESULTS_TSV=', 1)
+                    env["PRIVATE_OUT"] = str(root / "result.json")
+                    result = subprocess.run(["bash", "-c", command], capture_output=True,
+                                            text=True, env=env, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    row = json.loads((root / "result.json").read_text())["scenarios"][-1]
+                    self.assertEqual(row["status"], "FAILED")
+                    self.assertTrue(row["detail"].startswith("timing_error"), row)
+
+    def test_partial_evidence_expiry_has_no_recovery_time(self):
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_INPUT_OK": "0",
+                                    "EVIDENCE_WAIT_MS": "8000"}
+        code, doc = self.run_qa(["--only", "consumer_restart"], **env)
+        self.assert_budget_failure(code, doc)
+        row = doc["scenarios"][0]
+        self.assertIsNone(row["recovery_ms"])
+        self.assertGreaterEqual(row["elapsed_ms"], 5000)
+        self.assertIn('"event":"input_forwarded","ok":"true"', self.last_calls)
+
+    def test_pre_stimulus_blocking_has_no_clock_claim(self):
+        env = self.passing_env() | {"FAKE_ADB_LONG": "ONLY device usb:1-2.1"}
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assertEqual(code, 3, doc)
+        row = doc["scenarios"][0]
+        self.assertEqual(row["status"], "BLOCKED")
+        self.assertIsNone(row["recovery_ms"])
+        self.assertIsNone(row["elapsed_ms"])
+        self.assertNotIn("--no-bus --duration-ms", self.last_calls)
+
+    def test_reporting_and_cleanup_do_not_change_acceptance(self):
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_FREEZE_SLEEP": "1",
+                                    "FAKE_TERMINAL_MS": "1000", "FAKE_CLEANUP_DELAY": "3"}
+        env.pop("FAKE_FREEZE_SLEEP")
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assertEqual(code, 0, doc)
+        self.assertEqual(doc["scenarios"][0]["recovery_ms"], 1000)
+        self.assertGreaterEqual(doc["wall_ms"], 7000)
+        self.assertGreater(self.last_wall_ms, 0)
 
     def run_qa(self, args: list[str], **env: str) -> tuple[int, dict]:
         with tempfile.TemporaryDirectory() as directory:
@@ -133,6 +357,12 @@ class RecoveryQaGates(unittest.TestCase):
             shim = root / "ssh"
             shim.write_text(FAKE_SSH, encoding="utf-8")
             shim.chmod(0o755)
+            if env.get("FAKE_CLOCK") == "1":
+                # PATH, not a production timestamp override, owns the test clock.
+                for name, text in (("python3", CLOCK_SHIM), ("sleep", SLEEP_SHIM)):
+                    path = root / name
+                    path.write_text(text.replace("#!/usr/bin/env python3", f"#!{sys.executable}", 1), encoding="utf-8")
+                    path.chmod(0o755)
             out = root / "result.json"
             command = [str(self.script), "--out", str(out)]
             if "--readiness-only" not in args:
@@ -142,11 +372,21 @@ class RecoveryQaGates(unittest.TestCase):
             run_env["PATH"] = f"{directory}:{run_env['PATH']}"
             run_env["EVIDENCE_WAIT_MS"] = "300"
             run_env["FAKE_SSH_STATE"] = str(root / "state")
+            run_env["FAKE_SSH_LOG"] = str(root / "ssh.log")
+            run_env["FAKE_OUTCOMES"] = str(root / "outcomes.log")
+            run_env["REAL_PYTHON"] = sys.executable
             run_env.update(env)
+            started = time.monotonic_ns()
             result = subprocess.run(command, capture_output=True, text=True,
-                                    timeout=TIMEOUT_S, env=run_env)
+                                     timeout=TIMEOUT_S, env=run_env)
+            self.last_wall_ms = (time.monotonic_ns() - started) / 1_000_000
             document = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {}
             self.last_stderr = result.stderr
+            self.last_calls = Path(run_env["FAKE_SSH_LOG"]).read_text() if Path(run_env["FAKE_SSH_LOG"]).exists() else ""
+            outcomes = root / "outcomes.log"
+            self.last_outcomes = outcomes.read_text().splitlines() if outcomes.exists() else []
+            frames = root / "state" / "frames_trace"
+            self.last_frames = [json.loads(line)["frames_painted"] for line in frames.read_text().splitlines()] if frames.exists() else []
             return result.returncode, document
 
     # ---- P2-C: exact DRM status matching ----
@@ -389,8 +629,8 @@ class RecoveryQaGates(unittest.TestCase):
             log = Path(directory) / "ssh.log"
             code, doc = self.run_qa(["--only", "usb_unplug_replug"],
                                     FAKE_BIND_RC="1", FAKE_SSH_LOG=str(log))
-            self.assertEqual(code, 3, doc)
-            self.assertEqual(doc["status"], "BLOCKED")
+            self.assertEqual(code, 1, doc)
+            self.assertEqual(doc["status"], "FAILED")
             rows = {row["name"]: row for row in doc["scenarios"]}
             self.assertEqual(rows["usb_unplug_replug"]["detail"],
                              "sysfs_bind_requires_passwordless_sudo")
@@ -401,16 +641,16 @@ class RecoveryQaGates(unittest.TestCase):
     # ---- item 7: recovery_ms is ENFORCED against the budget on PASS and
     #      retries are the per-disturbance delta, not the cumulative maximum ----
     def test_recovery_budget_miss_is_failed(self):
-        status = '{"event":"status","frames_painted":7,"render_ok":true}'
         code, doc = self.run_qa(["--only", "consumer_restart"],
-                                FAKE_STATE_DELAY="1", BUDGET_MS="300",
-                                FAKE_DISPLAY_STATUS=status,
+                                FAKE_POST_STATE_DELAY="1", BUDGET_MS="1500",
+                                FAKE_FRAMES_BASE="5", FAKE_FRAMES_STEP="2",
                                 FAKE_MEDIA_TIMING="1", FAKE_INPUT_OK="1")
         self.assertEqual(code, 1, doc)
         self.assertEqual(doc["status"], "FAILED")
         rows = {row["name"]: row for row in doc["scenarios"]}
         self.assertEqual(rows["consumer_restart"]["detail"], "recovery_exceeded_budget")
-        self.assertGreater(rows["consumer_restart"]["recovery_ms"], 300)
+        self.assertIsNone(rows["consumer_restart"]["recovery_ms"])
+        self.assertGreaterEqual(rows["consumer_restart"]["elapsed_ms"], 1500)
 
     def test_retry_count_is_per_disturbance_delta(self):
         code, doc = self.run_qa(["--only", "consumer_restart"],

@@ -55,6 +55,15 @@
 
 set -euo pipefail
 
+# Host Python 3 is required. No remote or wall clock can authorize acceptance.
+monotonic_ns() {
+    local stamp
+    stamp="$(python3 -c 'import time; print(time.monotonic_ns())')" || return 1
+    [[ "$stamp" =~ ^(0|[1-9][0-9]{0,17})$ ]] || return 1
+    printf '%s\n' "$stamp"
+}
+HARNESS_ENTRY_NS="$(monotonic_ns)" || { echo 'timing_error: host monotonic clock unavailable' >&2; exit 1; }
+
 HOST="${HOST:-jetson.local}"
 PORT="${PORT:-1-2.1}"
 RECEIVER=""
@@ -115,6 +124,11 @@ if ! [[ "$BUDGET_MS" =~ ^[0-9]+$ ]]; then
     echo "refusing hostile --budget-ms value: must be a plain integer" >&2
     exit 2
 fi
+contract_budget_ms=5000
+BUDGET_MS="$(python3 -c 'import sys; n=int(sys.argv[1]); print(n); sys.exit(not 1 <= n <= int(sys.argv[2]))' "$BUDGET_MS" "$contract_budget_ms")" || {
+    echo 'refusing --budget-ms/BUDGET_MS: contract requires 1..5000' >&2
+    exit 2
+}
 if ! [[ "$EVIDENCE_WAIT_MS" =~ ^[0-9]+$ ]]; then
     echo "refusing hostile EVIDENCE_WAIT_MS value: must be a plain integer" >&2
     exit 2
@@ -154,8 +168,20 @@ shq() { printf '%q' "$1"; }
 # consumer aborts with no DISPLAY. $(id -u) must expand on the TARGET (escaped
 # here); it is the ssh login user's uid, not this host's.
 remote() {
-    timeout 30 ssh "${SSH_OPTS[@]}" -- "$HOST" \
-        "export DBUS_SESSION_BUS_ADDRESS=\"unix:path=/run/user/\$(id -u)/bus\"; export DISPLAY=:1; $*"
+    local limit=30 rc=0 now remaining
+    if [[ -n "${STIMULUS_NS:-}" && "${CLEANING:-0}" == 0 && -z "${TERMINAL_NS:-}" ]]; then
+        now="$(monotonic_ns)" || { printf timing_error > "$TIMING_FAULT"; return 125; }
+        remaining=$(( DEADLINE_NS - now ))
+        (( remaining > 0 )) || return 124
+        printf -v limit '%d.%09d' "$(( remaining / 1000000000 ))" "$(( remaining % 1000000000 ))"
+    fi
+    timeout "$limit" ssh "${SSH_OPTS[@]}" -- "$HOST" \
+        "export DBUS_SESSION_BUS_ADDRESS=\"unix:path=/run/user/\$(id -u)/bus\"; export DISPLAY=:1; $*" || rc=$?
+    if [[ -n "${STIMULUS_NS:-}" && "${CLEANING:-0}" == 0 && -z "${TERMINAL_NS:-}" ]]; then
+        now="$(monotonic_ns)" || { printf timing_error > "$TIMING_FAULT"; return 125; }
+        (( now < DEADLINE_NS )) || return 124
+    fi
+    return "$rc"
 }
 
 json_escape() { printf '%s' "$1" | tr -d '\000' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -168,9 +194,101 @@ PORT_Q="$(shq "$PORT")"
 # separator: tab is IFS whitespace and collapses the empty recovery/retries
 # fields, which shifted values into the wrong JSON slots.
 FRAMES_BASELINE=""
+SCENARIO_NAME=""
+STIMULUS_NS=""
+DEADLINE_NS=""
+TERMINAL_NS=""
+TERMINAL_SCENARIO=""
+TIMING_FAULT="${RESULTS_DIR}/timing-fault"
+RECORDED=0
+CLEANING=0
+
+reset_scenario() {
+    SCENARIO_NAME="$1"
+    STIMULUS_NS="" DEADLINE_NS="" TERMINAL_NS="" TERMINAL_SCENARIO=""
+    FRAMES_BASELINE="" RECORDED=0
+    : > "$TIMING_FAULT"
+}
+
+arm_scenario() {
+    if [[ -n "$STIMULUS_NS" ]]; then
+        printf timing_error_rearmed > "$TIMING_FAULT"
+        return 1
+    fi
+    STIMULUS_NS="$(monotonic_ns)" || { printf timing_error_clock > "$TIMING_FAULT"; return 1; }
+    DEADLINE_NS=$(( STIMULUS_NS + BUDGET_MS * 1000000 ))
+}
+
+# Called in the parent only AFTER all scenario-specific terminal predicates.
+complete_scenario() {
+    TERMINAL_SCENARIO="$SCENARIO_NAME"
+    TERMINAL_NS="$(monotonic_ns)" || { printf timing_error_clock > "$TIMING_FAULT"; return 1; }
+}
+
+run_scenario() {
+    local combined_results="$RESULTS_TSV"
+    RESULTS_TSV="${RESULTS_DIR}/scenario.tsv"
+    : > "$RESULTS_TSV"
+    reset_scenario "$1"
+    "scenario_$1"
+    if (( RECORDED != 1 )); then
+        : > "$RESULTS_TSV"
+        RECORDED=0
+        record "$1" FAILED "" "" "" scenario_result_count_invalid
+    fi
+    cat "$RESULTS_TSV" >> "$combined_results"
+    RESULTS_TSV="$combined_results"
+}
+
 record() {
-    printf '%s|%s|%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "${FRAMES_BASELINE}" >> "${RESULTS_TSV}"
+    local name="$1" status="$2" recovery="" retries="$4" evidence="$5" detail="$6"
+    local now elapsed="" delta
+    if [[ -n "$STIMULUS_NS" || "$status" == PASS || -s "$TIMING_FAULT" ]]; then
+        now="$(monotonic_ns)" || now=""
+        if [[ -s "$TIMING_FAULT" || ! "$STIMULUS_NS" =~ ^(0|[1-9][0-9]{0,17})$ ||
+              ! "$DEADLINE_NS" =~ ^(0|[1-9][0-9]{0,17})$ ||
+              ! "$now" =~ ^(0|[1-9][0-9]{0,17})$ || "$name" != "$SCENARIO_NAME" ]] ||
+              (( now < STIMULUS_NS || DEADLINE_NS != STIMULUS_NS + BUDGET_MS * 1000000 )); then
+            status=FAILED detail=timing_error_invalid_context
+        else
+            elapsed="$(( (now - STIMULUS_NS) / 1000000 ))"
+            if [[ -n "$TERMINAL_NS" ]]; then
+                if [[ ! "$TERMINAL_NS" =~ ^(0|[1-9][0-9]{0,17})$ || "$TERMINAL_SCENARIO" != "$name" ]] ||
+                    (( TERMINAL_NS < STIMULUS_NS || TERMINAL_NS > now )); then
+                    status=FAILED detail=timing_error_invalid_terminal
+                else
+                    delta=$(( TERMINAL_NS - STIMULUS_NS ))
+                    # Compare ns BEFORE converting to the reporting unit.
+                    if (( delta >= BUDGET_MS * 1000000 )); then
+                        status=FAILED detail=recovery_exceeded_budget
+                    fi
+                    recovery="$(printf '%d.%06d' "$(( delta / 1000000 ))" "$(( delta % 1000000 ))")"
+                fi
+            elif [[ "$status" == PASS ]]; then
+                status=FAILED detail=timing_error_missing_terminal
+            elif (( now >= DEADLINE_NS )); then
+                status=FAILED detail=recovery_exceeded_budget
+            fi
+        fi
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$name" "$status" "$recovery" "$retries" "$evidence" "$detail" "${FRAMES_BASELINE}" "$elapsed" >> "${RESULTS_TSV}"
+    RECORDED=$(( RECORDED + 1 ))
     FRAMES_BASELINE=""
+}
+
+probe_deadline() {
+    local now
+    now="$(monotonic_ns)" || { printf timing_error_clock > "$TIMING_FAULT"; return 1; }
+    PROBE_DEADLINE_NS=$(( now + $1 * 1000000 ))
+    if [[ -n "$STIMULUS_NS" ]] && (( DEADLINE_NS < PROBE_DEADLINE_NS )); then
+        PROBE_DEADLINE_NS="$DEADLINE_NS"
+    fi
+}
+
+before_deadline() {
+    local now
+    now="$(monotonic_ns)" || { printf timing_error_clock > "$TIMING_FAULT"; return 1; }
+    (( now < $1 ))
 }
 
 # D-Bus projection state (the same contract the task-30 harness uses).
@@ -181,10 +299,11 @@ projecting() {
 }
 
 wait_projecting() {
-    local deadline=$(( $(date +%s%3N) + $1 ))
-    while (( $(date +%s%3N) < deadline )); do
+    probe_deadline "$1" || return 1
+    local deadline="$PROBE_DEADLINE_NS"
+    while before_deadline "$deadline"; do
         if projecting; then
-            return 0
+            before_deadline "$deadline"; return $?
         fi
         sleep 0.2
     done
@@ -192,10 +311,11 @@ wait_projecting() {
 }
 
 wait_not_projecting() {
-    local deadline=$(( $(date +%s%3N) + $1 ))
-    while (( $(date +%s%3N) < deadline )); do
+    probe_deadline "$1" || return 1
+    local deadline="$PROBE_DEADLINE_NS"
+    while before_deadline "$deadline"; do
         if ! projecting; then
-            return 0
+            before_deadline "$deadline"; return $?
         fi
         sleep 0.2
     done
@@ -340,10 +460,11 @@ attributed_rejection() {
 media_evidence() {
     local since="${1:-0}" frames_baseline="${2:-0}"
     stimulate_input
-    local deadline=$(( $(date +%s%3N) + EVIDENCE_WAIT_MS ))
-    while (( $(date +%s%3N) < deadline )); do
+    probe_deadline "$EVIDENCE_WAIT_MS" || return 1
+    local deadline="$PROBE_DEADLINE_NS"
+    while before_deadline "$deadline"; do
         if painted_frames_grew "${frames_baseline}" && audio_pumped "${since}" && input_ok "${since}"; then
-            return 0
+            before_deadline "$deadline"; return $?
         fi
         sleep 0.5
     done
@@ -482,7 +603,7 @@ dip_attributed() {
 # + real media delivery. Anything unobservable is BLOCKED, never PASS.
 
 scenario_receiver_restart() {
-    local t0 t1 recovery offset retries_before
+    local recovery="" offset retries_before
     # The stack is already up and projecting (item 4 setup): this scenario only
     # disturbs it and restarts the receiver.
     if ! wait_projecting "${BUDGET_MS}"; then
@@ -492,7 +613,11 @@ scenario_receiver_restart() {
     # Kill and verify the tracked child BY PID (item 5): pattern kills
     # (pkill/pgrep -f) self-match on the remote command line and can neither
     # kill nor observe this specific child's death.
-    remote "kill ${RECEIVER_PID} 2>/dev/null || true" >/dev/null 2>&1 || true
+    FRAMES_BASELINE="$(frames_painted_baseline)"
+    retries_before=0
+    arm_scenario || { record receiver_restart FAILED "" "" "" timing_error_clock; return; }
+    remote "kill ${RECEIVER_PID} 2>/dev/null || true" >/dev/null 2>&1 ||
+        { record receiver_restart FAILED "" "" "" stimulus_failed; return; }
     sleep 1
     # The receiver's process death is the observed state dip (gate P2).
     if [[ "$(proc_state "${RECEIVER_PID}")" != "gone" ]]; then
@@ -500,27 +625,20 @@ scenario_receiver_restart() {
         return
     fi
     wait_not_projecting 3000 || true
-    t0=$(date +%s%3N)
-    FRAMES_BASELINE="$(frames_painted_baseline)"
     start_receiver || { record receiver_restart FAILED "" "" "" "restart_failed"; return; }
     # start_receiver launches with `> /tmp/aa-wired-receiver.log` (truncate):
     # the pre-restart offset points past EOF in the fresh log and would miss
     # genuine post-recovery media. The evidence window is the fresh log from
     # byte 0 (N4) and the retry baseline restarts with it (item 7).
     offset=0
-    retries_before="$(retries_total)"
     if wait_projecting "${BUDGET_MS}"; then
-        t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
-        if (( recovery > BUDGET_MS )); then
-            record receiver_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
-            return
-        fi
         if ! remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log 2>/dev/null && echo ok" >/dev/null 2>&1; then
             record receiver_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "session_active_not_observed" "no_active_event"
             return
         fi
         if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
-            record receiver_restart PASS "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+active+frames+pump+input" "recovered"
+            complete_scenario || true
+            record receiver_restart PASS "" "$(retry_delta "${retries_before}")" "process_dip+active+frames+pump+input" "recovered"
         else
             record receiver_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+media_unobserved" "no_media_evidence_after_recovery"
         fi
@@ -530,31 +648,28 @@ scenario_receiver_restart() {
 }
 
 scenario_consumer_restart() {
-    local t0 t1 recovery offset retries_before
+    local recovery="" offset retries_before
     # The stack is already up and projecting (item 4 setup): this scenario only
     # disturbs it and restarts the display.
     wait_projecting "${BUDGET_MS}" || { record consumer_restart FAILED "" "" "" "no_initial_projection"; return; }
     # Kill and verify the tracked child BY PID (item 5), never by pattern.
-    remote "kill ${CONSUMER_PID} 2>/dev/null || true" >/dev/null 2>&1 || true
+    offset="$(log_offset)"
+    retries_before="$(retries_total)"
+    arm_scenario || { record consumer_restart FAILED "" "" "" timing_error_clock; return; }
+    remote "kill ${CONSUMER_PID} 2>/dev/null || true" >/dev/null 2>&1 ||
+        { record consumer_restart FAILED "" "" "" stimulus_failed; return; }
     sleep 1
     # The consumer's process death is the observed state dip (gate P2).
     if [[ "$(proc_state "${CONSUMER_PID}")" != "gone" ]]; then
         record consumer_restart FAILED "" "" "dip_unobserved" "display_did_not_stop"
         return
     fi
-    t0=$(date +%s%3N)
-    offset="$(log_offset)"
-    retries_before="$(retries_total)"
     start_consumer || { record consumer_restart FAILED "" "" "" "restart_failed"; return; }
-    FRAMES_BASELINE="$(frames_painted_baseline)" 
+    FRAMES_BASELINE="$(frames_painted_baseline)"
     if wait_projecting "${BUDGET_MS}"; then
-        t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
-        if (( recovery > BUDGET_MS )); then
-            record consumer_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
-            return
-        fi
         if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
-            record consumer_restart PASS "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+frames+pump+input" "recovered"
+            complete_scenario || true
+            record consumer_restart PASS "" "$(retry_delta "${retries_before}")" "process_dip+frames+pump+input" "recovered"
         else
             record consumer_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "process_dip+media_unobserved" "no_media_evidence_after_recovery"
         fi
@@ -564,35 +679,31 @@ scenario_consumer_restart() {
 }
 
 scenario_usb_unplug_replug() {
-    local t0 t1 recovery offset retries_before
+    local recovery="" offset retries_before
     wait_projecting "${BUDGET_MS}" || { record usb_unplug_replug FAILED "" "" "" "no_initial_projection"; return; }
     offset="$(log_offset)"
     retries_before="$(retries_total)"
+    FRAMES_BASELINE="$(frames_painted_baseline)"
+    arm_scenario || { record usb_unplug_replug FAILED "" "" "" timing_error_clock; return; }
+    UNBOUND_PORT="${PORT}"
     if ! remote "sudo -n sh -c 'echo -n ${PORT_Q} > /sys/bus/usb/drivers/usb/unbind'" >/dev/null 2>&1; then
-        record usb_unplug_replug BLOCKED "" "" "" "sysfs_unbind_requires_passwordless_sudo"
+        record usb_unplug_replug FAILED "" "" "" "sysfs_unbind_requires_passwordless_sudo"
         return
     fi
-    UNBOUND_PORT="${PORT}"
     sleep 1
-    t0=$(date +%s%3N)
-    FRAMES_BASELINE="$(frames_painted_baseline)"
     if ! remote "sudo -n sh -c 'echo -n ${PORT_Q} > /sys/bus/usb/drivers/usb/bind'" >/dev/null 2>&1; then
-        record usb_unplug_replug BLOCKED "" "" "" "sysfs_bind_requires_passwordless_sudo"
+        record usb_unplug_replug FAILED "" "" "" "sysfs_bind_requires_passwordless_sudo"
         return
     fi
     UNBOUND_PORT=""
     if wait_projecting "${BUDGET_MS}"; then
-        t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
-        if (( recovery > BUDGET_MS )); then
-            record usb_unplug_replug FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
-            return
-        fi
         if ! dip_observed "${offset}"; then
             record usb_unplug_replug BLOCKED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unobserved" "no_state_or_flow_dip_observed"
             return
         fi
         if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
-            record usb_unplug_replug PASS "${recovery}" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_on_replug"
+            complete_scenario || true
+            record usb_unplug_replug PASS "" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_on_replug"
         else
             record usb_unplug_replug FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip+media_unobserved" "no_media_evidence_after_recovery"
         fi
@@ -602,37 +713,33 @@ scenario_usb_unplug_replug() {
 }
 
 scenario_phone_lock_unlock() {
-    local t0 t1 recovery offset retries_before serial label
+    local recovery="" offset retries_before serial label
     wait_projecting "${BUDGET_MS}" || { record phone_lock_unlock FAILED "" "" "" "no_initial_projection"; return; }
     serial="$(stimulus_serial)" || { record phone_lock_unlock BLOCKED "" "" "" "stimulus_device_unattributed"; return; }
     offset="$(log_offset)"
     retries_before="$(retries_total)"
+    FRAMES_BASELINE="$(frames_painted_baseline)"
+    label="$(intended_phone_label)" || label=""
+    arm_scenario || { record phone_lock_unlock FAILED "" "" "" timing_error_clock; return; }
     adb_stimulus "${serial}" "shell input keyevent 26" >/dev/null 2>&1 ||
         { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
     sleep 2
-    t0=$(date +%s%3N)
     adb_stimulus "${serial}" "shell input keyevent 224" >/dev/null 2>&1 ||
         { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
     adb_stimulus "${serial}" "shell input swipe 540 1600 540 400" >/dev/null 2>&1 ||
         { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
-    FRAMES_BASELINE="$(frames_painted_baseline)"
     if wait_projecting "${BUDGET_MS}"; then
-        t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
-        if (( recovery > BUDGET_MS )); then
-            record phone_lock_unlock FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
-            return
-        fi
         if ! dip_observed "${offset}"; then
             record phone_lock_unlock BLOCKED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unobserved" "no_state_or_flow_dip_observed"
             return
         fi
-        label="$(intended_phone_label)" || label=""
         if ! dip_attributed "${offset}" "${label}"; then
             record phone_lock_unlock FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unattributed" "dip_not_attributed_to_intended_device"
             return
         fi
         if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
-            record phone_lock_unlock PASS "${recovery}" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_after_unlock"
+            complete_scenario || true
+            record phone_lock_unlock PASS "" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_after_unlock"
         else
             record phone_lock_unlock FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip+media_unobserved" "no_media_evidence_after_recovery"
         fi
@@ -642,32 +749,28 @@ scenario_phone_lock_unlock() {
 }
 
 scenario_phone_aa_restart() {
-    local t0 t1 recovery offset retries_before serial label
+    local recovery="" offset retries_before serial label
     wait_projecting "${BUDGET_MS}" || { record phone_aa_restart FAILED "" "" "" "no_initial_projection"; return; }
     serial="$(stimulus_serial)" || { record phone_aa_restart BLOCKED "" "" "" "stimulus_device_unattributed"; return; }
     offset="$(log_offset)"
     retries_before="$(retries_total)"
-    t0=$(date +%s%3N)
+    FRAMES_BASELINE="$(frames_painted_baseline)"
+    label="$(intended_phone_label)" || label=""
+    arm_scenario || { record phone_aa_restart FAILED "" "" "" timing_error_clock; return; }
     adb_stimulus "${serial}" "shell am force-stop com.google.android.projection.gearhead" >/dev/null 2>&1 ||
         { record phone_aa_restart FAILED "" "" "" "stimulus_failed"; return; }
-    FRAMES_BASELINE="$(frames_painted_baseline)"
     if wait_projecting "${BUDGET_MS}"; then
-        t1=$(date +%s%3N); recovery=$(( t1 - t0 ))
-        if (( recovery > BUDGET_MS )); then
-            record phone_aa_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "budget_exceeded" "recovery_exceeded_budget"
-            return
-        fi
         if ! dip_observed "${offset}"; then
             record phone_aa_restart BLOCKED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unobserved" "no_state_or_flow_dip_observed"
             return
         fi
-        label="$(intended_phone_label)" || label=""
         if ! dip_attributed "${offset}" "${label}"; then
             record phone_aa_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unattributed" "dip_not_attributed_to_intended_device"
             return
         fi
         if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
-            record phone_aa_restart PASS "${recovery}" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_after_aa_restart"
+            complete_scenario || true
+            record phone_aa_restart PASS "" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_after_aa_restart"
         else
             record phone_aa_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip+media_unobserved" "no_media_evidence_after_recovery"
         fi
@@ -707,6 +810,7 @@ scenario_unknown_phone() {
     # (b) drive the SECOND device through admission: one bounded receiver run
     # on ITS port with the same store. The link-error record of that attempt
     # carries the rejected attempt's identity+port (additive fields).
+    arm_scenario || { record unknown_phone FAILED "" "" "" timing_error_clock; return; }
     drive_admission_attempt "${d2_port}"
     local window attribution phone_id attempt_port
     window="$(attempt_window)"
@@ -736,6 +840,7 @@ scenario_unknown_phone() {
             record unknown_phone FAILED "" "" "rejection+activation" "unknown_device_reached_active"
             return
         fi
+        complete_scenario || true
         record unknown_phone PASS "" "" "attributed_rejection" "unknown_device_rejected_fail_closed"
         return
     fi
@@ -762,6 +867,7 @@ rebind_unbound() {
 }
 
 cleanup_target() {
+    CLEANING=1
     rebind_unbound
     # Teardown by tracked PID (item 5): pattern kills (pkill -f) self-match the
     # remote wrapper shell and can kill the wrong process.
@@ -771,6 +877,11 @@ cleanup_target() {
 
 write_result() {
     local overall_status="$1" blocked_on="$2"
+    cleanup_target
+    trap - EXIT
+    local wall_end wall_ms=null
+    wall_end="$(monotonic_ns)" || wall_end=""
+    if [[ -n "$wall_end" ]]; then wall_ms=$(( (wall_end - HARNESS_ENTRY_NS) / 1000000 )); fi
     local subset="false"
     local only_field="null"
     local verdict_note="phase-A host-side acceptance is separate (ctest -R wired_recovery); this is the live record"
@@ -787,29 +898,32 @@ write_result() {
         printf '  "host": "sha256:%s",\n' "${host_tag}"
         printf '  "port": "%s",\n' "$(json_escape "$PORT")"
         printf '  "budget_ms": %s,\n' "$BUDGET_MS"
+        printf '  "wall_ms": %s,\n' "$wall_ms"
         printf '  "only": %s,\n' "${only_field}"
         printf '  "subset": %s,\n' "${subset}"
         printf '  "status": "%s",\n' "$overall_status"
         printf '  "blocked_on": "%s",\n' "$(json_escape "$blocked_on")"
         printf '  "scenarios": [\n'
-        local first=1 name status recovery retries evidence detail frames_baseline
-        while IFS='|' read -r name status recovery retries evidence detail frames_baseline; do
+        local first=1 name status recovery retries evidence detail frames_baseline elapsed
+        while IFS='|' read -r name status recovery retries evidence detail frames_baseline elapsed; do
             [[ -n "${name}" ]] || continue
             (( first )) || printf ',\n'
             first=0
-            printf '    {"name": "%s", "status": "%s", "recovery_ms": %s, "retries": %s, "evidence": "%s", "detail": "%s", "frames_painted_baseline": %s}' \
+            printf '    {"name": "%s", "status": "%s", "recovery_ms": %s, "retries": %s, "evidence": "%s", "detail": "%s", "frames_painted_baseline": %s, "elapsed_ms": %s}' \
                 "$(json_escape "$name")" "$(json_escape "$status")" \
                 "${recovery:-null}" "${retries:-null}" \
                 "$(json_escape "$evidence")" "$(json_escape "$detail")" \
-                "${frames_baseline:-null}"
+                "${frames_baseline:-null}" "${elapsed:-null}"
         done < "${RESULTS_TSV}"
         printf '\n  ],\n'
-        printf '  "budget_note": "recovery_ms is harness-measured wall time (disturbance -> observed recovery) and is ENFORCED against the <=%s ms budget on every PASS: a budget miss records FAILED, never PASS; the bounded waits bound the observations",\n' "$BUDGET_MS"
+        printf '  "budget_note": "recovery_ms is host-monotonic first-stimulus to COMPLETE terminal observation, ENFORCED strictly < %s ms on every PASS; exactly the boundary is FAILED; elapsed_ms includes partial observation and wall_ms includes setup and completed cleanup",\n' "$BUDGET_MS"
         printf '  "note": "%s"\n' "$(json_escape "${verdict_note}")"
         printf '}\n'
     } > "$OUT"
     echo "wrote $OUT (status=$overall_status${blocked_on:+ blocked_on=$blocked_on})"
 }
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 
 # ---- 1. reachability (bounded) ----
 if ! remote "true" >/dev/null 2>&1; then
@@ -899,7 +1013,7 @@ fi
 # ---- 4. run the scenario matrix ----
 for scenario in "${SCENARIOS[@]}"; do
     if scenario_selected "$scenario"; then
-        "scenario_${scenario}"
+        run_scenario "$scenario"
     fi
 done
 
@@ -914,11 +1028,14 @@ fi
 # ---- 4. verdict: PASS only if every SELECTED scenario passed with evidence ----
 overall="PASS"
 blocked_on=""
-while IFS='|' read -r name status recovery retries evidence detail; do
+while IFS='|' read -r name status recovery retries evidence detail frames_baseline elapsed; do
     [[ -n "${name}" ]] || continue
+    if [[ "$status" == PASS ]] && ! python3 -c 'import sys; v=float(sys.argv[1]); sys.exit(not (0 <= v < int(sys.argv[2])))' "$recovery" "$BUDGET_MS"; then
+        status=FAILED detail=timing_error_pass_invariant
+    fi
     case "${status}" in
         PASS|N/A) ;;
-        BLOCKED) overall="BLOCKED"; blocked_on="${blocked_on:+${blocked_on},}${name}:${detail}" ;;
+        BLOCKED) [[ "$overall" == FAILED ]] || overall="BLOCKED"; blocked_on="${blocked_on:+${blocked_on},}${name}:${detail}" ;;
         *) overall="FAILED"; blocked_on="${blocked_on:+${blocked_on},}${name}:${detail}" ;;
     esac
 done < "${RESULTS_TSV}"
