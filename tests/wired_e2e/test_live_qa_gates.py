@@ -73,6 +73,7 @@ if [ "$cmd" = "true" ]; then
     exit 0
 fi
 if [[ "$cmd" == *grep* && "$cmd" != *aa-disp.in* ]]; then
+    sleep "${FAKE_PROBE_DELAY_S:-0}"
     counter="$FAKE_LOG_ROOT/polls"
     count=0
     [[ -f "$counter" ]] && count="$(cat "$counter")"
@@ -123,14 +124,16 @@ esac
 class LiveQaGates(unittest.TestCase):
     script = ""
 
-    def run_qa(self, readiness_only: bool, **env: str) -> tuple[int, dict]:
+    def run_qa(self, readiness_only: bool, *, projection_timeout_ms: int = 300,
+               **env: str) -> tuple[int, dict]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             shim = root / "ssh"
             shim.write_text(FAKE_SSH, encoding="utf-8")
             shim.chmod(0o755)
             out = root / "result.json"
-            command = [str(self.script), "--out", str(out), "--projection-timeout-ms", "300"]
+            command = [str(self.script), "--out", str(out), "--projection-timeout-ms",
+                       str(projection_timeout_ms)]
             if readiness_only:
                 command.append("--readiness-only")
             else:
@@ -179,9 +182,15 @@ class LiveQaGates(unittest.TestCase):
         self.assertFalse(doc["observables"]["input_evidence"])
 
     def test_delayed_streams_and_activation_are_polled(self) -> None:
-        code, doc = self.run_qa(False, FAKE_DELAY_POLLS="4")
-        self.assertEqual(code, 0, doc)
-        self.assertEqual(doc["status"], "PASS")
+        # This checks eventual evidence, not a 300 ms host scheduling budget.
+        with tempfile.TemporaryDirectory() as directory:
+            code, doc = self.run_qa(
+                False, projection_timeout_ms=1500, FAKE_LOG_ROOT=directory,
+                FAKE_DELAY_POLLS="4", FAKE_PROBE_DELAY_S="0.04",
+            )
+            self.assertEqual(code, 0, doc)
+            self.assertEqual(doc["status"], "PASS")
+            self.assertGreater(int((Path(directory) / "polls").read_text()), 4)
 
     def test_teardown_terminates_and_checks_both_target_pids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
