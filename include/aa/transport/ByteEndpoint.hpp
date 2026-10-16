@@ -6,6 +6,7 @@
 #include <aa/core/Result.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <span>
 
@@ -23,6 +24,11 @@ namespace aa::transport {
 class ByteEndpoint {
 public:
     virtual void set_io_deadline(core::Deadline::Clock::time_point) noexcept {}
+    // Opt-in, on the I/O owner between blocking transfers. May process control/
+    // store work and request cancellation; MUST NOT close, replace, destroy or
+    // recursively operate the endpoint/transport. Empty preserves other callers.
+    // NOLINTNEXTLINE(performance-unnecessary-value-param): overrides take ownership.
+    virtual void set_io_checkpoint(std::function<void()> checkpoint) { (void)checkpoint; }
     virtual ~ByteEndpoint() = default;
     ByteEndpoint() = default;
     ByteEndpoint(const ByteEndpoint&) = delete;
