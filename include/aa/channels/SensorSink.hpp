@@ -20,12 +20,14 @@ public:
 
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override;
     [[nodiscard]] core::Result<void> set_night_mode(bool night);
+    [[nodiscard]] std::uint64_t unhandled() const noexcept { return unhandled_; }
 
 private:
     void on_sensor_event(const input::SensorEvent& event) override;
     Send send_;
     input::SensorService service_;
     std::optional<Error> event_error_;
+    std::uint64_t unhandled_{0};
 };
 
 } // namespace aa::channels

@@ -9,6 +9,11 @@ core::Result<void> SensorSink::on_message(const protocol::MessageView& message) 
     if (message.header.channel != protocol::ChannelRole::sensors) {
         return Error{ErrorCode::protocol_unsupported_channel};
     }
+    if (message.payload.size() >= 2 &&
+        (message.payload[0] != std::byte{0x80} || message.payload[1] != std::byte{0x01})) {
+        ++unhandled_;
+        return {};
+    }
     const auto request = protocol::decode_sensor_request(message.payload);
     if (!request) { return request.error(); }
     // All non-night types map to an unsupported policy channel, never to a

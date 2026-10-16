@@ -26,6 +26,7 @@
 #include <aa/app/WiredSession.hpp>
 #include <aa/audio/AudioRouter.hpp>
 #include <aa/channels/SensorSink.hpp>
+#include <aa/channels/InputSink.hpp>
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/ControlService.hpp>
@@ -77,6 +78,19 @@ void log_line(const std::string &json) {
 }
 
 void on_signal(int) { g_running.store(false); }
+
+std::string poll_error_json(aa::ErrorCode code,
+                            std::optional<aa::app::WiredSession::RejectedFrame> reject) {
+    std::string line = std::string{"{\"event\":\"err\",\"detail\":\"poll\",\"code\":\""} +
+                       std::string{aa::to_string(code)} + "\"";
+    if (code == aa::ErrorCode::channel_not_registered && reject) {
+        line += ",\"reject_channel\":" + std::to_string(reject->channel);
+        if (reject->msg_id) {
+            line += ",\"reject_msg_id\":" + std::to_string(*reject->msg_id);
+        }
+    }
+    return line + "}";
+}
 
 // Task-48 media-timing diagnostics: nanoseconds -> milliseconds as an exact
 // rational (ns / 1e6) carried in a double, with no lossy pre-rounding - the
@@ -430,6 +444,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     VideoOutlet video_outlet;
+    aa::channels::InputSink input_sink;
     aa::channels::SensorSink sensor_sink{input, [&session](std::vector<std::byte> payload) {
         return session.send_channel_payload(aa::protocol::ChannelRole::sensors, std::move(payload));
     }};
@@ -438,6 +453,7 @@ int main(int argc, char **argv) {
         !session.register_sink(aa::protocol::ChannelRole::guidance_audio, audio_sink).has_value() ||
         !session.register_sink(aa::protocol::ChannelRole::system_audio, audio_sink).has_value() ||
         !session.register_sink(aa::protocol::ChannelRole::speech_audio, audio_sink).has_value() ||
+        !session.register_sink(aa::protocol::ChannelRole::input, input_sink).has_value() ||
         !session.register_sink(aa::protocol::ChannelRole::sensors, sensor_sink).has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"sink\"}");
         return 1;
@@ -622,8 +638,7 @@ int main(int argc, char **argv) {
                     if (!g_running.load()) {
                         break;
                     }
-                    log_line(std::string{"{\"event\":\"err\",\"detail\":\"poll\",\"code\":\""} +
-                             std::string{aa::to_string(code)} + "\"}");
+                    log_line(poll_error_json(code, session.last_reject()));
                     if (!session.failure() &&
                         (code == aa::ErrorCode::transport_closed ||
                          code == aa::ErrorCode::transport_io || code == aa::ErrorCode::timeout)) {

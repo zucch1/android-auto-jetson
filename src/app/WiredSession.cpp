@@ -152,6 +152,8 @@ void WiredSession::reset_link() noexcept {
     cipher_.reset();
     sequence_ = 0;
     channel_opens_ = 0;
+    channel_closes_ = 0;
+    last_reject_.reset();
     version_responses_ = 0;
     pings_answered_ = 0;
     encapsulated_ssls_ = 0;
@@ -239,6 +241,7 @@ core::Result<std::size_t> WiredSession::send_version_request(std::uint16_t major
 // ---------------------------------------------------------------------------
 
 core::Result<bool> WiredSession::poll_transport() {
+    last_reject_.reset();
     if (transport_ == nullptr) {
         return Error{ErrorCode::transport_unavailable};
     }
@@ -286,12 +289,56 @@ core::Result<void> WiredSession::route(const transport::Message &message) {
         return Error{ErrorCode::transport_unauthorized_peer};
     }
     if (!negotiator_.has_value()) {
+        const auto id = message.payload.size() >= 2
+            ? std::optional<std::uint16_t>{static_cast<std::uint16_t>(
+                (static_cast<std::uint16_t>(message.payload[0]) << 8U) |
+                static_cast<std::uint16_t>(message.payload[1]))} : std::nullopt;
+        last_reject_ = RejectedFrame{message.channel, id};
         return not_configured();
+    }
+    const auto id = message.payload.size() >= 2
+        ? std::optional<std::uint16_t>{static_cast<std::uint16_t>(
+            (static_cast<std::uint16_t>(message.payload[0]) << 8U) |
+            static_cast<std::uint16_t>(message.payload[1]))} : std::nullopt;
+    const protocol::ServiceKey service{message.channel};
+    // Like pinned SensorSourceService::messageHandler, service channels carry
+    // their own open requests before ordinary service-message dispatch.
+    if (id == static_cast<std::uint16_t>(protocol::ControlMessageId::channel_open_request)) {
+        auto request = protocol::decode_channel_open_request(message.payload);
+        if (!request) {
+            request = protocol::decode_in_band_channel_open_request(message.payload);
+        }
+        protocol::ChannelOpenResponse response{protocol::ChannelOpenStatus::unsupported};
+        if (!request || request.value().service == service) {
+            const auto opened = negotiator_->open({request ? request.value().priority : 0, service});
+            if (opened) { response = opened.value(); }
+        }
+        auto payload = protocol::encode(response);
+        if (!payload) { return payload.error(); }
+        if (auto sent = send_service_payload(message.channel, std::move(payload).value()); !sent) {
+            return sent.error();
+        }
+        if (response.status == protocol::ChannelOpenStatus::success) { ++channel_opens_; }
+        return {};
+    }
+    if (id == static_cast<std::uint16_t>(protocol::ControlMessageId::channel_close_notification)) {
+        ++channel_closes_;
+        return {};
+    }
+    if (!negotiator_->is_open(service)) {
+        const auto opened = negotiator_->open({0, service});
+        if (opened && opened.value().status == protocol::ChannelOpenStatus::success) {
+            ++channel_opens_;
+        }
     }
     ++sequence_;
     const auto at = deps_.clock.now();
-    return negotiator_->dispatch(
+    auto dispatched = negotiator_->dispatch(
         protocol::WireMessageView{message.channel, sequence_, at, message.payload});
+    if (!dispatched && dispatched.error().code() == ErrorCode::channel_not_registered) {
+        last_reject_ = RejectedFrame{message.channel, id};
+    }
+    return dispatched;
 }
 
 core::Result<void> WiredSession::handle_control(std::span<const std::byte> payload) {
@@ -503,19 +550,26 @@ core::Result<std::size_t> WiredSession::send_frames(std::vector<std::byte> paylo
 // Input (task 26).
 // ---------------------------------------------------------------------------
 
+core::Result<void> WiredSession::send_service_payload(std::uint8_t channel,
+                                                       std::vector<std::byte> payload) {
+    if (!authenticated()) { return Error{ErrorCode::transport_unauthorized_peer}; }
+    // D19 keeps the kind bit clear for Samsung framers, deliberately diverging
+    // from AASDK's CONTROL-kind sendChannelOpenResponse on service channels.
+    transport::Message message{channel, transport::MessageKind::specific, std::move(payload)};
+    auto frames = transport::encode_message(message, transport::Encryption::encrypted, cipher_.get());
+    if (!frames) { return frames.error(); }
+    for (const auto& frame : frames.value()) {
+        if (auto sent = send_frame(frame); !sent) { return sent.error(); }
+    }
+    return {};
+}
+
 core::Result<void> WiredSession::send_channel_payload(protocol::ChannelRole role,
                                                        std::vector<std::byte> payload) {
     if (!authenticated()) { return Error{ErrorCode::transport_unauthorized_peer}; }
     for (const auto& service : descriptors_) {
         if (service.role != role) { continue; }
-        transport::Message message{static_cast<std::uint8_t>(service.id.value),
-                                   transport::MessageKind::specific, std::move(payload)};
-        auto frames = transport::encode_message(message, transport::Encryption::encrypted, cipher_.get());
-        if (!frames) { return frames.error(); }
-        for (const auto& frame : frames.value()) {
-            if (auto sent = send_frame(frame); !sent) { return sent.error(); }
-        }
-        return {};
+        return send_service_payload(static_cast<std::uint8_t>(service.id.value), std::move(payload));
     }
     return Error{ErrorCode::channel_not_registered};
 }

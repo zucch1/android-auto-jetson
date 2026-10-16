@@ -177,6 +177,23 @@ core::Result<ChannelOpenRequest> decode_channel_open_request(std::span<const std
     return message;
 }
 
+core::Result<ChannelOpenRequest>
+decode_in_band_channel_open_request(std::span<const std::byte> payload) {
+    const auto body = aasdk_adapter::control_body(payload, ControlMessageId::channel_open_request);
+    if (!body || body.value().size() > aasdk_adapter::kMaxProtoBodyBytes) {
+        return aasdk_adapter::malformed();
+    }
+    ctl::ChannelOpenRequest wire;
+    // Phones can omit proto2-required priority on service channels. Partial
+    // parsing tolerates that omission only; service_id still needs validation.
+    if (!wire.ParsePartialFromArray(body.value().data(), static_cast<int>(body.value().size())) ||
+        !wire.has_service_id() || !ServiceKey{wire.service_id()}) {
+        return aasdk_adapter::malformed();
+    }
+    return ChannelOpenRequest{wire.has_priority() ? wire.priority() : 0,
+                              ServiceKey{wire.service_id()}};
+}
+
 core::Result<std::vector<std::byte>> encode(const ChannelOpenRequest &message) {
     if (!message.service) {
         return aasdk_adapter::malformed();
