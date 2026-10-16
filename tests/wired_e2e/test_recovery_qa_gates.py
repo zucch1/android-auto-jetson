@@ -724,28 +724,56 @@ class RecoveryQaGates(unittest.TestCase):
 
     # ---- N1: every media conjunct independently gates the verdict ----
     def test_audio_pump_missing_is_not_media(self):
-        status = '{"event":"status","frames_painted":7,"render_ok":true}'
-        code, doc = self.run_qa(
-            ["--only", "consumer_restart"],
-            FAKE_STATE='string "projecting"', FAKE_DISP_ALIVE="0",
-            FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="0",
-            FAKE_AUDIO_CHUNKS="1", FAKE_INPUT_OK="1")
-        self.assertNotEqual(code, 0, doc)
-        self.assertEqual(doc["status"], "FAILED")
-        rows = {row["name"]: row for row in doc["scenarios"]}
-        self.assertIn("media_unobserved", rows["consumer_restart"]["evidence"])
+        for enabled in ("0", "1"):
+            with self.subTest(media_timing=enabled):
+                code, doc = self.run_qa(
+                    ["--only", "consumer_restart"],
+                    FAKE_FRAMES_BASE="5", FAKE_FRAMES_STEP="2",
+                    FAKE_MEDIA_TIMING=enabled, FAKE_AUDIO_CHUNKS="1", FAKE_INPUT_OK="1")
+                row = doc["scenarios"][0]
+                probes = [line for line in self.last_outcomes if '\"event\":\"media_timing\"' in line]
+                self.assertTrue(probes, self.last_calls)
+                self.assertTrue(all(line.startswith(f"{1-int(enabled)}|") for line in probes))
+                self.assertEqual(row["frames_painted_baseline"], 5)
+                self.assertEqual(self.last_frames[0], 5)
+                self.assertGreater(max(self.last_frames), 5)
+                self.assertEqual(code, 0 if enabled == "1" else 1, doc)
+                self.assertEqual(row["status"], "PASS" if enabled == "1" else "FAILED")
+                if enabled == "0":
+                    self.assertEqual(row["detail"], "no_media_evidence_after_recovery")
+                self.assert_fixture_available("audio_chunks", "FAKE_AUDIO_CHUNKS")
 
     def test_input_ok_true_missing_is_not_media(self):
-        status = '{"event":"status","frames_painted":7,"render_ok":true}'
-        code, doc = self.run_qa(
-            ["--only", "consumer_restart"],
-            FAKE_STATE='string "projecting"', FAKE_DISP_ALIVE="0",
-            FAKE_DISPLAY_STATUS=status, FAKE_MEDIA_TIMING="1",
-            FAKE_INPUT_OK="0", FAKE_INPUT_ANY="1")
-        self.assertNotEqual(code, 0, doc)
-        self.assertEqual(doc["status"], "FAILED")
-        rows = {row["name"]: row for row in doc["scenarios"]}
-        self.assertIn("media_unobserved", rows["consumer_restart"]["evidence"])
+        for enabled in ("0", "1"):
+            with self.subTest(input_ok=enabled):
+                code, doc = self.run_qa(
+                    ["--only", "consumer_restart"],
+                    FAKE_FRAMES_BASE="5", FAKE_FRAMES_STEP="2", FAKE_MEDIA_TIMING="1",
+                    FAKE_INPUT_OK=enabled, FAKE_INPUT_ANY="1")
+                row = doc["scenarios"][0]
+                audio = [line for line in self.last_outcomes if '\"event\":\"media_timing\"' in line]
+                inputs = [line for line in self.last_outcomes if '\"event\":\"input_forwarded\",\"ok\":\"true\"' in line]
+                self.assertTrue(audio, self.last_calls)
+                self.assertTrue(all(line.startswith("0|") for line in audio))
+                self.assertTrue(inputs, self.last_calls)
+                self.assertTrue(all(line.startswith(f"{1-int(enabled)}|") for line in inputs))
+                self.assertEqual(self.last_frames[0], 5)
+                self.assertGreater(max(self.last_frames), 5)
+                self.assertEqual(code, 0 if enabled == "1" else 1, doc)
+                self.assertEqual(row["status"], "PASS" if enabled == "1" else "FAILED")
+                if enabled == "0":
+                    self.assertEqual(row["detail"], "no_media_evidence_after_recovery")
+                self.assert_fixture_available("input_forwarded", "FAKE_INPUT_ANY")
+
+    def assert_fixture_available(self, token: str, variable: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, FAKE_SSH_STATE=directory,
+                       FAKE_OUTCOMES=f"{directory}/outcomes", **{variable: "1"})
+            command = ('export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"; '
+                       f"export DISPLAY=:1; grep -q '{token}'")
+            result = subprocess.run(["bash", "-c", FAKE_SSH, "ssh", command],
+                                    capture_output=True, env=env, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     # ---- P3: subset recording, hostile args, redaction, budget labelling ----
     def test_subset_run_records_only_field_and_verdict(self):
