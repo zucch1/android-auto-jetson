@@ -72,7 +72,7 @@ if [ "$cmd" = "true" ]; then
     [ "${FAKE_SSH_FAIL:-0}" = "1" ] && exit 255
     exit 0
 fi
-if [[ "$cmd" == *grep* ]]; then
+if [[ "$cmd" == *grep* && "$cmd" != *aa-disp.in* ]]; then
     counter="$FAKE_LOG_ROOT/polls"
     count=0
     [[ -f "$counter" ]] && count="$(cat "$counter")"
@@ -83,6 +83,7 @@ if [[ "$cmd" == *grep* ]]; then
         [[ "${FAKE_ACTIVE:-1}" == 1 ]] && printf '%s\n' '{"event":"active"}' >> "$log"
         [[ "${FAKE_OBS_VIDEO:-1}" == 1 ]] && printf '%s\n' '{"event":"video_sent"}' >> "$log"
         [[ "${FAKE_OBS_AUDIO:-1}" == 1 ]] && printf '%s\n' '{"event":"audio_chunks"}' >> "$log"
+        [[ "${FAKE_OBS_PUMP:-1}" == 1 ]] && printf '%s\n' '{"event":"media_timing"}' >> "$log"
         if [[ "${FAKE_OBS_INPUT:-1}" == 1 ]]; then
             printf '%s\n' "{\"event\":\"input_forwarded\",\"ok\":\"${FAKE_INPUT_OK:-true}\"}" >> "$log"
         fi
