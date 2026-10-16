@@ -22,6 +22,7 @@
 // budget. The session thread is the only caller of WiredSession methods.
 
 #include <aa/app/WiredLink.hpp>
+#include <aa/app/WiredPhoneControl.hpp>
 #include <aa/app/WiredSession.hpp>
 #include <aa/audio/AudioRouter.hpp>
 #include <aa/diagnostics/Diagnostics.hpp>
@@ -104,10 +105,10 @@ class StdoutDiagnostics final : public aa::diagnostics::DiagnosticSink {
 
 class StorePhones final : public aa::ipc::PhoneDirectory {
   public:
-    explicit StorePhones(aa::trust::ApprovedPhoneStore &store) : store_(store) {}
+    explicit StorePhones(aa::app::WiredPhoneControl &control) : control_(control) {}
 
     [[nodiscard]] aa::core::Result<void> forget(aa::core::PhoneId phone) override {
-        return store_.forget_phone(phone);
+        return control_.forget(phone);
     }
     [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId) override {
         return aa::Error{aa::ErrorCode::invalid_argument};
@@ -123,7 +124,7 @@ class StorePhones final : public aa::ipc::PhoneDirectory {
     }
 
   private:
-    aa::trust::ApprovedPhoneStore &store_;
+    aa::app::WiredPhoneControl &control_;
 };
 
 bool is_idr_au(const std::vector<std::uint8_t> &payload) {
@@ -390,8 +391,14 @@ int main(int argc, char **argv) {
         return 3;
     }
 
+    aa::app::WiredSessionConfig session_config{};
+    session_config.lifecycle.phases.negotiate = Milliseconds{15'000};
+    session_config.input_enabled = true;
+    session_config.input = input;
+    aa::app::WiredSession session{{store, clock, diagnostics}, session_config};
+    aa::app::WiredPhoneControl control{store, session};
     aa::ipc::RandomPairingIdSource ids;
-    StorePhones phones{store};
+    StorePhones phones{control};
     std::optional<aa::ipc::ControlBusService> bus{};
     if (!no_bus) {
         auto started_bus = aa::ipc::ControlBusService::start(
@@ -403,12 +410,6 @@ int main(int argc, char **argv) {
         }
         bus.emplace(std::move(started_bus.value()));
     }
-
-    aa::app::WiredSessionConfig session_config{};
-    session_config.lifecycle.phases.negotiate = Milliseconds{15'000};
-    session_config.input_enabled = true;
-    session_config.input = input;
-    aa::app::WiredSession session{{store, clock, diagnostics}, session_config};
     if (!session.configure(service_descriptors(input)).has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"configure\"}");
         return 1;
@@ -473,22 +474,43 @@ int main(int argc, char **argv) {
     std::atomic<bool> session_failed{false};
     bool runtime_failed = false;
 
+    auto service_control = [&] {
+        control.checkpoint();
+        if (control.finish()) {
+            session_failed.store(true);
+            g_running.store(false);
+            return true;
+        }
+        return false;
+    };
+
     auto reconnect = [&]() -> aa::core::Result<void> {
+        if (service_control()) {
+            return aa::Error{aa::ErrorCode::cancelled};
+        }
         if (auto lost = session.apply(aa::session::Event::link_lost); !lost) {
             return lost.error();
         }
         const auto budget = session.io_deadline();
         while (g_running.load()) {
+            if (service_control()) {
+                return aa::Error{aa::ErrorCode::cancelled};
+            }
             if (auto checked = budget.check(); !checked) {
                 session.tick();
                 return checked.error();
             }
             auto relink = aa::app::open_wired_link(selector, accessory, store, budget);
+            if (service_control()) {
+                return aa::Error{aa::ErrorCode::cancelled};
+            }
             if (relink) {
                 if (relink.value().phone.key != link->phone.key) {
                     return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
                 }
                 link.emplace(std::move(relink.value()));
+                control.bind_phone(link->phone);
+                link->transport->set_io_checkpoint([&] { control.checkpoint(); });
                 session.attach_transport(link->transport.get());
                 if (!bind_link_cipher(link->phone)) {
                     return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
@@ -517,14 +539,24 @@ int main(int argc, char **argv) {
                           std::min(budget.until, std::chrono::steady_clock::now() +
                                                     std::chrono::milliseconds{50}),
                           [] { return false; });
+            lock.unlock();
+            if (service_control()) {
+                return aa::Error{aa::ErrorCode::cancelled};
+            }
         }
         return aa::Error{aa::ErrorCode::cancelled};
     };
 
     std::thread session_thread([&] {
+        control.bind_owner();
+        control.bind_phone(link->phone);
+        link->transport->set_io_checkpoint([&] { control.checkpoint(); });
         while (g_running.load()) {
             {
                 std::lock_guard lock(session_mutex);
+                if (service_control()) {
+                    break;
+                }
                 session.tick();
                 if (session.failure()) {
                     session_failed.store(true);
@@ -533,13 +565,22 @@ int main(int argc, char **argv) {
                 }
                 while (auto event = input_queue.pop()) {
                     const auto outcome = session.submit_input(*event);
+                    if (service_control()) {
+                        break;
+                    }
                     log_line(std::string{"{\"event\":\"input_forwarded\",\"ok\":\""} +
                              (outcome.has_value() ? "true" : "false") + "\"}");
                 }
             }
+            if (!g_running.load()) {
+                break;
+            }
             auto polled = session.poll_transport();
             {
                 std::lock_guard lock(session_mutex);
+                if (service_control()) {
+                    break;
+                }
                 if (!polled.has_value()) {
                     const auto code = polled.error().code();
                     if (!g_running.load()) {
@@ -580,7 +621,14 @@ int main(int argc, char **argv) {
             }
         }
         std::lock_guard lock(session_mutex);
+        (void)control.finish();
+        session.request_stop();
         session.tick();
+        if (session.state() == aa::session::State::stopping) {
+            (void)session.apply(aa::session::Event::cleanup_finished);
+        }
+        link->transport->set_io_checkpoint({});
+        control.close();
     });
 
     std::thread input_thread([&] {
@@ -633,10 +681,6 @@ int main(int argc, char **argv) {
     // thread is gone, so the router report is final and race-free here.
     audio_sink.emit_media_timing();
 
-    {
-        std::lock_guard lock(session_mutex);
-        (void)session.apply(aa::session::Event::cleanup_finished);
-    }
     video_outlet.close();
     router.value().close();
     input_server.value().close();

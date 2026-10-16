@@ -5,6 +5,8 @@
 #undef main
 
 #include "harness.hpp"
+#include "../trust/syscall_faults.hpp"
+#include "../../src/ipc/dbus_adapter/BusConnection.hpp"
 #include <gtest/gtest.h>
 #include <condition_variable>
 #include <unistd.h>
@@ -13,6 +15,11 @@ namespace {
 std::atomic<int> runtime_connects{0};
 std::atomic<int> runtime_ciphers{0};
 bool runtime_recovers = false;
+bool runtime_quiet = false;
+std::atomic<bool> runtime_waiting{false};
+std::atomic<bool> runtime_closed{false};
+std::mutex runtime_owner_mutex;
+std::thread::id runtime_io_owner;
 aa::trust::PhoneIdentity runtime_phone;
 
 class RuntimeTransport final : public aa::transport::Transport {
@@ -30,24 +37,44 @@ class RuntimeTransport final : public aa::transport::Transport {
         return {};
     }
     aa::core::Result<void> send(std::span<const std::byte>) override { return {}; }
+    void set_io_checkpoint(std::function<void()> checkpoint) override {
+        checkpoint_ = std::move(checkpoint);
+    }
     aa::core::Result<std::vector<std::byte>> receive() override {
+        {
+            const std::lock_guard lock(runtime_owner_mutex);
+            runtime_io_owner = std::this_thread::get_id();
+        }
+        if (checkpoint_) {
+            checkpoint_();
+        }
         if (next_ < frames_.size()) {
             return frames_[next_++];
         }
-        if (drops_) {
+        if (drops_ && !runtime_quiet) {
             return aa::Error{aa::ErrorCode::transport_closed};
         }
         std::mutex mutex;
         std::condition_variable_any cv;
         std::unique_lock lock(mutex);
-        cv.wait(lock, token_, [] { return false; });
+        runtime_waiting.store(true);
+        while (!token_.stop_requested()) {
+            lock.unlock();
+            if (checkpoint_) {
+                checkpoint_();
+            }
+            lock.lock();
+            cv.wait_for(lock, token_, std::chrono::milliseconds{20}, [] { return false; });
+        }
+        close();
         return aa::Error{aa::ErrorCode::cancelled};
     }
-    void close() noexcept override {}
+    void close() noexcept override { runtime_closed.store(true); }
   private:
     bool drops_;
     std::size_t next_{};
     aa::core::CancellationToken token_;
+    std::function<void()> checkpoint_;
     std::vector<std::vector<std::byte>> frames_;
 };
 }
@@ -129,6 +156,7 @@ RuntimeResult run_runtime(bool recovers) {
     EXPECT_TRUE(store.approve(aa::trust::TransportIdentity{identity}).has_value());
     runtime_phone = aa::app::wired_phone_identity(identity).value();
     runtime_recovers = recovers;
+    runtime_quiet = false;
     runtime_connects.store(0);
     runtime_ciphers.store(0);
     g_running.store(true);
@@ -167,5 +195,126 @@ TEST(WiredReceiver, PermanentLinkLossExitsNonzeroWithinWiredRecoveryBudget) {
     EXPECT_GE(runtime_connects.load(), 3);
     EXPECT_EQ(runtime_ciphers.load(), 1);
     EXPECT_LT(result.elapsed, std::chrono::milliseconds{5500});
+}
+
+TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
+    namespace bus = aa::ipc::dbus_adapter;
+    namespace faults = aa::trust::test::faults;
+    char directory[] = "/tmp/wired-revoke-runtime-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore initial{path};
+    ASSERT_TRUE(initial.load().has_value());
+    const aa::trust::WiredIdentity identity{
+        "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+    const auto approved = initial.approve(aa::trust::TransportIdentity{identity});
+    ASSERT_TRUE(approved.has_value());
+    runtime_phone = aa::app::wired_phone_identity(identity).value();
+    runtime_quiet = true;
+    runtime_recovers = false;
+    runtime_connects.store(0);
+    runtime_ciphers.store(0);
+    runtime_waiting.store(false);
+    runtime_closed.store(false);
+    g_running.store(true);
+    std::vector<std::string> args{"receiver", "--port", "1-2.1", "--store", path.string(),
+        "--video-socket", (root / "video").string(), "--input-socket", (root / "input").string(),
+        "--duration-ms", "5000"};
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (auto& arg : args) {
+        argv.push_back(arg.data());
+    }
+    std::vector<std::thread::id> mutations;
+    faults::arm(faults::Fault::none);
+    faults::set_observer([&] { mutations.push_back(std::this_thread::get_id()); });
+    testing::internal::CaptureStdout();
+    int code = -1;
+    std::thread::id dispatcher;
+    std::thread receiver([&] {
+        dispatcher = std::this_thread::get_id();
+        code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+    });
+    std::atomic<bool> watchdog_fired{false};
+    std::jthread watchdog([&](const std::stop_token& stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, stop, std::chrono::seconds{3}, [] { return false; });
+        if (!stop.stop_requested()) {
+            watchdog_fired.store(true);
+            g_running.store(false);
+        }
+    });
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (!runtime_waiting.load() && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    const bool was_quiet = runtime_waiting.load();
+    auto client = bus::BusConnection::connect_session();
+    aa::core::Result<bus::ParsedMessage> reply{aa::Error{aa::ErrorCode::internal}};
+    bool registered = false;
+    bool closed_at_reply = false;
+    if (client && was_quiet) {
+        const aa::ipc::BusName consumer{"org.custom.AndroidAutoReceiverTest.Consumer"};
+        const aa::ipc::BusName service{"org.custom.AndroidAutoReceiver"};
+        auto named = client.value().request_name(consumer);
+        auto owner = client.value().get_name_owner(service);
+        if (named && owner) {
+            bus::MessageWriter registration;
+            registration.destination(service.value).path("/org/custom/AndroidAutoReceiver")
+                .interface_name("org.custom.AndroidAutoReceiver1").member("RegisterConsumer")
+                .body_signature("s").put_string(consumer.value);
+            auto serial = client.value().send_message(bus::MessageType::method_call, registration);
+            if (serial) {
+                auto result = client.value().await_reply(serial.value(), owner.value());
+                registered = result && result.value().type == bus::MessageType::method_return;
+            }
+            if (registered) {
+                bus::MessageWriter forget;
+                forget.destination(service.value).path("/org/custom/AndroidAutoReceiver")
+                    .interface_name("org.custom.AndroidAutoReceiver1").member("ForgetPhone")
+                    .body_signature("t").put_u64(approved.value().value);
+                auto sent = client.value().send_message(bus::MessageType::method_call, forget);
+                if (sent) {
+                    reply = client.value().await_reply(sent.value(), owner.value());
+                    closed_at_reply = runtime_closed.load();
+                }
+            }
+        }
+    }
+    if (!registered || !reply) {
+        g_running.store(false);
+    }
+    receiver.join();
+    watchdog.request_stop();
+    watchdog.join();
+    const auto output = testing::internal::GetCapturedStdout();
+    faults::set_observer({});
+    faults::disarm();
+    EXPECT_FALSE(watchdog_fired.load()) << output;
+    EXPECT_TRUE(was_quiet);
+    EXPECT_TRUE(registered);
+    ASSERT_TRUE(reply.has_value()) << output;
+    EXPECT_EQ(reply.value().type, bus::MessageType::method_return);
+    EXPECT_TRUE(closed_at_reply);
+    EXPECT_EQ(code, 1) << output;
+    EXPECT_EQ(runtime_connects.load(), 1);
+    EXPECT_EQ(runtime_ciphers.load(), 1);
+    EXPECT_NE(output.find("\"to_state\":\"failed\""), std::string::npos) << output;
+    EXPECT_EQ(output.find("\"detail\":\"poll\""), std::string::npos) << output;
+    ASSERT_FALSE(mutations.empty());
+    {
+        const std::lock_guard lock(runtime_owner_mutex);
+        for (const auto thread : mutations) {
+            EXPECT_EQ(thread, runtime_io_owner);
+            EXPECT_NE(thread, dispatcher);
+        }
+    }
+    aa::trust::ApprovedPhoneStore persisted{path};
+    ASSERT_TRUE(persisted.load().has_value());
+    EXPECT_EQ(persisted.lookup(runtime_phone), aa::trust::Decision::unknown);
+    std::filesystem::remove_all(root);
+    runtime_quiet = false;
 }
 } // namespace
