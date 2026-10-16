@@ -11,6 +11,7 @@
 
 namespace {
 std::atomic<int> runtime_connects{0};
+std::atomic<int> runtime_ciphers{0};
 bool runtime_recovers = false;
 aa::trust::PhoneIdentity runtime_phone;
 
@@ -71,6 +72,7 @@ runtime_cipher(const std::function<bool()> &)
     asm("__wrap__ZN2aa9transport28make_client_handshake_cipherERKSt8functionIFbvEE");
 std::unique_ptr<aa::transport::HandshakingCipher>
 runtime_cipher(const std::function<bool()> &) {
+    ++runtime_ciphers;
     return std::make_unique<wiredtest::FakeHandshakeCipher>();
 }
 
@@ -128,6 +130,7 @@ RuntimeResult run_runtime(bool recovers) {
     runtime_phone = aa::app::wired_phone_identity(identity).value();
     runtime_recovers = recovers;
     runtime_connects.store(0);
+    runtime_ciphers.store(0);
     g_running.store(true);
     std::vector<std::string> args{"receiver", "--port", "1-2.1", "--no-bus", "--store",
                                   path.string(), "--video-socket", (root / "video").string(),
@@ -151,6 +154,7 @@ TEST(WiredReceiver, TransientLinkLossRetriesUntilFreshSessionRecovers) {
     const auto result = run_runtime(true);
     EXPECT_EQ(result.code, 0) << result.output;
     EXPECT_GE(runtime_connects.load(), 4) << "reconnect stopped after one immediate attempt";
+    EXPECT_EQ(runtime_ciphers.load(), 2);
     const auto active = result.output.find("\"to_state\":\"active\"");
     ASSERT_NE(active, std::string::npos) << result.output;
     EXPECT_NE(result.output.find("\"to_state\":\"active\"", active + 1), std::string::npos)
@@ -161,6 +165,7 @@ TEST(WiredReceiver, PermanentLinkLossExitsNonzeroWithinWiredRecoveryBudget) {
     const auto result = run_runtime(false);
     EXPECT_EQ(result.code, 1) << "dead session returned clean success: " << result.output;
     EXPECT_GE(runtime_connects.load(), 3);
+    EXPECT_EQ(runtime_ciphers.load(), 1);
     EXPECT_LT(result.elapsed, std::chrono::milliseconds{5500});
 }
 } // namespace
