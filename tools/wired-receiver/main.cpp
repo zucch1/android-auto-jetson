@@ -25,6 +25,7 @@
 #include <aa/app/WiredPhoneControl.hpp>
 #include <aa/app/WiredSession.hpp>
 #include <aa/audio/AudioRouter.hpp>
+#include <aa/channels/SensorSink.hpp>
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/ControlService.hpp>
@@ -295,6 +296,16 @@ std::vector<aa::protocol::ServiceDescriptor>
 service_descriptors(const aa::input::CapabilityDescriptor &input) {
     const aa::protocol::VideoConfiguration video{{{1280, 720, 30}, {800, 480, 30}}};
     const aa::protocol::AudioConfiguration audio{{{48000, 16, 2}}};
+    aa::protocol::SensorConfiguration sensors;
+    if (input.night_mode() == aa::input::NightModePolicy::manual) {
+        sensors.kinds.push_back(aa::protocol::SensorKind::night_mode);
+    }
+    for (const auto kind : input.vehicle_sensors()) {
+        // The capability vocabulary follows the pinned sensor kinds from
+        // location (1) to toll card (22); unsupported kinds fail validation.
+        sensors.kinds.push_back(static_cast<aa::protocol::SensorKind>(
+            static_cast<std::int32_t>(kind) + 1));
+    }
     return {
         {aa::protocol::ServiceKey{99}, aa::protocol::ChannelRole::video, video},
         {aa::protocol::ServiceKey{100}, aa::protocol::ChannelRole::media_audio, audio},
@@ -303,6 +314,7 @@ service_descriptors(const aa::input::CapabilityDescriptor &input) {
         {aa::protocol::ServiceKey{103}, aa::protocol::ChannelRole::speech_audio, audio},
         {aa::protocol::ServiceKey{104}, aa::protocol::ChannelRole::input,
          aa::protocol::ButtonConfiguration{input.keycodes()}},
+        {aa::protocol::ServiceKey{105}, aa::protocol::ChannelRole::sensors, sensors},
     };
 }
 
@@ -415,11 +427,15 @@ int main(int argc, char **argv) {
         return 1;
     }
     VideoOutlet video_outlet;
+    aa::channels::SensorSink sensor_sink{input, [&session](std::vector<std::byte> payload) {
+        return session.send_channel_payload(aa::protocol::ChannelRole::sensors, std::move(payload));
+    }};
     if (!session.register_sink(aa::protocol::ChannelRole::video, video_outlet).has_value() ||
         !session.register_sink(aa::protocol::ChannelRole::media_audio, audio_sink).has_value() ||
         !session.register_sink(aa::protocol::ChannelRole::guidance_audio, audio_sink).has_value() ||
         !session.register_sink(aa::protocol::ChannelRole::system_audio, audio_sink).has_value() ||
-        !session.register_sink(aa::protocol::ChannelRole::speech_audio, audio_sink).has_value()) {
+        !session.register_sink(aa::protocol::ChannelRole::speech_audio, audio_sink).has_value() ||
+        !session.register_sink(aa::protocol::ChannelRole::sensors, sensor_sink).has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"sink\"}");
         return 1;
     }

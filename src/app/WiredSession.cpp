@@ -485,6 +485,23 @@ core::Result<std::size_t> WiredSession::send_frames(std::vector<std::byte> paylo
 // Input (task 26).
 // ---------------------------------------------------------------------------
 
+core::Result<void> WiredSession::send_channel_payload(protocol::ChannelRole role,
+                                                       std::vector<std::byte> payload) {
+    if (!authenticated()) { return Error{ErrorCode::transport_unauthorized_peer}; }
+    for (const auto& service : descriptors_) {
+        if (service.role != role) { continue; }
+        transport::Message message{static_cast<std::uint8_t>(service.id.value),
+                                   transport::MessageKind::specific, std::move(payload)};
+        auto frames = transport::encode_message(message, transport::Encryption::encrypted, cipher_.get());
+        if (!frames) { return frames.error(); }
+        for (const auto& frame : frames.value()) {
+            if (auto sent = send_frame(frame); !sent) { return sent.error(); }
+        }
+        return {};
+    }
+    return Error{ErrorCode::channel_not_registered};
+}
+
 core::Result<void> WiredSession::submit_input(const ipc::InputEvent &event) {
     if (!input_service_.has_value()) {
         return Error{ErrorCode::channel_unsupported_capability};

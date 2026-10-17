@@ -162,6 +162,9 @@ class WiredSession final {
     // onto the input service channel over the transport.
     [[nodiscard]] core::Result<void> submit_input(const ipc::InputEvent &event);
 
+    [[nodiscard]] core::Result<void>
+    send_channel_payload(protocol::ChannelRole role, std::vector<std::byte> payload);
+
     // Observed counters (diagnostics/tests). The negotiation counters
     // (channel_opens, version_responses, pings_answered, encapsulated_ssls,
     // auth_completes) are PER-LINK: attach_transport() zeroes them with the
