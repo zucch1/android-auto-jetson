@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <aa/consumer/DecodeTelemetry.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/core/Time.hpp>
 #include <aa/ipc/VideoSocket.hpp>
@@ -133,6 +134,9 @@ struct DecodeConfig final {
     protocol::VideoProfile caps{};   // must satisfy protocol::valid_video_profile
     DecodeBackend backend{DecodeBackend::automatic};
     FrameCallback on_frame{};
+    // Observed submit-entry through matched I420 copy completion, before the
+    // frame callback. Unmatched/expired outputs never acquire a duration.
+    DecodeCompletionObserver on_completion{};
 };
 
 // Automatic backend selection and functional software substitution occur
