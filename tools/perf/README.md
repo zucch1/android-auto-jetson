@@ -11,6 +11,7 @@ fixtures/tests and the phase-B runbook; the actual 30-minute performance run and
 tools/perf/
   aa-projection-perf.sh            entry point (strict CLI, fail-closed)
   aa_projection_collect.py         on-target collector (launched over ssh)
+  aa_video_measurements.py         bounded side-band video endpoint reducer
   aa_perf_report.py                capture -> result document + budget verdict
   aa_perf_schema.py                stdlib JSON Schema validator (own output)
   aa-projection-perf.schema.json   the result-document contract
@@ -66,9 +67,9 @@ newline-delimited JSON event stream:
 | --- | --- |
 | receiver RSS / CPU | `/proc/<pid>/status` (`VmRSS`), `/proc/<pid>/stat` (utime+stime over the sampling interval) |
 | thermal state | `/sys/class/thermal/thermal_zone*/{temp,type}` |
-| frame drops | `diag`/`decode_stats` `dropped`/`drops` (or a `frame_drops` field) |
-| decode timing | `diag`/`decode_stats` `p50_latency_ms`/`p95_latency_ms`/`fps`/`frames` |
-| IPC | `diag`/`transport_stats` `p95_latency_ms`/`throughput_mbps` |
+| frame drops | receiver `decode_stats.frame_drops`: observed outlet AU drops, cumulative with final flush |
+| decode timing | matched `video_decode_completed` local submit-entry / I420-copy completion events |
+| IPC | correlated `video_ipc_send` / `video_ipc_receive` endpoints; consumed payload bytes over measured consumer window |
 | A/V sync | peak absolute completion delta of concurrent `video_presented` / `audio_write_completed` events |
 | audio scheduling skew (informational) | `media_timing.audio_scheduling_skew_ms` |
 | audio latency | an event field `audio_latency_ms` |
@@ -91,6 +92,16 @@ completion events, not photon/speaker observations. Until an audio chunk is rout
 stay absent and the collector keeps them `null` -> the run is **BLOCKED** (fail
 closed, never a fabricated `0`). Device-supplied text (thermal zone names) is
 JSON-escaped as data and never injected into the document.
+
+Video endpoints preserve the v1 wire and A/V timestamp. The latter is an opaque
+join key, never a send-start proxy. The reducer bounds pending/dedup tables and
+rolling percentile deltas to 4096 entries, expires unmatched IPC at ten seconds,
+and keeps cumulative observed frame/byte counts. Quantiles use nearest rank over
+the last 4096 processed matched samples. See the runbook's **Video measurements**
+section for exact endpoints, reconnect attribution, drop scope and exclusions.
+The ssh stdin payload bundles the collector and reducer; no target-side module
+installation is assumed. `video_telemetry` in the raw capture records final
+retained, unmatched and pending counts. Missing pairs are never zero-valued data.
 
 Live qualification excludes a bounded 60-second startup grace: the requested
 window begins only with active receiver video/audio progress, consumer paint/
@@ -126,3 +137,9 @@ fixture, strict duration parsing, the plan-mandated contracts, the collector
 against a deterministic fake receiver, and the task-48 media-timing hook (the
 collector picks up both fields, the value tracks the injected measurement, an
 absent measurement stays BLOCKED). No live hardware is required.
+
+`wired_perf_video_measurements` adds deterministic delta/byte/count/quantile,
+reordering, duplicate, reconnect, stale and capacity cases, then drives the real
+receiver outlet, AF_UNIX channel and software decode helper with the 90-frame
+fixture and checks all seven fields through the actual collector parser. This
+is host endpoint evidence only, not the 30-minute run or two-hour soak.
