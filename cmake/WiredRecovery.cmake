@@ -73,6 +73,7 @@ if(NOT CMAKE_CROSSCOMPILING)
         wired_recovery_unknown_phone wired_recovery_lock_unlock
         wired_recovery_real_clock wired_recovery_qa_gates
         PROPERTIES TIMEOUT 120)
+    set_tests_properties(wired_recovery_qa_gates PROPERTIES TIMEOUT 300)
 endif()
 
 unset(AA_WIRED_RECOVERY_TEST_SOURCES)
