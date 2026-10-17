@@ -26,6 +26,7 @@
 #include <aa/app/WiredSession.hpp>
 #include <aa/audio/AudioRouter.hpp>
 #include <aa/channels/SensorSink.hpp>
+#include <aa/channels/MicrophoneSink.hpp>
 #include <aa/channels/InputSink.hpp>
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/ipc/ControlBusService.hpp>
@@ -335,7 +336,8 @@ aa::audio::RouterConfig pcm_router_config() {
 std::vector<aa::protocol::ServiceDescriptor>
 service_descriptors(const aa::input::CapabilityDescriptor &input) {
     const aa::protocol::VideoConfiguration video{{{1280, 720, 30}, {800, 480, 30}}};
-    const aa::protocol::AudioConfiguration audio{{{48000, 16, 2}}};
+    const aa::protocol::AudioConfiguration media_audio{{{48000, 16, 2}}};
+    const aa::protocol::AudioConfiguration voice_audio{{{16000, 16, 1}}};
     aa::protocol::SensorConfiguration sensors;
     if (input.night_mode() == aa::input::NightModePolicy::manual) {
         sensors.kinds.push_back(aa::protocol::SensorKind::night_mode);
@@ -348,14 +350,28 @@ service_descriptors(const aa::input::CapabilityDescriptor &input) {
     }
     return {
         {aa::protocol::ServiceKey{99}, aa::protocol::ChannelRole::video, video},
-        {aa::protocol::ServiceKey{100}, aa::protocol::ChannelRole::media_audio, audio},
-        {aa::protocol::ServiceKey{101}, aa::protocol::ChannelRole::guidance_audio, audio},
-        {aa::protocol::ServiceKey{102}, aa::protocol::ChannelRole::system_audio, audio},
-        {aa::protocol::ServiceKey{103}, aa::protocol::ChannelRole::speech_audio, audio},
+        {aa::protocol::ServiceKey{100}, aa::protocol::ChannelRole::media_audio, media_audio},
+        {aa::protocol::ServiceKey{101}, aa::protocol::ChannelRole::guidance_audio, voice_audio},
+        {aa::protocol::ServiceKey{102}, aa::protocol::ChannelRole::system_audio, voice_audio},
         {aa::protocol::ServiceKey{104}, aa::protocol::ChannelRole::input,
          aa::protocol::ButtonConfiguration{input.keycodes()}},
         {aa::protocol::ServiceKey{105}, aa::protocol::ChannelRole::sensors, sensors},
+        {aa::protocol::ServiceKey{106}, aa::protocol::ChannelRole::microphone,
+         aa::protocol::MicrophoneConfiguration{{16000, 16, 1}}},
     };
+}
+
+aa::core::Result<void> register_av_sinks(aa::app::WiredSession &session,
+                                        VideoOutlet &video, RouterSink &audio) {
+    using aa::protocol::ChannelRole;
+    if (auto result = session.register_av_sink(ChannelRole::video, video); !result) {
+        return result.error();
+    }
+    for (const auto role : {ChannelRole::media_audio, ChannelRole::guidance_audio,
+                            ChannelRole::system_audio}) {
+        if (auto result = session.register_av_sink(role, audio); !result) { return result.error(); }
+    }
+    return {};
 }
 
 const char *const kUsage =
@@ -471,11 +487,11 @@ int main(int argc, char **argv) {
     aa::channels::SensorSink sensor_sink{input, [&session](std::vector<std::byte> payload) {
         return session.send_channel_payload(aa::protocol::ChannelRole::sensors, std::move(payload));
     }};
-    if (!session.register_sink(aa::protocol::ChannelRole::video, video_outlet).has_value() ||
-        !session.register_sink(aa::protocol::ChannelRole::media_audio, audio_sink).has_value() ||
-        !session.register_sink(aa::protocol::ChannelRole::guidance_audio, audio_sink).has_value() ||
-        !session.register_sink(aa::protocol::ChannelRole::system_audio, audio_sink).has_value() ||
-        !session.register_sink(aa::protocol::ChannelRole::speech_audio, audio_sink).has_value() ||
+    aa::channels::MicrophoneSink microphone_sink{[&session](std::vector<std::byte> payload) {
+        return session.send_channel_payload(aa::protocol::ChannelRole::microphone, std::move(payload));
+    }};
+    if (!register_av_sinks(session, video_outlet, audio_sink).has_value() ||
+        !session.register_sink(aa::protocol::ChannelRole::microphone, microphone_sink).has_value() ||
         !session.register_sink(aa::protocol::ChannelRole::input, input_sink).has_value() ||
         !session.register_sink(aa::protocol::ChannelRole::sensors, sensor_sink).has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"sink\"}");

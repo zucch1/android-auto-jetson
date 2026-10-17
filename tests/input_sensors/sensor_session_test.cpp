@@ -37,8 +37,23 @@ TEST(InputSensorsWireSession, NightModeOnlyIsMinimalPhoneRequiredSurfaceWithNoVe
                                     static_cast<int>(encoded.value().size() - 2)));
     ASSERT_EQ(wire.channels_size(), 7);
     unsigned sensor_services = 0;
+    unsigned microphone_services = 0;
     for (const auto& entry : wire.channels()) {
-        EXPECT_FALSE(entry.has_media_source_service());
+        if (entry.id() == 106) {
+            ++microphone_services;
+            ASSERT_TRUE(entry.has_media_source_service());
+            const auto& source = entry.media_source_service();
+            EXPECT_EQ(source.available_type(),
+                      aap_protobuf::service::media::shared::message::MEDIA_CODEC_AUDIO_PCM);
+            EXPECT_TRUE(source.has_available_while_in_call());
+            EXPECT_FALSE(source.available_while_in_call());
+            ASSERT_TRUE(source.has_audio_config());
+            EXPECT_EQ(source.audio_config().sampling_rate(), 16000u);
+            EXPECT_EQ(source.audio_config().number_of_bits(), 16u);
+            EXPECT_EQ(source.audio_config().number_of_channels(), 1u);
+        } else {
+            EXPECT_FALSE(entry.has_media_source_service());
+        }
         EXPECT_FALSE(entry.has_bluetooth_service());
         EXPECT_FALSE(entry.has_wifi_projection_service());
         if (!entry.has_sensor_source_service()) { continue; }
@@ -48,6 +63,7 @@ TEST(InputSensorsWireSession, NightModeOnlyIsMinimalPhoneRequiredSurfaceWithNoVe
         EXPECT_EQ(entry.sensor_source_service().sensors(0).sensor_type(), sensor::SENSOR_NIGHT_MODE);
     }
     EXPECT_EQ(sensor_services, 1u);
+    EXPECT_EQ(microphone_services, 1u);
     const auto decoded = proto::decode_service_discovery_response(encoded.value());
     ASSERT_TRUE(decoded);
     EXPECT_EQ(decoded.value().services, services);
@@ -59,7 +75,12 @@ TEST(InputSensorsWireSession, UnsupportedVehicleCapabilityIsNotSilentlyAdvertise
     const aa::input::CapabilityDescriptor capability{bench.sources(), bench.keycodes(),
         bench.touch_viewport(), {aa::input::SensorChannel::speed}, bench.night_mode()};
     const auto services = service_descriptors(capability);
-    const auto& config = std::get<proto::SensorConfiguration>(services.back().configuration);
+    const auto service = std::find_if(services.begin(), services.end(), [](const auto& entry) {
+        return entry.id.value == 105 && entry.role == proto::ChannelRole::sensors;
+    });
+    ASSERT_NE(service, services.end());
+    ASSERT_TRUE(std::holds_alternative<proto::SensorConfiguration>(service->configuration));
+    const auto& config = std::get<proto::SensorConfiguration>(service->configuration);
     ASSERT_EQ(config.kinds.size(), 2u);
     EXPECT_EQ(static_cast<std::int32_t>(config.kinds[1]), 3);
     EXPECT_FALSE(aa::channels::SupportConfiguration::create(services));
