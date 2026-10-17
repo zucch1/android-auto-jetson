@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -51,12 +52,21 @@ WiredSession::~WiredSession() { reset_owned_av(); }
 
 core::Result<void> WiredSession::apply(session::Event event) {
     auto outcome = lifecycle_.apply(event);
+    // Recovery telemetry resolves BEFORE the state-change record: an event that
+    // both ends a recovery attempt and moves the state (a failed reconnect)
+    // must produce exactly one terminal recovery record, not one per hook.
+    note_recovery(event, outcome);
     note_state();
     return outcome;
 }
 
 core::Result<void> WiredSession::phone_discovered(const trust::PhoneIdentity &identity) {
     auto outcome = lifecycle_.phone_discovered(identity);
+    if (outcome.has_value()) {
+        // Remember the ADMITTED identity for recovery-telemetry attribution
+        // (item 3): a rejected discovery never re-labels the admitted phone.
+        last_identity_key_ = identity.key;
+    }
     note_state(identity.key);
     return outcome;
 }
@@ -69,6 +79,8 @@ core::Result<void> WiredSession::fail(Error reason) {
 
 void WiredSession::tick() {
     lifecycle_.tick();
+    // Deadline expiry is an owner-thread transition like any other: surface the
+    // state change and resolve any open recovery as terminal failed (item 1).
     note_state();
 }
 
@@ -751,6 +763,108 @@ void WiredSession::note_state(std::string_view identity_key) {
     default: break;
     }
     emit(identity_key);
+    // A state change is the only place a recovery attempt can RESOLVE outside
+    // its opening event: acceptance is gated on State::active (item 1), and any
+    // terminal exit ends the attempt as failed so it can never be accepted
+    // later (deadline/negotiation failure, or a cancelled teardown).
+    switch (last_state_) {
+    case session::State::active:
+        resolve_recovery(RecoveryStatus::accepted, std::nullopt);
+        break;
+    case session::State::failed: {
+        std::optional<std::int64_t> code;
+        if (lifecycle_.failure().has_value()) {
+            code = static_cast<std::int64_t>(lifecycle_.failure()->code());
+        }
+        resolve_recovery(RecoveryStatus::failed, code);
+        break;
+    }
+    case session::State::stopping:
+    case session::State::disconnected:
+        resolve_recovery(RecoveryStatus::failed,
+                         static_cast<std::int64_t>(ErrorCode::cancelled));
+        break;
+    default:
+        break;
+    }
+}
+
+void WiredSession::note_recovery(session::Event event, const core::Result<void> &outcome) {
+    switch (event) {
+    case session::Event::link_lost:
+        if (outcome.has_value()) {
+            recovery_in_flight_ = true;
+            recovery_reason_ = "link lost";
+            emit_recovery("link lost", RecoveryStatus::pending, std::nullopt);
+        }
+        break;
+    case session::Event::reconnect:
+    case session::Event::recover: {
+        ++reconnect_attempts_;
+        const char *reason = event == session::Event::recover ? "peer disconnected" : "link lost";
+        recovery_reason_ = reason;
+        recovery_in_flight_ = true;
+        if (!outcome.has_value()) {
+            resolve_recovery(RecoveryStatus::failed,
+                             std::optional<std::int64_t>{
+                                 static_cast<std::int64_t>(outcome.error().code())});
+            break;
+        }
+        // Gate acceptance on active (item 1): a successful reconnect only
+        // CONNECTS, so the attempt stays pending until the state reaches
+        // active; only recover can land straight in active.
+        if (lifecycle_.state() == session::State::active) {
+            resolve_recovery(RecoveryStatus::accepted, std::nullopt);
+        } else {
+            emit_recovery(reason, RecoveryStatus::pending, std::nullopt);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void WiredSession::resolve_recovery(RecoveryStatus status, std::optional<std::int64_t> code) {
+    if (!recovery_in_flight_) {
+        return;
+    }
+    recovery_in_flight_ = false;
+    if (status == RecoveryStatus::failed) {
+        ++recovery_failures_;
+    }
+    emit_recovery(recovery_reason_, status, code);
+}
+
+void WiredSession::emit_recovery(const char *reason, RecoveryStatus status,
+                                 std::optional<std::int64_t> code) {
+    const std::string_view status_text = status == RecoveryStatus::accepted ? "accepted"
+                                         : status == RecoveryStatus::failed ? "failed"
+                                                                            : "pending";
+    diagnostics::Event event{};
+    event.session = session_id_;
+    event.kind = diagnostics::EventKind::reconnect;
+    event.monotonic_time = deps_.clock.now();
+    event.fields.push_back(diagnostics::EventField::text("reason", std::string{reason}));
+    event.fields.push_back(diagnostics::EventField::text("status", std::string{status_text}));
+    event.fields.push_back(
+        diagnostics::EventField::count("retries", static_cast<std::int64_t>(reconnect_attempts_)));
+    event.fields.push_back(
+        diagnostics::EventField::count("errors", static_cast<std::int64_t>(recovery_failures_)));
+    if (code.has_value()) {
+        event.fields.push_back(diagnostics::EventField::count("code", *code));
+    }
+    event.fields.push_back(diagnostics::EventField::text("transport", "usb"));
+    // Identity attribution (item 3, same attribution as the link-error event):
+    // the recovery record names the admitted phone so a harness can correlate a
+    // state/flow transition to the intended device. Pseudonymized by the
+    // boundary like every identity that leaves.
+    if (!last_identity_key_.empty()) {
+        event.fields.push_back(
+            diagnostics::EventField::identifier("phone_id", last_identity_key_));
+    }
+    deps_.diagnostics.emit(event);
+    ++diagnostics_emitted_;
 }
 
 } // namespace aa::app

@@ -129,13 +129,12 @@ if [[ "$policy" != "installed" ]]; then
     write_result "BLOCKED" "udev_policy_not_installed" "false" "false" "false" "false" "null"
     exit 3
 fi
-# Exact-token DRM status match: `disconnected` must NOT read as `connected`.
+# Exact-line DRM status record (lane-32 pattern, tools/perf/aa-projection-perf.sh):
+# `disconnected` must NOT read as `connected`; only an exact `connected` line passes.
 display_connected="false"
-for token in $display_status; do
-    if [[ "$token" == "connected" ]]; then
-        display_connected="true"
-    fi
-done
+if printf '%s\n' "$display_status" | grep -Fxq 'connected'; then
+    display_connected="true"
+fi
 # NVIDIA DRM can report disconnected while X drives a live monitor. Accept only
 # a successful query with an exact second-field `connected` token, parsed locally.
 if [[ "$display_connected" != "true" ]]; then
@@ -167,7 +166,10 @@ fi
 
 # The receiver owns the D-Bus contract name; the display registers as a consumer
 # and requests projection. Both run under a bounded ssh; logs are captured on the
-# target under /tmp for later retrieval (redaction applied before export).
+# target under /tmp for later retrieval (redaction applied before export). The
+# display also runs with the shipped TEST-ONLY stdin control channel
+# (--test-only-control-stdin) wired through a FIFO so the harness can request
+# real status (painted frames) and stimulate one input event (gate P2-G).
 start_ms="$(date +%s%3N)"
 receiver_pid=""; display_pid=""
 teardown() {

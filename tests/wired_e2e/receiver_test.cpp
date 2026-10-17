@@ -593,11 +593,13 @@ class RuntimeTransport final : public aa::transport::Transport {
 // Link-time seams keep the real CLI/thread loop under test without USB or audio hardware.
 aa::core::Result<aa::app::WiredLink>
 runtime_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
-                  const aa::trust::TrustStore &, const aa::core::Deadline &)
-    asm("__wrap__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineE");
+                  const aa::trust::TrustStore &, const aa::core::Deadline &,
+                  aa::trust::WiredIdentity *)
+    asm("__wrap__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE");
 aa::core::Result<aa::app::WiredLink>
 runtime_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
-                  const aa::trust::TrustStore &, const aa::core::Deadline &) {
+                  const aa::trust::TrustStore &, const aa::core::Deadline &,
+                  aa::trust::WiredIdentity *) {
     const int attempt = ++runtime_connects;
     if (attempt == 1 || (runtime_recovers && attempt >= 4)) {
         return aa::app::WiredLink{std::make_unique<RuntimeTransport>(attempt == 1), runtime_phone};
