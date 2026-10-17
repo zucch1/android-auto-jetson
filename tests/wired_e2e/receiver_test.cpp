@@ -158,9 +158,12 @@ class ObservedSessionMutex {
 #undef AA_WIRED_RECEIVER_SHUTDOWN_TEST
 
 #include "harness.hpp"
+#include "../video_socket/pair.hpp"
 #include "../trust/syscall_faults.hpp"
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
+#include <aap_protobuf/service/control/message/ServiceDiscoveryResponse.pb.h>
 #include <gtest/gtest.h>
+#include <array>
 #include <condition_variable>
 #include <fstream>
 #include <iterator>
@@ -168,6 +171,173 @@ class ObservedSessionMutex {
 #include <unistd.h>
 
 namespace {
+namespace media_wire = aap_protobuf::service::media::sink::message;
+
+TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
+    VideoOutlet outlet;
+    const std::vector<std::byte> payload{std::byte{0}, std::byte{0}, std::byte{1},
+                                         std::byte{0x65}, std::byte{0x10}};
+    for (int index = 0; index < 31; ++index) {
+        testing::internal::CaptureStdout();
+        const auto result = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, payload});
+        const auto log = testing::internal::GetCapturedStdout();
+        ASSERT_TRUE(result);
+        if (index % 30 == 0) {
+            EXPECT_EQ(log, "{\"event\":\"video_dropped\",\"reason\":\"no_consumer\",\"count\":" +
+                               std::to_string(index + 1) + "}\n");
+        } else {
+            EXPECT_TRUE(log.empty());
+        }
+    }
+}
+
+TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    VideoOutlet outlet;
+    outlet.install(std::move(pair.value().producer));
+    const std::vector<std::byte> non_idr{std::byte{0}, std::byte{0}, std::byte{1},
+                                         std::byte{0x41}, std::byte{0x10}};
+    const std::vector<std::byte> idr{std::byte{0}, std::byte{0}, std::byte{1},
+                                     std::byte{0x65}, std::byte{0x10}};
+    for (int index = 0; index < 31; ++index) {
+        testing::internal::CaptureStdout();
+        const auto result = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, non_idr});
+        const auto log = testing::internal::GetCapturedStdout();
+        ASSERT_TRUE(result);
+        if (index % 30 == 0) {
+            EXPECT_EQ(log, "{\"event\":\"video_dropped\",\"reason\":\"waiting_idr\",\"count\":" +
+                               std::to_string(index + 1) + "}\n");
+        } else {
+            EXPECT_TRUE(log.empty());
+        }
+    }
+    const auto empty = pair.value().consumer.receive(Milliseconds{0});
+    ASSERT_FALSE(empty);
+    EXPECT_EQ(empty.error().code(), aa::ErrorCode::timeout);
+
+    for (std::uint64_t delivered = 1; delivered <= 31; ++delivered) {
+        const auto &payload = delivered == 1 ? idr : non_idr;
+        testing::internal::CaptureStdout();
+        const auto result = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {123}}, payload});
+        const auto log = testing::internal::GetCapturedStdout();
+        ASSERT_TRUE(result);
+        if (delivered % 30 == 1) {
+            EXPECT_EQ(log, "{\"event\":\"video_sent\",\"units\":" +
+                               std::to_string(delivered) + "}\n");
+        } else {
+            EXPECT_TRUE(log.empty());
+        }
+        const auto received = pair.value().consumer.receive(Milliseconds{500});
+        ASSERT_TRUE(received);
+        ASSERT_EQ(received.value(), aa::ipc::ReceiveStatus::complete);
+        const auto &unit = pair.value().consumer.access_unit();
+        EXPECT_EQ(unit.frame, 31 + delivered);
+        EXPECT_EQ(unit.timestamp_ns, 123U);
+        EXPECT_EQ(unit.idr, delivered == 1);
+        EXPECT_EQ(unit.payload, (std::vector<std::uint8_t>{0, 0, 1,
+                                  static_cast<std::uint8_t>(delivered == 1 ? 0x65 : 0x41), 0x10}));
+    }
+}
+
+TEST(WiredReceiver, VideoOutletSendErrorsDoNotCountAsSent) {
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    VideoOutlet outlet;
+    outlet.install(std::move(pair.value().producer));
+    testing::internal::CaptureStdout();
+    const auto invalid = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, {}});
+    const auto invalid_log = testing::internal::GetCapturedStdout();
+    ASSERT_FALSE(invalid);
+    EXPECT_EQ(invalid.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_TRUE(invalid_log.empty());
+
+    const std::vector<std::byte> idr{std::byte{0}, std::byte{0}, std::byte{1},
+                                     std::byte{0x65}, std::byte{0x10}};
+    testing::internal::CaptureStdout();
+    const auto sent = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, idr});
+    const auto sent_log = testing::internal::GetCapturedStdout();
+    ASSERT_TRUE(sent);
+    EXPECT_EQ(sent_log, "{\"event\":\"video_sent\",\"units\":1}\n");
+    const auto received = pair.value().consumer.receive(Milliseconds{500});
+    ASSERT_TRUE(received);
+    ASSERT_EQ(received.value(), aa::ipc::ReceiveStatus::complete);
+    EXPECT_EQ(pair.value().consumer.access_unit().frame, 2U);
+}
+
+struct ReceiverAudioExpectation {
+    std::int32_t service;
+    aa::protocol::ChannelRole channel;
+    aa::audio::Role role;
+    int wire_role;
+    aa::audio::AudioFormat input;
+};
+
+const std::array receiver_audio_expectations{
+    ReceiverAudioExpectation{100, aa::protocol::ChannelRole::media_audio, aa::audio::Role::media,
+                             media_wire::AUDIO_STREAM_MEDIA, {48000, 2, 16}},
+    ReceiverAudioExpectation{101, aa::protocol::ChannelRole::guidance_audio, aa::audio::Role::guidance,
+                             media_wire::AUDIO_STREAM_GUIDANCE, {16000, 1, 16}},
+    ReceiverAudioExpectation{102, aa::protocol::ChannelRole::system_audio, aa::audio::Role::system,
+                             media_wire::AUDIO_STREAM_SYSTEM_AUDIO, {16000, 1, 16}},
+    ReceiverAudioExpectation{103, aa::protocol::ChannelRole::speech_audio, aa::audio::Role::speech,
+                             media_wire::AUDIO_STREAM_TELEPHONY, {16000, 1, 16}},
+};
+
+class ReceiverProfileSink final : public aa::audio::detail::ObservedAudioSink {
+  public:
+    aa::audio::AudioFormat format{};
+    std::size_t writes{};
+    std::vector<std::byte> pcm;
+    aa::core::Result<void> write(const aa::audio::MixedChunk &chunk) override {
+        ++writes;
+        format = chunk.format;
+        pcm.insert(pcm.end(), chunk.pcm.begin(), chunk.pcm.end());
+        return {};
+    }
+    aa::core::Result<void> drain(aa::core::Milliseconds) override { return {}; }
+    aa::audio::SinkProbeStats probe_stats() const override { return {}; }
+    aa::audio::RenderBarrierStats render_stats() const override { return {}; }
+};
+
+TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereoAndKeepCompletionCallback) {
+    for (const auto &expected : receiver_audio_expectations) {
+        SCOPED_TRACE(expected.service);
+        auto output = std::make_unique<ReceiverProfileSink>();
+        const auto *observed = output.get();
+        auto router = aa::audio::detail::open_router_with_sink_for_test(
+            pcm_router_config(), std::move(output));
+        ASSERT_TRUE(router.has_value());
+        const std::size_t frames = expected.input.sample_rate_hz / 50U;
+        const std::vector<std::byte> pcm(frames * expected.input.channels * sizeof(std::int16_t),
+                                         std::byte{0x10});
+        RouterSink sink{router.value()};
+        testing::internal::CaptureStdout();
+        const auto result = sink.on_message({{expected.channel, 1, {}}, pcm});
+        const auto log = testing::internal::GetCapturedStdout();
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(observed->format, (aa::audio::AudioFormat{48000, 2, 16}));
+        // Resampling may retain a filter tail; require the 3x rate expansion,
+        // allowing that bounded tail rather than assuming one exact chunk size.
+        if (expected.input.channels == 1) {
+            EXPECT_GT(observed->pcm.size(), frames * 2U * 2U * sizeof(std::int16_t));
+            EXPECT_LE(observed->pcm.size(), frames * 3U * 2U * sizeof(std::int16_t));
+        } else {
+            EXPECT_EQ(observed->pcm.size(), pcm.size());
+        }
+        ASSERT_FALSE(observed->pcm.empty());
+        ASSERT_EQ(observed->pcm.size() % 4U, 0U);
+        EXPECT_TRUE(std::any_of(observed->pcm.begin(), observed->pcm.end(),
+                               [](std::byte value) { return value != std::byte{0}; }));
+        for (std::size_t offset = 0; offset < observed->pcm.size(); offset += 4U) {
+            EXPECT_EQ(observed->pcm[offset], observed->pcm[offset + 2U]);
+            EXPECT_EQ(observed->pcm[offset + 1U], observed->pcm[offset + 3U]);
+        }
+        EXPECT_NE(log.find("\"event\":\"audio_write_completed\""), std::string::npos);
+        EXPECT_NE(log.find("\"scheduled_end_ns\":"), std::string::npos);
+    }
+}
+
 std::atomic<int> runtime_connects{0};
 std::atomic<int> runtime_ciphers{0};
 bool runtime_recovers = false;
