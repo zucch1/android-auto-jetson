@@ -176,9 +176,14 @@ struct SensorConfiguration final {
     [[nodiscard]] friend bool operator==(const SensorConfiguration &,
                                          const SensorConfiguration &) = default;
 };
+struct MicrophoneConfiguration final {
+    AudioProfile profile{};
+    [[nodiscard]] friend bool operator==(const MicrophoneConfiguration &,
+                                         const MicrophoneConfiguration &) = default;
+};
 using ServiceConfiguration =
     std::variant<std::monostate, VideoConfiguration, AudioConfiguration, ButtonConfiguration,
-                 SensorConfiguration>;
+                 SensorConfiguration, MicrophoneConfiguration>;
 
 // One advertised channel service. `id` is dynamic (ID space 2); `role` is the
 // semantic role resolved by the session router, never an ordinal.
