@@ -136,28 +136,57 @@ observed. This is the same stream-write endpoint vocabulary as `audio_latency_ms
 The old audio-only completion-versus-schedule maximum is emitted honestly as
 `audio_scheduling_skew_ms` (informational); it never satisfies the 50 ms A/V gate.
 
-The receiver/display pair supplies cross-stream completion events and audio
-timing (`av_sync_ms`, `audio_latency_ms`, plus informational audio scheduling
-skew). The following **7 of the
-9 event-metric slots have no emitter** in that pair and stay `null` in every
-capture it produces:
+### Video measurements (task-32 additive emitters)
 
-1. `frame_drops`
-2. `decode_p50_ms`
-3. `decode_p95_ms`
-4. `decode_fps`
-5. `decode_frames`
-6. `ipc_throughput_mbps`
-7. `ipc_p95_added_latency_ms`
+The receiver/display pair now emits the seven formerly missing video metrics.
+This removes the **missing-emitter implementation gap**, not the need to run
+the final candidate for 30 minutes and separately for two hours. No live
+performance or software-decoder qualification is implied by host tests.
 
-The reporter fails closed on this: any absent event-metric slot is listed in the
-result's `named_gaps`, `qualification_status` stays `INCOMPLETE`, and the verdict
-is `BLOCKED` — such a capture is **never** presented as complete task-32
-qualification and never a PASS. (Decode timing remains informational per the
-task-9 caveat above and is not re-claimed here.) The emitter halves —
-decode/IPC/frame-drop stats events — are cross-lane work in `tools/wired-receiver` /
-`tools/dummy-display` (lanes 30/31) and land separately; until then phase-B
-runs are expected to end BLOCKED on these named gaps rather than PASS.
+| Metric | Exact observed source and scope |
+| --- | --- |
+| `frame_drops` | Cumulative `VideoOutlet` AU decisions: no consumer, producer backpressure, or producer waiting for IDR. Not inferred from fragment gaps; not decoder/compositor/phone loss. `decode_stats.frame_drops` is absent until an AU is observed; a measured zero after successful input is valid. |
+| `decode_p50_ms`, `decode_p95_ms` | Nearest-rank percentiles of matched `video_decode_completed` deltas: local `DecodeHelper::submit()` admission-entry `submitted_at` through mapped, dimension-checked, copied I420 output in `pump()`, before either completion or frame callback. Includes allocation, parser/decoder/conversion, pipeline and caller pump delay; NOT isolated hardware execution time. |
+| `decode_frames` | Cumulative number of unique matched decoded output completion events across helper sessions. Unmatched/expired/reset correlations supply neither a frame measurement nor a duration. |
+| `decode_fps` | Matched output count divided by measured elapsed time from earliest contributing submit entry to latest observed I420 completion. Not negotiated FPS and not a schedule-based estimate. |
+| `ipc_throughput_mbps` | Unique successfully consumed/reassembled encoded payload bytes times 8, divided by the elapsed consumer window (earliest contributing connection attempt to latest receive completion), in decimal Mbit/s. Excludes header bytes, incomplete/rejected/suppressed AUs and decode time. Includes connection startup and inter-connection idle time. Does not require a matching producer log. |
+| `ipc_p95_added_latency_ms` | Nearest-rank p95 of matched `video_ipc_send`/`video_ipc_receive`: producer timestamp immediately before the first fragment `send()` attempt through consumer full validated reassembly completion, before stream capture/decode. Includes remaining fragmentation/copies, socket queuing, receive polling and reassembly; excludes upstream AV dispatch and decode. |
+
+All duration endpoints use same-host Linux `steady_clock` nanoseconds. The
+existing wire `timestamp_ns` remains the unchanged common A/V timestamp and is
+**only an opaque correlation key here**, never an IPC latency start or guessed
+peer-clock conversion. The 56-byte v1 header, reserved words and limits exchange
+are unchanged. Successful producer events are emitted after the last send using
+the retained first-send timestamp; partial/error/backpressure/suppressed sends
+have no successful endpoint. Consumer events occur only on complete AUs.
+
+The collector joins `(producer_pid, consumer_pid, frame, first_fragment_sequence,
+timestamp_ns)`, checks equal payload sizes, forward endpoint time and compatible
+connection epochs, and binds each producer/consumer epoch one-to-one. Receiver
+`VideoOutlet` frame IDs remain increasing across consumer reconnects; sequence
+resets alone cannot match old frames. Consumer connect-attempt time must precede
+the producer's post-handshake connection epoch and the send. A new epoch after an
+old send therefore cannot borrow its endpoint. Logs may arrive in either order.
+
+`aa_video_measurements.py` retains at most 4096 pending events per side, 4096
+deduplication/binding entries per table, and 4096 deltas per metric. Pending IPC
+events expire at ten seconds of event-time age (an operational retention bound,
+not a performance budget); capacity eviction advances a conservative time floor
+so a discarded endpoint cannot be revived by late replay. Quantiles describe
+the last 4096 matched samples in processing order, not an exact whole-soak
+distribution. Frame/byte counts and measured time bounds remain cumulative.
+The capture's `video_telemetry` section records retained sample counts, unmatched
+or expired IPC endpoints and final pending counts. Unpaired endpoints never
+contribute zero latency. Invalid endpoint records latch the existing invalid
+metric handling; missing data remains `null`, and all existing completeness and
+budget gates stay unchanged.
+
+Raw endpoint lines are flushed synchronously, so there is no periodic tail to
+lose; orderly receiver close/destruction also flushes the final cumulative drop
+counter. The collector's existing final log poll includes both streams after
+termination. These additive diagnostics do add per-frame logging overhead,
+which is part of the measured candidate. Decode telemetry remains informational:
+the withdrawn 33 ms gate is **not** restored.
 
 ## Provenance and equivalence
 
