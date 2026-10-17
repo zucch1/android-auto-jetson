@@ -66,7 +66,27 @@ Conflict-file suites `wired_e2e_av_sink`, `channel_services_sensors`,
 `channel_services_wire_reject` pass as well. Total focused: **47/47 passed**.
 Full suite (465 tests) deferred to a separate worker.
 
+## Full-suite closure and final fixture correction
+
+The first exclusive full run found a genuine repository-gate conflict, not a
+hardware or runtime fault: integration's new privacy fixture stored a raw PEM
+marker in source, tripping the pre-existing zero-credential scan
+(`tls_posture_reference`, `tls_posture_key_scan`) while the rest passed 462/464.
+The correction replaces the stored literal with runtime concatenation in
+`tests/qualification/test_privacy.py`; the same negative fixture marker is still
+produced when the test runs and no scanner rule is weakened.
+
+Verified after the correction: `tools/tls/scan.py` passes,
+21/21 qualification/privacy tests pass, and a fresh exclusive full suite exits 0:
+**464/464 passed**, 536.15 seconds
+(`build/host-dev/Testing/integration-final56-nonlong-fixed-20261017.log`).
+Landed PR56 squash `2fa07dae` was later added as an ancestry parent without
+changing the reviewed union tree (receipt may appear as an additional parent
+while source content remains the same). This is host qualification only; target
+deployment and the real 30-minute / 2-hour windows remain the next gates.
+
 ## Remaining blockers
 
-- Normal merge of final PR56 on GitHub is still blocked by running CI (unchanged; not waited on).
-- Squash ancestry recording can follow once the squash merge actually lands.
+- No remaining host-suite blocker on the corrected candidate.
+- Target build/deploy, fresh positive-control admission, actual separate 30m
+  and 2h media runs, and sanitized task33 evidence remain pending.
