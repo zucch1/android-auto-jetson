@@ -617,6 +617,10 @@ int main(int argc, char **argv) {
                 if (service_control()) {
                     break;
                 }
+                if (session.state() == aa::session::State::stopping) {
+                    g_running.store(false);
+                    break;
+                }
                 if (!polled.has_value()) {
                     const auto code = polled.error().code();
                     if (!g_running.load()) {
@@ -756,6 +760,7 @@ int main(int argc, char **argv) {
              ",\"input_sends\":" + std::to_string(session.input_sends()) +
              ",\"input_failures\":" + std::to_string(session.input_send_failures()) +
              ",\"channel_opens\":" + std::to_string(session.channel_opens()) +
-             ",\"version_responses\":" + std::to_string(session.version_responses()) + "}");
+             ",\"version_responses\":" + std::to_string(session.version_responses()) +
+             ",\"unhandled_controls\":" + std::to_string(session.unhandled_controls()) + "}");
     return runtime_failed || session_failed.load() ? 1 : 0;
 }

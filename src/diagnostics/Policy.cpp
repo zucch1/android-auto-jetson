@@ -81,7 +81,8 @@ TelemetryType telemetry_type(std::string_view key) noexcept {
     static constexpr std::string_view counts[] = {
         "frames", "packets", "bytes", "samples", "count", "total", "retries", "drops",
         "errors", "warnings", "events", "width", "height", "size", "capacity", "depth",
-        "queue", "inflight", "offset", "index", "seq", "sequence", "code", "error_code"};
+        "queue", "inflight", "offset", "index", "seq", "sequence", "code", "error_code",
+        "msg_id", "auth_phase", "payload_bytes"};
     static constexpr std::string_view numbers[] = {
         "fps", "bitrate", "latency_ms", "p50_latency_ms", "p95_latency_ms", "p99_latency_ms",
         "jitter_ms", "rtt_ms", "elapsed_ms", "duration_ms", "update_ms", "interval_ms",
