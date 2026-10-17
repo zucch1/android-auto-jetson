@@ -139,6 +139,8 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
         case "$cmd" in
             *--test-only-control-stdin*)
                 mkdir -p "${FAKE_SSH_STATE:-/tmp}"; touch "${FAKE_SSH_STATE:-/tmp}/disp"
+                # A new display process owns a fresh painted-frame counter.
+                rm -f "$state/frames_n"
                 echo 4243; exit 0 ;;
             *) echo "fake-ssh: display started without --test-only-control-stdin" >&2; exit 97 ;;
         esac ;;
@@ -146,6 +148,15 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
         mkdir -p "${FAKE_SSH_STATE:-/tmp}"; touch "${FAKE_SSH_STATE:-/tmp}/recv"
         echo 4242; exit 0 ;;
     *'"event":"status"'*)
+        probe="$(cat "$state/status_n" 2>/dev/null || echo 0)"
+        probe=$((probe+1)); printf '%s' "$probe" > "$state/status_n"
+        if [ "$probe" = "${FAKE_BASELINE_PROBE:-1}" ] && [ "${FAKE_BASELINE_STATUS+x}" = x ]; then
+            printf '%s' "$FAKE_BASELINE_STATUS"
+            exit "${FAKE_BASELINE_RC:-0}"
+        fi
+        if [ "$probe" -gt 1 ] && [ "${FAKE_POST_STATUS+x}" = x ]; then
+            printf '%s' "$FAKE_POST_STATUS"; exit "${FAKE_POST_RC:-0}"
+        fi
         if [ -n "${FAKE_DISPLAY_STATUS:-}" ]; then printf '%s\n' "$FAKE_DISPLAY_STATUS" >> "$state/frames_trace"; printf '%s' "${FAKE_DISPLAY_STATUS}"; exit 0; fi
         n="$(cat "${FAKE_SSH_STATE:-/tmp}/frames_n" 2>/dev/null || echo 0)"
         n=$((n+1)); mkdir -p "${FAKE_SSH_STATE:-/tmp}"; echo "$n" > "${FAKE_SSH_STATE:-/tmp}/frames_n"
@@ -679,6 +690,127 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertEqual(code, 0, doc)
         rows = {row["name"]: row for row in doc["scenarios"]}
         self.assertEqual(rows["consumer_restart"]["frames_painted_baseline"], 5)
+
+    def test_baseline_failure_stops_all_scenarios_before_disturbance(self) -> None:
+        # Given: only the baseline fails; later status is stale 7, other media is good.
+        stale = '{"event":"status","frames_painted":7,"render_ok":true}'
+        cases = (("command_failure", "", "1"), ("failed_with_output", stale, "1"),
+                 ("empty", "", "0"), ("malformed_json", "broken", "0"),
+                 ("missing", '{"event":"status","render_ok":true}', "0"),
+                 ("malformed", '{"frames_painted":7.5,"render_ok":true}', "0"),
+                 ("negative", '{"frames_painted":-1,"render_ok":true}', "0"))
+        for scenario in self.recovery_scenarios[:-1]:
+            for name, status, rc in cases:
+                with self.subTest(scenario=scenario, case=name):
+                    env = self.passing_env() | {
+                        "FAKE_CLOCK": "1", "FAKE_BASELINE_STATUS": status,
+                        "FAKE_BASELINE_RC": rc, "FAKE_DISPLAY_STATUS": stale}
+                    # When: invoke the real set-e harness, including its receipt finalizer.
+                    code, doc = self.run_qa(["--only", scenario], **env)
+                    # Then: one honest failed receipt, without a scenario disturbance.
+                    self.assertEqual(code, 1, doc)
+                    self.assertEqual(doc["status"], "FAILED")
+                    self.assertEqual(len(doc["scenarios"]), 1)
+                    row = doc["scenarios"][0]
+                    self.assertEqual(row["detail"], "frames_baseline_unavailable")
+                    self.assertIsNone(row["frames_painted_baseline"])
+                    self.assertIsNone(row["elapsed_ms"])
+                    calls = self.last_calls.splitlines()
+                    # Cleanup kills are allowed, but only AFTER the single status probe.
+                    probe = next(i for i, call in enumerate(calls) if '\"event\":\"status\"' in call)
+                    self.assertFalse(any("kill 424" in call or "drivers/usb/unbind" in call
+                                         or "keyevent 26" in call or "am force-stop" in call
+                                         for call in calls[:probe]))
+                    self.assertEqual(sum('\"event\":\"status\"' in call for call in calls), 1)
+                    self.assertNotIn("drivers/usb/unbind", self.last_calls)
+                    self.assertNotIn("keyevent 26", self.last_calls)
+                    self.assertNotIn("am force-stop", self.last_calls)
+
+    def test_baseline_zero_with_growth_passes_all_scenarios(self) -> None:
+        for scenario in self.recovery_scenarios[:-1]:
+            with self.subTest(scenario=scenario):
+                # Given: a real zero baseline and positive post-recovery painting.
+                env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_FRAMES_BASE": "0"}
+                # When: drive each baseline caller through the CLI.
+                code, doc = self.run_qa(["--only", scenario], **env)
+                # Then: zero remains valid evidence, not an unavailable sentinel.
+                self.assertEqual(code, 0, doc)
+                self.assertEqual(doc["scenarios"][0]["frames_painted_baseline"], 0)
+                self.assertEqual(doc["scenarios"][0]["status"], "PASS")
+
+    def test_baseline_shim_failure_leaves_later_stale_status_available(self) -> None:
+        # Given: a single failed baseline command, independent later stale 7.
+        stale = '{"event":"status","frames_painted":7,"render_ok":true}'
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, FAKE_SSH_STATE=directory,
+                       FAKE_OUTCOMES=f"{directory}/outcomes", FAKE_BASELINE_STATUS="",
+                       FAKE_BASELINE_RC="1", FAKE_DISPLAY_STATUS=stale)
+            command = ('export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"; '
+                       'export DISPLAY=:1; grep \'"event":"status"\'')
+            # When: run the same fake SSH status command twice.
+            first = subprocess.run(["bash", "-c", FAKE_SSH, "ssh", command],
+                                   capture_output=True, text=True, env=env, timeout=5)
+            later = subprocess.run(["bash", "-c", FAKE_SSH, "ssh", command],
+                                   capture_output=True, text=True, env=env, timeout=5)
+            # Then: only baseline fails; a later probe is valid and unchanged at 7.
+            self.assertEqual((first.returncode, first.stdout), (1, ""))
+            self.assertEqual((later.returncode, later.stdout), (0, stale))
+
+    def test_baseline_growth_helper_rejects_invalid_baseline_before_probe(self) -> None:
+        for baseline in ("", "-1", "broken", "7.5", "07", "1+1"):
+            with self.subTest(baseline=baseline):
+                # Given: a valid-looking later frame, but no valid baseline.
+                command = ('set -euo pipefail; set --; source "$SCRIPT"; '
+                           'remote() { printf unexpected_probe >&2; '
+                           'printf \'{"frames_painted":7,"render_ok":true}\'; }; '
+                           'if painted_frames_grew "$BASELINE"; then exit 9; fi')
+                env = dict(os.environ, SCRIPT=str(self.script), BASELINE=baseline)
+                # When: use the shared helper under parent-shell errexit.
+                result = subprocess.run(["bash", "-c", command], capture_output=True,
+                                        text=True, env=env, timeout=5)
+                # Then: invalid arithmetic operands are rejected normally, never accepted.
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+
+    def test_baseline_failure_after_consumer_reset_writes_receipt(self) -> None:
+        # Given: pre-disturbance status works but the new consumer has no baseline.
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_BASELINE_PROBE": "2",
+                                    "FAKE_BASELINE_STATUS": "", "FAKE_BASELINE_RC": "1"}
+        # When: restart the consumer.
+        code, doc = self.run_qa(["--only", "consumer_restart"], **env)
+        # Then: caught command substitution failure still reaches JSON finalization.
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["scenarios"][0]["detail"], "frames_baseline_unavailable")
+        self.assertIsNone(doc["scenarios"][0]["frames_painted_baseline"])
+
+    def test_baseline_valid_does_not_authorize_invalid_post_status(self) -> None:
+        cases = ('{"frames_painted":7.5,"render_ok":true}',
+                 '{"frames_painted":7e2,"render_ok":true}',
+                 '{"frames_painted":-7,"render_ok":true}',
+                 '{"frames_painted":7oops,"render_ok":true}',
+                 '{"frames_painted":true,"render_ok":true}',
+                 '{"frames_painted":7,"render_ok":false}',
+                 '{"frames_painted":7,"render_ok":"true"}',
+                 '{"frames_painted":5,"render_ok":true}')
+        for status in cases:
+            with self.subTest(status=status):
+                # Given: valid 5 baseline and bad/stale post status, audio/input good.
+                env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_POST_STATUS": status}
+                # When: recover without restarting the display counter.
+                code, doc = self.run_qa(["--only", "receiver_restart"], **env)
+                # Then: malformed/negative/stale counters or missing rendering never pass.
+                self.assertEqual(code, 1, doc)
+                self.assertEqual(doc["scenarios"][0]["status"], "FAILED")
+
+    def test_baseline_valid_does_not_authorize_failed_post_command(self) -> None:
+        # Given: valid-looking growth from a command that failed.
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_POST_RC": "1",
+                                    "FAKE_POST_STATUS": '{"frames_painted":7,"render_ok":true}'}
+        # When: the media probe runs after recovery.
+        code, doc = self.run_qa(["--only", "receiver_restart"], **env)
+        # Then: command success is required as well as payload evidence.
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["scenarios"][0]["status"], "FAILED")
 
     def test_consumer_restart_requires_process_death(self):
         code, doc = self.run_qa(["--only", "consumer_restart"], FAKE_DISP_ALIVE="1")

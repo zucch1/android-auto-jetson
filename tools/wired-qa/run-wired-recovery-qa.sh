@@ -366,26 +366,38 @@ retry_delta() {
 # the recovery start and post-recovery frames must GROW past it with render_ok
 # - a stuck counter is not post-recovery painting (video_sent alone only proves
 # units crossed the channel, not that anything painted).
-frames_painted_baseline() {
+painted_frame_probe() {
     local line
-    remote "printf 'status\n' > /tmp/aa-disp.in 2>/dev/null; sleep 0.3; grep '\"event\":\"status\"' /tmp/aa-wired-display.log 2>/dev/null | tail -1" >/tmp/aa-status.$$ 2>/dev/null || true
-    line="$(cat /tmp/aa-status.$$ 2>/dev/null || true)"
-    rm -f /tmp/aa-status.$$
-    if [[ "$line" =~ \"frames_painted\":([0-9]+) ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    else
-        printf '0\n'
-    fi
+    line="$(remote "printf 'status\n' > /tmp/aa-disp.in 2>/dev/null && sleep 0.3 && grep '\"event\":\"status\"' /tmp/aa-wired-display.log 2>/dev/null | tail -1" 2>/dev/null)" || return 1
+    # Parse the whole JSON value, never an integer prefix; compare in Python so
+    # unsigned display counters cannot overflow Bash's signed arithmetic.
+    python3 -c '
+import json, sys
+try:
+    status = json.loads(sys.argv[1])
+except (ValueError, RecursionError):
+    sys.exit(1)
+if not isinstance(status, dict):
+    sys.exit(1)
+count = status.get("frames_painted")
+if type(count) is not int or not 0 <= count <= 2**64 - 1:
+    sys.exit(1)
+if sys.argv[2]:
+    baseline = int(sys.argv[2])
+    if not 0 <= baseline < count or count <= 0 or status.get("render_ok") is not True:
+        sys.exit(1)
+print(count)
+' "$line" "${1:-}"
+}
+
+frames_painted_baseline() {
+    painted_frame_probe
 }
 
 painted_frames_grew() {
-    local baseline="${1:-0}" line
-    remote "printf 'status\n' > /tmp/aa-disp.in 2>/dev/null; sleep 0.3; grep '\"event\":\"status\"' /tmp/aa-wired-display.log 2>/dev/null | tail -1" >/tmp/aa-status.$$ 2>/dev/null || true
-    line="$(cat /tmp/aa-status.$$ 2>/dev/null || true)"
-    rm -f /tmp/aa-status.$$
-    [[ "$line" =~ \"frames_painted\":([0-9]+) ]] || return 1
-    (( ${BASH_REMATCH[1]} > baseline )) || return 1
-    [[ "$line" == *'"render_ok":true'* ]]
+    local baseline="${1:-}"
+    [[ "$baseline" =~ ^(0|[1-9][0-9]{0,19})$ ]] || return 1
+    painted_frame_probe "$baseline" >/dev/null
 }
 
 # Successful audio pump evidence: audio_chunks is logged BEFORE router_.pump()
@@ -464,7 +476,7 @@ attributed_rejection() {
 # GREW past the recorded baseline AND a successful audio pump AND a delivered
 # input event (stimulated here).
 media_evidence() {
-    local since="${1:-0}" frames_baseline="${2:-0}"
+    local since="${1:-0}" frames_baseline="${2:-}"
     stimulate_input
     probe_deadline "$EVIDENCE_WAIT_MS" || return 1
     local deadline="$PROBE_DEADLINE_NS"
@@ -619,7 +631,8 @@ scenario_receiver_restart() {
     # Kill and verify the tracked child BY PID (item 5): pattern kills
     # (pkill/pgrep -f) self-match on the remote command line and can neither
     # kill nor observe this specific child's death.
-    FRAMES_BASELINE="$(frames_painted_baseline)"
+    FRAMES_BASELINE="$(frames_painted_baseline)" ||
+        { record receiver_restart FAILED "" "" "" frames_baseline_unavailable; return; }
     retries_before=0
     arm_scenario || { record receiver_restart FAILED "" "" "" timing_error_clock; return; }
     remote "kill ${RECEIVER_PID} 2>/dev/null || true" >/dev/null 2>&1 ||
@@ -661,6 +674,8 @@ scenario_consumer_restart() {
     # Kill and verify the tracked child BY PID (item 5), never by pattern.
     offset="$(log_offset)"
     retries_before="$(retries_total)"
+    FRAMES_BASELINE="$(frames_painted_baseline)" ||
+        { record consumer_restart FAILED "" "" "" frames_baseline_unavailable; return; }
     arm_scenario || { record consumer_restart FAILED "" "" "" timing_error_clock; return; }
     remote "kill ${CONSUMER_PID} 2>/dev/null || true" >/dev/null 2>&1 ||
         { record consumer_restart FAILED "" "" "" stimulus_failed; return; }
@@ -671,7 +686,10 @@ scenario_consumer_restart() {
         return
     fi
     start_consumer || { record consumer_restart FAILED "" "" "" "restart_failed"; return; }
-    FRAMES_BASELINE="$(frames_painted_baseline)"
+    # The restarted display owns a new counter: require an observed baseline
+    # again, not a fabricated zero or the previous process's counter.
+    FRAMES_BASELINE="$(frames_painted_baseline)" ||
+        { record consumer_restart FAILED "" "" "" frames_baseline_unavailable; return; }
     if wait_projecting "${BUDGET_MS}"; then
         if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
             complete_scenario || true
@@ -689,7 +707,8 @@ scenario_usb_unplug_replug() {
     wait_projecting "${BUDGET_MS}" || { record usb_unplug_replug FAILED "" "" "" "no_initial_projection"; return; }
     offset="$(log_offset)"
     retries_before="$(retries_total)"
-    FRAMES_BASELINE="$(frames_painted_baseline)"
+    FRAMES_BASELINE="$(frames_painted_baseline)" ||
+        { record usb_unplug_replug FAILED "" "" "" frames_baseline_unavailable; return; }
     arm_scenario || { record usb_unplug_replug FAILED "" "" "" timing_error_clock; return; }
     UNBOUND_PORT="${PORT}"
     if ! remote "sudo -n sh -c 'echo -n ${PORT_Q} > /sys/bus/usb/drivers/usb/unbind'" >/dev/null 2>&1; then
@@ -724,7 +743,8 @@ scenario_phone_lock_unlock() {
     serial="$(stimulus_serial)" || { record phone_lock_unlock BLOCKED "" "" "" "stimulus_device_unattributed"; return; }
     offset="$(log_offset)"
     retries_before="$(retries_total)"
-    FRAMES_BASELINE="$(frames_painted_baseline)"
+    FRAMES_BASELINE="$(frames_painted_baseline)" ||
+        { record phone_lock_unlock FAILED "" "" "" frames_baseline_unavailable; return; }
     label="$(intended_phone_label)" || label=""
     arm_scenario || { record phone_lock_unlock FAILED "" "" "" timing_error_clock; return; }
     adb_stimulus "${serial}" "shell input keyevent 26" >/dev/null 2>&1 ||
@@ -760,7 +780,8 @@ scenario_phone_aa_restart() {
     serial="$(stimulus_serial)" || { record phone_aa_restart BLOCKED "" "" "" "stimulus_device_unattributed"; return; }
     offset="$(log_offset)"
     retries_before="$(retries_total)"
-    FRAMES_BASELINE="$(frames_painted_baseline)"
+    FRAMES_BASELINE="$(frames_painted_baseline)" ||
+        { record phone_aa_restart FAILED "" "" "" frames_baseline_unavailable; return; }
     label="$(intended_phone_label)" || label=""
     arm_scenario || { record phone_aa_restart FAILED "" "" "" timing_error_clock; return; }
     adb_stimulus "${serial}" "shell am force-stop com.google.android.projection.gearhead" >/dev/null 2>&1 ||
