@@ -124,7 +124,20 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
         }
         return ServiceConfiguration{std::move(config)};
     }
-    case ChannelRole::microphone:
+    case ChannelRole::microphone: {
+        const auto& source = entry.media_source_service();
+        constexpr int source_tags[] = {1, 2, 3};
+        if (rejects_unknown(source, source_tags) || !source.has_audio_config()
+            || source.available_type() != shared::MEDIA_CODEC_AUDIO_PCM
+            || source.available_while_in_call()) { return malformed(); }
+        const auto& audio = source.audio_config();
+        if (rejects_unknown(audio, kAudioConfigurationTags)
+            || !audio.IsInitialized() || audio.sampling_rate() != 16000
+            || audio.number_of_bits() != 16 || audio.number_of_channels() != 1) {
+            return malformed();
+        }
+        return ServiceConfiguration{MicrophoneConfiguration{{16000, 16, 1}}};
+    }
     case ChannelRole::bluetooth_projection:
     case ChannelRole::wifi_projection:
     case ChannelRole::diagnostics:
@@ -184,7 +197,17 @@ core::Result<void> put_configuration(aap_protobuf::service::Service& entry,
             entry.mutable_input_source_service()->add_keycodes_supported(keycode);
         }
         return {};
-    case ChannelRole::microphone:
+    case ChannelRole::microphone: {
+        auto* source = entry.mutable_media_source_service();
+        source->set_available_type(shared::MEDIA_CODEC_AUDIO_PCM);
+        source->set_available_while_in_call(false);
+        const auto profile = std::get<MicrophoneConfiguration>(descriptor.configuration).profile;
+        auto* audio = source->mutable_audio_config();
+        audio->set_sampling_rate(profile.sampling_rate);
+        audio->set_number_of_bits(profile.bits);
+        audio->set_number_of_channels(profile.channels);
+        return {};
+    }
     case ChannelRole::bluetooth_projection:
     case ChannelRole::wifi_projection:
     case ChannelRole::diagnostics:

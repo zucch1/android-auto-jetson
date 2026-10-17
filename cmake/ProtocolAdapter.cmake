@@ -45,6 +45,7 @@ endif()
 set(AA_PROTOCOL_TEST_SOURCES
     tests/protocol/messages_roundtrip_test.cpp
     tests/protocol/sensor_configuration_test.cpp
+    tests/protocol/microphone_configuration_test.cpp
     tests/protocol/messages_reject_test.cpp
     tests/protocol/channel_map_test.cpp)
 foreach(source IN LISTS AA_PROTOCOL_TEST_SOURCES)
