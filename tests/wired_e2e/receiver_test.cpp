@@ -180,7 +180,7 @@ namespace {
 namespace media_wire = aap_protobuf::service::media::sink::message;
 
 TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
-    VideoOutlet outlet;
+    VideoOutlet outlet{log_line};
     const std::vector<std::byte> payload{std::byte{0}, std::byte{0}, std::byte{1},
                                          std::byte{0x65}, std::byte{0x10}};
     for (int index = 0; index < 31; ++index) {
@@ -190,6 +190,8 @@ TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
         ASSERT_TRUE(result);
         if (index % 30 == 0) {
             EXPECT_EQ(log, "{\"event\":\"video_dropped\",\"reason\":\"no_consumer\",\"count\":" +
+                               std::to_string(index + 1) + "}\n" +
+                               "{\"event\":\"decode_stats\",\"frame_drops\":" +
                                std::to_string(index + 1) + "}\n");
         } else {
             EXPECT_TRUE(log.empty());
@@ -200,7 +202,7 @@ TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
 TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
-    VideoOutlet outlet;
+    VideoOutlet outlet{log_line};
     outlet.install(std::move(pair.value().producer));
     const std::vector<std::byte> non_idr{std::byte{0}, std::byte{0}, std::byte{1},
                                          std::byte{0x41}, std::byte{0x10}};
@@ -213,6 +215,8 @@ TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
         ASSERT_TRUE(result);
         if (index % 30 == 0) {
             EXPECT_EQ(log, "{\"event\":\"video_dropped\",\"reason\":\"waiting_idr\",\"count\":" +
+                               std::to_string(index + 1) + "}\n" +
+                               "{\"event\":\"decode_stats\",\"frame_drops\":" +
                                std::to_string(index + 1) + "}\n");
         } else {
             EXPECT_TRUE(log.empty());
@@ -228,11 +232,16 @@ TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
         const auto result = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {123}}, payload});
         const auto log = testing::internal::GetCapturedStdout();
         ASSERT_TRUE(result);
+        ASSERT_TRUE(log.starts_with("{\"event\":\"video_ipc_send\","));
+        const auto endpoint_end = log.find('\n');
+        ASSERT_NE(endpoint_end, std::string::npos);
+        const auto summary = log.substr(endpoint_end + 1);
         if (delivered % 30 == 1) {
-            EXPECT_EQ(log, "{\"event\":\"video_sent\",\"units\":" +
-                               std::to_string(delivered) + "}\n");
+            EXPECT_EQ(summary, "{\"event\":\"video_sent\",\"units\":" +
+                               std::to_string(delivered) + "}\n" +
+                               "{\"event\":\"decode_stats\",\"frame_drops\":31}\n");
         } else {
-            EXPECT_TRUE(log.empty());
+            EXPECT_TRUE(summary.empty());
         }
         const auto received = pair.value().consumer.receive(Milliseconds{500});
         ASSERT_TRUE(received);
@@ -249,7 +258,7 @@ TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
 TEST(WiredReceiver, VideoOutletSendErrorsDoNotCountAsSent) {
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
-    VideoOutlet outlet;
+    VideoOutlet outlet{log_line};
     outlet.install(std::move(pair.value().producer));
     testing::internal::CaptureStdout();
     const auto invalid = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, {}});
@@ -264,7 +273,11 @@ TEST(WiredReceiver, VideoOutletSendErrorsDoNotCountAsSent) {
     const auto sent = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, idr});
     const auto sent_log = testing::internal::GetCapturedStdout();
     ASSERT_TRUE(sent);
-    EXPECT_EQ(sent_log, "{\"event\":\"video_sent\",\"units\":1}\n");
+    ASSERT_TRUE(sent_log.starts_with("{\"event\":\"video_ipc_send\","));
+    const auto endpoint_end = sent_log.find('\n');
+    ASSERT_NE(endpoint_end, std::string::npos);
+    EXPECT_EQ(sent_log.substr(endpoint_end + 1), "{\"event\":\"video_sent\",\"units\":1}\n"
+                                               "{\"event\":\"decode_stats\",\"frame_drops\":0}\n");
     const auto received = pair.value().consumer.receive(Milliseconds{500});
     ASSERT_TRUE(received);
     ASSERT_EQ(received.value(), aa::ipc::ReceiveStatus::complete);
@@ -381,7 +394,7 @@ TEST(WiredReceiver, ProductionAvRegistrationNegotiatesEncryptedMediaWithoutSetup
     RouterSink audio{router.value()};
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
-    VideoOutlet video;
+    VideoOutlet video{log_line};
     video.install(std::move(pair.value().producer));
     aa::app::WiredSession session{{trust, clock, diagnostics}};
     ASSERT_TRUE(session.configure(service_descriptors(aa::input::CapabilityDescriptor::bench_defaults())));

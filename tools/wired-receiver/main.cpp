@@ -63,10 +63,12 @@
 #include <vector>
 
 #include <signal.h>
+#include "VideoOutlet.hpp"
 
 namespace {
 
 using aa::core::Milliseconds;
+using aa::wired_receiver::VideoOutlet;
 
 std::atomic<bool> g_running{true};
 std::mutex g_log_mutex;
@@ -141,95 +143,6 @@ class StorePhones final : public aa::ipc::PhoneDirectory {
 
   private:
     aa::app::WiredPhoneControl &control_;
-};
-
-bool is_idr_au(const std::vector<std::uint8_t> &payload) {
-    for (std::size_t index = 0; index + 4 < payload.size(); ++index) {
-        if (payload[index] != 0 || payload[index + 1] != 0) {
-            continue;
-        }
-        std::size_t nal = 0;
-        if (payload[index + 2] == 1) {
-            nal = index + 3;
-        } else if (payload[index + 2] == 0 && payload[index + 3] == 1) {
-            nal = index + 4;
-        } else {
-            continue;
-        }
-        if (nal < payload.size() && (payload[nal] & 0x1FU) == 5U) {
-            return true;
-        }
-    }
-    return false;
-}
-
-class VideoOutlet final : public aa::protocol::MessageSink {
-  public:
-    [[nodiscard]] aa::core::Result<void>
-    on_message(const aa::protocol::MessageView &message) override {
-        std::lock_guard lock(mutex_);
-        if (!producer_.has_value()) {
-            record_drop("no_consumer");
-            return {};
-        }
-        std::vector<std::uint8_t> payload;
-        payload.reserve(message.payload.size());
-        for (const std::byte byte : message.payload) {
-            payload.push_back(std::to_integer<std::uint8_t>(byte));
-        }
-        const auto sent = producer_->send_access_unit(aa::ipc::VideoSendRequest{
-            ++sequence_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr_au(payload),
-            payload});
-        if (!sent) {
-            return sent.error();
-        }
-        switch (sent.value()) {
-        case aa::ipc::SendStatus::dropped_backpressure:
-            record_drop("backpressure");
-            return {};
-        case aa::ipc::SendStatus::dropped_waiting_idr:
-            record_drop("waiting_idr");
-            return {};
-        case aa::ipc::SendStatus::sent:
-            break;
-        }
-        ++units_;
-        if (units_ % 30 == 1) {
-            log_line("{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
-        }
-        return {};
-    }
-
-    void install(aa::ipc::VideoProducer producer) {
-        std::lock_guard lock(mutex_);
-        if (producer_.has_value()) {
-            producer_->close();
-        }
-        producer_.emplace(std::move(producer));
-    }
-
-    void close() noexcept {
-        std::lock_guard lock(mutex_);
-        if (producer_.has_value()) {
-            producer_->close();
-            producer_.reset();
-        }
-    }
-
-  private:
-    void record_drop(const char *reason) {
-        ++dropped_;
-        if (dropped_ % 30 == 1) {
-            log_line(std::string{"{\"event\":\"video_dropped\",\"reason\":\""} + reason +
-                     "\",\"count\":" + std::to_string(dropped_) + "}");
-        }
-    }
-
-    std::mutex mutex_{};
-    std::optional<aa::ipc::VideoProducer> producer_{};
-    std::uint64_t sequence_{0};
-    std::uint64_t units_{0};
-    std::uint64_t dropped_{0};
 };
 
 class RouterSink final : public aa::protocol::MessageSink {
@@ -482,7 +395,7 @@ int main(int argc, char **argv) {
         log_line("{\"event\":\"err\",\"detail\":\"configure\"}");
         return 1;
     }
-    VideoOutlet video_outlet;
+    VideoOutlet video_outlet{log_line};
     aa::channels::InputSink input_sink;
     aa::channels::SensorSink sensor_sink{input, [&session](std::vector<std::byte> payload) {
         return session.send_channel_payload(aa::protocol::ChannelRole::sensors, std::move(payload));

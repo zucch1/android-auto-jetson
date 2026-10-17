@@ -35,6 +35,7 @@ set(AA_WIRED_TEST_SOURCES
     tests/wired_e2e/wired_e2e_revoke_test.cpp
     tests/wired_e2e/wired_e2e_failures_test.cpp
     tests/wired_e2e/receiver_test.cpp
+    tests/wired_e2e/video_outlet_test.cpp
     tests/wired_e2e/av_sink_test.cpp
     tests/wired_e2e/microphone_test.cpp
     tests/wired_e2e/wired_deadline_test.cpp

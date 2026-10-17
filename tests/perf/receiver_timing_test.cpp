@@ -5,6 +5,7 @@
 #undef main
 
 #include "../../src/audio/AudioSinkFactory.hpp"
+#include "../video_socket/pair.hpp"
 #include <gtest/gtest.h>
 #include <regex>
 
@@ -85,4 +86,56 @@ TEST(ReceiverTiming, EmitsActualAudioWriteCompletionWithScheduledInterval) {
     EXPECT_GT(std::stoll(match[2].str()), start);
     EXPECT_GE(std::stoll(match[3].str()), start);
     EXPECT_LE(std::stoll(match[3].str()), end);
+}
+
+TEST(ReceiverTiming, VideoDropsIncludeFinalTailAfterPeriodicEmission) {
+    // Given an outlet without a consumer and 29 real input access units.
+    testing::internal::CaptureStdout();
+    {
+        VideoOutlet outlet{log_line};
+        aa::protocol::MessageView message{};
+        for (int frame = 0; frame < 29; ++frame) {
+            ASSERT_TRUE(outlet.on_message(message));
+        }
+        // When teardown flushes the cumulative drop tail.
+    }
+    const auto output = testing::internal::GetCapturedStdout();
+    // Then both the initial observation and final actual count are exported.
+    EXPECT_NE(output.find("\"frame_drops\":1}"), std::string::npos);
+    EXPECT_NE(output.find("\"frame_drops\":29}"), std::string::npos);
+}
+
+TEST(ReceiverTiming, VideoWithoutInputKeepsDropMeasurementAbsent) {
+    // Given an outlet which never observed input.
+    testing::internal::CaptureStdout();
+    { VideoOutlet outlet{log_line}; }
+    // When it is destroyed, then no zero-valued observation is invented.
+    const auto output = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(output.find("frame_drops"), std::string::npos);
+}
+
+TEST(ReceiverTiming, ActualSocketBackpressureContributesToOutletDrops) {
+    // Given a bounded socket consumer which never reads its queued frames.
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    std::vector<std::byte> payload(16UL * 1024, std::byte{0});
+    payload[2] = std::byte{1};
+    payload[3] = std::byte{0x65};
+    aa::protocol::MessageView message{};
+    message.payload = payload;
+    testing::internal::CaptureStdout();
+    {
+        VideoOutlet outlet{log_line};
+        outlet.install(std::move(pair.value().producer));
+        // When more IDR access units are offered than the kernel budget can hold.
+        for (int frame = 0; frame < 64; ++frame) {
+            EXPECT_TRUE(outlet.on_message(message));
+        }
+    }
+    const auto output = testing::internal::GetCapturedStdout();
+    // Then the observed backpressure reason and a positive final count survive.
+    EXPECT_NE(output.find("\"reason\":\"backpressure\""), std::string::npos);
+    std::smatch match;
+    ASSERT_TRUE(std::regex_search(output, match, std::regex{"\"frame_drops\":([1-9][0-9]*)"}));
+    EXPECT_GT(std::stoull(match[1].str()), 0U);
 }
