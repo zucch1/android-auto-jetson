@@ -158,6 +158,7 @@ class ObservedSessionMutex {
 #undef AA_WIRED_RECEIVER_SHUTDOWN_TEST
 
 #include "harness.hpp"
+#include "../video_socket/pair.hpp"
 #include "../trust/syscall_faults.hpp"
 #include "../transport/UsbAoaFakes.hpp"
 #include "../../src/transport/usb_adapter/LibusbWorld.hpp"
@@ -173,6 +174,98 @@ class ObservedSessionMutex {
 #include <unistd.h>
 
 namespace {
+TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
+    VideoOutlet outlet;
+    const std::vector<std::byte> payload{std::byte{0}, std::byte{0}, std::byte{1},
+                                         std::byte{0x65}, std::byte{0x10}};
+    for (int index = 0; index < 31; ++index) {
+        testing::internal::CaptureStdout();
+        const auto result = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, payload});
+        const auto log = testing::internal::GetCapturedStdout();
+        ASSERT_TRUE(result);
+        if (index % 30 == 0) {
+            EXPECT_EQ(log, "{\"event\":\"video_dropped\",\"reason\":\"no_consumer\",\"count\":" +
+                               std::to_string(index + 1) + "}\n");
+        } else {
+            EXPECT_TRUE(log.empty());
+        }
+    }
+}
+
+TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    VideoOutlet outlet;
+    outlet.install(std::move(pair.value().producer));
+    const std::vector<std::byte> non_idr{std::byte{0}, std::byte{0}, std::byte{1},
+                                         std::byte{0x41}, std::byte{0x10}};
+    const std::vector<std::byte> idr{std::byte{0}, std::byte{0}, std::byte{1},
+                                     std::byte{0x65}, std::byte{0x10}};
+    for (int index = 0; index < 31; ++index) {
+        testing::internal::CaptureStdout();
+        const auto result = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, non_idr});
+        const auto log = testing::internal::GetCapturedStdout();
+        ASSERT_TRUE(result);
+        if (index % 30 == 0) {
+            EXPECT_EQ(log, "{\"event\":\"video_dropped\",\"reason\":\"waiting_idr\",\"count\":" +
+                               std::to_string(index + 1) + "}\n");
+        } else {
+            EXPECT_TRUE(log.empty());
+        }
+    }
+    const auto empty = pair.value().consumer.receive(Milliseconds{0});
+    ASSERT_FALSE(empty);
+    EXPECT_EQ(empty.error().code(), aa::ErrorCode::timeout);
+
+    for (std::uint64_t delivered = 1; delivered <= 31; ++delivered) {
+        const auto &payload = delivered == 1 ? idr : non_idr;
+        testing::internal::CaptureStdout();
+        const auto result = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {123}}, payload});
+        const auto log = testing::internal::GetCapturedStdout();
+        ASSERT_TRUE(result);
+        if (delivered % 30 == 1) {
+            EXPECT_EQ(log, "{\"event\":\"video_sent\",\"units\":" +
+                               std::to_string(delivered) + "}\n");
+        } else {
+            EXPECT_TRUE(log.empty());
+        }
+        const auto received = pair.value().consumer.receive(Milliseconds{500});
+        ASSERT_TRUE(received);
+        ASSERT_EQ(received.value(), aa::ipc::ReceiveStatus::complete);
+        const auto &unit = pair.value().consumer.access_unit();
+        EXPECT_EQ(unit.frame, 31 + delivered);
+        EXPECT_EQ(unit.timestamp_ns, 123U);
+        EXPECT_EQ(unit.idr, delivered == 1);
+        EXPECT_EQ(unit.payload, (std::vector<std::uint8_t>{0, 0, 1,
+                                  static_cast<std::uint8_t>(delivered == 1 ? 0x65 : 0x41), 0x10}));
+    }
+}
+
+TEST(WiredReceiver, VideoOutletSendErrorsDoNotCountAsSent) {
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    VideoOutlet outlet;
+    outlet.install(std::move(pair.value().producer));
+    testing::internal::CaptureStdout();
+    const auto invalid = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, {}});
+    const auto invalid_log = testing::internal::GetCapturedStdout();
+    ASSERT_FALSE(invalid);
+    EXPECT_EQ(invalid.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_TRUE(invalid_log.empty());
+
+    const std::vector<std::byte> idr{std::byte{0}, std::byte{0}, std::byte{1},
+                                     std::byte{0x65}, std::byte{0x10}};
+    testing::internal::CaptureStdout();
+    const auto sent = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, idr});
+    const auto sent_log = testing::internal::GetCapturedStdout();
+    ASSERT_TRUE(sent);
+    EXPECT_EQ(sent_log, "{\"event\":\"video_sent\",\"units\":1}\n");
+    const auto received = pair.value().consumer.receive(Milliseconds{500});
+    ASSERT_TRUE(received);
+    ASSERT_EQ(received.value(), aa::ipc::ReceiveStatus::complete);
+    EXPECT_EQ(pair.value().consumer.access_unit().frame, 2U);
+}
+
 std::atomic<int> runtime_connects{0};
 std::atomic<int> runtime_ciphers{0};
 bool runtime_recovers = false;

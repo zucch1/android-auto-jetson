@@ -168,6 +168,7 @@ class VideoOutlet final : public aa::protocol::MessageSink {
     on_message(const aa::protocol::MessageView &message) override {
         std::lock_guard lock(mutex_);
         if (!producer_.has_value()) {
+            record_drop("no_consumer");
             return {};
         }
         std::vector<std::uint8_t> payload;
@@ -175,13 +176,23 @@ class VideoOutlet final : public aa::protocol::MessageSink {
         for (const std::byte byte : message.payload) {
             payload.push_back(std::to_integer<std::uint8_t>(byte));
         }
-        ++units_;
         const auto sent = producer_->send_access_unit(aa::ipc::VideoSendRequest{
-            units_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr_au(payload),
+            ++sequence_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr_au(payload),
             payload});
         if (!sent) {
             return sent.error();
         }
+        switch (sent.value()) {
+        case aa::ipc::SendStatus::dropped_backpressure:
+            record_drop("backpressure");
+            return {};
+        case aa::ipc::SendStatus::dropped_waiting_idr:
+            record_drop("waiting_idr");
+            return {};
+        case aa::ipc::SendStatus::sent:
+            break;
+        }
+        ++units_;
         if (units_ % 30 == 1) {
             log_line("{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
         }
@@ -205,9 +216,19 @@ class VideoOutlet final : public aa::protocol::MessageSink {
     }
 
   private:
+    void record_drop(const char *reason) {
+        ++dropped_;
+        if (dropped_ % 30 == 1) {
+            log_line(std::string{"{\"event\":\"video_dropped\",\"reason\":\""} + reason +
+                     "\",\"count\":" + std::to_string(dropped_) + "}");
+        }
+    }
+
     std::mutex mutex_{};
     std::optional<aa::ipc::VideoProducer> producer_{};
+    std::uint64_t sequence_{0};
     std::uint64_t units_{0};
+    std::uint64_t dropped_{0};
 };
 
 class RouterSink final : public aa::protocol::MessageSink {
