@@ -110,10 +110,11 @@ TEST(InputSensorsWireSession, RequestAndToggleUseEncryptedNegotiatedServiceAndFa
     ASSERT_TRUE(session.poll_transport());
     ASSERT_EQ(transport.sent_count(), before + 2);
     EXPECT_EQ(transport.last_sent()[0], std::byte{105});
-    EXPECT_EQ(transport.last_sent()[1] & std::byte{0x08}, std::byte{0x08});
+    EXPECT_EQ(transport.last_sent()[1] & std::byte{0x0c}, std::byte{0x08});
     auto message = decode_last();
     ASSERT_TRUE(message);
     ASSERT_EQ(message.value().channel, 105);
+    EXPECT_EQ(message.value().kind, aa::transport::MessageKind::specific);
     const auto& payload = message.value().payload;
     ASSERT_GE(payload.size(), 2u);
     EXPECT_EQ(payload[0], std::byte{0x80});
@@ -127,6 +128,9 @@ TEST(InputSensorsWireSession, RequestAndToggleUseEncryptedNegotiatedServiceAndFa
     ASSERT_EQ(transport.sent_count(), before + 3);
     message = decode_last();
     ASSERT_TRUE(message);
+    EXPECT_EQ(transport.last_sent()[1] & std::byte{0x0c}, std::byte{0x08});
+    EXPECT_EQ(message.value().channel, 105);
+    EXPECT_EQ(message.value().kind, aa::transport::MessageKind::specific);
     const auto& toggle = message.value().payload;
     ASSERT_TRUE(batch.ParseFromArray(toggle.data() + 2, static_cast<int>(toggle.size() - 2)));
     ASSERT_EQ(batch.night_mode_data_size(), 1);
@@ -187,11 +191,11 @@ protected:
 
     void expect_open(std::uint8_t channel, proto::ChannelOpenStatus status) {
         EXPECT_EQ(transport.last_sent()[0], static_cast<std::byte>(channel));
-        EXPECT_EQ(transport.last_sent()[1] & std::byte{0x0c}, std::byte{0x08});
+        EXPECT_EQ(transport.last_sent()[1] & std::byte{0x0c}, std::byte{0x0c});
         const auto message = last_message();
         ASSERT_TRUE(message);
         EXPECT_EQ(message.value().channel, channel);
-        EXPECT_EQ(message.value().kind, aa::transport::MessageKind::specific);
+        EXPECT_EQ(message.value().kind, aa::transport::MessageKind::control);
         const auto response = proto::decode_channel_open_response(message.value().payload);
         ASSERT_TRUE(response);
         EXPECT_EQ(response.value().status, status);
@@ -202,7 +206,7 @@ protected:
         std::byte{0x0a}, std::byte{0x10}, std::byte{0x00}};
 };
 
-TEST_F(InBandSession, OpenOnSensorServiceRepliesOnSameEncryptedSpecificChannelThenDispatches) {
+TEST_F(InBandSession, OpenOnSensorServiceRepliesOnSameEncryptedControlChannelThenDispatches) {
     ASSERT_TRUE(receive(105, proto::encode(proto::ChannelOpenRequest{1, {105}}).value()));
     expect_open(105, proto::ChannelOpenStatus::success);
     EXPECT_EQ(session.channel_opens(), 1u);
@@ -210,6 +214,26 @@ TEST_F(InBandSession, OpenOnSensorServiceRepliesOnSameEncryptedSpecificChannelTh
     ASSERT_TRUE(receive(105, sensor_request));
     EXPECT_EQ(transport.sent_count(), before + 2);
     EXPECT_EQ(session.channel_opens(), 1u);
+    EXPECT_EQ(transport.last_sent()[1] & std::byte{0x0c}, std::byte{0x08});
+    const auto data = last_message();
+    ASSERT_TRUE(data);
+    EXPECT_EQ(data.value().channel, 105);
+    EXPECT_EQ(data.value().kind, aa::transport::MessageKind::specific);
+    ASSERT_GE(data.value().payload.size(), 2u);
+    EXPECT_EQ(data.value().payload[0], std::byte{0x80});
+    EXPECT_EQ(data.value().payload[1], std::byte{0x03});
+    const auto before_unsupported = transport.sent_count();
+    ASSERT_TRUE(receive(105, {std::byte{0x80}, std::byte{0x01}, std::byte{0x08},
+                              std::byte{0x03}, std::byte{0x10}, std::byte{0x00}}));
+    ASSERT_EQ(transport.sent_count(), before_unsupported + 1);
+    EXPECT_EQ(transport.last_sent()[1] & std::byte{0x0c}, std::byte{0x08});
+    const auto response = last_message();
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response.value().channel, 105);
+    EXPECT_EQ(response.value().kind, aa::transport::MessageKind::specific);
+    ASSERT_GE(response.value().payload.size(), 2u);
+    EXPECT_EQ(response.value().payload[0], std::byte{0x80});
+    EXPECT_EQ(response.value().payload[1], std::byte{0x02});
 }
 
 TEST_F(InBandSession, UnknownOpenIsUnsupportedAndDoesNotFailSession) {
@@ -265,6 +289,9 @@ TEST_F(InBandSession, SensorRequestImplicitlyOpensAdvertisedUnopenedRouteExactly
 TEST_F(InBandSession, RegisteredInputAppearsAs104InputSourceServiceInDiscoveryBytes) {
     const auto message = last_message();
     ASSERT_TRUE(message);
+    EXPECT_EQ(transport.last_sent()[1] & std::byte{0x0c}, std::byte{0x08});
+    EXPECT_EQ(message.value().channel, 0);
+    EXPECT_EQ(message.value().kind, aa::transport::MessageKind::specific);
     aap_protobuf::service::control::message::ServiceDiscoveryResponse wire;
     const auto& payload = message.value().payload;
     ASSERT_TRUE(wire.ParseFromArray(payload.data() + 2, static_cast<int>(payload.size() - 2)));
