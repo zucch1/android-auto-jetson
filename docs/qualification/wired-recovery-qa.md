@@ -94,6 +94,15 @@ normal operation.
   - **painted frames**: `frames_painted` growth with `render_ok` from the
     shipped dummy display's test-only status channel (`video_sent` alone only
     proves units crossed the channel, not that anything painted);
+    all five media-recovery scenarios require a successfully probed, nonnegative
+    integer baseline before disturbance. Missing/empty/malformed status or a
+    failed probe records `FAILED` `frames_baseline_unavailable`, with
+    `frames_painted_baseline: null` (never a fallback `0`) and no recovery-time
+    claim. A parsed `0` is valid. Consumer restart also requires a fresh baseline
+    from the new display process. Post-recovery status must come from a successful
+    probe and contain an integer counter strictly greater than that baseline,
+    greater than zero, with JSON boolean `render_ok: true`; unchanged counters,
+    negative values, numeric prefixes, and non-integer values cannot pass;
   - **successful audio pump**: a `media_timing` record - the receiver logs
     `audio_chunks` BEFORE `router_.pump()` runs, so `audio_chunks` presence is
     not proof of pump success;
