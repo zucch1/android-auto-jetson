@@ -55,6 +55,37 @@ TEST(UsbAoaSwitch, SendStringPayloadIsNulTerminatedAscii) {
     EXPECT_EQ(payload.value()[0], std::byte{'A'});
 }
 
+TEST(UsbAoaSwitch, SendStringPayloadAcceptsFullWireBudget) {
+    const std::string text(ua::kAoaStringMaxChars, 'a');
+    auto payload = ua::aoa_string_payload(text);
+    ASSERT_TRUE(payload.has_value());
+    EXPECT_EQ(payload.value().size(), ua::kAoaStringMaxWireBytes);
+    EXPECT_EQ(payload.value().back(), std::byte{0});
+}
+
+TEST(UsbAoaSwitch, SendStringPayloadRejectsOnePastWireBudget) {
+    const std::string text(ua::kAoaStringMaxChars + 1, 'a');
+    auto payload = ua::aoa_string_payload(text);
+    ASSERT_FALSE(payload.has_value());
+    EXPECT_EQ(payload.error().code(), ErrorCode::invalid_argument);
+}
+
+TEST(UsbAoaSwitch, OverBudgetStringSendsNothing) {
+    aa::transport::AoaAccessoryInfo info;
+    info.manufacturer = std::string(ua::kAoaStringMaxChars + 1, 'm');
+    fx::FakeControlChannel channel;
+    aa::transport::AoaSwitchReport report;
+
+    auto result = ua::run_aoa_switch(channel, info, report);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code(), ErrorCode::invalid_argument);
+    EXPECT_TRUE(channel.state()->calls().empty()) << "no partial send before rejection";
+    EXPECT_EQ(report.requests, 0);
+    EXPECT_TRUE(report.steps.empty());
+    EXPECT_FALSE(report.started);
+}
+
 TEST(UsbAoaSwitch, RejectsProtocolLengthMismatch) {
     for (const std::size_t length : {std::size_t{1}, std::size_t{3}, std::size_t{0}}) {
         fx::FakeControlChannel channel;
