@@ -156,4 +156,38 @@ TEST(UsbAoaWorld, ResetMatchesFullSelectorAndResetsTarget) {
         << "a device that matches the full selector must be reset (test not vacuous)";
 }
 
+TEST(UsbAoaWorld, BoundedDescriptorReadsPreserveAdmissionIdentity) {
+    set_scenario("claim-fail-pre");
+    auto factory = ua::make_libusb_link_factory();
+    ASSERT_TRUE(factory.has_value());
+    const aa::trust::WiredIdentity expected{"04e8", "6860", "TEST-SERIAL-001",
+                                          "Android", "Android Auto", "HU-AAAAAA001", "1-2.1"};
+
+    auto link = ua::connect_aoa(
+        std::move(factory.value()), phone_selector(), tr::AoaAccessoryInfo{},
+        [&](const aa::trust::WiredIdentity &identity) { return identity == expected; });
+
+    ASSERT_TRUE(link.has_value());
+    EXPECT_EQ(link.value().identity, expected);
+    EXPECT_EQ(link.value().pre_switch.manufacturer, "SAMSUNG");
+    EXPECT_EQ(link.value().pre_switch.product, "SAMSUNG_Android");
+    EXPECT_TRUE(contains(read_log(), "libusb_control_transfer:6:1033"));
+    EXPECT_EQ(count_of(read_log(), "libusb_claim_interface"), 1);
+    EXPECT_FALSE(contains(read_log(), "libusb_detach_kernel_driver"));
+}
+
+TEST(UsbAoaWorld, ExpiredCallerDeadlinePreventsAccessoryClaim) {
+    set_scenario("happy");
+    auto factory = ua::make_libusb_link_factory();
+    ASSERT_TRUE(factory.has_value());
+    factory.value()->set_connect_deadline({aa::core::Deadline::Clock::now(), {}});
+    tr::UsbDeviceSnapshot post;
+
+    auto claimed = factory.value()->claim_accessory(phone_selector(), post);
+
+    ASSERT_FALSE(claimed.has_value());
+    EXPECT_EQ(claimed.error().code(), ErrorCode::timeout);
+    EXPECT_FALSE(contains(read_log(), "libusb_claim_interface"));
+}
+
 } // namespace

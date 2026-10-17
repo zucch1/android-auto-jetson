@@ -30,6 +30,8 @@ public:
     [[nodiscard]] Kind kind() const noexcept override { return Kind::usb_aoa; }
 
     core::Result<void> open(core::CancellationToken cancellation) override;
+    void set_io_deadline(core::Deadline::Clock::time_point until) noexcept override;
+    void set_io_checkpoint(std::function<void()> checkpoint) override;
     core::Result<void> send(std::span<const std::byte> frame) override;
     [[nodiscard]] core::Result<std::vector<std::byte>> receive() override;
     void close() noexcept override;

@@ -2,9 +2,11 @@
 #pragma once
 
 #include <aa/core/Cancellation.hpp>
+#include <aa/core/Deadline.hpp>
 #include <aa/core/Result.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -34,6 +36,12 @@ enum class Kind { usb_aoa, tcp, tls };
 
 class Transport {
 public:
+    virtual void set_io_deadline(core::Deadline::Clock::time_point) noexcept {}
+    // Opt-in: invoked on the I/O owner between blocking transfers. May process
+    // control/store work and request cancellation, but MUST NOT close, replace,
+    // destroy or recursively operate the transport. Empty preserves other callers.
+    // NOLINTNEXTLINE(performance-unnecessary-value-param): overrides take ownership.
+    virtual void set_io_checkpoint(std::function<void()> checkpoint) { (void)checkpoint; }
     virtual ~Transport() = default;
     Transport() = default;
     Transport(const Transport&) = delete;

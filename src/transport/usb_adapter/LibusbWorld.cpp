@@ -151,27 +151,41 @@ class Enumeration final {
 }
 
 [[nodiscard]] std::string fetch_string(const LibusbApi &api, LibusbDeviceHandle *handle,
-                                       std::uint8_t index) {
-    if (index == 0) {
+                                       std::uint8_t index, const core::Deadline &budget) {
+    if (index == 0 || !budget.check()) {
         return {};
     }
     std::uint8_t buffer[kStringFetchLength] = {};
-    const int length = api.get_string_descriptor_ascii(handle, index, buffer, kStringFetchLength);
-    if (length <= 0) {
-        // A device may refuse string fetches; the identity then carries less
-        // material and admission decides. Never a crash, never an overflow.
+    // The libusb ASCII convenience API has an internal timeout that the caller
+    // cannot shorten. Fetch the USB UTF-16 descriptor with bounded control I/O.
+    const int languages = api.control_transfer(handle, 0x80, 6, 0x0300, 0, buffer,
+                                                kStringFetchLength, budget.slice_ms(200));
+    if (languages < 4 || !budget.check()) {
         return {};
     }
-    return std::string(reinterpret_cast<const char *>(buffer), static_cast<std::size_t>(length));
+    const auto language = static_cast<std::uint16_t>(buffer[2] | (buffer[3] << 8U));
+    const int length = api.control_transfer(
+        handle, 0x80, 6, static_cast<std::uint16_t>(0x0300U | index), language, buffer,
+        kStringFetchLength, budget.slice_ms(200));
+    if (length < 2 || !budget.check()) {
+        return {};
+    }
+    std::string text;
+    const int end = std::min(length, static_cast<int>(buffer[0]));
+    for (int offset = 2; offset + 1 < end; offset += 2) {
+        text.push_back(buffer[offset + 1] == 0 && buffer[offset] < 128
+                           ? static_cast<char>(buffer[offset]) : '?');
+    }
+    return text;
 }
 
-// Open the device and fetch its descriptor strings. Deliberately NO interface
-// claim and NO kernel-driver detach: the pre-switch AOA control transfers use
-// endpoint 0 only and must not disturb an existing interface 0 binding (a
-// claim here can disrupt the phone's current configuration or fail an
-// otherwise valid switch).
-[[nodiscard]] core::Result<LibusbHandle>
-open_with_strings(const LibusbApi &api, LibusbDevice *device, UsbDeviceSnapshot &snapshot) {
+// Pre-switch endpoint-0 control transfers must not claim or detach interface 0.
+[[nodiscard]] core::Result<LibusbHandle> open_with_strings(const LibusbApi &api, LibusbDevice *device,
+                                                        UsbDeviceSnapshot &snapshot,
+                                                        const core::Deadline &budget) {
+    if (auto checked = budget.check(); !checked) {
+        return checked.error();
+    }
     LibusbDeviceHandle *raw = nullptr;
     const int rc = api.open(device, &raw);
     if (rc != kLibusbSuccess) {
@@ -180,9 +194,12 @@ open_with_strings(const LibusbApi &api, LibusbDevice *device, UsbDeviceSnapshot 
     LibusbHandle handle(&api, raw);
     LibusbDeviceDescriptor descriptor{};
     if (api.get_device_descriptor(device, &descriptor) == kLibusbSuccess) {
-        snapshot.manufacturer = fetch_string(api, handle.get(), descriptor.iManufacturer);
-        snapshot.product = fetch_string(api, handle.get(), descriptor.iProduct);
-        snapshot.serial = fetch_string(api, handle.get(), descriptor.iSerialNumber);
+        snapshot.manufacturer = fetch_string(api, handle.get(), descriptor.iManufacturer, budget);
+        snapshot.product = fetch_string(api, handle.get(), descriptor.iProduct, budget);
+        snapshot.serial = fetch_string(api, handle.get(), descriptor.iSerialNumber, budget);
+    }
+    if (auto checked = budget.check(); !checked) {
+        return checked.error();
     }
     return handle;
 }
@@ -208,16 +225,20 @@ open_with_strings(const LibusbApi &api, LibusbDevice *device, UsbDeviceSnapshot 
 
 class LibusbControlChannel final : public AoaControlChannel {
   public:
-    LibusbControlChannel(const LibusbApi &api, LibusbHandle handle) noexcept
-        : api_(api), handle_(std::move(handle)) {}
+    LibusbControlChannel(const LibusbApi &api, LibusbHandle handle, core::Deadline budget) noexcept
+        : api_(api), handle_(std::move(handle)), budget_(std::move(budget)) {}
 
     core::Result<std::vector<std::byte>> control_in(std::uint8_t request, std::uint16_t value,
                                                     std::uint16_t index,
                                                     std::uint16_t length) override {
+        if (auto checked = budget_.check(); !checked) {
+            return checked.error();
+        }
         std::vector<std::byte> buffer(length);
         const int transferred = api_.control_transfer(
             handle_.get(), kAoaRequestIn, request, value, index,
-            reinterpret_cast<std::uint8_t *>(buffer.data()), length, kAoaControlTimeoutMs);
+            reinterpret_cast<std::uint8_t *>(buffer.data()), length,
+            budget_.slice_ms(kAoaControlTimeoutMs));
         if (transferred < 0) {
             return map_libusb_error(transferred);
         }
@@ -228,10 +249,13 @@ class LibusbControlChannel final : public AoaControlChannel {
     core::Result<std::size_t> control_out(std::uint8_t request, std::uint16_t value,
                                           std::uint16_t index,
                                           std::span<const std::byte> payload) override {
+        if (auto checked = budget_.check(); !checked) {
+            return checked.error();
+        }
         const auto *data = reinterpret_cast<const std::uint8_t *>(payload.data());
         const int transferred = api_.control_transfer(
             handle_.get(), kAoaRequestOut, request, value, index, const_cast<std::uint8_t *>(data),
-            static_cast<std::uint16_t>(payload.size()), kAoaControlTimeoutMs);
+            static_cast<std::uint16_t>(payload.size()), budget_.slice_ms(kAoaControlTimeoutMs));
         if (transferred < 0) {
             return map_libusb_error(transferred);
         }
@@ -241,6 +265,7 @@ class LibusbControlChannel final : public AoaControlChannel {
   private:
     const LibusbApi &api_;
     LibusbHandle handle_;
+    core::Deadline budget_;
 };
 
 class LibusbBulkPipe final : public UsbBulkPipe {
@@ -300,6 +325,9 @@ class LibusbLinkFactory final : public AoaLinkFactory {
                                            const AoaAccessoryInfo &info,
                                            UsbDeviceSnapshot &pre_switch,
                                            AoaSwitchReport &switch_report) override {
+        if (auto checked = deadline_.check(); !checked) {
+            return checked.error();
+        }
         if (!live_) {
             return Error{ErrorCode::transport_unavailable};
         }
@@ -324,11 +352,11 @@ class LibusbLinkFactory final : public AoaLinkFactory {
         }
         pre_switch = found->snapshot;
         LibusbDevice *device = found->device;
-        auto handle = open_with_strings(session_.api(), device, pre_switch);
+        auto handle = open_with_strings(session_.api(), device, pre_switch, deadline_);
         if (!handle) {
             return handle.error();
         }
-        LibusbControlChannel channel(session_.api(), std::move(handle.value()));
+        LibusbControlChannel channel(session_.api(), std::move(handle.value()), deadline_);
         return run_aoa_switch(channel, info, switch_report);
     }
 
@@ -341,9 +369,14 @@ class LibusbLinkFactory final : public AoaLinkFactory {
         if (!validated) {
             return validated.error();
         }
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(kAccessoryWaitMs.count);
+        const core::Deadline budget{
+            std::min(deadline_.until, core::Deadline::Clock::now() +
+                                          std::chrono::milliseconds{kAccessoryWaitMs.count}),
+            deadline_.cancellation};
         for (;;) {
+            if (auto checked = budget.check(); !checked) {
+                return checked.error();
+            }
             Enumeration enumeration;
             auto enumerated = enumeration.run(session_.api(), session_.context());
             if (!enumerated) {
@@ -362,7 +395,7 @@ class LibusbLinkFactory final : public AoaLinkFactory {
             if (found != nullptr) {
                 post_switch = found->snapshot;
                 LibusbDevice *device = found->device;
-                auto handle = open_with_strings(session_.api(), device, post_switch);
+                auto handle = open_with_strings(session_.api(), device, post_switch, budget);
                 if (!handle) {
                     return handle.error();
                 }
@@ -373,10 +406,13 @@ class LibusbLinkFactory final : public AoaLinkFactory {
                 return std::unique_ptr<UsbBulkPipe>(
                     std::make_unique<LibusbBulkPipe>(session_.api(), std::move(handle.value())));
             }
-            if (std::chrono::steady_clock::now() >= deadline) {
-                return Error{ErrorCode::timeout};
-            }
-            std::this_thread::sleep_for(kReenumPollInterval);
+            std::mutex mutex;
+            std::condition_variable_any cv;
+            std::unique_lock lock(mutex);
+            cv.wait_until(lock, budget.cancellation,
+                          std::min(budget.until,
+                                   std::chrono::steady_clock::now() + kReenumPollInterval),
+                          [] { return false; });
         }
     }
 

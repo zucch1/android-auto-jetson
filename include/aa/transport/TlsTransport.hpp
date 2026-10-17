@@ -3,6 +3,7 @@
 
 #include <aa/core/Cancellation.hpp>
 #include <aa/core/Result.hpp>
+#include <aa/transport/Framing.hpp>
 #include <aa/transport/Transport.hpp>
 
 #include <cstdint>
@@ -33,13 +34,13 @@ enum class TlsMode { encryption_only_compatibility, verified_peer_test_only };
 // framed API's ENCRYPTED flag. This transport layer makes no live Android Auto
 // protocol-integration claim; that is a later task.
 class TlsTransport final : public Transport {
-public:
+  public:
     // Approved-phone predicate: identity is independent of certificates. A
     // false/throwing predicate makes every session step fail closed.
     using ApprovedPredicate = std::function<bool()>;
 
     [[nodiscard]] static core::Result<std::unique_ptr<TlsTransport>>
-    connect(const char* host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode);
+    connect(const char *host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode);
 
     ~TlsTransport() override;
 
@@ -51,7 +52,7 @@ public:
     [[nodiscard]] core::Result<std::vector<std::byte>> receive() override;
     void close() noexcept override;
 
-private:
+  private:
     friend class TlsListener;
 
     struct Impl;
@@ -65,11 +66,11 @@ private:
 
 // A TLS server listener bound to host:port. Accept one peer and handshake it.
 class TlsListener final {
-public:
+  public:
     using ApprovedPredicate = TlsTransport::ApprovedPredicate;
 
     [[nodiscard]] static core::Result<std::unique_ptr<TlsListener>>
-    listen(const char* host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode);
+    listen(const char *host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode);
 
     ~TlsListener();
 
@@ -77,7 +78,7 @@ public:
     [[nodiscard]] core::Result<std::unique_ptr<TlsTransport>> accept();
     void close() noexcept;
 
-private:
+  private:
     struct Impl;
     explicit TlsListener(std::unique_ptr<Impl> impl) noexcept;
 
@@ -92,6 +93,16 @@ struct TlsLoopbackPair final {
 };
 
 [[nodiscard]] core::Result<TlsLoopbackPair>
-make_tls_loopback(const TlsTransport::ApprovedPredicate& approved, TlsMode mode);
+make_tls_loopback(const TlsTransport::ApprovedPredicate &approved, TlsMode mode);
+
+// Create the HU-side TLS handshake cipher (client role: the HU presents the
+// task-8 credential and emits its handshake flight first - the wire contract in
+// tests/wired_e2e/wired_e2e_auth_test.cpp is version_response -> HU
+// encapsulated_ssl -> phone encapsulated_ssl -> HU final chunk + auth_complete).
+// The approved-phone admission predicate is re-checked on every handshake step,
+// so a mid-handshake revoke fails closed. Implemented by the TLS record
+// adapter; no OpenSSL type crosses this boundary.
+[[nodiscard]] std::unique_ptr<HandshakingCipher>
+make_client_handshake_cipher(const TlsTransport::ApprovedPredicate &approved);
 
 } // namespace aa::transport

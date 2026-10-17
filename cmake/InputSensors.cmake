@@ -82,6 +82,13 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_target_properties(aa_input_sensors_test PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     list(APPEND AA_INPUT_SENSORS_WARN_TARGETS aa_input_sensors_test)
+    add_executable(aa_sensor_session_test tests/input_sensors/sensor_session_test.cpp)
+    set_target_properties(aa_sensor_session_test PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_link_libraries(aa_sensor_session_test PRIVATE
+        aa_wired aa_protocol_adapter aap_protobuf aa_ipc_control aa_ipc_dbus
+        aa_video aa_input aa_transport_tls aareceiver-audio pthread GTest::gtest_main)
+    list(APPEND AA_INPUT_SENSORS_WARN_TARGETS aa_sensor_session_test)
 endif()
 
 foreach(target IN LISTS AA_INPUT_SENSORS_WARN_TARGETS)
@@ -107,6 +114,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME input_sensors_capability COMMAND aa_input_sensors_test --gtest_filter=InputSensorsCapability.*)
     add_test(NAME input_sensors_input COMMAND aa_input_sensors_test --gtest_filter=InputSensorsInput.*)
     add_test(NAME input_sensors_sensors COMMAND aa_input_sensors_test --gtest_filter=InputSensorsSensor.*)
+    add_test(NAME input_sensors_wire_session COMMAND aa_sensor_session_test)
+    set_tests_properties(input_sensors_wire_session PROPERTIES TIMEOUT 60)
     # Mandatory memcheck qualification (gate r1): input_sensors_memory is
     # ALWAYS registered natively. With valgrind it is the real memcheck run;
     # without it (or with a nonexistent AA_VALGRIND_EXECUTABLE path) the same

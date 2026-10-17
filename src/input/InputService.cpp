@@ -65,7 +65,10 @@ core::Result<void> InputService::submit(const ipc::InputEvent& event) {
         ++rejected_;
         return normalized.error();
     }
-    channel_.on_normalized(normalized.value());
+    if (auto sent = channel_.on_normalized(normalized.value()); !sent) {
+        ++rejected_;
+        return sent.error();
+    }
     ++forwarded_;
     return {};
 }

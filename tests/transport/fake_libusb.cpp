@@ -27,6 +27,8 @@
 
 #include "../../src/transport/usb_adapter/LibusbAbi.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -402,6 +404,34 @@ int libusb_release_interface(ua::LibusbDeviceHandle *handle, int interface_numbe
 int libusb_control_transfer(ua::LibusbDeviceHandle *handle, std::uint8_t request_type,
                             std::uint8_t request, std::uint16_t value, std::uint16_t index,
                             std::uint8_t *data, std::uint16_t length, unsigned timeout_ms) {
+    if (request_type == 0x80 && request == 6 && (value >> 8U) == 3) {
+        log_control(request, index);
+        if (value == 0x0300 && length >= 4) {
+            data[0] = 4;
+            data[1] = 3;
+            data[2] = 0x09;
+            data[3] = 0x04;
+            return 4;
+        }
+        if (length < 2 || index != 0x0409) {
+            return ua::kLibusbErrorIo;
+        }
+        std::array<std::uint8_t, 126> text{};
+        const int count = libusb_get_string_descriptor_ascii(
+            handle, static_cast<std::uint8_t>(value & 0xFFU), text.data(),
+            static_cast<int>(text.size()));
+        if (count < 0) {
+            return count;
+        }
+        const int characters = std::min(count, (static_cast<int>(length) - 2) / 2);
+        data[0] = static_cast<std::uint8_t>(2 + characters * 2);
+        data[1] = 3;
+        for (int at = 0; at < characters; ++at) {
+            data[2 + at * 2] = text[static_cast<std::size_t>(at)];
+            data[3 + at * 2] = 0;
+        }
+        return data[0];
+    }
     return control_transfer_typed(handle, BmRequestType{request_type}, BRequest{request},
                                   WValue{value}, WIndex{index}, data, WLength{length},
                                   TimeoutMs{timeout_ms});

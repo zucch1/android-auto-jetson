@@ -6,6 +6,7 @@
 #include "Framing.hpp"
 
 #include <aap_protobuf/service/control/ControlMessageType.pb.h>
+#include <aap_protobuf/service/control/message/AuthResponse.pb.h>
 #include <aap_protobuf/service/control/message/ChannelOpenRequest.pb.h>
 #include <aap_protobuf/service/control/message/ChannelOpenResponse.pb.h>
 #include <aap_protobuf/service/control/message/PingRequest.pb.h>
@@ -36,11 +37,11 @@ static_assert(static_cast<std::uint16_t>(ControlMessageId::service_discovery_res
 
 // Bound check shared by decode and encode so both sides accept the same value
 // space; an out-of-bound payload is rejected with the same typed code.
-[[nodiscard]] bool ping_data_in_bounds(const std::vector<std::byte>& data) noexcept {
+[[nodiscard]] bool ping_data_in_bounds(const std::vector<std::byte> &data) noexcept {
     return data.size() <= kMaxPingDataBytes;
 }
 
-[[nodiscard]] std::vector<std::byte> copy_bytes(const std::string& raw) {
+[[nodiscard]] std::vector<std::byte> copy_bytes(const std::string &raw) {
     std::vector<std::byte> bytes;
     bytes.reserve(raw.size());
     for (const char byte : raw) {
@@ -49,7 +50,7 @@ static_assert(static_cast<std::uint16_t>(ControlMessageId::service_discovery_res
     return bytes;
 }
 
-[[nodiscard]] std::string copy_string(const std::vector<std::byte>& bytes) {
+[[nodiscard]] std::string copy_string(const std::vector<std::byte> &bytes) {
     std::string raw;
     raw.reserve(bytes.size());
     for (const std::byte byte : bytes) {
@@ -69,16 +70,16 @@ core::Result<VersionRequest> decode_version_request(std::span<const std::byte> p
     if (body.value().size() != 4) {
         return aasdk_adapter::malformed();
     }
-    const auto* raw = body.value().data();
+    const auto *raw = body.value().data();
     VersionRequest message;
-    message.major = static_cast<std::uint16_t>(
-        (static_cast<std::uint16_t>(raw[0]) << 8U) | static_cast<std::uint16_t>(raw[1]));
-    message.minor = static_cast<std::uint16_t>(
-        (static_cast<std::uint16_t>(raw[2]) << 8U) | static_cast<std::uint16_t>(raw[3]));
+    message.major = static_cast<std::uint16_t>((static_cast<std::uint16_t>(raw[0]) << 8U) |
+                                               static_cast<std::uint16_t>(raw[1]));
+    message.minor = static_cast<std::uint16_t>((static_cast<std::uint16_t>(raw[2]) << 8U) |
+                                               static_cast<std::uint16_t>(raw[3]));
     return message;
 }
 
-core::Result<std::vector<std::byte>> encode(const VersionRequest& message) {
+core::Result<std::vector<std::byte>> encode(const VersionRequest &message) {
     const std::byte body[4] = {
         static_cast<std::byte>((message.major >> 8U) & 0xFFU),
         static_cast<std::byte>(message.major & 0xFFU),
@@ -111,7 +112,7 @@ core::Result<PingRequest> decode_ping_request(std::span<const std::byte> payload
     return message;
 }
 
-core::Result<std::vector<std::byte>> encode(const PingRequest& message) {
+core::Result<std::vector<std::byte>> encode(const PingRequest &message) {
     if (!ping_data_in_bounds(message.data)) {
         return aasdk_adapter::malformed();
     }
@@ -143,7 +144,7 @@ core::Result<PingResponse> decode_ping_response(std::span<const std::byte> paylo
     return message;
 }
 
-core::Result<std::vector<std::byte>> encode(const PingResponse& message) {
+core::Result<std::vector<std::byte>> encode(const PingResponse &message) {
     if (!ping_data_in_bounds(message.data)) {
         return aasdk_adapter::malformed();
     }
@@ -176,7 +177,24 @@ core::Result<ChannelOpenRequest> decode_channel_open_request(std::span<const std
     return message;
 }
 
-core::Result<std::vector<std::byte>> encode(const ChannelOpenRequest& message) {
+core::Result<ChannelOpenRequest>
+decode_in_band_channel_open_request(std::span<const std::byte> payload) {
+    const auto body = aasdk_adapter::control_body(payload, ControlMessageId::channel_open_request);
+    if (!body || body.value().size() > aasdk_adapter::kMaxProtoBodyBytes) {
+        return aasdk_adapter::malformed();
+    }
+    ctl::ChannelOpenRequest wire;
+    // Phones can omit proto2-required priority on service channels. Partial
+    // parsing tolerates that omission only; service_id still needs validation.
+    if (!wire.ParsePartialFromArray(body.value().data(), static_cast<int>(body.value().size())) ||
+        !wire.has_service_id() || !ServiceKey{wire.service_id()}) {
+        return aasdk_adapter::malformed();
+    }
+    return ChannelOpenRequest{wire.has_priority() ? wire.priority() : 0,
+                              ServiceKey{wire.service_id()}};
+}
+
+core::Result<std::vector<std::byte>> encode(const ChannelOpenRequest &message) {
     if (!message.service) {
         return aasdk_adapter::malformed();
     }
@@ -188,7 +206,9 @@ core::Result<std::vector<std::byte>> encode(const ChannelOpenRequest& message) {
 
 core::Result<ChannelOpenResponse> decode_channel_open_response(std::span<const std::byte> payload) {
     const auto body = aasdk_adapter::control_body(payload, ControlMessageId::channel_open_response);
-    if (!body) { return body.error(); }
+    if (!body) {
+        return body.error();
+    }
     ctl::ChannelOpenResponse wire;
     if (const auto parsed = aasdk_adapter::parse_body(wire, body.value()); !parsed) {
         return parsed.error();
@@ -203,7 +223,7 @@ core::Result<ChannelOpenResponse> decode_channel_open_response(std::span<const s
     }
 }
 
-core::Result<std::vector<std::byte>> encode(const ChannelOpenResponse& message) {
+core::Result<std::vector<std::byte>> encode(const ChannelOpenResponse &message) {
     ctl::ChannelOpenResponse wire;
     switch (message.status) {
     case ChannelOpenStatus::success:
@@ -216,6 +236,74 @@ core::Result<std::vector<std::byte>> encode(const ChannelOpenResponse& message) 
         return aasdk_adapter::malformed();
     }
     return aasdk_adapter::framed(ControlMessageId::channel_open_response, wire);
+}
+
+core::Result<VersionResponse> decode_version_response(std::span<const std::byte> payload) {
+    const auto body = aasdk_adapter::control_body(payload, ControlMessageId::version_response);
+    if (!body) {
+        return body.error();
+    }
+    // Fixed-width raw body prefix: three big-endian uint16 fields. >= v1.6
+    // appends a WireConfig tail (conformance D15 / fixture F-B2 - a real S24
+    // answered 1.7 with trailing bytes while the receiver requests 1.6), so
+    // only the first six bytes are read and trailing bytes are tolerated.
+    if (body.value().size() < 6) {
+        return aasdk_adapter::malformed();
+    }
+    const auto *raw = body.value().data();
+    VersionResponse message;
+    message.major = static_cast<std::uint16_t>((static_cast<std::uint16_t>(raw[0]) << 8U) |
+                                               static_cast<std::uint16_t>(raw[1]));
+    message.minor = static_cast<std::uint16_t>((static_cast<std::uint16_t>(raw[2]) << 8U) |
+                                               static_cast<std::uint16_t>(raw[3]));
+    message.status = static_cast<std::uint16_t>((static_cast<std::uint16_t>(raw[4]) << 8U) |
+                                                static_cast<std::uint16_t>(raw[5]));
+    return message;
+}
+
+core::Result<std::vector<std::byte>> encode(const VersionResponse &message) {
+    const std::byte body[6] = {
+        static_cast<std::byte>((message.major >> 8U) & 0xFFU),
+        static_cast<std::byte>(message.major & 0xFFU),
+        static_cast<std::byte>((message.minor >> 8U) & 0xFFU),
+        static_cast<std::byte>(message.minor & 0xFFU),
+        static_cast<std::byte>((message.status >> 8U) & 0xFFU),
+        static_cast<std::byte>(message.status & 0xFFU),
+    };
+    return aasdk_adapter::framed_raw(ControlMessageId::version_response, body);
+}
+
+core::Result<EncapsulatedSsl> decode_encapsulated_ssl(std::span<const std::byte> payload) {
+    const auto body = aasdk_adapter::control_body(payload, ControlMessageId::encapsulated_ssl);
+    if (!body) {
+        return body.error();
+    }
+    return EncapsulatedSsl{std::vector<std::byte>(body.value().begin(), body.value().end())};
+}
+
+core::Result<std::vector<std::byte>> encode(const EncapsulatedSsl &message) {
+    return aasdk_adapter::framed_raw(ControlMessageId::encapsulated_ssl, message.bytes);
+}
+
+core::Result<AuthComplete> decode_auth_complete(std::span<const std::byte> payload) {
+    const auto body = aasdk_adapter::control_body(payload, ControlMessageId::auth_complete);
+    if (!body) {
+        return body.error();
+    }
+    ctl::AuthResponse wire;
+    if (const auto parsed = aasdk_adapter::parse_body(wire, body.value()); !parsed) {
+        return parsed.error();
+    }
+    if (!wire.has_status()) {
+        return aasdk_adapter::malformed();
+    }
+    return AuthComplete{wire.status()};
+}
+
+core::Result<std::vector<std::byte>> encode(const AuthComplete &message) {
+    ctl::AuthResponse wire;
+    wire.set_status(message.status);
+    return aasdk_adapter::framed(ControlMessageId::auth_complete, wire);
 }
 
 } // namespace aa::protocol

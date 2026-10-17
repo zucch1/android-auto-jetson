@@ -290,4 +290,16 @@ TEST(ReplayTyped, SetServicesRechecksExpectationRoles) {
     expect_error(refused, aa::ErrorCode::invalid_argument);
 }
 
+TEST(ReplayTyped, SensorConfigurationRemainsOutsideFrozenReplaySchema) {
+    const replay::ServiceEntry sensor{proto::ServiceKey{105}, proto::ChannelRole::sensors,
+        proto::SensorConfiguration{{proto::SensorKind::night_mode}}};
+    replay::Recorder recorder;
+    expect_error(recorder.set_services({sensor}), aa::ErrorCode::invalid_argument);
+    auto fixture = typed_golden();
+    fixture.services.push_back(sensor);
+    const auto exported = replay::export_fixture(fixture);
+    ASSERT_FALSE(exported);
+    EXPECT_EQ(exported.error().code(), aa::ErrorCode::invalid_argument);
+}
+
 } // namespace

@@ -152,6 +152,10 @@ include(cmake/DummyDisplay.cmake)
 # sanctioned target GStreamer metadata binding) and is placed after the
 # decode-probe subproject, per its integration contract.
 include(cmake/AudioPipeline.cmake)
+# Task 30 wired end-to-end projection integrator follows the audio pipeline:
+# it composes transport/session/channels/video/audio/input/diagnostics into one
+# wired path and its test wires the real aa_video channel and aareceiver-audio.
+include(cmake/WiredE2e.cmake)
 if(NOT CMAKE_CROSSCOMPILING)
     if(NOT BUILD_TESTING)
         message(FATAL_ERROR "AA_DECODE_COVERAGE: native builds require BUILD_TESTING=ON")

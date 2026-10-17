@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <span>
 #include <string>
@@ -174,6 +175,9 @@ class FakeBulkPipe final : public ua::UsbBulkPipe {
     int zero_progress_writes{0};
     int zero_progress_reads{0};
     bool block_writes{false};
+    std::size_t max_write_bytes{std::numeric_limits<std::size_t>::max()};
+    std::size_t fail_write_after{std::numeric_limits<std::size_t>::max()};
+    int stall_after_first_write{0};
 
     [[nodiscard]] std::shared_ptr<PipeState> state() const noexcept { return state_; }
 
@@ -197,6 +201,9 @@ class FakeBulkPipe final : public ua::UsbBulkPipe {
     }
 
     core::Result<std::size_t> write(std::span<const std::byte> data, unsigned timeout_ms) override {
+        if (state_->out_size() >= fail_write_after) {
+            return Error{ErrorCode::transport_io};
+        }
         if (zero_progress_writes > 0) {
             --zero_progress_writes;
             std::lock_guard lock(mutex_);
@@ -224,9 +231,12 @@ class FakeBulkPipe final : public ua::UsbBulkPipe {
         }
         {
             std::lock_guard observed(state_->mutex);
-            state_->out.insert(state_->out.end(), data.begin(), data.end());
+            const auto count = std::min(data.size(), max_write_bytes);
+            state_->out.insert(state_->out.end(), data.begin(), data.begin() +
+                                                                  static_cast<std::ptrdiff_t>(count));
         }
-        return data.size();
+        zero_progress_writes = std::exchange(stall_after_first_write, 0);
+        return std::min(data.size(), max_write_bytes);
     }
 
     void release_writes() {
