@@ -283,3 +283,16 @@ SEPARATE fresh worker later. No publication, PR mutation, auto/admin merge,
 hardware soak, target build, acoustic-output or physical-scanout qualification
 is claimed. Completion endpoints remain consumer-write handoff and Qt paint,
 not speaker output or physical presentation.
+
+### Subsequent lead verification
+
+After the focused worker completed, the lead ran the exclusive full nonlong
+suite with `ctest --test-dir build/host-dev -LE long --output-on-failure`:
+**462/462 passed**, exit 0, 523.02 seconds. Log:
+`build/host-dev/Testing/pr56-final-nonlong-20261017.log`. The preceding
+not-run statement records the worker's earlier handoff, not the final state.
+The lead also ran three shipped-sink timing tests (actual PCM completion and
+idempotent finalization, empty-route refusal, late-peak retention), all passing,
+and the receiver CLI rejected an invalid option with expected usage exit 2.
+Logs: `build/host-dev/task32-lead-{timing,cli}.log`. These checks establish host
+behavior only; the hardware qualification boundary above remains unchanged.
