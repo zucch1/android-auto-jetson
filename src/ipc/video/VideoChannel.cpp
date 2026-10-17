@@ -536,6 +536,8 @@ struct VideoProducer::Impl final {
     std::uint64_t backpressure{};
     bool waiting_idr{true};
     bool closed{false};
+    VideoEndpoint endpoint{};
+    VideoEndpointObserver observer{};
 
     Impl() = default;
     ~Impl() { release(); }
@@ -586,6 +588,8 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
     const std::size_t datagram = impl_->limits.max_datagram_payload;
     const auto count =
         static_cast<std::uint32_t>((request.payload.size() + datagram - 1) / datagram);
+    const auto first_sequence = impl_->sequence;
+    std::uint64_t send_started_ns{};
     for (std::uint32_t index = 0; index < count; ++index) {
         const auto length = std::min<std::size_t>(
             datagram, request.payload.size() - static_cast<std::size_t>(index) * datagram);
@@ -598,6 +602,9 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
         std::memcpy(impl_->packet.data() + kFrameHeaderBytes,
                     request.payload.data() + static_cast<std::size_t>(index) * datagram, length);
         ssize_t sent;
+        if (index == 0) {
+            send_started_ns = video_monotonic_ns();
+        }
         do {
             sent = ::send(impl_->fd, impl_->packet.data(), kFrameHeaderBytes + length,
                           MSG_DONTWAIT | MSG_NOSIGNAL);
@@ -613,7 +620,20 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
         }
     }
     impl_->waiting_idr = false;
+    if (impl_->observer) {
+        auto event = impl_->endpoint;
+        event.frame = request.frame;
+        event.sequence = first_sequence;
+        event.timestamp_ns = request.timestamp_ns;
+        event.observed_ns = send_started_ns;
+        event.payload_bytes = request.payload.size();
+        impl_->observer(event);
+    }
     return SendStatus::sent;
+}
+
+void VideoProducer::set_observer(VideoEndpointObserver observer) {
+    impl_->observer = std::move(observer);
 }
 
 void VideoProducer::close() noexcept {
@@ -636,6 +656,8 @@ struct VideoConsumer::Impl final {
     VideoStreamCapture* capture{nullptr};
     bool closed{false};
     bool eof{false};
+    VideoEndpoint endpoint{};
+    VideoEndpointObserver observer{};
 
     Impl() = default;
     ~Impl() { release(); }
@@ -722,6 +744,16 @@ core::Result<ReceiveStatus> VideoConsumer::receive(core::Milliseconds timeout) {
     if (!step) {
         return step.error();
     }
+    if (step.value() == ReceiveStatus::complete && impl_->observer) {
+        const auto& unit = impl_->assembler->unit();
+        auto event = impl_->endpoint;
+        event.observed_ns = video_monotonic_ns();
+        event.frame = unit.frame;
+        event.sequence = unit.sequence;
+        event.timestamp_ns = unit.timestamp_ns;
+        event.payload_bytes = unit.payload.size();
+        impl_->observer(event);
+    }
     if (step.value() == ReceiveStatus::complete && impl_->capture != nullptr) {
         if (auto recorded = impl_->capture->on_access_unit(impl_->assembler->unit()); !recorded) {
             return recorded.error();
@@ -736,6 +768,10 @@ const VideoAccessUnit& VideoConsumer::access_unit() const noexcept {
 
 void VideoConsumer::set_capture(VideoStreamCapture* capture) noexcept {
     impl_->capture = capture;
+}
+
+void VideoConsumer::set_observer(VideoEndpointObserver observer) {
+    impl_->observer = std::move(observer);
 }
 
 void VideoConsumer::close() noexcept {
@@ -893,6 +929,8 @@ core::Result<VideoProducer> VideoServer::accept_consumer(core::Milliseconds time
     auto producer_impl = std::make_unique<VideoProducer::Impl>();
     producer_impl->fd = fd;
     producer_impl->limits = negotiated.value();
+    producer_impl->endpoint = VideoEndpoint{VideoEndpointKind::send_started,
+        static_cast<std::uint32_t>(::getpid()), peer.value().pid, video_monotonic_ns()};
     return VideoProducer{std::move(producer_impl)};
 }
 
@@ -909,6 +947,7 @@ int VideoServer::native_handle() const noexcept { return impl_->fd; }
 
 core::Result<VideoConsumer> connect_video_consumer(const VideoSocketPath& path,
                                                    const VideoClientOptions& options) {
+    const auto connection_ns = video_monotonic_ns();
     const int fd = make_seqpacket();
     if (fd < 0) {
         return io_error();
@@ -938,6 +977,8 @@ core::Result<VideoConsumer> connect_video_consumer(const VideoSocketPath& path,
     auto consumer_impl = std::make_unique<VideoConsumer::Impl>();
     consumer_impl->fd = fd;
     consumer_impl->limits = negotiated.value();
+    consumer_impl->endpoint = VideoEndpoint{VideoEndpointKind::receive_completed,
+        peer.value().pid, static_cast<std::uint32_t>(::getpid()), connection_ns};
     consumer_impl->assembler =
         std::make_unique<VideoReassembler>(consumer_impl->limits);
     return VideoConsumer{std::move(consumer_impl)};
