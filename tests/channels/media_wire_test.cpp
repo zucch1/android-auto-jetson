@@ -38,6 +38,8 @@ TEST(MediaWire, ConfiguredProfilesProduceActualPinnedVideoFields) {
         EXPECT_TRUE(profile.has_frame_rate());
         EXPECT_EQ(profile.frame_rate(), sink::VIDEO_FPS_30);
         EXPECT_EQ(profile.video_codec_type(), shared::MEDIA_CODEC_VIDEO_H264_BP);
+        EXPECT_TRUE(profile.has_density());
+        EXPECT_EQ(profile.density(), 160u);
     }
     const auto decoded = proto::decode_service_discovery_response(encoded.value());
     ASSERT_TRUE(decoded);
