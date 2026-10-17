@@ -40,6 +40,8 @@ import sys
 import time
 from pathlib import Path
 
+from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
+
 CAPTURE_SCHEMA = "aa-projection-perf-capture/1"
 _STARTUP_GRACE_SECONDS = 3.0
 _TERMINATE_GRACE_SECONDS = 5.0
@@ -218,6 +220,7 @@ class EventParser:
         self.projection_active = False
         self.last_audio_scheduled = -1
         self.last_video_scheduled = -1
+        self.video_measurements = VideoMeasurements()
 
     def _completion(self, event: dict) -> None:
         """Join endpoint events by concurrent scheduled presentation, not log arrival."""
@@ -323,6 +326,25 @@ class EventParser:
         # a bare event line names its kind in "event" itself.
         inner = event.get("kind")
         kind = inner if isinstance(inner, str) else envelope
+        if envelope in ("video_ipc_send", "video_ipc_receive"):
+            endpoint = IpcEndpoint.parse(event)
+            if endpoint is not None:
+                measured = self.video_measurements.ipc(
+                    "send" if envelope == "video_ipc_send" else "receive", endpoint)
+                for target in measured:
+                    self._number(measured, target, target)
+            else:
+                for target in _IPC_KEYS.values():
+                    self._number({"invalid": None}, "invalid", target)
+        if envelope == "video_decode_completed":
+            decoded = DecodeEndpoint.parse(event)
+            if decoded is not None:
+                measured = self.video_measurements.decode(decoded)
+                for target in measured:
+                    self._number(measured, target, target, integer=target == "decode_frames")
+            else:
+                for target in _DECODE_KEYS.values():
+                    self._number({"invalid": None}, "invalid", target)
         if envelope == "err":
             self.terminal_errors.append({"event": "err", "code": str(event.get("code", "unknown"))})
         if envelope == "video_sent" and isinstance(event.get("units"), int):
@@ -521,6 +543,15 @@ def collect(args: argparse.Namespace) -> dict:
         "invalid_telemetry": parser.invalid_telemetry,
         "samples": samples,
         "events": events,
+        "video_telemetry": {
+            "ipc_matched": parser.video_measurements.ipc_matched,
+            "ipc_consumed_bytes": parser.video_measurements.receive_bytes,
+            "ipc_matched_samples_retained": len(parser.video_measurements.ipc_samples),
+            "ipc_unmatched_or_expired": parser.video_measurements.unmatched,
+            "ipc_pending_send": len(parser.video_measurements.sends),
+            "ipc_pending_receive": len(parser.video_measurements.receives),
+            "decode_samples_retained": len(parser.video_measurements.decode_samples),
+        },
         "target_hardware_state": _target_hardware_state(),
     }
 
