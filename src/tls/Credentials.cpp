@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
+#include <string>
+#include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -59,22 +61,82 @@ Credentials load_credentials() {
     std::unique_ptr<FILE, CloseFile> file(::fdopen(descriptor.value, "r"));
     if (!file) { throw Error(Failure::unreadable); }
     descriptor.value = -1;
-    std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new_fp(file.get(), BIO_NOCLOSE), &BIO_free);
-    if (!bio) { throw Error(Failure::configuration); }
-    Certificate certificate(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr), &X509_free);
-    PrivateKey key(PEM_read_bio_PrivateKey(bio.get(), nullptr, reject_password, nullptr), &EVP_PKEY_free);
-    if (!certificate || !key) { throw Error(Failure::malformed); }
-    if (X509_check_private_key(certificate.get(), key.get()) != 1) { throw Error(Failure::mismatch); }
-    char remainder[256];
-    int count;
-    while ((count = BIO_read(bio.get(), remainder, sizeof(remainder))) > 0) {
-        for (int index = 0; index < count; ++index) {
-            if (!std::isspace(static_cast<unsigned char>(remainder[index]))) {
-                throw Error(Failure::malformed);
-            }
+    std::string content;
+    {
+        char buffer[4096];
+        for (;;) {
+            const std::size_t count = std::fread(buffer, 1, sizeof(buffer), file.get());
+            if (count == 0) { break; }
+            content.append(buffer, count);
+            if (content.size() > 65536) { throw Error(Failure::malformed); }
+        }
+        if (std::ferror(file.get()) != 0) { throw Error(Failure::unreadable); }
+    }
+    struct Block { std::string name; std::string text; };
+    std::vector<Block> blocks;
+    std::size_t position = 0;
+    while (position < content.size()) {
+        while (position < content.size() &&
+               std::isspace(static_cast<unsigned char>(content[position]))) {
+            ++position;
+        }
+        if (position >= content.size()) { break; }
+        static const std::string kBegin = "-----BEGIN ";
+        if (content.compare(position, kBegin.size(), kBegin) != 0) {
+            throw Error(Failure::malformed);
+        }
+        const std::size_t name_start = position + kBegin.size();
+        const std::size_t name_end = content.find("-----", name_start);
+        if (name_end == std::string::npos || name_end == name_start) {
+            throw Error(Failure::malformed);
+        }
+        const std::string name = content.substr(name_start, name_end - name_start);
+        if (name.find('-') != std::string::npos) { throw Error(Failure::malformed); }
+        std::size_t cursor = name_end + 5;
+        if (cursor < content.size() && content[cursor] == '\r') { ++cursor; }
+        if (cursor >= content.size() || content[cursor] != '\n') {
+            throw Error(Failure::malformed);
+        }
+        const std::string end_tag = "-----END " + name + "-----";
+        const std::size_t end_line = content.find(end_tag, cursor);
+        if (end_line == std::string::npos) { throw Error(Failure::malformed); }
+        std::size_t after = end_line + end_tag.size();
+        if (after < content.size() && content[after] == '\r') { ++after; }
+        if (after < content.size() && content[after] == '\n') { ++after; }
+        blocks.push_back({name, content.substr(position, after - position)});
+        position = after;
+    }
+    if (blocks.size() < 2) { throw Error(Failure::malformed); }
+    for (std::size_t index = 0; index + 1 < blocks.size(); ++index) {
+        if (blocks[index].name != "CERTIFICATE" && blocks[index].name != "X509 CERTIFICATE") {
+            throw Error(Failure::malformed);
         }
     }
-    if (std::ferror(file.get()) != 0) { throw Error(Failure::unreadable); }
-    return Credentials{std::move(certificate), std::move(key)};
+    const std::string &key_name = blocks.back().name;
+    if (key_name != "PRIVATE KEY" && key_name != "RSA PRIVATE KEY" && key_name != "EC PRIVATE KEY") {
+        throw Error(Failure::malformed);
+    }
+    std::vector<Certificate> chain;
+    Certificate certificate(nullptr, &X509_free);
+    PrivateKey key(nullptr, &EVP_PKEY_free);
+    for (std::size_t index = 0; index < blocks.size(); ++index) {
+        std::unique_ptr<BIO, decltype(&BIO_free)> block_bio(
+            BIO_new_mem_buf(blocks[index].text.data(), static_cast<int>(blocks[index].text.size())),
+            &BIO_free);
+        if (!block_bio) { throw Error(Failure::configuration); }
+        if (index + 1 < blocks.size()) {
+            Certificate parsed(PEM_read_bio_X509(block_bio.get(), nullptr, nullptr, nullptr), &X509_free);
+            if (!parsed) { throw Error(Failure::malformed); }
+            if (index == 0) { certificate = std::move(parsed); }
+            else { chain.push_back(std::move(parsed)); }
+        } else {
+            key.reset(PEM_read_bio_PrivateKey(block_bio.get(), nullptr, reject_password, nullptr));
+            if (!key) { throw Error(Failure::malformed); }
+        }
+    }
+    if (X509_check_private_key(certificate.get(), key.get()) != 1) {
+        throw Error(Failure::mismatch);
+    }
+    return Credentials{std::move(certificate), std::move(key), std::move(chain)};
 }
 }

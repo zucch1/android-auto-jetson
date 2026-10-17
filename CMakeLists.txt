@@ -160,6 +160,8 @@ include(cmake/WiredE2e.cmake)
 # link loss/replug, restarts, malformed input and unknown-phone attempts against
 # aa_wired and asserts the task-19 recovery/retry telemetry.
 include(cmake/WiredRecovery.cmake)
+# Task 32 wired performance/soak measurement tooling (host-side fixtures).
+include(cmake/WiredPerf.cmake)
 if(NOT CMAKE_CROSSCOMPILING)
     if(NOT BUILD_TESTING)
         message(FATAL_ERROR "AA_DECODE_COVERAGE: native builds require BUILD_TESTING=ON")

@@ -1,0 +1,49 @@
+{
+  "schema": "aa-projection-perf-capture/1",
+  "mode": "wired",
+  "duration_seconds": 1800,
+  "crashes": 0,
+  "samples": [
+    {
+      "t_ms": 0,
+      "receiver_rss_mb": 200.0,
+      "receiver_cpu_pct_one_core": 30.0,
+      "thermal_peak_c": 45.0,
+      "thermal_zones": [{"zone": "cpu-thermal", "temp_c": 45.0}]
+    },
+    {
+      "t_ms": 900000,
+      "receiver_rss_mb": 205.0,
+      "receiver_cpu_pct_one_core": 32.0,
+      "thermal_peak_c": 50.0,
+      "thermal_zones": [{"zone": "cpu-thermal", "temp_c": 50.0}]
+    },
+    {
+      "t_ms": 1800000,
+      "receiver_rss_mb": 210.0,
+      "receiver_cpu_pct_one_core": 34.0,
+      "thermal_peak_c": 52.0,
+      "thermal_zones": [{"zone": "cpu-thermal", "temp_c": 52.0}]
+    }
+  ],
+  "events": {
+    "frame_drops": 0,
+    "decode_p50_ms": 20.0,
+    "decode_p95_ms": 36.09,
+    "decode_fps": 30.0,
+    "decode_frames": 18000,
+    "ipc_throughput_mbps": 10.1,
+    "ipc_p95_added_latency_ms": 1.2,
+    "av_sync_ms": 12.0,
+    "audio_latency_ms": 84.0,
+    "helper_rss_mb": null
+  },
+  "provenance": {
+    "source_digest": "fixture-source",
+    "build_artifact_digest": "fixture-build",
+    "configuration_digest": "fixture-config",
+    "service_definitions": [],
+    "dependency_versions": {"gstreamer": "1.24.2"},
+    "target_hardware_state": {"machine": "aarch64", "model": "fixture"}
+  }
+}

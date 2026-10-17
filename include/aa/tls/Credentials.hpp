@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <exception>
+#include <vector>
 #include <openssl/ssl.h>
 
 namespace aa::tls {
@@ -24,6 +25,7 @@ using PrivateKey = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
 struct Credentials {
     Certificate certificate;
     PrivateKey private_key;
+    std::vector<Certificate> chain;
 };
 
 [[nodiscard]] Credentials load_credentials();
