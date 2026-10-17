@@ -26,15 +26,22 @@ if(NOT TARGET aa_input_service)
 endif()
 
 set(AA_WIRED_SOURCES
+    src/app/WiredPhoneControl.cpp
     src/app/WiredSession.cpp
     src/app/WiredLink.cpp)
 set(AA_WIRED_TEST_SOURCES
+    tests/trust/syscall_faults.cpp
     tests/wired_e2e/wired_e2e_happy_test.cpp
     tests/wired_e2e/wired_e2e_revoke_test.cpp
     tests/wired_e2e/wired_e2e_failures_test.cpp
+    tests/wired_e2e/receiver_test.cpp
+    tests/wired_e2e/av_sink_test.cpp
+    tests/wired_e2e/microphone_test.cpp
+    tests/wired_e2e/wired_deadline_test.cpp
     tests/wired_e2e/wired_e2e_trust_link_test.cpp
     tests/wired_e2e/wired_e2e_input_wire_test.cpp
     tests/wired_e2e/wired_e2e_auth_test.cpp
+    tests/wired_e2e/wired_e2e_control_test.cpp
     tests/wired_e2e/wired_e2e_recovery_test.cpp)
 foreach(source IN LISTS AA_WIRED_SOURCES AA_WIRED_TEST_SOURCES)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/${source}")
@@ -77,7 +84,8 @@ if(NOT CMAKE_CROSSCOMPILING)
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_link_libraries(aa_wired_e2e_test PRIVATE
         aa_wired aa_protocol_adapter aap_protobuf aasdk
-        aa_video aa_input aa_input_service aareceiver-audio pthread GTest::gtest_main)
+        aa_video aa_input aa_input_service aa_ipc_control aa_ipc_dbus aa_transport_tls
+        aareceiver-audio pthread GTest::gtest_main)
     target_include_directories(aa_wired_e2e_test PRIVATE
         "${CMAKE_BINARY_DIR}/aasdk/protobuf"
         "${AA_DEPENDENCY_STAGE}/aasdk/include"
@@ -86,6 +94,11 @@ if(NOT CMAKE_CROSSCOMPILING)
         target_link_libraries(aa_wired_e2e_test PRIVATE PkgConfig::AA_AUDIO_GST)
     endif()
     target_compile_definitions(aa_wired_e2e_test PRIVATE AA_WIRED_HAS_AUDIO_ROUTER=1)
+    target_link_options(aa_wired_e2e_test PRIVATE
+        "-Wl,--wrap=fsync" "-Wl,--wrap=renameat"
+        "-Wl,--wrap=_ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE"
+        "-Wl,--wrap=_ZN2aa9transport28make_client_handshake_cipherERKSt8functionIFbvEE"
+        "-Wl,--wrap=_ZN2aa5audio6detail17open_default_sinkERKNS1_15SinkOpenRequestE")
     list(APPEND AA_WIRED_WARN_TARGETS aa_wired_e2e_test)
 endif()
 
@@ -115,9 +128,19 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_e2e_trust_link COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eTrustLink.*)
     add_test(NAME wired_e2e_input_wire COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eInputWire.*)
     add_test(NAME wired_e2e_auth COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eAuth.*)
+    add_test(NAME wired_e2e_av_sink COMMAND aa_wired_e2e_test --gtest_filter=WiredAvSink.*:WiredAvRegistration.*)
+    set_tests_properties(wired_e2e_av_sink PROPERTIES TIMEOUT 120)
+    add_test(NAME wired_e2e_control COMMAND aa_wired_e2e_test --gtest_filter=WiredControl.*)
+    add_test(NAME wired_e2e_microphone COMMAND aa_wired_e2e_test --gtest_filter=WiredMicrophone.*)
+    set_tests_properties(wired_e2e_control PROPERTIES TIMEOUT 120)
     add_test(NAME wired_recovery COMMAND aa_wired_e2e_test --gtest_filter=WiredRecovery.*)
+    add_test(NAME wired_receiver COMMAND dbus-run-session --
+        $<TARGET_FILE:aa_wired_e2e_test> --gtest_filter=WiredReceiver.*)
+    add_test(NAME wired_deadline COMMAND aa_wired_e2e_test --gtest_filter=WiredDeadline.*)
+    set_tests_properties(wired_deadline PROPERTIES TIMEOUT 30)
+    set_tests_properties(wired_receiver PROPERTIES TIMEOUT 120)
     set_tests_properties(wired_e2e_happy wired_e2e_revoke wired_e2e_failures wired_e2e_trust_link
-        wired_e2e_input_wire wired_e2e_auth wired_recovery PROPERTIES TIMEOUT 120)
+        wired_e2e_input_wire wired_e2e_auth wired_e2e_microphone wired_recovery PROPERTIES TIMEOUT 120)
     add_test(NAME wired_e2e_live_qa_gates COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/wired_e2e/test_live_qa_gates.py"
         "${CMAKE_SOURCE_DIR}/tools/wired-qa/run-wired-live-qa.sh")

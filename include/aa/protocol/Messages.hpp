@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <variant>
 #include <vector>
@@ -104,6 +105,38 @@ struct PingResponse final {
     [[nodiscard]] friend bool operator==(const PingResponse &, const PingResponse &) = default;
 };
 
+enum class AudioFocusRequestType : std::int32_t {
+    gain = 1, gain_transient = 2, gain_transient_may_duck = 3, release = 4,
+};
+struct AudioFocusRequest final {
+    AudioFocusRequestType type{};
+};
+enum class AudioFocusState : std::int32_t {
+    invalid = 0, gain = 1, gain_transient = 2, loss = 3,
+    loss_transient_can_duck = 4, loss_transient = 5,
+    gain_media_only = 6, gain_transient_guidance_only = 7,
+};
+struct AudioFocusNotification final {
+    AudioFocusState state{};
+    bool unsolicited{false};
+};
+enum class ByeByeReason : std::int32_t {
+    user_selection = 1, device_switch = 2, not_supported = 3,
+    not_currently_supported = 4, probe_supported = 5,
+    wireless_projection_disabled = 6, power_down = 7, user_profile_switch = 8,
+};
+struct ByeByeRequest final {
+    ByeByeReason reason{};
+};
+struct ByeByeResponse final {};
+enum class NavFocusType : std::int32_t { native = 1, projected = 2 };
+struct NavFocusRequest final {
+    std::optional<NavFocusType> type{};
+};
+struct NavFocusNotification final {
+    NavFocusType type{};
+};
+
 // MESSAGE_CHANNEL_OPEN_REQUEST body: protobuf, `priority` and `service_id`
 // required. `service` is the dynamic Service.id (ID space 2), never a
 // frame-channel ordinal.
@@ -137,8 +170,20 @@ struct ButtonConfiguration final {
     [[nodiscard]] friend bool operator==(const ButtonConfiguration &,
                                          const ButtonConfiguration &) = default;
 };
+enum class SensorKind : std::int32_t { night_mode = 10 };
+struct SensorConfiguration final {
+    std::vector<SensorKind> kinds{};
+    [[nodiscard]] friend bool operator==(const SensorConfiguration &,
+                                         const SensorConfiguration &) = default;
+};
+struct MicrophoneConfiguration final {
+    AudioProfile profile{};
+    [[nodiscard]] friend bool operator==(const MicrophoneConfiguration &,
+                                         const MicrophoneConfiguration &) = default;
+};
 using ServiceConfiguration =
-    std::variant<std::monostate, VideoConfiguration, AudioConfiguration, ButtonConfiguration>;
+    std::variant<std::monostate, VideoConfiguration, AudioConfiguration, ButtonConfiguration,
+                 SensorConfiguration, MicrophoneConfiguration>;
 
 // One advertised channel service. `id` is dynamic (ID space 2); `role` is the
 // semantic role resolved by the session router, never an ordinal.
@@ -206,8 +251,18 @@ struct AuthComplete final {
 decode_version_request(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<PingRequest> decode_ping_request(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<PingResponse> decode_ping_response(std::span<const std::byte> payload);
+[[nodiscard]] core::Result<AudioFocusRequest>
+decode_audio_focus_request(std::span<const std::byte> payload);
+[[nodiscard]] core::Result<ByeByeRequest>
+decode_byebye_request(std::span<const std::byte> payload);
+[[nodiscard]] core::Result<NavFocusRequest>
+decode_nav_focus_request(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<ChannelOpenRequest>
 decode_channel_open_request(std::span<const std::byte> payload);
+// Service-channel compatibility only: priority may be absent (defaults to 0).
+// The control-channel decoder above remains strict.
+[[nodiscard]] core::Result<ChannelOpenRequest>
+decode_in_band_channel_open_request(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<ChannelOpenResponse>
 decode_channel_open_response(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<ServiceDiscoveryResponse>
@@ -224,6 +279,9 @@ decode_encapsulated_ssl(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<std::vector<std::byte>> encode(const VersionRequest &message);
 [[nodiscard]] core::Result<std::vector<std::byte>> encode(const PingRequest &message);
 [[nodiscard]] core::Result<std::vector<std::byte>> encode(const PingResponse &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const AudioFocusNotification &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const ByeByeResponse &message);
+[[nodiscard]] core::Result<std::vector<std::byte>> encode(const NavFocusNotification &message);
 [[nodiscard]] core::Result<std::vector<std::byte>> encode(const ChannelOpenRequest &message);
 [[nodiscard]] core::Result<std::vector<std::byte>> encode(const ChannelOpenResponse &message);
 [[nodiscard]] core::Result<std::vector<std::byte>> encode(const ServiceDiscoveryResponse &message);

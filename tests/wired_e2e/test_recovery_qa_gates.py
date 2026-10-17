@@ -108,9 +108,11 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
     # carry no media tokens). The wrong-marker arms (audio_chunks / bare
     # input_forwarded) model the pre-P2-G defect shape: a gate that regressed
     # to presence greps lands there, so the per-conjunct pins can prove it.
+    *'"event":"media_timing"'*'"event":"audio_chunks"'*)
+        [ "${FAKE_MEDIA_TIMING:-0}" = "1" ] && [ "${FAKE_AUDIO_CHUNKS:-1}" = "1" ] && exit 0 || exit 1 ;;
     *'"event":"media_timing"'*) [ "${FAKE_MEDIA_TIMING:-0}" = "1" ] && exit 0 || exit 1 ;;
     *'"event":"input_forwarded","ok":"true"'*) [ "${FAKE_INPUT_OK:-0}" = "1" ] && exit 0 || exit 1 ;;
-    *audio_chunks*) [ "${FAKE_AUDIO_CHUNKS:-0}" = "1" ] && exit 0 || exit 1 ;;
+    *audio_chunks*) [ "${FAKE_AUDIO_CHUNKS:-1}" = "1" ] && exit 0 || exit 1 ;;
     *'input_forwarded'*) [ "${FAKE_INPUT_ANY:-0}" = "1" ] && exit 0 || exit 1 ;;
     *'tail -c +'*aa-wired-receiver-attempt.log*) printf '%s' "${FAKE_ATTEMPT_LOG:-}"; exit 0 ;;
     *'tail -c +'*) printf '%s' "${FAKE_LOG_WINDOW:-}"; exit 0 ;;
@@ -874,6 +876,12 @@ class RecoveryQaGates(unittest.TestCase):
                 if enabled == "0":
                     self.assertEqual(row["detail"], "no_media_evidence_after_recovery")
                 self.assert_fixture_available("audio_chunks", "FAKE_AUDIO_CHUNKS")
+
+    def test_final_flush_timing_without_delivered_audio_is_not_media(self) -> None:
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_AUDIO_CHUNKS": "0"}
+        code, doc = self.run_qa(["--only", "consumer_restart"], **env)
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["scenarios"][0]["detail"], "no_media_evidence_after_recovery")
 
     def test_input_ok_true_missing_is_not_media(self):
         for enabled in ("0", "1"):

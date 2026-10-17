@@ -32,6 +32,13 @@ class UsbAoaEndpoint final : public ByteEndpoint {
     ~UsbAoaEndpoint() override;
 
     [[nodiscard]] core::Result<void> open() override;
+    [[nodiscard]] core::Result<void> open(const core::Deadline &deadline);
+    void set_io_checkpoint(std::function<void()> checkpoint) override {
+        checkpoint_ = std::move(checkpoint);
+    }
+    void set_io_deadline(core::Deadline::Clock::time_point until) noexcept override {
+        io_deadline_ = until;
+    }
     [[nodiscard]] core::Result<std::size_t> read(std::span<std::byte> buffer,
                                                  const core::CancellationToken &token) override;
     [[nodiscard]] core::Result<std::size_t> write(std::span<const std::byte> data,
@@ -52,6 +59,7 @@ class UsbAoaEndpoint final : public ByteEndpoint {
     UsbDeviceSelector selector_;
     AoaAccessoryInfo info_;
     WiredAdmission admit_;
+    std::function<void()> checkpoint_;
     std::unique_ptr<UsbBulkPipe> pipe_;
     trust::WiredIdentity identity_{};
     UsbDeviceSnapshot pre_switch_{};
@@ -59,6 +67,7 @@ class UsbAoaEndpoint final : public ByteEndpoint {
     AoaSwitchReport switch_report_{};
     bool opened_{false};
     bool terminal_{false};
+    core::Deadline::Clock::time_point io_deadline_{core::Deadline::Clock::time_point::max()};
 };
 
 // The connection pipeline behind open()/connect_usb_aoa(): discovery + switch
@@ -71,6 +80,7 @@ class UsbAoaEndpoint final : public ByteEndpoint {
                                                    const UsbDeviceSelector &selector,
                                                    const AoaAccessoryInfo &info,
                                                    const WiredAdmission &admit,
+                                                   const core::Deadline &deadline = {},
                                                    trust::WiredIdentity *attempted_identity = nullptr);
 
 } // namespace aa::transport::usb_adapter

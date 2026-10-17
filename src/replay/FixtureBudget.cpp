@@ -189,6 +189,9 @@ core::Result<std::set<protocol::ChannelRole>> validate_service_entries(
     std::vector<protocol::ServiceDescriptor> descriptors;
     descriptors.reserve(services.size());
     for (const auto& service : services) {
+        if (std::holds_alternative<protocol::SensorConfiguration>(service.configuration)) {
+            return malformed();
+        }
         if (!service.id) {
             return malformed();
         }

@@ -29,23 +29,44 @@ UsbAoaEndpoint::make(std::unique_ptr<AoaLinkFactory> factory, UsbDeviceSelector 
 }
 
 core::Result<void> UsbAoaEndpoint::open() {
+    return open(core::Deadline{std::min(io_deadline_, core::Deadline::Clock::now() +
+                                                       std::chrono::milliseconds{kAccessoryWaitMs.count}), {}});
+}
+
+core::Result<void> UsbAoaEndpoint::open(const core::Deadline &deadline) {
     if (opened_) {
         return {};
     }
     if (terminal_) {
         return Error{ErrorCode::transport_closed};
     }
+    if (auto checked = deadline.check(); !checked) {
+        terminal_ = true;
+        return checked.error();
+    }
+    factory_->set_connect_deadline(deadline);
     auto validated = validate_selector(selector_);
     if (!validated) {
         terminal_ = true;
         return validated.error();
     }
     auto switched = factory_->switch_to_accessory(selector_, info_, pre_switch_, switch_report_);
+    if (auto checked = deadline.check(); !checked) {
+        terminal_ = true;
+        return checked.error();
+    }
     if (!switched) {
         terminal_ = true;
         return switched.error();
     }
     auto pipe = factory_->claim_accessory(selector_, post_switch_);
+    if (auto checked = deadline.check(); !checked) {
+        if (pipe) {
+            pipe.value()->close();
+        }
+        terminal_ = true;
+        return checked.error();
+    }
     if (!pipe) {
         terminal_ = true;
         return pipe.error();
@@ -79,11 +100,26 @@ core::Result<std::size_t> UsbAoaEndpoint::read(std::span<std::byte> buffer,
     // is the cancellation token (ByteEndpoint.hpp), one kBulkTransferTimeoutMs
     // slice at a time; write carries the zero-progress stall bound instead.
     for (;;) {
+        const core::Deadline budget{io_deadline_, token};
+        if (checkpoint_) {
+            checkpoint_();
+        }
+        if (auto checked = budget.check(); !checked) {
+            close();
+            return checked.error();
+        }
         if (token.stop_requested()) {
             close();
             return Error{ErrorCode::cancelled};
         }
-        auto count = pipe_->read(buffer, kBulkTransferTimeoutMs);
+        auto count = pipe_->read(buffer, budget.slice_ms(kBulkTransferTimeoutMs));
+        if (checkpoint_) {
+            checkpoint_();
+        }
+        if (auto checked = budget.check(); !checked) {
+            close();
+            return checked.error();
+        }
         if (!count) {
             close();
             return count.error();
@@ -102,18 +138,33 @@ core::Result<std::size_t> UsbAoaEndpoint::write(std::span<const std::byte> data,
     if (data.empty()) {
         return std::size_t{0};
     }
-    // Bounded stall policy (gate P2-4): each bulk attempt is already bounded by
-    // kBulkTransferTimeoutMs; three consecutive zero-progress attempts mean the
-    // OUT pipe is stuck and end in a typed transport_io failure instead of an
-    // indefinite retry. Any failure terminally closes the endpoint.
+    // Without a caller deadline retain the legacy finite stall bound. With a
+    // deadline, zero progress is retryable; positive progress returns its exact
+    // count so FrameStreamIO advances the offset without replaying any bytes.
     constexpr int kMaxZeroProgressWrites = 3;
     int zero_progress = 0;
+    const core::Deadline budget{
+        std::min(io_deadline_, core::Deadline::Clock::now() + std::chrono::seconds{5}), token};
     for (;;) {
+        if (checkpoint_) {
+            checkpoint_();
+        }
+        if (auto checked = budget.check(); !checked) {
+            close();
+            return checked.error();
+        }
         if (token.stop_requested()) {
             close();
             return Error{ErrorCode::cancelled};
         }
-        auto count = pipe_->write(data, kBulkTransferTimeoutMs);
+        auto count = pipe_->write(data, budget.slice_ms(kBulkTransferTimeoutMs));
+        if (checkpoint_) {
+            checkpoint_();
+        }
+        if (auto checked = budget.check(); !checked) {
+            close();
+            return checked.error();
+        }
         if (!count) {
             close();
             return count.error();
@@ -121,7 +172,8 @@ core::Result<std::size_t> UsbAoaEndpoint::write(std::span<const std::byte> data,
         if (count.value() > 0) {
             return count.value();
         }
-        if (++zero_progress >= kMaxZeroProgressWrites) {
+        if (++zero_progress >= kMaxZeroProgressWrites &&
+            io_deadline_ == core::Deadline::Clock::time_point::max()) {
             close();
             return Error{ErrorCode::transport_io};
         }
@@ -176,9 +228,10 @@ core::Result<void> admit_wired_identity(const trust::WiredIdentity &identity,
 }
 
 core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
-                                     const UsbDeviceSelector &selector,
-                                     const AoaAccessoryInfo &info, const WiredAdmission &admit,
-                                     trust::WiredIdentity *attempted_identity) {
+                                      const UsbDeviceSelector &selector,
+                                      const AoaAccessoryInfo &info, const WiredAdmission &admit,
+                                      const core::Deadline &deadline,
+                                      trust::WiredIdentity *attempted_identity) {
     // The admission callback is the one seam that sees the CAPTURED identity of
     // a refused attempt: record it there so callers can attribute the rejection
     // (additive out-param; the admission decision itself is unchanged).
@@ -196,7 +249,7 @@ core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
     if (!endpoint) {
         return endpoint.error();
     }
-    auto opened = endpoint.value()->open();
+    auto opened = endpoint.value()->open(deadline);
     if (!opened) {
         return opened.error();
     }
@@ -222,14 +275,18 @@ WiredAdmission admit_via(const trust::TrustStore &store) {
 }
 
 core::Result<UsbAoaLink> connect_usb_aoa(const UsbDeviceSelector &selector,
-                                         const AoaAccessoryInfo &info,
-                                         const WiredAdmission &admit,
-                                         trust::WiredIdentity *attempted_identity) {
+                                          const AoaAccessoryInfo &info,
+                                          const WiredAdmission &admit,
+                                          const core::Deadline &deadline,
+                                          trust::WiredIdentity *attempted_identity) {
+    if (auto checked = deadline.check(); !checked) {
+        return checked.error();
+    }
     auto world = usb_adapter::make_libusb_link_factory();
     if (!world) {
         return world.error();
     }
-    return usb_adapter::connect_aoa(std::move(world.value()), selector, info, admit,
+    return usb_adapter::connect_aoa(std::move(world.value()), selector, info, admit, deadline,
                                     attempted_identity);
 }
 

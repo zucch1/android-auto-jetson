@@ -15,6 +15,7 @@ namespace aa::transport {
 struct UsbByteTransport::Impl final {
     std::unique_ptr<ByteEndpoint> endpoint;
     FrameStreamIO io;
+    std::function<void()> checkpoint;
 
     explicit Impl(std::unique_ptr<ByteEndpoint> ep) noexcept
         : endpoint(std::move(ep)),
@@ -51,11 +52,38 @@ core::Result<void> UsbByteTransport::open(core::CancellationToken cancellation) 
     return {};
 }
 
+void UsbByteTransport::set_io_deadline(core::Deadline::Clock::time_point until) noexcept {
+    if (impl_) {
+        impl_->endpoint->set_io_deadline(until);
+    }
+}
+
+void UsbByteTransport::set_io_checkpoint(std::function<void()> checkpoint) {
+    if (impl_) {
+        impl_->checkpoint = std::move(checkpoint);
+        impl_->endpoint->set_io_checkpoint(impl_->checkpoint);
+    }
+}
+
 core::Result<void> UsbByteTransport::send(std::span<const std::byte> frame) {
     if (!impl_) {
         return Error{ErrorCode::transport_closed};
     }
+    if (impl_->checkpoint) {
+        impl_->checkpoint();
+    }
+    if (token_.stop_requested()) {
+        close();
+        return Error{ErrorCode::cancelled};
+    }
     auto sent = impl_->io.send_frame(frame, token_);
+    if (impl_->checkpoint) {
+        impl_->checkpoint();
+    }
+    if (token_.stop_requested()) {
+        close();
+        return Error{ErrorCode::cancelled};
+    }
     if (!sent) {
         close();
     }
@@ -66,7 +94,21 @@ core::Result<std::vector<std::byte>> UsbByteTransport::receive() {
     if (!impl_) {
         return Error{ErrorCode::transport_closed};
     }
+    if (impl_->checkpoint) {
+        impl_->checkpoint();
+    }
+    if (token_.stop_requested()) {
+        close();
+        return Error{ErrorCode::cancelled};
+    }
     auto got = impl_->io.receive_frame(token_);
+    if (impl_->checkpoint) {
+        impl_->checkpoint();
+    }
+    if (token_.stop_requested()) {
+        close();
+        return Error{ErrorCode::cancelled};
+    }
     if (!got) {
         close();
     }

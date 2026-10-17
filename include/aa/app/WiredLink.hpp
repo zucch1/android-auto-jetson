@@ -55,6 +55,7 @@ wired_phone_identity(const trust::WiredIdentity &identity);
 [[nodiscard]] core::Result<WiredLink> open_wired_link(const transport::UsbDeviceSelector &selector,
                                                       const transport::AoaAccessoryInfo &info,
                                                       const trust::TrustStore &store,
+                                                      const core::Deadline &deadline = {},
                                                       trust::WiredIdentity *attempted_identity = nullptr);
 
 } // namespace aa::app

@@ -87,9 +87,10 @@ and audio activity; a green smoke without those observables is never a pass.
   > 0 with `render_ok` from the shipped test-only status channel,
   `tools/dummy-display/test_control.hpp`). `video_sent` alone only proves units
   crossed the channel, not that anything painted.
-- `audio_present`: a `media_timing` record from the receiver log - it is
-  emitted ONLY after `router_.pump()` succeeds. The `audio_chunks` event is
-  logged BEFORE the pump call and proves nothing about the sink write.
+- `audio_present`: BOTH `audio_chunks` and `media_timing` records from the
+  receiver log. The current receiver emits `audio_chunks` only after a
+  successful pump writes frames; timing alone can also appear at final flush
+  after a failed pump and is not delivery evidence.
 - `input_evidence`: an `input_forwarded` record with `"ok":"true"`. The bare
   event is not proof of delivery (`"ok":"false"` means the send failed).
 - `startup_budget_ms`: the receiver's `active` event value (session start ->

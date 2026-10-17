@@ -64,8 +64,19 @@ core::Result<void> validate_service(const ServiceDescriptor& service) {
         }
         return {};
     }
-    case ChannelRole::microphone:
-    case ChannelRole::sensors:
+    case ChannelRole::sensors: {
+        const auto* config = std::get_if<SensorConfiguration>(&service.configuration);
+        if (config == nullptr || config->kinds.size() != 1
+            || config->kinds.front() != SensorKind::night_mode) { return malformed; }
+        return {};
+    }
+    case ChannelRole::microphone: {
+        const auto* config = std::get_if<MicrophoneConfiguration>(&service.configuration);
+        if (config == nullptr || config->profile != AudioProfile{16000, 16, 1}) {
+            return malformed;
+        }
+        return {};
+    }
     case ChannelRole::bluetooth_projection:
     case ChannelRole::wifi_projection:
     case ChannelRole::diagnostics:

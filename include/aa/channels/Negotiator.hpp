@@ -39,6 +39,9 @@ public:
     void reset() noexcept;
     [[nodiscard]] core::Result<protocol::ChannelOpenResponse>
     open(const protocol::ChannelOpenRequest& request);
+    [[nodiscard]] bool is_open(protocol::ServiceKey service) const {
+        return opened_route(service) != nullptr;
+    }
     core::Result<void> dispatch(const protocol::WireMessageView& message);
     [[nodiscard]] core::Result<protocol::VideoProfile>
     select_video(protocol::ServiceKey service, std::span<const protocol::VideoProfile> offered) const;

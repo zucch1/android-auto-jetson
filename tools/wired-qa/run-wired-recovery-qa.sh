@@ -394,12 +394,11 @@ painted_frames_grew() {
     painted_frame_probe "$baseline" >/dev/null
 }
 
-# Successful audio pump evidence: audio_chunks is logged BEFORE router_.pump()
-# runs (so its presence proves nothing about the sink); emit_media_timing is
-# emitted ONLY after pump() succeeds. media_timing is the pump-success marker.
+# Timing can be emitted at final flush after a failed pump; require the
+# current receiver's nonempty post-success audio_chunks record in this window.
 audio_pumped() {
     local since="${1:-0}"
-    remote "tail -c +$(( since + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep -q '\"event\":\"media_timing\"' && echo ok" >/dev/null 2>&1
+    remote "tail -c +$(( since + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep -q '\"event\":\"media_timing\"' && tail -c +$(( since + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep -q '\"event\":\"audio_chunks\"' && echo ok" >/dev/null 2>&1
 }
 
 # Input delivery evidence: input_forwarded presence alone is not a delivery

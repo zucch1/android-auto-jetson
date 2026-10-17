@@ -132,6 +132,7 @@ struct UsbAoaLink final {
 [[nodiscard]] core::Result<UsbAoaLink> connect_usb_aoa(const UsbDeviceSelector &selector,
                                                        const AoaAccessoryInfo &info,
                                                        const WiredAdmission &admit,
+                                                       const core::Deadline &deadline = {},
                                                        trust::WiredIdentity *attempted_identity = nullptr);
 
 // ByteEndpoint seam: the returned endpoint performs device discovery, the AOA

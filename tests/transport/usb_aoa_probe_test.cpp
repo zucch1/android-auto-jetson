@@ -122,6 +122,70 @@ TEST(UsbAoaProbe, JsonStringQuotesAndEscapesControlCharacters) {
     EXPECT_EQ(probe::json_string(""), std::string{"\"\""});
 }
 
+// Exact byte strings for hostile-input cases (hex escapes in literals would
+// bleed into adjacent digits; bytes are stated numerically instead).
+std::string raw(std::initializer_list<int> byte_values) {
+    std::string out;
+    for (const int value : byte_values) {
+        out.push_back(static_cast<char>(static_cast<unsigned char>(value)));
+    }
+    return out;
+}
+
+TEST(UsbAoaProbe, JsonEscapeValidUtf8RoundTripsVerbatim) {
+    // Fix round P2-1: a valid multibyte character must decode back to the
+    // same text, so valid RFC 3629 sequences pass through UNCHANGED - never
+    // naive per-byte \u00XX, which would mojibake them.
+    for (const std::string &text :
+         {std::string{"ascii"}, raw({0xC3, 0xA9}), raw({0xE2, 0x82, 0xAC}),
+          raw({0xE6, 0x97, 0xA5, 0xE6, 0x9C, 0xAC}), raw({0xF0, 0x9F, 0x98, 0x80}),
+          raw({0xC2, 0x80}), raw({0xDF, 0xBF}), raw({0xE0, 0xA0, 0x80}), raw({0xEF, 0xBF, 0xBF}),
+          raw({0xF0, 0x90, 0x80, 0x80}), raw({0xF4, 0x8F, 0xBF, 0xBF}),
+          raw({'a', 0xC3, 0xA9, 'b'})}) {
+        EXPECT_EQ(probe::json_escape(text), text) << "valid UTF-8 must round-trip verbatim";
+    }
+    // JSON specials adjacent to multibyte text are still escaped - only the
+    // specials change, the character does not.
+    EXPECT_EQ(probe::json_string(raw({'"', 0xC3, 0xA9, '\\'})),
+              std::string{"\"\\\""} + raw({0xC3, 0xA9}) + "\\\\\"");
+}
+
+TEST(UsbAoaProbe, JsonEscapeInvalidBytesBecomeUfffdNeverRaw) {
+    // Fix round P2-1: bytes outside any valid UTF-8 sequence are replaced with
+    // U+FFFD (one \ufffd per offending byte) so the JSON body stays valid
+    // UTF-8 for arbitrary hostile input.
+    const std::string one = "\\ufffd";
+    EXPECT_EQ(probe::json_escape(raw({0xFF})), one);
+    EXPECT_EQ(probe::json_escape(raw({0xFE})), one);
+    EXPECT_EQ(probe::json_escape(raw({0x80})), one);
+    EXPECT_EQ(probe::json_escape(raw({0xBF})), one);
+    EXPECT_EQ(probe::json_escape(raw({0xC0, 0xAF})), one + one);             // overlong '/'
+    EXPECT_EQ(probe::json_escape(raw({0xC1, 0xBF})), one + one);             // overlong 0x7F
+    EXPECT_EQ(probe::json_escape(raw({0xE0, 0x80, 0xAF})), one + one + one); // overlong 3-byte
+    EXPECT_EQ(probe::json_escape(raw({0xE0, 0x9F, 0xBF})), one + one + one); // overlong U+07FF
+    EXPECT_EQ(probe::json_escape(raw({0xF0, 0x80, 0x80, 0xAF})), one + one + one + one);
+    EXPECT_EQ(probe::json_escape(raw({0xE2, 0x82})), one + one);             // truncated U+20AC
+    EXPECT_EQ(probe::json_escape(raw({0xF0, 0x9F, 0x98})), one + one + one); // truncated U+1F600
+    EXPECT_EQ(probe::json_escape(raw({0xED, 0xA0, 0x80})), one + one + one); // surrogate half
+    EXPECT_EQ(probe::json_escape(raw({0xED, 0xBF, 0xBF})), one + one + one); // surrogate half
+    EXPECT_EQ(probe::json_escape(raw({0xF4, 0x90, 0x80, 0x80})),
+              one + one + one + one); // > U+10FFFF
+    EXPECT_EQ(probe::json_escape(raw({0xF5, 0x80, 0x80, 0x80})), one + one + one + one);
+    EXPECT_EQ(probe::json_escape(raw({0xC3})), one); // truncated 2-byte
+    // Mixed hostile text: invalid bytes are replaced, valid characters kept.
+    EXPECT_EQ(probe::json_escape(raw({'a', 0xFF, 0xC3, 0xA9, 0x80, 'b'})),
+              std::string{"a"} + one + raw({0xC3, 0xA9}) + one + "b");
+}
+
+TEST(UsbAoaProbe, JsonEscapeNulAndDelAreEscaped) {
+    // NUL cannot ride argv (execve is NUL-terminated) but can arrive in
+    // device-supplied text; it must never terminate the JSON body early.
+    EXPECT_EQ(probe::json_escape(raw({0x00})), std::string{"\\u0000"});
+    EXPECT_EQ(probe::json_string(raw({'a', 0x00, 'b'})), std::string{"\"a\\u0000b\""});
+    EXPECT_EQ(probe::json_escape(raw({0x7F})), std::string{"\\u007f"});
+    EXPECT_EQ(probe::json_escape(raw({0x00, 0x1F, 0x7F})), std::string{"\\u0000\\u001f\\u007f"});
+}
+
 TEST(UsbAoaProbe, TimeoutParseAcceptsOnlyPlainBoundedDecimal) {
     unsigned value = 0;
     EXPECT_TRUE(probe::parse_timeout_ms("1", value));

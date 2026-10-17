@@ -103,9 +103,10 @@ normal operation.
     probe and contain an integer counter strictly greater than that baseline,
     greater than zero, with JSON boolean `render_ok: true`; unchanged counters,
     negative values, numeric prefixes, and non-integer values cannot pass;
-  - **successful audio pump**: a `media_timing` record - the receiver logs
-    `audio_chunks` BEFORE `router_.pump()` runs, so `audio_chunks` presence is
-    not proof of pump success;
+  - **successful audio pump**: BOTH `audio_chunks` and `media_timing` records
+    in the post-disturbance byte window. The current receiver emits
+    `audio_chunks` only after a successful pump writes frames; timing alone
+    can also appear at final flush after a failed pump and cannot pass;
   - **delivered input**: an `input_forwarded` record with `"ok":"true"` - the
     bare event is not proof (`"ok":"false"` means the send failed).
 

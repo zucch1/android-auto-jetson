@@ -72,7 +72,7 @@ public:
     InputChannelTarget(InputChannelTarget&&) = delete;
     InputChannelTarget& operator=(InputChannelTarget&&) = delete;
 
-    virtual void on_normalized(const NormalizedInput& event) = 0;
+    [[nodiscard]] virtual core::Result<void> on_normalized(const NormalizedInput& event) = 0;
 };
 
 // The receiver-side input service. Caller-driven and thread-free: one thread
