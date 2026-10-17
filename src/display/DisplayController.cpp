@@ -199,6 +199,8 @@ core::Result<void> DisplayController::start_projection(const ipc::VideoSocketPat
         return connected.error();
     }
     consumer::DecodeConfig decode_config{};
+    connected.value().set_observer(impl_->config.on_video_endpoint);
+    decode_config.on_completion = impl_->config.on_decode_completion;
     decode_config.caps = impl_->config.caps;
     decode_config.backend = consumer::DecodeBackend::automatic;
     Impl* impl = impl_.get();

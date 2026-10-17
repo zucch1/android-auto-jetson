@@ -142,6 +142,16 @@ int main(int argc, char** argv) {
     config.consumer_name = aa::ipc::BusName{"org.custom.DummyDisplay1"};
     config.viewport = aa::ipc::Viewport{1280, 720, 160};
     config.caps = aa::protocol::VideoProfile{1280, 720, 30};
+    config.on_video_endpoint = [](const aa::ipc::VideoEndpoint& event) {
+        const auto line = aa::ipc::video_endpoint_json(event);
+        std::puts(line.c_str());
+        std::fflush(stdout);
+    };
+    config.on_decode_completion = [](const aa::consumer::DecodeCompletion& event) {
+        const auto line = aa::consumer::decode_completion_json(event);
+        std::puts(line.c_str());
+        std::fflush(stdout);
+    };
 
     aa::display::qt_adapter::ProjectionWidget widget(sender, config.caps);
     g_widget = &widget;
