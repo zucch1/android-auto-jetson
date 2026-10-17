@@ -31,6 +31,7 @@
 // payload is the real AAP InputReport protobuf (protocol::encode_input_report),
 // converted at the input boundary - not the local IPC record.
 
+#include <aa/channels/AvSink.hpp>
 #include <aa/channels/Negotiator.hpp>
 #include <aa/channels/Services.hpp>
 #include <aa/core/Cancellation.hpp>
@@ -82,6 +83,13 @@ struct WiredSessionConfig final {
 
 class WiredSession final {
   public:
+    struct RejectedFrame final {
+        std::uint8_t channel{};
+        std::optional<std::uint16_t> msg_id{};
+        [[nodiscard]] friend bool operator==(const RejectedFrame&,
+                                             const RejectedFrame&) = default;
+    };
+
     WiredSession(WiredSessionDeps deps, WiredSessionConfig config = WiredSessionConfig{});
     ~WiredSession();
 
@@ -137,7 +145,12 @@ class WiredSession final {
     // forwarder, the audio router forwarder). Non-owning; must outlive the
     // session. Registering a role twice is refused.
     [[nodiscard]] core::Result<void> register_sink(protocol::ChannelRole role,
-                                                   protocol::MessageSink &sink);
+                                                    protocol::MessageSink &sink);
+
+    // Own the negotiated AV boundary; raw_sink remains non-owning and receives
+    // only stripped media. Requires a configured AV descriptor for this role.
+    [[nodiscard]] core::Result<void> register_av_sink(protocol::ChannelRole role,
+                                                     protocol::MessageSink &raw_sink);
 
     // Publish the service-discovery response for the configured services and
     // send it over the transport. Returns the number of frames sent.
@@ -162,9 +175,12 @@ class WiredSession final {
     // onto the input service channel over the transport.
     [[nodiscard]] core::Result<void> submit_input(const ipc::InputEvent &event);
 
+    [[nodiscard]] core::Result<void>
+    send_channel_payload(protocol::ChannelRole role, std::vector<std::byte> payload);
+
     // Observed counters (diagnostics/tests). The negotiation counters
     // (channel_opens, version_responses, pings_answered, encapsulated_ssls,
-    // auth_completes) are PER-LINK: attach_transport() zeroes them with the
+    // auth_completes, unhandled_controls) are PER-LINK: attach_transport() zeroes them with the
     // link state. input_sends/input_send_failures/diagnostics_emitted are
     // run-cumulative telemetry.
     [[nodiscard]] std::uint64_t diagnostics_emitted() const noexcept {
@@ -175,6 +191,9 @@ class WiredSession final {
         return input_send_failures_;
     }
     [[nodiscard]] std::uint64_t channel_opens() const noexcept { return channel_opens_; }
+    [[nodiscard]] std::uint64_t unhandled_controls() const noexcept { return unhandled_controls_; }
+    [[nodiscard]] std::uint64_t channel_closes() const noexcept { return channel_closes_; }
+    [[nodiscard]] std::optional<RejectedFrame> last_reject() const noexcept { return last_reject_; }
     [[nodiscard]] std::uint64_t version_responses() const noexcept { return version_responses_; }
     [[nodiscard]] std::uint64_t pings_answered() const noexcept { return pings_answered_; }
     [[nodiscard]] std::uint64_t encapsulated_ssls() const noexcept { return encapsulated_ssls_; }
@@ -192,6 +211,7 @@ class WiredSession final {
     [[nodiscard]] core::Result<void> handle_control(std::span<const std::byte> payload);
     [[nodiscard]] core::Result<void> drive_ssl_handshake();
     void reset_link() noexcept;
+    void reset_owned_av() noexcept;
     [[nodiscard]] core::Result<std::size_t>
     send_payload(const protocol::ServiceDiscoveryResponse &response);
     [[nodiscard]] core::Result<std::size_t>
@@ -200,6 +220,10 @@ class WiredSession final {
     [[nodiscard]] core::Result<std::size_t> send_frames(std::vector<std::byte> payload,
                                                         bool encrypted);
     [[nodiscard]] core::Result<void> forward_input(const input::NormalizedInput &event);
+    [[nodiscard]] core::Result<void> send_service_payload(std::uint8_t channel,
+                                                         std::vector<std::byte> payload,
+                                                         transport::MessageKind kind =
+                                                             transport::MessageKind::specific);
     [[nodiscard]] std::optional<std::uint8_t> input_channel() const noexcept;
 
     void note_state(std::string_view identity_key = {});
@@ -212,6 +236,7 @@ class WiredSession final {
     std::vector<protocol::ServiceDescriptor> descriptors_;
     std::optional<channels::Negotiator> negotiator_;
     std::map<protocol::ChannelRole, protocol::MessageSink *> sinks_;
+    std::map<protocol::ChannelRole, std::unique_ptr<channels::AvSink>> av_sinks_;
     transport::FrameStreamParser parser_{};
     transport::MessageReassembler reassembler_{};
     std::unique_ptr<InputForwarder> input_forwarder_{};
@@ -227,6 +252,9 @@ class WiredSession final {
     std::uint64_t input_sends_{0};
     std::uint64_t input_send_failures_{0};
     std::uint64_t channel_opens_{0};
+    std::uint64_t unhandled_controls_{0};
+    std::uint64_t channel_closes_{0};
+    std::optional<RejectedFrame> last_reject_{};
     std::uint64_t version_responses_{0};
     std::uint64_t pings_answered_{0};
     std::uint64_t encapsulated_ssls_{0};

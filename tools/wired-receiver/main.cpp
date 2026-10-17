@@ -22,8 +22,12 @@
 // budget. The session thread is the only caller of WiredSession methods.
 
 #include <aa/app/WiredLink.hpp>
+#include <aa/app/WiredPhoneControl.hpp>
 #include <aa/app/WiredSession.hpp>
 #include <aa/audio/AudioRouter.hpp>
+#include <aa/channels/SensorSink.hpp>
+#include <aa/channels/MicrophoneSink.hpp>
+#include <aa/channels/InputSink.hpp>
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/ControlService.hpp>
@@ -76,11 +80,24 @@ void log_line(const std::string &json) {
 
 void on_signal(int) { g_running.store(false); }
 
-// Task-48 media-timing diagnostics: nanoseconds -> milliseconds as an exact
-// rational (ns / 1e6) carried in a double, with no lossy pre-rounding - the
-// collector and reporter compare the value as-is against the ms budgets.
-// Non-finite input (not producible from an int64 count) degrades to a JSON
-// null, which the collector treats as an absent metric (BLOCKED), never 0.
+std::string poll_error_json(aa::ErrorCode code,
+                            std::optional<aa::app::WiredSession::RejectedFrame> reject) {
+    std::string line = std::string{"{\"event\":\"err\",\"detail\":\"poll\",\"code\":\""} +
+                       std::string{aa::to_string(code)} + "\"";
+    if (code == aa::ErrorCode::channel_not_registered && reject) {
+        line += ",\"reject_channel\":" + std::to_string(reject->channel);
+        if (reject->msg_id) {
+            line += ",\"reject_msg_id\":" + std::to_string(*reject->msg_id);
+        }
+    }
+    return line + "}";
+}
+
+// Media-timing diagnostics: nanoseconds -> milliseconds as an exact rational
+// (ns / 1e6) carried in a double, no lossy pre-rounding - the collector and
+// reporter compare the value as-is against the ms budgets. Non-finite input
+// (not producible from an int64 count) degrades to a JSON null, which the
+// collector treats as an absent metric (BLOCKED), never 0.
 std::string format_ms(aa::core::Nanoseconds value) {
     const double ms = static_cast<double>(value.count) / 1'000'000.0;
     if (!std::isfinite(ms)) {
@@ -104,10 +121,10 @@ class StdoutDiagnostics final : public aa::diagnostics::DiagnosticSink {
 
 class StorePhones final : public aa::ipc::PhoneDirectory {
   public:
-    explicit StorePhones(aa::trust::ApprovedPhoneStore &store) : store_(store) {}
+    explicit StorePhones(aa::app::WiredPhoneControl &control) : control_(control) {}
 
     [[nodiscard]] aa::core::Result<void> forget(aa::core::PhoneId phone) override {
-        return store_.forget_phone(phone);
+        return control_.forget(phone);
     }
     [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId) override {
         return aa::Error{aa::ErrorCode::invalid_argument};
@@ -123,7 +140,7 @@ class StorePhones final : public aa::ipc::PhoneDirectory {
     }
 
   private:
-    aa::trust::ApprovedPhoneStore &store_;
+    aa::app::WiredPhoneControl &control_;
 };
 
 bool is_idr_au(const std::vector<std::uint8_t> &payload) {
@@ -152,6 +169,7 @@ class VideoOutlet final : public aa::protocol::MessageSink {
     on_message(const aa::protocol::MessageView &message) override {
         std::lock_guard lock(mutex_);
         if (!producer_.has_value()) {
+            record_drop("no_consumer");
             return {};
         }
         std::vector<std::uint8_t> payload;
@@ -159,13 +177,23 @@ class VideoOutlet final : public aa::protocol::MessageSink {
         for (const std::byte byte : message.payload) {
             payload.push_back(std::to_integer<std::uint8_t>(byte));
         }
-        ++units_;
         const auto sent = producer_->send_access_unit(aa::ipc::VideoSendRequest{
-            units_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr_au(payload),
+            ++sequence_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr_au(payload),
             payload});
         if (!sent) {
             return sent.error();
         }
+        switch (sent.value()) {
+        case aa::ipc::SendStatus::dropped_backpressure:
+            record_drop("backpressure");
+            return {};
+        case aa::ipc::SendStatus::dropped_waiting_idr:
+            record_drop("waiting_idr");
+            return {};
+        case aa::ipc::SendStatus::sent:
+            break;
+        }
+        ++units_;
         if (units_ % 30 == 1) {
             log_line("{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
         }
@@ -189,9 +217,19 @@ class VideoOutlet final : public aa::protocol::MessageSink {
     }
 
   private:
+    void record_drop(const char *reason) {
+        ++dropped_;
+        if (dropped_ % 30 == 1) {
+            log_line(std::string{"{\"event\":\"video_dropped\",\"reason\":\""} + reason +
+                     "\",\"count\":" + std::to_string(dropped_) + "}");
+        }
+    }
+
     std::mutex mutex_{};
     std::optional<aa::ipc::VideoProducer> producer_{};
+    std::uint64_t sequence_{0};
     std::uint64_t units_{0};
+    std::uint64_t dropped_{0};
 };
 
 class RouterSink final : public aa::protocol::MessageSink {
@@ -236,8 +274,8 @@ class RouterSink final : public aa::protocol::MessageSink {
     }
 
   private:
-    // These are audio-only cumulative maxima. Cross-stream av_sync_ms is
-    // computed by the collector from audio_write_completed + video_presented.
+    // Audio-only cumulative maxima. The collector derives cross-stream
+    // av_sync_ms from audio_write_completed paired with video_presented.
     void emit_media_timing() {
         const auto &stats = router_.report().stats;
         if (stats.frames_written == 0) {
@@ -282,8 +320,10 @@ aa::audio::RouterConfig pcm_router_config() {
     config.output_format = aa::audio::AudioFormat{48000, 2, 16};
     for (auto &role : config.roles) {
         role.codec = aa::audio::Codec::pcm;
-        role.input_format = aa::audio::AudioFormat{48000, 2, 16};
+        role.input_format = aa::audio::AudioFormat{16000, 1, 16};
     }
+    config.roles[aa::audio::role_index(aa::audio::Role::media)].input_format =
+        aa::audio::AudioFormat{48000, 2, 16};
     config.on_write_completed = [](const aa::audio::WriteCompletion &completion) {
         log_line("{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
                  std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
@@ -296,16 +336,42 @@ aa::audio::RouterConfig pcm_router_config() {
 std::vector<aa::protocol::ServiceDescriptor>
 service_descriptors(const aa::input::CapabilityDescriptor &input) {
     const aa::protocol::VideoConfiguration video{{{1280, 720, 30}, {800, 480, 30}}};
-    const aa::protocol::AudioConfiguration audio{{{48000, 16, 2}}};
+    const aa::protocol::AudioConfiguration media_audio{{{48000, 16, 2}}};
+    const aa::protocol::AudioConfiguration voice_audio{{{16000, 16, 1}}};
+    aa::protocol::SensorConfiguration sensors;
+    if (input.night_mode() == aa::input::NightModePolicy::manual) {
+        sensors.kinds.push_back(aa::protocol::SensorKind::night_mode);
+    }
+    for (const auto kind : input.vehicle_sensors()) {
+        // The capability vocabulary follows the pinned sensor kinds from
+        // location (1) to toll card (22); unsupported kinds fail validation.
+        sensors.kinds.push_back(static_cast<aa::protocol::SensorKind>(
+            static_cast<std::int32_t>(kind) + 1));
+    }
     return {
         {aa::protocol::ServiceKey{99}, aa::protocol::ChannelRole::video, video},
-        {aa::protocol::ServiceKey{100}, aa::protocol::ChannelRole::media_audio, audio},
-        {aa::protocol::ServiceKey{101}, aa::protocol::ChannelRole::guidance_audio, audio},
-        {aa::protocol::ServiceKey{102}, aa::protocol::ChannelRole::system_audio, audio},
-        {aa::protocol::ServiceKey{103}, aa::protocol::ChannelRole::speech_audio, audio},
+        {aa::protocol::ServiceKey{100}, aa::protocol::ChannelRole::media_audio, media_audio},
+        {aa::protocol::ServiceKey{101}, aa::protocol::ChannelRole::guidance_audio, voice_audio},
+        {aa::protocol::ServiceKey{102}, aa::protocol::ChannelRole::system_audio, voice_audio},
         {aa::protocol::ServiceKey{104}, aa::protocol::ChannelRole::input,
          aa::protocol::ButtonConfiguration{input.keycodes()}},
+        {aa::protocol::ServiceKey{105}, aa::protocol::ChannelRole::sensors, sensors},
+        {aa::protocol::ServiceKey{106}, aa::protocol::ChannelRole::microphone,
+         aa::protocol::MicrophoneConfiguration{{16000, 16, 1}}},
     };
+}
+
+aa::core::Result<void> register_av_sinks(aa::app::WiredSession &session,
+                                        VideoOutlet &video, RouterSink &audio) {
+    using aa::protocol::ChannelRole;
+    if (auto result = session.register_av_sink(ChannelRole::video, video); !result) {
+        return result.error();
+    }
+    for (const auto role : {ChannelRole::media_audio, ChannelRole::guidance_audio,
+                            ChannelRole::system_audio}) {
+        if (auto result = session.register_av_sink(role, audio); !result) { return result.error(); }
+    }
+    return {};
 }
 
 const char *const kUsage =
@@ -393,8 +459,14 @@ int main(int argc, char **argv) {
         return 3;
     }
 
+    aa::app::WiredSessionConfig session_config{};
+    session_config.lifecycle.phases.negotiate = Milliseconds{15'000};
+    session_config.input_enabled = true;
+    session_config.input = input;
+    aa::app::WiredSession session{{store, clock, diagnostics}, session_config};
+    aa::app::WiredPhoneControl control{store, session};
     aa::ipc::RandomPairingIdSource ids;
-    StorePhones phones{store};
+    StorePhones phones{control};
     std::optional<aa::ipc::ControlBusService> bus{};
     if (!no_bus) {
         auto started_bus = aa::ipc::ControlBusService::start(
@@ -406,22 +478,22 @@ int main(int argc, char **argv) {
         }
         bus.emplace(std::move(started_bus.value()));
     }
-
-    aa::app::WiredSessionConfig session_config{};
-    session_config.lifecycle.phases.negotiate = Milliseconds{15'000};
-    session_config.input_enabled = true;
-    session_config.input = input;
-    aa::app::WiredSession session{{store, clock, diagnostics}, session_config};
     if (!session.configure(service_descriptors(input)).has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"configure\"}");
         return 1;
     }
     VideoOutlet video_outlet;
-    if (!session.register_sink(aa::protocol::ChannelRole::video, video_outlet).has_value() ||
-        !session.register_sink(aa::protocol::ChannelRole::media_audio, audio_sink).has_value() ||
-        !session.register_sink(aa::protocol::ChannelRole::guidance_audio, audio_sink).has_value() ||
-        !session.register_sink(aa::protocol::ChannelRole::system_audio, audio_sink).has_value() ||
-        !session.register_sink(aa::protocol::ChannelRole::speech_audio, audio_sink).has_value()) {
+    aa::channels::InputSink input_sink;
+    aa::channels::SensorSink sensor_sink{input, [&session](std::vector<std::byte> payload) {
+        return session.send_channel_payload(aa::protocol::ChannelRole::sensors, std::move(payload));
+    }};
+    aa::channels::MicrophoneSink microphone_sink{[&session](std::vector<std::byte> payload) {
+        return session.send_channel_payload(aa::protocol::ChannelRole::microphone, std::move(payload));
+    }};
+    if (!register_av_sinks(session, video_outlet, audio_sink).has_value() ||
+        !session.register_sink(aa::protocol::ChannelRole::microphone, microphone_sink).has_value() ||
+        !session.register_sink(aa::protocol::ChannelRole::input, input_sink).has_value() ||
+        !session.register_sink(aa::protocol::ChannelRole::sensors, sensor_sink).has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"sink\"}");
         return 1;
     }
@@ -471,27 +543,52 @@ int main(int argc, char **argv) {
     log_line("{\"event\":\"ready\",\"state\":\"negotiating\"}");
 
     InputQueue input_queue;
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+    ObservedSessionMutex session_mutex;
+#else
     std::mutex session_mutex;
+#endif
     std::atomic<std::int64_t> active_ms{-1};
     std::atomic<bool> session_failed{false};
     bool runtime_failed = false;
 
+    auto service_control = [&] {
+        control.checkpoint();
+        if (control.finish()) {
+            session_failed.store(true);
+            g_running.store(false);
+            return true;
+        }
+        return false;
+    };
+
     auto reconnect = [&]() -> aa::core::Result<void> {
+        if (service_control()) {
+            return aa::Error{aa::ErrorCode::cancelled};
+        }
         if (auto lost = session.apply(aa::session::Event::link_lost); !lost) {
             return lost.error();
         }
         const auto budget = session.io_deadline();
         while (g_running.load()) {
+            if (service_control()) {
+                return aa::Error{aa::ErrorCode::cancelled};
+            }
             if (auto checked = budget.check(); !checked) {
                 session.tick();
                 return checked.error();
             }
             auto relink = aa::app::open_wired_link(selector, accessory, store, budget);
+            if (service_control()) {
+                return aa::Error{aa::ErrorCode::cancelled};
+            }
             if (relink) {
                 if (relink.value().phone.key != link->phone.key) {
                     return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
                 }
                 link.emplace(std::move(relink.value()));
+                control.bind_phone(link->phone);
+                link->transport->set_io_checkpoint([&] { control.checkpoint(); });
                 session.attach_transport(link->transport.get());
                 if (!bind_link_cipher(link->phone)) {
                     return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
@@ -520,14 +617,24 @@ int main(int argc, char **argv) {
                           std::min(budget.until, std::chrono::steady_clock::now() +
                                                     std::chrono::milliseconds{50}),
                           [] { return false; });
+            lock.unlock();
+            if (service_control()) {
+                return aa::Error{aa::ErrorCode::cancelled};
+            }
         }
         return aa::Error{aa::ErrorCode::cancelled};
     };
 
     std::thread session_thread([&] {
+        control.bind_owner();
+        control.bind_phone(link->phone);
+        link->transport->set_io_checkpoint([&] { control.checkpoint(); });
         while (g_running.load()) {
             {
                 std::lock_guard lock(session_mutex);
+                if (service_control()) {
+                    break;
+                }
                 session.tick();
                 if (session.failure()) {
                     session_failed.store(true);
@@ -536,20 +643,32 @@ int main(int argc, char **argv) {
                 }
                 while (auto event = input_queue.pop()) {
                     const auto outcome = session.submit_input(*event);
+                    if (service_control()) {
+                        break;
+                    }
                     log_line(std::string{"{\"event\":\"input_forwarded\",\"ok\":\""} +
                              (outcome.has_value() ? "true" : "false") + "\"}");
                 }
             }
+            if (!g_running.load()) {
+                break;
+            }
             auto polled = session.poll_transport();
             {
                 std::lock_guard lock(session_mutex);
+                if (service_control()) {
+                    break;
+                }
+                if (session.state() == aa::session::State::stopping) {
+                    g_running.store(false);
+                    break;
+                }
                 if (!polled.has_value()) {
                     const auto code = polled.error().code();
                     if (!g_running.load()) {
                         break;
                     }
-                    log_line(std::string{"{\"event\":\"err\",\"detail\":\"poll\",\"code\":\""} +
-                             std::string{aa::to_string(code)} + "\"}");
+                    log_line(poll_error_json(code, session.last_reject()));
                     if (!session.failure() &&
                         (code == aa::ErrorCode::transport_closed ||
                          code == aa::ErrorCode::transport_io || code == aa::ErrorCode::timeout)) {
@@ -583,7 +702,20 @@ int main(int argc, char **argv) {
             }
         }
         std::lock_guard lock(session_mutex);
+        (void)control.finish();
+        session.request_stop();
         session.tick();
+        if (session.state() == aa::session::State::stopping) {
+            (void)session.apply(aa::session::Event::cleanup_finished);
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+            if (shutdown_observation) {
+                shutdown_observation->reset_finished(
+                    session.state() == aa::session::State::disconnected);
+            }
+#endif
+        }
+        link->transport->set_io_checkpoint({});
+        control.close();
     });
 
     std::thread input_thread([&] {
@@ -627,22 +759,34 @@ int main(int argc, char **argv) {
     }
 
     g_running.store(false);
-    session.request_stop();
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+    if (shutdown_observation) {
+        shutdown_observation->published_false();
+    }
+#endif
+    {
+        const std::lock_guard lock(session_mutex);
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+        if (shutdown_observation) {
+            shutdown_observation->main_stop();
+        }
+#endif
+        session.request_stop();
+    }
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+    if (shutdown_observation) {
+        shutdown_observation->main_join();
+    }
+#endif
     session_thread.join();
     input_thread.join();
 
     // P2-D: one final media-timing export before shutdown so the last audio
     // tail (routed after the last periodic emission) is not lost. The session
     // thread is gone, so the router report is final and race-free here.
-    // finish() is guard-flagged: the destructor's second call is a no-op.
     audio_sink.finish();
 
-    {
-        std::lock_guard lock(session_mutex);
-        (void)session.apply(aa::session::Event::cleanup_finished);
-    }
     video_outlet.close();
-    audio_sink.finish();
     router.value().close();
     input_server.value().close();
     video.value().close();
@@ -658,6 +802,7 @@ int main(int argc, char **argv) {
              ",\"input_sends\":" + std::to_string(session.input_sends()) +
              ",\"input_failures\":" + std::to_string(session.input_send_failures()) +
              ",\"channel_opens\":" + std::to_string(session.channel_opens()) +
-             ",\"version_responses\":" + std::to_string(session.version_responses()) + "}");
+             ",\"version_responses\":" + std::to_string(session.version_responses()) +
+             ",\"unhandled_controls\":" + std::to_string(session.unhandled_controls()) + "}");
     return runtime_failed || session_failed.load() ? 1 : 0;
 }

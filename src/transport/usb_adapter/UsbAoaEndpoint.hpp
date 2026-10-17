@@ -33,6 +33,9 @@ class UsbAoaEndpoint final : public ByteEndpoint {
 
     [[nodiscard]] core::Result<void> open() override;
     [[nodiscard]] core::Result<void> open(const core::Deadline &deadline);
+    void set_io_checkpoint(std::function<void()> checkpoint) override {
+        checkpoint_ = std::move(checkpoint);
+    }
     void set_io_deadline(core::Deadline::Clock::time_point until) noexcept override {
         io_deadline_ = until;
     }
@@ -56,6 +59,7 @@ class UsbAoaEndpoint final : public ByteEndpoint {
     UsbDeviceSelector selector_;
     AoaAccessoryInfo info_;
     WiredAdmission admit_;
+    std::function<void()> checkpoint_;
     std::unique_ptr<UsbBulkPipe> pipe_;
     trust::WiredIdentity identity_{};
     UsbDeviceSnapshot pre_switch_{};

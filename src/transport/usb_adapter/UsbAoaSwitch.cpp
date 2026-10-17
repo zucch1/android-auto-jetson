@@ -72,7 +72,10 @@ send_string_specs(const AoaAccessoryInfo &info) {
 core::Result<std::vector<std::byte>> aoa_string_payload(const std::string &text) {
     // Receiver-side configuration text is bounded printable ASCII; the wire
     // form is the ASCII bytes plus one NUL (exactly what the probe sends).
-    if (text.size() > trust::kMaxIdentityFieldBytes) {
+    // The wire payload itself must fit the AOA SEND_STRING limit
+    // (kAoaStringMaxWireBytes incl. NUL), which caps the text at 255 chars -
+    // tighter than the identity field budget.
+    if (text.size() > kAoaStringMaxChars) {
         return Error{ErrorCode::invalid_argument};
     }
     std::vector<std::byte> payload;

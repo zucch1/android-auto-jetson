@@ -5,6 +5,7 @@
 # dependencies = []
 # ///
 # Run: python3 -B tests/wired_e2e/test_live_qa_gates.py <path-to-run-wired-live-qa.sh>
+# noqa: SIZE_OK - one hermetic harness CLI regression suite; limited to this file by task scope.
 """Script-level gate regressions for tools/wired-qa/run-wired-live-qa.sh (findings F3/F5).
 
 A fake `ssh` shim is placed on PATH and scripted through environment variables so
@@ -39,18 +40,6 @@ if [ -n "${FAKE_SSH_LOG:-}" ]; then
     printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
 fi
 cmd="${@: -1}"
-if [[ "$cmd" == *nohup* || "$cmd" == *kill* ]]; then
-    if [[ "${FAKE_PROCESSES:-0}" == 1 ]]; then
-        cmd="${cmd//\/tmp\//$FAKE_TARGET/}"
-        cmd="${cmd//\/opt\/aa\/recv/$FAKE_TARGET/recv}"
-        cmd="${cmd//\/opt\/aa\/disp/$FAKE_TARGET/disp}"
-        if [[ "$cmd" == *nohup*disp* && "${FAKE_LAUNCH_FAILURE:-0}" == 1 ]]; then
-            exit 55
-        fi
-        bash -c "$cmd"
-        exit $?
-    fi
-fi
 # T30 env guard: every harness ssh invocation must carry the target session
 # environment, with $(id -u) left unexpanded for the TARGET shell to resolve.
 all_args="$*"
@@ -62,9 +51,58 @@ case "$all_args" in
     *'DISPLAY=:1'*) ;;
     *) echo "fake-ssh: remote command missing DISPLAY=:1: $all_args" >&2; exit 98 ;;
 esac
+if [[ "$cmd" == *nohup* || "$cmd" == *kill* ]]; then
+    if [[ "${FAKE_PROCESSES:-0}" == 1 ]]; then
+        cmd="${cmd//\/tmp\//$FAKE_TARGET/}"
+        cmd="${cmd//\/opt\/aa\/recv/$FAKE_TARGET/recv}"
+        cmd="${cmd//\/opt\/aa\/disp/$FAKE_TARGET/disp}"
+        if [[ "$cmd" == *nohup*disp* && "${FAKE_LAUNCH_FAILURE:-0}" == 1 ]]; then
+            exit 55
+        fi
+        bash -euc "$cmd"
+        exit $?
+    fi
+fi
 if [ "$cmd" = "true" ]; then
     [ "${FAKE_SSH_FAIL:-0}" = "1" ] && exit 255
     exit 0
+fi
+if [[ "$cmd" == *nohup*--test-only-autostart* ]]; then
+    [[ "${FAKE_DISPLAY_LAUNCH_FAIL:-0}" == 1 ]] && exit 41
+    cmd="${cmd//\/tmp\//$FAKE_TARGET/}"
+    # Execute the launch shell/redirections, validating the actual display CLI
+    # and FIFO stdin rather than accepting any command containing 'nohup'.
+    bash -euc 'nohup() {
+        [[ "$#" == 3 && "$2" == --test-only-autostart && "$3" == --test-only-control-stdin ]]
+        [[ -p /dev/stdin && "${FAKE_CONTROL_READY:-1}" == 1 ]]
+        touch "$FAKE_TARGET/control-ready"
+    }; '"$cmd"'; wait' >/dev/null
+    echo 4343
+    exit 0
+fi
+if [[ "$cmd" == *aa-disp.in* ]]; then
+    [[ -f "$FAKE_TARGET/control-ready" && -p "$FAKE_TARGET/aa-disp.in" ]] || exit 97
+    cmd="${cmd//\/tmp\//$FAKE_TARGET/}"
+    # Keep a real FIFO reader open, then execute the exact remote writes/grep.
+    # The status grep consumes the request before producing the fixture reply.
+    bash -euc 'exec 9<>"$FAKE_TARGET/aa-disp.in"
+        grep() {
+            IFS= read -r -t 0.1 -u 9 request
+            [[ "$request" == status ]]
+            printf "{\"event\":\"status\",\"frames_presented\":3,\"frames_painted\":%s,\"render_ok\":%s}\n" \
+                "${FAKE_FRAMES_PAINTED:-3}" "${FAKE_RENDER_OK:-true}" > "$FAKE_TARGET/aa-wired-display.log"
+            command grep "$@"
+        }
+        '"$cmd"'
+        if IFS= read -r -t 0.01 -u 9 press; then
+            IFS= read -r -t 0.1 -u 9 release
+            [[ "$press" == "key a press" && "$release" == "key a release" ]]
+            command grep -q '\''"event":"active"'\'' "$FAKE_LOG_ROOT/receiver.log"
+            count=0
+            [[ -f "$FAKE_LOG_ROOT/keys" ]] && count="$(cat "$FAKE_LOG_ROOT/keys")"
+            printf "%s" "$((count + 1))" > "$FAKE_LOG_ROOT/keys"
+        fi'
+    exit $?
 fi
 if [[ "$cmd" == *grep* ]]; then
     counter="$FAKE_LOG_ROOT/polls"
@@ -77,7 +115,12 @@ if [[ "$cmd" == *grep* ]]; then
         [[ "${FAKE_ACTIVE:-1}" == 1 ]] && printf '%s\n' '{"event":"active"}' >> "$log"
         [[ "${FAKE_OBS_VIDEO:-1}" == 1 ]] && printf '%s\n' '{"event":"video_sent"}' >> "$log"
         [[ "${FAKE_OBS_AUDIO:-1}" == 1 ]] && printf '%s\n' '{"event":"audio_chunks"}' >> "$log"
-        if [[ "${FAKE_OBS_INPUT:-1}" == 1 ]]; then
+        if [[ "${FAKE_FINAL_MEDIA_TIMING:-0}" == 1 || ( "${FAKE_OBS_AUDIO:-1}" == 1 && "${FAKE_OBS_PUMP:-1}" == 1 ) ]]; then
+            printf '%s\n' '{"event":"media_timing","audio_latency_ms":1,"av_sync_ms":1}' >> "$log"
+        fi
+        keys=0
+        [[ -f "$FAKE_LOG_ROOT/keys" ]] && keys="$(cat "$FAKE_LOG_ROOT/keys")"
+        if [[ "${FAKE_OBS_INPUT:-1}" == 1 ]] && ((keys >= ${FAKE_INPUT_AFTER_KEYS:-1})); then
             printf '%s\n' "{\"event\":\"input_forwarded\",\"ok\":\"${FAKE_INPUT_OK:-true}\"}" >> "$log"
         fi
     fi
@@ -87,20 +130,15 @@ fi
 case "$cmd" in
     *idVendor*) printf '%s' "${FAKE_PHONE:-04e8:6860}"; exit 0 ;;
     *"/sys/class/drm"*) printf '%s' "${FAKE_DISPLAY:-connected}"; exit 0 ;;
+    *xrandr*) printf '%s' "${FAKE_XRANDR-}"; exit "${FAKE_XRANDR_EXIT:-0}" ;;
     *pactl*|*pw-cli*) printf '%s' "${FAKE_SINK:-sink1}"; exit 0 ;;
     *70-android-auto-receiver.rules*) printf '%s' "${FAKE_POLICY:-installed}"; exit 0 ;;
-    *nohup*--test-only-autostart*)
-        [[ "${FAKE_DISPLAY_LAUNCH_FAIL:-0}" == 1 ]] && exit 41
-        echo 4343; exit 0 ;;
     *nohup*) echo 4242; exit 0 ;;
     *busctl*) printf '%s' "${FAKE_STATE:-string \"projecting\"}"; exit 0 ;;
-    *active*) [ "${FAKE_ACTIVE:-1}" = "1" ] && { echo ok; exit 0; } || exit 1 ;;
-    *video_sent*) [ "${FAKE_OBS_VIDEO:-1}" = "1" ] && { echo ok; exit 0; } || exit 1 ;;
-    *audio_chunks*) [ "${FAKE_OBS_AUDIO:-1}" = "1" ] && { echo ok; exit 0; } || exit 1 ;;
     *kill*)
         bash -c 'kill() { printf "kill %s\n" "$*" >> "$FAKE_SSH_LOG"; [[ "$1" != -0 ]]; }; '"$cmd"
         exit $? ;;
-    *) exit 0 ;;
+    *) exit 96 ;;
 esac
 """
 
@@ -148,6 +186,29 @@ class LiveQaGates(unittest.TestCase):
         self.assertEqual(code, 3, doc)
         self.assertEqual(doc["blocked_on"], "display_disconnected")
 
+    def test_xrandr_connected_passes_when_drm_is_disconnected(self) -> None:
+        # Given a stale NVIDIA DRM connector and a live X output.
+        output = "DP-0 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis)"
+        # When the real readiness CLI probes the scripted target.
+        code, doc = self.run_qa(True, FAKE_DISPLAY="disconnected", FAKE_XRANDR=output)
+        # Then readiness passes without claiming projection or delivery.
+        self.assertEqual((code, doc["status"], doc["blocked_on"]), (0, "READY", ""))
+        self.assertFalse(any(value for key, value in doc["observables"].items()
+                             if key != "startup_budget_ms"))
+
+    def test_xrandr_nonpositive_or_failed_probe_stays_blocked(self) -> None:
+        # Given no positive DRM evidence and empty, negative, malformed, or failed X probes.
+        for output, exit_code in (("", "0"), ("DP-0 disconnected", "0"),
+                                  ("DP-0 connectedness", "0"), ("connected DP-0", "0"),
+                                  ("", "1"), ("", "127"), ("DP-0 connected 1920x1080+0+0", "1")):
+            with self.subTest(output=output, exit_code=exit_code):
+                # When readiness runs with the probe's actual stdout and exit status.
+                code, doc = self.run_qa(True, FAKE_DISPLAY="disconnected",
+                                       FAKE_XRANDR=output, FAKE_XRANDR_EXIT=exit_code)
+                # Then the existing fail-closed display verdict remains intact.
+                self.assertEqual((code, doc["status"], doc["blocked_on"]),
+                                 (3, "BLOCKED", "display_disconnected"))
+
     # ---- F3: session activation + observable gates ----
     def test_all_observables_pass(self):
         code, doc = self.run_qa(False, FAKE_STATE='string "projecting"', FAKE_ACTIVE="1",
@@ -162,6 +223,104 @@ class LiveQaGates(unittest.TestCase):
         code, doc = self.run_qa(False, FAKE_INPUT_OK="false")
         self.assertEqual(code, 4, doc)
         self.assertFalse(doc["observables"]["input_evidence"])
+
+    def test_video_requires_painted_frames_and_successful_render(self) -> None:
+        # Given video_sent and presented frames, but no positive paint/render evidence.
+        for frames, render in (("0", "true"), ("3", "false")):
+            with self.subTest(frames=frames, render=render):
+                # When the harness requests status over its real FIFO command.
+                code, doc = self.run_qa(False, FAKE_FRAMES_PAINTED=frames,
+                                       FAKE_RENDER_OK=render)
+                # Then receiver-side video alone cannot qualify delivery.
+                self.assertEqual((code, doc["status"], doc["blocked_on"]),
+                                 (4, "FAILED", "observable_missing"))
+                self.assertFalse(doc["observables"]["video_present"])
+
+    def test_audio_chunks_without_successful_pump_is_failed(self) -> None:
+        # Given successful delivery chunks but no media_timing measurement.
+        # When the harness runs its normal delivery probes.
+        code, doc = self.run_qa(False, FAKE_OBS_AUDIO="1", FAKE_OBS_PUMP="0")
+        # Then chunks alone cannot satisfy both required audio observables.
+        self.assertEqual((code, doc["status"], doc["blocked_on"]),
+                         (4, "FAILED", "observable_missing"))
+        self.assertFalse(doc["observables"]["audio_present"])
+
+    def test_final_timing_after_failed_pump_without_chunks_is_failed(self) -> None:
+        # Given a failed pump whose final timing export has no delivered chunks.
+        # When all other delivery paths succeed through the normal CLI.
+        code, doc = self.run_qa(False, FAKE_OBS_AUDIO="0", FAKE_OBS_PUMP="0",
+                               FAKE_FINAL_MEDIA_TIMING="1")
+        # Then timing alone must not produce the old false PASS.
+        self.assertEqual((code, doc["status"], doc["blocked_on"]),
+                         (4, "FAILED", "observable_missing"), doc)
+        self.assertFalse(doc["observables"]["audio_present"])
+        for observable in ("projection_reached", "video_present", "input_evidence"):
+            self.assertTrue(doc["observables"][observable], doc)
+
+    def test_audio_chunks_and_timing_qualify_delivery(self) -> None:
+        # Given successful written frames and a periodic timing measurement.
+        # When the normal CLI observes both records without a final export.
+        code, doc = self.run_qa(False, FAKE_OBS_AUDIO="1", FAKE_OBS_PUMP="1",
+                               FAKE_FINAL_MEDIA_TIMING="0")
+        # Then real delivery still qualifies.
+        self.assertEqual((code, doc["status"]), (0, "PASS"), doc)
+        self.assertTrue(doc["observables"]["audio_present"])
+
+    def test_control_channel_absent_cannot_qualify_input(self) -> None:
+        # Given a display that never enables its test-only channel.
+        # When the exact remote FIFO writes run without a control consumer.
+        code, doc = self.run_qa(False, FAKE_CONTROL_READY="0")
+        # Then no input delivery is invented by the SSH fixture.
+        self.assertEqual((code, doc["status"]), (4, "FAILED"))
+        self.assertFalse(doc["observables"]["input_evidence"])
+
+    def test_fifo_launch_status_and_keys_retry_until_delivery(self) -> None:
+        # Given input that succeeds only after a second key pair.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            # When the normal harness launches and stimulates the display.
+            code, doc = self.run_qa(False, FAKE_INPUT_AFTER_KEYS="2", FAKE_SSH_LOG=str(log))
+            # Then the real FIFO/CLI contract was used, not an unconditional input marker.
+            self.assertEqual((code, doc["status"]), (0, "PASS"))
+            commands = log.read_text(encoding="utf-8")
+            self.assertIn("--test-only-autostart --test-only-control-stdin <>/tmp/aa-disp.in", commands)
+            self.assertIn(r"printf 'status\n' > /tmp/aa-disp.in", commands)
+            self.assertGreaterEqual(commands.count(r"printf 'key a press\nkey a release\n'"), 2)
+
+    def test_input_is_not_stimulated_before_active(self) -> None:
+        # Given a projecting control service without an ACTIVE phone session.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            # When delivery polling reaches its unchanged short test deadline.
+            code, doc = self.run_qa(False, FAKE_ACTIVE="0", FAKE_SSH_LOG=str(log))
+            # Then no premature key events or input delivery are claimed.
+            self.assertEqual((code, doc["blocked_on"]), (4, "session_not_active"))
+            self.assertNotIn("key a press", log.read_text(encoding="utf-8"))
+            self.assertFalse(doc["observables"]["input_evidence"])
+
+    def test_control_fixture_rejects_invalid_flag_or_non_fifo_stdin(self) -> None:
+        # Given incorrect display CLI flags or a regular file in place of the FIFO.
+        for flag, fifo in (("--test-only-control", True), ("", True),
+                           ("--test-only-control-stdin", False)):
+            with self.subTest(flag=flag, fifo=fifo), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                shim = root / "ssh"
+                shim.write_text(FAKE_SSH, encoding="utf-8")
+                env = dict(os.environ, FAKE_TARGET=directory)
+                session = ('export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus; '
+                           'export DISPLAY=:1;')
+                setup = "mkfifo" if fifo else "touch"
+                launch = (f"{setup} /tmp/aa-disp.in; nohup /opt/aa/disp --test-only-autostart "
+                          f"{flag} <>/tmp/aa-disp.in > /tmp/aa-wired-display.log 2>&1 & echo $!")
+                # When the same fixture executes launch redirection and a status request.
+                subprocess.run(["bash", str(shim), session, launch], env=env,
+                               capture_output=True, timeout=TIMEOUT_S, check=True)
+                result = subprocess.run(
+                    ["bash", str(shim), session, "printf 'status\n' > /tmp/aa-disp.in"],
+                    env=env, capture_output=True, timeout=TIMEOUT_S,
+                )
+                # Then the invalid launch cannot manufacture control-channel evidence.
+                self.assertEqual(result.returncode, 97)
 
     def test_delayed_streams_and_activation_are_polled(self) -> None:
         code, doc = self.run_qa(False, FAKE_DELAY_POLLS="4")
@@ -224,7 +383,11 @@ class LiveQaGates(unittest.TestCase):
                     program = target / name
                     program.write_text(
                         '#!/usr/bin/env bash\nset -euo pipefail\n'
-                        'printf "%s\\n" "$$" > "${0}.actual-pid"\nexec sleep 60\n',
+                        'printf "%s\\n" "$$" > "${0}.actual-pid"\n'
+                        'if [[ "$0" == */disp ]]; then\n'
+                        '  [[ "$#" == 2 && "$1" == --test-only-autostart && "$2" == --test-only-control-stdin && -p /dev/stdin ]] || exit 2\n'
+                        '  touch "$FAKE_TARGET/control-ready"\n'
+                        'fi\nexec sleep 60\n',
                         encoding="utf-8",
                     )
                     program.chmod(0o755)

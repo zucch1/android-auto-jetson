@@ -84,7 +84,7 @@ void write_service(std::string& out, const ServiceEntry& service) {
                     out += "]";
                 }
                 out += "]";
-            } else {
+            } else if constexpr (std::is_same_v<T, protocol::ButtonConfiguration>) {
                 out += ",\"buttons\":[";
                 bool first = true;
                 for (const auto keycode : configuration.keycodes) {

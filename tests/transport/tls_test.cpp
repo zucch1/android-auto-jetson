@@ -51,6 +51,35 @@ void handshake(tls::TlsRecordCodec& client, tls::TlsRecordCodec& server) {
 
 } // namespace
 
+TEST(TlsRecordCodec, HuClientFactoryEmitsClientHelloAndHandshakesWithServer) {
+    auto hu = tr::make_client_handshake_cipher([] { return true; });
+    ASSERT_NE(hu, nullptr);
+    ASSERT_TRUE(hu->step_handshake().has_value());
+    EXPECT_FALSE(hu->is_active());
+    auto first_flight = hu->take_handshake();
+    ASSERT_GT(first_flight.size(), 5U);
+    EXPECT_EQ(first_flight[0], std::byte{0x16});
+    EXPECT_EQ(first_flight[5], std::byte{0x01});
+
+    bool approved = true;
+    tls::TlsRecordCodec server(approved_policy(&approved), tls::TlsRecordCodec::Role::server);
+    server.give_handshake(first_flight);
+    for (int round = 0; round < 16 && (!hu->is_active() || !server.is_active()); ++round) {
+        ASSERT_TRUE(server.step_handshake().has_value());
+        hu->give_handshake(server.take_handshake());
+        ASSERT_TRUE(hu->step_handshake().has_value());
+        server.give_handshake(hu->take_handshake());
+    }
+    ASSERT_TRUE(hu->is_active());
+    ASSERT_TRUE(server.is_active());
+    const auto plain = pattern(37);
+    auto sealed = hu->seal(plain);
+    ASSERT_TRUE(sealed.has_value());
+    auto opened = server.open(sealed.value());
+    ASSERT_TRUE(opened.has_value());
+    EXPECT_EQ(opened.value(), plain);
+}
+
 TEST(TlsRecordCodec, SealOpenRoundTripsWithExactOverhead) {
     bool approved = true;
     tls::TlsRecordCodec client(approved_policy(&approved), tls::TlsRecordCodec::Role::client);

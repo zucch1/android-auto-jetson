@@ -4,6 +4,8 @@
 
 #include <aa/protocol/InputReport.hpp>
 
+#include <algorithm>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -41,7 +43,7 @@ WiredSession::WiredSession(WiredSessionDeps deps, WiredSessionConfig config)
     }
 }
 
-WiredSession::~WiredSession() = default;
+WiredSession::~WiredSession() { reset_owned_av(); }
 
 // ---------------------------------------------------------------------------
 // Session / trust delegation. No approval happens here: the store decides.
@@ -65,7 +67,10 @@ core::Result<void> WiredSession::fail(Error reason) {
     return outcome;
 }
 
-void WiredSession::tick() { lifecycle_.tick(); }
+void WiredSession::tick() {
+    lifecycle_.tick();
+    note_state();
+}
 
 void WiredSession::request_stop() noexcept { lifecycle_.request_stop(); }
 
@@ -106,6 +111,9 @@ core::Result<void> WiredSession::send_frame(std::span<const std::byte> frame) {
     if (auto sent = transport_->send(frame); !sent) {
         return io_error(sent.error(), deadline);
     }
+    if (auto checked = deadline.check(); !checked) {
+        return io_error(checked.error(), deadline);
+    }
     return {};
 }
 
@@ -123,6 +131,7 @@ void WiredSession::attach_transport(transport::Transport *transport) noexcept {
 // impossible until attach_cipher() binds a fresh cipher and its handshake
 // completes (channels::Negotiator::reset() contract).
 void WiredSession::reset_link() noexcept {
+    reset_owned_av();
     parser_ = transport::FrameStreamParser{};
     reassembler_ = transport::MessageReassembler{};
     if (negotiator_.has_value()) {
@@ -133,6 +142,9 @@ void WiredSession::reset_link() noexcept {
     cipher_.reset();
     sequence_ = 0;
     channel_opens_ = 0;
+    unhandled_controls_ = 0;
+    channel_closes_ = 0;
+    last_reject_.reset();
     version_responses_ = 0;
     pings_answered_ = 0;
     encapsulated_ssls_ = 0;
@@ -183,10 +195,41 @@ core::Result<void> WiredSession::register_sink(protocol::ChannelRole role,
     return {};
 }
 
+core::Result<void> WiredSession::register_av_sink(protocol::ChannelRole role,
+                                                  protocol::MessageSink &raw_sink) {
+    if (!negotiator_ || sinks_.contains(role)) { return bad_argument(); }
+    switch (role) {
+    case protocol::ChannelRole::video:
+    case protocol::ChannelRole::media_audio:
+    case protocol::ChannelRole::guidance_audio:
+    case protocol::ChannelRole::system_audio:
+    case protocol::ChannelRole::speech_audio: break;
+    default: return Error{ErrorCode::protocol_unsupported_channel};
+    }
+    const auto service = std::find_if(descriptors_.begin(), descriptors_.end(),
+        [role](const auto &descriptor) { return descriptor.role == role; });
+    if (service == descriptors_.end()) { return not_configured(); }
+    auto wrapper = std::make_unique<channels::AvSink>(*service, raw_sink,
+        [this, role](std::vector<std::byte> payload) {
+            return send_channel_payload(role, std::move(payload));
+        });
+    if (auto registered = registry_.register_sink(role, *wrapper); !registered) {
+        return registered.error();
+    }
+    sinks_.emplace(role, wrapper.get());
+    av_sinks_.emplace(role, std::move(wrapper));
+    return {};
+}
+
+void WiredSession::reset_owned_av() noexcept {
+    for (auto &[role, sink] : av_sinks_) { sink->reset(); }
+}
+
 core::Result<std::size_t> WiredSession::announce_services() {
     if (!negotiator_.has_value()) {
         return not_configured();
     }
+    reset_owned_av();
     return send_payload(negotiator_->start());
 }
 
@@ -220,6 +263,7 @@ core::Result<std::size_t> WiredSession::send_version_request(std::uint16_t major
 // ---------------------------------------------------------------------------
 
 core::Result<bool> WiredSession::poll_transport() {
+    last_reject_.reset();
     if (transport_ == nullptr) {
         return Error{ErrorCode::transport_unavailable};
     }
@@ -236,6 +280,9 @@ core::Result<bool> WiredSession::poll_transport() {
     if (!frame) {
         return io_error(frame.error(), deadline);
     }
+    if (auto checked = deadline.check(); !checked) {
+        return io_error(checked.error(), deadline);
+    }
     auto chunks = parser_.feed(frame.value());
     if (!chunks) {
         return chunks.error();
@@ -251,6 +298,7 @@ core::Result<bool> WiredSession::poll_transport() {
                 return handled.error();
             }
             routed = true;
+            if (token().stop_requested()) { break; }
         }
     }
     return routed;
@@ -264,12 +312,62 @@ core::Result<void> WiredSession::route(const transport::Message &message) {
         return Error{ErrorCode::transport_unauthorized_peer};
     }
     if (!negotiator_.has_value()) {
+        const auto id = message.payload.size() >= 2
+            ? std::optional<std::uint16_t>{static_cast<std::uint16_t>(
+                (static_cast<std::uint16_t>(message.payload[0]) << 8U) |
+                static_cast<std::uint16_t>(message.payload[1]))} : std::nullopt;
+        last_reject_ = RejectedFrame{message.channel, id};
         return not_configured();
+    }
+    const auto id = message.payload.size() >= 2
+        ? std::optional<std::uint16_t>{static_cast<std::uint16_t>(
+            (static_cast<std::uint16_t>(message.payload[0]) << 8U) |
+            static_cast<std::uint16_t>(message.payload[1]))} : std::nullopt;
+    const protocol::ServiceKey service{message.channel};
+    // Like pinned SensorSourceService::messageHandler, service channels carry
+    // their own open requests before ordinary service-message dispatch.
+    if (id == static_cast<std::uint16_t>(protocol::ControlMessageId::channel_open_request)) {
+        auto request = protocol::decode_channel_open_request(message.payload);
+        if (!request) {
+            request = protocol::decode_in_band_channel_open_request(message.payload);
+        }
+        protocol::ChannelOpenResponse response{protocol::ChannelOpenStatus::unsupported};
+        if (!request || request.value().service == service) {
+            const auto opened = negotiator_->open({request ? request.value().priority : 0, service});
+            if (opened) { response = opened.value(); }
+        }
+        auto payload = protocol::encode(response);
+        if (!payload) { return payload.error(); }
+        if (auto sent = send_service_payload(message.channel, std::move(payload).value(),
+                                              transport::MessageKind::control); !sent) {
+            return sent.error();
+        }
+        if (response.status == protocol::ChannelOpenStatus::success) { ++channel_opens_; }
+        return {};
+    }
+    if (id == static_cast<std::uint16_t>(protocol::ControlMessageId::channel_close_notification)) {
+        for (const auto &descriptor : descriptors_) {
+            if (descriptor.id != service) { continue; }
+            const auto sink = av_sinks_.find(descriptor.role);
+            if (sink != av_sinks_.end()) { sink->second->reset(); }
+        }
+        ++channel_closes_;
+        return {};
+    }
+    if (!negotiator_->is_open(service)) {
+        const auto opened = negotiator_->open({0, service});
+        if (opened && opened.value().status == protocol::ChannelOpenStatus::success) {
+            ++channel_opens_;
+        }
     }
     ++sequence_;
     const auto at = deps_.clock.now();
-    return negotiator_->dispatch(
+    auto dispatched = negotiator_->dispatch(
         protocol::WireMessageView{message.channel, sequence_, at, message.payload});
+    if (!dispatched && dispatched.error().code() == ErrorCode::channel_not_registered) {
+        last_reject_ = RejectedFrame{message.channel, id};
+    }
+    return dispatched;
 }
 
 core::Result<void> WiredSession::handle_control(std::span<const std::byte> payload) {
@@ -330,7 +428,7 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         if (!negotiator_.has_value()) {
             return not_configured();
         }
-        if (auto sent = send_payload(negotiator_->start()); !sent) {
+        if (auto sent = announce_services(); !sent) {
             return sent.error();
         }
         return {};
@@ -356,6 +454,52 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         ++channel_opens_;
         return {};
     }
+    case protocol::ControlMessageId::audio_focus_request: {
+        if (!authenticated()) {
+            return Error{ErrorCode::transport_unauthorized_peer};
+        }
+        const auto request = protocol::decode_audio_focus_request(payload);
+        if (!request) { return request.error(); }
+        const auto state = request.value().type == protocol::AudioFocusRequestType::release
+            ? protocol::AudioFocusState::loss : protocol::AudioFocusState::gain;
+        auto encoded = protocol::encode(protocol::AudioFocusNotification{state, false});
+        if (!encoded) { return encoded.error(); }
+        if (auto sent = send_frames(std::move(encoded).value(), true); !sent) {
+            return sent.error();
+        }
+        return {};
+    }
+    case protocol::ControlMessageId::nav_focus_request: {
+        if (!authenticated()) {
+            return Error{ErrorCode::transport_unauthorized_peer};
+        }
+        const auto request = protocol::decode_nav_focus_request(payload);
+        if (!request) { return request.error(); }
+        // An absent optional selection defaults to projected; native releases focus.
+        auto encoded = protocol::encode(
+            protocol::NavFocusNotification{request.value().type.value_or(protocol::NavFocusType::projected)});
+        if (!encoded) { return encoded.error(); }
+        if (auto sent = send_frames(std::move(encoded).value(), true); !sent) {
+            return sent.error();
+        }
+        return {};
+    }
+    case protocol::ControlMessageId::byebye_request: {
+        if (!authenticated()) {
+            return Error{ErrorCode::transport_unauthorized_peer};
+        }
+        const auto request = protocol::decode_byebye_request(payload);
+        if (!request) { return request.error(); }
+        auto encoded = protocol::encode(protocol::ByeByeResponse{});
+        if (!encoded) { return encoded.error(); }
+        if (auto sent = send_frames(std::move(encoded).value(), true); !sent) {
+            (void)fail(sent.error());
+            return sent.error();
+        }
+        request_stop();
+        tick();
+        return {};
+    }
     case protocol::ControlMessageId::ping_request: {
         auto request = protocol::decode_ping_request(payload);
         if (!request) {
@@ -373,7 +517,22 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         return {};
     }
     default:
-        return bad_argument();
+        // Pinned ControlServiceChannel.cpp:231-234 continues receiving unknown IDs.
+        ++unhandled_controls_;
+        if (unhandled_controls_ <= 8) {
+            diagnostics::Event event{};
+            event.session = session_id_;
+            event.kind = diagnostics::EventKind::transport_stats;
+            event.monotonic_time = deps_.clock.now();
+            event.fields.push_back(diagnostics::EventField::count("msg_id", (high << 8U) | low));
+            event.fields.push_back(diagnostics::EventField::count(
+                "auth_phase", static_cast<std::int64_t>(auth_phase_)));
+            event.fields.push_back(diagnostics::EventField::count(
+                "payload_bytes", static_cast<std::int64_t>(payload.size())));
+            deps_.diagnostics.emit(event);
+            ++diagnostics_emitted_;
+        }
+        return {};
     }
 }
 
@@ -385,16 +544,11 @@ core::Result<void> WiredSession::drive_ssl_handshake() {
         return Error{ErrorCode::channel_not_registered};
     }
     auto stepped = cipher_->step_handshake();
-    std::fprintf(stderr, "HS-DBG step has_value=%d val=%d active=%d\n",
-                 (int)stepped.has_value(),
-                 (int)(stepped.has_value() ? stepped.value() : false),
-                 (int)cipher_->is_active());
     if (!stepped) {
         (void)fail(Error{ErrorCode::transport_unauthorized_peer});
         return stepped.error();
     }
     auto out = cipher_->take_handshake();
-    std::fprintf(stderr, "HS-DBG out=%zu\n", out.size());
     if (!out.empty()) {
         if (auto sent = send_encapsulated_ssl(std::move(out)); !sent) {
             return sent.error();
@@ -481,7 +635,36 @@ core::Result<std::size_t> WiredSession::send_frames(std::vector<std::byte> paylo
 // Input (task 26).
 // ---------------------------------------------------------------------------
 
+core::Result<void> WiredSession::send_service_payload(std::uint8_t channel,
+                                                       std::vector<std::byte> payload,
+                                                       transport::MessageKind kind) {
+    if (!authenticated()) { return Error{ErrorCode::transport_unauthorized_peer}; }
+    // Service open replies use CONTROL; ordinary service payloads stay SPECIFIC.
+    // D19's SPECIFIC evidence applies to control channel 0, not service opens.
+    transport::Message message{channel, kind, std::move(payload)};
+    auto frames = transport::encode_message(message, transport::Encryption::encrypted, cipher_.get());
+    if (!frames) { return frames.error(); }
+    for (const auto& frame : frames.value()) {
+        if (auto sent = send_frame(frame); !sent) { return sent.error(); }
+    }
+    return {};
+}
+
+core::Result<void> WiredSession::send_channel_payload(protocol::ChannelRole role,
+                                                       std::vector<std::byte> payload) {
+    if (!authenticated()) { return Error{ErrorCode::transport_unauthorized_peer}; }
+    for (const auto& service : descriptors_) {
+        if (service.role != role) { continue; }
+        return send_service_payload(static_cast<std::uint8_t>(service.id.value), std::move(payload));
+    }
+    return Error{ErrorCode::channel_not_registered};
+}
+
 core::Result<void> WiredSession::submit_input(const ipc::InputEvent &event) {
+    const auto video = av_sinks_.find(protocol::ChannelRole::video);
+    if (video != av_sinks_.end() && !video->second->input_focus_allowed()) {
+        return Error{ErrorCode::channel_unsupported_capability};
+    }
     if (!input_service_.has_value()) {
         return Error{ErrorCode::channel_unsupported_capability};
     }
@@ -560,6 +743,13 @@ void WiredSession::note_state(std::string_view identity_key) {
         return;
     }
     last_state_ = lifecycle_.state();
+    switch (last_state_) {
+    case session::State::reconnecting:
+    case session::State::failed:
+    case session::State::stopping:
+    case session::State::disconnected: reset_owned_av(); break;
+    default: break;
+    }
     emit(identity_key);
 }
 

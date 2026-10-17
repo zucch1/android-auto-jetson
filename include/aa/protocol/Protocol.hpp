@@ -26,7 +26,7 @@ enum class ChannelRole {
     system_audio,
     speech_audio,
     input,
-    microphone,          // never advertised by default (no qualified mic path)
+    microphone,          // negotiation endpoint; capture may be unavailable
     sensors,             // never advertised by default (no vehicle sensors)
     bluetooth_projection,
     wifi_projection,
