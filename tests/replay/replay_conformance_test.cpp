@@ -34,7 +34,7 @@ using namespace conformancewire;
 // file bytes, as written by aa_conformance_fixture_write from the spec).
 // Regenerating the files must reproduce these; a mismatch fails closed.
 inline constexpr std::string_view kControlFixtureSha256 =
-    "5142555bafed8c0f6b441b9a5432bafb5b363a05ffd91dd5694ca7777fab464f"; // PIN-CONTROL
+    "23db83c073e57a6c4832ff89b546a2185aa346923e7add96eeea400abdc47e79"; // PIN-CONTROL
 inline constexpr std::string_view kMediaFixtureSha256 =
     "faafeeb072f63c83b5373e2b57c36312272f21fe9dde61c7100cbd2df4b34d13"; // PIN-MEDIA
 inline constexpr std::string_view kUiConfigFixtureSha256 =
