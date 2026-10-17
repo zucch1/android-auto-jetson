@@ -108,13 +108,23 @@ TEST_F(SensorWire, ManualToggleEmitsOneBatchAndLaterRequestUsesCurrentState) {
 
 TEST_F(SensorWire, MalformedRequestsAndWrongRoleEmitNothing) {
     const std::vector<std::vector<std::byte>> malformed{
-        {}, {std::byte{0x80}}, {std::byte{0x80}, std::byte{0x02}},
+        {}, {std::byte{0x80}},
         {std::byte{0x80}, std::byte{0x01}, std::byte{0x08}, std::byte{0x0a}},
         {std::byte{0x80}, std::byte{0x01}, std::byte{0x10}, std::byte{0x00}},
         request(sensor::SENSOR_NIGHT_MODE, -1)};
     for (const auto& payload : malformed) { EXPECT_FALSE(submit(payload)); }
     const auto payload = request(sensor::SENSOR_NIGHT_MODE);
     EXPECT_FALSE(sink.on_message({{proto::ChannelRole::input, 1, {}}, payload}));
+    EXPECT_TRUE(sent.empty());
+}
+
+TEST_F(SensorWire, UnclaimedIdsAreCountedWithoutReplyOrBodyParsing) {
+    for (const auto id : {0x8002, 0x8004, 0x1234}) {
+        const std::vector<std::byte> payload{static_cast<std::byte>(id >> 8),
+            static_cast<std::byte>(id & 0xff), std::byte{0xff}};
+        EXPECT_TRUE(submit(payload));
+    }
+    EXPECT_EQ(sink.unhandled(), 3u);
     EXPECT_TRUE(sent.empty());
 }
 
