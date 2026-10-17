@@ -153,6 +153,8 @@ core::Result<void> put_configuration(aap_protobuf::service::Service& entry,
                                                              : sink::VIDEO_800x480);
             video->set_frame_rate(sink::VIDEO_FPS_30);
             video->set_video_codec_type(shared::MEDIA_CODEC_VIDEO_H264_BP);
+            // Baseline UI scaling, not a physical real_density measurement.
+            video->set_density(160);
         }
         return {};
     }
