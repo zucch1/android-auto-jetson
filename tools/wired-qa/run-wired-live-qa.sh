@@ -9,11 +9,8 @@
 # Fail-closed by construction: every ssh runs under `timeout`; a missing
 # prerequisite (phone absent, udev policy not installed, no audio sink, display
 # disconnected, receiver binary not supplied) writes a BLOCKED result and exits
-# non-zero. Exit 0 requires REAL media evidence - painted frames on the display,
-# a successful audio pump (post-pump media_timing), and a delivered input event
-# ("ok":"true") - on top of the D-Bus projection contract. `GetState=projecting`
-# with no observed media is NON-PASS (gate P2-G): a green smoke without evidence
-# is never a pass (misleading_success_output).
+# non-zero. Exit 0 requires projection plus painted frames, a successful audio
+# pump and delivered input - never a green smoke without delivery evidence.
 #
 # Usage:
 #   run-wired-live-qa.sh --receiver /opt/aa/aa-wired-receiver \
@@ -134,7 +131,20 @@ if [[ "$policy" != "installed" ]]; then
 fi
 # Exact-line DRM status record (lane-32 pattern, tools/perf/aa-projection-perf.sh):
 # `disconnected` must NOT read as `connected`; only an exact `connected` line passes.
-if ! printf '%s\n' "$display_status" | grep -Fxq 'connected'; then
+display_connected="false"
+if printf '%s\n' "$display_status" | grep -Fxq 'connected'; then
+    display_connected="true"
+fi
+# NVIDIA DRM can report disconnected while X drives a live monitor. Accept only
+# a successful query with an exact second-field `connected` token, parsed locally.
+if [[ "$display_connected" != "true" ]]; then
+    if xrandr_status="$(remote "xrandr --query 2>/dev/null")"; then
+        if printf '%s\n' "$xrandr_status" | grep -Eq '^[^ ]+ connected( |$)'; then
+            display_connected="true"
+        fi
+    fi
+fi
+if [[ "$display_connected" != "true" ]]; then
     write_result "BLOCKED" "display_disconnected" "false" "false" "false" "false" "null"
     exit 3
 fi
@@ -182,7 +192,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 receiver_pid="$(remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!")"
-display_pid="$(remote "rm -f /tmp/aa-disp.in; mkfifo /tmp/aa-disp.in; nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>/tmp/aa-disp.in > /tmp/aa-wired-display.log 2>&1 & echo \$!")"
+# Open the FIFO read/write so startup does not wait for a separate writer and
+# the test-only channel stays open between bounded status/input requests.
+display_pid="$(remote "rm -f /tmp/aa-disp.in; mkfifo /tmp/aa-disp.in && { nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>/tmp/aa-disp.in > /tmp/aa-wired-display.log 2>&1 & echo \$!; }")"
 
 projection="false"
 session_active="false"; video="false"; audio="false"; input="false"
@@ -200,17 +212,14 @@ while (( $(date +%s%3N) < deadline )); do
     fi
     poll_remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && session_active="true"
     if poll_remote "grep -q '\"event\":\"video_sent\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1; then
-        painted="$(poll_remote "printf 'status\n' > /tmp/aa-disp.in; sleep 0.03; grep '\"event\":\"status\"' /tmp/aa-wired-display.log | tail -1" || true)"
-        if [[ "$painted" =~ \"frames_painted\":([0-9]+) ]] && ((BASH_REMATCH[1] > 0)) \
-            && [[ "$painted" == *'"render_ok":true'* ]]; then
+        status="$(poll_remote "printf 'status\n' > /tmp/aa-disp.in 2>/dev/null; grep '\"event\":\"status\"' /tmp/aa-wired-display.log 2>/dev/null | tail -1" || true)"
+        if [[ "$status" =~ \"frames_painted\":([0-9]+) ]] && ((BASH_REMATCH[1] > 0)) && [[ "$status" == *'"render_ok":true'* ]]; then
             video="true"
         fi
     fi
-    # Final shutdown can emit timing after a failed pump; only audio_chunks
-    # certifies nonempty post-success delivery in the current receiver.
     poll_remote "grep -q '\"event\":\"audio_chunks\"' /tmp/aa-wired-receiver.log && grep -q '\"event\":\"media_timing\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && audio="true"
     if [[ "$session_active" == true && "$input" != true ]]; then
-        poll_remote "printf 'key a press\nkey a release\n' > /tmp/aa-disp.in" >/dev/null 2>&1 || true
+        poll_remote "printf 'key a press\nkey a release\n' > /tmp/aa-disp.in 2>/dev/null" >/dev/null 2>&1 || true
     fi
     poll_remote "grep -q '\"event\":\"input_forwarded\",\"ok\":\"true\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && input="true"
     if [[ "$projection" == true && "$session_active" == true && "$video" == true && "$audio" == true && "$input" == true ]]; then
@@ -231,10 +240,9 @@ fi
 
 # Verdict taxonomy: a missing prerequisite is BLOCKED; the session running but
 # failing to project / activate / deliver every observable is FAILED. PASS
-# requires an ACTIVE session AND all three delivery paths OBSERVED as real
-# media: painted frames (not just video_sent), a successful audio pump
-# (media_timing), and a delivered input event ("ok":"true"). `GetState=projecting`
-# with no observed media is NON-PASS (gate P2-G).
+# requires an ACTIVE session AND all three delivery paths observed: painted
+# frames with render_ok, successful-pump audio_chunks plus media_timing, and
+# input_forwarded ok:true. Final media_timing alone can follow a failed pump.
 if [[ "$projection" != "true" || "$session_active" != "true" ]]; then
     write_result "FAILED" "session_not_active" "$projection" "$video" "$audio" "$input" "$budget_ms"
     exit 4
