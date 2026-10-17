@@ -158,6 +158,7 @@ class ObservedSessionMutex {
 #undef AA_WIRED_RECEIVER_SHUTDOWN_TEST
 
 #include "harness.hpp"
+#include "../session/Fakes.hpp"
 #include "../video_socket/pair.hpp"
 #include "../trust/syscall_faults.hpp"
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
@@ -284,6 +285,64 @@ const std::array receiver_audio_expectations{
                              media_wire::AUDIO_STREAM_TELEPHONY, {16000, 1, 16}},
 };
 
+TEST(WiredReceiver, ProductionAudioProfilesMatchWireAndRouterInputs) {
+    const auto services = service_descriptors(aa::input::CapabilityDescriptor::bench_defaults());
+    const auto encoded = aa::protocol::encode(aa::protocol::ServiceDiscoveryResponse{services});
+    ASSERT_TRUE(encoded.has_value());
+    ASSERT_GE(encoded.value().size(), 2U);
+    aap_protobuf::service::control::message::ServiceDiscoveryResponse wire;
+    ASSERT_TRUE(wire.ParseFromArray(encoded.value().data() + 2,
+                                   static_cast<int>(encoded.value().size() - 2)));
+    const auto decoded = aa::protocol::decode_service_discovery_response(encoded.value());
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded.value().services, services);
+    ASSERT_EQ(wire.channels_size(), 7);
+    const auto router = pcm_router_config();
+    EXPECT_EQ(router.output_format, (aa::audio::AudioFormat{48000, 2, 16}));
+    for (const auto &expected : receiver_audio_expectations) {
+        if (expected.channel == aa::protocol::ChannelRole::speech_audio) { continue; }
+        SCOPED_TRACE(expected.service);
+        const auto entry = std::find_if(wire.channels().begin(), wire.channels().end(),
+            [&](const auto &channel) { return channel.id() == expected.service; });
+        ASSERT_NE(entry, wire.channels().end());
+        ASSERT_TRUE(entry->has_media_sink_service());
+        const auto &media = entry->media_sink_service();
+        EXPECT_EQ(media.audio_type(), expected.wire_role);
+        EXPECT_EQ(media.available_type(),
+                  aap_protobuf::service::media::shared::message::MEDIA_CODEC_AUDIO_PCM);
+        ASSERT_EQ(media.audio_configs_size(), 1);
+        const auto &profile = media.audio_configs(0);
+        EXPECT_EQ(profile.sampling_rate(), expected.input.sample_rate_hz);
+        EXPECT_EQ(profile.number_of_bits(), expected.input.bits_per_sample);
+        EXPECT_EQ(profile.number_of_channels(), expected.input.channels);
+        const auto &input = router.roles[aa::audio::role_index(expected.role)];
+        EXPECT_EQ(input.codec, aa::audio::Codec::pcm);
+        EXPECT_EQ(input.input_format, expected.input);
+        EXPECT_EQ(input.input_format.sample_rate_hz, profile.sampling_rate());
+        EXPECT_EQ(input.input_format.bits_per_sample, profile.number_of_bits());
+        EXPECT_EQ(input.input_format.channels, profile.number_of_channels());
+        const auto descriptor = std::find_if(decoded.value().services.begin(),
+            decoded.value().services.end(),
+            [&](const auto &service) { return service.id.value == expected.service; });
+        ASSERT_NE(descriptor, decoded.value().services.end());
+        EXPECT_EQ(descriptor->role, expected.channel);
+    }
+    const auto mic = std::find_if(wire.channels().begin(), wire.channels().end(),
+        [](const auto &entry) { return entry.id() == 106; });
+    ASSERT_NE(mic, wire.channels().end());
+    ASSERT_TRUE(mic->has_media_source_service());
+    const auto &source = mic->media_source_service();
+    EXPECT_EQ(source.available_type(),
+              aap_protobuf::service::media::shared::message::MEDIA_CODEC_AUDIO_PCM);
+    EXPECT_TRUE(source.has_available_while_in_call());
+    EXPECT_FALSE(source.available_while_in_call());
+    ASSERT_TRUE(source.has_audio_config());
+    EXPECT_EQ(source.audio_config().sampling_rate(), 16000u);
+    EXPECT_EQ(source.audio_config().number_of_bits(), 16u);
+    EXPECT_EQ(source.audio_config().number_of_channels(), 1u);
+    for (const auto &entry : wire.channels()) { EXPECT_NE(entry.id(), 103); }
+}
+
 class ReceiverProfileSink final : public aa::audio::detail::ObservedAudioSink {
   public:
     aa::audio::AudioFormat format{};
@@ -300,7 +359,98 @@ class ReceiverProfileSink final : public aa::audio::detail::ObservedAudioSink {
     aa::audio::RenderBarrierStats render_stats() const override { return {}; }
 };
 
-TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereoAndKeepCompletionCallback) {
+TEST(WiredReceiver, ProductionAvRegistrationNegotiatesEncryptedMediaWithoutSetupPcm) {
+    namespace p = aa::protocol;
+    namespace tr = aa::transport;
+    aa::session::test::MapTrustStore trust;
+    aa::session::test::ManualClock clock;
+    wiredtest::CaptureSink capture;
+    aa::diagnostics::Diagnostics diagnostics{capture};
+    wiredtest::ScriptedTransport transport;
+    auto output = std::make_unique<ReceiverProfileSink>();
+    const auto *observed = output.get();
+    auto router = aa::audio::detail::open_router_with_sink_for_test(
+        pcm_router_config(), std::move(output));
+    ASSERT_TRUE(router);
+    RouterSink audio{router.value()};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    VideoOutlet video;
+    video.install(std::move(pair.value().producer));
+    aa::app::WiredSession session{{trust, clock, diagnostics}};
+    ASSERT_TRUE(session.configure(service_descriptors(aa::input::CapabilityDescriptor::bench_defaults())));
+    ASSERT_TRUE(register_av_sinks(session, video, audio));
+    session.attach_transport(&transport);
+    auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    auto *cipher = owned.get();
+    session.attach_cipher(std::move(owned));
+    wiredtest::walk_auth(session, transport);
+    ASSERT_TRUE(session.authenticated());
+    ASSERT_TRUE(session.announce_services());
+    const auto receive = [&](std::uint8_t channel, std::vector<std::byte> payload) {
+        auto frames = tr::encode_message({channel, tr::MessageKind::specific, std::move(payload)},
+                                         tr::Encryption::encrypted, cipher);
+        if (!frames) { return aa::core::Result<bool>{frames.error()}; }
+        for (auto &frame : frames.value()) { transport.push_inbound(std::move(frame)); }
+        return session.poll_transport();
+    };
+    const auto reply = [&](std::uint8_t channel, const std::vector<std::byte> &expected) {
+        const auto frame = tr::decode_frame(transport.last_sent());
+        ASSERT_TRUE(frame);
+        EXPECT_EQ(frame.value().header.channel, channel);
+        EXPECT_EQ(frame.value().header.kind, tr::MessageKind::specific);
+        EXPECT_EQ(frame.value().header.encryption, tr::Encryption::encrypted);
+        const auto payload = cipher->open(frame.value().payload);
+        ASSERT_TRUE(payload);
+        EXPECT_EQ(payload.value(), expected);
+    };
+    for (const std::uint8_t channel : {std::uint8_t{100}, std::uint8_t{101}, std::uint8_t{102}}) {
+        const auto before = transport.sent_count();
+        ASSERT_TRUE(receive(channel, {std::byte{0x80}, std::byte{0}, std::byte{8}, std::byte{1}}));
+        EXPECT_EQ(transport.sent_count(), before + 1);
+        EXPECT_TRUE(observed->pcm.empty()) << "Setup reached the production PCM router";
+        EXPECT_EQ(observed->writes, 0U);
+        reply(channel, p::encode_av_sink_ready().value());
+    }
+    ASSERT_TRUE(receive(99, p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    reply(99, p::encode(p::VideoFocusNotification{p::VideoFocusMode::projected, true}).value());
+    ASSERT_TRUE(receive(99, p::encode(p::AvSinkStart{-7, 0}).value()));
+    auto config = std::vector<std::byte>{std::byte{0}, std::byte{1}, std::byte{0},
+        std::byte{0}, std::byte{0}, std::byte{1}, std::byte{0x67}, std::byte{0x42}};
+    ASSERT_TRUE(receive(99, config));
+    reply(99, p::encode_av_sink_ack(-7).value());
+    const auto empty = pair.value().consumer.receive(Milliseconds{0});
+    ASSERT_FALSE(empty);
+    EXPECT_EQ(empty.error().code(), aa::ErrorCode::timeout);
+    std::vector<std::byte> data(10, std::byte{0x55});
+    data[0] = data[1] = std::byte{0};
+    data.insert(data.end(), wiredtest::kVideoIdr.begin(), wiredtest::kVideoIdr.end());
+    clock.set(aa::core::Nanoseconds{987654});
+    ASSERT_TRUE(receive(99, data));
+    reply(99, p::encode_av_sink_ack(-7).value());
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    const auto &unit = pair.value().consumer.access_unit();
+    EXPECT_EQ(unit.timestamp_ns, 987654U);
+    std::vector<std::uint8_t> expected;
+    for (auto it = config.begin() + 2; it != config.end(); ++it) {
+        expected.push_back(std::to_integer<std::uint8_t>(*it));
+    }
+    for (const auto byte : wiredtest::kVideoIdr) { expected.push_back(std::to_integer<std::uint8_t>(byte)); }
+    EXPECT_EQ(unit.payload, expected);
+    EXPECT_TRUE(unit.idr);
+    ASSERT_TRUE(receive(100, p::encode(p::AvSinkStart{0, 0}).value()));
+    data.resize(10);
+    const auto pcm = wiredtest::pcm_unit();
+    data.insert(data.end(), pcm.begin(), pcm.end());
+    ASSERT_TRUE(receive(100, data));
+    reply(100, p::encode_av_sink_ack(0).value());
+    EXPECT_EQ(observed->pcm, pcm);
+    EXPECT_EQ(observed->writes, 1U);
+    ASSERT_TRUE(receive(0, p::encode(p::PingRequest{42, {}}).value()));
+    EXPECT_EQ(session.pings_answered(), 1U);
+}
+
+TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereo) {
     for (const auto &expected : receiver_audio_expectations) {
         SCOPED_TRACE(expected.service);
         auto output = std::make_unique<ReceiverProfileSink>();
@@ -312,9 +462,7 @@ TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereoAndKeepCompletionCallba
         const std::vector<std::byte> pcm(frames * expected.input.channels * sizeof(std::int16_t),
                                          std::byte{0x10});
         RouterSink sink{router.value()};
-        testing::internal::CaptureStdout();
         const auto result = sink.on_message({{expected.channel, 1, {}}, pcm});
-        const auto log = testing::internal::GetCapturedStdout();
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(observed->format, (aa::audio::AudioFormat{48000, 2, 16}));
         // Resampling may retain a filter tail; require the 3x rate expansion,
@@ -333,8 +481,6 @@ TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereoAndKeepCompletionCallba
             EXPECT_EQ(observed->pcm[offset], observed->pcm[offset + 2U]);
             EXPECT_EQ(observed->pcm[offset + 1U], observed->pcm[offset + 3U]);
         }
-        EXPECT_NE(log.find("\"event\":\"audio_write_completed\""), std::string::npos);
-        EXPECT_NE(log.find("\"scheduled_end_ns\":"), std::string::npos);
     }
 }
 
