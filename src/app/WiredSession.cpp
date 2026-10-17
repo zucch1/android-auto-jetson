@@ -4,6 +4,8 @@
 
 #include <aa/protocol/InputReport.hpp>
 
+#include <algorithm>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -41,7 +43,7 @@ WiredSession::WiredSession(WiredSessionDeps deps, WiredSessionConfig config)
     }
 }
 
-WiredSession::~WiredSession() = default;
+WiredSession::~WiredSession() { reset_owned_av(); }
 
 // ---------------------------------------------------------------------------
 // Session / trust delegation. No approval happens here: the store decides.
@@ -129,6 +131,7 @@ void WiredSession::attach_transport(transport::Transport *transport) noexcept {
 // impossible until attach_cipher() binds a fresh cipher and its handshake
 // completes (channels::Negotiator::reset() contract).
 void WiredSession::reset_link() noexcept {
+    reset_owned_av();
     parser_ = transport::FrameStreamParser{};
     reassembler_ = transport::MessageReassembler{};
     if (negotiator_.has_value()) {
@@ -192,10 +195,41 @@ core::Result<void> WiredSession::register_sink(protocol::ChannelRole role,
     return {};
 }
 
+core::Result<void> WiredSession::register_av_sink(protocol::ChannelRole role,
+                                                  protocol::MessageSink &raw_sink) {
+    if (!negotiator_ || sinks_.contains(role)) { return bad_argument(); }
+    switch (role) {
+    case protocol::ChannelRole::video:
+    case protocol::ChannelRole::media_audio:
+    case protocol::ChannelRole::guidance_audio:
+    case protocol::ChannelRole::system_audio:
+    case protocol::ChannelRole::speech_audio: break;
+    default: return Error{ErrorCode::protocol_unsupported_channel};
+    }
+    const auto service = std::find_if(descriptors_.begin(), descriptors_.end(),
+        [role](const auto &descriptor) { return descriptor.role == role; });
+    if (service == descriptors_.end()) { return not_configured(); }
+    auto wrapper = std::make_unique<channels::AvSink>(*service, raw_sink,
+        [this, role](std::vector<std::byte> payload) {
+            return send_channel_payload(role, std::move(payload));
+        });
+    if (auto registered = registry_.register_sink(role, *wrapper); !registered) {
+        return registered.error();
+    }
+    sinks_.emplace(role, wrapper.get());
+    av_sinks_.emplace(role, std::move(wrapper));
+    return {};
+}
+
+void WiredSession::reset_owned_av() noexcept {
+    for (auto &[role, sink] : av_sinks_) { sink->reset(); }
+}
+
 core::Result<std::size_t> WiredSession::announce_services() {
     if (!negotiator_.has_value()) {
         return not_configured();
     }
+    reset_owned_av();
     return send_payload(negotiator_->start());
 }
 
@@ -312,6 +346,11 @@ core::Result<void> WiredSession::route(const transport::Message &message) {
         return {};
     }
     if (id == static_cast<std::uint16_t>(protocol::ControlMessageId::channel_close_notification)) {
+        for (const auto &descriptor : descriptors_) {
+            if (descriptor.id != service) { continue; }
+            const auto sink = av_sinks_.find(descriptor.role);
+            if (sink != av_sinks_.end()) { sink->second->reset(); }
+        }
         ++channel_closes_;
         return {};
     }
@@ -389,7 +428,7 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         if (!negotiator_.has_value()) {
             return not_configured();
         }
-        if (auto sent = send_payload(negotiator_->start()); !sent) {
+        if (auto sent = announce_services(); !sent) {
             return sent.error();
         }
         return {};
@@ -622,6 +661,10 @@ core::Result<void> WiredSession::send_channel_payload(protocol::ChannelRole role
 }
 
 core::Result<void> WiredSession::submit_input(const ipc::InputEvent &event) {
+    const auto video = av_sinks_.find(protocol::ChannelRole::video);
+    if (video != av_sinks_.end() && !video->second->input_focus_allowed()) {
+        return Error{ErrorCode::channel_unsupported_capability};
+    }
     if (!input_service_.has_value()) {
         return Error{ErrorCode::channel_unsupported_capability};
     }
@@ -700,6 +743,13 @@ void WiredSession::note_state(std::string_view identity_key) {
         return;
     }
     last_state_ = lifecycle_.state();
+    switch (last_state_) {
+    case session::State::reconnecting:
+    case session::State::failed:
+    case session::State::stopping:
+    case session::State::disconnected: reset_owned_av(); break;
+    default: break;
+    }
     emit(identity_key);
 }
 

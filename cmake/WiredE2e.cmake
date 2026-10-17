@@ -35,6 +35,7 @@ set(AA_WIRED_TEST_SOURCES
     tests/wired_e2e/wired_e2e_revoke_test.cpp
     tests/wired_e2e/wired_e2e_failures_test.cpp
     tests/wired_e2e/receiver_test.cpp
+    tests/wired_e2e/av_sink_test.cpp
     tests/wired_e2e/microphone_test.cpp
     tests/wired_e2e/wired_deadline_test.cpp
     tests/wired_e2e/wired_e2e_trust_link_test.cpp
@@ -127,6 +128,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_e2e_trust_link COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eTrustLink.*)
     add_test(NAME wired_e2e_input_wire COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eInputWire.*)
     add_test(NAME wired_e2e_auth COMMAND aa_wired_e2e_test --gtest_filter=WiredE2eAuth.*)
+    add_test(NAME wired_e2e_av_sink COMMAND aa_wired_e2e_test --gtest_filter=WiredAvSink.*:WiredAvRegistration.*)
+    set_tests_properties(wired_e2e_av_sink PROPERTIES TIMEOUT 120)
     add_test(NAME wired_e2e_control COMMAND aa_wired_e2e_test --gtest_filter=WiredControl.*)
     add_test(NAME wired_e2e_microphone COMMAND aa_wired_e2e_test --gtest_filter=WiredMicrophone.*)
     set_tests_properties(wired_e2e_control PROPERTIES TIMEOUT 120)

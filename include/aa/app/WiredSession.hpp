@@ -31,6 +31,7 @@
 // payload is the real AAP InputReport protobuf (protocol::encode_input_report),
 // converted at the input boundary - not the local IPC record.
 
+#include <aa/channels/AvSink.hpp>
 #include <aa/channels/Negotiator.hpp>
 #include <aa/channels/Services.hpp>
 #include <aa/core/Cancellation.hpp>
@@ -144,7 +145,12 @@ class WiredSession final {
     // forwarder, the audio router forwarder). Non-owning; must outlive the
     // session. Registering a role twice is refused.
     [[nodiscard]] core::Result<void> register_sink(protocol::ChannelRole role,
-                                                   protocol::MessageSink &sink);
+                                                    protocol::MessageSink &sink);
+
+    // Own the negotiated AV boundary; raw_sink remains non-owning and receives
+    // only stripped media. Requires a configured AV descriptor for this role.
+    [[nodiscard]] core::Result<void> register_av_sink(protocol::ChannelRole role,
+                                                     protocol::MessageSink &raw_sink);
 
     // Publish the service-discovery response for the configured services and
     // send it over the transport. Returns the number of frames sent.
@@ -205,6 +211,7 @@ class WiredSession final {
     [[nodiscard]] core::Result<void> handle_control(std::span<const std::byte> payload);
     [[nodiscard]] core::Result<void> drive_ssl_handshake();
     void reset_link() noexcept;
+    void reset_owned_av() noexcept;
     [[nodiscard]] core::Result<std::size_t>
     send_payload(const protocol::ServiceDiscoveryResponse &response);
     [[nodiscard]] core::Result<std::size_t>
@@ -229,6 +236,7 @@ class WiredSession final {
     std::vector<protocol::ServiceDescriptor> descriptors_;
     std::optional<channels::Negotiator> negotiator_;
     std::map<protocol::ChannelRole, protocol::MessageSink *> sinks_;
+    std::map<protocol::ChannelRole, std::unique_ptr<channels::AvSink>> av_sinks_;
     transport::FrameStreamParser parser_{};
     transport::MessageReassembler reassembler_{};
     std::unique_ptr<InputForwarder> input_forwarder_{};
