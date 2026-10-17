@@ -109,7 +109,7 @@ class PrivacyTests(PackageTest):
                     'latitude=12.345678', 'longitude=-123.456789',
                     'location=TEST_ONLY_PLACE', 'password=TESTONLY_CREDENTIAL',
                     'Authorization: Bearer TESTONLY_CREDENTIAL',
-                    '-----BEGIN PRIVATE KEY-----',
+                    '-----BEGIN ' + 'PRIVATE KEY-----',
                     'https://test:TESTONLY_CREDENTIAL@example.invalid',
                     '{"mac":"02\\u003a11\\u003a22\\u003a33\\u003a44\\u003a55"}')
         for value in controls:
