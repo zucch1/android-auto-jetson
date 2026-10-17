@@ -82,6 +82,13 @@ struct WiredSessionConfig final {
 
 class WiredSession final {
   public:
+    struct RejectedFrame final {
+        std::uint8_t channel{};
+        std::optional<std::uint16_t> msg_id{};
+        [[nodiscard]] friend bool operator==(const RejectedFrame&,
+                                             const RejectedFrame&) = default;
+    };
+
     WiredSession(WiredSessionDeps deps, WiredSessionConfig config = WiredSessionConfig{});
     ~WiredSession();
 
@@ -178,6 +185,8 @@ class WiredSession final {
         return input_send_failures_;
     }
     [[nodiscard]] std::uint64_t channel_opens() const noexcept { return channel_opens_; }
+    [[nodiscard]] std::uint64_t channel_closes() const noexcept { return channel_closes_; }
+    [[nodiscard]] std::optional<RejectedFrame> last_reject() const noexcept { return last_reject_; }
     [[nodiscard]] std::uint64_t version_responses() const noexcept { return version_responses_; }
     [[nodiscard]] std::uint64_t pings_answered() const noexcept { return pings_answered_; }
     [[nodiscard]] std::uint64_t encapsulated_ssls() const noexcept { return encapsulated_ssls_; }
@@ -203,6 +212,8 @@ class WiredSession final {
     [[nodiscard]] core::Result<std::size_t> send_frames(std::vector<std::byte> payload,
                                                         bool encrypted);
     [[nodiscard]] core::Result<void> forward_input(const input::NormalizedInput &event);
+    [[nodiscard]] core::Result<void> send_service_payload(std::uint8_t channel,
+                                                         std::vector<std::byte> payload);
     [[nodiscard]] std::optional<std::uint8_t> input_channel() const noexcept;
 
     void note_state(std::string_view identity_key = {});
@@ -230,6 +241,8 @@ class WiredSession final {
     std::uint64_t input_sends_{0};
     std::uint64_t input_send_failures_{0};
     std::uint64_t channel_opens_{0};
+    std::uint64_t channel_closes_{0};
+    std::optional<RejectedFrame> last_reject_{};
     std::uint64_t version_responses_{0};
     std::uint64_t pings_answered_{0};
     std::uint64_t encapsulated_ssls_{0};

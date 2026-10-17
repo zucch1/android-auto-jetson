@@ -215,6 +215,10 @@ decode_version_request(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<PingResponse> decode_ping_response(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<ChannelOpenRequest>
 decode_channel_open_request(std::span<const std::byte> payload);
+// Service-channel compatibility only: priority may be absent (defaults to 0).
+// The control-channel decoder above remains strict.
+[[nodiscard]] core::Result<ChannelOpenRequest>
+decode_in_band_channel_open_request(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<ChannelOpenResponse>
 decode_channel_open_response(std::span<const std::byte> payload);
 [[nodiscard]] core::Result<ServiceDiscoveryResponse>
