@@ -124,7 +124,7 @@ TEST(ChannelWireReject, RejectsPlaceholderAndDuplicateProjectConfigurations) {
 
 TEST(ChannelWireReject, RefusesUnqualifiedHardwareAndLocalDiagnosticsOnWire) {
     // Given: no qualified hardware configurations or diagnostics wire kind exist.
-    for (const auto role : {proto::ChannelRole::microphone, proto::ChannelRole::sensors,
+    for (const auto role : {proto::ChannelRole::microphone,
          proto::ChannelRole::bluetooth_projection, proto::ChannelRole::wifi_projection,
          proto::ChannelRole::diagnostics}) {
         // When: a caller tries to advertise a placeholder role.
@@ -133,6 +133,15 @@ TEST(ChannelWireReject, RefusesUnqualifiedHardwareAndLocalDiagnosticsOnWire) {
         ASSERT_FALSE(encoded);
         EXPECT_EQ(encoded.error().code(), aa::ErrorCode::protocol_unsupported_channel);
     }
+}
+
+TEST(ChannelWireReject, NightModeOnlyIsMinimalPhoneRequiredSurfaceButSensorPlaceholderIsMalformed) {
+    // Night-mode-only advertisement adds no vehicle sensors; an unconfigured
+    // sensor role is still invalid, never a default vehicle-sensor capability.
+    const auto encoded = proto::encode(proto::ServiceDiscoveryResponse{{
+        {proto::ServiceKey{105}, proto::ChannelRole::sensors}}});
+    ASSERT_FALSE(encoded);
+    EXPECT_EQ(encoded.error().code(), aa::ErrorCode::protocol_malformed_message);
 }
 
 TEST(ChannelWireReject, RejectsOpenResponseMissingStatusWrongDiscriminatorAndUnsupportedStatus) {

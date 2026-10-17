@@ -137,8 +137,15 @@ struct ButtonConfiguration final {
     [[nodiscard]] friend bool operator==(const ButtonConfiguration &,
                                          const ButtonConfiguration &) = default;
 };
+enum class SensorKind : std::int32_t { night_mode = 10 };
+struct SensorConfiguration final {
+    std::vector<SensorKind> kinds{};
+    [[nodiscard]] friend bool operator==(const SensorConfiguration &,
+                                         const SensorConfiguration &) = default;
+};
 using ServiceConfiguration =
-    std::variant<std::monostate, VideoConfiguration, AudioConfiguration, ButtonConfiguration>;
+    std::variant<std::monostate, VideoConfiguration, AudioConfiguration, ButtonConfiguration,
+                 SensorConfiguration>;
 
 // One advertised channel service. `id` is dynamic (ID space 2); `role` is the
 // semantic role resolved by the session router, never an ordinal.

@@ -25,6 +25,7 @@ add_library(aa_protocol_adapter STATIC
     src/protocol/aasdk_adapter/ServiceAdapter.cpp
     src/protocol/aasdk_adapter/MediaConfiguration.cpp
     src/protocol/aasdk_adapter/InputAdapter.cpp
+    src/protocol/aasdk_adapter/SensorAdapter.cpp
     src/protocol/aasdk_adapter/ChannelAdapter.cpp)
 set_target_properties(aa_protocol_adapter PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO
@@ -42,6 +43,7 @@ endif()
 
 set(AA_PROTOCOL_TEST_SOURCES
     tests/protocol/messages_roundtrip_test.cpp
+    tests/protocol/sensor_configuration_test.cpp
     tests/protocol/messages_reject_test.cpp
     tests/protocol/channel_map_test.cpp)
 foreach(source IN LISTS AA_PROTOCOL_TEST_SOURCES)

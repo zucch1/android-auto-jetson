@@ -5,11 +5,14 @@
 
 #include <aap_protobuf/service/media/shared/message/MediaCodecType.pb.h>
 #include <aap_protobuf/service/media/sink/message/AudioStreamType.pb.h>
+#include <aap_protobuf/service/sensorsource/message/SensorType.pb.h>
 
 namespace aa::protocol::aasdk_adapter {
 namespace media = aap_protobuf::service::media;
 namespace sink = media::sink::message;
 namespace shared = media::shared::message;
+namespace sensor = aap_protobuf::service::sensorsource::message;
+static_assert(sensor::SENSOR_NIGHT_MODE == 10);
 
 namespace {
 
@@ -46,6 +49,23 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
         return malformed();
     }
     switch (role) {
+    case ChannelRole::sensors: {
+        const auto& wire = entry.sensor_source_service();
+        constexpr int service_tags[] = {1, 2, 3, 4};
+        constexpr int sensor_tags[] = {1};
+        if (rejects_unknown(wire, service_tags) || wire.sensors_size() != 1
+            || wire.has_location_characterization() || wire.supported_fuel_types_size() != 0
+            || wire.supported_ev_connector_types_size() != 0) {
+            return malformed();
+        }
+        SensorConfiguration config;
+        for (const auto& item : wire.sensors()) {
+            if (rejects_unknown(item, sensor_tags) || !item.has_sensor_type()
+                || item.sensor_type() != sensor::SENSOR_NIGHT_MODE) { return malformed(); }
+            config.kinds.push_back(SensorKind::night_mode);
+        }
+        return ServiceConfiguration{std::move(config)};
+    }
     case ChannelRole::input: {
         const auto& input = entry.input_source_service();
         if (rejects_unknown(input, kInputSourceServiceTags)
@@ -105,7 +125,6 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
         return ServiceConfiguration{std::move(config)};
     }
     case ChannelRole::microphone:
-    case ChannelRole::sensors:
     case ChannelRole::bluetooth_projection:
     case ChannelRole::wifi_projection:
     case ChannelRole::diagnostics:
@@ -118,6 +137,13 @@ core::Result<void> put_configuration(aap_protobuf::service::Service& entry,
                                     const ServiceDescriptor& descriptor) {
     if (const auto valid = validate_service(descriptor); !valid) { return valid.error(); }
     switch (descriptor.role) {
+    case ChannelRole::sensors:
+        for (const auto kind : std::get<SensorConfiguration>(descriptor.configuration).kinds) {
+            if (kind != SensorKind::night_mode) { return malformed(); }
+            entry.mutable_sensor_source_service()->add_sensors()->set_sensor_type(
+                sensor::SENSOR_NIGHT_MODE);
+        }
+        return {};
     case ChannelRole::video: {
         auto* wire = entry.mutable_media_sink_service();
         wire->set_available_type(shared::MEDIA_CODEC_VIDEO_H264_BP);
@@ -157,7 +183,6 @@ core::Result<void> put_configuration(aap_protobuf::service::Service& entry,
         }
         return {};
     case ChannelRole::microphone:
-    case ChannelRole::sensors:
     case ChannelRole::bluetooth_projection:
     case ChannelRole::wifi_projection:
     case ChannelRole::diagnostics:
