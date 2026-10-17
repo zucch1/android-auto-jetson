@@ -13,6 +13,85 @@ namespace ss = aa::session;
 namespace tr = aa::transport;
 using wiredcontrol::WiredControl;
 
+TEST_F(WiredControl, InBandChannelOpenResponsesUseEncryptedControlKind) {
+    wiredtest::RecordingSink sink;
+    ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, sink));
+    ASSERT_TRUE(session.announce_services());
+    for (const auto channel : {std::uint8_t{99}, std::uint8_t{102}}) {
+        SCOPED_TRACE(static_cast<unsigned>(channel));
+        auto payload = proto::encode(proto::ChannelOpenRequest{1, proto::ServiceKey{channel}});
+        ASSERT_TRUE(payload);
+        auto frames = tr::encode_message({channel, tr::MessageKind::control,
+                                          std::move(payload).value()},
+                                         tr::Encryption::encrypted, cipher);
+        ASSERT_TRUE(frames);
+        for (auto& frame : frames.value()) { transport.push_inbound(std::move(frame)); }
+        const auto before = transport.sent_count();
+        const auto received = session.poll_transport();
+        ASSERT_TRUE(received);
+        EXPECT_TRUE(received.value());
+        ASSERT_EQ(transport.sent_count(), before + 1);
+        const auto& wire = transport.last_sent();
+        ASSERT_GE(wire.size(), 2u);
+        EXPECT_EQ(wire[1], std::byte{0x0f});
+        const auto frame = tr::decode_frame(wire);
+        ASSERT_TRUE(frame);
+        EXPECT_EQ(frame.value().header.channel, channel);
+        EXPECT_EQ(frame.value().header.kind, tr::MessageKind::control);
+        EXPECT_EQ(frame.value().header.encryption, tr::Encryption::encrypted);
+        const auto opened = cipher->open(frame.value().payload);
+        ASSERT_TRUE(opened);
+        const auto reply = proto::decode_channel_open_response(opened.value());
+        ASSERT_TRUE(reply);
+        EXPECT_EQ(reply.value().status, channel == 99 ? proto::ChannelOpenStatus::success
+                                                    : proto::ChannelOpenStatus::unsupported);
+    }
+    EXPECT_TRUE(sink.payloads.empty());
+}
+
+TEST_F(WiredControl, ChannelZeroOpenResponseRemainsEncryptedSpecific) {
+    wiredtest::RecordingSink sink;
+    ASSERT_TRUE(session.register_sink(proto::ChannelRole::video, sink));
+    ASSERT_TRUE(session.announce_services());
+    auto payload = proto::encode(proto::ChannelOpenRequest{1, proto::ServiceKey{99}});
+    ASSERT_TRUE(payload);
+    const auto before = transport.sent_count();
+    ASSERT_TRUE(receive(std::move(payload).value()));
+    ASSERT_EQ(transport.sent_count(), before + 1);
+    const auto& wire = transport.last_sent();
+    ASSERT_GE(wire.size(), 2u);
+    EXPECT_EQ(wire[1], std::byte{0x0b});
+    const auto frame = tr::decode_frame(wire);
+    ASSERT_TRUE(frame);
+    EXPECT_EQ(frame.value().header.channel, 0);
+    EXPECT_EQ(frame.value().header.kind, tr::MessageKind::specific);
+    EXPECT_EQ(frame.value().header.encryption, tr::Encryption::encrypted);
+    const auto opened = cipher->open(frame.value().payload);
+    ASSERT_TRUE(opened);
+    const auto reply = proto::decode_channel_open_response(opened.value());
+    ASSERT_TRUE(reply);
+    EXPECT_EQ(reply.value().status, proto::ChannelOpenStatus::success);
+}
+
+TEST_F(WiredControl, OrdinaryServicePayloadRemainsEncryptedSpecific) {
+    const std::vector<std::byte> payload{std::byte{0x80}, std::byte{0x03}, std::byte{0x08},
+                                         std::byte{0x01}};
+    const auto before = transport.sent_count();
+    ASSERT_TRUE(session.send_channel_payload(proto::ChannelRole::video, payload));
+    ASSERT_EQ(transport.sent_count(), before + 1);
+    const auto& wire = transport.last_sent();
+    ASSERT_GE(wire.size(), 2u);
+    EXPECT_EQ(wire[1], std::byte{0x0b});
+    const auto frame = tr::decode_frame(wire);
+    ASSERT_TRUE(frame);
+    EXPECT_EQ(frame.value().header.channel, 99);
+    EXPECT_EQ(frame.value().header.kind, tr::MessageKind::specific);
+    EXPECT_EQ(frame.value().header.encryption, tr::Encryption::encrypted);
+    const auto opened = cipher->open(frame.value().payload);
+    ASSERT_TRUE(opened);
+    EXPECT_EQ(opened.value(), payload);
+}
+
 TEST_F(WiredControl, Unknown255ThenPingInSameReceiveContinues) {
     auto combined = wiredtest::control_frame({std::byte{0}, std::byte{255}});
     auto ping = proto::encode(proto::PingRequest{9876, false, {std::byte{0x77}}});

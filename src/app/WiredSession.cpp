@@ -304,7 +304,8 @@ core::Result<void> WiredSession::route(const transport::Message &message) {
         }
         auto payload = protocol::encode(response);
         if (!payload) { return payload.error(); }
-        if (auto sent = send_service_payload(message.channel, std::move(payload).value()); !sent) {
+        if (auto sent = send_service_payload(message.channel, std::move(payload).value(),
+                                              transport::MessageKind::control); !sent) {
             return sent.error();
         }
         if (response.status == protocol::ChannelOpenStatus::success) { ++channel_opens_; }
@@ -596,11 +597,12 @@ core::Result<std::size_t> WiredSession::send_frames(std::vector<std::byte> paylo
 // ---------------------------------------------------------------------------
 
 core::Result<void> WiredSession::send_service_payload(std::uint8_t channel,
-                                                       std::vector<std::byte> payload) {
+                                                       std::vector<std::byte> payload,
+                                                       transport::MessageKind kind) {
     if (!authenticated()) { return Error{ErrorCode::transport_unauthorized_peer}; }
-    // D19 keeps the kind bit clear for Samsung framers, deliberately diverging
-    // from AASDK's CONTROL-kind sendChannelOpenResponse on service channels.
-    transport::Message message{channel, transport::MessageKind::specific, std::move(payload)};
+    // Service open replies use CONTROL; ordinary service payloads stay SPECIFIC.
+    // D19's SPECIFIC evidence applies to control channel 0, not service opens.
+    transport::Message message{channel, kind, std::move(payload)};
     auto frames = transport::encode_message(message, transport::Encryption::encrypted, cipher_.get());
     if (!frames) { return frames.error(); }
     for (const auto& frame : frames.value()) {

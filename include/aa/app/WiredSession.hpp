@@ -214,7 +214,9 @@ class WiredSession final {
                                                         bool encrypted);
     [[nodiscard]] core::Result<void> forward_input(const input::NormalizedInput &event);
     [[nodiscard]] core::Result<void> send_service_payload(std::uint8_t channel,
-                                                         std::vector<std::byte> payload);
+                                                         std::vector<std::byte> payload,
+                                                         transport::MessageKind kind =
+                                                             transport::MessageKind::specific);
     [[nodiscard]] std::optional<std::uint8_t> input_channel() const noexcept;
 
     void note_state(std::string_view identity_key = {});
