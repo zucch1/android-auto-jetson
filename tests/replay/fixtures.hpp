@@ -145,7 +145,7 @@ inline const std::vector<std::byte> kPcmOne =
     make_bytes({0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80});
 
 inline constexpr std::string_view kGoldenFixtureSha256 =
-    "1b7f939d4174424212a3ee0da1fca74b678980bdba2523f5560e79ec08683e48";
+    "a94925416b951766220fd065f96864f16d4037204858a47735d94df5af235422";
 
 // Hand-written expected output trace for the golden scenario.
 inline replay::Expectation golden_expectation() {

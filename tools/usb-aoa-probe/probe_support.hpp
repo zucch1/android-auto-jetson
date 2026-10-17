@@ -46,47 +46,124 @@ class SysfsReader {
     [[nodiscard]] virtual std::string read_file(const std::string &path) = 0;
 };
 
-// JSON string content escaping (gate P2-3): quote, backslash and control
-// characters become \" \\ \u00XX so device-supplied text can never inject
-// structure into the evidence document.
+// Strict UTF-8 sequence length (RFC 3629) of the sequence starting at
+// `bytes[index]`: 2..4 byte forms only - no overlong encodings, no surrogate
+// halves (U+D800..U+DFFF), nothing past U+10FFFF. Returns 0 when the bytes at
+// `index` do NOT form one valid sequence (stray continuation byte, bad lead,
+// bad or truncated tail).
+[[nodiscard]] inline std::size_t utf8_sequence_length(const unsigned char *bytes, std::size_t size,
+                                                      std::size_t index) {
+    const int lead = bytes[index];
+    const auto continuation = [&](std::size_t offset, int low, int high) {
+        return index + offset < size && static_cast<int>(bytes[index + offset]) >= low &&
+               static_cast<int>(bytes[index + offset]) <= high;
+    };
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        return continuation(1, 0x80, 0xBF) ? 2 : 0;
+    }
+    if (lead == 0xE0) {
+        return (continuation(1, 0xA0, 0xBF) && continuation(2, 0x80, 0xBF)) ? 3 : 0;
+    }
+    if (lead >= 0xE1 && lead <= 0xEC) {
+        return (continuation(1, 0x80, 0xBF) && continuation(2, 0x80, 0xBF)) ? 3 : 0;
+    }
+    if (lead == 0xED) {
+        return (continuation(1, 0x80, 0x9F) && continuation(2, 0x80, 0xBF)) ? 3 : 0;
+    }
+    if (lead >= 0xEE && lead <= 0xEF) {
+        return (continuation(1, 0x80, 0xBF) && continuation(2, 0x80, 0xBF)) ? 3 : 0;
+    }
+    if (lead == 0xF0) {
+        return (continuation(1, 0x90, 0xBF) && continuation(2, 0x80, 0xBF) &&
+                continuation(3, 0x80, 0xBF))
+                   ? 4
+                   : 0;
+    }
+    if (lead >= 0xF1 && lead <= 0xF3) {
+        return (continuation(1, 0x80, 0xBF) && continuation(2, 0x80, 0xBF) &&
+                continuation(3, 0x80, 0xBF))
+                   ? 4
+                   : 0;
+    }
+    if (lead == 0xF4) {
+        return (continuation(1, 0x80, 0x8F) && continuation(2, 0x80, 0xBF) &&
+                continuation(3, 0x80, 0xBF))
+                   ? 4
+                   : 0;
+    }
+    return 0;
+}
+
+// JSON string content escaping (gate P2-3 + fix round P2-1). The guarantee:
+// for ANY input bytes the result is a valid UTF-8 JSON string body.
+//   - quote, backslash and control characters become \" \\ \u00XX (structure
+//     injection is impossible);
+//   - valid UTF-8 sequences (including multibyte characters) pass through
+//     UNCHANGED and therefore round-trip exactly - never naive per-byte
+//     \u00XX, which would mojibake them;
+//   - every byte that is not part of a valid UTF-8 sequence is replaced with
+//     U+FFFD (\ufffd), one per offending byte, so hostile non-UTF-8 argv or
+//     device text can never make the document unparseable.
 [[nodiscard]] inline std::string json_escape(std::string_view text) {
     std::string out;
     out.reserve(text.size() + 8);
     constexpr char digits[] = "0123456789abcdef";
-    for (const char character : text) {
-        const auto byte = static_cast<unsigned char>(character);
+    const auto *bytes = reinterpret_cast<const unsigned char *>(text.data());
+    std::size_t index = 0;
+    while (index < text.size()) {
+        const auto byte = bytes[index];
         switch (byte) {
         case '"':
             out += "\\\"";
-            break;
+            ++index;
+            continue;
         case '\\':
             out += "\\\\";
-            break;
+            ++index;
+            continue;
         case '\b':
             out += "\\b";
-            break;
+            ++index;
+            continue;
         case '\f':
             out += "\\f";
-            break;
+            ++index;
+            continue;
         case '\n':
             out += "\\n";
-            break;
+            ++index;
+            continue;
         case '\r':
             out += "\\r";
-            break;
+            ++index;
+            continue;
         case '\t':
             out += "\\t";
-            break;
+            ++index;
+            continue;
         default:
-            if (byte < 0x20U || byte == 0x7FU) {
-                out += "\\u00";
-                out.push_back(digits[(byte >> 4U) & 0xFU]);
-                out.push_back(digits[byte & 0xFU]);
-            } else {
-                out.push_back(character);
-            }
             break;
         }
+        if (byte < 0x20U || byte == 0x7FU) {
+            out += "\\u00";
+            out.push_back(digits[(byte >> 4U) & 0xFU]);
+            out.push_back(digits[byte & 0xFU]);
+            ++index;
+            continue;
+        }
+        if (byte < 0x80U) {
+            out.push_back(static_cast<char>(byte));
+            ++index;
+            continue;
+        }
+        const std::size_t length = utf8_sequence_length(bytes, text.size(), index);
+        if (length == 0) {
+            out += "\\ufffd";
+            ++index;
+            continue;
+        }
+        out.append(text.data() + index, length);
+        index += length;
     }
     return out;
 }

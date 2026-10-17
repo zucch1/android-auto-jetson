@@ -116,35 +116,39 @@ inline const std::vector<std::byte> F_D_service_discovery_request_frame =
 //   Service.f1 id = 99        -> 08 63
 //   Service.f3 media_sink     -> 1A 0A
 //     MediaSink.f1 available_type = H264_BP(3) -> 08 03
-//     MediaSink.f4 video_configs  -> 22 06
+//     MediaSink.f4 video_configs  -> 22 09
 //       VideoConfig.f1 resolution = 1280x720(2) -> 08 02
 //       VideoConfig.f2 fps        = 30(2)       -> 10 02
+//       VideoConfig.f5 density    = 160         -> 28 A0 01
 //       VideoConfig.f10 codec     = H264_BP(3)  -> 50 03
-// Response.f1 channels -> 0A 10 wrapping the 14-byte Service
-// (Service body = 08 63 1A 0A 08 03 22 06 08 02 10 02 50 03 = 14 bytes).
+// Response.f1 channels -> 0A 11 wrapping the 17-byte Service
+// (Service body = 08 63 1A 0D 08 03 22 09 08 02 10 02 28 A0 01 50 03 = 17 bytes).
 // Enum values match BOTH rulebooks (matrix R04): resolution 2 = 1280x720,
-// fps 2 = 30, codec 3 = H264_BP.
+// fps 2 = 30, codec 3 = H264_BP. Density is baseline UI scaling, not a
+// physical measurement.
 // ---------------------------------------------------------------------------
 inline const std::vector<std::byte> F_E_service_discovery_response_payload =
     bytes({0x00, 0x06,
-           0x0A, 0x0E,
+           0x0A, 0x11,
              0x08, 0x63,
-             0x1A, 0x0A,
+             0x1A, 0x0D,
                0x08, 0x03,
-               0x22, 0x06,
+               0x22, 0x09,
                  0x08, 0x02,
                  0x10, 0x02,
+                 0x28, 0xA0, 0x01,
                  0x50, 0x03});
 inline const std::vector<std::byte> F_E_service_discovery_response_frame =
-    bytes({0x00, 0x07, 0x00, 0x12,
+    bytes({0x00, 0x07, 0x00, 0x15,
            0x00, 0x06,
-           0x0A, 0x0E,
+           0x0A, 0x11,
              0x08, 0x63,
-             0x1A, 0x0A,
+             0x1A, 0x0D,
                0x08, 0x03,
-               0x22, 0x06,
+               0x22, 0x09,
                  0x08, 0x02,
                  0x10, 0x02,
+                 0x28, 0xA0, 0x01,
                  0x50, 0x03});
 
 // ---------------------------------------------------------------------------

@@ -27,6 +27,13 @@ inline constexpr std::uint8_t kAoaRequestOut = 0x40;
 inline constexpr std::uint16_t kAoaProtocolLength = 2;
 inline constexpr unsigned kAoaControlTimeoutMs = 2000;
 
+// AOA SEND_STRING wire limit: one accessory string is at most 256 bytes ON THE
+// WIRE including the NUL terminator (AOA 2.0 accessory string parameter max),
+// so at most 255 printable ASCII characters. This is tighter than the identity
+// field budget (trust::kMaxIdentityFieldBytes) and is the bound that governs.
+inline constexpr std::size_t kAoaStringMaxChars = 255;
+inline constexpr std::size_t kAoaStringMaxWireBytes = 256;
+
 // The SEND_STRING wIndex order mandated by the AOA spec (and the probe).
 inline constexpr std::uint16_t kAoaStringManufacturer = 0;
 inline constexpr std::uint16_t kAoaStringModel = 1;
@@ -69,7 +76,9 @@ class AoaControlChannel {
 [[nodiscard]] core::Result<void>
 run_aoa_switch(AoaControlChannel &channel, const AoaAccessoryInfo &info, AoaSwitchReport &report);
 
-// The NUL-terminated ASCII payload one SEND_STRING step carries.
+// The NUL-terminated ASCII payload one SEND_STRING step carries. Rejects text
+// over kAoaStringMaxChars or outside printable ASCII with invalid_argument;
+// the payload (text + NUL) then always fits kAoaStringMaxWireBytes.
 [[nodiscard]] core::Result<std::vector<std::byte>> aoa_string_payload(const std::string &text);
 
 } // namespace aa::transport::usb_adapter

@@ -131,7 +131,7 @@ TEST_F(SensorWire, UnclaimedIdsAreCountedWithoutReplyOrBodyParsing) {
 TEST_F(SensorWire, SendFailuresPropagateWithoutSendingBatchAfterFailedResponse) {
     unsigned attempts = 0;
     aa::channels::SensorSink sink{aa::input::CapabilityDescriptor::bench_defaults(),
-        [&attempts](std::vector<std::byte>) -> aa::core::Result<void> {
+        [&attempts](const std::vector<std::byte>&) -> aa::core::Result<void> {
             ++attempts;
             return aa::Error{aa::ErrorCode::transport_io};
         }};

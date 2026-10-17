@@ -1,6 +1,6 @@
 {
   "schema": "aa-capability-gate/1",
-  "generated_at_utc": "2026-10-11T09:31:37Z",
+  "generated_at_utc": "2026-10-13T05:19:12Z",
   "report_stage": "continuation",
   "target": {
     "architecture": "aarch64",
@@ -446,7 +446,7 @@
     {
       "id": "wireless",
       "classification": "owner-signed-reduced-scope",
-      "summary": "UNII-1 5 GHz AP (ch 44, 20 MHz), isolated client-association and the AP-startup release budget are demonstrated (qual-run-1/5/6, qual-client-assoc, qual-ht20-test receipts); the session-reconnect release budget stays unmeasured (the 2026-10-11 window exercised infrastructure-STA recovery, not the receiver-hosted AA session transport). Channel-36 wording is a 2026-10-11 owner-signed re-scope (the vendor driver forces a CSA 36->44) and is not silently passed. BlueZ ProfileManager/Agent registration succeeded with clean unregister and unchanged adapter state. The 3.009 s event-loop observation is NOT a strict 3 s deadline pass. AP mode advertisement is not AP operation.",
+      "summary": "UNII-1 5 GHz AP (ch 44, 20 MHz), isolated client-association and the AP-startup release budget are demonstrated (qual-run-1/5/6, qual-client-assoc, qual-ht20-test receipts). The session-reconnect release budget remains UNMEASURED: qual-run-7 captured a WiFi+ADB proxy recovery chain only (31.715 s worst contract-aligned / 29.233 s from radio-on; both exceed 15 s) - the session-contract endpoint (renegotiation to State::active) was not exercised. Claim 3 stays withdrawn/open. Channel-36 wording is a 2026-10-11 owner-signed re-scope (the vendor driver forces a CSA 36->44) and is not silently passed. BlueZ ProfileManager/Agent registration succeeded with clean unregister and unchanged adapter state. The 3.009 s event-loop observation is NOT a strict 3 s deadline pass. AP mode advertisement is not AP operation.",
       "evidence": [
         {
           "name": "task-12-bluez-lightweight.json",
@@ -503,6 +503,30 @@
         {
           "name": "task-12-fix/qual-run-6/claim3-qual-v2.sh",
           "sha256": "c931250c5cfd8d34265beb7083b2ed1b4847ad95c3fd4d6ca6f683b27baa2053"
+        },
+        {
+          "name": "task-12-fix/qual-run-7/qual-receipt-run-7.md",
+          "sha256": "43ec71e6bb35978f2509c4cd201bc0aa5509602ba1057ffc4f0f95cf12d776e3"
+        },
+        {
+          "name": "task-12-fix/qual-run-7/qual-receipt-run-7.json",
+          "sha256": "f992748e263ab670d7ce6760ac597d850d2ad6b61e3e1cdfea40a16c4a5edbee"
+        },
+        {
+          "name": "task-12-fix/qual-run-7/qual-log-run-7.txt",
+          "sha256": "6169d09a0590d627ac821b614fb096d2d8d0b0bef6392d6a117397add96ed282"
+        },
+        {
+          "name": "task-12-fix/qual-run-7/journal-raw-run-7.txt",
+          "sha256": "ad64d49a9f218c4c6556d18939221743989945faf10e334ea24b617419ded5d1"
+        },
+        {
+          "name": "task-12-fix/qual-run-7/session-qual-v7.1.sh",
+          "sha256": "664cad455641452fb4e411ce95f211467c79668dffceaa0e9df9892c454b0abd"
+        },
+        {
+          "name": "task-12-fix/qual-run-7/qual-results-run-7.json",
+          "sha256": "1592bbb5d4a2e5097c136174c03b627d338d59d9401a13b5bd4ef29e234d3851"
         }
       ],
       "measurements": {
@@ -524,9 +548,11 @@
         "claim_1_text": "Completed onboard RTL8822CE UNII-1 5 GHz AP qualification (ch 44, 20 MHz) at the early capability gate",
         "claim_1_status": "demonstrated (qual-run-1, qual-run-5, qual-ht20-test)",
         "claim_2_status": "demonstrated (qual-client-assoc)",
-        "claim_3_status": "open (withdrawn): ap_startup_s measured 4.223 s <= 5.0 s at its stated trigger (modprobe-start -> AP-ENABLED, receiver-hosted aa-qual-44 AP); session_reconnect_s NOT measured - the 2026-10-11 window exercised infrastructure-STA RF-kill recovery (4.139 s, recorded separately), which is not the receiver-hosted AA session transport",
+        "claim_3_status": "open (withdrawn): ap_startup_s 4.223 s <= 5.0 s PASS (qual-run-6). session_reconnect_s remains UNMEASURED: the 2026-10-13 window captured only a WiFi-reassociation + adb-over-WiFi PROXY chain (qual-run-7: 31.715 s worst from link-loss-aligned onset; 29.233 s from radio-on - a diagnostic), not the session-contract endpoint (transport restoration + renegotiation to State::active, src/session/Lifecycle.cpp). Both proxy clocks exceed 15 s. Closing claim 3 needs either a real AA session-recovery capture or an owner-signed budget withdrawal naming a miss",
         "ap_startup_s": 4.223,
-        "infra_sta_rfkill_reconnect_s": 4.139
+        "infra_sta_rfkill_reconnect_s": 4.139,
+        "wifi_adb_proxy_recovery_s": 31.715,
+        "wifi_adb_proxy_recovery_from_radio_on_s": 29.233
       },
       "budgets": [
         {

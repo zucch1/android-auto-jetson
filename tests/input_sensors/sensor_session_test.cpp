@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #define main sensor_test_receiver_main
-#include "../../tools/wired-receiver/main.cpp"
+#include "../../tools/wired-receiver/main.cpp" // NOLINT(bugprone-suspicious-include)
 #undef main
 
 #include "../wired_e2e/harness.hpp"

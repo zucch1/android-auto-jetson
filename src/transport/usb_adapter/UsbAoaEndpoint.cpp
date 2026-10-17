@@ -228,10 +228,10 @@ core::Result<void> admit_wired_identity(const trust::WiredIdentity &identity,
 }
 
 core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
-                                     const UsbDeviceSelector &selector,
-                                     const AoaAccessoryInfo &info, const WiredAdmission &admit,
-                                     const core::Deadline &deadline,
-                                     trust::WiredIdentity *attempted_identity) {
+                                      const UsbDeviceSelector &selector,
+                                      const AoaAccessoryInfo &info, const WiredAdmission &admit,
+                                      const core::Deadline &deadline,
+                                      trust::WiredIdentity *attempted_identity) {
     // The admission callback is the one seam that sees the CAPTURED identity of
     // a refused attempt: record it there so callers can attribute the rejection
     // (additive out-param; the admission decision itself is unchanged).

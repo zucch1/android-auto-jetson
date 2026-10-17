@@ -139,3 +139,57 @@ TEST(ReceiverTiming, ActualSocketBackpressureContributesToOutletDrops) {
     ASSERT_TRUE(std::regex_search(output, match, std::regex{"\"frame_drops\":([1-9][0-9]*)"}));
     EXPECT_GT(std::stoull(match[1].str()), 0U);
 }
+
+TEST(ReceiverTiming, CurrentPcmProfilesEmitCompletionAndFlushOnlyOnce) {
+    // Given the production media and resampled voice profiles.
+    for (const auto role : {aa::protocol::ChannelRole::media_audio,
+                            aa::protocol::ChannelRole::guidance_audio,
+                            aa::protocol::ChannelRole::system_audio}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        auto router = aa::audio::detail::open_router_with_sink_for_test(
+            pcm_router_config(), std::make_unique<LatePeakSink>());
+        ASSERT_TRUE(router);
+        const auto voice = role != aa::protocol::ChannelRole::media_audio;
+        const std::vector<std::byte> pcm(voice ? 640 : 3840, std::byte{1});
+        const auto start = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        testing::internal::CaptureStdout();
+        {
+            RouterSink sink{router.value()};
+            // When real PCM is delivered, then explicitly finalized before destruction.
+            EXPECT_TRUE(sink.on_message({{role, 1, {start}}, pcm}));
+            sink.finish();
+            sink.finish();
+        }
+        const auto output = testing::internal::GetCapturedStdout();
+        // Then every path reports a real write interval and exactly one final flush.
+        std::smatch completion;
+        ASSERT_TRUE(std::regex_search(output, completion, std::regex{
+            "\"event\":\"audio_write_completed\",\"scheduled_ns\":([0-9]+),"
+            "\"scheduled_end_ns\":([0-9]+),\"completed_ns\":([0-9]+)"})) << output;
+        EXPECT_EQ(std::stoll(completion[1].str()), start);
+        EXPECT_GT(std::stoll(completion[2].str()), start);
+        EXPECT_LE(std::stoll(completion[2].str()), start + 20'000'000);
+        EXPECT_GE(std::stoll(completion[3].str()), start);
+        const std::regex timing{"\"event\":\"media_timing\""};
+        EXPECT_EQ(std::distance(std::sregex_iterator(output.begin(), output.end(), timing),
+                                std::sregex_iterator()), 2);
+        EXPECT_NE(output.find("\"audio_scheduling_skew_ms\":"), std::string::npos);
+        EXPECT_EQ(output.find("\"av_sync_ms\":"), std::string::npos);
+    }
+}
+
+TEST(ReceiverTiming, EmptyRouteDoesNotInventFinalTiming) {
+    // Given an opened route without any delivered PCM.
+    auto router = aa::audio::detail::open_router_with_sink_for_test(
+        pcm_router_config(), std::make_unique<LatePeakSink>());
+    ASSERT_TRUE(router);
+    testing::internal::CaptureStdout();
+    {
+        RouterSink sink{router.value()};
+        // When shutdown finalizes the untouched route.
+        sink.finish();
+    }
+    // Then neither audio delivery nor timing is fabricated.
+    EXPECT_TRUE(testing::internal::GetCapturedStdout().empty());
+}

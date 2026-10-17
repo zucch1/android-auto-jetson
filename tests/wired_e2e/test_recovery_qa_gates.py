@@ -5,6 +5,7 @@
 # dependencies = []
 # ///
 # Run: python3 -B tests/wired_e2e/test_recovery_qa_gates.py <path-to-run-wired-recovery-qa.sh>
+# noqa: SIZE_OK - one hermetic harness CLI regression suite; two-file task scope precludes extraction.
 """Script-level gate regressions for tools/wired-qa/run-wired-recovery-qa.sh.
 
 A fake `ssh` shim is placed on PATH and scripted through environment variables so
@@ -54,6 +55,9 @@ case "$cmd" in
 esac
 if (( stimulus )) && [ ! -f "$state/stimulus" ]; then
     touch "$state/stimulus"
+    if [ "${FAKE_REAL_LOG:-0}" = 1 ]; then
+        printf '%s\n' '{"kind":"reconnect","phone_id":"id-approved"}' >> "$state/receiver.log"
+    fi
     [ -z "${FAKE_FIRST_DELAY:-}" ] || sleep "$FAKE_FIRST_DELAY"
 fi
 case "$cmd" in
@@ -90,6 +94,38 @@ case "$cmd" in
         [ "${FAKE_SSH_FAIL:-0}" = "1" ] && exit 255
         exit 0 ;;
 esac
+if [ "${FAKE_REAL_LOG:-0}" = 1 ]; then
+    case "$cmd" in
+        *nohup*aa-wired-receiver.log*)
+            printf '%s\n' '{"event":"diag","phone_id":"id-approved"}' > "$state/receiver.log" ;;
+        *'"event":"status"'*)
+            if [ ! -f "$state/stimulus" ]; then
+                printf '%s\n' '{"event":"media_timing"}' '{"event":"audio_chunks"}' \
+                    '{"event":"input_forwarded","ok":"true"}' >> "$state/receiver.log"
+            fi ;;
+        *"key a press"*)
+            if [ "${FAKE_FRESH_AUDIO:-1}" = 1 ]; then
+                printf '%s\n' '{"event":"media_timing"}' '{"event":"audio_chunks"}' >> "$state/receiver.log"
+            fi
+            if [ "${FAKE_FRESH_INPUT:-1}" = 1 ]; then
+                printf '%s\n' '{"event":"input_forwarded","ok":"true"}' >> "$state/receiver.log"
+            fi ;;
+    esac
+    case "$cmd" in
+        *'wc -c'*|*'tail -c +'*aa-wired-receiver.log*)
+            if [[ "$cmd" == *'wc -c'* ]]; then
+                phase=pre
+                [ ! -f "$state/stimulus" ] || phase=post
+                if [ "${FAKE_BOUNDARY_PHASE:-}" = "$phase" ]; then
+                    [ -z "${FAKE_BOUNDARY_DELAY:-}" ] || sleep "$FAKE_BOUNDARY_DELAY"
+                    printf '%s' "${FAKE_BOUNDARY_OUTPUT:-}"
+                    exit "${FAKE_BOUNDARY_RC:-0}"
+                fi
+            fi
+            bash -c "${cmd//\/tmp\/aa-wired-receiver.log/$state/receiver.log}"
+            exit $? ;;
+    esac
+fi
 case "$cmd" in
     *idVendor*|*idProduct*) printf '%s' "${FAKE_PHONE:-04e8:6860}"; exit 0 ;;
     *"/sys/class/drm"*) printf '%s\n' "${FAKE_DISPLAY:-connected}"; exit 0 ;;
@@ -108,9 +144,11 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
     # carry no media tokens). The wrong-marker arms (audio_chunks / bare
     # input_forwarded) model the pre-P2-G defect shape: a gate that regressed
     # to presence greps lands there, so the per-conjunct pins can prove it.
+    *'"event":"media_timing"'*'"event":"audio_chunks"'*)
+        [ "${FAKE_MEDIA_TIMING:-0}" = "1" ] && [ "${FAKE_AUDIO_CHUNKS:-1}" = "1" ] && exit 0 || exit 1 ;;
     *'"event":"media_timing"'*) [ "${FAKE_MEDIA_TIMING:-0}" = "1" ] && exit 0 || exit 1 ;;
     *'"event":"input_forwarded","ok":"true"'*) [ "${FAKE_INPUT_OK:-0}" = "1" ] && exit 0 || exit 1 ;;
-    *audio_chunks*) [ "${FAKE_AUDIO_CHUNKS:-0}" = "1" ] && exit 0 || exit 1 ;;
+    *audio_chunks*) [ "${FAKE_AUDIO_CHUNKS:-1}" = "1" ] && exit 0 || exit 1 ;;
     *'input_forwarded'*) [ "${FAKE_INPUT_ANY:-0}" = "1" ] && exit 0 || exit 1 ;;
     *'tail -c +'*aa-wired-receiver-attempt.log*) printf '%s' "${FAKE_ATTEMPT_LOG:-}"; exit 0 ;;
     *'tail -c +'*) printf '%s' "${FAKE_LOG_WINDOW:-}"; exit 0 ;;
@@ -236,6 +274,84 @@ class RecoveryQaGates(unittest.TestCase):
                     code, doc = self.run_qa(args, **({} if cli else {"BUDGET_MS": budget}))
                     self.assertEqual(code, 2, self.last_stderr)
                     self.assertEqual(doc, {})
+
+    def test_baseline_media_cannot_satisfy_post_disturbance_gates(self) -> None:
+        for scenario in self.recovery_scenarios[1:-1]:
+            for missing in ("AUDIO", "INPUT"):
+                with self.subTest(scenario=scenario, missing=missing):
+                    # Given: real log reads see baseline media, but one fresh path is silent.
+                    env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                                f"FAKE_FRESH_{missing}": "0"}
+                    # When: the other media paths recover after the disturbance.
+                    code, doc = self.run_qa(["--only", scenario], **env)
+                    # Then: stale media cannot authorize a recovery PASS.
+                    self.assertEqual(code, 1, doc)
+                    self.assertEqual(doc["scenarios"][0]["detail"], "no_media_evidence_after_recovery")
+                    self.assertGreater(max(self.last_frames), 5)
+
+    def test_real_log_fresh_media_passes_all_recoveries(self) -> None:
+        for scenario in self.recovery_scenarios[:-1]:
+            with self.subTest(scenario=scenario):
+                # Given: baseline records plus genuine fresh audio and input.
+                env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1"}
+                # When: run the unmodified production probes against the fixture log.
+                code, doc = self.run_qa(["--only", scenario], **env)
+                # Then: valid recovery retains its baseline and bounded terminal receipt.
+                self.assertEqual(code, 0, doc)
+                self.assertEqual(doc["scenarios"][0]["frames_painted_baseline"], 5)
+                self.assertLess(doc["scenarios"][0]["recovery_ms"], 5000)
+
+    def test_required_log_boundaries_fail_closed(self) -> None:
+        cases = (("", "1"), ("0", "1"), ("", "0"), ("size=123", "0"),
+                 ("12\n34", "0"), ("-1", "0"), ("1.5", "0"),
+                 ("9223372036854775808", "0"))
+        for scenario in self.recovery_scenarios[1:-1]:
+            phases = ("post",) if scenario == "consumer_restart" else ("pre", "post")
+            for phase in phases:
+                for output, rc in cases:
+                    with self.subTest(scenario=scenario, phase=phase, output=output, rc=rc):
+                        # Given: good media, but a required offset cannot be observed.
+                        env = self.passing_env() | {
+                            "FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                            "FAKE_BOUNDARY_PHASE": phase, "FAKE_BOUNDARY_OUTPUT": output,
+                            "FAKE_BOUNDARY_RC": rc}
+                        # When: the CLI reaches that pre/post-disturbance boundary.
+                        code, doc = self.run_qa(["--only", scenario], **env)
+                        # Then: one failed receipt and cleanup, not an invented zero.
+                        self.assertEqual(code, 1, doc)
+                        self.assertEqual(len(doc["scenarios"]), 1)
+                        row = doc["scenarios"][0]
+                        prefix = "media" if phase == "post" else "dip"
+                        self.assertEqual(row["detail"], f"{prefix}_boundary_unavailable")
+                        self.assertIsNone(row["recovery_ms"])
+                        self.assertEqual(row["frames_painted_baseline"], 5 if phase == "post" else None)
+                        self.assertIn("kill 4242", self.last_calls)
+                        self.assertIn("kill 4243", self.last_calls)
+
+    def test_observed_zero_log_boundaries_allow_fresh_media(self) -> None:
+        for scenario in self.recovery_scenarios[1:-1]:
+            with self.subTest(scenario=scenario):
+                # Given: a successful wc reports a valid, whitespace-padded zero.
+                env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_LOG_SIZE": "  0\n"}
+                # When: later audio and input succeed after that observed boundary.
+                code, doc = self.run_qa(["--only", scenario], **env)
+                # Then: zero is valid only as a successful observation.
+                self.assertEqual(code, 0, doc)
+                self.assertIn("wc -c", self.last_calls)
+                self.assertEqual(doc["scenarios"][0]["status"], "PASS")
+
+    def test_media_boundary_probe_cannot_extend_deadline(self) -> None:
+        for scenario in self.recovery_scenarios[1:-1]:
+            with self.subTest(scenario=scenario):
+                # Given: a valid boundary result arrives too late.
+                env = self.passing_env() | {
+                    "FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_BOUNDARY_PHASE": "post",
+                    "FAKE_BOUNDARY_OUTPUT": "0", "FAKE_BOUNDARY_DELAY": "5"}
+                # When: the real bounded remote wrapper observes completion.
+                code, doc = self.run_qa(["--only", scenario], **env)
+                # Then: no new probe budget or recovery receipt can authorize PASS.
+                self.assert_budget_failure(code, doc)
+                self.assertIsNone(doc["scenarios"][0]["recovery_ms"])
 
     def test_terminal_boundary_all_scenarios(self):
         for scenario in self.recovery_scenarios:
@@ -874,6 +990,12 @@ class RecoveryQaGates(unittest.TestCase):
                 if enabled == "0":
                     self.assertEqual(row["detail"], "no_media_evidence_after_recovery")
                 self.assert_fixture_available("audio_chunks", "FAKE_AUDIO_CHUNKS")
+
+    def test_final_flush_timing_without_delivered_audio_is_not_media(self) -> None:
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_AUDIO_CHUNKS": "0"}
+        code, doc = self.run_qa(["--only", "consumer_restart"], **env)
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["scenarios"][0]["detail"], "no_media_evidence_after_recovery")
 
     def test_input_ok_true_missing_is_not_media(self):
         for enabled in ("0", "1"):

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
+# allow: SIZE_OK - sourced CLI scenario state machine; two-file fix scope precludes extraction.
 #
 # Task 31 phase-B wired reconnect/recovery live-QA harness (READY TO RUN). This
 # is the live companion to the host-side logic matrix (`ctest -R wired_recovery`):
@@ -330,7 +331,10 @@ wait_not_projecting() {
 
 # Current receiver-log size (byte offset marker for per-scenario windows).
 log_offset() {
-    remote "wc -c < /tmp/aa-wired-receiver.log 2>/dev/null || echo 0" | tr -dc '0-9' || echo 0
+    local size
+    size="$(remote "wc -c < /tmp/aa-wired-receiver.log 2>/dev/null")" || return 1
+    [[ "$size" =~ ^[[:blank:]]*(0|[1-9][0-9]{0,17})[[:blank:]]*$ ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
 # Receiver-log content written after the given byte offset.
@@ -400,12 +404,11 @@ painted_frames_grew() {
     painted_frame_probe "$baseline" >/dev/null
 }
 
-# Successful audio pump evidence: audio_chunks is logged BEFORE router_.pump()
-# runs (so its presence proves nothing about the sink); emit_media_timing is
-# emitted ONLY after pump() succeeds. media_timing is the pump-success marker.
+# Timing can be emitted at final flush after a failed pump; require the
+# current receiver's nonempty post-success audio_chunks record in this window.
 audio_pumped() {
     local since="${1:-0}"
-    remote "tail -c +$(( since + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep -q '\"event\":\"media_timing\"' && echo ok" >/dev/null 2>&1
+    remote "tail -c +$(( since + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep -q '\"event\":\"media_timing\"' && tail -c +$(( since + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep -q '\"event\":\"audio_chunks\"' && echo ok" >/dev/null 2>&1
 }
 
 # Input delivery evidence: input_forwarded presence alone is not a delivery
@@ -667,12 +670,11 @@ scenario_receiver_restart() {
 }
 
 scenario_consumer_restart() {
-    local recovery="" offset retries_before
+    local recovery="" media_offset retries_before
     # The stack is already up and projecting (item 4 setup): this scenario only
     # disturbs it and restarts the display.
     wait_projecting "${BUDGET_MS}" || { record consumer_restart FAILED "" "" "" "no_initial_projection"; return; }
     # Kill and verify the tracked child BY PID (item 5), never by pattern.
-    offset="$(log_offset)"
     retries_before="$(retries_total)"
     FRAMES_BASELINE="$(frames_painted_baseline)" ||
         { record consumer_restart FAILED "" "" "" frames_baseline_unavailable; return; }
@@ -686,12 +688,15 @@ scenario_consumer_restart() {
         return
     fi
     start_consumer || { record consumer_restart FAILED "" "" "" "restart_failed"; return; }
+    # Snapshot after restart so baseline-time media cannot qualify recovery.
+    media_offset="$(log_offset)" ||
+        { record consumer_restart FAILED "" "" "" media_boundary_unavailable; return; }
     # The restarted display owns a new counter: require an observed baseline
     # again, not a fabricated zero or the previous process's counter.
     FRAMES_BASELINE="$(frames_painted_baseline)" ||
         { record consumer_restart FAILED "" "" "" frames_baseline_unavailable; return; }
     if wait_projecting "${BUDGET_MS}"; then
-        if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
+        if media_evidence "${media_offset}" "${FRAMES_BASELINE}"; then
             complete_scenario || true
             record consumer_restart PASS "" "$(retry_delta "${retries_before}")" "process_dip+frames+pump+input" "recovered"
         else
@@ -703,9 +708,10 @@ scenario_consumer_restart() {
 }
 
 scenario_usb_unplug_replug() {
-    local recovery="" offset retries_before
+    local recovery="" offset media_offset retries_before
     wait_projecting "${BUDGET_MS}" || { record usb_unplug_replug FAILED "" "" "" "no_initial_projection"; return; }
-    offset="$(log_offset)"
+    offset="$(log_offset)" ||
+        { record usb_unplug_replug FAILED "" "" "" dip_boundary_unavailable; return; }
     retries_before="$(retries_total)"
     FRAMES_BASELINE="$(frames_painted_baseline)" ||
         { record usb_unplug_replug FAILED "" "" "" frames_baseline_unavailable; return; }
@@ -721,12 +727,14 @@ scenario_usb_unplug_replug() {
         return
     fi
     UNBOUND_PORT=""
+    media_offset="$(log_offset)" ||
+        { record usb_unplug_replug FAILED "" "" "" media_boundary_unavailable; return; }
     if wait_projecting "${BUDGET_MS}"; then
         if ! dip_observed "${offset}"; then
             record usb_unplug_replug BLOCKED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unobserved" "no_state_or_flow_dip_observed"
             return
         fi
-        if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
+        if media_evidence "${media_offset}" "${FRAMES_BASELINE}"; then
             complete_scenario || true
             record usb_unplug_replug PASS "" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_on_replug"
         else
@@ -738,10 +746,11 @@ scenario_usb_unplug_replug() {
 }
 
 scenario_phone_lock_unlock() {
-    local recovery="" offset retries_before serial label
+    local recovery="" offset media_offset retries_before serial label
     wait_projecting "${BUDGET_MS}" || { record phone_lock_unlock FAILED "" "" "" "no_initial_projection"; return; }
     serial="$(stimulus_serial)" || { record phone_lock_unlock BLOCKED "" "" "" "stimulus_device_unattributed"; return; }
-    offset="$(log_offset)"
+    offset="$(log_offset)" ||
+        { record phone_lock_unlock FAILED "" "" "" dip_boundary_unavailable; return; }
     retries_before="$(retries_total)"
     FRAMES_BASELINE="$(frames_painted_baseline)" ||
         { record phone_lock_unlock FAILED "" "" "" frames_baseline_unavailable; return; }
@@ -754,6 +763,8 @@ scenario_phone_lock_unlock() {
         { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
     adb_stimulus "${serial}" "shell input swipe 540 1600 540 400" >/dev/null 2>&1 ||
         { record phone_lock_unlock FAILED "" "" "" "stimulus_failed"; return; }
+    media_offset="$(log_offset)" ||
+        { record phone_lock_unlock FAILED "" "" "" media_boundary_unavailable; return; }
     if wait_projecting "${BUDGET_MS}"; then
         if ! dip_observed "${offset}"; then
             record phone_lock_unlock BLOCKED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unobserved" "no_state_or_flow_dip_observed"
@@ -763,7 +774,7 @@ scenario_phone_lock_unlock() {
             record phone_lock_unlock FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unattributed" "dip_not_attributed_to_intended_device"
             return
         fi
-        if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
+        if media_evidence "${media_offset}" "${FRAMES_BASELINE}"; then
             complete_scenario || true
             record phone_lock_unlock PASS "" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_after_unlock"
         else
@@ -775,10 +786,11 @@ scenario_phone_lock_unlock() {
 }
 
 scenario_phone_aa_restart() {
-    local recovery="" offset retries_before serial label
+    local recovery="" offset media_offset retries_before serial label
     wait_projecting "${BUDGET_MS}" || { record phone_aa_restart FAILED "" "" "" "no_initial_projection"; return; }
     serial="$(stimulus_serial)" || { record phone_aa_restart BLOCKED "" "" "" "stimulus_device_unattributed"; return; }
-    offset="$(log_offset)"
+    offset="$(log_offset)" ||
+        { record phone_aa_restart FAILED "" "" "" dip_boundary_unavailable; return; }
     retries_before="$(retries_total)"
     FRAMES_BASELINE="$(frames_painted_baseline)" ||
         { record phone_aa_restart FAILED "" "" "" frames_baseline_unavailable; return; }
@@ -786,6 +798,8 @@ scenario_phone_aa_restart() {
     arm_scenario || { record phone_aa_restart FAILED "" "" "" timing_error_clock; return; }
     adb_stimulus "${serial}" "shell am force-stop com.google.android.projection.gearhead" >/dev/null 2>&1 ||
         { record phone_aa_restart FAILED "" "" "" "stimulus_failed"; return; }
+    media_offset="$(log_offset)" ||
+        { record phone_aa_restart FAILED "" "" "" media_boundary_unavailable; return; }
     if wait_projecting "${BUDGET_MS}"; then
         if ! dip_observed "${offset}"; then
             record phone_aa_restart BLOCKED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unobserved" "no_state_or_flow_dip_observed"
@@ -795,7 +809,7 @@ scenario_phone_aa_restart() {
             record phone_aa_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "dip_unattributed" "dip_not_attributed_to_intended_device"
             return
         fi
-        if media_evidence "${offset}" "${FRAMES_BASELINE}"; then
+        if media_evidence "${media_offset}" "${FRAMES_BASELINE}"; then
             complete_scenario || true
             record phone_aa_restart PASS "" "$(retry_delta "${retries_before}")" "dip+frames+pump+input" "recovered_after_aa_restart"
         else

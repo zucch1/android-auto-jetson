@@ -556,16 +556,11 @@ core::Result<void> WiredSession::drive_ssl_handshake() {
         return Error{ErrorCode::channel_not_registered};
     }
     auto stepped = cipher_->step_handshake();
-    std::fprintf(stderr, "HS-DBG step has_value=%d val=%d active=%d\n",
-                 (int)stepped.has_value(),
-                 (int)(stepped.has_value() ? stepped.value() : false),
-                 (int)cipher_->is_active());
     if (!stepped) {
         (void)fail(Error{ErrorCode::transport_unauthorized_peer});
         return stepped.error();
     }
     auto out = cipher_->take_handshake();
-    std::fprintf(stderr, "HS-DBG out=%zu\n", out.size());
     if (!out.empty()) {
         if (auto sent = send_encapsulated_ssl(std::move(out)); !sent) {
             return sent.error();

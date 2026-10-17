@@ -179,9 +179,8 @@ class Enumeration final {
     return text;
 }
 
-// Open, fetch descriptor strings and claim accessory interface 0, detaching a
-// kernel driver first when one is bound.
-[[nodiscard]] core::Result<LibusbHandle> open_and_claim(const LibusbApi &api, LibusbDevice *device,
+// Pre-switch endpoint-0 control transfers must not claim or detach interface 0.
+[[nodiscard]] core::Result<LibusbHandle> open_with_strings(const LibusbApi &api, LibusbDevice *device,
                                                         UsbDeviceSnapshot &snapshot,
                                                         const core::Deadline &budget) {
     if (auto checked = budget.check(); !checked) {
@@ -202,6 +201,14 @@ class Enumeration final {
     if (auto checked = budget.check(); !checked) {
         return checked.error();
     }
+    return handle;
+}
+
+// Claim accessory interface 0 on the post-switch (re-enumerated) device,
+// detaching a kernel driver first when one is bound. This is the ONLY place an
+// interface claim happens: bulk transfers need it, AOA control transfers do not.
+[[nodiscard]] core::Result<void> claim_accessory_interface(const LibusbApi &api,
+                                                           LibusbHandle &handle) {
     const int active = api.kernel_driver_active(handle.get(), kAccessoryInterface);
     if (active > 0) {
         const int detached = api.detach_kernel_driver(handle.get(), kAccessoryInterface);
@@ -213,7 +220,7 @@ class Enumeration final {
     if (claimed != kLibusbSuccess) {
         return map_libusb_error(claimed);
     }
-    return handle;
+    return {};
 }
 
 class LibusbControlChannel final : public AoaControlChannel {
@@ -345,7 +352,7 @@ class LibusbLinkFactory final : public AoaLinkFactory {
         }
         pre_switch = found->snapshot;
         LibusbDevice *device = found->device;
-        auto handle = open_and_claim(session_.api(), device, pre_switch, deadline_);
+        auto handle = open_with_strings(session_.api(), device, pre_switch, deadline_);
         if (!handle) {
             return handle.error();
         }
@@ -362,8 +369,12 @@ class LibusbLinkFactory final : public AoaLinkFactory {
         if (!validated) {
             return validated.error();
         }
+        const core::Deadline budget{
+            std::min(deadline_.until, core::Deadline::Clock::now() +
+                                          std::chrono::milliseconds{kAccessoryWaitMs.count}),
+            deadline_.cancellation};
         for (;;) {
-            if (auto checked = deadline_.check(); !checked) {
+            if (auto checked = budget.check(); !checked) {
                 return checked.error();
             }
             Enumeration enumeration;
@@ -384,9 +395,13 @@ class LibusbLinkFactory final : public AoaLinkFactory {
             if (found != nullptr) {
                 post_switch = found->snapshot;
                 LibusbDevice *device = found->device;
-                auto handle = open_and_claim(session_.api(), device, post_switch, deadline_);
+                auto handle = open_with_strings(session_.api(), device, post_switch, budget);
                 if (!handle) {
                     return handle.error();
+                }
+                auto claimed = claim_accessory_interface(session_.api(), handle.value());
+                if (!claimed) {
+                    return claimed.error();
                 }
                 return std::unique_ptr<UsbBulkPipe>(
                     std::make_unique<LibusbBulkPipe>(session_.api(), std::move(handle.value())));
@@ -394,8 +409,8 @@ class LibusbLinkFactory final : public AoaLinkFactory {
             std::mutex mutex;
             std::condition_variable_any cv;
             std::unique_lock lock(mutex);
-            cv.wait_until(lock, deadline_.cancellation,
-                          std::min(deadline_.until,
+            cv.wait_until(lock, budget.cancellation,
+                          std::min(budget.until,
                                    std::chrono::steady_clock::now() + kReenumPollInterval),
                           [] { return false; });
         }
@@ -497,7 +512,7 @@ core::Result<void> reset_port_device(const UsbDeviceSelector &selector) {
     }
     const Candidate *found = nullptr;
     for (const auto &candidate : enumeration.candidates()) {
-        if (candidate.port_path == selector.port_context) {
+        if (matches(selector, candidate)) {
             found = &candidate;
             break;
         }

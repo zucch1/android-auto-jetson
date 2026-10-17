@@ -12,9 +12,12 @@ tools/usb-policy/
   70-android-auto-receiver.rules   the policy (installed verbatim)
   install.sh                       bounded, idempotent installer
   rollback.sh                      restores the exact prior state (idempotent)
+  common.sh                        shared trust/staging/state-validation
+                                   helpers sourced by both scripts
   rules_check.py                   stdlib-only fail-closed rules parser /
-                                   structural matcher (also used by install.sh
-                                   and tests/usb/test_usb_policy.py)
+                                   structural matcher + exact-policy gate
+                                   (also used by install.sh and
+                                   tests/usb/test_usb_policy.py)
   README.md                        this file (ops + rollback doc)
 ```
 
@@ -37,7 +40,7 @@ disable.
 
 ## Port-path encoding (kernel 6.8.12-1021-tegra, verified on target)
 
-Verified with `udevadm info -a /sys/bus/usb/devices/1-2.1` on jetson.local:
+Verified with `udevadm info -a /sys/bus/usb/devices/1-2.1` on the qualified target:
 
 - `KERNEL=="1-2.1"` / `KERNELS=="1-2.1"` - the device's kernel name **is** the
   bus-qualified stable topology path (bus 1 -> root port 2 -> hub port 1).
@@ -96,19 +99,38 @@ sudo -n bash tools/usb-policy/install.sh
 
 Idempotent and fail-closed:
 
-1. Validates the rules file first (`rules_check.py` strict parse and
-   `udevadm verify` when available). Malformed input aborts **before any
-   system state is touched**.
-2. Records the exact prior state (file existence + `sha256` + a byte-exact
-   backup of any pre-existing file) in
-   `/var/lib/android-auto-receiver/usb-policy/`.
+1. Captures the rules file into a private snapshot and validates **that one
+   copy** (`rules_check.py` verify - which requires byte identity with the shipped policy,
+   not merely parseable rules - and `udevadm verify` when available); the same
+   snapshot is hashed and installed, so a source swap between steps can
+   neither install rejected content nor record a wrong digest. Malformed or
+   non-approved input aborts **before any system state is touched**.
+2. Verifies the destination/state ancestry (real, caller-owned,
+   non-group/other-writable directories; no symlinked or irregular
+   destination, manifest or backup entries) and records the exact prior state
+   (file existence + `sha256` + a byte-exact backup of any pre-existing file)
+   in `/var/lib/android-auto-receiver/usb-policy/`.
 3. Installs the rules file to `/etc/udev/rules.d/70-android-auto-receiver.rules`
-   (mode 0644) and reloads udev, then re-triggers **only** the qualified
-   port's device tree (`udevadm trigger --action=change --parent-match=<syspath
-   of 1-2.1>`; dry-run verified on target to select exactly that tree).
+   (mode 0644) via staged temp + atomic rename - the destination is never
+   reopened for writing or chmod - and reloads udev, then re-triggers **only**
+   the qualified port's device tree (`udevadm trigger --action=change
+   --parent-match=<syspath of 1-2.1>`; dry-run verified on target to select
+   exactly that tree).
 4. Re-running with no change is a no-op besides the reload; re-running after
    drift repairs the installed file while keeping the FIRST install's
-   prior-state record authoritative for rollback.
+   prior-state record authoritative for rollback. `install.sh` and
+   `rollback.sh` serialize on an exclusive `flock` of the stable `/var/lib` ancestor and
+   record the transaction phase before every destructive change, so an
+   interrupted run is recovered instead of re-basing the backup.
+
+The initial backup and manifest are staged privately and published together
+by directory rename, before the policy changes. Rollback retains that pair
+through restoration and udev reconciliation, then retires the directory
+atomically before disposal. Fault-injection tests cover every recorded phase,
+destination publication, reload failure, and state retirement with both
+present and absent baselines. An untrappable process kill can leave private
+staging/retirement directories; these never become active rollback records.
+This is process-interruption recovery, not a qualified power-loss guarantee.
 
 Tests run the same scripts against a throwaway root via `AA_USB_POLICY_ROOT`
 (no udevadm calls in that mode).
@@ -124,15 +146,34 @@ Restores the **exact** prior state recorded by the first install:
 - no file existed before -> the installed rules file is removed;
 - a different file existed before -> its recorded bytes are restored
   (`sha256`-verified before and after);
-- udev is reloaded and the qualified port's device tree is re-triggered, so no
-  ACL or `ID_MM_DEVICE_IGNORE` state survives the removed rules (no stale
-  ACLs);
+- udev is reloaded and the qualified port's device tree is re-triggered:
+  rule-derived udev properties - `ID_MM_DEVICE_IGNORE` above all - are
+  re-evaluated and disappear with the removed rules (verified on target, see
+  the evidence receipt);
 - the install manifest and backup are removed - no trace of this tooling
   remains.
 
+**Named limitation - named-user ACLs are NOT revoked by rollback.** The
+`uaccess` builtin applies its POSIX ACL only while a rule tags the device at
+event-processing time; removing this rule set does **not** flush an ACL that
+is already on the node, and a successful reload+trigger is **not** evidence
+that one was revoked. Such an ACL persists until the seat session ends
+(logind revokes the grants it applied), the device re-enumerates, or it is
+removed explicitly (`setfacl -b /dev/bus/usb/BBB/DDD`). On this image the
+distro's `51-android.rules` additionally tags the qualified vendor ids
+`uaccess`, so an equivalent access grant can legitimately survive this
+rollback - that grant is independently authorized and is deliberately left
+untouched (this tooling cannot attribute an ACL entry to a single rule).
+Rollback therefore restores rules state and re-triggers udev only; it makes
+no live ACL-revocation claim.
+
 Idempotent: a second run with no recorded state is a clean no-op (exit 0).
-Fail closed: an unknown/corrupt manifest or a hash-mismatched backup aborts
-without deleting anything. Rollback is always the documented reversal of
+Fail closed: an unknown/corrupt manifest, a hash-mismatched backup or an
+inconsistent saved state aborts without deleting anything. Interrupted
+install/rollback runs are recovered from the recorded transaction phase
+(`installing`/`installed`/`restoring`/`restored`): a rerun of `rollback.sh`
+finishes an interrupted rollback instead of refusing, and the third-party
+drift refusal is unchanged. Rollback is always the documented reversal of
 `install.sh`; nothing else on the system is touched at any point.
 
 ## Tests and evidence

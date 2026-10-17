@@ -3,6 +3,8 @@
 #include <aa/ipc/VideoSocket.hpp>
 #include <aa/transport/Frames.hpp>
 
+#include <algorithm>
+
 namespace aa::channels {
 namespace {
 Error malformed() { return Error{ErrorCode::protocol_malformed_message}; }
@@ -112,7 +114,9 @@ core::Result<void> AvSink::data(const protocol::MessageView& message) {
     if (present) {
         auto media = body;
         if (!combined.empty()) {
-            combined.insert(combined.end(), body.begin(), body.end());
+            const auto cached_size = combined.size();
+            combined.resize(cached_size + body.size());
+            std::copy(body.begin(), body.end(), combined.data() + cached_size);
             media = combined;
         }
         if (auto delivered = raw_.on_message({message.header, media}); !delivered) { return delivered.error(); }

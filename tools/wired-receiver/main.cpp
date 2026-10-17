@@ -95,11 +95,11 @@ std::string poll_error_json(aa::ErrorCode code,
     return line + "}";
 }
 
-// Task-48 media-timing diagnostics: nanoseconds -> milliseconds as an exact
-// rational (ns / 1e6) carried in a double, with no lossy pre-rounding - the
-// collector and reporter compare the value as-is against the ms budgets.
-// Non-finite input (not producible from an int64 count) degrades to a JSON
-// null, which the collector treats as an absent metric (BLOCKED), never 0.
+// Media-timing diagnostics: nanoseconds -> milliseconds as an exact rational
+// (ns / 1e6) carried in a double, no lossy pre-rounding - the collector and
+// reporter compare the value as-is against the ms budgets. Non-finite input
+// (not producible from an int64 count) degrades to a JSON null, which the
+// collector treats as an absent metric (BLOCKED), never 0.
 std::string format_ms(aa::core::Nanoseconds value) {
     const double ms = static_cast<double>(value.count) / 1'000'000.0;
     if (!std::isfinite(ms)) {
@@ -187,8 +187,8 @@ class RouterSink final : public aa::protocol::MessageSink {
     }
 
   private:
-    // These are audio-only cumulative maxima. Cross-stream av_sync_ms is
-    // computed by the collector from audio_write_completed + video_presented.
+    // Audio-only cumulative maxima. The collector derives cross-stream
+    // av_sync_ms from audio_write_completed paired with video_presented.
     void emit_media_timing() {
         const auto &stats = router_.report().stats;
         if (stats.frames_written == 0) {
@@ -710,7 +710,6 @@ int main(int argc, char **argv) {
     // P2-D: one final media-timing export before shutdown so the last audio
     // tail (routed after the last periodic emission) is not lost. The session
     // thread is gone, so the router report is final and race-free here.
-    // finish() is guard-flagged: the destructor's second call is a no-op.
     audio_sink.finish();
 
     video_outlet.close();
