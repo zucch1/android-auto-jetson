@@ -1,5 +1,9 @@
 # PR56 forward merge of the PR54 foundation
 
+The PR54 receipt below is historical. The final PR55 reconciliation and current
+candidate gates are recorded in the final section; it supersedes the earlier
+statements that PR55 is pending.
+
 ## Boundary and provenance
 
 - Starting PR56 head: `13a235d7cac84516483a16d8616d3aebe78adecd` (clean).
@@ -141,3 +145,141 @@ integration. No hardware soak, target build, acoustic output, physical scanout,
 or end-to-end phone latency is qualified by this host result. Existing
 completion endpoints are consumer write handoff and Qt paint completion,
 not speaker output or physical display presentation.
+
+## Final PR55 source and squash forward reconciliation
+
+### Pins, parents and tree preservation
+
+- Clean starting local PR56: `8cdc13b2a7fe440b9acef4e97dcbb12556a8ef4e`.
+  Published PR56 remains `13a235d7cac84516483a16d8616d3aebe78adecd`;
+  this reconciliation was not published.
+- Foundation: `8e23bda1c199e09483f69fe515bd0f7070eb1042`.
+- Final PR55 source: `73d2a7ffc6ff643ace937b3ab9134a336e6ec986`.
+- New immutable main squash: `0c607eae68a94f264158ebc564911fab5e0903ed`.
+- Source and squash trees were both verified as
+  `ba15e956bfe924aa0b4907d245406ae7a441e50e`, with an empty tree diff.
+- Source-union merge: `3d7fa571a7595a3f6d9728f98cf9d4e923b85ba6`.
+  Its ordered parents are the clean starting local PR56 and final PR55 source
+  above. Its tree is `8099c4b16453b3d816774eea00c565db994f8955`.
+- Squash-ancestry merge: `0b4fbcd34956b94a3dbfd0f82b01e048396878d5`.
+  Its ordered parents are `3d7fa571a7595a3f6d9728f98cf9d4e923b85ba6`
+  and `0c607eae68a94f264158ebc564911fab5e0903ed`.
+  Its tree is also `8099c4b16453b3d816774eea00c565db994f8955`:
+  the second merge has an empty first-parent diff, not a dependency rollback.
+- Both source and squash are ancestors of the candidate; `5dec44a` is not.
+  No integration-reference content, future telemetry or history rewrite was used.
+  The subsequent receipt-only commit changes this document, not tested code.
+
+### Individual conflict receipt
+
+Source merge reported exactly four conflicted paths. Resolutions were applied
+per hunk with no blanket ours/theirs selection:
+
+| Path | Source-merge decision |
+| --- | --- |
+| `CMakeLists.txt` | Include PR55 `WiredRecovery.cmake` after the integrator, then retain PR56 `WiredPerf.cmake`. Both host test inventories remain enabled. |
+| `tests/wired_e2e/test_live_qa_gates.py` | Retain source's expanded F3/F5/P2-G description. The auto-merged suite retains real FIFO/paint/audio/input evidence and the final-flush-without-audio rejection test. |
+| `tools/wired-qa/run-wired-live-qa.sh` | Use source's exact-line DRM `grep -Fxq connected` check, not token splitting. Retain successful xrandr fallback and existing bounded process/FIFO evidence checks. |
+| `tools/wired-receiver/main.cpp` | Keep PR56 `on_write_completed` observer on the current negotiated PCM configuration. Preserve PR55 rejected-attempt identity attribution and the existing negotiated sink routing. |
+
+Squash merge reported exactly one conflicted path: `CMakeLists.txt`. Retain
+the perf include alongside the already-present recovery include. Staging then
+proved exact tree equality with the source-union parent before committing.
+
+The automatically merged dependency paths retain final PR55 recovery accounting:
+pending attempts resolve at active or terminal failure, admitted identity stays
+distinct from rejected-attempt attribution, and USB admission remains fail-closed.
+The link signature and receiver test linker wrapper move together. All dependency
+paths other than the intentional CMake and receiver timing unions match source.
+
+PR56 performance/audio/paint files are unchanged from starting `8cdc13b`.
+`main.cpp` still has 48 kHz stereo media and 16 kHz mono guidance/system
+profiles, `register_av_sinks`, successful-write-only cumulative timing,
+`audio_scheduling_skew_ms` rather than mislabeled A/V sync, the completion
+observer, and idempotent `finish()` after session-thread join before router
+close (plus destructor fallback). Paired A/V sync still uses audio-write and
+Qt-paint completion. Fixed budgets and continuity gates were not relaxed.
+
+### Exact diff against new main
+
+The candidate differs from `0c607ea` in these 30 paths, including this receipt:
+
+```text
+CMakeLists.txt
+cmake/TlsCredentials.cmake
+cmake/WiredPerf.cmake
+docs/qualification/task32-pr54-forward-merge.md
+docs/qualification/wired-perf-runbook.md
+include/aa/audio/AudioRouter.hpp
+include/aa/tls/Credentials.hpp
+src/audio/AudioRouter.cpp
+src/display/qt_adapter/ProjectionWidget.cpp
+src/display/qt_adapter/ProjectionWidget.hpp
+src/tls/Credentials.cpp
+src/transport/tls_adapter/TlsRecordCodec.cpp
+tests/display/dummy_display_test.cpp
+tests/perf/fixtures/wired_perf/fake_receiver.py
+tests/perf/fixtures/wired_perf/nominal_capture.json
+tests/perf/fixtures/wired_perf/overload_capture.json
+tests/perf/receiver_timing_test.cpp
+tests/perf/test_continuity_regressions.py
+tests/perf/test_gate_regressions.py
+tests/perf/test_review_regressions.py
+tests/perf/test_wired_perf.py
+tests/tls/credential_probe.cpp
+tests/tls/credentials.py
+tools/perf/README.md
+tools/perf/aa-projection-perf.schema.json
+tools/perf/aa-projection-perf.sh
+tools/perf/aa_perf_report.py
+tools/perf/aa_perf_schema.py
+tools/perf/aa_projection_collect.py
+tools/wired-receiver/main.cpp
+```
+
+These remain PR56 timing/perf/paint and already-published certificate-chain
+support, not recovery files reverted from main. Compared to starting local
+PR56, the reconciliation imports the 20 PR55 dependency paths plus this receipt.
+
+### Current focused host gates and limitations
+
+On the source tree above, using the existing host-dev build directory:
+
+- `cmake --preset host-dev`: exit 0 (existing upstream CMake deprecation warning).
+- `cmake --build --preset host-dev`: exit 0; 37 incremental build steps,
+  including receiver, recovery executable and receiver timing test.
+- Serial `ctest --test-dir build/host-dev -j1 --output-on-failure -R REGEX`:
+
+| Exact REGEX | Result | Log suffix |
+| --- | --- | --- |
+| `^(wired_perf_|dummy_display_)` | 29/29, 87.24 s | `perf-display.log` |
+| `^(wired_receiver|wired_deadline|wired_e2e_(av_sink|microphone|control|revoke|recovery|auth|input_wire|happy|trust_link)|audio_pipeline_.*|wired_e2e_live_qa_gates)$` | 16/16, 40.17 s (`wired_e2e_recovery` has no registration; actual `wired_recovery` is covered below) | `receiver.log` |
+| `^(wired_recovery_|usb_aoa_identity)` | 9/9, 167.91 s | `recovery.log` |
+| `^(wired_recovery|wired_e2e_failures)$` | 2/2, 0.03 s | `recovery-smoke.log` |
+
+Total: 56/56 focused CTests, not a full-suite result. Durable local logs are
+`build/host-dev/task32-pr55-{configure,build,perf-display,receiver,recovery,recovery-smoke,syntax}.log`.
+Test tool timeouts were at least 300000 ms. Harness tests use fake SSH locally;
+no target SSH, ADB, hardware, trust-store or credential access was performed.
+
+`bash -n` passed for the perf, live-QA and recovery-QA scripts. Python
+`py_compile` passed for both QA gate suites, perf tools/tests and fake receiver,
+with bytecode confined to `build/host-dev/task32-pycache`. C++ LSP error checks
+passed for receiver main, app implementation directory (3 C++ files), wired E2E
+directory (13 C++ files), USB adapter headers (5), USB endpoint implementation,
+session/link/USB public headers and USB identity test. Python LSP was attempted
+but basedpyright is unavailable (previous installation declined); CMake LSP is
+not configured. Syntax checks and host configure/build provide those gates,
+not an unsupported claim of all-language LSP coverage.
+
+This is source-preserving reconciliation, with no new parser, helper, boundary,
+type escape hatch, logging schema or budget change. Inherited large receiver
+and recovery harness files are deliberately not refactored in this merge.
+Existing timing and recovery behavior tests are reused rather than adding
+tests that merely restate the conflict edits.
+
+The full nonlong suite is explicitly NOT RUN and remains reserved for a
+SEPARATE fresh worker later. No publication, PR mutation, auto/admin merge,
+hardware soak, target build, acoustic-output or physical-scanout qualification
+is claimed. Completion endpoints remain consumer-write handoff and Qt paint,
+not speaker output or physical presentation.
