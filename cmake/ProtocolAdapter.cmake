@@ -28,6 +28,7 @@ add_library(aa_protocol_adapter STATIC
     src/protocol/aasdk_adapter/InputAdapter.cpp
     src/protocol/aasdk_adapter/SensorAdapter.cpp
     src/protocol/aasdk_adapter/MicrophoneAdapter.cpp
+    src/protocol/aasdk_adapter/AvSinkAdapter.cpp
     src/protocol/aasdk_adapter/ChannelAdapter.cpp)
 set_target_properties(aa_protocol_adapter PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO
@@ -47,6 +48,7 @@ set(AA_PROTOCOL_TEST_SOURCES
     tests/protocol/messages_roundtrip_test.cpp
     tests/protocol/sensor_configuration_test.cpp
     tests/protocol/microphone_configuration_test.cpp
+    tests/protocol/av_sink_test.cpp
     tests/protocol/messages_reject_test.cpp
     tests/protocol/channel_map_test.cpp)
 foreach(source IN LISTS AA_PROTOCOL_TEST_SOURCES)
@@ -79,6 +81,9 @@ add_test(NAME protocol_adapter_reject COMMAND aa_protocol_adapter_test
     --gtest_filter=MessageReject.*)
 add_test(NAME protocol_adapter_channel_map COMMAND aa_protocol_adapter_test
     --gtest_filter=ChannelMapping.*)
+add_test(NAME protocol_adapter_av_sink COMMAND aa_protocol_adapter_test
+    --gtest_filter=AvSink.*)
+set_tests_properties(protocol_adapter_av_sink PROPERTIES TIMEOUT 60)
 set_tests_properties(protocol_adapter_messages protocol_adapter_reject protocol_adapter_channel_map
     PROPERTIES TIMEOUT 60)
 
