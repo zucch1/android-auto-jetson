@@ -186,6 +186,7 @@ class WiredSession final {
     [[nodiscard]] std::uint64_t diagnostics_emitted() const noexcept {
         return diagnostics_emitted_;
     }
+
     [[nodiscard]] std::uint64_t input_sends() const noexcept { return input_sends_; }
     [[nodiscard]] std::uint64_t input_send_failures() const noexcept {
         return input_send_failures_;
@@ -198,6 +199,14 @@ class WiredSession final {
     [[nodiscard]] std::uint64_t pings_answered() const noexcept { return pings_answered_; }
     [[nodiscard]] std::uint64_t encapsulated_ssls() const noexcept { return encapsulated_ssls_; }
     [[nodiscard]] std::uint64_t auth_completes() const noexcept { return auth_completes_; }
+
+    // ---- Recovery telemetry (task 31 additive seam) ----
+    // Counts reconnect/recover attempts and failed recovery outcomes observed on
+    // the session; each is emitted as a redacted EventKind::reconnect diagnostic.
+    // Purely additive observability: the lifecycle transitions and the delegated
+    // TrustStore admission decisions are unchanged.
+    [[nodiscard]] std::uint64_t reconnect_attempts() const noexcept { return reconnect_attempts_; }
+    [[nodiscard]] std::uint64_t recovery_failures() const noexcept { return recovery_failures_; }
 
   private:
     class InputForwarder;
@@ -228,6 +237,10 @@ class WiredSession final {
 
     void note_state(std::string_view identity_key = {});
     void emit(std::string_view identity_key = {});
+    enum class RecoveryStatus : std::uint8_t { pending, accepted, failed };
+    void note_recovery(session::Event event, const core::Result<void> &outcome);
+    void emit_recovery(const char *reason, RecoveryStatus status, std::optional<std::int64_t> code);
+    void resolve_recovery(RecoveryStatus status, std::optional<std::int64_t> code);
 
     WiredSessionDeps deps_;
     WiredSessionConfig config_;
@@ -259,6 +272,11 @@ class WiredSession final {
     std::uint64_t pings_answered_{0};
     std::uint64_t encapsulated_ssls_{0};
     std::uint64_t auth_completes_{0};
+    std::uint64_t reconnect_attempts_{0};
+    std::uint64_t recovery_failures_{0};
+    bool recovery_in_flight_{false};
+    const char *recovery_reason_{"link lost"};
+    std::string last_identity_key_{};
 };
 
 } // namespace aa::app
