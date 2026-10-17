@@ -163,7 +163,9 @@ class ObservedSessionMutex {
 #include "../transport/UsbAoaFakes.hpp"
 #include "../../src/transport/usb_adapter/LibusbWorld.hpp"
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
+#include <aap_protobuf/service/control/message/ServiceDiscoveryResponse.pb.h>
 #include <gtest/gtest.h>
+#include <array>
 #include <condition_variable>
 #include <fstream>
 #include <iterator>
@@ -174,6 +176,8 @@ class ObservedSessionMutex {
 #include <unistd.h>
 
 namespace {
+namespace media_wire = aap_protobuf::service::media::sink::message;
+
 TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
     VideoOutlet outlet;
     const std::vector<std::byte> payload{std::byte{0}, std::byte{0}, std::byte{1},
@@ -264,6 +268,79 @@ TEST(WiredReceiver, VideoOutletSendErrorsDoNotCountAsSent) {
     ASSERT_TRUE(received);
     ASSERT_EQ(received.value(), aa::ipc::ReceiveStatus::complete);
     EXPECT_EQ(pair.value().consumer.access_unit().frame, 2U);
+}
+
+struct ReceiverAudioExpectation {
+    std::int32_t service;
+    aa::protocol::ChannelRole channel;
+    aa::audio::Role role;
+    int wire_role;
+    aa::audio::AudioFormat input;
+};
+
+const std::array receiver_audio_expectations{
+    ReceiverAudioExpectation{100, aa::protocol::ChannelRole::media_audio, aa::audio::Role::media,
+                             media_wire::AUDIO_STREAM_MEDIA, {48000, 2, 16}},
+    ReceiverAudioExpectation{101, aa::protocol::ChannelRole::guidance_audio, aa::audio::Role::guidance,
+                             media_wire::AUDIO_STREAM_GUIDANCE, {16000, 1, 16}},
+    ReceiverAudioExpectation{102, aa::protocol::ChannelRole::system_audio, aa::audio::Role::system,
+                             media_wire::AUDIO_STREAM_SYSTEM_AUDIO, {16000, 1, 16}},
+    ReceiverAudioExpectation{103, aa::protocol::ChannelRole::speech_audio, aa::audio::Role::speech,
+                             media_wire::AUDIO_STREAM_TELEPHONY, {16000, 1, 16}},
+};
+
+class ReceiverProfileSink final : public aa::audio::detail::ObservedAudioSink {
+  public:
+    aa::audio::AudioFormat format{};
+    std::size_t writes{};
+    std::vector<std::byte> pcm;
+    aa::core::Result<void> write(const aa::audio::MixedChunk &chunk) override {
+        ++writes;
+        format = chunk.format;
+        pcm.insert(pcm.end(), chunk.pcm.begin(), chunk.pcm.end());
+        return {};
+    }
+    aa::core::Result<void> drain(aa::core::Milliseconds) override { return {}; }
+    aa::audio::SinkProbeStats probe_stats() const override { return {}; }
+    aa::audio::RenderBarrierStats render_stats() const override { return {}; }
+};
+
+TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereoAndKeepCompletionCallback) {
+    for (const auto &expected : receiver_audio_expectations) {
+        SCOPED_TRACE(expected.service);
+        auto output = std::make_unique<ReceiverProfileSink>();
+        const auto *observed = output.get();
+        auto router = aa::audio::detail::open_router_with_sink_for_test(
+            pcm_router_config(), std::move(output));
+        ASSERT_TRUE(router.has_value());
+        const std::size_t frames = expected.input.sample_rate_hz / 50U;
+        const std::vector<std::byte> pcm(frames * expected.input.channels * sizeof(std::int16_t),
+                                         std::byte{0x10});
+        RouterSink sink{router.value()};
+        testing::internal::CaptureStdout();
+        const auto result = sink.on_message({{expected.channel, 1, {}}, pcm});
+        const auto log = testing::internal::GetCapturedStdout();
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(observed->format, (aa::audio::AudioFormat{48000, 2, 16}));
+        // Resampling may retain a filter tail; require the 3x rate expansion,
+        // allowing that bounded tail rather than assuming one exact chunk size.
+        if (expected.input.channels == 1) {
+            EXPECT_GT(observed->pcm.size(), frames * 2U * 2U * sizeof(std::int16_t));
+            EXPECT_LE(observed->pcm.size(), frames * 3U * 2U * sizeof(std::int16_t));
+        } else {
+            EXPECT_EQ(observed->pcm.size(), pcm.size());
+        }
+        ASSERT_FALSE(observed->pcm.empty());
+        ASSERT_EQ(observed->pcm.size() % 4U, 0U);
+        EXPECT_TRUE(std::any_of(observed->pcm.begin(), observed->pcm.end(),
+                               [](std::byte value) { return value != std::byte{0}; }));
+        for (std::size_t offset = 0; offset < observed->pcm.size(); offset += 4U) {
+            EXPECT_EQ(observed->pcm[offset], observed->pcm[offset + 2U]);
+            EXPECT_EQ(observed->pcm[offset + 1U], observed->pcm[offset + 3U]);
+        }
+        EXPECT_NE(log.find("\"event\":\"audio_write_completed\""), std::string::npos);
+        EXPECT_NE(log.find("\"scheduled_end_ns\":"), std::string::npos);
+    }
 }
 
 std::atomic<int> runtime_connects{0};

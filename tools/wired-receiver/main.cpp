@@ -319,8 +319,10 @@ aa::audio::RouterConfig pcm_router_config() {
     config.output_format = aa::audio::AudioFormat{48000, 2, 16};
     for (auto &role : config.roles) {
         role.codec = aa::audio::Codec::pcm;
-        role.input_format = aa::audio::AudioFormat{48000, 2, 16};
+        role.input_format = aa::audio::AudioFormat{16000, 1, 16};
     }
+    config.roles[aa::audio::role_index(aa::audio::Role::media)].input_format =
+        aa::audio::AudioFormat{48000, 2, 16};
     config.on_write_completed = [](const aa::audio::WriteCompletion &completion) {
         log_line("{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
                  std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
