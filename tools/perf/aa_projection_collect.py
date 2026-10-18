@@ -42,12 +42,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Literal
 
 from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
 from aa_measurement_coverage import Sample, ThermalZone, VideoEvidence
 
 CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
-_STARTUP_GRACE_SECONDS = 3.0
 _TERMINATE_GRACE_SECONDS = 5.0
 _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
 _MEDIA_STALL_SECONDS = 10
@@ -223,6 +223,7 @@ class EventParser:
         self.av_pairs = 0
         self.audio_writes = 0
         self.video_presentations = 0
+        self.receiver_ready = False
         self.projection_active = False
         self.last_audio_scheduled = -1
         self.last_video_scheduled = -1
@@ -357,6 +358,8 @@ class EventParser:
             self.video_units = event["units"]
         if envelope == "audio_chunks" and isinstance(event.get("count"), int):
             self.audio_chunks = event["count"]
+        if envelope == "ready":
+            self.receiver_ready = True
         if envelope == "active" and isinstance(event.get("startup_ms"), int):
             self.startup_ms = event["startup_ms"]
             self.projection_active = True
@@ -378,9 +381,9 @@ class EventParser:
         self._number(event, "frame_drops", "frame_drops", integer=True)
 
 
-def _terminate(proc: subprocess.Popen | None) -> None:
+def _terminate(proc: subprocess.Popen | None) -> Literal["clean", "forced_kill", "unreaped"]:
     if proc is None or proc.poll() is not None:
-        return
+        return "clean"
     proc.terminate()
     try:
         proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
@@ -389,7 +392,9 @@ def _terminate(proc: subprocess.Popen | None) -> None:
         try:
             proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            pass
+            return "unreaped"
+        return "forced_kill"
+    return "clean"
 
 
 def collect(args: argparse.Namespace) -> dict:
@@ -399,10 +404,21 @@ def collect(args: argparse.Namespace) -> dict:
     display_log = state_dir / "display.log"
 
     startup_timeout = getattr(args, "startup_timeout_seconds", _PROJECTION_STARTUP_TIMEOUT_SECONDS)
+    managed_display = bool(args.display and not args.no_display)
+    video_socket = getattr(args, "video_socket", None)
+    input_socket = getattr(args, "input_socket", None)
     receiver_cmd = [args.receiver, "--port", args.port, "--duration-ms",
                     str((args.duration_seconds + startup_timeout + 10) * 1000)]
     if args.store:
         receiver_cmd += ["--store", args.store]
+    if video_socket:
+        receiver_cmd += ["--video-socket", video_socket]
+    if input_socket:
+        receiver_cmd += ["--input-socket", input_socket]
+    if managed_display:
+        # Contract: --require-video-consumer makes the receiver emit "ready"
+        # after listeners/control init and BEFORE version negotiation.
+        receiver_cmd += ["--require-video-consumer"]
 
     samples: list[Sample] = []
     parser = EventParser()
@@ -423,23 +439,40 @@ def collect(args: argparse.Namespace) -> dict:
     inventory: tuple[ThermalZone, ...] = ()
     video_evidence = VideoEvidence((), (), ())
     observed_duration = 0.0
+    deadline = start + startup_timeout
 
     try:
         rec_file = open(receiver_log, "w", encoding="utf-8")
         receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
                                     start_new_session=True)
-        if args.display and not args.no_display:
-            time.sleep(_STARTUP_GRACE_SECONDS)
-            disp_file = open(display_log, "w", encoding="utf-8")
-            display_cmd = [args.display, "--test-only-autostart"]
-            if args.video_socket:
-                display_cmd += ["--video-socket", args.video_socket]
-            if args.input_socket:
-                display_cmd += ["--input-socket", args.input_socket]
-            display = subprocess.Popen(display_cmd, stdout=disp_file, stderr=subprocess.STDOUT,
-                                       start_new_session=True)
+        if managed_display:
+            # Bounded receiver-ready observation: the managed display launches on
+            # THIS receiver's "ready" event, never on a fixed sleep. The wait is
+            # bounded by the one absolute startup deadline above, measured from
+            # the pre-launch origin and never refreshed by readiness.
+            while True:
+                parser.poll(str(receiver_log))
+                now = time.monotonic_ns() / 1e9
+                if receiver.poll() is not None:
+                    early_exit = True
+                    break
+                if parser.terminal_errors:
+                    break
+                if now >= deadline or parser.receiver_ready:
+                    break
+                time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
+            if (parser.receiver_ready and now < deadline
+                    and not early_exit and not parser.terminal_errors):
+                disp_file = open(display_log, "w", encoding="utf-8")
+                display_cmd = [args.display, "--test-only-autostart"]
+                if video_socket:
+                    display_cmd += ["--video-socket", video_socket]
+                if input_socket:
+                    display_cmd += ["--input-socket", input_socket]
+                if time.monotonic_ns() / 1e9 < deadline:
+                    display = subprocess.Popen(display_cmd, stdout=disp_file, stderr=subprocess.STDOUT,
+                                               start_new_session=True)
 
-        deadline = start + startup_timeout
         while True:
             now = time.monotonic_ns() / 1e9
             if display is not None:
@@ -483,6 +516,22 @@ def collect(args: argparse.Namespace) -> dict:
                 break
 
         video_evidence = parser.video_measurements.finish(progress.last_ns)
+        events = {key: value for key, value in parser.metrics.items()
+                  if key not in {*_DECODE_KEYS.values(), *_IPC_KEYS.values()}}
+        events["helper_rss_mb"] = None
+        events["video_units"] = parser.video_units
+        events["audio_chunks"] = parser.audio_chunks
+        events["startup_ms"] = parser.startup_ms
+        invalid_telemetry = sorted(set(parser.invalid_telemetry) | set(parser.video_measurements.issues))
+        video_telemetry = {
+            "ipc_matched": parser.video_measurements.ipc_matched,
+            "ipc_consumed_bytes": parser.video_measurements.receive_bytes,
+            "ipc_matched_samples_retained": len(parser.video_measurements.ipc_samples),
+            "ipc_unmatched_or_expired": parser.video_measurements.unmatched,
+            "ipc_pending_send": len(parser.video_measurements.sends),
+            "ipc_pending_receive": len(parser.video_measurements.receives),
+            "decode_samples_retained": len(parser.video_measurements.decode_samples),
+        }
         observed_duration = (time.monotonic_ns() - origin_ns) / 1e9
         if display is not None and display_survived is None:
             display_survived = display.poll() is None
@@ -491,14 +540,16 @@ def collect(args: argparse.Namespace) -> dict:
                 receiver.wait(timeout=min(args.interval, _TERMINATE_GRACE_SECONDS))
             except subprocess.TimeoutExpired:
                 stopped_by_us = True
-                _terminate(receiver)
-        receiver_exit = receiver.returncode
     except FileNotFoundError as exc:
         raise SystemExit(f"error: cannot launch receiver: {exc}") from exc
     finally:
         parser.video_measurements.frozen = True
-        _terminate(display)
-        _terminate(receiver)
+        if display is not None and display.poll() is not None:
+            display_survived = False
+        for name, proc in (("display", display), ("receiver", receiver)):
+            cleanup = _terminate(proc)
+            if cleanup != "clean":
+                parser.terminal_errors.append({"event": "err", "code": name + "_cleanup_" + cleanup})
         if rec_file is not None:
             rec_file.close()
         if disp_file is not None:
@@ -507,19 +558,12 @@ def collect(args: argparse.Namespace) -> dict:
         if display is not None:
             parser.poll(str(display_log))
 
-    if receiver_exit is None and receiver is not None:
+    if receiver is not None:
         receiver_exit = receiver.returncode
     if not stopped_by_us and receiver_exit is not None and receiver_exit != 0:
         crashes = 1
     if not stopped_by_us and not early_exit and receiver_exit is None:
         crashes = 1
-
-    events = {key: value for key, value in parser.metrics.items()
-              if key not in {*_DECODE_KEYS.values(), *_IPC_KEYS.values()}}
-    events["helper_rss_mb"] = None
-    events["video_units"] = parser.video_units
-    events["audio_chunks"] = parser.audio_chunks
-    events["startup_ms"] = parser.startup_ms
 
     return {
         "schema": CAPTURE_SCHEMA,
@@ -537,21 +581,13 @@ def collect(args: argparse.Namespace) -> dict:
         "display_survived": display_survived,
         "display_connected": display_connected,
         "terminal_errors": parser.terminal_errors,
-        "invalid_telemetry": sorted(set(parser.invalid_telemetry) | set(parser.video_measurements.issues)),
+        "invalid_telemetry": invalid_telemetry,
         "monotonic_origin_ns": origin_ns,
         "cpu_ticks_per_second": clk,
         "samples": [asdict(sample) for sample in samples],
         "video_evidence": asdict(video_evidence),
         "events": events,
-        "video_telemetry": {
-            "ipc_matched": parser.video_measurements.ipc_matched,
-            "ipc_consumed_bytes": parser.video_measurements.receive_bytes,
-            "ipc_matched_samples_retained": len(parser.video_measurements.ipc_samples),
-            "ipc_unmatched_or_expired": parser.video_measurements.unmatched,
-            "ipc_pending_send": len(parser.video_measurements.sends),
-            "ipc_pending_receive": len(parser.video_measurements.receives),
-            "decode_samples_retained": len(parser.video_measurements.decode_samples),
-        },
+        "video_telemetry": video_telemetry,
         "target_hardware_state": _target_hardware_state(),
     }
 

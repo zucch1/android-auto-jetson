@@ -10,7 +10,10 @@ Speaks the same newline-delimited JSON event stream as
 ``tools/wired-receiver/main.cpp`` (ready/active/video_sent/audio_chunks and a
 ``diag`` ``decode_stats`` event) so ``aa_projection_collect.py`` can be
 exercised on the host without hardware. Accepts (and ignores) the receiver CLI
-``--port`` / ``--duration-ms`` / ``--store``.
+``--port`` / ``--duration-ms`` / ``--store`` / ``--video-socket`` /
+``--input-socket`` / ``--require-video-consumer`` (the managed-display consumer
+gate: accepted here, never emulated - this fixture fakes no hardware
+qualification).
 
 Env knobs for the test:
   FAKE_RECEIVER_CRASH=1  exit non-zero before the duration elapses (crash path)

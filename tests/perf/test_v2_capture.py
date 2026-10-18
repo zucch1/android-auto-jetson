@@ -210,7 +210,7 @@ def test_collector_freezes_before_final_poll_and_preserves_missing_raw_reads() -
               patch.object(collector, "_target_hardware_state", return_value={} )):
             # When the real collector samples then terminates and drains its logs.
             capture = collector.collect(args)
-    # Then only active endpoints survive and shutdown audio/terminal diagnostics remain.
+    # Then measurements freeze, while shutdown terminal diagnostics remain live.
     evidence = parse_capture(json.loads(json.dumps(capture)))
     reduction = reduce_capture(evidence, Window(SECOND, 4 * SECOND))
     assert reduction.measurement_coverage.decode.count == 3
@@ -221,7 +221,7 @@ def test_collector_freezes_before_final_poll_and_preserves_missing_raw_reads() -
     assert reduction.measurement_coverage.cpu.missing == 2
     assert reduction.measurement_coverage.thermal.missing == 1
     assert evidence.samples[1].receiver_cpu_ticks is None
-    assert capture["events"]["audio_latency_ms"] == 199
+    assert capture["events"]["audio_latency_ms"] is None
     assert capture["terminal_errors"] == [{"event": "err", "code": "shutdown-diagnostic"}]
     assert not set(collector._DECODE_KEYS.values()) & capture["events"].keys()
     assert not set(collector._IPC_KEYS.values()) & capture["events"].keys()

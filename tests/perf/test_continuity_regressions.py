@@ -27,8 +27,11 @@ from aa_measurement_coverage import CoverageLedger, Sample
 class Process:
     pid = os.getpid()
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, command=(), *, stdout=None, **kwargs) -> None:
         self.returncode = None
+        if stdout is not None:
+            stdout.write(json.dumps({"event": "ready", "state": "negotiating"}) + "\n")
+            stdout.flush()
 
     def poll(self) -> int | None:
         return self.returncode
@@ -61,7 +64,6 @@ def disconnected() -> None:
                                   state_dir=str(Path(tmp) / "state"))
         with (patch.object(collector.time, "monotonic_ns", side_effect=lambda: int(clock[0] * 1e9)),
               patch.object(collector.time, "sleep", side_effect=sleep),
-              patch.object(collector, "_STARTUP_GRACE_SECONDS", 0),
               patch.object(collector.subprocess, "Popen", Process),
               patch.object(collector.subprocess, "run", side_effect=query),
               patch.object(collector.glob, "glob", return_value=[str(status)]),
@@ -112,7 +114,7 @@ def active_window(freeze_after: float | None = None) -> None:
     logs = {}
     class LoggingProcess(Process):
         def __init__(self, command, *, stdout, **kwargs) -> None:
-            super().__init__()
+            super().__init__(command, stdout=stdout)
             logs[command[0]] = stdout
     def sleep(seconds: float) -> None:
         clock[0] += seconds
@@ -136,7 +138,6 @@ def active_window(freeze_after: float | None = None) -> None:
                                   input_socket=None, state_dir=tmp)
         with (patch.object(collector.time, "monotonic_ns", side_effect=lambda: int(clock[0] * 1e9)),
               patch.object(collector.time, "sleep", side_effect=sleep),
-              patch.object(collector, "_STARTUP_GRACE_SECONDS", 0),
               patch.object(collector.subprocess, "Popen", LoggingProcess),
               patch.object(collector, "_display_connected", return_value=True),
               patch.object(collector, "_thermal_zones", return_value=()),

@@ -1,7 +1,7 @@
 # Wired projection performance + soak measurement (task 32)
 
 `aa-projection-perf.sh` measures wired (USB/AOA) Android Auto projection
-performance on the qualified Jetson and evaluates the **contractual** budgets.
+performance on the target Jetson and evaluates the **contractual** budgets.
 It is the task-32 deliverable: phase A ships the tool, its JSON schema, its
 fixtures/tests and the phase-B runbook; the actual 30-minute performance run and
 2-hour soak are run later under orchestrator control (see
@@ -73,11 +73,33 @@ Video evidence has one sealed summary per active sample interval for consumption
 IPC matches and decode. Edge-inclusive coverage retains whole-window counts,
 bytes and gaps beyond 4096 observations. A ten-second event-time reorder horizon
 seals whole sample intervals; old replay cannot repair sealed gaps. Capacity loss
-latches `coverage_capacity`. Video ingestion freezes at the last sample before
-termination. Rings retain the last 4096 eligible processing-order deltas with
-nearest-rank percentiles. Six decode/IPC event scalars are forbidden; they are
+latches `coverage_capacity`. Rings retain the last 4096 eligible processing-order
+deltas with nearest-rank percentiles. Six decode/IPC event scalars are forbidden; they are
 derived exclusively from evidence. Diagnostic `video_telemetry` never proves
-completeness. A/V maxima, audio latency/skew and drops retain run-cumulative scope.
+completeness.
+
+### Measurement cutoff versus terminal diagnostics
+
+Immediately after `VideoMeasurements.finish(last_sample)`, before the receiver
+grace wait, termination or final log drain, the collector snapshots all exported
+event measurements: scalars, counters, startup timing and `helper_rss_mb: null`,
+plus invalid-measurement markers and all `video_telemetry`. Samples, sealed video
+evidence and progress retain their existing semantics. An event first consumed
+after this cutoff cannot change measurements, even if its completion timestamp
+is backdated into the prior window; sealed intervals cannot reopen.
+
+Scalar peaks (including audio latency/skew and matched A/V), drops and counters
+remain **run-cumulative observations admitted through the measurement cutoff**.
+They are not newly startup-exclusive active-window metrics: startup maxima are
+not subtracted and counter scope is not reset. RSS/CPU/thermal and video evidence
+are reduced over the active window separately.
+
+Terminal `err` records, crashes, actual exit status, early exit, unexpected
+display death and unsuccessful bounded cleanup remain genuine failure information
+through cleanup. Raw shutdown logs retain numbers for diagnostics only; a final
+shutdown flush is not eligible measurement input. A pre-cutoff budget breach
+still yields FAIL. Shutdown-only over-budget numbers change neither measurements
+nor verdict, but a genuine failure can still make the verdict FAIL.
 
 Missing RSS/CPU/thermal or any video stream yields BLOCKED/INCOMPLETE, without
 adding throughput/FPS/thermal/decode budgets. Definite measured budget breaches
@@ -109,7 +131,7 @@ newline-delimited JSON event stream:
 | --- | --- |
 | receiver RSS / CPU | `/proc/<pid>/status` (`VmRSS`), `/proc/<pid>/stat` (utime+stime over the sampling interval) |
 | thermal state | `/sys/class/thermal/thermal_zone*/{temp,type}` |
-| frame drops | receiver `decode_stats.frame_drops`: observed outlet AU drops, cumulative with final flush |
+| frame drops | receiver `decode_stats.frame_drops`: run-cumulative observed outlet AU drops admitted through the measurement cutoff; shutdown-only final flush excluded |
 | decode timing | matched `video_decode_completed` local submit-entry / I420-copy completion events |
 | IPC | correlated `video_ipc_send` / `video_ipc_receive` endpoints; consumed payload bytes over measured consumer window |
 | A/V sync | peak absolute completion delta of concurrent `video_presented` / `audio_write_completed` events |
@@ -122,15 +144,19 @@ emits a low-rate `media_timing` event carrying `audio_scheduling_skew_ms` (peak
 `RouterStats::max_completion_skew`, informational only) and `audio_latency_ms`
 (peak `RouterStats::max_path_latency`:
 receiver input before decode to handoff-confirmed write completion at the
-routing element). Both are the cumulative peak (worst observed) because the
-phase-B gate is a run/soak budget. A final cumulative event is flushed before
-router teardown, including orderly early exits. `av_sync_ms` is computed only
+routing element). Both are run-cumulative peaks (worst observed in events
+admitted through the measurement cutoff), not startup-exclusive active-window
+peaks. The receiver flushes a final cumulative event before router teardown,
+including orderly early exits; if first consumed after the cutoff it is raw-log
+diagnostic information only. `av_sync_ms` is computed only
 from the cross-stream consumer completion events: the video's retained common
 monotonic timestamp must lie in the audio write's half-open scheduled interval.
 The collector retains the maximum absolute paint-completion / stream-write-
-completion delta over the window, regardless of log arrival order. No matched
-pair means `null`, never a proxy or fabricated zero. These endpoints are API
-completion events, not photon/speaker observations. Until an audio chunk is routed the fields
+completion delta among pairs admitted through the cutoff, regardless of their
+log arrival order before that cutoff. No matched pair means `null`, never a proxy
+or fabricated zero. These endpoints are API completion events, not photon/speaker
+observations; they do not qualify microphone input or physical output.
+Until an audio chunk is routed the fields
 stay absent and the collector keeps them `null` -> the run is **BLOCKED** (fail
 closed, never a fabricated `0`). Device-supplied text (thermal zone names) is
 JSON-escaped as data and never injected into the document.
@@ -138,12 +164,13 @@ JSON-escaped as data and never injected into the document.
 Video endpoints preserve the v1 wire and A/V timestamp. The latter is an opaque
 join key, never a send-start proxy. The reducer bounds pending/dedup tables and
 rolling percentile deltas to 4096 entries, expires unmatched IPC at ten seconds,
-and keeps cumulative observed frame/byte counts. Quantiles use nearest rank over
-the last 4096 processed matched samples. See the runbook's **Video measurements**
+and keeps cumulative eligible active-window frame/byte counts. Quantiles use
+nearest rank over the last 4096 processed matched samples. See the runbook's **Video measurements**
 section for exact endpoints, reconnect attribution, drop scope and exclusions.
 The ssh stdin payload bundles the collector and reducer; no target-side module
-installation is assumed. `video_telemetry` in the raw capture records final
-retained, unmatched and pending counts. Missing pairs are never zero-valued data.
+installation is assumed. `video_telemetry` in the raw capture records retained,
+unmatched and pending counts frozen at the measurement cutoff, not after cleanup.
+Missing pairs are never zero-valued data.
 
 Live qualification excludes a bounded 60-second startup grace: the requested
 window begins only with active receiver video/audio progress, consumer paint/
@@ -154,6 +181,18 @@ session's `xrandr --query` are positive connection sources (either suffices;
 neither means disconnected). The reporter independently verifies progress over
 the entire window; startup-only evidence never qualifies. See the runbook for
 endpoint limitations and the continuous-workload requirement.
+
+Startup sequencing: `--video-socket`/`--input-socket` overrides are passed to
+both the receiver and the display. With a managed display (`--display` and not
+`--no-display`) the receiver is started with `--require-video-consumer` and the
+display launches only once that receiver emits its `ready` event (listeners and
+control infrastructure initialized, before version negotiation). The handshake
+is bounded by the same absolute startup deadline measured from the monotonic
+origin before launch - readiness never refreshes it. No `ready` event by that
+deadline ends the run BLOCKED with the consumer unlaunched; receiver death
+during the wait is an early exit. Readiness is the `ready` event alone: socket
+existence, `ACTIVE` or a bare connection never substitute for it. Without a
+managed display the receiver runs unchanged and no consumer gate is requested.
 
 ## Result document and provenance
 

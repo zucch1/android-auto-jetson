@@ -93,6 +93,7 @@ def interruption(tmp: Path) -> None:
         receiver = tmp / (scenario + "-receiver")
         receiver.write_text('''#!/usr/bin/env python3
 import json, time
+print('{"event":"ready","state":"negotiating"}', flush=True)
 print('{"event":"active","startup_ms":5}', flush=True)
 print('{"event":"video_sent","units":10}', flush=True)
 print('{"event":"audio_chunks","count":10}', flush=True)
@@ -112,13 +113,8 @@ time.sleep(0.35)
                                   duration_seconds=1, interval=0.1, store=None,
                                   video_socket=None, input_socket=None,
                                   state_dir=str(tmp / scenario))
-        grace = aa_projection_collect._STARTUP_GRACE_SECONDS
-        aa_projection_collect._STARTUP_GRACE_SECONDS = 0
-        try:
-            with patch.object(aa_projection_collect, "_display_connected", return_value=True):
-                capture = aa_projection_collect.collect(args)
-        finally:
-            aa_projection_collect._STARTUP_GRACE_SECONDS = grace
+        with patch.object(aa_projection_collect, "_display_connected", return_value=True):
+            capture = aa_projection_collect.collect(args)
         doc = result(capture)
         failure = {"clean_early": "early_exit", "terminal_alive": "terminal_errors",
                    "display_death": "display_survived"}[scenario]
@@ -238,8 +234,9 @@ while True: time.sleep(0.01)
                            "--state-dir", str(tmp / "state")], capture_output=True, text=True, timeout=15)
     assert proc.returncode == 0, proc.stderr
     capture = json.loads(proc.stdout)
-    assert capture["events"]["av_sync_ms"] == 75, capture
-    assert result(capture)["verdict"] == "FAIL"
+    assert capture["events"]["av_sync_ms"] is None, capture
+    assert result(capture)["verdict"] == "BLOCKED"
+    assert not result(capture)["violations"]
 
 
 def receiver_hook_present(source: str) -> bool:

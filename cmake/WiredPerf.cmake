@@ -23,6 +23,12 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_perf_video_measurements COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_video_measurements.py" "$<TARGET_FILE:aa_video_telemetry_probe>")
     set_tests_properties(wired_perf_video_measurements PROPERTIES TIMEOUT 60)
+    add_test(NAME wired_perf_startup_repair COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/perf/test_startup_repair.py")
+    set_tests_properties(wired_perf_startup_repair PROPERTIES TIMEOUT 180)
+    add_test(NAME wired_perf_measurement_freeze COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/perf/test_measurement_freeze.py")
+    set_tests_properties(wired_perf_measurement_freeze PROPERTIES TIMEOUT 45)
     add_test(NAME wired_perf_av_sync COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" av_sync)
     add_test(NAME wired_perf_display_sources COMMAND "${Python3_EXECUTABLE}" -B
