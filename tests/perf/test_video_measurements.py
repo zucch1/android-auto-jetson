@@ -28,6 +28,12 @@ def consume(parser: EventParser, events: list[dict[str, int | str]]) -> None:
         parser._consume(json.dumps(event))
 
 
+def active_parser() -> EventParser:
+    parser = EventParser()
+    parser.video_measurements.start_window(0, 0)
+    return parser
+
+
 def test_ipc_uses_send_start_and_consumed_bytes_when_logs_are_reordered() -> None:
     # Given true send/receive endpoints 25 ms apart and an unrelated AV key.
     events = [ipc_event("video_ipc_send", 1, 1_000_000_100),
@@ -36,7 +42,7 @@ def test_ipc_uses_send_start_and_consumed_bytes_when_logs_are_reordered() -> Non
               ipc_event("video_ipc_receive", 2, 2_000_000_100)]
     # When either file is polled first, including duplicate endpoint lines.
     for order in (events, list(reversed(events)), events[::2] + events[1::2]):
-        parser = EventParser()
+        parser = active_parser()
         consume(parser, order + order)
         # Then latency is not receive minus AV time and bytes are counted once.
         assert parser.metrics["ipc_p95_added_latency_ms"] == 25
@@ -58,7 +64,7 @@ def test_ipc_missing_stale_and_reset_samples_stay_absent() -> None:
     wrong_process["producer_pid"] = 9
     # When each unmatched path reaches the real collector.
     for receive in (missing, reset, stale, regressed, wrong_size, wrong_process):
-        parser = EventParser()
+        parser = active_parser()
         consume(parser, [send, receive])
         # Then no duration is fabricated for it.
         assert parser.metrics["ipc_p95_added_latency_ms"] is None, receive
@@ -66,7 +72,7 @@ def test_ipc_missing_stale_and_reset_samples_stay_absent() -> None:
 
 def test_throughput_keeps_consumed_bytes_when_producer_log_is_far_ahead() -> None:
     # Given an unmatched future producer event and an older complete consumed AU.
-    parser = EventParser()
+    parser = active_parser()
     future = ipc_event("video_ipc_send", 2, 2 * RETENTION_NS)
     consumed = ipc_event("video_ipc_receive", 1, 1_000_000_100)
     # When latency correlation has already expired but consumption was observed.
@@ -85,7 +91,7 @@ def test_ipc_reconnect_rebinds_only_new_frame_identity() -> None:
     receive = ipc_event("video_ipc_receive", 2, 1_020_000_000)
     receive["connection_ns"] = 400
     receive["sequence"] = 0
-    parser = EventParser()
+    parser = active_parser()
     # When the new consumer log arrives before the producer log.
     consume(parser, [receive, old, send])
     # Then only the new matched transfer contributes.
@@ -101,7 +107,7 @@ def test_quantiles_count_and_fps_use_decode_completion_deltas() -> None:
         events.append({"event": "video_decode_completed", "session_ns": 100,
                        "frame": frame, "sequence": frame * 3, "timestamp_ns": 900 + frame,
                        "submitted_ns": 1_000_000_000, "completed_ns": 1_000_000_000 + frame * 1_000_000})
-    parser = EventParser()
+    parser = active_parser()
     # When reordered completions, duplicates and measured drops are consumed.
     consume(parser, list(reversed(events)) + events + [{"event": "decode_stats", "frame_drops": 3}])
     # Then nearest-rank quantiles and the measured output rate are exact.
@@ -114,7 +120,7 @@ def test_quantiles_count_and_fps_use_decode_completion_deltas() -> None:
 
 def test_missing_decode_and_invalid_endpoints_never_supply_zero() -> None:
     # Given an empty capture or a duration beyond the decode retention policy.
-    parser = EventParser()
+    parser = active_parser()
     assert all(parser.metrics[key] is None for key in (
         "decode_frames", "decode_fps", "decode_p50_ms", "decode_p95_ms", "frame_drops"))
     invalid = {"event": "video_decode_completed", "session_ns": 100, "frame": 1,
@@ -127,20 +133,18 @@ def test_missing_decode_and_invalid_endpoints_never_supply_zero() -> None:
     assert "decode_p95_ms" in parser.invalid_telemetry
 
 
-def test_unmatched_storage_is_bounded_and_expired_keys_cannot_revive() -> None:
+def test_unmatched_storage_is_bounded_and_capacity_loss_is_explicit() -> None:
     # Given more pending sends than the fixed correlation capacity.
-    parser = EventParser()
+    parser = active_parser()
     # When the consumer never reports those frames.
     consume(parser, [ipc_event("video_ipc_send", frame, 1_000 + frame)
                      for frame in range(LIMIT + 50)])
-    # Then eviction is accounted and cannot create a latency sample.
+    # Then rejected admission is accounted and cannot create a latency sample.
     assert len(parser.video_measurements.sends) == LIMIT
     assert parser.video_measurements.unmatched == 50
     assert parser.metrics["ipc_p95_added_latency_ms"] is None
     assert IpcEndpoint.parse({"observed_ns": True}) is None
-    consume(parser, [ipc_event("video_ipc_receive", 0, 9_000),
-                     ipc_event("video_ipc_send", 0, 1_000)])
-    assert parser.metrics["ipc_p95_added_latency_ms"] is None
+    assert "coverage_capacity" in parser.video_measurements.issues
 
 
 def test_decode_counts_continue_across_sessions_without_reusing_old_identity() -> None:
@@ -150,7 +154,7 @@ def test_decode_counts_continue_across_sessions_without_reusing_old_identity() -
              "completed_ns": 1_010_000_000}
     second = dict(first, session_ns=2_000_000_000, submitted_ns=2_000_000_000,
                   completed_ns=2_020_000_000)
-    parser = EventParser()
+    parser = active_parser()
     # When the fresh completion and duplicate old completion arrive.
     consume(parser, [first, second, first])
     # Then both real completions count once and the old event cannot reset totals.
@@ -174,13 +178,35 @@ def test_remote_stdin_bundle_contains_reducer_without_target_installation() -> N
     assert "--duration-seconds" in result.stdout
 
 
+def test_wrapper_blocked_capture_is_reportable_v2_without_live_readiness() -> None:
+    # Given the wrapper's actual blocked-capture builder, without executing SSH readiness.
+    tool = Path(__file__).resolve().parents[2] / "tools/perf"
+    shell = (tool / "aa-projection-perf.sh").read_text()
+    builder = shell.split('"$PY" -B - "$capture" <<\'PY\'\n', 1)[1].split('\nPY\n', 1)[0]
+    with tempfile.TemporaryDirectory(prefix="perf-v2-blocked-") as tmp:
+        capture, output = Path(tmp) / "capture.json", Path(tmp) / "result.json"
+        subprocess.run([sys.executable, "-B", "-", str(capture)], input=builder,
+                       text=True, capture_output=True, check=True, timeout=5)
+        # When that capture passes through the real reporter contract and schema.
+        result = subprocess.run([sys.executable, "-B", str(tool / "aa_perf_report.py"),
+                                 "--capture", str(capture), "--out", str(output),
+                                 "--live", "--blocked-on", "fixture_absent"],
+                                text=True, capture_output=True, timeout=5)
+        document = json.loads(output.read_text())
+    # Then missing prerequisites produce v2 BLOCKED, not malformed evidence or a live pass.
+    assert result.returncode == 3, result.stderr
+    assert document["schema"] == "aa-projection-perf/2"
+    assert document["verdict"] == "BLOCKED"
+    assert document["measurement_coverage"]["window"] is None
+
+
 def real_endpoints(probe: str) -> None:
     # Given a real fixture, receiver outlet, AF_UNIX channel and software decoder.
     fixture = Path(__file__).resolve().parents[1] / "fixtures/media/h264_720p30_baseline_90f.h264"
     # When the executable drives those endpoints without phones or target hardware.
     result = subprocess.run([probe, str(fixture)], text=True, capture_output=True, timeout=30)
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
-    parser = EventParser()
+    parser = active_parser()
     for line in result.stdout.splitlines():
         parser._consume(line)
     events = [json.loads(line) for line in result.stdout.splitlines()]

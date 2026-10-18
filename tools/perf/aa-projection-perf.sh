@@ -31,7 +31,7 @@ set -euo pipefail
 
 TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PYTHON:-python3}"
-SCHEMA="$TOOL_DIR/aa-projection-perf.schema.json"
+SCHEMA="$TOOL_DIR/aa-projection-perf-v2.schema.json"
 REPORTER="$TOOL_DIR/aa_perf_report.py"
 
 MODE=""
@@ -181,7 +181,10 @@ blocked_result() {
 import json, sys
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump({
-        "schema": "aa-projection-perf-capture/1",
+        "schema": "aa-projection-perf-capture/2",
+        "monotonic_origin_ns": 0,
+        "cpu_ticks_per_second": 1,
+        "video_evidence": {"blocks": [], "ipc_latency_ns": [], "decode_latency_ns": []},
         "mode": "wired",
         "duration_seconds": 0,
         "crashes": 0,
@@ -275,12 +278,13 @@ capture_file="$BUFFER/capture.json"
 "$PY" -B - "$TOOL_DIR" >"$BUFFER/collector.py" <<'PY'
 import pathlib, sys
 root = pathlib.Path(sys.argv[1])
-source = (root / "aa_video_measurements.py").read_text()
 collector = (root / "aa_projection_collect.py").read_text()
 print("import sys, types")
-print("module = types.ModuleType('aa_video_measurements')")
-print("sys.modules[module.__name__] = module")
-print("exec(" + repr(source) + ", module.__dict__)")
+for name in ("aa_measurement_coverage", "aa_video_measurements"):
+    source = (root / (name + ".py")).read_text()
+    print("module = types.ModuleType(" + repr(name) + ")")
+    print("sys.modules[module.__name__] = module")
+    print("exec(" + repr(source) + ", module.__dict__)")
 print("exec(compile(" + repr(collector) + ", 'aa_projection_collect.py', 'exec'))")
 PY
 collector_timeout=$((duration_secs + 120))
