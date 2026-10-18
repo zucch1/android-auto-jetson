@@ -163,6 +163,11 @@ include(cmake/WiredRecovery.cmake)
 # Task 32 wired performance/soak measurement tooling (host-side fixtures).
 include(cmake/WiredPerf.cmake)
 if(NOT CMAKE_CROSSCOMPILING)
+    foreach(suite coverage capture)
+        add_test(NAME wired_perf_v2_${suite} COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_SOURCE_DIR}/tests/perf/test_v2_${suite}.py")
+        set_tests_properties(wired_perf_v2_${suite} PROPERTIES TIMEOUT 120)
+    endforeach()
     add_test(NAME wired_qualification COMMAND "${Python3_EXECUTABLE}" -B
         -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/qualification" -v)
     set_tests_properties(wired_qualification PROPERTIES TIMEOUT 120)

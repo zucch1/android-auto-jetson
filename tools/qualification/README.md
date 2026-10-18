@@ -61,7 +61,7 @@ private raw paths are not exported. Never invent missing historical bytes.
   this does not claim a live malformed-input injection. Blocked/reduced-scope
   matrices are not accepted by version 1; owner-signoff support is not inferred.
 - Task32 requires the exact task `32. Measure wired performance and two-hour soak`,
-  validates against the existing perf schema, then independently
+  requires `aa-projection-perf/2`, validates against the v2 perf schema, then independently
   checks live/COMPLETE_LIVE, PASS, empty gaps/violations/invalid telemetry, zero
   crashes, complete observed **and active** windows >=1800 / >=7200 seconds,
   positive media counters, connected/surviving display, orderly collector stop,
@@ -72,6 +72,19 @@ private raw paths are not exported. Never invent missing historical bytes.
   Helper RSS must be null/NOT_REQUIRED. Decode, frame-drop, IPC, RSS/CPU and
   thermal informational measurements must be numeric; thermal zones must be
   recorded. This does not reintroduce the withdrawn decode-p95 budget.
+- After the raw `capture` pointer is stripped, task33 itself calls the shared
+  `parse_coverage` and `coverage_gaps` boundaries. `measurement_coverage` must
+  satisfy `active-window-coverage/1`: the window duration must equal active
+  seconds, sampling/RSS/thermal must span the window with every resource sample
+  valid, CPU must measure every adjacent interval with a valid baseline, and
+  consumption/matched-IPC/decode evidence must cover both edges with no gap
+  greater than 10 seconds (exactly 10 seconds passes). Counts, expected/missing
+  relationships, bounds, bytes and retained quantile counts are independently
+  parsed; booleans, missing coverage and contradictory summaries reject even
+  when labels say PASS and the changed result is rehashed. Decode frames and
+  decode/IPC rates must agree with coverage counts/bytes/durations; thermal peak
+  must agree with the recorded zone peaks. Historical v1 results cannot qualify.
+  Summaries establish contract consistency, not measurement authenticity.
 - Provenance requires SHA256 source/build/configuration digests, nonempty
   service definitions (name + digest), dependency versions, target hardware
   state, **`package_digest: null` and `equivalence_status: "provisional"`**.
@@ -109,3 +122,11 @@ not the factual completeness of its prose.
 The host-only `wired_qualification` test runs this offline suite from CTest with
 a 120-second timeout. No target access, network, C++ rebuild or live evidence is
 needed for this test. It does not certify a real qualification package.
+`synthetic_capture.py` constructs complete live-shaped v2 samples and endpoint
+blocks for both windows; `fixture.py` passes those inputs through the real
+reporter without relabeling offline results or patching verdicts. Decode p95 is
+100 ms and remains informational. `test_coverage.py` exercises independent
+sanitized-summary rejection in addition to the existing wired/privacy tests.
+The shared `tools/perf/aa_measurement_coverage.py`, v2 default schema, reporter
+and typed-sample `ProjectionProgress` must be delivered together before running
+these tests. Actual 30-minute and two-hour hardware acceptance remains outstanding.

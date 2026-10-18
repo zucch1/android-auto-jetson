@@ -83,7 +83,9 @@ The requested 30-minute/2-hour window starts only after `active` and positive
 receiver video/audio counters **and** video paint/audio write completions with
 matched A/V pairs. A capture without that evidence is BLOCKED, not timed as a
 successful projection. `startup_wait_seconds` and `active_projection_seconds`
-are recorded separately from process lifetime (`duration_seconds`).
+are recorded separately from process lifetime. V2 result `duration_seconds` is
+exactly the replayed active window; capture `observed_duration_seconds` is only
+a process-lifetime diagnostic.
 
 At least every five seconds the collector samples those cumulative counters.
 Every stream, including the matched-pair counter, must advance within **10
@@ -95,7 +97,7 @@ the window. Use a continuously playing audio/video workload for qualification;
 intentional media pauses do not count as verified active projection.
 
 Both runs write a result document (validated against
-`tools/perf/aa-projection-perf.schema.json`) whose gated metrics are compared to
+`tools/perf/aa-projection-perf-v2.schema.json`) whose gated metrics are compared to
 the contractual budgets:
 
 - receiver RSS peak <= 250 MB; receiver CPU sustained <= 50 % of one core;
@@ -183,12 +185,34 @@ budget gates stay unchanged.
 
 Raw endpoint lines are flushed synchronously, so there is no periodic tail to
 lose; orderly receiver close/destruction also flushes the final cumulative drop
-counter. The collector's existing final log poll includes both streams after
-termination. These additive diagnostics do add per-frame logging overhead,
+counter. The final log poll retains terminal/audio diagnostics after termination,
+but v2 video ingestion freezes at the last sampled E: shutdown endpoints cannot
+extend counts, bytes, rings or repair coverage. These diagnostics add per-frame logging overhead,
 which is part of the measured candidate. Decode telemetry remains informational:
 the withdrawn 33 ms gate is **not** restored.
 
 ## Provenance and equivalence
+
+Both runs require capture `aa-projection-perf-capture/2` and result
+`aa-projection-perf/2`, with `measurement_coverage` policy
+`active-window-coverage/1`. V1 results remain explicitly validatable against
+their unchanged schema, not automatically qualified as v2. Independently parse
+coverage after export removes the capture: labels/hashes alone prove neither
+completeness nor hardware authenticity.
+
+Require sampling/RSS/thermal at both active edges and maximum gaps <=10s;
+every CPU interval with a valid initial baseline and measured duration E-S;
+and nonempty consumption/match/decode streams with edge-inclusive gaps <=10s.
+Thermal needs the stable first-active inventory at every sample; empty inventory
+is not zero temperature. Rates require positive denominators. Rings must contain
+`min(4096, stream count)` deltas and use nearest rank in eligible processing order;
+sealed interval summaries retain whole-window counts/gaps beyond that ring.
+Missing required evidence yields BLOCKED/INCOMPLETE, but measured breaches,
+crashes and short/frozen progress retain FAIL precedence. These availability
+rules add no decode-33ms, throughput or FPS budget.
+
+No actual 30-minute or two-hour run is started by these changes or synthetic
+tests. Both live acceptance runs remain outstanding.
 
 Both result documents carry the provenance block with `package_digest: null` and
 `equivalence_status: "provisional"`. Post-package equivalence is established in
