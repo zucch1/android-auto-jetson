@@ -42,11 +42,11 @@
 #   5. passwordless sudo for the sysfs unbind/bind step, adb authorized
 #
 # Usage:
-#   run-wired-recovery-qa.sh --readiness-only [--out /tmp/task-31-wired-recovery.json]
+#   run-wired-recovery-qa.sh --readiness-only --out "$CAPTURE_DIR/task-31-readiness.json"
 #   run-wired-recovery-qa.sh --receiver /opt/aa/aa-wired-receiver \
 #       --display /opt/aa/aa-dummy-display --store /home/zucchi/.local/state/... \
 #       [--only usb_unplug_replug,consumer_restart] \
-#       --out /tmp/task-31-wired-recovery.json
+#       --out "$CAPTURE_DIR/task-31-wired-recovery.json"
 #
 # Environment overrides: HOST (jetson.local), PORT (1-2.1), BUDGET_MS (5000),
 # EVIDENCE_WAIT_MS (8000, per-scenario media/rejection evidence window; the
@@ -71,7 +71,7 @@ RECEIVER=""
 DISPLAY=""
 STORE=""
 ADB_SERIAL=""
-OUT="/tmp/task-31-wired-recovery.json"
+OUT=""
 BUDGET_MS="${BUDGET_MS:-5000}"
 EVIDENCE_WAIT_MS="${EVIDENCE_WAIT_MS:-8000}"
 READINESS_ONLY=0
@@ -80,10 +80,6 @@ ONLY_SEEN=0
 SCENARIOS=(usb_unplug_replug receiver_restart consumer_restart
           phone_lock_unlock phone_aa_restart unknown_phone malformed_input)
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
-RESULTS_DIR="$(mktemp -d)"
-RESULTS_TSV="${RESULTS_DIR}/results.tsv"
-: > "${RESULTS_TSV}"
-
 usage() {
     sed -n '2,55p' "$0"
     exit 2
@@ -97,7 +93,9 @@ while (($# > 0)); do
         --display) DISPLAY="$2"; shift 2 ;;
         --store) STORE="$2"; shift 2 ;;
         --adb-serial) ADB_SERIAL="$2"; shift 2 ;;
-        --out) OUT="$2"; shift 2 ;;
+        --out)
+            (($# >= 2)) || usage
+            OUT="$2"; shift 2 ;;
         --budget-ms) BUDGET_MS="$2"; shift 2 ;;
         --only)
             if (($# < 2)); then
@@ -110,6 +108,14 @@ while (($# > 0)); do
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
 done
+
+if [[ "${BASH_SOURCE[0]}" == "$0" && -z "$OUT" ]]; then
+    echo '--out is required; choose a durable capture directory' >&2
+    usage
+fi
+RESULTS_DIR="$(mktemp -d)"
+RESULTS_TSV="${RESULTS_DIR}/results.tsv"
+: > "${RESULTS_TSV}"
 
 # Hostile-argument neutralization (gate P3): a leading-dash HOST would be read
 # as an ssh OPTION (e.g. -oProxyCommand=...) and a quote-bearing PORT would
@@ -960,6 +966,7 @@ write_result() {
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 
+
 # ---- 1. reachability (bounded) ----
 if ! remote "true" >/dev/null 2>&1; then
     record ssh BLOCKED "" "" "" "ssh_unreachable"
@@ -995,6 +1002,17 @@ for token in $display_status; do
         display_connected="true"
     fi
 done
+# nvidia-drm quirk fallback (lane-32 commit 3e60499): the kernel connector can stay
+# `disconnected` while the X server drives the live monitor. Accept positive xrandr
+# session evidence too - second field exactly `connected`, so `disconnected` never
+# matches. The wire probe is grep-free (the QA fake-ssh shim intercepts `grep`);
+# parsing is local and empty output stays fail-closed.
+if [[ "$display_connected" != "true" ]]; then
+    xrandr_status="$(remote "xrandr --query 2>/dev/null" || true)"
+    if printf '%s\n' "$xrandr_status" | grep -Eq '^[^ ]+ connected( |$)'; then
+        display_connected="true"
+    fi
+fi
 if [[ "$display_connected" != "true" ]]; then
     record readiness BLOCKED "" "" "" "display_disconnected"
     write_result "BLOCKED" "display_disconnected"

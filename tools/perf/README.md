@@ -11,15 +11,18 @@ fixtures/tests and the phase-B runbook; the actual 30-minute performance run and
 tools/perf/
   aa-projection-perf.sh            entry point (strict CLI, fail-closed)
   aa_projection_collect.py         on-target collector (launched over ssh)
+  aa_video_measurements.py         bounded side-band video endpoint reducer
+  aa_measurement_coverage.py       shared typed active-window evidence contract
   aa_perf_report.py                capture -> result document + budget verdict
   aa_perf_schema.py                stdlib JSON Schema validator (own output)
-  aa-projection-perf.schema.json   the result-document contract
+  aa-projection-perf-v2.schema.json current result-document contract
+  aa-projection-perf.schema.json   unchanged historical v1 validation only
   README.md                        this file
 ```
 
 ## Contractual budgets
 
-Fixed in `aa-projection-perf.schema.json` and `aa_perf_report.py`. They are
+Fixed in `aa-projection-perf-v2.schema.json` and `aa_perf_report.py`. They are
 never weakened and a diagnostics-suppressing flag does not exist:
 
 | Metric | Budget | Gate |
@@ -41,6 +44,46 @@ Exit codes: `0` PASS, `1` FAIL (budget violation), `2` usage error, `3` BLOCKED
 (prerequisite or gated metric unavailable), `4` internal contract violation.
 A green run without measured values is never a pass: if a gated metric cannot be
 measured the run is BLOCKED.
+
+## V2 active-window completeness
+
+The reporter requires `aa-projection-perf-capture/2` and emits
+`aa-projection-perf/2`; missing versions and historical v1 captures are not
+promoted. Historical results can still be checked explicitly with
+`aa_perf_schema.py validate tools/perf/aa-projection-perf.schema.json old.json`.
+That is historical validation, not current qualification.
+
+`measurement_coverage` is independently parseable after raw capture removal.
+Its only window is the reporter's replayed active progress
+`[started_ns,last_ns]`, in integer nanoseconds relative to the same-host
+monotonic origin. The capture's active duration is cross-checked, never used as
+an alternative window. Nominal sample spacing is <=5s; availability permits
+gaps <=10s, including both edges. Missing starts have a null window, not
+fabricated zero timestamps. Short or stalled active runs fail.
+
+Every active RSS sample and entire first-active thermal inventory is required.
+Thermal IDs combine sysfs directory and type; null, missing or changed inventory
+blocks completeness. Negative finite temperatures are legal. RSS includes early
+active breaches; growth needs actual first/last samples and a positive initial
+value. CPU uses adjacent raw tick reads without bridging missing/decreasing
+reads. Sustained CPU is duration-weighted and null unless the baseline and every
+interval exist. Startup/shutdown resource readings never contribute.
+
+Video evidence has one sealed summary per active sample interval for consumption,
+IPC matches and decode. Edge-inclusive coverage retains whole-window counts,
+bytes and gaps beyond 4096 observations. A ten-second event-time reorder horizon
+seals whole sample intervals; old replay cannot repair sealed gaps. Capacity loss
+latches `coverage_capacity`. Video ingestion freezes at the last sample before
+termination. Rings retain the last 4096 eligible processing-order deltas with
+nearest-rank percentiles. Six decode/IPC event scalars are forbidden; they are
+derived exclusively from evidence. Diagnostic `video_telemetry` never proves
+completeness. A/V maxima, audio latency/skew and drops retain run-cumulative scope.
+
+Missing RSS/CPU/thermal or any video stream yields BLOCKED/INCOMPLETE, without
+adding throughput/FPS/thermal/decode budgets. Definite measured budget breaches
+and failed runs retain FAIL precedence. Nominal/overload JSON fixtures are short,
+synthetic **offline-only** v2 captures; separate tests synthesize 1800/7200-second
+evidence. Neither proves a live run or hardware authenticity.
 
 ## Usage
 
@@ -66,9 +109,9 @@ newline-delimited JSON event stream:
 | --- | --- |
 | receiver RSS / CPU | `/proc/<pid>/status` (`VmRSS`), `/proc/<pid>/stat` (utime+stime over the sampling interval) |
 | thermal state | `/sys/class/thermal/thermal_zone*/{temp,type}` |
-| frame drops | `diag`/`decode_stats` `dropped`/`drops` (or a `frame_drops` field) |
-| decode timing | `diag`/`decode_stats` `p50_latency_ms`/`p95_latency_ms`/`fps`/`frames` |
-| IPC | `diag`/`transport_stats` `p95_latency_ms`/`throughput_mbps` |
+| frame drops | receiver `decode_stats.frame_drops`: observed outlet AU drops, cumulative with final flush |
+| decode timing | matched `video_decode_completed` local submit-entry / I420-copy completion events |
+| IPC | correlated `video_ipc_send` / `video_ipc_receive` endpoints; consumed payload bytes over measured consumer window |
 | A/V sync | peak absolute completion delta of concurrent `video_presented` / `audio_write_completed` events |
 | audio scheduling skew (informational) | `media_timing.audio_scheduling_skew_ms` |
 | audio latency | an event field `audio_latency_ms` |
@@ -92,6 +135,16 @@ stay absent and the collector keeps them `null` -> the run is **BLOCKED** (fail
 closed, never a fabricated `0`). Device-supplied text (thermal zone names) is
 JSON-escaped as data and never injected into the document.
 
+Video endpoints preserve the v1 wire and A/V timestamp. The latter is an opaque
+join key, never a send-start proxy. The reducer bounds pending/dedup tables and
+rolling percentile deltas to 4096 entries, expires unmatched IPC at ten seconds,
+and keeps cumulative observed frame/byte counts. Quantiles use nearest rank over
+the last 4096 processed matched samples. See the runbook's **Video measurements**
+section for exact endpoints, reconnect attribution, drop scope and exclusions.
+The ssh stdin payload bundles the collector and reducer; no target-side module
+installation is assumed. `video_telemetry` in the raw capture records final
+retained, unmatched and pending counts. Missing pairs are never zero-valued data.
+
 Live qualification excludes a bounded 60-second startup grace: the requested
 window begins only with active receiver video/audio progress, consumer paint/
 write completions, and matched A/V pairs. Per-sample counters must keep advancing
@@ -109,7 +162,7 @@ digest, configuration digest, service definitions, dependency versions and the
 target hardware state. `package_digest` is forced to `null` and
 `equivalence_status` to `"provisional"`: post-package equivalence belongs to
 todo 43, and the tool rejects a capture that claims otherwise. The report
-validates its own output against `aa-projection-perf.schema.json` before
+validates its own output against `aa-projection-perf-v2.schema.json` before
 returning.
 
 ## Tests
@@ -126,3 +179,13 @@ fixture, strict duration parsing, the plan-mandated contracts, the collector
 against a deterministic fake receiver, and the task-48 media-timing hook (the
 collector picks up both fields, the value tracks the injected measurement, an
 absent measurement stays BLOCKED). No live hardware is required.
+
+`wired_perf_video_measurements` adds deterministic delta/byte/count/quantile,
+reordering, duplicate, reconnect, stale and capacity cases, then drives the real
+receiver outlet, AF_UNIX channel and software decode helper with the 90-frame
+fixture and checks all seven fields through the actual collector parser. This
+is host endpoint evidence only, not the 30-minute run or two-hour soak.
+
+`wired_perf_v2_coverage` and `wired_perf_v2_capture` cover shared evidence,
+adversarial summaries, missing resources/streams, sealing, edge gaps and synthetic
+long windows. Run these independently of readiness or the full suite.

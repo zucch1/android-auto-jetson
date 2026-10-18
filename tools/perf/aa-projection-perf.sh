@@ -31,9 +31,8 @@ set -euo pipefail
 
 TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PYTHON:-python3}"
-SCHEMA="$TOOL_DIR/aa-projection-perf.schema.json"
+SCHEMA="$TOOL_DIR/aa-projection-perf-v2.schema.json"
 REPORTER="$TOOL_DIR/aa_perf_report.py"
-COLLECTOR="$TOOL_DIR/aa_projection_collect.py"
 
 MODE=""
 DURATION=""
@@ -182,7 +181,10 @@ blocked_result() {
 import json, sys
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump({
-        "schema": "aa-projection-perf-capture/1",
+        "schema": "aa-projection-perf-capture/2",
+        "monotonic_origin_ns": 0,
+        "cpu_ticks_per_second": 1,
+        "video_evidence": {"blocks": [], "ipc_latency_ns": [], "decode_latency_ns": []},
         "mode": "wired",
         "duration_seconds": 0,
         "crashes": 0,
@@ -273,11 +275,23 @@ fi
 
 # Collect a capture on the target via a bounded ssh (collector piped on stdin).
 capture_file="$BUFFER/capture.json"
+"$PY" -B - "$TOOL_DIR" >"$BUFFER/collector.py" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+collector = (root / "aa_projection_collect.py").read_text()
+print("import sys, types")
+for name in ("aa_measurement_coverage", "aa_video_measurements"):
+    source = (root / (name + ".py")).read_text()
+    print("module = types.ModuleType(" + repr(name) + ")")
+    print("sys.modules[module.__name__] = module")
+    print("exec(" + repr(source) + ", module.__dict__)")
+print("exec(compile(" + repr(collector) + ", 'aa_projection_collect.py', 'exec'))")
+PY
 collector_timeout=$((duration_secs + 120))
 if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port '${PORT}' \
         --duration-seconds ${duration_secs} --interval ${INTERVAL} \
         ${DISPLAY:+--display '${DISPLAY}'} ${STORE:+--store '${STORE}'}" \
-        <"$COLLECTOR" >"$capture_file" 2>"$BUFFER/collector.err"; then
+        <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err"; then
     echo "BLOCKED: collector_failed" >&2
     sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
     blocked_result "collector_failed"

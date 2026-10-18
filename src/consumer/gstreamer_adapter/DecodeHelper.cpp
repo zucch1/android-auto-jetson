@@ -160,6 +160,8 @@ struct DecodeHelper::Impl final {
     DecodeReport report{};
     protocol::VideoProfile caps{};
     FrameCallback on_frame{};
+    DecodeCompletionObserver on_completion{};
+    std::uint64_t session_ns{};
     std::uint64_t frame_duration_ns{};
 
     GstElement* pipeline{nullptr};
@@ -365,6 +367,9 @@ core::Result<DecodeHelper> DecodeHelper::open(DecodeConfig config) {
     auto impl = std::make_unique<Impl>();
     impl->caps = config.caps;
     impl->on_frame = std::move(config.on_frame);
+    impl->on_completion = std::move(config.on_completion);
+    impl->session_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        DecodeSessionState::Clock::now().time_since_epoch()).count());
     impl->frame_duration_ns = 1'000'000'000ULL / static_cast<std::uint64_t>(config.caps.fps);
 
     const auto needs_nvmm_conversion = [&](const std::string& element) {
@@ -598,6 +603,7 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         // Late pre-recovery outputs find no mapping: counted unmatched,
         // released, and never handed to the callback (frames keep their real
         // metadata; nothing is relabeled).
+        const auto completed = DecodeSessionState::Clock::now();
         const auto meta = impl_->session.take_correlation(pts);
         if (!meta.has_value()) {
             ++impl_->report.frames_unmatched;
@@ -605,6 +611,15 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
             frame.frame = meta->frame;
             frame.sequence = meta->sequence;
             frame.timestamp_ns = meta->timestamp_ns;
+            if (impl_->on_completion && completed - meta->submitted_at <
+                    DecodeSessionState::kCorrelationRetention) {
+                impl_->on_completion(DecodeCompletion{impl_->session_ns, meta->frame,
+                    meta->sequence, meta->timestamp_ns,
+                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        meta->submitted_at.time_since_epoch()).count()),
+                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        completed.time_since_epoch()).count())});
+            }
             if (impl_->on_frame) {
                 impl_->on_frame(frame);
             }

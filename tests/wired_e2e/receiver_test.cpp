@@ -161,6 +161,8 @@ class ObservedSessionMutex {
 #include "../session/Fakes.hpp"
 #include "../video_socket/pair.hpp"
 #include "../trust/syscall_faults.hpp"
+#include "../transport/UsbAoaFakes.hpp"
+#include "../../src/transport/usb_adapter/LibusbWorld.hpp"
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
 #include <aap_protobuf/service/control/message/ServiceDiscoveryResponse.pb.h>
 #include <gtest/gtest.h>
@@ -169,13 +171,16 @@ class ObservedSessionMutex {
 #include <fstream>
 #include <iterator>
 #include <pthread.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <sstream>
 #include <unistd.h>
 
 namespace {
 namespace media_wire = aap_protobuf::service::media::sink::message;
 
 TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
-    VideoOutlet outlet;
+    VideoOutlet outlet{log_line};
     const std::vector<std::byte> payload{std::byte{0}, std::byte{0}, std::byte{1},
                                          std::byte{0x65}, std::byte{0x10}};
     for (int index = 0; index < 31; ++index) {
@@ -185,6 +190,8 @@ TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
         ASSERT_TRUE(result);
         if (index % 30 == 0) {
             EXPECT_EQ(log, "{\"event\":\"video_dropped\",\"reason\":\"no_consumer\",\"count\":" +
+                               std::to_string(index + 1) + "}\n" +
+                               "{\"event\":\"decode_stats\",\"frame_drops\":" +
                                std::to_string(index + 1) + "}\n");
         } else {
             EXPECT_TRUE(log.empty());
@@ -195,7 +202,7 @@ TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
 TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
-    VideoOutlet outlet;
+    VideoOutlet outlet{log_line};
     outlet.install(std::move(pair.value().producer));
     const std::vector<std::byte> non_idr{std::byte{0}, std::byte{0}, std::byte{1},
                                          std::byte{0x41}, std::byte{0x10}};
@@ -208,6 +215,8 @@ TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
         ASSERT_TRUE(result);
         if (index % 30 == 0) {
             EXPECT_EQ(log, "{\"event\":\"video_dropped\",\"reason\":\"waiting_idr\",\"count\":" +
+                               std::to_string(index + 1) + "}\n" +
+                               "{\"event\":\"decode_stats\",\"frame_drops\":" +
                                std::to_string(index + 1) + "}\n");
         } else {
             EXPECT_TRUE(log.empty());
@@ -223,11 +232,16 @@ TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
         const auto result = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {123}}, payload});
         const auto log = testing::internal::GetCapturedStdout();
         ASSERT_TRUE(result);
+        ASSERT_TRUE(log.starts_with("{\"event\":\"video_ipc_send\","));
+        const auto endpoint_end = log.find('\n');
+        ASSERT_NE(endpoint_end, std::string::npos);
+        const auto summary = log.substr(endpoint_end + 1);
         if (delivered % 30 == 1) {
-            EXPECT_EQ(log, "{\"event\":\"video_sent\",\"units\":" +
-                               std::to_string(delivered) + "}\n");
+            EXPECT_EQ(summary, "{\"event\":\"video_sent\",\"units\":" +
+                               std::to_string(delivered) + "}\n" +
+                               "{\"event\":\"decode_stats\",\"frame_drops\":31}\n");
         } else {
-            EXPECT_TRUE(log.empty());
+            EXPECT_TRUE(summary.empty());
         }
         const auto received = pair.value().consumer.receive(Milliseconds{500});
         ASSERT_TRUE(received);
@@ -244,7 +258,7 @@ TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
 TEST(WiredReceiver, VideoOutletSendErrorsDoNotCountAsSent) {
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
-    VideoOutlet outlet;
+    VideoOutlet outlet{log_line};
     outlet.install(std::move(pair.value().producer));
     testing::internal::CaptureStdout();
     const auto invalid = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, {}});
@@ -259,7 +273,11 @@ TEST(WiredReceiver, VideoOutletSendErrorsDoNotCountAsSent) {
     const auto sent = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, idr});
     const auto sent_log = testing::internal::GetCapturedStdout();
     ASSERT_TRUE(sent);
-    EXPECT_EQ(sent_log, "{\"event\":\"video_sent\",\"units\":1}\n");
+    ASSERT_TRUE(sent_log.starts_with("{\"event\":\"video_ipc_send\","));
+    const auto endpoint_end = sent_log.find('\n');
+    ASSERT_NE(endpoint_end, std::string::npos);
+    EXPECT_EQ(sent_log.substr(endpoint_end + 1), "{\"event\":\"video_sent\",\"units\":1}\n"
+                                               "{\"event\":\"decode_stats\",\"frame_drops\":0}\n");
     const auto received = pair.value().consumer.receive(Milliseconds{500});
     ASSERT_TRUE(received);
     ASSERT_EQ(received.value(), aa::ipc::ReceiveStatus::complete);
@@ -299,6 +317,7 @@ TEST(WiredReceiver, ProductionAudioProfilesMatchWireAndRouterInputs) {
     ASSERT_EQ(wire.channels_size(), 7);
     const auto router = pcm_router_config();
     EXPECT_EQ(router.output_format, (aa::audio::AudioFormat{48000, 2, 16}));
+    EXPECT_TRUE(router.on_write_completed);
     for (const auto &expected : receiver_audio_expectations) {
         if (expected.channel == aa::protocol::ChannelRole::speech_audio) { continue; }
         SCOPED_TRACE(expected.service);
@@ -375,7 +394,7 @@ TEST(WiredReceiver, ProductionAvRegistrationNegotiatesEncryptedMediaWithoutSetup
     RouterSink audio{router.value()};
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
-    VideoOutlet video;
+    VideoOutlet video{log_line};
     video.install(std::move(pair.value().producer));
     aa::app::WiredSession session{{trust, clock, diagnostics}};
     ASSERT_TRUE(session.configure(service_descriptors(aa::input::CapabilityDescriptor::bench_defaults())));
@@ -450,7 +469,7 @@ TEST(WiredReceiver, ProductionAvRegistrationNegotiatesEncryptedMediaWithoutSetup
     EXPECT_EQ(session.pings_answered(), 1U);
 }
 
-TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereo) {
+TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereoAndKeepCompletionCallback) {
     for (const auto &expected : receiver_audio_expectations) {
         SCOPED_TRACE(expected.service);
         auto output = std::make_unique<ReceiverProfileSink>();
@@ -462,7 +481,9 @@ TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereo) {
         const std::vector<std::byte> pcm(frames * expected.input.channels * sizeof(std::int16_t),
                                          std::byte{0x10});
         RouterSink sink{router.value()};
+        testing::internal::CaptureStdout();
         const auto result = sink.on_message({{expected.channel, 1, {}}, pcm});
+        const auto log = testing::internal::GetCapturedStdout();
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(observed->format, (aa::audio::AudioFormat{48000, 2, 16}));
         // Resampling may retain a filter tail; require the 3x rate expansion,
@@ -481,6 +502,8 @@ TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereo) {
             EXPECT_EQ(observed->pcm[offset], observed->pcm[offset + 2U]);
             EXPECT_EQ(observed->pcm[offset + 1U], observed->pcm[offset + 3U]);
         }
+        EXPECT_NE(log.find("\"event\":\"audio_write_completed\""), std::string::npos);
+        EXPECT_NE(log.find("\"scheduled_end_ns\":"), std::string::npos);
     }
 }
 
@@ -493,6 +516,9 @@ std::atomic<bool> runtime_closed{false};
 std::mutex runtime_owner_mutex;
 std::thread::id runtime_io_owner;
 aa::trust::PhoneIdentity runtime_phone;
+bool runtime_real_admission = false;
+bool runtime_fail_before_admission = false;
+std::shared_ptr<aa::test::usb_aoa::LinkState> admission_state;
 
 class RuntimeTransport final : public aa::transport::Transport {
   public:
@@ -592,19 +618,44 @@ class RuntimeTransport final : public aa::transport::Transport {
 
 // Link-time seams keep the real CLI/thread loop under test without USB or audio hardware.
 aa::core::Result<aa::app::WiredLink>
+real_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
+               const aa::trust::TrustStore &, const aa::core::Deadline &,
+               aa::trust::WiredIdentity *)
+    asm("__real__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE");
+aa::core::Result<aa::app::WiredLink>
 runtime_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
                   const aa::trust::TrustStore &, const aa::core::Deadline &,
                   aa::trust::WiredIdentity *)
     asm("__wrap__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE");
 aa::core::Result<aa::app::WiredLink>
-runtime_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
-                  const aa::trust::TrustStore &, const aa::core::Deadline &,
-                  aa::trust::WiredIdentity *) {
+runtime_open_link(const aa::transport::UsbDeviceSelector &selector,
+                  const aa::transport::AoaAccessoryInfo &info,
+                  const aa::trust::TrustStore &store, const aa::core::Deadline &deadline,
+                  aa::trust::WiredIdentity *attempted_identity) {
     const int attempt = ++runtime_connects;
+    if (runtime_real_admission) {
+        return real_open_link(selector, info, store, deadline, attempted_identity);
+    }
     if (attempt == 1 || (runtime_recovers && attempt >= 4)) {
         return aa::app::WiredLink{std::make_unique<RuntimeTransport>(attempt == 1), runtime_phone};
     }
     return aa::Error{aa::ErrorCode::transport_unavailable};
+}
+
+aa::core::Result<std::unique_ptr<aa::transport::usb_adapter::AoaLinkFactory>>
+real_link_factory() asm("__real__ZN2aa9transport11usb_adapter24make_libusb_link_factoryEv");
+aa::core::Result<std::unique_ptr<aa::transport::usb_adapter::AoaLinkFactory>>
+runtime_link_factory() asm("__wrap__ZN2aa9transport11usb_adapter24make_libusb_link_factoryEv");
+aa::core::Result<std::unique_ptr<aa::transport::usb_adapter::AoaLinkFactory>>
+runtime_link_factory() {
+    if (!runtime_real_admission) {
+        return real_link_factory();
+    }
+    auto factory = std::make_unique<aa::test::usb_aoa::FakeLinkFactory>(admission_state);
+    factory->phone.serial = "SECOND-PRIVATE-USB";
+    factory->accessory.serial = "SECOND-PRIVATE-AOA";
+    factory->fail_switch = runtime_fail_before_admission;
+    return std::unique_ptr<aa::transport::usb_adapter::AoaLinkFactory>{std::move(factory)};
 }
 
 std::unique_ptr<aa::transport::HandshakingCipher>
@@ -626,6 +677,179 @@ runtime_sink(const aa::audio::detail::SinkOpenRequest &) {
 }
 
 namespace {
+struct AdmissionResult {
+    int status{};
+    bool watchdog_fired = false;
+    int connects = -1;
+    int ciphers = -1;
+    int switches = -1;
+    int claims = -1;
+    std::string expected_label;
+    std::string output;
+};
+
+AdmissionResult run_admission_child(bool pre_admission_failure) {
+    if (const char *child_root = std::getenv("AA_TEST_ADMISSION_ROOT")) {
+        const std::filesystem::path root{child_root};
+        runtime_real_admission = true;
+        runtime_fail_before_admission = std::string{std::getenv("AA_TEST_ADMISSION_FAILURE")} == "1";
+        admission_state = std::make_shared<aa::test::usb_aoa::LinkState>();
+        runtime_connects.store(0);
+        runtime_ciphers.store(0);
+        shutdown_observation = nullptr;
+        g_running.store(true);
+        const aa::trust::WiredIdentity second{
+            "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
+            "SECOND-PRIVATE-AOA", "1-2.2"};
+        const auto label = aa::trust::redacted_label(aa::trust::TransportIdentity{second});
+        std::vector<std::string> args{"receiver", "--port", "1-2.2", "--no-bus", "--store",
+            (root / "approved.json").string(), "--video-socket", (root / "video").string(),
+            "--input-socket", (root / "input").string(), "--duration-ms", "100"};
+        std::vector<char *> argv;
+        argv.reserve(args.size());
+        for (auto &arg : args) {
+            argv.push_back(arg.data());
+        }
+        const int code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+        {
+            std::ofstream metrics(root / "metrics");
+            metrics << runtime_connects.load() << ' ' << runtime_ciphers.load() << ' '
+                    << admission_state->switches() << ' ' << admission_state->claims() << ' ' << label;
+        }
+        std::fflush(stdout);
+        ::_exit(code);
+    }
+    AdmissionResult result;
+    char directory[] = "/tmp/wired-admission-XXXXXX";
+    const char *created = ::mkdtemp(directory);
+    EXPECT_NE(created, nullptr);
+    if (!created) {
+        result.status = -1;
+        return result;
+    }
+    const std::filesystem::path root{created};
+    const auto store_path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore initial{store_path};
+    EXPECT_TRUE(initial.load().has_value());
+    const aa::trust::WiredIdentity first{
+        "04e8", "6860", "FIRST-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
+        "FIRST-PRIVATE-AOA", "1-2.1"};
+    EXPECT_TRUE(initial.approve(aa::trust::TransportIdentity{first}).has_value());
+    std::string root_env = "AA_TEST_ADMISSION_ROOT=" + root.string();
+    std::string failure_env = pre_admission_failure ? "AA_TEST_ADMISSION_FAILURE=1"
+                                                   : "AA_TEST_ADMISSION_FAILURE=0";
+    std::vector<char *> environment;
+    for (char **entry = ::environ; *entry != nullptr; ++entry) {
+        environment.push_back(*entry);
+    }
+    environment.push_back(root_env.data());
+    environment.push_back(failure_env.data());
+    environment.push_back(nullptr);
+    std::string executable = "/proc/self/exe";
+    std::string filter = pre_admission_failure
+        ? "--gtest_filter=WiredReceiver.PreAdmissionFailureEmitsNoAttemptAttribution"
+        : "--gtest_filter=WiredReceiver.RejectedAttemptEmitsCapturedPseudonymAndPort";
+    std::string repeat = "--gtest_repeat=1";
+    char *child_argv[]{executable.data(), filter.data(), repeat.data(), nullptr};
+    const int capture_fd = ::open((root / "stdout").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    EXPECT_GE(capture_fd, 0);
+    std::fflush(nullptr);
+    const pid_t child = ::fork();
+    EXPECT_GE(child, 0);
+    if (child == 0) {
+        if (capture_fd < 0 || ::dup2(capture_fd, STDOUT_FILENO) < 0) {
+            ::_exit(90);
+        }
+        ::close(capture_fd);
+        ::execve(executable.c_str(), child_argv, environment.data());
+        ::_exit(91);
+    }
+    if (capture_fd >= 0) {
+        ::close(capture_fd);
+    }
+    if (child > 0) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        for (;;) {
+            const auto waited = ::waitpid(child, &result.status, WNOHANG);
+            if (waited == child) {
+                break;
+            }
+            if (waited < 0 || std::chrono::steady_clock::now() >= deadline) {
+                result.watchdog_fired = true;
+                (void)::kill(child, SIGKILL);
+                (void)::waitpid(child, &result.status, 0);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        std::ifstream capture(root / "stdout");
+        result.output.assign(std::istreambuf_iterator<char>{capture}, {});
+        std::ifstream metrics(root / "metrics");
+        metrics >> result.connects >> result.ciphers >> result.switches >> result.claims
+                >> result.expected_label;
+    }
+    std::filesystem::remove_all(root);
+    return result;
+}
+
+void expect_admission_exit(const AdmissionResult &result, int claims) {
+    ASSERT_FALSE(result.watchdog_fired) << "ADMISSION_WATCHDOG_FIRED";
+    ASSERT_TRUE(WIFEXITED(result.status)) << result.status;
+    EXPECT_EQ(WEXITSTATUS(result.status), 3) << result.output;
+    EXPECT_EQ(result.connects, 1);
+    EXPECT_EQ(result.switches, 1);
+    EXPECT_EQ(result.claims, claims);
+    EXPECT_EQ(result.ciphers, 0) << "rejected attempt reached TLS construction";
+    EXPECT_EQ(result.output.find("\"event\":\"ready\""), std::string::npos);
+    EXPECT_EQ(result.output.find("\"event\":\"active\""), std::string::npos);
+    EXPECT_EQ(result.output.find("\"to_state\":\"active\""), std::string::npos);
+}
+
+std::vector<std::string> link_errors(const std::string &output) {
+    std::vector<std::string> errors;
+    std::istringstream lines(output);
+    for (std::string line; std::getline(lines, line);) {
+        if (line.find("\"detail\":\"link\"") != std::string::npos) {
+            errors.push_back(std::move(line));
+        }
+    }
+    return errors;
+}
+
+TEST(WiredReceiver, RejectedAttemptEmitsCapturedPseudonymAndPort) {
+    const aa::trust::WiredIdentity second{
+        "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
+        "SECOND-PRIVATE-AOA", "1-2.2"};
+    const auto result = run_admission_child(false);
+    const auto &label = result.expected_label;
+    ASSERT_FALSE(label.empty());
+    expect_admission_exit(result, 1);
+    const auto errors = link_errors(result.output);
+    ASSERT_EQ(errors.size(), 1U) << result.output;
+    EXPECT_NE(errors[0].find("\"phone_id\":\"" + label + "\""), std::string::npos)
+        << "CAPTURED_PSEUDONYM_MISSING: " << errors[0];
+    EXPECT_NE(errors[0].find("\"port\":\"1-2.2\""), std::string::npos)
+        << "SECOND_PORT_MISSING: " << errors[0];
+    EXPECT_EQ(errors[0], "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"transport_unauthorized_peer\","
+                         "\"phone_id\":\"" + label + "\",\"port\":\"1-2.2\"}");
+    const auto key = aa::trust::validated_key(aa::trust::TransportIdentity{second});
+    ASSERT_TRUE(key.has_value());
+    for (const auto &raw : {second.usb_serial, second.aoa_serial, second.aoa_manufacturer,
+                            second.aoa_model, key.value(), std::string{"FIRST-PRIVATE"}}) {
+        EXPECT_EQ(result.output.find(raw), std::string::npos) << "raw identity leaked: " << raw;
+    }
+}
+
+TEST(WiredReceiver, PreAdmissionFailureEmitsNoAttemptAttribution) {
+    const auto result = run_admission_child(true);
+    expect_admission_exit(result, 0);
+    const auto errors = link_errors(result.output);
+    ASSERT_EQ(errors.size(), 1U) << result.output;
+    EXPECT_EQ(errors[0], "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"transport_unavailable\"}");
+    EXPECT_EQ(errors[0].find("phone_id"), std::string::npos);
+    EXPECT_EQ(errors[0].find("\"port\""), std::string::npos);
+}
+
 class RejectAudio final : public aa::audio::detail::ObservedAudioSink {
   public:
     aa::core::Result<void> write(const aa::audio::MixedChunk &) override {

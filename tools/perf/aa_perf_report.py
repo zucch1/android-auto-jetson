@@ -22,7 +22,7 @@ event-derived observations. This reporter:
   claims otherwise is rejected,
 * records ``helper_rss_mb`` as ``null`` (the wired path does not require the
   helper before todo 34); a non-null value is rejected,
-* validates the document it produced against ``aa-projection-perf.schema.json``
+* validates the document it produced against ``aa-projection-perf-v2.schema.json``
   before writing it, so the tool can never emit an off-schema document.
 
 Exit: 0 PASS, 1 FAIL (budget violation), 3 BLOCKED (prerequisite/metric
@@ -40,11 +40,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aa_perf_schema  # noqa: E402
+from aa_measurement_coverage import (
+    CoverageError, Window, coverage_gaps, coverage_to_json, parse_capture, reduce_capture,
+)
 from aa_projection_collect import ProjectionProgress
 
 TASK = "32. Measure wired performance and two-hour soak"
-SCHEMA_VERSION = "aa-projection-perf/1"
-CAPTURE_SCHEMA = "aa-projection-perf-capture/1"
+SCHEMA_VERSION = "aa-projection-perf/2"
+CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
 EVENT_METRICS = ("frame_drops", "decode_p50_ms", "decode_p95_ms", "decode_fps",
                  "decode_frames", "ipc_throughput_mbps", "ipc_p95_added_latency_ms")
 
@@ -124,88 +127,62 @@ def _metric(
     return entry
 
 
-def _mean(values: list[float]) -> float | None:
-    return sum(values) / len(values) if values else None
-
-
-def _peak(values: list[float]) -> float | None:
-    return max(values) if values else None
-
-
-def _thermal(capture: dict, samples: list[dict]) -> dict | None:
-    peaks: list[float] = []
-    zones: list[dict] = []
-    for sample in samples:
-        sample_peak = _as_float(sample.get("thermal_peak_c"))
-        if sample_peak is not None:
-            peaks.append(sample_peak)
-        for zone in sample.get("thermal_zones") or []:
-            if not isinstance(zone, dict) or "temp_c" not in zone:
-                continue
-            temp = _as_float(zone.get("temp_c"))
-            if temp is None:
-                continue
-            peaks.append(temp)
-            if not zones:
-                zones.append({"zone": str(zone.get("zone", "unknown")), "temp_c": temp})
-    if not peaks and not zones:
-        return None
-    return {"peak_c": _peak(peaks), "zones": zones}
-
-
 def build_result(capture: dict, *, duration_requested: str | None, now: str,
                  capture_path: str | None, capture_sha256: str | None,
                  provenance_override: dict | None = None,
                  blocked_on_override: str | None = None) -> dict:
     if not isinstance(capture, dict):
         raise ContractError("capture must be a JSON object")
-    capture, numeric_errors = aa_perf_schema.finite_numbers(capture)
-    if capture.get("schema") not in (CAPTURE_SCHEMA, None):
+    if capture.get("schema") != CAPTURE_SCHEMA:
         raise ContractError(f"unexpected capture schema: {capture.get('schema')!r}")
+    evidence = parse_capture(capture)
+    capture, numeric_errors = aa_perf_schema.finite_numbers(capture)
     if capture.get("mode") != "wired":
         raise ContractError(f"capture mode must be 'wired', got {capture.get('mode')!r}")
 
-    duration_seconds = _as_float(capture.get("observed_duration_seconds",
-                                             capture.get("duration_seconds")))
-    if duration_seconds is None or duration_seconds < 0:
-        raise ContractError("capture duration must be a finite non-negative number")
     crashes = _as_int(capture.get("crashes"))
-
-    samples = capture.get("samples") or []
-    if not isinstance(samples, list):
-        raise ContractError("capture.samples must be an array")
-    rss_series = [v for s in samples if (v := _as_float(s.get("receiver_rss_mb"))) is not None]
-    cpu_series = [
-        v for s in samples if (v := _as_float(s.get("receiver_cpu_pct_one_core"))) is not None
-    ]
-    rss_growth: float | None = None
-    if len(rss_series) >= 2 and rss_series[0] > 0:
-        rss_growth = (rss_series[-1] - rss_series[0]) / rss_series[0] * 100.0
+    if crashes is not None and crashes < 0:
+        raise ContractError("crashes must be nonnegative")
+    samples = evidence.samples
+    progress = ProjectionProgress()
+    for sample in samples:
+        progress.observe(sample)
+    window = (Window(progress.started_ns, progress.last_ns)
+              if progress.started_ns is not None else None)
+    reduced = reduce_capture(evidence, window)
+    values = reduced.metrics
+    duration_seconds = progress.seconds
+    active_assertion = _as_float(capture.get("active_projection_seconds"))
+    coverage_missing = list(coverage_gaps(reduced.measurement_coverage, active_assertion))
 
     events = capture.get("events") or {}
     if not isinstance(events, dict):
         raise ContractError("capture.events must be an object")
+    if any(name in events for name in EVENT_METRICS if name != "frame_drops"):
+        raise ContractError("v2 video metrics must be derived exclusively from video_evidence")
     helper_rss = events.get("helper_rss_mb")
     if helper_rss is not None:
         raise ContractError(
             "helper_rss_mb must be null on the wired path until todo 34 (plan-mandated)"
         )
 
-    thermal_state = _thermal(capture, samples)
-    thermal_peak = thermal_state["peak_c"] if thermal_state else None
+    thermal_state = ({"peak_c": reduced.thermal_state.peak_c,
+                      "zones": [{"zone": zone.zone, "temp_c": zone.temp_c}
+                                for zone in reduced.thermal_state.zones]}
+                     if reduced.thermal_state else None)
 
     metrics = {
         "receiver_rss_peak_mb": _metric(
-            _peak(rss_series), "MB", budget_max=BUDGETS["receiver_rss_mb_max"], gated=True
+            values["receiver_rss_peak_mb"], "MB", budget_max=BUDGETS["receiver_rss_mb_max"], gated=True
         ),
-        "receiver_rss_mean_mb": _metric(_mean(rss_series), "MB"),
+        "receiver_rss_mean_mb": _metric(values["receiver_rss_mean_mb"], "MB"),
         "receiver_cpu_sustained_pct_one_core": _metric(
-            _mean(cpu_series), "% of one core",
+            values["receiver_cpu_sustained_pct_one_core"], "% of one core",
             budget_max=BUDGETS["receiver_cpu_pct_one_core_max"], gated=True,
         ),
-        "receiver_cpu_peak_pct_one_core": _metric(_peak(cpu_series), "% of one core"),
+        "receiver_cpu_peak_pct_one_core": _metric(values["receiver_cpu_peak_pct_one_core"], "% of one core"),
         "rss_growth_pct": _metric(
-            rss_growth, "%", budget_max=BUDGETS["rss_growth_pct_max"], op="lt", gated=True
+            values["rss_growth_pct"], "%", budget_max=BUDGETS["rss_growth_pct_max"], op="lt", gated=True
         ),
         "av_sync_ms": _metric(
             _as_float(events.get("av_sync_ms")), "ms", budget_max=BUDGETS["av_sync_ms_max"],
@@ -223,15 +200,15 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                                  status="NOT_REQUIRED",
                                  note="wired path does not require the helper before todo 34"),
         "frame_drops": _metric(_as_int(events.get("frame_drops")), "frames"),
-        "decode_p50_ms": _metric(_as_float(events.get("decode_p50_ms")), "ms", note=DECODE_NOTE),
-        "decode_p95_ms": _metric(_as_float(events.get("decode_p95_ms")), "ms", note=DECODE_NOTE),
-        "decode_fps": _metric(_as_float(events.get("decode_fps")), "fps", note=DECODE_NOTE),
-        "decode_frames": _metric(_as_int(events.get("decode_frames")), "frames", note=DECODE_NOTE),
-        "ipc_throughput_mbps": _metric(_as_float(events.get("ipc_throughput_mbps")), "Mbps"),
+        "decode_p50_ms": _metric(values["decode_p50_ms"], "ms", note=DECODE_NOTE),
+        "decode_p95_ms": _metric(values["decode_p95_ms"], "ms", note=DECODE_NOTE),
+        "decode_fps": _metric(values["decode_fps"], "fps", note=DECODE_NOTE),
+        "decode_frames": _metric(values["decode_frames"], "frames", note=DECODE_NOTE),
+        "ipc_throughput_mbps": _metric(values["ipc_throughput_mbps"], "Mbps"),
         "ipc_p95_added_latency_ms": _metric(
-            _as_float(events.get("ipc_p95_added_latency_ms")), "ms"
+            values["ipc_p95_added_latency_ms"], "ms"
         ),
-        "thermal_peak_c": _metric(thermal_peak, "C"),
+        "thermal_peak_c": _metric(values["thermal_peak_c"], "C"),
     }
 
     # Violations + verdict. A measured violation is a definite FAIL; an
@@ -273,13 +250,9 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                    "display_survived", "display_connected", "terminal_errors")}
     run_status.update({name: events.get(name) for name in
                         ("startup_ms", "video_units", "audio_chunks")})
-    progress = ProjectionProgress()
-    if origin == "live":
-        for sample in samples:
-            progress.observe(sample)
-    run_status.update(active_projection_seconds=progress.seconds if origin == "live" else None,
-                      startup_wait_seconds=progress.started_ms / 1000
-                      if progress.started_ms is not None else None,
+    run_status.update(active_projection_seconds=progress.seconds if window else None,
+                      startup_wait_seconds=progress.started_ns / 1e9
+                      if progress.started_ns is not None else None,
                       projection_failure=progress.failure)
     run_failures = []
     if run_status["early_exit"]:
@@ -293,9 +266,9 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     if run_status["terminal_errors"]:
         run_failures.append("terminal_errors")
     requested_window = _as_float(capture.get("duration_seconds"))
-    if origin != "live" and requested_window is not None and duration_seconds < requested_window:
-        run_failures.append("incomplete_window")
-    if origin == "live" and progress.started_ms is not None:
+    if requested_window is None or requested_window < 0:
+        raise ContractError("requested duration must be finite and nonnegative")
+    if progress.started_ns is not None:
         if requested_window is None or progress.seconds < requested_window:
             run_failures.append("incomplete_active_window")
         if progress.failure:
@@ -303,13 +276,15 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     for failure in run_failures:
         violations.append({"metric": failure, "value": None, "budget_max": 0,
                            "detail": "projection run failed: " + failure})
-    named_gaps = [name for name in EVENT_METRICS if metrics[name]["value"] is None]
+    named_gaps = [name for name in (*EVENT_METRICS, "thermal_peak_c", "receiver_rss_peak_mb",
+                                  "receiver_cpu_sustained_pct_one_core", "rss_growth_pct")
+                  if metrics[name]["value"] is None] + coverage_missing
     unavailable.extend(named_gaps)
     invalid_telemetry = list(capture.get("invalid_telemetry") or []) + numeric_errors
     if invalid_telemetry:
         unavailable.append("invalid_telemetry")
     if origin == "live":
-        if progress.started_ms is None:
+        if progress.started_ns is None:
             unavailable.append("run_evidence:active_projection_progress")
         for name in ("early_exit", "receiver_exit_code", "startup_ms", "video_units",
                      "audio_chunks", "display_survived", "display_connected"):
@@ -389,6 +364,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         "crashes": crashes if crashes is not None else 0,
         "budgets": dict(BUDGETS),
         "metrics": metrics,
+        "measurement_coverage": coverage_to_json(reduced.measurement_coverage),
         "thermal_state": thermal_state,
         "violations": violations,
         "provenance": provenance,
@@ -492,7 +468,7 @@ def _cli(argv: list[str]) -> int:
             provenance_override=provenance_override,
             blocked_on_override=args.blocked_on,
         )
-    except ContractError as exc:
+    except (ContractError, CoverageError) as exc:
         print(f"contract violation: {exc}", file=sys.stderr)
         return 4
 

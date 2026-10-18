@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import os
 import subprocess
@@ -20,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools/perf"))
 import aa_projection_collect as collector
 import aa_perf_report as reporter
+from aa_measurement_coverage import CoverageLedger, Sample
 
 
 class Process:
@@ -57,13 +59,13 @@ def disconnected() -> None:
                                   no_display=False, duration_seconds=10, interval=1,
                                   store=None, video_socket=None, input_socket=None,
                                   state_dir=str(Path(tmp) / "state"))
-        with (patch.object(collector.time, "monotonic", side_effect=lambda: clock[0]),
+        with (patch.object(collector.time, "monotonic_ns", side_effect=lambda: int(clock[0] * 1e9)),
               patch.object(collector.time, "sleep", side_effect=sleep),
               patch.object(collector, "_STARTUP_GRACE_SECONDS", 0),
               patch.object(collector.subprocess, "Popen", Process),
               patch.object(collector.subprocess, "run", side_effect=query),
               patch.object(collector.glob, "glob", return_value=[str(status)]),
-              patch.object(collector, "_thermal_zones", return_value=[]),
+              patch.object(collector, "_thermal_zones", return_value=()),
               patch.object(collector, "_target_hardware_state", return_value={})):
             # When xrandr loses the output without either process exiting.
             capture = collector.collect(args)
@@ -71,7 +73,7 @@ def disconnected() -> None:
         assert capture.get("display_connected") is False, capture
         assert capture["display_survived"] is True
         assert capture["observed_duration_seconds"] < 10
-        doc = reporter.build_result(capture, duration_requested="10s", now="2026-10-15T00:00:00Z",
+        doc = reporter.build_result(json.loads(json.dumps(capture)), duration_requested="10s", now="2026-10-15T00:00:00Z",
                                     capture_path=None, capture_sha256=None)
         assert doc["verdict"] != "PASS"
         assert "display_disconnected" in {v["metric"] for v in doc["violations"]}
@@ -87,10 +89,16 @@ def frozen() -> None:
     capture["provenance"].update(source_digest="a" * 64, build_artifact_digest="b" * 64,
                                  configuration_digest="c" * 64,
                                  service_definitions=[{"name": "fixture", "digest": "d" * 64}])
-    capture["samples"] = [{"t_ms": second * 1000, "receiver_rss_mb": 100,
-                           "receiver_cpu_pct_one_core": 10, "projection_active": True,
+    capture["samples"] = [{"t_ns": second * 1_000_000_000, "receiver_rss_mb": 100,
+                           "receiver_cpu_ticks": second * 10, "thermal_zones": [], "projection_active": True,
                            "video_units": 1, "audio_chunks": 1, "video_presentations": 1,
                            "audio_writes": 1, "av_pairs": 1} for second in range(0, 1801, 5)]
+    capture.update(schema="aa-projection-perf-capture/2", monotonic_origin_ns=0, cpu_ticks_per_second=100,
+                   video_evidence={"blocks": [], "ipc_latency_ns": [], "decode_latency_ns": []})
+    ledger = CoverageLedger(0)
+    for second in (5, 10, 15):
+        ledger.advance(second * 1_000_000_000)
+    capture["video_evidence"]["blocks"] = [asdict(block) for block in ledger.finish(15 * 1_000_000_000)]
     # When evaluating the actual time-series, not just nonzero startup evidence.
     doc = reporter.build_result(capture, duration_requested="30m", now="2026-10-15T00:00:00Z",
                                 capture_path=None, capture_sha256=None)
@@ -126,12 +134,12 @@ def active_window(freeze_after: float | None = None) -> None:
                                   no_display=False, duration_seconds=10 if freeze_after is None else 30, interval=1,
                                   startup_timeout_seconds=6, store=None, video_socket=None,
                                   input_socket=None, state_dir=tmp)
-        with (patch.object(collector.time, "monotonic", side_effect=lambda: clock[0]),
+        with (patch.object(collector.time, "monotonic_ns", side_effect=lambda: int(clock[0] * 1e9)),
               patch.object(collector.time, "sleep", side_effect=sleep),
               patch.object(collector, "_STARTUP_GRACE_SECONDS", 0),
               patch.object(collector.subprocess, "Popen", LoggingProcess),
               patch.object(collector, "_display_connected", return_value=True),
-              patch.object(collector, "_thermal_zones", return_value=[]),
+              patch.object(collector, "_thermal_zones", return_value=()),
               patch.object(collector, "_target_hardware_state", return_value={})):
             # When requesting ten seconds of active projection after bounded startup.
             capture = collector.collect(args)
@@ -149,15 +157,17 @@ def active_window(freeze_after: float | None = None) -> None:
     for duration in (1800, 7200):
         progress = collector.ProjectionProgress()
         for second in range(0, duration + 1, 5):
-            progress.observe({"t_ms": second * 1000, "projection_active": True,
-                              **{key: second + 1 for key in collector._PROGRESS_KEYS}})
+            progress.observe(Sample(t_ns=second * 1_000_000_000, receiver_rss_mb=None,
+                                    receiver_cpu_ticks=None, thermal_zones=(), projection_active=True,
+                                    **{key: second + 1 for key in collector._PROGRESS_KEYS}))
         assert progress.seconds == duration and progress.failure is None
     for stream in collector._PROGRESS_KEYS:
         progress = collector.ProjectionProgress()
         for second in range(0, 21, 5):
-            progress.observe({"t_ms": second * 1000, "projection_active": True,
-                              **{key: 1 if key == stream else second + 1
-                                 for key in collector._PROGRESS_KEYS}})
+            progress.observe(Sample(t_ns=second * 1_000_000_000, receiver_rss_mb=None,
+                                    receiver_cpu_ticks=None, thermal_zones=(), projection_active=True,
+                                    **{key: 1 if key == stream else second + 1
+                                       for key in collector._PROGRESS_KEYS}))
         assert progress.failure == "media_stalled:" + stream, (stream, progress.failure)
 
 
