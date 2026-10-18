@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / 'tools/qualification'))
 sys.path.insert(0, str(ROOT / 'tools/perf'))
 from common import JSON, Document
 from aa_perf_report import build_result
+from synthetic_capture import capture
 
 
 class PackageTest(unittest.TestCase):
@@ -77,21 +78,11 @@ def make_package(root: Path) -> Path:
     }
     write(root / 'projection.json', projection)
     write(root / 'recovery.json', recovery)
-    nominal = json.loads((ROOT / 'tests/perf/fixtures/wired_perf/nominal_capture.json').read_text())
     for name, seconds, stamp in (('perf.json', 1800, '2026-01-01T00:30:00Z'),
                                  ('soak.json', 7200, '2026-01-01T02:30:00Z')):
-        result = build_result(nominal, duration_requested=None, now=stamp,
-                              capture_path=None, capture_sha256=None)
-        result.update(measurement_origin='live', qualification_status='COMPLETE_LIVE',
-                      duration_seconds=seconds, provenance=provenance,
-                      notes=['SYNTHETIC TEST ONLY; not observed on hardware'])
-        result['run_status'] = {
-            'early_exit': False, 'receiver_exit_code': 0, 'receiver_stopped_by_collector': True,
-            'display_survived': True, 'display_connected': True, 'terminal_errors': [],
-            'startup_ms': 900, 'video_units': 300, 'audio_chunks': 500,
-            'active_projection_seconds': seconds, 'startup_wait_seconds': 1,
-            'projection_failure': None,
-        }
+        result = build_result(capture(seconds, provenance), duration_requested=None, now=stamp,
+                               capture_path=None, capture_sha256=None)
+        result['notes'].append('SYNTHETIC TEST ONLY; not observed on hardware')
         write(root / name, result)
     (root / 'session.jsonl').write_text('{"event":"active","identity":"sha256:'
                                         + 'a' * 64 + '"}\n', encoding='utf-8')

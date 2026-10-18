@@ -2,14 +2,16 @@
 """Semantic checks of native task30/31/32 results, not their PASS labels alone."""
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 from typing import Final
 
-from common import DIGEST, Document, require
+from common import DIGEST, Document, EvidenceError, require
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'perf'))
 import aa_perf_schema
+from aa_measurement_coverage import CoverageError, coverage_gaps, parse_coverage
 
 RECOVERY: Final = {
     'usb_unplug_replug': 'dip+frames+pump+input',
@@ -95,6 +97,7 @@ def recovery(doc: Document) -> None:
 def performance(doc: Document, seconds: int) -> None:
     doc.equal('task', '32. Measure wired performance and two-hour soak')
     require('capture' not in doc.values, 'RAW_CAPTURE_REFERENCE')
+    doc.equal('schema', 'aa-projection-perf/2')
     schema = aa_perf_schema.load_schema(aa_perf_schema.DEFAULT_SCHEMA)
     require(not aa_perf_schema.validate(doc.values, schema), 'PERF_SCHEMA')
     doc.equal('measurement_origin', 'live')
@@ -114,6 +117,12 @@ def performance(doc: Document, seconds: int) -> None:
     run.equal('terminal_errors', [])
     active = run.number('active_projection_seconds')
     require(seconds <= active <= doc.number('duration_seconds'), 'INCOMPLETE_ACTIVE_WINDOW')
+    try:
+        coverage = parse_coverage(doc.get('measurement_coverage'))
+        gaps = coverage_gaps(coverage, active)
+    except CoverageError as error:
+        raise EvidenceError('INVALID_PERF_COVERAGE') from error
+    require(not gaps, 'INCOMPLETE_PERF_COVERAGE')
     require(0 <= run.number('startup_wait_seconds') <= 60, 'PERF_STARTUP_GRACE')
     require(run.integer('startup_ms') >= 0, 'PERF_STARTUP')
     for name in ('video_units', 'audio_chunks'):
@@ -139,6 +148,21 @@ def performance(doc: Document, seconds: int) -> None:
     for name in RECORDED:
         metrics.child(name).number('value')
     thermal = doc.child('thermal_state')
-    thermal.number('peak_c')
+    peak = thermal.number('peak_c')
     require(bool(thermal.array('zones')), 'MISSING_THERMAL_ZONES')
+    require(metrics.child('thermal_peak_c').number('value') == peak,
+            'PERF_THERMAL_PEAK')
+    zone_peaks = [Document.parse(zone).number('temp_c') for zone in thermal.array('zones')]
+    require(max(zone_peaks) == peak, 'PERF_THERMAL_ZONES')
+    require(metrics.child('decode_frames').number('value') == coverage.decode.count,
+            'PERF_DECODE_COUNT')
+    for name, stream, scale in (('decode_fps', coverage.decode, 1e9),
+                                ('ipc_throughput_mbps', coverage.ipc_consumption, 8000)):
+        if stream.begin_ns is None or stream.last_ns is None:
+            raise EvidenceError('PERF_RATE_BOUNDS')
+        duration = stream.last_ns - stream.begin_ns
+        require(duration > 0, 'PERF_RATE_DURATION')
+        numerator = stream.count if name == 'decode_fps' else stream.bytes
+        require(math.isclose(metrics.child(name).number('value'), numerator * scale / duration,
+                             rel_tol=1e-12, abs_tol=1e-12), 'PERF_RATE:' + name)
     provenance(doc.child('provenance'))
