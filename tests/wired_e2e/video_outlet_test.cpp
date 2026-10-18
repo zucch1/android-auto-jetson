@@ -5,10 +5,17 @@
 #include "../video_socket/pair.hpp"
 
 #include <gtest/gtest.h>
+#include <aa/ipc/VideoSocket.hpp>
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <chrono>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
+#include <unistd.h>
 
 namespace {
 namespace p = aa::protocol;
@@ -147,5 +154,72 @@ TEST(WiredReceiver, MalformedVideoStillPropagatesWithoutAck) {
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code(), aa::ErrorCode::protocol_malformed_message);
     EXPECT_EQ(replies, before);
+}
+
+int connect_raw_video_client(const std::string &path) {
+    const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+void retire_video_runtime_dir(const std::string &runtime_dir) {
+    const auto path = aa::ipc::video_socket_path_in(runtime_dir);
+    videotest::remove_startup_lock(path.value);
+    (void)::rmdir((runtime_dir + "/android-auto-receiver").c_str());
+    (void)::rmdir(runtime_dir.c_str());
+}
+
+TEST(WiredReceiver, AcceptConsumerAdmitsLimitsRecordDelayedWithinBound) {
+    const std::string runtime_dir = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime_dir.empty());
+    const auto path = aa::ipc::video_socket_path_in(runtime_dir);
+    auto server = aa::ipc::VideoServer::listen(path, {{}, aa::ipc::current_uid()});
+    ASSERT_TRUE(server.has_value()) << aa::to_string(server.error().code());
+    const int fd = connect_raw_video_client(path.value);
+    ASSERT_GE(fd, 0);
+    aa::core::Result<aa::ipc::VideoProducer> accepted{aa::Error{aa::ErrorCode::internal}};
+    std::thread acceptor([&] { accepted = server.value().accept_consumer(Milliseconds{1500}); });
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    std::array<std::uint8_t, aa::ipc::kLimitsRecordBytes> record{};
+    aa::ipc::encode_limits_record(record, {});
+    ASSERT_EQ(::send(fd, record.data(), record.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(record.size()));
+    std::array<std::uint8_t, aa::ipc::kLimitsRecordBytes> peer{};
+    (void)::recv(fd, peer.data(), peer.size(), 0);
+    acceptor.join();
+    ASSERT_TRUE(accepted.has_value())
+        << "delayed limits record inside the positive bound was not admitted: "
+        << aa::to_string(accepted.error().code());
+    accepted.value().close();
+    ::close(fd);
+    server.value().close();
+    retire_video_runtime_dir(runtime_dir);
+}
+
+TEST(WiredReceiver, AcceptConsumerTimesOutWhenLimitsRecordAbsent) {
+    const std::string runtime_dir = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime_dir.empty());
+    const auto path = aa::ipc::video_socket_path_in(runtime_dir);
+    auto server = aa::ipc::VideoServer::listen(path, {{}, aa::ipc::current_uid()});
+    ASSERT_TRUE(server.has_value()) << aa::to_string(server.error().code());
+    const int fd = connect_raw_video_client(path.value);
+    ASSERT_GE(fd, 0);
+    aa::core::Result<aa::ipc::VideoProducer> accepted{aa::Error{aa::ErrorCode::internal}};
+    std::thread acceptor([&] { accepted = server.value().accept_consumer(Milliseconds{300}); });
+    acceptor.join();
+    ::close(fd);
+    ASSERT_FALSE(accepted.has_value()) << "absent limits record still produced a producer";
+    EXPECT_EQ(accepted.error().code(), aa::ErrorCode::timeout);
+    server.value().close();
+    retire_video_runtime_dir(runtime_dir);
 }
 } // namespace
