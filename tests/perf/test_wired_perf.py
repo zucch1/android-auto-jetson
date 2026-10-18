@@ -45,7 +45,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools" / "perf"
 FIXTURES = ROOT / "tests" / "perf" / "fixtures" / "wired_perf"
-SCHEMA = TOOL / "aa-projection-perf.schema.json"
+SCHEMA = TOOL / "aa-projection-perf-v2.schema.json"
 SHELL = TOOL / "aa-projection-perf.sh"
 REPORTER = TOOL / "aa_perf_report.py"
 VALIDATOR = TOOL / "aa_perf_schema.py"
@@ -59,6 +59,7 @@ sys.path.insert(0, str(TOOL))
 import aa_perf_schema  # noqa: E402
 import aa_perf_report  # noqa: E402
 import test_gate_regressions as gate
+from test_v2_coverage import synthetic
 
 
 def run(argv: list[str], env: dict | None = None, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -88,20 +89,14 @@ def write(path: Path, doc: object) -> None:
 def make_capture(tmp: Path, name: str, *, rss0: float, rss1: float, cpu: float, av: float,
                  audio: float, crashes: int = 0) -> Path:
     path = tmp / name
-    write(path, {
-        "schema": "aa-projection-perf-capture/1",
-        "mode": "wired",
-        "duration_seconds": 1800,
-        "crashes": crashes,
-        "samples": [
-            {"t_ms": 0, "receiver_rss_mb": rss0, "receiver_cpu_pct_one_core": cpu,
-             "thermal_peak_c": 45.0},
-            {"t_ms": 1800000, "receiver_rss_mb": rss1, "receiver_cpu_pct_one_core": cpu,
-             "thermal_peak_c": 46.0},
-        ],
-        "events": {**load(NOMINAL)["events"], "av_sync_ms": av,
-                   "audio_latency_ms": audio, "helper_rss_mb": None},
-    })
+    capture = synthetic(20)
+    capture["cpu_ticks_per_second"] = 10000
+    capture["crashes"] = crashes
+    for index, sample in enumerate(capture["samples"]):
+        sample["receiver_rss_mb"] = rss0 + (rss1 - rss0) * index / 4
+        sample["receiver_cpu_ticks"] = round(index * 5 * cpu * 100)
+    capture["events"].update(av_sync_ms=av, audio_latency_ms=audio)
+    write(path, capture)
     return path
 
 
@@ -164,18 +159,10 @@ def case_schema(tmp: Path) -> None:
     # Untrusted device text (a thermal zone name) must be JSON-escaped data, not
     # injected into the document structure.
     hostile = tmp / "hostile-capture.json"
-    write(hostile, {
-        "schema": "aa-projection-perf-capture/1", "mode": "wired", "duration_seconds": 60,
-        "crashes": 0,
-        "samples": [
-            {"t_ms": 0, "receiver_rss_mb": 100.0, "receiver_cpu_pct_one_core": 10.0,
-             "thermal_zones": [{"zone": 'cpu"]},"pwned":true', "temp_c": 44.0}]},
-            {"t_ms": 60000, "receiver_rss_mb": 100.0, "receiver_cpu_pct_one_core": 10.0,
-             "thermal_zones": [{"zone": 'cpu"]},"pwned":true', "temp_c": 44.0}]},
-        ],
-        "events": {**load(NOMINAL)["events"], "av_sync_ms": 5.0,
-                   "audio_latency_ms": 10.0, "helper_rss_mb": None},
-    })
+    hostile_capture = synthetic(20)
+    for sample in hostile_capture["samples"]:
+        sample["thermal_zones"] = [{"zone": 'cpu"]},"pwned":true', "temp_c": 44.0}]
+    write(hostile, hostile_capture)
     hostile_out = tmp / "hostile-result.json"
     assert report(hostile, hostile_out).returncode == 0
     hostile_doc = load(hostile_out)
@@ -336,11 +323,11 @@ def case_collector(tmp: Path) -> None:
     capture_path = tmp / "capture.json"
     capture_path.write_text(res.stdout, encoding="utf-8")
     capture = load(capture_path)
-    assert capture["schema"] == "aa-projection-perf-capture/1"
+    assert capture["schema"] == "aa-projection-perf-capture/2"
     assert len(capture["samples"]) >= 2, capture["samples"]
     assert all(s["receiver_rss_mb"] and s["receiver_rss_mb"] > 0 for s in capture["samples"])
     assert capture["crashes"] == 0
-    assert capture["events"]["decode_p95_ms"] == 25.0
+    assert "decode_p95_ms" not in capture["events"]
     assert capture["events"]["video_units"] is not None
     assert "machine" in capture["target_hardware_state"]
 

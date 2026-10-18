@@ -1,34 +1,18 @@
 {
-  "schema": "aa-projection-perf-capture/1",
-  "mode": "wired",
-  "duration_seconds": 1800,
-  "crashes": 1,
+  "schema": "aa-projection-perf-capture/2", "mode": "wired", "measurement_origin": "offline",
+  "duration_seconds": 10, "observed_duration_seconds": 10, "active_projection_seconds": 10,
+  "monotonic_origin_ns": 0, "cpu_ticks_per_second": 100, "crashes": 1,
   "samples": [
-    {
-      "t_ms": 0,
-      "receiver_rss_mb": 300.0,
-      "receiver_cpu_pct_one_core": 71.0,
-      "thermal_peak_c": 78.0,
-      "thermal_zones": [{"zone": "cpu-thermal", "temp_c": 78.0}]
-    },
-    {
-      "t_ms": 1800000,
-      "receiver_rss_mb": 360.0,
-      "receiver_cpu_pct_one_core": 74.0,
-      "thermal_peak_c": 79.0,
-      "thermal_zones": [{"zone": "cpu-thermal", "temp_c": 79.0}]
-    }
+    {"t_ns":0,"receiver_rss_mb":300,"receiver_cpu_ticks":0,"thermal_zones":[{"zone":"thermal_zone0:CPU","temp_c":78}],"projection_active":true,"video_units":1,"audio_chunks":1,"video_presentations":1,"audio_writes":1,"av_pairs":1},
+    {"t_ns":5000000000,"receiver_rss_mb":330,"receiver_cpu_ticks":355,"thermal_zones":[{"zone":"thermal_zone0:CPU","temp_c":79}],"projection_active":true,"video_units":2,"audio_chunks":2,"video_presentations":2,"audio_writes":2,"av_pairs":2},
+    {"t_ns":10000000000,"receiver_rss_mb":360,"receiver_cpu_ticks":725,"thermal_zones":[{"zone":"thermal_zone0:CPU","temp_c":79}],"projection_active":true,"video_units":3,"audio_chunks":3,"video_presentations":3,"audio_writes":3,"av_pairs":3}
   ],
-  "events": {
-    "frame_drops": 42,
-    "decode_p50_ms": 30.0,
-    "decode_p95_ms": 80.0,
-    "decode_fps": 22.0,
-    "decode_frames": 13200,
-    "ipc_throughput_mbps": 6.0,
-    "ipc_p95_added_latency_ms": 9.0,
-    "av_sync_ms": 90.0,
-    "audio_latency_ms": 260.0,
-    "helper_rss_mb": null
-  }
+  "video_evidence": {
+    "blocks": [
+      {"start_ns":0,"end_ns":5000000000,"ipc_consumption":{"count":1,"first_ns":5000000000,"last_ns":5000000000,"max_internal_gap_ns":0,"begin_ns":0,"bytes":4096},"ipc_matches":{"count":1,"first_ns":5000000000,"last_ns":5000000000,"max_internal_gap_ns":0,"begin_ns":4991000000,"bytes":0},"decode":{"count":1,"first_ns":5000000000,"last_ns":5000000000,"max_internal_gap_ns":0,"begin_ns":4970000000,"bytes":0}},
+      {"start_ns":5000000000,"end_ns":10000000000,"ipc_consumption":{"count":1,"first_ns":10000000000,"last_ns":10000000000,"max_internal_gap_ns":0,"begin_ns":5000000000,"bytes":4096},"ipc_matches":{"count":1,"first_ns":10000000000,"last_ns":10000000000,"max_internal_gap_ns":0,"begin_ns":9991000000,"bytes":0},"decode":{"count":1,"first_ns":10000000000,"last_ns":10000000000,"max_internal_gap_ns":0,"begin_ns":9920000000,"bytes":0}}
+    ],
+    "ipc_latency_ns": [9000000,9000000], "decode_latency_ns": [30000000,80000000]
+  },
+  "events": {"frame_drops":42,"av_sync_ms":90,"audio_latency_ms":260,"helper_rss_mb":null}
 }

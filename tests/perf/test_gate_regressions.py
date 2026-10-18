@@ -22,10 +22,12 @@ sys.path.insert(0, str(ROOT / "tools/perf"))
 import aa_perf_report
 import aa_perf_schema
 import aa_projection_collect
+from aa_measurement_coverage import CoverageError
+from test_v2_coverage import synthetic
 
 
 def result(capture: dict) -> dict:
-    return aa_perf_report.build_result(capture, duration_requested="30m",
+    return aa_perf_report.build_result(json.loads(json.dumps(capture)), duration_requested="30m",
                                       now="2026-10-14T00:00:00Z", capture_path=None,
                                       capture_sha256=None)
 
@@ -64,7 +66,12 @@ def finite(tmp: Path) -> None:
         json.dumps(collected, allow_nan=False)
     capture = nominal()
     capture["samples"][0]["receiver_rss_mb"] = float("nan")
-    assert result(capture)["verdict"] == "BLOCKED"
+    try:
+        result(capture)
+    except CoverageError:
+        pass
+    else:
+        raise AssertionError("nonfinite raw measurement accepted")
     parser = aa_projection_collect.EventParser()
     parser._consume('{"event":"decode_stats","frames":1e999}')
     assert parser.metrics["decode_frames"] is None
@@ -79,7 +86,7 @@ def interruption(tmp: Path) -> None:
         capture["observed_duration_seconds"] = 2.5
         doc = result(capture)
         assert doc["verdict"] != "PASS", field
-        assert doc["duration_seconds"] == 2.5
+        assert doc["duration_seconds"] == 20
         assert doc["run_status"][field] == value
         assert doc["violations"], field
     for scenario in ("clean_early", "terminal_alive", "display_death"):
@@ -124,30 +131,30 @@ time.sleep(0.35)
 def completeness(tmp: Path) -> None:
     gaps = ["frame_drops", "decode_p50_ms", "decode_p95_ms", "decode_fps",
             "decode_frames", "ipc_throughput_mbps", "ipc_p95_added_latency_ms"]
-    capture = nominal()
-    for name in gaps:
-        capture["events"].pop(name)
+    capture = synthetic(20)
+    capture["events"].pop("frame_drops")
+    capture["video_evidence"]["blocks"] = [{**block,
+        **{stream: {"count": 0, "first_ns": None, "last_ns": None,
+                    "max_internal_gap_ns": 0, "begin_ns": None, "bytes": 0}
+           for stream in ("ipc_consumption", "ipc_matches", "decode")}}
+        for block in capture["video_evidence"]["blocks"]]
+    capture["video_evidence"].update(ipc_latency_ns=[], decode_latency_ns=[])
     doc = result(capture)
     assert doc["verdict"] == "BLOCKED"
-    assert sorted(doc["named_gaps"]) == sorted(gaps)
+    assert set(gaps) <= set(doc["named_gaps"])
     assert doc["qualification_status"] == "INCOMPLETE"
-    capture = nominal()
+    capture = synthetic(1800)
     capture["measurement_origin"] = "live"
     capture["provenance"] = {}
     doc = result(capture)
     assert doc["verdict"] == "BLOCKED"
     assert len(doc["provenance_gaps"]) == 5
     assert result(nominal())["qualification_status"] == "OFFLINE_ONLY"
-    capture = nominal()
+    capture = synthetic(1800)
     capture.update(measurement_origin="live", observed_duration_seconds=1800,
                    early_exit=False, receiver_exit_code=0, display_survived=True,
                    display_connected=True)
     capture["events"].update(startup_ms=10, video_units=100, audio_chunks=100)
-    capture["samples"] = [{**capture["samples"][0], "t_ms": second * 1000,
-                           "projection_active": True, "video_units": second + 1,
-                           "audio_chunks": second + 1, "video_presentations": second + 1,
-                           "audio_writes": second + 1, "av_pairs": second + 1}
-                          for second in range(0, 1801, 5)]
     capture["provenance"].update(source_digest="a" * 64, build_artifact_digest="b" * 64,
                                  configuration_digest="c" * 64,
                                  service_definitions=[{"name": "fixture.service", "digest": "d" * 64}])

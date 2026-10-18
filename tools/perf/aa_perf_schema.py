@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-DEFAULT_SCHEMA = _HERE / "aa-projection-perf.schema.json"
+DEFAULT_SCHEMA = _HERE / "aa-projection-perf-v2.schema.json"
 
 # Keywords this validator understands. Any other keyword is a hard error.
 _KNOWN_KEYWORDS = frozenset(
@@ -259,7 +259,15 @@ def validate(instance: object, schema: dict, root: dict | None = None) -> list[s
     if not isinstance(schema, dict):
         raise SchemaError("schema must be a JSON object")
     _, numeric_errors = finite_numbers(instance)
-    return numeric_errors + _validate(instance, schema, root if root is not None else schema, "$", 0)
+    errors = numeric_errors + _validate(instance, schema, root if root is not None else schema, "$", 0)
+    if (not errors and isinstance(instance, dict) and instance.get("schema") == "aa-projection-perf/2"
+            and schema.get("properties", {}).get("schema", {}).get("const") == "aa-projection-perf/2"):
+        from aa_measurement_coverage import CoverageError, parse_coverage
+        try:
+            parse_coverage(instance.get("measurement_coverage"))
+        except CoverageError as exc:
+            errors.append("$.measurement_coverage: " + str(exc))
+    return errors
 
 
 def finite_numbers(instance, path: str = "$") -> tuple:

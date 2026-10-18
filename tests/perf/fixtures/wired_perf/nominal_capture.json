@@ -1,49 +1,24 @@
 {
-  "schema": "aa-projection-perf-capture/1",
-  "mode": "wired",
-  "duration_seconds": 1800,
-  "crashes": 0,
+  "schema": "aa-projection-perf-capture/2", "mode": "wired", "measurement_origin": "offline",
+  "duration_seconds": 20, "observed_duration_seconds": 20, "active_projection_seconds": 20,
+  "monotonic_origin_ns": 0, "cpu_ticks_per_second": 100, "crashes": 0,
   "samples": [
-    {
-      "t_ms": 0,
-      "receiver_rss_mb": 200.0,
-      "receiver_cpu_pct_one_core": 30.0,
-      "thermal_peak_c": 45.0,
-      "thermal_zones": [{"zone": "cpu-thermal", "temp_c": 45.0}]
-    },
-    {
-      "t_ms": 900000,
-      "receiver_rss_mb": 205.0,
-      "receiver_cpu_pct_one_core": 32.0,
-      "thermal_peak_c": 50.0,
-      "thermal_zones": [{"zone": "cpu-thermal", "temp_c": 50.0}]
-    },
-    {
-      "t_ms": 1800000,
-      "receiver_rss_mb": 210.0,
-      "receiver_cpu_pct_one_core": 34.0,
-      "thermal_peak_c": 52.0,
-      "thermal_zones": [{"zone": "cpu-thermal", "temp_c": 52.0}]
-    }
+    {"t_ns":0,"receiver_rss_mb":200,"receiver_cpu_ticks":0,"thermal_zones":[{"zone":"thermal_zone0:CPU","temp_c":45}],"projection_active":true,"video_units":1,"audio_chunks":1,"video_presentations":1,"audio_writes":1,"av_pairs":1},
+    {"t_ns":5000000000,"receiver_rss_mb":202.5,"receiver_cpu_ticks":150,"thermal_zones":[{"zone":"thermal_zone0:CPU","temp_c":47}],"projection_active":true,"video_units":2,"audio_chunks":2,"video_presentations":2,"audio_writes":2,"av_pairs":2},
+    {"t_ns":10000000000,"receiver_rss_mb":205,"receiver_cpu_ticks":310,"thermal_zones":[{"zone":"thermal_zone0:CPU","temp_c":50}],"projection_active":true,"video_units":3,"audio_chunks":3,"video_presentations":3,"audio_writes":3,"av_pairs":3},
+    {"t_ns":15000000000,"receiver_rss_mb":207.5,"receiver_cpu_ticks":480,"thermal_zones":[{"zone":"thermal_zone0:CPU","temp_c":51}],"projection_active":true,"video_units":4,"audio_chunks":4,"video_presentations":4,"audio_writes":4,"av_pairs":4},
+    {"t_ns":20000000000,"receiver_rss_mb":210,"receiver_cpu_ticks":650,"thermal_zones":[{"zone":"thermal_zone0:CPU","temp_c":52}],"projection_active":true,"video_units":5,"audio_chunks":5,"video_presentations":5,"audio_writes":5,"av_pairs":5}
   ],
-  "events": {
-    "frame_drops": 0,
-    "decode_p50_ms": 20.0,
-    "decode_p95_ms": 36.09,
-    "decode_fps": 30.0,
-    "decode_frames": 18000,
-    "ipc_throughput_mbps": 10.1,
-    "ipc_p95_added_latency_ms": 1.2,
-    "av_sync_ms": 12.0,
-    "audio_latency_ms": 84.0,
-    "helper_rss_mb": null
+  "video_evidence": {
+    "blocks": [
+      {"start_ns":0,"end_ns":5000000000,"ipc_consumption":{"count":1,"first_ns":5000000000,"last_ns":5000000000,"max_internal_gap_ns":0,"begin_ns":0,"bytes":4096},"ipc_matches":{"count":1,"first_ns":5000000000,"last_ns":5000000000,"max_internal_gap_ns":0,"begin_ns":4998800000,"bytes":0},"decode":{"count":1,"first_ns":5000000000,"last_ns":5000000000,"max_internal_gap_ns":0,"begin_ns":4970000000,"bytes":0}},
+      {"start_ns":5000000000,"end_ns":10000000000,"ipc_consumption":{"count":1,"first_ns":10000000000,"last_ns":10000000000,"max_internal_gap_ns":0,"begin_ns":5000000000,"bytes":4096},"ipc_matches":{"count":1,"first_ns":10000000000,"last_ns":10000000000,"max_internal_gap_ns":0,"begin_ns":9998800000,"bytes":0},"decode":{"count":1,"first_ns":10000000000,"last_ns":10000000000,"max_internal_gap_ns":0,"begin_ns":9980000000,"bytes":0}},
+      {"start_ns":10000000000,"end_ns":15000000000,"ipc_consumption":{"count":1,"first_ns":15000000000,"last_ns":15000000000,"max_internal_gap_ns":0,"begin_ns":10000000000,"bytes":4096},"ipc_matches":{"count":1,"first_ns":15000000000,"last_ns":15000000000,"max_internal_gap_ns":0,"begin_ns":14998800000,"bytes":0},"decode":{"count":1,"first_ns":15000000000,"last_ns":15000000000,"max_internal_gap_ns":0,"begin_ns":14980000000,"bytes":0}},
+      {"start_ns":15000000000,"end_ns":20000000000,"ipc_consumption":{"count":1,"first_ns":20000000000,"last_ns":20000000000,"max_internal_gap_ns":0,"begin_ns":15000000000,"bytes":4096},"ipc_matches":{"count":1,"first_ns":20000000000,"last_ns":20000000000,"max_internal_gap_ns":0,"begin_ns":19998800000,"bytes":0},"decode":{"count":1,"first_ns":20000000000,"last_ns":20000000000,"max_internal_gap_ns":0,"begin_ns":19963910000,"bytes":0}}
+    ],
+    "ipc_latency_ns": [1200000,1200000,1200000,1200000],
+    "decode_latency_ns": [30000000,20000000,20000000,36090000]
   },
-  "provenance": {
-    "source_digest": "fixture-source",
-    "build_artifact_digest": "fixture-build",
-    "configuration_digest": "fixture-config",
-    "service_definitions": [],
-    "dependency_versions": {"gstreamer": "1.24.2"},
-    "target_hardware_state": {"machine": "aarch64", "model": "fixture"}
-  }
+  "events": {"frame_drops":0,"av_sync_ms":12,"audio_latency_ms":84,"helper_rss_mb":null},
+  "provenance": {"source_digest":"fixture-source","build_artifact_digest":"fixture-build","configuration_digest":"fixture-config","service_definitions":[],"dependency_versions":{"gstreamer":"1.24.2"},"target_hardware_state":{"machine":"aarch64","model":"offline-fixture"}}
 }
