@@ -16,16 +16,47 @@
 #include <QApplication>
 #include <QTimer>
 
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace {
 
 using aa::display::DisplayState;
+
+class ErrorReporter final {
+public:
+    void begin_attempt() {
+        emitted_ = 0;
+        last_.reset();
+    }
+
+    void report(std::string_view stage, aa::ErrorCode code) {
+        const auto pair = std::pair{stage, code};
+        if (emitted_ == 4 || last_ == pair) {
+            return;
+        }
+        ++emitted_;
+        last_ = pair;
+        const auto code_str = aa::to_string(code);
+        std::string line{};
+        line.reserve(64 + stage.size() + code_str.size());
+        line.append("{\"event\":\"display_error\",\"stage\":\"");
+        line.append(stage);
+        line.append("\",\"code\":\"");
+        line.append(code_str);
+        line.append("\"}");
+        std::puts(line.c_str());
+        std::fflush(stdout);
+    }
+
+private:
+    unsigned emitted_{0};
+    std::optional<std::pair<std::string_view, aa::ErrorCode>> last_{};
+};
 
 // Display-side control wiring (task 24 F2): the widget's F5/F6 shortcuts
 // reach DisplayController::start_projection/stop_projection through this
@@ -34,8 +65,9 @@ using aa::display::DisplayState;
 class ControlWiring final : public aa::display::ProjectionControl {
 public:
     ControlWiring(std::optional<aa::display::DisplayController>& controller,
-                  aa::ipc::VideoSocketPath video, aa::display::qt_adapter::ProjectionWidget& widget)
-        : controller_(controller), video_(std::move(video)), widget_(widget) {}
+                  aa::ipc::VideoSocketPath video, aa::display::qt_adapter::ProjectionWidget& widget,
+                  ErrorReporter& errors)
+        : controller_(controller), video_(std::move(video)), widget_(widget), errors_(errors) {}
 
     void on_start_projection() override {
         if (!controller_.has_value()) {
@@ -62,6 +94,8 @@ private:
             widget_.set_error(std::string_view{});
             return;
         }
+        errors_.report(std::strcmp(operation, "StartProjection") == 0 ? "start" : "stop",
+                       result.error().code());
         const auto state = aa::display::to_string(controller_->state());
         const auto code = aa::to_string(result.error().code());
         std::string message{};
@@ -76,6 +110,7 @@ private:
     std::optional<aa::display::DisplayController>& controller_;
     aa::ipc::VideoSocketPath video_;
     aa::display::qt_adapter::ProjectionWidget& widget_;
+    ErrorReporter& errors_;
 };
 
 std::optional<aa::display::DisplayController> g_controller{};
@@ -113,6 +148,7 @@ aa::display::testcontrol::Status probe_status() {
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+    auto errors = std::make_shared<ErrorReporter>();
 
     bool test_autostart = false;
     bool test_control_stdin = false;
@@ -142,6 +178,16 @@ int main(int argc, char** argv) {
     config.consumer_name = aa::ipc::BusName{"org.custom.DummyDisplay1"};
     config.viewport = aa::ipc::Viewport{1280, 720, 160};
     config.caps = aa::protocol::VideoProfile{1280, 720, 30};
+    config.on_video_endpoint = [](const aa::ipc::VideoEndpoint& event) {
+        const auto line = aa::ipc::video_endpoint_json(event);
+        std::puts(line.c_str());
+        std::fflush(stdout);
+    };
+    config.on_decode_completion = [](const aa::consumer::DecodeCompletion& event) {
+        const auto line = aa::consumer::decode_completion_json(event);
+        std::puts(line.c_str());
+        std::fflush(stdout);
+    };
 
     aa::display::qt_adapter::ProjectionWidget widget(sender, config.caps);
     g_widget = &widget;
@@ -152,27 +198,43 @@ int main(int argc, char** argv) {
         aa::display::TestOnlyAutostart gate{};
         gate.marker = test_autostart ? aa::display::TestOnlyAutostart::kMarker : std::string_view{};
         gate.video_socket = aa::ipc::VideoSocketPath{video_socket};
-        aa::display::DisplayController::Deps deps{client.value(), aa::display::helper_decode_sessions(),
-                                                  widget};
+        auto factory = [errors, inner = aa::display::helper_decode_sessions()](
+                           const aa::consumer::DecodeConfig& decode_config) {
+            errors->begin_attempt();
+            return inner(decode_config);
+        };
+        aa::display::DisplayController::Deps deps{client.value(), std::move(factory), widget};
         auto attached = test_autostart
                             ? aa::display::attach_test_only_autostart(gate, deps, config)
                             : aa::display::DisplayController::attach(std::move(deps), config);
         if (attached.has_value()) {
             widget.set_status(attached.value().state());
             g_controller.emplace(std::move(attached.value()));
+        } else {
+            errors->report(test_autostart ? "autostart" : "attach", attached.error().code());
         }
+    } else {
+        errors->report("attach", client.error().code());
     }
 
-    ControlWiring controls{g_controller, aa::ipc::VideoSocketPath{video_socket}, widget};
+    ControlWiring controls{g_controller, aa::ipc::VideoSocketPath{video_socket}, widget, *errors};
     widget.set_projection_control(&controls);
 
     // Pump timer must outlive app.exec(): declared at main scope, not inside
     // the attach block (task 24 F1 - a timer destroyed before the event loop
     // starts never pumps video into the helper or presents frames).
     auto pump_timer = std::make_unique<QTimer>();
-    QObject::connect(pump_timer.get(), &QTimer::timeout, [] {
+    QObject::connect(pump_timer.get(), &QTimer::timeout, [errors] {
         if (g_controller.has_value()) {
-            static_cast<void>(g_controller->pump(aa::core::Milliseconds{0}));
+            const auto pumped = g_controller->pump(aa::core::Milliseconds{0});
+            if (!pumped.has_value()) {
+                const auto code = pumped.error().code();
+                if (code != aa::ErrorCode::timeout &&
+                    code != aa::ErrorCode::transport_queue_full &&
+                    code != aa::ErrorCode::session_illegal_transition) {
+                    errors->report("pump", code);
+                }
+            }
         }
     });
     if (g_controller.has_value()) {
@@ -186,8 +248,10 @@ int main(int argc, char** argv) {
 
     widget.show();
     const int outcome = app.exec();
+    pump_timer->stop();
     if (g_controller.has_value()) {
         g_controller->shutdown();
+        g_controller.reset();
     }
     return outcome;
 }

@@ -4,6 +4,7 @@
 #include <aa/core/Result.hpp>
 #include <aa/core/Time.hpp>
 #include <aa/ipc/VideoSocket.hpp>
+#include <aa/ipc/VideoTelemetry.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -109,6 +110,10 @@ public:
     // (dropped_waiting_idr) after any backpressure drop.
     [[nodiscard]] core::Result<SendStatus> send_access_unit(const VideoSendRequest& request);
 
+    // Called after a successful full AU send, with the timestamp sampled just
+    // before its first send syscall. Failed/partial sends acquire no sample.
+    void set_observer(VideoEndpointObserver observer);
+
     // shutdown(SHUT_WR) + close; idempotent; the consumer then sees a clean
     // end of stream.
     void close() noexcept;
@@ -145,6 +150,9 @@ public:
     // Invoked after each reassembled access unit; a capture error is
     // propagated but the stream stays usable.
     void set_capture(VideoStreamCapture* capture) noexcept;
+
+    // Called after successful full reassembly, before capture/decode work.
+    void set_observer(VideoEndpointObserver observer);
 
     void close() noexcept;
 

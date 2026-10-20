@@ -28,6 +28,7 @@ set(AA_VIDEO_SOURCES
 set(AA_VIDEO_TEST_SOURCES
     tests/video_socket/video_codec_test.cpp
     tests/video_socket/video_channel_test.cpp
+    tests/video_socket/video_telemetry_test.cpp
     tests/video_socket/video_peer_test.cpp
     tests/video_socket/video_backpressure_test.cpp
     tests/video_socket/video_malformed_test.cpp

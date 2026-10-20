@@ -43,6 +43,9 @@ durable evidence directory outside disposable worktrees. Use its absolute path
 as `CAPTURE_DIR`; retain sanitized results and command logs there with SHA-256
 hashes, not only in temporary storage:
 
+`--out` is required, including for readiness-only runs. A bare invocation exits
+with usage status 2 and never writes a default result under `/tmp`.
+
 ```bash
 tools/wired-qa/run-wired-recovery-qa.sh --readiness-only \
     --out "$CAPTURE_DIR/task-31-readiness.json"

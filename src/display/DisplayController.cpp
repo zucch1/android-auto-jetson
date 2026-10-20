@@ -192,13 +192,8 @@ core::Result<void> DisplayController::start_projection(const ipc::VideoSocketPat
     if (!started.has_value()) {
         return started.error();
     }
-    auto connected = ipc::connect_video_consumer(
-        video_socket, ipc::VideoClientOptions{{}, ipc::current_uid(), Milliseconds{5000}});
-    if (!connected.has_value()) {
-        impl_->rollback_projection_start();
-        return connected.error();
-    }
     consumer::DecodeConfig decode_config{};
+    decode_config.on_completion = impl_->config.on_decode_completion;
     decode_config.caps = impl_->config.caps;
     decode_config.backend = consumer::DecodeBackend::automatic;
     Impl* impl = impl_.get();
@@ -207,11 +202,17 @@ core::Result<void> DisplayController::start_projection(const ipc::VideoSocketPat
     };
     auto session = impl_->decode_sessions(decode_config);
     if (!session.has_value()) {
-        impl_->video.emplace(std::move(connected.value()));
-        impl_->release_media();
         impl_->rollback_projection_start();
         return session.error();
     }
+    auto connected = ipc::connect_video_consumer(
+        video_socket, ipc::VideoClientOptions{{}, ipc::current_uid(), Milliseconds{5000}});
+    if (!connected.has_value()) {
+        session.value()->close();
+        impl_->rollback_projection_start();
+        return connected.error();
+    }
+    connected.value().set_observer(impl_->config.on_video_endpoint);
     impl_->video.emplace(std::move(connected.value()));
     impl_->session = std::move(session.value());
     impl_->helper_started = true;

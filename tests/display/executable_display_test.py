@@ -31,6 +31,7 @@ Cases:
                 lands idle with the widget error cleared.
 """
 
+import argparse
 import json
 import os
 import select
@@ -42,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 
 TIMEOUT = 120.0
 HELPER_STUBS = ("aa-system-helper", "nmcli", "iw", "busctl", "ip", "hostapd", "dnsmasq")
@@ -149,7 +151,11 @@ def start_receiver(args, runtime, mode=None):
     if mode is not None:
         argv += ["--mode", mode]
     proc = Driver(argv)
-    proc.await_event("ready")
+    try:
+        proc.await_event("ready")
+    except AssertionError:
+        proc.stop(False)
+        raise
     return proc, video, input_sock
 
 
@@ -174,7 +180,11 @@ def start_display(args, video, input_sock, autostart, env):
     if autostart:
         argv.append("--test-only-autostart")
     proc = Driver(argv, env=env)
-    proc.await_event("ready")
+    try:
+        proc.await_event("ready")
+    except AssertionError:
+        proc.stop(False)
+        raise
     return proc
 
 
@@ -520,19 +530,75 @@ def case_stalled(args):
         shutil.rmtree(runtime, ignore_errors=True)
 
 
+def case_diagnostics(args: argparse.Namespace) -> None:
+    """Bound bootstrap errors and give each actual factory attempt fresh credit."""
+    with tempfile.TemporaryDirectory(prefix="aa-exec-diagnostics-") as runtime, ExitStack() as children:
+        env = os.environ.copy()
+        env["XDG_RUNTIME_DIR"] = runtime
+        video = os.path.join(runtime, "missing-video.sock")
+        input_sock = os.path.join(runtime, "missing-input.sock")
+        if args.case != "diagnostics-bootstrap":
+            receiver, _, input_sock = start_receiver(args, runtime)
+            children.callback(receiver.stop, False)
+        if args.case == "diagnostics-factory":
+            plugins = os.path.join(runtime, "empty-plugins")
+            os.mkdir(plugins)
+            env.update(GST_PLUGIN_SYSTEM_PATH_1_0=plugins, GST_PLUGIN_PATH_1_0=plugins,
+                       GST_REGISTRY_1_0=os.path.join(runtime, "registry.bin"))
+        display = start_display(args, video, input_sock, False, env)
+        children.callback(display.stop)
+        if args.case == "diagnostics-bootstrap":
+            # Given no receiver, no request can invoke the helper factory.
+            for command in ["start"] * 8 + ["start", "stop"] * 16:
+                display.send(command)
+            display.send("status")
+            status = display.await_event("status", timeout=10)
+            assert status["state"] == "unavailable" and not status["helper_started"], status
+            assert display.stop() == 0
+            errors = [event for event in display.events if event.get("event") == "display_error"]
+            print(f"bootstrap commands=40 errors={len(errors)}", flush=True)
+            assert 1 <= len(errors) <= 4, errors
+        else:
+            code = ("channel_decode_unavailable" if args.case == "diagnostics-factory"
+                    else "transport_unavailable")
+            for attempt in range(2):
+                # When the same failure occurs in two distinct factory attempts.
+                with display.lock:
+                    offset = len(display.events)
+                display.send("start")
+                display.send("status")
+                status = display.await_event("status", timeout=15)
+                assert status["state"] == "idle" and not status["helper_started"], status
+                assert code in status["last_error"], status
+                with display.lock:
+                    errors = [event for event in display.events[offset:]
+                              if event.get("event") == "display_error"]
+                print(f"{args.case} attempt={attempt + 1} errors={len(errors)}", flush=True)
+                assert errors == [{"event": "display_error", "stage": "start", "code": code}], errors
+                receiver.await_output(lambda event: event.get("event") == "state"
+                                      and event.get("projection") == "stopped", timeout=10)
+            assert display.stop() == 0
+            assert receiver.stop(False) == 0
+            assert not [event for event in receiver.events
+                        if event.get("event") == "video_accepted"], receiver.events
+        for event in errors:
+            assert set(event) == {"event", "stage", "code"}, event
+
+
 def main():
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--display", required=True)
     parser.add_argument("--receiver", required=True)
     parser.add_argument("--fixture", required=True)
     parser.add_argument("--case", required=True,
                         choices=("replay", "flow", "absent", "stalled", "stopfail",
-                                 "stopreject"))
+                                 "stopreject", "diagnostics-bootstrap", "diagnostics-factory",
+                                 "diagnostics-connect"))
     args = parser.parse_args()
     {"replay": case_replay, "flow": case_flow, "absent": case_absent,
      "stalled": case_stalled, "stopfail": case_stopfail,
-     "stopreject": case_stopreject}[args.case](args)
+     "stopreject": case_stopreject, "diagnostics-bootstrap": case_diagnostics,
+     "diagnostics-factory": case_diagnostics, "diagnostics-connect": case_diagnostics}[args.case](args)
     print(f"PASS: {args.case}")
     return 0
 

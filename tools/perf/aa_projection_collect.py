@@ -12,7 +12,7 @@ the receiver (and optionally the dummy display), samples the receiver process
 and the thermal zones for the requested duration, parses the receiver/display
 JSON event stream, and writes ONE capture document to stdout:
 
-  {"schema":"aa-projection-perf-capture/1","mode":"wired",
+  {"schema":"aa-projection-perf-capture/2","mode":"wired",
    "duration_seconds":N,"crashes":0,"samples":[...],"events":{...},
    "target_hardware_state":{...}}
 
@@ -25,8 +25,11 @@ changes); it only launches the supplied binaries and reads procfs/sysfs.
 """
 from __future__ import annotations
 
+# allow: SIZE_OK - preserve the existing collector lifecycle and parser in the frozen owned file set.
+
 import argparse
 from collections import deque
+from dataclasses import asdict
 import glob
 import json
 import math
@@ -39,9 +42,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Literal
 
-CAPTURE_SCHEMA = "aa-projection-perf-capture/1"
-_STARTUP_GRACE_SECONDS = 3.0
+from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
+from aa_measurement_coverage import Sample, ThermalZone, VideoEvidence
+
+CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
 _TERMINATE_GRACE_SECONDS = 5.0
 _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
 _MEDIA_STALL_SECONDS = 10
@@ -88,27 +94,27 @@ def _cpu_ticks(pid: int) -> int | None:
     if len(rest) < 13:
         return None
     try:
-        return int(rest[11]) + int(rest[12])
+        ticks = int(rest[11]) + int(rest[12])
+        return ticks if ticks >= 0 else None
     except ValueError:
         return None
 
 
-def _thermal_zones() -> list[dict]:
-    zones: list[dict] = []
-    for temp_path in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
-        zone_dir = os.path.dirname(temp_path)
-        raw = _read_text(temp_path)
-        if raw is None:
-            continue
+def _thermal_zones(expected: tuple[ThermalZone, ...] = ()) -> tuple[ThermalZone, ...]:
+    inventory = {os.path.basename(path) + ":" + (_read_text(os.path.join(path, "type")) or "unknown"): path
+                 for path in sorted(glob.glob("/sys/class/thermal/thermal_zone*"))}
+    zones: list[ThermalZone] = []
+    for name in sorted(set(inventory) | {zone.zone for zone in expected}):
+        path = inventory.get(name)
+        raw = _read_text(os.path.join(path, "temp")) if path is not None else None
         try:
-            temp_c = float(raw) / 1000.0
+            temp_c = float(raw) / 1000.0 if raw is not None else None
         except ValueError:
-            continue
-        if not math.isfinite(temp_c):
-            continue
-        name = _read_text(os.path.join(zone_dir, "type")) or os.path.basename(zone_dir)
-        zones.append({"zone": name, "temp_c": temp_c})
-    return zones
+            temp_c = None
+        if temp_c is not None and not math.isfinite(temp_c):
+            temp_c = None
+        zones.append(ThermalZone(name, temp_c))
+    return tuple(zones)
 
 
 def _target_hardware_state() -> dict:
@@ -150,48 +156,50 @@ class ProjectionProgress:
     """Accumulate a fail-closed active window from observed, increasing counters."""
 
     def __init__(self) -> None:
-        self.started_ms: int | None = None
-        self.last_ms = 0
+        self.started_ns: int | None = None
+        self.last_ns = 0
         self.previous: dict[str, int] = {}
-        self.advanced_ms: dict[str, int] = {}
+        self.advanced_ns: dict[str, int] = {}
         self.failure: str | None = None
 
     @property
     def seconds(self) -> float:
-        return (self.last_ms - self.started_ms) / 1000 if self.started_ms is not None else 0.0
+        return (self.last_ns - self.started_ns) / 1e9 if self.started_ns is not None else 0.0
 
-    def observe(self, sample: dict) -> None:
+    def observe(self, sample: Sample) -> None:
         if self.failure:
             return
-        stamp = sample.get("t_ms")
-        counters = {key: sample.get(key) for key in _PROGRESS_KEYS}
-        valid = (type(stamp) is int and stamp >= 0
+        stamp = sample.t_ns
+        counters = {key: value for key, value in zip(_PROGRESS_KEYS, (
+            sample.video_units, sample.audio_chunks, sample.video_presentations,
+            sample.audio_writes, sample.av_pairs)) if value is not None}
+        valid = (len(counters) == len(_PROGRESS_KEYS) and type(stamp) is int and stamp >= 0
                  and all(type(value) is int and value >= 0 for value in counters.values()))
         if not valid:
-            if self.started_ms is not None:
+            if self.started_ns is not None:
                 self.failure = "missing_progress"
             return
-        if self.started_ms is None:
-            if sample.get("projection_active") is not True or not all(counters.values()):
+        if self.started_ns is None:
+            if not sample.projection_active or not all(counters.values()):
                 return
-            self.started_ms = stamp
+            self.started_ns = stamp
             self.previous = counters
-            self.advanced_ms = {key: stamp for key in counters}
+            self.advanced_ns = {key: stamp for key in counters}
         else:
-            if stamp < self.last_ms or stamp - self.last_ms > _MEDIA_STALL_SECONDS * 1000:
+            if stamp <= self.last_ns or stamp - self.last_ns > _MEDIA_STALL_SECONDS * 1_000_000_000:
                 self.failure = "sampling_gap"
-            if sample.get("projection_active") is not True:
+            if not sample.projection_active:
                 self.failure = "projection_inactive"
             for key, value in counters.items():
                 if value < self.previous[key]:
                     self.failure = "counter_reset:" + key
                 # Check age before accepting a resumed stream: a late recovery cannot heal a freeze.
-                if stamp - self.advanced_ms[key] > _MEDIA_STALL_SECONDS * 1000:
+                if stamp - self.advanced_ns[key] > _MEDIA_STALL_SECONDS * 1_000_000_000:
                     self.failure = "media_stalled:" + key
                 if value > self.previous[key]:
-                    self.advanced_ms[key] = stamp
+                    self.advanced_ns[key] = stamp
             self.previous = counters
-        self.last_ms = stamp
+        self.last_ns = stamp
 
 
 class EventParser:
@@ -215,9 +223,11 @@ class EventParser:
         self.av_pairs = 0
         self.audio_writes = 0
         self.video_presentations = 0
+        self.receiver_ready = False
         self.projection_active = False
         self.last_audio_scheduled = -1
         self.last_video_scheduled = -1
+        self.video_measurements = VideoMeasurements()
 
     def _completion(self, event: dict) -> None:
         """Join endpoint events by concurrent scheduled presentation, not log arrival."""
@@ -323,23 +333,39 @@ class EventParser:
         # a bare event line names its kind in "event" itself.
         inner = event.get("kind")
         kind = inner if isinstance(inner, str) else envelope
+        if envelope in ("video_ipc_send", "video_ipc_receive") and not self.video_measurements.frozen:
+            endpoint = IpcEndpoint.parse(event)
+            if endpoint is not None:
+                measured = self.video_measurements.ipc(
+                    "send" if envelope == "video_ipc_send" else "receive", endpoint)
+                for target in measured:
+                    self._number(measured, target, target)
+            else:
+                for target in _IPC_KEYS.values():
+                    self._number({"invalid": None}, "invalid", target)
+        if envelope == "video_decode_completed" and not self.video_measurements.frozen:
+            decoded = DecodeEndpoint.parse(event)
+            if decoded is not None:
+                measured = self.video_measurements.decode(decoded)
+                for target in measured:
+                    self._number(measured, target, target, integer=target == "decode_frames")
+            else:
+                for target in _DECODE_KEYS.values():
+                    self._number({"invalid": None}, "invalid", target)
         if envelope == "err":
             self.terminal_errors.append({"event": "err", "code": str(event.get("code", "unknown"))})
         if envelope == "video_sent" and isinstance(event.get("units"), int):
             self.video_units = event["units"]
         if envelope == "audio_chunks" and isinstance(event.get("count"), int):
             self.audio_chunks = event["count"]
+        if envelope == "ready":
+            self.receiver_ready = True
         if envelope == "active" and isinstance(event.get("startup_ms"), int):
             self.startup_ms = event["startup_ms"]
             self.projection_active = True
         if envelope in ("stopping", "disconnected", "err"):
             self.projection_active = False
-        if kind == "transport_stats":
-            for key, target in _IPC_KEYS.items():
-                self._number(event, key, target)
         if kind == "decode_stats":
-            for key, target in _DECODE_KEYS.items():
-                self._number(event, key, target, integer=target == "decode_frames")
             for drops_key in ("dropped", "drops"):
                 self._number(event, drops_key, "frame_drops", integer=True)
         if envelope in ("audio_write_completed", "video_presented"):
@@ -355,9 +381,9 @@ class EventParser:
         self._number(event, "frame_drops", "frame_drops", integer=True)
 
 
-def _terminate(proc: subprocess.Popen | None) -> None:
+def _terminate(proc: subprocess.Popen | None) -> Literal["clean", "forced_kill", "unreaped"]:
     if proc is None or proc.poll() is not None:
-        return
+        return "clean"
     proc.terminate()
     try:
         proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
@@ -366,7 +392,9 @@ def _terminate(proc: subprocess.Popen | None) -> None:
         try:
             proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            pass
+            return "unreaped"
+        return "forced_kill"
+    return "clean"
 
 
 def collect(args: argparse.Namespace) -> dict:
@@ -376,12 +404,23 @@ def collect(args: argparse.Namespace) -> dict:
     display_log = state_dir / "display.log"
 
     startup_timeout = getattr(args, "startup_timeout_seconds", _PROJECTION_STARTUP_TIMEOUT_SECONDS)
+    managed_display = bool(args.display and not args.no_display)
+    video_socket = getattr(args, "video_socket", None)
+    input_socket = getattr(args, "input_socket", None)
     receiver_cmd = [args.receiver, "--port", args.port, "--duration-ms",
                     str((args.duration_seconds + startup_timeout + 10) * 1000)]
     if args.store:
         receiver_cmd += ["--store", args.store]
+    if video_socket:
+        receiver_cmd += ["--video-socket", video_socket]
+    if input_socket:
+        receiver_cmd += ["--input-socket", input_socket]
+    if managed_display:
+        # Contract: --require-video-consumer makes the receiver emit "ready"
+        # after listeners/control init and BEFORE version negotiation.
+        receiver_cmd += ["--require-video-consumer"]
 
-    samples: list[dict] = []
+    samples: list[Sample] = []
     parser = EventParser()
     progress = ProjectionProgress()
     receiver: subprocess.Popen | None = None
@@ -394,30 +433,48 @@ def collect(args: argparse.Namespace) -> dict:
     stopped_by_us = False
     display_survived: bool | None = None
     display_connected: bool | None = None
-    start = time.monotonic()
+    origin_ns = time.monotonic_ns()
+    start = origin_ns / 1e9
+    clk = os.sysconf("SC_CLK_TCK")
+    inventory: tuple[ThermalZone, ...] = ()
+    video_evidence = VideoEvidence((), (), ())
     observed_duration = 0.0
+    deadline = start + startup_timeout
 
     try:
         rec_file = open(receiver_log, "w", encoding="utf-8")
         receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
                                     start_new_session=True)
-        if args.display and not args.no_display:
-            time.sleep(_STARTUP_GRACE_SECONDS)
-            disp_file = open(display_log, "w", encoding="utf-8")
-            display_cmd = [args.display, "--test-only-autostart"]
-            if args.video_socket:
-                display_cmd += ["--video-socket", args.video_socket]
-            if args.input_socket:
-                display_cmd += ["--input-socket", args.input_socket]
-            display = subprocess.Popen(display_cmd, stdout=disp_file, stderr=subprocess.STDOUT,
-                                       start_new_session=True)
+        if managed_display:
+            # Bounded receiver-ready observation: the managed display launches on
+            # THIS receiver's "ready" event, never on a fixed sleep. The wait is
+            # bounded by the one absolute startup deadline above, measured from
+            # the pre-launch origin and never refreshed by readiness.
+            while True:
+                parser.poll(str(receiver_log))
+                now = time.monotonic_ns() / 1e9
+                if receiver.poll() is not None:
+                    early_exit = True
+                    break
+                if parser.terminal_errors:
+                    break
+                if now >= deadline or parser.receiver_ready:
+                    break
+                time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
+            if (parser.receiver_ready and now < deadline
+                    and not early_exit and not parser.terminal_errors):
+                disp_file = open(display_log, "w", encoding="utf-8")
+                display_cmd = [args.display, "--test-only-autostart"]
+                if video_socket:
+                    display_cmd += ["--video-socket", video_socket]
+                if input_socket:
+                    display_cmd += ["--input-socket", input_socket]
+                if time.monotonic_ns() / 1e9 < deadline:
+                    display = subprocess.Popen(display_cmd, stdout=disp_file, stderr=subprocess.STDOUT,
+                                               start_new_session=True)
 
-        clk = os.sysconf("SC_CLK_TCK")
-        prev_ticks = _cpu_ticks(receiver.pid)
-        prev_time = time.monotonic()
-        deadline = start + startup_timeout
         while True:
-            now = time.monotonic()
+            now = time.monotonic_ns() / 1e9
             if display is not None:
                 display_connected = _display_connected()
                 if not display_connected:
@@ -433,40 +490,49 @@ def collect(args: argparse.Namespace) -> dict:
             if parser.terminal_errors:
                 break
             time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
-            now = time.monotonic()
-            ticks = _cpu_ticks(receiver.pid)
-            cpu = None
-            if ticks is not None and prev_ticks is not None and now > prev_time:
-                cpu = (ticks - prev_ticks) / clk / (now - prev_time) * 100.0
-            rss = _rss_mb(receiver.pid)
-            zones = _thermal_zones()
-            peak = max((z["temp_c"] for z in zones), default=None)
             parser.poll(str(receiver_log))
             if display is not None:
                 parser.poll(str(display_log))
-            sample = {
-                "t_ms": int((now - start) * 1000),
-                "receiver_rss_mb": rss,
-                "receiver_cpu_pct_one_core": cpu,
-                "thermal_peak_c": peak,
-                "thermal_zones": zones,
-                "projection_active": parser.projection_active,
-                "video_units": parser.video_units,
-                "audio_chunks": parser.audio_chunks,
-                "video_presentations": parser.video_presentations,
-                "audio_writes": parser.audio_writes,
-                "av_pairs": parser.av_pairs,
-            }
+            sample = Sample(
+                t_ns=time.monotonic_ns() - origin_ns,
+                receiver_rss_mb=_rss_mb(receiver.pid),
+                receiver_cpu_ticks=_cpu_ticks(receiver.pid),
+                thermal_zones=_thermal_zones(inventory),
+                projection_active=parser.projection_active,
+                video_units=parser.video_units, audio_chunks=parser.audio_chunks,
+                video_presentations=parser.video_presentations,
+                audio_writes=parser.audio_writes, av_pairs=parser.av_pairs,
+            )
             samples.append(sample)
-            was_started = progress.started_ms is not None
+            was_started = progress.started_ns is not None
             progress.observe(sample)
-            if not was_started and progress.started_ms is not None:
-                deadline = start + progress.started_ms / 1000 + args.duration_seconds
+            if not was_started and progress.started_ns is not None:
+                inventory = sample.thermal_zones
+                parser.video_measurements.start_window(origin_ns, progress.started_ns)
+                deadline = start + progress.started_ns / 1e9 + args.duration_seconds
+            elif was_started and progress.last_ns == sample.t_ns:
+                parser.video_measurements.advance(sample.t_ns)
             if progress.failure:
                 break
-            prev_ticks, prev_time = ticks, now
 
-        observed_duration = time.monotonic() - start
+        video_evidence = parser.video_measurements.finish(progress.last_ns)
+        events = {key: value for key, value in parser.metrics.items()
+                  if key not in {*_DECODE_KEYS.values(), *_IPC_KEYS.values()}}
+        events["helper_rss_mb"] = None
+        events["video_units"] = parser.video_units
+        events["audio_chunks"] = parser.audio_chunks
+        events["startup_ms"] = parser.startup_ms
+        invalid_telemetry = sorted(set(parser.invalid_telemetry) | set(parser.video_measurements.issues))
+        video_telemetry = {
+            "ipc_matched": parser.video_measurements.ipc_matched,
+            "ipc_consumed_bytes": parser.video_measurements.receive_bytes,
+            "ipc_matched_samples_retained": len(parser.video_measurements.ipc_samples),
+            "ipc_unmatched_or_expired": parser.video_measurements.unmatched,
+            "ipc_pending_send": len(parser.video_measurements.sends),
+            "ipc_pending_receive": len(parser.video_measurements.receives),
+            "decode_samples_retained": len(parser.video_measurements.decode_samples),
+        }
+        observed_duration = (time.monotonic_ns() - origin_ns) / 1e9
         if display is not None and display_survived is None:
             display_survived = display.poll() is None
         if receiver.poll() is None:
@@ -474,13 +540,16 @@ def collect(args: argparse.Namespace) -> dict:
                 receiver.wait(timeout=min(args.interval, _TERMINATE_GRACE_SECONDS))
             except subprocess.TimeoutExpired:
                 stopped_by_us = True
-                _terminate(receiver)
-        receiver_exit = receiver.returncode
     except FileNotFoundError as exc:
         raise SystemExit(f"error: cannot launch receiver: {exc}") from exc
     finally:
-        _terminate(display)
-        _terminate(receiver)
+        parser.video_measurements.frozen = True
+        if display is not None and display.poll() is not None:
+            display_survived = False
+        for name, proc in (("display", display), ("receiver", receiver)):
+            cleanup = _terminate(proc)
+            if cleanup != "clean":
+                parser.terminal_errors.append({"event": "err", "code": name + "_cleanup_" + cleanup})
         if rec_file is not None:
             rec_file.close()
         if disp_file is not None:
@@ -489,18 +558,12 @@ def collect(args: argparse.Namespace) -> dict:
         if display is not None:
             parser.poll(str(display_log))
 
-    if receiver_exit is None and receiver is not None:
+    if receiver is not None:
         receiver_exit = receiver.returncode
     if not stopped_by_us and receiver_exit is not None and receiver_exit != 0:
         crashes = 1
     if not stopped_by_us and not early_exit and receiver_exit is None:
         crashes = 1
-
-    events = dict(parser.metrics)
-    events["helper_rss_mb"] = None
-    events["video_units"] = parser.video_units
-    events["audio_chunks"] = parser.audio_chunks
-    events["startup_ms"] = parser.startup_ms
 
     return {
         "schema": CAPTURE_SCHEMA,
@@ -508,7 +571,7 @@ def collect(args: argparse.Namespace) -> dict:
         "duration_seconds": args.duration_seconds,
         "observed_duration_seconds": observed_duration,
         "active_projection_seconds": progress.seconds,
-        "startup_wait_seconds": progress.started_ms / 1000 if progress.started_ms is not None else None,
+        "startup_wait_seconds": progress.started_ns / 1e9 if progress.started_ns is not None else None,
         "projection_failure": progress.failure,
         "measurement_origin": "live",
         "crashes": crashes,
@@ -518,9 +581,13 @@ def collect(args: argparse.Namespace) -> dict:
         "display_survived": display_survived,
         "display_connected": display_connected,
         "terminal_errors": parser.terminal_errors,
-        "invalid_telemetry": parser.invalid_telemetry,
-        "samples": samples,
+        "invalid_telemetry": invalid_telemetry,
+        "monotonic_origin_ns": origin_ns,
+        "cpu_ticks_per_second": clk,
+        "samples": [asdict(sample) for sample in samples],
+        "video_evidence": asdict(video_evidence),
         "events": events,
+        "video_telemetry": video_telemetry,
         "target_hardware_state": _target_hardware_state(),
     }
 

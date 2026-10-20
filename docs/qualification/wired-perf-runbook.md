@@ -83,7 +83,9 @@ The requested 30-minute/2-hour window starts only after `active` and positive
 receiver video/audio counters **and** video paint/audio write completions with
 matched A/V pairs. A capture without that evidence is BLOCKED, not timed as a
 successful projection. `startup_wait_seconds` and `active_projection_seconds`
-are recorded separately from process lifetime (`duration_seconds`).
+are recorded separately from process lifetime. V2 result `duration_seconds` is
+exactly the replayed active window; capture `observed_duration_seconds` is only
+a process-lifetime diagnostic.
 
 At least every five seconds the collector samples those cumulative counters.
 Every stream, including the matched-pair counter, must advance within **10
@@ -94,8 +96,33 @@ a long-lived but stalled process cannot qualify. Connection loss also invalidate
 the window. Use a continuously playing audio/video workload for qualification;
 intentional media pauses do not count as verified active projection.
 
+### Measurement cutoff and cleanup diagnostics
+
+Immediately after `VideoMeasurements.finish(last_sample)`, before receiver grace
+wait, termination and the final log drain, all exported event measurements are
+snapshotted: scalar metrics, counters, startup timing and `helper_rss_mb: null`,
+invalid-measurement markers and all `video_telemetry`. Existing samples, sealed
+video evidence and progress are unchanged. An event first consumed after that
+cutoff cannot update measurements even if its completion timestamp is backdated
+into the prior window. No sealed interval reopens or gains late coverage.
+
+Scalar peaks (audio latency/skew and matched A/V included), drops and counters
+remain **run-cumulative observations admitted through the measurement cutoff**,
+not newly startup-exclusive active-window metrics. Do not subtract startup maxima
+or reset counter scope. RSS/CPU/thermal and video evidence retain their separate
+active-window reduction and completeness rules.
+
+The final drain still preserves terminal `err` records and lifecycle diagnostics.
+Crashes, actual exit status, early exit, unexpected display death and unsuccessful
+bounded cleanup remain genuine failure information through cleanup. Raw logs may
+contain shutdown numbers, including final cumulative media-timing/drop flushes;
+these are diagnostic only when first consumed after the cutoff, not eligible
+measurements. A pre-cutoff over-budget observation still yields FAIL. A
+shutdown-only over-budget value changes neither metrics nor verdict, whereas a
+genuine failure during cleanup can still produce FAIL.
+
 Both runs write a result document (validated against
-`tools/perf/aa-projection-perf.schema.json`) whose gated metrics are compared to
+`tools/perf/aa-projection-perf-v2.schema.json`) whose gated metrics are compared to
 the contractual budgets:
 
 - receiver RSS peak <= 250 MB; receiver CPU sustained <= 50 % of one core;
@@ -128,38 +155,96 @@ monotonic A/V clock. Video source/presentation timestamps are retained through
 `VideoOutlet` -> video IPC -> decode correlation -> widget pixel queue. The
 collector matches a video timestamp to the audio write's half-open scheduled
 presentation interval, then compares the two observed completion timestamps.
-Log arrival order does not define concurrency. No matched pair means BLOCKED.
+Log arrival order does not define concurrency, but both events must be admitted
+through the measurement cutoff; late first consumption cannot add a pair even
+with backdated completion timestamps. The maximum remains run-cumulative through
+that cutoff, not startup-exclusive. No matched pair means BLOCKED.
 
 These are **consumer-side completion events**, not photon/speaker observations:
 Qt/compositor/display scanout and downstream PipeWire/device buffering are not
 observed. This is the same stream-write endpoint vocabulary as `audio_latency_ms`.
+These observations do not qualify microphone input or physical output.
 The old audio-only completion-versus-schedule maximum is emitted honestly as
 `audio_scheduling_skew_ms` (informational); it never satisfies the 50 ms A/V gate.
 
-The receiver/display pair supplies cross-stream completion events and audio
-timing (`av_sync_ms`, `audio_latency_ms`, plus informational audio scheduling
-skew). The following **7 of the
-9 event-metric slots have no emitter** in that pair and stay `null` in every
-capture it produces:
+### Video measurements (task-32 additive emitters)
 
-1. `frame_drops`
-2. `decode_p50_ms`
-3. `decode_p95_ms`
-4. `decode_fps`
-5. `decode_frames`
-6. `ipc_throughput_mbps`
-7. `ipc_p95_added_latency_ms`
+The receiver/display pair now emits the seven formerly missing video metrics.
+This removes the **missing-emitter implementation gap**, not the need to run
+the final candidate for 30 minutes and separately for two hours. No live
+performance or software-decoder qualification is implied by host tests.
 
-The reporter fails closed on this: any absent event-metric slot is listed in the
-result's `named_gaps`, `qualification_status` stays `INCOMPLETE`, and the verdict
-is `BLOCKED` — such a capture is **never** presented as complete task-32
-qualification and never a PASS. (Decode timing remains informational per the
-task-9 caveat above and is not re-claimed here.) The emitter halves —
-decode/IPC/frame-drop stats events — are cross-lane work in `tools/wired-receiver` /
-`tools/dummy-display` (lanes 30/31) and land separately; until then phase-B
-runs are expected to end BLOCKED on these named gaps rather than PASS.
+| Metric | Exact observed source and scope |
+| --- | --- |
+| `frame_drops` | Run-cumulative `VideoOutlet` AU decisions admitted through the measurement cutoff: no consumer, producer backpressure, or producer waiting for IDR. Not inferred from fragment gaps; not decoder/compositor/phone loss. `decode_stats.frame_drops` is absent until an AU is observed; a measured zero after successful input is valid. Shutdown-only final flushes are excluded. |
+| `decode_p50_ms`, `decode_p95_ms` | Nearest-rank percentiles of matched `video_decode_completed` deltas: local `DecodeHelper::submit()` admission-entry `submitted_at` through mapped, dimension-checked, copied I420 output in `pump()`, before either completion or frame callback. Includes allocation, parser/decoder/conversion, pipeline and caller pump delay; NOT isolated hardware execution time. |
+| `decode_frames` | Cumulative number of eligible active-window unique matched decoded output completion events across helper sessions, frozen at the measurement cutoff. Unmatched/expired/reset correlations supply neither a frame measurement nor a duration. |
+| `decode_fps` | Matched output count divided by measured elapsed time from earliest contributing submit entry to latest observed I420 completion. Not negotiated FPS and not a schedule-based estimate. |
+| `ipc_throughput_mbps` | Unique successfully consumed/reassembled encoded payload bytes times 8, divided by the elapsed consumer window (earliest contributing connection attempt to latest receive completion), in decimal Mbit/s. Excludes header bytes, incomplete/rejected/suppressed AUs and decode time. Includes connection startup and inter-connection idle time. Does not require a matching producer log. |
+| `ipc_p95_added_latency_ms` | Nearest-rank p95 of matched `video_ipc_send`/`video_ipc_receive`: producer timestamp immediately before the first fragment `send()` attempt through consumer full validated reassembly completion, before stream capture/decode. Includes remaining fragmentation/copies, socket queuing, receive polling and reassembly; excludes upstream AV dispatch and decode. |
+
+All duration endpoints use same-host Linux `steady_clock` nanoseconds. The
+existing wire `timestamp_ns` remains the unchanged common A/V timestamp and is
+**only an opaque correlation key here**, never an IPC latency start or guessed
+peer-clock conversion. The 56-byte v1 header, reserved words and limits exchange
+are unchanged. Successful producer events are emitted after the last send using
+the retained first-send timestamp; partial/error/backpressure/suppressed sends
+have no successful endpoint. Consumer events occur only on complete AUs.
+
+The collector joins `(producer_pid, consumer_pid, frame, first_fragment_sequence,
+timestamp_ns)`, checks equal payload sizes, forward endpoint time and compatible
+connection epochs, and binds each producer/consumer epoch one-to-one. Receiver
+`VideoOutlet` frame IDs remain increasing across consumer reconnects; sequence
+resets alone cannot match old frames. Consumer connect-attempt time must precede
+the producer's post-handshake connection epoch and the send. A new epoch after an
+old send therefore cannot borrow its endpoint. Logs may arrive in either order.
+
+`aa_video_measurements.py` retains at most 4096 pending events per side, 4096
+deduplication/binding entries per table, and 4096 deltas per metric. Pending IPC
+events expire at ten seconds of event-time age (an operational retention bound,
+not a performance budget); capacity eviction advances a conservative time floor
+so a discarded endpoint cannot be revived by late replay. Quantiles describe
+the last 4096 matched samples in processing order, not an exact whole-soak
+distribution. Eligible active-window frame/byte counts and measured time bounds
+remain cumulative within that window and freeze at the measurement cutoff.
+The capture's `video_telemetry` section records retained sample counts, unmatched
+or expired IPC endpoints and pending counts at the cutoff, not after cleanup.
+Unpaired endpoints never contribute zero latency. Invalid endpoint records latch the existing invalid
+metric handling; missing data remains `null`, and all existing completeness and
+budget gates stay unchanged.
+
+Raw endpoint lines are flushed synchronously, so there is no periodic tail to
+lose; orderly receiver close/destruction also flushes the final cumulative drop
+counter, which is diagnostic only if first consumed after the measurement cutoff.
+The final log poll retains terminal/lifecycle diagnostics after termination,
+but all measurements are already frozen: shutdown endpoints cannot extend counts,
+bytes, rings, scalar peaks or telemetry, change invalid-measurement markers, or
+repair coverage. These diagnostics add per-frame logging overhead,
+which is part of the measured candidate. Decode telemetry remains informational:
+the withdrawn 33 ms gate is **not** restored.
 
 ## Provenance and equivalence
+
+Both runs require capture `aa-projection-perf-capture/2` and result
+`aa-projection-perf/2`, with `measurement_coverage` policy
+`active-window-coverage/1`. V1 results remain explicitly validatable against
+their unchanged schema, not automatically qualified as v2. Independently parse
+coverage after export removes the capture: labels/hashes alone prove neither
+completeness nor hardware authenticity.
+
+Require sampling/RSS/thermal at both active edges and maximum gaps <=10s;
+every CPU interval with a valid initial baseline and measured duration E-S;
+and nonempty consumption/match/decode streams with edge-inclusive gaps <=10s.
+Thermal needs the stable first-active inventory at every sample; empty inventory
+is not zero temperature. Rates require positive denominators. Rings must contain
+`min(4096, stream count)` deltas and use nearest rank in eligible processing order;
+sealed interval summaries retain whole-window counts/gaps beyond that ring.
+Missing required evidence yields BLOCKED/INCOMPLETE, but measured breaches,
+crashes and short/frozen progress retain FAIL precedence. These availability
+rules add no decode-33ms, throughput or FPS budget.
+
+No actual 30-minute or two-hour run is started by these changes or synthetic
+tests. Both live acceptance runs remain outstanding.
 
 Both result documents carry the provenance block with `package_digest: null` and
 `equivalence_status: "provisional"`. Post-package equivalence is established in

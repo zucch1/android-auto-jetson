@@ -11,7 +11,24 @@ if(NOT CMAKE_CROSSCOMPILING)
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     get_target_property(receiver_libraries aa-wired-receiver LINK_LIBRARIES)
     target_link_libraries(aa_receiver_timing_test PRIVATE ${receiver_libraries} GTest::gtest_main)
+    add_executable(aa_video_telemetry_probe tests/perf/video_telemetry_probe.cpp)
+    set_target_properties(aa_video_telemetry_probe PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_link_libraries(aa_video_telemetry_probe PRIVATE aa_video aareceiver-consumer pthread)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
+        target_compile_options(aa_video_telemetry_probe PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
+    endif()
     add_test(NAME wired_perf_receiver_timing COMMAND aa_receiver_timing_test)
+    add_test(NAME wired_perf_video_measurements COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/perf/test_video_measurements.py" "$<TARGET_FILE:aa_video_telemetry_probe>")
+    set_tests_properties(wired_perf_video_measurements PROPERTIES TIMEOUT 60)
+    add_test(NAME wired_perf_startup_repair COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/perf/test_startup_repair.py")
+    set_tests_properties(wired_perf_startup_repair PROPERTIES TIMEOUT 180)
+    add_test(NAME wired_perf_measurement_freeze COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/perf/test_measurement_freeze.py")
+    set_tests_properties(wired_perf_measurement_freeze PROPERTIES TIMEOUT 45)
     add_test(NAME wired_perf_av_sync COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" av_sync)
     add_test(NAME wired_perf_display_sources COMMAND "${Python3_EXECUTABLE}" -B

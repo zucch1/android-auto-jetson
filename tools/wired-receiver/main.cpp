@@ -47,6 +47,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -63,10 +64,12 @@
 #include <vector>
 
 #include <signal.h>
+#include "VideoOutlet.hpp"
 
 namespace {
 
 using aa::core::Milliseconds;
+using aa::wired_receiver::VideoOutlet;
 
 std::atomic<bool> g_running{true};
 std::mutex g_log_mutex;
@@ -141,95 +144,6 @@ class StorePhones final : public aa::ipc::PhoneDirectory {
 
   private:
     aa::app::WiredPhoneControl &control_;
-};
-
-bool is_idr_au(const std::vector<std::uint8_t> &payload) {
-    for (std::size_t index = 0; index + 4 < payload.size(); ++index) {
-        if (payload[index] != 0 || payload[index + 1] != 0) {
-            continue;
-        }
-        std::size_t nal = 0;
-        if (payload[index + 2] == 1) {
-            nal = index + 3;
-        } else if (payload[index + 2] == 0 && payload[index + 3] == 1) {
-            nal = index + 4;
-        } else {
-            continue;
-        }
-        if (nal < payload.size() && (payload[nal] & 0x1FU) == 5U) {
-            return true;
-        }
-    }
-    return false;
-}
-
-class VideoOutlet final : public aa::protocol::MessageSink {
-  public:
-    [[nodiscard]] aa::core::Result<void>
-    on_message(const aa::protocol::MessageView &message) override {
-        std::lock_guard lock(mutex_);
-        if (!producer_.has_value()) {
-            record_drop("no_consumer");
-            return {};
-        }
-        std::vector<std::uint8_t> payload;
-        payload.reserve(message.payload.size());
-        for (const std::byte byte : message.payload) {
-            payload.push_back(std::to_integer<std::uint8_t>(byte));
-        }
-        const auto sent = producer_->send_access_unit(aa::ipc::VideoSendRequest{
-            ++sequence_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr_au(payload),
-            payload});
-        if (!sent) {
-            return sent.error();
-        }
-        switch (sent.value()) {
-        case aa::ipc::SendStatus::dropped_backpressure:
-            record_drop("backpressure");
-            return {};
-        case aa::ipc::SendStatus::dropped_waiting_idr:
-            record_drop("waiting_idr");
-            return {};
-        case aa::ipc::SendStatus::sent:
-            break;
-        }
-        ++units_;
-        if (units_ % 30 == 1) {
-            log_line("{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
-        }
-        return {};
-    }
-
-    void install(aa::ipc::VideoProducer producer) {
-        std::lock_guard lock(mutex_);
-        if (producer_.has_value()) {
-            producer_->close();
-        }
-        producer_.emplace(std::move(producer));
-    }
-
-    void close() noexcept {
-        std::lock_guard lock(mutex_);
-        if (producer_.has_value()) {
-            producer_->close();
-            producer_.reset();
-        }
-    }
-
-  private:
-    void record_drop(const char *reason) {
-        ++dropped_;
-        if (dropped_ % 30 == 1) {
-            log_line(std::string{"{\"event\":\"video_dropped\",\"reason\":\""} + reason +
-                     "\",\"count\":" + std::to_string(dropped_) + "}");
-        }
-    }
-
-    std::mutex mutex_{};
-    std::optional<aa::ipc::VideoProducer> producer_{};
-    std::uint64_t sequence_{0};
-    std::uint64_t units_{0};
-    std::uint64_t dropped_{0};
 };
 
 class RouterSink final : public aa::protocol::MessageSink {
@@ -378,8 +292,11 @@ const char *const kUsage =
     "usage: aa-wired-receiver --port <usb-port-context> [--store PATH]\n"
     "                         [--video-socket PATH] [--input-socket PATH]\n"
     "                         [--duration-ms N] [--no-bus]\n"
+    "                         [--require-video-consumer]\n"
     "  runs the wired session over USB/AOA with TrustStore admission;\n"
     "  the approved-phones store must already contain the phone (fail closed).\n"
+    "  --require-video-consumer defers upstream negotiation until a video\n"
+    "  consumer has been accepted and installed (bounded, fail closed).\n"
     "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked.\n";
 
 } // namespace
@@ -391,6 +308,7 @@ int main(int argc, char **argv) {
     std::string input_socket = aa::ipc::production_input_socket_path().value;
     std::int64_t duration_ms = 0;
     bool no_bus = false;
+    bool require_video_consumer = false;
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--port") == 0 && index + 1 < argc) {
             port = argv[++index];
@@ -404,6 +322,8 @@ int main(int argc, char **argv) {
             duration_ms = std::strtoll(argv[++index], nullptr, 10);
         } else if (std::strcmp(argv[index], "--no-bus") == 0) {
             no_bus = true;
+        } else if (std::strcmp(argv[index], "--require-video-consumer") == 0) {
+            require_video_consumer = true;
         } else {
             std::fputs(kUsage, stderr);
             return 2;
@@ -415,6 +335,13 @@ int main(int argc, char **argv) {
     }
 
     const auto started = std::chrono::steady_clock::now();
+    const auto deadline = duration_ms > 0 ? started + std::chrono::milliseconds{duration_ms}
+                                          : std::chrono::steady_clock::time_point::max();
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+    if (deadline_observation) {
+        deadline_observation->cutoff = started + std::chrono::milliseconds{duration_ms};
+    }
+#endif
     ::signal(SIGINT, on_signal);
     ::signal(SIGTERM, on_signal);
 
@@ -482,7 +409,7 @@ int main(int argc, char **argv) {
         log_line("{\"event\":\"err\",\"detail\":\"configure\"}");
         return 1;
     }
-    VideoOutlet video_outlet;
+    VideoOutlet video_outlet{log_line};
     aa::channels::InputSink input_sink;
     aa::channels::SensorSink sensor_sink{input, [&session](std::vector<std::byte> payload) {
         return session.send_channel_payload(aa::protocol::ChannelRole::sensors, std::move(payload));
@@ -549,9 +476,11 @@ int main(int argc, char **argv) {
         log_line("{\"event\":\"err\",\"detail\":\"lifecycle\"}");
         return 1;
     }
-    if (!session.send_version_request(1, 6).has_value()) {
-        log_line("{\"event\":\"err\",\"detail\":\"version_request\"}");
-        return 1;
+    if (!require_video_consumer) {
+        if (!session.send_version_request(1, 6).has_value()) {
+            log_line("{\"event\":\"err\",\"detail\":\"version_request\"}");
+            return 1;
+        }
     }
     log_line("{\"event\":\"ready\",\"state\":\"negotiating\"}");
 
@@ -563,6 +492,9 @@ int main(int argc, char **argv) {
 #endif
     std::atomic<std::int64_t> active_ms{-1};
     std::atomic<bool> session_failed{false};
+    std::atomic<bool> admitted{false};
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
     bool runtime_failed = false;
 
     auto service_control = [&] {
@@ -642,6 +574,57 @@ int main(int argc, char **argv) {
         control.bind_owner();
         control.bind_phone(link->phone);
         link->transport->set_io_checkpoint([&] { control.checkpoint(); });
+        if (require_video_consumer) {
+            while (!admitted.load() && g_running.load()) {
+                {
+                    std::lock_guard lock(session_mutex);
+                    if (service_control()) {
+                        break;
+                    }
+                    session.tick();
+                    if (session.failure()) {
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+                        if (required_failure_observation) {
+                            required_failure_observation->negotiation_timeout =
+                                session.failure()->code() == aa::ErrorCode::timeout;
+                        }
+#endif
+                        session_failed.store(true);
+                        g_running.store(false);
+                        break;
+                    }
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        g_running.store(false);
+                        break;
+                    }
+                }
+                std::unique_lock gate_lock(gate_mutex);
+                gate_cv.wait_until(gate_lock, std::min(deadline, std::chrono::steady_clock::now() +
+                                                     std::chrono::milliseconds{50}), [&] {
+                    return admitted.load() || !g_running.load();
+                });
+            }
+            if (admitted.load() && g_running.load()) {
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+                if (deadline_observation) {
+                    deadline_observation->cross(DeadlineObservation::Edge::owner);
+                }
+#endif
+                const std::lock_guard lock(session_mutex);
+                if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
+                    g_running.store(false);
+                } else if (!session.send_version_request(1, 6).has_value()) {
+                    log_line("{\"event\":\"err\",\"detail\":\"version_request\"}");
+                    session_failed.store(true);
+                    g_running.store(false);
+                }
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+                if (deadline_observation) {
+                    deadline_observation->finish_owner();
+                }
+#endif
+            }
+        }
         while (g_running.load()) {
             {
                 std::lock_guard lock(session_mutex);
@@ -752,22 +735,57 @@ int main(int argc, char **argv) {
         }
     });
 
-    const auto deadline = duration_ms > 0 ? started + std::chrono::milliseconds{duration_ms}
-                                          : std::chrono::steady_clock::time_point::max();
+    const auto runtime_slice = [&] {
+        return Milliseconds{std::max<std::int64_t>(0, std::min<std::int64_t>(200,
+            std::chrono::ceil<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count()))};
+    };
     while (g_running.load() && std::chrono::steady_clock::now() < deadline) {
         if (bus.has_value()) {
-            auto step = bus.value().cycle(Milliseconds{200});
+            auto step = bus.value().cycle(runtime_slice());
             if (!step.has_value()) {
                 runtime_failed = true;
                 break;
             }
         } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds{200});
+            std::this_thread::sleep_for(std::chrono::milliseconds{runtime_slice().count});
         }
-        auto producer = video.value().accept_consumer(Milliseconds{0});
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+        if (deadline_observation) {
+            deadline_observation->cross(DeadlineObservation::Edge::dispatch);
+        }
+#endif
+        if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        const auto accept_timeout = (require_video_consumer && !admitted.load())
+                                        ? runtime_slice()
+                                        : Milliseconds{0};
+        auto producer = video.value().accept_consumer(accept_timeout);
         if (producer.has_value()) {
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+            if (deadline_observation) {
+                deadline_observation->cross(DeadlineObservation::Edge::accepted);
+            }
+#endif
+            if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
             log_line("{\"event\":\"video_accepted\"}");
             video_outlet.install(std::move(producer.value()));
+            {
+                std::lock_guard gate_lock(gate_mutex);
+                if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+                admitted.store(true);
+            }
+            gate_cv.notify_all();
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+            if (deadline_observation) {
+                deadline_observation->hold_dispatcher();
+            }
+#endif
         }
     }
 

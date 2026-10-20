@@ -118,6 +118,44 @@ struct ShutdownObservation {
 };
 ShutdownObservation *shutdown_observation = nullptr;
 
+// Actual-main scheduling seam, absent from the shipped executable. Waiting to
+// the real cutoff makes the ordering deterministic, not a scheduler sleep race.
+struct DeadlineObservation {
+    enum class Edge { dispatch, accepted, owner };
+    Edge edge;
+    std::chrono::steady_clock::time_point cutoff{};
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool crossed = false;
+    bool owner_done = false;
+    bool gate_failed = false;
+
+    explicit DeadlineObservation(Edge value) : edge(value) {}
+    void cross(Edge point) {
+        if (edge == point) {
+            std::this_thread::sleep_until(cutoff);
+            const std::lock_guard lock(mutex);
+            crossed = std::chrono::steady_clock::now() >= cutoff;
+        }
+    }
+    void finish_owner() {
+        const std::lock_guard lock(mutex);
+        owner_done = true;
+        cv.notify_all();
+    }
+    void hold_dispatcher() {
+        if (edge == Edge::owner) {
+            std::unique_lock lock(mutex);
+            gate_failed = !cv.wait_for(lock, std::chrono::seconds{3}, [&] { return owner_done; });
+        }
+    }
+};
+DeadlineObservation *deadline_observation = nullptr;
+struct RequiredFailureObservation {
+    bool negotiation_timeout = false;
+};
+RequiredFailureObservation *required_failure_observation = nullptr;
+
 class ObservedSessionMutex {
   public:
     void lock() {
@@ -161,6 +199,8 @@ class ObservedSessionMutex {
 #include "../session/Fakes.hpp"
 #include "../video_socket/pair.hpp"
 #include "../trust/syscall_faults.hpp"
+#include "../transport/UsbAoaFakes.hpp"
+#include "../../src/transport/usb_adapter/LibusbWorld.hpp"
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
 #include <aap_protobuf/service/control/message/ServiceDiscoveryResponse.pb.h>
 #include <gtest/gtest.h>
@@ -169,13 +209,16 @@ class ObservedSessionMutex {
 #include <fstream>
 #include <iterator>
 #include <pthread.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <sstream>
 #include <unistd.h>
 
 namespace {
 namespace media_wire = aap_protobuf::service::media::sink::message;
 
 TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
-    VideoOutlet outlet;
+    VideoOutlet outlet{log_line};
     const std::vector<std::byte> payload{std::byte{0}, std::byte{0}, std::byte{1},
                                          std::byte{0x65}, std::byte{0x10}};
     for (int index = 0; index < 31; ++index) {
@@ -185,6 +228,8 @@ TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
         ASSERT_TRUE(result);
         if (index % 30 == 0) {
             EXPECT_EQ(log, "{\"event\":\"video_dropped\",\"reason\":\"no_consumer\",\"count\":" +
+                               std::to_string(index + 1) + "}\n" +
+                               "{\"event\":\"decode_stats\",\"frame_drops\":" +
                                std::to_string(index + 1) + "}\n");
         } else {
             EXPECT_TRUE(log.empty());
@@ -195,7 +240,7 @@ TEST(WiredReceiver, VideoOutletNoConsumerDropsAreNotSent) {
 TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
-    VideoOutlet outlet;
+    VideoOutlet outlet{log_line};
     outlet.install(std::move(pair.value().producer));
     const std::vector<std::byte> non_idr{std::byte{0}, std::byte{0}, std::byte{1},
                                          std::byte{0x41}, std::byte{0x10}};
@@ -208,6 +253,8 @@ TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
         ASSERT_TRUE(result);
         if (index % 30 == 0) {
             EXPECT_EQ(log, "{\"event\":\"video_dropped\",\"reason\":\"waiting_idr\",\"count\":" +
+                               std::to_string(index + 1) + "}\n" +
+                               "{\"event\":\"decode_stats\",\"frame_drops\":" +
                                std::to_string(index + 1) + "}\n");
         } else {
             EXPECT_TRUE(log.empty());
@@ -223,11 +270,16 @@ TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
         const auto result = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {123}}, payload});
         const auto log = testing::internal::GetCapturedStdout();
         ASSERT_TRUE(result);
+        ASSERT_TRUE(log.starts_with("{\"event\":\"video_ipc_send\","));
+        const auto endpoint_end = log.find('\n');
+        ASSERT_NE(endpoint_end, std::string::npos);
+        const auto summary = log.substr(endpoint_end + 1);
         if (delivered % 30 == 1) {
-            EXPECT_EQ(log, "{\"event\":\"video_sent\",\"units\":" +
-                               std::to_string(delivered) + "}\n");
+            EXPECT_EQ(summary, "{\"event\":\"video_sent\",\"units\":" +
+                               std::to_string(delivered) + "}\n" +
+                               "{\"event\":\"decode_stats\",\"frame_drops\":31}\n");
         } else {
-            EXPECT_TRUE(log.empty());
+            EXPECT_TRUE(summary.empty());
         }
         const auto received = pair.value().consumer.receive(Milliseconds{500});
         ASSERT_TRUE(received);
@@ -244,7 +296,7 @@ TEST(WiredReceiver, VideoOutletWaitingIdrDropsDoNotCountAsSent) {
 TEST(WiredReceiver, VideoOutletSendErrorsDoNotCountAsSent) {
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
-    VideoOutlet outlet;
+    VideoOutlet outlet{log_line};
     outlet.install(std::move(pair.value().producer));
     testing::internal::CaptureStdout();
     const auto invalid = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, {}});
@@ -259,7 +311,11 @@ TEST(WiredReceiver, VideoOutletSendErrorsDoNotCountAsSent) {
     const auto sent = outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, idr});
     const auto sent_log = testing::internal::GetCapturedStdout();
     ASSERT_TRUE(sent);
-    EXPECT_EQ(sent_log, "{\"event\":\"video_sent\",\"units\":1}\n");
+    ASSERT_TRUE(sent_log.starts_with("{\"event\":\"video_ipc_send\","));
+    const auto endpoint_end = sent_log.find('\n');
+    ASSERT_NE(endpoint_end, std::string::npos);
+    EXPECT_EQ(sent_log.substr(endpoint_end + 1), "{\"event\":\"video_sent\",\"units\":1}\n"
+                                               "{\"event\":\"decode_stats\",\"frame_drops\":0}\n");
     const auto received = pair.value().consumer.receive(Milliseconds{500});
     ASSERT_TRUE(received);
     ASSERT_EQ(received.value(), aa::ipc::ReceiveStatus::complete);
@@ -299,6 +355,7 @@ TEST(WiredReceiver, ProductionAudioProfilesMatchWireAndRouterInputs) {
     ASSERT_EQ(wire.channels_size(), 7);
     const auto router = pcm_router_config();
     EXPECT_EQ(router.output_format, (aa::audio::AudioFormat{48000, 2, 16}));
+    EXPECT_TRUE(router.on_write_completed);
     for (const auto &expected : receiver_audio_expectations) {
         if (expected.channel == aa::protocol::ChannelRole::speech_audio) { continue; }
         SCOPED_TRACE(expected.service);
@@ -375,7 +432,7 @@ TEST(WiredReceiver, ProductionAvRegistrationNegotiatesEncryptedMediaWithoutSetup
     RouterSink audio{router.value()};
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
-    VideoOutlet video;
+    VideoOutlet video{log_line};
     video.install(std::move(pair.value().producer));
     aa::app::WiredSession session{{trust, clock, diagnostics}};
     ASSERT_TRUE(session.configure(service_descriptors(aa::input::CapabilityDescriptor::bench_defaults())));
@@ -450,7 +507,7 @@ TEST(WiredReceiver, ProductionAvRegistrationNegotiatesEncryptedMediaWithoutSetup
     EXPECT_EQ(session.pings_answered(), 1U);
 }
 
-TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereo) {
+TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereoAndKeepCompletionCallback) {
     for (const auto &expected : receiver_audio_expectations) {
         SCOPED_TRACE(expected.service);
         auto output = std::make_unique<ReceiverProfileSink>();
@@ -462,7 +519,9 @@ TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereo) {
         const std::vector<std::byte> pcm(frames * expected.input.channels * sizeof(std::int16_t),
                                          std::byte{0x10});
         RouterSink sink{router.value()};
+        testing::internal::CaptureStdout();
         const auto result = sink.on_message({{expected.channel, 1, {}}, pcm});
+        const auto log = testing::internal::GetCapturedStdout();
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(observed->format, (aa::audio::AudioFormat{48000, 2, 16}));
         // Resampling may retain a filter tail; require the 3x rate expansion,
@@ -481,11 +540,14 @@ TEST(WiredReceiver, ProductionAudioInputsRouteTo48kStereo) {
             EXPECT_EQ(observed->pcm[offset], observed->pcm[offset + 2U]);
             EXPECT_EQ(observed->pcm[offset + 1U], observed->pcm[offset + 3U]);
         }
+        EXPECT_NE(log.find("\"event\":\"audio_write_completed\""), std::string::npos);
+        EXPECT_NE(log.find("\"scheduled_end_ns\":"), std::string::npos);
     }
 }
 
 std::atomic<int> runtime_connects{0};
 std::atomic<int> runtime_ciphers{0};
+std::atomic<int> runtime_sends{0};
 bool runtime_recovers = false;
 bool runtime_quiet = false;
 std::atomic<bool> runtime_waiting{false};
@@ -493,6 +555,9 @@ std::atomic<bool> runtime_closed{false};
 std::mutex runtime_owner_mutex;
 std::thread::id runtime_io_owner;
 aa::trust::PhoneIdentity runtime_phone;
+bool runtime_real_admission = false;
+bool runtime_fail_before_admission = false;
+std::shared_ptr<aa::test::usb_aoa::LinkState> admission_state;
 
 class RuntimeTransport final : public aa::transport::Transport {
   public:
@@ -512,6 +577,7 @@ class RuntimeTransport final : public aa::transport::Transport {
         return {};
     }
     aa::core::Result<void> send(std::span<const std::byte> bytes) override {
+        ++runtime_sends;
         if (shutdown_observation) {
             shutdown_observation->io();
             // Pings use plain framing. Match the complete valid response, not
@@ -588,23 +654,129 @@ class RuntimeTransport final : public aa::transport::Transport {
     std::function<void()> checkpoint_;
     std::vector<std::vector<std::byte>> frames_;
 };
+
+// Phone-side double for the required-video-consumer admission regressions: a
+// test-pushed frame queue the owner may only consume once the admission gate
+// has opened, plus an exact record of every upstream frame the receiver sent.
+// An exhausted queue blocks (like the quiet runtime link), never reports
+// transport_closed, so a gated run cannot enter the reconnect loop and mask
+// an ordering failure.
+struct AdmissionState final {
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::vector<std::vector<std::byte>> inbound;
+    std::vector<std::vector<std::byte>> sent;
+    std::size_t served = 0;
+    bool created = false;
+    bool closed = false;
+};
+
+class AdmissionTransport final : public aa::transport::Transport {
+  public:
+    explicit AdmissionTransport(std::shared_ptr<AdmissionState> state) : state_(std::move(state)) {}
+    aa::transport::Kind kind() const noexcept override { return aa::transport::Kind::usb_aoa; }
+    aa::core::Result<void> open(aa::core::CancellationToken token) override {
+        token_ = token;
+        return {};
+    }
+    aa::core::Result<void> send(std::span<const std::byte> bytes) override {
+        std::lock_guard lock(state_->mutex);
+        state_->sent.emplace_back(bytes.begin(), bytes.end());
+        return {};
+    }
+    void set_io_checkpoint(std::function<void()> checkpoint) override {
+        checkpoint_ = std::move(checkpoint);
+    }
+    aa::core::Result<std::vector<std::byte>> receive() override {
+        std::unique_lock lock(state_->mutex);
+        for (;;) {
+            if (state_->closed) {
+                return aa::Error{aa::ErrorCode::transport_closed};
+            }
+            if (state_->served < state_->inbound.size()) {
+                auto frame = state_->inbound[state_->served];
+                ++state_->served;
+                lock.unlock();
+                state_->cv.notify_all();
+                return frame;
+            }
+            if (checkpoint_) {
+                lock.unlock();
+                checkpoint_();
+                lock.lock();
+            }
+            state_->cv.wait_for(lock, token_, std::chrono::milliseconds{20}, [] { return false; });
+            if (token_.stop_requested()) {
+                return aa::Error{aa::ErrorCode::cancelled};
+            }
+        }
+    }
+    void close() noexcept override {
+        std::lock_guard lock(state_->mutex);
+        state_->closed = true;
+        state_->cv.notify_all();
+    }
+  private:
+    std::shared_ptr<AdmissionState> state_;
+    aa::core::CancellationToken token_;
+    std::function<void()> checkpoint_;
+};
+
+std::shared_ptr<AdmissionState> admission_link_state;
 }
 
 // Link-time seams keep the real CLI/thread loop under test without USB or audio hardware.
+aa::core::Result<aa::app::WiredLink>
+real_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
+               const aa::trust::TrustStore &, const aa::core::Deadline &,
+               aa::trust::WiredIdentity *)
+    asm("__real__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE");
 aa::core::Result<aa::app::WiredLink>
 runtime_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
                   const aa::trust::TrustStore &, const aa::core::Deadline &,
                   aa::trust::WiredIdentity *)
     asm("__wrap__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE");
 aa::core::Result<aa::app::WiredLink>
-runtime_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
-                  const aa::trust::TrustStore &, const aa::core::Deadline &,
-                  aa::trust::WiredIdentity *) {
+runtime_open_link(const aa::transport::UsbDeviceSelector &selector,
+                  const aa::transport::AoaAccessoryInfo &info,
+                  const aa::trust::TrustStore &store, const aa::core::Deadline &deadline,
+                  aa::trust::WiredIdentity *attempted_identity) {
     const int attempt = ++runtime_connects;
+    if (runtime_real_admission) {
+        return real_open_link(selector, info, store, deadline, attempted_identity);
+    }
+    if (admission_link_state) {
+        if (attempt != 1) {
+            return aa::Error{aa::ErrorCode::transport_unavailable};
+        }
+        auto transport = std::make_unique<AdmissionTransport>(admission_link_state);
+        {
+            const std::lock_guard lock(admission_link_state->mutex);
+            admission_link_state->created = true;
+        }
+        admission_link_state->cv.notify_all();
+        return aa::app::WiredLink{std::move(transport), runtime_phone};
+    }
     if (attempt == 1 || (runtime_recovers && attempt >= 4)) {
         return aa::app::WiredLink{std::make_unique<RuntimeTransport>(attempt == 1), runtime_phone};
     }
     return aa::Error{aa::ErrorCode::transport_unavailable};
+}
+
+aa::core::Result<std::unique_ptr<aa::transport::usb_adapter::AoaLinkFactory>>
+real_link_factory() asm("__real__ZN2aa9transport11usb_adapter24make_libusb_link_factoryEv");
+aa::core::Result<std::unique_ptr<aa::transport::usb_adapter::AoaLinkFactory>>
+runtime_link_factory() asm("__wrap__ZN2aa9transport11usb_adapter24make_libusb_link_factoryEv");
+aa::core::Result<std::unique_ptr<aa::transport::usb_adapter::AoaLinkFactory>>
+runtime_link_factory() {
+    if (!runtime_real_admission) {
+        return real_link_factory();
+    }
+    auto factory = std::make_unique<aa::test::usb_aoa::FakeLinkFactory>(admission_state);
+    factory->phone.serial = "SECOND-PRIVATE-USB";
+    factory->accessory.serial = "SECOND-PRIVATE-AOA";
+    factory->fail_switch = runtime_fail_before_admission;
+    return std::unique_ptr<aa::transport::usb_adapter::AoaLinkFactory>{std::move(factory)};
 }
 
 std::unique_ptr<aa::transport::HandshakingCipher>
@@ -626,6 +798,179 @@ runtime_sink(const aa::audio::detail::SinkOpenRequest &) {
 }
 
 namespace {
+struct AdmissionResult {
+    int status{};
+    bool watchdog_fired = false;
+    int connects = -1;
+    int ciphers = -1;
+    int switches = -1;
+    int claims = -1;
+    std::string expected_label;
+    std::string output;
+};
+
+AdmissionResult run_admission_child(bool pre_admission_failure) {
+    if (const char *child_root = std::getenv("AA_TEST_ADMISSION_ROOT")) {
+        const std::filesystem::path root{child_root};
+        runtime_real_admission = true;
+        runtime_fail_before_admission = std::string{std::getenv("AA_TEST_ADMISSION_FAILURE")} == "1";
+        admission_state = std::make_shared<aa::test::usb_aoa::LinkState>();
+        runtime_connects.store(0);
+        runtime_ciphers.store(0);
+        shutdown_observation = nullptr;
+        g_running.store(true);
+        const aa::trust::WiredIdentity second{
+            "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
+            "SECOND-PRIVATE-AOA", "1-2.2"};
+        const auto label = aa::trust::redacted_label(aa::trust::TransportIdentity{second});
+        std::vector<std::string> args{"receiver", "--port", "1-2.2", "--no-bus", "--store",
+            (root / "approved.json").string(), "--video-socket", (root / "video").string(),
+            "--input-socket", (root / "input").string(), "--duration-ms", "100"};
+        std::vector<char *> argv;
+        argv.reserve(args.size());
+        for (auto &arg : args) {
+            argv.push_back(arg.data());
+        }
+        const int code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+        {
+            std::ofstream metrics(root / "metrics");
+            metrics << runtime_connects.load() << ' ' << runtime_ciphers.load() << ' '
+                    << admission_state->switches() << ' ' << admission_state->claims() << ' ' << label;
+        }
+        std::fflush(stdout);
+        ::_exit(code);
+    }
+    AdmissionResult result;
+    char directory[] = "/tmp/wired-admission-XXXXXX";
+    const char *created = ::mkdtemp(directory);
+    EXPECT_NE(created, nullptr);
+    if (!created) {
+        result.status = -1;
+        return result;
+    }
+    const std::filesystem::path root{created};
+    const auto store_path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore initial{store_path};
+    EXPECT_TRUE(initial.load().has_value());
+    const aa::trust::WiredIdentity first{
+        "04e8", "6860", "FIRST-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
+        "FIRST-PRIVATE-AOA", "1-2.1"};
+    EXPECT_TRUE(initial.approve(aa::trust::TransportIdentity{first}).has_value());
+    std::string root_env = "AA_TEST_ADMISSION_ROOT=" + root.string();
+    std::string failure_env = pre_admission_failure ? "AA_TEST_ADMISSION_FAILURE=1"
+                                                   : "AA_TEST_ADMISSION_FAILURE=0";
+    std::vector<char *> environment;
+    for (char **entry = ::environ; *entry != nullptr; ++entry) {
+        environment.push_back(*entry);
+    }
+    environment.push_back(root_env.data());
+    environment.push_back(failure_env.data());
+    environment.push_back(nullptr);
+    std::string executable = "/proc/self/exe";
+    std::string filter = pre_admission_failure
+        ? "--gtest_filter=WiredReceiver.PreAdmissionFailureEmitsNoAttemptAttribution"
+        : "--gtest_filter=WiredReceiver.RejectedAttemptEmitsCapturedPseudonymAndPort";
+    std::string repeat = "--gtest_repeat=1";
+    char *child_argv[]{executable.data(), filter.data(), repeat.data(), nullptr};
+    const int capture_fd = ::open((root / "stdout").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    EXPECT_GE(capture_fd, 0);
+    std::fflush(nullptr);
+    const pid_t child = ::fork();
+    EXPECT_GE(child, 0);
+    if (child == 0) {
+        if (capture_fd < 0 || ::dup2(capture_fd, STDOUT_FILENO) < 0) {
+            ::_exit(90);
+        }
+        ::close(capture_fd);
+        ::execve(executable.c_str(), child_argv, environment.data());
+        ::_exit(91);
+    }
+    if (capture_fd >= 0) {
+        ::close(capture_fd);
+    }
+    if (child > 0) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        for (;;) {
+            const auto waited = ::waitpid(child, &result.status, WNOHANG);
+            if (waited == child) {
+                break;
+            }
+            if (waited < 0 || std::chrono::steady_clock::now() >= deadline) {
+                result.watchdog_fired = true;
+                (void)::kill(child, SIGKILL);
+                (void)::waitpid(child, &result.status, 0);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        std::ifstream capture(root / "stdout");
+        result.output.assign(std::istreambuf_iterator<char>{capture}, {});
+        std::ifstream metrics(root / "metrics");
+        metrics >> result.connects >> result.ciphers >> result.switches >> result.claims
+                >> result.expected_label;
+    }
+    std::filesystem::remove_all(root);
+    return result;
+}
+
+void expect_admission_exit(const AdmissionResult &result, int claims) {
+    ASSERT_FALSE(result.watchdog_fired) << "ADMISSION_WATCHDOG_FIRED";
+    ASSERT_TRUE(WIFEXITED(result.status)) << result.status;
+    EXPECT_EQ(WEXITSTATUS(result.status), 3) << result.output;
+    EXPECT_EQ(result.connects, 1);
+    EXPECT_EQ(result.switches, 1);
+    EXPECT_EQ(result.claims, claims);
+    EXPECT_EQ(result.ciphers, 0) << "rejected attempt reached TLS construction";
+    EXPECT_EQ(result.output.find("\"event\":\"ready\""), std::string::npos);
+    EXPECT_EQ(result.output.find("\"event\":\"active\""), std::string::npos);
+    EXPECT_EQ(result.output.find("\"to_state\":\"active\""), std::string::npos);
+}
+
+std::vector<std::string> link_errors(const std::string &output) {
+    std::vector<std::string> errors;
+    std::istringstream lines(output);
+    for (std::string line; std::getline(lines, line);) {
+        if (line.find("\"detail\":\"link\"") != std::string::npos) {
+            errors.push_back(std::move(line));
+        }
+    }
+    return errors;
+}
+
+TEST(WiredReceiver, RejectedAttemptEmitsCapturedPseudonymAndPort) {
+    const aa::trust::WiredIdentity second{
+        "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
+        "SECOND-PRIVATE-AOA", "1-2.2"};
+    const auto result = run_admission_child(false);
+    const auto &label = result.expected_label;
+    ASSERT_FALSE(label.empty());
+    expect_admission_exit(result, 1);
+    const auto errors = link_errors(result.output);
+    ASSERT_EQ(errors.size(), 1U) << result.output;
+    EXPECT_NE(errors[0].find("\"phone_id\":\"" + label + "\""), std::string::npos)
+        << "CAPTURED_PSEUDONYM_MISSING: " << errors[0];
+    EXPECT_NE(errors[0].find("\"port\":\"1-2.2\""), std::string::npos)
+        << "SECOND_PORT_MISSING: " << errors[0];
+    EXPECT_EQ(errors[0], "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"transport_unauthorized_peer\","
+                         "\"phone_id\":\"" + label + "\",\"port\":\"1-2.2\"}");
+    const auto key = aa::trust::validated_key(aa::trust::TransportIdentity{second});
+    ASSERT_TRUE(key.has_value());
+    for (const auto &raw : {second.usb_serial, second.aoa_serial, second.aoa_manufacturer,
+                            second.aoa_model, key.value(), std::string{"FIRST-PRIVATE"}}) {
+        EXPECT_EQ(result.output.find(raw), std::string::npos) << "raw identity leaked: " << raw;
+    }
+}
+
+TEST(WiredReceiver, PreAdmissionFailureEmitsNoAttemptAttribution) {
+    const auto result = run_admission_child(true);
+    expect_admission_exit(result, 0);
+    const auto errors = link_errors(result.output);
+    ASSERT_EQ(errors.size(), 1U) << result.output;
+    EXPECT_EQ(errors[0], "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"transport_unavailable\"}");
+    EXPECT_EQ(errors[0].find("phone_id"), std::string::npos);
+    EXPECT_EQ(errors[0].find("\"port\""), std::string::npos);
+}
+
 class RejectAudio final : public aa::audio::detail::ObservedAudioSink {
   public:
     aa::core::Result<void> write(const aa::audio::MixedChunk &) override {
@@ -995,5 +1340,683 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     EXPECT_EQ(persisted.lookup(runtime_phone), aa::trust::Decision::unknown);
     std::filesystem::remove_all(root);
     runtime_quiet = false;
+}
+
+struct RequiredRun {
+    int code{0};
+    std::string output;
+    std::chrono::steady_clock::duration elapsed{};
+    int sends{0};
+    int connects{0};
+    bool watchdog_fired{false};
+    bool negotiation_timeout{false};
+};
+
+RequiredRun run_required_mode(bool require_flag, bool attach_consumer,
+                              std::int64_t duration_ms = 2500) {
+    RequiredFailureObservation failure;
+    required_failure_observation = &failure;
+    char directory[] = "/tmp/wired-required-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore store{path};
+    EXPECT_TRUE(store.load().has_value());
+    const aa::trust::WiredIdentity identity{
+        "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+    EXPECT_TRUE(store.approve(aa::trust::TransportIdentity{identity}).has_value());
+    runtime_phone = aa::app::wired_phone_identity(identity).value();
+    runtime_recovers = false;
+    runtime_quiet = true;
+    runtime_connects.store(0);
+    runtime_ciphers.store(0);
+    runtime_sends.store(0);
+    g_running.store(true);
+    const auto video_socket = root / "video";
+    std::vector<std::string> args{"receiver", "--port", "1-2.1", "--no-bus", "--store",
+                                  path.string(), "--video-socket", video_socket.string(),
+                                  "--input-socket", (root / "input").string(), "--duration-ms",
+                                  std::to_string(duration_ms)};
+    if (require_flag) {
+        args.push_back("--require-video-consumer");
+    }
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (auto &arg : args) {
+        argv.push_back(arg.data());
+    }
+    testing::internal::CaptureStdout();
+    const auto began = std::chrono::steady_clock::now();
+    int code = -1;
+    std::thread receiver([&] {
+        code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+    });
+    std::atomic<bool> watchdog_fired{false};
+    std::jthread watchdog([&](const std::stop_token &stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, stop, std::chrono::seconds{20}, [] { return false; });
+        if (!stop.stop_requested()) {
+            watchdog_fired.store(true);
+            g_running.store(false);
+        }
+    });
+    std::optional<aa::ipc::VideoConsumer> consumer;
+    if (attach_consumer) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+        while (!std::filesystem::exists(video_socket) &&
+               std::chrono::steady_clock::now() < until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        aa::core::Result<aa::ipc::VideoConsumer> client{aa::ipc::VideoConsumer{}};
+        std::thread connector([&] {
+            client = aa::ipc::connect_video_consumer(
+                aa::ipc::VideoSocketPath{video_socket.string()},
+                aa::ipc::VideoClientOptions{{}, aa::ipc::current_uid(),
+                                            aa::core::Milliseconds{3000}});
+        });
+        connector.join();
+        if (client.has_value()) {
+            consumer.emplace(std::move(client.value()));
+        }
+    }
+    receiver.join();
+    const auto elapsed = std::chrono::steady_clock::now() - began;
+    watchdog.request_stop();
+    watchdog.join();
+    auto output = testing::internal::GetCapturedStdout();
+    if (consumer.has_value()) {
+        consumer.value().close();
+    }
+    std::filesystem::remove_all(root);
+    runtime_quiet = false;
+    required_failure_observation = nullptr;
+    return {code, std::move(output), elapsed, runtime_sends.load(), runtime_connects.load(),
+            watchdog_fired.load(), failure.negotiation_timeout};
+}
+
+TEST(WiredReceiver, RequiredVideoConsumerDefersUpstreamUntilProducerInstalled) {
+    const auto withheld = run_required_mode(true, false);
+    EXPECT_EQ(withheld.sends, 0)
+        << "upstream protocol progressed before a video producer was installed: "
+        << withheld.output;
+    EXPECT_EQ(withheld.output.find("\"event\":\"active\""), std::string::npos) << withheld.output;
+
+    const auto attached = run_required_mode(true, true);
+    EXPECT_GT(attached.sends, 0)
+        << "upstream did not proceed after a video producer was installed: " << attached.output;
+}
+
+TEST(WiredReceiver, RequiredVideoConsumerDurationStopIsCleanWithoutNegotiationFailure) {
+    const auto withheld = run_required_mode(true, false, 2500);
+    EXPECT_FALSE(withheld.watchdog_fired);
+    EXPECT_EQ(withheld.code, 0) << withheld.output;
+    EXPECT_FALSE(withheld.negotiation_timeout);
+    EXPECT_GE(withheld.elapsed, std::chrono::milliseconds{2500});
+    EXPECT_EQ(withheld.sends, 0) << withheld.output;
+    EXPECT_EQ(withheld.output.find("\"event\":\"active\""), std::string::npos) << withheld.output;
+    EXPECT_EQ(withheld.connects, 1) << "admission timeout reconnected/reset the budget";
+    EXPECT_EQ(withheld.output.find("\"to_state\":\"failed\""), std::string::npos) << withheld.output;
+    EXPECT_EQ(withheld.output.find("\"event\":\"err\""), std::string::npos) << withheld.output;
+    EXPECT_LT(withheld.elapsed, std::chrono::milliseconds{2500 + 1500}) << withheld.output;
+}
+
+TEST(WiredReceiver, RequiredVideoConsumerNaturallyExpiresOriginal15SecondNegotiation) {
+    // Given no consumer and a runtime longer than the unchanged negotiation phase.
+    // When the actual main runs, only its owner tick may produce this failure.
+    const auto withheld = run_required_mode(true, false, 19000);
+    // Then cancellation, runtime expiry, reconnect and watchdog cannot count as proof.
+    EXPECT_FALSE(withheld.watchdog_fired) << "NEGOTIATION_WATCHDOG_FIRED";
+    EXPECT_EQ(withheld.code, 1) << withheld.output;
+    EXPECT_EQ(withheld.sends, 0) << withheld.output;
+    EXPECT_EQ(withheld.connects, 1);
+    EXPECT_GE(withheld.elapsed, std::chrono::seconds{15});
+    EXPECT_LT(withheld.elapsed, std::chrono::seconds{18});
+    EXPECT_NE(withheld.output.find("\"to_state\":\"failed\""), std::string::npos) << withheld.output;
+    EXPECT_TRUE(withheld.negotiation_timeout) << withheld.output;
+    EXPECT_EQ(withheld.output.find("\"event\":\"active\""), std::string::npos) << withheld.output;
+    EXPECT_EQ(withheld.output.find("\"to_state\":\"active\""), std::string::npos) << withheld.output;
+    EXPECT_EQ(withheld.output.find("\"to_state\":\"reconnecting\""), std::string::npos) << withheld.output;
+}
+
+TEST(WiredReceiver, RequiredVideoConsumerRejectsAdmissionAfterRuntimeDeadline) {
+    for (const auto edge : {DeadlineObservation::Edge::dispatch, DeadlineObservation::Edge::accepted}) {
+        SCOPED_TRACE(edge == DeadlineObservation::Edge::dispatch ? "dispatch" : "accept/limits");
+        DeadlineObservation observed{edge};
+        deadline_observation = &observed;
+        const auto result = run_required_mode(true, true, 1000);
+        deadline_observation = nullptr;
+        EXPECT_TRUE(observed.crossed);
+        EXPECT_FALSE(result.watchdog_fired);
+        EXPECT_EQ(result.code, 0) << result.output;
+        EXPECT_EQ(result.sends, 0) << result.output;
+        EXPECT_EQ(result.connects, 1);
+        EXPECT_EQ(result.output.find("\"event\":\"video_accepted\""), std::string::npos)
+            << "LATE_PRODUCER_INSTALLED: " << result.output;
+        EXPECT_EQ(result.output.find("\"to_state\":\"active\""), std::string::npos) << result.output;
+    }
+}
+
+TEST(WiredReceiver, RequiredVideoConsumerOwnerRejectsInitialVersionAfterRuntimeDeadline) {
+    DeadlineObservation observed{DeadlineObservation::Edge::owner};
+    deadline_observation = &observed;
+    const auto result = run_required_mode(true, true, 1000);
+    deadline_observation = nullptr;
+    EXPECT_TRUE(observed.crossed);
+    EXPECT_TRUE(observed.owner_done);
+    EXPECT_FALSE(observed.gate_failed);
+    EXPECT_FALSE(result.watchdog_fired);
+    EXPECT_EQ(result.code, 0) << result.output;
+    EXPECT_EQ(result.connects, 1);
+    EXPECT_NE(result.output.find("\"event\":\"video_accepted\""), std::string::npos) << result.output;
+    EXPECT_EQ(result.sends, 0) << "OWNER_SENT_AFTER_RUNTIME_DEADLINE: " << result.output;
+    EXPECT_EQ(result.output.find("\"to_state\":\"active\""), std::string::npos) << result.output;
+}
+
+TEST(WiredReceiver, DefaultModeWithoutConsumerStillNegotiates) {
+    const auto headless = run_required_mode(false, false, 1500);
+    EXPECT_GT(headless.sends, 0)
+        << "default headless mode no longer sends upstream without a consumer: "
+        << headless.output;
+}
+
+TEST(WiredReceiver, RequiredVideoConsumerForgetPhoneWhileGatedCompletesWithoutDeadlock) {
+    namespace bus = aa::ipc::dbus_adapter;
+    char directory[] = "/tmp/wired-required-revoke-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore initial{path};
+    ASSERT_TRUE(initial.load().has_value());
+    const aa::trust::WiredIdentity identity{
+        "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+    const auto approved = initial.approve(aa::trust::TransportIdentity{identity});
+    ASSERT_TRUE(approved.has_value());
+    runtime_phone = aa::app::wired_phone_identity(identity).value();
+    runtime_quiet = true;
+    runtime_recovers = false;
+    runtime_connects.store(0);
+    runtime_ciphers.store(0);
+    runtime_sends.store(0);
+    g_running.store(true);
+    const auto video_socket = root / "video";
+    std::vector<std::string> args{"receiver", "--port", "1-2.1", "--store", path.string(),
+                                  "--video-socket", video_socket.string(),
+                                  "--input-socket", (root / "input").string(),
+                                  "--duration-ms", "5000", "--require-video-consumer"};
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (auto &arg : args) {
+        argv.push_back(arg.data());
+    }
+    testing::internal::CaptureStdout();
+    int code = -1;
+    std::thread receiver([&] {
+        code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+    });
+    std::atomic<bool> watchdog_fired{false};
+    std::jthread watchdog([&](const std::stop_token &stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, stop, std::chrono::seconds{4}, [] { return false; });
+        if (!stop.stop_requested()) {
+            watchdog_fired.store(true);
+            g_running.store(false);
+        }
+    });
+    const auto socket_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+    while (!std::filesystem::exists(video_socket) &&
+           std::chrono::steady_clock::now() < socket_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    auto client = bus::BusConnection::connect_session();
+    aa::core::Result<bus::ParsedMessage> reply{aa::Error{aa::ErrorCode::internal}};
+    bool registered = false;
+    if (client.has_value()) {
+        const aa::ipc::BusName consumer{"org.custom.AndroidAutoReceiverTest.Consumer"};
+        const aa::ipc::BusName service{"org.custom.AndroidAutoReceiver"};
+        auto owner = client.value().get_name_owner(service);
+        const auto owner_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+        while (!owner.has_value() && std::chrono::steady_clock::now() < owner_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+            owner = client.value().get_name_owner(service);
+        }
+        auto named = client.value().request_name(consumer);
+        if (named.has_value() && owner.has_value()) {
+            bus::MessageWriter registration;
+            registration.destination(service.value)
+                .path("/org/custom/AndroidAutoReceiver")
+                .interface_name("org.custom.AndroidAutoReceiver1")
+                .member("RegisterConsumer")
+                .body_signature("s")
+                .put_string(consumer.value);
+            auto serial = client.value().send_message(bus::MessageType::method_call, registration);
+            if (serial.has_value()) {
+                auto result = client.value().await_reply(serial.value(), owner.value());
+                registered = result.has_value() &&
+                             result.value().type == bus::MessageType::method_return;
+            }
+            if (registered) {
+                bus::MessageWriter forget;
+                forget.destination(service.value)
+                    .path("/org/custom/AndroidAutoReceiver")
+                    .interface_name("org.custom.AndroidAutoReceiver1")
+                    .member("ForgetPhone")
+                    .body_signature("t")
+                    .put_u64(approved.value().value);
+                auto sent = client.value().send_message(bus::MessageType::method_call, forget);
+                if (sent.has_value()) {
+                    reply = client.value().await_reply(sent.value(), owner.value());
+                }
+            }
+        }
+    }
+    if (!registered || !reply.has_value()) {
+        g_running.store(false);
+    }
+    receiver.join();
+    watchdog.request_stop();
+    watchdog.join();
+    const auto output = testing::internal::GetCapturedStdout();
+    EXPECT_FALSE(watchdog_fired.load()) << "ForgetPhone deadlocked while admission was gated: "
+                                        << output;
+    EXPECT_TRUE(registered);
+    ASSERT_TRUE(reply.has_value()) << output;
+    EXPECT_EQ(reply.value().type, bus::MessageType::method_return);
+    aa::trust::ApprovedPhoneStore persisted{path};
+    ASSERT_TRUE(persisted.load().has_value());
+    EXPECT_EQ(persisted.lookup(runtime_phone), aa::trust::Decision::unknown)
+        << "consent bypass: ForgetPhone did not revoke while admission was gated";
+    std::filesystem::remove_all(root);
+    runtime_quiet = false;
+}
+
+TEST(WiredReceiver, InitialConfigIdrReachesConsumerExactlyWithFollowingNonIdr) {
+    namespace p = aa::protocol;
+    namespace tr = aa::transport;
+    aa::session::test::MapTrustStore trust;
+    const aa::trust::PhoneIdentity phone{"synthetic-idr-peer"};
+    trust.set(phone, aa::trust::Decision::approved);
+    aa::session::test::ManualClock clock;
+    wiredtest::CaptureSink capture;
+    aa::diagnostics::Diagnostics diagnostics{capture};
+    wiredtest::ScriptedTransport transport;
+    std::vector<std::string> logs;
+    VideoOutlet video{[&](const std::string &line) { logs.push_back(line); }};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    video.install(std::move(pair.value().producer));
+    auto output = std::make_unique<ReceiverProfileSink>();
+    auto router =
+        aa::audio::detail::open_router_with_sink_for_test(pcm_router_config(), std::move(output));
+    ASSERT_TRUE(router);
+    RouterSink audio{router.value()};
+    aa::app::WiredSession session{{trust, clock, diagnostics}};
+    ASSERT_TRUE(session.configure(
+        service_descriptors(aa::input::CapabilityDescriptor::bench_defaults())));
+    ASSERT_TRUE(register_av_sinks(session, video, audio));
+    session.attach_transport(&transport);
+    auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    auto *cipher = owned.get();
+    session.attach_cipher(std::move(owned));
+    wiredtest::walk_auth(session, transport);
+    ASSERT_TRUE(session.authenticated());
+    ASSERT_TRUE(session.announce_services());
+    const auto receive = [&](std::vector<std::byte> payload) -> aa::core::Result<bool> {
+        auto frames = tr::encode_message({99, tr::MessageKind::specific, std::move(payload)},
+                                         tr::Encryption::encrypted, cipher);
+        if (!frames) {
+            return frames.error();
+        }
+        for (auto &frame : frames.value()) {
+            transport.push_inbound(std::move(frame));
+        }
+        return session.poll_transport();
+    };
+    ASSERT_TRUE(receive(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    ASSERT_TRUE(receive(p::encode(p::AvSinkStart{-7, 0}).value()));
+    auto config = std::vector<std::byte>{std::byte{0}, std::byte{1}, std::byte{0},
+                                         std::byte{0}, std::byte{0}, std::byte{1},
+                                         std::byte{0x67}, std::byte{0x42}};
+    ASSERT_TRUE(receive(config));
+    std::vector<std::byte> idr(10, std::byte{0x55});
+    idr[0] = idr[1] = std::byte{0};
+    idr.insert(idr.end(), wiredtest::kVideoIdr.begin(), wiredtest::kVideoIdr.end());
+    clock.set(aa::core::Nanoseconds{987654});
+    ASSERT_TRUE(receive(idr));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    const auto &unit = pair.value().consumer.access_unit();
+    EXPECT_EQ(unit.timestamp_ns, 987654U);
+    EXPECT_TRUE(unit.idr);
+    std::vector<std::uint8_t> expected;
+    for (auto it = config.begin() + 2; it != config.end(); ++it) {
+        expected.push_back(std::to_integer<std::uint8_t>(*it));
+    }
+    for (const auto byte : wiredtest::kVideoIdr) {
+        expected.push_back(std::to_integer<std::uint8_t>(byte));
+    }
+    EXPECT_EQ(unit.payload, expected);
+    auto non_idr = idr;
+    non_idr[14] = std::byte{0x41};
+    for (std::uint64_t follow = 1; follow <= 3; ++follow) {
+        clock.set(aa::core::Nanoseconds{static_cast<std::int64_t>(987654 + follow * 100)});
+        ASSERT_TRUE(receive(non_idr));
+        ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+        const auto &next = pair.value().consumer.access_unit();
+        EXPECT_EQ(next.timestamp_ns, 987654U + follow * 100U);
+        EXPECT_FALSE(next.idr);
+        EXPECT_FALSE(next.payload.empty());
+    }
+    video.close();
+}
+
+std::int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::unique_ptr<wiredtest::FakeHandshakeCipher> active_test_cipher() {
+    auto cipher = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    (void)cipher->step_handshake();
+    (void)cipher->step_handshake();
+    return cipher;
+}
+
+std::vector<std::byte> av_data_message(std::uint64_t peer_timestamp,
+                                       const std::vector<std::byte> &media) {
+    std::vector<std::byte> payload{std::byte{0}, std::byte{0}};
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        payload.push_back(static_cast<std::byte>((peer_timestamp >> shift) & 0xffU));
+    }
+    payload.insert(payload.end(), media.begin(), media.end());
+    return payload;
+}
+
+struct ReceiverRunGuard {
+    std::thread worker;
+    ReceiverRunGuard() = default;
+    ~ReceiverRunGuard() {
+        if (worker.joinable()) {
+            g_running.store(false);
+            worker.join();
+        }
+    }
+    ReceiverRunGuard(const ReceiverRunGuard &) = delete;
+    ReceiverRunGuard &operator=(const ReceiverRunGuard &) = delete;
+};
+
+struct StdoutCaptureGuard {
+    std::string output;
+    bool released = false;
+    StdoutCaptureGuard() { testing::internal::CaptureStdout(); }
+    ~StdoutCaptureGuard() {
+        if (!released) {
+            auto text = testing::internal::GetCapturedStdout();
+            if (testing::Test::HasFailure()) {
+                std::fputs(text.c_str(), stdout);
+            }
+        }
+    }
+    std::string release() {
+        released = true;
+        output = testing::internal::GetCapturedStdout();
+        return output;
+    }
+    StdoutCaptureGuard(const StdoutCaptureGuard &) = delete;
+    StdoutCaptureGuard &operator=(const StdoutCaptureGuard &) = delete;
+};
+
+TEST(WiredReceiver, RequiredVideoConsumerAdmissionDeliversSoleInitialConfigIdr) {
+    namespace p = aa::protocol;
+    namespace tr = aa::transport;
+    char directory[] = "/tmp/wired-gate-deliver-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto store_path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore store{store_path};
+    ASSERT_TRUE(store.load().has_value());
+    const aa::trust::WiredIdentity identity{
+        "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+    ASSERT_TRUE(store.approve(aa::trust::TransportIdentity{identity}).has_value());
+    runtime_phone = aa::app::wired_phone_identity(identity).value();
+    runtime_recovers = false;
+    runtime_quiet = false;
+    runtime_connects.store(0);
+    runtime_ciphers.store(0);
+    runtime_sends.store(0);
+    g_running.store(true);
+    auto state = std::make_shared<AdmissionState>();
+    admission_link_state = state;
+    std::vector<std::string> args{"receiver", "--port", "1-2.1", "--no-bus", "--store",
+        store_path.string(), "--video-socket", (root / "video").string(), "--input-socket",
+        (root / "input").string(), "--duration-ms", "6000", "--require-video-consumer"};
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (auto &arg : args) {
+        argv.push_back(arg.data());
+    }
+    StdoutCaptureGuard capture;
+    int code = -1;
+    ReceiverRunGuard guard;
+    guard.worker =
+        std::thread([&] { code = wired_receiver_main(static_cast<int>(argv.size()), argv.data()); });
+    {
+        std::unique_lock lock(state->mutex);
+        ASSERT_TRUE(state->cv.wait_for(lock, std::chrono::seconds{3},
+                                       [&] { return state->created; }))
+            << "LINK_NEVER_CREATED";
+    }
+    auto cipher = active_test_cipher();
+    const auto push_plain = [&](const std::vector<std::byte> &frame) {
+        const std::lock_guard lock(state->mutex);
+        state->inbound.push_back(frame);
+        state->cv.notify_all();
+    };
+    const auto push_media = [&](std::vector<std::byte> payload) {
+        auto frames = tr::encode_message(
+            {std::uint8_t{99}, tr::MessageKind::specific, std::move(payload)},
+            tr::Encryption::encrypted, cipher.get());
+        ASSERT_TRUE(frames.has_value());
+        const std::lock_guard lock(state->mutex);
+        for (auto &frame : frames.value()) {
+            state->inbound.push_back(std::move(frame));
+        }
+        state->cv.notify_all();
+    };
+    const std::vector<std::byte> config_body{std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+                                             std::byte{0x01}, std::byte{0x67}, std::byte{0x42}};
+    const std::vector<std::byte> idr_body{std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+                                          std::byte{0x01}, std::byte{0x65}, std::byte{0x88}};
+    const std::vector<std::byte> p_body{std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+                                        std::byte{0x01}, std::byte{0x41}, std::byte{0x10}};
+    std::vector<std::byte> config_message{std::byte{0x00}, std::byte{0x01}};
+    config_message.insert(config_message.end(), config_body.begin(), config_body.end());
+    const std::int64_t t_push_ns = steady_ns();
+    push_plain(wiredtest::control_frame(
+        aa::protocol::encode(aa::protocol::VersionResponse{1, 6, 0}).value()));
+    push_plain(wiredtest::control_frame(
+        aa::protocol::encode(aa::protocol::EncapsulatedSsl{{std::byte{1}}}).value()));
+    push_plain(wiredtest::discovery_request_frame());
+    push_plain(wiredtest::open_request_frame(99));
+    push_media(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value());
+    push_media(p::encode(p::AvSinkStart{-7, 0}).value());
+    push_media(config_message);
+    push_media(av_data_message(0x1111, idr_body));
+    push_media(av_data_message(0x2222, p_body));
+    push_media(av_data_message(0x3333, p_body));
+    std::size_t pushed = 0;
+    {
+        std::lock_guard lock(state->mutex);
+        pushed = state->inbound.size();
+    }
+    {
+        std::unique_lock lock(state->mutex);
+        (void)state->cv.wait_for(lock, std::chrono::milliseconds{700},
+                                 [&] { return state->served >= pushed; });
+    }
+    auto connected = aa::ipc::connect_video_consumer(
+        aa::ipc::VideoSocketPath{(root / "video").string()},
+        aa::ipc::VideoClientOptions{{}, aa::ipc::current_uid(), aa::core::Milliseconds{3000}});
+    ASSERT_TRUE(connected.has_value()) << aa::to_string(connected.error().code());
+    const auto first = connected.value().receive(Milliseconds{3000});
+    ASSERT_TRUE(first.has_value()) << "SOLE_INITIAL_CONFIG_IDR_NEVER_REACHED_CONSUMER: "
+                                   << aa::to_string(first.error().code());
+    ASSERT_EQ(first.value(), aa::ipc::ReceiveStatus::complete);
+    const auto &unit = connected.value().access_unit();
+    EXPECT_EQ(unit.frame, 1U);
+    EXPECT_TRUE(unit.idr);
+    std::vector<std::uint8_t> expected;
+    expected.reserve(config_body.size() + idr_body.size());
+    for (const auto byte : config_body) {
+        expected.push_back(std::to_integer<std::uint8_t>(byte));
+    }
+    for (const auto byte : idr_body) {
+        expected.push_back(std::to_integer<std::uint8_t>(byte));
+    }
+    EXPECT_EQ(unit.payload, expected);
+    std::vector<std::uint8_t> p_frame;
+    p_frame.reserve(p_body.size());
+    for (const auto byte : p_body) {
+        p_frame.push_back(std::to_integer<std::uint8_t>(byte));
+    }
+    const std::int64_t t_recv_ns = steady_ns();
+    EXPECT_GE(unit.timestamp_ns, static_cast<std::uint64_t>(t_push_ns));
+    EXPECT_LE(unit.timestamp_ns, static_cast<std::uint64_t>(t_recv_ns));
+    for (int follow = 0; follow < 2; ++follow) {
+        const auto step = connected.value().receive(Milliseconds{3000});
+        ASSERT_TRUE(step.has_value());
+        ASSERT_EQ(step.value(), aa::ipc::ReceiveStatus::complete);
+        EXPECT_FALSE(connected.value().access_unit().idr);
+        EXPECT_EQ(connected.value().access_unit().payload, p_frame);
+    }
+    guard.worker.join();
+    const auto output = capture.release();
+    admission_link_state.reset();
+    EXPECT_EQ(code, 0) << output;
+    EXPECT_EQ(runtime_connects.load(), 1) << output;
+    const auto ready_at = output.find("\"event\":\"ready\"");
+    const auto accepted_at = output.find("\"event\":\"video_accepted\"");
+    ASSERT_NE(accepted_at, std::string::npos) << output;
+    EXPECT_NE(ready_at, std::string::npos) << output;
+    EXPECT_LT(ready_at, accepted_at) << "ready must be infrastructure readiness, pre-gate: "
+                                     << output;
+    EXPECT_NE(output.find("\"to_state\":\"active\""), std::string::npos) << output;
+    std::filesystem::remove_all(root);
+}
+
+TEST(WiredReceiver, ForgetPhoneWhileWaitingForVideoConsumerCompletesWithoutDeadlock) {
+    namespace bus = aa::ipc::dbus_adapter;
+    namespace faults = aa::trust::test::faults;
+    char directory[] = "/tmp/wired-gate-revoke-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore initial{path};
+    ASSERT_TRUE(initial.load().has_value());
+    const aa::trust::WiredIdentity identity{
+        "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+    const auto approved = initial.approve(aa::trust::TransportIdentity{identity});
+    ASSERT_TRUE(approved.has_value());
+    runtime_phone = aa::app::wired_phone_identity(identity).value();
+    runtime_recovers = false;
+    runtime_quiet = false;
+    runtime_connects.store(0);
+    runtime_ciphers.store(0);
+    g_running.store(true);
+    auto state = std::make_shared<AdmissionState>();
+    admission_link_state = state;
+    std::vector<std::string> args{"receiver", "--port", "1-2.1", "--store", path.string(),
+        "--video-socket", (root / "video").string(), "--input-socket", (root / "input").string(),
+        "--duration-ms", "8000", "--require-video-consumer"};
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (auto &arg : args) {
+        argv.push_back(arg.data());
+    }
+    std::vector<std::thread::id> mutations;
+    faults::arm(faults::Fault::none);
+    faults::set_observer([&] { mutations.push_back(std::this_thread::get_id()); });
+    StdoutCaptureGuard capture;
+    int code = -1;
+    std::thread::id dispatcher;
+    ReceiverRunGuard guard;
+    guard.worker = std::thread([&] {
+        dispatcher = std::this_thread::get_id();
+        code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+    });
+    std::atomic<bool> watchdog_fired{false};
+    std::jthread watchdog([&](const std::stop_token &stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, stop, std::chrono::seconds{5}, [] { return false; });
+        if (!stop.stop_requested()) {
+            watchdog_fired.store(true);
+            g_running.store(false);
+        }
+    });
+    {
+        std::unique_lock lock(state->mutex);
+        ASSERT_TRUE(state->cv.wait_for(lock, std::chrono::seconds{3},
+                                       [&] { return state->created; }))
+            << "LINK_NEVER_CREATED";
+    }
+    auto client = bus::BusConnection::connect_session();
+    aa::core::Result<bus::ParsedMessage> reply{aa::Error{aa::ErrorCode::internal}};
+    bool registered = false;
+    if (client) {
+        const aa::ipc::BusName consumer{"org.custom.AndroidAutoReceiverTest.Consumer"};
+        const aa::ipc::BusName service{"org.custom.AndroidAutoReceiver"};
+        auto named = client.value().request_name(consumer);
+        auto owner = client.value().get_name_owner(service);
+        if (named && owner) {
+            bus::MessageWriter registration;
+            registration.destination(service.value).path("/org/custom/AndroidAutoReceiver")
+                .interface_name("org.custom.AndroidAutoReceiver1").member("RegisterConsumer")
+                .body_signature("s").put_string(consumer.value);
+            auto serial = client.value().send_message(bus::MessageType::method_call, registration);
+            if (serial) {
+                auto result = client.value().await_reply(serial.value(), owner.value());
+                registered = result && result.value().type == bus::MessageType::method_return;
+            }
+            if (registered) {
+                bus::MessageWriter forget;
+                forget.destination(service.value).path("/org/custom/AndroidAutoReceiver")
+                    .interface_name("org.custom.AndroidAutoReceiver1").member("ForgetPhone")
+                    .body_signature("t").put_u64(approved.value().value);
+                auto sent = client.value().send_message(bus::MessageType::method_call, forget);
+                if (sent) {
+                    reply = client.value().await_reply(sent.value(), owner.value());
+                }
+            }
+        }
+    }
+    if (!registered || !reply) {
+        g_running.store(false);
+    }
+    guard.worker.join();
+    watchdog.request_stop();
+    watchdog.join();
+    const auto output = capture.release();
+    faults::set_observer({});
+    faults::disarm();
+    admission_link_state.reset();
+    EXPECT_FALSE(watchdog_fired.load()) << "FORGET_WHILE_GATED_DEADLOCK: " << output;
+    EXPECT_TRUE(registered) << output;
+    ASSERT_TRUE(reply.has_value()) << output;
+    EXPECT_EQ(reply.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(code, 1) << output;
+    EXPECT_EQ(runtime_connects.load(), 1) << output;
+    EXPECT_NE(output.find("\"to_state\":\"failed\""), std::string::npos) << output;
+    EXPECT_EQ(output.find("\"detail\":\"poll\""), std::string::npos) << output;
+    EXPECT_EQ(output.find("\"detail\":\"video_admission\""), std::string::npos) << output;
+    EXPECT_EQ(output.find("\"event\":\"active\""), std::string::npos) << output;
+    ASSERT_FALSE(mutations.empty()) << "ForgetPhone bypassed the owner queue while gated";
+    for (const auto thread : mutations) {
+        EXPECT_NE(thread, dispatcher) << "store mutation ran on the D-Bus dispatcher";
+    }
+    aa::trust::ApprovedPhoneStore persisted{path};
+    ASSERT_TRUE(persisted.load().has_value());
+    EXPECT_EQ(persisted.lookup(runtime_phone), aa::trust::Decision::unknown);
+    std::filesystem::remove_all(root);
 }
 } // namespace

@@ -30,7 +30,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -44,6 +46,7 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <gtest/gtest-spi.h>
 
 namespace {
 
@@ -1338,6 +1341,262 @@ TEST(DummyDisplayStopRecovery, StartupRollbackWithStoppedSnapshotLandsIdle) {
     EXPECT_EQ(started.error().code(), ErrorCode::channel_decode_unavailable);
     EXPECT_EQ(fixture->display().state(), DisplayState::idle);
     EXPECT_FALSE(fixture->display().helper_started());
+}
+
+namespace {
+
+class OwnedRuntime final {
+public:
+    OwnedRuntime() : path_(private_runtime_dir()) {}
+    ~OwnedRuntime() {
+        if (!path_.empty()) {
+            std::error_code error;
+            std::filesystem::remove_all(path_, error);
+            EXPECT_FALSE(error) << error.message();
+        }
+    }
+    const std::string& path() const { return path_; }
+    OwnedRuntime(const OwnedRuntime&) = delete;
+    OwnedRuntime& operator=(const OwnedRuntime&) = delete;
+private:
+    std::string path_;
+};
+
+class FactoryLatch final {
+public:
+    bool hold() {
+        std::unique_lock lock(mutex_);
+        entered_ = true;
+        condition_.notify_all();
+        return condition_.wait_for(lock, std::chrono::seconds{5}, [this] { return released_; });
+    }
+    bool await_entered() {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds{2}, [this] { return entered_; });
+    }
+    void release() {
+        const std::lock_guard lock(mutex_);
+        released_ = true;
+        condition_.notify_all();
+    }
+private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool entered_{false};
+    bool released_{false};
+};
+
+class StartupGuard final {
+public:
+    StartupGuard(FactoryLatch& latch, std::thread& worker) : latch_(latch), worker_(worker) {}
+    ~StartupGuard() {
+        latch_.release();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+private:
+    FactoryLatch& latch_;
+    std::thread& worker_;
+};
+
+void exercise_factory_barrier(bool fail_while_held) {
+    // Given: a registered display consumer and a live video server
+    ScriptedReceiver::Script script{};
+    script["StartProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+
+    OwnedRuntime runtime;
+    ASSERT_FALSE(runtime.path().empty());
+    const auto socket = aa::ipc::video_socket_path_in(runtime.path());
+    auto server = aa::ipc::VideoServer::listen(socket, aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
+    ASSERT_TRUE(server.has_value());
+
+    FactoryLatch latch;
+    int opens = 0;
+    int closes = 0;
+    int submits = 0;
+    int eofs = 0;
+
+    auto barrier_factory = [&](const aa::consumer::DecodeConfig&) -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+        ++opens;
+        if (!latch.hold() || fail_while_held) {
+            return aa::Error{ErrorCode::timeout};
+        }
+        return std::unique_ptr<DecodeSession>(std::make_unique<RecordingSession>(&opens, &closes, &submits, &eofs));
+    };
+
+    RecordingFrameTarget frames;
+    auto controller = DisplayController::attach(
+        DisplayController::Deps{client.value(), barrier_factory, frames},
+        test_config("StartupBarrier"));
+    ASSERT_TRUE(controller.has_value());
+
+    // When: starting projection asynchronously with decode factory held on barrier
+    std::optional<aa::core::Result<void>> starter_result;
+    std::thread starter([&] { starter_result.emplace(controller.value().start_projection(socket)); });
+    StartupGuard guard(latch, starter);
+    ASSERT_TRUE(latch.await_entered());
+    if (fail_while_held) {
+        FAIL() << "injected held-factory assertion";
+    }
+
+    // Then: remote StartProjection was invoked but no video connection was accepted yet
+    EXPECT_EQ(receiver->count_calls("StartProjection"), 1U);
+    ::pollfd descriptor{server.value().native_handle(), POLLIN, 0};
+    EXPECT_EQ(::poll(&descriptor, 1, 150), 0);
+    latch.release();
+    auto accepted = server.value().accept_consumer(Milliseconds{2000});
+    ASSERT_TRUE(accepted.has_value());
+    starter.join();
+    ASSERT_TRUE(starter_result.has_value());
+    ASSERT_TRUE(starter_result->has_value());
+    EXPECT_EQ(controller.value().state(), DisplayState::projecting);
+    EXPECT_EQ(opens, 1);
+}
+
+} // namespace
+
+TEST(DummyDisplayStartupReadiness, FactoryRunsBeforeVideoConnectionWithBarrier) {
+    exercise_factory_barrier(false);
+}
+
+TEST(DummyDisplayStartupReadiness, FatalAssertionReleasesHeldFactoryBeforeJoining) {
+    const auto before = std::chrono::steady_clock::now();
+    EXPECT_FATAL_FAILURE(exercise_factory_barrier(true), "injected held-factory assertion");
+    EXPECT_LT(std::chrono::steady_clock::now() - before, std::chrono::seconds{2});
+}
+
+TEST(DummyDisplayStartupReadiness, DecoderFailureRejectsBeforeAnyAcceptedVideoConsumer) {
+    // Given: a registered display consumer and a failing decode factory
+    ScriptedReceiver::Script script{};
+    script["StartProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+
+    OwnedRuntime runtime;
+    ASSERT_FALSE(runtime.path().empty());
+    const auto socket = aa::ipc::video_socket_path_in(runtime.path());
+    auto server = aa::ipc::VideoServer::listen(socket, aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
+    ASSERT_TRUE(server.has_value());
+
+    int opens = 0;
+    auto failing_factory = [&](const aa::consumer::DecodeConfig&) -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+        ++opens;
+        return aa::Error{ErrorCode::channel_decode_unavailable};
+    };
+
+    RecordingFrameTarget frames;
+    auto controller = DisplayController::attach(
+        DisplayController::Deps{client.value(), failing_factory, frames},
+        test_config("StartupFailNoAccept"));
+    ASSERT_TRUE(controller.has_value());
+
+    // When: projection start is attempted
+    const auto started = controller.value().start_projection(socket);
+
+    // Then: start fails with decode error, rolls back remote projection, and never connects video
+    ASSERT_FALSE(started.has_value());
+    EXPECT_EQ(started.error().code(), ErrorCode::channel_decode_unavailable);
+    EXPECT_EQ(controller.value().state(), DisplayState::idle);
+    EXPECT_EQ(receiver->count_calls("StartProjection"), 1U);
+    EXPECT_EQ(receiver->count_calls("StopProjection"), 1U);
+
+    EXPECT_EQ(opens, 1);
+    EXPECT_FALSE(controller.value().helper_started());
+    ::pollfd descriptor{server.value().native_handle(), POLLIN, 0};
+    EXPECT_EQ(::poll(&descriptor, 1, 150), 0);
+}
+
+TEST(DummyDisplayStartupReadiness, ConnectFailureClosesHelperExactlyOnceAndRollsBack) {
+    // Given: successful decode factory but unreachable video socket
+    OwnedRuntime runtime;
+    ASSERT_FALSE(runtime.path().empty());
+    ScriptedReceiver::Script script{};
+    script["StartProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+
+    int opens = 0;
+    int closes = 0;
+    int submits = 0;
+    int eofs = 0;
+    auto factory = [&](const aa::consumer::DecodeConfig&) -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+        ++opens;
+        return std::unique_ptr<DecodeSession>(std::make_unique<RecordingSession>(&opens, &closes, &submits, &eofs));
+    };
+
+    RecordingFrameTarget frames;
+    auto controller = DisplayController::attach(
+        DisplayController::Deps{client.value(), factory, frames},
+        test_config("ConnectFailCloseHelper"));
+    ASSERT_TRUE(controller.has_value());
+
+    const auto non_existent_socket = aa::ipc::video_socket_path_in(runtime.path());
+
+    // When: start projection is called
+    const auto started = controller.value().start_projection(non_existent_socket);
+
+    // Then: connect failure is returned, helper is closed once, and projection rolled back
+    ASSERT_FALSE(started.has_value());
+    EXPECT_EQ(started.error().code(), ErrorCode::transport_unavailable);
+    EXPECT_EQ(controller.value().state(), DisplayState::idle);
+    EXPECT_EQ(receiver->count_calls("StartProjection"), 1U);
+    EXPECT_EQ(receiver->count_calls("StopProjection"), 1U);
+    EXPECT_EQ(opens, 1);
+    EXPECT_EQ(closes, 1);
+    EXPECT_FALSE(controller.value().helper_started());
+}
+
+TEST(DummyDisplayStartupReadiness, ConnectFailurePreservesOriginalErrorWhenRollbackRejected) {
+    // Given: a different typed rollback failure and an owned, unbound video path.
+    OwnedRuntime runtime;
+    ASSERT_FALSE(runtime.path().empty());
+    ScriptedReceiver::Script script;
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::error}};
+    script["GetState"] = {ScriptedReply{.projecting = true}};
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+    int opens = 0, closes = 0, submits = 0, eofs = 0;
+    auto factory = [&](const aa::consumer::DecodeConfig&)
+        -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+        ++opens;
+        return std::unique_ptr<DecodeSession>(
+            std::make_unique<RecordingSession>(&opens, &closes, &submits, &eofs));
+    };
+    RecordingFrameTarget frames;
+    auto controller = DisplayController::attach(
+        DisplayController::Deps{client.value(), factory, frames}, test_config("ConnectRollbackReject"));
+    ASSERT_TRUE(controller.has_value());
+    // When: connect fails and rollback is rejected as illegal-transition.
+    const auto started = controller.value().start_projection(
+        aa::ipc::video_socket_path_in(runtime.path()));
+    // Then: transport failure is preserved, helper closes once, inactivity is unconfirmed.
+    ASSERT_FALSE(started.has_value());
+    EXPECT_EQ(started.error().code(), ErrorCode::transport_unavailable);
+    EXPECT_EQ(controller.value().state(), DisplayState::stop_failed);
+    EXPECT_FALSE(controller.value().helper_started());
+    EXPECT_EQ(opens, 1);
+    EXPECT_EQ(closes, 1);
+    EXPECT_EQ(receiver->count_calls("StopProjection"), 1U);
+    EXPECT_EQ(receiver->count_calls("GetState"), 1U);
+    controller.value().shutdown();
+    EXPECT_EQ(closes, 1);
 }
 
 // ---------------------------------------------------------------------------

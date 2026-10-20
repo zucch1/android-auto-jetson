@@ -111,6 +111,8 @@ struct DisplayConfig final {
     ipc::BusName consumer_name{};
     ipc::Viewport viewport{};
     protocol::VideoProfile caps{1280, 720, 30};
+    ipc::VideoEndpointObserver on_video_endpoint{};
+    consumer::DecodeCompletionObserver on_decode_completion{};
 };
 
 // Dummy display consumer (task 24). Projection control ALWAYS travels the

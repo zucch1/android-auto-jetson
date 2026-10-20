@@ -190,9 +190,12 @@ if(NOT CMAKE_CROSSCOMPILING)
     # the existing name and unregister releases it (real daemon queueing).
     add_test(NAME dummy_display_registration COMMAND "${AA_DBUS_RUN_SESSION}" --
         "$<TARGET_FILE:aa_dummy_display_test>" --gtest_filter=DummyDisplayRegistration.*)
+    add_test(NAME dummy_display_startup_readiness COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "$<TARGET_FILE:aa_dummy_display_test>" --gtest_filter=DummyDisplayStartupReadiness.*)
     set_tests_properties(dummy_display_contract_control dummy_display_contract_render
         dummy_display_contract_input dummy_display_contract_absent dummy_display_contract_idle
         dummy_display_contract_autostart dummy_display_stop_recovery dummy_display_registration
+        dummy_display_startup_readiness
         PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
             TIMEOUT 180)
@@ -209,7 +212,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     # receiver MODE (aa-test-receiver --mode reject-first-stop) - stop_failed
     # plus the typed rejection, no second remote StartProjection, and the
     # accepted retry landing idle with the widget error cleared.
-    foreach(case replay flow absent stalled stopfail stopreject)
+    foreach(case replay flow absent stalled stopfail stopreject
+            diagnostics-bootstrap diagnostics-factory diagnostics-connect)
         add_test(NAME dummy_display_exec_${case} COMMAND "${AA_DBUS_RUN_SESSION}" --
             "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/display/executable_display_test.py"

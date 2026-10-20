@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zucch1/android-auto-jetson/tools/perf/aa-projection-perf-v2.schema.json",
+  "title": "Wired active-window measurement result v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "task", "generated_at_utc", "mode", "duration_seconds", "verdict", "crashes", "budgets", "metrics", "thermal_state", "measurement_coverage", "violations", "provenance", "notes", "measurement_origin", "qualification_status", "named_gaps", "provenance_gaps", "invalid_telemetry", "run_status"],
+  "properties": {
+    "schema": {"const": "aa-projection-perf/2"},
+    "task": {"type": "string", "minLength": 1},
+    "generated_at_utc": {"type": "string", "format": "date-time"},
+    "mode": {"enum": ["wired"]},
+    "duration_requested": {"type": ["string", "null"]},
+    "duration_seconds": {"type": "number", "minimum": 0},
+    "measurement_origin": {"enum": ["live", "offline"]},
+    "qualification_status": {"enum": ["COMPLETE_LIVE", "OFFLINE_ONLY", "INCOMPLETE"]},
+    "named_gaps": {"$ref": "#/$defs/strings"},
+    "provenance_gaps": {"$ref": "#/$defs/strings"},
+    "invalid_telemetry": {"$ref": "#/$defs/strings"},
+    "run_status": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "early_exit": {"type": ["boolean", "null"]},
+        "receiver_exit_code": {"type": ["integer", "null"]},
+        "receiver_stopped_by_collector": {"type": ["boolean", "null"]},
+        "display_survived": {"type": ["boolean", "null"]},
+        "display_connected": {"type": ["boolean", "null"]},
+        "active_projection_seconds": {"type": ["number", "null"], "minimum": 0},
+        "startup_wait_seconds": {"type": ["number", "null"], "minimum": 0},
+        "projection_failure": {"type": ["string", "null"]},
+        "terminal_errors": {"type": ["array", "null"], "items": {"type": "object"}},
+        "startup_ms": {"$ref": "#/$defs/bound"},
+        "video_units": {"$ref": "#/$defs/bound"},
+        "audio_chunks": {"$ref": "#/$defs/bound"}
+      }
+    },
+    "verdict": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+    "blocked_on": {"type": ["string", "null"]},
+    "crashes": {"$ref": "#/$defs/count"},
+    "budgets": {"$ref": "#/$defs/budgets"},
+    "metrics": {
+      "type": "object", "additionalProperties": {"$ref": "#/$defs/metric"},
+      "required": ["receiver_rss_peak_mb", "receiver_rss_mean_mb", "receiver_cpu_sustained_pct_one_core", "receiver_cpu_peak_pct_one_core", "rss_growth_pct", "av_sync_ms", "audio_latency_ms", "audio_scheduling_skew_ms", "helper_rss_mb", "frame_drops", "decode_p50_ms", "decode_p95_ms", "decode_fps", "decode_frames", "ipc_throughput_mbps", "ipc_p95_added_latency_ms", "thermal_peak_c"]
+    },
+    "thermal_state": {
+      "type": ["object", "null"], "additionalProperties": false, "required": ["peak_c", "zones"],
+      "properties": {
+        "peak_c": {"type": "number"},
+        "zones": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["zone", "temp_c"],
+          "properties": {"zone": {"type": "string", "minLength": 1}, "temp_c": {"type": ["number", "null"]}}
+        }}
+      }
+    },
+    "measurement_coverage": {"$ref": "#/$defs/coverage"},
+    "violations": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false, "required": ["metric", "value", "budget_max", "detail"],
+      "properties": {"metric": {"type": "string"}, "value": {"type": ["number", "null"]}, "budget_max": {"type": "number"}, "detail": {"type": "string"}}
+    }},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "capture": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"],
+      "properties": {"path": {"type": ["string", "null"]}, "sha256": {"type": ["string", "null"]}}},
+    "notes": {"$ref": "#/$defs/strings"}
+  },
+  "$defs": {
+    "count": {"type": "integer", "minimum": 0},
+    "bound": {"type": ["integer", "null"], "minimum": 0},
+    "strings": {"type": "array", "items": {"type": "string"}},
+    "budgets": {
+      "type": "object", "additionalProperties": false,
+      "required": ["receiver_rss_mb_max", "receiver_cpu_pct_one_core_max", "av_sync_ms_max", "audio_latency_ms_max", "rss_growth_pct_max", "crashes_max", "helper_rss_mb_max"],
+      "properties": {
+        "receiver_rss_mb_max": {"const": 250.0}, "receiver_cpu_pct_one_core_max": {"const": 50.0},
+        "av_sync_ms_max": {"const": 50.0}, "audio_latency_ms_max": {"const": 200.0},
+        "rss_growth_pct_max": {"const": 10.0}, "crashes_max": {"const": 0}, "helper_rss_mb_max": {"const": 32.0}
+      }
+    },
+    "metric": {
+      "type": "object", "additionalProperties": false, "required": ["value", "unit", "gated", "status"],
+      "properties": {
+        "value": {"type": ["number", "null"]}, "unit": {"type": "string"},
+        "budget_max": {"type": ["number", "null"]}, "op": {"enum": ["le", "lt"]},
+        "gated": {"type": "boolean"}, "status": {"enum": ["PASS", "FAIL", "INFORMATIONAL", "NOT_REQUIRED", "UNAVAILABLE"]},
+        "note": {"type": "string"}
+      }
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_digest", "build_artifact_digest", "configuration_digest", "service_definitions", "dependency_versions", "target_hardware_state", "package_digest", "equivalence_status"],
+      "properties": {
+        "source_digest": {"type": ["string", "null"]}, "build_artifact_digest": {"type": ["string", "null"]},
+        "configuration_digest": {"type": ["string", "null"]},
+        "service_definitions": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["name", "digest"],
+          "properties": {"name": {"type": "string"}, "digest": {"type": ["string", "null"]}}
+        }},
+        "dependency_versions": {"type": "object", "additionalProperties": {"type": "string"}},
+        "target_hardware_state": {"type": "object"}, "package_digest": {"const": null},
+        "equivalence_status": {"const": "provisional"}
+      }
+    },
+    "timeline": {
+      "type": "object", "additionalProperties": false, "required": ["count", "first_ns", "last_ns", "max_gap_ns"],
+      "properties": {"count": {"$ref": "#/$defs/count"}, "first_ns": {"$ref": "#/$defs/bound"}, "last_ns": {"$ref": "#/$defs/bound"}, "max_gap_ns": {"$ref": "#/$defs/count"}}
+    },
+    "observation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["expected", "valid", "missing", "first_ns", "last_ns", "max_gap_ns"],
+      "properties": {"expected": {"$ref": "#/$defs/count"}, "valid": {"$ref": "#/$defs/count"}, "missing": {"$ref": "#/$defs/count"}, "first_ns": {"$ref": "#/$defs/bound"}, "last_ns": {"$ref": "#/$defs/bound"}, "max_gap_ns": {"$ref": "#/$defs/count"}}
+    },
+    "cpu": {
+      "type": "object", "additionalProperties": false,
+      "required": ["expected", "valid", "missing", "first_ns", "last_ns", "max_gap_ns", "baseline_valid", "measured_interval_ns"],
+      "properties": {"expected": {"$ref": "#/$defs/count"}, "valid": {"$ref": "#/$defs/count"}, "missing": {"$ref": "#/$defs/count"}, "first_ns": {"$ref": "#/$defs/bound"}, "last_ns": {"$ref": "#/$defs/bound"}, "max_gap_ns": {"$ref": "#/$defs/count"}, "baseline_valid": {"type": "boolean"}, "measured_interval_ns": {"$ref": "#/$defs/count"}}
+    },
+    "endpoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["count", "first_ns", "last_ns", "max_gap_ns", "begin_ns", "bytes"],
+      "properties": {"count": {"$ref": "#/$defs/count"}, "first_ns": {"$ref": "#/$defs/bound"}, "last_ns": {"$ref": "#/$defs/bound"}, "max_gap_ns": {"$ref": "#/$defs/count"}, "begin_ns": {"$ref": "#/$defs/bound"}, "bytes": {"$ref": "#/$defs/count"}}
+    },
+    "coverage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["policy", "window", "sampling", "rss", "cpu", "thermal", "ipc_consumption", "ipc_matches", "decode", "quantiles"],
+      "properties": {
+        "policy": {"const": "active-window-coverage/1"},
+        "window": {"type": ["object", "null"], "additionalProperties": false, "required": ["start_ns", "end_ns"],
+          "properties": {"start_ns": {"$ref": "#/$defs/count"}, "end_ns": {"$ref": "#/$defs/count"}}},
+        "sampling": {"$ref": "#/$defs/timeline"}, "rss": {"$ref": "#/$defs/observation"},
+        "cpu": {"$ref": "#/$defs/cpu"}, "thermal": {"$ref": "#/$defs/observation"},
+        "ipc_consumption": {"$ref": "#/$defs/endpoint"}, "ipc_matches": {"$ref": "#/$defs/endpoint"},
+        "decode": {"$ref": "#/$defs/endpoint"},
+        "quantiles": {"type": "object", "additionalProperties": false,
+          "required": ["policy", "limit", "ipc_retained", "decode_retained"],
+          "properties": {
+            "policy": {"const": "nearest-rank-last-4096-eligible-processing-order"}, "limit": {"const": 4096},
+            "ipc_retained": {"type": "integer", "minimum": 0, "maximum": 4096},
+            "decode_retained": {"type": "integer", "minimum": 0, "maximum": 4096}
+          }
+        }
+      }
+    }
+  }
+}
