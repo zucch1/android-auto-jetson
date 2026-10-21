@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<node name="/org/custom/AndroidAutoSystemHelper">
+  <interface name="org.custom.AndroidAutoSystemHelper1">
+    <annotation name="org.custom.Contract.SemVer" value="1.0.0"/>
+    <method name="Issue">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="confirmed_source" type="t" direction="in"/>
+      <arg name="action" type="u" direction="in"/>
+      <arg name="channel" type="u" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="grant" type="t" direction="out"/>
+    </method>
+    <method name="Execute">
+      <arg name="action" type="u" direction="in"/>
+      <arg name="channel" type="u" direction="in"/>
+      <arg name="grant" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="state" type="t" direction="out"/>
+    </method>
+    <method name="Invalidate">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="confirmed_source" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
+    </method>
+  </interface>
+</node>
