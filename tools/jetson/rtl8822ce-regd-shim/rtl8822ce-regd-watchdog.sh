@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
+set -euo pipefail
 # rtl8822ce-regd-watchdog — re-assert the US regd whenever the vendor driver's mode
 # transitions clobber the shim's one-shot registration (drift observed after AP/STA
 # qual cycles: phy#0 reverts to `country 00` while the shim module stays loaded).
@@ -13,29 +14,41 @@
 # wlP1p1s0) and inspects that phy's section — it does not assume the first
 # self-managed section, so a second self-managed adapter cannot mask drift.
 IFACE="${1:-wlP1p1s0}"
+
+resolve_wiphy() {
+  iw dev "$IFACE" info 2>/dev/null | sed -n 's/.*wiphy \([0-9][0-9]*\).*/\1/p'
+}
+
+target_country() {
+  iw reg get 2>/dev/null | awk -v p="phy#${WIPHY_IDX} (self-managed)" '
+    $0 == p { inphy = 1; next }
+    /^phy#/ { inphy = 0 }
+    inphy && $1 == "country" && !found { print $2; found = 1 }
+  '
+}
+
+verify_recovery() {
+  WIPHY_IDX=$(resolve_wiphy) && [ -n "$WIPHY_IDX" ] &&
+    COUNTRY=$(target_country) && [ "$COUNTRY" = "US:" ]
+}
+
 while true; do
-  WIPHY_IDX=$(iw dev "$IFACE" info 2>/dev/null | sed -n 's/.*wiphy \([0-9][0-9]*\).*/\1/p')
-  if [ -z "$WIPHY_IDX" ]; then
+  if ! WIPHY_IDX=$(resolve_wiphy) || [ -z "$WIPHY_IDX" ]; then
     logger -t regd-watchdog "WARN: cannot resolve wiphy for $IFACE — retry next cycle"
     sleep 5
     continue
   fi
-  COUNTRY=$(iw reg get 2>/dev/null | awk -v p="phy#${WIPHY_IDX} (self-managed)" '
-    $0 == p { inphy = 1; next }
-    /^phy#/ { inphy = 0 }
-    inphy && /^country/ { print $2; exit }
-  ')
+  COUNTRY=$(target_country) || COUNTRY=""
   if [ "$COUNTRY" != "US:" ]; then
     logger -t regd-watchdog "drift detected (phy#${WIPHY_IDX} != country US) — re-asserting"
-    if lsmod 2>/dev/null | grep -q '^rtl8822ce_regd_shim'; then
+    if lsmod 2>/dev/null | grep '^rtl8822ce_regd_shim' >/dev/null; then
       if rmmod rtl8822ce_regd_shim 2>/dev/null; then
         if modprobe rtl8822ce_regd_shim 2>/dev/null; then
-          STATE=$(iw reg get 2>/dev/null | awk -v p="phy#${WIPHY_IDX} (self-managed)" '
-            $0 == p { inphy = 1; next }
-            /^phy#/ { inphy = 0 }
-            inphy && /^country/ { print; exit }
-          ')
-          logger -t regd-watchdog "re-assert ok: ${STATE}"
+          if verify_recovery; then
+            logger -t regd-watchdog "re-assert ok: country ${COUNTRY}"
+          else
+            logger -t regd-watchdog "WARN: recovery verification failed for $IFACE — retry next cycle"
+          fi
         else
           logger -t regd-watchdog "ERROR: modprobe failed after unload — retry next cycle"
         fi
@@ -44,12 +57,11 @@ while true; do
       fi
     else
       if modprobe rtl8822ce_regd_shim 2>/dev/null; then
-        STATE=$(iw reg get 2>/dev/null | awk -v p="phy#${WIPHY_IDX} (self-managed)" '
-          $0 == p { inphy = 1; next }
-          /^phy#/ { inphy = 0 }
-          inphy && /^country/ { print; exit }
-        ')
-        logger -t regd-watchdog "load ok (module was absent): ${STATE}"
+        if verify_recovery; then
+          logger -t regd-watchdog "load ok (module was absent): country ${COUNTRY}"
+        else
+          logger -t regd-watchdog "WARN: recovery verification failed for $IFACE — retry next cycle"
+        fi
       else
         logger -t regd-watchdog "ERROR: modprobe failed (module absent) — retry next cycle"
       fi
