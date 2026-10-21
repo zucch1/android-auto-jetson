@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+if(CMAKE_CROSSCOMPILING)
+    message(STATUS "System helper qualification unavailable in cross-smoke mode")
+    return()
+endif()
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 add_library(aa_system_helper STATIC
     src/helper/Identity.cpp src/helper/SystemHelper.cpp src/helper/BusService.cpp
@@ -29,4 +33,10 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME system_helper_private_bus COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/helper/private_bus.py" "${CMAKE_BINARY_DIR}")
     set_tests_properties(system_helper_private_bus PROPERTIES TIMEOUT 90)
+    add_test(NAME system_helper_delivery_policy COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/helper/policy_bus.py" "${CMAKE_BINARY_DIR}")
+    set_tests_properties(system_helper_delivery_policy PROPERTIES TIMEOUT 30)
+    add_test(NAME system_helper_cross_smoke_configuration COMMAND "${CMAKE_COMMAND}"
+        -DCMAKE_CROSSCOMPILING=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE
+        -P "${CMAKE_SOURCE_DIR}/cmake/SystemHelper.cmake")
 endif()
