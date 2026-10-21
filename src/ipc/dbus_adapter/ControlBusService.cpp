@@ -9,6 +9,8 @@
 #include "BusWire.hpp"
 
 #include <cerrno>
+#include <chrono>
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <utility>
@@ -95,10 +97,12 @@ struct ControlBusService::Impl final {
     ControlDispatcher dispatcher;
     std::uint64_t idle_refreshes{0};
     bool closed{false};
+    std::chrono::steady_clock::time_point next_refresh{std::chrono::steady_clock::now()};
 
-    Impl(ControlServiceConfig config, PairingIdSource& ids, PhoneDirectory& directory)
+    Impl(ControlServiceConfig config, PairingIdSource& ids, PhoneDirectory& directory,
+         helper::Confirmation* confirmation)
         : pairing_ids(ids), phones(directory),
-          service(config, ControlServiceDeps{credentials, emitter, pairing_ids, phones}),
+          service(config, ControlServiceDeps{credentials, emitter, pairing_ids, phones, confirmation}),
           dispatcher(service) {}
 };
 
@@ -108,7 +112,7 @@ core::Result<ControlBusService> ControlBusService::start(Config config, Deps dep
         return connection.error();
     }
     auto impl = std::make_unique<Impl>(ControlServiceConfig{config.session_unix_uid},
-                                       deps.pairing_ids, deps.phones);
+                                       deps.pairing_ids, deps.phones, deps.confirmation);
     impl->connection = std::move(connection.value());
     impl->emitter.bind(&*impl->connection);
     const auto owned =
@@ -124,13 +128,25 @@ ControlBusService::ControlBusService(std::unique_ptr<Impl> impl) noexcept : impl
 ControlBusService::~ControlBusService() { close(); }
 
 ControlBusService::ControlBusService(ControlBusService&& other) noexcept = default;
-ControlBusService& ControlBusService::operator=(ControlBusService&& other) noexcept = default;
+ControlBusService& ControlBusService::operator=(ControlBusService&& other) noexcept {
+    if (this != &other) {
+        close();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
 
 core::Result<std::size_t> ControlBusService::cycle(core::Milliseconds idle_interval) {
     if (!impl_ || impl_->closed || !impl_->connection.has_value()) {
         return Error{ErrorCode::transport_closed};
     }
-    const int limit = idle_interval.count < 0 ? -1 : static_cast<int>(idle_interval.count);
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= impl_->next_refresh) {
+        impl_->service.refresh_consumer_owner();
+        impl_->next_refresh = now + std::chrono::seconds(1);
+    }
+    const int limit = static_cast<int>(idle_interval.count < 0 ? 1000 :
+                                       std::min<std::int64_t>(idle_interval.count, 1000));
     ::pollfd descriptor{impl_->connection->native_handle(), POLLIN, 0};
     const int ready = ::poll(&descriptor, 1, limit);
     if (ready < 0) {
@@ -166,6 +182,7 @@ void ControlBusService::close() noexcept {
         return;
     }
     impl_->closed = true;
+    impl_->service.shutdown();
     impl_->emitter.bind(nullptr);
     if (impl_->connection.has_value()) {
         static_cast<void>(
