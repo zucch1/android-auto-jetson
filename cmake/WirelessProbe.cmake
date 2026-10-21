@@ -22,4 +22,7 @@ if(NOT CMAKE_CROSSCOMPILING)
             "${CMAKE_SOURCE_DIR}/tests/wireless/test_psk.py" Psk.test_${case})
         set_tests_properties(wireless_psk_${case} PROPERTIES TIMEOUT 30)
     endforeach()
+    add_test(NAME wireless_watchdog COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/wireless/test_watchdog.py")
+    set_tests_properties(wireless_watchdog PROPERTIES TIMEOUT 30)
 endif()
