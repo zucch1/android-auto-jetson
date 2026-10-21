@@ -2,6 +2,7 @@
 #pragma once
 
 #include <aa/core/Cancellation.hpp>
+#include <aa/core/Ids.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/core/Time.hpp>
 
@@ -36,6 +37,8 @@ enum class Operation {
 struct Request final {
     Operation op{};
     std::uint8_t channel{36};  // only meaningful for ensure_access_point
+    core::ConsumerId consumer_generation{};
+    core::PairingRequestId confirmation_source{};
 };
 
 struct Response final {
