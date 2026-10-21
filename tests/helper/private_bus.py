@@ -57,11 +57,18 @@ def rss(child: subprocess.Popen[bytes]) -> int:
 
 
 def flow(build: Path, receiver: subprocess.Popen[bytes], env: dict[str, str],
-         suite: str = "HelperBus.*") -> None:
+         suite: str = "HelperBus.*", helper: subprocess.Popen[bytes] | None = None) -> None:
     with process([str(build / "aa_system_helper_bus_test"), f"--gtest_filter={suite}"], env) as test:
         while test.poll() is None:
             text = line(test)
-            if text.startswith("COMMAND "):
+            if text == "COMMAND wait-entered":
+                assert helper is not None
+                send(test, line(helper, 2))
+            elif text == "COMMAND release-held":
+                assert helper is not None
+                send(helper, "release")
+                send(test, "released")
+            elif text.startswith("COMMAND "):
                 send(receiver, text.removeprefix("COMMAND "))
                 send(test, line(receiver))
             else:
@@ -69,6 +76,24 @@ def flow(build: Path, receiver: subprocess.Popen[bytes], env: dict[str, str],
             if text.startswith("[  PASSED  ]") or text.startswith("[  FAILED  ]") and "tests, listed below" in text:
                 break
         assert test.wait(timeout=10) == 0
+
+
+def concurrent_flow(build: Path, directory: Path) -> None:
+    """Drive same-instance regressions on fresh real buses and an inert backend."""
+    env = dict(os.environ, AA_HELPER_HOLD_RELEASE="1")
+    fixture = build / "aa_system_helper_fixture"
+    with contextlib.ExitStack() as stack:
+        buses = [stack.enter_context(process(["dbus-daemon", "--session", "--nofork", "--print-address=1"], env))
+                 for _ in range(2)]
+        helper_address, env["DBUS_SESSION_BUS_ADDRESS"] = [line(bus) for bus in buses]
+        env["AA_HELPER_TEST_BUS"] = helper_address
+        helper = stack.enter_context(process([str(fixture), "helper", helper_address, str(directory),
+                                              str(directory / "concurrent-effects")], env))
+        assert line(helper) == "ready"
+        receiver = stack.enter_context(process([str(fixture), "receiver", helper_address,
+                                               str(directory / "concurrent-store"), "unused"], env))
+        assert line(receiver) == "ready"
+        flow(build, receiver, env, env.get("AA_HELPER_CONCURRENCY_FILTER", "HelperConcurrency.*"), helper)
 
 
 def wait_cleanup(path: Path, previous: int, start: float) -> float:
@@ -86,6 +111,9 @@ def run(build: Path, directory: Path) -> None:
     (directory / "receiver.sha256").write_text(hashlib.sha256(fixture.read_bytes()).hexdigest() + "\n")
     for name in ("session.uid", "receiver.sha256"):
         (directory / name).chmod(0o600)
+    concurrent_flow(build, directory)
+    if os.environ.get("AA_HELPER_CONCURRENCY_ONLY") == "1":
+        return
     effects = directory / "effects"
     effects.touch()
     with contextlib.ExitStack() as stack:

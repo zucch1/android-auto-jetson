@@ -4,8 +4,11 @@
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/trust/PairingPolicy.hpp>
 #include <fstream>
+#include <future>
+#include <cstdlib>
 #include <iostream>
 #include <poll.h>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -15,6 +18,13 @@ class RecordingBackend final : public Backend {
 public:
     explicit RecordingBackend(const char* path) : path_(path) {}
     core::Result<State> apply(Action action, std::uint32_t) override {
+        if (action == Action::release_ap && std::getenv("AA_HELPER_HOLD_RELEASE")) {
+            std::cout << "entered\n" << std::flush;
+            ::pollfd input{STDIN_FILENO, POLLIN, 0};
+            std::string release;
+            if (::poll(&input, 1, 5000) <= 0 || !std::getline(std::cin, release) || release != "release")
+                return Error{ErrorCode::helper_unavailable};
+        }
         std::ofstream{path_, std::ios::app} << "effect " << static_cast<std::uint32_t>(action) << '\n';
         if (action == Action::release_ap) active_ = false;
         if (action == Action::acquire_ap) active_ = true;
@@ -40,6 +50,12 @@ int receiver(const char* address, const std::filesystem::path& store_path) {
     if (!helper) return 3;
     auto service = ipc::ControlBusService::start({::getuid()}, {ids, phones, helper.value().get()});
     if (!service) return 4;
+    struct Worker {
+        core::CancellationSource cancellation;
+        std::future<unsigned int> result;
+        std::jthread thread;
+    };
+    Worker first, second;
     std::cout << "ready\n" << std::flush;
     for (;;) {
         if (!service.value().cycle(core::Milliseconds{10})) return 5;
@@ -48,7 +64,42 @@ int receiver(const char* address, const std::filesystem::path& store_path) {
         std::string command;
         if (!std::getline(std::cin, command)) return 0;
         core::Result<void> result{Error{ErrorCode::invalid_argument}};
-        if (command == "acquire" || command == "pair" || command == "release" || command == "wrong-source" ||
+        if (command.starts_with("worker-")) {
+            auto& worker = command == "worker-release" ? first : second;
+            if (worker.thread.joinable()) return 6;
+            worker.cancellation = core::CancellationSource{};
+            std::promise<unsigned int> response;
+            worker.result = response.get_future();
+            std::promise<pid_t> started;
+            auto tid = started.get_future();
+            worker.thread = std::jthread{[&, command, response = std::move(response), started = std::move(started)]() mutable {
+                started.set_value(::gettid());
+                if (command == "worker-status") {
+                    const auto reply = helper.value()->status(Action::ap_status);
+                    response.set_value(reply ? 0U : static_cast<unsigned int>(reply.error().code()));
+                } else {
+                    const Request request{command == "worker-release" ? Operation::teardown_access_point :
+                                          Operation::ensure_access_point, 36};
+                    const auto reply = helper.value()->call(request, core::Milliseconds{command == "worker-timeout" ? 100 : 1000},
+                                                           worker.cancellation.get_token());
+                    response.set_value(reply ? 0U : static_cast<unsigned int>(reply.error().code()));
+                }
+            }};
+            std::cout << ::getpid() << ' ' << tid.get() << '\n' << std::flush;
+            continue;
+        } else if (command == "stop-worker") {
+            second.cancellation.request_stop();
+            result = {};
+        } else if (command == "join-first" || command == "join-second") {
+            auto& worker = command == "join-first" ? first : second;
+            if (worker.result.wait_for(std::chrono::seconds(2)) != std::future_status::ready) return 7;
+            std::cout << worker.result.get() << '\n' << std::flush;
+            worker.thread.join();
+            continue;
+        } else if (command == "duplicate-confirm") {
+            if (!helper.value()->confirmed(core::ConsumerId{777}, core::PairingRequestId{888})) return 8;
+            result = helper.value()->confirmed(core::ConsumerId{777}, core::PairingRequestId{888});
+        } else if (command == "acquire" || command == "pair" || command == "release" || command == "wrong-source" ||
             command == "cancelled" || command == "timeout") {
             const auto op = command == "pair" ? Operation::open_pairing_window :
                             command == "release" ? Operation::teardown_access_point : Operation::ensure_access_point;

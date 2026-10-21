@@ -4,7 +4,10 @@
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include <fstream>
+#include <future>
 #include <iostream>
+#include <sstream>
 #include <thread>
 
 namespace {
@@ -32,6 +35,108 @@ std::string command(const std::string& text) {
     std::string result;
     if (!std::getline(std::cin, result)) throw std::runtime_error("fixture response missing");
     return result;
+}
+bool queued(const std::string& worker, bool owner_thread = false) {
+    std::istringstream ids{worker};
+    long pid{}, tid{};
+    ids >> pid >> tid;
+    if (owner_thread) tid = pid;
+    const auto path = "/proc/" + std::to_string(pid) + "/task/" + std::to_string(tid) + "/wchan";
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    while (std::chrono::steady_clock::now() < until) {
+        std::string wait;
+        std::ifstream{path} >> wait;
+        if (wait.find("futex") != std::string::npos) return true;
+        std::this_thread::yield();
+    }
+    return false;
+}
+class HelperConcurrency : public ::testing::Test {
+protected:
+    std::optional<BusConnection> caller;
+    void SetUp() override {
+        auto connection = BusConnection::connect_session(); ASSERT_TRUE(connection);
+        caller.emplace(std::move(connection.value()));
+        ASSERT_TRUE(caller->request_name(ipc::BusName{"org.custom.HelperConcurrentConsumer"}));
+        MessageWriter name; name.put_string("org.custom.HelperConcurrentConsumer");
+        ASSERT_EQ(control(*caller, "RegisterConsumer", "s", name).type, MessageType::method_return);
+    }
+    void TearDown() override { if (caller) (void)control(*caller, "UnregisterConsumer"); }
+    std::uint64_t confirm() {
+        const auto source = request(*caller);
+        MessageWriter body; body.put_u64(source);
+        EXPECT_EQ(control(*caller, "ConfirmPhonePairing", "t", body).type, MessageType::method_return);
+        return source;
+    }
+};
+TEST_F(HelperConcurrency, CancelledWaiterCannotInterruptOwnerOrConsumeGrant) {
+    // Given an issued grant and A held inside the real backend.
+    confirm();
+    command("worker-release");
+    ASSERT_EQ(command("wait-entered"), "entered");
+    const auto worker = command("worker-acquire");
+    EXPECT_TRUE(queued(worker));
+    // When B is cancelled while demonstrably waiting for transaction ownership.
+    EXPECT_EQ(command("stop-worker"), "0");
+    EXPECT_EQ(command("join-second"), "2");
+    // Then B finishes before A is released, without damaging A or its grant.
+    EXPECT_EQ(command("release-held"), "released");
+    EXPECT_EQ(command("join-first"), "0");
+    EXPECT_EQ(command("acquire"), "0");
+    EXPECT_EQ(command("status"), "0");
+    EXPECT_EQ(command("reconnect"), "0");
+}
+TEST_F(HelperConcurrency, DeadlineExpiresWhileQueuedWithoutConsumingGrant) {
+    // Given A held and B supplied a shorter total budget.
+    confirm();
+    command("worker-release");
+    ASSERT_EQ(command("wait-entered"), "entered");
+    command("worker-timeout");
+    // When B completes before the backend release handshake.
+    EXPECT_EQ(command("join-second"), "3");
+    EXPECT_EQ(command("release-held"), "released");
+    // Then A succeeds and B's unused grant still works on the same client.
+    EXPECT_EQ(command("join-first"), "0");
+    EXPECT_EQ(command("acquire"), "0");
+    EXPECT_EQ(command("status"), "0");
+    EXPECT_EQ(command("reconnect"), "0");
+}
+TEST_F(HelperConcurrency, ControlConfirmationAndCancelOverlapWorkers) {
+    // Given real ControlService dispatch on the receiver's owning thread.
+    const auto source = request(*caller);
+    const auto worker = command("worker-release");
+    ASSERT_EQ(command("wait-entered"), "entered");
+    MessageWriter body; body.put_u64(source);
+    // When confirmation queues behind a worker call on the very same client.
+    auto confirmation = std::async(std::launch::async, [&] { return control(*caller, "ConfirmPhonePairing", "t", body); });
+    EXPECT_TRUE(queued(worker, true));
+    EXPECT_EQ(command("release-held"), "released");
+    EXPECT_EQ(confirmation.get().type, MessageType::method_return);
+    EXPECT_EQ(command("join-first"), "0");
+    command("worker-release");
+    ASSERT_EQ(command("wait-entered"), "entered");
+    const auto status = command("worker-status");
+    EXPECT_TRUE(queued(status));
+    auto cancel = std::async(std::launch::async, [&] { return control(*caller, "CancelPhonePairing", "t", body); });
+    EXPECT_TRUE(queued(worker, true));
+    EXPECT_EQ(command("release-held"), "released");
+    // Then both worker replies remain intact and unused cancelled grants reject.
+    EXPECT_EQ(cancel.get().type, MessageType::method_return);
+    EXPECT_EQ(command("join-first"), "0");
+    EXPECT_EQ(command("join-second"), "0");
+    EXPECT_EQ(command("acquire"), "1001");
+    EXPECT_EQ(command("pair"), "1001");
+    EXPECT_EQ(command("status"), "0");
+    EXPECT_EQ(command("reconnect"), "0");
+}
+TEST_F(HelperConcurrency, DuplicateConfirmationFailureInvalidatesWithoutRecursiveLock) {
+    // Given a source already confirmed directly on the store-owner thread.
+    // When the helper rejects duplicate issuance, cleanup must not relock.
+    EXPECT_EQ(command("duplicate-confirm"), "1001");
+    // Then local grants are unusable and the same connection remains healthy.
+    EXPECT_EQ(command("acquire"), "1001");
+    EXPECT_EQ(command("pair"), "1001");
+    EXPECT_EQ(command("status"), "0");
 }
 TEST(HelperBus, RegisteredConsumerTrustConfirmationAndRevocation) {
     auto caller = BusConnection::connect_session(); ASSERT_TRUE(caller);

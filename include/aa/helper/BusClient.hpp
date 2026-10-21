@@ -7,6 +7,13 @@
 #include <memory>
 
 namespace aa::helper {
+// Confirmation and HelperClient operations may share an instance across threads;
+// complete transactions (including local grants and cancellation) are serialized.
+// The store remains session-thread-owned: reconnect must run on its owner thread,
+// as must all external store access/mutation. This mutex does not protect the store.
+// call/confirmed/status/reconnect budgets include waiting for transaction ownership.
+// Void invalidations wait for ownership, then allow 500ms for remote cleanup.
+// Destruction requires all callers to have finished.
 class BusClient final : public HelperClient, public Confirmation {
 public:
     static core::Result<std::unique_ptr<BusClient>> system(trust::ApprovedPhoneStore& store);
