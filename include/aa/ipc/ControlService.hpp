@@ -2,6 +2,7 @@
 #pragma once
 
 #include <aa/core/Ids.hpp>
+#include <aa/helper/Confirmation.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/ipc/Control.hpp>
 #include <aa/ipc/PairingGate.hpp>
@@ -142,6 +143,7 @@ struct ControlServiceDeps final {
     ControlEventSink& events;
     PairingIdSource& pairing_ids;
     PhoneDirectory& phones;
+    helper::Confirmation* confirmation{nullptr};
 };
 
 // Session D-Bus control dispatcher (task 21) for
@@ -162,7 +164,7 @@ class ControlService final {
 public:
     ControlService(ControlServiceConfig config, ControlServiceDeps deps)
         : config_(config), credentials_(deps.credentials), events_(deps.events),
-          phones_(deps.phones), gate_(deps.pairing_ids) {}
+          phones_(deps.phones), gate_(deps.pairing_ids), confirmation_(deps.confirmation) {}
 
     // RegisterConsumer / UnregisterConsumer.
     [[nodiscard]] core::Result<core::ConsumerId> register_consumer(const BusName& caller,
@@ -180,6 +182,9 @@ public:
     // (task 24) MUST call this while idle: lookup-on-use cannot detect an idle
     // disconnect on its own.
     void refresh_consumer_owner();
+    void shutdown() {
+        if (registered_) teardown("consumer_unregistered", DiagnosticSeverity::info);
+    }
 
     // StartProjection / StopProjection.
     [[nodiscard]] core::Result<void> start_projection(const BusName& caller);
@@ -235,6 +240,7 @@ private:
     ControlEventSink& events_;
     PhoneDirectory& phones_;
     PairingGate gate_;
+    helper::Confirmation* confirmation_{};
     std::optional<Registered> registered_{};
     ProjectionState projection_{ProjectionState::stopped};
     std::optional<Viewport> viewport_{};
