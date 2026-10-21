@@ -50,8 +50,11 @@ producing an avoidable startup failure and relying on the service to recover.
 ## Verify
 
 ```bash
-iw reg get    # expect: phy#0 (self-managed) country US: DFS-FCC with the full rule table
-iw phy        # expect: ch 36/44/48/149 without NO-IR; 5 GHz power up to 23-30 dBm
+iw dev wlP1p1s0 info   # resolve the wiphy index for the target interface; do not assume phy#0
+iw reg get             # in that phy's (self-managed) section, expect: country US: DFS-FCC,
+                       # full rule table
+iw phy                 # expect ch 36/44/48/149 without NO-IR; the dBm figures are the
+                       # configured regulatory rule limits, not measured transmit power
 lsmod | grep rtl8822ce_regd_shim
 systemctl is-active rtl8822ce-regd-watchdog   # holds the domain after mode transitions
 ```
@@ -82,6 +85,52 @@ sudo reboot   # regd returns to the driver's default (world)
   forces a channel switch (CSA) off ch 36 to ch 44 for AP operation (documented in
   the evidence store; a source patch is the separate B-route option).
 - Bluetooth (hci0/BlueZ) is untouched; coexistence behavior is unchanged by this module.
+
+## Requalification after kernel or driver changes (issue #38)
+
+The 2026-10-10/11 receipts (see Evidence below) were captured on one specific
+stack: kernel `6.8.12-1021-tegra` with `rtl8822ce` v5.14.0.4-261-g3e7be62b5 COEX.
+They do not transfer automatically. After any kernel, driver, shim, or watchdog
+change, run this checklist on the device during an explicit maintenance window
+(it runs nowhere else; none of it executes in CI or on the host):
+
+1. **Record identity.** Capture `uname -r`, the `rtl8822ce` driver version
+   (`modinfo rtl8822ce`), the shim source and built module (source SHA-256 plus
+   `modinfo rtl8822ce-regd-shim.ko`), and the watchdog script hash. A
+   requalification receipt names all four.
+2. **Rebuild on-target.** Build against the running kernel's headers exactly as
+   in the Install section; the existing `-Wall -Werror` flags must stay clean.
+   A module built against different headers proves nothing about the new stack.
+3. **Cold-boot ordering.** Reboot with both units enabled and save
+   `journalctl -b -u rtl8822ce-regd-shim.service -u rtl8822ce-regd-watchdog.service`:
+   the device-ordered unit must load the shim only after the netdev exists (no
+   `-ENODEV`), and the watchdog must start and stay active.
+4. **Verify the actual target wiphy.** Resolve the phy index from the interface
+   (`iw dev <iface> info`; do not assume `phy#0`) and confirm that phy's
+   `iw reg get` section reads `country US: DFS-FCC` with the full rule table
+   after boot.
+5. **Mode-transition drift and recovery.** Exercise AP/STA transitions and show
+   via journal plus `iw reg get` that any drift back to `country 00` is
+   re-asserted by the watchdog on its poll cycle.
+6. **Bounded AP/client association.** Re-run the isolated AP and
+   client-association check inside the existing qualified scope: ch 44 / 20 MHz
+   AP, not ch 36 (the vendor driver forces a CSA 36 to 44). Keep the evidence
+   pattern of the original qual runs (journal-valid cycles, `iw` captures).
+
+Scope reminders for any requalification:
+
+- Deployment intent is US-only. The shim registers the standard US rule set and
+  power stays the driver's conservative table; RF maximization is not a goal.
+- Historical receipts are evidence for the recorded stack only. After a kernel
+  or driver change they are review inputs, not automatic qualification.
+- The wireless gate status (`ap_startup_s` measured, `session_reconnect_s`
+  unmeasured, claim 3 withdrawn) lives in
+  [docs/capability-gate.md](../../../docs/capability-gate.md); this README does
+  not change it. Existing qualification evidence is local-only (see Evidence
+  below; the `.omo/` store is git-ignored and not part of the public tree).
+- Host-side tests of the watchdog script run with mocked commands. They do not
+  compile or load the out-of-tree module, touch hardware, or prove AP behavior
+  or a full wireless session. Receiver host/ARM64 CI is not module qualification.
 
 ## License
 
