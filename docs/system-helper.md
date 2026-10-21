@@ -48,10 +48,27 @@ configuration generation or installation/activation in this implementation.
 
 `packaging/systemd/aa-system-helper.service` is a reference root service;
 `packaging/dbus/org.custom.AndroidAutoSystemHelper.conf` reserves bus ownership
-for root and permits method delivery to the versioned interface. Delivery
-permission is **not** authorization: every helper method authenticates the
-receiver. Review sandbox/ptrace/proc access against the deployed receiver and
-system-bus policy before installation. No systemd D-Bus activation file is
+for root and denies helper method delivery by default. Installation must add a
+root-owned, non-writable policy fragment granting delivery only to the explicitly
+provisioned receiver account, whose numeric UID must match `session.uid`. For
+example, substitute that actual numeric UID for `RECEIVER_UID` before installing
+this fragment; never install the unresolved placeholder or a default-context
+allow rule:
+
+```xml
+<busconfig>
+  <policy user="RECEIVER_UID">
+    <allow send_destination="org.custom.AndroidAutoSystemHelper"
+           send_interface="org.custom.AndroidAutoSystemHelper1"
+           send_type="method_call"/>
+  </policy>
+</busconfig>
+```
+
+Without this explicit per-user provisioning the receiver is denied access.
+Delivery permission is **not** authorization: every helper method still
+authenticates the receiver. Review sandbox/ptrace/proc access against the deployed
+receiver and system-bus policy before installation. No systemd D-Bus activation file is
 provided. No unit/policy was installed or activated during host verification.
 
 Production takes no arguments and always connects to
@@ -66,7 +83,17 @@ The recording backend exists only in the separate test fixture executable.
 ## Receiver integration and partial effects
 
 Inject `helper::BusClient` through the optional `ControlBusService::Deps`
-`confirmation` pointer (and use that same instance as `HelperClient`). Existing
+`confirmation` pointer (and use that same instance as `HelperClient`). One internal
+transaction lock serializes all confirmation, cancellation, status, reconnect and
+effect calls, including grant-state changes and the entire socket RPC/reply.
+Both Issue calls for a confirmation hold the same lock. Private failure cleanup
+uses the existing lock rather than acquiring it recursively.
+
+This lock does not make `ApprovedPhoneStore` thread-safe. All trust-store reads
+and mutations, including `reconnect()` lookup and control/trust dispatch, must
+remain on the store-owning session thread as required by its existing contract.
+The helper-only operations can share the client from another thread; destruction
+requires callers to have finished. Existing
 wired clients without this dependency retain their original behavior; they do
 not gain helper authority. The actual `ControlService::confirm_phone_pairing`
 path invokes it only after registered-consumer UID/name authorization,
@@ -148,12 +175,22 @@ Test backends are nonblocking; future production backends must provide bounded
 cleanup and persist/reconcile external leases across helper SIGKILL/crash.
 There are no real external leases to recover in this reference backend.
 
-Credential RPCs share an absolute 500 ms deadline, helper export read/reply
-steps 500 ms, typed client RPCs at most 1 second, and confirmation's two Issue
-RPCs share 1 second. The raw transport does not reset a timeout for each byte
-or skipped message. Cancellation shuts down the client's dedicated connection;
-recreate it to resume. A cancelled/failed RPC may have consumed a grant or
-applied an effect; cancellation is not transactional rollback.
+Credential RPCs share an absolute 500 ms deadline and helper export read/reply
+steps 500 ms. Typed client calls use the caller's timeout capped at one second;
+confirmation's two Issue RPCs, status and reconnect each use a one-second budget.
+These budgets begin before transaction-lock acquisition and include waiting.
+Confirmation failure cleanup uses only the original budget's remaining time.
+Void invalidation first waits for transaction ownership so local authority is
+always erased, then allows 500 ms for its remote attempt; that is not a total
+500 ms bound including lock waiting. The raw transport does not reset a timeout
+for each byte or skipped message.
+
+A call cancelled while waiting for ownership returns without consuming a grant
+or touching the socket. Once it owns the transaction, cancellation shuts down
+the client's dedicated connection; recreate it to resume. The cancellation
+callback is destroyed before transaction ownership is released, so it cannot
+interrupt a later caller. A cancelled/failed RPC may already have consumed a
+grant or applied an effect; cancellation is not transactional rollback.
 
 ## Host verification and deferred qualification
 
@@ -177,6 +214,20 @@ millisecond for four seconds. Cleanup's 10-second absolute deadline starts
 before killing the receiver or terminating the private bus, including process
 wait time, not after the disconnect has already completed.
 
+The shared-client contention cases hold a recording backend RPC open using an
+entered/release handshake, then exercise queued cancellation, queued timeout,
+and real control confirmation/cancellation on the same client. Queued calls must
+leave the active RPC, socket health and unused grant intact. Duplicate-confirm
+failure also exercises cleanup without recursive locking. The delivery-policy
+test loads the packaged policy into private buses: default access is denied;
+an explicit fixture-UID delivery grant still requires executable authentication.
+
 Real AP, USB-policy verification, ModemManager exclusion, BlueZ pairing/profile
 effects, target service/sandbox integration and Jetson RSS/timing qualification
 are **deferred**. Host fixture success is not wireless or target acceptance.
+
+The synthetic cross-smoke sysroot does not contain OpenSSL development inputs.
+Like the TLS qualification targets, the helper is explicitly unavailable in
+that configuration; native host helper tests remain mandatory. The cross-smoke
+configuration regression verifies that no target OpenSSL lookup is attempted,
+not that the helper has been cross-built or qualified on ARM64.
