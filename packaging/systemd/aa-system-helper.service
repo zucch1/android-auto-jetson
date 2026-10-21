@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Unit]
+Description=Android Auto reference privileged system helper
+Requires=dbus.service
+After=dbus.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/libexec/aa-system-helper
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+RestrictSUIDSGID=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

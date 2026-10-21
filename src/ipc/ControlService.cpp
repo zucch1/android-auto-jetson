@@ -24,6 +24,9 @@ core::Result<ControlService::Registered> ControlService::require_consumer() {
 
 void ControlService::teardown(std::string_view reason, DiagnosticSeverity severity) {
     const auto consumer = registered_->consumer;
+    if (confirmation_ != nullptr) {
+        confirmation_->teardown(consumer);
+    }
     if (projection_ == ProjectionState::projecting) {
         projection_ = ProjectionState::stopped;
         events_.emit(StateChanged{ProjectionState::stopped, consumer});
@@ -161,6 +164,9 @@ core::Result<core::PairingRequestId> ControlService::request_add_phone(const Bus
     // PairingClosed) before a new request can be admitted, or dead pairings
     // would hold the admission budget hostage until restart.
     for (const auto expired : phones_.reap_expired()) {
+        if (confirmation_ != nullptr) {
+            confirmation_->cancel(active.value().consumer, expired);
+        }
         (void)gate_.cancel({active.value().consumer, active.value().name}, expired);
         events_.emit(PairingClosed{expired});
     }
@@ -210,6 +216,17 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller,
             DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return approved.error();
     }
+    if (confirmation_ != nullptr) {
+        const auto granted = confirmation_->confirmed(active.value().consumer, request);
+        if (!granted.has_value()) {
+            // Trust may already be durably approved. Only the helper window
+            // failed; do not claim or attempt a trust-store rollback.
+            confirmation_->cancel(active.value().consumer, request);
+            (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+            events_.emit(PairingClosed{request});
+            return granted.error();
+        }
+    }
     events_.emit(PairingOpened{request});
     events_.emit(
         DiagnosticEmitted{DiagnosticSeverity::info, "pairing_opened", request.value});
@@ -233,6 +250,9 @@ core::Result<void> ControlService::cancel_phone_pairing(const BusName& caller,
         return closed.error();
     }
     phones_.pairing_cancelled(request);
+    if (confirmation_ != nullptr) {
+        confirmation_->cancel(active.value().consumer, request);
+    }
     events_.emit(PairingClosed{request});
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_closed", request.value});
     return {};
@@ -251,6 +271,10 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
         return Error{ErrorCode::invalid_argument};
     }
     const auto forgotten = phones_.forget(phone);
+    if (confirmation_ != nullptr &&
+        (forgotten.has_value() || forgotten.error().code() == ErrorCode::trust_store_not_durable)) {
+        confirmation_->forgotten();
+    }
     // Reconcile BEFORE returning any forget error: when the revocation
     // landed (durable or committed-but-not-durable) every request it
     // invalidated gets its gate entry cancelled and exactly one PairingClosed.

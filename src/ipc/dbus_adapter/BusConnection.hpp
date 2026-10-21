@@ -15,6 +15,8 @@
 #include "BusWire.hpp"
 
 #include <cstdint>
+#include <chrono>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -31,6 +33,10 @@ public:
     // Connects to the session bus named by DBUS_SESSION_BUS_ADDRESS
     // (unix:path=... or unix:abstract=...) and completes AUTH EXTERNAL + Hello.
     [[nodiscard]] static core::Result<BusConnection> connect_session();
+    [[nodiscard]] static core::Result<BusConnection> connect_system();
+    [[nodiscard]] static core::Result<BusConnection> connect_private(std::string_view address);
+    void deadline(std::chrono::steady_clock::time_point until) { deadline_ = until; }
+    void clear_deadline() { deadline_.reset(); }
 
     [[nodiscard]] const BusName& unique_name() const noexcept { return unique_name_; }
 
@@ -44,6 +50,7 @@ public:
     [[nodiscard]] core::Result<void> add_match(std::string_view rule);
     [[nodiscard]] core::Result<BusName> get_name_owner(const BusName& name);
     [[nodiscard]] core::Result<std::uint32_t> get_connection_unix_uid(const BusName& name);
+    [[nodiscard]] core::Result<std::uint32_t> get_connection_unix_pid(const BusName& name);
 
     // Poll handle for caller-driven dispatch loops (same pattern as the video
     // channel's native_handle()): readable when read_message() will not block.
@@ -84,6 +91,7 @@ private:
     int fd_{-1};
     std::uint32_t next_serial_{1};
     BusName unique_name_{};
+    std::optional<std::chrono::steady_clock::time_point> deadline_;
 };
 
 // Maps a daemon-delivered message to the dispatch boundary input. The caller
