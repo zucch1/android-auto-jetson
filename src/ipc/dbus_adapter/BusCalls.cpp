@@ -26,7 +26,7 @@ constexpr std::string_view kDaemonPath = "/org/freedesktop/DBus";
 core::Result<std::uint32_t> BusConnection::send_message(MessageType type,
                                                         const MessageWriter& message) {
     const std::uint32_t serial = next_serial_++;
-    const auto sent = bus_io::write_full(fd_, message.build(type, serial));
+    const auto sent = bus_io::write_full(fd_, message.build(type, serial), deadline_.value_or(bus_io::deadline()));
     if (!sent.has_value()) {
         return sent.error();
     }
@@ -36,6 +36,13 @@ core::Result<std::uint32_t> BusConnection::send_message(MessageType type,
 core::Result<ParsedMessage> BusConnection::await_reply(std::uint32_t serial,
                                                        const BusName& expected_sender) {
     bool saw_forged = false;
+    const auto previous = deadline_;
+    deadline_ = deadline_.value_or(bus_io::deadline());
+    struct Restore {
+        decltype(deadline_)& target;
+        decltype(deadline_) value;
+        ~Restore() { target = value; }
+    } restore{deadline_, previous};
     for (int skipped = 0; skipped < kMaxSkippedMessages; ++skipped) {
         auto message = read_message();
         if (!message.has_value()) {
@@ -200,6 +207,15 @@ core::Result<std::uint32_t> BusConnection::get_connection_unix_uid(const BusName
     if (reply.value().type == MessageType::error_reply) {
         return Error{ErrorCode::ipc_peer_unauthorized};
     }
+    return reply_u32(reply.value());
+}
+
+core::Result<std::uint32_t> BusConnection::get_connection_unix_pid(const BusName& name) {
+    MessageWriter body;
+    body.put_string(name.value);
+    const auto reply = call("GetConnectionUnixProcessID", "s", body);
+    if (!reply || reply.value().type == MessageType::error_reply)
+        return Error{ErrorCode::ipc_peer_unauthorized};
     return reply_u32(reply.value());
 }
 

@@ -11,6 +11,7 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace aa::ipc::dbus_adapter {
@@ -62,7 +63,7 @@ BusConnection::~BusConnection() {
 }
 
 BusConnection::BusConnection(BusConnection&& other) noexcept
-    : fd_(other.fd_), next_serial_(other.next_serial_), unique_name_(std::move(other.unique_name_)) {
+    : fd_(other.fd_), next_serial_(other.next_serial_), unique_name_(std::move(other.unique_name_)), deadline_(other.deadline_) {
     other.fd_ = -1;
 }
 
@@ -74,6 +75,7 @@ BusConnection& BusConnection::operator=(BusConnection&& other) noexcept {
         fd_ = other.fd_;
         next_serial_ = other.next_serial_;
         unique_name_ = std::move(other.unique_name_);
+        deadline_ = other.deadline_;
         other.fd_ = -1;
     }
     return *this;
@@ -81,7 +83,8 @@ BusConnection& BusConnection::operator=(BusConnection&& other) noexcept {
 
 core::Result<ParsedMessage> BusConnection::read_message() {
     std::array<std::uint8_t, 16> head{};
-    const auto got_head = bus_io::read_full(fd_, head);
+    const auto until = deadline_.value_or(bus_io::deadline());
+    const auto got_head = bus_io::read_full(fd_, head, until);
     if (!got_head.has_value()) {
         return got_head.error();
     }
@@ -92,7 +95,7 @@ core::Result<ParsedMessage> BusConnection::read_message() {
     std::vector<std::uint8_t> bytes(total.value());
     std::copy(head.begin(), head.end(), bytes.begin());
     const auto got_rest =
-        bus_io::read_full(fd_, std::span<std::uint8_t>{bytes}.subspan(head.size()));
+        bus_io::read_full(fd_, std::span<std::uint8_t>{bytes}.subspan(head.size()), until);
     if (!got_rest.has_value()) {
         return got_rest.error();
     }
@@ -101,9 +104,10 @@ core::Result<ParsedMessage> BusConnection::read_message() {
 
 core::Result<std::string> BusConnection::read_line() {
     std::string line;
+    const auto until = deadline_.value_or(bus_io::deadline());
     while (line.size() < kMaxLineBytes) {
         std::array<std::uint8_t, 1> byte{};
-        const auto got = bus_io::read_full(fd_, byte);
+        const auto got = bus_io::read_full(fd_, byte, until);
         if (!got.has_value()) {
             return got.error();
         }
@@ -132,7 +136,7 @@ core::Result<void> BusConnection::authenticate() {
     auth += "\r\n";
     const auto sent = bus_io::write_full(
         fd_, std::span<const std::uint8_t>{
-                 reinterpret_cast<const std::uint8_t*>(auth.data()), auth.size()});
+                 reinterpret_cast<const std::uint8_t*>(auth.data()), auth.size()}, deadline_.value_or(bus_io::deadline()));
     if (!sent.has_value()) {
         return sent.error();
     }
@@ -146,7 +150,7 @@ core::Result<void> BusConnection::authenticate() {
     const std::string begin = "BEGIN\r\n";
     return bus_io::write_full(
         fd_, std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(begin.data()),
-                                           begin.size()});
+                                           begin.size()}, deadline_.value_or(bus_io::deadline()));
 }
 
 core::Result<BusConnection> BusConnection::connect_session() {
@@ -154,8 +158,17 @@ core::Result<BusConnection> BusConnection::connect_session() {
     if (environment == nullptr) {
         return Error{ErrorCode::transport_unavailable};
     }
+    return connect_private(environment);
+}
+
+core::Result<BusConnection> BusConnection::connect_system() {
+    return connect_private("unix:path=/run/dbus/system_bus_socket");
+}
+
+core::Result<BusConnection> BusConnection::connect_private(std::string_view bus_address) {
+    const auto until = bus_io::deadline();
     Endpoint endpoint;
-    if (!session_address(environment, endpoint)) {
+    if (!session_address(bus_address, endpoint)) {
         return Error{ErrorCode::transport_unavailable};
     }
     sockaddr_un address{};
@@ -175,16 +188,23 @@ core::Result<BusConnection> BusConnection::connect_session() {
         std::memcpy(address.sun_path + 1, endpoint.value.data(), endpoint.value.size());
         length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + endpoint.value.size());
     }
-    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) {
         return Error{ErrorCode::transport_io};
     }
     if (::connect(fd, reinterpret_cast<sockaddr*>(&address), length) != 0) {
-        ::close(fd);
-        return Error{ErrorCode::transport_unavailable};
+        ::pollfd poller{fd, POLLOUT, 0};
+        int error{};
+        socklen_t size = sizeof(error);
+        if (errno != EINPROGRESS || ::poll(&poller, 1, bus_io::remaining(until)) <= 0 ||
+            ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0 || error != 0) {
+            ::close(fd);
+            return Error{ErrorCode::transport_unavailable};
+        }
     }
     BusConnection connection;
     connection.fd_ = fd;
+    connection.deadline(until);
     const auto auth = connection.authenticate();
     if (!auth.has_value()) {
         return auth.error();
@@ -205,6 +225,7 @@ core::Result<BusConnection> BusConnection::connect_session() {
         return Error{ErrorCode::transport_unauthorized_peer};
     }
     connection.unique_name_ = BusName{name.value()};
+    connection.clear_deadline();
     return connection;
 }
 
