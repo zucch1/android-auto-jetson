@@ -30,7 +30,7 @@ case "$name" in
       if [[ $phy != missing ]]; then printf 'Interface %s\n\twiphy %s\n' "$2" "$phy"; fi
       exit "$status"
     fi
-    country=${BEFORE_COUNTRY:-00:}
+    country=${BEFORE_COUNTRY-00:}
     phy=${BEFORE_PHY:-0}
     status=${BEFORE_REG_STATUS:-0}
     if (( loads > 0 )); then
@@ -39,10 +39,13 @@ case "$name" in
       status=${AFTER_REG_STATUS:-0}
       if (( loads >= ${RECOVER_AT:-999} )); then country=US:; status=0; fi
     fi
+    if [[ ${REG_EMPTY:-0} == 1 ]]; then exit "$status"; fi
     printf 'global\ncountry US: DFS-FCC\nphy#9 (self-managed)\ncountry US: DFS-FCC\n'
-    if [[ $phy != missing ]]; then
+    if [[ $phy != missing && ${REG_SECTION:-present} != missing ]]; then
       printf 'phy#%s (self-managed)\n' "$phy"
-      if [[ $country != missing ]]; then printf 'country %s DFS-FCC\n' "$country"; fi
+      if [[ $country != missing ]]; then
+        printf 'country %s\n' "$country"
+      fi
     fi
     # A stale wiphy can still be US while the newly resolved target is not.
     if [[ $phy != 0 ]]; then printf 'phy#0 (self-managed)\ncountry US: DFS-FCC\n'; fi
@@ -102,11 +105,13 @@ class Watchdog(unittest.TestCase):
                              ['sleep 5'] * int(settings.get('POLLS', '1')))
             return trace
 
-    def assert_verified(self, trace: list[str], present: bool) -> None:
+    def assert_verified(self, trace: list[str], present: bool, iface: str = 'wlan-test') -> None:
         success = [i for i, line in enumerate(trace) if ' ok' in line]
         self.assertEqual(len(success), 1, trace)
-        loaded = trace.index('modprobe rtl8822ce_regd_shim')
-        self.assertIn('iw dev wlan-test info', trace[loaded + 1:success[0]])
+        loader = f'modprobe rtl8822ce_regd_shim ifname={iface}'
+        self.assertEqual([line for line in trace if line.startswith('modprobe ')], [loader])
+        loaded = trace.index(loader)
+        self.assertIn(f'iw dev {iface} info', trace[loaded + 1:success[0]])
         self.assertIn('iw reg get', trace[loaded + 1:success[0]])
         self.assertIn('country US:', trace[success[0]])
         self.assertEqual('rmmod rtl8822ce_regd_shim' in trace, present)
@@ -123,11 +128,13 @@ class Watchdog(unittest.TestCase):
 
     def test_load_verifies_target_in_both_branches(self) -> None:
         for present in (False, True):
-            with self.subTest(present=present):
-                # Given drift; when loaded/reloaded; then only verified US is success.
-                trace = self.run_watchdog({'PRESENT': str(int(present)), 'REG_PADDING': '1',
-                                           'MODULE_PADDING': '1'}, 'wlan-test')
-                self.assert_verified(trace, present)
+            for iface in ('', 'wlan-test'):
+                for country in ('00:', 'CA:'):
+                    with self.subTest(present=present, iface=iface, country=country):
+                        # Given drift; when loaded/reloaded; then target argv and US are verified.
+                        trace = self.run_watchdog({'PRESENT': str(int(present)), 'REG_PADDING': '1',
+                                                   'MODULE_PADDING': '1', 'BEFORE_COUNTRY': country}, iface)
+                        self.assert_verified(trace, present, iface or 'wlP1p1s0')
 
     def test_failed_load_retries_in_both_branches(self) -> None:
         for present in (False, True):
@@ -135,14 +142,14 @@ class Watchdog(unittest.TestCase):
                 # Given a loader failure; when two polls run; then both attempt recovery.
                 trace = self.run_watchdog({'PRESENT': str(int(present)), 'LOAD_STATUS': '1', 'POLLS': '2'})
                 self.assert_retry(trace)
-                self.assertEqual(trace.count('modprobe rtl8822ce_regd_shim'), 2)
+                self.assertEqual(trace.count('modprobe rtl8822ce_regd_shim ifname=wlP1p1s0'), 2)
 
     def test_busy_unload_retries_without_loading(self) -> None:
         # Given a busy module; when two polls run; then unloading is retried safely.
         trace = self.run_watchdog({'UNLOAD_STATUS': '1', 'POLLS': '2'})
         self.assert_retry(trace)
         self.assertEqual(trace.count('rmmod rtl8822ce_regd_shim'), 2)
-        self.assertNotIn('modprobe rtl8822ce_regd_shim', trace)
+        self.assertFalse(any(line.startswith('modprobe ') for line in trace))
 
     def test_unresolved_interface_skips_load(self) -> None:
         for failure in ({'BEFORE_PHY': 'missing'}, {'DEV_STATUS': '1'}):
@@ -150,7 +157,7 @@ class Watchdog(unittest.TestCase):
                 # Given no usable interface; when polled; then no other-phy fallback occurs.
                 trace = self.run_watchdog(failure)
                 self.assert_retry(trace)
-                self.assertNotIn('modprobe rtl8822ce_regd_shim', trace)
+                self.assertFalse(any(line.startswith('modprobe ') for line in trace))
                 self.assertNotIn('iw reg get', trace)
 
     def test_failed_verification_retries_in_both_branches(self) -> None:
@@ -164,13 +171,25 @@ class Watchdog(unittest.TestCase):
                     # Given invalid evidence plus unrelated US; when loaded; then warn, not success.
                     trace = self.run_watchdog(dict(failure, PRESENT=str(int(present))))
                     self.assert_retry(trace)
-                    self.assertIn('modprobe rtl8822ce_regd_shim', trace)
+                    self.assertIn('modprobe rtl8822ce_regd_shim ifname=wlP1p1s0', trace)
                     self.assertTrue(any('WARN:' in line for line in trace), trace)
 
     def test_failed_initial_iw_output_cannot_mask_drift(self) -> None:
-        # Given plausible US on a failing iw; when polled; then recovery is attempted.
-        trace = self.run_watchdog({'BEFORE_COUNTRY': 'US:', 'BEFORE_REG_STATUS': '1'}, 'wlan-test')
-        self.assert_verified(trace, True)
+        failures = ({'BEFORE_COUNTRY': 'US:', 'BEFORE_REG_STATUS': '1'},
+                    {'BEFORE_COUNTRY': '00:', 'BEFORE_REG_STATUS': '1'},
+                    {'BEFORE_COUNTRY': 'missing'}, {'BEFORE_COUNTRY': ''},
+                    {'REG_EMPTY': '1'}, {'REG_SECTION': 'missing'})
+        for present in (False, True):
+            for failure in failures:
+                with self.subTest(present=present, failure=failure):
+                    # Given unknown country; when two polls run; then observe again, never mutate.
+                    trace = self.run_watchdog(dict(failure, PRESENT=str(int(present)), POLLS='2'))
+                    self.assertFalse(any(line.startswith(('lsmod ', 'rmmod ', 'modprobe '))
+                                         for line in trace), trace)
+                    self.assert_retry(trace)
+                    self.assertEqual(sum('WARN:' in line for line in trace), 2)
+                    polls = [line for line in trace if line.startswith(('iw ', 'sleep '))]
+                    self.assertEqual(polls, ['iw dev wlP1p1s0 info', 'iw reg get', 'sleep 5'] * 2)
 
     def test_new_wiphy_is_resolved_after_loading(self) -> None:
         for present in (False, True):
@@ -187,7 +206,7 @@ class Watchdog(unittest.TestCase):
                                            'RECOVER_AT': '2', 'POLLS': '2'})
                 first_poll = trace.index('sleep 5')
                 self.assert_retry(trace[:first_poll])
-                self.assertEqual(trace.count('modprobe rtl8822ce_regd_shim'), 2)
+                self.assertEqual(trace.count('modprobe rtl8822ce_regd_shim ifname=wlP1p1s0'), 2)
                 self.assertEqual(sum(' ok' in line for line in trace[first_poll + 1:]), 1)
 
 

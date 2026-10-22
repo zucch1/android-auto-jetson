@@ -38,12 +38,16 @@ while true; do
     sleep 5
     continue
   fi
-  COUNTRY=$(target_country) || COUNTRY=""
+  if ! COUNTRY=$(target_country) || [ -z "$COUNTRY" ]; then
+    logger -t regd-watchdog "WARN: cannot observe target country for $IFACE — retry next cycle"
+    sleep 5
+    continue
+  fi
   if [ "$COUNTRY" != "US:" ]; then
     logger -t regd-watchdog "drift detected (phy#${WIPHY_IDX} != country US) — re-asserting"
     if lsmod 2>/dev/null | grep '^rtl8822ce_regd_shim' >/dev/null; then
       if rmmod rtl8822ce_regd_shim 2>/dev/null; then
-        if modprobe rtl8822ce_regd_shim 2>/dev/null; then
+        if modprobe rtl8822ce_regd_shim ifname="$IFACE" 2>/dev/null; then
           if verify_recovery; then
             logger -t regd-watchdog "re-assert ok: country ${COUNTRY}"
           else
@@ -56,7 +60,7 @@ while true; do
         logger -t regd-watchdog "WARN: rmmod failed (module busy) — retry next cycle"
       fi
     else
-      if modprobe rtl8822ce_regd_shim 2>/dev/null; then
+      if modprobe rtl8822ce_regd_shim ifname="$IFACE" 2>/dev/null; then
         if verify_recovery; then
           logger -t regd-watchdog "load ok (module was absent): country ${COUNTRY}"
         else
