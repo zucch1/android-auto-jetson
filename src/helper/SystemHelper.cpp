@@ -111,7 +111,10 @@ core::Result<void> SystemHelper::invalidate(const std::string& sender, Source so
     });
     if (lease_ && (!source.generation || !lease_->generation || source.generation == lease_->generation) &&
         (!source.confirmation || source.confirmation == lease_->confirmation)) {
-        backend_.cleanup();
+        // Matching bindings were discarded above; a single-source retirement
+        // must not destroy observations still bound to other live sources.
+        if (source.confirmation) backend_.retire_lease();
+        else backend_.cleanup(); // wildcard teardown retains full cleanup
         lease_.reset();
     }
     return {};

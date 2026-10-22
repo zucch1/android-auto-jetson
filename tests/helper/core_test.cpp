@@ -17,13 +17,14 @@ public:
 };
 class Effects final : public Backend {
 public:
-    int calls{}, cleanups{}, discarded{};
+    int calls{}, cleanups{}, discarded{}, lease_cleanups{};
     bool fail{};
     core::Result<State> apply(Action, std::uint32_t) override {
         ++calls;
         return fail ? core::Result<State>{Error{ErrorCode::helper_unavailable}} : core::Result<State>{State::active};
     }
     void cleanup() noexcept override { ++cleanups; }
+    void retire_lease() noexcept override { ++lease_cleanups; cleanup(); }
     core::Result<void> revoke(std::uint64_t) override { return {}; }
     void discard(std::uint64_t) override { ++discarded; }
     core::Result<State> authorize(std::uint64_t handle) override {
@@ -108,6 +109,18 @@ TEST_F(HelperCore, CancellingUnrelatedSourceCannotCleanOwningLease) {
     EXPECT_EQ(effects.cleanups, 0);
     ASSERT_TRUE(helper.invalidate(":1.2", {1, 1}));
     EXPECT_EQ(effects.cleanups, 1);
+    EXPECT_EQ(effects.lease_cleanups, 1);
+}
+TEST_F(HelperCore, WildcardTeardownAndBusLossRetainFullCleanup) {
+    // Given: a source owns active backend effects.
+    const auto owner = issue(); ASSERT_TRUE(owner);
+    ASSERT_TRUE(helper.execute(":1.2", {Action::acquire_ap, 36, owner.value()}, now));
+    // When: the whole consumer generation is torn down, then its bus is lost.
+    ASSERT_TRUE(helper.invalidate(":1.2", {1, 0}));
+    helper.bus_lost();
+    // Then: neither lifecycle cleanup uses single-source retirement.
+    EXPECT_EQ(effects.cleanups, 2);
+    EXPECT_EQ(effects.lease_cleanups, 0);
 }
 TEST_F(HelperCore, PendingAndHistoryExhaustionFailClosed) {
     for (std::size_t i = 0; i < SystemHelper::kMaxPending; ++i) ASSERT_TRUE(issue({1, i + 1}));

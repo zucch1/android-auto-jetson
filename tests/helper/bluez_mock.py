@@ -38,6 +38,7 @@ class MockBluez:
         self.bonded = False
         self.multiple = False
         self.present = True
+        self.observed_device = DEVICE
         self.fail_remove = False
         self.fail_set = False
         self.slow_inventory = False
@@ -65,7 +66,7 @@ class MockBluez:
 
     def inventory(self) -> GLib.Variant:
         objects = {ADAPTER: {"org.bluez.Adapter1": {"Address": GLib.Variant("s", "02:00:00:00:00:AA")}}}
-        paths = ([DEVICE] if self.present else []) + ([OTHER] if self.multiple else [])
+        paths = ([self.observed_device] if self.present else []) + ([OTHER] if self.multiple else [])
         for path in paths:
             objects[path] = {"org.bluez.Device1": {
                 "Address": GLib.Variant("s", "02:00:00:00:00:01" if path == DEVICE else "02:00:00:00:00:02"),
@@ -167,6 +168,8 @@ class MockBluez:
                     "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper})
             case "multiple": self.multiple = True
             case "single": self.multiple = False
+            case "observe-other": self.observed_device = OTHER
+            case "observe-first": self.observed_device = DEVICE
             case "paired": self.paired = True; self.bonded = True
             case "temporary-pair": self.paired = True; self.bonded = False
             case "unpaired": self.paired = False; self.bonded = False

@@ -264,12 +264,42 @@ def pending_ap_survives_other_phone_forget(surface: ComposedSurface) -> None:
     print("PASS composed_pending_ap_survives_other_phone_forget", flush=True)
 
 
+def pending_bind_survives_lease_owner_forget(surface: ComposedSurface) -> None:
+    # Given: wireless A owns the lease and socket; distinct B is bound but unconfirmed.
+    phone_a = surface.approve_and_acquire()
+    assert command(surface.mock, "NewConnection") == "allowed"
+    assert command(surface.mock, "fd-eof") == "open"
+    command(surface.mock, "observe-other")
+    request_b = surface.request()
+    command(surface.mock, "observe-first")
+    command(surface.mock, "multiple")
+    # When: retiring A closes its lease and removes only A's actual BlueZ bond.
+    surface.forget(phone_a)
+    assert command(surface.receiver, "pending-revocations") == "0"
+    assert surface.phone() == 0
+    assert surface.state()["removed"] == ["/org/bluez/hci0/dev_02_00_00_00_00_01"]
+    assert not surface.state()["properties"]["Pairable"] and not surface.nm_state()["active"]
+    assert command(surface.mock, "fd-eof") == "closed"
+    assert command(surface.mock, "RequestAuthorization wrong") == "rejected"
+    # Then: B's original bound observation still authorizes, without re-observing.
+    print("A retired; confirming B's original pending observation", flush=True)
+    surface.confirm(request_b)
+    assert surface.phone() not in (0, phone_a)
+    assert command(surface.mock, "RequestAuthorization") == "rejected"
+    assert command(surface.mock, "RequestAuthorization wrong") == "allowed"
+    command(surface.mock, "paired")
+    assert command(surface.mock, "AuthorizeService wrong") == "allowed"
+    assert command(surface.mock, "NewConnection wrong") == "allowed"
+    assert command(surface.mock, "fd-eof") == "open"
+    print("PASS composed_pending_bind_survives_lease_owner_forget", flush=True)
+
+
 def main() -> None:
     build = Path(sys.argv[1]).resolve()
     for scenario in (ap_complete_bond_pending, bond_complete_ap_pending, durability_and_precommit, wired_ap_only,
                      cleanup_and_unregister, unregister_after_wired_revoke, cancel_after_wired_revoke,
                      consumer_loss_after_wired_revoke, pending_bind_survives_other_phone_forget,
-                     pending_ap_survives_other_phone_forget):
+                     pending_ap_survives_other_phone_forget, pending_bind_survives_lease_owner_forget):
         with tempfile.TemporaryDirectory(prefix="cmp-", dir=build) as temporary:
             with contextlib.ExitStack() as stack:
                 scenario(ComposedSurface(stack, build, Path(temporary)))

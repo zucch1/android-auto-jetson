@@ -24,6 +24,7 @@ public:
         return Error{ErrorCode::helper_rejected};
     }
     void cleanup() noexcept override { ap_.cleanup(); bluetooth_.cleanup(); }
+    void retire_lease() noexcept override { ap_.retire_lease(); bluetooth_.retire_lease(); }
     void tick() override { ap_.tick(); bluetooth_.tick(); }
     core::Result<void> revoke(std::uint64_t phone) override { return ap_.revoke(phone); }
     core::Result<ObservedPeer> observe() override { return bluetooth_.observe(); }

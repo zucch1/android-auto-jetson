@@ -16,6 +16,7 @@ public:
     core::Result<void> revoke_peer(const PeerIdentity&) override;
     void discard(std::uint64_t) override;
     void cleanup() noexcept override;
+    void retire_lease() noexcept override;
     void tick() override;
 private:
     struct Impl;

@@ -169,6 +169,7 @@ bool BluezBackend::available() const { return impl_->bus && !g_dbus_connection_i
 void BluezBackend::tick() { impl_->pump(); }
 void BluezBackend::discard(std::uint64_t handle) { impl_->observations.erase(handle); }
 void BluezBackend::cleanup() noexcept { impl_->observations.clear(); impl_->close_window(); }
+void BluezBackend::retire_lease() noexcept { impl_->close_window(); }
 core::Result<State> BluezBackend::apply(Action action, std::uint32_t channel) {
     if (channel) return Error{ErrorCode::helper_rejected};
     switch (action) {

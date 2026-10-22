@@ -28,6 +28,9 @@ public:
     virtual core::Result<State> apply(Action action, std::uint32_t channel) = 0;
     // Internal cleanup uses the stored lease, not authentication of a dead PID.
     virtual void cleanup() noexcept = 0;
+    // Retire active lease effects without erasing other sources' pending observations.
+    // Backends without observations can use full cleanup.
+    virtual void retire_lease() noexcept { cleanup(); }
     virtual void tick() {}
     virtual core::Result<void> revoke(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
     virtual core::Result<ObservedPeer> observe() { return Error{ErrorCode::helper_unavailable}; }
