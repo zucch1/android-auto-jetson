@@ -30,6 +30,7 @@ EXPECTED = {'wireless_' + case for case in ('policy', 'discovery', 'active', 'cl
     'wireless_psk_host_transfer_argv_and_report_are_secret_free',
     'wireless_psk_nm_secret_stdin_and_failure_diagnostics',
     'wireless_psk_nm_happy_argv_and_report_are_secret_free',
+    'wireless_watchdog',
 }
 missing = EXPECTED - registered
 if missing:
