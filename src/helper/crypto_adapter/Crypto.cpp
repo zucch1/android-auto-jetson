@@ -41,4 +41,13 @@ core::Result<std::uint64_t> random_id() {
         return Error{ErrorCode::helper_unavailable};
     return id;
 }
+core::Result<std::string> random_ap_secret() {
+    std::array<unsigned char, 40> random{};
+    if (RAND_bytes(random.data(), static_cast<int>(random.size())) != 1)
+        return Error{ErrorCode::helper_unavailable};
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    for (const auto byte : random) { result += digits[byte >> 4]; result += digits[byte & 15]; }
+    return result;
+}
 }
