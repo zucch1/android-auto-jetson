@@ -115,10 +115,11 @@ A helper error closes the control gate and invalidates the source; trust may
 already be persisted and is **not rolled back**. The pre-existing
 `trust_store_not_durable` approval outcome never calls the bridge. Cancel,
 consumer teardown/owner loss, successful or committed-not-durable forget, and
-control-service shutdown invalidate helper authority. Committed forget clears
-local grants and sends narrow revocation requests; `RevokeAP1` clears helper grants
-and discards bound observations. Failed remote invalidation also discards
-local grants; the helper independently expires grants and detects receiver loss.
+control-service shutdown invalidate helper authority. Committed forget invalidates
+only the retired phone's sources locally and remotely, then sends narrow revocation
+requests. `RevokeAP1` rotates/evicts AP access without clearing unrelated grants or
+bound observations: it has no phone-to-source map. Failed remote invalidation also
+discards matching local grants; the helper independently expires grants and detects receiver loss.
 Control-service owner refresh runs at least once per second even under traffic.
 Typed effect requests may carry explicit consumer-generation/confirmation IDs;
 the zero/default selects only the bridge's current active
@@ -173,6 +174,11 @@ later missing-ID calls use normal store semantics, not indefinite success histor
 Lost replies remain unknown outcomes: this is neither globally exactly-once nor
 crash-durable revocation. NM retains its in-flight rotation latch. BlueZ managed
 identities remain process-lifetime state; after restart unknown bonds stay rejected.
+
+**Known limitation — not production qualified:** helper restart loses process-lifetime
+managed-peer knowledge. Persistent BlueZ bonds of a forgotten phone may then survive
+`ForgetPhone`. Operator recovery/crash reconciliation must be defined before
+production qualification; rejecting unknown managed identities is not bond removal.
 
 ## System bus API 1.1.0
 

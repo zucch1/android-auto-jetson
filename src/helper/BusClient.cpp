@@ -59,9 +59,8 @@ RevocationAttempt BusClient::forgotten_v1(const RevocationV1& snapshot, const Re
         if (progress.ap != RevocationLeg::complete) report.ap = Error{ErrorCode::timeout};
         return report;
     }
-    impl_->pending.clear();
-    impl_->active_source.reset();
-    impl_->ap_source.reset();
+    // ControlService derives retirements from the snapshot's identity. Their
+    // invalidate_locked calls below clear only that phone's local authority.
     const bool bond_pending = peer && progress.bond != RevocationLeg::complete;
     if (!progress.retirements.empty()) {
         const auto now = Clock::now();

@@ -120,24 +120,38 @@ TEST_F(HelperCore, PendingAndHistoryExhaustionFailClosed) {
     EXPECT_FALSE(issue({2, 9999}));
     EXPECT_FALSE(issue());
 }
-TEST_F(HelperCore, ApRevocationInvalidatesPendingButPreservesMatchingCleanupOwner) {
-    // Given
+TEST_F(HelperCore, ApRevocationPreservesUnrelatedAuthorityAndMatchingCleanupOwner) {
+    // PR64 review: global quarantine invalidated other phones. Retire exact
+    // sources via Invalidate; RevokeAP1 has no phone-to-source attribution.
+    // Given: a live unrelated owner, pending unrelated grants/binding, and a
+    // retired phone's source, as supplied by ControlService before RevokeAP1.
     const auto owner = issue({1, 1}); ASSERT_TRUE(owner);
     ASSERT_TRUE(helper.execute(":1.2", {Action::acquire_ap, 36, owner.value()}, now));
     const auto pending = issue({2, 2}); ASSERT_TRUE(pending);
+    const auto pairing = issue({2, 2}, Action::open_pairing, 0); ASSERT_TRUE(pairing);
     ASSERT_TRUE(helper.bind(":1.2", {1, 1}, 123));
-    // When
+    ASSERT_TRUE(helper.bind(":1.2", {2, 2}, 123));
+    const auto retired = issue({3, 3}); ASSERT_TRUE(retired);
+    const auto retired_pairing = issue({3, 3}, Action::open_pairing, 0); ASSERT_TRUE(retired_pairing);
+    ASSERT_TRUE(helper.bind(":1.2", {3, 3}, 123));
+    // When: retire the forgotten source idempotently, then rotate/evict AP.
+    ASSERT_TRUE(helper.invalidate(":1.2", {3, 3}));
+    ASSERT_TRUE(helper.invalidate(":1.2", {3, 3}));
     ASSERT_TRUE(helper.revoke(":1.2", 7));
-    // Then
-    EXPECT_EQ(helper.pending(), 0U);
+    // Then: retired authority is gone, unrelated grants and binding survive.
+    EXPECT_EQ(helper.pending(), 2U);
     EXPECT_EQ(effects.discarded, 1);
-    EXPECT_FALSE(helper.execute(":1.2", {Action::acquire_ap, 36, pending.value()}, now));
-    ASSERT_TRUE(helper.invalidate(":1.2", {2, 2}));
+    EXPECT_FALSE(helper.execute(":1.2", {Action::acquire_ap, 36, retired.value()}, now));
+    EXPECT_FALSE(helper.execute(":1.2", {Action::open_pairing, 0, retired_pairing.value()}, now));
     EXPECT_EQ(effects.cleanups, 0);
     ASSERT_TRUE(helper.invalidate(":1.2", {1, 1}));
     EXPECT_EQ(effects.cleanups, 1);
-    const auto pairing = issue({1, 1}, Action::open_pairing, 0); ASSERT_TRUE(pairing);
-    EXPECT_FALSE(helper.execute(":1.2", {Action::open_pairing, 0, pairing.value()}, now));
+    ASSERT_TRUE(helper.invalidate(":1.2", {1, 1}));
+    EXPECT_EQ(effects.cleanups, 1);
+    EXPECT_EQ(effects.discarded, 2);
+    ASSERT_TRUE(helper.execute(":1.2", {Action::acquire_ap, 36, pending.value()}, now));
+    ASSERT_TRUE(helper.execute(":1.2", {Action::open_pairing, 0, pairing.value()}, now));
+    EXPECT_EQ(effects.discarded, 2);
 }
 TEST(HelperBackend, ProductionNeverPretendsEffectsSucceeded) {
     UnavailableBackend backend;

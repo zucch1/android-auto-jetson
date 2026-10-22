@@ -229,11 +229,47 @@ def consumer_loss_after_wired_revoke(surface: ComposedSurface) -> None:
     print("PASS composed_consumer_owner_loss_after_wired_ap_revoke_cleans_live_peer", flush=True)
 
 
+def pending_bind_survives_other_phone_forget(surface: ComposedSurface) -> None:
+    # Given: approved wired A and wireless B's captured, unconfirmed BlueZ bind.
+    assert command(surface.receiver, "seed-wired") == "0"
+    phone_a = surface.phone()
+    request_b = surface.request()
+    # When: A's committed retirement completes before B confirms.
+    surface.forget(phone_a)
+    assert command(surface.receiver, "pending-revocations") == "0"
+    # Then: B's exact binding still opens a usable pairing window.
+    surface.confirm(request_b)
+    assert surface.phone() not in (0, phone_a)
+    assert surface.state()["properties"]["Pairable"]
+    assert command(surface.mock, "RequestAuthorization") == "allowed"
+    print("PASS composed_pending_bind_survives_other_phone_forget", flush=True)
+
+
+def pending_ap_survives_other_phone_forget(surface: ComposedSurface) -> None:
+    # Given: approved wired A and wireless B's confirmed, unconsumed AP grant.
+    assert command(surface.receiver, "seed-wired") == "0"
+    phone_a = surface.phone()
+    surface.confirm(surface.request())
+    command(surface.mock, "paired")
+    assert surface.nm_state()["starts"] == 0
+    # When: A's committed retirement completes before B acquires AP.
+    surface.forget(phone_a)
+    assert command(surface.receiver, "pending-revocations") == "0"
+    # Then: default-source lookup and both local/remote grants remain usable.
+    assert command(surface.receiver, "acquire") == "0"
+    wait(lambda: surface.nm_state()["active"])
+    assert surface.nm_state()["valid"] and surface.nm_state()["starts"] == 1
+    assert command(surface.mock, "RequestAuthorization") == "allowed"
+    assert surface.phone() not in (0, phone_a)
+    print("PASS composed_pending_ap_survives_other_phone_forget", flush=True)
+
+
 def main() -> None:
     build = Path(sys.argv[1]).resolve()
     for scenario in (ap_complete_bond_pending, bond_complete_ap_pending, durability_and_precommit, wired_ap_only,
                      cleanup_and_unregister, unregister_after_wired_revoke, cancel_after_wired_revoke,
-                     consumer_loss_after_wired_revoke):
+                     consumer_loss_after_wired_revoke, pending_bind_survives_other_phone_forget,
+                     pending_ap_survives_other_phone_forget):
         with tempfile.TemporaryDirectory(prefix="cmp-", dir=build) as temporary:
             with contextlib.ExitStack() as stack:
                 scenario(ComposedSurface(stack, build, Path(temporary)))

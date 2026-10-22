@@ -124,11 +124,9 @@ void SystemHelper::tick(Time now) {
 }
 core::Result<void> SystemHelper::revoke(const std::string& sender, std::uint64_t phone) {
     if (!authenticate(sender) || !phone || phone > 4096) return Error{ErrorCode::helper_rejected};
-    grants_.clear();
-    for (const auto& binding : bindings_) backend_.discard(binding.handle);
-    bindings_.clear();
-    // AP revocation does not end the source's BlueZ lifetime. Retain its scoped
-    // cleanup ownership until matching invalidation or receiver loss.
+    // Phone IDs cannot identify Source-keyed authority here. The receiver retires
+    // matching sources through Invalidate; AP rotation must preserve unrelated
+    // grants, bindings and their BlueZ cleanup ownership.
     return backend_.revoke(phone);
 }
 void SystemHelper::bus_lost() noexcept {

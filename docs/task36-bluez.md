@@ -102,6 +102,12 @@ claimed. No packages/services were installed and no host system bus was used.
 
 Deployment remains BLOCKED on these explicit limitations:
 
+**Known limitation — not production qualified:** helper restart loses process-lifetime
+managed-peer knowledge. Persistent BlueZ bonds of a forgotten phone may then survive
+`ForgetPhone`. Operator recovery/crash reconciliation must be defined before
+production qualification; rejection of an unknown managed identity does not remove
+its persistent bond.
+
 - Real phone stimulation must supply an unambiguous already observed candidate
   while the helper remains non-discoverable/non-pairable by default. The host
   reference rejects multiple adapters/devices instead of inventing candidate UI.
