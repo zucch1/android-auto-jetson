@@ -35,6 +35,7 @@ core::Result<std::uint64_t> SystemHelper::issue(const std::string& sender, Sourc
     expire(now);
     if (action < Action::acquire_ap || action > Action::close_pairing)
         return Error{ErrorCode::helper_rejected};
+    if (action == Action::reconnect) return Error{ErrorCode::helper_rejected};
     if (!privileged(action) || !source.generation || !source.confirmation ||
         channel != (action == Action::acquire_ap ? 36U : 0U) ||
         grants_.size() >= kMaxPending || history_.size() >= kMaxHistory) {
@@ -85,6 +86,15 @@ core::Result<State> SystemHelper::execute(const std::string& sender, Invocation 
     // failure, so loss cleanup never depends on a success reply.
     if (action != Action::ap_status && action != Action::usb_status && action != Action::modem_status)
         lease_ = grant_source.value_or(lease_.value_or(Source{}));
+    if (action == Action::open_pairing) {
+        const auto binding = std::find_if(bindings_.begin(), bindings_.end(),
+            [&grant_source](const Binding& b) { return grant_source && b.source == *grant_source; });
+        if (binding == bindings_.end()) return Error{ErrorCode::helper_rejected};
+        const auto handle = binding->handle;
+        bindings_.erase(binding);
+        return backend_.authorize(handle);
+    }
+    if (action == Action::reconnect) return Error{ErrorCode::helper_rejected};
     return backend_.apply(action, channel);
 }
 core::Result<void> SystemHelper::invalidate(const std::string& sender, Source source) {
@@ -93,9 +103,18 @@ core::Result<void> SystemHelper::invalidate(const std::string& sender, Source so
         return (!source.generation || g.source.generation == source.generation) &&
                (!source.confirmation || g.source.confirmation == source.confirmation);
     });
+    std::erase_if(bindings_, [this, source](const Binding& b) {
+        const bool matches = (!source.generation || b.source.generation == source.generation) &&
+                             (!source.confirmation || b.source.confirmation == source.confirmation);
+        if (matches) backend_.discard(b.handle);
+        return matches;
+    });
     if (lease_ && (!source.generation || !lease_->generation || source.generation == lease_->generation) &&
         (!source.confirmation || source.confirmation == lease_->confirmation)) {
-        backend_.cleanup();
+        // Matching bindings were discarded above; a single-source retirement
+        // must not destroy observations still bound to other live sources.
+        if (source.confirmation) backend_.retire_lease();
+        else backend_.cleanup(); // wildcard teardown retains full cleanup
         lease_.reset();
     }
     return {};
@@ -106,11 +125,39 @@ void SystemHelper::tick(Time now) {
     const auto current = identities_.resolve(receiver_->unique_name);
     if (!current || current.value() != *receiver_) bus_lost();
 }
+core::Result<void> SystemHelper::revoke(const std::string& sender, std::uint64_t phone) {
+    if (!authenticate(sender) || !phone || phone > 4096) return Error{ErrorCode::helper_rejected};
+    // Phone IDs cannot identify Source-keyed authority here. The receiver retires
+    // matching sources through Invalidate; AP rotation must preserve unrelated
+    // grants, bindings and their BlueZ cleanup ownership.
+    return backend_.revoke(phone);
+}
 void SystemHelper::bus_lost() noexcept {
-    if (lease_) backend_.cleanup();
+    backend_.cleanup();
     lease_.reset();
     grants_.clear();
+    bindings_.clear();
     receiver_.reset();
     // Never evict replay history. Exhaustion requires an explicit restart.
+}
+core::Result<ObservedPeer> SystemHelper::observe(const std::string& sender) {
+    if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
+    return backend_.observe();
+}
+core::Result<void> SystemHelper::bind(const std::string& sender, Source source, std::uint64_t handle) {
+    if (!authenticate(sender) || !source.generation || !source.confirmation || !handle ||
+        bindings_.size() >= kMaxPending) return Error{ErrorCode::helper_rejected};
+    for (const auto& b : bindings_) if (b.source == source) return Error{ErrorCode::helper_rejected};
+    bindings_.push_back({source, handle});
+    return {};
+}
+core::Result<State> SystemHelper::reconnect_peer(const std::string& sender, std::uint64_t handle) {
+    if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
+    lease_ = lease_.value_or(Source{});
+    return backend_.reconnect_peer(handle);
+}
+core::Result<void> SystemHelper::revoke_peer(const std::string& sender, const PeerIdentity& identity) {
+    if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
+    return backend_.revoke_peer(identity);
 }
 } // namespace aa::helper

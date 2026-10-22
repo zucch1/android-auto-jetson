@@ -14,6 +14,28 @@ core::Nanoseconds SteadyClock::now() const noexcept {
 void PairingPolicy::note_candidate(TransportIdentity identity) {
     candidate_ = std::move(identity);
 }
+core::Result<void> PairingPolicy::note_wireless_candidate(const helper::PeerIdentity& peer) {
+    TransportIdentity identity{WirelessIdentity{peer.address, peer.adapter}};
+    if (!validated_key(identity)) return Error{ErrorCode::trust_unknown_phone};
+    note_candidate(std::move(identity));
+    return {};
+}
+std::optional<helper::PeerIdentity> PairingPolicy::wireless_identity(core::PhoneId phone) const {
+    for (const auto& entry : store_.phones()) {
+        if (entry.phone_id != phone) continue;
+        if (const auto* wireless = std::get_if<WirelessIdentity>(&entry.identity))
+            return helper::PeerIdentity{wireless->bond_address, wireless->adapter};
+    }
+    return std::nullopt;
+}
+std::optional<helper::PeerIdentity> PairingPolicy::pairing_wireless_identity(core::PairingRequestId request) const {
+    const auto index = find(request);
+    if (index < pending_.size()) {
+        if (const auto* wireless = std::get_if<WirelessIdentity>(&pending_[index].identity))
+            return helper::PeerIdentity{wireless->bond_address, wireless->adapter};
+    }
+    return std::nullopt;
+}
 
 std::size_t PairingPolicy::find(core::PairingRequestId request) const {
     for (std::size_t index = 0; index < pending_.size(); ++index) {
@@ -57,9 +79,12 @@ core::Result<void> PairingPolicy::forget(core::PhoneId phone) {
     // committed-but-not-durable error), so a pre-replacement failure leaves
     // the pending table and the invalidated buffer untouched.
     std::optional<std::string> key;
+    std::optional<helper::RevocationV1> snapshot;
+    revocation_.reset();
     for (const auto& entry : store_.phones()) {
         if (entry.phone_id == phone) {
             key = identity_key(entry.identity);
+            snapshot = helper::RevocationV1{phone, entry.identity};
             break;
         }
     }
@@ -75,6 +100,7 @@ core::Result<void> PairingPolicy::forget(core::PhoneId phone) {
     const bool landed = saved.has_value() ||
                         saved.error().code() == ErrorCode::trust_store_not_durable;
     if (landed) {
+        revocation_ = std::move(snapshot);
         for (const auto request : doomed) {
             const std::size_t index = find(request);
             if (index < pending_.size()) {
@@ -84,6 +110,12 @@ core::Result<void> PairingPolicy::forget(core::PhoneId phone) {
         }
     }
     return saved;
+}
+
+std::optional<helper::RevocationV1> PairingPolicy::take_revocation_v1() {
+    auto result = std::move(revocation_);
+    revocation_.reset();
+    return result;
 }
 
 std::vector<core::PairingRequestId> PairingPolicy::take_invalidated_pairings() {

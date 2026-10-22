@@ -62,9 +62,17 @@ void WiredPhoneControl::checkpoint() {
     if (!request) {
         return;
     }
+    std::optional<helper::RevocationV1> snapshot;
+    for (const auto& entry : store_.phones()) {
+        if (entry.phone_id == request->phone) snapshot = helper::RevocationV1{entry.phone_id, entry.identity};
+    }
     auto result = store_.forget_phone(request->phone);
     const bool committed = result.has_value() ||
-                           result.error().code() == ErrorCode::trust_store_not_durable;
+                            result.error().code() == ErrorCode::trust_store_not_durable;
+    {
+        const std::lock_guard lock{mutex_};
+        revocation_ = committed ? std::move(snapshot) : std::nullopt;
+    }
     if (committed && phone_ && store_.lookup(*phone_) != trust::Decision::approved) {
         pending_result_ = result;
         pending_ = std::move(request);
@@ -73,6 +81,13 @@ void WiredPhoneControl::checkpoint() {
         return;
     }
     complete(std::move(request), result);
+}
+
+std::optional<helper::RevocationV1> WiredPhoneControl::take_revocation_v1() {
+    const std::lock_guard lock{mutex_};
+    auto result = std::move(revocation_);
+    revocation_.reset();
+    return result;
 }
 
 bool WiredPhoneControl::finish() {

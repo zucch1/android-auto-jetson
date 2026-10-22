@@ -160,8 +160,8 @@ TEST(HelperBus, RegisteredConsumerTrustConfirmationAndRevocation) {
     EXPECT_EQ(command("cancelled"), "2");
     EXPECT_EQ(command("timeout"), "3");
     EXPECT_EQ(command("acquire"), "0");
-    EXPECT_EQ(command("acquire"), "1001");
-    EXPECT_EQ(command("pair"), "0");
+    EXPECT_EQ(command("acquire"), "0");
+    EXPECT_EQ(command("pair"), "1001");
     EXPECT_EQ(command("pair"), "1001");
     EXPECT_EQ(command("status"), "0");
     EXPECT_EQ(command("usb-status"), "0");
@@ -182,7 +182,7 @@ TEST(HelperBus, RegisteredConsumerTrustConfirmationAndRevocation) {
     EXPECT_EQ(command("acquire"), "1001");
     EXPECT_EQ(command("reconnect"), "701");
     MessageWriter close_second; close_second.put_u64(second);
-    ASSERT_EQ(control(caller.value(), "CancelPhonePairing", "t", close_second).type, MessageType::method_return);
+    ASSERT_EQ(control(caller.value(), "CancelPhonePairing", "t", close_second).type, MessageType::error_reply);
     // Confirm another source, then teardown must kill its still-pending grants.
     second = request(caller.value());
     MessageWriter third_confirm; third_confirm.put_u64(second);
@@ -222,19 +222,17 @@ TEST(HelperFlood, DirectedTrafficCannotStarveLiveness) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
-TEST(HelperProduction, AuthorizedEffectsRemainUnavailable) {
+TEST(HelperProduction, MissingBluezDoesNotManufactureCandidateOrEffects) {
     auto caller = BusConnection::connect_session(); ASSERT_TRUE(caller);
     ASSERT_TRUE(caller.value().request_name(ipc::BusName{"org.custom.HelperProductionConsumer"}));
     MessageWriter name; name.put_string("org.custom.HelperProductionConsumer");
     ASSERT_EQ(control(caller.value(), "RegisterConsumer", "s", name).type, MessageType::method_return);
-    const auto source = request(caller.value());
-    MessageWriter confirm; confirm.put_u64(source);
-    ASSERT_EQ(control(caller.value(), "ConfirmPhonePairing", "t", confirm).type, MessageType::method_return);
-    EXPECT_EQ(command("acquire"), "1000");
-    EXPECT_EQ(command("pair"), "1000");
+    EXPECT_EQ(control(caller.value(), "RequestAddPhone").type, MessageType::error_reply);
+    EXPECT_EQ(command("acquire"), "1001");
+    EXPECT_EQ(command("pair"), "1001");
     EXPECT_EQ(command("acquire"), "1001");
     EXPECT_EQ(command("release"), "1000");
-    EXPECT_EQ(command("reconnect"), "1000");
+    EXPECT_EQ(command("reconnect"), "701");
     EXPECT_EQ(command("status"), "0");
     EXPECT_EQ(command("usb-status"), "0");
     EXPECT_EQ(command("modem-status"), "0");

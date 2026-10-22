@@ -1320,7 +1320,9 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     EXPECT_TRUE(was_quiet);
     EXPECT_TRUE(registered);
     ASSERT_TRUE(reply.has_value()) << output;
-    EXPECT_EQ(reply.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
+    bus::Cursor external_error{reply.value().body};
+    EXPECT_EQ(external_error.read_string().value(), aa::Error{aa::ErrorCode::helper_unavailable}.message());
     EXPECT_TRUE(closed_at_reply);
     EXPECT_EQ(code, 1) << output;
     EXPECT_EQ(runtime_connects.load(), 1);
@@ -1622,7 +1624,9 @@ TEST(WiredReceiver, RequiredVideoConsumerForgetPhoneWhileGatedCompletesWithoutDe
                                         << output;
     EXPECT_TRUE(registered);
     ASSERT_TRUE(reply.has_value()) << output;
-    EXPECT_EQ(reply.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
+    bus::Cursor external_error{reply.value().body};
+    EXPECT_EQ(external_error.read_string().value(), aa::Error{aa::ErrorCode::helper_unavailable}.message());
     aa::trust::ApprovedPhoneStore persisted{path};
     ASSERT_TRUE(persisted.load().has_value());
     EXPECT_EQ(persisted.lookup(runtime_phone), aa::trust::Decision::unknown)
@@ -2003,7 +2007,9 @@ TEST(WiredReceiver, ForgetPhoneWhileWaitingForVideoConsumerCompletesWithoutDeadl
     EXPECT_FALSE(watchdog_fired.load()) << "FORGET_WHILE_GATED_DEADLOCK: " << output;
     EXPECT_TRUE(registered) << output;
     ASSERT_TRUE(reply.has_value()) << output;
-    EXPECT_EQ(reply.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
+    bus::Cursor external_error{reply.value().body};
+    EXPECT_EQ(external_error.read_string().value(), aa::Error{aa::ErrorCode::helper_unavailable}.message());
     EXPECT_EQ(code, 1) << output;
     EXPECT_EQ(runtime_connects.load(), 1) << output;
     EXPECT_NE(output.find("\"to_state\":\"failed\""), std::string::npos) << output;

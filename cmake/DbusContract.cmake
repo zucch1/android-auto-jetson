@@ -29,6 +29,7 @@ set(AA_DBUS_GENERATED_HEADER "${AA_DBUS_GENERATED_DIR}/aa/ipc/dbus_contract.gene
 set(AA_IPC_CONTROL_SOURCES
     src/ipc/Contract.cpp
     src/ipc/PairingGate.cpp
+    src/ipc/ControlPairing.cpp src/ipc/ControlRevocation.cpp
     src/ipc/ControlService.cpp)
 set(AA_IPC_DBUS_SOURCES
     src/ipc/dbus_adapter/BusWire.cpp

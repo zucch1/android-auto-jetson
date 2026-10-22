@@ -1,78 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include <aa/helper/BusClient.hpp>
-#include <aa/helper/BusService.hpp>
-#include "../ipc/dbus_adapter/BusConnection.hpp"
+#include "BusClientImpl.hpp"
 #include <algorithm>
-#include <mutex>
 #include <sys/socket.h>
 
 namespace aa::helper {
-namespace {
-using namespace ipc::dbus_adapter;
-using Clock = std::chrono::steady_clock;
-}
-struct BusClient::Impl {
-    std::timed_mutex mutex;
-    BusConnection bus;
-    trust::ApprovedPhoneStore& store;
-    struct Pending { Source source; Action action; std::uint64_t grant; };
-    std::vector<Pending> pending;
-    std::optional<Source> active_source;
-    Impl(BusConnection connection, trust::ApprovedPhoneStore& approvals)
-        : bus(std::move(connection)), store(approvals) {}
-    // All transaction helpers require mutex ownership, including failure cleanup.
-    core::Result<std::uint64_t> rpc(const char* member, const char* signature, MessageWriter writer,
-                                    Clock::time_point until) {
-        if (Clock::now() >= until) return Error{ErrorCode::timeout};
-        bus.deadline(until);
-        const auto owner = bus.get_name_owner(ipc::BusName{kBusName});
-        if (!owner) return Error{Clock::now() >= until ? ErrorCode::timeout : ErrorCode::helper_unavailable};
-        writer.destination(owner.value().value).path(kObjectPath).interface_name(kInterface)
-              .member(member).body_signature(signature);
-        const auto serial = bus.send_message(MessageType::method_call, writer);
-        if (!serial) return Error{Clock::now() >= until ? ErrorCode::timeout : ErrorCode::helper_unavailable};
-        const auto reply = bus.await_reply(serial.value(), owner.value());
-        if (Clock::now() >= until) return Error{ErrorCode::timeout};
-        if (!reply) return Error{ErrorCode::helper_unavailable};
-        if (reply.value().type != MessageType::method_return || reply.value().signature != "ut")
-            return Error{ErrorCode::helper_protocol_mismatch};
-        Cursor body{reply.value().body};
-        const auto error = body.read_u32();
-        const auto value = body.read_u64();
-        if (!error || !value || !body.done()) return Error{ErrorCode::helper_protocol_mismatch};
-        switch (error.value()) {
-        case 0: return value.value();
-        case 1000: return Error{ErrorCode::helper_unavailable};
-        case 1001: return Error{ErrorCode::helper_rejected};
-        default: return Error{ErrorCode::helper_protocol_mismatch};
-        }
-    }
-    core::Result<State> execute(Invocation invocation, Clock::time_point until) {
-        const auto [action, channel, grant] = invocation;
-        MessageWriter writer;
-        writer.put_u32(static_cast<std::uint32_t>(action)).put_u32(channel).put_u64(grant);
-        const auto result = rpc("Execute", "uut", writer, until);
-        if (!result) return result.error();
-        if (result.value() > static_cast<std::uint64_t>(State::unavailable))
-            return Error{ErrorCode::helper_protocol_mismatch};
-        return static_cast<State>(result.value());
-    }
-    void invalidate_locked(Source source, Clock::time_point until) {
-        if (active_source && (!source.generation || source.generation == active_source->generation) &&
-            (!source.confirmation || source.confirmation == active_source->confirmation)) active_source.reset();
-        std::erase_if(pending, [source](const Pending& p) {
-            return (!source.generation || p.source.generation == source.generation) &&
-                   (!source.confirmation || p.source.confirmation == source.confirmation);
-        });
-        MessageWriter writer;
-        writer.put_u64(source.generation).put_u64(source.confirmation);
-        (void)rpc("Invalidate", "tt", writer, until);
-    }
-    void invalidate(Source source) {
-        const std::lock_guard lock{mutex};
-        invalidate_locked(source, Clock::now() + std::chrono::milliseconds(500));
-    }
-};
 BusClient::BusClient(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 BusClient::~BusClient() = default;
 core::Result<std::unique_ptr<BusClient>> BusClient::system(trust::ApprovedPhoneStore& store) {
@@ -95,10 +26,17 @@ core::Result<void> BusClient::confirmed(core::ConsumerId generation, core::Pairi
               .put_u32(static_cast<std::uint32_t>(action)).put_u32(action == Action::acquire_ap ? 36U : 0U);
         const auto grant = impl_->rpc("Issue", "ttuu", writer, until);
         if (!grant || !grant.value()) {
-            impl_->invalidate_locked({generation.value, source.value}, until);
+            (void)impl_->invalidate_locked({generation.value, source.value}, until);
             return grant ? Error{ErrorCode::helper_protocol_mismatch} : grant.error();
         }
         impl_->pending.push_back({{generation.value, source.value}, action, grant.value()});
+    }
+    const auto pairing = impl_->pending.back();
+    impl_->pending.pop_back();
+    const auto opened = impl_->execute({Action::open_pairing, 0, pairing.grant}, until);
+    if (!opened || opened.value() != State::active) {
+        (void)impl_->invalidate_locked({generation.value, source.value}, until);
+        return opened ? Error{ErrorCode::helper_unavailable} : opened.error();
     }
     impl_->active_source = Source{generation.value, source.value};
     return {};
@@ -107,7 +45,53 @@ void BusClient::cancel(core::ConsumerId generation, core::PairingRequestId sourc
     impl_->invalidate({generation.value, source.value});
 }
 void BusClient::teardown(core::ConsumerId generation) { impl_->invalidate({generation.value, 0}); }
-void BusClient::forgotten() { impl_->invalidate({0, 0}); }
+RevocationAttempt BusClient::forgotten_v1(const RevocationV1& snapshot, const RevocationProgress& progress) {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    const auto peer = revocation_peer(snapshot);
+    RevocationAttempt report;
+    if (progress.ap == RevocationLeg::complete) report.ap = {};
+    if (peer) report.bond = progress.bond == RevocationLeg::complete ? core::Result<void>{} :
+                                                                        core::Result<void>{Error{ErrorCode::timeout}};
+    report.retirement = progress.retirements.empty() ? core::Result<void>{} :
+                                                     core::Result<void>{Error{ErrorCode::timeout}};
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until) || Clock::now() >= until) {
+        if (progress.ap != RevocationLeg::complete) report.ap = Error{ErrorCode::timeout};
+        return report;
+    }
+    // ControlService derives retirements from the snapshot's identity. Their
+    // invalidate_locked calls below clear only that phone's local authority.
+    const bool bond_pending = peer && progress.bond != RevocationLeg::complete;
+    if (!progress.retirements.empty()) {
+        const auto now = Clock::now();
+        const int slices = 1 + (progress.ap != RevocationLeg::complete ? 1 : 0) + (bond_pending ? 1 : 0);
+        // All closed IDs share one cleanup slice; each unfinished external leg
+        // retains its own share even if the first Invalidate reply stalls.
+        const auto deadline = std::min(until, now + std::min((until - now) / slices,
+            std::chrono::duration_cast<Clock::duration>(std::chrono::milliseconds(500))));
+        report.retirement = {};
+        for (const auto& source : progress.retirements) {
+            const auto result = impl_->invalidate_locked({source.generation.value, source.request.value}, deadline);
+            if (!result) { report.retirement = result.error(); break; }
+            ++report.retired;
+        }
+    }
+    if (progress.ap != RevocationLeg::complete) {
+        const auto now = Clock::now();
+        const auto allowance = bond_pending ? (until - now) / 2 : until - now;
+        const auto deadline = std::min(until, now + std::min(allowance,
+            std::chrono::duration_cast<Clock::duration>(std::chrono::milliseconds(500))));
+        MessageWriter writer;
+        writer.put_u64(snapshot.phone.value);
+        const auto result = impl_->rpc("RevokeAP1", "t", writer, deadline);
+        report.ap = result ? core::Result<void>{} : core::Result<void>{result.error()};
+    }
+    if (bond_pending) {
+        const auto deadline = std::min(until, Clock::now() + std::chrono::milliseconds(500));
+        report.bond = impl_->revoke(*peer, deadline);
+    }
+    return report;
+}
 core::Result<State> BusClient::status(Action action) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
     if (action != Action::ap_status && action != Action::usb_status && action != Action::modem_status)
@@ -123,7 +107,27 @@ core::Result<State> BusClient::reconnect(const trust::TransportIdentity& identit
         return Error{ErrorCode::trust_unknown_phone};
     std::unique_lock lock{impl_->mutex, std::defer_lock};
     if (!lock.try_lock_until(until) || Clock::now() >= until) return Error{ErrorCode::timeout};
-    return impl_->execute({Action::reconnect, 0, 0}, until);
+    const auto peer = impl_->observe(until);
+    if (!peer) return peer.error();
+    const trust::TransportIdentity observed{trust::WirelessIdentity{peer.value().identity.address, peer.value().identity.adapter}};
+    if (trust::identity_key(observed) != key.value()) return Error{ErrorCode::trust_unknown_phone};
+    MessageWriter writer; writer.put_u64(peer.value().handle);
+    const auto result = impl_->rpc("ReconnectPeerV1", "t", writer, until);
+    if (!result) return result.error();
+    if (result.value() != static_cast<std::uint64_t>(State::active)) return Error{ErrorCode::helper_rejected};
+    return State::active;
+}
+core::Result<std::optional<PeerIdentity>> BusClient::prepare(core::ConsumerId generation, core::PairingRequestId source) {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until)) return Error{ErrorCode::timeout};
+    const auto peer = impl_->observe(until);
+    if (!peer) return peer.error();
+    MessageWriter writer;
+    writer.put_u64(generation.value).put_u64(source.value).put_u64(peer.value().handle);
+    const auto bound = impl_->rpc("BindPeerV1", "ttt", writer, until);
+    if (!bound) return bound.error();
+    return std::optional<PeerIdentity>{peer.value().identity};
 }
 core::Result<Response> BusClient::call(const Request& request, core::Milliseconds timeout,
                                       core::CancellationToken cancellation) {
@@ -155,6 +159,7 @@ core::Result<Response> BusClient::call(const Request& request, core::Millisecond
     case Operation::exclude_modem_manager: return Error{ErrorCode::helper_unavailable};
     }
     std::uint64_t grant{};
+    bool poll_ap = false;
     if (action == Action::acquire_ap || action == Action::open_pairing) {
         const Source explicit_source{request.consumer_generation.value, request.confirmation_source.value};
         const auto source = explicit_source.generation || explicit_source.confirmation ?
@@ -165,15 +170,26 @@ core::Result<Response> BusClient::call(const Request& request, core::Millisecond
                                        [action, source](const Impl::Pending& p) {
                                            return p.action == action && p.source == *source;
                                        });
-        if (found == impl_->pending.end()) return Error{ErrorCode::helper_rejected};
+        if (found == impl_->pending.end()) {
+            if (action != Action::acquire_ap || impl_->ap_source != source) return Error{ErrorCode::helper_rejected};
+            poll_ap = true;
+        }
         if (cancellation.stop_requested()) return Error{ErrorCode::cancelled};
         if (Clock::now() >= until) return Error{ErrorCode::timeout};
-        grant = found->grant;
-        impl_->pending.erase(found);
+        if (!poll_ap) {
+            grant = found->grant;
+            impl_->pending.erase(found);
+        }
     }
-    const auto result = impl_->execute({action, action == Action::acquire_ap ? request.channel : 0U, grant}, until);
+    if (action == Action::acquire_ap && request.channel != 36) return Error{ErrorCode::helper_rejected};
+    const auto result = impl_->execute({poll_ap ? Action::ap_status : action,
+        action == Action::acquire_ap && !poll_ap ? request.channel : 0U, grant}, until);
     if (cancellation.stop_requested()) return Error{ErrorCode::cancelled};
     if (!result) return result.error();
+    if (action == Action::acquire_ap) {
+        if (!poll_ap && result.value() != State::unavailable) impl_->ap_source = impl_->active_source;
+        return Response{result.value() == State::active};
+    }
     return Response{result.value() != State::unavailable};
 }
 }

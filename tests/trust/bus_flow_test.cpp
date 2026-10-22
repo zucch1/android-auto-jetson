@@ -141,7 +141,10 @@ TEST(TrustBusFlow, ApproveOnceOverTheWireThenForget) {
     forget.body_signature("t").put_u64(bus_state.store.phones()[0].phone_id.value);
     const auto forgotten = round_trip(bus_state, "ForgetPhone", forget);
     ASSERT_TRUE(forgotten.has_value());
-    ASSERT_EQ(forgotten.value().type, bus::MessageType::method_return);
+    ASSERT_EQ(forgotten.value().type, bus::MessageType::error_reply);
+    bus::Cursor forget_error{forgotten.value().body};
+    ASSERT_EQ(forget_error.read_string().value(), aa::Error{ErrorCode::helper_unavailable}.message());
+    EXPECT_EQ(bus_state.service->pending_revocations(), 1U);
     EXPECT_EQ(bus_state.store.lookup(identity), trust::Decision::unknown);
 }
 
@@ -220,7 +223,10 @@ TEST(TrustBusFlow, ForgottenPhoneRejectsStaleConfirmOverTheWire) {
     forget.body_signature("t").put_u64(saved.value);
     const auto forgotten = round_trip(bus_state, "ForgetPhone", forget);
     ASSERT_TRUE(forgotten.has_value());
-    ASSERT_EQ(forgotten.value().type, bus::MessageType::method_return);
+    ASSERT_EQ(forgotten.value().type, bus::MessageType::error_reply);
+    bus::Cursor forget_error{forgotten.value().body};
+    ASSERT_EQ(forget_error.read_string().value(), aa::Error{ErrorCode::helper_unavailable}.message());
+    EXPECT_EQ(bus_state.service->pending_revocations(), 1U);
 
     bus::MessageWriter stale;
     stale.body_signature("t").put_u64(first_id);

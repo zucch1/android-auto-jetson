@@ -26,7 +26,8 @@ public:
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override;
     void cancel(core::ConsumerId, core::PairingRequestId) override;
     void teardown(core::ConsumerId) override;
-    void forgotten() override;
+    RevocationAttempt forgotten_v1(const RevocationV1&, const RevocationProgress&) override;
+    core::Result<std::optional<PeerIdentity>> prepare(core::ConsumerId, core::PairingRequestId) override;
 private:
     struct Impl;
     explicit BusClient(std::unique_ptr<Impl> impl);

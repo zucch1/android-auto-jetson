@@ -9,6 +9,7 @@
 #include <aa/ipc/PeerCredentials.hpp>
 
 #include <cstdint>
+#include <chrono>
 #include <map>
 #include <optional>
 #include <string>
@@ -123,6 +124,7 @@ public:
     PhoneDirectory& operator=(PhoneDirectory&&) = delete;
 
     [[nodiscard]] virtual core::Result<void> forget(core::PhoneId phone) = 0;
+    virtual std::optional<helper::RevocationV1> take_revocation_v1() { return std::nullopt; }
     [[nodiscard]] virtual core::Result<void> pairing_requested(
         core::PairingRequestId request) = 0;
     [[nodiscard]] virtual core::Result<core::PhoneId> pairing_confirmed(
@@ -130,6 +132,11 @@ public:
     virtual void pairing_cancelled(core::PairingRequestId request) = 0;
     [[nodiscard]] virtual std::vector<core::PairingRequestId> reap_expired() = 0;
     [[nodiscard]] virtual std::vector<core::PairingRequestId> take_invalidated_pairings() = 0;
+    virtual core::Result<void> note_wireless_candidate(const helper::PeerIdentity&) {
+        return Error{ErrorCode::trust_unknown_phone};
+    }
+    virtual std::optional<helper::PeerIdentity> wireless_identity(core::PhoneId) const { return std::nullopt; }
+    virtual std::optional<helper::PeerIdentity> pairing_wireless_identity(core::PairingRequestId) const { return std::nullopt; }
 };
 
 // The active session user the caller's Unix UID must equal. Production fills
@@ -214,6 +221,8 @@ public:
     // Pairing-window observability (the todo-27 machinery hooks this). Cached:
     // reflects the gate state as of the last control call.
     [[nodiscard]] bool pairing_window_open() const noexcept { return gate_.window_open(); }
+    std::size_t pending_revocations() const noexcept { return revocations_.size(); }
+    std::optional<helper::RevocationProgress> revocation_progress(core::PhoneId phone) const;
 
 private:
     struct Registered final {
@@ -234,6 +243,13 @@ private:
 
     [[nodiscard]] core::Result<Registered> require_consumer();
     [[nodiscard]] core::Result<void> admit(const BusName& caller, const Registered& active);
+    struct PendingRevocation {
+        helper::RevocationV1 snapshot;
+        helper::RevocationProgress progress;
+        bool not_durable;
+    };
+    core::Result<void> attempt_revocation(PendingRevocation& record);
+    bool revocation_blocks(const helper::PeerIdentity&) const;
 
     ControlServiceConfig config_{};
     PeerCredentialLookup& credentials_;
@@ -241,10 +257,18 @@ private:
     PhoneDirectory& phones_;
     PairingGate gate_;
     helper::Confirmation* confirmation_{};
+    std::vector<PendingRevocation> revocations_;
     std::optional<Registered> registered_{};
     ProjectionState projection_{ProjectionState::stopped};
     std::optional<Viewport> viewport_{};
     std::uint64_t next_consumer_id_{1};
+    struct OpenPairing {
+        core::PairingRequestId request;
+        core::PhoneId phone;
+        std::optional<helper::PeerIdentity> peer;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::optional<OpenPairing> open_pairing_;
 };
 
 } // namespace aa::ipc

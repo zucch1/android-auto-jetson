@@ -211,7 +211,8 @@ TEST(ControlService, ForgetPhoneForwardsToDirectory) {
     const auto invalid = fixture.service.forget_phone(connection, aa::core::PhoneId{});
 
     // Then: the directory saw the id and the unset id is typed invalid.
-    ASSERT_TRUE(forgotten.has_value());
+    ASSERT_FALSE(forgotten.has_value());
+    EXPECT_EQ(forgotten.error().code(), ErrorCode::helper_protocol_mismatch);
     ASSERT_EQ(fixture.phones.forgotten.size(), 1U);
     EXPECT_EQ(fixture.phones.forgotten.front(), aa::core::PhoneId{7});
     ASSERT_FALSE(invalid.has_value());
