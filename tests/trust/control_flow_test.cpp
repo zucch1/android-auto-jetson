@@ -67,7 +67,9 @@ TEST(ControlFlow, ApproveOnceThenReconnectAndForget) {
 
     const auto& phones = f.store.phones();
     ASSERT_EQ(phones.size(), 1U);
-    ASSERT_TRUE(f.service.forget_phone(connection, phones[0].phone_id).has_value());
+    const auto forgotten = f.service.forget_phone(connection, phones[0].phone_id);
+    ASSERT_FALSE(forgotten); EXPECT_EQ(forgotten.error().code(), ErrorCode::helper_unavailable);
+    EXPECT_EQ(f.service.pending_revocations(), 1U);
     EXPECT_EQ(f.store.lookup(identity), trust::Decision::unknown);
 }
 
@@ -306,7 +308,9 @@ TEST(ControlFlow, ForgetPhoneInvalidatesPendingClosesGateOnceAndSparesUnrelated)
     const auto unrelated = f.service.request_add_phone(connection);
     ASSERT_TRUE(unrelated.has_value());
 
-    ASSERT_TRUE(f.service.forget_phone(connection, saved).has_value());
+    const auto forgotten = f.service.forget_phone(connection, saved);
+    ASSERT_FALSE(forgotten); EXPECT_EQ(forgotten.error().code(), ErrorCode::helper_unavailable);
+    EXPECT_EQ(f.service.pending_revocations(), 1U);
 
     const auto stale_first = f.service.confirm_phone_pairing(connection, first.value());
     ASSERT_FALSE(stale_first.has_value());
@@ -342,7 +346,9 @@ TEST(ControlFlow, ForgottenPhoneCanBeRequestedAndApprovedAgain) {
 
     const auto approved = f.store.approve(trust::TransportIdentity{test::kWired});
     ASSERT_TRUE(approved.has_value());
-    ASSERT_TRUE(f.service.forget_phone(connection, approved.value()).has_value());
+    const auto forgotten = f.service.forget_phone(connection, approved.value());
+    ASSERT_FALSE(forgotten); EXPECT_EQ(forgotten.error().code(), ErrorCode::helper_unavailable);
+    EXPECT_EQ(f.service.pending_revocations(), 1U);
 
     f.policy.note_candidate(trust::TransportIdentity{test::kWired});
     const auto fresh = f.service.request_add_phone(connection);

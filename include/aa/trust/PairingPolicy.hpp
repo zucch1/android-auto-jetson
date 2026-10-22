@@ -94,6 +94,9 @@ public:
     // is bound at pairing_requested time so a later swap cannot change what an
     // in-flight confirm approves (SNAPSHOT-ONLY PAIRING CONTRACT above).
     void note_candidate(TransportIdentity identity);
+    core::Result<void> note_wireless_candidate(const helper::PeerIdentity& peer) override;
+    std::optional<helper::PeerIdentity> wireless_identity(core::PhoneId phone) const override;
+    std::optional<helper::PeerIdentity> pairing_wireless_identity(core::PairingRequestId request) const override;
 
     [[nodiscard]] const std::optional<TransportIdentity>& candidate() const noexcept {
         return candidate_;
@@ -111,6 +114,7 @@ public:
     // Unknown phone ids invalidate nothing; the zero id is invalid_argument.
     // The candidate slot is never consulted or cleared here.
     [[nodiscard]] core::Result<void> forget(core::PhoneId phone) override;
+    std::optional<helper::RevocationV1> take_revocation_v1() override;
     [[nodiscard]] core::Result<void> pairing_requested(core::PairingRequestId request) override;
     [[nodiscard]] core::Result<core::PhoneId> pairing_confirmed(
         core::PairingRequestId request) override;
@@ -146,6 +150,7 @@ private:
     std::optional<TransportIdentity> candidate_{};
     std::vector<Pending> pending_{};
     std::vector<core::PairingRequestId> invalidated_{};
+    std::optional<helper::RevocationV1> revocation_;
 };
 
 } // namespace aa::trust

@@ -4,6 +4,7 @@
 #include <aa/core/Ids.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/trust/Trust.hpp>
+#include <aa/helper/Confirmation.hpp>
 
 #include <future>
 #include <memory>
@@ -22,6 +23,7 @@ class WiredPhoneControl final {
     void bind_owner();
     void bind_phone(const trust::PhoneIdentity&);
     [[nodiscard]] core::Result<void> forget(core::PhoneId);
+    std::optional<helper::RevocationV1> take_revocation_v1();
     void checkpoint();
     [[nodiscard]] bool finish();
     void close();
@@ -45,5 +47,6 @@ class WiredPhoneControl final {
     core::Result<void> pending_result_{};
     std::optional<trust::PhoneIdentity> phone_;
     bool revoked_{false};
+    std::optional<helper::RevocationV1> revocation_;
 };
 } // namespace aa::app

@@ -3,9 +3,11 @@
 #include <aa/helper/BusService.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/trust/PairingPolicy.hpp>
+#include "../trust/syscall_faults.hpp"
 #include <fstream>
 #include <future>
 #include <cstdlib>
+#include <charconv>
 #include <iostream>
 #include <poll.h>
 #include <thread>
@@ -34,17 +36,26 @@ public:
         std::ofstream{path_, std::ios::app} << "cleanup\n";
         active_ = false;
     }
+    core::Result<ObservedPeer> observe() override { return ObservedPeer{123, {"fixture-bond", "fixture-adapter"}}; }
+    core::Result<State> authorize(std::uint64_t handle) override {
+        if (handle != 123) return Error{ErrorCode::helper_rejected};
+        const auto effect = apply(Action::open_pairing, 0);
+        return effect ? core::Result<State>{State::active} : effect;
+    }
+    core::Result<State> reconnect_peer(std::uint64_t) override { return State::active; }
+    core::Result<void> revoke_peer(const PeerIdentity&) override { return {}; }
+    core::Result<void> revoke(std::uint64_t) override { cleanup(); return {}; }
 private:
     const char* path_;
     bool active_{};
 };
-int receiver(const char* address, const std::filesystem::path& store_path) {
+int receiver(const char* address, const std::filesystem::path& store_path, bool bluez) {
     trust::ApprovedPhoneStore store{store_path};
     if (!store.load()) return 2;
     trust::SteadyClock clock;
     trust::PairingPolicy phones{store, clock};
-    const trust::TransportIdentity identity{trust::WirelessIdentity{"fixture-bond", "fixture-adapter"}};
-    phones.note_candidate(identity);
+    const trust::TransportIdentity identity{bluez ? trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"} :
+                                                   trust::WirelessIdentity{"fixture-bond", "fixture-adapter"}};
     ipc::RandomPairingIdSource ids;
     auto helper = BusClient::private_bus(address, store);
     if (!helper) return 3;
@@ -97,11 +108,15 @@ int receiver(const char* address, const std::filesystem::path& store_path) {
             worker.thread.join();
             continue;
         } else if (command == "duplicate-confirm") {
+            if (!helper.value()->prepare(core::ConsumerId{777}, core::PairingRequestId{888})) return 8;
             if (!helper.value()->confirmed(core::ConsumerId{777}, core::PairingRequestId{888})) return 8;
             result = helper.value()->confirmed(core::ConsumerId{777}, core::PairingRequestId{888});
         } else if (command == "acquire" || command == "pair" || command == "release" || command == "wrong-source" ||
+            command == "unregister-profile" || command == "register-profile" ||
             command == "cancelled" || command == "timeout") {
-            const auto op = command == "pair" ? Operation::open_pairing_window :
+            const auto op = command == "unregister-profile" ? Operation::unregister_bluez_profile :
+                            command == "register-profile" ? Operation::register_bluez_profile :
+                            command == "pair" ? Operation::open_pairing_window :
                             command == "release" ? Operation::teardown_access_point : Operation::ensure_access_point;
             Request request{op, 36};
             if (command == "wrong-source") {
@@ -112,6 +127,27 @@ int receiver(const char* address, const std::filesystem::path& store_path) {
             if (command == "cancelled") cancellation.request_stop();
             const auto response = helper.value()->call(request, core::Milliseconds{command == "timeout" ? 0 : 1000}, cancellation.get_token());
             result = response ? core::Result<void>{} : core::Result<void>{response.error()};
+        } else if (command == "fault-dir" || command == "fault-temp" || command == "fault-clear") {
+            using trust::test::faults::Fault;
+            trust::test::faults::arm(command == "fault-dir" ? Fault::dir_fsync :
+                                     command == "fault-temp" ? Fault::temp_fsync : Fault::none);
+            result = {};
+        } else if (command == "pending-revocations") {
+            std::cout << service.value().service().pending_revocations() << '\n' << std::flush;
+            continue;
+        } else if (command.starts_with("progress ") || command.starts_with("retirements ")) {
+            std::uint64_t phone{};
+            const bool retirements = command.starts_with("retirements ");
+            const auto text = command.substr(retirements ? 12 : 9);
+            const auto parsed = std::from_chars(text.data(), text.data() + text.size(), phone);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) return 9;
+            const auto progress = service.value().service().revocation_progress(core::PhoneId{phone});
+            if (!progress) std::cout << "none\n";
+            else if (retirements) std::cout << progress->retirements.size() << '\n';
+            else std::cout << static_cast<int>(progress->ap) << ' '
+                           << (progress->bond ? static_cast<int>(*progress->bond) : -1) << '\n';
+            std::cout << std::flush;
+            continue;
         } else if (command == "reconnect" || command == "unknown") {
             auto candidate = identity;
             if (command == "unknown") candidate = trust::WirelessIdentity{"different", "fixture-adapter"};
@@ -125,6 +161,9 @@ int receiver(const char* address, const std::filesystem::path& store_path) {
         } else if (command == "phone") {
             std::cout << "phone " << (store.phones().empty() ? 0 : store.phones().front().phone_id.value) << '\n' << std::flush;
             continue;
+        } else if (command == "seed-wired") {
+            const auto approved = store.approve(trust::WiredIdentity{"18d1", "2d00", "wired-fixture", "Google", "AA", "wired", "1-2"});
+            result = approved ? core::Result<void>{} : core::Result<void>{approved.error()};
         } else if (command == "refresh") {
             service.value().service().refresh_consumer_owner();
             result = {};
@@ -135,7 +174,7 @@ int receiver(const char* address, const std::filesystem::path& store_path) {
 }
 int main(int argc, char** argv) {
     if (argc != 5) return 2;
-    if (std::string{argv[1]} == "receiver") return receiver(argv[2], argv[3]);
+    if (std::string{argv[1]} == "receiver") return receiver(argv[2], argv[3], std::string{argv[4]} == "bluez");
     if (std::string{argv[1]} != "helper") return 2;
     auto policy = aa::helper::IdentityPolicy::load(std::string{argv[3]} + "/session.uid",
                                                  std::string{argv[3]} + "/receiver.sha256", ::getuid());

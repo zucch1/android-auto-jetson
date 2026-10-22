@@ -129,6 +129,9 @@ class StorePhones final : public aa::ipc::PhoneDirectory {
     [[nodiscard]] aa::core::Result<void> forget(aa::core::PhoneId phone) override {
         return control_.forget(phone);
     }
+    std::optional<aa::helper::RevocationV1> take_revocation_v1() override {
+        return control_.take_revocation_v1();
+    }
     [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId) override {
         return aa::Error{aa::ErrorCode::invalid_argument};
     }
