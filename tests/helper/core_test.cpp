@@ -17,13 +17,19 @@ public:
 };
 class Effects final : public Backend {
 public:
-    int calls{}, cleanups{};
+    int calls{}, cleanups{}, discarded{};
     bool fail{};
     core::Result<State> apply(Action, std::uint32_t) override {
         ++calls;
         return fail ? core::Result<State>{Error{ErrorCode::helper_unavailable}} : core::Result<State>{State::active};
     }
     void cleanup() noexcept override { ++cleanups; }
+    core::Result<void> revoke(std::uint64_t) override { return {}; }
+    void discard(std::uint64_t) override { ++discarded; }
+    core::Result<State> authorize(std::uint64_t handle) override {
+        if (handle != 123) return Error{ErrorCode::helper_rejected};
+        return apply(Action::open_pairing, 0);
+    }
 };
 class HelperCore : public ::testing::Test {
 protected:
@@ -46,6 +52,7 @@ TEST_F(HelperCore, OneUseSeparateActionsAndArgumentBinding) {
     EXPECT_FALSE(helper.execute(":1.2", {Action::acquire_ap, 40, ap.value()}, now));
     ASSERT_TRUE(helper.execute(":1.2", {Action::acquire_ap, 36, ap.value()}, now));
     EXPECT_FALSE(helper.execute(":1.2", {Action::acquire_ap, 36, ap.value()}, now));
+    ASSERT_TRUE(helper.bind(":1.2", {1, 1}, 123));
     ASSERT_TRUE(helper.execute(":1.2", {Action::open_pairing, 0, pairing.value()}, now));
     EXPECT_EQ(effects.calls, 2);
     EXPECT_FALSE(issue());
@@ -76,7 +83,7 @@ TEST_F(HelperCore, StarttimeDigestAndDeadProcessRevalidateAndCleanLease) {
 TEST_F(HelperCore, StatusReleaseAndReconnectRequireBindingNotGrants) {
     EXPECT_TRUE(helper.execute(":1.2", {Action::ap_status, 0, 0}, now));
     EXPECT_TRUE(helper.execute(":1.2", {Action::release_ap, 0, 0}, now));
-    EXPECT_TRUE(helper.execute(":1.2", {Action::reconnect, 0, 0}, now));
+    EXPECT_FALSE(helper.execute(":1.2", {Action::reconnect, 0, 0}, now));
     EXPECT_FALSE(helper.execute(":1.3", {Action::reconnect, 0, 0}, now));
     ids.dead = true;
     helper.tick(now);
@@ -112,6 +119,25 @@ TEST_F(HelperCore, PendingAndHistoryExhaustionFailClosed) {
     }
     EXPECT_FALSE(issue({2, 9999}));
     EXPECT_FALSE(issue());
+}
+TEST_F(HelperCore, ApRevocationInvalidatesPendingButPreservesMatchingCleanupOwner) {
+    // Given
+    const auto owner = issue({1, 1}); ASSERT_TRUE(owner);
+    ASSERT_TRUE(helper.execute(":1.2", {Action::acquire_ap, 36, owner.value()}, now));
+    const auto pending = issue({2, 2}); ASSERT_TRUE(pending);
+    ASSERT_TRUE(helper.bind(":1.2", {1, 1}, 123));
+    // When
+    ASSERT_TRUE(helper.revoke(":1.2", 7));
+    // Then
+    EXPECT_EQ(helper.pending(), 0U);
+    EXPECT_EQ(effects.discarded, 1);
+    EXPECT_FALSE(helper.execute(":1.2", {Action::acquire_ap, 36, pending.value()}, now));
+    ASSERT_TRUE(helper.invalidate(":1.2", {2, 2}));
+    EXPECT_EQ(effects.cleanups, 0);
+    ASSERT_TRUE(helper.invalidate(":1.2", {1, 1}));
+    EXPECT_EQ(effects.cleanups, 1);
+    const auto pairing = issue({1, 1}, Action::open_pairing, 0); ASSERT_TRUE(pairing);
+    EXPECT_FALSE(helper.execute(":1.2", {Action::open_pairing, 0, pairing.value()}, now));
 }
 TEST(HelperBackend, ProductionNeverPretendsEffectsSucceeded) {
     UnavailableBackend backend;

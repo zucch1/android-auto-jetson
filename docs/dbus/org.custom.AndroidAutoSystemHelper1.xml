@@ -2,7 +2,36 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <node name="/org/custom/AndroidAutoSystemHelper">
   <interface name="org.custom.AndroidAutoSystemHelper1">
-    <annotation name="org.custom.Contract.SemVer" value="1.0.0"/>
+    <annotation name="org.custom.Contract.SemVer" value="1.1.0"/>
+    <method name="RevokeAP1">
+      <arg name="phone_id" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
+    </method>
+    <method name="PollPeerV1">
+      <arg name="error" type="u" direction="out"/>
+      <arg name="observed_handle" type="t" direction="out"/>
+      <arg name="bond_address" type="s" direction="out"/>
+      <arg name="adapter_identity" type="s" direction="out"/>
+    </method>
+    <method name="BindPeerV1">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="request_source" type="t" direction="in"/>
+      <arg name="observed_handle" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
+    </method>
+    <method name="ReconnectPeerV1">
+      <arg name="observed_handle" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="state" type="t" direction="out"/>
+    </method>
+    <method name="RevokePeerV1">
+      <arg name="removed_bond_address" type="s" direction="in"/>
+      <arg name="removed_adapter_identity" type="s" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
+    </method>
     <method name="Issue">
       <arg name="consumer_generation" type="t" direction="in"/>
       <arg name="confirmed_source" type="t" direction="in"/>

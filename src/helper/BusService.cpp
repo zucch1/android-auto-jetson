@@ -44,9 +44,37 @@ struct BusService::Impl {
         reply.destination(message.sender).reply_serial(message.serial);
         core::Result<std::uint64_t> result{Error{ErrorCode::helper_protocol_mismatch}};
         Cursor body{message.body};
+        std::optional<ObservedPeer> peer;
+        const bool polling = message.member == "PollPeerV1";
         if (message.path == kObjectPath && message.interface_name == kInterface &&
             !message.sender.empty() && message.sender.front() == ':') {
-            if (message.member == "Issue" && message.signature == "ttuu") {
+            if (polling && message.signature.empty() && body.done()) {
+                const auto observed = helper.observe(message.sender);
+                if (observed) { peer = observed.value(); result = peer->handle; }
+                else result = observed.error();
+            } else if (message.member == "BindPeerV1" && message.signature == "ttt") {
+                const auto generation = body.read_u64();
+                const auto confirmation = body.read_u64();
+                const auto handle = body.read_u64();
+                if (generation && confirmation && handle && body.done()) {
+                    const auto bound = helper.bind(message.sender, {generation.value(), confirmation.value()}, handle.value());
+                    result = bound ? core::Result<std::uint64_t>{0} : core::Result<std::uint64_t>{bound.error()};
+                }
+            } else if (message.member == "ReconnectPeerV1" && message.signature == "t") {
+                const auto handle = body.read_u64();
+                if (handle && body.done()) {
+                    const auto connected = helper.reconnect_peer(message.sender, handle.value());
+                    result = connected ? core::Result<std::uint64_t>{static_cast<std::uint64_t>(connected.value())}
+                                       : core::Result<std::uint64_t>{connected.error()};
+                }
+            } else if (message.member == "RevokePeerV1" && message.signature == "ss") {
+                const auto address = body.read_string();
+                const auto adapter = body.read_string();
+                if (address && adapter && body.done()) {
+                    const auto revoked = helper.revoke_peer(message.sender, {address.value(), adapter.value()});
+                    result = revoked ? core::Result<std::uint64_t>{0} : core::Result<std::uint64_t>{revoked.error()};
+                }
+            } else if (message.member == "Issue" && message.signature == "ttuu") {
                 const auto generation = body.read_u64();
                 const auto confirmation = body.read_u64();
                 const auto action = body.read_u32();
@@ -64,6 +92,12 @@ struct BusService::Impl {
                     result = effect ? core::Result<std::uint64_t>{static_cast<std::uint64_t>(effect.value())}
                                     : core::Result<std::uint64_t>{effect.error()};
                 }
+            } else if (message.member == "RevokeAP1" && message.signature == "t") {
+                const auto phone = body.read_u64();
+                if (phone && body.done()) {
+                    const auto revoked = helper.revoke(message.sender, phone.value());
+                    result = revoked ? core::Result<std::uint64_t>{0} : core::Result<std::uint64_t>{revoked.error()};
+                }
             } else if (message.member == "Invalidate" && message.signature == "tt") {
                 const auto generation = body.read_u64();
                 const auto confirmation = body.read_u64();
@@ -74,8 +108,9 @@ struct BusService::Impl {
             }
         }
         // Every reply has the same typed error/value shape; no dynamic identifiers.
-        reply.body_signature("ut").put_u32(result ? 0U : static_cast<std::uint32_t>(result.error().code()))
-             .put_u64(result ? result.value() : 0);
+        reply.body_signature(polling ? "utss" : "ut").put_u32(result ? 0U : static_cast<std::uint32_t>(result.error().code()))
+              .put_u64(result ? result.value() : 0);
+        if (polling) reply.put_string(peer ? peer->identity.address : "").put_string(peer ? peer->identity.adapter : "");
         export_bus.deadline(Clock::now() + std::chrono::milliseconds(500));
         const auto sent = export_bus.send_message(MessageType::method_return, reply);
         return sent ? core::Result<void>{} : core::Result<void>{sent.error()};
@@ -104,13 +139,14 @@ core::Result<BusService> BusService::private_bus(const std::string& address,
                                            std::move(policy), backend)};
 }
 core::Result<void> BusService::cycle() {
+    impl_->helper.platform_tick();
     if (Clock::now() >= impl_->next_tick) {
         impl_->helper.tick(Clock::now());
         impl_->next_tick = Clock::now() + std::chrono::seconds(1);
     }
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(impl_->next_tick - Clock::now()).count();
     ::pollfd fd{impl_->export_bus.native_handle(), POLLIN, 0};
-    const int ready = ::poll(&fd, 1, static_cast<int>(std::clamp<std::int64_t>(remaining, 0, 1000)));
+    const int ready = ::poll(&fd, 1, static_cast<int>(std::clamp<std::int64_t>(remaining, 0, 20)));
     if (ready < 0 && errno == EINTR) return {};
     if (ready < 0 || (ready > 0 && (fd.revents & (POLLERR | POLLHUP | POLLNVAL)))) {
         impl_->helper.bus_lost();
