@@ -135,6 +135,9 @@ def contended_forget(build: Path) -> None:
         assert command(receiver, f"progress {phone}") == "0 0"
         assert command(receiver, f"retirements {phone}") == "1"
         rejected(consumer, "CancelPhonePairing", GLib.Variant("(t)", (request,)))
+        # join-first joins the timed-out caller, not the helper's queued RPCs.
+        # A same-connection status reply fences those RPCs before the retry.
+        assert command(receiver, "status") == "0"
         control(consumer, "ForgetPhone", GLib.Variant("(t)", (phone,)))
         assert command(receiver, "pending-revocations") == "0"
         request = control(consumer, "RequestAddPhone").unpack()[0]
