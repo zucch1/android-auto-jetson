@@ -9,6 +9,7 @@ pkg_check_modules(AA_GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
 find_package(Protobuf REQUIRED)
 protobuf_generate_cpp(AA_AAW_SOURCES AA_AAW_HEADERS src/helper/bluetooth_bootstrap/Bootstrap.proto)
 add_library(aa_aaw_proto STATIC ${AA_AAW_SOURCES} ${AA_AAW_HEADERS})
+set_target_properties(aa_aaw_proto PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 target_include_directories(aa_aaw_proto PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(aa_aaw_proto PUBLIC protobuf::libprotobuf)
 add_library(aa_system_helper STATIC
