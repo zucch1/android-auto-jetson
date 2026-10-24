@@ -93,6 +93,12 @@ bool process_uids(const Fd& proc, std::uint32_t expected) {
     }
     return false;
 }
+bool same_executable(const struct stat& a, const struct stat& b) {
+    return a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_size == b.st_size &&
+        a.st_mode == b.st_mode && a.st_uid == b.st_uid && a.st_gid == b.st_gid &&
+        a.st_ctim.tv_sec == b.st_ctim.tv_sec && a.st_ctim.tv_nsec == b.st_ctim.tv_nsec &&
+        a.st_mtim.tv_sec == b.st_mtim.tv_sec && a.st_mtim.tv_nsec == b.st_mtim.tv_nsec;
+}
 }
 core::Result<IdentityPolicy> IdentityPolicy::load(const std::string& uid_file,
                                                 const std::string& digest_file,
@@ -135,7 +141,7 @@ core::Result<ReceiverIdentity> inspect_process(const std::string& name, std::uin
         std::chrono::steady_clock::now() >= deadline ||
         ::fstat(proc.value, &after) != 0 || after.st_uid != uid || !process_uids(proc, uid) ||
         current.value < 0 || ::fstat(current.value, &current_exe) != 0 ||
-        current_exe.st_dev != executable.st_dev || current_exe.st_ino != executable.st_ino)
+        !same_executable(current_exe, executable))
         return Error{ErrorCode::helper_rejected};
     return ReceiverIdentity{name, uid, pid, start.value(), digest.value()};
 }

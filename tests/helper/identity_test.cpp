@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/helper/Identity.hpp>
+#include "../../src/helper/crypto_adapter/Crypto.hpp"
 #include "../../src/ipc/dbus_adapter/BusIo.hpp"
 #include <gtest/gtest.h>
 #include <openssl/evp.h>
@@ -9,6 +10,7 @@
 #include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 namespace {
 using namespace aa;
@@ -90,18 +92,41 @@ TEST_F(HelperIdentity, RehashRejectsExecAndDeadProcessWithUnchangedPid) {
         ~Child() { ::close(fd); ::kill(pid, SIGKILL); ::waitpid(pid, nullptr, 0); }
     } child{pid, trigger[1]};
     ::close(trigger[0]);
-    const auto before = inspect_process(":1.3", ::getuid(), static_cast<std::uint32_t>(pid), policy.value());
+    const auto resolve = [&] { return inspect_process(":1.3", ::getuid(), static_cast<std::uint32_t>(pid), policy.value(),
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500)); };
+    const auto before = resolve();
     ASSERT_TRUE(before);
     ASSERT_EQ(::write(trigger[1], "x", 1), 1);
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     bool rejected = false;
     while (!rejected && std::chrono::steady_clock::now() < until)
-        rejected = !inspect_process(":1.3", ::getuid(), static_cast<std::uint32_t>(pid), policy.value());
+        rejected = !resolve();
     EXPECT_TRUE(rejected);
     EXPECT_EQ(::waitpid(pid, nullptr, WNOHANG), 0);
     ASSERT_EQ(::kill(pid, SIGKILL), 0);
     ASSERT_EQ(::waitpid(pid, nullptr, 0), pid);
-    EXPECT_FALSE(inspect_process(":1.3", ::getuid(), static_cast<std::uint32_t>(pid), policy.value()));
+    EXPECT_FALSE(resolve());
+}
+TEST_F(HelperIdentity, RequestDigestRehashesModifiedInodeAndNeverBypassesPolicy) {
+    const auto path = directory / "executable";
+    std::ofstream{path} << "first";
+    const auto hash = [&] {
+        const auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        const auto result = crypto_adapter::hash_executable(fd, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+        if (fd >= 0) ::close(fd);
+        return result;
+    };
+    const auto first = hash(); ASSERT_TRUE(first);
+    ASSERT_TRUE(hash()); EXPECT_EQ(hash().value(), first.value());
+    std::ofstream{path} << "other";
+    const auto modified = hash(); ASSERT_TRUE(modified);
+    EXPECT_NE(modified.value(), first.value());
+    auto policy = load(::getuid()); ASSERT_TRUE(policy);
+    ASSERT_TRUE(inspect_process(":1.3", ::getuid(), ::getpid(), policy.value(),
+        std::chrono::steady_clock::now() + std::chrono::seconds(1)));
+    policy.value().digest = std::string(64, '0');
+    EXPECT_FALSE(inspect_process(":1.3", ::getuid(), ::getpid(), policy.value(),
+        std::chrono::steady_clock::now() + std::chrono::seconds(1)));
 }
 TEST(HelperDeadline, TrickleReadsShareOneAbsoluteDeadline) {
     int sockets[2]{};
