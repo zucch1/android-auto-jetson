@@ -21,6 +21,7 @@ if(NOT TARGET aap_protobuf)
 endif()
 
 add_library(aa_protocol_adapter STATIC
+    src/protocol/aasdk_adapter/WifiProjectionAdapter.cpp
     src/protocol/aasdk_adapter/ControlAdapter.cpp
     src/protocol/aasdk_adapter/FocusAdapter.cpp
     src/protocol/aasdk_adapter/ServiceAdapter.cpp
@@ -45,6 +46,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
 endif()
 
 set(AA_PROTOCOL_TEST_SOURCES
+    tests/protocol/wifi_projection_test.cpp
     tests/protocol/messages_roundtrip_test.cpp
     tests/protocol/sensor_configuration_test.cpp
     tests/protocol/microphone_configuration_test.cpp
@@ -77,6 +79,9 @@ endif()
 
 add_test(NAME protocol_adapter_messages COMMAND aa_protocol_adapter_test
     --gtest_filter=ControlMessages.*)
+add_test(NAME protocol_adapter_wifi_projection COMMAND aa_protocol_adapter_test
+    --gtest_filter=WifiProjection.*)
+set_tests_properties(protocol_adapter_wifi_projection PROPERTIES TIMEOUT 60)
 add_test(NAME protocol_adapter_reject COMMAND aa_protocol_adapter_test
     --gtest_filter=MessageReject.*)
 add_test(NAME protocol_adapter_channel_map COMMAND aa_protocol_adapter_test

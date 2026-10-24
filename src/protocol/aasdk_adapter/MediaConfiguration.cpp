@@ -138,8 +138,15 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
         }
         return ServiceConfiguration{MicrophoneConfiguration{{16000, 16, 1}}};
     }
+    case ChannelRole::wifi_projection: {
+        const auto& wire = entry.wifi_projection_service();
+        constexpr int wifi_tags[] = {1};
+        if (rejects_unknown(wire, wifi_tags)) { return malformed(); }
+        WifiProjectionConfiguration config;
+        if (wire.has_car_wifi_bssid()) { config.car_wifi_bssid = wire.car_wifi_bssid(); }
+        return ServiceConfiguration{std::move(config)};
+    }
     case ChannelRole::bluetooth_projection:
-    case ChannelRole::wifi_projection:
     case ChannelRole::diagnostics:
         return Error{ErrorCode::protocol_unsupported_channel};
     }
@@ -208,8 +215,13 @@ core::Result<void> put_configuration(aap_protobuf::service::Service& entry,
         audio->set_number_of_channels(profile.channels);
         return {};
     }
+    case ChannelRole::wifi_projection: {
+        auto* wire = entry.mutable_wifi_projection_service();
+        const auto& config = std::get<WifiProjectionConfiguration>(descriptor.configuration);
+        if (config.car_wifi_bssid) { wire->set_car_wifi_bssid(*config.car_wifi_bssid); }
+        return {};
+    }
     case ChannelRole::bluetooth_projection:
-    case ChannelRole::wifi_projection:
     case ChannelRole::diagnostics:
         return Error{ErrorCode::protocol_unsupported_channel};
     }
