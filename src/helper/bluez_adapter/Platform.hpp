@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <aa/helper/BluezBackend.hpp>
+#include <aa/helper/Bootstrap.hpp>
 #include <gio/gio.h>
 #include <chrono>
 #include <map>
@@ -13,17 +14,24 @@ inline constexpr auto kProfilePath = "/org/custom/AndroidAutoSystemHelper/aa_pro
 inline constexpr auto kAgentPath = "/org/custom/AndroidAutoSystemHelper/aa_agent";
 struct BluezBackend::Impl {
     using Clock = std::chrono::steady_clock;
+    Now now;
     struct Device {
         std::string path, adapter_path;
         PeerIdentity identity;
         bool bonded{};
     };
-    struct Observation { Device device; std::string owner; Clock::time_point expires; };
+    struct Observation {
+        Device device; std::string owner; Clock::time_point expires;
+        std::uint64_t owner_epoch{}, device_epoch{}, adapter_epoch{};
+    };
     GMainContext* context{};
     GDBusConnection* bus{};
     GDBusNodeInfo* xml{};
     guint profile_export{}, agent_export{};
     guint owner_subscription{};
+    guint removal_subscription{}, properties_subscription{};
+    std::uint64_t owner_epoch{};
+    std::map<std::string, std::uint64_t> incarnations;
     std::string owner;
     bool profile_requested{true};
     bool registered{}, agent_registered{};
@@ -35,8 +43,14 @@ struct BluezBackend::Impl {
     bool pairing_enabled{};
     bool quiet_pending{};
     int connection{-1};
+    std::shared_ptr<Bootstrap> bootstrap;
+    std::optional<Observation> connected;
+    std::uint64_t handoff_handle{};
+    SnapshotProvider snapshots;
+    SnapshotFence fence;
+    HandoffFailure last_failure{HandoffFailure::none};
     Clock::time_point next_check{};
-    explicit Impl(const std::string&);
+    Impl(const std::string&, Now);
     ~Impl();
     GVariant* call(const char*, const char*, const char*, GVariant*, const GVariantType* = nullptr);
     bool current_owner();
@@ -46,12 +60,17 @@ struct BluezBackend::Impl {
     bool quiet();
     void close_connection();
     void close_window();
+    void close_admission();
     void reset();
     void pump();
     bool exact(const Observation&, bool require_bond);
     bool permitted(const char*, bool pairing);
     std::optional<Observation> consume(std::uint64_t);
     void remember(const PeerIdentity&);
+    void watch_continuity();
+    void drain_events();
+    void lost_path(const std::string&);
+    void retire(std::uint64_t, HandoffFailure);
     static void method(GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar*,
                        GVariant*, GDBusMethodInvocation*, gpointer);
 };

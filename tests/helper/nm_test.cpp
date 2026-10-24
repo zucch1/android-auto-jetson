@@ -3,6 +3,10 @@
 #include "../../src/helper/crypto_adapter/Crypto.hpp"
 #include <aa/helper/BusClient.hpp>
 #include <aa/helper/BusService.hpp>
+#include <aa/helper/AawFrame.hpp>
+#include <aa/helper/BluezBackend.hpp>
+#include <aa/helper/BackendRouter.hpp>
+#include "Bootstrap.pb.h"
 #include <aa/trust/PairingPolicy.hpp>
 #include "../dbus/fakes.hpp"
 #include "../trust/syscall_faults.hpp"
@@ -49,6 +53,7 @@ std::string read_text(const std::filesystem::path& path) {
 struct Child final {
     pid_t pid{};
     int input{-1};
+    int output{-1};
     void start(const std::vector<std::string>& args) {
         std::vector<char*> argv;
         argv.reserve(args.size() + 1);
@@ -73,11 +78,19 @@ struct Child final {
         char byte{};
         ::pollfd input{fd[0], POLLIN, 0};
         while (::poll(&input, 1, 3000) == 1 && ::read(fd[0], &byte, 1) == 1 && byte != '\n') ready += byte;
-        ::close(fd[0]); ASSERT_EQ(ready, "ready");
+        output = fd[0]; ASSERT_EQ(ready, "ready");
+    }
+    std::string command(const std::string& text) {
+        const auto bytes = text + "\n";
+        if (::write(input, bytes.data(), bytes.size()) != static_cast<ssize_t>(bytes.size())) return "write-failed";
+        ::pollfd event{output, POLLIN, 0}; std::string result; char byte{};
+        while (::poll(&event, 1, 4000) == 1 && ::read(output, &byte, 1) == 1 && byte != '\n') result += byte;
+        return result;
     }
     void stop() {
         if (pid) { ::kill(pid, SIGTERM); EXPECT_TRUE(eventually([this] { return ::waitpid(pid, nullptr, WNOHANG) == pid; }, 8000ms)); pid = 0; }
         if (input >= 0) { ::close(input); input = -1; }
+        if (output >= 0) { ::close(output); output = -1; }
     }
     ~Child() { stop(); }
 };
@@ -143,10 +156,12 @@ constexpr auto xml = R"xml(<node>
 <method name="DeactivateConnection"><arg type="o" direction="in"/></method>
 </interface>
 <interface name="org.freedesktop.NetworkManager.Device">
-<property name="DeviceType" type="u" access="read"/><property name="Interface" type="s" access="read"/><property name="ActiveConnection" type="o" access="read"/>
+<property name="DeviceType" type="u" access="read"/><property name="Interface" type="s" access="read"/><property name="ActiveConnection" type="o" access="read"/><property name="Ip4Config" type="o" access="read"/>
 </interface>
 <interface name="org.freedesktop.NetworkManager.Connection.Active"><property name="State" type="u" access="read"/></interface>
 <interface name="org.freedesktop.NetworkManager.Settings.Connection"><method name="Delete"/></interface>
+<interface name="org.freedesktop.NetworkManager.Device.Wireless"><property name="Mode" type="u" access="read"/><property name="HwAddress" type="s" access="read"/></interface>
+<interface name="org.freedesktop.NetworkManager.IP4Config"><property name="AddressData" type="aa{sv}" access="read"/></interface>
 </node>)xml";
 class NetworkManager final {
 public:
@@ -155,6 +170,9 @@ public:
     Boundary& boundary;
     std::mutex mutex;
     std::string seen_psk;
+    std::atomic<bool> bad_mac{}, replaced{}, wrong_mode{}, changed_mac{}, changed_ip{};
+    std::atomic<int> release_owner_at_address{}, replace_device_at_address{}, change_channel_at_address{}, address_reads{}, delay_address_ms{};
+    std::atomic<bool> owner_released{}, device_remapped{};
     NetworkManager(const std::string& address, Boundary& commands) : boundary(commands) {
         std::promise<bool> ready;
         auto result = ready.get_future();
@@ -173,6 +191,8 @@ public:
             const char* paths[]{root, dev, active, profile};
             for (unsigned i = 0; i < 4; ++i)
                 EXPECT_NE(g_dbus_connection_register_object(bus_, paths[i], node->interfaces[i], &vtable, this, nullptr, nullptr), 0U);
+            EXPECT_NE(g_dbus_connection_register_object(bus_, dev, node->interfaces[4], &vtable, this, nullptr, nullptr), 0U);
+            EXPECT_NE(g_dbus_connection_register_object(bus_, "/org/freedesktop/NetworkManager/IP4Config/1", node->interfaces[5], &vtable, this, nullptr, nullptr), 0U);
             const auto subscription = g_dbus_connection_signal_subscribe(bus_, "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
                 "/org/freedesktop/DBus", nullptr, G_DBUS_SIGNAL_FLAGS_NONE, owner_changed, this, nullptr);
             ready.set_value(true);
@@ -204,7 +224,34 @@ private:
     static GVariant* property(GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar* name, GError**, gpointer data) {
         auto& self = *static_cast<NetworkManager*>(data);
         if (std::string{name} == "DeviceType") return g_variant_new_uint32(2);
-        if (std::string{name} == "Interface") return g_variant_new_string("wlan-test");
+        if (std::string{name} == "Interface") return g_variant_new_string(self.replaced ? "replacement" : "wlan-test");
+        if (std::string{name} == "Mode") return g_variant_new_uint32(self.wrong_mode ? 2 : 3);
+        if (std::string{name} == "HwAddress") return g_variant_new_string(self.bad_mac ? "bad" : self.changed_mac ? "02:AB:CD:EF:01:24" : "02:AB:CD:EF:01:23");
+        if (std::string{name} == "Ip4Config") return g_variant_new_object_path("/org/freedesktop/NetworkManager/IP4Config/1");
+        if (std::string{name} == "AddressData") {
+            const auto read = ++self.address_reads;
+            if (self.release_owner_at_address == read) {
+                auto* reply = g_dbus_connection_call_sync(self.bus_, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus", "ReleaseName", g_variant_new("(s)", manager), G_VARIANT_TYPE("(u)"),
+                    G_DBUS_CALL_FLAGS_NONE, 500, nullptr, nullptr);
+                self.owner_released = reply != nullptr;
+                if (reply) g_variant_unref(reply);
+            }
+            if (self.replace_device_at_address == read) self.device_remapped = true;
+            if (self.change_channel_at_address == read) self.boundary.wrong_channel = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds{self.delay_address_ms.load()});
+            GVariantBuilder entries, entry; g_variant_builder_init(&entries, G_VARIANT_TYPE("aa{sv}"));
+            g_variant_builder_init(&entry, G_VARIANT_TYPE_VARDICT);
+            g_variant_builder_add(&entry, "{sv}", "address", g_variant_new_string(self.changed_ip ? "10.42.0.2" :
+#ifdef AA_NM_TEST_ENDPOINT
+                AA_NM_TEST_ENDPOINT
+#else
+                "10.42.0.1"
+#endif
+            ));
+            g_variant_builder_add(&entry, "{sv}", "prefix", g_variant_new_uint32(24));
+            g_variant_builder_add_value(&entries, g_variant_builder_end(&entry)); return g_variant_builder_end(&entries);
+        }
         if (std::string{name} == "ActiveConnection") return g_variant_new_object_path(self.active_now || self.pending ? active : "/");
         if (std::string{name} == "State") return g_variant_new_uint32(self.active_now ? 2 : 1);
         return nullptr;
@@ -213,7 +260,8 @@ private:
                        GVariant* args, GDBusMethodInvocation* invocation, gpointer data) {
         auto& self = *static_cast<NetworkManager*>(data);
         const std::string member{name};
-        if (member == "GetDeviceByIpIface") { g_dbus_method_invocation_return_value(invocation, g_variant_new("(o)", dev)); return; }
+        if (member == "GetDeviceByIpIface") { g_dbus_method_invocation_return_value(invocation,
+            g_variant_new("(o)", self.device_remapped ? "/org/freedesktop/NetworkManager/Devices/2" : dev)); return; }
         if (member == "DeactivateConnection") {
             ++self.deactivations;
             if (self.fail_stop) { g_dbus_method_invocation_return_dbus_error(invocation, "org.example.Failed", "blocked"); return; }
@@ -332,6 +380,253 @@ TEST_F(NmDaemon, HappyStartProjectionIsolationAndRollback) {
     EXPECT_GT(nm->deactivations, 0); EXPECT_GT(nm->deletions, 0);
     EXPECT_EQ(text, read_text(directory / "state/ap.credentials"));
     EXPECT_FALSE(client->call({Operation::open_pairing_window, 0}, core::Milliseconds{500}, {}));
+}
+TEST_F(NmDaemon, ActivationSnapshotUsesCachedCredentialsAndCurrentLocalMac) {
+    Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
+        private_commands((directory / "commands").string())};
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
+    ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::active; }));
+    auto snapshot = backend.ap_snapshot(); ASSERT_TRUE(snapshot);
+    EXPECT_EQ(snapshot.value().bssid, "02:ab:cd:ef:01:23"); EXPECT_EQ(snapshot.value().ip, "10.42.0.1"); EXPECT_EQ(snapshot.value().port, 5277U);
+    const auto saved = read_text(directory / "state/ap.credentials");
+    EXPECT_TRUE(snapshot.value().password == saved.substr(20, 64));
+    save(directory / "state/ap.credentials", "invalid-file-must-not-be-read");
+    auto cached = backend.ap_snapshot(); ASSERT_TRUE(cached); EXPECT_TRUE(cached.value() == snapshot.value());
+    EXPECT_TRUE(backend.snapshot_current(snapshot.value().generation));
+    backend.cleanup(); EXPECT_FALSE(backend.snapshot_current(snapshot.value().generation)); EXPECT_FALSE(backend.ap_snapshot());
+}
+TEST_F(NmDaemon, SnapshotRejectsMalformedMacModeAndDeviceChanges) {
+    Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
+        private_commands((directory / "commands").string())};
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
+    ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::active; }));
+    nm->bad_mac = true; EXPECT_FALSE(backend.ap_snapshot()); nm->bad_mac = false;
+    nm->wrong_mode = true; EXPECT_FALSE(backend.ap_snapshot()); nm->wrong_mode = false;
+    nm->replaced = true; EXPECT_FALSE(backend.ap_snapshot()); nm->replaced = false;
+    boundary->wrong_channel = true; EXPECT_FALSE(backend.ap_snapshot());
+}
+TEST_F(NmDaemon, OwnerReleaseDuringFinalEndpointReadCannotPublishOldUniqueReply) {
+    Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
+        private_commands((directory / "commands").string())};
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
+    ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::active; }));
+    nm->release_owner_at_address = 2;
+    const auto snapshot = backend.ap_snapshot();
+    EXPECT_TRUE(nm->owner_released); EXPECT_EQ(nm->address_reads, 2);
+    EXPECT_FALSE(snapshot);
+}
+TEST_F(NmDaemon, DeviceRemapDuringFinalEndpointReadCannotPublishCachedGeneration) {
+    Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
+        private_commands((directory / "commands").string())};
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
+    ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::active; }));
+    nm->replace_device_at_address = 2;
+    EXPECT_FALSE(backend.ap_snapshot()); EXPECT_TRUE(nm->device_remapped);
+}
+TEST_F(NmDaemon, DeviceReplacementAfterSnapshotCannotPassTransmitFence) {
+    Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
+        private_commands((directory / "commands").string())};
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
+    ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::active; }));
+    const auto snapshot = backend.ap_snapshot(); ASSERT_TRUE(snapshot);
+    nm->device_remapped = true; bool transmitted{};
+    EXPECT_FALSE(backend.with_snapshot(snapshot.value().generation, [&] { transmitted = true; }));
+    EXPECT_FALSE(transmitted);
+}
+TEST_F(NmDaemon, ChannelChangeDuringTransmitFenceCannotSendCredentialsOrReviveEpoch) {
+    // Given a collected snapshot on channel36, change only the radio at the next fence read.
+    Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
+        private_commands((directory / "commands").string())};
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
+    ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::active; }));
+    const auto snapshot = backend.ap_snapshot(); ASSERT_TRUE(snapshot);
+    nm->change_channel_at_address = nm->address_reads + 1;
+    bool transmitted{};
+    // When transmission is requested, the endpoint read changes the channel to44.
+    const auto sent = backend.with_snapshot(snapshot.value().generation, [&] { transmitted = true; });
+    // Then no credential callback runs, and restoring the radio cannot revive authority.
+    EXPECT_TRUE(boundary->wrong_channel); EXPECT_FALSE(nm->device_remapped);
+    EXPECT_FALSE(sent); EXPECT_FALSE(transmitted);
+    boundary->wrong_channel = false;
+    EXPECT_FALSE(backend.snapshot_current(snapshot.value().generation));
+}
+TEST_F(NmDaemon, OwnerReleaseDuringTransmitFenceCannotUsePreviouslyValidatedSnapshot) {
+    Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
+        private_commands((directory / "commands").string())};
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
+    ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::active; }));
+    const auto snapshot = backend.ap_snapshot(); ASSERT_TRUE(snapshot);
+    nm->release_owner_at_address = nm->address_reads + 1; bool transmitted{};
+    EXPECT_FALSE(backend.with_snapshot(snapshot.value().generation, [&] { transmitted = true; }));
+    EXPECT_TRUE(nm->owner_released); EXPECT_FALSE(transmitted);
+    EXPECT_FALSE(backend.snapshot_current(snapshot.value().generation));
+}
+std::vector<std::uint8_t> unhex(const std::string& hex) {
+    std::vector<std::uint8_t> bytes;
+    if (hex == "open" || hex == "closed" || hex.size() % 2) return bytes;
+    for (std::size_t i = 0; i < hex.size(); i += 2) bytes.push_back(static_cast<std::uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+    return bytes;
+}
+TEST_F(NmDaemon, ComposedBootstrapUsesRealBusClientAndRfcommBytes) {
+    start(); acquire(); ASSERT_TRUE(state(State::active));
+    ASSERT_EQ(bluez.command("paired"), "ok"); ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    HandoffFailure failure{}; auto peer = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(peer);
+    const auto handle = peer.value().handle;
+    EXPECT_FALSE(client->get_ap_credentials({2, 2}, handle)); EXPECT_FALSE(client->get_ap_credentials({1, 1}, handle + 1));
+    auto rogue = BusClient::private_bus(address, *store); ASSERT_TRUE(rogue);
+    EXPECT_FALSE(rogue.value()->get_ap_credentials({1, 1}, handle));
+    auto snapshot = client->get_ap_credentials({1, 1}, handle); ASSERT_TRUE(snapshot);
+    EXPECT_EQ(bluez.command("wire-read"), "open");
+    ASSERT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, true));
+    AawDecoder start_decoder; AawDecodeResult first;
+    ASSERT_TRUE(eventually([&] {
+        start_decoder.feed(unhex(bluez.command("wire-read"))); first = start_decoder.next();
+        return !std::holds_alternative<std::monostate>(first);
+    }));
+    ASSERT_TRUE(std::holds_alternative<AawRecord>(first));
+    EXPECT_EQ(std::get<AawRecord>(first).id, 1); aaw::WifiStartRequest endpoint;
+    ASSERT_TRUE(endpoint.ParseFromArray(std::get<AawRecord>(first).payload.data(), static_cast<int>(std::get<AawRecord>(first).payload.size())));
+    EXPECT_EQ(endpoint.ip_address(), "10.42.0.1"); EXPECT_EQ(endpoint.port(), 5277U);
+    ASSERT_EQ(bluez.command("wire-send 00000002"), "ok");
+    AawDecoder info_decoder; AawDecodeResult info_record;
+    ASSERT_TRUE(eventually([&] {
+        info_decoder.feed(unhex(bluez.command("wire-read"))); info_record = info_decoder.next();
+        return !std::holds_alternative<std::monostate>(info_record);
+    }));
+    ASSERT_TRUE(std::holds_alternative<AawRecord>(info_record)); EXPECT_EQ(std::get<AawRecord>(info_record).id, 3);
+    aaw::WifiInfoResponse info; ASSERT_TRUE(info.ParseFromArray(std::get<AawRecord>(info_record).payload.data(), static_cast<int>(std::get<AawRecord>(info_record).payload.size())));
+    EXPECT_TRUE(info.password() == snapshot.value().password); EXPECT_EQ(info.bssid(), "02:ab:cd:ef:01:23");
+    EXPECT_EQ(info.security_mode(), 8); EXPECT_EQ(info.access_point_type(), 1);
+    ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    // Contract v2.4: successful FD closure transfers revocable authority, not retirement.
+    const auto completed = client->get_ap_credentials({1, 1}, handle); ASSERT_TRUE(completed);
+    EXPECT_TRUE(completed.value() == snapshot.value());
+    const auto polled = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(polled);
+    EXPECT_EQ(polled.value().handle, handle);
+    EXPECT_FALSE(client->get_ap_credentials({2, 2}, handle));
+    EXPECT_FALSE(client->get_ap_credentials({1, 1}, handle + 1));
+    EXPECT_FALSE(rogue.value()->get_ap_credentials({1, 1}, handle));
+}
+#include "nm_lifecycle_tests.inc"
+TEST_F(NmDaemon, ComposedReceiverDenialClosesWithoutAnyPayload) {
+    start(); acquire(); ASSERT_TRUE(state(State::active));
+    ASSERT_EQ(bluez.command("paired"), "ok"); ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    HandoffFailure failure{}; auto peer = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(peer);
+    ASSERT_TRUE(client->authorize_bootstrap({1, 1}, peer.value().handle, false, false));
+    EXPECT_EQ(bluez.command("wire-read"), "closed"); EXPECT_FALSE(client->get_ap_credentials({1, 1}, peer.value().handle));
+    EXPECT_FALSE(client->poll_bootstrap({1, 1}, failure)); EXPECT_EQ(failure, HandoffFailure::denied);
+}
+TEST_F(NmDaemon, ComposedReplacementInSameAdmissionNeedsFreshHandleAuthorization) {
+    start(); acquire(); ASSERT_TRUE(state(State::active));
+    ASSERT_EQ(bluez.command("paired"), "ok"); ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    HandoffFailure failure{}; const auto old = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(old);
+    ASSERT_TRUE(client->get_ap_credentials({1, 1}, old.value().handle));
+    ASSERT_TRUE(client->authorize_bootstrap({1, 1}, old.value().handle, false, false));
+    ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    const auto fresh = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(fresh);
+    EXPECT_NE(fresh.value().handle, old.value().handle); EXPECT_EQ(bluez.command("wire-read"), "open");
+    EXPECT_FALSE(client->get_ap_credentials({1, 1}, old.value().handle));
+    ASSERT_TRUE(client->get_ap_credentials({1, 1}, fresh.value().handle));
+    ASSERT_TRUE(client->authorize_bootstrap({1, 1}, fresh.value().handle, true, true));
+    AawDecoder decoder; AawDecodeResult endpoint;
+    ASSERT_TRUE(eventually([&] {
+        decoder.feed(unhex(bluez.command("wire-read"))); endpoint = decoder.next();
+        return !std::holds_alternative<std::monostate>(endpoint);
+    }));
+    ASSERT_TRUE(std::holds_alternative<AawRecord>(endpoint)); EXPECT_EQ(std::get<AawRecord>(endpoint).id, 1);
+    ASSERT_EQ(bluez.command("RequestDisconnection"), "allowed");
+    ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    const auto third = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(third);
+    EXPECT_NE(third.value().handle, fresh.value().handle); EXPECT_EQ(bluez.command("wire-read"), "open");
+    EXPECT_FALSE(client->get_ap_credentials({1, 1}, fresh.value().handle));
+    EXPECT_TRUE(client->get_ap_credentials({1, 1}, third.value().handle));
+    EXPECT_TRUE(client->authorize_bootstrap({1, 1}, third.value().handle, true, true));
+}
+TEST_F(NmDaemon, ExpiredHandoffRejectsOnUseWithoutPlatformTick) {
+    const auto began = Clock::now(); std::atomic<std::int64_t> elapsed{};
+    BluezBackend bluetooth{address, [&] { return began + std::chrono::milliseconds{elapsed.load()}; }};
+    ASSERT_TRUE(bluetooth.apply(Action::register_profile, 0));
+    ASSERT_EQ(bluez.command("paired"), "ok"); const auto observed = bluetooth.observe(); ASSERT_TRUE(observed);
+    ASSERT_TRUE(bluetooth.reconnect_peer(observed.value().handle));
+    auto incoming = std::async(std::launch::async, [&] { return bluez.command("NewConnection"); });
+    ASSERT_TRUE(eventually([&] { bluetooth.tick(); return incoming.wait_for(0ms) == std::future_status::ready; }));
+    ASSERT_EQ(incoming.get(), "allowed"); ASSERT_TRUE(bluetooth.handoff());
+    elapsed = 10000;
+    EXPECT_FALSE(bluetooth.handoff()); EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_EQ(bluetooth.handoff_failure(), HandoffFailure::timeout);
+}
+TEST_F(NmDaemon, NearExpiryDelayedCollectionClosesSocketAndReturnsEmptyTypedError) {
+    const auto began = Clock::now();
+    std::atomic<std::int64_t> offset{}, resumed_at{};
+    BluezBackend bluetooth{address, [&] {
+        const auto resumed = resumed_at.load();
+        return began + std::chrono::milliseconds{offset.load()} + (resumed ? Clock::now().time_since_epoch() - Clock::duration{resumed} : Clock::duration{});
+    }};
+    Backend ap{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
+        private_commands((directory / "commands").string())};
+    BackendRouter router{{ap, bluetooth}};
+    const int fd = ::open("/proc/self/exe", O_RDONLY | O_CLOEXEC); ASSERT_GE(fd, 0);
+    const auto digest = crypto_adapter::hash_executable(fd, Clock::now() + 1s); ::close(fd); ASSERT_TRUE(digest);
+    auto service = BusService::private_bus(address, {::getuid(), digest.value()}, router); ASSERT_TRUE(service);
+    std::jthread pump{[&](const std::stop_token& stop) { while (!stop.stop_requested()) if (!service.value().cycle()) return; }};
+    auto connected = BusClient::private_bus(address, *store); ASSERT_TRUE(connected); client = std::move(connected.value());
+    acquire(); ASSERT_TRUE(state(State::active));
+    ASSERT_EQ(bluez.command("paired"), "ok"); ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    HandoffFailure failure{}; const auto peer = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(peer);
+    nm->delay_address_ms = 120; offset = 9850;
+    auto fetched = std::async(std::launch::async, [&] { return client->get_ap_credentials({1, 1}, peer.value().handle); });
+    ASSERT_TRUE(eventually([&] { return nm->address_reads > 0; }, 1000ms));
+    resumed_at = Clock::now().time_since_epoch().count();
+    const auto closure = bluez.command("wire-read");
+    EXPECT_EQ(closure, "closed");
+    const auto result = fetched.get(); EXPECT_FALSE(result);
+    if (!result) { EXPECT_EQ(result.error().code(), ErrorCode::helper_rejected); }
+    pump.request_stop(); pump.join();
+}
+TEST_F(NmDaemon, ComposedApprovedReconnectFetchesWithoutPendingAddPhone) {
+    start(); acquire(); ASSERT_TRUE(state(State::active));
+    const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
+    ASSERT_TRUE(store->approve(identity)); ASSERT_EQ(bluez.command("paired"), "ok");
+    ASSERT_TRUE(client->reconnect(identity)); ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    HandoffFailure failure{}; const auto peer = client->poll_bootstrap({7, 0}, failure); ASSERT_TRUE(peer);
+    ASSERT_TRUE(client->get_ap_credentials({7, 0}, peer.value().handle));
+    EXPECT_EQ(store->phones().size(), 1U); EXPECT_FALSE(client->get_ap_credentials({1, 1}, peer.value().handle));
+    EXPECT_TRUE(client->authorize_bootstrap({7, 0}, peer.value().handle, false, false));
+}
+TEST_F(NmDaemon, ComposedBssidChangeAfterFetchFailsBeforeEndpoint) {
+    start(); acquire(); ASSERT_TRUE(state(State::active));
+    ASSERT_EQ(bluez.command("paired"), "ok"); ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    HandoffFailure failure{}; const auto peer = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(peer);
+    ASSERT_TRUE(client->get_ap_credentials({1, 1}, peer.value().handle)); nm->changed_mac = true;
+    EXPECT_FALSE(client->authorize_bootstrap({1, 1}, peer.value().handle, true, true));
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_FALSE(client->poll_bootstrap({1, 1}, failure)); EXPECT_EQ(failure, HandoffFailure::snapshot);
+}
+TEST_F(NmDaemon, AcceptedBootstrapOutlivesAdmissionButNotItsOwnTenSeconds) {
+    const auto began = Clock::now(); std::atomic<std::int64_t> elapsed{};
+    BluezBackend bluetooth{address, [&] { return began + std::chrono::milliseconds{elapsed.load()}; }};
+    ASSERT_TRUE(bluetooth.apply(Action::register_profile, 0));
+    ASSERT_EQ(bluez.command("paired"), "ok"); const auto observed = bluetooth.observe(); ASSERT_TRUE(observed);
+    ASSERT_TRUE(bluetooth.reconnect_peer(observed.value().handle));
+    elapsed = 59000;
+    auto incoming = std::async(std::launch::async, [&] { return bluez.command("NewConnection"); });
+    ASSERT_TRUE(eventually([&] { bluetooth.tick(); return incoming.wait_for(0ms) == std::future_status::ready; }));
+    ASSERT_EQ(incoming.get(), "allowed"); const auto handoff = bluetooth.handoff(); ASSERT_TRUE(handoff);
+    elapsed += 2000; bluetooth.tick(); EXPECT_TRUE(bluetooth.handoff());
+    auto late = std::async(std::launch::async, [&] { return bluez.command("NewConnection"); });
+    ASSERT_TRUE(eventually([&] { bluetooth.tick(); return late.wait_for(0ms) == std::future_status::ready; }));
+    EXPECT_EQ(late.get(), "rejected"); EXPECT_TRUE(bluetooth.handoff());
+    elapsed += 8000; bluetooth.tick(); EXPECT_FALSE(bluetooth.handoff()); EXPECT_EQ(bluetooth.handoff_failure(), HandoffFailure::timeout);
+}
+TEST_F(NmDaemon, ComposedRevocationAfterSnapshotPreventsCredentialSend) {
+    start(); acquire(); ASSERT_TRUE(state(State::active));
+    ASSERT_EQ(bluez.command("paired"), "ok"); ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    HandoffFailure failure{}; auto peer = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(peer);
+    ASSERT_TRUE(client->get_ap_credentials({1, 1}, peer.value().handle));
+    client->teardown(core::ConsumerId{1});
+    EXPECT_FALSE(client->authorize_bootstrap({1, 1}, peer.value().handle, true, true));
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
 }
 TEST_F(NmDaemon, EffectiveCountryUnsetFailsBeforeExposure) {
     boundary->country = false; start(); acquire(); ASSERT_TRUE(state(State::unavailable));
