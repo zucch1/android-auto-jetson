@@ -3,6 +3,9 @@
 #include <fcntl.h>
 #include <limits>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <cctype>
+#include <algorithm>
 
 namespace aa::helper::nm {
 namespace {
@@ -101,9 +104,11 @@ Connection::~Connection() {
 }
 bool Connection::healthy() const {
     if (!bus_ || g_dbus_connection_is_closed(bus_) || owner_.empty()) return false;
+    const int timeout = call_timeout();
+    if (!timeout) return false;
     auto* reply = g_dbus_connection_call_sync(bus_, "org.freedesktop.DBus", "/org/freedesktop/DBus",
         "org.freedesktop.DBus", "GetNameOwner", g_variant_new("(s)", manager), G_VARIANT_TYPE("(s)"),
-        G_DBUS_CALL_FLAGS_NONE, 300, nullptr, nullptr);
+        G_DBUS_CALL_FLAGS_NONE, timeout, nullptr, nullptr);
     if (!reply) return false;
     const char* owner{};
     g_variant_get(reply, "(&s)", &owner);
@@ -113,12 +118,18 @@ bool Connection::healthy() const {
 }
 GVariant* Connection::call(const std::string& path, const char* interface, const char* method,
                             GVariant* args, const GVariantType* result, GError** error) {
-    if (!bus_ || owner_.empty()) {
+    const int timeout = call_timeout();
+    if (!bus_ || owner_.empty() || !timeout) {
         if (args) { g_variant_ref_sink(args); g_variant_unref(args); }
         return nullptr;
     }
     return g_dbus_connection_call_sync(bus_, owner_.c_str(), path.c_str(), interface, method,
-        args, result, G_DBUS_CALL_FLAGS_NO_AUTO_START, 300, nullptr, error);
+        args, result, G_DBUS_CALL_FLAGS_NO_AUTO_START, timeout, nullptr, error);
+}
+int Connection::call_timeout() const {
+    if (collection_deadline_.until == std::chrono::steady_clock::time_point::max()) return 300;
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(collection_deadline_.until - collection_deadline_.now()).count();
+    return static_cast<int>(std::clamp<std::int64_t>(left, 0, 300));
 }
 std::string Connection::device(const std::string& interface) {
     auto* reply = call(root, manager, "GetDeviceByIpIface", g_variant_new("(s)", interface.c_str()), G_VARIANT_TYPE("(o)"));
@@ -190,6 +201,45 @@ bool Connection::start(const Policy& policy, const Credentials& secret, const st
 }
 bool Connection::active() const {
     return !active_.empty() && const_cast<Connection*>(this)->number_property(active_, active_interface, "State") == 2;
+}
+bool Connection::identity_current(const Policy& policy, const std::string& path) {
+    return device(policy.interface) == path && text_property(path, device_interface, "Interface") == policy.interface &&
+        text_property(path, device_interface, "ActiveConnection") == active_ && active() && healthy();
+}
+core::Result<std::pair<std::string, std::string>> Connection::endpoint(const Policy& policy, const std::string& path) {
+    constexpr auto wireless = "org.freedesktop.NetworkManager.Device.Wireless";
+    if (!healthy() || !active() || device(policy.interface) != path ||
+        text_property(path, device_interface, "Interface") != policy.interface ||
+        text_property(path, device_interface, "ActiveConnection") != active_ ||
+        number_property(path, device_interface, "DeviceType") != 2 || number_property(path, wireless, "Mode") != 3)
+        return Error{ErrorCode::helper_unavailable};
+    auto mac = text_property(path, wireless, "HwAddress");
+    if (mac.size() != 17) return Error{ErrorCode::helper_rejected};
+    for (std::size_t i = 0; i < mac.size(); ++i) {
+        if (i % 3 == 2 ? mac[i] != ':' : !std::isxdigit(static_cast<unsigned char>(mac[i])))
+            return Error{ErrorCode::helper_rejected};
+        mac[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(mac[i])));
+    }
+    if (mac == "00:00:00:00:00:00" || (std::stoi(mac.substr(0, 2), nullptr, 16) & 1))
+        return Error{ErrorCode::helper_rejected};
+    const auto config = text_property(path, device_interface, "Ip4Config");
+    if (config.empty() || config == "/") return Error{ErrorCode::helper_unavailable};
+    auto* reply = call(config, "org.freedesktop.DBus.Properties", "Get",
+        g_variant_new("(ss)", "org.freedesktop.NetworkManager.IP4Config", "AddressData"), G_VARIANT_TYPE("(v)"));
+    if (!reply) return Error{ErrorCode::helper_unavailable};
+    GVariant* addresses{}; g_variant_get(reply, "(v)", &addresses);
+    std::string ip;
+    if (g_variant_is_of_type(addresses, G_VARIANT_TYPE("aa{sv}")) && g_variant_n_children(addresses) == 1) {
+        auto* entry = g_variant_get_child_value(addresses, 0); const char* text{};
+        if (g_variant_lookup(entry, "address", "&s", &text)) ip = text;
+        g_variant_unref(entry);
+    }
+    g_variant_unref(addresses); g_variant_unref(reply);
+    in_addr parsed{};
+    if (::inet_pton(AF_INET, ip.c_str(), &parsed) != 1 || ip == "0.0.0.0" || ip == "255.255.255.255" || ip.starts_with("127."))
+        return Error{ErrorCode::helper_rejected};
+    if (!identity_current(policy, path)) return Error{ErrorCode::helper_unavailable};
+    return std::pair{mac, ip};
 }
 bool Connection::stop(const std::string& device_path) {
     if (unknown_activation_ || !healthy()) {

@@ -63,7 +63,8 @@ BusConnection::~BusConnection() {
 }
 
 BusConnection::BusConnection(BusConnection&& other) noexcept
-    : fd_(other.fd_), next_serial_(other.next_serial_), unique_name_(std::move(other.unique_name_)), deadline_(other.deadline_) {
+    : fd_(other.fd_), next_serial_(other.next_serial_), unique_name_(std::move(other.unique_name_)), deadline_(other.deadline_),
+      sensitive_receive_(other.sensitive_receive_) {
     other.fd_ = -1;
 }
 
@@ -76,12 +77,14 @@ BusConnection& BusConnection::operator=(BusConnection&& other) noexcept {
         next_serial_ = other.next_serial_;
         unique_name_ = std::move(other.unique_name_);
         deadline_ = other.deadline_;
+        sensitive_receive_ = other.sensitive_receive_;
         other.fd_ = -1;
     }
     return *this;
 }
 
-core::Result<ParsedMessage> BusConnection::read_message() {
+core::Result<ParsedMessage> BusConnection::read_message(bool sensitive) {
+    sensitive_receive_ = sensitive_receive_ || sensitive;
     std::array<std::uint8_t, 16> head{};
     const auto until = deadline_.value_or(bus_io::deadline());
     const auto got_head = bus_io::read_full(fd_, head, until);
@@ -93,6 +96,7 @@ core::Result<ParsedMessage> BusConnection::read_message() {
         return total.error();
     }
     std::vector<std::uint8_t> bytes(total.value());
+    const core::SecretScope wipe_bytes{bytes, sensitive_receive_};
     std::copy(head.begin(), head.end(), bytes.begin());
     const auto got_rest =
         bus_io::read_full(fd_, std::span<std::uint8_t>{bytes}.subspan(head.size()), until);

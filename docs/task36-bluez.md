@@ -62,8 +62,11 @@ PIN/passkey/numeric-comparison paths are rejected, not silently approved.
    generic Device1.Connect. Targetless action9 is rejected.
 5. NewConnection validates the real Unix-FD index, duplicates and owns one socket,
    rejects wrong/duplicate connections, and closes it on RequestDisconnection,
-   cancel, idle expiry, owner change, receiver loss and teardown. No RFCOMM bytes
-   are read/written: **task37 owns Wi-Fi credential exchange and session/media**.
+   cancel, idle expiry, owner change, receiver loss and teardown. Task37 now
+   implements the helper-owned RFCOMM Wi-Fi credential bootstrap on this socket,
+   host-tested only, plus the shared session/media path; see
+   [wireless-handoff.md](wireless-handoff.md). Production TCP endpoint binding
+   and real-phone qualification remain **BLOCKED**.
 
 Cancellation/failed trust confirmation discards the bound observation. Ordinary
 Invalidate/teardown quiets the adapter and closes sockets but never RemoveDevice.
@@ -125,5 +128,7 @@ its persistent bond.
   is added. Actual proc/executable inspection, BlueZ/system-bus policy/default-agent
   permission and sandbox behavior must be verified on target before installation.
 - Local composition integrates exact revocation with AP PSK rotation/client eviction.
-  Task37 must provide RFCOMM Wi-Fi handoff/session
-  ownership. This feature alone cannot establish wireless projection.
+  Task37 now provides the host-tested helper-owned RFCOMM Wi-Fi handoff and
+  session ownership described in [wireless-handoff.md](wireless-handoff.md).
+  Production wireless admission remains **BLOCKED** on TCP endpoint binding;
+  this feature alone cannot establish or qualify wireless projection.

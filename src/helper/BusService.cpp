@@ -40,15 +40,42 @@ struct BusService::Impl {
           helper(identities, backend) {}
     core::Result<void> dispatch(const ParsedMessage& message) {
         if (message.type != MessageType::method_call) return {};
-        MessageWriter reply;
-        reply.destination(message.sender).reply_serial(message.serial);
         core::Result<std::uint64_t> result{Error{ErrorCode::helper_protocol_mismatch}};
         Cursor body{message.body};
         std::optional<ObservedPeer> peer;
         const bool polling = message.member == "PollPeerV1";
+        const bool bootstrap_poll = message.member == "PollBootstrapV1";
+        const bool credentials = message.member == "GetAPCredentialsV1";
+        std::optional<ApSnapshot> snapshot;
+        Source snapshot_source;
+        std::uint64_t snapshot_handle{};
         if (message.path == kObjectPath && message.interface_name == kInterface &&
             !message.sender.empty() && message.sender.front() == ':') {
-            if (polling && message.signature.empty() && body.done()) {
+            if ((bootstrap_poll || credentials || message.member == "AuthorizeBootstrapV1") &&
+                message.signature == (bootstrap_poll ? "tt" : credentials ? "ttt" : "tttuu")) {
+                const auto generation = body.read_u64(); const auto confirmation = body.read_u64();
+                if (generation && confirmation) {
+                    const Source source{generation.value(), confirmation.value()};
+                    if (bootstrap_poll && body.done()) {
+                        const auto observed = helper.poll_handoff(message.sender, source);
+                        if (observed) { peer = observed.value(); result = peer->handle; } else result = observed.error();
+                    } else if (!bootstrap_poll) {
+                        const auto handle = body.read_u64();
+                        if (credentials && handle && body.done()) {
+                            auto fetched = helper.ap_credentials(message.sender, source, handle.value());
+                            if (fetched) {
+                                snapshot = fetched.value(); snapshot_source = source; snapshot_handle = handle.value(); result = 0;
+                            } else result = fetched.error();
+                        } else if (!credentials && handle) {
+                            const auto allow = body.read_u32(); const auto ready = body.read_u32();
+                            if (allow && ready && allow.value() <= 1 && ready.value() <= 1 && body.done()) {
+                                const auto authorized = helper.authorize_handoff(message.sender, source, handle.value(), allow.value() != 0, ready.value() != 0);
+                                result = authorized ? core::Result<std::uint64_t>{0} : core::Result<std::uint64_t>{authorized.error()};
+                            }
+                        }
+                    }
+                }
+            } else if (polling && message.signature.empty() && body.done()) {
                 const auto observed = helper.observe(message.sender);
                 if (observed) { peer = observed.value(); result = peer->handle; }
                 else result = observed.error();
@@ -107,13 +134,36 @@ struct BusService::Impl {
                 }
             }
         }
-        // Every reply has the same typed error/value shape; no dynamic identifiers.
-        reply.body_signature(polling ? "utss" : "ut").put_u32(result ? 0U : static_cast<std::uint32_t>(result.error().code()))
-              .put_u64(result ? result.value() : 0);
-        if (polling) reply.put_string(peer ? peer->identity.address : "").put_string(peer ? peer->identity.adapter : "");
-        export_bus.deadline(Clock::now() + std::chrono::milliseconds(500));
-        const auto sent = export_bus.send_message(MessageType::method_return, reply);
-        return sent ? core::Result<void>{} : core::Result<void>{sent.error()};
+        core::Result<void> sent{Error{ErrorCode::helper_unavailable}};
+        const auto transmit = [&] {
+            for (;;) {
+                MessageWriter reply;
+                const auto wipe_body = reply.protect_body(credentials);
+                reply.destination(message.sender).reply_serial(message.serial);
+                reply.body_signature(credentials ? "utssssut" : bootstrap_poll ? "utssu" : polling ? "utss" : "ut")
+                    .put_u32(result ? 0U : static_cast<std::uint32_t>(result.error().code())).put_u64(result ? result.value() : 0);
+                if (polling || bootstrap_poll) reply.put_string(peer ? peer->identity.address : "").put_string(peer ? peer->identity.adapter : "");
+                if (bootstrap_poll) reply.put_u32(static_cast<std::uint32_t>(helper.handoff_failure(message.sender)));
+                if (credentials) reply.put_string(snapshot ? snapshot->ssid : "").put_string(snapshot ? std::string_view{snapshot->password} : std::string_view{})
+                    .put_string(snapshot ? snapshot->bssid : "").put_string(snapshot ? snapshot->ip : "")
+                    .put_u32(snapshot ? snapshot->port : 0).put_u64(snapshot ? snapshot->generation : 0);
+                auto until = Clock::now() + std::chrono::milliseconds(500);
+                if (snapshot) {
+                    const auto authority = helper.snapshot_deadline();
+                    if (authority.expired()) { snapshot.reset(); result = Error{ErrorCode::helper_rejected}; continue; }
+                    if (authority.until != Clock::time_point::max()) until = std::min(until, Clock::now() + (authority.until - authority.now()));
+                }
+                export_bus.deadline(until);
+                const auto reply_sent = export_bus.send_message(MessageType::method_return, reply, credentials);
+                sent = reply_sent ? core::Result<void>{} : core::Result<void>{reply_sent.error()};
+                return;
+            }
+        };
+        if (snapshot) {
+            if (helper.transmit_snapshot(message.sender, {snapshot_source, snapshot_handle, snapshot->generation}, transmit)) return sent;
+            snapshot.reset(); result = Error{ErrorCode::helper_rejected};
+        }
+        transmit(); return sent;
     }
 };
 BusService::BusService(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -139,7 +189,6 @@ core::Result<BusService> BusService::private_bus(const std::string& address,
                                            std::move(policy), backend)};
 }
 core::Result<void> BusService::cycle() {
-    impl_->helper.platform_tick();
     if (Clock::now() >= impl_->next_tick) {
         impl_->helper.tick(Clock::now());
         impl_->next_tick = Clock::now() + std::chrono::seconds(1);
@@ -152,7 +201,7 @@ core::Result<void> BusService::cycle() {
         impl_->helper.bus_lost();
         return Error{ErrorCode::helper_unavailable};
     }
-    if (!ready) return {};
+    if (!ready) { impl_->helper.platform_tick(); return {}; }
     impl_->export_bus.deadline(Clock::now() + std::chrono::milliseconds(500));
     const auto message = impl_->export_bus.read_message();
     if (!message) {
@@ -161,6 +210,7 @@ core::Result<void> BusService::cycle() {
     }
     const auto result = impl_->dispatch(message.value());
     if (!result) impl_->helper.bus_lost();
+    else impl_->helper.platform_tick();
     return result;
 }
 }

@@ -3,6 +3,7 @@
 
 #include <aa/core/Result.hpp>
 #include <aa/protocol/Protocol.hpp>
+#include <aa/protocol/WifiProjection.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -183,7 +184,7 @@ struct MicrophoneConfiguration final {
 };
 using ServiceConfiguration =
     std::variant<std::monostate, VideoConfiguration, AudioConfiguration, ButtonConfiguration,
-                 SensorConfiguration, MicrophoneConfiguration>;
+                 SensorConfiguration, MicrophoneConfiguration, WifiProjectionConfiguration>;
 
 // One advertised channel service. `id` is dynamic (ID space 2); `role` is the
 // semantic role resolved by the session router, never an ordinal.

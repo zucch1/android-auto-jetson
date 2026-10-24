@@ -23,8 +23,19 @@ explicitly confirm the actual jurisdiction (or replace US with the confirmed
 two-uppercase-letter jurisdiction), interface and projection port. No country
 is inferred, no automatic regulatory override is made, and there is no fallback
 channel. Missing/malformed/unconfirmed configuration aborts daemon startup with
-an actionable diagnostic. Configure the receiver's later projection listener to
-the same port; task35 does not implement that listener or task37 handoff.
+an actionable diagnostic. Configure the receiver projection listener to the same
+port. Task35 does not implement that listener or handoff; task37 now implements
+the host-tested receiver listener and helper-owned RFCOMM handoff, with
+production TCP admission still **BLOCKED** as described in
+[wireless-handoff.md](wireless-handoff.md).
+
+Task37's `GetAPCredentialsV1` uses an activation snapshot that pins the
+activation generation, live BSSID/IP and provisioned port, and fences the NM
+owner, device and channel through credential transmission. Any change
+invalidates the snapshot rather than mixing generations. Committed ForgetPhone
+or error703 revocation rotates credentials and evicts all AP access by design;
+shared-AP disruption is expected even though unrelated trust and bindings
+survive.
 
 `StateDirectory=aa-system-helper`, mode0700, gives only
 `/var/lib/aa-system-helper` writable state. `ap.credentials` is generated using

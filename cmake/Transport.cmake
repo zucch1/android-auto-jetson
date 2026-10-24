@@ -56,7 +56,8 @@ if(NOT CMAKE_CROSSCOMPILING)
 
     add_executable(aa_transport_io_test
         tests/transport/io_test.cpp tests/transport/cancellation_test.cpp
-        tests/transport/lifetime_test.cpp tests/transport/pending_test.cpp)
+        tests/transport/lifetime_test.cpp tests/transport/pending_test.cpp
+        tests/transport/wireless_tcp_test.cpp)
     target_link_libraries(aa_transport_io_test PRIVATE aa_transport GTest::gtest_main)
     set_target_properties(aa_transport_io_test PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
@@ -95,6 +96,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME transport_malformed COMMAND aa_transport_frame_test --gtest_filter=Malformed.*)
     add_test(NAME transport_fuzz_smoke COMMAND aa_transport_frame_test --gtest_filter=FuzzSmoke.*)
     add_test(NAME transport_tcp COMMAND aa_transport_io_test --gtest_filter=TcpTransport.*)
+    add_test(NAME wireless_e2e_tcp COMMAND aa_transport_io_test --gtest_filter=WirelessTcp.*)
+    set_tests_properties(wireless_e2e_tcp PROPERTIES TIMEOUT 30)
     add_test(NAME transport_usb COMMAND aa_transport_io_test --gtest_filter=UsbByteTransport.*)
     add_test(NAME transport_cancellation COMMAND aa_transport_io_test --gtest_filter=InFlightCancellation.*)
     add_test(NAME transport_tls COMMAND "${Python3_EXECUTABLE}" -B

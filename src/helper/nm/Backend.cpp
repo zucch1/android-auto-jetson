@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Platform.hpp"
 #include <condition_variable>
-#include <iostream>
+#include <iostream> // IWYU pragma: keep
 #include <mutex>
 #include <thread>
+#include <future>
 
 namespace aa::helper::nm {
 namespace {
@@ -26,6 +27,23 @@ struct Backend::Impl final {
     bool owned_table{};
     bool reconciled{};
     bool quarantined{};
+    ApSnapshot activation;
+    struct SnapshotJob {
+        std::promise<core::Result<ApSnapshot>> result;
+        SnapshotDeadline deadline;
+        SnapshotDeadline authority_deadline;
+    };
+    std::shared_ptr<SnapshotJob> snapshot_job;
+    struct FenceJob {
+        std::promise<bool> result;
+        std::uint64_t epoch;
+        std::function<void()> send;
+        SnapshotDeadline deadline;
+    };
+    std::shared_ptr<FenceJob> fence_job;
+    std::uint64_t validated_epoch{};
+    std::pair<std::string, std::string> validated_endpoint;
+    SnapshotDeadline validated_deadline;
     std::thread worker;
     Impl(Policy provision, std::string bus, std::unique_ptr<Commands> runner)
         : policy(std::move(provision)), address(std::move(bus)), commands(std::move(runner)),
@@ -68,6 +86,7 @@ struct Backend::Impl final {
         return true;
     }
     bool stop() {
+        wipe(activation.password); activation.generation = 0;
         if (protected_interface && !quarantined) {
             quarantined = commands->run({"/usr/sbin/nft", "-f", "-"},
                 "flush chain inet aa_receiver_ap input\nadd rule inet aa_receiver_ap input iifname \"" +
@@ -93,68 +112,63 @@ struct Backend::Impl final {
             if (connection->active()) {
                 if (!actual_channel(policy, *commands) || Clock::now() >= deadline) return false;
                 const std::lock_guard lock{mutex};
-                if (wanted && !exiting && generation == epoch) { state = State::active; return true; }
+                if (wanted && !exiting && generation == epoch) {
+                    activation = ApSnapshot{{secret.value().ssid, secret.value().psk, {}, {}, policy.port, epoch}};
+                    state = State::active; return true;
+                }
                 return false;
             }
             std::unique_lock lock{mutex}; changed.wait_for(lock, std::chrono::milliseconds(50));
         }
         return false;
     }
-    void run() {
-        std::uint64_t attempted = 0;
-        auto next_regulatory = Clock::now();
-        for (;;) {
-            bool request{}, quit{}, revoke{};
-            std::uint64_t epoch{};
-            { std::unique_lock lock{mutex};
-              changed.wait_for(lock, std::chrono::milliseconds(100));
-              request = wanted; quit = exiting; epoch = generation; revoke = revoke_pending;
-            }
-            if (quit) { (void)stop(); return; }
-            if (revoke) {
-                if (protected_interface && !quarantined) {
-                    quarantined = commands->run({"/usr/sbin/nft", "-f", "-"},
-                        "flush chain inet aa_receiver_ap input\nadd rule inet aa_receiver_ap input iifname \"" +
-                        policy.interface + "\" drop\n").has_value();
-                }
-                if (!rotated) rotated = credentials(policy, true).has_value();
-                const bool safe = stop();
-                const std::lock_guard lock{mutex};
-                state = safe && rotated ? State::inactive : State::unavailable;
-                if (safe && rotated) { revoke_pending = false; revoke_done = true; changed.notify_all(); }
-                continue;
-            }
-            if (!request) {
-                publish(!protected_interface || stop() ? State::inactive : State::unavailable);
-                continue;
-            }
-            if (attempted != epoch) {
-                attempted = epoch;
-                if (!start(epoch)) {
-                    (void)stop();
-                    publish(State::unavailable);
-                    std::cerr << "system-helper: AP startup failed; check jurisdiction, channel36, NM and isolation\n";
-                }
-                continue;
-            }
-            State observed;
-            { const std::lock_guard lock{mutex}; observed = state; }
-            bool regulatory_ok = true;
-            if (observed == State::active && Clock::now() >= next_regulatory) {
-                regulatory_ok = eligible(policy, *commands);
-                next_regulatory = Clock::now() + std::chrono::seconds(1);
-            }
-            if (observed == State::active && (!regulatory_ok || !connection->healthy() || !connection->active() ||
-                !actual_channel(policy, *commands))) {
-                (void)stop(); publish(State::unavailable);
-                std::cerr << "system-helper: AP lost eligibility/channel/owner; rolled back\n";
-            } else if (observed == State::unavailable && protected_interface) (void)stop();
-        }
-    }
+#include "BackendWorker.inc"
 };
 Backend::Backend(Policy policy, std::string address, std::unique_ptr<Commands> commands)
     : impl_(std::make_unique<Impl>(std::move(policy), std::move(address), std::move(commands))) {}
 Backend::~Backend() = default;
+bool Backend::snapshot_current(std::uint64_t epoch) {
+    return with_snapshot(epoch, [] {});
+}
+bool Backend::with_snapshot(std::uint64_t epoch, const std::function<void()>& send) {
+    auto job = std::make_shared<Impl::FenceJob>();
+    auto result = job->result.get_future();
+    {
+        const std::lock_guard lock{impl_->mutex};
+        if (!epoch || epoch != impl_->generation || epoch != impl_->validated_epoch || !impl_->wanted || impl_->exiting ||
+            impl_->revoke_pending || impl_->state != State::active || impl_->fence_job) return false;
+        job->epoch = epoch; job->send = send; job->deadline = impl_->validated_deadline;
+        if (job->deadline.expired()) return false;
+        job->deadline.until = std::min(job->deadline.until, job->deadline.now() + std::chrono::milliseconds(400));
+        impl_->fence_job = job; impl_->changed.notify_all();
+    }
+    // The callback borrows caller storage, so drain the worker even on expiry.
+    return result.get();
+}
+core::Result<ApSnapshot> Backend::ap_snapshot() {
+    return ap_snapshot({});
+}
+core::Result<ApSnapshot> Backend::ap_snapshot(const SnapshotDeadline& deadline) {
+    if (deadline.expired()) return Error{ErrorCode::helper_unavailable};
+    auto job = std::make_shared<Impl::SnapshotJob>();
+    job->deadline = deadline;
+    job->authority_deadline = deadline;
+    job->deadline.until = std::min(deadline.until, deadline.now() + std::chrono::milliseconds(400));
+    auto result = job->result.get_future();
+    {
+        const std::lock_guard lock{impl_->mutex};
+        if (!impl_->wanted || impl_->exiting || impl_->revoke_pending || impl_->state != State::active || impl_->snapshot_job)
+            return Error{ErrorCode::helper_unavailable};
+        impl_->snapshot_job = job; impl_->changed.notify_all();
+    }
+    while (result.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) {
+        if (job->deadline.expired()) return Error{ErrorCode::helper_unavailable};
+    }
+    if (job->deadline.expired()) return Error{ErrorCode::helper_unavailable};
+    auto snapshot = result.get();
+    if (!snapshot) return Error{ErrorCode::helper_unavailable};
+    return snapshot;
+}
 core::Result<State> Backend::apply(Action action, std::uint32_t channel) {
     const std::lock_guard lock{impl_->mutex};
     switch (action) {

@@ -32,6 +32,8 @@ public:
     [[nodiscard]] Kind kind() const noexcept override { return Kind::tcp; }
 
     core::Result<void> open(core::CancellationToken cancellation) override;
+    void set_io_deadline(core::Deadline::Clock::time_point until) noexcept override;
+    void set_io_checkpoint(std::function<void()> checkpoint) override;
     core::Result<void> send(std::span<const std::byte> frame) override;
     [[nodiscard]] core::Result<std::vector<std::byte>> receive() override;
     void close() noexcept override;
@@ -56,6 +58,8 @@ public:
 
     [[nodiscard]] std::uint16_t port() const noexcept;
     [[nodiscard]] core::Result<std::unique_ptr<TcpTransport>> accept();
+    [[nodiscard]] core::Result<std::unique_ptr<TcpTransport>>
+    accept(const core::Deadline& deadline, std::function<void()> checkpoint = {});
     void close() noexcept;
 
 private:

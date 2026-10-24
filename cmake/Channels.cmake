@@ -24,6 +24,7 @@ endif()
 set(AA_CHANNELS_WARN_TARGETS aa_channels)
 if(NOT CMAKE_CROSSCOMPILING)
     add_executable(aa_channel_services_test
+        tests/channels/wifi_projection_test.cpp
         tests/channels/negotiator_test.cpp
         tests/channels/media_wire_test.cpp
         tests/channels/sensor_sink_test.cpp
@@ -51,6 +52,8 @@ foreach(target IN LISTS AA_CHANNELS_WARN_TARGETS)
 endforeach()
 
 if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME channels_wifi_projection COMMAND aa_channel_services_test --gtest_filter=WifiProjectionRouting.*)
+    set_tests_properties(channels_wifi_projection PROPERTIES TIMEOUT 60)
     add_test(NAME channel_services_routing COMMAND aa_channel_services_test --gtest_filter=ChannelServices.*)
     add_test(NAME channel_services_media_wire COMMAND aa_channel_services_test --gtest_filter=MediaWire.*)
     add_test(NAME channel_services_wire_reject COMMAND aa_channel_services_test --gtest_filter=ChannelWireReject.*)
