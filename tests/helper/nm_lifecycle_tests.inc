@@ -10,6 +10,7 @@ protected:
     std::optional<BusService> service;
     std::jthread pump;
     HandoffFailure failure{};
+    Source source{1, 1};
     void SetUp() override {
         NmDaemon::SetUp();
         bluetooth = std::make_unique<BluezBackend>(address, [this] { return began + std::chrono::milliseconds{elapsed.load()}; });
@@ -29,12 +30,12 @@ protected:
     }
     std::uint64_t accept() {
         EXPECT_EQ(bluez.command("NewConnection"), "allowed");
-        const auto peer = client->poll_bootstrap({1, 1}, failure);
+        const auto peer = client->poll_bootstrap(source, failure);
         EXPECT_TRUE(peer); return peer ? peer.value().handle : 0;
     }
     void begin(std::uint64_t handle) {
-        ASSERT_TRUE(client->get_ap_credentials({1, 1}, handle));
-        ASSERT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, true));
+        ASSERT_TRUE(client->get_ap_credentials(source, handle));
+        ASSERT_TRUE(client->authorize_bootstrap(source, handle, true, true));
         EXPECT_TRUE(eventually([&] { return bluez.command("wire-read") != "open"; }));
         ASSERT_EQ(bluez.command("wire-send 00000002"), "ok");
         EXPECT_TRUE(eventually([&] { return bluez.command("wire-read") != "open"; }));
@@ -44,9 +45,9 @@ protected:
         ASSERT_EQ(bluez.command("wire-read"), "closed");
     }
     void retired(std::uint64_t handle) {
-        EXPECT_FALSE(client->poll_bootstrap({1, 1}, failure));
-        EXPECT_FALSE(client->get_ap_credentials({1, 1}, handle));
-        EXPECT_FALSE(client->authorize_bootstrap({1, 1}, handle, true, true));
+        EXPECT_FALSE(client->poll_bootstrap(source, failure));
+        EXPECT_FALSE(client->get_ap_credentials(source, handle));
+        EXPECT_FALSE(client->authorize_bootstrap(source, handle, true, true));
     }
 };
 TEST_F(CompletedLifecycle, CompletedOutlivesBothDeadlinesWhileAdmissionCloses) {
@@ -88,8 +89,57 @@ TEST_P(CompletedLoss, ObservedLossPermanentlyRetiresExactHandle) {
     ASSERT_EQ(bluez.command("paired"), "ok"); retired(handle);
 }
 INSTANTIATE_TEST_SUITE_P(Terminal, CompletedLoss, ::testing::Values(
-    "RequestDisconnection", "release-name", "remove", "unpaired", "owner-during-inventory", "recreate", "Release",
+    // v2.6 supersedes channel-teardown revocation with genuine Connected loss.
+    "connected-false", "release-name", "remove", "unpaired", "owner-during-inventory", "recreate", "Release",
     "adapter-recreate", "bond-cycle"));
+TEST_F(CompletedLifecycle, CompletedChannelTeardownPreservesPinnedAuthority) {
+    // Given a successful real RFCOMM exchange and its pinned activation snapshot.
+    const auto handle = accept(); const auto original = client->get_ap_credentials({1, 1}, handle); ASSERT_TRUE(original);
+    complete(handle);
+    // When BlueZ reports the helper's normal post-completion channel teardown.
+    ASSERT_EQ(bluez.command("RequestDisconnection"), "allowed");
+    // Then the exact handle, snapshot and completed allow/no-listener no-op survive.
+    const auto peer = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(peer);
+    EXPECT_EQ(peer.value().handle, handle); EXPECT_EQ(failure, HandoffFailure::none);
+    const auto current = client->get_ap_credentials({1, 1}, handle); ASSERT_TRUE(current);
+    EXPECT_TRUE(current.value() == original.value());
+    EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, false));
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
+}
+TEST_F(CompletedLifecycle, CompletedConnectedLossRequiresFreshBootstrap) {
+    // Given completed authority with the bond intact throughout both loss forms.
+    auto handle = accept(); complete(handle);
+    std::uint64_t generation{1};
+    for (const auto* loss : {"connected-false", "connected-invalidated"}) {
+        // When link continuity is lost and then reports connected again.
+        ASSERT_EQ(bluez.command(loss), "ok"); retired(handle);
+        ASSERT_EQ(bluez.command("connected-true"), "ok"); retired(handle);
+        EXPECT_EQ(bluez.command("NewConnection"), "rejected");
+        // Then only a fresh grant and accepted bootstrap can create new authority.
+        client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation});
+        ++generation; source = {generation, generation};
+        acquire(generation); ASSERT_TRUE(state(State::active));
+        const auto fresh = accept(); ASSERT_NE(fresh, handle);
+        EXPECT_FALSE(client->get_ap_credentials(source, handle));
+        handle = fresh; complete(handle);
+    }
+}
+TEST_F(CompletedLifecycle, PendingChannelOrConnectedLossRetiresExchange) {
+    std::uint64_t generation{1};
+    for (const auto* loss : {"RequestDisconnection", "connected-false", "connected-invalidated"}) {
+        // Given a real pending exchange that has already delivered credentials.
+        const auto handle = accept(); begin(handle);
+        // When channel teardown or genuine link loss occurs before completion.
+        ASSERT_EQ(bluez.command(loss), std::string_view{loss} == "RequestDisconnection" ? "allowed" : "ok");
+        // Then no authority or socket survives, and Connected=true cannot revive it.
+        retired(handle); EXPECT_EQ(failure, HandoffFailure::eligibility);
+        EXPECT_EQ(bluez.command("wire-read"), "closed");
+        ASSERT_EQ(bluez.command("connected-true"), "ok"); retired(handle);
+        client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation});
+        ++generation; source = {generation, generation};
+        acquire(generation); ASSERT_TRUE(state(State::active));
+    }
+}
 class CompletedApLoss : public CompletedLifecycle, public ::testing::WithParamInterface<int> {};
 TEST_P(CompletedApLoss, ChangedSnapshotCannotTransmitOrRevive) {
     // Given completed authority pinned to the original AP.

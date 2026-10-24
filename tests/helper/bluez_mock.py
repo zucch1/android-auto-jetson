@@ -5,22 +5,18 @@
 # ///
 # Run: python3 -B tests/helper/bluez_runtime.py build/host-dev
 from __future__ import annotations
-
 import json
 import socket
 import sys
 import threading
 from typing import Final
-
 from gi.repository import Gio, GLib
-
 AA: Final = "4de17a00-52cb-11e6-bdf4-0800200c9a66"
 ADAPTER: Final = "/org/bluez/hci0"
 DEVICE: Final = ADAPTER + "/dev_02_00_00_00_00_01"
 OTHER: Final = ADAPTER + "/dev_02_00_00_00_00_02"
 ROOT: Final = "/org/custom/AndroidAutoSystemHelper"
 FLAGS: Final = Gio.DBusCallFlags.NO_AUTO_START
-
 
 def connect(address: str) -> Gio.DBusConnection:
     return Gio.DBusConnection.new_for_address_sync(
@@ -208,6 +204,11 @@ class MockBluez:
             case "bond-cycle":
                 self.bus.emit_signal(None, DEVICE, "org.freedesktop.DBus.Properties", "PropertiesChanged",
                                      GLib.Variant("(sa{sv}as)", ("org.bluez.Device1", {"Bonded": GLib.Variant("b", False)}, [])))
+            case "connected-false" | "connected-true" | "connected-invalidated":
+                self.bus.emit_signal(None, DEVICE, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                    GLib.Variant("(sa{sv}as)", ("org.bluez.Device1",
+                        {} if text == "connected-invalidated" else {"Connected": GLib.Variant("b", text == "connected-true")},
+                        ["Connected"] if text == "connected-invalidated" else [])))
             case "wire-eof":
                 assert self.peer_socket is not None
                 self.peer_socket.shutdown(socket.SHUT_WR)
@@ -231,8 +232,6 @@ class MockBluez:
             case _:
                 return self.callback(text)
         return "ok"
-
-
 def main() -> None:
     mock = MockBluez(sys.argv[1])
     loop = GLib.MainLoop()

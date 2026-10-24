@@ -42,10 +42,12 @@ void BluezBackend::Impl::watch_continuity() {
             if (std::string_view{interface} == "org.bluez.Device1") {
                 gboolean value{};
                 bool lost = (g_variant_lookup(changed, "Paired", "b", &value) && !value) ||
-                    (g_variant_lookup(changed, "Bonded", "b", &value) && !value);
+                    (g_variant_lookup(changed, "Bonded", "b", &value) && !value) ||
+                    (g_variant_lookup(changed, "Connected", "b", &value) && !value);
                 GVariantIter iter; g_variant_iter_init(&iter, invalidated); const char* name{};
                 while (g_variant_iter_next(&iter, "&s", &name)) {
-                    if (std::string_view{name} == "Paired" || std::string_view{name} == "Bonded") lost = true;
+                    if (std::string_view{name} == "Paired" || std::string_view{name} == "Bonded" ||
+                        std::string_view{name} == "Connected") lost = true;
                 }
                 if (lost) self.lost_path(path);
             }

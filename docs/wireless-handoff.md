@@ -106,8 +106,12 @@ established bootstrap, completed handoff, or projection session.
 
 Successful completion transfers the exact handle, receiver/source ownership,
 BlueZ owner/device identity, and pinned AP snapshot into revocable
-completed-handoff authority. It survives normal RFCOMM close and has no
-absolute TTL. Failed bootstrap, matching disconnection, BlueZ owner/device/bond
+completed-handoff authority. It survives normal RFCOMM close and the subsequent
+Profile1 `RequestDisconnection` callback, and has no absolute TTL. Before
+completion, that callback still retires the pending exchange. Device1
+`Connected=false` or an invalidated `Connected` value establishes link loss;
+`Connected=true` cannot revive retired authority.
+Failed bootstrap, matching link loss, BlueZ owner/device/bond
 loss, source retirement or revocation, receiver/helper loss, AP or snapshot
 invalidation, owning-link teardown, and accepted replacement retire it.
 Retirement is handle/incarnation scoped, delayed old work cannot retire a

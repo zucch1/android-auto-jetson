@@ -36,7 +36,8 @@ void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gch
         if (method == "RequestDisconnection") {
             if ((!self.connected || self.connected->device.path != device) &&
                 (!self.allowed || self.allowed->device.path != device)) { reject(); return; }
-            self.close_connection();
+            // Completed RFCOMM teardown is not Bluetooth link loss (contract v2.6).
+            if (!self.bootstrap || !self.bootstrap->complete()) self.close_connection();
             g_dbus_method_invocation_return_value(invocation, nullptr); return;
         }
         if (method != "NewConnection" || !self.permitted(device, false) ||
