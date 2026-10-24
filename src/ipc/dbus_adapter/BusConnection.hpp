@@ -57,13 +57,13 @@ public:
     [[nodiscard]] int native_handle() const noexcept { return fd_; }
 
     // Reads the next message off the bus (bounded strict framing).
-    [[nodiscard]] core::Result<ParsedMessage> read_message();
+    [[nodiscard]] core::Result<ParsedMessage> read_message(bool sensitive = false);
 
     // Fire-and-forget send of one already-assembled message (signal emission
     // and test reply injection). The serial is allocated from this
     // connection's counter and returned so replies can be matched.
     [[nodiscard]] core::Result<std::uint32_t> send_message(MessageType type,
-                                                           const MessageWriter& message);
+                                                           const MessageWriter& message, bool sensitive = false);
 
     // Waits for the method return/error answering `serial`, accepting ONLY
     // messages whose daemon-stamped sender equals `expected_sender` and whose
@@ -71,7 +71,7 @@ public:
     // sender/destination) are never accepted and are counted; an exhaustion
     // or timeout after forged candidates is a typed transport_unauthorized_peer.
     [[nodiscard]] core::Result<ParsedMessage> await_reply(std::uint32_t serial,
-                                                          const BusName& expected_sender);
+                                                          const BusName& expected_sender, bool sensitive = false);
 
     // Sends a dispatch-boundary reply (typed body) addressed to `destination`.
     [[nodiscard]] core::Result<void> send_reply(std::uint32_t reply_serial,
@@ -92,6 +92,9 @@ private:
     std::uint32_t next_serial_{1};
     BusName unique_name_{};
     std::optional<std::chrono::steady_clock::time_point> deadline_;
+    // Opt-in survives timeout, skipped/malformed replies and serial reuse. Only
+    // closing this connection proves no late sensitive reply can remain.
+    bool sensitive_receive_{};
 };
 
 // Maps a daemon-delivered message to the dispatch boundary input. The caller

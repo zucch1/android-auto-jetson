@@ -24,9 +24,11 @@ constexpr std::string_view kDaemonPath = "/org/freedesktop/DBus";
 } // namespace
 
 core::Result<std::uint32_t> BusConnection::send_message(MessageType type,
-                                                        const MessageWriter& message) {
+                                                        const MessageWriter& message, bool sensitive) {
     const std::uint32_t serial = next_serial_++;
-    const auto sent = bus_io::write_full(fd_, message.build(type, serial), deadline_.value_or(bus_io::deadline()));
+    auto bytes = message.build(type, serial);
+    const core::SecretScope wipe_bytes{bytes, sensitive};
+    const auto sent = bus_io::write_full(fd_, bytes, deadline_.value_or(bus_io::deadline()));
     if (!sent.has_value()) {
         return sent.error();
     }
@@ -34,7 +36,8 @@ core::Result<std::uint32_t> BusConnection::send_message(MessageType type,
 }
 
 core::Result<ParsedMessage> BusConnection::await_reply(std::uint32_t serial,
-                                                       const BusName& expected_sender) {
+                                                       const BusName& expected_sender, bool sensitive) {
+    sensitive_receive_ = sensitive_receive_ || sensitive;
     bool saw_forged = false;
     const auto previous = deadline_;
     deadline_ = deadline_.value_or(bus_io::deadline());
@@ -44,11 +47,12 @@ core::Result<ParsedMessage> BusConnection::await_reply(std::uint32_t serial,
         ~Restore() { target = value; }
     } restore{deadline_, previous};
     for (int skipped = 0; skipped < kMaxSkippedMessages; ++skipped) {
-        auto message = read_message();
+        auto message = read_message(sensitive);
         if (!message.has_value()) {
             return saw_forged ? core::Result<ParsedMessage>{Error{ErrorCode::transport_unauthorized_peer}}
                               : core::Result<ParsedMessage>{message.error()};
         }
+        core::SecretScope wipe_body{message.value().body, sensitive_receive_};
         const bool is_reply = message.value().type == MessageType::method_return ||
                               message.value().type == MessageType::error_reply;
         if (!is_reply || message.value().reply_serial != serial) {
@@ -63,6 +67,7 @@ core::Result<ParsedMessage> BusConnection::await_reply(std::uint32_t serial,
             saw_forged = true;
             continue;
         }
+        wipe_body.release();
         return message;
     }
     return Error{saw_forged ? ErrorCode::transport_unauthorized_peer : ErrorCode::transport_io};

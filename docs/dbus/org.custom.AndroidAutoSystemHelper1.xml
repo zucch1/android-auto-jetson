@@ -2,7 +2,38 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <node name="/org/custom/AndroidAutoSystemHelper">
   <interface name="org.custom.AndroidAutoSystemHelper1">
-    <annotation name="org.custom.Contract.SemVer" value="1.1.0"/>
+    <annotation name="org.custom.Contract.SemVer" value="1.2.0"/>
+    <method name="PollBootstrapV1">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="source" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="handoff_handle" type="t" direction="out"/>
+      <arg name="bond_address" type="s" direction="out"/>
+      <arg name="adapter_identity" type="s" direction="out"/>
+      <arg name="local_failure" type="u" direction="out"/>
+    </method>
+    <method name="AuthorizeBootstrapV1">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="source" type="t" direction="in"/>
+      <arg name="handoff_handle" type="t" direction="in"/>
+      <arg name="allow" type="u" direction="in"/>
+      <arg name="listener_ready" type="u" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
+    </method>
+    <method name="GetAPCredentialsV1">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="source" type="t" direction="in"/>
+      <arg name="handoff_handle" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
+      <arg name="ssid" type="s" direction="out"/>
+      <arg name="password" type="s" direction="out"/>
+      <arg name="bssid" type="s" direction="out"/>
+      <arg name="receiver_ip" type="s" direction="out"/>
+      <arg name="port" type="u" direction="out"/>
+      <arg name="activation_generation" type="t" direction="out"/>
+    </method>
     <method name="RevokeAP1">
       <arg name="phone_id" type="t" direction="in"/>
       <arg name="error" type="u" direction="out"/>

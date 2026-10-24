@@ -6,6 +6,36 @@
 namespace aa::helper {
 BusClient::BusClient(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 BusClient::~BusClient() = default;
+core::Result<ObservedPeer> BusClient::poll_bootstrap(Source source, HandoffFailure& failure) {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until)) return Error{ErrorCode::timeout};
+    MessageWriter writer; writer.put_u64(source.generation).put_u64(source.confirmation);
+    ObservedPeer peer;
+    const auto result = impl_->rpc("PollBootstrapV1", "tt", writer, until, &peer, &failure);
+    if (!result) return result.error();
+    if (!peer.handle) return Error{ErrorCode::helper_rejected};
+    return peer;
+}
+core::Result<void> BusClient::authorize_bootstrap(Source source, std::uint64_t handle, bool allow, bool ready) {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until)) return Error{ErrorCode::timeout};
+    MessageWriter writer; writer.put_u64(source.generation).put_u64(source.confirmation).put_u64(handle)
+        .put_u32(allow ? 1U : 0U).put_u32(ready ? 1U : 0U);
+    const auto result = impl_->rpc("AuthorizeBootstrapV1", "tttuu", writer, until);
+    return result ? core::Result<void>{} : core::Result<void>{result.error()};
+}
+core::Result<ApSnapshot> BusClient::get_ap_credentials(Source source, std::uint64_t handle) {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until)) return Error{ErrorCode::timeout};
+    MessageWriter writer; writer.put_u64(source.generation).put_u64(source.confirmation).put_u64(handle);
+    ApSnapshot snapshot;
+    const auto result = impl_->rpc("GetAPCredentialsV1", "ttt", writer, until, nullptr, nullptr, &snapshot);
+    if (!result) return result.error();
+    return snapshot;
+}
 core::Result<std::unique_ptr<BusClient>> BusClient::system(trust::ApprovedPhoneStore& store) {
     return private_bus("unix:path=/run/dbus/system_bus_socket", store);
 }

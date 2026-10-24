@@ -28,7 +28,9 @@ TEST(HelperSchema, ComposedContractPreservesNarrowApAndPeerMethods) {
     const std::map<std::string, Signatures> expected{
         {"Issue", {"ttuu", "ut"}}, {"Execute", {"uut", "ut"}}, {"Invalidate", {"tt", "ut"}},
         {"RevokeAP1", {"t", "ut"}}, {"PollPeerV1", {"", "utss"}}, {"BindPeerV1", {"ttt", "ut"}},
-        {"ReconnectPeerV1", {"t", "ut"}}, {"RevokePeerV1", {"ss", "ut"}}};
+        {"ReconnectPeerV1", {"t", "ut"}}, {"RevokePeerV1", {"ss", "ut"}},
+        {"PollBootstrapV1", {"tt", "utssu"}}, {"AuthorizeBootstrapV1", {"tttuu", "ut"}},
+        {"GetAPCredentialsV1", {"ttt", "utssssut"}}};
     EXPECT_EQ(actual, expected);
 }
 }

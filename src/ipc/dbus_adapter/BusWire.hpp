@@ -10,6 +10,7 @@
 // traffic is rejected with a typed transport error, never trusted.
 
 #include <aa/core/Result.hpp>
+#include <aa/core/SecretScope.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -69,6 +70,10 @@ public:
     MessageWriter& put_property_dict(const std::map<std::string, std::string>& entries);
 
     [[nodiscard]] std::vector<std::uint8_t> build(MessageType type, std::uint32_t serial) const;
+    [[nodiscard]] core::SecretScope<std::vector<std::uint8_t>> protect_body(bool sensitive) {
+        if (sensitive) body_.reserve(kMaxMessageBytes);
+        return core::SecretScope{body_, sensitive};
+    }
 
 private:
     void field_string(HeaderField field, std::string_view value);
@@ -102,6 +107,7 @@ public:
     [[nodiscard]] core::Result<std::uint32_t> read_u32();
     [[nodiscard]] core::Result<std::uint64_t> read_u64();
     [[nodiscard]] core::Result<std::string> read_string();
+    [[nodiscard]] core::Result<std::string_view> read_string_view();
     [[nodiscard]] core::Result<std::string> read_signature();
     // Skips one complete value of the given complete type (bounded depth).
     [[nodiscard]] core::Result<void> skip_value(std::string_view type);
