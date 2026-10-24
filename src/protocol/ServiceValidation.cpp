@@ -77,8 +77,15 @@ core::Result<void> validate_service(const ServiceDescriptor& service) {
         }
         return {};
     }
-    case ChannelRole::bluetooth_projection:
     case ChannelRole::wifi_projection:
+        if (std::holds_alternative<std::monostate>(service.configuration)) {
+            return Error{ErrorCode::protocol_unsupported_channel};
+        }
+        if (!std::holds_alternative<WifiProjectionConfiguration>(service.configuration)) {
+            return malformed;
+        }
+        return {};
+    case ChannelRole::bluetooth_projection:
     case ChannelRole::diagnostics:
         // No qualified project configuration for these wire services yet.
         return Error{ErrorCode::protocol_unsupported_channel};

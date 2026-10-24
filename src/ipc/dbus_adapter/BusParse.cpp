@@ -97,6 +97,11 @@ core::Result<std::uint64_t> Cursor::read_u64() {
 }
 
 core::Result<std::string> Cursor::read_string() {
+    const auto value = read_string_view();
+    if (!value) return value.error();
+    return std::string{value.value()};
+}
+core::Result<std::string_view> Cursor::read_string_view() {
     const auto length = read_u32();
     if (!length.has_value()) {
         return length.error();
@@ -104,7 +109,7 @@ core::Result<std::string> Cursor::read_string() {
     if (pos_ + length.value() + 1 > data_.size()) {
         return Error{ErrorCode::transport_malformed_frame};
     }
-    std::string value(reinterpret_cast<const char*>(data_.data() + pos_), length.value());
+    std::string_view value(reinterpret_cast<const char*>(data_.data() + pos_), length.value());
     pos_ += length.value();
     if (data_[pos_] != 0) {
         return Error{ErrorCode::transport_malformed_frame};

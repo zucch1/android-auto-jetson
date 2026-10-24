@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+add_test(NAME wireless_e2e_helper_snapshot COMMAND aa_nm_ap_test --gtest_filter=-CompletedLifecycle.*:Terminal/*)
+set_tests_properties(wireless_e2e_helper_snapshot PROPERTIES TIMEOUT 90 RESOURCE_LOCK aa_wireless_composed)
+foreach(suite CompletedLifecycle CompletedLoss CompletedApLoss FailedReplacement)
+    add_test(NAME wireless_e2e_helper_${suite} COMMAND aa_nm_ap_test --gtest_filter=*${suite}.*)
+    set_tests_properties(wireless_e2e_helper_${suite} PROPERTIES TIMEOUT 90 RESOURCE_LOCK aa_wireless_composed)
+endforeach()
+add_test(NAME wireless_e2e_helper_bootstrap COMMAND system_helper_bootstrap)
+set_tests_properties(wireless_e2e_helper_bootstrap PROPERTIES TIMEOUT 20)
+add_test(NAME wireless_e2e_helper_frames COMMAND system_helper_aaw_frame)
+set_tests_properties(wireless_e2e_helper_frames PROPERTIES TIMEOUT 10)
+add_test(NAME wireless_e2e_helper_authority COMMAND aa_system_helper_test)
+set_tests_properties(wireless_e2e_helper_authority PROPERTIES TIMEOUT 60)
+add_test(NAME wireless_e2e_helper_secrets COMMAND dbus-run-session -- $<TARGET_FILE:system_helper_secret>)
+set_tests_properties(wireless_e2e_helper_secrets PROPERTIES TIMEOUT 20)
+add_test(NAME wireless_e2e_helper_bluez COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_SOURCE_DIR}/tests/helper/bluez_runtime.py" "${CMAKE_BINARY_DIR}")
+set_tests_properties(wireless_e2e_helper_bluez PROPERTIES TIMEOUT 120 RESOURCE_LOCK aa_wireless_composed)
+add_test(NAME wireless_e2e_helper_composition COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_SOURCE_DIR}/tests/helper/composition_runtime.py" "${CMAKE_BINARY_DIR}")
+set_tests_properties(wireless_e2e_helper_composition PROPERTIES TIMEOUT 60 RESOURCE_LOCK aa_wireless_composed)
+foreach(case durable 703 mutex)
+    add_test(NAME wireless_e2e_retirement_${case} COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/helper/retirement_budget.py" "${CMAKE_BINARY_DIR}" ${case})
+    set_tests_properties(wireless_e2e_retirement_${case} PROPERTIES TIMEOUT 20 RESOURCE_LOCK aa_wireless_composed)
+endforeach()
+add_test(NAME wireless_e2e_core COMMAND aa_wired_e2e_test
+    --gtest_filter=WiredE2eHappy.*:WiredE2eAuth.*:WiredE2eInputWire.*)
+set_tests_properties(wireless_e2e_core PROPERTIES TIMEOUT 120)
+add_test(NAME wireless_e2e_core_channels COMMAND aa_channel_services_test --gtest_filter=WifiProjectionRouting.*:ChannelWireReject.*)
+set_tests_properties(wireless_e2e_core_channels PROPERTIES TIMEOUT 60)
+add_test(NAME wireless_e2e_core_wifi COMMAND aa_protocol_adapter_test --gtest_filter=WifiProjection.*)
+set_tests_properties(wireless_e2e_core_wifi PROPERTIES TIMEOUT 60)

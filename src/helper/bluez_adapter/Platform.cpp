@@ -22,13 +22,14 @@ constexpr auto interfaces = R"(<node>
 <method name="DisplayPasskey"><arg type="o" direction="in"/><arg type="u" direction="in"/><arg type="q" direction="in"/></method>
 </interface></node>)";
 }
-BluezBackend::Impl::Impl(const std::string& address) {
+BluezBackend::Impl::Impl(const std::string& address, Now clock) : now(std::move(clock)) {
     context = g_main_context_new();
     g_main_context_push_thread_default(context);
     GError* error = nullptr;
     bus = bluez_adapter::connect_bus(address, context);
     if (bus) {
         g_dbus_connection_set_exit_on_close(bus, FALSE);
+        watch_continuity();
         owner_subscription = g_dbus_connection_signal_subscribe(bus, "org.freedesktop.DBus",
             "org.freedesktop.DBus", "NameOwnerChanged", "/org/freedesktop/DBus", "org.bluez",
             G_DBUS_SIGNAL_FLAGS_NONE,
@@ -60,6 +61,8 @@ BluezBackend::Impl::~Impl() {
     }
     if (bus) {
         if (owner_subscription) g_dbus_connection_signal_unsubscribe(bus, owner_subscription);
+        if (removal_subscription) g_dbus_connection_signal_unsubscribe(bus, removal_subscription);
+        if (properties_subscription) g_dbus_connection_signal_unsubscribe(bus, properties_subscription);
         if (profile_export) g_dbus_connection_unregister_object(bus, profile_export);
         if (agent_export) g_dbus_connection_unregister_object(bus, agent_export);
         g_dbus_connection_close_sync(bus, nullptr, nullptr);
@@ -108,32 +111,46 @@ bool BluezBackend::Impl::quiet() {
     }
     return ok;
 }
-void BluezBackend::Impl::close_connection() { if (connection >= 0) ::close(connection); connection = -1; }
-void BluezBackend::Impl::close_window() {
+void BluezBackend::Impl::close_connection() {
+    if (connection >= 0) ::close(connection);
+    connection = -1;
+    if (bootstrap) { bootstrap->deny(HandoffFailure::eligibility); last_failure = bootstrap->failure(); }
+    connected.reset(); handoff_handle = 0;
+}
+void BluezBackend::Impl::close_admission() {
     window = {};
     pairing_enabled = false;
-    close_connection();
     if (allowed) {
         if (auto* reply = call(allowed->device.path.c_str(), "org.bluez.Device1", "CancelPairing", nullptr)) g_variant_unref(reply);
     }
     allowed.reset();
     quiet_pending = !quiet();
 }
+void BluezBackend::Impl::close_window() { close_connection(); close_admission(); }
 void BluezBackend::Impl::reset() {
+    ++owner_epoch;
     close_connection();
     allowed.reset(); window = {}; pairing_enabled = false; observations.clear(); adapters.clear();
     registered = false; agent_registered = false;
 }
 void BluezBackend::Impl::pump() {
-    for (unsigned i = 0; i < 32 && g_main_context_pending(context); ++i) g_main_context_iteration(context, FALSE);
-    if (Clock::now() >= next_check) {
+    drain_events();
+    if (now() >= next_check) {
         const bool alive = current_owner();
         if (alive && profile_requested && (!registered || !agent_registered)) (void)ensure();
         if (alive && quiet_pending) quiet_pending = !quiet();
-        if (alive && allowed && Clock::now() >= window) close_window();
-        next_check = Clock::now() + std::chrono::milliseconds(100);
+        if (alive && allowed && now() >= window) {
+            close_admission();
+        }
+        next_check = now() + std::chrono::milliseconds(100);
     }
-    std::erase_if(observations, [](const auto& item) { return Clock::now() >= item.second.expires; });
+    std::erase_if(observations, [this](const auto& item) { return now() >= item.second.expires; });
+    if (bootstrap && bootstrap->live()) {
+        const auto captured = bootstrap;
+        const auto handle = handoff_handle;
+        captured->tick(now(), snapshots, fence, true);
+        if (handoff_handle == handle) last_failure = captured->failure();
+    }
 }
 bool BluezBackend::Impl::ensure() {
     if (!profile_requested) return false;
@@ -163,9 +180,46 @@ bool BluezBackend::Impl::ensure() {
     g_variant_unref(reply); registered = true;
     return true;
 }
-BluezBackend::BluezBackend(const std::string& address) : impl_(std::make_unique<Impl>(address)) {}
+BluezBackend::BluezBackend(const std::string& address, Now now) : impl_(std::make_unique<Impl>(address, std::move(now))) {}
 BluezBackend::~BluezBackend() = default;
 bool BluezBackend::available() const { return impl_->bus && !g_dbus_connection_is_closed(impl_->bus); }
+core::Result<ObservedPeer> BluezBackend::handoff() {
+    if (impl_->bootstrap && impl_->bootstrap->expire()) impl_->last_failure = impl_->bootstrap->failure();
+    if (!impl_->bootstrap || (!impl_->bootstrap->live() && !impl_->bootstrap->complete()) || !impl_->connected) return Error{ErrorCode::helper_rejected};
+    const auto handle = impl_->handoff_handle;
+    const auto captured = *impl_->connected;
+    if (!impl_->exact(captured, true)) { impl_->retire(handle, HandoffFailure::eligibility); return Error{ErrorCode::helper_rejected}; }
+    if (!handle || impl_->handoff_handle != handle || !impl_->connected) return Error{ErrorCode::helper_rejected};
+    if (impl_->bootstrap->expire()) { impl_->last_failure = impl_->bootstrap->failure(); return Error{ErrorCode::helper_rejected}; }
+    return ObservedPeer{handle, captured.device.identity};
+}
+SnapshotDeadline BluezBackend::handoff_deadline() const {
+    return impl_->bootstrap ? impl_->bootstrap->deadline() : SnapshotDeadline{impl_->now(), impl_->now};
+}
+HandoffFailure BluezBackend::handoff_failure() const { return impl_->last_failure; }
+void BluezBackend::fail_handoff(std::uint64_t handle, HandoffFailure reason) { impl_->retire(handle, reason); }
+void BluezBackend::snapshot_provider(const SnapshotProvider& provider) { impl_->snapshots = provider; }
+void BluezBackend::snapshot_fence(const SnapshotFence& fence) { impl_->fence = fence; }
+core::Result<void> BluezBackend::authorize_handoff(std::uint64_t handle, bool allow, bool ready) {
+    const auto peer = handoff();
+    if (!peer || peer.value().handle != handle) return Error{ErrorCode::helper_rejected};
+    if (!allow) {
+        impl_->bootstrap->deny(HandoffFailure::denied); impl_->last_failure = HandoffFailure::denied; return {};
+    }
+    if (!ready && impl_->bootstrap->complete()) return {};
+    if (!ready || !impl_->snapshots) {
+        impl_->bootstrap->deny(HandoffFailure::eligibility); impl_->last_failure = HandoffFailure::eligibility;
+        return Error{ErrorCode::helper_rejected};
+    }
+    const auto snapshot = impl_->snapshots();
+    const auto current = handoff();
+    if (!current || current.value().handle != handle) return Error{ErrorCode::helper_rejected};
+    if (!snapshot || !impl_->bootstrap->authorize(snapshot.value(), ready, impl_->now())) {
+        impl_->retire(handle, HandoffFailure::snapshot);
+        return Error{ErrorCode::helper_unavailable};
+    }
+    return {};
+}
 void BluezBackend::tick() { impl_->pump(); }
 void BluezBackend::discard(std::uint64_t handle) { impl_->observations.erase(handle); }
 void BluezBackend::cleanup() noexcept { impl_->observations.clear(); impl_->close_window(); }

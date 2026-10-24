@@ -1,0 +1,189 @@
+# Task37: wireless handoff and projection (host reference)
+
+Task37 implements the receiver listener, helper-owned RFCOMM bootstrap, and
+shared projection-session path for host testing. This is a reduced-scope
+result: scripted-peer success does not qualify a real phone, and production
+wireless admission remains unavailable because TCP endpoint binding is
+**BLOCKED** as described below.
+
+## Two protocol surfaces
+
+The Bluetooth AAW bootstrap and the negotiated AAP Wi-Fi service are distinct.
+They have different schemas, enum values, timing, and security boundaries.
+
+### Helper-owned RFCOMM AAW bootstrap
+
+`aa-system-helper` owns the AA profile socket, record framing, and bootstrap
+state machine for UUID `4de17a00-52cb-11e6-bdf4-0800200c9a66`. The receiver
+never receives a generic RFCOMM byte stream or an arbitrary socket FD.
+
+Each record has a four-byte header followed by its protobuf payload. The first
+u16 is the big-endian payload length, excluding the header; the second u16 is
+the big-endian message ID. Payloads larger than 4096 bytes are protocol
+violations. Fragmented records are accumulated and coalesced records are split.
+
+The receiver plays the head-unit role:
+
+```text
+receiver  WifiStartRequest=1 {ip, port}             listener already ready
+phone     WifiInfoRequest=2
+receiver  WifiInfoResponse=3 {ssid, password, bssid,
+                              security_mode, access_point_type}
+phone     WifiStartResponse=7
+phone     WifiConnectStatus=6
+```
+
+The initial request is sent only after the projection listener is ready. The
+credential response is sent only after the complete eligibility chain and AP
+snapshot checks below succeed. Both trailing phone messages are validated.
+Completion requires the trailing-data check, including a nonblocking socket
+peek, and a deadline recheck; receiving one expected record is not enough.
+
+On this AAW surface, `security_mode` uses its own bitmask-style enum with
+`WPA2_PERSONAL=8`; `access_point_type` is `DYNAMIC=1`. The BSSID is the current
+AP interface MAC as a lowercase, colon-separated string. The project-owned
+`Bootstrap.proto` is intentional: vendored AASDK imports the negotiated Wi-Fi
+projection enum, which is not the AAW bootstrap enum and cannot encode this
+contract correctly.
+
+Denial, malformed or oversized input, wrong order, duplicates, unknown IDs,
+EOF, timeout, and phone-side rejection close RFCOMM without a rejection payload
+or further credentials. The helper reports a typed local failure without secret
+material and does not mutate trust. Normal closure after confirmed success has
+the separate completed-handoff semantics described under lifetimes.
+
+The wire rules are reverse-engineered, not an official Google interoperability
+specification. Pinned head-unit-role references are
+`nisargjhaveri/WirelessAndroidAutoDongle` at
+`ef645221ec28e87361391b9bdcf27e31ff48cb6f` and `manio/aa-proxy-rs` at
+`b753a002b7ff19f94a861a81396eacaccfa58d5e`.
+
+### Negotiated AAP WifiProjection/WifiCredentials service
+
+The second surface runs inside the established encrypted AAP session. It is
+advertised only on the wireless path through the existing dynamic negotiated
+service ID, never through a fixed channel ordinal. Its metadata-only response
+uses that service's own `WPA2_PERSONAL=5` enum value, channel 36, and `DYNAMIC`.
+It never carries the SSID or password. Between these two surfaces, only the
+RFCOMM bootstrap response carries those secrets; neither service may be used to
+infer the other's wire enum.
+
+## Authorization and credential release
+
+The receiver uses only authenticated `PollBootstrapV1`,
+`AuthorizeBootstrapV1`, and `GetAPCredentialsV1`. Task37 adds no helper methods
+beyond those. The receiver never reads the root-only `ap.credentials` file and
+does not expose returned secrets through logs, status, properties, or persisted
+receiver state.
+
+At request entry and again immediately before any secret leaves the helper,
+the helper re-resolves the receiver identity using the full executable hash.
+It does not cache that digest. Credential transmission remains fenced even if
+an earlier check succeeded.
+
+`GetAPCredentialsV1` returns one coherent D3 activation snapshot: activation
+generation, live BSSID and AP-side receiver IP, and the provisioned projection
+port. The NetworkManager owner, device, and channel are fenced through
+transmission. A generation, owner, device, channel, BSSID, or endpoint change
+invalidates that snapshot rather than substituting newer state.
+
+For a new session, the D4 chain requires all of the following:
+
+1. The exact helper-connected peer or its completed live handoff authority.
+2. An approved matching identity in the receiver TrustStore.
+3. A registered, live, authorized consumer.
+4. A valid pinned AP activation snapshot.
+
+The listener is ready before `AuthorizeBootstrapV1(allow=true)` can release the
+bootstrap. An approved reconnect needs no new `AddPhone` transaction. Failure
+of any link denies credentials without changing trust.
+
+## Lifetimes, freshness, and deadlines
+
+An incomplete bootstrap has a 10-second budget. The 60-second pairing window
+limits only acceptance of new RFCOMM connections; it is not a TTL for an
+established bootstrap, completed handoff, or projection session.
+
+Successful completion transfers the exact handle, receiver/source ownership,
+BlueZ owner/device identity, and pinned AP snapshot into revocable
+completed-handoff authority. It survives normal RFCOMM close and the subsequent
+Profile1 `RequestDisconnection` callback, and has no absolute TTL. Before
+completion, that callback still retires the pending exchange. Device1
+`Connected=false` or an invalidated `Connected` value establishes link loss;
+`Connected=true` cannot revive retired authority.
+Failed bootstrap, matching link loss, BlueZ owner/device/bond
+loss, source retirement or revocation, receiver/helper loss, AP or snapshot
+invalidation, owning-link teardown, and accepted replacement retire it.
+Retirement is handle/incarnation scoped, delayed old work cannot retire a
+replacement, and retired handles never revive.
+
+Initial establishment has no one-second aggregate SLA. Once listening,
+admission requires bounded-freshness authority and snapshot evidence. Only a
+successful current-epoch validation, timestamped conservatively at request
+start, renews freshness. The implemented budget is 950 ms evidence age plus
+owner scheduling and close, totaling at most one second from actual eligibility
+loss. Pending work and stale positive replies do not extend the lease; late
+results are epoch-fenced and cannot reopen admission.
+
+Accept cancellation and listener stop complete within one second. AAP
+authentication, including encapsulated TLS, has a 10-second budget. Control
+operations and teardown complete within five seconds against silent or
+backpressured peers. An ACTIVE session has no maximum duration.
+
+ACTIVE requires confirmed completed bootstrap. The completion-sensitive
+`AuthorizeBootstrapV1` result is `allow=1, ready=0`; a still-pending bootstrap
+is retired rather than activated. Consumer loss closes admission and fresh
+credential release immediately. Only an already confirmed ACTIVE session keeps
+the existing 10-second degraded-consumer grace, which grants no fresh
+credential or admission rights.
+
+## Projection transport
+
+Each accepted TCP link gets a fresh `WiredSession`, cipher, parser, and routes.
+The link carries the existing AAP authentication and encapsulated-TLS encrypted
+frames directly over TCP. There is no outer TLS transport. The listener binds
+only the numeric IP from the pinned AP snapshot and the provisioned port, never
+all interfaces.
+
+## TCP endpoint binding: BLOCKED
+
+A shared AP PSK cannot cryptographically bind an accepted TCP socket to the
+authorized Bluetooth peer. Production therefore rejects every unbound TCP
+connection. The host happy path uses separately compiled test-only attestation:
+`AA_WIRELESS_TEST_ATTESTATION` in `aa_wireless_attested_test_only`. That fixture
+is not production identity proof and is not compiled into the production path.
+Production wireless admission is not delivered; task37 is reduced-scope.
+
+## Revocation and shared-AP disruption
+
+Committed `ForgetPhone`, including committed-not-durable error 703, rotates AP
+credentials and evicts **all AP access by design**. Shared-AP disruption is
+expected. This does not retire unrelated trust, bonds, sources, or bindings;
+an unrelated pending binding survives. The inherited 1000 ms total attempt,
+500 ms per-leg cap, and 703-wins retry rules are unchanged.
+
+## Host evidence and limits
+
+```sh
+cmake --build build/host-dev -j2
+ctest --test-dir build/host-dev -R wireless_e2e --output-on-failure
+```
+
+The 26 `wireless_e2e` groups run the D6 matrix. One end-to-end case composes the
+actual `aa-system-helper`, private NetworkManager and BlueZ wire doubles, real
+RFCOMM bytes, real `BusClient`, the trust/control path, TCP, and AAP TLS through
+ACTIVE with media, audio, and input routing.
+
+Coverage is not exhaustive. Secret scans, race/shutdown cross-products, and
+full transcript comparison cover only part of their respective D6 subclaims.
+Real-phone stimulation is **BLOCKED** and closes only as completed-reduced-scope
+with owner sign-off. Real phones, RTL8822CE channel 36/DHCP/firewall behavior on
+Jetson, installed-service and sandbox behavior, RSS/timing, and phone ordering
+of `WifiConnectStatus` relative to AAP negotiation remain **TARGET BLOCKED**.
+
+## Non-goals
+
+No phone-hosted hotspot, Wi-Fi Direct/P2P, A2DP, AVRCP, SAP, or HFP is added.
+Reconnect and recovery are task38, performance and soak are task39, the
+wireless qualification package is task40, and packaging is task41. None of
+those scopes is closed by the host handoff reference.

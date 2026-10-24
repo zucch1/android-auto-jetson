@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Platform.hpp"
+#include "../crypto_adapter/Crypto.hpp"
 #include <gio/gunixfdlist.h>
 #include <string_view>
 #include <sys/stat.h>
@@ -7,10 +8,10 @@
 namespace aa::helper {
 bool BluezBackend::Impl::permitted(const char* path, bool pairing) {
     if (pairing && !pairing_enabled) return false;
-    if (!allowed || Clock::now() >= window) { close_window(); return false; }
+    if (!allowed || now() >= window) { close_admission(); return false; }
     const auto captured = *allowed;
     if (captured.device.path != path || !exact(captured, !pairing)) return false;
-    return allowed && Clock::now() < window;
+    return allowed && now() < window;
 }
 void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gchar*, const gchar*,
                               const gchar*, GVariant* args, GDBusMethodInvocation* invocation, gpointer data) {
@@ -33,11 +34,14 @@ void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gch
     g_variant_get_child(args, 0, "&o", &device);
     if (std::string_view{interface} == "org.bluez.Profile1") {
         if (method == "RequestDisconnection") {
-            if (!self.allowed || self.allowed->device.path != device) { reject(); return; }
-            self.close_connection();
+            if ((!self.connected || self.connected->device.path != device) &&
+                (!self.allowed || self.allowed->device.path != device)) { reject(); return; }
+            // Completed RFCOMM teardown is not Bluetooth link loss (contract v2.6).
+            if (!self.bootstrap || !self.bootstrap->complete()) self.close_connection();
             g_dbus_method_invocation_return_value(invocation, nullptr); return;
         }
-        if (method != "NewConnection" || !self.permitted(device, false) || self.connection >= 0) { reject(); return; }
+        if (method != "NewConnection" || !self.permitted(device, false) ||
+            self.connection >= 0 || (self.bootstrap && self.bootstrap->live())) { reject(); return; }
         gint index{};
         g_variant_get_child(args, 1, "h", &index);
         auto* list = g_dbus_message_get_unix_fd_list(g_dbus_method_invocation_get_message(invocation));
@@ -50,6 +54,13 @@ void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gch
         if (::fstat(self.connection, &info) != 0 || !S_ISSOCK(info.st_mode)) {
             self.close_connection(); reject(); return;
         }
+        const auto handle = crypto_adapter::random_id();
+        if (!handle || !handle.value()) { self.close_connection(); reject(); return; }
+        self.retire(self.handoff_handle, HandoffFailure::eligibility);
+        self.connected = self.allowed;
+        self.handoff_handle = handle.value(); self.last_failure = HandoffFailure::none;
+        self.bootstrap = std::make_shared<Bootstrap>(self.connection, self.now(), self.now);
+        self.connection = -1;
         g_dbus_method_invocation_return_value(invocation, nullptr); return;
     }
     if (method == "AuthorizeService") {

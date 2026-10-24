@@ -6,7 +6,8 @@
 namespace aa::helper {
 class BluezBackend final : public Backend {
 public:
-    explicit BluezBackend(const std::string& bus_address);
+    using Now = std::function<std::chrono::steady_clock::time_point()>;
+    explicit BluezBackend(const std::string& bus_address, Now now = std::chrono::steady_clock::now);
     ~BluezBackend() override;
     bool available() const;
     core::Result<State> apply(Action, std::uint32_t) override;
@@ -18,6 +19,13 @@ public:
     void cleanup() noexcept override;
     void retire_lease() noexcept override;
     void tick() override;
+    core::Result<ObservedPeer> handoff() override;
+    SnapshotDeadline handoff_deadline() const override;
+    HandoffFailure handoff_failure() const override;
+    void fail_handoff(std::uint64_t, HandoffFailure) override;
+    core::Result<void> authorize_handoff(std::uint64_t, bool, bool) override;
+    void snapshot_provider(const SnapshotProvider&) override;
+    void snapshot_fence(const SnapshotFence&) override;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

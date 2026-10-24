@@ -108,6 +108,20 @@ resolved.
    (explicit jurisdiction handling; fail-closed channel validation;
    jurisdiction must be install-time confirmed or the AP never starts).
 
+## Wireless handoff
+
+Task37 implements the host-tested receiver listener and helper-owned RFCOMM
+bootstrap. The helper alone handles AAW framing and credentials; the receiver
+uses authenticated bootstrap RPCs and a fenced NetworkManager AP snapshot.
+A negotiated AAP WifiCredentials service is metadata-only and distinct from
+that bootstrap. Each accepted TCP link reuses a fresh `WiredSession` with AAP
+encapsulated TLS, not an outer TLS transport. See
+[wireless-handoff.md](docs/wireless-handoff.md) for authorization, lifetimes,
+and revocation. **BLOCKED:** a shared PSK cannot bind TCP to the Bluetooth
+peer, so production rejects unbound connections and wireless admission is not
+delivered. Host attestation is test-only; real-phone and Jetson qualification
+remain **TARGET BLOCKED**.
+
 ## Contract budgets referenced by interfaces
 
 - Video: 1280x720@30 primary, 800x480@30 fallback

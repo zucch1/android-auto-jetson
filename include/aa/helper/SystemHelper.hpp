@@ -2,6 +2,7 @@
 #pragma once
 #include <aa/helper/Identity.hpp>
 #include <aa/helper/ObservedPeer.hpp>
+#include <aa/helper/ApSnapshot.hpp>
 #include <chrono>
 #include <optional>
 #include <vector>
@@ -22,6 +23,11 @@ struct Source final {
     std::uint64_t confirmation{};
     friend bool operator==(const Source&, const Source&) = default;
 };
+struct SnapshotAuthority final {
+    Source source;
+    std::uint64_t handle;
+    std::uint64_t generation;
+};
 class Backend {
 public:
     virtual ~Backend() = default;
@@ -38,6 +44,17 @@ public:
     virtual core::Result<State> reconnect_peer(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
     virtual core::Result<void> revoke_peer(const PeerIdentity&) { return Error{ErrorCode::helper_unavailable}; }
     virtual void discard(std::uint64_t) {}
+    virtual core::Result<ObservedPeer> handoff() { return Error{ErrorCode::helper_rejected}; }
+    virtual HandoffFailure handoff_failure() const { return HandoffFailure::none; }
+    virtual void fail_handoff(std::uint64_t, HandoffFailure) {}
+    virtual core::Result<void> authorize_handoff(std::uint64_t, bool, bool) { return Error{ErrorCode::helper_rejected}; }
+    virtual void snapshot_provider(const SnapshotProvider&) {}
+    virtual void snapshot_fence(const SnapshotFence&) {}
+    virtual core::Result<ApSnapshot> ap_snapshot() { return Error{ErrorCode::helper_unavailable}; }
+    virtual core::Result<ApSnapshot> ap_snapshot(const SnapshotDeadline&) { return ap_snapshot(); }
+    virtual SnapshotDeadline handoff_deadline() const { return {}; }
+    virtual bool snapshot_current(std::uint64_t) { return false; }
+    virtual bool with_snapshot(std::uint64_t, const std::function<void()>&) { return false; }
 };
 class UnavailableBackend final : public Backend {
 public:
@@ -51,7 +68,17 @@ public:
     static constexpr std::size_t kMaxHistory = 4096;
     static constexpr auto kGrantLifetime = std::chrono::seconds(5);
     SystemHelper(IdentityLookup& identities, Backend& backend)
-        : identities_(identities), backend_(backend) {}
+        : identities_(identities), backend_(backend) {
+        backend_.snapshot_provider([this]() -> core::Result<ApSnapshot> {
+            if (!receiver_ || !handoff_binding_) return Error{ErrorCode::helper_rejected};
+            return ap_credentials(receiver_->unique_name, handoff_binding_->source, handoff_binding_->handle);
+        });
+        backend_.snapshot_fence([this](std::uint64_t epoch, const std::function<void()>& send) {
+            if (!receiver_ || !handoff_binding_) return false;
+            return transmit_snapshot(receiver_->unique_name, {handoff_binding_->source, handoff_binding_->handle, epoch}, send);
+        });
+    }
+    ~SystemHelper() { backend_.snapshot_provider({}); backend_.snapshot_fence({}); }
     core::Result<std::uint64_t> issue(const std::string& sender, Source source,
                                       Action action, std::uint32_t channel, Time now);
     core::Result<State> execute(const std::string& sender, Invocation invocation, Time now);
@@ -61,8 +88,19 @@ public:
     core::Result<void> bind(const std::string& sender, Source source, std::uint64_t handle);
     core::Result<State> reconnect_peer(const std::string& sender, std::uint64_t handle);
     core::Result<void> revoke_peer(const std::string& sender, const PeerIdentity& identity);
+    core::Result<ObservedPeer> poll_handoff(const std::string&, Source);
+    core::Result<ApSnapshot> ap_credentials(const std::string&, Source, std::uint64_t);
+    core::Result<void> authorize_handoff(const std::string&, Source, std::uint64_t, bool allow, bool ready);
+    HandoffFailure handoff_failure(const std::string& sender) {
+        return authenticate(sender) ? backend_.handoff_failure() : HandoffFailure::none;
+    }
+    bool transmit_snapshot(const std::string&, SnapshotAuthority, const std::function<void()>&);
+    SnapshotDeadline snapshot_deadline() const { return backend_.handoff_deadline(); }
     void tick(Time now);
-    void platform_tick() { backend_.tick(); }
+    void platform_tick() {
+        backend_.tick();
+        if (backend_.handoff_failure() != HandoffFailure::none) { handoff_binding_.reset(); handoff_snapshot_.reset(); }
+    }
     void bus_lost() noexcept;
     std::size_t pending() const noexcept { return grants_.size(); }
 private:
@@ -89,5 +127,11 @@ private:
     std::optional<Source> lease_;
     struct Binding { Source source; std::uint64_t handle; };
     std::vector<Binding> bindings_;
+    std::optional<Binding> handoff_binding_;
+    std::optional<ApSnapshot> handoff_snapshot_;
+    bool handoff_owned(const std::string&, Source, std::uint64_t);
+    bool handoff_bound(Source, std::uint64_t);
+    core::Result<ApSnapshot> validated_snapshot(Source, std::uint64_t);
+    void retire_handoff(std::uint64_t, HandoffFailure);
 };
 } // namespace aa::helper

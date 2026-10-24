@@ -23,6 +23,9 @@ public:
     core::Result<Response> call(const Request&, core::Milliseconds, core::CancellationToken) override;
     core::Result<State> status(Action action);
     core::Result<State> reconnect(const trust::TransportIdentity& identity);
+    core::Result<ObservedPeer> poll_bootstrap(Source, HandoffFailure&);
+    core::Result<void> authorize_bootstrap(Source, std::uint64_t handle, bool allow, bool listener_ready);
+    core::Result<ApSnapshot> get_ap_credentials(Source, std::uint64_t handle);
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override;
     void cancel(core::ConsumerId, core::PairingRequestId) override;
     void teardown(core::ConsumerId) override;

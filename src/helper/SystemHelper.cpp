@@ -99,6 +99,12 @@ core::Result<State> SystemHelper::execute(const std::string& sender, Invocation 
 }
 core::Result<void> SystemHelper::invalidate(const std::string& sender, Source source) {
     if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
+    if (handoff_binding_ && (!source.generation || source.generation == handoff_binding_->source.generation) &&
+        (!source.confirmation || source.confirmation == handoff_binding_->source.confirmation)) {
+        (void)backend_.authorize_handoff(handoff_binding_->handle, false, false);
+        handoff_binding_.reset();
+        handoff_snapshot_.reset();
+    }
     std::erase_if(grants_, [source](const Grant& g) {
         return (!source.generation || g.source.generation == source.generation) &&
                (!source.confirmation || g.source.confirmation == source.confirmation);
@@ -137,6 +143,8 @@ void SystemHelper::bus_lost() noexcept {
     lease_.reset();
     grants_.clear();
     bindings_.clear();
+    handoff_binding_.reset();
+    handoff_snapshot_.reset();
     receiver_.reset();
     // Never evict replay history. Exhaustion requires an explicit restart.
 }
@@ -153,11 +161,90 @@ core::Result<void> SystemHelper::bind(const std::string& sender, Source source, 
 }
 core::Result<State> SystemHelper::reconnect_peer(const std::string& sender, std::uint64_t handle) {
     if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
-    lease_ = lease_.value_or(Source{});
-    return backend_.reconnect_peer(handle);
+    const auto result = backend_.reconnect_peer(handle);
+    if (!result) return result.error();
+    handoff_binding_.reset();
+    handoff_snapshot_.reset();
+    lease_ = Source{};
+    return result;
 }
 core::Result<void> SystemHelper::revoke_peer(const std::string& sender, const PeerIdentity& identity) {
     if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
     return backend_.revoke_peer(identity);
+}
+core::Result<ObservedPeer> SystemHelper::poll_handoff(const std::string& sender, Source source) {
+    if (!authenticate(sender) || !source.generation || !lease_) return Error{ErrorCode::helper_rejected};
+    if (*lease_ != Source{} && *lease_ != source) return Error{ErrorCode::helper_rejected};
+    if (*lease_ == Source{} && source.confirmation) return Error{ErrorCode::helper_rejected};
+    auto peer = backend_.handoff();
+    if (!peer) return peer.error();
+    if (handoff_binding_ && handoff_binding_->handle != peer.value().handle) {
+        handoff_binding_.reset(); handoff_snapshot_.reset();
+    }
+    if (handoff_binding_ && (handoff_binding_->source != source || handoff_binding_->handle != peer.value().handle))
+        return Error{ErrorCode::helper_rejected};
+    handoff_binding_ = Binding{source, peer.value().handle};
+    if (*lease_ == Source{}) lease_ = source;
+    if (handoff_snapshot_ && !validated_snapshot(source, peer.value().handle)) return Error{ErrorCode::helper_rejected};
+    return peer;
+}
+void SystemHelper::retire_handoff(std::uint64_t handle, HandoffFailure reason) {
+    backend_.fail_handoff(handle, reason);
+    if (handoff_binding_ && handoff_binding_->handle == handle) {
+        handoff_binding_.reset(); handoff_snapshot_.reset();
+    }
+}
+// One full identity resolution per request entry and another immediately before
+// a secret leaves the helper; intermediate checks reuse no digest across them.
+bool SystemHelper::handoff_owned(const std::string& sender, Source source, std::uint64_t handle) {
+    return authenticate(sender) && handoff_bound(source, handle);
+}
+bool SystemHelper::handoff_bound(Source source, std::uint64_t handle) {
+    if (!handoff_binding_ || handoff_binding_->source != source || handoff_binding_->handle != handle || !handle)
+        return false;
+    const auto peer = backend_.handoff();
+    return peer && peer.value().handle == handle;
+}
+core::Result<ApSnapshot> SystemHelper::ap_credentials(const std::string& sender, Source source, std::uint64_t handle) {
+    if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
+    return validated_snapshot(source, handle);
+}
+core::Result<ApSnapshot> SystemHelper::validated_snapshot(Source source, std::uint64_t handle) {
+    if (!handoff_bound(source, handle)) return Error{ErrorCode::helper_rejected};
+    const auto deadline = backend_.handoff_deadline();
+    if (deadline.expired()) { retire_handoff(handle, HandoffFailure::timeout); return Error{ErrorCode::helper_rejected}; }
+    auto snapshot = backend_.ap_snapshot(deadline);
+    if (deadline.expired()) {
+        retire_handoff(handle, HandoffFailure::timeout); return Error{ErrorCode::helper_rejected};
+    }
+    if (!snapshot) {
+        retire_handoff(handle, HandoffFailure::snapshot); return Error{ErrorCode::helper_rejected};
+    }
+    if (!handoff_bound(source, handle) || !backend_.snapshot_current(snapshot.value().generation)) {
+        retire_handoff(handle, HandoffFailure::snapshot);
+        return Error{ErrorCode::helper_rejected};
+    }
+    if (handoff_snapshot_ && *handoff_snapshot_ != snapshot.value()) {
+        retire_handoff(handle, HandoffFailure::snapshot); return Error{ErrorCode::helper_rejected};
+    }
+    handoff_snapshot_ = snapshot.value();
+    return snapshot;
+}
+core::Result<void> SystemHelper::authorize_handoff(const std::string& sender, Source source, std::uint64_t handle,
+                                                  bool allow, bool ready) {
+    if (!handoff_owned(sender, source, handle)) return Error{ErrorCode::helper_rejected};
+    const auto result = backend_.authorize_handoff(handle, allow, ready);
+    if ((!allow || !result) && handoff_binding_ && handoff_binding_->handle == handle) handoff_snapshot_.reset();
+    return result;
+}
+bool SystemHelper::transmit_snapshot(const std::string& sender, SnapshotAuthority authority,
+                                      const std::function<void()>& send) {
+    if (!handoff_bound(authority.source, authority.handle)) return false;
+    const auto deadline = backend_.handoff_deadline();
+    bool transmitted{};
+    if (backend_.with_snapshot(authority.generation, [&] {
+        if (!deadline.expired() && handoff_owned(sender, authority.source, authority.handle)) { send(); transmitted = true; }
+    }) && transmitted) return true;
+    retire_handoff(authority.handle, HandoffFailure::snapshot); return false;
 }
 } // namespace aa::helper

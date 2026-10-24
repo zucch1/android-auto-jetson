@@ -5,22 +5,18 @@
 # ///
 # Run: python3 -B tests/helper/bluez_runtime.py build/host-dev
 from __future__ import annotations
-
 import json
 import socket
 import sys
 import threading
 from typing import Final
-
 from gi.repository import Gio, GLib
-
 AA: Final = "4de17a00-52cb-11e6-bdf4-0800200c9a66"
 ADAPTER: Final = "/org/bluez/hci0"
 DEVICE: Final = ADAPTER + "/dev_02_00_00_00_00_01"
 OTHER: Final = ADAPTER + "/dev_02_00_00_00_00_02"
 ROOT: Final = "/org/custom/AndroidAutoSystemHelper"
 FLAGS: Final = Gio.DBusCallFlags.NO_AUTO_START
-
 
 def connect(address: str) -> Gio.DBusConnection:
     return Gio.DBusConnection.new_for_address_sync(
@@ -42,6 +38,7 @@ class MockBluez:
         self.fail_remove = False
         self.fail_set = False
         self.slow_inventory = False
+        self.owner_during_inventory = False
         self.removed: list[str] = []
         self.properties = {"Pairable": True, "Discoverable": True}
         self.profile: list[str] = []
@@ -80,6 +77,9 @@ class MockBluez:
                method: str, args: GLib.Variant, invocation: Gio.DBusMethodInvocation) -> None:
         match method:
             case "GetManagedObjects":
+                if self.owner_during_inventory:
+                    self.owner_during_inventory = False
+                    self.name("ReleaseName", GLib.Variant("(s)", ("org.bluez",)))
                 if self.slow_inventory:
                     def delayed() -> bool:
                         invocation.return_value(self.inventory())
@@ -145,15 +145,23 @@ class MockBluez:
                 raise AssertionError(command)
         try:
             if member == "NewConnection":
-                if self.peer_socket is not None:
-                    self.peer_socket.close()
-                local, self.peer_socket = socket.socketpair()
-                self.peer_socket.settimeout(0.2)
+                local, candidate = socket.socketpair()
+                candidate.settimeout(0.2)
                 with local:
                     fds = Gio.UnixFDList.new()
                     index = fds.append(local.fileno())
-                    bus.call_with_unix_fd_list_sync(self.helper, path, interface, member,
-                        GLib.Variant("(oha{sv})", (device, index, {})), None, FLAGS, 2000, fds, None)
+                    try:
+                        bus.call_with_unix_fd_list_sync(self.helper, path, interface, member,
+                            GLib.Variant("(oha{sv})", (device, index, {})), None, FLAGS, 2000, fds, None)
+                    except GLib.Error:
+                        if self.peer_socket is None:
+                            self.peer_socket = candidate
+                        else:
+                            candidate.close()
+                        raise
+                if self.peer_socket is not None:
+                    self.peer_socket.close()
+                self.peer_socket = candidate
             else:
                 bus.call_sync(self.helper, path, interface, member, params, None, FLAGS, 2000, None)
             return "allowed"
@@ -162,7 +170,18 @@ class MockBluez:
             return "rejected"
 
     def command(self, text: str) -> str:
+        if text.startswith("wire-send "):
+            assert self.peer_socket is not None
+            self.peer_socket.sendall(bytes.fromhex(text.removeprefix("wire-send ")))
+            return "ok"
         match text:
+            case "wire-read":
+                assert self.peer_socket is not None
+                try:
+                    payload = self.peer_socket.recv(8192)
+                    return payload.hex() if payload else "closed"
+                except TimeoutError:
+                    return "open"
             case "state":
                 return json.dumps({"properties": self.properties, "profile": self.profile,
                     "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper})
@@ -174,6 +193,28 @@ class MockBluez:
             case "temporary-pair": self.paired = True; self.bonded = False
             case "unpaired": self.paired = False; self.bonded = False
             case "restore": self.present = True
+            case "remove": self.present = False
+            case "owner-during-inventory": self.owner_during_inventory = True
+            case "recreate":
+                self.bus.emit_signal(None, "/", "org.freedesktop.DBus.ObjectManager", "InterfacesRemoved",
+                                     GLib.Variant("(oas)", (DEVICE, ["org.bluez.Device1"])))
+            case "adapter-recreate":
+                self.bus.emit_signal(None, "/", "org.freedesktop.DBus.ObjectManager", "InterfacesRemoved",
+                                     GLib.Variant("(oas)", (ADAPTER, ["org.bluez.Adapter1"])))
+            case "bond-cycle":
+                self.bus.emit_signal(None, DEVICE, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                     GLib.Variant("(sa{sv}as)", ("org.bluez.Device1", {"Bonded": GLib.Variant("b", False)}, [])))
+            case "connected-false" | "connected-true" | "connected-invalidated":
+                self.bus.emit_signal(None, DEVICE, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                    GLib.Variant("(sa{sv}as)", ("org.bluez.Device1",
+                        {} if text == "connected-invalidated" else {"Connected": GLib.Variant("b", text == "connected-true")},
+                        ["Connected"] if text == "connected-invalidated" else [])))
+            case "wire-eof":
+                assert self.peer_socket is not None
+                self.peer_socket.shutdown(socket.SHUT_WR)
+            case "wire-shutdown-read":
+                assert self.peer_socket is not None
+                self.peer_socket.shutdown(socket.SHUT_RD)
             case "fail-remove": self.fail_remove = True
             case "allow-remove": self.fail_remove = False
             case "fail-set": self.fail_set = True
@@ -191,8 +232,6 @@ class MockBluez:
             case _:
                 return self.callback(text)
         return "ok"
-
-
 def main() -> None:
     mock = MockBluez(sys.argv[1])
     loop = GLib.MainLoop()
