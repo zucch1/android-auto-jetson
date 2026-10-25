@@ -167,6 +167,7 @@ class NetworkManager final {
 public:
     std::atomic<bool> active_now{}, pending{}, deny{}, stall{}, fail_stop{}, late_reply{}, valid{true};
     std::atomic<int> starts{}, deactivations{}, deletions{}, disconnects{};
+    std::atomic<Clock::duration::rep> teardown_started{};
     Boundary& boundary;
     std::mutex mutex;
     std::string seen_psk;
@@ -253,7 +254,7 @@ private:
             g_variant_builder_add_value(&entries, g_variant_builder_end(&entry)); return g_variant_builder_end(&entries);
         }
         if (std::string{name} == "ActiveConnection") return g_variant_new_object_path(self.active_now || self.pending ? active : "/");
-        if (std::string{name} == "State") return g_variant_new_uint32(self.active_now ? 2 : 1);
+        if (std::string{name} == "State") return g_variant_new_uint32(self.active_now ? 2 : self.pending ? 1 : 4);
         return nullptr;
     }
     static void method(GDBusConnection*, const gchar* sender, const gchar*, const gchar*, const gchar* name,
@@ -263,6 +264,7 @@ private:
         if (member == "GetDeviceByIpIface") { g_dbus_method_invocation_return_value(invocation,
             g_variant_new("(o)", self.device_remapped ? "/org/freedesktop/NetworkManager/Devices/2" : dev)); return; }
         if (member == "DeactivateConnection") {
+            self.teardown_started = Clock::now().time_since_epoch().count();
             ++self.deactivations;
             if (self.fail_stop) { g_dbus_method_invocation_return_dbus_error(invocation, "org.example.Failed", "blocked"); return; }
             self.active_now = false; self.pending = false;

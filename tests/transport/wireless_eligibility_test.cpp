@@ -16,7 +16,7 @@ struct EligibilityFixture {
     std::atomic<bool> helper_live{true};
     std::atomic<bool> stalled{false};
     std::atomic<bool> slow_refresh{false};
-    std::atomic<bool> moderate_refresh{false};
+    std::atomic<bool> moderate_refresh{false}, moderate_ops{false};
     std::atomic<bool> slow_setup{false};
     std::atomic<bool> early_sample{false};
     std::atomic<bool> sampled{false};
@@ -47,11 +47,13 @@ struct EligibilityFixture {
             if (allow) {
                 ordering_ok = listening; authorizing = true;
                 while (authorize_wait.load()) std::this_thread::yield();
+                if (moderate_ops.load()) std::this_thread::sleep_for(350ms);
                 ++allowed;
             } else ++denied;
             return {};
         }, [this](aa::helper::Source, std::uint64_t) -> aa::core::Result<void> {
             ++withdrawn;
+            if (moderate_ops.load()) std::this_thread::sleep_for(350ms);
             if (!bootstrap_complete.load()) return aa::Error{aa::ErrorCode::helper_rejected};
             return {};
         }},
@@ -194,6 +196,28 @@ TEST(WirelessEligibility, HealthyLateSamplingWithinSerialRefreshBudgetStaysEligi
         std::this_thread::sleep_for(5ms);
     }
 }
+void serialized_validation_preserves_freshness(bool confirming) {
+    // Given 350ms refreshes with a 350ms validating authorize or completed confirm between them.
+    EligibilityFixture f;
+    f.moderate_refresh = !confirming; f.moderate_ops = !confirming;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }, 2s));
+    if (confirming) { f.moderate_refresh = true; f.moderate_ops = true; f.coordinator.confirm_completion(); }
+    const auto epoch = f.coordinator.epoch();
+    // When three serialized operations exceed one 950ms evidence window.
+    const auto until = std::chrono::steady_clock::now() + 1500ms;
+    while (std::chrono::steady_clock::now() < until) {
+        f.coordinator.tick();
+        // Then each successful validation renews from its request start and eligibility never lapses.
+        ASSERT_TRUE(f.coordinator.valid_session());
+        ASSERT_EQ(f.coordinator.epoch(), epoch);
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_EQ(f.coordinator.bootstrap_completed(), confirming);
+    EXPECT_EQ(f.denied.load(), 0U);
+}
+TEST(WirelessEligibility, SerializedAuthorizePreservesFreshness) { serialized_validation_preserves_freshness(false); }
+TEST(WirelessEligibility, SerializedCompletedConfirmPreservesFreshness) { serialized_validation_preserves_freshness(true); }
 TEST(WirelessEligibility, EarlySampleDeliveredLateDoesNotRenewFromReplyTime) {
     EligibilityFixture f;
     f.start();

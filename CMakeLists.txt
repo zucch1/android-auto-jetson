@@ -158,6 +158,7 @@ include(cmake/AudioPipeline.cmake)
 # wired path and its test wires the real aa_video channel and aareceiver-audio.
 include(cmake/WiredE2e.cmake)
 include(cmake/WirelessE2e.cmake)
+include(cmake/WirelessRecovery.cmake)
 # Task 31 wired reconnect/recovery matrix follows the integrator: it exercises
 # link loss/replug, restarts, malformed input and unknown-phone attempts against
 # aa_wired and asserts the task-19 recovery/retry telemetry.

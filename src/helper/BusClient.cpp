@@ -71,6 +71,26 @@ core::Result<void> BusClient::confirmed(core::ConsumerId generation, core::Pairi
     impl_->active_source = Source{generation.value, source.value};
     return {};
 }
+core::Result<State> BusClient::acquire_ap(Source source) {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    if (!source.generation || !source.confirmation) return Error{ErrorCode::helper_rejected};
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until) || Clock::now() >= until) return Error{ErrorCode::timeout};
+    MessageWriter writer;
+    writer.put_u64(source.generation).put_u64(source.confirmation)
+        .put_u32(static_cast<std::uint32_t>(Action::acquire_ap)).put_u32(36);
+    const auto grant = impl_->rpc("Issue", "ttuu", writer, until);
+    if (!grant) return grant.error();
+    if (!grant.value()) return Error{ErrorCode::helper_protocol_mismatch};
+    const auto result = impl_->execute({Action::acquire_ap, 36, grant.value()}, until);
+    if (!result || result.value() == State::unavailable) {
+        (void)impl_->invalidate_locked(source, until);
+        return result ? Error{ErrorCode::helper_unavailable} : result.error();
+    }
+    impl_->active_source = source;
+    impl_->ap_source = source;
+    return result;
+}
 void BusClient::cancel(core::ConsumerId generation, core::PairingRequestId source) {
     impl_->invalidate({generation.value, source.value});
 }

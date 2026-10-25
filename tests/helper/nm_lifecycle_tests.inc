@@ -156,6 +156,22 @@ TEST_P(CompletedApLoss, ChangedSnapshotCannotTransmitOrRevive) {
     // Then restore never revives the retired handoff.
     nm->changed_ip = false; nm->changed_mac = false; boundary->wrong_channel = false; retired(handle);
 }
+TEST_P(CompletedApLoss, ChangedSnapshotRejectsCompletedConfirmation) {
+    // Given completed authority pinned to the original AP.
+    const auto handle = accept(); complete(handle); ASSERT_TRUE(client->get_ap_credentials({1, 1}, handle));
+    ASSERT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, false));
+    // When the AP changes before the next completed confirmation.
+    switch (GetParam()) {
+    case 0: ap->cleanup(); break;
+    case 1: nm->changed_ip = true; break;
+    case 2: nm->changed_mac = true; break;
+    case 3: boundary->wrong_channel = true; break;
+    case 4: nm->release_owner_at_address = nm->address_reads + 1; break;
+    }
+    // Then confirmation is not renewing evidence and the handle stays retired after restore.
+    EXPECT_FALSE(client->authorize_bootstrap({1, 1}, handle, true, false));
+    nm->changed_ip = false; nm->changed_mac = false; boundary->wrong_channel = false; retired(handle);
+}
 INSTANTIATE_TEST_SUITE_P(Terminal, CompletedApLoss, ::testing::Range(0, 5));
 class FailedReplacement : public CompletedLifecycle, public ::testing::WithParamInterface<const char*> {};
 TEST_P(FailedReplacement, FailedFreshBootstrapCannotInheritCompletedPredecessor) {

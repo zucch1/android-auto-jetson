@@ -1,10 +1,11 @@
-# Task37: wireless handoff and projection (host reference)
+# Wireless handoff, projection and recovery (host reference)
 
 Task37 implements the receiver listener, helper-owned RFCOMM bootstrap, and
-shared projection-session path for host testing. This is a reduced-scope
-result: scripted-peer success does not qualify a real phone, and production
-wireless admission remains unavailable because TCP endpoint binding is
-**BLOCKED** as described below.
+shared projection-session path for host testing; task38 adds the host
+reconnect/recovery matrix. This is a reduced-scope result: scripted-peer
+success does not qualify a real phone, and production wireless admission
+remains unavailable because TCP endpoint binding is **BLOCKED** as described
+below.
 
 ## Two protocol surfaces
 
@@ -123,7 +124,13 @@ successful current-epoch validation, timestamped conservatively at request
 start, renews freshness. The implemented budget is 950 ms evidence age plus
 owner scheduling and close, totaling at most one second from actual eligibility
 loss. Pending work and stale positive replies do not extend the lease; late
-results are epoch-fenced and cannot reopen admission.
+results are epoch-fenced and cannot reopen admission. Under v2.7, the renewing
+operations are refresh validation, ready authorization, and completed-bootstrap
+confirmation; completed confirmation revalidates the pinned snapshot rather
+than returning an unconditional no-op. With two 25 ms owner turns, each
+validating operation's full client latency must be below 450 ms, and a
+non-validating operation cannot sit between refreshes while authority depends
+on freshness.
 
 Accept cancellation and listener stop complete within one second. AAP
 authentication, including encapsulated TLS, has a 10-second budget. Control
@@ -167,9 +174,15 @@ an unrelated pending binding survives. The inherited 1000 ms total attempt,
 ```sh
 cmake --build build/host-dev -j2
 ctest --test-dir build/host-dev -R wireless_e2e --output-on-failure
+ctest --test-dir build/host-dev -R wireless_recovery --output-on-failure
+python3 -B tools/wireless-qa/wireless_recovery_qa.py run --build build/host-dev \
+  --out .omo/evidence/jetson-android-auto-receiver/task-38-wireless-recovery.json
 ```
 
-The 26 `wireless_e2e` groups run the D6 matrix. One end-to-end case composes the
+The 27 `wireless_e2e` groups run the D6 matrix. The `wireless_recovery` groups
+run R01-R11 plus validator mutation gates; see
+[qualification/wireless-recovery-qa.md](qualification/wireless-recovery-qa.md)
+for the task38 evidence contract, blocked scenarios, and sign-off status. One end-to-end case composes the
 actual `aa-system-helper`, private NetworkManager and BlueZ wire doubles, real
 RFCOMM bytes, real `BusClient`, the trust/control path, TCP, and AAP TLS through
 ACTIVE with media, audio, and input routing.
@@ -184,6 +197,7 @@ of `WifiConnectStatus` relative to AAP negotiation remain **TARGET BLOCKED**.
 ## Non-goals
 
 No phone-hosted hotspot, Wi-Fi Direct/P2P, A2DP, AVRCP, SAP, or HFP is added.
-Reconnect and recovery are task38, performance and soak are task39, the
-wireless qualification package is task40, and packaging is task41. None of
-those scopes is closed by the host handoff reference.
+Performance and soak are task39, the wireless qualification package is task40,
+and packaging is task41. The task38 host recovery matrix does not close those
+scopes, real-phone scenarios, production TCP admission, or full wireless
+qualification.
