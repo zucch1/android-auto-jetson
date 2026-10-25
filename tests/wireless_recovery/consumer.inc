@@ -28,4 +28,6 @@ TEST_F(WirelessRecoveryConsumer, R09NewOwnerGenerationRetiresOldAdmission) {
     const auto current = observe_snapshot(); ASSERT_TRUE(current);
     EXPECT_FALSE(client->get_ap_credentials({old_consumer.value, 0}, current->handle));
     EXPECT_FALSE(control->pairing_window_open()); EXPECT_EQ(events.count_opened(), 0U);
+    record_cleanup_observations("old activation State4; Device.ActiveConnection=/; original NM/device incarnation",
+        "old owned table removed; fresh activation owns current table");
 }

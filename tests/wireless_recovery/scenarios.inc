@@ -8,6 +8,7 @@ TEST_F(WirelessRecovery, R01ConnectedLossNeedsFreshHandoff) {
     ASSERT_NO_FATAL_FAILURE(closed());
     ASSERT_EQ(bluez.command("connected-true"), "ok"); ASSERT_NO_FATAL_FAILURE(stays_retired());
     ASSERT_NO_FATAL_FAILURE(recover_ap());
+    RecordProperty("cleanup_observations_applicability", "old-AP shutdown not claimed; existing activation may be reused");
 }
 TEST_F(WirelessRecovery, R02BluezOwnerLossFailsClosed) {
     // Given completed admission.
@@ -18,18 +19,27 @@ TEST_F(WirelessRecovery, R02BluezOwnerLossFailsClosed) {
     ASSERT_NO_FATAL_FAILURE(closed());
     ASSERT_EQ(bluez.command("acquire-name"), "ok"); ASSERT_NO_FATAL_FAILURE(stays_retired());
     timing.terminal_recovery = timing.elapsed(); EXPECT_LE(*timing.terminal_recovery, 15000);
+    RecordProperty("cleanup_observations_applicability", "old-AP shutdown not claimed; BlueZ owner-loss fail-closed authority only");
 }
 TEST_F(WirelessRecovery, R03NmTeardownClosesAdmissionAndCleansOwnedRules) {
     // Given completed admission and owned AP resources.
     ASSERT_NO_FATAL_FAILURE(setup_admission()); ASSERT_TRUE(boundary->table);
-    // When an actual helper AP teardown operation is requested.
+    // When teardown acknowledgement precedes asynchronous NM completion.
+    nm->deactivate_delay_ms = 2000;
     timing.t0 = Clock::now();
     if (!negative_control()) { ASSERT_TRUE(client->call({Operation::teardown_access_point, 0}, core::Milliseconds{1000}, {})); }
-    // Then both admission and independently observed NM resources retire.
     ASSERT_NO_FATAL_FAILURE(closed());
+    const auto acknowledged = nm_identity.activation(address); ASSERT_TRUE(acknowledged);
+    EXPECT_EQ(acknowledged->state, 3U); EXPECT_EQ(acknowledged->connection, active);
+    EXPECT_FALSE(nm_identity.inactive(address));
+    RecordProperty("deactivation_ack", "DeactivateConnection acknowledged; State3 and ActiveConnection retained; not AP-off");
+    // Then only State4 plus interface detachment counts as old-AP inactivity.
     ASSERT_TRUE(eventually([&] { pump(); return inactive_observed(); }, 5s));
     timing.ap_inactive = timing.elapsed(); EXPECT_LE(*timing.ap_inactive, 5000);
     timing.terminal_recovery = timing.elapsed();
+    EXPECT_EQ(nm->deactivations, 1); nm->deactivate_delay_ms = 0;
+    record_cleanup_observations("old activation State4; Device.ActiveConnection=/; original NM/device incarnation",
+        "owned table absent");
 }
 TEST_F(WirelessRecovery, R04FreshApAcquisitionCannotReuseOldSnapshot) {
     // Given a pinned old activation.
@@ -44,6 +54,8 @@ TEST_F(WirelessRecovery, R04FreshApAcquisitionCannotReuseOldSnapshot) {
     ASSERT_NO_FATAL_FAILURE(recover_ap());
     EXPECT_GT(timing.new_activation, timing.old_activation);
     EXPECT_FALSE(client->get_ap_credentials({consumer.value, 0}, old_handle));
+    record_cleanup_observations("old activation State4; Device.ActiveConnection=/; original NM/device incarnation",
+        "old owned table removed; fresh activation owns current table");
 }
 TEST_F(WirelessRecovery, R10SyntheticUnapprovedUnbondedPeerDeniedBeforeCredentials) {
     // Given approved first-peer admission, with an unchanged persistent store.
@@ -56,6 +68,7 @@ TEST_F(WirelessRecovery, R10SyntheticUnapprovedUnbondedPeerDeniedBeforeCredentia
     EXPECT_EQ(bluez.command("wire-read"), "closed");
     EXPECT_FALSE(receiver->active());
     timing.terminal_recovery = timing.elapsed(); EXPECT_LE(*timing.terminal_recovery, 1000);
+    RecordProperty("cleanup_observations_applicability", "not applicable: synthetic peer rejected before admission");
 }
 TEST_F(WirelessRecovery, ApOnlyAcquisitionUsesFreshLiveConsumerWithoutPairing) {
     // Given the actual registered consumer, then its actual authorized unregister.

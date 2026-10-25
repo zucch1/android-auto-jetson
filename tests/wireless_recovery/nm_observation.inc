@@ -16,9 +16,10 @@ struct RecoveryNmIdentity {
     bool current(GDBusConnection* bus) const {
         return !owner.empty() && device == dev && read(bus) == std::pair{owner, device};
     }
-    bool inactive(const std::string& address) const {
-        auto* bus = connect(address); if (!bus) return false;
-        if (!current(bus)) { close(bus); return false; }
+    struct Activation final { std::uint32_t state; std::string connection; };
+    std::optional<Activation> activation(const std::string& address) const {
+        auto* bus = connect(address); if (!bus) return std::nullopt;
+        if (!current(bus)) { close(bus); return std::nullopt; }
         const auto property = [&](const char* path, const char* interface, const char* key) {
             return g_dbus_connection_call_sync(bus, owner.c_str(), path, "org.freedesktop.DBus.Properties", "Get",
                 g_variant_new("(ss)", interface, key), G_VARIANT_TYPE("(v)"),
@@ -26,15 +27,20 @@ struct RecoveryNmIdentity {
         };
         auto* state = property(active, "org.freedesktop.NetworkManager.Connection.Active", "State");
         auto* device_state = property(dev, "org.freedesktop.NetworkManager.Device", "ActiveConnection");
-        bool off{};
+        std::optional<Activation> observed;
         if (state && device_state) {
             GVariant *s{}, *d{}; g_variant_get(state, "(v)", &s); g_variant_get(device_state, "(v)", &d);
-            off = g_variant_get_uint32(s) == 4 && std::string{g_variant_get_string(d, nullptr)} == "/";
+            observed = Activation{g_variant_get_uint32(s), g_variant_get_string(d, nullptr)};
             g_variant_unref(s); g_variant_unref(d);
         }
         if (state) g_variant_unref(state);
         if (device_state) g_variant_unref(device_state);
-        off = off && current(bus); close(bus); return off;
+        if (!current(bus)) observed.reset();
+        close(bus); return observed;
+    }
+    bool inactive(const std::string& address) const {
+        const auto observed = activation(address);
+        return observed && observed->state == 4 && observed->connection == "/";
     }
     void capture(const std::string& address) {
         auto* bus = connect(address);

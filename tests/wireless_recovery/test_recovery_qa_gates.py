@@ -38,6 +38,12 @@ def valid_document():
             observations.update({"fresh_confirmed_active": "true", "video_delivered": "true",
                                  "audio_delivered": "true", "input_delivered": "true",
                                  "attestation": "test-only"})
+        if scenario in qa.AP_OFF_SCENARIOS:
+            observations.update({"cleanup_nm": "State4 and Device.ActiveConnection=/",
+                                 "cleanup_nft": "owned table absent",
+                                 "cleanup_bluez": "pairing closed; RFCOMM closed"})
+        else:
+            observations["cleanup_observations_applicability"] = "not applicable: no old-AP shutdown claim"
         cases = [case(f"{scenario}Primary", observations)]
         if scenario == "R07":
             observations.update({"hard_kill_cleanup": "pass: independent NM proof",
@@ -46,13 +52,17 @@ def valid_document():
                        "link_retired_ms": "100", "terminal_recovery_ms": "100",
                        "old_activation_id": "1", "new_activation_id": "0",
                        "hard_kill_cleanup": "BLOCKED: cleanup-unverified / operator-supervised recovery required",
-                       "protocol_result": "pass: fail-closed after respawn"}
+                       "protocol_result": "pass: fail-closed after respawn",
+                       "cleanup_nm": "unknown: client-bound shutdown did not complete",
+                       "cleanup_nft": "owned table retained; not AP-off proof",
+                       "cleanup_bluez": "profile retained; RFCOMM closed"}
             cases.append(case("R07Unverified", blocked))
         document["scenarios"].append(qa.scenario_from_cases(scenario, cases, 0))
     document["scenarios"].extend(qa.blocked_scenarios())
     document["trust_store_unmodified_on_reconnect"] = True
     document["no_ap_leak_verified"] = qa.expected_ap_leak(document)
-    document["hard_kill_cleanup"] = {"status": "blocked", "reason": "cleanup-unverified"}
+    r07 = next(entry for entry in document["scenarios"] if entry["scenario_id"] == "R07")
+    document["hard_kill_cleanup"] = {"status": r07["status"], "reason": r07["blocked_reason"]}
     return document
 
 
@@ -103,6 +113,34 @@ class RecoveryQaGates(unittest.TestCase):
             entry["status"] = "pass"
             entry["blocked_reason"] = None
         self.mutation(promote, "R07: cleanup limitation must not be promoted to pass")
+
+    def test_missing_case_evidence(self):
+        self.mutation(lambda d: self.scenario(d, "R06").update(cases=[]), "R06: missing per-case evidence")
+
+    def test_blocked_case_cannot_be_promoted(self):
+        def promote(document):
+            self.scenario(document, "R07")["cases"][1]["status"] = "pass"
+        self.mutation(promote, "R07 case 1: blocked cleanup case must have blocked status")
+
+    def test_case_timing_cannot_hide_behind_aggregate(self):
+        def late_case(document):
+            self.scenario(document, "R07")["cases"][1]["offsets"]["terminal_recovery_ms"] = 15001
+        self.mutation(late_case, "R07 case 1: terminal state exceeds its budget")
+
+    def test_negative_offset_rejected(self):
+        self.mutation(lambda d: self.scenario(d, "R03").update(admission_closed_ms=-1),
+                      "R03: admission_closed_ms must be a nonnegative integer")
+
+    def test_aggregate_must_match_cases(self):
+        def change_aggregate(document):
+            entry = self.scenario(document, "R06")
+            entry["terminal_recovery_ms"] += 1
+        self.mutation(change_aggregate, "R06: aggregate terminal_recovery_ms does not match cases")
+
+    def test_cleanup_observation_required(self):
+        def remove_cleanup(document):
+            del self.scenario(document, "R03")["cases"][0]["observations"]["cleanup_nm"]
+        self.mutation(remove_cleanup, "R03 case 0: missing cleanup_nm")
 
     def test_projection_recovery_requires_media_evidence(self):
         def remove_video(document):

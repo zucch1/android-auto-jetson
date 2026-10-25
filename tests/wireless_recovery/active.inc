@@ -84,6 +84,8 @@ TEST_F(WirelessRecoveryActive, R08ConfirmedActiveOwnerLossGraceAndActualApTeardo
     EXPECT_EQ(video.messages, 1U); EXPECT_EQ(audio.messages, 1U);
     EXPECT_EQ(control->state().consumer.value, 0U); EXPECT_FALSE(occupied());
     EXPECT_EQ(nm->starts, timing.old_activation);
+    record_cleanup_observations("old activation State4; Device.ActiveConnection=/; original NM/device incarnation",
+        "owned table absent");
     RecordProperty("terminal_state", "confirmed ACTIVE grace expired; old AP independently inactive; fail-closed");
     RecordProperty("fresh_acquisition_applicability", "not applicable: consumer absent, no reacquisition authorized");
 }
@@ -127,4 +129,5 @@ TEST_F(WirelessRecoveryActive, R11ConnectedLossFullProjectionReconnect) {
     RecordProperty("audio_delivered", audio.messages == 1 ? "true" : "false");
     RecordProperty("input_delivered", input_sent ? "true" : "false");
     RecordProperty("attestation", "test-only; production unbound TCP admission remains rejected");
+    RecordProperty("cleanup_observations_applicability", "old-AP shutdown not claimed; existing activation reused after link loss");
 }

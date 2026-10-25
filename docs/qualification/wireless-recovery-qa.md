@@ -25,7 +25,9 @@ returning success. Evidence and scenario logs stay uncommitted. The validator
 has mutation controls for missing scenarios, missing teardown-start evidence,
 late AP-off, missing old/new activation distinction, unsupported AP-leak
 claims, unsigned reduced-scope closure, promoted blocked scenarios, and missing
-R11 media evidence.
+R11 media evidence. Per-case status, nonnegative timings, aggregate/case
+consistency, blocked-cleanup case status, and required cleanup observations are
+also validated.
 
 ## Matrix and terminal claims
 
@@ -38,11 +40,11 @@ state at most 15 s unless the confirmed-consumer grace applies.
 |---|---|
 | R01 `Connected=false` | Old handle stays retired after `Connected=true`; explicit fresh reconnect admits. |
 | R02 BlueZ owner/name loss | Authority fails closed; restoring the name alone does not revive it. |
-| R03 NM AP teardown | Admission closes; old activation is independently inactive and owned nft state is removed. |
+| R03 NM AP teardown | Admission closes; acknowledged State3 deactivation with the interface still attached is not AP-off; later State4 plus `Device.ActiveConnection=/` and owned nft removal are independently observed. |
 | R04 AP generation/endpoint restart | Fresh AP-only grant and fresh bootstrap use a new activation and pinned snapshot on port 5277. |
 | R05 fresh receiver objects | Receiver-loss cleanup is observed; the same persistent approval reloads without `AddPhone`. |
 | R06 graceful helper SIGTERM/respawn | Graceful NM/nft/BlueZ cleanup is recorded; respawn reacquires AP and admits without pairing. |
-| R07 helper SIGKILL/respawn | Protocol recovery/fail-closed is separate from cleanup. Client-bound NM shutdown has independent State4 plus `Device.ActiveConnection=/` proof when available. When NM cannot complete shutdown, cleanup is **BLOCKED** as `cleanup-unverified / operator-supervised recovery required`, never passed. |
+| R07 helper SIGKILL/respawn | Protocol recovery/fail-closed is separate from cleanup. Delayed client-bound shutdown exposes State3 before independent State4 plus `Device.ActiveConnection=/` proof. When NM cannot complete shutdown, cleanup is **BLOCKED** as `cleanup-unverified / operator-supervised recovery required`, never passed. |
 | R08 confirmed ACTIVE consumer owner loss | Admission closes immediately; grace expiry and actual teardown start are in `[10000,11000)` ms; old AP is independently inactive by `min(teardown_start+5000,15000)` ms. |
 | R09 consumer generation replacement | Old admission/epoch retires; stale work cannot reopen it; only the new generation acquires fresh AP and handoff authority. |
 | R10 synthetic unapproved/unbonded peer | Rejected before credential release or session creation; this is not production TCP-to-Bluetooth identity proof. |

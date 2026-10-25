@@ -210,11 +210,15 @@ def expected_ap_leak(document: dict) -> bool:
         s["old_ap_inactive_ms"] is not None for s in host if s["scenario_id"] in AP_OFF_SCENARIOS)
 
 
+def valid_offset(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def validate(document: dict) -> list[str]:
     errors = []
     for key in ("task", "git_commit", "timestamp", "compliance_status", "withdrawn_claims",
                 "owner_approval", "reduced_scope_signoff", "no_ap_leak_verified",
-                "trust_store_unmodified_on_reconnect", "scenarios"):
+                "trust_store_unmodified_on_reconnect", "hard_kill_cleanup", "scenarios"):
         if key not in document:
             errors.append(f"missing top-level field {key}")
     if errors:
@@ -253,8 +257,91 @@ def validate(document: dict) -> list[str]:
                 errors.append(f"{scenario}: missing offset key {field}")
             elif entry[field] is None and field not in entry.get("null_reasons", {}):
                 errors.append(f"{scenario}: null {field} has no applicability reason")
+            elif entry[field] is not None and not valid_offset(entry[field]):
+                errors.append(f"{scenario}: {field} must be a nonnegative integer")
         if entry["status"] == "fail":
             continue
+        cases = entry.get("cases")
+        if not isinstance(cases, list) or not cases:
+            errors.append(f"{scenario}: missing per-case evidence")
+            continue
+        for field in REQUIRED_OFFSETS[scenario]:
+            if cases[0].get("offsets", {}).get(field) is None:
+                errors.append(f"{scenario}: primary case missing {field}")
+        statuses = []
+        for index, case in enumerate(cases):
+            label = f"{scenario} case {index}"
+            status, observations, offsets = case.get("status"), case.get("observations"), case.get("offsets")
+            if status not in {"pass", "fail", "blocked"} or not isinstance(observations, dict) or not isinstance(offsets, dict):
+                errors.append(f"{label}: invalid status, observations or offsets")
+                continue
+            statuses.append(status)
+            for field in OFFSETS:
+                if field not in offsets:
+                    errors.append(f"{label}: missing offset key {field}")
+                elif offsets[field] is not None and not valid_offset(offsets[field]):
+                    errors.append(f"{label}: {field} must be a nonnegative integer")
+            common = {"terminal_recovery_ms"} if scenario == "R10" else {
+                "admission_closed_ms", "link_retired_ms", "terminal_recovery_ms"}
+            for field in common:
+                if offsets.get(field) is None:
+                    errors.append(f"{label}: missing {field}")
+            admission, link = offsets.get("admission_closed_ms"), offsets.get("link_retired_ms")
+            terminal, inactive = offsets.get("terminal_recovery_ms"), offsets.get("old_ap_inactive_ms")
+            teardown = offsets.get("teardown_started_ms")
+            if scenario != "R10" and valid_offset(admission) and admission > 1000:
+                errors.append(f"{label}: admission closure exceeds 1s")
+            if scenario not in {"R08", "R10"} and valid_offset(link) and link > 5000:
+                errors.append(f"{label}: link teardown exceeds 5s")
+            if valid_offset(terminal) and terminal > (1000 if scenario == "R10" else 15000):
+                errors.append(f"{label}: terminal state exceeds its budget")
+            if scenario in AP_OFF_SCENARIOS and scenario != "R08" and valid_offset(inactive) and inactive > 5000:
+                errors.append(f"{label}: old AP inactivity exceeds 5s")
+            if scenario == "R08":
+                for field in ("grace_expiry_observed_ms", "teardown_started_ms", "link_retired_ms"):
+                    value = offsets.get(field)
+                    if valid_offset(value) and not 10000 <= value < 11000:
+                        errors.append(f"{label}: {field} outside [10000,11000)")
+                if valid_offset(teardown) and valid_offset(inactive) and inactive > min(teardown + 5000, 15000):
+                    errors.append(f"{label}: AP-off after derived deadline")
+            cleanup = observations.get("hard_kill_cleanup", "")
+            if cleanup.startswith("BLOCKED") and status != "blocked":
+                errors.append(f"{label}: blocked cleanup case must have blocked status")
+            if status == "blocked" and not cleanup.startswith("BLOCKED"):
+                errors.append(f"{label}: blocked case lacks a blocked cleanup reason")
+            if scenario in AP_OFF_SCENARIOS:
+                for key in ("cleanup_nm", "cleanup_nft", "cleanup_bluez"):
+                    if not observations.get(key):
+                        errors.append(f"{label}: missing {key}")
+            elif not observations.get("cleanup_observations_applicability"):
+                errors.append(f"{label}: missing cleanup applicability reason")
+            if observations.get("trust_store_unmodified") != "true":
+                errors.append(f"{label}: trust-store preservation is not evidenced")
+        if statuses:
+            expected = "fail" if "fail" in statuses else "blocked" if "blocked" in statuses else "pass"
+            if entry["status"] != expected:
+                errors.append(f"{scenario}: aggregate status does not match per-case outcomes")
+        usable = [case for case in cases if isinstance(case.get("offsets"), dict)]
+        for field in OFFSETS:
+            values = [case["offsets"][field] for case in usable if valid_offset(case["offsets"].get(field))]
+            expected = max(values) if values else None
+            if entry.get(field) != expected:
+                errors.append(f"{scenario}: aggregate {field} does not match cases")
+        if entry.get("protocol_elapsed_ms") != entry.get("terminal_recovery_ms"):
+            errors.append(f"{scenario}: protocol_elapsed_ms does not match terminal recovery")
+        for field in ("old_activation_id", "new_activation_id"):
+            raw = cases[0].get("observations", {}).get(field)
+            try:
+                expected = int(raw) if raw is not None else None
+            except ValueError:
+                expected = None
+                errors.append(f"{scenario}: invalid primary {field}")
+            if entry.get(field) != expected:
+                errors.append(f"{scenario}: aggregate {field} does not match primary case")
+        expected_reason = next((case.get("observations", {}).get("hard_kill_cleanup") for case in cases
+                                if case.get("observations", {}).get("hard_kill_cleanup", "").startswith("BLOCKED")), None)
+        if entry.get("blocked_reason") != expected_reason:
+            errors.append(f"{scenario}: blocked_reason does not match per-case cleanup evidence")
         for field in REQUIRED_OFFSETS[scenario]:
             if entry.get(field) is None:
                 errors.append(f"{scenario}: missing required observation {field}")
@@ -297,9 +384,6 @@ def validate(document: dict) -> list[str]:
                     errors.append(f"R11: missing {key} evidence")
             if "test-only" not in observations.get("attestation", ""):
                 errors.append("R11: attestation scope is not explicit")
-        for case in entry.get("cases", []):
-            if case["observations"].get("trust_store_unmodified") != "true":
-                errors.append(f"{scenario}: trust-store preservation is not evidenced")
     if any(scenarios[s]["status"] == "fail" for s in HOST_SCENARIOS):
         if document["compliance_status"] != "failed":
             errors.append("failed host scenario requires failed compliance_status")
@@ -307,8 +391,19 @@ def validate(document: dict) -> list[str]:
         errors.append("failed compliance_status has no failed host scenario")
     if document["no_ap_leak_verified"] != expected_ap_leak(document):
         errors.append("unsupported no_ap_leak_verified value")
+    all_cases = [case for scenario in HOST_SCENARIOS for case in scenarios[scenario].get("cases", [])]
+    expected_trust = bool(all_cases) and all(
+        case.get("observations", {}).get("trust_store_unmodified") == "true" for case in all_cases)
+    if document["trust_store_unmodified_on_reconnect"] != expected_trust:
+        errors.append("trust_store_unmodified_on_reconnect does not match per-case evidence")
     if not document["trust_store_unmodified_on_reconnect"]:
         errors.append("trust_store_unmodified_on_reconnect is not evidenced")
+    hard_kill = document["hard_kill_cleanup"]
+    r07 = scenarios["R07"]
+    if not isinstance(hard_kill, dict) or hard_kill.get("status") != r07["status"]:
+        errors.append("hard_kill_cleanup status does not match R07")
+    elif r07["status"] == "blocked" and hard_kill.get("reason") != r07.get("blocked_reason"):
+        errors.append("hard_kill_cleanup reason does not match R07")
     return errors
 
 

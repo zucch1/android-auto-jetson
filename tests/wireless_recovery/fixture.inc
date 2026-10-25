@@ -166,6 +166,15 @@ protected:
         if (timing.new_activation > timing.old_activation) { EXPECT_NE(observation->generation, old_snapshot_generation); }
         EXPECT_LE(*timing.terminal_recovery, 15000);
     }
+    void record_cleanup_observations(const char* nm_state, const char* nft_state) {
+        RecordProperty("cleanup_nm", nm_state); RecordProperty("cleanup_nft", nft_state);
+        const auto bluetooth = bluez.command("state");
+        EXPECT_NE(bluetooth.find("\"Pairable\": false"), std::string::npos);
+        const bool profile = bluetooth.find("4de17a00-52cb-11e6-bdf4-0800200c9a66") != std::string::npos;
+        EXPECT_EQ(bluez.command("wire-read"), "closed");
+        RecordProperty("cleanup_bluez", std::string{profile ? "helper-global profile retained" : "profile absent"} +
+            "; pairing closed; RFCOMM closed");
+    }
     void TearDown() override {
         const auto cleanup_request = cleanup_monitor ? cleanup_monitor->first.load() : Clock::duration::rep{};
         if (control) control->shutdown();
