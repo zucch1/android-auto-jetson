@@ -206,15 +206,17 @@ core::Result<void> BluezBackend::authorize_handoff(std::uint64_t handle, bool al
     if (!allow) {
         impl_->bootstrap->deny(HandoffFailure::denied); impl_->last_failure = HandoffFailure::denied; return {};
     }
-    if (!ready && impl_->bootstrap->complete()) return {};
-    if (!ready || !impl_->snapshots) {
+    // v2.7: completed confirmation (allow, no listener) revalidates the pinned
+    // snapshot like ready authorization, so either success is renewing evidence.
+    const bool completed = impl_->bootstrap->complete();
+    if ((!ready && !completed) || !impl_->snapshots) {
         impl_->bootstrap->deny(HandoffFailure::eligibility); impl_->last_failure = HandoffFailure::eligibility;
         return Error{ErrorCode::helper_rejected};
     }
     const auto snapshot = impl_->snapshots();
     const auto current = handoff();
     if (!current || current.value().handle != handle) return Error{ErrorCode::helper_rejected};
-    if (!snapshot || !impl_->bootstrap->authorize(snapshot.value(), ready, impl_->now())) {
+    if (!snapshot || !impl_->bootstrap->authorize(snapshot.value(), ready || completed, impl_->now())) {
         impl_->retire(handle, HandoffFailure::snapshot);
         return Error{ErrorCode::helper_unavailable};
     }

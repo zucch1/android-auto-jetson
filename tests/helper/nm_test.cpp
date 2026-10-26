@@ -167,11 +167,13 @@ class NetworkManager final {
 public:
     std::atomic<bool> active_now{}, pending{}, deny{}, stall{}, fail_stop{}, late_reply{}, valid{true};
     std::atomic<int> starts{}, deactivations{}, deletions{}, disconnects{};
+    std::atomic<Clock::duration::rep> teardown_started{};
     Boundary& boundary;
     std::mutex mutex;
     std::string seen_psk;
     std::atomic<bool> bad_mac{}, replaced{}, wrong_mode{}, changed_mac{}, changed_ip{};
     std::atomic<int> release_owner_at_address{}, replace_device_at_address{}, change_channel_at_address{}, address_reads{}, delay_address_ms{};
+    std::atomic<int> deactivate_delay_ms{}, client_stop_delay_ms{};
     std::atomic<bool> owner_released{}, device_remapped{};
     NetworkManager(const std::string& address, Boundary& commands) : boundary(commands) {
         std::promise<bool> ready;
@@ -197,6 +199,7 @@ public:
                 "/org/freedesktop/DBus", nullptr, G_DBUS_SIGNAL_FLAGS_NONE, owner_changed, this, nullptr);
             ready.set_value(true);
             while (!stop.stop_requested()) {
+                advance_deactivation();
                 while (g_main_context_pending(context_)) g_main_context_iteration(context_, FALSE);
                 std::this_thread::sleep_for(1ms);
             }
@@ -214,11 +217,29 @@ private:
     GMainContext* context_{};
     std::jthread worker_;
     std::string client_;
+    std::atomic<bool> deactivating{};
+    std::atomic<int> deactivation_starts{};
+    std::atomic<Clock::duration::rep> deactivation_due{};
+    void schedule_deactivation(int delay) {
+        if (delay > 0) {
+            deactivation_starts = starts.load();
+            deactivation_due = (Clock::now() + std::chrono::milliseconds{delay}).time_since_epoch().count();
+            deactivating = true;
+            return;
+        }
+        deactivation_due = 0; deactivating = false; active_now = false; pending = false;
+    }
+    void advance_deactivation() {
+        const auto due = deactivation_due.load();
+        if (!deactivating || !due || Clock::now().time_since_epoch().count() < due) return;
+        if (starts.load() == deactivation_starts.load()) { active_now = false; pending = false; }
+        deactivating = false; deactivation_due = 0;
+    }
     static void owner_changed(GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar*, GVariant* args, gpointer data) {
         auto& self = *static_cast<NetworkManager*>(data);
         const char *name{}, *old{}, *next{}; g_variant_get(args, "(&s&s&s)", &name, &old, &next);
         if (self.client_ == name && *old && !*next && !self.fail_stop) {
-            self.active_now = false; self.pending = false; ++self.disconnects;
+            ++self.disconnects; self.schedule_deactivation(self.client_stop_delay_ms.load());
         }
     }
     static GVariant* property(GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar* name, GError**, gpointer data) {
@@ -252,8 +273,8 @@ private:
             g_variant_builder_add(&entry, "{sv}", "prefix", g_variant_new_uint32(24));
             g_variant_builder_add_value(&entries, g_variant_builder_end(&entry)); return g_variant_builder_end(&entries);
         }
-        if (std::string{name} == "ActiveConnection") return g_variant_new_object_path(self.active_now || self.pending ? active : "/");
-        if (std::string{name} == "State") return g_variant_new_uint32(self.active_now ? 2 : 1);
+        if (std::string{name} == "ActiveConnection") return g_variant_new_object_path(self.active_now || self.pending || self.deactivating ? active : "/");
+        if (std::string{name} == "State") return g_variant_new_uint32(self.deactivating ? 3 : self.active_now ? 2 : self.pending ? 1 : 4);
         return nullptr;
     }
     static void method(GDBusConnection*, const gchar* sender, const gchar*, const gchar*, const gchar* name,
@@ -263,9 +284,10 @@ private:
         if (member == "GetDeviceByIpIface") { g_dbus_method_invocation_return_value(invocation,
             g_variant_new("(o)", self.device_remapped ? "/org/freedesktop/NetworkManager/Devices/2" : dev)); return; }
         if (member == "DeactivateConnection") {
+            self.teardown_started = Clock::now().time_since_epoch().count();
             ++self.deactivations;
             if (self.fail_stop) { g_dbus_method_invocation_return_dbus_error(invocation, "org.example.Failed", "blocked"); return; }
-            self.active_now = false; self.pending = false;
+            self.schedule_deactivation(self.deactivate_delay_ms.load());
         } else if (member == "Delete") ++self.deletions;
         else if (member == "AddAndActivateConnection2") {
             ++self.starts; self.client_ = sender;
@@ -294,6 +316,7 @@ private:
             if (ipv4) g_variant_unref(ipv4);
             g_variant_unref(settings); g_variant_unref(options);
             if (self.deny) { g_dbus_method_invocation_return_dbus_error(invocation, "org.example.Denied", "denied"); return; }
+            self.deactivating = false; self.deactivation_due = 0;
             self.pending = true; self.active_now = !self.stall;
             if (self.late_reply) std::this_thread::sleep_for(450ms);
             GVariantBuilder result; g_variant_builder_init(&result, G_VARIANT_TYPE_VARDICT);

@@ -20,6 +20,20 @@ public:
           }) {}
     ~WirelessReceiver() { stop(); }
     helper::Confirmation& confirmation() { return confirmation_; }
+#ifdef AA_WIRELESS_TEST_ATTESTATION
+    // Forward only the existing host-test hook; absent from production builds.
+    void attest_for_test(WirelessLink::TestAttestation attestation) { link_.attest_for_test(std::move(attestation)); }
+    WiredSession* session_for_test() const { return link_.session(); }
+#endif
+    // The acquiring source becomes the helper AP lease; drive this AP's handoff
+    // with begin(source). reconnect() resets the lease to the empty source and
+    // must precede, not follow, acquisition (docs/wireless-handoff.md).
+    core::Result<helper::State> acquire_ap(ipc::ControlService& control, helper::Source source) {
+        const auto state = control.state();
+        if (!state.consumer.value || state.consumer.value != source.generation || !source.confirmation)
+            return Error{ErrorCode::ipc_consumer_rejected};
+        return helper_.acquire_ap(source);
+    }
     core::Result<void> begin(ipc::ControlService& control, helper::Source source) {
         const auto state = control.state();
         if (!state.consumer.value || state.consumer.value != source.generation)
@@ -36,7 +50,7 @@ public:
         return begin(control, {state.consumer.value, 0});
     }
     core::Result<bool> poll(ipc::ControlService& control, std::function<void()> work = {}) {
-        auto result = link_.poll(eligibility_, [&] {
+        auto result = link_.poll(eligibility_, [this, &control, work = std::move(work)] {
             if (work) work();
             const auto state = control.state();
             eligibility_.tick(active());

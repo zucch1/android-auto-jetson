@@ -70,7 +70,11 @@ struct HandoffEligibilityCoordinator::Impl {
     void accept(Reply reply) {
         if (reply.job.epoch != epoch.load() || reply.job.operation == Operation::deny) return;
         if (!reply.result) { retire(); return; }
-        if (reply.job.operation == Operation::withdraw) { completed = true; confirming = false; return; }
+        const auto fresh_until = reply.job.started + 950ms;
+        if (reply.job.operation == Operation::withdraw) {
+            if (Clock::now() >= fresh_until || !trusted() || (!live_consumer() && !active)) { retire(); return; }
+            expires = fresh_until; completed = true; confirming = false; return;
+        }
         if (reply.job.operation == Operation::observe) {
             const auto& observed = reply.result.value();
             if (!observed.peer.handle || observed.peer.handle == retired_handle || !observed.snapshot) { retire(); return; }
@@ -83,8 +87,8 @@ struct HandoffEligibilityCoordinator::Impl {
             snapshot = observed.snapshot;
             stage = Stage::preparing;
         } else if (reply.job.operation == Operation::authorize) {
-            if (!trusted() || !live_consumer()) { retire(); return; }
-            stage = Stage::authorized;
+            if (Clock::now() >= fresh_until || !trusted() || !live_consumer()) { retire(); return; }
+            expires = fresh_until; stage = Stage::authorized;
         } else {
             if (reply.job.credentials && !reply.result.value().snapshot) { retire(); return; }
             if (reply.result.value().snapshot) {
@@ -96,7 +100,6 @@ struct HandoffEligibilityCoordinator::Impl {
                     trust::WirelessIdentity{peer.identity.address, peer.identity.adapter}});
                 if (peer.handle != handle || !key || !phone || key.value() != phone->key) { retire(); return; }
             }
-            const auto fresh_until = reply.job.started + 950ms;
             if (Clock::now() >= fresh_until || !trusted() || (!live_consumer() && !active)) { retire(); return; }
             expires = fresh_until;
             if (stage == Stage::preparing) {
