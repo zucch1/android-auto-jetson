@@ -144,6 +144,17 @@ aa::display::testcontrol::Status probe_status() {
     return status;
 }
 
+void print_usage(std::FILE* stream) {
+    std::fputs("usage: aa-dummy-display [--video-socket PATH] [--input-socket PATH]\n"
+               "                        [--test-only-autostart] [--test-only-control-stdin]\n"
+               "\n"
+               "TEST-ONLY Android Auto projection consumer.\n"
+               "  F5 start projection   F6 stop projection\n"
+               "  F1 toggle HUD         F11 toggle full screen\n"
+               "  arrows/enter/letters  forwarded as keys; left mouse button = touch\n",
+               stream);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -165,7 +176,12 @@ int main(int argc, char** argv) {
             video_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--input-socket") == 0 && index + 1 < argc) {
             input_socket = argv[++index];
+        } else if (std::strcmp(argv[index], "--help") == 0 || std::strcmp(argv[index], "-h") == 0) {
+            print_usage(stdout);
+            return 0;
         } else {
+            std::fprintf(stderr, "aa-dummy-display: unrecognized argument '%s'\n", argv[index]);
+            print_usage(stderr);
             return 2;
         }
     }

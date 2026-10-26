@@ -574,6 +574,56 @@ TEST(DummyDisplayContractInput, KeyboardAndMouseNormalizeToSeamEvents) {
     EXPECT_EQ(widget.status_text(), QStringLiteral("projecting"));
 }
 
+TEST(DummyDisplayContractInput, LetterboxedTouchMapsIntoVideoPixels) {
+    // Given: a 1280x720 surface resized to 4:3, so the video is letterboxed
+    // into a centered 640x360 area with 60 px bars above and below.
+    qt_app();
+    CountingInputSink sink;
+    aa::display::qt_adapter::ProjectionWidget widget(sink, kCaps);
+    widget.resize(640, 480);
+    ASSERT_EQ(widget.video_rect(), QRect(0, 60, 640, 360));
+    const auto send = [&widget](QEvent::Type type, QPointF at) {
+        QMouseEvent event(type, at, at, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&widget, &event);
+    };
+
+    // When: a gesture starts in the letterbox bar, then one starts inside the
+    // video and drags past its edge.
+    send(QEvent::MouseButtonPress, QPointF(10.0, 20.0));
+    send(QEvent::MouseMove, QPointF(30.0, 30.0));
+    send(QEvent::MouseButtonRelease, QPointF(30.0, 30.0));
+    send(QEvent::MouseButtonPress, QPointF(320.0, 240.0));
+    send(QEvent::MouseMove, QPointF(700.0, 470.0));
+    send(QEvent::MouseButtonRelease, QPointF(700.0, 470.0));
+
+    // Then: the bar gesture is dropped entirely; the video gesture is scaled
+    // into absolute video pixels and clamped to the frame.
+    ASSERT_EQ(sink.events.size(), 3U);
+    EXPECT_EQ(std::get<TouchEvent>(sink.events[0]), (TouchEvent{640, 360, TouchAction::down}));
+    EXPECT_EQ(std::get<TouchEvent>(sink.events[1]), (TouchEvent{1279, 719, TouchAction::move}));
+    EXPECT_EQ(std::get<TouchEvent>(sink.events[2]), (TouchEvent{1279, 719, TouchAction::up}));
+}
+
+TEST(DummyDisplayContractInput, ViewShortcutsStayLocal) {
+    // Given: a display surface with the HUD shown by default.
+    qt_app();
+    CountingInputSink sink;
+    aa::display::qt_adapter::ProjectionWidget widget(sink, kCaps);
+    ASSERT_TRUE(widget.hud_visible());
+
+    // When: F1 (HUD) and F11 (full screen) are pressed and released.
+    for (const int key : {Qt::Key_F1, Qt::Key_F11}) {
+        QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
+        QKeyEvent release(QEvent::KeyRelease, key, Qt::NoModifier);
+        QApplication::sendEvent(&widget, &press);
+        QApplication::sendEvent(&widget, &release);
+    }
+
+    // Then: the HUD toggled and nothing reached the phone input seam.
+    EXPECT_FALSE(widget.hud_visible());
+    EXPECT_TRUE(sink.events.empty());
+}
+
 TEST(DummyDisplayContractAbsent, ReceiverAbsentShowsUnavailableWithoutStartingHelper) {
     // Given: a bus with NO receiver owning the contract name.
     qt_app();
