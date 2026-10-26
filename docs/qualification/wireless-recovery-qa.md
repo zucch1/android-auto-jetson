@@ -74,4 +74,6 @@ activation identifiers, null-field applicability reasons, the bounded-cleanup
 owner decision (2026-10-24), and `reduced_scope_signoff: null` until separately
 approved. The validator accepts `completed-reduced-scope` only when the
 sign-off `pr_head` equals the evidence `git_commit` and its `claims` list
-covers every withdrawn claim; required withdrawn claims cannot be dropped.
+covers every withdrawn claim, and the evidence records `worktree_dirty=false`;
+required withdrawn claims cannot be dropped. Only R07 may be `blocked` among
+host scenarios.

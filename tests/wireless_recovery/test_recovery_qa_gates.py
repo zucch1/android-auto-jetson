@@ -107,7 +107,8 @@ class RecoveryQaGates(unittest.TestCase):
         signoff = {"approver": "owner", "date": "2026-10-25",
                    "claims": list(document["withdrawn_claims"]), "pr_head": document["git_commit"]}
         signoff.update(overrides)
-        document.update(compliance_status="completed-reduced-scope", reduced_scope_signoff=signoff)
+        document.update(compliance_status="completed-reduced-scope", reduced_scope_signoff=signoff,
+                        worktree_dirty=False)
 
     def test_complete_signoff_accepted(self):
         document = copy.deepcopy(self.document)
@@ -127,6 +128,24 @@ class RecoveryQaGates(unittest.TestCase):
             document["withdrawn_claims"] = document["withdrawn_claims"][:-1]
             self.signed(document)
         self.mutation(drop, "required withdrawn claim missing")
+
+    def test_signoff_requires_clean_worktree(self):
+        for dirty in (True, None):
+            with self.subTest(worktree_dirty=dirty):
+                def sign_dirty(document):
+                    self.signed(document)
+                    document["worktree_dirty"] = dirty
+                self.mutation(sign_dirty, "requires evidence from a verified clean worktree")
+        def sign_missing(document):
+            self.signed(document)
+            del document["worktree_dirty"]
+        self.mutation(sign_missing, "requires evidence from a verified clean worktree")
+
+    def test_unapproved_blocked_host_outcome_rejected(self):
+        for scenario in ("R11", "R03"):
+            with self.subTest(scenario=scenario):
+                self.mutation(lambda d: self.scenario(d, scenario).update(status="blocked"),
+                              f"{scenario}: blocked outcome is not an approved exception")
 
     def test_blocked_device_scenario_cannot_pass(self):
         self.mutation(lambda d: self.scenario(d, "B01").update(status="pass"),

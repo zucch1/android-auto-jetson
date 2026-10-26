@@ -244,6 +244,8 @@ def validate(document: dict) -> list[str]:
         else:
             if signoff["pr_head"] != document["git_commit"] or document["git_commit"] == "unknown":
                 errors.append("reduced-scope sign-off pr_head does not match evaluated git_commit")
+            if document.get("worktree_dirty") is not False:
+                errors.append("reduced-scope closure requires evidence from a verified clean worktree")
             claims = signoff["claims"]
             if not isinstance(claims, list):
                 errors.append("reduced-scope sign-off claims must be a list")
@@ -267,6 +269,8 @@ def validate(document: dict) -> list[str]:
         if entry["status"] not in {"pass", "fail", "blocked"}:
             errors.append(f"{scenario}: invalid status")
             continue
+        if entry["status"] == "blocked" and scenario != "R07":
+            errors.append(f"{scenario}: blocked outcome is not an approved exception")
         for field in OFFSETS:
             if field not in entry:
                 errors.append(f"{scenario}: missing offset key {field}")
