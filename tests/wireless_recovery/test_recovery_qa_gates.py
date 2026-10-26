@@ -103,6 +103,31 @@ class RecoveryQaGates(unittest.TestCase):
         self.mutation(lambda d: d.update(compliance_status="completed-reduced-scope"),
                       "reduced-scope closure requires explicit owner sign-off")
 
+    def signed(self, document, **overrides):
+        signoff = {"approver": "owner", "date": "2026-10-25",
+                   "claims": list(document["withdrawn_claims"]), "pr_head": document["git_commit"]}
+        signoff.update(overrides)
+        document.update(compliance_status="completed-reduced-scope", reduced_scope_signoff=signoff)
+
+    def test_complete_signoff_accepted(self):
+        document = copy.deepcopy(self.document)
+        self.signed(document)
+        self.assertEqual(qa.validate(document), [])
+
+    def test_signoff_head_must_match_evaluated_commit(self):
+        self.mutation(lambda d: self.signed(d, pr_head="fedcba9876543210"),
+                      "reduced-scope sign-off pr_head does not match evaluated git_commit")
+
+    def test_signoff_must_cover_withdrawn_claims(self):
+        self.mutation(lambda d: self.signed(d, claims=d["withdrawn_claims"][:-1]),
+                      "reduced-scope sign-off does not cover withdrawn claim")
+
+    def test_required_withdrawn_claim_cannot_be_dropped(self):
+        def drop(document):
+            document["withdrawn_claims"] = document["withdrawn_claims"][:-1]
+            self.signed(document)
+        self.mutation(drop, "required withdrawn claim missing")
+
     def test_blocked_device_scenario_cannot_pass(self):
         self.mutation(lambda d: self.scenario(d, "B01").update(status="pass"),
                       "B01 must remain blocked")

@@ -87,4 +87,11 @@ TEST_F(WirelessRecovery, ApOnlyAcquisitionUsesFreshLiveConsumerWithoutPairing) {
     EXPECT_NE(bluez.command("state").find("\"Pairable\": false"), std::string::npos);
     EXPECT_FALSE(acquire_only({consumer.value, request}));
     EXPECT_FALSE(control->pairing_window_open());
+    // And after one approved reconnect plus fresh acquisition, handoff is bound
+    // to the acquiring source with no second reconnect resetting the lease:
+    // a zero-confirmation source is rejected, the acquiring source admits.
+    const auto source = acquire_recovery_ap(); ASSERT_FALSE(HasFailure());
+    ASSERT_NO_FATAL_FAILURE(rejects_unbound_handoff());
+    ASSERT_NO_FATAL_FAILURE(admit(source, false));
+    EXPECT_FALSE(control->pairing_window_open());
 }

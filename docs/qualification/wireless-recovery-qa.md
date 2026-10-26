@@ -72,4 +72,6 @@ is unverified, including the intentional R07 unverified-shutdown case. It also
 records trust-store preservation, per-case cleanup observations, old/new
 activation identifiers, null-field applicability reasons, the bounded-cleanup
 owner decision (2026-10-24), and `reduced_scope_signoff: null` until separately
-approved.
+approved. The validator accepts `completed-reduced-scope` only when the
+sign-off `pr_head` equals the evidence `git_commit` and its `claims` list
+covers every withdrawn claim; required withdrawn claims cannot be dropped.

@@ -232,15 +232,30 @@ def validate(document: dict) -> list[str]:
     if document["compliance_status"] not in {"failed", "pending-owner-signoff", "completed-reduced-scope"}:
         errors.append("invalid compliance_status")
     signoff = document["reduced_scope_signoff"]
+    withdrawn = document["withdrawn_claims"]
+    if not isinstance(withdrawn, list):
+        return errors + ["withdrawn_claims must be a list"]
+    for claim in base_document()["withdrawn_claims"]:
+        if claim not in withdrawn:
+            errors.append(f"required withdrawn claim missing: {claim}")
     if document["compliance_status"] == "completed-reduced-scope":
         if not isinstance(signoff, dict) or not all(signoff.get(key) for key in ("approver", "date", "claims", "pr_head")):
             errors.append("reduced-scope closure requires explicit owner sign-off with approver/date/claims/pr_head")
+        else:
+            if signoff["pr_head"] != document["git_commit"] or document["git_commit"] == "unknown":
+                errors.append("reduced-scope sign-off pr_head does not match evaluated git_commit")
+            claims = signoff["claims"]
+            if not isinstance(claims, list):
+                errors.append("reduced-scope sign-off claims must be a list")
+            else:
+                for claim in withdrawn:
+                    if claim not in claims:
+                        errors.append(f"reduced-scope sign-off does not cover withdrawn claim: {claim}")
     elif signoff is not None:
         errors.append("sign-off is present but closure is not completed-reduced-scope")
     approval = document["owner_approval"]
     if not isinstance(approval, dict) or not approval.get("decision") or not approval.get("date"):
         errors.append("missing bounded-cleanup owner decision/date")
-    withdrawn = document["withdrawn_claims"]
     for scenario in BLOCKED_SCENARIOS:
         entry = scenarios[scenario]
         if entry["status"] != "blocked" or not entry.get("blocked_reason"):

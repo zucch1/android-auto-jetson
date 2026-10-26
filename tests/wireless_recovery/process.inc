@@ -15,11 +15,10 @@ protected:
         control.reset(); receiver.reset(); phones.reset(); client.reset();
     }
     void recover_process() {
-        ASSERT_TRUE(receiver->reconnect(*control, identity));
-        ASSERT_TRUE(acquire_only({consumer.value, ++request}));
+        const auto source = acquire_recovery_ap(); ASSERT_FALSE(HasFailure());
         ASSERT_TRUE(state(State::active)); timing.fresh_acquisition = timing.elapsed();
         timing.new_activation = nm->starts;
-        ASSERT_NO_FATAL_FAILURE(admit()); timing.terminal_recovery = timing.elapsed();
+        ASSERT_NO_FATAL_FAILURE(admit(source)); timing.terminal_recovery = timing.elapsed();
         ASSERT_TRUE(observe_snapshot());
         EXPECT_GT(timing.new_activation, timing.old_activation);
         EXPECT_LE(*timing.terminal_recovery, 15000);

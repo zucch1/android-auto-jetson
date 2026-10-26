@@ -103,9 +103,13 @@ protected:
         nm_identity.capture(address);
         pump(); ASSERT_TRUE(occupied());
     }
-    void admit() {
-        ASSERT_TRUE(receiver->reconnect(*control, identity));
-        ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    // Without a source, admission starts from an approved reconnect on the
+    // existing AP. With a source, admission continues the AP acquisition that
+    // source performed: the helper lease is that source and no reconnect resets it.
+    void admit(std::optional<Source> handoff = std::nullopt, bool connect = true) {
+        if (handoff) { ASSERT_TRUE(receiver->begin(*control, *handoff)); }
+        else { ASSERT_TRUE(receiver->reconnect(*control, identity)); }
+        if (connect) { ASSERT_EQ(bluez.command("NewConnection"), "allowed"); }
         ASSERT_TRUE(eventually([&] { pump(); return occupied(); }, 10s));
         auto phone = std::async(std::launch::async, [&] {
             const auto read_record = [&](std::uint16_t expected) {
@@ -155,12 +159,29 @@ protected:
         const auto result = receiver->acquire_ap(*control, source);
         return result ? core::Result<void>{} : core::Result<void>{result.error()};
     }
+    // Source contract: one approved reconnect retires the old handoff and
+    // re-establishes the peer; the fresh AP-acquisition source then owns the
+    // lease, and only that same source may drive the handoff.
+    Source acquire_recovery_ap() {
+        EXPECT_TRUE(receiver->reconnect(*control, identity));
+        const Source source{consumer.value, ++request};
+        EXPECT_TRUE(acquire_only(source));
+        return source;
+    }
+    // A zero-confirmation (reconnect-style) source must not drive handoff
+    // under a lease held by a confirmation-bearing AP acquisition. The RFCOMM
+    // connection stays pending for the bound source (admit(source, false)).
+    void rejects_unbound_handoff() {
+        ASSERT_TRUE(receiver->begin(*control, {consumer.value, 0}));
+        ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+        const auto until = Clock::now() + 1500ms;
+        while (Clock::now() < until) { pump(); ASSERT_FALSE(occupied()); std::this_thread::sleep_for(50ms); }
+    }
     void recover_ap() {
-        ASSERT_TRUE(receiver->reconnect(*control, identity));
-        ASSERT_TRUE(acquire_only({consumer.value, ++request}));
+        const auto source = acquire_recovery_ap(); ASSERT_FALSE(HasFailure());
         ASSERT_TRUE(state(State::active)); timing.fresh_acquisition = timing.elapsed();
         timing.new_activation = nm->starts;
-        ASSERT_NO_FATAL_FAILURE(admit()); timing.terminal_recovery = timing.elapsed();
+        ASSERT_NO_FATAL_FAILURE(admit(source)); timing.terminal_recovery = timing.elapsed();
         const auto observation = observe_snapshot(); ASSERT_TRUE(observation);
         EXPECT_NE(observation->handle, old_handle);
         if (timing.new_activation > timing.old_activation) { EXPECT_NE(observation->generation, old_snapshot_generation); }

@@ -99,6 +99,16 @@ The listener is ready before `AuthorizeBootstrapV1(allow=true)` can release the
 bootstrap. An approved reconnect needs no new `AddPhone` transaction. Failure
 of any link denies credentials without changing trust.
 
+### Handoff source contract
+
+`reconnect()` resets the helper AP lease to the empty source and begins
+handoff with `{consumer, 0}` (approved reconnect on the existing AP).
+`acquire_ap(source)` sets the lease to that confirmation-bearing source, and
+only `begin(source)` with the same source may then drive handoff. Fresh-AP
+recovery is one `reconnect()`, then `acquire_ap(source)`, then
+`begin(source)`; the host matrix tests this order and rejects a
+zero-confirmation source after acquisition.
+
 ## Lifetimes, freshness, and deadlines
 
 An incomplete bootstrap has a 10-second budget. The 60-second pairing window
