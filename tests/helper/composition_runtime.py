@@ -34,7 +34,6 @@ class ComposedSurface(Surface):
         (directory / "state").mkdir(mode=0o700)
         (directory / "ap.conf").write_text("v1 wlan-test US jurisdiction-confirmed 5277\n")
         (directory / "ap.conf").chmod(0o600)
-        self.credentials = directory / "state/ap.credentials"
         socket = str(directory / "cmd")
         self.nm = stack.enter_context(process([str(build / "aa_nm_ap_test"), "--wire-double", self.address, socket], self.env))
         assert line(self.nm) == "ready"
@@ -50,7 +49,6 @@ class ComposedSurface(Surface):
         assert command(self.receiver, "acquire") == "0"
         wait(lambda: self.nm_state()["active"])
         assert self.nm_state()["valid"] and self.nm_state()["starts"] == 1
-        assert self.credentials.exists()
         return self.phone()
 
     def forget_error(self, phone: int, expected: str) -> None:
@@ -66,15 +64,15 @@ class ComposedSurface(Surface):
 
 def ap_complete_bond_pending(surface: ComposedSurface) -> None:
     phone = surface.approve_and_acquire()
-    before = surface.credentials.read_bytes()
+    before = surface.nm_state()["deactivations"]
     command(surface.mock, "fail-remove")
     surface.forget_error(phone, "system helper unavailable")
-    rotated = surface.credentials.read_bytes()
-    assert rotated != before
+    deactivated = surface.nm_state()["deactivations"]
+    assert deactivated == before + 1
     assert not surface.nm_state()["active"] and not surface.nm_state()["table"]
     for _ in range(3):
         surface.forget_error(phone, "system helper unavailable")
-        assert surface.credentials.read_bytes() == rotated
+        assert surface.nm_state()["deactivations"] == deactivated
         assert command(surface.receiver, "pending-revocations") == "1"
         assert command(surface.receiver, f"progress {phone}") == "1 0"
         assert surface.state()["removed"] == []
@@ -83,9 +81,9 @@ def ap_complete_bond_pending(surface: ComposedSurface) -> None:
     surface.forget(phone)
     assert command(surface.receiver, "pending-revocations") == "0"
     assert command(surface.receiver, f"progress {phone}") == "none"
-    assert surface.credentials.read_bytes() == rotated
+    assert surface.nm_state()["deactivations"] == deactivated
     assert len(surface.state()["removed"]) == 1
-    print("PASS composed_ap_ack_bond_retries_preserve_credentials_and_block_reapproval", flush=True)
+    print("PASS composed_ap_ack_bond_retries_preserve_shutdown_and_block_reapproval", flush=True)
 
 
 def bond_complete_ap_pending(surface: ComposedSurface) -> None:
@@ -94,12 +92,11 @@ def bond_complete_ap_pending(surface: ComposedSurface) -> None:
     surface.forget_error(phone, "system helper unavailable")
     assert len(surface.state()["removed"]) == 1
     assert surface.nm_state()["quarantined"] and surface.nm_state()["table"]
-    rotated = surface.credentials.read_bytes()
     for _ in range(2):
         surface.forget_error(phone, "system helper unavailable")
         assert command(surface.receiver, f"progress {phone}") == "0 1"
         assert len(surface.state()["removed"]) == 1
-        assert surface.credentials.read_bytes() == rotated
+        assert surface.nm_state()["starts"] == 1
     command(surface.nm, "allow-stop")
     wait(lambda: not surface.nm_state()["table"])
     surface.forget(phone)
@@ -110,22 +107,21 @@ def bond_complete_ap_pending(surface: ComposedSurface) -> None:
 
 def durability_and_precommit(surface: ComposedSurface) -> None:
     phone = surface.approve_and_acquire()
-    before = surface.credentials.read_bytes()
+    before = surface.nm_state()["deactivations"]
     command(surface.receiver, "fault-temp")
     surface.forget_error(phone, "trust store io failure")
-    assert surface.phone() == phone and surface.credentials.read_bytes() == before
+    assert surface.phone() == phone and surface.nm_state()["deactivations"] == before
     assert surface.state()["removed"] == [] and surface.nm_state()["active"]
     command(surface.receiver, "fault-dir")
     command(surface.nm, "fail-stop")
     command(surface.mock, "fail-remove")
     surface.forget_error(phone, "Trust store replaced; crash durability unconfirmed.")
     command(surface.receiver, "fault-clear")
-    rotated = surface.credentials.read_bytes()
-    assert surface.phone() == 0 and rotated != before
+    assert surface.phone() == 0 and surface.nm_state()["deactivations"] > before
     for _ in range(3):
         surface.forget_error(phone, "Trust store replaced; crash durability unconfirmed.")
         assert command(surface.receiver, f"progress {phone}") == "0 0"
-        assert surface.credentials.read_bytes() == rotated
+        assert surface.nm_state()["starts"] == 1
         assert command(surface.receiver, "pending-revocations") == "1"
     command(surface.nm, "allow-stop")
     command(surface.mock, "allow-remove")
@@ -139,7 +135,7 @@ def durability_and_precommit(surface: ComposedSurface) -> None:
 def wired_ap_only(surface: ComposedSurface) -> None:
     assert command(surface.receiver, "seed-wired") == "0"
     surface.forget(surface.phone())
-    assert surface.credentials.exists()
+    assert not surface.nm_state()["active"]
     assert command(surface.receiver, "pending-revocations") == "0"
     assert surface.state()["removed"] == []
     print("PASS composed_wired_deletion_requires_ap_and_no_bond", flush=True)

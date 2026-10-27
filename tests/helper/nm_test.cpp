@@ -135,8 +135,8 @@ public:
                         const std::lock_guard lock{mutex}; rules = request;
                         table = true; quarantined = false; ++installations; reply = "0";
                     }
-                } else if (request == "/usr/sbin/nft\n-f\n-\n\nflush chain inet aa_receiver_ap input\nadd rule inet aa_receiver_ap input iifname \"wlan-test\" drop\n") {
-                    if (table) { quarantined = true; reply = "0"; }
+                } else if (request.starts_with("/usr/sbin/nft\n-f\n-\n\nflush chain inet aa_receiver_ap input\n")) {
+                    if (table) { const std::lock_guard lock{mutex}; rules = request; quarantined = true; reply = "0"; }
                 } else if (request == "/usr/sbin/nft\n-f\n-\n\ndelete table inet aa_receiver_ap\n") {
                     if (!block_remove) { table = false; ++removals; reply = "0"; }
                 }
@@ -389,11 +389,14 @@ protected:
 TEST_F(NmDaemon, HappyStartProjectionIsolationAndRollback) {
     start(); acquire(); ASSERT_TRUE(state(State::active)); EXPECT_TRUE(nm->valid);
     ASSERT_EQ(nm->starts, 1); ASSERT_TRUE(boundary->table);
-    const auto text = read_text(directory / "state/ap.credentials"); EXPECT_EQ(text.size(), 85U);
-    struct stat st{}; ASSERT_EQ(::stat((directory / "state/ap.credentials").c_str(), &st), 0); EXPECT_EQ(st.st_mode & 0777, 0600U);
+    // Per-activation credentials stay in memory; no secret is written at rest.
+    EXPECT_FALSE(std::filesystem::exists(directory / "state/ap.credentials"));
     { const std::lock_guard lock{boundary->mutex};
       EXPECT_NE(boundary->rules.find("udp sport 68 udp dport 67 accept"), std::string::npos);
       EXPECT_NE(boundary->rules.find("tcp dport 5277 accept"), std::string::npos);
+      const auto ingress = boundary->rules.find("input iifname != \"wlan-test\" tcp dport 5277 drop");
+      EXPECT_NE(ingress, std::string::npos);
+      EXPECT_LT(ingress, boundary->rules.find("tcp dport 5277 accept"));
       EXPECT_NE(boundary->rules.find("forward iifname \"wlan-test\" drop"), std::string::npos);
       EXPECT_NE(boundary->rules.find("forward oifname \"wlan-test\" drop"), std::string::npos);
       EXPECT_EQ(boundary->rules.find("dport 53 accept"), std::string::npos);
@@ -401,22 +404,74 @@ TEST_F(NmDaemon, HappyStartProjectionIsolationAndRollback) {
     client->teardown(core::ConsumerId{1});
     ASSERT_TRUE(eventually([this] { return !nm->active_now && !boundary->table; }));
     EXPECT_GT(nm->deactivations, 0); EXPECT_GT(nm->deletions, 0);
-    EXPECT_EQ(text, read_text(directory / "state/ap.credentials"));
+    EXPECT_FALSE(std::filesystem::exists(directory / "state/ap.credentials"));
     EXPECT_FALSE(client->call({Operation::open_pairing_window, 0}, core::Milliseconds{500}, {}));
 }
-TEST_F(NmDaemon, ActivationSnapshotUsesCachedCredentialsAndCurrentLocalMac) {
+TEST_F(NmDaemon, ActivationSnapshotUsesActivationCredentialsAndCurrentLocalMac) {
     Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
         private_commands((directory / "commands").string())};
     ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
     ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::active; }));
     auto snapshot = backend.ap_snapshot(); ASSERT_TRUE(snapshot);
     EXPECT_EQ(snapshot.value().bssid, "02:ab:cd:ef:01:23"); EXPECT_EQ(snapshot.value().ip, "10.42.0.1"); EXPECT_EQ(snapshot.value().port, 5277U);
-    const auto saved = read_text(directory / "state/ap.credentials");
-    EXPECT_TRUE(snapshot.value().password == saved.substr(20, 64));
-    save(directory / "state/ap.credentials", "invalid-file-must-not-be-read");
+    { const std::lock_guard lock{nm->mutex}; EXPECT_TRUE(snapshot.value().password == nm->seen_psk); }
+    EXPECT_EQ(snapshot.value().password.size(), 64U);
     auto cached = backend.ap_snapshot(); ASSERT_TRUE(cached); EXPECT_TRUE(cached.value() == snapshot.value());
     EXPECT_TRUE(backend.snapshot_current(snapshot.value().generation));
     backend.cleanup(); EXPECT_FALSE(backend.snapshot_current(snapshot.value().generation)); EXPECT_FALSE(backend.ap_snapshot());
+}
+TEST_F(NmDaemon, EveryActivationAndRekeyIssuesFreshCredentials) {
+    // Given an active AP whose credentials were released for generation 1.
+    Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
+        private_commands((directory / "commands").string())};
+    const auto fresh = [&](std::uint64_t old) -> std::optional<ApSnapshot> {
+        std::optional<ApSnapshot> result;
+        EXPECT_TRUE(eventually([&] {
+            auto snapshot = backend.ap_snapshot();
+            if (!snapshot || snapshot.value().generation == old) return false;
+            result = snapshot.value(); return true;
+        }, 10s));
+        return result;
+    };
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
+    const auto first = fresh(0); ASSERT_TRUE(first);
+    // When a rebind rekeys it, and later a new activation starts.
+    backend.rekey(first->generation);
+    const auto rekeyed = fresh(first->generation); ASSERT_TRUE(rekeyed);
+    ASSERT_TRUE(backend.apply(Action::release_ap, 0));
+    ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::inactive; }));
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
+    const auto next = fresh(rekeyed->generation); ASSERT_TRUE(next);
+    // Then no earlier SSID/PSK admits a station to the newer activation.
+    EXPECT_FALSE(backend.snapshot_current(first->generation));
+    EXPECT_NE(rekeyed->ssid, first->ssid); EXPECT_FALSE(rekeyed->password == first->password);
+    EXPECT_NE(next->ssid, rekeyed->ssid); EXPECT_FALSE(next->password == rekeyed->password);
+    EXPECT_EQ(nm->starts, 3);
+}
+TEST_F(NmDaemon, DelayedDeactivationDoesNotConsumeRekey) {
+    Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
+        private_commands((directory / "commands").string())};
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 36));
+    ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::active; }));
+    const auto first = backend.ap_snapshot(); ASSERT_TRUE(first);
+    nm->deactivate_delay_ms = 300;
+    backend.rekey(first.value().generation);
+    EXPECT_FALSE(backend.snapshot_current(first.value().generation));
+    ASSERT_TRUE(eventually([&] { return nm->deactivations > 0; }));
+    EXPECT_TRUE(boundary->quarantined);
+    { const std::lock_guard lock{boundary->mutex};
+      EXPECT_NE(boundary->rules.find("input tcp dport 5277 drop"), std::string::npos);
+      EXPECT_NE(boundary->rules.find("input iifname \"wlan-test\" drop"), std::string::npos); }
+    std::optional<ApSnapshot> replacement;
+    ASSERT_TRUE(eventually([&] {
+        auto snapshot = backend.ap_snapshot();
+        if (!snapshot || snapshot.value().generation == first.value().generation) return false;
+        replacement = snapshot.value(); return true;
+    }, 10s));
+    ASSERT_TRUE(replacement);
+    EXPECT_NE(replacement->ssid, first.value().ssid); EXPECT_NE(replacement->password, first.value().password);
+    EXPECT_EQ(nm->starts, 2);
+    nm->deactivate_delay_ms = 0;
 }
 TEST_F(NmDaemon, SnapshotRejectsMalformedMacModeAndDeviceChanges) {
     Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
@@ -711,6 +766,9 @@ TEST_F(NmDaemon, FailedShutdownRetainsRulesAndRevocationRetries) {
     const RevocationV1 snapshot{core::PhoneId{1}, trust::WirelessIdentity{"exact-bond", "adapter"}};
     EXPECT_FALSE(revoke_ap(snapshot)); EXPECT_TRUE(boundary->table);
     EXPECT_TRUE(boundary->quarantined);
+    { const std::lock_guard lock{boundary->mutex};
+      EXPECT_NE(boundary->rules.find("input tcp dport 5277 drop"), std::string::npos);
+      EXPECT_NE(boundary->rules.find("input iifname \"wlan-test\" drop"), std::string::npos); }
     ASSERT_TRUE(eventually([&] { return read_text(directory / "state/ap.credentials") != before; }));
     const auto rotated = read_text(directory / "state/ap.credentials");
     nm->fail_stop = false; nm->active_now = false; nm->pending = false;

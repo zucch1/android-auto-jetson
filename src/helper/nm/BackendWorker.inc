@@ -69,11 +69,7 @@
             }
             if (pending_revocation && !revoke) continue;
             if (revoke) {
-                if (protected_interface && !quarantined) {
-                    quarantined = commands->run({"/usr/sbin/nft", "-f", "-"},
-                        "flush chain inet aa_receiver_ap input\nadd rule inet aa_receiver_ap input iifname \"" +
-                        policy.interface + "\" drop\n").has_value();
-                }
+                if (protected_interface && !quarantined) quarantined = quarantine_input();
                 if (!rotated) rotated = credentials(policy, true).has_value();
                 const bool safe = stop();
                 const std::lock_guard lock{mutex};
@@ -88,7 +84,13 @@
                 continue;
             }
             if (attempted != epoch) {
+                bool restart{};
+                { const std::lock_guard lock{mutex}; restart = rekey_pending; }
+                // Deactivation can acknowledge before the device is actually
+                // inactive. Keep the restart pending until shutdown is proved.
+                if (restart && !stop()) { publish(State::unavailable); continue; }
                 attempted = epoch;
+                { const std::lock_guard lock{mutex}; if (generation == epoch) rekey_pending = false; }
                 if (!start(epoch)) {
                     (void)stop();
                     publish(State::unavailable);

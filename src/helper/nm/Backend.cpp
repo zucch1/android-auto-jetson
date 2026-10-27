@@ -4,6 +4,7 @@
 #include <iostream> // IWYU pragma: keep
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <future>
 
 namespace aa::helper::nm {
@@ -17,7 +18,7 @@ struct Backend::Impl final {
     std::unique_ptr<Commands> commands;
     std::mutex mutex;
     std::condition_variable changed;
-    bool wanted{}, exiting{}, revoke_pending{}, revoke_done{}, rotated{};
+    bool wanted{}, exiting{}, revoke_pending{}, revoke_done{}, rotated{}, rekey_pending{};
     std::uint64_t generation{};
     std::uint64_t revoking_phone{};
     State state{State::inactive};
@@ -85,13 +86,15 @@ struct Backend::Impl final {
         owned_table = protected_interface = quarantined = false;
         return true;
     }
+    bool quarantine_input() {
+        return commands->run({"/usr/sbin/nft", "-f", "-"},
+            "flush chain inet aa_receiver_ap input\n"
+            "add rule inet aa_receiver_ap input tcp dport " + std::to_string(policy.port) + " drop\n"
+            "add rule inet aa_receiver_ap input iifname \"" + policy.interface + "\" drop\n").has_value();
+    }
     bool stop() {
         wipe(activation.password); activation.generation = 0;
-        if (protected_interface && !quarantined) {
-            quarantined = commands->run({"/usr/sbin/nft", "-f", "-"},
-                "flush chain inet aa_receiver_ap input\nadd rule inet aa_receiver_ap input iifname \"" +
-                policy.interface + "\" drop\n").has_value();
-        }
+        if (protected_interface && !quarantined) quarantined = quarantine_input();
         if (!connection || device.empty()) return !protected_interface;
         if (!connection->stop(device)) return false;
         return remove_rules();
@@ -102,7 +105,9 @@ struct Backend::Impl final {
         if (!connection || !connection->healthy()) return false;
         if (connection->text_property(device, device_interface, "ActiveConnection") != "/") return false;
         if (!current(epoch) || !eligible(policy, *commands)) return false;
-        const auto secret = credentials(policy, false);
+        // A fresh in-memory SSID/PSK per activation: credentials released for an
+        // earlier activation never admit a station to this one.
+        const auto secret = fresh_credentials();
         if (!secret || !current(epoch)) return false;
         if (!commands->run({"/usr/sbin/nft", "-f", "-"}, firewall(policy))) return false;
         owned_table = protected_interface = true;
@@ -187,6 +192,12 @@ core::Result<State> Backend::apply(Action action, std::uint32_t channel) {
     case Action::modem_status: return State::unavailable;
     default: return Error{ErrorCode::helper_unavailable};
     }
+}
+void Backend::rekey(std::uint64_t epoch) {
+    const std::lock_guard lock{impl_->mutex};
+    if (!epoch || epoch != impl_->generation || !impl_->wanted || impl_->exiting || impl_->revoke_pending) return;
+    impl_->rekey_pending = true; ++impl_->generation; impl_->validated_epoch = 0;
+    impl_->state = State::inactive; impl_->changed.notify_all();
 }
 void Backend::cleanup() noexcept {
     const std::lock_guard lock{impl_->mutex};

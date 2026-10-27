@@ -146,6 +146,9 @@ std::string firewall(const Policy& policy) {
     return "create table inet aa_receiver_ap { comment \"aa-system-helper-v1\"; }\n"
            "add chain inet aa_receiver_ap input { type filter hook input priority -200; policy accept; }\n"
            "add chain inet aa_receiver_ap forward { type filter hook forward priority -200; policy accept; }\n"
+           // The projection port is reachable only from stations of this AP.
+           "add rule inet aa_receiver_ap input iifname != \"" + policy.interface + "\" tcp dport " +
+               std::to_string(policy.port) + " drop\n"
            "add rule inet aa_receiver_ap input " + match + "udp sport 68 udp dport 67 accept\n"
            "add rule inet aa_receiver_ap input " + match + "tcp dport " + std::to_string(policy.port) + " accept\n"
            "add rule inet aa_receiver_ap input " + match + "drop\n"
