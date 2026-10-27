@@ -199,11 +199,13 @@ void SystemHelper::retire_handoff(std::uint64_t handle, HandoffFailure reason) {
 bool SystemHelper::handoff_owned(const std::string& sender, Source source, std::uint64_t handle) {
     return authenticate(sender) && handoff_bound(source, handle);
 }
-bool SystemHelper::handoff_bound(Source source, std::uint64_t handle) {
+bool SystemHelper::handoff_bound(Source source, std::uint64_t handle) { return bound_peer(source, handle).has_value(); }
+std::optional<PeerIdentity> SystemHelper::bound_peer(Source source, std::uint64_t handle) {
     if (!handoff_binding_ || handoff_binding_->source != source || handoff_binding_->handle != handle || !handle)
-        return false;
+        return std::nullopt;
     const auto peer = backend_.handoff();
-    return peer && peer.value().handle == handle;
+    if (!peer || peer.value().handle != handle) return std::nullopt;
+    return peer.value().identity;
 }
 core::Result<ApSnapshot> SystemHelper::ap_credentials(const std::string& sender, Source source, std::uint64_t handle) {
     if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
@@ -220,12 +222,16 @@ core::Result<ApSnapshot> SystemHelper::validated_snapshot(Source source, std::ui
     if (!snapshot) {
         retire_handoff(handle, HandoffFailure::snapshot); return Error{ErrorCode::helper_rejected};
     }
-    if (!handoff_bound(source, handle) || !backend_.snapshot_current(snapshot.value().generation)) {
+    const auto peer = bound_peer(source, handle);
+    if (!peer || !backend_.snapshot_current(snapshot.value().generation)) {
         retire_handoff(handle, HandoffFailure::snapshot);
         return Error{ErrorCode::helper_rejected};
     }
     if (handoff_snapshot_ && *handoff_snapshot_ != snapshot.value()) {
         retire_handoff(handle, HandoffFailure::snapshot); return Error{ErrorCode::helper_rejected};
+    }
+    if (owned_by_other(snapshot.value().generation, *peer)) {
+        rebind(handle, snapshot.value().generation); return Error{ErrorCode::helper_rejected};
     }
     handoff_snapshot_ = snapshot.value();
     return snapshot;
@@ -241,10 +247,21 @@ bool SystemHelper::transmit_snapshot(const std::string& sender, SnapshotAuthorit
                                       const std::function<void()>& send) {
     if (!handoff_bound(authority.source, authority.handle)) return false;
     const auto deadline = backend_.handoff_deadline();
-    bool transmitted{};
+    bool transmitted{}, foreign{};
     if (backend_.with_snapshot(authority.generation, [&] {
-        if (!deadline.expired() && handoff_owned(sender, authority.source, authority.handle)) { send(); transmitted = true; }
+        if (deadline.expired() || !authenticate(sender)) return;
+        const auto peer = bound_peer(authority.source, authority.handle);
+        if (!peer) return;
+        if (owned_by_other(authority.generation, *peer)) { foreign = true; return; }
+        // Bind at the first fenced release; this handoff now carries the PSK.
+        activation_owner_ = ActivationOwner{authority.generation, *peer};
+        send(); transmitted = true;
     }) && transmitted) return true;
+    if (foreign) { rebind(authority.handle, authority.generation); return false; }
     retire_handoff(authority.handle, HandoffFailure::snapshot); return false;
+}
+void SystemHelper::rebind(std::uint64_t handle, std::uint64_t generation) {
+    retire_handoff(handle, HandoffFailure::rebind);
+    backend_.rekey(generation);
 }
 } // namespace aa::helper
