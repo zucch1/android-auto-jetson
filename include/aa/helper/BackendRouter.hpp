@@ -45,6 +45,7 @@ public:
     SnapshotDeadline handoff_deadline() const override { return bluetooth_.handoff_deadline(); }
     bool snapshot_current(std::uint64_t generation) override { return ap_.snapshot_current(generation); }
     bool with_snapshot(std::uint64_t generation, const std::function<void()>& send) override { return ap_.with_snapshot(generation, send); }
+    void rekey(std::uint64_t generation) override { ap_.rekey(generation); }
 private:
     Backend& ap_;
     Backend& bluetooth_;

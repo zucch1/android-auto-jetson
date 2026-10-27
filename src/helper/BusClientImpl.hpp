@@ -56,7 +56,7 @@ struct BusClient::Impl {
         }
         if (failure) {
             const auto code = body.read_u32();
-            if (!code || code.value() > static_cast<std::uint32_t>(HandoffFailure::snapshot)) return Error{ErrorCode::helper_protocol_mismatch};
+            if (!code || code.value() > static_cast<std::uint32_t>(HandoffFailure::rebind)) return Error{ErrorCode::helper_protocol_mismatch};
             *failure = static_cast<HandoffFailure>(code.value());
         }
         if (snapshot) {

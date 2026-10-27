@@ -55,6 +55,8 @@ public:
     virtual SnapshotDeadline handoff_deadline() const { return {}; }
     virtual bool snapshot_current(std::uint64_t) { return false; }
     virtual bool with_snapshot(std::uint64_t, const std::function<void()>&) { return false; }
+    // Replace the current activation's credentials with a new activation.
+    virtual void rekey(std::uint64_t) {}
 };
 class UnavailableBackend final : public Backend {
 public:
@@ -129,8 +131,16 @@ private:
     std::vector<Binding> bindings_;
     std::optional<Binding> handoff_binding_;
     std::optional<ApSnapshot> handoff_snapshot_;
+    // An activation's credentials are released over RFCOMM to one phone only.
+    struct ActivationOwner { std::uint64_t generation; PeerIdentity peer; };
+    std::optional<ActivationOwner> activation_owner_;
+    bool owned_by_other(std::uint64_t generation, const PeerIdentity& peer) const {
+        return activation_owner_ && activation_owner_->generation == generation && activation_owner_->peer != peer;
+    }
+    void rebind(std::uint64_t handle, std::uint64_t generation);
     bool handoff_owned(const std::string&, Source, std::uint64_t);
     bool handoff_bound(Source, std::uint64_t);
+    std::optional<PeerIdentity> bound_peer(Source, std::uint64_t);
     core::Result<ApSnapshot> validated_snapshot(Source, std::uint64_t);
     void retire_handoff(std::uint64_t, HandoffFailure);
 };
