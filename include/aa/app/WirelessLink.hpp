@@ -21,12 +21,6 @@ public:
     void stop();
     [[nodiscard]] bool listening() const;
     [[nodiscard]] WiredSession* session() const { return session_.get(); }
-#ifdef AA_WIRELESS_TEST_ATTESTATION
-    // Host-only assertion, NOT Bluetooth-to-TCP identity proof. Absent from the
-    // production library and its public class layout.
-    using TestAttestation = std::function<bool(const transport::TcpTransport&, const trust::PhoneIdentity&)>;
-    void attest_for_test(TestAttestation attestation) { attestation_ = std::move(attestation); }
-#endif
 private:
     core::Result<void> on_message(const protocol::MessageView&) override;
     core::Result<void> attach(std::unique_ptr<transport::TcpTransport>, const trust::PhoneIdentity&);
@@ -37,10 +31,8 @@ private:
     std::unique_ptr<transport::TcpTransport> transport_;
     std::unique_ptr<WiredSession> session_;
     std::string bssid_;
+    std::uint64_t generation_{};
     HandoffEligibilityCoordinator* coordinator_{};
     std::chrono::steady_clock::time_point auth_until_{};
-#ifdef AA_WIRELESS_TEST_ATTESTATION
-    TestAttestation attestation_;
-#endif
 };
 }

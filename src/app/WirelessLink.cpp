@@ -17,7 +17,7 @@ core::Result<void> WirelessLink::listen(const helper::ApSnapshot& snapshot) {
     close_admission();
     auto listener = transport::TcpListener::listen(snapshot.ip.c_str(), static_cast<std::uint16_t>(snapshot.port));
     if (!listener) return listener.error();
-    bssid_ = snapshot.bssid;
+    bssid_ = snapshot.bssid; generation_ = snapshot.generation;
     listener_ = std::move(listener).value();
     return {};
 }
@@ -95,12 +95,12 @@ core::Result<bool> WirelessLink::poll(HandoffEligibilityCoordinator& coordinator
             if (tcp.error().code() == ErrorCode::timeout || tcp.error().code() == ErrorCode::cancelled) return false;
             return tcp.error();
         }
+        // Binding (docs/wireless-handoff.md): the listener belongs to the validated
+        // activation, whose PSK the helper released only to phone(); the helper
+        // firewall admits this port only from that activation's stations.
         const auto phone = coordinator.phone();
-        bool attested = false;
-#ifdef AA_WIRELESS_TEST_ATTESTATION
-        attested = phone && attestation_ && attestation_(*tcp.value(), *phone);
-#endif
-        if (!attested || !phone || !coordinator.admitting()) return Error{ErrorCode::transport_unauthorized_peer};
+        if (!phone || !coordinator.admitting() || coordinator.snapshot_generation() != generation_)
+            return Error{ErrorCode::transport_unauthorized_peer};
         if (auto attached = attach(std::move(tcp).value(), *phone); !attached) { stop(); coordinator.retire(); return attached.error(); }
         close_admission();
         transport_->set_io_checkpoint([this, &coordinator, work] { checkpoint(coordinator, work); });
