@@ -15,8 +15,9 @@
 
 namespace aa::wireless_receiver {
 constexpr const char* usage =
-    "usage: aa-wireless-receiver --store-dir PATH --phone-id N [options]\n"
+    "usage: aa-wireless-receiver --store-dir PATH (--phone-id N | --pairing-only) [options]\n"
     "  PATH contains approved-phones.json; N selects an approved wireless phone.\n"
+    "  --pairing-only       run only the authenticated control/pairing API; no projection.\n"
     "  --video-socket PATH   encoded H.264 consumer socket\n"
     "  --input-socket PATH   normalized display input socket\n"
     "  --helper-bus-address ADDRESS  explicit alternate helper bus (default: system bus)\n"
@@ -38,6 +39,7 @@ struct Options final {
     std::string helper_address;
     std::int64_t duration_ms{};
     bool diagnostics{};
+    bool pairing_only{};
 };
 
 std::optional<Options> parse_options(int argc, char** argv) {
@@ -45,6 +47,7 @@ std::optional<Options> parse_options(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg{argv[i]};
         if (arg == "--diagnostics") { options.diagnostics = true; continue; }
+        if (arg == "--pairing-only") { options.pairing_only = true; continue; }
         if (i + 1 == argc) return std::nullopt;
         const std::string_view value{argv[++i]};
         if (value.empty() || value.starts_with("--")) return std::nullopt;
@@ -66,7 +69,7 @@ std::optional<Options> parse_options(int argc, char** argv) {
             }
         } else return std::nullopt;
     }
-    if (options.store_dir.empty() || !options.phone.value ||
+    if (options.store_dir.empty() || (options.pairing_only ? options.phone.value != 0 : options.phone.value == 0) ||
         !options.store_dir.is_absolute() || !std::filesystem::path{options.video_socket}.is_absolute() ||
         !std::filesystem::path{options.input_socket}.is_absolute() || options.video_socket == options.input_socket)
         return std::nullopt;
@@ -93,6 +96,40 @@ int main(int argc, char** argv) {
     if (!helper) { report("system helper connection", helper.error().code()); return 3; }
     if (auto status = helper.value()->status(aa::helper::Action::ap_status); !status) {
         report("org.custom.AndroidAutoSystemHelper AP status", status.error().code()); return 3;
+    }
+    if (options->pairing_only) {
+        DiagnosticOutput output{options->diagnostics};
+        aa::diagnostics::Diagnostics diagnostics{output};
+        aa::session::SteadyClock clock;
+        aa::trust::SteadyClock trust_clock;
+        aa::trust::PairingPolicy phones{store, trust_clock};
+        aa::ipc::RandomPairingIdSource ids;
+        aa::app::WirelessReceiver receiver{{store, clock, diagnostics}, *helper.value(),
+            aa::app::WirelessLink::Config{}};
+        auto bus = aa::ipc::ControlBusService::start({aa::ipc::current_uid()},
+            {ids, phones, &receiver.confirmation()});
+        if (!bus) { report("session control bus", bus.error().code()); return 3; }
+        struct sigaction action{};
+        action.sa_handler = on_signal;
+        ::sigemptyset(&action.sa_mask);
+        if (::sigaction(SIGINT, &action, nullptr) != 0 || ::sigaction(SIGTERM, &action, nullptr) != 0) {
+            std::fputs("aa-wireless-receiver: signal handler installation failed\n", stderr); return 3;
+        }
+        const auto deadline = options->duration_ms ? Runtime::Clock::now() + std::chrono::milliseconds{options->duration_ms}
+            : Runtime::Clock::time_point::max();
+        log_line("{\"event\":\"ready\",\"state\":\"pairing_only\"}");
+        while (running && Runtime::Clock::now() < deadline) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Runtime::Clock::now()).count();
+            const auto wait = options->duration_ms && remaining < 50 ? remaining : 50;
+            if (wait < 0) break;
+            if (auto step = bus.value().cycle(aa::core::Milliseconds{wait}); !step) {
+                report("session bus dispatch", step.error().code());
+                bus.value().service().shutdown(); receiver.stop(); return 1;
+            }
+        }
+        bus.value().service().shutdown(); receiver.stop();
+        log_line("{\"event\":\"stopping\"}");
+        return 0;
     }
     std::optional<aa::trust::TransportIdentity> identity;
     for (const auto& phone : store.phones()) {

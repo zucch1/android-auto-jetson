@@ -26,6 +26,7 @@ if(NOT "${result}" STREQUAL "0" OR NOT output MATCHES "usage:")
     message(FATAL_ERROR "--help failed: ${result}: ${error}")
 endif()
 foreach(arguments IN ITEMS "" "--unknown" "--duration-ms;garbage" "--phone-id;-1"
+        "--store-dir;/tmp" "--store-dir;/tmp;--pairing-only;--phone-id;1"
         "--store-dir;/tmp;--phone-id;1;--duration-ms;1tail")
     execute_process(COMMAND "$<TARGET_FILE:aa-wireless-receiver>" ${arguments}
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 3)
@@ -40,11 +41,18 @@ execute_process(COMMAND "$<TARGET_FILE:aa-wireless-receiver>"
     --store-dir "${directory}" --phone-id 1 --duration-ms 100
     --helper-bus-address "unix:path=${directory}/absent-bus"
     RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 5)
-file(REMOVE_RECURSE "${directory}")
 if(NOT "${result}" STREQUAL "3" OR NOT error MATCHES "system helper connection")
     message(FATAL_ERROR "absent helper failed closed incorrectly: ${result}: ${error}")
 endif()
-message(STATUS "wireless_receiver_smoke: help=0, invalid arguments=2, absent helper=3 (bounded)")
+execute_process(COMMAND "$<TARGET_FILE:aa-wireless-receiver>"
+    --store-dir "${directory}" --pairing-only --duration-ms 100
+    --helper-bus-address "unix:path=${directory}/absent-bus"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 5)
+file(REMOVE_RECURSE "${directory}")
+if(NOT "${result}" STREQUAL "3" OR NOT error MATCHES "system helper connection")
+    message(FATAL_ERROR "pairing-only did not reach helper without an approved id: ${result}: ${error}")
+endif()
+message(STATUS "wireless_receiver_smoke: help=0, invalid arguments=2, normal/pairing-only absent helper=3 (bounded)")
 ]=])
     add_test(NAME wireless_receiver_smoke COMMAND "${CMAKE_COMMAND}" -P
         "${CMAKE_CURRENT_BINARY_DIR}/wireless-receiver-smoke.cmake")
