@@ -142,7 +142,6 @@ def base_document() -> dict:
         "compliance_status": "pending-owner-signoff",
         "withdrawn_claims": [
             *(f"{scenario}: {reason}" for scenario, reason in BLOCKED_SCENARIOS.items()),
-            "production TCP-to-Bluetooth identity binding remains BLOCKED; test attestation is not identity proof",
             "host NM/BlueZ doubles do not qualify real BlueZ signal completeness, RF, driver channel policy, or installed-service behavior",
             "no crash-durable managed-peer/revocation-ledger claim and no full wireless compliance claim",
         ],
@@ -401,8 +400,8 @@ def validate(document: dict) -> list[str]:
             for key in ("fresh_confirmed_active", "video_delivered", "audio_delivered", "input_delivered"):
                 if observations.get(key) != "true":
                     errors.append(f"R11: missing {key} evidence")
-            if "test-only" not in observations.get("attestation", ""):
-                errors.append("R11: attestation scope is not explicit")
+            if observations.get("admission") != "production activation-bound predicate":
+                errors.append("R11: admission is not the production activation-bound predicate")
     if any(scenarios[s]["status"] == "fail" for s in HOST_SCENARIOS):
         if document["compliance_status"] != "failed":
             errors.append("failed host scenario requires failed compliance_status")

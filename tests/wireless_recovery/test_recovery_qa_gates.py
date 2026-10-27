@@ -37,7 +37,7 @@ def valid_document():
         if scenario == "R11":
             observations.update({"fresh_confirmed_active": "true", "video_delivered": "true",
                                  "audio_delivered": "true", "input_delivered": "true",
-                                 "attestation": "test-only"})
+                                 "admission": "production activation-bound predicate"})
         if scenario in qa.AP_OFF_SCENARIOS:
             observations.update({"cleanup_nm": "State4 and Device.ActiveConnection=/",
                                  "cleanup_nft": "owned table absent",
