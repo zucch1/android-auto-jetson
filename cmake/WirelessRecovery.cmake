@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 if(NOT CMAKE_CROSSCOMPILING)
     add_executable(aa_wireless_recovery_test tests/wireless_recovery/recovery_test.cpp tests/trust/syscall_faults.cpp)
-    target_link_libraries(aa_wireless_recovery_test PRIVATE aa_wireless_attested_test_only GTest::gtest_main PkgConfig::AA_GIO)
+    target_link_libraries(aa_wireless_recovery_test PRIVATE aa_wireless GTest::gtest_main PkgConfig::AA_GIO)
     target_compile_definitions(aa_wireless_recovery_test PRIVATE AA_HELPER_BUILD="${CMAKE_BINARY_DIR}" AA_HELPER_SOURCE="${CMAKE_SOURCE_DIR}")
     target_link_options(aa_wireless_recovery_test PRIVATE -Wl,--wrap=fsync -Wl,--wrap=renameat)
     target_compile_options(aa_wireless_recovery_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)

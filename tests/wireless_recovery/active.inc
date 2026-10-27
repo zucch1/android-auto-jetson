@@ -36,9 +36,6 @@ protected:
 TEST_F(WirelessRecoveryActive, R08ConfirmedActiveOwnerLossGraceAndActualApTeardown) {
     // Given real RFCOMM bootstrap followed by TCP/AAP encapsulated TLS and confirmed ACTIVE.
     ASSERT_NO_FATAL_FAILURE(setup_admission());
-    receiver->attest_for_test([&](const transport::TcpTransport&, const trust::PhoneIdentity& phone) {
-        return phone.key == trust::identity_key(identity);
-    });
     auto tcp = transport::TcpTransport::connect(wireless_test::host_endpoint().c_str(), 5277);
     ASSERT_TRUE(tcp); tcp.value()->set_io_deadline(Clock::now() + 5s);
     std::atomic<bool> release{};
@@ -53,7 +50,7 @@ TEST_F(WirelessRecoveryActive, R08ConfirmedActiveOwnerLossGraceAndActualApTeardo
     const bool established = eventually([&] {
         (void)receiver->poll(*control, [this] { owner_work(); });
         if (active && audio.messages && !input_sent) {
-            EXPECT_TRUE(receiver->session_for_test()->submit_input(ipc::InputEvent{ipc::KeyEvent{66, true}}));
+            EXPECT_TRUE(receiver->session()->submit_input(ipc::InputEvent{ipc::KeyEvent{66, true}}));
             input_sent = true;
         }
         return HasFailure() || (finished.load() && timing.t0 != Clock::time_point{});
@@ -92,9 +89,6 @@ TEST_F(WirelessRecoveryActive, R08ConfirmedActiveOwnerLossGraceAndActualApTeardo
 TEST_F(WirelessRecoveryActive, R11ConnectedLossFullProjectionReconnect) {
     // Given completed composed admission for the approved phone.
     ASSERT_NO_FATAL_FAILURE(setup_admission());
-    receiver->attest_for_test([&](const transport::TcpTransport&, const trust::PhoneIdentity& phone) {
-        return phone.key == trust::identity_key(identity);
-    });
     // When the BlueZ link drops and returns (R01-style loss).
     timing.t0 = Clock::now(); ASSERT_EQ(bluez.command(negative_control() ? "connected-true" : "connected-false"), "ok");
     ASSERT_NO_FATAL_FAILURE(closed());
@@ -112,7 +106,7 @@ TEST_F(WirelessRecoveryActive, R11ConnectedLossFullProjectionReconnect) {
     const bool established = eventually([&] {
         (void)receiver->poll(*control, [this] { active = receiver->active(); });
         if (active && audio.messages && !input_sent) {
-            EXPECT_TRUE(receiver->session_for_test()->submit_input(ipc::InputEvent{ipc::KeyEvent{66, true}}));
+            EXPECT_TRUE(receiver->session()->submit_input(ipc::InputEvent{ipc::KeyEvent{66, true}}));
             input_sent = true;
         }
         projection_active = projection_active || (active && video.messages && audio.messages);
@@ -128,6 +122,6 @@ TEST_F(WirelessRecoveryActive, R11ConnectedLossFullProjectionReconnect) {
     RecordProperty("video_delivered", video.messages == 1 ? "true" : "false");
     RecordProperty("audio_delivered", audio.messages == 1 ? "true" : "false");
     RecordProperty("input_delivered", input_sent ? "true" : "false");
-    RecordProperty("attestation", "test-only; production unbound TCP admission remains rejected");
+    RecordProperty("admission", "production activation-bound predicate");
     RecordProperty("cleanup_observations_applicability", "old-AP shutdown not claimed; existing activation reused after link loss");
 }
