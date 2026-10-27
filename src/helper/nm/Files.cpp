@@ -101,5 +101,11 @@ core::Result<Credentials> credentials(const Policy& policy, bool rotate) {
     }
     if (::fsync(dir.value)) return Error{ErrorCode::helper_unavailable};
     return result;
+}core::Result<Credentials> fresh_credentials() {
+    auto generated = crypto_adapter::random_ap_secret();
+    if (!generated) return generated.error();
+    Credentials result{"AA-" + generated.value().substr(0, 16), generated.value().substr(16)};
+    wipe(generated.value());
+    return result;
 }
 }

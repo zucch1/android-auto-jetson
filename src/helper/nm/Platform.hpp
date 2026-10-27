@@ -17,6 +17,8 @@ struct Policy final {
 struct Credentials final { std::string ssid, psk; ~Credentials() { wipe(psk); } };
 core::Result<Policy> load_policy(const std::string& directory, std::uint32_t owner);
 core::Result<Credentials> credentials(const Policy& policy, bool rotate);
+// Per-activation credentials, never written to disk.
+core::Result<Credentials> fresh_credentials();
 class Commands {
 public:
     virtual ~Commands() = default;
@@ -66,6 +68,7 @@ public:
     core::Result<ApSnapshot> ap_snapshot(const SnapshotDeadline&) override;
     bool snapshot_current(std::uint64_t) override;
     bool with_snapshot(std::uint64_t, const std::function<void()>&) override;
+    void rekey(std::uint64_t) override;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
