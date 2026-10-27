@@ -7,7 +7,7 @@ namespace aa::helper::nm {
 namespace {
 class WirelessComposedTls : public SecretDaemon {};
 TEST_F(WirelessComposedTls, ApprovedReconnectBootstrapTlsAndAuthorizedSinks) {
-    start(); acquire(99); ASSERT_TRUE(state(State::active));
+    start(); acquire(99); ASSERT_TRUE(state(State::active)); ASSERT_NO_FATAL_FAILURE(adopt_activation_secret());
     const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
     ASSERT_TRUE(store->approve(identity));
     ASSERT_EQ(bluez.command("paired"), "ok");
@@ -49,7 +49,6 @@ TEST_F(WirelessComposedTls, ApprovedReconnectBootstrapTlsAndAuthorizedSinks) {
         << "epoch=" << coordinator.epoch() << " listener_started=" << snapshot.has_value();
     ASSERT_TRUE(snapshot); ASSERT_TRUE(link.listening());
     EXPECT_TRUE(snapshot->password == sentinel);
-    { const std::lock_guard lock{nm->mutex}; EXPECT_TRUE(nm->seen_psk == sentinel); }
     aaw::WifiStartRequest endpoint;
     auto bootstrap = std::async(std::launch::async, [&] {
     const auto read_record = [&](AawRecord& record) {
@@ -77,9 +76,6 @@ TEST_F(WirelessComposedTls, ApprovedReconnectBootstrapTlsAndAuthorizedSinks) {
     });
     ASSERT_TRUE(eventually([&] { coordinator.tick(); return bootstrap.wait_for(0ms) == std::future_status::ready; }, 5s));
     bootstrap.get(); ASSERT_FALSE(HasFatalFailure());
-    link.attest_for_test([&](const transport::TcpTransport&, const trust::PhoneIdentity& phone) {
-        return phone.key == trust::identity_key(identity);
-    });
     auto tcp = transport::TcpTransport::connect(endpoint.ip_address().c_str(), static_cast<std::uint16_t>(endpoint.port()));
     ASSERT_TRUE(tcp); tcp.value()->set_io_deadline(Clock::now() + 5s);
     std::atomic<bool> finished{}, active{}, release_phone{};
@@ -138,8 +134,8 @@ TEST_F(WirelessComposedTls, ApprovedReconnectBootstrapTlsAndAuthorizedSinks) {
     EXPECT_TRUE(scanned_active); surfaces(diagnostic_sink, control, events);
 }
 TEST_F(WirelessComposedTls, SnapshotDenialBeforeReleaseDoesNotDiscloseProvisionedPassword) {
-    // Given: the composed helper loaded the sentinel and a real consumer owns admission.
-    start(); acquire(99); ASSERT_TRUE(state(State::active));
+    // Given: the composed helper activated a fresh PSK and a real consumer owns admission.
+    start(); acquire(99); ASSERT_TRUE(state(State::active)); ASSERT_NO_FATAL_FAILURE(adopt_activation_secret());
     const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
     ASSERT_TRUE(store->approve(identity)); ASSERT_EQ(bluez.command("paired"), "ok");
     SecretDiagnostics diagnostic_sink;
