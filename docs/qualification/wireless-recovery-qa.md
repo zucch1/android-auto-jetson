@@ -48,7 +48,7 @@ state at most 15 s unless the confirmed-consumer grace applies.
 | R08 confirmed ACTIVE consumer owner loss | Admission closes immediately; grace expiry and actual teardown start are in `[10000,11000)` ms; old AP is independently inactive by `min(teardown_start+5000,15000)` ms. |
 | R09 consumer generation replacement | Old admission/epoch retires; stale work cannot reopen it; only the new generation acquires fresh AP and handoff authority. |
 | R10 synthetic unapproved/unbonded peer | Rejected before credential release or session creation; this is not production TCP-to-Bluetooth identity proof. |
-| R11 full reconnect through projection | Fresh RFCOMM bootstrap, TCP and encapsulated AAP TLS reach confirmed ACTIVE, with video, audio and input evidence. Attestation remains test-only. |
+| R11 full reconnect through projection | Fresh RFCOMM bootstrap, TCP and encapsulated AAP TLS reach confirmed ACTIVE, with video, audio and input evidence, admitted by the production activation-bound predicate. |
 
 R01-R10 except R11 are admission-level recovery/fail-closed claims; only R11
 claims full projection recovery. Every recovery uses an explicit fresh
@@ -62,8 +62,6 @@ reloads `ApprovedPhoneStore`, and approved recovery does not open pairing.
 - **B02:** real Android Auto restart through ADB is blocked.
 - **B03:** real `bluetoothctl disconnect`/`block` and Jetson controller/RF and
   BlueZ signal-completeness behavior are blocked.
-- Production TCP-to-Bluetooth identity binding remains **BLOCKED**. The R08/R11
-  attestation target is test-only and is not identity proof.
 - Host NM/BlueZ doubles do not qualify real RF, driver channel policy,
   installed-service behavior, or crash-durable managed-peer/revocation state.
 

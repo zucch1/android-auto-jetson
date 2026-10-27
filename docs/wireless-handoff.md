@@ -3,9 +3,8 @@
 Task37 implements the receiver listener, helper-owned RFCOMM bootstrap, and
 shared projection-session path for host testing; task38 adds the host
 reconnect/recovery matrix. This is a reduced-scope result: scripted-peer
-success does not qualify a real phone, and production wireless admission
-remains unavailable because TCP endpoint binding is **BLOCKED** as described
-below.
+success does not qualify a real phone; real-device results are recorded
+separately. TCP endpoint binding is described below.
 
 ## Two protocol surfaces
 
@@ -162,14 +161,31 @@ frames directly over TCP. There is no outer TLS transport. The listener binds
 only the numeric IP from the pinned AP snapshot and the provisioned port, never
 all interfaces.
 
-## TCP endpoint binding: BLOCKED
+## TCP endpoint binding
 
-A shared AP PSK cannot cryptographically bind an accepted TCP socket to the
-authorized Bluetooth peer. Production therefore rejects every unbound TCP
-connection. The host happy path uses separately compiled test-only attestation:
-`AA_WIRELESS_TEST_ATTESTATION` in `aa_wireless_attested_test_only`. That fixture
-is not production identity proof and is not compiled into the production path.
-Production wireless admission is not delivered; task37 is reduced-scope.
+Each AP activation is bound to one phone:
+
+- Every activation, including a rekey, starts with a fresh random SSID and
+  WPA2 PSK, so credentials released for an earlier activation never admit a
+  station to a later one.
+- The helper binds an activation's generation to the BlueZ identity of the
+  first handoff whose credentials pass the transmit fence. Credentials are
+  sent only over that phone's bonded RFCOMM bootstrap. A handoff for a
+  different identity on a bound activation fails with `rebind`, receives no
+  credential bytes, and the helper rekeys the AP.
+- The helper firewall drops the projection port unless it arrives on the AP
+  interface, so a connection on that port came from a station that completed
+  WPA2 with that activation's PSK.
+
+The receiver admits an accepted TCP connection only while the coordinator is
+admitting a trusted phone and its validated snapshot generation equals the
+generation the listener was started from.
+
+Limitations: the binding proves possession of the activation's PSK, not the
+phone hardware. A device with which the authorized phone shares that network
+can connect, consistent with the plan's phone identity boundary. Local root on
+the receiver host is outside the threat model. A second approved phone that
+hands off forces a rekey and ends the first phone's idle admission.
 
 ## Revocation and shared-AP disruption
 
@@ -209,5 +225,5 @@ of `WifiConnectStatus` relative to AAP negotiation remain **TARGET BLOCKED**.
 No phone-hosted hotspot, Wi-Fi Direct/P2P, A2DP, AVRCP, SAP, or HFP is added.
 Performance and soak are task39, the wireless qualification package is task40,
 and packaging is task41. The task38 host recovery matrix does not close those
-scopes, real-phone scenarios, production TCP admission, or full wireless
+scopes, real-phone scenarios, or full wireless
 qualification.
