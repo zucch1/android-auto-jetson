@@ -74,9 +74,6 @@ struct ControlIoFixture {
             coordinator.tick(); std::this_thread::sleep_for(2ms);
         }
         ASSERT_TRUE(coordinator.admitting()); ASSERT_TRUE(link.listening());
-        link.attest_for_test([this](const aa::transport::TcpTransport&, const aa::trust::PhoneIdentity& identity) {
-            return identity.key == f.identity.key;
-        });
     }
     void dispatch(ControlOperation operation) {
         dispatched = true; lost = Clock::now();

@@ -20,11 +20,7 @@ public:
           }) {}
     ~WirelessReceiver() { stop(); }
     helper::Confirmation& confirmation() { return confirmation_; }
-#ifdef AA_WIRELESS_TEST_ATTESTATION
-    // Forward only the existing host-test hook; absent from production builds.
-    void attest_for_test(WirelessLink::TestAttestation attestation) { link_.attest_for_test(std::move(attestation)); }
-    WiredSession* session_for_test() const { return link_.session(); }
-#endif
+    WiredSession* session() const { return link_.session(); }
     // The acquiring source becomes the helper AP lease; drive this AP's handoff
     // with begin(source). reconnect() resets the lease to the empty source and
     // must precede, not follow, acquisition (docs/wireless-handoff.md).
