@@ -168,4 +168,7 @@ bool HandoffEligibilityCoordinator::admitting() const { return impl_->valid() &&
 bool HandoffEligibilityCoordinator::valid_session() const { return impl_->valid(); }
 std::optional<trust::PhoneIdentity> HandoffEligibilityCoordinator::phone() const { return impl_->phone; }
 std::uint64_t HandoffEligibilityCoordinator::epoch() const { return impl_->epoch.load(); }
+std::uint64_t HandoffEligibilityCoordinator::snapshot_generation() const {
+    return impl_->snapshot ? impl_->snapshot->generation : 0;
+}
 }

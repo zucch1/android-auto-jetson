@@ -49,6 +49,8 @@ public:
     [[nodiscard]] bool valid_session() const;
     [[nodiscard]] std::optional<trust::PhoneIdentity> phone() const;
     [[nodiscard]] std::uint64_t epoch() const;
+    // Generation of the validated AP activation, or 0 without one.
+    [[nodiscard]] std::uint64_t snapshot_generation() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
