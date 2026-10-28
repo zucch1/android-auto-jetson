@@ -9,14 +9,8 @@ import json
 import socket
 import sys
 import threading
-from typing import Final
 from gi.repository import Gio, GLib
-AA: Final = "4de17a00-52cb-11e6-bdf4-0800200c9a66"
-ADAPTER: Final = "/org/bluez/hci0"
-DEVICE: Final = ADAPTER + "/dev_02_00_00_00_00_01"
-OTHER: Final = ADAPTER + "/dev_02_00_00_00_00_02"
-ROOT: Final = "/org/custom/AndroidAutoSystemHelper"
-FLAGS: Final = Gio.DBusCallFlags.NO_AUTO_START
+from bluez_profile_mock import AA, HFP, ADAPTER, DEVICE, OTHER, ROOT, FLAGS, ProfileSockets
 
 def connect(address: str) -> Gio.DBusConnection:
     return Gio.DBusConnection.new_for_address_sync(
@@ -25,7 +19,7 @@ def connect(address: str) -> Gio.DBusConnection:
     )
 
 
-class MockBluez:
+class MockBluez(ProfileSockets):
     def __init__(self, address: str) -> None:
         self.bus = connect(address)
         self.rogue = connect(address)
@@ -42,8 +36,12 @@ class MockBluez:
         self.removed: list[str] = []
         self.properties = {"Pairable": True, "Discoverable": True}
         self.profile: list[str] = []
+        self.profile_senders: dict[str, str] = {}
+        self.fail_register: set[str] = set()
+        self.late_register: set[str] = set()
+        self.register_attempts = {AA: 0, HFP: 0}
         self.default_agent = False
-        self.peer_socket: socket.socket | None = None
+        self.comparison_result = "pending"
         xml = """<node>
 <interface name="org.freedesktop.DBus.ObjectManager"><method name="GetManagedObjects"><arg type="a{oa{sa{sv}}}" direction="out"/></method></interface>
 <interface name="org.bluez.ProfileManager1"><method name="RegisterProfile"><arg type="o" direction="in"/><arg type="s" direction="in"/><arg type="a{sv}" direction="in"/></method><method name="UnregisterProfile"><arg type="o" direction="in"/></method></interface>
@@ -96,16 +94,35 @@ class MockBluez:
                 self.properties[prop] = value
             case "RegisterProfile":
                 path, uuid, options = args.unpack()
-                assert uuid == AA and path == ROOT + "/aa_profile"
-                assert options["Role"] == "server" and options["Channel"] == 8
+                assert (uuid, path, options["Channel"]) in (
+                    (AA, ROOT + "/aa_profile", 8), (HFP, ROOT + "/hfp_ag_profile", 7))
+                assert options["Role"] == "server"
                 assert options["RequireAuthentication"] and options["RequireAuthorization"]
                 assert not options["AutoConnect"]
                 self.helper = sender
-                self.profile = [uuid]
+                self.register_attempts[uuid] += 1
+                if uuid in self.profile:
+                    previous = self.profile_senders[uuid]
+                    alive = self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                        "org.freedesktop.DBus", "NameHasOwner", GLib.Variant("(s)", (previous,)),
+                        None, FLAGS, 1000, None).unpack()[0]
+                    if alive:
+                        invocation.return_dbus_error("org.bluez.Error.AlreadyExists", "profile already registered")
+                        return
+                    self.profile.remove(uuid)
+                if uuid in self.fail_register:
+                    invocation.return_dbus_error("org.bluez.Error.Failed", "fixture RegisterProfile failure")
+                    return
+                self.profile.append(uuid)
+                self.profile_senders[uuid] = sender
+                if uuid in self.late_register:
+                    self.late_register.remove(uuid)
+                    invocation.return_dbus_error("org.bluez.Error.Timeout", "fixture late successful registration")
+                    return
             case "RequestDefaultAgent":
                 self.default_agent = True
             case "RegisterAgent":
-                assert args.unpack() == (ROOT + "/aa_agent", "NoInputNoOutput")
+                assert args.unpack() == (ROOT + "/aa_agent", "DisplayYesNo")
             case "RemoveDevice":
                 if self.fail_remove:
                     invocation.return_dbus_error("org.bluez.Error.Failed", "fixture RemoveDevice failure")
@@ -114,7 +131,10 @@ class MockBluez:
                 self.present = False
                 self.paired = False
             case "UnregisterProfile":
-                self.profile = []
+                uuid = HFP if args.unpack()[0] == ROOT + "/hfp_ag_profile" else AA
+                if uuid in self.profile:
+                    self.profile.remove(uuid)
+                self.profile_senders.pop(uuid, None)
             case "UnregisterAgent" | "CancelPairing":
                 pass
             case _:
@@ -130,46 +150,50 @@ class MockBluez:
         interface = "org.bluez.Agent1"
         path = ROOT + "/aa_agent"
         params = GLib.Variant("(o)", (device,))
+        if "hfp" in words or "aa-profile" in words:
+            interface = "org.bluez.Profile1"
+            path = ROOT + ("/hfp_ag_profile" if "hfp" in words else "/aa_profile")
         match member:
             case "AuthorizeService":
-                params = GLib.Variant("(os)", (device, "0000110b-0000-1000-8000-00805f9b34fb" if "audio" in words else AA))
+                interface, path = "org.bluez.Agent1", ROOT + "/aa_agent"
+                uuid = HFP if "hfp" in words else AA
+                params = GLib.Variant("(os)", (device, "0000110b-0000-1000-8000-00805f9b34fb" if "audio" in words else uuid))
             case "RequestDisconnection" | "NewConnection":
-                interface, path = "org.bluez.Profile1", ROOT + "/aa_profile"
+                interface = "org.bluez.Profile1"
+                path = ROOT + ("/hfp_ag_profile" if "hfp" in words else "/aa_profile")
             case "Cancel" | "Release":
                 params = None
-            case "RequestAuthorization":
+            case "RequestAuthorization" | "RequestPinCode" | "RequestPasskey":
                 pass
             case "RequestConfirmation":
-                params = GLib.Variant("(ou)", (device, 123456))
+                params = GLib.Variant("(ou)", (device, 1000000 if "overflow" in words else 42))
             case _:
                 raise AssertionError(command)
         try:
             if member == "NewConnection":
-                local, candidate = socket.socketpair()
-                candidate.settimeout(0.2)
-                with local:
-                    fds = Gio.UnixFDList.new()
-                    index = fds.append(local.fileno())
-                    try:
-                        bus.call_with_unix_fd_list_sync(self.helper, path, interface, member,
-                            GLib.Variant("(oha{sv})", (device, index, {})), None, FLAGS, 2000, fds, None)
-                    except GLib.Error:
-                        if self.peer_socket is None:
-                            self.peer_socket = candidate
-                        else:
-                            candidate.close()
-                        raise
-                if self.peer_socket is not None:
-                    self.peer_socket.close()
-                self.peer_socket = candidate
+                self.deliver(bus, path, words)
             else:
-                bus.call_sync(self.helper, path, interface, member, params, None, FLAGS, 2000, None)
+                if member == "Release" and interface == "org.bluez.Profile1" and bus is self.bus:
+                    self.profile.remove(HFP if "hfp" in words else AA)
+                bus.call_sync(self.helper, path, interface, member, params, None, FLAGS,
+                              70000 if member == "RequestConfirmation" else 2000, None)
             return "allowed"
         except GLib.Error as error:
             assert "org.bluez.Error.Rejected" in str(error), str(error)
             return "rejected"
 
     def command(self, text: str) -> str:
+        if text.startswith("hfp-wire-"):
+            return self.hfp_wire(text)
+        if text.startswith("comparison-start"):
+            self.comparison_result = "pending"
+            callback = text.replace("comparison-start", "RequestConfirmation", 1)
+            def compare() -> None:
+                self.comparison_result = self.callback(callback)
+            threading.Thread(target=compare, daemon=True).start()
+            return "ok"
+        if text == "comparison-result":
+            return self.comparison_result
         if text.startswith("wire-send "):
             assert self.peer_socket is not None
             self.peer_socket.sendall(bytes.fromhex(text.removeprefix("wire-send ")))
@@ -184,7 +208,8 @@ class MockBluez:
                     return "open"
             case "state":
                 return json.dumps({"properties": self.properties, "profile": self.profile,
-                    "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper})
+                    "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper,
+                    "register_attempts": self.register_attempts})
             case "multiple": self.multiple = True
             case "single": self.multiple = False
             case "observe-other": self.observed_device = OTHER
@@ -219,9 +244,14 @@ class MockBluez:
             case "allow-remove": self.fail_remove = False
             case "fail-set": self.fail_set = True
             case "allow-set": self.fail_set = False
+            case "fail-register-hfp": self.fail_register.add(HFP)
+            case "allow-register-hfp": self.fail_register.discard(HFP)
+            case "late-register-hfp": self.late_register.add(HFP)
             case "slow-inventory": self.slow_inventory = True
             case "fast-inventory": self.slow_inventory = False
-            case "release-name": self.name("ReleaseName", GLib.Variant("(s)", ("org.bluez",)))
+            case "release-name":
+                self.name("ReleaseName", GLib.Variant("(s)", ("org.bluez",)))
+                self.profile.clear()
             case "acquire-name": self.name("RequestName", GLib.Variant("(su)", ("org.bluez", 0)))
             case "fd-eof":
                 assert self.peer_socket is not None

@@ -22,6 +22,7 @@ from gi.repository import Gio, GLib
 
 from bluez_mock import connect
 from private_bus import line, process, send
+from comparison_cases import affirmative, negative_comparisons, probe_flow
 
 RECEIVER: Final = "org.custom.AndroidAutoReceiver"
 PATH: Final = "/org/custom/AndroidAutoReceiver"
@@ -34,6 +35,7 @@ class MockState(TypedDict):
     default_agent: bool
     removed: list[str]
     helper: str
+    register_attempts: dict[str, int]
 
 
 def command(child: subprocess.Popen[bytes], text: str) -> str:
@@ -82,7 +84,7 @@ class Surface:
             (directory / filename).chmod(0o600)
         options = self.platform_options(stack, build, directory)
         self.daemon = stack.enter_context(process([str(build / "aa-system-helper"), "--private-bus", self.address, str(directory), *options], self.env))
-        wait(lambda: bool(self.state()["profile"]))
+        wait(lambda: len(self.state()["profile"]) == 2)
         args = [str(binary), self.address] if probe else [str(binary), "receiver", self.address, str(directory / "store"), "bluez"]
         self.receiver = stack.enter_context(process(args, self.env))
         assert line(self.receiver) == "ready"
@@ -112,7 +114,7 @@ class Surface:
 
 def authorization_flow(surface: Surface) -> None:
     state = surface.state()
-    assert state["default_agent"] and len(state["profile"]) == 1
+    assert state["default_agent"] and len(state["profile"]) == 2
     assert not state["properties"]["Pairable"] and not state["properties"]["Discoverable"]
     command(surface.mock, "slow-inventory")
     started = time.monotonic()
@@ -134,7 +136,7 @@ def authorization_flow(surface: Surface) -> None:
     assert command(surface.mock, "RequestAuthorization") == "allowed"
     assert command(surface.mock, "RequestAuthorization wrong") == "rejected"
     assert command(surface.mock, "RequestAuthorization rogue") == "rejected"
-    assert command(surface.mock, "RequestConfirmation") == "rejected"
+    affirmative(surface, request)
     assert command(surface.mock, "AuthorizeService") == "rejected"
     command(surface.mock, "paired")
     assert command(surface.mock, "AuthorizeService audio") == "rejected"
@@ -150,6 +152,7 @@ def authorization_flow(surface: Surface) -> None:
     assert command(surface.receiver, "reconnect") == "0"
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     assert command(surface.mock, "AuthorizeService") == "allowed"
+    assert command(surface.mock, "RequestConfirmation") == "rejected"
     command(surface.mock, "temporary-pair")
     assert command(surface.receiver, "reconnect") == "1001"
     assert command(surface.mock, "AuthorizeService") == "rejected"
@@ -227,50 +230,6 @@ def rollback_flow(surface: Surface) -> None:
     print("PASS helper_failure_keeps_committed_approval_and_closes_window", flush=True)
 
 
-def probe_flow(surface: Surface) -> None:
-    def rpc(text: str) -> tuple[int, int]:
-        values = command(surface.receiver, text).split()
-        return int(values[0]), int(values[1])
-    assert rpc("targetless")[0] == 1001
-    assert rpc("malformed")[0] == 1002
-    error, handle = rpc("poll")
-    assert error == 0 and handle
-    assert rpc(f"bind {handle} 1")[0] == 0
-    error, grant = rpc("issue 1")
-    assert error == 0 and rpc(f"open {grant}")[0] == 0
-    assert rpc(f"open {grant}")[0] == 1001
-    assert rpc("close")[0] == 0
-    assert rpc(f"bind {handle} 2")[0] == 0
-    error, grant = rpc("issue 2")
-    assert error == 0 and rpc(f"open {grant}")[0] == 1001
-    assert rpc("close")[0] == 0
-    error, stale = rpc("poll")
-    assert error == 0
-    command(surface.mock, "release-name")
-    wait(lambda: command(surface.mock, "RequestAuthorization") == "rejected")
-    command(surface.mock, "acquire-name")
-    wait(lambda: bool(surface.state()["profile"]))
-    assert rpc(f"reconnect {stale}")[0] == 1001
-    error, expiring = rpc("poll")
-    assert error == 0
-    error, fresh = rpc("poll")
-    assert error == 0 and rpc(f"bind {fresh} 3")[0] == 0
-    error, grant = rpc("issue 3")
-    assert error == 0 and rpc(f"open {grant}")[0] == 0
-    command(surface.mock, "paired")
-    assert command(surface.mock, "NewConnection") == "allowed"
-    error, expired_grant = rpc("issue 4")
-    assert error == 0
-    started = time.monotonic()
-    wait(lambda: not surface.state()["properties"]["Pairable"], 62)
-    assert 59 <= time.monotonic() - started <= 62
-    assert rpc(f"reconnect {expiring}")[0] == 1001
-    assert rpc(f"open {expired_grant}")[0] == 1001
-    assert command(surface.mock, "fd-eof") == "closed"
-    assert command(surface.mock, "RequestAuthorization") == "rejected"
-    print("PASS consumed_replayed_expired_owner_fenced_handles_and_monotonic60s_idle_expiry", flush=True)
-
-
 def main() -> None:
     build = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="bluez36-", dir=build) as directory:
@@ -278,7 +237,7 @@ def main() -> None:
             surface = Surface(stack, build, Path(directory))
             authorization_flow(surface)
             revocation_flow(surface)
-        for scenario in (bond_retry_flow, loss_flow):
+        for scenario in (bond_retry_flow, loss_flow, negative_comparisons):
             with contextlib.ExitStack() as stack:
                 scenario_directory = Path(directory) / scenario.__name__
                 scenario_directory.mkdir(mode=0o700)
