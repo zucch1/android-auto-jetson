@@ -69,7 +69,13 @@ struct HandoffEligibilityCoordinator::Impl {
     }
     void accept(Reply reply) {
         if (reply.job.epoch != epoch.load() || reply.job.operation == Operation::deny) return;
-        if (!reply.result) { retire(); return; }
+        if (!reply.result) {
+            // A server-side RFCOMM peer may not have connected yet. Keep only
+            // initial observation bounded by establishment; all later errors retire.
+            if (reply.job.operation == Operation::observe && reply.result.error().code() == ErrorCode::helper_rejected)
+                return;
+            retire(); return;
+        }
         const auto fresh_until = reply.job.started + 950ms;
         if (reply.job.operation == Operation::withdraw) {
             if (Clock::now() >= fresh_until || !trusted() || (!live_consumer() && !active)) { retire(); return; }
