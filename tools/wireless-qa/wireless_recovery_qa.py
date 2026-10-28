@@ -8,7 +8,7 @@ Check: wireless_recovery_qa.py validate EVIDENCE.json
 The runner executes the registered ctest scenarios one at a time with
 GTEST_OUTPUT, converts their recorded monotonic observations to JSON, then runs
 the same validator used by the mutation tests. Blocked is never promoted to
-pass, and a green host matrix alone never produces reduced-scope sign-off.
+pass, and a green host matrix alone never produces qualification or sign-off.
 """
 from __future__ import annotations
 
@@ -21,33 +21,17 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
-HOST_SCENARIOS = tuple(f"R{number:02d}" for number in range(1, 12))
+from recovery_host_gates import (
+    HOST_SCENARIOS, OFFSETS, REQUIRED_OFFSETS, ACTIVATION_SCENARIOS,
+    NEW_ACTIVATION_SCENARIOS, AP_OFF_SCENARIOS, validate_host,
+)
+from recovery_scope_gates import validate_scope
+from recovery_device_gates import validate_device
 BLOCKED_SCENARIOS = {
     "B01": "real phone lock/unlock via ADB is unavailable; no host surrogate claim",
     "B02": "real Android Auto restart via ADB is unavailable; no host surrogate claim",
     "B03": "real bluetoothctl disconnect/block and Jetson RF/driver behavior are unqualified",
 }
-OFFSETS = (
-    "admission_closed_ms", "link_retired_ms", "grace_expiry_observed_ms",
-    "teardown_started_ms", "old_ap_inactive_ms", "fresh_acquisition_ms",
-    "terminal_recovery_ms",
-)
-REQUIRED_OFFSETS = {
-    "R01": {"admission_closed_ms", "link_retired_ms", "fresh_acquisition_ms", "terminal_recovery_ms"},
-    "R02": {"admission_closed_ms", "link_retired_ms", "terminal_recovery_ms"},
-    "R03": {"admission_closed_ms", "link_retired_ms", "teardown_started_ms", "old_ap_inactive_ms", "terminal_recovery_ms"},
-    "R04": {"admission_closed_ms", "link_retired_ms", "teardown_started_ms", "old_ap_inactive_ms", "fresh_acquisition_ms", "terminal_recovery_ms"},
-    "R05": {"admission_closed_ms", "link_retired_ms", "teardown_started_ms", "old_ap_inactive_ms", "fresh_acquisition_ms", "terminal_recovery_ms"},
-    "R06": {"admission_closed_ms", "link_retired_ms", "teardown_started_ms", "old_ap_inactive_ms", "fresh_acquisition_ms", "terminal_recovery_ms"},
-    "R07": {"admission_closed_ms", "link_retired_ms", "old_ap_inactive_ms", "fresh_acquisition_ms", "terminal_recovery_ms"},
-    "R08": {"admission_closed_ms", "link_retired_ms", "grace_expiry_observed_ms", "teardown_started_ms", "old_ap_inactive_ms", "terminal_recovery_ms"},
-    "R09": {"admission_closed_ms", "link_retired_ms", "teardown_started_ms", "old_ap_inactive_ms", "fresh_acquisition_ms", "terminal_recovery_ms"},
-    "R10": {"terminal_recovery_ms"},
-    "R11": {"admission_closed_ms", "link_retired_ms", "fresh_acquisition_ms", "terminal_recovery_ms"},
-}
-ACTIVATION_SCENARIOS = {"R01", "R04", "R05", "R06", "R07", "R09", "R11"}
-NEW_ACTIVATION_SCENARIOS = {"R04", "R05", "R06", "R07", "R09"}
-AP_OFF_SCENARIOS = {"R03", "R04", "R05", "R06", "R07", "R08", "R09"}
 
 
 def null_reason(scenario: str, field: str) -> str:
@@ -134,8 +118,8 @@ def blocked_scenarios() -> list[dict]:
     } for scenario, reason in BLOCKED_SCENARIOS.items()]
 
 
-def base_document() -> dict:
-    return {
+def base_document(*, full_scope: bool = False) -> dict:
+    document = {
         "task": "task-38-wireless-recovery",
         "git_commit": "unknown",
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -156,12 +140,16 @@ def base_document() -> dict:
         "hard_kill_cleanup": {"status": "blocked", "reason": BLOCKED_SCENARIOS["B01"]},
         "scenarios": [],
     }
+    if full_scope:
+        document.update(schema_version=2, qualification_scope="full-task38",
+                        device_evidence={}, full_scope_signoff=None)
+    return document
 
 
 def run_matrix(build: Path, out: Path, repo: Path) -> dict:
     logs = (out.parent / f"{out.stem}-logs").resolve()
     logs.mkdir(parents=True, exist_ok=True)
-    document = base_document()
+    document = base_document(full_scope=True)
     try:
         document["git_commit"] = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
@@ -209,11 +197,7 @@ def expected_ap_leak(document: dict) -> bool:
         s["old_ap_inactive_ms"] is not None for s in host if s["scenario_id"] in AP_OFF_SCENARIOS)
 
 
-def valid_offset(value) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
-
-
-def validate(document: dict) -> list[str]:
+def validate(document: dict, evidence_root: Path | None = None) -> list[str]:
     errors = []
     for key in ("task", "git_commit", "timestamp", "compliance_status", "withdrawn_claims",
                 "owner_approval", "reduced_scope_signoff", "no_ap_leak_verified",
@@ -223,189 +207,26 @@ def validate(document: dict) -> list[str]:
     if errors:
         return errors
     scenarios = {s.get("scenario_id"): s for s in document["scenarios"]}
+    if len(scenarios) != len(document["scenarios"]):
+        errors.append("duplicate scenario_id")
     for scenario in (*HOST_SCENARIOS, *BLOCKED_SCENARIOS):
         if scenario not in scenarios:
             errors.append(f"missing scenario {scenario}")
     if errors:
         return errors
-    if document["compliance_status"] not in {"failed", "pending-owner-signoff", "completed-reduced-scope"}:
-        errors.append("invalid compliance_status")
-    signoff = document["reduced_scope_signoff"]
-    withdrawn = document["withdrawn_claims"]
-    if not isinstance(withdrawn, list):
-        return errors + ["withdrawn_claims must be a list"]
-    for claim in base_document()["withdrawn_claims"]:
-        if claim not in withdrawn:
-            errors.append(f"required withdrawn claim missing: {claim}")
-    if document["compliance_status"] == "completed-reduced-scope":
-        if not isinstance(signoff, dict) or not all(signoff.get(key) for key in ("approver", "date", "claims", "pr_head")):
-            errors.append("reduced-scope closure requires explicit owner sign-off with approver/date/claims/pr_head")
-        else:
-            if signoff["pr_head"] != document["git_commit"] or document["git_commit"] == "unknown":
-                errors.append("reduced-scope sign-off pr_head does not match evaluated git_commit")
-            if document.get("worktree_dirty") is not False:
-                errors.append("reduced-scope closure requires evidence from a verified clean worktree")
-            claims = signoff["claims"]
-            if not isinstance(claims, list):
-                errors.append("reduced-scope sign-off claims must be a list")
-            else:
-                for claim in withdrawn:
-                    if claim not in claims:
-                        errors.append(f"reduced-scope sign-off does not cover withdrawn claim: {claim}")
-    elif signoff is not None:
-        errors.append("sign-off is present but closure is not completed-reduced-scope")
-    approval = document["owner_approval"]
-    if not isinstance(approval, dict) or not approval.get("decision") or not approval.get("date"):
-        errors.append("missing bounded-cleanup owner decision/date")
-    for scenario in BLOCKED_SCENARIOS:
-        entry = scenarios[scenario]
-        if entry["status"] != "blocked" or not entry.get("blocked_reason"):
-            errors.append(f"{scenario} must remain blocked with a reason")
-        if not any(scenario in claim for claim in withdrawn):
-            errors.append(f"{scenario} has no withdrawn claim")
-    for scenario in HOST_SCENARIOS:
-        entry = scenarios[scenario]
-        if entry["status"] not in {"pass", "fail", "blocked"}:
-            errors.append(f"{scenario}: invalid status")
-            continue
-        if entry["status"] == "blocked" and scenario != "R07":
-            errors.append(f"{scenario}: blocked outcome is not an approved exception")
-        for field in OFFSETS:
-            if field not in entry:
-                errors.append(f"{scenario}: missing offset key {field}")
-            elif entry[field] is None and field not in entry.get("null_reasons", {}):
-                errors.append(f"{scenario}: null {field} has no applicability reason")
-            elif entry[field] is not None and not valid_offset(entry[field]):
-                errors.append(f"{scenario}: {field} must be a nonnegative integer")
-        if entry["status"] == "fail":
-            continue
-        cases = entry.get("cases")
-        if not isinstance(cases, list) or not cases:
-            errors.append(f"{scenario}: missing per-case evidence")
-            continue
-        for field in REQUIRED_OFFSETS[scenario]:
-            if cases[0].get("offsets", {}).get(field) is None:
-                errors.append(f"{scenario}: primary case missing {field}")
-        statuses = []
-        for index, case in enumerate(cases):
-            label = f"{scenario} case {index}"
-            status, observations, offsets = case.get("status"), case.get("observations"), case.get("offsets")
-            if status not in {"pass", "fail", "blocked"} or not isinstance(observations, dict) or not isinstance(offsets, dict):
-                errors.append(f"{label}: invalid status, observations or offsets")
-                continue
-            statuses.append(status)
-            for field in OFFSETS:
-                if field not in offsets:
-                    errors.append(f"{label}: missing offset key {field}")
-                elif offsets[field] is not None and not valid_offset(offsets[field]):
-                    errors.append(f"{label}: {field} must be a nonnegative integer")
-            common = {"terminal_recovery_ms"} if scenario == "R10" else {
-                "admission_closed_ms", "link_retired_ms", "terminal_recovery_ms"}
-            for field in common:
-                if offsets.get(field) is None:
-                    errors.append(f"{label}: missing {field}")
-            admission, link = offsets.get("admission_closed_ms"), offsets.get("link_retired_ms")
-            terminal, inactive = offsets.get("terminal_recovery_ms"), offsets.get("old_ap_inactive_ms")
-            teardown = offsets.get("teardown_started_ms")
-            if scenario != "R10" and valid_offset(admission) and admission > 1000:
-                errors.append(f"{label}: admission closure exceeds 1s")
-            if scenario not in {"R08", "R10"} and valid_offset(link) and link > 5000:
-                errors.append(f"{label}: link teardown exceeds 5s")
-            if valid_offset(terminal) and terminal > (1000 if scenario == "R10" else 15000):
-                errors.append(f"{label}: terminal state exceeds its budget")
-            if scenario in AP_OFF_SCENARIOS and scenario != "R08" and valid_offset(inactive) and inactive > 5000:
-                errors.append(f"{label}: old AP inactivity exceeds 5s")
-            if scenario == "R08":
-                for field in ("grace_expiry_observed_ms", "teardown_started_ms", "link_retired_ms"):
-                    value = offsets.get(field)
-                    if valid_offset(value) and not 10000 <= value < 11000:
-                        errors.append(f"{label}: {field} outside [10000,11000)")
-                if valid_offset(teardown) and valid_offset(inactive) and inactive > min(teardown + 5000, 15000):
-                    errors.append(f"{label}: AP-off after derived deadline")
-            cleanup = observations.get("hard_kill_cleanup", "")
-            if cleanup.startswith("BLOCKED") and status != "blocked":
-                errors.append(f"{label}: blocked cleanup case must have blocked status")
-            if status == "blocked" and not cleanup.startswith("BLOCKED"):
-                errors.append(f"{label}: blocked case lacks a blocked cleanup reason")
-            if scenario in AP_OFF_SCENARIOS:
-                for key in ("cleanup_nm", "cleanup_nft", "cleanup_bluez"):
-                    if not observations.get(key):
-                        errors.append(f"{label}: missing {key}")
-            elif not observations.get("cleanup_observations_applicability"):
-                errors.append(f"{label}: missing cleanup applicability reason")
-            if observations.get("trust_store_unmodified") != "true":
-                errors.append(f"{label}: trust-store preservation is not evidenced")
-        if statuses:
-            expected = "fail" if "fail" in statuses else "blocked" if "blocked" in statuses else "pass"
-            if entry["status"] != expected:
-                errors.append(f"{scenario}: aggregate status does not match per-case outcomes")
-        usable = [case for case in cases if isinstance(case.get("offsets"), dict)]
-        for field in OFFSETS:
-            values = [case["offsets"][field] for case in usable if valid_offset(case["offsets"].get(field))]
-            expected = max(values) if values else None
-            if entry.get(field) != expected:
-                errors.append(f"{scenario}: aggregate {field} does not match cases")
-        if entry.get("protocol_elapsed_ms") != entry.get("terminal_recovery_ms"):
-            errors.append(f"{scenario}: protocol_elapsed_ms does not match terminal recovery")
-        for field in ("old_activation_id", "new_activation_id"):
-            raw = cases[0].get("observations", {}).get(field)
-            try:
-                expected = int(raw) if raw is not None else None
-            except ValueError:
-                expected = None
-                errors.append(f"{scenario}: invalid primary {field}")
-            if entry.get(field) != expected:
-                errors.append(f"{scenario}: aggregate {field} does not match primary case")
-        expected_reason = next((case.get("observations", {}).get("hard_kill_cleanup") for case in cases
-                                if case.get("observations", {}).get("hard_kill_cleanup", "").startswith("BLOCKED")), None)
-        if entry.get("blocked_reason") != expected_reason:
-            errors.append(f"{scenario}: blocked_reason does not match per-case cleanup evidence")
-        for field in REQUIRED_OFFSETS[scenario]:
-            if entry.get(field) is None:
-                errors.append(f"{scenario}: missing required observation {field}")
-        if any(entry.get(field) is None for field in REQUIRED_OFFSETS[scenario]):
-            continue
-        if scenario != "R10" and entry["admission_closed_ms"] > 1000:
-            errors.append(f"{scenario}: admission closure exceeds 1s")
-        if scenario not in {"R08", "R10"} and entry["link_retired_ms"] > 5000:
-            errors.append(f"{scenario}: link teardown exceeds 5s")
-        if entry["terminal_recovery_ms"] > (1000 if scenario == "R10" else 15000):
-            errors.append(f"{scenario}: terminal state exceeds its budget")
-        if scenario in AP_OFF_SCENARIOS and scenario != "R08" and entry["old_ap_inactive_ms"] > 5000:
-            errors.append(f"{scenario}: old AP inactivity exceeds 5s")
-        if scenario in ACTIVATION_SCENARIOS:
-            old, new = entry.get("old_activation_id"), entry.get("new_activation_id")
-            if old is None or new is None:
-                errors.append(f"{scenario}: missing old/new activation distinction")
-            elif scenario in NEW_ACTIVATION_SCENARIOS and new <= old:
-                errors.append(f"{scenario}: recovery did not use a distinct new activation")
-        if scenario == "R08":
-            for field in ("grace_expiry_observed_ms", "teardown_started_ms", "link_retired_ms"):
-                if not 10000 <= entry[field] < 11000:
-                    errors.append(f"R08: {field} outside [10000,11000)")
-            deadline = min(entry["teardown_started_ms"] + 5000, 15000)
-            if entry["old_ap_inactive_ms"] > deadline:
-                errors.append("R08: AP-off after derived deadline despite protocol result")
-        if scenario == "R07":
-            cases = entry.get("cases", [])
-            cleanups = [case["observations"].get("hard_kill_cleanup", "") for case in cases]
-            if len(cases) < 2 or not any(value.startswith("BLOCKED") for value in cleanups):
-                errors.append("R07: unverified hard-kill cleanup must remain explicitly blocked")
-            if entry["status"] != "blocked" or not entry.get("blocked_reason"):
-                errors.append("R07: cleanup limitation must not be promoted to pass")
-            if not all(case["observations"].get("protocol_result", "").startswith("pass:") for case in cases):
-                errors.append("R07: protocol result must be recorded separately from cleanup")
-        if scenario == "R11":
-            observations = entry["cases"][0]["observations"] if entry.get("cases") else {}
-            for key in ("fresh_confirmed_active", "video_delivered", "audio_delivered", "input_delivered"):
-                if observations.get(key) != "true":
-                    errors.append(f"R11: missing {key} evidence")
-            if observations.get("admission") != "production activation-bound predicate":
-                errors.append("R11: admission is not the production activation-bound predicate")
+    errors.extend(validate_scope(document, base_document()["withdrawn_claims"]))
+    if errors:
+        return errors
+    if document.get("schema_version") == 2:
+        errors.extend(validate_device(document, evidence_root or Path.cwd()))
+    errors.extend(validate_host(scenarios))
     if any(scenarios[s]["status"] == "fail" for s in HOST_SCENARIOS):
         if document["compliance_status"] != "failed":
             errors.append("failed host scenario requires failed compliance_status")
-    elif document["compliance_status"] == "failed":
+    elif document["compliance_status"] == "failed" and not any(
+            isinstance(entry, dict) and entry.get("status") == "fail"
+            for entry in (document["device_evidence"].values()
+                          if isinstance(document.get("device_evidence"), dict) else ())):
         errors.append("failed compliance_status has no failed host scenario")
     if document["no_ap_leak_verified"] != expected_ap_leak(document):
         errors.append("unsupported no_ap_leak_verified value")
@@ -439,9 +260,9 @@ def main() -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         document = run_matrix(args.build, args.out, args.repo)
         args.out.write_text(json.dumps(document, indent=2) + "\n")
-        problems = validate(document)
+        problems = validate(document, args.out.parent)
     else:
-        problems = validate(json.loads(args.evidence.read_text()))
+        problems = validate(json.loads(args.evidence.read_text()), args.evidence.parent)
     for problem in problems:
         print(f"FAIL {problem}")
     if problems:
