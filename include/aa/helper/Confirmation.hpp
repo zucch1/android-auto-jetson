@@ -3,6 +3,7 @@
 #include <aa/core/Ids.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/helper/ObservedPeer.hpp>
+#include <aa/helper/PairingComparison.hpp>
 #include <aa/trust/Identity.hpp>
 #include <cstddef>
 #include <optional>
@@ -51,6 +52,12 @@ struct RevocationAttempt final {
 class Confirmation {
 public:
     virtual ~Confirmation() = default;
+    virtual core::Result<PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) {
+        return Error{ErrorCode::helper_rejected};
+    }
+    virtual core::Result<void> respond_comparison(core::ConsumerId, core::PairingRequestId, ComparisonResponse) {
+        return Error{ErrorCode::helper_rejected};
+    }
     virtual core::Result<void> confirmed(core::ConsumerId generation,
                                          core::PairingRequestId source) = 0;
     virtual void cancel(core::ConsumerId generation, core::PairingRequestId source) = 0;

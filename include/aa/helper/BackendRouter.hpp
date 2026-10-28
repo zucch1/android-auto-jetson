@@ -26,6 +26,8 @@ public:
     void cleanup() noexcept override { ap_.cleanup(); bluetooth_.cleanup(); }
     void retire_lease() noexcept override { ap_.retire_lease(); bluetooth_.retire_lease(); }
     void tick() override { ap_.tick(); bluetooth_.tick(); }
+    core::Result<PairingComparison> comparison() override { return bluetooth_.comparison(); }
+    core::Result<void> respond_comparison(ComparisonResponse response) override { return bluetooth_.respond_comparison(response); }
     core::Result<void> revoke(std::uint64_t phone) override { return ap_.revoke(phone); }
     core::Result<ObservedPeer> observe() override { return bluetooth_.observe(); }
     core::Result<State> authorize(std::uint64_t handle) override { return bluetooth_.authorize(handle); }
