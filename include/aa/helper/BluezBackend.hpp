@@ -10,6 +10,8 @@ public:
     explicit BluezBackend(const std::string& bus_address, Now now = std::chrono::steady_clock::now);
     ~BluezBackend() override;
     bool available() const;
+    core::Result<PairingComparison> comparison() override;
+    core::Result<void> respond_comparison(ComparisonResponse) override;
     core::Result<State> apply(Action, std::uint32_t) override;
     core::Result<ObservedPeer> observe() override;
     core::Result<State> authorize(std::uint64_t) override;

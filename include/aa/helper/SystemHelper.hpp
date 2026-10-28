@@ -3,6 +3,7 @@
 #include <aa/helper/Identity.hpp>
 #include <aa/helper/ObservedPeer.hpp>
 #include <aa/helper/ApSnapshot.hpp>
+#include <aa/helper/PairingComparison.hpp>
 #include <chrono>
 #include <optional>
 #include <vector>
@@ -38,6 +39,8 @@ public:
     // Backends without observations can use full cleanup.
     virtual void retire_lease() noexcept { cleanup(); }
     virtual void tick() {}
+    virtual core::Result<PairingComparison> comparison() { return Error{ErrorCode::helper_rejected}; }
+    virtual core::Result<void> respond_comparison(ComparisonResponse) { return Error{ErrorCode::helper_rejected}; }
     virtual core::Result<void> revoke(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
     virtual core::Result<ObservedPeer> observe() { return Error{ErrorCode::helper_unavailable}; }
     virtual core::Result<State> authorize(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
@@ -88,6 +91,8 @@ public:
     core::Result<void> revoke(const std::string& sender, std::uint64_t phone);
     core::Result<ObservedPeer> observe(const std::string& sender);
     core::Result<void> bind(const std::string& sender, Source source, std::uint64_t handle);
+    core::Result<PairingComparison> comparison(const std::string&, Source);
+    core::Result<void> respond_comparison(const std::string&, Source, ComparisonResponse);
     core::Result<State> reconnect_peer(const std::string& sender, std::uint64_t handle);
     core::Result<void> revoke_peer(const std::string& sender, const PeerIdentity& identity);
     core::Result<ObservedPeer> poll_handoff(const std::string&, Source);
