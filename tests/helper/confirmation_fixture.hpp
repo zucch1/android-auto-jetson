@@ -19,6 +19,21 @@ public:
     int ap_attempts{}, bond_attempts{};
     std::vector<helper::RevocationV1> snapshots;
     std::optional<helper::PeerIdentity> prepared;
+    std::optional<helper::PairingComparison> challenge;
+    int responses{};
+    helper::ComparisonResponse response;
+    core::ConsumerId response_generation;
+    core::PairingRequestId response_request;
+    core::Result<helper::PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) override {
+        return challenge ? core::Result<helper::PairingComparison>{*challenge} :
+                           core::Result<helper::PairingComparison>{Error{ErrorCode::helper_rejected}};
+    }
+    core::Result<void> respond_comparison(core::ConsumerId generation, core::PairingRequestId request,
+                                         helper::ComparisonResponse answer) override {
+        ++responses; response = answer; response_generation = generation; response_request = request;
+        challenge.reset();
+        return {};
+    }
     std::optional<std::size_t> retirement_limit;
     std::vector<std::vector<helper::RetirementSource>> retirement_batches;
     explicit Bridge(trust::ApprovedPhoneStore& approvals) : store(approvals) {}
