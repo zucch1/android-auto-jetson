@@ -50,7 +50,14 @@ def unregister_stays_off(build: Path) -> None:
             error, grant = rpc(surface, "issue 1")
             assert error == 0 and grant
             # When the authenticated receiver explicitly unregisters.
+            error, fresh = rpc(surface, "poll")
+            assert error == 0 and fresh
+            assert rpc(surface, f"reconnect {fresh}")[0] == 0
+            assert command(surface.mock, "NewConnection hfp") == "allowed"
             assert rpc(surface, "execute 8") == (0, 0)
+            assert command(surface.mock, "hfp-wire-read") == "closed"
+            assert command(surface.mock, "AuthorizeService hfp") == "rejected"
+            assert command(surface.mock, "NewConnection hfp") == "rejected"
             # Then idle, observations, consumed grants and owner changes stay off.
             stays_unregistered(surface)
             assert rpc(surface, "poll")[0] == 1000
@@ -69,10 +76,10 @@ def unregister_stays_off(build: Path) -> None:
             stays_unregistered(surface)
             # Explicit register restores registration and ordinary self-healing.
             assert rpc(surface, "execute 7") == (0, 1)
-            assert len(surface.state()["profile"]) == 1
+            assert len(surface.state()["profile"]) == 2
             command(surface.mock, "release-name")
             command(surface.mock, "acquire-name")
-            wait(lambda: bool(surface.state()["profile"]))
+            wait(lambda: len(surface.state()["profile"]) == 2)
             assert rpc(surface, "poll")[0] == 0
             assert surface.state()["removed"] == []
             print("PASS unregister persists across idle, peer operations and owner changes; explicit register restores", flush=True)
