@@ -42,7 +42,9 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_executable(aa_wireless_composed_tls_test tests/wireless_e2e/composed_tls_test.cpp tests/trust/syscall_faults.cpp)
     target_link_libraries(aa_wireless_composed_tls_test PRIVATE aa_wireless GTest::gtest_main PkgConfig::AA_GIO)
     target_compile_definitions(aa_wireless_composed_tls_test PRIVATE AA_HELPER_BUILD="${CMAKE_BINARY_DIR}" AA_HELPER_SOURCE="${CMAKE_SOURCE_DIR}")
-    target_link_options(aa_wireless_composed_tls_test PRIVATE -Wl,--wrap=fsync -Wl,--wrap=renameat)
+    # Real helper authentication hashes this fixture's entire ELF on every call.
+    # Keep DWARF available without making debug data dominate freshness budgets.
+    target_link_options(aa_wireless_composed_tls_test PRIVATE -Wl,--wrap=fsync -Wl,--wrap=renameat -Wl,--compress-debug-sections=zlib)
     target_compile_options(aa_wireless_composed_tls_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
     add_dependencies(aa_wireless_composed_tls_test aa-system-helper)
     add_test(NAME wireless_e2e_composed_tls COMMAND "${CMAKE_COMMAND}" -E env "GTEST_FILTER=WirelessComposedTls.*" "${Python3_EXECUTABLE}" -B
