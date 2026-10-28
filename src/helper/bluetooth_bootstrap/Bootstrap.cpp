@@ -58,9 +58,13 @@ void Bootstrap::deny(HandoffFailure reason) {
     fd_ = -1; wipe(snapshot_.password); wipe_bytes(output_);
 }
 bool Bootstrap::queue(std::uint16_t id, const std::string& payload) {
-    auto bytes = encode_aaw(id, {reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()});
+    // The shared legacy codec only knows IDs 1..7; SetupInfo uses the same framing.
+    auto bytes = encode_aaw(id == 11 ? 1 : id, {reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()});
     if (!bytes) { deny(HandoffFailure::oversize); return false; }
-    output_ = std::move(*bytes); sent_ = 0; return true;
+    if (id == 11) (*bytes)[3] = 11;
+    if (output_.empty()) sent_ = 0;
+    output_.insert(output_.end(), bytes->begin(), bytes->end());
+    wipe_bytes(*bytes); return true;
 }
 bool Bootstrap::authorize(const ApSnapshot& snapshot, bool ready, Time now) {
     if (expire()) return false;
@@ -69,8 +73,10 @@ bool Bootstrap::authorize(const ApSnapshot& snapshot, bool ready, Time now) {
     if (fd_ < 0) return false;
     if (now >= deadline_.until || expire()) { deny(HandoffFailure::timeout); return false; }
     snapshot_ = snapshot;
-    aaw::WifiStartRequest message; message.set_ip_address(snapshot.ip); message.set_port(snapshot.port);
-    stage_ = Stage::info; return queue(1, message.SerializeAsString());
+    aaw::WifiVersionRequest message;
+    message.set_major_version(1); message.set_minor_version(0);
+    message.set_selected_channel(aaw::CHANNEL_5GHZ_ONLY);
+    stage_ = Stage::info; return queue(4, message.SerializeAsString());
 }
 bool Bootstrap::verify(const SnapshotProvider& provider) {
     if (!provider) { deny(HandoffFailure::snapshot); return false; }
@@ -99,25 +105,48 @@ bool Bootstrap::flush(const SnapshotFence& fence) {
     wipe_bytes(output_); return true;
 }
 void Bootstrap::record(const AawRecord& record) {
-    if ((record.id == 2 && seen_info_) || (record.id == 7 && seen_start_)) { deny(HandoffFailure::duplicate); return; }
-    if (stage_ == Stage::info && record.id == 2) {
+    if (((record.id == 2 || record.id == 5) && seen_info_) || (record.id == 7 && seen_start_)) { deny(HandoffFailure::duplicate); return; }
+    if (stage_ == Stage::info && record.id == 5) {
+        aaw::WifiVersionResponse response;
+        if (!parse(response, record)) { deny(HandoffFailure::protobuf); return; }
+        if (response.status() != aaw::SUCCESS) { deny(HandoffFailure::phone_rejected); return; }
+        if (response.major_version() != 1 || response.minor_version() != 0) { deny(HandoffFailure::phone_rejected); return; }
+        aaw::WifiSetupInfo setup;
+        setup.set_major_version(1); setup.set_minor_version(0);
+        setup.mutable_endpoint()->set_ip_address(snapshot_.ip); setup.mutable_endpoint()->set_port(snapshot_.port);
+        auto* ap = setup.mutable_access_point();
+        ap->set_ssid(snapshot_.ssid); ap->set_bssid(snapshot_.bssid); ap->set_password(snapshot_.password);
+        ap->set_security_mode(aaw::WPA2_PERSONAL);
+        auto payload = setup.SerializeAsString();
+        const auto queued = queue(11, payload); wipe(payload); wipe(*ap->mutable_password());
+        if (!queued) return;
+        aaw::ModernWifiStartRequest start;
+        start.set_ip_address(snapshot_.ip); start.set_port(snapshot_.port); start.set_reason(aaw::DYNAMIC);
+        if (!queue(1, start.SerializeAsString())) return;
+        modern_ = true; seen_info_ = true; stage_ = Stage::start;
+    } else if (stage_ == Stage::info && record.id == 2) {
         aaw::WifiInfoRequest request;
         if (!parse(request, record)) { deny(HandoffFailure::protobuf); return; }
         aaw::WifiInfoResponse response;
         response.set_ssid(snapshot_.ssid); response.set_password(snapshot_.password); response.set_bssid(snapshot_.bssid);
         response.set_security_mode(aaw::WPA2_PERSONAL); response.set_access_point_type(aaw::DYNAMIC);
         auto payload = response.SerializeAsString();
-        queue(3, payload); wipe(payload); wipe(*response.mutable_password());
+        const auto queued = queue(3, payload); wipe(payload); wipe(*response.mutable_password());
+        if (!queued) return;
+        aaw::WifiStartRequest start; start.set_ip_address(snapshot_.ip); start.set_port(snapshot_.port);
+        if (!queue(1, start.SerializeAsString())) return;
         seen_info_ = true; stage_ = Stage::start;
     } else if (stage_ == Stage::start && record.id == 7) {
-        aaw::WifiStartResponse response;
-        if (!parse(response, record)) { deny(HandoffFailure::protobuf); return; }
-        if (response.status() != aaw::STATUS_SUCCESS) { deny(HandoffFailure::phone_rejected); return; }
+        aaw::WifiStartResponse legacy;
+        aaw::ModernWifiStartResponse modern;
+        if (modern_ ? !parse(modern, record) : !parse(legacy, record)) { deny(HandoffFailure::protobuf); return; }
+        if (modern_ ? modern.status() != aaw::SUCCESS : legacy.status() != aaw::STATUS_SUCCESS) { deny(HandoffFailure::phone_rejected); return; }
         seen_start_ = true; stage_ = Stage::connect;
     } else if (stage_ == Stage::connect && record.id == 6) {
-        aaw::WifiConnectStatus response;
-        if (!parse(response, record)) { deny(HandoffFailure::protobuf); return; }
-        if (response.status() != aaw::STATUS_SUCCESS) { deny(HandoffFailure::phone_rejected); return; }
+        aaw::WifiConnectStatus legacy;
+        aaw::ModernWifiConnectStatus modern;
+        if (modern_ ? !parse(modern, record) : !parse(legacy, record)) { deny(HandoffFailure::protobuf); return; }
+        if (modern_ ? modern.status() != aaw::SUCCESS : legacy.status() != aaw::STATUS_SUCCESS) { deny(HandoffFailure::phone_rejected); return; }
         stage_ = Stage::finishing;
     } else { deny(HandoffFailure::wrong_order); }
 }
