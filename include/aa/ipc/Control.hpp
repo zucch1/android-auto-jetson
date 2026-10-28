@@ -34,6 +34,8 @@ enum class ControlMethod {
     get_capabilities,
     set_display_viewport,
     ping,
+    get_pairing_comparison,
+    respond_pairing_comparison,
 };
 
 // Stable wire names (the D-Bus introspection contract).
@@ -51,6 +53,8 @@ enum class ControlMethod {
     case ControlMethod::get_capabilities: return "GetCapabilities";
     case ControlMethod::set_display_viewport: return "SetDisplayViewport";
     case ControlMethod::ping: return "Ping";
+    case ControlMethod::get_pairing_comparison: return "GetPairingComparison";
+    case ControlMethod::respond_pairing_comparison: return "RespondPairingComparison";
     }
     return {};
 }

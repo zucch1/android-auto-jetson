@@ -154,7 +154,7 @@ struct ControlServiceDeps final {
 };
 
 // Session D-Bus control dispatcher (task 21) for
-// org.custom.AndroidAutoReceiver1: the twelve contract methods with their
+// org.custom.AndroidAutoReceiver1: the fourteen contract methods with their
 // authorization semantics, the one-time pairing request-id gate, and the
 // typed event stream behind the contract's signals.
 //
@@ -204,6 +204,8 @@ public:
     [[nodiscard]] core::Result<void> cancel_phone_pairing(const BusName& caller,
                                                           core::PairingRequestId request);
     [[nodiscard]] core::Result<void> forget_phone(const BusName& caller, core::PhoneId phone);
+    core::Result<std::map<std::string, std::string>> pairing_comparison(const BusName&, core::PairingRequestId);
+    core::Result<void> respond_pairing_comparison(const BusName&, core::PairingRequestId, helper::ComparisonResponse);
 
     // GetState / GetCapabilities / Ping (open to every caller). state()
     // reconciles the incumbent owner before snapshotting and can emit the
@@ -267,6 +269,7 @@ private:
         core::PhoneId phone;
         std::optional<helper::PeerIdentity> peer;
         std::chrono::steady_clock::time_point deadline;
+        std::optional<std::uint64_t> presented_comparison{};
     };
     std::optional<OpenPairing> open_pairing_;
 };
