@@ -47,7 +47,7 @@ service. The following limits are explicit acceptance conditions for this task.
 
 - `tools/ipc/dbus_contract.py` runs in `check` (validate the checked XML) and
   `generate` (validate, then emit the introspection header) modes.
-- Validation is a structural allowlist: exactly twelve methods, five signals and
+- Validation is a structural allowlist: exactly fourteen methods, five signals and
   one read-only property, with argument types restricted to scalars and the string
   map so bulk or high-rate payload shapes are rejected.
 - Violations print named `DBUS_CONTRACT_*` diagnostics, exit nonzero, and produce
