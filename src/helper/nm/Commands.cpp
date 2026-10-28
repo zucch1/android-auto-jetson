@@ -130,7 +130,7 @@ bool eligible(const Policy& policy, Commands& commands) {
     if (!capabilities) return false;
     std::istringstream frequencies{capabilities.value()};
     while (std::getline(frequencies, line)) {
-        if (line.find("5180 MHz [36]") == std::string::npos) continue;
+        if (line.find("5180 MHz [36]") == std::string::npos && line.find("5180.0 MHz [36]") == std::string::npos) continue;
         return line.find("disabled") == std::string::npos && line.find("no IR") == std::string::npos &&
                line.find("radar") == std::string::npos && line.find("NO-IR") == std::string::npos;
     }

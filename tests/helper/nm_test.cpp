@@ -124,7 +124,7 @@ public:
                         std::string{wrong_channel ? "44 (5220 MHz)" : "36 (5180 MHz)"} + ", width: 20 MHz\n";
                 } else if (request == "/usr/sbin/iw\ndev\n\n") reply = "0phy#0\n\tInterface wlan-test\n";
                 else if (request == "/usr/sbin/iw\nreg\nget\n\n") reply = country ? "0global\ncountry US: DFS-FCC\n" : "0global\ncountry 00: DFS-UNSET\n";
-                else if (request == "/usr/sbin/iw\nphy\nphy0\ninfo\n\n") reply = enabled ? "0 * 5180 MHz [36] (23.0 dBm)\n" : "0 * 5180 MHz [36] (disabled)\n";
+                else if (request == "/usr/sbin/iw\nphy\nphy0\ninfo\n\n") reply = enabled ? "0 * 5180.0 MHz [36] (23.0 dBm)\n" : "0 * 5180.0 MHz [36] (disabled)\n";
                 else if (request == "/usr/sbin/nft\nlist\ntables\ninet\n\n") {
                     if (!fail_listing) reply = table ? "0table inet aa_receiver_ap\n" : "0";
                 } else if (request == "/usr/sbin/nft\nlist\ntable\ninet\naa_receiver_ap\n\n") {
