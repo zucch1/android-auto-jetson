@@ -22,7 +22,8 @@ struct BusClient::Impl {
     // All transaction helpers require mutex ownership, including failure cleanup.
     core::Result<std::uint64_t> rpc(const char* member, const char* signature, MessageWriter writer,
                                     Clock::time_point until, ObservedPeer* observed = nullptr,
-                                    HandoffFailure* failure = nullptr, ApSnapshot* snapshot = nullptr) {
+                                    HandoffFailure* failure = nullptr, ApSnapshot* snapshot = nullptr,
+                                    PairingComparison* comparison = nullptr) {
         if (Clock::now() >= until) return Error{ErrorCode::timeout};
         bus.deadline(until);
         const auto owner = bus.get_name_owner(ipc::BusName{kBusName});
@@ -41,12 +42,20 @@ struct BusClient::Impl {
         const core::SecretScope wipe_body{reply.value().body, snapshot != nullptr};
         if (Clock::now() >= until) return Error{ErrorCode::timeout};
         if (reply.value().type != MessageType::method_return || reply.value().signature !=
-            (snapshot ? "utssssut" : failure ? "utssu" : observed ? "utss" : "ut"))
+            (comparison ? "utuss" : snapshot ? "utssssut" : failure ? "utssu" : observed ? "utss" : "ut"))
             return Error{ErrorCode::helper_protocol_mismatch};
         Cursor body{reply.value().body};
         const auto error = body.read_u32();
         const auto value = body.read_u64();
         if (!error || !value) return Error{ErrorCode::helper_protocol_mismatch};
+        if (comparison) {
+            const auto number = body.read_u32();
+            const auto address = body.read_string(); const auto adapter = body.read_string();
+            if (!number || number.value() > 999999 || !address || !adapter ||
+                address.value().size() > 64 || adapter.value().size() > 64)
+                return Error{ErrorCode::helper_protocol_mismatch};
+            *comparison = PairingComparison{value.value(), number.value(), {address.value(), adapter.value()}};
+        }
         if (observed) {
             const auto address = body.read_string();
             const auto adapter = body.read_string();
