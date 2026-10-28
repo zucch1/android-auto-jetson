@@ -34,6 +34,12 @@ int main(int argc, char** argv) {
             writer.put_u32(2).put_u32(0).put_u64(value);
         } else if (op == "reconnect") {
             input >> value; member = "ReconnectPeerV1"; signature = "t"; writer.put_u64(value);
+        } else if (op == "comparison") {
+            input >> source; member = "GetPairingComparisonV1"; signature = "tt";
+            writer.put_u64(1).put_u64(source);
+        } else if (op == "respond") {
+            input >> source >> value; member = "RespondPairingComparisonV1"; signature = "tttu";
+            writer.put_u64(1).put_u64(source).put_u64(value).put_u32(1);
         } else if (op == "close") {
             member = "Invalidate"; signature = "tt"; writer.put_u64(0).put_u64(0);
         } else if (op == "targetless") {

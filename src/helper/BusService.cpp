@@ -43,6 +43,8 @@ struct BusService::Impl {
         core::Result<std::uint64_t> result{Error{ErrorCode::helper_protocol_mismatch}};
         Cursor body{message.body};
         std::optional<ObservedPeer> peer;
+        std::optional<PairingComparison> comparison;
+        const bool comparison_poll = message.member == "GetPairingComparisonV1";
         const bool polling = message.member == "PollPeerV1";
         const bool bootstrap_poll = message.member == "PollBootstrapV1";
         const bool credentials = message.member == "GetAPCredentialsV1";
@@ -51,7 +53,24 @@ struct BusService::Impl {
         std::uint64_t snapshot_handle{};
         if (message.path == kObjectPath && message.interface_name == kInterface &&
             !message.sender.empty() && message.sender.front() == ':') {
-            if ((bootstrap_poll || credentials || message.member == "AuthorizeBootstrapV1") &&
+            if ((comparison_poll || message.member == "RespondPairingComparisonV1") &&
+                message.signature == (comparison_poll ? "tt" : "tttu")) {
+                const auto generation = body.read_u64(); const auto request = body.read_u64();
+                if (generation && request) {
+                    const Source source{generation.value(), request.value()};
+                    if (comparison_poll && body.done()) {
+                        const auto fetched = helper.comparison(message.sender, source);
+                        if (fetched) { comparison = fetched.value(); result = comparison->id; }
+                        else result = fetched.error();
+                    } else if (!comparison_poll) {
+                        const auto id = body.read_u64(); const auto accept = body.read_u32();
+                        if (id && accept && accept.value() <= 1 && body.done()) {
+                            const auto answered = helper.respond_comparison(message.sender, source, {id.value(), accept.value() != 0});
+                            result = answered ? core::Result<std::uint64_t>{0} : core::Result<std::uint64_t>{answered.error()};
+                        }
+                    }
+                }
+            } else if ((bootstrap_poll || credentials || message.member == "AuthorizeBootstrapV1") &&
                 message.signature == (bootstrap_poll ? "tt" : credentials ? "ttt" : "tttuu")) {
                 const auto generation = body.read_u64(); const auto confirmation = body.read_u64();
                 if (generation && confirmation) {
@@ -140,8 +159,10 @@ struct BusService::Impl {
                 MessageWriter reply;
                 const auto wipe_body = reply.protect_body(credentials);
                 reply.destination(message.sender).reply_serial(message.serial);
-                reply.body_signature(credentials ? "utssssut" : bootstrap_poll ? "utssu" : polling ? "utss" : "ut")
+                reply.body_signature(comparison_poll ? "utuss" : credentials ? "utssssut" : bootstrap_poll ? "utssu" : polling ? "utss" : "ut")
                     .put_u32(result ? 0U : static_cast<std::uint32_t>(result.error().code())).put_u64(result ? result.value() : 0);
+                if (comparison_poll) reply.put_u32(comparison ? comparison->number : 0)
+                    .put_string(comparison ? comparison->peer.address : "").put_string(comparison ? comparison->peer.adapter : "");
                 if (polling || bootstrap_poll) reply.put_string(peer ? peer->identity.address : "").put_string(peer ? peer->identity.adapter : "");
                 if (bootstrap_poll) reply.put_u32(static_cast<std::uint32_t>(helper.handoff_failure(message.sender)));
                 if (credentials) reply.put_string(snapshot ? snapshot->ssid : "").put_string(snapshot ? std::string_view{snapshot->password} : std::string_view{})
