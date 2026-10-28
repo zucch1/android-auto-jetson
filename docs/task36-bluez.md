@@ -17,19 +17,25 @@ OAA is pinned by `third_party/provenance/inventory.json` to commit
 (the guide is outside the vendored subset). It describes the AA service UUID
 `4de17a00-52cb-11e6-bdf4-0800200c9a66`, RFCOMM server channel8 and the subsequent
 Wi-Fi protobuf handshake. This is reverse-engineered research, **not an official
-Google interoperability guarantee**. The backend uses only that AA UUID/server
-role/channel, with authentication and authorization REQUIRED. It does not adopt
-the guide's authorization bypass, HFP/HSP advice, legacy SDP/compat changes or
-global plugin changes. No SPP, A2DP, AVRCP, SAP or HFP/HSP profile is registered.
-Phone interoperability without the guide's audio-profile advice is BLOCKED.
+Google interoperability guarantee**. The backend registers that AA UUID/server
+on channel 8 and a separately scoped HFP AG UUID
+`0000111f-0000-1000-8000-00805f9b34fb` on channel 7, both with authentication
+and authorization REQUIRED. Channel 7 follows the observed A26 HFP attempt; it
+is not inferred from BlueZ's default AG channel. The HFP endpoint performs only
+the BRSF/CIND/CMER service-level negotiation required for presence, with a
+three-second incomplete-negotiation deadline. It provides no call control,
+SCO/audio routing, A2DP, AVRCP, SAP, SPP, HSP, or global plugin changes. Real
+phone HFP and subsequent AA interoperability remain **BLOCKED** pending target
+qualification; host socket tests are not phone proof.
 
 API references: [BlueZ Profile API](https://bluez.readthedocs.io/en/latest/profile-api/),
 [Agent API](https://bluez.readthedocs.io/en/latest/agent-api/), and GLib GIO
 `g_dbus_connection_register_object`, thread-default main contexts,
 `g_dbus_message_get_unix_fd_list` (borrowed list) and `g_unix_fd_list_get`
-(owned close-on-exec duplicate). Agent capability is `NoInputNoOutput`;
+(owned close-on-exec duplicate). Agent capability is `DisplayYesNo`;
 `RequestDefaultAgent` must succeed to mediate unsolicited Just Works attempts.
-PIN/passkey/numeric-comparison paths are rejected, not silently approved.
+PIN/passkey entry and display paths remain rejected. Numeric comparison is
+human-mediated during explicit enrollment only, never automatically approved.
 
 ## Cross-process transaction
 
@@ -52,15 +58,35 @@ PIN/passkey/numeric-comparison paths are rejected, not silently approved.
    for at most60s. Only an active result permits `PairingOpened`. A failed helper
    operation never implicitly erases already committed approval. AP's grant is
     retained for the separately requested AP acquire; pending AP status is not active.
-4. Every effect-bearing Agent1/Profile1 callback authenticates the CURRENT BlueZ
+4. `ConfirmPhonePairing` opens enrollment and preserves the existing snapshot-only
+   store approval; it does **not** approve an unseen comparison number. BlueZ
+   `RequestConfirmation` retains one asynchronous invocation per enrollment.
+   Only the authenticated registered consumer can call `GetPairingComparison(t)`
+   for that request. Its string map contains `challenge_id` (decimal uint64),
+   `comparison` (exactly six digits, including leading zeroes), `address` and
+   `adapter`. The consumer must display that number beside the phone identity,
+   ask a human whether both devices show the same number, and call
+   `RespondPairingComparison(ttb)` with an explicit decision. No comparison
+   signal is broadcast; comparison numbers are never persisted or included in
+   `DiagnosticEvent`. Retrieval is not acceptance, and a response without prior
+   retrieval is rejected. The one-use challenge is bound to the existing
+   consumer generation/request, approved snapshot, exact peer and BlueZ
+   owner/device/adapter incarnations. Revalidation precedes answering BlueZ.
+   Rejection, cancel, original monotonic enrollment deadline, consumer/receiver
+   loss, owner or peer continuity loss all reject the pending invocation.
+   Reconnect cannot create or answer comparisons. Failed comparison does not
+   roll back the already committed application approval or delete a bond.
+5. Every effect-bearing Agent1/Profile1 callback authenticates the CURRENT BlueZ
    owner, exact device identity, and deadline; service authorization accepts only
-   the AA UUID and an actual paired bond. Unknown Just Works is rejected outside
+   the AA or scoped HFP AG UUID and an actual paired bond for that same peer. HFP
+   and AA use distinct profile object paths and independently owned sockets, so
+   one profile's disconnect does not tear down the other. Unknown Just Works is rejected outside
    the explicit window. Approved reconnect still requires a fresh observation,
    exact full store lookup on its owner thread and actual BlueZ Paired=true AND
    Bonded=true. Missing Bonded is rejected, never treated as an implicit bond.
    It enables only incoming AA service authorization, never re-pairing and never
    generic Device1.Connect. Targetless action9 is rejected.
-5. NewConnection validates the real Unix-FD index, duplicates and owns one socket,
+6. NewConnection validates the real Unix-FD index, duplicates and owns one socket,
    rejects wrong/duplicate connections, and closes it on RequestDisconnection,
    cancel, idle expiry, owner change, receiver loss and teardown. Task37 now
    implements the helper-owned RFCOMM Wi-Fi credential bootstrap on this socket,
@@ -96,6 +122,8 @@ cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE=/home/zucchi/android-auto-jetson
 cmake --build build/host-dev --parallel 2
 ctest --test-dir build/host-dev -R 'system_helper|trust_store|dbus_contract|architecture_boundary' --output-on-failure
 python3 -B tests/helper/bluez_runtime.py build/host-dev
+python3 -B tests/helper/bluez_hfp_runtime.py build/host-dev
+build/host-dev/system_helper_hfp_slc
 ```
 
 Composition evidence is under `.omo/evidence/composition/implementation/`. No task closure,
@@ -114,9 +142,9 @@ its persistent bond.
 - Real phone stimulation must supply an unambiguous already observed candidate
   while the helper remains non-discoverable/non-pairable by default. The host
   reference rejects multiple adapters/devices instead of inventing candidate UI.
-- Real BlueZ/phone support for authenticated AA-only channel8 and default-agent
-  permission and the Device1.Bonded property must be qualified; adding audio
-  profiles or accepting a temporary non-bonded pairing is not an allowed fallback.
+- Real BlueZ/phone support for the authenticated scoped HFP AG SLC, AA channel8,
+  default-agent permission and the Device1.Bonded property must be qualified;
+  accepting a temporary non-bonded pairing is not an allowed fallback.
 - The helper managed-peer set and receiver pending records are process-lifetime state.
   After helper/receiver restart, previously managed bonds cannot be blindly
   removed; an unknown managed identity is explicitly rejected. Crash-durable
