@@ -112,28 +112,37 @@ protected:
         if (connect) { ASSERT_EQ(bluez.command("NewConnection"), "allowed"); }
         ASSERT_TRUE(eventually([&] { pump(); return occupied(); }, 10s));
         auto phone = std::async(std::launch::async, [&] {
+            std::vector<std::uint8_t> buffered;
+            std::size_t offset{};
             const auto read_record = [&](std::uint16_t expected) {
-                AawDecoder decoder;
                 bool received = false, terminal = false;
                 EXPECT_TRUE(eventually([&] {
+                    const auto complete = [&] {
+                        if (buffered.size() - offset < 4) return false;
+                        const auto size = (static_cast<std::size_t>(buffered[offset]) << 8) | buffered[offset + 1];
+                        if (size > 4096) { terminal = true; return true; }
+                        if (buffered.size() - offset < size + 4) return false;
+                        const auto id = static_cast<std::uint16_t>(
+                            (static_cast<unsigned>(buffered[offset + 2]) << 8) | buffered[offset + 3]);
+                        if (id != expected) { terminal = true; return true; }
+                        offset += size + 4; received = true; return true;
+                    };
+                    if (complete()) return true;
                     const auto raw = bluez.command("wire-read");
                     if (raw == "closed") { terminal = true; return true; }
                     if (raw == "open") return false;
-                    decoder.feed(unhex(raw));
-                    const auto decoded = decoder.next();
-                    if (const auto* record = std::get_if<AawRecord>(&decoded)) {
-                        if (record->id != expected) { terminal = true; return true; }
-                        received = true;
-                    } else if (std::get_if<AawError>(&decoded)) { terminal = true; return true; }
-                    return received;
+                    const auto bytes = unhex(raw);
+                    buffered.insert(buffered.end(), bytes.begin(), bytes.end());
+                    return complete();
                 }));
                 EXPECT_FALSE(terminal) << "RFCOMM closed, mismatched or undecodable before record " << expected;
                 return received;
             };
+            ASSERT_TRUE(read_record(4));
+            ASSERT_EQ(bluez.command("wire-send 0008000510011800280c3001"), "ok");
+            ASSERT_TRUE(read_record(11));
             ASSERT_TRUE(read_record(1));
-            ASSERT_EQ(bluez.command("wire-send 00000002"), "ok");
-            ASSERT_TRUE(read_record(3));
-            ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
+            ASSERT_EQ(bluez.command("wire-send 00020007200c00020006100c"), "ok");
             ASSERT_TRUE(eventually([&] { return bluez.command("wire-read") == "closed"; }));
         });
         ASSERT_TRUE(eventually([&] { pump(); return phone.wait_for(0ms) == std::future_status::ready; }, 5s));
