@@ -45,6 +45,8 @@ BluezBackend::Impl::Impl(const std::string& address, Now clock) : now(std::move(
         if (xml) {
             profile_export = g_dbus_connection_register_object(bus, kProfilePath, xml->interfaces[0], &vtable, this, nullptr, &error);
             g_clear_error(&error);
+            hfp_export = g_dbus_connection_register_object(bus, kHfpPath, xml->interfaces[0], &vtable, this, nullptr, &error);
+            g_clear_error(&error);
             agent_export = g_dbus_connection_register_object(bus, kAgentPath, xml->interfaces[1], &vtable, this, nullptr, &error);
             g_clear_error(&error);
         }
@@ -53,9 +55,7 @@ BluezBackend::Impl::Impl(const std::string& address, Now clock) : now(std::move(
 }
 BluezBackend::Impl::~Impl() {
     close_window();
-    if (registered) {
-        if (auto* reply = call("/org/bluez", "org.bluez.ProfileManager1", "UnregisterProfile", g_variant_new("(o)", kProfilePath))) g_variant_unref(reply);
-    }
+    (void)unregister_profiles();
     if (agent_registered) {
         if (auto* reply = call("/org/bluez", "org.bluez.AgentManager1", "UnregisterAgent", g_variant_new("(o)", kAgentPath))) g_variant_unref(reply);
     }
@@ -64,6 +64,7 @@ BluezBackend::Impl::~Impl() {
         if (removal_subscription) g_dbus_connection_signal_unsubscribe(bus, removal_subscription);
         if (properties_subscription) g_dbus_connection_signal_unsubscribe(bus, properties_subscription);
         if (profile_export) g_dbus_connection_unregister_object(bus, profile_export);
+        if (hfp_export) g_dbus_connection_unregister_object(bus, hfp_export);
         if (agent_export) g_dbus_connection_unregister_object(bus, agent_export);
         g_dbus_connection_close_sync(bus, nullptr, nullptr);
         g_object_unref(bus);
@@ -118,6 +119,7 @@ void BluezBackend::Impl::close_connection() {
     connected.reset(); handoff_handle = 0;
 }
 void BluezBackend::Impl::close_admission() {
+    reject_comparison();
     window = {};
     pairing_enabled = false;
     if (allowed) {
@@ -126,18 +128,21 @@ void BluezBackend::Impl::close_admission() {
     allowed.reset();
     quiet_pending = !quiet();
 }
-void BluezBackend::Impl::close_window() { close_connection(); close_admission(); }
+void BluezBackend::Impl::close_window() { close_hfp(); close_connection(); close_admission(); }
 void BluezBackend::Impl::reset() {
+    reject_comparison();
     ++owner_epoch;
+    close_hfp();
     close_connection();
     allowed.reset(); window = {}; pairing_enabled = false; observations.clear(); adapters.clear();
-    registered = false; agent_registered = false;
+    registered = false; hfp_registered = false; agent_registered = false;
 }
 void BluezBackend::Impl::pump() {
     drain_events();
+    if (comparison && now() >= comparison->deadline) close_admission();
     if (now() >= next_check) {
         const bool alive = current_owner();
-        if (alive && profile_requested && (!registered || !agent_registered)) (void)ensure();
+        if (alive && profile_requested && (!registered || !hfp_registered || !agent_registered)) (void)ensure();
         if (alive && quiet_pending) quiet_pending = !quiet();
         if (alive && allowed && now() >= window) {
             close_admission();
@@ -145,6 +150,7 @@ void BluezBackend::Impl::pump() {
         next_check = now() + std::chrono::milliseconds(100);
     }
     std::erase_if(observations, [this](const auto& item) { return now() >= item.second.expires; });
+    tick_hfp();
     if (bootstrap && bootstrap->live()) {
         const auto captured = bootstrap;
         const auto handle = handoff_handle;
@@ -154,31 +160,20 @@ void BluezBackend::Impl::pump() {
 }
 bool BluezBackend::Impl::ensure() {
     if (!profile_requested) return false;
-    if (!current_owner() || !profile_export || !agent_export) return false;
-    if (registered && agent_registered) return true;
+    if (!current_owner() || !profile_export || !hfp_export || !agent_export) return false;
+    if (registered && hfp_registered && agent_registered) return true;
     std::vector<Device> devices;
-    if (!inventory(devices) || adapters.size() != 1 || !quiet()) return false;
+    if (!inventory(devices) || adapters.size() != 1) return false;
+    if ((!pairing_enabled || !allowed) && !quiet()) return false;
     if (!agent_registered) {
-        auto* reply = call("/org/bluez", "org.bluez.AgentManager1", "RegisterAgent", g_variant_new("(os)", kAgentPath, "NoInputNoOutput"));
+        auto* reply = call("/org/bluez", "org.bluez.AgentManager1", "RegisterAgent", g_variant_new("(os)", kAgentPath, "DisplayYesNo"));
         if (!reply) return false;
         g_variant_unref(reply); agent_registered = true;
     }
     auto* reply = call("/org/bluez", "org.bluez.AgentManager1", "RequestDefaultAgent", g_variant_new("(o)", kAgentPath));
     if (!reply) return false;
     g_variant_unref(reply);
-    GVariantBuilder options;
-    g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    g_variant_builder_add(&options, "{sv}", "Name", g_variant_new_string("Android Auto"));
-    g_variant_builder_add(&options, "{sv}", "Role", g_variant_new_string("server"));
-    g_variant_builder_add(&options, "{sv}", "Channel", g_variant_new_uint16(8));
-    g_variant_builder_add(&options, "{sv}", "RequireAuthentication", g_variant_new_boolean(TRUE));
-    g_variant_builder_add(&options, "{sv}", "RequireAuthorization", g_variant_new_boolean(TRUE));
-    g_variant_builder_add(&options, "{sv}", "AutoConnect", g_variant_new_boolean(FALSE));
-    if (registered) { g_variant_builder_clear(&options); return true; }
-    reply = call("/org/bluez", "org.bluez.ProfileManager1", "RegisterProfile", g_variant_new("(os@a{sv})", kProfilePath, kAaUuid, g_variant_builder_end(&options)));
-    if (!reply) return false;
-    g_variant_unref(reply); registered = true;
-    return true;
+    return register_profiles();
 }
 BluezBackend::BluezBackend(const std::string& address, Now now) : impl_(std::make_unique<Impl>(address, std::move(now))) {}
 BluezBackend::~BluezBackend() = default;
@@ -239,9 +234,8 @@ core::Result<State> BluezBackend::apply(Action action, std::uint32_t channel) {
         impl_->profile_requested = false;
         cleanup();
         if (!impl_->current_owner()) return Error{ErrorCode::helper_unavailable};
-        auto* reply = impl_->call("/org/bluez", "org.bluez.ProfileManager1", "UnregisterProfile", g_variant_new("(o)", kProfilePath));
-        if (!reply) return Error{ErrorCode::helper_unavailable};
-        g_variant_unref(reply); impl_->registered = false; return State::inactive;
+        if (!impl_->unregister_profiles()) return Error{ErrorCode::helper_unavailable};
+        return State::inactive;
     }
     default: { UnavailableBackend unavailable; return unavailable.apply(action, channel); }
     }
