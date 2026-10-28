@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Platform.hpp"
 #include "../crypto_adapter/Crypto.hpp"
-#include <gio/gunixfdlist.h>
 #include <string_view>
-#include <sys/stat.h>
 
 namespace aa::helper {
 bool BluezBackend::Impl::permitted(const char* path, bool pairing) {
@@ -18,21 +16,29 @@ void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gch
     auto& self = *static_cast<Impl*>(data);
     const auto* interface = g_dbus_method_invocation_get_interface_name(invocation);
     const auto* member = g_dbus_method_invocation_get_method_name(invocation);
+    const auto* path = g_dbus_method_invocation_get_object_path(invocation);
     const auto reject = [&] { g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.Rejected", "Not authorized"); };
     if (!self.current_owner() || self.owner != sender) { reject(); return; }
     const std::string_view method{member};
-    if (method == "Release" || (std::string_view{interface} == "org.bluez.Agent1" && method == "Cancel")) {
+    const bool profile = std::string_view{interface} == "org.bluez.Profile1";
+    if (profile && std::string_view{path} == kHfpPath) { self.hfp_method(args, invocation); return; }
+    if ((profile && std::string_view{path} != kProfilePath) ||
+        (!profile && std::string_view{path} != kAgentPath)) { reject(); return; }
+    if (profile && method == "Release") {
+        self.close_connection(); self.registered = false;
+        g_dbus_method_invocation_return_value(invocation, nullptr); return;
+    }
+    if (!profile && (method == "Release" || method == "Cancel")) {
         self.close_window();
         if (method == "Release") {
-            if (std::string_view{interface} == "org.bluez.Profile1") self.registered = false;
-            else self.agent_registered = false;
+            self.agent_registered = false;
             self.observations.clear();
         }
         g_dbus_method_invocation_return_value(invocation, nullptr); return;
     }
     const char* device{};
     g_variant_get_child(args, 0, "&o", &device);
-    if (std::string_view{interface} == "org.bluez.Profile1") {
+    if (profile) {
         if (method == "RequestDisconnection") {
             if ((!self.connected || self.connected->device.path != device) &&
                 (!self.allowed || self.allowed->device.path != device)) { reject(); return; }
@@ -40,20 +46,10 @@ void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gch
             if (!self.bootstrap || !self.bootstrap->complete()) self.close_connection();
             g_dbus_method_invocation_return_value(invocation, nullptr); return;
         }
-        if (method != "NewConnection" || !self.permitted(device, false) ||
+        if (method != "NewConnection" || !self.registered || !self.permitted(device, false) ||
             self.connection >= 0 || (self.bootstrap && self.bootstrap->live())) { reject(); return; }
-        gint index{};
-        g_variant_get_child(args, 1, "h", &index);
-        auto* list = g_dbus_message_get_unix_fd_list(g_dbus_method_invocation_get_message(invocation));
-        if (!list || index < 0 || index >= g_unix_fd_list_get_length(list)) { reject(); return; }
-        GError* error = nullptr;
-        self.connection = g_unix_fd_list_get(list, index, &error);
-        g_clear_error(&error);
+        self.connection = socket_fd(invocation);
         if (self.connection < 0) { reject(); return; }
-        struct stat info{};
-        if (::fstat(self.connection, &info) != 0 || !S_ISSOCK(info.st_mode)) {
-            self.close_connection(); reject(); return;
-        }
         const auto handle = crypto_adapter::random_id();
         if (!handle || !handle.value()) { self.close_connection(); reject(); return; }
         self.retire(self.handoff_handle, HandoffFailure::eligibility);
@@ -63,9 +59,23 @@ void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gch
         self.connection = -1;
         g_dbus_method_invocation_return_value(invocation, nullptr); return;
     }
+    if (method == "RequestConfirmation") {
+        guint32 number{};
+        g_variant_get_child(args, 1, "u", &number);
+        if (number > 999999 || !self.permitted(device, true) ||
+            self.comparison_used || !self.allowed) { reject(); return; }
+        const auto id = crypto_adapter::random_id();
+        if (!id || !id.value()) { reject(); return; }
+        self.comparison_used = true;
+        self.comparison = Comparison{{id.value(), number, self.allowed->device.identity}, *self.allowed,
+            self.window, G_DBUS_METHOD_INVOCATION(g_object_ref(invocation))};
+        return;
+    }
     if (method == "AuthorizeService") {
         const char* uuid{}; g_variant_get_child(args, 1, "&s", &uuid);
-        if (std::string_view{uuid} != kAaUuid || !self.permitted(device, false)) { reject(); return; }
+        const bool service = std::string_view{uuid} == kAaUuid ||
+            (std::string_view{uuid} == kHfpUuid && self.hfp_registered);
+        if (!service || !self.permitted(device, false)) { reject(); return; }
     } else if (method == "RequestAuthorization") {
         if (!self.permitted(device, true)) { reject(); return; }
     } else {
