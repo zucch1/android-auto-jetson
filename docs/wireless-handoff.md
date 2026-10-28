@@ -11,6 +11,13 @@ separately. TCP endpoint binding is described below.
 The Bluetooth AAW bootstrap and the negotiated AAP Wi-Fi service are distinct.
 They have different schemas, enum values, timing, and security boundaries.
 
+Separately, the helper exposes a scoped HFP Audio Gateway on RFCOMM channel 7
+for Android Auto head-unit presence. Its owned socket performs the actual
+BRSF/CIND/CMER service-level negotiation; RFCOMM acceptance alone is not HFP
+success. Only the same exact approved and bonded peer is authorized. Incomplete
+negotiation closes after three seconds, and HFP and AA sockets have independent
+lifecycles. This endpoint has no call-control or audio/SCO support.
+
 ### Helper-owned RFCOMM AAW bootstrap
 
 `aa-system-helper` owns the AA profile socket, record framing, and bootstrap
@@ -22,20 +29,39 @@ u16 is the big-endian payload length, excluding the header; the second u16 is
 the big-endian message ID. Payloads larger than 4096 bytes are protocol
 violations. Fragmented records are accumulated and coalesced records are split.
 
-The receiver plays the head-unit role:
+The receiver plays the head-unit role. It opens with a version request, then
+follows whichever path the phone's reply selects:
 
 ```text
-receiver  WifiStartRequest=1 {ip, port}             listener already ready
+receiver  WifiVersionRequest=4 {1.0, 5GHZ_ONLY}     authorized, listener ready
+
+modern path:
+phone     WifiVersionResponse=5 {1.0, status=12}
+receiver  WifiSetupInfo=11 {endpoint {ip, port},
+                            access_point {ssid, bssid, password,
+                                          security_mode}}
+receiver  WifiStartRequest=1 {ip, port, DYNAMIC}
+phone     WifiStartResponse=7 {status field 4 = 12}
+phone     WifiConnectStatus=6 {status field 2 = 12}
+
+legacy fallback:
 phone     WifiInfoRequest=2
 receiver  WifiInfoResponse=3 {ssid, password, bssid,
                               security_mode, access_point_type}
-phone     WifiStartResponse=7
-phone     WifiConnectStatus=6
+receiver  WifiStartRequest=1 {ip, port}
+phone     WifiStartResponse=7 {status field 3 = 0}
+phone     WifiConnectStatus=6 {status field 1 = 0}
 ```
 
-The initial request is sent only after the projection listener is ready. The
-credential response is sent only after the complete eligibility chain and AP
-snapshot checks below succeed. Both trailing phone messages are validated.
+The version request is sent only after authorization and only once the
+projection listener is ready. Credentials leave the helper only in the
+modern `11` or legacy `3` record, from the pinned AP snapshot and behind the
+same snapshot fence and eligibility checks described below. Both paths then
+send the endpoint in message `1` and validate the trailing phone `7` and `6`.
+The success value differs by path: the modern layouts use status `12` in
+different field tags, while the legacy layouts use `STATUS_SUCCESS=0`. Any
+other version, status, or path mixing is a phone rejection or wrong-order
+failure.
 Completion requires the trailing-data check, including a nonblocking socket
 peek, and a deadline recheck; receiving one expected record is not enough.
 
@@ -56,7 +82,10 @@ The wire rules are reverse-engineered, not an official Google interoperability
 specification. Pinned head-unit-role references are
 `nisargjhaveri/WirelessAndroidAutoDongle` at
 `ef645221ec28e87361391b9bdcf27e31ff48cb6f` and `manio/aa-proxy-rs` at
-`b753a002b7ff19f94a861a81396eacaccfa58d5e`.
+`b753a002b7ff19f94a861a81396eacaccfa58d5e` for the legacy path, and
+`mrmees/open-android-auto` at `61eab61c5f9968154ff1a80faa8c0a427b208479` for
+the modern path. Both paths are exercised only by host tests against scripted
+peers; that is not proof of interoperability with a real phone.
 
 ### Negotiated AAP WifiProjection/WifiCredentials service
 
@@ -222,8 +251,9 @@ of `WifiConnectStatus` relative to AAP negotiation remain **TARGET BLOCKED**.
 
 ## Non-goals
 
-No phone-hosted hotspot, Wi-Fi Direct/P2P, A2DP, AVRCP, SAP, or HFP is added.
-Performance and soak are task39, the wireless qualification package is task40,
+No phone-hosted hotspot, Wi-Fi Direct/P2P, A2DP, AVRCP, SAP, HSP, or HFP
+call-control/audio routing is added; the scoped HFP AG presence endpoint above
+must not be read as telephony qualification. Performance and soak are task39, the wireless qualification package is task40,
 and packaging is task41. The task38 host recovery matrix does not close those
 scopes, real-phone scenarios, or full wireless
 qualification.
