@@ -8,7 +8,7 @@
 
 The introspection XML is the contract authority; these tables are the
 machine-readable checked schema it must match exactly: interface identity,
-the twelve method signatures, five events, the SemVer metadata and the
+the fourteen method signatures, five events, the SemVer metadata and the
 argument-type allowlist that keeps audio/video and every other high-rate
 payload off the control surface.
 """
@@ -37,6 +37,8 @@ METHODS: Final[dict[str, tuple[str, str]]] = {
     "GetCapabilities": ("", "a{ss}"),
     "SetDisplayViewport": ("uuu", ""),
     "Ping": ("", "t"),
+    "GetPairingComparison": ("t", "a{ss}"),
+    "RespondPairingComparison": ("ttb", ""),
 }
 # name -> full signal argument signature
 SIGNALS: Final[dict[str, str]] = {
