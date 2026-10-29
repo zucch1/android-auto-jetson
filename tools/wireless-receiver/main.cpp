@@ -23,6 +23,7 @@ constexpr const char* usage =
     "  --helper-bus-address ADDRESS  explicit alternate helper bus (default: system bus)\n"
     "  --diagnostics        emit redacted diagnostic JSON to stdout\n"
     "  --duration-ms N      bounded run (1..86400000 ms; omitted: until signal)\n"
+    "  --ap-channel N       AP channel; must equal ap.conf (36, 40, 44 or 48; default 36)\n"
     "  --help               show this help, exit 0\n"
     "  Env: DBUS_SESSION_BUS_ADDRESS selects the session control bus.\n"
     "       HU_KEY_PATH must name an owner-only certificate/private-key PEM bundle.\n"
@@ -38,6 +39,7 @@ struct Options final {
     std::string input_socket{ipc::production_input_socket_path().value};
     std::string helper_address;
     std::int64_t duration_ms{};
+    std::uint32_t ap_channel{36};
     bool diagnostics{};
     bool pairing_only{};
 };
@@ -55,7 +57,13 @@ std::optional<Options> parse_options(int argc, char** argv) {
         else if (arg == "--video-socket") options.video_socket = value;
         else if (arg == "--input-socket") options.input_socket = value;
         else if (arg == "--helper-bus-address") options.helper_address = value;
-        else if (arg == "--phone-id" || arg == "--duration-ms") {
+        else if (arg == "--ap-channel") {
+            std::uint32_t number{};
+            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (error != std::errc{} || end != value.data() + value.size() || !helper::ap_channel_allowed(number))
+                return std::nullopt;
+            options.ap_channel = number;
+        } else if (arg == "--phone-id" || arg == "--duration-ms") {
             std::uint64_t number{};
             const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
             if (error != std::errc{} || end != value.data() + value.size() || number == 0)
@@ -156,7 +164,9 @@ int main(int argc, char** argv) {
     Media media{router.value()};
     // Receiver precedes ControlService so its confirmation observer is valid
     // throughout bus dispatch and the bus's final owner teardown.
-    aa::app::WirelessReceiver receiver{{store, clock, diagnostics}, *helper.value(), media.config()};
+    auto link_config = media.config();
+    link_config.ap_channel = options->ap_channel;
+    aa::app::WirelessReceiver receiver{{store, clock, diagnostics}, *helper.value(), std::move(link_config)};
     media.send = [&receiver](aa::protocol::ChannelRole role, std::vector<std::byte> payload) {
         auto* session = receiver.session();
         return session ? session->send_channel_payload(role, std::move(payload))

@@ -124,7 +124,8 @@ core::Result<void> WirelessLink::on_message(const protocol::MessageView& message
     auto request = protocol::decode_wifi_credentials_request(message);
     if (!request) return request.error();
     auto payload = protocol::encode(protocol::WifiCredentialsResponse{
-        protocol::WifiSecurityMode::wpa2_personal, {36}, protocol::WifiAccessPointType::dynamic});
+        protocol::WifiSecurityMode::wpa2_personal, {static_cast<std::int32_t>(config_.ap_channel)},
+        protocol::WifiAccessPointType::dynamic});
     if (!payload) return payload.error();
     return session_->send_channel_payload(protocol::ChannelRole::wifi_projection, std::move(payload).value());
 }

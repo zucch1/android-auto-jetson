@@ -94,7 +94,7 @@
                 if (!start(epoch)) {
                     (void)stop();
                     publish(State::unavailable);
-                    std::cerr << "system-helper: AP startup failed; check jurisdiction, channel36, NM and isolation\n";
+                    std::cerr << "system-helper: AP startup failed; check jurisdiction, ap.conf channel, NM and isolation\n";
                 }
                 continue;
             }

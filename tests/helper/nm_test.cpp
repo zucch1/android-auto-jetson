@@ -98,6 +98,7 @@ class Boundary final {
 public:
     std::atomic<bool> table{}, country{true}, enabled{true}, wrong_channel{}, block_remove{}, fail_install{}, foreign_table{}, quarantined{}, fail_listing{};
     std::atomic<int> installations{}, removals{}, radios{}, calls{};
+    std::atomic<unsigned> channel{36};
     std::mutex mutex;
     std::string rules;
     Boundary(const std::string& path) {
@@ -121,10 +122,12 @@ public:
                 if (request == "/usr/sbin/iw\ndev\nwlan-test\ninfo\n\n") {
                     ++radios;
                     reply = "0Interface wlan-test\n\twiphy 0\n\ttype AP\n\tchannel " +
-                        std::string{wrong_channel ? "44 (5220 MHz)" : "36 (5180 MHz)"} + ", width: 20 MHz\n";
+                        std::string{(channel == 36) == static_cast<bool>(wrong_channel) ? "44 (5220 MHz)" : "36 (5180 MHz)"} +
+                        ", width: 20 MHz\n";
                 } else if (request == "/usr/sbin/iw\ndev\n\n") reply = "0phy#0\n\tInterface wlan-test\n";
                 else if (request == "/usr/sbin/iw\nreg\nget\n\n") reply = country ? "0global\ncountry US: DFS-FCC\n" : "0global\ncountry 00: DFS-UNSET\n";
-                else if (request == "/usr/sbin/iw\nphy\nphy0\ninfo\n\n") reply = enabled ? "0 * 5180.0 MHz [36] (23.0 dBm)\n" : "0 * 5180.0 MHz [36] (disabled)\n";
+                else if (request == "/usr/sbin/iw\nphy\nphy0\ninfo\n\n") reply = enabled ? "0 * 5180.0 MHz [36] (23.0 dBm)\n * 5220.0 MHz [44] (23.0 dBm)\n" :
+                                                                                "0 * 5180.0 MHz [36] (disabled)\n * 5220.0 MHz [44] (disabled)\n";
                 else if (request == "/usr/sbin/nft\nlist\ntables\ninet\n\n") {
                     if (!fail_listing) reply = table ? "0table inet aa_receiver_ap\n" : "0";
                 } else if (request == "/usr/sbin/nft\nlist\ntable\ninet\naa_receiver_ap\n\n") {
@@ -174,6 +177,7 @@ public:
     std::atomic<bool> bad_mac{}, replaced{}, wrong_mode{}, changed_mac{}, changed_ip{};
     std::atomic<int> release_owner_at_address{}, replace_device_at_address{}, change_channel_at_address{}, address_reads{}, delay_address_ms{};
     std::atomic<int> deactivate_delay_ms{}, client_stop_delay_ms{};
+    std::atomic<unsigned> expected_channel{36};
     std::atomic<bool> owner_released{}, device_remapped{};
     NetworkManager(const std::string& address, Boundary& commands) : boundary(commands) {
         std::promise<bool> ready;
@@ -306,7 +310,7 @@ private:
             self.valid = self.valid && wireless && security && ipv4 &&
                 g_variant_lookup(wireless, "mode", "&s", &mode) && std::string{mode} == "ap" &&
                 g_variant_lookup(wireless, "band", "&s", &band) && std::string{band} == "a" &&
-                g_variant_lookup(wireless, "channel", "u", &channel) && channel == 36 &&
+                g_variant_lookup(wireless, "channel", "u", &channel) && channel == self.expected_channel &&
                 g_variant_lookup(security, "key-mgmt", "&s", &key) && std::string{key} == "wpa-psk" &&
                 g_variant_lookup(security, "psk", "&s", &psk) && std::string{psk}.size() == 64 &&
                 g_variant_lookup(ipv4, "method", "&s", &ipv4_method) && std::string{ipv4_method} == "shared";
@@ -481,6 +485,20 @@ TEST_F(NmDaemon, SnapshotRejectsMalformedMacModeAndDeviceChanges) {
     nm->bad_mac = true; EXPECT_FALSE(backend.ap_snapshot()); nm->bad_mac = false;
     nm->wrong_mode = true; EXPECT_FALSE(backend.ap_snapshot()); nm->wrong_mode = false;
     nm->replaced = true; EXPECT_FALSE(backend.ap_snapshot()); nm->replaced = false;
+    boundary->wrong_channel = true; EXPECT_FALSE(backend.ap_snapshot());
+}
+TEST_F(NmDaemon, ConfiguredChannelBuildsAndVerifiesAp) {
+    // Given an operator policy for channel 44 and a radio that honours it.
+    boundary->channel = 44; nm->expected_channel = 44;
+    Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid(), 44}, address,
+        private_commands((directory / "commands").string())};
+    // When the receiver requests another channel, then the helper refuses it.
+    EXPECT_FALSE(backend.apply(Action::acquire_ap, 36));
+    // When it requests the configured channel, then NM builds and iw verifies that channel.
+    ASSERT_TRUE(backend.apply(Action::acquire_ap, 44));
+    ASSERT_TRUE(eventually([&] { return backend.apply(Action::ap_status, 0).value() == State::active; }));
+    EXPECT_TRUE(nm->valid); ASSERT_TRUE(backend.ap_snapshot());
+    // When the driver moves the AP off the configured channel, then no snapshot is released.
     boundary->wrong_channel = true; EXPECT_FALSE(backend.ap_snapshot());
 }
 TEST_F(NmDaemon, OwnerReleaseDuringFinalEndpointReadCannotPublishOldUniqueReply) {
@@ -802,8 +820,14 @@ TEST_F(NmDaemon, StrictPolicyAndCredentialFilesystem) {
     EXPECT_FALSE(load_policy(path, 0));
     save(directory / "ap.conf", "v1 wlan-test US not-confirmed 5277\n"); EXPECT_FALSE(load_policy(path, ::getuid()));
     save(directory / "ap.conf", "v1 wlan-test US jurisdiction-confirmed 5277 extra\n"); EXPECT_FALSE(load_policy(path, ::getuid()));
+    for (const char* channel : {"52", "149", "0", "44x", "44 extra"}) {
+        save(directory / "ap.conf", std::string{"v1 wlan-test US jurisdiction-confirmed 5277 "} + channel + "\n");
+        EXPECT_FALSE(load_policy(path, ::getuid())) << channel;
+    }
+    save(directory / "ap.conf", "v1 wlan-test US jurisdiction-confirmed 5277 44\n");
+    const auto configured = load_policy(path, ::getuid()); ASSERT_TRUE(configured); EXPECT_EQ(configured.value().channel, 44U);
     save(directory / "ap.conf", "v1 wlan-test US jurisdiction-confirmed 5277\n");
-    const auto policy = load_policy(path, ::getuid()); ASSERT_TRUE(policy);
+    const auto policy = load_policy(path, ::getuid()); ASSERT_TRUE(policy); EXPECT_EQ(policy.value().channel, 36U);
     const auto first = credentials(policy.value(), false); ASSERT_TRUE(first);
     const auto same = credentials(policy.value(), false); ASSERT_TRUE(same); EXPECT_EQ(first.value().psk, same.value().psk);
     const auto next = credentials(policy.value(), true); ASSERT_TRUE(next); EXPECT_NE(next.value().psk, first.value().psk);

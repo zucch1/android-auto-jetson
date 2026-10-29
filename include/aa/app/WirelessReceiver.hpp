@@ -10,7 +10,7 @@ namespace aa::app {
 class WirelessReceiver final {
 public:
     WirelessReceiver(WiredSessionDeps deps, helper::BusClient& helper, WirelessLink::Config config)
-        : helper_(helper), link_(deps, std::move(config)),
+        : helper_(helper), ap_channel_(config.ap_channel), link_(deps, std::move(config)),
           eligibility_(deps.trust, handoff_operations(helper),
               {[this](const helper::ApSnapshot& snapshot) { return link_.listen(snapshot); },
                [this] { link_.close_admission(); }}),
@@ -28,7 +28,7 @@ public:
         const auto state = control.state();
         if (!state.consumer.value || state.consumer.value != source.generation || !source.confirmation)
             return Error{ErrorCode::ipc_consumer_rejected};
-        return helper_.acquire_ap(source);
+        return helper_.acquire_ap(source, ap_channel_);
     }
     core::Result<void> begin(ipc::ControlService& control, helper::Source source) {
         const auto state = control.state();
@@ -64,6 +64,7 @@ public:
     }
 private:
     helper::BusClient& helper_;
+    std::uint32_t ap_channel_;
     WirelessLink link_;
     HandoffEligibilityCoordinator eligibility_;
     WirelessConfirmation confirmation_;

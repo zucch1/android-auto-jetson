@@ -55,8 +55,8 @@ core::Result<Policy> load_policy(const std::string& path, std::uint32_t owner) {
     auto text = read_file(dir.value, "ap.conf", owner);
     if (!text) return text.error();
     std::istringstream fields{text.value()};
-    std::string version, interface, country, confirmed, port, extra;
-    if (!(fields >> version >> interface >> country >> confirmed >> port) || fields >> extra ||
+    std::string version, interface, country, confirmed, port, channel, extra;
+    if (!(fields >> version >> interface >> country >> confirmed >> port) || (fields >> channel && fields >> extra) ||
         version != "v1" || confirmed != "jurisdiction-confirmed" || country.size() != 2 ||
         country.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ") != std::string::npos ||
         country == "00" || interface.empty() || interface.size() > 15 ||
@@ -66,8 +66,14 @@ core::Result<Policy> load_policy(const std::string& path, std::uint32_t owner) {
     const auto number = std::from_chars(port.data(), port.data() + port.size(), parsed);
     if (number.ec != std::errc{} || number.ptr != port.data() + port.size() || parsed < 1024 || parsed > 65535)
         return Error{ErrorCode::config_invalid};
+    unsigned ap_channel = 36;
+    if (!channel.empty()) {
+        const auto value = std::from_chars(channel.data(), channel.data() + channel.size(), ap_channel);
+        if (value.ec != std::errc{} || value.ptr != channel.data() + channel.size() || !ap_channel_allowed(ap_channel))
+            return Error{ErrorCode::config_invalid};
+    }
     return Policy{interface, country, static_cast<std::uint16_t>(parsed),
-                  owner ? path + "/state" : "/var/lib/aa-system-helper", owner};
+                  owner ? path + "/state" : "/var/lib/aa-system-helper", owner, ap_channel};
 }
 core::Result<Credentials> credentials(const Policy& policy, bool rotate) {
     Fd dir{directory(policy.state_directory, policy.owner)};

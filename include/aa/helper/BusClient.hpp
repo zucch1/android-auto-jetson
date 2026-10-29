@@ -23,7 +23,7 @@ public:
     core::Result<Response> call(const Request&, core::Milliseconds, core::CancellationToken) override;
     core::Result<State> status(Action action);
     core::Result<State> reconnect(const trust::TransportIdentity& identity);
-    core::Result<State> acquire_ap(Source source);
+    core::Result<State> acquire_ap(Source source, std::uint32_t channel = 36);
     core::Result<ObservedPeer> poll_bootstrap(Source, HandoffFailure&);
     core::Result<void> authorize_bootstrap(Source, std::uint64_t handle, bool allow, bool listener_ready);
     core::Result<ApSnapshot> get_ap_credentials(Source, std::uint64_t handle);

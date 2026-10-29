@@ -37,7 +37,7 @@ core::Result<std::uint64_t> SystemHelper::issue(const std::string& sender, Sourc
         return Error{ErrorCode::helper_rejected};
     if (action == Action::reconnect) return Error{ErrorCode::helper_rejected};
     if (!privileged(action) || !source.generation || !source.confirmation ||
-        channel != (action == Action::acquire_ap ? 36U : 0U) ||
+        (action == Action::acquire_ap ? !ap_channel_allowed(channel) : channel != 0U) ||
         grants_.size() >= kMaxPending || history_.size() >= kMaxHistory) {
         return Error{ErrorCode::helper_rejected};
     }
@@ -62,7 +62,7 @@ core::Result<State> SystemHelper::execute(const std::string& sender, Invocation 
     expire(now + (std::chrono::steady_clock::now() - began));
     if (action < Action::acquire_ap || action > Action::close_pairing)
         return Error{ErrorCode::helper_rejected};
-    if (channel != (action == Action::acquire_ap ? 36U : 0U))
+    if (action == Action::acquire_ap ? !ap_channel_allowed(channel) : channel != 0U)
         return Error{ErrorCode::helper_rejected};
     std::optional<Time> grant_expiry;
     std::optional<Source> grant_source;

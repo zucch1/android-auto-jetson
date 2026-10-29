@@ -13,6 +13,7 @@ struct Policy final {
     std::uint16_t port{};
     std::string state_directory;
     std::uint32_t owner{};
+    std::uint32_t channel{36};
 };
 struct Credentials final { std::string ssid, psk; ~Credentials() { wipe(psk); } };
 core::Result<Policy> load_policy(const std::string& directory, std::uint32_t owner);

@@ -178,7 +178,7 @@ core::Result<State> Backend::apply(Action action, std::uint32_t channel) {
     const std::lock_guard lock{impl_->mutex};
     switch (action) {
     case Action::acquire_ap:
-        if (channel != 36 || impl_->revoke_pending) return Error{ErrorCode::helper_rejected};
+        if (channel != impl_->policy.channel || impl_->revoke_pending) return Error{ErrorCode::helper_rejected};
         if (!impl_->wanted) {
             impl_->wanted = true; ++impl_->generation; impl_->state = State::inactive;
             impl_->revoke_done = false; impl_->rotated = false; impl_->changed.notify_all();

@@ -17,8 +17,8 @@ namespace aa::config {
 // Fail-closed rules (wireless startup, plan scope):
 //  - the wireless jurisdiction must be explicitly confirmed or overridden at
 //    install time; an unconfirmed jurisdiction never starts the AP;
-//  - the fixed AP channel is 36 (planned 5 GHz design) and is validated, not
-//    taken from the phone;
+//  - the AP channel is an operator choice from the non-DFS UNII-1 set
+//    (36/40/44/48, default 36), validated and never taken from the phone;
 //  - microphone and sensor capabilities stay disabled until their qualification
 //    exists (tasks 25/26); they cannot be enabled by a phone.
 struct Wireless final {

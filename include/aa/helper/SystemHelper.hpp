@@ -14,6 +14,12 @@ enum class Action : std::uint32_t {
     modem_status, register_profile, unregister_profile, reconnect, close_pairing
 };
 enum class State : std::uint32_t { inactive, active, unavailable };
+// AP channels the helper may operate: non-DFS UNII-1. The exact channel is the
+// operator's ap.conf choice; the receiver must request that same channel.
+constexpr bool ap_channel_allowed(std::uint32_t channel) {
+    return channel == 36 || channel == 40 || channel == 44 || channel == 48;
+}
+constexpr std::uint32_t ap_frequency_mhz(std::uint32_t channel) { return 5000 + 5 * channel; }
 struct Invocation final {
     Action action{};
     std::uint32_t channel{};

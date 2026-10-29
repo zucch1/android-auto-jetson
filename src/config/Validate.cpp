@@ -13,7 +13,8 @@ core::Result<Config> validate(Config candidate) {
     if (!candidate.wireless.jurisdiction_confirmed) {
         return Error{ErrorCode::config_jurisdiction_unconfirmed};
     }
-    if (candidate.wireless.channel != 36) {
+    const auto channel = candidate.wireless.channel;
+    if (channel != 36 && channel != 40 && channel != 44 && channel != 48) {
         return Error{ErrorCode::config_invalid};
     }
     return candidate;

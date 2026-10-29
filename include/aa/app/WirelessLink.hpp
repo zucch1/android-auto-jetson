@@ -12,6 +12,7 @@ public:
         std::vector<protocol::ServiceDescriptor> services;
         std::map<protocol::ChannelRole, protocol::MessageSink*> sinks;
         protocol::ServiceKey wifi_service{73};
+        std::uint32_t ap_channel{36};
     };
     WirelessLink(WiredSessionDeps, Config);
     ~WirelessLink() override;

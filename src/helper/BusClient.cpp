@@ -71,18 +71,18 @@ core::Result<void> BusClient::confirmed(core::ConsumerId generation, core::Pairi
     impl_->active_source = Source{generation.value, source.value};
     return {};
 }
-core::Result<State> BusClient::acquire_ap(Source source) {
+core::Result<State> BusClient::acquire_ap(Source source, std::uint32_t channel) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
-    if (!source.generation || !source.confirmation) return Error{ErrorCode::helper_rejected};
+    if (!source.generation || !source.confirmation || !ap_channel_allowed(channel)) return Error{ErrorCode::helper_rejected};
     std::unique_lock lock{impl_->mutex, std::defer_lock};
     if (!lock.try_lock_until(until) || Clock::now() >= until) return Error{ErrorCode::timeout};
     MessageWriter writer;
     writer.put_u64(source.generation).put_u64(source.confirmation)
-        .put_u32(static_cast<std::uint32_t>(Action::acquire_ap)).put_u32(36);
+        .put_u32(static_cast<std::uint32_t>(Action::acquire_ap)).put_u32(channel);
     const auto grant = impl_->rpc("Issue", "ttuu", writer, until);
     if (!grant) return grant.error();
     if (!grant.value()) return Error{ErrorCode::helper_protocol_mismatch};
-    const auto result = impl_->execute({Action::acquire_ap, 36, grant.value()}, until);
+    const auto result = impl_->execute({Action::acquire_ap, channel, grant.value()}, until);
     if (!result || result.value() == State::unavailable) {
         (void)impl_->invalidate_locked(source, until);
         return result ? Error{ErrorCode::helper_unavailable} : result.error();
@@ -231,7 +231,7 @@ core::Result<Response> BusClient::call(const Request& request, core::Millisecond
             impl_->pending.erase(found);
         }
     }
-    if (action == Action::acquire_ap && request.channel != 36) return Error{ErrorCode::helper_rejected};
+    if (action == Action::acquire_ap && !ap_channel_allowed(request.channel)) return Error{ErrorCode::helper_rejected};
     const auto result = impl_->execute({poll_ap ? Action::ap_status : action,
         action == Action::acquire_ap && !poll_ap ? request.channel : 0U, grant}, until);
     if (cancellation.stop_requested()) return Error{ErrorCode::cancelled};
