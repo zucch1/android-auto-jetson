@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <node name="/org/custom/AndroidAutoSystemHelper">
   <interface name="org.custom.AndroidAutoSystemHelper1">
-    <annotation name="org.custom.Contract.SemVer" value="1.2.0"/>
+    <annotation name="org.custom.Contract.SemVer" value="1.3.0"/>
     <method name="PollBootstrapV1">
       <arg name="consumer_generation" type="t" direction="in"/>
       <arg name="source" type="t" direction="in"/>
@@ -77,6 +77,23 @@
       <arg name="grant" type="t" direction="in"/>
       <arg name="error" type="u" direction="out"/>
       <arg name="state" type="t" direction="out"/>
+    </method>
+    <method name="GetPairingComparisonV1">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="request_source" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="challenge_id" type="t" direction="out"/>
+      <arg name="comparison" type="u" direction="out"/>
+      <arg name="bond_address" type="s" direction="out"/>
+      <arg name="adapter_identity" type="s" direction="out"/>
+    </method>
+    <method name="RespondPairingComparisonV1">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="request_source" type="t" direction="in"/>
+      <arg name="challenge_id" type="t" direction="in"/>
+      <arg name="accept" type="u" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
     </method>
     <method name="Invalidate">
       <arg name="consumer_generation" type="t" direction="in"/>

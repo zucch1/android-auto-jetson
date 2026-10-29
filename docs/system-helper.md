@@ -180,7 +180,7 @@ managed-peer knowledge. Persistent BlueZ bonds of a forgotten phone may then sur
 `ForgetPhone`. Operator recovery/crash reconciliation must be defined before
 production qualification; rejecting unknown managed identities is not bond removal.
 
-## System bus API 1.1.0
+## System bus API 1.3.0
 
 Name `org.custom.AndroidAutoSystemHelper`, path
 `/org/custom/AndroidAutoSystemHelper`, interface
@@ -197,6 +197,8 @@ the helper does not expose Introspectable). Methods:
 | BindPeerV1 | `ttt` generation, request source, observed handle | `ut` error, zero | Snapshot binding before confirmation, no radio exposure |
 | ReconnectPeerV1 | `t` observed handle | `ut` error, state | Store-owner exact lookup followed by helper actual-bond check |
 | RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only previously managed exact identity; re-resolve BlueZ object, never accept a supplied path |
+| GetPairingComparisonV1 | `tt` generation, request source | `utuss` error, challenge ID, comparison, address, adapter | Authenticated consumer-only retrieval during explicit enrollment |
+| RespondPairingComparisonV1 | `tttu` generation, request source, challenge ID, accept | `ut` error, reserved zero | Explicit human decision after retrieval; one use, same enrollment/peer/deadline |
 
 Errors: 0 success, 1000 unavailable, 1001 rejected, 1002 protocol mismatch.
 Nonzero errors carry value zero. States: 0 inactive, 1 active, 2 unavailable.
