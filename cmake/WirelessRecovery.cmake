@@ -26,4 +26,8 @@ if(NOT CMAKE_CROSSCOMPILING)
         "${CMAKE_SOURCE_DIR}/tests/wireless_recovery/test_recovery_qa_gates.py"
         "${CMAKE_SOURCE_DIR}/tools/wireless-qa/wireless_recovery_qa.py")
     set_tests_properties(wireless_recovery_qa_gates PROPERTIES TIMEOUT 30)
+    add_test(NAME wireless_recovery_full_scope_qa_gates COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/wireless_recovery/test_full_scope_qa_gates.py"
+        "${CMAKE_SOURCE_DIR}/tools/wireless-qa/wireless_recovery_qa.py")
+    set_tests_properties(wireless_recovery_full_scope_qa_gates PROPERTIES TIMEOUT 30)
 endif()
