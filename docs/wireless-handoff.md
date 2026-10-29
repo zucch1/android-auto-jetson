@@ -92,7 +92,8 @@ peers; that is not proof of interoperability with a real phone.
 The second surface runs inside the established encrypted AAP session. It is
 advertised only on the wireless path through the existing dynamic negotiated
 service ID, never through a fixed channel ordinal. Its metadata-only response
-uses that service's own `WPA2_PERSONAL=5` enum value, channel 36, and `DYNAMIC`.
+uses that service's own `WPA2_PERSONAL=5` enum value, the configured AP channel
+(`--ap-channel`, default 36), and `DYNAMIC`.
 It never carries the SSID or password. Between these two surfaces, only the
 RFCOMM bootstrap response carries those secrets; neither service may be used to
 infer the other's wire enum.

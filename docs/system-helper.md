@@ -12,7 +12,7 @@ or network profiles. Bluetooth identity data is used only by the narrow
 versioned observed-peer API below. USB policy and ModemManager exclusion remain
 status seams, not policy writers. See [task36-bluez.md](task36-bluez.md) for
 the exact source evidence, authorization contract and target blockers.
-See [networkmanager-ap.md](networkmanager-ap.md) for fixed channel36, explicitly
+See [networkmanager-ap.md](networkmanager-ap.md) for the configured UNII-1 AP channel, explicitly
 confirmed jurisdiction, root-only credentials and isolation/shutdown policy.
 
 The receiver executable is the trust anchor, **not cryptographic attestation of
@@ -210,7 +210,7 @@ Actions (wire numbers are append-only):
 
 | Number | Action | Authorization argument |
 |---|---|---|
-| 1 | AP acquire | channel exactly 36; one-use AP grant |
+| 1 | AP acquire | channel 36/40/44/48 and equal to ap.conf (default 36); one-use AP grant |
 | 2 | Open pairing (fixed backend 60-second-window contract) | channel 0; distinct one-use pairing grant and captured peer binding |
 | 3 | AP release | channel 0, grant 0, same receiver binding |
 | 4 | AP status | channel 0, grant 0, same binding |
