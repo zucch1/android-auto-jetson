@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "confirmation_fixture.hpp"
+#include <aa/app/WirelessConfirmation.hpp>
 
 namespace {
 struct ComparisonClock final {
@@ -99,6 +100,26 @@ TEST_F(ComparisonControl, ExpiryDuringFinalConsumerReconciliationCannotApproveCh
     EXPECT_EQ(count_closed(), 1U);
     EXPECT_EQ(control.state().consumer.value, 1U);
     EXPECT_EQ(bridge.teardowns, 0);
+}
+TEST_F(ComparisonControl, ProductionWirelessConfirmationForwardsComparison) {
+    // Given: the production receiver adapter and control service share the same fixture consumer.
+    app::WirelessConfirmation adapter{bridge, [] { return false; }, [](core::ConsumerId) {}};
+    ipc::ControlService production{{1000}, {credentials, events, ids, phones, &adapter}};
+    ASSERT_TRUE(production.register_consumer(caller, name));
+    const auto request = production.request_add_phone(caller);
+    ASSERT_TRUE(request);
+    ASSERT_TRUE(production.confirm_phone_pairing(caller, request.value()));
+
+    // When: the consumer retrieves and accepts through the production adapter.
+    const auto challenge = production.pairing_comparison(caller, request.value());
+    ASSERT_TRUE(challenge);
+    const auto responded = production.respond_pairing_comparison(caller, request.value(), {79, true});
+
+    // Then: both calls reach the helper bridge exactly once.
+    EXPECT_TRUE(responded);
+    EXPECT_EQ(challenge.value().at("comparison"), "000042");
+    EXPECT_EQ(bridge.responses, 1);
+    EXPECT_TRUE(bridge.response.accept);
 }
 TEST_F(ComparisonControl, ExplicitHumanResponseIsBoundAndConsumedOnce) {
     const auto request = enroll();

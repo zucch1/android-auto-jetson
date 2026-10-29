@@ -20,11 +20,24 @@ public:
         return target_.confirmed(generation, source);
     }
     core::Result<std::optional<helper::PeerIdentity>> prepare(core::ConsumerId generation,
-                                                           core::PairingRequestId source) override {
+                                                            core::PairingRequestId source) override {
         flush();
         if (deferred_) return Error{ErrorCode::helper_rejected};
         return target_.prepare(generation, source);
     }
+    core::Result<helper::PairingComparison> comparison(core::ConsumerId generation,
+                                                        core::PairingRequestId source) override {
+        flush();
+        if (deferred_) return Error{ErrorCode::helper_rejected};
+        return target_.comparison(generation, source);
+    }
+    core::Result<void> respond_comparison(core::ConsumerId generation, core::PairingRequestId source,
+                                          helper::ComparisonResponse response) override {
+        flush();
+        if (deferred_) return Error{ErrorCode::helper_rejected};
+        return target_.respond_comparison(generation, source, response);
+    }
+
     void cancel(core::ConsumerId generation, core::PairingRequestId source) override {
         target_.cancel(generation, source);
     }
