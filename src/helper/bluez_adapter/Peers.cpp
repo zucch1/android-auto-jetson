@@ -135,8 +135,7 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
         std::find(impl_->managed.begin(), impl_->managed.end(), identity) == impl_->managed.end()) return Error{ErrorCode::helper_rejected};
     if (!impl_->current_owner()) return Error{ErrorCode::helper_unavailable};
     if ((impl_->allowed && impl_->allowed->device.identity == identity) ||
-        (impl_->connected && impl_->connected->device.identity == identity) ||
-        (impl_->hfp_peer && impl_->hfp_peer->device.identity == identity)) impl_->close_window();
+        (impl_->connected && impl_->connected->device.identity == identity)) impl_->close_window();
     std::erase_if(impl_->observations, [&](const auto& item) { return item.second.device.identity == identity; });
     std::vector<Impl::Device> devices;
     if (!impl_->inventory(devices)) return Error{ErrorCode::helper_unavailable};

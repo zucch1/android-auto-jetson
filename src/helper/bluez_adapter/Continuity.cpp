@@ -13,7 +13,6 @@ void BluezBackend::Impl::lost_path(const std::string& path) {
     std::erase_if(observations, [&](const auto& item) { return matches(item.second); });
     if (allowed && matches(*allowed)) { reject_comparison(); allowed.reset(); }
     if (connected && matches(*connected)) retire(handoff_handle, HandoffFailure::eligibility);
-    if (hfp_peer && matches(*hfp_peer)) close_hfp();
 }
 void BluezBackend::Impl::watch_continuity() {
     removal_subscription = g_dbus_connection_signal_subscribe(bus, nullptr,

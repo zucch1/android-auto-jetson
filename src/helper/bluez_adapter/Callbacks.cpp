@@ -21,7 +21,6 @@ void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gch
     if (!self.current_owner() || self.owner != sender) { reject(); return; }
     const std::string_view method{member};
     const bool profile = std::string_view{interface} == "org.bluez.Profile1";
-    if (profile && std::string_view{path} == kHfpPath) { self.hfp_method(args, invocation); return; }
     if ((profile && std::string_view{path} != kProfilePath) ||
         (!profile && std::string_view{path} != kAgentPath)) { reject(); return; }
     if (profile && method == "Release") {
@@ -73,8 +72,7 @@ void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gch
     }
     if (method == "AuthorizeService") {
         const char* uuid{}; g_variant_get_child(args, 1, "&s", &uuid);
-        const bool service = std::string_view{uuid} == kAaUuid ||
-            (std::string_view{uuid} == kHfpUuid && self.hfp_registered);
+        const bool service = std::string_view{uuid} == kAaUuid || std::string_view{uuid} == kHfpUuid;
         if (!service || !self.permitted(device, false)) { reject(); return; }
     } else if (method == "RequestAuthorization") {
         if (!self.permitted(device, true)) { reject(); return; }
