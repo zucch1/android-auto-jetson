@@ -18,15 +18,14 @@ OAA is pinned by `third_party/provenance/inventory.json` to commit
 `4de17a00-52cb-11e6-bdf4-0800200c9a66`, RFCOMM server channel8 and the subsequent
 Wi-Fi protobuf handshake. This is reverse-engineered research, **not an official
 Google interoperability guarantee**. The backend registers that AA UUID/server
-on channel 8 and a separately scoped HFP AG UUID
-`0000111f-0000-1000-8000-00805f9b34fb` on channel 7, both with authentication
-and authorization REQUIRED. Channel 7 follows the observed A26 HFP attempt; it
-is not inferred from BlueZ's default AG channel. The HFP endpoint performs only
-the BRSF/CIND/CMER service-level negotiation required for presence, with a
-three-second incomplete-negotiation deadline. It provides no call control,
-SCO/audio routing, A2DP, AVRCP, SAP, SPP, HSP, or global plugin changes. Real
-phone HFP and subsequent AA interoperability remain **BLOCKED** pending target
-qualification; host socket tests are not phone proof.
+on channel 8 with authentication and authorization REQUIRED. On the Jetson,
+WirePlumber already owns the HFP AG UUID
+`0000111f-0000-1000-8000-00805f9b34fb` on channel 7. The helper does not register
+a competing HFP provider; it authorizes that existing service only for the exact
+approved and bonded peer. No call control, SCO/audio routing, A2DP, AVRCP, SAP,
+SPP, HSP, or global plugin changes are added. Real phone HFP and subsequent AA
+interoperability remain **BLOCKED** pending target qualification; host tests are
+not phone proof.
 
 API references: [BlueZ Profile API](https://bluez.readthedocs.io/en/latest/profile-api/),
 [Agent API](https://bluez.readthedocs.io/en/latest/agent-api/), and GLib GIO
@@ -78,9 +77,9 @@ human-mediated during explicit enrollment only, never automatically approved.
    roll back the already committed application approval or delete a bond.
 5. Every effect-bearing Agent1/Profile1 callback authenticates the CURRENT BlueZ
    owner, exact device identity, and deadline; service authorization accepts only
-   the AA or scoped HFP AG UUID and an actual paired bond for that same peer. HFP
-   and AA use distinct profile object paths and independently owned sockets, so
-   one profile's disconnect does not tear down the other. Unknown Just Works is rejected outside
+   the AA or scoped HFP AG UUID and an actual paired bond for that same peer.
+   Authorizing WirePlumber's HFP service does not transfer or own its socket; the
+   helper's AA profile callback and socket behavior remain unchanged. Unknown Just Works is rejected outside
    the explicit window. Approved reconnect still requires a fresh observation,
    exact full store lookup on its owner thread and actual BlueZ Paired=true AND
    Bonded=true. Missing Bonded is rejected, never treated as an implicit bond.
@@ -122,8 +121,6 @@ cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE=/home/zucchi/android-auto-jetson
 cmake --build build/host-dev --parallel 2
 ctest --test-dir build/host-dev -R 'system_helper|trust_store|dbus_contract|architecture_boundary' --output-on-failure
 python3 -B tests/helper/bluez_runtime.py build/host-dev
-python3 -B tests/helper/bluez_hfp_runtime.py build/host-dev
-build/host-dev/system_helper_hfp_slc
 ```
 
 Composition evidence is under `.omo/evidence/composition/implementation/`. No task closure,
@@ -142,7 +139,7 @@ its persistent bond.
 - Real phone stimulation must supply an unambiguous already observed candidate
   while the helper remains non-discoverable/non-pairable by default. The host
   reference rejects multiple adapters/devices instead of inventing candidate UI.
-- Real BlueZ/phone support for the authenticated scoped HFP AG SLC, AA channel8,
+- Real BlueZ/phone support for the authenticated WirePlumber HFP AG connection, AA channel8,
   default-agent permission and the Device1.Bonded property must be qualified;
   accepting a temporary non-bonded pairing is not an allowed fallback.
 - The helper managed-peer set and receiver pending records are process-lifetime state.
