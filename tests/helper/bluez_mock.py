@@ -40,6 +40,7 @@ class MockBluez:
         self.slow_inventory = False
         self.owner_during_inventory = False
         self.removed: list[str] = []
+        self.cancel_unpaired = 0
         self.properties = {"Pairable": True, "Discoverable": True}
         self.profile: list[str] = []
         self.default_agent = False
@@ -115,7 +116,13 @@ class MockBluez:
                 self.paired = False
             case "UnregisterProfile":
                 self.profile = []
-            case "UnregisterAgent" | "CancelPairing":
+            case "CancelPairing":
+                # BlueZ answers CancelPairing without an in-flight Pair() with MGMT Unpair Device.
+                if self.paired:
+                    self.cancel_unpaired += 1
+                self.paired = False
+                self.bonded = False
+            case "UnregisterAgent":
                 pass
             case _:
                 invocation.return_dbus_error("org.bluez.Error.NotSupported", "fixture method")
@@ -184,7 +191,8 @@ class MockBluez:
                     return "open"
             case "state":
                 return json.dumps({"properties": self.properties, "profile": self.profile,
-                    "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper})
+                    "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper,
+                    "cancel_unpaired": self.cancel_unpaired})
             case "multiple": self.multiple = True
             case "single": self.multiple = False
             case "observe-other": self.observed_device = OTHER

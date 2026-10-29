@@ -147,6 +147,7 @@ def authorization_flow(surface: Surface) -> None:
     surface.cancel(request)
     assert not surface.state()["properties"]["Pairable"]
     assert surface.state()["removed"] == []
+    assert surface.state()["cancel_unpaired"] == 0
     assert command(surface.receiver, "reconnect") == "0"
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     assert command(surface.mock, "AuthorizeService") == "allowed"
