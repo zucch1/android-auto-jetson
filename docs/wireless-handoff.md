@@ -11,12 +11,12 @@ separately. TCP endpoint binding is described below.
 The Bluetooth AAW bootstrap and the negotiated AAP Wi-Fi service are distinct.
 They have different schemas, enum values, timing, and security boundaries.
 
-Separately, the helper exposes a scoped HFP Audio Gateway on RFCOMM channel 7
-for Android Auto head-unit presence. Its owned socket performs the actual
-BRSF/CIND/CMER service-level negotiation; RFCOMM acceptance alone is not HFP
-success. Only the same exact approved and bonded peer is authorized. Incomplete
-negotiation closes after three seconds, and HFP and AA sockets have independent
-lifecycles. This endpoint has no call-control or audio/SCO support.
+Separately, WirePlumber owns the Jetson's HFP Audio Gateway on RFCOMM channel 7
+for Android Auto head-unit presence. The helper does not register a competing
+provider or own its socket; it authorizes that existing service only for the same
+exact approved and bonded peer. RFCOMM acceptance alone is not HFP success: the
+phone and WirePlumber must complete service-level negotiation. No call-control
+or audio/SCO behavior is added by this authorization rule.
 
 ### Helper-owned RFCOMM AAW bootstrap
 
