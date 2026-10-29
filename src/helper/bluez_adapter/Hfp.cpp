@@ -9,8 +9,7 @@ namespace aa::helper {
 bool BluezBackend::Impl::register_profiles() {
     struct Profile { const char* path; const char* uuid; const char* name; guint16 channel; bool& active; };
     // A26 reaches HFP AG on scn 7 before the separate AA bootstrap on scn 8.
-    const Profile profiles[]{{kProfilePath, kAaUuid, "Android Auto", 8, registered},
-        {kHfpPath, kHfpUuid, "Android Auto HFP AG", 7, hfp_registered}};
+    const Profile profiles[]{{kProfilePath, kAaUuid, "Android Auto", 8, registered}};
     std::vector<const Profile*> added;
     const auto unregister = [&](const char* path) {
         auto* reply = call("/org/bluez", "org.bluez.ProfileManager1", "UnregisterProfile", g_variant_new("(o)", path));
@@ -44,14 +43,12 @@ bool BluezBackend::Impl::register_profiles() {
     return true;
 }
 bool BluezBackend::Impl::unregister_profiles() {
-    bool ok = true;
-    for (const auto& entry : {std::pair{kHfpPath, &hfp_registered}, std::pair{kProfilePath, &registered}}) {
-        if (!*entry.second) continue;
-        auto* reply = call("/org/bluez", "org.bluez.ProfileManager1", "UnregisterProfile", g_variant_new("(o)", entry.first));
-        if (!reply) { ok = false; continue; }
-        g_variant_unref(reply); *entry.second = false;
-    }
-    return ok;
+    if (!registered) return true;
+    auto* reply = call("/org/bluez", "org.bluez.ProfileManager1", "UnregisterProfile", g_variant_new("(o)", kProfilePath));
+    if (!reply) return false;
+    g_variant_unref(reply);
+    registered = false;
+    return true;
 }
 int BluezBackend::Impl::socket_fd(GDBusMethodInvocation* invocation) {
     gint index{};
@@ -65,46 +62,5 @@ int BluezBackend::Impl::socket_fd(GDBusMethodInvocation* invocation) {
     struct stat info{};
     if (::fstat(fd, &info) != 0 || !S_ISSOCK(info.st_mode)) { ::close(fd); return -1; }
     return fd;
-}
-void BluezBackend::Impl::close_hfp() {
-    hfp.reset(); hfp_peer.reset(); hfp_deadline = {}; hfp_check = {};
-}
-void BluezBackend::Impl::tick_hfp() {
-    if (!hfp || !hfp_peer) return;
-    const auto captured = hfp;
-    if (now() >= hfp_check) {
-        const auto observed = *hfp_peer;
-        const bool valid = hfp_registered && exact(observed, true);
-        // exact() drains callbacks, which may revoke or replace this connection.
-        if (hfp != captured) return;
-        if (!valid) { close_hfp(); return; }
-        hfp_check = now() + std::chrono::milliseconds(100);
-    }
-    if (!captured->connected() && now() >= hfp_deadline) { close_hfp(); return; }
-    captured->tick();
-    if (captured->state() == HfpSlc::State::closed) close_hfp();
-}
-void BluezBackend::Impl::hfp_method(GVariant* args, GDBusMethodInvocation* invocation) {
-    const std::string_view member{g_dbus_method_invocation_get_method_name(invocation)};
-    const auto reject = [&] { g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.Rejected", "Not authorized"); };
-    if (member == "Release") {
-        close_hfp(); hfp_registered = false;
-        g_dbus_method_invocation_return_value(invocation, nullptr); return;
-    }
-    const char* device{};
-    g_variant_get_child(args, 0, "&o", &device);
-    if (member == "RequestDisconnection") {
-        if (!hfp_peer || hfp_peer->device.path != device) { reject(); return; }
-        close_hfp();
-        g_dbus_method_invocation_return_value(invocation, nullptr); return;
-    }
-    if (member != "NewConnection" || !hfp_registered || !permitted(device, false) || hfp || !hfp_registered) { reject(); return; }
-    const int fd = socket_fd(invocation);
-    if (fd < 0) { reject(); return; }
-    hfp_peer = allowed;
-    hfp_deadline = now() + std::chrono::seconds(3);
-    hfp_check = {};
-    hfp = std::make_shared<HfpSlc>(fd);
-    g_dbus_method_invocation_return_value(invocation, nullptr);
 }
 }
