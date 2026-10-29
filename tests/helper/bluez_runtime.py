@@ -84,7 +84,7 @@ class Surface:
             (directory / filename).chmod(0o600)
         options = self.platform_options(stack, build, directory)
         self.daemon = stack.enter_context(process([str(build / "aa-system-helper"), "--private-bus", self.address, str(directory), *options], self.env))
-        wait(lambda: len(self.state()["profile"]) == 2)
+        wait(lambda: len(self.state()["profile"]) == 1)
         args = [str(binary), self.address] if probe else [str(binary), "receiver", self.address, str(directory / "store"), "bluez"]
         self.receiver = stack.enter_context(process(args, self.env))
         assert line(self.receiver) == "ready"
@@ -114,7 +114,7 @@ class Surface:
 
 def authorization_flow(surface: Surface) -> None:
     state = surface.state()
-    assert state["default_agent"] and len(state["profile"]) == 2
+    assert state["default_agent"] and len(state["profile"]) == 1
     assert not state["properties"]["Pairable"] and not state["properties"]["Discoverable"]
     command(surface.mock, "slow-inventory")
     started = time.monotonic()
@@ -140,6 +140,7 @@ def authorization_flow(surface: Surface) -> None:
     assert command(surface.mock, "AuthorizeService") == "rejected"
     command(surface.mock, "paired")
     assert command(surface.mock, "AuthorizeService audio") == "rejected"
+    assert command(surface.mock, "AuthorizeService hfp") == "allowed"
     assert command(surface.mock, "AuthorizeService") == "allowed"
     assert command(surface.mock, "NewConnection") == "allowed"
     assert command(surface.mock, "fd-eof") == "open"

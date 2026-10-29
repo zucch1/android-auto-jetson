@@ -94,8 +94,7 @@ class MockBluez(ProfileSockets):
                 self.properties[prop] = value
             case "RegisterProfile":
                 path, uuid, options = args.unpack()
-                assert (uuid, path, options["Channel"]) in (
-                    (AA, ROOT + "/aa_profile", 8), (HFP, ROOT + "/hfp_ag_profile", 7))
+                assert (uuid, path, options["Channel"]) == (AA, ROOT + "/aa_profile", 8)
                 assert options["Role"] == "server"
                 assert options["RequireAuthentication"] and options["RequireAuthorization"]
                 assert not options["AutoConnect"]
