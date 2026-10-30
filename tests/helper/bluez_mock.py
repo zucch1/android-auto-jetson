@@ -163,7 +163,9 @@ class MockBluez(ProfileSockets):
             case "AuthorizeService":
                 interface, path = "org.bluez.Agent1", ROOT + "/aa_agent"
                 uuid = HFP if "hfp" in words else AA
-                params = GLib.Variant("(os)", (device, "0000110b-0000-1000-8000-00805f9b34fb" if "audio" in words else uuid))
+                if "audio" in words: uuid = "0000110b-0000-1000-8000-00805f9b34fb"
+                if "ag" in words: uuid = "0000111f-0000-1000-8000-00805f9b34fb"
+                params = GLib.Variant("(os)", (device, uuid))
             case "RequestDisconnection" | "NewConnection":
                 interface = "org.bluez.Profile1"
                 path = ROOT + ("/hfp_ag_profile" if "hfp" in words else "/aa_profile")

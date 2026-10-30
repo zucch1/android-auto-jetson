@@ -11,7 +11,7 @@
 namespace aa::helper {
 inline constexpr auto kAaUuid = "4de17a00-52cb-11e6-bdf4-0800200c9a66";
 inline constexpr auto kProfilePath = "/org/custom/AndroidAutoSystemHelper/aa_profile";
-inline constexpr auto kHfpUuid = "0000111f-0000-1000-8000-00805f9b34fb";
+inline constexpr auto kHfpUuid = "0000111e-0000-1000-8000-00805f9b34fb";
 inline constexpr auto kAgentPath = "/org/custom/AndroidAutoSystemHelper/aa_agent";
 struct BluezBackend::Impl {
     using Clock = std::chrono::steady_clock;

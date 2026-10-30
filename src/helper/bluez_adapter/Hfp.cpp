@@ -8,7 +8,7 @@
 namespace aa::helper {
 bool BluezBackend::Impl::register_profiles() {
     struct Profile { const char* path; const char* uuid; const char* name; guint16 channel; bool& active; };
-    // A26 reaches HFP AG on scn 7 before the separate AA bootstrap on scn 8.
+    // A26 (HFP AG) reaches WirePlumber's Hands-Free unit on scn 7 before the separate AA bootstrap on scn 8.
     const Profile profiles[]{{kProfilePath, kAaUuid, "Android Auto", 8, registered}};
     std::vector<const Profile*> added;
     const auto unregister = [&](const char* path) {

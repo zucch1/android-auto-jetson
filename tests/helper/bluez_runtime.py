@@ -140,6 +140,7 @@ def authorization_flow(surface: Surface) -> None:
     assert command(surface.mock, "AuthorizeService") == "rejected"
     command(surface.mock, "paired")
     assert command(surface.mock, "AuthorizeService audio") == "rejected"
+    assert command(surface.mock, "AuthorizeService ag") == "rejected"
     assert command(surface.mock, "AuthorizeService hfp") == "allowed"
     assert command(surface.mock, "AuthorizeService") == "allowed"
     assert command(surface.mock, "NewConnection") == "allowed"

@@ -11,7 +11,7 @@ separately. TCP endpoint binding is described below.
 The Bluetooth AAW bootstrap and the negotiated AAP Wi-Fi service are distinct.
 They have different schemas, enum values, timing, and security boundaries.
 
-Separately, WirePlumber owns the Jetson's HFP Audio Gateway on RFCOMM channel 7
+Separately, WirePlumber owns the Jetson's HFP Hands-Free unit (`0000111e`) on RFCOMM channel 7
 for Android Auto head-unit presence. The helper does not register a competing
 provider or own its socket; it authorizes that existing service only for the same
 exact approved and bonded peer. RFCOMM acceptance alone is not HFP success: the
@@ -253,7 +253,7 @@ of `WifiConnectStatus` relative to AAP negotiation remain **TARGET BLOCKED**.
 ## Non-goals
 
 No phone-hosted hotspot, Wi-Fi Direct/P2P, A2DP, AVRCP, SAP, HSP, or HFP
-call-control/audio routing is added; the scoped HFP AG presence endpoint above
+call-control/audio routing is added; the scoped HFP Hands-Free unit presence endpoint above
 must not be read as telephony qualification. Performance and soak are task39, the wireless qualification package is task40,
 and packaging is task41. The task38 host recovery matrix does not close those
 scopes, real-phone scenarios, or full wireless

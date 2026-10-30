@@ -10,7 +10,7 @@ from typing import Final
 from gi.repository import Gio, GLib
 
 AA: Final = "4de17a00-52cb-11e6-bdf4-0800200c9a66"
-HFP: Final = "0000111f-0000-1000-8000-00805f9b34fb"
+HFP: Final = "0000111e-0000-1000-8000-00805f9b34fb"
 ROOT: Final = "/org/custom/AndroidAutoSystemHelper"
 ADAPTER: Final = "/org/bluez/hci0"
 DEVICE: Final = ADAPTER + "/dev_02_00_00_00_00_01"
