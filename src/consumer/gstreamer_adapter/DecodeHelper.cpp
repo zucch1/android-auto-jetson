@@ -7,6 +7,7 @@
 #include <aa/protocol/Messages.hpp> // protocol::valid_video_profile (budget profile)
 
 #include "DecodeSessionState.hpp" // GStreamer-free admission + timestamp state
+#include "DecodeArrivalProbe.hpp"
 
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
@@ -22,6 +23,11 @@
 
 namespace aa::consumer {
 namespace {
+
+std::uint64_t steady_ns(DecodeSessionState::Clock::time_point time) noexcept {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        time.time_since_epoch()).count());
+}
 
 void ensure_gstreamer_initialized() {
     static std::once_flag flag;
@@ -168,6 +174,9 @@ struct DecodeHelper::Impl final {
     GstElement* appsrc{nullptr};
     GstElement* appsink{nullptr};
     GstBus* bus{nullptr};
+    GstPad* arrival_pad{nullptr};
+    gulong arrival_probe{};
+    DecodeArrivalObserver arrivals{};
 
     // GStreamer-free session state: timestamp/byte admission plus the
     // bounded-age correlation lifecycle (pending map + awaiting_idr resync).
@@ -180,6 +189,15 @@ struct DecodeHelper::Impl final {
         if (pipeline != nullptr) {
             gst_element_set_state(pipeline, GST_STATE_NULL);
         }
+        // Streaming is stopped before removing the probe or clearing its data.
+        // No observer lock is held across any GStreamer operation.
+        if (arrival_pad != nullptr) {
+            gst_pad_remove_probe(arrival_pad, arrival_probe);
+            gst_object_unref(arrival_pad);
+            arrival_pad = nullptr;
+            arrival_probe = 0;
+        }
+        arrivals.clear();
         if (bus != nullptr) {
             gst_object_unref(bus);
             bus = nullptr;
@@ -334,16 +352,20 @@ core::Result<void> DecodeHelper::Impl::build_pipeline(const std::string& decoder
         return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
     }
 
-    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        gst_object_unref(pipeline);
-        return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
-    }
-
     this->pipeline = pipeline;
     this->appsrc = source;
     this->appsink = sink;
     this->bus = gst_element_get_bus(pipeline);
+    arrival_pad = gst_element_get_static_pad(sink, "sink");
+    if (arrival_pad != nullptr) {
+        arrival_probe = gst_pad_add_probe(arrival_pad, kDecodeArrivalProbeTypes,
+                                         observe_decode_arrival, &arrivals, nullptr);
+    }
+    if (arrival_pad == nullptr || arrival_probe == 0 ||
+        gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        release();
+        return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
+    }
     return core::Result<void>{};
 }
 
@@ -466,12 +488,13 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
     }
 
     const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(impl_->appsrc), buffer);
+    const auto push_returned = DecodeSessionState::Clock::now();
     if (flow != GST_FLOW_OK) {
         return impl_->fail_terminal(ErrorCode::channel_decode_failed);
     }
     impl_->session.accept_timestamp(access_unit.timestamp_ns);
     impl_->session.record_correlation(access_unit.frame, access_unit.sequence,
-                                      access_unit.timestamp_ns, now);
+                                      access_unit.timestamp_ns, now, push_returned);
     return core::Result<void>{};
 }
 
@@ -518,6 +541,7 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         const std::uint64_t timeout = first_pull ? first_timeout : 0ULL;
         first_pull = false;
         GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(impl_->appsink), timeout);
+        const auto pull_returned = DecodeSessionState::Clock::now();
         if (sample == nullptr) {
             // The pull may have raced the error message; re-check before returning.
             if (auto failed = impl_->bus_error(); !failed.has_value()) {
@@ -539,6 +563,7 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         GstBuffer* buffer = gst_sample_get_buffer(sample);
         GstVideoInfo info;
         GstVideoFrame video_frame;
+        const auto map_copy_started = DecodeSessionState::Clock::now();
         const bool mapped = caps != nullptr && buffer != nullptr
             && gst_video_info_from_caps(&info, caps)
             && GST_VIDEO_INFO_FORMAT(&info) == GST_VIDEO_FORMAT_I420
@@ -605,6 +630,8 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         // metadata; nothing is relabeled).
         const auto completed = DecodeSessionState::Clock::now();
         const auto meta = impl_->session.take_correlation(pts);
+        const auto arrival = impl_->arrivals.take(pts, meta ? meta->submitted_at : pull_returned,
+                                                pull_returned);
         if (!meta.has_value()) {
             ++impl_->report.frames_unmatched;
         } else {
@@ -613,12 +640,21 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
             frame.timestamp_ns = meta->timestamp_ns;
             if (impl_->on_completion && completed - meta->submitted_at <
                     DecodeSessionState::kCorrelationRetention) {
-                impl_->on_completion(DecodeCompletion{impl_->session_ns, meta->frame,
+                DecodeCompletion event{impl_->session_ns, meta->frame,
                     meta->sequence, meta->timestamp_ns,
                     static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                         meta->submitted_at.time_since_epoch()).count()),
                     static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        completed.time_since_epoch()).count())});
+                        completed.time_since_epoch()).count())};
+                if (meta->push_returned_at) {
+                    event.push_returned_ns = steady_ns(*meta->push_returned_at);
+                }
+                if (arrival) {
+                    event.sink_pad_observed_arrival_ns = steady_ns(*arrival);
+                }
+                event.pull_returned_ns = steady_ns(pull_returned);
+                event.map_copy_started_ns = steady_ns(map_copy_started);
+                impl_->on_completion(event);
             }
             if (impl_->on_frame) {
                 impl_->on_frame(frame);

@@ -13,6 +13,7 @@
 #include <aa/consumer/Decode.hpp>
 
 #include "DecodeSessionState.hpp" // GStreamer-free admission + timestamp state
+#include "DecodeArrivalProbe.hpp"
 #include "discovery.hpp"          // tools/aa-decode-probe: runtime detection oracle
 
 #include <algorithm>
@@ -23,11 +24,14 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <sys/wait.h>
 #include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <gst/app/gstappsink.h>
+#include <gst/app/gstappsrc.h>
 
 namespace {
 using namespace aa::consumer;
@@ -355,6 +359,7 @@ struct FixtureRun final {
     std::string failure;
     std::vector<SentMeta> sent;
     std::vector<DecodedFrame> frames;
+    std::vector<DecodeCompletion> completions;
     std::vector<double> latencies_ms;
     std::uint64_t bytes_fed{};
     double duration_s{};
@@ -382,6 +387,9 @@ FixtureRun run_fixture_decode(DecodeBackend backend) {
     DecodeConfig config;
     config.caps = kPrimaryCaps;
     config.backend = backend;
+    config.on_completion = [&](const DecodeCompletion& event) {
+        run.completions.push_back(event);
+    };
     config.on_frame = [&](const DecodedFrame& frame) {
         run.latencies_ms.push_back(
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()
@@ -439,8 +447,23 @@ FixtureRun run_fixture_decode(DecodeBackend backend) {
 
 void expect_fixture_delivery(const FixtureRun& run) {
     ASSERT_EQ(run.frames.size(), run.sent.size());
+    ASSERT_EQ(run.completions.size(), run.sent.size());
     EXPECT_EQ(run.unmatched, 0U);
     for (std::size_t i = 0; i < run.frames.size(); ++i) {
+        const auto& event = run.completions[i];
+        EXPECT_EQ(event.frame, run.sent[i].frame);
+        EXPECT_EQ(event.sequence, run.sent[i].sequence);
+        EXPECT_EQ(event.timestamp_ns, run.sent[i].timestamp_ns);
+        ASSERT_TRUE(event.push_returned_ns.has_value());
+        ASSERT_TRUE(event.sink_pad_observed_arrival_ns.has_value());
+        ASSERT_TRUE(event.pull_returned_ns.has_value());
+        ASSERT_TRUE(event.map_copy_started_ns.has_value());
+        EXPECT_LE(event.submitted_ns, *event.push_returned_ns);
+        EXPECT_LE(*event.push_returned_ns, *event.pull_returned_ns);
+        EXPECT_LE(event.submitted_ns, *event.sink_pad_observed_arrival_ns);
+        EXPECT_LE(*event.sink_pad_observed_arrival_ns, *event.pull_returned_ns);
+        EXPECT_LE(*event.pull_returned_ns, *event.map_copy_started_ns);
+        EXPECT_LE(*event.map_copy_started_ns, event.completed_ns);
         EXPECT_EQ(run.frames[i].frame, run.sent[i].frame);
         EXPECT_EQ(run.frames[i].sequence, run.sent[i].sequence);
         EXPECT_EQ(run.frames[i].timestamp_ns, run.sent[i].timestamp_ns);
@@ -1347,4 +1370,208 @@ TEST(ConsumerDecodeRuntime, DimensionMismatchLatchesCapsUnsupported) {
     EXPECT_EQ(pumped.error().code(), ErrorCode::channel_caps_unsupported);
     EXPECT_EQ(callbacks, 0U);
     helper.value().close();
+}
+
+TEST(ConsumerDecodeTiming, ObserverMissingDuplicateAndStale) {
+    using Clock = DecodeArrivalObserver::Clock;
+    const Clock::time_point start{};
+    const auto arrived = start + std::chrono::milliseconds{10};
+    DecodeArrivalObserver observer;
+    EXPECT_FALSE(observer.take(1, start, arrived));
+    observer.observe(DecodeSessionState::kClockTimeNone, arrived);
+    EXPECT_FALSE(observer.take(DecodeSessionState::kClockTimeNone, start, arrived));
+    observer.observe(1, arrived);
+    EXPECT_EQ(observer.take(1, start, arrived), arrived);
+    EXPECT_FALSE(observer.take(1, start, arrived));
+    observer.observe(1, arrived + std::chrono::milliseconds{1});
+    EXPECT_FALSE(observer.take(1, start, arrived + std::chrono::milliseconds{2}));
+    observer.observe(2, arrived);
+    observer.observe(2, arrived + std::chrono::milliseconds{1});
+    EXPECT_FALSE(observer.take(2, start, arrived + std::chrono::milliseconds{2}));
+    observer.observe(3, arrived);
+    EXPECT_FALSE(observer.take(3, start, arrived + DecodeArrivalObserver::kRetention));
+    observer.observe(4, arrived);
+    EXPECT_EQ(observer.take(4, start, arrived + DecodeArrivalObserver::kRetention
+                           - std::chrono::nanoseconds{1}), arrived);
+    observer.clear();
+    observer.observe(5, arrived);
+    observer.clear();
+    EXPECT_FALSE(observer.take(5, start, arrived));
+}
+
+TEST(ConsumerDecodeTiming, ObserverCapacityEvictsOldestArrivalNotLowestPts) {
+    using Clock = DecodeArrivalObserver::Clock;
+    const Clock::time_point start{};
+    DecodeArrivalObserver observer;
+    for (std::size_t i = 0; i < DecodeArrivalObserver::kCapacity; ++i) {
+        observer.observe(10'000U - i, start + std::chrono::nanoseconds{i});
+    }
+    const auto pulled = start + std::chrono::milliseconds{1};
+    observer.observe(0, pulled);
+    EXPECT_FALSE(observer.take(10'000, start, pulled));
+    for (std::size_t i = 1; i < DecodeArrivalObserver::kCapacity; ++i) {
+        EXPECT_EQ(observer.take(10'000U - i, start, pulled),
+                  start + std::chrono::nanoseconds{i});
+    }
+    EXPECT_EQ(observer.take(0, start, pulled), pulled);
+}
+
+TEST(ConsumerDecodeTiming, ArrivalMayPrecedeOrFollowPushReturn) {
+    using Clock = DecodeArrivalObserver::Clock;
+    const Clock::time_point submitted{};
+    const auto pushed = submitted + std::chrono::milliseconds{20};
+    const auto pulled = submitted + std::chrono::milliseconds{40};
+    for (const auto arrival : {pushed - std::chrono::milliseconds{10},
+                               pushed + std::chrono::milliseconds{10}}) {
+        DecodeArrivalObserver observer;
+        DecodeSessionState session;
+        observer.observe(123, arrival);
+        session.record_correlation(7, 9, 123, submitted, pushed);
+        const auto meta = session.take_correlation(123);
+        ASSERT_TRUE(meta);
+        EXPECT_EQ(meta->submitted_at, submitted);
+        EXPECT_EQ(meta->push_returned_at, pushed);
+        EXPECT_EQ(observer.take(123, meta->submitted_at, pulled), arrival);
+    }
+    DecodeArrivalObserver observer;
+    observer.observe(1, submitted - std::chrono::nanoseconds{1});
+    EXPECT_FALSE(observer.take(1, submitted, pulled));
+    observer.observe(2, pulled + std::chrono::nanoseconds{1});
+    EXPECT_FALSE(observer.take(2, submitted, pulled));
+    DecodeSessionState legacy;
+    legacy.record_correlation(1, 2, 3, submitted);
+    EXPECT_FALSE(legacy.take_correlation(3)->push_returned_at);
+}
+
+TEST(ConsumerDecodeTiming, SerializationPreservesEndpointsAndMissingEvidence) {
+    DecodeCompletion event{1, 2, 3, 4, 5, 6};
+    const auto missing = decode_completion_json(event);
+    EXPECT_NE(missing.find("\"submitted_ns\":5,\"completed_ns\":6"), std::string::npos);
+    EXPECT_NE(missing.find("\"sink_pad_observed_arrival_ns\":null"), std::string::npos);
+    EXPECT_NE(missing.find("\"push_returned_ns\":null"), std::string::npos);
+    event.push_returned_ns = 9;
+    event.sink_pad_observed_arrival_ns = 8;
+    event.pull_returned_ns = 10;
+    event.map_copy_started_ns = 11;
+    const auto present = decode_completion_json(event);
+    EXPECT_NE(present.find("\"sink_pad_observed_arrival_ns\":8"), std::string::npos);
+    EXPECT_NE(present.find("\"push_returned_ns\":9"), std::string::npos);
+    EXPECT_NE(present.find("\"pull_returned_ns\":10"), std::string::npos);
+    EXPECT_NE(present.find("\"map_copy_started_ns\":11"), std::string::npos);
+}
+
+namespace {
+
+struct ArrivalPipeline final {
+    DecodeArrivalObserver observer;
+    GstElement* pipeline{};
+    GstElement* source{};
+    GstElement* sink{};
+    GstPad* pad{};
+    gulong probe{};
+
+    ~ArrivalPipeline() {
+        if (pipeline != nullptr) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+        }
+        if (pad != nullptr) {
+            gst_pad_remove_probe(pad, probe);
+            gst_object_unref(pad);
+        }
+        if (source != nullptr) {
+            gst_object_unref(source);
+        }
+        if (sink != nullptr) {
+            gst_object_unref(sink);
+        }
+        if (pipeline != nullptr) {
+            gst_object_unref(pipeline);
+        }
+    }
+
+    void open(const char* description) {
+        gst_init(nullptr, nullptr);
+        pipeline = gst_parse_launch(description, nullptr);
+        ASSERT_NE(pipeline, nullptr);
+        source = gst_bin_get_by_name(GST_BIN(pipeline), "src");
+        sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+        ASSERT_NE(source, nullptr);
+        ASSERT_NE(sink, nullptr);
+        pad = gst_element_get_static_pad(sink, "sink");
+        ASSERT_NE(pad, nullptr);
+        probe = gst_pad_add_probe(pad, kDecodeArrivalProbeTypes,
+                                 observe_decode_arrival, &observer, nullptr);
+        ASSERT_NE(probe, 0U);
+        ASSERT_NE(gst_element_set_state(pipeline, GST_STATE_PLAYING), GST_STATE_CHANGE_FAILURE);
+    }
+};
+
+} // namespace
+
+TEST(ConsumerDecodeTiming, RealSinkPadSeparatesPreArrivalDelayFromDelayedPull) {
+    using Clock = DecodeArrivalObserver::Clock;
+    for (const bool delay_consumption : {false, true}) {
+        ArrivalPipeline pipeline;
+        pipeline.open("appsrc name=src format=time ! identity sleep-time=100000 ! "
+                      "appsink name=sink sync=false emit-signals=false max-buffers=10 drop=false");
+        ASSERT_FALSE(HasFatalFailure());
+        GstBuffer* buffer = gst_buffer_new_allocate(nullptr, 1, nullptr);
+        ASSERT_NE(buffer, nullptr);
+        GST_BUFFER_PTS(buffer) = 123;
+        const auto submitted = Clock::now();
+        ASSERT_EQ(gst_app_src_push_buffer(GST_APP_SRC(pipeline.source), buffer), GST_FLOW_OK);
+        // PLAYING confirms preroll reached the sink, without pulling any sample.
+        ASSERT_EQ(gst_element_get_state(pipeline.pipeline, nullptr, nullptr, 3 * GST_SECOND),
+                  GST_STATE_CHANGE_SUCCESS);
+        const auto ready = Clock::now();
+        if (delay_consumption) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{150});
+        }
+        GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline.sink), GST_SECOND);
+        const auto pulled = Clock::now();
+        ASSERT_NE(sample, nullptr);
+        const auto pts = GST_BUFFER_PTS(gst_sample_get_buffer(sample));
+        gst_sample_unref(sample);
+        EXPECT_EQ(pts, 123U);
+        const auto arrival = pipeline.observer.take(pts, submitted, pulled);
+        ASSERT_TRUE(arrival);
+        EXPECT_GE(*arrival - submitted, std::chrono::milliseconds{100});
+        EXPECT_LE(*arrival, ready);
+        if (delay_consumption) {
+            EXPECT_GE(pulled - *arrival, std::chrono::milliseconds{150});
+        }
+    }
+}
+
+TEST(ConsumerDecodeTiming, RealSinkPadObservesBufferListPtsWithoutPulling) {
+    using Clock = DecodeArrivalObserver::Clock;
+    ArrivalPipeline pipeline;
+    pipeline.open("appsrc name=src format=time ! appsink name=sink buffer-list=true "
+                  "sync=false emit-signals=false max-buffers=10 drop=false");
+    ASSERT_FALSE(HasFatalFailure());
+    GstBufferList* list = gst_buffer_list_new();
+    ASSERT_NE(list, nullptr);
+    for (const auto pts : {123U, 456U}) {
+        GstBuffer* buffer = gst_buffer_new_allocate(nullptr, 1, nullptr);
+        ASSERT_NE(buffer, nullptr);
+        GST_BUFFER_PTS(buffer) = pts;
+        gst_buffer_list_add(list, buffer);
+    }
+    const auto submitted = Clock::now();
+    ASSERT_EQ(gst_app_src_push_buffer_list(GST_APP_SRC(pipeline.source), list), GST_FLOW_OK);
+    ASSERT_EQ(gst_element_get_state(pipeline.pipeline, nullptr, nullptr, 3 * GST_SECOND),
+              GST_STATE_CHANGE_SUCCESS);
+    const auto ready = Clock::now();
+    for (const auto pts : {123U, 456U}) {
+        const auto arrival = pipeline.observer.take(pts, submitted, ready);
+        ASSERT_TRUE(arrival) << pts;
+        EXPECT_GE(*arrival, submitted);
+        EXPECT_LE(*arrival, ready);
+    }
+    GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline.sink), GST_SECOND);
+    ASSERT_NE(sample, nullptr);
+    auto* received = gst_sample_get_buffer_list(sample);
+    ASSERT_NE(received, nullptr);
+    EXPECT_EQ(gst_buffer_list_length(received), 2U);
+    gst_sample_unref(sample);
 }
