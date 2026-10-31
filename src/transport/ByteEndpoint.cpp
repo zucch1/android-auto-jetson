@@ -66,6 +66,30 @@ public:
         return count;
     }
 
+    core::Result<std::optional<std::size_t>>
+    poll_read(std::span<std::byte> buffer, const core::CancellationToken& token,
+              core::Deadline::Clock::time_point until) override {
+        std::unique_lock lock(in_->mutex);
+        const bool ready = in_->cv.wait_until(lock, token, until, [this] {
+            return !in_->queue.empty() || in_->writer_closed || in_->reader_closed;
+        });
+        if (token.stop_requested()) {
+            return Error{ErrorCode::cancelled};
+        }
+        if (!ready) {
+            return std::optional<std::size_t>{};
+        }
+        if (in_->reader_closed || in_->queue.empty()) {
+            return std::optional<std::size_t>{0};
+        }
+        const std::size_t count = std::min(buffer.size(), in_->queue.size());
+        for (std::size_t i = 0; i < count; ++i) {
+            buffer[i] = in_->queue.front();
+            in_->queue.pop_front();
+        }
+        return std::optional<std::size_t>{count};
+    }
+
     core::Result<std::size_t> write(std::span<const std::byte> data,
                                   const core::CancellationToken& token) override {
         std::lock_guard lock(out_->mutex);

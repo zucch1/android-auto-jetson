@@ -38,6 +38,26 @@ struct Raw final : p::MessageSink {
         return {};
     }
 };
+struct DeliveryRecorder final {
+    std::vector<aa::channels::AvDeliveryId> ids;
+    std::vector<Bytes> bodies;
+    std::vector<p::MessageHeader> headers;
+    std::vector<std::pair<p::ChannelRole, std::uint64_t>> invalidations;
+    aa::core::Result<void> submission;
+
+    aa::channels::DeferredAvDelivery callbacks() {
+        return {
+            [this](const p::MessageView& message, aa::channels::AvDeliveryId id) -> aa::core::Result<void> {
+                ids.push_back(id);
+                bodies.emplace_back(message.payload.begin(), message.payload.end());
+                headers.push_back(message.header);
+                return submission;
+            },
+            [this](p::ChannelRole role, std::uint64_t generation) {
+                invalidations.emplace_back(role, generation);
+            }};
+    }
+};
 class AvSinkWire : public ::testing::Test {
 protected:
     Raw raw;
@@ -49,11 +69,20 @@ protected:
         return {};
     };
     aa::channels::AvSink sink{audio(), raw, send};
+    DeliveryRecorder delivery;
+    aa::channels::AvSink deferred{audio(), delivery.callbacks(), send};
     aa::core::Result<void> submit(const Bytes& bytes) {
         return sink.on_message({{p::ChannelRole::media_audio, 42, aa::core::Nanoseconds{123}}, bytes});
     }
     void setup() { ASSERT_TRUE(submit(p::encode(p::AvSinkSetup{p::AvSinkCodec::pcm}).value())); }
     void start(std::int32_t id = -7) { ASSERT_TRUE(submit(p::encode(p::AvSinkStart{id, 0}).value())); }
+    aa::core::Result<void> submit_deferred(const Bytes& bytes) {
+        return deferred.on_message({{p::ChannelRole::media_audio, 42, aa::core::Nanoseconds{123}}, bytes});
+    }
+    void start_deferred(std::int32_t id = -7) {
+        ASSERT_TRUE(submit_deferred(p::encode(p::AvSinkSetup{p::AvSinkCodec::pcm}).value()));
+        ASSERT_TRUE(submit_deferred(p::encode(p::AvSinkStart{id, 0}).value()));
+    }
 };
 
 TEST_F(AvSinkWire, LiteralPcmSetupNeverReachesRawAndReadyIsExact) {
@@ -355,5 +384,209 @@ TEST_F(AvSinkWire, FocusTruthfullyRoutesVideoAndInputAndCreditsNativeDiscard) {
     EXPECT_TRUE(v.input_focus_allowed());
     v.reset();
     EXPECT_FALSE(v.input_focus_allowed());
+}
+
+TEST_F(AvSinkWire, DeferredCopiesStrippedBodyAndUnchangedHeaderWithoutPrematureAck) {
+    EXPECT_FALSE(submit_deferred(data()));
+    start_deferred();
+    auto source = data();
+    ASSERT_TRUE(submit_deferred(source));
+    ASSERT_EQ(delivery.ids.size(), 1u);
+    EXPECT_EQ(sent.size(), 1u);
+    EXPECT_EQ(delivery.bodies.front(), Bytes(4, std::byte{0x55}));
+    EXPECT_EQ(delivery.headers.front().channel, p::ChannelRole::media_audio);
+    EXPECT_EQ(delivery.headers.front().sequence, 42u);
+    EXPECT_EQ(delivery.headers.front().timestamp, aa::core::Nanoseconds{123});
+    EXPECT_EQ(deferred.peer_timestamp(), 0x5555555555555555ULL);
+    source.assign(source.size(), std::byte{0});
+    EXPECT_EQ(delivery.bodies.front(), Bytes(4, std::byte{0x55}));
+    const auto id = delivery.ids.front();
+    EXPECT_EQ(id.role, p::ChannelRole::media_audio);
+    EXPECT_EQ(id.session_id, -7);
+    ASSERT_EQ(delivery.invalidations.size(), 1u);
+    EXPECT_EQ(id.generation, delivery.invalidations.back().second);
+    ASSERT_TRUE(deferred.complete_av_delivery(id, {}));
+    ASSERT_EQ(sent.size(), 2u);
+    EXPECT_EQ(sent.back(), p::encode_av_sink_ack(-7).value());
+    ASSERT_TRUE(deferred.complete_av_delivery(id, {}));
+    EXPECT_EQ(sent.size(), 2u);
+}
+
+TEST_F(AvSinkWire, DeferredSubmissionAndWorkerFailuresPreserveOriginalErrorWithoutCredit) {
+    start_deferred();
+    const aa::Error failure{aa::ErrorCode::audio_sink_unavailable};
+    delivery.submission = failure;
+    auto result = submit_deferred(data());
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), failure);
+    const auto rejected = delivery.ids.back();
+    EXPECT_EQ(sent.size(), 1u);
+    delivery.submission = {};
+    ASSERT_TRUE(submit_deferred(data()));
+    const auto accepted = delivery.ids.back();
+    EXPECT_NE(accepted.sequence, rejected.sequence);
+    ASSERT_TRUE(deferred.complete_av_delivery(rejected, {}));
+    result = deferred.complete_av_delivery(accepted, failure);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), failure);
+    EXPECT_EQ(sent.size(), 1u);
+    ASSERT_TRUE(deferred.complete_av_delivery(accepted, {}));
+    EXPECT_EQ(sent.size(), 1u);
+    ASSERT_TRUE(submit_deferred(data()));
+    ASSERT_TRUE(deferred.complete_av_delivery(delivery.ids.back(), {}));
+    EXPECT_EQ(sent.size(), 2u);
+}
+
+TEST_F(AvSinkWire, DeferredAckFailureConsumesPendingAndCannotBeRetried) {
+    start_deferred();
+    ASSERT_TRUE(submit_deferred(data()));
+    const auto id = delivery.ids.back();
+    fail_send = true;
+    const auto result = deferred.complete_av_delivery(id, {});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), aa::Error{aa::ErrorCode::transport_io});
+    fail_send = false;
+    ASSERT_TRUE(deferred.complete_av_delivery(id, {}));
+    ASSERT_TRUE(submit_deferred(p::encode(p::AvSinkStart{-7, 0}).value()));
+    EXPECT_EQ(sent.size(), 1u);
+    ASSERT_TRUE(submit_deferred(data()));
+    ASSERT_TRUE(deferred.complete_av_delivery(delivery.ids.back(), {}));
+    EXPECT_EQ(sent.size(), 2u);
+}
+
+TEST_F(AvSinkWire, DeferredPendingRejectsDataAndCodecCreditWithoutChangingTimestamp) {
+    start_deferred();
+    ASSERT_TRUE(submit_deferred(data()));
+    auto other_data = data();
+    other_data[2] = std::byte{0x66};
+    for (const auto& bytes : {other_data, config(0)}) {
+        const auto result = submit_deferred(bytes);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), aa::Error{aa::ErrorCode::ipc_queue_full});
+    }
+    EXPECT_EQ(delivery.ids.size(), 1u);
+    EXPECT_EQ(sent.size(), 1u);
+    EXPECT_EQ(deferred.peer_timestamp(), 0x5555555555555555ULL);
+    ASSERT_TRUE(deferred.complete_av_delivery(delivery.ids.back(), {}));
+    ASSERT_TRUE(submit_deferred(config(0)));
+    EXPECT_EQ(sent.size(), 3u);
+    EXPECT_EQ(delivery.ids.size(), 1u);
+}
+
+TEST_F(AvSinkWire, DeferredCompletionRequiresEveryIdFieldAndKeepsPendingOnMismatch) {
+    start_deferred();
+    ASSERT_TRUE(submit_deferred(data()));
+    const auto id = delivery.ids.back();
+    for (int field = 0; field < 4; ++field) {
+        auto wrong = id;
+        if (field == 0) { wrong.role = p::ChannelRole::system_audio; }
+        if (field == 1) { ++wrong.generation; }
+        if (field == 2) { ++wrong.sequence; }
+        if (field == 3) { ++wrong.session_id; }
+        ASSERT_TRUE(deferred.complete_av_delivery(wrong, {}));
+        ASSERT_TRUE(deferred.complete_av_delivery(wrong, aa::Error{aa::ErrorCode::audio_decode_failed}));
+        EXPECT_EQ(sent.size(), 1u);
+        const auto blocked = submit_deferred(data());
+        ASSERT_FALSE(blocked);
+        EXPECT_EQ(blocked.error().code(), aa::ErrorCode::ipc_queue_full);
+    }
+    ASSERT_TRUE(deferred.complete_av_delivery(id, {}));
+    EXPECT_EQ(sent.size(), 2u);
+}
+
+TEST_F(AvSinkWire, DeferredSameStartPreservesPendingButStreamChangesInvalidateIt) {
+    start_deferred();
+    ASSERT_TRUE(submit_deferred(data()));
+    const auto first = delivery.ids.back();
+    const auto invalidations = delivery.invalidations.size();
+    ASSERT_TRUE(submit_deferred(p::encode(p::AvSinkStart{-7, 0}).value()));
+    EXPECT_EQ(delivery.invalidations.size(), invalidations);
+    ASSERT_TRUE(deferred.complete_av_delivery(first, {}));
+    EXPECT_EQ(sent.size(), 2u);
+    for (int operation = 0; operation < 4; ++operation) {
+        SCOPED_TRACE(operation);
+        ASSERT_TRUE(submit_deferred(data()));
+        const auto old = delivery.ids.back();
+        if (operation == 0) {
+            ASSERT_TRUE(submit_deferred(p::encode(p::AvSinkStop{}).value()));
+            EXPECT_FALSE(submit_deferred(data()));
+            ASSERT_TRUE(submit_deferred(p::encode(p::AvSinkStart{-7, 0}).value()));
+        } else if (operation == 1) {
+            ASSERT_TRUE(submit_deferred(p::encode(p::AvSinkStart{19, 0}).value()));
+        } else {
+            if (operation == 3) { deferred.reset(); }
+            ASSERT_TRUE(submit_deferred(p::encode(p::AvSinkSetup{p::AvSinkCodec::pcm}).value()));
+            EXPECT_FALSE(submit_deferred(data()));
+            ASSERT_TRUE(submit_deferred(p::encode(p::AvSinkStart{-7, 0}).value()));
+        }
+        ASSERT_TRUE(submit_deferred(data()));
+        const auto current = delivery.ids.back();
+        EXPECT_GT(current.generation, old.generation);
+        EXPECT_EQ(delivery.invalidations.back(), (std::pair{current.role, current.generation}));
+        const auto before = sent.size();
+        ASSERT_TRUE(deferred.complete_av_delivery(old, {}));
+        ASSERT_TRUE(deferred.complete_av_delivery(old, aa::Error{aa::ErrorCode::audio_sink_unavailable}));
+        EXPECT_EQ(sent.size(), before);
+        ASSERT_TRUE(deferred.complete_av_delivery(current, {}));
+        EXPECT_EQ(sent.size(), before + 1);
+        EXPECT_EQ(sent.back(), p::encode_av_sink_ack(current.session_id).value());
+    }
+}
+
+TEST_F(AvSinkWire, DeferredVideoRetainsStagedCreditsCombinedHeadersAndSynchronousNativeDiscard) {
+    aa::channels::AvSink v{video(), delivery.callbacks(), send};
+    const auto call = [&](const Bytes& bytes) { return v.on_message({{p::ChannelRole::video, 8, aa::core::Nanoseconds{321}}, bytes}); };
+    ASSERT_TRUE(call(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    ASSERT_TRUE(call(config()));
+    EXPECT_EQ(sent.size(), 2u);
+    ASSERT_TRUE(call(p::encode(p::AvSinkStart{6, 0}).value()));
+    EXPECT_EQ(sent.size(), 3u);
+    ASSERT_TRUE(call(data()));
+    ASSERT_EQ(delivery.bodies.size(), 1u);
+    EXPECT_EQ(delivery.bodies.back().size(), 7u);
+    EXPECT_EQ(delivery.headers.back().sequence, 8u);
+    EXPECT_EQ(delivery.headers.back().timestamp, aa::core::Nanoseconds{321});
+    EXPECT_EQ(sent.size(), 3u);
+    const auto blocked = call(config());
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code(), aa::ErrorCode::ipc_queue_full);
+    ASSERT_TRUE(v.complete_av_delivery(delivery.ids.back(), {}));
+    ASSERT_TRUE(call(config()));
+    ASSERT_TRUE(call(p::encode(p::VideoFocusRequest{p::VideoFocusMode::native}).value()));
+    const auto before = sent.size();
+    ASSERT_TRUE(call(data()));
+    EXPECT_EQ(delivery.ids.size(), 1u);
+    EXPECT_EQ(sent.size(), before + 1);
+    ASSERT_TRUE(call(p::encode(p::VideoFocusRequest{p::VideoFocusMode::projected}).value()));
+    ASSERT_TRUE(call(data()));
+    EXPECT_EQ(delivery.bodies.back().size(), 4u);
+    ASSERT_TRUE(v.complete_av_delivery(delivery.ids.back(), {}));
+}
+
+TEST_F(AvSinkWire, DeferredReplacementUsesSessionOwnedGenerationInsteadOfReusingIds) {
+    std::uint64_t generation = 0;
+    aa::channels::AvDeliveryId retired{};
+    {
+        aa::channels::AvSink original{audio(), delivery.callbacks(), send, generation};
+        const auto call = [&](const Bytes& bytes) { return original.on_message({{p::ChannelRole::media_audio, 42, {}}, bytes}); };
+        ASSERT_TRUE(call(p::encode(p::AvSinkSetup{}).value()));
+        ASSERT_TRUE(call(p::encode(p::AvSinkStart{-7, 0}).value()));
+        ASSERT_TRUE(call(data()));
+        retired = delivery.ids.back();
+        original.reset();
+    }
+    aa::channels::AvSink replacement{audio(), delivery.callbacks(), send, generation};
+    const auto call = [&](const Bytes& bytes) { return replacement.on_message({{p::ChannelRole::media_audio, 42, {}}, bytes}); };
+    ASSERT_TRUE(call(p::encode(p::AvSinkSetup{}).value()));
+    ASSERT_TRUE(call(p::encode(p::AvSinkStart{-7, 0}).value()));
+    ASSERT_TRUE(call(data()));
+    const auto current = delivery.ids.back();
+    EXPECT_EQ(current.sequence, retired.sequence);
+    EXPECT_GT(current.generation, retired.generation);
+    const auto before = sent.size();
+    ASSERT_TRUE(replacement.complete_av_delivery(retired, {}));
+    EXPECT_EQ(sent.size(), before);
+    ASSERT_TRUE(replacement.complete_av_delivery(current, {}));
+    EXPECT_EQ(sent.size(), before + 1);
 }
 } // namespace

@@ -34,6 +34,8 @@ public:
     void set_io_checkpoint(std::function<void()> checkpoint) override;
     core::Result<void> send(std::span<const std::byte> frame) override;
     [[nodiscard]] core::Result<std::vector<std::byte>> receive() override;
+    [[nodiscard]] core::Result<std::optional<std::vector<std::byte>>>
+    poll_receive(core::Deadline::Clock::time_point until) override;
     void close() noexcept override;
 
 private:

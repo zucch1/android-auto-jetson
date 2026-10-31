@@ -41,6 +41,9 @@ class UsbAoaEndpoint final : public ByteEndpoint {
     }
     [[nodiscard]] core::Result<std::size_t> read(std::span<std::byte> buffer,
                                                  const core::CancellationToken &token) override;
+    [[nodiscard]] core::Result<std::optional<std::size_t>>
+    poll_read(std::span<std::byte> buffer, const core::CancellationToken &token,
+              core::Deadline::Clock::time_point until) override;
     [[nodiscard]] core::Result<std::size_t> write(std::span<const std::byte> data,
                                                   const core::CancellationToken &token) override;
     void close() noexcept override;

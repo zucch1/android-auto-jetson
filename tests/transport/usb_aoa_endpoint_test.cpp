@@ -344,3 +344,170 @@ TEST(UsbAoaEndpoint, SlowAccessoryDiscoveryUsesCallerDeadline) {
     EXPECT_LT(std::chrono::steady_clock::now() - began, std::chrono::milliseconds{150})
         << "accessory discovery ignored the caller deadline";
 }
+
+TEST(UsbAoaEndpoint, PollIdleIsNonterminalAndNeverReplacesLifecycleDeadline) {
+    Connected link = connect();
+    ASSERT_NE(link.endpoint, nullptr);
+    auto state = link.state->pipe_state();
+    link.factory->pipe()->zero_progress_reads = 100;
+    const auto lifecycle = aa::core::Deadline::Clock::now() + std::chrono::hours{1};
+    link.endpoint->set_io_deadline(lifecycle);
+    std::array<std::byte, 32> buffer{};
+    for (int i = 0; i < 100; ++i) {
+        auto idle = link.endpoint->poll_read(
+            buffer, {}, aa::core::Deadline::Clock::now() + std::chrono::milliseconds{5});
+        ASSERT_TRUE(idle.has_value());
+        EXPECT_FALSE(idle.value().has_value());
+        EXPECT_FALSE(state->closed);
+    }
+    EXPECT_GT(state->reads_started.load(), 0);
+    EXPECT_GE(state->last_read_timeout_ms.load(), 1u);
+    EXPECT_LE(state->last_read_timeout_ms.load(), 5u);
+    link.factory->pipe()->push_in(pattern(8));
+    auto got = link.endpoint->read(buffer, {});
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got.value(), 8u);
+    EXPECT_FALSE(state->closed);
+}
+
+TEST(UsbAoaEndpoint, ExpiredPollDoesNotTouchPipeButLaterActualDeadlineCloses) {
+    Connected link = connect();
+    ASSERT_NE(link.endpoint, nullptr);
+    auto state = link.state->pipe_state();
+    std::array<std::byte, 32> buffer{};
+    link.endpoint->set_io_deadline(aa::core::Deadline::Clock::now() + std::chrono::hours{1});
+    auto idle = link.endpoint->poll_read(buffer, {}, aa::core::Deadline::Clock::now() -
+                                                    std::chrono::seconds{1});
+    ASSERT_TRUE(idle.has_value());
+    EXPECT_FALSE(idle.value().has_value());
+    EXPECT_EQ(state->reads_started.load(), 0);
+    EXPECT_FALSE(state->closed);
+    link.factory->pipe()->push_in(pattern(4));
+    auto still_live = link.endpoint->read(buffer, {});
+    ASSERT_TRUE(still_live.has_value());
+    EXPECT_EQ(still_live.value(), 4u);
+
+    link.endpoint->set_io_deadline(aa::core::Deadline::Clock::now());
+    auto expired = link.endpoint->poll_read(buffer, {}, aa::core::Deadline::Clock::now());
+    ASSERT_FALSE(expired.has_value());
+    EXPECT_EQ(expired.error().code(), ErrorCode::timeout);
+    EXPECT_TRUE(state->closed);
+    auto after = link.endpoint->open();
+    ASSERT_FALSE(after.has_value());
+    EXPECT_EQ(after.error().code(), ErrorCode::transport_closed);
+}
+
+TEST(UsbAoaEndpoint, SubmillisecondPollNeverPassesInfiniteTimeoutToLibusb) {
+    Connected link = connect();
+    ASSERT_NE(link.endpoint, nullptr);
+    auto state = link.state->pipe_state();
+    std::array<std::byte, 32> buffer{};
+    auto idle = link.endpoint->poll_read(buffer, {}, aa::core::Deadline::Clock::now() +
+                                                    std::chrono::microseconds{500});
+    ASSERT_TRUE(idle.has_value());
+    EXPECT_FALSE(idle.value().has_value());
+    EXPECT_EQ(state->reads_started.load(), 0);
+    EXPECT_FALSE(state->closed);
+}
+
+TEST(UsbAoaEndpoint, BusyPartialFrameYieldsAfterOneTransferAndPreservesEveryByte) {
+    Connected link = connect();
+    ASSERT_NE(link.endpoint, nullptr);
+    auto state = link.state->pipe_state();
+    auto *pipe = link.factory->pipe();
+    pipe->max_read_bytes = 1;
+    auto frame = tr::encode_frame(
+        {0x01, tr::FrameType::first, tr::MessageKind::specific, tr::Encryption::plain},
+        pattern(16), 32);
+    ASSERT_TRUE(frame.has_value());
+    pipe->push_in(frame.value());
+    auto transport = tr::UsbByteTransport::over_endpoint(std::move(link.endpoint));
+    ASSERT_TRUE(transport.has_value());
+    int checkpoints = 0;
+    transport.value()->set_io_checkpoint([&] { ++checkpoints; });
+    for (std::size_t i = 0; i < frame.value().size(); ++i) {
+        const auto reads_before = state->reads_started.load();
+        auto got = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                                   std::chrono::seconds{1});
+        ASSERT_TRUE(got.has_value());
+        EXPECT_EQ(state->reads_started.load(), reads_before + 1);
+        EXPECT_EQ(got.value().has_value(), i + 1 == frame.value().size());
+        if (got.value()) {
+            EXPECT_EQ(*got.value(), frame.value());
+        }
+        EXPECT_FALSE(state->closed);
+    }
+    EXPECT_EQ(checkpoints, static_cast<int>(frame.value().size()) * 4);
+}
+
+TEST(UsbAoaEndpoint, PollCheckpointCancellationAfterTransferRemainsTerminal) {
+    Connected link = connect();
+    ASSERT_NE(link.endpoint, nullptr);
+    auto state = link.state->pipe_state();
+    link.factory->pipe()->push_in(pattern(4));
+    aa::core::CancellationSource source;
+    int checkpoints = 0;
+    link.endpoint->set_io_checkpoint([&] {
+        if (++checkpoints == 2) {
+            source.request_stop();
+        }
+    });
+    std::array<std::byte, 32> buffer{};
+    auto got = link.endpoint->poll_read(buffer, source.get_token(),
+                                       aa::core::Deadline::Clock::now() + std::chrono::seconds{1});
+    ASSERT_FALSE(got.has_value());
+    EXPECT_EQ(got.error().code(), ErrorCode::cancelled);
+    EXPECT_EQ(state->reads_started.load(), 1);
+    EXPECT_TRUE(state->closed);
+    EXPECT_FALSE(link.endpoint->open().has_value());
+}
+
+TEST(UsbAoaEndpoint, PollDetachClosesTransportAndPipe) {
+    Connected link = connect();
+    ASSERT_NE(link.endpoint, nullptr);
+    auto state = link.state->pipe_state();
+    link.factory->pipe()->detach();
+    auto transport = tr::UsbByteTransport::over_endpoint(std::move(link.endpoint));
+    ASSERT_TRUE(transport.has_value());
+    auto got = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                               std::chrono::seconds{1});
+    ASSERT_FALSE(got.has_value());
+    EXPECT_EQ(got.error().code(), ErrorCode::transport_closed);
+    EXPECT_TRUE(state->closed);
+    EXPECT_FALSE(transport.value()->open({}).has_value());
+}
+
+TEST(UsbAoaEndpoint, LegacyReadRetriesIdleTimeoutsInsteadOfReturningEof) {
+    Connected link = connect();
+    ASSERT_NE(link.endpoint, nullptr);
+    auto state = link.state->pipe_state();
+    link.factory->pipe()->zero_progress_reads = 3;
+    link.factory->pipe()->push_in(pattern(8));
+    std::array<std::byte, 32> buffer{};
+    auto got = link.endpoint->read(buffer, {});
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got.value(), 8u);
+    EXPECT_EQ(state->reads_started.load(), 4);
+    EXPECT_FALSE(state->closed);
+}
+
+TEST(UsbAoaEndpoint, PollActualLifecycleDeadlineClosesFramedTransportAfterIdle) {
+    Connected link = connect();
+    ASSERT_NE(link.endpoint, nullptr);
+    auto state = link.state->pipe_state();
+    auto transport = tr::UsbByteTransport::over_endpoint(std::move(link.endpoint));
+    ASSERT_TRUE(transport.has_value());
+    auto idle = transport.value()->poll_receive(aa::core::Deadline::Clock::now());
+    ASSERT_TRUE(idle.has_value());
+    EXPECT_FALSE(idle.value().has_value());
+    EXPECT_FALSE(state->closed);
+    transport.value()->set_io_deadline(aa::core::Deadline::Clock::now());
+    auto got = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                               std::chrono::seconds{1});
+    ASSERT_FALSE(got.has_value());
+    EXPECT_EQ(got.error().code(), ErrorCode::timeout);
+    EXPECT_TRUE(state->closed);
+    auto after = transport.value()->receive();
+    ASSERT_FALSE(after.has_value());
+    EXPECT_EQ(after.error().code(), ErrorCode::transport_closed);
+}

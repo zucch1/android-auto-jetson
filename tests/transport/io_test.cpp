@@ -11,6 +11,7 @@
 #include <aa/transport/UsbByteTransport.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -260,4 +261,175 @@ TEST(TcpTransport, RoundTripsLargeFragmentedMessage) {
                               pattern(tr::kPlainChunkBytes * 3 + 100)};
     // When/Then: it round-trips within bounded memory over a real loopback.
     roundtrip({*pair.value().client, *pair.value().server}, message);
+}
+
+TEST(UsbByteTransport, PollIdleKeepsInputOpenThenReceivesFrame) {
+    auto pair = tr::make_loopback();
+    ASSERT_TRUE(pair.has_value());
+    auto transport = tr::UsbByteTransport::over_endpoint(std::move(pair.value().b));
+    ASSERT_TRUE(transport.has_value());
+    for (int i = 0; i < 100; ++i) {
+        auto idle = transport.value()->poll_receive(aa::core::Deadline::Clock::now());
+        ASSERT_TRUE(idle.has_value());
+        EXPECT_FALSE(idle.value().has_value());
+    }
+    auto frame = tr::encode_frame(
+        {0x01, FrameType::bulk, MessageKind::specific, Encryption::plain}, pattern(16), 0);
+    ASSERT_TRUE(frame.has_value());
+    ASSERT_TRUE(pair.value().a->write(frame.value()).has_value());
+    auto got = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                               std::chrono::seconds{1});
+    ASSERT_TRUE(got.has_value());
+    ASSERT_TRUE(got.value().has_value());
+    EXPECT_EQ(*got.value(), frame.value());
+    ASSERT_TRUE(transport.value()->send(frame.value()).has_value());
+}
+
+TEST(UsbByteTransport, PollPreservesPartialHeaderAndPayloadAcrossIdleAndBlockingReceive) {
+    auto pair = tr::make_loopback();
+    ASSERT_TRUE(pair.has_value());
+    auto transport = tr::UsbByteTransport::over_endpoint(std::move(pair.value().b));
+    ASSERT_TRUE(transport.has_value());
+    auto frame = tr::encode_frame(
+        {0x01, FrameType::first, MessageKind::specific, Encryption::plain}, pattern(16), 32);
+    ASSERT_TRUE(frame.has_value());
+    const auto data = std::span<const std::byte>{frame.value()};
+    std::size_t consumed = 0;
+    for (const auto count : {2u, 3u, 5u}) {
+        ASSERT_TRUE(pair.value().a->write(data.subspan(consumed, count)).has_value());
+        consumed += count;
+        auto partial = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                                       std::chrono::seconds{1});
+        ASSERT_TRUE(partial.has_value());
+        EXPECT_FALSE(partial.value().has_value());
+        auto idle = transport.value()->poll_receive(aa::core::Deadline::Clock::now());
+        ASSERT_TRUE(idle.has_value());
+        EXPECT_FALSE(idle.value().has_value());
+    }
+    ASSERT_TRUE(pair.value().a->write(data.subspan(consumed)).has_value());
+    auto got = transport.value()->receive();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got.value(), frame.value());
+}
+
+TEST(UsbByteTransport, PollPreservesQueuedFramesAndTrailingPartialFrame) {
+    auto pair = tr::make_loopback();
+    ASSERT_TRUE(pair.has_value());
+    auto transport = tr::UsbByteTransport::over_endpoint(std::move(pair.value().b));
+    ASSERT_TRUE(transport.has_value());
+    auto one = tr::encode_frame(
+        {0x01, FrameType::bulk, MessageKind::specific, Encryption::plain}, pattern(8), 0);
+    auto two = tr::encode_frame(
+        {0x02, FrameType::bulk, MessageKind::control, Encryption::plain}, pattern(9), 0);
+    ASSERT_TRUE(one.has_value());
+    ASSERT_TRUE(two.has_value());
+    auto stream = one.value();
+    stream.insert(stream.end(), two.value().begin(), two.value().end());
+    stream.insert(stream.end(), one.value().begin(), one.value().begin() + 2);
+    ASSERT_TRUE(pair.value().a->write(stream).has_value());
+    auto first = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                                 std::chrono::seconds{1});
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(first.value().has_value());
+    EXPECT_EQ(*first.value(), one.value());
+    auto second = transport.value()->poll_receive(aa::core::Deadline::Clock::now());
+    ASSERT_TRUE(second.has_value());
+    ASSERT_TRUE(second.value().has_value());
+    EXPECT_EQ(*second.value(), two.value());
+    auto idle = transport.value()->poll_receive(aa::core::Deadline::Clock::now());
+    ASSERT_TRUE(idle.has_value());
+    EXPECT_FALSE(idle.value().has_value());
+    ASSERT_TRUE(pair.value().a->write(std::span<const std::byte>{one.value()}.subspan(2)).has_value());
+    auto third = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                                 std::chrono::seconds{1});
+    ASSERT_TRUE(third.has_value());
+    ASSERT_TRUE(third.value().has_value());
+    EXPECT_EQ(*third.value(), one.value());
+}
+
+TEST(UsbByteTransport, PollEofAndCancelStayTerminal) {
+    for (const bool cancel : {false, true}) {
+        auto pair = tr::make_loopback();
+        ASSERT_TRUE(pair.has_value());
+        auto transport = tr::UsbByteTransport::over_endpoint(std::move(pair.value().b));
+        ASSERT_TRUE(transport.has_value());
+        aa::core::CancellationSource source;
+        ASSERT_TRUE(transport.value()->open(source.get_token()).has_value());
+        ASSERT_TRUE(pair.value().a->write(bytes({0x01, 0x03})).has_value());
+        auto partial = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                                       std::chrono::seconds{1});
+        ASSERT_TRUE(partial.has_value());
+        EXPECT_FALSE(partial.value().has_value());
+        if (cancel) {
+            source.request_stop();
+        } else {
+            pair.value().a->close();
+        }
+        auto got = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                                   std::chrono::seconds{1});
+        ASSERT_FALSE(got.has_value());
+        EXPECT_EQ(got.error().code(), cancel ? aa::ErrorCode::cancelled
+                                             : aa::ErrorCode::transport_closed);
+        auto reopen = transport.value()->open({});
+        ASSERT_FALSE(reopen.has_value());
+        EXPECT_EQ(reopen.error().code(), aa::ErrorCode::transport_closed);
+        auto peer_write = pair.value().a->write(pattern(4));
+        ASSERT_FALSE(peer_write.has_value());
+        EXPECT_EQ(peer_write.error().code(), aa::ErrorCode::transport_closed);
+    }
+}
+
+TEST(UsbByteTransport, PollMalformedAndOversizeStayTerminal) {
+    for (const bool oversize : {false, true}) {
+        auto pair = tr::make_loopback();
+        ASSERT_TRUE(pair.has_value());
+        auto transport = tr::UsbByteTransport::over_endpoint(std::move(pair.value().b));
+        ASSERT_TRUE(transport.has_value());
+        const auto bad = oversize ? bytes({0x01, 0x03, 0xFF, 0xFF})
+                                  : bytes({0x01, 0xF3, 0x00, 0x01, 0xAA});
+        ASSERT_TRUE(pair.value().a->write(bad).has_value());
+        auto got = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                                   std::chrono::seconds{1});
+        ASSERT_FALSE(got.has_value());
+        EXPECT_EQ(got.error().code(), oversize ? aa::ErrorCode::transport_oversize_frame
+                                               : aa::ErrorCode::transport_malformed_frame);
+        auto after = transport.value()->receive();
+        ASSERT_FALSE(after.has_value());
+        EXPECT_EQ(after.error().code(), aa::ErrorCode::transport_closed);
+        auto written = pair.value().a->write(pattern(4));
+        ASSERT_FALSE(written.has_value());
+        EXPECT_EQ(written.error().code(), aa::ErrorCode::transport_closed);
+    }
+}
+
+TEST(TcpTransport, PollIsExplicitlyUnsupportedAndDoesNotConsumeOrClose) {
+    auto pair = tr::make_tcp_loopback();
+    ASSERT_TRUE(pair.has_value());
+    auto got = pair.value().client->poll_receive(aa::core::Deadline::Clock::now());
+    ASSERT_FALSE(got.has_value());
+    EXPECT_EQ(got.error().code(), aa::ErrorCode::transport_unavailable);
+    roundtrip({*pair.value().server, *pair.value().client},
+              tr::Message{0x21, MessageKind::specific, pattern(8)});
+}
+
+TEST(UsbByteTransport, ByteEndpointPollingDefaultsToExplicitUnsupportedWithoutBlockingRead) {
+    class BlockingOnlyEndpoint final : public tr::ByteEndpoint {
+    public:
+        aa::core::Result<void> open() override { return {}; }
+        aa::core::Result<std::size_t> read(std::span<std::byte>,
+                                          const aa::core::CancellationToken&) override {
+            ADD_FAILURE() << "unsupported poll must never call blocking read";
+            return aa::Error{aa::ErrorCode::internal};
+        }
+        aa::core::Result<std::size_t> write(std::span<const std::byte>,
+                                           const aa::core::CancellationToken&) override {
+            return aa::Error{aa::ErrorCode::internal};
+        }
+        void close() noexcept override {}
+    };
+    auto transport = tr::UsbByteTransport::over_endpoint(std::make_unique<BlockingOnlyEndpoint>());
+    ASSERT_TRUE(transport.has_value());
+    auto got = transport.value()->poll_receive(aa::core::Deadline::Clock::now());
+    ASSERT_FALSE(got.has_value());
+    EXPECT_EQ(got.error().code(), aa::ErrorCode::transport_unavailable);
 }

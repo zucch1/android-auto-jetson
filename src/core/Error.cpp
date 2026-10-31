@@ -22,6 +22,7 @@ std::string_view Error::message() const noexcept {
     case ErrorCode::protocol_unsupported_channel: return "unsupported protocol channel";
     case ErrorCode::protocol_negotiation_failed: return "protocol negotiation failed";
     case ErrorCode::protocol_malformed_message: return "malformed protocol message";
+    case ErrorCode::protocol_payload_oversize: return "payload exceeds receiver support envelope";
 
     case ErrorCode::session_illegal_transition: return "illegal session transition";
     case ErrorCode::session_pairing_timeout: return "session pairing timeout";
@@ -83,6 +84,7 @@ std::string_view to_string(ErrorCode code) noexcept {
     case ErrorCode::protocol_unsupported_channel: return "protocol_unsupported_channel";
     case ErrorCode::protocol_negotiation_failed: return "protocol_negotiation_failed";
     case ErrorCode::protocol_malformed_message: return "protocol_malformed_message";
+    case ErrorCode::protocol_payload_oversize: return "protocol_payload_oversize";
 
     case ErrorCode::session_illegal_transition: return "session_illegal_transition";
     case ErrorCode::session_pairing_timeout: return "session_pairing_timeout";

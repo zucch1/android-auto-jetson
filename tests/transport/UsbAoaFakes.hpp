@@ -51,6 +51,7 @@ struct PipeState final {
     mutable std::mutex mutex{};
     std::vector<std::byte> out{};
     std::atomic<int> reads_started{0};
+    std::atomic<unsigned> last_read_timeout_ms{0};
     std::atomic<int> writes_started{0};
     bool detached{false};
     bool closed{false};
@@ -175,6 +176,7 @@ class FakeBulkPipe final : public ua::UsbBulkPipe {
     int zero_progress_writes{0};
     int zero_progress_reads{0};
     bool block_writes{false};
+    std::size_t max_read_bytes{std::numeric_limits<std::size_t>::max()};
     std::size_t max_write_bytes{std::numeric_limits<std::size_t>::max()};
     std::size_t fail_write_after{std::numeric_limits<std::size_t>::max()};
     int stall_after_first_write{0};
@@ -183,7 +185,15 @@ class FakeBulkPipe final : public ua::UsbBulkPipe {
 
     core::Result<std::size_t> read(std::span<std::byte> buffer, unsigned timeout_ms) override {
         ++state_->reads_started;
+        state_->last_read_timeout_ms.store(timeout_ms);
         std::unique_lock lock(mutex_);
+        if (detached_ || closed_) {
+            return Error{ErrorCode::transport_closed};
+        }
+        if (zero_progress_reads > 0) {
+            --zero_progress_reads;
+            return std::size_t{0};
+        }
         cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
                      [this] { return !in_.empty() || detached_ || closed_; });
         if (detached_ || closed_) {
@@ -192,7 +202,7 @@ class FakeBulkPipe final : public ua::UsbBulkPipe {
         if (in_.empty()) {
             return std::size_t{0};
         }
-        const std::size_t count = std::min(buffer.size(), in_.size());
+        const std::size_t count = std::min({buffer.size(), in_.size(), max_read_bytes});
         for (std::size_t i = 0; i < count; ++i) {
             buffer[i] = in_.front();
             in_.pop_front();
