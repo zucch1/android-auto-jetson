@@ -91,8 +91,8 @@ if(NOT CMAKE_CROSSCOMPILING)
         aareceiver-audio pthread GTest::gtest_main)
     target_include_directories(aa_wired_e2e_test PRIVATE
         "${CMAKE_BINARY_DIR}/aasdk/protobuf"
-        "${AA_DEPENDENCY_STAGE}/aasdk/include"
-        ${Protobuf_INCLUDE_DIRS})
+        "${AA_DEPENDENCY_STAGE}/aasdk/include")
+    target_include_directories(aa_wired_e2e_test SYSTEM PRIVATE ${Protobuf_INCLUDE_DIRS})
     if(TARGET PkgConfig::AA_AUDIO_GST)
         target_link_libraries(aa_wired_e2e_test PRIVATE PkgConfig::AA_AUDIO_GST)
     endif()
