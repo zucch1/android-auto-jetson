@@ -368,6 +368,16 @@ struct FixtureRun final {
     std::string nvidia_cause;
     std::string negotiated_caps;
     std::uint64_t unmatched{};
+    // Negative phase times mean the phase was not reached; diagnostic only.
+    double open_s{-1.0};
+    double submission_s{-1.0};
+    double eos_s{-1.0};
+    double pump_s{-1.0};
+    double close_s{-1.0};
+    std::size_t pump_calls{};
+    std::size_t submitted_before_close{};
+    std::size_t frames_before_close{};
+    std::size_t completions_before_close{};
 };
 
 FixtureRun run_fixture_decode(DecodeBackend backend) {
@@ -397,13 +407,31 @@ FixtureRun run_fixture_decode(DecodeBackend backend) {
                 .count());
         run.frames.push_back(frame);
     };
+    const auto open_start = std::chrono::steady_clock::now();
     auto helper = DecodeHelper::open(std::move(config));
+    run.open_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - open_start).count();
     if (!helper) {
         run.failure = "open failed, code " + std::to_string(static_cast<int>(helper.error().code()));
         return run;
     }
 
     const auto start = std::chrono::steady_clock::now();
+    const auto finish = [&] {
+        run.duration_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const auto& report = helper.value().report();
+        run.selected_element = report.selected_element;
+        run.selected_hardware = report.nvidia_enabled;
+        run.nvidia_cause = report.nvidia_cause;
+        run.negotiated_caps = report.negotiated_caps;
+        run.unmatched = report.frames_unmatched;
+        run.submitted_before_close = run.sent.size();
+        run.frames_before_close = run.frames.size();
+        run.completions_before_close = run.completions.size();
+        const auto close_start = std::chrono::steady_clock::now();
+        helper.value().close();
+        run.close_s =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - close_start).count();
+    };
     for (std::size_t i = 0; i < units.size(); ++i) {
         const std::uint64_t frame_id = static_cast<std::uint64_t>(i);
         const std::uint64_t sequence = 3 * frame_id + 1;
@@ -416,33 +444,58 @@ FixtureRun run_fixture_decode(DecodeBackend backend) {
         if (!result) {
             run.failure = "submit failed at frame " + std::to_string(frame_id) + ", code "
                 + std::to_string(static_cast<int>(result.error().code()));
+            run.submission_s =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            finish();
             return run;
         }
     }
-    if (const auto eos = helper.value().end_of_stream(); !eos) {
+    const auto eos_start = std::chrono::steady_clock::now();
+    run.submission_s = std::chrono::duration<double>(eos_start - start).count();
+    const auto eos = helper.value().end_of_stream();
+    const auto pump_start = std::chrono::steady_clock::now();
+    run.eos_s = std::chrono::duration<double>(pump_start - eos_start).count();
+    if (!eos) {
         run.failure = "end_of_stream failed, code "
             + std::to_string(static_cast<int>(eos.error().code()));
+        finish();
         return run;
     }
 
     std::size_t delivered = 0;
     for (int poll = 0; poll < 200 && delivered < units.size(); ++poll) {
+        ++run.pump_calls;
         const auto drained = helper.value().pump(Milliseconds{50});
         if (!drained) {
             run.failure = "pump failed, code "
                 + std::to_string(static_cast<int>(drained.error().code()));
+            run.pump_s =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - pump_start).count();
+            finish();
             return run;
         }
         delivered += drained.value();
     }
-    run.duration_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    run.selected_element = helper.value().report().selected_element;
-    run.selected_hardware = helper.value().report().nvidia_enabled;
-    run.nvidia_cause = helper.value().report().nvidia_cause;
-    run.negotiated_caps = helper.value().report().negotiated_caps;
-    run.unmatched = helper.value().report().frames_unmatched;
-    helper.value().close();
+    run.pump_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - pump_start).count();
+    finish();
     return run;
+}
+
+std::string fixture_diagnostic(const FixtureRun& run, const char* requested_backend) {
+    const std::string diagnostic = (::testing::Message()
+        << "fixture diagnostic (not qualification): requested_backend=" << requested_backend
+        << " failure=\"" << run.failure << "\" selected_element=" << run.selected_element
+        << " selected_hardware=" << run.selected_hardware
+        << " negotiated_caps=\"" << run.negotiated_caps << "\" unmatched=" << run.unmatched
+        << " duration_s=" << run.duration_s
+        << " open_s=" << run.open_s << " submission_s=" << run.submission_s
+        << " eos_s=" << run.eos_s << " pump_s=" << run.pump_s << " close_s=" << run.close_s
+        << " pump_calls=" << run.pump_calls
+        << " submitted_before_close=" << run.submitted_before_close
+        << " frames_before_close=" << run.frames_before_close
+        << " completions_before_close=" << run.completions_before_close).GetString();
+    std::fprintf(stderr, "%s\n", diagnostic.c_str());
+    return diagnostic;
 }
 
 void expect_fixture_delivery(const FixtureRun& run) {
@@ -480,6 +533,7 @@ FixtureReport fixture_report;
 
 TEST(ConsumerDecodeFixture, HappyFixtureDecodeDeliversMonotonicFrames) {
     const FixtureRun run = run_fixture_decode(DecodeBackend::automatic);
+    SCOPED_TRACE(fixture_diagnostic(run, "automatic"));
     ASSERT_TRUE(run.failure.empty()) << run.failure;
     ASSERT_EQ(run.frames.size(), 90U);
     expect_fixture_delivery(run);
@@ -519,6 +573,7 @@ TEST(ConsumerDecodeFixture, ForcedSoftwareBackendDeliversFixtureFrames) {
     // is made here (the latter is a withdrawn claim); this is functional
     // coverage only.
     const FixtureRun run = run_fixture_decode(DecodeBackend::software);
+    SCOPED_TRACE(fixture_diagnostic(run, "software"));
     ASSERT_TRUE(run.failure.empty()) << run.failure;
 
     EXPECT_FALSE(run.selected_hardware);
