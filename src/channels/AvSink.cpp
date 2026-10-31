@@ -4,6 +4,7 @@
 #include <aa/transport/Frames.hpp>
 
 #include <algorithm>
+#include <limits>
 
 namespace aa::channels {
 namespace {
@@ -15,6 +16,51 @@ core::Result<void> AvSink::send(core::Result<std::vector<std::byte>> payload) {
     return send_(std::move(payload).value());
 }
 
+void AvSink::observe(AvCreditEvent event, std::optional<ErrorCode> error, std::uint32_t count) const {
+    if (!deferred_ || !deferred_->observe) { return; }
+    auto value = current_observation_;
+    value.event = event;
+    value.delivery.role = service_.role;
+    value.delivery.generation = generation_;
+    value.delivery.session_id = session_.value_or(0);
+    value.session_active = session_.has_value();
+    value.pending = pending_;
+    value.error = error;
+    value.count = count;
+    value.at_ns = av_observation_now();
+    deferred_->observe(value);
+}
+
+void AvSink::observe_receive(bool entering) const {
+    observe(entering ? AvCreditEvent::receive_entry : AvCreditEvent::receive_return);
+}
+
+core::Result<void> AvSink::send_ack(std::int32_t session, AckFor for_message) {
+    auto result = send(protocol::encode_av_sink_ack(session));
+    current_observation_.ack_for = static_cast<std::uint16_t>(for_message);
+    observe(AvCreditEvent::ack, result ? std::nullopt : std::optional{result.error().code()}, 1);
+    return result;
+}
+
+void AvSink::invalidate_delivery() noexcept {
+    pending_.reset();
+    auto& counter = generation_counter_ ? *generation_counter_ : generation_;
+    // Exhaustion fails closed in data(); never wrap into a retired generation.
+    if (counter != std::numeric_limits<std::uint64_t>::max()) { ++counter; }
+    generation_ = counter;
+    if (deferred_ && deferred_->invalidate) { deferred_->invalidate(service_.role, generation_); }
+    observe(AvCreditEvent::reset);
+}
+
+core::Result<void> AvSink::complete_av_delivery(AvDeliveryId id, core::Result<void> result) {
+    if (!pending_ || *pending_ != id || id.generation != generation_
+        || session_ != id.session_id) { return {}; }
+    current_observation_ = pending_observation_;
+    pending_.reset();
+    if (!result) { return result.error(); }
+    return send_ack(id.session_id, AckFor::data);
+}
+
 void AvSink::reset() noexcept {
     ready_ = false;
     session_.reset();
@@ -22,6 +68,7 @@ void AvSink::reset() noexcept {
     codec_cache_.clear();
     staged_credit_ = false;
     focus_ = protocol::VideoFocusMode::projected;
+    invalidate_delivery();
 }
 
 bool AvSink::input_focus_allowed() const noexcept {
@@ -51,7 +98,9 @@ core::Result<void> AvSink::setup(std::span<const std::byte> payload) {
             || request.value().codec != protocol::AvSinkCodec::pcm) { return malformed(); }
     }
     reset();
-    if (auto result = send(protocol::encode_av_sink_ready()); !result) { return result.error(); }
+    const auto result = send(protocol::encode_av_sink_ready());
+    observe(AvCreditEvent::ready, result ? std::nullopt : std::optional{result.error().code()}, 1);
+    if (!result) { return result.error(); }
     if (video) {
         if (auto result = send(protocol::encode(protocol::VideoFocusNotification{focus_, true})); !result) {
             return result.error();
@@ -70,16 +119,23 @@ core::Result<void> AvSink::start(std::span<const std::byte> payload) {
         codec_cache_.clear();
         staged_credit_ = false;
         peer_timestamp_.reset();
+        invalidate_delivery();
     }
     session_ = request.value().session_id;
     if (std::exchange(staged_credit_, false)) {
-        return send(protocol::encode_av_sink_ack(*session_));
+        return send_ack(*session_, AckFor::codec_config);
     }
     return {};
 }
 
 core::Result<void> AvSink::codec_config(std::span<const std::byte> payload) {
     if (!ready_ || (!session_ && staged_credit_)) { return malformed(); }
+    if (pending_) {
+        last_queue_rejection_ = diagnostics::QueueRejection{
+            diagnostics::QueueSource::av_pending, diagnostics::QueueReason::codec_config,
+            service_.role, 1, 1, 0, 0, 0, 0, payload.size()};
+        return Error{ErrorCode::ipc_queue_full};
+    }
     const auto decoded = protocol::decode_av_sink_codec_config(payload);
     if (!decoded) { return decoded.error(); }
     const auto body = decoded.value();
@@ -90,11 +146,17 @@ core::Result<void> AvSink::codec_config(std::span<const std::byte> payload) {
         return malformed();
     }
     if (!session_) { staged_credit_ = true; return {}; }
-    return send(protocol::encode_av_sink_ack(*session_));
+    return send_ack(*session_, AckFor::codec_config);
 }
 
 core::Result<void> AvSink::data(const protocol::MessageView& message) {
     if (!session_) { return malformed(); }
+    if (pending_) {
+        last_queue_rejection_ = diagnostics::QueueRejection{
+            diagnostics::QueueSource::av_pending, diagnostics::QueueReason::data,
+            service_.role, 1, 1, 0, 0, 0, 0, message.payload.size()};
+        return Error{ErrorCode::ipc_queue_full};
+    }
     const auto decoded = protocol::decode_av_sink_data(message.payload);
     if (!decoded) { return decoded.error(); }
     const auto body = decoded.value().body;
@@ -119,9 +181,28 @@ core::Result<void> AvSink::data(const protocol::MessageView& message) {
             std::copy(body.begin(), body.end(), combined.data() + cached_size);
             media = combined;
         }
-        if (auto delivered = raw_.on_message({message.header, media}); !delivered) { return delivered.error(); }
+        if (deferred_) {
+            if (!deferred_->submit) { return Error{ErrorCode::invalid_argument}; }
+            if (generation_ == std::numeric_limits<std::uint64_t>::max()
+                || delivery_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
+                return Error{ErrorCode::internal};
+            }
+            const AvDeliveryId id{service_.role, generation_, ++delivery_sequence_, *session_};
+            pending_ = id;
+            current_observation_.delivery.sequence = id.sequence;
+            pending_observation_ = current_observation_;
+            if (auto submitted = deferred_->submit({message.header, media}, id); !submitted) {
+                if (submitted.error().code() == ErrorCode::ipc_queue_full && deferred_->rejection) {
+                    last_queue_rejection_ = deferred_->rejection();
+                }
+                pending_.reset();
+                return submitted.error();
+            }
+            return {};
+        }
+        if (auto delivered = raw_->on_message({message.header, media}); !delivered) { return delivered.error(); }
     }
-    return send(protocol::encode_av_sink_ack(*session_));
+    return send_ack(*session_, AckFor::data);
 }
 
 core::Result<void> AvSink::focus(std::span<const std::byte> payload) {
@@ -137,11 +218,17 @@ core::Result<void> AvSink::focus(std::span<const std::byte> payload) {
 }
 
 core::Result<void> AvSink::on_message(const protocol::MessageView& message) {
+    last_queue_rejection_.reset();
     if (message.header.channel != service_.role) { return Error{ErrorCode::protocol_unsupported_channel}; }
     const auto payload = message.payload;
     if (payload.size() < 2 || payload.size() > transport::kMaxMessageBytes) { return malformed(); }
     const auto id = (static_cast<unsigned>(payload[0]) << 8u) | static_cast<unsigned>(payload[1]);
-    switch (id) {
+    current_observation_ = {};
+    current_observation_.message_sequence = message.header.sequence;
+    current_observation_.message_id = static_cast<std::uint16_t>(id);
+    current_observation_.bytes = payload.size();
+    observe(AvCreditEvent::arrival);
+    const auto result = [&]() -> core::Result<void> { switch (id) {
     case 0x8000: return setup(payload);
     case 0x8001: return start(payload);
     case 0x8002: {
@@ -150,13 +237,17 @@ core::Result<void> AvSink::on_message(const protocol::MessageView& message) {
         peer_timestamp_.reset();
         codec_cache_.clear();
         staged_credit_ = false;
+        invalidate_delivery();
         return {};
     }
     case 0x0000: return data(message);
     case 0x0001: return codec_config(payload);
     case 0x8007: return focus(payload);
     default: return malformed();
-    }
+    }}();
+    observe(result ? AvCreditEvent::accepted : AvCreditEvent::rejected,
+            result ? std::nullopt : std::optional{result.error().code()});
+    return result;
 }
 
 } // namespace aa::channels

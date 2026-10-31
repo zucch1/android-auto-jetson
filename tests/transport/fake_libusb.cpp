@@ -43,6 +43,7 @@ namespace ua = aa::transport::usb_adapter;
 enum class Mode { phone, accessory };
 
 Mode g_mode = Mode::phone;
+std::size_t g_bulk_read_offset = 0;
 char g_slots[6][256] = {};
 std::mutex g_mutex;
 
@@ -63,6 +64,8 @@ enum class Scenario {
     absent,
     happy,
     stall,
+    partial_timeout,
+    bulk_io_error,
     claim_fail_pre,
     claim_fail_always,
     replacement,
@@ -77,6 +80,12 @@ enum class Scenario {
     }
     if (text == "stall") {
         return Scenario::stall;
+    }
+    if (text == "partial-timeout") {
+        return Scenario::partial_timeout;
+    }
+    if (text == "bulk-io-error") {
+        return Scenario::bulk_io_error;
     }
     if (text == "claim-fail-pre") {
         return Scenario::claim_fail_pre;
@@ -119,9 +128,10 @@ void log_control(std::uint8_t request, std::uint16_t index) {
     log_line(line);
 }
 
-void log_bulk(std::uint8_t endpoint) {
+void log_bulk(std::uint8_t endpoint, unsigned timeout_ms) {
     char line[64] = {};
-    std::snprintf(line, sizeof(line), "libusb_bulk_transfer:%02x", static_cast<unsigned>(endpoint));
+    std::snprintf(line, sizeof(line), "libusb_bulk_transfer:%02x:%u",
+                  static_cast<unsigned>(endpoint), timeout_ms);
     log_line(line);
 }
 
@@ -219,6 +229,7 @@ int libusb_init(ua::LibusbContext **ctx) {
                  ? Mode::accessory
                  : Mode::phone;
     std::memset(g_slots, 0, sizeof(g_slots));
+    g_bulk_read_offset = 0;
     *ctx = reinterpret_cast<ua::LibusbContext *>(&g_device_storage);
     return ua::kLibusbSuccess;
 }
@@ -446,16 +457,27 @@ static_assert(
 int libusb_bulk_transfer(ua::LibusbDeviceHandle *handle, std::uint8_t endpoint, std::uint8_t *data,
                          int length, int *transferred, unsigned timeout_ms) {
     (void)handle;
-    (void)timeout_ms;
-    log_bulk(endpoint);
+    log_bulk(endpoint, timeout_ms);
     std::lock_guard lock(g_mutex);
     if (endpoint == 0x01) {
         *transferred = length;
         return ua::kLibusbSuccess;
     }
     if (endpoint == 0x81) {
+        if (scenario() == Scenario::bulk_io_error) {
+            *transferred = 0;
+            return ua::kLibusbErrorIo;
+        }
         if (scenario() == Scenario::stall) {
             *transferred = 0;
+            return ua::kLibusbErrorTimeout;
+        }
+        if (scenario() == Scenario::partial_timeout) {
+            const auto count = std::min({sizeof(kReplyFrame) - g_bulk_read_offset,
+                                         static_cast<std::size_t>(length), std::size_t{2}});
+            std::memcpy(data, kReplyFrame + g_bulk_read_offset, count);
+            g_bulk_read_offset += count;
+            *transferred = static_cast<int>(count);
             return ua::kLibusbErrorTimeout;
         }
         const int count = static_cast<int>(sizeof(kReplyFrame)) < length

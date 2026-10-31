@@ -38,6 +38,7 @@ enum class ErrorCode : std::uint16_t {
     protocol_unsupported_channel = 201,
     protocol_negotiation_failed = 202,
     protocol_malformed_message = 203,
+    protocol_payload_oversize = 204,
 
     // session
     session_illegal_transition = 300,

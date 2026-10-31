@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -29,6 +30,7 @@ constexpr std::size_t kRoleCount = 4;
 constexpr std::size_t kMaxAudioPayloadBytes = std::size_t{64} * 1024;
 constexpr std::size_t kMaxPendingRunsPerRole = 512;
 constexpr std::size_t kMaxOutputPieceBytes = std::size_t{64} * 1024;
+constexpr std::size_t kMaxBackpressureIntervals = 64;
 
 [[nodiscard]] std::optional<Role> role_of(protocol::ChannelRole channel) {
     switch (channel) {
@@ -50,23 +52,61 @@ constexpr std::size_t kMaxOutputPieceBytes = std::size_t{64} * 1024;
 // submit() BEFORE decode() so the whole decode + mix + write path is inside
 // the recorded latency (gate fix F4).
 struct Run final {
+    protocol::MessageHeader header{};
     core::Nanoseconds timestamp{};
     std::vector<std::byte> pcm{};
     std::uint64_t frames{};
     std::int64_t submitted_at_ns{};
+    std::optional<std::uint64_t> placed{};
+    std::uint64_t trimmed{};
+    std::uint64_t consumed{};
+    bool preflighted{};
 };
 
 // One run placed on the sample timeline at an effective (non-overlapping)
 // frame range. Same-role runs are sequentialized in arrival order so no
 // samples are dropped when consecutive channel chunks overlap.
+// head_trim_frames is the live-PCM drift correction offset: that many decoded
+// frames were dropped from the run's head and the retained PCM starts there.
 struct ScheduledRun final {
     std::size_t role{0};
     std::uint64_t start_frame{0};
     std::uint64_t end_frame{0};
+    std::uint64_t head_trim_frames{0};
     const Run* run{nullptr};
+    std::optional<std::int64_t> intended{};
+    std::uint64_t role_end_before{};
 };
 
 } // namespace
+
+LivePcmDriftCorrector::LivePcmDriftCorrector(LivePcmDriftPolicy policy,
+                                             std::uint32_t output_rate_hz) noexcept
+    : policy_(policy), rate_(output_rate_hz) {}
+
+// Trim = min(max_trim, phase - target) converted to whole frames (floor), then
+// capped by the run itself. Only runs above the high watermark are touched;
+// the residual lands near `target`, so a slower producer (negative phase) and
+// a zero-drift stream never lose a frame.
+std::uint64_t LivePcmDriftCorrector::trim_frames(core::Nanoseconds phase,
+                                                 std::uint64_t run_frames) const noexcept {
+    if (!policy_.enabled || rate_ == 0 || phase <= policy_.high_watermark) {
+        return 0;
+    }
+    const core::Nanoseconds excess{phase.count - policy_.target.count};
+    const core::Nanoseconds budget = excess < policy_.max_trim ? excess : policy_.max_trim;
+    if (budget.count <= 0) {
+        return 0;
+    }
+    const std::uint64_t nanoseconds = static_cast<std::uint64_t>(budget.count);
+    const std::uint64_t seconds = nanoseconds / 1'000'000'000ULL;
+    if (seconds > UINT64_MAX / rate_) {
+        return run_frames;
+    }
+    const std::uint64_t frames =
+        seconds * rate_ + ((nanoseconds % 1'000'000'000ULL) * rate_) / 1'000'000'000ULL;
+    return std::min(frames, run_frames);
+}
 
 SinkSelection select_sink_backend(const SinkReport& report, SinkBackend request) {
     SinkSelection selection;
@@ -138,7 +178,11 @@ struct AudioRouter::Impl final {
 
     // Per-role decoded runs pending on the mix timeline.
     std::array<std::deque<Run>, kRoleCount> pending{};
+    std::mutex pending_mutex{};
+    std::array<std::uint64_t, kRoleCount> generations{};
+    bool incremental{};
     std::vector<std::byte> silence_scratch{};
+    LivePcmDriftCorrector drift{};
 
     // Persistent sample timeline across pumps: base timestamp anchored at the
     // FIRST nonempty pump, the playback cursor (frames already committed to
@@ -147,6 +191,83 @@ struct AudioRouter::Impl final {
     std::optional<core::Nanoseconds> timeline_base{};
     std::uint64_t playback_cursor_frames{0};
     std::array<std::uint64_t, kRoleCount> role_end_frames{};
+    // Disjoint, sorted [start, end) steady-clock intervals during which the
+    // owner withheld peer credit (note_backpressure). Empty for every caller
+    // that never records one, which keeps the strict gap policy unchanged.
+    std::vector<std::pair<std::int64_t, std::int64_t>> backpressure{};
+    struct IdleAuthorization final {
+        std::pair<std::int64_t, std::int64_t> interval;
+        std::optional<std::uint64_t> prefix_end{};
+    };
+    std::optional<IdleAuthorization> idle{};
+
+    struct ElapsedRange final {
+        std::uint64_t first;
+        std::uint64_t last;
+        bool idle;
+    };
+
+    struct TimelineClock final {
+        std::int64_t base_ns;
+        std::int64_t now_ns;
+    };
+
+    // Frame range [first, last) of one recorded interval on the timeline,
+    // clipped to `now` so only already-elapsed time is ever skippable.
+    [[nodiscard]] bool backpressure_frames(const std::pair<std::int64_t, std::int64_t>& interval,
+                                           TimelineClock clock,
+                                           std::uint64_t& first, std::uint64_t& last) const {
+        const auto start_ns = std::max(interval.first, clock.base_ns);
+        const auto end_ns = std::min(interval.second, clock.now_ns);
+        std::int64_t start_frame = 0;
+        std::int64_t end_frame = 0;
+        if (start_ns >= end_ns
+            || !ns_to_frames_signed(core::Nanoseconds{start_ns - clock.base_ns}, start_frame)
+            || !ns_to_frames_signed(core::Nanoseconds{end_ns - clock.base_ns}, end_frame)) {
+            return false;
+        }
+        std::int64_t start_frame_ns = 0;
+        if (!frame_time(static_cast<std::uint64_t>(start_frame), clock.base_ns, start_frame_ns)) {
+            return false;
+        }
+        if (start_frame_ns < start_ns) { ++start_frame; }
+        if (end_frame <= start_frame) { return false; }
+        first = static_cast<std::uint64_t>(start_frame);
+        last = static_cast<std::uint64_t>(end_frame);
+        return true;
+    }
+
+    [[nodiscard]] std::vector<ElapsedRange> elapsed_ranges(TimelineClock clock,
+                                                          std::uint64_t prefix_end) const {
+        std::vector<ElapsedRange> ranges;
+        for (const auto& interval : backpressure) {
+            std::uint64_t first = 0;
+            std::uint64_t last = 0;
+            if (backpressure_frames(interval, clock, first, last)) {
+                ranges.push_back({first, last, false});
+            }
+        }
+        std::uint64_t first = 0;
+        std::uint64_t last = 0;
+        if (idle && backpressure_frames(idle->interval, clock, first, last)) {
+            last = std::min(last, prefix_end);
+            // Backpressure owns overlap. Split the idle range around it so
+            // preflight and advancement use the same disjoint, reason-tagged union.
+            const auto backpressure_count = ranges.size();
+            for (std::size_t i = 0; i < backpressure_count && first < last; ++i) {
+                const auto range = ranges[i];
+                if (range.last <= first) { continue; }
+                if (range.first >= last) { break; }
+                if (range.first > first) { ranges.push_back({first, range.first, true}); }
+                first = std::max(first, range.last);
+            }
+            if (first < last) { ranges.push_back({first, last, true}); }
+        }
+        std::sort(ranges.begin(), ranges.end(), [](const auto& left, const auto& right) {
+            return left.first < right.first;
+        });
+        return ranges;
+    }
 
     void mark_degraded(std::string cause) {
         report.state = RouterState::degraded;
@@ -271,6 +392,8 @@ core::Result<AudioRouter> open_router_with(const RouterConfig& config,
 
     auto impl = std::make_unique<AudioRouter::Impl>();
     impl->config = config;
+    impl->drift = LivePcmDriftCorrector{config.live_pcm_drift,
+                                        config.output_format.sample_rate_hz};
     impl->mixer = AudioMixer{config.mix};
     impl->report.sink.requested = config.backend;
 
@@ -300,6 +423,7 @@ core::Result<AudioRouter> open_router_with(const RouterConfig& config,
         request.write_timeout = config.sink_write_timeout;
         request.drop_nonempty_at_ingress = config.drop_nonempty_at_ingress;
         request.drop_nonempty_after_window = config.drop_nonempty_after_window;
+        request.on_write_progress = config.on_sink_write_progress;
         detail::SinkOpenOutcome outcome = detail::open_default_sink(request);
 
         impl->report.sink = outcome.report;
@@ -342,6 +466,12 @@ AudioRouter::AudioRouter(AudioRouter&& other) noexcept = default;
 AudioRouter& AudioRouter::operator=(AudioRouter&& other) noexcept = default;
 
 core::Result<void> AudioRouter::submit(const protocol::MessageView& message) {
+    return submit(message, core::Nanoseconds{steady_now_ns()});
+}
+
+core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
+                                      core::Nanoseconds receiver_input_at) {
+    if (impl_) { impl_->report.queue_rejection.reset(); }
     if (!impl_ || impl_->closed) {
         return Error{ErrorCode::invalid_argument};
     }
@@ -365,13 +495,17 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message) {
         return Error{ErrorCode::invalid_argument};
     }
     const std::size_t index = role_index(*role);
+    std::lock_guard lock(impl_->pending_mutex);
     if (impl_->pending[index].size() >= kMaxPendingRunsPerRole) {
+        impl_->report.queue_rejection = diagnostics::QueueRejection{
+            diagnostics::QueueSource::audio_router, diagnostics::QueueReason::pending_runs,
+            message.header.channel, impl_->pending[index].size(), kMaxPendingRunsPerRole,
+            0, 0, 0, 0, message.payload.size()};
         return Error{ErrorCode::ipc_queue_full};
     }
 
-    // Gate fix F4: the receiver-input timestamp is taken BEFORE decoding so
-    // decoder waits (e.g. the AAC drain window) are inside the path latency.
-    const std::int64_t submitted_at_ns = steady_now_ns();
+    // Includes owner-side copy/queue wait as well as decoder and render waits.
+    const std::int64_t submitted_at_ns = receiver_input_at.count;
 
     EncodedChunk chunk;
     chunk.role = *role;
@@ -387,6 +521,7 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message) {
     }
 
     Run run;
+    run.header = message.header;
     run.timestamp = message.header.timestamp;
     run.pcm.assign(decoded.value().pcm.begin(), decoded.value().pcm.end());
     const std::uint64_t frame_bytes =
@@ -397,12 +532,20 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message) {
         return Error{ErrorCode::audio_format_unsupported};
     }
 
+    impl_->report.stats.frames_decoded += run.frames;
     impl_->pending[index].push_back(std::move(run));
     impl_->report.stats.chunks_submitted += 1;
     return {};
 }
 
 core::Result<void> AudioRouter::pump() {
+    if (impl_ && impl_->incremental) {
+        for (;;) {
+            auto step = render_step();
+            if (!step) { return step.error(); }
+            if (!step.value().pending) { return {}; }
+        }
+    }
     if (!impl_ || impl_->closed) {
         return Error{ErrorCode::invalid_argument};
     }
@@ -416,6 +559,8 @@ core::Result<void> AudioRouter::pump() {
         impl_->mark_degraded("disabled: routing sink missing");
         return Error{ErrorCode::audio_sink_unavailable};
     }
+
+    std::lock_guard lock(impl_->pending_mutex);
 
     // Gate fix F2 + persistent-cursor fix: mix on a PERSISTENT SAMPLE
     // TIMELINE. The base anchors at the FIRST nonempty pump and the playback
@@ -455,6 +600,8 @@ core::Result<void> AudioRouter::pump() {
 
     std::vector<ScheduledRun> scheduled;
     std::array<std::uint64_t, kRoleCount> new_role_ends = impl_->role_end_frames;
+    std::uint64_t planned_retained = 0;
+    std::uint64_t planned_trimmed = 0;
     bool schedule_ok = true;
     for (std::size_t i = 0; i < kRoleCount; ++i) {
         std::uint64_t role_end = impl_->role_end_frames[i];
@@ -477,11 +624,24 @@ core::Result<void> AudioRouter::pump() {
             const std::int64_t placed = std::max<int64_t>(
                 intended, static_cast<std::int64_t>(std::max(cursor, role_end)));
             entry.start_frame = static_cast<std::uint64_t>(placed);
-            if (run.frames > UINT64_MAX - entry.start_frame) {
+            std::int64_t planned_ns = 0;
+            if (!impl_->frame_time(entry.start_frame, base_ns, planned_ns)) {
                 schedule_ok = false;
                 continue;
             }
-            entry.end_frame = entry.start_frame + run.frames;
+            // Live-PCM drift correction (policy-gated; default off): the
+            // phase is the planned start minus the run's ORIGINAL scheduled
+            // timestamp, measured before the run is committed to the sink.
+            // Over-watermark runs lose bounded head frames and the timeline
+            // advances by the retained frames only.
+            const core::Nanoseconds phase{planned_ns - run.timestamp.count};
+            entry.head_trim_frames = impl_->drift.trim_frames(phase, run.frames);
+            const std::uint64_t retained = run.frames - entry.head_trim_frames;
+            if (retained > UINT64_MAX - entry.start_frame) {
+                schedule_ok = false;
+                continue;
+            }
+            entry.end_frame = entry.start_frame + retained;
             std::int64_t end_ns = 0;
             if (!impl_->frame_time(entry.end_frame, base_ns, end_ns)) {
                 schedule_ok = false;
@@ -490,6 +650,8 @@ core::Result<void> AudioRouter::pump() {
             role_end = entry.end_frame;
             new_role_ends[i] = entry.end_frame;
             entry.run = &run;
+            planned_retained += retained;
+            planned_trimmed += entry.head_trim_frames;
             scheduled.push_back(entry);
         }
     }
@@ -582,8 +744,10 @@ core::Result<void> AudioRouter::pump() {
             }
             // A boundary-split interval always lies inside one run's range
             // for this role slot (same-role runs do not overlap), so the
-            // slice covers the whole interval.
-            const std::uint64_t offset_frames = start - entry.start_frame;
+            // slice covers the whole interval. The retained PCM starts at the
+            // run's head-trim offset inside the decoded buffer.
+            const std::uint64_t offset_frames =
+                entry.head_trim_frames + (start - entry.start_frame);
             const std::size_t byte_offset =
                 static_cast<std::size_t>(offset_frames) * frame_bytes;
             const std::size_t byte_count = static_cast<std::size_t>(frames) * frame_bytes;
@@ -669,6 +833,10 @@ core::Result<void> AudioRouter::pump() {
                     to_write.timestamp, core::Nanoseconds{end_ns},
                     core::Nanoseconds{write_done_ns}});
             }
+            impl_->report.stats.frames_output += piece_frames;
+            if (!any_input) {
+                impl_->report.stats.frames_silence += piece_frames;
+            }
             piece_start += piece_frames;
         }
 
@@ -707,6 +875,8 @@ core::Result<void> AudioRouter::pump() {
     }
     impl_->playback_cursor_frames = timeline_frames;
     impl_->role_end_frames = new_role_ends;
+    impl_->report.stats.frames_retained += planned_retained;
+    impl_->report.stats.frames_trimmed += planned_trimmed;
     for (auto& queue : impl_->pending) {
         queue.clear();
     }
@@ -714,6 +884,396 @@ core::Result<void> AudioRouter::pump() {
     impl_->report.sink_probe = impl_->sink->probe_stats();
     impl_->report.render_barrier = impl_->sink->render_stats();
     return {};
+}
+
+void AudioRouter::cancel_pending(protocol::ChannelRole role) {
+    if (!impl_) { return; }
+    const auto index = role_of(role);
+    if (!index) { return; }
+    std::lock_guard lock(impl_->pending_mutex);
+    impl_->pending[role_index(*index)].clear();
+    impl_->role_end_frames[role_index(*index)] = impl_->playback_cursor_frames;
+    ++impl_->generations[role_index(*index)];
+}
+
+void AudioRouter::note_backpressure(core::Nanoseconds start, core::Nanoseconds end) {
+    if (!impl_ || end <= start) { return; }
+    std::lock_guard lock(impl_->pending_mutex);
+    auto& intervals = impl_->backpressure;
+    std::pair<std::int64_t, std::int64_t> merged{start.count, end.count};
+    std::erase_if(intervals, [&](const auto& interval) {
+        if (interval.second < merged.first || interval.first > merged.second) { return false; }
+        merged = {std::min(merged.first, interval.first), std::max(merged.second, interval.second)};
+        return true;
+    });
+    intervals.insert(std::upper_bound(intervals.begin(), intervals.end(), merged), merged);
+    if (intervals.size() > kMaxBackpressureIntervals) { intervals.erase(intervals.begin()); }
+}
+
+void AudioRouter::note_all_role_idle(core::Nanoseconds start, core::Nanoseconds end) {
+    if (!impl_ || start.count < 0) { return; }
+    end.count = std::min(end.count, steady_now_ns());
+    if (end <= start || end.count - start.count <= 200'000'000) { return; }
+    std::lock_guard lock(impl_->pending_mutex);
+    if (!impl_->closed && !impl_->flushed && !impl_->idle) {
+        impl_->idle = Impl::IdleAuthorization{{start.count, end.count}, {}};
+    }
+}
+
+void AudioRouter::retire_all_role_idle() {
+    if (!impl_) { return; }
+    std::lock_guard lock(impl_->pending_mutex);
+    impl_->idle.reset();
+}
+
+core::Result<RenderStep> AudioRouter::render_step() {
+    if (!impl_) { return Error{ErrorCode::invalid_argument}; }
+    impl_->report.render_failure.reset();
+    std::unique_lock lock(impl_->pending_mutex);
+    RenderFailureSnapshot diagnostic;
+    diagnostic.output_sample_rate = impl_->config.output_format.sample_rate_hz;
+    diagnostic.base_committed = impl_->timeline_base.has_value();
+    if (impl_->timeline_base) { diagnostic.base_ns = impl_->timeline_base->count; }
+    diagnostic.entry_cursor = impl_->playback_cursor_frames;
+    const auto fail = [&](RenderFailureReason reason, std::optional<ErrorCode> code = {}) {
+        if (impl_->report.render_failure) { return; }
+        diagnostic.reason = reason;
+        diagnostic.underlying_code = code;
+        const auto store = [](RenderRangeSummary& summary, const auto& interval) {
+            ++summary.count;
+            summary.start_ns = summary.start_ns ? std::min(*summary.start_ns, interval.first) : interval.first;
+            summary.end_ns = summary.end_ns ? std::max(*summary.end_ns, interval.second) : interval.second;
+        };
+        for (const auto& interval : impl_->backpressure) { store(diagnostic.stored_backpressure, interval); }
+        if (impl_->idle) {
+            store(diagnostic.stored_idle, impl_->idle->interval);
+            diagnostic.stored_idle_prefix = impl_->idle->prefix_end;
+        }
+        impl_->report.render_failure = diagnostic;
+    };
+    if (impl_->closed) { fail(RenderFailureReason::closed); return Error{ErrorCode::invalid_argument}; }
+    if (impl_->report.state == RouterState::degraded) {
+        fail(RenderFailureReason::degraded);
+        return Error{ErrorCode::audio_sink_unavailable};
+    }
+    if (impl_->flushed) { fail(RenderFailureReason::flushed); return Error{ErrorCode::invalid_argument}; }
+    if (!impl_->sink) {
+        fail(RenderFailureReason::missing_sink);
+        impl_->mark_degraded("disabled: routing sink missing");
+        return Error{ErrorCode::audio_sink_unavailable};
+    }
+    impl_->incremental = true;
+    const auto generations = impl_->generations;
+    RenderStep result;
+    auto base = impl_->timeline_base;
+    if (!base) {
+        for (const auto& queue : impl_->pending) {
+            for (const auto& run : queue) {
+                if (!base || run.timestamp < *base) { base = run.timestamp; }
+            }
+        }
+    }
+    if (!base) { return result; }
+    diagnostic.base_ns = base->count;
+    const auto cursor = impl_->playback_cursor_frames;
+    const auto cap = impl_->ns_to_frames(core::Nanoseconds{200'000'000});
+    const auto frame_bytes = static_cast<std::size_t>(impl_->config.output_format.channels) * 2;
+    const auto quantum = std::min<std::uint64_t>(
+        kMaxOutputPieceBytes / frame_bytes,
+        impl_->config.render_quantum.count > 0 ? impl_->ns_to_frames(impl_->config.render_quantum) : 0);
+    diagnostic.cap = cap;
+    diagnostic.quantum = quantum;
+    if (quantum == 0) { fail(RenderFailureReason::zero_quantum); return Error{ErrorCode::audio_format_unsupported}; }
+
+    // Preflight all parents, not just the visible heads: splitting a schedule
+    // into steps must not evade the existing atomic discontinuity policy.
+    // This is a dry run; placement/trim become persistent only on consumption.
+    std::vector<ScheduledRun> planned;
+    bool valid = cursor <= static_cast<std::uint64_t>(INT64_MAX)
+        && quantum <= UINT64_MAX - cursor;
+    if (!valid) {
+        fail(cursor > static_cast<std::uint64_t>(INT64_MAX)
+            ? RenderFailureReason::cursor_range : RenderFailureReason::quantum_end_overflow);
+    }
+    for (std::size_t role = 0; role < kRoleCount && valid; ++role) {
+        auto role_end = impl_->role_end_frames[role];
+        for (const auto& run : impl_->pending[role]) {
+            diagnostic.offending = run.header;
+            diagnostic.preflighted = run.preflighted;
+            diagnostic.role_end = role_end;
+            diagnostic.intended.reset();
+            diagnostic.start.reset();
+            diagnostic.remaining.reset();
+            diagnostic.time_conversion_frame.reset();
+            ScheduledRun entry;
+            entry.role = role;
+            entry.run = &run;
+            entry.role_end_before = role_end;
+            if (run.placed) {
+                entry.start_frame = *run.placed + run.consumed;
+                entry.head_trim_frames = run.trimmed + run.consumed;
+            } else {
+                std::int64_t intended = 0;
+                if (!impl_->ns_to_frames_signed(
+                        core::Nanoseconds{run.timestamp.count - base->count}, intended)) {
+                    fail(RenderFailureReason::intended_time_conversion);
+                    valid = false;
+                    break;
+                }
+                diagnostic.intended = intended;
+                entry.intended = intended;
+                if (!run.preflighted && intended < static_cast<std::int64_t>(cursor)
+                    && static_cast<std::uint64_t>(static_cast<std::int64_t>(cursor) - intended) > cap) {
+                    fail(RenderFailureReason::late);
+                    valid = false;
+                    break;
+                }
+                entry.start_frame = static_cast<std::uint64_t>(std::max<std::int64_t>(
+                    intended, static_cast<std::int64_t>(std::max(cursor, role_end))));
+                diagnostic.start = entry.start_frame;
+                std::int64_t placed_ns = 0;
+                if (!impl_->frame_time(entry.start_frame, base->count, placed_ns)) {
+                    diagnostic.time_conversion_frame = entry.start_frame;
+                    fail(RenderFailureReason::placement_time_conversion);
+                    valid = false;
+                    break;
+                }
+                entry.head_trim_frames = impl_->drift.trim_frames(
+                    core::Nanoseconds{placed_ns - run.timestamp.count}, run.frames);
+            }
+            const auto remaining = run.frames - entry.head_trim_frames;
+            diagnostic.start = entry.start_frame;
+            diagnostic.remaining = remaining;
+            std::int64_t end_ns = 0;
+            if (remaining > UINT64_MAX - entry.start_frame) {
+                fail(RenderFailureReason::parent_end_overflow);
+                valid = false;
+                break;
+            }
+            if (!impl_->frame_time(entry.start_frame + remaining, base->count, end_ns)) {
+                diagnostic.time_conversion_frame = entry.start_frame + remaining;
+                fail(RenderFailureReason::parent_end_time_conversion);
+                valid = false;
+                break;
+            }
+            entry.end_frame = entry.start_frame + remaining;
+            role_end = entry.end_frame;
+            planned.push_back(entry);
+        }
+    }
+    std::stable_sort(planned.begin(), planned.end(), [](const auto& left, const auto& right) {
+        return left.start_frame < right.start_frame;
+    });
+    const auto now_ns = steady_now_ns();
+    diagnostic.now_ns = now_ns;
+    std::int64_t cursor_ns = 0;
+    if (valid && impl_->frame_time(cursor, base->count, cursor_ns)) {
+        std::erase_if(impl_->backpressure, [&](const auto& interval) { return interval.second <= cursor_ns; });
+    }
+    auto prefix_end = cursor;
+    if (!planned.empty() && impl_->idle) {
+        prefix_end = impl_->idle->prefix_end.value_or(planned.front().start_frame);
+        prefix_end = std::min(prefix_end, planned.front().start_frame);
+    }
+    const auto elapsed = impl_->elapsed_ranges({base->count, now_ns}, prefix_end);
+    diagnostic.prefix_end = prefix_end;
+    auto covered_end = cursor;
+    std::uint64_t total_gap = 0;
+    for (const auto& entry : planned) {
+        // As in pump(), even a completely trimmed parent can end a gap. Only
+        // silence still requiring synthesis counts against the caps; time
+        // that already elapsed while credit was withheld is never rendered.
+        if (entry.start_frame > covered_end) {
+            auto gap = entry.start_frame - covered_end;
+            for (const auto& range : elapsed) {
+                const auto lo = std::max(covered_end, range.first);
+                const auto hi = std::min(entry.start_frame, range.last);
+                if (hi > lo) { gap -= hi - lo; }
+            }
+            if (gap > cap || total_gap > cap - gap) {
+                diagnostic.offending = entry.run->header;
+                diagnostic.preflighted = entry.run->preflighted;
+                diagnostic.intended = entry.intended;
+                diagnostic.role_end = entry.role_end_before;
+                diagnostic.start = entry.start_frame;
+                diagnostic.remaining = entry.end_frame - entry.start_frame;
+                diagnostic.time_conversion_frame.reset();
+                diagnostic.covered_end = covered_end;
+                diagnostic.raw_gap = entry.start_frame - covered_end;
+                diagnostic.uncovered_gap = gap;
+                diagnostic.total_gap_before = total_gap;
+                diagnostic.effective_backpressure.emplace();
+                diagnostic.effective_idle.emplace();
+                for (const auto& range : elapsed) {
+                    const auto lo = std::max(covered_end, range.first);
+                    const auto hi = std::min(entry.start_frame, range.last);
+                    if (hi <= lo) { continue; }
+                    auto& summary = range.idle ? *diagnostic.effective_idle : *diagnostic.effective_backpressure;
+                    ++summary.count;
+                    summary.first_frame = summary.first_frame ? std::min(*summary.first_frame, lo) : lo;
+                    summary.last_frame = summary.last_frame ? std::max(*summary.last_frame, hi) : hi;
+                    summary.excluded_frames += hi - lo;
+                }
+                fail(gap > cap ? RenderFailureReason::single_gap : RenderFailureReason::aggregate_gap);
+                valid = false;
+                break;
+            }
+            total_gap += gap;
+        }
+        covered_end = std::max(covered_end, entry.end_frame);
+    }
+    if (!valid) {
+        for (auto& queue : impl_->pending) { queue.clear(); }
+        impl_->idle.reset();
+        return Error{ErrorCode::invalid_argument};
+    }
+    if (!planned.empty() && impl_->idle) { impl_->idle->prefix_end = prefix_end; }
+    for (auto& queue : impl_->pending) {
+        for (auto& run : queue) { run.preflighted = true; }
+    }
+    std::array<std::optional<ScheduledRun>, kRoleCount> heads{};
+    auto end = cursor + quantum;
+    bool any = false;
+    for (const auto& head : planned) {
+        const auto role = head.role;
+        if (heads[role]) { continue; }
+        auto& queue = impl_->pending[role];
+        if (head.start_frame == head.end_frame) {
+            impl_->report.stats.frames_trimmed += head.head_trim_frames;
+            impl_->role_end_frames[role] = head.end_frame;
+            result.completed.push_back(queue.front().header);
+            queue.pop_front();
+            continue;
+        }
+        // Never cross an earlier queued head/end to reach a future role.
+        end = std::min(end, head.start_frame > cursor ? head.start_frame : head.end_frame);
+        heads[role] = head;
+        any = true;
+    }
+    if (!any) { return result; }
+    const bool silence_only = std::none_of(heads.begin(), heads.end(), [&](const auto& head) {
+        return head && head->start_frame <= cursor;
+    });
+    if (silence_only) {
+        auto next_start = UINT64_MAX;
+        for (const auto& head : heads) {
+            if (head) { next_start = std::min(next_start, head->start_frame); }
+        }
+        for (const auto& range : elapsed) {
+            if (range.first <= cursor && cursor < range.last) {
+                const auto skipped = std::min(range.last, next_start) - cursor;
+                impl_->timeline_base = base;
+                impl_->playback_cursor_frames = cursor + skipped;
+                if (range.idle) { impl_->report.stats.frames_idle_skipped += skipped; }
+                else { impl_->report.stats.frames_skipped += skipped; }
+                result.pending = true;
+                return result;
+            }
+            if (range.first > cursor) { end = std::min(end, range.first); }
+        }
+    }
+    const auto frames = end - cursor;
+    std::int64_t scheduled_ns = 0;
+    std::int64_t end_ns = 0;
+    // Interval operands are copied before any parents can be popped/unlocked.
+    diagnostic.offending.reset();
+    diagnostic.preflighted.reset();
+    diagnostic.intended.reset();
+    diagnostic.role_end.reset();
+    diagnostic.start.reset();
+    diagnostic.remaining.reset();
+    diagnostic.output_start = cursor;
+    diagnostic.output_end = end;
+    if (!impl_->frame_time(cursor, base->count, scheduled_ns)) {
+        diagnostic.time_conversion_frame = cursor;
+        fail(RenderFailureReason::output_start_time_conversion);
+        return Error{ErrorCode::invalid_argument};
+    }
+    if (!impl_->frame_time(end, base->count, end_ns)) {
+        diagnostic.time_conversion_frame = end;
+        fail(RenderFailureReason::output_end_time_conversion);
+        return Error{ErrorCode::invalid_argument};
+    }
+    std::array<PcmChunk, kRoleCount> materialized{};
+    std::array<const PcmChunk*, kRoleCount> pieces{};
+    std::optional<std::int64_t> oldest;
+    for (std::size_t role = 0; role < kRoleCount; ++role) {
+        if (!heads[role] || heads[role]->start_frame > cursor) { continue; }
+        const auto& head = *heads[role];
+        auto& run = impl_->pending[role].front();
+        if (!run.placed) {
+            run.placed = head.start_frame;
+            run.trimmed = head.head_trim_frames;
+            impl_->report.stats.frames_trimmed += run.trimmed;
+        }
+        materialized[role] = PcmChunk{static_cast<Role>(role), impl_->config.output_format,
+            core::Nanoseconds{scheduled_ns}, std::span<const std::byte>{run.pcm}.subspan(
+                static_cast<std::size_t>(head.head_trim_frames) * frame_bytes,
+                static_cast<std::size_t>(frames) * frame_bytes)};
+        pieces[role] = &materialized[role];
+        oldest = oldest ? std::min(*oldest, run.submitted_at_ns) : run.submitted_at_ns;
+        result.contributors.push_back(run.header);
+    }
+    // Materialize before detaching: cancel_pending can now free EVERY parent
+    // remainder while this single, bounded mixed piece is inside sink->write.
+    std::vector<std::byte> output;
+    if (oldest) {
+        auto mixed = impl_->mixer.mix(MixFrame{core::Nanoseconds{scheduled_ns}, frames, pieces});
+        if (!mixed) { fail(RenderFailureReason::mixer_error, mixed.error().code()); return mixed.error(); }
+        output.assign(mixed.value().pcm.begin(), mixed.value().pcm.end());
+    } else {
+        output.assign(static_cast<std::size_t>(frames) * frame_bytes, std::byte{0});
+    }
+    for (std::size_t role = 0; role < kRoleCount; ++role) {
+        if (!pieces[role]) { continue; }
+        impl_->idle.reset();
+        auto& run = impl_->pending[role].front();
+        run.consumed += frames;
+        impl_->role_end_frames[role] = end;
+        if (run.trimmed + run.consumed == run.frames) {
+            result.completed.push_back(run.header);
+            impl_->pending[role].pop_front();
+        }
+    }
+    impl_->timeline_base = base;
+    impl_->playback_cursor_frames = end;
+    lock.unlock();
+    const auto written = impl_->sink->write(MixedChunk{
+        impl_->config.output_format, core::Nanoseconds{scheduled_ns}, output});
+    const auto done = steady_now_ns();
+    impl_->report.sink_probe = impl_->sink->probe_stats();
+    impl_->report.render_barrier = impl_->sink->render_stats();
+    if (!written) {
+        lock.lock();
+        fail(RenderFailureReason::sink_write_error, written.error().code());
+        for (auto& queue : impl_->pending) { queue.clear(); }
+        impl_->mark_degraded("disabled: routing write failed ("
+            + std::string{to_string(written.error().code())} + "); output no longer accepting audio");
+        return Error{ErrorCode::audio_sink_unavailable};
+    }
+    auto& stats = impl_->report.stats;
+    ++stats.frames_mixed;
+    ++stats.frames_written;
+    stats.samples_written += frames * impl_->config.output_format.channels;
+    stats.frames_output += frames;
+    stats.frames_retained += frames * result.contributors.size();
+    if (oldest) {
+        stats.last_path_latency = core::Nanoseconds{done - *oldest};
+        stats.max_path_latency = std::max(stats.max_path_latency, stats.last_path_latency);
+        stats.last_completion_skew = core::Nanoseconds{done - scheduled_ns};
+        stats.max_completion_skew = std::max(stats.max_completion_skew, stats.last_completion_skew);
+        if (impl_->config.on_write_completed) {
+            impl_->config.on_write_completed(WriteCompletion{core::Nanoseconds{scheduled_ns},
+                core::Nanoseconds{end_ns}, core::Nanoseconds{done}});
+        }
+    } else { stats.frames_silence += frames; }
+    lock.lock();
+    std::erase_if(result.completed, [&](const auto& header) {
+        const auto role = role_of(header.channel);
+        return role && generations[role_index(*role)] != impl_->generations[role_index(*role)];
+    });
+    for (const auto& queue : impl_->pending) { result.pending = result.pending || !queue.empty(); }
+    return result;
 }
 
 core::Result<void> AudioRouter::flush() {
@@ -765,7 +1325,7 @@ void AudioRouter::set_muted(bool muted) noexcept {
 }
 
 void AudioRouter::close() noexcept {
-    if (!impl_) {
+    if (!impl_ || impl_->closed) {
         return;
     }
     impl_->closed = true;
@@ -781,12 +1341,14 @@ void AudioRouter::close() noexcept {
         // A flushed route already spent its single terminal EOS drain - a
         // second one is never sent (and never retried after a failed one).
         if (!impl_->flushed) {
+            impl_->flushed = true;
             (void)impl_->sink->drain(core::Milliseconds{2000});
         }
         impl_->report.sink_probe = impl_->sink->probe_stats();
         impl_->report.render_barrier = impl_->sink->render_stats();
     }
     impl_->sink.reset();
+    std::lock_guard lock(impl_->pending_mutex);
     for (auto& queue : impl_->pending) {
         queue.clear();
     }
