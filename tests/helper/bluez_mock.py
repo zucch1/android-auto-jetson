@@ -38,6 +38,7 @@ class MockBluez:
         self.fail_remove = False
         self.fail_set = False
         self.slow_inventory = False
+        self.fail_inventory = False
         self.owner_during_inventory = False
         self.removed: list[str] = []
         self.cancel_unpaired = 0
@@ -78,6 +79,9 @@ class MockBluez:
                method: str, args: GLib.Variant, invocation: Gio.DBusMethodInvocation) -> None:
         match method:
             case "GetManagedObjects":
+                if self.fail_inventory:
+                    invocation.return_dbus_error("org.bluez.Error.Failed", "fixture inventory failure")
+                    return
                 if self.owner_during_inventory:
                     self.owner_during_inventory = False
                     self.name("ReleaseName", GLib.Variant("(s)", ("org.bluez",)))
@@ -229,6 +233,8 @@ class MockBluez:
             case "allow-set": self.fail_set = False
             case "slow-inventory": self.slow_inventory = True
             case "fast-inventory": self.slow_inventory = False
+            case "fail-inventory": self.fail_inventory = True
+            case "allow-inventory": self.fail_inventory = False
             case "release-name": self.name("ReleaseName", GLib.Variant("(s)", ("org.bluez",)))
             case "acquire-name": self.name("RequestName", GLib.Variant("(su)", ("org.bluez", 0)))
             case "fd-eof":
