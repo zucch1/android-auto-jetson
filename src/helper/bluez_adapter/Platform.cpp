@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Platform.hpp"
 #include "Startup.hpp"
+#include <algorithm>
 #include <unistd.h>
 
 namespace aa::helper {
@@ -121,7 +122,17 @@ void BluezBackend::Impl::close_admission() {
     window = {};
     pairing_enabled = false;
     if (allowed) {
-        if (auto* reply = call(allowed->device.path.c_str(), "org.bluez.Device1", "CancelPairing", nullptr)) g_variant_unref(reply);
+        // BlueZ turns CancelPairing without an in-flight Pair() into MGMT Unpair Device, which
+        // drops the kernel link key of a just-completed bond. Only cancel pairing confirmed as
+        // unbonded; an unknown bond state (failed inventory) must not risk unpairing.
+        std::vector<Device> devices;
+        if (inventory(devices)) {
+            const bool bonded = std::any_of(devices.begin(), devices.end(),
+                [&](const Device& device) { return device.path == allowed->device.path && device.bonded; });
+            if (!bonded) {
+                if (auto* reply = call(allowed->device.path.c_str(), "org.bluez.Device1", "CancelPairing", nullptr)) g_variant_unref(reply);
+            }
+        }
     }
     allowed.reset();
     quiet_pending = !quiet();
