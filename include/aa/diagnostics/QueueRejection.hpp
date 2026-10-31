@@ -38,6 +38,8 @@ enum class QueueReason { payload_oversize, slots, bytes, weighted_units, data, c
 // that dimension is not used by this gate. AV requested_bytes counts the wire
 // message payload; worker/router requested_bytes counts stripped media bytes.
 // Worker units are rounded input-frame bytes (voice weighted 6x).
+// Worker occupancy/caps are role-local. Remaining permits exclude this arrival's
+// consumed credit. Their total charges are reserved_bytes/reserved_units.
 struct QueueRejection final {
     QueueSource source;
     QueueReason reason;
@@ -50,6 +52,10 @@ struct QueueRejection final {
     std::size_t unit_capacity{};
     std::size_t requested_bytes{};
     std::size_t requested_units{};
+    std::size_t requested_items{};
+    std::size_t remaining_permits{};
+    std::size_t reserved_bytes{};
+    std::size_t reserved_units{};
     [[nodiscard]] friend bool operator==(const QueueRejection&, const QueueRejection&) = default;
 };
 

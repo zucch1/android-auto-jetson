@@ -402,7 +402,14 @@ std::string poll_error_json(aa::ErrorCode code,
                 ",\"units\":" + std::to_string(queue->units) +
                 ",\"unit_capacity\":" + std::to_string(queue->unit_capacity) +
                 ",\"requested_bytes\":" + std::to_string(queue->requested_bytes) +
-                ",\"requested_units\":" + std::to_string(queue->requested_units) + "}";
+                ",\"requested_units\":" + std::to_string(queue->requested_units);
+        if (queue->source == aa::diagnostics::QueueSource::audio_worker) {
+            line += ",\"requested_items\":" + std::to_string(queue->requested_items) +
+                    ",\"remaining_permits\":" + std::to_string(queue->remaining_permits) +
+                    ",\"reserved_bytes\":" + std::to_string(queue->reserved_bytes) +
+                    ",\"reserved_units\":" + std::to_string(queue->reserved_units);
+        }
+        line += "}";
         if (audio && audio->queue == *queue) {
             line += ",\"audio_rejection\":" + audio_rejection_json(*audio);
         }
@@ -510,7 +517,13 @@ class ConcreteAudioRenderWorker final {
         const auto reject = [&](aa::diagnostics::QueueReason reason, std::size_t units) {
             last_queue_rejection_ = aa::diagnostics::QueueRejection{
                 aa::diagnostics::QueueSource::audio_worker, reason, message.header.channel,
-                slots_, kMaxSlots, bytes_, kMaxBytes, units_, kMaxUnits, bytes, units};
+                role_slots_[*role], kRoleSlots, role_bytes_[*role], capacity(*role).bytes,
+                role_units_[*role], capacity(*role).units, bytes, units, 1,
+                credits_[*role].empty() ? 0 : credits_[*role].size() - 1};
+            last_queue_rejection_->reserved_bytes =
+                last_queue_rejection_->remaining_permits * envelope(*role).bytes;
+            last_queue_rejection_->reserved_units =
+                last_queue_rejection_->remaining_permits * envelope(*role).units;
             AudioRejectionSnapshot snapshot{
                 *last_queue_rejection_, monotonic_now(),
                 {id, message.header.sequence, message.header.timestamp, receiver_input_at}, active_};
@@ -758,8 +771,6 @@ class ConcreteAudioRenderWorker final {
         return index == 0 ? Reservation{38400, 38400} : Reservation{6400, 38400};
     }
     static constexpr std::size_t kMaxSlots = kAdvertisedRoles * kRoleSlots;
-    static constexpr std::size_t kMaxBytes = 38400 + 2 * 6400;
-    static constexpr std::size_t kMaxUnits = kAdvertisedRoles * 38400;
     // Each call owns its batch: no shared publication queue or lock-held logging.
     // At most kMaxSlots parents can contribute or receive a deferred credit in
     // one reconciliation. Idle completion retires its ID on the first capture.

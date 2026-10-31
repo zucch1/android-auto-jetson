@@ -3595,6 +3595,8 @@ TEST_F(ReceiverAudioDispatch, PollJsonDistinguishesAvPendingDataAndConfigAndSurv
                   std::string::npos) << json;
         EXPECT_NE(json.find("\"source\":\"av_pending\""), std::string::npos) << json;
         EXPECT_NE(json.find("\"items\":1,\"capacity\":1"), std::string::npos) << json;
+        EXPECT_EQ(json.find("remaining_permits"), std::string::npos) << json;
+        EXPECT_EQ(json.find("reserved_bytes"), std::string::npos) << json;
         EXPECT_EQ(json.find("reject_channel"), std::string::npos);
         EXPECT_EQ(transport.wire.sent_count(), before);
     }
@@ -3623,9 +3625,10 @@ TEST_F(ReceiverAudioDispatch, PollJsonReportsWorkerSlotCapacityAndClearsOnNextPo
     const auto json = poll_error_json(result.error().code(), {}, audio.last_queue_rejection(),
                                       audio.current_rejection_snapshot());
     EXPECT_NE(json.find("\"source\":\"audio_worker\",\"reason\":\"slots\""), std::string::npos) << json;
-    EXPECT_NE(json.find("\"items\":4,\"capacity\":12,\"bytes\":16,\"byte_capacity\":51200,\"units\":16"),
+    EXPECT_NE(json.find("\"items\":4,\"capacity\":4,\"bytes\":16,\"byte_capacity\":38400,\"units\":16,\"unit_capacity\":38400"),
               std::string::npos) << json;
-    EXPECT_NE(json.find("\"requested_bytes\":4,\"requested_units\":4"), std::string::npos) << json;
+    EXPECT_NE(json.find("\"requested_bytes\":4,\"requested_units\":4,\"requested_items\":1,\"remaining_permits\":0,\"reserved_bytes\":0,\"reserved_units\":0"),
+              std::string::npos) << json;
     const auto frozen = audio.rejection_snapshot();
     ASSERT_TRUE(frozen);
     ASSERT_TRUE(frozen->active);
@@ -4013,14 +4016,18 @@ TEST_F(ReceiverAudioDispatch, PollJsonReportsWorkerByteCapacityBeforeWeightedCap
         if (i == 0) { ASSERT_TRUE(gate->wait_writes(1)); }
     }
     ASSERT_TRUE(receive(101, av_data_message(2, std::vector<std::byte>(1600, std::byte{1}))));
+    const auto before = transport.wire.sent_count();
     const auto result = audio.submit({{role, 99, {base}}, std::span{pcm}.first(4)}, {role, 100, 99, 7});
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code(), aa::ErrorCode::ipc_queue_full);
     const auto json = poll_error_json(result.error().code(), {}, audio.last_queue_rejection(),
                                       audio.current_rejection_snapshot());
     EXPECT_NE(json.find("\"source\":\"audio_worker\",\"reason\":\"bytes\""), std::string::npos) << json;
-    EXPECT_NE(json.find("\"items\":3,\"capacity\":12,\"bytes\":40000,\"byte_capacity\":51200,\"units\":48000"),
+    EXPECT_NE(json.find("\"items\":2,\"capacity\":4,\"bytes\":38400,\"byte_capacity\":38400,\"units\":38400,\"unit_capacity\":38400"),
               std::string::npos) << json;
+    EXPECT_NE(json.find("\"requested_bytes\":4,\"requested_units\":4,\"requested_items\":1,\"remaining_permits\":0,\"reserved_bytes\":0,\"reserved_units\":0"),
+              std::string::npos) << json;
+    EXPECT_EQ(transport.wire.sent_count(), before);
     const auto frozen = audio.rejection_snapshot();
     ASSERT_TRUE(frozen);
     ASSERT_TRUE(session.fail(result.error()));
@@ -4031,6 +4038,136 @@ TEST_F(ReceiverAudioDispatch, PollJsonReportsWorkerByteCapacityBeforeWeightedCap
     ASSERT_TRUE(audio.finish());
     EXPECT_EQ(audio.rejection_snapshot(), frozen);
     EXPECT_EQ(poll_error_json(result.error().code(), {}, frozen->queue, frozen), json);
+}
+
+TEST(WiredReceiver, PollJsonPreservesSyntheticNonzeroReservationsAndRequiresExactSnapshotCorrelation) {
+    const aa::diagnostics::QueueRejection queue{
+        aa::diagnostics::QueueSource::audio_worker, aa::diagnostics::QueueReason::bytes,
+        aa::protocol::ChannelRole::media_audio, 2, 4, 19204, 38400, 19204, 38400,
+        4, 4, 1, 1, 19200, 19200};
+    const AudioRejectionSnapshot snapshot{queue, {123},
+        {{aa::protocol::ChannelRole::media_audio, 100, 99, 7}, 99, {100}, {110}}};
+    const auto json = poll_error_json(aa::ErrorCode::ipc_queue_full, {}, queue, snapshot);
+    EXPECT_NE(json.find("\"requested_bytes\":4,\"requested_units\":4,\"requested_items\":1,\"remaining_permits\":1,\"reserved_bytes\":19200,\"reserved_units\":19200}"),
+              std::string::npos) << json;
+    EXPECT_NE(json.find("\"audio_rejection\":"), std::string::npos) << json;
+    for (const auto field : {&aa::diagnostics::QueueRejection::remaining_permits,
+                             &aa::diagnostics::QueueRejection::reserved_bytes,
+                             &aa::diagnostics::QueueRejection::reserved_units,
+                             &aa::diagnostics::QueueRejection::requested_items}) {
+        auto unrelated = queue;
+        ++(unrelated.*field);
+        EXPECT_EQ(poll_error_json(aa::ErrorCode::ipc_queue_full, {}, unrelated, snapshot)
+                      .find("\"audio_rejection\":"), std::string::npos);
+    }
+    for (const auto source : {aa::diagnostics::QueueSource::av_pending,
+                              aa::diagnostics::QueueSource::audio_router}) {
+        auto other = queue;
+        other.source = source;
+        const auto other_json = poll_error_json(aa::ErrorCode::ipc_queue_full, {}, other, snapshot);
+        EXPECT_EQ(other_json.find("remaining_permits"), std::string::npos);
+        EXPECT_EQ(other_json.find("reserved_bytes"), std::string::npos);
+        EXPECT_EQ(other_json.find("reserved_units"), std::string::npos);
+        EXPECT_EQ(other_json.find("requested_items"), std::string::npos);
+        EXPECT_EQ(other_json.find("\"audio_rejection\":"), std::string::npos);
+    }
+}
+
+TEST_F(ReceiverAudioDispatch, PollJsonReportsWorkerSlotPrecedenceWithOtherRolesOccupied) {
+    const auto media = aa::protocol::ChannelRole::media_audio;
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    const std::vector<std::byte> pcm(9600, std::byte{1});
+    audio.invalidate(media, 100);
+    for (std::uint64_t i = 1; i <= 4; ++i) {
+        ASSERT_TRUE(audio.submit({{media, i, {base + static_cast<std::int64_t>(i - 1) * 50'000'000}}, pcm},
+                                 {media, 100, i, 7}));
+        if (i == 1) { ASSERT_TRUE(gate->wait_writes(1)); }
+    }
+    ASSERT_TRUE(start_audio_channel(101));
+    ASSERT_TRUE(receive(101, av_data_message(1, std::vector<std::byte>(1600, std::byte{1}))));
+    const auto before = transport.wire.sent_count();
+    const auto result = audio.submit({{media, 99, {base}}, std::span{pcm}.first(4)},
+                                     {media, 100, 99, 7});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::ipc_queue_full);
+    const auto frozen = audio.rejection_snapshot();
+    ASSERT_TRUE(frozen);
+    // All three guards exceed their caps; slots must retain first precedence.
+    const auto json = poll_error_json(result.error().code(), {}, frozen->queue, frozen);
+    EXPECT_NE(json.find("\"source\":\"audio_worker\",\"reason\":\"slots\",\"role\":1,\"items\":4,\"capacity\":4,\"bytes\":38400,\"byte_capacity\":38400,\"units\":38400,\"unit_capacity\":38400"),
+              std::string::npos) << json;
+    EXPECT_NE(json.find("\"requested_bytes\":4,\"requested_units\":4,\"requested_items\":1,\"remaining_permits\":0,\"reserved_bytes\":0,\"reserved_units\":0"),
+              std::string::npos) << json;
+    EXPECT_EQ(frozen->occupied_by_role, (std::array<std::size_t, 4>{4, 1, 0, 0}));
+    EXPECT_EQ(frozen->pending_completions_by_role, (std::array<std::size_t, 4>{2, 0, 0, 0}));
+    std::vector<aa::channels::AvDeliveryId> credits;
+    while (const auto id = audio.take_completion()) { credits.push_back(*id); }
+    ASSERT_EQ(credits.size(), 2U);
+    EXPECT_EQ(transport.wire.sent_count(), before);
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    while (const auto id = audio.take_completion()) { credits.push_back(*id); }
+    ASSERT_EQ(credits.size(), 5U);
+    for (std::uint64_t i = 1; i <= 4; ++i) {
+        EXPECT_EQ(std::count(credits.begin(), credits.end(), aa::channels::AvDeliveryId{media, 100, i, 7}), 1);
+    }
+    EXPECT_EQ(std::count_if(credits.begin(), credits.end(), [guidance](const auto &id) {
+        return id.role == guidance;
+    }), 1);
+    EXPECT_FALSE(audio.failure());
+    ASSERT_TRUE(audio.finish());
+    EXPECT_EQ(audio.rejection_snapshot(), frozen);
+    EXPECT_EQ(poll_error_json(result.error().code(), {}, frozen->queue, frozen), json);
+    EXPECT_EQ(transport.wire.sent_count(), before);
+}
+
+TEST_F(ReceiverAudioDispatch, RemainingPermitReservesNextEnvelopeWithoutChangingAdmissionOrCredit) {
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> half_envelope(9600, std::byte{1});
+    audio.invalidate(role, 100);
+    for (std::uint64_t i = 1; i <= 4; ++i) {
+        ASSERT_TRUE(audio.submit({{role, i, {base + static_cast<std::int64_t>(i - 1) * 50'000'000}}, half_envelope},
+                                 {role, 100, i, 7}));
+        if (i == 1) { ASSERT_TRUE(gate->wait_writes(1)); }
+    }
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    for (std::uint64_t i = 1; i <= 4; ++i) {
+        EXPECT_EQ(audio.take_completion(), (aa::channels::AvDeliveryId{role, 100, i, 7}));
+    }
+    EXPECT_FALSE(audio.take_completion());
+    const auto drained = audio.credit_observation_for_test();
+    ASSERT_GT(drained.size, 0U);
+    EXPECT_EQ(drained.events[drained.size - 1].worker.roles[0].credits, 2U);
+    std::size_t prior_writes;
+    {
+        std::lock_guard lock(gate->mutex);
+        gate->released = false;
+        prior_writes = gate->writes;
+    }
+    const auto before = transport.wire.sent_count();
+    const std::vector<std::byte> envelope(19200, std::byte{1});
+    const aa::channels::AvDeliveryId id{role, 100, 5, 7};
+    // Of two outstanding permits, this arrival consumes one. The other still
+    // reserves a full envelope; request + reservation exactly fits 38400.
+    ASSERT_TRUE(audio.submit({{role, 5, {base + 200'000'000}}, envelope}, id));
+    ASSERT_TRUE(gate->wait_writes(prior_writes + 1));
+    const auto held = audio.credit_observation_for_test();
+    ASSERT_GT(held.size, 0U);
+    const auto state = held.events[held.size - 1].worker.roles[0];
+    EXPECT_EQ(state.slots, 1U);
+    EXPECT_EQ(state.bytes, 19200U);
+    EXPECT_EQ(state.units, 19200U);
+    EXPECT_EQ(state.credits, 1U);
+    EXPECT_FALSE(audio.last_queue_rejection());
+    EXPECT_FALSE(audio.take_completion());
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    EXPECT_EQ(audio.take_completion(), id);
+    EXPECT_FALSE(audio.take_completion());
+    EXPECT_FALSE(audio.failure());
+    ASSERT_TRUE(audio.finish());
+    EXPECT_EQ(transport.wire.sent_count(), before);
 }
 
 TEST_F(ReceiverAudioDispatch, PollJsonReportsWorkerWeightedUnitsAcrossAudioRoles) {
@@ -4055,9 +4192,10 @@ TEST_F(ReceiverAudioDispatch, PollJsonReportsWorkerWeightedUnitsAcrossAudioRoles
     const auto json = poll_error_json(result.error().code(), {}, audio.last_queue_rejection(),
                                       audio.current_rejection_snapshot());
     EXPECT_NE(json.find("\"source\":\"audio_worker\",\"reason\":\"weighted_units\""), std::string::npos) << json;
-    EXPECT_NE(json.find("\"items\":4,\"capacity\":12,\"bytes\":27203,\"byte_capacity\":51200,\"units\":67204"),
+    EXPECT_NE(json.find("\"items\":1,\"capacity\":4,\"bytes\":6399,\"byte_capacity\":6400,\"units\":38400,\"unit_capacity\":38400"),
               std::string::npos) << json;
-    EXPECT_NE(json.find("\"requested_bytes\":1,\"requested_units\":12"), std::string::npos) << json;
+    EXPECT_NE(json.find("\"requested_bytes\":1,\"requested_units\":12,\"requested_items\":1,\"remaining_permits\":0,\"reserved_bytes\":0,\"reserved_units\":0"),
+              std::string::npos) << json;
     ASSERT_TRUE(session.fail(result.error()));
     EXPECT_EQ(poll_error_json(result.error().code(), {}, audio.last_queue_rejection(),
                               audio.current_rejection_snapshot()), json);
@@ -4966,12 +5104,12 @@ TEST(WiredReceiver, WorkerCapacityChargesReservationsUntilRenderAndRejectsOverfl
         EXPECT_EQ(rejection->source, aa::diagnostics::QueueSource::audio_worker);
         EXPECT_EQ(rejection->reason, scenario == 0 ? aa::diagnostics::QueueReason::slots
             : aa::diagnostics::QueueReason::bytes);
-        EXPECT_EQ(rejection->items, admitted.size());
-        EXPECT_EQ(rejection->capacity, 12U);
-        EXPECT_EQ(rejection->byte_capacity, 51200U);
-        EXPECT_EQ(rejection->unit_capacity, 115200U);
-        EXPECT_EQ(rejection->bytes, scenario == 0 ? 16U : scenario == 1 ? 38400U : 25600U);
-        EXPECT_EQ(rejection->units, scenario == 0 ? 16U : scenario == 1 ? 38400U : 57600U);
+        EXPECT_EQ(rejection->items, scenario == 2 ? 1U : admitted.size());
+        EXPECT_EQ(rejection->capacity, 4U);
+        EXPECT_EQ(rejection->byte_capacity, scenario == 2 ? 6400U : 38400U);
+        EXPECT_EQ(rejection->unit_capacity, 38400U);
+        EXPECT_EQ(rejection->bytes, scenario == 0 ? 16U : scenario == 1 ? 38400U : 6400U);
+        EXPECT_EQ(rejection->units, scenario == 0 ? 16U : 38400U);
         EXPECT_EQ(rejection->requested_bytes, 1U);
         EXPECT_EQ(rejection->requested_units, scenario == 2 ? 12U : 4U);
         const auto charged = audio.rejection_snapshot();
