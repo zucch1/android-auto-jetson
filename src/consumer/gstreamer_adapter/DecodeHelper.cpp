@@ -192,7 +192,9 @@ struct DecodeHelper::Impl final {
         // Streaming is stopped before removing the probe or clearing its data.
         // No observer lock is held across any GStreamer operation.
         if (arrival_pad != nullptr) {
-            gst_pad_remove_probe(arrival_pad, arrival_probe);
+            if (arrival_probe != 0) {
+                gst_pad_remove_probe(arrival_pad, arrival_probe);
+            }
             gst_object_unref(arrival_pad);
             arrival_pad = nullptr;
             arrival_probe = 0;
@@ -361,8 +363,7 @@ core::Result<void> DecodeHelper::Impl::build_pipeline(const std::string& decoder
         arrival_probe = gst_pad_add_probe(arrival_pad, kDecodeArrivalProbeTypes,
                                          observe_decode_arrival, &arrivals, nullptr);
     }
-    if (arrival_pad == nullptr || arrival_probe == 0 ||
-        gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
         release();
         return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
     }
