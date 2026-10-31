@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ProjectionWidget.hpp"
 
+#include <QColor>
+#include <QFont>
+#include <QFocusEvent>
+#include <QFontMetrics>
+#include <QHideEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
+#include <QPen>
+#include <QRectF>
 
 #include <algorithm>
 #include <chrono>
@@ -74,11 +81,78 @@ namespace {
     return image;
 }
 
+[[nodiscard]] int ui_unit(int widget_height) noexcept { return std::max(11, widget_height / 45); }
+
+[[nodiscard]] QColor state_color(DisplayState state) noexcept {
+    switch (state) {
+    case DisplayState::unavailable: return {158, 158, 158};
+    case DisplayState::idle: return {255, 179, 0};
+    case DisplayState::projecting: return {67, 160, 71};
+    case DisplayState::stop_failed: return {229, 57, 53};
+    }
+    return {158, 158, 158};
+}
+
+[[nodiscard]] QString state_hint(DisplayState state) {
+    switch (state) {
+    case DisplayState::unavailable:
+        return QStringLiteral("Receiver not found on the session bus. Start the receiver, then relaunch.");
+    case DisplayState::idle: return QStringLiteral("Press F5 to start projection");
+    case DisplayState::projecting: return QStringLiteral("Waiting for video from the phone… (F6 stops)");
+    case DisplayState::stop_failed: return QStringLiteral("Stop was not confirmed. Press F6 to retry.");
+    }
+    return {};
+}
+
+[[nodiscard]] std::int64_t steady_now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 } // namespace
 
+void FpsMeter::note(std::int64_t presented_ns) noexcept {
+    if (last_ns_ == 0 || presented_ns - last_ns_ >= kStaleNs) {
+        window_start_ns_ = presented_ns;
+        window_count_ = 0;
+        fps_ = 0.0;
+    } else {
+        ++window_count_;
+        const auto elapsed_ns = presented_ns - window_start_ns_;
+        if (elapsed_ns >= kWindowNs) {
+            fps_ = static_cast<double>(window_count_) * 1e9 / static_cast<double>(elapsed_ns);
+            window_start_ns_ = presented_ns;
+            window_count_ = 0;
+        }
+    }
+    last_ns_ = presented_ns;
+}
+
+std::optional<double> FpsMeter::reading(std::int64_t now_ns) const noexcept {
+    if (fps_ <= 0.0 || now_ns - last_ns_ >= kStaleNs) {
+        return std::nullopt;
+    }
+    return fps_;
+}
+
+void FpsMeter::reset() noexcept { *this = FpsMeter{}; }
+
 ProjectionWidget::ProjectionWidget(InputSink& input, protocol::VideoProfile caps, QWidget* parent)
-    : QWidget(parent), input_(input), width_(caps.width), height_(caps.height) {
-    setFixedSize(static_cast<int>(caps.width), static_cast<int>(caps.height));
+    : QWidget(parent), input_(input), width_(caps.width), height_(caps.height), fps_cap_(caps.fps) {
+    resize(static_cast<int>(caps.width), static_cast<int>(caps.height));
+    setMinimumSize(std::max(1, static_cast<int>(caps.width) / 4),
+                   std::max(1, static_cast<int>(caps.height) / 4));
+    setAttribute(Qt::WA_OpaquePaintEvent);
+    setFocusPolicy(Qt::StrongFocus);
+    setCursor(Qt::CrossCursor);
+    connect(&fps_expiry_, &QTimer::timeout, this, [this] { expire_stale_fps(); });
+    fps_expiry_.start(500);
+}
+
+void ProjectionWidget::expire_stale_fps() {
+    if (fps_shown_ && hud_visible_ && !fps_meter_.reading(steady_now_ns()).has_value()) {
+        update();
+    }
 }
 
 void ProjectionWidget::on_frame(const consumer::DecodedFrame& frame) {
@@ -94,8 +168,21 @@ void ProjectionWidget::on_frame(const consumer::DecodedFrame& frame) {
 }
 
 void ProjectionWidget::set_status(DisplayState state) {
+    state_ = state;
     const auto text = to_string(state);
     status_ = QString::fromUtf8(text.data(), static_cast<qsizetype>(text.size()));
+    if (state != DisplayState::projecting) {
+        cancel_touch();
+    }
+    if (state == DisplayState::idle || state == DisplayState::unavailable) {
+        pending_.clear();
+        frame_ = QImage{};
+        presentation_pending_ = false;
+        fps_meter_.reset();
+    }
+    if (isWindow()) {
+        setWindowTitle(QStringLiteral("Android Auto dummy display (test only) - %1").arg(status_));
+    }
     update();
 }
 
@@ -114,6 +201,16 @@ QString ProjectionWidget::status_text() const { return status_; }
 
 std::uint64_t ProjectionWidget::frames_painted() const noexcept { return frames_painted_; }
 
+bool ProjectionWidget::hud_visible() const noexcept { return hud_visible_; }
+
+QRect ProjectionWidget::video_rect() const {
+    if (width_ == 0 || height_ == 0) {
+        return rect();
+    }
+    const QSize fitted = QSize(width_, height_).scaled(size(), Qt::KeepAspectRatio);
+    return {QPoint((width() - fitted.width()) / 2, (height() - fitted.height()) / 2), fitted};
+}
+
 void ProjectionWidget::paintEvent(QPaintEvent*) {
     QPainter painter(this);
     if (frame_.isNull() && !pending_.empty()) {
@@ -124,21 +221,25 @@ void ProjectionWidget::paintEvent(QPaintEvent*) {
         frame_ = i420_to_image(frame);
     }
     if (frame_.isNull()) {
-        painter.fillRect(rect(), QColor(24, 24, 24));
+        paint_placeholder(painter);
     } else {
-        painter.drawImage(rect(), frame_);
+        const QRect area = video_rect();
+        if (area != rect()) {
+            painter.fillRect(rect(), Qt::black);
+        }
+        painter.drawImage(area, frame_);
         ++frames_painted_;
+        if (hud_visible_) {
+            paint_hud(painter);
+        }
     }
-    painter.setPen(Qt::white);
-    painter.drawText(rect().adjusted(6, 4, -6, -4), Qt::AlignLeft | Qt::AlignTop, status_);
     if (!error_.isEmpty()) {
-        painter.setPen(Qt::red);
-        painter.drawText(rect().adjusted(6, 4, -6, -4), Qt::AlignLeft | Qt::AlignBottom, error_);
+        paint_error(painter);
     }
     painter.end();
     if (!frame_.isNull() && presentation_pending_) {
-        const auto completed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto completed = steady_now_ns();
+        fps_meter_.note(completed);
         ++presentations_;
         std::printf("{\"event\":\"video_presented\",\"frame\":%llu,\"scheduled_ns\":%llu,"
                     "\"completed_ns\":%lld,\"count\":%llu}\n",
@@ -149,6 +250,153 @@ void ProjectionWidget::paintEvent(QPaintEvent*) {
         std::fflush(stdout);
         presentation_pending_ = false;
     }
+}
+
+void ProjectionWidget::paint_placeholder(QPainter& painter) const {
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setRenderHint(QPainter::TextAntialiasing);
+    painter.fillRect(rect(), QColor(12, 13, 15));
+    const QRect area = video_rect();
+    painter.fillRect(area, QColor(24, 26, 30));
+    const int unit = ui_unit(area.height());
+
+    QFont title_font = font();
+    title_font.setPixelSize(unit * 3);
+    title_font.setBold(true);
+    QFont body_font = font();
+    body_font.setPixelSize(unit);
+    QFont pill_font = font();
+    pill_font.setPixelSize(unit);
+    pill_font.setBold(true);
+    pill_font.setLetterSpacing(QFont::PercentageSpacing, 110);
+    QFont footer_font = font();
+    footer_font.setPixelSize(std::max(10, unit * 4 / 5));
+
+    const QString title = QStringLiteral("Android Auto");
+    const QString subtitle = QStringLiteral("Dummy projection display · test consumer only");
+    const QString pill = status_.toUpper().replace(QLatin1Char('_'), QLatin1Char(' '));
+    const QString hint = state_hint(state_);
+
+    const QFontMetrics title_metrics(title_font);
+    const QFontMetrics body_metrics(body_font);
+    const QFontMetrics pill_metrics(pill_font);
+    const int pill_height = pill_metrics.height() + unit;
+    const int pill_width = pill_metrics.horizontalAdvance(pill) + unit * 3;
+    const int total = title_metrics.height() + unit / 2 + body_metrics.height() + unit * 2 +
+                      pill_height + unit + body_metrics.height();
+    int y = area.center().y() - total / 2;
+
+    painter.setFont(title_font);
+    painter.setPen(QColor(240, 242, 245));
+    painter.drawText(QRect(area.left(), y, area.width(), title_metrics.height()), Qt::AlignCenter,
+                     title);
+    y += title_metrics.height() + unit / 2;
+
+    painter.setFont(body_font);
+    painter.setPen(QColor(154, 160, 166));
+    painter.drawText(QRect(area.left(), y, area.width(), body_metrics.height()), Qt::AlignCenter,
+                     subtitle);
+    y += body_metrics.height() + unit * 2;
+
+    const QColor accent = state_color(state_);
+    const QRect pill_rect(area.center().x() - pill_width / 2, y, pill_width, pill_height);
+    QColor pill_fill = accent;
+    pill_fill.setAlpha(48);
+    painter.setPen(QPen(accent, 1.5));
+    painter.setBrush(pill_fill);
+    painter.drawRoundedRect(pill_rect, pill_height / 2.0, pill_height / 2.0);
+    painter.setFont(pill_font);
+    painter.setPen(accent.lighter(130));
+    painter.drawText(pill_rect, Qt::AlignCenter, pill);
+    y += pill_height + unit;
+
+    painter.setFont(body_font);
+    painter.setPen(QColor(208, 212, 217));
+    const QRect hint_rect(area.left() + unit, y, area.width() - unit * 2, body_metrics.height());
+    painter.drawText(hint_rect, Qt::AlignCenter,
+                     body_metrics.elidedText(hint, Qt::ElideRight, hint_rect.width()));
+
+    painter.setFont(footer_font);
+    painter.setPen(QColor(128, 134, 139));
+    const QString footer =
+        QStringLiteral("F5 start  ·  F6 stop  ·  F1 HUD  ·  F11 full screen        %1×%2 @ %3 fps")
+            .arg(static_cast<int>(width_))
+            .arg(static_cast<int>(height_))
+            .arg(static_cast<int>(fps_cap_));
+    painter.drawText(area.adjusted(unit, unit, -unit, -unit), Qt::AlignHCenter | Qt::AlignBottom,
+                     footer);
+    painter.restore();
+}
+
+void ProjectionWidget::paint_hud(QPainter& painter) {
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing);
+    const QRect area = video_rect();
+    const int unit = ui_unit(area.height());
+    QFont hud_font = font();
+    hud_font.setPixelSize(unit);
+    const QFontMetrics metrics(hud_font);
+    const auto fps = fps_meter_.reading(steady_now_ns());
+    fps_shown_ = fps.has_value();
+    const QString fps_text = fps ? QString::number(*fps, 'f', 1) : QStringLiteral("--");
+    const QString text = QStringLiteral("%1   %2 fps   %3×%4   painted %5")
+                             .arg(status_)
+                             .arg(fps_text)
+                             .arg(static_cast<int>(width_))
+                             .arg(static_cast<int>(height_))
+                             .arg(static_cast<qulonglong>(frames_painted_));
+    const int pad = unit / 2;
+    const int dot = unit * 2 / 3;
+    const QRect box(area.left() + pad, area.top() + pad,
+                    pad * 3 + dot + metrics.horizontalAdvance(text), metrics.height() + pad);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(0, 0, 0, 160));
+    painter.drawRoundedRect(box, pad, pad);
+    painter.setBrush(state_color(state_));
+    painter.drawEllipse(QRect(box.left() + pad, box.center().y() - dot / 2, dot, dot));
+    painter.setFont(hud_font);
+    painter.setPen(Qt::white);
+    painter.drawText(box.adjusted(pad * 2 + dot, 0, -pad, 0), Qt::AlignLeft | Qt::AlignVCenter,
+                     text);
+    painter.restore();
+}
+
+void ProjectionWidget::paint_error(QPainter& painter) const {
+    painter.save();
+    const int unit = ui_unit(height());
+    QFont error_font = font();
+    error_font.setPixelSize(unit);
+    const QFontMetrics metrics(error_font);
+    const int bar_height = metrics.height() + unit;
+    const QRect bar(0, height() - bar_height, width(), bar_height);
+    painter.fillRect(bar, QColor(183, 28, 28, 225));
+    painter.setFont(error_font);
+    painter.setPen(Qt::white);
+    const QRect text_rect = bar.adjusted(unit, 0, -unit, 0);
+    painter.drawText(text_rect, Qt::AlignLeft | Qt::AlignVCenter,
+                     metrics.elidedText(error_, Qt::ElideRight, text_rect.width()));
+    painter.restore();
+}
+
+bool ProjectionWidget::handle_view_key(QKeyEvent* event) {
+    const int key = event->key();
+    if (key != Qt::Key_F1 && key != Qt::Key_F11) {
+        return false;
+    }
+    if (event->type() == QEvent::KeyPress && !event->isAutoRepeat()) {
+        if (key == Qt::Key_F1) {
+            hud_visible_ = !hud_visible_;
+            update();
+        } else if (isWindow()) {
+            if (isFullScreen()) {
+                showNormal();
+            } else {
+                showFullScreen();
+            }
+        }
+    }
+    return true;
 }
 
 bool ProjectionWidget::handle_control_key(QKeyEvent* event) {
@@ -167,7 +415,7 @@ bool ProjectionWidget::handle_control_key(QKeyEvent* event) {
 }
 
 void ProjectionWidget::keyPressEvent(QKeyEvent* event) {
-    if (handle_control_key(event)) {
+    if (handle_control_key(event) || handle_view_key(event)) {
         event->accept();
         return;
     }
@@ -176,7 +424,7 @@ void ProjectionWidget::keyPressEvent(QKeyEvent* event) {
 }
 
 void ProjectionWidget::keyReleaseEvent(QKeyEvent* event) {
-    if (handle_control_key(event)) {
+    if (handle_control_key(event) || handle_view_key(event)) {
         event->accept();
         return;
     }
@@ -185,17 +433,44 @@ void ProjectionWidget::keyReleaseEvent(QKeyEvent* event) {
 }
 
 void ProjectionWidget::mousePressEvent(QMouseEvent* event) {
-    deliver_touch(event, TouchAction::down);
+    if (event->button() == Qt::LeftButton && QRectF(video_rect()).contains(event->position())) {
+        cancel_touch();
+        touch_active_ = true;
+        deliver_touch(event, TouchAction::down);
+    }
     event->accept();
 }
 
+void ProjectionWidget::focusOutEvent(QFocusEvent* event) {
+    cancel_touch();
+    QWidget::focusOutEvent(event);
+}
+
+void ProjectionWidget::hideEvent(QHideEvent* event) {
+    cancel_touch();
+    QWidget::hideEvent(event);
+}
+
+void ProjectionWidget::cancel_touch() {
+    if (!touch_active_) {
+        return;
+    }
+    touch_active_ = false;
+    input_.on_input(TouchEvent{touch_x_, touch_y_, TouchAction::up});
+}
+
 void ProjectionWidget::mouseMoveEvent(QMouseEvent* event) {
-    deliver_touch(event, TouchAction::move);
+    if (touch_active_) {
+        deliver_touch(event, TouchAction::move);
+    }
     event->accept();
 }
 
 void ProjectionWidget::mouseReleaseEvent(QMouseEvent* event) {
-    deliver_touch(event, TouchAction::up);
+    if (touch_active_ && event->button() == Qt::LeftButton) {
+        touch_active_ = false;
+        deliver_touch(event, TouchAction::up);
+    }
     event->accept();
 }
 
@@ -208,11 +483,20 @@ void ProjectionWidget::deliver_key(QKeyEvent* event, bool pressed) {
 }
 
 void ProjectionWidget::deliver_touch(QMouseEvent* event, TouchAction action) {
-    const QPointF position = event->position();
+    const QRect area = video_rect();
+    if (area.isEmpty() || width_ == 0 || height_ == 0) {
+        return;
+    }
+    const QPointF local = event->position() - QPointF(area.topLeft());
+    const QPointF position(local.x() * static_cast<double>(width_) / static_cast<double>(area.width()),
+                           local.y() * static_cast<double>(height_) /
+                               static_cast<double>(area.height()));
     const auto x = static_cast<std::uint32_t>(
         std::clamp(static_cast<int>(position.x()), 0, static_cast<int>(width_) - 1));
     const auto y = static_cast<std::uint32_t>(
         std::clamp(static_cast<int>(position.y()), 0, static_cast<int>(height_) - 1));
+    touch_x_ = x;
+    touch_y_ = y;
     input_.on_input(TouchEvent{x, y, action});
 }
 

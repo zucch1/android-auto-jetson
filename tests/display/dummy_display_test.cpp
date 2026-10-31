@@ -574,6 +574,130 @@ TEST(DummyDisplayContractInput, KeyboardAndMouseNormalizeToSeamEvents) {
     EXPECT_EQ(widget.status_text(), QStringLiteral("projecting"));
 }
 
+TEST(DummyDisplayContractInput, LetterboxedTouchMapsIntoVideoPixels) {
+    // Given: a 1280x720 surface resized to 4:3, so the video is letterboxed
+    // into a centered 640x360 area with 60 px bars above and below.
+    qt_app();
+    CountingInputSink sink;
+    aa::display::qt_adapter::ProjectionWidget widget(sink, kCaps);
+    widget.resize(640, 480);
+    ASSERT_EQ(widget.video_rect(), QRect(0, 60, 640, 360));
+    const auto send = [&widget](QEvent::Type type, QPointF at) {
+        QMouseEvent event(type, at, at, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&widget, &event);
+    };
+
+    // When: a gesture starts in the letterbox bar, then one starts inside the
+    // video and drags past its edge.
+    send(QEvent::MouseButtonPress, QPointF(10.0, 20.0));
+    send(QEvent::MouseMove, QPointF(30.0, 30.0));
+    send(QEvent::MouseButtonRelease, QPointF(30.0, 30.0));
+    send(QEvent::MouseButtonPress, QPointF(320.0, 240.0));
+    send(QEvent::MouseMove, QPointF(700.0, 470.0));
+    send(QEvent::MouseButtonRelease, QPointF(700.0, 470.0));
+
+    // Then: the bar gesture is dropped entirely; the video gesture is scaled
+    // into absolute video pixels and clamped to the frame.
+    ASSERT_EQ(sink.events.size(), 3U);
+    EXPECT_EQ(std::get<TouchEvent>(sink.events[0]), (TouchEvent{640, 360, TouchAction::down}));
+    EXPECT_EQ(std::get<TouchEvent>(sink.events[1]), (TouchEvent{1279, 719, TouchAction::move}));
+    EXPECT_EQ(std::get<TouchEvent>(sink.events[2]), (TouchEvent{1279, 719, TouchAction::up}));
+}
+
+TEST(DummyDisplayContractInput, LostReleaseIsCancelledAndNeverPoisonsLaterGestures) {
+    // Given: a projecting surface.
+    qt_app();
+    CountingInputSink sink;
+    aa::display::qt_adapter::ProjectionWidget widget(sink, kCaps);
+    widget.set_status(DisplayState::projecting);
+    const auto mouse = [&widget](QEvent::Type type, QPointF at) {
+        QMouseEvent event(type, at, at, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&widget, &event);
+    };
+    QFocusEvent focus_out(QEvent::FocusOut, Qt::ActiveWindowFocusReason);
+
+    // When: a drag loses focus before its release, a later gesture runs
+    // normally, another press arrives with no release before projection
+    // stops, and a repeated press interrupts a gesture without a release.
+    mouse(QEvent::MouseButtonPress, QPointF(10.0, 20.0));
+    mouse(QEvent::MouseMove, QPointF(30.0, 40.0));
+    QApplication::sendEvent(&widget, &focus_out);
+    mouse(QEvent::MouseMove, QPointF(50.0, 60.0));
+    mouse(QEvent::MouseButtonRelease, QPointF(50.0, 60.0));
+    mouse(QEvent::MouseButtonPress, QPointF(100.0, 110.0));
+    mouse(QEvent::MouseButtonRelease, QPointF(100.0, 110.0));
+    mouse(QEvent::MouseButtonPress, QPointF(200.0, 210.0));
+    widget.set_status(DisplayState::idle);
+    widget.set_status(DisplayState::projecting);
+    mouse(QEvent::MouseButtonPress, QPointF(300.0, 310.0));
+    mouse(QEvent::MouseButtonPress, QPointF(400.0, 410.0));
+    mouse(QEvent::MouseButtonRelease, QPointF(400.0, 410.0));
+
+    // Then: every lost release becomes an "up" at the last delivered point,
+    // stray post-cancel move/release events are dropped, and each new press
+    // starts a fresh gesture.
+    const std::vector<InputEvent> expected{
+        TouchEvent{10, 20, TouchAction::down},   TouchEvent{30, 40, TouchAction::move},
+        TouchEvent{30, 40, TouchAction::up},     TouchEvent{100, 110, TouchAction::down},
+        TouchEvent{100, 110, TouchAction::up},   TouchEvent{200, 210, TouchAction::down},
+        TouchEvent{200, 210, TouchAction::up},   TouchEvent{300, 310, TouchAction::down},
+        TouchEvent{300, 310, TouchAction::up},   TouchEvent{400, 410, TouchAction::down},
+        TouchEvent{400, 410, TouchAction::up},
+    };
+    EXPECT_EQ(sink.events, expected);
+}
+
+TEST(DummyDisplayContractRender, FpsReadingExpiresAfterPresentationStall) {
+    // Given: a meter fed 30 fps presentations for just over one second.
+    aa::display::qt_adapter::FpsMeter meter;
+    constexpr std::int64_t kStart = 5'000'000'000;
+    constexpr std::int64_t kPeriod = 1'000'000'000 / 30;
+    EXPECT_FALSE(meter.reading(kStart).has_value());
+    std::int64_t last = kStart;
+    for (int index = 0; index <= 31; ++index) {
+        last = kStart + index * kPeriod;
+        meter.note(last);
+    }
+
+    // Then: the rate is reported while presentations are fresh...
+    const auto fresh = meter.reading(last + kPeriod);
+    ASSERT_TRUE(fresh.has_value());
+    EXPECT_NEAR(*fresh, 30.0, 0.5);
+    EXPECT_TRUE(meter.reading(last + aa::display::qt_adapter::FpsMeter::kStaleNs - 1).has_value());
+    // ...expires once presentations stall...
+    EXPECT_FALSE(meter.reading(last + aa::display::qt_adapter::FpsMeter::kStaleNs).has_value());
+    // ...and a resumed stream starts a new window instead of averaging the stall in.
+    const std::int64_t resumed = last + 10'000'000'000;
+    meter.note(resumed);
+    EXPECT_FALSE(meter.reading(resumed).has_value());
+    for (int index = 1; index <= 31; ++index) {
+        meter.note(resumed + index * kPeriod);
+    }
+    const auto after = meter.reading(resumed + 31 * kPeriod);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_NEAR(*after, 30.0, 0.5);
+}
+
+TEST(DummyDisplayContractInput, ViewShortcutsStayLocal) {
+    // Given: a display surface with the HUD shown by default.
+    qt_app();
+    CountingInputSink sink;
+    aa::display::qt_adapter::ProjectionWidget widget(sink, kCaps);
+    ASSERT_TRUE(widget.hud_visible());
+
+    // When: F1 (HUD) and F11 (full screen) are pressed and released.
+    for (const int key : {Qt::Key_F1, Qt::Key_F11}) {
+        QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
+        QKeyEvent release(QEvent::KeyRelease, key, Qt::NoModifier);
+        QApplication::sendEvent(&widget, &press);
+        QApplication::sendEvent(&widget, &release);
+    }
+
+    // Then: the HUD toggled and nothing reached the phone input seam.
+    EXPECT_FALSE(widget.hud_visible());
+    EXPECT_TRUE(sink.events.empty());
+}
+
 TEST(DummyDisplayContractAbsent, ReceiverAbsentShowsUnavailableWithoutStartingHelper) {
     // Given: a bus with NO receiver owning the contract name.
     qt_app();
