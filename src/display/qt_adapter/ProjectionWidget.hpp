@@ -8,13 +8,35 @@
 #include <QString>
 #include <QWidget>
 
+#include <QTimer>
+
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <vector>
 
 class QPainter;
 
 namespace aa::display::qt_adapter {
+
+// Presentation-rate meter for the HUD: counts presentations over >= 1 s
+// windows; a reading expires once no presentation has arrived for kStaleNs,
+// so a stalled stream never keeps showing its last rate.
+class FpsMeter final {
+public:
+    static constexpr std::int64_t kWindowNs{1'000'000'000};
+    static constexpr std::int64_t kStaleNs{2'000'000'000};
+
+    void note(std::int64_t presented_ns) noexcept;
+    [[nodiscard]] std::optional<double> reading(std::int64_t now_ns) const noexcept;
+    void reset() noexcept;
+
+private:
+    std::int64_t window_start_ns_{};
+    std::int64_t last_ns_{};
+    std::uint32_t window_count_{};
+    double fps_{};
+};
 
 // Qt rendering/input surface for the dummy display (task 24): presents I420
 // frames decoded by the todo-23 helper and normalizes Qt keyboard/D-pad and
@@ -62,16 +84,21 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void focusOutEvent(QFocusEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private:
     void deliver_key(QKeyEvent* event, bool pressed);
     void deliver_touch(QMouseEvent* event, TouchAction action);
+    // Ends an in-flight gesture with an "up" at its last position so a lost
+    // mouse release never leaves the phone (or this widget) stuck mid-touch.
+    void cancel_touch();
     bool handle_control_key(QKeyEvent* event);
     bool handle_view_key(QKeyEvent* event);
     void paint_placeholder(QPainter& painter) const;
-    void paint_hud(QPainter& painter) const;
+    void paint_hud(QPainter& painter);
     void paint_error(QPainter& painter) const;
-    void note_presentation(std::int64_t completed_ns);
+    void expire_stale_fps();
 
     InputSink& input_;
     ProjectionControl* control_{nullptr};
@@ -87,9 +114,11 @@ private:
     bool presentation_pending_{};
     bool hud_visible_{true};
     bool touch_active_{false};
-    std::int64_t fps_window_start_ns_{};
-    std::uint32_t fps_window_count_{};
-    double fps_{};
+    std::uint32_t touch_x_{};
+    std::uint32_t touch_y_{};
+    FpsMeter fps_meter_{};
+    bool fps_shown_{false};
+    QTimer fps_expiry_{};
     std::uint16_t width_{};
     std::uint16_t height_{};
     std::uint8_t fps_cap_{};

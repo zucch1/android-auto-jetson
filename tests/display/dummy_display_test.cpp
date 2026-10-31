@@ -604,6 +604,80 @@ TEST(DummyDisplayContractInput, LetterboxedTouchMapsIntoVideoPixels) {
     EXPECT_EQ(std::get<TouchEvent>(sink.events[2]), (TouchEvent{1279, 719, TouchAction::up}));
 }
 
+TEST(DummyDisplayContractInput, LostReleaseIsCancelledAndNeverPoisonsLaterGestures) {
+    // Given: a projecting surface.
+    qt_app();
+    CountingInputSink sink;
+    aa::display::qt_adapter::ProjectionWidget widget(sink, kCaps);
+    widget.set_status(DisplayState::projecting);
+    const auto mouse = [&widget](QEvent::Type type, QPointF at) {
+        QMouseEvent event(type, at, at, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&widget, &event);
+    };
+    QFocusEvent focus_out(QEvent::FocusOut, Qt::ActiveWindowFocusReason);
+
+    // When: a drag loses focus before its release, a later gesture runs
+    // normally, another press arrives with no release before projection
+    // stops, and a repeated press interrupts a gesture without a release.
+    mouse(QEvent::MouseButtonPress, QPointF(10.0, 20.0));
+    mouse(QEvent::MouseMove, QPointF(30.0, 40.0));
+    QApplication::sendEvent(&widget, &focus_out);
+    mouse(QEvent::MouseMove, QPointF(50.0, 60.0));
+    mouse(QEvent::MouseButtonRelease, QPointF(50.0, 60.0));
+    mouse(QEvent::MouseButtonPress, QPointF(100.0, 110.0));
+    mouse(QEvent::MouseButtonRelease, QPointF(100.0, 110.0));
+    mouse(QEvent::MouseButtonPress, QPointF(200.0, 210.0));
+    widget.set_status(DisplayState::idle);
+    widget.set_status(DisplayState::projecting);
+    mouse(QEvent::MouseButtonPress, QPointF(300.0, 310.0));
+    mouse(QEvent::MouseButtonPress, QPointF(400.0, 410.0));
+    mouse(QEvent::MouseButtonRelease, QPointF(400.0, 410.0));
+
+    // Then: every lost release becomes an "up" at the last delivered point,
+    // stray post-cancel move/release events are dropped, and each new press
+    // starts a fresh gesture.
+    const std::vector<InputEvent> expected{
+        TouchEvent{10, 20, TouchAction::down},   TouchEvent{30, 40, TouchAction::move},
+        TouchEvent{30, 40, TouchAction::up},     TouchEvent{100, 110, TouchAction::down},
+        TouchEvent{100, 110, TouchAction::up},   TouchEvent{200, 210, TouchAction::down},
+        TouchEvent{200, 210, TouchAction::up},   TouchEvent{300, 310, TouchAction::down},
+        TouchEvent{300, 310, TouchAction::up},   TouchEvent{400, 410, TouchAction::down},
+        TouchEvent{400, 410, TouchAction::up},
+    };
+    EXPECT_EQ(sink.events, expected);
+}
+
+TEST(DummyDisplayContractRender, FpsReadingExpiresAfterPresentationStall) {
+    // Given: a meter fed 30 fps presentations for just over one second.
+    aa::display::qt_adapter::FpsMeter meter;
+    constexpr std::int64_t kStart = 5'000'000'000;
+    constexpr std::int64_t kPeriod = 1'000'000'000 / 30;
+    EXPECT_FALSE(meter.reading(kStart).has_value());
+    std::int64_t last = kStart;
+    for (int index = 0; index <= 31; ++index) {
+        last = kStart + index * kPeriod;
+        meter.note(last);
+    }
+
+    // Then: the rate is reported while presentations are fresh...
+    const auto fresh = meter.reading(last + kPeriod);
+    ASSERT_TRUE(fresh.has_value());
+    EXPECT_NEAR(*fresh, 30.0, 0.5);
+    EXPECT_TRUE(meter.reading(last + aa::display::qt_adapter::FpsMeter::kStaleNs - 1).has_value());
+    // ...expires once presentations stall...
+    EXPECT_FALSE(meter.reading(last + aa::display::qt_adapter::FpsMeter::kStaleNs).has_value());
+    // ...and a resumed stream starts a new window instead of averaging the stall in.
+    const std::int64_t resumed = last + 10'000'000'000;
+    meter.note(resumed);
+    EXPECT_FALSE(meter.reading(resumed).has_value());
+    for (int index = 1; index <= 31; ++index) {
+        meter.note(resumed + index * kPeriod);
+    }
+    const auto after = meter.reading(resumed + 31 * kPeriod);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_NEAR(*after, 30.0, 0.5);
+}
+
 TEST(DummyDisplayContractInput, ViewShortcutsStayLocal) {
     // Given: a display surface with the HUD shown by default.
     qt_app();

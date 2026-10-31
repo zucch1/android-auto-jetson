@@ -3,7 +3,9 @@
 
 #include <QColor>
 #include <QFont>
+#include <QFocusEvent>
 #include <QFontMetrics>
+#include <QHideEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPaintEvent>
@@ -109,6 +111,32 @@ namespace {
 
 } // namespace
 
+void FpsMeter::note(std::int64_t presented_ns) noexcept {
+    if (last_ns_ == 0 || presented_ns - last_ns_ >= kStaleNs) {
+        window_start_ns_ = presented_ns;
+        window_count_ = 0;
+        fps_ = 0.0;
+    } else {
+        ++window_count_;
+        const auto elapsed_ns = presented_ns - window_start_ns_;
+        if (elapsed_ns >= kWindowNs) {
+            fps_ = static_cast<double>(window_count_) * 1e9 / static_cast<double>(elapsed_ns);
+            window_start_ns_ = presented_ns;
+            window_count_ = 0;
+        }
+    }
+    last_ns_ = presented_ns;
+}
+
+std::optional<double> FpsMeter::reading(std::int64_t now_ns) const noexcept {
+    if (fps_ <= 0.0 || now_ns - last_ns_ >= kStaleNs) {
+        return std::nullopt;
+    }
+    return fps_;
+}
+
+void FpsMeter::reset() noexcept { *this = FpsMeter{}; }
+
 ProjectionWidget::ProjectionWidget(InputSink& input, protocol::VideoProfile caps, QWidget* parent)
     : QWidget(parent), input_(input), width_(caps.width), height_(caps.height), fps_cap_(caps.fps) {
     resize(static_cast<int>(caps.width), static_cast<int>(caps.height));
@@ -117,6 +145,14 @@ ProjectionWidget::ProjectionWidget(InputSink& input, protocol::VideoProfile caps
     setAttribute(Qt::WA_OpaquePaintEvent);
     setFocusPolicy(Qt::StrongFocus);
     setCursor(Qt::CrossCursor);
+    connect(&fps_expiry_, &QTimer::timeout, this, [this] { expire_stale_fps(); });
+    fps_expiry_.start(500);
+}
+
+void ProjectionWidget::expire_stale_fps() {
+    if (fps_shown_ && hud_visible_ && !fps_meter_.reading(steady_now_ns()).has_value()) {
+        update();
+    }
 }
 
 void ProjectionWidget::on_frame(const consumer::DecodedFrame& frame) {
@@ -135,13 +171,14 @@ void ProjectionWidget::set_status(DisplayState state) {
     state_ = state;
     const auto text = to_string(state);
     status_ = QString::fromUtf8(text.data(), static_cast<qsizetype>(text.size()));
+    if (state != DisplayState::projecting) {
+        cancel_touch();
+    }
     if (state == DisplayState::idle || state == DisplayState::unavailable) {
         pending_.clear();
         frame_ = QImage{};
         presentation_pending_ = false;
-        fps_ = 0.0;
-        fps_window_count_ = 0;
-        fps_window_start_ns_ = 0;
+        fps_meter_.reset();
     }
     if (isWindow()) {
         setWindowTitle(QStringLiteral("Android Auto dummy display (test only) - %1").arg(status_));
@@ -202,7 +239,7 @@ void ProjectionWidget::paintEvent(QPaintEvent*) {
     painter.end();
     if (!frame_.isNull() && presentation_pending_) {
         const auto completed = steady_now_ns();
-        note_presentation(completed);
+        fps_meter_.note(completed);
         ++presentations_;
         std::printf("{\"event\":\"video_presented\",\"frame\":%llu,\"scheduled_ns\":%llu,"
                     "\"completed_ns\":%lld,\"count\":%llu}\n",
@@ -212,20 +249,6 @@ void ProjectionWidget::paintEvent(QPaintEvent*) {
                     static_cast<unsigned long long>(presentations_));
         std::fflush(stdout);
         presentation_pending_ = false;
-    }
-}
-
-void ProjectionWidget::note_presentation(std::int64_t completed_ns) {
-    if (fps_window_start_ns_ == 0) {
-        fps_window_start_ns_ = completed_ns;
-        return;
-    }
-    ++fps_window_count_;
-    const auto elapsed_ns = completed_ns - fps_window_start_ns_;
-    if (elapsed_ns >= 1'000'000'000) {
-        fps_ = static_cast<double>(fps_window_count_) * 1e9 / static_cast<double>(elapsed_ns);
-        fps_window_start_ns_ = completed_ns;
-        fps_window_count_ = 0;
     }
 }
 
@@ -306,7 +329,7 @@ void ProjectionWidget::paint_placeholder(QPainter& painter) const {
     painter.restore();
 }
 
-void ProjectionWidget::paint_hud(QPainter& painter) const {
+void ProjectionWidget::paint_hud(QPainter& painter) {
     painter.save();
     painter.setRenderHint(QPainter::Antialiasing);
     const QRect area = video_rect();
@@ -314,8 +337,9 @@ void ProjectionWidget::paint_hud(QPainter& painter) const {
     QFont hud_font = font();
     hud_font.setPixelSize(unit);
     const QFontMetrics metrics(hud_font);
-    const QString fps_text =
-        fps_ > 0.0 ? QString::number(fps_, 'f', 1) : QStringLiteral("--");
+    const auto fps = fps_meter_.reading(steady_now_ns());
+    fps_shown_ = fps.has_value();
+    const QString fps_text = fps ? QString::number(*fps, 'f', 1) : QStringLiteral("--");
     const QString text = QStringLiteral("%1   %2 fps   %3×%4   painted %5")
                              .arg(status_)
                              .arg(fps_text)
@@ -409,12 +433,30 @@ void ProjectionWidget::keyReleaseEvent(QKeyEvent* event) {
 }
 
 void ProjectionWidget::mousePressEvent(QMouseEvent* event) {
-    if (event->button() == Qt::LeftButton && !touch_active_ &&
-        QRectF(video_rect()).contains(event->position())) {
+    if (event->button() == Qt::LeftButton && QRectF(video_rect()).contains(event->position())) {
+        cancel_touch();
         touch_active_ = true;
         deliver_touch(event, TouchAction::down);
     }
     event->accept();
+}
+
+void ProjectionWidget::focusOutEvent(QFocusEvent* event) {
+    cancel_touch();
+    QWidget::focusOutEvent(event);
+}
+
+void ProjectionWidget::hideEvent(QHideEvent* event) {
+    cancel_touch();
+    QWidget::hideEvent(event);
+}
+
+void ProjectionWidget::cancel_touch() {
+    if (!touch_active_) {
+        return;
+    }
+    touch_active_ = false;
+    input_.on_input(TouchEvent{touch_x_, touch_y_, TouchAction::up});
 }
 
 void ProjectionWidget::mouseMoveEvent(QMouseEvent* event) {
@@ -453,6 +495,8 @@ void ProjectionWidget::deliver_touch(QMouseEvent* event, TouchAction action) {
         std::clamp(static_cast<int>(position.x()), 0, static_cast<int>(width_) - 1));
     const auto y = static_cast<std::uint32_t>(
         std::clamp(static_cast<int>(position.y()), 0, static_cast<int>(height_) - 1));
+    touch_x_ = x;
+    touch_y_ = y;
     input_.on_input(TouchEvent{x, y, action});
 }
 
