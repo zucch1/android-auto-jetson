@@ -61,10 +61,17 @@ def check(manifest: Path) -> None:
         performance(result, seconds)
         require(result.child('provenance').values == doc.child('provenance').values,
                 'PROVENANCE_MISMATCH')
+        if 'thermal_scope' in result.child('measurement_coverage').values:
+            model = result.child('measurement_coverage').child('thermal_scope').child('policy').text('model')
+            require(model == doc.child('target').text('model'), 'THERMAL_POLICY_TARGET_MISMATCH')
     short = load(paths['perf_30m'])
     long = load(paths['soak_2h'])
     require(short.text('generated_at_utc') != long.text('generated_at_utc'),
             'PERF_RUNS_MUST_BE_DISTINCT')
+    policies = [result.child('measurement_coverage').child('thermal_scope').child('policy').values
+                if 'thermal_scope' in result.child('measurement_coverage').values else None
+                for result in (short, long)]
+    require(policies[0] == policies[1], 'THERMAL_POLICY_RUN_MISMATCH')
 
 
 def main() -> int:

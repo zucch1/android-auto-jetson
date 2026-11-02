@@ -6,6 +6,7 @@
 #   aa-projection-perf.sh --mode wired --duration 30m --out result.json
 #   aa-projection-perf.sh --mode wired --duration 2h  --out soak.json
 #   aa-projection-perf.sh --mode wired --capture capture.json --out result.json
+#   Optional approved model-only policy: --thermal-policy orin-nano-cv-unavailable/1
 #   aa-projection-perf.sh --readiness-only [--out readiness.json]
 #
 # This tool measures CPU/RSS, thermal state, frame drops, decode/IPC timing,
@@ -49,6 +50,7 @@ PROVENANCE=""
 INTERVAL=5
 NOW=""
 READINESS_ONLY=0
+THERMAL_POLICY=""
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 
@@ -93,12 +95,22 @@ while (($# > 0)); do
         --capture-out) require_value "$@"; CAPTURE_OUT="$2"; shift 2 ;;
         --provenance) require_value "$@"; PROVENANCE="$2"; shift 2 ;;
         --interval) require_value "$@"; INTERVAL="$2"; shift 2 ;;
+        --thermal-policy) require_value "$@"; THERMAL_POLICY="$2"; shift 2 ;;
         --now) require_value "$@"; NOW="$2"; shift 2 ;;
         --readiness-only) READINESS_ONLY=1; shift ;;
         -h | --help) usage ;;
         *) echo "usage error: unknown argument: $1" >&2; usage ;;
     esac
 done
+
+case "$THERMAL_POLICY" in
+    "" | strict-all-zones | orin-nano-cv-unavailable/1) ;;
+    *) echo "usage error: unknown --thermal-policy" >&2; exit 2 ;;
+esac
+thermal_args=()
+if [[ -n "$THERMAL_POLICY" ]]; then
+    thermal_args=(--thermal-policy "$THERMAL_POLICY")
+fi
 
 if ((!READINESS_ONLY)) && [[ "$MODE" != "wired" ]]; then
     echo "usage error: --mode must be 'wired' (got '${MODE:-<unset>}')" >&2
@@ -237,6 +249,7 @@ if [[ -n "$CAPTURE" ]]; then
     capture_sha="$(sha256sum "$CAPTURE" | cut -d' ' -f1)"
     set +e
     "$PY" -B "$REPORTER" --capture "$CAPTURE" --out "$OUT" \
+        "${thermal_args[@]}" \
         --duration-requested "${DURATION:-}" --capture-sha256 "$capture_sha" \
         --now "${NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
     rc=$?
@@ -290,6 +303,7 @@ PY
 collector_timeout=$((duration_secs + 120))
 if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port '${PORT}' \
         --duration-seconds ${duration_secs} --interval ${INTERVAL} \
+        ${THERMAL_POLICY:+--thermal-policy '${THERMAL_POLICY}'} \
         ${DISPLAY:+--display '${DISPLAY}'} ${STORE:+--store '${STORE}'}" \
         <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err"; then
     echo "BLOCKED: collector_failed" >&2

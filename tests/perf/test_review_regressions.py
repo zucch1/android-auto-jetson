@@ -48,6 +48,16 @@ def av_sync() -> None:
     unpaired._consume(json.dumps(events[0]))
     unpaired._consume(json.dumps(events[2]))
     assert unpaired.metrics["av_sync_ms"] is None
+    # Given a frame near the end of a 42 ms audio chunk: video takes 30 ms, audio 2 ms.
+    chunk = collector.EventParser()
+    chunk._consume(json.dumps({"event": "audio_write_completed", "scheduled_ns": 3_000_000_000,
+                               "scheduled_end_ns": 3_042_000_000,
+                               "completed_ns": 3_002_000_000}))
+    chunk._consume(json.dumps({"event": "video_presented", "frame": 11,
+                               "scheduled_ns": 3_040_000_000,
+                               "completed_ns": 3_070_000_000}))
+    # Then skew is the 28 ms latency difference, not the 68 ms completion gap.
+    assert chunk.metrics["av_sync_ms"] == 28, chunk.metrics
 
 
 def display_sources() -> None:

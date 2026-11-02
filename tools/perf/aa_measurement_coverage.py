@@ -9,12 +9,19 @@ only here; no collector or reporter import is permitted.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
 from types import MappingProxyType
 from typing import Final, Literal
 
 POLICY: Final = "active-window-coverage/1"
+NANO_COVERAGE_POLICY: Final = "active-window-coverage/orin-nano-cv-unavailable/1"
+NANO_PROFILE: Final = "orin-nano-cv-unavailable/1"
+NANO_MODEL: Final = "NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super"
+NANO_APPROVAL: Final = "owner-approved-nano-cv-availability-20261018"
+NANO_SCOPE: Final = "continuous-cpu-gpu-soc0-soc1-soc2-tj;cv0-cv1-cv2-availability-exception"
+NANO_FAMILIES: Final = ("cpu", "gpu", "soc0", "soc1", "soc2", "tj", "cv0", "cv1", "cv2")
 QUANTILE_POLICY: Final = "nearest-rank-last-4096-eligible-processing-order"
 LIMIT: Final = 4096
 HORIZON_NS: Final = 10_000_000_000
@@ -70,6 +77,53 @@ class ThermalZone:
 
 
 @dataclass(frozen=True, slots=True)
+class ThermalPolicy:
+    profile: str
+    model: str
+    approval: str
+    scope: str
+
+
+NANO_THERMAL_POLICY: Final = ThermalPolicy(NANO_PROFILE, NANO_MODEL, NANO_APPROVAL, NANO_SCOPE)
+
+
+@dataclass(frozen=True, slots=True)
+class ZoneAvailability:
+    zone: str
+    numeric: int
+    unavailable: int
+
+
+@dataclass(frozen=True, slots=True)
+class ThermalScope:
+    policy: ThermalPolicy
+    zones: tuple[ZoneAvailability, ...]
+
+
+def thermal_policy_for_model(profile: str, model: str | None) -> ThermalPolicy | None:
+    """Parse explicit operational selection; model detection never opts in."""
+    match profile:
+        case "strict-all-zones":
+            return None
+        case "orin-nano-cv-unavailable/1":
+            if model != NANO_MODEL:
+                raise CoverageError("Nano thermal policy requires the exact approved model")
+            return NANO_THERMAL_POLICY
+        case _:
+            raise CoverageError("unknown thermal policy")
+
+
+def _cv_zone(name: str) -> bool:
+    return re.fullmatch(r"thermal_zone[0-9]+:cv[012]-thermal", name) is not None
+
+
+def _nano_inventory(names: tuple[str, ...]) -> bool:
+    families = [name.split(":", 1)[1] for name in names
+                if re.fullmatch(r"thermal_zone[0-9]+:(?:cpu|gpu|soc[012]|tj|cv[012])-thermal", name)]
+    return all(families.count(family + "-thermal") == 1 for family in NANO_FAMILIES)
+
+
+@dataclass(frozen=True, slots=True)
 class Sample:
     t_ns: int
     receiver_rss_mb: float | None
@@ -96,6 +150,7 @@ class CaptureEvidence:
     cpu_ticks_per_second: int
     samples: tuple[Sample, ...]
     video_evidence: VideoEvidence
+    thermal_policy: ThermalPolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +213,7 @@ class Coverage:
     ipc_matches: EndpointCoverage
     decode: EndpointCoverage
     quantiles: QuantileScope
+    thermal_scope: ThermalScope | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,20 +356,25 @@ def _boolean(raw: object) -> bool:
     return raw
 
 
-def _sample(raw: object) -> Sample:
-    obj = _exact(raw, tuple(field.name for field in fields(Sample)))
+def _zones(raw: object) -> tuple[ThermalZone, ...]:
     zones: list[ThermalZone] = []
-    for item in _array(obj["thermal_zones"]):
+    for item in _array(raw):
         zone = _exact(item, ("zone", "temp_c"))
         name = zone["zone"]
         if not isinstance(name, str) or not name or any(z.zone == name for z in zones):
             raise CoverageError("thermal zone identities must be unique nonempty strings")
         zones.append(ThermalZone(name, _number(zone["temp_c"])))
+    return tuple(zones)
+
+
+def _sample(raw: object) -> Sample:
+    obj = _exact(raw, tuple(field.name for field in fields(Sample)))
+    zones = _zones(obj["thermal_zones"])
     rss = _number(obj["receiver_rss_mb"])
     if rss is not None and rss < 0:
         raise CoverageError("negative RSS")
     return Sample(_integer(obj["t_ns"]), rss, _nullable_integer(obj["receiver_cpu_ticks"]),
-                  tuple(zones), _boolean(obj["projection_active"]),
+                  zones, _boolean(obj["projection_active"]),
                   *(_nullable_integer(obj[key]) for key in
                     ("video_units", "audio_chunks", "video_presentations", "audio_writes", "av_pairs")))
 
@@ -325,11 +386,21 @@ def _raw_stream(raw: object) -> StreamBlock:
                        _nullable_integer(obj["begin_ns"]), _integer(obj["bytes"]))
 
 
+def _thermal_policy(raw: object) -> ThermalPolicy:
+    obj = _exact(raw, tuple(field.name for field in fields(ThermalPolicy)))
+    if obj != asdict(NANO_THERMAL_POLICY):
+        raise CoverageError("unknown or unapproved thermal policy scope")
+    return NANO_THERMAL_POLICY
+
+
 def parse_capture(raw: object) -> CaptureEvidence:
     obj = _object(raw)
     required = ("monotonic_origin_ns", "cpu_ticks_per_second", "samples", "video_evidence")
     if any(key not in obj for key in required):
         raise CoverageError("missing v2 capture evidence")
+    policy = _thermal_policy(obj["thermal_policy"]) if "thermal_policy" in obj else None
+    if policy is not None and _object(obj.get("target_hardware_state")).get("model") != policy.model:
+        raise CoverageError("capture hardware does not match thermal policy")
     clock = _integer(obj["cpu_ticks_per_second"])
     if clock == 0:
         raise CoverageError("CPU tick frequency must be positive")
@@ -348,7 +419,7 @@ def parse_capture(raw: object) -> CaptureEvidence:
             or any(d >= 5_000_000_000 for d in decode)):
         raise CoverageError("invalid quantile ring")
     return CaptureEvidence(_integer(obj["monotonic_origin_ns"]), clock, samples,
-                           VideoEvidence(tuple(blocks), ipc, decode))
+                           VideoEvidence(tuple(blocks), ipc, decode), policy)
 
 
 def _point_bounds(point: Timeline, window: Window | None) -> None:
@@ -385,7 +456,21 @@ def _endpoint(raw: object) -> EndpointCoverage:
 
 
 def parse_coverage(raw: object) -> Coverage:
-    obj = _exact(raw, tuple(field.name for field in fields(Coverage)))
+    obj = _object(raw)
+    scoped = obj.get("policy") == NANO_COVERAGE_POLICY
+    names = tuple(field.name for field in fields(Coverage) if scoped or field.name != "thermal_scope")
+    obj = _exact(obj, names)
+    scope = None
+    if scoped:
+        thermal = _exact(obj["thermal_scope"], ("policy", "zones"))
+        availability: list[ZoneAvailability] = []
+        for raw_zone in _array(thermal["zones"]):
+            zone = _exact(raw_zone, ("zone", "numeric", "unavailable"))
+            name = zone["zone"]
+            if not isinstance(name, str) or not name or any(item.zone == name for item in availability):
+                raise CoverageError("invalid thermal availability identity")
+            availability.append(ZoneAvailability(name, _integer(zone["numeric"]), _integer(zone["unavailable"])))
+        scope = ThermalScope(_thermal_policy(thermal["policy"]), tuple(availability))
     window = None
     if obj["window"] is not None:
         bounds = _exact(obj["window"], ("start_ns", "end_ns"))
@@ -402,12 +487,12 @@ def parse_coverage(raw: object) -> Coverage:
                                cpu_counts.first_ns, cpu_counts.last_ns, cpu_counts.max_gap_ns,
                                _boolean(cpu["baseline_valid"]), _integer(cpu["measured_interval_ns"]))
     quantiles = _exact(obj["quantiles"], tuple(field.name for field in fields(QuantileScope)))
-    if obj["policy"] != POLICY or quantiles["policy"] != QUANTILE_POLICY or _integer(quantiles["limit"]) != LIMIT:
+    if obj["policy"] not in (POLICY, NANO_COVERAGE_POLICY) or quantiles["policy"] != QUANTILE_POLICY or _integer(quantiles["limit"]) != LIMIT:
         raise CoverageError("unknown coverage or quantile policy")
     endpoints = tuple(_endpoint(obj[stream]) for stream in STREAMS)
-    result = Coverage(POLICY, window, timeline, rss, cpu_coverage, thermal, *endpoints,
+    result = Coverage(NANO_COVERAGE_POLICY if scoped else POLICY, window, timeline, rss, cpu_coverage, thermal, *endpoints,
                       QuantileScope(QUANTILE_POLICY, LIMIT, _integer(quantiles["ipc_retained"]),
-                                    _integer(quantiles["decode_retained"])))
+                                    _integer(quantiles["decode_retained"])), scope)
     _validate_coverage(result)
     return result
 
@@ -426,6 +511,19 @@ def _ipc_subset(consumed: StreamBlock | EndpointCoverage,
 def _validate_coverage(value: Coverage) -> None:
     window, sampling, cpu = value.window, value.sampling, value.cpu
     duration = window.end_ns - window.start_ns if window else 0
+    scope = value.thermal_scope
+    if (value.policy == NANO_COVERAGE_POLICY) != (scope is not None):
+        raise CoverageError("thermal scope and coverage policy disagree")
+    if scope is not None:
+        if scope.policy != NANO_THERMAL_POLICY:
+            raise CoverageError("unknown thermal scope")
+        if value.thermal.valid and not _nano_inventory(tuple(zone.zone for zone in scope.zones)):
+            raise CoverageError("Nano coverage requires all nine unique sensor families")
+        for zone in scope.zones:
+            if zone.numeric + zone.unavailable != sampling.count:
+                raise CoverageError("thermal availability count contradicts sampling")
+            if not _cv_zone(zone.zone) and zone.numeric < value.thermal.valid:
+                raise CoverageError("required sensor availability contradicts thermal coverage")
     _point_bounds(sampling, window)
     if window and (sampling.count == 0 or sampling.first_ns != window.start_ns or sampling.last_ns != window.end_ns):
         raise CoverageError("sampling must span the active window")
@@ -482,7 +580,45 @@ def _validate_coverage(value: Coverage) -> None:
 
 
 def coverage_to_json(coverage: Coverage) -> dict[str, object]:
-    return asdict(coverage)
+    result = asdict(coverage)
+    if coverage.thermal_scope is None:
+        result.pop("thermal_scope")
+    else:
+        result["thermal_scope"]["zones"] = [asdict(zone) for zone in coverage.thermal_scope.zones]
+    return result
+
+
+def validate_thermal_export(raw: object, coverage: Coverage) -> None:
+    """Bind sanitized thermal peaks/availability/scope without the private capture."""
+    obj = _object(raw)
+    scope = coverage.thermal_scope
+    policy = _thermal_policy(obj["thermal_policy"]) if "thermal_policy" in obj else None
+    if policy != (scope.policy if scope is not None else None):
+        raise CoverageError("export thermal policy does not match coverage scope")
+    if scope is not None:
+        provenance = _object(obj.get("provenance"))
+        if _object(provenance.get("target_hardware_state")).get("model") != scope.policy.model:
+            raise CoverageError("export hardware does not match thermal policy")
+    state = obj.get("thermal_state")
+    zones = _zones(_object(state).get("zones")) if state is not None else ()
+    if scope is not None:
+        availability = {zone.zone: zone.numeric for zone in scope.zones}
+        if zones and {zone.zone for zone in zones} != set(availability):
+            raise CoverageError("export thermal inventory does not match scoped availability")
+        if not zones and any(availability.values()):
+            raise CoverageError("export lost measured thermal readings")
+        for zone in zones:
+            if (zone.temp_c is not None) != (availability[zone.zone] > 0):
+                raise CoverageError("export peak contradicts numeric availability")
+    if obj.get("verdict") == "PASS":
+        if not zones or coverage.thermal.missing or not coverage.thermal.valid:
+            raise CoverageError("PASS requires continuous thermal coverage")
+        if scope is None and any(zone.temp_c is None for zone in zones):
+            raise CoverageError("strict all-zone PASS cannot contain unavailable temperatures")
+        readings = [zone.temp_c for zone in zones if zone.temp_c is not None]
+        peak = _number(_object(state).get("peak_c"))
+        if not readings or max(readings) != peak:
+            raise CoverageError("export thermal peak contradicts zone peaks")
 
 
 def coverage_gaps(coverage: Coverage, active_seconds: float | None) -> tuple[str, ...]:
@@ -603,9 +739,13 @@ def reduce_capture(evidence: CaptureEvidence, window: Window | None) -> Reductio
     rss_values = [sample.receiver_rss_mb for sample in active if sample.receiver_rss_mb is not None]
     rss = _observed(_timeline([sample.t_ns for sample in active if sample.receiver_rss_mb is not None], window), len(active))
     inventory = {zone.zone for zone in active[0].thermal_zones} if active else set()
+    nano = evidence.thermal_policy is not None
+    inventory_valid = bool(inventory) and (not nano or _nano_inventory(tuple(inventory)))
     thermal_times = [sample.t_ns for sample in active if inventory
-                     and {zone.zone for zone in sample.thermal_zones} == inventory
-                     and all(zone.temp_c is not None for zone in sample.thermal_zones)]
+                      and inventory_valid
+                      and {zone.zone for zone in sample.thermal_zones} == inventory
+                      and all(zone.temp_c is not None or (nano and _cv_zone(zone.zone))
+                              for zone in sample.thermal_zones)]
     zone_peaks: dict[str, float] = {}
     readings: list[float] = []
     for sample in active:
@@ -633,8 +773,16 @@ def reduce_capture(evidence: CaptureEvidence, window: Window | None) -> Reductio
                       intervals[0][0] if intervals else None, intervals[-1][1] if intervals else None,
                       uncovered, baseline, measured)
     video = evidence.video_evidence
-    value = Coverage(POLICY, window, sampling, rss, cpu, thermal, *endpoints,
-                     QuantileScope(QUANTILE_POLICY, LIMIT, len(video.ipc_latency_ns), len(video.decode_latency_ns)))
+    scope = None
+    if evidence.thermal_policy is not None:
+        availability = []
+        for name in sorted(inventory):
+            numeric = sum(any(zone.zone == name and zone.temp_c is not None for zone in sample.thermal_zones)
+                          for sample in active)
+            availability.append(ZoneAvailability(name, numeric, len(active) - numeric))
+        scope = ThermalScope(evidence.thermal_policy, tuple(availability))
+    value = Coverage(NANO_COVERAGE_POLICY if nano else POLICY, window, sampling, rss, cpu, thermal, *endpoints,
+                     QuantileScope(QUANTILE_POLICY, LIMIT, len(video.ipc_latency_ns), len(video.decode_latency_ns)), scope)
     _validate_coverage(value)
     growth = None
     if len(active) >= 2:
