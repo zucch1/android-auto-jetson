@@ -72,6 +72,7 @@ struct SinkOpenRequest final {
     // audio that was never rendered. Never set by production callers.
     bool drop_nonempty_at_ingress{false};
     bool drop_nonempty_after_window{false};
+    std::function<void(const SinkWriteProgress&)> on_write_progress{};
 };
 
 struct SinkOpenOutcome final {

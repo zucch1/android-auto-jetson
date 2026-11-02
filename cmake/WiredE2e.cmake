@@ -35,6 +35,7 @@ set(AA_WIRED_TEST_SOURCES
     tests/wired_e2e/wired_e2e_revoke_test.cpp
     tests/wired_e2e/wired_e2e_failures_test.cpp
     tests/wired_e2e/receiver_test.cpp
+    tests/wired_e2e/av_credit_ledger_test.cpp
     tests/wired_e2e/video_outlet_test.cpp
     tests/wired_e2e/av_sink_test.cpp
     tests/wired_e2e/microphone_test.cpp
@@ -81,6 +82,7 @@ if(NOT CMAKE_CROSSCOMPILING)
             "AA_WIRED_E2E_REQUIRES_AUDIO_ROUTER: include cmake/AudioPipeline.cmake before cmake/WiredE2e.cmake")
     endif()
     add_executable(aa_wired_e2e_test ${AA_WIRED_TEST_SOURCES})
+    add_test(NAME wired_e2e_av_credit_ledger COMMAND aa_wired_e2e_test --gtest_filter=AvCreditLedger.*)
     set_target_properties(aa_wired_e2e_test PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_link_libraries(aa_wired_e2e_test PRIVATE
@@ -137,7 +139,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_tests_properties(wired_e2e_control PROPERTIES TIMEOUT 120)
     add_test(NAME wired_recovery COMMAND aa_wired_e2e_test --gtest_filter=WiredRecovery.*)
     add_test(NAME wired_receiver COMMAND dbus-run-session --
-        $<TARGET_FILE:aa_wired_e2e_test> --gtest_filter=WiredReceiver.*)
+        $<TARGET_FILE:aa_wired_e2e_test> --gtest_filter=WiredReceiver.*:ReceiverAudioDispatch.*)
     add_test(NAME wired_deadline COMMAND aa_wired_e2e_test --gtest_filter=WiredDeadline.*)
     set_tests_properties(wired_deadline PROPERTIES TIMEOUT 30)
     set_tests_properties(wired_receiver PROPERTIES TIMEOUT 120)

@@ -19,12 +19,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <signal.h>
 #include <sys/stat.h>
@@ -34,6 +37,7 @@
 #include <sstream>
 #include <spawn.h>
 #include <string>
+#include <thread>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -248,8 +252,24 @@ namespace {
     return config;
 }
 
+struct RecordingSinkState;
+
 class AudioPipelineRoute : public ::testing::Test {
 protected:
+    const aa::protocol::ChannelRole media{aa::protocol::ChannelRole::media_audio};
+    const aa::protocol::ChannelRole guidance{aa::protocol::ChannelRole::guidance_audio};
+    const aa::core::Nanoseconds base{1'000'000'000};
+    std::shared_ptr<RecordingSinkState> rec;
+    std::optional<aa::audio::AudioRouter> router;
+    std::vector<aa::audio::WriteCompletion> completions;
+
+    void open_incremental();
+    void enqueue(aa::protocol::ChannelRole role, std::uint64_t sequence,
+                 Tone tone, std::int64_t offset_ns = 0);
+    aa::audio::RenderStep step();
+    void expect_headers(const std::vector<aa::protocol::MessageHeader>& actual,
+                        const std::vector<std::pair<aa::protocol::ChannelRole, std::uint64_t>>& expected);
+
     [[nodiscard]] aa::core::Result<aa::audio::AudioRouter> open_router() {
         return aa::audio::AudioRouter::open(pcm_router_config());
     }
@@ -938,8 +958,11 @@ public:
                 }
                 const std::string token = token_after(vline, ref + 7);
                 if (!token.empty() && denied_token(token)) {
-                    return {ConfigOutcome::Stage::denied_module_verify,
-                            "retained forbidden module " + token + " in " + dest_path};
+                    std::string cause = "retained forbidden module ";
+                    cause += token;
+                    cause += " in ";
+                    cause += dest_path;
+                    return {ConfigOutcome::Stage::denied_module_verify, cause};
                 }
             }
         }
@@ -1739,6 +1762,12 @@ TEST(AudioPipelineSinkBackend, FullAppsrcQueueHonorsSingleWriteDeadline) {
     request.format = stereo_48k();
     request.start_timeout = aa::core::Milliseconds{2000};
     request.write_timeout = aa::core::Milliseconds{200};
+    std::mutex progress_mutex;
+    std::optional<aa::audio::SinkWriteProgress> progress;
+    request.on_write_progress = [&](const aa::audio::SinkWriteProgress& value) {
+        std::lock_guard lock(progress_mutex);
+        progress = value;
+    };
     auto outcome = aa::audio::detail::open_default_sink(request);
     ASSERT_TRUE(outcome.sink != nullptr);
 
@@ -1796,7 +1825,168 @@ TEST(AudioPipelineSinkBackend, FullAppsrcQueueHonorsSingleWriteDeadline) {
     EXPECT_EQ(after.queued_buffers, before.queued_buffers);
     EXPECT_LE(after.queued_bytes, after.max_bytes);
     EXPECT_LE(after.queued_buffers, after.max_buffers);
+    std::lock_guard lock(progress_mutex);
+    ASSERT_TRUE(progress);
+    EXPECT_FALSE(progress->readiness_probe);
+    EXPECT_EQ(progress->effective_scheduled, chunk.timestamp);
+    EXPECT_EQ(progress->deadline.count - progress->entered_at.count, 200'000'000);
+    EXPECT_TRUE(progress->levels_valid);
+    EXPECT_GE(progress->queued_bytes, limits.max_bytes);
+    EXPECT_FALSE(progress->admitted_at);
+    EXPECT_FALSE(progress->pair_pushed_at);
+    EXPECT_FALSE(progress->ingress_at);
+    EXPECT_FALSE(progress->marker_at);
+    EXPECT_FALSE(progress->handoff_at);
+    EXPECT_EQ(progress->outcome, aa::ErrorCode::timeout);
+    ASSERT_TRUE(progress->completed_at);
+    EXPECT_GE(*progress->completed_at, progress->deadline);
     // The guard releases the downstream block here on every exit path.
+}
+
+TEST(AudioPipelineSinkBackend, FrozenProgressDistinguishesPushedFromIngressAndSurvivesTeardown) {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::optional<aa::audio::SinkWriteProgress> latest;
+    aa::audio::detail::SinkOpenRequest request;
+    request.format = stereo_48k();
+    request.write_timeout = aa::core::Milliseconds{2000};
+    request.on_write_progress = [&](const aa::audio::SinkWriteProgress& value) {
+        std::lock_guard lock(mutex);
+        latest = value;
+        cv.notify_all();
+    };
+    auto outcome = aa::audio::detail::open_default_sink(request);
+    ASSERT_TRUE(outcome.sink);
+    {
+        std::lock_guard lock(mutex);
+        ASSERT_TRUE(latest);
+        EXPECT_TRUE(latest->readiness_probe);
+    }
+    ASSERT_TRUE(aa::audio::detail::block_downstream_for_test(*outcome.sink));
+    const auto pcm = constant_pcm({kMediaLevel, 960});
+    const aa::audio::MixedChunk chunk{stereo_48k(), now_ns(), pcm};
+    aa::core::Result<void> written;
+    std::thread writer([&] { written = outcome.sink->write(chunk); });
+    // Always release the real block and join before sink/callback destruction.
+    struct Release final {
+        aa::audio::detail::ObservedAudioSink* sink;
+        std::thread& writer;
+        ~Release() {
+            if (sink) { aa::audio::detail::unblock_downstream_for_test(*sink); }
+            if (writer.joinable()) { writer.join(); }
+        }
+    } release{outcome.sink.get(), writer};
+    ASSERT_TRUE(aa::audio::detail::wait_downstream_block_entered_for_test(
+        *outcome.sink, aa::core::Milliseconds{1000}));
+    aa::audio::SinkWriteProgress frozen;
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{1}, [&] {
+            return latest && !latest->readiness_probe && latest->pair_pushed_at;
+        }));
+        frozen = *latest;
+    }
+    ASSERT_TRUE(frozen.admitted_at);
+    ASSERT_TRUE(frozen.pair_pushed_at);
+    EXPECT_LE(frozen.entered_at, *frozen.admitted_at);
+    EXPECT_LE(*frozen.admitted_at, *frozen.pair_pushed_at);
+    EXPECT_FALSE(frozen.ingress_at);
+    EXPECT_FALSE(frozen.marker_at);
+    EXPECT_FALSE(frozen.handoff_at);
+    EXPECT_FALSE(frozen.completed_at);
+    EXPECT_FALSE(frozen.outcome);
+    EXPECT_EQ(frozen.effective_scheduled, chunk.timestamp);
+    EXPECT_TRUE(frozen.pts_ns);
+    EXPECT_TRUE(frozen.pts_origin_ns);
+    ASSERT_TRUE(frozen.clock_ns);
+    ASSERT_TRUE(frozen.base_time_ns);
+    ASSERT_TRUE(frozen.running_time_ns);
+    EXPECT_EQ(*frozen.running_time_ns, *frozen.clock_ns - *frozen.base_time_ns);
+    const auto retained = frozen;
+    EXPECT_EQ(outcome.sink->render_stats().handoff_events, 0U);
+    const auto levels = aa::audio::detail::appsrc_queue_level_for_test(*outcome.sink);
+    EXPECT_EQ(levels.max_bytes, 65536U);
+    EXPECT_EQ(levels.max_buffers, 2U);
+    aa::audio::detail::unblock_downstream_for_test(*outcome.sink);
+    writer.join();
+    EXPECT_TRUE(written);
+    {
+        std::lock_guard lock(mutex);
+        ASSERT_TRUE(latest->ingress_at);
+        ASSERT_TRUE(latest->marker_at);
+        ASSERT_TRUE(latest->handoff_at);
+        ASSERT_TRUE(latest->completed_at);
+        EXPECT_LE(*latest->pair_pushed_at, *latest->ingress_at);
+        EXPECT_LE(*latest->ingress_at, *latest->handoff_at);
+        EXPECT_LE(*latest->handoff_at, *latest->marker_at);
+        EXPECT_LE(*latest->marker_at, *latest->completed_at);
+        EXPECT_FALSE(latest->outcome);
+    }
+    EXPECT_EQ(outcome.sink->render_stats().handoff_events, 1U);
+    EXPECT_EQ(outcome.sink->render_stats().chain_return_buffers, 1U);
+    EXPECT_TRUE(outcome.sink->drain(aa::core::Milliseconds{2000}));
+    release.sink = nullptr;
+    outcome.sink.reset();
+    EXPECT_EQ(frozen, retained);
+}
+
+TEST(AudioPipelineSinkBackend, MissingWriteObservationsRemainUnknown) {
+    const aa::audio::SinkWriteProgress value;
+    EXPECT_FALSE(value.levels_valid);
+    EXPECT_FALSE(value.pts_ns);
+    EXPECT_FALSE(value.pts_origin_ns);
+    EXPECT_FALSE(value.clock_ns);
+    EXPECT_FALSE(value.base_time_ns);
+    EXPECT_FALSE(value.running_time_ns);
+    EXPECT_FALSE(value.admitted_at);
+    EXPECT_FALSE(value.pair_pushed_at);
+    EXPECT_FALSE(value.ingress_at);
+    EXPECT_FALSE(value.marker_at);
+    EXPECT_FALSE(value.handoff_at);
+    EXPECT_FALSE(value.completed_at);
+    EXPECT_FALSE(value.outcome);
+}
+
+TEST_F(AudioPipelineRoute, ProgressCallbackCarriesEffectiveScheduleWithoutChangingReceiptOrTrim) {
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    std::mutex mutex;
+    std::optional<aa::audio::SinkWriteProgress> latest;
+    std::uint64_t readiness_sequence = 0;
+    config.on_sink_write_progress = [&](const auto& value) {
+        std::lock_guard lock(mutex);
+        latest = value;
+        if (value.readiness_probe) { readiness_sequence = value.sequence; }
+    };
+    auto opened = aa::audio::AudioRouter::open(config);
+    ASSERT_TRUE(opened);
+    auto& router = opened.value();
+    ASSERT_EQ(router.state(), aa::audio::RouterState::active);
+    const auto scheduled = now_ns();
+    const auto pcm = constant_pcm({kMediaLevel, 2048});
+    const auto receipt = aa::core::Nanoseconds{scheduled.count - 40'000'000};
+    ASSERT_TRUE(router.submit(make_message(aa::protocol::ChannelRole::media_audio, 1, scheduled, pcm), receipt));
+    ASSERT_TRUE(router.pump());
+    ASSERT_TRUE(router.submit(make_message(aa::protocol::ChannelRole::media_audio, 2, scheduled, pcm), receipt));
+    ASSERT_TRUE(router.pump());
+    aa::audio::SinkWriteProgress frozen;
+    {
+        std::lock_guard lock(mutex);
+        ASSERT_TRUE(latest);
+        frozen = *latest;
+    }
+    EXPECT_GT(frozen.sequence, readiness_sequence);
+    EXPECT_FALSE(frozen.readiness_probe);
+    EXPECT_EQ(frozen.effective_scheduled.count, scheduled.count + 42'666'666);
+    EXPECT_EQ(router.report().stats.frames_decoded, 4096U);
+    EXPECT_EQ(router.report().stats.frames_trimmed, 240U);
+    EXPECT_EQ(router.report().stats.frames_retained, 3856U);
+    ASSERT_TRUE(frozen.completed_at);
+    EXPECT_GE(router.report().stats.last_path_latency.count,
+              frozen.completed_at->count - receipt.count);
+    router.close();
+    EXPECT_TRUE(frozen.completed_at);
+    EXPECT_EQ(frozen.effective_scheduled.count, scheduled.count + 42'666'666);
 }
 
 TEST(MicrophoneContract, DisabledByDefaultWithTypedRefusal) {
@@ -1999,6 +2189,8 @@ struct RecordingSinkState final {
     std::uint64_t drain_calls{0};
     std::uint64_t drains_completed{0};
     bool fail_drain{false};
+    bool fail_write{false};
+    std::function<void()> during_write{};
 };
 
 class RecordingAudioSink final : public aa::audio::detail::ObservedAudioSink {
@@ -2006,8 +2198,10 @@ public:
     std::shared_ptr<RecordingSinkState> state{std::make_shared<RecordingSinkState>()};
 
     aa::core::Result<void> write(const aa::audio::MixedChunk& chunk) override {
+        if (state->during_write) { state->during_write(); }
         state->writes.emplace_back(chunk.pcm.begin(), chunk.pcm.end());
         state->write_ns.push_back(chunk.timestamp.count);
+        if (state->fail_write) { return aa::Error{aa::ErrorCode::audio_sink_unavailable}; }
         return {};
     }
     aa::core::Result<void> drain(aa::core::Milliseconds) override {
@@ -2039,6 +2233,60 @@ std::vector<std::int16_t> flatten_i16(const std::vector<std::vector<std::byte>>&
 }
 
 } // namespace
+
+TEST_F(AudioPipelineRoute, ExplicitReceiptIncludesQueueWaitWithoutMovingSchedule) {
+    auto sink = std::make_unique<RecordingAudioSink>();
+    const auto observed = sink->state;
+    auto config = pcm_router_config();
+    std::optional<aa::audio::WriteCompletion> completion;
+    config.on_write_completed = [&](const auto& value) { completion = value; };
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router);
+    const auto scheduled = now_ns();
+    const aa::core::Nanoseconds receipt{scheduled.count - 75'000'000};
+    const auto pcm = constant_pcm({kMediaLevel, 960});
+    ASSERT_TRUE(router.value().submit(
+        make_message(aa::protocol::ChannelRole::media_audio, 42, scheduled, pcm), receipt));
+    ASSERT_TRUE(router.value().pump());
+    ASSERT_TRUE(completion);
+    EXPECT_EQ(completion->scheduled, scheduled);
+    EXPECT_EQ(observed->write_ns.front(), scheduled.count);
+    EXPECT_EQ(router.value().report().stats.last_path_latency.count,
+              completion->completed.count - receipt.count);
+    EXPECT_GE(router.value().report().stats.last_path_latency.count, 75'000'000);
+    EXPECT_LT(router.value().report().stats.last_completion_skew.count,
+              router.value().report().stats.last_path_latency.count);
+}
+
+TEST_F(AudioPipelineRoute, PendingRunRejectionRecordsBoundedOccupancyUntilNextSubmitOrClose) {
+    auto sink = std::make_unique<RecordingAudioSink>();
+    const auto observed = sink->state;
+    auto router = aa::audio::detail::open_router_with_sink_for_test(pcm_router_config(), std::move(sink));
+    ASSERT_TRUE(router);
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(4, std::byte{1});
+    const auto message = make_message(role, 1, now_ns(), pcm);
+    for (int i = 0; i < 512; ++i) { ASSERT_TRUE(router.value().submit(message)); }
+    const auto rejected = router.value().submit(message);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::ipc_queue_full);
+    const auto snapshot = router.value().report().queue_rejection;
+    ASSERT_TRUE(snapshot);
+    EXPECT_EQ(snapshot->source, aa::diagnostics::QueueSource::audio_router);
+    EXPECT_EQ(snapshot->reason, aa::diagnostics::QueueReason::pending_runs);
+    EXPECT_EQ(snapshot->role, role);
+    EXPECT_EQ(snapshot->items, 512U);
+    EXPECT_EQ(snapshot->capacity, 512U);
+    EXPECT_EQ(snapshot->requested_bytes, 4U);
+    EXPECT_EQ(router.value().report().stats.chunks_submitted, 512U);
+    EXPECT_TRUE(observed->writes.empty());
+    router.value().close();
+    EXPECT_EQ(router.value().report().queue_rejection, snapshot);
+    const auto closed = router.value().submit(message);
+    ASSERT_FALSE(closed);
+    EXPECT_EQ(closed.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_FALSE(router.value().report().queue_rejection);
+}
 
 TEST_F(AudioPipelineRoute, MultiPumpPreservesTimestampGap) {
     const auto config = pcm_router_config();
@@ -2183,6 +2431,265 @@ TEST_F(AudioPipelineRoute, MultiPumpLateRunsSequentializeWithoutDroppingSamples)
     for (std::size_t i = 1; i < rec->write_ns.size(); ++i) {
         ASSERT_GE(rec->write_ns[i], rec->write_ns[i - 1]) << i;
     }
+}
+
+TEST_F(AudioPipelineRoute, DriftPolicyTrimMathMatchesWatermarkTargetAndCaps) {
+    aa::audio::LivePcmDriftPolicy policy;
+    policy.enabled = true;
+    const aa::audio::LivePcmDriftCorrector corrector{policy, 48000};
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{0}, 960), 0U);
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{20'000'000LL}, 960), 0U);
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{21'000'000LL}, 960), 240U);
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{30'000'000LL}, 960), 240U);
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{16'000'000LL}, 960), 0U);
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{-5'000'000LL}, 960), 0U);
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{30'000'000LL}, 100), 100U);
+    const aa::audio::LivePcmDriftCorrector at_96k{policy, 96000};
+    EXPECT_EQ(at_96k.trim_frames(aa::core::Nanoseconds{21'000'000LL}, 960), 480U);
+    aa::audio::LivePcmDriftPolicy custom;
+    custom.enabled = true;
+    custom.high_watermark = aa::core::Nanoseconds{10'000'000LL};
+    custom.target = aa::core::Nanoseconds{8'000'000LL};
+    custom.max_trim = aa::core::Nanoseconds{1'000'000LL};
+    const aa::audio::LivePcmDriftCorrector custom_corrector{custom, 48000};
+    EXPECT_EQ(custom_corrector.trim_frames(aa::core::Nanoseconds{11'000'000LL}, 960), 48U);
+    aa::audio::LivePcmDriftPolicy lossless;
+    lossless.high_watermark = aa::core::Nanoseconds{1};
+    const aa::audio::LivePcmDriftCorrector disabled{lossless, 48000};
+    EXPECT_EQ(disabled.trim_frames(aa::core::Nanoseconds{30'000'000LL}, 960), 0U);
+}
+
+namespace {
+
+constexpr std::uint64_t kSimChunkFrames = 960;
+constexpr std::int64_t kSimChunkNs = 20'000'000LL;
+constexpr std::uint64_t kSimRate = 48000;
+constexpr std::uint64_t kSimQueueSlots = 4;
+
+struct DriftSim final {
+    std::uint64_t produced{};
+    std::uint64_t admitted{};
+    std::uint64_t acked{};
+    std::uint64_t rejected{};
+    std::uint64_t decoded{};
+    std::uint64_t retained{};
+    std::uint64_t trimmed{};
+    std::uint64_t pending{};
+    std::uint64_t silence{};
+    std::uint64_t output{};
+    std::uint64_t trims{};
+    std::uint64_t rendered{};
+    std::uint64_t max_unacked{};
+    std::uint64_t max_queue_slots{};
+    std::uint64_t max_queue_frames{};
+    std::int64_t max_phase_ns{};
+    bool cursor_monotonic{true};
+    bool accounting_holds{true};
+};
+
+[[nodiscard]] std::uint64_t sim_intended(std::int64_t timestamp_ns) {
+    const auto t = static_cast<std::uint64_t>(timestamp_ns);
+    return (t / 1'000'000'000ULL) * kSimRate + ((t % 1'000'000'000ULL) * kSimRate) / 1'000'000'000ULL;
+}
+
+[[nodiscard]] std::int64_t sim_frame_time(std::uint64_t frame) {
+    return static_cast<std::int64_t>((frame / kSimRate) * 1'000'000'000ULL
+                                     + ((frame % kSimRate) * 1'000'000'000ULL) / kSimRate);
+}
+
+// Virtual-clock model of phone -> admission queue -> router: chunks of
+// kSimChunkFrames frames are produced every kSimChunkNs/(1+ppm) of the OUTPUT
+// clock and stamped with the production time (the common monotonic clock);
+// each chunk is admitted and credited immediately (ACK-on-admission) into the
+// bounded queue and rendered FIFO at the output rate while the router policy
+// trims over-watermark runs. No PCM is materialized - only counters and
+// virtual time. The exact rational production spacing keeps the run
+// deterministic.
+[[nodiscard]] DriftSim run_drift_sim(std::int64_t ppm, // NOLINT(bugprone-easily-swappable-parameters): virtual clock drift in ppm and a chunk count are distinct units
+                                     std::uint64_t chunks) {
+    aa::audio::LivePcmDriftPolicy policy;
+    policy.enabled = true;
+    const aa::audio::LivePcmDriftCorrector corrector{policy, 48000};
+    DriftSim sim;
+    const std::int64_t denominator = 1'000'000LL + ppm;
+    std::int64_t remainder = 0;
+    std::int64_t produced_at_ns = 0;
+    std::uint64_t role_end = 0;
+    std::int64_t previous_render_done_ns = 0;
+    std::deque<std::int64_t> render_done;
+    for (std::uint64_t n = 0; n < chunks; ++n) {
+        ++sim.produced;
+        if (sim.produced - sim.acked > sim.max_unacked) {
+            sim.max_unacked = sim.produced - sim.acked;
+        }
+        while (!render_done.empty() && render_done.front() <= produced_at_ns) {
+            render_done.pop_front();
+        }
+        if (render_done.size() + 1 > sim.max_queue_slots) {
+            sim.max_queue_slots = render_done.size() + 1;
+        }
+        const std::uint64_t queue_frames =
+            static_cast<std::uint64_t>(render_done.size() + 1) * kSimChunkFrames;
+        if (queue_frames > sim.max_queue_frames) {
+            sim.max_queue_frames = queue_frames;
+        }
+        if (render_done.size() + 1 > kSimQueueSlots) {
+            ++sim.rejected;
+        } else {
+            ++sim.admitted;
+            ++sim.acked;
+            sim.decoded += kSimChunkFrames;
+            sim.pending += kSimChunkFrames;
+
+            const std::uint64_t intended = sim_intended(produced_at_ns);
+            const std::uint64_t placed = std::max(intended, role_end);
+            const std::int64_t phase = sim_frame_time(placed) - produced_at_ns;
+            if (phase > sim.max_phase_ns) {
+                sim.max_phase_ns = phase;
+            }
+            const std::uint64_t trim = corrector.trim_frames(aa::core::Nanoseconds{phase},
+                                                             kSimChunkFrames);
+            if (trim != 0) {
+                ++sim.trims;
+            }
+            const std::uint64_t retained = kSimChunkFrames - trim;
+            const std::uint64_t gap = placed - role_end;
+            if (placed + retained < placed || placed < role_end) {
+                sim.cursor_monotonic = false;
+            }
+            role_end = placed + retained;
+            sim.retained += retained;
+            sim.trimmed += trim;
+            sim.pending -= kSimChunkFrames;
+            sim.silence += gap;
+            sim.output += gap + retained;
+            if (sim.decoded != sim.retained + sim.trimmed + sim.pending) {
+                sim.accounting_holds = false;
+            }
+
+            const std::int64_t render_start_ns =
+                std::max<std::int64_t>(produced_at_ns, previous_render_done_ns);
+            previous_render_done_ns = render_start_ns + sim_frame_time(gap + retained);
+            render_done.push_back(previous_render_done_ns);
+            ++sim.rendered;
+        }
+        remainder += kSimChunkNs * 1'000'000LL;
+        produced_at_ns += remainder / denominator;
+        remainder %= denominator;
+    }
+    return sim;
+}
+
+} // namespace
+
+TEST_F(AudioPipelineRoute, LivePcmLongRunDriftAtPlus200PpmStaysBounded) {
+    const auto sim = run_drift_sim(200, 3ULL * 3600ULL * 50ULL);
+    EXPECT_EQ(sim.rejected, 0U) << "queue-full over simulated hours";
+    EXPECT_EQ(sim.produced, 3ULL * 3600ULL * 50ULL);
+    EXPECT_EQ(sim.acked, sim.produced);
+    EXPECT_LE(sim.max_unacked, 1U);
+    EXPECT_LT(sim.max_queue_slots, kSimQueueSlots);
+    EXPECT_LT(sim.max_queue_frames, kSimQueueSlots * kSimChunkFrames);
+    EXPECT_GT(sim.trims, 0U);
+    EXPECT_LT(sim.max_phase_ns, 21'000'000LL);
+    EXPECT_TRUE(sim.cursor_monotonic);
+    EXPECT_TRUE(sim.accounting_holds);
+    EXPECT_EQ(sim.decoded, sim.retained + sim.trimmed + sim.pending);
+    EXPECT_EQ(sim.pending, 0U);
+}
+
+TEST_F(AudioPipelineRoute, LivePcmLongRunZeroDriftNeverTrims) {
+    const auto sim = run_drift_sim(0, 3ULL * 3600ULL * 50ULL);
+    EXPECT_EQ(sim.rejected, 0U);
+    EXPECT_EQ(sim.trims, 0U);
+    EXPECT_EQ(sim.trimmed, 0U);
+    EXPECT_EQ(sim.silence, 0U);
+    EXPECT_EQ(sim.output, sim.decoded);
+    EXPECT_EQ(sim.max_phase_ns, 0);
+    EXPECT_EQ(sim.acked, sim.produced);
+    EXPECT_TRUE(sim.accounting_holds);
+    EXPECT_EQ(sim.decoded, sim.retained + sim.trimmed + sim.pending);
+}
+
+TEST_F(AudioPipelineRoute, LivePcmLongRunMinus200PpmKeepsBoundedSilence) {
+    const auto chunks = 3ULL * 3600ULL * 50ULL;
+    const auto sim = run_drift_sim(-200, chunks);
+    EXPECT_EQ(sim.rejected, 0U);
+    EXPECT_EQ(sim.trims, 0U);
+    EXPECT_EQ(sim.trimmed, 0U);
+    EXPECT_LT(sim.max_phase_ns, 20'834LL * 2);
+    EXPECT_GT(sim.silence, 0U);
+    EXPECT_LT(sim.silence, 2U * chunks);
+    EXPECT_EQ(sim.output, sim.retained + sim.silence);
+    EXPECT_EQ(sim.acked, sim.produced);
+    EXPECT_TRUE(sim.cursor_monotonic);
+    EXPECT_TRUE(sim.accounting_holds);
+    EXPECT_EQ(sim.decoded, sim.retained + sim.trimmed + sim.pending);
+}
+
+TEST_F(AudioPipelineRoute, LivePcmDriftTrimAccountsFramesAndKeepsMonotonicTimeline) {
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto rec = sink->state;
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{3'500'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    for (std::uint64_t n = 0; n < 15; ++n) {
+        const aa::core::Nanoseconds stamp{
+            base.count + static_cast<std::int64_t>(n) * 18'000'000LL};
+        ASSERT_TRUE(router.value()
+                        .submit(make_message(aa::protocol::ChannelRole::media_audio, n, stamp,
+                                             media))
+                        .has_value());
+        ASSERT_TRUE(router.value().pump().has_value());
+    }
+
+    const auto& stats = router.value().report().stats;
+    EXPECT_EQ(stats.frames_decoded, 15U * 960U);
+    EXPECT_EQ(stats.frames_trimmed, 480U);
+    EXPECT_EQ(stats.frames_retained, 13'920U);
+    EXPECT_EQ(stats.frames_silence, 0U);
+    EXPECT_EQ(stats.frames_output, 13'920U);
+    EXPECT_EQ(stats.frames_decoded, stats.frames_retained + stats.frames_trimmed);
+    EXPECT_EQ(flatten_i16(rec->writes).size(), 13'920U * 2U);
+    ASSERT_EQ(rec->write_ns.size(), 15U);
+    EXPECT_EQ(rec->write_ns.front(), base.count);
+    EXPECT_EQ(rec->write_ns.back(), base.count + 270'000'000LL);
+    for (std::size_t i = 1; i < rec->write_ns.size(); ++i) {
+        ASSERT_GT(rec->write_ns[i], rec->write_ns[i - 1]) << i;
+    }
+}
+
+TEST_F(AudioPipelineRoute, LivePcmZeroDriftIntegrationTrimsNothing) {
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    auto sink = std::make_unique<RecordingAudioSink>();
+    auto rec = sink->state;
+    auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(router.has_value());
+
+    const aa::core::Nanoseconds base{4'500'000'000LL};
+    const std::vector<std::byte> media = constant_pcm({kMediaLevel, 960});
+    for (std::uint64_t n = 0; n < 15; ++n) {
+        const aa::core::Nanoseconds stamp{
+            base.count + static_cast<std::int64_t>(n) * 20'000'000LL};
+        ASSERT_TRUE(router.value()
+                        .submit(make_message(aa::protocol::ChannelRole::media_audio, n, stamp,
+                                             media))
+                        .has_value());
+        ASSERT_TRUE(router.value().pump().has_value());
+    }
+
+    const auto& stats = router.value().report().stats;
+    EXPECT_EQ(stats.frames_decoded, 15U * 960U);
+    EXPECT_EQ(stats.frames_trimmed, 0U);
+    EXPECT_EQ(stats.frames_retained, 15U * 960U);
+    EXPECT_EQ(stats.frames_silence, 0U);
+    EXPECT_EQ(stats.frames_output, 15U * 960U);
+    EXPECT_EQ(flatten_i16(rec->writes).size(), 15U * 960U * 2U);
 }
 
 TEST_F(AudioPipelineRoute, EmptyPumpDoesNotRebaseTimeline) {
@@ -2657,4 +3164,1055 @@ TEST_F(AudioPipelineRoute, FailedFlushLeavesRouteTerminalAndDegraded) {
     router.value().close();
     EXPECT_EQ(rec->drain_calls, 1U);
     EXPECT_EQ(router.value().report().sink.cause, recorded_cause);
+}
+
+namespace {
+
+    void AudioPipelineRoute::open_incremental() {
+        auto sink = std::make_unique<RecordingAudioSink>();
+        rec = sink->state;
+        auto config = pcm_router_config();
+        config.render_quantum = aa::core::Nanoseconds{5'000'000};
+        config.on_write_completed = [&](const auto& value) { completions.push_back(value); };
+        auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+        ASSERT_TRUE(opened);
+        router.emplace(std::move(opened).value());
+    }
+
+    void AudioPipelineRoute::enqueue(aa::protocol::ChannelRole role, std::uint64_t sequence,
+                                    Tone tone, std::int64_t offset_ns) {
+        const auto pcm = constant_pcm(tone);
+        ASSERT_TRUE(router->submit(make_message(role, sequence,
+            aa::core::Nanoseconds{base.count + offset_ns}, pcm), aa::core::Nanoseconds{123}));
+    }
+
+    aa::audio::RenderStep AudioPipelineRoute::step() {
+        auto result = router->render_step();
+        EXPECT_TRUE(result);
+        return result ? std::move(result).value() : aa::audio::RenderStep{};
+    }
+
+    void AudioPipelineRoute::expect_headers(const std::vector<aa::protocol::MessageHeader>& actual,
+                        const std::vector<std::pair<aa::protocol::ChannelRole, std::uint64_t>>& expected) {
+        std::vector<std::pair<aa::protocol::ChannelRole, std::uint64_t>> identities;
+        identities.reserve(actual.size());
+        for (const auto& header : actual) { identities.emplace_back(header.channel, header.sequence); }
+        EXPECT_EQ(identities, expected);
+    }
+
+} // namespace
+
+TEST_F(AudioPipelineRoute, IncrementalSharedFrontierDoesNotDisplaceNewMediaForFutureGuidance) {
+    open_incremental();
+    enqueue(media, 1, {1000, 480});
+    enqueue(guidance, 2, {2000, 240}, 100'000'000);
+    const auto first = step();
+    expect_headers(first.contributors, {{media, 1}});
+    EXPECT_TRUE(first.completed.empty());
+    EXPECT_TRUE(first.pending);
+    enqueue(media, 3, {3000, 240}, 10'000'000);
+
+    const auto second = step();
+
+    expect_headers(second.contributors, {{media, 1}});
+    expect_headers(second.completed, {{media, 1}});
+    EXPECT_TRUE(second.pending);
+    EXPECT_EQ(rec->write_ns, (std::vector<std::int64_t>{base.count, base.count + 5'000'000}));
+    const auto third = step();
+    expect_headers(third.contributors, {{media, 3}});
+    expect_headers(third.completed, {{media, 3}});
+    EXPECT_EQ(rec->write_ns.back(), base.count + 10'000'000);
+    EXPECT_EQ(flatten_i16({rec->writes.back()}), std::vector<std::int16_t>(480, 3000));
+    EXPECT_EQ(router->report().stats.frames_silence, 0U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalOverlappingRolesHaveExactCreditsAndShortTails) {
+    open_incremental();
+    enqueue(media, 7, {1000, 481});
+    enqueue(guidance, 7, {2000, 240}, 5'000'000);
+
+    const auto first = step();
+    const auto overlap = step();
+    const auto tail = step();
+    const auto empty = step();
+
+    expect_headers(first.contributors, {{media, 7}});
+    EXPECT_TRUE(first.completed.empty());
+    expect_headers(overlap.contributors, {{media, 7}, {guidance, 7}});
+    expect_headers(overlap.completed, {{guidance, 7}});
+    expect_headers(tail.contributors, {{media, 7}});
+    expect_headers(tail.completed, {{media, 7}});
+    EXPECT_FALSE(tail.pending);
+    EXPECT_FALSE(empty.pending);
+    EXPECT_TRUE(empty.completed.empty());
+    EXPECT_TRUE(empty.contributors.empty());
+    ASSERT_EQ(rec->writes.size(), 3U);
+    EXPECT_EQ(flatten_i16({rec->writes[0]}), std::vector<std::int16_t>(480, 1000));
+    EXPECT_EQ(flatten_i16({rec->writes[1]}), std::vector<std::int16_t>(480, 2250));
+    EXPECT_EQ(flatten_i16({rec->writes[2]}), std::vector<std::int16_t>(2, 250));
+    const auto& stats = router->report().stats;
+    EXPECT_EQ(stats.frames_decoded, 721U);
+    EXPECT_EQ(stats.frames_retained, 721U);
+    EXPECT_EQ(stats.frames_output, 481U);
+    ASSERT_EQ(completions.size(), 3U);
+    EXPECT_EQ(completions.back().scheduled.count, base.count + 10'000'000);
+    EXPECT_EQ(completions.back().scheduled_end.count, base.count + 481LL * 1'000'000'000 / 48000);
+    EXPECT_EQ(stats.last_path_latency.count, completions.back().completed.count - 123);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalStepsMatchBatchedPcmWithFifoOverlapsAndGaps) {
+    open_incremental();
+    auto sink = std::make_unique<RecordingAudioSink>();
+    const auto batched_rec = sink->state;
+    auto batched = aa::audio::detail::open_router_with_sink_for_test(pcm_router_config(), std::move(sink));
+    ASSERT_TRUE(batched);
+    const std::array<aa::protocol::ChannelRole, 4> roles{media, media, guidance, media};
+    const std::array<std::int64_t, 4> times{0, 0, 5'000'000, 30'000'000};
+    const std::array<Tone, 4> tones{{{1000, 481}, {3000, 239}, {2000, 240}, {5000, 1}}};
+    for (std::size_t i = 0; i < roles.size(); ++i) {
+        enqueue(roles[i], i, tones[i], times[i]);
+        const auto pcm = constant_pcm(tones[i]);
+        ASSERT_TRUE(batched.value().submit(make_message(roles[i], i,
+            aa::core::Nanoseconds{base.count + times[i]}, pcm)));
+    }
+    ASSERT_TRUE(batched.value().pump());
+
+    std::vector<std::pair<aa::protocol::ChannelRole, std::uint64_t>> completed;
+    for (int i = 0; i < 20; ++i) {
+        const auto result = step();
+        for (const auto& header : result.completed) { completed.emplace_back(header.channel, header.sequence); }
+        if (!result.pending) { break; }
+        ASSERT_LT(i, 19);
+    }
+
+    EXPECT_EQ(flatten_i16(rec->writes), flatten_i16(batched_rec->writes));
+    EXPECT_EQ(completed, (std::vector<std::pair<aa::protocol::ChannelRole, std::uint64_t>>{
+        {guidance, 2}, {media, 0}, {media, 1}, {media, 3}}));
+    std::uint64_t frame_offset = 0;
+    for (std::size_t i = 0; i < rec->writes.size(); ++i) {
+        EXPECT_LE(rec->writes[i].size(), 240U * 4U);
+        EXPECT_EQ(rec->write_ns[i], base.count
+            + static_cast<std::int64_t>(frame_offset * 1'000'000'000 / 48000));
+        frame_offset += rec->writes[i].size() / 4;
+    }
+    EXPECT_EQ(router->report().stats.frames_silence, 720U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalCancellationBeforeStepDiscardsOnlySelectedRole) {
+    open_incremental();
+    enqueue(media, 1, {1000, 960});
+    enqueue(guidance, 2, {2000, 240});
+
+    router->cancel_pending(media);
+    const auto result = step();
+
+    expect_headers(result.contributors, {{guidance, 2}});
+    expect_headers(result.completed, {{guidance, 2}});
+    EXPECT_FALSE(result.pending);
+    EXPECT_EQ(flatten_i16(rec->writes), std::vector<std::int16_t>(480, 2000));
+}
+
+TEST_F(AudioPipelineRoute, IncrementalCancellationDuringWriteSuppressesEvenFinalParentCredit) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    enqueue(media, 2, {3000, 960});
+    enqueue(guidance, 1, {2000, 480});
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool cancelled = false;
+    rec->during_write = [&] {
+        std::unique_lock lock(mutex);
+        entered = true;
+        cv.notify_all();
+        EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds{2}, [&] { return cancelled; }));
+    };
+    std::jthread canceller([&] {
+        std::unique_lock lock(mutex);
+        if (!cv.wait_for(lock, std::chrono::seconds{2}, [&] { return entered; })) { return; }
+        lock.unlock();
+        router->cancel_pending(media);
+        lock.lock();
+        cancelled = true;
+        cv.notify_all();
+    });
+
+    const auto result = step();
+
+    canceller.join();
+    rec->during_write = {};
+    expect_headers(result.contributors, {{media, 1}, {guidance, 1}});
+    EXPECT_TRUE(result.completed.empty());
+    EXPECT_TRUE(result.pending);
+    EXPECT_EQ(flatten_i16(rec->writes), std::vector<std::int16_t>(480, 2250));
+    const auto tail = step();
+    expect_headers(tail.completed, {{guidance, 1}});
+    EXPECT_FALSE(tail.pending);
+    enqueue(media, 3, {4000, 1}, 10'000'000);
+    expect_headers(step().completed, {{media, 3}});
+}
+
+TEST_F(AudioPipelineRoute, IncrementalFailedWriteAfterCancellationStillFailsAndFlushDoesNotRetry) {
+    open_incremental();
+    enqueue(media, 1, {1000, 960});
+    rec->during_write = [&] { router->cancel_pending(media); };
+    rec->fail_write = true;
+
+    const auto result = router->render_step();
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::audio_sink_unavailable);
+    EXPECT_EQ(router->state(), aa::audio::RouterState::degraded);
+    EXPECT_EQ(router->report().stats.frames_output, 0U);
+    EXPECT_EQ(router->report().stats.frames_retained, 0U);
+    EXPECT_TRUE(completions.empty());
+    EXPECT_FALSE(router->flush());
+    EXPECT_FALSE(router->pump());
+    EXPECT_FALSE(router->render_step());
+    EXPECT_EQ(rec->writes.size(), 1U);
+    EXPECT_EQ(rec->drain_calls, 0U);
+    router->close();
+    EXPECT_EQ(rec->writes.size(), 1U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalFlushDrainsRemainderOnceAndCloseDoesNotReplay) {
+    open_incremental();
+    enqueue(media, 1, {1000, 481});
+    ASSERT_TRUE(step().pending);
+
+    ASSERT_TRUE(router->flush());
+
+    EXPECT_EQ(flatten_i16(rec->writes), std::vector<std::int16_t>(962, 1000));
+    EXPECT_EQ(rec->drain_calls, 1U);
+    EXPECT_FALSE(router->render_step());
+    ASSERT_TRUE(router->flush());
+    router->close();
+    EXPECT_EQ(rec->drain_calls, 1U);
+    EXPECT_EQ(rec->writes.size(), 3U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalCloseDiscardsUnrenderedRemainder) {
+    open_incremental();
+    enqueue(media, 1, {1000, 960});
+    ASSERT_TRUE(step().pending);
+
+    router->close();
+
+    EXPECT_EQ(rec->writes.size(), 1U);
+    EXPECT_EQ(rec->drain_calls, 1U);
+    EXPECT_FALSE(router->render_step());
+}
+
+TEST_F(AudioPipelineRoute, IncrementalHiddenFutureParentRejectsWholeScheduleBeforeWrite) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    enqueue(media, 2, {1000, 240}, 300'000'000);
+
+    const auto result = router->render_step();
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_TRUE(rec->writes.empty());
+    ASSERT_TRUE(router->report().render_failure);
+    const auto failure = *router->report().render_failure;
+    EXPECT_EQ(failure.reason, aa::audio::RenderFailureReason::single_gap);
+    ASSERT_TRUE(failure.offending);
+    EXPECT_EQ(failure.offending->sequence, 2U);
+    EXPECT_EQ(failure.base_ns, 1'000'000'000);
+    EXPECT_FALSE(failure.base_committed);
+    EXPECT_EQ(failure.entry_cursor, 0U);
+    EXPECT_EQ(failure.intended, 14400);
+    EXPECT_EQ(failure.start, 14400U);
+    EXPECT_EQ(failure.raw_gap, 14160U);
+    EXPECT_EQ(failure.uncovered_gap, 14160U);
+    EXPECT_EQ(failure.total_gap_before, 0U);
+    EXPECT_EQ(failure.cap, 9600U);
+    router->cancel_pending(media);
+    router->retire_all_role_idle();
+    ASSERT_TRUE(router->report().render_failure);
+    EXPECT_EQ(router->report().render_failure->reason, failure.reason);
+    EXPECT_FALSE(step().pending);
+    EXPECT_FALSE(router->report().render_failure);
+    enqueue(media, 3, {1000, 1});
+    expect_headers(step().completed, {{media, 3}});
+    EXPECT_EQ(rec->write_ns.front(), base.count);
+    EXPECT_FALSE(router->report().render_failure);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalTotalGapBudgetRejectsBeforeAnyStep) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    enqueue(guidance, 2, {2000, 240}, 155'000'000);
+    enqueue(media, 3, {1000, 240}, 310'000'000);
+
+    const auto result = router->render_step();
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_TRUE(rec->writes.empty());
+    ASSERT_TRUE(router->report().render_failure);
+    const auto& failure = *router->report().render_failure;
+    EXPECT_EQ(failure.reason, aa::audio::RenderFailureReason::aggregate_gap);
+    ASSERT_TRUE(failure.offending);
+    EXPECT_EQ(failure.offending->sequence, 3U);
+    EXPECT_EQ(failure.raw_gap, 7200U);
+    EXPECT_EQ(failure.uncovered_gap, 7200U);
+    EXPECT_EQ(failure.total_gap_before, 7200U);
+    EXPECT_EQ(failure.cap, 9600U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalGapAtCapIsBoundedSilenceWithoutContributorCredits) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    expect_headers(step().completed, {{media, 1}});
+    enqueue(guidance, 2, {2000, 1}, 205'000'000);
+
+    for (int i = 0; i < 40; ++i) {
+        const auto silence = step();
+        EXPECT_TRUE(silence.contributors.empty());
+        EXPECT_TRUE(silence.completed.empty());
+        EXPECT_TRUE(silence.pending);
+        EXPECT_EQ(rec->writes.back(), std::vector<std::byte>(960));
+    }
+    const auto tail = step();
+
+    expect_headers(tail.completed, {{guidance, 2}});
+    EXPECT_FALSE(tail.pending);
+    EXPECT_EQ(router->report().stats.frames_silence, 9600U);
+    EXPECT_EQ(completions.size(), 2U);
+    EXPECT_EQ(rec->write_ns.back(), base.count + 205'000'000);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalLateArrivalAboveCapRejectsWithoutMovingCursor) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    step();
+    const auto pcm = constant_pcm({3000, 1});
+    ASSERT_TRUE(router->submit(make_message(media, 2, aa::core::Nanoseconds{0}, pcm)));
+
+    const auto rejected = router->render_step();
+
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
+    ASSERT_TRUE(router->report().render_failure);
+    const auto& failure = *router->report().render_failure;
+    EXPECT_EQ(failure.reason, aa::audio::RenderFailureReason::late);
+    ASSERT_TRUE(failure.offending);
+    EXPECT_EQ(failure.offending->timestamp.count, 0);
+    EXPECT_EQ(failure.base_ns, 1'000'000'000);
+    EXPECT_TRUE(failure.base_committed);
+    EXPECT_EQ(failure.entry_cursor, 240U);
+    EXPECT_EQ(failure.intended, -48000);
+    EXPECT_EQ(failure.cap, 9600U);
+    EXPECT_EQ(failure.preflighted, false);
+    EXPECT_FALSE(failure.start);
+    EXPECT_FALSE(failure.now_ns);
+    EXPECT_FALSE(failure.raw_gap);
+    enqueue(media, 3, {3000, 1}, 5'000'000);
+    expect_headers(step().completed, {{media, 3}});
+    EXPECT_EQ(rec->write_ns.back(), base.count + 5'000'000);
+    EXPECT_FALSE(router->report().render_failure);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalFailureSnapshotKeepsFirstReasonAcrossPartialPlanScanAndClose) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    step();
+    enqueue(media, 2, {1000, 240}, 300'000'000);
+    const auto pcm = constant_pcm({2000, 240});
+    ASSERT_TRUE(router->submit(make_message(guidance, 3, aa::core::Nanoseconds{0}, pcm)));
+    const auto rejected = router->render_step();
+    ASSERT_FALSE(rejected);
+    ASSERT_TRUE(router->report().render_failure);
+    EXPECT_EQ(router->report().render_failure->reason, aa::audio::RenderFailureReason::late);
+    ASSERT_TRUE(router->report().render_failure->offending);
+    EXPECT_EQ(router->report().render_failure->offending->sequence, 3U);
+    EXPECT_EQ(rec->writes.size(), 1U);
+    router->close();
+    ASSERT_TRUE(router->report().render_failure);
+    EXPECT_EQ(router->report().render_failure->reason, aa::audio::RenderFailureReason::late);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalParentEndConversionSnapshotHasExactOperandBeforeAnyWrite) {
+    open_incremental();
+    const auto pcm = constant_pcm({1000, 960});
+    ASSERT_TRUE(router->submit(make_message(media, 1,
+        aa::core::Nanoseconds{INT64_MAX - 5'000'000}, pcm)));
+    const auto rejected = router->render_step();
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
+    ASSERT_TRUE(router->report().render_failure);
+    const auto& failure = *router->report().render_failure;
+    EXPECT_EQ(failure.reason, aa::audio::RenderFailureReason::parent_end_time_conversion);
+    EXPECT_EQ(failure.time_conversion_frame, 960U);
+    EXPECT_EQ(failure.start, 0U);
+    EXPECT_EQ(failure.remaining, 960U);
+    EXPECT_FALSE(failure.raw_gap);
+    EXPECT_FALSE(failure.now_ns);
+    EXPECT_TRUE(rec->writes.empty());
+}
+
+TEST_F(AudioPipelineRoute, IncrementalDriftTrimIsOncePerParentAndRetainsAbsolutePcmOffsets) {
+    open_incremental();
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    config.render_quantum = aa::core::Nanoseconds{5'000'000};
+    auto sink = std::make_unique<RecordingAudioSink>();
+    const auto observed = sink->state;
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(opened);
+    auto& route = opened.value();
+    const auto lead = constant_pcm({1000, 1440});
+    ASSERT_TRUE(route.submit(make_message(media, 1, base, lead)));
+    ASSERT_TRUE(route.pump());
+    std::vector<std::byte> ramp;
+    for (std::int16_t i = 0; i < 961; ++i) {
+        const auto frame = constant_pcm({i, 1});
+        ramp.insert(ramp.end(), frame.begin(), frame.end());
+    }
+    ASSERT_TRUE(route.submit(make_message(media, 2, base, ramp)));
+
+    for (int i = 0; i < 4; ++i) {
+        const auto rendered = route.render_step();
+        ASSERT_TRUE(rendered);
+        EXPECT_EQ(rendered.value().pending, i != 3);
+        expect_headers(rendered.value().completed, i == 3
+            ? std::vector<std::pair<aa::protocol::ChannelRole, std::uint64_t>>{{media, 2}}
+            : std::vector<std::pair<aa::protocol::ChannelRole, std::uint64_t>>{});
+    }
+
+    const auto& stats = route.report().stats;
+    EXPECT_EQ(stats.frames_decoded, 2401U);
+    EXPECT_EQ(stats.frames_trimmed, 240U);
+    EXPECT_EQ(stats.frames_retained, 2161U);
+    EXPECT_EQ(stats.frames_output, 2161U);
+    const auto flat = flatten_i16(observed->writes);
+    ASSERT_EQ(flat.size(), 2161U * 2U);
+    for (std::size_t i = 0; i < 721; ++i) {
+        EXPECT_EQ(flat[(1440 + i) * 2], static_cast<std::int16_t>(i + 240));
+    }
+    EXPECT_EQ(observed->write_ns.back(), base.count + 45'000'000);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalQueuedParentsDoNotBecomeLateArrivalsBetweenSteps) {
+    open_incremental();
+    for (std::uint64_t i = 0; i < 12; ++i) { enqueue(media, i, {1000, 960}); }
+
+    std::vector<std::uint64_t> completed;
+    for (int i = 0; i < 48; ++i) {
+        const auto result = router->render_step();
+        ASSERT_TRUE(result) << i;
+        EXPECT_EQ(result.value().pending, i != 47);
+        for (const auto& header : result.value().completed) { completed.push_back(header.sequence); }
+    }
+
+    EXPECT_EQ(completed, (std::vector<std::uint64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}));
+    EXPECT_EQ(flatten_i16(rec->writes), std::vector<std::int16_t>(std::size_t{12} * 960 * 2, 1000));
+}
+
+TEST_F(AudioPipelineRoute, IncrementalCancellationDuringSilencePreservesOnlyDetachedGap) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    step();
+    enqueue(guidance, 2, {2000, 240}, 100'000'000);
+    rec->during_write = [&] { router->cancel_pending(guidance); };
+
+    const auto result = step();
+
+    rec->during_write = {};
+    EXPECT_FALSE(result.pending);
+    EXPECT_TRUE(result.contributors.empty());
+    EXPECT_TRUE(result.completed.empty());
+    enqueue(media, 3, {3000, 1}, 10'000'000);
+    expect_headers(step().completed, {{media, 3}});
+    EXPECT_EQ(router->report().stats.frames_silence, 240U);
+    EXPECT_EQ(rec->write_ns.back(), base.count + 10'000'000);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalFullyTrimmedParentCompletesOnceWithoutWriting) {
+    open_incremental();
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    auto sink = std::make_unique<RecordingAudioSink>();
+    const auto observed = sink->state;
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(opened);
+    const auto lead = constant_pcm({1000, 1440});
+    ASSERT_TRUE(opened.value().submit(make_message(media, 1, base, lead)));
+    ASSERT_TRUE(opened.value().pump());
+    const auto tiny = constant_pcm({3000, 1});
+    ASSERT_TRUE(opened.value().submit(make_message(media, 2, base, tiny)));
+
+    const auto result = opened.value().render_step();
+
+    ASSERT_TRUE(result);
+    expect_headers(result.value().completed, {{media, 2}});
+    EXPECT_FALSE(result.value().pending);
+    EXPECT_TRUE(result.value().contributors.empty());
+    EXPECT_EQ(observed->writes.size(), 1U);
+    EXPECT_EQ(opened.value().report().stats.frames_trimmed, 1U);
+    const auto empty = opened.value().render_step();
+    ASSERT_TRUE(empty);
+    EXPECT_TRUE(empty.value().completed.empty());
+}
+
+TEST_F(AudioPipelineRoute, IncrementalCancellationCountsOnlySuccessfullyWrittenDetachedInput) {
+    open_incremental();
+    enqueue(media, 1, {1000, 960});
+    rec->during_write = [&] { router->cancel_pending(media); };
+
+    const auto result = step();
+
+    rec->during_write = {};
+    expect_headers(result.contributors, {{media, 1}});
+    EXPECT_TRUE(result.completed.empty());
+    EXPECT_FALSE(result.pending);
+    const auto& stats = router->report().stats;
+    EXPECT_EQ(stats.frames_decoded, 960U);
+    EXPECT_EQ(stats.frames_retained, 240U);
+    EXPECT_EQ(stats.frames_trimmed, 0U);
+    EXPECT_EQ(stats.frames_output, 240U);
+    ASSERT_TRUE(router->flush());
+    EXPECT_EQ(rec->writes.size(), 1U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalNonintegralQuantumBoundsAudioAndSilenceByFiveMilliseconds) {
+    open_incremental();
+    auto config = pcm_router_config();
+    config.output_format.sample_rate_hz = 44100;
+    config.render_quantum = aa::core::Nanoseconds{5'000'000};
+    for (auto& role : config.roles) { role.input_format = config.output_format; }
+    auto sink = std::make_unique<RecordingAudioSink>();
+    const auto observed = sink->state;
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(opened);
+    const auto first = constant_pcm({1000, 443});
+    const auto second = constant_pcm({2000, 441});
+    ASSERT_TRUE(opened.value().submit(make_message(media, 1, base, first)));
+    ASSERT_TRUE(opened.value().submit(make_message(guidance, 2,
+        aa::core::Nanoseconds{base.count + 20'000'000}, second)));
+
+    for (int i = 0; i < 20; ++i) {
+        const auto result = opened.value().render_step();
+        ASSERT_TRUE(result);
+        if (!result.value().pending) { break; }
+        ASSERT_LT(i, 19);
+    }
+
+    std::uint64_t offset = 0;
+    for (std::size_t i = 0; i < observed->writes.size(); ++i) {
+        const auto frames = observed->writes[i].size() / 4;
+        EXPECT_GT(frames, 0U);
+        EXPECT_LE(frames, 220U);
+        const auto start = static_cast<std::int64_t>(offset * 1'000'000'000 / 44100);
+        const auto end = static_cast<std::int64_t>((offset + frames) * 1'000'000'000 / 44100);
+        EXPECT_LE(end - start, 5'000'000);
+        EXPECT_EQ(observed->write_ns[i], base.count + start);
+        offset += frames;
+    }
+    EXPECT_EQ(offset, 1323U);
+    EXPECT_EQ(opened.value().report().stats.frames_silence, 439U);
+    EXPECT_EQ(opened.value().report().stats.frames_retained, 884U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalElapsedBackpressureGapAdvancesWithoutSilenceWrites) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    expect_headers(step().completed, {{media, 1}});
+    enqueue(media, 2, {2000, 240}, 300'000'000);
+    router->note_backpressure(base, aa::core::Nanoseconds{base.count + 300'000'000});
+
+    const auto skipped = step();
+
+    EXPECT_TRUE(skipped.contributors.empty());
+    EXPECT_TRUE(skipped.completed.empty());
+    EXPECT_TRUE(skipped.pending);
+    EXPECT_EQ(rec->writes.size(), 1U);
+    const auto resumed = step();
+    expect_headers(resumed.completed, {{media, 2}});
+    EXPECT_FALSE(resumed.pending);
+    EXPECT_EQ(rec->write_ns, (std::vector<std::int64_t>{base.count, base.count + 300'000'000}));
+    EXPECT_EQ(flatten_i16({rec->writes.back()}), std::vector<std::int16_t>(480, 2000));
+    EXPECT_EQ(router->report().stats.frames_silence, 0U);
+    EXPECT_EQ(router->report().stats.frames_skipped, 14160U);
+    ASSERT_EQ(completions.size(), 2U);
+    EXPECT_EQ(completions.back().scheduled.count, base.count + 300'000'000);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalPartialBackpressureLeavesOversizedRemainderRejected) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    expect_headers(step().completed, {{media, 1}});
+    enqueue(media, 2, {2000, 240}, 300'000'000);
+    router->note_backpressure(aa::core::Nanoseconds{base.count + 250'000'000},
+                              aa::core::Nanoseconds{base.count + 300'000'000});
+
+    const auto result = router->render_step();
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_EQ(rec->writes.size(), 1U);
+    EXPECT_EQ(router->report().stats.frames_skipped, 0U);
+    ASSERT_TRUE(router->report().render_failure);
+    const auto& failure = *router->report().render_failure;
+    EXPECT_EQ(failure.reason, aa::audio::RenderFailureReason::single_gap);
+    EXPECT_EQ(failure.raw_gap, 14160U);
+    EXPECT_EQ(failure.uncovered_gap, 11760U);
+    EXPECT_EQ(failure.stored_backpressure.count, 1U);
+    EXPECT_EQ(failure.stored_backpressure.start_ns, base.count + 250'000'000);
+    EXPECT_EQ(failure.stored_backpressure.end_ns, base.count + 300'000'000);
+    ASSERT_TRUE(failure.effective_backpressure);
+    EXPECT_EQ(failure.effective_backpressure->count, 1U);
+    EXPECT_EQ(failure.effective_backpressure->first_frame, 12000U);
+    EXPECT_EQ(failure.effective_backpressure->last_frame, 14400U);
+    EXPECT_EQ(failure.effective_backpressure->excluded_frames, 2400U);
+    EXPECT_EQ(failure.stored_idle.count, 0U);
+    EXPECT_FALSE(failure.stored_idle.start_ns);
+    EXPECT_FALSE(failure.stored_idle_prefix);
+    ASSERT_TRUE(failure.effective_idle);
+    EXPECT_EQ(failure.effective_idle->excluded_frames, 0U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalFutureBackpressureGapIsNotSkippable) {
+    open_incremental();
+    const auto future = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() + 3'600'000'000'000LL - base.count;
+    enqueue(media, 1, {1000, 240}, future);
+    expect_headers(step().completed, {{media, 1}});
+    enqueue(media, 2, {2000, 240}, future + 300'000'000);
+    router->note_backpressure(aa::core::Nanoseconds{base.count + future},
+                              aa::core::Nanoseconds{base.count + future + 300'000'000});
+
+    const auto result = router->render_step();
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_EQ(router->report().stats.frames_skipped, 0U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalBackpressureNeverSkipsAnotherRolesPcm) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    expect_headers(step().completed, {{media, 1}});
+    enqueue(guidance, 2, {2000, 80}, 100'000'000);
+    enqueue(media, 3, {3000, 240}, 300'000'000);
+    router->note_backpressure(base, aa::core::Nanoseconds{base.count + 300'000'000});
+
+    for (int i = 0; i < 8 && step().pending; ++i) {}
+
+    ASSERT_EQ(rec->write_ns, (std::vector<std::int64_t>{
+        base.count, base.count + 100'000'000, base.count + 300'000'000}));
+    const auto guidance_pcm = flatten_i16({rec->writes[1]});
+    ASSERT_FALSE(guidance_pcm.empty());
+    EXPECT_EQ(guidance_pcm, std::vector<std::int16_t>(guidance_pcm.size(), 2000));
+    EXPECT_EQ(router->report().stats.frames_silence, 0U);
+    EXPECT_EQ(router->report().stats.frames_skipped, 14400U - 240U - guidance_pcm.size() / 2);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalBackpressureStartingMidFrameRendersThatFrame) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    expect_headers(step().completed, {{media, 1}});
+    enqueue(media, 2, {2000, 240}, 300'000'000);
+    router->note_backpressure(aa::core::Nanoseconds{base.count + 5'000'010},
+                              aa::core::Nanoseconds{base.count + 300'000'000});
+
+    for (int i = 0; i < 4 && step().pending; ++i) {}
+
+    EXPECT_EQ(router->report().stats.frames_silence, 1U);
+    EXPECT_EQ(router->report().stats.frames_skipped, 14159U);
+    EXPECT_EQ(rec->write_ns.back(), base.count + 300'000'000);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalExplicitIdleResumesAtOriginalTimestamp) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    expect_headers(step().completed, {{media, 1}});
+    // Settlement is B+5 ms; receipt of the next parent is B+2405 ms.
+    enqueue(media, 2, {2000, 240}, 2'405'000'000);
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                               aa::core::Nanoseconds{base.count + 2'405'000'000});
+
+    const auto skipped = router->render_step();
+
+    ASSERT_TRUE(skipped);
+    EXPECT_TRUE(skipped.value().contributors.empty());
+    EXPECT_TRUE(skipped.value().completed.empty());
+    EXPECT_TRUE(skipped.value().pending);
+    EXPECT_EQ(rec->writes.size(), 1U);
+    EXPECT_EQ(completions.size(), 1U);
+    const auto resumed = step();
+    expect_headers(resumed.contributors, {{media, 2}});
+    expect_headers(resumed.completed, {{media, 2}});
+    EXPECT_FALSE(resumed.pending);
+    EXPECT_TRUE(step().completed.empty());
+    EXPECT_EQ(rec->write_ns, (std::vector<std::int64_t>{base.count, base.count + 2'405'000'000}));
+    EXPECT_EQ(flatten_i16({rec->writes.back()}), std::vector<std::int16_t>(480, 2000));
+    ASSERT_EQ(completions.size(), 2U);
+    EXPECT_EQ(completions.back().scheduled.count, base.count + 2'405'000'000);
+    const auto& stats = router->report().stats;
+    EXPECT_EQ(stats.frames_idle_skipped, 115200U);
+    EXPECT_EQ(stats.frames_skipped, 0U);
+    EXPECT_EQ(stats.frames_silence, 0U);
+    EXPECT_EQ(stats.frames_output, 480U);
+    EXPECT_EQ(stats.frames_retained, 480U);
+    EXPECT_EQ(stats.frames_trimmed, 0U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalAbandonedIdleAuthorizationAllowsSecondResumeAfterRetirement) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    expect_headers(step().completed, {{media, 1}});
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                               aa::core::Nanoseconds{base.count + 2'405'000'000});
+    enqueue(media, 2, {2000, 240}, 2'405'000'000);
+    const auto first_skip = step();
+    EXPECT_TRUE(first_skip.pending);
+    EXPECT_TRUE(first_skip.contributors.empty());
+    EXPECT_TRUE(first_skip.completed.empty());
+    ASSERT_EQ(rec->writes.size(), 1U);
+    router->cancel_pending(media);
+    router->retire_all_role_idle();
+
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + 2'405'000'000},
+                               aa::core::Nanoseconds{base.count + 4'805'000'000});
+    enqueue(media, 3, {3000, 240}, 4'805'000'000);
+    const auto second_skip = router->render_step();
+    ASSERT_TRUE(second_skip);
+    EXPECT_TRUE(second_skip.value().pending);
+    EXPECT_TRUE(second_skip.value().contributors.empty());
+    EXPECT_TRUE(second_skip.value().completed.empty());
+    EXPECT_EQ(rec->writes.size(), 1U);
+    EXPECT_EQ(completions.size(), 1U);
+    const auto resumed = step();
+    expect_headers(resumed.contributors, {{media, 3}});
+    expect_headers(resumed.completed, {{media, 3}});
+    EXPECT_FALSE(resumed.pending);
+    EXPECT_EQ(rec->write_ns, (std::vector<std::int64_t>{base.count, base.count + 4'805'000'000}));
+    EXPECT_EQ(flatten_i16({rec->writes.back()}), std::vector<std::int16_t>(480, 3000));
+    ASSERT_EQ(completions.size(), 2U);
+    EXPECT_EQ(completions.back().scheduled.count, base.count + 4'805'000'000);
+    const auto& stats = router->report().stats;
+    EXPECT_EQ(stats.frames_idle_skipped, 230400U);
+    EXPECT_EQ(stats.frames_skipped, 0U);
+    EXPECT_EQ(stats.frames_silence, 0U);
+    EXPECT_EQ(stats.frames_output, 480U);
+    EXPECT_EQ(stats.frames_retained, 480U);
+    EXPECT_EQ(stats.frames_trimmed, 0U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalIdleRetirementPreservesCountersTimelinePendingAndBackpressure) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    step();
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                               aa::core::Nanoseconds{base.count + 2'405'000'000});
+    enqueue(media, 2, {2000, 240}, 2'405'000'000);
+    EXPECT_TRUE(step().contributors.empty());
+    router->note_backpressure(aa::core::Nanoseconds{base.count + 2'410'000'000},
+                              aa::core::Nanoseconds{base.count + 2'710'000'000});
+    const auto before = router->report().stats;
+
+    router->retire_all_role_idle();
+    router->retire_all_role_idle();
+
+    const auto& after = router->report().stats;
+    EXPECT_EQ(after.chunks_submitted, before.chunks_submitted);
+    EXPECT_EQ(after.frames_mixed, before.frames_mixed);
+    EXPECT_EQ(after.frames_written, before.frames_written);
+    EXPECT_EQ(after.samples_written, before.samples_written);
+    EXPECT_EQ(after.last_path_latency.count, before.last_path_latency.count);
+    EXPECT_EQ(after.max_path_latency.count, before.max_path_latency.count);
+    EXPECT_EQ(after.last_completion_skew.count, before.last_completion_skew.count);
+    EXPECT_EQ(after.max_completion_skew.count, before.max_completion_skew.count);
+    EXPECT_EQ(after.frames_decoded, before.frames_decoded);
+    EXPECT_EQ(after.frames_retained, before.frames_retained);
+    EXPECT_EQ(after.frames_trimmed, before.frames_trimmed);
+    EXPECT_EQ(after.frames_silence, before.frames_silence);
+    EXPECT_EQ(after.frames_output, before.frames_output);
+    EXPECT_EQ(after.frames_skipped, before.frames_skipped);
+    EXPECT_EQ(after.frames_idle_skipped, before.frames_idle_skipped);
+    EXPECT_EQ(rec->writes.size(), 1U);
+    EXPECT_EQ(completions.size(), 1U);
+    expect_headers(step().completed, {{media, 2}});
+    enqueue(media, 3, {3000, 240}, 2'710'000'000);
+    const auto skipped = step();
+    EXPECT_TRUE(skipped.pending);
+    EXPECT_TRUE(skipped.contributors.empty());
+    EXPECT_TRUE(skipped.completed.empty());
+    expect_headers(step().completed, {{media, 3}});
+    EXPECT_EQ(rec->write_ns, (std::vector<std::int64_t>{
+        base.count, base.count + 2'405'000'000, base.count + 2'710'000'000}));
+    EXPECT_EQ(after.frames_idle_skipped, 115200U);
+    EXPECT_EQ(after.frames_skipped, 14400U);
+    EXPECT_EQ(after.frames_silence, 0U);
+    EXPECT_EQ(after.frames_retained, 720U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalIdleRetirementCannotHideStaleFutureOrHiddenGapParents) {
+    for (int scenario = 0; scenario < 5; ++scenario) {
+        SCOPED_TRACE(scenario);
+        open_incremental();
+        enqueue(media, 1, {1000, 240});
+        step();
+        router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                                   aa::core::Nanoseconds{base.count + 2'405'000'000});
+        router->retire_all_role_idle();
+        router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                                   aa::core::Nanoseconds{base.count + 4'805'000'000});
+        if (scenario == 0) {
+            ASSERT_TRUE(router->submit(make_message(media, 2, aa::core::Nanoseconds{0},
+                                                    constant_pcm({2000, 240}))));
+        } else {
+            const auto future = now_ns().count + 3'600'000'000'000LL - base.count;
+            enqueue(media, 2, {2000, 240}, scenario == 1 ? future : 4'805'000'000);
+            if (scenario == 2 || scenario == 3) {
+                enqueue(scenario == 2 ? media : guidance, 3, {3000, 240}, 5'110'000'000);
+            } else if (scenario == 4) {
+                enqueue(guidance, 3, {3000, 240}, 100'000'000);
+            }
+        }
+        router->retire_all_role_idle();
+        router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                                   aa::core::Nanoseconds{base.count + 4'805'000'000});
+
+        const auto rejected = router->render_step();
+
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
+        EXPECT_EQ(rec->writes.size(), 1U);
+        EXPECT_EQ(router->report().stats.frames_idle_skipped, 0U);
+        EXPECT_EQ(router->report().stats.frames_skipped, 0U);
+        EXPECT_EQ(router->report().stats.frames_silence, 0U);
+        EXPECT_EQ(router->report().stats.frames_output, 240U);
+        enqueue(media, 4, {4000, 1}, 5'000'000);
+        expect_headers(step().completed, {{media, 4}});
+        EXPECT_EQ(rec->write_ns.back(), base.count + 5'000'000);
+    }
+}
+
+TEST_F(AudioPipelineRoute, IncrementalLongIdleWithoutObservationKeepsBaselineRejection) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    expect_headers(step().completed, {{media, 1}});
+    enqueue(media, 2, {2000, 240}, 2'405'000'000);
+
+    const auto rejected = router->render_step();
+
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_EQ(rec->writes.size(), 1U);
+    EXPECT_EQ(router->report().stats.frames_idle_skipped, 0U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalShortIdleDoesNotAuthorizeAnyFrames) {
+    for (const auto duration : {0LL, 100'000'000LL, 200'000'000LL}) {
+        SCOPED_TRACE(duration);
+        open_incremental();
+        enqueue(media, 1, {1000, 240});
+        step();
+        router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+            aa::core::Nanoseconds{base.count + 5'000'000 + duration});
+        enqueue(media, 2, {2000, 240}, 205'000'000);
+        for (int i = 0; i < 41 && step().pending; ++i) {}
+        EXPECT_EQ(router->report().stats.frames_idle_skipped, 0U);
+        EXPECT_EQ(router->report().stats.frames_silence, 9600U);
+        EXPECT_EQ(rec->write_ns.back(), base.count + 205'000'000);
+    }
+}
+
+TEST_F(AudioPipelineRoute, IncrementalIdleRejectsStaleFutureHiddenAndOverflowAtomically) {
+    for (int scenario = 0; scenario < 6; ++scenario) {
+        SCOPED_TRACE(scenario);
+        open_incremental();
+        enqueue(media, 1, {1000, 240});
+        step();
+        router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                                   aa::core::Nanoseconds{base.count + 2'405'000'000});
+        if (scenario == 0) {
+            ASSERT_TRUE(router->submit(make_message(media, 2, aa::core::Nanoseconds{0},
+                                                    constant_pcm({2000, 240}))));
+        } else {
+            enqueue(media, 2, {2000, 240}, scenario == 1 ? 2'710'000'000 : 2'405'000'000);
+            if (scenario == 2 || scenario == 3) {
+                enqueue(scenario == 2 ? media : guidance, 3, {3000, 240}, 2'710'000'000);
+            } else if (scenario == 4) {
+                enqueue(guidance, 3, {3000, 240}, 100'000'000);
+            } else if (scenario == 5) {
+                ASSERT_TRUE(router->submit(make_message(guidance, 3,
+                    aa::core::Nanoseconds{INT64_MAX}, constant_pcm({3000, 240}))));
+            }
+        }
+
+        const auto rejected = router->render_step();
+
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
+        EXPECT_EQ(rec->writes.size(), 1U);
+        EXPECT_EQ(router->report().stats.frames_idle_skipped, 0U);
+        EXPECT_EQ(router->report().stats.frames_skipped, 0U);
+        EXPECT_EQ(router->report().stats.frames_silence, 0U);
+        EXPECT_EQ(router->report().stats.frames_output, 240U);
+        EXPECT_FALSE(step().pending);
+        enqueue(media, 4, {4000, 240}, 2'405'000'000);
+        EXPECT_FALSE(router->render_step());
+        enqueue(media, 5, {4000, 1}, 5'000'000);
+        expect_headers(step().completed, {{media, 5}});
+        EXPECT_EQ(rec->write_ns.back(), base.count + 5'000'000);
+    }
+}
+
+TEST_F(AudioPipelineRoute, IncrementalIdleDoesNotAuthorizeFutureTime) {
+    open_incremental();
+    const auto future = now_ns().count + 3'600'000'000'000LL - base.count;
+    enqueue(media, 1, {1000, 240}, future);
+    step();
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + future + 5'000'000},
+                               aa::core::Nanoseconds{base.count + future + 2'405'000'000});
+    enqueue(media, 2, {2000, 240}, future + 2'405'000'000);
+
+    const auto rejected = router->render_step();
+
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_EQ(rec->writes.size(), 1U);
+    EXPECT_EQ(router->report().stats.frames_idle_skipped, 0U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalIdleOverlappingBackpressureCountsUnionOnce) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    step();
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                               aa::core::Nanoseconds{base.count + 2'405'000'000});
+    router->note_backpressure(aa::core::Nanoseconds{base.count + 105'000'000},
+                              aa::core::Nanoseconds{base.count + 1'105'000'000});
+    router->note_backpressure(aa::core::Nanoseconds{base.count + 605'000'000},
+                              aa::core::Nanoseconds{base.count + 1'605'000'000});
+    enqueue(media, 2, {2000, 240}, 2'405'000'000);
+    for (int i = 0; i < 4; ++i) {
+        const auto result = step();
+        if (i < 3) {
+            EXPECT_TRUE(result.completed.empty());
+            EXPECT_TRUE(result.contributors.empty());
+            EXPECT_EQ(rec->writes.size(), 1U);
+        } else {
+            expect_headers(result.completed, {{media, 2}});
+            EXPECT_FALSE(result.pending);
+        }
+    }
+    EXPECT_EQ(router->report().stats.frames_idle_skipped, 43200U);
+    EXPECT_EQ(router->report().stats.frames_skipped, 72000U);
+    EXPECT_EQ(router->report().stats.frames_silence, 0U);
+    EXPECT_EQ(rec->write_ns.back(), base.count + 2'405'000'000);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalIdleStartingAndEndingMidFrameIsConservative) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    step();
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'010},
+                               aa::core::Nanoseconds{base.count + 2'404'999'990});
+    enqueue(media, 2, {2000, 240}, 2'405'000'000);
+    for (int i = 0; i < 4 && step().pending; ++i) {}
+    EXPECT_EQ(router->report().stats.frames_idle_skipped, 115198U);
+    EXPECT_EQ(router->report().stats.frames_silence, 2U);
+    EXPECT_EQ(rec->write_ns.back(), base.count + 2'405'000'000);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalIdleRetiresUnusedTailOnFirstPcmConsumption) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    step();
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                               aa::core::Nanoseconds{base.count + 5'000'000'000});
+    enqueue(media, 2, {2000, 480}, 2'405'000'000);
+    EXPECT_TRUE(step().contributors.empty());
+    const auto first_pcm = step();
+    expect_headers(first_pcm.contributors, {{media, 2}});
+    EXPECT_TRUE(first_pcm.completed.empty());
+    enqueue(guidance, 3, {3000, 240}, 3'000'000'000);
+
+    const auto rejected = router->render_step();
+
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_EQ(rec->writes.size(), 2U);
+    EXPECT_EQ(router->report().stats.frames_idle_skipped, 115200U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalIdleCannotExtendLatchedPrefixWithLaterSubmission) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    step();
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                               aa::core::Nanoseconds{base.count + 5'000'000'000});
+    enqueue(media, 2, {2000, 240}, 2'405'000'000);
+    EXPECT_TRUE(step().contributors.empty());
+    enqueue(guidance, 3, {3000, 240}, 3'000'000'000);
+
+    const auto rejected = router->render_step();
+
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_EQ(rec->writes.size(), 1U);
+    EXPECT_EQ(router->report().stats.frames_idle_skipped, 115200U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalIdleRepeatedObservationCannotExtendAuthorization) {
+    open_incremental();
+    enqueue(media, 1, {1000, 240});
+    step();
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                               aa::core::Nanoseconds{base.count + 305'000'000});
+    router->note_all_role_idle(aa::core::Nanoseconds{base.count + 5'000'000},
+                               aa::core::Nanoseconds{base.count + 2'405'000'000});
+    enqueue(media, 2, {2000, 240}, 2'405'000'000);
+
+    EXPECT_FALSE(router->render_step());
+    EXPECT_EQ(rec->writes.size(), 1U);
+    EXPECT_EQ(router->report().stats.frames_idle_skipped, 0U);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalIdleAt44100PreservesOriginalSampleTimeline) {
+    auto config = pcm_router_config();
+    config.output_format.sample_rate_hz = 44100;
+    for (auto& role : config.roles) { role.input_format = config.output_format; }
+    auto sink = std::make_unique<RecordingAudioSink>();
+    const auto observed = sink->state;
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(opened);
+    auto& route = opened.value();
+    ASSERT_TRUE(route.submit(make_message(media, 1, base, constant_pcm({1000, 441}))));
+    ASSERT_TRUE(route.render_step());
+    route.note_all_role_idle(aa::core::Nanoseconds{base.count + 10'000'010},
+                             aa::core::Nanoseconds{base.count + 2'410'000'000});
+    ASSERT_TRUE(route.submit(make_message(media, 2,
+        aa::core::Nanoseconds{base.count + 2'410'000'000}, constant_pcm({2000, 441}))));
+    for (int i = 0; i < 4; ++i) {
+        const auto rendered = route.render_step();
+        ASSERT_TRUE(rendered);
+        if (!rendered.value().pending) {
+            expect_headers(rendered.value().completed, {{media, 2}});
+            break;
+        }
+        ASSERT_LT(i, 3);
+    }
+    EXPECT_EQ(route.report().stats.frames_idle_skipped, 105839U);
+    EXPECT_EQ(route.report().stats.frames_silence, 1U);
+    EXPECT_EQ(route.report().stats.frames_retained, 882U);
+    EXPECT_EQ(observed->write_ns.back(), base.count + 2'410'000'000);
+}
+
+TEST_F(AudioPipelineRoute, IncrementalDefaultQuantumWritesOneObservedMediaParentPerStep) {
+    auto sink = std::make_unique<RecordingAudioSink>();
+    const auto observed = sink->state;
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(pcm_router_config(), std::move(sink));
+    ASSERT_TRUE(opened);
+    // One observed media parent: 8192 B at 48 kHz stereo = 2048 frames (42.67 ms).
+    ASSERT_TRUE(opened.value().submit(make_message(media, 1, base, constant_pcm({1000, 2048}))));
+    for (int i = 0; i < 8 && opened.value().render_step().value().pending; ++i) {}
+    std::vector<std::size_t> frames;
+    for (const auto& write : observed->writes) { frames.push_back(write.size() / 4); }
+    EXPECT_EQ(frames, (std::vector<std::size_t>{2048}));
 }

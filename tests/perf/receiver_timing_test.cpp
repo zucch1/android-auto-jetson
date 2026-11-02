@@ -24,29 +24,52 @@ class LatePeakSink final : public aa::audio::detail::ObservedAudioSink {
   private:
     int writes_{};
 };
+
+class ReceiverTiming : public testing::Test {
+  protected:
+    aa::wired_receiver::StdoutLogScope logging{g_running};
+
+    void capture_stdout() {
+        ASSERT_FALSE(logging.log.flush());
+        testing::internal::CaptureStdout();
+    }
+    std::string captured_stdout() {
+        EXPECT_FALSE(logging.log.flush());
+        return testing::internal::GetCapturedStdout();
+    }
+};
 }
 
-TEST(ReceiverTiming, ShutdownRetainsPeakAfterLastPeriodicEmission) {
+TEST_F(ReceiverTiming, ShutdownRetainsPeakAfterLastPeriodicEmission) {
     // Given 90 writes, with a spike on write 80 after the last cadence at 51.
-    auto router = aa::audio::detail::open_router_with_sink_for_test(
-        pcm_router_config(), std::make_unique<LatePeakSink>());
-    ASSERT_TRUE(router.has_value());
     const auto base = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const std::vector<std::byte> pcm(4, std::byte{1});
-    testing::internal::CaptureStdout();
+    capture_stdout();
+    std::optional<aa::audio::RouterReport> report;
     {
-        RouterSink sink(router.value());
+        ConcreteAudioRenderWorker sink{pcm_router_config(), [](const auto &config) {
+            return aa::audio::detail::open_router_with_sink_for_test(
+                config, std::make_unique<LatePeakSink>());
+        }};
+        ASSERT_TRUE(sink.ready());
         for (int index = 0; index < 90; ++index) {
             aa::protocol::MessageView message{};
             message.header.channel = aa::protocol::ChannelRole::media_audio;
             message.header.timestamp = aa::core::Nanoseconds{base + index * 20'834LL};
             message.payload = pcm;
-            EXPECT_TRUE(sink.on_message(message).has_value());
+            EXPECT_TRUE(sink.submit(message, {message.header.channel, 0,
+                                             static_cast<std::uint64_t>(index), 1}));
+            EXPECT_TRUE(sink.take_completion(std::chrono::steady_clock::now() +
+                                             std::chrono::seconds{2}));
+            ASSERT_TRUE(sink.wait_idle(std::chrono::steady_clock::now() +
+                                       std::chrono::seconds{2}));
         }
+        EXPECT_TRUE(sink.finish());
+        report = sink.final_report();
         // When the sink leaves scope (also used on early-return shutdown).
     }
-    const auto output = testing::internal::GetCapturedStdout();
+    const auto output = captured_stdout();
     double emitted_peak = 0;
     const std::regex latency{"\"audio_latency_ms\":([0-9.e+-]+)"};
     for (auto it = std::sregex_iterator(output.begin(), output.end(), latency);
@@ -56,13 +79,10 @@ TEST(ReceiverTiming, ShutdownRetainsPeakAfterLastPeriodicEmission) {
     // Then the final cumulative maximum, not the write-51 snapshot, is logged.
     EXPECT_GE(emitted_peak, 70.0) << output;
     EXPECT_DOUBLE_EQ(emitted_peak,
-        static_cast<double>(router.value().report().stats.max_path_latency.count) / 1e6);
+        static_cast<double>(report->stats.max_path_latency.count) / 1e6);
 }
 
-TEST(ReceiverTiming, EmitsActualAudioWriteCompletionWithScheduledInterval) {
-    auto router = aa::audio::detail::open_router_with_sink_for_test(
-        pcm_router_config(), std::make_unique<LatePeakSink>());
-    ASSERT_TRUE(router.has_value());
+TEST_F(ReceiverTiming, EmitsActualAudioWriteCompletionWithScheduledInterval) {
     const std::vector<std::byte> pcm(4, std::byte{1});
     const auto start = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -70,12 +90,19 @@ TEST(ReceiverTiming, EmitsActualAudioWriteCompletionWithScheduledInterval) {
     message.header.channel = aa::protocol::ChannelRole::media_audio;
     message.header.timestamp = aa::core::Nanoseconds{start};
     message.payload = pcm;
-    testing::internal::CaptureStdout();
+    capture_stdout();
     {
-        RouterSink sink(router.value());
-        EXPECT_TRUE(sink.on_message(message).has_value());
+        ConcreteAudioRenderWorker sink{pcm_router_config(), [](const auto &config) {
+            return aa::audio::detail::open_router_with_sink_for_test(
+                config, std::make_unique<LatePeakSink>());
+        }};
+        ASSERT_TRUE(sink.ready());
+        EXPECT_TRUE(sink.submit(message, {message.header.channel, 0, 1, 1}));
+        EXPECT_TRUE(sink.take_completion(std::chrono::steady_clock::now() +
+                                         std::chrono::seconds{2}));
+        ASSERT_TRUE(sink.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
     }
-    const auto output = testing::internal::GetCapturedStdout();
+    const auto output = captured_stdout();
     const auto end = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     std::smatch match;
@@ -88,9 +115,9 @@ TEST(ReceiverTiming, EmitsActualAudioWriteCompletionWithScheduledInterval) {
     EXPECT_LE(std::stoll(match[3].str()), end);
 }
 
-TEST(ReceiverTiming, VideoDropsIncludeFinalTailAfterPeriodicEmission) {
+TEST_F(ReceiverTiming, VideoDropsIncludeFinalTailAfterPeriodicEmission) {
     // Given an outlet without a consumer and 29 real input access units.
-    testing::internal::CaptureStdout();
+    capture_stdout();
     {
         VideoOutlet outlet{log_line};
         aa::protocol::MessageView message{};
@@ -99,22 +126,22 @@ TEST(ReceiverTiming, VideoDropsIncludeFinalTailAfterPeriodicEmission) {
         }
         // When teardown flushes the cumulative drop tail.
     }
-    const auto output = testing::internal::GetCapturedStdout();
+    const auto output = captured_stdout();
     // Then both the initial observation and final actual count are exported.
     EXPECT_NE(output.find("\"frame_drops\":1}"), std::string::npos);
     EXPECT_NE(output.find("\"frame_drops\":29}"), std::string::npos);
 }
 
-TEST(ReceiverTiming, VideoWithoutInputKeepsDropMeasurementAbsent) {
+TEST_F(ReceiverTiming, VideoWithoutInputKeepsDropMeasurementAbsent) {
     // Given an outlet which never observed input.
-    testing::internal::CaptureStdout();
+    capture_stdout();
     { VideoOutlet outlet{log_line}; }
     // When it is destroyed, then no zero-valued observation is invented.
-    const auto output = testing::internal::GetCapturedStdout();
+    const auto output = captured_stdout();
     EXPECT_EQ(output.find("frame_drops"), std::string::npos);
 }
 
-TEST(ReceiverTiming, ActualSocketBackpressureContributesToOutletDrops) {
+TEST_F(ReceiverTiming, ActualSocketBackpressureContributesToOutletDrops) {
     // Given a bounded socket consumer which never reads its queued frames.
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
@@ -123,7 +150,7 @@ TEST(ReceiverTiming, ActualSocketBackpressureContributesToOutletDrops) {
     payload[3] = std::byte{0x65};
     aa::protocol::MessageView message{};
     message.payload = payload;
-    testing::internal::CaptureStdout();
+    capture_stdout();
     {
         VideoOutlet outlet{log_line};
         outlet.install(std::move(pair.value().producer));
@@ -132,7 +159,7 @@ TEST(ReceiverTiming, ActualSocketBackpressureContributesToOutletDrops) {
             EXPECT_TRUE(outlet.on_message(message));
         }
     }
-    const auto output = testing::internal::GetCapturedStdout();
+    const auto output = captured_stdout();
     // Then the observed backpressure reason and a positive final count survive.
     EXPECT_NE(output.find("\"reason\":\"backpressure\""), std::string::npos);
     std::smatch match;
@@ -140,28 +167,33 @@ TEST(ReceiverTiming, ActualSocketBackpressureContributesToOutletDrops) {
     EXPECT_GT(std::stoull(match[1].str()), 0U);
 }
 
-TEST(ReceiverTiming, CurrentPcmProfilesEmitCompletionAndFlushOnlyOnce) {
+TEST_F(ReceiverTiming, CurrentPcmProfilesEmitCompletionAndFlushOnlyOnce) {
     // Given the production media and resampled voice profiles.
     for (const auto role : {aa::protocol::ChannelRole::media_audio,
                             aa::protocol::ChannelRole::guidance_audio,
                             aa::protocol::ChannelRole::system_audio}) {
         SCOPED_TRACE(static_cast<int>(role));
-        auto router = aa::audio::detail::open_router_with_sink_for_test(
-            pcm_router_config(), std::make_unique<LatePeakSink>());
-        ASSERT_TRUE(router);
         const auto voice = role != aa::protocol::ChannelRole::media_audio;
         const std::vector<std::byte> pcm(voice ? 640 : 3840, std::byte{1});
         const auto start = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        testing::internal::CaptureStdout();
+        capture_stdout();
         {
-            RouterSink sink{router.value()};
+            ConcreteAudioRenderWorker sink{pcm_router_config(), [](const auto &config) {
+                return aa::audio::detail::open_router_with_sink_for_test(
+                    config, std::make_unique<LatePeakSink>());
+            }};
+            ASSERT_TRUE(sink.ready());
             // When real PCM is delivered, then explicitly finalized before destruction.
-            EXPECT_TRUE(sink.on_message({{role, 1, {start}}, pcm}));
-            sink.finish();
-            sink.finish();
+            EXPECT_TRUE(sink.submit({{role, 1, {start}}, pcm}, {role, 0, 1, 1}));
+            EXPECT_TRUE(sink.take_completion(std::chrono::steady_clock::now() +
+                                             std::chrono::seconds{2}));
+            ASSERT_TRUE(sink.wait_idle(std::chrono::steady_clock::now() +
+                                       std::chrono::seconds{2}));
+            EXPECT_TRUE(sink.finish());
+            EXPECT_TRUE(sink.finish());
         }
-        const auto output = testing::internal::GetCapturedStdout();
+        const auto output = captured_stdout();
         // Then every path reports a real write interval and exactly one final flush.
         std::smatch completion;
         ASSERT_TRUE(std::regex_search(output, completion, std::regex{
@@ -179,17 +211,18 @@ TEST(ReceiverTiming, CurrentPcmProfilesEmitCompletionAndFlushOnlyOnce) {
     }
 }
 
-TEST(ReceiverTiming, EmptyRouteDoesNotInventFinalTiming) {
+TEST_F(ReceiverTiming, EmptyRouteDoesNotInventFinalTiming) {
     // Given an opened route without any delivered PCM.
-    auto router = aa::audio::detail::open_router_with_sink_for_test(
-        pcm_router_config(), std::make_unique<LatePeakSink>());
-    ASSERT_TRUE(router);
-    testing::internal::CaptureStdout();
+    capture_stdout();
     {
-        RouterSink sink{router.value()};
+        ConcreteAudioRenderWorker sink{pcm_router_config(), [](const auto &config) {
+            return aa::audio::detail::open_router_with_sink_for_test(
+                config, std::make_unique<LatePeakSink>());
+        }};
+        ASSERT_TRUE(sink.ready());
         // When shutdown finalizes the untouched route.
-        sink.finish();
+        EXPECT_TRUE(sink.finish());
     }
     // Then neither audio delivery nor timing is fabricated.
-    EXPECT_TRUE(testing::internal::GetCapturedStdout().empty());
+    EXPECT_TRUE(captured_stdout().empty());
 }

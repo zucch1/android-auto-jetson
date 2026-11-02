@@ -44,6 +44,41 @@ void ensure_gstreamer_initialized() {
     std::call_once(flag, [] { gst_init(nullptr, nullptr); });
 }
 
+[[nodiscard]] core::Nanoseconds observation_time(
+    std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now()) {
+    return core::Nanoseconds{
+        std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count()};
+}
+
+// One scalar slot. Publication is serialized with streaming updates; callbacks
+// must only copy it, never log/wait or take a lock held across a sink call.
+class WriteProgress final {
+public:
+    explicit WriteProgress(std::function<void(const SinkWriteProgress&)> publish)
+        : publish_(std::move(publish)) {}
+
+    [[nodiscard]] std::uint64_t begin(SinkWriteProgress value) {
+        std::lock_guard lock(mutex_);
+        value.sequence = ++sequence_;
+        value_ = value;
+        if (publish_) { publish_(value_); }
+        return sequence_;
+    }
+    template <class Update>
+    void update(std::uint64_t sequence, Update change) {
+        std::lock_guard lock(mutex_);
+        if (sequence != sequence_ || value_.completed_at) { return; }
+        change(value_);
+        if (publish_) { publish_(value_); }
+    }
+
+private:
+    std::mutex mutex_;
+    std::uint64_t sequence_{};
+    SinkWriteProgress value_{};
+    std::function<void(const SinkWriteProgress&)> publish_;
+};
+
 // Handoff/stream-state observation per routing element (gate r2 F1/F3). The
 // routing elements log their PipeWire/Pulse handoff inside the render call
 // (`gst_pipewire_sink_render: push buffer`, `gst_pulseringbuffer_commit:
@@ -66,6 +101,8 @@ struct HandoffTracker final {
     std::uint64_t window_seq{0};
     std::uint64_t acked_seq{0};
     std::thread::id window_thread{};
+    WriteProgress* progress{};
+    std::uint64_t observation_sequence{};
 };
 
 std::mutex g_trackers_mutex{};
@@ -147,6 +184,9 @@ void handoff_log_observer(GstDebugCategory*, GstDebugLevel, const gchar*, const 
         single->acked_seq = single->window_seq;
         single->window_open = false;
         single->handoff_events += 1;
+        single->progress->update(single->observation_sequence, [](auto& value) {
+            value.handoff_at = observation_time();
+        });
         single->cv.notify_all();
         return;
     }
@@ -282,6 +322,17 @@ public:
     void arm_drop_nonempty() noexcept { drop_nonempty_ = true; }
     void arm_drop_after_window() noexcept { drop_after_window_ = true; }
     [[nodiscard]] GstPadProbeReturn on_buffer(GstBuffer* buffer) {
+        std::uint64_t observation_sequence = 0;
+        {
+            std::lock_guard lock(mutex_);
+            observation_sequence = observation_sequence_;
+        }
+        if (observation_sequence != 0) {
+            tracker_->progress->update(observation_sequence, [buffer](auto& value) {
+                if (gst_buffer_get_size(buffer) == 0) { value.marker_at = observation_time(); }
+                else { value.ingress_at = observation_time(); }
+            });
+        }
         GstMapInfo map;
         if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
             return GST_PAD_PROBE_OK;
@@ -341,6 +392,7 @@ public:
             tracker_->window_seq = write_identity;
             tracker_->window_open = true;
             tracker_->window_thread = std::this_thread::get_id();
+            tracker_->observation_sequence = observation_sequence;
         }
         if (drop_after_window_) {
             // Gate r3 F1 GDB scenario: the window is open (a foreign
@@ -351,9 +403,10 @@ public:
         return GST_PAD_PROBE_OK;
     }
 
-    [[nodiscard]] std::uint64_t expect_write() {
+    [[nodiscard]] std::uint64_t expect_write(std::uint64_t observation_sequence) {
         std::lock_guard<std::mutex> lock(mutex_);
         expected_writes_ += 1;
+        observation_sequence_ = observation_sequence;
         return expected_writes_;
     }
 
@@ -379,6 +432,7 @@ public:
         chain_return_buffers_ = 0;
         chain_return_samples_ = 0;
         expected_writes_ = 0;
+        observation_sequence_ = 0;
         min_sample_ = 0;
         max_sample_ = 0;
         seen_ = false;
@@ -416,6 +470,7 @@ private:
     std::uint64_t chain_return_buffers_{0};
     std::uint64_t chain_return_samples_{0};
     std::uint64_t expected_writes_{0};
+    std::uint64_t observation_sequence_{0};
     std::uint64_t drains_completed_{0};
     std::int32_t min_sample_{0};
     std::int32_t max_sample_{0};
@@ -466,10 +521,12 @@ struct SinkElements final {
 class GstSink final : public detail::ObservedAudioSink {
 public:
     GstSink(SinkElements elements, AudioFormat format, core::Milliseconds write_timeout,
-            GstElement* sink_element, bool drop_nonempty, bool drop_after_window)
+            GstElement* sink_element, bool drop_nonempty, bool drop_after_window,
+            std::function<void(const SinkWriteProgress&)> publish)
         : pipeline_(elements.pipeline), appsrc_(elements.appsrc), sink_element_(sink_element),
           format_(format), write_timeout_(write_timeout),
-          probe_(&handoff_, false, false) {
+          progress_(std::move(publish)), probe_(&handoff_, false, false) {
+        handoff_.progress = &progress_;
         (void)drop_nonempty;
         (void)drop_after_window;
         pending_drop_nonempty_ = drop_nonempty;
@@ -507,8 +564,51 @@ public:
     [[nodiscard]] WriteOutcome write_with_timeout(const MixedChunk& chunk,
                                                   core::Milliseconds timeout,
                                                   bool readiness_probe) {
-        const auto deadline = std::chrono::steady_clock::now()
-            + std::chrono::milliseconds(timeout.count);
+        const auto entered = std::chrono::steady_clock::now();
+        const auto deadline = entered + std::chrono::milliseconds(timeout.count);
+        SinkWriteProgress value;
+        value.readiness_probe = readiness_probe;
+        value.effective_scheduled = chunk.timestamp;
+        value.entered_at = observation_time(entered);
+        value.deadline = observation_time(deadline);
+        value.max_bytes = kAppsrcMaxBytes;
+        value.max_buffers = kAppsrcMaxBuffers;
+        if (pts_origin_set_) {
+            value.pts_origin_ns = pts_origin_ns_;
+            value.pts_ns = chunk.timestamp.count > pts_origin_ns_
+                ? static_cast<std::uint64_t>(chunk.timestamp.count) - static_cast<std::uint64_t>(pts_origin_ns_)
+                : 0;
+        }
+        if (pipeline_ != nullptr && !released_) {
+            const auto levels = appsrc_queue_levels();
+            value.levels_valid = true;
+            value.levels_at = observation_time();
+            value.queued_bytes = levels.first;
+            value.queued_buffers = levels.second;
+            GstClock* clock = gst_element_get_clock(pipeline_);
+            const auto base = gst_element_get_base_time(pipeline_);
+            if (GST_CLOCK_TIME_IS_VALID(base)) { value.base_time_ns = base; }
+            if (clock != nullptr) {
+                const auto now = gst_clock_get_time(clock);
+                if (GST_CLOCK_TIME_IS_VALID(now)) {
+                    value.clock_ns = now;
+                    if (value.base_time_ns && now >= base) { value.running_time_ns = now - base; }
+                }
+                gst_object_unref(clock);
+            }
+        }
+        const auto sequence = progress_.begin(value);
+        const auto outcome = write_until(chunk, deadline, readiness_probe, sequence);
+        progress_.update(sequence, [&](auto& current) {
+            current.completed_at = observation_time();
+            if (!outcome.result) { current.outcome = outcome.result.error().code(); }
+        });
+        return outcome;
+    }
+
+    [[nodiscard]] WriteOutcome write_until(const MixedChunk& chunk,
+        std::chrono::steady_clock::time_point deadline, bool readiness_probe,
+        std::uint64_t observation_sequence) {
         WriteOutcome outcome;
         if (pipeline_ == nullptr || released_) {
             return fail_write(outcome, Error{ErrorCode::audio_sink_unavailable},
@@ -551,8 +651,17 @@ public:
         // naps bounded by the remaining budget - never past the deadline.
         for (;;) {
             const std::pair<std::uint64_t, std::uint64_t> levels = appsrc_queue_levels();
+            progress_.update(observation_sequence, [&](auto& value) {
+                value.levels_valid = true;
+                value.levels_at = observation_time();
+                value.queued_bytes = levels.first;
+                value.queued_buffers = levels.second;
+            });
             if (levels.first + data_bytes <= kAppsrcMaxBytes
                 && levels.second + kWriteBufferPair <= kAppsrcMaxBuffers) {
+                progress_.update(observation_sequence, [](auto& value) {
+                    value.admitted_at = observation_time();
+                });
                 break;
             }
             const auto full_bus_error = poll_bus_error();
@@ -589,6 +698,10 @@ public:
         std::memcpy(map.data, chunk.pcm.data(), chunk.pcm.size());
         gst_buffer_unmap(buffer, &map);
         GST_BUFFER_PTS(buffer) = chunk_pts(chunk.timestamp);
+        progress_.update(observation_sequence, [&](auto& value) {
+            value.pts_ns = GST_BUFFER_PTS(buffer);
+            value.pts_origin_ns = pts_origin_ns_;
+        });
 
         // Chain-return observation: the zero-length marker behind the data
         // buffer reaches the sink pad only after the data buffer's chain
@@ -613,7 +726,7 @@ public:
             return fail_write(outcome, Error{ErrorCode::timeout}, readiness_probe);
         }
 
-        const std::uint64_t write_seq = probe_.expect_write();
+        const std::uint64_t write_seq = probe_.expect_write(observation_sequence);
         GstFlowReturn pushed = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer);
         if (pushed != GST_FLOW_OK) {
             // The failed push already consumed the data buffer (ownership
@@ -630,6 +743,14 @@ public:
             return fail_write(outcome, Error{ErrorCode::audio_sink_unavailable},
                               readiness_probe);
         }
+        const auto pushed_levels = appsrc_queue_levels();
+        progress_.update(observation_sequence, [&](auto& value) {
+            value.pair_pushed_at = observation_time();
+            value.levels_valid = true;
+            value.levels_at = *value.pair_pushed_at;
+            value.queued_bytes = pushed_levels.first;
+            value.queued_buffers = pushed_levels.second;
+        });
 
         // The write is acknowledged ONLY at the renderer's handoff (gate r2
         // F1): the element's render call actually handed the audio to
@@ -1002,6 +1123,7 @@ private:
     gulong probe_id_{0};
     AudioFormat format_{};
     core::Milliseconds write_timeout_{2000};
+    WriteProgress progress_;
     mutable HandoffTracker handoff_{};
     PadProbe probe_;
     bool pending_drop_nonempty_{false};
@@ -1329,7 +1451,8 @@ SinkOpenOutcome open_default_sink(const SinkOpenRequest& request) {
     auto handle = std::make_unique<GstSink>(SinkElements{pipeline, source}, request.format,
                                             request.write_timeout, sink,
                                             request.drop_nonempty_at_ingress,
-                                            request.drop_nonempty_after_window);
+                                            request.drop_nonempty_after_window,
+                                            request.on_write_progress);
     if (!handle->attach_probe()) {
         handle->release();
         outcome.report.usable = false;

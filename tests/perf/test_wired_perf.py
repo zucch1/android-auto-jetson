@@ -472,10 +472,18 @@ def case_media_timing(tmp: Path) -> None:
     receiver_source = (ROOT / "tools" / "wired-receiver" / "main.cpp").read_text(
         encoding="utf-8")
     assert gate.receiver_hook_present(receiver_source), "receiver hook/stat read is absent"
-    assert not gate.receiver_hook_present(receiver_source.replace(
-        "emit_media_timing();", "/* emit_media_timing(); */")), "commented call passed guard"
-    assert not gate.receiver_hook_present(receiver_source.replace(
-        "router_.pump()", "/* router_.pump() */")), "missing stat update passed guard"
+    for original, replacement in (
+        ("router_.render_step()", ""),
+        ("router_.render_step()", "/* router_.render_step() */"),
+        ("emit_media_timing(stats);", ""),
+        ("emit_media_timing(stats);", "/* emit_media_timing(stats); */"),
+        ("const auto stats = router_.report().stats;", ""),
+        ("format_ms(stats.max_completion_skew)", "format_ms(0)"),
+        ("format_ms(stats.max_path_latency)", "format_ms(0)"),
+    ):
+        mutated = receiver_source.replace(original, replacement)
+        assert mutated != receiver_source, f"mutation did not change source: {original}"
+        assert not gate.receiver_hook_present(mutated), f"mutation passed guard: {original} -> {replacement}"
 
 
 def case_readiness(tmp: Path) -> None:

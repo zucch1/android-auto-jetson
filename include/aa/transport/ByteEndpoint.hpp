@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace aa::transport {
@@ -45,6 +46,19 @@ public:
     // so a stalled peer can never block the caller indefinitely.
     [[nodiscard]] virtual core::Result<std::size_t>
     read(std::span<std::byte> buffer, const core::CancellationToken& token) = 0;
+
+    // Opt-in bounded read; nullopt is nonterminal idle/yield, while an actual
+    // zero count retains read()'s EOF meaning. until limits only this call and
+    // must not replace the terminal I/O deadline. May yield before until.
+    // No blocking fallback: existing endpoints need not implement polling.
+    [[nodiscard]] virtual core::Result<std::optional<std::size_t>>
+    poll_read(std::span<std::byte> buffer, const core::CancellationToken& token,
+              core::Deadline::Clock::time_point until) {
+        (void)buffer;
+        (void)token;
+        (void)until;
+        return Error{ErrorCode::transport_unavailable};
+    }
 
     // Write up to data.size() bytes; every syscall/wait must observe token.
     // The bounded loopback rejects a full queue instead of waiting for space.
