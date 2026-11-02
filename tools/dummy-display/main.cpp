@@ -11,6 +11,7 @@
 #include <aa/ipc/InputChannel.hpp>
 
 #include "ProjectionWidget.hpp"
+#include "pump_timer.hpp"
 #include "test_control.hpp"
 
 #include <QApplication>
@@ -240,6 +241,7 @@ int main(int argc, char** argv) {
     // the attach block (task 24 F1 - a timer destroyed before the event loop
     // starts never pumps video into the helper or presents frames).
     auto pump_timer = std::make_unique<QTimer>();
+    aa::display::pump::configure(*pump_timer);
     QObject::connect(pump_timer.get(), &QTimer::timeout, [errors] {
         if (g_controller.has_value()) {
             const auto pumped = g_controller->pump(aa::core::Milliseconds{0});
@@ -254,7 +256,7 @@ int main(int argc, char** argv) {
         }
     });
     if (g_controller.has_value()) {
-        pump_timer->start(30);
+        pump_timer->start();
     }
 
     std::unique_ptr<aa::display::testcontrol::Channel> control{};
