@@ -1257,6 +1257,139 @@ IsolatedPipeWire::StartOutcome IsolatedPipeWire::start(bool with_null_sink) {
 
 } // namespace
 
+namespace {
+
+struct SinkLoggingCase {
+    const char* name;
+    const char* debug;
+    bool sink_debug;
+    bool factory_info;
+};
+
+class AudioPipelineSinkLogging : public ::testing::TestWithParam<SinkLoggingCase> {};
+
+} // namespace
+
+TEST_P(AudioPipelineSinkLogging, PreservesUserThresholdsWithRealHandoff) {
+    const auto& config = GetParam();
+    if (std::getenv("AA_AUDIO_LOG_CHILD") != nullptr) {
+        auto started = IsolatedPipeWire::start(true);
+        ASSERT_TRUE(started.error.empty()) << started.error;
+        ASSERT_TRUE(started.backend) << "isolated PipeWire prerequisites missing: "
+                                    << started.unavailable_what;
+        auto daemon = std::move(*started.backend);
+        std::mutex mutex;
+        std::optional<aa::audio::SinkWriteProgress> latest;
+        aa::audio::detail::SinkOpenRequest request;
+        request.format = stereo_48k();
+        request.backend = aa::audio::SinkBackend::pipewire;
+        request.on_write_progress = [&](const auto& value) {
+            std::lock_guard lock(mutex);
+            latest = value;
+        };
+        auto opened = aa::audio::detail::open_default_sink(request);
+        ASSERT_TRUE(opened.sink) << opened.report.cause;
+        const auto pcm = constant_pcm({kMediaLevel, 960});
+        ASSERT_TRUE(opened.sink->write({stereo_48k(), now_ns(), pcm}));
+        {
+            std::lock_guard lock(mutex);
+            ASSERT_TRUE(latest);
+            EXPECT_FALSE(latest->readiness_probe);
+            EXPECT_TRUE(latest->handoff_at);
+            EXPECT_TRUE(latest->marker_at);
+            EXPECT_TRUE(latest->completed_at);
+            EXPECT_FALSE(latest->outcome);
+        }
+        EXPECT_EQ(opened.sink->render_stats().handoff_events, 1U);
+        EXPECT_EQ(opened.sink->render_stats().chain_return_buffers, 1U);
+        ASSERT_TRUE(opened.sink->drain(aa::core::Milliseconds{2000}));
+        return;
+    }
+
+    // GST_DEBUG is startup configuration: exec the same case before any
+    // GStreamer initialization, with a real timeout and captured child stdout/stderr.
+    char path[] = "/tmp/aa-sink-logging-XXXXXX";
+    const int fd = mkstemp(path);
+    ASSERT_GE(fd, 0);
+    struct Capture final {
+        int fd;
+        const char* path;
+        ~Capture() { close(fd); unlink(path); }
+    } capture{fd, path};
+    std::vector<std::string> env;
+    for (char** entry = environ; *entry != nullptr; ++entry) {
+        const std::string value{*entry};
+        if (value.rfind("GST_DEBUG", 0) != 0 && value.rfind("AA_AUDIO_LOG_CHILD=", 0) != 0) {
+            env.push_back(value);
+        }
+    }
+    env.emplace_back("AA_AUDIO_LOG_CHILD=1");
+    env.emplace_back("GST_DEBUG_NO_COLOR=1");
+    if (config.debug != nullptr) { env.emplace_back(std::string{"GST_DEBUG="} + config.debug); }
+    std::vector<char*> envp;
+    envp.reserve(env.size() + 1);
+    for (auto& value : env) { envp.push_back(value.data()); }
+    envp.push_back(nullptr);
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    std::string filter = std::string{"--gtest_filter="} + info->test_suite_name() + "." + info->name();
+    char* argv[] = {const_cast<char*>("timeout"), const_cast<char*>("--kill-after=5s"),
+                    const_cast<char*>("20s"), const_cast<char*>("/proc/self/exe"),
+                    filter.data(), const_cast<char*>("--gtest_output="), nullptr};
+    // /proc/self/exe would name timeout after exec; resolve this test first.
+    std::array<char, 4096> executable{};
+    const auto length = readlink("/proc/self/exe", executable.data(), executable.size() - 1);
+    ASSERT_GT(length, 0);
+    ASSERT_LT(static_cast<std::size_t>(length), executable.size() - 1);
+    argv[3] = executable.data();
+    posix_spawn_file_actions_t actions;
+    ASSERT_EQ(posix_spawn_file_actions_init(&actions), 0);
+    const int stderr_redirected = posix_spawn_file_actions_adddup2(&actions, fd, STDERR_FILENO);
+    const int redirected = stderr_redirected == 0
+        ? posix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO) : stderr_redirected;
+    pid_t pid = 0;
+    const int spawned = redirected == 0
+        ? posix_spawn(&pid, "/usr/bin/timeout", &actions, nullptr, argv, envp.data()) : redirected;
+    posix_spawn_file_actions_destroy(&actions);
+    ASSERT_EQ(spawned, 0);
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited == -1 && errno == EINTR);
+    ASSERT_EQ(waited, pid);
+    std::ifstream input{path};
+    const std::string output{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+    RecordProperty("child_stderr", output);
+    ASSERT_TRUE(WIFEXITED(status)) << status << "\n" << output;
+    ASSERT_EQ(WEXITSTATUS(status), 0) << output;
+    bool sink_debug = false;
+    bool factory_info = false;
+    std::istringstream lines{output};
+    for (std::string line; std::getline(lines, line);) {
+        std::istringstream fields{line};
+        std::string timestamp, process, thread, level, category;
+        if (!(fields >> timestamp >> process >> thread >> level >> category)) { continue; }
+        if (category == "pipewiresink"
+            && line.find("gst_pipewire_sink_render: push buffer") != std::string::npos) {
+            sink_debug = true;
+        }
+        if (category == "GST_ELEMENT_FACTORY") { factory_info = true; }
+        if (!config.sink_debug) {
+            EXPECT_FALSE((category == "pipewiresink" || category == "pulse")
+                         && (level == "DEBUG" || level == "LOG" || level == "TRACE")) << line;
+        }
+    }
+    EXPECT_EQ(sink_debug, config.sink_debug);
+    EXPECT_EQ(factory_info, config.factory_info);
+}
+
+INSTANTIATE_TEST_SUITE_P(Startup, AudioPipelineSinkLogging, ::testing::Values(
+    SinkLoggingCase{"Unrelated", "GST_ELEMENT_FACTORY:4,GST_STATES:4", false, true},
+    SinkLoggingCase{"SinkDebug", "pipewiresink:DEBUG", true, false},
+    SinkLoggingCase{"SinkTrace", "pipewiresink:TRACE", true, false},
+    SinkLoggingCase{"WildcardOverride", "*:DEBUG,pipewire*:INFO,pulse:INFO", false, true},
+    SinkLoggingCase{"Numeric", "5", true, true},
+    SinkLoggingCase{"Unset", nullptr, false, false}),
+    [](const ::testing::TestParamInfo<SinkLoggingCase>& info) { return info.param.name; });
+
 TEST_F(AudioPipelineRoute, IsolatedBackendWithoutSinksNeverOpensActive) {
     // Gate r2 F3 regression (a): an available PipeWire server with no outputs
     // must NOT pass as active while the host Pulse provider is present - the

@@ -778,7 +778,13 @@ class ConcreteAudioRenderWorker final {
         struct Credit { aa::channels::AvDeliveryId id; std::int64_t duration; };
         struct IdleSkip { std::uint64_t id; std::uint64_t frames; std::uint64_t total; };
         struct IdleResume { std::uint64_t id; aa::core::Nanoseconds start; aa::core::Nanoseconds end; };
-        struct SinkStall { aa::core::Nanoseconds start; aa::core::Nanoseconds end; };
+        struct SinkStall {
+            aa::core::Nanoseconds start;
+            aa::core::Nanoseconds end;
+            aa::core::Nanoseconds step_started;
+            aa::core::Nanoseconds returned_at;
+            std::optional<aa::audio::SinkWriteProgress> write;
+        };
         std::array<Credit, kMaxSlots> credits{};
         std::size_t credit_count{};
         std::array<AudioDispatchObservation, kMaxSlots> correlated{};
@@ -792,7 +798,12 @@ class ConcreteAudioRenderWorker final {
                 log_line("{\"event\":\"audio_sink_stall\",\"blocked_from_ns\":" +
                     std::to_string(stall->start.count) + ",\"completed_ns\":" +
                     std::to_string(stall->end.count) + ",\"stall_ns\":" +
-                    std::to_string(stall->end.count - stall->start.count) + "}");
+                    std::to_string(stall->end.count - stall->start.count) + ",\"scheduled_ns\":" +
+                    std::to_string(completion->scheduled.count) + ",\"scheduled_end_ns\":" +
+                    std::to_string(completion->scheduled_end.count) + ",\"step_started_ns\":" +
+                    std::to_string(stall->step_started.count) + ",\"returned_at_ns\":" +
+                    std::to_string(stall->returned_at.count) + ",\"write\":" +
+                    (stall->write ? sink_write_json(*stall->write) : "null") + "}");
             }
             if (resumed) {
                 log_line("{\"event\":\"audio_idle_resume\",\"id\":" + std::to_string(resumed->id) +
@@ -1048,7 +1059,13 @@ class ConcreteAudioRenderWorker final {
                         aa::core::Nanoseconds{step_started.count + piece_duration});
                     if (completion.completed > blocked_from) {
                         router_.note_backpressure(blocked_from, completion.completed);
-                        diagnostics.stall = SettlementDiagnostics::SinkStall{blocked_from, completion.completed};
+                        diagnostics.stall = SettlementDiagnostics::SinkStall{
+                            blocked_from, completion.completed, step_started, returned_at, {}};
+                        if (result && step_write_ && !step_write_->readiness_probe &&
+                            step_write_->effective_scheduled == completion.scheduled &&
+                            step_write_->completed_at && !step_write_->outcome) {
+                            diagnostics.stall->write = step_write_;
+                        }
                     }
                 }
             }

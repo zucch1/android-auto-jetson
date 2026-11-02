@@ -222,6 +222,12 @@ void handoff_log_observer(GstDebugCategory*, GstDebugLevel, const gchar*, const 
     }
 }
 
+struct HandoffLogCategory final {
+    const char* name;
+    std::atomic<GstDebugLevel> user_threshold{GST_LEVEL_COUNT};
+};
+HandoffLogCategory g_handoff_log_categories[] = {{"pipewiresink"}, {"pulse"}};
+
 // Keeps GStreamer trace output working exactly as the user configured it
 // (GST_DEBUG=...) while letting the handoff observer run at the thresholds it
 // needs without spamming stderr during normal test runs.
@@ -229,6 +235,12 @@ void quiet_default_log_handler(GstDebugCategory* category, GstDebugLevel level, 
                                const gchar* function, gint line, GObject* object,
                                GstDebugMessage* message, gpointer) {
     if (g_getenv("GST_DEBUG") != nullptr) {
+        for (const auto& saved : g_handoff_log_categories) {
+            if (std::strcmp(gst_debug_category_get_name(category), saved.name) == 0
+                && level > saved.user_threshold.load(std::memory_order_acquire)) {
+                return;
+            }
+        }
         gst_debug_log_default(category, level, file, function, line, object, message, nullptr);
     }
 }
@@ -242,16 +254,24 @@ void install_handoff_observer() {
     });
 }
 
-// The handoff lines are TRACE-level in the elements' sources
-// (gst_pipewire_sink_render logs "push buffer" at GST_TRACE), and a category
-// only registers when its element class initializes - so the thresholds are
+// Enable through TRACE for the backend handoff observations (PipeWire 1.0.5
+// logs "push buffer" at DEBUG). A category only registers when its element
+// class initializes - so the thresholds are
 // applied AFTER the elements have been probed; before that the names do not
 // exist and the set is a no-op.
 void enable_handoff_thresholds() {
     static std::once_flag flag;
     std::call_once(flag, [] {
-        gst_debug_set_threshold_for_name("pipewiresink", GST_LEVEL_TRACE);
-        gst_debug_set_threshold_for_name("pulse", GST_LEVEL_TRACE);
+        for (auto& saved : g_handoff_log_categories) {
+            GstDebugCategory* category = nullptr;
+            GST_DEBUG_CATEGORY_GET(category, saved.name);
+            if (category == nullptr) { continue; }
+            const auto threshold = gst_debug_category_get_threshold(category);
+            // Publish GStreamer's effective user filter before raising the
+            // category threshold seen by concurrent streaming callbacks.
+            saved.user_threshold.store(threshold, std::memory_order_release);
+            gst_debug_set_threshold_for_name(saved.name, std::max(threshold, GST_LEVEL_TRACE));
+        }
     });
 }
 
