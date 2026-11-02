@@ -146,6 +146,7 @@ aa::display::testcontrol::Status probe_status() {
 
 void print_usage(std::FILE* stream) {
     std::fputs("usage: aa-dummy-display [--video-socket PATH] [--input-socket PATH]\n"
+               "                        [--decoder-backend automatic|software|nvidia]\n"
                "                        [--test-only-autostart] [--test-only-control-stdin]\n"
                "\n"
                "TEST-ONLY Android Auto projection consumer.\n"
@@ -167,6 +168,7 @@ int main(int argc, char** argv) {
         aa::ipc::production_video_socket_path().value;
     std::string input_socket =
         aa::ipc::production_input_socket_path().value;
+    aa::consumer::DecodeBackend decoder_backend = aa::consumer::DecodeBackend::automatic;
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--test-only-autostart") == 0) {
             test_autostart = true;
@@ -176,6 +178,17 @@ int main(int argc, char** argv) {
             video_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--input-socket") == 0 && index + 1 < argc) {
             input_socket = argv[++index];
+        } else if (std::strcmp(argv[index], "--decoder-backend") == 0 && index + 1 < argc) {
+            const char* backend_val = argv[++index];
+            if (std::strcmp(backend_val, "automatic") == 0) {
+                decoder_backend = aa::consumer::DecodeBackend::automatic;
+            } else if (std::strcmp(backend_val, "software") == 0) {
+                decoder_backend = aa::consumer::DecodeBackend::software;
+            } else if (std::strcmp(backend_val, "nvidia") == 0) {
+                decoder_backend = aa::consumer::DecodeBackend::nvidia;
+            } else {
+                return 2;
+            }
         } else if (std::strcmp(argv[index], "--help") == 0 || std::strcmp(argv[index], "-h") == 0) {
             print_usage(stdout);
             return 0;
@@ -214,10 +227,12 @@ int main(int argc, char** argv) {
         aa::display::TestOnlyAutostart gate{};
         gate.marker = test_autostart ? aa::display::TestOnlyAutostart::kMarker : std::string_view{};
         gate.video_socket = aa::ipc::VideoSocketPath{video_socket};
-        auto factory = [errors, inner = aa::display::helper_decode_sessions()](
+        auto factory = [errors, decoder_backend, inner = aa::display::helper_decode_sessions()](
                            const aa::consumer::DecodeConfig& decode_config) {
             errors->begin_attempt();
-            return inner(decode_config);
+            auto effective_config = decode_config;
+            effective_config.backend = decoder_backend;
+            return inner(effective_config);
         };
         aa::display::DisplayController::Deps deps{client.value(), std::move(factory), widget};
         auto attached = test_autostart
