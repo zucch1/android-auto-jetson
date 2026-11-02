@@ -211,7 +211,8 @@ class EventParser:
             "frame_drops": None, "decode_p50_ms": None, "decode_p95_ms": None,
             "decode_fps": None, "decode_frames": None, "ipc_throughput_mbps": None,
             "ipc_p95_added_latency_ms": None, "av_sync_ms": None, "audio_latency_ms": None,
-            "audio_scheduling_skew_ms": None,
+            "audio_scheduling_skew_ms": None, "audio_stall_dropouts": 0,
+            "audio_stall_dropped_chunks": 0,
         }
         self.video_units: int | None = None
         self.audio_chunks: int | None = None
@@ -354,6 +355,13 @@ class EventParser:
                     self._number({"invalid": None}, "invalid", target)
         if envelope == "err":
             self.terminal_errors.append({"event": "err", "code": str(event.get("code", "unknown"))})
+        # A survived sink stall (#60) is an audio output gap, never a silent one.
+        if envelope == "audio_stall_bypass" and event.get("phase") == "end":
+            self.metrics["audio_stall_dropouts"] = int(self.metrics["audio_stall_dropouts"] or 0) + 1
+            lost = sum(event[key] for key in ("dropped", "discarded")
+                       if isinstance(event.get(key), int) and not isinstance(event.get(key), bool))
+            self.metrics["audio_stall_dropped_chunks"] = (
+                int(self.metrics["audio_stall_dropped_chunks"] or 0) + lost)
         if envelope == "video_sent" and isinstance(event.get("units"), int):
             self.video_units = event["units"]
         if envelope == "audio_chunks" and isinstance(event.get("count"), int):

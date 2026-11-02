@@ -81,6 +81,22 @@ def display_sources() -> None:
             assert actual == ready, (drm, randr, proc.stdout, proc.stderr)
 
 
+def stall_dropouts() -> None:
+    # Given two survived sink stalls (#60), each logged at begin and end.
+    parser = collector.EventParser()
+    for dropped, discarded in ((5, 2), (1, 0)):
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
+                                    "trigger": "credit_wait", "discarded": discarded}))
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "end",
+                                    "outcome": "write_returned", "dropped": dropped,
+                                    "discarded": discarded}))
+    # Then each stall is one reported dropout and every lost chunk is counted.
+    assert parser.metrics["audio_stall_dropouts"] == 2, parser.metrics
+    assert parser.metrics["audio_stall_dropped_chunks"] == 8, parser.metrics
+    # And survived stalls are not terminal errors.
+    assert parser.terminal_errors == [], parser.terminal_errors
+
+
 if __name__ == "__main__":
     globals()[sys.argv[1]]()
     print(f"PASS review-{sys.argv[1]}")

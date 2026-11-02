@@ -1040,6 +1040,9 @@ struct CadencedPcmSource {
     std::vector<std::int64_t> arrivals;
     std::vector<std::int64_t> acks;
     std::vector<std::size_t> held_chunks; // Due chunk indices held for credit.
+    // HU09's phone sent past max_unacked=1 after waiting ~470 ms for an ACK.
+    std::optional<std::chrono::milliseconds> unacked_send_after;
+    std::size_t unacked_sends = 0;
     std::int64_t elapsed_ns() const {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - epoch).count();
     }
@@ -1203,7 +1206,11 @@ class RuntimeTransport final : public aa::transport::Transport {
                 if (source.held_chunks.empty() || source.held_chunks.back() != source.arrivals.size()) {
                     source.held_chunks.push_back(source.arrivals.size());
                 }
-                return std::optional<std::vector<std::byte>>{};
+                if (!source.unacked_send_after ||
+                    CadencedPcmSource::Clock::now() < source.due() + *source.unacked_send_after) {
+                    return std::optional<std::vector<std::byte>>{};
+                }
+                ++source.unacked_sends;
             }
             std::vector<std::byte> data(10 + 8192, std::byte{0});
             wiredtest::FakeHandshakeCipher cipher;
@@ -1570,11 +1577,21 @@ class RejectAudio final : public aa::audio::detail::ObservedAudioSink {
     aa::audio::RenderBarrierStats render_stats() const override { return {}; }
 };
 
+// A failed sink write is survived by reopening the sink (#60). These cases
+// cover a sink that stays broken: its replacement cannot open.
+ConcreteAudioRenderWorker::OpenRouter first_open_only(ConcreteAudioRenderWorker::OpenRouter open) {
+    return [open = std::move(open), opens = std::make_shared<int>(0)](
+               const aa::audio::RouterConfig &config) -> aa::core::Result<aa::audio::AudioRouter> {
+        if ((*opens)++ != 0) { return aa::Error{aa::ErrorCode::audio_sink_unavailable}; }
+        return open(config);
+    };
+}
+
 TEST(WiredReceiver, FailedAudioPumpAcksAdmissionAndEmitsNoRenderedDelivery) {
     ReceiverLogScope logging{g_running};
-    ConcreteAudioRenderWorker sink{pcm_router_config(), [](const auto &config) {
+    ConcreteAudioRenderWorker sink{pcm_router_config(), first_open_only([](const auto &config) {
         return aa::audio::detail::open_router_with_sink_for_test(config, std::make_unique<RejectAudio>());
-    }};
+    })};
     ASSERT_TRUE(sink.ready());
     const auto pcm = wiredtest::pcm_unit();
     aa::protocol::MessageView message{
@@ -2561,6 +2578,7 @@ struct RenderGate {
     std::vector<aa::core::Nanoseconds> timestamps;
     std::vector<std::thread::id> threads;
     std::optional<std::chrono::milliseconds> first_write_delay;
+    bool fail_first_write = false; // after first_write_delay, as a sink write timeout
     std::vector<std::int64_t> entered_ns;
     std::vector<std::int64_t> completed_ns;
     void release() {
@@ -2594,6 +2612,7 @@ class GatedRenderSink final : public aa::audio::detail::ObservedAudioSink {
             gate_->cv.wait_until(lock, std::chrono::steady_clock::now() + *gate_->first_write_delay,
                                 [&] { return gate_->released; });
             gate_->released = true;
+            if (gate_->fail_first_write) { return aa::Error{aa::ErrorCode::timeout}; }
         } else if (!gate_->cv.wait_for(lock, gate_->write_timeout, [&] { return gate_->released; })) {
             gate_->timed_out = true;
             return aa::Error{aa::ErrorCode::timeout};
@@ -2706,7 +2725,7 @@ TEST(WiredReceiver, WorkerSinkTimeoutContextPreservesUnderlyingErrorAndDetachedI
     ReceiverLogScope logging{g_running};
     auto gate = std::make_shared<RenderGate>();
     gate->fail_write = true;
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{pcm_router_config(), first_open_only(gated_router(gate))};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
     const std::vector<std::byte> pcm(960, std::byte{1});
@@ -2821,7 +2840,12 @@ TEST(WiredReceiver, ActualMainIdleAudioCompletesAndRenderFailureNeverReconnects)
         runtime_send_audio = true;
         runtime_audio_ack_attempts.store(0);
         runtime_polls.store(0);
-        runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+        // A failed write reopens the sink (#60); here the replacement cannot open.
+        runtime_sink_override = [gate, opens = std::make_shared<int>(0)]()
+            -> std::unique_ptr<aa::audio::detail::ObservedAudioSink> {
+            if ((*opens)++ != 0) { return {}; }
+            return std::make_unique<GatedRenderSink>(gate);
+        };
         runtime_on_poll = [gate] { gate->release(); };
         const auto result = run_runtime(false, 200, true);
         runtime_sink_override = {};
@@ -2947,6 +2971,8 @@ TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst)
             continue;
         }
         EXPECT_EQ(result.code, 0) << result.output;
+        // Ordinary stalls stay inside the credit window: nothing is dropped.
+        EXPECT_EQ(result.output.find("audio_stall_bypass"), std::string::npos) << result.output;
         ASSERT_EQ(source.arrivals.size(), 8U) << result.output;
         ASSERT_EQ(source.acks.size(), 8U) << result.output;
         EXPECT_EQ(runtime_audio_ack_attempts.load(), static_cast<int>(source.acks.size()));
@@ -2982,6 +3008,51 @@ TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst)
                       << " completed_ns=" << gate->completed_ns[i] - epoch_ns << '\n';
         }
         std::cout << result.output;
+    }
+}
+
+// #60 / HU09: a sink stall far beyond the credit window must not end the
+// session. Stalled audio is dropped and ACKed in time, then output resumes.
+TEST(WiredReceiver, SinkStallBeyondCreditWindowDropsAudioAndContinues) {
+    struct Case {
+        const char *name;
+        int stall_ms;
+        bool fail_write;
+        std::optional<int> unacked_ms;
+        const char *outcome;
+    };
+    for (const Case c : {Case{"conforming_phone", 1000, false, std::nullopt, "write_returned"},
+                         Case{"hu09_phone", 1000, false, 470, "write_returned"},
+                         Case{"sink_write_timeout", 2500, true, 470, "sink_reopened"}}) {
+        SCOPED_TRACE(c.name);
+        CadencedPcmSource source;
+        source.chunks = 80; // ~3.4 s of 8192-byte media chunks at normal cadence
+        if (c.unacked_ms) { source.unacked_send_after = std::chrono::milliseconds{*c.unacked_ms}; }
+        auto gate = std::make_shared<RenderGate>();
+        gate->first_write_delay = std::chrono::milliseconds{c.stall_ms};
+        gate->fail_first_write = c.fail_write;
+        runtime_send_audio = true;
+        runtime_pcm_source = &source;
+        runtime_audio_ack_attempts.store(0);
+        runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+        const auto result = run_runtime(false, 6000, true);
+        runtime_sink_override = {};
+        runtime_pcm_source = nullptr;
+        runtime_send_audio = false;
+        EXPECT_EQ(result.code, 0) << result.output;
+        EXPECT_EQ(result.output.find("ipc_queue_full"), std::string::npos) << result.output;
+        EXPECT_EQ(result.output.find("\"event\":\"err\""), std::string::npos) << result.output;
+        EXPECT_NE(result.output.find("\"event\":\"audio_stall_bypass\",\"phase\":\"begin\""),
+                  std::string::npos) << result.output;
+        EXPECT_NE(result.output.find(std::string{"\"outcome\":\""} + c.outcome + "\""),
+                  std::string::npos) << result.output;
+        ASSERT_EQ(source.arrivals.size(), source.chunks) << result.output;
+        EXPECT_EQ(source.acks.size(), source.arrivals.size());
+        // Every withheld ACK was released before the phone stopped waiting.
+        EXPECT_EQ(source.unacked_sends, 0U);
+        std::lock_guard lock(gate->mutex);
+        EXPECT_GT(gate->completed_ns.size(), 5U) << "output did not resume after the stall";
+        if (c.fail_write) { EXPECT_GE(gate->destroyed, 2U); }
     }
 }
 
@@ -3041,7 +3112,8 @@ class ReceiverAudioDispatch : public testing::Test {
     wiredtest::CaptureSink capture;
     aa::diagnostics::Diagnostics diagnostics{capture};
     std::shared_ptr<RenderGate> gate = std::make_shared<RenderGate>();
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    // Failed writes here model a sink that stays broken (no reopen).
+    ConcreteAudioRenderWorker audio{pcm_router_config(), first_open_only(gated_router(gate))};
     ReceiverPollTransport transport;
     VideoOutlet video{log_line};
     aa::app::WiredSession session{{trust, clock, diagnostics}};
@@ -5045,7 +5117,7 @@ TEST(WiredReceiver, WorkerSettledIdleCannotReviveStoppedOrFailedRoute) {
         gate->release();
         const auto base = steady_ns() - 10'000'000'000LL;
         std::atomic<std::int64_t> now{base + 5'000'000};
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate),
+        ConcreteAudioRenderWorker audio{pcm_router_config(), first_open_only(gated_router(gate)),
             [&] { return aa::core::Nanoseconds{now.load()}; }};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::media_audio;
