@@ -31,6 +31,8 @@ Exit: 0 valid, 1 invalid (errors on stderr), 2 usage or I/O error.
 """
 from __future__ import annotations
 
+# allow: SIZE_OK -- Existing standalone stdlib schema validator; policy validation must not introduce a packaging refactor.
+
 import json
 import math
 import re
@@ -262,9 +264,10 @@ def validate(instance: object, schema: dict, root: dict | None = None) -> list[s
     errors = numeric_errors + _validate(instance, schema, root if root is not None else schema, "$", 0)
     if (not errors and isinstance(instance, dict) and instance.get("schema") == "aa-projection-perf/2"
             and schema.get("properties", {}).get("schema", {}).get("const") == "aa-projection-perf/2"):
-        from aa_measurement_coverage import CoverageError, parse_coverage
+        from aa_measurement_coverage import CoverageError, parse_coverage, validate_thermal_export
         try:
-            parse_coverage(instance.get("measurement_coverage"))
+            coverage = parse_coverage(instance.get("measurement_coverage"))
+            validate_thermal_export(instance, coverage)
         except CoverageError as exc:
             errors.append("$.measurement_coverage: " + str(exc))
     return errors

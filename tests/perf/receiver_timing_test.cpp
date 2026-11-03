@@ -115,6 +115,114 @@ TEST_F(ReceiverTiming, EmitsActualAudioWriteCompletionWithScheduledInterval) {
     EXPECT_LE(std::stoll(match[3].str()), end);
 }
 
+TEST_F(ReceiverTiming, SlowSettlementPublishesOnlyMatchingSuccessfulWriteProgress) {
+    for (const std::string scenario : {"matching", "absent", "mismatched", "readiness", "failed",
+                                       "incomplete", "normal"}) {
+        SCOPED_TRACE(scenario);
+        const auto now_ns = [] {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+        // A stale schedule makes ordinary piece completion deterministically
+        // precede step entry. No wall-clock delay is needed to select either gate.
+        const auto scheduled = now_ns() - 10'000'000'000LL;
+        const std::vector<std::byte> pcm(960, std::byte{1});
+        aa::audio::SinkWriteProgress progress{};
+        progress.sequence = 37;
+        progress.effective_scheduled = {scheduled};
+        progress.entered_at = {scheduled + 10};
+        progress.deadline = {scheduled + 2'000'000'000};
+        progress.levels_valid = true;
+        progress.levels_at = {scheduled + 20};
+        progress.queued_bytes = 960;
+        progress.queued_buffers = 2;
+        progress.max_bytes = 65536;
+        progress.max_buffers = 8;
+        progress.admitted_at = aa::core::Nanoseconds{scheduled + 30};
+        progress.pair_pushed_at = aa::core::Nanoseconds{scheduled + 40};
+        progress.ingress_at = aa::core::Nanoseconds{scheduled + 50};
+        progress.marker_at = aa::core::Nanoseconds{scheduled + 60};
+        progress.handoff_at = aa::core::Nanoseconds{scheduled + 70};
+        progress.completed_at = aa::core::Nanoseconds{scheduled + 80};
+        progress.pts_ns = 100;
+        progress.pts_origin_ns = scheduled;
+        progress.clock_ns = 300;
+        progress.base_time_ns = 200;
+        progress.running_time_ns = 100;
+        if (scenario == "mismatched") { ++progress.effective_scheduled.count; }
+        if (scenario == "readiness") { progress.readiness_probe = true; }
+        if (scenario == "failed") { progress.outcome = aa::ErrorCode::timeout; }
+        if (scenario == "incomplete") { progress.completed_at.reset(); }
+        std::optional<aa::audio::WriteCompletion> completion;
+        capture_stdout();
+        const auto before = now_ns();
+        {
+            ConcreteAudioRenderWorker sink{pcm_router_config(), [&](const auto &config) {
+                auto injected = config;
+                injected.on_write_completed = [&, publish = config.on_write_completed,
+                                                observe = config.on_sink_write_progress](auto value) {
+                    // Feed the existing worker callbacks from a real router
+                    // completion. Only test observations are injected; settlement
+                    // and asynchronous stdout publication run unchanged.
+                    if (scenario != "absent") { observe(progress); }
+                    value.completed = scenario == "normal" ? value.scheduled_end :
+                        aa::core::Nanoseconds{now_ns() +
+                            value.scheduled_end.count - value.scheduled.count + 1};
+                    completion = value;
+                    publish(value);
+                };
+                return aa::audio::detail::open_router_with_sink_for_test(
+                    injected, std::make_unique<LatePeakSink>());
+            }};
+            ASSERT_TRUE(sink.ready());
+            const auto role = aa::protocol::ChannelRole::media_audio;
+            ASSERT_TRUE(sink.submit({{role, 1, {scheduled}}, pcm}, {role, 0, 1, 1}));
+            ASSERT_TRUE(sink.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_FALSE(sink.failure());
+            ASSERT_TRUE(sink.finish()); // Join before reading callback data or flushing logs.
+            const auto report = sink.final_report();
+            ASSERT_TRUE(report);
+            EXPECT_EQ(report->stats.frames_written, 1U);
+            EXPECT_EQ(report->stats.frames_output, 240U);
+            EXPECT_EQ(report->stats.chunks_submitted, 1U);
+        }
+        const auto after = now_ns();
+        const auto output = captured_stdout();
+        ASSERT_TRUE(completion);
+        const auto event = output.find("{\"event\":\"audio_sink_stall\",");
+        if (scenario == "normal") {
+            EXPECT_EQ(event, std::string::npos) << output;
+            continue;
+        }
+        ASSERT_NE(event, std::string::npos) << output;
+        EXPECT_EQ(output.find("{\"event\":\"audio_sink_stall\",", event + 1), std::string::npos) << output;
+        const auto record = output.substr(event, output.find('\n', event) - event);
+        std::smatch stamps;
+        ASSERT_TRUE(std::regex_search(record, stamps, std::regex{
+            "\"blocked_from_ns\":([0-9]+),\"completed_ns\":([0-9]+),\"stall_ns\":([0-9]+),"
+            "\"scheduled_ns\":([0-9]+),\"scheduled_end_ns\":([0-9]+),"
+            "\"step_started_ns\":([0-9]+),\"returned_at_ns\":([0-9]+),\"write\":"})) << record;
+        const auto step_started = std::stoll(stamps[6].str());
+        const auto returned_at = std::stoll(stamps[7].str());
+        EXPECT_GE(step_started, before);
+        EXPECT_GE(returned_at, step_started);
+        EXPECT_LE(returned_at, after);
+        const auto blocked = std::max<std::int64_t>(completion->scheduled_end.count,
+            step_started + completion->scheduled_end.count - completion->scheduled.count);
+        EXPECT_EQ(std::stoll(stamps[1].str()), blocked);
+        EXPECT_EQ(std::stoll(stamps[2].str()), completion->completed.count);
+        EXPECT_EQ(std::stoll(stamps[3].str()), completion->completed.count - blocked);
+        EXPECT_EQ(std::stoll(stamps[4].str()), completion->scheduled.count);
+        EXPECT_EQ(std::stoll(stamps[5].str()), completion->scheduled_end.count);
+        if (scenario == "matching") {
+            ASSERT_LT(progress.completed_at->count, completion->completed.count);
+            EXPECT_NE(record.find("\"write\":" + sink_write_json(progress) + "}"), std::string::npos) << record;
+        } else {
+            EXPECT_NE(record.find("\"write\":null}"), std::string::npos) << record;
+        }
+    }
+}
+
 TEST_F(ReceiverTiming, VideoDropsIncludeFinalTailAfterPeriodicEmission) {
     // Given an outlet without a consumer and 29 real input access units.
     capture_stdout();

@@ -37,8 +37,8 @@ set_target_properties(aa_protocol_adapter PROPERTIES
 target_include_directories(aa_protocol_adapter PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_include_directories(aa_protocol_adapter PRIVATE
     "${CMAKE_BINARY_DIR}/aasdk/protobuf"
-    "${AA_DEPENDENCY_STAGE}/aasdk/include"
-    ${Protobuf_INCLUDE_DIRS})
+    "${AA_DEPENDENCY_STAGE}/aasdk/include")
+target_include_directories(aa_protocol_adapter SYSTEM PRIVATE ${Protobuf_INCLUDE_DIRS})
 target_link_libraries(aa_protocol_adapter PUBLIC aa_core PRIVATE aap_protobuf)
 if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
     target_compile_options(aa_protocol_adapter PRIVATE

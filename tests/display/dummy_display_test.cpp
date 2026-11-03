@@ -19,8 +19,11 @@
 #include "ProjectionWidget.hpp"
 
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
+#include "../../tools/dummy-display/pump_timer.hpp"
 
 #include <QApplication>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QKeyEvent>
 #include <QMouseEvent>
 
@@ -676,6 +679,36 @@ TEST(DummyDisplayContractRender, FpsReadingExpiresAfterPresentationStall) {
     const auto after = meter.reading(resumed + 31 * kPeriod);
     ASSERT_TRUE(after.has_value());
     EXPECT_NEAR(*after, 30.0, 0.5);
+}
+
+TEST(DummyDisplayContractRender, PumpRunsAtQualifiedFiveMsPreciseCadence) {
+    // Given: a timer configured exactly as the shipped display's video pump.
+    qt_app();
+    QTimer timer;
+    aa::display::pump::configure(timer);
+
+    // Then: it carries the #60-qualified 5 ms precise cadence (display
+    // 802cd63e), never the coarse 30 ms pump that failed A/V at ~135 ms.
+    EXPECT_EQ(aa::display::pump::kInterval, std::chrono::milliseconds{5});
+    EXPECT_EQ(timer.intervalAsDuration(), std::chrono::milliseconds{5});
+    EXPECT_EQ(timer.timerType(), Qt::PreciseTimer);
+    EXPECT_FALSE(timer.isSingleShot());
+
+    // When: the real event loop runs it for 300 ms.
+    int ticks = 0;
+    QObject::connect(&timer, &QTimer::timeout, [&ticks] { ++ticks; });
+    QEventLoop loop;
+    QTimer::singleShot(std::chrono::milliseconds{300}, Qt::PreciseTimer, &loop, &QEventLoop::quit);
+    QElapsedTimer elapsed;
+    elapsed.start();
+    timer.start();
+    loop.exec();
+    timer.stop();
+
+    // Then: it fires well above the 30 ms pump's ceiling (10 ticks per
+    // 300 ms); a 5 ms pump yields about 60, so 24 leaves load headroom.
+    ASSERT_GE(elapsed.elapsed(), 300);
+    EXPECT_GE(ticks, 24) << "pump fired " << ticks << " times in " << elapsed.elapsed() << " ms";
 }
 
 TEST(DummyDisplayContractInput, ViewShortcutsStayLocal) {

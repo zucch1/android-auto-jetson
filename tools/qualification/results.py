@@ -152,7 +152,8 @@ def performance(doc: Document, seconds: int) -> None:
     require(bool(thermal.array('zones')), 'MISSING_THERMAL_ZONES')
     require(metrics.child('thermal_peak_c').number('value') == peak,
             'PERF_THERMAL_PEAK')
-    zone_peaks = [Document.parse(zone).number('temp_c') for zone in thermal.array('zones')]
+    zone_peaks = [Document.parse(zone).number('temp_c') for zone in thermal.array('zones')
+                  if Document.parse(zone).get('temp_c') is not None]
     require(max(zone_peaks) == peak, 'PERF_THERMAL_ZONES')
     require(metrics.child('decode_frames').number('value') == coverage.decode.count,
             'PERF_DECODE_COUNT')

@@ -48,6 +48,16 @@ def av_sync() -> None:
     unpaired._consume(json.dumps(events[0]))
     unpaired._consume(json.dumps(events[2]))
     assert unpaired.metrics["av_sync_ms"] is None
+    # Given a frame near the end of a 42 ms audio chunk: video takes 30 ms, audio 2 ms.
+    chunk = collector.EventParser()
+    chunk._consume(json.dumps({"event": "audio_write_completed", "scheduled_ns": 3_000_000_000,
+                               "scheduled_end_ns": 3_042_000_000,
+                               "completed_ns": 3_002_000_000}))
+    chunk._consume(json.dumps({"event": "video_presented", "frame": 11,
+                               "scheduled_ns": 3_040_000_000,
+                               "completed_ns": 3_070_000_000}))
+    # Then skew is the 28 ms latency difference, not the 68 ms completion gap.
+    assert chunk.metrics["av_sync_ms"] == 28, chunk.metrics
 
 
 def display_sources() -> None:
@@ -79,6 +89,38 @@ def display_sources() -> None:
             # Then only positive connected evidence makes it ready.
             actual = "connected" in proc.stdout.splitlines()
             assert actual == ready, (drm, randr, proc.stdout, proc.stderr)
+
+
+def stall_dropouts() -> None:
+    # Given two survived sink stalls (#60), each logged at begin and end.
+    parser = collector.EventParser()
+    for dropped, discarded in ((5, 2), (1, 0)):
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
+                                    "trigger": "credit_wait", "discarded": discarded}))
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "end",
+                                    "outcome": "write_returned", "dropped": dropped,
+                                    "discarded": discarded}))
+    # Then each stall is one reported dropout and every lost chunk is counted.
+    assert parser.metrics["audio_stall_dropouts"] == 2, parser.metrics
+    assert parser.metrics["audio_stall_dropped_chunks"] == 8, parser.metrics
+    assert parser.metrics["audio_stall_unrecovered"] == 0, parser.metrics
+    # And survived stalls are not terminal errors.
+    assert parser.terminal_errors == [], parser.terminal_errors
+    # Given a failed reopen, a stop during recovery and a bypass that never ends.
+    for outcome in ("reopen_failed", "stopped"):
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
+                                    "trigger": "sink_write_error", "discarded": 1}))
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "end",
+                                    "outcome": outcome, "dropped": 2, "discarded": 1,
+                                    "partial": 1, "rendered": 1}))
+    parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
+                                "trigger": "credit_wait", "discarded": 4}))
+    # Then none of them counts as survived, all three are unrecovered, and
+    # only ended stalls contribute measured lost chunks: a partly cut chunk is
+    # lost, a fully rendered in-flight chunk is not.
+    assert parser.metrics["audio_stall_dropouts"] == 2, parser.metrics
+    assert parser.metrics["audio_stall_unrecovered"] == 3, parser.metrics
+    assert parser.metrics["audio_stall_dropped_chunks"] == 16, parser.metrics
 
 
 if __name__ == "__main__":

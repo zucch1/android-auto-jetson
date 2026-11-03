@@ -30,18 +30,21 @@ unavailable), 2 usage or I/O error, 4 internal contract violation.
 """
 from __future__ import annotations
 
+# allow: SIZE_OK -- Existing single-file result CLI contract; preserve lifecycle/budget semantics in this scoped policy change.
+
 import argparse
 import json
 import math
 import re
 import sys
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aa_perf_schema  # noqa: E402
 from aa_measurement_coverage import (
-    CoverageError, Window, coverage_gaps, coverage_to_json, parse_capture, reduce_capture,
+    CoverageError, NANO_PROFILE, Window, coverage_gaps, coverage_to_json, parse_capture, reduce_capture,
 )
 from aa_projection_collect import ProjectionProgress
 
@@ -200,6 +203,19 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                                  status="NOT_REQUIRED",
                                  note="wired path does not require the helper before todo 34"),
         "frame_drops": _metric(_as_int(events.get("frame_drops")), "frames"),
+        "audio_stall_dropouts": _metric(
+            _as_int(events.get("audio_stall_dropouts")), "events",
+            note="audio sink stalls survived by dropping audio (#60); each is an audible gap",
+        ),
+        "audio_stall_dropped_chunks": _metric(
+            _as_int(events.get("audio_stall_dropped_chunks")), "chunks",
+            note="phone audio chunks dropped or partly cut while the sink was stalled, survived "
+                 "or not; excludes in-flight chunks the blocked write fully delivered",
+        ),
+        "audio_stall_unrecovered": _metric(
+            _as_int(events.get("audio_stall_unrecovered")), "events",
+            note="sink stalls whose recovery failed, was stopped, or had not ended (#60)",
+        ),
         "decode_p50_ms": _metric(values["decode_p50_ms"], "ms", note=DECODE_NOTE),
         "decode_p95_ms": _metric(values["decode_p95_ms"], "ms", note=DECODE_NOTE),
         "decode_fps": _metric(values["decode_fps"], "fps", note=DECODE_NOTE),
@@ -300,6 +316,8 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     provenance = _normalise_provenance(provenance_source)
     if not provenance["target_hardware_state"] and "target_hardware_state" in capture:
         provenance["target_hardware_state"] = capture["target_hardware_state"]
+    if evidence.thermal_policy is not None and provenance["target_hardware_state"].get("model") != evidence.thermal_policy.model:
+        raise ContractError("provenance hardware does not match approved Nano thermal policy")
     provenance_gaps = []
     if origin == "live":
         for name in ("source_digest", "build_artifact_digest", "configuration_digest"):
@@ -344,6 +362,10 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     ]
     if not samples:
         notes.append("capture contained no samples; gated metrics are unavailable")
+    if evidence.thermal_policy is not None:
+        notes.append("Nano-specific owner-approved CV availability exception; not full-all-zone thermal qualification. "
+                     "CV nulls mean unavailable, not measured temperatures; cause unproven. "
+                     "Continuous CPU/GPU/SoC0/SoC1/SoC2/TJ and stable inventory remain required.")
 
     result = {
         "schema": SCHEMA_VERSION,
@@ -370,6 +392,8 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         "provenance": provenance,
         "notes": notes,
     }
+    if evidence.thermal_policy is not None:
+        result["thermal_policy"] = asdict(evidence.thermal_policy)
     if capture_path is not None:
         result["capture"] = {"path": capture_path, "sha256": capture_sha256}
 
@@ -430,6 +454,8 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--blocked-on", default=None,
                          help="force a BLOCKED verdict with this reason (pre-run prerequisites)")
     parser.add_argument("--live", action="store_true")
+    parser.add_argument("--thermal-policy", choices=("strict-all-zones", NANO_PROFILE), default=None,
+                        help="require the capture's policy selection; never relabel a capture")
     args = parser.parse_args(argv)
 
     provenance_override: dict | None = None
@@ -459,6 +485,11 @@ def _cli(argv: list[str]) -> int:
     if args.live and isinstance(capture, dict):
         capture["measurement_origin"] = "live"
     try:
+        if args.thermal_policy is not None:
+            evidence = parse_capture(capture)
+            selected = evidence.thermal_policy.profile if evidence.thermal_policy is not None else "strict-all-zones"
+            if args.thermal_policy != selected:
+                raise ContractError("requested thermal policy does not match capture; replay cannot opt in")
         result = build_result(
             capture,
             duration_requested=args.duration_requested,

@@ -85,6 +85,19 @@ private raw paths are not exported. Never invent missing historical bytes.
   decode/IPC rates must agree with coverage counts/bytes/durations; thermal peak
   must agree with the recorded zone peaks. Historical v1 results cannot qualify.
   Summaries establish contract consistency, not measurement authenticity.
+- Explicit approved Nano task32 captures export the distinct coverage policy
+  `active-window-coverage/orin-nano-cv-unavailable/1` and retain
+  `measurement_coverage.thermal_scope` (profile/model/approval/scope plus every
+  zone's numeric/unavailable active counts). Only canonical CV0/1/2 may be null;
+  CPU/GPU/SoC0/1/2/TJ and other zones remain continuously required, with all nine
+  families unique and stable. Actual CV readings remain in peaks. Keep this
+  block and the scope note when removing `capture`: these results are **not
+  full-all-zone thermal qualification**. Independent parsing checks scope,
+  counts, peaks and exact hardware model, and rejects strict relabeling of
+  unavailable CV peaks. Both runs must select the same policy and match the
+  manifest target. Old strict v2 documents retain their default contract.
+  The runbook records the actual limited owner approval and unproven CV cause;
+  a marker/hash alone authenticates neither approval nor hardware measurements.
 - Provenance requires SHA256 source/build/configuration digests, nonempty
   service definitions (name + digest), dependency versions, target hardware
   state, **`package_digest: null` and `equivalence_status: "provisional"`**.

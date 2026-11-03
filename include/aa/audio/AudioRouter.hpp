@@ -91,6 +91,10 @@ struct RenderStep final {
     // Fully consumed parents, once, after successful write completion (or a
     // whole-parent drift trim). Cancellation suppresses stale completion credits.
     std::vector<protocol::MessageHeader> completed{};
+    // Parents whose final frames were in this successful write, even if their
+    // role was cancelled during it. Delivery accounting only, never a credit;
+    // whole-parent drift trims are not deliveries.
+    std::vector<protocol::MessageHeader> delivered{};
     bool pending{};
 };
 

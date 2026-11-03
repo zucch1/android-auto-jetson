@@ -65,6 +65,7 @@ struct DecodeSessionState final {
         std::uint64_t sequence{};
         std::uint64_t timestamp_ns{};
         Clock::time_point submitted_at{};
+        std::optional<Clock::time_point> push_returned_at{};
     };
 
     // High-water mark of the timestamps accepted in this session. Fresh per
@@ -223,8 +224,10 @@ struct DecodeSessionState final {
     // set is never cleared here; only expiry/capacity invalidation sacrifices
     // it.
     void record_correlation(std::uint64_t frame, std::uint64_t sequence,
-                            std::uint64_t timestamp_ns, Clock::time_point now) noexcept {
-        pending.emplace(timestamp_ns, PendingCorrelation{frame, sequence, timestamp_ns, now});
+                            std::uint64_t timestamp_ns, Clock::time_point now,
+                            std::optional<Clock::time_point> push_returned_at = std::nullopt) noexcept {
+        pending.emplace(timestamp_ns, PendingCorrelation{frame, sequence, timestamp_ns, now,
+                                                       push_returned_at});
         awaiting_idr = false;
     }
 

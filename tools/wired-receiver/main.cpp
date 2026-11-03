@@ -550,6 +550,18 @@ class ConcreteAudioRenderWorker final {
         if (bytes > envelope(*role).bytes) {
             return aa::Error{aa::ErrorCode::protocol_payload_oversize};
         }
+        maybe_bypass_locked(monotonic_now());
+        if (bypass_since_) {
+            ++bypass_dropped_;
+            completed_.push_back(id);
+            auto observation = credit_event(aa::channels::AvCreditEvent::granted, id);
+            observation.message_sequence = message.header.sequence;
+            observation.bytes = bytes;
+            record_credit_locked(observation);
+            cv_.notify_all();
+            publish_bypass_logs(lock);
+            return {};
+        }
         // Units are input bytes at 192000 B/s; voice costs 6x. Round UP to
         // whole input frames, so malformed short frames never under-reserve.
         const std::size_t frame_bytes = *role == 0 ? 4 : 2;
@@ -620,11 +632,15 @@ class ConcreteAudioRenderWorker final {
     [[nodiscard]] std::optional<aa::channels::AvDeliveryId>
     take_completion(Clock::time_point until = Clock::now()) {
         std::unique_lock lock(mutex_);
+        maybe_bypass_locked(monotonic_now());
         cv_.wait_until(lock, until, [&] { return !completed_.empty() || failure_ || stopped_; });
-        if (completed_.empty()) { return std::nullopt; }
-        const auto completion = completed_.front();
-        record_credit_locked(credit_event(aa::channels::AvCreditEvent::taken, completion));
-        completed_.pop_front();
+        std::optional<aa::channels::AvDeliveryId> completion;
+        if (!completed_.empty()) {
+            completion = completed_.front();
+            record_credit_locked(credit_event(aa::channels::AvCreditEvent::taken, *completion));
+            completed_.pop_front();
+        }
+        publish_bypass_logs(lock);
         return completion;
     }
 
@@ -667,7 +683,8 @@ class ConcreteAudioRenderWorker final {
     }
     [[nodiscard]] bool outstanding() const {
         std::lock_guard lock(mutex_);
-        return slots_ != 0 || in_flight_ || failure_.has_value();
+        return slots_ != 0 || in_flight_ || failure_.has_value() || bypass_since_.has_value() ||
+               !completed_.empty();
     }
     void observe_av(const aa::channels::AvObservation& value) {
         std::lock_guard lock(mutex_);
@@ -753,6 +770,7 @@ class ConcreteAudioRenderWorker final {
         Reservation reservation;
         std::optional<aa::core::Nanoseconds> dequeued_at{};
         WorkerAdmission admission;
+        bool rendered_any{}; // some of its frames reached the sink in an earlier write
     };
     struct DeferredCredit {
         aa::channels::AvDeliveryId id;
@@ -778,7 +796,13 @@ class ConcreteAudioRenderWorker final {
         struct Credit { aa::channels::AvDeliveryId id; std::int64_t duration; };
         struct IdleSkip { std::uint64_t id; std::uint64_t frames; std::uint64_t total; };
         struct IdleResume { std::uint64_t id; aa::core::Nanoseconds start; aa::core::Nanoseconds end; };
-        struct SinkStall { aa::core::Nanoseconds start; aa::core::Nanoseconds end; };
+        struct SinkStall {
+            aa::core::Nanoseconds start;
+            aa::core::Nanoseconds end;
+            aa::core::Nanoseconds step_started;
+            aa::core::Nanoseconds returned_at;
+            std::optional<aa::audio::SinkWriteProgress> write;
+        };
         std::array<Credit, kMaxSlots> credits{};
         std::size_t credit_count{};
         std::array<AudioDispatchObservation, kMaxSlots> correlated{};
@@ -792,7 +816,12 @@ class ConcreteAudioRenderWorker final {
                 log_line("{\"event\":\"audio_sink_stall\",\"blocked_from_ns\":" +
                     std::to_string(stall->start.count) + ",\"completed_ns\":" +
                     std::to_string(stall->end.count) + ",\"stall_ns\":" +
-                    std::to_string(stall->end.count - stall->start.count) + "}");
+                    std::to_string(stall->end.count - stall->start.count) + ",\"scheduled_ns\":" +
+                    std::to_string(completion->scheduled.count) + ",\"scheduled_end_ns\":" +
+                    std::to_string(completion->scheduled_end.count) + ",\"step_started_ns\":" +
+                    std::to_string(stall->step_started.count) + ",\"returned_at_ns\":" +
+                    std::to_string(stall->returned_at.count) + ",\"write\":" +
+                    (stall->write ? sink_write_json(*stall->write) : "null") + "}");
             }
             if (resumed) {
                 log_line("{\"event\":\"audio_idle_resume\",\"id\":" + std::to_string(resumed->id) +
@@ -839,7 +868,8 @@ class ConcreteAudioRenderWorker final {
         return IdleDisposition::authorized;
     }
     void observe_idle(SettlementDiagnostics &diagnostics) {
-        const bool eligible = !stopping_ && !failure_ && output_established_ && queued_.empty() && !in_flight_;
+        const bool eligible = router_ && !stopping_ && !failure_ && output_established_ && queued_.empty() &&
+                              !in_flight_;
         if (eligible) {
             router_->retire_all_role_idle();
             complete_idle_resume(diagnostics);
@@ -848,7 +878,7 @@ class ConcreteAudioRenderWorker final {
         last_idle_ = WorkerIdleObservation{monotonic_now(), idle_since_, eligible, queue_observation()};
     }
     void complete_idle_resume(SettlementDiagnostics &diagnostics) {
-        if (idle_resume_id_ && idle_resume_frames_ != 0) {
+        if (router_ && idle_resume_id_ && idle_resume_frames_ != 0) {
             diagnostics.skipped = SettlementDiagnostics::IdleSkip{
                 *idle_resume_id_, idle_resume_frames_, router_->report().stats.frames_idle_skipped};
         }
@@ -950,6 +980,103 @@ class ConcreteAudioRenderWorker final {
         deferred_ = {};
         cv_.notify_all();
     }
+    void maybe_bypass_locked(aa::core::Nanoseconds now) {
+        if (bypass_since_ || !in_flight_ || stopping_ || failure_) { return; }
+        for (const auto &pending : deferred_) {
+            if (!pending.empty() && now.count - pending.front().since.count >= kStallBypassAfterNs) {
+                enter_bypass_locked("credit_wait");
+                return;
+            }
+        }
+    }
+    // Drops every admitted-but-unrendered parent, ACKs every withheld credit
+    // and makes later arrivals drop-and-ACK until the blocked write resolves.
+    // Parents already dispatched to the router may still reach the sink in the
+    // blocked write. Their fate settles when the bypass ends: rendered if the
+    // write delivered their final frames, partial if only some of their frames
+    // reached the sink (the cancelled remainder is lost), discarded otherwise.
+    void enter_bypass_locked(const char *trigger) {
+        const auto at = idle_clock_();
+        bypass_since_ = step_started_.value_or(at);
+        bypass_dropped_ = 0;
+        bypass_discarded_ = 0;
+        bypass_partial_ = 0;
+        bypass_rendered_ = 0;
+        bypass_in_flight_.clear();
+        for (const auto &job : queued_) {
+            if (job.dequeued_at) {
+                bypass_in_flight_.push_back({job.header.channel, job.header.sequence, job.rendered_any});
+            } else {
+                ++bypass_discarded_;
+            }
+        }
+        ++bypass_total_;
+        cancel_all();
+        discard_if(queued_, [](const auto &) { return true; });
+        credits_ = {};
+        std::size_t granted = 0;
+        for (auto &pending : deferred_) {
+            for (const auto &entry : pending) {
+                completed_.push_back(entry.id);
+                auto observation = credit_event(aa::channels::AvCreditEvent::granted, entry.id);
+                observation.message_sequence = entry.message_sequence;
+                observation.bytes = entry.bytes;
+                record_credit_locked(observation);
+                ++granted;
+            }
+            pending.clear();
+        }
+        idle_since_.reset();
+        idle_resume_id_.reset();
+        idle_resume_frames_ = 0;
+        bypass_logs_.push_back("{\"event\":\"audio_stall_bypass\",\"phase\":\"begin\",\"trigger\":\"" +
+            std::string{trigger} + "\",\"since_ns\":" + std::to_string(bypass_since_->count) +
+            ",\"at_ns\":" + std::to_string(at.count) + ",\"discarded\":" +
+            std::to_string(bypass_discarded_) + ",\"in_flight\":" +
+            std::to_string(bypass_in_flight_.size()) + ",\"granted\":" + std::to_string(granted) + "}");
+        cv_.notify_all();
+    }
+    // The blocked write returned successfully. Contributors had frames in it;
+    // only delivered parents had their final frames in it, whatever the
+    // cancellation did to their completion credit.
+    void reconcile_bypass_locked(const aa::audio::RenderStep &step) {
+        const auto has = [](const auto &headers, const InFlightParent &parent) {
+            return std::any_of(headers.begin(), headers.end(), [&](const auto &header) {
+                return header.channel == parent.channel && header.sequence == parent.sequence;
+            });
+        };
+        std::erase_if(bypass_in_flight_, [&](InFlightParent &parent) {
+            if (has(step.delivered, parent)) {
+                ++bypass_rendered_;
+                return true;
+            }
+            parent.rendered_any = parent.rendered_any || has(step.contributors, parent);
+            return false;
+        });
+    }
+    void exit_bypass_locked(const char *outcome) {
+        const auto at = idle_clock_();
+        for (const auto &parent : bypass_in_flight_) {
+            ++(parent.rendered_any ? bypass_partial_ : bypass_discarded_);
+        }
+        bypass_in_flight_.clear();
+        dropped_total_ += bypass_dropped_;
+        bypass_logs_.push_back("{\"event\":\"audio_stall_bypass\",\"phase\":\"end\",\"outcome\":\"" +
+            std::string{outcome} + "\",\"since_ns\":" + std::to_string(bypass_since_->count) +
+            ",\"at_ns\":" + std::to_string(at.count) + ",\"stall_ns\":" +
+            std::to_string(at.count - bypass_since_->count) + ",\"dropped\":" +
+            std::to_string(bypass_dropped_) + ",\"discarded\":" + std::to_string(bypass_discarded_) +
+            ",\"partial\":" + std::to_string(bypass_partial_) +
+            ",\"rendered\":" + std::to_string(bypass_rendered_) +
+            ",\"bypasses_total\":" + std::to_string(bypass_total_) + ",\"dropped_total\":" +
+            std::to_string(dropped_total_) + "}");
+        bypass_since_.reset();
+    }
+    void publish_bypass_logs(std::unique_lock<std::mutex> &lock) {
+        auto lines = std::exchange(bypass_logs_, {});
+        lock.unlock();
+        for (const auto &line : lines) { log_line(line); }
+    }
     void cancel_all() {
         if (!router_) { return; }
         for (const auto role : {aa::protocol::ChannelRole::media_audio,
@@ -1028,6 +1155,7 @@ class ConcreteAudioRenderWorker final {
             step_write_.reset();
             step_completion_.reset();
             in_flight_ = true;
+            step_started_ = idle_clock_();
             const auto before = router_.report().stats.frames_written;
             const auto idle_before = router_.report().stats.frames_idle_skipped;
             lock.unlock();
@@ -1048,7 +1176,13 @@ class ConcreteAudioRenderWorker final {
                         aa::core::Nanoseconds{step_started.count + piece_duration});
                     if (completion.completed > blocked_from) {
                         router_.note_backpressure(blocked_from, completion.completed);
-                        diagnostics.stall = SettlementDiagnostics::SinkStall{blocked_from, completion.completed};
+                        diagnostics.stall = SettlementDiagnostics::SinkStall{
+                            blocked_from, completion.completed, step_started, returned_at, {}};
+                        if (result && step_write_ && !step_write_->readiness_probe &&
+                            step_write_->effective_scheduled == completion.scheduled &&
+                            step_write_->completed_at && !step_write_->outcome) {
+                            diagnostics.stall->write = step_write_;
+                        }
                     }
                 }
             }
@@ -1068,6 +1202,12 @@ class ConcreteAudioRenderWorker final {
                         diagnostics.correlated.at(diagnostics.correlated_count++) = parent->dispatch;
                     }
                 }
+                for (const auto &header : result.value().contributors) {
+                    for (auto &job : queued_) {
+                        if (job.dequeued_at && job.header.channel == header.channel &&
+                            job.header.sequence == header.sequence) { job.rendered_any = true; }
+                    }
+                }
                 for (const auto &header : result.value().completed) {
                     discard_if(queued_, [&](const Job &job) {
                         return job.header.channel == header.channel && job.header.sequence == header.sequence &&
@@ -1079,6 +1219,10 @@ class ConcreteAudioRenderWorker final {
             }
             if (!stopping_) { grant_deferred(diagnostics); }
             active_.reset();
+            // A failed write is survived by reopening the sink; if that fails
+            // too, the latched context stays the original failed write's.
+            std::function<void()> latch_render_failure;
+            bool reopen = false;
             if (!result) {
                 const auto snapshot = router_.report().render_failure;
                 std::optional<AudioDispatchObservation> parent;
@@ -1096,9 +1240,28 @@ class ConcreteAudioRenderWorker final {
                     }
                 }
                 if (matches != 1) { parent.reset(); admission.reset(); }
-                latch(result.error(), AudioFailureOrigin::render_step,
-                    router_.report().queue_rejection, parent, snapshot, admission);
+                latch_render_failure = [this, error = result.error(), rejection = router_.report().queue_rejection,
+                                        parent, snapshot, admission] {
+                    latch(error, AudioFailureOrigin::render_step, rejection, parent, snapshot, admission);
+                };
+                reopen = snapshot && snapshot->reason == aa::audio::RenderFailureReason::sink_write_error &&
+                         !stopping_ && consecutive_reopens_ < kMaxConsecutiveReopens;
+                if (reopen) {
+                    if (!bypass_since_) { enter_bypass_locked("sink_write_error"); }
+                    this->router_ = nullptr; // no concurrent cancel_pending during reopen
+                    in_flight_ = true;       // wait_idle() covers the reopen
+                } else {
+                    latch_render_failure();
+                }
             } else {
+                if (bypass_since_) {
+                    // The dropped span becomes an authorized all-role idle gap:
+                    // the next arrival re-anchors instead of failing the gap cap.
+                    if (output_established_) { idle_since_ = *bypass_since_; }
+                    reconcile_bypass_locked(result.value());
+                    exit_bypass_locked("write_returned");
+                }
+                if (stats.frames_written > before) { consecutive_reopens_ = 0; }
                 output_established_ = output_established_ || stats.frames_written != 0;
                 last_success_ = WorkerSuccessfulStep{returned_at, monotonic_now(), result.value().pending,
                     result.value().contributors.size(), result.value().completed.size(), queue_observation()};
@@ -1110,7 +1273,7 @@ class ConcreteAudioRenderWorker final {
 #endif
             }
             cv_.notify_all();
-            lock.unlock();
+            publish_bypass_logs(lock);
             if (diagnostics.completion && completed) { completed(*diagnostics.completion); }
             diagnostics.publish();
             if (result && stats.frames_written > before) {
@@ -1119,6 +1282,36 @@ class ConcreteAudioRenderWorker final {
                     log_line("{\"event\":\"audio_chunks\",\"count\":" + std::to_string(chunks) + "}");
                     emit_media_timing(stats);
                 }
+            }
+            if (reopen) {
+                // Arrivals keep dropping and ACKing while the failed sink is
+                // replaced; the new route anchors on its first arrival.
+                router_.close();
+                auto reopened = open(config);
+                lock.lock();
+                ++consecutive_reopens_;
+                in_flight_ = false;
+                const bool healthy = reopened && reopened.value().state() != aa::audio::RouterState::degraded;
+                if (healthy && stopping_) {
+                    // stop() ran while the lock was released for open(): keep the
+                    // new route private so shutdown below flushes and closes it,
+                    // and never republish it for concurrent cancellation.
+                    router_ = std::move(reopened).value();
+                    exit_bypass_locked("stopped");
+                } else if (healthy) {
+                    router_ = std::move(reopened).value();
+                    this->router_ = &router_;
+                    output_established_ = false;
+                    idle_since_.reset();
+                    idle_resume_id_.reset();
+                    idle_resume_frames_ = 0;
+                    exit_bypass_locked("sink_reopened");
+                } else {
+                    exit_bypass_locked("reopen_failed");
+                    latch_render_failure();
+                }
+                cv_.notify_all();
+                publish_bypass_logs(lock);
             }
         }
         {
@@ -1182,6 +1375,29 @@ class ConcreteAudioRenderWorker final {
     std::optional<std::uint64_t> idle_resume_id_;
     std::uint64_t idle_resume_frames_{};
     std::uint64_t idle_sequence_{};
+    // Sink-stall survival (#60): once a blocked write has kept a phone credit
+    // waiting this long, the phone may send past max_unacked=1 (HU09 did after
+    // ~470 ms), so stalled audio is dropped and ACKed instead of ending the
+    // session. A timed-out sink is reopened; repeated reopen failures stay fatal.
+    static constexpr std::int64_t kStallBypassAfterNs = 250'000'000;
+    static constexpr std::size_t kMaxConsecutiveReopens = 3;
+    std::optional<aa::core::Nanoseconds> step_started_;      // idle-clock domain
+    std::optional<aa::core::Nanoseconds> bypass_since_;      // idle-clock domain
+    std::uint64_t bypass_dropped_{};
+    std::uint64_t bypass_discarded_{}; // no frame reached the sink
+    std::uint64_t bypass_partial_{};   // some frames reached it, the cancelled rest is lost
+    std::uint64_t bypass_rendered_{};  // final frames delivered by the blocked write
+    struct InFlightParent {
+        aa::protocol::ChannelRole channel;
+        std::uint64_t sequence;
+        bool rendered_any;
+    };
+    // Dispatched parents whose fate the blocked write decides.
+    std::vector<InFlightParent> bypass_in_flight_;
+    std::uint64_t bypass_total_{};
+    std::uint64_t dropped_total_{};
+    std::size_t consecutive_reopens_{};
+    std::vector<std::string> bypass_logs_;
     std::thread thread_;
 };
 
