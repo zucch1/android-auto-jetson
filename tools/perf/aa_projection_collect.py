@@ -202,6 +202,9 @@ class ProjectionProgress:
         self.last_ns = stamp
 
 
+_STALL_SURVIVED = frozenset({"write_returned", "sink_reopened"})
+
+
 class EventParser:
     """Incrementally parse newline-delimited JSON events from log files."""
 
@@ -212,8 +215,10 @@ class EventParser:
             "decode_fps": None, "decode_frames": None, "ipc_throughput_mbps": None,
             "ipc_p95_added_latency_ms": None, "av_sync_ms": None, "audio_latency_ms": None,
             "audio_scheduling_skew_ms": None, "audio_stall_dropouts": 0,
-            "audio_stall_dropped_chunks": 0,
+            "audio_stall_dropped_chunks": 0, "audio_stall_unrecovered": 0,
         }
+        self.stall_open = False
+        self.stall_failed = 0
         self.video_units: int | None = None
         self.audio_chunks: int | None = None
         self.startup_ms: int | None = None
@@ -355,13 +360,23 @@ class EventParser:
                     self._number({"invalid": None}, "invalid", target)
         if envelope == "err":
             self.terminal_errors.append({"event": "err", "code": str(event.get("code", "unknown"))})
-        # A survived sink stall (#60) is an audio output gap, never a silent one.
+        # A sink stall (#60) is an audio output gap, never a silent one. Only a
+        # resumed sink counts as survived; a failed reopen, a stop during
+        # recovery or a bypass still open at the end is unrecovered.
+        if envelope == "audio_stall_bypass" and event.get("phase") == "begin":
+            self.stall_open = True
         if envelope == "audio_stall_bypass" and event.get("phase") == "end":
-            self.metrics["audio_stall_dropouts"] = int(self.metrics["audio_stall_dropouts"] or 0) + 1
+            self.stall_open = False
+            if event.get("outcome") in _STALL_SURVIVED:
+                self.metrics["audio_stall_dropouts"] = int(self.metrics["audio_stall_dropouts"] or 0) + 1
+            else:
+                self.stall_failed += 1
             lost = sum(event[key] for key in ("dropped", "discarded")
                        if isinstance(event.get(key), int) and not isinstance(event.get(key), bool))
             self.metrics["audio_stall_dropped_chunks"] = (
                 int(self.metrics["audio_stall_dropped_chunks"] or 0) + lost)
+        if envelope == "audio_stall_bypass":
+            self.metrics["audio_stall_unrecovered"] = self.stall_failed + int(self.stall_open)
         if envelope == "video_sent" and isinstance(event.get("units"), int):
             self.video_units = event["units"]
         if envelope == "audio_chunks" and isinstance(event.get("count"), int):

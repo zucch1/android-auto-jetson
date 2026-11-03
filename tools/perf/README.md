@@ -137,7 +137,8 @@ newline-delimited JSON event stream:
 | A/V sync | peak absolute completion delta of concurrent `video_presented` / `audio_write_completed` events |
 | audio scheduling skew (informational) | `media_timing.audio_scheduling_skew_ms` |
 | audio latency | an event field `audio_latency_ms` |
-| audio stall dropouts (informational) | `audio_stall_bypass` `phase:"end"` events: sink stalls survived by dropping audio (#60), and the `dropped` + `discarded` chunks they cost |
+| audio stall dropouts (informational) | `audio_stall_bypass` `phase:"end"` events with outcome `write_returned` or `sink_reopened`: sink stalls survived by dropping audio (#60), and the `dropped` + `discarded` chunks every ended stall cost; in-flight chunks the blocked write still rendered are reported as `rendered`, not lost |
+| unrecovered audio stalls (informational) | `audio_stall_bypass` ends with any other outcome (`reopen_failed`, `stopped`), plus a bypass still open when the capture ends |
 | crashes | receiver exit status (non-zero, or death before the window ends) |
 
 A metric with no source in the current build stays `null`. The wired receiver

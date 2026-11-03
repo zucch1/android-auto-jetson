@@ -93,8 +93,22 @@ def stall_dropouts() -> None:
     # Then each stall is one reported dropout and every lost chunk is counted.
     assert parser.metrics["audio_stall_dropouts"] == 2, parser.metrics
     assert parser.metrics["audio_stall_dropped_chunks"] == 8, parser.metrics
+    assert parser.metrics["audio_stall_unrecovered"] == 0, parser.metrics
     # And survived stalls are not terminal errors.
     assert parser.terminal_errors == [], parser.terminal_errors
+    # Given a failed reopen, a stop during recovery and a bypass that never ends.
+    for outcome in ("reopen_failed", "stopped"):
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
+                                    "trigger": "sink_write_error", "discarded": 1}))
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "end",
+                                    "outcome": outcome, "dropped": 2, "discarded": 1}))
+    parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
+                                "trigger": "credit_wait", "discarded": 4}))
+    # Then none of them counts as survived, all three are unrecovered, and
+    # only ended stalls contribute measured lost chunks.
+    assert parser.metrics["audio_stall_dropouts"] == 2, parser.metrics
+    assert parser.metrics["audio_stall_unrecovered"] == 3, parser.metrics
+    assert parser.metrics["audio_stall_dropped_chunks"] == 14, parser.metrics
 
 
 if __name__ == "__main__":

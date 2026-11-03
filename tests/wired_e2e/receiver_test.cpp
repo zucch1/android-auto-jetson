@@ -3056,6 +3056,93 @@ TEST(WiredReceiver, SinkStallBeyondCreditWindowDropsAudioAndContinues) {
     }
 }
 
+// #78 review: a parent already inside the blocked write is not lost when that
+// write later succeeds; only parents that never reached the sink are discarded.
+TEST(WiredReceiver, StallBypassCountsInFlightRenderedParentAsRendered) {
+    ReceiverLogScope logging{g_running};
+    auto gate = std::make_shared<RenderGate>();
+    gate->first_write_delay = std::chrono::milliseconds{3000}; // released explicitly below
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    capture_receiver_stdout();
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(960, std::byte{1});
+    // Given: parent 1 blocks inside the sink write and parents 2-4 queue behind
+    // it, the fourth with its credit withheld (four media slots).
+    ASSERT_TRUE(audio.submit({{role, 1, {1'000'000'000}}, pcm}, {role, 0, 1, 7}));
+    ASSERT_TRUE(gate->wait_writes(1));
+    for (std::uint64_t sequence = 2; sequence <= 4; ++sequence) {
+        const auto at = static_cast<std::int64_t>(1'000'000'000 + (sequence - 1) * 5'000'000);
+        ASSERT_TRUE(audio.submit({{role, sequence, {at}}, pcm}, {role, 0, sequence, 7}));
+    }
+    // When: the withheld credit outlives the bypass threshold, then the blocked
+    // write returns successfully.
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    (void)audio.take_completion(std::chrono::steady_clock::now());
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    EXPECT_TRUE(audio.finish());
+    const auto output = captured_receiver_stdout();
+    // Then: the three undispatched parents are discarded and parent 1 rendered.
+    EXPECT_NE(output.find("\"phase\":\"begin\",\"trigger\":\"credit_wait\""), std::string::npos) << output;
+    EXPECT_NE(output.find("\"discarded\":3,\"in_flight\":1"), std::string::npos) << output;
+    EXPECT_NE(output.find("\"outcome\":\"write_returned\""), std::string::npos) << output;
+    EXPECT_NE(output.find("\"dropped\":0,\"discarded\":3,\"rendered\":1"), std::string::npos) << output;
+    EXPECT_FALSE(gate->timed_out);
+}
+
+// #78 review: stop() can run while the worker reopens a failed sink without the
+// lock; the reopened router must stay private and shut down, never republished.
+TEST(WiredReceiver, StopDuringSinkReopenNeverRepublishesRouter) {
+    ReceiverLogScope logging{g_running};
+    auto gate = std::make_shared<RenderGate>();
+    gate->first_write_delay = std::chrono::milliseconds{0};
+    gate->fail_first_write = true;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool reopening = false;
+    bool proceed = false;
+    int opens = 0;
+    ConcreteAudioRenderWorker audio{pcm_router_config(), [&](const auto &config) {
+        {
+            std::unique_lock lock(mutex);
+            if (opens++ != 0) {
+                reopening = true;
+                cv.notify_all();
+                cv.wait(lock, [&] { return proceed; });
+            }
+        }
+        return gated_router(gate)(config);
+    }};
+    ASSERT_TRUE(audio.ready());
+    capture_receiver_stdout();
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(960, std::byte{1});
+    // Given: the first write fails and the worker is inside the replacement open().
+    ASSERT_TRUE(audio.submit({{role, 1, {1'000'000'000}}, pcm}, {role, 0, 1, 7}));
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds{2}, [&] { return reopening; }));
+    }
+    // When: the session stops before that open() returns a healthy router.
+    audio.stop();
+    {
+        std::lock_guard lock(mutex);
+        proceed = true;
+        cv.notify_all();
+    }
+    // Then: shutdown is clean, the recovery reports a stop rather than a reopened
+    // sink, and both sinks are torn down with nothing written after the stop.
+    EXPECT_TRUE(audio.finish());
+    const auto output = captured_receiver_stdout();
+    EXPECT_EQ(opens, 2);
+    EXPECT_NE(output.find("\"outcome\":\"stopped\""), std::string::npos) << output;
+    EXPECT_EQ(output.find("\"outcome\":\"sink_reopened\""), std::string::npos) << output;
+    std::lock_guard lock(gate->mutex);
+    EXPECT_EQ(gate->writes, 1U);
+    EXPECT_EQ(gate->destroyed, 2U);
+}
+
 class ReceiverPollTransport final : public aa::transport::Transport {
   public:
     wiredtest::ScriptedTransport wire;
