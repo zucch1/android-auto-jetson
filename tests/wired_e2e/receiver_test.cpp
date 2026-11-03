@@ -3087,7 +3087,52 @@ TEST(WiredReceiver, StallBypassCountsInFlightRenderedParentAsRendered) {
     EXPECT_NE(output.find("\"phase\":\"begin\",\"trigger\":\"credit_wait\""), std::string::npos) << output;
     EXPECT_NE(output.find("\"discarded\":3,\"in_flight\":1"), std::string::npos) << output;
     EXPECT_NE(output.find("\"outcome\":\"write_returned\""), std::string::npos) << output;
-    EXPECT_NE(output.find("\"dropped\":0,\"discarded\":3,\"rendered\":1"), std::string::npos) << output;
+    EXPECT_NE(output.find("\"dropped\":0,\"discarded\":3,\"partial\":0,\"rendered\":1"), std::string::npos)
+        << output;
+    EXPECT_FALSE(gate->timed_out);
+}
+
+// #78 review: a voice parent spans several 50 ms render quanta. If the stall
+// blocks its first detached piece, the bypass cancels the rest: the parent is
+// partially delivered, its credit settles exactly once and the loss is reported.
+TEST(WiredReceiver, StallBypassReportsPartiallyRenderedVoiceParentAsLost) {
+    ReceiverLogScope logging{g_running};
+    auto gate = std::make_shared<RenderGate>();
+    gate->first_write_delay = std::chrono::milliseconds{3000}; // released explicitly below
+    auto config = pcm_router_config();
+    config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format =
+        aa::audio::AudioFormat{16000, 1, 16}; // as the receiver advertises voice audio
+    ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    capture_receiver_stdout();
+    const auto role = aa::protocol::ChannelRole::guidance_audio;
+    // Given: one 200 ms voice parent (four quanta) whose first piece blocks in the
+    // sink; it fills the voice capacity, so its own credit is withheld.
+    const std::vector<std::byte> pcm(6400, std::byte{1});
+    const aa::channels::AvDeliveryId id{role, 0, 1, 7};
+    ASSERT_TRUE(audio.submit({{role, 1, {1'000'000'000}}, pcm}, id));
+    ASSERT_TRUE(gate->wait_writes(1));
+    // When: the withheld credit outlives the bypass threshold, then the blocked
+    // first piece returns successfully.
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    std::vector<aa::channels::AvDeliveryId> settled;
+    if (const auto first = audio.take_completion(std::chrono::steady_clock::now())) { settled.push_back(*first); }
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    while (const auto more = audio.take_completion(std::chrono::steady_clock::now() +
+                                                   std::chrono::milliseconds{100})) {
+        settled.push_back(*more);
+    }
+    EXPECT_TRUE(audio.finish());
+    const auto output = captured_receiver_stdout();
+    // Then: the credit settled exactly once, only the first piece was written,
+    // and the parent is reported partial (lost remainder), never rendered.
+    EXPECT_EQ(settled, (std::vector<aa::channels::AvDeliveryId>{id}));
+    EXPECT_EQ(gate->writes, 1U);
+    EXPECT_NE(output.find("\"discarded\":0,\"in_flight\":1"), std::string::npos) << output;
+    EXPECT_NE(output.find("\"outcome\":\"write_returned\""), std::string::npos) << output;
+    EXPECT_NE(output.find("\"dropped\":0,\"discarded\":0,\"partial\":1,\"rendered\":0"), std::string::npos)
+        << output;
     EXPECT_FALSE(gate->timed_out);
 }
 

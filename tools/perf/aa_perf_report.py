@@ -206,8 +206,8 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         ),
         "audio_stall_dropped_chunks": _metric(
             _as_int(events.get("audio_stall_dropped_chunks")), "chunks",
-            note="phone audio chunks dropped while the sink was stalled, survived or not; "
-                 "excludes in-flight chunks the blocked write still rendered",
+            note="phone audio chunks dropped or partly cut while the sink was stalled, survived "
+                 "or not; excludes in-flight chunks the blocked write fully delivered",
         ),
         "audio_stall_unrecovered": _metric(
             _as_int(events.get("audio_stall_unrecovered")), "events",

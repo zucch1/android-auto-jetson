@@ -371,7 +371,7 @@ class EventParser:
                 self.metrics["audio_stall_dropouts"] = int(self.metrics["audio_stall_dropouts"] or 0) + 1
             else:
                 self.stall_failed += 1
-            lost = sum(event[key] for key in ("dropped", "discarded")
+            lost = sum(event[key] for key in ("dropped", "discarded", "partial")
                        if isinstance(event.get(key), int) and not isinstance(event.get(key), bool))
             self.metrics["audio_stall_dropped_chunks"] = (
                 int(self.metrics["audio_stall_dropped_chunks"] or 0) + lost)

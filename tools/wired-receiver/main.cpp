@@ -770,6 +770,7 @@ class ConcreteAudioRenderWorker final {
         Reservation reservation;
         std::optional<aa::core::Nanoseconds> dequeued_at{};
         WorkerAdmission admission;
+        bool rendered_any{}; // some of its frames reached the sink in an earlier write
     };
     struct DeferredCredit {
         aa::channels::AvDeliveryId id;
@@ -991,17 +992,23 @@ class ConcreteAudioRenderWorker final {
     // Drops every admitted-but-unrendered parent, ACKs every withheld credit
     // and makes later arrivals drop-and-ACK until the blocked write resolves.
     // Parents already dispatched to the router may still reach the sink in the
-    // blocked write; they count as discarded only once that write fails or
-    // they turn out not to have contributed to it (reconcile_bypass_locked).
+    // blocked write. Their fate settles when the bypass ends: rendered if the
+    // write delivered their final frames, partial if only some of their frames
+    // reached the sink (the cancelled remainder is lost), discarded otherwise.
     void enter_bypass_locked(const char *trigger) {
         const auto at = idle_clock_();
         bypass_since_ = step_started_.value_or(at);
         bypass_dropped_ = 0;
-        bypass_discarded_ = queued_.size();
+        bypass_discarded_ = 0;
+        bypass_partial_ = 0;
         bypass_rendered_ = 0;
         bypass_in_flight_.clear();
         for (const auto &job : queued_) {
-            if (job.dequeued_at) { bypass_in_flight_.push_back({job.header.channel, job.header.sequence}); }
+            if (job.dequeued_at) {
+                bypass_in_flight_.push_back({job.header.channel, job.header.sequence, job.rendered_any});
+            } else {
+                ++bypass_discarded_;
+            }
         }
         ++bypass_total_;
         cancel_all();
@@ -1025,35 +1032,45 @@ class ConcreteAudioRenderWorker final {
         bypass_logs_.push_back("{\"event\":\"audio_stall_bypass\",\"phase\":\"begin\",\"trigger\":\"" +
             std::string{trigger} + "\",\"since_ns\":" + std::to_string(bypass_since_->count) +
             ",\"at_ns\":" + std::to_string(at.count) + ",\"discarded\":" +
-            std::to_string(bypass_discarded_ - bypass_in_flight_.size()) + ",\"in_flight\":" +
+            std::to_string(bypass_discarded_) + ",\"in_flight\":" +
             std::to_string(bypass_in_flight_.size()) + ",\"granted\":" + std::to_string(granted) + "}");
         cv_.notify_all();
     }
-    // The blocked write returned successfully: in-flight parents that
-    // contributed to it reached the sink and were not lost.
-    void reconcile_bypass_locked(const std::vector<aa::protocol::MessageHeader> &contributors) {
-        for (const auto &header : contributors) {
-            const auto it = std::find(bypass_in_flight_.begin(), bypass_in_flight_.end(),
-                                      std::pair{header.channel, header.sequence});
-            if (it == bypass_in_flight_.end()) { continue; }
-            bypass_in_flight_.erase(it);
-            --bypass_discarded_;
-            ++bypass_rendered_;
-        }
+    // The blocked write returned successfully. Contributors had frames in it;
+    // only delivered parents had their final frames in it, whatever the
+    // cancellation did to their completion credit.
+    void reconcile_bypass_locked(const aa::audio::RenderStep &step) {
+        const auto has = [](const auto &headers, const InFlightParent &parent) {
+            return std::any_of(headers.begin(), headers.end(), [&](const auto &header) {
+                return header.channel == parent.channel && header.sequence == parent.sequence;
+            });
+        };
+        std::erase_if(bypass_in_flight_, [&](InFlightParent &parent) {
+            if (has(step.delivered, parent)) {
+                ++bypass_rendered_;
+                return true;
+            }
+            parent.rendered_any = parent.rendered_any || has(step.contributors, parent);
+            return false;
+        });
     }
     void exit_bypass_locked(const char *outcome) {
         const auto at = idle_clock_();
+        for (const auto &parent : bypass_in_flight_) {
+            ++(parent.rendered_any ? bypass_partial_ : bypass_discarded_);
+        }
+        bypass_in_flight_.clear();
         dropped_total_ += bypass_dropped_;
         bypass_logs_.push_back("{\"event\":\"audio_stall_bypass\",\"phase\":\"end\",\"outcome\":\"" +
             std::string{outcome} + "\",\"since_ns\":" + std::to_string(bypass_since_->count) +
             ",\"at_ns\":" + std::to_string(at.count) + ",\"stall_ns\":" +
             std::to_string(at.count - bypass_since_->count) + ",\"dropped\":" +
             std::to_string(bypass_dropped_) + ",\"discarded\":" + std::to_string(bypass_discarded_) +
+            ",\"partial\":" + std::to_string(bypass_partial_) +
             ",\"rendered\":" + std::to_string(bypass_rendered_) +
             ",\"bypasses_total\":" + std::to_string(bypass_total_) + ",\"dropped_total\":" +
             std::to_string(dropped_total_) + "}");
         bypass_since_.reset();
-        bypass_in_flight_.clear();
     }
     void publish_bypass_logs(std::unique_lock<std::mutex> &lock) {
         auto lines = std::exchange(bypass_logs_, {});
@@ -1185,6 +1202,12 @@ class ConcreteAudioRenderWorker final {
                         diagnostics.correlated.at(diagnostics.correlated_count++) = parent->dispatch;
                     }
                 }
+                for (const auto &header : result.value().contributors) {
+                    for (auto &job : queued_) {
+                        if (job.dequeued_at && job.header.channel == header.channel &&
+                            job.header.sequence == header.sequence) { job.rendered_any = true; }
+                    }
+                }
                 for (const auto &header : result.value().completed) {
                     discard_if(queued_, [&](const Job &job) {
                         return job.header.channel == header.channel && job.header.sequence == header.sequence &&
@@ -1235,7 +1258,7 @@ class ConcreteAudioRenderWorker final {
                     // The dropped span becomes an authorized all-role idle gap:
                     // the next arrival re-anchors instead of failing the gap cap.
                     if (output_established_) { idle_since_ = *bypass_since_; }
-                    reconcile_bypass_locked(result.value().contributors);
+                    reconcile_bypass_locked(result.value());
                     exit_bypass_locked("write_returned");
                 }
                 if (stats.frames_written > before) { consecutive_reopens_ = 0; }
@@ -1361,10 +1384,16 @@ class ConcreteAudioRenderWorker final {
     std::optional<aa::core::Nanoseconds> step_started_;      // idle-clock domain
     std::optional<aa::core::Nanoseconds> bypass_since_;      // idle-clock domain
     std::uint64_t bypass_dropped_{};
-    std::uint64_t bypass_discarded_{};
-    std::uint64_t bypass_rendered_{};
-    // Dispatched parents (channel, sequence) whose fate the blocked write decides.
-    std::vector<std::pair<aa::protocol::ChannelRole, std::uint64_t>> bypass_in_flight_;
+    std::uint64_t bypass_discarded_{}; // no frame reached the sink
+    std::uint64_t bypass_partial_{};   // some frames reached it, the cancelled rest is lost
+    std::uint64_t bypass_rendered_{};  // final frames delivered by the blocked write
+    struct InFlightParent {
+        aa::protocol::ChannelRole channel;
+        std::uint64_t sequence;
+        bool rendered_any;
+    };
+    // Dispatched parents whose fate the blocked write decides.
+    std::vector<InFlightParent> bypass_in_flight_;
     std::uint64_t bypass_total_{};
     std::uint64_t dropped_total_{};
     std::size_t consecutive_reopens_{};

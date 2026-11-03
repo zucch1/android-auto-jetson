@@ -3476,6 +3476,8 @@ TEST_F(AudioPipelineRoute, IncrementalCancellationDuringWriteSuppressesEvenFinal
     rec->during_write = {};
     expect_headers(result.contributors, {{media, 1}, {guidance, 1}});
     EXPECT_TRUE(result.completed.empty());
+    // Media 1 still reached the sink whole; guidance 1 only partly.
+    expect_headers(result.delivered, {{media, 1}});
     EXPECT_TRUE(result.pending);
     EXPECT_EQ(flatten_i16(rec->writes), std::vector<std::int16_t>(480, 2250));
     const auto tail = step();

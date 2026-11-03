@@ -101,14 +101,16 @@ def stall_dropouts() -> None:
         parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
                                     "trigger": "sink_write_error", "discarded": 1}))
         parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "end",
-                                    "outcome": outcome, "dropped": 2, "discarded": 1}))
+                                    "outcome": outcome, "dropped": 2, "discarded": 1,
+                                    "partial": 1, "rendered": 1}))
     parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
                                 "trigger": "credit_wait", "discarded": 4}))
     # Then none of them counts as survived, all three are unrecovered, and
-    # only ended stalls contribute measured lost chunks.
+    # only ended stalls contribute measured lost chunks: a partly cut chunk is
+    # lost, a fully rendered in-flight chunk is not.
     assert parser.metrics["audio_stall_dropouts"] == 2, parser.metrics
     assert parser.metrics["audio_stall_unrecovered"] == 3, parser.metrics
-    assert parser.metrics["audio_stall_dropped_chunks"] == 14, parser.metrics
+    assert parser.metrics["audio_stall_dropped_chunks"] == 16, parser.metrics
 
 
 if __name__ == "__main__":

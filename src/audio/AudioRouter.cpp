@@ -1232,6 +1232,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
         impl_->role_end_frames[role] = end;
         if (run.trimmed + run.consumed == run.frames) {
             result.completed.push_back(run.header);
+            result.delivered.push_back(run.header);
             impl_->pending[role].pop_front();
         }
     }
