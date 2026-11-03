@@ -81,6 +81,38 @@ def display_sources() -> None:
             assert actual == ready, (drm, randr, proc.stdout, proc.stderr)
 
 
+def stall_dropouts() -> None:
+    # Given two survived sink stalls (#60), each logged at begin and end.
+    parser = collector.EventParser()
+    for dropped, discarded in ((5, 2), (1, 0)):
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
+                                    "trigger": "credit_wait", "discarded": discarded}))
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "end",
+                                    "outcome": "write_returned", "dropped": dropped,
+                                    "discarded": discarded}))
+    # Then each stall is one reported dropout and every lost chunk is counted.
+    assert parser.metrics["audio_stall_dropouts"] == 2, parser.metrics
+    assert parser.metrics["audio_stall_dropped_chunks"] == 8, parser.metrics
+    assert parser.metrics["audio_stall_unrecovered"] == 0, parser.metrics
+    # And survived stalls are not terminal errors.
+    assert parser.terminal_errors == [], parser.terminal_errors
+    # Given a failed reopen, a stop during recovery and a bypass that never ends.
+    for outcome in ("reopen_failed", "stopped"):
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
+                                    "trigger": "sink_write_error", "discarded": 1}))
+        parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "end",
+                                    "outcome": outcome, "dropped": 2, "discarded": 1,
+                                    "partial": 1, "rendered": 1}))
+    parser._consume(json.dumps({"event": "audio_stall_bypass", "phase": "begin",
+                                "trigger": "credit_wait", "discarded": 4}))
+    # Then none of them counts as survived, all three are unrecovered, and
+    # only ended stalls contribute measured lost chunks: a partly cut chunk is
+    # lost, a fully rendered in-flight chunk is not.
+    assert parser.metrics["audio_stall_dropouts"] == 2, parser.metrics
+    assert parser.metrics["audio_stall_unrecovered"] == 3, parser.metrics
+    assert parser.metrics["audio_stall_dropped_chunks"] == 16, parser.metrics
+
+
 if __name__ == "__main__":
     globals()[sys.argv[1]]()
     print(f"PASS review-{sys.argv[1]}")

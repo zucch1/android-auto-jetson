@@ -209,7 +209,9 @@ def real_endpoints(probe: str) -> None:
     parser = active_parser()
     for line in result.stdout.splitlines():
         parser._consume(line)
-    events = [json.loads(line) for line in result.stdout.splitlines()]
+    # On Jetson, backend discovery opens nvv4l2decoder, whose library prints
+    # "Opening in BLOCKING MODE" to stdout; only JSON lines are events.
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
     sent_identity = {event["frame"]: (event["sequence"], event["timestamp_ns"])
                      for event in events if event["event"] == "video_ipc_send"}
     received_identity = {event["frame"]: (event["sequence"], event["timestamp_ns"])
