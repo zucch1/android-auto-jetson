@@ -24,6 +24,10 @@ struct UsbByteTransport::Impl final {
           },
              [this](std::span<const std::byte> data, const core::CancellationToken& token) {
                  return this->endpoint->write(data, token);
+             },
+             [this](std::span<std::byte> buffer, const core::CancellationToken& token,
+                    core::Deadline::Clock::time_point until) {
+                 return this->endpoint->poll_read(buffer, token, until);
              }) {}
 };
 
@@ -102,6 +106,32 @@ core::Result<std::vector<std::byte>> UsbByteTransport::receive() {
         return Error{ErrorCode::cancelled};
     }
     auto got = impl_->io.receive_frame(token_);
+    if (impl_->checkpoint) {
+        impl_->checkpoint();
+    }
+    if (token_.stop_requested()) {
+        close();
+        return Error{ErrorCode::cancelled};
+    }
+    if (!got) {
+        close();
+    }
+    return got;
+}
+
+core::Result<std::optional<std::vector<std::byte>>>
+UsbByteTransport::poll_receive(core::Deadline::Clock::time_point until) {
+    if (!impl_) {
+        return Error{ErrorCode::transport_closed};
+    }
+    if (impl_->checkpoint) {
+        impl_->checkpoint();
+    }
+    if (token_.stop_requested()) {
+        close();
+        return Error{ErrorCode::cancelled};
+    }
+    auto got = impl_->io.poll_receive_frame(token_, until);
     if (impl_->checkpoint) {
         impl_->checkpoint();
     }

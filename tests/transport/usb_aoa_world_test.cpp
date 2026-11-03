@@ -14,7 +14,9 @@
 
 #include <aa/core/Error.hpp>
 #include <aa/transport/UsbAoa.hpp>
+#include <aa/transport/UsbByteTransport.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -22,6 +24,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -188,6 +191,87 @@ TEST(UsbAoaWorld, ExpiredCallerDeadlinePreventsAccessoryClaim) {
     ASSERT_FALSE(claimed.has_value());
     EXPECT_EQ(claimed.error().code(), ErrorCode::timeout);
     EXPECT_FALSE(contains(read_log(), "libusb_claim_interface"));
+}
+
+TEST(UsbAoaWorld, PollBoundsRealLibusbTimeoutAndIdleDoesNotCloseInput) {
+    set_scenario("stall");
+    auto factory = ua::make_libusb_link_factory();
+    ASSERT_TRUE(factory.has_value());
+    auto link = ua::connect_aoa(std::move(factory.value()), phone_selector(), {}, admit_all());
+    ASSERT_TRUE(link.has_value());
+    auto transport = tr::UsbByteTransport::over_endpoint(std::move(link.value().endpoint));
+    ASSERT_TRUE(transport.has_value());
+    std::remove(log_path().c_str());
+    auto idle = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                                std::chrono::milliseconds{5});
+    ASSERT_TRUE(idle.has_value());
+    EXPECT_FALSE(idle.value().has_value());
+    const auto log = read_log();
+    EXPECT_EQ(count_of(log, "libusb_bulk_transfer:81:"), 1);
+    EXPECT_FALSE(contains(log, "libusb_close"));
+    const auto at = log.find("libusb_bulk_transfer:81:");
+    ASSERT_NE(at, std::string::npos);
+    const auto timeout = std::stoul(log.substr(at + std::string{"libusb_bulk_transfer:81:"}.size()));
+    EXPECT_GE(timeout, 1u);
+    EXPECT_LE(timeout, 5u);
+
+    ::setenv("AA_FAKE_LIBUSB_SCENARIO", "happy", 1);
+    auto got = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                               std::chrono::seconds{1});
+    ASSERT_TRUE(got.has_value());
+    ASSERT_TRUE(got.value().has_value());
+    EXPECT_EQ(got.value()->size(), 10u);
+    EXPECT_FALSE(contains(read_log(), "libusb_close"));
+}
+
+TEST(UsbAoaWorld, PollPreservesPartialLibusbTimeoutProgressAcrossIdleYields) {
+    set_scenario("partial-timeout");
+    auto factory = ua::make_libusb_link_factory();
+    ASSERT_TRUE(factory.has_value());
+    auto link = ua::connect_aoa(std::move(factory.value()), phone_selector(), {}, admit_all());
+    ASSERT_TRUE(link.has_value());
+    auto transport = tr::UsbByteTransport::over_endpoint(std::move(link.value().endpoint));
+    ASSERT_TRUE(transport.has_value());
+    for (int i = 0; i < 5; ++i) {
+        auto got = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                                   std::chrono::seconds{1});
+        ASSERT_TRUE(got.has_value());
+        EXPECT_EQ(got.value().has_value(), i == 4);
+        if (got.value()) {
+            const std::vector<std::byte> expected{
+                std::byte{0x00}, std::byte{0x03}, std::byte{0x00}, std::byte{0x06},
+                std::byte{0x00}, std::byte{0x02}, std::byte{0x00}, std::byte{0x01},
+                std::byte{0x00}, std::byte{0x06}};
+            EXPECT_EQ(*got.value(), expected);
+        }
+        ::setenv("AA_FAKE_LIBUSB_SCENARIO", "stall", 1);
+        auto idle = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                                    std::chrono::seconds{1});
+        ASSERT_TRUE(idle.has_value());
+        EXPECT_FALSE(idle.value().has_value());
+        ::setenv("AA_FAKE_LIBUSB_SCENARIO", "partial-timeout", 1);
+    }
+}
+
+TEST(UsbAoaWorld, PollRealIoErrorRemainsTypedAndTerminal) {
+    set_scenario("bulk-io-error");
+    auto factory = ua::make_libusb_link_factory();
+    ASSERT_TRUE(factory.has_value());
+    auto link = ua::connect_aoa(std::move(factory.value()), phone_selector(), {}, admit_all());
+    ASSERT_TRUE(link.has_value());
+    auto transport = tr::UsbByteTransport::over_endpoint(std::move(link.value().endpoint));
+    ASSERT_TRUE(transport.has_value());
+    std::remove(log_path().c_str());
+    auto got = transport.value()->poll_receive(aa::core::Deadline::Clock::now() +
+                                               std::chrono::seconds{1});
+    ASSERT_FALSE(got.has_value());
+    EXPECT_EQ(got.error().code(), ErrorCode::transport_io);
+    EXPECT_EQ(count_of(read_log(), "libusb_close"), 1);
+    auto after = transport.value()->poll_receive(aa::core::Deadline::Clock::now());
+    ASSERT_FALSE(after.has_value());
+    EXPECT_EQ(after.error().code(), ErrorCode::transport_closed);
+    EXPECT_EQ(count_of(read_log(), "libusb_bulk_transfer:81:"), 1);
+    EXPECT_EQ(count_of(read_log(), "libusb_close"), 1);
 }
 
 } // namespace

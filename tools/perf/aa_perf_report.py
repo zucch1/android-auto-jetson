@@ -203,6 +203,19 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                                  status="NOT_REQUIRED",
                                  note="wired path does not require the helper before todo 34"),
         "frame_drops": _metric(_as_int(events.get("frame_drops")), "frames"),
+        "audio_stall_dropouts": _metric(
+            _as_int(events.get("audio_stall_dropouts")), "events",
+            note="audio sink stalls survived by dropping audio (#60); each is an audible gap",
+        ),
+        "audio_stall_dropped_chunks": _metric(
+            _as_int(events.get("audio_stall_dropped_chunks")), "chunks",
+            note="phone audio chunks dropped or partly cut while the sink was stalled, survived "
+                 "or not; excludes in-flight chunks the blocked write fully delivered",
+        ),
+        "audio_stall_unrecovered": _metric(
+            _as_int(events.get("audio_stall_unrecovered")), "events",
+            note="sink stalls whose recovery failed, was stopped, or had not ended (#60)",
+        ),
         "decode_p50_ms": _metric(values["decode_p50_ms"], "ms", note=DECODE_NOTE),
         "decode_p95_ms": _metric(values["decode_p95_ms"], "ms", note=DECODE_NOTE),
         "decode_fps": _metric(values["decode_fps"], "fps", note=DECODE_NOTE),
