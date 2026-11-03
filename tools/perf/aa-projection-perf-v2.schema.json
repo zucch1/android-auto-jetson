@@ -53,6 +53,7 @@
       }
     },
     "measurement_coverage": {"$ref": "#/$defs/coverage"},
+    "thermal_policy": {"$ref": "#/$defs/coverage/properties/thermal_scope/properties/policy"},
     "violations": {"type": "array", "items": {
       "type": "object", "additionalProperties": false, "required": ["metric", "value", "budget_max", "detail"],
       "properties": {"metric": {"type": "string"}, "value": {"type": ["number", "null"]}, "budget_max": {"type": "number"}, "detail": {"type": "string"}}
@@ -122,7 +123,25 @@
       "type": "object", "additionalProperties": false,
       "required": ["policy", "window", "sampling", "rss", "cpu", "thermal", "ipc_consumption", "ipc_matches", "decode", "quantiles"],
       "properties": {
-        "policy": {"const": "active-window-coverage/1"},
+        "policy": {"enum": ["active-window-coverage/1", "active-window-coverage/orin-nano-cv-unavailable/1"]},
+        "thermal_scope": {
+          "type": "object", "additionalProperties": false, "required": ["policy", "zones"],
+          "properties": {
+            "policy": {"type": "object", "additionalProperties": false,
+              "required": ["profile", "model", "approval", "scope"],
+              "properties": {
+                "profile": {"const": "orin-nano-cv-unavailable/1"},
+                "model": {"const": "NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super"},
+                "approval": {"const": "owner-approved-nano-cv-availability-20261018"},
+                "scope": {"const": "continuous-cpu-gpu-soc0-soc1-soc2-tj;cv0-cv1-cv2-availability-exception"}
+              }},
+            "zones": {"type": "array", "items": {
+              "type": "object", "additionalProperties": false, "required": ["zone", "numeric", "unavailable"],
+              "properties": {"zone": {"type": "string", "minLength": 1},
+                "numeric": {"$ref": "#/$defs/count"}, "unavailable": {"$ref": "#/$defs/count"}}
+            }}
+          }
+        },
         "window": {"type": ["object", "null"], "additionalProperties": false, "required": ["start_ns", "end_ns"],
           "properties": {"start_ns": {"$ref": "#/$defs/count"}, "end_ns": {"$ref": "#/$defs/count"}}},
         "sampling": {"$ref": "#/$defs/timeline"}, "rss": {"$ref": "#/$defs/observation"},
@@ -137,7 +156,11 @@
             "decode_retained": {"type": "integer", "minimum": 0, "maximum": 4096}
           }
         }
-      }
+      },
+      "oneOf": [
+        {"properties": {"policy": {"const": "active-window-coverage/1"}}, "not": {"required": ["thermal_scope"]}},
+        {"properties": {"policy": {"const": "active-window-coverage/orin-nano-cv-unavailable/1"}}, "required": ["thermal_scope"]}
+      ]
     }
   }
 }
