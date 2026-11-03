@@ -39,6 +39,12 @@ import unittest
 from pathlib import Path
 
 TIMEOUT_S = 60
+# Delivery window for cases that must reach PASS. The harness loop breaks once
+# every observable is true, so a generous budget costs nothing on a pass, while
+# launch plus each ~7-round-trip fake-ssh poll iteration can exceed the short
+# default on a loaded host. Negative cases keep the short default because they
+# run to the deadline and their verdicts do not depend on its length.
+PASS_BUDGET_MS = 3000
 
 FAKE_SSH = r"""#!/usr/bin/env bash
 set -euo pipefail
@@ -220,7 +226,8 @@ class LiveQaGates(unittest.TestCase):
 
     # ---- F3: session activation + observable gates ----
     def test_all_observables_pass(self):
-        code, doc = self.run_qa(False, FAKE_STATE='string "projecting"', FAKE_ACTIVE="1",
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                FAKE_STATE='string "projecting"', FAKE_ACTIVE="1",
                                 FAKE_OBS_VIDEO="1", FAKE_OBS_AUDIO="1", FAKE_OBS_INPUT="1")
         self.assertEqual(code, 0, doc)
         self.assertEqual(doc["status"], "PASS")
@@ -257,8 +264,9 @@ class LiveQaGates(unittest.TestCase):
     def test_final_timing_after_failed_pump_without_chunks_is_failed(self) -> None:
         # Given a failed pump whose final timing export has no delivered chunks.
         # When all other delivery paths succeed through the normal CLI.
-        code, doc = self.run_qa(False, FAKE_OBS_AUDIO="0", FAKE_OBS_PUMP="0",
-                               FAKE_FINAL_MEDIA_TIMING="1")
+        # One full poll iteration must fit for the other observables to be seen.
+        code, doc = self.run_qa(False, projection_timeout_ms=1500, FAKE_OBS_AUDIO="0",
+                               FAKE_OBS_PUMP="0", FAKE_FINAL_MEDIA_TIMING="1")
         # Then timing alone must not produce the old false PASS.
         self.assertEqual((code, doc["status"], doc["blocked_on"]),
                          (4, "FAILED", "observable_missing"), doc)
@@ -269,7 +277,8 @@ class LiveQaGates(unittest.TestCase):
     def test_audio_chunks_and_timing_qualify_delivery(self) -> None:
         # Given successful written frames and a periodic timing measurement.
         # When the normal CLI observes both records without a final export.
-        code, doc = self.run_qa(False, FAKE_OBS_AUDIO="1", FAKE_OBS_PUMP="1",
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                               FAKE_OBS_AUDIO="1", FAKE_OBS_PUMP="1",
                                FAKE_FINAL_MEDIA_TIMING="0")
         # Then real delivery still qualifies.
         self.assertEqual((code, doc["status"]), (0, "PASS"), doc)
@@ -287,10 +296,12 @@ class LiveQaGates(unittest.TestCase):
         # Given input that succeeds only after a second key pair.
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "ssh.log"
-            # When the normal harness launches and stimulates the display.
-            code, doc = self.run_qa(False, FAKE_INPUT_AFTER_KEYS="2", FAKE_SSH_LOG=str(log))
+            # When the normal harness launches and stimulates the display across
+            # the two poll iterations this needs.
+            code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                    FAKE_INPUT_AFTER_KEYS="2", FAKE_SSH_LOG=str(log))
             # Then the real FIFO/CLI contract was used, not an unconditional input marker.
-            self.assertEqual((code, doc["status"]), (0, "PASS"))
+            self.assertEqual((code, doc["status"]), (0, "PASS"), doc)
             commands = log.read_text(encoding="utf-8")
             self.assertIn("--test-only-autostart --test-only-control-stdin <>/tmp/aa-disp.in", commands)
             self.assertIn(r"printf 'status\n' > /tmp/aa-disp.in", commands)
@@ -335,7 +346,7 @@ class LiveQaGates(unittest.TestCase):
         # This checks eventual evidence, not a 300 ms host scheduling budget.
         with tempfile.TemporaryDirectory() as directory:
             code, doc = self.run_qa(
-                False, projection_timeout_ms=1500, FAKE_LOG_ROOT=directory,
+                False, projection_timeout_ms=PASS_BUDGET_MS, FAKE_LOG_ROOT=directory,
                 FAKE_DELAY_POLLS="4", FAKE_PROBE_DELAY_S="0.04",
             )
             self.assertEqual(code, 0, doc)
@@ -345,7 +356,8 @@ class LiveQaGates(unittest.TestCase):
     def test_teardown_terminates_and_checks_both_target_pids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "ssh.log"
-            code, doc = self.run_qa(False, FAKE_SSH_LOG=str(log))
+            code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                    FAKE_SSH_LOG=str(log))
             self.assertEqual(code, 0, doc)
             logged = log.read_text(encoding="utf-8")
             for pid in (4242, 4343):
@@ -450,7 +462,8 @@ class LiveQaGates(unittest.TestCase):
                 log = target / "commands.log"
                 try:
                     code, doc = self.run_qa(
-                        False, FAKE_PROCESSES="1", FAKE_TARGET=directory,
+                        False, projection_timeout_ms=PASS_BUDGET_MS, FAKE_PROCESSES="1",
+                        FAKE_TARGET=directory,
                         FAKE_LAUNCH_FAILURE=failure, FAKE_SSH_LOG=str(log),
                     )
                     self.assertEqual(code, 0 if failure == "0" else 55, doc)
