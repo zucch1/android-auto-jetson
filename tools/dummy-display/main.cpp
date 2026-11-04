@@ -188,6 +188,9 @@ int main(int argc, char** argv) {
             } else if (std::strcmp(backend_val, "nvidia") == 0) {
                 decoder_backend = aa::consumer::DecodeBackend::nvidia;
             } else {
+                std::fprintf(stderr, "aa-dummy-display: invalid --decoder-backend '%s'\n",
+                             backend_val);
+                print_usage(stderr);
                 return 2;
             }
         } else if (std::strcmp(argv[index], "--help") == 0 || std::strcmp(argv[index], "-h") == 0) {

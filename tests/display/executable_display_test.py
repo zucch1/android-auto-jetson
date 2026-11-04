@@ -204,6 +204,8 @@ def case_replay(args):
             [args.display, "--decoder-backend", *values],
             capture_output=True, text=True, timeout=15)
         assert result.returncode == 2, (values, result)
+        assert result.stderr.startswith("aa-dummy-display: "), (values, result)
+        assert "usage: aa-dummy-display" in result.stderr, (values, result)
     with tempfile.TemporaryDirectory(prefix="aa-exec-replay-") as runtime, ExitStack() as children:
         receiver, video, input_sock = start_receiver(args, runtime)
         children.callback(receiver.stop, False)
