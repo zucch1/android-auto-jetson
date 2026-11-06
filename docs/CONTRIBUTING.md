@@ -40,7 +40,8 @@ skip only the 600 s `ipc-bench-happy-600` throughput gate, and only when
 `tools/ci/ipc_bench_gate.py` shows that the PR leaves the benchmark's sources, every
 ninja command that builds `aa-ipc-bench` and its test registration identical to the
 PR base (any difference or error runs it; `ci_ipc_bench_gate` tests the
-classification). Every other test runs on every PR, and the gate runs on every
+classification). A PR that edits `.github/workflows/ci.yml` always runs it, since
+runner-image or provisioning changes do not show up in that comparison. Every other test runs on every PR, and the gate runs on every
 push to `main` and on dispatch, so a throughput regression that does not
 come from the PR's own changes to the benchmark build (for example runner image or
 toolchain drift) is caught after merge, not before. Both jobs use only

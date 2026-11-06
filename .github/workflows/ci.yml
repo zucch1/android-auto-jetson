@@ -165,11 +165,16 @@ jobs:
           # bench sources, every ninja command that builds aa-ipc-bench (flags, defines,
           # link line) and the test registration against this merge result. Any
           # difference or error runs the gate. Every other test, including
-          # input_sensors_memory above, runs on every PR.
+          # input_sensors_memory above, runs on every PR. A PR that edits this
+          # workflow always runs the gate: both trees are configured under the PR's
+          # runner image and provisioning, so an environment change (image, apt
+          # packages, system libraries) would not show up in the comparison.
           bench='run'
           if [ "$GITHUB_EVENT_NAME" = 'pull_request' ]; then
             base_tree="$RUNNER_TEMP/ipc-bench-base"
-            if git worktree add --detach "$base_tree" "$PR_BASE_SHA" \
+            if ! git diff --quiet "$PR_BASE_SHA" HEAD -- .github/workflows/ci.yml; then
+              echo 'ipc-bench-gate RUN: .github/workflows/ci.yml differs from the PR base (or the diff failed)'
+            elif git worktree add --detach "$base_tree" "$PR_BASE_SHA" \
                 && (cd "$base_tree" && cmake --preset host-dev \
                       -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE" -DBUILD_TESTING=ON \
                       >"$RUNNER_TEMP/ipc-bench-base-configure.log" 2>&1) \
