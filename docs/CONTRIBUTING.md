@@ -31,8 +31,8 @@ The planned merge gate consists of three exact, stable contexts:
 | `ci/arm64-cross-build` | Provisioned private companion workflow; not a public job (see below) |
 
 `.github/workflows/ci.yml` runs the three independent nonmatrix public jobs on pull
-requests targeting `main` or `aa/**`, on pushes to `main`, nightly on `main`, and on
-manual `workflow_dispatch`. Pushes to `aa/**` branches start no separate run: the
+requests targeting `main` or `aa/**`, on pushes to `main`, and on manual
+`workflow_dispatch`. Pushes to `aa/**` branches start no separate run: the
 PR run already reports every required context on the head commit, and a newer push
 to the same PR cancels the superseded PR run. There are no workflow path filters
 that could silently omit a required context. Inside `ci/host-build-test`, PR runs
@@ -41,7 +41,7 @@ skip only the 600 s `ipc-bench-happy-600` throughput gate, and only when
 ninja command that builds `aa-ipc-bench` and its test registration identical to the
 PR base (any difference or error runs it; `ci_ipc_bench_gate` tests the
 classification). Every other test runs on every PR, and the gate runs on every
-push to `main`, nightly and on dispatch, so a throughput regression that does not
+push to `main` and on dispatch, so a throughput regression that does not
 come from the PR's own changes to the benchmark build (for example runner image or
 toolchain drift) is caught after merge, not before. Both jobs use only
 `contents: read`, a full-commit-pinned checkout with credential persistence

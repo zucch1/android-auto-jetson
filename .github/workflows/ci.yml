@@ -8,19 +8,14 @@ on:
     branches: [main, 'aa/**']
   push:
     branches: [main]
-  schedule:
-    # Nightly full run on main, including the ipc-bench-happy-600 gate, to catch
-    # regressions that reach main without a code change (runner image, toolchain,
-    # apt packages). Cost: one ~40 min host job plus the short jobs per day, on
-    # free public-repo hosted runners.
-    - cron: '23 3 * * *'
+  # Manual full run (including ipc-bench-happy-600) on any branch.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 # A newer push to the same PR cancels the superseded PR run. Runs on main
-# (push, schedule, dispatch) each get a unique group and are never cancelled.
+# pushes and dispatches each get a unique group and are never cancelled.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -164,7 +159,7 @@ jobs:
           # memcheck pass), and its sentinel semantics are qualified by that step.
           exclude='^input_sensors_memory$'
           # ipc-bench-happy-600 is the 600 s IPC throughput gate (~10 minutes). It runs
-          # on every push to main, nightly, and on workflow_dispatch. On a pull request
+          # on every push to main and on workflow_dispatch. On a pull request
           # it runs unless tools/ci/ipc_bench_gate.py proves the PR leaves the benchmark
           # unchanged: it configures the PR base in a scratch worktree and compares the
           # bench sources, every ninja command that builds aa-ipc-bench (flags, defines,
@@ -193,7 +188,7 @@ jobs:
             echo '## ci/host-build-test'
             echo
             if [ "$bench" = 'deferred' ]; then
-              echo '- `ipc-bench-happy-600`: deferred to the post-merge run on `main` and the nightly run (sources, build commands and registration identical to the PR base).'
+              echo '- `ipc-bench-happy-600`: deferred to the post-merge run on `main` (sources, build commands and registration identical to the PR base).'
             else
               echo '- `ipc-bench-happy-600`: ran in this job.'
             fi
