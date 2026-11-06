@@ -8,10 +8,12 @@
 // (task 24 F3, execution-input-transport-decision.json) to the receiver's
 // endpoint; the D-Bus contract stays control-only.
 #include <aa/display/Display.hpp>
+#include <aa/display/TelemetryWriter.hpp>
 #include <aa/ipc/InputChannel.hpp>
 
 #include "ProjectionWidget.hpp"
 #include "pump_timer.hpp"
+#include "shutdown_outcome.hpp"
 #include "test_control.hpp"
 
 #include <QApplication>
@@ -28,8 +30,12 @@ namespace {
 
 using aa::display::DisplayState;
 
+// display_error lines go through the telemetry writer once it is attached, so
+// runtime error reporting on the GUI thread never waits on stdout either.
 class ErrorReporter final {
 public:
+    void attach(aa::display::TelemetryWriter* writer) noexcept { writer_ = writer; }
+
     void begin_attempt() {
         emitted_ = 0;
         last_.reset();
@@ -50,11 +56,16 @@ public:
         line.append("\",\"code\":\"");
         line.append(code_str);
         line.append("\"}");
+        if (writer_ != nullptr) {
+            static_cast<void>(writer_->enqueue(std::move(line)));
+            return;
+        }
         std::puts(line.c_str());
         std::fflush(stdout);
     }
 
 private:
+    aa::display::TelemetryWriter* writer_{nullptr};
     unsigned emitted_{0};
     std::optional<std::pair<std::string_view, aa::ErrorCode>> last_{};
 };
@@ -67,8 +78,9 @@ class ControlWiring final : public aa::display::ProjectionControl {
 public:
     ControlWiring(std::optional<aa::display::DisplayController>& controller,
                   aa::ipc::VideoSocketPath video, aa::display::qt_adapter::ProjectionWidget& widget,
-                  ErrorReporter& errors)
-        : controller_(controller), video_(std::move(video)), widget_(widget), errors_(errors) {}
+                  ErrorReporter& errors, aa::display::TelemetryWriter& diagnostics)
+        : controller_(controller), video_(std::move(video)), widget_(widget), errors_(errors),
+          diagnostics_(diagnostics) {}
 
     void on_start_projection() override {
         if (!controller_.has_value()) {
@@ -88,7 +100,8 @@ private:
     // Captures the result, refreshes the state text and reports a typed
     // failure ("<state>: <Operation> failed (<code>)") on stderr and through
     // the widget error setter; a successful recovery clears the error while
-    // the success-state text stays owned by set_status().
+    // the success-state text stays owned by set_status(). The stderr line is
+    // queued on its own writer: this runs on the GUI thread.
     void report(const char* operation, const aa::core::Result<void>& result) {
         widget_.set_status(controller_->state());
         if (result.has_value()) {
@@ -103,8 +116,7 @@ private:
         message.reserve(state.size() + code.size() + 32);
         message.append(state).append(": ").append(operation).append(" failed (");
         message.append(code).append(")");
-        std::fputs(message.c_str(), stderr);
-        std::fputc('\n', stderr);
+        static_cast<void>(diagnostics_.enqueue(message));
         widget_.set_error(message);
     }
 
@@ -112,6 +124,7 @@ private:
     aa::ipc::VideoSocketPath video_;
     aa::display::qt_adapter::ProjectionWidget& widget_;
     ErrorReporter& errors_;
+    aa::display::TelemetryWriter& diagnostics_;
 };
 
 std::optional<aa::display::DisplayController> g_controller{};
@@ -211,19 +224,22 @@ int main(int argc, char** argv) {
     config.consumer_name = aa::ipc::BusName{"org.custom.DummyDisplay1"};
     config.viewport = aa::ipc::Viewport{1280, 720, 160};
     config.caps = aa::protocol::VideoProfile{1280, 720, 30};
-    config.on_video_endpoint = [](const aa::ipc::VideoEndpoint& event) {
-        const auto line = aa::ipc::video_endpoint_json(event);
-        std::puts(line.c_str());
-        std::fflush(stdout);
+    // Endpoint, decode and presentation telemetry is written by a background
+    // thread: a slow stdout write must never stall the GUI thread that pumps,
+    // decodes and paints (a stalled GUI thread shows up as a frozen display).
+    aa::display::TelemetryWriter telemetry;
+    errors->attach(&telemetry);
+    aa::display::TelemetryWriter diagnostics{aa::display::default_stderr_sink, 64};
+    config.on_video_endpoint = [&telemetry](const aa::ipc::VideoEndpoint& event) {
+        static_cast<void>(telemetry.enqueue(aa::ipc::video_endpoint_json(event)));
     };
-    config.on_decode_completion = [](const aa::consumer::DecodeCompletion& event) {
-        const auto line = aa::consumer::decode_completion_json(event);
-        std::puts(line.c_str());
-        std::fflush(stdout);
+    config.on_decode_completion = [&telemetry](const aa::consumer::DecodeCompletion& event) {
+        static_cast<void>(telemetry.enqueue(aa::consumer::decode_completion_json(event)));
     };
 
     aa::display::qt_adapter::ProjectionWidget widget(sender, config.caps);
     g_widget = &widget;
+    widget.set_telemetry_writer(&telemetry);
     widget.set_status(DisplayState::unavailable);
 
     auto client = aa::ipc::ControlBusClient::connect();
@@ -252,7 +268,8 @@ int main(int argc, char** argv) {
         errors->report("attach", client.error().code());
     }
 
-    ControlWiring controls{g_controller, aa::ipc::VideoSocketPath{video_socket}, widget, *errors};
+    ControlWiring controls{g_controller, aa::ipc::VideoSocketPath{video_socket}, widget, *errors,
+                           diagnostics};
     widget.set_projection_control(&controls);
 
     // Pump timer must outlive app.exec(): declared at main scope, not inside
@@ -260,7 +277,15 @@ int main(int argc, char** argv) {
     // starts never pumps video into the helper or presents frames).
     auto pump_timer = std::make_unique<QTimer>();
     aa::display::pump::configure(*pump_timer);
-    QObject::connect(pump_timer.get(), &QTimer::timeout, [errors] {
+    QObject::connect(pump_timer.get(), &QTimer::timeout,
+                     [errors, &telemetry, &widget, telemetry_reported = false]() mutable {
+        // A full queue or failed write loses measurement events: show it once.
+        // Only on screen: a stream write here could block on the same stdout
+        // that failed the writer, freezing the GUI thread it protects.
+        if (!telemetry_reported && telemetry.failed()) {
+            telemetry_reported = true;
+            widget.set_error("telemetry failure: events undelivered");
+        }
         if (g_controller.has_value()) {
             const auto pumped = g_controller->pump(aa::core::Milliseconds{0});
             if (!pumped.has_value()) {
@@ -279,15 +304,21 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<aa::display::testcontrol::Channel> control{};
     if (test_control_stdin) {
-        control = std::make_unique<aa::display::testcontrol::Channel>(widget, probe_status);
+        control = std::make_unique<aa::display::testcontrol::Channel>(widget, probe_status,
+                                                                      &telemetry);
     }
 
     widget.show();
-    const int outcome = app.exec();
+    int outcome = app.exec();
     pump_timer->stop();
     if (g_controller.has_value()) {
         g_controller->shutdown();
         g_controller.reset();
     }
-    return outcome;
+    widget.set_telemetry_writer(nullptr);
+    errors->attach(nullptr);
+    return aa::display::shutdown::finish(outcome, diagnostics, telemetry,
+                                         [](const std::string& line) {
+                                             std::fputs(line.c_str(), stderr);
+                                         });
 }

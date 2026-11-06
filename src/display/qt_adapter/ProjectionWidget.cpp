@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <string>
 
 namespace aa::display::qt_adapter {
 
@@ -193,6 +194,10 @@ void ProjectionWidget::set_error(std::string_view message) {
 
 QString ProjectionWidget::error_text() const { return error_; }
 
+void ProjectionWidget::set_telemetry_writer(TelemetryWriter* writer) noexcept {
+    telemetry_writer_ = writer;
+}
+
 void ProjectionWidget::set_projection_control(ProjectionControl* control) noexcept {
     control_ = control;
 }
@@ -241,13 +246,19 @@ void ProjectionWidget::paintEvent(QPaintEvent*) {
         const auto completed = steady_now_ns();
         fps_meter_.note(completed);
         ++presentations_;
-        std::printf("{\"event\":\"video_presented\",\"frame\":%llu,\"scheduled_ns\":%llu,"
-                    "\"completed_ns\":%lld,\"count\":%llu}\n",
-                    static_cast<unsigned long long>(pending_frame_),
-                    static_cast<unsigned long long>(pending_timestamp_ns_),
-                    static_cast<long long>(completed),
-                    static_cast<unsigned long long>(presentations_));
-        std::fflush(stdout);
+        std::string line = "{\"event\":\"video_presented\",\"frame\":" +
+                           std::to_string(pending_frame_) + ",\"scheduled_ns\":" +
+                           std::to_string(pending_timestamp_ns_) + ",\"completed_ns\":" +
+                           std::to_string(completed) + ",\"count\":" +
+                           std::to_string(presentations_) + "}\n";
+        if (telemetry_writer_ == nullptr) {
+            std::fputs(line.c_str(), stdout);
+            std::fflush(stdout);
+        } else {
+            // A rejected event is counted by the writer (undelivered); nothing
+            // is written here, so painting never waits on a stream.
+            static_cast<void>(telemetry_writer_->enqueue(std::move(line)));
+        }
         presentation_pending_ = false;
     }
 }
