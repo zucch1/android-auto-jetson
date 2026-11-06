@@ -139,6 +139,11 @@ add_test(NAME target_safety_coverage COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tests/target_safety/assert_coverage.py" "${CMAKE_BINARY_DIR}")
 
 add_subdirectory(tools/aa-ipc-bench)
+# Regression test for the CI classifier that defers ipc-bench-happy-600 on PRs
+# whose build of the benchmark is identical to the PR base.
+add_test(NAME ci_ipc_bench_gate COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_SOURCE_DIR}/tests/ci/ipc_bench_gate_test.py")
+set_tests_properties(ci_ipc_bench_gate PROPERTIES TIMEOUT 60)
 
 # Task 9 is mandatory: missing development inputs must not turn CI green by omission.
 add_subdirectory(tools/aa-decode-probe)

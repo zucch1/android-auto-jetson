@@ -36,10 +36,14 @@ manual `workflow_dispatch`. Pushes to `aa/**` branches start no separate run: th
 PR run already reports every required context on the head commit, and a newer push
 to the same PR cancels the superseded PR run. There are no workflow path filters
 that could silently omit a required context. Inside `ci/host-build-test`, PR runs
-skip only the 600 s `ipc-bench-happy-600` throughput gate unless the PR touches
-`tools/aa-ipc-bench/`, `tests/ipc/` or `CMakePresets.json`; every other test runs
-on every PR, and the gate runs on every push to `main`, nightly and on dispatch, so
-an unrelated IPC throughput regression is caught right after merge, not before. Both jobs use only
+skip only the 600 s `ipc-bench-happy-600` throughput gate, and only when
+`tools/ci/ipc_bench_gate.py` shows that the PR leaves the benchmark's sources, every
+ninja command that builds `aa-ipc-bench` and its test registration identical to the
+PR base (any difference or error runs it; `ci_ipc_bench_gate` tests the
+classification). Every other test runs on every PR, and the gate runs on every
+push to `main`, nightly and on dispatch, so a throughput regression that does not
+come from the PR's own changes to the benchmark build (for example runner image or
+toolchain drift) is caught after merge, not before. Both jobs use only
 `contents: read`, a full-commit-pinned checkout with credential persistence
 disabled, and no artifact upload or cache actions.
 

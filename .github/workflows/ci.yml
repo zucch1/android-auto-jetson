@@ -9,7 +9,10 @@ on:
   push:
     branches: [main]
   schedule:
-    # Nightly full run on main, including the ipc-bench-happy-600 gate.
+    # Nightly full run on main, including the ipc-bench-happy-600 gate, to catch
+    # regressions that reach main without a code change (runner image, toolchain,
+    # apt packages). Cost: one ~40 min host job plus the short jobs per day, on
+    # free public-repo hosted runners.
     - cron: '23 3 * * *'
   workflow_dispatch:
 
@@ -142,7 +145,6 @@ jobs:
         env:
           AA_GOOGLETEST_ARCHIVE: ${{ runner.temp }}/googletest-v1.15.2.tar.gz
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/opencode
@@ -162,29 +164,36 @@ jobs:
           # memcheck pass), and its sentinel semantics are qualified by that step.
           exclude='^input_sensors_memory$'
           # ipc-bench-happy-600 is the 600 s IPC throughput gate (~10 minutes). It runs
-          # on every push to main, nightly, and on workflow_dispatch. Pull requests skip
-          # it unless they touch the benchmark's own sources (tools/aa-ipc-bench/,
-          # tests/ipc/) or the build presets; if the diff cannot be computed it runs.
-          # Every other test, including input_sensors_memory above, runs on every PR.
+          # on every push to main, nightly, and on workflow_dispatch. On a pull request
+          # it runs unless tools/ci/ipc_bench_gate.py proves the PR leaves the benchmark
+          # unchanged: it configures the PR base in a scratch worktree and compares the
+          # bench sources, every ninja command that builds aa-ipc-bench (flags, defines,
+          # link line) and the test registration against this merge result. Any
+          # difference or error runs the gate. Every other test, including
+          # input_sensors_memory above, runs on every PR.
           bench='run'
           if [ "$GITHUB_EVENT_NAME" = 'pull_request' ]; then
-            if changed="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"; then
-              # Here-string, not a pipe: with pipefail, an early `grep -q` exit can
-              # SIGPIPE the writer and flip the result.
-              if ! grep -Eq '^(tools/aa-ipc-bench/|tests/ipc/|CMakePresets\.json$)' <<<"$changed"; then
-                bench='deferred'
-                exclude='^(input_sensors_memory|ipc-bench-happy-600)$'
-              fi
+            base_tree="$RUNNER_TEMP/ipc-bench-base"
+            if git worktree add --detach "$base_tree" "$PR_BASE_SHA" \
+                && (cd "$base_tree" && cmake --preset host-dev \
+                      -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE" -DBUILD_TESTING=ON \
+                      >"$RUNNER_TEMP/ipc-bench-base-configure.log" 2>&1) \
+                && python3 -B tools/ci/ipc_bench_gate.py \
+                      --base-src "$base_tree" --base-build "$base_tree/build/host-dev" \
+                      --head-src "$PWD" --head-build build/host-dev; then
+              bench='deferred'
+              exclude='^(input_sensors_memory|ipc-bench-happy-600)$'
             else
-              echo '::warning::PR diff unavailable; running ipc-bench-happy-600'
+              tail -n 20 "$RUNNER_TEMP/ipc-bench-base-configure.log" 2>/dev/null || true
             fi
+            git worktree remove --force "$base_tree" 2>/dev/null || true
           fi
           echo "ipc-bench-happy-600: $bench (event: $GITHUB_EVENT_NAME)"
           {
             echo '## ci/host-build-test'
             echo
             if [ "$bench" = 'deferred' ]; then
-              echo '- `ipc-bench-happy-600`: deferred to the post-merge run on `main` and the nightly run (PR does not touch tools/aa-ipc-bench/, tests/ipc/ or CMakePresets.json).'
+              echo '- `ipc-bench-happy-600`: deferred to the post-merge run on `main` and the nightly run (sources, build commands and registration identical to the PR base).'
             else
               echo '- `ipc-bench-happy-600`: ran in this job.'
             fi
