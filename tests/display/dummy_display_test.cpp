@@ -430,48 +430,104 @@ TEST(DummyDisplayContractRender, TelemetryQueueSaturationAndSinkFailureFailClose
     }
 }
 
-TEST(DummyDisplayContractRender, TelemetryBlockedShutdownBoundedWithoutMemoryError) {
-    std::mutex block_mutex;
-    std::condition_variable block_cv;
-    bool allow_sink = false;
-    std::atomic<bool> in_sink{false};
+namespace {
 
-    auto blocking_sink = [&](const std::string&) -> bool {
-        in_sink.store(true);
-        std::unique_lock lock(block_mutex);
-        block_cv.wait(lock, [&] { return allow_sink; });
+// Blocking sink whose state is shared with the writer's worker, so a detached
+// worker can still touch it after the test body returns (no stack lifetime UB).
+struct BlockingSinkState final {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool allow{false};
+    std::atomic<bool> entered{false};
+
+    void release() {
+        {
+            std::lock_guard lock(mutex);
+            allow = true;
+        }
+        cv.notify_all();
+    }
+    [[nodiscard]] bool wait_entered() const {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!entered.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        return entered.load();
+    }
+};
+
+aa::display::TelemetryWriter::Sink blocking_sink(const std::shared_ptr<BlockingSinkState>& state) {
+    return [state](const std::string&) -> bool {
+        state->entered.store(true);
+        std::unique_lock lock(state->mutex);
+        state->cv.wait(lock, [&] { return state->allow; });
         return true;
     };
+}
 
-    auto writer = std::make_unique<aa::display::TelemetryWriter>(blocking_sink);
+}  // namespace
+
+TEST(DummyDisplayContractRender, TelemetryBlockedShutdownBoundedWithoutMemoryError) {
+    auto sink = std::make_shared<BlockingSinkState>();
+    auto writer = std::make_unique<aa::display::TelemetryWriter>(blocking_sink(sink));
     EXPECT_TRUE(writer->enqueue("{\"event\":\"will_block\"}"));
+    ASSERT_TRUE(sink->wait_entered());
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
-    while (!in_sink.load() && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds{5});
-    }
-    ASSERT_TRUE(in_sink.load());
-
-    // Bounded shutdown: close with short timeout (50ms)
+    // Bounded shutdown: close with a short timeout, then destroy; the
+    // destructor's close() must not wait again (close is idempotent).
     const auto before_close = std::chrono::steady_clock::now();
-    const bool closed_clean = writer->close(std::chrono::milliseconds{50});
-    const auto after_close = std::chrono::steady_clock::now();
-
-    EXPECT_FALSE(closed_clean);
-    EXPECT_LT(after_close - before_close, std::chrono::milliseconds{500});
+    EXPECT_FALSE(writer->close(std::chrono::milliseconds{50}));
+    EXPECT_FALSE(writer->close(std::chrono::seconds{5}));
     EXPECT_GT(writer->undelivered(), 0U);
-
-    // Destroy writer while worker thread is still blocked in sink!
     writer.reset();
+    EXPECT_LT(std::chrono::steady_clock::now() - before_close, std::chrono::milliseconds{500});
 
-    // Now unblock sink. The detached worker wakes up and accesses shared state.
-    // Under ASan / Valgrind, this must NOT cause use-after-free or memory errors.
-    {
-        std::lock_guard lock(block_mutex);
-        allow_sink = true;
+    // The detached worker wakes after the writer is gone; it owns its state
+    // and the sink's, so this must be clean under ASan.
+    sink->release();
+}
+
+TEST(DummyDisplayContractRender, TelemetryDrainWaitsForInFlightWrite) {
+    auto sink = std::make_shared<BlockingSinkState>();
+    aa::display::TelemetryWriter writer(blocking_sink(sink));
+    EXPECT_TRUE(writer.enqueue("{\"event\":\"last\"}"));
+    ASSERT_TRUE(sink->wait_entered());
+    // The queue is empty but the only event is still inside the sink.
+    EXPECT_FALSE(writer.drain(std::chrono::milliseconds{50}));
+    sink->release();
+    EXPECT_TRUE(writer.drain(std::chrono::seconds{2}));
+    EXPECT_TRUE(writer.close(std::chrono::seconds{2}));
+}
+
+TEST(DummyDisplayContractRender, TelemetrySaturatedQueueWithBlockedSinkDoesNotBlockPainting) {
+    static_cast<void>(qt_app());
+    CountingInputSink input;
+    aa::display::qt_adapter::ProjectionWidget widget(input, VideoProfile{2, 2, 30});
+    auto sink = std::make_shared<BlockingSinkState>();
+    aa::display::TelemetryWriter writer(blocking_sink(sink), 2);
+    widget.set_telemetry_writer(&writer);
+    EXPECT_TRUE(writer.enqueue("{\"event\":\"blocks\"}"));
+    ASSERT_TRUE(sink->wait_entered());
+
+    // Stdout is stuck and the queue overflows: every presentation after that
+    // is rejected, yet painting stays fast and writes nothing to any stream.
+    testing::internal::CaptureStderr();
+    const auto before = std::chrono::steady_clock::now();
+    for (std::uint64_t frame = 1; frame <= 8; ++frame) {
+        aa::consumer::DecodedFrame decoded{frame, frame, 100000 * frame, 2, 2,
+                                           {80, 80, 80, 80, 128, 128}};
+        widget.on_frame(decoded);
+        static_cast<void>(widget.grab());
     }
-    block_cv.notify_all();
-    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    const auto elapsed = std::chrono::steady_clock::now() - before;
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+    EXPECT_LT(elapsed, std::chrono::milliseconds{500});
+    EXPECT_TRUE(writer.failed());
+    EXPECT_GT(writer.undelivered(), 0U);
+
+    widget.set_telemetry_writer(nullptr);
+    sink->release();
+    EXPECT_FALSE(writer.close(std::chrono::seconds{2}));
 }
 
 struct FrameRecord final {

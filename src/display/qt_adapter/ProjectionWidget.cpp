@@ -254,9 +254,10 @@ void ProjectionWidget::paintEvent(QPaintEvent*) {
         if (telemetry_writer_ == nullptr) {
             std::fputs(line.c_str(), stdout);
             std::fflush(stdout);
-        } else if (!telemetry_writer_->enqueue(std::move(line))) {
-            // The writer is now failed; the app's pump reports it once.
-            std::fputs("aa-dummy-display: video_presented telemetry enqueue failed\n", stderr);
+        } else {
+            // A rejected event is counted by the writer (undelivered); nothing
+            // is written here, so painting never waits on a stream.
+            static_cast<void>(telemetry_writer_->enqueue(std::move(line)));
         }
         presentation_pending_ = false;
     }

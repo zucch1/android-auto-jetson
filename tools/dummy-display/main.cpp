@@ -264,11 +264,11 @@ int main(int argc, char** argv) {
     aa::display::pump::configure(*pump_timer);
     QObject::connect(pump_timer.get(), &QTimer::timeout,
                      [errors, &telemetry, &widget, telemetry_reported = false]() mutable {
-        // A full queue or failed write loses measurement events: surface it
-        // once instead of running on silently.
+        // A full queue or failed write loses measurement events: show it once.
+        // Only on screen: a stream write here could block on the same stdout
+        // that failed the writer, freezing the GUI thread it protects.
         if (!telemetry_reported && telemetry.failed()) {
             telemetry_reported = true;
-            errors->report("telemetry", aa::ErrorCode::diagnostics_sink_failed);
             widget.set_error("telemetry failure: events undelivered");
         }
         if (g_controller.has_value()) {
@@ -301,7 +301,8 @@ int main(int argc, char** argv) {
     }
     widget.set_telemetry_writer(nullptr);
     if (!telemetry.close()) {
-        errors->report("telemetry", aa::ErrorCode::diagnostics_sink_failed);
+        // stderr, not the display_error stdout line: a worker detached while
+        // blocked in a stdout write may still hold the stdout stream lock.
         std::fprintf(stderr, "aa-dummy-display: %zu telemetry event(s) undelivered\n",
                      telemetry.undelivered());
         if (outcome == 0) {

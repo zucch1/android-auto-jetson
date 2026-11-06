@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -24,7 +25,9 @@ inline bool default_stdout_sink(const std::string& line) {
 }
 
 // Single-owner bounded writer for line-oriented diagnostic telemetry. Producers
-// only take the queue mutex; the sink is exclusively called by the worker.
+// only take the queue mutex; the sink is exclusively called by the worker, so a
+// producer (the GUI thread) never waits on stdout. A full queue or failed write
+// fails closed: later events are counted as undelivered, never written.
 // Shutdown safety: the worker thread captures a shared_ptr to the internal state,
 // so if close() times out and detaches the worker, no detached thread ever touches
 // freed memory when the TelemetryWriter is destroyed.
@@ -66,9 +69,14 @@ public:
 
     // Allows deterministic tests to inject a blocked/failing sink and bounded
     // shutdown without making GUI-side producers wait for that sink.
+    // Idempotent: after the first close() (clean or timed out and detached),
+    // later calls, including the destructor's, return that result immediately.
     [[nodiscard]] bool close(std::chrono::milliseconds timeout = std::chrono::seconds{2}) {
         if (!state_) {
             return true;
+        }
+        if (close_result_.has_value()) {
+            return *close_result_;
         }
         {
             std::lock_guard lock(state_->mutex);
@@ -92,6 +100,7 @@ public:
             }
             std::fputs(("aa-dummy-display: telemetry writer shutdown timed out with " +
                         std::to_string(undelivered) + " undelivered event(s)\n").c_str(), stderr);
+            close_result_ = false;
             return false;
         }
         lock.unlock();
@@ -99,16 +108,19 @@ public:
             worker_.join();
         }
         std::lock_guard final_lock(state_->mutex);
-        return !state_->failed && state_->queue.empty() && state_->undelivered_count == 0;
+        close_result_ = !state_->failed && state_->queue.empty() && state_->undelivered_count == 0;
+        return *close_result_;
     }
 
+    // True once every accepted event has been handed to the sink AND the sink
+    // returned: an event the worker already popped counts until its write ends.
     [[nodiscard]] bool drain(std::chrono::milliseconds timeout = std::chrono::seconds{2}) {
         if (!state_) {
             return true;
         }
         std::unique_lock lock(state_->mutex);
         return state_->drained.wait_for(lock, timeout, [state = state_] {
-            return state->failed || state->queue.empty();
+            return state->failed || (state->queue.empty() && !state->in_flight);
         }) && !state_->failed;
     }
 
@@ -139,6 +151,7 @@ private:
         bool closed{false};
         bool failed{false};
         bool exited{false};
+        bool in_flight{false};
         std::size_t undelivered_count{0};
 
         SharedState(Sink s, std::size_t cap)
@@ -157,11 +170,13 @@ private:
                 if (!state->queue.empty()) {
                     line = std::move(state->queue.front());
                     state->queue.pop_front();
+                    state->in_flight = true;
                 }
             }
             if (!line.empty()) {
                 if (!state->sink(line)) {
                     std::lock_guard lock(state->mutex);
+                    state->in_flight = false;
                     state->failed = true;
                     state->undelivered_count += state->queue.size() + 1;
                     state->queue.clear();
@@ -170,6 +185,7 @@ private:
             }
             {
                 std::lock_guard lock(state->mutex);
+                state->in_flight = false;
                 if (state->queue.empty()) {
                     state->drained.notify_all();
                 }
@@ -189,6 +205,7 @@ private:
 
     std::shared_ptr<SharedState> state_;
     std::thread worker_;
+    std::optional<bool> close_result_{};
 };
 
 } // namespace aa::display
