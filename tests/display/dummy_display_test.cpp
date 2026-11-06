@@ -23,6 +23,7 @@
 
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
 #include "../../tools/dummy-display/pump_timer.hpp"
+#include "../../tools/dummy-display/shutdown_outcome.hpp"
 #include "../../tools/dummy-display/test_control.hpp"
 
 #include <QApplication>
@@ -536,6 +537,59 @@ TEST(DummyDisplayContractRender, TelemetryDrainWaitsForInFlightWrite) {
     sink->release();
     EXPECT_TRUE(writer.drain(std::chrono::seconds{2}));
     EXPECT_TRUE(writer.close(std::chrono::seconds{2}));
+}
+
+TEST(DummyDisplayContractRender, ShutdownBlockedStderrDiagnosticsExitsBoundedAndSilent) {
+    auto sink = std::make_shared<BlockingSinkState>();
+    aa::display::TelemetryWriter diagnostics(blocking_sink(sink), 4);
+    aa::display::TelemetryWriter telemetry([](const std::string&) { return true; });
+    EXPECT_TRUE(diagnostics.enqueue("stopping: Stop failed (busy)\n"));
+    ASSERT_TRUE(sink->wait_entered());
+    EXPECT_TRUE(telemetry.enqueue("{\"event\":\"ok\"}"));
+
+    std::vector<std::string> reported;
+    const auto before = std::chrono::steady_clock::now();
+    const int outcome = aa::display::shutdown::finish(
+        0, diagnostics, telemetry, [&](const std::string& line) { reported.push_back(line); },
+        std::chrono::milliseconds{50});
+    EXPECT_EQ(outcome, aa::display::shutdown::kSinkTimedOut);
+    EXPECT_TRUE(reported.empty());  // stderr is stuck: write nothing more
+    EXPECT_LT(std::chrono::steady_clock::now() - before, std::chrono::milliseconds{500});
+    sink->release();
+}
+
+TEST(DummyDisplayContractRender, ShutdownFailedStderrDiagnosticsChangesExitStatus) {
+    aa::display::TelemetryWriter diagnostics([](const std::string&) { return false; }, 4);
+    aa::display::TelemetryWriter telemetry([](const std::string&) { return true; });
+    EXPECT_TRUE(diagnostics.enqueue("stopping: Stop failed (busy)\n"));
+    EXPECT_TRUE(telemetry.enqueue("{\"event\":\"ok\"}"));
+
+    std::vector<std::string> reported;
+    const auto report = [&](const std::string& line) { reported.push_back(line); };
+    EXPECT_EQ(aa::display::shutdown::finish(0, diagnostics, telemetry, report),
+              aa::display::shutdown::kEventsUndelivered);
+    ASSERT_EQ(reported.size(), 1U);
+    EXPECT_NE(reported[0].find("diagnostic line(s) undelivered"), std::string::npos);
+
+    // A failing event loop keeps its own status.
+    aa::display::TelemetryWriter diagnostics2([](const std::string&) { return false; }, 4);
+    aa::display::TelemetryWriter telemetry2([](const std::string&) { return true; });
+    EXPECT_TRUE(diagnostics2.enqueue("x\n"));
+    EXPECT_EQ(aa::display::shutdown::finish(2, diagnostics2, telemetry2, report), 2);
+}
+
+TEST(DummyDisplayContractRender, ShutdownHealthyWritersKeepOutcome) {
+    std::vector<std::string> lines;
+    aa::display::TelemetryWriter diagnostics(
+        [&](const std::string& line) { lines.push_back(line); return true; }, 4);
+    aa::display::TelemetryWriter telemetry([](const std::string&) { return true; });
+    EXPECT_TRUE(diagnostics.enqueue("stopping: Stop failed (busy)\n"));
+    std::vector<std::string> reported;
+    EXPECT_EQ(aa::display::shutdown::finish(0, diagnostics, telemetry,
+                                            [&](const std::string& l) { reported.push_back(l); }),
+              0);
+    EXPECT_TRUE(reported.empty());
+    EXPECT_EQ(lines.size(), 1U);
 }
 
 TEST(DummyDisplayContractRender, TelemetrySaturatedQueueWithBlockedSinkDoesNotBlockPainting) {

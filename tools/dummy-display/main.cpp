@@ -13,6 +13,7 @@
 
 #include "ProjectionWidget.hpp"
 #include "pump_timer.hpp"
+#include "shutdown_outcome.hpp"
 #include "test_control.hpp"
 
 #include <QApplication>
@@ -316,19 +317,8 @@ int main(int argc, char** argv) {
     }
     widget.set_telemetry_writer(nullptr);
     errors->attach(nullptr);
-    static_cast<void>(diagnostics.close());
-    if (!telemetry.close()) {
-        if (telemetry.timed_out()) {
-            // The stdout sink never returned; write nothing more (stderr may
-            // share its destination) and signal it through the exit code.
-            outcome = 3;
-        } else {
-            std::fprintf(stderr, "aa-dummy-display: %zu telemetry event(s) undelivered\n",
-                         telemetry.undelivered());
-            if (outcome == 0) {
-                outcome = 1;
-            }
-        }
-    }
-    return outcome;
+    return aa::display::shutdown::finish(outcome, diagnostics, telemetry,
+                                         [](const std::string& line) {
+                                             std::fputs(line.c_str(), stderr);
+                                         });
 }
