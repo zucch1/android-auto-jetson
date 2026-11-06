@@ -2,6 +2,7 @@
 #pragma once
 
 #include <aa/display/Display.hpp>
+#include <aa/display/TelemetryWriter.hpp>
 
 #include <QImage>
 #include <QRect>
@@ -67,6 +68,10 @@ public:
     // bypasses the D-Bus contract (the app's wiring calls the contract).
     void set_projection_control(ProjectionControl* control) noexcept;
 
+    // Presentation telemetry goes through this writer so the GUI thread never
+    // blocks on stdout. Null keeps the direct stdout write (tests).
+    void set_telemetry_writer(TelemetryWriter* writer) noexcept;
+
     // Local view controls (never forwarded to the input seam): F1 toggles the
     // diagnostics HUD and F11 toggles full screen.
     [[nodiscard]] bool hud_visible() const noexcept;
@@ -102,6 +107,7 @@ private:
 
     InputSink& input_;
     ProjectionControl* control_{nullptr};
+    TelemetryWriter* telemetry_writer_{nullptr};
     QImage frame_{};
     std::vector<std::uint8_t> pending_{};
     DisplayState state_{DisplayState::unavailable};

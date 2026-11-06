@@ -8,6 +8,7 @@
 // (task 24 F3, execution-input-transport-decision.json) to the receiver's
 // endpoint; the D-Bus contract stays control-only.
 #include <aa/display/Display.hpp>
+#include <aa/display/TelemetryWriter.hpp>
 #include <aa/ipc/InputChannel.hpp>
 
 #include "ProjectionWidget.hpp"
@@ -211,19 +212,20 @@ int main(int argc, char** argv) {
     config.consumer_name = aa::ipc::BusName{"org.custom.DummyDisplay1"};
     config.viewport = aa::ipc::Viewport{1280, 720, 160};
     config.caps = aa::protocol::VideoProfile{1280, 720, 30};
-    config.on_video_endpoint = [](const aa::ipc::VideoEndpoint& event) {
-        const auto line = aa::ipc::video_endpoint_json(event);
-        std::puts(line.c_str());
-        std::fflush(stdout);
+    // Endpoint, decode and presentation telemetry is written by a background
+    // thread: a slow stdout write must never stall the GUI thread that pumps,
+    // decodes and paints (a stalled GUI thread shows up as a frozen display).
+    aa::display::TelemetryWriter telemetry;
+    config.on_video_endpoint = [&telemetry](const aa::ipc::VideoEndpoint& event) {
+        static_cast<void>(telemetry.enqueue(aa::ipc::video_endpoint_json(event)));
     };
-    config.on_decode_completion = [](const aa::consumer::DecodeCompletion& event) {
-        const auto line = aa::consumer::decode_completion_json(event);
-        std::puts(line.c_str());
-        std::fflush(stdout);
+    config.on_decode_completion = [&telemetry](const aa::consumer::DecodeCompletion& event) {
+        static_cast<void>(telemetry.enqueue(aa::consumer::decode_completion_json(event)));
     };
 
     aa::display::qt_adapter::ProjectionWidget widget(sender, config.caps);
     g_widget = &widget;
+    widget.set_telemetry_writer(&telemetry);
     widget.set_status(DisplayState::unavailable);
 
     auto client = aa::ipc::ControlBusClient::connect();
@@ -260,7 +262,15 @@ int main(int argc, char** argv) {
     // starts never pumps video into the helper or presents frames).
     auto pump_timer = std::make_unique<QTimer>();
     aa::display::pump::configure(*pump_timer);
-    QObject::connect(pump_timer.get(), &QTimer::timeout, [errors] {
+    QObject::connect(pump_timer.get(), &QTimer::timeout,
+                     [errors, &telemetry, &widget, telemetry_reported = false]() mutable {
+        // A full queue or failed write loses measurement events: surface it
+        // once instead of running on silently.
+        if (!telemetry_reported && telemetry.failed()) {
+            telemetry_reported = true;
+            errors->report("telemetry", aa::ErrorCode::diagnostics_sink_failed);
+            widget.set_error("telemetry failure: events undelivered");
+        }
         if (g_controller.has_value()) {
             const auto pumped = g_controller->pump(aa::core::Milliseconds{0});
             if (!pumped.has_value()) {
@@ -283,11 +293,20 @@ int main(int argc, char** argv) {
     }
 
     widget.show();
-    const int outcome = app.exec();
+    int outcome = app.exec();
     pump_timer->stop();
     if (g_controller.has_value()) {
         g_controller->shutdown();
         g_controller.reset();
+    }
+    widget.set_telemetry_writer(nullptr);
+    if (!telemetry.close()) {
+        errors->report("telemetry", aa::ErrorCode::diagnostics_sink_failed);
+        std::fprintf(stderr, "aa-dummy-display: %zu telemetry event(s) undelivered\n",
+                     telemetry.undelivered());
+        if (outcome == 0) {
+            outcome = 1;
+        }
     }
     return outcome;
 }
