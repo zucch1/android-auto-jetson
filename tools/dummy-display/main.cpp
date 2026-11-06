@@ -29,8 +29,12 @@ namespace {
 
 using aa::display::DisplayState;
 
+// display_error lines go through the telemetry writer once it is attached, so
+// runtime error reporting on the GUI thread never waits on stdout either.
 class ErrorReporter final {
 public:
+    void attach(aa::display::TelemetryWriter* writer) noexcept { writer_ = writer; }
+
     void begin_attempt() {
         emitted_ = 0;
         last_.reset();
@@ -51,11 +55,16 @@ public:
         line.append("\",\"code\":\"");
         line.append(code_str);
         line.append("\"}");
+        if (writer_ != nullptr) {
+            static_cast<void>(writer_->enqueue(std::move(line)));
+            return;
+        }
         std::puts(line.c_str());
         std::fflush(stdout);
     }
 
 private:
+    aa::display::TelemetryWriter* writer_{nullptr};
     unsigned emitted_{0};
     std::optional<std::pair<std::string_view, aa::ErrorCode>> last_{};
 };
@@ -216,6 +225,7 @@ int main(int argc, char** argv) {
     // thread: a slow stdout write must never stall the GUI thread that pumps,
     // decodes and paints (a stalled GUI thread shows up as a frozen display).
     aa::display::TelemetryWriter telemetry;
+    errors->attach(&telemetry);
     config.on_video_endpoint = [&telemetry](const aa::ipc::VideoEndpoint& event) {
         static_cast<void>(telemetry.enqueue(aa::ipc::video_endpoint_json(event)));
     };
@@ -300,13 +310,18 @@ int main(int argc, char** argv) {
         g_controller.reset();
     }
     widget.set_telemetry_writer(nullptr);
+    errors->attach(nullptr);
     if (!telemetry.close()) {
-        // stderr, not the display_error stdout line: a worker detached while
-        // blocked in a stdout write may still hold the stdout stream lock.
-        std::fprintf(stderr, "aa-dummy-display: %zu telemetry event(s) undelivered\n",
-                     telemetry.undelivered());
-        if (outcome == 0) {
-            outcome = 1;
+        if (telemetry.timed_out()) {
+            // The stdout sink never returned; write nothing more (stderr may
+            // share its destination) and signal it through the exit code.
+            outcome = 3;
+        } else {
+            std::fprintf(stderr, "aa-dummy-display: %zu telemetry event(s) undelivered\n",
+                         telemetry.undelivered());
+            if (outcome == 0) {
+                outcome = 1;
+            }
         }
     }
     return outcome;

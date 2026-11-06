@@ -91,15 +91,16 @@ public:
             // A sink that never returns cannot be joined safely. Detach only
             // after the worker owns its own shared_ptr to the shared state.
             state_->failed = true;
-            const std::size_t undelivered = state_->queue.size() + 1;
-            state_->undelivered_count += undelivered;
+            state_->undelivered_count += state_->queue.size() + 1;
             state_->queue.clear();
             lock.unlock();
             if (worker_.joinable()) {
                 worker_.detach();
             }
-            std::fputs(("aa-dummy-display: telemetry writer shutdown timed out with " +
-                        std::to_string(undelivered) + " undelivered event(s)\n").c_str(), stderr);
+            // No diagnostic write here: the stuck sink may share its
+            // destination with stderr, and shutdown must stay bounded.
+            // Callers learn of this through timed_out().
+            timed_out_ = true;
             close_result_ = false;
             return false;
         }
@@ -123,6 +124,10 @@ public:
             return state->failed || (state->queue.empty() && !state->in_flight);
         }) && !state_->failed;
     }
+
+    // True when close() gave up on a sink that never returned and detached
+    // the worker: that destination is unusable for any further output.
+    [[nodiscard]] bool timed_out() const noexcept { return timed_out_; }
 
     [[nodiscard]] bool failed() const {
         if (!state_) {
@@ -206,6 +211,7 @@ private:
     std::shared_ptr<SharedState> state_;
     std::thread worker_;
     std::optional<bool> close_result_{};
+    bool timed_out_{false};
 };
 
 } // namespace aa::display

@@ -476,10 +476,14 @@ TEST(DummyDisplayContractRender, TelemetryBlockedShutdownBoundedWithoutMemoryErr
     // Bounded shutdown: close with a short timeout, then destroy; the
     // destructor's close() must not wait again (close is idempotent).
     const auto before_close = std::chrono::steady_clock::now();
+    testing::internal::CaptureStderr();
     EXPECT_FALSE(writer->close(std::chrono::milliseconds{50}));
     EXPECT_FALSE(writer->close(std::chrono::seconds{5}));
+    EXPECT_TRUE(writer->timed_out());
     EXPECT_GT(writer->undelivered(), 0U);
     writer.reset();
+    // The timed-out path writes nothing: stderr may share the stuck sink.
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
     EXPECT_LT(std::chrono::steady_clock::now() - before_close, std::chrono::milliseconds{500});
 
     // The detached worker wakes after the writer is gone; it owns its state
@@ -528,6 +532,7 @@ TEST(DummyDisplayContractRender, TelemetrySaturatedQueueWithBlockedSinkDoesNotBl
     widget.set_telemetry_writer(nullptr);
     sink->release();
     EXPECT_FALSE(writer.close(std::chrono::seconds{2}));
+    EXPECT_FALSE(writer.timed_out());
 }
 
 struct FrameRecord final {
