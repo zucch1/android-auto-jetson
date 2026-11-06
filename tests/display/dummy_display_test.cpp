@@ -23,6 +23,7 @@
 
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
 #include "../../tools/dummy-display/pump_timer.hpp"
+#include "../../tools/dummy-display/test_control.hpp"
 
 #include <QApplication>
 #include <QElapsedTimer>
@@ -489,6 +490,40 @@ TEST(DummyDisplayContractRender, TelemetryBlockedShutdownBoundedWithoutMemoryErr
     // The detached worker wakes after the writer is gone; it owns its state
     // and the sink's, so this must be clean under ASan.
     sink->release();
+}
+
+TEST(DummyDisplayContractRender, TestControlRepliesGoThroughWriterWithoutBlocking) {
+    static_cast<void>(qt_app());
+    CountingInputSink input;
+    aa::display::qt_adapter::ProjectionWidget widget(input, VideoProfile{2, 2, 30});
+    auto sink_state = std::make_shared<BlockingSinkState>();
+    std::vector<std::string> seen;
+    std::mutex seen_mutex;
+    auto sink = [sink_state, &seen, &seen_mutex](const std::string& line) -> bool {
+        {
+            std::lock_guard lock(seen_mutex);
+            seen.push_back(line);
+        }
+        return blocking_sink(sink_state)(line);
+    };
+    aa::display::TelemetryWriter writer(sink);
+    const int stdin_flags = ::fcntl(0, F_GETFL, 0);
+    {
+        // The channel announces itself on construction; with stdout stuck
+        // that must still return at once (the reply is only queued).
+        const auto before = std::chrono::steady_clock::now();
+        aa::display::testcontrol::Channel channel(widget, nullptr, &writer);
+        EXPECT_LT(std::chrono::steady_clock::now() - before, std::chrono::milliseconds{100});
+        ASSERT_TRUE(sink_state->wait_entered());
+    }
+    if (stdin_flags >= 0) {
+        static_cast<void>(::fcntl(0, F_SETFL, stdin_flags));
+    }
+    sink_state->release();
+    EXPECT_TRUE(writer.close(std::chrono::seconds{2}));
+    std::lock_guard lock(seen_mutex);
+    ASSERT_EQ(seen.size(), 1U);
+    EXPECT_EQ(seen[0], "{\"event\":\"ready\"}\n");
 }
 
 TEST(DummyDisplayContractRender, TelemetryDrainWaitsForInFlightWrite) {

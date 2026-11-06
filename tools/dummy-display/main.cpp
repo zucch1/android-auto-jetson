@@ -96,9 +96,10 @@ public:
 
 private:
     // Captures the result, refreshes the state text and reports a typed
-    // failure ("<state>: <Operation> failed (<code>)") on stderr and through
-    // the widget error setter; a successful recovery clears the error while
-    // the success-state text stays owned by set_status().
+    // failure ("<state>: <Operation> failed (<code>)") as display_error
+    // telemetry and through the widget error setter; a successful recovery
+    // clears the error while the success-state text stays owned by
+    // set_status(). Nothing is written to a stream here (GUI thread).
     void report(const char* operation, const aa::core::Result<void>& result) {
         widget_.set_status(controller_->state());
         if (result.has_value()) {
@@ -113,8 +114,6 @@ private:
         message.reserve(state.size() + code.size() + 32);
         message.append(state).append(": ").append(operation).append(" failed (");
         message.append(code).append(")");
-        std::fputs(message.c_str(), stderr);
-        std::fputc('\n', stderr);
         widget_.set_error(message);
     }
 
@@ -299,7 +298,8 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<aa::display::testcontrol::Channel> control{};
     if (test_control_stdin) {
-        control = std::make_unique<aa::display::testcontrol::Channel>(widget, probe_status);
+        control = std::make_unique<aa::display::testcontrol::Channel>(widget, probe_status,
+                                                                      &telemetry);
     }
 
     widget.show();
