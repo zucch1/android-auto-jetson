@@ -31,8 +31,15 @@ The planned merge gate consists of three exact, stable contexts:
 | `ci/arm64-cross-build` | Provisioned private companion workflow; not a public job (see below) |
 
 `.github/workflows/ci.yml` runs the three independent nonmatrix public jobs on pull
-requests targeting `main` or `aa/**`, and pushes to those branches. There are no
-path filters that could silently omit a required context. Both jobs use only
+requests targeting `main` or `aa/**`, on pushes to `main`, nightly on `main`, and on
+manual `workflow_dispatch`. Pushes to `aa/**` branches start no separate run: the
+PR run already reports every required context on the head commit, and a newer push
+to the same PR cancels the superseded PR run. There are no workflow path filters
+that could silently omit a required context. Inside `ci/host-build-test`, PR runs
+skip only the 600 s `ipc-bench-happy-600` throughput gate unless the PR touches
+`tools/aa-ipc-bench/`, `tests/ipc/` or `CMakePresets.json`; every other test runs
+on every PR, and the gate runs on every push to `main`, nightly and on dispatch, so
+an unrelated IPC throughput regression is caught right after merge, not before. Both jobs use only
 `contents: read`, a full-commit-pinned checkout with credential persistence
 disabled, and no artifact upload or cache actions.
 

@@ -1,13 +1,26 @@
 name: CI
 
+# One run per commit: PR branches (including stacked `aa/**` bases) are
+# covered by `pull_request` alone, and `push` is limited to `main`. A push to
+# an `aa/**` PR branch used to start a second, identical `push` run.
 on:
   pull_request:
     branches: [main, 'aa/**']
   push:
-    branches: [main, 'aa/**']
+    branches: [main]
+  schedule:
+    # Nightly full run on main, including the ipc-bench-happy-600 gate.
+    - cron: '23 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# A newer push to the same PR cancels the superseded PR run. Runs on main
+# (push, schedule, dispatch) each get a unique group and are never cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -128,6 +141,8 @@ jobs:
       - name: Configure, build and qualify native AASDK and host foundation
         env:
           AA_GOOGLETEST_ARCHIVE: ${{ runner.temp }}/googletest-v1.15.2.tar.gz
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/opencode
@@ -143,11 +158,38 @@ jobs:
           # is missing or a run claims SKIPPED.
           ctest --test-dir build/host-dev --no-tests=error --output-on-failure -V \
             -R '^input_sensors_memory$' -j 1
-          # Unfiltered host-dev run intentionally includes the ipc-bench-happy-600 gate,
-          # which adds ~10 minutes; the job timeout above accounts for this explicitly.
           # input_sensors_memory is excluded here: it already ran above (avoid a double
           # memcheck pass), and its sentinel semantics are qualified by that step.
-          ctest --preset host-dev --output-on-failure -E '^input_sensors_memory$'
+          exclude='^input_sensors_memory$'
+          # ipc-bench-happy-600 is the 600 s IPC throughput gate (~10 minutes). It runs
+          # on every push to main, nightly, and on workflow_dispatch. Pull requests skip
+          # it unless they touch the benchmark's own sources (tools/aa-ipc-bench/,
+          # tests/ipc/) or the build presets; if the diff cannot be computed it runs.
+          # Every other test, including input_sensors_memory above, runs on every PR.
+          bench='run'
+          if [ "$GITHUB_EVENT_NAME" = 'pull_request' ]; then
+            if changed="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"; then
+              # Here-string, not a pipe: with pipefail, an early `grep -q` exit can
+              # SIGPIPE the writer and flip the result.
+              if ! grep -Eq '^(tools/aa-ipc-bench/|tests/ipc/|CMakePresets\.json$)' <<<"$changed"; then
+                bench='deferred'
+                exclude='^(input_sensors_memory|ipc-bench-happy-600)$'
+              fi
+            else
+              echo '::warning::PR diff unavailable; running ipc-bench-happy-600'
+            fi
+          fi
+          echo "ipc-bench-happy-600: $bench (event: $GITHUB_EVENT_NAME)"
+          {
+            echo '## ci/host-build-test'
+            echo
+            if [ "$bench" = 'deferred' ]; then
+              echo '- `ipc-bench-happy-600`: deferred to the post-merge run on `main` and the nightly run (PR does not touch tools/aa-ipc-bench/, tests/ipc/ or CMakePresets.json).'
+            else
+              echo '- `ipc-bench-happy-600`: ran in this job.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          ctest --preset host-dev --output-on-failure -E "$exclude"
 
   decode-overlay-cross:
     name: ci/decode-overlay-cross
