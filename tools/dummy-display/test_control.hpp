@@ -10,6 +10,7 @@
 // surface (no production UI/settings/app-host scope, task 44 owns that).
 
 #include <aa/display/Display.hpp>
+#include <aa/display/TelemetryWriter.hpp>
 
 #include "ProjectionWidget.hpp"
 
@@ -50,8 +51,11 @@ class Channel final {
 public:
     using StatusProbe = Status (*)();
 
-    Channel(qt_adapter::ProjectionWidget& widget, StatusProbe probe)
-        : widget_(widget), probe_(probe) {
+    // Replies go through `writer` when given, so a stalled stdout never
+    // blocks the GUI event loop that dispatches these commands.
+    Channel(qt_adapter::ProjectionWidget& widget, StatusProbe probe,
+            TelemetryWriter* writer = nullptr)
+        : widget_(widget), probe_(probe), writer_(writer) {
         const int flags = ::fcntl(0, F_GETFL, 0);
         if (flags >= 0) {
             static_cast<void>(::fcntl(0, F_SETFL, flags | O_NONBLOCK));
@@ -93,7 +97,11 @@ private:
         return 0;
     }
 
-    static void write_line(const std::string& line) {
+    void write_line(const std::string& line) {
+        if (writer_ != nullptr) {
+            static_cast<void>(writer_->enqueue(line));
+            return;
+        }
         const std::string out = line + "\n";
         std::size_t off = 0;
         while (off < out.size()) {
@@ -245,6 +253,7 @@ private:
 
     qt_adapter::ProjectionWidget& widget_;
     StatusProbe probe_{nullptr};
+    TelemetryWriter* writer_{nullptr};
     QTimer poll_{};
     std::string buffer_{};
 };
