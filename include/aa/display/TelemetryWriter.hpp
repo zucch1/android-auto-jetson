@@ -24,6 +24,11 @@ inline bool default_stdout_sink(const std::string& line) {
     return std::fflush(stdout) == 0;
 }
 
+// Same for stderr (unbuffered, so no flush), for human-readable diagnostics.
+inline bool default_stderr_sink(const std::string& line) {
+    return std::fputs(line.c_str(), stderr) != EOF;
+}
+
 // Single-owner bounded writer for line-oriented diagnostic telemetry. Producers
 // only take the queue mutex; the sink is exclusively called by the worker, so a
 // producer (the GUI thread) never waits on stdout. A full queue or failed write
