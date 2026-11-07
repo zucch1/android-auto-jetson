@@ -14,8 +14,8 @@ what that gate runs:
     properties other than the CMake backtrace).
 
 Identical fingerprints mean the PR cannot change the benchmark as built and
-run, so the gate is deferred to main/nightly. Any difference, or any error,
-means the gate runs. Exit status: 0 = defer, 1 = run, 2 = error (run).
+run, so the gate is deferred to the post-merge run on main. Any difference, or
+any error, means the gate runs. Exit status: 0 = defer, 1 = run, 2 = error (run).
 """
 import argparse
 import hashlib
