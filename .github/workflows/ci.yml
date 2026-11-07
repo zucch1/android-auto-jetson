@@ -1,13 +1,24 @@
 name: CI
 
+# One run per commit: PR branches (including stacked `aa/**` bases) are
+# covered by `pull_request` alone, and `push` is limited to `main`. A push to
+# an `aa/**` PR branch used to start a second, identical `push` run.
 on:
   pull_request:
     branches: [main, 'aa/**']
   push:
-    branches: [main, 'aa/**']
+    branches: [main]
+  # Manual full run (including ipc-bench-happy-600) on any branch.
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# A newer push to the same PR cancels the superseded PR run. Runs on main
+# pushes and dispatches each get a unique group and are never cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -128,6 +139,7 @@ jobs:
       - name: Configure, build and qualify native AASDK and host foundation
         env:
           AA_GOOGLETEST_ARCHIVE: ${{ runner.temp }}/googletest-v1.15.2.tar.gz
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/opencode
@@ -143,11 +155,50 @@ jobs:
           # is missing or a run claims SKIPPED.
           ctest --test-dir build/host-dev --no-tests=error --output-on-failure -V \
             -R '^input_sensors_memory$' -j 1
-          # Unfiltered host-dev run intentionally includes the ipc-bench-happy-600 gate,
-          # which adds ~10 minutes; the job timeout above accounts for this explicitly.
           # input_sensors_memory is excluded here: it already ran above (avoid a double
           # memcheck pass), and its sentinel semantics are qualified by that step.
-          ctest --preset host-dev --output-on-failure -E '^input_sensors_memory$'
+          exclude='^input_sensors_memory$'
+          # ipc-bench-happy-600 is the 600 s IPC throughput gate (~10 minutes). It runs
+          # on every push to main and on workflow_dispatch. On a pull request
+          # it runs unless tools/ci/ipc_bench_gate.py proves the PR leaves the benchmark
+          # unchanged: it configures the PR base in a scratch worktree and compares the
+          # bench sources, every ninja command that builds aa-ipc-bench (flags, defines,
+          # link line) and the test registration against this merge result. Any
+          # difference or error runs the gate. Every other test, including
+          # input_sensors_memory above, runs on every PR. A PR that edits this
+          # workflow always runs the gate: both trees are configured under the PR's
+          # runner image and provisioning, so an environment change (image, apt
+          # packages, system libraries) would not show up in the comparison.
+          bench='run'
+          if [ "$GITHUB_EVENT_NAME" = 'pull_request' ]; then
+            base_tree="$RUNNER_TEMP/ipc-bench-base"
+            if ! git diff --quiet "$PR_BASE_SHA" HEAD -- .github/workflows/ci.yml; then
+              echo 'ipc-bench-gate RUN: .github/workflows/ci.yml differs from the PR base (or the diff failed)'
+            elif git worktree add --detach "$base_tree" "$PR_BASE_SHA" \
+                && (cd "$base_tree" && cmake --preset host-dev \
+                      -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE" -DBUILD_TESTING=ON \
+                      >"$RUNNER_TEMP/ipc-bench-base-configure.log" 2>&1) \
+                && python3 -B tools/ci/ipc_bench_gate.py \
+                      --base-src "$base_tree" --base-build "$base_tree/build/host-dev" \
+                      --head-src "$PWD" --head-build build/host-dev; then
+              bench='deferred'
+              exclude='^(input_sensors_memory|ipc-bench-happy-600)$'
+            else
+              tail -n 20 "$RUNNER_TEMP/ipc-bench-base-configure.log" 2>/dev/null || true
+            fi
+            git worktree remove --force "$base_tree" 2>/dev/null || true
+          fi
+          echo "ipc-bench-happy-600: $bench (event: $GITHUB_EVENT_NAME)"
+          {
+            echo '## ci/host-build-test'
+            echo
+            if [ "$bench" = 'deferred' ]; then
+              echo '- `ipc-bench-happy-600`: deferred to the post-merge run on `main` (sources, build commands and registration identical to the PR base).'
+            else
+              echo '- `ipc-bench-happy-600`: ran in this job.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          ctest --preset host-dev --output-on-failure -E "$exclude"
 
   decode-overlay-cross:
     name: ci/decode-overlay-cross
