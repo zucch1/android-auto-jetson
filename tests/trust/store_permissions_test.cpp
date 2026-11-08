@@ -316,4 +316,54 @@ TEST(StorePermissions, SymlinkedParentCannotLoadAnExistingStore) {
     EXPECT_EQ(mode_of(target), 0755);  // the failed load must NOT mutate the target
 }
 
+// Independent-validation hardening (2026-11-06): the two cases above pin a
+// symlink at the store's IMMEDIATE parent. create_missing_ancestors() walks the
+// path with lstat/mkdir/open by PATH, so a symlink at an intermediate
+// component (e.g. `state -> elsewhere`) is followed: the receiver would create
+// `<component>/android-auto-receiver/` and the store inside the symlink target,
+// i.e. outside the intended state tree, contradicting the header contract that
+// the write path is symlink-safe and anchored on verified descriptors.
+TEST(StorePermissions, IntermediateSymlinkComponentCannotRedirectTheWrite) {
+    test::TempStoreDir dir;
+    const auto outside = dir.dir() / "outside";
+    std::filesystem::create_directories(outside);
+    const auto state = dir.dir() / "state";
+    ASSERT_EQ(::symlink(outside.c_str(), state.c_str()), 0);
+
+    // The receiver does not exist yet below the symlinked component, so it is
+    // create_missing_ancestors() (not open_verified_parent) that would follow it.
+    const auto store_path = state / "android-auto-receiver" / "approved-phones.json";
+    const auto written = trust::detail::write_file_private(store_path, "{\"schema_version\":2}");
+
+    EXPECT_FALSE(written.has_value()) << "an intermediate symlink must refuse the write";
+    EXPECT_FALSE(std::filesystem::exists(outside / "android-auto-receiver"))
+        << "the failed write must not create directories inside the symlink target";
+    EXPECT_FALSE(std::filesystem::exists(outside / "android-auto-receiver" / "approved-phones.json"));
+}
+
+TEST(StorePermissions, IntermediateSymlinkComponentCannotLoadAnExteriorStore) {
+    test::TempStoreDir dir;
+    const auto outside = dir.dir() / "outside";
+    std::filesystem::create_directories(outside / "android-auto-receiver");
+    const auto planted = outside / "android-auto-receiver" / "approved-phones.json";
+    {
+        std::ofstream out{planted};
+        out << "{\"schema_version\":2,\"next_phone_id\":2,\"phones\":["
+               "{\"phone_id\":1,\"identity\":{\"kind\":\"opaque\",\"key\":\"approved-key\"}}]}";
+    }
+    ASSERT_EQ(::chmod(planted.c_str(), 0600), 0);
+
+    const auto state = dir.dir() / "state";
+    ASSERT_EQ(::symlink(outside.c_str(), state.c_str()), 0);
+    const auto store_path = state / "android-auto-receiver" / "approved-phones.json";
+
+    const auto text = trust::detail::read_file(store_path);
+    EXPECT_FALSE(text.has_value())
+        << "an intermediate symlink must not redirect the store read outside the state tree";
+
+    trust::ApprovedPhoneStore store{store_path};
+    EXPECT_FALSE(store.load().has_value());
+    EXPECT_EQ(store.lookup(trust::PhoneIdentity{"approved-key"}), trust::Decision::unknown);
+}
+
 } // namespace
