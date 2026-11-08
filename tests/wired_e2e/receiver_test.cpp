@@ -5726,3 +5726,23 @@ TEST(WiredReceiver, RealGstMidStreamStallRecoversToRealTime) {
     EXPECT_EQ(run.late_after_recovery, 0U);
     EXPECT_LE(run.tail_sink_lag, 20'000'000);
 }
+
+// #60: the receiver routes through pulsesink by default (pipewiresink streams
+// degrade after ~1.5-2.3 h on this host's PipeWire 1.0.5 plugin); the flag
+// restores pipewiresink or the automatic choice.
+TEST(WiredReceiver, AudioSinkDefaultsToPulseAndFlagSelectsBackend) {
+    EXPECT_EQ(pcm_router_config().backend, aa::audio::SinkBackend::pulse);
+    EXPECT_EQ(pcm_router_config(aa::audio::SinkBackend::pipewire).backend,
+              aa::audio::SinkBackend::pipewire);
+    EXPECT_EQ(pcm_router_config(aa::audio::SinkBackend::automatic).backend,
+              aa::audio::SinkBackend::automatic);
+}
+
+TEST(WiredReceiver, InvalidOrMissingAudioSinkValueIsUsageError) {
+    std::string executable = "receiver", port_flag = "--port", port = "1-2.1";
+    std::string sink_flag = "--audio-sink", bad = "alsa";
+    char *invalid[]{executable.data(), port_flag.data(), port.data(), sink_flag.data(), bad.data()};
+    EXPECT_EQ(receiver_main(5, invalid), 2);
+    char *missing[]{executable.data(), port_flag.data(), port.data(), sink_flag.data()};
+    EXPECT_EQ(receiver_main(4, missing), 2);
+}

@@ -1448,6 +1448,17 @@ SinkOpenOutcome open_default_sink(const SinkOpenRequest& request) {
     // the control pipeline (`gst-launch audiotestsrc is-live ... ! pipewiresink`)
     // whose render handoffs are observable.
     g_object_set(sink, "sync", TRUE, "async", TRUE, nullptr);
+    if (std::string_view{selection.element} == "pulsesink") {
+        // #60. latency-time: one 1024-frame PipeWire quantum per ring-buffer
+        // segment, the value the 150 min host probe ran clean with;
+        // buffer-time stays at the element default (200 ms), queued after the
+        // measured write-completion endpoint. provide-clock=FALSE: with the
+        // pulse clock as pipeline clock, sync=TRUE renders ran 0.3-0.4 s
+        // behind the write schedule (RealGstSustainedCadence*); on the system
+        // clock the lag matches pipewiresink (~2 ms).
+        g_object_set(sink, "latency-time", static_cast<gint64>(21333), "provide-clock", FALSE,
+                     nullptr);
+    }
 
     if (!request.target.empty()) {
         // Connection-target override (pulsesink `server`, pipewiresink
