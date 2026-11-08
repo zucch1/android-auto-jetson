@@ -3999,6 +3999,7 @@ struct CadencedGstObservation {
     std::vector<std::int64_t> scheduled_at;
     std::vector<std::int64_t> returned_at;
     std::vector<bool> succeeded;
+    std::vector<std::optional<std::int64_t>> playback_slot_at;
 };
 
 class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
@@ -4044,6 +4045,8 @@ class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
         auto result = sink_->write(chunk);
         observation_.returned_at.push_back(steady_ns());
         observation_.succeeded.push_back(result.has_value());
+        const auto slot = sink_->last_playback_slot();
+        observation_.playback_slot_at.push_back(slot ? std::optional{slot->count} : std::nullopt);
         return result;
     }
     aa::core::Result<void> drain(Milliseconds timeout) override {
@@ -4053,6 +4056,9 @@ class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
     }
     aa::audio::SinkProbeStats probe_stats() const override { return sink_->probe_stats(); }
     aa::audio::RenderBarrierStats render_stats() const override { return sink_->render_stats(); }
+    std::optional<aa::core::Nanoseconds> last_playback_slot() const override {
+        return sink_->last_playback_slot();
+    }
   private:
     std::unique_ptr<aa::audio::detail::ObservedAudioSink> sink_;
     CadencedGstObservation &observation_;
@@ -5654,6 +5660,9 @@ struct SustainedRun {
     std::size_t late_after_recovery = 0; // writes > 50 ms late once 2 s past the hold
     std::int64_t phone_lag = 0;
     std::int64_t tail_sink_lag = 0;      // max lateness over the final half
+    std::size_t slots_missing = 0;       // successful writes without a playback slot
+    std::int64_t tail_presented_lag = 0; // max(handoff, slot) - scheduled, final half
+    bool presented_logged = false;
     bool held = false;
 };
 
@@ -5696,11 +5705,20 @@ SustainedRun run_sustained(std::size_t chunks, int hold_ms, std::size_t hold_aft
     for (std::size_t i = 0; i < run.writes; ++i) {
         const auto lag = observed.returned_at[i] - observed.scheduled_at[i];
         if (i >= run.writes / 2) { run.tail_sink_lag = std::max(run.tail_sink_lag, lag); }
+        const auto &slot = observed.playback_slot_at[i];
+        if (observed.succeeded[i] && !slot) { ++run.slots_missing; }
+        if (slot && i >= run.writes / 2) {
+            run.tail_presented_lag = std::max(run.tail_presented_lag,
+                std::max(*slot, observed.returned_at[i]) - observed.scheduled_at[i]);
+        }
         if ((!run.held || observed.write_at[i] > settle) && lag > 50'000'000) { ++run.late_after_recovery; }
     }
     std::cout << "SUSTAINED hold_ms=" << hold_ms << " writes=" << run.writes << " late_after_recovery="
               << run.late_after_recovery << " phone_lag_us=" << run.phone_lag / 1000
-              << " tail_sink_lag_us=" << run.tail_sink_lag / 1000 << '\n';
+              << " tail_sink_lag_us=" << run.tail_sink_lag / 1000
+              << " tail_presented_lag_us=" << run.tail_presented_lag / 1000
+              << " slots_missing=" << run.slots_missing << '\n';
+    run.presented_logged = result.output.find("\"presented_ns\":") != std::string::npos;
     return run;
 }
 
@@ -5713,6 +5731,11 @@ TEST(WiredReceiver, RealGstSustainedCadenceKeepsPhoneAndSinkRealTime) {
     // A conforming phone is never held back more than one chunk period.
     EXPECT_LE(run.phone_lag, kSustainChunkNs);
     EXPECT_LE(run.tail_sink_lag, 100'000'000);
+    // #60: every acknowledged real write reports when it plays, the receiver
+    // logs it for the A/V gate, and playback stays near the schedule.
+    EXPECT_EQ(run.slots_missing, 0U);
+    EXPECT_TRUE(run.presented_logged);
+    EXPECT_LE(run.tail_presented_lag, 100'000'000);
 }
 
 // Issue 60 (Jetson perf-1800 v4): one transient downstream stall left a

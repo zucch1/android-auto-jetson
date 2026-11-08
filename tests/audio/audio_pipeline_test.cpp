@@ -2324,6 +2324,7 @@ struct RecordingSinkState final {
     bool fail_drain{false};
     bool fail_write{false};
     std::function<void()> during_write{};
+    std::optional<aa::core::Nanoseconds> playback_slot{};
 };
 
 class RecordingAudioSink final : public aa::audio::detail::ObservedAudioSink {
@@ -2350,6 +2351,9 @@ public:
         aa::audio::RenderBarrierStats stats;
         stats.drains_completed = state->drains_completed;
         return stats;
+    }
+    std::optional<aa::core::Nanoseconds> last_playback_slot() const override {
+        return state->playback_slot;
     }
 };
 
@@ -2389,6 +2393,40 @@ TEST_F(AudioPipelineRoute, ExplicitReceiptIncludesQueueWaitWithoutMovingSchedule
     EXPECT_GE(router.value().report().stats.last_path_latency.count, 75'000'000);
     EXPECT_LT(router.value().report().stats.last_completion_skew.count,
               router.value().report().stats.last_path_latency.count);
+}
+
+// #60: the completion carries when the chunk starts playing, max(handoff,
+// the sink's playback slot); a sink without a position reports none.
+TEST_F(AudioPipelineRoute, CompletionPresentedIsLaterOfHandoffAndPlaybackSlot) {
+    const auto scheduled = now_ns();
+    const auto run = [&](std::optional<aa::core::Nanoseconds> slot) {
+        auto sink = std::make_unique<RecordingAudioSink>();
+        sink->state->playback_slot = slot;
+        auto config = pcm_router_config();
+        std::optional<aa::audio::WriteCompletion> completion;
+        config.on_write_completed = [&](const auto& value) { completion = value; };
+        auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+        EXPECT_TRUE(router);
+        const auto pcm = constant_pcm({kMediaLevel, 960});
+        EXPECT_TRUE(router.value().submit(
+            make_message(aa::protocol::ChannelRole::media_audio, 42, scheduled, pcm), scheduled));
+        EXPECT_TRUE(router.value().pump());
+        EXPECT_TRUE(completion);
+        return completion.value_or(aa::audio::WriteCompletion{});
+    };
+    // Committed ahead of playback (pulsesink): presented is the slot.
+    const aa::core::Nanoseconds later{scheduled.count + 3'000'000'000};
+    const auto early = run(later);
+    ASSERT_TRUE(early.presented);
+    EXPECT_LT(early.completed.count, later.count);
+    EXPECT_EQ(early.presented->count, later.count);
+    // Handed off after its slot (a stalled sink): presented is the handoff,
+    // so lateness is never hidden.
+    const auto late = run(aa::core::Nanoseconds{scheduled.count - 3'000'000'000});
+    ASSERT_TRUE(late.presented);
+    EXPECT_EQ(late.presented->count, late.completed.count);
+    // No position reported: no presented time is invented.
+    EXPECT_FALSE(run(std::nullopt).presented);
 }
 
 TEST_F(AudioPipelineRoute, PendingRunRejectionRecordsBoundedOccupancyUntilNextSubmitOrClose) {

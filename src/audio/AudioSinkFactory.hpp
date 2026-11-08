@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace aa::audio::detail {
@@ -58,6 +59,13 @@ public:
     [[nodiscard]] virtual core::Result<void> drain(core::Milliseconds timeout) = 0;
     [[nodiscard]] virtual SinkProbeStats probe_stats() const = 0;
     [[nodiscard]] virtual RenderBarrierStats render_stats() const = 0;
+    // #60 playback endpoint of the last acknowledged write: the steady-clock
+    // time its first sample is due on the sink's own clock, read from the
+    // element's position query right after the handoff. Absent when the
+    // element did not answer (or for sinks without a clock, e.g. test fakes).
+    [[nodiscard]] virtual std::optional<core::Nanoseconds> last_playback_slot() const {
+        return std::nullopt;
+    }
 };
 
 struct SinkOpenRequest final {

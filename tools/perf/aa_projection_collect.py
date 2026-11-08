@@ -256,6 +256,17 @@ class EventParser:
         scheduled, completed = event["scheduled_ns"], event["completed_ns"]
         if audio:
             end = event["scheduled_end_ns"]
+            # Owner-approved 2026-11-08 (#60): audio is "done" when it starts
+            # playing on the sink's clock (presented_ns), not at the element
+            # handoff; pulsesink commits ahead of playback. Older logs without
+            # the field keep the handoff endpoint.
+            if "presented_ns" in event:
+                presented = event["presented_ns"]
+                if type(presented) is not int or presented < completed:
+                    self.invalid_telemetry.append("av_sync_ms")
+                    self.metrics["av_sync_ms"] = None
+                    return
+                completed = presented
             if end <= scheduled:
                 self.invalid_telemetry.append("av_sync_ms")
                 self.metrics["av_sync_ms"] = None

@@ -82,6 +82,12 @@ struct WriteCompletion final {
     core::Nanoseconds scheduled{};
     core::Nanoseconds scheduled_end{};
     core::Nanoseconds completed{};
+    // #60: when the chunk starts playing, max(completed, playback slot on the
+    // sink's clock). A sample cannot play before its handoff, and with
+    // sync=true it does not play before its slot; pulsesink hands off early
+    // (ring-buffer commit), pipewiresink near the slot. Absent when the sink
+    // reported no position.
+    std::optional<core::Nanoseconds> presented{};
 };
 
 struct RenderStep final {

@@ -586,6 +586,7 @@ public:
                                                   bool readiness_probe) {
         const auto entered = std::chrono::steady_clock::now();
         const auto deadline = entered + std::chrono::milliseconds(timeout.count);
+        playback_slot_.reset();
         SinkWriteProgress value;
         value.readiness_probe = readiness_probe;
         value.effective_scheduled = chunk.timestamp;
@@ -718,6 +719,7 @@ public:
         std::memcpy(map.data, chunk.pcm.data(), chunk.pcm.size());
         gst_buffer_unmap(buffer, &map);
         GST_BUFFER_PTS(buffer) = chunk_pts(chunk.timestamp);
+        const GstClockTime data_pts = GST_BUFFER_PTS(buffer);
         progress_.update(observation_sequence, [&](auto& value) {
             value.pts_ns = GST_BUFFER_PTS(buffer);
             value.pts_origin_ns = pts_origin_ns_;
@@ -794,7 +796,29 @@ public:
             }
             return fail_write(outcome, Error{ErrorCode::timeout}, readiness_probe);
         }
+        playback_slot_ = playback_slot(data_pts);
         return outcome;
+    }
+
+    [[nodiscard]] std::optional<core::Nanoseconds> last_playback_slot() const override {
+        return playback_slot_;
+    }
+
+    // #60 playback endpoint: the steady-clock time at which a buffer's first
+    // sample is due on the sink's own clock, from the element's position query
+    // (the stream time being played now). The route's segment starts at 0, so
+    // the buffer PTS is its stream time. pulsesink commits into its ring
+    // buffer ahead of this slot, pipewiresink hands off near it; on the
+    // Jetson's sink monitor both played a click within 2.5 ms of the slot.
+    [[nodiscard]] std::optional<core::Nanoseconds> playback_slot(GstClockTime pts) const {
+        gint64 position = -1;
+        if (!GST_CLOCK_TIME_IS_VALID(pts)
+            || !gst_element_query_position(sink_element_, GST_FORMAT_TIME, &position)
+            || position < 0) {
+            return std::nullopt;
+        }
+        const auto now = observation_time();
+        return core::Nanoseconds{now.count + (static_cast<std::int64_t>(pts) - position)};
     }
 
     // Render-probe round-trip (gate r2 F3): the CHOSEN route must
@@ -1150,6 +1174,7 @@ private:
     bool pending_drop_after_window_{false};
     bool pts_origin_set_{false};
     std::int64_t pts_origin_ns_{0};
+    std::optional<core::Nanoseconds> playback_slot_{};
     bool drained_{false};
     bool drain_attempted_{false};
     core::Result<void> drain_outcome_{};

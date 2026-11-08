@@ -59,6 +59,29 @@ def av_sync() -> None:
     # Then skew is the 28 ms latency difference, not the 68 ms completion gap.
     assert chunk.metrics["av_sync_ms"] == 28, chunk.metrics
 
+    # #60: given a sink that commits audio 30 ms before it plays (pulsesink ring
+    # buffer), presented_ns, not the handoff, is the audio endpoint.
+    early = collector.EventParser()
+    early._consume(json.dumps({"event": "audio_write_completed", "scheduled_ns": 5_000_000_000,
+                               "scheduled_end_ns": 5_020_000_000,
+                               "completed_ns": 4_970_000_000,
+                               "presented_ns": 5_001_000_000}))
+    early._consume(json.dumps({"event": "video_presented", "frame": 12,
+                               "scheduled_ns": 5_000_000_000,
+                               "completed_ns": 5_011_000_000}))
+    # Then skew is 11 - 1 = 10 ms, not the 41 ms the early handoff would give.
+    assert early.metrics["av_sync_ms"] == 10, early.metrics
+    # A presented time before the handoff, or a non-integer one, is invalid
+    # telemetry, never silently replaced by the handoff.
+    for bad in (4_960_000_000, 5.0e9, None, True):
+        broken = collector.EventParser()
+        broken._consume(json.dumps({"event": "audio_write_completed",
+                                    "scheduled_ns": 5_000_000_000,
+                                    "scheduled_end_ns": 5_020_000_000,
+                                    "completed_ns": 4_970_000_000, "presented_ns": bad}))
+        assert broken.metrics["av_sync_ms"] is None, bad
+        assert "av_sync_ms" in broken.invalid_telemetry, bad
+
 
 def display_sources() -> None:
     source = (ROOT / "tools/perf/aa-projection-perf.sh").read_text()

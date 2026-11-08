@@ -1488,10 +1488,16 @@ aa::audio::RouterConfig pcm_router_config(
     // bounded head trims the preserved backlog grows without bound.
     config.live_pcm_drift.enabled = true;
     config.on_write_completed = [](const aa::audio::WriteCompletion &completion) {
+        // presented_ns (#60): when the chunk starts playing on the sink's
+        // clock; the A/V gate uses it in place of the element handoff.
         log_line("{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
                  std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
                  std::to_string(completion.scheduled_end.count) + ",\"completed_ns\":" +
-                 std::to_string(completion.completed.count) + "}");
+                 std::to_string(completion.completed.count) +
+                 (completion.presented
+                      ? ",\"presented_ns\":" + std::to_string(completion.presented->count)
+                      : std::string{}) +
+                 "}");
     };
     return config;
 }
