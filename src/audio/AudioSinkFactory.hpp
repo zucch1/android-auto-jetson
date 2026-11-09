@@ -147,11 +147,30 @@ void unblock_downstream_for_test(ObservedAudioSink& sink) noexcept;
 // Reads the appsrc queue levels and the configured limits.
 [[nodiscard]] AppsrcQueueLevel appsrc_queue_level_for_test(ObservedAudioSink& sink);
 
-// Test-only (#60 review): holds the routing sink's playback-slot worker before
-// its next position query, as if the element's query blocked, until released.
-// Writes must still return within their one deadline, reporting no slot.
-// Tests must release on EVERY exit path; teardown also releases it.
-void stall_playback_slot_query_for_test(ObservedAudioSink& sink);
-void release_playback_slot_query_for_test(ObservedAudioSink& sink) noexcept;
+// Test-only (#60 review): makes the routing sink's playback-slot worker block
+// inside its next position query, as a stuck element would. Like a real stuck
+// query it ignores the sink's stop; only release() (or the handle's
+// destruction) ends it. The handle shares the worker's state, so it stays
+// valid after the sink is destroyed: writes must still return within their
+// deadline, and teardown/reopen must not wait on the blocked query.
+struct SlotWorkerState;
+class PlaybackSlotQueryStall final {
+public:
+    explicit PlaybackSlotQueryStall(std::shared_ptr<SlotWorkerState> state);
+    ~PlaybackSlotQueryStall();
+    PlaybackSlotQueryStall(const PlaybackSlotQueryStall&) = delete;
+    PlaybackSlotQueryStall& operator=(const PlaybackSlotQueryStall&) = delete;
+    void release() noexcept;
+    // True once the worker is blocked inside the stalled query.
+    [[nodiscard]] bool query_entered(core::Milliseconds timeout) const;
+    // True once the worker thread has finished (its element reference dropped).
+    [[nodiscard]] bool worker_exited(core::Milliseconds timeout) const;
+
+private:
+    std::shared_ptr<SlotWorkerState> state_;
+};
+// Null when the sink is not the GStreamer routing sink.
+[[nodiscard]] std::unique_ptr<PlaybackSlotQueryStall> stall_playback_slot_query_for_test(
+    ObservedAudioSink& sink);
 
 } // namespace aa::audio::detail

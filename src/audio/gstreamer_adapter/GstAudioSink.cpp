@@ -36,6 +36,30 @@
 #include <utility>
 #include <vector>
 
+namespace aa::audio::detail {
+
+// Playback-slot worker state (#60 review). Shared by the sink and its worker
+// thread, so a worker stuck inside the element's position query can be left
+// behind at teardown without touching the destroyed sink: it owns its own
+// reference on the routing element, released when the worker exits.
+struct SlotWorkerState final {
+    std::mutex mutex{};
+    std::condition_variable cv{};
+    GstElement* element{nullptr};
+    bool stop{false};
+    bool pending{false};
+    bool busy{false};
+    bool exited{false};
+    bool stalled_for_test{false};
+    bool query_entered_for_test{false};
+    std::uint64_t request_sequence{0};
+    std::uint64_t answer_sequence{0};
+    GstClockTime request_pts{GST_CLOCK_TIME_NONE};
+    std::optional<core::Nanoseconds> answer{};
+};
+
+} // namespace aa::audio::detail
+
 namespace aa::audio {
 namespace {
 
@@ -528,6 +552,64 @@ constexpr std::chrono::microseconds kAdmissionPollNap{500};
 // one 20 ms chunk period, and never past the write's deadline. The position
 // query itself takes microseconds; a slower answer is reported absent.
 constexpr std::chrono::milliseconds kPlaybackSlotWait{20};
+// Longest teardown waits for the slot worker to exit (#60 review). A worker
+// still inside a blocked position query after this is detached: it holds only
+// the shared state and its own element reference, never the sink.
+constexpr std::chrono::milliseconds kSlotWorkerStopWait{100};
+
+// #60 playback endpoint: the steady-clock time at which a buffer's first
+// sample is due on the sink's own clock, from the element's position query
+// (the stream time being played now). The route's segment starts at 0, so
+// the buffer PTS is its stream time. pulsesink commits into its ring buffer
+// ahead of this slot, pipewiresink hands off near it; on the Jetson's sink
+// monitor both played a click within 2.5 ms of the slot. Runs on the slot
+// worker only.
+[[nodiscard]] std::optional<core::Nanoseconds> query_playback_slot(GstElement* element,
+                                                                   GstClockTime pts) {
+    gint64 position = -1;
+    if (element == nullptr || !GST_CLOCK_TIME_IS_VALID(pts)
+        || !gst_element_query_position(element, GST_FORMAT_TIME, &position)
+        || position < 0) {
+        return std::nullopt;
+    }
+    const auto now = observation_time();
+    return core::Nanoseconds{now.count + (static_cast<std::int64_t>(pts) - position)};
+}
+
+void run_slot_worker(const std::shared_ptr<detail::SlotWorkerState>& state) {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    for (;;) {
+        state->cv.wait(lock, [&] { return state->stop || state->pending; });
+        if (state->stop) {
+            break;
+        }
+        state->pending = false;
+        const std::uint64_t sequence = state->request_sequence;
+        const GstClockTime pts = state->request_pts;
+        if (state->stalled_for_test) {
+            // Test-only: a query that blocks inside the element. Like a real
+            // one it does NOT observe stop; only the test's release ends it.
+            state->query_entered_for_test = true;
+            state->cv.notify_all();
+            state->cv.wait(lock, [&] { return !state->stalled_for_test; });
+        }
+        lock.unlock();
+        const auto answer = query_playback_slot(state->element, pts);
+        lock.lock();
+        state->answer = answer;
+        state->answer_sequence = sequence;
+        state->busy = false;
+        state->cv.notify_all();
+    }
+    GstElement* element = std::exchange(state->element, nullptr);
+    lock.unlock();
+    if (element != nullptr) {
+        gst_object_unref(element);
+    }
+    lock.lock();
+    state->exited = true;
+    state->cv.notify_all();
+}
 
 // Per-write outcome (gate fix 3): the typed result plus whether this write's
 // marker reached the element (fully consumed). Startup readiness probes are
@@ -816,19 +898,8 @@ public:
         return playback_slot_;
     }
 
-    // Test-only (#60 review): holds the slot worker before its next position
-    // query, as if the element's query blocked, until released.
-    void stall_slot_query() {
-        std::lock_guard<std::mutex> lock(slot_mutex_);
-        slot_stalled_for_test_ = true;
-    }
-
-    void release_slot_query() noexcept {
-        {
-            std::lock_guard<std::mutex> lock(slot_mutex_);
-            slot_stalled_for_test_ = false;
-        }
-        slot_cv_.notify_all();
+    [[nodiscard]] std::shared_ptr<detail::SlotWorkerState> slot_state() const {
+        return slot_state_;
     }
 
     // Hands one query to the slot worker and waits for its answer until
@@ -836,79 +907,49 @@ public:
     // is never queued behind: the slot is reported absent at once.
     [[nodiscard]] std::optional<core::Nanoseconds> request_playback_slot(
         GstClockTime pts, std::chrono::steady_clock::time_point until) {
-        std::unique_lock<std::mutex> lock(slot_mutex_);
-        if (!slot_worker_.joinable() || slot_stop_ || slot_busy_) {
+        auto& state = *slot_state_;
+        std::unique_lock<std::mutex> lock(state.mutex);
+        if (state.stop || state.exited || state.busy) {
             return std::nullopt;
         }
-        const std::uint64_t sequence = ++slot_request_sequence_;
-        slot_request_pts_ = pts;
-        slot_pending_ = true;
-        slot_busy_ = true;
-        slot_cv_.notify_all();
-        if (!slot_cv_.wait_until(lock, until,
-                                 [&] { return slot_answer_sequence_ == sequence; })) {
+        const std::uint64_t sequence = ++state.request_sequence;
+        state.request_pts = pts;
+        state.pending = true;
+        state.busy = true;
+        state.cv.notify_all();
+        if (!state.cv.wait_until(lock, until,
+                                 [&] { return state.answer_sequence == sequence; })) {
             return std::nullopt;
         }
-        return slot_answer_;
+        return state.answer;
     }
 
     void start_slot_worker() {
-        slot_worker_ = std::thread([this] { run_slot_worker(); });
+        slot_state_->element = GST_ELEMENT(gst_object_ref(sink_element_));
+        slot_worker_ = std::thread([state = slot_state_] { run_slot_worker(state); });
     }
 
-    void run_slot_worker() {
-        std::unique_lock<std::mutex> lock(slot_mutex_);
-        for (;;) {
-            slot_cv_.wait(lock, [&] { return slot_stop_ || slot_pending_; });
-            if (slot_stop_) {
-                return;
-            }
-            slot_pending_ = false;
-            const std::uint64_t sequence = slot_request_sequence_;
-            const GstClockTime pts = slot_request_pts_;
-            slot_cv_.wait(lock, [&] { return slot_stop_ || !slot_stalled_for_test_; });
-            if (slot_stop_) {
-                return;
-            }
-            lock.unlock();
-            const auto answer = playback_slot(pts);
-            lock.lock();
-            slot_answer_ = answer;
-            slot_answer_sequence_ = sequence;
-            slot_busy_ = false;
-            slot_cv_.notify_all();
-        }
-    }
-
-    // Stops the slot worker. Called with the element still alive (before it
-    // is unreferenced) so an in-flight query never outlives sink_element_.
+    // Bounded stop (#60 review): teardown and reopen never wait on the
+    // element. The worker gets kSlotWorkerStopWait to exit; one still inside
+    // a blocked query is detached and finishes on its own, holding only the
+    // shared state and its own element reference.
     void stop_slot_worker() noexcept {
+        if (!slot_worker_.joinable()) {
+            return;
+        }
+        bool exited = false;
         {
-            std::lock_guard<std::mutex> lock(slot_mutex_);
-            slot_stop_ = true;
+            std::unique_lock<std::mutex> lock(slot_state_->mutex);
+            slot_state_->stop = true;
+            slot_state_->cv.notify_all();
+            exited = slot_state_->cv.wait_for(lock, kSlotWorkerStopWait,
+                                              [&] { return slot_state_->exited; });
         }
-        slot_cv_.notify_all();
-        if (slot_worker_.joinable()) {
+        if (exited) {
             slot_worker_.join();
+        } else {
+            slot_worker_.detach();
         }
-    }
-
-    // #60 playback endpoint: the steady-clock time at which a buffer's first
-    // sample is due on the sink's own clock, from the element's position query
-    // (the stream time being played now). The route's segment starts at 0, so
-    // the buffer PTS is its stream time. pulsesink commits into its ring
-    // buffer ahead of this slot, pipewiresink hands off near it; on the
-    // Jetson's sink monitor both played a click within 2.5 ms of the slot.
-    // Runs on the slot worker only.
-    [[nodiscard]] std::optional<core::Nanoseconds> playback_slot(GstClockTime pts) const {
-        gint64 position = -1;
-        if (!GST_CLOCK_TIME_IS_VALID(pts)
-            || !gst_element_query_position(sink_element_, GST_FORMAT_TIME, &position)
-            || position < 0) {
-            return std::nullopt;
-        }
-        const auto now = observation_time();
-        return core::Nanoseconds{now.count + (static_cast<std::int64_t>(pts) - position)};
     }
 
     // Render-probe round-trip (gate r2 F3): the CHOSEN route must
@@ -1050,7 +1091,6 @@ public:
         // Teardown must never stall on a test-only downstream block (gate fix
         // 3): release it first, the tests also release it on every exit path.
         disarm_downstream_block();
-        release_slot_query();
         if (pipeline_ != nullptr && !released_ && !drain_attempted_) {
             (void)drain(core::Milliseconds{2000});
         }
@@ -1059,8 +1099,8 @@ public:
         if (pipeline_ != nullptr) {
             gst_element_set_state(pipeline_, GST_STATE_NULL);
         }
-        // After NULL (which ends any query a live element still holds) and
-        // before the element is unreferenced.
+        // Bounded: a worker blocked in a position query is left behind with
+        // its own element reference (#60 review).
         stop_slot_worker();
         if (pad_ != nullptr && probe_id_ != 0) {
             gst_pad_remove_probe(pad_, probe_id_);
@@ -1270,18 +1310,10 @@ private:
     std::int64_t pts_origin_ns_{0};
     std::optional<core::Nanoseconds> playback_slot_{};
     // Playback-slot worker (#60 review): the element's position query never
-    // runs on the write path. Guarded by slot_mutex_.
-    std::mutex slot_mutex_{};
-    std::condition_variable slot_cv_{};
+    // runs on the write path, and teardown never waits on it unboundedly.
+    std::shared_ptr<detail::SlotWorkerState> slot_state_{
+        std::make_shared<detail::SlotWorkerState>()};
     std::thread slot_worker_{};
-    bool slot_stop_{false};
-    bool slot_pending_{false};
-    bool slot_busy_{false};
-    bool slot_stalled_for_test_{false};
-    std::uint64_t slot_request_sequence_{0};
-    std::uint64_t slot_answer_sequence_{0};
-    GstClockTime slot_request_pts_{GST_CLOCK_TIME_NONE};
-    std::optional<core::Nanoseconds> slot_answer_{};
     bool drained_{false};
     bool drain_attempted_{false};
     core::Result<void> drain_outcome_{};
@@ -1479,18 +1511,41 @@ std::uint64_t prefill_appsrc_for_test(ObservedAudioSink& sink, std::uint64_t tar
     return gstreamer_sink != nullptr ? gstreamer_sink->prefill_appsrc(target_bytes) : 0;
 }
 
-void stall_playback_slot_query_for_test(ObservedAudioSink& sink) {
-    GstSink* gstreamer_sink = gstreamer_sink_of(sink);
-    if (gstreamer_sink != nullptr) {
-        gstreamer_sink->stall_slot_query();
-    }
+PlaybackSlotQueryStall::PlaybackSlotQueryStall(std::shared_ptr<SlotWorkerState> state)
+    : state_(std::move(state)) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->stalled_for_test = true;
 }
 
-void release_playback_slot_query_for_test(ObservedAudioSink& sink) noexcept {
-    GstSink* gstreamer_sink = gstreamer_sink_of(sink);
-    if (gstreamer_sink != nullptr) {
-        gstreamer_sink->release_slot_query();
+PlaybackSlotQueryStall::~PlaybackSlotQueryStall() { release(); }
+
+void PlaybackSlotQueryStall::release() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->stalled_for_test = false;
     }
+    state_->cv.notify_all();
+}
+
+bool PlaybackSlotQueryStall::query_entered(core::Milliseconds timeout) const {
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    return state_->cv.wait_for(lock, std::chrono::milliseconds(timeout.count),
+                               [&] { return state_->query_entered_for_test; });
+}
+
+bool PlaybackSlotQueryStall::worker_exited(core::Milliseconds timeout) const {
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    return state_->cv.wait_for(lock, std::chrono::milliseconds(timeout.count),
+                               [&] { return state_->exited; });
+}
+
+std::unique_ptr<PlaybackSlotQueryStall> stall_playback_slot_query_for_test(
+    ObservedAudioSink& sink) {
+    GstSink* gstreamer_sink = gstreamer_sink_of(sink);
+    if (gstreamer_sink == nullptr) {
+        return nullptr;
+    }
+    return std::make_unique<PlaybackSlotQueryStall>(gstreamer_sink->slot_state());
 }
 
 AppsrcQueueLevel appsrc_queue_level_for_test(ObservedAudioSink& sink) {
