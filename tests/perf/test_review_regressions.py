@@ -82,6 +82,35 @@ def av_sync() -> None:
         assert broken.metrics["av_sync_ms"] is None, bad
         assert "av_sync_ms" in broken.invalid_telemetry, bad
 
+    # #60 review: one run never mixes playback-time and handoff-time audio
+    # endpoints, in either order. A write without presented_ns in a run whose
+    # writes carry it (or the reverse) invalidates A/V; pairs measured before
+    # the mix cannot rescue it.
+    playback = {"event": "audio_write_completed", "scheduled_ns": 6_000_000_000,
+                "scheduled_end_ns": 6_020_000_000, "completed_ns": 5_970_000_000,
+                "presented_ns": 6_001_000_000}
+    handoff = {"event": "audio_write_completed", "scheduled_ns": 6_020_000_000,
+               "scheduled_end_ns": 6_040_000_000, "completed_ns": 6_021_000_000}
+    frame = {"event": "video_presented", "frame": 13, "scheduled_ns": 6_000_000_000,
+             "completed_ns": 6_011_000_000}
+    for first, second in ((playback, handoff), (handoff | {"scheduled_ns": 5_980_000_000,
+                                                           "scheduled_end_ns": 6_000_000_000},
+                                                playback)):
+        mixed = collector.EventParser()
+        mixed._consume(json.dumps(first))
+        mixed._consume(json.dumps(frame))
+        mixed._consume(json.dumps(second))
+        assert mixed.metrics["av_sync_ms"] is None, (first, second)
+        assert "av_sync_ms" in mixed.invalid_telemetry, (first, second)
+    # A whole legacy run (no presented_ns anywhere) keeps the handoff endpoint.
+    legacy = collector.EventParser()
+    legacy._consume(json.dumps(handoff | {"scheduled_ns": 6_000_000_000,
+                                          "scheduled_end_ns": 6_020_000_000}))
+    legacy._consume(json.dumps(handoff))
+    legacy._consume(json.dumps(frame))
+    assert legacy.metrics["av_sync_ms"] == 10, legacy.metrics
+    assert "av_sync_ms" not in legacy.invalid_telemetry
+
 
 def display_sources() -> None:
     source = (ROOT / "tools/perf/aa-projection-perf.sh").read_text()

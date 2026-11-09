@@ -4652,7 +4652,9 @@ void expect_post_completion_idle_order(CompletionIdleOrder order) {
         const auto event = "{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
             std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
             std::to_string(completion.scheduled_end.count) + ",\"completed_ns\":" +
-            std::to_string(completion.completed.count) + "}";
+            std::to_string(completion.completed.count) + ",\"presented_ns\":" +
+            (completion.presented ? std::to_string(completion.presented->count)
+                                  : std::string{"null"}) + "}";
         const auto first = output.find(event);
         ASSERT_NE(first, std::string::npos);
         EXPECT_EQ(output.find(event, first + 1), std::string::npos);
@@ -5718,7 +5720,10 @@ SustainedRun run_sustained(std::size_t chunks, int hold_ms, std::size_t hold_aft
               << " tail_sink_lag_us=" << run.tail_sink_lag / 1000
               << " tail_presented_lag_us=" << run.tail_presented_lag / 1000
               << " slots_missing=" << run.slots_missing << '\n';
-    run.presented_logged = result.output.find("\"presented_ns\":") != std::string::npos;
+    // Every write logs the key (#60 review); null would mean a write without a
+    // slot, which the collector rejects.
+    run.presented_logged = result.output.find("\"presented_ns\":") != std::string::npos
+                           && result.output.find("\"presented_ns\":null") == std::string::npos;
     return run;
 }
 

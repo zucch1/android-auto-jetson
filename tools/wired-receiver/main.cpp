@@ -100,6 +100,17 @@ std::string json_text(std::string_view text) {
     return out;
 }
 
+// Run provenance (#60): the routing element a route actually uses, logged at
+// the first open and again after every successful sink reopen (an automatic
+// backend can select a different element on reopen).
+void log_sink_selected(const aa::audio::SinkReport &selected, std::string_view origin) {
+    log_line(std::string{"{\"event\":\"audio_sink_selected\",\"origin\":\""} +
+             std::string{origin} + "\",\"requested\":\"" +
+             std::string{aa::audio::to_string(selected.requested)} + "\",\"element\":\"" +
+             json_text(selected.selected_element) + "\",\"cause\":\"" +
+             json_text(selected.cause) + "\"}");
+}
+
 void on_signal(int) { g_running.store(false); }
 
 struct AudioDispatchObservation final {
@@ -1328,6 +1339,8 @@ class ConcreteAudioRenderWorker final {
                 } else if (healthy) {
                     router_ = std::move(reopened).value();
                     this->router_ = &router_;
+                    sink_report_ = router_.report().sink;
+                    log_sink_selected(sink_report_, "reopen");
                     output_established_ = false;
                     idle_since_.reset();
                     idle_resume_id_.reset();
@@ -1489,14 +1502,16 @@ aa::audio::RouterConfig pcm_router_config(
     config.live_pcm_drift.enabled = true;
     config.on_write_completed = [](const aa::audio::WriteCompletion &completion) {
         // presented_ns (#60): when the chunk starts playing on the sink's
-        // clock; the A/V gate uses it in place of the element handoff.
+        // clock; the A/V gate uses it in place of the element handoff. It is
+        // ALWAYS present on this playback-time contract: null when the sink
+        // reported no slot, so the collector invalidates A/V instead of
+        // mixing in a handoff endpoint.
         log_line("{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
                  std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
                  std::to_string(completion.scheduled_end.count) + ",\"completed_ns\":" +
-                 std::to_string(completion.completed.count) +
-                 (completion.presented
-                      ? ",\"presented_ns\":" + std::to_string(completion.presented->count)
-                      : std::string{}) +
+                 std::to_string(completion.completed.count) + ",\"presented_ns\":" +
+                 (completion.presented ? std::to_string(completion.presented->count)
+                                       : std::string{"null"}) +
                  "}");
     };
     return config;
@@ -1683,14 +1698,8 @@ int receiver_main(int argc, char **argv) {
                  std::string{aa::to_string(opened.error().code())} + "\"}");
         return 3;
     }
-    {
-        // Run provenance (#60): which routing element this session uses.
-        const auto selected = audio_sink.sink_report();
-        log_line(std::string{"{\"event\":\"audio_sink_selected\",\"requested\":\""} +
-                 std::string{aa::audio::to_string(selected.requested)} + "\",\"element\":\"" +
-                 json_text(selected.selected_element) + "\",\"cause\":\"" +
-                 json_text(selected.cause) + "\"}");
-    }
+    // Run provenance (#60): which routing element this session uses.
+    log_sink_selected(audio_sink.sink_report(), "open");
 
     auto video =
         aa::ipc::VideoServer::listen(aa::ipc::VideoSocketPath{video_socket},

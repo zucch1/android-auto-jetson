@@ -147,4 +147,11 @@ void unblock_downstream_for_test(ObservedAudioSink& sink) noexcept;
 // Reads the appsrc queue levels and the configured limits.
 [[nodiscard]] AppsrcQueueLevel appsrc_queue_level_for_test(ObservedAudioSink& sink);
 
+// Test-only (#60 review): holds the routing sink's playback-slot worker before
+// its next position query, as if the element's query blocked, until released.
+// Writes must still return within their one deadline, reporting no slot.
+// Tests must release on EVERY exit path; teardown also releases it.
+void stall_playback_slot_query_for_test(ObservedAudioSink& sink);
+void release_playback_slot_query_for_test(ObservedAudioSink& sink) noexcept;
+
 } // namespace aa::audio::detail
