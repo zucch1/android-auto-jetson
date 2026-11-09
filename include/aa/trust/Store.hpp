@@ -11,9 +11,12 @@
 // TRUST, NOT CRYPTOGRAPHIC PROOF. USB descriptor strings and serials can be
 // spoofed by anyone with physical access to the port; an approved wired record
 // therefore authorizes "the approved identifiers presented on the qualified
-// port", not "this specific handset". Wireless records bind the BlueZ bond
-// (stronger, still bond-not-human identity). Unknown phones always fail closed:
-// lookup() returns Decision::unknown and allows_session() is false.
+// port", not "this specific handset". A wired record with neither USB nor AOA
+// serial is an explicitly weaker PORT-ONLY pairing record: it is retained for
+// audit/revocation and labelled in diagnostics, but never authorizes lookup().
+// Wireless records bind the BlueZ bond (stronger, still bond-not-human
+// identity). Unknown phones always fail closed: lookup() returns
+// Decision::unknown and allows_session() is false.
 //
 // Persistence: `$XDG_STATE_HOME/android-auto-receiver/approved-phones.json`
 // (XDG fallback `~/.local/state/...`), created 0600 and re-enforced to 0600 on
@@ -86,9 +89,10 @@ public:
     core::Result<void> forget(const PhoneIdentity& identity) override;
 
     // Structured approve-once (task 27 pairing flow): persist the strongest
-    // available transport identity and allocate a stable PhoneId. Approve-once
-    // semantics: re-approving an already-approved key returns the existing id
-    // and never adds a second record.
+    // available transport identity and allocate a stable PhoneId. Serial-less
+    // wired identities become port-only records which never satisfy lookup().
+    // Approve-once semantics: re-approving an already-approved key returns the
+    // existing id and never adds a second record.
     [[nodiscard]] core::Result<core::PhoneId> approve(const TransportIdentity& identity);
 
     // ForgetPhone path: revoke by phone id, persist the removal.

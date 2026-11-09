@@ -4,7 +4,9 @@
 // Typed transport identity for approved phones (task 27). The store keeps the
 // STRONGEST available transport identity per phone:
 //   - wired    : USB descriptor ids + USB serial + AOA identity + physical-port
-//                context (the qualified USB3 port path as the kernel reports it)
+//                context (the qualified USB3 port path as the kernel reports it).
+//                With neither serial, this is only a port-only pairing record,
+//                never a reusable authorization (see Store.hpp).
 //   - wireless : the BlueZ bond identity (bond address + adapter) carried as
 //                plain DATA. This module never talks to BlueZ; the transport
 //                layer hands the bond identity over.

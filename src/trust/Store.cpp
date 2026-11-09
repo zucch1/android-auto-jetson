@@ -15,6 +15,15 @@ namespace {
     return !identity.key.empty();
 }
 
+// A port-only record preserves the user's explicit pairing decision for audit
+// and revocation, but has no device-unique material and therefore cannot be a
+// reusable authorization. The current pairing flow can still use the returned
+// PhoneId; a later connection must pair again with a stronger identity.
+[[nodiscard]] bool port_only(const TransportIdentity& identity) {
+    const auto* wired = std::get_if<WiredIdentity>(&identity);
+    return wired != nullptr && wired->usb_serial.empty() && wired->aoa_serial.empty();
+}
+
 } // namespace
 
 core::Result<std::filesystem::path> ApprovedPhoneStore::default_path() {
@@ -77,7 +86,11 @@ Decision ApprovedPhoneStore::lookup(const PhoneIdentity& identity) const {
     if (!usable_ || !usable_key(identity)) {
         return Decision::unknown;  // fail closed
     }
-    return index_of_key(identity.key).has_value() ? Decision::approved : Decision::unknown;
+    const auto index = index_of_key(identity.key);
+    if (!index.has_value() || port_only(phones_[index.value()].identity)) {
+        return Decision::unknown;
+    }
+    return Decision::approved;
 }
 
 core::Result<void> ApprovedPhoneStore::approve_once(const PhoneIdentity& identity) {
@@ -203,6 +216,9 @@ std::string ApprovedPhoneStore::redacted_summary() const {
         out += "phone-";
         out += std::to_string(phone.phone_id.value);
         out += "=";
+        if (port_only(phone.identity)) {
+            out += "port-only:";
+        }
         out += redacted_label(phone.identity);
     }
     return out;
