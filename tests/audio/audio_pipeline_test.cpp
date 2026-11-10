@@ -2063,6 +2063,114 @@ TEST(AudioPipelineSinkBackend, FrozenProgressDistinguishesPushedFromIngressAndSu
     EXPECT_EQ(frozen, retained);
 }
 
+namespace {
+
+[[nodiscard]] aa::audio::detail::SinkOpenOutcome open_slot_test_sink() {
+    aa::audio::detail::SinkOpenRequest request;
+    request.format = stereo_48k();
+    request.start_timeout = aa::core::Milliseconds{2000};
+    request.write_timeout = aa::core::Milliseconds{200};
+    return aa::audio::detail::open_default_sink(request);
+}
+
+// Paced 20 ms writes on one sink, with the playback-slot answer of each.
+class SlotWriter final {
+public:
+    explicit SlotWriter(aa::audio::detail::ObservedAudioSink& sink) : sink_(&sink) {}
+
+    [[nodiscard]] aa::core::Result<void> write_next() {
+        const aa::audio::MixedChunk chunk{stereo_48k(), aa::core::Nanoseconds{timestamp_},
+                                          std::span<const std::byte>{pcm_}};
+        timestamp_ += 20'000'000;
+        return sink_->write(chunk);
+    }
+
+    [[nodiscard]] bool slot_returns_within(int writes) {
+        for (int i = 0; i < writes; ++i) {
+            if (!write_next().has_value()) { return false; }
+            if (sink_->last_playback_slot()) { return true; }
+        }
+        return false;
+    }
+
+private:
+    aa::audio::detail::ObservedAudioSink* sink_;
+    std::vector<std::byte> pcm_{constant_pcm({kMediaLevel, 960})};
+    std::int64_t timestamp_{now_ns().count};
+};
+
+} // namespace
+
+TEST(AudioPipelineSinkBackend, StalledPlaybackSlotQueryNeverExtendsTheWrite) {
+    // #60 review regression: the element's position query (the playback-slot
+    // telemetry) must not hold an acknowledged write. With the query blocked
+    // inside the element, writes still succeed within their ONE deadline and
+    // report no slot; once released, slots come back.
+    auto outcome = open_slot_test_sink();
+    ASSERT_TRUE(outcome.sink != nullptr);
+    SlotWriter writer{*outcome.sink};
+    ASSERT_TRUE(writer.slot_returns_within(10));
+
+    // Declared after the sink: released (and the worker unblocked) first.
+    const auto stall = aa::audio::detail::stall_playback_slot_query_for_test(*outcome.sink);
+    ASSERT_TRUE(stall != nullptr);
+    for (int i = 0; i < 3; ++i) {
+        const auto started = std::chrono::steady_clock::now();
+        const auto written = writer.write_next();
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        ASSERT_TRUE(written.has_value()) << "write " << i;
+        EXPECT_FALSE(outcome.sink->last_playback_slot()) << "write " << i;
+        // Bounded by the write's own deadline, never by the blocked query.
+        EXPECT_LT(elapsed, std::chrono::milliseconds{200}) << "write " << i;
+    }
+    EXPECT_TRUE(stall->query_entered(aa::core::Milliseconds{1000}));
+
+    stall->release();
+    EXPECT_TRUE(writer.slot_returns_within(10));
+}
+
+TEST(AudioPipelineSinkBackend, TeardownAndReopenNeverWaitOnBlockedPlaybackSlotQuery) {
+    // #60 re-review regression: a position query genuinely in flight and
+    // blocked inside GStreamer (gst_element_query_position -> base sink
+    // position -> element clock read) must not hold sink teardown, including
+    // its NULL state transition on the same element, or a reopen. The
+    // blocked worker is left behind with its own element reference and
+    // finishes once the query returns, after its sink is gone.
+    auto outcome = open_slot_test_sink();
+    ASSERT_TRUE(outcome.sink != nullptr);
+    SlotWriter writer{*outcome.sink};
+    ASSERT_TRUE(writer.slot_returns_within(10));
+
+    const auto stall = aa::audio::detail::stall_playback_slot_query_for_test(*outcome.sink);
+    ASSERT_TRUE(stall != nullptr);
+    ASSERT_TRUE(writer.write_next().has_value());
+    ASSERT_TRUE(stall->query_entered(aa::core::Milliseconds{1000}));
+
+    // Stop: the old sink's teardown returns with its query still blocked.
+    const auto started = std::chrono::steady_clock::now();
+    outcome.sink.reset();
+    const auto teardown = std::chrono::steady_clock::now() - started;
+    // The 2 s drain bound plus the 100 ms worker stop wait, never unbounded.
+    EXPECT_LT(teardown, std::chrono::milliseconds{2500});
+    // Teardown, NULL transition included, finished while the query was still
+    // blocked inside GStreamer.
+    EXPECT_FALSE(stall->query_returned());
+    EXPECT_FALSE(stall->worker_exited(aa::core::Milliseconds{0}));
+
+    // Reopen: a fresh route works, with slots, while the old query is stuck.
+    auto reopened = open_slot_test_sink();
+    ASSERT_TRUE(reopened.sink != nullptr);
+    SlotWriter reopened_writer{*reopened.sink};
+    EXPECT_TRUE(reopened_writer.slot_returns_within(10));
+    reopened.sink.reset();
+    EXPECT_FALSE(stall->query_returned());
+
+    // The left-behind worker completes on its own once the query returns,
+    // against an element already in NULL with its pipeline gone.
+    stall->release();
+    EXPECT_TRUE(stall->worker_exited(aa::core::Milliseconds{2000}));
+}
+
 TEST(AudioPipelineSinkBackend, MissingWriteObservationsRemainUnknown) {
     const aa::audio::SinkWriteProgress value;
     EXPECT_FALSE(value.levels_valid);
@@ -2324,6 +2432,7 @@ struct RecordingSinkState final {
     bool fail_drain{false};
     bool fail_write{false};
     std::function<void()> during_write{};
+    std::optional<aa::core::Nanoseconds> playback_slot{};
 };
 
 class RecordingAudioSink final : public aa::audio::detail::ObservedAudioSink {
@@ -2350,6 +2459,9 @@ public:
         aa::audio::RenderBarrierStats stats;
         stats.drains_completed = state->drains_completed;
         return stats;
+    }
+    std::optional<aa::core::Nanoseconds> last_playback_slot() const override {
+        return state->playback_slot;
     }
 };
 
@@ -2389,6 +2501,40 @@ TEST_F(AudioPipelineRoute, ExplicitReceiptIncludesQueueWaitWithoutMovingSchedule
     EXPECT_GE(router.value().report().stats.last_path_latency.count, 75'000'000);
     EXPECT_LT(router.value().report().stats.last_completion_skew.count,
               router.value().report().stats.last_path_latency.count);
+}
+
+// #60: the completion carries when the chunk starts playing, max(handoff,
+// the sink's playback slot); a sink without a position reports none.
+TEST_F(AudioPipelineRoute, CompletionPresentedIsLaterOfHandoffAndPlaybackSlot) {
+    const auto scheduled = now_ns();
+    const auto run = [&](std::optional<aa::core::Nanoseconds> slot) {
+        auto sink = std::make_unique<RecordingAudioSink>();
+        sink->state->playback_slot = slot;
+        auto config = pcm_router_config();
+        std::optional<aa::audio::WriteCompletion> completion;
+        config.on_write_completed = [&](const auto& value) { completion = value; };
+        auto router = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+        EXPECT_TRUE(router);
+        const auto pcm = constant_pcm({kMediaLevel, 960});
+        EXPECT_TRUE(router.value().submit(
+            make_message(aa::protocol::ChannelRole::media_audio, 42, scheduled, pcm), scheduled));
+        EXPECT_TRUE(router.value().pump());
+        EXPECT_TRUE(completion);
+        return completion.value_or(aa::audio::WriteCompletion{});
+    };
+    // Committed ahead of playback (pulsesink): presented is the slot.
+    const aa::core::Nanoseconds later{scheduled.count + 3'000'000'000};
+    const auto early = run(later);
+    ASSERT_TRUE(early.presented);
+    EXPECT_LT(early.completed.count, later.count);
+    EXPECT_EQ(early.presented->count, later.count);
+    // Handed off after its slot (a stalled sink): presented is the handoff,
+    // so lateness is never hidden.
+    const auto late = run(aa::core::Nanoseconds{scheduled.count - 3'000'000'000});
+    ASSERT_TRUE(late.presented);
+    EXPECT_EQ(late.presented->count, late.completed.count);
+    // No position reported: no presented time is invented.
+    EXPECT_FALSE(run(std::nullopt).presented);
 }
 
 TEST_F(AudioPipelineRoute, PendingRunRejectionRecordsBoundedOccupancyUntilNextSubmitOrClose) {

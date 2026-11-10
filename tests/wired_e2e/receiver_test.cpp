@@ -3999,6 +3999,7 @@ struct CadencedGstObservation {
     std::vector<std::int64_t> scheduled_at;
     std::vector<std::int64_t> returned_at;
     std::vector<bool> succeeded;
+    std::vector<std::optional<std::int64_t>> playback_slot_at;
 };
 
 class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
@@ -4044,6 +4045,8 @@ class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
         auto result = sink_->write(chunk);
         observation_.returned_at.push_back(steady_ns());
         observation_.succeeded.push_back(result.has_value());
+        const auto slot = sink_->last_playback_slot();
+        observation_.playback_slot_at.push_back(slot ? std::optional{slot->count} : std::nullopt);
         return result;
     }
     aa::core::Result<void> drain(Milliseconds timeout) override {
@@ -4053,6 +4056,9 @@ class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
     }
     aa::audio::SinkProbeStats probe_stats() const override { return sink_->probe_stats(); }
     aa::audio::RenderBarrierStats render_stats() const override { return sink_->render_stats(); }
+    std::optional<aa::core::Nanoseconds> last_playback_slot() const override {
+        return sink_->last_playback_slot();
+    }
   private:
     std::unique_ptr<aa::audio::detail::ObservedAudioSink> sink_;
     CadencedGstObservation &observation_;
@@ -4646,7 +4652,9 @@ void expect_post_completion_idle_order(CompletionIdleOrder order) {
         const auto event = "{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
             std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
             std::to_string(completion.scheduled_end.count) + ",\"completed_ns\":" +
-            std::to_string(completion.completed.count) + "}";
+            std::to_string(completion.completed.count) + ",\"presented_ns\":" +
+            (completion.presented ? std::to_string(completion.presented->count)
+                                  : std::string{"null"}) + "}";
         const auto first = output.find(event);
         ASSERT_NE(first, std::string::npos);
         EXPECT_EQ(output.find(event, first + 1), std::string::npos);
@@ -5654,6 +5662,9 @@ struct SustainedRun {
     std::size_t late_after_recovery = 0; // writes > 50 ms late once 2 s past the hold
     std::int64_t phone_lag = 0;
     std::int64_t tail_sink_lag = 0;      // max lateness over the final half
+    std::size_t slots_missing = 0;       // successful writes without a playback slot
+    std::int64_t tail_presented_lag = 0; // max(handoff, slot) - scheduled, final half
+    bool presented_logged = false;
     bool held = false;
 };
 
@@ -5696,11 +5707,23 @@ SustainedRun run_sustained(std::size_t chunks, int hold_ms, std::size_t hold_aft
     for (std::size_t i = 0; i < run.writes; ++i) {
         const auto lag = observed.returned_at[i] - observed.scheduled_at[i];
         if (i >= run.writes / 2) { run.tail_sink_lag = std::max(run.tail_sink_lag, lag); }
+        const auto &slot = observed.playback_slot_at[i];
+        if (observed.succeeded[i] && !slot) { ++run.slots_missing; }
+        if (slot && i >= run.writes / 2) {
+            run.tail_presented_lag = std::max(run.tail_presented_lag,
+                std::max(*slot, observed.returned_at[i]) - observed.scheduled_at[i]);
+        }
         if ((!run.held || observed.write_at[i] > settle) && lag > 50'000'000) { ++run.late_after_recovery; }
     }
     std::cout << "SUSTAINED hold_ms=" << hold_ms << " writes=" << run.writes << " late_after_recovery="
               << run.late_after_recovery << " phone_lag_us=" << run.phone_lag / 1000
-              << " tail_sink_lag_us=" << run.tail_sink_lag / 1000 << '\n';
+              << " tail_sink_lag_us=" << run.tail_sink_lag / 1000
+              << " tail_presented_lag_us=" << run.tail_presented_lag / 1000
+              << " slots_missing=" << run.slots_missing << '\n';
+    // Every write logs the key (#60 review); null would mean a write without a
+    // slot, which the collector rejects.
+    run.presented_logged = result.output.find("\"presented_ns\":") != std::string::npos
+                           && result.output.find("\"presented_ns\":null") == std::string::npos;
     return run;
 }
 
@@ -5713,6 +5736,11 @@ TEST(WiredReceiver, RealGstSustainedCadenceKeepsPhoneAndSinkRealTime) {
     // A conforming phone is never held back more than one chunk period.
     EXPECT_LE(run.phone_lag, kSustainChunkNs);
     EXPECT_LE(run.tail_sink_lag, 100'000'000);
+    // #60: every acknowledged real write reports when it plays, the receiver
+    // logs it for the A/V gate, and playback stays near the schedule.
+    EXPECT_EQ(run.slots_missing, 0U);
+    EXPECT_TRUE(run.presented_logged);
+    EXPECT_LE(run.tail_presented_lag, 100'000'000);
 }
 
 // Issue 60 (Jetson perf-1800 v4): one transient downstream stall left a
@@ -5725,4 +5753,24 @@ TEST(WiredReceiver, RealGstMidStreamStallRecoversToRealTime) {
     ASSERT_TRUE(run.held);
     EXPECT_EQ(run.late_after_recovery, 0U);
     EXPECT_LE(run.tail_sink_lag, 20'000'000);
+}
+
+// #60: the receiver routes through pulsesink by default (pipewiresink streams
+// degrade after ~1.5-2.3 h on this host's PipeWire 1.0.5 plugin); the flag
+// restores pipewiresink or the automatic choice.
+TEST(WiredReceiver, AudioSinkDefaultsToPulseAndFlagSelectsBackend) {
+    EXPECT_EQ(pcm_router_config().backend, aa::audio::SinkBackend::pulse);
+    EXPECT_EQ(pcm_router_config(aa::audio::SinkBackend::pipewire).backend,
+              aa::audio::SinkBackend::pipewire);
+    EXPECT_EQ(pcm_router_config(aa::audio::SinkBackend::automatic).backend,
+              aa::audio::SinkBackend::automatic);
+}
+
+TEST(WiredReceiver, InvalidOrMissingAudioSinkValueIsUsageError) {
+    std::string executable = "receiver", port_flag = "--port", port = "1-2.1";
+    std::string sink_flag = "--audio-sink", bad = "alsa";
+    char *invalid[]{executable.data(), port_flag.data(), port.data(), sink_flag.data(), bad.data()};
+    EXPECT_EQ(receiver_main(5, invalid), 2);
+    char *missing[]{executable.data(), port_flag.data(), port.data(), sink_flag.data()};
+    EXPECT_EQ(receiver_main(4, missing), 2);
 }

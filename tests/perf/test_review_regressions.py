@@ -59,6 +59,58 @@ def av_sync() -> None:
     # Then skew is the 28 ms latency difference, not the 68 ms completion gap.
     assert chunk.metrics["av_sync_ms"] == 28, chunk.metrics
 
+    # #60: given a sink that commits audio 30 ms before it plays (pulsesink ring
+    # buffer), presented_ns, not the handoff, is the audio endpoint.
+    early = collector.EventParser()
+    early._consume(json.dumps({"event": "audio_write_completed", "scheduled_ns": 5_000_000_000,
+                               "scheduled_end_ns": 5_020_000_000,
+                               "completed_ns": 4_970_000_000,
+                               "presented_ns": 5_001_000_000}))
+    early._consume(json.dumps({"event": "video_presented", "frame": 12,
+                               "scheduled_ns": 5_000_000_000,
+                               "completed_ns": 5_011_000_000}))
+    # Then skew is 11 - 1 = 10 ms, not the 41 ms the early handoff would give.
+    assert early.metrics["av_sync_ms"] == 10, early.metrics
+    # A presented time before the handoff, or a non-integer one, is invalid
+    # telemetry, never silently replaced by the handoff.
+    for bad in (4_960_000_000, 5.0e9, None, True):
+        broken = collector.EventParser()
+        broken._consume(json.dumps({"event": "audio_write_completed",
+                                    "scheduled_ns": 5_000_000_000,
+                                    "scheduled_end_ns": 5_020_000_000,
+                                    "completed_ns": 4_970_000_000, "presented_ns": bad}))
+        assert broken.metrics["av_sync_ms"] is None, bad
+        assert "av_sync_ms" in broken.invalid_telemetry, bad
+
+    # #60 review: one run never mixes playback-time and handoff-time audio
+    # endpoints, in either order. A write without presented_ns in a run whose
+    # writes carry it (or the reverse) invalidates A/V; pairs measured before
+    # the mix cannot rescue it.
+    playback = {"event": "audio_write_completed", "scheduled_ns": 6_000_000_000,
+                "scheduled_end_ns": 6_020_000_000, "completed_ns": 5_970_000_000,
+                "presented_ns": 6_001_000_000}
+    handoff = {"event": "audio_write_completed", "scheduled_ns": 6_020_000_000,
+               "scheduled_end_ns": 6_040_000_000, "completed_ns": 6_021_000_000}
+    frame = {"event": "video_presented", "frame": 13, "scheduled_ns": 6_000_000_000,
+             "completed_ns": 6_011_000_000}
+    for first, second in ((playback, handoff), (handoff | {"scheduled_ns": 5_980_000_000,
+                                                           "scheduled_end_ns": 6_000_000_000},
+                                                playback)):
+        mixed = collector.EventParser()
+        mixed._consume(json.dumps(first))
+        mixed._consume(json.dumps(frame))
+        mixed._consume(json.dumps(second))
+        assert mixed.metrics["av_sync_ms"] is None, (first, second)
+        assert "av_sync_ms" in mixed.invalid_telemetry, (first, second)
+    # A whole legacy run (no presented_ns anywhere) keeps the handoff endpoint.
+    legacy = collector.EventParser()
+    legacy._consume(json.dumps(handoff | {"scheduled_ns": 6_000_000_000,
+                                          "scheduled_end_ns": 6_020_000_000}))
+    legacy._consume(json.dumps(handoff))
+    legacy._consume(json.dumps(frame))
+    assert legacy.metrics["av_sync_ms"] == 10, legacy.metrics
+    assert "av_sync_ms" not in legacy.invalid_telemetry
+
 
 def display_sources() -> None:
     source = (ROOT / "tools/perf/aa-projection-perf.sh").read_text()

@@ -236,6 +236,9 @@ class EventParser:
         self.video_completions: deque[tuple[int, int]] = deque()
         self.av_pairs = 0
         self.audio_writes = 0
+        # The audio A/V endpoint the run's first write used (#60):
+        # "playback" (presented_ns) or "handoff" (legacy completed_ns).
+        self.audio_endpoint: str | None = None
         self.video_presentations = 0
         self.receiver_ready = False
         self.projection_active = False
@@ -256,6 +259,27 @@ class EventParser:
         scheduled, completed = event["scheduled_ns"], event["completed_ns"]
         if audio:
             end = event["scheduled_end_ns"]
+            # Owner-approved 2026-11-08 (#60): audio is "done" when it starts
+            # playing on the sink's clock (presented_ns), not at the element
+            # handoff; pulsesink commits ahead of playback. A receiver on this
+            # playback-time contract logs the key on EVERY write (null when
+            # the sink gave no slot); legacy logs never carry it and keep the
+            # handoff endpoint. One run never mixes the two: a key missing
+            # from some writes, or a null/malformed value, invalidates A/V.
+            contract = "playback" if "presented_ns" in event else "handoff"
+            if self.audio_endpoint is None:
+                self.audio_endpoint = contract
+            if contract != self.audio_endpoint:
+                self.invalid_telemetry.append("av_sync_ms")
+                self.metrics["av_sync_ms"] = None
+                return
+            if contract == "playback":
+                presented = event["presented_ns"]
+                if type(presented) is not int or presented < completed:
+                    self.invalid_telemetry.append("av_sync_ms")
+                    self.metrics["av_sync_ms"] = None
+                    return
+                completed = presented
             if end <= scheduled:
                 self.invalid_telemetry.append("av_sync_ms")
                 self.metrics["av_sync_ms"] = None

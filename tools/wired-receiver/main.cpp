@@ -83,6 +83,34 @@ void log_line(const std::string &json) {
     if (writer->submit(json)) { g_running.store(false); }
 }
 
+// Escapes free text for a JSON string value.
+std::string json_text(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const char c : text) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            out += ' ';
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// Run provenance (#60): the routing element a route actually uses, logged at
+// the first open and again after every successful sink reopen (an automatic
+// backend can select a different element on reopen).
+void log_sink_selected(const aa::audio::SinkReport &selected, std::string_view origin) {
+    log_line(std::string{"{\"event\":\"audio_sink_selected\",\"origin\":\""} +
+             std::string{origin} + "\",\"requested\":\"" +
+             std::string{aa::audio::to_string(selected.requested)} + "\",\"element\":\"" +
+             json_text(selected.selected_element) + "\",\"cause\":\"" +
+             json_text(selected.cause) + "\"}");
+}
+
 void on_signal(int) { g_running.store(false); }
 
 struct AudioDispatchObservation final {
@@ -496,6 +524,12 @@ class ConcreteAudioRenderWorker final {
         cv_.wait(lock, [&] { return initialized_; });
         if (failure_) { return *failure_; }
         return {};
+    }
+
+    // The opened route's sink selection; empty until ready() returns.
+    [[nodiscard]] aa::audio::SinkReport sink_report() {
+        std::lock_guard lock(mutex_);
+        return sink_report_;
     }
 
     [[nodiscard]] aa::core::Result<void>
@@ -1104,8 +1138,12 @@ class ConcreteAudioRenderWorker final {
             std::lock_guard lock(mutex_);
             initialized_ = true;
             if (!opened) { latch(opened.error(), AudioFailureOrigin::open); }
-            else if (opened.value().state() == aa::audio::RouterState::degraded) {
-                latch(aa::Error{aa::ErrorCode::audio_sink_unavailable}, AudioFailureOrigin::open);
+            else {
+                sink_report_ = opened.value().report().sink;
+                if (opened.value().state() == aa::audio::RouterState::degraded) {
+                    latch(aa::Error{aa::ErrorCode::audio_sink_unavailable},
+                          AudioFailureOrigin::open);
+                }
             }
             cv_.notify_all();
         }
@@ -1301,6 +1339,8 @@ class ConcreteAudioRenderWorker final {
                 } else if (healthy) {
                     router_ = std::move(reopened).value();
                     this->router_ = &router_;
+                    sink_report_ = router_.report().sink;
+                    log_sink_selected(sink_report_, "reopen");
                     output_established_ = false;
                     idle_since_.reset();
                     idle_resume_id_.reset();
@@ -1367,6 +1407,7 @@ class ConcreteAudioRenderWorker final {
     aa::wired_receiver::AvCreditLedger credit_ledger_;
     std::optional<aa::audio::RouterReport> final_report_;
     bool initialized_{};
+    aa::audio::SinkReport sink_report_{};
     bool stopping_{};
     bool stopped_{};
     const IdleClock idle_clock_;
@@ -1440,8 +1481,14 @@ class InputQueue final {
     std::deque<aa::ipc::InputEvent> queue_{};
 };
 
-aa::audio::RouterConfig pcm_router_config() {
+// Default routing element (#60): pulsesink via pipewire-pulse. On this host's
+// GStreamer PipeWire plugin (1.0.5) a pipewiresink stream degrades after
+// ~1.5-2.3 h of continuous playback into ~340 ms blocks; pulsesink ran clean
+// side by side. --audio-sink pipewire|automatic restores the old choice.
+aa::audio::RouterConfig pcm_router_config(
+    aa::audio::SinkBackend backend = aa::audio::SinkBackend::pulse) {
     aa::audio::RouterConfig config;
+    config.backend = backend;
     config.output_format = aa::audio::AudioFormat{48000, 2, 16};
     for (auto &role : config.roles) {
         role.codec = aa::audio::Codec::pcm;
@@ -1454,10 +1501,18 @@ aa::audio::RouterConfig pcm_router_config() {
     // bounded head trims the preserved backlog grows without bound.
     config.live_pcm_drift.enabled = true;
     config.on_write_completed = [](const aa::audio::WriteCompletion &completion) {
+        // presented_ns (#60): when the chunk starts playing on the sink's
+        // clock; the A/V gate uses it in place of the element handoff. It is
+        // ALWAYS present on this playback-time contract: null when the sink
+        // reported no slot, so the collector invalidates A/V instead of
+        // mixing in a handoff endpoint.
         log_line("{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
                  std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
                  std::to_string(completion.scheduled_end.count) + ",\"completed_ns\":" +
-                 std::to_string(completion.completed.count) + "}");
+                 std::to_string(completion.completed.count) + ",\"presented_ns\":" +
+                 (completion.presented ? std::to_string(completion.presented->count)
+                                       : std::string{"null"}) +
+                 "}");
     };
     return config;
 }
@@ -1547,10 +1602,14 @@ const char *const kUsage =
     "                         [--video-socket PATH] [--input-socket PATH]\n"
     "                         [--duration-ms N] [--no-bus]\n"
     "                         [--require-video-consumer]\n"
+    "                         [--audio-sink pulse|pipewire|automatic]\n"
     "  runs the wired session over USB/AOA with TrustStore admission;\n"
     "  the approved-phones store must already contain the phone (fail closed).\n"
     "  --require-video-consumer defers upstream negotiation until a video\n"
     "  consumer has been accepted and installed (bounded, fail closed).\n"
+    "  --audio-sink picks the routing element (default pulse: pulsesink via\n"
+    "  pipewire-pulse; pipewire: pipewiresink; automatic: pipewiresink, else\n"
+    "  pulsesink).\n"
     "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked.\n";
 
 int receiver_main(int argc, char **argv) {
@@ -1561,6 +1620,7 @@ int receiver_main(int argc, char **argv) {
     std::int64_t duration_ms = 0;
     bool no_bus = false;
     bool require_video_consumer = false;
+    aa::audio::SinkBackend audio_backend = aa::audio::SinkBackend::pulse;
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--port") == 0 && index + 1 < argc) {
             port = argv[++index];
@@ -1576,6 +1636,18 @@ int receiver_main(int argc, char **argv) {
             no_bus = true;
         } else if (std::strcmp(argv[index], "--require-video-consumer") == 0) {
             require_video_consumer = true;
+        } else if (std::strcmp(argv[index], "--audio-sink") == 0 && index + 1 < argc) {
+            const std::string_view value{argv[++index]};
+            if (value == "pulse") {
+                audio_backend = aa::audio::SinkBackend::pulse;
+            } else if (value == "pipewire") {
+                audio_backend = aa::audio::SinkBackend::pipewire;
+            } else if (value == "automatic") {
+                audio_backend = aa::audio::SinkBackend::automatic;
+            } else {
+                std::fputs(kUsage, stderr);
+                return 2;
+            }
         } else {
             std::fputs(kUsage, stderr);
             return 2;
@@ -1619,13 +1691,15 @@ int receiver_main(int argc, char **argv) {
     aa::session::SteadyClock clock{};
     aa::input::CapabilityDescriptor input = aa::input::CapabilityDescriptor::bench_defaults();
 
-    aa::audio::RouterConfig audio_config = pcm_router_config();
+    aa::audio::RouterConfig audio_config = pcm_router_config(audio_backend);
     ConcreteAudioRenderWorker audio_sink{audio_config};
     if (const auto opened = audio_sink.ready(); !opened) {
         log_line(std::string{"{\"event\":\"err\",\"detail\":\"audio_router\",\"code\":\""} +
                  std::string{aa::to_string(opened.error().code())} + "\"}");
         return 3;
     }
+    // Run provenance (#60): which routing element this session uses.
+    log_sink_selected(audio_sink.sink_report(), "open");
 
     auto video =
         aa::ipc::VideoServer::listen(aa::ipc::VideoSocketPath{video_socket},

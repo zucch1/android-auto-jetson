@@ -48,6 +48,14 @@ constexpr std::size_t kMaxBackpressureIntervals = 64;
         .count();
 }
 
+// #60: a chunk starts playing no earlier than its handoff and no earlier than
+// its slot on the sink's clock.
+[[nodiscard]] std::optional<core::Nanoseconds> presented_at(
+    std::optional<core::Nanoseconds> slot, std::int64_t completed_ns) {
+    if (!slot) { return std::nullopt; }
+    return core::Nanoseconds{std::max(slot->count, completed_ns)};
+}
+
 // One decoded run pending on the mix timeline. submitted_at_ns is stamped at
 // submit() BEFORE decode() so the whole decode + mix + write path is inside
 // the recorded latency (gate fix F4).
@@ -831,7 +839,8 @@ core::Result<void> AudioRouter::pump() {
                 }
                 impl_->config.on_write_completed(WriteCompletion{
                     to_write.timestamp, core::Nanoseconds{end_ns},
-                    core::Nanoseconds{write_done_ns}});
+                    core::Nanoseconds{write_done_ns},
+                    presented_at(impl_->sink->last_playback_slot(), write_done_ns)});
             }
             impl_->report.stats.frames_output += piece_frames;
             if (!any_input) {
@@ -1265,7 +1274,8 @@ core::Result<RenderStep> AudioRouter::render_step() {
         stats.max_completion_skew = std::max(stats.max_completion_skew, stats.last_completion_skew);
         if (impl_->config.on_write_completed) {
             impl_->config.on_write_completed(WriteCompletion{core::Nanoseconds{scheduled_ns},
-                core::Nanoseconds{end_ns}, core::Nanoseconds{done}});
+                core::Nanoseconds{end_ns}, core::Nanoseconds{done},
+                presented_at(impl_->sink->last_playback_slot(), done)});
         }
     } else { stats.frames_silence += frames; }
     lock.lock();
