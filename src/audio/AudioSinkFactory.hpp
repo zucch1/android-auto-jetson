@@ -148,28 +148,36 @@ void unblock_downstream_for_test(ObservedAudioSink& sink) noexcept;
 [[nodiscard]] AppsrcQueueLevel appsrc_queue_level_for_test(ObservedAudioSink& sink);
 
 // Test-only (#60 review): makes the routing sink's playback-slot worker block
-// inside its next position query, as a stuck element would. Like a real stuck
-// query it ignores the sink's stop; only release() (or the handle's
-// destruction) ends it. The handle shares the worker's state, so it stays
-// valid after the sink is destroyed: writes must still return within their
-// deadline, and teardown/reopen must not wait on the blocked query.
+// INSIDE its next gst_element_query_position(): the routing element gets a
+// clock that parks reads from the worker's thread, which the base sink's
+// position path reaches after dropping its own lock. Like a real stuck query
+// it ignores the sink's stop; only release() (or the handle's destruction)
+// ends it. The handle shares the worker's state, so it stays valid after the
+// sink is destroyed: writes must still return within their deadline, and
+// teardown/reopen must not wait on the blocked query.
 struct SlotWorkerState;
+struct PlaybackSlotStallState;
 class PlaybackSlotQueryStall final {
 public:
-    explicit PlaybackSlotQueryStall(std::shared_ptr<SlotWorkerState> state);
+    PlaybackSlotQueryStall(std::shared_ptr<SlotWorkerState> worker,
+                           std::shared_ptr<PlaybackSlotStallState> stall);
     ~PlaybackSlotQueryStall();
     PlaybackSlotQueryStall(const PlaybackSlotQueryStall&) = delete;
     PlaybackSlotQueryStall& operator=(const PlaybackSlotQueryStall&) = delete;
     void release() noexcept;
-    // True once the worker is blocked inside the stalled query.
+    // True once the worker is blocked inside the element's position query.
     [[nodiscard]] bool query_entered(core::Milliseconds timeout) const;
+    // True once the blocked query's clock read has been let go.
+    [[nodiscard]] bool query_returned() const;
     // True once the worker thread has finished (its element reference dropped).
     [[nodiscard]] bool worker_exited(core::Milliseconds timeout) const;
 
 private:
-    std::shared_ptr<SlotWorkerState> state_;
+    std::shared_ptr<SlotWorkerState> worker_;
+    std::shared_ptr<PlaybackSlotStallState> stall_;
 };
-// Null when the sink is not the GStreamer routing sink.
+// Null when the sink is not the GStreamer routing sink, or its clock is not
+// GStreamer's monotonic system clock (the stand-in must keep its time base).
 [[nodiscard]] std::unique_ptr<PlaybackSlotQueryStall> stall_playback_slot_query_for_test(
     ObservedAudioSink& sink);
 

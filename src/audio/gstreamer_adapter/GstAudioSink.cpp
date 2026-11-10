@@ -50,8 +50,6 @@ struct SlotWorkerState final {
     bool pending{false};
     bool busy{false};
     bool exited{false};
-    bool stalled_for_test{false};
-    bool query_entered_for_test{false};
     std::uint64_t request_sequence{0};
     std::uint64_t answer_sequence{0};
     GstClockTime request_pts{GST_CLOCK_TIME_NONE};
@@ -586,13 +584,6 @@ void run_slot_worker(const std::shared_ptr<detail::SlotWorkerState>& state) {
         state->pending = false;
         const std::uint64_t sequence = state->request_sequence;
         const GstClockTime pts = state->request_pts;
-        if (state->stalled_for_test) {
-            // Test-only: a query that blocks inside the element. Like a real
-            // one it does NOT observe stop; only the test's release ends it.
-            state->query_entered_for_test = true;
-            state->cv.notify_all();
-            state->cv.wait(lock, [&] { return !state->stalled_for_test; });
-        }
         lock.unlock();
         const auto answer = query_playback_slot(state->element, pts);
         lock.lock();
@@ -900,6 +891,12 @@ public:
 
     [[nodiscard]] std::shared_ptr<detail::SlotWorkerState> slot_state() const {
         return slot_state_;
+    }
+    [[nodiscard]] std::thread::id slot_worker_id() const { return slot_worker_.get_id(); }
+    [[nodiscard]] GstElement* routing_element() const { return sink_element_; }
+    [[nodiscard]] bool slot_worker_idle() const {
+        std::lock_guard<std::mutex> lock(slot_state_->mutex);
+        return !slot_state_->busy && !slot_state_->pending;
     }
 
     // Hands one query to the slot worker and waits for its answer until
@@ -1511,32 +1508,108 @@ std::uint64_t prefill_appsrc_for_test(ObservedAudioSink& sink, std::uint64_t tar
     return gstreamer_sink != nullptr ? gstreamer_sink->prefill_appsrc(target_bytes) : 0;
 }
 
-PlaybackSlotQueryStall::PlaybackSlotQueryStall(std::shared_ptr<SlotWorkerState> state)
-    : state_(std::move(state)) {
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    state_->stalled_for_test = true;
+// Test-only (#60 re-review): blocks the playback-slot worker INSIDE
+// gst_element_query_position(), not before it. The routing element is given
+// a clock that reads the same monotonic system time as GStreamer's default
+// pipeline clock, but parks reads made on the worker's thread while armed.
+// gst_base_sink_get_position() (GStreamer 1.24.2, gstbasesink.c) drops the
+// sink's OBJECT_LOCK before it calls gst_clock_get_time() on the element
+// clock, so the worker is stuck exactly where a stalled sink-provided audio
+// clock would hold a real query, while the NULL transition runs on its own
+// thread against the same element and clock.
+struct PlaybackSlotStallState final {
+    std::mutex mutex{};
+    std::condition_variable cv{};
+    std::thread::id target{};
+    bool armed{true};
+    bool entered{false};
+    bool returned{false};
+};
+
+namespace {
+
+struct AaSlotStallClock {
+    GstSystemClock parent;
+    std::shared_ptr<PlaybackSlotStallState>* stall;
+};
+
+struct AaSlotStallClockClass {
+    GstSystemClockClass parent_class;
+};
+
+G_DEFINE_TYPE(AaSlotStallClock, aa_slot_stall_clock, GST_TYPE_SYSTEM_CLOCK)
+
+GstClockTime aa_slot_stall_clock_internal_time(GstClock* clock) {
+    auto* self = reinterpret_cast<AaSlotStallClock*>(clock);
+    const std::shared_ptr<PlaybackSlotStallState> stall =
+        self->stall != nullptr ? *self->stall : nullptr;
+    bool parked = false;
+    if (stall) {
+        std::unique_lock<std::mutex> lock(stall->mutex);
+        if (stall->armed && std::this_thread::get_id() == stall->target) {
+            parked = true;
+            stall->entered = true;
+            stall->cv.notify_all();
+            stall->cv.wait(lock, [&] { return !stall->armed; });
+        }
+    }
+    const GstClockTime time =
+        GST_CLOCK_CLASS(aa_slot_stall_clock_parent_class)->get_internal_time(clock);
+    if (parked) {
+        std::lock_guard<std::mutex> lock(stall->mutex);
+        stall->returned = true;
+        stall->cv.notify_all();
+    }
+    return time;
 }
+
+void aa_slot_stall_clock_finalize(GObject* object) {
+    auto* self = reinterpret_cast<AaSlotStallClock*>(object);
+    delete self->stall;
+    self->stall = nullptr;
+    G_OBJECT_CLASS(aa_slot_stall_clock_parent_class)->finalize(object);
+}
+
+void aa_slot_stall_clock_class_init(AaSlotStallClockClass* klass) {
+    GST_CLOCK_CLASS(klass)->get_internal_time = aa_slot_stall_clock_internal_time;
+    G_OBJECT_CLASS(klass)->finalize = aa_slot_stall_clock_finalize;
+}
+
+void aa_slot_stall_clock_init(AaSlotStallClock* self) {
+    self->stall = new std::shared_ptr<PlaybackSlotStallState>();
+}
+
+} // namespace
+
+PlaybackSlotQueryStall::PlaybackSlotQueryStall(std::shared_ptr<SlotWorkerState> worker,
+                                               std::shared_ptr<PlaybackSlotStallState> stall)
+    : worker_(std::move(worker)), stall_(std::move(stall)) {}
 
 PlaybackSlotQueryStall::~PlaybackSlotQueryStall() { release(); }
 
 void PlaybackSlotQueryStall::release() noexcept {
     {
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        state_->stalled_for_test = false;
+        std::lock_guard<std::mutex> lock(stall_->mutex);
+        stall_->armed = false;
     }
-    state_->cv.notify_all();
+    stall_->cv.notify_all();
 }
 
 bool PlaybackSlotQueryStall::query_entered(core::Milliseconds timeout) const {
-    std::unique_lock<std::mutex> lock(state_->mutex);
-    return state_->cv.wait_for(lock, std::chrono::milliseconds(timeout.count),
-                               [&] { return state_->query_entered_for_test; });
+    std::unique_lock<std::mutex> lock(stall_->mutex);
+    return stall_->cv.wait_for(lock, std::chrono::milliseconds(timeout.count),
+                               [&] { return stall_->entered; });
+}
+
+bool PlaybackSlotQueryStall::query_returned() const {
+    std::lock_guard<std::mutex> lock(stall_->mutex);
+    return stall_->returned;
 }
 
 bool PlaybackSlotQueryStall::worker_exited(core::Milliseconds timeout) const {
-    std::unique_lock<std::mutex> lock(state_->mutex);
-    return state_->cv.wait_for(lock, std::chrono::milliseconds(timeout.count),
-                               [&] { return state_->exited; });
+    std::unique_lock<std::mutex> lock(worker_->mutex);
+    return worker_->cv.wait_for(lock, std::chrono::milliseconds(timeout.count),
+                                [&] { return worker_->exited; });
 }
 
 std::unique_ptr<PlaybackSlotQueryStall> stall_playback_slot_query_for_test(
@@ -1545,7 +1618,45 @@ std::unique_ptr<PlaybackSlotQueryStall> stall_playback_slot_query_for_test(
     if (gstreamer_sink == nullptr) {
         return nullptr;
     }
-    return std::make_unique<PlaybackSlotQueryStall>(gstreamer_sink->slot_state());
+    GstElement* element = gstreamer_sink->routing_element();
+    // The stand-in must read the same time base as the clock it replaces, or
+    // the element's sync would jump: only GStreamer's monotonic system clock
+    // (what the route selects with provide-clock=FALSE) qualifies.
+    GstClock* current = gst_element_get_clock(element);
+    if (current == nullptr) {
+        return nullptr;
+    }
+    GstClockType type = GST_CLOCK_TYPE_REALTIME;
+    const bool replaceable = GST_IS_SYSTEM_CLOCK(current);
+    if (replaceable) {
+        g_object_get(current, "clock-type", &type, nullptr);
+    }
+    gst_object_unref(current);
+    if (!replaceable || type != GST_CLOCK_TYPE_MONOTONIC) {
+        return nullptr;
+    }
+    // Arm only between queries, so the stall catches the NEXT one whole.
+    const auto idle_until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!gstreamer_sink->slot_worker_idle()) {
+        if (std::chrono::steady_clock::now() >= idle_until) {
+            return nullptr;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    auto stall = std::make_shared<PlaybackSlotStallState>();
+    stall->target = gstreamer_sink->slot_worker_id();
+    auto* clock = static_cast<AaSlotStallClock*>(
+        g_object_new(aa_slot_stall_clock_get_type(), "clock-type", GST_CLOCK_TYPE_MONOTONIC,
+                     nullptr));
+    gst_object_ref_sink(clock);
+    *clock->stall = stall;
+    const gboolean set = gst_element_set_clock(element, GST_CLOCK(clock));
+    gst_object_unref(clock);
+    if (set == FALSE) {
+        return nullptr;
+    }
+    return std::make_unique<PlaybackSlotQueryStall>(gstreamer_sink->slot_state(),
+                                                    std::move(stall));
 }
 
 AppsrcQueueLevel appsrc_queue_level_for_test(ObservedAudioSink& sink) {

@@ -2131,8 +2131,10 @@ TEST(AudioPipelineSinkBackend, StalledPlaybackSlotQueryNeverExtendsTheWrite) {
 
 TEST(AudioPipelineSinkBackend, TeardownAndReopenNeverWaitOnBlockedPlaybackSlotQuery) {
     // #60 re-review regression: a position query genuinely in flight and
-    // blocked inside the element must not hold sink teardown or a reopen.
-    // The blocked worker is left behind with its own element reference and
+    // blocked inside GStreamer (gst_element_query_position -> base sink
+    // position -> element clock read) must not hold sink teardown, including
+    // its NULL state transition on the same element, or a reopen. The
+    // blocked worker is left behind with its own element reference and
     // finishes once the query returns, after its sink is gone.
     auto outcome = open_slot_test_sink();
     ASSERT_TRUE(outcome.sink != nullptr);
@@ -2150,6 +2152,9 @@ TEST(AudioPipelineSinkBackend, TeardownAndReopenNeverWaitOnBlockedPlaybackSlotQu
     const auto teardown = std::chrono::steady_clock::now() - started;
     // The 2 s drain bound plus the 100 ms worker stop wait, never unbounded.
     EXPECT_LT(teardown, std::chrono::milliseconds{2500});
+    // Teardown, NULL transition included, finished while the query was still
+    // blocked inside GStreamer.
+    EXPECT_FALSE(stall->query_returned());
     EXPECT_FALSE(stall->worker_exited(aa::core::Milliseconds{0}));
 
     // Reopen: a fresh route works, with slots, while the old query is stuck.
@@ -2158,8 +2163,10 @@ TEST(AudioPipelineSinkBackend, TeardownAndReopenNeverWaitOnBlockedPlaybackSlotQu
     SlotWriter reopened_writer{*reopened.sink};
     EXPECT_TRUE(reopened_writer.slot_returns_within(10));
     reopened.sink.reset();
+    EXPECT_FALSE(stall->query_returned());
 
-    // The left-behind worker completes on its own once the query returns.
+    // The left-behind worker completes on its own once the query returns,
+    // against an element already in NULL with its pipeline gone.
     stall->release();
     EXPECT_TRUE(stall->worker_exited(aa::core::Milliseconds{2000}));
 }
