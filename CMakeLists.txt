@@ -144,6 +144,12 @@ add_subdirectory(tools/aa-ipc-bench)
 add_test(NAME ci_ipc_bench_gate COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tests/ci/ipc_bench_gate_test.py")
 set_tests_properties(ci_ipc_bench_gate PROPERTIES TIMEOUT 60)
+# H1: the ARM64 relay builds the untrusted PR tree only inside a sandbox and posts its status
+# outside it. Skips (exit 77) with a reason where no sandbox backend works (e.g. no usable
+# unprivileged user namespaces).
+add_test(NAME ci_relay_sandbox COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_SOURCE_DIR}/tests/ci/relay_sandbox_test.py")
+set_tests_properties(ci_relay_sandbox PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 
 # Task 9 is mandatory: missing development inputs must not turn CI green by omission.
 add_subdirectory(tools/aa-decode-probe)

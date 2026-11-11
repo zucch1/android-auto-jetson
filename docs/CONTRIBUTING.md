@@ -28,9 +28,9 @@ The planned merge gate consists of three exact, stable contexts:
 |---|---|
 | `ci/host-build-test` | Ubuntu 24.04 host foundation configure/build/CTest including the task-5 target-safety suite (public job) |
 | `ci/provenance-lint` | Source/notice and dependency-lock checks plus scratch mutation tests (public job) |
-| `ci/arm64-cross-build` | Provisioned private companion workflow; not a public job (see below) |
+| `ci/arm64-cross-build` | Posted only by the owner-run sandboxed relay `tools/ci/arm64-cross-relay.sh` (see below); the public Actions job is `ci/arm64-cross-fixture` and cannot satisfy it |
 
-`.github/workflows/ci.yml` runs the three independent nonmatrix public jobs on pull
+`.github/workflows/ci.yml` runs the independent nonmatrix public jobs (the two public required contexts plus `ci/decode-overlay-cross` and the fixture-only `ci/arm64-cross-fixture`) on pull
 requests targeting `main` or `aa/**`, on pushes to `main`, and on manual
 `workflow_dispatch`. Pushes to `aa/**` branches start no separate run: the
 PR run already reports every required context on the head commit, and a newer push
@@ -47,6 +47,18 @@ come from the PR's own changes to the benchmark build (for example runner image 
 toolchain drift) is caught after merge, not before. Both jobs use only
 `contents: read`, a full-commit-pinned checkout with credential persistence
 disabled, and no artifact upload or cache actions.
+
+### Validators run from the base revision on pull requests
+
+On `pull_request` runs, `ci/provenance-lint` additionally runs
+`tools/deps/check_manifest.py` (against `deps/manifest.lock`),
+`tools/provenance/check.py` (which imports `tools/provenance/inventory.py`) and
+`tools/tls/scan.py` from the PR's **base** revision against the PR tree, so one PR
+cannot change a check and the data it checks together and stay green. If a PR
+legitimately changes one of these validators or their pinned constants, those
+steps fail by design: land the validator change on its own first (the owner reviews
+it explicitly), then rebase the data change on it. The workflow file itself is still
+taken from the PR, so any change under `.github/` needs explicit owner review.
 
 The host build downloads the exact GoogleTest v1.15.2 archive specified by
 `deps/manifest.json` outside configure, then verifies it against
@@ -77,11 +89,48 @@ parent verifies the exact private workflow head, owner/actor, dispatch, approved
 public SHA, run attempt, and completed build/test logs, then POSTs the
 `ci/arm64-cross-build` status through the existing authorized local `gh`
 channel. A passing local reproduction is not a substitute for that reviewed
-live run. There is no fake public ARM64 job: the public workflow still exposes
-only the three public jobs above, and no placeholder is registered as a required
-check. Green public jobs are not full task-6 acceptance or authorization to
-merge; a ruleset change to require these contexts is a separate, explicitly
-authorized step. Hardware evidence is not replaced by host smoke tests.
+live run. The public workflow's fixture job is named `ci/arm64-cross-fixture`, never
+`ci/arm64-cross-build`, so only an owner-posted status can satisfy the required
+context. Green public jobs are not full task-6 acceptance or authorization to
+merge. Hardware evidence is not replaced by host smoke tests.
+
+### Owner-run sandboxed relay
+
+Where the observed sysroot is on the owner machine, `tools/ci/arm64-cross-relay.sh`
+produces and posts the same status directly (it replaces running the PR tree's own
+build with the owner's credentials). The observed-sysroot ARM64 cross-build is relayed
+at a reviewed, exact head SHA, just before the squash merge. The relay treats the
+PR tree as untrusted code:
+
+- Run it from your own checkout of `main`, never from the PR branch. It fetches
+  `origin/main` into a base worktree and runs `tools/build/validate_sysroot.py` from
+  there (scrubbed environment), so the PR cannot change the validator that judges it.
+- The PR head is exported with `git archive` into a scratch directory and built
+  (`cmake --preset jetson-aarch64`, `cmake --build --preset jetson-aarch64`) only
+  inside a sandbox with no `$HOME`, no `gh` auth, no SSH agent, no network, the
+  sysroot, manifest and GoogleTest archive mounted read-only, and a complete scrubbed
+  environment (`env -i`-style: fixed `PATH`, `GIT_CONFIG_NOSYSTEM=1`, empty `HOME`).
+- Only after the sandbox has exited does the trusted script post the
+  `ci/arm64-cross-build` commit status for that exact SHA with `gh`, using your own
+  auth, outside the sandbox. Re-run for the new SHA after every push or sync.
+- With a PR number the relay first checks that the SHA is that PR's head and that the
+  PR author is the repository owner; pass `--allow-author LOGIN` to relay another
+  author's PR you have reviewed. Without a PR number that check is skipped (with a
+  warning). The relay only proves the tree builds against the observed sysroot; it
+  does not make an unreviewed PR safe, so read the diff first.
+
+```bash
+export AA_SYSROOT_ROOTFS=... AA_SYSROOT_MANIFEST=... AA_GOOGLETEST_ARCHIVE=...
+tools/ci/arm64-cross-relay.sh [--sandbox auto|podman|bwrap|docker] [--allow-author LOGIN] <head-sha> [pr-number]
+```
+
+Sandbox backend: `auto` picks rootless `podman` (needs `AA_RELAY_IMAGE`, a local image
+with cmake, ninja, aarch64 g++ and python3), then `bwrap` (bubblewrap over the host's
+read-only `/usr`; expose a toolchain installed elsewhere with `AA_RELAY_EXTRA_RO=/path:/path2`),
+then `docker` (also needs `AA_RELAY_IMAGE`; its daemon is root-equivalent, so it is last).
+If none is usable the relay stops; there is no unsandboxed mode.
+`tests/ci/relay_sandbox_test.py` (ctest `ci_relay_sandbox`) proves the isolation and the
+post-after-sandbox ordering with a probe command and skips with a reason where no backend works.
 
 ## Local validation and privacy
 

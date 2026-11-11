@@ -249,6 +249,28 @@ jobs:
           set -euo pipefail
           python3 -B tools/deps/check_manifest.py --lock deps/manifest.lock
           tools/provenance/check.sh
+      # M5: on a pull request the validators below run from the BASE revision against the PR
+      # tree, so one PR cannot change a check together with the data it checks and stay green.
+      # A PR that legitimately changes a validator fails these steps by design: land the
+      # validator change on its own first, or have the owner review it explicitly.
+      # (This workflow file is itself taken from the PR; changes under .github/ need owner review.)
+      - name: Export the PR base revision (trusted validators)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          mkdir "$RUNNER_TEMP/base-validators"
+          git archive --format=tar "$BASE_SHA" | tar -x -C "$RUNNER_TEMP/base-validators"
+      - name: Run base-revision validators against the PR tree
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/base-validators"
+          python3 -B "$base/tools/deps/check_manifest.py" --lock deps/manifest.lock
+          python3 -B "$base/tools/provenance/check.py" --root "$PWD"
+          python3 -B "$base/tools/tls/scan.py" "$PWD"
       - name: Reject malicious provenance mutations in scratch fixtures
         run: |
           set -euo pipefail
@@ -256,8 +278,11 @@ jobs:
             python3 -B tests/provenance/scenarios.py "$PWD" "$case"
           done
 
-  arm64-cross-build:
-    name: ci/arm64-cross-build
+  # Fixture-only job. It must NEVER share the `ci/arm64-cross-build` name: that required
+  # context is posted solely by tools/ci/arm64-cross-relay.sh after an observed-sysroot,
+  # sandboxed build (see docs/CONTRIBUTING.md), so fixture results cannot satisfy it.
+  arm64-cross-fixture:
+    name: ci/arm64-cross-fixture
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -329,9 +354,9 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo '## ci/arm64-cross-build (fixture mode)'
+            echo '## ci/arm64-cross-fixture (fixture mode)'
             echo
-            echo 'Fixture-sysroot cross build (fixture-not-target). This is NOT target qualification — the private observed-sysroot exact-SHA smoke (sysroot jetson-r39.2.1) is the acceptance evidence (task 5 receipts / F3 later).'
+            echo 'Fixture-sysroot cross build (fixture-not-target). This is NOT target qualification and does not satisfy `ci/arm64-cross-build`: the private observed-sysroot exact-SHA smoke (sysroot jetson-r39.2.1), relayed by tools/ci/arm64-cross-relay.sh, is the acceptance evidence.'
             echo
             echo "- head: \`${GITHUB_SHA}\`"
             echo '- env: AA_SYSROOT_REQUIRE_OBSERVED=OFF; fixture provenance is accepted here and always reported fixture-not-target.'
