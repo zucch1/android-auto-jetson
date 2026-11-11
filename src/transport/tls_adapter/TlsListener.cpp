@@ -44,13 +44,19 @@ std::uint16_t TlsListener::port() const noexcept {
 }
 
 core::Result<std::unique_ptr<TlsTransport>> TlsListener::accept() {
+    return accept({core::Deadline::Clock::now() + std::chrono::seconds{10}, {}});
+}
+
+core::Result<std::unique_ptr<TlsTransport>> TlsListener::accept(const core::Deadline& deadline) {
     if (!impl_ || impl_->fd < 0) {
         return Error{ErrorCode::transport_closed};
     }
+    if (auto checked = deadline.check(); !checked) return checked.error();
     sockaddr_storage address{};
     socklen_t length = sizeof(address);
-    const int fd = su::accept_socket(impl_->fd, reinterpret_cast<sockaddr*>(&address), &length);
+    const int fd = su::accept_socket(impl_->fd, reinterpret_cast<sockaddr*>(&address), &length, deadline);
     if (fd < 0) {
+        if (auto checked = deadline.check(); !checked) return checked.error();
         return Error{ErrorCode::transport_io};
     }
     char host[NI_MAXHOST]{};

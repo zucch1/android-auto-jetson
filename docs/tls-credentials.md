@@ -129,3 +129,24 @@ These tests establish host API/build behavior only. They do not qualify a real
 phone, Jetson, deployment installation, pairing store, production credentials,
 production TLS trust, cross compilation or target performance. No target or
 phone contact, push, PR or acceptance-ledger update is part of this task.
+
+## Generic TCP/TLS adapter deadlines
+
+The generic TLS stream adapter is host/test transport; the live wired runtime
+uses its separate bounded link. Socket connect and accept use nonblocking I/O
+with a 10-second default and accept an explicit cancellation/deadline. DNS
+resolution through `getaddrinfo` remains synchronous; numeric endpoint addresses
+avoid that resolver wait. TLS handshake retains its existing whole-operation
+10-second deadline. TCP keepalive and a 30-second unacknowledged-data timeout
+are enabled. Writes and a frame after its first decrypted bytes share a
+30-second whole-frame deadline, so fragment progress does not restart the budget.
+
+The protocol code only answers phone `PingRequest`s (`WiredSession.cpp`); it
+does not schedule or negotiate a guaranteed ping interval. Consequently there
+is no safe universal idle cutoff for a quiet healthy phone. Generic stream
+callers with a known maximum peer ping interval can call
+`set_peer_ping_interval`: the idle deadline is **three intervals plus 10 seconds**
+of scheduling margin. It is deliberately opt-in; an unset cadence leaves the
+wait for a frame's first byte cancellation-bound. The clock can be injected for
+idle-expiry tests. A deployment-wide idle cutoff still needs a specified peer
+keepalive contract and phone qualification.

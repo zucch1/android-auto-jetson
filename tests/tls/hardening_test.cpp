@@ -230,3 +230,75 @@ TEST(TlsHardening, ListenerRechecksBoundPeerAfterRevocation) {
     EXPECT_EQ(result.error().code(), aa::ErrorCode::transport_unauthorized_peer);
     EXPECT_GT(checks, initial);
 }
+
+#include "../transport/PendingIo.hpp"
+TEST(TlsHardening, SilentPeerHitsHandshakeDeadline) {
+    namespace tr = aa::transport;
+    auto pair = tr::make_tls_loopback([] { return true; },
+        tr::TlsMode::encryption_only_compatibility);
+    ASSERT_TRUE(pair);
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = pair.value().client->open({});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::timeout);
+    EXPECT_GE(std::chrono::steady_clock::now() - start, std::chrono::seconds{9});
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{12});
+}
+
+TEST(TlsHardening, IdlePeerHitsDerivedDeadlineWithInjectedClock) {
+    namespace tr = aa::transport;
+    using namespace std::chrono_literals;
+    auto pair = tr::make_tls_loopback([] { return true; },
+        tr::TlsMode::encryption_only_compatibility);
+    ASSERT_TRUE(pair);
+    aa::core::CancellationSource cancellation;
+    bool client_open = false;
+    std::thread thread([&] { client_open = pair.value().client->open(cancellation.get_token()).has_value(); });
+    const auto server_open = pair.value().server->open({});
+    thread.join();
+    ASSERT_TRUE(client_open && server_open.has_value());
+    const auto epoch = std::chrono::steady_clock::now();
+    std::atomic<int> seconds{0};
+    ASSERT_TRUE(pair.value().client->set_peer_ping_interval(30s,
+        [&] { return epoch + std::chrono::seconds{seconds.load()}; }));
+    PendingIo pending([&] { return pair.value().client->receive(); });
+    EXPECT_TRUE(pending.blocked(SYS_poll));
+    seconds = 99; // three 30s intervals + 10s margin: still healthy
+    EXPECT_NE(pending.result.wait_for(100ms), std::future_status::ready);
+    seconds = 101;
+    const bool timed_out = pending.result.wait_for(500ms) == std::future_status::ready;
+    // Bound the negative control against the old infinite wait.
+    if (!timed_out) cancellation.request_stop();
+    const auto result = pending.result.get();
+    EXPECT_TRUE(timed_out);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::timeout);
+    EXPECT_EQ(pair.value().client->receive().error().code(), aa::ErrorCode::transport_closed);
+}
+
+TEST(TlsHardening, EmptyListenerAcceptTimesOutAndCancels) {
+    namespace tr = aa::transport;
+    using namespace std::chrono_literals;
+    auto listener = tr::TlsListener::listen("127.0.0.1", 0,
+        [](const tr::TlsPeerInfo&) { return true; },
+        tr::TlsMode::encryption_only_compatibility);
+    ASSERT_TRUE(listener);
+    const auto timeout = listener.value()->accept({std::chrono::steady_clock::now() + 20ms, {}});
+    ASSERT_FALSE(timeout);
+    EXPECT_EQ(timeout.error().code(), aa::ErrorCode::timeout);
+    aa::core::CancellationSource cancellation;
+    PendingIo pending([&] {
+        return listener.value()->accept({std::chrono::steady_clock::now() + 10s, cancellation.get_token()});
+    });
+    EXPECT_TRUE(pending.blocked(SYS_poll));
+    cancellation.request_stop();
+    ASSERT_EQ(pending.result.wait_for(1s), std::future_status::ready);
+    const auto result = pending.result.get();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::cancelled);
+    auto connect = tr::TlsTransport::connect("127.0.0.1", listener.value()->port(),
+        [] { return true; }, tr::TlsMode::encryption_only_compatibility,
+        {std::chrono::steady_clock::now() + 10s, cancellation.get_token()});
+    ASSERT_FALSE(connect);
+    EXPECT_EQ(connect.error().code(), aa::ErrorCode::cancelled);
+}

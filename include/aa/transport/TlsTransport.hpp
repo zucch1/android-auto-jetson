@@ -2,11 +2,13 @@
 #pragma once
 
 #include <aa/core/Cancellation.hpp>
+#include <aa/core/Deadline.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/transport/Framing.hpp>
 #include <aa/transport/Transport.hpp>
 
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <span>
@@ -43,7 +45,19 @@ class TlsTransport final : public Transport {
     [[nodiscard]] static core::Result<std::unique_ptr<TlsTransport>>
     connect(const char *host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode);
 
+    [[nodiscard]] static core::Result<std::unique_ptr<TlsTransport>>
+    connect(const char *host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode,
+            const core::Deadline& deadline);
+
     ~TlsTransport() override;
+
+    // No ping cadence is guaranteed by the protocol adapter: WiredSession only
+    // answers incoming pings. Enable idle expiry only when the caller knows
+    // the peer's maximum ping interval. Allow three missed intervals plus 10s
+    // scheduling margin; do not infer a cadence from a quiet phone.
+    // The injected monotonic clock permits deterministic deadline tests.
+    core::Result<void> set_peer_ping_interval(std::chrono::milliseconds interval,
+        std::function<std::chrono::steady_clock::time_point()> now = {});
 
     [[nodiscard]] Kind kind() const noexcept override { return Kind::tls; }
 
@@ -85,6 +99,7 @@ class TlsListener final {
 
     [[nodiscard]] std::uint16_t port() const noexcept;
     [[nodiscard]] core::Result<std::unique_ptr<TlsTransport>> accept();
+    [[nodiscard]] core::Result<std::unique_ptr<TlsTransport>> accept(const core::Deadline& deadline);
     void close() noexcept;
 
   private:

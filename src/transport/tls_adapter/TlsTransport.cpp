@@ -7,6 +7,7 @@
 #include "../socket_util.hpp"
 #include <aa/tls/Credentials.hpp>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <utility>
 
 namespace aa::transport {
@@ -19,6 +20,14 @@ TlsTransport::build_impl(int fd, ApprovedPredicate approved, TlsMode mode, bool 
     auto impl = std::make_unique<Impl>(fd, make_policy(std::move(approved), mode));
     const int flags = ::fcntl(fd, F_GETFL, 0);
     if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return Error{ErrorCode::transport_io};
+    }
+    const int enabled = 1;
+    const int unacked_timeout_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(kFrameDeadline).count());
+    if (::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0 ||
+        ::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                     &unacked_timeout_ms, sizeof(unacked_timeout_ms)) != 0) {
         return Error{ErrorCode::transport_io};
     }
     try {
@@ -64,8 +73,17 @@ TlsTransport::build_impl(int fd, ApprovedPredicate approved, TlsMode mode, bool 
 core::Result<std::unique_ptr<TlsTransport>>
 TlsTransport::connect(const char* host, std::uint16_t port,
                       ApprovedPredicate approved, TlsMode mode) {
-    const int fd = socket_util::connect_socket(host, port);
+    return connect(host, port, std::move(approved), mode,
+                   {core::Deadline::Clock::now() + kHandshakeDeadline, {}});
+}
+
+core::Result<std::unique_ptr<TlsTransport>>
+TlsTransport::connect(const char* host, std::uint16_t port,
+                      ApprovedPredicate approved, TlsMode mode, const core::Deadline& deadline) {
+    if (auto checked = deadline.check(); !checked) return checked.error();
+    const int fd = socket_util::connect_socket(host, port, deadline);
     if (fd < 0) {
+        if (auto checked = deadline.check(); !checked) return checked.error();
         return Error{ErrorCode::transport_unavailable};
     }
     auto transport = build_impl(fd, std::move(approved), mode, false);
@@ -128,6 +146,7 @@ core::Result<void> TlsTransport::send(std::span<const std::byte> frame) {
         close();
         return tls_adapter::map_tls_error(error);
     }
+    impl_->io_deadline = impl_->now() + kFrameDeadline;
     auto sent = impl_->io.send_frame(frame, token_);
     if (!sent) {
         close();
@@ -145,11 +164,25 @@ core::Result<std::vector<std::byte>> TlsTransport::receive() {
         close();
         return tls_adapter::map_tls_error(error);
     }
+    impl_->frame_started = false;
+    impl_->io_deadline = impl_->idle_budget
+        ? impl_->now() + *impl_->idle_budget : Deadline::max();
     auto got = impl_->io.receive_frame(token_);
     if (!got) {
         close();
     }
     return got;
+}
+
+core::Result<void> TlsTransport::set_peer_ping_interval(
+    std::chrono::milliseconds interval, std::function<Deadline()> now) {
+    // Bound configuration arithmetic and reject an invalid cadence explicitly.
+    if (interval <= std::chrono::milliseconds::zero() || interval > std::chrono::hours{1}) {
+        return Error{ErrorCode::transport_unavailable};
+    }
+    impl_->idle_budget = interval * 3 + kHandshakeDeadline;
+    if (now) impl_->now = std::move(now);
+    return {};
 }
 
 void TlsTransport::close() noexcept { impl_->close_once(); }
