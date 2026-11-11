@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace aa::transport {
@@ -64,10 +65,18 @@ class TlsTransport final : public Transport {
     core::CancellationToken token_{};
 };
 
+// Numeric address and source port captured from the accepted TCP socket.
+// Admission must compare this endpoint with the expected phone/AP client;
+// certificates do not identify real phones in compatibility mode.
+struct TlsPeerInfo final {
+    std::string address;
+    std::uint16_t port;
+};
+
 // A TLS server listener bound to host:port. Accept one peer and handshake it.
 class TlsListener final {
   public:
-    using ApprovedPredicate = TlsTransport::ApprovedPredicate;
+    using ApprovedPredicate = std::function<bool(const TlsPeerInfo&)>;
 
     [[nodiscard]] static core::Result<std::unique_ptr<TlsListener>>
     listen(const char *host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode);

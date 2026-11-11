@@ -166,3 +166,67 @@ TEST(TlsHardening, CleansesPemOnMalformedInput) {
     EXPECT_EQ(pem_cleanses.load() - before, 1);
     EXPECT_FALSE(cleanse_left_bytes);
 }
+
+#include <aa/transport/TlsTransport.hpp>
+#include <tuple>
+
+TEST(TlsHardening, ListenerAdmissionReceivesActualPeer) {
+    namespace tr = aa::transport;
+    std::string observed;
+    std::uint16_t observed_port = 0;
+    // Variadic only so this regression also compiles against the old API:
+    // its missing peer input allowed an unrelated approval to admit anyone.
+    auto admission = [&](const auto&... peers) {
+        if constexpr (sizeof...(peers) == 1) {
+            const auto& peer = std::get<0>(std::tie(peers...));
+            observed = peer.address;
+            observed_port = peer.port;
+            return peer.address == "192.0.2.1";
+        }
+        return true;
+    };
+    auto listener = tr::TlsListener::listen("127.0.0.1", 0, admission,
+        tr::TlsMode::encryption_only_compatibility);
+    ASSERT_TRUE(listener);
+    auto client = tr::TlsTransport::connect("127.0.0.1", listener.value()->port(),
+        [] { return true; }, tr::TlsMode::encryption_only_compatibility);
+    ASSERT_TRUE(client);
+    auto server = listener.value()->accept();
+    ASSERT_TRUE(server);
+    aa::core::CancellationSource cancelled;
+    cancelled.request_stop();
+    const auto result = server.value()->open(cancelled.get_token());
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_EQ(observed, "127.0.0.1");
+    EXPECT_GT(observed_port, 0);
+}
+
+#include <thread>
+TEST(TlsHardening, ListenerRechecksBoundPeerAfterRevocation) {
+    namespace tr = aa::transport;
+    bool approved = true;
+    int checks = 0;
+    auto listener = tr::TlsListener::listen("127.0.0.1", 0,
+        [&](const tr::TlsPeerInfo& peer) {
+            ++checks;
+            return approved && peer.address == "127.0.0.1" && peer.port != 0;
+        }, tr::TlsMode::encryption_only_compatibility);
+    ASSERT_TRUE(listener);
+    auto client = tr::TlsTransport::connect("127.0.0.1", listener.value()->port(),
+        [] { return true; }, tr::TlsMode::encryption_only_compatibility);
+    ASSERT_TRUE(client);
+    auto server = listener.value()->accept();
+    ASSERT_TRUE(server);
+    bool client_open = false;
+    std::thread thread([&] { client_open = client.value()->open({}).has_value(); });
+    const auto server_open = server.value()->open({});
+    thread.join();
+    ASSERT_TRUE(client_open && server_open.has_value());
+    const int initial = checks;
+    approved = false;
+    const auto result = server.value()->receive();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_GT(checks, initial);
+}

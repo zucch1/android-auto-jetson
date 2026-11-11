@@ -186,12 +186,12 @@ inline void close_fd(int& fd) noexcept {
 }
 
 // Accept one connection on a listening fd. Returns the connected fd or -1.
-[[nodiscard]] inline int accept_socket(int listen_fd) {
+[[nodiscard]] inline int accept_socket(int listen_fd, sockaddr* peer = nullptr, socklen_t* length = nullptr) {
     if (listen_fd < 0) {
         return -1;
     }
     for (;;) {
-        const int fd = ::accept(listen_fd, nullptr, nullptr);
+        const int fd = ::accept(listen_fd, peer, length);
         if (fd < 0) {
             if (errno == EINTR) {
                 continue;
