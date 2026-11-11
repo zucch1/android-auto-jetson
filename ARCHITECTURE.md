@@ -20,7 +20,7 @@
 | channels | `include/aa/channels/*` | capability advertisement, service dispatch, AV/input/sensor/microphone sinks | implemented (`src/channels/*`) |
 | ipc | `include/aa/ipc/*` | D-Bus control surface contract (`org.custom.AndroidAutoReceiver1`), pairing gate, video socket, input socket | implemented (`src/ipc/*`, `src/ipc/video`, `src/ipc/dbus_adapter`) |
 | audio | `include/aa/audio/*` | multi-role PCM audio routing and sink boundary, A/V sync gating; supports `pulsesink` (default) and `pipewiresink` backends | implemented (`src/audio/*`, `src/audio/gstreamer_adapter`) |
-| trust | `include/aa/trust/*` | approve-once phone store, pairing policy, HMAC-SHA256 tokens, fail-closed admission | implemented (`src/trust/*`) |
+| trust | `include/aa/trust/*` | persistent identity allowlist, atomic persistence, fail-closed admission (wired identifiers are spoofable) | implemented (`src/trust/*`) |
 | config | `include/aa/config/*` | typed validated configuration boundary, fail-closed jurisdiction rules | implemented (`src/config/*`) |
 | diagnostics | `include/aa/diagnostics/*` | structured JSON events, privacy redaction (salted pseudonyms), ring buffers | implemented (`src/diagnostics/*`) |
 | helper | `include/aa/helper/*` | privileged helper client/service, NetworkManager AP worker, BlueZ AA RFCOMM bootstrap | implemented (`src/helper/*`, `src/helper/bluez_adapter`, `src/helper/nm`) |

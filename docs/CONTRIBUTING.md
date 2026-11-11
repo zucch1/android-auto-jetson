@@ -37,7 +37,9 @@ Inside `ci/host-build-test`, PR runs skip only the 600 s `ipc-bench-happy-600` t
 
 The host build downloads the exact GoogleTest v1.15.2 archive specified by `deps/manifest.json` outside configure, then verifies it against `deps/manifest.lock` and the checker's independently anchored source identity before staging. The release tag resolves to `b514bdc898e2951020cbdca1304b75f5950d1f59`; its exact archive SHA-256 is `7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926`. A moved tag or altered archive must fail verification, not update the lock. Checkout v4.2.2 was verified against the upstream tag as `11bd71901bbe5b1630ceea73d27597364c9af683`. Review and independently verify upstream identity before changing any action or source pin.
 
-The public `ci/arm64-cross-build` job executes against a synthetic fixture sysroot generated in `RUNNER_TEMP` (`tests/media/decode_cross_fixture.py`, `AA_SYSROOT_REQUIRE_OBSERVED=OFF`). It verifies toolchain invocation, compilation, and cross inventory (`assert_dbus_coverage.py --cross`). This public cross-build is explicitly **fixture-not-target**: it is NOT physical target qualification. The separate private observed-sysroot exact-SHA smoke (`sysroot jetson-r39.2.1`) and hardware qualification evidence remain distinct. Green public jobs are not full target acceptance or authorization to merge; hardware evidence is not replaced by host smoke tests or synthetic cross-builds.
+The public `ci/arm64-cross-build` job executes against a synthetic fixture sysroot generated in `RUNNER_TEMP` (`tests/media/decode_cross_fixture.py`, `AA_SYSROOT_REQUIRE_OBSERVED=OFF`). It verifies toolchain invocation, compilation, and cross inventory (`assert_dbus_coverage.py --cross`). This public cross-build is explicitly **fixture-not-target**: it is NOT physical target qualification.
+
+Target qualification evidence requires the separate observed-sysroot cross-smoke (`sysroot jetson-r39.2.1`), relayed by the maintainer via `tools/ci/arm64-cross-relay.sh:5-18`. The relay executes the observed-sysroot smoke (`AA_SYSROOT_REQUIRE_OBSERVED=ON`) against the exact commit SHA and posts the `ci/arm64-cross-build` commit status through the maintainer's local `gh` channel. Acceptance is strictly bound to the reviewed exact-head (exact-SHA) commit: after any squash merge, rebase, or sync, the head commit SHA changes and the smoke must be re-run and re-posted for the new exact SHA — never relay a stale SHA. Passing a local reproduction or synthetic fixture run is not a substitute for that reviewed exact-SHA run. Green public jobs are not full target acceptance or authorization to merge; hardware evidence is not replaced by host smoke tests or synthetic cross-builds.
 
 ## Local validation and privacy
 
@@ -70,9 +72,11 @@ done
 ```
 
 The mutation suite uses existing isolated, retained scratch fixtures; it never
-modifies the vendored sources in the working tree. The host build compiles
-GoogleTest/GoogleMock and the C++20 smoke target, not the full AASDK or a Jetson
-runtime. Keep private `.local/` content, evidence, sysroots, logs, caches, phone
-data, and credentials out of commits, PR attachments, and public CI uploads.
+modifies the vendored sources in the working tree. The native presets (`host-dev`,
+`host-release`, `host-asan`) build upstream AASDK (`cmake/AasdkAbi.cmake`), the
+receiver, and test targets; this establishes host and ABI compatibility, but
+does not establish Jetson qualification. Keep private `.local/` content, evidence,
+sysroots, logs, caches, phone data, and credentials out of commits, PR attachments,
+and public CI uploads.
 Review the exact staged file list before any authorized commit; do not use a
 blanket add of a dirty worktree. Preserve historical evidence locally.

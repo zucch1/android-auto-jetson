@@ -10,7 +10,7 @@ To prevent confusion between host tests, cross-compilation, and device qualifica
 
 - **Implemented**: Unprivileged wired receiver (`aa-wired-receiver`), privileged helper daemon (`aa-system-helper`), dummy test display (`aa-dummy-display`), H.264 hardware/software consumer decode pipeline, audio pipeline (defaulting to `pulsesink` via `pipewire-pulse`), versioned D-Bus control service (`org.custom.AndroidAutoReceiver1`), approve-once phone trust store (`aa_trust`), and pseudonymizing diagnostics.
 - **Host-tested**: Native unit, integration, and recovery test suites pass under host simulation and synthetic fixtures (`ctest --preset host-dev`).
-- **Cross-built against fixture**: Public CI cross-compiles for AArch64 against a synthetic fixture sysroot (`ci/arm64-cross-build`, `AA_SYSROOT_REQUIRE_OBSERVED=OFF`). This is explicitly **fixture-not-target**, not target qualification.
+- **Cross-built against fixture**: Public CI cross-compiles for AArch64 against a synthetic fixture sysroot (`ci/arm64-cross-build` in `.github/workflows/ci.yml:235-350`, `AA_SYSROOT_REQUIRE_OBSERVED=OFF`). This is explicitly **fixture-not-target**, not target qualification. Observed-sysroot cross-compilation acceptance is relayed via `tools/ci/arm64-cross-relay.sh` for exact head commits.
 - **Target-qualified**: On-device execution on NVIDIA Jetson hardware (L4T R39.2.1) is governed by live qualification runbooks (`docs/qualification/`); synthetic host tests do not substitute for target acceptance.
 - **Real-phone-qualified**: End-to-end projection with a physical phone over USB/AOA is governed by phase-B live QA procedures; host-side fixture passes do not qualify device interoperability.
 - **Active blockers**:
@@ -20,11 +20,11 @@ To prevent confusion between host tests, cross-compilation, and device qualifica
 ## Implemented architecture
 
 - **`aa-wired-receiver`**: Unprivileged receiver daemon running in user session. Owns USB/AOA and TCP transports, AASDK protocol translation, session state machine, media routing, and the user-session D-Bus control service (`org.custom.AndroidAutoReceiver`).
-- **`aa-system-helper`**: Privileged daemon managing NetworkManager AP, BlueZ Android Auto RFCOMM profile bootstrap, one-use token authentication, and caller UID/PID verification.
+- **`aa-system-helper`**: Privileged daemon managing NetworkManager AP, BlueZ Android Auto RFCOMM profile bootstrap, one-use grants, and caller UID/PID verification.
 - **`aa-dummy-display`**: Qt6 test display consuming encoded H.264 access units over a bounded `AF_UNIX` `SOCK_SEQPACKET` socket, with GStreamer hardware decode and a 5 ms precise timer pump (`tools/dummy-display/pump_timer.hpp`) for A/V synchronization.
 - **Audio pipeline**: Multi-role audio sink (`aareceiver-audio`) supporting `pulsesink` (default, via `pipewire-pulse` for continuous playback stability) and `pipewiresink`, with A/V sync gating.
 - **D-Bus control contract**: Versioned interface `org.custom.AndroidAutoReceiver1` (12 methods, 5 signals) with peer credential verification and pairing gates.
-- **Trust store**: Approve-once phone store (`aa_trust`) with HMAC-SHA256 tokens, atomic file persistence, and fail-closed admission.
+- **Trust store**: Persistent identity allowlist (`aa_trust`) with atomic file persistence and fail-closed admission; wired identifiers represent physical-access trust rather than cryptographic proof and are spoofable (`include/aa/trust/Store.hpp:5-23`).
 - **Diagnostics**: Structured JSON event telemetry with salted identifier pseudonymization (`id-<hex>`).
 
 ## How to build and test
@@ -32,32 +32,35 @@ To prevent confusion between host tests, cross-compilation, and device qualifica
 ### Prerequisites
 
 - CMake >= 3.20, Ninja, Python >= 3.12, C++20 compiler (GCC or Clang).
-- System development packages: `libprotobuf-dev`, `protobuf-compiler`, `libboost-system-dev`, `libboost-log-dev`, `libssl-dev`, `libusb-1.0-0-dev`, `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, `gstreamer1.0-tools`, `gstreamer1.0-plugins-good`, `gstreamer1.0-plugins-bad`, `pipewire-pulse`, `dbus-daemon`, `qt6-base-dev`, `valgrind`, `pkg-config`, `binutils`.
+- System development packages: `libprotobuf-dev`, `protobuf-compiler`, `libboost-system-dev`, `libboost-log-dev`, `libssl-dev`, `libusb-1.0-0-dev`, `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, `gstreamer1.0-tools`, `gstreamer1.0-plugins-good`, `gstreamer1.0-plugins-bad`, `gstreamer1.0-pipewire`, `pipewire-bin`, `wireplumber`, `pipewire-pulse`, `pulseaudio-utils`, `dbus-daemon`, `qt6-base-dev`, `valgrind`, `pkg-config`, `binutils` (matching `.github/workflows/ci.yml:44-59`).
 - Pre-staged locked GoogleTest v1.15.2 archive (configure never downloads dependencies).
+- Audio runtime: Audio pipeline route tests require an active user-session PipeWire audio runtime with default sink resolution and PulseAudio compatibility (`.github/workflows/ci.yml:74-137`).
 
 ### Host build
 
 ```sh
 set -euo pipefail
-export AA_GOOGLETEST_ARCHIVE=/path/to/googletest-v1.15.2.tar.gz
+export AA_GOOGLETEST_ARCHIVE="${AA_GOOGLETEST_ARCHIVE:-.local/dependencies/googletest-v1.15.2.tar.gz}"
 
 # Verify dependency manifest integrity
 python3 -B tools/deps/check_manifest.py --lock deps/manifest.lock --archive "$AA_GOOGLETEST_ARCHIVE"
 
-# Configure, build and test host preset
-cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE"
+# Configure, build and test host preset (AA_GOOGLETEST_ARCHIVE is optional if staged at .local/dependencies/)
+cmake --preset host-dev
 cmake --build --preset host-dev
 ctest --preset host-dev --output-on-failure
 ```
 
 ### Reproducing public CI checks locally
 
-The public CI workflow (`.github/workflows/ci.yml`) executes four independent checks:
+The public CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), which is the authority for active CI job names and steps) executes four independent checks:
 
 1. **`ci/host-build-test`**: `cmake --build --preset host-dev && ctest --preset host-dev --output-on-failure` (PR runs defer `ipc-bench-happy-600` when benchmark sources and build commands are unchanged vs base).
-2. **`ci/provenance-lint`**: `tools/provenance/check.sh` and `python3 -B tests/provenance/scenarios.py "$PWD" <scenario>`.
-3. **`ci/decode-overlay-cross`**: `python3 -B tests/media/cross_decode_overlay.py`.
-4. **`ci/arm64-cross-build`**: `cmake --preset jetson-aarch64 && cmake --build --preset jetson-aarch64` (against generated synthetic fixture sysroot; explicitly **fixture-not-target**).
+2. **`ci/provenance-lint`**: `tools/provenance/check.sh` and `for case in baseline overlay content header extra generated license gpl inventory listing symlink missing mode; do python3 -B tests/provenance/scenarios.py "$PWD" "$case"; done`.
+3. **`ci/decode-overlay-cross`**: Both invocations executed in `.github/workflows/ci.yml:195-215`:
+   - Probe, AArch64 ELF and bound overlay provenance: `python3 -B tests/media/cross_decode_overlay.py --scratch "$RUNNER_TEMP/decode-overlay-cross"`
+   - Full root cross provenance with external overlay: `python3 -B tests/media/cross_decode_overlay.py --root-project --archive "${AA_GOOGLETEST_ARCHIVE:-.local/dependencies/googletest-v1.15.2.tar.gz}" --scratch "$RUNNER_TEMP/decode-root-cross"`
+4. **`ci/arm64-cross-build`**: `cmake --preset jetson-aarch64 && cmake --build --preset jetson-aarch64` (against generated synthetic fixture sysroot with `AA_SYSROOT_REQUIRE_OBSERVED=OFF`; explicitly **fixture-not-target** per `.github/workflows/ci.yml:235-350`). For exact-head target cross-acceptance, the maintainer relays the observed-sysroot smoke (`AA_SYSROOT_REQUIRE_OBSERVED=ON`) via `tools/ci/arm64-cross-relay.sh:5-18`.
 
 ## Documentation directory
 
