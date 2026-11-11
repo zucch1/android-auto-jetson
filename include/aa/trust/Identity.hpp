@@ -4,7 +4,11 @@
 // Typed transport identity for approved phones (task 27). The store keeps the
 // STRONGEST available transport identity per phone:
 //   - wired    : USB descriptor ids + USB serial + AOA identity + physical-port
-//                context (the qualified USB3 port path as the kernel reports it)
+//                context (the qualified USB3 port path as the kernel reports it).
+//                With neither serial it is PORT-ONLY: nothing distinguishes one
+//                such phone from another of the same model on the same port, so
+//                serial-less wired phones are REFUSED for pairing and never
+//                authorize a session (see Store.hpp).
 //   - wireless : the BlueZ bond identity (bond address + adapter) carried as
 //                plain DATA. This module never talks to BlueZ; the transport
 //                layer hands the bond identity over.
@@ -31,6 +35,7 @@
 #include <aa/core/Result.hpp>
 
 #include <string>
+#include <string_view>
 #include <variant>
 
 namespace aa::trust {
@@ -89,6 +94,23 @@ inline constexpr std::size_t kMaxIdentityFieldBytes = 512;
 // structured forms distinct from each other. Use validated_key() upstream: it
 // rejects identities that carry no usable identity material.
 [[nodiscard]] std::string identity_key(const TransportIdentity& identity);
+
+// Classification of a canonical key against the serial-less wired policy
+// (audit M12). It inspects the KEY, never the stored variant, so a "w1:" key
+// held as an OpaqueIdentity (approve_once(PhoneIdentity), legacy migration) is
+// judged exactly like the structured WiredIdentity that produced it.
+//   not_wired    : not a "w1:" key (wireless, or an opaque legacy key)
+//   serial_bound : a canonical "w1:" key with a USB or AOA serial
+//   port_only    : a canonical "w1:" key with BOTH serials empty
+//   malformed    : starts with "w1:" but is not exactly the seven canonical
+//                  length-prefixed fields identity_key() emits
+enum class WiredKeyClass { not_wired, serial_bound, port_only, malformed };
+
+[[nodiscard]] WiredKeyClass classify_wired_key(std::string_view key) noexcept;
+
+// Fail-closed predicate for the trust store: true for a port-only or a
+// malformed "w1:" key. Such a key is never approved and never authorizes.
+[[nodiscard]] bool refuses_wired_authorization(std::string_view key) noexcept;
 
 // Field-level validation (printable ASCII, usable material). Fail closed.
 [[nodiscard]] core::Result<std::string> validated_key(const TransportIdentity& identity);

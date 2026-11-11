@@ -138,6 +138,11 @@ core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId reque
         // Fail closed: a request with no presented phone approves nothing.
         return Error{ErrorCode::trust_unknown_phone};
     }
+    if (refuses_wired_authorization(identity_key(*candidate_))) {
+        // Audit M12: a serial-less wired phone can never be approved, so the
+        // user is never prompted for a pairing that could not work.
+        return Error{ErrorCode::trust_rejected};
+    }
     if (pending_.size() >= kMaxPending) {
         return Error{ErrorCode::ipc_queue_full};
     }
