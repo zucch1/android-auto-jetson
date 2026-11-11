@@ -1,0 +1,3134 @@
+{
+ "accepted": [
+  {
+   "category": "unmatched-pending-research-aasdk",
+   "covers": [
+    "U-048dafbf7fde",
+    "U-12b0ba63c0a7",
+    "U-189c2cfaa45c",
+    "U-19b1e6cb897b",
+    "U-1ac964897b04",
+    "U-22b736976cee",
+    "U-350714af27d6",
+    "U-41f9f5b893d7",
+    "U-5a6e61f9a934",
+    "U-6bd5b4651312",
+    "U-7997e4076931",
+    "U-a114de0e8af0",
+    "U-b2e35995241f",
+    "U-bc5540a7a07e",
+    "U-cd8df6a76380",
+    "U-d294476a4f95",
+    "U-e4012b0f4480",
+    "U-e56787920781",
+    "U-fa513f65055a"
+   ],
+   "id": "ACC-UNMATCHED_PENDING_RESEARCH_AASDK",
+   "reason": "AASDK definition with no counterpart by explicit mapping, name, field position or structure. Recorded as unmatched-pending-research: not asserted absent from OAA, not asserted to be a product deficiency."
+  },
+  {
+   "category": "unmatched-pending-research-oaa",
+   "covers": [
+    "U-01224e56b05c",
+    "U-01495a19afc7",
+    "U-04e0898faf0f",
+    "U-0577fe96877a",
+    "U-08c7b6fe9bd2",
+    "U-0972b8e6f40c",
+    "U-0ad07f613e05",
+    "U-10166380eb3a",
+    "U-101b9b030e0c",
+    "U-11fe6277867b",
+    "U-128db63ccd3c",
+    "U-14c5d1fc1d9d",
+    "U-14d163c0fe31",
+    "U-157e40ad3838",
+    "U-15cc4165bf98",
+    "U-18ce5a4b83d5",
+    "U-19a18a98daa6",
+    "U-1a7796117798",
+    "U-1a86d8b106a8",
+    "U-1ed36c412538",
+    "U-238f292901c3",
+    "U-239e414f03d3",
+    "U-247a29999715",
+    "U-2647fe6b0aff",
+    "U-288df6c44178",
+    "U-2a2a42ce9d88",
+    "U-2be6b5599ac3",
+    "U-2cf7afaa6c2f",
+    "U-2d0ca0dad354",
+    "U-2e2356459545",
+    "U-2e3f560fbba1",
+    "U-2e5ced79c95f",
+    "U-2fbd2f7c05e0",
+    "U-2ff089766b0a",
+    "U-32c42a60b8d5",
+    "U-33d799102e08",
+    "U-34554abe0237",
+    "U-38f0ad5f5c85",
+    "U-38f610c5203a",
+    "U-3a18ec416f21",
+    "U-3b94246d4bd8",
+    "U-3d02a77fd62f",
+    "U-3db041496a71",
+    "U-41e69a041c10",
+    "U-42a5adc80640",
+    "U-434e36486ace",
+    "U-44b799407e68",
+    "U-4638db232ea2",
+    "U-4864414c1b48",
+    "U-4a2863536cca",
+    "U-4b991a4819a6",
+    "U-4ec8de970668",
+    "U-53b7dbb09536",
+    "U-55b6850a6e68",
+    "U-5684a2eb8974",
+    "U-57fcc5becc9a",
+    "U-5c65b778f15c",
+    "U-5e9cce352cee",
+    "U-62c96fe557c2",
+    "U-66cbc8ed5d73",
+    "U-68d684cbdd6f",
+    "U-6b65192260d4",
+    "U-6e5cfc3f5691",
+    "U-6fe46db36174",
+    "U-730142fce87e",
+    "U-7683d10c282b",
+    "U-7746e253f2e2",
+    "U-77fdb429a443",
+    "U-782d99391a50",
+    "U-7ee20da9c64d",
+    "U-82fedb267a28",
+    "U-835a351481c5",
+    "U-845dd88f01e2",
+    "U-863288980ed4",
+    "U-886c5dac73f1",
+    "U-8900b86db8d5",
+    "U-8ccbae22de57",
+    "U-8d9947ac1b85",
+    "U-92d0d928811b",
+    "U-935e487ac9bb",
+    "U-93cc07dcd571",
+    "U-962617bd218f",
+    "U-96c733f5193f",
+    "U-994b2b0ae538",
+    "U-9b97f9a70175",
+    "U-9c5786f5db8e",
+    "U-9e8852d0c729",
+    "U-9f74c6b14ac7",
+    "U-a110fd7a660c",
+    "U-a38758481f1a",
+    "U-a445b9ce73b1",
+    "U-a5d021e7b23d",
+    "U-a6fc4da08bb1",
+    "U-a81c4d9f1e91",
+    "U-a8216318903e",
+    "U-adb5b707bee3",
+    "U-adf40b0f0673",
+    "U-b01cc3c495c9",
+    "U-b4234a324799",
+    "U-b5988bb3b645",
+    "U-ba310f217a1a",
+    "U-ba617196d06e",
+    "U-bc17f51a78b7",
+    "U-bcfd317f5657",
+    "U-c32c3b920f00",
+    "U-c4025615c4cf",
+    "U-c606c760a725",
+    "U-c75da3d11fa4",
+    "U-c7d9f571098d",
+    "U-cb6e0ee4984c",
+    "U-ce7389f2a3d4",
+    "U-cfb1a5f64460",
+    "U-d07790bb1131",
+    "U-d0c48617f09f",
+    "U-d0f730773f4f",
+    "U-d26c3c6d886d",
+    "U-d5b7806681a5",
+    "U-d7a5d81411b4",
+    "U-db8c99ba25df",
+    "U-dfdf755d8013",
+    "U-e24bc98394c5",
+    "U-e2e4ce8b06e0",
+    "U-e335588be679",
+    "U-e507d7782210",
+    "U-e51eb03a2abd",
+    "U-e8db85ea4b3f",
+    "U-e9854a011293",
+    "U-e9de8e18cbc1",
+    "U-ec25078119bf",
+    "U-eca2a15cd87d",
+    "U-ed9fbadbd51a",
+    "U-f0cc70861b39",
+    "U-f0fe420e9c9b",
+    "U-f261b47e0f43",
+    "U-f37cc0c562a9",
+    "U-f58e2582b1de",
+    "U-f787bccbf585",
+    "U-f8967b2657fc",
+    "U-f92fd9887235",
+    "U-faf5fa3847ff",
+    "U-fb13caebaa80",
+    "U-fcb5b6a24748",
+    "U-fe64813a55be",
+    "U-ff71fffe21d7"
+   ],
+   "id": "ACC-UNMATCHED_PENDING_RESEARCH_OAA",
+   "reason": "OAA definition with no counterpart by explicit mapping, name, field position or structure. Recorded as unmatched-pending-research: not asserted absent from AASDK, not asserted to be a product deficiency."
+  },
+  {
+   "category": "undecided-pending-research",
+   "covers": [
+    "U-0ecc7c80c8c9",
+    "U-604b7fb5ca3c",
+    "U-69401b4cdc10",
+    "U-81c1bf6cb2d4",
+    "U-840959b9c522",
+    "U-b48ab52e956a",
+    "U-c95673ab1c14",
+    "U-e2bf85ae1ff7",
+    "U-e77cae153148",
+    "U-ef970da2a12b",
+    "U-fbdbc2bcc590"
+   ],
+   "id": "ACC-UNDECIDED_PENDING_RESEARCH",
+   "reason": "Candidate counterparts exist but the evidence is tied, collapses to a name collision, or is not mutual; deliberately left undecided rather than guessed."
+  },
+  {
+   "category": "untriaged-wire-differences",
+   "covers": [
+    "W-019c4ec0a9e3",
+    "W-01c126690776",
+    "W-0319c83445c7",
+    "W-04c92e4e3ad5",
+    "W-06570c2ad39e",
+    "W-069ad73b3646",
+    "W-073fd2e4c83e",
+    "W-08cf54c69849",
+    "W-0a5349bafbf0",
+    "W-0aec882a29f7",
+    "W-0e0eaa591708",
+    "W-11a93fa72dc6",
+    "W-12d7f556b2c1",
+    "W-164ef35789a4",
+    "W-1677c0793896",
+    "W-1736bad898f3",
+    "W-183ae0c94130",
+    "W-1c1c8e20cad6",
+    "W-1c278349f7e4",
+    "W-1f50457d155d",
+    "W-200c18c0b4da",
+    "W-2148b289ac9e",
+    "W-21c4bf8bdf07",
+    "W-21e62fff0e23",
+    "W-2252a4359203",
+    "W-23fe897ecb2c",
+    "W-27387ac4f686",
+    "W-275c3bc78a85",
+    "W-29d9176aeb15",
+    "W-2a6505e017e0",
+    "W-2e4d24078d0a",
+    "W-31001689b09a",
+    "W-33c0cdd2e87d",
+    "W-34ba0e2bb515",
+    "W-35d104f7a1ee",
+    "W-38fb5dc170b3",
+    "W-39ad20f8b563",
+    "W-3c2cdd680e50",
+    "W-3d1fc7932e78",
+    "W-404a0e2d640d",
+    "W-405f3afe71a4",
+    "W-433b31e95399",
+    "W-4465515a3b87",
+    "W-4505a790ea87",
+    "W-45d0fe866401",
+    "W-463f8a4f2176",
+    "W-4801587e1e2b",
+    "W-486757287dbe",
+    "W-49251106c564",
+    "W-4a9c2f18cd28",
+    "W-4ca8b9f1c956",
+    "W-4f70b699dd33",
+    "W-50287e37691c",
+    "W-507e763a97b5",
+    "W-51f79326af90",
+    "W-539c9e3871c7",
+    "W-5599673ab73a",
+    "W-5a9bf98ba701",
+    "W-5d3f18a66a2e",
+    "W-5e727f2a959f",
+    "W-5f7bbdb02e2a",
+    "W-62a6181d61a9",
+    "W-63d5547d991e",
+    "W-644c7f4b389b",
+    "W-663c2eb34fbd",
+    "W-66621ab322c1",
+    "W-66719d6b1369",
+    "W-67f22cd94c5b",
+    "W-681def165bc3",
+    "W-68390eed7262",
+    "W-689a5e090ea2",
+    "W-691d8561e90f",
+    "W-69799cb707f9",
+    "W-6e4533794fd1",
+    "W-71a4753ce541",
+    "W-74583354032f",
+    "W-74817a5f05bd",
+    "W-74ddeedcc270",
+    "W-75dba6f6e78a",
+    "W-76f346284968",
+    "W-77162427c0af",
+    "W-790d181ee0bb",
+    "W-79ad8561ab3b",
+    "W-7ad9632f604c",
+    "W-7c716f308a62",
+    "W-7e4c9744b642",
+    "W-7f36cc1d9a8d",
+    "W-83b50c79ca07",
+    "W-8509ad9f4b87",
+    "W-851cffa89e46",
+    "W-859b24157d07",
+    "W-86389dfd5582",
+    "W-86aeb7ca6af2",
+    "W-8baba108b80a",
+    "W-8d18344fe17f",
+    "W-8f2dc4a965de",
+    "W-90a2a031de07",
+    "W-90d71abfc4ce",
+    "W-913acadde900",
+    "W-9337bb3765d9",
+    "W-947448462c7f",
+    "W-949db16a2268",
+    "W-9576eeab98f5",
+    "W-966591d409ad",
+    "W-9865e6dae288",
+    "W-9a24652f13fb",
+    "W-9c966a940eba",
+    "W-9e094cf1257f",
+    "W-9e19eca5fa93",
+    "W-a107c8a10578",
+    "W-a1e73eafb187",
+    "W-a35e6158b14e",
+    "W-a5a7f0d66f70",
+    "W-aa79e0c5cb13",
+    "W-ab69d73659f2",
+    "W-af74361c4275",
+    "W-b029e5774673",
+    "W-b12c525b6739",
+    "W-b16e74f51a3d",
+    "W-b25cd2749dda",
+    "W-b349416d7d44",
+    "W-b410619fc0b9",
+    "W-b469f8e8a295",
+    "W-b4872b1bf06b",
+    "W-b4a6140b79b1",
+    "W-b52beac186c8",
+    "W-b6dc403e0b2e",
+    "W-b79aafe4111f",
+    "W-b9149e93b966",
+    "W-b987dc7c5861",
+    "W-ba590d71ba39",
+    "W-bb1aeff626ed",
+    "W-bc2d770891a2",
+    "W-be2398662647",
+    "W-be80685a800a",
+    "W-c0165d44a661",
+    "W-c3eb9425ba89",
+    "W-c569bc77f916",
+    "W-c5a69fa04b4e",
+    "W-c685da60b9c4",
+    "W-d04b6dd7d0bd",
+    "W-d04e883cabfb",
+    "W-d08d3d4a2eb6",
+    "W-d1c5dcfeaef6",
+    "W-d3b93eb838dc",
+    "W-d45a94fe98a7",
+    "W-d5022fcc937a",
+    "W-dab1a21e461f",
+    "W-dbd2973d2a8b",
+    "W-df120e32b7e5",
+    "W-e08a24175234",
+    "W-e408d5b18fae",
+    "W-e4d38030d858",
+    "W-edeac8988da1",
+    "W-efeedfbdeefa",
+    "W-f12543eb3c52",
+    "W-f171b9de7ad6",
+    "W-f1f6a778e95d",
+    "W-f57c6d92bbd0",
+    "W-faf33eaac0da",
+    "W-fb298e83e0e6",
+    "W-fbbfdcc0d2b8",
+    "W-fd54070a4689",
+    "W-fe1b5753476a",
+    "W-feaf18492acc",
+    "W-ffa403443229"
+   ],
+   "id": "ACC-UNTRIAGED_WIRE_DIFFERENCES",
+   "reason": "Generated wire-affecting difference (field or enum value on one side only, cardinality, embedded type, or same value number with a different name) that no human has triaged yet. Not asserted to be harmless or a gap."
+  },
+  {
+   "category": "untriaged-interpretation-differences",
+   "covers": [
+    "W-02f7fde42c47",
+    "W-03c291408b3a",
+    "W-04319c931f67",
+    "W-049a213ec6bd",
+    "W-05701a1c97d7",
+    "W-07f2c5a1be98",
+    "W-089ae5f72f09",
+    "W-08fc073aa91f",
+    "W-0a177e7de7c8",
+    "W-0cb30e179697",
+    "W-0e21ad503115",
+    "W-0f9c58bc770f",
+    "W-1049caedb41e",
+    "W-1124dbff09ed",
+    "W-1448c24f5e07",
+    "W-174a731bc60e",
+    "W-1f21fcbcb340",
+    "W-2091a9f31f60",
+    "W-217310f418e5",
+    "W-220f6d335893",
+    "W-2299d9020025",
+    "W-23d376093dfd",
+    "W-25bd8af642dd",
+    "W-25d6c0468886",
+    "W-2bbf1e4f61a5",
+    "W-2d84c0144c35",
+    "W-2dd61ef474a6",
+    "W-2f3255e2a596",
+    "W-30482118d1f7",
+    "W-31b9eb23782f",
+    "W-32a6ee715335",
+    "W-35ce7a8bc5b3",
+    "W-35fac2ff745d",
+    "W-3667cd5eebb0",
+    "W-3aee2712ea28",
+    "W-3cf4f8a868e2",
+    "W-3da4bdc40d40",
+    "W-3f8fbff1b201",
+    "W-3fcbdee76299",
+    "W-4251c58e8727",
+    "W-465d151b8b3f",
+    "W-4802e954cba0",
+    "W-4b07299bae3e",
+    "W-4bf887e6ecfd",
+    "W-4ce6dc667ecf",
+    "W-4daaab13fc9f",
+    "W-4fc23806996c",
+    "W-51692a498809",
+    "W-51f01de540b7",
+    "W-52347fc2352b",
+    "W-56add1ab6bb0",
+    "W-5af011633966",
+    "W-5c5b79f91d70",
+    "W-6121de348c32",
+    "W-616a6faef160",
+    "W-622445776964",
+    "W-63885a9c100b",
+    "W-6454d8e6be19",
+    "W-65d10a3915f4",
+    "W-6949ca70d555",
+    "W-69b725a1082f",
+    "W-6b6032a93812",
+    "W-6bf4dea13aff",
+    "W-6dd9d5844a78",
+    "W-6df41a15aba1",
+    "W-6ef83c6d29e7",
+    "W-708f957fa736",
+    "W-70e12ed08153",
+    "W-723907d14e96",
+    "W-72bf8be4dddc",
+    "W-749177e5f357",
+    "W-7858b8c7565a",
+    "W-7a9ade8f6642",
+    "W-7afdbd9db832",
+    "W-7cb6ace88645",
+    "W-7d1d437f0644",
+    "W-820ff89ccdbc",
+    "W-85f71525bb7b",
+    "W-8b3828e2289d",
+    "W-8c4939bcda65",
+    "W-8cf31201edb1",
+    "W-901707604880",
+    "W-9070920e450f",
+    "W-90feee7f790e",
+    "W-91c87b0fc12b",
+    "W-91de30ba5a83",
+    "W-93f534129615",
+    "W-94fb3cd48b31",
+    "W-963146219a0e",
+    "W-97d04d7d0512",
+    "W-9bac006ce2e3",
+    "W-9fbbec30c7dd",
+    "W-a0e3e5287f96",
+    "W-a3418e419591",
+    "W-a47a5ad9eabe",
+    "W-a5059beb5f20",
+    "W-a5d891c186e0",
+    "W-a7348766caa4",
+    "W-a80caaeb487d",
+    "W-a853a08eb47a",
+    "W-aadbd340a81d",
+    "W-ab0c3b3b4cfd",
+    "W-abdcda12e2e2",
+    "W-abf6fbb5abe5",
+    "W-ac81a00acdf9",
+    "W-acaf172ec80a",
+    "W-acb6f8e67057",
+    "W-b03afbaeafa6",
+    "W-b211e9c138ad",
+    "W-b29dc6f7f635",
+    "W-b2e4d2c1edca",
+    "W-b4f2b2e14e9e",
+    "W-b60cce114916",
+    "W-b6993916b2a7",
+    "W-b702f51efa8b",
+    "W-b7a31160641a",
+    "W-b8d2aefc8948",
+    "W-b9f23240bf99",
+    "W-baa69f1ce796",
+    "W-bb7b22fb8ec9",
+    "W-bb9dcf767666",
+    "W-bc6457f7300e",
+    "W-bdeb4d29088a",
+    "W-bdfa66a0a2ac",
+    "W-be0b0649c76f",
+    "W-be7c4f5cb5b8",
+    "W-c0b215202dab",
+    "W-c1f53247f5d0",
+    "W-c2f8f6645043",
+    "W-c44c5d72b8ac",
+    "W-c4dedc194ce7",
+    "W-c8eb92c34bd4",
+    "W-ce7a45f0cf9f",
+    "W-d1dcff9c2bfb",
+    "W-d347fa327199",
+    "W-d4a4ea8adeb9",
+    "W-d64db6200388",
+    "W-d7d92d751ccd",
+    "W-db8c48071cdc",
+    "W-dbb687b19430",
+    "W-df1afed1311c",
+    "W-e116ff9e8651",
+    "W-e1cdc5738948",
+    "W-e33ce4a131ac",
+    "W-e34df192d6d6",
+    "W-e53f549c9b9b",
+    "W-e57fcb0ff6df",
+    "W-e5983d0e4900",
+    "W-e9710cf2a093",
+    "W-edb4504c9303",
+    "W-ee98c4c16fa7",
+    "W-f24dea872f3b",
+    "W-f2bfa4c19bf4",
+    "W-f35358be7a37",
+    "W-f57f5084d03f",
+    "W-f6944743741b",
+    "W-fa93721a587b"
+   ],
+   "id": "ACC-UNTRIAGED_INTERPRETATION_DIFFERENCES",
+   "reason": "Generated interpretation difference (presence, default, integer family, enum type, oneof, non-normalised field rename) that no human has triaged yet. Not asserted to be harmless or a gap."
+  }
+ ],
+ "description": "Human-curated layer over the generated differences in protobuf-audit-inventory.json. The 24 legacy discrepancy texts are not stored here: they are copied verbatim from wire-conformance-matrix.json, whose per-entry sha256 is pinned in legacy_pins. 'covers' lists generated difference IDs; 'accepted' entries cover differences nobody has triaged, explicitly and with a reason.",
+ "findings": [
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "MEDIA_MESSAGE_UPDATE_UI_CONFIG_REPLY = 32778",
+       "lines": "19",
+       "path": "third_party/aasdk/protobuf/aap_protobuf/service/media/sink/MediaMessageId.proto"
+      },
+      {
+       "diff": "W-465783333a6b"
+      }
+     ],
+     "result": "verified",
+     "text": "The pinned AASDK MediaMessageId names value 32778 (0x800A) MEDIA_MESSAGE_UPDATE_UI_CONFIG_REPLY."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "UPDATE_UI_CONFIG_REQUEST = 0x8009",
+       "lines": "25",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMessageIdsEnum.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "The OAA message-id enum has 0x8009 UPDATE_UI_CONFIG_REQUEST and no 0x800A entry."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "message UpdateUiConfigReply",
+       "lines": "7",
+       "path": "third_party/aasdk/protobuf/aap_protobuf/service/control/message/UpdateUiConfigReply.proto"
+      },
+      {
+       "contains": "message UpdateUiConfigRequest",
+       "lines": "31",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UpdateUiConfigRequestMessage.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK carries the 0x8009 and 0x800A payloads in two messages (UpdateUiConfigRequest, UpdateUiConfigReply); OAA defines one UpdateUiConfigRequest."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "Wire msg 0x8009 HU->Phone (inbound), 0x800A Phone->HU (outbound)",
+       "lines": "14",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UpdateUiConfigRequestMessage.proto"
+      }
+     ],
+     "result": "unverifiable",
+     "text": "0x8009/0x800A are the two directions of one request and 'no reply is implied'; the real reply is 0x8012 (OAA, 'gold' handler evidence)."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "U-d0501e019b1e",
+    "W-465783333a6b",
+    "W-8ab3d3d7262c",
+    "W-f6804ae77ce2"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "absent_pattern": "UpdateUiConfig|0x8009|0x800A|0x8011|0x8012",
+      "in": [
+       "src",
+       "include"
+      ]
+     }
+    ],
+    "text": "No UI-config message (0x8009/0x800A/0x8011/0x8012) is referenced anywhere in src/ or include/."
+   },
+   "disposition": "confirmed-gap",
+   "domain": "av_media_video",
+   "evidence_tier": "oaa-claim-unverified",
+   "id": "D1-800A-NAME",
+   "legacy": true,
+   "owner": "child-3-display-ui-theming",
+   "rationale": "Mechanical difference confirmed; the 'reply vs request' reading of 0x800A rests on OAA handler comments that are not independently verified here.",
+   "receiver_impact": "The receiver neither consumes 0x8009 nor emits 0x800A; the phone-side semantics of 0x800A are an OAA claim.",
+   "related": [
+    "D2-8012-MISSING"
+   ],
+   "severity": "high",
+   "status": "confirmed",
+   "version_gates": "AA 17.x (UI-config exchange)"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-37fb2234a136"
+      }
+     ],
+     "result": "verified",
+     "text": "The pinned AASDK MediaMessageId ends at 32779 (0x800B) and has no 0x8012."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "THEMING_TOKENS_ACCEPTED = 1",
+       "lines": "25",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UpdateHuUiConfigResponse.proto"
+      },
+      {
+       "contains": "UPDATE_HU_UI_CONFIG_RESPONSE = 0x8012",
+       "lines": "33",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMessageIdsEnum.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA defines UpdateHuUiConfigResponse (ThemingTokensStatus ERROR=0, ACCEPTED=1, REJECTED=2) for id 0x8012."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "confidence: unverified",
+       "lines": "14",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UpdateHuUiConfigResponse.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA's own confidence for the 0x8012 message is 'unverified'."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "Response to UiConfigRequest (0x8011)",
+       "lines": "11",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UpdateHuUiConfigResponse.proto"
+      }
+     ],
+     "result": "unverifiable",
+     "text": "Without 0x8012 the theming-token exchange (0x8011 -> 0x8012) cannot be answered."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-37fb2234a136",
+    "W-4666a0abd1c5"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "absent_pattern": "UpdateHuUiConfig|0x8012|0x8011",
+      "in": [
+       "src",
+       "include"
+      ]
+     }
+    ],
+    "text": "No reference to 0x8011/0x8012 or UpdateHuUiConfigResponse in src/ or include/."
+   },
+   "disposition": "confirmed-gap",
+   "domain": "av_media_video",
+   "evidence_tier": "oaa-claim-unverified",
+   "id": "D2-8012-MISSING",
+   "legacy": true,
+   "owner": "child-3-display-ui-theming",
+   "rationale": "AASDK has no 0x8011/0x8012 ids; OAA marks the 0x8012 message itself 'confidence: unverified'.",
+   "receiver_impact": "No 0x8011/0x8012 exchange exists in the receiver; whether a phone requires it is unverified.",
+   "related": [
+    "D1-800A-NAME",
+    "D25-VID-COLOR-SCHEME"
+   ],
+   "severity": "high",
+   "status": "confirmed",
+   "version_gates": "AA 17.x (theming tokens, Material You v2)"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-3785c00bb100"
+      },
+      {
+       "diff": "W-463ef8374642"
+      },
+      {
+       "contains": "blended_ui_config",
+       "lines": "31",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/AdditionalVideoConfigData.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK UiConfig has fields 1-4; OAA AdditionalVideoConfig has fields 1-8."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "ui_theme",
+       "lines": "12",
+       "path": "third_party/aasdk/protobuf/aap_protobuf/service/media/shared/message/UiConfig.proto"
+      }
+     ],
+     "result": "partly-verified",
+     "text": "Tags 1-4 are wire-compatible between the two (same numbers, varint/len types); 5-8 are extensions."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "hidden_ui_elements",
+       "lines": "28",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/AdditionalVideoConfigData.proto"
+      }
+     ],
+     "result": "unverifiable",
+     "text": "Fields 5-8 are GAL 4.3+ features (hidden_ui_elements, resize_actions, margin_configs, blended_ui_config)."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "U-77a59633f119",
+    "W-3785c00bb100",
+    "W-463ef8374642"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "inline constexpr ExtensionPolicy kStrictExtensionPolicy = ExtensionPolicy::reject;",
+      "lines": "113",
+      "path": "src/protocol/aasdk_adapter/UnknownFields.hpp"
+     }
+    ],
+    "text": "UnknownFields.hpp keeps ExtensionPolicy::reject as the boundary default."
+   },
+   "disposition": "deferred",
+   "domain": "av_media_video",
+   "evidence_tier": "oaa-claim-unverified",
+   "id": "D3-UICFG-PAYLOAD",
+   "legacy": true,
+   "owner": "child-3-display-ui-theming",
+   "rationale": "Deferred until the UI-config exchange (D1/D2) is implemented; extension tolerance policy decision belongs with it.",
+   "receiver_impact": "AdditionalVideoConfig fields 5-8 are unrepresentable in the pinned schema; no UI-config consumer exists, so nothing reads them today.",
+   "related": [
+    "D1-800A-NAME",
+    "D39-UNKNOWN-FIELDS-POLICY"
+   ],
+   "severity": "medium",
+   "status": "deferred",
+   "version_gates": "GAL 4.3+ per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-9f7ce0022564"
+      },
+      {
+       "diff": "W-cbe411fa6fc0"
+      },
+      {
+       "diff": "W-d79c4083db9c"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK Config.Status is WAIT=1/READY=2; OAA AVChannelSetupStatus is NONE=0/FAIL=1/OK=2."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "wire.set_status(shared::Config::STATUS_READY);",
+       "lines": "171",
+       "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
+      }
+     ],
+     "result": "verified",
+     "text": "The receiver emits READY (2) only."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-9f7ce0022564",
+    "W-b509562c0d84",
+    "W-cbe411fa6fc0",
+    "W-d79c4083db9c",
+    "W-fffa4b7248e5"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "wire.set_status(shared::Config::STATUS_READY);",
+      "lines": "171",
+      "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
+     },
+     {
+      "contains": "static_assert(shared::Config::STATUS_READY == 2);",
+      "lines": "31",
+      "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
+     }
+    ],
+    "text": "encode_av_sink_ready() sets Config::STATUS_READY (2); status 1 is never emitted."
+   },
+   "disposition": "unverified",
+   "domain": "av_media_video",
+   "evidence_tier": "code-verified",
+   "id": "D4-SETUP-STATUS",
+   "legacy": true,
+   "owner": "child-2-av-media-focus",
+   "rationale": "Conflict is mechanical (WAIT=1 vs FAIL=1); no gap while only 2 is emitted. Phone evidence is needed to classify value 1.",
+   "receiver_impact": "Receiver emits status 2 only (READY/OK agree); how a phone treats value 1 is unverified.",
+   "severity": "high",
+   "status": "proposed",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-421d92bb0383"
+      },
+      {
+       "diff": "W-80222f5bb403"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK VideoFocusReason has 0-2; OAA adds 3=LAST_MODE and 4=USER_SELECTION."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "bool malformed() const noexcept { return has_unknown_enum_or_wiretype(); }",
+       "lines": "74",
+       "path": "src/protocol/aasdk_adapter/UnknownFields.hpp"
+      }
+     ],
+     "result": "contradicted",
+     "text": "Legacy text: an unknown enum value 'silently defaults to 0 - a misread, not a rejection'. In the current adapter it is rejected as malformed (class 1 unknown enum on a known tag)."
+    }
+   ],
+   "confidence": "high",
+   "covers": [
+    "W-421d92bb0383",
+    "W-80222f5bb403"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "constexpr int tags[] = {1, 2, 3};",
+      "lines": "104",
+      "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
+     },
+     {
+      "contains": "known ? UnknownFieldOrigin::unknown_enum_or_wiretype",
+      "lines": "105",
+      "path": "src/protocol/aasdk_adapter/UnknownFields.hpp"
+     }
+    ],
+    "text": "decode_video_focus_request() lists tags {1,2,3}; an enum value the pinned proto2 enum lacks lands in the unknown-field set on a known tag, which classify_unknown_fields marks malformed."
+   },
+   "disposition": "confirmed-gap",
+   "domain": "av_media_video",
+   "evidence_tier": "code-verified",
+   "id": "D5-VF-REASON",
+   "legacy": true,
+   "owner": "child-2-av-media-focus",
+   "rationale": "Mechanical enum difference plus verified fail-closed handling. Whether phones actually send 3/4 is OAA's claim.",
+   "receiver_impact": "A phone sending VideoFocusReason 3 or 4 would have the whole 0x8007 request rejected as malformed.",
+   "severity": "medium-high",
+   "status": "confirmed",
+   "version_gates": "modern phones per OAA (values 3/4)"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-b23ba1b03817"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK VideoFocusRequestNotification has deprecated disp_channel_id=1; OAA VideoFocusRequest has no field 1."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "constexpr int tags[] = {1, 2, 3};",
+       "lines": "104",
+       "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
+      }
+     ],
+     "result": "verified",
+     "text": "Decode ignores field 1 and routes on field 2."
+    }
+   ],
+   "confidence": "high",
+   "covers": [
+    "W-535a1ecefd0a",
+    "W-87e194584650",
+    "W-b23ba1b03817"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "if (wire.has_mode()) { request.mode = static_cast<VideoFocusMode>(wire.mode()); }",
+      "lines": "109",
+      "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
+     }
+    ],
+    "text": "decode_video_focus_request() accepts tag 1 in its known-tag list and reads only has_mode()."
+   },
+   "disposition": "equivalent",
+   "domain": "av_media_video",
+   "evidence_tier": "code-verified",
+   "id": "D6-VF-FIELD1",
+   "legacy": true,
+   "owner": "triage:phase0-closed",
+   "rationale": "Field 1 exists only in AASDK (mechanical); the receiver never routes on it.",
+   "receiver_impact": "None: field 1 is accepted and ignored; routing uses mode (field 2).",
+   "severity": "low",
+   "status": "resolved",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "AUDIO_UNDERFLOW = 0x800B",
+       "lines": "26",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMessageIdsEnum.proto"
+      },
+      {
+       "diff": "U-19282653cf7f"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK defines AudioUnderflowNotification (message id 0x800B) with a required session_id; OAA has the id AUDIO_UNDERFLOW but no payload message."
+    },
+    {
+     "evidence": [],
+     "result": "unverifiable",
+     "text": "The 17.3 endpoint receives no payload on 0x800B."
+    }
+   ],
+   "confidence": "low",
+   "covers": [
+    "U-19282653cf7f",
+    "W-3f94bd1c10df"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "absent_pattern": "AudioUnderflow|0x800B|MEDIA_MESSAGE_AUDIO_UNDERFLOW",
+      "in": [
+       "src",
+       "include"
+      ]
+     }
+    ],
+    "text": "No reference to AudioUnderflow or 0x800B in src/ or include/."
+   },
+   "disposition": "unverified",
+   "domain": "av_media_video",
+   "evidence_tier": "oaa-claim-unverified",
+   "id": "D7-UNDERFLOW-PAYLOAD",
+   "legacy": true,
+   "owner": "child-2-av-media-focus",
+   "rationale": "AASDK defines a payload for 0x800B; OAA defines the id but no message. Absence of an OAA payload message is mechanical; its meaning is not.",
+   "receiver_impact": "The receiver never sends 0x800B; whether a phone parses a body is unverified.",
+   "severity": "low-medium",
+   "status": "proposed",
+   "version_gates": "AA 17.3 per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-1ff152ed56c0"
+      },
+      {
+       "diff": "W-3f81fb7bf180"
+      },
+      {
+       "diff": "W-444d1406f165"
+      },
+      {
+       "diff": "W-4e6836664574"
+      },
+      {
+       "diff": "W-788cdf44139c"
+      },
+      {
+       "diff": "W-ca7c9fcac2e7"
+      },
+      {
+       "diff": "W-ec347cca5796"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK names fields 4/5 label_text/device_name; OAA names them device_name/device_brand."
+    },
+    {
+     "evidence": [],
+     "result": "unverifiable",
+     "text": "The OAA reading comes from a live capture."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-1ff152ed56c0",
+    "W-3f81fb7bf180",
+    "W-444d1406f165",
+    "W-4e6836664574",
+    "W-788cdf44139c",
+    "W-ca7c9fcac2e7",
+    "W-ec347cca5796"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "case protocol::ControlMessageId::service_discovery_request: {",
+      "lines": "499",
+      "path": "src/app/WiredSession.cpp"
+     },
+     {
+      "contains": "if (auto sent = announce_services(); !sent) {",
+      "lines": "506",
+      "path": "src/app/WiredSession.cpp"
+     }
+    ],
+    "text": "On ServiceDiscoveryRequest the receiver only checks authentication and announces services; the payload is not decoded."
+   },
+   "disposition": "deferred",
+   "domain": "control_sdp",
+   "evidence_tier": "code-verified",
+   "id": "D8-SDQ-45-SEMANTICS",
+   "legacy": true,
+   "owner": "child-1-control-sdp",
+   "rationale": "Field 4/5 names differ (label_text/device_name vs device_name/device_brand): same wire type, so the meaning difference is not mechanically decidable; deferred until a consumer exists.",
+   "receiver_impact": "No consumer: the receiver does not read the request's fields.",
+   "severity": "medium",
+   "status": "deferred",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-53afed41673b"
+      },
+      {
+       "contains": "// Field 16 not in APK v16.1.",
+       "lines": "54",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ServiceDiscoveryResponseMessage.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK ServiceDiscoveryResponse has connection_configuration=16; OAA has no field 16."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "confidence: retracted",
+       "lines": "25",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ConnectionConfigurationData.proto"
+      }
+     ],
+     "result": "retracted-upstream",
+     "text": "OAA marks its ConnectionConfiguration definition 'retracted'."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "WireService* entry = wire.add_channels();",
+       "lines": "160",
+       "path": "src/protocol/aasdk_adapter/ServiceAdapter.cpp"
+      }
+     ],
+     "result": "contradicted",
+     "text": "Legacy resolution: receiver emits fields 1-15 and omits 16. Corrected: the encoder sets only field 1 (channels)."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-0e20c4fcbf90",
+    "W-114fe423c0fd",
+    "W-53afed41673b",
+    "W-582844496744",
+    "W-6920ab6e9a6b",
+    "W-9c11fa0c57d2",
+    "W-deabc8521cba",
+    "W-eebabd1d6b46"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "WireService* entry = wire.add_channels();",
+      "lines": "160",
+      "path": "src/protocol/aasdk_adapter/ServiceAdapter.cpp"
+     }
+    ],
+    "text": "encode(ServiceDiscoveryResponse) populates only channels (field 1); connection_configuration (16) is never set."
+   },
+   "disposition": "unverified",
+   "domain": "control_sdp",
+   "evidence_tier": "code-verified",
+   "id": "D9-SDR-F16",
+   "legacy": true,
+   "owner": "child-1-control-sdp",
+   "rationale": "Field-16 presence only in AASDK is mechanical; OAA's retraction of the field-16 mapping is an upstream claim.",
+   "receiver_impact": "None today: the encoder never sets field 16. OAA claims phones ignore or reject it.",
+   "severity": "medium",
+   "status": "proposed",
+   "version_gates": "AA 16.1+ per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "CAR_PROPERTY_LISTENER_FAILED = -27",
+       "lines": "43",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/common/StatusEnum.proto"
+      },
+      {
+       "contains": "CAR_PROPERTY_SET_FAILED = -26",
+       "lines": "42",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/common/StatusEnum.proto"
+      },
+      {
+       "diff": "W-11b9ee2ff19a"
+      },
+      {
+       "diff": "W-9641075f23b6"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA Status adds CAR_PROPERTY_SET_FAILED=-26 and CAR_PROPERTY_LISTENER_FAILED=-27; AASDK MessageStatus lacks them."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "CAR_PROPERTY_LISTENER_FAILED = -27",
+       "lines": "43",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/common/StatusEnum.proto"
+      }
+     ],
+     "result": "contradicted",
+     "text": "Previous PR text claimed -27 was CAR_PROPERTY_NOT_AVAILABLE and cited ControlAdapter.cpp:202 (encode(ChannelOpenRequest)); both were wrong."
+    }
+   ],
+   "confidence": "high",
+   "covers": [
+    "W-11b9ee2ff19a",
+    "W-337a06d29b99",
+    "W-9641075f23b6",
+    "W-a11ba77f3a4f",
+    "W-d15d1a7c685b"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "case aap_protobuf::shared::STATUS_COMMAND_NOT_SUPPORTED:",
+      "lines": "219",
+      "path": "src/protocol/aasdk_adapter/ControlAdapter.cpp"
+     },
+     {
+      "contains": "return ChannelOpenResponse{ChannelOpenStatus::unsupported};",
+      "lines": "220",
+      "path": "src/protocol/aasdk_adapter/ControlAdapter.cpp"
+     }
+    ],
+    "text": "decode_channel_open_response accepts STATUS_SUCCESS and STATUS_COMMAND_NOT_SUPPORTED only; anything else is malformed."
+   },
+   "disposition": "deferred",
+   "domain": "control_sdp",
+   "evidence_tier": "code-verified",
+   "id": "D10-STATUS-EXTRA",
+   "legacy": true,
+   "owner": "child-5-wireless-bt-radio",
+   "rationale": "Legacy text restored: OAA value -27 is CAR_PROPERTY_LISTENER_FAILED (StatusEnum.proto:43), -26 CAR_PROPERTY_SET_FAILED (StatusEnum.proto:42).",
+   "receiver_impact": "A ChannelOpenResponse carrying -26/-27 is rejected as malformed; those values belong to car control, which is intentionally unsupported (D32).",
+   "related": [
+    "D32-CAR-CONTROL-SERVICE"
+   ],
+   "severity": "medium",
+   "status": "deferred",
+   "version_gates": "car-control era (OAA)"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-917fa0441c28"
+      },
+      {
+       "diff": "W-9e4e9a864e2a"
+      },
+      {
+       "diff": "W-a24322e35bcc"
+      }
+     ],
+     "result": "verified",
+     "text": "Value 1 is AUDIO_STREAM_GUIDANCE in AASDK and SPEECH in OAA; 4 is TELEPHONY vs ALARM."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "confidence: unverified",
+       "lines": "8",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/audio/AudioTypeEnum.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA marks its AudioType enum 'confidence: unverified'."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-917fa0441c28",
+    "W-9e4e9a864e2a",
+    "W-a24322e35bcc",
+    "W-ec48b8a129a7"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "case ChannelRole::guidance_audio: wire->set_audio_type(sink::AUDIO_STREAM_GUIDANCE); break;",
+      "lines": "189",
+      "path": "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
+     },
+     {
+      "contains": "case ChannelRole::speech_audio: wire->set_audio_type(sink::AUDIO_STREAM_TELEPHONY); break;",
+      "lines": "191",
+      "path": "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
+     }
+    ],
+    "text": "guidance_audio advertises AUDIO_STREAM_GUIDANCE (1) and speech_audio advertises AUDIO_STREAM_TELEPHONY (4)."
+   },
+   "disposition": "unverified",
+   "domain": "av_media_audio",
+   "evidence_tier": "code-verified",
+   "id": "D11-AUDIOTYPE-NAME",
+   "legacy": true,
+   "owner": "child-2-av-media-focus",
+   "rationale": "Same numbers, different names (1: GUIDANCE/SPEECH, 4: TELEPHONY/ALARM); OAA labels its enum 'unverified'. A phone probe is needed.",
+   "receiver_impact": "Values align on the wire; what the phone routes on streams advertised as 1 or 4 is contested.",
+   "severity": "medium",
+   "status": "proposed",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "static_assert(static_cast<std::uint8_t>(sdk::ChannelId::WIFI_PROJECTION) == 18);",
+       "lines": "35",
+       "path": "src/protocol/aasdk_adapter/ChannelAdapter.cpp"
+      },
+      {
+       "contains": "// 1. Static SDK ChannelId ordinal: reference mapping only",
+       "lines": "22",
+       "path": "include/aa/protocol/Messages.hpp"
+      }
+     ],
+     "result": "verified",
+     "text": "The receiver asserts the pinned AASDK ordinals at compile time and never routes frames by them."
+    },
+    {
+     "evidence": [],
+     "result": "unverifiable",
+     "text": "The OAA/f1xpl ordinal table differs (1=INPUT, 7=SENSOR, ...)."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "(ID space 1, the per-frame channel byte)",
+       "lines": "3",
+       "path": "src/protocol/aasdk_adapter/ChannelAdapter.cpp"
+      }
+     ],
+     "result": "verified",
+     "text": "Legacy follow-up: ChannelAdapter.cpp:2 comment calls ID space 1 'the per-frame channel byte', contradicting Messages.hpp. The comment is still present."
+    }
+   ],
+   "confidence": "high",
+   "covers": [],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "static_assert(static_cast<std::uint8_t>(sdk::ChannelId::SENSOR) == 1);",
+      "lines": "18",
+      "path": "src/protocol/aasdk_adapter/ChannelAdapter.cpp"
+     },
+     {
+      "contains": "static_assert(static_cast<std::uint8_t>(sdk::ChannelId::WIFI_PROJECTION) == 18);",
+      "lines": "35",
+      "path": "src/protocol/aasdk_adapter/ChannelAdapter.cpp"
+     },
+     {
+      "contains": "// 1. Static SDK ChannelId ordinal: reference mapping only",
+      "lines": "22",
+      "path": "include/aa/protocol/Messages.hpp"
+     }
+    ],
+    "text": "ChannelAdapter.cpp static_asserts the pinned SDK ChannelId layout (1=SENSOR ... 18=WIFI_PROJECTION)."
+   },
+   "disposition": "fixed",
+   "domain": "channel_ids",
+   "evidence_tier": "code-verified",
+   "id": "D12-ORDINAL-FORK",
+   "legacy": true,
+   "no_generated_difference_reason": "The ordinal fork lives in AASDK C++ headers (aasdk::messenger::ChannelId), not in any .proto file; there is no generated difference to cover.",
+   "owner": "triage:phase0-closed",
+   "rationale": "No schema difference: the ordinals are C++ enum values of the AASDK library, not protobuf. OAA ordinal tables (docs/channel-map.md) are not vendored and cannot be re-verified here.",
+   "receiver_impact": "None: routing uses the dynamic Service.id; the fork-specific static ordinals are compile-time asserted reference data.",
+   "severity": "medium",
+   "status": "resolved",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-849426ccf30f"
+      },
+      {
+       "diff": "W-e08929d3e81f"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK NavFocusNotification requires focus_type; OAA NavigationFocusResponse marks it optional."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "nav_focus_request = 13,",
+       "lines": "49",
+       "path": "include/aa/protocol/Messages.hpp"
+      },
+      {
+       "contains": "nav_focus_notification = 14,",
+       "lines": "50",
+       "path": "include/aa/protocol/Messages.hpp"
+      }
+     ],
+     "result": "verified",
+     "text": "Both control message ids (0x000D/0x000E) are implemented in the project-owned codec."
+    }
+   ],
+   "confidence": "high",
+   "covers": [
+    "W-60dd32f0798e",
+    "W-849426ccf30f",
+    "W-e08929d3e81f"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "if (!wire.has_focus_type()) { return NavFocusRequest{}; }",
+      "lines": "124",
+      "path": "src/protocol/aasdk_adapter/FocusAdapter.cpp"
+     },
+     {
+      "contains": "case NavFocusType::native: wire.set_focus_type(ctl::NAV_FOCUS_NATIVE); break;",
+      "lines": "135",
+      "path": "src/protocol/aasdk_adapter/FocusAdapter.cpp"
+     }
+    ],
+    "text": "encode(NavFocusNotification) always sets focus_type; decode_nav_focus_request returns a default request when field 1 is absent."
+   },
+   "disposition": "equivalent",
+   "domain": "control_nav",
+   "evidence_tier": "code-verified",
+   "id": "D13-NAV14-NAME-REQ",
+   "legacy": true,
+   "owner": "triage:phase0-closed",
+   "rationale": "Required (AASDK) vs optional (OAA) is a presence difference only; the receiver's encoder satisfies both.",
+   "receiver_impact": "None: the receiver always sets focus_type when it answers 0x000E and tolerates an absent field on 0x000D.",
+   "severity": "low-medium",
+   "status": "resolved",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-2d730905d11f"
+      },
+      {
+       "diff": "W-b5b1c5dcdf53"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK ControlMessageType.proto declares the sentinel values; OAA's id enum does not."
+    },
+    {
+     "evidence": [
+      {
+       "absent_pattern": "ControlMessageId::(unexpected_message|framing_error)",
+       "in": [
+        "src",
+        "include"
+       ]
+      }
+     ],
+     "result": "verified",
+     "text": "No code outside the enum definition references the sentinels."
+    }
+   ],
+   "confidence": "high",
+   "covers": [
+    "W-2d730905d11f",
+    "W-b5b1c5dcdf53",
+    "W-ec2731cae768"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "// Control-channel discriminator. Values are the wire contract; new values are",
+      "lines": "35",
+      "path": "include/aa/protocol/Messages.hpp"
+     },
+     {
+      "contains": "unexpected_message = 255,",
+      "lines": "63",
+      "path": "include/aa/protocol/Messages.hpp"
+     }
+    ],
+    "text": "ControlMessageId still lists unexpected_message=255 and framing_error=65535 under a comment that calls all values 'the wire contract'."
+   },
+   "disposition": "deferred",
+   "domain": "control_ids",
+   "evidence_tier": "code-verified",
+   "id": "D14-SENTINEL-IDS",
+   "legacy": true,
+   "owner": "child-1-control-sdp",
+   "rationale": "Legacy 'fixed' claim (previous PR) cited a MessageFramer.cpp that does not exist; the comment/contract clarification is still outstanding, so the honest disposition is deferred.",
+   "receiver_impact": "None on the wire: nothing in src/ emits or matches 255/65535; only the misleading comment remains.",
+   "severity": "low",
+   "status": "deferred",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "only the first six bytes are read and trailing bytes are tolerated.",
+       "lines": "249",
+       "path": "src/protocol/aasdk_adapter/ControlAdapter.cpp"
+      }
+     ],
+     "result": "verified",
+     "text": "The decoder tolerates a trailing tail after the 6-byte prefix."
+    }
+   ],
+   "confidence": "high",
+   "covers": [],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "only the first six bytes are read and trailing bytes are tolerated.",
+      "lines": "249",
+      "path": "src/protocol/aasdk_adapter/ControlAdapter.cpp"
+     }
+    ],
+    "text": "decode_version_response reads only the first six bytes and tolerates trailing bytes."
+   },
+   "disposition": "fixed",
+   "domain": "control_version",
+   "evidence_tier": "code-verified",
+   "id": "D15-VERSION-RESP-LEN",
+   "legacy": true,
+   "no_generated_difference_reason": "VersionRequest/VersionResponse bodies are raw big-endian fields, not protobuf messages; no .proto difference exists.",
+   "owner": "triage:phase0-closed",
+   "rationale": "VersionResponse is a raw (non-protobuf) body, so no schema difference exists.",
+   "receiver_impact": "None: the response codec reads the 6-byte prefix and tolerates a trailing WireConfig tail.",
+   "severity": "medium",
+   "status": "resolved",
+   "version_gates": ">= v1.6"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "if (auto sent = announce_services(); !sent) {",
+       "lines": "506",
+       "path": "src/app/WiredSession.cpp"
+      }
+     ],
+     "result": "verified",
+     "text": "The receiver implements request -> response."
+    },
+    {
+     "evidence": [],
+     "result": "unverifiable",
+     "text": "OAA interactions/03 says the HU sends the response first."
+    }
+   ],
+   "confidence": "low",
+   "covers": [],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "case protocol::ControlMessageId::service_discovery_request: {",
+      "lines": "499",
+      "path": "src/app/WiredSession.cpp"
+     }
+    ],
+    "text": "service_discovery_request triggers announce_services(); nothing sends a response before a request."
+   },
+   "disposition": "unverified",
+   "domain": "control_sdp",
+   "evidence_tier": "phone-trace-unverified",
+   "id": "D16-SDP-ORDER",
+   "legacy": true,
+   "no_generated_difference_reason": "Handshake ordering is runtime behaviour; the schemas agree on the message bytes.",
+   "owner": "child-1-control-sdp",
+   "rationale": "Sequencing is behaviour, not schema. Needs a real-phone capture; do not change ordering without it.",
+   "receiver_impact": "The receiver answers a phone's ServiceDiscoveryRequest; whether a phone expects an unsolicited response first is unverified.",
+   "severity": "high",
+   "status": "proposed",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "auto request = protocol::decode_channel_open_request(message.payload);",
+       "lines": "395",
+       "path": "src/app/WiredSession.cpp"
+      }
+     ],
+     "result": "verified",
+     "text": "The receiver treats 0x0007 as phone -> head unit."
+    },
+    {
+     "evidence": [],
+     "result": "unverifiable",
+     "text": "OAA's channel-lifecycle doc and channel map say the HU opens channels."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-fafba4959f4e"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "auto request = protocol::decode_channel_open_request(message.payload);",
+      "lines": "395",
+      "path": "src/app/WiredSession.cpp"
+     },
+     {
+      "contains": "request = protocol::decode_in_band_channel_open_request(message.payload);",
+      "lines": "397",
+      "path": "src/app/WiredSession.cpp"
+     }
+    ],
+    "text": "WiredSession decodes ChannelOpenRequest from the phone (strict, then in-band tolerant form)."
+   },
+   "disposition": "unverified",
+   "domain": "control_channel_open",
+   "evidence_tier": "code-verified",
+   "id": "D17-OPEN-DIR-CLAIM",
+   "legacy": true,
+   "owner": "child-1-control-sdp",
+   "rationale": "Direction conflict is between OAA's proto comment and OAA's docs; the receiver implements Phone->HU. No phone trace on this commit.",
+   "receiver_impact": "The receiver parses an inbound ChannelOpenRequest; who sends 0x0007 first in a real session has not been recorded.",
+   "severity": "medium",
+   "status": "proposed",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [],
+     "result": "unverifiable",
+     "text": "OAA docs/channel-map.md:43-45 inverts SDP directions."
+    }
+   ],
+   "confidence": "low",
+   "covers": [],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "decode_service_discovery_response(std::span<const std::byte> payload) {",
+      "lines": "106",
+      "path": "src/protocol/aasdk_adapter/ServiceAdapter.cpp"
+     }
+    ],
+    "text": "The receiver's control codec follows the .proto schemas (ServiceDiscoveryRequest decode and Response encode in ServiceAdapter.cpp)."
+   },
+   "disposition": "incorrect-reference",
+   "domain": "oaa_docs",
+   "evidence_tier": "oaa-claim-unverified",
+   "id": "D18-CHANNELMAP-CTRL",
+   "legacy": true,
+   "no_generated_difference_reason": "The defect is in an OAA Markdown document, not in a .proto file.",
+   "owner": "triage:phase0-closed",
+   "rationale": "The defect is in OAA docs/channel-map.md, which is not vendored (OAA docs are excluded from the pinned import) and cannot be re-verified here.",
+   "receiver_impact": "None: OAA documentation defect; the receiver follows the schemas.",
+   "severity": "low",
+   "status": "resolved",
+   "version_gates": "n/a"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [],
+     "result": "unverifiable",
+     "text": "OAA 02-version-ssl-auth.md:74 annotates the version frame flags incorrectly."
+    }
+   ],
+   "confidence": "low",
+   "covers": [],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "MessageKind kind{MessageKind::specific};",
+      "lines": "87",
+      "path": "include/aa/transport/Framing.hpp"
+     }
+    ],
+    "text": "Frame kind for the version request is decided in the frame layer (Framing.hpp), not the control codec."
+   },
+   "disposition": "incorrect-reference",
+   "domain": "oaa_docs",
+   "evidence_tier": "oaa-claim-unverified",
+   "id": "D19-OAA-02-FLAGS",
+   "legacy": true,
+   "no_generated_difference_reason": "Frame header flags are outside the protobuf schemas and the OAA document is not vendored.",
+   "owner": "triage:phase0-closed",
+   "rationale": "The OAA document is not vendored; the legacy resolution cites an S24 probe whose captures are not in this repository.",
+   "receiver_impact": "None: framing is a frame-layer concern outside the protobuf schemas.",
+   "severity": "low",
+   "status": "resolved",
+   "version_gates": "n/a"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "Wire msg 0x8007, Phone->HU (video channel)",
+       "lines": "12",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/VideoFocusRequestMessage.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA VideoFocusRequest is wire msg 0x8007 Phone->HU."
+    },
+    {
+     "evidence": [],
+     "result": "unverifiable",
+     "text": "The OAA docs table swaps the two directions."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-d6406a53bdfd",
+    "W-f9cc18dd99f3"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "static_assert(ids::MEDIA_MESSAGE_VIDEO_FOCUS_REQUEST == 0x8007);",
+      "lines": "27",
+      "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
+     },
+     {
+      "contains": "static_assert(ids::MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION == 0x8008);",
+      "lines": "28",
+      "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
+     }
+    ],
+    "text": "AvSinkAdapter asserts 0x8007 = video focus request and 0x8008 = video focus notification."
+   },
+   "disposition": "incorrect-reference",
+   "domain": "av_media_video",
+   "evidence_tier": "code-verified",
+   "id": "D20-VIDFOCUS-OAA-DOCS",
+   "legacy": true,
+   "owner": "triage:phase0-closed",
+   "rationale": "The conflicting table is in OAA interactions/04 (not vendored). The vendored OAA proto states the direction.",
+   "receiver_impact": "None: the receiver's ids match the proto comments (0x8007 phone->HU request, 0x8008 HU->phone notification).",
+   "severity": "low-medium",
+   "status": "resolved",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-d266b4cbdfbd"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK names 19 MESSAGE_AUDIO_FOCUS_NOTIFICATION; OAA names it AUDIO_FOCUS_RESPONSE."
+    }
+   ],
+   "confidence": "high",
+   "covers": [
+    "U-887c3590459e",
+    "W-05c9f1f8c333",
+    "W-370ba8101d55",
+    "W-6247d31960c0",
+    "W-8a7fd0cf4d01",
+    "W-a51ae9fd8cf5",
+    "W-d266b4cbdfbd"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "audio_focus_notification = 19,",
+      "lines": "55",
+      "path": "include/aa/protocol/Messages.hpp"
+     }
+    ],
+    "text": "Messages.hpp names 18 audio_focus_request and 19 audio_focus_notification."
+   },
+   "disposition": "equivalent",
+   "domain": "control_ids",
+   "evidence_tier": "code-verified",
+   "id": "D21-AUDIOFOCUS-NAME",
+   "legacy": true,
+   "owner": "triage:phase0-closed",
+   "rationale": "Same ids and structurally matched messages; see the generated pair differences.",
+   "receiver_impact": "None: ids agree (0x12/0x13); naming differs only.",
+   "severity": "low",
+   "status": "resolved",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-1edc0a3dfbaf"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK names 17 VOICE_SESSION_NOTIFICATION; OAA VOICE_SESSION_REQUEST."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-1edc0a3dfbaf",
+    "W-4193681f51b6",
+    "W-bbe9280a6a25"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "voice_session_notification = 17,",
+      "lines": "53",
+      "path": "include/aa/protocol/Messages.hpp"
+     }
+    ],
+    "text": "Messages.hpp names 17 voice_session_notification."
+   },
+   "disposition": "equivalent",
+   "domain": "control_ids",
+   "evidence_tier": "code-verified",
+   "id": "D22-VOICE-NAME",
+   "legacy": true,
+   "owner": "triage:phase0-closed",
+   "rationale": "Same id; the value enum has VOICE_SESSION_END (2) vs VOICE_SESSION_STOP (2): a rename not decidable mechanically, same wire value.",
+   "receiver_impact": "None for id 0x11; the value enums differ in one name (VOICE_SESSION_END vs VOICE_SESSION_STOP).",
+   "severity": "low",
+   "status": "resolved",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-1e9f9c05da9e"
+      },
+      {
+       "diff": "W-59c0f36e89d1"
+      },
+      {
+       "diff": "W-9c6ba1374bc9"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA ShutdownReason adds values 6, 7, 8 over AASDK ByeByeReason (1-5)."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "case 8: return ByeByeRequest{ByeByeReason::user_profile_switch};",
+       "lines": "104",
+       "path": "src/protocol/aasdk_adapter/FocusAdapter.cpp"
+      }
+     ],
+     "result": "verified",
+     "text": "The receiver accepts reasons 6-8."
+    }
+   ],
+   "confidence": "high",
+   "covers": [
+    "W-1e9f9c05da9e",
+    "W-59c0f36e89d1",
+    "W-5b23cd51a997",
+    "W-63b957d0f5e0",
+    "W-9c6ba1374bc9"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "case 8: return ByeByeRequest{ByeByeReason::user_profile_switch};",
+      "lines": "104",
+      "path": "src/protocol/aasdk_adapter/FocusAdapter.cpp"
+     },
+     {
+      "contains": "byebye_request = 15,",
+      "lines": "51",
+      "path": "include/aa/protocol/Messages.hpp"
+     }
+    ],
+    "text": "decode_byebye_request accepts reasons 1-5 from the pinned enum and 6-8 from the unknown-field set."
+   },
+   "disposition": "equivalent",
+   "domain": "control_ids",
+   "evidence_tier": "code-verified",
+   "id": "D23-SHUTDOWN-NAME",
+   "legacy": true,
+   "owner": "triage:phase0-closed",
+   "rationale": "Names differ (BYEBYE vs SHUTDOWN); the extra OAA reason values are generated differences and handled in code.",
+   "receiver_impact": "None for ids 0x0F/0x10; OAA adds reasons 6-8 which the receiver already accepts.",
+   "severity": "low",
+   "status": "resolved",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "wire.set_data(copy_string(message.data));",
+       "lines": "122",
+       "path": "src/protocol/aasdk_adapter/ControlAdapter.cpp"
+      },
+      {
+       "contains": "F-J2 PingResponse - OUR ENCODER FORM",
+       "lines": "213",
+       "path": "tests/replay/conformance_wire_spec.hpp"
+      }
+     ],
+     "result": "verified",
+     "text": "The encoder marks proto2 field 2 present even when empty; the fixture pair F-J/F-J2 documents both forms."
+    }
+   ],
+   "confidence": "high",
+   "covers": [
+    "W-171c7ab5f331",
+    "W-3b442c7e1f53",
+    "W-960793598bc5",
+    "W-a6b105a3ce52",
+    "W-f018a4fd321f"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "wire.set_data(copy_string(message.data));",
+      "lines": "122",
+      "path": "src/protocol/aasdk_adapter/ControlAdapter.cpp"
+     },
+     {
+      "contains": "F-J2 PingResponse - OUR ENCODER FORM",
+      "lines": "213",
+      "path": "tests/replay/conformance_wire_spec.hpp"
+     }
+    ],
+    "text": "encode(PingResponse) calls set_data(...) unconditionally, so field 2 is present even when empty."
+   },
+   "disposition": "equivalent",
+   "domain": "control_ping",
+   "evidence_tier": "code-verified",
+   "id": "D24-PING-OPTCANON",
+   "legacy": true,
+   "owner": "triage:phase0-closed",
+   "rationale": "AASDK PingResponse.data vs OAA PingResponse.payload: same field 2, same type (name differs).",
+   "receiver_impact": "None: both encodings are wire-legal and decode identically; the encoder emits the explicit-empty form.",
+   "severity": "low",
+   "status": "resolved",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "color_scheme_support = 9;",
+       "lines": "32",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelData.proto"
+      },
+      {
+       "diff": "W-d2d28613509a"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA AVChannel has color_scheme_support=9; AASDK MediaSinkService has no field 9."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "Set to 2 for Material You v2.",
+       "lines": "32",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelData.proto"
+      }
+     ],
+     "result": "unverifiable",
+     "text": "Setting it to 2 activates Material You v2 theming on the phone."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-394ca17aa355",
+    "W-7ec167c30f6c",
+    "W-887b07645daf",
+    "W-d2d28613509a",
+    "W-fb26a278e7f8",
+    "W-ff6b2f827c6f"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "wire->set_available_type(shared::MEDIA_CODEC_VIDEO_H264_BP);",
+      "lines": "169",
+      "path": "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
+     }
+    ],
+    "text": "MediaConfiguration.cpp builds MediaSinkService fields 1-4 and 6-8 paths; it never sets a color-scheme field (none exists in the pinned schema)."
+   },
+   "disposition": "unverified",
+   "domain": "av_media_video",
+   "evidence_tier": "oaa-claim-unverified",
+   "id": "D25-VID-COLOR-SCHEME",
+   "legacy": false,
+   "owner": "child-3-display-ui-theming",
+   "rationale": "Field 9 only in OAA is mechanical; its effect ('set to 2 for Material You v2') is an OAA comment.",
+   "receiver_impact": "The receiver cannot advertise field 9; what a phone does without it is unverified.",
+   "related": [
+    "D2-8012-MISSING"
+   ],
+   "severity": "medium",
+   "status": "proposed",
+   "version_gates": "AA 17.x / Material You v2 per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-620d2b938e0f"
+      },
+      {
+       "diff": "W-c8bce0b19e24"
+      },
+      {
+       "diff": "W-e9a7275fb274"
+      },
+      {
+       "diff": "W-eec8dd0ebb1e"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA SensorEventIndication has fields 23-26 (vehicle_energy_model, trailer, raw_vehicle_energy_model, raw_ev_trip_settings); AASDK SensorBatch ends at 22."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "wire.add_night_mode_data()->set_night_mode(night);",
+       "lines": "66",
+       "path": "src/protocol/aasdk_adapter/SensorAdapter.cpp"
+      }
+     ],
+     "result": "verified",
+     "text": "The receiver emits night mode only."
+    }
+   ],
+   "confidence": "high",
+   "covers": [
+    "W-1856f7d613af",
+    "W-21ef77742183",
+    "W-24ff45199aa4",
+    "W-2b4c2391c9fd",
+    "W-323b6b56f2db",
+    "W-35aacd04e1a9",
+    "W-3f944361f828",
+    "W-4717902b7265",
+    "W-620d2b938e0f",
+    "W-71a2003fae66",
+    "W-897e66fdd1e3",
+    "W-89b8889a825e",
+    "W-8f098c83a12d",
+    "W-911877ec1e7b",
+    "W-96f59f73e361",
+    "W-a84fe40b9924",
+    "W-bed2cbeea77b",
+    "W-c8bce0b19e24",
+    "W-cadf86a6e66a",
+    "W-cb8465be5401",
+    "W-d5fe20337f34",
+    "W-e9a7275fb274",
+    "W-ebe7aa44cb92",
+    "W-ed8227df19e3",
+    "W-eec8dd0ebb1e",
+    "W-f572d6c0bdbe"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "wire.add_night_mode_data()->set_night_mode(night);",
+      "lines": "66",
+      "path": "src/protocol/aasdk_adapter/SensorAdapter.cpp"
+     }
+    ],
+    "text": "encode_sensor_batch fills night_mode_data only."
+   },
+   "disposition": "deferred",
+   "domain": "sensors",
+   "evidence_tier": "code-verified",
+   "id": "D26-SEN-EV-ENERGY",
+   "legacy": false,
+   "owner": "child-4-input-nav-sensors",
+   "rationale": "Fields 23-26 exist only in OAA (mechanical). Previous text 'receiver supports tags up to 22' was inaccurate: the receiver supports night mode only.",
+   "receiver_impact": "None: the receiver sends only night-mode sensor data; EV telemetry has no source on this receiver.",
+   "severity": "medium",
+   "status": "deferred",
+   "version_gates": "AA 17.3 per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "optional WifiCredentialStatus status = 5;",
+       "lines": "37",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto"
+      },
+      {
+       "diff": "W-a1bd1a09afb0"
+      },
+      {
+       "diff": "W-c4ceadb7f253"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK field 5 is AccessPointType (0 STATIC, 1 DYNAMIC); OAA field 5 is WifiCredentialStatus (0 OK, 1 FAILED)."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "the GAL version uses sequential values 0-11.",
+       "lines": "42",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA's GAL WifiCredentialSecurityMode is sequential 0-11, AASDK WifiSecurityMode 0-9; the OAA BT-RFCOMM WifiSecurityMode is non-sequential."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "If status indicates failure or security_mode is",
+       "lines": "15",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto"
+      }
+     ],
+     "result": "unverifiable",
+     "text": "Phones discard credentials when status indicates failure."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-058dd0a455c1",
+    "W-0d098e7f6094",
+    "W-31031bd00e64",
+    "W-72953b3eadff",
+    "W-8de36ee8ba54",
+    "W-a1bd1a09afb0",
+    "W-c4ceadb7f253",
+    "W-d576798b2d2b",
+    "W-da2440ff30d8"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "wire.set_access_point_type(static_cast<wifi::AccessPointType>(value));",
+      "lines": "62",
+      "path": "src/protocol/aasdk_adapter/WifiProjectionAdapter.cpp"
+     }
+    ],
+    "text": "encode(WifiCredentialsResponse) sets field 5 from access_point_type when the caller provides one."
+   },
+   "disposition": "unverified",
+   "domain": "wireless",
+   "evidence_tier": "code-verified",
+   "id": "D27-WIFI-CRED-STATUS",
+   "legacy": false,
+   "owner": "child-5-wireless-bt-radio",
+   "rationale": "Same wire position, conflicting meaning (AccessPointType STATIC/DYNAMIC vs WifiCredentialStatus OK/FAILED) is mechanical; which one a phone implements needs a capture.",
+   "receiver_impact": "If OAA is right, an AccessPointType of DYNAMIC (1) in field 5 reads as CREDENTIAL_STATUS_FAILED and the phone discards the credentials; unverified.",
+   "related": [
+    "D37-BT-PHONE-NAME"
+   ],
+   "severity": "medium-high",
+   "status": "proposed",
+   "version_gates": "AA 17.x per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "elapsedRealtime in microseconds",
+       "lines": "18",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/input/InputEventIndicationMessage.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA documents InputEventIndication.timestamp as 'elapsedRealtime in microseconds'."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "protocol::encode_input_report(event, static_cast<std::uint64_t>(deps_.clock.now().count));",
+       "lines": "772",
+       "path": "src/app/WiredSession.cpp"
+      }
+     ],
+     "result": "verified",
+     "text": "The receiver sends nanoseconds."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "required uint64 timestamp = 1;",
+       "lines": "12",
+       "path": "third_party/aasdk/protobuf/aap_protobuf/service/inputsource/message/InputReport.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK InputReport.timestamp is a required uint64 without a unit comment."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-187cd90fa844",
+    "W-8a067358bdac",
+    "W-dc1e633ade21",
+    "W-e307d962c307"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "protocol::encode_input_report(event, static_cast<std::uint64_t>(deps_.clock.now().count));",
+      "lines": "772",
+      "path": "src/app/WiredSession.cpp"
+     },
+     {
+      "contains": "std::chrono::duration_cast<std::chrono::nanoseconds>(ticks).count()",
+      "lines": "31",
+      "path": "include/aa/session/Clock.hpp"
+     }
+    ],
+    "text": "WiredSession passes MonotonicClock::now().count (nanoseconds) as the InputReport timestamp."
+   },
+   "disposition": "unverified",
+   "domain": "input",
+   "evidence_tier": "code-verified",
+   "id": "D28-INPUT-TS-UNITS",
+   "legacy": false,
+   "owner": "child-4-input-nav-sensors",
+   "rationale": "Unit is a comment-level claim (no schema difference: both are uint64 field 1). Needs phone evidence before changing the encoder.",
+   "receiver_impact": "The receiver sends nanoseconds of its monotonic clock in InputReport.timestamp; OAA's comment says microseconds (elapsedRealtime). Unverified on a phone.",
+   "severity": "medium",
+   "status": "proposed",
+   "version_gates": "AA 17.3 per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "MEDIA_STATS = 0x8013;",
+       "lines": "34",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMessageIdsEnum.proto"
+      },
+      {
+       "contains": "MEDIA_OPTIONS = 0x8014;",
+       "lines": "35",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMessageIdsEnum.proto"
+      },
+      {
+       "diff": "W-4749c7026a12"
+      },
+      {
+       "diff": "W-77b2cf8f218a"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA defines MEDIA_STATS=0x8013 and MEDIA_OPTIONS=0x8014; AASDK's MediaMessageId has neither."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "U-94fd87c3f849",
+    "U-b6488c628fbf",
+    "W-4749c7026a12",
+    "W-77b2cf8f218a"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "absent_pattern": "0x8013|0x8014|MediaStats|MediaOptions",
+      "in": [
+       "src",
+       "include"
+      ]
+     }
+    ],
+    "text": "No reference to 0x8013/0x8014 or media stats/options in src/ or include/."
+   },
+   "disposition": "deferred",
+   "domain": "av_media_video",
+   "evidence_tier": "code-verified",
+   "id": "D29-AV-MEDIA-STATS-OPTS",
+   "legacy": false,
+   "owner": "child-2-av-media-focus",
+   "rationale": "Previous text cited AVChannelMessageIdsEnum.proto:29-30; the real lines are 34-35.",
+   "receiver_impact": "None: the receiver does not handle 0x8013/0x8014.",
+   "severity": "low-medium",
+   "status": "deferred",
+   "version_gates": "GAL 5.1/6.0 per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "OVERLAY_PARAMETERS = 0x800D;",
+       "lines": "28",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMessageIdsEnum.proto"
+      },
+      {
+       "contains": "CRITICAL_UI_NOTIFICATION = 0x8015;",
+       "lines": "36",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMessageIdsEnum.proto"
+      },
+      {
+       "diff": "W-a3236ede40f2"
+      },
+      {
+       "diff": "W-d4e5959c0a2b"
+      },
+      {
+       "diff": "W-ca0409830b27"
+      },
+      {
+       "diff": "W-9ef9cbfdb043"
+      },
+      {
+       "diff": "W-1aff7d296fe0"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA defines ACTION_TAKEN (0x800C), OVERLAY_PARAMETERS/START/STOP (0x800D-0x800F) and CRITICAL_UI_NOTIFICATION (0x8015); AASDK's enum has none."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "0x8010 is reserved",
+       "lines": "31",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMessageIdsEnum.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "0x8010 is reserved: name, payload and direction unknown."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "U-0a4fb28c7e46",
+    "U-0c85df4c7460",
+    "U-242425ee4edf",
+    "U-6bc08a7a09ad",
+    "U-7ed7c5d264e1",
+    "U-a4c4d164b474",
+    "W-1aff7d296fe0",
+    "W-9ef9cbfdb043",
+    "W-a3236ede40f2",
+    "W-ca0409830b27",
+    "W-d4e5959c0a2b"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "absent_pattern": "0x800C|0x800D|0x800E|0x800F|0x8015|IntegratedOverlay",
+      "in": [
+       "src",
+       "include"
+      ]
+     }
+    ],
+    "text": "No reference to these ids in src/ or include/."
+   },
+   "disposition": "deferred",
+   "domain": "av_media_video",
+   "evidence_tier": "code-verified",
+   "id": "D30-AV-OVERLAYS-800D-8010",
+   "legacy": false,
+   "owner": "child-3-display-ui-theming",
+   "rationale": "OAA marks 0x8010 reserved with unknown payload; do not shift a later name into that slot.",
+   "receiver_impact": "None: no handling of 0x800C-0x800F or 0x8015.",
+   "severity": "low-medium",
+   "status": "deferred",
+   "version_gates": "AA 17.x per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "message RadioProgramIdentifier {",
+       "lines": "90",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA keeps the pre-modern radio protocol under Legacy* names and defines modern radio messages in RadioMessages.proto; AASDK has no counterpart for the latter."
+    },
+    {
+     "evidence": [],
+     "result": "unverifiable",
+     "text": "The modern phone handler ignores the legacy ids (0x8001-0x8019)."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "U-019b2f2a6a65",
+    "U-021d44173709",
+    "U-03c4a084f655",
+    "U-07bf70f1f1fb",
+    "U-0a392f3221a7",
+    "U-0c84c7f4e10d",
+    "U-0e130865198f",
+    "U-0e20f7dc048d",
+    "U-124fd6762435",
+    "U-175a9bb6db68",
+    "U-224fd0589af6",
+    "U-22a8d53ea366",
+    "U-24f9a32dc232",
+    "U-271252b71d4d",
+    "U-41f0e2587f44",
+    "U-41fbd218a6e4",
+    "U-57edd45aff52",
+    "U-5c981e2e2c95",
+    "U-5f87c28ab346",
+    "U-66eeec7d0805",
+    "U-781e21680c0f",
+    "U-79ac3b47c5e3",
+    "U-8abe75c53c7d",
+    "U-907d2ecbdd5d",
+    "U-980fe896d3f8",
+    "U-9c1f46f48eb9",
+    "U-af28aed9e9d4",
+    "U-b8d49467c68a",
+    "U-bf90410e983e",
+    "U-c5489a88acd8",
+    "U-cddf4611df07",
+    "U-dbe31b2470e0",
+    "U-dc94f76c9256",
+    "U-e1fbdca2f3b0",
+    "U-e5e74a81f2d7",
+    "U-e6bde78d3776",
+    "U-ea20f06e1052",
+    "U-ee888b89f68a",
+    "U-f18a39e87a8b",
+    "U-f9459769890d",
+    "U-f9c3fc4f20ff",
+    "U-fcc56e7fc2fa",
+    "W-05019b00c58b",
+    "W-07613537d2de",
+    "W-07f8b4ddc7b2",
+    "W-0c16199e0450",
+    "W-0f387d64e64e",
+    "W-106c40d8c278",
+    "W-12d0444cd6fa",
+    "W-14e50431c2f2",
+    "W-15cf88981a42",
+    "W-16f4e9d2acd6",
+    "W-1916bb106076",
+    "W-1b8f70fde403",
+    "W-1d82007734f9",
+    "W-1e6f5279c20c",
+    "W-1ecd5181f914",
+    "W-2bf3c5208f54",
+    "W-2e0097763abb",
+    "W-2f185aba1598",
+    "W-2f612eb9fe63",
+    "W-2ff2406f57cd",
+    "W-3b6905707107",
+    "W-461765dffcde",
+    "W-47e250264517",
+    "W-47fd5139a1b6",
+    "W-4ccc6e281353",
+    "W-54562649bbba",
+    "W-5671bf44c3f6",
+    "W-60a12ff72e0b",
+    "W-6734167cb64e",
+    "W-6ae472c86eb7",
+    "W-6c554d81cfcc",
+    "W-6d82d185a795",
+    "W-6e0ff28f392c",
+    "W-6e31e8c2d67e",
+    "W-781ddb8a0295",
+    "W-7abc305e08e9",
+    "W-7be7b6981b24",
+    "W-88603ddc5034",
+    "W-88b8ed0c782b",
+    "W-900c629ad4e6",
+    "W-93b7a29f6d8f",
+    "W-95019855d26f",
+    "W-98707f5c957e",
+    "W-9adf90d8d828",
+    "W-9e9a6cd7da08",
+    "W-a138b68b7872",
+    "W-a7b6f053a403",
+    "W-a80f9ada94c2",
+    "W-aa02ebd55b50",
+    "W-aafca5525ccb",
+    "W-ac41d8404d25",
+    "W-ac9a775d1c7e",
+    "W-aea5afd70b99",
+    "W-b378083ed1ab",
+    "W-b9d70480e830",
+    "W-b9f95879c5ee",
+    "W-bb262fc1666e",
+    "W-bdb1f57db742",
+    "W-c750952b6475",
+    "W-c77563496862",
+    "W-cc2cf702bfc2",
+    "W-d3ccdab9aef7",
+    "W-d7552414b7d3",
+    "W-d983b21a0760",
+    "W-db783f9a57c3",
+    "W-de6601efa7a7",
+    "W-de8475ebf761",
+    "W-dec165effce1",
+    "W-dfe0cd0c06c5",
+    "W-e6604c6fbbab",
+    "W-e77b6c16e2a7",
+    "W-ede44bfbaf5a",
+    "W-ef96fa8ebfad",
+    "W-f18f191e86f1"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "+ static_cast<int>(entry.has_radio_service())",
+      "lines": "40",
+      "path": "src/protocol/aasdk_adapter/ServiceAdapter.cpp"
+     },
+     {
+      "contains": "return unsupported_channel();",
+      "lines": "100",
+      "path": "src/protocol/aasdk_adapter/ServiceAdapter.cpp"
+     }
+    ],
+    "text": "classify_service() has no radio branch and falls through to unsupported_channel(); nothing builds a radio service."
+   },
+   "disposition": "deferred",
+   "domain": "radio",
+   "evidence_tier": "code-verified",
+   "id": "D31-RADIO-HAL2-GAP",
+   "legacy": false,
+   "owner": "child-5-wireless-bt-radio",
+   "rationale": "Radio definitions split into AASDK 'service/radio' and OAA 'radio/' (Legacy* and modern messages); unmatched/undecided ones are covered here.",
+   "receiver_impact": "None: the receiver does not configure a radio service; a radio entry in a service list is classified unsupported.",
+   "severity": "medium",
+   "status": "deferred",
+   "version_gates": "AA 16.2+ per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "0x8001 = CAR_CONTROL_SET_CAR_PROPERTY_VALUE_REQUEST",
+       "lines": "14",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA defines CarControl messages (ids 0x8001-0x8007 on a car-control channel); AASDK has none."
+    },
+    {
+     "evidence": [],
+     "result": "unverifiable",
+     "text": "Phones do not open channel 19 when it is not advertised."
+    }
+   ],
+   "confidence": "high",
+   "covers": [
+    "U-0ed24803c8b6",
+    "U-102199d71131",
+    "U-219ff4a410ab",
+    "U-34ca35df5eec",
+    "U-3b57e09f3b0b",
+    "U-3ecfb4fce4f6",
+    "U-48548134320f",
+    "U-49e94af9b118",
+    "U-4d7735d7d373",
+    "U-590dc6e0ef36",
+    "U-5a8463fc59fe",
+    "U-5e57c7e24764",
+    "U-648c072e6080",
+    "U-649471444733",
+    "U-65e358e3f258",
+    "U-70792332d7fb",
+    "U-7386ae7bae92",
+    "U-7b59044f213c",
+    "U-7de4ff6828e2",
+    "U-7f5f756d3022",
+    "U-89ff43a29ad1",
+    "U-8b1db197dcc7",
+    "U-a52421f91628",
+    "U-aff6c35e9f32",
+    "U-ddbddb3ba6c3",
+    "U-e0bfe453e11c",
+    "U-e8c2d923d2ff",
+    "U-f58e939b2ec4",
+    "U-fa48d0ab396d"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "absent_pattern": "car_control|CarControl",
+      "in": [
+       "src",
+       "include"
+      ]
+     }
+    ],
+    "text": "No car-control service in the discovery encode/decode paths."
+   },
+   "disposition": "intentionally-unsupported",
+   "domain": "car_control",
+   "evidence_tier": "code-verified",
+   "id": "D32-CAR-CONTROL-SERVICE",
+   "legacy": false,
+   "owner": "triage:phase0-closed",
+   "rationale": "OAA defines the car-control channel (VHAL property access); AASDK has no counterpart definitions.",
+   "receiver_impact": "None: car control is not advertised, so the phone has nothing to open.",
+   "severity": "medium",
+   "status": "resolved",
+   "version_gates": "AA 16.2+ per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "optional string metadata = 2;",
+       "lines": "19",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carintent/CarIntentMessage.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA CarIntentMessage has only optional string metadata=2 and an unknown message id."
+    }
+   ],
+   "confidence": "low",
+   "covers": [
+    "U-cdeaae7e9506"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "absent_pattern": "CarIntent|car_intent",
+      "in": [
+       "src",
+       "include"
+      ]
+     }
+    ],
+    "text": "No car-intent handling in src/ or include/."
+   },
+   "disposition": "unverified",
+   "domain": "car_intent",
+   "evidence_tier": "oaa-claim-unverified",
+   "id": "D33-CAR-INTENT-SERVICE",
+   "legacy": false,
+   "owner": "child-5-wireless-bt-radio",
+   "rationale": "OAA marks the id and channel context unestablished.",
+   "receiver_impact": "Unknown: OAA establishes only an optional string field 2 and no message id.",
+   "severity": "low",
+   "status": "proposed",
+   "version_gates": "AA 17.3 per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "DEPRECATED: This channel is DEAD in AA v16.1+",
+       "lines": "8",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA declares the media-browser channel DEAD in AA 16.1+ and the definitions 'preserved from the opencardev/aasdk project'."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "U-5e0a4fb85541",
+    "W-50d55f8eeeda",
+    "W-6c4a54d65279",
+    "W-72797e3b0dd3",
+    "W-7ace647728d3",
+    "W-862dec0f75e5",
+    "W-aa6b59104fd6",
+    "W-af143246ee5d",
+    "W-c8049aed1480",
+    "W-e938795df418",
+    "W-eb4979539bab",
+    "W-f26673558c42"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "+ static_cast<int>(entry.has_media_browser_service())",
+      "lines": "44",
+      "path": "src/protocol/aasdk_adapter/ServiceAdapter.cpp"
+     },
+     {
+      "contains": "return unsupported_channel();",
+      "lines": "100",
+      "path": "src/protocol/aasdk_adapter/ServiceAdapter.cpp"
+     }
+    ],
+    "text": "classify_service() has no media-browser branch and falls through to unsupported_channel()."
+   },
+   "disposition": "not-applicable",
+   "domain": "media_browser",
+   "evidence_tier": "oaa-claim-unverified",
+   "id": "D34-MEDIABROWSER-DEAD",
+   "legacy": false,
+   "owner": "triage:phase0-closed",
+   "rationale": "OAA's own header declares the channel dead in AA 16.1+ and says its definitions are preserved from AASDK for historical reference.",
+   "receiver_impact": "None: the channel is not advertised; a media-browser entry in a service list is classified unsupported.",
+   "severity": "low",
+   "status": "resolved",
+   "version_gates": "AA 16.1+ per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "message VehicleEnergyForecastMessage {",
+       "lines": "30",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto"
+      },
+      {
+       "contains": "// confidence: unverified",
+       "lines": "29",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA defines VehicleEnergyForecastMessage (0x8008, Phone->HU) as a proto2 wrapper over serialized proto3 bytes."
+    }
+   ],
+   "confidence": "low",
+   "covers": [
+    "U-2b779547ed6d",
+    "U-371d47fc51ba",
+    "U-67e92ac2a4ee",
+    "U-6ecc53fa428e",
+    "U-86870d256188",
+    "U-a7641cf564b7",
+    "U-ca988a24361a"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "+ static_cast<int>(entry.has_navigation_status_service())",
+      "lines": "41",
+      "path": "src/protocol/aasdk_adapter/ServiceAdapter.cpp"
+     },
+     {
+      "contains": "return unsupported_channel();",
+      "lines": "100",
+      "path": "src/protocol/aasdk_adapter/ServiceAdapter.cpp"
+     },
+     {
+      "absent_pattern": "VehicleEnergyForecast",
+      "in": [
+       "src",
+       "include"
+      ]
+     }
+    ],
+    "text": "classify_service() has no navigation-status branch and falls through to unsupported_channel(); nothing references VehicleEnergyForecast."
+   },
+   "disposition": "deferred",
+   "domain": "navigation",
+   "evidence_tier": "oaa-claim-unverified",
+   "id": "D35-NAV-EV-FORECAST",
+   "legacy": false,
+   "owner": "child-4-input-nav-sensors",
+   "rationale": "OAA marks the forecast message 'confidence: unverified'.",
+   "receiver_impact": "None: message 0x8008 on the navigation channel is not consumed; a navigation-status service entry is classified unsupported.",
+   "severity": "low-medium",
+   "status": "deferred",
+   "version_gates": "AA 16.2+, CarInfo >= 5.1 per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "diff": "W-056cbb01f286"
+      },
+      {
+       "diff": "W-0a2a1d1d10b3"
+      },
+      {
+       "diff": "W-3b08cf601428"
+      },
+      {
+       "diff": "W-47369f4764a5"
+      },
+      {
+       "diff": "W-5be3041b7a6b"
+      },
+      {
+       "diff": "W-6d6cb8d23f50"
+      },
+      {
+       "diff": "W-86464ffe61e2"
+      },
+      {
+       "diff": "W-b061b327beeb"
+      },
+      {
+       "diff": "W-b731c98800d8"
+      },
+      {
+       "diff": "W-da37b36c3269"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA ManeuverType and AASDK NavigationManeuver.NavigationType share names for the common numbers and differ in the ranges generated below."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-056cbb01f286",
+    "W-0a2a1d1d10b3",
+    "W-3b08cf601428",
+    "W-47369f4764a5",
+    "W-5be3041b7a6b",
+    "W-6d6cb8d23f50",
+    "W-86464ffe61e2",
+    "W-b061b327beeb",
+    "W-b731c98800d8",
+    "W-da37b36c3269"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "+ static_cast<int>(entry.has_navigation_status_service())",
+      "lines": "41",
+      "path": "src/protocol/aasdk_adapter/ServiceAdapter.cpp"
+     },
+     {
+      "absent_pattern": "ManeuverType|NavigationManeuver|NavigationType",
+      "in": [
+       "src",
+       "include"
+      ]
+     }
+    ],
+    "text": "classify_service() has no navigation-status branch; nothing references the maneuver enums."
+   },
+   "disposition": "deferred",
+   "domain": "navigation",
+   "evidence_tier": "code-verified",
+   "id": "D36-NAV-MANEUVER-EXT",
+   "legacy": false,
+   "owner": "child-4-input-nav-sensors",
+   "rationale": "Value differences are mechanical; consumption is absent.",
+   "receiver_impact": "None: no navigation renderer consumes maneuver types; a navigation-status service entry is classified unsupported.",
+   "severity": "low",
+   "status": "deferred",
+   "version_gates": "AA 16.1+ per OAA"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "phone_name = 3;",
+       "lines": "26",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/bluetooth/BluetoothPairingRequestMessage.proto"
+      },
+      {
+       "diff": "W-a4e2eaf08946"
+      },
+      {
+       "diff": "W-e0b2ebbf61e3"
+      },
+      {
+       "diff": "W-e3ef6b87f929"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA BluetoothPairingRequest adds optional phone_name=3; AASDK has two required fields."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "W-a4e2eaf08946",
+    "W-e0b2ebbf61e3",
+    "W-e3ef6b87f929"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "absent_pattern": "BluetoothPairingRequest",
+      "in": [
+       "src",
+       "include"
+      ]
+     }
+    ],
+    "text": "No BluetoothPairingRequest reference in src/ or include/."
+   },
+   "disposition": "unverified",
+   "domain": "bluetooth",
+   "evidence_tier": "code-verified",
+   "id": "D37-BT-PHONE-NAME",
+   "legacy": false,
+   "owner": "child-5-wireless-bt-radio",
+   "rationale": "Required (AASDK) vs optional (OAA) presence plus an extra OAA field 3 are mechanical; interop impact is unverified.",
+   "receiver_impact": "None today: the receiver does not use the BluetoothPairingRequest message.",
+   "severity": "low",
+   "status": "proposed",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "required int32 status = 1;",
+       "lines": "24",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mic/MicrophoneOpenResponse.proto"
+      },
+      {
+       "contains": "message AVInputOpenResponse",
+       "lines": "9",
+       "path": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVInputOpenResponseMessage.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "OAA has two definitions for mic-channel id 0x8006: MicrophoneOpenResponse (required status=1, session_config=2) and AVInputOpenResponse (session=1, value=2)."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "required int32 status = 1;",
+       "lines": "6",
+       "path": "third_party/aasdk/protobuf/aap_protobuf/service/media/source/message/MicrophoneResponse.proto"
+      }
+     ],
+     "result": "verified",
+     "text": "AASDK MicrophoneResponse is required int32 status=1 plus optional int32 session_id=2."
+    }
+   ],
+   "confidence": "medium",
+   "covers": [
+    "U-b5839f364aab",
+    "W-e5e66974a797"
+   ],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "source::MicrophoneResponse wire;",
+      "lines": "69",
+      "path": "src/protocol/aasdk_adapter/MicrophoneAdapter.cpp"
+     }
+    ],
+    "text": "decode_microphone_response parses the AASDK MicrophoneResponse."
+   },
+   "disposition": "unverified",
+   "domain": "av_media_mic",
+   "evidence_tier": "code-verified",
+   "id": "D38-MIC-OPEN-PAIR",
+   "legacy": false,
+   "owner": "child-2-av-media-focus",
+   "rationale": "Corrected: AASDK MicrophoneResponse matches oaa/mic/MicrophoneOpenResponse (status, session_config), not oaa/av/AVInputOpenResponse (session, value), which defines the same id 0x8006 differently inside OAA.",
+   "receiver_impact": "The adapter parses MicrophoneResponse with the AASDK schema; the OAA schema also contains a contradictory second definition for the same id.",
+   "related": [
+    "D29-AV-MEDIA-STATS-OPTS"
+   ],
+   "severity": "low",
+   "status": "proposed",
+   "version_gates": "all"
+  },
+  {
+   "claims": [
+    {
+     "evidence": [
+      {
+       "contains": "inline constexpr ExtensionPolicy kStrictExtensionPolicy = ExtensionPolicy::reject;",
+       "lines": "113",
+       "path": "src/protocol/aasdk_adapter/UnknownFields.hpp"
+      }
+     ],
+     "result": "verified",
+     "text": "The classifier and the strict default exist in UnknownFields.hpp."
+    },
+    {
+     "evidence": [
+      {
+       "contains": "classify_unknown_fields",
+       "lines": "62",
+       "path": "tests/protocol/unknown_field_tolerance_test.cpp"
+      }
+     ],
+     "result": "verified",
+     "text": "A unit test exercises the classifier."
+    }
+   ],
+   "confidence": "high",
+   "covers": [],
+   "current_behavior": {
+    "citations": [
+     {
+      "contains": "classify_unknown_fields(const google::protobuf::Message& message,",
+      "lines": "89",
+      "path": "src/protocol/aasdk_adapter/UnknownFields.hpp"
+     },
+     {
+      "contains": "inline constexpr ExtensionPolicy kStrictExtensionPolicy = ExtensionPolicy::reject;",
+      "lines": "113",
+      "path": "src/protocol/aasdk_adapter/UnknownFields.hpp"
+     }
+    ],
+    "text": "classify_unknown_fields distinguishes unknown_enum_or_wiretype from extension_tag; the boundary default is ExtensionPolicy::reject."
+   },
+   "disposition": "fixed",
+   "domain": "protocol_policy",
+   "evidence_tier": "code-verified",
+   "id": "D39-UNKNOWN-FIELDS-POLICY",
+   "legacy": false,
+   "no_generated_difference_reason": "Receiver policy, not a schema difference.",
+   "owner": "triage:phase0-closed",
+   "rationale": "Classification is implemented and unit-tested; extension tolerance is deliberately still off. Previous citation 'lines 1-120' overran the 115-line file.",
+   "receiver_impact": "Unknown-enum-on-known-tag and extension-tag cases are classified separately; both are rejected under the strict default; tolerance is not enabled.",
+   "related": [
+    "D3-UICFG-PAYLOAD",
+    "D5-VF-REASON"
+   ],
+   "severity": "medium-high",
+   "status": "resolved",
+   "version_gates": "n/a"
+  }
+ ],
+ "implementation_children": [
+  {
+   "acceptance_criteria": [
+    "A real-phone capture records who sends 0x0007 and whether the phone or head unit sends the first service-discovery message.",
+    "If the receiver starts decoding ServiceDiscoveryRequest, fields 4/5 are read per captured evidence, with raw-byte fixtures."
+   ],
+   "id": "child-1-control-sdp",
+   "linked_findings": [
+    "D14-SENTINEL-IDS",
+    "D16-SDP-ORDER",
+    "D17-OPEN-DIR-CLAIM",
+    "D8-SDQ-45-SEMANTICS",
+    "D9-SDR-F16"
+   ],
+   "scope": "Decide the SDP field 4/5 consumer semantics (D8), re-confirm field 16 (D9), record the real ChannelOpenRequest direction (D17) and handshake order (D16) from a phone capture.",
+   "title": "Control, authentication, service discovery and channel negotiation"
+  },
+  {
+   "acceptance_criteria": [
+    "A 0x8007 request carrying reason 3 or 4 is decoded (not malformed) with raw-byte fixtures.",
+    "A phone probe records what is sent on streams advertised with audio_type 1 and 4."
+   ],
+   "id": "child-2-av-media-focus",
+   "linked_findings": [
+    "D11-AUDIOTYPE-NAME",
+    "D29-AV-MEDIA-STATS-OPTS",
+    "D38-MIC-OPEN-PAIR",
+    "D4-SETUP-STATUS",
+    "D5-VF-REASON",
+    "D7-UNDERFLOW-PAYLOAD"
+   ],
+   "scope": "Handle VideoFocusReason 3/4 without rejecting the request (D5), classify setup status 1 (D4), audio type 1/4 meaning (D11), decide on 0x8013/0x8014 (D29), underflow payload (D7), mic open response (D38).",
+   "title": "AV setup, media, codecs and focus"
+  },
+  {
+   "acceptance_criteria": [
+    "Before implementing, a phone capture shows whether 0x8011 is ever sent when color_scheme_support is advertised.",
+    "Any added message is a project-owned codec with raw-byte fixtures, not a generated-bytes round trip."
+   ],
+   "id": "child-3-display-ui-theming",
+   "linked_findings": [
+    "D1-800A-NAME",
+    "D2-8012-MISSING",
+    "D25-VID-COLOR-SCHEME",
+    "D3-UICFG-PAYLOAD",
+    "D30-AV-OVERLAYS-800D-8010"
+   ],
+   "scope": "UI-config exchange 0x8009/0x800A/0x8011/0x8012 (D1, D2, D3), video descriptor field 9 (D25), overlay and notification ids (D30).",
+   "title": "Display, video configuration, UI theming and overlays"
+  },
+  {
+   "acceptance_criteria": [
+    "A phone capture decides microseconds vs nanoseconds for InputReport.timestamp before the encoder changes.",
+    "Sensor additions are gated on an actual data source."
+   ],
+   "id": "child-4-input-nav-sensors",
+   "linked_findings": [
+    "D26-SEN-EV-ENERGY",
+    "D28-INPUT-TS-UNITS",
+    "D35-NAV-EV-FORECAST",
+    "D36-NAV-MANEUVER-EXT"
+   ],
+   "scope": "Input timestamp unit (D28), EV sensor tags 23-26 (D26), navigation EV forecast and maneuver ranges (D35, D36).",
+   "title": "Input, navigation, sensors and vehicle services"
+  },
+  {
+   "acceptance_criteria": [
+    "A phone capture determines whether field 5 of WifiCredentialsResponse is read as access-point type or credential status.",
+    "A decision is recorded for each radio/car-control/car-intent definition: implement, or intentionally unsupported."
+   ],
+   "id": "child-5-wireless-bt-radio",
+   "linked_findings": [
+    "D10-STATUS-EXTRA",
+    "D27-WIFI-CRED-STATUS",
+    "D31-RADIO-HAL2-GAP",
+    "D33-CAR-INTENT-SERVICE",
+    "D37-BT-PHONE-NAME"
+   ],
+   "scope": "Wi-Fi credentials field 5 meaning (D27), Bluetooth pairing phone_name (D37), radio architecture (D31), car intent (D33), car-control status values (D10).",
+   "title": "Wireless projection, Bluetooth, radio and remaining services"
+  }
+ ],
+ "legacy_pins": {
+  "D1-800A-NAME": "6206a5243d0e572453db6cb8197ce10d083354bd102285755770120a84cba355",
+  "D10-STATUS-EXTRA": "81af90435030c6253073bec32b7d7129da55ca8b27b6335733dc8771d48cea72",
+  "D11-AUDIOTYPE-NAME": "a92b625e681a6406388925e7258a909a5f351eceda2ec49f4d1012b2b84e9d28",
+  "D12-ORDINAL-FORK": "3da7a06708861934e38f839d9ce050b57fe1781a29bcfea188d49fd2fee02d0f",
+  "D13-NAV14-NAME-REQ": "4ba692394484341277cbf33ce3c7c19c117fce6e3bc89f3894799b50bcc0937f",
+  "D14-SENTINEL-IDS": "5e5f8ffa88a85695c47ad10371685a7c9be48794ff1d23ea7c7be43191a75f54",
+  "D15-VERSION-RESP-LEN": "3df9bc1a399638081a1794a9027d0ed724e37474e3c4e9561778ac614f2039b1",
+  "D16-SDP-ORDER": "cfc5aa08ba94fc320205e2045ef576ec8defe43a5b479114937426589a666951",
+  "D17-OPEN-DIR-CLAIM": "7e7be5b5dc4d717eaa8047fae38d04651378f6398b96052121f90235aedb2bdb",
+  "D18-CHANNELMAP-CTRL": "55ca24cf3ae8a6e8fde7d548af4d8104de8723fe14acd060b5aa1d1707b51a86",
+  "D19-OAA-02-FLAGS": "0542100cc800faffc6334e2689ce27974796bdebc3e566cb105b40e51d1a46e4",
+  "D2-8012-MISSING": "b3c2f637d3702457f4f219ac19fd3fb38af5fb8cc791bbdc6afe282399270659",
+  "D20-VIDFOCUS-OAA-DOCS": "d107a87b253bc500b04abaf0ced35a81dc3d643bec1dfda75b736a592afeb559",
+  "D21-AUDIOFOCUS-NAME": "13e5a6c9f28276ac66888b3addd499835002f8da66b08ce47e6ab18d4b421be2",
+  "D22-VOICE-NAME": "5b22094f1a008a0e697375138e3f154b0c2bd5d5a6de64ac80af6551d8275bf0",
+  "D23-SHUTDOWN-NAME": "a5044389539b69b55597572f7bcf32eda50eeed2b04ea604c278799cf0ebd202",
+  "D24-PING-OPTCANON": "67593e76c7fdc9a914db1bc682c8ba01f806d3eff8815ae2724c22e5bad894c1",
+  "D3-UICFG-PAYLOAD": "fcd623db768631bd17dea3147e5b1594d03c836ac6e405b4aca6818f1937b570",
+  "D4-SETUP-STATUS": "98e802f1fb59ca5dcdfbd80195dff5a4879a57dc6051b13738784cc79d82523d",
+  "D5-VF-REASON": "c98d4d802d8b25b3111d78dee797455b8876d9618a4d568553267bc57705361c",
+  "D6-VF-FIELD1": "fa4bdff7d264389257e7cc50a44fa312482bba69c0671c40b562a1327701e180",
+  "D7-UNDERFLOW-PAYLOAD": "8a33141047a6e7b3b89ae311ec082fbc2e064e2221e4ed04d5c5a370533b887d",
+  "D8-SDQ-45-SEMANTICS": "22e84ff582bf99e65079c31735dcfa71f945e405531878cca6257afa1875eb5a",
+  "D9-SDR-F16": "403fd776d2a819c3f0f4007f2ea0c9b7658f8d205bd5ea930718d9ae6e975699"
+ },
+ "retired": [],
+ "schema": "aa-protobuf-audit-findings-1"
+}
