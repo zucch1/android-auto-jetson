@@ -165,6 +165,41 @@ TEST(Config, ConfirmedBenchConfigValidates) {
     EXPECT_FALSE(result.value().sensors_enabled);
 }
 
+TEST(Config, MalformedJurisdictionFailsClosed) {
+    for (const auto &bad_jurisdiction : {"USA", "us", "U", "", "U1", "12", "U$"}) {
+        aa::config::Config candidate{};
+        candidate.credential_path = "/etc/aa/hu.pem";
+        candidate.wireless.jurisdiction = bad_jurisdiction;
+        candidate.wireless.jurisdiction_confirmed = true;
+        const auto result = aa::config::validate(std::move(candidate));
+        ASSERT_FALSE(result.has_value()) << "Expected rejection for jurisdiction: " << bad_jurisdiction;
+        EXPECT_EQ(result.error().code(), aa::ErrorCode::config_invalid);
+    }
+}
+
+TEST(Config, EnabledExtrasFailClosed) {
+    {
+        aa::config::Config candidate{};
+        candidate.credential_path = "/etc/aa/hu.pem";
+        candidate.wireless.jurisdiction = "US";
+        candidate.wireless.jurisdiction_confirmed = true;
+        candidate.microphone_enabled = true;
+        const auto result = aa::config::validate(std::move(candidate));
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code(), aa::ErrorCode::config_invalid);
+    }
+    {
+        aa::config::Config candidate{};
+        candidate.credential_path = "/etc/aa/hu.pem";
+        candidate.wireless.jurisdiction = "US";
+        candidate.wireless.jurisdiction_confirmed = true;
+        candidate.sensors_enabled = true;
+        const auto result = aa::config::validate(std::move(candidate));
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code(), aa::ErrorCode::config_invalid);
+    }
+}
+
 TEST(Transport, FramedInterfaceIsImplementableAndTyped) {
     // Given: a loopback implementation of the framed-message contract.
     LoopbackTransport transport;
