@@ -128,3 +128,28 @@ TEST(ReplayParity, NearLimitBudgetsRoundTrip) {
 }
 
 } // namespace
+
+namespace {
+TEST(ReplayParity, ConfiguredScreenSurvivesFixtureExportAndLoad) {
+    replay::Recorder recorder;
+    fill_video(recorder, 32, 1);
+    proto::VideoConfiguration video{{{1280, 720, 30}}};
+    video.screen.density = 240;
+    video.screen.real_density = 210;
+    video.screen.theme = 2;
+    video.screen.width_margin = 20;
+    video.screen.height_margin = 40;
+    video.screen.pixel_aspect_ratio_e4 = 10000;
+    video.screen.decoder_additional_depth = 1;
+    video.screen.margins = aa::config::ScreenInsets{1, 2, 3, 4};
+    video.screen.content_insets = aa::config::ScreenInsets{5, 6, 7, 8};
+    video.screen.stable_content_insets = aa::config::ScreenInsets{9, 10, 11, 12};
+    ASSERT_TRUE(recorder.set_services({{proto::ServiceKey{99}, proto::ChannelRole::video, video}}));
+    const auto exported = recorder.export_fixture();
+    ASSERT_TRUE(exported);
+    const auto loaded = replay::load_fixture(exported.value().file_bytes);
+    ASSERT_TRUE(loaded);
+    ASSERT_EQ(loaded.value().services.size(), 1u);
+    EXPECT_EQ(std::get<proto::VideoConfiguration>(loaded.value().services.front().configuration), video);
+}
+} // namespace

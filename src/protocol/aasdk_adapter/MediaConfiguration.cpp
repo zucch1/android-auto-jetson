@@ -34,6 +34,13 @@ constexpr int kAudioConfigurationTags[] = {1, 2, 3};
         .rejected_under(kStrictExtensionPolicy);
 }
 
+void put_insets(shared::Insets& wire, const config::ScreenInsets& i) {
+    wire.set_top(i.top); wire.set_bottom(i.bottom); wire.set_left(i.left); wire.set_right(i.right);
+}
+config::ScreenInsets read_insets(const shared::Insets& i) {
+    return {i.top(), i.bottom(), i.left(), i.right()};
+}
+
 } // namespace
 
 core::Result<ServiceConfiguration>
@@ -91,9 +98,32 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
                 || !video.has_video_codec_type()
                 || video.video_codec_type() != shared::MEDIA_CODEC_VIDEO_H264_BP
                 || video.frame_rate() != sink::VIDEO_FPS_30
-                || video.width_margin() != 0 || video.height_margin() != 0) {
+                || video.has_viewing_distance()) {
                 return malformed();
             }
+            config::Screen screen;
+            screen.density = video.has_density() ? video.density() : 160;
+            if (video.has_width_margin()) { screen.width_margin = video.width_margin(); }
+            if (video.has_height_margin()) { screen.height_margin = video.height_margin(); }
+            if (video.has_real_density()) { screen.real_density = video.real_density(); }
+            if (video.has_pixel_aspect_ratio_e4()) { screen.pixel_aspect_ratio_e4 = video.pixel_aspect_ratio_e4(); }
+            if (video.has_decoder_additional_depth()) { screen.decoder_additional_depth = video.decoder_additional_depth(); }
+
+            if (video.has_ui_config()) {
+                const auto& ui = video.ui_config();
+                constexpr int ui_tags[] = {1, 2, 3, 4};
+                constexpr int inset_tags[] = {1, 2, 3, 4};
+                if (rejects_unknown(ui, ui_tags)
+                    || rejects_unknown(ui.margins(), inset_tags)
+                    || rejects_unknown(ui.content_insets(), inset_tags)
+                    || rejects_unknown(ui.stable_content_insets(), inset_tags)) { return malformed(); }
+                if (ui.has_margins()) { screen.margins = read_insets(ui.margins()); }
+                if (ui.has_content_insets()) { screen.content_insets = read_insets(ui.content_insets()); }
+                if (ui.has_stable_content_insets()) { screen.stable_content_insets = read_insets(ui.stable_content_insets()); }
+                if (ui.has_ui_theme()) { screen.theme = static_cast<std::uint32_t>(ui.ui_theme()); }
+            }
+            if (!config.profiles.empty() && config.screen != screen) { return malformed(); }
+            config.screen = screen;
             switch (video.codec_resolution()) {
             case sink::VIDEO_1280x720: config.profiles.push_back({1280, 720, 30}); break;
             case sink::VIDEO_800x480: config.profiles.push_back({800, 480, 30}); break;
@@ -173,8 +203,18 @@ core::Result<void> put_configuration(aap_protobuf::service::Service& entry,
                                                              : sink::VIDEO_800x480);
             video->set_frame_rate(sink::VIDEO_FPS_30);
             video->set_video_codec_type(shared::MEDIA_CODEC_VIDEO_H264_BP);
-            // Baseline UI scaling, not a physical real_density measurement.
-            video->set_density(160);
+            const auto& screen = std::get<VideoConfiguration>(descriptor.configuration).screen;
+            video->set_density(screen.density);
+            if (screen.width_margin) { video->set_width_margin(*screen.width_margin); }
+            if (screen.height_margin) { video->set_height_margin(*screen.height_margin); }
+            if (screen.real_density) { video->set_real_density(*screen.real_density); }
+            if (screen.pixel_aspect_ratio_e4) { video->set_pixel_aspect_ratio_e4(*screen.pixel_aspect_ratio_e4); }
+            if (screen.decoder_additional_depth) { video->set_decoder_additional_depth(*screen.decoder_additional_depth); }
+
+            if (screen.margins) { put_insets(*video->mutable_ui_config()->mutable_margins(), *screen.margins); }
+            if (screen.content_insets) { put_insets(*video->mutable_ui_config()->mutable_content_insets(), *screen.content_insets); }
+            if (screen.stable_content_insets) { put_insets(*video->mutable_ui_config()->mutable_stable_content_insets(), *screen.stable_content_insets); }
+            if (screen.theme) { video->mutable_ui_config()->set_ui_theme(static_cast<shared::UiTheme>(*screen.theme)); }
         }
         return {};
     }

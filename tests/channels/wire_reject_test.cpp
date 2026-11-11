@@ -64,7 +64,7 @@ TEST(ChannelWireReject, RejectsMissingVideoFieldsMarginsCodecAndProfileFlood) {
         case 0: config->clear_codec_resolution(); break;
         case 1: config->clear_frame_rate(); break;
         case 2: config->set_video_codec_type(shared::MEDIA_CODEC_VIDEO_VP9); break;
-        case 3: config->set_width_margin(1); break;
+        case 3: config->set_width_margin(1280); break;
         case 4: config->set_codec_resolution(sink::VIDEO_1920x1080); break;
         case 5: config->set_frame_rate(sink::VIDEO_FPS_60); break;
         case 6:
@@ -159,5 +159,26 @@ TEST(ChannelWireReject, RejectsOpenResponseMissingStatusWrongDiscriminatorAndUns
     EXPECT_FALSE(proto::decode_channel_open_response(payload(wire, proto::ControlMessageId::channel_open_response)));
     wire.set_status(aap_protobuf::shared::STATUS_SUCCESS);
     EXPECT_FALSE(proto::decode_channel_open_response(payload(wire, proto::ControlMessageId::ping_response)));
+}
+} // namespace
+
+namespace {
+TEST(ChannelWireReject, ScreenBoundsAndNestedUnknownFieldsFailClosed) {
+    for (const int scenario : {0, 1, 2, 3, 4, 5, 6, 7, 8}) {
+        auto wire = wire_video();
+        auto* v = wire.mutable_channels(0)->mutable_media_sink_service()->mutable_video_configs(0);
+        switch (scenario) {
+        case 0: v->set_density(161); break;
+        case 1: v->set_real_density(0); break;
+        case 2: v->set_pixel_aspect_ratio_e4(20001); break;
+        case 3: v->set_decoder_additional_depth(9); break;
+        case 4: v->set_height_margin(720); break;
+        case 5: v->mutable_ui_config()->mutable_margins()->set_left(1280); break;
+        case 6: v->mutable_ui_config()->mutable_unknown_fields()->AddVarint(4, 99); break;
+        case 7: v->mutable_ui_config()->mutable_content_insets()->mutable_unknown_fields()->AddVarint(5, 1); break;
+        case 8: v->mutable_ui_config()->mutable_unknown_fields()->AddVarint(99, 1); break;
+        }
+        EXPECT_FALSE(proto::decode_service_discovery_response(payload(wire))) << scenario;
+    }
 }
 } // namespace

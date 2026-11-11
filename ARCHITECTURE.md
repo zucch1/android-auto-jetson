@@ -142,3 +142,66 @@ remain **TARGET BLOCKED**.
   socket; no high-rate audio/video over D-Bus.
 - Dependencies are pinned and vendored with provenance and license review
   (GPL-3.0-or-later compatible).
+
+## Receiver screen description (single panel, issue #86)
+
+`aa-wired-receiver` accepts `--screen-<field> N` alongside its existing
+`--port`, `--store`, `--video-socket` and `--audio-sink` options. Values are
+unsigned decimal integers (no sign, whitespace or trailing characters).
+Invalid syntax, unknown screen fields or unsafe geometry exit with code 2,
+name the field on stderr, and fail before opening USB, sockets or the store.
+
+| Field | Accepted values | Default announcement |
+| --- | --- | --- |
+| `density` | Android bucket: 120, 160, 240, 320, 480, 640 | 160 |
+| `real-density` | 40–1000 DPI, explicitly measured by installer | absent |
+| `pixel-aspect-ratio-e4` | 5000–20000 (10000 = square pixels) | absent |
+| `decoder-additional-depth` | 0–8 extra buffered frames | absent |
+| `width-margin` | 0–799 total horizontal stream margin in pixels | absent |
+| `height-margin` | 0–479 total vertical stream margin in pixels | absent |
+| `theme` | 0 automatic, 1 light, 2 dark | absent |
+| `margins-{top,bottom,left,right}` | pixels, each edge and opposing sum smaller than active extent | absent |
+| `content-insets-{top,bottom,left,right}` | same bounds | absent |
+| `stable-content-insets-{top,bottom,left,right}` | same bounds | absent |
+
+The bounds are conservative receiver policy, not claimed protocol limits.
+One description is applied to both existing 1280×720 and 800×480 offers.
+Margin bounds and each inset rectangle must fit **both** offers; active extent
+is stream extent minus the total stream margin. Setting any edge creates its
+inset rectangle with the remaining edges zero. Other optional fields stay
+absent unless set, preserving the legacy discovery bytes exactly by default.
+The `screen_description` startup event logs all configured fields (null means
+not advertised). Density is an explicit bucket override; it is not automatically inferred from
+DPI. Do not substitute physical DPI for an Android density bucket.
+
+Example announcement experiment:
+
+```sh
+aa-wired-receiver --port 1-2.1 --screen-density 240 \
+  --screen-real-density 210 --screen-height-margin 80 \
+  --screen-content-insets-left 12 --screen-theme 2 \
+  --screen-pixel-aspect-ratio-e4 10000 --screen-decoder-additional-depth 1
+```
+
+These options describe capabilities during service discovery; video setup
+continues to use the existing fixed stream profiles. The pinned schema has no
+separate panel refresh-rate or presentation-pacing field. Decoder depth is a
+phone buffering hint, **not** vsync or a frame-rate negotiation control (#79,
+#85). `theme` sets `ui_config.ui_theme`; automatic scheduling, sensor-driven
+night mode and ambient-light sources are not implemented by this option.
+
+Remaining issue #86 work: attached-panel/EDID detection, physical dimensions
+and automatic density selection, viewport/sub-area presentation, cropping
+stream margins and matching touchscreen mapping/type, and real-phone
+verification. In particular, advertising margins does not make the current
+display consumer crop them. Treat nonzero margins as experimental until those
+paths are completed. No multi-display support, obsolete viewing distance,
+new wire extensions, codec negotiation or hardware decode is added here.
+Phone screenshots at 120/160/240, non-16:9 coverage, accurate edge touch, and
+1800/7200-second qualification remain required before issue #86 can close.
+
+Replay video services may carry an optional `screen` object whose numeric keys
+are the same field names used after `--screen-`. Export preserves optional-field
+presence; default descriptions omit the object, keeping existing fixture bytes
+and hashes unchanged. The loader uses the same screen parser and geometry
+validation as discovery and rejects unknown keys and unsafe values.

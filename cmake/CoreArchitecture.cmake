@@ -10,6 +10,7 @@ set(AA_CORE_SOURCES
     src/channels/Services.cpp
     src/protocol/ServiceValidation.cpp
     src/config/Validate.cpp
+    src/config/Screen.cpp
     src/diagnostics/Redaction.cpp)
 set(AA_CORE_TEST_SOURCES
     tests/architecture/contract_core_test.cpp

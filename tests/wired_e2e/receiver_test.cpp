@@ -5774,3 +5774,28 @@ TEST(WiredReceiver, InvalidOrMissingAudioSinkValueIsUsageError) {
     char *missing[]{executable.data(), port_flag.data(), port.data(), sink_flag.data()};
     EXPECT_EQ(receiver_main(4, missing), 2);
 }
+
+TEST(WiredReceiver, InvalidScreenFailsBeforeRuntimeAndNamesField) {
+    for (const auto& option : {std::pair{"density", "161"}, std::pair{"height-margin", "480"},
+                              std::pair{"theme", "3"}, std::pair{"density", "-1"},
+                              std::pair{"unknown", "1"}}) {
+        std::vector<std::string> args{"receiver", "--port", "1-2.1",
+                                      "--screen-" + std::string{option.first}, option.second};
+        std::vector<char*> argv;
+        for (auto& arg : args) { argv.push_back(arg.data()); }
+        testing::internal::CaptureStderr();
+        EXPECT_EQ(receiver_main(static_cast<int>(argv.size()), argv.data()), 2);
+        const auto error = testing::internal::GetCapturedStderr();
+        EXPECT_NE(error.find(std::string{"invalid screen field: "} + option.first), std::string::npos);
+    }
+}
+
+TEST(WiredReceiver, ServiceDescriptorsUseConfiguredSingleScreen) {
+    aa::config::Screen screen;
+    screen.density = 320;
+    screen.theme = 1;
+    const auto descriptors = service_descriptors(aa::input::CapabilityDescriptor::bench_defaults(), screen);
+    const auto& video = std::get<aa::protocol::VideoConfiguration>(descriptors.front().configuration);
+    EXPECT_EQ(video.screen, screen);
+    EXPECT_EQ(video.profiles.size(), 2u);
+}

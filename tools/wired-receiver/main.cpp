@@ -1518,8 +1518,9 @@ aa::audio::RouterConfig pcm_router_config(
 }
 
 std::vector<aa::protocol::ServiceDescriptor>
-service_descriptors(const aa::input::CapabilityDescriptor &input) {
-    const aa::protocol::VideoConfiguration video{{{1280, 720, 30}, {800, 480, 30}}};
+service_descriptors(const aa::input::CapabilityDescriptor &input,
+                    const aa::config::Screen &screen = {}) {
+    const aa::protocol::VideoConfiguration video{{{1280, 720, 30}, {800, 480, 30}}, screen};
     const aa::protocol::AudioConfiguration media_audio{{{48000, 16, 2}}};
     const aa::protocol::AudioConfiguration voice_audio{{{16000, 16, 1}}};
     aa::protocol::SensorConfiguration sensors;
@@ -1601,7 +1602,7 @@ const char *const kUsage =
     "usage: aa-wired-receiver --port <usb-port-context> [--store PATH]\n"
     "                         [--video-socket PATH] [--input-socket PATH]\n"
     "                         [--duration-ms N] [--no-bus]\n"
-    "                         [--require-video-consumer]\n"
+    "                         [--require-video-consumer] [--screen-<field> N]\n"
     "                         [--audio-sink pulse|pipewire|automatic]\n"
     "  runs the wired session over USB/AOA with TrustStore admission;\n"
     "  the approved-phones store must already contain the phone (fail closed).\n"
@@ -1613,6 +1614,7 @@ const char *const kUsage =
     "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked.\n";
 
 int receiver_main(int argc, char **argv) {
+    aa::config::Screen screen;
     std::string port;
     std::string store_path;
     std::string video_socket = aa::ipc::production_video_socket_path().value;
@@ -1624,6 +1626,12 @@ int receiver_main(int argc, char **argv) {
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--port") == 0 && index + 1 < argc) {
             port = argv[++index];
+        } else if (std::string_view{argv[index]}.starts_with("--screen-")) {
+            const auto field = std::string_view{argv[index]}.substr(9);
+            if (index + 1 >= argc || !aa::config::parse_screen_option(screen, field, argv[++index])) {
+                std::fprintf(stderr, "invalid screen field: %.*s\n", static_cast<int>(field.size()), field.data());
+                return 2;
+            }
         } else if (std::strcmp(argv[index], "--store") == 0 && index + 1 < argc) {
             store_path = argv[++index];
         } else if (std::strcmp(argv[index], "--video-socket") == 0 && index + 1 < argc) {
@@ -1658,6 +1666,11 @@ int receiver_main(int argc, char **argv) {
         return 2;
     }
 
+    // Every description must fit both existing backend-supported profiles.
+    if (const auto field = aa::config::invalid_screen_field(screen, 800, 480); !field.empty()) {
+        std::fprintf(stderr, "invalid screen field: %.*s\n", static_cast<int>(field.size()), field.data());
+        return 2;
+    }
     const auto started = std::chrono::steady_clock::now();
     const auto deadline = duration_ms > 0 ? started + std::chrono::milliseconds{duration_ms}
                                           : std::chrono::steady_clock::time_point::max();
@@ -1731,7 +1744,30 @@ int receiver_main(int argc, char **argv) {
         }
         bus.emplace(std::move(started_bus.value()));
     }
-    if (!session.configure(service_descriptors(input)).has_value()) {
+    // Numeric installer settings contain no phone identifiers or credentials.
+    std::string screen_event = "{\"event\":\"screen_description\",\"density\":" + std::to_string(screen.density);
+    const auto add_screen_field = [&](const char* name, const std::optional<std::uint32_t>& value) {
+        screen_event += ",\"" + std::string{name} + "\":" + (value ? std::to_string(*value) : "null");
+    };
+    add_screen_field("real_density", screen.real_density);
+    add_screen_field("pixel_aspect_ratio_e4", screen.pixel_aspect_ratio_e4);
+    add_screen_field("decoder_additional_depth", screen.decoder_additional_depth);
+    add_screen_field("width_margin", screen.width_margin);
+    add_screen_field("height_margin", screen.height_margin);
+    add_screen_field("theme", screen.theme);
+    const auto add_screen_insets = [&](const char* name, const std::optional<aa::config::ScreenInsets>& value) {
+        screen_event += ",\"" + std::string{name} + "\":";
+        if (!value) { screen_event += "null"; return; }
+        screen_event += "{\"top\":" + std::to_string(value->top)
+            + ",\"bottom\":" + std::to_string(value->bottom)
+            + ",\"left\":" + std::to_string(value->left)
+            + ",\"right\":" + std::to_string(value->right) + "}";
+    };
+    add_screen_insets("margins", screen.margins);
+    add_screen_insets("content_insets", screen.content_insets);
+    add_screen_insets("stable_content_insets", screen.stable_content_insets);
+    log_line(screen_event + "}");
+    if (!session.configure(service_descriptors(input, screen)).has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"configure\"}");
         return 1;
     }

@@ -14,6 +14,7 @@ namespace {
 // Canonical body grammar (the hashed region is exactly these bytes):
 //   {"provenance":"synthetic","metadata":"<line>","services":[S...],"records":[R...],"expect":E}
 //   S: {"id":N,"role":"<role>","video":[[w,h,fps]...]} | {"id":N,"role":"<role>","audio":[[rate,bits,ch]...]}
+//   Video entries may additionally carry "screen":{CLI-field:N,...}.
 //      | {"id":N,"role":"<role>","buttons":[N...]} | {"id":N,"role":"<role>","none":true}
 //   R: {"kind":"session","t":N,"op":"<op>",...} | {"kind":"transport","t":N,"dir":"in|out",
 //      "opaque":"synthetic","frame":"<hex>"} | {"kind":"video","t":N,"frame":N,"sequence":N,
@@ -67,6 +68,32 @@ void write_service(std::string& out, const ServiceEntry& service) {
                     out += "]";
                 }
                 out += "]";
+                if (configuration.screen != config::Screen{}) {
+                    const auto& screen = configuration.screen;
+                    out += ",\"screen\":{\"density\":";
+                    write_int(out, screen.density);
+                    const auto scalar = [&](std::string_view key, const std::optional<std::uint32_t>& value) {
+                        if (!value) { return; }
+                        out += ","; write_string(out, key); out += ":"; write_int(out, *value);
+                    };
+                    scalar("real-density", screen.real_density);
+                    scalar("pixel-aspect-ratio-e4", screen.pixel_aspect_ratio_e4);
+                    scalar("decoder-additional-depth", screen.decoder_additional_depth);
+                    scalar("width-margin", screen.width_margin);
+                    scalar("height-margin", screen.height_margin);
+                    scalar("theme", screen.theme);
+                    const auto insets = [&](std::string_view prefix, const std::optional<config::ScreenInsets>& value) {
+                        if (!value) { return; }
+                        scalar(std::string{prefix} + "-top", value->top);
+                        scalar(std::string{prefix} + "-bottom", value->bottom);
+                        scalar(std::string{prefix} + "-left", value->left);
+                        scalar(std::string{prefix} + "-right", value->right);
+                    };
+                    insets("margins", screen.margins);
+                    insets("content-insets", screen.content_insets);
+                    insets("stable-content-insets", screen.stable_content_insets);
+                    out += "}";
+                }
             } else if constexpr (std::is_same_v<T, protocol::AudioConfiguration>) {
                 out += ",\"audio\":[";
                 bool first = true;

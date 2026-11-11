@@ -27,7 +27,8 @@ core::Result<void> validate_service(const ServiceDescriptor& service) {
             || config->profiles.size() > kMaxMediaProfiles) { return malformed; }
         std::vector<VideoProfile> seen;
         for (const auto profile : config->profiles) {
-            if (!valid_video_profile(profile)
+            if (!config::invalid_screen_field(config->screen, profile.width, profile.height).empty()
+                || !valid_video_profile(profile)
                 || std::find(seen.begin(), seen.end(), profile) != seen.end()) {
                 return malformed;
             }
