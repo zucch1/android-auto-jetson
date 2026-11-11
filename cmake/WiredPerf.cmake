@@ -37,10 +37,13 @@ if(NOT CMAKE_CROSSCOMPILING)
         "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" stall_dropouts)
     add_test(NAME wired_perf_display_disconnect COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_continuity_regressions.py" disconnected)
-    foreach(case frozen active_window collector_frozen collector_gap_progress real_media_stall collector_gap_stalled)
+    foreach(case frozen active_window collector_frozen)
         add_test(NAME wired_perf_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_continuity_regressions.py" ${case})
     endforeach()
+    add_test(NAME wired_perf_collector_gaps COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/perf/test_collector_gaps.py")
+    set_tests_properties(wired_perf_collector_gaps PROPERTIES TIMEOUT 120)
     foreach(case schema nominal budget_fail duration contract collector media_timing readiness)
         add_test(NAME wired_perf_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_wired_perf.py" ${case})

@@ -54,6 +54,19 @@ CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
 _TERMINATE_GRACE_SECONDS = 5.0
 _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
 _MEDIA_STALL_SECONDS = 10
+# A normal sample interval is at most 5 s (see the sleeps in collect) plus a short
+# parse. Anything beyond this is the collector itself having been frozen, so it is
+# recorded as host interference; the margin below _MEDIA_STALL_SECONDS means gaps
+# that are close to, but under, the stall threshold are not silently dropped (#90).
+_COLLECTOR_INTERFERENCE_SECONDS = 7
+# The I/O freeze that stops the collector also delays the receiver's log reaching
+# disk, so the first sample after a gap can miss events the receiver already
+# logged. After a gap over _MEDIA_STALL_SECONDS the collector re-polls for at most
+# this long before judging. Five seconds is half the stall threshold: long enough
+# for the page cache to drain once the disk is back, short enough that a dead
+# receiver is still reported, and a bounded addition to the observed gap.
+_COLLECTOR_LOG_GRACE_SECONDS = 5.0
+_COLLECTOR_LOG_POLL_SECONDS = 0.25
 _PROGRESS_KEYS = ("video_units", "audio_chunks", "video_presentations", "audio_writes", "av_pairs")
 
 # Diagnostic keys the receiver/display event stream may carry (task-19
@@ -175,11 +188,36 @@ class ProjectionProgress:
     def seconds(self) -> float:
         return (self.last_ns - self.started_ns) / 1e9 if self.started_ns is not None else 0.0
 
-    @property
-    def interference(self) -> list[dict]:
-        return self.interferences
+    def covers_gap(self, sample: Sample, logged_progress: dict[str, dict] | None) -> bool:
+        """Whether receiver-logged events show every stream flowing through a gap.
 
-    def observe(self, sample: Sample) -> None:
+        Judged on the receiver's own event times, never on counter deltas: a count
+        that moved by one says nothing about where inside the window it moved.
+        """
+        return (logged_progress is not None and bool(self.previous)
+                and all(self._continuous(key, getattr(sample, key), sample.t_ns, logged_progress)
+                        for key in _PROGRESS_KEYS))
+
+    def _continuous(self, key: str, value: int | None, stamp: int,
+                    logged_progress: dict[str, dict]) -> bool:
+        evidence = logged_progress.get(key)
+        if not isinstance(evidence, dict) or type(value) is not int:
+            return False
+        count, silence, last = (evidence.get("event_count"), evidence.get("max_silence_ns"),
+                                evidence.get("last_event_ns"))
+        return (value > self.previous.get(key, value)
+                and type(count) is int and count > 0
+                and type(silence) is int and 0 <= silence <= _MEDIA_STALL_SECONDS * 1_000_000_000
+                and type(last) is int and self.last_ns < last <= stamp)
+
+    def observe(self, sample: Sample, logged_progress: dict[str, dict] | None = None) -> None:
+        """Fold in one sample.
+
+        ``logged_progress`` is receiver-clock evidence for the window since the last
+        sample (see EventParser.logged_progress). It is consulted only when the
+        collector's own sampling gap exceeds _MEDIA_STALL_SECONDS; with no such gap
+        this is the historical age-before-resume check, unchanged.
+        """
         if self.failure:
             return
         stamp = sample.t_ns
@@ -199,32 +237,44 @@ class ProjectionProgress:
             self.previous = counters
             self.advanced_ns = {key: stamp for key in counters}
         else:
-            if stamp <= self.last_ns:
-                self.failure = "sampling_gap"
-                return
             sampling_gap_ns = stamp - self.last_ns
-            if sampling_gap_ns > _MEDIA_STALL_SECONDS * 1_000_000_000:
-                self.interferences.append({
+            interference = None
+            if sampling_gap_ns > _COLLECTOR_INTERFERENCE_SECONDS * 1_000_000_000:
+                interference = {
                     "reason": "collector_sampling_gap",
                     "classification": "host_interference",
                     "gap_seconds": sampling_gap_ns / 1e9,
                     "gap_ns": sampling_gap_ns,
+                    "start_ns": self.last_ns,
                     "t_ns": stamp,
-                })
+                }
+                self.interferences.append(interference)
+            gap_judged = (logged_progress is not None
+                          and sampling_gap_ns > _MEDIA_STALL_SECONDS * 1_000_000_000)
+            if not gap_judged and (stamp <= self.last_ns
+                                   or sampling_gap_ns > _MEDIA_STALL_SECONDS * 1_000_000_000):
+                self.failure = "sampling_gap"
             if not sample.projection_active:
                 self.failure = "projection_inactive"
             for key, value in counters.items():
                 if value < self.previous[key]:
                     self.failure = "counter_reset:" + key
-                # Check whether the receiver logged progress during the window:
-                # if progress was logged, the media did not stall (even if the collector had a gap).
-                # Only declare a media stall if no progress was logged and the time since this
-                # stream last advanced exceeds _MEDIA_STALL_SECONDS.
-                advanced = value > self.previous[key]
-                if advanced:
-                    self.advanced_ns[key] = stamp
-                elif stamp - self.advanced_ns[key] > _MEDIA_STALL_SECONDS * 1_000_000_000:
+                if gap_judged:
+                    if self._continuous(key, value, stamp, logged_progress):
+                        self.advanced_ns[key] = logged_progress[key]["last_event_ns"]
+                    else:
+                        self.failure = "media_stalled:" + key
+                    continue
+                # Check age before accepting a resumed stream: a late recovery cannot heal a freeze.
+                if stamp - self.advanced_ns[key] > _MEDIA_STALL_SECONDS * 1_000_000_000:
                     self.failure = "media_stalled:" + key
+                if value > self.previous[key]:
+                    self.advanced_ns[key] = stamp
+            if interference is not None:
+                # The gap is context for, never a substitute for, the verdict.
+                interference["projection_failure"] = self.failure
+                if gap_judged:
+                    interference["logged_progress"] = logged_progress
             self.previous = counters
         self.last_ns = stamp
 
@@ -255,6 +305,14 @@ class EventParser:
         self.video_completions: deque[tuple[int, int]] = deque()
         self.av_pairs = 0
         self.audio_writes = 0
+        # Receiver-clock times (the receiver's own monotonic stamps) of the events
+        # behind each progress counter, kept only since the last accepted sample,
+        # plus the newest earlier event per stream so a window's leading silence is
+        # measured from the stream's real last event. video_units / audio_chunks
+        # log no timestamp of their own; their evidence is the timestamped
+        # video_presented / audio_write_completed events of the same stream.
+        self.media_event_times: dict[str, list[int]] = {key: [] for key in _PROGRESS_KEYS}
+        self.media_last_before: dict[str, int | None] = {key: None for key in _PROGRESS_KEYS}
         # The audio A/V endpoint the run's first write used (#60):
         # "playback" (presented_ns) or "handoff" (legacy completed_ns).
         self.audio_endpoint: str | None = None
@@ -264,6 +322,46 @@ class EventParser:
         self.last_audio_scheduled = -1
         self.last_video_scheduled = -1
         self.video_measurements = VideoMeasurements()
+
+    def _record_progress(self, keys: tuple[str, ...], stamp: int) -> None:
+        for key in keys:
+            self.media_event_times[key].append(stamp)
+
+    def progress_sampled(self, sample_ns: int, origin_ns: int) -> None:
+        """Close the observation window at an accepted sample (collector clock)."""
+        absolute = origin_ns + sample_ns
+        for key, times in self.media_event_times.items():
+            older = [stamp for stamp in times if stamp <= absolute]
+            if older:
+                prior = self.media_last_before[key]
+                self.media_last_before[key] = max(older) if prior is None else max(prior, max(older))
+            self.media_event_times[key] = [stamp for stamp in times if stamp > absolute]
+
+    def logged_progress(self, origin_ns: int, start_ns: int, end_ns: int) -> dict[str, dict]:
+        """Receiver-clock continuity of each stream over (start_ns, end_ns].
+
+        ``max_silence_ns`` is the longest stretch with no logged event, measured from
+        the stream's last event before the window (or the window start if it has
+        none) through to the window end.
+        """
+        result: dict[str, dict] = {}
+        for key, recorded in self.media_event_times.items():
+            times = sorted(stamp - origin_ns for stamp in recorded
+                           if start_ns < stamp - origin_ns <= end_ns)
+            prior = self.media_last_before[key]
+            cursor = min(start_ns, prior - origin_ns) if prior is not None else start_ns
+            max_silence = 0
+            for stamp in times:
+                max_silence = max(max_silence, stamp - cursor)
+                cursor = stamp
+            max_silence = max(max_silence, end_ns - cursor)
+            result[key] = {
+                "event_count": len(times),
+                "first_event_ns": times[0] if times else None,
+                "last_event_ns": times[-1] if times else None,
+                "max_silence_ns": max_silence,
+            }
+        return result
 
     def _completion(self, event: dict) -> None:
         """Join endpoint events by concurrent scheduled presentation, not log arrival."""
@@ -307,12 +405,14 @@ class EventParser:
                 return
             self.last_audio_scheduled = scheduled
             self.audio_writes += 1
+            self._record_progress(("audio_chunks", "audio_writes"), event["completed_ns"])
             self.audio_completions.append((scheduled, end, completed))
         else:
             if scheduled <= self.last_video_scheduled:
                 return
             self.last_video_scheduled = scheduled
             self.video_presentations += 1
+            self._record_progress(("video_units", "video_presentations"), event["completed_ns"])
             self.video_completions.append((scheduled, completed))
         pending: deque[tuple[int, int]] = deque()
         for stamp, video_done in self.video_completions:
@@ -331,6 +431,7 @@ class EventParser:
                 self._number({"delta": abs(skew) / 1e6}, "delta",
                              "av_sync_ms", peak=True)
                 self.av_pairs += 1
+                self._record_progress(("av_pairs",), event["completed_ns"])
         self.video_completions = pending
         # Bound retention even if a stream disappears. Missing pairs never become zero.
         while len(self.audio_completions) > 16384:
@@ -523,6 +624,28 @@ def collect(args: argparse.Namespace) -> dict:
     observed_duration = 0.0
     deadline = start + startup_timeout
 
+    def read_sample() -> Sample:
+        nonlocal inventory
+        parser.poll(str(receiver_log))
+        if display is not None:
+            parser.poll(str(display_log))
+        observed = _thermal_inventory() if thermal_policy is not None else None
+        if observed is not None and inventory and set(observed) != {zone.zone for zone in inventory}:
+            parser.invalid_telemetry.append("thermal_inventory_changed")
+        zones = (_thermal_zones(inventory, observed) if observed is not None
+                 else _thermal_zones(inventory))
+        assert receiver is not None
+        return Sample(
+            t_ns=time.monotonic_ns() - origin_ns,
+            receiver_rss_mb=_rss_mb(receiver.pid),
+            receiver_cpu_ticks=_cpu_ticks(receiver.pid),
+            thermal_zones=zones,
+            projection_active=parser.projection_active,
+            video_units=parser.video_units, audio_chunks=parser.audio_chunks,
+            video_presentations=parser.video_presentations,
+            audio_writes=parser.audio_writes, av_pairs=parser.av_pairs,
+        )
+
     try:
         rec_file = open(receiver_log, "w", encoding="utf-8")
         receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
@@ -572,27 +695,26 @@ def collect(args: argparse.Namespace) -> dict:
             if parser.terminal_errors:
                 break
             time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
-            parser.poll(str(receiver_log))
-            if display is not None:
-                parser.poll(str(display_log))
-            observed = _thermal_inventory() if thermal_policy is not None else None
-            if observed is not None and inventory and set(observed) != {zone.zone for zone in inventory}:
-                parser.invalid_telemetry.append("thermal_inventory_changed")
-            zones = (_thermal_zones(inventory, observed) if observed is not None
-                     else _thermal_zones(inventory))
-            sample = Sample(
-                t_ns=time.monotonic_ns() - origin_ns,
-                receiver_rss_mb=_rss_mb(receiver.pid),
-                receiver_cpu_ticks=_cpu_ticks(receiver.pid),
-                thermal_zones=zones,
-                projection_active=parser.projection_active,
-                video_units=parser.video_units, audio_chunks=parser.audio_chunks,
-                video_presentations=parser.video_presentations,
-                audio_writes=parser.audio_writes, av_pairs=parser.av_pairs,
-            )
+            sample = read_sample()
+            logged_progress = None
+            if (progress.started_ns is not None
+                    and sample.t_ns - progress.last_ns > _MEDIA_STALL_SECONDS * 1_000_000_000):
+                # The collector itself was frozen. The receiver's log may not have
+                # reached disk yet, so do not judge the first post-gap read: re-poll
+                # for a bounded grace, stopping early once the logged events show
+                # every stream flowing, then decide from the receiver's own clock.
+                grace_end_ns = sample.t_ns + int(_COLLECTOR_LOG_GRACE_SECONDS * 1_000_000_000)
+                while True:
+                    logged_progress = parser.logged_progress(origin_ns, progress.last_ns,
+                                                             sample.t_ns)
+                    if progress.covers_gap(sample, logged_progress) or sample.t_ns >= grace_end_ns:
+                        break
+                    time.sleep(_COLLECTOR_LOG_POLL_SECONDS)
+                    sample = read_sample()
             samples.append(sample)
             was_started = progress.started_ns is not None
-            progress.observe(sample)
+            progress.observe(sample, logged_progress)
+            parser.progress_sampled(sample.t_ns, origin_ns)
             if not was_started and progress.started_ns is not None:
                 inventory = sample.thermal_zones
                 parser.video_measurements.start_window(origin_ns, progress.started_ns)
