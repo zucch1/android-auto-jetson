@@ -4,7 +4,7 @@
 
 ## Processes
 
-- `aa-wired-receiver` (`aa-receiver.service`, unprivileged user session): Android Auto protocol and session state, media handling, session D-Bus control/status service (`org.custom.AndroidAutoReceiver`), bounded video socket, and input socket.
+- `aa-wired-receiver` (unprivileged user session; no systemd unit for it is packaged yet): Android Auto protocol and session state, media handling, session D-Bus control/status service (`org.custom.AndroidAutoReceiver`), bounded video socket, and input socket.
 - `aa-system-helper` (`aa-system-helper.service`, privileged, narrowly scoped): NetworkManager access point management, USB policy status, BlueZ profile registration and RFCOMM bootstrap mediation. The receiver reaches it only through `aa::helper::HelperClient`; no privileged tool is called directly.
 - `aa-dummy-display` (consumer-side decode helper and test display): GStreamer hardware/software H.264 decode pipeline, Qt6 presentation, and a 5 ms precise timer pump (`tools/dummy-display/pump_timer.hpp`) for A/V synchronization.
 - Bounded `AF_UNIX` `SOCK_SEQPACKET` channels: Video channel carrying encoded H.264 access units (timestamps, sequence numbers, IDR flags, drop-to-IDR recovery, 16 KiB fragment payload, 4 MiB frame limit, 56-byte header) and input channel for touch and key input reports.
@@ -69,7 +69,7 @@ The scanner matches include directives with full `#`/`include` whitespace tolera
 
 The host-tested receiver listener and helper-owned RFCOMM bootstrap are implemented. The helper alone handles AAW framing and credentials; the receiver uses authenticated bootstrap RPCs and a fenced NetworkManager AP snapshot. A negotiated AAP WifiCredentials service is metadata-only and distinct from that bootstrap. Each accepted TCP link reuses a fresh `WiredSession` with AAP encapsulated TLS, not an outer TLS transport. See [wireless-handoff.md](docs/wireless-handoff.md) for authorization, lifetimes, and revocation.
 
-**Active Blocker:** A shared PSK cannot cryptographically bind the incoming TCP connection to the authenticated Bluetooth peer, so production rejects unbound connections (`src/app/HandoffEligibility.cpp`); wireless admission is not delivered in production. Host attestation is test-only; real-phone and Jetson qualification remain **TARGET BLOCKED**.
+**Active Blocker:** A shared PSK cannot cryptographically bind the incoming TCP connection to the authenticated Bluetooth peer, so production rejects unbound connections with `transport_unauthorized_peer` (`src/app/WirelessLink.cpp`); wireless admission is not delivered in production. Host attestation is test-only; real-phone and Jetson qualification remain **TARGET BLOCKED**.
 
 ## Contract budgets referenced by interfaces
 
@@ -79,7 +79,7 @@ The host-tested receiver listener and helper-owned RFCOMM bootstrap are implemen
 - Display pump cadence: 5 ms precise timer (`tools/dummy-display/pump_timer.hpp`), bounding schedule-to-present delay to pass the 50 ms A/V gate (PR #81).
 - A/V sync formula: `abs((video_done - video_stamp) - (audio_done - audio_begin))` schedule-to-completion latency difference.
 - Audio routing default: `pulsesink` via `pipewire-pulse` (PR #88) for long-run playback stability, selectable via `--audio-sink pulse|pipewire|automatic`.
-- Bench defaults advertise video, the four audio roles, bench input and diagnostics only — microphone, vehicle sensors and the projection passthrough services are not advertised until qualified.
+- `bench_defaults()` carries only the two video profiles. The wired receiver's service list (`service_descriptors` in `tools/wired-receiver/main.cpp`) advertises video, media, guidance and system audio, input, sensors and a 16 kHz mono microphone.
 
 ## Scope boundaries
 

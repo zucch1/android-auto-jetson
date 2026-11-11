@@ -10,11 +10,11 @@ To prevent confusion between host tests, cross-compilation, and device qualifica
 
 - **Implemented**: Unprivileged wired receiver (`aa-wired-receiver`), privileged helper daemon (`aa-system-helper`), dummy test display (`aa-dummy-display`), H.264 hardware/software consumer decode pipeline, audio pipeline (defaulting to `pulsesink` via `pipewire-pulse`), versioned D-Bus control service (`org.custom.AndroidAutoReceiver1`), approve-once phone trust store (`aa_trust`), and pseudonymizing diagnostics.
 - **Host-tested**: Native unit, integration, and recovery test suites pass under host simulation and synthetic fixtures (`ctest --preset host-dev`).
-- **Cross-built against fixture**: Public CI cross-compiles for AArch64 against a synthetic fixture sysroot (`ci/arm64-cross-build` in `.github/workflows/ci.yml:235-350`, `AA_SYSROOT_REQUIRE_OBSERVED=OFF`). This is explicitly **fixture-not-target**, not target qualification. Observed-sysroot cross-compilation acceptance is relayed via `tools/ci/arm64-cross-relay.sh` for exact head commits.
+- **Cross-built against fixture**: Public CI cross-compiles for AArch64 against a synthetic fixture sysroot (the fixture cross-build job in `.github/workflows/ci.yml`, `AA_SYSROOT_REQUIRE_OBSERVED=OFF`). This is explicitly **fixture-not-target**, not target qualification. Observed-sysroot cross-compilation acceptance is relayed via `tools/ci/arm64-cross-relay.sh` for exact head commits.
 - **Target-qualified**: On-device execution on NVIDIA Jetson hardware (L4T R39.2.1) is governed by live qualification runbooks (`docs/qualification/`); synthetic host tests do not substitute for target acceptance.
 - **Real-phone-qualified**: End-to-end projection with a physical phone over USB/AOA is governed by phase-B live QA procedures; host-side fixture passes do not qualify device interoperability.
 - **Active blockers**:
-  - *Wireless TCP endpoint binding*: A shared WPA2/WPA3 PSK cannot cryptographically bind the incoming TCP connection to the authenticated Bluetooth peer. Production rejects unbound connections (`src/app/HandoffEligibility.cpp`); wireless admission is **BLOCKED** and not delivered in production.
+  - *Wireless TCP endpoint binding*: A shared WPA2/WPA3 PSK cannot cryptographically bind the incoming TCP connection to the authenticated Bluetooth peer. Production rejects unbound connections with `transport_unauthorized_peer` (`src/app/WirelessLink.cpp`); wireless admission is **BLOCKED** and not delivered in production.
   - *Target development dependency bindings*: While toolchain runtime packages are bound (`deps/manifest.json` status `bound-task5-observed`), required development components (`protobuf`, `Boost`, `OpenSSL`, `libusb`, `GStreamer`, `Qt6`) remain `unbound-no-target-observations`.
 
 ## Implemented architecture
@@ -32,9 +32,9 @@ To prevent confusion between host tests, cross-compilation, and device qualifica
 ### Prerequisites
 
 - CMake >= 3.20, Ninja, Python >= 3.12, C++20 compiler (GCC or Clang).
-- System development packages: `libprotobuf-dev`, `protobuf-compiler`, `libboost-system-dev`, `libboost-log-dev`, `libssl-dev`, `libusb-1.0-0-dev`, `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, `gstreamer1.0-tools`, `gstreamer1.0-plugins-good`, `gstreamer1.0-plugins-bad`, `gstreamer1.0-pipewire`, `pipewire-bin`, `wireplumber`, `pipewire-pulse`, `pulseaudio-utils`, `dbus-daemon`, `qt6-base-dev`, `valgrind`, `pkg-config`, `binutils` (matching `.github/workflows/ci.yml:44-59`).
+- System development packages: `libprotobuf-dev`, `protobuf-compiler`, `libboost-system-dev`, `libboost-log-dev`, `libssl-dev`, `libusb-1.0-0-dev`, `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, `gstreamer1.0-tools`, `gstreamer1.0-plugins-good`, `gstreamer1.0-plugins-bad`, `gstreamer1.0-pipewire`, `pipewire-bin`, `wireplumber`, `pipewire-pulse`, `pulseaudio-utils`, `dbus-daemon`, `qt6-base-dev`, `valgrind`, `pkg-config`, `binutils` (matching `.github/workflows/ci.yml`).
 - Pre-staged locked GoogleTest v1.15.2 archive (configure never downloads dependencies).
-- Audio runtime: Audio pipeline route tests require an active user-session PipeWire audio runtime with default sink resolution and PulseAudio compatibility (`.github/workflows/ci.yml:74-137`).
+- Audio runtime: Audio pipeline route tests require an active user-session PipeWire audio runtime with default sink resolution and PulseAudio compatibility (see the audio runtime step in `.github/workflows/ci.yml`).
 
 ### Host build
 
@@ -53,14 +53,14 @@ ctest --preset host-dev --output-on-failure
 
 ### Reproducing public CI checks locally
 
-The public CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), which is the authority for active CI job names and steps) executes four independent checks:
+The public CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), which is the authority for active CI job names and steps) executes independent checks. Today they are:
 
 1. **`ci/host-build-test`**: `cmake --build --preset host-dev && ctest --preset host-dev --output-on-failure` (PR runs defer `ipc-bench-happy-600` when benchmark sources and build commands are unchanged vs base).
 2. **`ci/provenance-lint`**: `tools/provenance/check.sh` and `for case in baseline overlay content header extra generated license gpl inventory listing symlink missing mode; do python3 -B tests/provenance/scenarios.py "$PWD" "$case"; done`.
-3. **`ci/decode-overlay-cross`**: Both invocations executed in `.github/workflows/ci.yml:195-215`:
+3. **`ci/decode-overlay-cross`**: Both invocations of the decode job in `.github/workflows/ci.yml`:
    - Probe, AArch64 ELF and bound overlay provenance: `python3 -B tests/media/cross_decode_overlay.py --scratch "$RUNNER_TEMP/decode-overlay-cross"`
    - Full root cross provenance with external overlay: `python3 -B tests/media/cross_decode_overlay.py --root-project --archive "${AA_GOOGLETEST_ARCHIVE:-.local/dependencies/googletest-v1.15.2.tar.gz}" --scratch "$RUNNER_TEMP/decode-root-cross"`
-4. **`ci/arm64-cross-build`**: `cmake --preset jetson-aarch64 && cmake --build --preset jetson-aarch64` (against generated synthetic fixture sysroot with `AA_SYSROOT_REQUIRE_OBSERVED=OFF`; explicitly **fixture-not-target** per `.github/workflows/ci.yml:235-350`). For exact-head target cross-acceptance, the maintainer relays the observed-sysroot smoke (`AA_SYSROOT_REQUIRE_OBSERVED=ON`) via `tools/ci/arm64-cross-relay.sh:5-18`.
+4. **ARM64 fixture cross-build**: `cmake --preset jetson-aarch64 && cmake --build --preset jetson-aarch64` against a generated synthetic fixture sysroot with `AA_SYSROOT_REQUIRE_OBSERVED=OFF`; explicitly **fixture-not-target**. The workflow file names the job. For exact-head target cross-acceptance, the maintainer runs the observed-sysroot smoke (`AA_SYSROOT_REQUIRE_OBSERVED=ON`) with `tools/ci/arm64-cross-relay.sh`, which posts the `ci/arm64-cross-build` commit status for that exact SHA.
 
 ## Documentation directory
 

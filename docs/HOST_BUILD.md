@@ -4,7 +4,7 @@ Requires CMake >= 3.20, Ninja, Python >= 3.12, and a C/C++ compiler with C++20 s
 
 ## Dependencies
 
-The native host build and tests require system development packages (matching `.github/workflows/ci.yml:44-59`):
+The native host build and tests require system development packages (matching the package-install step of `.github/workflows/ci.yml`):
 
 - **Build tools**: `cmake`, `ninja-build`, `pkg-config`, `binutils`, `g++` (or `clang`).
 - **Protobuf**: `libprotobuf-dev`, `protobuf-compiler` (versions must match; tested with 3.21.12).
