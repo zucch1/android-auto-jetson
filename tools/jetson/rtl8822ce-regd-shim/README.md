@@ -23,13 +23,16 @@ module `rtl8822ce` v5.14.0.4-261-g3e7be62b5 COEX).
 
 | File | Purpose |
 |---|---|
-| `rtl8822ce-regd-shim.c` | GPL kernel module; registers the US regdomain on the wiphy at init (88 LOC) |
+| `rtl8822ce-regd-shim.c` | GPL kernel module; registers the US regdomain on the wiphy at init (177 lines) |
 | `Makefile` | kbuild wrapper (`make -C /lib/modules/$(uname -r)/build M=$PWD`) |
 | `rtl8822ce-regd-watchdog.sh` | drift convergence: re-asserts via `rmmod`+`modprobe` every 5 s |
 | `rtl8822ce-regd-shim.service` | loads the shim at boot (waits for the netdev device unit) |
 | `rtl8822ce-regd-watchdog.service` | runs the watchdog (`Restart=always`) |
 
 ## Install (on the target)
+
+These files are staged in the repository, not installed by checkout. During an
+explicit maintenance window, install them manually:
 
 ```bash
 cd tools/jetson/rtl8822ce-regd-shim
