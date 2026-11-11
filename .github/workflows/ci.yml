@@ -255,6 +255,13 @@ jobs:
           for case in baseline overlay content header extra generated license gpl inventory listing symlink missing mode; do
             python3 -B tests/provenance/scenarios.py "$PWD" "$case"
           done
+      - name: Verify protobuf audit inventory and guard against schema drift
+        run: |
+          set -euo pipefail
+          python3 -B tools/protocol/protobuf_audit.py --check
+          for case in baseline drift-inventory missing-file tampered-hash duplicate-id missing-field invalid-disposition unexplained-deletion; do
+            python3 -B tests/protocol/audit_scenarios.py "$PWD" "$case"
+          done
 
   arm64-cross-build:
     name: ci/arm64-cross-build

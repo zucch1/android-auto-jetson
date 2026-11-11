@@ -109,4 +109,24 @@ endforeach()
 unset(case)
 unset(test_suffix)
 unset(AA_PROTOCOL_CODEGEN_CASES)
+
+add_test(NAME protocol_adapter_protobuf_audit
+    COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_SOURCE_DIR}/tools/protocol/protobuf_audit.py" --check)
+set_tests_properties(protocol_adapter_protobuf_audit PROPERTIES TIMEOUT 60)
+
+set(AA_PROTOCOL_AUDIT_CASES
+    baseline drift-inventory missing-file tampered-hash duplicate-id
+    missing-field invalid-disposition unexplained-deletion)
+foreach(case IN LISTS AA_PROTOCOL_AUDIT_CASES)
+    string(REPLACE "-" "_" test_suffix "${case}")
+    add_test(NAME protocol_adapter_audit_${test_suffix}
+        COMMAND "${Python3_EXECUTABLE}" -B
+                "${CMAKE_SOURCE_DIR}/tests/protocol/audit_scenarios.py"
+                "${CMAKE_SOURCE_DIR}" "${case}")
+    set_tests_properties(protocol_adapter_audit_${test_suffix} PROPERTIES TIMEOUT 60)
+endforeach()
+unset(case)
+unset(test_suffix)
+unset(AA_PROTOCOL_AUDIT_CASES)
 unset(AA_PROTOCOL_TEST_SOURCES)
