@@ -22,6 +22,7 @@ core::Result<std::filesystem::path> ApprovedPhoneStore::default_path() {
 }
 
 core::Result<void> ApprovedPhoneStore::load() {
+    dropped_port_only_count_ = 0;
     auto text = detail::read_file(path_);
     if (!text.has_value()) {
         usable_ = false;
@@ -42,6 +43,7 @@ core::Result<void> ApprovedPhoneStore::load() {
         phones_.clear();
         return parsed.error();
     }
+    dropped_port_only_count_ = parsed.value().dropped_port_only_count;
     phones_ = std::move(parsed.value().phones);
     next_phone_id_ = parsed.value().next_phone_id;
     loaded_ = true;

@@ -168,6 +168,10 @@ core::Result<std::filesystem::path> resolve_default_path() {
 }
 
 core::Result<void> ensure_private_file(const std::filesystem::path& path) {
+    const auto filename = path.filename();
+    if (filename.empty() || filename == "." || filename == "..") {
+        return Error{ErrorCode::trust_store_io};
+    }
     const int dirfd = open_verified_parent(path.parent_path(), false);
     if (dirfd < 0) {
         return Error{ErrorCode::trust_store_io};
@@ -184,6 +188,10 @@ core::Result<void> ensure_private_file(const std::filesystem::path& path) {
 }
 
 core::Result<std::string> read_file(const std::filesystem::path& path) {
+    const auto filename = path.filename();
+    if (filename.empty() || filename == "." || filename == "..") {
+        return Error{ErrorCode::trust_store_io};
+    }
     const int dirfd = open_verified_parent(path.parent_path(), false, true);
     if (dirfd < 0) {
         if (errno == ENOENT) { return std::string{}; }

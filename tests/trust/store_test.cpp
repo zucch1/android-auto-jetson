@@ -393,6 +393,9 @@ TEST(TrustStore, SerialLessApprovalDoesNotAliasADifferentDevice) {
 
     const auto explicit_grant = store.approve_port_only(phone_a);
     ASSERT_TRUE(explicit_grant.has_value());
+    const auto repeated = store.approve_port_only(phone_a);
+    ASSERT_TRUE(repeated.has_value());
+    EXPECT_EQ(repeated.value(), explicit_grant.value());
     ASSERT_EQ(store.phones().size(), 1U);
     EXPECT_EQ(store.phones()[0].strength, trust::IdentityStrength::port_only);
     EXPECT_NE(store.redacted_summary().find("[port-only]"), std::string::npos);
@@ -410,6 +413,51 @@ TEST(TrustStore, SerialLessApprovalDoesNotAliasADifferentDevice) {
     ASSERT_TRUE(fresh.forget_phone(explicit_grant.value()).has_value());
     EXPECT_EQ(fresh.lookup(test::identity_of(trust::TransportIdentity{phone_b})),
               trust::Decision::unknown);
+}
+
+TEST(TrustStore, PortOnlyApiRejectsSerialBearingIdentity) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    for (bool usb_serial : {false, true}) {
+        auto identity = test::kWired;
+        if (usb_serial) { identity.aoa_serial.clear(); }
+        else { identity.usb_serial.clear(); }
+        const auto approved = store.approve_port_only(identity);
+        ASSERT_FALSE(approved.has_value());
+        EXPECT_EQ(approved.error().code(), ErrorCode::invalid_argument);
+    }
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file()));
+}
+
+TEST(TrustStore, WhitespaceOnlySerialsRequirePortOnlyConsentWithoutChangingKey) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    auto wired = test::kWired;
+    wired.usb_serial = " ";
+    wired.aoa_serial = "   ";
+    const trust::TransportIdentity identity{wired};
+    const auto key = trust::validated_key(identity);
+    ASSERT_TRUE(key.has_value());
+    EXPECT_NE(key.value().find("1: "), std::string::npos);
+    EXPECT_EQ(trust::strength_of(identity), trust::IdentityStrength::port_only);
+    const auto implicit = store.approve(identity);
+    ASSERT_FALSE(implicit.has_value());
+    EXPECT_EQ(implicit.error().code(), ErrorCode::trust_port_only_requires_opt_in);
+    ASSERT_TRUE(store.approve_port_only(wired).has_value());
+    trust::ApprovedPhoneStore fresh{dir.file()};
+    ASSERT_TRUE(fresh.load().has_value());
+    EXPECT_EQ(fresh.lookup(trust::PhoneIdentity{key.value()}), trust::Decision::approved);
+    EXPECT_EQ(fresh.phones()[0].strength, trust::IdentityStrength::port_only);
+    wired.usb_serial = " S ";
+    EXPECT_EQ(trust::strength_of(trust::TransportIdentity{wired}),
+              trust::IdentityStrength::serial_backed);
+    wired.usb_serial = "\t\n\r\f\v";
+    EXPECT_EQ(trust::strength_of(trust::TransportIdentity{wired}),
+              trust::IdentityStrength::port_only);
+    EXPECT_FALSE(trust::validated_key(trust::TransportIdentity{wired}).has_value());
 }
 
 } // namespace

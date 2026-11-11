@@ -397,4 +397,24 @@ TEST(StorePermissions, NonDirectoryAncestorRejectsReadAndWrite) {
     EXPECT_EQ(contents, "untouched");
 }
 
+TEST(StorePermissions, InvalidFinalNamesFailBeforeMissingParentIsTreatedAsEmpty) {
+    test::TempStoreDir dir;
+    for (bool exists : {false, true}) {
+        const auto parent = dir.dir() / "parent";
+        if (exists) { std::filesystem::create_directory(parent); }
+        for (const auto* name : {"", ".", ".."}) {
+            const auto path = parent / name;
+            const auto read = trust::detail::read_file(path);
+            ASSERT_FALSE(read.has_value()) << path;
+            EXPECT_EQ(read.error().code(), ErrorCode::trust_store_io);
+            const auto checked = trust::detail::ensure_private_file(path);
+            ASSERT_FALSE(checked.has_value()) << path;
+            EXPECT_EQ(checked.error().code(), ErrorCode::trust_store_io);
+            trust::ApprovedPhoneStore store{path};
+            EXPECT_FALSE(store.load().has_value());
+            EXPECT_FALSE(store.usable());
+        }
+    }
+}
+
 } // namespace

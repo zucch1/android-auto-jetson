@@ -59,7 +59,7 @@ std::string write_store(const ParsedStore& store) {
         out += "{\"phone_id\":";
         out += std::to_string(phone.phone_id.value);
         out += ",\"strength\":";
-        append_json_string(out, strength_name(phone.strength));
+        append_json_string(out, strength_name(strength_of(phone.identity)));
         out += ",\"identity\":";
         write_identity(out, phone.identity);
         out += "}";

@@ -81,7 +81,8 @@ public:
     // fails lookup() closed (Decision::unknown).
     [[nodiscard]] core::Result<void> load();
 
-    // TrustStore seam (session admission by opaque key).
+    // TrustStore seam (session admission by opaque key). approve_once rejects
+    // all opaque w1: keys; wired approvals must use the structured APIs.
     [[nodiscard]] Decision lookup(const PhoneIdentity& identity) const override;
     core::Result<void> approve_once(const PhoneIdentity& identity) override;
     core::Result<void> forget(const PhoneIdentity& identity) override;
@@ -104,6 +105,12 @@ public:
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
     [[nodiscard]] bool usable() const noexcept { return usable_; }
 
+    // Number of unconsented port-only records dropped by the last successful
+    // load's v1/v2 migration; zero after an empty/v3 load or a failed load.
+    [[nodiscard]] std::size_t dropped_port_only_count() const noexcept {
+        return dropped_port_only_count_;
+    }
+
     // Diagnostics-safe summary (task-19): every identity appears only as a
     // per-process pseudonym — no raw serials, Bluetooth MACs or port contexts.
     [[nodiscard]] std::string redacted_summary() const;
@@ -117,6 +124,7 @@ private:
     std::filesystem::path path_;
     std::vector<ApprovedPhone> phones_{};
     std::uint64_t next_phone_id_{1};
+    std::size_t dropped_port_only_count_{0};
     bool loaded_{false};
     bool usable_{false};
 };

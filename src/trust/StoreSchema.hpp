@@ -39,6 +39,7 @@ inline constexpr std::uint64_t kSchemaVersionCurrent = kCurrentSchemaVersion;
 struct ParsedStore final {
     std::vector<ApprovedPhone> phones{};
     std::uint64_t next_phone_id{1};
+    std::size_t dropped_port_only_count{0};
 };
 
 // Parse + migrate one store document. Empty text is the empty store. Every

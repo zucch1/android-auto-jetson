@@ -59,9 +59,11 @@ TransportKind kind_of(const TransportIdentity& identity) noexcept {
     }
 }
 
+// Classify blank serials as absent without changing the stable identity key.
 IdentityStrength strength_of(const TransportIdentity& identity) noexcept {
     if (const auto* wired = std::get_if<WiredIdentity>(&identity)) {
-        return wired->usb_serial.empty() && wired->aoa_serial.empty()
+        return wired->usb_serial.find_first_not_of(" \t\n\r\f\v") == std::string::npos &&
+               wired->aoa_serial.find_first_not_of(" \t\n\r\f\v") == std::string::npos
             ? IdentityStrength::port_only : IdentityStrength::serial_backed;
     }
     return kind_of(identity) == TransportKind::wireless

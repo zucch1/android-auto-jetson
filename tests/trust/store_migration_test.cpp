@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Task 27 store migration: schema_version 1 (legacy key-only records) loads by
-// migrating to opaque identities and persists as version 2; malformed legacy
+// migrating to opaque identities and persists as version 3; malformed legacy
 // records are rejected and never silently trusted.
 #include <aa/trust/Store.hpp>
 
 #include "fakes.hpp"
+#include "../../src/trust/StoreSchema.hpp"
 
 #include <fstream>
 #include <string>
@@ -103,11 +104,13 @@ TEST(StoreMigration, V2PortOnlyApprovalRequiresFreshConsent) {
     trust::ApprovedPhoneStore store{dir.file()};
     ASSERT_TRUE(store.load().has_value());
     EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(store.dropped_port_only_count(), 1U);
     const auto approved = store.approve(trust::TransportIdentity{test::kWired});
     ASSERT_TRUE(approved.has_value());
     EXPECT_EQ(approved.value(), aa::core::PhoneId{8});
     trust::ApprovedPhoneStore fresh{dir.file()};
     ASSERT_TRUE(fresh.load().has_value());
+    EXPECT_EQ(fresh.dropped_port_only_count(), 0U);
     ASSERT_EQ(fresh.phones().size(), 1U);
     EXPECT_EQ(fresh.phones()[0].strength, trust::IdentityStrength::serial_backed);
 }
@@ -139,8 +142,45 @@ TEST(StoreMigration, LegacyOpaquePortOnlyKeysCannotPreserveImplicitConsent) {
         trust::ApprovedPhoneStore store{dir.file()};
         ASSERT_TRUE(store.load().has_value());
         EXPECT_TRUE(store.phones().empty());
+        EXPECT_EQ(store.dropped_port_only_count(), 1U);
         EXPECT_EQ(store.lookup(trust::PhoneIdentity{key}), trust::Decision::unknown);
     }
+}
+
+TEST(StoreMigration, V3RejectsOpaquePortOnlyWiredKeys) {
+    for (const std::string serial : {"", "   "}) {
+        test::TempStoreDir dir;
+        const trust::TransportIdentity weak{trust::WiredIdentity{
+            "18d1", "4ee1", serial, "", "", "", "1-2.3"}};
+        const auto key = trust::identity_key(weak);
+        write_text(dir.file(),
+            "{\"schema_version\":3,\"next_phone_id\":2,\"phones\":[{\"phone_id\":1,"
+            "\"strength\":\"opaque\",\"identity\":{\"kind\":\"opaque\",\"key\":\"" + key + "\"}}]}");
+        trust::ApprovedPhoneStore store{dir.file()};
+        const auto loaded = store.load();
+        ASSERT_FALSE(loaded.has_value());
+        EXPECT_EQ(loaded.error().code(), ErrorCode::trust_store_io);
+        EXPECT_FALSE(store.usable());
+        EXPECT_EQ(store.lookup(trust::PhoneIdentity{key}), trust::Decision::unknown);
+        EXPECT_TRUE(store.phones().empty());
+        EXPECT_EQ(store.dropped_port_only_count(), 0U);
+    }
+}
+
+TEST(StoreMigration, WriterDerivesStrengthFromIdentity) {
+    trust::detail::ParsedStore snapshot;
+    snapshot.phones = {
+        {aa::core::PhoneId{1}, trust::TransportIdentity{test::kWired}},
+        {aa::core::PhoneId{2}, trust::TransportIdentity{test::kWireless}},
+        {aa::core::PhoneId{3}, trust::TransportIdentity{trust::WiredIdentity{
+            "18d1", "4ee1", "", "", "", "", "1-2.3"}}}};
+    snapshot.next_phone_id = 4;
+    const auto parsed = trust::detail::parse_store(trust::detail::write_store(snapshot));
+    ASSERT_TRUE(parsed.has_value());
+    ASSERT_EQ(parsed.value().phones.size(), 3U);
+    EXPECT_EQ(parsed.value().phones[0].strength, trust::IdentityStrength::serial_backed);
+    EXPECT_EQ(parsed.value().phones[1].strength, trust::IdentityStrength::bond_backed);
+    EXPECT_EQ(parsed.value().phones[2].strength, trust::IdentityStrength::port_only);
 }
 
 } // namespace
