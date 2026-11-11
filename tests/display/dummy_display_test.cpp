@@ -22,6 +22,7 @@
 #include "ProjectionWidget.hpp"
 
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
+#include "../../tools/dummy-display/decode_loss.hpp"
 #include "../../tools/dummy-display/pump_timer.hpp"
 #include "../../tools/dummy-display/shutdown_outcome.hpp"
 #include "../../tools/dummy-display/test_control.hpp"
@@ -202,6 +203,70 @@ TEST(DummyDisplayContractRender, PaintCompletionRetainsCorrelationAndIgnoresRepa
     EXPECT_LE(std::stoll(match[1].str()), after);
     EXPECT_EQ(output.find("video_presented", output.find("video_presented") + 1),
               std::string::npos);
+}
+
+TEST(DummyDisplayContractRender, DecodeLossTelemetryIsCumulativeReasonedAndRateLimited) {
+    using Clock = DecodeLossTelemetry::Clock;
+    const Clock::time_point t0{std::chrono::seconds{100}};
+    DecodeLossTelemetry loss;
+    aa::consumer::DecodeReport report;
+    EXPECT_TRUE(loss.observe(report, t0).empty());
+
+    report.frames_lost_retention = 90;
+    report.awaiting_idr = true;
+    auto lines = loss.observe(report, t0);
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":90,"
+                        "\"awaiting_idr\":true}");
+    EXPECT_TRUE(loss.observe(report, t0).empty());
+
+    // A further episode inside the one-second window is coalesced, not lost.
+    report.frames_lost_retention = 91;
+    EXPECT_TRUE(loss.observe(report, t0 + std::chrono::milliseconds{100}).empty());
+    report.frames_lost_capacity = 2;
+    lines = loss.observe(report, t0 + std::chrono::milliseconds{100});
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"capacity\",\"count\":2,"
+                        "\"awaiting_idr\":true}");
+    report.frames_lost_eos = 3;
+    lines = loss.observe(report, t0 + std::chrono::milliseconds{100});
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"end_of_stream\",\"count\":3,"
+                        "\"awaiting_idr\":true}");
+
+    report.frames_lost_retention = 92;
+    report.awaiting_idr = false;
+    lines = loss.observe(report, t0 + std::chrono::milliseconds{1100});
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":92,"
+                        "\"awaiting_idr\":false}");
+
+    // Lower counters denote a new decode session, not negative loss; its first
+    // new episode is immediately visible even within the old rate-limit window.
+    EXPECT_TRUE(loss.observe(aa::consumer::DecodeReport{}, t0 + std::chrono::seconds{2}).empty());
+    aa::consumer::DecodeReport fresh;
+    fresh.frames_lost_capacity = 1;
+    lines = loss.observe(fresh, t0 + std::chrono::seconds{2});
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"capacity\",\"count\":1,"
+                        "\"awaiting_idr\":false}");
+
+    // A session replaced between two observations (new total below the old
+    // one, never seen as zero) is still reported, immediately.
+    fresh.frames_lost_capacity = 5;
+    EXPECT_EQ(loss.observe(fresh, t0 + std::chrono::seconds{10}).size(), 1U);
+    fresh.frames_lost_capacity = 1;
+    lines = loss.observe(fresh, t0 + std::chrono::seconds{10});
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_NE(lines[0].find("\"count\":1,"), std::string::npos);
+
+    // A total coalesced by the rate limit is written by the final flush.
+    fresh.frames_lost_capacity = 2;
+    EXPECT_TRUE(loss.observe(fresh, t0 + std::chrono::seconds{10}).empty());
+    lines = loss.observe(fresh, t0 + std::chrono::seconds{10}, true);
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_NE(lines[0].find("\"count\":2,"), std::string::npos);
+    EXPECT_TRUE(loss.observe(fresh, t0 + std::chrono::seconds{10}, true).empty());
 }
 
 TEST(DummyDisplayContractRender, TelemetryBlockedSinkDoesNotBlockProducersOrPainting) {

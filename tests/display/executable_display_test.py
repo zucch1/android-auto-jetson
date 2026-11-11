@@ -216,6 +216,11 @@ def case_replay(args):
         assert status["state"] == "projecting", status
         assert status["helper_started"] is True, status
         assert status["render_ok"] is True and status["render_width"] == 1280, status
+        # Issue #76: the cumulative decode-loss counters are part of the status
+        # and stay zero on a clean replay.
+        for key in ("frames_lost_retention", "frames_lost_capacity", "frames_lost_eos"):
+            assert status[key] == 0, (key, status)
+        assert status["awaiting_idr"] is False, status
         assert display.stop() == 0
         assert receiver.stop(False) == 0
 

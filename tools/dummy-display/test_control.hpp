@@ -37,6 +37,10 @@ struct Status final {
     DisplayState state{DisplayState::unavailable};
     std::uint64_t frames_presented{};
     std::uint64_t frames_painted{};
+    std::uint64_t frames_lost_retention{};
+    std::uint64_t frames_lost_capacity{};
+    std::uint64_t frames_lost_eos{};
+    bool awaiting_idr{};
     bool helper_started{};
     std::uint64_t input_sent{};
     std::uint64_t input_dropped{};
@@ -140,6 +144,11 @@ private:
         out.append(state);
         out += "\",\"frames_presented\":" + std::to_string(s.frames_presented);
         out += ",\"frames_painted\":" + std::to_string(s.frames_painted);
+        out += ",\"frames_lost_retention\":" + std::to_string(s.frames_lost_retention);
+        out += ",\"frames_lost_capacity\":" + std::to_string(s.frames_lost_capacity);
+        out += ",\"frames_lost_eos\":" + std::to_string(s.frames_lost_eos);
+        out += ",\"awaiting_idr\":";
+        out += s.awaiting_idr ? "true" : "false";
         out += ",\"helper_started\":";
         out += s.helper_started ? "true" : "false";
         out += ",\"input_sent\":" + std::to_string(s.input_sent);

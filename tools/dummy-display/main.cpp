@@ -12,6 +12,7 @@
 #include <aa/ipc/InputChannel.hpp>
 
 #include "ProjectionWidget.hpp"
+#include "decode_loss.hpp"
 #include "pump_timer.hpp"
 #include "shutdown_outcome.hpp"
 #include "test_control.hpp"
@@ -19,6 +20,7 @@
 #include <QApplication>
 #include <QTimer>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -140,6 +142,11 @@ aa::display::testcontrol::Status probe_status() {
     status.frames_presented = g_controller->frames_presented();
     status.frames_painted = g_widget->frames_painted();
     status.helper_started = g_controller->helper_started();
+    const auto& decode = g_controller->decode_report();
+    status.frames_lost_retention = decode.frames_lost_retention;
+    status.frames_lost_capacity = decode.frames_lost_capacity;
+    status.frames_lost_eos = decode.frames_lost_eos;
+    status.awaiting_idr = decode.awaiting_idr;
     if (g_sender != nullptr) {
         status.input_sent = g_sender->sent();
         status.input_dropped = g_sender->dropped();
@@ -275,10 +282,12 @@ int main(int argc, char** argv) {
     // Pump timer must outlive app.exec(): declared at main scope, not inside
     // the attach block (task 24 F1 - a timer destroyed before the event loop
     // starts never pumps video into the helper or presents frames).
+    aa::display::DecodeLossTelemetry decode_loss;
     auto pump_timer = std::make_unique<QTimer>();
     aa::display::pump::configure(*pump_timer);
     QObject::connect(pump_timer.get(), &QTimer::timeout,
-                     [errors, &telemetry, &widget, telemetry_reported = false]() mutable {
+                     [errors, &telemetry, &widget, &decode_loss,
+                      telemetry_reported = false]() mutable {
         // A full queue or failed write loses measurement events: show it once.
         // Only on screen: a stream write here could block on the same stdout
         // that failed the writer, freezing the GUI thread it protects.
@@ -296,6 +305,10 @@ int main(int argc, char** argv) {
                     errors->report("pump", code);
                 }
             }
+            for (auto& line : decode_loss.observe(g_controller->decode_report(),
+                                                  std::chrono::steady_clock::now())) {
+                static_cast<void>(telemetry.enqueue(std::move(line)));
+            }
         }
     });
     if (g_controller.has_value()) {
@@ -312,6 +325,11 @@ int main(int argc, char** argv) {
     int outcome = app.exec();
     pump_timer->stop();
     if (g_controller.has_value()) {
+        // Totals coalesced by the rate limit must not die with the session.
+        for (auto& line : decode_loss.observe(g_controller->decode_report(),
+                                              std::chrono::steady_clock::now(), true)) {
+            static_cast<void>(telemetry.enqueue(std::move(line)));
+        }
         g_controller->shutdown();
         g_controller.reset();
     }
