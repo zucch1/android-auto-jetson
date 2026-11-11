@@ -169,10 +169,15 @@ class ProjectionProgress:
         self.previous: dict[str, int] = {}
         self.advanced_ns: dict[str, int] = {}
         self.failure: str | None = None
+        self.interferences: list[dict] = []
 
     @property
     def seconds(self) -> float:
         return (self.last_ns - self.started_ns) / 1e9 if self.started_ns is not None else 0.0
+
+    @property
+    def interference(self) -> list[dict]:
+        return self.interferences
 
     def observe(self, sample: Sample) -> None:
         if self.failure:
@@ -194,18 +199,32 @@ class ProjectionProgress:
             self.previous = counters
             self.advanced_ns = {key: stamp for key in counters}
         else:
-            if stamp <= self.last_ns or stamp - self.last_ns > _MEDIA_STALL_SECONDS * 1_000_000_000:
+            if stamp <= self.last_ns:
                 self.failure = "sampling_gap"
+                return
+            sampling_gap_ns = stamp - self.last_ns
+            if sampling_gap_ns > _MEDIA_STALL_SECONDS * 1_000_000_000:
+                self.interferences.append({
+                    "reason": "collector_sampling_gap",
+                    "classification": "host_interference",
+                    "gap_seconds": sampling_gap_ns / 1e9,
+                    "gap_ns": sampling_gap_ns,
+                    "t_ns": stamp,
+                })
             if not sample.projection_active:
                 self.failure = "projection_inactive"
             for key, value in counters.items():
                 if value < self.previous[key]:
                     self.failure = "counter_reset:" + key
-                # Check age before accepting a resumed stream: a late recovery cannot heal a freeze.
-                if stamp - self.advanced_ns[key] > _MEDIA_STALL_SECONDS * 1_000_000_000:
-                    self.failure = "media_stalled:" + key
-                if value > self.previous[key]:
+                # Check whether the receiver logged progress during the window:
+                # if progress was logged, the media did not stall (even if the collector had a gap).
+                # Only declare a media stall if no progress was logged and the time since this
+                # stream last advanced exceeds _MEDIA_STALL_SECONDS.
+                advanced = value > self.previous[key]
+                if advanced:
                     self.advanced_ns[key] = stamp
+                elif stamp - self.advanced_ns[key] > _MEDIA_STALL_SECONDS * 1_000_000_000:
+                    self.failure = "media_stalled:" + key
             self.previous = counters
         self.last_ns = stamp
 
@@ -641,6 +660,7 @@ def collect(args: argparse.Namespace) -> dict:
         "active_projection_seconds": progress.seconds,
         "startup_wait_seconds": progress.started_ns / 1e9 if progress.started_ns is not None else None,
         "projection_failure": progress.failure,
+        "interference": list(progress.interferences),
         "measurement_origin": "live",
         "crashes": crashes,
         "early_exit": early_exit,

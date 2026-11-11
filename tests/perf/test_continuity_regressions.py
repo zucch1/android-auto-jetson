@@ -108,16 +108,25 @@ def frozen() -> None:
     assert doc["verdict"] != "PASS", doc["run_status"]
 
 
-def active_window(freeze_after: float | None = None) -> None:
+def active_window(freeze_after: float | None = None,
+                  gap_at: float | None = None,
+                  gap_seconds: float = 30.0) -> dict:
     # Given a receiver that first supplies complete consumer progress at t=4 seconds.
     clock = [0.0]
     logs = {}
+    gap_applied = [False]
+
     class LoggingProcess(Process):
         def __init__(self, command, *, stdout, **kwargs) -> None:
             super().__init__(command, stdout=stdout)
             logs[command[0]] = stdout
+
     def sleep(seconds: float) -> None:
-        clock[0] += seconds
+        if gap_at is not None and clock[0] >= gap_at and not gap_applied[0]:
+            clock[0] += gap_seconds
+            gap_applied[0] = True
+        else:
+            clock[0] += seconds
         if clock[0] < 4 or (freeze_after is not None and clock[0] > freeze_after):
             return
         stamp = int(clock[0] * 1e9)
@@ -131,9 +140,11 @@ def active_window(freeze_after: float | None = None) -> None:
         logs["display"].write(json.dumps({"event": "video_presented", "frame": stamp,
                                          "scheduled_ns": stamp, "completed_ns": stamp + 1000}) + "\n")
         logs["display"].flush()
+
     with tempfile.TemporaryDirectory(prefix="perf-active-") as tmp:
+        target_duration = 10 if freeze_after is None else 30
         args = argparse.Namespace(receiver="receiver", display="display", port="fixture",
-                                  no_display=False, duration_seconds=10 if freeze_after is None else 30, interval=1,
+                                  no_display=False, duration_seconds=target_duration, interval=1,
                                   startup_timeout_seconds=6, store=None, video_socket=None,
                                   input_socket=None, state_dir=tmp)
         with (patch.object(collector.time, "monotonic_ns", side_effect=lambda: int(clock[0] * 1e9)),
@@ -142,16 +153,14 @@ def active_window(freeze_after: float | None = None) -> None:
               patch.object(collector, "_display_connected", return_value=True),
               patch.object(collector, "_thermal_zones", return_value=()),
               patch.object(collector, "_target_hardware_state", return_value={})):
-            # When requesting ten seconds of active projection after bounded startup.
+            # When requesting active projection after bounded startup.
             capture = collector.collect(args)
-        # Then startup adds time; it never shortens the active window.
+
         if freeze_after is not None:
             assert capture["projection_failure"].startswith("media_stalled:"), capture
-            assert capture["observed_duration_seconds"] < 34
-            return
-        assert capture["active_projection_seconds"] == 10, capture
+            return capture
+        assert capture["active_projection_seconds"] >= 10, capture
         assert capture["startup_wait_seconds"] == 4
-        assert capture["observed_duration_seconds"] == 14
         assert capture["projection_failure"] is None
 
     # Given healthy counters across either contractual window, then full progress validates.
@@ -171,9 +180,84 @@ def active_window(freeze_after: float | None = None) -> None:
                                        for key in collector._PROGRESS_KEYS}))
         assert progress.failure == "media_stalled:" + stream, (stream, progress.failure)
 
+    # (a) A collector gap with receiver progress: reported as interference and the run continues.
+    progress = collector.ProjectionProgress()
+    progress.observe(Sample(t_ns=0, receiver_rss_mb=None, receiver_cpu_ticks=None,
+                            thermal_zones=(), projection_active=True,
+                            **{key: 1 for key in collector._PROGRESS_KEYS}))
+    progress.observe(Sample(t_ns=5 * 1_000_000_000, receiver_rss_mb=None, receiver_cpu_ticks=None,
+                            thermal_zones=(), projection_active=True,
+                            **{key: 2 for key in collector._PROGRESS_KEYS}))
+    progress.observe(Sample(t_ns=int(38.7 * 1_000_000_000), receiver_rss_mb=None, receiver_cpu_ticks=None,
+                            thermal_zones=(), projection_active=True,
+                            **{key: 945 for key in collector._PROGRESS_KEYS}))
+    assert progress.failure is None
+    assert len(progress.interferences) == 1
+    assert progress.interferences[0]["gap_seconds"] == 33.7
+    assert progress.interferences[0]["classification"] == "host_interference"
+    assert progress.interferences[0]["reason"] == "collector_sampling_gap"
+    progress.observe(Sample(t_ns=int(43.7 * 1_000_000_000), receiver_rss_mb=None, receiver_cpu_ticks=None,
+                            thermal_zones=(), projection_active=True,
+                            **{key: 950 for key in collector._PROGRESS_KEYS}))
+    assert progress.failure is None
+
+    # (b) A real media stall: still reported as a stall.
+    progress = collector.ProjectionProgress()
+    for second in range(0, 21, 5):
+        progress.observe(Sample(t_ns=second * 1_000_000_000, receiver_rss_mb=None,
+                                receiver_cpu_ticks=None, thermal_zones=(), projection_active=True,
+                                **{key: 1 if key == "av_pairs" else second + 1
+                                   for key in collector._PROGRESS_KEYS}))
+    assert progress.failure == "media_stalled:av_pairs"
+    assert len(progress.interferences) == 0
+
+    # (c) A collector gap during which the receiver really did stall: reported as a stall.
+    progress = collector.ProjectionProgress()
+    progress.observe(Sample(t_ns=0, receiver_rss_mb=None, receiver_cpu_ticks=None,
+                            thermal_zones=(), projection_active=True,
+                            **{key: 1 for key in collector._PROGRESS_KEYS}))
+    progress.observe(Sample(t_ns=5 * 1_000_000_000, receiver_rss_mb=None, receiver_cpu_ticks=None,
+                            thermal_zones=(), projection_active=True,
+                            **{key: 2 for key in collector._PROGRESS_KEYS}))
+    progress.observe(Sample(t_ns=int(38.7 * 1_000_000_000), receiver_rss_mb=None, receiver_cpu_ticks=None,
+                            thermal_zones=(), projection_active=True,
+                            **{key: 2 for key in collector._PROGRESS_KEYS}))
+    assert progress.failure.startswith("media_stalled:")
+    assert len(progress.interferences) == 1
+    assert progress.interferences[0]["gap_seconds"] == 33.7
+    return capture
+
 
 def collector_frozen() -> None:
     active_window(freeze_after=5)
+
+
+def collector_gap_progress() -> None:
+    # (a) A collector gap with receiver progress: reported as interference and the run continues.
+    capture = active_window(gap_at=5, gap_seconds=30)
+    assert capture["projection_failure"] is None
+    assert len(capture["interference"]) == 1
+    assert capture["interference"][0]["gap_seconds"] == 30.0
+    assert capture["interference"][0]["classification"] == "host_interference"
+    assert capture["interference"][0]["reason"] == "collector_sampling_gap"
+    assert capture["early_exit"] is False
+
+
+def real_media_stall() -> None:
+    # (b) A real media stall: still reported as a stall.
+    capture = active_window(freeze_after=5)
+    assert capture["projection_failure"].startswith("media_stalled:")
+    assert capture["interference"] == []
+
+
+def collector_gap_stalled() -> None:
+    # (c) A collector gap during which the receiver really did stall: reported as a stall.
+    capture = active_window(freeze_after=5, gap_at=5, gap_seconds=30)
+    assert capture["projection_failure"].startswith("media_stalled:")
+    assert len(capture["interference"]) == 1
+    assert capture["interference"][0]["gap_seconds"] == 30.0
+    assert capture["interference"][0]["classification"] == "host_interference"
+    assert capture["interference"][0]["reason"] == "collector_sampling_gap"
 
 
 if __name__ == "__main__":
