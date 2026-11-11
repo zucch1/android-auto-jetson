@@ -17,7 +17,11 @@ Deinitialization clears active state. TLS cannot substitute for the future task
 27 approved-phone store and pairing policy, which are not implemented here.
 
 `verified-peer-test-only` is an explicit constructor policy for tests, with
-OpenSSL peer verification and an empty trust store by default. Unknown and
+OpenSSL peer verification requiring a peer certificate. The generic TCP/TLS
+adapter loads the system trust store and verifies the dialed DNS name or IP
+on clients. Policy users supplying their own SSL context must populate its
+trust store explicitly (the memory-BIO tests pin their generated certificate).
+Unknown and
 self-signed peer certificates fail closed. It is not a deployment default or
 a prerequisite for the approved-phone qualification path. A trusted-peer
 configuration/provisioning API is not claimed in this task.

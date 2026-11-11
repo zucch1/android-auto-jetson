@@ -34,6 +34,12 @@ TlsTransport::build_impl(int fd, ApprovedPredicate approved, TlsMode mode, bool 
             SSL_CTX_check_private_key(impl->ctx) != 1) {
             return Error{ErrorCode::transport_unavailable};
         }
+        // Verified test mode uses the OpenSSL system trust store. Compatibility
+        // mode deliberately continues to use the independent admission gate.
+        if (mode == TlsMode::verified_peer_test_only &&
+            SSL_CTX_set_default_verify_paths(impl->ctx) != 1) {
+            return Error{ErrorCode::transport_unavailable};
+        }
         impl->ssl = SSL_new(impl->ctx);
         if (impl->ssl == nullptr) {
             return Error{ErrorCode::transport_io};
@@ -62,7 +68,18 @@ TlsTransport::connect(const char* host, std::uint16_t port,
     if (fd < 0) {
         return Error{ErrorCode::transport_unavailable};
     }
-    return build_impl(fd, std::move(approved), mode, false);
+    auto transport = build_impl(fd, std::move(approved), mode, false);
+    if (transport && mode == TlsMode::verified_peer_test_only) {
+        unsigned char address[sizeof(in6_addr)];
+        auto* ssl = transport.value()->impl_->ssl;
+        const bool numeric = ::inet_pton(AF_INET, host, address) == 1 ||
+                             ::inet_pton(AF_INET6, host, address) == 1;
+        const int configured = numeric
+            ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host)
+            : SSL_set1_host(ssl, host);
+        if (configured != 1) return Error{ErrorCode::transport_unavailable};
+    }
+    return transport;
 }
 
 core::Result<void> TlsTransport::open(core::CancellationToken cancellation) {
