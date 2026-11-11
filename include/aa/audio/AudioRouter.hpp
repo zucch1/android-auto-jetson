@@ -28,7 +28,9 @@ namespace aa::audio {
 // PipeWire-capable element is usable the router degrades typed and never
 // silently misroutes. pipewiresink routes to PipeWire natively; pulsesink
 // routes via the PulseAudio-compatible layer (pipewire-pulse on a PipeWire
-// host) and is the recorded fallback.
+// host). Real-time selection uses that ring buffer. Native pipewiresink is
+// refused with audio_sink_quantum_unverified: its public API cannot verify
+// the negotiated graph quantum or report changes (#80).
 enum class SinkBackend : std::uint8_t { automatic, pipewire, pulse };
 
 [[nodiscard]] std::string_view to_string(SinkBackend backend) noexcept;
@@ -61,7 +63,7 @@ struct SinkSelection final {
 
 // Pure selection policy over a probe report. Explicit requests never
 // downgrade silently: an unsatisfiable request is unusable with a recorded
-// "disabled:" cause.
+// "disabled:" cause. automatic selects only the ring-buffer pulsesink path.
 [[nodiscard]] SinkSelection select_sink_backend(const SinkReport& report,
                                                 SinkBackend request);
 
@@ -202,10 +204,9 @@ struct RouterConfig final {
     // only by the wired receiver's pcm_router_config().
     LivePcmDriftPolicy live_pcm_drift{};
     std::function<void(const SinkWriteProgress&)> on_sink_write_progress{};
-    // render_step() interval bound. Each sink write costs PipeWire about one
-    // graph cycle (1024 frames) while catching up after a stall; 20 ms pieces
-    // (3 per 42.67 ms media parent) never recovered. 50 ms renders one write per
-    // observed media parent.
+    // render_step() interval bound. Keep the qualified 50 ms batching value.
+    // Production uses the Pulse ring buffer; native pipewiresink is refused
+    // because its one-buffer-per-cycle capacity cannot be verified (#80).
     core::Nanoseconds render_quantum{core::Nanoseconds{50'000'000}};
 };
 

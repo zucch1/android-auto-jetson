@@ -1484,7 +1484,8 @@ class InputQueue final {
 // Default routing element (#60): pulsesink via pipewire-pulse. On this host's
 // GStreamer PipeWire plugin (1.0.5) a pipewiresink stream degrades after
 // ~1.5-2.3 h of continuous playback into ~340 ms blocks; pulsesink ran clean
-// side by side. --audio-sink pipewire|automatic restores the old choice.
+// side by side. #80: automatic also uses the Pulse ring buffer; explicit
+// pipewire is refused until the native graph quantum can be verified.
 aa::audio::RouterConfig pcm_router_config(
     aa::audio::SinkBackend backend = aa::audio::SinkBackend::pulse) {
     aa::audio::RouterConfig config;
@@ -1608,8 +1609,8 @@ const char *const kUsage =
     "  --require-video-consumer defers upstream negotiation until a video\n"
     "  consumer has been accepted and installed (bounded, fail closed).\n"
     "  --audio-sink picks the routing element (default pulse: pulsesink via\n"
-    "  pipewire-pulse; pipewire: pipewiresink; automatic: pipewiresink, else\n"
-    "  pulsesink).\n"
+    "  pipewire-pulse; automatic: pulsesink; pipewire: disabled because the\n"
+    "  negotiated graph quantum cannot be verified).\n"
     "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked.\n";
 
 int receiver_main(int argc, char **argv) {

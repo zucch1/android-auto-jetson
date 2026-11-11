@@ -96,9 +96,10 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME audio_pipeline_route COMMAND aa_audio_pipeline_test --gtest_filter=AudioPipelineRoute.*)
     add_test(NAME audio_pipeline_decode COMMAND aa_audio_pipeline_test --gtest_filter=AudioPipelineDecodeSuite.*)
     add_test(NAME audio_pipeline_sink COMMAND aa_audio_pipeline_test --gtest_filter=AudioPipelineSinkBackend.*:Startup/AudioPipelineSinkLogging.*)
+    add_test(NAME audio_pipeline_quantum_guard COMMAND aa_audio_pipeline_test --gtest_filter=AudioPipelineQuantumGuard.*)
     add_test(NAME audio_pipeline_mic COMMAND aa_audio_pipeline_test --gtest_filter=MicrophoneContract.*)
     set_tests_properties(audio_pipeline_mix audio_pipeline_route audio_pipeline_decode
-        audio_pipeline_sink audio_pipeline_mic
+        audio_pipeline_sink audio_pipeline_quantum_guard audio_pipeline_mic
         PROPERTIES TIMEOUT 120)
 endif()
 

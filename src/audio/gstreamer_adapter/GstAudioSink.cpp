@@ -1665,7 +1665,7 @@ AppsrcQueueLevel appsrc_queue_level_for_test(ObservedAudioSink& sink) {
 }
 
 
-SinkOpenOutcome open_default_sink(const SinkOpenRequest& request) {
+static SinkOpenOutcome open_sink(const SinkOpenRequest& request, bool native_qualification) {
     ensure_gstreamer_initialized();
     install_handoff_observer();
 
@@ -1673,7 +1673,15 @@ SinkOpenOutcome open_default_sink(const SinkOpenRequest& request) {
     outcome.report = probe_sinks();
     outcome.report.requested = request.backend;
 
-    const SinkSelection selection = select_sink_backend(outcome.report, request.backend);
+    SinkSelection selection = select_sink_backend(outcome.report, request.backend);
+    if (native_qualification && request.backend == SinkBackend::pipewire) {
+        for (const auto& candidate : outcome.report.candidates) {
+            if (candidate.element == "pipewiresink" && candidate.viable) {
+                selection = {candidate.element, true,
+                    "test-only: unverified native quantum; not a realtime qualification"};
+            }
+        }
+    }
     outcome.report.selected_element = selection.element;
     outcome.report.usable = selection.usable;
     outcome.report.cause = selection.cause;
@@ -1835,6 +1843,14 @@ SinkOpenOutcome open_default_sink(const SinkOpenRequest& request) {
 
     outcome.sink = std::move(handle);
     return outcome;
+}
+
+SinkOpenOutcome open_default_sink(const SinkOpenRequest& request) {
+    return open_sink(request, false);
+}
+
+SinkOpenOutcome open_unverified_native_sink_for_test(const SinkOpenRequest& request) {
+    return open_sink(request, true);
 }
 
 } // namespace detail

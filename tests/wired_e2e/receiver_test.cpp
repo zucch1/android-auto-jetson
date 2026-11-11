@@ -5757,13 +5757,38 @@ TEST(WiredReceiver, RealGstMidStreamStallRecoversToRealTime) {
 
 // #60: the receiver routes through pulsesink by default (pipewiresink streams
 // degrade after ~1.5-2.3 h on this host's PipeWire 1.0.5 plugin); the flag
-// restores pipewiresink or the automatic choice.
+// preserves the requested policy; the production opener guards native use.
 TEST(WiredReceiver, AudioSinkDefaultsToPulseAndFlagSelectsBackend) {
     EXPECT_EQ(pcm_router_config().backend, aa::audio::SinkBackend::pulse);
     EXPECT_EQ(pcm_router_config(aa::audio::SinkBackend::pipewire).backend,
               aa::audio::SinkBackend::pipewire);
     EXPECT_EQ(pcm_router_config(aa::audio::SinkBackend::automatic).backend,
               aa::audio::SinkBackend::automatic);
+}
+
+TEST(WiredReceiver, QuantumGuardReasonIsLoggedForOpenAndReopen) {
+    // Synthetic factory results exercise production selection and the actual
+    // receiver log formatter without any audio server or physical device.
+    aa::audio::SinkReport report;
+    report.candidates = {{"pipewiresink", true, true, true, "READY"},
+                         {"pulsesink", true, true, true, "READY"}};
+    ReceiverLogScope logs{g_running};
+    for (const auto backend : {aa::audio::SinkBackend::pipewire,
+                               aa::audio::SinkBackend::automatic}) {
+        const auto selection = aa::audio::select_sink_backend(report, backend);
+        report.requested = backend;
+        report.selected_element = selection.element;
+        report.usable = selection.usable;
+        report.cause = selection.cause;
+        capture_receiver_stdout();
+        log_sink_selected(report, "open");
+        log_sink_selected(report, "reopen");
+        const auto output = captured_receiver_stdout();
+        EXPECT_NE(output.find("audio_sink_quantum_unverified"), std::string::npos);
+        EXPECT_NE(output.find("\"origin\":\"open\""), std::string::npos);
+        EXPECT_NE(output.find("\"origin\":\"reopen\""), std::string::npos);
+        EXPECT_EQ(selection.usable, backend == aa::audio::SinkBackend::automatic);
+    }
 }
 
 TEST(WiredReceiver, InvalidOrMissingAudioSinkValueIsUsageError) {

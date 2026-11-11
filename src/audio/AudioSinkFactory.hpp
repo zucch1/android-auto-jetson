@@ -97,6 +97,14 @@ struct SinkOpenOutcome final {
 // report - never a silent misroute.
 [[nodiscard]] SinkOpenOutcome open_default_sink(const SinkOpenRequest& request);
 
+// Native-plugin qualification ONLY. These open the deliberately unsupported
+// pipewiresink path to retain the real render/handoff/readiness regression
+// gates. They do not verify the graph quantum and must never be used by a
+// receiver. Production open_default_sink refuses this path (#80).
+[[nodiscard]] SinkOpenOutcome open_unverified_native_sink_for_test(const SinkOpenRequest& request);
+[[nodiscard]] core::Result<AudioRouter> open_router_with_unverified_native_sink_for_test(
+    const RouterConfig& config);
+
 // Test-only opener: builds the router around a caller-supplied sink (e.g. a
 // recording fake) instead of probing/starting the GStreamer routing element.
 // Same private seam - no GStreamer types cross it, no public API.

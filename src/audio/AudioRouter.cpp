@@ -120,15 +120,18 @@ SinkSelection select_sink_backend(const SinkReport& report, SinkBackend request)
     SinkSelection selection;
     const SinkCandidate* chosen = nullptr;
 
-    if (request == SinkBackend::pipewire || request == SinkBackend::automatic) {
-        for (const auto& candidate : report.candidates) {
-            if (candidate.element == "pipewiresink" && candidate.viable) {
-                chosen = &candidate;
-                break;
-            }
-        }
+    // #80: pipewiresink's stop-and-wait handoff costs a graph cycle per
+    // buffer. Its public API exposes neither the negotiated quantum nor
+    // quantum changes; node.latency is only a suggestion. Fail closed rather
+    // than pretending a request or a successful render probe proves capacity.
+    constexpr std::string_view native_reason =
+        "audio_sink_quantum_unverified: pipewiresink cannot verify negotiated "
+        "graph quantum against render_quantum; use pulsesink ring buffer";
+    if (request == SinkBackend::pipewire) {
+        selection.cause = "disabled: " + std::string{native_reason};
+        return selection;
     }
-    if (chosen == nullptr && (request == SinkBackend::pulse || request == SinkBackend::automatic)) {
+    if (request == SinkBackend::pulse || request == SinkBackend::automatic) {
         for (const auto& candidate : report.candidates) {
             if (candidate.element == "pulsesink" && candidate.viable) {
                 chosen = &candidate;
@@ -139,7 +142,8 @@ SinkSelection select_sink_backend(const SinkReport& report, SinkBackend request)
 
     if (chosen == nullptr) {
         selection.usable = false;
-        selection.cause = "disabled:";
+        selection.cause = request == SinkBackend::automatic
+            ? "disabled: " + std::string{native_reason} : "disabled:";
         bool first = true;
         for (const auto& candidate : report.candidates) {
             const bool wanted = request == SinkBackend::automatic
@@ -153,16 +157,18 @@ SinkSelection select_sink_backend(const SinkReport& report, SinkBackend request)
             }
             first = false;
             selection.cause += " " + candidate.element + " "
-                + (candidate.available ? "not viable" : "absent") + " (" + candidate.cause + ")";
+                + (candidate.element == "pipewiresink" && candidate.viable
+                    ? "refused" : (candidate.available ? "not viable" : "absent"))
+                + " (" + candidate.cause + ")";
         }
         return selection;
     }
 
     selection.element = chosen->element;
     selection.usable = true;
-    if (request == SinkBackend::automatic && chosen->element != "pipewiresink") {
+    if (request == SinkBackend::automatic) {
         selection.cause =
-            "disabled: pipewiresink not usable, falling back to pulsesink (recorded fallback)";
+            "enabled: falling back to pulsesink ring buffer; " + std::string{native_reason};
     } else {
         selection.cause = "enabled: " + chosen->element + " runtime-detected viable";
     }
@@ -378,8 +384,9 @@ struct AudioRouter::Impl final {
 
 namespace {
 
-core::Result<AudioRouter> open_router_with(const RouterConfig& config,
-                                           std::unique_ptr<detail::ObservedAudioSink> injected) {
+core::Result<AudioRouter> open_router_with(
+    const RouterConfig& config, std::unique_ptr<detail::ObservedAudioSink> injected,
+    detail::SinkOpenOutcome (*opener)(const detail::SinkOpenRequest&) = detail::open_default_sink) {
     if (config.output_format.bits_per_sample != 16 || config.output_format.channels == 0
         || config.output_format.sample_rate_hz == 0
         || config.output_format.sample_rate_hz > static_cast<std::uint32_t>(INT32_MAX)) {
@@ -432,7 +439,7 @@ core::Result<AudioRouter> open_router_with(const RouterConfig& config,
         request.drop_nonempty_at_ingress = config.drop_nonempty_at_ingress;
         request.drop_nonempty_after_window = config.drop_nonempty_after_window;
         request.on_write_progress = config.on_sink_write_progress;
-        detail::SinkOpenOutcome outcome = detail::open_default_sink(request);
+        detail::SinkOpenOutcome outcome = opener(request);
 
         impl->report.sink = outcome.report;
         if (!outcome.sink) {
@@ -461,6 +468,11 @@ namespace detail {
 core::Result<AudioRouter> open_router_with_sink_for_test(const RouterConfig& config,
                                                          std::unique_ptr<ObservedAudioSink> sink) {
     return open_router_with(config, std::move(sink));
+}
+
+core::Result<AudioRouter> open_router_with_unverified_native_sink_for_test(
+    const RouterConfig& config) {
+    return open_router_with(config, nullptr, open_unverified_native_sink_for_test);
 }
 
 } // namespace detail

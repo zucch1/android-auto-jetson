@@ -716,7 +716,7 @@ TEST_F(AudioPipelineRoute, MissingDefaultOutputDegradesTypedWithRecordedCause) {
     auto config = pcm_router_config();
     config.backend = aa::audio::SinkBackend::pipewire;
     config.sink_remote = "aa-task25-no-such-output";
-    auto router = aa::audio::AudioRouter::open(config);
+    auto router = aa::audio::detail::open_router_with_unverified_native_sink_for_test(config);
     ASSERT_TRUE(router.has_value());
 
     EXPECT_EQ(router.value().state(), aa::audio::RouterState::degraded);
@@ -1287,7 +1287,7 @@ TEST_P(AudioPipelineSinkLogging, PreservesUserThresholdsWithRealHandoff) {
             std::lock_guard lock(mutex);
             latest = value;
         };
-        auto opened = aa::audio::detail::open_default_sink(request);
+        auto opened = aa::audio::detail::open_unverified_native_sink_for_test(request);
         ASSERT_TRUE(opened.sink) << opened.report.cause;
         const auto pcm = constant_pcm({kMediaLevel, 960});
         ASSERT_TRUE(opened.sink->write({stereo_48k(), now_ns(), pcm}));
@@ -1407,7 +1407,7 @@ TEST_F(AudioPipelineRoute, IsolatedBackendWithoutSinksNeverOpensActive) {
 
     auto config = pcm_router_config();
     config.backend = aa::audio::SinkBackend::pipewire;
-    auto router = aa::audio::AudioRouter::open(config);
+    auto router = aa::audio::detail::open_router_with_unverified_native_sink_for_test(config);
     ASSERT_TRUE(router.has_value());
 
     EXPECT_EQ(router.value().state(), aa::audio::RouterState::degraded);
@@ -1442,7 +1442,7 @@ TEST_F(AudioPipelineRoute, DaemonKillMidStreamDegradesTypedWithRecordedCause) {
 
     auto config = pcm_router_config();
     config.backend = aa::audio::SinkBackend::pipewire;
-    auto router = aa::audio::AudioRouter::open(config);
+    auto router = aa::audio::detail::open_router_with_unverified_native_sink_for_test(config);
     ASSERT_TRUE(router.has_value());
     ASSERT_EQ(router.value().state(), aa::audio::RouterState::active);
 
@@ -1528,7 +1528,7 @@ TEST_F(AudioPipelineRoute, OutputLossMidStreamDegradesTypedWithRecordedCause) {
 
     auto config = pcm_router_config();
     config.backend = aa::audio::SinkBackend::pipewire;
-    auto lost = aa::audio::AudioRouter::open(config);
+    auto lost = aa::audio::detail::open_router_with_unverified_native_sink_for_test(config);
     ASSERT_TRUE(lost.has_value());
     ASSERT_EQ(lost.value().state(), aa::audio::RouterState::active);
 
@@ -1881,6 +1881,71 @@ TEST(AudioPipelineSinkBackend, MissingPipeWireElementsRecordDisabledCause) {
         EXPECT_FALSE(selection.usable);
         EXPECT_TRUE(selection.element.empty());
         EXPECT_NE(selection.cause.find("disabled:"), std::string::npos);
+    }
+}
+
+// #80 production guard: these tests need no audio daemon. A successful
+// factory probe (or even a render handoff) cannot verify native graph capacity.
+TEST(AudioPipelineQuantumGuard, ViableNativeSinkCannotBypassQuantumGuard) {
+    aa::audio::SinkReport report;
+    report.candidates = {{"pipewiresink", true, true, true, "READY"},
+                         {"pulsesink", true, true, true, "READY"}};
+    const auto native = aa::audio::select_sink_backend(report, aa::audio::SinkBackend::pipewire);
+    EXPECT_FALSE(native.usable);
+    EXPECT_TRUE(native.element.empty());
+    EXPECT_NE(native.cause.find("audio_sink_quantum_unverified"), std::string::npos);
+    const auto automatic = aa::audio::select_sink_backend(report, aa::audio::SinkBackend::automatic);
+    EXPECT_TRUE(automatic.usable);
+    EXPECT_EQ(automatic.element, "pulsesink");
+    EXPECT_NE(automatic.cause.find("audio_sink_quantum_unverified"), std::string::npos);
+    const auto pulse = aa::audio::select_sink_backend(report, aa::audio::SinkBackend::pulse);
+    EXPECT_TRUE(pulse.usable);
+    EXPECT_EQ(pulse.element, "pulsesink");
+}
+
+TEST(AudioPipelineQuantumGuard, NativeOnlyHostCannotSilentlyRestoreUnsafeFallback) {
+    aa::audio::SinkReport report;
+    report.candidates = {{"pipewiresink", true, true, true, "READY"},
+                         {"pulsesink", true, false, false, "absent"}};
+    const auto selection = aa::audio::select_sink_backend(report, aa::audio::SinkBackend::automatic);
+    EXPECT_FALSE(selection.usable);
+    EXPECT_TRUE(selection.element.empty());
+    EXPECT_NE(selection.cause.find("audio_sink_quantum_unverified"), std::string::npos);
+    EXPECT_NE(selection.cause.find("pulsesink absent"), std::string::npos);
+}
+
+TEST(AudioPipelineQuantumGuard, SinkOpenRefusesUnobservableQuantumBeforeRendering) {
+    aa::audio::detail::SinkOpenRequest request;
+    request.format = stereo_48k();
+    request.backend = aa::audio::SinkBackend::pipewire;
+    std::uint64_t writes = 0;
+    request.on_write_progress = [&](const auto&) { ++writes; };
+    const auto opened = aa::audio::detail::open_default_sink(request);
+    EXPECT_FALSE(opened.sink);
+    EXPECT_FALSE(opened.report.usable);
+    EXPECT_NE(opened.report.cause.find("audio_sink_quantum_unverified"), std::string::npos);
+    EXPECT_EQ(writes, 0U);
+}
+
+TEST(AudioPipelineQuantumGuard, RouterRefusesAllUnverifiedQuantaWithTypedDegradation) {
+    // Refuse unknown capacity even with a large render quantum, without
+    // inventing a negotiated value or requiring a server. No active native
+    // route can later change to an unsafe quantum.
+    for (const auto quantum : {1LL, 50'000'000LL, 1'000'000'000LL}) {
+        auto config = pcm_router_config();
+        config.backend = aa::audio::SinkBackend::pipewire;
+        config.render_quantum = aa::core::Nanoseconds{quantum};
+        auto opened = aa::audio::AudioRouter::open(config);
+        ASSERT_TRUE(opened);
+        EXPECT_EQ(opened.value().state(), aa::audio::RouterState::degraded);
+        EXPECT_NE(opened.value().report().sink.cause.find("audio_sink_quantum_unverified"),
+                  std::string::npos);
+        const auto pcm = constant_pcm({kMediaLevel, 960});
+        const auto result = opened.value().submit(make_message(
+            aa::protocol::ChannelRole::media_audio, 0, now_ns(), pcm));
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code(), aa::ErrorCode::audio_sink_unavailable);
+        EXPECT_EQ(opened.value().report().stats.frames_written, 0U);
     }
 }
 
