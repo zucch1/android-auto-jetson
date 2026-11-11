@@ -13,8 +13,7 @@ in the explicit project policy branch. TLS 1.2 is the minimum. The Cryptor must
 also have an approved-phone predicate, bound by its caller to the transport and
 session identity. Absent, false or throwing predicates deny. Approval is checked
 at initialization, each handshake step and before encrypted application I/O.
-Deinitialization clears active state. TLS cannot substitute for the future task
-27 approved-phone store and pairing policy, which are not implemented here.
+Deinitialization clears active state. TLS cannot substitute for the approved-phone trust store and pairing policy (implemented in `aa::trust`, [`include/aa/trust/Store.hpp`](../include/aa/trust/Store.hpp)), which are decoupled from this TLS layer.
 
 `verified-peer-test-only` is an explicit constructor policy for tests, with
 OpenSSL peer verification and an empty trust store by default. Unknown and
