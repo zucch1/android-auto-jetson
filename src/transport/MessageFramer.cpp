@@ -101,6 +101,11 @@ MessageReassembler::push(std::span<const std::byte> frame_bytes) {
     }
     const Frame& frame = decoded.value();
 
+    // Latch as soon as the cipher is seen active (see require_encryption()).
+    if (cipher_ != nullptr && cipher_->is_active()) {
+        encryption_required_ = true;
+    }
+
     std::vector<std::byte> chunk;
     if (frame.header.encryption == Encryption::encrypted) {
         if (cipher_ == nullptr || !cipher_->is_active()) {
@@ -114,8 +119,9 @@ MessageReassembler::push(std::span<const std::byte> frame_bytes) {
         chunk = std::move(opened).value();
     } else {
         // Version exchange and encapsulated TLS flights arrive before activation.
-        // Once TLS finishes, every inbound frame must have record integrity.
-        if (cipher_ != nullptr && cipher_->is_active()) {
+        // Once TLS has finished, every inbound frame must have record integrity,
+        // whatever later happens to the cipher (latched, not is_active()).
+        if (encryption_required_ && plaintext_ == PlaintextAfterHandshake::reject) {
             return fail(Error{ErrorCode::transport_plaintext_after_tls});
         }
         chunk = frame.payload;

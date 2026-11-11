@@ -113,8 +113,17 @@ phone contact, push, PR or acceptance-ledger update is part of this task.
 The production AAP record codec pins TLS 1.2 to
 `ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384` and checks protocol
 and cipher configuration for failure. These suites provide forward secrecy.
-No captured real-phone cipher negotiation is available in this repository;
-a real-phone check on the Jetson is still required.
+Real-phone check (Jetson, 2026-11-11, one phone: Samsung SM-A266U, Android 16,
+wired AOA on USB port `1-2.1`, static-RSA switch OFF): TLS 1.2 with
+`ECDHE-RSA-AES128-GCM-SHA256` negotiated, service discovery and 7 channel opens
+completed, video and audio flowed, and the session stayed `active` for 200 s.
+Only the version exchange and the TLS handshake flights arrived plaintext; every
+frame after the handshake was encrypted, and no reason-107 violation occurred.
+Not measured: any other phone model or Android version, and whether a phone
+ever sends its own PingRequest (this phone sent none in 200 s; when the HU sent
+PingRequests, 12 plaintext and 11 encrypted, all 23 PingResponses came back
+encrypted). A second attached phone (SM-N960U) did not answer the version
+request on either this branch or `main`, so it produced no data.
 
 For a phone proven to require static RSA, configure with
 `-DAA_TLS_ALLOW_STATIC_RSA_COMPATIBILITY=ON` (default: `OFF`). This adds
@@ -126,4 +135,13 @@ Version exchange and encapsulated TLS flights remain plaintext until the cipher
 becomes active. The HU also sends its plaintext AuthComplete at that transition.
 All inbound frames after activation must be encrypted, on every channel;
 plaintext is a terminal `transport_plaintext_after_tls` protocol violation,
-recorded in session diagnostics as error code 107.
+recorded in session diagnostics as error code 107. The requirement is latched
+when the handshake completes and holds for the rest of the link whatever later
+happens to the cipher (a seal failure or mid-session revoke clears `is_active()`
+but never re-admits plaintext). A fresh link builds a fresh reassembler. The
+rule applies to HU-inbound traffic only; the HU still sends plaintext
+AuthComplete and PingResponse, so peer-side test readers of HU output construct
+their `MessageReassembler` with `PlaintextAfterHandshake::allow`. No plaintext
+exception exists (not even for ping): the real phone encrypted everything.
+A failed cipher setup (credential or cipher configuration) is reported by the
+receiver as `{"event":"err","detail":"tls_cipher","reason":"..."}`.

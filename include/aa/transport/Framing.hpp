@@ -105,12 +105,30 @@ encode_message(const Message &message, Encryption encryption, PayloadCipher *cip
 // running total that overruns the FIRST total, and any bound overrun) with
 // deterministic typed errors. Once it fails it is closed and every later push
 // re-returns transport_closed, so a caller can close the transport safely.
+// Direction of the stream a MessageReassembler reads. The post-handshake
+// plaintext rule is an HU-INBOUND rule (the phone must not send plaintext once
+// TLS is up). The HU itself still sends a few plaintext frames after the
+// handshake (AuthComplete, PingResponse), so a PEER-side reader of HU output
+// (test phones, replay) must opt out with `allow`. Production receive paths use
+// the default.
+enum class PlaintextAfterHandshake : std::uint8_t { reject, allow };
+
 class MessageReassembler final {
   public:
-    // Plaintext is rejected once the cipher is active (TLS handshake complete).
+    // Once the TLS handshake has completed, every inbound frame must be
+    // encrypted for the rest of this reassembler's life: plaintext fails with
+    // transport_plaintext_after_tls. The requirement is LATCHED, not re-derived
+    // from cipher health, so a cipher that later deactivates (seal/open failure,
+    // mid-session revoke) can never re-admit plaintext. It latches the first
+    // time push() sees an active cipher, or explicitly via require_encryption()
+    // (WiredSession calls it at handshake completion, so even a cipher that
+    // deactivates before the first post-handshake frame cannot reopen the
+    // plaintext path). A fresh link builds a fresh reassembler, which resets it.
     // `cipher` is used to open encrypted frame payloads; pass nullptr only for
     // a plain-only stream (an encrypted frame then fails closed).
-    explicit MessageReassembler(PayloadCipher *cipher = nullptr) : cipher_(cipher) {}
+    explicit MessageReassembler(PayloadCipher *cipher = nullptr,
+                                PlaintextAfterHandshake plaintext = PlaintextAfterHandshake::reject)
+        : cipher_(cipher), plaintext_(plaintext) {}
 
     // Feed one complete frame's bytes. Returns the completed message when a
     // BULK or LAST frame closes it, or std::nullopt while a fragmented message
@@ -118,6 +136,11 @@ class MessageReassembler final {
     [[nodiscard]] core::Result<std::optional<Message>> push(std::span<const std::byte> frame_bytes);
 
     [[nodiscard]] bool closed() const noexcept { return closed_; }
+
+    // Latch "plaintext no longer acceptable" (the TLS handshake has completed).
+    // Idempotent and irreversible for the life of this reassembler.
+    void require_encryption() noexcept { encryption_required_ = true; }
+    [[nodiscard]] bool encryption_required() const noexcept { return encryption_required_; }
 
   private:
     struct Pending {
@@ -131,12 +154,14 @@ class MessageReassembler final {
     [[nodiscard]] core::Result<std::optional<Message>> fail(Error error);
 
     PayloadCipher *cipher_;
+    PlaintextAfterHandshake plaintext_;
     // Per-channel in-progress messages, so fragments from different channels
     // may interleave without corrupting each other. The running total of
     // buffered plaintext across all channels is capped by kMaxQueuedBytes.
     std::map<std::uint8_t, Pending> pending_{};
     std::size_t queued_bytes_{};
     bool closed_{false};
+    bool encryption_required_{false};
 };
 
 } // namespace aa::transport

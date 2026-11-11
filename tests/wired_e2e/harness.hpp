@@ -178,6 +178,9 @@ class FakeHandshakeCipher final : public aa::transport::HandshakingCipher {
     [[nodiscard]] std::size_t record_overhead() const noexcept override { return 0; }
     [[nodiscard]] bool is_active() const noexcept override { return active_; }
     [[nodiscard]] std::size_t received() const noexcept { return received_; }
+    // Mirrors TlsRecordCodec::seal()/open() clearing active_ on a failure or a
+    // mid-session revoke while the session itself still reports authenticated.
+    void deactivate() noexcept { active_ = false; }
 
   private:
     int handshake_steps_;

@@ -12,7 +12,9 @@
 #include <aa/transport/TlsTransport.hpp>
 
 #include <cstring>
+#include <exception>
 #include <stdexcept>
+#include <string>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -59,7 +61,7 @@ TlsRecordCodec::TlsRecordCodec(aa::tls::Policy policy, Role role)
     // Pin TLS 1.2 AES-GCM so the record overhead is exactly 29 bytes.
     constexpr const char* suites =
         "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384"
-#ifdef AA_TLS_ALLOW_STATIC_RSA_COMPATIBILITY
+#if AA_TLS_ALLOW_STATIC_RSA_COMPATIBILITY
         ":AES128-GCM-SHA256:AES256-GCM-SHA384"
 #endif
         ;
@@ -269,13 +271,25 @@ void pump_handshake(TlsRecordCodec &a, TlsRecordCodec &b) {
 
 namespace aa::transport {
 
+namespace {
+thread_local std::string g_last_cipher_failure;
+} // namespace
+
+std::string last_handshake_cipher_failure() { return g_last_cipher_failure; }
+
 std::unique_ptr<HandshakingCipher>
 make_client_handshake_cipher(const TlsTransport::ApprovedPredicate &approved) {
+    g_last_cipher_failure.clear();
     try {
         aa::tls::Policy policy(approved, aa::tls::Mode::encryption_only_compatibility);
         return std::make_unique<tls_adapter::TlsRecordCodec>(
             std::move(policy), tls_adapter::TlsRecordCodec::Role::client);
+    } catch (const std::exception &error) {
+        // what() carries a stable failure class, never key material.
+        g_last_cipher_failure = error.what();
+        return nullptr;
     } catch (...) {
+        g_last_cipher_failure = "unknown";
         return nullptr;
     }
 }

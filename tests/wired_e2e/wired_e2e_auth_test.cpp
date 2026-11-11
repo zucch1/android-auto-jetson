@@ -546,4 +546,39 @@ TEST(WiredE2eAuth, PlaintextAfterTlsEndsSessionWithDistinctDiagnostic) {
     EXPECT_EQ(f.session.pings_answered(), 0U);
 }
 
+// Audit M9 / review P2: the post-handshake plaintext rejection is latched. A
+// cipher that deactivates after authentication (seal failure, mid-session revoke)
+// must not re-admit plaintext, on the control channel or on a service channel.
+TEST(WiredE2eAuth, PlaintextStaysRejectedAfterCipherDeactivates) {
+    for (const bool service_channel : {false, true}) {
+        AuthFixture f;
+        wiredtest::walk_auth(f.session, f.transport);
+        ASSERT_TRUE(f.session.authenticated());
+        ASSERT_TRUE(f.cipher->is_active());
+        f.cipher->deactivate();
+        ASSERT_FALSE(f.cipher->is_active());
+        ASSERT_TRUE(f.session.authenticated());
+        const int closes_before = f.transport.close_calls();
+        if (service_channel) {
+            auto frames = aa::transport::encode_message(
+                aa::transport::Message{99, aa::transport::MessageKind::specific,
+                                       {std::byte{0x80}, std::byte{0x01}, std::byte{0x00}}},
+                aa::transport::Encryption::plain, nullptr);
+            ASSERT_TRUE(frames.has_value());
+            f.transport.push_inbound(frames.value().front());
+        } else {
+            f.transport.push_inbound(wiredtest::control_frame(
+                proto::encode(proto::PingRequest{123, false, {}}).value()));
+        }
+        auto result = f.session.poll_transport();
+        ASSERT_FALSE(result.has_value()) << "service_channel=" << service_channel;
+        EXPECT_EQ(result.error().code(), aa::ErrorCode::transport_plaintext_after_tls);
+        EXPECT_EQ(f.session.state(), ss::State::failed);
+        EXPECT_TRUE(f.capture.contains("\"error_code\":107"));
+        EXPECT_EQ(f.session.pings_answered(), 0U);
+        // The terminal violation closes the transport exactly once.
+        EXPECT_EQ(f.transport.close_calls(), closes_before + 1);
+    }
+}
+
 } // namespace
