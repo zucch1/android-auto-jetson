@@ -68,15 +68,29 @@ its name and its existing in-tree steps, and now has `needs: base-validators` pl
 step that fails unless `ci/base-validators` **succeeded**, for every event type (the job runs under
 `!cancelled()`, because a *skipped* required job would otherwise count as passing; `skipped` is
 not accepted, so `gh workflow run ci.yml --ref <pr-branch>` cannot produce a green
-`ci/provenance-lint` without the trusted validators). `pull_request` also reruns on `edited`,
-so retargeting a PR reruns CI. Optionally add `ci/base-validators` to the ruleset's
+`ci/provenance-lint` without the trusted validators). `pull_request` runs on `opened`,
+`synchronize` and `reopened` only: `edited` would cancel and restart the whole run (including the
+600 s ipc bench when it applies) on every title or body edit, and since the validators always come
+from `main`, a retarget no longer changes what they check. **After retargeting a PR, close and
+reopen it, or push a commit, to rerun CI.** Do not replace this with job-level `if:` skipping: a
+skipped required job counts as passing. Optionally add `ci/base-validators` to the ruleset's
 required contexts after its first run.
 
 If a PR legitimately changes one of these validators or their pinned constants, the base run
 fails by design: land the validator change on its own first (the owner reviews it explicitly),
-then rebase the data change on it. **Residual:** `.github/workflows/ci.yml` itself is still
-taken from the PR, so a PR can edit or delete these jobs; any change under `.github/` needs
-explicit owner review (enforcing it needs `pull_request_target`/ruleset work, not done here).
+then rebase the data change on it. That does not work when a validator's pinned constant and
+the data it checks must change together (`check_manifest.py` + `deps/manifest.lock`): make the
+change backward compatible (the old validator must accept the new data, or the new validator the
+old data) so the two can land in either order, or accept a red `main` between two merges, or use
+an admin bypass for that merge.
+
+**Residuals.** (a) Any file under `.github/workflows/` comes from the PR, not just `ci.yml`: a PR
+can edit or delete these jobs, and can add a *new* workflow with a job named `ci/provenance-lint`
+(or `ci/base-validators`). Any change under `.github/workflows/` needs explicit owner review
+(enforcing it needs `pull_request_target`/ruleset work, not done here). (b) The
+`workflow_dispatch` closure (a dispatch on an old PR branch cannot turn the gate green) relies on
+the ruleset's **strict "require branches to be up to date before merging"** setting: an old PR
+branch carries the old gate until `main` is merged into it. Turning strict off reopens that hole.
 `tests/ci/ci_workflow_trust_test.py` (ctest `ci_workflow_trust`) guards this structure.
 
 The host build downloads the exact GoogleTest v1.15.2 archive specified by
@@ -138,11 +152,24 @@ PR tree as untrusted code:
   refuses to run if a writable path (`AA_SYSROOT_CACHE`, the scratch tree) equals,
   contains or sits inside a read-only input such as the sysroot, equals or contains your
   `$HOME` or the repo checkout, or overlaps the repo's git dirs or the relay's own logs,
-  base checkout and empty-HOME directories. The default scratch is a fresh `mktemp -d`
-  (mode 0700) under `$XDG_RUNTIME_DIR`, else `$TMPDIR`, else `/tmp`.
-- Use a fresh, dedicated `AA_SYSROOT_CACHE` for each run (or leave it unset): hardlink or
-  bind-mount aliases into the cache, and cache poisoning that carries over between PRs, are
-  not defended against.
+  base checkout and empty-HOME directories. The repo checkout is fully protected: a
+  writable path may not equal it, contain it or sit inside it (so `AA_SYSROOT_CACHE=<repo>/build`
+  or `<repo>/tools/ci` is refused: the sandbox could otherwise rewrite the host `build.ninja` or
+  the running relay script). `$HOME` itself may not be equalled or contained, but a dedicated
+  directory inside it is fine.
+- `AA_SYSROOT_CACHE` and an explicit `AA_RELAY_SCRATCH` must be nonexistent, empty, or hold
+  the `.aa-relay-dedicated` marker file the relay creates on first use; a non-empty directory
+  without it (`~/.ssh`, `~/.config`, a project) is refused with exit 65. An existing
+  `AA_RELAY_SCRATCH` must also be owned by you and not group/world-writable.
+- Scratch: by default a fresh `mktemp -d` (mode 0700) under `$TMPDIR`, else `/var/tmp` (never
+  `$XDG_RUNTIME_DIR`: a RAM tmpfs is too small for the cross build). The cleanup trap is
+  installed before anything is created, so a refused or failed run (fetch, missing commit, PR
+  binding, author check) leaves nothing behind. On exit the relay removes everything except
+  `logs/` (the status carries their sha256s), and prints where the scratch is; a default
+  scratch with no logs disappears entirely.
+- Use a fresh, dedicated `AA_SYSROOT_CACHE` for each run (or leave it unset: it is then
+  `<scratch>/build-binding` and removed at exit): hardlink or bind-mount aliases into the
+  cache, and cache poisoning that carries over between PRs, are not defended against.
 - `SIGKILL` of the relay (or a second signal while it is cleaning up) can leave a
   container behind; check `docker ps` / `podman ps` and remove it by hand.
 - Containers (podman/docker) get a random name. After every step, and on timeout, error,

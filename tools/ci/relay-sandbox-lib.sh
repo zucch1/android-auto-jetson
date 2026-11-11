@@ -17,7 +17,8 @@
 #   RELAY_SB_RW   array of paths mounted read-write at the same absolute path
 #   RELAY_SB_RO   array of paths mounted read-only at the same absolute path
 #   RELAY_SB_PROTECT        optional: extra paths no writable mount may equal, contain or sit inside
-#   RELAY_SB_PROTECT_COVER  optional: paths no writable mount may equal or contain (\$HOME, repo root)
+#   RELAY_SB_PROTECT_COVER  optional: paths no writable mount may equal or contain, but may sit
+#                           inside (the owner's \$HOME: a dedicated cache under it is fine)
 #   RELAY_SB_ENV  array of KEY=VALUE pairs; this is the COMPLETE environment of the sandbox
 #   RELAY_SB_HOME in-sandbox HOME (a fresh empty tmpfs; default /home/aa-relay)
 #   RELAY_SB_PATH in-sandbox PATH (default /usr/local/bin:/usr/bin:/bin)
@@ -125,7 +126,7 @@ relay_sandbox_canonicalize() {
         protected+=("$c")
     done
     # RELAY_SB_PROTECT_COVER: paths a writable mount may sit inside but never equal or contain
-    # (the owner's $HOME and the repo checkout: a writable mount of a parent would expose them).
+    # (the owner's $HOME: a writable mount of it or a parent would expose it).
     local -a cover=()
     for item in ${RELAY_SB_PROTECT_COVER[@]+"${RELAY_SB_PROTECT_COVER[@]}"}; do
         [ -n "$item" ] || continue
@@ -147,12 +148,63 @@ relay_sandbox_canonicalize() {
         for d in ${cover[@]+"${cover[@]}"}; do
             if [ "$c" = "$d" ] || [ "${d#"${c%/}"/}" != "$d" ]; then
                 echo "error: refusing to run: writable path '$c' equals or contains protected path '$d'" >&2
-                echo "       (it would expose the owner's HOME or checkout inside the sandbox; use a fresh dedicated directory)" >&2
+                echo "       (it would expose the owner's HOME inside the sandbox; use a fresh dedicated directory)" >&2
                 return 65
             fi
         done
     done
     return 0
+}
+
+# Marker the relay itself creates in a directory it was told to use as AA_SYSROOT_CACHE or
+# AA_RELAY_SCRATCH. A non-empty directory without it (~/.ssh, ~/.config, a project) is never
+# adopted: the sandbox gets a writable view of the cache, so it must be dedicated.
+RELAY_DEDICATED_MARKER=.aa-relay-dedicated
+
+# relay_dedicated_check <path> <label>: 0 when <path> is nonexistent, an empty directory, or a
+# directory holding the marker (a regular file); 65 otherwise. Creates nothing.
+relay_dedicated_check() {
+    local dir=$1 label=$2
+    [ -e "$dir" ] || [ -L "$dir" ] || return 0
+    if [ ! -d "$dir" ]; then
+        echo "error: refusing to run: $label '$dir' exists and is not a directory" >&2
+        return 65
+    fi
+    if [ -f "$dir/$RELAY_DEDICATED_MARKER" ] && [ ! -L "$dir/$RELAY_DEDICATED_MARKER" ]; then
+        return 0
+    fi
+    if [ -z "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+        return 0
+    fi
+    echo "error: refusing to run: $label '$dir' is a non-empty directory the relay did not create" >&2
+    echo "       (no $RELAY_DEDICATED_MARKER marker; use a nonexistent or empty directory, never one that holds your files)" >&2
+    return 65
+}
+
+# relay_dedicated_owner_check <path> <label>: an existing directory must belong to the current
+# user and not be group/world-writable (another user could swap its contents under the relay).
+relay_dedicated_owner_check() {
+    local dir=$1 label=$2 owner mode
+    [ -d "$dir" ] || return 0
+    owner=$(stat -c %u -- "$dir") && mode=$(stat -c %a -- "$dir") || return 70
+    if [ "$owner" != "$(id -u)" ]; then
+        echo "error: refusing to run: $label '$dir' is not owned by the current user" >&2
+        return 65
+    fi
+    if [ $((8#$mode & 8#022)) -ne 0 ]; then
+        echo "error: refusing to run: $label '$dir' is group- or world-writable (mode $mode)" >&2
+        return 65
+    fi
+    return 0
+}
+
+# relay_dedicated_claim <path>: create the directory (0700) and its marker.
+relay_dedicated_claim() {
+    local dir=$1
+    if [ ! -d "$dir" ]; then
+        mkdir -p -- "$dir" && chmod 0700 -- "$dir" || return 70
+    fi
+    [ -e "$dir/$RELAY_DEDICATED_MARKER" ] || : >"$dir/$RELAY_DEDICATED_MARKER" || return 70
 }
 
 # relay_sandbox_build_argv <backend> <workdir> <command...>: fills RELAY_SB_ARGV (client or bwrap

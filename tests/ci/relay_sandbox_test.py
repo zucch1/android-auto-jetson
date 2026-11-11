@@ -18,7 +18,10 @@ cmake build; the sandboxed step is a probe command) with a fake `gh` first on PA
   the sysroot, or a symlink to it) is refused, and read-only mounts are emitted after writable
   ones; round 2: HOME, the repo root and its git dirs, logs, the base checkout and the empty
   HOME cannot be equalled or contained by a writable mount, and the default scratch is a fresh
-  0700 mktemp directory; a container that ignores SIGTERM is gone after the step timeout, and when its
+  0700 mktemp directory; round 3: the repo root is fully protected, AA_SYSROOT_CACHE and an explicit
+  AA_RELAY_SCRATCH must be nonexistent, empty or marked (an existing scratch also owned by the user and
+  not group/world-writable), the default scratch lives under TMPDIR / /var/tmp and early exits leak
+  nothing; a container that ignores SIGTERM is gone after the step timeout, and when its
   termination cannot be confirmed nothing is posted and the relay exits non-zero.
 
 Exits 77 (ctest SKIP) with a reason when no sandbox backend works on this machine.
@@ -40,9 +43,10 @@ ROOT = Path(__file__).resolve().parents[2]
 RELAY = ROOT / 'tools' / 'ci' / 'arm64-cross-relay.sh'
 LIB = ROOT / 'tools' / 'ci' / 'relay-sandbox-lib.sh'
 SKIP = 77
-# A canary standing in for the owner's gh token. Assembled at runtime and deliberately not
-# token-shaped, so no secret scanner (CodeQL, gitleaks) sees a credential literal in the source.
-SECRET = '-'.join(('canary', 'owner', 'credential', 'must', 'not', 'reach', 'the', 'sandbox'))
+# A canary standing in for the owner's gh credential. Assembled at runtime and deliberately not
+# credential-shaped, so no scanner (CodeQL, gitleaks) sees a literal in the source. Its value is
+# never printed: check() redacts it from every detail.
+SANDBOX_CANARY = '-'.join(('canary', 'owner', 'credential', 'must', 'not', 'reach', 'the', 'sandbox'))
 
 
 def skip(reason: str) -> None:
@@ -126,13 +130,14 @@ echo SANDBOX-OK
 def run_relay(tmp: Path, sha: str, *, probe: str, pr: str | None = None, author: str = 'zucch1',
               extra: tuple[str, ...] = (), backend: str, env_extra: dict[str, str] | None = None,
               path_prefix: str = '', leak_fds: bool = False,
-              interrupt=None) -> tuple[int, str, str]:
+              interrupt=None, drop_env: tuple[str, ...] = ()
+              ) -> tuple[int, str, str]:
     scratch = tmp / 'scratch'
     outside = tmp / 'outside-marker'
     outside.write_text('owner-only\n', encoding='utf-8')
     home = tmp / 'home'
     (home / '.config' / 'gh').mkdir(parents=True, exist_ok=True)
-    (home / '.config' / 'gh' / 'hosts.yml').write_text(f'oauth_token: {SECRET}\n', encoding='utf-8')
+    (home / '.config' / 'gh' / 'hosts.yml').write_text(f'canary: {SANDBOX_CANARY}\n', encoding='utf-8')
     fakebin = tmp / 'bin'
     fakebin.mkdir(exist_ok=True)
     gh = fakebin / 'gh'
@@ -153,8 +158,8 @@ def run_relay(tmp: Path, sha: str, *, probe: str, pr: str | None = None, author:
     env = {
         'PATH': f'{path_prefix}{fakebin}:{os.environ["PATH"]}',
         'HOME': str(home),
-        'GH_TOKEN': SECRET,
-        'GITHUB_TOKEN': SECRET,
+        'GH_TOKEN': SANDBOX_CANARY,
+        'GITHUB_TOKEN': SANDBOX_CANARY,
         'SSH_AUTH_SOCK': str(tmp / 'agent.sock'),
         'AA_SYSROOT_ROOTFS': str(sysroot),
         'AA_SYSROOT_MANIFEST': str(manifest),
@@ -176,6 +181,8 @@ def run_relay(tmp: Path, sha: str, *, probe: str, pr: str | None = None, author:
     if 'AA_RELAY_IMAGE' in os.environ:
         env['AA_RELAY_IMAGE'] = os.environ['AA_RELAY_IMAGE']
     env.update(env_extra or {})
+    for name in drop_env:
+        env.pop(name, None)
     args = ['bash', str(RELAY), *extra, sha] + ([pr] if pr else [])
     # Leak a regular-file fd, a directory fd (the owner's HOME, so openat() reaches .config/gh)
     # and a socket fd into the relay; they must not survive into the sandbox.
@@ -222,7 +229,8 @@ def read_step_log(tmp: Path, name: str) -> str:
 
 def check(condition: bool, message: str, detail: str = '') -> None:
     if not condition:
-        print(f'FAIL: {message}\n{detail}')
+        shown = detail.replace(SANDBOX_CANARY, '<canary-redacted>')
+        print(f'FAIL: {message}\n{shown}')
         raise SystemExit(1)
 
 
@@ -340,7 +348,7 @@ def main() -> int:
         check(rc == 0, 'relay with a passing probe must exit 0', err + sandbox_log)
         check('SANDBOX-OK' in sandbox_log and 'SANDBOX-LEAK' not in sandbox_log,
               'sandbox probe did not pass', sandbox_log)
-        check(SECRET not in sandbox_log, 'token leaked into the sandbox environment', sandbox_log)
+        check(SANDBOX_CANARY not in sandbox_log, 'canary leaked into the sandbox environment')
         allowed = {'HOME', 'PATH', 'GIT_CONFIG_NOSYSTEM', 'PKG_CONFIG_PATH', 'PWD', 'SHLVL', '_', 'OLDPWD',
                    'AA_SYSROOT_ROOTFS', 'AA_SYSROOT_MANIFEST', 'AA_GOOGLETEST_ARCHIVE', 'AA_SYSROOT_CACHE',
                    'AA_SYSROOT_PAYLOAD', 'AA_SYSROOT_REQUIRE_OBSERVED',
@@ -440,19 +448,146 @@ def main() -> int:
         rc, err, gh_log = run_relay(tmp, sha, probe='true', backend=backend,
                                     env_extra={'AA_SYSROOT_CACHE': str(tmp / 'home' / 'cache' / 'aa')})
         check(rc == 0, 'a dedicated cache directory inside HOME must still work', err)
-    # Default scratch (no AA_RELAY_SCRATCH): a fresh unpredictable 0700 directory, not /tmp/<name>-<sha>.
+    # Default scratch (no AA_RELAY_SCRATCH): a fresh unpredictable 0700 directory under $TMPDIR
+    # (else /var/tmp), never under $XDG_RUNTIME_DIR (RAM tmpfs) and not /tmp/<name>-<sha>.
     with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
         tmp = Path(t)
         runtime = tmp / 'xdg'
         runtime.mkdir(mode=0o755)
-        predictable = Path(os.environ.get('TMPDIR', '/tmp')) / f'arm64-cross-relay-{sha}'
-        check(not predictable.exists(), 'stale predictable scratch present; remove it', str(predictable))
+        tmpdir = tmp / 'tmpdir'
+        tmpdir.mkdir(mode=0o755)
+        predictable = tmpdir / f'arm64-cross-relay-{sha}'
         rc, err, gh_log = run_relay(tmp, sha, probe='true', backend=backend,
-                                    env_extra={'XDG_RUNTIME_DIR': str(runtime), 'AA_RELAY_SCRATCH': ''})
-        made = sorted(runtime.glob('arm64-cross-relay.*'))
-        check(rc == 0 and len(made) == 1, 'default scratch must be one mktemp dir under XDG_RUNTIME_DIR', err)
+                                    env_extra={'XDG_RUNTIME_DIR': str(runtime), 'TMPDIR': str(tmpdir),
+                                               'AA_RELAY_SCRATCH': ''})
+        made = sorted(tmpdir.glob('arm64-cross-relay.*'))
+        check(rc == 0 and len(made) == 1, 'default scratch must be one mktemp dir under TMPDIR', err)
+        check(not list(runtime.iterdir()), 'the default scratch must not live under XDG_RUNTIME_DIR')
         check(stat.S_IMODE(made[0].stat().st_mode) == 0o700, 'scratch must be mode 0700', oct(made[0].stat().st_mode))
-        check(not predictable.exists(), 'relay used the predictable /tmp scratch path')
+        check(not predictable.exists(), 'relay used a predictable scratch path')
+        # Success removes everything except the logs and says where the scratch is.
+        check(sorted(p.name for p in made[0].iterdir()) == ['.aa-relay-dedicated', 'logs'],
+              'success must leave only the logs (and the marker)', str(sorted(p.name for p in made[0].iterdir())))
+        check(f'scratch kept at {made[0]}' in err, 'the scratch path must be printed at exit', err)
+    # Without TMPDIR the default is /var/tmp, never XDG_RUNTIME_DIR.
+    with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+        tmp = Path(t)
+        runtime = tmp / 'xdg'
+        runtime.mkdir(mode=0o755)
+        before = set(Path('/var/tmp').glob('arm64-cross-relay.*'))
+        rc, err, gh_log = run_relay(tmp, sha, probe='true', backend=backend, drop_env=('TMPDIR',),
+                                    env_extra={'XDG_RUNTIME_DIR': str(runtime), 'AA_RELAY_SCRATCH': ''})
+        made = set(Path('/var/tmp').glob('arm64-cross-relay.*')) - before
+        try:
+            check(rc == 0 and len(made) == 1 and not list(runtime.iterdir()),
+                  'without TMPDIR the default scratch must be /var/tmp, not XDG_RUNTIME_DIR', err)
+        finally:
+            for d in made:
+                shutil.rmtree(d, ignore_errors=True)
+    # Early exits must not leak the default scratch: missing commit, non-owner author, PR head mismatch.
+    for label, kwargs, want_rc in (
+            ('missing commit', {'sha_override': 'a' * 40}, 66),
+            ('non-owner author', {'pr': '7', 'author': 'someone-else'}, 65),
+            ('PR head mismatch', {'pr': '7', 'head_override': 'b' * 40}, 65)):
+        with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+            tmp = Path(t)
+            tmpdir = tmp / 'tmpdir'
+            tmpdir.mkdir(mode=0o755)
+            rc, err, gh_log = run_relay(tmp, kwargs.get('sha_override', sha), probe='true', backend=backend,
+                                        pr=kwargs.get('pr'), author=kwargs.get('author', 'zucch1'),
+                                        env_extra={'TMPDIR': str(tmpdir), 'AA_RELAY_SCRATCH': '',
+                                                   **({'FAKE_PR_HEAD': kwargs['head_override']}
+                                                      if 'head_override' in kwargs else {})})
+            check(rc == want_rc, f'{label}: expected exit {want_rc}', err)
+            check(not list(tmpdir.iterdir()), f'{label}: leaked a scratch directory', str(list(tmpdir.iterdir())))
+            check('removed (nothing to keep)' in err, f'{label}: the removal must be reported', err)
+    # Round 3: the repo root is fully protected (not just "may not contain it"): a cache that
+    # IS or sits inside the checkout (build/, tools/ci/) could let the sandbox rewrite the host
+    # build.ninja or the running relay script. Nothing is created in the checkout.
+    for label, cache_of in (('cache is the repo build dir', lambda t: ROOT / 'build'),
+                            ('cache is the repo tools/ci dir', lambda t: ROOT / 'tools' / 'ci'),
+                            ('cache is a new dir inside the repo', lambda t: ROOT / 'aa-relay-test-cache')):
+        existed = cache_of(None).exists()
+        with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+            tmp = Path(t)
+            rc, err, gh_log = run_relay(tmp, sha, probe=PROBE.replace('SANDBOX-OK', 'SANDBOX-RAN'), backend=backend,
+                                        env_extra={'AA_SYSROOT_CACHE': str(cache_of(tmp))})
+            check(rc == 65 and 'overlaps protected path' in err, f'{label}: must be refused', err)
+            check(gh_log == '' and not (tmp / 'scratch').exists(), f'{label}: nothing may run, be posted or be created', gh_log)
+        check(cache_of(None).exists() == existed, f'{label}: the checkout was modified')
+        check(not (ROOT / 'aa-relay-test-cache').exists(), f'{label}: created a directory in the checkout')
+    with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:  # scratch inside the checkout
+        tmp = Path(t)
+        rc, err, gh_log = run_relay(tmp, sha, probe='true', backend=backend,
+                                    env_extra={'AA_RELAY_SCRATCH': str(ROOT / 'aa-relay-test-scratch')})
+        check(rc == 65 and 'overlaps protected path' in err, 'scratch inside the repo checkout must be refused', err)
+        check(not (ROOT / 'aa-relay-test-scratch').exists(), 'created a scratch inside the checkout')
+    # Round 3: AA_SYSROOT_CACHE / AA_RELAY_SCRATCH must be nonexistent, empty, or marked by the
+    # relay itself; a non-empty unmarked directory (~/.ssh, ~/.config, a project) is refused (65).
+    for which in ('AA_SYSROOT_CACHE', 'AA_RELAY_SCRATCH'):
+        with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+            tmp = Path(t)
+            for victim_name in ('.ssh', '.config'):
+                victim = tmp / 'home' / victim_name
+                victim.mkdir(parents=True, exist_ok=True)
+                victim.chmod(0o700)
+                (victim / 'keep-me').write_text('owner data\n', encoding='utf-8')
+                rc, err, gh_log = run_relay(tmp, sha, probe='touch "$AA_SYSROOT_CACHE/planted"; true', backend=backend,
+                                            env_extra={which: str(victim)})
+                check(rc == 65 and 'non-empty directory the relay did not create' in err,
+                      f'{which}={victim_name}: a non-empty unmarked directory must be refused', err)
+                check(gh_log == '' and (victim / 'keep-me').is_file()
+                      and not (victim / 'planted').exists() and not (victim / '.aa-relay-dedicated').exists(),
+                      f'{which}={victim_name}: the directory must be untouched and nothing posted', gh_log)
+            # A regular file in place of the directory is refused as well.
+            afile = tmp / 'afile'
+            afile.write_text('x', encoding='utf-8')
+            rc, err, gh_log = run_relay(tmp, sha, probe='true', backend=backend, env_extra={which: str(afile)})
+            check(rc == 65 and 'not a directory' in err, f'{which}: a file must be refused', err)
+        # Nonexistent: created on first use with the marker. Empty: adopted, marker added.
+        # Marked: reused although non-empty.
+        for state in ('nonexistent', 'empty', 'marked'):
+            with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+                tmp = Path(t)
+                target = tmp / 'dedicated'
+                if state != 'nonexistent':
+                    target.mkdir(mode=0o700)
+                if state == 'marked':
+                    (target / '.aa-relay-dedicated').write_text('', encoding='utf-8')
+                    (target / 'earlier-run-leftover').write_text('ok\n', encoding='utf-8')
+                rc, err, gh_log = run_relay(tmp, sha, probe=PROBE if which == 'AA_SYSROOT_CACHE' else 'true',
+                                            backend=backend, env_extra={which: str(target)})
+                check(rc == 0, f'{which} ({state}) must be accepted', err)
+                check((target / '.aa-relay-dedicated').is_file(), f'{which} ({state}): marker missing after use')
+                if which == 'AA_SYSROOT_CACHE':
+                    check((target / 'ok').exists(), f'{which} ({state}): the sandbox could not write the cache')
+                if state == 'marked':
+                    check((target / 'earlier-run-leftover').exists(), f'{which}: a marked directory was cleaned out')
+    # An existing explicit scratch must be owned by the current user and not group/world-writable.
+    with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+        tmp = Path(t)
+        shared = tmp / 'scratch'
+        shared.mkdir()
+        (shared / '.aa-relay-dedicated').write_text('', encoding='utf-8')  # marked, so only mode can refuse it
+        for mode in (0o770, 0o707, 0o777):
+            shared.chmod(mode)
+            rc, err, gh_log = run_relay(tmp, sha, probe='true', backend=backend)
+            check(rc == 65 and 'group- or world-writable' in err, f'scratch mode {oct(mode)} must be refused', err)
+            check(gh_log == '', 'nothing may be posted for a writable scratch', gh_log)
+        shared.chmod(0o755)
+        rc, err, gh_log = run_relay(tmp, sha, probe='true', backend=backend)
+        check(rc == 0, 'a 0755 marked scratch of the current user must be accepted', err)
+    if os.getuid() != 0:
+        foreign = next((Path(d) for d in ('/srv', '/mnt', '/media', '/opt') if Path(d).is_dir()
+                        and Path(d).stat().st_uid != os.getuid() and not Path(d).stat().st_mode & 0o022), None)
+        if foreign is not None:
+            with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+                rc, err, gh_log = run_relay(Path(t), sha, probe='true', backend=backend,
+                                            env_extra={'AA_RELAY_SCRATCH': str(foreign)})
+                check(rc == 65 and 'not owned by the current user' in err,
+                      f'a scratch owned by another user ({foreign}) must be refused', err)
+        else:
+            print('SKIP (ownership case): no root-owned, non-writable /srv, /mnt, /media or /opt here')
     # Ordering: writable mounts first, caller's read-only inputs last (a later mount wins).
     with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
         tmp = Path(t)

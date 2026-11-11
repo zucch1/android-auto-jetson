@@ -6,9 +6,12 @@ name: CI
 on:
   pull_request:
     branches: [main, 'aa/**']
-    # `edited` covers a retarget (base branch change) with no new commit, so the
-    # validators rerun against the new base.
-    types: [opened, synchronize, reopened, edited]
+    # No `edited`: it cancels and restarts the whole run (including the 600 s ipc bench when it
+    # applies) on every title/body edit, and the validators always come from `main` now, so a
+    # retarget no longer changes what they check. After retargeting a PR, close and reopen it or
+    # push a commit to rerun CI. Do not "fix" this with job-level `if:` skips: a skipped
+    # required job counts as passing.
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
   # Manual full run (including ipc-bench-happy-600) on any branch.
@@ -249,10 +252,17 @@ jobs:
   # below accepts only `success`, so `gh workflow run ci.yml --ref <pr-branch>` cannot yield a green
   # ci/provenance-lint without it. A PR that legitimately changes one of these
   # validators or their pinned constants fails here by design: land the validator change on its
-  # own first (explicit owner review), then rebase the data change on it.
-  # RESIDUAL: this workflow file is itself taken from the PR, so a PR can edit or delete this
-  # job. Anything under .github/ needs owner review; enforcing it needs pull_request_target or a
-  # ruleset, not done here.
+  # own first (explicit owner review), then rebase the data change on it. That order does not
+  # work when a validator's pinned constant and the data it checks must change together
+  # (check_manifest.py + deps/manifest.lock): make the change backward compatible, accept a red
+  # main between two merges, or use an admin bypass.
+  # RESIDUAL: workflow files come from the PR, so a PR can edit or delete these jobs, and can
+  # ADD a new workflow under .github/workflows/ with a job named ci/provenance-lint. Anything
+  # under .github/workflows/ needs owner review; enforcing it needs pull_request_target or a
+  # ruleset, not done here. The workflow_dispatch closure (a dispatch on an old PR branch cannot
+  # turn the gate green) additionally relies on the ruleset's strict "require branches to be up
+  # to date" setting: an old PR branch carries the old gate until main is merged into it, and
+  # turning strict off reopens that.
   base-validators:
     name: ci/base-validators
     runs-on: ubuntu-24.04
@@ -261,7 +271,9 @@ jobs:
       - name: Check out the default branch (validator code)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          # Literal: an empty `ref` would make actions/checkout silently fall back to the
+          # event ref (the PR merge commit).
+          ref: main
           path: base
           persist-credentials: false
       - name: Check out the tree under test (data only)
@@ -280,6 +292,11 @@ jobs:
           }
           base="$GITHUB_WORKSPACE/base"
           pr="$GITHUB_WORKSPACE/pr"
+          # The validator checkout must really be main: on branch main, at the fetched origin/main.
+          [ "$(/usr/bin/git -C "$base" symbolic-ref --short HEAD)" = main ] \
+            || { echo "validator checkout is not on branch main"; exit 1; }
+          [ "$(/usr/bin/git -C "$base" rev-parse HEAD)" = "$(/usr/bin/git -C "$base" rev-parse refs/remotes/origin/main)" ] \
+            || { echo "validator checkout is not at origin/main"; exit 1; }
           cd "$pr"
           run_base "$base/tools/deps/check_manifest.py" --lock "$pr/deps/manifest.lock"
           run_base "$base/tools/provenance/check.py" --root "$pr"

@@ -24,6 +24,8 @@ WORKFLOW = ROOT / '.github' / 'workflows' / 'ci.yml'
 
 
 def check(condition: bool, message: str, detail: str = '') -> None:
+    # `detail` is only ever subprocess output or a script body, never workflow step data (those
+    # dicts carry `persist-credentials`, which CodeQL treats as a secret source when logged).
     if not condition:
         print(f'FAIL: {message}\n{detail}')
         raise SystemExit(1)
@@ -42,25 +44,29 @@ def main() -> int:
     check(trusted is not None, 'ci.yml has no separate `base-validators` job for the trusted validators')
     check('needs' not in trusted, 'the trusted job must not depend on a job that runs PR code first')
     check('if' not in trusted, 'the trusted job must run on EVERY event (pull_request, push, workflow_dispatch): '
-          'a skipped base-validators job is the workflow_dispatch bypass', str(trusted.get('if')))
+          'a skipped base-validators job is the workflow_dispatch bypass')
     triggers = doc.get('on', doc.get(True))
     check({'pull_request', 'push', 'workflow_dispatch'} <= set(triggers), 'unexpected trigger set', str(triggers))
-    check(set(triggers['pull_request'].get('types', [])) >= {'opened', 'synchronize', 'reopened', 'edited'},
-          'pull_request must rerun on retarget (types must include edited)', str(triggers['pull_request']))
+    pr_types = set(triggers['pull_request'].get('types', []))
+    check(pr_types == {'opened', 'synchronize', 'reopened'},
+          'pull_request types must be exactly opened/synchronize/reopened: `edited` restarts full CI on every '
+          'title/body edit (retarget: close+reopen or push), and no job-level `if:` skip may replace it')
     steps = trusted['steps']
     runs = [s for s in steps if 'run' in s]
     uses = [s for s in steps if 'uses' in s]
     check(len(runs) == 1 and steps[-1] is runs[0], 'exactly one run step, and it comes last (after the checkouts)')
     check(all(s['uses'].startswith('actions/checkout@') for s in uses), 'only the pinned checkout action may precede it')
     refs = {(s.get('with') or {}).get('path'): (s.get('with') or {}).get('ref') for s in uses}
-    check(refs.get('base') == '${{ github.event.repository.default_branch }}' and refs.get('pr') is None,
-          'validator code must always come from the default branch (not the PR base ref, which can be an '
-          'author-pushable aa/** branch); the tree under test is checked out separately as data', str(refs))
+    check(refs.get('base') == 'main' and refs.get('pr') is None,
+          'validator code must come from the literal ref `main` (not the PR base ref, which can be an '
+          'author-pushable aa/** branch, and not an expression that could be empty: actions/checkout then '
+          'silently falls back to the event ref); the tree under test is checked out separately as data')
     check('pull_request' not in json.dumps(uses) and 'head' not in json.dumps(refs),
-          'validator checkout must not reference PR-controlled refs', json.dumps(uses))
+          'validator checkout must not reference PR-controlled refs')
     script = runs[0]['run']
     for needle in ('/usr/bin/env -i', '/usr/bin/python3', '-B -s -E', 'tools/deps/check_manifest.py',
-                   'tools/provenance/check.py', 'tools/tls/scan.py'):
+                   'tools/provenance/check.py', 'tools/tls/scan.py', 'symbolic-ref --short HEAD',
+                   'refs/remotes/origin/main'):
         check(needle in script, f'trusted run step is missing {needle!r}', script)
     for forbidden in ('GITHUB_ENV', 'GITHUB_PATH', 'source ', '. "$pr', 'tools/provenance/check.sh', 'bash "$pr'):
         check(forbidden not in script, f'trusted run step must not use {forbidden!r}', script)
@@ -116,11 +122,26 @@ def main() -> int:
         for d in (base, pr):
             d.mkdir(parents=True)
             subprocess.run(f'git -C {ROOT} archive HEAD | tar -x -C {d}', shell=True, check=True)
+        # The base dir must look like actions/checkout of `main`: on branch main at origin/main.
+        git = ['git', '-C', str(base), '-c', 'user.name=t', '-c', 'user.email=t@example.invalid']
+        subprocess.run([*git, 'init', '-q', '-b', 'main'], check=True)
+        subprocess.run([*git, 'add', '-A'], check=True, capture_output=True)
+        subprocess.run([*git, 'commit', '-q', '-m', 'base'], check=True, capture_output=True)
+        subprocess.run([*git, 'update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
         env['GITHUB_WORKSPACE'] = str(tmp / 'ws2')
         done = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script], env=env,
                               capture_output=True, text=True, check=False, cwd=tmp)
         check(done.returncode == 0 and 'provenance-check: PASS' in done.stdout and 'tls-key-scan: PASS' in done.stdout,
               'the validators did not really run under a poisoned shell', done.stdout + done.stderr)
+        # A validator checkout that is not main (the silent fallback to the event ref) must fail,
+        # however good the validators are.
+        env['GITHUB_WORKSPACE'] = str(tmp / 'ws2')
+        subprocess.run([*git, 'switch', '-q', '-c', 'event-ref'], check=True)
+        done = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script], env=env,
+                              capture_output=True, text=True, check=False, cwd=tmp)
+        check(done.returncode != 0 and 'not on branch main' in done.stdout,
+              'a validator checkout on another ref must fail the trusted job', done.stdout + done.stderr)
+        subprocess.run([*git, 'switch', '-q', 'main'], check=True)
     print('ci workflow trust test: PASS')
     return 0
 
