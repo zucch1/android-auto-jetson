@@ -1045,6 +1045,94 @@ TEST(ConsumerDecodeAdmission, DuplicateLiveTimestampRejected) {
 // so the lifecycle is deterministic and never races the pipeline.
 // ---------------------------------------------------------------------------
 
+TEST(ConsumerDecodeCorrelation, SlowFirstDecodeReportsLossBeforeAndAfterPull) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point submitted_at{};
+    // Exercise both expiry at pump entry and a first pull crossing the bound.
+    for (const bool blocking_pull : {false, true}) {
+        DecodeSessionState state;
+        for (std::uint64_t i = 0; i < 90; ++i) {
+            const auto ts = kTimestampBaseNs + i * kFramePeriodNs;
+            ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts, i == 0, submitted_at));
+            state.accept_timestamp(ts);
+            state.record_correlation(i, i + 100, ts, submitted_at);
+        }
+        if (blocking_pull) {
+            ASSERT_TRUE(state.check_pump(submitted_at + std::chrono::seconds{4}));
+        }
+        // Inject the recorded slow-first-output shape, without sleeping or
+        // touching the PTS: the first sample arrives after nine seconds.
+        const auto arrived_at = submitted_at + std::chrono::seconds{9};
+        const auto pumped = state.check_pump(arrived_at);
+        ASSERT_FALSE(pumped) << "accepted frames disappeared behind successful pumping";
+        EXPECT_EQ(pumped.error().code(), ErrorCode::ipc_consumer_rejected);
+        EXPECT_EQ(state.pending_count(), 0U);
+        EXPECT_TRUE(state.awaiting_idr);
+        EXPECT_EQ(state.frames_lost_retention, 90U);
+        EXPECT_EQ(state.frames_lost_capacity, 0U);
+        EXPECT_FALSE(state.take_correlation(kTimestampBaseNs));
+        // One notification per loss episode; the caller may continue pumping.
+        EXPECT_TRUE(state.check_pump(arrived_at));
+    }
+}
+
+TEST(ConsumerDecodeCorrelation, SubmitExpiryNoticeSurvivesRecoveryIdr) {
+    const DecodeSessionState::Clock::time_point t0{};
+    DecodeSessionState state;
+    state.accept_timestamp(kTimestampBaseNs);
+    state.record_correlation(1, 10, kTimestampBaseNs, t0);
+    const auto boundary = t0 + DecodeSessionState::kCorrelationRetention;
+    EXPECT_TRUE(state.check_pump(boundary - std::chrono::nanoseconds{1}));
+    EXPECT_EQ(state.pending_count(), 1U);
+    const auto recovery_pts = kTimestampBaseNs + kFramePeriodNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, recovery_pts, true, boundary));
+    state.accept_timestamp(recovery_pts);
+    state.record_correlation(2, 20, recovery_pts, boundary);
+    EXPECT_FALSE(state.awaiting_idr);
+    const auto notice = state.check_pump(boundary);
+    ASSERT_FALSE(notice);
+    EXPECT_EQ(notice.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(state.frames_lost_retention, 1U);
+    EXPECT_FALSE(state.take_correlation(kTimestampBaseNs));
+    const auto recovered = state.take_correlation(recovery_pts);
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(recovered->frame, 2U);
+    EXPECT_EQ(recovered->sequence, 20U);
+    EXPECT_EQ(recovered->timestamp_ns, recovery_pts);
+    EXPECT_TRUE(state.check_pump(boundary));
+    EXPECT_EQ(state.frames_lost_retention, 1U);
+}
+
+TEST(ConsumerDecodeCorrelation, CapacityAndEosLossHaveSeparateAccounting) {
+    const DecodeSessionState::Clock::time_point now{};
+    DecodeSessionState state;
+    for (std::size_t i = 0; i < DecodeSessionState::kMaxPendingCorrelations; ++i) {
+        const auto ts = kTimestampBaseNs + i * kFramePeriodNs;
+        ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts, i == 0, now));
+        state.accept_timestamp(ts);
+        state.record_correlation(i, i, ts, now);
+    }
+    const auto recovery_pts = kTimestampBaseNs
+        + DecodeSessionState::kMaxPendingCorrelations * kFramePeriodNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, recovery_pts, true, now));
+    state.accept_timestamp(recovery_pts);
+    state.record_correlation(900, 901, recovery_pts, now);
+    const auto capacity_notice = state.check_pump(now);
+    ASSERT_FALSE(capacity_notice);
+    EXPECT_EQ(capacity_notice.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(state.frames_lost_capacity, DecodeSessionState::kMaxPendingCorrelations);
+    EXPECT_EQ(state.frames_lost_retention, 0U);
+    EXPECT_EQ(state.pending_count(), 1U);
+    state.finish_correlations();
+    const auto eos_notice = state.check_pump(now);
+    ASSERT_FALSE(eos_notice);
+    EXPECT_EQ(eos_notice.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(state.frames_lost_eos, 1U);
+    state.finish_correlations();
+    EXPECT_TRUE(state.check_pump(now));
+    EXPECT_EQ(state.frames_lost_eos, 1U);
+}
+
 TEST(ConsumerDecodeCorrelation, DroppedAuExpiresAndRequiresIdr) {
     using Clock = DecodeSessionState::Clock;
     const Clock::time_point submitted_at{};

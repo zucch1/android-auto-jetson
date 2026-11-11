@@ -84,6 +84,14 @@ struct DecodeSessionState final {
     // and no non-IDR submission acquires a mapping.
     bool awaiting_idr{};
 
+    // Constant-space accounting for accepted AUs sacrificed without output.
+    // Notice survives an immediate recovery IDR (and coalesces episodes until
+    // pump observes it); counters retain the exact AU totals for the session.
+    std::uint64_t frames_lost_retention{};
+    std::uint64_t frames_lost_capacity{};
+    std::uint64_t frames_lost_eos{};
+    bool loss_unreported{};
+
     // Terminal runtime failure latch (contract on Decode.hpp): the first
     // fatal error observed after open() is remembered and every later
     // active-session operation fails with it without touching the pipeline.
@@ -164,12 +172,13 @@ struct DecodeSessionState final {
     // is NOT reset (no timestamp reset at IDR recovery) and nothing here
     // switches backends or rebuilds pipelines.
     void invalidate_correlations() noexcept {
+        loss_unreported = loss_unreported || !pending.empty();
         pending.clear();
         awaiting_idr = true;
     }
 
     // Drop undelivered correlations without changing the resync state: used
-    // when appsink reaches EOS (nothing can match anymore) and on close().
+    // on terminal failure/close and after EOS loss has been accounted for.
     void clear_correlations() noexcept {
         pending.clear();
     }
@@ -180,8 +189,26 @@ struct DecodeSessionState final {
     // expired metadata).
     void expire_stale_correlations(Clock::time_point now) noexcept {
         if (correlations_expired(now)) {
+            frames_lost_retention += pending.size();
             invalidate_correlations();
         }
+    }
+
+    // Shared pump gate; the explicit clock also covers a blocking pull.
+    [[nodiscard]] core::Result<void> check_pump(Clock::time_point now) {
+        expire_stale_correlations(now);
+        if (loss_unreported) {
+            loss_unreported = false;
+            return core::Result<void>{Error{ErrorCode::ipc_consumer_rejected}};
+        }
+        return core::Result<void>{};
+    }
+
+    // EOS can strand accepted AUs too; report those independently of expiry.
+    void finish_correlations() noexcept {
+        frames_lost_eos += pending.size();
+        loss_unreported = loss_unreported || !pending.empty();
+        clear_correlations();
     }
 
     // Full pre-submit correlation gate, mutating, run before the push. Order
@@ -208,6 +235,7 @@ struct DecodeSessionState final {
             return core::Result<void>{Error{ErrorCode::invalid_argument}};
         }
         if (pending.size() >= kMaxPendingCorrelations && feed_admission_allows(load)) {
+            frames_lost_capacity += pending.size();
             invalidate_correlations();
         }
         if (awaiting_idr && !idr) {

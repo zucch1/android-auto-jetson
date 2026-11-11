@@ -538,11 +538,22 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         // Retention-bound evaluation during the pump: stale correlations are
         // invalidated (and the session armed for an IDR resync) even when this
         // iteration ends up pulling nothing.
-        impl_->session.expire_stale_correlations(DecodeSessionState::Clock::now());
+        if (auto status = impl_->session.check_pump(DecodeSessionState::Clock::now()); !status) {
+            return core::Result<std::size_t>{status.error()};
+        }
         const std::uint64_t timeout = first_pull ? first_timeout : 0ULL;
         first_pull = false;
         GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(impl_->appsink), timeout);
         const auto pull_returned = DecodeSessionState::Clock::now();
+        // A blocking pull can cross retention even when it returns no sample.
+        // Release any late sample before surfacing the recoverable loss notice.
+        if (auto status = impl_->session.check_pump(pull_returned); !status) {
+            if (sample != nullptr) {
+                ++impl_->report.frames_unmatched;
+                gst_sample_unref(sample);
+            }
+            return core::Result<std::size_t>{status.error()};
+        }
         if (sample == nullptr) {
             // The pull may have raced the error message; re-check before returning.
             if (auto failed = impl_->bus_error(); !failed.has_value()) {
@@ -550,16 +561,13 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
             }
             if (gst_app_sink_is_eos(GST_APP_SINK(impl_->appsink))) {
                 // EOS: undelivered correlations can never be matched now.
-                impl_->session.clear_correlations();
+                impl_->session.finish_correlations();
+                if (auto status = impl_->session.check_pump(pull_returned); !status) {
+                    return core::Result<std::size_t>{status.error()};
+                }
             }
             break;
         }
-        // The first pull may have blocked up to `wait`: re-evaluate the
-        // retention bound BEFORE correlating this sample, so a long pump(wait)
-        // never delivers expired metadata. Expired/invalidated/late samples
-        // find no mapping and are released without a callback.
-        impl_->session.expire_stale_correlations(DecodeSessionState::Clock::now());
-
         GstCaps* caps = gst_sample_get_caps(sample);
         GstBuffer* buffer = gst_sample_get_buffer(sample);
         GstVideoInfo info;
@@ -681,7 +689,14 @@ bool DecodeHelper::closed() const noexcept {
 
 const DecodeReport& DecodeHelper::report() const noexcept {
     static const DecodeReport empty{};
-    return impl_ ? impl_->report : empty;
+    if (!impl_) {
+        return empty;
+    }
+    impl_->report.frames_lost_retention = impl_->session.frames_lost_retention;
+    impl_->report.frames_lost_capacity = impl_->session.frames_lost_capacity;
+    impl_->report.frames_lost_eos = impl_->session.frames_lost_eos;
+    impl_->report.awaiting_idr = impl_->session.awaiting_idr;
+    return impl_->report;
 }
 
 } // namespace aa::consumer
