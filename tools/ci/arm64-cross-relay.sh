@@ -57,6 +57,7 @@
 #                           one follows the same marker rule and, if it exists, must be owned by you and not
 #                           group/world-writable. At exit everything except logs/ is removed and the scratch
 #                           path is printed; a default scratch with no logs disappears entirely.
+#   AA_RELAY_TRUSTED_REV    independently reviewed full SHA for bootstrap only; default origin/main.
 #   AA_RELAY_SANDBOX        same as --sandbox
 #   AA_RELAY_IMAGE          local container image (cmake, ninja, aarch64 g++, python3) for podman/docker
 #   AA_RELAY_EXTRA_RO       colon-separated extra host paths to expose read-only to bwrap/containers
@@ -70,6 +71,35 @@ set -euo pipefail
 repo_slug=zucch1/android-auto-jetson
 repo_owner=${repo_slug%%/*}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Establish trust BEFORE sourcing any dependency or selecting a sandbox. The initial
+# executable itself must be installed from an independently reviewed, pinned revision
+# (see docs/CONTRIBUTING.md); a self-check cannot authenticate a malicious entrypoint.
+export GIT_NO_REPLACE_OBJECTS=1
+repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
+trusted_revision=${AA_RELAY_TRUSTED_REV:-}
+if [ -n "$trusted_revision" ]; then
+    [[ "$trusted_revision" =~ ^[0-9a-f]{40}$ ]] || {
+        echo "error: AA_RELAY_TRUSTED_REV must be an independently reviewed full commit SHA" >&2
+        exit 65
+    }
+else
+    git -C "$repo_root" fetch origin main --quiet || {
+        echo "error: cannot refresh trusted origin/main" >&2
+        exit 66
+    }
+    trusted_revision=$(git -C "$repo_root" rev-parse 'origin/main^{commit}')
+fi
+# Compare raw bytes, not git diff (filters, attributes and stat caches are irrelevant).
+# The exporter is also executed on the host, so it belongs to the same trust boundary.
+for executable in arm64-cross-relay.sh relay-sandbox-lib.sh relay-export-tree.py; do
+    local_file=$script_dir/$executable
+    expected=$(git -C "$repo_root" cat-file blob "$trusted_revision:tools/ci/$executable" | sha256sum) || exit 65
+    actual=$(sha256sum < "$local_file") || exit 65
+    if [ -L "$local_file" ] || [ "$expected" != "$actual" ]; then
+        echo "error: untrusted relay executable $executable; must match $trusted_revision" >&2
+        exit 65
+    fi
+done
 # shellcheck source=tools/ci/relay-sandbox-lib.sh
 . "$script_dir/relay-sandbox-lib.sh"
 
@@ -127,8 +157,6 @@ echo "relay: sandbox backend=$sandbox_backend" >&2
 
 # Test hook (tests/ci/relay_sandbox_test.py): no network, no real sysroot validator or build.
 test_mode=${AA_RELAY_TEST_MODE:-}
-
-repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
 
 # Cleanup is installed BEFORE anything is created, so no early exit (bad argument, failed fetch,
 # missing commit, PR binding or author refusal) can leak a scratch directory.
@@ -249,9 +277,6 @@ git -C "$repo_root" cat-file -e "${head_sha}^{commit}" || {
     echo "error: commit $head_sha not present locally or on origin" >&2
     exit 66
 }
-if [ -z "$test_mode" ] && ! git -C "$repo_root" diff --quiet "$base_sha" -- tools/ci/arm64-cross-relay.sh tools/ci/relay-sandbox-lib.sh 2>/dev/null; then
-    echo "warning: this relay script differs from origin/main; run it from a reviewed checkout of main, not the PR branch" >&2
-fi
 
 # The PR number binds the SHA and the author before any untrusted code is touched.
 if [ -n "$pr_number" ]; then
@@ -350,6 +375,12 @@ else
     if [ "$overall_rc" -eq 0 ]; then
         run_sandbox_step 20-build cmake --build --preset jetson-aarch64
     fi
+fi
+# Test hooks replace validation and builds; their results are NEVER attestations.
+# Exit before constructing an observed result or entering any production status path.
+if [ -n "$test_mode" ]; then
+    echo "relay: TEST MODE finished; no commit status posted" >&2
+    exit "$overall_rc"
 fi
 completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo "relay: all sandboxed work finished; the status is posted from the trusted shell only now" >&2

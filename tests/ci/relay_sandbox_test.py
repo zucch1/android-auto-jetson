@@ -8,8 +8,8 @@ cmake build; the sandboxed step is a probe command) with a fake `gh` first on PA
   has only the scrubbed environment, no network (not even host loopback), a read-only
   sysroot, and no .git link back to the owner's repository;
 * the trusted step runs from the base checkout with a scrubbed environment;
-* the status post runs OUTSIDE the sandbox and only AFTER the sandbox exited, keyed to the
-  SHA, with state following the sandbox exit code;
+* test-mode invocations never post a commit status, on either success or failure;
+* all host-executed relay files match a trusted revision before dependencies are sourced;
 * a non-owner PR author is refused before any untrusted code runs or any status is posted;
 * with no usable backend the selector fails closed;
 * review fixes (PR #92): inherited file, directory and socket fds never reach the sandbox and
@@ -166,6 +166,7 @@ def run_relay(tmp: Path, sha: str, *, probe: str, pr: str | None = None, author:
         'AA_GOOGLETEST_ARCHIVE': str(archive),
         'AA_RELAY_SCRATCH': str(scratch),
         'AA_RELAY_TEST_MODE': '1',
+        'AA_RELAY_TRUSTED_REV': TRUSTED_SHA,
         'AA_RELAY_SANDBOX': backend,
         'AA_RELAY_TEST_TRUSTED_CMD': 'echo "TRUSTED-CWD=$(pwd)"; echo "TRUSTED-HOME=$HOME"; '
                                      '[ -z "${GH_TOKEN:-}${SSH_AUTH_SOCK:-}" ] || { echo TRUSTED-LEAK; exit 1; }; '
@@ -289,7 +290,7 @@ def run_container_tests(sha: str) -> None:
             shutil.rmtree(tmp / 'scratch' / 'pr-tree', ignore_errors=True)
 
     # 6b. Real docker: a container that ignores SIGTERM must be gone after the step timeout, and
-    #     the failure status must be posted only after that.
+    #     test mode must still post nothing.
     image = usable_docker_image()
     if image is None:
         print('SKIP (container section): no usable docker daemon + local image with sh/sleep')
@@ -302,11 +303,10 @@ def run_container_tests(sha: str) -> None:
                 tmp, sha, backend='docker', probe='trap "" TERM; while :; do sleep 1; done',
                 env_extra={'AA_RELAY_IMAGE': image, 'AA_RELAY_STEP_TIMEOUT': '3', 'AA_RELAY_KILL_AFTER': '2',
                            'AA_RELAY_CONTAINER_PREFIX': prefix})
-            check(rc == 1 and 'state=failure' in gh_log, 'a timed-out container step must post failure', err + gh_log)
+            check(rc == 1 and gh_log == '', 'a timed-out test container must not post a status', err + gh_log)
             check(docker_names(prefix) == '', 'the container survived its client being killed (docker kill/rm missing)',
                   docker_names(prefix))
-            check(err.index('sandbox exited step=10-sandbox-probe') < err.index('GH-CALL'),
-                  'status posted before the container was confirmed gone', err)
+            check('sandbox exited step=10-sandbox-probe' in err, 'container exit was not confirmed', err)
         finally:
             leftovers = docker_names(prefix)
             if leftovers:
@@ -337,16 +337,41 @@ def run_container_tests(sha: str) -> None:
                 subprocess.run(['docker', 'rm', '-f', *leftovers.split()], capture_output=True, check=False)
 
 
+def run_bootstrap_tests() -> None:
+    # These run before backend detection, so trust enforcement is tested even
+    # on CI runners without usable user namespaces or a container daemon.
+    for pin in (TRUSTED_SHA, ''):
+        for name in ('arm64-cross-relay.sh', 'relay-sandbox-lib.sh', 'relay-export-tree.py'):
+            path = ROOT / 'tools' / 'ci' / name
+            original = path.read_bytes()
+            with tempfile.TemporaryDirectory(prefix='relay-trust-test-') as t:
+                marker = Path(t) / 'executed'
+                # A compromised sourced library must never execute, even in test mode.
+                path.write_bytes(original + f'\necho unreviewed > {shlex.quote(str(marker))}\n'.encode())
+                try:
+                    done = subprocess.run(['bash', str(RELAY)], capture_output=True, text=True,
+                                          env={**os.environ, 'AA_RELAY_TRUSTED_REV': pin,
+                                               'AA_RELAY_TEST_MODE': '1'}, check=False)
+                    check(done.returncode == 65 and 'untrusted relay executable' in done.stderr,
+                          f'{name}: divergence from pin/main must fail closed', done.stderr)
+                    check(not marker.exists(), 'unreviewed host code executed before refusal')
+                finally:
+                    path.write_bytes(original)
+    print('relay bootstrap: 6 divergence cases PASS (pin and origin/main)')
+
+
 def main() -> int:
+    run_bootstrap_tests()
     backend = detect_backend()
     sha = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], capture_output=True, text=True,
                          check=True).stdout.strip()
     print(f'sandbox backend under test: {backend}')
 
-    # 1. Passing sandbox: isolation holds, status posted after the sandbox, outside it.
+    # 1. Passing sandbox: isolation holds, test mode posts nothing.
     with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
         tmp = Path(t)
         rc, err, gh_log = run_relay(tmp, sha, probe=PROBE, backend=backend, leak_fds=True)
+        check(rc == 0, 'passing relay setup failed', err)
         sandbox_log = read_step_log(tmp, '10-sandbox-probe')
         check(rc == 0, 'relay with a passing probe must exit 0', err + sandbox_log)
         check('SANDBOX-OK' in sandbox_log and 'SANDBOX-LEAK' not in sandbox_log,
@@ -364,27 +389,41 @@ def main() -> int:
         cwd = next(line for line in trusted_log.splitlines() if line.startswith('TRUSTED-CWD=')).split('=', 1)[1]
         check(cwd.endswith('/scratch/base'), 'trusted step must run from the base checkout', trusted_log)
         check('SANDBOX_OK' not in trusted_log and 'pr-tree' not in cwd, 'trusted step ran in the PR tree', trusted_log)
-        # Status post: exactly once, outside the sandbox, after the sandbox exited, keyed to the SHA.
-        check(gh_log.count('args=') == 1, 'expected exactly one gh status post', gh_log)
-        check(f'statuses/{sha}' in gh_log and 'state=success' in gh_log and 'context=ci/arm64-cross-build' in gh_log,
-              'status post is not keyed to the SHA / success / required context', gh_log)
-        check('outside_marker_visible=yes' in gh_log and f'home={tmp / "home"}' in gh_log,
-              'gh must run in the owner environment, outside the sandbox', gh_log)
-        exited = err.index('sandbox exited step=10-sandbox-probe rc=0')
-        posted = err.index('GH-CALL')
-        check(exited < posted, 'the status was posted before the sandbox exited', err)
+        check(gh_log == '' and 'TEST MODE finished; no commit status posted' in err,
+              'passing test mode must never post a production status', err + gh_log)
         check(not (tmp / 'scratch' / 'pr-tree').exists(), 'untrusted PR tree was not cleaned up')
         check(not (tmp / 'sysroot' / 'rootfs' / 'probe-write').exists()
               and (tmp / 'googletest.tar.gz').read_bytes() == b'x'
               and (tmp / 'sysroot' / 'manifest.json').read_text(encoding='utf-8') == '{}\n',
               'the sysroot, manifest or archive was modified from inside the sandbox')
 
-    # 2. A failing sandboxed build yields a failure status (the exit code decides, not the log text).
+    # 2. A failing test build returns failure without posting a status.
     with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
         tmp = Path(t)
         rc, err, gh_log = run_relay(tmp, sha, probe='echo SANDBOX-OK; exit 3', backend=backend)
         check(rc == 1, 'relay must exit non-zero when the sandboxed step fails', err)
-        check('state=failure' in gh_log and 'state=success' not in gh_log, 'failure must be posted as failure', gh_log)
+        check(gh_log == '', 'failing test mode must never post a production status', gh_log)
+
+    # Nonempty false-looking mode values also select probes; default true hooks
+    # must not turn those probes into production acceptance receipts.
+    for mode in ('1', '0', 'false'):
+        with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+            rc, err, gh_log = run_relay(Path(t), sha, probe='true', backend=backend,
+                                        env_extra={'AA_RELAY_TEST_MODE': mode},
+                                        drop_env=('AA_RELAY_TEST_TRUSTED_CMD', 'AA_RELAY_TEST_SANDBOX_CMD'))
+            check(rc == 0 and gh_log == '', f'default hooks in mode {mode} must not post', err + gh_log)
+
+    # Production still reports real validation failure outside the sandbox. This
+    # fixture deliberately has no validator; test hooks must be ignored without mode.
+    with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+        tmp = Path(t)
+        rc, err, gh_log = run_relay(tmp, sha, probe='true', backend=backend,
+                                    drop_env=('AA_RELAY_TEST_MODE',))
+        check(rc == 1 and gh_log.count('args=') == 1 and 'state=failure' in gh_log
+              and 'context=ci/arm64-cross-build' in gh_log and f'statuses/{sha}' in gh_log,
+              'production validator failure must post one exact-SHA failure', err + gh_log)
+        check('outside_marker_visible=yes' in gh_log and f'home={tmp / "home"}' in gh_log,
+              'production status must run outside the sandbox', gh_log)
 
     # 3. Non-owner PR author: refused before any untrusted code runs, nothing posted.
     with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
@@ -615,4 +654,24 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    # A private repository pins the current source bytes without trusting the PR's
+    # production invocation. All test state lives under TMPDIR (tmpfs locally).
+    source = ROOT
+    with tempfile.TemporaryDirectory(prefix='relay-repo-test-') as t:
+        ROOT = Path(t)
+        scripts = ROOT / 'tools' / 'ci'
+        scripts.mkdir(parents=True)
+        for name in ('arm64-cross-relay.sh', 'relay-sandbox-lib.sh', 'relay-export-tree.py'):
+            shutil.copy2(source / 'tools' / 'ci' / name, scripts / name)
+        def git(*args):
+            return subprocess.run(['git', '-C', str(ROOT), *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git('init', '-b', 'main')
+        git('add', '.')
+        git('-c', 'user.name=Relay Test', '-c', 'user.email=relay@example.invalid',
+            'commit', '-m', 'reviewed fixture')
+        TRUSTED_SHA = git('rev-parse', 'HEAD')
+        git('remote', 'add', 'origin', str(ROOT))
+        RELAY = scripts / 'arm64-cross-relay.sh'
+        LIB = scripts / 'relay-sandbox-lib.sh'
+        sys.exit(main())

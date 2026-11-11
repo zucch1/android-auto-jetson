@@ -191,6 +191,41 @@ export AA_SYSROOT_ROOTFS=... AA_SYSROOT_MANIFEST=... AA_GOOGLETEST_ARCHIVE=...
 tools/ci/arm64-cross-relay.sh [--sandbox auto|podman|bwrap|docker] [--allow-author LOGIN] <head-sha> [pr-number]
 ```
 
+The initial executable must come from an **independently reviewed full commit SHA**.
+Never run a PR checkout's relay with owner credentials. For the #92 bootstrap (main
+still has the unsafe relay), the owner must review the exact raw bytes of
+`arm64-cross-relay.sh`, `relay-sandbox-lib.sh` and `relay-export-tree.py`, then install
+that pinned set in a separate owner-only repository. Choose the SHA explicitly after
+review; do not derive it from a mutable PR ref at execution time:
+
+```bash
+# Set REVIEWED_SHA to the full 40-character SHA you independently reviewed.
+: "${REVIEWED_SHA:?set the independently reviewed SHA}"
+install_dir=$(mktemp -d "${TMPDIR:-/var/tmp}/aa-trusted-relay.XXXXXXXXXX")
+git -C "$install_dir" init
+git -C "$install_dir" remote add origin https://github.com/zucch1/android-auto-jetson.git
+git -C "$install_dir" fetch origin main "$REVIEWED_SHA"
+mkdir -p "$install_dir/tools/ci"
+for file in arm64-cross-relay.sh relay-sandbox-lib.sh relay-export-tree.py; do
+  git --no-replace-objects -C "$install_dir" cat-file blob "$REVIEWED_SHA:tools/ci/$file" > "$install_dir/tools/ci/$file" || exit 1
+done
+AA_RELAY_TRUSTED_REV="$REVIEWED_SHA" bash "$install_dir/tools/ci/arm64-cross-relay.sh" <head-sha> <pr-number>
+```
+
+The pin is an owner trust decision, not evidence that a commit was reviewed. It
+covers the exporter as well as the executable and sourced library. After installation
+on main, omit `AA_RELAY_TRUSTED_REV`: the relay requires a successful refresh of
+`origin/main` and exact raw-byte matches of all three local files **before sourcing
+anything**. Divergence, missing files, symlinks or an invalid pin stop the run; there is
+no warning-only fallback. The entrypoint cannot authenticate itself if it was replaced
+by malicious code: the separate, reviewed installation is essential. Use a trusted
+shell/environment (no PR-provided `BASH_ENV`, PATH tools or Git configuration).
+
+`AA_RELAY_TEST_MODE` runs probes instead of sysroot validation/builds and exits before
+all status-posting code, on success and failure. It can never publish a production
+`ci/arm64-cross-build` status. Tests install their own isolated, pinned fixture;
+that fixture is never used for a real attestation.
+
 Sandbox backend: `auto` picks rootless `podman` (needs `AA_RELAY_IMAGE`, a local image
 with cmake, ninja, aarch64 g++ and python3), then `bwrap` (bubblewrap over the host's
 read-only `/usr`; expose a toolchain installed elsewhere with `AA_RELAY_EXTRA_RO=/path:/path2`),
@@ -198,7 +233,8 @@ then `docker` (also needs `AA_RELAY_IMAGE`; its daemon is root-equivalent, so it
 If none is usable the relay stops; there is no unsandboxed mode.
 `tests/ci/relay_sandbox_test.py` (ctest `ci_relay_sandbox`) proves the isolation (including
 leaked fds, the original credential path, mount overlap/order and, when docker plus a local
-image exist, container termination) and the post-after-sandbox ordering with a probe command;
+image exist, container termination), fail-closed bootstrap checks, and suppression of all
+test-mode statuses; a separate production-mode failure checks the status channel;
 `tests/ci/relay_export_test.py` (`ci_relay_export`) proves the filter-free export. Both skip or
 shrink with a reason where no backend works.
 
