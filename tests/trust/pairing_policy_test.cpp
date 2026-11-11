@@ -44,6 +44,37 @@ TEST(PairingPolicy, ApproveOnceThenReconnectAndForget) {
     EXPECT_FALSE(trust::allows_session(store.lookup(identity)));
 }
 
+// Review fix (PR #93, P1): a serial-less wired phone can never authorise a
+// wired session, so it is refused at request time — the user is never
+// prompted for a pairing that cannot work, and nothing is left pending.
+TEST(PairingPolicy, SerialLessWiredCandidateIsRejectedAtRequest) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    test::ManualClock clock;
+    trust::PairingPolicy policy{store, clock};
+
+    trust::WiredIdentity serial_less = test::kWired;
+    serial_less.usb_serial.clear();
+    serial_less.aoa_serial.clear();
+    policy.note_candidate(trust::TransportIdentity{serial_less});
+
+    const aa::core::PairingRequestId request{600};
+    const auto requested = policy.pairing_requested(request);
+    ASSERT_FALSE(requested.has_value());
+    EXPECT_EQ(requested.error().code(), ErrorCode::trust_rejected);
+    EXPECT_EQ(policy.pending_count(), 0U);
+    EXPECT_FALSE(policy.has_pending(request));
+
+    const auto confirmed = policy.pairing_confirmed(request);
+    ASSERT_FALSE(confirmed.has_value());
+    EXPECT_EQ(confirmed.error().code(), ErrorCode::trust_unknown_phone);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file()));
+    EXPECT_EQ(store.lookup(test::identity_of(trust::TransportIdentity{serial_less})),
+              trust::Decision::unknown);
+}
+
 TEST(PairingPolicy, RequestWithoutConfirmLeavesStoreUntouched) {
     test::TempStoreDir dir;
     trust::ApprovedPhoneStore store{dir.file()};
