@@ -162,6 +162,12 @@ core::Result<std::size_t> ControlBusService::cycle(core::Milliseconds idle_inter
     }
     auto message = impl_->connection->read_message();
     if (!message.has_value()) {
+        if (message.error().code() == ErrorCode::transport_message_dropped) {
+            impl_->emitter.emit(DiagnosticEmitted{
+                DiagnosticSeverity::warning, "dbus_message_dropped",
+                impl_->connection->dropped_messages()});
+            return std::size_t{0};
+        }
         return message.error();
     }
     const auto call = dbus_adapter::to_incoming_call(message.value());
