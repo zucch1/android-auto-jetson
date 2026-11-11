@@ -149,3 +149,28 @@ TEST(ConformanceTolerance, DecodePathStillAcceptsCleanSpecBytes) {
         conformancewire::F_E_service_discovery_response_payload);
     EXPECT_TRUE(decoded.has_value());
 }
+
+TEST(ConformanceTolerance, ControlPingRequestRejectsUnknownFields) {
+    const auto clean = bytes_of({0x00, 0x0B, 0x08, 0xB9, 0x60});
+    const auto clean_decoded = proto::decode_ping_request(clean);
+    ASSERT_TRUE(clean_decoded.has_value());
+    EXPECT_EQ(clean_decoded.value().timestamp, 12345);
+
+    // Tag 99 varint (792 = 0x98, 0x06), value 42 (0x2A)
+    const auto with_unknown = bytes_of({0x00, 0x0B, 0x08, 0xB9, 0x60, 0x98, 0x06, 0x2A});
+    const auto unknown_decoded = proto::decode_ping_request(with_unknown);
+    ASSERT_FALSE(unknown_decoded.has_value());
+    EXPECT_EQ(unknown_decoded.error().code(), aa::ErrorCode::protocol_malformed_message);
+}
+
+TEST(ConformanceTolerance, InBandChannelOpenRequestRejectsUnknownFields) {
+    const auto clean = bytes_of({0x00, 0x07, 0x08, 0x01, 0x10, 0x01});
+    const auto clean_decoded = proto::decode_in_band_channel_open_request(clean);
+    ASSERT_TRUE(clean_decoded.has_value());
+    EXPECT_EQ(clean_decoded.value().service.value, 1);
+
+    const auto with_unknown = bytes_of({0x00, 0x07, 0x08, 0x01, 0x10, 0x01, 0x98, 0x06, 0x2A});
+    const auto unknown_decoded = proto::decode_in_band_channel_open_request(with_unknown);
+    ASSERT_FALSE(unknown_decoded.has_value());
+    EXPECT_EQ(unknown_decoded.error().code(), aa::ErrorCode::protocol_malformed_message);
+}

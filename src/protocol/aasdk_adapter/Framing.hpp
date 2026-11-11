@@ -9,6 +9,9 @@
 #include <aa/core/Result.hpp>
 #include <aa/protocol/Messages.hpp>
 
+#include "UnknownFields.hpp"
+
+#include <google/protobuf/message.h>
 #include <google/protobuf/message_lite.h>
 
 #include <cstddef>
@@ -53,6 +56,29 @@ control_body(std::span<const std::byte> payload, ControlMessageId expected) {
     }
     if (!message.IsInitialized()) {
         return malformed();
+    }
+    return {};
+}
+
+// Overload for full google::protobuf::Message types: enforce unknown field rejection.
+[[nodiscard]] inline core::Result<void>
+parse_body(google::protobuf::Message &message,
+           std::span<const std::byte> body,
+           std::span<const int> known_tags = {},
+           ExtensionPolicy policy = kStrictExtensionPolicy) {
+    if (body.size() > kMaxProtoBodyBytes) {
+        return malformed();
+    }
+    if (!message.ParseFromArray(body.data(), static_cast<int>(body.size()))) {
+        return malformed();
+    }
+    if (!message.IsInitialized()) {
+        return malformed();
+    }
+    if (message.GetReflection()->GetUnknownFields(message).field_count() > 0) {
+        if (classify_unknown_fields(message, known_tags).rejected_under(policy)) {
+            return malformed();
+        }
     }
     return {};
 }

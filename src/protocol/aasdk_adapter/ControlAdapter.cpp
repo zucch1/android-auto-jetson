@@ -190,6 +190,9 @@ decode_in_band_channel_open_request(std::span<const std::byte> payload) {
         !wire.has_service_id() || !ServiceKey{wire.service_id()}) {
         return aasdk_adapter::malformed();
     }
+    if (wire.GetReflection()->GetUnknownFields(wire).field_count() > 0) {
+        return aasdk_adapter::malformed();
+    }
     return ChannelOpenRequest{wire.has_priority() ? wire.priority() : 0,
                               ServiceKey{wire.service_id()}};
 }
