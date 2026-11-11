@@ -19,7 +19,7 @@ add_library(aa_system_helper STATIC
     src/helper/BusClient.cpp src/helper/crypto_adapter/Crypto.cpp
     src/helper/bluez_adapter/Platform.cpp src/helper/bluez_adapter/Peers.cpp
     src/helper/bluez_adapter/Callbacks.cpp src/helper/bluez_adapter/Startup.cpp
-    src/helper/bluez_adapter/Continuity.cpp
+    src/helper/bluez_adapter/Continuity.cpp src/helper/bluez_adapter/ManagedPeers.cpp
     src/helper/nm/Files.cpp src/helper/nm/Commands.cpp src/helper/nm/Connection.cpp src/helper/nm/Backend.cpp)
 target_include_directories(aa_system_helper PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aa_system_helper PUBLIC aa_ipc_dbus aa_trust OpenSSL::Crypto aa_aaw_proto)
@@ -108,6 +108,9 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME system_helper_delivery_policy COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/helper/policy_bus.py" "${CMAKE_BINARY_DIR}")
     set_tests_properties(system_helper_delivery_policy PROPERTIES TIMEOUT 30)
+    add_test(NAME system_helper_bond_restart COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/helper/bond_restart.py" "${CMAKE_BINARY_DIR}")
+    set_tests_properties(system_helper_bond_restart PROPERTIES TIMEOUT 20)
     add_test(NAME system_helper_bluez_runtime COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/helper/bluez_runtime.py" "${CMAKE_BINARY_DIR}")
     set_tests_properties(system_helper_bluez_runtime PROPERTIES TIMEOUT 120)
@@ -137,4 +140,11 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME system_helper_cross_smoke_configuration COMMAND "${CMAKE_COMMAND}"
         -DCMAKE_CROSSCOMPILING=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE
         -P "${CMAKE_SOURCE_DIR}/cmake/SystemHelper.cmake")
+    add_executable(aa_helper_security_test tests/helper/security_test.cpp tests/trust/syscall_faults.cpp)
+    target_link_options(aa_helper_security_test PRIVATE -Wl,--wrap=fsync -Wl,--wrap=renameat)
+    target_link_libraries(aa_helper_security_test PRIVATE aa_system_helper GTest::gtest_main)
+    set_target_properties(aa_helper_security_test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES)
+    target_compile_options(aa_helper_security_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME system_helper_security COMMAND dbus-run-session -- $<TARGET_FILE:aa_helper_security_test>)
+    set_tests_properties(system_helper_security PROPERTIES TIMEOUT 20)
 endif()

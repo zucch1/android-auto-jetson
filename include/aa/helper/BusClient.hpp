@@ -19,6 +19,10 @@ public:
     static core::Result<std::unique_ptr<BusClient>> system(trust::ApprovedPhoneStore& store);
     static core::Result<std::unique_ptr<BusClient>> private_bus(const std::string& address,
                                                                trust::ApprovedPhoneStore& store);
+    // Host-only private-bus fixtures can explicitly trust this process's UID.
+    // system() and private_bus() always require a root-owned helper.
+    static core::Result<std::unique_ptr<BusClient>> private_bus_for_test(const std::string& address,
+                                                                       trust::ApprovedPhoneStore& store);
     ~BusClient() override;
     core::Result<Response> call(const Request&, core::Milliseconds, core::CancellationToken) override;
     core::Result<State> status(Action action);

@@ -173,12 +173,17 @@ fully completed external work returns success. Diagnostics reference PhoneId:
 later missing-ID calls use normal store semantics, not indefinite success history.
 Lost replies remain unknown outcomes: this is neither globally exactly-once nor
 crash-durable revocation. NM retains its in-flight rotation latch. BlueZ managed
-identities remain process-lifetime state; after restart unknown bonds stay rejected.
-
-**Known limitation — not production qualified:** helper restart loses process-lifetime
-managed-peer knowledge. Persistent BlueZ bonds of a forgotten phone may then survive
-`ForgetPhone`. Operator recovery/crash reconciliation must be defined before
-production qualification; rejecting unknown managed identities is not bond removal.
+identities are durably recorded in `/var/lib/aa-system-helper/managed-bonds`
+(versioned exact address/adapter pairs, at most 256). The helper commits the
+allow-list before enabling pairing or admitting a trusted reconnect. It loads
+only an owner-only regular file in a private, owner-validated directory, using
+no-follow path traversal. Writes use exclusive 0600 staging, file fsync, atomic
+rename and directory fsync. Invalid state fails closed; global BlueZ inventory
+never grants revocation authority. Historical entries are retained for idempotent
+revocation retries. Bonds managed before this state format was deployed cannot
+be inferred safely and need explicit operator removal. A stale `.new` file after
+a crash blocks new admissions until an operator removes it; existing records
+remain usable for revocation.
 
 ## System bus API 1.1.0
 

@@ -57,7 +57,7 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
     const trust::TransportIdentity identity{bluez ? trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"} :
                                                    trust::WirelessIdentity{"fixture-bond", "fixture-adapter"}};
     ipc::RandomPairingIdSource ids;
-    auto helper = BusClient::private_bus(address, store);
+    auto helper = BusClient::private_bus_for_test(address, store);
     if (!helper) return 3;
     auto service = ipc::ControlBusService::start({::getuid()}, {ids, phones, helper.value().get()});
     if (!service) return 4;

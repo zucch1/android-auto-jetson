@@ -43,7 +43,8 @@ int main(int argc, char **argv) {
                     : aa::helper::nm::production_commands());
     }
     if (!fixture || argc != 5) {
-        bluetooth = std::make_unique<aa::helper::BluezBackend>(bus_address);
+        bluetooth = std::make_unique<aa::helper::BluezBackend>(bus_address, std::chrono::steady_clock::now,
+            fixture ? directory : "/var/lib/aa-system-helper", fixture ? ::getuid() : 0);
         if (!bluetooth->available())
             return 1;
     }

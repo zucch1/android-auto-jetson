@@ -7,7 +7,9 @@ namespace aa::helper {
 class BluezBackend final : public Backend {
 public:
     using Now = std::function<std::chrono::steady_clock::time_point()>;
-    explicit BluezBackend(const std::string& bus_address, Now now = std::chrono::steady_clock::now);
+    explicit BluezBackend(const std::string& bus_address, Now now = std::chrono::steady_clock::now,
+                          const std::string& state_directory = "/var/lib/aa-system-helper",
+                          std::uint32_t state_owner = 0);
     ~BluezBackend() override;
     bool available() const;
     core::Result<State> apply(Action, std::uint32_t) override;

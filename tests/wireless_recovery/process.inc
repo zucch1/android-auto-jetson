@@ -59,7 +59,7 @@ TEST_F(WirelessRecoveryProcess, R05FreshReceiverReloadsPersistentApproval) {
     store = std::make_unique<trust::ApprovedPhoneStore>(directory / "phones");
     ASSERT_TRUE(store->load()); ASSERT_EQ(store->phones().size(), 1U);
     ASSERT_EQ(read_text(directory / "phones"), approvals);
-    auto connection = BusClient::private_bus(address, *store); ASSERT_TRUE(connection);
+    auto connection = BusClient::private_bus_for_test(address, *store); ASSERT_TRUE(connection);
     client = std::move(connection.value());
     ASSERT_NO_FATAL_FAILURE(fresh_receiver());
     ASSERT_NO_FATAL_FAILURE(recover_process());

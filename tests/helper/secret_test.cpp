@@ -84,7 +84,7 @@ TEST_F(SecretLifetime, CredentialRpcWipesWriterWireReceiveAndParsedBody) {
     trust::ApprovedPhoneStore store{std::filesystem::path{path} / "phones"}; ASSERT_TRUE(store.load());
     const trust::TransportIdentity identity{trust::WirelessIdentity{"AA:BB:CC:DD:EE:FF", "00:11:22:33:44:55"}};
     ASSERT_TRUE(store.approve(identity));
-    auto client = BusClient::private_bus(address, store); ASSERT_TRUE(client);
+    auto client = BusClient::private_bus_for_test(address, store); ASSERT_TRUE(client);
     ASSERT_TRUE(client.value()->reconnect(identity));
     HandoffFailure failure{}; ASSERT_TRUE(client.value()->poll_bootstrap({7, 0}, failure));
     secret_strings = 0; secret_buffers = 0;
@@ -101,7 +101,7 @@ TEST_P(SecretReply, MalformedErrorAndSkippedTimeoutRepliesWipeAllOwnedBuffers) {
     ASSERT_TRUE(server.value().request_name(ipc::BusName{kBusName}));
     char path[] = "/tmp/task37-secret-reply-XXXXXX"; ASSERT_NE(::mkdtemp(path), nullptr);
     trust::ApprovedPhoneStore store{std::filesystem::path{path} / "phones"}; ASSERT_TRUE(store.load());
-    auto client = BusClient::private_bus(std::getenv("DBUS_SESSION_BUS_ADDRESS"), store); ASSERT_TRUE(client);
+    auto client = BusClient::private_bus_for_test(std::getenv("DBUS_SESSION_BUS_ADDRESS"), store); ASSERT_TRUE(client);
     const auto mode = GetParam();
     auto reply = std::async(std::launch::async, [&] {
         for (;;) {
@@ -130,7 +130,7 @@ TEST_F(SecretLifetime, LateCredentialReplyIsWipedWhenOrdinaryStatusDrainsItAfter
     ASSERT_TRUE(server.value().request_name(ipc::BusName{kBusName}));
     char path[] = "/tmp/task37-secret-late-XXXXXX"; ASSERT_NE(::mkdtemp(path), nullptr);
     trust::ApprovedPhoneStore store{std::filesystem::path{path} / "phones"}; ASSERT_TRUE(store.load());
-    auto client = BusClient::private_bus(std::getenv("DBUS_SESSION_BUS_ADDRESS"), store); ASSERT_TRUE(client);
+    auto client = BusClient::private_bus_for_test(std::getenv("DBUS_SESSION_BUS_ADDRESS"), store); ASSERT_TRUE(client);
     std::promise<void> release;
     auto allowed = release.get_future();
     auto late = std::async(std::launch::async, [&] {
