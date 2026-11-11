@@ -2,6 +2,7 @@
 if(NOT CMAKE_CROSSCOMPILING)
     add_executable(aa_tls_hardening_test tests/tls/hardening_test.cpp)
     target_link_libraries(aa_tls_hardening_test PRIVATE aa_transport_tls GTest::gtest_main)
+    target_link_options(aa_tls_hardening_test PRIVATE -Wl,--wrap=OPENSSL_cleanse)
     set_target_properties(aa_tls_hardening_test PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_compile_options(aa_tls_hardening_test PRIVATE -Wall -Wextra -Wpedantic -Werror)

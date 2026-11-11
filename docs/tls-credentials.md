@@ -38,6 +38,15 @@ attacker-substituted pathname. Operators must control the parent directories;
 parent-directory symlinks are not rejected. POSIX ACLs and concurrent in-place
 modification by the same credential owner are not separately modeled.
 
+PEM text is read directly into one fixed 64 KiB allocation plus an overflow
+sentinel; parsing uses views rather than secret-bearing string copies. RAII
+cleanses the full allocation with `OPENSSL_cleanse` before release on successful
+loads and exceptions. OpenSSL owns the parsed private key for the session.
+This reduces residual copies; it cannot protect a live key from an authorized
+debugger. Deployments should disable core dumps (`LimitCORE=0` in the receiver's
+systemd unit, or `ulimit -c 0` for a manual launch). This repository currently
+ships no receiver service unit to apply that directive to.
+
 Files are bounded to 64 KiB. OpenSSL parses certificate and key, encrypted-key
 password prompts are disabled, the public/private components must match, and
 non-whitespace trailing content is rejected. Typed errors contain only stable

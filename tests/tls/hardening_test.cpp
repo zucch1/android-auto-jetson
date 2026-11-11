@@ -128,3 +128,41 @@ TEST(TlsHardening, ExpiredHeadUnitCertificateWarnsAndLoads) {
     EXPECT_NO_THROW((void)aa::tls::load_credentials());
     EXPECT_EQ(testing::internal::GetCapturedStderr(), "tls-credential-warning: certificate-expired\n");
 }
+
+#include <atomic>
+namespace {
+std::atomic<int> pem_cleanses{0};
+std::atomic<bool> cleanse_left_bytes{false};
+}
+extern "C" void __real_OPENSSL_cleanse(void*, std::size_t);
+extern "C" void __wrap_OPENSSL_cleanse(void* buffer, std::size_t size) {
+    __real_OPENSSL_cleanse(buffer, size);
+    if (size == 65537) {
+        const auto* bytes = static_cast<const unsigned char*>(buffer);
+        for (std::size_t i = 0; i < size; ++i) {
+            if (bytes[i] != 0) cleanse_left_bytes = true;
+        }
+        ++pem_cleanses;
+    }
+}
+
+TEST(TlsHardening, CleansesPemOnSuccessfulLoad) {
+    const int before = pem_cleanses;
+    EXPECT_NO_THROW((void)aa::tls::load_credentials());
+    EXPECT_EQ(pem_cleanses.load() - before, 1);
+    EXPECT_FALSE(cleanse_left_bytes);
+}
+
+TEST(TlsHardening, CleansesPemOnMalformedInput) {
+    auto credential = aa::tls::load_credentials();
+    Bundle bundle(credential.certificate.get(), credential.private_key.get(), true);
+    const int before = pem_cleanses;
+    try {
+        (void)aa::tls::load_credentials();
+        FAIL() << "malformed bundle was accepted";
+    } catch (const aa::tls::Error& error) {
+        EXPECT_EQ(error.failure(), aa::tls::Failure::malformed);
+    }
+    EXPECT_EQ(pem_cleanses.load() - before, 1);
+    EXPECT_FALSE(cleanse_left_bytes);
+}
