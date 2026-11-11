@@ -2,6 +2,7 @@
 #pragma once
 #include <aa/helper/SystemHelper.hpp>
 #include <memory>
+#include <string>
 
 namespace aa::helper {
 class BluezBackend final : public Backend {
@@ -12,6 +13,8 @@ public:
                           std::uint32_t state_owner = 0);
     ~BluezBackend() override;
     bool available() const;
+    // Why persistent managed-bond state was rejected at startup; empty when it loaded.
+    std::string state_error() const;
     core::Result<State> apply(Action, std::uint32_t) override;
     core::Result<ObservedPeer> observe() override;
     core::Result<State> authorize(std::uint64_t) override;

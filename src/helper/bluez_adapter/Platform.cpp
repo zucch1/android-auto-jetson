@@ -195,6 +195,7 @@ bool BluezBackend::Impl::ensure() {
 BluezBackend::BluezBackend(const std::string& address, Now now, const std::string& state, std::uint32_t state_owner)
     : impl_(std::make_unique<Impl>(address, std::move(now), state, state_owner)) {}
 BluezBackend::~BluezBackend() = default;
+std::string BluezBackend::state_error() const { return impl_->managed.reason(); }
 bool BluezBackend::available() const { return impl_->managed.valid() && impl_->bus && !g_dbus_connection_is_closed(impl_->bus); }
 core::Result<ObservedPeer> BluezBackend::handoff() {
     if (impl_->bootstrap && impl_->bootstrap->expire()) impl_->last_failure = impl_->bootstrap->failure();

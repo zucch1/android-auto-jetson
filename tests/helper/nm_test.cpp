@@ -566,7 +566,13 @@ TEST_F(NmDaemon, ComposedReplacementInSameAdmissionNeedsFreshHandleAuthorization
     EXPECT_TRUE(client->get_ap_credentials({1, 1}, third.value().handle));
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, third.value().handle, true, true));
 }
+// The mock phone was admitted by an earlier helper run: reconnect never creates
+// revocation authority, so the persisted managed-bond state must already name it.
+void seed_managed_phone(const std::filesystem::path& directory) {
+    save(directory / "managed-bonds", "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n");
+}
 TEST_F(NmDaemon, ExpiredHandoffRejectsOnUseWithoutPlatformTick) {
+    seed_managed_phone(directory);
     const auto began = Clock::now(); std::atomic<std::int64_t> elapsed{};
     BluezBackend bluetooth{address, [&] { return began + std::chrono::milliseconds{elapsed.load()}; }, directory.string(), ::getuid()};
     ASSERT_TRUE(bluetooth.apply(Action::register_profile, 0));
@@ -627,6 +633,7 @@ TEST_F(NmDaemon, ComposedBssidChangeAfterFetchFailsBeforeEndpoint) {
     EXPECT_FALSE(client->poll_bootstrap({1, 1}, failure)); EXPECT_EQ(failure, HandoffFailure::snapshot);
 }
 TEST_F(NmDaemon, AcceptedBootstrapOutlivesAdmissionButNotItsOwnTenSeconds) {
+    seed_managed_phone(directory);
     const auto began = Clock::now(); std::atomic<std::int64_t> elapsed{};
     BluezBackend bluetooth{address, [&] { return began + std::chrono::milliseconds{elapsed.load()}; }, directory.string(), ::getuid()};
     ASSERT_TRUE(bluetooth.apply(Action::register_profile, 0));

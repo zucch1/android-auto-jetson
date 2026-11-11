@@ -116,7 +116,10 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
 }
 core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     const auto observed = impl_->consume(handle);
-    if (!observed || !impl_->exact(*observed, true) || !impl_->managed.remember(observed->device.identity)) return Error{ErrorCode::helper_rejected};
+    // Only a bond this helper itself admitted may reconnect: a reconnect never
+    // creates revocation authority for a bond the helper did not create, and it
+    // needs no write, so it keeps working when state persistence is failing.
+    if (!observed || !impl_->exact(*observed, true) || !impl_->managed.contains(observed->device.identity)) return Error{ErrorCode::helper_rejected};
     impl_->close_window();
     impl_->allowed = *observed;
     impl_->window = impl_->now() + std::chrono::seconds(60);

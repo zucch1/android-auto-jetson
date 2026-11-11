@@ -175,15 +175,22 @@ Lost replies remain unknown outcomes: this is neither globally exactly-once nor
 crash-durable revocation. NM retains its in-flight rotation latch. BlueZ managed
 identities are durably recorded in `/var/lib/aa-system-helper/managed-bonds`
 (versioned exact address/adapter pairs, at most 256). The helper commits the
-allow-list before enabling pairing or admitting a trusted reconnect. It loads
+allow-list before enabling pairing; a trusted reconnect is admitted only for an
+identity already on the list and never adds one. It loads
 only an owner-only regular file in a private, owner-validated directory, using
-no-follow path traversal. Writes use exclusive 0600 staging, file fsync, atomic
-rename and directory fsync. Invalid state fails closed; global BlueZ inventory
-never grants revocation authority. Historical entries are retained for idempotent
-revocation retries. Bonds managed before this state format was deployed cannot
-be inferred safely and need explicit operator removal. A stale `.new` file after
-a crash blocks new admissions until an operator removes it; existing records
-remain usable for revocation.
+no-follow path traversal. Writes use an exclusive, randomly named 0600 staging file (EINTR retried), file
+fsync, atomic rename and directory fsync. A write failure refuses only the NEW
+admission; revocation of every entry already stored, or already renamed into
+place when only the directory fsync failed, keeps working. After a failed
+directory fsync that entry is not admitted again until a later fsync succeeds.
+Stored state that is invalid at startup makes the helper log the reason and
+exit, so bonds are never forgotten silently; global BlueZ inventory never grants
+revocation authority. Historical entries are retained for idempotent revocation
+retries and are never removed, so the 256-entry limit is permanent until an
+operator edits the file. Bonds managed before this state format was deployed
+cannot be inferred safely and need explicit operator removal; they must be
+re-paired before they can reconnect. A staging file left by a power cut has a
+random name, blocks nothing and may be deleted by an operator.
 
 ## System bus API 1.1.0
 
