@@ -16,7 +16,7 @@ execute_process(COMMAND "${CMAKE_CXX_COMPILER}" -print-libgcc-file-name
     OUTPUT_VARIABLE _aa_libgcc OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
 get_filename_component(_aa_support "${_aa_libgcc}" DIRECTORY)
 set(_aa_lib "${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu")
-if(NOT EXISTS "${_aa_lib}/crt1.o")
+if(NOT EXISTS "${_aa_lib}/Scrt1.o")
     set(_aa_lib "${CMAKE_SYSROOT}/usr/lib")
 endif()
 set(_aa_cpp "${CMAKE_SYSROOT}/usr/include/c++/13")
@@ -30,9 +30,9 @@ if(NOT EXISTS "${_aa_cpp_arch}/bits/c++config.h")
 endif()
 foreach(_aa_required "${CMAKE_SYSROOT}/usr/include/stdio.h" "${CMAKE_SYSROOT}/usr/include/stdc-predef.h"
         "${_aa_cpp}/vector" "${_aa_cpp_arch}/bits/c++config.h"
-        "${_aa_lib}/crt1.o" "${_aa_lib}/crti.o" "${_aa_lib}/crtn.o"
+        "${_aa_lib}/Scrt1.o" "${_aa_lib}/crti.o" "${_aa_lib}/crtn.o"
         "${_aa_lib}/libc.so" "${_aa_lib}/libm.so" "${_aa_stdcpp}" "${_aa_lib}/libgcc_s.so.1"
-        "${_aa_support}/crtbegin.o" "${_aa_support}/crtend.o" "${_aa_libgcc}")
+        "${_aa_support}/crtbeginS.o" "${_aa_support}/crtendS.o" "${_aa_libgcc}")
     if(NOT EXISTS "${_aa_required}")
         message(FATAL_ERROR "AA_RUNTIME_READY: missing ${_aa_required}; no host cross-runtime fallback")
     endif()
@@ -49,10 +49,11 @@ set(_aa_c "-nostdinc -isystem \"${_aa_builtin}\" -isystem \"${CMAKE_SYSROOT}/usr
 set(CMAKE_C_FLAGS_INIT "${_aa_c}")
 set(CMAKE_CXX_FLAGS_INIT "-nostdinc++ -isystem \"${_aa_cpp}\" -isystem \"${_aa_cpp_arch}\" -isystem \"${_aa_cpp}/backward\" ${_aa_c}")
 set(_aa_link "-nostdlib -Wl,-nostdlib -B\"${_aa_lib}/\" -L\"${_aa_lib}\" -L\"${CMAKE_SYSROOT}/lib/aarch64-linux-gnu\" -L\"${CMAKE_SYSROOT}/lib\"")
-set(CMAKE_EXE_LINKER_FLAGS_INIT "${_aa_link} -no-pie \"${_aa_lib}/crt1.o\" \"${_aa_lib}/crti.o\" \"${_aa_support}/crtbegin.o\"")
+# PIE uses the same Scrt1/crtbeginS/crtendS selection as GCC's own specs.
+set(CMAKE_EXE_LINKER_FLAGS_INIT "${_aa_link} -pie \"${_aa_lib}/Scrt1.o\" \"${_aa_lib}/crti.o\" \"${_aa_support}/crtbeginS.o\"")
 set(CMAKE_SHARED_LINKER_FLAGS_INIT "${_aa_link} \"${_aa_lib}/crti.o\" \"${_aa_support}/crtbeginS.o\"")
 set(CMAKE_MODULE_LINKER_FLAGS_INIT "${CMAKE_SHARED_LINKER_FLAGS_INIT}")
-set(_aa_libraries "\"${_aa_libgcc}\" \"${_aa_lib}/libgcc_s.so.1\" \"${_aa_lib}/libm.so\" \"${_aa_lib}/libc.so\" \"${_aa_libgcc}\" \"${_aa_support}/crtend.o\" \"${_aa_lib}/crtn.o\"")
+set(_aa_libraries "\"${_aa_libgcc}\" \"${_aa_lib}/libgcc_s.so.1\" \"${_aa_lib}/libm.so\" \"${_aa_lib}/libc.so\" \"${_aa_libgcc}\" \"${_aa_support}/crtendS.o\" \"${_aa_lib}/crtn.o\"")
 set(CMAKE_C_STANDARD_LIBRARIES_INIT "${_aa_libraries}")
 set(CMAKE_CXX_STANDARD_LIBRARIES_INIT "\"${_aa_stdcpp}\" ${_aa_libraries}")
 # Keep dependency files including system headers alongside every actual object.
