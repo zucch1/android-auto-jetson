@@ -8,6 +8,7 @@
 
 #include <fstream>
 #include <string>
+#include <variant>
 
 #include <gtest/gtest.h>
 
@@ -382,12 +383,127 @@ TEST(TrustStore, SerialLessApprovalDoesNotAliasADifferentDevice) {
     ASSERT_EQ(trust::identity_key(trust::TransportIdentity{phone_a}),
               trust::identity_key(trust::TransportIdentity{phone_b}));
 
+    // Review fix (PR #93): a serial-less wired phone is REFUSED outright, so
+    // no port-only record exists that phone B could ever alias.
     const auto approved = store.approve(trust::TransportIdentity{phone_a});
-    ASSERT_TRUE(approved.has_value());
+    ASSERT_FALSE(approved.has_value());
+    EXPECT_EQ(approved.error().code(), ErrorCode::trust_rejected);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file())) << "a refused approval persists nothing";
 
     EXPECT_EQ(store.lookup(test::identity_of(trust::TransportIdentity{phone_b})),
               trust::Decision::unknown)
         << "a serial-less approval must not authorise a different physical device";
+}
+
+[[nodiscard]] trust::WiredIdentity serial_less_wired() {
+    trust::WiredIdentity wired;
+    wired.usb_vendor_id = "18d1";
+    wired.usb_product_id = "4ee1";
+    wired.aoa_manufacturer = "Google";
+    wired.aoa_model = "Pixel";
+    wired.port_context = "1-2.3";
+    return wired;
+}
+
+// Review fix (PR #93, P1): the M12 decision is made on the canonical KEY, not
+// the stored variant. A legacy/opaque record carrying a serial-less "w1:" key
+// must not authorise another serial-less device presenting the same key.
+TEST(TrustStore, OpaqueSerialLessWiredKeyDoesNotAuthoriseAnotherDevice) {
+    test::TempStoreDir dir;
+    const std::string port_only_key =
+        trust::identity_key(trust::TransportIdentity{serial_less_wired()});
+    ASSERT_EQ(trust::classify_wired_key(port_only_key), trust::WiredKeyClass::port_only);
+    write_text(dir.file(),
+               "{\"schema_version\":2,\"next_phone_id\":3,\"phones\":["
+               "{\"phone_id\":1,\"identity\":{\"kind\":\"opaque\",\"key\":\"" +
+                   port_only_key +
+                   "\"}},"
+                   "{\"phone_id\":2,\"identity\":{\"kind\":\"opaque\",\"key\":\"w1:4:18d1:9\"}}]}");
+
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    ASSERT_EQ(store.phones().size(), 2U);
+    ASSERT_TRUE(std::holds_alternative<trust::OpaqueIdentity>(store.phones()[0].identity));
+
+    // Another serial-less device of the same model on the same port presents
+    // exactly the stored key.
+    const auto other_device = test::identity_of(trust::TransportIdentity{serial_less_wired()});
+    ASSERT_EQ(other_device.key, port_only_key);
+    EXPECT_EQ(store.lookup(other_device), trust::Decision::unknown);
+    EXPECT_FALSE(trust::allows_session(store.lookup(other_device)));
+    EXPECT_EQ(store.lookup(trust::PhoneIdentity{"w1:4:18d1:9"}), trust::Decision::unknown)
+        << "a malformed w1 key must fail closed";
+
+    const std::string summary = store.redacted_summary();
+    EXPECT_NE(summary.find("phone-1=port-only:"), std::string::npos) << summary;
+    EXPECT_NE(summary.find("phone-2=malformed-wired:"), std::string::npos) << summary;
+
+    // Re-approving the same key is refused, not answered with the legacy id.
+    const auto reapproved = store.approve(trust::TransportIdentity{serial_less_wired()});
+    ASSERT_FALSE(reapproved.has_value());
+    EXPECT_EQ(reapproved.error().code(), ErrorCode::trust_rejected);
+}
+
+TEST(TrustStore, ApproveOnceSerialLessWiredKeyIsRejected) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+
+    const auto port_only = test::identity_of(trust::TransportIdentity{serial_less_wired()});
+    const auto rejected = store.approve_once(port_only);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error().code(), ErrorCode::trust_rejected);
+
+    const auto malformed = store.approve_once(trust::PhoneIdentity{"w1:not-a-canonical-key"});
+    ASSERT_FALSE(malformed.has_value());
+    EXPECT_EQ(malformed.error().code(), ErrorCode::trust_rejected);
+
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file())) << "a refused approval persists nothing";
+    EXPECT_EQ(store.lookup(port_only), trust::Decision::unknown);
+
+    // Control: a serial-bound wired key still approves through the same seam.
+    const auto strong = test::identity_of(trust::TransportIdentity{test::kWired});
+    ASSERT_TRUE(store.approve_once(strong).has_value());
+    EXPECT_EQ(store.lookup(strong), trust::Decision::approved);
+}
+
+TEST(TrustStore, WiredKeyClassificationFailsClosed) {
+    using trust::WiredKeyClass;
+    EXPECT_EQ(trust::classify_wired_key(trust::identity_key(trust::TransportIdentity{test::kWired})),
+              WiredKeyClass::serial_bound);
+    EXPECT_EQ(trust::classify_wired_key(
+                  trust::identity_key(trust::TransportIdentity{serial_less_wired()})),
+              WiredKeyClass::port_only);
+    trust::WiredIdentity usb_only = serial_less_wired();
+    usb_only.usb_serial = "S";
+    EXPECT_EQ(trust::classify_wired_key(trust::identity_key(trust::TransportIdentity{usb_only})),
+              WiredKeyClass::serial_bound);
+    trust::WiredIdentity aoa_only = serial_less_wired();
+    aoa_only.aoa_serial = "A";
+    EXPECT_EQ(trust::classify_wired_key(trust::identity_key(trust::TransportIdentity{aoa_only})),
+              WiredKeyClass::serial_bound);
+    // A field containing ':' and digits is still parsed by its length prefix.
+    trust::WiredIdentity tricky = serial_less_wired();
+    tricky.aoa_model = "0:0:0:";
+    EXPECT_EQ(trust::classify_wired_key(trust::identity_key(trust::TransportIdentity{tricky})),
+              WiredKeyClass::port_only);
+
+    EXPECT_EQ(trust::classify_wired_key(trust::identity_key(trust::TransportIdentity{test::kWireless})),
+              WiredKeyClass::not_wired);
+    EXPECT_EQ(trust::classify_wired_key("legacy-key"), WiredKeyClass::not_wired);
+
+    const std::string canonical = trust::identity_key(trust::TransportIdentity{serial_less_wired()});
+    for (const std::string& bad : {std::string{"w1:"}, canonical + "x", canonical + "0:",
+                                   canonical.substr(0, canonical.size() - 1),
+                                   std::string{"w1:04:18d14:4ee10:0:6:Google5:Pixel0:5:1-2.3"},
+                                   std::string{"w1:4:18d14:4ee10:6:Google5:Pixel5:1-2.3"},
+                                   std::string{"w1:99999999999999999999999:x"},
+                                   std::string{"w1:x:"}}) {
+        EXPECT_EQ(trust::classify_wired_key(bad), WiredKeyClass::malformed) << bad;
+        EXPECT_TRUE(trust::refuses_wired_authorization(bad)) << bad;
+    }
 }
 
 } // namespace

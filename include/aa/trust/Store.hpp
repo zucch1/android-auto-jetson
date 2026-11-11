@@ -11,9 +11,14 @@
 // TRUST, NOT CRYPTOGRAPHIC PROOF. USB descriptor strings and serials can be
 // spoofed by anyone with physical access to the port; an approved wired record
 // therefore authorizes "the approved identifiers presented on the qualified
-// port", not "this specific handset". A wired record with neither USB nor AOA
-// serial is an explicitly weaker PORT-ONLY pairing record: it is retained for
-// audit/revocation and labelled in diagnostics, but never authorizes lookup().
+// port", not "this specific handset". SERIAL-LESS WIRED PHONES ARE REFUSED
+// (audit M12): a wired key with neither USB nor AOA serial cannot tell one
+// phone from another of the same model on the same port, so approve() and
+// approve_once() reject it with trust_rejected and persist nothing. The check
+// is on the canonical key, so the same "w1:" key held as an opaque record is
+// refused too, and a malformed "w1:" key fails closed. A legacy serial-less
+// record already on disk is kept for audit/revocation and labelled
+// "port-only:" in diagnostics, but lookup() never returns approved for it.
 // Wireless records bind the BlueZ bond (stronger, still bond-not-human
 // identity). Unknown phones always fail closed: lookup() returns
 // Decision::unknown and allows_session() is false.
@@ -89,8 +94,9 @@ public:
     core::Result<void> forget(const PhoneIdentity& identity) override;
 
     // Structured approve-once (task 27 pairing flow): persist the strongest
-    // available transport identity and allocate a stable PhoneId. Serial-less
-    // wired identities become port-only records which never satisfy lookup().
+    // available transport identity and allocate a stable PhoneId. A serial-less
+    // (port-only) or malformed wired key is refused with trust_rejected and
+    // nothing is persisted; approve_once() applies the same refusal by key.
     // Approve-once semantics: re-approving an already-approved key returns the
     // existing id and never adds a second record.
     [[nodiscard]] core::Result<core::PhoneId> approve(const TransportIdentity& identity);

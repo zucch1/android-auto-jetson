@@ -18,7 +18,11 @@
 //
 // TRUST MODEL (see Identity.hpp): wired identity is physical-access trust,
 // NOT cryptographic proof; USB identifier spoofing is a known, documented
-// limitation of the wired trust boundary.
+// limitation of the wired trust boundary. Serial-less wired phones are REFUSED
+// (audit M12): such an identity cannot distinguish one device from another of
+// the same model on the same port, so pairing_requested() rejects it up front
+// (trust_rejected, nothing pending) and the user is never prompted for a
+// pairing that could not authorize a session.
 //
 // SNAPSHOT-ONLY PAIRING CONTRACT: approval is bound to the canonical identity
 // captured when RequestAddPhone succeeds, not to the currently connected
@@ -77,11 +81,13 @@ public:
 // Error contract (typed, fail closed):
 //   - no candidate presented at pairing_requested -> trust_unknown_phone
 //   - duplicate request binding                    -> trust_rejected
+//   - serial-less (port-only) wired candidate      -> trust_rejected
 //   - pending table full                           -> ipc_queue_full
 //   - confirm of an unbound/already-consumed id    -> trust_unknown_phone
 //   - confirm past the 60 s window                 -> session_pairing_timeout
 //     (the request is dropped and NOT persisted)
 //   - store persistence failure                    -> trust_store_io
+//   - store refusal of the bound identity          -> trust_rejected
 class PairingPolicy final : public ipc::PhoneDirectory {
 public:
     static constexpr core::Milliseconds kConfirmWindow{60'000};

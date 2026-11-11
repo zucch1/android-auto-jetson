@@ -87,7 +87,19 @@ constexpr mode_t kDirMode = 0700;
 // failure rolls the creation back (unlinkat AT_REMOVEDIR) and fails closed.
 [[nodiscard]] int open_verified_parent(const std::filesystem::path& parent, bool tighten,
                                        bool create = false) {
+    // Every failure returns -1 with errno describing WHY (preserved across the
+    // cleanup close() calls), so read_file() can tell a genuinely missing
+    // component (ENOENT: a fresh install) from a rejection. Ownership and mode
+    // failures report EACCES, never ENOENT.
+    const auto fail = [](int saved_errno, int fd) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        errno = saved_errno;
+        return -1;
+    };
     if (parent.empty()) {
+        errno = EINVAL;
         return -1;
     }
     int dirfd = ::open(parent.is_absolute() ? "/" : ".",
@@ -103,8 +115,7 @@ constexpr mode_t kDirMode = 0700;
                             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         if (next < 0 && create && errno == ENOENT) {
             if (::mkdirat(dirfd, component.c_str(), kDirMode) != 0) {
-                ::close(dirfd);
-                return -1;
+                return fail(errno, dirfd);
             }
             next = ::openat(dirfd, component.c_str(),
                             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -112,30 +123,30 @@ constexpr mode_t kDirMode = 0700;
                                  fsync_interruptible(next) == 0 &&
                                  fsync_interruptible(dirfd) == 0;
             if (!durable) {
+                const int saved = errno != 0 ? errno : EIO;
                 if (next >= 0) {
                     ::close(next);
                 }
                 (void)::unlinkat(dirfd, component.c_str(), AT_REMOVEDIR);
-                ::close(dirfd);
-                return -1;
+                return fail(saved, dirfd);
             }
         }
         if (next < 0) {
-            ::close(dirfd);
-            return -1;
+            return fail(errno, dirfd);
         }
         ::close(dirfd);
         dirfd = next;
     }
     struct stat info {};
-    if (::fstat(dirfd, &info) != 0 || !S_ISDIR(info.st_mode) || info.st_uid != ::geteuid()) {
-        ::close(dirfd);
-        return -1;
+    if (::fstat(dirfd, &info) != 0) {
+        return fail(errno, dirfd);
+    }
+    if (!S_ISDIR(info.st_mode) || info.st_uid != ::geteuid()) {
+        return fail(EACCES, dirfd);
     }
     if (tighten && (::fchmod(dirfd, kDirMode) != 0 || ::fstat(dirfd, &info) != 0 ||
                     (info.st_mode & 07777) != kDirMode)) {
-        ::close(dirfd);
-        return -1;
+        return fail(EACCES, dirfd);
     }
     return dirfd;
 }
@@ -182,23 +193,26 @@ core::Result<void> ensure_private_file(const std::filesystem::path& path) {
 }
 
 core::Result<std::string> read_file(const std::filesystem::path& path) {
-    struct stat probe {};
-    if (::lstat(path.c_str(), &probe) != 0) {
-        if (errno == ENOENT) {
-            return std::string{};  // absent store is the empty store
-        }
-        return Error{ErrorCode::trust_store_io};
-    }
-    // The store exists: reach it ONLY through the verified parent descriptor.
-    // A symlinked parent is a rejection, never a traversal (fail closed).
+    // Verify EVERY directory component first (audit M11), with no path-based
+    // pre-check: a symlinked ancestor is trust_store_io even when its target
+    // lacks the store file. Only a genuinely missing directory component
+    // (ENOENT from the walk: a fresh install) or a missing basename inside the
+    // verified directory is the empty store.
     const int dirfd = open_verified_parent(path.parent_path(), false);
     if (dirfd < 0) {
+        if (errno == ENOENT) {
+            return std::string{};  // state directory not created yet
+        }
         return Error{ErrorCode::trust_store_io};
     }
     const int fd = ::openat(dirfd, path.filename().c_str(),
                             O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    const int open_errno = errno;
     ::close(dirfd);
     if (fd < 0) {
+        if (open_errno == ENOENT) {
+            return std::string{};  // absent store is the empty store
+        }
         return Error{ErrorCode::trust_store_io};  // includes symlink rejection (ELOOP)
     }
     auto checked = validate_private_fd(fd);

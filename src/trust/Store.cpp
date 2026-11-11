@@ -15,13 +15,15 @@ namespace {
     return !identity.key.empty();
 }
 
-// A port-only record preserves the user's explicit pairing decision for audit
-// and revocation, but has no device-unique material and therefore cannot be a
-// reusable authorization. The current pairing flow can still use the returned
-// PhoneId; a later connection must pair again with a stronger identity.
-[[nodiscard]] bool port_only(const TransportIdentity& identity) {
-    const auto* wired = std::get_if<WiredIdentity>(&identity);
-    return wired != nullptr && wired->usb_serial.empty() && wired->aoa_serial.empty();
+// Audit M12: a serial-less wired key carries no device-unique material, so
+// approving it would authorize every serial-less device of the same model on
+// the same port. The decision is made on the canonical KEY (never on the stored
+// variant), so an OpaqueIdentity holding the same "w1:" key is refused exactly
+// like a structured WiredIdentity; a malformed "w1:" key fails closed too.
+// approve()/approve_once() refuse such keys (trust_rejected, nothing persisted);
+// lookup() still refuses them as defence for legacy records already on disk.
+[[nodiscard]] bool refused_key(const std::string& key) {
+    return refuses_wired_authorization(key);
 }
 
 } // namespace
@@ -87,7 +89,9 @@ Decision ApprovedPhoneStore::lookup(const PhoneIdentity& identity) const {
         return Decision::unknown;  // fail closed
     }
     const auto index = index_of_key(identity.key);
-    if (!index.has_value() || port_only(phones_[index.value()].identity)) {
+    // The matched record's canonical key IS identity.key, so the refusal holds
+    // whatever variant the record was stored as (structured or opaque).
+    if (!index.has_value() || refused_key(identity.key)) {
         return Decision::unknown;
     }
     return Decision::approved;
@@ -105,6 +109,9 @@ core::Result<void> ApprovedPhoneStore::approve_once(const PhoneIdentity& identit
     const auto key = validated_key(opaque);
     if (!key.has_value()) {
         return Error{ErrorCode::trust_unknown_phone};
+    }
+    if (refused_key(key.value())) {
+        return Error{ErrorCode::trust_rejected};  // serial-less wired: refused (M12)
     }
     if (index_of_key(key.value()).has_value()) {
         return {};  // approve-once: already eligible
@@ -136,6 +143,9 @@ core::Result<core::PhoneId> ApprovedPhoneStore::approve(const TransportIdentity&
     auto key = validated_key(identity);
     if (!key.has_value()) {
         return Error{ErrorCode::trust_unknown_phone};
+    }
+    if (refused_key(key.value())) {
+        return Error{ErrorCode::trust_rejected};  // serial-less wired: refused (M12)
     }
     if (const auto existing = index_of_key(key.value()); existing.has_value()) {
         return phones_[existing.value()].phone_id;  // approve-once
@@ -216,8 +226,13 @@ std::string ApprovedPhoneStore::redacted_summary() const {
         out += "phone-";
         out += std::to_string(phone.phone_id.value);
         out += "=";
-        if (port_only(phone.identity)) {
-            out += "port-only:";
+        // Legacy serial-less wired records can only arrive from disk; they are
+        // labelled so diagnostics show why they never authorize.
+        switch (classify_wired_key(identity_key(phone.identity))) {
+        case WiredKeyClass::port_only: out += "port-only:"; break;
+        case WiredKeyClass::malformed: out += "malformed-wired:"; break;
+        case WiredKeyClass::not_wired:
+        case WiredKeyClass::serial_bound: break;
         }
         out += redacted_label(phone.identity);
     }

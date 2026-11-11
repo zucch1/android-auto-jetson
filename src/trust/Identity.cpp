@@ -82,6 +82,54 @@ std::string identity_key(const TransportIdentity& identity) {
     return opaque.key;
 }
 
+WiredKeyClass classify_wired_key(std::string_view key) noexcept {
+    constexpr std::string_view kWiredPrefix{"w1:"};
+    if (key.substr(0, kWiredPrefix.size()) != kWiredPrefix) {
+        return WiredKeyClass::not_wired;
+    }
+    // Field order is identity_key()'s: vid, pid, usb_serial, aoa_manufacturer,
+    // aoa_model, aoa_serial, port_context. Anything that identity_key() could
+    // not have produced (missing/extra fields, a non-canonical length with a
+    // leading zero, a length past the end) is malformed and fails closed.
+    constexpr std::size_t kFieldCount = 7;
+    constexpr std::size_t kUsbSerial = 2;
+    constexpr std::size_t kAoaSerial = 5;
+    std::string_view rest = key.substr(kWiredPrefix.size());
+    bool has_serial = false;
+    for (std::size_t field = 0; field < kFieldCount; ++field) {
+        std::size_t digits = 0;
+        std::size_t length = 0;
+        while (digits < rest.size() && rest[digits] >= '0' && rest[digits] <= '9') {
+            length = length * 10 + static_cast<std::size_t>(rest[digits] - '0');
+            ++digits;
+            if (length > rest.size()) {
+                return WiredKeyClass::malformed;  // also bounds the accumulator
+            }
+        }
+        if (digits == 0 || (digits > 1 && rest[0] == '0') || digits >= rest.size() ||
+            rest[digits] != ':') {
+            return WiredKeyClass::malformed;
+        }
+        rest.remove_prefix(digits + 1);
+        if (length > rest.size()) {
+            return WiredKeyClass::malformed;
+        }
+        if ((field == kUsbSerial || field == kAoaSerial) && length != 0) {
+            has_serial = true;
+        }
+        rest.remove_prefix(length);
+    }
+    if (!rest.empty()) {
+        return WiredKeyClass::malformed;
+    }
+    return has_serial ? WiredKeyClass::serial_bound : WiredKeyClass::port_only;
+}
+
+bool refuses_wired_authorization(std::string_view key) noexcept {
+    const WiredKeyClass klass = classify_wired_key(key);
+    return klass == WiredKeyClass::port_only || klass == WiredKeyClass::malformed;
+}
+
 core::Result<std::string> validated_key(const TransportIdentity& identity) {
     if (const auto* wired = std::get_if<WiredIdentity>(&identity)) {
         if (!all_fields_printable(*wired) || !wired_has_material(*wired)) {

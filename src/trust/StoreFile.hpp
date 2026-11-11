@@ -38,10 +38,13 @@ inline constexpr std::size_t kMaxStoreBytes = std::size_t{256} * 1024;
 // or at any directory component is a trust_store_io rejection, never followed.
 [[nodiscard]] core::Result<void> ensure_private_file(const std::filesystem::path& path);
 
-// Reads the store file through verified directory descriptors; an absent file
-// yields an empty string (fresh store). Symlinked (store name OR any directory
-// component), foreign-owned, permissive, oversized or unreadable stores are
-// trust_store_io.
+// Reads the store file through verified directory descriptors, walking every
+// directory component BEFORE looking at the basename (no path-based probe).
+// A genuinely missing directory component (fresh install) or a missing store
+// name inside the verified directory yields an empty string (fresh store).
+// Symlinked (store name OR any directory component, even when the symlink's
+// target lacks the store file), foreign-owned, permissive, oversized or
+// unreadable stores are trust_store_io.
 [[nodiscard]] core::Result<std::string> read_file(const std::filesystem::path& path);
 
 // Atomic replace anchored on the verified store-directory descriptor:
