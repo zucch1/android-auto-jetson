@@ -133,6 +133,26 @@ TEST(VideoCodec, LimitsRecordRejectsOutOfRangeOffer) {
     EXPECT_EQ(out.error().code(), aa::ErrorCode::protocol_negotiation_failed);
 }
 
+TEST(VideoCodec, LimitsRecordRejectsSub1024BytePayload) {
+    for (const std::uint32_t small_payload : {1U, 512U, 1023U}) {
+        NegotiatedLimits under{};
+        under.max_datagram_payload = small_payload;
+        std::array<std::uint8_t, kLimitsRecordBytes> record{};
+        encode_limits_record(record, under);
+        const auto out = decode_limits_record(record);
+        ASSERT_FALSE(out) << "Expected rejection for payload " << small_payload;
+        EXPECT_EQ(out.error().code(), aa::ErrorCode::protocol_negotiation_failed);
+    }
+}
+
+TEST(VideoCodec, NegotiateRejectsSub1024ByteAgreedPayload) {
+    NegotiatedLimits a{4096, 65536, 8192};
+    NegotiatedLimits b{512, 65536, 8192};
+    const auto agreed = negotiate_limits(a, b);
+    ASSERT_FALSE(agreed);
+    EXPECT_EQ(agreed.error().code(), aa::ErrorCode::protocol_negotiation_failed);
+}
+
 TEST(VideoCodec, NegotiateTakesFieldMinimum) {
     NegotiatedLimits a{4096, 65536, 8192};
     NegotiatedLimits b{1024, 32768, 16384};

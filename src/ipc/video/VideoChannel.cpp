@@ -362,7 +362,10 @@ core::Result<EndpointIdentity> bind_path(int fd, const std::string& path) noexce
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+    const mode_t previous_umask = ::umask(0177);
+    const int bind_result = ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    ::umask(previous_umask);
+    if (bind_result != 0) {
         return Error{ErrorCode::transport_unavailable};
     }
     struct stat bound {};
@@ -917,7 +920,11 @@ core::Result<VideoProducer> VideoServer::accept_consumer(core::Milliseconds time
         ::close(fd);
         return authorized.error();
     }
-    auto negotiated = exchange_limits(fd, impl_->options.local_limits, timeout);
+    constexpr core::Milliseconds kHandshakeTimeout{2000};
+    const auto handshake_timeout =
+        (timeout.count >= 0 && timeout.count < kHandshakeTimeout.count) ? timeout
+                                                                        : kHandshakeTimeout;
+    auto negotiated = exchange_limits(fd, impl_->options.local_limits, handshake_timeout);
     if (!negotiated) {
         ::close(fd);
         return negotiated.error();
@@ -965,7 +972,12 @@ core::Result<VideoConsumer> connect_video_consumer(const VideoSocketPath& path,
         ::close(fd);
         return authorized.error();
     }
-    auto negotiated = exchange_limits(fd, options.local_limits, options.timeout);
+    constexpr core::Milliseconds kHandshakeTimeout{2000};
+    const auto handshake_timeout =
+        (options.timeout.count >= 0 && options.timeout.count < kHandshakeTimeout.count)
+            ? options.timeout
+            : kHandshakeTimeout;
+    auto negotiated = exchange_limits(fd, options.local_limits, handshake_timeout);
     if (!negotiated) {
         ::close(fd);
         return negotiated.error();
