@@ -59,3 +59,72 @@ TEST(TlsHardening, VerifiedServerAcceptsExplicitlyTrustedCertificate) {
 TEST(TlsHardening, VerifiedServerRejectsUntrustedCertificate) {
     EXPECT_FALSE(verified_handshake(true, false));
 }
+
+#include <cstdlib>
+#include <string>
+#include <unistd.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+
+namespace {
+struct Bundle {
+    std::string previous{std::getenv("HU_KEY_PATH")};
+    std::string path;
+    Bundle(X509* certificate, EVP_PKEY* key, bool trailing = false) {
+        const char* temporary = std::getenv("TMPDIR");
+        path = std::string(temporary ? temporary : "/tmp") + "/tls-check-XXXXXX";
+        const int fd = ::mkstemp(path.data());
+        if (fd < 0) throw std::runtime_error("test-file-create");
+        FILE* file = ::fdopen(fd, "w");
+        if (!file) { ::close(fd); throw std::runtime_error("test-file-open"); }
+        EXPECT_EQ(PEM_write_X509(file, certificate), 1);
+        EXPECT_EQ(PEM_write_PrivateKey(file, key, nullptr, nullptr, 0, nullptr, nullptr), 1);
+        if (trailing) std::fputs("invalid trailing data", file);
+        EXPECT_EQ(std::fclose(file), 0);
+        ::setenv("HU_KEY_PATH", path.c_str(), 1);
+    }
+    ~Bundle() { ::setenv("HU_KEY_PATH", previous.c_str(), 1); ::unlink(path.c_str()); }
+};
+
+void expect_insecure() {
+    try {
+        (void)aa::tls::load_credentials();
+        FAIL() << "insecure credential was accepted";
+    } catch (const aa::tls::Error& error) {
+        EXPECT_EQ(error.failure(), aa::tls::Failure::insecure);
+    }
+}
+}
+
+TEST(TlsHardening, RejectsRsa1024) {
+    auto credential = aa::tls::load_credentials();
+    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> context(
+        EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr), EVP_PKEY_CTX_free);
+    ASSERT_EQ(EVP_PKEY_keygen_init(context.get()), 1);
+    ASSERT_EQ(EVP_PKEY_CTX_set_rsa_keygen_bits(context.get(), 1024), 1);
+    EVP_PKEY* generated = nullptr;
+    ASSERT_EQ(EVP_PKEY_keygen(context.get(), &generated), 1);
+    aa::tls::PrivateKey key(generated, EVP_PKEY_free);
+    ASSERT_EQ(X509_set_pubkey(credential.certificate.get(), key.get()), 1);
+    ASSERT_GT(X509_sign(credential.certificate.get(), key.get(), EVP_sha256()), 0);
+    Bundle bundle(credential.certificate.get(), key.get());
+    expect_insecure();
+}
+
+TEST(TlsHardening, RejectsSha1Signature) {
+    auto credential = aa::tls::load_credentials();
+    ASSERT_GT(X509_sign(credential.certificate.get(), credential.private_key.get(), EVP_sha1()), 0);
+    Bundle bundle(credential.certificate.get(), credential.private_key.get());
+    expect_insecure();
+}
+
+TEST(TlsHardening, ExpiredHeadUnitCertificateWarnsAndLoads) {
+    auto credential = aa::tls::load_credentials();
+    ASSERT_NE(X509_gmtime_adj(X509_getm_notBefore(credential.certificate.get()), -7200), nullptr);
+    ASSERT_NE(X509_gmtime_adj(X509_getm_notAfter(credential.certificate.get()), -3600), nullptr);
+    ASSERT_GT(X509_sign(credential.certificate.get(), credential.private_key.get(), EVP_sha256()), 0);
+    Bundle bundle(credential.certificate.get(), credential.private_key.get());
+    testing::internal::CaptureStderr();
+    EXPECT_NO_THROW((void)aa::tls::load_credentials());
+    EXPECT_EQ(testing::internal::GetCapturedStderr(), "tls-credential-warning: certificate-expired\n");
+}

@@ -43,6 +43,15 @@ password prompts are disabled, the public/private components must match, and
 non-whitespace trailing content is rejected. Typed errors contain only stable
 failure classes; unset/empty credentials additionally explain HU_KEY_PATH.
 No full path, phone identifier or PEM material enters the new diagnostics.
+Keys and certificate signatures must provide at least 112 security bits
+(RSA at least 2048 bits); SHA-1/MD5 certificate signatures are rejected.
+Expired head-unit certificates emit `tls-credential-warning: certificate-expired`
+on stderr at every load, without a pathname or certificate identity. They remain
+loadable because a phone may accept a long-lived compatibility identity beyond
+its validity dates. This warning does not relax peer verification in verified
+mode. The unencrypted bundle is plaintext at rest: restrict access to the file
+and its parent directories.
+
 Parsed objects are RAII-owned until handed to Cryptor; its destructor releases
 TLS resources, including after failed initialization.
 

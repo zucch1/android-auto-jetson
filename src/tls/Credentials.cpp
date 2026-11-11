@@ -2,6 +2,7 @@
 #include <aa/tls/Credentials.hpp>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
@@ -137,6 +138,25 @@ Credentials load_credentials() {
     if (X509_check_private_key(certificate.get(), key.get()) != 1) {
         throw Error(Failure::mismatch);
     }
+    // Security bits compare different key families fairly: RSA-2048 and
+    // P-256 both meet this floor; RSA-1024 does not.
+    if (EVP_PKEY_security_bits(key.get()) < 112) { throw Error(Failure::insecure); }
+    const auto check_certificate = [](X509* cert) {
+        int digest = 0, signature_key = 0, security_bits = 0;
+        std::uint32_t flags = 0;
+        if (X509_get_signature_info(cert, &digest, &signature_key, &security_bits, &flags) != 1 ||
+            security_bits < 112 || digest == NID_sha1 || digest == NID_md5) {
+            throw Error(Failure::insecure);
+        }
+        const int expiry = X509_cmp_current_time(X509_get0_notAfter(cert));
+        if (expiry == 0) { throw Error(Failure::malformed); }
+        // Android Auto HU identity is not a Web PKI server identity. Rejecting
+        // an expired compatibility credential can disable otherwise working
+        // phones; emit a stable, redacted warning on every load instead.
+        if (expiry < 0) std::fputs("tls-credential-warning: certificate-expired\n", stderr);
+    };
+    check_certificate(certificate.get());
+    for (const auto& intermediate : chain) check_certificate(intermediate.get());
     return Credentials{std::move(certificate), std::move(key), std::move(chain)};
 }
 }
