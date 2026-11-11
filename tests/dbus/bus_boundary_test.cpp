@@ -14,6 +14,12 @@
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
 #include "../../src/ipc/dbus_adapter/BusIo.hpp"
 #include "fakes.hpp"
+#include "../../src/ipc/dbus_adapter/DropDiagnostic.hpp"
+
+#include <array>
+#include <chrono>
+#include <thread>
+#include <sys/socket.h>
 
 #include <unistd.h>
 
@@ -586,6 +592,110 @@ TEST(BusBoundary, BigEndianCallIsDrainedAndTheNextCallSurvives) {
     ASSERT_TRUE(ping.has_value());
     EXPECT_EQ(ping.value().type, bus::MessageType::method_return);
     EXPECT_EQ(ping.value().signature, "t");
+}
+
+
+TEST(BusBoundary, DropDiagnosticsAggregateAtMostOncePerInterval) {
+    bus::DropDiagnostic throttle;
+    const bus::DropDiagnostic::Clock::time_point start{};
+    EXPECT_EQ(throttle.record(start), 1U);
+    for (int i = 0; i < 1000; ++i) {
+        EXPECT_FALSE(throttle.record(start + std::chrono::seconds(9)));
+    }
+    EXPECT_EQ(throttle.record(start + std::chrono::seconds(10)), 1001U);
+    EXPECT_FALSE(throttle.record(start + std::chrono::seconds(10)));
+    EXPECT_EQ(throttle.record(start + std::chrono::seconds(20)), 2U);
+    EXPECT_EQ(throttle.record(start + std::chrono::seconds(100)), 1U);
+}
+
+// Substitute only the authenticated connection's transport, leaving production
+// read_message ownership/closure intact and avoiding daemon frame rewriting.
+class SocketBoundary : public ::testing::Test {
+protected:
+    std::optional<bus::BusConnection> receiver;
+    int peer{-1};
+    void SetUp() override {
+        auto connected = bus::BusConnection::connect_session();
+        ASSERT_TRUE(connected.has_value());
+        receiver.emplace(std::move(connected.value()));
+        int sockets[2]{};
+        ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets), 0);
+        peer = sockets[1];
+        ASSERT_EQ(::dup2(sockets[0], receiver->native_handle()), receiver->native_handle());
+        ::close(sockets[0]);
+    }
+    void TearDown() override { if (peer >= 0) ::close(peer); }
+    static std::vector<std::uint8_t> frame(std::size_t total) {
+        bus::MessageWriter writer;
+        writer.path(kReceiverPath).interface_name("org.custom.AndroidAutoReceiver1")
+            .member("Ping").body_signature("s").put_string("x");
+        auto bytes = writer.build(bus::MessageType::method_call, 42);
+        const auto body = total - (bytes.size() - 6); // string length + x + NUL
+        bytes.resize(total, 0);
+        for (unsigned i = 0; i < 4; ++i) bytes[4 + i] = static_cast<std::uint8_t>((body >> (8U * i)) & 0xffU);
+        return bytes;
+    }
+};
+
+TEST_F(SocketBoundary, CapPlusOneDrainsExactlyAndParsesNextMessage) {
+    const auto oversized = frame(bus::kMaxMessageBytes + 1);
+    ASSERT_EQ(bus::inspect_frame(oversized).value().total_bytes, bus::kMaxMessageBytes + 1);
+    bus::MessageWriter ping;
+    ping.path(kReceiverPath).member("Ping");
+    const auto valid = ping.build(bus::MessageType::method_call, 43);
+    bool sent = false;
+    std::jthread writer{[&] {
+        sent = bus::bus_io::write_full(peer, oversized).has_value() &&
+               bus::bus_io::write_full(peer, valid).has_value();
+    }};
+    const auto dropped = receiver->read_message();
+    const auto next = receiver->read_message();
+    writer.join();
+    ASSERT_TRUE(sent);
+    ASSERT_FALSE(dropped.has_value());
+    EXPECT_EQ(dropped.error().code(), ErrorCode::transport_message_dropped);
+    EXPECT_EQ(receiver->dropped_messages(), 1U);
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(next.value().serial, 43U);
+    EXPECT_EQ(next.value().member, "Ping");
+}
+
+TEST_F(SocketBoundary, PeerClosingMidDrainClosesConnection) {
+    const auto oversized = frame(1024 * 1024);
+    ASSERT_TRUE(bus::bus_io::write_full(peer, std::span{oversized}.first(5000)));
+    ::close(peer); peer = -1;
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = receiver->read_message();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code(), ErrorCode::transport_closed);
+    EXPECT_EQ(receiver->native_handle(), -1);
+    EXPECT_EQ(receiver->dropped_messages(), 0U);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1));
+}
+
+TEST_F(SocketBoundary, TricklingPeerCannotExtendDrainDeadline) {
+    const auto oversized = frame(1024 * 1024);
+    ASSERT_TRUE(bus::bus_io::write_full(peer, std::span{oversized}.first(16)));
+    std::jthread trickle{[&](const std::stop_token& stop) {
+        const std::array<std::uint8_t, 1024> chunk{};
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (!stop.stop_requested() && std::chrono::steady_clock::now() < until) {
+            if (!bus::bus_io::write_full(peer, chunk, until)) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }};
+    const auto start = std::chrono::steady_clock::now();
+    receiver->deadline(start + std::chrono::milliseconds(100));
+    const auto result = receiver->read_message();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    trickle.request_stop(); trickle.join();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(result.error().code() == ErrorCode::transport_io ||
+                result.error().code() == ErrorCode::timeout);
+    EXPECT_EQ(receiver->native_handle(), -1);
+    EXPECT_EQ(receiver->dropped_messages(), 0U);
+    EXPECT_GE(elapsed, std::chrono::milliseconds(50));
+    EXPECT_LT(elapsed, std::chrono::milliseconds(400));
 }
 
 } // namespace
