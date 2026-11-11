@@ -952,6 +952,25 @@ class Rollback(unittest.TestCase):
                                      capture_output=True, text=True, timeout=30)
                 self.assertEqual(run.returncode, 0, run.stderr)
 
+    @unittest.skipUnless(shutil.which("unshare"), "unshare required for EUID-0 fixture")
+    def test_euid_zero_cannot_reach_fake_root_eval_hooks(self) -> None:
+        # A user namespace gives the test process EUID 0 without host privileges.
+        # Both scripts must reject test mode before the command hook can execute.
+        sentinel = self.root / "hook-evaluated"
+        env = dict(self.env, AA_USB_POLICY_TEST_HOOKS="after-validate",
+                   AA_USB_POLICY_TEST_HOOK_CMD=f'touch -- "{sentinel}"')
+        for script in ("install.sh", "rollback.sh"):
+            with self.subTest(script=script):
+                run = subprocess.run(
+                    ["unshare", "-Ur", "bash", str(POLICY_DIR / script)],
+                    env=env, capture_output=True, text=True, timeout=30)
+                if run.returncode != 0 and "unshare failed" in run.stderr:
+                    self.skipTest(f"user namespaces unavailable: {run.stderr.strip()}")
+                self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+                self.assertIn("forbidden when euid is 0", run.stderr)
+                self.assertFalse(sentinel.exists())
+                self.assertFalse(self.dst.exists())
+
     def test_live_root_ancestry_accepts_root(self) -> None:
         # Given
         command = f'set -euo pipefail; source "{POLICY_DIR / "common.sh"}"; ROOT=""; die() {{ exit 91; }}; check_dir_trusted() {{ printf "%s\\n" "$1"; }}; trusted_chain_check /etc'
