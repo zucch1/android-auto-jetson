@@ -1150,7 +1150,7 @@ class RuntimeTransport final : public aa::transport::Transport {
                 shutdown_observation->record("final-receive");
             }
             ++shutdown_observation->pings;
-            return wiredtest::control_frame(
+            return wiredtest::encrypted_control_frame(
                 aa::protocol::encode(aa::protocol::PingRequest{1, {}}).value());
         }
         if (drops_ && !runtime_quiet) {

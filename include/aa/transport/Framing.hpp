@@ -107,6 +107,7 @@ encode_message(const Message &message, Encryption encryption, PayloadCipher *cip
 // re-returns transport_closed, so a caller can close the transport safely.
 class MessageReassembler final {
   public:
+    // Plaintext is rejected once the cipher is active (TLS handshake complete).
     // `cipher` is used to open encrypted frame payloads; pass nullptr only for
     // a plain-only stream (an encrypted frame then fails closed).
     explicit MessageReassembler(PayloadCipher *cipher = nullptr) : cipher_(cipher) {}

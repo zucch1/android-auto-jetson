@@ -57,10 +57,17 @@ TlsRecordCodec::TlsRecordCodec(aa::tls::Policy policy, Role role)
         throw std::runtime_error("tls-record-adapter-context");
     }
     // Pin TLS 1.2 AES-GCM so the record overhead is exactly 29 bytes.
-    SSL_CTX_set_min_proto_version(ssl_->ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ssl_->ctx, TLS1_2_VERSION);
-    SSL_CTX_set_cipher_list(ssl_->ctx, "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:"
-                                       "AES128-GCM-SHA256:AES256-GCM-SHA384");
+    constexpr const char* suites =
+        "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384"
+#ifdef AA_TLS_ALLOW_STATIC_RSA_COMPATIBILITY
+        ":AES128-GCM-SHA256:AES256-GCM-SHA384"
+#endif
+        ;
+    if (SSL_CTX_set_min_proto_version(ssl_->ctx, TLS1_2_VERSION) != 1 ||
+        SSL_CTX_set_max_proto_version(ssl_->ctx, TLS1_2_VERSION) != 1 ||
+        SSL_CTX_set_cipher_list(ssl_->ctx, suites) != 1) {
+        throw std::runtime_error("tls-record-adapter-cipher-configuration");
+    }
     if (SSL_CTX_use_certificate(ssl_->ctx, credentials.certificate.get()) != 1 ||
         SSL_CTX_use_PrivateKey(ssl_->ctx, credentials.private_key.get()) != 1 ||
         SSL_CTX_check_private_key(ssl_->ctx) != 1) {

@@ -356,6 +356,11 @@ core::Result<bool> WiredSession::poll_transport_impl(
     for (const auto &chunk : chunks.value()) {
         auto message = reassembler_.push(chunk);
         if (!message) {
+            if (message.error().code() == ErrorCode::transport_plaintext_after_tls) {
+                // Terminal protocol violation; fail() emits the distinct error code.
+                (void)fail(message.error());
+                transport_->close();
+            }
             return message.error();
         }
         if (message.value().has_value()) {

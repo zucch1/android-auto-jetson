@@ -99,12 +99,12 @@ TEST(WiredE2eAuth, RedrivenHandshakeDoesNotResendAuthComplete) {
     ASSERT_TRUE(f.session.authenticated());
     const auto before = f.transport.sent_count();
     f.transport.push_inbound(
-        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+        wiredtest::encrypted_control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
     ASSERT_TRUE(f.session.poll_transport().has_value());
     EXPECT_EQ(f.session.auth_completes(), 1U);
     EXPECT_EQ(f.transport.sent_count(), before);
     f.transport.push_inbound(
-        wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
+        wiredtest::encrypted_control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()));
     auto refused = f.session.poll_transport();
     ASSERT_FALSE(refused.has_value());
     EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
@@ -128,7 +128,7 @@ TEST(WiredE2eAuth, FailedAuthCompleteSendDoesNotAuthenticate) {
     EXPECT_FALSE(f.session.authenticated());
     EXPECT_EQ(f.session.auth_completes(), 0U);
     f.transport.push_inbound(
-        wiredtest::control_frame(proto::encode(proto::AuthComplete{0}).value()));
+        wiredtest::encrypted_control_frame(proto::encode(proto::AuthComplete{0}).value()));
     auto refused = f.session.poll_transport();
     ASSERT_FALSE(refused.has_value());
     EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
@@ -136,7 +136,7 @@ TEST(WiredE2eAuth, FailedAuthCompleteSendDoesNotAuthenticate) {
     EXPECT_EQ(f.session.auth_completes(), 0U);
     f.transport.fail_send_at(std::nullopt);
     f.transport.push_inbound(
-        wiredtest::control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
+        wiredtest::encrypted_control_frame(proto::encode(proto::EncapsulatedSsl{{std::byte{0x01}}}).value()));
     ASSERT_TRUE(f.session.poll_transport().has_value());
     EXPECT_TRUE(f.session.authenticated());
     EXPECT_EQ(f.session.auth_completes(), 1U);
@@ -154,7 +154,7 @@ TEST(WiredE2eAuth, InboundAuthCompleteAfterSslIsRefusedWithoutStateChange) {
     const auto state = f.session.state();
     const auto before = f.transport.sent_count();
     f.transport.push_inbound(
-        wiredtest::control_frame(proto::encode(proto::AuthComplete{0}).value()));
+        wiredtest::encrypted_control_frame(proto::encode(proto::AuthComplete{0}).value()));
     auto refused = f.session.poll_transport();
     ASSERT_FALSE(refused.has_value());
     EXPECT_EQ(refused.error().code(), aa::ErrorCode::transport_unauthorized_peer);
@@ -286,7 +286,7 @@ TEST(WiredE2eAuth, ControlChannelFramesUseAasdkSpecificKind) {
     // asserted against the AASDK truth, so neither side can drift to 0x07).
     expect_specific_control_frame(
         wiredtest::control_frame(proto::encode(proto::VersionResponse{1, 6, 0}).value()), false);
-    expect_specific_control_frame(wiredtest::discovery_request_frame(), false);
+    expect_specific_control_frame(wiredtest::discovery_request_frame(), true);
 
     // Handshake chunk (encapsulated_ssl, HU -> phone).
     f.transport.push_inbound(
@@ -527,6 +527,23 @@ TEST(WiredE2eAuth, EncapsulatedSslCountedOnlyAfterValidation) {
     ASSERT_FALSE(refused.has_value());
     EXPECT_EQ(refused.error().code(), aa::ErrorCode::channel_not_registered);
     EXPECT_EQ(session.encapsulated_ssls(), 0U);
+}
+
+TEST(WiredE2eAuth, PlaintextAfterTlsEndsSessionWithDistinctDiagnostic) {
+    AuthFixture f;
+    wiredtest::walk_auth(f.session, f.transport);
+    ASSERT_TRUE(f.session.authenticated());
+    f.transport.push_inbound(wiredtest::control_frame(
+        proto::encode(proto::PingRequest{123, false, {}}).value()));
+    auto result = f.session.poll_transport();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::transport_plaintext_after_tls);
+    EXPECT_EQ(f.session.state(), ss::State::failed);
+    ASSERT_TRUE(f.session.failure().has_value());
+    EXPECT_EQ(f.session.failure()->code(), aa::ErrorCode::transport_plaintext_after_tls);
+    EXPECT_FALSE(f.transport.is_open());
+    EXPECT_TRUE(f.capture.contains("\"error_code\":107"));
+    EXPECT_EQ(f.session.pings_answered(), 0U);
 }
 
 } // namespace

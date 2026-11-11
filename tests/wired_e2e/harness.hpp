@@ -201,20 +201,31 @@ inline std::vector<std::byte> control_frame(std::vector<std::byte> payload) {
     return frames.value().front();
 }
 
+// Post-authentication synthetic phone traffic uses the same reversible test cipher.
+inline std::vector<std::byte> encrypted_control_frame(std::vector<std::byte> payload) {
+    FakeHandshakeCipher cipher{1};
+    (void)cipher.step_handshake();
+    return aa::transport::encode_message(
+        {0, aa::transport::MessageKind::specific, std::move(payload)},
+        aa::transport::Encryption::encrypted, &cipher).value().front();
+}
+
 inline std::vector<std::byte> discovery_request_frame() {
-    return control_frame({std::byte{0x00}, std::byte{0x05}});
+    return encrypted_control_frame({std::byte{0x00}, std::byte{0x05}});
 }
 
 inline std::vector<std::byte> open_request_frame(std::int32_t service) {
-    return control_frame(
+    return encrypted_control_frame(
         aa::protocol::encode(aa::protocol::ChannelOpenRequest{1, aa::protocol::ServiceKey{service}})
             .value());
 }
 
 inline std::vector<std::byte> service_frame(std::uint8_t channel, std::vector<std::byte> payload) {
+    FakeHandshakeCipher cipher{1};
+    (void)cipher.step_handshake();
     auto frames = aa::transport::encode_message(
         aa::transport::Message{channel, aa::transport::MessageKind::specific, std::move(payload)},
-        aa::transport::Encryption::plain, nullptr);
+        aa::transport::Encryption::encrypted, &cipher);
     return frames.value().front();
 }
 

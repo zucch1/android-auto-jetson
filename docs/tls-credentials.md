@@ -107,3 +107,23 @@ These tests establish host API/build behavior only. They do not qualify a real
 phone, Jetson, deployment installation, pairing store, production credentials,
 production TLS trust, cross compilation or target performance. No target or
 phone contact, push, PR or acceptance-ledger update is part of this task.
+
+### AAP record cipher policy
+
+The production AAP record codec pins TLS 1.2 to
+`ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384` and checks protocol
+and cipher configuration for failure. These suites provide forward secrecy.
+No captured real-phone cipher negotiation is available in this repository;
+a real-phone check on the Jetson is still required.
+
+For a phone proven to require static RSA, configure with
+`-DAA_TLS_ALLOW_STATIC_RSA_COMPATIBILITY=ON` (default: `OFF`). This adds
+`AES128-GCM-SHA256:AES256-GCM-SHA384`, emits a configure warning, and sacrifices
+forward secrecy if one is negotiated. Record the affected phone and rotate the
+HU credential regularly while this compatibility setting is in use.
+
+Version exchange and encapsulated TLS flights remain plaintext until the cipher
+becomes active. The HU also sends its plaintext AuthComplete at that transition.
+All inbound frames after activation must be encrypted, on every channel;
+plaintext is a terminal `transport_plaintext_after_tls` protocol violation,
+recorded in session diagnostics as error code 107.

@@ -113,6 +113,11 @@ MessageReassembler::push(std::span<const std::byte> frame_bytes) {
         }
         chunk = std::move(opened).value();
     } else {
+        // Version exchange and encapsulated TLS flights arrive before activation.
+        // Once TLS finishes, every inbound frame must have record integrity.
+        if (cipher_ != nullptr && cipher_->is_active()) {
+            return fail(Error{ErrorCode::transport_plaintext_after_tls});
+        }
         chunk = frame.payload;
     }
 

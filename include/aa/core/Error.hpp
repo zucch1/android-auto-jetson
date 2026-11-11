@@ -32,6 +32,7 @@ enum class ErrorCode : std::uint16_t {
     transport_oversize_frame = 104,
     transport_unauthorized_peer = 105,
     transport_queue_full = 106,
+    transport_plaintext_after_tls = 107,
 
     // protocol
     protocol_version_mismatch = 200,
