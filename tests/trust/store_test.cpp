@@ -354,4 +354,40 @@ TEST(TrustStore, ApproveStructuredNonprintableFieldIsRejected) {
     EXPECT_FALSE(std::filesystem::exists(dir.file()));
 }
 
+// Independent validation (2026-11-06): Identity.hpp advertises "the STRONGEST
+// available transport identity per phone", but validated_key() accepts a
+// WiredIdentity that carries NO serial at all (wired_has_material() is happy
+// with VID/PID + port_context alone). A phone approved in that state therefore
+// authorises EVERY other serial-less device presenting the same VID/PID on the
+// same port -- approving attacker phone A silently approves phone B. The
+// documented wired trust boundary is physical-port access, but it does not say
+// "any device, forever"; a port-only approval should be visibly weaker (or
+// refused) rather than recorded as an ordinary identity.
+TEST(TrustStore, SerialLessApprovalDoesNotAliasADifferentDevice) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+
+    trust::WiredIdentity phone_a;
+    phone_a.usb_vendor_id = "18d1";
+    phone_a.usb_product_id = "4ee1";
+    phone_a.port_context = "1-2.3";
+
+    trust::WiredIdentity phone_b;
+    phone_b.usb_vendor_id = "18d1";
+    phone_b.usb_product_id = "4ee1";
+    phone_b.port_context = "1-2.3";
+
+    // Control: the two records are structurally identical serial-less devices.
+    ASSERT_EQ(trust::identity_key(trust::TransportIdentity{phone_a}),
+              trust::identity_key(trust::TransportIdentity{phone_b}));
+
+    const auto approved = store.approve(trust::TransportIdentity{phone_a});
+    ASSERT_TRUE(approved.has_value());
+
+    EXPECT_EQ(store.lookup(test::identity_of(trust::TransportIdentity{phone_b})),
+              trust::Decision::unknown)
+        << "a serial-less approval must not authorise a different physical device";
+}
+
 } // namespace
