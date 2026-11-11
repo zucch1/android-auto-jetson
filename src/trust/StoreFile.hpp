@@ -37,17 +37,21 @@ inline constexpr std::size_t kMaxStoreBytes = std::size_t{256} * 1024;
 // O_DIRECTORY|O_NOFOLLOW). A symlink at the store name or any ancestor is a trust_store_io rejection, never followed.
 [[nodiscard]] core::Result<void> ensure_private_file(const std::filesystem::path& path);
 
-// Reads the store file through the verified parent descriptor; an absent file
-// yields an empty string (fresh store). Symlinked (store name OR parent),
-// foreign-owned, permissive, oversized or unreadable stores are
-// trust_store_io.
+// Reads through verified directory descriptors before looking at the basename.
+// A genuinely missing directory component or store file yields an empty string.
+// Symlinks at the store name or any ancestor reject even if the target lacks
+// the file. Foreign-owned parents, or foreign-owned, permissive, oversized or
+// unreadable store files, are trust_store_io.
 [[nodiscard]] core::Result<std::string> read_file(const std::filesystem::path& path);
 
 // Atomic replace anchored on the verified store-directory descriptor:
-// create missing ancestors at 0700 (checked fchmod on the creation fd, fail
-// closed; each newly created directory and its containing directory are
-// fsynced before anything is written inside), open the immediate parent
-// O_DIRECTORY|O_NOFOLLOW (a symlinked parent rejects BEFORE any mutation),
+// walk every ancestor with openat(O_DIRECTORY|O_NOFOLLOW), creating missing
+// ancestors at 0700 (checked fchmod on the creation fd, fail closed). Each
+// newly created directory and its containing directory are
+// fsynced before anything is written inside. Rollback is local: a newly
+// opened component that fails verification or sync is removed best-effort;
+// ancestors created earlier remain after a later failure. A symlink rejects
+// before any mutation below it. On the final directory descriptor,
 // validate ownership via fstat and tighten via checked fchmod on that fd to
 // 0700, then exclusively create (O_CREAT|O_EXCL) an unpredictably named 0600
 // temp file there (fchmod defeats umask), fsync and CHECKED-close the temp

@@ -44,6 +44,60 @@ TEST(PairingPolicy, ApproveOnceThenReconnectAndForget) {
     EXPECT_FALSE(trust::allows_session(store.lookup(identity)));
 }
 
+// Normal pairing cannot grant port-only consent: reject before prompting
+// and leave nothing pending. Explicit consent uses the separate store API.
+TEST(PairingPolicy, SerialLessWiredCandidateIsRejectedAtRequest) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    test::ManualClock clock;
+    trust::PairingPolicy policy{store, clock};
+
+    trust::WiredIdentity serial_less = test::kWired;
+    serial_less.usb_serial.clear();
+    serial_less.aoa_serial.clear();
+    policy.note_candidate(trust::TransportIdentity{serial_less});
+
+    const aa::core::PairingRequestId request{600};
+    const auto requested = policy.pairing_requested(request);
+    ASSERT_FALSE(requested.has_value());
+    EXPECT_EQ(requested.error().code(), ErrorCode::trust_port_only_requires_opt_in);
+    EXPECT_EQ(policy.pending_count(), 0U);
+    EXPECT_FALSE(policy.has_pending(request));
+
+    const auto confirmed = policy.pairing_confirmed(request);
+    ASSERT_FALSE(confirmed.has_value());
+    EXPECT_EQ(confirmed.error().code(), ErrorCode::trust_unknown_phone);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file()));
+    EXPECT_EQ(store.lookup(test::identity_of(trust::TransportIdentity{serial_less})),
+              trust::Decision::unknown);
+}
+
+TEST(PairingPolicy, OpaqueWiredCandidateCannotBypassRequestPreflight) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    test::ManualClock clock;
+    trust::PairingPolicy policy{store, clock};
+    auto wired = test::kWired;
+    wired.usb_serial = " ";
+    wired.aoa_serial.clear();
+    const aa::core::PairingRequestId request{601};
+    policy.note_candidate(trust::TransportIdentity{trust::OpaqueIdentity{
+        trust::identity_key(trust::TransportIdentity{wired})}});
+    const auto port_only = policy.pairing_requested(request);
+    ASSERT_FALSE(port_only.has_value());
+    EXPECT_EQ(port_only.error().code(), ErrorCode::trust_port_only_requires_opt_in);
+    policy.note_candidate(trust::TransportIdentity{trust::OpaqueIdentity{"w1:bad"}});
+    const auto malformed = policy.pairing_requested(request);
+    ASSERT_FALSE(malformed.has_value());
+    EXPECT_EQ(malformed.error().code(), ErrorCode::trust_unknown_phone);
+    EXPECT_EQ(policy.pending_count(), 0U);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file()));
+}
+
 TEST(PairingPolicy, RequestWithoutConfirmLeavesStoreUntouched) {
     test::TempStoreDir dir;
     trust::ApprovedPhoneStore store{dir.file()};
@@ -396,12 +450,15 @@ TEST(PairingPolicy, NormalPairingCannotCreatePortOnlyApproval) {
     wired.aoa_serial.clear();
     policy.note_candidate(trust::TransportIdentity{wired});
     const aa::core::PairingRequestId request{501};
-    ASSERT_TRUE(policy.pairing_requested(request).has_value());
-    const auto approved = policy.pairing_confirmed(request);
-    ASSERT_FALSE(approved.has_value());
-    EXPECT_EQ(approved.error().code(), ErrorCode::trust_port_only_requires_opt_in);
+    const auto requested = policy.pairing_requested(request);
+    ASSERT_FALSE(requested.has_value());
+    EXPECT_EQ(requested.error().code(), ErrorCode::trust_port_only_requires_opt_in);
+    EXPECT_EQ(policy.pending_count(), 0U);
+    ASSERT_TRUE(store.approve_port_only(wired).has_value());
+    EXPECT_EQ(store.lookup(test::identity_of(trust::TransportIdentity{wired})),
+              trust::Decision::approved);
+    ASSERT_TRUE(store.forget(test::identity_of(trust::TransportIdentity{wired})).has_value());
     EXPECT_TRUE(store.phones().empty());
-    EXPECT_FALSE(std::filesystem::exists(dir.file()));
 }
 
 } // namespace

@@ -4,8 +4,6 @@
 #include "Json.hpp"
 
 #include <algorithm>
-#include <array>
-#include <charconv>
 
 namespace aa::trust::detail {
 
@@ -124,24 +122,8 @@ using Object = JsonValue::Object;
 // being represented as opaque. Malformed reserved w1: encodings also return
 // true to fail closed and count as dropped port-only grants in v1/v2 migration.
 [[nodiscard]] bool implicit_port_key(std::string_view key) {
-    if (!key.starts_with("w1:")) { return false; }
-    key.remove_prefix(3);
-    std::array<std::string_view, 7> fields{};
-    for (auto& field : fields) {
-        const auto colon = key.find(':');
-        if (colon == std::string_view::npos) { return true; }
-        std::size_t size{};
-        const auto parsed = std::from_chars(key.data(), key.data() + colon, size);
-        if (parsed.ec != std::errc{} || parsed.ptr != key.data() + colon) { return true; }
-        key.remove_prefix(colon + 1);
-        if (size > key.size()) { return true; }
-        field = key.substr(0, size);
-        key.remove_prefix(size);
-    }
-    WiredIdentity wired;
-    wired.usb_serial = fields[2];
-    wired.aoa_serial = fields[5];
-    return !key.empty() || strength_of(TransportIdentity{wired}) == IdentityStrength::port_only;
+    const auto classification = classify_wired_key(key);
+    return classification == WiredKeyClass::port_only || classification == WiredKeyClass::malformed;
 }
 
 [[nodiscard]] core::Result<ApprovedPhone> parse_record_impl(const JsonValue& value, bool has_strength) {

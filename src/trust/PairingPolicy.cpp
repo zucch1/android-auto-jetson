@@ -138,6 +138,14 @@ core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId reque
         // Fail closed: a request with no presented phone approves nothing.
         return Error{ErrorCode::trust_unknown_phone};
     }
+    const auto wired_class = classify_wired_key(identity_key(*candidate_));
+    if (wired_class == WiredKeyClass::malformed) {
+        return Error{ErrorCode::trust_unknown_phone};
+    }
+    if (wired_class == WiredKeyClass::port_only) {
+        // Normal pairing has no separate port-only consent; reject before prompting.
+        return Error{ErrorCode::trust_port_only_requires_opt_in};
+    }
     if (pending_.size() >= kMaxPending) {
         return Error{ErrorCode::ipc_queue_full};
     }

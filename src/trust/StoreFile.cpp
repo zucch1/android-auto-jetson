@@ -73,11 +73,12 @@ constexpr mode_t kDirMode = 0700;
 // Resolve every component relative to the preceding descriptor. Never normalize
 // away a symlink/.. pair: reject .. before any creation or permission change.
 // Existing ancestors may be shared (e.g. /tmp); only created directories and
-// the final store parent must belong to this user and be private. Reads
-// defer the final ownership check until a file is found, preserving the empty
-// store semantics for an absent file in a shared directory.
-[[nodiscard]] int open_verified_parent(const std::filesystem::path& parent, bool create,
-                                       bool allow_foreign = false) {
+// the final store parent must belong to this user; writes make it private.
+// Creation rollback is local: if verification or fsync of a newly opened
+// component fails, attempt to remove that component with unlinkat. Ancestors
+// created successfully earlier in this walk remain; a later failure does not
+// roll back the whole walk (nor change the previous store file).
+[[nodiscard]] int open_verified_parent(const std::filesystem::path& parent, bool create) {
     for (const auto& component : parent) {
         if (component == "..") {
             errno = EINVAL;
@@ -132,7 +133,7 @@ constexpr mode_t kDirMode = 0700;
     }
     struct stat info {};
     if (::fstat(current, &info) != 0 || !S_ISDIR(info.st_mode) ||
-        (!allow_foreign && info.st_uid != ::geteuid()) ||
+        info.st_uid != ::geteuid() ||
         (create && (::fchmod(current, kDirMode) != 0 || ::fstat(current, &info) != 0 ||
                     (info.st_mode & 07777) != kDirMode))) {
         ::close(current);
@@ -192,7 +193,7 @@ core::Result<std::string> read_file(const std::filesystem::path& path) {
     if (filename.empty() || filename == "." || filename == "..") {
         return Error{ErrorCode::trust_store_io};
     }
-    const int dirfd = open_verified_parent(path.parent_path(), false, true);
+    const int dirfd = open_verified_parent(path.parent_path(), false);
     if (dirfd < 0) {
         if (errno == ENOENT) { return std::string{}; }
         return Error{ErrorCode::trust_store_io};
