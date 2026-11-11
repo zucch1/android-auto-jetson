@@ -88,6 +88,23 @@ def plant_rejections(root: Path) -> None:
             assert result.returncode == 1, (name, result)
             assert result.stdout == 'tls-key-scan: FAIL credential-material-present\n', (name, result)
             target.unlink()
+        # Workspace links have a distinct diagnosis, never a false credential claim.
+        benign = fixture / 'benign.txt'
+        benign.write_text('no credential material\n')
+        for name, target_path in (('source-link', benign), ('directory-link', fixture)):
+            link = fixture / name
+            link.symlink_to(target_path, target_is_directory=target_path.is_dir())
+            result = run(scanner, fixture)
+            assert result.returncode == 1, (name, result)
+            assert result.stdout == 'tls-key-scan: FAIL symlink-present\n', (name, result)
+            link.unlink()
+        # Top-level local agent workspaces are non-source and excluded explicitly.
+        workspace = fixture / '.claude/worktrees'
+        workspace.mkdir(parents=True)
+        (workspace / 'local').symlink_to(fixture, target_is_directory=True)
+        result = run(scanner, fixture)
+        assert result.returncode == 0, result
+        (workspace / 'local').unlink()
         historical = denied_digests(scanner)
         payload = b'synthetic stand-in for a digest-checked copy\n'
         assert hashlib.sha256(payload).hexdigest() not in historical, payload
