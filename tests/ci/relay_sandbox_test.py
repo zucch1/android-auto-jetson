@@ -27,6 +27,7 @@ cmake build; the sandboxed step is a probe command) with a fake `gh` first on PA
 Exits 77 (ctest SKIP) with a reason when no sandbox backend works on this machine.
 """
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -358,6 +359,17 @@ def run_bootstrap_tests() -> None:
                 finally:
                     path.write_bytes(original)
     print('relay bootstrap: 6 divergence cases PASS (pin and origin/main)')
+
+    # Every host-side Python the relay starts must run isolated (-I). Without it a script
+    # read from stdin or -c puts the current directory first on sys.path, so a planted
+    # hashlib.py next to the caller would run inside the status-posting step.
+    for name in ('arm64-cross-relay.sh', 'relay-sandbox-lib.sh'):
+        for number, line in enumerate((ROOT / 'tools' / 'ci' / name).read_text().splitlines(), 1):
+            code = line.split('#', 1)[0]
+            if re.search(r'(\bpython3|"\$py")\s+-', code):
+                check(re.search(r'(\bpython3|"\$py")\s+-I\b', code) is not None,
+                      f'{name}:{number}: host python must run isolated (-I)', line)
+    print('relay bootstrap: host python invocations are isolated PASS')
 
 
 def main() -> int:

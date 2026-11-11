@@ -395,7 +395,7 @@ fi
 
 # Commit statuses have a short description limit, so include compact sha256 prefixes
 # while the full per-log sha256 values remain recorded above in step_shas.
-description="$(python3 -B - "$logs" "$conclusion" <<'PY'
+description="$(python3 -I -B - "$logs" "$conclusion" <<'PY'
 import hashlib
 import sys
 from pathlib import Path
