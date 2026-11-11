@@ -215,10 +215,9 @@ TEST(StorePermissions, PermissiveUmaskStillYields0700Ancestors) {
 TEST(StorePermissions, UnTightenableParentDirectoryFailsClosed) {
     test::TempStoreDir dir;
     const auto dangling = dir.dir() / "dangling";
-    ASSERT_EQ(::symlink((dir.dir() / "missing-target").c_str(), dangling.c_str()), 0);
-
     trust::ApprovedPhoneStore store{dangling / "approved-phones.json"};
     ASSERT_TRUE(store.load().has_value());
+    ASSERT_EQ(::symlink((dir.dir() / "missing-target").c_str(), dangling.c_str()), 0);
     const auto approved = store.approve(trust::TransportIdentity{test::kWired});
     ASSERT_FALSE(approved.has_value());
     EXPECT_EQ(approved.error().code(), ErrorCode::trust_store_io);
@@ -273,10 +272,9 @@ TEST(StorePermissions, SymlinkedParentWriteFailsClosedWithoutMutatingTarget) {
     std::filesystem::create_directories(target);
     ASSERT_EQ(::chmod(target.c_str(), 0755), 0);
     const auto link = dir.dir() / "link";
-    ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
-
     trust::ApprovedPhoneStore store{link / "approved-phones.json"};
     ASSERT_TRUE(store.load().has_value());
+    ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
     const auto approved = store.approve(trust::TransportIdentity{test::kWired});
     ASSERT_FALSE(approved.has_value());
     EXPECT_EQ(approved.error().code(), ErrorCode::trust_store_io);
@@ -364,6 +362,39 @@ TEST(StorePermissions, IntermediateSymlinkComponentCannotLoadAnExteriorStore) {
     trust::ApprovedPhoneStore store{store_path};
     EXPECT_FALSE(store.load().has_value());
     EXPECT_EQ(store.lookup(trust::PhoneIdentity{"approved-key"}), trust::Decision::unknown);
+}
+
+TEST(StorePermissions, DotDotRejectedBeforeCreatingAnyDirectory) {
+    test::TempStoreDir dir;
+    const auto path = dir.dir() / "new" / ".." / "store" / "phones.json";
+    EXPECT_FALSE(trust::detail::write_file_private(path, "{}").has_value());
+    EXPECT_FALSE(std::filesystem::exists(dir.dir() / "new"));
+    EXPECT_FALSE(trust::detail::read_file(path).has_value());
+}
+
+TEST(StorePermissions, RelativePathWalkRetainsPrivateStoreSemantics) {
+    test::TempStoreDir dir;
+    const auto previous = std::filesystem::current_path();
+    std::filesystem::current_path(dir.dir());
+    const auto written = trust::detail::write_file_private("./a/b/store.json", "{}");
+    const auto read = trust::detail::read_file("a/./b/store.json");
+    std::filesystem::current_path(previous);
+    EXPECT_TRUE(written.has_value());
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(read.value(), "{}");
+}
+
+TEST(StorePermissions, NonDirectoryAncestorRejectsReadAndWrite) {
+    test::TempStoreDir dir;
+    const auto blocker = dir.dir() / "file";
+    { std::ofstream out{blocker}; out << "untouched"; }
+    const auto path = blocker / "store" / "phones.json";
+    EXPECT_FALSE(trust::detail::read_file(path).has_value());
+    EXPECT_FALSE(trust::detail::write_file_private(path, "{}").has_value());
+    std::ifstream in{blocker};
+    std::string contents;
+    in >> contents;
+    EXPECT_EQ(contents, "untouched");
 }
 
 } // namespace

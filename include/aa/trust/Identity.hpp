@@ -5,6 +5,9 @@
 // STRONGEST available transport identity per phone:
 //   - wired    : USB descriptor ids + USB serial + AOA identity + physical-port
 //                context (the qualified USB3 port path as the kernel reports it)
+//     Serial-less wired identities have a port-only strength: the descriptor
+//     tuple on that port matches every indistinguishable device. The store
+//     requires a separate explicit approval API for this weaker grant.
 //   - wireless : the BlueZ bond identity (bond address + adapter) carried as
 //                plain DATA. This module never talks to BlueZ; the transport
 //                layer hands the bond identity over.
@@ -34,6 +37,9 @@
 #include <variant>
 
 namespace aa::trust {
+
+// Port-only identifies a descriptor tuple on a port, never a particular phone.
+enum class IdentityStrength { serial_backed, port_only, bond_backed, opaque };
 
 enum class TransportKind { wired, wireless, opaque };
 
@@ -79,6 +85,9 @@ using TransportIdentity = std::variant<WiredIdentity, WirelessIdentity, OpaqueId
 inline constexpr std::size_t kMaxIdentityFieldBytes = 512;
 
 [[nodiscard]] TransportKind kind_of(const TransportIdentity& identity) noexcept;
+
+[[nodiscard]] IdentityStrength strength_of(const TransportIdentity& identity) noexcept;
+[[nodiscard]] std::string_view strength_name(IdentityStrength strength) noexcept;
 
 // Stable, injective canonical key of the FULL structured identity:
 //   wired    -> "w1:" + length-prefixed descriptor, serial, AOA and port fields

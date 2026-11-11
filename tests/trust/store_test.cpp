@@ -382,12 +382,34 @@ TEST(TrustStore, SerialLessApprovalDoesNotAliasADifferentDevice) {
     ASSERT_EQ(trust::identity_key(trust::TransportIdentity{phone_a}),
               trust::identity_key(trust::TransportIdentity{phone_b}));
 
-    const auto approved = store.approve(trust::TransportIdentity{phone_a});
-    ASSERT_TRUE(approved.has_value());
-
+    const auto implicit = store.approve(trust::TransportIdentity{phone_a});
+    ASSERT_FALSE(implicit.has_value());
+    EXPECT_EQ(implicit.error().code(), aa::ErrorCode::trust_port_only_requires_opt_in);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file()));
     EXPECT_EQ(store.lookup(test::identity_of(trust::TransportIdentity{phone_b})),
-              trust::Decision::unknown)
-        << "a serial-less approval must not authorise a different physical device";
+              trust::Decision::unknown);
+    EXPECT_FALSE(store.approve_once(test::identity_of(trust::TransportIdentity{phone_a})).has_value());
+
+    const auto explicit_grant = store.approve_port_only(phone_a);
+    ASSERT_TRUE(explicit_grant.has_value());
+    ASSERT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(store.phones()[0].strength, trust::IdentityStrength::port_only);
+    EXPECT_NE(store.redacted_summary().find("[port-only]"), std::string::npos);
+    EXPECT_EQ(store.redacted_summary().find(phone_a.port_context), std::string::npos);
+    // Consent is to the port/descriptor tuple; it cannot distinguish these devices.
+    EXPECT_EQ(store.lookup(test::identity_of(trust::TransportIdentity{phone_b})),
+              trust::Decision::approved);
+    EXPECT_FALSE(store.approve(trust::TransportIdentity{phone_a}).has_value());
+
+    trust::ApprovedPhoneStore fresh{dir.file()};
+    ASSERT_TRUE(fresh.load().has_value());
+    ASSERT_EQ(fresh.phones().size(), 1U);
+    EXPECT_EQ(fresh.phones()[0].strength, trust::IdentityStrength::port_only);
+    EXPECT_NE(fresh.redacted_summary().find("[port-only]"), std::string::npos);
+    ASSERT_TRUE(fresh.forget_phone(explicit_grant.value()).has_value());
+    EXPECT_EQ(fresh.lookup(test::identity_of(trust::TransportIdentity{phone_b})),
+              trust::Decision::unknown);
 }
 
 } // namespace

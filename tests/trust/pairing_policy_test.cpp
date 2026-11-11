@@ -385,4 +385,23 @@ TEST(PairingPolicy, FreshRequestAfterForgetApprovesAgainAndPersists) {
               trust::Decision::approved);
 }
 
+TEST(PairingPolicy, NormalPairingCannotCreatePortOnlyApproval) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    test::ManualClock clock;
+    trust::PairingPolicy policy{store, clock};
+    auto wired = test::kWired;
+    wired.usb_serial.clear();
+    wired.aoa_serial.clear();
+    policy.note_candidate(trust::TransportIdentity{wired});
+    const aa::core::PairingRequestId request{501};
+    ASSERT_TRUE(policy.pairing_requested(request).has_value());
+    const auto approved = policy.pairing_confirmed(request);
+    ASSERT_FALSE(approved.has_value());
+    EXPECT_EQ(approved.error().code(), ErrorCode::trust_port_only_requires_opt_in);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file()));
+}
+
 } // namespace

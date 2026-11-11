@@ -7,9 +7,9 @@
 //
 // Runtime-file boundary (gate-fix rounds 2-3): every open is symlink-safe
 // (O_NOFOLLOW), every check runs against the opened fd (fstat) rather than a
-// path lookup, and reads and writes traverse ONLY the verified immediate
-// parent descriptor — a symlinked parent is a rejection that mutates nothing
-// (no path-based chmod anywhere). Created directories are 0700 at every
+// path lookup, and reads and writes walk every ancestor via openat on the
+// previous directory descriptor. A symlinked ancestor is rejected
+// (no path-based chmod anywhere); .. is rejected before mutations. Created directories are 0700 at every
 // created ancestor (checked fchmod on the creation fd), and the temp file is
 // exclusively created (O_CREAT|O_EXCL) under an unpredictable name so a
 // pre-placed file or symlink can never intercept the write.
@@ -34,8 +34,7 @@ inline constexpr std::size_t kMaxStoreBytes = std::size_t{256} * 1024;
 // Succeeds only when the store path is a regular file owned by the effective
 // user with no group/other mode bits, reached THROUGH the verified parent
 // descriptor (immediate parent: real directory, effective-user-owned, opened
-// O_DIRECTORY|O_NOFOLLOW). A symlink at the store name or at the immediate
-// parent is a trust_store_io rejection, never followed.
+// O_DIRECTORY|O_NOFOLLOW). A symlink at the store name or any ancestor is a trust_store_io rejection, never followed.
 [[nodiscard]] core::Result<void> ensure_private_file(const std::filesystem::path& path);
 
 // Reads the store file through the verified parent descriptor; an absent file

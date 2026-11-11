@@ -76,6 +76,7 @@ enum class ErrorCode : std::uint16_t {
     // and only crash durability of the new directory entry is unconfirmed.
     // Append-only band: never renumber or repurpose.
     trust_store_not_durable = 703,
+    trust_port_only_requires_opt_in = 704,
 
     // config
     config_invalid = 800,

@@ -59,6 +59,25 @@ TransportKind kind_of(const TransportIdentity& identity) noexcept {
     }
 }
 
+IdentityStrength strength_of(const TransportIdentity& identity) noexcept {
+    if (const auto* wired = std::get_if<WiredIdentity>(&identity)) {
+        return wired->usb_serial.empty() && wired->aoa_serial.empty()
+            ? IdentityStrength::port_only : IdentityStrength::serial_backed;
+    }
+    return kind_of(identity) == TransportKind::wireless
+        ? IdentityStrength::bond_backed : IdentityStrength::opaque;
+}
+
+std::string_view strength_name(IdentityStrength strength) noexcept {
+    switch (strength) {
+    case IdentityStrength::serial_backed: return "serial-backed";
+    case IdentityStrength::port_only: return "port-only";
+    case IdentityStrength::bond_backed: return "bond-backed";
+    case IdentityStrength::opaque: return "opaque";
+    }
+    return "opaque";
+}
+
 std::string identity_key(const TransportIdentity& identity) {
     std::string out;
     if (const auto* wired = std::get_if<WiredIdentity>(&identity)) {

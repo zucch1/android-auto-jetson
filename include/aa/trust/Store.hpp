@@ -48,6 +48,7 @@ namespace aa::trust {
 struct ApprovedPhone final {
     core::PhoneId phone_id{};
     TransportIdentity identity{};
+    IdentityStrength strength{IdentityStrength::opaque};
 
     [[nodiscard]] friend bool operator==(const ApprovedPhone&, const ApprovedPhone&) noexcept =
         default;
@@ -55,7 +56,7 @@ struct ApprovedPhone final {
 
 // Store document bounds (fail closed beyond these).
 inline constexpr std::size_t kMaxApprovedPhones = 256;
-inline constexpr std::uint64_t kCurrentSchemaVersion = 2;
+inline constexpr std::uint64_t kCurrentSchemaVersion = 3;
 
 // ONE coherent phone-id range shared by the loader and the allocators: record
 // ids live in [1, kMaxPhoneId]; next_phone_id is accepted in
@@ -88,8 +89,13 @@ public:
     // Structured approve-once (task 27 pairing flow): persist the strongest
     // available transport identity and allocate a stable PhoneId. Approve-once
     // semantics: re-approving an already-approved key returns the existing id
-    // and never adds a second record.
+    // and never adds a second record. Serial-less wired identities are rejected
+    // with trust_port_only_requires_opt_in; use approve_port_only explicitly.
     [[nodiscard]] core::Result<core::PhoneId> approve(const TransportIdentity& identity);
+
+    // Explicit weaker grant: any device presenting the same descriptors on this
+    // port will match. Normal pairing never calls this API.
+    [[nodiscard]] core::Result<core::PhoneId> approve_port_only(const WiredIdentity& identity);
 
     // ForgetPhone path: revoke by phone id, persist the removal.
     [[nodiscard]] core::Result<void> forget_phone(core::PhoneId phone);
@@ -103,6 +109,8 @@ public:
     [[nodiscard]] std::string redacted_summary() const;
 
 private:
+    [[nodiscard]] core::Result<core::PhoneId> approve_impl(const TransportIdentity& identity,
+                                                        bool allow_port_only);
     [[nodiscard]] core::Result<void> persist();
     [[nodiscard]] std::optional<std::size_t> index_of_key(const std::string& key) const;
 

@@ -96,4 +96,51 @@ TEST(StoreMigration, DuplicatePhoneIdIsRejected) {
     EXPECT_EQ(loaded.error().code(), ErrorCode::trust_store_io);
 }
 
+TEST(StoreMigration, V2PortOnlyApprovalRequiresFreshConsent) {
+    test::TempStoreDir dir;
+    write_text(dir.file(),
+        R"({"schema_version":2,"next_phone_id":8,"phones":[{"phone_id":7,"identity":{"kind":"wired","usb_vendor_id":"18d1","usb_product_id":"4ee1","usb_serial":"","aoa_manufacturer":"","aoa_model":"","aoa_serial":"","port_context":"1-2.3"}}]})");
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    EXPECT_TRUE(store.phones().empty());
+    const auto approved = store.approve(trust::TransportIdentity{test::kWired});
+    ASSERT_TRUE(approved.has_value());
+    EXPECT_EQ(approved.value(), aa::core::PhoneId{8});
+    trust::ApprovedPhoneStore fresh{dir.file()};
+    ASSERT_TRUE(fresh.load().has_value());
+    ASSERT_EQ(fresh.phones().size(), 1U);
+    EXPECT_EQ(fresh.phones()[0].strength, trust::IdentityStrength::serial_backed);
+}
+
+TEST(StoreMigration, V3RejectsMissingOrMisrepresentedStrength) {
+    test::TempStoreDir dir;
+    for (const std::string tier : {"", ",\"strength\":\"serial-backed\"",
+                                  ",\"strength\":\"unrecognized\""}) {
+        write_text(dir.file(),
+            "{\"schema_version\":3,\"next_phone_id\":2,\"phones\":[{\"phone_id\":1" + tier +
+            R"(,"identity":{"kind":"wired","usb_vendor_id":"18d1","usb_product_id":"4ee1","usb_serial":"","aoa_manufacturer":"","aoa_model":"","aoa_serial":"","port_context":"1-2.3"}}]})");
+        trust::ApprovedPhoneStore store{dir.file()};
+        EXPECT_FALSE(store.load().has_value());
+        EXPECT_FALSE(store.usable());
+    }
+}
+
+TEST(StoreMigration, LegacyOpaquePortOnlyKeysCannotPreserveImplicitConsent) {
+    for (int version : {1, 2}) {
+        test::TempStoreDir dir;
+        const trust::TransportIdentity weak{trust::WiredIdentity{
+            "18d1", "4ee1", "", "", "", "", "1-2.3"}};
+        const auto key = trust::identity_key(weak);
+        const auto record = version == 1
+            ? "{\"phone_id\":1,\"key\":\"" + key + "\"}"
+            : "{\"phone_id\":1,\"identity\":{\"kind\":\"opaque\",\"key\":\"" + key + "\"}}";
+        write_text(dir.file(), "{\"schema_version\":" + std::to_string(version) +
+            (version == 2 ? ",\"next_phone_id\":2" : "") + ",\"phones\":[" + record + "]}");
+        trust::ApprovedPhoneStore store{dir.file()};
+        ASSERT_TRUE(store.load().has_value());
+        EXPECT_TRUE(store.phones().empty());
+        EXPECT_EQ(store.lookup(trust::PhoneIdentity{key}), trust::Decision::unknown);
+    }
+}
+
 } // namespace
