@@ -31,7 +31,7 @@ std::size_t expectation_payload(const Expectation& expect) {
 
 core::Result<void> admit_record(AdmissionBudget& budget, core::Nanoseconds t,
                               std::size_t payload_bytes) {
-    if (t.count < 0) {
+    if (t.count < 0 || t.count > kMaxTraceNs) {
         return malformed();
     }
     if (budget.records >= kMaxRecords) {
@@ -68,7 +68,7 @@ core::Result<void> validate_audio_format(const audio::AudioFormat& format) {
 }
 
 core::Result<void> validate_media_time(core::Nanoseconds timestamp) {
-    if (timestamp.count < 0) {
+    if (timestamp.count < 0 || timestamp.count > kMaxTraceNs) {
         return malformed();
     }
     return {};
