@@ -50,15 +50,30 @@ disabled, and no artifact upload or cache actions.
 
 ### Validators run from the base revision on pull requests
 
-On `pull_request` runs, `ci/provenance-lint` additionally runs
+On `pull_request` runs the separate job `ci/base-validators` runs
 `tools/deps/check_manifest.py` (against `deps/manifest.lock`),
 `tools/provenance/check.py` (which imports `tools/provenance/inventory.py`) and
 `tools/tls/scan.py` from the PR's **base** revision against the PR tree, so one PR
-cannot change a check and the data it checks together and stay green. If a PR
-legitimately changes one of these validators or their pinned constants, those
-steps fail by design: land the validator change on its own first (the owner reviews
-it explicitly), then rebase the data change on it. The workflow file itself is still
-taken from the PR, so any change under `.github/` needs explicit owner review.
+cannot change a check and the data it checks together and stay green. It is a
+**separate job on a fresh runner**: no PR code executes before it (so a PR step cannot
+poison later "trusted" steps through `$GITHUB_ENV`/`BASH_ENV`, `$GITHUB_PATH` or a shell
+function). It checks out the base revision (validator code) and the PR tree (data only:
+only ever a path argument, nothing from it is executed or sourced) and runs the validators
+with `/usr/bin/python3 -B -s -E` from a scrubbed `env -i`.
+
+Which job produces which required status: the required context `ci/provenance-lint` keeps
+its name and its existing in-tree steps, and now has `needs: base-validators` plus a first
+step that fails unless `ci/base-validators` succeeded (the job runs under `!cancelled()`, because a
+*skipped* required job would otherwise count as passing). So `ci/provenance-lint` cannot go green on a pull
+request without the trusted validators. Optionally add `ci/base-validators` to the ruleset's
+required contexts after its first run.
+
+If a PR legitimately changes one of these validators or their pinned constants, the base run
+fails by design: land the validator change on its own first (the owner reviews it explicitly),
+then rebase the data change on it. **Residual:** `.github/workflows/ci.yml` itself is still
+taken from the PR, so a PR can edit or delete these jobs; any change under `.github/` needs
+explicit owner review (enforcing it needs `pull_request_target`/ruleset work, not done here).
+`tests/ci/ci_workflow_trust_test.py` (ctest `ci_workflow_trust`) guards this structure.
 
 The host build downloads the exact GoogleTest v1.15.2 archive specified by
 `deps/manifest.json` outside configure, then verifies it against
@@ -105,11 +120,24 @@ PR tree as untrusted code:
 - Run it from your own checkout of `main`, never from the PR branch. It fetches
   `origin/main` into a base worktree and runs `tools/build/validate_sysroot.py` from
   there (scrubbed environment), so the PR cannot change the validator that judges it.
-- The PR head is exported with `git archive` into a scratch directory and built
+- The PR head is exported by `tools/ci/relay-export-tree.py` (raw blobs from
+  `git ls-tree`/`git cat-file`, **not** `git archive`: a PR's `.gitattributes` must not
+  be able to select a filter or `export-subst` that runs on your machine; symlinks are
+  written but never followed, gitlinks are skipped, `.git`/`..` paths are rejected) into
+  a scratch directory and built
   (`cmake --preset jetson-aarch64`, `cmake --build --preset jetson-aarch64`) only
-  inside a sandbox with no `$HOME`, no `gh` auth, no SSH agent, no network, the
-  sysroot, manifest and GoogleTest archive mounted read-only, and a complete scrubbed
-  environment (`env -i`-style: fixed `PATH`, `GIT_CONFIG_NOSYSTEM=1`, empty `HOME`).
+  inside a sandbox with no `$HOME`, no `gh` auth, no SSH agent, no network, no inherited
+  file descriptors (every fd above 2 is closed before the sandbox starts; stdin is
+  `/dev/null`), the sysroot, manifest and GoogleTest archive mounted read-only, and a
+  complete scrubbed environment (`env -i`-style: fixed `PATH`, `GIT_CONFIG_NOSYSTEM=1`,
+  empty `HOME`). All writable and read-only paths are canonicalised first and the relay
+  refuses to run if a writable path (`AA_SYSROOT_CACHE`, the scratch tree) equals,
+  contains or sits inside a read-only input such as the sysroot.
+- Containers (podman/docker) get a random name. After every step, and on timeout, error,
+  INT, TERM or exit, the relay `kill`s and `rm -f`s the container and verifies it is gone
+  (the daemon must answer and list no such container) before it hashes logs or posts a
+  status. If that cannot be confirmed it posts nothing, leaves the scratch tree in place
+  and exits 70: investigate before reusing the machine state.
 - Only after the sandbox has exited does the trusted script post the
   `ci/arm64-cross-build` commit status for that exact SHA with `gh`, using your own
   auth, outside the sandbox. Re-run for the new SHA after every push or sync.
@@ -129,8 +157,11 @@ with cmake, ninja, aarch64 g++ and python3), then `bwrap` (bubblewrap over the h
 read-only `/usr`; expose a toolchain installed elsewhere with `AA_RELAY_EXTRA_RO=/path:/path2`),
 then `docker` (also needs `AA_RELAY_IMAGE`; its daemon is root-equivalent, so it is last).
 If none is usable the relay stops; there is no unsandboxed mode.
-`tests/ci/relay_sandbox_test.py` (ctest `ci_relay_sandbox`) proves the isolation and the
-post-after-sandbox ordering with a probe command and skips with a reason where no backend works.
+`tests/ci/relay_sandbox_test.py` (ctest `ci_relay_sandbox`) proves the isolation (including
+leaked fds, the original credential path, mount overlap/order and, when docker plus a local
+image exist, container termination) and the post-after-sandbox ordering with a probe command;
+`tests/ci/relay_export_test.py` (`ci_relay_export`) proves the filter-free export. Both skip or
+shrink with a reason where no backend works.
 
 ## Local validation and privacy
 

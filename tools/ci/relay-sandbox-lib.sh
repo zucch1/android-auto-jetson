@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# shellcheck shell=bash
 # relay-sandbox-lib.sh — sourced by arm64-cross-relay.sh (and tests/ci/relay_sandbox_test.py).
 #
 # Runs ONE command inside an isolated sandbox. The untrusted PR tree is built here, so the
@@ -19,7 +20,21 @@
 #   RELAY_SB_HOME in-sandbox HOME (a fresh empty tmpfs; default /home/aa-relay)
 #   RELAY_SB_PATH in-sandbox PATH (default /usr/local/bin:/usr/bin:/bin)
 # Optional: AA_RELAY_EXTRA_RO (colon-separated host paths to expose read-only, e.g. /opt/toolchain),
-#           AA_RELAY_STEP_TIMEOUT (seconds per sandboxed command; default 3600).
+#           AA_RELAY_STEP_TIMEOUT (seconds per sandboxed command; default 3600),
+#           AA_RELAY_KILL_AFTER (seconds between TERM and KILL of the launcher; default 30),
+#           AA_RELAY_CONTAINER_PREFIX (container name prefix; default aa-relay).
+#
+# Hardening contract (review of PR #92):
+#   * Every file descriptor above 2 is closed before the sandbox (or the container client) is
+#     exec'd, and stdin is /dev/null: `env -i` clears variables but not fds, and a leaked
+#     directory fd (e.g. the owner's HOME) would let the sandbox openat() its way to ~/.config/gh.
+#   * All writable and protected paths are canonicalised (realpath); the run is REFUSED if a
+#     writable path equals, contains or is contained by a protected one (read-only inputs and the
+#     sandbox's own /usr, /etc, ...). Writable mounts are emitted first and read-only last, so a
+#     read-only mount always wins.
+#   * Containers get a known random name; on timeout, error, INT/TERM or normal exit they are
+#     `kill`ed and `rm -f`ed and verified GONE before the caller hashes logs or posts a status.
+#     If that cannot be confirmed relay_sandbox_run returns 71 and the caller must stop.
 
 relay_sandbox_probe() {
     case "$1" in
@@ -58,60 +73,187 @@ relay_sandbox_select() {
     return 1
 }
 
-# relay_sandbox_run <backend> <workdir> <command...>   (stdout/stderr pass through)
-relay_sandbox_run() {
+# Python is the trusted-side launcher helper: close every fd > 2, then exec the real command.
+# (bwrap and the container clients have no close-all option, and bash cannot enumerate fds
+# without opening one.) stdin is replaced by /dev/null by the caller.
+RELAY_CLOSER_PY='
+import os, sys
+for name in os.listdir("/proc/self/fd"):
+    fd = int(name)
+    if fd > 2:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+os.execvp(sys.argv[1], sys.argv[1:])
+'
+
+# relay_sandbox_overlaps A B: true if A equals, contains or is contained by B (canonical paths).
+relay_sandbox_overlaps() {
+    local a=${1%/} b=${2%/}
+    [ -z "$a" ] || [ -z "$b" ] || [ "$a" = "$b" ] || [ "${a#"$b"/}" != "$a" ] || [ "${b#"$a"/}" != "$b" ]
+}
+
+# relay_sandbox_canonicalize: rewrite RELAY_SB_RO/RELAY_SB_RW (+ AA_RELAY_EXTRA_RO) to
+# canonical absolute paths in RELAY_SB_CRO / RELAY_SB_CRW, then refuse any rw/ro overlap.
+relay_sandbox_canonicalize() {
+    local item c d
+    local -a extra=()
+    RELAY_SB_CRO=()
+    RELAY_SB_CRW=()
+    if [ -n "${AA_RELAY_EXTRA_RO:-}" ]; then
+        IFS=: read -r -a extra <<<"$AA_RELAY_EXTRA_RO"
+    fi
+    for item in "${RELAY_SB_RO[@]}" "${extra[@]}"; do
+        [ -n "$item" ] || continue
+        c=$(realpath -m -- "$item") || return 70
+        RELAY_SB_CRO+=("$c")
+    done
+    for item in "${RELAY_SB_RW[@]}"; do
+        c=$(realpath -m -- "$item") || return 70
+        RELAY_SB_CRW+=("$c")
+    done
+    # Protected paths = caller's read-only inputs + the sandbox's own system mounts.
+    local -a protected=("${RELAY_SB_CRO[@]}" /usr /bin /sbin /lib /lib32 /lib64 /etc /proc /dev)
+    for c in "${RELAY_SB_CRW[@]}"; do
+        if [ "$c" = / ]; then
+            echo "error: refusing to run: the filesystem root cannot be a writable mount" >&2
+            return 65
+        fi
+        for d in "${protected[@]}"; do
+            if relay_sandbox_overlaps "$c" "$d"; then
+                echo "error: refusing to run: writable path '$c' overlaps protected path '$d'" >&2
+                echo "       (a writable mount must never equal, contain or sit inside a read-only input)" >&2
+                return 65
+            fi
+        done
+    done
+    return 0
+}
+
+# relay_sandbox_build_argv <backend> <workdir> <command...>: fills RELAY_SB_ARGV (client or bwrap
+# command line) and RELAY_SB_NAME (container name, containers only). Does not run anything.
+relay_sandbox_build_argv() {
     local backend=$1 workdir=$2
     shift 2
     local home=${RELAY_SB_HOME:-/home/aa-relay}
     local sb_path=${RELAY_SB_PATH:-/usr/local/bin:/usr/bin:/bin}
-    local timeout_s=${AA_RELAY_STEP_TIMEOUT:-3600}
-    local -a ro=("${RELAY_SB_RO[@]}") rw=("${RELAY_SB_RW[@]}") envs=("HOME=$home" "PATH=$sb_path" "GIT_CONFIG_NOSYSTEM=1" "${RELAY_SB_ENV[@]}")
-    local -a extra=() argv
-    local item d
-    if [ -n "${AA_RELAY_EXTRA_RO:-}" ]; then
-        IFS=: read -r -a extra <<<"$AA_RELAY_EXTRA_RO"
-        ro+=("${extra[@]}")
-    fi
+    local -a envs=("HOME=$home" "PATH=$sb_path" "GIT_CONFIG_NOSYSTEM=1" "${RELAY_SB_ENV[@]}")
+    local item d rc=0
+    relay_sandbox_canonicalize || rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    workdir=$(realpath -m -- "$workdir")
+    RELAY_SB_ARGV=()
+    RELAY_SB_NAME=
     case "$backend" in
         bwrap)
-            argv=(bwrap --unshare-all --die-with-parent --new-session --clearenv
+            RELAY_SB_ARGV=(bwrap --unshare-all --die-with-parent --new-session --clearenv
                 --ro-bind /usr /usr --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$home")
             for d in bin sbin lib lib32 lib64; do
                 if [ -L "/$d" ]; then
-                    argv+=(--symlink "$(readlink "/$d")" "/$d")
+                    RELAY_SB_ARGV+=(--symlink "$(readlink "/$d")" "/$d")
                 elif [ -d "/$d" ]; then
-                    argv+=(--ro-bind "/$d" "/$d")
+                    RELAY_SB_ARGV+=(--ro-bind "/$d" "/$d")
                 fi
             done
             for d in alternatives ld.so.cache ld.so.conf ld.so.conf.d localtime ssl; do
-                argv+=(--ro-bind-try "/etc/$d" "/etc/$d")
+                RELAY_SB_ARGV+=(--ro-bind-try "/etc/$d" "/etc/$d")
             done
-            for item in "${ro[@]}"; do argv+=(--ro-bind "$item" "$item"); done
-            for item in "${rw[@]}"; do argv+=(--bind "$item" "$item"); done
-            for item in "${envs[@]}"; do argv+=(--setenv "${item%%=*}" "${item#*=}"); done
-            argv+=(--chdir "$workdir" -- "$@")
-            # env -i: the bwrap process itself holds none of the caller's variables either.
-            timeout --kill-after=30 "$timeout_s" env -i PATH=/usr/bin:/bin "${argv[@]}"
+            # Writable first, protected read-only LAST: later mounts win, so ro can never be masked.
+            for item in "${RELAY_SB_CRW[@]}"; do RELAY_SB_ARGV+=(--bind "$item" "$item"); done
+            for item in "${RELAY_SB_CRO[@]}"; do RELAY_SB_ARGV+=(--ro-bind "$item" "$item"); done
+            for item in "${envs[@]}"; do RELAY_SB_ARGV+=(--setenv "${item%%=*}" "${item#*=}"); done
+            RELAY_SB_ARGV+=(--chdir "$workdir" -- "$@")
             ;;
         podman | docker)
-            argv=("$backend" run --rm --network none --read-only --cap-drop ALL
+            RELAY_SB_NAME="${AA_RELAY_CONTAINER_PREFIX:-aa-relay}-$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+            RELAY_SB_ARGV=("$backend" run --rm --name "$RELAY_SB_NAME" --network none --read-only --cap-drop ALL
                 --security-opt no-new-privileges --pids-limit 4096
                 --tmpfs "/tmp:rw,exec,mode=1777" --tmpfs "$home:rw,mode=1777" -w "$workdir")
             if [ "$backend" = podman ]; then
-                argv+=(--userns keep-id)
+                RELAY_SB_ARGV+=(--userns keep-id)
             else
-                argv+=(--user "$(id -u):$(id -g)")
+                RELAY_SB_ARGV+=(--user "$(id -u):$(id -g)")
             fi
-            for item in "${ro[@]}"; do argv+=(-v "$item:$item:ro"); done
-            for item in "${rw[@]}"; do argv+=(-v "$item:$item:rw"); done
-            for item in "${envs[@]}"; do argv+=(-e "$item"); done
-            argv+=("$AA_RELAY_IMAGE" "$@")
-            # Container env is not inherited from the host; only the -e pairs above exist inside.
-            timeout --kill-after=30 "$timeout_s" "${argv[@]}"
+            for item in "${RELAY_SB_CRW[@]}"; do RELAY_SB_ARGV+=(-v "$item:$item:rw"); done
+            for item in "${RELAY_SB_CRO[@]}"; do RELAY_SB_ARGV+=(-v "$item:$item:ro"); done
+            for item in "${envs[@]}"; do RELAY_SB_ARGV+=(-e "$item"); done
+            RELAY_SB_ARGV+=("$AA_RELAY_IMAGE" "$@")
             ;;
         *)
             echo "error: unknown sandbox backend '$backend'" >&2
             return 70
             ;;
     esac
+}
+
+# Container bookkeeping for the active run (read by relay_sandbox_reap_active from EXIT/INT/TERM traps).
+RELAY_SB_ACTIVE_BACKEND=
+RELAY_SB_ACTIVE_NAME=
+RELAY_SB_ACTIVE_PID=
+
+# relay_container_gone <backend> <name>: true only if the daemon answered and no container
+# of that name exists (a daemon that is down must NOT look like "gone").
+relay_container_gone() {
+    local out
+    out=$("$1" ps -a -q --no-trunc --filter "name=^/?$2\$" 2>/dev/null) || return 1
+    [ -z "$out" ]
+}
+
+# relay_sandbox_reap_active: stop whatever sandbox run is active. For containers: kill, rm -f,
+# verify gone. Returns 0 when nothing is left running, 71 when that cannot be confirmed.
+relay_sandbox_reap_active() {
+    [ -n "$RELAY_SB_ACTIVE_BACKEND" ] || return 0
+    if [ -n "$RELAY_SB_ACTIVE_PID" ]; then
+        kill -KILL "$RELAY_SB_ACTIVE_PID" 2>/dev/null || true
+    fi
+    if [ -n "$RELAY_SB_ACTIVE_NAME" ]; then
+        for _ in 1 2 3 4 5; do
+            "$RELAY_SB_ACTIVE_BACKEND" kill "$RELAY_SB_ACTIVE_NAME" >/dev/null 2>&1 || true
+            "$RELAY_SB_ACTIVE_BACKEND" rm -f "$RELAY_SB_ACTIVE_NAME" >/dev/null 2>&1 || true
+            if relay_container_gone "$RELAY_SB_ACTIVE_BACKEND" "$RELAY_SB_ACTIVE_NAME"; then
+                RELAY_SB_ACTIVE_BACKEND=
+                RELAY_SB_ACTIVE_NAME=
+                RELAY_SB_ACTIVE_PID=
+                return 0
+            fi
+            sleep 1
+        done
+        echo "error: could not confirm that container $RELAY_SB_ACTIVE_NAME is gone; untrusted code may still be running" >&2
+        return 71
+    fi
+    RELAY_SB_ACTIVE_BACKEND=
+    RELAY_SB_ACTIVE_PID=
+    return 0
+}
+
+# relay_sandbox_run <backend> <workdir> <command...>   (stdout/stderr pass through)
+# Returns the sandboxed command's status; 71 = termination could not be confirmed (caller must
+# not trust anything and must post nothing); 65 = refused because of overlapping mounts.
+relay_sandbox_run() {
+    local backend=$1 workdir=$2
+    local timeout_s=${AA_RELAY_STEP_TIMEOUT:-3600} kill_after=${AA_RELAY_KILL_AFTER:-30} rc=0
+    relay_sandbox_build_argv "$@" || return $?
+    RELAY_SB_ACTIVE_BACKEND=$backend
+    RELAY_SB_ACTIVE_NAME=$RELAY_SB_NAME
+    # Backgrounded + `wait`, so INT/TERM traps in the caller run immediately instead of after the
+    # sandbox ends. timeout only kills the CLIENT; relay_sandbox_reap_active ends the sandbox itself.
+    # env -i also keeps the owner's variables out of bwrap; the container client keeps the owner's
+    # env (it needs DOCKER_HOST etc.) but the container only gets the -e pairs.
+    local py
+    py=$(command -v python3) || { echo "error: python3 is required for the fd-closing launcher" >&2; return 70; }
+    if [ "$backend" = bwrap ]; then
+        timeout --kill-after="$kill_after" "$timeout_s" \
+            /usr/bin/env -i PATH=/usr/bin:/bin "$py" -I -B -c "$RELAY_CLOSER_PY" "${RELAY_SB_ARGV[@]}" </dev/null &
+    else
+        timeout --kill-after="$kill_after" "$timeout_s" \
+            "$py" -I -B -c "$RELAY_CLOSER_PY" "${RELAY_SB_ARGV[@]}" </dev/null &
+    fi
+    RELAY_SB_ACTIVE_PID=$!
+    wait "$RELAY_SB_ACTIVE_PID" || rc=$?
+    # A signal trap in the caller exits before this point; here the launcher has been reaped.
+    RELAY_SB_ACTIVE_PID=
+    # Whatever happened (normal exit, timeout, client killed), end and verify the sandbox now.
+    relay_sandbox_reap_active || return 71
+    return "$rc"
 }

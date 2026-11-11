@@ -235,11 +235,75 @@ jobs:
             --archive "$RUNNER_TEMP/googletest-v1.15.2.tar.gz" \
             --scratch "$RUNNER_TEMP/decode-root-cross"
 
-  provenance-lint:
-    name: ci/provenance-lint
+  # M5 (trusted validators). A SEPARATE job on a fresh runner: nothing from the PR is executed
+  # before the validators run, so a PR step cannot poison them through $GITHUB_ENV (BASH_ENV,
+  # PATH, ...), $GITHUB_PATH or a shell function. The validator CODE is the PR base revision;
+  # the PR tree is only passed to them as DATA (a path argument): no PR script is run, no PR
+  # file is sourced, and the interpreter is invoked by absolute path from a scrubbed environment
+  # (`env -i`, `-B -s -E`; not `-I`, because the validators import their sibling modules from
+  # the base directory). Pull requests only. A PR that legitimately changes one of these
+  # validators or their pinned constants fails here by design: land the validator change on its
+  # own first (explicit owner review), then rebase the data change on it.
+  # RESIDUAL: this workflow file is itself taken from the PR, so a PR can edit or delete this
+  # job. Anything under .github/ needs owner review; enforcing it needs pull_request_target or a
+  # ruleset, not done here.
+  base-validators:
+    name: ci/base-validators
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - name: Check out the PR base revision (validator code)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+      - name: Check out the PR tree (data only)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: pr
+          persist-credentials: false
+      - name: Run base-revision validators against the PR tree
+        run: |
+          set -euo pipefail
+          py=/usr/bin/python3
+          run_base() {
+            # Scrubbed env; the PR tree is only ever an argument or the working directory.
+            /usr/bin/env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" LC_ALL=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 \
+              "$py" -B -s -E "$@"
+          }
+          base="$GITHUB_WORKSPACE/base"
+          pr="$GITHUB_WORKSPACE/pr"
+          cd "$pr"
+          run_base "$base/tools/deps/check_manifest.py" --lock "$pr/deps/manifest.lock"
+          run_base "$base/tools/provenance/check.py" --root "$pr"
+          run_base "$base/tools/tls/scan.py" "$pr"
+
+  # The required context. It cannot pass on a pull request unless ci/base-validators passed
+  # (the first step fails the job otherwise, before any PR-controlled step runs). Its remaining
+  # steps are the existing in-tree checks, which execute PR code and are therefore not trusted
+  # on their own.
+  provenance-lint:
+    name: ci/provenance-lint
+    needs: base-validators
+    # A skipped dependency would otherwise skip this job, and GitHub counts a skipped job as
+    # passing for a required check: always run, and decide explicitly below.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require the trusted base-revision validators
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_RESULT: ${{ needs.base-validators.result }}
+        run: |
+          set -euo pipefail
+          case "$EVENT:$BASE_RESULT" in
+            pull_request:success) ;;
+            push:skipped | workflow_dispatch:skipped) ;; # no base revision outside pull requests
+            *) echo "ci/base-validators result '$BASE_RESULT' on '$EVENT' does not allow ci/provenance-lint"; exit 1 ;;
+          esac
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -249,28 +313,6 @@ jobs:
           set -euo pipefail
           python3 -B tools/deps/check_manifest.py --lock deps/manifest.lock
           tools/provenance/check.sh
-      # M5: on a pull request the validators below run from the BASE revision against the PR
-      # tree, so one PR cannot change a check together with the data it checks and stay green.
-      # A PR that legitimately changes a validator fails these steps by design: land the
-      # validator change on its own first, or have the owner review it explicitly.
-      # (This workflow file is itself taken from the PR; changes under .github/ need owner review.)
-      - name: Export the PR base revision (trusted validators)
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          mkdir "$RUNNER_TEMP/base-validators"
-          git archive --format=tar "$BASE_SHA" | tar -x -C "$RUNNER_TEMP/base-validators"
-      - name: Run base-revision validators against the PR tree
-        if: github.event_name == 'pull_request'
-        run: |
-          set -euo pipefail
-          base="$RUNNER_TEMP/base-validators"
-          python3 -B "$base/tools/deps/check_manifest.py" --lock deps/manifest.lock
-          python3 -B "$base/tools/provenance/check.py" --root "$PWD"
-          python3 -B "$base/tools/tls/scan.py" "$PWD"
       - name: Reject malicious provenance mutations in scratch fixtures
         run: |
           set -euo pipefail

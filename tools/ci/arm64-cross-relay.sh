@@ -6,11 +6,16 @@
 # trusted script runs from the owner's own checkout of main (never from the PR branch) and:
 #   1. fetches origin/main into a BASE worktree and runs the sysroot validator from there,
 #      with a scrubbed environment, against the owner-local sysroot paths,
-#   2. exports the exact PR head SHA with `git archive` into a scratch tree (no .git link
-#      back to the owner's repository),
+#   2. exports the exact PR head SHA into a scratch tree with tools/ci/relay-export-tree.py:
+#      raw blobs from `git ls-tree`/`git cat-file`, NO attribute processing (a PR's
+#      .gitattributes must not be able to select a filter or export-subst that runs on the
+#      owner's machine), symlinks never followed, no .git link back to the owner's repository,
 #   3. builds that tree ONLY inside a sandbox (podman/docker container or bubblewrap): no
-#      $HOME, no gh auth, no SSH agent, no network, sysroot/archive mounted read-only, and a
-#      complete, scrubbed environment (fixed PATH, GIT_CONFIG_NOSYSTEM=1, empty HOME),
+#      $HOME, no gh auth, no SSH agent, no network, no inherited file descriptors, sysroot/
+#      archive mounted read-only (the run is refused if a writable path overlaps one), and a
+#      complete, scrubbed environment (fixed PATH, GIT_CONFIG_NOSYSTEM=1, empty HOME). A
+#      container is killed, removed and verified gone before anything else happens; if that
+#      cannot be confirmed nothing is posted and the relay exits 70,
 #   4. only AFTER the sandbox has exited, posts the `ci/arm64-cross-build` COMMIT STATUS for
 #      that exact SHA through the owner's local gh channel (outside the sandbox), with the
 #      sysroot identity and short sha256s of every log.
@@ -117,14 +122,24 @@ echo "relay: sandbox backend=$sandbox_backend" >&2
 test_mode=${AA_RELAY_TEST_MODE:-}
 
 repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
-scratch=${AA_RELAY_SCRATCH:-${TMPDIR:-/tmp}/arm64-cross-relay-$head_sha}
+scratch=$(realpath -m -- "${AA_RELAY_SCRATCH:-${TMPDIR:-/tmp}/arm64-cross-relay-$head_sha}")
 base_tree=$scratch/base
 pr_tree=$scratch/pr-tree
 logs=$scratch/logs
 empty_home=$scratch/empty-home
-mkdir -p "$logs" "$empty_home" "$pr_tree"
-AA_SYSROOT_CACHE=$(realpath -m "${AA_SYSROOT_CACHE:-$scratch/build-binding}")
-mkdir -p "$AA_SYSROOT_CACHE"
+AA_SYSROOT_CACHE=$(realpath -m -- "${AA_SYSROOT_CACHE:-$scratch/build-binding}")
+
+# Sandbox mount contract. Checked BEFORE anything is created: a writable path (tree, cache) that
+# equals, contains or sits inside a read-only input (sysroot, manifest, archive, extra) would mask
+# or expose it, so the relay refuses to run.
+RELAY_SB_RW=("$pr_tree" "$AA_SYSROOT_CACHE")
+RELAY_SB_RO=("$AA_SYSROOT_ROOTFS" "$AA_SYSROOT_MANIFEST" "$AA_GOOGLETEST_ARCHIVE")
+# Observed-mode contract: the hash-validated payload IS the link sysroot (SysrootGate).
+RELAY_SB_ENV=("AA_SYSROOT_ROOTFS=$AA_SYSROOT_ROOTFS" "AA_SYSROOT_MANIFEST=$AA_SYSROOT_MANIFEST"
+    "AA_GOOGLETEST_ARCHIVE=$AA_GOOGLETEST_ARCHIVE" "AA_SYSROOT_CACHE=$AA_SYSROOT_CACHE"
+    "AA_SYSROOT_PAYLOAD=$AA_SYSROOT_ROOTFS" "AA_SYSROOT_REQUIRE_OBSERVED=ON" "PKG_CONFIG_PATH=")
+relay_sandbox_canonicalize || exit $?
+mkdir -p "$logs" "$empty_home" "$pr_tree" "$AA_SYSROOT_CACHE"
 
 if [ -n "$test_mode" ]; then
     base_sha=$(git -C "$repo_root" rev-parse "HEAD^{commit}")
@@ -170,14 +185,27 @@ fi
 
 git -C "$repo_root" worktree add --detach "$base_tree" "$base_sha" >/dev/null
 cleanup() {
+    local rc=$?
+    # Whatever ends the relay (success, error, INT, TERM), the sandbox must be gone before the
+    # tree is touched. If that cannot be confirmed, leave everything in place and say so.
+    if ! relay_sandbox_reap_active; then
+        echo "error: sandbox termination unconfirmed; leaving $pr_tree in place; investigate before reuse" >&2
+        exit 70
+    fi
     git -C "$repo_root" worktree remove --force "$base_tree" >/dev/null 2>&1 || true
     # The PR tree holds untrusted build output; logs stay under $scratch/logs.
     chmod -R u+rwX "$pr_tree" 2>/dev/null || true
     rm -rf "$pr_tree"
+    exit "$rc"
 }
 trap cleanup EXIT
-# Plain export: the sandboxed tree has no .git file pointing back into the owner's repository.
-git -C "$repo_root" archive --format=tar "$head_sha" | tar -x -C "$pr_tree" --no-same-owner
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+# Raw export (no .git, no attribute processing); see tools/ci/relay-export-tree.py.
+python3 -I -B "$script_dir/relay-export-tree.py" "$repo_root" "$head_sha" "$pr_tree" || {
+    echo "error: could not export $head_sha" >&2
+    exit 65
+}
 
 step_names=()
 step_rcs=()
@@ -206,12 +234,6 @@ run_trusted_step() {
 }
 
 # Sandboxed step: the PR tree is the working directory; nothing else of the owner's is visible.
-RELAY_SB_RW=("$pr_tree" "$AA_SYSROOT_CACHE")
-RELAY_SB_RO=("$AA_SYSROOT_ROOTFS" "$AA_SYSROOT_MANIFEST" "$AA_GOOGLETEST_ARCHIVE")
-# Observed-mode contract: the hash-validated payload IS the link sysroot (SysrootGate).
-RELAY_SB_ENV=("AA_SYSROOT_ROOTFS=$AA_SYSROOT_ROOTFS" "AA_SYSROOT_MANIFEST=$AA_SYSROOT_MANIFEST"
-    "AA_GOOGLETEST_ARCHIVE=$AA_GOOGLETEST_ARCHIVE" "AA_SYSROOT_CACHE=$AA_SYSROOT_CACHE"
-    "AA_SYSROOT_PAYLOAD=$AA_SYSROOT_ROOTFS" "AA_SYSROOT_REQUIRE_OBSERVED=ON" "PKG_CONFIG_PATH=")
 run_sandbox_step() {
     local name=$1
     shift
@@ -221,6 +243,12 @@ run_sandbox_step() {
     relay_sandbox_run "$sandbox_backend" "$pr_tree" "$@" >"$log" 2>&1
     rc=$?
     set -e
+    if [ "$rc" -eq 71 ]; then
+        # The sandbox could not be confirmed gone: untrusted code may still hold the mounts.
+        # Do not hash logs, do not post any status; the EXIT trap keeps the tree in place.
+        echo "error: relay: step=$name sandbox termination unconfirmed; no status posted" >&2
+        exit 70
+    fi
     echo "relay: sandbox exited step=$name rc=$rc" >&2
     record_step "$name" "$rc" "$log"
 }
