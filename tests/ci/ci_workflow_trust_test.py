@@ -12,6 +12,7 @@ Checks the structure of the workflow, then runs the job's real `run` script unde
 with nonexistent validator paths and proves it still FAILS (it must not be satisfiable by shell functions).
 Skips (77) when PyYAML is unavailable.
 """
+import json
 import os
 import subprocess
 import sys
@@ -40,15 +41,23 @@ def main() -> int:
     trusted = jobs.get('base-validators')
     check(trusted is not None, 'ci.yml has no separate `base-validators` job for the trusted validators')
     check('needs' not in trusted, 'the trusted job must not depend on a job that runs PR code first')
-    check(trusted.get('if') == "github.event_name == 'pull_request'", 'trusted job must run on pull requests')
+    check('if' not in trusted, 'the trusted job must run on EVERY event (pull_request, push, workflow_dispatch): '
+          'a skipped base-validators job is the workflow_dispatch bypass', str(trusted.get('if')))
+    triggers = doc.get('on', doc.get(True))
+    check({'pull_request', 'push', 'workflow_dispatch'} <= set(triggers), 'unexpected trigger set', str(triggers))
+    check(set(triggers['pull_request'].get('types', [])) >= {'opened', 'synchronize', 'reopened', 'edited'},
+          'pull_request must rerun on retarget (types must include edited)', str(triggers['pull_request']))
     steps = trusted['steps']
     runs = [s for s in steps if 'run' in s]
     uses = [s for s in steps if 'uses' in s]
     check(len(runs) == 1 and steps[-1] is runs[0], 'exactly one run step, and it comes last (after the checkouts)')
     check(all(s['uses'].startswith('actions/checkout@') for s in uses), 'only the pinned checkout action may precede it')
     refs = {(s.get('with') or {}).get('path'): (s.get('with') or {}).get('ref') for s in uses}
-    check(refs.get('base') == '${{ github.event.pull_request.base.sha }}' and refs.get('pr') is None,
-          'validator code must be the PR base revision; the PR tree is checked out separately as data', str(refs))
+    check(refs.get('base') == '${{ github.event.repository.default_branch }}' and refs.get('pr') is None,
+          'validator code must always come from the default branch (not the PR base ref, which can be an '
+          'author-pushable aa/** branch); the tree under test is checked out separately as data', str(refs))
+    check('pull_request' not in json.dumps(uses) and 'head' not in json.dumps(refs),
+          'validator checkout must not reference PR-controlled refs', json.dumps(uses))
     script = runs[0]['run']
     for needle in ('/usr/bin/env -i', '/usr/bin/python3', '-B -s -E', 'tools/deps/check_manifest.py',
                    'tools/provenance/check.py', 'tools/tls/scan.py'):
@@ -65,6 +74,27 @@ def main() -> int:
     check('needs.base-validators.result' in str(first.get('env', {})) and 'run' in first,
           'the first step of ci/provenance-lint must check the trusted job result before any PR code runs')
     check(jobs['provenance-lint']['name'] == 'ci/provenance-lint', 'required context name changed')
+
+    # Event/result matrix for the gate step (the real script): ONLY `success` passes, for every
+    # event type. `workflow_dispatch:skipped` and `push:skipped` used to pass, which let
+    # `gh workflow run ci.yml --ref <pr-branch>` produce a green ci/provenance-lint without the
+    # base validators (nothing in the diff).
+    gate_script = first['run']
+    for event in ('pull_request', 'push', 'workflow_dispatch', 'schedule'):
+        for result in ('success', 'skipped', 'failure', 'cancelled', ''):
+            env = {'PATH': '/usr/bin:/bin', 'EVENT': event, 'BASE_RESULT': result}
+            done = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', gate_script],
+                                  env=env, capture_output=True, text=True, check=False)
+            check((done.returncode == 0) == (result == 'success'),
+                  f'gate: event={event!r} result={result!r} returned {done.returncode}',
+                  done.stdout + done.stderr)
+    # The dispatch-on-a-non-main-branch case in particular: the validator job is skipped there
+    # only if someone put an `if:` back, and the gate must still refuse.
+    done = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', gate_script],
+                          env={'PATH': '/usr/bin:/bin', 'EVENT': 'workflow_dispatch', 'BASE_RESULT': 'skipped',
+                               'GITHUB_REF': 'refs/heads/aa/some-pr-branch'},
+                          capture_output=True, text=True, check=False)
+    check(done.returncode != 0, 'workflow_dispatch on a PR branch with base-validators skipped must fail the gate')
 
     # Executable check: poison the shell the way a PR step could and run the real script.
     with tempfile.TemporaryDirectory(prefix='ci-trust-test-') as t:

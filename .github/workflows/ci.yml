@@ -6,6 +6,9 @@ name: CI
 on:
   pull_request:
     branches: [main, 'aa/**']
+    # `edited` covers a retarget (base branch change) with no new commit, so the
+    # validators rerun against the new base.
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
   # Manual full run (including ipc-bench-happy-600) on any branch.
@@ -237,11 +240,14 @@ jobs:
 
   # M5 (trusted validators). A SEPARATE job on a fresh runner: nothing from the PR is executed
   # before the validators run, so a PR step cannot poison them through $GITHUB_ENV (BASH_ENV,
-  # PATH, ...), $GITHUB_PATH or a shell function. The validator CODE is the PR base revision;
-  # the PR tree is only passed to them as DATA (a path argument): no PR script is run, no PR
+  # PATH, ...), $GITHUB_PATH or a shell function. The validator CODE always comes from the
+  # repository default branch (main), never from the PR's base ref (a stacked `aa/X` base is
+  # author-pushable) and never from the PR itself; the PR tree is only passed to them as DATA (a path argument): no PR script is run, no PR
   # file is sourced, and the interpreter is invoked by absolute path from a scrubbed environment
   # (`env -i`, `-B -s -E`; not `-I`, because the validators import their sibling modules from
-  # the base directory). Pull requests only. A PR that legitimately changes one of these
+  # the base directory). It runs on EVERY event (pull_request, push, workflow_dispatch) and the gate
+  # below accepts only `success`, so `gh workflow run ci.yml --ref <pr-branch>` cannot yield a green
+  # ci/provenance-lint without it. A PR that legitimately changes one of these
   # validators or their pinned constants fails here by design: land the validator change on its
   # own first (explicit owner review), then rebase the data change on it.
   # RESIDUAL: this workflow file is itself taken from the PR, so a PR can edit or delete this
@@ -249,17 +255,16 @@ jobs:
   # ruleset, not done here.
   base-validators:
     name: ci/base-validators
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Check out the PR base revision (validator code)
+      - name: Check out the default branch (validator code)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           path: base
           persist-credentials: false
-      - name: Check out the PR tree (data only)
+      - name: Check out the tree under test (data only)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: pr
@@ -299,9 +304,10 @@ jobs:
           BASE_RESULT: ${{ needs.base-validators.result }}
         run: |
           set -euo pipefail
-          case "$EVENT:$BASE_RESULT" in
-            pull_request:success) ;;
-            push:skipped | workflow_dispatch:skipped) ;; # no base revision outside pull requests
+          # Only `success` passes, for every event type: a skipped, cancelled or failed
+          # base-validators job (or a dispatch/push that skipped it) never satisfies this gate.
+          case "$BASE_RESULT" in
+            success) ;;
             *) echo "ci/base-validators result '$BASE_RESULT' on '$EVENT' does not allow ci/provenance-lint"; exit 1 ;;
           esac
       - name: Check out source

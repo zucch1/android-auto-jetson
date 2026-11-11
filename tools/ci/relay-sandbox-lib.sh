@@ -16,6 +16,8 @@
 # Callers set before relay_sandbox_run:
 #   RELAY_SB_RW   array of paths mounted read-write at the same absolute path
 #   RELAY_SB_RO   array of paths mounted read-only at the same absolute path
+#   RELAY_SB_PROTECT        optional: extra paths no writable mount may equal, contain or sit inside
+#   RELAY_SB_PROTECT_COVER  optional: paths no writable mount may equal or contain (\$HOME, repo root)
 #   RELAY_SB_ENV  array of KEY=VALUE pairs; this is the COMPLETE environment of the sandbox
 #   RELAY_SB_HOME in-sandbox HOME (a fresh empty tmpfs; default /home/aa-relay)
 #   RELAY_SB_PATH in-sandbox PATH (default /usr/local/bin:/usr/bin:/bin)
@@ -113,8 +115,23 @@ relay_sandbox_canonicalize() {
         c=$(realpath -m -- "$item") || return 70
         RELAY_SB_CRW+=("$c")
     done
-    # Protected paths = caller's read-only inputs + the sandbox's own system mounts.
+    # Protected paths = caller's read-only inputs + the sandbox's own system mounts + the
+    # caller's RELAY_SB_PROTECT (trusted scratch such as logs, base checkout, empty HOME, the
+    # repo's git dirs): a writable path may not equal, contain or sit inside any of them.
     local -a protected=("${RELAY_SB_CRO[@]}" /usr /bin /sbin /lib /lib32 /lib64 /etc /proc /dev)
+    for item in ${RELAY_SB_PROTECT[@]+"${RELAY_SB_PROTECT[@]}"}; do
+        [ -n "$item" ] || continue
+        c=$(realpath -m -- "$item") || return 70
+        protected+=("$c")
+    done
+    # RELAY_SB_PROTECT_COVER: paths a writable mount may sit inside but never equal or contain
+    # (the owner's $HOME and the repo checkout: a writable mount of a parent would expose them).
+    local -a cover=()
+    for item in ${RELAY_SB_PROTECT_COVER[@]+"${RELAY_SB_PROTECT_COVER[@]}"}; do
+        [ -n "$item" ] || continue
+        c=$(realpath -m -- "$item") || return 70
+        cover+=("$c")
+    done
     for c in "${RELAY_SB_CRW[@]}"; do
         if [ "$c" = / ]; then
             echo "error: refusing to run: the filesystem root cannot be a writable mount" >&2
@@ -124,6 +141,13 @@ relay_sandbox_canonicalize() {
             if relay_sandbox_overlaps "$c" "$d"; then
                 echo "error: refusing to run: writable path '$c' overlaps protected path '$d'" >&2
                 echo "       (a writable mount must never equal, contain or sit inside a read-only input)" >&2
+                return 65
+            fi
+        done
+        for d in ${cover[@]+"${cover[@]}"}; do
+            if [ "$c" = "$d" ] || [ "${d#"${c%/}"/}" != "$d" ]; then
+                echo "error: refusing to run: writable path '$c' equals or contains protected path '$d'" >&2
+                echo "       (it would expose the owner's HOME or checkout inside the sandbox; use a fresh dedicated directory)" >&2
                 return 65
             fi
         done

@@ -16,7 +16,9 @@ cmake build; the sandboxed step is a probe command) with a fake `gh` first on PA
   stdin is /dev/null; the ORIGINAL credential path is absent, not just the replacement HOME; a
   writable mount that overlaps a read-only input (cache == parent of the sysroot, a cache inside
   the sysroot, or a symlink to it) is refused, and read-only mounts are emitted after writable
-  ones; a container that ignores SIGTERM is gone after the step timeout, and when its
+  ones; round 2: HOME, the repo root and its git dirs, logs, the base checkout and the empty
+  HOME cannot be equalled or contained by a writable mount, and the default scratch is a fresh
+  0700 mktemp directory; a container that ignores SIGTERM is gone after the step timeout, and when its
   termination cannot be confirmed nothing is posted and the relay exits non-zero.
 
 Exits 77 (ctest SKIP) with a reason when no sandbox backend works on this machine.
@@ -26,6 +28,7 @@ import shlex
 import shutil
 import socket
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,7 +40,9 @@ ROOT = Path(__file__).resolve().parents[2]
 RELAY = ROOT / 'tools' / 'ci' / 'arm64-cross-relay.sh'
 LIB = ROOT / 'tools' / 'ci' / 'relay-sandbox-lib.sh'
 SKIP = 77
-SECRET = 'ghp_SECRET_MUST_NOT_REACH_THE_SANDBOX'
+# A canary standing in for the owner's gh token. Assembled at runtime and deliberately not
+# token-shaped, so no secret scanner (CodeQL, gitleaks) sees a credential literal in the source.
+SECRET = '-'.join(('canary', 'owner', 'credential', 'must', 'not', 'reach', 'the', 'sandbox'))
 
 
 def skip(reason: str) -> None:
@@ -404,6 +409,50 @@ def main() -> int:
             check(gh_log == '' and not (tmp / 'scratch' / 'logs' / '10-sandbox-probe.log').exists(),
                   f'{label}: nothing may run or be posted', gh_log)
             check(not (tmp / 'sysroot' / 'rootfs' / 'cache').exists(), f'{label}: host sysroot was modified')
+    # Round-2: the trusted scratch (logs, base checkout, empty HOME), the owner's HOME, the
+    # repo checkout and its git dirs are protected too. AA_SYSROOT_CACHE/scratch may not equal,
+    # contain or (for scratch) sit inside them: exit 65, nothing runs, nothing posted.
+    git_dir = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', '--absolute-git-dir'], capture_output=True,
+                             text=True, check=True).stdout.strip()
+    for label, cache_of in (
+            ('cache is the owner HOME', lambda t: t / 'home'),
+            ('cache is the parent of the owner HOME', lambda t: t),
+            ('cache is the repo root', lambda t: ROOT),
+            ('cache is the repo git dir', lambda t: Path(git_dir)),
+            ('cache is inside the repo git dir', lambda t: Path(git_dir) / 'aa-relay-test-cache'),
+            ('cache is the trusted logs dir', lambda t: t / 'scratch' / 'logs'),
+            ('cache is inside the trusted logs dir', lambda t: t / 'scratch' / 'logs' / 'c'),
+            ('cache is the base checkout', lambda t: t / 'scratch' / 'base'),
+            ('cache is the empty HOME', lambda t: t / 'scratch' / 'empty-home'),
+            ('cache is the scratch root', lambda t: t / 'scratch')):
+        with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+            tmp = Path(t)
+            rc, err, gh_log = run_relay(tmp, sha, probe=PROBE.replace('SANDBOX-OK', 'SANDBOX-RAN'),
+                                        backend=backend, env_extra={'AA_SYSROOT_CACHE': str(cache_of(tmp))})
+            check(rc == 65 and ('overlaps protected path' in err or 'equals or contains protected path' in err),
+                  f'{label}: must be refused', err)
+            check(gh_log == '' and not (tmp / 'scratch' / 'logs' / '10-sandbox-probe.log').exists(),
+                  f'{label}: nothing may run or be posted', gh_log)
+        check(not (Path(git_dir) / 'aa-relay-test-cache').exists(), f'{label}: touched the repo git dir')
+    # A cache that merely sits inside the owner's HOME (not HOME itself) stays allowed.
+    with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+        tmp = Path(t)
+        rc, err, gh_log = run_relay(tmp, sha, probe='true', backend=backend,
+                                    env_extra={'AA_SYSROOT_CACHE': str(tmp / 'home' / 'cache' / 'aa')})
+        check(rc == 0, 'a dedicated cache directory inside HOME must still work', err)
+    # Default scratch (no AA_RELAY_SCRATCH): a fresh unpredictable 0700 directory, not /tmp/<name>-<sha>.
+    with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
+        tmp = Path(t)
+        runtime = tmp / 'xdg'
+        runtime.mkdir(mode=0o755)
+        predictable = Path(os.environ.get('TMPDIR', '/tmp')) / f'arm64-cross-relay-{sha}'
+        check(not predictable.exists(), 'stale predictable scratch present; remove it', str(predictable))
+        rc, err, gh_log = run_relay(tmp, sha, probe='true', backend=backend,
+                                    env_extra={'XDG_RUNTIME_DIR': str(runtime), 'AA_RELAY_SCRATCH': ''})
+        made = sorted(runtime.glob('arm64-cross-relay.*'))
+        check(rc == 0 and len(made) == 1, 'default scratch must be one mktemp dir under XDG_RUNTIME_DIR', err)
+        check(stat.S_IMODE(made[0].stat().st_mode) == 0o700, 'scratch must be mode 0700', oct(made[0].stat().st_mode))
+        check(not predictable.exists(), 'relay used the predictable /tmp scratch path')
     # Ordering: writable mounts first, caller's read-only inputs last (a later mount wins).
     with tempfile.TemporaryDirectory(prefix='relay-sb-test-') as t:
         tmp = Path(t)

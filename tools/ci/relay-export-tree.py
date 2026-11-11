@@ -33,7 +33,9 @@ class ExportError(Exception):
 def git_env() -> dict[str, str]:
     # Nothing of the owner's configuration is needed to read objects; keep it out regardless.
     return {'PATH': '/usr/bin:/bin', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
-            'HOME': '/nonexistent', 'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C'}
+            'HOME': '/nonexistent', 'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C',
+            # refs/replace/* in the owner's repo must not rewrite the object read for the PR SHA.
+            'GIT_NO_REPLACE_OBJECTS': '1'}
 
 
 def parse_ls_tree(raw: bytes) -> list[tuple[bytes, bytes, bytes]]:

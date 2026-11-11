@@ -48,24 +48,28 @@ toolchain drift) is caught after merge, not before. Both jobs use only
 `contents: read`, a full-commit-pinned checkout with credential persistence
 disabled, and no artifact upload or cache actions.
 
-### Validators run from the base revision on pull requests
+### Validators run from the default branch on every run
 
-On `pull_request` runs the separate job `ci/base-validators` runs
+On every run (`pull_request`, `push` and `workflow_dispatch` alike) the separate job
+`ci/base-validators` runs
 `tools/deps/check_manifest.py` (against `deps/manifest.lock`),
 `tools/provenance/check.py` (which imports `tools/provenance/inventory.py`) and
-`tools/tls/scan.py` from the PR's **base** revision against the PR tree, so one PR
+`tools/tls/scan.py` from the repository **default branch** (`main`, never the PR's base ref: a stacked `aa/X`
+base is author-pushable) against the tree under test, so one PR
 cannot change a check and the data it checks together and stay green. It is a
 **separate job on a fresh runner**: no PR code executes before it (so a PR step cannot
 poison later "trusted" steps through `$GITHUB_ENV`/`BASH_ENV`, `$GITHUB_PATH` or a shell
-function). It checks out the base revision (validator code) and the PR tree (data only:
+function). It checks out `main` (validator code) and the tree under test (data only:
 only ever a path argument, nothing from it is executed or sourced) and runs the validators
 with `/usr/bin/python3 -B -s -E` from a scrubbed `env -i`.
 
 Which job produces which required status: the required context `ci/provenance-lint` keeps
 its name and its existing in-tree steps, and now has `needs: base-validators` plus a first
-step that fails unless `ci/base-validators` succeeded (the job runs under `!cancelled()`, because a
-*skipped* required job would otherwise count as passing). So `ci/provenance-lint` cannot go green on a pull
-request without the trusted validators. Optionally add `ci/base-validators` to the ruleset's
+step that fails unless `ci/base-validators` **succeeded**, for every event type (the job runs under
+`!cancelled()`, because a *skipped* required job would otherwise count as passing; `skipped` is
+not accepted, so `gh workflow run ci.yml --ref <pr-branch>` cannot produce a green
+`ci/provenance-lint` without the trusted validators). `pull_request` also reruns on `edited`,
+so retargeting a PR reruns CI. Optionally add `ci/base-validators` to the ruleset's
 required contexts after its first run.
 
 If a PR legitimately changes one of these validators or their pinned constants, the base run
@@ -132,7 +136,15 @@ PR tree as untrusted code:
   complete scrubbed environment (`env -i`-style: fixed `PATH`, `GIT_CONFIG_NOSYSTEM=1`,
   empty `HOME`). All writable and read-only paths are canonicalised first and the relay
   refuses to run if a writable path (`AA_SYSROOT_CACHE`, the scratch tree) equals,
-  contains or sits inside a read-only input such as the sysroot.
+  contains or sits inside a read-only input such as the sysroot, equals or contains your
+  `$HOME` or the repo checkout, or overlaps the repo's git dirs or the relay's own logs,
+  base checkout and empty-HOME directories. The default scratch is a fresh `mktemp -d`
+  (mode 0700) under `$XDG_RUNTIME_DIR`, else `$TMPDIR`, else `/tmp`.
+- Use a fresh, dedicated `AA_SYSROOT_CACHE` for each run (or leave it unset): hardlink or
+  bind-mount aliases into the cache, and cache poisoning that carries over between PRs, are
+  not defended against.
+- `SIGKILL` of the relay (or a second signal while it is cleaning up) can leave a
+  container behind; check `docker ps` / `podman ps` and remove it by hand.
 - Containers (podman/docker) get a random name. After every step, and on timeout, error,
   INT, TERM or exit, the relay `kill`s and `rm -f`s the container and verifies it is gone
   (the daemon must answer and list no such container) before it hashes logs or posts a

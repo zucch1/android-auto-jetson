@@ -49,7 +49,7 @@
 #   AA_GOOGLETEST_ARCHIVE   locked GoogleTest v1.15.2 archive
 # Optional environment:
 #   AA_SYSROOT_CACHE        immutable build cache root (default: scratch/build-binding)
-#   AA_RELAY_SCRATCH        scratch root (default: ${TMPDIR:-/tmp}/arm64-cross-relay-<head-sha>)
+#   AA_RELAY_SCRATCH        scratch root (default: fresh `mktemp -d` 0700 dir under $XDG_RUNTIME_DIR, else $TMPDIR, else /tmp)
 #   AA_RELAY_SANDBOX        same as --sandbox
 #   AA_RELAY_IMAGE          local container image (cmake, ninja, aarch64 g++, python3) for podman/docker
 #   AA_RELAY_EXTRA_RO       colon-separated extra host paths to expose read-only to bwrap/containers
@@ -122,7 +122,23 @@ echo "relay: sandbox backend=$sandbox_backend" >&2
 test_mode=${AA_RELAY_TEST_MODE:-}
 
 repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
-scratch=$(realpath -m -- "${AA_RELAY_SCRATCH:-${TMPDIR:-/tmp}/arm64-cross-relay-$head_sha}")
+# Scratch root: an explicit AA_RELAY_SCRATCH (tests, owner), else a fresh unpredictable 0700
+# directory from mktemp (never a guessable /tmp/<name>-<sha> that another local user could
+# pre-create or symlink-race). Under $XDG_RUNTIME_DIR when set, else $TMPDIR, else /tmp.
+scratch_created=
+if [ -n "${AA_RELAY_SCRATCH:-}" ]; then
+    scratch=$(realpath -m -- "$AA_RELAY_SCRATCH")
+else
+    scratch_parent=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+    [ -d "$scratch_parent" ] || { echo "error: scratch parent '$scratch_parent' is not a directory" >&2; exit 66; }
+    scratch=$(mktemp -d "${scratch_parent%/}/arm64-cross-relay.XXXXXXXXXX") || {
+        echo "error: could not create a scratch directory under $scratch_parent" >&2
+        exit 70
+    }
+    chmod 0700 "$scratch"
+    scratch=$(realpath -- "$scratch")
+    scratch_created=1
+fi
 base_tree=$scratch/base
 pr_tree=$scratch/pr-tree
 logs=$scratch/logs
@@ -134,11 +150,21 @@ AA_SYSROOT_CACHE=$(realpath -m -- "${AA_SYSROOT_CACHE:-$scratch/build-binding}")
 # or expose it, so the relay refuses to run.
 RELAY_SB_RW=("$pr_tree" "$AA_SYSROOT_CACHE")
 RELAY_SB_RO=("$AA_SYSROOT_ROOTFS" "$AA_SYSROOT_MANIFEST" "$AA_GOOGLETEST_ARCHIVE")
+# Trusted scratch and the repo's git dirs: no writable mount may overlap them in any way.
+RELAY_SB_PROTECT=("$logs" "$base_tree" "$empty_home"
+    "$(git -C "$repo_root" rev-parse --absolute-git-dir)"
+    "$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)")
+# The owner's HOME and the checkout itself: a writable mount may not equal or contain them.
+RELAY_SB_PROTECT_COVER=("${HOME:-}" "$repo_root")
 # Observed-mode contract: the hash-validated payload IS the link sysroot (SysrootGate).
 RELAY_SB_ENV=("AA_SYSROOT_ROOTFS=$AA_SYSROOT_ROOTFS" "AA_SYSROOT_MANIFEST=$AA_SYSROOT_MANIFEST"
     "AA_GOOGLETEST_ARCHIVE=$AA_GOOGLETEST_ARCHIVE" "AA_SYSROOT_CACHE=$AA_SYSROOT_CACHE"
     "AA_SYSROOT_PAYLOAD=$AA_SYSROOT_ROOTFS" "AA_SYSROOT_REQUIRE_OBSERVED=ON" "PKG_CONFIG_PATH=")
-relay_sandbox_canonicalize || exit $?
+relay_sandbox_canonicalize || {
+    rc=$?
+    [ -z "$scratch_created" ] || rmdir "$scratch" 2>/dev/null || true
+    exit "$rc"
+}
 mkdir -p "$logs" "$empty_home" "$pr_tree" "$AA_SYSROOT_CACHE"
 
 if [ -n "$test_mode" ]; then

@@ -112,6 +112,16 @@ def main() -> int:
         check(done.returncode == 0 and (tmp / 'export-gitlink' / 'ok').exists() and not (tmp / 'export-gitlink' / 'sub').exists(),
               'gitlink handling', done.stderr)
 
+        # refs/replace/* in the owner's repo must not rewrite the PR's objects (GIT_NO_REPLACE_OBJECTS=1).
+        orig_blob = git(repo, 'rev-parse', f'{sha}:dir/a.txt')
+        evil_blob = git(repo, 'hash-object', '-w', '--stdin', stdin=b'REPLACED\n')
+        git(repo, 'replace', orig_blob, evil_blob)
+        check(git(repo, 'cat-file', 'blob', orig_blob) == 'REPLACED', 'test setup: replace ref must be effective')
+        done = export(repo, sha, tmp / 'export-replace')
+        check(done.returncode == 0, 'export with a replace ref failed', done.stderr)
+        check((tmp / 'export-replace' / 'dir' / 'a.txt').read_text(encoding='utf-8') == 'a\n',
+              'a refs/replace object rewrote the exported content (GIT_NO_REPLACE_OBJECTS missing)')
+
     # The relay must use the exporter rather than `git archive`.
     relay = (ROOT / 'tools' / 'ci' / 'arm64-cross-relay.sh').read_text(encoding='utf-8')
     check('relay-export-tree.py' in relay and 'git -C "$repo_root" archive' not in relay,
