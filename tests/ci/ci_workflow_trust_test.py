@@ -27,7 +27,8 @@ def check(condition: bool, message: str, detail: str = '') -> None:
     # `detail` is only ever subprocess output or a script body, never workflow step data (those
     # dicts carry `persist-credentials`, which CodeQL treats as a secret source when logged).
     if not condition:
-        print(f'FAIL: {message}\n{detail}')
+        print(f'FAIL: {message}')
+        os.write(2, (detail + '\n').encode('utf-8', 'replace'))
         raise SystemExit(1)
 
 

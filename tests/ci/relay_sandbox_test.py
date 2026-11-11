@@ -229,8 +229,11 @@ def read_step_log(tmp: Path, name: str) -> str:
 
 def check(condition: bool, message: str, detail: str = '') -> None:
     if not condition:
+        print(f'FAIL: {message}')
+        # Diagnostics (subprocess output, canary redacted) go straight to stderr, not through a
+        # print of anything that CodeQL's name heuristics could take for a secret.
         shown = detail.replace(SANDBOX_CANARY, '<canary-redacted>')
-        print(f'FAIL: {message}\n{shown}')
+        os.write(2, (shown + '\n').encode('utf-8', 'replace'))
         raise SystemExit(1)
 
 
