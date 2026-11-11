@@ -49,6 +49,11 @@ def command(args: list[str], payload: str | None = None) -> str:
     return result.stdout
 
 
+def redact_mac_addresses(text: str) -> str:
+    """Remove client identifiers before station output enters a retained report."""
+    return re.sub(r'(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b', '<redacted-mac>', text)
+
+
 def regulatory_section(reg: str, phy: str) -> str:
     """Validate every section before selecting a phy override or global rules."""
     if not reg.isascii():
@@ -179,7 +184,7 @@ def active(report: Report, args: argparse.Namespace) -> None:
             while time.monotonic() < end:
                 context.iteration(False)
                 stations = command(['iw', 'dev', args.interface, 'station', 'dump'])
-                report.raw['stations'] = stations
+                report.raw['stations'] = redact_mac_addresses(stations)
                 report.client_association |= bool(re.search(
                     r'(?ms)^Station [0-9a-f:]{17} [^\n]*\n(?:(?!^Station ).)*?\bauthorized:\s+yes\b',
                     stations))

@@ -143,6 +143,12 @@ class Active(unittest.TestCase):
         self.assertIn('no', calls[0])
         self.assertFalse(report.pairing_asserted or report.trust_asserted)
 
+    def test_station_macs_are_redacted_before_report_retention(self):
+        report, _ = self.exercise()
+        self.assertNotIn('aa:bb:cc:dd:ee:ff', json.dumps(asdict(report)))
+        self.assertIn('Station <redacted-mac> (on wlan0)', report.raw['stations'])
+        self.assertTrue(report.client_association)
+
     def test_ap_failure_cleans_own_uuid(self):
         report, calls = self.exercise(failure=True)
         self.assertEqual(calls[-1][:4], ['nmcli', 'connection', 'delete', 'uuid'])
