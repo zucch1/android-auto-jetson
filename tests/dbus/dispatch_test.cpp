@@ -240,6 +240,17 @@ TEST(CallBoundary, NonMethodCallMessagesAreDroppedNotDispatched) {
     ASSERT_TRUE(ping.has_value());
     EXPECT_FALSE(ping->is_error);
     EXPECT_TRUE(std::holds_alternative<std::uint64_t>(ping->body));
+
+    // And: the original consumer registration is preserved and still holds authority.
+    const auto start = fixture.dispatcher.handle(call_from(":1.40", "StartProjection"));
+    ASSERT_TRUE(start.has_value());
+    EXPECT_FALSE(start->is_error);
+    EXPECT_EQ(fixture.service.state().projection, ProjectionState::projecting);
+
+    const auto stop = fixture.dispatcher.handle(call_from(":1.40", "StopProjection"));
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_FALSE(stop->is_error);
+    EXPECT_EQ(fixture.service.state().projection, ProjectionState::stopped);
 }
 
 TEST(CallBoundary, RejectsForeignObjectPathsWithoutDispatching) {
@@ -272,6 +283,17 @@ TEST(CallBoundary, RejectsForeignObjectPathsWithoutDispatching) {
     ASSERT_TRUE(ping.has_value());
     EXPECT_FALSE(ping->is_error);
     EXPECT_TRUE(std::holds_alternative<std::uint64_t>(ping->body));
+
+    // And: the original consumer registration is preserved and still holds authority.
+    const auto start = fixture.dispatcher.handle(call_from(":1.41", "StartProjection"));
+    ASSERT_TRUE(start.has_value());
+    EXPECT_FALSE(start->is_error);
+    EXPECT_EQ(fixture.service.state().projection, ProjectionState::projecting);
+
+    const auto stop = fixture.dispatcher.handle(call_from(":1.41", "StopProjection"));
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_FALSE(stop->is_error);
+    EXPECT_EQ(fixture.service.state().projection, ProjectionState::stopped);
 }
 
 TEST(CallBoundary, PairingFlowRoutesThroughTheBoundary) {

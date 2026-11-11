@@ -290,6 +290,21 @@ TEST(BusBoundary, SignalWithControlMemberCannotChangeState) {
     const auto ping_payload = ping_cursor.read_u64();
     ASSERT_TRUE(ping_payload.has_value());
     EXPECT_TRUE(ping_cursor.done());
+
+    // And: the original consumer registration is preserved and still holds authority.
+    bus::MessageWriter empty;
+    empty.body_signature("");
+    const auto start =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "StartProjection", empty);
+    ASSERT_TRUE(start.has_value());
+    EXPECT_EQ(start.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(bus_state.service->state().projection, ProjectionState::projecting);
+
+    const auto stop =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "StopProjection", empty);
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(bus_state.service->state().projection, ProjectionState::stopped);
 }
 
 TEST(BusBoundary, WrongPathMethodCallCannotChangeState) {
@@ -344,6 +359,21 @@ TEST(BusBoundary, WrongPathMethodCallCannotChangeState) {
     const auto ping_payload = ping_cursor.read_u64();
     ASSERT_TRUE(ping_payload.has_value());
     EXPECT_TRUE(ping_cursor.done());
+
+    // And: the original consumer registration is preserved and still holds authority.
+    bus::MessageWriter empty;
+    empty.body_signature("");
+    const auto start =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "StartProjection", empty);
+    ASSERT_TRUE(start.has_value());
+    EXPECT_EQ(start.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(bus_state.service->state().projection, ProjectionState::projecting);
+
+    const auto stop =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "StopProjection", empty);
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(bus_state.service->state().projection, ProjectionState::stopped);
 }
 
 TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
