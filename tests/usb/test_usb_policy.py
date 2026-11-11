@@ -1072,6 +1072,9 @@ class Rollback(unittest.TestCase):
         run = self.rollback()
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("named-user ACLs are NOT revoked by this tooling", run.stdout)
+        self.assertIn("done: prior rules restored and install state removed", run.stdout)
+        self.assertIn("live named-user ACLs are NOT revoked", run.stdout)
+        self.assertNotIn("done: prior state restored", run.stdout)
         self.assertNotIn("cannot survive", run.stdout + run.stderr)
 
 

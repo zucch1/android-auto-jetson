@@ -182,4 +182,5 @@ test_hook after-retire-state
 rm -rf -- "${PRIVATE_STATE_TMP:?}"
 PRIVATE_STATE_TMP=""
 rmdir "${ROOT}/var/lib/android-auto-receiver" 2>/dev/null || true
-log "done: prior state restored; install state removed"
+log "done: prior rules restored and install state removed;" \
+    "live named-user ACLs are NOT revoked; end the seat session or physically re-plug the device to clear them"
