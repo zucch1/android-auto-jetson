@@ -1754,7 +1754,8 @@ int receiver_main(int argc, char **argv) {
     aa::transport::UsbDeviceSelector selector{};
     selector.port_context = port;
     aa::transport::AoaAccessoryInfo accessory{};
-    log_line("{\"event\":\"connecting\",\"port\":\"" + port + "\"}");
+    log_line("{\"event\":\"connecting\",\"port\":\"" +
+             aa::wired_receiver::sanitize_logged_string(port) + "\"}");
 
     // Per-link cipher (P1-B/P1-C): the initial attach AND every reconnect build
     // a FRESH cipher bound to the identity the TrustStore admitted for THIS
@@ -1784,7 +1785,8 @@ int receiver_main(int argc, char **argv) {
         if (!attempted_identity.port_context.empty()) {
             line += ",\"phone_id\":\"" +
                     aa::trust::redacted_label(aa::trust::TransportIdentity{attempted_identity}) +
-                    "\",\"port\":\"" + attempted_identity.port_context + "\"";
+                    "\",\"port\":\"" +
+                    aa::wired_receiver::sanitize_logged_string(attempted_identity.port_context) + "\"";
         }
         line += "}";
         log_line(line);

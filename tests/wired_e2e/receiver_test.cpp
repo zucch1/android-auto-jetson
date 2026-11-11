@@ -1567,6 +1567,43 @@ TEST(WiredReceiver, PreAdmissionFailureEmitsNoAttemptAttribution) {
     EXPECT_EQ(errors[0].find("\"port\""), std::string::npos);
 }
 
+TEST(WiredReceiver, SanitizeLoggedStringEscapesAndScrubsUntrustedInput) {
+    using aa::wired_receiver::sanitize_logged_string;
+    // 1. Escapes quotes, backslashes, control characters, and newlines that could forge log lines
+    EXPECT_EQ(sanitize_logged_string("port\n{\"event\":\"fake\"}\r\t\""),
+              "port\\n{\\\"event\\\":\\\"fake\\\"}\\r\\t\\\"");
+
+    // 2. Control characters below 0x20 and 0x7F are hex escaped
+    EXPECT_EQ(sanitize_logged_string(std::string_view{"\x00\x1f\x7f", 3}),
+              "\\u0000\\u001f\\u007f");
+
+    // 3. Scrubs sensitive patterns such as MAC addresses
+    const auto scrubbed_mac = sanitize_logged_string("11:22:33:44:55:66");
+    EXPECT_TRUE(scrubbed_mac.starts_with("id-"));
+    EXPECT_EQ(scrubbed_mac.find("11:22"), std::string::npos);
+
+    // 4. Clean strings pass through unchanged
+    EXPECT_EQ(sanitize_logged_string("1-2.2"), "1-2.2");
+}
+
+TEST(WiredReceiver, RejectedAttemptWithForgedPortContextIsSanitized) {
+    const aa::trust::WiredIdentity second{
+        "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
+        "SECOND-PRIVATE-AOA", "1-2.2\n{\"event\":\"forged\"}\"token=secret123"};
+    const auto label = aa::trust::redacted_label(aa::trust::TransportIdentity{second});
+    std::string line = std::string{"{\"event\":\"err\",\"detail\":\"link\",\"code\":\"transport_unauthorized_peer\""};
+    if (!second.port_context.empty()) {
+        line += ",\"phone_id\":\"" + label +
+                "\",\"port\":\"" + aa::wired_receiver::sanitize_logged_string(second.port_context) + "\"";
+    }
+    line += "}";
+    // Must be a single line (no raw newlines)
+    EXPECT_EQ(line.find('\n'), std::string::npos);
+    EXPECT_NE(line.find("\\n"), std::string::npos);
+    EXPECT_NE(line.find("\\\""), std::string::npos);
+    EXPECT_EQ(line.find("token=secret123"), std::string::npos);
+}
+
 class RejectAudio final : public aa::audio::detail::ObservedAudioSink {
   public:
     aa::core::Result<void> write(const aa::audio::MixedChunk &) override {

@@ -12,6 +12,7 @@
 #include <mutex>
 #include <pthread.h>
 #include <signal.h>
+#include <aa/diagnostics/Diagnostics.hpp>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -20,6 +21,38 @@
 #include <utility>
 
 namespace aa::wired_receiver {
+
+[[nodiscard]] inline std::string json_escape(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const char c : text) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20U || static_cast<unsigned char>(c) == 0x7FU) {
+                static constexpr char kHex[] = "0123456789abcdef";
+                out += "\\u00";
+                out += kHex[(static_cast<unsigned char>(c) >> 4) & 0x0FU];
+                out += kHex[static_cast<unsigned char>(c) & 0x0FU];
+            } else {
+                out.push_back(c);
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] inline std::string sanitize_logged_string(std::string_view text) {
+    return json_escape(aa::diagnostics::scrub_text(text));
+}
+
 class StdoutLog final {
 public:
     static constexpr std::size_t byte_capacity = 1'048'576;
