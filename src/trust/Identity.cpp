@@ -34,8 +34,13 @@ void append_field(std::string& out, std::string_view field) {
     out.append(field);
 }
 
+// Treat blank serials as absent while retaining their bytes in identity_key.
+[[nodiscard]] bool blank_serial(std::string_view serial) noexcept {
+    return serial.find_first_not_of(" \t\n\r\f\v") == std::string_view::npos;
+}
+
 [[nodiscard]] bool wired_has_material(const WiredIdentity& wired) {
-    if (!wired.usb_serial.empty() || !wired.aoa_serial.empty()) {
+    if (!blank_serial(wired.usb_serial) || !blank_serial(wired.aoa_serial)) {
         return true;
     }
     return !wired.usb_vendor_id.empty() && !wired.usb_product_id.empty() &&
@@ -62,8 +67,7 @@ TransportKind kind_of(const TransportIdentity& identity) noexcept {
 // Classify blank serials as absent without changing the stable identity key.
 IdentityStrength strength_of(const TransportIdentity& identity) noexcept {
     if (const auto* wired = std::get_if<WiredIdentity>(&identity)) {
-        return wired->usb_serial.find_first_not_of(" \t\n\r\f\v") == std::string::npos &&
-               wired->aoa_serial.find_first_not_of(" \t\n\r\f\v") == std::string::npos
+        return blank_serial(wired->usb_serial) && blank_serial(wired->aoa_serial)
             ? IdentityStrength::port_only : IdentityStrength::serial_backed;
     }
     return kind_of(identity) == TransportKind::wireless

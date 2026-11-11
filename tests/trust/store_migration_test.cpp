@@ -167,6 +167,33 @@ TEST(StoreMigration, V3RejectsOpaquePortOnlyWiredKeys) {
     }
 }
 
+TEST(StoreMigration, V3OpaqueSerialBackedWiredKeyRoundTrips) {
+    test::TempStoreDir dir;
+    const auto key = trust::identity_key(trust::TransportIdentity{test::kWired});
+    ASSERT_TRUE(key.starts_with("w1:"));
+    ASSERT_EQ(trust::strength_of(trust::TransportIdentity{test::kWired}),
+              trust::IdentityStrength::serial_backed);
+    write_text(dir.file(),
+        "{\"schema_version\":3,\"next_phone_id\":8,\"phones\":[{\"phone_id\":7,"
+        "\"strength\":\"opaque\",\"identity\":{\"kind\":\"opaque\",\"key\":\"" + key + "\"}}]}");
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    EXPECT_EQ(store.lookup(trust::PhoneIdentity{key}), trust::Decision::approved);
+    ASSERT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(store.phones()[0].strength, trust::IdentityStrength::opaque);
+    EXPECT_EQ(store.dropped_port_only_count(), 0U);
+
+    // A new approval persists the loaded compatibility record unchanged.
+    ASSERT_TRUE(store.approve(trust::TransportIdentity{test::kWireless}).has_value());
+    trust::ApprovedPhoneStore fresh{dir.file()};
+    ASSERT_TRUE(fresh.load().has_value());
+    EXPECT_EQ(fresh.lookup(trust::PhoneIdentity{key}), trust::Decision::approved);
+    ASSERT_EQ(fresh.phones().size(), 2U);
+    EXPECT_EQ(fresh.phones()[0].phone_id, aa::core::PhoneId{7});
+    EXPECT_EQ(fresh.phones()[0].strength, trust::IdentityStrength::opaque);
+    EXPECT_EQ(trust::identity_key(fresh.phones()[0].identity), key);
+}
+
 TEST(StoreMigration, WriterDerivesStrengthFromIdentity) {
     trust::detail::ParsedStore snapshot;
     snapshot.phones = {

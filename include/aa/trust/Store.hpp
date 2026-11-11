@@ -106,7 +106,8 @@ public:
     [[nodiscard]] bool usable() const noexcept { return usable_; }
 
     // Number of unconsented port-only records dropped by the last successful
-    // load's v1/v2 migration; zero after an empty/v3 load or a failed load.
+    // load's v1/v2 migration, including malformed reserved w1: keys dropped
+    // fail-closed; zero after an empty/v3 load or a failed load.
     [[nodiscard]] std::size_t dropped_port_only_count() const noexcept {
         return dropped_port_only_count_;
     }

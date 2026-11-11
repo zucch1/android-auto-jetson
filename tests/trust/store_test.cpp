@@ -431,6 +431,45 @@ TEST(TrustStore, PortOnlyApiRejectsSerialBearingIdentity) {
     EXPECT_FALSE(std::filesystem::exists(dir.file()));
 }
 
+TEST(TrustStore, WhitespaceSerialsRequireCompletePortBinding) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    for (const auto& wired : {
+             trust::WiredIdentity{"", "", " ", "", "", "", ""},
+             trust::WiredIdentity{"", "", "", "", "", "   ", ""},
+             trust::WiredIdentity{"", "4ee1", " ", "", "", "", "1-2.3"},
+             trust::WiredIdentity{"18d1", "", " ", "", "", "", "1-2.3"},
+             trust::WiredIdentity{"18d1", "4ee1", " ", "", "", "", ""}}) {
+        const auto approved = store.approve_port_only(wired);
+        ASSERT_FALSE(approved.has_value());
+        EXPECT_EQ(approved.error().code(), ErrorCode::trust_unknown_phone);
+        EXPECT_FALSE(trust::validated_key(trust::TransportIdentity{wired}).has_value());
+    }
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file()));
+
+    const trust::WiredIdentity bound{"18d1", "4ee1", " ", "", "", "", "1-2.3"};
+    ASSERT_TRUE(store.approve_port_only(bound).has_value());
+    ASSERT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(store.phones()[0].strength, trust::IdentityStrength::port_only);
+}
+
+TEST(TrustStore, WhitespaceUsbSerialWithRealAoaSerialIsSerialBacked) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    const trust::WiredIdentity wired{"", "", " ", "", "", "real-aoa-serial", ""};
+    EXPECT_EQ(trust::strength_of(trust::TransportIdentity{wired}),
+              trust::IdentityStrength::serial_backed);
+    ASSERT_TRUE(store.approve(trust::TransportIdentity{wired}).has_value());
+    ASSERT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(store.phones()[0].strength, trust::IdentityStrength::serial_backed);
+    const auto port_only = store.approve_port_only(wired);
+    ASSERT_FALSE(port_only.has_value());
+    EXPECT_EQ(port_only.error().code(), ErrorCode::invalid_argument);
+}
+
 TEST(TrustStore, WhitespaceOnlySerialsRequirePortOnlyConsentWithoutChangingKey) {
     test::TempStoreDir dir;
     trust::ApprovedPhoneStore store{dir.file()};

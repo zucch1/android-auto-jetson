@@ -121,7 +121,8 @@ using Object = JsonValue::Object;
 
 // Legacy opaque keys may contain the old wired encoding. Keep serial-backed
 // compatibility keys, but do not let a port-only grant escape migration by
-// being represented as opaque. Malformed reserved wired encodings fail closed.
+// being represented as opaque. Malformed reserved w1: encodings also return
+// true to fail closed and count as dropped port-only grants in v1/v2 migration.
 [[nodiscard]] bool implicit_port_key(std::string_view key) {
     if (!key.starts_with("w1:")) { return false; }
     key.remove_prefix(3);
@@ -198,6 +199,7 @@ using Object = JsonValue::Object;
 
 // Old documents contain no proof of consent to a port-only grant. Drop them
 // rather than silently upgrading their authority; preserve allocation counters.
+// The dropped-port-only count also includes malformed reserved w1: keys.
 void drop_implicit_port_grants(ParsedStore& store) {
     store.dropped_port_only_count = std::erase_if(store.phones, [](const ApprovedPhone& phone) {
         const auto* opaque = std::get_if<OpaqueIdentity>(&phone.identity);
