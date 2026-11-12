@@ -10,6 +10,7 @@
 #include <optional>
 #include <poll.h>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -37,7 +38,14 @@ inline bool is_idr_au(const std::vector<std::uint8_t>& payload) {
 
 class VideoOutlet final : public protocol::MessageSink {
 public:
-    explicit VideoOutlet(std::function<void(const std::string&)> log) : log_(std::move(log)) {}
+    using MediaLog = std::function<void(std::string_view kind, const std::string&)>;
+
+    // `log` carries lifecycle records (endpoint events, final stats). `media_log`
+    // (audit L13) carries the periodic, phone-driven records (video_sent,
+    // video_dropped, running decode_stats): the receiver binds it to a
+    // rate-limited, never-blocking sink. Without one they go to `log` unchanged.
+    explicit VideoOutlet(std::function<void(const std::string&)> log, MediaLog media_log = {})
+        : log_(std::move(log)), media_log_(std::move(media_log)) {}
     ~VideoOutlet() override { close(); }
 
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override {
@@ -83,8 +91,8 @@ public:
         }
         ++units_;
         if (units_ % 30 == 1) {
-            log_("{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
-            emit_drops();
+            media("video_sent", "{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
+            emit_drops(false);
         }
         return {};
     }
@@ -102,7 +110,7 @@ public:
 
     void close() noexcept {
         std::lock_guard lock(mutex_);
-        emit_drops();
+        emit_drops(true);
         if (producer_.has_value()) {
             producer_->close();
             producer_.reset();
@@ -110,24 +118,38 @@ public:
     }
 
 private:
-    void emit_drops() {
+    void media(std::string_view kind, const std::string& line) {
+        if (media_log_) {
+            media_log_(kind, line);
+        } else {
+            log_(line);
+        }
+    }
+
+    void emit_drops(bool final) {
         if (units_ + dropped_ == 0 || exported_observations_ == units_ + dropped_) {
             return;
         }
         exported_observations_ = units_ + dropped_;
-        log_("{\"event\":\"decode_stats\",\"frame_drops\":" + std::to_string(dropped_) + "}");
+        const auto line = "{\"event\":\"decode_stats\",\"frame_drops\":" + std::to_string(dropped_) + "}";
+        if (final) {
+            log_(line);
+        } else {
+            media("decode_stats", line);
+        }
     }
 
     void record_drop(const char* reason) {
         ++dropped_;
         if (dropped_ % 30 == 1) {
-            log_(std::string{"{\"event\":\"video_dropped\",\"reason\":\""} + reason +
-                 "\",\"count\":" + std::to_string(dropped_) + "}");
-            emit_drops();
+            media("video_dropped", std::string{"{\"event\":\"video_dropped\",\"reason\":\""} + reason +
+                                       "\",\"count\":" + std::to_string(dropped_) + "}");
+            emit_drops(false);
         }
     }
 
     std::function<void(const std::string&)> log_;
+    MediaLog media_log_;
     std::mutex mutex_{};
     std::optional<ipc::VideoProducer> producer_{};
     std::uint64_t sequence_{};

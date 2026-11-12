@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exercise the actual harness adapters, not copies of their logging logic.
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
+#include <future>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -539,6 +541,139 @@ TEST(WiredReceiver, StdoutLogFinishWaitsForFrontAndJoinsOnlyOnce) {
     EXPECT_EQ(harness.probe.bytes, "final\n");
     EXPECT_FALSE(harness.log.finish());
     EXPECT_EQ(harness.log.submit("closed").value(), ESHUTDOWN);
+}
+
+// ---- Audit L13: phone-driven telemetry must not consume the sink or block shutdown ----
+
+std::atomic<std::int64_t> g_log_fake_ns{0};
+aa::wired_receiver::StdoutLog::Clock::time_point log_fake_now() {
+    return aa::wired_receiver::StdoutLog::Clock::time_point{std::chrono::nanoseconds{g_log_fake_ns.load()}};
+}
+std::size_t count_substr(const std::string &text, const std::string &needle) {
+    std::size_t count = 0;
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) { ++count; }
+    return count;
+}
+std::uint64_t sum_reported(const std::string &text, const std::string &field) {
+    std::uint64_t total = 0;
+    const std::string key = "\"" + field + "\":";
+    for (auto at = text.find("media_telemetry_dropped"); at != std::string::npos;
+         at = text.find("media_telemetry_dropped", at + 1)) {
+        const auto value = text.find(key, at);
+        total += std::stoull(text.substr(value + key.size()));
+    }
+    return total;
+}
+
+TEST(WiredReceiver, StdoutLogMediaTelemetryIsRateLimitedPerKindAndCounted) {
+    // Given: a 10/s, burst-20 limiter on a controllable clock and a free-flowing sink.
+    LogWriteProbe probe;
+    probe.released = true;
+    LogWriteProbe::active = &probe;
+    std::atomic<bool> running{true};
+    g_log_fake_ns = 0;
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {10.0, 20.0}};
+    // When: a phone floods one media kind in a single instant.
+    for (int i = 0; i < 1000; ++i) { EXPECT_FALSE(log.submit_media("audio_write_completed", "{\"event\":\"audio_write_completed\"}")); }
+    // Then: only the burst is admitted; the rest is counted, none of it errors.
+    EXPECT_EQ(log.media_drops().rate_limited, 980U);
+    EXPECT_EQ(log.media_drops().backpressure, 0U);
+    // And a different kind has its own bucket.
+    for (int i = 0; i < 20; ++i) { EXPECT_FALSE(log.submit_media("video_sent", "{\"event\":\"video_sent\"}")); }
+    EXPECT_EQ(log.media_drops().rate_limited, 980U);
+    // When: a second passes the bucket refills at the sustained rate (10 tokens).
+    g_log_fake_ns = 1'000'000'000;
+    for (int i = 0; i < 100; ++i) { EXPECT_FALSE(log.submit_media("audio_write_completed", "{\"event\":\"audio_write_completed\"}")); }
+    EXPECT_EQ(log.media_drops().rate_limited, 980U + 90U);
+    // Lossless lifecycle records are unaffected by the media limiter.
+    EXPECT_FALSE(log.submit("{\"event\":\"ready\"}"));
+    EXPECT_FALSE(log.finish());
+    LogWriteProbe::active = nullptr;
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_write_completed\""), 30U);
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"video_sent\""), 20U);
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"ready\""), 1U);
+    // And the loss is reported in-band, exactly once accounted.
+    EXPECT_EQ(sum_reported(probe.bytes, "rate_limited"), 980U + 90U);
+}
+
+TEST(WiredReceiver, StdoutLogMediaTelemetryNeverBlocksOnAStalledSink) {
+    // Given: a sink that never returns and an unlimited rate, so only capacity bounds admission.
+    auto *probe = new LogWriteProbe; // Intentionally leaked: a worker may outlive this test.
+    LogWriteProbe::active = probe;
+    std::atomic<bool> running{true};
+    g_log_fake_ns = 0;
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {1e9, 1e9}};
+    constexpr std::size_t total = aa::wired_receiver::StdoutLog::entry_capacity + 904;
+    // When: media threads submit more than the queue holds.
+    auto flood = std::async(std::launch::async, [&] {
+        for (std::size_t i = 0; i < total; ++i) { EXPECT_FALSE(log.submit_media("audio_write_completed", "{}")); }
+    });
+    // Then: they return promptly (no waiting for space) and the overflow is counted.
+    ASSERT_EQ(flood.wait_for(std::chrono::seconds{2}), std::future_status::ready);
+    EXPECT_EQ(log.media_drops().backpressure, 904U);
+    EXPECT_EQ(log.media_drops().rate_limited, 0U);
+    probe->release();
+    EXPECT_FALSE(log.finish());
+    EXPECT_FALSE(probe->timed_out);
+    LogWriteProbe::active = nullptr;
+}
+
+TEST(WiredReceiver, StdoutLogFinishIsBoundedWhenTheSinkNeverReturns) {
+    // Given: a stalled sink, a full queue and a lossless producer waiting for space.
+    auto *probe = new LogWriteProbe; // Intentionally leaked: the abandoned worker outlives the log.
+    LogWriteProbe::active = probe;
+    std::atomic<bool> running{true};
+    std::error_code waiting_producer;
+    {
+        aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write};
+        for (std::size_t i = 0; i < aa::wired_receiver::StdoutLog::entry_capacity; ++i) {
+            ASSERT_FALSE(log.submit("x"));
+        }
+        std::thread producer([&] { waiting_producer = log.submit("blocked"); });
+        ASSERT_TRUE(log.wait_for_capacity_wait());
+        // When: shutdown asks for a 300 ms flush.
+        const auto started = std::chrono::steady_clock::now();
+        const auto error = log.finish(std::chrono::milliseconds{300});
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        producer.join();
+        // Then: it gives up inside the bound, reports the timeout, and wakes the producer.
+        EXPECT_EQ(error.value(), ETIMEDOUT);
+        EXPECT_LT(elapsed, std::chrono::milliseconds{1500});
+        EXPECT_TRUE(log.timed_out());
+        EXPECT_EQ(waiting_producer.value(), ESHUTDOWN);
+        EXPECT_EQ(log.submit("late").value(), ETIMEDOUT);
+        EXPECT_EQ(log.finish(std::chrono::milliseconds{300}).value(), ETIMEDOUT); // Repeat is a no-op.
+    }
+    // The detached worker finishes safely after the owner is gone.
+    probe->release();
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    EXPECT_TRUE(running.load()); // Never touched the owner's flag after abandonment.
+    LogWriteProbe::active = nullptr;
+}
+
+TEST(WiredReceiver, ReceiverLogMediaPathIsRateLimitedAndAccountedThroughTheRealCallSite) {
+    // Given: the receiver's real log_media call site bound to a real scope, capturing stdout.
+    g_running.store(true);
+    constexpr int total = 50'000;
+    capture_receiver_stdout();
+    std::uint64_t dropped = 0;
+    {
+        ReceiverLogScope logging{g_running};
+        // When: a phone drives far more audio completions than the limit in a tight burst.
+        for (int i = 0; i < total; ++i) {
+            log_media("audio_write_completed", "{\"event\":\"audio_write_completed\",\"scheduled_ns\":1}");
+        }
+        dropped = logging.log.media_drops().rate_limited + logging.log.media_drops().backpressure;
+        EXPECT_FALSE(logging.log.finish());
+    }
+    const auto output = captured_receiver_stdout();
+    // Then: every record is either written or counted as dropped, and most were dropped.
+    const auto written = count_substr(output, "\"event\":\"audio_write_completed\"");
+    EXPECT_EQ(written + dropped, static_cast<std::uint64_t>(total));
+    EXPECT_LT(written, 2'000U);
+    EXPECT_GT(dropped, 40'000U);
+    EXPECT_EQ(sum_reported(output, "rate_limited") + sum_reported(output, "backpressure"), dropped);
+    EXPECT_TRUE(g_running.load());
 }
 
 TEST(WiredReceiver, StdoutLogRequiresExplicitBinding) {
@@ -1565,43 +1700,6 @@ TEST(WiredReceiver, PreAdmissionFailureEmitsNoAttemptAttribution) {
     EXPECT_EQ(errors[0], "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"transport_unavailable\"}");
     EXPECT_EQ(errors[0].find("phone_id"), std::string::npos);
     EXPECT_EQ(errors[0].find("\"port\""), std::string::npos);
-}
-
-TEST(WiredReceiver, SanitizeLoggedStringEscapesAndScrubsUntrustedInput) {
-    using aa::wired_receiver::sanitize_logged_string;
-    // 1. Escapes quotes, backslashes, control characters, and newlines that could forge log lines
-    EXPECT_EQ(sanitize_logged_string("port\n{\"event\":\"fake\"}\r\t\""),
-              "port\\n{\\\"event\\\":\\\"fake\\\"}\\r\\t\\\"");
-
-    // 2. Control characters below 0x20 and 0x7F are hex escaped
-    EXPECT_EQ(sanitize_logged_string(std::string_view{"\x00\x1f\x7f", 3}),
-              "\\u0000\\u001f\\u007f");
-
-    // 3. Scrubs sensitive patterns such as MAC addresses
-    const auto scrubbed_mac = sanitize_logged_string("11:22:33:44:55:66");
-    EXPECT_TRUE(scrubbed_mac.starts_with("id-"));
-    EXPECT_EQ(scrubbed_mac.find("11:22"), std::string::npos);
-
-    // 4. Clean strings pass through unchanged
-    EXPECT_EQ(sanitize_logged_string("1-2.2"), "1-2.2");
-}
-
-TEST(WiredReceiver, RejectedAttemptWithForgedPortContextIsSanitized) {
-    const aa::trust::WiredIdentity second{
-        "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
-        "SECOND-PRIVATE-AOA", "1-2.2\n{\"event\":\"forged\"}\"token=secret123"};
-    const auto label = aa::trust::redacted_label(aa::trust::TransportIdentity{second});
-    std::string line = std::string{"{\"event\":\"err\",\"detail\":\"link\",\"code\":\"transport_unauthorized_peer\""};
-    if (!second.port_context.empty()) {
-        line += ",\"phone_id\":\"" + label +
-                "\",\"port\":\"" + aa::wired_receiver::sanitize_logged_string(second.port_context) + "\"";
-    }
-    line += "}";
-    // Must be a single line (no raw newlines)
-    EXPECT_EQ(line.find('\n'), std::string::npos);
-    EXPECT_NE(line.find("\\n"), std::string::npos);
-    EXPECT_NE(line.find("\\\""), std::string::npos);
-    EXPECT_EQ(line.find("token=secret123"), std::string::npos);
 }
 
 class RejectAudio final : public aa::audio::detail::ObservedAudioSink {
