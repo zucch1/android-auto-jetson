@@ -9,7 +9,7 @@ from bluez_runtime import Surface, command, wait
 from private_bus import process
 
 build = Path(sys.argv[1]).resolve()
-with tempfile.TemporaryDirectory(prefix="bond-restart-") as directory:
+with tempfile.TemporaryDirectory(prefix="bond-restart-", dir=build) as directory:
     with contextlib.ExitStack() as stack:
         surface = Surface(stack, build, Path(directory), probe=True)
         def rpc(text):
