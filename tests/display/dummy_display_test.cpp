@@ -1551,10 +1551,10 @@ private:
             }
             auto message = connection_->read_message();
             if (!message.has_value()) {
-                if (message.error().code() == ErrorCode::transport_closed) {
-                    break;
+                if (message.error().code() == ErrorCode::transport_message_dropped) {
+                    continue;
                 }
-                continue;
+                break;
             }
             if (message.value().type != bus::MessageType::method_call) {
                 continue;
