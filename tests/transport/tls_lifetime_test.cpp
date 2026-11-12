@@ -52,7 +52,7 @@ TEST(TlsLifetime, StalledHandshakeCancelsWithinDeadline) {
     ASSERT_TRUE(pair);
     aa::core::CancellationSource source;
     PendingIo pending([&] { return pair.value().client->open(source.get_token()); });
-    const bool blocked = pending.blocked(SYS_poll);
+    const bool blocked = pending.blocked_in_poll();
     // When: cancellation fires while the handshake waits for server bytes.
     source.request_stop();
     // Then: it returns cancelled promptly, well inside the 10s whole-handshake
