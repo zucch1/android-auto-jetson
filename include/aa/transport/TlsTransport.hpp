@@ -129,4 +129,10 @@ make_tls_loopback(const TlsTransport::ApprovedPredicate &approved, TlsMode mode)
 [[nodiscard]] std::unique_ptr<HandshakingCipher>
 make_client_handshake_cipher(const TlsTransport::ApprovedPredicate &approved);
 
+// Why the last make_client_handshake_cipher() on THIS thread returned nullptr
+// (e.g. "tls-record-adapter-cipher-configuration", a credential-loading class),
+// or an empty string after a success. The factory signature is deliberately
+// unchanged (tests link-wrap it), so the reason travels out of band.
+[[nodiscard]] std::string last_handshake_cipher_failure();
+
 } // namespace aa::transport

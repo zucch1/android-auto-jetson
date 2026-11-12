@@ -13,6 +13,7 @@ std::string_view Error::message() const noexcept {
     case ErrorCode::transport_unavailable: return "transport unavailable";
     case ErrorCode::transport_closed: return "transport closed";
     case ErrorCode::transport_io: return "transport io failure";
+    case ErrorCode::transport_plaintext_after_tls: return "plaintext frame after TLS handshake";
     case ErrorCode::transport_malformed_frame: return "malformed transport frame";
     case ErrorCode::transport_oversize_frame: return "oversize transport frame";
     case ErrorCode::transport_unauthorized_peer: return "unauthorized transport peer";
@@ -77,6 +78,7 @@ std::string_view to_string(ErrorCode code) noexcept {
     case ErrorCode::transport_unavailable: return "transport_unavailable";
     case ErrorCode::transport_closed: return "transport_closed";
     case ErrorCode::transport_io: return "transport_io";
+    case ErrorCode::transport_plaintext_after_tls: return "transport_plaintext_after_tls";
     case ErrorCode::transport_malformed_frame: return "transport_malformed_frame";
     case ErrorCode::transport_oversize_frame: return "transport_oversize_frame";
     case ErrorCode::transport_unauthorized_peer: return "transport_unauthorized_peer";

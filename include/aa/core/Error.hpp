@@ -34,6 +34,7 @@ enum class ErrorCode : std::uint16_t {
     transport_queue_full = 106,
     // A complete frame was discarded without desynchronizing the transport.
     transport_message_dropped = 107,
+    transport_plaintext_after_tls = 108,
 
     // protocol
     protocol_version_mismatch = 200,

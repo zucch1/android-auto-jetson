@@ -10,6 +10,9 @@
 # (cmake/TlsCredentials.cmake): the frozen cross sysroot carries no OpenSSL
 # development inputs. Test executables and registrations are host-side.
 
+option(AA_TLS_ALLOW_STATIC_RSA_COMPATIBILITY
+    "Allow non-forward-secret static-RSA AAP suites for legacy phones" OFF)
+
 set(AA_TRANSPORT_SOURCES
     src/transport/FrameCodec.cpp
     src/transport/MessageFramer.cpp
@@ -47,6 +50,10 @@ if(NOT CMAKE_CROSSCOMPILING)
         POSITION_INDEPENDENT_CODE ON)
     target_include_directories(aa_transport_tls PUBLIC "${CMAKE_SOURCE_DIR}/include")
     target_link_libraries(aa_transport_tls PUBLIC aa_transport aa_tls)
+    if(AA_TLS_ALLOW_STATIC_RSA_COMPATIBILITY)
+        target_compile_definitions(aa_transport_tls PUBLIC AA_TLS_ALLOW_STATIC_RSA_COMPATIBILITY=1)
+        message(WARNING "AAP static-RSA compatibility enabled: forward secrecy is not required")
+    endif()
 
     add_executable(aa_transport_frame_test
         tests/transport/framing_test.cpp tests/transport/malformed_test.cpp)
