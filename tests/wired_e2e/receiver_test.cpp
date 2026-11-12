@@ -5822,7 +5822,11 @@ namespace {
 std::string hex_of(const std::string &bytes) {
     static constexpr char digits[] = "0123456789abcdef";
     std::string out;
-    for (const unsigned char c : bytes) { out += digits[c >> 4]; out += digits[c & 15]; }
+    for (const char raw : bytes) {
+        const auto c = static_cast<unsigned char>(raw);
+        out += digits[c >> 4];
+        out += digits[c & 15];
+    }
     return out;
 }
 
