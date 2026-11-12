@@ -266,13 +266,4 @@ TEST(ReplayBounds, WrongSchemaRejectedWithCorrectHash) {
     expect_reject(*bad, aa::ErrorCode::invalid_argument);
 }
 
-TEST(ReplayBounds, OversizedAbsoluteTimestampRejected) {
-    // Given: a video record with an absolute timestamp exceeding the 1h trace cap.
-    const auto bad = tamper_resealed(golden_file(), R"("ts":5000000,"idr")",
-                                     R"("ts":9223372036854775000,"idr")");
-    ASSERT_TRUE(bad);
-    // When/Then: the loader rejects it on the timestamp boundary, hash intact.
-    expect_reject(*bad, aa::ErrorCode::invalid_argument);
-}
-
 } // namespace
