@@ -315,6 +315,10 @@ TEST(BusBoundary, SignalWithControlMemberCannotChangeState) {
         round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "RegisterConsumer", register_body);
     ASSERT_TRUE(registered.has_value());
     ASSERT_EQ(registered.value().type, bus::MessageType::method_return);
+    // The identity issued at registration. A successful StartProjection alone would also
+    // pass if the rejected traffic had swapped in a different consumer on this connection.
+    const auto original_consumer = bus_state.service->state().consumer;
+    ASSERT_NE(original_consumer, aa::core::ConsumerId{});
 
     // When: a SIGNAL (not a method call) carries the StartProjection member on
     // the real contract interface and object path.
@@ -352,6 +356,22 @@ TEST(BusBoundary, SignalWithControlMemberCannotChangeState) {
     const auto ping_payload = ping_cursor.read_u64();
     ASSERT_TRUE(ping_payload.has_value());
     EXPECT_TRUE(ping_cursor.done());
+
+    // And: the original consumer registration is preserved and still holds authority.
+    EXPECT_EQ(bus_state.service->state().consumer, original_consumer);
+    bus::MessageWriter empty;
+    empty.body_signature("");
+    const auto start =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "StartProjection", empty);
+    ASSERT_TRUE(start.has_value());
+    EXPECT_EQ(start.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(bus_state.service->state().projection, ProjectionState::projecting);
+
+    const auto stop =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "StopProjection", empty);
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(bus_state.service->state().projection, ProjectionState::stopped);
 }
 
 TEST(BusBoundary, WrongPathMethodCallCannotChangeState) {
@@ -365,6 +385,10 @@ TEST(BusBoundary, WrongPathMethodCallCannotChangeState) {
         round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "RegisterConsumer", register_body);
     ASSERT_TRUE(registered.has_value());
     ASSERT_EQ(registered.value().type, bus::MessageType::method_return);
+    // The identity issued at registration. A successful StartProjection alone would also
+    // pass if the rejected traffic had swapped in a different consumer on this connection.
+    const auto original_consumer = bus_state.service->state().consumer;
+    ASSERT_NE(original_consumer, aa::core::ConsumerId{});
 
     // When: a real method call names StartProjection on a foreign object path.
     bus::MessageWriter call;
@@ -406,6 +430,22 @@ TEST(BusBoundary, WrongPathMethodCallCannotChangeState) {
     const auto ping_payload = ping_cursor.read_u64();
     ASSERT_TRUE(ping_payload.has_value());
     EXPECT_TRUE(ping_cursor.done());
+
+    // And: the original consumer registration is preserved and still holds authority.
+    EXPECT_EQ(bus_state.service->state().consumer, original_consumer);
+    bus::MessageWriter empty;
+    empty.body_signature("");
+    const auto start =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "StartProjection", empty);
+    ASSERT_TRUE(start.has_value());
+    EXPECT_EQ(start.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(bus_state.service->state().projection, ProjectionState::projecting);
+
+    const auto stop =
+        round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "StopProjection", empty);
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(bus_state.service->state().projection, ProjectionState::stopped);
 }
 
 TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
