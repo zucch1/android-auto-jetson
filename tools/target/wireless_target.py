@@ -50,7 +50,7 @@ def command(args: list[str], payload: str | None = None) -> str:
 
 
 def redact_mac_addresses(text: str) -> str:
-    """Remove client identifiers before station output enters a retained report."""
+    """Remove device and client identifiers before observations enter a report."""
     return re.sub(r'(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b', '<redacted-mac>', text)
 
 
@@ -125,19 +125,21 @@ def discover(report: Report, interface: str) -> str:
     report.raw['driver'] = driver
     if driver not in ('rtw_8822ce', 'rtw88_8822ce', 'rtl8822ce'):
         report.blockers.append('rtl8822ce-not-identified')
-    report.raw['iw_phy'] = command(['iw', 'phy', phy, 'info'])
-    report.raw['iw_reg'] = command(['iw', 'reg', 'get'])
-    report.raw['nm'] = command(['nmcli', '-t', '-f', 'GENERAL.STATE,GENERAL.CONNECTION',
-                                'device', 'show', interface])
-    report.raw['bluez'] = command(['busctl', '--system', 'introspect', 'org.bluez', '/org/bluez'])
-    section = regulatory_section(report.raw['iw_reg'], phy)
+    iw_phy = command(['iw', 'phy', phy, 'info'])
+    iw_reg = command(['iw', 'reg', 'get'])
+    nm = command(['nmcli', '-t', '-f', 'GENERAL.STATE,GENERAL.CONNECTION',
+                  'device', 'show', interface])
+    bluez = command(['busctl', '--system', 'introspect', 'org.bluez', '/org/bluez'])
+    for name, observation in (('iw_phy', iw_phy), ('iw_reg', iw_reg),
+                              ('nm', nm), ('bluez', bluez)):
+        report.raw[name] = redact_mac_addresses(observation)
+    section = regulatory_section(iw_reg, phy)
     country = re.search(r'(?m)^COUNTRY ([A-Z0-9]{2}):', section)
     report.effective_regulatory_domain = country[1] if country else 'unknown'
-    report.ap_mode = bool(re.search(r'(?m)^\s*\* AP\s*$', report.raw['iw_phy']))
-    report.channel_36_eligible = eligible(report.raw['iw_phy'], section,
-                                          report.confirmed_jurisdiction)
-    report.bluez_profile_capability = 'org.bluez.ProfileManager1' in report.raw['bluez']
-    report.bluez_agent_capability = 'org.bluez.AgentManager1' in report.raw['bluez']
+    report.ap_mode = bool(re.search(r'(?m)^\s*\* AP\s*$', iw_phy))
+    report.channel_36_eligible = eligible(iw_phy, section, report.confirmed_jurisdiction)
+    report.bluez_profile_capability = 'org.bluez.ProfileManager1' in bluez
+    report.bluez_agent_capability = 'org.bluez.AgentManager1' in bluez
     for passed, blocker in ((report.ap_mode, 'missing-ap-capability'),
                             (report.channel_36_eligible, 'channel-36-ineligible'),
                             (report.bluez_profile_capability, 'missing-bluez-profile-capability'),
@@ -173,9 +175,10 @@ def active(report: Report, args: argparse.Namespace) -> None:
                  'ipv4.method', 'disabled', 'ipv6.method', 'disabled'])
         command(['nmcli', '--wait', '20', 'connection', 'up', 'uuid', connection,
                  'passwd-file', '/dev/stdin'], '802-11-wireless-security.psk:' + args.ap_psk + '\n')
-        report.raw['iw_operation'] = command(['iw', 'dev', args.interface, 'info'])
+        iw_operation = command(['iw', 'dev', args.interface, 'info'])
+        report.raw['iw_operation'] = redact_mac_addresses(iw_operation)
         report.channel_36_operation = bool(re.search(
-            r'channel 36 \(5180 MHz\)', report.raw['iw_operation'])) and 'type AP' in report.raw['iw_operation']
+            r'channel 36 \(5180 MHz\)', iw_operation)) and 'type AP' in iw_operation
         if not report.channel_36_operation:
             report.blockers.append('channel-36-operation-failed')
             return

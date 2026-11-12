@@ -537,7 +537,67 @@ class LiveQaGates(unittest.TestCase):
             self.assertEqual(output.parent.parent, runtime)
             self.assertTrue(output.parent.name.startswith("aa-wired-live-qa."))
             self.assertEqual(output.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(output.read_text())["status"], "READY")
+
+    def exercise_explicit_output(self, kind):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shim = root / "ssh"
+            shim.write_text(FAKE_SSH, encoding="utf-8")
+            shim.chmod(0o755)
+            parent = root / "reports"
+            parent.mkdir(mode=0o700)
+            output = parent / "result.json"
+            target = root / "sentinel"
+            target.write_text("untouched", encoding="utf-8")
+            if kind == "symlink":
+                output.symlink_to(target)
+            elif kind == "dangling-symlink":
+                target.unlink()
+                output.symlink_to(target)
+            elif kind == "world-writable":
+                parent.chmod(0o777)
+            elif kind == "existing":
+                output.write_text("untouched", encoding="utf-8")
+            env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                       FAKE_TARGET=directory, FAKE_LOG_ROOT=directory,
+                       FAKE_SSH_LOG=str(root / "ssh.log"))
+            result = subprocess.run([str(self.script), "--readiness-only", "--out", str(output)],
+                                    capture_output=True, text=True, timeout=TIMEOUT_S, env=env)
+            if kind == "private":
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(output.read_text())["status"], "READY")
+                self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            else:
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(str(output), result.stderr)
+                self.assertIn("Refusing report output", result.stderr)
+                if kind in ("symlink", "dangling-symlink"):
+                    self.assertTrue(output.is_symlink())
+                elif kind == "existing":
+                    self.assertEqual(output.read_text(), "untouched")
+                else:
+                    self.assertFalse(output.exists())
+            if kind == "dangling-symlink":
+                self.assertFalse(target.exists())
+            else:
+                self.assertEqual(target.read_text(), "untouched")
+
+    def test_explicit_symlink_output_is_refused(self):
+        self.exercise_explicit_output("symlink")
+
+    def test_explicit_dangling_symlink_output_is_refused(self):
+        self.exercise_explicit_output("dangling-symlink")
+
+    def test_explicit_world_writable_parent_is_refused(self):
+        self.exercise_explicit_output("world-writable")
+
+    def test_explicit_private_output_works(self):
+        self.exercise_explicit_output("private")
+
+    def test_explicit_existing_output_is_not_overwritten(self):
+        self.exercise_explicit_output("existing")
 
     def test_remote_args_are_shell_escaped(self):
         # remote() runs its command string through the TARGET shell: a

@@ -93,8 +93,31 @@ host_tag="$(printf '%s' "$HOST" | sha256sum | cut -c1-16)"
 
 write_result() {
     local status="$1" blocked_on="$2" projection="$3" video="$4" audio="$5" input="$6" budget_ms="$7"
-    mkdir -p "$(dirname "$OUT")"
-    cat > "$OUT" <<EOF
+    # Pin the checked parent directory, then create once without following links.
+    # An existing file (including a dangling symlink) is never overwritten.
+    python3 -c '
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+try:
+    parent, name = os.path.split(os.path.abspath(path))
+    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.fstat(directory).st_mode & stat.S_IWOTH:
+            raise OSError("parent directory is world-writable; use a private directory")
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory)
+        with os.fdopen(fd, "w") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(sys.stdin.read())
+    finally:
+        os.close(directory)
+except OSError as error:
+    print(f"Refusing report output {path!r}: {error}", file=sys.stderr)
+    sys.exit(2)
+' "$OUT" <<EOF
 {
   "task": "30. Qualify wired end-to-end projection",
   "phase": "B (live device)",
