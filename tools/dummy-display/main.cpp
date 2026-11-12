@@ -249,17 +249,23 @@ int main(int argc, char** argv) {
     widget.set_telemetry_writer(&telemetry);
     widget.set_status(DisplayState::unavailable);
 
+    aa::display::DecodeLossTelemetry decode_loss;
     auto client = aa::ipc::ControlBusClient::connect();
     if (client.has_value()) {
         aa::display::TestOnlyAutostart gate{};
         gate.marker = test_autostart ? aa::display::TestOnlyAutostart::kMarker : std::string_view{};
         gate.video_socket = aa::ipc::VideoSocketPath{video_socket};
-        auto factory = [errors, decoder_backend, inner = aa::display::helper_decode_sessions()](
+        auto factory = [errors, decoder_backend, &decode_loss,
+                        inner = aa::display::helper_decode_sessions()](
                            const aa::consumer::DecodeConfig& decode_config) {
             errors->begin_attempt();
             auto effective_config = decode_config;
             effective_config.backend = decoder_backend;
-            return inner(effective_config);
+            auto opened = inner(effective_config);
+            if (opened.has_value()) {
+                decode_loss.begin_session();
+            }
+            return opened;
         };
         aa::display::DisplayController::Deps deps{client.value(), std::move(factory), widget};
         auto attached = test_autostart
@@ -282,7 +288,6 @@ int main(int argc, char** argv) {
     // Pump timer must outlive app.exec(): declared at main scope, not inside
     // the attach block (task 24 F1 - a timer destroyed before the event loop
     // starts never pumps video into the helper or presents frames).
-    aa::display::DecodeLossTelemetry decode_loss;
     auto pump_timer = std::make_unique<QTimer>();
     aa::display::pump::configure(*pump_timer);
     QObject::connect(pump_timer.get(), &QTimer::timeout,

@@ -269,6 +269,23 @@ TEST(DummyDisplayContractRender, DecodeLossTelemetryIsCumulativeReasonedAndRateL
     EXPECT_TRUE(loss.observe(fresh, t0 + std::chrono::seconds{10}, true).empty());
 }
 
+TEST(DummyDisplayContractRender, DecodeLossTelemetryResetsForEqualAndGreaterSessionTotals) {
+    using Clock = DecodeLossTelemetry::Clock;
+    const Clock::time_point now{std::chrono::seconds{100}};
+    DecodeLossTelemetry loss;
+    // No zero-valued observation or rate-limit delay between sessions.
+    for (const std::uint64_t count : {2U, 2U, 3U}) {
+        SCOPED_TRACE(count);
+        loss.begin_session();
+        aa::consumer::DecodeReport report;
+        report.frames_lost_retention = count;
+        const auto lines = loss.observe(report, now);
+        EXPECT_EQ(lines, (std::vector<std::string>{
+            "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":" +
+            std::to_string(count) + ",\"awaiting_idr\":false}"}));
+    }
+}
+
 TEST(DummyDisplayContractRender, TelemetryBlockedSinkDoesNotBlockProducersOrPainting) {
     static_cast<void>(qt_app());
     CountingInputSink input;

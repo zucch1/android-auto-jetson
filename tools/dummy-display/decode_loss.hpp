@@ -18,6 +18,10 @@ class DecodeLossTelemetry final {
 public:
     using Clock = std::chrono::steady_clock;
 
+    // Called when the decode factory opens a new session, before its first
+    // observation: equal or greater totals must not reuse the old rate limit.
+    void begin_session() noexcept { *this = DecodeLossTelemetry{}; }
+
     // `final_flush` ignores the rate limit so the last cumulative totals are
     // written before shutdown even if they were coalesced a moment ago.
     [[nodiscard]] std::vector<std::string> observe(const consumer::DecodeReport& report,
