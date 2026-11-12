@@ -150,27 +150,93 @@ TEST(ConformanceTolerance, DecodePathStillAcceptsCleanSpecBytes) {
     EXPECT_TRUE(decoded.has_value());
 }
 
-TEST(ConformanceTolerance, ControlPingRequestRejectsUnknownFields) {
-    const auto clean = bytes_of({0x00, 0x0B, 0x08, 0xB9, 0x60});
-    const auto clean_decoded = proto::decode_ping_request(clean);
-    ASSERT_TRUE(clean_decoded.has_value());
-    EXPECT_EQ(clean_decoded.value().timestamp, 12345);
+// ---- Audit L14: strictness is opt-in per call site --------------------------
+//
+// Only decode_auth_complete (the authentication verdict) states an explicit
+// reject policy. Every other decoder keeps main's tolerant parse_body, so a
+// phone that appends an extension field must still be accepted. The tests below
+// append an unseen tag (99, varint 42) to a clean message of each decoder that a
+// Message&-typed parse_body overload would have captured.
 
-    // Tag 99 varint (792 = 0x98, 0x06), value 42 (0x2A)
-    const auto with_unknown = bytes_of({0x00, 0x0B, 0x08, 0xB9, 0x60, 0x98, 0x06, 0x2A});
-    const auto unknown_decoded = proto::decode_ping_request(with_unknown);
-    ASSERT_FALSE(unknown_decoded.has_value());
-    EXPECT_EQ(unknown_decoded.error().code(), aa::ErrorCode::protocol_malformed_message);
+std::vector<std::byte> with_extension(std::vector<std::byte> payload) {
+    // Tag 99 varint (0x98 0x06) value 42.
+    for (const int byte : {0x98, 0x06, 0x2A}) {
+        payload.push_back(static_cast<std::byte>(byte));
+    }
+    return payload;
 }
 
-TEST(ConformanceTolerance, InBandChannelOpenRequestRejectsUnknownFields) {
-    const auto clean = bytes_of({0x00, 0x07, 0x08, 0x01, 0x10, 0x01});
-    const auto clean_decoded = proto::decode_in_band_channel_open_request(clean);
-    ASSERT_TRUE(clean_decoded.has_value());
-    EXPECT_EQ(clean_decoded.value().service.value, 1);
+TEST(ConformanceTolerance, TopLevelServiceDiscoveryResponseToleratesExtensionTag) {
+    const auto& clean = conformancewire::F_E_service_discovery_response_payload;
+    ASSERT_TRUE(proto::decode_service_discovery_response(clean).has_value());
+    const auto decoded = proto::decode_service_discovery_response(with_extension(clean));
+    EXPECT_TRUE(decoded.has_value());
+}
 
-    const auto with_unknown = bytes_of({0x00, 0x07, 0x08, 0x01, 0x10, 0x01, 0x98, 0x06, 0x2A});
-    const auto unknown_decoded = proto::decode_in_band_channel_open_request(with_unknown);
-    ASSERT_FALSE(unknown_decoded.has_value());
-    EXPECT_EQ(unknown_decoded.error().code(), aa::ErrorCode::protocol_malformed_message);
+TEST(ConformanceTolerance, ChannelOpenResponseToleratesExtensionTag) {
+    const auto clean = proto::encode(proto::ChannelOpenResponse{proto::ChannelOpenStatus::success});
+    ASSERT_TRUE(clean.has_value());
+    ASSERT_TRUE(proto::decode_channel_open_response(clean.value()).has_value());
+    const auto decoded = proto::decode_channel_open_response(with_extension(clean.value()));
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded.value().status, proto::ChannelOpenStatus::success);
+}
+
+TEST(ConformanceTolerance, FocusRequestsToleratesExtensionTag) {
+    // audio_focus_request (0x12): audio_focus_type = GAIN (1); nav_focus_request (0x0D):
+    // focus_type = NATIVE (1).
+    const auto audio = bytes_of({0x00, 0x12, 0x08, 0x01});
+    ASSERT_TRUE(proto::decode_audio_focus_request(audio).has_value());
+    const auto audio_ext = proto::decode_audio_focus_request(with_extension(audio));
+    ASSERT_TRUE(audio_ext.has_value());
+    EXPECT_EQ(audio_ext.value().type, proto::AudioFocusRequestType::gain);
+    const auto nav = bytes_of({0x00, 0x0D, 0x08, 0x01});
+    ASSERT_TRUE(proto::decode_nav_focus_request(nav).has_value());
+    const auto nav_ext = proto::decode_nav_focus_request(with_extension(nav));
+    ASSERT_TRUE(nav_ext.has_value());
+    // The Focus-specific malformed class (a known tag with an uninterpretable
+    // value) is still rejected exactly as on main.
+    EXPECT_FALSE(proto::decode_audio_focus_request(bytes_of({0x00, 0x12, 0x08, 0x63})).has_value());
+}
+
+TEST(ConformanceTolerance, ControlPingRequestStaysTolerant) {
+    const auto clean = bytes_of({0x00, 0x0B, 0x08, 0xB9, 0x60});
+    ASSERT_TRUE(proto::decode_ping_request(clean).has_value());
+    const auto decoded = proto::decode_ping_request(with_extension(clean));
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded.value().timestamp, 12345);
+}
+
+TEST(ConformanceTolerance, AuthCompleteRejectsUnknownFieldsExplicitly) {
+    // The one opted-in site: AuthResponse { status = 1 }.
+    const auto clean = proto::encode(proto::AuthComplete{0});
+    ASSERT_TRUE(clean.has_value());
+    const auto accepted = proto::decode_auth_complete(clean.value());
+    ASSERT_TRUE(accepted.has_value());
+    EXPECT_EQ(accepted.value().status, 0);
+    // Extension tag: rejected by the explicit policy.
+    const auto extension = proto::decode_auth_complete(with_extension(clean.value()));
+    ASSERT_FALSE(extension.has_value());
+    EXPECT_EQ(extension.error().code(), aa::ErrorCode::protocol_malformed_message);
+    // Known tag (1) with the wrong wire type: malformed under every policy.
+    const auto wire_type = proto::decode_auth_complete(bytes_of({0x00, 0x04, 0x08, 0x00, 0x0A, 0x01, 0x00}));
+    ASSERT_FALSE(wire_type.has_value());
+}
+
+TEST(ConformanceTolerance, InBandChannelOpenRequestFollowsFocusPolicy) {
+    // Phones omit priority on in-band opens; that and extension tags stay accepted.
+    const auto omitted = bytes_of({0x00, 0x07, 0x10, 0x69});
+    const auto omitted_decoded = proto::decode_in_band_channel_open_request(omitted);
+    ASSERT_TRUE(omitted_decoded.has_value());
+    EXPECT_EQ(omitted_decoded.value().priority, 0);
+    EXPECT_EQ(omitted_decoded.value().service.value, 105);
+    const auto extension = proto::decode_in_band_channel_open_request(with_extension(omitted));
+    ASSERT_TRUE(extension.has_value());
+    EXPECT_EQ(extension.value().service.value, 105);
+    // A known tag with an uninterpretable value (priority as length-delimited)
+    // would be silently read as "omitted" by partial parsing: malformed.
+    const auto wire_type =
+        proto::decode_in_band_channel_open_request(bytes_of({0x00, 0x07, 0x0A, 0x01, 0x00, 0x10, 0x69}));
+    ASSERT_FALSE(wire_type.has_value());
+    EXPECT_EQ(wire_type.error().code(), aa::ErrorCode::protocol_malformed_message);
 }

@@ -186,11 +186,16 @@ decode_in_band_channel_open_request(std::span<const std::byte> payload) {
     ctl::ChannelOpenRequest wire;
     // Phones can omit proto2-required priority on service channels. Partial
     // parsing tolerates that omission only; service_id still needs validation.
+    // Unknown fields follow the Focus policy: extension tags (unseen by the
+    // pinned schema) are tolerated, but a known tag whose value proto2 could not
+    // interpret (e.g. priority sent with the wrong wire type, which partial
+    // parsing would otherwise silently read as "omitted") is malformed.
     if (!wire.ParsePartialFromArray(body.value().data(), static_cast<int>(body.value().size())) ||
         !wire.has_service_id() || !ServiceKey{wire.service_id()}) {
         return aasdk_adapter::malformed();
     }
-    if (wire.GetReflection()->GetUnknownFields(wire).field_count() > 0) {
+    constexpr int known_tags[]{1, 2};
+    if (aasdk_adapter::classify_unknown_fields(wire, known_tags).malformed()) {
         return aasdk_adapter::malformed();
     }
     return ChannelOpenRequest{wire.has_priority() ? wire.priority() : 0,
@@ -294,7 +299,14 @@ core::Result<AuthComplete> decode_auth_complete(std::span<const std::byte> paylo
         return body.error();
     }
     ctl::AuthResponse wire;
-    if (const auto parsed = aasdk_adapter::parse_body(wire, body.value()); !parsed) {
+    // Audit L14: the authentication verdict is security-relevant, so this one
+    // site states its extension policy explicitly and rejects any field the
+    // pinned schema (status = 1) does not define. Every other decoder in this
+    // file keeps the tolerant parse_body.
+    constexpr int known_tags[]{1};
+    if (const auto parsed = aasdk_adapter::parse_body_with_extension_policy(
+            wire, body.value(), known_tags, aasdk_adapter::ExtensionPolicy::reject);
+        !parsed) {
         return parsed.error();
     }
     if (!wire.has_status()) {

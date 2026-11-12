@@ -60,25 +60,28 @@ control_body(std::span<const std::byte> payload, ControlMessageId expected) {
     return {};
 }
 
-// Overload for full google::protobuf::Message types: enforce unknown field rejection.
+// Opt-in strict variant for security-relevant messages (audit L14).
+//
+// This is deliberately NOT an overload of parse_body: generated messages derive
+// from google::protobuf::Message, so a Message& overload would silently capture
+// every existing parse_body caller and change its unknown-field behavior. Every
+// decoder keeps the tolerant parse_body above unless it names this function and
+// states its ExtensionPolicy (and the message's full pinned tag set) itself.
+//
+//   - A known tag carrying an uninterpretable value is always malformed.
+//   - An unseen extension tag is rejected under ExtensionPolicy::reject and
+//     tolerated under ExtensionPolicy::tolerate.
 [[nodiscard]] inline core::Result<void>
-parse_body(google::protobuf::Message &message,
-           std::span<const std::byte> body,
-           std::span<const int> known_tags = {},
-           ExtensionPolicy policy = kStrictExtensionPolicy) {
-    if (body.size() > kMaxProtoBodyBytes) {
-        return malformed();
+parse_body_with_extension_policy(google::protobuf::Message &message,
+                                 std::span<const std::byte> body,
+                                 std::span<const int> known_tags,
+                                 ExtensionPolicy policy) {
+    if (const auto parsed = parse_body(static_cast<google::protobuf::MessageLite &>(message), body);
+        !parsed) {
+        return parsed;
     }
-    if (!message.ParseFromArray(body.data(), static_cast<int>(body.size()))) {
+    if (classify_unknown_fields(message, known_tags).rejected_under(policy)) {
         return malformed();
-    }
-    if (!message.IsInitialized()) {
-        return malformed();
-    }
-    if (message.GetReflection()->GetUnknownFields(message).field_count() > 0) {
-        if (classify_unknown_fields(message, known_tags).rejected_under(policy)) {
-            return malformed();
-        }
     }
     return {};
 }
