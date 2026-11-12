@@ -7,11 +7,19 @@
 // supplies its own identity.
 #include <aa/ipc/BusPeerLookup.hpp>
 #include <aa/ipc/Contract.hpp>
+#include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/ControlDispatcher.hpp>
 #include <aa/ipc/ControlService.hpp>
 
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
+#include "../../src/ipc/dbus_adapter/BusIo.hpp"
 #include "fakes.hpp"
+#include "../../src/ipc/dbus_adapter/DropDiagnostic.hpp"
+
+#include <array>
+#include <chrono>
+#include <thread>
+#include <sys/socket.h>
 
 #include <unistd.h>
 
@@ -103,6 +111,60 @@ struct BoundaryBus final {
     bus::Cursor cursor(message.body);
     auto value = cursor.read_string();
     return value.has_value() ? value.value() : std::string{};
+}
+
+[[nodiscard]] bus::MessageWriter oversized_ping() {
+    bus::MessageWriter writer;
+    writer.destination(kReceiverName)
+        .path(kReceiverPath)
+        .interface_name("org.custom.AndroidAutoReceiver1")
+        .member("Ping")
+        .body_signature("s")
+        .put_string(std::string(70U * 1024U, 'x'));
+    return writer;
+}
+
+void pad_to(std::vector<std::uint8_t>& bytes, std::size_t boundary) {
+    while (bytes.size() % boundary != 0) {
+        bytes.push_back(0);
+    }
+}
+
+void append_be32(std::vector<std::uint8_t>& bytes, std::uint32_t value) {
+    bytes.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xFFU));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
+    bytes.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+}
+
+void append_be_string_field(std::vector<std::uint8_t>& fields, std::uint8_t code,
+                            std::string_view variant_type, std::string_view value) {
+    pad_to(fields, 8);
+    fields.push_back(code);
+    fields.push_back(1);
+    fields.push_back(static_cast<std::uint8_t>(variant_type.front()));
+    fields.push_back(0);
+    pad_to(fields, 4);
+    append_be32(fields, static_cast<std::uint32_t>(value.size()));
+    fields.insert(fields.end(), value.begin(), value.end());
+    fields.push_back(0);
+}
+
+// A complete big-endian method call, assembled independently of MessageWriter
+// so the daemon and receiver both see genuine big-endian framing and fields.
+[[nodiscard]] std::vector<std::uint8_t> big_endian_ping(std::uint32_t serial) {
+    std::vector<std::uint8_t> fields;
+    append_be_string_field(fields, 1, "o", kReceiverPath);
+    append_be_string_field(fields, 2, "s", "org.custom.AndroidAutoReceiver1");
+    append_be_string_field(fields, 3, "s", "Ping");
+    append_be_string_field(fields, 6, "s", kReceiverName);
+    std::vector<std::uint8_t> bytes{'B', 1, 0, 1};
+    append_be32(bytes, 0);
+    append_be32(bytes, serial);
+    append_be32(bytes, static_cast<std::uint32_t>(fields.size()));
+    bytes.insert(bytes.end(), fields.begin(), fields.end());
+    pad_to(bytes, 8);
+    return bytes;
 }
 
 TEST(BusBoundary, RealCallsDispatchThroughBoundaryWithDaemonStampedIdentity) {
@@ -479,6 +541,201 @@ TEST(BusBoundary, PropertiesSetReturnsPropertyReadOnly) {
     EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
     EXPECT_EQ(reply.value().error_name, "org.freedesktop.DBus.Error.PropertyReadOnly");
     EXPECT_EQ(bus_state.service->capabilities().at("contract.semver"), "1.0.0");
+}
+
+TEST(BusBoundary, OversizeCallIsDrainedAndTheNextCallSurvives) {
+    // Given: a real daemon willing to forward a call beyond the receiver's
+    // deliberately smaller 64 KiB control-contract maximum.
+    BoundaryBus bus_state;
+    bus_state.start();
+    const bus::MessageWriter oversized = oversized_ping();
+
+    // When: the 70 KiB call is followed by an ordinary valid call.
+    const auto sent = bus_state.client->send_message(bus::MessageType::method_call, oversized);
+    ASSERT_TRUE(sent.has_value());
+    const auto dropped = bus_state.server->read_message();
+
+    // Then: the complete oversize frame is discarded as a distinct non-fatal
+    // result, counted for diagnostics, and the stream starts at the next head.
+    ASSERT_FALSE(dropped.has_value());
+    EXPECT_EQ(dropped.error().code(), ErrorCode::transport_message_dropped);
+    EXPECT_EQ(bus_state.server->dropped_messages(), 1U);
+    EXPECT_GE(bus_state.server->native_handle(), 0);
+    bus::MessageWriter ping_body;
+    ping_body.body_signature("");
+    const auto ping = round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "Ping", ping_body);
+    ASSERT_TRUE(ping.has_value());
+    EXPECT_EQ(ping.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(ping.value().signature, "t");
+}
+
+TEST(BusBoundary, OversizeDropDoesNotStopTheControlService) {
+    // Given: the production session-bus service rather than a manual dispatch
+    // loop, so the caller's non-fatal handling is exercised too.
+    aa::ipc::test::SequencePairingIds ids;
+    aa::ipc::test::RecordingPhoneDirectory phones;
+    auto service = aa::ipc::ControlBusService::start(
+        {static_cast<std::uint32_t>(::getuid())}, {ids, phones});
+    ASSERT_TRUE(service.has_value());
+    auto client = bus::BusConnection::connect_session();
+    ASSERT_TRUE(client.has_value());
+    const auto oversized = client.value().send_message(bus::MessageType::method_call, oversized_ping());
+    ASSERT_TRUE(oversized.has_value());
+
+    // When/Then: a drop is a successful zero-dispatch cycle, not service loss.
+    const auto dropped = service.value().cycle(aa::core::Milliseconds{1000});
+    ASSERT_TRUE(dropped.has_value());
+    EXPECT_EQ(dropped.value(), 0U);
+    EXPECT_FALSE(service.value().closed());
+
+    // And: the next valid call is dispatched and answered normally.
+    bus::MessageWriter ping;
+    ping.destination(kReceiverName)
+        .path(kReceiverPath)
+        .interface_name("org.custom.AndroidAutoReceiver1")
+        .member("Ping")
+        .body_signature("");
+    const auto sent = client.value().send_message(bus::MessageType::method_call, ping);
+    ASSERT_TRUE(sent.has_value());
+    const auto dispatched = service.value().cycle(aa::core::Milliseconds{1000});
+    ASSERT_TRUE(dispatched.has_value());
+    EXPECT_EQ(dispatched.value(), 1U);
+    const auto reply = client.value().await_reply(sent.value(), service.value().unique_name());
+    ASSERT_TRUE(reply.has_value());
+    EXPECT_EQ(reply.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(reply.value().signature, "t");
+}
+
+TEST(BusBoundary, BigEndianCallIsDrainedAndTheNextCallSurvives) {
+    // Given: a syntactically valid big-endian call accepted by the real bus.
+    BoundaryBus bus_state;
+    bus_state.start();
+    const auto bytes = big_endian_ping(1000);
+    const auto frame = bus::inspect_frame(bytes);
+    ASSERT_TRUE(frame.has_value());
+    ASSERT_EQ(frame.value().total_bytes, bytes.size());
+    ASSERT_FALSE(frame.value().little_endian);
+
+    // When: it precedes a little-endian call on the same client connection.
+    const auto sent = bus::bus_io::write_full(bus_state.client->native_handle(), bytes);
+    ASSERT_TRUE(sent.has_value());
+    const auto dropped = bus_state.server->read_message();
+
+    // Then: byte-order-aware framing drains exactly one message. The strict
+    // little-endian value parser need not grow a second decoding mode.
+    ASSERT_FALSE(dropped.has_value());
+    EXPECT_EQ(dropped.error().code(), ErrorCode::transport_message_dropped);
+    EXPECT_EQ(bus_state.server->dropped_messages(), 1U);
+    bus::MessageWriter ping_body;
+    ping_body.body_signature("");
+    const auto ping = round_trip(bus_state, "org.custom.AndroidAutoReceiver1", "Ping", ping_body);
+    ASSERT_TRUE(ping.has_value());
+    EXPECT_EQ(ping.value().type, bus::MessageType::method_return);
+    EXPECT_EQ(ping.value().signature, "t");
+}
+
+
+TEST(BusBoundary, DropDiagnosticsAggregateAtMostOncePerInterval) {
+    bus::DropDiagnostic throttle;
+    const bus::DropDiagnostic::Clock::time_point start{};
+    EXPECT_EQ(throttle.record(start), 1U);
+    for (int i = 0; i < 1000; ++i) {
+        EXPECT_FALSE(throttle.record(start + std::chrono::seconds(9)));
+    }
+    EXPECT_EQ(throttle.record(start + std::chrono::seconds(10)), 1001U);
+    EXPECT_FALSE(throttle.record(start + std::chrono::seconds(10)));
+    EXPECT_EQ(throttle.record(start + std::chrono::seconds(20)), 2U);
+    EXPECT_EQ(throttle.record(start + std::chrono::seconds(100)), 1U);
+}
+
+// Substitute only the authenticated connection's transport, leaving production
+// read_message ownership/closure intact and avoiding daemon frame rewriting.
+class SocketBoundary : public ::testing::Test {
+protected:
+    std::optional<bus::BusConnection> receiver;
+    int peer{-1};
+    void SetUp() override {
+        auto connected = bus::BusConnection::connect_session();
+        ASSERT_TRUE(connected.has_value());
+        receiver.emplace(std::move(connected.value()));
+        int sockets[2]{};
+        ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets), 0);
+        peer = sockets[1];
+        ASSERT_EQ(::dup2(sockets[0], receiver->native_handle()), receiver->native_handle());
+        ::close(sockets[0]);
+    }
+    void TearDown() override { if (peer >= 0) ::close(peer); }
+    static std::vector<std::uint8_t> frame(std::size_t total) {
+        bus::MessageWriter writer;
+        writer.path(kReceiverPath).interface_name("org.custom.AndroidAutoReceiver1")
+            .member("Ping").body_signature("s").put_string("x");
+        auto bytes = writer.build(bus::MessageType::method_call, 42);
+        const auto body = total - (bytes.size() - 6); // string length + x + NUL
+        bytes.resize(total, 0);
+        for (unsigned i = 0; i < 4; ++i) bytes[4 + i] = static_cast<std::uint8_t>((body >> (8U * i)) & 0xffU);
+        return bytes;
+    }
+};
+
+TEST_F(SocketBoundary, CapPlusOneDrainsExactlyAndParsesNextMessage) {
+    const auto oversized = frame(bus::kMaxMessageBytes + 1);
+    ASSERT_EQ(bus::inspect_frame(oversized).value().total_bytes, bus::kMaxMessageBytes + 1);
+    bus::MessageWriter ping;
+    ping.path(kReceiverPath).member("Ping");
+    const auto valid = ping.build(bus::MessageType::method_call, 43);
+    bool sent = false;
+    std::jthread writer{[&] {
+        sent = bus::bus_io::write_full(peer, oversized).has_value() &&
+               bus::bus_io::write_full(peer, valid).has_value();
+    }};
+    const auto dropped = receiver->read_message();
+    const auto next = receiver->read_message();
+    writer.join();
+    ASSERT_TRUE(sent);
+    ASSERT_FALSE(dropped.has_value());
+    EXPECT_EQ(dropped.error().code(), ErrorCode::transport_message_dropped);
+    EXPECT_EQ(receiver->dropped_messages(), 1U);
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(next.value().serial, 43U);
+    EXPECT_EQ(next.value().member, "Ping");
+}
+
+TEST_F(SocketBoundary, PeerClosingMidDrainClosesConnection) {
+    const auto oversized = frame(1024 * 1024);
+    ASSERT_TRUE(bus::bus_io::write_full(peer, std::span{oversized}.first(5000)));
+    ::close(peer); peer = -1;
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = receiver->read_message();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code(), ErrorCode::transport_closed);
+    EXPECT_EQ(receiver->native_handle(), -1);
+    EXPECT_EQ(receiver->dropped_messages(), 0U);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1));
+}
+
+TEST_F(SocketBoundary, TricklingPeerCannotExtendDrainDeadline) {
+    const auto oversized = frame(1024 * 1024);
+    ASSERT_TRUE(bus::bus_io::write_full(peer, std::span{oversized}.first(16)));
+    std::jthread trickle{[&](const std::stop_token& stop) {
+        const std::array<std::uint8_t, 1024> chunk{};
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (!stop.stop_requested() && std::chrono::steady_clock::now() < until) {
+            if (!bus::bus_io::write_full(peer, chunk, until)) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }};
+    const auto start = std::chrono::steady_clock::now();
+    receiver->deadline(start + std::chrono::milliseconds(100));
+    const auto result = receiver->read_message();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    trickle.request_stop(); trickle.join();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(result.error().code() == ErrorCode::transport_io ||
+                result.error().code() == ErrorCode::timeout);
+    EXPECT_EQ(receiver->native_handle(), -1);
+    EXPECT_EQ(receiver->dropped_messages(), 0U);
+    EXPECT_GE(elapsed, std::chrono::milliseconds(50));
+    EXPECT_LT(elapsed, std::chrono::milliseconds(400));
 }
 
 } // namespace

@@ -10,6 +10,19 @@ build produces through the `aa_dbus_contract_codegen` target and
 the checked contract authority: the generated header carries the same bytes, and
 the build fails closed with named diagnostics on any drift.
 
+## Message size limit (org.custom.AndroidAutoReceiver1)
+
+The receiver accepts D-Bus messages up to 64 KiB (65,536 bytes) in total.
+This covers the whole message: the 16-byte fixed header, header-fields array,
+alignment padding, and body. Larger messages are drained and dropped; method
+calls receive no reply. Clients must keep calls within this bound rather than
+relying on a bus daemon’s potentially larger forwarding limit.
+
+For dropped frames, `DiagnosticEvent` emits `dbus_message_dropped` immediately
+on the first drop, then at most once per 10 seconds on a subsequent drop. Its
+subject is the number of drops since the previous emission (including the
+current drop); the transport also retains a per-connection lifetime counter.
+
 ## Task 21 Acceptance Limits
 
 Task 21 delivers the checked contract and its in-process components, not a running
