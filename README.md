@@ -53,14 +53,94 @@ ctest --preset host-dev --output-on-failure
 
 ### Reproducing public CI checks locally
 
-The public CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), which is the authority for active CI job names and steps) executes independent checks. Today they are:
+The public CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), which is the authority for active CI job names and steps) executes independent checks, including the following:
 
 1. **`ci/host-build-test`**: `cmake --build --preset host-dev && ctest --preset host-dev --output-on-failure` (PR runs defer `ipc-bench-happy-600` when benchmark sources and build commands are unchanged vs base).
 2. **`ci/provenance-lint`**: `tools/provenance/check.sh` and `for case in baseline overlay content header extra generated license gpl inventory listing symlink missing mode; do python3 -B tests/provenance/scenarios.py "$PWD" "$case"; done`.
-3. **`ci/decode-overlay-cross`**: Both invocations of the decode job in `.github/workflows/ci.yml`:
-   - Probe, AArch64 ELF and bound overlay provenance: `python3 -B tests/media/cross_decode_overlay.py --scratch "$RUNNER_TEMP/decode-overlay-cross"`
-   - Full root cross provenance with external overlay: `python3 -B tests/media/cross_decode_overlay.py --root-project --archive "${AA_GOOGLETEST_ARCHIVE:-.local/dependencies/googletest-v1.15.2.tar.gz}" --scratch "$RUNNER_TEMP/decode-root-cross"`
-4. **ARM64 fixture cross-build**: `cmake --preset jetson-aarch64 && cmake --build --preset jetson-aarch64` against a generated synthetic fixture sysroot with `AA_SYSROOT_REQUIRE_OBSERVED=OFF`; explicitly **fixture-not-target**. The workflow file names the job. For exact-head target cross-acceptance, the maintainer runs the observed-sysroot smoke (`AA_SYSROOT_REQUIRE_OBSERVED=ON`) with `tools/ci/arm64-cross-relay.sh`, which posts the `ci/arm64-cross-build` commit status for that exact SHA.
+3. **`ci/decode-overlay-cross`**: Probe, AArch64 ELF and bound overlay provenance, followed by full root cross provenance with an external overlay (commands below).
+4. **ARM64 fixture cross-build**: A generated synthetic fixture sysroot with `AA_SYSROOT_REQUIRE_OBSERVED=OFF`; explicitly **fixture-not-target**. The workflow file names the job. For exact-head target cross-acceptance, the maintainer runs the observed-sysroot smoke (`AA_SYSROOT_REQUIRE_OBSERVED=ON`) with `tools/ci/arm64-cross-relay.sh`, which posts the `ci/arm64-cross-build` commit status for that exact SHA.
+
+Run the following setup from the repository root in Bash. The cross checks require
+`ninja-build`, `cmake`, `g++-aarch64-linux-gnu`, `pkg-config`, and `binutils`;
+the decode checks also require `libgstreamer1.0-dev` and
+`libgstreamer-plugins-base1.0-dev` (the workflow's “Provision public synthetic
+cross fixture dependencies” step). The archive is fetched and verified outside
+configure, as in the workflow's “Fetch and verify locked GoogleTest archive” steps.
+
+```bash
+set -euo pipefail
+export AA_CI_SCRATCH="$(mktemp -d /dev/shm/aa-ci.XXXXXXXX)"
+export AA_GOOGLETEST_ARCHIVE="$AA_CI_SCRATCH/googletest-v1.15.2.tar.gz"
+curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' \
+  https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.15.2 \
+  --output "$AA_GOOGLETEST_ARCHIVE"
+python3 -B tools/deps/check_manifest.py --lock deps/manifest.lock --archive "$AA_GOOGLETEST_ARCHIVE"
+```
+
+Run both decode checks in that shell. These match the workflow steps “Require
+AVAILABLE probe, AArch64 ELF and bound overlay provenance” and “Require full root
+cross provenance with an external overlay”, using local scratch paths.
+
+```bash
+python3 -B tests/media/cross_decode_overlay.py --scratch "$AA_CI_SCRATCH/decode-overlay-cross"
+python3 -B tests/media/cross_decode_overlay.py --root-project \
+  --archive "$AA_GOOGLETEST_ARCHIVE" --scratch "$AA_CI_SCRATCH/decode-root-cross"
+```
+
+Generate and bind the ARM64 fixture in the same shell. This adapts the fixture
+cross-build job's “Generate fixture sysroot into RUNNER_TEMP (fixture-not-target)”
+step in [`.github/workflows/ci.yml`](.github/workflows/ci.yml): the local scratch
+variable replaces `RUNNER_TEMP`, and sourcing a shell file replaces `GITHUB_ENV`.
+
+```bash
+python3 -B - <<'PYTHON'
+import os
+import shlex
+import sys
+from pathlib import Path
+
+sys.path.insert(0, 'tests/media')
+from decode_cross_fixture import make_sysroot
+
+base = Path(os.environ['AA_CI_SCRATCH']) / 'arm64-cross-fixture'
+base.mkdir(parents=True, exist_ok=False)
+rootfs, manifest = make_sysroot(base)
+if not rootfs.is_dir() or not manifest.is_file():
+    raise SystemExit('FIXTURE_SYSROOT_GENERATION_FAILED')
+cache = base / 'build-binding'
+cache.mkdir()
+bindings = {
+    'AA_SYSROOT_ROOTFS': str(rootfs),
+    'AA_SYSROOT_PAYLOAD': str(rootfs),
+    'AA_SYSROOT_MANIFEST': str(manifest),
+    'AA_SYSROOT_CACHE': str(cache),
+    'AA_SYSROOT_REQUIRE_OBSERVED': 'OFF',
+}
+with (base / 'fixture.env').open('w', encoding='utf-8') as environment:
+    for name, value in bindings.items():
+        environment.write(f'export {name}={shlex.quote(value)}\n')
+PYTHON
+source "$AA_CI_SCRATCH/arm64-cross-fixture/fixture.env"
+```
+
+**Workflow excerpt, not run locally:** Continue in that shell with the fixture
+cross-build job's “Configure and cross-build against the fixture sysroot” and
+“Cross-build IPC libraries explicitly and verify the cross inventory” steps in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). These build commands were
+not executed during this documentation fix round; fixture generation and both
+decode checks were exercised separately. Fixture results do not qualify a target.
+
+```bash
+mkdir -p /tmp/opencode
+export PKG_CONFIG_PATH=
+test -d "${AA_SYSROOT_ROOTFS:?AA_SYSROOT_ROOTFS must be set}"
+test -f "${AA_SYSROOT_MANIFEST:?AA_SYSROOT_MANIFEST must be set}"
+test "${AA_SYSROOT_REQUIRE_OBSERVED:?AA_SYSROOT_REQUIRE_OBSERVED must be set}" = "OFF"
+cmake --preset jetson-aarch64
+cmake --build --preset jetson-aarch64
+cmake --build --preset jetson-aarch64 --target aa_ipc_control aa_ipc_dbus
+python3 -B tests/dbus/assert_dbus_coverage.py --cross build/jetson-aarch64
+```
 
 ## Documentation directory
 

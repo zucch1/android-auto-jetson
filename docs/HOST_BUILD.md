@@ -17,7 +17,7 @@ The native host build and tests require system development packages (matching th
 
 ### Audio runtime setup for tests
 
-The audio pipeline route tests open the default output of the user session (`pipewiresink` auto-linked by the session manager and `pulsesink` driving against a Pulse server). Tests require an active user-session audio runtime with PipeWire, WirePlumber, and PipeWire-Pulse daemons, and a resolvable default sink (`@DEFAULT_AUDIO_SINK@`). In headless or container environments without an existing session, start the runtime daemons following the bounded setup in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml#L74-L137).
+The audio pipeline route tests open the default output of the user session (`pipewiresink` auto-linked by the session manager and `pulsesink` driving against a Pulse server). Tests require an active user-session audio runtime with PipeWire, WirePlumber, and PipeWire-Pulse daemons, and a resolvable default sink (`@DEFAULT_AUDIO_SINK@`). In headless or container environments without an existing session, start the runtime daemons following the “Start user-session audio runtime for the audio pipeline tests” step in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
 
 ### Dependency staging
 
@@ -30,7 +30,8 @@ The archive hashlock and original-source provenance checks always run before sta
 
 ## Building and testing presets
 
-For each of `host-dev`, `host-release`, and `host-asan`, run:
+For each of `host-dev`, `host-release`, and `host-asan`, run the commands below,
+substituting that preset name for `host-dev` throughout:
 
 ```sh
 set -euo pipefail
