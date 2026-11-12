@@ -25,6 +25,50 @@ std::string_view invalid_screen_field(const Screen& s, std::uint32_t width, std:
     if (s.stable_content_insets && !fits(*s.stable_content_insets)) { return "stable-content-insets"; }
     return {};
 }
+namespace {
+std::uint32_t scale_pixels(std::uint32_t value, std::uint32_t from, std::uint32_t to) {
+    return static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(value) * to + from / 2) / from);
+}
+} // namespace
+
+Screen scale_screen(const Screen& s, ScreenExtent from, ScreenExtent to) {
+    if (from.width == 0 || from.height == 0) { return s; }
+    Screen out = s;
+    const auto x = [&](std::uint32_t v) { return scale_pixels(v, from.width, to.width); };
+    const auto y = [&](std::uint32_t v) { return scale_pixels(v, from.height, to.height); };
+    if (out.width_margin) { out.width_margin = x(*out.width_margin); }
+    if (out.height_margin) { out.height_margin = y(*out.height_margin); }
+    const auto insets = [&](std::optional<ScreenInsets>& i) {
+        if (i) { *i = ScreenInsets{y(i->top), y(i->bottom), x(i->left), x(i->right)}; }
+    };
+    insets(out.margins);
+    insets(out.content_insets);
+    insets(out.stable_content_insets);
+    return out;
+}
+
+std::string_view invalid_screen_field(const Screen& s, std::span<const ScreenExtent> profiles) {
+    if (profiles.empty()) { return "profiles"; }
+    for (const auto profile : profiles) {
+        const auto field = invalid_screen_field(scale_screen(s, profiles.front(), profile),
+                                                profile.width, profile.height);
+        if (!field.empty()) { return field; }
+    }
+    return {};
+}
+
+std::string_view experimental_screen_field(const Screen& s) {
+    const auto nonzero = [](const std::optional<ScreenInsets>& i) {
+        return i && (i->top || i->bottom || i->left || i->right);
+    };
+    if (s.width_margin.value_or(0) != 0) { return "width-margin"; }
+    if (s.height_margin.value_or(0) != 0) { return "height-margin"; }
+    if (nonzero(s.margins)) { return "margins"; }
+    if (s.pixel_aspect_ratio_e4 && *s.pixel_aspect_ratio_e4 != 10000) { return "pixel-aspect-ratio-e4"; }
+    return {};
+}
+
 bool parse_screen_option(Screen& screen, std::string_view field, std::string_view value) {
     std::uint32_t number{};
     const auto result = std::from_chars(value.data(), value.data() + value.size(), number);

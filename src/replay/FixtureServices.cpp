@@ -69,6 +69,11 @@ core::Result<ServiceEntry> parse_service(const JsonValue& value) {
                     return malformed();
                 }
             }
+            // Canonical form only, so load -> export is byte-stable: the exporter
+            // omits a default screen and always writes "density" first.
+            if (configuration.screen == config::Screen{} || !seen.contains("density")) {
+                return malformed();
+            }
         }
         for (const auto& item : *profiles) {
             const auto* triple = array_of(item);

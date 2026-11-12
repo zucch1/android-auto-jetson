@@ -214,61 +214,194 @@ TEST(MediaWire, HostNegotiationDrivesWireOpenResponseAndHandlerDelivery) {
 
 namespace {
 TEST(MediaWire, DefaultScreenExactlyMatchesLegacyAnnouncement) {
-    // Independent pre-change serializer: compare complete discovery bytes,
-    // including proto2 presence (zero-valued optional fields must stay absent).
-    auto descriptor = channeltest::video();
-    const auto encoded = aa::protocol::encode(aa::protocol::ServiceDiscoveryResponse{{descriptor}});
+    // Golden captured independently of the screen encoder: the video Service
+    // entry main announced (1280x720 then 800x480, H.264 BP, 30 fps, density
+    // 160, no other field), from `protoc --encode=aap_protobuf.service.Service`.
+    // The receiver's own descriptor path is checked in wired_e2e.
+    const auto encoded = aa::protocol::encode(aa::protocol::ServiceDiscoveryResponse{{channeltest::video()}});
     ASSERT_TRUE(encoded);
     ctl::ServiceDiscoveryResponse actual;
     ASSERT_TRUE(actual.ParseFromArray(encoded.value().data() + 2,
                                      static_cast<int>(encoded.value().size() - 2)));
-    auto legacy = actual;
-    auto* media = legacy.mutable_channels(0)->mutable_media_sink_service();
-    media->clear_video_configs();
-    for (const auto profile : std::get<proto::VideoConfiguration>(descriptor.configuration).profiles) {
-        auto* v = media->add_video_configs();
-        v->set_codec_resolution(profile.width == 1280 ? sink::VIDEO_1280x720 : sink::VIDEO_800x480);
-        v->set_frame_rate(sink::VIDEO_FPS_30);
-        v->set_video_codec_type(shared::MEDIA_CODEC_VIDEO_H264_BP);
-        v->set_density(160);
-    }
-    EXPECT_EQ(actual.SerializeAsString(), legacy.SerializeAsString());
+    static constexpr unsigned char golden[] = {
+        0x08, 0x63, 0x1a, 0x18, 0x08, 0x03, 0x22, 0x09, 0x08, 0x02, 0x10, 0x02, 0x28, 0xa0, 0x01, 0x50,
+        0x03, 0x22, 0x09, 0x08, 0x01, 0x10, 0x02, 0x28, 0xa0, 0x01, 0x50, 0x03};
+    EXPECT_EQ(actual.channels(0).SerializeAsString(),
+              std::string(reinterpret_cast<const char*>(golden), sizeof golden));
 }
 
-TEST(MediaWire, ScreenOptionsReachDiscoveryAndRoundtrip) {
+TEST(MediaWire, ScreenOptionsReachDiscoveryScaledPerProfileAndRoundtrip) {
     auto descriptor = channeltest::video();
     auto& screen = std::get<proto::VideoConfiguration>(descriptor.configuration).screen;
     screen.density = 240;
     screen.real_density = 210;
-    screen.width_margin = 40;
-    screen.height_margin = 80;
+    screen.width_margin = 160;  // 1280x720 pixels
+    screen.height_margin = 120;
     screen.pixel_aspect_ratio_e4 = 10000;
     screen.decoder_additional_depth = 2;
     screen.theme = 2;
-    screen.margins = aa::config::ScreenInsets{1, 2, 3, 4};
-    screen.content_insets = aa::config::ScreenInsets{5, 6, 7, 8};
-    screen.stable_content_insets = aa::config::ScreenInsets{9, 10, 11, 12};
+    screen.margins = aa::config::ScreenInsets{60, 90, 128, 64};          // top, bottom, left, right
+    screen.content_insets = aa::config::ScreenInsets{3, 6, 3, 6};        // half-up rounding
+    screen.stable_content_insets = aa::config::ScreenInsets{12, 18, 16, 32};
     const proto::ServiceDiscoveryResponse response{{descriptor}};
     const auto encoded = proto::encode(response);
     ASSERT_TRUE(encoded);
     ctl::ServiceDiscoveryResponse wire;
     ASSERT_TRUE(wire.ParseFromArray(encoded.value().data() + 2,
                                    static_cast<int>(encoded.value().size() - 2)));
-    for (const auto& v : wire.channels(0).media_sink_service().video_configs()) {
+    const auto& configs = wire.channels(0).media_sink_service().video_configs();
+    ASSERT_EQ(configs.size(), 2);
+    for (const auto& v : configs) {  // panel properties are not scaled
         EXPECT_EQ(v.density(), 240u);
         EXPECT_EQ(v.real_density(), 210u);
-        EXPECT_EQ(v.width_margin(), 40u);
-        EXPECT_EQ(v.height_margin(), 80u);
         EXPECT_EQ(v.pixel_aspect_ratio_e4(), 10000u);
         EXPECT_EQ(v.decoder_additional_depth(), 2u);
         EXPECT_EQ(v.ui_config().ui_theme(), shared::UI_THEME_DARK);
-        EXPECT_EQ(v.ui_config().margins().right(), 4u);
-        EXPECT_EQ(v.ui_config().content_insets().left(), 7u);
-        EXPECT_EQ(v.ui_config().stable_content_insets().bottom(), 10u);
     }
+    // Primary 1280x720: exactly as configured.
+    const auto& primary = configs[0];
+    ASSERT_EQ(primary.codec_resolution(), sink::VIDEO_1280x720);
+    EXPECT_EQ(primary.width_margin(), 160u);
+    EXPECT_EQ(primary.height_margin(), 120u);
+    EXPECT_EQ(primary.ui_config().margins().top(), 60u);
+    EXPECT_EQ(primary.ui_config().margins().bottom(), 90u);
+    EXPECT_EQ(primary.ui_config().margins().left(), 128u);
+    EXPECT_EQ(primary.ui_config().margins().right(), 64u);
+    // Fallback 800x480: x scaled by 800/1280, y by 480/720, round half up.
+    const auto& fallback = configs[1];
+    ASSERT_EQ(fallback.codec_resolution(), sink::VIDEO_800x480);
+    EXPECT_EQ(fallback.width_margin(), 100u);
+    EXPECT_EQ(fallback.height_margin(), 80u);
+    EXPECT_EQ(fallback.ui_config().margins().top(), 40u);
+    EXPECT_EQ(fallback.ui_config().margins().bottom(), 60u);
+    EXPECT_EQ(fallback.ui_config().margins().left(), 80u);
+    EXPECT_EQ(fallback.ui_config().margins().right(), 40u);
+    EXPECT_EQ(fallback.ui_config().content_insets().top(), 2u);   // 3 * 2/3 = 2
+    EXPECT_EQ(fallback.ui_config().content_insets().bottom(), 4u);
+    EXPECT_EQ(fallback.ui_config().content_insets().left(), 2u);  // 1.875 -> 2
+    EXPECT_EQ(fallback.ui_config().content_insets().right(), 4u); // 3.75 -> 4
+    EXPECT_EQ(fallback.ui_config().stable_content_insets().left(), 10u);
+    EXPECT_EQ(fallback.ui_config().stable_content_insets().right(), 20u);
     const auto decoded = proto::decode_service_discovery_response(encoded.value());
     ASSERT_TRUE(decoded);
     EXPECT_EQ(decoded.value(), response);
+}
+
+TEST(MediaWire, ScalingIsPerAxisHalfUpAndLeavesPanelPropertiesAlone) {
+    aa::config::Screen screen;
+    screen.density = 320;
+    screen.real_density = 300;
+    screen.width_margin = 1;   // 0.625 -> 1
+    screen.height_margin = 1;  // 0.667 -> 1
+    screen.margins = aa::config::ScreenInsets{3, 1, 5, 2};
+    const aa::config::ScreenExtent primary{1280, 720}, fallback{800, 480};
+    const auto scaled = aa::config::scale_screen(screen, primary, fallback);
+    EXPECT_EQ(scaled.density, 320u);
+    EXPECT_EQ(scaled.real_density, screen.real_density);
+    EXPECT_EQ(scaled.width_margin, 1u);
+    EXPECT_EQ(scaled.height_margin, 1u);
+    EXPECT_EQ(*scaled.margins, (aa::config::ScreenInsets{2, 1, 3, 1}));  // 3*2/3=2, 5*.625=3.125, 2*.625=1.25
+    EXPECT_FALSE(scaled.content_insets);
+    EXPECT_EQ(aa::config::scale_screen(screen, primary, primary), screen);
+    EXPECT_EQ(aa::config::scale_screen(aa::config::scale_screen(screen, primary, primary), primary, fallback), scaled);
+}
+
+TEST(MediaWire, ScreenIsValidatedAgainstEveryOfferedProfile) {
+    const std::array<aa::config::ScreenExtent, 2> profiles{{{1280, 720}, {800, 480}}};
+    aa::config::Screen screen;
+    EXPECT_TRUE(aa::config::invalid_screen_field(screen, profiles).empty());
+    EXPECT_EQ(aa::config::invalid_screen_field(screen, std::span<const aa::config::ScreenExtent>{}), "profiles");
+    // 1275 + 4 < 1280 fits the primary profile, but half-up scaling gives
+    // 797 + 3 = 800 in the fallback: rejected by the fallback only.
+    screen.margins = aa::config::ScreenInsets{0, 0, 1275, 4};
+    EXPECT_TRUE(aa::config::invalid_screen_field(screen, 1280, 720).empty());
+    EXPECT_EQ(aa::config::invalid_screen_field(screen, profiles), "margins");
+    // 1279 in the primary extent is the last width margin that still fits both.
+    screen = {};
+    screen.width_margin = 1279;
+    EXPECT_TRUE(aa::config::invalid_screen_field(screen, profiles).empty());
+    screen.width_margin = 1280;
+    EXPECT_EQ(aa::config::invalid_screen_field(screen, profiles), "width-margin");
+    screen = {};
+    screen.height_margin = 719;
+    EXPECT_TRUE(aa::config::invalid_screen_field(screen, profiles).empty());
+    screen.height_margin = 720;
+    EXPECT_EQ(aa::config::invalid_screen_field(screen, profiles), "height-margin");
+    // The encoder refuses it too: nothing unsafe reaches the phone.
+    auto descriptor = channeltest::video();
+    std::get<proto::VideoConfiguration>(descriptor.configuration).screen =
+        aa::config::Screen{.margins = aa::config::ScreenInsets{0, 0, 1275, 4}};
+    EXPECT_FALSE(proto::encode(proto::ServiceDiscoveryResponse{{descriptor}}));
+}
+
+TEST(MediaWire, OnlyUnimplementedGeometryNeedsTheExperimentalFlag) {
+    EXPECT_TRUE(aa::config::experimental_screen_field({}).empty());
+    aa::config::Screen screen;
+    screen.density = 240;
+    screen.real_density = 210;
+    screen.theme = 1;
+    screen.decoder_additional_depth = 1;
+    screen.pixel_aspect_ratio_e4 = 10000;
+    screen.width_margin = 0;
+    screen.margins = aa::config::ScreenInsets{};
+    screen.content_insets = aa::config::ScreenInsets{4, 4, 4, 4};  // phone-side layout only
+    screen.stable_content_insets = aa::config::ScreenInsets{4, 4, 4, 4};
+    EXPECT_TRUE(aa::config::experimental_screen_field(screen).empty());
+    for (const auto& [field, apply] : std::vector<std::pair<std::string_view, void (*)(aa::config::Screen&)>>{
+             {"width-margin", [](aa::config::Screen& s) { s.width_margin = 1; }},
+             {"height-margin", [](aa::config::Screen& s) { s.height_margin = 1; }},
+             {"margins", [](aa::config::Screen& s) { s.margins = aa::config::ScreenInsets{0, 0, 0, 1}; }},
+             {"pixel-aspect-ratio-e4", [](aa::config::Screen& s) { s.pixel_aspect_ratio_e4 = 9999; }}}) {
+        auto changed = screen;
+        apply(changed);
+        EXPECT_EQ(aa::config::experimental_screen_field(changed), field);
+    }
+}
+
+TEST(MediaWire, LegacyViewingDistanceIsIgnoredOnDecode) {
+    // proto field 7 is obsolete (present through AA 16.4): a legacy sender may
+    // still set it, and decoding must keep accepting and ignoring it.
+    const auto encoded = proto::encode(proto::ServiceDiscoveryResponse{{channeltest::video()}});
+    ASSERT_TRUE(encoded);
+    ctl::ServiceDiscoveryResponse wire;
+    ASSERT_TRUE(wire.ParseFromArray(encoded.value().data() + 2,
+                                   static_cast<int>(encoded.value().size() - 2)));
+    for (auto& v : *wire.mutable_channels(0)->mutable_media_sink_service()->mutable_video_configs()) {
+        v.set_viewing_distance(100);
+    }
+    std::vector<std::byte> payload(encoded.value().begin(), encoded.value().begin() + 2);
+    const auto body = wire.SerializeAsString();
+    for (const char c : body) { payload.push_back(static_cast<std::byte>(c)); }
+    const auto decoded = proto::decode_service_discovery_response(payload);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded.value().services.front(), channeltest::video());
+}
+
+TEST(MediaWire, InsetEdgesAreCanonicalizedToExplicitZeros) {
+    // Only one edge configured: the other three go out as explicit zeros (the
+    // proto2 default value). Per-edge presence is not preserved or reported.
+    auto descriptor = channeltest::video();
+    std::get<proto::VideoConfiguration>(descriptor.configuration).screen.content_insets =
+        aa::config::ScreenInsets{0, 0, 12, 0};
+    const auto encoded = proto::encode(proto::ServiceDiscoveryResponse{{descriptor}});
+    ASSERT_TRUE(encoded);
+    ctl::ServiceDiscoveryResponse wire;
+    ASSERT_TRUE(wire.ParseFromArray(encoded.value().data() + 2,
+                                   static_cast<int>(encoded.value().size() - 2)));
+    const auto& insets = wire.channels(0).media_sink_service().video_configs(0).ui_config().content_insets();
+    EXPECT_TRUE(insets.has_top() && insets.has_bottom() && insets.has_right());
+    EXPECT_EQ(insets.left(), 12u);
+    EXPECT_EQ(insets.top() + insets.bottom() + insets.right(), 0u);
+    auto absent = wire;
+    for (auto& v : *absent.mutable_channels(0)->mutable_media_sink_service()->mutable_video_configs()) {
+        auto* i = v.mutable_ui_config()->mutable_content_insets();
+        i->clear_top(); i->clear_bottom(); i->clear_right();  // a sender that left the edges absent
+    }
+    std::vector<std::byte> payload(encoded.value().begin(), encoded.value().begin() + 2);
+    for (const char c : absent.SerializeAsString()) { payload.push_back(static_cast<std::byte>(c)); }
+    const auto decoded = proto::decode_service_discovery_response(payload);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded.value().services.front(), descriptor);
 }
 
 TEST(MediaWire, ScreenParserRejectsInvalidNumbersAndUnknownOptions) {
@@ -319,7 +452,9 @@ TEST(MediaWire, UnsafeScreenCannotBeAnnounced) {
     screen.density = 999;
     EXPECT_FALSE(proto::encode(proto::ServiceDiscoveryResponse{{descriptor}}));
     screen = {};
-    screen.height_margin = 480; // fits primary but not fallback
+    screen.height_margin = 720; // not below the primary profile's height
     EXPECT_FALSE(proto::encode(proto::ServiceDiscoveryResponse{{descriptor}}));
+    screen.height_margin = 719; // still below it, and below the scaled 800x480 height
+    EXPECT_TRUE(proto::encode(proto::ServiceDiscoveryResponse{{descriptor}}));
 }
 } // namespace

@@ -1020,6 +1020,11 @@ aa::trust::PhoneIdentity runtime_phone;
 bool runtime_real_admission = false;
 bool runtime_fail_before_admission = false;
 bool runtime_send_audio = false;
+// Extra receiver arguments and the discovery response the receiver put on the
+// (synthetic) wire, for tests that prove a command-line value reaches the phone.
+std::vector<std::string> runtime_extra_args;
+std::mutex runtime_discovery_mutex;
+std::vector<std::vector<std::byte>> runtime_discovery_payloads;
 std::size_t runtime_audio_bytes = 0;
 bool runtime_ack_send_failure = false;
 std::atomic<int> runtime_audio_ack_attempts{0};
@@ -1091,6 +1096,18 @@ class RuntimeTransport final : public aa::transport::Transport {
     }
     aa::core::Result<void> send(std::span<const std::byte> bytes) override {
         ++runtime_sends;
+        if (const auto frame = aa::transport::decode_frame(bytes);
+            frame && frame.value().header.channel == 0) {
+            std::vector<std::byte> plain;
+            for (auto byte : frame.value().payload) {
+                plain.push_back(frame.value().header.encryption == aa::transport::Encryption::encrypted
+                    ? static_cast<std::byte>(~std::to_integer<unsigned char>(byte)) : byte);
+            }
+            if (plain.size() > 2 && plain[0] == std::byte{0x00} && plain[1] == std::byte{0x06}) {
+                const std::lock_guard lock(runtime_discovery_mutex);
+                runtime_discovery_payloads.push_back(std::move(plain));
+            }
+        }
         if (runtime_send_audio) {
             const auto frame = aa::transport::decode_frame(bytes);
             if (frame && frame.value().header.channel == 100 &&
@@ -1643,6 +1660,7 @@ RuntimeResult run_runtime(bool recovers, int duration_ms = 0, bool quiet = false
                                   "--input-socket", (root / "input").string(), "--duration-ms",
                                    duration_ms > 0 ? std::to_string(duration_ms)
                                                    : recovers ? "1000" : "6500"};
+    args.insert(args.end(), runtime_extra_args.begin(), runtime_extra_args.end());
     std::vector<char *> argv;
     argv.reserve(args.size());
     for (auto &arg : args) {
@@ -5776,7 +5794,7 @@ TEST(WiredReceiver, InvalidOrMissingAudioSinkValueIsUsageError) {
 }
 
 TEST(WiredReceiver, InvalidScreenFailsBeforeRuntimeAndNamesField) {
-    for (const auto& option : {std::pair{"density", "161"}, std::pair{"height-margin", "480"},
+    for (const auto& option : {std::pair{"density", "161"}, std::pair{"height-margin", "720"},
                               std::pair{"theme", "3"}, std::pair{"density", "-1"},
                               std::pair{"unknown", "1"}}) {
         std::vector<std::string> args{"receiver", "--port", "1-2.1",
@@ -5798,4 +5816,167 @@ TEST(WiredReceiver, ServiceDescriptorsUseConfiguredSingleScreen) {
     const auto& video = std::get<aa::protocol::VideoConfiguration>(descriptors.front().configuration);
     EXPECT_EQ(video.screen, screen);
     EXPECT_EQ(video.profiles.size(), 2u);
+}
+
+namespace {
+std::string hex_of(const std::string &bytes) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string out;
+    for (const unsigned char c : bytes) { out += digits[c >> 4]; out += digits[c & 15]; }
+    return out;
+}
+
+std::pair<int, std::string> receiver_stderr(std::vector<std::string> args) {
+    args.insert(args.begin(), "receiver");
+    args.insert(args.begin() + 1, {"--port", "1-2.1"});
+    std::vector<char *> argv;
+    for (auto &arg : args) { argv.push_back(arg.data()); }
+    testing::internal::CaptureStderr();
+    const int code = receiver_main(static_cast<int>(argv.size()), argv.data());
+    return {code, testing::internal::GetCapturedStderr()};
+}
+} // namespace
+
+TEST(WiredReceiver, DefaultDiscoveryVideoEntryMatchesGoldenFromMain) {
+    // Golden: the video Service entry (id 99) main's encoder produced for the
+    // receiver's descriptors (1280x720 then 800x480, H.264 BP, 30 fps,
+    // density 160, nothing else). Generated independently of this branch's
+    // encoder with `protoc --encode=aap_protobuf.service.Service` from the
+    // field values main's put_configuration sets (src/protocol/aasdk_adapter/
+    // MediaConfiguration.cpp at dd013ec: resolution, frame rate, codec, density 160).
+    const auto services = service_descriptors(aa::input::CapabilityDescriptor::bench_defaults());
+    const auto encoded = aa::protocol::encode(aa::protocol::ServiceDiscoveryResponse{services});
+    ASSERT_TRUE(encoded.has_value());
+    aap_protobuf::service::control::message::ServiceDiscoveryResponse wire;
+    ASSERT_TRUE(wire.ParseFromArray(encoded.value().data() + 2,
+                                   static_cast<int>(encoded.value().size() - 2)));
+    const auto video = std::find_if(wire.channels().begin(), wire.channels().end(),
+                                    [](const auto &channel) { return channel.id() == 99; });
+    ASSERT_NE(video, wire.channels().end());
+    EXPECT_EQ(hex_of(video->SerializeAsString()),
+              "08631a18080322090802100228a001500322090801100228a0015003");
+}
+
+TEST(WiredReceiver, ExperimentalScreenGeometryNeedsExplicitFlag) {
+    struct Case { const char *option, *value, *named; };
+    for (const auto &c : {Case{"width-margin", "40", "width-margin"}, Case{"height-margin", "80", "height-margin"},
+                          Case{"margins-left", "12", "margins"},
+                          Case{"pixel-aspect-ratio-e4", "9000", "pixel-aspect-ratio-e4"}}) {
+        const auto [code, error] = receiver_stderr({std::string{"--screen-"} + c.option, c.value});
+        EXPECT_EQ(code, 2) << c.option;
+        EXPECT_NE(error.find(std::string{"--screen-experimental-geometry: "} + c.named), std::string::npos)
+            << c.option << ": " << error;
+    }
+}
+
+TEST(WiredReceiver, ScreenMustFitEveryOfferedProfileAfterScaling) {
+    // Valid in 1280x720 pixels (1275 + 4 < 1280) but 797 + 3 = 800 leaves no
+    // width in the scaled 800x480 offer.
+    const auto [code, error] = receiver_stderr({"--screen-margins-left", "1275", "--screen-margins-right", "4",
+                                                "--screen-experimental-geometry"});
+    EXPECT_EQ(code, 2);
+    EXPECT_NE(error.find("invalid screen field: margins"), std::string::npos) << error;
+}
+
+TEST(WiredReceiver, UsageListsScreenOptions) {
+    const auto [code, error] = receiver_stderr({"--bogus"});
+    EXPECT_EQ(code, 2);
+    for (const auto *text : {"--screen-<field> N", "--screen-experimental-geometry", "real-density",
+                              "pixel-aspect-ratio-e4", "decoder-additional-depth", "width-margin",
+                              "stable-content-insets", "1280x720 (primary profile)"}) {
+        EXPECT_NE(error.find(text), std::string::npos) << text;
+    }
+}
+
+TEST(WiredReceiver, ScreenDescriptionEventLogsEveryField) {
+    aa::config::Screen screen;
+    EXPECT_EQ(screen_description_event(screen),
+              "{\"event\":\"screen_description\",\"density\":160,\"real_density\":null,"
+              "\"pixel_aspect_ratio_e4\":null,\"decoder_additional_depth\":null,\"width_margin\":null,"
+              "\"height_margin\":null,\"theme\":null,\"margins\":null,\"content_insets\":null,"
+              "\"stable_content_insets\":null}");
+    screen.density = 240;
+    screen.real_density = 210;
+    screen.height_margin = 80;
+    screen.content_insets = aa::config::ScreenInsets{1, 2, 3, 4};
+    EXPECT_EQ(screen_description_event(screen),
+              "{\"event\":\"screen_description\",\"density\":240,\"real_density\":210,"
+              "\"pixel_aspect_ratio_e4\":null,\"decoder_additional_depth\":null,\"width_margin\":null,"
+              "\"height_margin\":80,\"theme\":null,\"margins\":null,"
+              "\"content_insets\":{\"top\":1,\"bottom\":2,\"left\":3,\"right\":4},"
+              "\"stable_content_insets\":null}");
+}
+
+namespace {
+// Runs the real receiver_main loop with a synthetic phone that asks for service
+// discovery, and returns the video entries it announced.
+struct AnnouncedScreen {
+    RuntimeResult run;
+    std::vector<aap_protobuf::service::media::sink::message::VideoConfiguration> video;
+};
+
+AnnouncedScreen announce_with(std::vector<std::string> extra) {
+    auto gate = std::make_shared<RenderGate>();
+    runtime_send_audio = true;
+    runtime_extra_args = std::move(extra);
+    runtime_discovery_payloads.clear();
+    runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+    runtime_on_poll = [gate] { gate->release(); };
+    gate->release();
+    AnnouncedScreen out{run_runtime(false, 300, true), {}};
+    runtime_sink_override = {};
+    runtime_on_poll = {};
+    runtime_send_audio = false;
+    runtime_extra_args.clear();
+    const std::lock_guard lock(runtime_discovery_mutex);
+    if (runtime_discovery_payloads.empty()) { return out; }
+    aap_protobuf::service::control::message::ServiceDiscoveryResponse wire;
+    const auto &payload = runtime_discovery_payloads.front();
+    if (!wire.ParseFromArray(payload.data() + 2, static_cast<int>(payload.size() - 2))) { return out; }
+    for (const auto &channel : wire.channels()) {
+        if (channel.id() == 99) {
+            for (const auto &video : channel.media_sink_service().video_configs()) { out.video.push_back(video); }
+        }
+    }
+    return out;
+}
+} // namespace
+
+TEST(WiredReceiver, ActualMainAnnouncesNonDefaultScreenToThePhone) {
+    const auto announced = announce_with({"--screen-density", "240", "--screen-real-density", "210",
+                                          "--screen-theme", "2", "--screen-decoder-additional-depth", "1",
+                                          "--screen-content-insets-left", "128",
+                                          "--screen-content-insets-top", "60"});
+    EXPECT_EQ(announced.run.code, 0) << announced.run.output;
+    ASSERT_EQ(announced.video.size(), 2u) << announced.run.output;
+    for (const auto &v : announced.video) {
+        EXPECT_EQ(v.density(), 240u);
+        EXPECT_EQ(v.real_density(), 210u);
+        EXPECT_EQ(v.decoder_additional_depth(), 1u);
+        EXPECT_EQ(v.ui_config().ui_theme(), aap_protobuf::service::media::shared::message::UI_THEME_DARK);
+        EXPECT_FALSE(v.has_width_margin());
+    }
+    // 1280x720 carries the value as given; 800x480 carries it scaled per axis.
+    EXPECT_EQ(announced.video[0].ui_config().content_insets().left(), 128u);
+    EXPECT_EQ(announced.video[0].ui_config().content_insets().top(), 60u);
+    EXPECT_EQ(announced.video[1].ui_config().content_insets().left(), 80u);
+    EXPECT_EQ(announced.video[1].ui_config().content_insets().top(), 40u);
+    EXPECT_NE(announced.run.output.find("{\"event\":\"screen_description\",\"density\":240,\"real_density\":210"),
+              std::string::npos) << announced.run.output;
+    EXPECT_EQ(announced.run.output.find("screen_experimental"), std::string::npos);
+}
+
+TEST(WiredReceiver, ActualMainAnnouncesExperimentalMarginsPerProfileAndWarns) {
+    const auto announced = announce_with({"--screen-experimental-geometry", "--screen-width-margin", "160",
+                                          "--screen-height-margin", "120"});
+    EXPECT_EQ(announced.run.code, 0) << announced.run.output;
+    ASSERT_EQ(announced.video.size(), 2u) << announced.run.output;
+    EXPECT_EQ(announced.video[0].width_margin(), 160u);
+    EXPECT_EQ(announced.video[0].height_margin(), 120u);
+    EXPECT_EQ(announced.video[1].width_margin(), 100u);
+    EXPECT_EQ(announced.video[1].height_margin(), 80u);
+    const auto warning = announced.run.output.find("\"event\":\"screen_experimental\"");
+    ASSERT_NE(warning, std::string::npos) << announced.run.output;
+    EXPECT_NE(announced.run.output.find("width-margin is advertised but the display does not crop", warning),
+              std::string::npos);
 }

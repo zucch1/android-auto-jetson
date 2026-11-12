@@ -97,8 +97,7 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
                 || !video.has_codec_resolution() || !video.has_frame_rate()
                 || !video.has_video_codec_type()
                 || video.video_codec_type() != shared::MEDIA_CODEC_VIDEO_H264_BP
-                || video.frame_rate() != sink::VIDEO_FPS_30
-                || video.has_viewing_distance()) {
+                || video.frame_rate() != sink::VIDEO_FPS_30) {
                 return malformed();
             }
             config::Screen screen;
@@ -122,13 +121,23 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
                 if (ui.has_stable_content_insets()) { screen.stable_content_insets = read_insets(ui.stable_content_insets()); }
                 if (ui.has_ui_theme()) { screen.theme = static_cast<std::uint32_t>(ui.ui_theme()); }
             }
-            if (!config.profiles.empty() && config.screen != screen) { return malformed(); }
-            config.screen = screen;
+            VideoProfile profile{};
             switch (video.codec_resolution()) {
-            case sink::VIDEO_1280x720: config.profiles.push_back({1280, 720, 30}); break;
-            case sink::VIDEO_800x480: config.profiles.push_back({800, 480, 30}); break;
+            case sink::VIDEO_1280x720: profile = {1280, 720, 30}; break;
+            case sink::VIDEO_800x480: profile = {800, 480, 30}; break;
             default: return malformed();
             }
+            // The first entry defines the screen in its own pixels; every later
+            // entry must carry exactly that screen scaled into its pixels.
+            // Obsolete viewing_distance (field 7) is deliberately ignored.
+            if (config.profiles.empty()) {
+                config.screen = screen;
+            } else if (screen != config::scale_screen(config.screen,
+                           {config.profiles.front().width, config.profiles.front().height},
+                           {profile.width, profile.height})) {
+                return malformed();
+            }
+            config.profiles.push_back(profile);
         }
         return ServiceConfiguration{std::move(config)};
     }
@@ -197,13 +206,17 @@ core::Result<void> put_configuration(aap_protobuf::service::Service& entry,
     case ChannelRole::video: {
         auto* wire = entry.mutable_media_sink_service();
         wire->set_available_type(shared::MEDIA_CODEC_VIDEO_H264_BP);
-        for (const auto profile : std::get<VideoConfiguration>(descriptor.configuration).profiles) {
+        const auto& configuration = std::get<VideoConfiguration>(descriptor.configuration);
+        for (const auto profile : configuration.profiles) {
             auto* video = wire->add_video_configs();
             video->set_codec_resolution(profile.width == 1280 ? sink::VIDEO_1280x720
                                                              : sink::VIDEO_800x480);
             video->set_frame_rate(sink::VIDEO_FPS_30);
             video->set_video_codec_type(shared::MEDIA_CODEC_VIDEO_H264_BP);
-            const auto& screen = std::get<VideoConfiguration>(descriptor.configuration).screen;
+            const auto screen = config::scale_screen(
+                configuration.screen,
+                {configuration.profiles.front().width, configuration.profiles.front().height},
+                {profile.width, profile.height});
             video->set_density(screen.density);
             if (screen.width_margin) { video->set_width_margin(*screen.width_margin); }
             if (screen.height_margin) { video->set_height_margin(*screen.height_margin); }

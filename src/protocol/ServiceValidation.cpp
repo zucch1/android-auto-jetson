@@ -26,14 +26,18 @@ core::Result<void> validate_service(const ServiceDescriptor& service) {
         if (config == nullptr || config->profiles.empty()
             || config->profiles.size() > kMaxMediaProfiles) { return malformed; }
         std::vector<VideoProfile> seen;
+        std::vector<config::ScreenExtent> extents;
         for (const auto profile : config->profiles) {
-            if (!config::invalid_screen_field(config->screen, profile.width, profile.height).empty()
-                || !valid_video_profile(profile)
+            if (!valid_video_profile(profile)
                 || std::find(seen.begin(), seen.end(), profile) != seen.end()) {
                 return malformed;
             }
             seen.push_back(profile);
+            extents.push_back({profile.width, profile.height});
         }
+        // The screen is defined in the first profile's pixels; it must stay
+        // valid once scaled into every other offered profile.
+        if (!config::invalid_screen_field(config->screen, extents).empty()) { return malformed; }
         return {};
     }
     case ChannelRole::media_audio:

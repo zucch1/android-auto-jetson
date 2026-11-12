@@ -182,3 +182,36 @@ TEST(ChannelWireReject, ScreenBoundsAndNestedUnknownFieldsFailClosed) {
     }
 }
 } // namespace
+
+namespace {
+TEST(ChannelWireReject, EachProfileMustCarryThePrimaryScreenScaledToItsPixels) {
+    // The first entry (1280x720) defines the screen; the 800x480 entry must be
+    // that screen scaled (y by 480/720, x by 800/1280), not an independent value.
+    for (const int scenario : {0, 1, 2, 3}) {
+        auto wire = wire_video();
+        auto* media = wire.mutable_channels(0)->mutable_media_sink_service();
+        auto* primary = media->mutable_video_configs(0);
+        primary->set_density(240);
+        primary->set_height_margin(120);
+        primary->mutable_ui_config()->mutable_content_insets()->set_left(128);
+        auto* fallback = media->add_video_configs();
+        *fallback = *primary;
+        fallback->set_codec_resolution(sink::VIDEO_800x480);
+        fallback->set_height_margin(80);
+        fallback->mutable_ui_config()->mutable_content_insets()->set_left(80);
+        switch (scenario) {
+        case 0: break;  // consistent: accepted
+        case 1: fallback->set_height_margin(120); break;  // unscaled primary value
+        case 2: fallback->set_density(160); break;
+        case 3: fallback->mutable_ui_config()->mutable_content_insets()->set_left(128); break;
+        }
+        const auto decoded = proto::decode_service_discovery_response(payload(wire));
+        EXPECT_EQ(static_cast<bool>(decoded), scenario == 0) << scenario;
+        if (decoded) {
+            const auto& video = std::get<proto::VideoConfiguration>(decoded.value().services.front().configuration);
+            EXPECT_EQ(video.screen.height_margin, 120u);
+            EXPECT_EQ(video.profiles.size(), 2u);
+        }
+    }
+}
+} // namespace
