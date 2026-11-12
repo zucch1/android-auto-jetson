@@ -181,6 +181,9 @@ class ProjectionProgress:
         self.last_ns = 0
         self.previous: dict[str, int] = {}
         self.advanced_ns: dict[str, int] = {}
+        # Streams whose advanced_ns is the receiver's last logged event time (set when a
+        # long collector gap was judged from the log), not a collector sample time.
+        self.event_anchored: set[str] = set()
         self.failure: str | None = None
         self.interferences: list[dict] = []
 
@@ -262,14 +265,25 @@ class ProjectionProgress:
                 if gap_judged:
                     if self._continuous(key, value, stamp, logged_progress):
                         self.advanced_ns[key] = logged_progress[key]["last_event_ns"]
+                        self.event_anchored.add(key)
                     else:
                         self.failure = "media_stalled:" + key
+                    continue
+                if (key in self.event_anchored and logged_progress is not None
+                        and value > self.previous[key]
+                        and self._continuous(key, value, stamp, logged_progress)):
+                    # First progress after a gap judged from the log: advanced_ns is the
+                    # last real event, so the age to this sample overstates the silence.
+                    # The log shows none over the limit from that event onward.
+                    self.advanced_ns[key] = logged_progress[key]["last_event_ns"]
+                    self.event_anchored.discard(key)
                     continue
                 # Check age before accepting a resumed stream: a late recovery cannot heal a freeze.
                 if stamp - self.advanced_ns[key] > _MEDIA_STALL_SECONDS * 1_000_000_000:
                     self.failure = "media_stalled:" + key
                 if value > self.previous[key]:
                     self.advanced_ns[key] = stamp
+                    self.event_anchored.discard(key)
             if interference is not None:
                 # The gap is context for, never a substitute for, the verdict.
                 interference["projection_failure"] = self.failure
@@ -697,6 +711,8 @@ def collect(args: argparse.Namespace) -> dict:
             time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
             sample = read_sample()
             logged_progress = None
+            if progress.event_anchored and progress.started_ns is not None:
+                logged_progress = parser.logged_progress(origin_ns, progress.last_ns, sample.t_ns)
             if (progress.started_ns is not None
                     and sample.t_ns - progress.last_ns > _MEDIA_STALL_SECONDS * 1_000_000_000):
                 # The collector itself was frozen. The receiver's log may not have
