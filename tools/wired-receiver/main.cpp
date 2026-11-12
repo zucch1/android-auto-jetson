@@ -1686,6 +1686,11 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
 
+    if (store.dropped_port_only_count() != 0) {
+        log_line(std::string{"{\"event\":\"trust_store_migrated_dropped_port_only\",\"count\":"} +
+                 std::to_string(store.dropped_port_only_count()) + "}");
+    }
+
     StdoutDiagnostics sink;
     aa::diagnostics::Diagnostics diagnostics{sink};
     aa::session::SteadyClock clock{};
