@@ -134,7 +134,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME dbus_contract_bus COMMAND "${AA_DBUS_RUN_SESSION}" --
         "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusLookup.*:BusFlow.*)
     add_test(NAME dbus_contract_boundary COMMAND "${AA_DBUS_RUN_SESSION}" --
-        "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusBoundary.*)
+        "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusBoundary.*:SocketBoundary.*)
     add_test(NAME dbus_contract_spoof COMMAND "${AA_DBUS_RUN_SESSION}" --
         "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusSpoof.*)
     set_tests_properties(dbus_contract_control dbus_contract_access dbus_contract_pairing
