@@ -542,7 +542,7 @@ TEST(WiredE2eAuth, PlaintextAfterTlsEndsSessionWithDistinctDiagnostic) {
     ASSERT_TRUE(f.session.failure().has_value());
     EXPECT_EQ(f.session.failure()->code(), aa::ErrorCode::transport_plaintext_after_tls);
     EXPECT_FALSE(f.transport.is_open());
-    EXPECT_TRUE(f.capture.contains("\"error_code\":107"));
+    EXPECT_TRUE(f.capture.contains("\"error_code\":108"));
     EXPECT_EQ(f.session.pings_answered(), 0U);
 }
 
@@ -574,7 +574,7 @@ TEST(WiredE2eAuth, PlaintextStaysRejectedAfterCipherDeactivates) {
         ASSERT_FALSE(result.has_value()) << "service_channel=" << service_channel;
         EXPECT_EQ(result.error().code(), aa::ErrorCode::transport_plaintext_after_tls);
         EXPECT_EQ(f.session.state(), ss::State::failed);
-        EXPECT_TRUE(f.capture.contains("\"error_code\":107"));
+        EXPECT_TRUE(f.capture.contains("\"error_code\":108"));
         EXPECT_EQ(f.session.pings_answered(), 0U);
         // The terminal violation closes the transport exactly once.
         EXPECT_EQ(f.transport.close_calls(), closes_before + 1);

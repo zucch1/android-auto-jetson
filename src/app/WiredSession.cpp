@@ -482,7 +482,7 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         // and never touches the handshake. Only an ENCRYPTED chunk reaches here
         // and is accepted and ignored; a plaintext one never gets this far: the
         // reassembler's latched post-handshake guard ends the session with
-        // transport_plaintext_after_tls (107) first.
+        // transport_plaintext_after_tls (108) first.
         if (auth_phase_ == AuthPhase::awaiting_version) {
             return Error{ErrorCode::transport_unauthorized_peer};
         }

@@ -18,6 +18,7 @@ std::string_view Error::message() const noexcept {
     case ErrorCode::transport_oversize_frame: return "oversize transport frame";
     case ErrorCode::transport_unauthorized_peer: return "unauthorized transport peer";
     case ErrorCode::transport_queue_full: return "transport queue full";
+    case ErrorCode::transport_message_dropped: return "message dropped: oversize or unsupported byte order";
 
     case ErrorCode::protocol_version_mismatch: return "protocol version mismatch";
     case ErrorCode::protocol_unsupported_channel: return "unsupported protocol channel";
@@ -81,6 +82,7 @@ std::string_view to_string(ErrorCode code) noexcept {
     case ErrorCode::transport_oversize_frame: return "transport_oversize_frame";
     case ErrorCode::transport_unauthorized_peer: return "transport_unauthorized_peer";
     case ErrorCode::transport_queue_full: return "transport_queue_full";
+    case ErrorCode::transport_message_dropped: return "transport_message_dropped";
 
     case ErrorCode::protocol_version_mismatch: return "protocol_version_mismatch";
     case ErrorCode::protocol_unsupported_channel: return "protocol_unsupported_channel";
