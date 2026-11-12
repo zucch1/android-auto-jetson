@@ -52,6 +52,7 @@ std::string_view Error::message() const noexcept {
     case ErrorCode::trust_store_io: return "trust store io failure";
     case ErrorCode::trust_unknown_phone: return "unknown phone not trusted";
     case ErrorCode::trust_rejected: return "phone rejected by trust store";
+    case ErrorCode::trust_port_only_requires_opt_in: return "port-only approval requires explicit opt-in";
     case ErrorCode::trust_store_not_durable:
         return "Trust store replaced; crash durability unconfirmed.";
 
@@ -116,6 +117,7 @@ std::string_view to_string(ErrorCode code) noexcept {
     case ErrorCode::trust_store_io: return "trust_store_io";
     case ErrorCode::trust_unknown_phone: return "trust_unknown_phone";
     case ErrorCode::trust_rejected: return "trust_rejected";
+    case ErrorCode::trust_port_only_requires_opt_in: return "trust_port_only_requires_opt_in";
     case ErrorCode::trust_store_not_durable: return "trust_store_not_durable";
 
     case ErrorCode::config_invalid: return "config_invalid";
