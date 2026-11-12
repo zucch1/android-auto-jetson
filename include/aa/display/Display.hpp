@@ -168,6 +168,12 @@ public:
 
     // Drains the video channel into the decode helper and presents decoded
     // frames to the FrameTarget; returns the frames presented this call.
+    // Retryable ipc_queue_full submission retains exactly one complete AU and
+    // resubmits it unchanged before any later receive. While that slot is
+    // occupied, later units remain in the video socket (source backpressure),
+    // never in an unbounded controller queue. IDR-resync discards and other
+    // submission failures are not retried. EOS is observed after a pending AU
+    // settles; stop/shutdown releases it with the rest of the media path.
     // Allowed in projecting and (media retained) stop_failed under the SAME
     // video/session preconditions; pump never creates a decoder or session.
     [[nodiscard]] core::Result<std::size_t> pump(core::Milliseconds wait);
