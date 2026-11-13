@@ -24,10 +24,10 @@ Every message and enum of each set is in exactly one bucket. Evidence order: exp
 |---|---|---:|---:|---:|---:|---:|---:|
 | message | AASDK | 208 | 174 | 21 | 13 | 0 | 208 |
 | message | OAA | 434 | 174 | 163 | 39 | 58 | 434 |
-| enum | AASDK | 70 | 57 | 8 | 5 | 0 | 70 |
-| enum | OAA | 121 | 57 | 57 | 7 | 0 | 121 |
+| enum | AASDK | 70 | 56 | 8 | 6 | 0 | 70 |
+| enum | OAA | 121 | 56 | 57 | 8 | 0 | 121 |
 
-Matched pairs by evidence: `explicit-mapping` 27, `name:normalized` 16, `name:relative-path` 86, `name:simple` 2, `propagated:field-position` 45, `structure` 55.
+Matched pairs by evidence: `explicit-mapping` 27, `name:normalized` 16, `name:relative-path` 86, `name:simple` 2, `propagated:field-position` 46, `structure` 53.
 
 *Wrapper* = the OAA `message Foo { enum Enum {…} }` namespace idiom: an empty message that is never used as a field type; its nested enum is matched like any other enum.
 
@@ -35,35 +35,40 @@ Matched pairs by evidence: `explicit-mapping` 27, `name:normalized` 16, `name:re
 
 | Class | Count | Meaning |
 |---|---:|---|
-| wire-affecting | 259 | field/value present on one side only, wire type or cardinality differs, enum number named differently (rename vs semantic change not mechanically decidable) |
+| wire-affecting | 238 | field/value present on one side only, wire type or cardinality differs, enum number named differently (rename vs semantic change not mechanically decidable) |
 | interpretation | 281 | same bytes for in-range values, different interpretation (presence, default, integer family, enum type, oneof, scale exponent) |
 | non-wire | 228 | renames, packed/unpacked, deprecated flag, syntax; no wire effect |
 | unmatched | 249 | definition has no counterpart by mapping, name or structure |
-| undecided | 18 | candidate counterparts exist but evidence is tied or contradictory |
+| undecided | 19 | candidate counterparts exist but evidence is tied or contradictory |
 
 Differences by kind:
 
-- **wire-affecting**: `enum-value-name-conflict` 129, `enum-value-only-aasdk` 17, `enum-value-only-oaa` 67, `field-embedded-type` 9, `field-only-aasdk` 12, `field-only-oaa` 22, `field-type-kind` 2, `field-wire-type` 1
+- **wire-affecting**: `enum-value-name-conflict` 112, `enum-value-only-aasdk` 17, `enum-value-only-oaa` 63, `field-embedded-type` 9, `field-only-aasdk` 12, `field-only-oaa` 22, `field-type-kind` 2, `field-wire-type` 1
 - **interpretation**: `field-default` 3, `field-enum-type` 7, `field-oneof-membership` 1, `field-presence` 83, `field-rename` 170, `field-varint-integer-interpretation` 17
 - **non-wire**: `enum-value-rename-normalized` 180, `field-deprecated` 9, `field-rename-normalized` 30, `syntax` 9
 - **unmatched**: `enum-only-aasdk` 8, `enum-only-oaa` 57, `message-only-aasdk` 21, `message-only-oaa` 163
-- **undecided**: `undecided-match` 18
+- **undecided**: `undecided-match` 19
 
 ## Per-difference triage summary
 
-Every difference across all classes (including `non-wire`) is individually triaged in `protobuf-audit-triage.json` with mechanically derived classification, wire-impact flag, channel, and receiver C++ usage citations.
+Every difference across all classes (including `non-wire`) is individually triaged in `protobuf-audit-triage.json` with mechanically derived classification, wire-impact flag, severity, channel, source file/line/field, match evidence, and receiver C++ usage citations.
 
-- **Total differences**: **1035** (triaged: **1035**, untriaged: **0**)
-- **Wire-affecting**: **259** (`class == wire-affecting`)
+- **Total differences**: **1015** (triaged: **1015**, untriaged: **0**)
+- **Wire-affecting**: **238** (`class == wire-affecting`)
 - **Used by receiver**: **191** (direct field/enum usage, strict-policy unknown-tag/enum rejection, or active entity)
 - **Wire-affecting AND used by receiver**: **59**
-- **Dispositions**: `follow-up-issue-needed` 224, `needs-phone-evidence` 56, `no-action` 755
+- **Dispositions**: `follow-up-issue-needed` 203, `needs-phone-evidence` 56, `no-action` 756
+- **Statuses**: `resolved` 756, `confirmed` 10, `deferred` 193, `proposed` 56
+- **Severities**: `high` 26, `medium-high` 33, `medium` 199, `low-medium` 186, `low` 571
+- **Owners**: `child-1-control-sdp` 23, `child-2-av-media-focus` 31, `child-3-display-ui-theming` 26, `child-4-input-nav-sensors` 69, `child-5-wireless-bt-radio` 110, `triage:phase0-closed` 756
+
+> **Severity derivation rule**: Derived deterministically from wire_affecting x used_by_receiver x classification: (1) wire_affecting=True & used_by_receiver=True -> 'high' for field-number-or-type-conflict / field-added-one-side / enum-value-difference, 'medium-high' for enum-value-conflict or others; (2) wire_affecting=True & used_by_receiver=False -> 'medium'; (3) wire_affecting=False & used_by_receiver=True -> 'medium' for field-number-or-type-conflict / optionality-difference / undecided-match, 'low-medium' for field-name-difference / message-missing-one-side / enum-missing-one-side, 'low' for naming-only / metadata-or-syntax; (4) wire_affecting=False & used_by_receiver=False -> 'low-medium' for field-number-or-type-conflict / optionality-difference / undecided-match, 'low' otherwise.
 
 | Derived classification | Count | Wire-affecting | Used by receiver | Wire & used |
 |---|---:|---:|---:|---:|
 | `enum-missing-one-side` | 65 | 0 | 1 | 0 |
-| `enum-value-conflict` | 129 | 129 | 33 | 33 |
-| `enum-value-difference` | 84 | 84 | 10 | 10 |
+| `enum-value-conflict` | 112 | 112 | 33 | 33 |
+| `enum-value-difference` | 80 | 80 | 10 | 10 |
 | `field-added-one-side` | 34 | 34 | 12 | 12 |
 | `field-name-difference` | 170 | 0 | 71 | 0 |
 | `field-number-or-type-conflict` | 36 | 12 | 11 | 4 |
@@ -71,18 +76,28 @@ Every difference across all classes (including `non-wire`) is individually triag
 | `metadata-or-syntax` | 18 | 0 | 1 | 0 |
 | `naming-only` | 210 | 0 | 35 | 0 |
 | `optionality-difference` | 87 | 0 | 13 | 0 |
-| `undecided-match` | 18 | 0 | 0 | 0 |
+| `undecided-match` | 19 | 0 | 0 | 0 |
+
+## Receiver-usage scanner methodology & known limitations
+
+`scan_receiver_usage()` in `tools/protocol/proto_triage.py` uses regex and alias matching (no C++ AST or compiler symbol resolution) over `src/protocol/` and `src/helper/bluetooth_bootstrap/` (plus `Bootstrap.proto`). Known approximation modes:
+
+- **Shared accessor names across messages (false positive)**: field accessors are matched with `\b(?:has_|set_|mutable_|add_|clear_)?<field>\s*\(` per translation unit once a message type is used, so identically named fields on two different used messages in the same file (for example `status`, `config`, or `channel_id`) can both be marked `direct-field` if one is accessed.
+- **Block comments, `#if 0`, and dead helpers (false positive)**: `//` line comments are stripped before scanning, but `/* ... */` multi-line comments, disabled `#if`/`#ifdef` blocks, and uncalled helper functions within scanned `.cpp`/`.hpp` files are still matched as code.
+- **Other C++ alias styles and indirect callers (false negative)**: only `namespace X = ...;` and single-target `using X = ...;` aliases in files with direct `.pb.h` includes are expanded; `using namespace ...;`, `typedef` aliases, deduced `auto`/template helpers, and transitive callers without a `.pb.h` include are not resolved.
+- **Generated accessors outside the scanned prefixes (false negative)**: the field regex omits `*_size()`, `release_*()`, `allocated_*()`, and `oneof_case()` accessors, so a repeated field inspected only via `<field>_size()` would not match `direct-field`.
+- **Files outside the scanned roots (false negative)**: only `src/protocol/` and `src/helper/bluetooth_bootstrap/` are scanned; proto usages elsewhere (for example `src/core/` or `tests/`) are intentionally excluded from runtime receiver-usage counts.
 
 ## Finding coverage
 
-Differences in `MUST_COVER` classes (`wire-affecting`, `interpretation`, `unmatched`, `undecided`): **807**; covered by a curated finding (`D1`–`D39`): **310**; covered individually by `protobuf-audit-triage.json`: **497**; covered only by legacy broad `accepted` buckets: **0** (retired; must be 0); uncovered: **0** (the guard fails if this is not 0).
+Differences in `MUST_COVER` classes (`wire-affecting`, `interpretation`, `unmatched`, `undecided`): **787**; covered by a curated finding (`D1`–`D39`): **310**; covered individually by `protobuf-audit-triage.json`: **477**; covered only by legacy broad `accepted` buckets: **0** (retired; must be 0); uncovered: **0** (the guard fails if this is not 0).
 
 | Class | Total | By finding | Individually triaged | Accepted buckets |
 |---|---:|---:|---:|---:|
 | interpretation | 281 | 124 | 157 | 0 |
-| undecided | 18 | 7 | 11 | 0 |
+| undecided | 19 | 7 | 12 | 0 |
 | unmatched | 249 | 86 | 163 | 0 |
-| wire-affecting | 259 | 93 | 166 | 0 |
+| wire-affecting | 238 | 93 | 145 | 0 |
 
 ## Per-channel summary
 
@@ -100,7 +115,7 @@ Derived mechanically from `.proto` paths/packages, receiver C++ sources (`src/pr
 | `bluetooth` | 17 | 6 | 1 | 2 | 0 | 2 | 3 | 2 | 0 | 0 | 1 | 0 | 7 | 1 | 0 | 10 | 4 | 3 | 0 |
 | `wifi-projection` | 31 | 9 | 5 | 1 | 1 | 0 | 3 | 3 | 6 | 3 | 0 | 0 | 7 | 18 | 4 | 23 | 0 | 8 | 3 |
 | `wireless-bootstrap` | 41 | 0 | 7 | 3 | 7 | 10 | 0 | 0 | 5 | 5 | 1 | 3 | 3 | 16 | 0 | 29 | 3 | 9 | 1 |
-| `navigation` | 92 | 0 | 16 | 2 | 6 | 3 | 17 | 19 | 23 | 2 | 0 | 4 | 41 | 0 | 0 | 19 | 73 | 0 | 0 |
+| `navigation` | 72 | 0 | 16 | 2 | 6 | 3 | 13 | 2 | 23 | 2 | 0 | 5 | 20 | 0 | 0 | 20 | 52 | 0 | 0 |
 | `media-playback` | 21 | 3 | 7 | 0 | 0 | 0 | 2 | 0 | 5 | 4 | 0 | 0 | 2 | 0 | 0 | 14 | 7 | 0 | 10 |
 | `media-browser` | 18 | 6 | 0 | 0 | 0 | 11 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 18 | 0 | 0 | 0 |
 | `phone-status` | 9 | 0 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 8 | 1 | 0 | 0 |
@@ -140,67 +155,67 @@ Derived mechanically from `.proto` paths/packages, receiver C++ sources (`src/pr
 
 All **59** differences where `wire_affecting == true` AND `used_by_receiver == true` (including strict `kStrictExtensionPolicy` unknown-tag/enum rejections and compile-time/runtime usages):
 
-| ID | Channel | Classification | Usage mode | AASDK ↔ OAA | Key | Receiver citations | Disposition | Phone evidence |
-|---|---|---|---|---|---|---|---|---|
-| `W-183ae0c94130` | `control` | `field-number-or-type-conflict` | `direct-field` | `service.Service` ↔ `data.ChannelDescriptor` | `field 13` | `ServiceAdapter.cpp` | `no-action` | out-of-scope |
-| `W-49251106c564` | `control` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.Service` ↔ `data.ChannelDescriptor` | `field 16` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | unknown, needs phone evidence |
-| `W-5b23cd51a997` | `control` | `enum-value-conflict` | `direct-enum-value` | `service.control.message.ControlMessageType` ↔ `ids.ControlMessage.Enum` | `value 16` | `FocusAdapter.cpp` | `no-action` | not-needed |
-| `W-63b957d0f5e0` | `control` | `enum-value-conflict` | `direct-enum-value` | `service.control.message.ControlMessageType` ↔ `ids.ControlMessage.Enum` | `value 15` | `FocusAdapter.cpp` | `no-action` | not-needed |
-| `W-6e4533794fd1` | `control` | `field-number-or-type-conflict` | `direct-field` | `service.Service` ↔ `data.ChannelDescriptor` | `field 7` | `ServiceAdapter.cpp` | `no-action` | out-of-scope |
-| `W-b9149e93b966` | `control` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.Service` ↔ `data.ChannelDescriptor` | `field 17` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | unknown, needs phone evidence |
-| `W-ba590d71ba39` | `control` | `enum-value-conflict` | `direct-enum-value` | `service.control.message.ControlMessageType` ↔ `ids.ControlMessage.Enum` | `value 13` | `FocusAdapter.cpp` | `no-action` | not-needed |
-| `W-d266b4cbdfbd` | `control` | `enum-value-conflict` | `direct-enum-value` | `service.control.message.ControlMessageType` ↔ `ids.ControlMessage.Enum` | `value 19` | `FocusAdapter.cpp` | `no-action` | not-needed |
-| `W-d45a94fe98a7` | `control` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.Service` ↔ `data.ChannelDescriptor` | `field 18` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | unknown, needs phone evidence |
-| `W-e408d5b18fae` | `control` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.Service` ↔ `data.ChannelDescriptor` | `field 15` | `MediaConfiguration.cpp` | `no-action` | out-of-scope |
-| `W-fd54070a4689` | `control` | `enum-value-conflict` | `direct-enum-value` | `service.control.message.ControlMessageType` ↔ `ids.ControlMessage.Enum` | `value 14` | `FocusAdapter.cpp` | `no-action` | not-needed |
-| `W-06570c2ad39e` | `av-video` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.video.message.VideoFocusMode` ↔ `enums.VideoFocusMode.Enum` | `value 0` | `AvSinkAdapter.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-463ef8374642` | `av-video` | `field-number-or-type-conflict` | `strict-tag-checked` | `service.media.sink.message.VideoConfiguration` ↔ `data.VideoConfig` | `field 11` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | unknown, needs phone evidence |
-| `W-4801587e1e2b` | `av-video` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.sink.message.VideoFrameRateType` ↔ `enums.VideoFPS.Enum` | `value 0` | `MediaConfiguration.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-50287e37691c` | `av-video` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.message.VideoFrameRateType` ↔ `enums.VideoFPS.Enum` | `value 2` | `MediaConfiguration.cpp` | `no-action` | not-needed |
-| `W-949db16a2268` | `av-video` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.sink.message.VideoCodecResolutionType` ↔ `enums.VideoResolution.Enum` | `value 0` | `MediaConfiguration.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-9576eeab98f5` | `av-video` | `field-added-one-side` | `direct-field` | `service.media.video.message.VideoFocusNotification` ↔ `messages.VideoFocusNotification` | `field 2` | `AvSinkAdapter.cpp` | `no-action` | not-needed |
-| `W-b23ba1b03817` | `av-video` | `field-added-one-side` | `strict-tag-checked` | `service.media.video.message.VideoFocusRequestNotification` ↔ `messages.VideoFocusRequest` | `field 1` | `AvSinkAdapter.cpp` | `no-action` | not-needed |
-| `W-917fa0441c28` | `av-audio` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.message.AudioStreamType` ↔ `enums.AudioType.Enum` | `value 2` | `MediaConfiguration.cpp`, `ServiceAdapter.cpp` | `no-action` | not-needed |
-| `W-9e4e9a864e2a` | `av-audio` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.message.AudioStreamType` ↔ `enums.AudioType.Enum` | `value 4` | `MediaConfiguration.cpp`, `ServiceAdapter.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-a24322e35bcc` | `av-audio` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.message.AudioStreamType` ↔ `enums.AudioType.Enum` | `value 1` | `MediaConfiguration.cpp`, `ServiceAdapter.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-ec48b8a129a7` | `av-audio` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.sink.message.AudioStreamType` ↔ `enums.AudioType.Enum` | `value 0` | `MediaConfiguration.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-9865e6dae288` | `av-mic` | `field-added-one-side` | `direct-field` | `service.media.source.MediaSourceService` ↔ `data.AVInputChannel` | `field 3` | `MediaConfiguration.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-069ad73b3646` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32773` | `MicrophoneAdapter.cpp` | `no-action` | not-needed |
-| `W-0e0eaa591708` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 1` | `AvSinkAdapter.cpp` | `no-action` | not-needed |
-| `W-4465515a3b87` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32770` | `AvSinkAdapter.cpp` | `no-action` | not-needed |
-| `W-4a9c2f18cd28` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32768` | `AvSinkAdapter.cpp`, `MicrophoneAdapter.cpp` | `no-action` | not-needed |
-| `W-5599673ab73a` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32774` | `MicrophoneAdapter.cpp` | `no-action` | not-needed |
-| `W-66621ab322c1` | `av-shared` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.media.shared.message.Start` ↔ `messages.AVChannelStartIndication` | `field 3` | `AvSinkAdapter.cpp` | `follow-up-issue-needed` | unknown, needs phone evidence |
-| `W-851cffa89e46` | `av-shared` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.shared.message.MediaCodecType` ↔ `enums.MediaCodecType.Enum` | `value 0` | `AvSinkAdapter.cpp`, `MediaConfiguration.cpp`, `MicrophoneAdapter.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-86389dfd5582` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 0` | `AvSinkAdapter.cpp` | `no-action` | not-needed |
-| `W-9e19eca5fa93` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32771` | `AvSinkAdapter.cpp`, `MicrophoneAdapter.cpp` | `no-action` | not-needed |
-| `W-af74361c4275` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32772` | `AvSinkAdapter.cpp`, `MicrophoneAdapter.cpp` | `no-action` | not-needed |
-| `W-b12c525b6739` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32769` | `AvSinkAdapter.cpp` | `no-action` | not-needed |
-| `W-d2d28613509a` | `av-shared` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.media.sink.MediaSinkService` ↔ `data.AVChannel` | `field 9` | `MediaConfiguration.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-d79c4083db9c` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.shared.message.Config.Status` ↔ `enums.AVChannelSetupStatus.Enum` | `value 2` | `AvSinkAdapter.cpp`, `MicrophoneAdapter.cpp` | `no-action` | not-needed |
-| `W-edeac8988da1` | `av-shared` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.media.shared.message.Start` ↔ `messages.AVChannelStartIndication` | `field 4` | `AvSinkAdapter.cpp` | `follow-up-issue-needed` | unknown, needs phone evidence |
-| `W-f9cc18dd99f3` | `av-shared` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32776` | `AvSinkAdapter.cpp` | `no-action` | not-needed |
-| `W-fb26a278e7f8` | `av-shared` | `field-added-one-side` | `direct-field` | `service.media.sink.MediaSinkService` ↔ `data.AVChannel` | `field 5` | `MediaConfiguration.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-2e4d24078d0a` | `input` | `enum-value-conflict` | `direct-enum-value` | `service.inputsource.message.PointerAction` ↔ `enums.TouchAction.Enum` | `value 2` | `InputAdapter.cpp` | `no-action` | not-needed |
-| `W-62a6181d61a9` | `input` | `enum-value-conflict` | `direct-enum-value` | `service.inputsource.message.PointerAction` ↔ `enums.TouchAction.Enum` | `value 1` | `InputAdapter.cpp` | `no-action` | not-needed |
-| `W-66719d6b1369` | `input` | `enum-value-conflict` | `direct-enum-value` | `service.inputsource.message.PointerAction` ↔ `enums.TouchAction.Enum` | `value 0` | `InputAdapter.cpp` | `no-action` | not-needed |
-| `W-a107c8a10578` | `input` | `enum-value-conflict` | `direct-enum-value` | `service.inputsource.InputMessageId` ↔ `ids.InputChannelMessage.Enum` | `value 32769` | `InputAdapter.cpp` | `no-action` | not-needed |
-| `W-0a5349bafbf0` | `sensor` | `enum-value-conflict` | `direct-enum-value` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 10` | `MediaConfiguration.cpp`, `SensorAdapter.cpp` | `no-action` | not-needed |
-| `W-21e62fff0e23` | `sensor` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 26` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | unknown, needs phone evidence |
-| `W-39ad20f8b563` | `sensor` | `field-number-or-type-conflict` | `direct-field` | `service.sensorsource.SensorSourceService` ↔ `data.SensorChannel` | `field 1` | `MediaConfiguration.cpp` | `no-action` | not-needed |
-| `W-5e727f2a959f` | `sensor` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 0` | `MediaConfiguration.cpp` | `no-action` | unknown, needs phone evidence |
-| `W-76f346284968` | `sensor` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 23` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | unknown, needs phone evidence |
-| `W-b79aafe4111f` | `sensor` | `enum-value-conflict` | `direct-enum-value` | `service.sensorsource.SensorMessageId` ↔ `ids.SensorChannelMessage.Enum` | `value 32769` | `SensorAdapter.cpp` | `no-action` | not-needed |
-| `W-c0165d44a661` | `sensor` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 24` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | unknown, needs phone evidence |
-| `W-c3eb9425ba89` | `sensor` | `enum-value-conflict` | `direct-enum-value` | `service.sensorsource.SensorMessageId` ↔ `ids.SensorChannelMessage.Enum` | `value 32770` | `SensorAdapter.cpp` | `no-action` | not-needed |
-| `W-c569bc77f916` | `sensor` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 25` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | unknown, needs phone evidence |
-| `W-c685da60b9c4` | `sensor` | `enum-value-conflict` | `direct-enum-value` | `service.sensorsource.SensorMessageId` ↔ `ids.SensorChannelMessage.Enum` | `value 32772` | `SensorAdapter.cpp` | `no-action` | not-needed |
-| `W-f171b9de7ad6` | `sensor` | `enum-value-conflict` | `direct-enum-value` | `service.sensorsource.SensorMessageId` ↔ `ids.SensorChannelMessage.Enum` | `value 32771` | `SensorAdapter.cpp` | `no-action` | not-needed |
-| `W-31031bd00e64` | `wifi-projection` | `enum-value-conflict` | `direct-enum-value` | `service.wifiprojection.message.WifiSecurityMode` ↔ `messages.WifiCredentialSecurityMode` | `value 0` | `WifiProjectionAdapter.cpp` | `no-action` | not-needed |
-| `W-72953b3eadff` | `wifi-projection` | `field-added-one-side` | `direct-field` | `service.wifiprojection.message.WifiCredentialsResponse` ↔ `messages.WifiCredentialsResponse` | `field 4` | `WifiProjectionAdapter.cpp` | `needs-phone-evidence` | unknown, needs phone evidence |
-| `W-7f36cc1d9a8d` | `wifi-projection` | `enum-value-conflict` | `direct-enum-value` | `service.wifiprojection.WifiProjectionMessageId` ↔ `ids.WifiChannelMessage.Enum` | `value 32770` | `WifiProjectionAdapter.cpp` | `no-action` | not-needed |
-| `W-a1e73eafb187` | `wifi-projection` | `enum-value-conflict` | `direct-enum-value` | `service.wifiprojection.WifiProjectionMessageId` ↔ `ids.WifiChannelMessage.Enum` | `value 32769` | `WifiProjectionAdapter.cpp` | `no-action` | not-needed |
-| `W-337a06d29b99` | `shared` | `enum-value-conflict` | `direct-enum-value` | `shared.MessageStatus` ↔ `enums.Status.Enum` | `value 0` | `ControlAdapter.cpp`, `SensorAdapter.cpp` | `no-action` | not-needed |
+| ID | Channel | Severity | Classification | Usage mode | AASDK ↔ OAA | Key | Receiver citations | Disposition | Status | Owner | Phone evidence |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `W-183ae0c94130` | `control` | `high` | `field-number-or-type-conflict` | `direct-field` | `service.Service` ↔ `data.ChannelDescriptor` | `field 13` | `ServiceAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | out-of-scope |
+| `W-49251106c564` | `control` | `high` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.Service` ↔ `data.ChannelDescriptor` | `field 16` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | `deferred` | `child-1-control-sdp` | unknown, needs phone evidence |
+| `W-5b23cd51a997` | `control` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.control.message.ControlMessageType` ↔ `ids.ControlMessage.Enum` | `value 16` | `FocusAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-63b957d0f5e0` | `control` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.control.message.ControlMessageType` ↔ `ids.ControlMessage.Enum` | `value 15` | `FocusAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-6e4533794fd1` | `control` | `high` | `field-number-or-type-conflict` | `direct-field` | `service.Service` ↔ `data.ChannelDescriptor` | `field 7` | `ServiceAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | out-of-scope |
+| `W-b9149e93b966` | `control` | `high` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.Service` ↔ `data.ChannelDescriptor` | `field 17` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | `deferred` | `child-1-control-sdp` | unknown, needs phone evidence |
+| `W-ba590d71ba39` | `control` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.control.message.ControlMessageType` ↔ `ids.ControlMessage.Enum` | `value 13` | `FocusAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-d266b4cbdfbd` | `control` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.control.message.ControlMessageType` ↔ `ids.ControlMessage.Enum` | `value 19` | `FocusAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-d45a94fe98a7` | `control` | `high` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.Service` ↔ `data.ChannelDescriptor` | `field 18` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | `deferred` | `child-1-control-sdp` | unknown, needs phone evidence |
+| `W-e408d5b18fae` | `control` | `high` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.Service` ↔ `data.ChannelDescriptor` | `field 15` | `MediaConfiguration.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | out-of-scope |
+| `W-fd54070a4689` | `control` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.control.message.ControlMessageType` ↔ `ids.ControlMessage.Enum` | `value 14` | `FocusAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-06570c2ad39e` | `av-video` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.video.message.VideoFocusMode` ↔ `enums.VideoFocusMode.Enum` | `value 0` | `AvSinkAdapter.cpp` | `needs-phone-evidence` | `proposed` | `child-2-av-media-focus` | unknown, needs phone evidence |
+| `W-463ef8374642` | `av-video` | `high` | `field-number-or-type-conflict` | `strict-tag-checked` | `service.media.sink.message.VideoConfiguration` ↔ `data.VideoConfig` | `field 11` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | `deferred` | `child-3-display-ui-theming` | unknown, needs phone evidence |
+| `W-4801587e1e2b` | `av-video` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.sink.message.VideoFrameRateType` ↔ `enums.VideoFPS.Enum` | `value 0` | `MediaConfiguration.cpp` | `needs-phone-evidence` | `proposed` | `child-2-av-media-focus` | unknown, needs phone evidence |
+| `W-50287e37691c` | `av-video` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.message.VideoFrameRateType` ↔ `enums.VideoFPS.Enum` | `value 2` | `MediaConfiguration.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-949db16a2268` | `av-video` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.sink.message.VideoCodecResolutionType` ↔ `enums.VideoResolution.Enum` | `value 0` | `MediaConfiguration.cpp` | `needs-phone-evidence` | `proposed` | `child-2-av-media-focus` | unknown, needs phone evidence |
+| `W-9576eeab98f5` | `av-video` | `high` | `field-added-one-side` | `direct-field` | `service.media.video.message.VideoFocusNotification` ↔ `messages.VideoFocusNotification` | `field 2` | `AvSinkAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-b23ba1b03817` | `av-video` | `high` | `field-added-one-side` | `strict-tag-checked` | `service.media.video.message.VideoFocusRequestNotification` ↔ `messages.VideoFocusRequest` | `field 1` | `AvSinkAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-917fa0441c28` | `av-audio` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.message.AudioStreamType` ↔ `enums.AudioType.Enum` | `value 2` | `MediaConfiguration.cpp`, `ServiceAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-9e4e9a864e2a` | `av-audio` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.message.AudioStreamType` ↔ `enums.AudioType.Enum` | `value 4` | `MediaConfiguration.cpp`, `ServiceAdapter.cpp` | `needs-phone-evidence` | `proposed` | `child-2-av-media-focus` | unknown, needs phone evidence |
+| `W-a24322e35bcc` | `av-audio` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.message.AudioStreamType` ↔ `enums.AudioType.Enum` | `value 1` | `MediaConfiguration.cpp`, `ServiceAdapter.cpp` | `needs-phone-evidence` | `proposed` | `child-2-av-media-focus` | unknown, needs phone evidence |
+| `W-ec48b8a129a7` | `av-audio` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.sink.message.AudioStreamType` ↔ `enums.AudioType.Enum` | `value 0` | `MediaConfiguration.cpp` | `needs-phone-evidence` | `proposed` | `child-2-av-media-focus` | unknown, needs phone evidence |
+| `W-9865e6dae288` | `av-mic` | `high` | `field-added-one-side` | `direct-field` | `service.media.source.MediaSourceService` ↔ `data.AVInputChannel` | `field 3` | `MediaConfiguration.cpp` | `needs-phone-evidence` | `proposed` | `child-2-av-media-focus` | unknown, needs phone evidence |
+| `W-069ad73b3646` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32773` | `MicrophoneAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-0e0eaa591708` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 1` | `AvSinkAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-4465515a3b87` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32770` | `AvSinkAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-4a9c2f18cd28` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32768` | `AvSinkAdapter.cpp`, `MicrophoneAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-5599673ab73a` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32774` | `MicrophoneAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-66621ab322c1` | `av-shared` | `high` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.media.shared.message.Start` ↔ `messages.AVChannelStartIndication` | `field 3` | `AvSinkAdapter.cpp` | `follow-up-issue-needed` | `confirmed` | `child-2-av-media-focus` | unknown, needs phone evidence |
+| `W-851cffa89e46` | `av-shared` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.shared.message.MediaCodecType` ↔ `enums.MediaCodecType.Enum` | `value 0` | `AvSinkAdapter.cpp`, `MediaConfiguration.cpp`, `MicrophoneAdapter.cpp` | `needs-phone-evidence` | `proposed` | `child-2-av-media-focus` | unknown, needs phone evidence |
+| `W-86389dfd5582` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 0` | `AvSinkAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-9e19eca5fa93` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32771` | `AvSinkAdapter.cpp`, `MicrophoneAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-af74361c4275` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32772` | `AvSinkAdapter.cpp`, `MicrophoneAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-b12c525b6739` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32769` | `AvSinkAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-d2d28613509a` | `av-shared` | `high` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.media.sink.MediaSinkService` ↔ `data.AVChannel` | `field 9` | `MediaConfiguration.cpp` | `needs-phone-evidence` | `proposed` | `child-3-display-ui-theming` | unknown, needs phone evidence |
+| `W-d79c4083db9c` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.shared.message.Config.Status` ↔ `enums.AVChannelSetupStatus.Enum` | `value 2` | `AvSinkAdapter.cpp`, `MicrophoneAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-edeac8988da1` | `av-shared` | `high` | `field-added-one-side` | `strict-unknown-tag-reject` | `service.media.shared.message.Start` ↔ `messages.AVChannelStartIndication` | `field 4` | `AvSinkAdapter.cpp` | `follow-up-issue-needed` | `confirmed` | `child-2-av-media-focus` | unknown, needs phone evidence |
+| `W-f9cc18dd99f3` | `av-shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.MediaMessageId` ↔ `ids.AVChannelMessage.Enum` | `value 32776` | `AvSinkAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-fb26a278e7f8` | `av-shared` | `high` | `field-added-one-side` | `direct-field` | `service.media.sink.MediaSinkService` ↔ `data.AVChannel` | `field 5` | `MediaConfiguration.cpp` | `needs-phone-evidence` | `proposed` | `child-3-display-ui-theming` | unknown, needs phone evidence |
+| `W-2e4d24078d0a` | `input` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.inputsource.message.PointerAction` ↔ `enums.TouchAction.Enum` | `value 2` | `InputAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-62a6181d61a9` | `input` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.inputsource.message.PointerAction` ↔ `enums.TouchAction.Enum` | `value 1` | `InputAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-66719d6b1369` | `input` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.inputsource.message.PointerAction` ↔ `enums.TouchAction.Enum` | `value 0` | `InputAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-a107c8a10578` | `input` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.inputsource.InputMessageId` ↔ `ids.InputChannelMessage.Enum` | `value 32769` | `InputAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-0a5349bafbf0` | `sensor` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 10` | `MediaConfiguration.cpp`, `SensorAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-21e62fff0e23` | `sensor` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 26` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | `deferred` | `child-4-input-nav-sensors` | unknown, needs phone evidence |
+| `W-39ad20f8b563` | `sensor` | `high` | `field-number-or-type-conflict` | `direct-field` | `service.sensorsource.SensorSourceService` ↔ `data.SensorChannel` | `field 1` | `MediaConfiguration.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-5e727f2a959f` | `sensor` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 0` | `MediaConfiguration.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | unknown, needs phone evidence |
+| `W-76f346284968` | `sensor` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 23` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | `deferred` | `child-4-input-nav-sensors` | unknown, needs phone evidence |
+| `W-b79aafe4111f` | `sensor` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.sensorsource.SensorMessageId` ↔ `ids.SensorChannelMessage.Enum` | `value 32769` | `SensorAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-c0165d44a661` | `sensor` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 24` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | `deferred` | `child-4-input-nav-sensors` | unknown, needs phone evidence |
+| `W-c3eb9425ba89` | `sensor` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.sensorsource.SensorMessageId` ↔ `ids.SensorChannelMessage.Enum` | `value 32770` | `SensorAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-c569bc77f916` | `sensor` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.sensorsource.message.SensorType` ↔ `enums.SensorType.Enum` | `value 25` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | `deferred` | `child-4-input-nav-sensors` | unknown, needs phone evidence |
+| `W-c685da60b9c4` | `sensor` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.sensorsource.SensorMessageId` ↔ `ids.SensorChannelMessage.Enum` | `value 32772` | `SensorAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-f171b9de7ad6` | `sensor` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.sensorsource.SensorMessageId` ↔ `ids.SensorChannelMessage.Enum` | `value 32771` | `SensorAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-31031bd00e64` | `wifi-projection` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.wifiprojection.message.WifiSecurityMode` ↔ `messages.WifiCredentialSecurityMode` | `value 0` | `WifiProjectionAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-72953b3eadff` | `wifi-projection` | `high` | `field-added-one-side` | `direct-field` | `service.wifiprojection.message.WifiCredentialsResponse` ↔ `messages.WifiCredentialsResponse` | `field 4` | `WifiProjectionAdapter.cpp` | `needs-phone-evidence` | `proposed` | `child-5-wireless-bt-radio` | unknown, needs phone evidence |
+| `W-7f36cc1d9a8d` | `wifi-projection` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.wifiprojection.WifiProjectionMessageId` ↔ `ids.WifiChannelMessage.Enum` | `value 32770` | `WifiProjectionAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-a1e73eafb187` | `wifi-projection` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.wifiprojection.WifiProjectionMessageId` ↔ `ids.WifiChannelMessage.Enum` | `value 32769` | `WifiProjectionAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-337a06d29b99` | `shared` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `shared.MessageStatus` ↔ `enums.Status.Enum` | `value 0` | `ControlAdapter.cpp`, `SensorAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
 
 ## Wireless modes comparison
 
@@ -333,6 +348,7 @@ OAA explicitly marks **64** schema entities `confidence: retracted` in its `.pro
 - enum `service.inputsource.message.TouchScreenType` ↔ `data.NativeUIElementType, enums.RadioBandType.Enum, enums.WifiChannelType.Enum, messages.CarPropertyAccessMode …`: best structural overlap 0.75 (same-name field/value matches 0) is tied or not mutual (5 OAA candidate(s)); not guessed
 - enum `service.navigationstatus.message.NavigationDistance.DistanceUnits` ↔ `messages.DistanceDisplayUnit, messages.MediaPlaybackStatusEventType`: best structural overlap 1.00 (same-name field/value matches 0) is tied or not mutual (2 OAA candidate(s)); not guessed
 - enum `service.navigationstatus.message.NavigationNextTurnDistanceEvent.DistanceUnits` ↔ `messages.DistanceDisplayUnit, messages.MediaPlaybackStatusEventType`: best structural overlap 1.00 (same-name field/value matches 0) is tied or not mutual (2 OAA candidate(s)); not guessed
+- enum `service.navigationstatus.message.NavigationNextTurnEvent.NextTurnEnum` ↔ `enums.ChannelType.Enum`: best structural overlap 0.82 (same-name field/value matches 0) is tied or not mutual (1 OAA candidate(s)); not guessed
 - enum `service.navigationstatus.message.NavigationStatus.NavigationStatusEnum` ↔ `data.NativeUIElementType, enums.RadioBandType.Enum, enums.WifiChannelType.Enum, messages.CarPropertyAccessMode …`: best structural overlap 1.00 (same-name field/value matches 0) is tied or not mutual (5 OAA candidate(s)); not guessed
 - message `aaw.WifiConnectionStatus` ↔ `data.CapConnComplexA, data.CapConnComplexC, data.CapabilityFlag, messages.CarControlGroup …`: best structural overlap 1.00 (same-name field/value matches 0) is tied or not mutual (7 OAA candidate(s)); not guessed
 - message `service.genericnotification.message.GenericNotificationAck` ↔ `data.NativeUIElement, data.VersionFeatureFlags, messages.NavigationRemainingDistance, messages.SetCarPropertyListenerResult …`: best structural overlap 1.00 (same-name field/value matches 0) is tied or not mutual (5 OAA candidate(s)); not guessed
@@ -347,6 +363,43 @@ OAA explicitly marks **64** schema entities `confidence: retracted` in its `.pro
 - message `service.radio.message.TuneToStationResponse` ↔ `messages.LegacyCancelRadioOperationsResponse, messages.LegacySeekStationResponse, messages.LegacyStepChannelResponse, messages.LegacyTuneToStationResponse`: best structural overlap 1.00 (same-name field/value matches 2) is tied or not mutual (4 OAA candidate(s)); not guessed
 - message `shared.PhoneInfo` ↔ `data.BlendedUIConfig, data.CapConnModelList, data.CapConnModelPair, data.CapConnValue …`: best structural overlap 1.00 (same-name field/value matches 0) is tied or not mutual (17 OAA candidate(s)); not guessed
 - message `aaw.WifiVersionRequest` ↔ `messages.WifiVersionRequest`: same name 'WifiVersionRequest' but structural overlap 0.00 < 0.25: possible name collision; same name 'wifiversionrequest' but structural overlap 0.00 < 0.25: possible name collision
+
+## Follow-up grouping (5 domain groups: confirmed fix needed vs research needed)
+
+All actionable / pending differences (`follow-up-issue-needed` + `needs-phone-evidence`) are grouped into the five domain groups below rather than creating one issue per difference. Within each group, items with **confirmed fix needed** (`status = confirmed`) are separated from **research needed** (`status = deferred | proposed`, spanning schema/capability research and real-phone evidence).
+
+| Domain group | Confirmed fix needed | Research needed (schema + phone) | Total follow-up/research |
+|---|---:|---:|---:|
+| `child-2-av-media-focus` | 4 | 27 (11 schema + 16 phone) | 31 |
+| `child-1-control-sdp` | 0 | 23 (14 schema + 9 phone) | 23 |
+| `child-3-display-ui-theming` | 6 | 20 (14 schema + 6 phone) | 26 |
+| `child-4-input-nav-sensors` | 0 | 69 (65 schema + 4 phone) | 69 |
+| `child-5-wireless-bt-radio` | 0 | 110 (89 schema + 21 phone) | 110 |
+
+### child-2-av-media-focus: AV setup, media, codecs and focus
+
+- **Confirmed fix needed (`4` diffs)**: findings: `D5-VF-REASON` (2); strict receiver diffs: `W-66621ab322c1`, `W-edeac8988da1`.
+- **Research needed (`27` diffs = `11` schema/deferred + `16` needs-phone-evidence)**: findings: `D11-AUDIOTYPE-NAME` (proposed, 3), `D29-AV-MEDIA-STATS-OPTS` (deferred, 4), `D38-MIC-OPEN-PAIR` (proposed, 2), `D4-SETUP-STATUS` (proposed, 4), `D7-UNDERFLOW-PAYLOAD` (proposed, 2); channel clusters: `av-mic` (1), `av-shared` (1), `av-video` (3), `media-playback` (7).
+
+### child-1-control-sdp: Control, authentication, service discovery and channel negotiation
+
+- **Confirmed fix needed (`0` diffs)**: none yet — all open items in this domain require research or phone verification first.
+- **Research needed (`23` diffs = `14` schema/deferred + `9` needs-phone-evidence)**: findings: `D14-SENTINEL-IDS` (deferred, 3), `D16-SDP-ORDER` (proposed, 0), `D17-OPEN-DIR-CLAIM` (proposed, 1), `D8-SDQ-45-SEMANTICS` (deferred, 7), `D9-SDR-F16` (proposed, 8); channel clusters: `control` (4).
+
+### child-3-display-ui-theming: Display, video configuration, UI theming and overlays
+
+- **Confirmed fix needed (`6` diffs)**: findings: `D1-800A-NAME` (4), `D2-8012-MISSING` (2).
+- **Research needed (`20` diffs = `14` schema/deferred + `6` needs-phone-evidence)**: findings: `D25-VID-COLOR-SCHEME` (proposed, 6), `D3-UICFG-PAYLOAD` (deferred, 3), `D30-AV-OVERLAYS-800D-8010` (deferred, 11).
+
+### child-4-input-nav-sensors: Input, navigation, sensors and vehicle services
+
+- **Confirmed fix needed (`0` diffs)**: none yet — all open items in this domain require research or phone verification first.
+- **Research needed (`69` diffs = `65` schema/deferred + `4` needs-phone-evidence)**: findings: `D26-SEN-EV-ENERGY` (deferred, 4), `D28-INPUT-TS-UNITS` (proposed, 4), `D35-NAV-EV-FORECAST` (deferred, 7), `D36-NAV-MANEUVER-EXT` (deferred, 10); channel clusters: `navigation` (35), `sensor` (9).
+
+### child-5-wireless-bt-radio: Wireless projection, Bluetooth, radio and remaining services
+
+- **Confirmed fix needed (`0` diffs)**: none yet — all open items in this domain require research or phone verification first.
+- **Research needed (`110` diffs = `89` schema/deferred + `21` needs-phone-evidence)**: findings: `D10-STATUS-EXTRA` (deferred, 4), `D27-WIFI-CRED-STATUS` (proposed, 8), `D31-RADIO-HAL2-GAP` (deferred, 77), `D33-CAR-INTENT-SERVICE` (proposed, 1), `D37-BT-PHONE-NAME` (proposed, 3); channel clusters: `bluetooth` (4), `phone-status` (1), `wireless-bootstrap` (12).
 
 ## Implementation children (prioritized, checked against open issues)
 
