@@ -2,17 +2,22 @@
 #pragma once
 #include <aa/helper/SystemHelper.hpp>
 #include <memory>
+#include <string>
 
 namespace aa::helper {
 class BluezBackend final : public Backend {
 public:
     using Now = std::function<std::chrono::steady_clock::time_point()>;
-    explicit BluezBackend(const std::string& bus_address, Now now = std::chrono::steady_clock::now);
+    explicit BluezBackend(const std::string& bus_address, Now now = std::chrono::steady_clock::now,
+                          const std::string& state_directory = "/var/lib/aa-system-helper",
+                          std::uint32_t state_owner = 0);
     ~BluezBackend() override;
     bool available() const;
     core::Result<bool> bond_confirmed() override;
     core::Result<PairingComparison> comparison() override;
     core::Result<void> respond_comparison(ComparisonResponse) override;
+    // Why persistent managed-bond state was rejected at startup; empty when it loaded.
+    std::string state_error() const;
     core::Result<State> apply(Action, std::uint32_t) override;
     core::Result<ObservedPeer> observe() override;
     core::Result<State> authorize(std::uint64_t) override;

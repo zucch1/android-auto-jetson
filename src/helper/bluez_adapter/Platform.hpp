@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <aa/helper/BluezBackend.hpp>
+#include "ManagedPeers.hpp"
 #include <aa/helper/Bootstrap.hpp>
 #include <gio/gio.h>
 #include <chrono>
@@ -38,7 +39,7 @@ struct BluezBackend::Impl {
     bool registered{}, agent_registered{};
     std::vector<std::string> adapters;
     std::map<std::uint64_t, Observation> observations;
-    std::vector<PeerIdentity> managed;
+    bluez_adapter::ManagedPeers managed;
     std::optional<Observation> allowed;
     Clock::time_point window{};
     bool pairing_enabled{};
@@ -62,7 +63,7 @@ struct BluezBackend::Impl {
     SnapshotFence fence;
     HandoffFailure last_failure{HandoffFailure::none};
     Clock::time_point next_check{};
-    Impl(const std::string&, Now);
+    Impl(const std::string&, Now, const std::string&, std::uint32_t);
     ~Impl();
     GVariant* call(const char*, const char*, const char*, GVariant*, const GVariantType* = nullptr);
     bool current_owner();
@@ -82,7 +83,6 @@ struct BluezBackend::Impl {
     bool exact(const Observation&, bool require_bond);
     bool permitted(const char*, bool pairing);
     std::optional<Observation> consume(std::uint64_t);
-    void remember(const PeerIdentity&);
     void watch_continuity();
     void drain_events();
     void lost_path(const std::string&);

@@ -23,7 +23,8 @@ constexpr auto interfaces = R"(<node>
 <method name="DisplayPasskey"><arg type="o" direction="in"/><arg type="u" direction="in"/><arg type="q" direction="in"/></method>
 </interface></node>)";
 }
-BluezBackend::Impl::Impl(const std::string& address, Now clock) : now(std::move(clock)) {
+BluezBackend::Impl::Impl(const std::string& address, Now clock, const std::string& state, std::uint32_t state_owner)
+    : now(std::move(clock)), managed(state, state_owner) {
     context = g_main_context_new();
     g_main_context_push_thread_default(context);
     GError* error = nullptr;
@@ -183,9 +184,11 @@ bool BluezBackend::Impl::ensure() {
     g_variant_unref(reply);
     return register_profiles();
 }
-BluezBackend::BluezBackend(const std::string& address, Now now) : impl_(std::make_unique<Impl>(address, std::move(now))) {}
+BluezBackend::BluezBackend(const std::string& address, Now now, const std::string& state, std::uint32_t state_owner)
+    : impl_(std::make_unique<Impl>(address, std::move(now), state, state_owner)) {}
 BluezBackend::~BluezBackend() = default;
-bool BluezBackend::available() const { return impl_->bus && !g_dbus_connection_is_closed(impl_->bus); }
+std::string BluezBackend::state_error() const { return impl_->managed.reason(); }
+bool BluezBackend::available() const { return impl_->managed.valid() && impl_->bus && !g_dbus_connection_is_closed(impl_->bus); }
 core::Result<ObservedPeer> BluezBackend::handoff() {
     if (impl_->bootstrap && impl_->bootstrap->expire()) impl_->last_failure = impl_->bootstrap->failure();
     if (!impl_->bootstrap || (!impl_->bootstrap->live() && !impl_->bootstrap->complete()) || !impl_->connected) return Error{ErrorCode::helper_rejected};

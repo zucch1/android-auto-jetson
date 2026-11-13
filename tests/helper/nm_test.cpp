@@ -366,7 +366,7 @@ protected:
     }
     void start() {
         daemon.start({std::string{AA_HELPER_BUILD} + "/aa-system-helper", "--private-bus", address, directory.string(), "--combined", (directory / "commands").string()});
-        auto connection = BusClient::private_bus(address, *store); ASSERT_TRUE(connection); client = std::move(connection.value());
+        auto connection = BusClient::private_bus_for_test(address, *store); ASSERT_TRUE(connection); client = std::move(connection.value());
         ASSERT_TRUE(eventually([this] { return client->status(Action::ap_status).has_value(); }));
     }
     void acquire(std::uint64_t generation = 1) {
@@ -583,7 +583,7 @@ TEST_F(NmDaemon, ComposedBootstrapUsesRealBusClientAndRfcommBytes) {
     HandoffFailure failure{}; auto peer = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(peer);
     const auto handle = peer.value().handle;
     EXPECT_FALSE(client->get_ap_credentials({2, 2}, handle)); EXPECT_FALSE(client->get_ap_credentials({1, 1}, handle + 1));
-    auto rogue = BusClient::private_bus(address, *store); ASSERT_TRUE(rogue);
+    auto rogue = BusClient::private_bus_for_test(address, *store); ASSERT_TRUE(rogue);
     EXPECT_FALSE(rogue.value()->get_ap_credentials({1, 1}, handle));
     auto snapshot = client->get_ap_credentials({1, 1}, handle); ASSERT_TRUE(snapshot);
     EXPECT_EQ(bluez.command("wire-read"), "open");
@@ -665,9 +665,15 @@ TEST_F(NmDaemon, ComposedReplacementInSameAdmissionNeedsFreshHandleAuthorization
     EXPECT_TRUE(client->get_ap_credentials({1, 1}, third.value().handle));
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, third.value().handle, true, true));
 }
+// The mock phone was admitted by an earlier helper run: reconnect never creates
+// revocation authority, so the persisted managed-bond state must already name it.
+void seed_managed_phone(const std::filesystem::path& directory) {
+    save(directory / "managed-bonds", "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n");
+}
 TEST_F(NmDaemon, ExpiredHandoffRejectsOnUseWithoutPlatformTick) {
+    seed_managed_phone(directory);
     const auto began = Clock::now(); std::atomic<std::int64_t> elapsed{};
-    BluezBackend bluetooth{address, [&] { return began + std::chrono::milliseconds{elapsed.load()}; }};
+    BluezBackend bluetooth{address, [&] { return began + std::chrono::milliseconds{elapsed.load()}; }, directory.string(), ::getuid()};
     ASSERT_TRUE(bluetooth.apply(Action::register_profile, 0));
     ASSERT_EQ(bluez.command("paired"), "ok"); const auto observed = bluetooth.observe(); ASSERT_TRUE(observed);
     ASSERT_TRUE(bluetooth.reconnect_peer(observed.value().handle));
@@ -684,7 +690,7 @@ TEST_F(NmDaemon, NearExpiryDelayedCollectionClosesSocketAndReturnsEmptyTypedErro
     BluezBackend bluetooth{address, [&] {
         const auto resumed = resumed_at.load();
         return began + std::chrono::milliseconds{offset.load()} + (resumed ? Clock::now().time_since_epoch() - Clock::duration{resumed} : Clock::duration{});
-    }};
+    }, directory.string(), ::getuid()};
     Backend ap{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
         private_commands((directory / "commands").string())};
     BackendRouter router{{ap, bluetooth}};
@@ -692,7 +698,7 @@ TEST_F(NmDaemon, NearExpiryDelayedCollectionClosesSocketAndReturnsEmptyTypedErro
     const auto digest = crypto_adapter::hash_executable(fd, Clock::now() + 1s); ::close(fd); ASSERT_TRUE(digest);
     auto service = BusService::private_bus(address, {::getuid(), digest.value()}, router); ASSERT_TRUE(service);
     std::jthread pump{[&](const std::stop_token& stop) { while (!stop.stop_requested()) if (!service.value().cycle()) return; }};
-    auto connected = BusClient::private_bus(address, *store); ASSERT_TRUE(connected); client = std::move(connected.value());
+    auto connected = BusClient::private_bus_for_test(address, *store); ASSERT_TRUE(connected); client = std::move(connected.value());
     acquire(); ASSERT_TRUE(state(State::active));
     ASSERT_EQ(bluez.command("paired"), "ok"); ASSERT_EQ(bluez.command("NewConnection"), "allowed");
     HandoffFailure failure{}; const auto peer = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(peer);
@@ -726,8 +732,9 @@ TEST_F(NmDaemon, ComposedBssidChangeAfterFetchFailsBeforeEndpoint) {
     EXPECT_FALSE(client->poll_bootstrap({1, 1}, failure)); EXPECT_EQ(failure, HandoffFailure::snapshot);
 }
 TEST_F(NmDaemon, AcceptedBootstrapOutlivesAdmissionButNotItsOwnTenSeconds) {
+    seed_managed_phone(directory);
     const auto began = Clock::now(); std::atomic<std::int64_t> elapsed{};
-    BluezBackend bluetooth{address, [&] { return began + std::chrono::milliseconds{elapsed.load()}; }};
+    BluezBackend bluetooth{address, [&] { return began + std::chrono::milliseconds{elapsed.load()}; }, directory.string(), ::getuid()};
     ASSERT_TRUE(bluetooth.apply(Action::register_profile, 0));
     ASSERT_EQ(bluez.command("paired"), "ok"); const auto observed = bluetooth.observe(); ASSERT_TRUE(observed);
     ASSERT_TRUE(bluetooth.reconnect_peer(observed.value().handle));

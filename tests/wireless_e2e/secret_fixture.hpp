@@ -42,7 +42,7 @@ protected:
         ASSERT_EQ(::posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO), 0);
         const auto spawned = ::posix_spawn(&daemon.pid, argv[0], &actions, nullptr, argv.data(), environ);
         ::posix_spawn_file_actions_destroy(&actions); ASSERT_EQ(spawned, 0);
-        auto connection = BusClient::private_bus(address, *store);
+        auto connection = BusClient::private_bus_for_test(address, *store);
         ASSERT_TRUE(connection); client = std::move(connection.value());
         ASSERT_TRUE(eventually([this] { return client->status(Action::ap_status).has_value(); }));
     }

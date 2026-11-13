@@ -16,7 +16,6 @@ void BluezBackend::Impl::retire_unaccepted() {
             if (!reply) return false;
             g_variant_unref(reply);
         }
-        std::erase(managed, peer);
         return true;
     });
 }
@@ -27,6 +26,7 @@ core::Result<bool> BluezBackend::bond_confirmed() {
     if (!impl_->exact(captured, false) || !impl_->allowed) return Error{ErrorCode::helper_rejected};
     if (!impl_->comparison_accepted || !impl_->exact(captured, true)) return false;
     if (!impl_->allowed || impl_->now() >= impl_->window) return Error{ErrorCode::helper_rejected};
+    if (!impl_->managed.remember(captured.device.identity)) return Error{ErrorCode::helper_rejected};
     std::erase(impl_->unaccepted, captured.device.identity);
     return true;
 }

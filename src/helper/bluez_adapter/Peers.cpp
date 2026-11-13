@@ -87,9 +87,6 @@ std::optional<BluezBackend::Impl::Observation> BluezBackend::Impl::consume(std::
     if (now() >= observed.expires || !exact(observed, false)) return std::nullopt;
     return observed;
 }
-void BluezBackend::Impl::remember(const PeerIdentity& identity) {
-    if (std::find(managed.begin(), managed.end(), identity) == managed.end()) managed.push_back(identity);
-}
 core::Result<ObservedPeer> BluezBackend::observe() {
     if (!impl_->ensure()) return Error{ErrorCode::helper_unavailable};
     std::vector<Impl::Device> devices;
@@ -104,7 +101,7 @@ core::Result<ObservedPeer> BluezBackend::observe() {
 }
 core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     const auto observed = impl_->consume(handle);
-    if (!observed || impl_->allowed || impl_->managed.size() >= 256) return Error{ErrorCode::helper_rejected};
+    if (!observed || impl_->allowed) return Error{ErrorCode::helper_rejected};
     if (impl_->unaccepted.size() >= 256 ||
         std::find(impl_->unaccepted.begin(), impl_->unaccepted.end(), observed->device.identity) != impl_->unaccepted.end())
         return Error{ErrorCode::helper_rejected};
@@ -113,7 +110,6 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     impl_->comparison_used = false;
     impl_->comparison_accepted = false;
     impl_->unaccepted.push_back(observed->device.identity);
-    impl_->remember(observed->device.identity);
     impl_->window = impl_->now() + std::chrono::seconds(60);
     if (!impl_->set(observed->device.adapter_path, "PairableTimeout", g_variant_new_uint32(60)) ||
         !impl_->set(observed->device.adapter_path, "DiscoverableTimeout", g_variant_new_uint32(60)) ||
@@ -126,18 +122,20 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
 }
 core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     const auto observed = impl_->consume(handle);
-    if (!observed || !impl_->exact(*observed, true) || impl_->managed.size() >= 256) return Error{ErrorCode::helper_rejected};
+    // Only a bond this helper itself admitted may reconnect: a reconnect never
+    // creates revocation authority for a bond the helper did not create, and it
+    // needs no write, so it keeps working when state persistence is failing.
+    if (!observed || !impl_->exact(*observed, true) || !impl_->managed.contains(observed->device.identity)) return Error{ErrorCode::helper_rejected};
     impl_->close_window();
     impl_->allowed = *observed;
     impl_->window = impl_->now() + std::chrono::seconds(60);
-    impl_->remember(observed->device.identity);
     // The AA profile is a server: the bonded phone initiates RFCOMM. No generic
     // Device1.Connect (which could activate unrelated audio profiles) is used.
     return State::active;
 }
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     if (!address_valid(identity.address) || !address_valid(identity.adapter) ||
-        std::find(impl_->managed.begin(), impl_->managed.end(), identity) == impl_->managed.end()) return Error{ErrorCode::helper_rejected};
+        !impl_->managed.contains(identity)) return Error{ErrorCode::helper_rejected};
     if (!impl_->current_owner()) return Error{ErrorCode::helper_unavailable};
     if ((impl_->allowed && impl_->allowed->device.identity == identity) ||
         (impl_->connected && impl_->connected->device.identity == identity)) impl_->close_window();

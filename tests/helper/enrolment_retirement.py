@@ -17,6 +17,7 @@ def run(build: Path, directory: Path, failure: str) -> None:
         surface.confirm(request)
         command(surface.mock, "comparison-start")
         challenge = present(surface, request)
+        assert not (directory / "managed-bonds").exists(), "pending enrolment wrote managed authority"
         assert surface.phone() == 0, "unaccepted comparison must never persist trust"
         # Simulate a bond appearing before consent. Retirement must remove it.
         command(surface.mock, "paired")
@@ -45,6 +46,7 @@ def run(build: Path, directory: Path, failure: str) -> None:
                 command(surface.mock, "allow-inventory")
         wait(lambda: len(surface.state()["removed"]) == 1, 5)
         assert not surface.state()["properties"]["Pairable"]
+        assert not (directory / "managed-bonds").exists(), "failed pending enrolment wrote managed authority"
         assert not (directory / "store").exists(), "failed pending enrolment wrote durable trust"
         if failure != "restart":
             assert surface.phone() == 0
