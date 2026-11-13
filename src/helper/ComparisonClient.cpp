@@ -2,6 +2,16 @@
 #include "BusClientImpl.hpp"
 
 namespace aa::helper {
+core::Result<bool> BusClient::bond_confirmed(core::ConsumerId generation, core::PairingRequestId request) {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until)) return Error{ErrorCode::timeout};
+    MessageWriter writer; writer.put_u64(generation.value).put_u64(request.value);
+    const auto result = impl_->rpc("PairingBondConfirmedV1", "tt", writer, until);
+    if (!result) return result.error();
+    if (result.value() > 1) return Error{ErrorCode::helper_protocol_mismatch};
+    return result.value() == 1;
+}
 core::Result<PairingComparison> BusClient::comparison(core::ConsumerId generation, core::PairingRequestId request) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
     std::unique_lock lock{impl_->mutex, std::defer_lock};

@@ -56,6 +56,7 @@ def affirmative(surface: Surface, request: int) -> None:
 def negative_comparisons(surface: Surface) -> None:
     from bluez_runtime import command, control, rejected, wait
     for action in ("reject", "cancel", "Cancel", "recreate", "adapter-recreate", "observe-other", "release-name", "consumer-loss"):
+        command(surface.mock, "restore")
         command(surface.mock, "observe-first")
         request = surface.request()
         surface.confirm(request)
@@ -87,7 +88,11 @@ def negative_comparisons(surface: Surface) -> None:
                 "RequestName", GLib.Variant("(su)", ("org.custom.BluezConsumer", 0)), None, 0, 1000, None)
             control(surface.consumer, "RegisterConsumer", GLib.Variant("(s)", ("org.custom.BluezConsumer",)))
         if action not in ("cancel", "consumer-loss"):
-            surface.cancel(request)
+            try:
+                surface.cancel(request)
+            except GLib.Error:
+                pass  # helper rejection may already have retired the pending request
+        assert surface.phone() == 0
         rejected(surface.consumer, "RespondPairingComparison", response)
     print("PASS comparison_reject_cancel_peer_incarnation_owner_and_consumer_loss", flush=True)
 
@@ -135,7 +140,7 @@ def probe_flow(surface: Surface) -> None:
     assert rpc(f"respond 4 {challenge}")[0] == 1001
     assert command(surface.mock, "comparison-result") == "pending"
     command(surface.mock, "paired")
-    assert command(surface.mock, "NewConnection") == "allowed"
+    assert command(surface.mock, "NewConnection") == "rejected"
     error, expired_grant = rpc("issue 4")
     assert error == 0
     started = time.monotonic()
@@ -148,4 +153,5 @@ def probe_flow(surface: Surface) -> None:
     assert rpc(f"open {expired_grant}")[0] == 1001
     assert command(surface.mock, "fd-eof") == "closed"
     assert command(surface.mock, "RequestAuthorization") == "rejected"
+    wait(lambda: len(surface.state()["removed"]) == 1)
     print("PASS comparison_timeout_wrong_source_and_monotonic60s_idle_expiry", flush=True)

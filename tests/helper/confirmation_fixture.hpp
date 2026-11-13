@@ -20,6 +20,17 @@ public:
     std::vector<helper::RevocationV1> snapshots;
     std::optional<helper::PeerIdentity> prepared;
     std::optional<helper::PairingComparison> challenge;
+    bool comparison_required{};
+    bool requires_comparison() const override { return comparison_required; }
+    bool bonded{true};
+    bool fail_after_response{};
+    bool approved_at_bond{};
+    core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) override {
+        approved_at_bond = !store.phones().empty();
+        if (fail_after_response && responses) return Error{ErrorCode::helper_unavailable};
+        if (!result) return result.error();
+        return bonded;
+    }
     int responses{};
     helper::ComparisonResponse response;
     core::ConsumerId response_generation;

@@ -164,6 +164,11 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
         } else if (command == "seed-wired") {
             const auto approved = store.approve(trust::WiredIdentity{"18d1", "2d00", "wired-fixture", "Google", "AA", "wired", "1-2"});
             result = approved ? core::Result<void>{} : core::Result<void>{approved.error()};
+        } else if (command == "reload-store") {
+            result = store.load();
+        } else if (command == "pending-pairings") {
+            std::cout << phones.pending_count() << '\n' << std::flush;
+            continue;
         } else if (command == "refresh") {
             service.value().service().refresh_consumer_owner();
             result = {};

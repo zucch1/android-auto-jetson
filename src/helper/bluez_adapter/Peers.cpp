@@ -105,9 +105,14 @@ core::Result<ObservedPeer> BluezBackend::observe() {
 core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     const auto observed = impl_->consume(handle);
     if (!observed || impl_->allowed || impl_->managed.size() >= 256) return Error{ErrorCode::helper_rejected};
+    if (impl_->unaccepted.size() >= 256 ||
+        std::find(impl_->unaccepted.begin(), impl_->unaccepted.end(), observed->device.identity) != impl_->unaccepted.end())
+        return Error{ErrorCode::helper_rejected};
     impl_->allowed = *observed;
     impl_->pairing_enabled = true;
     impl_->comparison_used = false;
+    impl_->comparison_accepted = false;
+    impl_->unaccepted.push_back(observed->device.identity);
     impl_->remember(observed->device.identity);
     impl_->window = impl_->now() + std::chrono::seconds(60);
     if (!impl_->set(observed->device.adapter_path, "PairableTimeout", g_variant_new_uint32(60)) ||

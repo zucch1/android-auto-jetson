@@ -6,6 +6,7 @@
 namespace aa::helper {
 bool BluezBackend::Impl::permitted(const char* path, bool pairing) {
     if (pairing && !pairing_enabled) return false;
+    if (!pairing && pairing_enabled && !comparison_accepted) return false;
     if (!allowed || now() >= window) { close_admission(); return false; }
     const auto captured = *allowed;
     if (captured.device.path != path || !exact(captured, !pairing)) return false;

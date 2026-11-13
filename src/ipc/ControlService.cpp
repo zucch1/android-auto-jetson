@@ -47,6 +47,8 @@ void ControlService::refresh_consumer_owner() {
         return;
     }
     if (open_pairing_ && std::chrono::steady_clock::now() >= open_pairing_->deadline) {
+        phones_.pairing_cancelled(open_pairing_->request);
+        events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_expired", open_pairing_->request.value});
         const auto request = open_pairing_->request;
         if (confirmation_ != nullptr) confirmation_->cancel(registered_->consumer, request);
         (void)gate_.cancel({registered_->consumer, registered_->name}, request);
@@ -56,6 +58,17 @@ void ControlService::refresh_consumer_owner() {
     const auto owner = credentials_.name_owner(registered_->name);
     if (!owner.has_value() || !(owner.value() == registered_->connection)) {
         teardown("consumer_owner_lost", DiagnosticSeverity::warning);
+    }
+    if (registered_) {
+        advance_enrolment();
+        if (!registered_) return;
+        for (const auto request : phones_.reap_expired()) {
+            if (confirmation_) confirmation_->cancel(registered_->consumer, request);
+            (void)gate_.cancel({registered_->consumer, registered_->name}, request);
+            if (open_pairing_ && open_pairing_->request == request) open_pairing_.reset();
+            events_.emit(PairingClosed{request});
+            events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_expired", request.value});
+        }
     }
 }
 

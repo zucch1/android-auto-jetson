@@ -28,6 +28,8 @@ public:
     core::Result<void> authorize_bootstrap(Source, std::uint64_t handle, bool allow, bool listener_ready);
     core::Result<ApSnapshot> get_ap_credentials(Source, std::uint64_t handle);
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override;
+    bool requires_comparison() const override { return true; }
+    core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) override;
     core::Result<PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) override;
     core::Result<void> respond_comparison(core::ConsumerId, core::PairingRequestId, ComparisonResponse) override;
     void cancel(core::ConsumerId, core::PairingRequestId) override;

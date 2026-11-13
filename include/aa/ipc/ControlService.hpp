@@ -247,6 +247,9 @@ private:
 
     [[nodiscard]] core::Result<Registered> require_consumer();
     [[nodiscard]] core::Result<void> admit(const BusName& caller, const Registered& active);
+    core::Result<void> persist_pairing(const Registered&, core::PairingRequestId);
+    void close_enrolment(std::string_view reason);
+    void advance_enrolment();
     struct PendingRevocation {
         helper::RevocationV1 snapshot;
         helper::RevocationProgress progress;
@@ -272,6 +275,8 @@ private:
         std::optional<helper::PeerIdentity> peer;
         std::chrono::steady_clock::time_point deadline;
         std::optional<std::uint64_t> presented_comparison{};
+        bool awaiting_acceptance{};
+        bool accepted{};
     };
     std::optional<OpenPairing> open_pairing_;
 };

@@ -18,6 +18,7 @@ from gi.repository import Gio, GLib
 
 from bluez_runtime import Surface, command, control, rejected, wait
 from private_bus import line, process
+from comparison_cases import present
 
 
 class NmState(TypedDict):
@@ -38,6 +39,15 @@ class ComposedSurface(Surface):
         self.nm = stack.enter_context(process([str(build / "aa_nm_ap_test"), "--wire-double", self.address, socket], self.env))
         assert line(self.nm) == "ready"
         return ["--combined", socket]
+
+    def confirm(self, request: int, wrong: bool = False) -> None:
+        super().confirm(request)
+        command(self.mock, "comparison-start wrong" if wrong else "comparison-start")
+        challenge = present(self, request)
+        control(self.consumer, "RespondPairingComparison",
+                GLib.Variant("(ttb)", (request, int(challenge["challenge_id"]), True)))
+        command(self.mock, "paired")
+        wait(lambda: command(self.receiver, "pending-pairings") == "0")
 
     def nm_state(self) -> NmState:
         return json.loads(command(self.nm, "state"))
@@ -279,7 +289,7 @@ def pending_bind_survives_lease_owner_forget(surface: ComposedSurface) -> None:
     assert command(surface.mock, "RequestAuthorization wrong") == "rejected"
     # Then: B's original bound observation still authorizes, without re-observing.
     print("A retired; confirming B's original pending observation", flush=True)
-    surface.confirm(request_b)
+    surface.confirm(request_b, wrong=True)
     assert surface.phone() not in (0, phone_a)
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     assert command(surface.mock, "RequestAuthorization wrong") == "allowed"

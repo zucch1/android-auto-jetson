@@ -78,6 +78,13 @@
       <arg name="error" type="u" direction="out"/>
       <arg name="state" type="t" direction="out"/>
     </method>
+    <!-- True only after explicit comparison acceptance and an exact bonded snapshot. -->
+    <method name="PairingBondConfirmedV1">
+      <arg name="generation" type="t" direction="in"/>
+      <arg name="request" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="bonded" type="t" direction="out"/>
+    </method>
     <method name="GetPairingComparisonV1">
       <arg name="consumer_generation" type="t" direction="in"/>
       <arg name="request_source" type="t" direction="in"/>

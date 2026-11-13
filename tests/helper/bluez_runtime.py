@@ -139,6 +139,7 @@ def authorization_flow(surface: Surface) -> None:
     affirmative(surface, request)
     assert command(surface.mock, "AuthorizeService") == "rejected"
     command(surface.mock, "paired")
+    wait(lambda: surface.phone() != 0)
     assert command(surface.mock, "AuthorizeService audio") == "rejected"
     assert command(surface.mock, "AuthorizeService ag") == "rejected"
     assert command(surface.mock, "AuthorizeService hfp") == "allowed"
@@ -189,7 +190,9 @@ def revocation_flow(surface: Surface) -> None:
 def bond_retry_flow(surface: Surface) -> None:
     request = surface.request()
     surface.confirm(request)
+    affirmative(surface, request)
     command(surface.mock, "paired")
+    wait(lambda: surface.phone() != 0)
     command(surface.mock, "fail-remove")
     phone = surface.phone()
     rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (phone,)))
@@ -207,7 +210,10 @@ def unknown_bond_state_flow(surface: Surface) -> None:
     surface.confirm(request)
     command(surface.mock, "paired")
     command(surface.mock, "fail-inventory")
-    surface.cancel(request)
+    try:
+        surface.cancel(request)
+    except GLib.Error:
+        pass  # the failed helper health check may already retire enrollment
     command(surface.mock, "allow-inventory")
     assert not surface.state()["properties"]["Pairable"]
     assert surface.state()["cancel_unpaired"] == 0
@@ -218,7 +224,9 @@ def loss_flow(surface: Surface) -> None:
     command(surface.mock, "restore")
     request = surface.request()
     surface.confirm(request)
+    affirmative(surface, request)
     command(surface.mock, "paired")
+    wait(lambda: surface.phone() != 0)
     assert command(surface.mock, "NewConnection") == "allowed"
     surface.receiver.kill()
     surface.receiver.wait(timeout=3)

@@ -53,7 +53,14 @@ struct BusService::Impl {
         std::uint64_t snapshot_handle{};
         if (message.path == kObjectPath && message.interface_name == kInterface &&
             !message.sender.empty() && message.sender.front() == ':') {
-            if ((comparison_poll || message.member == "RespondPairingComparisonV1") &&
+            if (message.member == "PairingBondConfirmedV1" && message.signature == "tt") {
+                const auto generation = body.read_u64(); const auto request = body.read_u64();
+                if (generation && request && body.done()) {
+                    const auto bonded = helper.bond_confirmed(message.sender, {generation.value(), request.value()});
+                    result = bonded ? core::Result<std::uint64_t>{bonded.value() ? 1U : 0U} :
+                                      core::Result<std::uint64_t>{bonded.error()};
+                }
+            } else if ((comparison_poll || message.member == "RespondPairingComparisonV1") &&
                 message.signature == (comparison_poll ? "tt" : "tttu")) {
                 const auto generation = body.read_u64(); const auto request = body.read_u64();
                 if (generation && request) {

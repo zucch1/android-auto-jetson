@@ -37,7 +37,20 @@ protected:
     void SetUp() override {
         HelperConfirmation::SetUp();
         bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
+        bridge.comparison_required = true;
         bridge.challenge = helper::PairingComparison{79, 42, *bridge.prepared};
+    }
+    void expect_empty() {
+        EXPECT_TRUE(store.phones().empty()); EXPECT_EQ(phones.pending_count(), 0U);
+        trust::ApprovedPhoneStore reopened{directory / "store"}; ASSERT_TRUE(reopened.load());
+        EXPECT_TRUE(reopened.phones().empty());
+        EXPECT_TRUE(std::any_of(events.events.begin(), events.events.end(), [](const auto& event) {
+            const auto* diagnostic = std::get_if<ipc::DiagnosticEmitted>(&event);
+            return diagnostic && (diagnostic->event == "pairing_comparison_rejected" ||
+                diagnostic->event == "pairing_closed" || diagnostic->event == "pairing_expired" ||
+                diagnostic->event == "consumer_owner_lost" || diagnostic->event == "consumer_unregistered" ||
+                diagnostic->event == "pairing_snapshot_invalidated" || diagnostic->event == "pairing_helper_failed");
+        }));
     }
     core::PairingRequestId enroll() {
         const auto request = control.request_add_phone(caller);
@@ -48,12 +61,12 @@ protected:
     }
 };
 TEST_F(ComparisonControl, UnseenNumberCannotBeApprovedByEnrollmentConfirmation) {
-    // Given: an approved identity and an open enrollment, but no number retrieved.
+    // Given: a pending identity and an open enrollment, but no number retrieved.
     const auto request = enroll();
     // When: the consumer tries to approve the challenge without presenting it.
     EXPECT_FALSE(control.respond_pairing_comparison(caller, request, {79, true}));
     // Then: nothing reaches the helper response seam and store semantics stay intact.
-    EXPECT_EQ(bridge.responses, 0); EXPECT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(bridge.responses, 0); EXPECT_TRUE(store.phones().empty());
 }
 TEST_F(ComparisonControl, RetrievedNumberHasSixDigitsAndBindsOriginalSnapshot) {
     const auto request = enroll();
@@ -182,4 +195,75 @@ TEST_F(ComparisonControl, CancelledRequestCannotAnswerAndDiagnosticsContainNoNum
         }
     }
 }
+TEST_F(ComparisonControl, RejectionLeavesNoApprovalOrPending) {
+    const auto request = enroll();
+    ASSERT_TRUE(control.pairing_comparison(caller, request));
+    ASSERT_TRUE(control.respond_pairing_comparison(caller, request, {79, false}));
+    expect_empty();
+    EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U);
+}
+TEST_F(ComparisonControl, CancellationLeavesNoApprovalOrPending) {
+    const auto request = enroll();
+    ASSERT_TRUE(control.cancel_phone_pairing(caller, request));
+    expect_empty();
+    EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U);
+}
+TEST_F(ComparisonControl, TimeoutLeavesNoApprovalOrPending) {
+    ComparisonClock clock;
+    enroll(); clock.now += std::chrono::seconds{61}; (void)control.state();
+    expect_empty();
+    EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U);
+}
+TEST_F(ComparisonControl, DisconnectLeavesNoApprovalOrPending) {
+    enroll(); credentials.remove_owner(name); (void)control.state();
+    expect_empty();
+    EXPECT_EQ(bridge.teardowns, 1); EXPECT_EQ(count_closed(), 1U);
+}
+TEST_F(ComparisonControl, ReceiverRestartLeavesNoApprovalOrPending) {
+    enroll(); control.shutdown();
+    trust::ApprovedPhoneStore reopened{directory / "store"}; ASSERT_TRUE(reopened.load());
+    EXPECT_TRUE(reopened.phones().empty()); expect_empty();
+    EXPECT_EQ(bridge.teardowns, 1); EXPECT_EQ(count_closed(), 1U);
+}
+TEST_F(ComparisonControl, StoreReloadInvalidatesPendingEnrollment) {
+    const auto request = enroll(); ASSERT_TRUE(store.load()); (void)control.state();
+    expect_empty();
+    EXPECT_FALSE(control.pairing_comparison(caller, request)); EXPECT_EQ(count_closed(), 1U);
+}
+TEST_F(ComparisonControl, HelperFailureAfterAcceptanceLeavesNoApprovalOrPending) {
+    const auto request = enroll(); ASSERT_TRUE(control.pairing_comparison(caller, request));
+    bridge.fail_after_response = true;
+    (void)control.respond_pairing_comparison(caller, request, {79, true});
+    (void)control.state();
+    expect_empty();
+    EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U);
+}
+
+TEST_F(ComparisonControl, AcceptanceWaitsForBondAcknowledgementBeforePersistence) {
+    bridge.bonded = false;
+    const auto request = enroll(); ASSERT_TRUE(control.pairing_comparison(caller, request));
+    ASSERT_TRUE(control.respond_pairing_comparison(caller, request, {79, true}));
+    EXPECT_TRUE(store.phones().empty()); EXPECT_EQ(phones.pending_count(), 1U);
+    bridge.bonded = true; (void)control.state();
+    ASSERT_EQ(store.phones().size(), 1U); EXPECT_EQ(phones.pending_count(), 0U);
+    EXPECT_FALSE(bridge.approved_at_call);
+    EXPECT_FALSE(bridge.approved_at_bond);
+    trust::ApprovedPhoneStore reopened{directory / "store"}; ASSERT_TRUE(reopened.load());
+    EXPECT_EQ(reopened.phones().size(), 1U);
+}
+
+TEST_F(ComparisonControl, StoreReloadBeforeComparisonOpensRetiresRequest) {
+    const auto request = control.request_add_phone(caller); ASSERT_TRUE(request);
+    ASSERT_TRUE(store.load()); (void)control.state();
+    expect_empty(); EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U);
+    EXPECT_FALSE(control.confirm_phone_pairing(caller, request.value()));
+}
+TEST_F(ComparisonControl, TimeoutBeforeComparisonOpensRetiresRequest) {
+    ComparisonClock clock;
+    const auto request = control.request_add_phone(caller); ASSERT_TRUE(request);
+    clock.now += std::chrono::seconds{61}; (void)control.state();
+    expect_empty(); EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U);
+    EXPECT_FALSE(control.confirm_phone_pairing(caller, request.value()));
+}
+
 }

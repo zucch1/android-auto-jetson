@@ -148,6 +148,7 @@ private:
         core::PairingRequestId request{};
         TransportIdentity identity{};
         core::Nanoseconds deadline{};
+        std::uint64_t reload_epoch{};
     };
 
     [[nodiscard]] std::size_t find(core::PairingRequestId request) const;

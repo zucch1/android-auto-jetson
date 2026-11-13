@@ -50,6 +50,9 @@ struct BluezBackend::Impl {
     };
     std::optional<Comparison> comparison;
     bool comparison_used{};
+    bool comparison_accepted{};
+    std::vector<PeerIdentity> unaccepted;
+    void retire_unaccepted();
     bool quiet_pending{};
     int connection{-1};
     std::shared_ptr<Bootstrap> bootstrap;

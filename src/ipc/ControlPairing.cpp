@@ -69,21 +69,34 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
             confirmation_->cancel(active.value().consumer, request);
             (void)gate_.cancel({active.value().consumer, active.value().name}, request);
             events_.emit(PairingClosed{request});
+            events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_helper_failed", request.value});
             return granted.error();
         }
     }
+    if (confirmation_ && confirmation_->requires_comparison()) {
+        open_pairing_ = OpenPairing{request, {}, phones_.pairing_wireless_identity(request),
+            std::chrono::steady_clock::now() + std::chrono::seconds(60)};
+        open_pairing_->awaiting_acceptance = true;
+        events_.emit(PairingOpened{request});
+        return {};
+    }
+    return persist_pairing(active.value(), request);
+}
+
+core::Result<void> ControlService::persist_pairing(const Registered& active, core::PairingRequestId request) {
+    const bool comparison = open_pairing_ && open_pairing_->request == request && open_pairing_->awaiting_acceptance;
     const auto approved = phones_.pairing_confirmed(request);
     if (!approved) {
-        if (confirmation_ != nullptr) confirmation_->cancel(active.value().consumer, request);
-        (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+        if (confirmation_ != nullptr) confirmation_->cancel(active.consumer, request);
+        (void)gate_.cancel({active.consumer, active.name}, request);
         events_.emit(PairingClosed{request});
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return approved.error();
     }
     open_pairing_ = OpenPairing{request, approved.value(), phones_.wireless_identity(approved.value()),
                                std::chrono::steady_clock::now() + std::chrono::seconds(60)};
-    events_.emit(PairingOpened{request});
-    events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_opened", request.value});
+    if (!comparison) events_.emit(PairingOpened{request});
+    events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, comparison ? "pairing_approved" : "pairing_opened", request.value});
     return {};
 }
 

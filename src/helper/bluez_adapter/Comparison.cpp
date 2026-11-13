@@ -2,6 +2,34 @@
 #include "Platform.hpp"
 
 namespace aa::helper {
+// Retry failed RemoveDevice calls on the helper owner thread. No trust-store identity is needed.
+void BluezBackend::Impl::retire_unaccepted() {
+    if (unaccepted.empty() || !current_owner()) return;
+    std::vector<Device> devices;
+    if (!inventory(devices)) return;
+    std::erase_if(unaccepted, [&](const PeerIdentity& peer) {
+        if (allowed && allowed->device.identity == peer) return false;
+        for (const auto& device : devices) {
+            if (device.identity != peer) continue;
+            auto* reply = call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
+                               g_variant_new("(o)", device.path.c_str()));
+            if (!reply) return false;
+            g_variant_unref(reply);
+        }
+        std::erase(managed, peer);
+        return true;
+    });
+}
+core::Result<bool> BluezBackend::bond_confirmed() {
+    impl_->pump();
+    if (!impl_->allowed) return Error{ErrorCode::helper_rejected};
+    const auto captured = *impl_->allowed;
+    if (!impl_->exact(captured, false) || !impl_->allowed) return Error{ErrorCode::helper_rejected};
+    if (!impl_->comparison_accepted || !impl_->exact(captured, true)) return false;
+    if (!impl_->allowed || impl_->now() >= impl_->window) return Error{ErrorCode::helper_rejected};
+    std::erase(impl_->unaccepted, captured.device.identity);
+    return true;
+}
 void BluezBackend::Impl::reject_comparison() {
     if (!comparison) return;
     auto* invocation = comparison->invocation;
@@ -32,6 +60,7 @@ core::Result<void> BluezBackend::respond_comparison(ComparisonResponse response)
         impl_->now() >= captured.deadline || impl_->now() >= impl_->window) {
         impl_->close_admission(); return Error{ErrorCode::helper_rejected};
     }
+    impl_->comparison_accepted = true;
     auto* invocation = impl_->comparison->invocation;
     impl_->comparison.reset();
     g_dbus_method_invocation_return_value(invocation, nullptr);

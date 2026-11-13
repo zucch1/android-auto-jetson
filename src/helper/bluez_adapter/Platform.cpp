@@ -135,6 +135,7 @@ void BluezBackend::Impl::close_admission() {
     }
     allowed.reset();
     quiet_pending = !quiet();
+    retire_unaccepted();
 }
 void BluezBackend::Impl::close_window() { close_connection(); close_admission(); }
 void BluezBackend::Impl::reset() {
@@ -146,6 +147,7 @@ void BluezBackend::Impl::reset() {
 }
 void BluezBackend::Impl::pump() {
     drain_events();
+    retire_unaccepted();
     if (comparison && now() >= comparison->deadline) close_admission();
     if (now() >= next_check) {
         const bool alive = current_owner();

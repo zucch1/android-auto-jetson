@@ -53,6 +53,10 @@ struct RevocationAttempt final {
 class Confirmation {
 public:
     virtual ~Confirmation() = default;
+    virtual bool requires_comparison() const { return false; }
+    virtual core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) {
+        return Error{ErrorCode::helper_rejected};
+    }
     virtual core::Result<PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) {
         return Error{ErrorCode::helper_rejected};
     }

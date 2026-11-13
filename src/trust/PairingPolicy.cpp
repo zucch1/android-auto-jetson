@@ -36,7 +36,7 @@ std::optional<helper::PeerIdentity> PairingPolicy::wireless_identity(core::Phone
 }
 std::optional<helper::PeerIdentity> PairingPolicy::pairing_wireless_identity(core::PairingRequestId request) const {
     const auto index = find(request);
-    if (index < pending_.size()) {
+    if (index < pending_.size() && pending_[index].reload_epoch == store_.reload_epoch()) {
         if (const auto* wireless = std::get_if<WirelessIdentity>(&pending_[index].identity))
             return helper::PeerIdentity{wireless->bond_address, wireless->adapter};
     }
@@ -67,7 +67,7 @@ std::vector<core::PairingRequestId> PairingPolicy::reap_expired() {
     std::vector<core::PairingRequestId> expired;
     const core::Nanoseconds now = clock_.now();
     for (std::size_t index = 0; index < pending_.size();) {
-        if (now.count > pending_[index].deadline.count) {
+        if (now.count > pending_[index].deadline.count || pending_[index].reload_epoch != store_.reload_epoch()) {
             expired.push_back(pending_[index].request);
             drop_at(index);  // rejected and never persisted
             continue;
@@ -158,7 +158,7 @@ core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId reque
     const core::Nanoseconds now = clock_.now();
     pending_.push_back(Pending{
         request, *candidate_,
-        core::Nanoseconds{now.count + core::to_nanoseconds(kConfirmWindow).count}});
+        core::Nanoseconds{now.count + core::to_nanoseconds(kConfirmWindow).count}, store_.reload_epoch()});
     return {};
 }
 
@@ -168,7 +168,7 @@ core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingReques
         return Error{ErrorCode::trust_unknown_phone};
     }
     const core::Nanoseconds now = clock_.now();
-    if (now.count > pending_[index].deadline.count) {
+    if (now.count > pending_[index].deadline.count || pending_[index].reload_epoch != store_.reload_epoch()) {
         drop_at(index);  // rejected and never persisted; the caller owns this
                          // id's gate rollback and PairingClosed
         return Error{ErrorCode::session_pairing_timeout};

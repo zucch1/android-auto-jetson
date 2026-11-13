@@ -14,6 +14,12 @@ public:
                          std::function<void(core::ConsumerId)> lost)
         : target_(target), active_(std::move(active)), lost_(std::move(lost)) {}
     ~WirelessConfirmation() override { flush(true); }
+    bool requires_comparison() const override { return target_.requires_comparison(); }
+    core::Result<bool> bond_confirmed(core::ConsumerId generation, core::PairingRequestId request) override {
+        flush();
+        if (deferred_) return Error{ErrorCode::helper_rejected};
+        return target_.bond_confirmed(generation, request);
+    }
     core::Result<void> confirmed(core::ConsumerId generation, core::PairingRequestId source) override {
         flush();
         if (deferred_) return Error{ErrorCode::helper_rejected};
