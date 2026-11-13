@@ -36,6 +36,14 @@ namespace aa::wired_receiver {
 //     rate, or arriving at a full queue, are dropped and counted; the count is
 //     reported in-band as a media_telemetry_dropped record (at most once a
 //     second, and once at finish) and through media_drops().
+//   * Shutdown (audit L13): once the owner's running flag is false, a lossless
+//     submit() that finds no space waits at most `shutdown_wait` for the sink
+//     (a healthy sink drains and the record is delivered). When the sink does
+//     not make room in that window the record is dropped with ETIMEDOUT and every
+//     later submit that finds no space drops immediately, so receiver teardown
+//     (video_outlet.close(), the `stopping` record, any session thread still
+//     logging) can never wait on a stuck stdout. While running stays true the
+//     lossless wait is unbounded (issue #60).
 //   * finish(): audit L13: shutdown waits for the queue to drain only up to a
 //     deadline. A sink that never returns (blocked pipe or terminal) is
 //     abandoned: the worker is detached and owns the shared state, so nothing it
@@ -46,6 +54,8 @@ public:
     static constexpr std::size_t entry_capacity = 4096;
     static constexpr std::chrono::milliseconds default_finish_timeout{2000};
     static constexpr std::chrono::milliseconds media_summary_interval{1000};
+    // How often a blocked lossless producer re-checks the running flag.
+    static constexpr std::chrono::milliseconds shutdown_poll{20};
     using Write = ssize_t (*)(int, const void *, std::size_t);
     using Clock = std::chrono::steady_clock;
     using Now = Clock::time_point (*)();
@@ -62,8 +72,9 @@ public:
     };
 
     explicit StdoutLog(std::atomic<bool> &running, Write write = ::write,
-                       Now now = &Clock::now, MediaLimit limit = MediaLimit())
-        : state_(std::make_shared<State>(running, write, now, limit)),
+                       Now now = &Clock::now, MediaLimit limit = MediaLimit(),
+                       std::chrono::milliseconds shutdown_wait = default_finish_timeout)
+        : state_(std::make_shared<State>(running, write, now, limit, shutdown_wait)),
           worker_([state = state_] { run(state); }) {}
     // Owners check finish explicitly; unwinding still must join (or abandon) the worker.
     ~StdoutLog() { [[maybe_unused]] const auto error = finish(); }
@@ -85,14 +96,15 @@ public:
             s.changed.notify_all();
 #endif
             const bool waited = !s.error && !s.closed && !s.space(charge);
-            s.changed.wait(lock, [&] { return s.error || s.closed || s.space(charge); });
+            const bool admitted = s.wait_for_space(lock, charge);
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
             s.waiting = false;
 #endif
-            if (s.error || s.closed) {
+            if (s.error || s.closed || !admitted) {
                 s.chunked = false;
-                // Admission closure wakes existing waiters with ESHUTDOWN even
-                // if finish() has already latched its owner-facing timeout.
+                if (!admitted && !s.error && !s.closed) { return shutdown_error(); }
+                // A producer woken by an abandoning finish() always sees ESHUTDOWN;
+                // the ETIMEDOUT latch is for the owner and for later arrivals.
                 if (s.error && !(waited && s.abandoned)) { return s.error; }
                 return closed_error();
             }
@@ -130,6 +142,12 @@ public:
         s.push(record, charge);
         s.changed.notify_all();
         return {};
+    }
+
+    // Lossless records dropped because the sink made no room during shutdown.
+    [[nodiscard]] std::uint64_t shutdown_drops() const {
+        const std::lock_guard lock(state_->mutex);
+        return state_->shutdown_dropped;
     }
 
     [[nodiscard]] MediaDrops media_drops() const {
@@ -218,12 +236,13 @@ private:
         Clock::time_point refilled{};
     };
     struct State {
-        State(std::atomic<bool> &r, Write w, Now n, MediaLimit l)
-            : running(&r), write(w), now(n), limit(l) {}
+        State(std::atomic<bool> &r, Write w, Now n, MediaLimit l, std::chrono::milliseconds wait)
+            : running(&r), write(w), now(n), limit(l), shutdown_wait(wait) {}
         std::atomic<bool> *running; // cleared when finish() abandons the worker
         Write write;
         Now now;
         MediaLimit limit;
+        std::chrono::milliseconds shutdown_wait;
         mutable std::mutex mutex;
         std::condition_variable changed;
         std::deque<std::string> queue;
@@ -234,6 +253,8 @@ private:
         bool abandoned = false;
         bool chunked = false; // an oversize record is mid-admission
         std::size_t undelivered = 0;
+        bool shutdown_expired = false; // a shutdown-time wait for space ran out
+        std::uint64_t shutdown_dropped = 0;
         MediaDrops drops{0, 0};
         MediaDrops reported{0, 0};
         Clock::time_point last_report{};
@@ -245,6 +266,35 @@ private:
 #endif
         bool space(std::size_t charge) const {
             return charge <= byte_capacity - bytes && queue.size() < entry_capacity;
+        }
+        bool stopping() const { return running && !running->load(); }
+        // Waits for room for `charge`. Unbounded while the owner is running
+        // (issue #60); bounded by `shutdown_wait` once it is not. Returns false
+        // only when the shutdown bound expired with the queue still full.
+        bool wait_for_space(std::unique_lock<std::mutex> &lock, std::size_t charge) {
+            const auto ready = [&] { return error || closed || space(charge); };
+            Clock::time_point deadline{};
+            bool armed = false;
+            while (!ready()) {
+                if (!armed && stopping()) {
+                    if (shutdown_expired) {
+                        ++shutdown_dropped;
+                        return false;
+                    }
+                    armed = true;
+                    deadline = Clock::now() + shutdown_wait;
+                }
+                if (armed && Clock::now() >= deadline) {
+                    shutdown_expired = true;
+                    ++shutdown_dropped;
+                    return false;
+                }
+                // Poll the running flag: stopping it does not notify this condition.
+                auto wake = Clock::now() + shutdown_poll;
+                if (armed && deadline < wake) { wake = deadline; }
+                changed.wait_until(lock, wake);
+            }
+            return true;
         }
         void push(std::string_view record, std::size_t charge) {
             queue.emplace_back(charge, '\n');
@@ -296,6 +346,7 @@ private:
     };
 
     static std::error_code closed_error() { return {ESHUTDOWN, std::generic_category()}; }
+    static std::error_code shutdown_error() { return {ETIMEDOUT, std::generic_category()}; }
     std::error_code error_snapshot() const {
         const std::lock_guard lock(state_->mutex);
         return state_->error;
