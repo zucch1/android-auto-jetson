@@ -372,6 +372,20 @@ protected:
     void acquire(std::uint64_t generation = 1) {
         ASSERT_TRUE(client->prepare(core::ConsumerId{generation}, core::PairingRequestId{generation}));
         ASSERT_TRUE(client->confirmed(core::ConsumerId{generation}, core::PairingRequestId{generation}));
+        ASSERT_EQ(bluez.command("comparison-start"), "ok");
+        std::optional<PairingComparison> challenge;
+        ASSERT_TRUE(eventually([&] {
+            const auto value = client->comparison(core::ConsumerId{generation}, core::PairingRequestId{generation});
+            if (value) challenge = value.value();
+            return challenge.has_value();
+        }));
+        ASSERT_TRUE(client->respond_comparison(core::ConsumerId{generation}, core::PairingRequestId{generation},
+                                               {challenge->id, true}));
+        ASSERT_EQ(bluez.command("paired"), "ok");
+        ASSERT_TRUE(eventually([&] {
+            const auto bonded = client->bond_confirmed(core::ConsumerId{generation}, core::PairingRequestId{generation});
+            return bonded && bonded.value();
+        }));
         core::CancellationSource cancel;
         const auto result = client->call({Operation::ensure_access_point, 36}, core::Milliseconds{1000}, cancel.get_token());
         ASSERT_TRUE(result);

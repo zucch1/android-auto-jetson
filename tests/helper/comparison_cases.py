@@ -48,6 +48,7 @@ def affirmative(surface: Surface, request: int) -> None:
     rejected(surface.consumer, "RespondPairingComparison", GLib.Variant("(ttb)", (request + 1, int(challenge["challenge_id"]), True)))
     rejected(surface.consumer, "RespondPairingComparison", GLib.Variant("(ttb)", (request, int(challenge["challenge_id"]) ^ 1, True)))
     control(surface.consumer, "RespondPairingComparison", response)
+    assert surface.phone() == 0, "acceptance alone must wait for helper bond acknowledgement"
     wait(lambda: command(surface.mock, "comparison-result") == "allowed")
     rejected(surface.consumer, "RespondPairingComparison", response)
     assert command(surface.mock, "RequestConfirmation") == "rejected"
@@ -101,7 +102,13 @@ def probe_flow(surface: Surface) -> None:
     import time
     from bluez_runtime import command, wait
     def rpc(text: str) -> tuple[int, int]:
-        values = command(surface.receiver, text).split()
+        try:
+            values = command(surface.receiver, text).split()
+        except AssertionError as error:
+            details = b""
+            if surface.receiver.poll() is not None and surface.receiver.stderr:
+                details = surface.receiver.stderr.read()
+            raise AssertionError(f"probe command {text!r}: {error}; stderr={details!r}") from error
         return int(values[0]), int(values[1])
     assert rpc("targetless")[0] == 1001
     assert rpc("malformed")[0] == 1002
@@ -116,6 +123,7 @@ def probe_flow(surface: Surface) -> None:
     error, grant = rpc("issue 2")
     assert error == 0 and rpc(f"open {grant}")[0] == 1001
     assert rpc("close")[0] == 0
+    command(surface.mock, "restore")
     error, stale = rpc("poll")
     assert error == 0
     command(surface.mock, "release-name")
@@ -139,6 +147,7 @@ def probe_flow(surface: Surface) -> None:
     assert rpc("comparison 4")[0] == 1001
     assert rpc(f"respond 4 {challenge}")[0] == 1001
     assert command(surface.mock, "comparison-result") == "pending"
+    removed_before = len(surface.state()["removed"])
     command(surface.mock, "paired")
     assert command(surface.mock, "NewConnection") == "rejected"
     error, expired_grant = rpc("issue 4")
@@ -153,5 +162,5 @@ def probe_flow(surface: Surface) -> None:
     assert rpc(f"open {expired_grant}")[0] == 1001
     assert command(surface.mock, "fd-eof") == "closed"
     assert command(surface.mock, "RequestAuthorization") == "rejected"
-    wait(lambda: len(surface.state()["removed"]) == 1)
+    wait(lambda: len(surface.state()["removed"]) == removed_before + 1)
     print("PASS comparison_timeout_wrong_source_and_monotonic60s_idle_expiry", flush=True)

@@ -180,7 +180,8 @@ TEST(ControlFlow, ExpiredConfirmIsRejectedAndNotPersisted) {
     const auto expired = f.service.confirm_phone_pairing(connection, request.value());
 
     ASSERT_FALSE(expired.has_value());
-    EXPECT_EQ(expired.error().code(), ErrorCode::session_pairing_timeout);
+    EXPECT_EQ(expired.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(f.policy.pending_count(), 0U);
     EXPECT_TRUE(f.store.phones().empty());
     EXPECT_FALSE(std::filesystem::exists(f.dir.file()));
     EXPECT_FALSE(f.service.pairing_window_open());

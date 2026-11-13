@@ -45,6 +45,7 @@ def run(build: Path, directory: Path, failure: str) -> None:
                 command(surface.mock, "allow-inventory")
         wait(lambda: len(surface.state()["removed"]) == 1, 5)
         assert not surface.state()["properties"]["Pairable"]
+        assert not (directory / "store").exists(), "failed pending enrolment wrote durable trust"
         if failure != "restart":
             assert surface.phone() == 0
             assert command(surface.receiver, "pending-pairings") == "0"

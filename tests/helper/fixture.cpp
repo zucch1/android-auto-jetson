@@ -49,6 +49,23 @@ private:
     const char* path_;
     bool active_{};
 };
+// Recording-backend tests exercise the non-comparison flow; real BlueZ always requires consent.
+class FixtureConfirmation final : public Confirmation {
+public:
+    FixtureConfirmation(Confirmation& target, bool comparison) : target_(target), comparison_(comparison) {}
+    bool requires_comparison() const override { return comparison_; }
+    core::Result<std::optional<PeerIdentity>> prepare(core::ConsumerId g, core::PairingRequestId r) override { return target_.prepare(g, r); }
+    core::Result<void> confirmed(core::ConsumerId g, core::PairingRequestId r) override { return target_.confirmed(g, r); }
+    core::Result<PairingComparison> comparison(core::ConsumerId g, core::PairingRequestId r) override { return target_.comparison(g, r); }
+    core::Result<void> respond_comparison(core::ConsumerId g, core::PairingRequestId r, ComparisonResponse response) override { return target_.respond_comparison(g, r, response); }
+    core::Result<bool> bond_confirmed(core::ConsumerId g, core::PairingRequestId r) override { return target_.bond_confirmed(g, r); }
+    void cancel(core::ConsumerId g, core::PairingRequestId r) override { target_.cancel(g, r); }
+    void teardown(core::ConsumerId g) override { target_.teardown(g); }
+    RevocationAttempt forgotten_v1(const RevocationV1& s, const RevocationProgress& p) override { return target_.forgotten_v1(s, p); }
+private:
+    Confirmation& target_;
+    bool comparison_;
+};
 int receiver(const char* address, const std::filesystem::path& store_path, bool bluez) {
     trust::ApprovedPhoneStore store{store_path};
     if (!store.load()) return 2;
@@ -59,7 +76,8 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
     ipc::RandomPairingIdSource ids;
     auto helper = BusClient::private_bus(address, store);
     if (!helper) return 3;
-    auto service = ipc::ControlBusService::start({::getuid()}, {ids, phones, helper.value().get()});
+    FixtureConfirmation confirmation{*helper.value(), bluez};
+    auto service = ipc::ControlBusService::start({::getuid()}, {ids, phones, &confirmation});
     if (!service) return 4;
     struct Worker {
         core::CancellationSource cancellation;
