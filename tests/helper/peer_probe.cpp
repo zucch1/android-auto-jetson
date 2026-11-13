@@ -34,6 +34,10 @@ int main(int argc, char** argv) {
             writer.put_u32(2).put_u32(0).put_u64(value);
         } else if (op == "reconnect") {
             input >> value; member = "ReconnectPeerV1"; signature = "t"; writer.put_u64(value);
+        } else if (op == "revoke") {
+            std::string address, adapter; input >> address >> adapter;
+            member = "RevokePeerV1"; signature = "ss";
+            writer.put_string(address).put_string(adapter);
         } else if (op == "close") {
             member = "Invalidate"; signature = "tt"; writer.put_u64(0).put_u64(0);
         } else if (op == "targetless") {
