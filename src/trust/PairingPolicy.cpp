@@ -20,6 +20,12 @@ core::Result<void> PairingPolicy::note_wireless_candidate(const helper::PeerIden
     note_candidate(std::move(identity));
     return {};
 }
+bool PairingPolicy::same_wireless_identity(const helper::PeerIdentity& a,
+                                         const helper::PeerIdentity& b) const {
+    const auto first = validated_key(WirelessIdentity{a.address, a.adapter});
+    const auto second = validated_key(WirelessIdentity{b.address, b.adapter});
+    return first && second && first.value() == second.value();
+}
 std::optional<helper::PeerIdentity> PairingPolicy::wireless_identity(core::PhoneId phone) const {
     for (const auto& entry : store_.phones()) {
         if (entry.phone_id != phone) continue;
@@ -138,10 +144,13 @@ core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId reque
         // Fail closed: a request with no presented phone approves nothing.
         return Error{ErrorCode::trust_unknown_phone};
     }
-    if (refuses_wired_authorization(identity_key(*candidate_))) {
-        // Audit M12: a serial-less wired phone can never be approved, so the
-        // user is never prompted for a pairing that could not work.
-        return Error{ErrorCode::trust_rejected};
+    const auto wired_class = classify_wired_key(identity_key(*candidate_));
+    if (wired_class == WiredKeyClass::malformed) {
+        return Error{ErrorCode::trust_unknown_phone};
+    }
+    if (wired_class == WiredKeyClass::port_only) {
+        // Normal pairing has no separate port-only consent; reject before prompting.
+        return Error{ErrorCode::trust_port_only_requires_opt_in};
     }
     if (pending_.size() >= kMaxPending) {
         return Error{ErrorCode::ipc_queue_full};

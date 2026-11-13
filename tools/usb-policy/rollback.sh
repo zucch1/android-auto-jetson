@@ -20,8 +20,8 @@
 # from the manifest's installed_sha256 aborts WITHOUT deleting anything.
 #
 # Environment:
-#   AA_USB_POLICY_ROOT   Alternate filesystem root (tests). Empty = live
-#                        system. When non-empty, udevadm is never invoked.
+#   AA_USB_POLICY_ROOT   Alternate filesystem root (non-root tests only).
+#                        Empty = live system. When non-empty, udevadm is never invoked.
 #
 # Usage: sudo -n bash tools/usb-policy/rollback.sh
 set -euo pipefail
@@ -42,6 +42,7 @@ if [ -n "$ROOT" ]; then
     [ "$RESOLVED_ROOT" != "/" ] \
         || die "AA_USB_POLICY_ROOT resolves to the live filesystem root; use an empty value for live mode"
 fi
+validate_test_environment
 DST="${ROOT}/etc/udev/rules.d/${RULES_NAME}"
 STATE_DIR="${ROOT}/var/lib/android-auto-receiver/usb-policy"
 MANIFEST="${STATE_DIR}/manifest"
@@ -182,4 +183,5 @@ test_hook after-retire-state
 rm -rf -- "${PRIVATE_STATE_TMP:?}"
 PRIVATE_STATE_TMP=""
 rmdir "${ROOT}/var/lib/android-auto-receiver" 2>/dev/null || true
-log "done: prior state restored; install state removed"
+log "done: prior rules restored and install state removed;" \
+    "live named-user ACLs are NOT revoked; end the seat session or physically re-plug the device to clear them"

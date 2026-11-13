@@ -952,6 +952,35 @@ class Rollback(unittest.TestCase):
                                      capture_output=True, text=True, timeout=30)
                 self.assertEqual(run.returncode, 0, run.stderr)
 
+    def test_euid_zero_cannot_reach_fake_root_eval_hooks(self) -> None:
+        # The stricter-only override exercises the production guard without
+        # requiring user namespaces (which some CI hosts disable).
+        self._assert_euid_zero_refusal([], "1")
+
+    @unittest.skipUnless(shutil.which("unshare"), "unshare required for EUID-0 fixture")
+    def test_real_euid_zero_cannot_disable_refusal(self) -> None:
+        probe = subprocess.run(["unshare", "-r", "true"], capture_output=True,
+                               text=True, timeout=30)
+        if probe.returncode != 0:
+            self.skipTest(f"user namespaces unavailable: {probe.stderr.strip()}")
+        # A real EUID 0 must still refuse when the override is disabled.
+        self._assert_euid_zero_refusal(["unshare", "-r"], "0")
+
+    def _assert_euid_zero_refusal(self, prefix: list[str], override: str) -> None:
+        sentinel = self.root / "hook-evaluated"
+        env = dict(self.env, AA_USB_POLICY_TEST_HOOKS="after-validate",
+                   AA_USB_POLICY_TEST_HOOK_CMD=f'touch -- "{sentinel}"',
+                   AA_USB_POLICY_TEST_EUID_ZERO=override)
+        for script in ("install.sh", "rollback.sh"):
+            with self.subTest(script=script):
+                run = subprocess.run(
+                    [*prefix, "bash", str(POLICY_DIR / script)],
+                    env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+                self.assertIn("forbidden when euid is 0", run.stderr)
+                self.assertFalse(sentinel.exists())
+                self.assertFalse(self.dst.exists())
+
     def test_live_root_ancestry_accepts_root(self) -> None:
         # Given
         command = f'set -euo pipefail; source "{POLICY_DIR / "common.sh"}"; ROOT=""; die() {{ exit 91; }}; check_dir_trusted() {{ printf "%s\\n" "$1"; }}; trusted_chain_check /etc'
@@ -1072,6 +1101,9 @@ class Rollback(unittest.TestCase):
         run = self.rollback()
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("named-user ACLs are NOT revoked by this tooling", run.stdout)
+        self.assertIn("done: prior rules restored and install state removed", run.stdout)
+        self.assertIn("live named-user ACLs are NOT revoked", run.stdout)
+        self.assertNotIn("done: prior state restored", run.stdout)
         self.assertNotIn("cannot survive", run.stdout + run.stderr)
 
 

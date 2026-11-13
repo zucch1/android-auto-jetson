@@ -12,9 +12,9 @@
 #     FIRST install's prior-state record authoritative for rollback.
 #
 # Environment:
-#   AA_USB_POLICY_ROOT   Alternate filesystem root (tests). Empty = live
-#                        system. When non-empty, udevadm is never invoked and
-#                        the test hooks below become active.
+#   AA_USB_POLICY_ROOT   Alternate filesystem root (non-root tests only).
+#                        Empty = live system. When non-empty, udevadm is never
+#                        invoked and the test hooks below become active.
 #   AA_USB_POLICY_USER   Receiver session user for the plugdev membership
 #                        check (default: SUDO_USER or the invoking user).
 #   AA_USB_POLICY_TEST_HOOKS / AA_USB_POLICY_TEST_HOOK_CMD
@@ -45,6 +45,7 @@ if [ -n "$ROOT" ]; then
     [ "$RESOLVED_ROOT" != "/" ] \
         || die "AA_USB_POLICY_ROOT resolves to the live filesystem root; use an empty value for live mode"
 fi
+validate_test_environment
 SRC="${SCRIPT_DIR}/${RULES_NAME}"
 DST="${ROOT}/etc/udev/rules.d/${RULES_NAME}"
 STATE_DIR="${ROOT}/var/lib/android-auto-receiver/usb-policy"

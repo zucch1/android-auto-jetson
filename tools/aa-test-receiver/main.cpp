@@ -276,10 +276,12 @@ private:
             }
             auto message = connection_->read_message();
             if (!message.has_value()) {
-                if (message.error().code() == aa::ErrorCode::transport_closed) {
-                    break;
+                if (message.error().code() == aa::ErrorCode::transport_message_dropped) {
+                    continue;
                 }
-                continue;
+                // Malformed/incomplete frames close the connection. Never
+                // poll a dead descriptor in a loop after a framing failure.
+                break;
             }
             if (message.value().type != bus::MessageType::method_call) {
                 continue;

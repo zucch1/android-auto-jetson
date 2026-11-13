@@ -58,7 +58,8 @@ TEST_F(SecretLifetime, SmallStringMoveWipesSourceAndAssignmentWipesOldInlineSecr
 class SecretBackend final : public Backend {
 public:
     core::Result<State> apply(Action, std::uint32_t) override { return State::active; }
-    void cleanup() noexcept override {}
+    int cleanups{};
+    void cleanup() noexcept override { ++cleanups; }
     core::Result<ObservedPeer> observe() override { return handoff(); }
     core::Result<State> reconnect_peer(std::uint64_t) override { return State::active; }
     core::Result<ObservedPeer> handoff() override { return ObservedPeer{123, {"AA:BB:CC:DD:EE:FF", "00:11:22:33:44:55"}}; }
@@ -69,6 +70,38 @@ public:
         send(); return true;
     }
 };
+TEST(HelperBusBoundary, OversizeDropDoesNotCauseBusLossOrStopDispatch) {
+    using namespace ipc::dbus_adapter;
+    const char* address = std::getenv("DBUS_SESSION_BUS_ADDRESS"); ASSERT_NE(address, nullptr);
+    SecretBackend backend;
+    auto service = BusService::private_bus(address, {::getuid(), std::string(64, 'a')}, backend);
+    ASSERT_TRUE(service);
+    auto caller = BusConnection::connect_session(); ASSERT_TRUE(caller);
+    MessageWriter oversized;
+    oversized.destination(kBusName).path(kObjectPath).interface_name(kInterface)
+        .member("Issue").body_signature("s").put_string(std::string(70 * 1024, 'x'));
+    ASSERT_TRUE(caller.value().send_message(MessageType::method_call, oversized));
+    // Name acquisition can queue a daemon signal ahead of the dropped call.
+    // Pump until a following sentinel call receives a reply, proving continued
+    // dispatch as well as the absence of bus_lost()'s backend cleanup.
+    MessageWriter valid;
+    valid.destination(kBusName).path(kObjectPath).interface_name(kInterface)
+        .member("Issue").body_signature("ttuu").put_u64(1).put_u64(1).put_u32(1).put_u32(36);
+    const auto owner = caller.value().get_name_owner(ipc::BusName{kBusName}); ASSERT_TRUE(owner);
+    const auto sent = caller.value().send_message(MessageType::method_call, valid); ASSERT_TRUE(sent);
+    std::atomic<bool> failed{};
+    std::jthread pump{[&](const std::stop_token& stop) {
+        while (!stop.stop_requested()) if (!service.value().cycle()) { failed = true; return; }
+    }};
+    const auto reply = caller.value().await_reply(sent.value(),
+        owner.value());
+    pump.request_stop(); pump.join();
+    ASSERT_TRUE(reply);
+    EXPECT_EQ(reply.value().type, MessageType::method_return);
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(backend.cleanups, 0);
+}
+
 TEST_F(SecretLifetime, CredentialRpcWipesWriterWireReceiveAndParsedBody) {
     const char* address = std::getenv("DBUS_SESSION_BUS_ADDRESS"); ASSERT_NE(address, nullptr);
     const int fd = ::open("/proc/self/exe", O_RDONLY | O_CLOEXEC); ASSERT_GE(fd, 0);

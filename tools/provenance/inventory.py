@@ -83,6 +83,14 @@ SANITIZATIONS: Final = (
         None, None,
         'Published head-unit credential copy removed; see third_party/compat-credentials/README.md.'),
     Sanitization(
+        'cert/README.md', True, 'correct-credential-documentation-2026-11-11',
+        '429467a2d8b89609dd1e9029d24672832bc51a01',
+        '73f7d67eadd4619276d655a4597529e14c9be79d27994bfb2d2f67b27e3c3bcd',
+        '0e19ca804e43a4dc42ba033f235ddcbd70f14c2c',
+        '33b985853b7743f93aa57102ad2698eddb1ef9200284a71b0dd92c90da30ee2a',
+        'Obsolete bundled/embedded credential and insecure installation instructions replaced '
+        'with the fail-closed HU_KEY_PATH-only contract.'),
+    Sanitization(
         'src/Messenger/Cryptor.cpp', True, 'strip-embedded-credential-2026-10-10',
         '71c679ff32e1c457925a201beb4a17fd96d05bd2',
         'af6d9f58d135229a0ef1de3a09caf59b32a3cf064c0198d4a82626ca2fc2be9d',

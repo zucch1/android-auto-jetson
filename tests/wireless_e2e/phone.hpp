@@ -25,7 +25,9 @@ inline aa::core::Result<void> send(tr::TcpTransport& tcp, std::uint8_t channel,
     return {};
 }
 inline aa::core::Result<tr::Message> receive(tr::TcpTransport& tcp, tr::PayloadCipher* cipher = nullptr) {
-    tr::MessageReassembler reassembler{cipher};
+    // Peer-side reader of HU output: the HU legitimately sends plaintext
+    // PingResponse/AuthComplete after the handshake, so opt out of the HU-inbound rule.
+    tr::MessageReassembler reassembler{cipher, tr::PlaintextAfterHandshake::allow};
     for (;;) {
         auto frame = tcp.receive();
         if (!frame) return frame.error();

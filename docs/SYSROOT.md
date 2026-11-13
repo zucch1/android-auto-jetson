@@ -8,11 +8,16 @@ describe the implemented offline boundary.
 Current task-6 handoff: task 5's final acceptance is PASS. The prerequisite
 failure and outstanding-gate notes below are historical, not a current block
 on the independent host CI jobs. They remain preserved and are not evidence
-of present target reachability. Private ARM64 CI runs as a companion workflow
-outside this repository; no ARM64 CI job is implemented here. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the public contexts and the companion
-ARM64 integration context. This status update performs no target
-access and grants no live-acquisition authority.
+of present target reachability. Public CI includes an ARM64 fixture cross-build
+against a synthetic sysroot (`AA_SYSROOT_REQUIRE_OBSERVED=OFF`), explicitly
+**fixture-not-target**; [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
+is the authority for the fixture cross-build job's name and steps. Separate
+observed-sysroot cross-compilation acceptance (`AA_SYSROOT_REQUIRE_OBSERVED=ON`)
+is relayed by the maintainer via `tools/ci/arm64-cross-relay.sh`, which posts the
+`ci/arm64-cross-build` commit status for the exact SHA. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for public CI and exact-head relay guidance.
+This status update performs no target access and grants no live-acquisition
+authority.
 
 ## CLI
 
