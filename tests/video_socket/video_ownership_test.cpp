@@ -457,7 +457,9 @@ TEST(VideoOwnership, ListenRejectsHeldLockInInvalidDirectoryWithoutBlocking) {
         if (::flock(fd, LOCK_EX) != 0) {
             ::_exit(2);
         }
-        (void)::write(ready[1], "x", 1);
+        if (::write(ready[1], "x", 1) != 1) {
+            ::_exit(3);
+        }
         ::sleep(5);
         ::_exit(0);
     }

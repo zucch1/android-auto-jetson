@@ -12,6 +12,7 @@
 #include <aa/ipc/InputChannel.hpp>
 
 #include "ProjectionWidget.hpp"
+#include "decode_loss.hpp"
 #include "pump_timer.hpp"
 #include "shutdown_outcome.hpp"
 #include "test_control.hpp"
@@ -19,6 +20,7 @@
 #include <QApplication>
 #include <QTimer>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -140,6 +142,11 @@ aa::display::testcontrol::Status probe_status() {
     status.frames_presented = g_controller->frames_presented();
     status.frames_painted = g_widget->frames_painted();
     status.helper_started = g_controller->helper_started();
+    const auto& decode = g_controller->decode_report();
+    status.frames_lost_retention = decode.frames_lost_retention;
+    status.frames_lost_capacity = decode.frames_lost_capacity;
+    status.frames_lost_eos = decode.frames_lost_eos;
+    status.awaiting_idr = decode.awaiting_idr;
     if (g_sender != nullptr) {
         status.input_sent = g_sender->sent();
         status.input_dropped = g_sender->dropped();
@@ -242,17 +249,32 @@ int main(int argc, char** argv) {
     widget.set_telemetry_writer(&telemetry);
     widget.set_status(DisplayState::unavailable);
 
+    aa::display::DecodeLossTelemetry decode_loss;
     auto client = aa::ipc::ControlBusClient::connect();
     if (client.has_value()) {
         aa::display::TestOnlyAutostart gate{};
         gate.marker = test_autostart ? aa::display::TestOnlyAutostart::kMarker : std::string_view{};
         gate.video_socket = aa::ipc::VideoSocketPath{video_socket};
-        auto factory = [errors, decoder_backend, inner = aa::display::helper_decode_sessions()](
-                           const aa::consumer::DecodeConfig& decode_config) {
+        auto factory = [errors, decoder_backend, &decode_loss, &telemetry,
+                        inner = aa::display::helper_decode_sessions()](
+                           const aa::consumer::DecodeConfig& decode_config)
+            -> aa::core::Result<std::unique_ptr<aa::display::DecodeSession>> {
             errors->begin_attempt();
             auto effective_config = decode_config;
             effective_config.backend = decoder_backend;
-            return inner(effective_config);
+            auto opened = inner(effective_config);
+            if (!opened.has_value()) {
+                return opened;
+            }
+            for (auto& line : decode_loss.begin_session()) {
+                static_cast<void>(telemetry.enqueue(std::move(line)));
+            }
+            return std::unique_ptr<aa::display::DecodeSession>(
+                std::make_unique<aa::display::LossReportingDecodeSession>(
+                    std::move(opened.value()), decode_loss,
+                    [&telemetry](std::string line) {
+                        static_cast<void>(telemetry.enqueue(std::move(line)));
+                    }));
         };
         aa::display::DisplayController::Deps deps{client.value(), std::move(factory), widget};
         auto attached = test_autostart
@@ -278,7 +300,8 @@ int main(int argc, char** argv) {
     auto pump_timer = std::make_unique<QTimer>();
     aa::display::pump::configure(*pump_timer);
     QObject::connect(pump_timer.get(), &QTimer::timeout,
-                     [errors, &telemetry, &widget, telemetry_reported = false]() mutable {
+                     [errors, &telemetry, &widget, &decode_loss,
+                      telemetry_reported = false]() mutable {
         // A full queue or failed write loses measurement events: show it once.
         // Only on screen: a stream write here could block on the same stdout
         // that failed the writer, freezing the GUI thread it protects.
@@ -296,6 +319,10 @@ int main(int argc, char** argv) {
                     errors->report("pump", code);
                 }
             }
+            for (auto& line : decode_loss.observe(g_controller->decode_report(),
+                                                  std::chrono::steady_clock::now())) {
+                static_cast<void>(telemetry.enqueue(std::move(line)));
+            }
         }
     });
     if (g_controller.has_value()) {
@@ -312,6 +339,11 @@ int main(int argc, char** argv) {
     int outcome = app.exec();
     pump_timer->stop();
     if (g_controller.has_value()) {
+        // Totals coalesced by the rate limit must not die with the session.
+        for (auto& line : decode_loss.observe(g_controller->decode_report(),
+                                              std::chrono::steady_clock::now(), true)) {
+            static_cast<void>(telemetry.enqueue(std::move(line)));
+        }
         g_controller->shutdown();
         g_controller.reset();
     }
