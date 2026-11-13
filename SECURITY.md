@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-None yet. This repository is at bootstrap stage and has no releases.
+None yet. This repository is in pre-release development and has no tagged releases.
 
 ## Reporting a vulnerability
 

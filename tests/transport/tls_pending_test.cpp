@@ -28,7 +28,7 @@ using namespace std::chrono_literals;
 TEST(TlsInFlight, SendObservedUnderBackpressure) {
     // Given: a handshaked TLS session whose peer never consumes frames, with the
     // client socket shrunk so backpressure is deterministic and quick.
-    auto listener = tr::TlsListener::listen("127.0.0.1", 0, [] { return true; },
+    auto listener = tr::TlsListener::listen("127.0.0.1", 0, [](const tr::TlsPeerInfo& peer) { return peer.address == "127.0.0.1"; },
                                             tr::TlsMode::encryption_only_compatibility);
     ASSERT_TRUE(listener);
     const auto port = listener.value()->port();

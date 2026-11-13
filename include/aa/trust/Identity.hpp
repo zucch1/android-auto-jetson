@@ -4,11 +4,10 @@
 // Typed transport identity for approved phones (task 27). The store keeps the
 // STRONGEST available transport identity per phone:
 //   - wired    : USB descriptor ids + USB serial + AOA identity + physical-port
-//                context (the qualified USB3 port path as the kernel reports it).
-//                With neither serial it is PORT-ONLY: nothing distinguishes one
-//                such phone from another of the same model on the same port, so
-//                serial-less wired phones are REFUSED for pairing and never
-//                authorize a session (see Store.hpp).
+//                context (the qualified USB3 port path as the kernel reports it)
+//     Serial-less wired identities have a port-only strength: the descriptor
+//     tuple on that port matches every indistinguishable device. The store
+//     requires a separate explicit approval API for this weaker grant.
 //   - wireless : the BlueZ bond identity (bond address + adapter) carried as
 //                plain DATA. This module never talks to BlueZ; the transport
 //                layer hands the bond identity over.
@@ -39,6 +38,9 @@
 #include <variant>
 
 namespace aa::trust {
+
+// Port-only identifies a descriptor tuple on a port, never a particular phone.
+enum class IdentityStrength { serial_backed, port_only, bond_backed, opaque };
 
 enum class TransportKind { wired, wireless, opaque };
 
@@ -85,6 +87,9 @@ inline constexpr std::size_t kMaxIdentityFieldBytes = 512;
 
 [[nodiscard]] TransportKind kind_of(const TransportIdentity& identity) noexcept;
 
+[[nodiscard]] IdentityStrength strength_of(const TransportIdentity& identity) noexcept;
+[[nodiscard]] std::string_view strength_name(IdentityStrength strength) noexcept;
+
 // Stable, injective canonical key of the FULL structured identity:
 //   wired    -> "w1:" + length-prefixed descriptor, serial, AOA and port fields
 //   wireless -> "b1:" + length-prefixed bond address and adapter
@@ -101,16 +106,12 @@ inline constexpr std::size_t kMaxIdentityFieldBytes = 512;
 // judged exactly like the structured WiredIdentity that produced it.
 //   not_wired    : not a "w1:" key (wireless, or an opaque legacy key)
 //   serial_bound : a canonical "w1:" key with a USB or AOA serial
-//   port_only    : a canonical "w1:" key with BOTH serials empty
+//   port_only    : a canonical "w1:" key with BOTH serials blank
 //   malformed    : starts with "w1:" but is not exactly the seven canonical
 //                  length-prefixed fields identity_key() emits
 enum class WiredKeyClass { not_wired, serial_bound, port_only, malformed };
 
 [[nodiscard]] WiredKeyClass classify_wired_key(std::string_view key) noexcept;
-
-// Fail-closed predicate for the trust store: true for a port-only or a
-// malformed "w1:" key. Such a key is never approved and never authorizes.
-[[nodiscard]] bool refuses_wired_authorization(std::string_view key) noexcept;
 
 // Field-level validation (printable ASCII, usable material). Fail closed.
 [[nodiscard]] core::Result<std::string> validated_key(const TransportIdentity& identity);

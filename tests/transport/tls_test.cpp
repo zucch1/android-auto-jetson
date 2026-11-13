@@ -15,7 +15,9 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -78,6 +80,170 @@ TEST(TlsRecordCodec, HuClientFactoryEmitsClientHelloAndHandshakesWithServer) {
     auto opened = server.open(sealed.value());
     ASSERT_TRUE(opened.has_value());
     EXPECT_EQ(opened.value(), plain);
+}
+
+// Exercise the production cipher transition, rather than a synthetic active flag.
+TEST(TlsRecordCodec, PlaintextOnlyBeforeHandshake) {
+    bool approved = true;
+    tls::TlsRecordCodec client(approved_policy(&approved), tls::TlsRecordCodec::Role::client);
+    tls::TlsRecordCodec server(approved_policy(&approved), tls::TlsRecordCodec::Role::server);
+    tr::MessageReassembler reassembler(&server);
+    const tr::Message message{0, MessageKind::specific, pattern(16)};
+    auto frames = tr::encode_message(message, Encryption::plain, nullptr);
+    ASSERT_TRUE(frames.has_value());
+    auto before = reassembler.push(frames.value().front());
+    ASSERT_TRUE(before.has_value());
+    ASSERT_TRUE(before.value().has_value());
+    EXPECT_EQ(*before.value(), message);
+    ASSERT_FALSE(client.step_handshake().value());
+    server.give_handshake(client.take_handshake());
+    ASSERT_FALSE(server.step_handshake().value());
+    auto during = reassembler.push(frames.value().front());
+    ASSERT_TRUE(during.has_value());
+    EXPECT_EQ(*during.value(), message);
+    client.give_handshake(server.take_handshake());
+    handshake(client, server);
+    auto after = reassembler.push(frames.value().front());
+    ASSERT_FALSE(after.has_value());
+    EXPECT_EQ(after.error().code(), aa::ErrorCode::transport_plaintext_after_tls);
+    EXPECT_TRUE(reassembler.closed());
+    // Every channel and fragmentation flag is subject to the same policy.
+    for (const auto channel : {std::uint8_t{0}, std::uint8_t{99}}) {
+        for (const auto type : {FrameType::bulk, FrameType::first, FrameType::middle, FrameType::last}) {
+            tr::MessageReassembler fresh(&server);
+            auto frame = tr::encode_frame({channel, type, MessageKind::specific, Encryption::plain},
+                                          message.payload, 16);
+            ASSERT_TRUE(frame.has_value());
+            auto rejected = fresh.push(frame.value());
+            ASSERT_FALSE(rejected.has_value());
+            EXPECT_EQ(rejected.error().code(), aa::ErrorCode::transport_plaintext_after_tls);
+            EXPECT_TRUE(fresh.closed());
+        }
+    }
+    EXPECT_EQ(reassembler.push(frames.value().front()).error().code(),
+              aa::ErrorCode::transport_closed);
+}
+
+// Review P2: the rejection must not depend on cipher health. seal() clears
+// active_ on any failure (here a mid-session revoke); plaintext must still fail.
+TEST(TlsRecordCodec, PlaintextStaysRejectedAfterSealFailureClearsActive) {
+    bool approved = true;
+    tls::TlsRecordCodec client(approved_policy(&approved), tls::TlsRecordCodec::Role::client);
+    tls::TlsRecordCodec server(approved_policy(&approved), tls::TlsRecordCodec::Role::server);
+    handshake(client, server);
+    tr::MessageReassembler reassembler(&server);
+    const tr::Message message{0, MessageKind::specific, pattern(16)};
+
+    // Encrypted traffic is accepted while the cipher is healthy (this also
+    // latches the requirement on the first push that sees an active cipher).
+    auto sealed = tr::encode_message(message, Encryption::encrypted, &client);
+    ASSERT_TRUE(sealed.has_value());
+    auto opened = reassembler.push(sealed.value().front());
+    ASSERT_TRUE(opened.has_value());
+    ASSERT_TRUE(opened.value().has_value());
+    EXPECT_TRUE(reassembler.encryption_required());
+
+    // Revoke mid-session: the next seal fails and clears active_.
+    approved = false;
+    ASSERT_FALSE(server.seal(pattern(8)).has_value());
+    ASSERT_FALSE(server.is_active());
+    approved = true;
+
+    auto plain = tr::encode_message(message, Encryption::plain, nullptr);
+    ASSERT_TRUE(plain.has_value());
+    auto rejected = reassembler.push(plain.value().front());
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::transport_plaintext_after_tls);
+    EXPECT_TRUE(reassembler.closed());
+}
+
+// The cipher can also deactivate before the first post-handshake frame ever
+// reaches the reassembler; the explicit latch covers that gap.
+TEST(TlsRecordCodec, ExplicitLatchSurvivesCipherDeactivatingBeforeFirstFrame) {
+    bool approved = true;
+    tls::TlsRecordCodec client(approved_policy(&approved), tls::TlsRecordCodec::Role::client);
+    tls::TlsRecordCodec server(approved_policy(&approved), tls::TlsRecordCodec::Role::server);
+    handshake(client, server);
+    tr::MessageReassembler reassembler(&server);
+    EXPECT_FALSE(reassembler.encryption_required());
+    reassembler.require_encryption();
+    approved = false;
+    ASSERT_FALSE(server.seal(pattern(8)).has_value());
+    ASSERT_FALSE(server.is_active());
+    approved = true;
+    const tr::Message message{0, MessageKind::specific, pattern(16)};
+    auto plain = tr::encode_message(message, Encryption::plain, nullptr);
+    ASSERT_TRUE(plain.has_value());
+    auto rejected = reassembler.push(plain.value().front());
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::transport_plaintext_after_tls);
+    // Before any latch the pre-handshake plaintext path is unchanged.
+    tr::MessageReassembler fresh(&server);
+    EXPECT_FALSE(fresh.encryption_required());
+}
+
+// Review P3: a factory failure must say why, instead of surfacing as a bare null.
+TEST(TlsRecordCodec, FactoryFailureReasonIsReportedOutOfBand) {
+    const char *saved = std::getenv("HU_KEY_PATH");
+    const std::string saved_value = saved != nullptr ? saved : "";
+    ASSERT_EQ(::unsetenv("HU_KEY_PATH"), 0);
+    auto failed = tr::make_client_handshake_cipher([] { return true; });
+    EXPECT_EQ(failed, nullptr);
+    EXPECT_NE(tr::last_handshake_cipher_failure().find("tls-credential-unset"), std::string::npos)
+        << tr::last_handshake_cipher_failure();
+    if (saved != nullptr) {
+        ASSERT_EQ(::setenv("HU_KEY_PATH", saved_value.c_str(), 1), 0);
+        auto ok = tr::make_client_handshake_cipher([] { return true; });
+        EXPECT_NE(ok, nullptr);
+        EXPECT_TRUE(tr::last_handshake_cipher_failure().empty());
+    }
+}
+
+// A peer-side reader of HU output opts out explicitly; the production default
+// is the strict HU-inbound rule.
+TEST(TlsRecordCodec, PeerSideReaderCanOptOutOfInboundPlaintextRule) {
+    bool approved = true;
+    tls::TlsRecordCodec client(approved_policy(&approved), tls::TlsRecordCodec::Role::client);
+    tls::TlsRecordCodec server(approved_policy(&approved), tls::TlsRecordCodec::Role::server);
+    handshake(client, server);
+    const tr::Message message{0, MessageKind::specific, pattern(16)};
+    auto plain = tr::encode_message(message, Encryption::plain, nullptr);
+    ASSERT_TRUE(plain.has_value());
+    tr::MessageReassembler peer(&server, tr::PlaintextAfterHandshake::allow);
+    auto accepted = peer.push(plain.value().front());
+    ASSERT_TRUE(accepted.has_value());
+    EXPECT_EQ(*accepted.value(), message);
+    tr::MessageReassembler strict(&server);
+    EXPECT_FALSE(strict.push(plain.value().front()).has_value());
+}
+
+TEST(TlsRecordCodec, ClientHelloExcludesStaticRsa) {
+    auto hu = tr::make_client_handshake_cipher([] { return true; });
+    ASSERT_NE(hu, nullptr);
+    ASSERT_TRUE(hu->step_handshake().has_value());
+    const auto hello = hu->take_handshake();
+    // TLS record (5), handshake header (4), version (2), random (32), session ID.
+    ASSERT_GT(hello.size(), 44U);
+    const auto byte = [&](std::size_t i) { return std::to_integer<unsigned>(hello.at(i)); };
+    const std::size_t offset = 44U + byte(43);
+    const std::size_t length = (byte(offset) << 8U) | byte(offset + 1U);
+    ASSERT_LE(offset + 2U + length, hello.size());
+    ASSERT_EQ(length % 2U, 0U);
+    bool ecdhe = false;
+    for (std::size_t i = offset + 2U; i < offset + 2U + length; i += 2U) {
+        const auto suite = (byte(i) << 8U) | byte(i + 1U);
+        ecdhe |= suite == 0xc02fU || suite == 0xc030U;
+        // Ignore the renegotiation SCSV, which is not a negotiable cipher.
+        if (suite != 0x00ffU) {
+#if AA_TLS_ALLOW_STATIC_RSA_COMPATIBILITY
+            EXPECT_TRUE(suite == 0xc02fU || suite == 0xc030U || suite == 0x009cU || suite == 0x009dU)
+                << suite;
+#else
+            EXPECT_TRUE(suite == 0xc02fU || suite == 0xc030U) << suite;
+#endif
+        }
+    }
+    EXPECT_TRUE(ecdhe);
 }
 
 TEST(TlsRecordCodec, SealOpenRoundTripsWithExactOverhead) {
