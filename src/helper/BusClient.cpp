@@ -94,7 +94,7 @@ core::Result<State> BusClient::acquire_ap(Source source) {
 core::Result<void> BusClient::cancel(core::ConsumerId generation, core::PairingRequestId source) {
     return impl_->invalidate({generation.value, source.value});
 }
-void BusClient::teardown(core::ConsumerId generation) { (void)impl_->invalidate({generation.value, 0}); }
+void BusClient::teardown(core::ConsumerId generation) { impl_->invalidate_for_teardown({generation.value, 0}); }
 RevocationAttempt BusClient::forgotten_v1(const RevocationV1& snapshot, const RevocationProgress& progress) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
     const auto peer = revocation_peer(snapshot);

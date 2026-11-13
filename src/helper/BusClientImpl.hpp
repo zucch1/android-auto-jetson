@@ -106,11 +106,19 @@ struct BusClient::Impl {
         const auto result = rpc("Invalidate", "tt", writer, until);
         return result ? core::Result<void>{} : core::Result<void>{result.error()};
     }
+    // Pairing cancellation: bounded, and a failure is reported so the caller
+    // can track and retry the retirement.
     core::Result<void> invalidate(Source source) {
         const auto until = Clock::now() + std::chrono::milliseconds(500);
         std::unique_lock lock{mutex, std::defer_lock};
         if (!lock.try_lock_until(until)) return Error{ErrorCode::timeout};
         return invalidate_locked(source, until);
+    }
+    // Consumer teardown: local authority must always be cleared, so wait for an
+    // in-flight call to release the lock instead of giving up after 500 ms.
+    void invalidate_for_teardown(Source source) {
+        const std::lock_guard lock{mutex};
+        (void)invalidate_locked(source, Clock::now() + std::chrono::milliseconds(500));
     }
     core::Result<ObservedPeer> observe(Clock::time_point until) {
         ObservedPeer peer;
