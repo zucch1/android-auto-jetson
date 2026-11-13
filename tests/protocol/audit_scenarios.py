@@ -335,6 +335,145 @@ def sc_triage_invalid_disposition(f: Path) -> str:
     return "TRIAGE_INVALID"
 
 
+def sc_triage_missing_metadata(f: Path) -> str:
+    triage = load(f, TRIAGE)
+    first_id = next(iter(triage["entries"]))  # type: ignore[index]
+    del triage["entries"][first_id]["severity"]  # type: ignore[index]
+    save(f, TRIAGE, triage)
+    return "TRIAGE_INVALID"
+
+
+def sc_sentinel_false_match(f: Path) -> str:
+    inv = load(f, INVENTORY)
+    pairs = inv["matching"]["pairs"]  # type: ignore[index]
+    for p in pairs:
+        if (
+            p["aasdk"] == "aap_protobuf.service.navigationstatus.message.NavigationNextTurnEvent.NextTurnEnum"
+            and p["oaa"] == "oaa.proto.enums.ChannelType.Enum"
+        ):
+            raise SystemExit("FAIL: NextTurnEnum falsely matched with ChannelType.Enum")
+    diff_ids = {d["id"] for d in inv["differences"]}  # type: ignore[index]
+    if "W-9c966a940eba" in diff_ids:
+        raise SystemExit("FAIL: false enum diff W-9c966a940eba still present")
+    sys.path.insert(0, str(f / TOOL_DIR))
+    import proto_compare as pc  # type: ignore[import-not-found]
+    import proto_schema as ps  # type: ignore[import-not-found]
+
+    set_a = ps.build_schema_set({
+        "service/nav/TurnKind.proto": (
+            'syntax = "proto2";\n'
+            "package aap_protobuf.service.nav;\n"
+            "enum TurnKind {\n"
+            "  UNKNOWN = 0;\n"
+            "  SLIGHT_TURN = 1;\n"
+            "  U_TURN = 2;\n"
+            "  ROUNDABOUT = 3;\n"
+            "}\n"
+        ),
+        "service/nav/RouteHint.proto": (
+            'syntax = "proto2";\n'
+            "package aap_protobuf.service.nav;\n"
+            "message RouteHint {\n"
+            "  optional int32 unknown = 1;\n"
+            "  optional int32 road_class = 2;\n"
+            "}\n"
+        ),
+    })
+    set_b = ps.build_schema_set({
+        "common/SlotKind.proto": (
+            'syntax = "proto2";\n'
+            "package oaa.proto.enums;\n"
+            "enum SlotKind {\n"
+            "  UNKNOWN = 0;\n"
+            "  AUDIO_SINK_GUIDANCE = 1;\n"
+            "  AUDIO_SINK_MEDIA = 2;\n"
+            "  VIDEO_SINK = 3;\n"
+            "}\n"
+        ),
+        "common/SlotMeta.proto": (
+            'syntax = "proto2";\n'
+            "package oaa.proto.data;\n"
+            "message SlotMeta {\n"
+            "  optional int32 unknown = 1;\n"
+            "  optional int32 slot_rank = 2;\n"
+            "}\n"
+        ),
+    })
+    matched = pc.match_sets(set_a, set_b, {"pairs": [], "no_counterpart": []})
+    if matched["pairs"]:
+        raise SystemExit(f"FAIL: sentinel-only synthetic schemas matched: {matched['pairs']}")
+    return ""
+
+
+def sc_genuine_rename_still_matches(f: Path) -> str:
+    inv = load(f, INVENTORY)
+    pair_map = {(p["aasdk"], p["oaa"]) for p in inv["matching"]["pairs"]}  # type: ignore[index]
+    expected_pairs = (
+        (
+            "aap_protobuf.service.radio.message.HdAcquisionState",
+            "oaa.proto.messages.LegacyHdAcquisitionState",
+        ),
+        (
+            "aap_protobuf.service.sensorsource.message.SensorBatch",
+            "oaa.proto.messages.SensorEventIndication",
+        ),
+        (
+            "aap_protobuf.service.navigationstatus.message.NavigationNextTurnEvent",
+            "oaa.proto.messages.NavigationTurnEvent",
+        ),
+    )
+    for pair in expected_pairs:
+        if pair not in pair_map:
+            raise SystemExit(f"FAIL: genuine rename pair stopped matching: {pair}")
+    sys.path.insert(0, str(f / TOOL_DIR))
+    import proto_compare as pc  # type: ignore[import-not-found]
+    import proto_schema as ps  # type: ignore[import-not-found]
+
+    set_a = ps.build_schema_set({
+        "service/nav/GuidanceStep.proto": (
+            'syntax = "proto2";\n'
+            "package aap_protobuf.service.nav;\n"
+            "enum GuidanceAction {\n"
+            "  UNKNOWN = 0;\n"
+            "  DEPART = 1;\n"
+            "  TURN_LEFT = 2;\n"
+            "  MERGE = 3;\n"
+            "}\n"
+            "message GuidanceStep {\n"
+            "  optional string road_name = 1;\n"
+            "  optional int32 distance_meters = 2;\n"
+            "  optional uint32 turn_angle = 3;\n"
+            "}\n"
+        ),
+    })
+    set_b = ps.build_schema_set({
+        "nav/RouteStep.proto": (
+            'syntax = "proto3";\n'
+            "package oaa.proto.messages;\n"
+            "enum RouteManeuver {\n"
+            "  NONE = 0;\n"
+            "  DEPART = 1;\n"
+            "  TURN_LEFT = 2;\n"
+            "  MERGE = 3;\n"
+            "  EXIT_RAMP = 4;\n"
+            "}\n"
+            "message RouteManeuverStep {\n"
+            "  string road_name = 1;\n"
+            "  int32 distance_meters = 2;\n"
+            "  uint32 turn_angle = 3;\n"
+            "  string street_hint = 4;\n"
+            "}\n"
+        ),
+    })
+    matched = pc.match_sets(set_a, set_b, {"pairs": [], "no_counterpart": []})
+    got = {(p["aasdk"], p["oaa"]) for p in matched["pairs"]}
+    if ("aap_protobuf.service.nav.GuidanceAction", "oaa.proto.messages.RouteManeuver") not in got:
+        raise SystemExit(f"FAIL: genuine renamed enum failed to match: {matched}")
+    if ("aap_protobuf.service.nav.GuidanceStep", "oaa.proto.messages.RouteManeuverStep") not in got:
+        raise SystemExit(f"FAIL: genuine renamed message failed to match: {matched}")
+    return ""
+
+
 SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "baseline": sc_baseline,
     "drift-inventory": sc_drift_inventory,
@@ -367,6 +506,9 @@ SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "triage-missing-diff": sc_triage_missing_diff,
     "triage-dangling-diff": sc_triage_dangling_diff,
     "triage-invalid-disposition": sc_triage_invalid_disposition,
+    "triage-missing-metadata": sc_triage_missing_metadata,
+    "sentinel-false-match": sc_sentinel_false_match,
+    "genuine-rename-still-matches": sc_genuine_rename_still_matches,
 }
 
 

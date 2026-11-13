@@ -259,7 +259,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B tools/protocol/protobuf_audit.py --check
-          for case in baseline drift-inventory report-drift missing-file tampered-proto unpinned-file listing-tampered repin-comment field-number-changed field-type-changed enum-value-removed new-unmatched-message vanished-difference unparsed-construct finding-dangling-diff uncovered-by-removal duplicate-id missing-field invalid-disposition status-mismatch unexplained-deletion nonlegacy-deletion legacy-altered citation-broken absence-stale crosslink-dangling orphan-finding mapping-dangling triage-missing-diff triage-dangling-diff triage-invalid-disposition; do
+          for case in baseline drift-inventory report-drift missing-file tampered-proto unpinned-file listing-tampered repin-comment field-number-changed field-type-changed enum-value-removed new-unmatched-message vanished-difference unparsed-construct finding-dangling-diff uncovered-by-removal duplicate-id missing-field invalid-disposition status-mismatch unexplained-deletion nonlegacy-deletion legacy-altered citation-broken absence-stale crosslink-dangling orphan-finding mapping-dangling triage-missing-diff triage-dangling-diff triage-invalid-disposition triage-missing-metadata sentinel-false-match genuine-rename-still-matches; do
             python3 -B tests/protocol/audit_scenarios.py "$PWD" "$case"
           done
 

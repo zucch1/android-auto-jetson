@@ -146,7 +146,10 @@ set(AA_PROTOCOL_AUDIT_CASES
     mapping-dangling
     triage-missing-diff
     triage-dangling-diff
-    triage-invalid-disposition)
+    triage-invalid-disposition
+    triage-missing-metadata
+    sentinel-false-match
+    genuine-rename-still-matches)
 foreach(case IN LISTS AA_PROTOCOL_AUDIT_CASES)
     string(REPLACE "-" "_" test_suffix "${case}")
     add_test(NAME protocol_adapter_audit_${test_suffix}
