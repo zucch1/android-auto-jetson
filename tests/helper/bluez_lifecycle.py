@@ -46,6 +46,21 @@ def unregister_stays_off(build: Path) -> None:
             command(surface.mock, "paired")
             error, handle = rpc(surface, "poll")
             assert error == 0 and handle
+            # Establish a managed bond through explicit consent before testing trusted reconnect.
+            assert rpc(surface, f"bind {handle} 100")[0] == 0
+            error, enrolled = rpc(surface, "issue 100")
+            assert error == 0 and rpc(surface, f"open {enrolled}")[0] == 0
+            command(surface.mock, "comparison-start")
+            challenge = [0]
+            def presented():
+                error, challenge[0] = rpc(surface, "comparison 100")
+                return error == 0 and challenge[0] != 0
+            wait(presented)
+            assert rpc(surface, f"respond 100 {challenge[0]}")[0] == 0
+            assert rpc(surface, "bond 100") == (0, 1)
+            assert rpc(surface, "close")[0] == 0
+            error, handle = rpc(surface, "poll")
+            assert error == 0 and handle
             assert rpc(surface, f"bind {handle} 1")[0] == 0
             error, grant = rpc(surface, "issue 1")
             assert error == 0 and grant

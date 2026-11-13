@@ -249,7 +249,8 @@ def rollback_flow(surface: Surface) -> None:
     rejected(surface.consumer, "ConfirmPhonePairing", GLib.Variant("(t)", (request,)))
     assert surface.phone() == 0
     assert command(surface.receiver, "pending-revocations") == "0"
-    assert len(surface.state()["removed"]) == 0
+    wait(lambda: len(surface.state()["removed"]) == 1)
+    assert command(surface.receiver, "pending-pairings") == "0"
     print("PASS helper_failure_never_approves_and_closes_window", flush=True)
 
 

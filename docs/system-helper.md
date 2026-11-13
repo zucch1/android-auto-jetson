@@ -106,14 +106,15 @@ The helper-only operations can share the client from another thread; destruction
 requires callers to have finished. Wired clients without this dependency do not
 gain helper authority: committed forget now reports required AP work as pending,
 not implicit cleanup success. The actual `ControlService::confirm_phone_pairing`
-path invokes it only after registered-consumer UID/name authorization,
-`PairingGate::confirm`, and `PhoneDirectory::pairing_confirmed` all succeed.
-`PairingOpened` is emitted only after the bridge succeeds. Listening for or
-forging that signal never mints grants. No session D-Bus method proxies Issue.
-
-A helper error closes the control gate and invalidates the source; trust may
-already be persisted and is **not rolled back**. The pre-existing
-`trust_store_not_durable` approval outcome never calls the bridge. Cancel,
+path invokes the helper after registered-consumer UID/name authorization and
+`PairingGate::confirm`, before any phone approval is persisted. For numeric
+comparison this only opens a pending in-memory enrolment. The consumer must
+retrieve and explicitly accept the one-time comparison, and the helper must
+acknowledge the exact bond through `PairingBondConfirmedV1`, before the shared
+approval routine writes the trust store. `PairingOpened` describes admission;
+listening for or forging that signal never mints grants. No session D-Bus
+method proxies Issue. A helper error retires the pending request without approval.
+Cancel,
 consumer teardown/owner loss, successful or committed-not-durable forget, and
 control-service shutdown invalidate helper authority. Committed forget invalidates
 only the retired phone's sources locally and remotely, then sends narrow revocation
@@ -175,14 +176,15 @@ Lost replies remain unknown outcomes: this is neither globally exactly-once nor
 crash-durable revocation. NM retains its in-flight rotation latch. BlueZ managed
 identities are durably recorded in `/var/lib/aa-system-helper/managed-bonds`
 (versioned exact address/adapter pairs, at most 256). The helper commits the
-allow-list before enabling pairing; a trusted reconnect is admitted only for an
+allow-list only after explicit comparison acceptance and exact bond verification,
+before acknowledging the bond to the receiver. Pending admission writes nothing.
+A trusted reconnect is admitted only for an
 identity already on the list and never adds one. It loads
 only an owner-only regular file in a private, owner-validated directory, using
 no-follow path traversal. Writes use an exclusive, randomly named 0600 staging file (EINTR retried), file
-fsync, atomic rename and directory fsync. A write failure refuses only the NEW
-admission; revocation of every entry already stored, or already renamed into
+fsync, atomic rename and directory fsync. A write failure refuses the new bond acknowledgement; revocation of every entry already stored, or already renamed into
 place when only the directory fsync failed, keeps working. After a failed
-directory fsync that entry is not admitted again until a later fsync succeeds.
+directory fsync a new bond acknowledgement for that entry requires a later successful fsync.
 Stored state that is invalid at startup makes the helper log the reason and
 exit, so bonds are never forgotten silently; global BlueZ inventory never grants
 revocation authority. Historical entries are retained for idempotent revocation
@@ -209,6 +211,7 @@ the helper does not expose Introspectable). Methods:
 | BindPeerV1 | `ttt` generation, request source, observed handle | `ut` error, zero | Snapshot binding before confirmation, no radio exposure |
 | ReconnectPeerV1 | `t` observed handle | `ut` error, state | Store-owner exact lookup followed by helper actual-bond check |
 | RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only previously managed exact identity; re-resolve BlueZ object, never accept a supplied path |
+| PairingBondConfirmedV1 | `tt` generation, request source | `ut` error, bonded boolean | Exact accepted bond and durable helper ownership, before receiver approval |
 | GetPairingComparisonV1 | `tt` generation, request source | `utuss` error, challenge ID, comparison, address, adapter | Authenticated consumer-only retrieval during explicit enrollment |
 | RespondPairingComparisonV1 | `tttu` generation, request source, challenge ID, accept | `ut` error, reserved zero | Explicit human decision after retrieval; one use, same enrollment/peer/deadline |
 

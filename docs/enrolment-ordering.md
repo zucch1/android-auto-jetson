@@ -5,6 +5,8 @@ this is an in-memory pending enrolment, not approval. The consumer must retrieve
 the bound six-digit challenge and explicitly accept its one-time token. The
 receiver then polls `PairingBondConfirmedV1`: the helper verifies that the exact
 captured BlueZ owner, device and adapter incarnations still exist and are bonded.
+The helper persists its managed-bond ownership only after this explicit acceptance
+and exact bond verification; pending admission does not create managed-bonds state.
 Only a successful bond acknowledgement permits the shared `persist_pairing`
 routine to call `PhoneDirectory::pairing_confirmed`. The non-comparison flow
 continues to use that same persistence routine after helper confirmation (M10).

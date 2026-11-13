@@ -5,7 +5,8 @@ TEST_P(WirelessD6Admission, MissingChainLinkNeverReleasesCredentialsOrChangesTru
     const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
     const auto scenario = GetParam();
     if (scenario != 0) { ASSERT_TRUE(store->approve(identity)); }
-    if (scenario != 1 && scenario != 2) { ASSERT_EQ(bluez.command("paired"), "ok"); }
+    if (scenario == 1 || scenario == 2) { ASSERT_EQ(bluez.command("unpaired"), "ok"); }
+    else { ASSERT_EQ(bluez.command("paired"), "ok"); }
     const auto count = store->phones().size();
     if (scenario != 2 && scenario != 3) {
         const auto incoming = bluez.command("NewConnection");

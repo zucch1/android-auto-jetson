@@ -160,7 +160,7 @@ def probe_flow(surface: Surface) -> None:
     assert command(surface.mock, "comparison-result") == "rejected"
     assert rpc(f"reconnect {expiring}")[0] == 1001
     assert rpc(f"open {expired_grant}")[0] == 1001
-    assert command(surface.mock, "fd-eof") == "closed"
+    # NewConnection was rejected above: the mock never created a profile socket.
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     wait(lambda: len(surface.state()["removed"]) == removed_before + 1)
     print("PASS comparison_timeout_wrong_source_and_monotonic60s_idle_expiry", flush=True)
