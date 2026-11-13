@@ -31,6 +31,14 @@ Matched pairs by evidence: `explicit-mapping` 27, `name:normalized` 16, `name:re
 
 *Wrapper* = the OAA `message Foo { enum Enum {…} }` namespace idiom: an empty message that is never used as a field type; its nested enum is matched like any other enum.
 
+### Matcher heuristic boundaries & exceptions
+
+- **Enums require non-zero, non-sentinel value-name corroboration (intended conservatism)**: step 4 (`structure`) rejects any enum candidate with zero shared non-zero, non-sentinel value names (`nso < 1`). Value `0` entries (regardless of name) and named sentinels (`UNKNOWN`, `NONE`, `UNSPECIFIED`, `INVALID`, etc.) never corroborate, and path/package similarity alone cannot pair renamed enums; genuine renames with zero shared non-zero names require `explicit-mapping` or `propagated:field-position`.
+- **Small messages (`< 4` fields) require field-name corroboration**: step 4 rejects `< 4`-field messages unless they share at least one normalized non-sentinel field name at the same tag number (`nso >= 1`).
+- **Large messages (`>= 4` fields) allow path+shape fallback (accepted heuristic limit)**: messages with `>= 4` fields, mutual-unique-best `(tag, wire)` Jaccard `>= 0.75`, and at least one shared normalized path/package token (`path_package_overlap >= 1`) match even when `nso == 0`. Accepted because genuine refactored renames (`NavigationNextTurnEvent <-> NavigationTurnEvent`, 6 fields; `SensorBatch <-> SensorEventIndication`, 22/26 `len` fields — the only 2 production pairs using this path) rely on it; unrelated same-domain messages with identical `(tag, wire)` shapes remain a documented false-positive boundary managed via `protobuf-audit-mapping.json`.
+- **Name-collision floor (`MIN_NAME_SCORE = 0.25`)**: same-name pairs with structural Jaccard `< 0.25` are held in `undecided` rather than matched.
+- **Field-position propagation floors**: `propagated:field-position` pairs unmatched child types at the same tag of an already-matched parent only when structural Jaccard is `>= 0.6` (messages) or `>= 0.5` (enums).
+
 ## Generated differences
 
 | Class | Count | Meaning |
