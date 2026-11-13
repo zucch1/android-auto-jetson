@@ -22,7 +22,7 @@ To prevent confusion between host tests, cross-compilation, and device qualifica
 - **`aa-wired-receiver`**: Unprivileged receiver daemon running in user session. Owns USB/AOA and TCP transports, AASDK protocol translation, session state machine, media routing, and the user-session D-Bus control service (`org.custom.AndroidAutoReceiver`).
 - **`aa-system-helper`**: Privileged daemon managing NetworkManager AP, BlueZ Android Auto RFCOMM profile bootstrap, one-use grants, and caller UID/PID verification.
 - **`aa-dummy-display`**: Qt6 test display consuming encoded H.264 access units over a bounded `AF_UNIX` `SOCK_SEQPACKET` socket, with GStreamer hardware decode and a 5 ms precise timer pump (`tools/dummy-display/pump_timer.hpp`) for A/V synchronization.
-- **Audio pipeline**: Multi-role audio sink (`aareceiver-audio`) supporting `pulsesink` (default, via `pipewire-pulse` for continuous playback stability) and `pipewiresink`, with A/V sync gating.
+- **Audio pipeline**: Multi-role audio sink (`aareceiver-audio`) supporting `pulsesink` (default and only supported real-time route, via `pipewire-pulse`; `pipewiresink` is refused at startup on PipeWire 1.0.5 / Ubuntu noble), with A/V sync gating.
 - **D-Bus control contract**: Versioned interface `org.custom.AndroidAutoReceiver1` (12 methods, 5 signals) with peer credential verification and pairing gates.
 - **Trust store**: Persistent identity allowlist (`aa_trust`) with atomic file persistence and fail-closed admission; wired identifiers represent physical-access trust rather than cryptographic proof and are spoofable (`include/aa/trust/Store.hpp:5-23`).
 - **Diagnostics**: Structured JSON event telemetry with salted identifier pseudonymization (`id-<hex>`).

@@ -311,6 +311,8 @@ class RouterAudioSink final : public aa::protocol::MessageSink {
 
 inline aa::audio::RouterConfig pcm_router_config() {
     aa::audio::RouterConfig config;
+    // Uses pulsesink: the only supported production real-time route (pipewiresink is refused, #80).
+    config.backend = aa::audio::SinkBackend::pulse;
     config.output_format = aa::audio::AudioFormat{48000, 2, 16};
     for (auto &role : config.roles) {
         role.codec = aa::audio::Codec::pcm;

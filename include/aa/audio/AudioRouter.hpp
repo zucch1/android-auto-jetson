@@ -28,9 +28,10 @@ namespace aa::audio {
 // PipeWire-capable element is usable the router degrades typed and never
 // silently misroutes. pipewiresink routes to PipeWire natively; pulsesink
 // routes via the PulseAudio-compatible layer (pipewire-pulse on a PipeWire
-// host). Real-time selection uses that ring buffer. Native pipewiresink is
-// refused with audio_sink_quantum_unverified: its public API cannot verify
-// the negotiated graph quantum or report changes (#80).
+// host). pulsesink is the default and only supported real-time route: on the
+// target (PipeWire 1.0.5, Ubuntu noble) pipewiresink has no rate control and
+// degrades after 1.5-2.3 h, and no fixed PipeWire is packaged for noble.
+// Explicit pipewire requests are refused outright at startup (#80).
 enum class SinkBackend : std::uint8_t { automatic, pipewire, pulse };
 
 [[nodiscard]] std::string_view to_string(SinkBackend backend) noexcept;
@@ -62,8 +63,9 @@ struct SinkSelection final {
 [[nodiscard]] SinkReport probe_sinks();
 
 // Pure selection policy over a probe report. Explicit requests never
-// downgrade silently: an unsatisfiable request is unusable with a recorded
-// "disabled:" cause. automatic selects only the ring-buffer pulsesink path.
+// downgrade silently: pipewire is refused outright naming pulsesink as the
+// supported route, and automatic selects only pulsesink without falling back
+// to pipewiresink.
 [[nodiscard]] SinkSelection select_sink_backend(const SinkReport& report,
                                                 SinkBackend request);
 
@@ -205,8 +207,8 @@ struct RouterConfig final {
     LivePcmDriftPolicy live_pcm_drift{};
     std::function<void(const SinkWriteProgress&)> on_sink_write_progress{};
     // render_step() interval bound. Keep the qualified 50 ms batching value.
-    // Production uses the Pulse ring buffer; native pipewiresink is refused
-    // because its one-buffer-per-cycle capacity cannot be verified (#80).
+    // Production uses pulsesink; native pipewiresink is refused on PipeWire
+    // 1.0.5 / Ubuntu noble due to missing rate control and long-run degradation (#80).
     core::Nanoseconds render_quantum{core::Nanoseconds{50'000'000}};
 };
 

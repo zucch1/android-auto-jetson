@@ -19,7 +19,7 @@
 | session | `include/aa/session/*` | session state machine, lifecycle deadlines, event dispatch | implemented (`src/session/*`) |
 | channels | `include/aa/channels/*` | capability advertisement, service dispatch, AV/input/sensor/microphone sinks | implemented (`src/channels/*`) |
 | ipc | `include/aa/ipc/*` | D-Bus control surface contract (`org.custom.AndroidAutoReceiver1`), pairing gate, video socket, input socket | implemented (`src/ipc/*`, `src/ipc/video`, `src/ipc/dbus_adapter`) |
-| audio | `include/aa/audio/*` | multi-role PCM audio routing and sink boundary, A/V sync gating; supports `pulsesink` (default) and `pipewiresink` backends | implemented (`src/audio/*`, `src/audio/gstreamer_adapter`) |
+| audio | `include/aa/audio/*` | multi-role PCM audio routing and sink boundary, A/V sync gating; `pulsesink` is the default and only supported real-time route (`pipewiresink` is refused on PipeWire 1.0.5 / Ubuntu noble) | implemented (`src/audio/*`, `src/audio/gstreamer_adapter`) |
 | trust | `include/aa/trust/*` | persistent identity allowlist, atomic persistence, fail-closed admission (wired identifiers are spoofable) | implemented (`src/trust/*`) |
 | config | `include/aa/config/*` | typed validated configuration boundary, fail-closed jurisdiction rules | implemented (`src/config/*`) |
 | diagnostics | `include/aa/diagnostics/*` | structured JSON events, privacy redaction (salted pseudonyms), ring buffers | implemented (`src/diagnostics/*`) |
@@ -40,7 +40,7 @@
 
 - **Session thread** (`aa::core::SessionThread`): the single serialized owner of all session state (state machine, channel registry, active consumer, trust decisions). Other threads only `post()` tasks; posted tasks run FIFO, never concurrently, and must not throw. `request_stop()` drops queued work and fires the C++20 stop token that transports and helper calls observe.
 - **Transport I/O**: each `aa::transport::Transport` owns its fd/USB handle/SSL object exclusively; it is called from the session thread and returns whole frames or typed errors. Raw handles never leave the adapter.
-- **Audio thread**: owns the `aa::audio::AudioSink` (GStreamer adapter supporting `pulsesink` [default via pipewire-pulse] and `pipewiresink` backends); PCM chunk spans are valid only for the duration of `write()`.
+- **Audio thread**: owns the `aa::audio::AudioSink` (GStreamer adapter using `pulsesink` [default and only supported real-time route via `pipewire-pulse`; `pipewiresink` is refused]); PCM chunk spans are valid only for the duration of `write()`.
 - **Display pump**: Qt event loop runs on a 5 ms precise timer cadence (`tools/dummy-display/pump_timer.hpp`) to bound schedule-to-present latency and ensure A/V synchronization.
 - **IPC adapters**: D-Bus and socket adapters own their connections on their own threads and post parsed requests to the session thread.
 - **config**: immutable after `aa::config::validate()`; owned by the entry point.
@@ -78,7 +78,7 @@ The host-tested receiver listener and helper-owned RFCOMM bootstrap are implemen
 - Audio: ≤200 ms latency, ≤50 ms A/V skew (`aa::audio`).
 - Display pump cadence: 5 ms precise timer (`tools/dummy-display/pump_timer.hpp`), bounding schedule-to-present delay to pass the 50 ms A/V gate (PR #81).
 - A/V sync formula: `abs((video_done - video_stamp) - (audio_done - audio_begin))` schedule-to-completion latency difference.
-- Audio routing default: `pulsesink` via `pipewire-pulse` (PR #88) for long-run playback stability, selectable via `--audio-sink pulse|pipewire|automatic`.
+- Audio routing default: `pulsesink` via `pipewire-pulse` (PR #88) is the default and only supported real-time route (`--audio-sink automatic` selects `pulsesink`; `--audio-sink pipewire` fails at startup with `audio_sink_unavailable`, see [audio-quantum.md](docs/audio-quantum.md)).
 - `bench_defaults()` carries only the two video profiles. The wired receiver's service list (`service_descriptors` in `tools/wired-receiver/main.cpp`) advertises video, media, guidance and system audio, input, sensors and a 16 kHz mono microphone.
 
 ## Scope boundaries

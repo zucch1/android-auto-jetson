@@ -4169,6 +4169,7 @@ TEST(WiredReceiver, RealGstReversibleBlockSeparatesPairAdmissionFromMarkerHandof
         ConcreteAudioRenderWorker audio{pcm_router_config(), [&](const auto &config) {
             detail::SinkOpenRequest request;
             request.format = config.output_format;
+            request.backend = config.backend;
             auto outcome = real_runtime_sink(request);
             sink = outcome.sink.get();
             return detail::open_router_with_sink_for_test(config, std::move(outcome.sink));
@@ -5755,18 +5756,27 @@ TEST(WiredReceiver, RealGstMidStreamStallRecoversToRealTime) {
     EXPECT_LE(run.tail_sink_lag, 20'000'000);
 }
 
-// #60: the receiver routes through pulsesink by default (pipewiresink streams
-// degrade after ~1.5-2.3 h on this host's PipeWire 1.0.5 plugin); the flag
-// preserves the requested policy; the production opener guards native use.
+// #60/#80: the receiver routes through pulsesink by default (pipewiresink has
+// no rate control on PipeWire 1.0.5 / Ubuntu noble and degrades after ~1.5-2.3 h);
+// the flag preserves the requested backend and the production opener refuses
+// pipewire at startup without silent fallback.
 TEST(WiredReceiver, AudioSinkDefaultsToPulseAndFlagSelectsBackend) {
     EXPECT_EQ(pcm_router_config().backend, aa::audio::SinkBackend::pulse);
     EXPECT_EQ(pcm_router_config(aa::audio::SinkBackend::pipewire).backend,
               aa::audio::SinkBackend::pipewire);
     EXPECT_EQ(pcm_router_config(aa::audio::SinkBackend::automatic).backend,
               aa::audio::SinkBackend::automatic);
+    EXPECT_EQ(aa::audio::RouterConfig{}.backend, aa::audio::SinkBackend::automatic);
+
+    aa::audio::SinkReport report;
+    report.candidates = {{"pipewiresink", true, true, true, "READY"},
+                         {"pulsesink", true, true, true, "READY"}};
+    const auto automatic = aa::audio::select_sink_backend(report, aa::audio::SinkBackend::automatic);
+    EXPECT_TRUE(automatic.usable);
+    EXPECT_EQ(automatic.element, "pulsesink");
 }
 
-TEST(WiredReceiver, QuantumGuardReasonIsLoggedForOpenAndReopen) {
+TEST(WiredReceiver, NativeRefusalReasonIsLoggedForOpenAndReopen) {
     // Synthetic factory results exercise production selection and the actual
     // receiver log formatter without any audio server or physical device.
     aa::audio::SinkReport report;
@@ -5784,11 +5794,64 @@ TEST(WiredReceiver, QuantumGuardReasonIsLoggedForOpenAndReopen) {
         log_sink_selected(report, "open");
         log_sink_selected(report, "reopen");
         const auto output = captured_receiver_stdout();
-        EXPECT_NE(output.find("audio_sink_quantum_unverified"), std::string::npos);
+        EXPECT_NE(output.find("pipewiresink"), std::string::npos);
+        EXPECT_NE(output.find("pulsesink"), std::string::npos);
+        EXPECT_EQ(output.find("unverified"), std::string::npos);
         EXPECT_NE(output.find("\"origin\":\"open\""), std::string::npos);
         EXPECT_NE(output.find("\"origin\":\"reopen\""), std::string::npos);
         EXPECT_EQ(selection.usable, backend == aa::audio::SinkBackend::automatic);
     }
+}
+
+TEST(WiredReceiver, ExplicitPipewireFlagFailsAtStartupWithTypedErrorAndCause) {
+    char directory[] = "/tmp/wired-pipewire-refusal-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto store_path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore store{store_path};
+    ASSERT_TRUE(store.load().has_value());
+
+    struct Guard final {
+        const std::filesystem::path &root;
+        ~Guard() {
+            runtime_sink_request_override = {};
+            g_running.store(true);
+            std::error_code ec;
+            std::filesystem::remove_all(root, ec);
+        }
+    } guard{root};
+
+    runtime_sink_request_override = [](const aa::audio::detail::SinkOpenRequest &request) {
+        return real_runtime_sink(request);
+    };
+    runtime_connects.store(0);
+    g_running.store(true);
+
+    std::vector<std::string> args{
+        "receiver", "--port", "1-2.1", "--no-bus",
+        "--store", store_path.string(),
+        "--video-socket", (root / "video").string(),
+        "--input-socket", (root / "input").string(),
+        "--audio-sink", "pipewire"};
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (auto &arg : args) { argv.push_back(arg.data()); }
+
+    capture_receiver_stdout();
+    const int code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+    const auto output = captured_receiver_stdout();
+
+    EXPECT_EQ(code, 3) << output;
+    EXPECT_EQ(runtime_connects.load(), 0);
+    EXPECT_NE(output.find("\"event\":\"audio_sink_selected\",\"origin\":\"open\","
+                          "\"requested\":\"pipewire\",\"element\":\"\""),
+              std::string::npos) << output;
+    EXPECT_NE(output.find("pipewiresink"), std::string::npos) << output;
+    EXPECT_NE(output.find("pulsesink"), std::string::npos) << output;
+    EXPECT_NE(output.find("\"event\":\"err\",\"detail\":\"audio_router\","
+                          "\"code\":\"audio_sink_unavailable\""),
+              std::string::npos) << output;
+    EXPECT_EQ(output.find("\"event\":\"audio_write_completed\""), std::string::npos) << output;
+    EXPECT_EQ(output.find("\"event\":\"audio_chunks\""), std::string::npos) << output;
 }
 
 TEST(WiredReceiver, InvalidOrMissingAudioSinkValueIsUsageError) {

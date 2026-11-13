@@ -1678,7 +1678,7 @@ static SinkOpenOutcome open_sink(const SinkOpenRequest& request, bool native_qua
         for (const auto& candidate : outcome.report.candidates) {
             if (candidate.element == "pipewiresink" && candidate.viable) {
                 selection = {candidate.element, true,
-                    "test-only: unverified native quantum; not a realtime qualification"};
+                    "test-only: native pipewiresink adapter qualification (unsupported in production)"};
             }
         }
     }
@@ -1849,7 +1849,7 @@ SinkOpenOutcome open_default_sink(const SinkOpenRequest& request) {
     return open_sink(request, false);
 }
 
-SinkOpenOutcome open_unverified_native_sink_for_test(const SinkOpenRequest& request) {
+SinkOpenOutcome open_native_sink_for_test(const SinkOpenRequest& request) {
     return open_sink(request, true);
 }
 

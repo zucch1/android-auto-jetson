@@ -120,13 +120,14 @@ SinkSelection select_sink_backend(const SinkReport& report, SinkBackend request)
     SinkSelection selection;
     const SinkCandidate* chosen = nullptr;
 
-    // #80: pipewiresink's stop-and-wait handoff costs a graph cycle per
-    // buffer. Its public API exposes neither the negotiated quantum nor
-    // quantum changes; node.latency is only a suggestion. Fail closed rather
-    // than pretending a request or a successful render probe proves capacity.
+    // #80: pipewiresink is refused outright. On the target (PipeWire 1.0.5,
+    // Ubuntu noble) pipewiresink has no rate control and degrades after
+    // 1.5-2.3 h, and no fixed PipeWire is packaged for noble. pulsesink via
+    // pipewire-pulse is the default and only supported real-time route.
     constexpr std::string_view native_reason =
-        "audio_sink_quantum_unverified: pipewiresink cannot verify negotiated "
-        "graph quantum against render_quantum; use pulsesink ring buffer";
+        "pipewiresink_unsupported: pipewiresink has no rate control on PipeWire 1.0.5 / "
+        "Ubuntu noble and degrades after 1.5-2.3 h (no fixed PipeWire packaged for noble); "
+        "pulsesink is the supported real-time route";
     if (request == SinkBackend::pipewire) {
         selection.cause = "disabled: " + std::string{native_reason};
         return selection;
@@ -147,7 +148,6 @@ SinkSelection select_sink_backend(const SinkReport& report, SinkBackend request)
         bool first = true;
         for (const auto& candidate : report.candidates) {
             const bool wanted = request == SinkBackend::automatic
-                || (request == SinkBackend::pipewire && candidate.element == "pipewiresink")
                 || (request == SinkBackend::pulse && candidate.element == "pulsesink");
             if (!wanted) {
                 continue;
@@ -168,7 +168,7 @@ SinkSelection select_sink_backend(const SinkReport& report, SinkBackend request)
     selection.usable = true;
     if (request == SinkBackend::automatic) {
         selection.cause =
-            "enabled: falling back to pulsesink ring buffer; " + std::string{native_reason};
+            "enabled: falling back to pulsesink; " + std::string{native_reason};
     } else {
         selection.cause = "enabled: " + chosen->element + " runtime-detected viable";
     }
@@ -470,9 +470,10 @@ core::Result<AudioRouter> open_router_with_sink_for_test(const RouterConfig& con
     return open_router_with(config, std::move(sink));
 }
 
-core::Result<AudioRouter> open_router_with_unverified_native_sink_for_test(
-    const RouterConfig& config) {
-    return open_router_with(config, nullptr, open_unverified_native_sink_for_test);
+[[nodiscard]] SinkOpenOutcome open_native_sink_for_test(const SinkOpenRequest& request);
+
+core::Result<AudioRouter> open_router_with_native_sink_for_test(const RouterConfig& config) {
+    return open_router_with(config, nullptr, open_native_sink_for_test);
 }
 
 } // namespace detail
