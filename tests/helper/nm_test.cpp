@@ -746,7 +746,7 @@ TEST_F(NmDaemon, StrictPolicyAndCredentialFilesystem) {
 TEST_F(NmDaemon, CommittedForget703ReachesRealDaemonButPrecommitDoesNot) {
     start(); acquire(); ASSERT_TRUE(state(State::active));
     const auto before = read_text(directory / "state/ap.credentials");
-    const trust::TransportIdentity identity{trust::WirelessIdentity{"old-bond", "exact-adapter"}};
+    const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:02", "exact-adapter"}};
     const auto phone = store->approve(identity); ASSERT_TRUE(phone);
     trust::SteadyClock clock;
     trust::PairingPolicy phones{*store, clock};

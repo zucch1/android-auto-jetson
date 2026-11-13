@@ -61,6 +61,17 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return opened.error();
     }
+    if (confirmation_ != nullptr) {
+        const auto granted = confirmation_->confirmed(active.value().consumer, request);
+        if (!granted) {
+            // No approval has been persisted: retire the pending snapshot too.
+            phones_.pairing_cancelled(request);
+            confirmation_->cancel(active.value().consumer, request);
+            (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+            events_.emit(PairingClosed{request});
+            return granted.error();
+        }
+    }
     const auto approved = phones_.pairing_confirmed(request);
     if (!approved) {
         if (confirmation_ != nullptr) confirmation_->cancel(active.value().consumer, request);
@@ -68,16 +79,6 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
         events_.emit(PairingClosed{request});
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return approved.error();
-    }
-    if (confirmation_ != nullptr) {
-        const auto granted = confirmation_->confirmed(active.value().consumer, request);
-        if (!granted) {
-            // Approval may already be committed; helper failure is not a store rollback.
-            confirmation_->cancel(active.value().consumer, request);
-            (void)gate_.cancel({active.value().consumer, active.value().name}, request);
-            events_.emit(PairingClosed{request});
-            return granted.error();
-        }
     }
     open_pairing_ = OpenPairing{request, approved.value(), phones_.wireless_identity(approved.value()),
                                std::chrono::steady_clock::now() + std::chrono::seconds(60)};
@@ -124,7 +125,8 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
     const auto snapshot = phones_.take_revocation_v1();
     const auto peer = snapshot ? helper::revocation_peer(*snapshot) : std::nullopt;
     auto closed = phones_.take_invalidated_pairings();
-    if (open_pairing_ && (open_pairing_->phone == phone || (peer && open_pairing_->peer == peer))) {
+    if (open_pairing_ && (open_pairing_->phone == phone || (peer && open_pairing_->peer &&
+            phones_.same_wireless_identity(*peer, *open_pairing_->peer)))) {
         if (std::find(closed.begin(), closed.end(), open_pairing_->request) == closed.end())
             closed.push_back(open_pairing_->request);
         open_pairing_.reset();
