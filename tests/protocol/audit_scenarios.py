@@ -474,6 +474,118 @@ def sc_genuine_rename_still_matches(f: Path) -> str:
     return ""
 
 
+def sc_renamed_enums_path_only(f: Path) -> str:
+    # Probe (a): renamed enums sharing only path/package tokens and numeric 0..3 values
+    # must remain unpaired (intended conservatism: requires non-zero name overlap or explicit mapping).
+    sys.path.insert(0, str(f / TOOL_DIR))
+    import proto_compare as pc  # type: ignore[import-not-found]
+    import proto_schema as ps  # type: ignore[import-not-found]
+
+    set_a = ps.build_schema_set({
+        "nav/A.proto": (
+            'syntax = "proto2";\n'
+            "package aa.nav;\n"
+            "enum GuidanceAction {\n"
+            "  UNKNOWN = 0;\n"
+            "  LEFT = 1;\n"
+            "  RIGHT = 2;\n"
+            "  MERGE = 3;\n"
+            "}\n"
+        ),
+    })
+    set_b = ps.build_schema_set({
+        "nav/B.proto": (
+            'syntax = "proto2";\n'
+            "package bb.nav;\n"
+            "enum RouteManeuver {\n"
+            "  NONE = 0;\n"
+            "  PORT = 1;\n"
+            "  STARBOARD = 2;\n"
+            "  JOIN = 3;\n"
+            "}\n"
+        ),
+    })
+    matched = pc.match_sets(set_a, set_b, {"pairs": [], "no_counterpart": []})
+    if matched["pairs"]:
+        raise SystemExit(f"FAIL: path-only renamed enums unexpectedly matched: {matched['pairs']}")
+    return ""
+
+
+def sc_zero_only_enum_false_match(f: Path) -> str:
+    # Probe (b): unrelated enums sharing only a non-sentinel value-0 name (READY = 0)
+    # must be rejected because any value-0 entry is non-corroborating.
+    sys.path.insert(0, str(f / TOOL_DIR))
+    import proto_compare as pc  # type: ignore[import-not-found]
+    import proto_schema as ps  # type: ignore[import-not-found]
+
+    set_a = ps.build_schema_set({
+        "nav/A.proto": (
+            'syntax = "proto2";\n'
+            "package aa.nav;\n"
+            "enum TurnKind {\n"
+            "  READY = 0;\n"
+            "  LEFT = 1;\n"
+            "  RIGHT = 2;\n"
+            "  MERGE = 3;\n"
+            "}\n"
+        ),
+    })
+    set_b = ps.build_schema_set({
+        "nav/B.proto": (
+            'syntax = "proto2";\n'
+            "package bb.nav;\n"
+            "enum SlotKind {\n"
+            "  READY = 0;\n"
+            "  AUDIO = 1;\n"
+            "  VIDEO = 2;\n"
+            "  INPUT = 3;\n"
+            "}\n"
+        ),
+    })
+    matched = pc.match_sets(set_a, set_b, {"pairs": [], "no_counterpart": []})
+    if matched["pairs"]:
+        raise SystemExit(f"FAIL: value-0-only unrelated enums matched: {matched['pairs']}")
+    return ""
+
+
+def sc_message_path_shape_boundary(f: Path) -> str:
+    # Probe (c): >= 4-field messages in the same domain with identical (tag, wire) shape
+    # and nso=0 match under the documented MIN_STRUCT_STRONG path+shape rule.
+    sys.path.insert(0, str(f / TOOL_DIR))
+    import proto_compare as pc  # type: ignore[import-not-found]
+    import proto_schema as ps  # type: ignore[import-not-found]
+
+    set_a = ps.build_schema_set({
+        "nav/A.proto": (
+            'syntax = "proto2";\n'
+            "package aa.nav;\n"
+            "message RouteHint {\n"
+            "  optional int32 unknown = 1;\n"
+            "  optional int32 road_class = 2;\n"
+            "  optional int32 distance = 3;\n"
+            "  optional int32 angle = 4;\n"
+            "}\n"
+        ),
+    })
+    set_b = ps.build_schema_set({
+        "nav/B.proto": (
+            'syntax = "proto2";\n'
+            "package bb.nav;\n"
+            "message SlotMeta {\n"
+            "  optional int32 unknown = 1;\n"
+            "  optional int32 slot_rank = 2;\n"
+            "  optional int32 volume = 3;\n"
+            "  optional int32 frequency = 4;\n"
+            "}\n"
+        ),
+    })
+    matched = pc.match_sets(set_a, set_b, {"pairs": [], "no_counterpart": []})
+    got = {(p["aasdk"], p["oaa"], p["evidence"]) for p in matched["pairs"]}
+    if ("aa.nav.RouteHint", "bb.nav.SlotMeta", "structure") not in got:
+        raise SystemExit(f"FAIL: >=4-field message path+shape boundary did not match as documented: {matched}")
+    return ""
+
+
 SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "baseline": sc_baseline,
     "drift-inventory": sc_drift_inventory,
@@ -509,6 +621,9 @@ SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "triage-missing-metadata": sc_triage_missing_metadata,
     "sentinel-false-match": sc_sentinel_false_match,
     "genuine-rename-still-matches": sc_genuine_rename_still_matches,
+    "renamed-enums-path-only": sc_renamed_enums_path_only,
+    "zero-only-enum-false-match": sc_zero_only_enum_false_match,
+    "message-path-shape-boundary": sc_message_path_shape_boundary,
 }
 
 

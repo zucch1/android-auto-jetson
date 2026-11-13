@@ -149,7 +149,10 @@ set(AA_PROTOCOL_AUDIT_CASES
     triage-invalid-disposition
     triage-missing-metadata
     sentinel-false-match
-    genuine-rename-still-matches)
+    genuine-rename-still-matches
+    renamed-enums-path-only
+    zero-only-enum-false-match
+    message-path-shape-boundary)
 foreach(case IN LISTS AA_PROTOCOL_AUDIT_CASES)
     string(REPLACE "-" "_" test_suffix "${case}")
     add_test(NAME protocol_adapter_audit_${test_suffix}
