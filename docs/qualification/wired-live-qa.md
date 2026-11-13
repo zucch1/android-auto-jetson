@@ -59,14 +59,19 @@ composes the modules above and reimplements none of them.
 From the development checkout (bounded ssh, fail-closed):
 
 ```bash
-tools/wired-qa/run-wired-live-qa.sh --readiness-only \
-    --out /tmp/task-30-live-qa.json
+tools/wired-qa/run-wired-live-qa.sh --readiness-only
 
 tools/wired-qa/run-wired-live-qa.sh \
     --receiver /opt/aa/aa-wired-receiver \
-    --display  /opt/aa/aa-dummy-display \
-    --out /tmp/task-30-live-qa.json
+    --display  /opt/aa/aa-dummy-display
 ```
+
+Each invocation writes `result.json` with mode 0600 in a fresh private
+`$XDG_RUNTIME_DIR/aa-wired-live-qa.XXXXXX` directory (mode 0700) and prints
+the full result path. `XDG_RUNTIME_DIR` must name an existing directory.
+An explicit `--out` requires an existing parent directory that is not
+world-writable and a new file path; existing files and symlinks are refused.
+Use a private directory for explicit output, never a path directly under `/tmp`.
 
 The harness exits non-zero with a `BLOCKED` result (`blocked_on`) whenever a
 prerequisite is unmet - an unreachable host, an absent phone, an uninstalled

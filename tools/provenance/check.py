@@ -160,7 +160,7 @@ def main() -> int:
     if failures:
         print(f'provenance-check: FAIL violations={len(failures)}')
         return 1
-    print('provenance-check: PASS aasdk=564 sanitized=3 oaa=250 credential-copies=0')
+    print('provenance-check: PASS aasdk=564 sanitized=4 oaa=250 credential-copies=0')
     return 0
 
 

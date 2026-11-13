@@ -1,109 +1,48 @@
-# SSL/TLS Certificate Configuration
+# TLS credential configuration (downstream AASDK)
 
-## Overview
+## No bundled or embedded credentials
 
-This directory contains the SSL/TLS certificate and private key used by AASDK for Android Auto communication. These files are used during the SSL handshake between the head unit and the Android device.
+This directory intentionally contains no `headunit.crt` or `headunit.key`.
+The historical upstream certificate and private key were removed from this
+distribution. AASDK's `Cryptor::init()` has no embedded-certificate fallback and
+does not search `/etc/openauto`, `/usr/share/aasdk`, or relative `cert/` paths.
 
-## Files
+The old upstream instructions describing bundled credentials, automatic path
+fallback, embedded PEM data, and world-readable private-key installation do not
+apply to this tree.
 
-- **headunit.crt**: X.509 certificate (Google Automotive Link issued to JVC Kenwood)
-- **headunit.key**: RSA private key (2048-bit)
-- **.gitignore**: Protects custom certificates from being committed
+## Required credential input
 
-## Default Certificate
+The downstream adapter calls `aa::tls::load_credentials()`. Set `HU_KEY_PATH` to
+one PEM bundle containing, in order:
 
-The default certificate included (`headunit.crt`) is a publicly available certificate used in Android Auto head units. It is **not a secret** and is suitable for standard Android Auto functionality.
+1. the head-unit certificate;
+2. any intermediate CA certificates needed to build its chain; and
+3. the matching private key (`PRIVATE KEY`, `RSA PRIVATE KEY`, or
+   `EC PRIVATE KEY`).
 
-## Custom Certificates
+The loader fails closed when the variable is unset, the file cannot be read,
+the PEM structure is malformed, or the certificate and key do not match.
+Encrypted/password-protected private keys are not accepted.
 
-You can replace the default certificate with your own:
+## File security requirements
 
-1. Create custom certificate files:
-   - `custom_headunit.crt`
-   - `custom_headunit.key`
+`HU_KEY_PATH` must name a regular, non-symlink file owned by the receiver's
+effective UID, with exactly mode `0600` and exactly one hard link. The bundle
+must be non-empty and no larger than 65,536 bytes. Protect its parent
+directories against replacement as part of service deployment.
 
-2. These will be automatically ignored by git (see `.gitignore`)
-
-3. The application will try loading certificates from these paths in order:
-   - `/etc/openauto/headunit.crt` (installed location)
-   - `/usr/share/aasdk/cert/headunit.crt` (alternative system location)
-   - `./cert/headunit.crt` (development directory)
-   - `../cert/headunit.crt` (alternative development directory)
-
-4. If no certificate file is found, the application falls back to the embedded certificate in the code
-
-## Installation
-
-When building the aasdk package, the certificate files are automatically installed to `/etc/openauto/` with read-only permissions:
+Example for a service-specific account (substitute the actual account and
+paths):
 
 ```bash
-# Installed by debian package:
-/etc/openauto/headunit.crt  (owner: root, permissions: 0644)
-/etc/openauto/headunit.key  (owner: root, permissions: 0644)
+sudo install -o aa-receiver -g aa-receiver -m 0600 /secure/source/hu-bundle.pem \
+  /var/lib/aa-receiver/tls/hu-bundle.pem
+# The service environment must contain:
+# HU_KEY_PATH=/var/lib/aa-receiver/tls/hu-bundle.pem
 ```
 
-## Security Notes
-
-- The default certificate is public and **not confidential**
-- Custom certificates can be used for specific vendor requirements
-- The private key should be protected if using a custom certificate
-- Certificate files are loaded at runtime, allowing updates without recompilation
-
-## Usage
-
-The `Cryptor` class in AASDK automatically loads these certificates during initialization:
-
-```cpp
-// Certificate loading happens in Cryptor::init()
-std::string certContent = loadCertificate();  // Tries file paths, falls back to embedded
-std::string keyContent = loadPrivateKey();    // Tries file paths, falls back to embedded
-```
-
-Logging is enabled to show which certificate path was successfully loaded:
-```
-[INFO] [Cryptor] Loaded certificate from: /etc/openauto/headunit.crt
-```
-
-## Development
-
-During development, place your certificate files in the `cert/` directory:
-- `cert/headunit.crt`
-- `cert/headunit.key`
-
-The application will automatically find them using the relative path fallback mechanism.
-
-## Updating Certificates
-
-To update the certificate on an installed system:
-
-1. Copy new certificate files to `/etc/openauto/`:
-   ```bash
-   sudo cp new_headunit.crt /etc/openauto/headunit.crt
-   sudo cp new_headunit.key /etc/openauto/headunit.key
-   sudo chmod 644 /etc/openauto/headunit.*
-   ```
-
-2. Restart the service:
-   ```bash
-   sudo systemctl restart openauto
-   ```
-
-No recompilation required!
-
-## Troubleshooting
-
-If the certificate fails to load:
-
-1. Check file permissions:
-   ```bash
-   ls -l /etc/openauto/headunit.*
-   ```
-
-2. Verify certificate format (should be PEM):
-   ```bash
-   openssl x509 -in /etc/openauto/headunit.crt -text -noout
-   ```
-
-3. Check application logs for certificate loading messages
-
-4. The application will fall back to the embedded certificate if files cannot be read
+Do not install a private key with mode `0644`, and do not copy the removed
+historical credential back into this repository. Credential provisioning and
+rotation are deployment operations; this source tree neither generates nor
+installs a usable head-unit credential.

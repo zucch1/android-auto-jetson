@@ -11,8 +11,9 @@ tests/build/cross/build/
 .local/
 CMakeUserPresets.json
 
-# Local agent planning/evidence - never tracked
+# Local agent planning/evidence/workspaces - never tracked
 .omo/
+.claude/
 
 # Local codegraph index symlink
 .codegraph

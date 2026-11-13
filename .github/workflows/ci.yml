@@ -325,6 +325,10 @@ jobs:
           set -euo pipefail
           cmake --build --preset jetson-aarch64 --target aa_ipc_control aa_ipc_dbus
           python3 -B tests/dbus/assert_dbus_coverage.py --cross build/jetson-aarch64
+      - name: Verify hardening of every project-owned cross executable
+        run: |
+          set -euo pipefail
+          ctest --test-dir build/jetson-aarch64 --no-tests=error --output-on-failure -R '^build_hardening$'
       - name: State fixture-not-target scope in the step summary
         run: |
           set -euo pipefail
