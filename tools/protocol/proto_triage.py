@@ -1104,6 +1104,30 @@ def enrich_differences(
     return enriched, summary
 
 
+_FIELD_TAG_REF_RE: Final = re.compile(
+    r"\b(?:fields?|tags?)\s*[-:]?\s*(\d+(?:\s*[-/]\s*\d+)*)\b", re.IGNORECASE
+)
+_ENUM_VAL_REF_RE: Final = re.compile(
+    r"\bvalues?\s+(-?\d+(?:\s*/\s*-?\d+)*)\b", re.IGNORECASE
+)
+
+
+def _extract_ref_nums(rx: re.Pattern[str], text: str) -> set[int]:
+    out: set[int] = set()
+    for m in rx.finditer(text):
+        for part in re.split(r"\s*/\s*", m.group(1)):
+            rng = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part.strip())
+            if rng:
+                lo, hi = int(rng.group(1)), int(rng.group(2))
+                if lo <= hi and hi - lo <= 20:
+                    out.update(range(lo, hi + 1))
+                else:
+                    out.update((lo, hi))
+            else:
+                out.add(int(part.strip()))
+    return out
+
+
 def check_triage(
     triage_doc: dict[str, Any] | None,
     diffs: list[dict[str, Any]],
@@ -1119,6 +1143,7 @@ def check_triage(
         return ["TRIAGE_INVALID: 'entries' must be an object mapping difference IDs to triage records"]
 
     diff_ids = {d["id"] for d in diffs}
+    diffs_by_id = {d["id"]: d for d in diffs}
     enriched_by_id = {d["id"]: d for d in enriched} if enriched else {}
     for did in sorted(diff_ids - set(entries)):
         errors.append(f"TRIAGE_MISSING_DIFF: difference {did} has no triage entry in protobuf-audit-triage.json")
@@ -1134,6 +1159,25 @@ def check_triage(
             val = rec.get(req)
             if not isinstance(val, str) or not val.strip():
                 errors.append(f"TRIAGE_INVALID: triage entry {tid} missing required field '{req}'")
+        dkey = diffs_by_id[tid].get("key", "")
+        rat = rec.get("rationale")
+        if isinstance(rat, str):
+            if dkey.startswith("field "):
+                own_tag = int(dkey.split()[1])
+                refs = _extract_ref_nums(_FIELD_TAG_REF_RE, rat)
+                if refs and own_tag not in refs:
+                    errors.append(
+                        f"TRIAGE_INVALID: triage entry {tid} rationale references field/tag "
+                        f"{sorted(refs)} instead of its own {dkey}"
+                    )
+            elif dkey.startswith("value "):
+                own_val = int(dkey.split()[1])
+                refs = _extract_ref_nums(_ENUM_VAL_REF_RE, rat)
+                if refs and own_val not in refs:
+                    errors.append(
+                        f"TRIAGE_INVALID: triage entry {tid} rationale references value "
+                        f"{sorted(refs)} instead of its own {dkey}"
+                    )
         disp = rec.get("disposition")
         if disp not in ALLOWED_TRIAGE_DISPOSITIONS:
             errors.append(

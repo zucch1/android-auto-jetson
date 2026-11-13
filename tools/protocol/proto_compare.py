@@ -180,14 +180,12 @@ def path_package_overlap(a: dict[str, Any], b: dict[str, Any]) -> int:
     return len(path_package_tokens(a) & path_package_tokens(b))
 
 
-def non_sentinel_name_overlap(
-    kind: str, a: dict[str, Any], b: dict[str, Any], *, include_zero: bool = False,
-) -> int:
+def non_sentinel_name_overlap(kind: str, a: dict[str, Any], b: dict[str, Any]) -> int:
     """Count shared numbers with matching normalized non-sentinel names.
 
-    Sentinels (``UNKNOWN``, ``NONE``, ``UNSPECIFIED``, ``INVALID``, etc.) and, by
-    default, enum value ``0`` are excluded so generic placeholders cannot carry a
-    structural match.
+    Sentinels (``UNKNOWN``, ``NONE``, ``UNSPECIFIED``, ``INVALID``, etc.) and enum
+    value ``0`` (regardless of name) are excluded so generic placeholders cannot
+    carry a structural match.
     """
     if kind == "message":
         nb = {f["number"]: (f["name"], norm_name(f["name"])) for f in b["fields"]}
@@ -209,7 +207,7 @@ def non_sentinel_name_overlap(
     cnt = 0
     for v in a["values"]:
         n = v["number"]
-        if (not include_zero and n == 0) or n not in nb2:
+        if n == 0 or n not in nb2:
             continue
         na = norm_name(v["name"], pa)
         rb_raw, rb_norm = nb2[n]
@@ -427,7 +425,7 @@ def match_sets(
             pkg_sim = path_package_overlap(ea, eb)
             if nso < 1 and pkg_sim < 1:
                 continue
-            if kind == "enum" and nso < 1 and non_sentinel_name_overlap(kind, ea, eb, include_zero=True) < 1:
+            if kind == "enum" and nso < 1:
                 continue
             if kind == "message" and len(ea["fields"]) < MIN_STRUCT_STRONG and nso < 1:
                 continue
