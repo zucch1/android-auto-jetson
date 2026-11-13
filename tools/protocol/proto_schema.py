@@ -56,6 +56,127 @@ class ProtoParseError(ValueError):
 
 Token = tuple[str, str, int]  # (kind, text, line)
 
+_CONFIDENCE_RE: Final = re.compile(r"\bconfidence\s*:\s*([a-zA-Z0-9_-]+)", re.I)
+_RETRACTED_RE: Final = re.compile(r"\bretracted\b", re.I)
+_MSG_ID_RE: Final = re.compile(
+    r"(?:wire\s+msg(?:\s+id)?|msg(?:\s+id)?|message\s+id|ordinal)\s*[:=#]?\s*(0x[0-9a-fA-F]+|\d+)",
+    re.I,
+)
+_HEX_MSG_RE: Final = re.compile(r"\b(0x8[0-9a-fA-F]{3})\b")
+_DIR_RE: Final = re.compile(
+    r"(Phone\s*(?:->|→)\s*HU|HU\s*(?:->|→)\s*Phone|Bidirectional)",
+    re.I,
+)
+_VER_RE: Final = re.compile(
+    r"(?:AA\s*v?(\d+\.\d+)|Android\s+Auto\s+(\d+\.\d+)|PDK\s*<?\s*(\d+\.\d+)|HAL\s+(\d+\.\d+)|\b(16\.[12]|17\.[0-9])\b)",
+    re.I,
+)
+_DEPRECATED_CMT_RE: Final = re.compile(r"@deprecated|\bdeprecated\b", re.I)
+
+
+def _strip_comment(text: str) -> list[str]:
+    if text.startswith("//"):
+        return [text[2:].strip()]
+    if text.startswith("/*") and text.endswith("*/"):
+        lines: list[str] = []
+        for raw in text[2:-2].splitlines():
+            s = raw.strip().lstrip("*").strip()
+            if s:
+                lines.append(s)
+        return lines
+    return []
+
+
+def _normalize_dir(raw: str) -> str:
+    low = raw.lower()
+    if "bidirectional" in low:
+        return "Bidirectional"
+    if low.startswith("phone"):
+        return "Phone->HU"
+    if low.startswith("hu"):
+        return "HU->Phone"
+    return raw
+
+
+def _parse_comment_lines(lines: list[str]) -> dict[str, Any]:
+    confidences: list[str] = []
+    retracted = False
+    retraction_notes: list[str] = []
+    wire_ids: list[str] = []
+    directions: list[str] = []
+    versions: list[str] = []
+    deprecated = False
+    for line in lines:
+        for m in _CONFIDENCE_RE.finditer(line):
+            val = m.group(1).lower()
+            if val not in confidences:
+                confidences.append(val)
+            if val == "retracted":
+                retracted = True
+        if _RETRACTED_RE.search(line):
+            retracted = True
+            if "retraction" not in line.lower() or "retained" not in line.lower():
+                if len(retraction_notes) < 2 and line not in retraction_notes:
+                    retraction_notes.append(line)
+        for m in _MSG_ID_RE.finditer(line):
+            raw_id = m.group(1)
+            norm_id = f"0x{int(raw_id, 16):04X}" if raw_id.lower().startswith("0x") else raw_id
+            if norm_id not in wire_ids:
+                wire_ids.append(norm_id)
+        for m in _HEX_MSG_RE.finditer(line):
+            norm_id = f"0x{int(m.group(1), 16):04X}"
+            if norm_id not in wire_ids:
+                wire_ids.append(norm_id)
+        for m in _DIR_RE.finditer(line):
+            nd = _normalize_dir(m.group(1))
+            if nd not in directions:
+                directions.append(nd)
+        for m in _VER_RE.finditer(line):
+            v = next((g for g in m.groups() if g), "")
+            if v:
+                prefix = "PDK " if "pdk" in m.group(0).lower() else ("HAL " if "hal" in m.group(0).lower() else "AA ")
+                tag = f"{prefix}{v}"
+                if tag not in versions:
+                    versions.append(tag)
+        if _DEPRECATED_CMT_RE.search(line):
+            deprecated = True
+    return {
+        "confidence": confidences,
+        "retracted": retracted,
+        "retraction_note": "; ".join(retraction_notes),
+        "wire_msg_ids": sorted(wire_ids),
+        "directions": sorted(directions),
+        "version_gates": sorted(versions),
+        "deprecated_comment": deprecated,
+    }
+
+
+def extract_file_comments(content: str, path: str) -> dict[str, Any]:
+    """Extract per-line comment lines and file-level structured annotations."""
+    line_comments: dict[int, list[str]] = {}
+    all_lines: list[str] = []
+    pos = 0
+    line = 1
+    n = len(content)
+    while pos < n:
+        m = _TOKEN_RE.match(content, pos)
+        if m is None:
+            break
+        kind = m.lastgroup or ""
+        text = m.group(0)
+        if kind in ("lc", "bc"):
+            stripped = _strip_comment(text)
+            if stripped:
+                end_line = line + text.count("\n")
+                line_comments.setdefault(end_line, []).extend(stripped)
+                all_lines.extend(stripped)
+        line += text.count("\n")
+        pos = m.end()
+    return {
+        "file_annotations": _parse_comment_lines(all_lines),
+        "line_comments": line_comments,
+    }
+
 
 def tokenize(content: str, path: str) -> list[Token]:
     """Contiguous scan: every character is either consumed or an error."""
@@ -562,9 +683,58 @@ def build_schema_set(files: dict[str, str]) -> dict[str, Any]:
                                           f"field {f['number']} of {fqn} is reserved")
     for e in enums.values():
         e["values"].sort(key=lambda v: (v["number"], v["name"]))
+
+    comments_by_file = {path: extract_file_comments(files[path], path) for path in parsed}
+    top_entities_per_file: dict[str, int] = {}
+    for ent in (*msgs.values(), *enums.values()):
+        top_entities_per_file[ent["file"]] = top_entities_per_file.get(ent["file"], 0) + 1
+
+    for ent in (*msgs.values(), *enums.values()):
+        cinfo = comments_by_file[ent["file"]]
+        lc = cinfo["line_comments"]
+        raw_lines = files[ent["file"]].splitlines()
+        # Collect contiguous comment block directly above the entity declaration line
+        block: list[str] = []
+        cur = ent["line"] - 1
+        while cur >= 1:
+            if cur in lc:
+                block = lc[cur] + block
+                cur -= 1
+                continue
+            if 0 <= cur - 1 < len(raw_lines) and not raw_lines[cur - 1].strip():
+                cur -= 1
+                continue
+            break
+        # Also include file header comments (before line 1..first decl) if single-entity or top-level
+        fa = cinfo["file_annotations"]
+        ea = _parse_comment_lines(block)
+        if top_entities_per_file.get(ent["file"], 0) <= 2:
+            # Merge file-level annotations when the file represents one primary schema (or wrapper+enum)
+            merged_conf = list(dict.fromkeys([*ea["confidence"], *fa["confidence"]]))
+            merged_ret = ea["retracted"] or fa["retracted"]
+            merged_note = ea["retraction_note"] or fa["retraction_note"]
+            merged_ids = sorted(set(ea["wire_msg_ids"]) | set(fa["wire_msg_ids"]))
+            merged_dirs = sorted(set(ea["directions"]) | set(fa["directions"]))
+            merged_vers = sorted(set(ea["version_gates"]) | set(fa["version_gates"]))
+            ea = {
+                "confidence": merged_conf,
+                "retracted": merged_ret,
+                "retraction_note": merged_note,
+                "wire_msg_ids": merged_ids,
+                "directions": merged_dirs,
+                "version_gates": merged_vers,
+                "deprecated_comment": ea["deprecated_comment"] or fa["deprecated_comment"],
+            }
+        ent["annotations"] = ea
+
     file_info = {
-        path: {"syntax": p["syntax"], "package": p["package"], "imports": p["imports"],
-               "services": [s["name"] for s in p["services"]]}
+        path: {
+            "syntax": p["syntax"],
+            "package": p["package"],
+            "imports": p["imports"],
+            "services": [s["name"] for s in p["services"]],
+            "annotations": comments_by_file[path]["file_annotations"],
+        }
         for path, p in parsed.items()
     }
     # imports must resolve to a file in the same set (by suffix) - record, report later

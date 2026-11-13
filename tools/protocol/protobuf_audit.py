@@ -40,6 +40,7 @@ from typing import Any, Final
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import proto_compare as pc  # noqa: E402
 import proto_schema as ps  # noqa: E402
+import proto_triage as pt  # noqa: E402
 
 SCHEMA_VERSION: Final[str] = "aa-protobuf-audit-2"
 
@@ -72,6 +73,7 @@ INVENTORY_PATH: Final[str] = "docs/evidence/protobuf-audit-inventory.json"
 REPORT_PATH: Final[str] = "docs/evidence/protobuf-audit-report.md"
 MAPPING_PATH: Final[str] = "docs/evidence/protobuf-audit-mapping.json"
 FINDINGS_PATH: Final[str] = "docs/evidence/protobuf-audit-findings.json"
+TRIAGE_PATH: Final[str] = "docs/evidence/protobuf-audit-triage.json"
 REGISTRY_PATH: Final[str] = "docs/evidence/protobuf-audit-finding-registry.json"
 LEGACY_MATRIX_PATH: Final[str] = "docs/evidence/wire-conformance-matrix.json"
 PROVENANCE_INVENTORY_PATH: Final[str] = "third_party/provenance/inventory.json"
@@ -393,6 +395,7 @@ def difference_summary(diffs: list[dict[str, Any]]) -> dict[str, Any]:
 
 def finding_coverage(
     diffs: list[dict[str, Any]], findings: list[dict[str, Any]], accepted: list[dict[str, Any]],
+    triage_doc: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cover: dict[str, list[str]] = {}
     for f in findings:
@@ -401,11 +404,21 @@ def finding_coverage(
     for a in accepted:
         for did in a.get("covers", []) or []:
             cover.setdefault(did, []).append(a["id"])
+    triage_entries = (triage_doc or {}).get("entries", {})
+    if not isinstance(triage_entries, dict):
+        triage_entries = {}
     must = [d for d in diffs if d["class"] in MUST_COVER]
-    uncovered = [d["id"] for d in must if d["id"] not in cover]
+    uncovered = [
+        d["id"] for d in must
+        if d["id"] not in cover and d["id"] not in triage_entries
+    ]
     out: dict[str, Any] = {
         "must_cover_total": len(must),
         "covered_by_finding": sum(1 for d in must if any(not i.startswith("ACC-") for i in cover.get(d["id"], []))),
+        "covered_only_by_triage": sum(
+            1 for d in must
+            if d["id"] in triage_entries and not any(not i.startswith("ACC-") for i in cover.get(d["id"], []))
+        ),
         "covered_only_by_accepted": sum(
             1 for d in must if cover.get(d["id"]) and all(i.startswith("ACC-") for i in cover[d["id"]])),
         "uncovered": len(uncovered),
@@ -416,6 +429,10 @@ def finding_coverage(
         out["by_class"][cls] = {
             "total": len(sub),
             "covered_by_finding": sum(1 for d in sub if any(not i.startswith("ACC-") for i in cover.get(d["id"], []))),
+            "covered_only_by_triage": sum(
+                1 for d in sub
+                if d["id"] in triage_entries and not any(not i.startswith("ACC-") for i in cover.get(d["id"], []))
+            ),
             "covered_only_by_accepted": sum(
                 1 for d in sub if cover.get(d["id"]) and all(i.startswith("ACC-") for i in cover[d["id"]])),
         }
@@ -425,9 +442,10 @@ def finding_coverage(
 def build_inventory(
     root: Path, sources: dict[str, dict[str, Any]], sets: dict[str, dict[str, Any]],
     mapping: dict[str, Any], findings_doc: dict[str, Any], legacy_doc: dict[str, Any],
+    triage_doc: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     match = pc.compare(sets["aasdk"], sets["oaa"], mapping)
-    diffs = match["diffs"]
+    diffs, triage_summary = pt.enrich_differences(root, match["diffs"], sets, triage_doc)
     legacy_by_id = {d["id"]: d for d in legacy_doc.get("discrepancies", [])}
     findings = []
     for f in findings_doc.get("findings", []):
@@ -461,7 +479,7 @@ def build_inventory(
         }
     inv = {
         "schema": SCHEMA_VERSION,
-        "title": "AASDK-OAA protobuf schema audit: structural model, matching, generated differences, findings",
+        "title": "AASDK-OAA protobuf schema audit: structural model, matching, generated differences, findings, derived triage",
         "issue": "https://github.com/zucch1/android-auto-jetson/issues/62",
         "parent_issue": "https://github.com/zucch1/android-auto-jetson/issues/61",
         "sources": sources_out,
@@ -481,9 +499,10 @@ def build_inventory(
         },
         "differences": diffs,
         "difference_summary": difference_summary(diffs),
+        "triage_summary": triage_summary,
         "findings": findings,
         "accepted": accepted,
-        "findings_coverage": finding_coverage(diffs, findings_doc.get("findings", []), accepted),
+        "findings_coverage": finding_coverage(diffs, findings_doc.get("findings", []), accepted, triage_doc),
         "implementation_children": findings_doc.get("implementation_children", []),
     }
     return inv, match
@@ -496,6 +515,7 @@ def build_inventory(
 def check_findings(
     root: Path, findings_doc: dict[str, Any], diffs: list[dict[str, Any]],
     legacy_doc: dict[str, Any], registry: dict[str, Any] | None,
+    triage_doc: dict[str, Any] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     diff_ids = {d["id"] for d in diffs}
@@ -556,7 +576,12 @@ def check_findings(
         for rel in f.get("related", []) or []:
             if rel not in {x.get("id") for x in findings}:
                 errors.append(f"CROSSLINK_DANGLING: finding '{fid}' relates to unknown finding '{rel}'")
-    # accepted entries
+    # accepted entries are prohibited once per-difference triage is complete
+    if accepted:
+        errors.append(
+            f"ACCEPTED_BUCKET_NONEMPTY: {len(accepted)} broad accepted bucket(s) remain in "
+            f"{FINDINGS_PATH}; every difference must be individually triaged in {TRIAGE_PATH}"
+        )
     acc_seen: set[str] = set()
     for a in accepted:
         aid = a.get("id", "")
@@ -569,17 +594,21 @@ def check_findings(
             if did not in diff_ids:
                 errors.append(f"FINDING_DANGLING_DIFF: accepted entry {aid} references difference "
                               f"{did} which no longer exists")
-    # coverage: every wire-affecting / unmatched / undecided difference is covered
+    # coverage: every wire-affecting / interpretation / unmatched / undecided difference is covered
+    # by a finding and/or a triage entry
+    triage_entries = (triage_doc or {}).get("entries", {})
+    if not isinstance(triage_entries, dict):
+        triage_entries = {}
     covered: set[str] = set()
     for f in findings:
         covered.update(f.get("covers", []) or [])
     for a in accepted:
         covered.update(a.get("covers", []) or [])
     for d in diffs:
-        if d["class"] in MUST_COVER and d["id"] not in covered:
+        if d["class"] in MUST_COVER and d["id"] not in covered and d["id"] not in triage_entries:
             errors.append(f"UNCOVERED_DIFFERENCE: {d['id']} [{d['class']}/{d['kind']}] "
                           f"{d['aasdk'] or '-'} <-> {d['oaa'] or '-'} {d['key']}: covered by no finding "
-                          f"and no accepted entry")
+                          f"and no triage entry")
     # legacy integrity: ids present, verbatim, pinned
     legacy_pins = findings_doc.get("legacy_pins", {})
     legacy_by_id = {d.get("id"): d for d in legacy_doc.get("discrepancies", [])}
@@ -673,12 +702,16 @@ def check_integrity(root: Path) -> list[str]:
     legacy_doc, e = read_json(root, LEGACY_MATRIX_PATH)
     if e:
         errors.append(e)
+    triage_doc, e = read_json(root, TRIAGE_PATH)
+    if e:
+        errors.append(e)
     registry, _ = read_json(root, REGISTRY_PATH)
-    if len(sets) != 2 or mapping is None or findings_doc is None or legacy_doc is None:
+    if len(sets) != 2 or mapping is None or findings_doc is None or legacy_doc is None or triage_doc is None:
         return errors
-    inv, match = build_inventory(root, sources, sets, mapping, findings_doc, legacy_doc)
+    inv, match = build_inventory(root, sources, sets, mapping, findings_doc, legacy_doc, triage_doc)
     errors += match["errors"]
-    errors += check_findings(root, findings_doc, match["diffs"], legacy_doc, registry)
+    errors += check_findings(root, findings_doc, match["diffs"], legacy_doc, registry, triage_doc)
+    errors += pt.check_triage(triage_doc, match["diffs"])
     inv_path, rep_path = root / INVENTORY_PATH, root / REPORT_PATH
     if not inv_path.is_file():
         errors.append(f"INVENTORY_FILE_MISSING: {INVENTORY_PATH}")
@@ -715,13 +748,15 @@ def render_report(inv: dict[str, Any]) -> str:
     cov = inv["matching"]["coverage"]
     ds = inv["difference_summary"]
     fc = inv["findings_coverage"]
+    ts = inv["triage_summary"]
     L: list[str] = []
     w = L.append
     w("# AASDK ↔ OAA protobuf schema audit (Issue #62, parent #61)\n")
     w("Generated by `python3 -B tools/protocol/protobuf_audit.py --generate`; checked by `--check` "
-      "(CI job `ci/provenance-lint`). Do not edit by hand: every number below is computed from the "
-      "vendored `.proto` files. Human decisions live in `protobuf-audit-mapping.json` and "
-      "`protobuf-audit-findings.json`.\n")
+      "(CI job `ci/provenance-lint`). Do not edit by hand: every count, classification, channel mapping, "
+      "wire-impact flag, and C++ usage citation below is derived from the vendored `.proto` files and "
+      "receiver sources. Human decisions live in `protobuf-audit-mapping.json`, "
+      "`protobuf-audit-findings.json`, and `protobuf-audit-triage.json`.\n")
     w("## Sources\n")
     w("| Set | Upstream pin | `.proto` files | Blob IDs match pinned `git ls-tree` |")
     w("|---|---|---:|---|")
@@ -774,19 +809,127 @@ def render_report(inv: dict[str, Any]) -> str:
         if kinds:
             w(f"- **{cls}**: " + ", ".join(f"`{k}` {v}" for k, v in kinds.items()))
     w("")
-    w("## Finding coverage\n")
-    w(f"Differences that must be covered (every class except non-wire: wire-affecting, interpretation, unmatched, undecided): **{fc['must_cover_total']}**; "
-      f"covered by a curated finding: **{fc['covered_by_finding']}**; covered only by an explicit "
-      f"*accepted* entry: **{fc['covered_only_by_accepted']}**; uncovered: **{fc['uncovered']}** "
-      f"(the guard fails if this is not 0).\n")
-    w("| Class | Total | By finding | Only by accepted entry |")
-    w("|---|---:|---:|---:|")
-    for cls, c in fc["by_class"].items():
-        w(f"| {cls} | {c['total']} | {c['covered_by_finding']} | {c['covered_only_by_accepted']} |")
+    w("## Per-difference triage summary\n")
+    w(f"Every difference across all classes (including `non-wire`) is individually triaged in "
+      f"`protobuf-audit-triage.json` with mechanically derived classification, wire-impact flag, "
+      f"channel, and receiver C++ usage citations.\n")
+    w(f"- **Total differences**: **{ts['total_differences']}** (triaged: **{ts['triaged']}**, untriaged: **{ts['untriaged']}**)")
+    w(f"- **Wire-affecting**: **{ts['wire_affecting']}** (`class == wire-affecting`)")
+    w(f"- **Used by receiver**: **{ts['used_by_receiver']}** (direct field/enum usage, strict-policy unknown-tag/enum rejection, or active entity)")
+    w(f"- **Wire-affecting AND used by receiver**: **{ts['wire_and_used']}**")
+    w("- **Dispositions**: " + ", ".join(f"`{k}` {v}" for k, v in ts["by_disposition"].items()) + "\n")
+    w("| Derived classification | Count | Wire-affecting | Used by receiver | Wire & used |")
+    w("|---|---:|---:|---:|---:|")
+    for cls_name, cnt in ts["by_classification"].items():
+        sub = [d for d in inv["differences"] if d["classification"] == cls_name]
+        w_cnt = sum(1 for d in sub if d["wire_affecting"])
+        u_cnt = sum(1 for d in sub if d["used_by_receiver"])
+        wu_cnt = sum(1 for d in sub if d["wire_affecting"] and d["used_by_receiver"])
+        w(f"| `{cls_name}` | {cnt} | {w_cnt} | {u_cnt} | {wu_cnt} |")
     w("")
-    w("Accepted entries (explicit, reasoned, never implicit):\n")
-    for a in inv["accepted"]:
-        w(f"- `{a['id']}` ({a['category']}, {len(a['covers'])} differences): {a['reason']}")
+    w("## Finding coverage\n")
+    w(f"Differences in `MUST_COVER` classes (`wire-affecting`, `interpretation`, `unmatched`, `undecided`): **{fc['must_cover_total']}**; "
+      f"covered by a curated finding (`D1`–`D39`): **{fc['covered_by_finding']}**; covered individually by "
+      f"`protobuf-audit-triage.json`: **{fc.get('covered_only_by_triage', 0)}**; covered only by legacy "
+      f"broad `accepted` buckets: **{fc['covered_only_by_accepted']}** (retired; must be 0); "
+      f"uncovered: **{fc['uncovered']}** (the guard fails if this is not 0).\n")
+    w("| Class | Total | By finding | Individually triaged | Accepted buckets |")
+    w("|---|---:|---:|---:|---:|")
+    for cls, c in fc["by_class"].items():
+        w(f"| {cls} | {c['total']} | {c['covered_by_finding']} | "
+          f"{c.get('covered_only_by_triage', 0)} | {c['covered_only_by_accepted']} |")
+    w("")
+    w("## Per-channel summary\n")
+    w("Derived mechanically from `.proto` paths/packages, receiver C++ sources (`src/protocol/`, "
+      "`src/helper/bluetooth_bootstrap/`), and `protobuf-audit-triage.json`.\n")
+    cls_cols = [
+        ("naming-only", "naming"),
+        ("field-name-difference", "fld-name"),
+        ("field-added-one-side", "fld-add"),
+        ("field-number-or-type-conflict", "fld-num/type"),
+        ("optionality-difference", "opt"),
+        ("enum-value-difference", "enum-val"),
+        ("enum-value-conflict", "enum-conf"),
+        ("message-missing-one-side", "msg-miss"),
+        ("enum-missing-one-side", "enum-miss"),
+        ("metadata-or-syntax", "meta/syn"),
+        ("undecided-match", "undec"),
+    ]
+    w("| Channel | Diffs | " + " | ".join(lbl for _, lbl in cls_cols) +
+      " | Wire-aff | Used | Wire&Used | no-action | follow-up | phone-ev | OAA-ret |")
+    w("|---|---:|" + "|".join("---:" for _ in cls_cols) + "|---:|---:|---:|---:|---:|---:|---:|")
+    for ch in ts["per_channel"]:
+        bc = ch["by_classification"]
+        bd = ch["by_disposition"]
+        cls_cells = " | ".join(str(bc.get(k, 0)) for k, _ in cls_cols)
+        w(f"| `{ch['channel']}` | {ch['total']} | {cls_cells} | "
+          f"{ch['wire_affecting']} | {ch['used_by_receiver']} | {ch['wire_and_used']} | "
+          f"{bd.get('no-action', 0)} | {bd.get('follow-up-issue-needed', 0)} | "
+          f"{bd.get('needs-phone-evidence', 0)} | {ch['oaa_retracted_diffs']} |")
+    w("")
+    w("### Per-channel protocol metadata & receiver coverage\n")
+    w("| Channel | AASDK / OAA entities | Wire msg IDs (from .proto) | Directions | Version gates | OAA confidence | Active C++ files |")
+    w("|---|---:|---|---|---|---|---|")
+    for ch in ts["per_channel"]:
+        ids = ", ".join(ch["wire_msg_ids"][:6]) + (" …" if len(ch["wire_msg_ids"]) > 6 else "")
+        dirs = ", ".join(ch["directions"]) or "-"
+        gates = ", ".join(ch["version_gates"][:4]) + (" …" if len(ch["version_gates"]) > 4 else "")
+        conf = ", ".join(ch["oaa_confidence"]) or "-"
+        files = ", ".join(f"`{Path(p).name}`" for p in ch["receiver_files"][:4]) + (
+            f" (+{len(ch['receiver_files']) - 4})" if len(ch["receiver_files"]) > 4 else ""
+        )
+        w(f"| `{ch['channel']}` | {ch['aasdk_entities']} / {ch['oaa_entities']} | {ids or '-'} | "
+          f"{dirs} | {gates or '-'} | {conf} | {files or '-'} |")
+    w("")
+    w("## Wire-affecting differences used by receiver\n")
+    wu_diffs = sorted(
+        (d for d in inv["differences"] if d["wire_affecting"] and d["used_by_receiver"]),
+        key=lambda x: (pt.CHANNEL_ORDER.index(x["channel"]) if x["channel"] in pt.CHANNEL_ORDER else 999, x["id"]),
+    )
+    w(f"All **{len(wu_diffs)}** differences where `wire_affecting == true` AND `used_by_receiver == true` "
+      f"(including strict `kStrictExtensionPolicy` unknown-tag/enum rejections and compile-time/runtime usages):\n")
+    w("| ID | Channel | Classification | Usage mode | AASDK ↔ OAA | Key | Receiver citations | Disposition | Phone evidence |")
+    w("|---|---|---|---|---|---|---|---|---|")
+    for d in wu_diffs:
+        cites = ", ".join(f"`{Path(p).name}`" for p in d["receiver_citations"]) or "-"
+        tr = d.get("triage") or {}
+        disp = tr.get("disposition", "-")
+        pev = tr.get("phone_evidence_status", "-")
+        w(f"| `{d['id']}` | `{d['channel']}` | `{d['classification']}` | `{d['usage_mode']}` | "
+          f"`{short(d['aasdk'])}` ↔ `{short(d['oaa'])}` | `{d['key']}` | {cites} | `{disp}` | {pev} |")
+    w("")
+    w("## Wireless modes comparison\n")
+    wm = ts["wireless_modes"]
+    w("Wireless Android Auto uses two distinct protocol layers on top of or alongside Wired USB/TLS:\n")
+    w(f"1. **BT RFCOMM Wireless Bootstrap (`wireless-bootstrap`)**: Out-of-band pairing/Wi-Fi credential "
+      f"setup via `aap_protobuf.aaw.*` (`src/helper/bluetooth_bootstrap/Bootstrap.proto` & `Bootstrap.cpp`). "
+      f"AASDK defines **{wm['aasdk_bootstrap_message_count']}** messages; OAA documents **{wm['oaa_bootstrap_message_count']}** "
+      f"counterpart messages under `oaa/wifi/` (`WifiStartRequest`/`Response`, `WifiVersionRequest`/`Response`, "
+      f"`WifiInfoRequest`/`Response`, `WifiConnectStatus`, `WifiPing*`, `WifiSetupInfo`). Generated diffs: "
+      f"**{wm['wireless_bootstrap_diffs']}** (used by receiver: **{wm['wireless_bootstrap_used']}**). "
+      f"**Critical unverified discrepancy**: in `aaw.WifiInfoResponse`, AASDK has tag 2=`password` / tag 3=`bssid` "
+      f"whereas OAA (`apk_static`) has tag 2=`bssid` / tag 3=`passphrase` (`W-f24dea872f3b`, `W-749177e5f357` — "
+      f"same string wire type, semantic swap; unknown, needs phone evidence); tag 4 `WifiSecurityMode` also differs "
+      f"(AASDK dense `{', '.join(wm['aasdk_security_mode_values'][:6])} …` vs OAA `WifiSecurityMode.Enum` bitmask "
+      f"`{', '.join(wm['oaa_security_mode_values'][:5])} …`, `W-7cb6ace88645`).")
+    w(f"2. **Wi-Fi Projection GAL Channel (`wifi-projection`)**: In-band GAL service (`0x8001` `WifiCredentialsRequest`, "
+      f"`0x8002` `WifiCredentialsResponse`) exercised in `src/protocol/aasdk_adapter/WifiProjectionAdapter.cpp` and "
+      f"`MediaConfiguration.cpp`. Generated diffs: **{wm['wifi_projection_diffs']}** (used by receiver: "
+      f"**{wm['wifi_projection_used']}**). See `D27-WIFI-CRED-STATUS` for `WifiCredentialsResponse` field 5 "
+      f"(`access_point_type` vs `WifiCredentialStatus`) and security-mode encoding differences.")
+    w(f"3. **Wired USB/TLS**: Does not use `wireless-bootstrap`; negotiates GAL control + active service channels directly over USB AoA + TLS. "
+      f"OAA `WifiChannelType.Enum`: `{', '.join(wm['oaa_wifi_channel_types']) or '-'}`.\n")
+    w("## OAA retracted & contradictory entities\n")
+    retracted = ts["oaa_retracted_entities"]
+    w(f"OAA explicitly marks **{len(retracted)}** schema entities `confidence: retracted` in its `.proto` comments "
+      f"(e.g., wrong channel attribution such as `oaa/video/VideoFocusNotificationMessage.proto` mapped to `0x800E` "
+      f"instead of `0x8008` `VideoFocusIndicationMessage.proto`, or unconfirmed `ConnectionConfiguration`). "
+      f"Audited diffs touching retracted OAA definitions cannot be treated as normative without phone capture:\n")
+    w("| Kind | Channel | OAA FQN | `.proto` file | Retraction note |")
+    w("|---|---|---|---|---|")
+    for r in retracted:
+        note = r["note"].replace("|", "\\|")
+        w(f"| {r['kind']} | `{r['channel']}` | `{short(r['fqn'])}` | `{r['file']}` | {note or '-'} |")
     w("")
     w("## Findings\n")
     disp: dict[str, int] = {}
@@ -810,11 +953,15 @@ def render_report(inv: dict[str, Any]) -> str:
         w(f"- {u['kind']} `{', '.join(short(x) for x in u['aasdk'])}` ↔ "
           f"`{', '.join(short(x) for x in u['oaa'][:4])}{' …' if len(u['oaa']) > 4 else ''}`: {u['reason']}")
     w("")
-    w("## Implementation children (confirmed or still-open findings only)\n")
+    w("## Implementation children (prioritized, checked against open issues)\n")
     for c in inv["implementation_children"]:
         w(f"### {c['id']}: {c['title']}\n")
-        w(f"{c['scope']}\n")
-        w("Linked findings: " + ", ".join(f"`{x}`" for x in c["linked_findings"]) + "\n")
+        if c.get("priority"):
+            w(f"- **Priority**: {c['priority']}")
+        if c.get("existing_issue_overlap"):
+            w(f"- **Existing open-issue check**: {c['existing_issue_overlap']}")
+        w(f"- **Scope**: {c['scope']}")
+        w("- **Linked findings**: " + ", ".join(f"`{x}`" for x in c["linked_findings"]) + "\n")
         w("Acceptance criteria:\n")
         for a in c["acceptance_criteria"]:
             w(f"- {a}")
@@ -831,8 +978,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--root", type=Path, default=None, help="repository root")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--generate", action="store_true", help="regenerate inventory JSON and report")
-    g.add_argument("--check", action="store_true", help="verify pins, parse, matching, findings, drift (default)")
-    g.add_argument("--uncovered", action="store_true", help="list differences no finding/accepted entry covers")
+    g.add_argument("--check", action="store_true", help="verify pins, parse, matching, findings, triage, drift (default)")
+    g.add_argument("--uncovered", action="store_true", help="list differences no finding/triage/accepted entry covers")
     args = ap.parse_args(argv)
     root = (args.root or Path.cwd()).resolve()
     if not (root / "PROVENANCE.md").is_file():
@@ -853,11 +1000,12 @@ def main(argv: list[str]) -> int:
         mapping, em = read_json(root, MAPPING_PATH)
         fdoc, ef = read_json(root, FINDINGS_PATH)
         ldoc, el = read_json(root, LEGACY_MATRIX_PATH)
-        for e in (em, ef, el):
+        tdoc, et = read_json(root, TRIAGE_PATH)
+        for e in (em, ef, el, et):
             if e:
                 print(f"protobuf-audit: {e}", file=sys.stderr)
                 return 1
-        inv, match = build_inventory(root, sources, sets, mapping, fdoc, ldoc)
+        inv, match = build_inventory(root, sources, sets, mapping, fdoc, ldoc, tdoc)
         if match["errors"]:
             for e in match["errors"]:
                 print(f"  {e}", file=sys.stderr)
@@ -868,9 +1016,10 @@ def main(argv: list[str]) -> int:
                 cov.update(f.get("covers", []))
             for a in fdoc.get("accepted", []):
                 cov.update(a.get("covers", []))
+            triage_keys = set((tdoc or {}).get("entries", {}).keys())
             n = 0
             for d in match["diffs"]:
-                if d["class"] in MUST_COVER and d["id"] not in cov:
+                if (d["class"] in MUST_COVER and d["id"] not in cov and d["id"] not in triage_keys) or d["id"] not in triage_keys:
                     n += 1
                     print(f"{d['id']} {d['class']}/{d['kind']} {short(d['aasdk'])} <-> {short(d['oaa'])} {d['key']}")
             print(f"uncovered={n}")
@@ -878,8 +1027,10 @@ def main(argv: list[str]) -> int:
         (root / INVENTORY_PATH).write_text(dump_json(inv), encoding="utf-8")
         (root / REPORT_PATH).write_text(render_report(inv), encoding="utf-8")
         print(f"protobuf-audit: generated {INVENTORY_PATH} and {REPORT_PATH}")
-        cov = inv["matching"]["coverage"]
+        ts = inv["triage_summary"]
         print(f"  differences={len(match['diffs'])} {inv['difference_summary']['by_class']} "
+              f"triaged={ts['triaged']}/{ts['total_differences']} wire={ts['wire_affecting']} "
+              f"used={ts['used_by_receiver']} wire_used={ts['wire_and_used']} "
               f"uncovered={inv['findings_coverage']['uncovered']}")
         return 0
 
@@ -893,11 +1044,13 @@ def main(argv: list[str]) -> int:
         return 1
     inv = json.loads((root / INVENTORY_PATH).read_text(encoding="utf-8"))
     cov = inv["matching"]["coverage"]
+    ts = inv["triage_summary"]
     print(
         f"protobuf-audit-guard: PASS files={inv['sources']['aasdk']['proto_count'] + inv['sources']['oaa']['proto_count']} "
         f"pairs={cov['message']['matched_pairs']}m+{cov['enum']['matched_pairs']}e "
-        f"differences={len(inv['differences'])} findings={len(inv['findings'])} "
-        f"uncovered={inv['findings_coverage']['uncovered']}"
+        f"differences={len(inv['differences'])} triaged={ts['triaged']}/{ts['total_differences']} "
+        f"wire={ts['wire_affecting']} used={ts['used_by_receiver']} wire_used={ts['wire_and_used']} "
+        f"findings={len(inv['findings'])} uncovered={inv['findings_coverage']['uncovered']}"
     )
     return 0
 
