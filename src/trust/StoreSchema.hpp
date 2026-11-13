@@ -19,6 +19,10 @@
 // missing), record ids in [1, kMaxPhoneId], one phone id per record and ONE
 // record per canonical identity key (identity_key()) — a duplicate identity
 // could otherwise survive a forget and silently keep reconnect eligibility.
+// Wireless addresses are validated and compared case-insensitively; malformed
+// addresses or two records differing only by address case reject the whole file.
+// To recover, stop the receiver, back up and remove approved-phones.json, restart
+// with an empty store, and explicitly pair each phone again.
 // Versions 2 and 3 additionally require next_phone_id strictly greater than every
 // record id and at most kMaxPhoneId + 1 (the shared coherent id range; see
 // Store.hpp).

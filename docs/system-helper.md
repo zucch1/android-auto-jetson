@@ -106,14 +106,19 @@ The helper-only operations can share the client from another thread; destruction
 requires callers to have finished. Wired clients without this dependency do not
 gain helper authority: committed forget now reports required AP work as pending,
 not implicit cleanup success. The actual `ControlService::confirm_phone_pairing`
-path invokes it only after registered-consumer UID/name authorization,
-`PairingGate::confirm`, and `PhoneDirectory::pairing_confirmed` all succeed.
-`PairingOpened` is emitted only after the bridge succeeds. Listening for or
-forging that signal never mints grants. No session D-Bus method proxies Issue.
+path invokes it only after registered-consumer UID/name authorization and
+`PairingGate::confirm`, before persisting approval. A helper failure never
+persists approval. `PairingOpened` follows committed approval, including error
+703 (rename committed, directory durability uncertain); that outcome emits
+`pairing_approval_not_durable` and keeps helper confirmation consistent with
+the store. Listening for or forging that signal never mints grants.
 
-A helper error closes the control gate and invalidates the source; trust may
-already be persisted and is **not rolled back**. The pre-existing
-`trust_store_not_durable` approval outcome never calls the bridge. Cancel,
+If persistence fails before commit, cancellation must be acknowledged. A failed
+cancellation emits `phone_revocation_retirement_pending` and retains the source
+and captured identity in the existing revocation progress queue, blocking new
+pairing for that identity until acknowledged `Invalidate` retirement. Source-only
+records retry during owner reconciliation (including idle calls); ordinary phone
+revocations retain their existing ForgetPhone retry path. Cancel,
 consumer teardown/owner loss, successful or committed-not-durable forget, and
 control-service shutdown invalidate helper authority. Committed forget invalidates
 only the retired phone's sources locally and remotely, then sends narrow revocation

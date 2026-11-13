@@ -43,12 +43,18 @@ void ControlService::teardown(std::string_view reason, DiagnosticSeverity severi
 }
 
 void ControlService::refresh_consumer_owner() {
+    for (auto it = revocations_.begin(); it != revocations_.end();) {
+        if (it->snapshot.phone) { ++it; continue; }
+        (void)attempt_revocation(*it);
+        if (it->progress.complete()) it = revocations_.erase(it);
+        else ++it;
+    }
     if (!registered_.has_value()) {
         return;
     }
     if (open_pairing_ && std::chrono::steady_clock::now() >= open_pairing_->deadline) {
         const auto request = open_pairing_->request;
-        if (confirmation_ != nullptr) confirmation_->cancel(registered_->consumer, request);
+        if (confirmation_ != nullptr) (void)confirmation_->cancel(registered_->consumer, request);
         (void)gate_.cancel({registered_->consumer, registered_->name}, request);
         open_pairing_.reset();
         events_.emit(PairingClosed{request});

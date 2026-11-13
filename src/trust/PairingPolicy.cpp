@@ -163,6 +163,7 @@ core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId reque
 }
 
 core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingRequestId request) {
+    committed_pairing_.reset();
     const std::size_t index = find(request);
     if (index >= pending_.size()) {
         return Error{ErrorCode::trust_unknown_phone};
@@ -178,7 +179,12 @@ core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingReques
     // SNAPSHOT-ONLY PAIRING CONTRACT in PairingPolicy.hpp).
     const TransportIdentity identity = std::move(pending_[index].identity);
     drop_at(index);
-    return store_.approve(identity);
+    const auto approved = store_.approve(identity);
+    if (!approved && approved.error().code() == ErrorCode::trust_store_not_durable) {
+        for (const auto& phone : store_.phones())
+            if (identity_key(phone.identity) == identity_key(identity)) committed_pairing_ = phone.phone_id;
+    }
+    return approved;
 }
 
 void PairingPolicy::pairing_cancelled(core::PairingRequestId request) {

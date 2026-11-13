@@ -126,6 +126,7 @@ public:
     [[nodiscard]] core::Result<void> pairing_requested(core::PairingRequestId request) override;
     [[nodiscard]] core::Result<core::PhoneId> pairing_confirmed(
         core::PairingRequestId request) override;
+    std::optional<core::PhoneId> committed_pairing() const override { return committed_pairing_; }
     void pairing_cancelled(core::PairingRequestId request) override;
 
     // Drops pendings past the confirm window WITHOUT persisting anything and
@@ -159,6 +160,7 @@ private:
     std::vector<Pending> pending_{};
     std::vector<core::PairingRequestId> invalidated_{};
     std::optional<helper::RevocationV1> revocation_;
+    std::optional<core::PhoneId> committed_pairing_;
 };
 
 } // namespace aa::trust

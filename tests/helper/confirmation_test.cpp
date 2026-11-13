@@ -220,3 +220,55 @@ TEST_F(HelperConfirmation, FullPendingTableRejectsBeforeStoreMutation) {
     EXPECT_EQ(bridge.forgets, 256);
 }
 }
+
+namespace {
+using namespace aa;
+using helper::test::HelperConfirmation;
+TEST_F(HelperConfirmation, CommittedApprovalKeepsHelperAndOpenedEventOnDirectorySyncFailure) {
+    const auto source = control.request_add_phone(caller); ASSERT_TRUE(source);
+    {
+        const trust::test::faults::ScopedFault fault{trust::test::faults::Fault::dir_fsync};
+        EXPECT_TRUE(control.confirm_phone_pairing(caller, source.value()));
+    }
+    ASSERT_EQ(store.phones().size(), 1U);
+    trust::ApprovedPhoneStore reloaded{directory / "store"};
+    ASSERT_TRUE(reloaded.load());
+    EXPECT_EQ(reloaded.phones(), store.phones());
+    EXPECT_EQ(bridge.confirmations, 1);
+    EXPECT_EQ(bridge.cancellations, 0);
+    EXPECT_EQ(events.count_opened(), 1U);
+    EXPECT_EQ(count_closed(), 0U);
+    EXPECT_TRUE(has_diagnostic("pairing_approval_not_durable"));
+    EXPECT_FALSE(has_diagnostic("pairing_request_denied"));
+}
+TEST_F(HelperConfirmation, FailedApprovalRetirementBlocksIdentityUntilAcknowledgedRetry) {
+    const auto source = control.request_add_phone(caller); ASSERT_TRUE(source);
+    bridge.cancel_result = Error{ErrorCode::timeout};
+    {
+        const trust::test::faults::ScopedFault fault{trust::test::faults::Fault::renameat};
+        EXPECT_FALSE(control.confirm_phone_pairing(caller, source.value()));
+    }
+    EXPECT_EQ(bridge.cancellations, 1);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(events.count_opened(), 0U);
+    EXPECT_EQ(count_closed(), 1U);
+    EXPECT_TRUE(has_diagnostic("phone_revocation_retirement_pending"));
+    EXPECT_EQ(control.pending_revocations(), 1U);
+    bridge.retirement_limit = 0;
+    // prepare() must expose the same peer: admission stays blocked while
+    // the existing revocation attempt still cannot acknowledge retirement.
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:01", "adapter"};
+    EXPECT_FALSE(control.request_add_phone(caller));
+    EXPECT_EQ(control.pending_revocations(), 1U);
+    EXPECT_EQ(events.count_opened(), 0U);
+    bridge.retirement_limit.reset();
+    control.refresh_consumer_owner();
+    EXPECT_EQ(control.pending_revocations(), 0U);
+    ASSERT_FALSE(bridge.retirement_batches.empty());
+    ASSERT_EQ(bridge.retirement_batches.back().size(), 1U);
+    EXPECT_EQ(bridge.retirement_batches.back()[0].request, source.value());
+    EXPECT_EQ(bridge.ap_attempts, 0);
+    EXPECT_EQ(bridge.bond_attempts, 0);
+    EXPECT_TRUE(control.request_add_phone(caller));
+}
+} // namespace

@@ -129,6 +129,8 @@ public:
         core::PairingRequestId request) = 0;
     [[nodiscard]] virtual core::Result<core::PhoneId> pairing_confirmed(
         core::PairingRequestId request) = 0;
+    // Populated only by the last committed-but-not-durable confirmation.
+    virtual std::optional<core::PhoneId> committed_pairing() const { return std::nullopt; }
     virtual void pairing_cancelled(core::PairingRequestId request) = 0;
     [[nodiscard]] virtual std::vector<core::PairingRequestId> reap_expired() = 0;
     [[nodiscard]] virtual std::vector<core::PairingRequestId> take_invalidated_pairings() = 0;
@@ -251,6 +253,8 @@ private:
         bool not_durable;
     };
     core::Result<void> attempt_revocation(PendingRevocation& record);
+    void retire_failed_pairing(core::ConsumerId, core::PairingRequestId,
+                               const std::optional<helper::PeerIdentity>&);
     bool revocation_blocks(const helper::PeerIdentity&) const;
 
     ControlServiceConfig config_{};

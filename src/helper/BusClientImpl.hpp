@@ -106,9 +106,11 @@ struct BusClient::Impl {
         const auto result = rpc("Invalidate", "tt", writer, until);
         return result ? core::Result<void>{} : core::Result<void>{result.error()};
     }
-    void invalidate(Source source) {
-        const std::lock_guard lock{mutex};
-        (void)invalidate_locked(source, Clock::now() + std::chrono::milliseconds(500));
+    core::Result<void> invalidate(Source source) {
+        const auto until = Clock::now() + std::chrono::milliseconds(500);
+        std::unique_lock lock{mutex, std::defer_lock};
+        if (!lock.try_lock_until(until)) return Error{ErrorCode::timeout};
+        return invalidate_locked(source, until);
     }
     core::Result<ObservedPeer> observe(Clock::time_point until) {
         ObservedPeer peer;

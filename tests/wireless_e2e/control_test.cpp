@@ -8,7 +8,7 @@ struct Confirmation final : aa::helper::Confirmation {
     unsigned teardowns{};
     aa::core::ConsumerId retired{};
     aa::core::Result<void> confirmed(aa::core::ConsumerId, aa::core::PairingRequestId) override { return {}; }
-    void cancel(aa::core::ConsumerId, aa::core::PairingRequestId) override {}
+    aa::core::Result<void> cancel(aa::core::ConsumerId, aa::core::PairingRequestId) override { return {}; }
     void teardown(aa::core::ConsumerId generation) override { ++teardowns; retired = generation; }
     aa::helper::RevocationAttempt forgotten_v1(const aa::helper::RevocationV1&,
                                                const aa::helper::RevocationProgress&) override { return {}; }
