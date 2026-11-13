@@ -17,7 +17,11 @@ Deinitialization clears active state. TLS cannot substitute for the future task
 27 approved-phone store and pairing policy, which are not implemented here.
 
 `verified-peer-test-only` is an explicit constructor policy for tests, with
-OpenSSL peer verification and an empty trust store by default. Unknown and
+OpenSSL peer verification requiring a peer certificate. The generic TCP/TLS
+adapter loads the system trust store and verifies the dialed DNS name or IP
+on clients. Policy users supplying their own SSL context must populate its
+trust store explicitly (the memory-BIO tests pin their generated certificate).
+Unknown and
 self-signed peer certificates fail closed. It is not a deployment default or
 a prerequisite for the approved-phone qualification path. A trusted-peer
 configuration/provisioning API is not claimed in this task.
@@ -34,11 +38,29 @@ attacker-substituted pathname. Operators must control the parent directories;
 parent-directory symlinks are not rejected. POSIX ACLs and concurrent in-place
 modification by the same credential owner are not separately modeled.
 
+PEM text is read directly into one fixed 64 KiB allocation plus an overflow
+sentinel; parsing uses views rather than secret-bearing string copies. RAII
+cleanses the full allocation with `OPENSSL_cleanse` before release on successful
+loads and exceptions. OpenSSL owns the parsed private key for the session.
+This reduces residual copies; it cannot protect a live key from an authorized
+debugger. Deployments should disable core dumps (`LimitCORE=0` in the receiver's
+systemd unit, or `ulimit -c 0` for a manual launch). This repository currently
+ships no receiver service unit to apply that directive to.
+
 Files are bounded to 64 KiB. OpenSSL parses certificate and key, encrypted-key
 password prompts are disabled, the public/private components must match, and
 non-whitespace trailing content is rejected. Typed errors contain only stable
 failure classes; unset/empty credentials additionally explain HU_KEY_PATH.
 No full path, phone identifier or PEM material enters the new diagnostics.
+Keys and certificate signatures must provide at least 112 security bits
+(RSA at least 2048 bits); SHA-1/MD5 certificate signatures are rejected.
+Expired head-unit certificates emit `tls-credential-warning: certificate-expired`
+on stderr at every load, without a pathname or certificate identity. They remain
+loadable because a phone may accept a long-lived compatibility identity beyond
+its validity dates. This warning does not relax peer verification in verified
+mode. The unencrypted bundle is plaintext at rest: restrict access to the file
+and its parent directories.
+
 Parsed objects are RAII-owned until handed to Cryptor; its destructor releases
 TLS resources, including after failed initialization.
 
@@ -145,3 +167,24 @@ their `MessageReassembler` with `PlaintextAfterHandshake::allow`. No plaintext
 exception exists (not even for ping): the real phone encrypted everything.
 A failed cipher setup (credential or cipher configuration) is reported by the
 receiver as `{"event":"err","detail":"tls_cipher","reason":"..."}`.
+
+## Generic TCP/TLS adapter deadlines
+
+The generic TLS stream adapter is host/test transport; the live wired runtime
+uses its separate bounded link. Socket connect and accept use nonblocking I/O
+with a 10-second default and accept an explicit cancellation/deadline. DNS
+resolution through `getaddrinfo` remains synchronous; numeric endpoint addresses
+avoid that resolver wait. TLS handshake retains its existing whole-operation
+10-second deadline. TCP keepalive and a 30-second unacknowledged-data timeout
+are enabled. Writes and a frame after its first decrypted bytes share a
+30-second whole-frame deadline, so fragment progress does not restart the budget.
+
+The protocol code only answers phone `PingRequest`s (`WiredSession.cpp`); it
+does not schedule or negotiate a guaranteed ping interval. Consequently there
+is no safe universal idle cutoff for a quiet healthy phone. Generic stream
+callers with a known maximum peer ping interval can call
+`set_peer_ping_interval`: the idle deadline is **three intervals plus 10 seconds**
+of scheduling margin. It is deliberately opt-in; an unset cadence leaves the
+wait for a frame's first byte cancellation-bound. The clock can be injected for
+idle-expiry tests. A deployment-wide idle cutoff still needs a specified peer
+keepalive contract and phone qualification.

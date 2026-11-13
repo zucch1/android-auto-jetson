@@ -189,3 +189,5 @@ if(NOT CMAKE_CROSSCOMPILING)
                 "${CMAKE_SOURCE_DIR}/tests/fixtures/media/h264_720p30_baseline_90f.h264")
     set_tests_properties(media_decode_probe_suite PROPERTIES TIMEOUT 120)
 endif()
+
+include(cmake/TlsHardening.cmake)
