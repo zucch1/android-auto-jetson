@@ -652,6 +652,52 @@ TEST(WiredReceiver, StdoutLogFinishIsBoundedWhenTheSinkNeverReturns) {
     LogWriteProbe::active = nullptr;
 }
 
+// Fills a stalled log to its entry capacity (front entry held in the native write).
+void fill_log_queue(aa::wired_receiver::StdoutLog &log) {
+    for (std::size_t i = 0; i < aa::wired_receiver::StdoutLog::entry_capacity; ++i) {
+        ASSERT_FALSE(log.submit("x"));
+    }
+}
+
+TEST(WiredReceiver, VideoOutletPerAccessUnitObserverNeverBlocksOnAFullStalledStdoutQueue) {
+    // Given: the real producer observer bound to a log with a full queue and a stalled sink.
+    LogWriteProbe owned_probe;
+    auto *probe = &owned_probe;
+    LogWriteProbe::active = probe;
+    std::atomic<bool> running{true};
+    aa::wired_receiver::StdoutLog owned_log{running, LogWriteProbe::write};
+    auto *log = &owned_log;
+    fill_log_queue(*log);
+    VideoOutlet outlet{[&](const std::string &line) { (void)log->submit(line); },
+                       [&](std::string_view kind, const std::string &line) { (void)log->submit_media(kind, line); }};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    constexpr int units = 600;
+    // When: an admitted phone sends one access unit per frame (each fires the observer).
+    auto sent = std::async(std::launch::async, [&] {
+        int ok = 0;
+        for (int i = 0; i < units; ++i) {
+            if (outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, wiredtest::kVideoIdr})) { ++ok; }
+            if (!pair.value().consumer.receive(aa::core::Milliseconds{500})) { break; }
+        }
+        return ok;
+    });
+    const bool bounded = sent.wait_for(std::chrono::seconds{2}) == std::future_status::ready;
+    if (!bounded) { probe->release(); }
+    ASSERT_TRUE(bounded) << "PER_AU_VIDEO_OBSERVER_BLOCKED_ON_STALLED_STDOUT";
+    // Then: every unit was processed; each per-AU observation (plus the periodic
+    // video_sent / decode_stats records) was admitted or counted as dropped.
+    EXPECT_EQ(sent.get(), units);
+    const auto drops = log->media_drops();
+    EXPECT_GE(drops.rate_limited + drops.backpressure, static_cast<std::uint64_t>(units));
+    EXPECT_GT(drops.backpressure, 0U);
+    probe->release(); // Healthy again: the final lossless stats record is then delivered.
+    outlet.close();
+    EXPECT_FALSE(log->finish());
+    LogWriteProbe::active = nullptr;
+}
+
 TEST(WiredReceiver, ReceiverLogMediaPathIsRateLimitedAndAccountedThroughTheRealCallSite) {
     // Given: the receiver's real log_media call site bound to a real scope, capturing stdout.
     g_running.store(true);

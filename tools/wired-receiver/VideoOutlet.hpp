@@ -99,8 +99,16 @@ public:
 
     void install(ipc::VideoProducer producer) {
         std::lock_guard lock(mutex_);
+        // send_started fires once per access unit the phone sends (audit L13), so
+        // it is media telemetry: rate-limited and never waiting for the sink. Any
+        // other endpoint event is a lifecycle record and stays lossless.
         producer.set_observer([this](const ipc::VideoEndpoint& event) {
-            log_(ipc::video_endpoint_json(event));
+            auto line = ipc::video_endpoint_json(event);
+            if (event.kind == ipc::VideoEndpointKind::send_started) {
+                media("video_ipc_send", line);
+            } else {
+                log_(line);
+            }
         });
         if (producer_.has_value()) {
             producer_->close();
