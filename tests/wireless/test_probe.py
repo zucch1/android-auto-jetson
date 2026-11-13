@@ -78,6 +78,26 @@ class Discovery(unittest.TestCase):
         self.assertEqual(report.blockers, [])
         self.assertFalse(report.bluez_profile_registration)
 
+    def test_all_discovery_observations_redact_device_macs(self):
+        mac = '02:12:34:56:78:9A'
+        observations = [INFO + 'addr ' + mac, REG + '# ' + mac,
+                        'GENERAL.STATE:30 (disconnected)\nGENERAL.CONNECTION:' + mac,
+                        BUS + 'device ' + mac]
+        report = target.Report(confirmed_jurisdiction='US')
+        with patch.object(Path, 'resolve', side_effect=[Path('/sys/phy0'), Path('/drivers/rtw_8822ce')]), \
+                patch.object(target, 'command', side_effect=observations):
+            target.discover(report, 'wlan0')
+        self.assertNotIn(mac, json.dumps(asdict(report)))
+        for key in ('iw_phy', 'iw_reg', 'nm', 'bluez'):
+            self.assertIn('<redacted-mac>', report.raw[key])
+
+    def test_discovery_capabilities_use_unredacted_observations(self):
+        with patch.object(target, 'redact_mac_addresses', return_value='<redacted>'):
+            report = self.check_discovery()
+        self.assertEqual(report.blockers, [])
+        self.assertTrue(report.ap_mode and report.channel_36_eligible)
+        self.assertTrue(report.bluez_profile_capability and report.bluez_agent_capability)
+
     def test_missing_ap(self):
         self.assertIn('missing-ap-capability', self.check_discovery(info=INFO.replace('* AP', '* managed')).blockers)
 
@@ -123,7 +143,7 @@ class Active(unittest.TestCase):
             if 'up' in argv and failure:
                 raise subprocess.CalledProcessError(1, argv)
             if argv[:2] == ['iw', 'dev']:
-                return 'type AP\nchannel 36 (5180 MHz)' if argv[-1] == 'info' else ('Station aa:bb:cc:dd:ee:ff (on wlan0)\n\tauthorized: ' + ('yes' if authorized else 'no') + '\n')
+                return 'addr 02:12:34:56:78:9A\ntype AP\nchannel 36 (5180 MHz)' if argv[-1] == 'info' else ('Station aa:bb:cc:dd:ee:ff (on wlan0)\n\tauthorized: ' + ('yes' if authorized else 'no') + '\n')
             return ''
         args = argparse.Namespace(interface='wlan0', duration=1, ap_psk='fixture-only-password')
         with patch.object(target, 'command', side_effect=run), patch.object(bluez, 'registration', fake_registration), \
@@ -142,6 +162,18 @@ class Active(unittest.TestCase):
         self.assertIn('save', calls[0])
         self.assertIn('no', calls[0])
         self.assertFalse(report.pairing_asserted or report.trust_asserted)
+
+    def test_station_macs_are_redacted_before_report_retention(self):
+        report, _ = self.exercise()
+        self.assertNotIn('aa:bb:cc:dd:ee:ff', json.dumps(asdict(report)))
+        self.assertIn('Station <redacted-mac> (on wlan0)', report.raw['stations'])
+        self.assertTrue(report.client_association)
+
+    def test_device_mac_is_redacted_before_operation_retention(self):
+        report, _ = self.exercise()
+        self.assertNotIn('02:12:34:56:78:9A', json.dumps(asdict(report)))
+        self.assertIn('addr <redacted-mac>', report.raw['iw_operation'])
+        self.assertTrue(report.channel_36_operation)
 
     def test_ap_failure_cleans_own_uuid(self):
         report, calls = self.exercise(failure=True)

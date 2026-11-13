@@ -146,6 +146,31 @@ TEST(StorePermissions, MissingStoreFileLoadsAsEmptyStore) {
     EXPECT_TRUE(store.phones().empty());
 }
 
+TEST(StorePermissions, MissingStoreFileInExistingDirectoryLoadsAsEmptyStore) {
+    test::TempStoreDir dir;
+    std::filesystem::create_directories(dir.file().parent_path());
+    ASSERT_EQ(::chmod(dir.file().parent_path().c_str(), 0700), 0);
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    EXPECT_TRUE(store.usable());
+    EXPECT_TRUE(store.phones().empty());
+}
+
+// Review fix (PR #93, P2): a fresh install has no state tree at all; a missing
+// directory component (several levels deep) is still the empty store, and the
+// first approval creates it.
+TEST(StorePermissions, MissingStateDirectoryTreeLoadsAsEmptyStore) {
+    test::TempStoreDir dir;
+    const auto store_path =
+        dir.dir() / "state" / "nested" / "android-auto-receiver" / "approved-phones.json";
+    trust::ApprovedPhoneStore store{store_path};
+    ASSERT_TRUE(store.load().has_value());
+    EXPECT_TRUE(store.usable());
+    EXPECT_TRUE(store.phones().empty());
+    ASSERT_TRUE(store.approve(trust::TransportIdentity{test::kWired}).has_value());
+    EXPECT_TRUE(std::filesystem::exists(store_path));
+}
+
 TEST(StorePermissions, PrePlacedTmpSymlinkCannotRedirectWrites) {
     test::TempStoreDir dir;
     std::filesystem::create_directories(dir.file().parent_path());
@@ -215,15 +240,22 @@ TEST(StorePermissions, PermissiveUmaskStillYields0700Ancestors) {
 TEST(StorePermissions, UnTightenableParentDirectoryFailsClosed) {
     test::TempStoreDir dir;
     const auto dangling = dir.dir() / "dangling";
-    ASSERT_EQ(::symlink((dir.dir() / "missing-target").c_str(), dangling.c_str()), 0);
-
     trust::ApprovedPhoneStore store{dangling / "approved-phones.json"};
     ASSERT_TRUE(store.load().has_value());
+    ASSERT_EQ(::symlink((dir.dir() / "missing-target").c_str(), dangling.c_str()), 0);
+    trust::ApprovedPhoneStore fresh{dangling / "approved-phones.json"};
+    const auto loaded = fresh.load();
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_EQ(loaded.error().code(), ErrorCode::trust_store_io);
     const auto approved = store.approve(trust::TransportIdentity{test::kWired});
     ASSERT_FALSE(approved.has_value());
     EXPECT_EQ(approved.error().code(), ErrorCode::trust_store_io);
     EXPECT_TRUE(store.phones().empty());
+    const auto written = trust::detail::write_file_private(dangling / "approved-phones.json", "{\"schema_version\":2,\"next_phone_id\":1,\"phones\":[]}");
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error().code(), ErrorCode::trust_store_io);
     EXPECT_FALSE(std::filesystem::exists(dangling / "approved-phones.json"));
+    EXPECT_FALSE(std::filesystem::exists(dir.dir() / "missing-target"));
 }
 
 TEST(StorePermissions, UnownedParentDirectoryFailsClosed) {
@@ -247,11 +279,18 @@ TEST(StorePermissions, UnownedParentDirectoryFailsClosed) {
     }
 
     const auto path = foreign / ("aa-unowned-parent-" + std::to_string(::getpid()) + ".json");
+    // Review fix (PR #93, P2): the unowned parent is rejected at load() too
+    // (no missing-file shortcut), and the write path still fails closed.
     trust::ApprovedPhoneStore store{path};
-    ASSERT_TRUE(store.load().has_value());
+    const auto loaded = store.load();
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_EQ(loaded.error().code(), ErrorCode::trust_store_io);
     const auto approved = store.approve(trust::TransportIdentity{test::kWired});
     ASSERT_FALSE(approved.has_value());
     EXPECT_EQ(approved.error().code(), ErrorCode::trust_store_io);
+    const auto written = trust::detail::write_file_private(path, "{\"schema_version\":2,\"next_phone_id\":1,\"phones\":[]}");
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error().code(), ErrorCode::trust_store_io);
     EXPECT_FALSE(std::filesystem::exists(path));
 }
 
@@ -273,13 +312,19 @@ TEST(StorePermissions, SymlinkedParentWriteFailsClosedWithoutMutatingTarget) {
     std::filesystem::create_directories(target);
     ASSERT_EQ(::chmod(target.c_str(), 0755), 0);
     const auto link = dir.dir() / "link";
-    ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
-
     trust::ApprovedPhoneStore store{link / "approved-phones.json"};
     ASSERT_TRUE(store.load().has_value());
+    ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
+    trust::ApprovedPhoneStore fresh{link / "approved-phones.json"};
+    const auto loaded = fresh.load();
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_EQ(loaded.error().code(), ErrorCode::trust_store_io);
     const auto approved = store.approve(trust::TransportIdentity{test::kWired});
     ASSERT_FALSE(approved.has_value());
     EXPECT_EQ(approved.error().code(), ErrorCode::trust_store_io);
+    const auto written = trust::detail::write_file_private(link / "approved-phones.json", "{\"schema_version\":2,\"next_phone_id\":1,\"phones\":[]}");
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error().code(), ErrorCode::trust_store_io);
 
     EXPECT_EQ(mode_of(target), 0755);  // rejection must NOT mutate the target
     EXPECT_FALSE(std::filesystem::exists(target / "approved-phones.json"));
@@ -314,6 +359,144 @@ TEST(StorePermissions, SymlinkedParentCannotLoadAnExistingStore) {
               trust::Decision::unknown);
 
     EXPECT_EQ(mode_of(target), 0755);  // the failed load must NOT mutate the target
+}
+
+// Independent-validation hardening (2026-11-06): the two cases above pin a
+// symlink at the store's IMMEDIATE parent. create_missing_ancestors() walks the
+// path with lstat/mkdir/open by PATH, so a symlink at an intermediate
+// component (e.g. `state -> elsewhere`) is followed: the receiver would create
+// `<component>/android-auto-receiver/` and the store inside the symlink target,
+// i.e. outside the intended state tree, contradicting the header contract that
+// the write path is symlink-safe and anchored on verified descriptors.
+TEST(StorePermissions, IntermediateSymlinkComponentCannotRedirectTheWrite) {
+    test::TempStoreDir dir;
+    const auto outside = dir.dir() / "outside";
+    std::filesystem::create_directories(outside);
+    const auto state = dir.dir() / "state";
+    ASSERT_EQ(::symlink(outside.c_str(), state.c_str()), 0);
+
+    // The receiver does not exist yet below the symlinked component, so it is
+    // create_missing_ancestors() (not open_verified_parent) that would follow it.
+    const auto store_path = state / "android-auto-receiver" / "approved-phones.json";
+    const auto written = trust::detail::write_file_private(store_path, "{\"schema_version\":2}");
+
+    EXPECT_FALSE(written.has_value()) << "an intermediate symlink must refuse the write";
+    EXPECT_FALSE(std::filesystem::exists(outside / "android-auto-receiver"))
+        << "the failed write must not create directories inside the symlink target";
+    EXPECT_FALSE(std::filesystem::exists(outside / "android-auto-receiver" / "approved-phones.json"));
+}
+
+TEST(StorePermissions, IntermediateSymlinkComponentCannotLoadAnExteriorStore) {
+    test::TempStoreDir dir;
+    const auto outside = dir.dir() / "outside";
+    std::filesystem::create_directories(outside / "android-auto-receiver");
+    const auto planted = outside / "android-auto-receiver" / "approved-phones.json";
+    {
+        std::ofstream out{planted};
+        out << "{\"schema_version\":2,\"next_phone_id\":2,\"phones\":["
+               "{\"phone_id\":1,\"identity\":{\"kind\":\"opaque\",\"key\":\"approved-key\"}}]}";
+    }
+    ASSERT_EQ(::chmod(planted.c_str(), 0600), 0);
+
+    const auto state = dir.dir() / "state";
+    ASSERT_EQ(::symlink(outside.c_str(), state.c_str()), 0);
+    const auto store_path = state / "android-auto-receiver" / "approved-phones.json";
+
+    const auto text = trust::detail::read_file(store_path);
+    EXPECT_FALSE(text.has_value())
+        << "an intermediate symlink must not redirect the store read outside the state tree";
+
+    trust::ApprovedPhoneStore store{store_path};
+    EXPECT_FALSE(store.load().has_value());
+    EXPECT_EQ(store.lookup(trust::PhoneIdentity{"approved-key"}), trust::Decision::unknown);
+}
+
+TEST(StorePermissions, DotDotRejectedBeforeCreatingAnyDirectory) {
+    test::TempStoreDir dir;
+    const auto path = dir.dir() / "new" / ".." / "store" / "phones.json";
+    EXPECT_FALSE(trust::detail::write_file_private(path, "{}").has_value());
+    EXPECT_FALSE(std::filesystem::exists(dir.dir() / "new"));
+    EXPECT_FALSE(trust::detail::read_file(path).has_value());
+}
+
+TEST(StorePermissions, RelativePathWalkRetainsPrivateStoreSemantics) {
+    test::TempStoreDir dir;
+    const auto previous = std::filesystem::current_path();
+    std::filesystem::current_path(dir.dir());
+    const auto written = trust::detail::write_file_private("./a/b/store.json", "{}");
+    const auto read = trust::detail::read_file("a/./b/store.json");
+    std::filesystem::current_path(previous);
+    EXPECT_TRUE(written.has_value());
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(read.value(), "{}");
+}
+
+TEST(StorePermissions, NonDirectoryAncestorRejectsReadAndWrite) {
+    test::TempStoreDir dir;
+    const auto blocker = dir.dir() / "file";
+    { std::ofstream out{blocker}; out << "untouched"; }
+    const auto path = blocker / "store" / "phones.json";
+    EXPECT_FALSE(trust::detail::read_file(path).has_value());
+    EXPECT_FALSE(trust::detail::write_file_private(path, "{}").has_value());
+    std::ifstream in{blocker};
+    std::string contents;
+    in >> contents;
+    EXPECT_EQ(contents, "untouched");
+}
+
+TEST(StorePermissions, InvalidFinalNamesFailBeforeMissingParentIsTreatedAsEmpty) {
+    test::TempStoreDir dir;
+    for (bool exists : {false, true}) {
+        const auto parent = dir.dir() / "parent";
+        if (exists) { std::filesystem::create_directory(parent); }
+        for (const auto* name : {"", ".", ".."}) {
+            const auto path = parent / name;
+            const auto read = trust::detail::read_file(path);
+            ASSERT_FALSE(read.has_value()) << path;
+            EXPECT_EQ(read.error().code(), ErrorCode::trust_store_io);
+            const auto checked = trust::detail::ensure_private_file(path);
+            ASSERT_FALSE(checked.has_value()) << path;
+            EXPECT_EQ(checked.error().code(), ErrorCode::trust_store_io);
+            trust::ApprovedPhoneStore store{path};
+            EXPECT_FALSE(store.load().has_value());
+            EXPECT_FALSE(store.usable());
+        }
+    }
+}
+
+// Review fix (PR #93, P2): read_file() used to lstat() the full path BEFORE
+// the verified walk and return the empty store on ENOENT, so a symlinked
+// ancestor whose target merely lacked the store file loaded "successfully".
+// The walk now runs first: any symlinked component is trust_store_io.
+TEST(StorePermissions, SymlinkedAncestorWithoutStoreFileFailsLoad) {
+    test::TempStoreDir dir;
+    const auto outside = dir.dir() / "outside";
+    std::filesystem::create_directories(outside / "android-auto-receiver");
+    const auto state = dir.dir() / "state";
+    ASSERT_EQ(::symlink(outside.c_str(), state.c_str()), 0);
+
+    // Target directory exists but holds no store file.
+    const auto store_path = state / "android-auto-receiver" / "approved-phones.json";
+    const auto text = trust::detail::read_file(store_path);
+    ASSERT_FALSE(text.has_value());
+    EXPECT_EQ(text.error().code(), ErrorCode::trust_store_io);
+
+    trust::ApprovedPhoneStore store{store_path};
+    const auto loaded = store.load();
+    ASSERT_FALSE(loaded.has_value()) << "a symlinked ancestor must not load as an empty store";
+    EXPECT_EQ(loaded.error().code(), ErrorCode::trust_store_io);
+    EXPECT_FALSE(store.usable());
+
+    // Target lacks even the store directory: still a rejection, not "fresh".
+    const auto bare = dir.dir() / "bare";
+    std::filesystem::create_directories(bare);
+    const auto bare_link = dir.dir() / "bare-state";
+    ASSERT_EQ(::symlink(bare.c_str(), bare_link.c_str()), 0);
+    trust::ApprovedPhoneStore bare_store{bare_link / "android-auto-receiver" / "approved-phones.json"};
+    const auto bare_loaded = bare_store.load();
+    ASSERT_FALSE(bare_loaded.has_value());
+    EXPECT_EQ(bare_loaded.error().code(), ErrorCode::trust_store_io);
+    EXPECT_FALSE(std::filesystem::exists(bare / "android-auto-receiver"));
 }
 
 } // namespace

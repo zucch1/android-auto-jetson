@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -63,6 +64,17 @@ public:
     // bound cancellation token fires; peer EOF returns transport_closed (TLS
     // truncation may return transport_io). Any failure terminally closes it.
     virtual core::Result<std::vector<std::byte>> receive() = 0;
+
+    // Opt-in bounded receive on the same I/O owner as receive(). nullopt means
+    // idle/yield, NOT EOF or timeout: input and partial/queued frames stay live.
+    // May yield early (including after partial progress); until bounds this call,
+    // not the channel lifetime. Cancellation and actual I/O failures stay terminal.
+    // Unsupported transports explicitly fail rather than falling back to receive().
+    [[nodiscard]] virtual core::Result<std::optional<std::vector<std::byte>>>
+    poll_receive(core::Deadline::Clock::time_point until) {
+        (void)until;
+        return Error{ErrorCode::transport_unavailable};
+    }
 
     virtual void close() noexcept = 0;
 };

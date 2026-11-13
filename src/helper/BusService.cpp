@@ -226,6 +226,10 @@ core::Result<void> BusService::cycle() {
     impl_->export_bus.deadline(Clock::now() + std::chrono::milliseconds(500));
     const auto message = impl_->export_bus.read_message();
     if (!message) {
+        if (message.error().code() == ErrorCode::transport_message_dropped) {
+            impl_->helper.platform_tick();
+            return {};
+        }
         impl_->helper.bus_lost();
         return message.error();
     }

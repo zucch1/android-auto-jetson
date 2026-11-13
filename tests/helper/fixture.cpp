@@ -36,7 +36,7 @@ public:
         std::ofstream{path_, std::ios::app} << "cleanup\n";
         active_ = false;
     }
-    core::Result<ObservedPeer> observe() override { return ObservedPeer{123, {"fixture-bond", "fixture-adapter"}}; }
+    core::Result<ObservedPeer> observe() override { return ObservedPeer{123, {"02:00:00:00:00:01", "fixture-adapter"}}; }
     core::Result<State> authorize(std::uint64_t handle) override {
         if (handle != 123) return Error{ErrorCode::helper_rejected};
         const auto effect = apply(Action::open_pairing, 0);
@@ -55,7 +55,7 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
     trust::SteadyClock clock;
     trust::PairingPolicy phones{store, clock};
     const trust::TransportIdentity identity{bluez ? trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"} :
-                                                   trust::WirelessIdentity{"fixture-bond", "fixture-adapter"}};
+                                                   trust::WirelessIdentity{"02:00:00:00:00:01", "fixture-adapter"}};
     ipc::RandomPairingIdSource ids;
     auto helper = BusClient::private_bus(address, store);
     if (!helper) return 3;
@@ -150,7 +150,7 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
             continue;
         } else if (command == "reconnect" || command == "unknown") {
             auto candidate = identity;
-            if (command == "unknown") candidate = trust::WirelessIdentity{"different", "fixture-adapter"};
+            if (command == "unknown") candidate = trust::WirelessIdentity{"02:00:00:00:00:04", "fixture-adapter"};
             const auto response = helper.value()->reconnect(candidate);
             result = response ? core::Result<void>{} : core::Result<void>{response.error()};
         } else if (command == "status" || command == "usb-status" || command == "modem-status") {

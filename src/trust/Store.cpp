@@ -22,6 +22,7 @@ core::Result<std::filesystem::path> ApprovedPhoneStore::default_path() {
 }
 
 core::Result<void> ApprovedPhoneStore::load() {
+    dropped_port_only_count_ = 0;
     auto text = detail::read_file(path_);
     if (!text.has_value()) {
         usable_ = false;
@@ -42,6 +43,7 @@ core::Result<void> ApprovedPhoneStore::load() {
         phones_.clear();
         return parsed.error();
     }
+    dropped_port_only_count_ = parsed.value().dropped_port_only_count;
     phones_ = std::move(parsed.value().phones);
     next_phone_id_ = parsed.value().next_phone_id;
     loaded_ = true;
@@ -81,47 +83,40 @@ Decision ApprovedPhoneStore::lookup(const PhoneIdentity& identity) const {
 }
 
 core::Result<void> ApprovedPhoneStore::approve_once(const PhoneIdentity& identity) {
-    if (!usable_) {
-        return Error{ErrorCode::trust_unknown_phone};
-    }
-    // Opaque approval goes through the SAME shared field/document budgets as
-    // the structured path (validated_key rejects empty, unprintable and
-    // over-budget keys), so it can never persist a document the loader would
-    // refuse and poison a previously reloadable store.
-    const TransportIdentity opaque{OpaqueIdentity{identity.key}};
-    const auto key = validated_key(opaque);
-    if (!key.has_value()) {
-        return Error{ErrorCode::trust_unknown_phone};
-    }
-    if (index_of_key(key.value()).has_value()) {
-        return {};  // approve-once: already eligible
-    }
-    if (phones_.size() >= kMaxApprovedPhones || next_phone_id_ > kMaxPhoneId) {
-        return Error{ErrorCode::trust_store_io};  // id range exhausted: fail closed
-    }
-    const core::PhoneId phone{next_phone_id_};
-    phones_.push_back(ApprovedPhone{phone, opaque});
-    ++next_phone_id_;
-    auto saved = persist();
-    if (!saved.has_value()) {
-        // trust_store_not_durable (703): the replacement renamed and the
-        // mutation landed on disk — keep phones_ and the advanced
-        // next_phone_id_; every other error is pre-replacement and rolls back.
-        if (saved.error().code() != ErrorCode::trust_store_not_durable) {
-            phones_.pop_back();
-            --next_phone_id_;
-        }
-        return saved.error();
+    if (!usable_) { return Error{ErrorCode::trust_unknown_phone}; }
+    auto approved = approve(TransportIdentity{OpaqueIdentity{identity.key}});
+    if (!approved.has_value()) {
+        return approved.error();
     }
     return {};
 }
 
 core::Result<core::PhoneId> ApprovedPhoneStore::approve(const TransportIdentity& identity) {
+    return approve_impl(identity, false);
+}
+
+core::Result<core::PhoneId> ApprovedPhoneStore::approve_port_only(const WiredIdentity& identity) {
+    if (strength_of(TransportIdentity{identity}) != IdentityStrength::port_only) {
+        return Error{ErrorCode::invalid_argument};
+    }
+    return approve_impl(TransportIdentity{identity}, true);
+}
+
+core::Result<core::PhoneId> ApprovedPhoneStore::approve_impl(
+    const TransportIdentity& identity, bool allow_port_only) {
     if (!usable_) {
         return Error{ErrorCode::trust_store_io};
     }
     auto key = validated_key(identity);
     if (!key.has_value()) {
+        return Error{ErrorCode::trust_unknown_phone};
+    }
+    if (strength_of(identity) == IdentityStrength::port_only && !allow_port_only) {
+        return Error{ErrorCode::trust_port_only_requires_opt_in};
+    }
+    // The opaque compatibility seam cannot bypass structured wired approval.
+    if (const auto* opaque = std::get_if<OpaqueIdentity>(&identity);
+        opaque != nullptr && opaque->key.starts_with("w1:")) {
         return Error{ErrorCode::trust_unknown_phone};
     }
     if (const auto existing = index_of_key(key.value()); existing.has_value()) {
@@ -131,7 +126,7 @@ core::Result<core::PhoneId> ApprovedPhoneStore::approve(const TransportIdentity&
         return Error{ErrorCode::trust_store_io};  // id range exhausted: fail closed
     }
     const core::PhoneId phone{next_phone_id_};
-    phones_.push_back(ApprovedPhone{phone, identity});
+    phones_.push_back(ApprovedPhone{phone, identity, strength_of(identity)});
     ++next_phone_id_;
     auto saved = persist();
     if (!saved.has_value()) {
@@ -204,6 +199,9 @@ std::string ApprovedPhoneStore::redacted_summary() const {
         out += std::to_string(phone.phone_id.value);
         out += "=";
         out += redacted_label(phone.identity);
+        out += "[";
+        out += strength_name(phone.strength);
+        out += "]";
     }
     return out;
 }

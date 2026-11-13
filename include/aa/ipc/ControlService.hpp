@@ -135,6 +135,8 @@ public:
     virtual core::Result<void> note_wireless_candidate(const helper::PeerIdentity&) {
         return Error{ErrorCode::trust_unknown_phone};
     }
+    virtual bool same_wireless_identity(const helper::PeerIdentity& a,
+                                        const helper::PeerIdentity& b) const { return a == b; }
     virtual std::optional<helper::PeerIdentity> wireless_identity(core::PhoneId) const { return std::nullopt; }
     virtual std::optional<helper::PeerIdentity> pairing_wireless_identity(core::PairingRequestId) const { return std::nullopt; }
 };

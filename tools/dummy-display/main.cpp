@@ -8,9 +8,12 @@
 // (task 24 F3, execution-input-transport-decision.json) to the receiver's
 // endpoint; the D-Bus contract stays control-only.
 #include <aa/display/Display.hpp>
+#include <aa/display/TelemetryWriter.hpp>
 #include <aa/ipc/InputChannel.hpp>
 
 #include "ProjectionWidget.hpp"
+#include "pump_timer.hpp"
+#include "shutdown_outcome.hpp"
 #include "test_control.hpp"
 
 #include <QApplication>
@@ -27,8 +30,12 @@ namespace {
 
 using aa::display::DisplayState;
 
+// display_error lines go through the telemetry writer once it is attached, so
+// runtime error reporting on the GUI thread never waits on stdout either.
 class ErrorReporter final {
 public:
+    void attach(aa::display::TelemetryWriter* writer) noexcept { writer_ = writer; }
+
     void begin_attempt() {
         emitted_ = 0;
         last_.reset();
@@ -49,11 +56,16 @@ public:
         line.append("\",\"code\":\"");
         line.append(code_str);
         line.append("\"}");
+        if (writer_ != nullptr) {
+            static_cast<void>(writer_->enqueue(std::move(line)));
+            return;
+        }
         std::puts(line.c_str());
         std::fflush(stdout);
     }
 
 private:
+    aa::display::TelemetryWriter* writer_{nullptr};
     unsigned emitted_{0};
     std::optional<std::pair<std::string_view, aa::ErrorCode>> last_{};
 };
@@ -66,8 +78,9 @@ class ControlWiring final : public aa::display::ProjectionControl {
 public:
     ControlWiring(std::optional<aa::display::DisplayController>& controller,
                   aa::ipc::VideoSocketPath video, aa::display::qt_adapter::ProjectionWidget& widget,
-                  ErrorReporter& errors)
-        : controller_(controller), video_(std::move(video)), widget_(widget), errors_(errors) {}
+                  ErrorReporter& errors, aa::display::TelemetryWriter& diagnostics)
+        : controller_(controller), video_(std::move(video)), widget_(widget), errors_(errors),
+          diagnostics_(diagnostics) {}
 
     void on_start_projection() override {
         if (!controller_.has_value()) {
@@ -87,7 +100,8 @@ private:
     // Captures the result, refreshes the state text and reports a typed
     // failure ("<state>: <Operation> failed (<code>)") on stderr and through
     // the widget error setter; a successful recovery clears the error while
-    // the success-state text stays owned by set_status().
+    // the success-state text stays owned by set_status(). The stderr line is
+    // queued on its own writer: this runs on the GUI thread.
     void report(const char* operation, const aa::core::Result<void>& result) {
         widget_.set_status(controller_->state());
         if (result.has_value()) {
@@ -102,8 +116,7 @@ private:
         message.reserve(state.size() + code.size() + 32);
         message.append(state).append(": ").append(operation).append(" failed (");
         message.append(code).append(")");
-        std::fputs(message.c_str(), stderr);
-        std::fputc('\n', stderr);
+        static_cast<void>(diagnostics_.enqueue(message));
         widget_.set_error(message);
     }
 
@@ -111,6 +124,7 @@ private:
     aa::ipc::VideoSocketPath video_;
     aa::display::qt_adapter::ProjectionWidget& widget_;
     ErrorReporter& errors_;
+    aa::display::TelemetryWriter& diagnostics_;
 };
 
 std::optional<aa::display::DisplayController> g_controller{};
@@ -144,6 +158,18 @@ aa::display::testcontrol::Status probe_status() {
     return status;
 }
 
+void print_usage(std::FILE* stream) {
+    std::fputs("usage: aa-dummy-display [--video-socket PATH] [--input-socket PATH]\n"
+               "                        [--decoder-backend automatic|software|nvidia]\n"
+               "                        [--test-only-autostart] [--test-only-control-stdin]\n"
+               "\n"
+               "TEST-ONLY Android Auto projection consumer.\n"
+               "  F5 start projection   F6 stop projection\n"
+               "  F1 toggle HUD         F11 toggle full screen\n"
+               "  arrows/enter/letters  forwarded as keys; left mouse button = touch\n",
+               stream);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -156,6 +182,7 @@ int main(int argc, char** argv) {
         aa::ipc::production_video_socket_path().value;
     std::string input_socket =
         aa::ipc::production_input_socket_path().value;
+    aa::consumer::DecodeBackend decoder_backend = aa::consumer::DecodeBackend::automatic;
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--test-only-autostart") == 0) {
             test_autostart = true;
@@ -165,7 +192,26 @@ int main(int argc, char** argv) {
             video_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--input-socket") == 0 && index + 1 < argc) {
             input_socket = argv[++index];
+        } else if (std::strcmp(argv[index], "--decoder-backend") == 0 && index + 1 < argc) {
+            const char* backend_val = argv[++index];
+            if (std::strcmp(backend_val, "automatic") == 0) {
+                decoder_backend = aa::consumer::DecodeBackend::automatic;
+            } else if (std::strcmp(backend_val, "software") == 0) {
+                decoder_backend = aa::consumer::DecodeBackend::software;
+            } else if (std::strcmp(backend_val, "nvidia") == 0) {
+                decoder_backend = aa::consumer::DecodeBackend::nvidia;
+            } else {
+                std::fprintf(stderr, "aa-dummy-display: invalid --decoder-backend '%s'\n",
+                             backend_val);
+                print_usage(stderr);
+                return 2;
+            }
+        } else if (std::strcmp(argv[index], "--help") == 0 || std::strcmp(argv[index], "-h") == 0) {
+            print_usage(stdout);
+            return 0;
         } else {
+            std::fprintf(stderr, "aa-dummy-display: unrecognized argument '%s'\n", argv[index]);
+            print_usage(stderr);
             return 2;
         }
     }
@@ -178,19 +224,22 @@ int main(int argc, char** argv) {
     config.consumer_name = aa::ipc::BusName{"org.custom.DummyDisplay1"};
     config.viewport = aa::ipc::Viewport{1280, 720, 160};
     config.caps = aa::protocol::VideoProfile{1280, 720, 30};
-    config.on_video_endpoint = [](const aa::ipc::VideoEndpoint& event) {
-        const auto line = aa::ipc::video_endpoint_json(event);
-        std::puts(line.c_str());
-        std::fflush(stdout);
+    // Endpoint, decode and presentation telemetry is written by a background
+    // thread: a slow stdout write must never stall the GUI thread that pumps,
+    // decodes and paints (a stalled GUI thread shows up as a frozen display).
+    aa::display::TelemetryWriter telemetry;
+    errors->attach(&telemetry);
+    aa::display::TelemetryWriter diagnostics{aa::display::default_stderr_sink, 64};
+    config.on_video_endpoint = [&telemetry](const aa::ipc::VideoEndpoint& event) {
+        static_cast<void>(telemetry.enqueue(aa::ipc::video_endpoint_json(event)));
     };
-    config.on_decode_completion = [](const aa::consumer::DecodeCompletion& event) {
-        const auto line = aa::consumer::decode_completion_json(event);
-        std::puts(line.c_str());
-        std::fflush(stdout);
+    config.on_decode_completion = [&telemetry](const aa::consumer::DecodeCompletion& event) {
+        static_cast<void>(telemetry.enqueue(aa::consumer::decode_completion_json(event)));
     };
 
     aa::display::qt_adapter::ProjectionWidget widget(sender, config.caps);
     g_widget = &widget;
+    widget.set_telemetry_writer(&telemetry);
     widget.set_status(DisplayState::unavailable);
 
     auto client = aa::ipc::ControlBusClient::connect();
@@ -198,10 +247,12 @@ int main(int argc, char** argv) {
         aa::display::TestOnlyAutostart gate{};
         gate.marker = test_autostart ? aa::display::TestOnlyAutostart::kMarker : std::string_view{};
         gate.video_socket = aa::ipc::VideoSocketPath{video_socket};
-        auto factory = [errors, inner = aa::display::helper_decode_sessions()](
+        auto factory = [errors, decoder_backend, inner = aa::display::helper_decode_sessions()](
                            const aa::consumer::DecodeConfig& decode_config) {
             errors->begin_attempt();
-            return inner(decode_config);
+            auto effective_config = decode_config;
+            effective_config.backend = decoder_backend;
+            return inner(effective_config);
         };
         aa::display::DisplayController::Deps deps{client.value(), std::move(factory), widget};
         auto attached = test_autostart
@@ -217,14 +268,24 @@ int main(int argc, char** argv) {
         errors->report("attach", client.error().code());
     }
 
-    ControlWiring controls{g_controller, aa::ipc::VideoSocketPath{video_socket}, widget, *errors};
+    ControlWiring controls{g_controller, aa::ipc::VideoSocketPath{video_socket}, widget, *errors,
+                           diagnostics};
     widget.set_projection_control(&controls);
 
     // Pump timer must outlive app.exec(): declared at main scope, not inside
     // the attach block (task 24 F1 - a timer destroyed before the event loop
     // starts never pumps video into the helper or presents frames).
     auto pump_timer = std::make_unique<QTimer>();
-    QObject::connect(pump_timer.get(), &QTimer::timeout, [errors] {
+    aa::display::pump::configure(*pump_timer);
+    QObject::connect(pump_timer.get(), &QTimer::timeout,
+                     [errors, &telemetry, &widget, telemetry_reported = false]() mutable {
+        // A full queue or failed write loses measurement events: show it once.
+        // Only on screen: a stream write here could block on the same stdout
+        // that failed the writer, freezing the GUI thread it protects.
+        if (!telemetry_reported && telemetry.failed()) {
+            telemetry_reported = true;
+            widget.set_error("telemetry failure: events undelivered");
+        }
         if (g_controller.has_value()) {
             const auto pumped = g_controller->pump(aa::core::Milliseconds{0});
             if (!pumped.has_value()) {
@@ -238,20 +299,26 @@ int main(int argc, char** argv) {
         }
     });
     if (g_controller.has_value()) {
-        pump_timer->start(30);
+        pump_timer->start();
     }
 
     std::unique_ptr<aa::display::testcontrol::Channel> control{};
     if (test_control_stdin) {
-        control = std::make_unique<aa::display::testcontrol::Channel>(widget, probe_status);
+        control = std::make_unique<aa::display::testcontrol::Channel>(widget, probe_status,
+                                                                      &telemetry);
     }
 
     widget.show();
-    const int outcome = app.exec();
+    int outcome = app.exec();
     pump_timer->stop();
     if (g_controller.has_value()) {
         g_controller->shutdown();
         g_controller.reset();
     }
-    return outcome;
+    widget.set_telemetry_writer(nullptr);
+    errors->attach(nullptr);
+    return aa::display::shutdown::finish(outcome, diagnostics, telemetry,
+                                         [](const std::string& line) {
+                                             std::fputs(line.c_str(), stderr);
+                                         });
 }

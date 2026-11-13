@@ -152,6 +152,15 @@ class WiredSession final {
     [[nodiscard]] core::Result<void> register_av_sink(protocol::ChannelRole role,
                                                      protocol::MessageSink &raw_sink);
 
+    // Opt-in borrowed-view submission; delivery must copy before returning.
+    // Complete later on the session thread, never directly from a worker.
+    [[nodiscard]] core::Result<void> register_deferred_av_sink(protocol::ChannelRole role,
+                                                              channels::DeferredAvDelivery delivery);
+    // Stale/duplicate completions do nothing. Worker failures must also be
+    // latched independently by the owner, even if their delivery is stale.
+    [[nodiscard]] core::Result<void> complete_av_delivery(channels::AvDeliveryId id,
+                                                         core::Result<void> result);
+
     // Publish the service-discovery response for the configured services and
     // send it over the transport. Returns the number of frames sent.
     [[nodiscard]] core::Result<std::size_t> announce_services();
@@ -169,6 +178,8 @@ class WiredSession final {
     // Returns true when a complete message was routed. A transport/reassembly
     // failure is returned typed (and the underlying channel is terminal).
     [[nodiscard]] core::Result<bool> poll_transport();
+    // Service budget only: idle/incomplete input yields false, not a timeout.
+    [[nodiscard]] core::Result<bool> poll_transport(core::Deadline::Clock::time_point until);
 
     // ---- Input (task 26) ----
     // Capability-gate one display input event and forward the normalized event
@@ -195,6 +206,11 @@ class WiredSession final {
     [[nodiscard]] std::uint64_t unhandled_controls() const noexcept { return unhandled_controls_; }
     [[nodiscard]] std::uint64_t channel_closes() const noexcept { return channel_closes_; }
     [[nodiscard]] std::optional<RejectedFrame> last_reject() const noexcept { return last_reject_; }
+    // Scoped to the last poll, copied before teardown; cleared by the next poll
+    // or new link, not by AV invalidation/completion/lifecycle cleanup.
+    [[nodiscard]] std::optional<diagnostics::QueueRejection> last_queue_rejection() const noexcept {
+        return last_queue_rejection_;
+    }
     [[nodiscard]] std::uint64_t version_responses() const noexcept { return version_responses_; }
     [[nodiscard]] std::uint64_t pings_answered() const noexcept { return pings_answered_; }
     [[nodiscard]] std::uint64_t encapsulated_ssls() const noexcept { return encapsulated_ssls_; }
@@ -212,6 +228,8 @@ class WiredSession final {
     class InputForwarder;
     [[nodiscard]] core::Result<void> send_frame(std::span<const std::byte> frame);
     [[nodiscard]] Error io_error(Error reason, const core::Deadline &deadline);
+    [[nodiscard]] core::Result<bool>
+    poll_transport_impl(std::optional<core::Deadline::Clock::time_point> until);
 
     // AAP authentication progression (finding F1).
     enum class AuthPhase { awaiting_version, ssl_handshake, authenticated };
@@ -249,6 +267,7 @@ class WiredSession final {
     std::vector<protocol::ServiceDescriptor> descriptors_;
     std::optional<channels::Negotiator> negotiator_;
     std::map<protocol::ChannelRole, protocol::MessageSink *> sinks_;
+    std::uint64_t av_generation_{};
     std::map<protocol::ChannelRole, std::unique_ptr<channels::AvSink>> av_sinks_;
     transport::FrameStreamParser parser_{};
     transport::MessageReassembler reassembler_{};
@@ -268,6 +287,7 @@ class WiredSession final {
     std::uint64_t unhandled_controls_{0};
     std::uint64_t channel_closes_{0};
     std::optional<RejectedFrame> last_reject_{};
+    std::optional<diagnostics::QueueRejection> last_queue_rejection_{};
     std::uint64_t version_responses_{0};
     std::uint64_t pings_answered_{0};
     std::uint64_t encapsulated_ssls_{0};

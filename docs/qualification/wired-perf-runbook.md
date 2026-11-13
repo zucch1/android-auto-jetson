@@ -67,6 +67,69 @@ Optional overrides: `--host` (default `jetson.local`), `--port` (default
 `1-2.1`), `--receiver` (default `/opt/aa/aa-wired-receiver`), `--display`
 (default `/opt/aa/aa-dummy-display`), `--store`, `--interval`.
 
+### Explicit owner-approved Orin Nano thermal availability policy
+
+Default `--thermal-policy strict-all-zones` (also the default when omitted) is
+unchanged: any unavailable first-active thermal-zone reading blocks coverage.
+Model detection alone never enables an exception.
+
+The owner was asked: "May I revise qualification policy to retain those three
+readings explicitly as unavailable, while requiring continuous CPU/GPU/SoC/TJ
+and keeping every performance budget unchanged?" The actual reply was:
+"Approve Nano-specific policy (but I highly doubt there is no tegrastat command
+or other way...)". The approval is recorded as
+`owner-approved-nano-cv-availability-20261018`; it authorizes only this explicit
+availability exception, not fake temperatures or a universal Nano-model waiver.
+
+For the approved operation only, add this flag to **each** separately authorized
+live invocation above:
+
+```text
+--thermal-policy orin-nano-cv-unavailable/1
+```
+
+The collector checks the actual hardware model before launching anything. Only
+the exact model `NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super`
+is admitted; absent, unknown, other Jetson and approximate model names fail
+closed. The observed probe platform was L4T R39.2.1, kernel
+6.8.12-1021-tegra. This approval does not certify another deployment/release.
+
+All nine CPU/GPU/CV0/CV1/CV2/SoC0/SoC1/SoC2/TJ zone identities remain in every raw
+sample. Every required CPU/GPU/SoC0/SoC1/SoC2/TJ reading must be finite at every
+active sample; each family must occur exactly once. Other discovered zones are
+still required. Only the three canonical CV types may be null/unavailable;
+every real numeric CV observation still contributes to its zone peak and the
+overall thermal peak. No value is carried forward or mapped from another zone.
+The first-active inventory remains stable, including directory/type identity;
+disappearing CV directories latch `thermal_inventory_changed` even though their
+raw entries are retained as null. Added/renamed identities still block. Cadence,
+edge coverage <=10s, budgets, A/V, freezes, terminal failures and provenance are
+unchanged.
+
+The capture contains `thermal_policy` with explicit profile/model/approval/scope.
+The result carries distinct coverage policy
+`active-window-coverage/orin-nano-cv-unavailable/1` plus
+`measurement_coverage.thermal_scope`: the same policy and per-zone counts of
+numeric and unavailable active observations. Keep that entire block, the nine
+zone peaks/nulls and the scope note when removing the private `capture` pointer
+for export. Both qualification runs must have the same policy and match the
+manifest target model. This is **not full-all-zone thermal qualification**.
+The marker records this operational approval; it is not cryptographic approval
+authentication or evidence that a live run occurred.
+
+Replay reads selection from the capture, never from the current machine. An
+optional `--thermal-policy` on `--capture` requires a matching existing marker;
+it cannot opt an old strict capture into Nano policy. Historical shipped v2
+strict captures/results retain their original contract and layout.
+
+Read-only probe receipts are privately retained in
+`.omo/evidence/jetson-android-auto-receiver/live-unblock-20261018/thermal-probe/`.
+Sysfs CV reads returned ENODATA; four foreground tegrastats samples contained the
+six required families but no CV temperature fields, and hwmon exposed only NVMe
+temperature. No alternative CV measurement was demonstrated. Neither physical
+sensor absence nor a power-gating cause was proven; the approval is not such a
+finding. Future real CV measurements must be retained, not overridden by null.
+
 If a prerequisite is absent the tool writes a `BLOCKED` result and exits 3, with
 `blocked_on` naming the reason (`ssh_unreachable`, `receiver_binary_absent`,
 `display_disconnected`, `no_audio_sink`, `collector_failed`,

@@ -174,11 +174,13 @@ def drain_stderr(driver):
     return "".join(chunks)
 
 
-def start_display(args, video, input_sock, autostart, env):
+def start_display(args, video, input_sock, autostart, env, decoder_backend: str | None = None):
     argv = [args.display, "--test-only-control-stdin", "--video-socket", video,
             "--input-socket", input_sock]
     if autostart:
         argv.append("--test-only-autostart")
+    if decoder_backend is not None:
+        argv += ["--decoder-backend", decoder_backend]
     proc = Driver(argv, env=env)
     try:
         proc.await_event("ready")
@@ -190,18 +192,32 @@ def start_display(args, video, input_sock, autostart, env):
 
 def case_replay(args):
     """F1: the shipped event loop pumps and renders without any manual pump."""
-    runtime = tempfile.mkdtemp(prefix="aa-exec-replay-")
-    try:
+    for backend in ("automatic", "software", "nvidia"):
+        result = subprocess.run(
+            [args.display, "--test-only-control-stdin", "--decoder-backend", backend],
+            input="quit\n", capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, (backend, result)
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        assert any(event.get("event") == "ready" for event in events), (backend, events)
+    for values in (["unknown"], [""], [], ["--help"]):
+        result = subprocess.run(
+            [args.display, "--decoder-backend", *values],
+            capture_output=True, text=True, timeout=15)
+        assert result.returncode == 2, (values, result)
+        assert result.stderr.startswith("aa-dummy-display: "), (values, result)
+        assert "usage: aa-dummy-display" in result.stderr, (values, result)
+    with tempfile.TemporaryDirectory(prefix="aa-exec-replay-") as runtime, ExitStack() as children:
         receiver, video, input_sock = start_receiver(args, runtime)
-        display = start_display(args, video, input_sock, True, os.environ.copy())
+        children.callback(receiver.stop, False)
+        display = start_display(args, video, input_sock, True, os.environ.copy(),
+                                decoder_backend="software")
+        children.callback(display.stop)
         status = display.await_status(lambda s: s.get("frames_presented") == 90)
         assert status["state"] == "projecting", status
         assert status["helper_started"] is True, status
         assert status["render_ok"] is True and status["render_width"] == 1280, status
         assert display.stop() == 0
         assert receiver.stop(False) == 0
-    finally:
-        shutil.rmtree(runtime, ignore_errors=True)
 
 
 def case_flow(args):

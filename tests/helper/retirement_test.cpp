@@ -11,7 +11,7 @@ TEST_F(HelperConfirmation, CommittedRetirementKeepsOnlyUnacknowledgedExactSource
     const auto open = control.request_add_phone(caller); ASSERT_TRUE(open);
     ASSERT_TRUE(control.confirm_phone_pairing(caller, open.value()));
     const auto matching = control.request_add_phone(caller); ASSERT_TRUE(matching);
-    phones.note_candidate(trust::WirelessIdentity{"other", "adapter"});
+    phones.note_candidate(trust::WirelessIdentity{"02:00:00:00:00:03", "adapter"});
     const auto unrelated = control.request_add_phone(caller); ASSERT_TRUE(unrelated);
     const auto phone = store.phones().front().phone_id;
     bridge.retirement_limit = 1;

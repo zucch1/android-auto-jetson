@@ -2,8 +2,8 @@
 
 `--sysroot` alone does not isolate distro cross GCC. `JetsonRuntime.cmake`
 disables implicit system headers and startup/runtime selection. It selects
-target libc/libm/libstdc++/libgcc_s and libc startup objects by explicit paths.
-GCC's own intrinsic headers, libgcc.a and crtbegin/crtend are compiler support,
+target libc/libm/libstdc++/libgcc_s and PIE libc startup objects by explicit paths.
+GCC's own intrinsic headers, libgcc.a and crtbeginS/crtendS are compiler support,
 not acquired Jetson inputs; selected-input QA identifies and SHA256-hashes
 them separately, along with the compiler driver, cc1plus, assembler and linker.
 
@@ -17,7 +17,7 @@ The acquired manifest/payload needs the selected closure of:
 - Target libstdc++-13 development headers under `usr/include/c++/13`, with
   `bits/c++config.h` under `usr/include/aarch64-linux-gnu/c++/13`.
 - ARM64 libc development/runtime inputs under `usr/lib/aarch64-linux-gnu`
-  and `lib/aarch64-linux-gnu`: crt1.o, crti.o, crtn.o, libc.so linker script,
+  and `lib/aarch64-linux-gnu`: Scrt1.o (PIE startup), crti.o, crtn.o, libc.so linker script,
   libc.so.6, libc_nonshared.a, libm.so and its script-selected inputs,
   libgcc_s.so.1 and the ARM64 dynamic loader.
 - `usr/lib/gcc/aarch64-linux-gnu/13/libstdc++.so` and its complete symlink

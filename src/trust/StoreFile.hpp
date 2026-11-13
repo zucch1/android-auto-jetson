@@ -7,9 +7,9 @@
 //
 // Runtime-file boundary (gate-fix rounds 2-3): every open is symlink-safe
 // (O_NOFOLLOW), every check runs against the opened fd (fstat) rather than a
-// path lookup, and reads and writes traverse ONLY the verified immediate
-// parent descriptor — a symlinked parent is a rejection that mutates nothing
-// (no path-based chmod anywhere). Created directories are 0700 at every
+// path lookup, and reads and writes walk every ancestor via openat on the
+// previous directory descriptor. A symlinked ancestor is rejected
+// (no path-based chmod anywhere); .. is rejected before mutations. Created directories are 0700 at every
 // created ancestor (checked fchmod on the creation fd), and the temp file is
 // exclusively created (O_CREAT|O_EXCL) under an unpredictable name so a
 // pre-placed file or symlink can never intercept the write.
@@ -34,21 +34,24 @@ inline constexpr std::size_t kMaxStoreBytes = std::size_t{256} * 1024;
 // Succeeds only when the store path is a regular file owned by the effective
 // user with no group/other mode bits, reached THROUGH the verified parent
 // descriptor (immediate parent: real directory, effective-user-owned, opened
-// O_DIRECTORY|O_NOFOLLOW). A symlink at the store name or at the immediate
-// parent is a trust_store_io rejection, never followed.
+// O_DIRECTORY|O_NOFOLLOW). A symlink at the store name or any ancestor is a trust_store_io rejection, never followed.
 [[nodiscard]] core::Result<void> ensure_private_file(const std::filesystem::path& path);
 
-// Reads the store file through the verified parent descriptor; an absent file
-// yields an empty string (fresh store). Symlinked (store name OR parent),
-// foreign-owned, permissive, oversized or unreadable stores are
-// trust_store_io.
+// Reads through verified directory descriptors before looking at the basename.
+// A genuinely missing directory component or store file yields an empty string.
+// Symlinks at the store name or any ancestor reject even if the target lacks
+// the file. Foreign-owned parents, or foreign-owned, permissive, oversized or
+// unreadable store files, are trust_store_io.
 [[nodiscard]] core::Result<std::string> read_file(const std::filesystem::path& path);
 
 // Atomic replace anchored on the verified store-directory descriptor:
-// create missing ancestors at 0700 (checked fchmod on the creation fd, fail
-// closed; each newly created directory and its containing directory are
-// fsynced before anything is written inside), open the immediate parent
-// O_DIRECTORY|O_NOFOLLOW (a symlinked parent rejects BEFORE any mutation),
+// walk every ancestor with openat(O_DIRECTORY|O_NOFOLLOW), creating missing
+// ancestors at 0700 (checked fchmod on the creation fd, fail closed). Each
+// newly created directory and its containing directory are
+// fsynced before anything is written inside. Rollback is local: a newly
+// opened component that fails verification or sync is removed best-effort;
+// ancestors created earlier remain after a later failure. A symlink rejects
+// before any mutation below it. On the final directory descriptor,
 // validate ownership via fstat and tighten via checked fchmod on that fd to
 // 0700, then exclusively create (O_CREAT|O_EXCL) an unpredictably named 0600
 // temp file there (fchmod defeats umask), fsync and CHECKED-close the temp

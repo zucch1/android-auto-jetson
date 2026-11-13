@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace aa::audio::detail {
@@ -58,6 +59,13 @@ public:
     [[nodiscard]] virtual core::Result<void> drain(core::Milliseconds timeout) = 0;
     [[nodiscard]] virtual SinkProbeStats probe_stats() const = 0;
     [[nodiscard]] virtual RenderBarrierStats render_stats() const = 0;
+    // #60 playback endpoint of the last acknowledged write: the steady-clock
+    // time its first sample is due on the sink's own clock, read from the
+    // element's position query right after the handoff. Absent when the
+    // element did not answer (or for sinks without a clock, e.g. test fakes).
+    [[nodiscard]] virtual std::optional<core::Nanoseconds> last_playback_slot() const {
+        return std::nullopt;
+    }
 };
 
 struct SinkOpenRequest final {
@@ -72,6 +80,7 @@ struct SinkOpenRequest final {
     // audio that was never rendered. Never set by production callers.
     bool drop_nonempty_at_ingress{false};
     bool drop_nonempty_after_window{false};
+    std::function<void(const SinkWriteProgress&)> on_write_progress{};
 };
 
 struct SinkOpenOutcome final {
@@ -137,5 +146,39 @@ void unblock_downstream_for_test(ObservedAudioSink& sink) noexcept;
                                                     std::uint64_t target_bytes);
 // Reads the appsrc queue levels and the configured limits.
 [[nodiscard]] AppsrcQueueLevel appsrc_queue_level_for_test(ObservedAudioSink& sink);
+
+// Test-only (#60 review): makes the routing sink's playback-slot worker block
+// INSIDE its next gst_element_query_position(): the routing element gets a
+// clock that parks reads from the worker's thread, which the base sink's
+// position path reaches after dropping its own lock. Like a real stuck query
+// it ignores the sink's stop; only release() (or the handle's destruction)
+// ends it. The handle shares the worker's state, so it stays valid after the
+// sink is destroyed: writes must still return within their deadline, and
+// teardown/reopen must not wait on the blocked query.
+struct SlotWorkerState;
+struct PlaybackSlotStallState;
+class PlaybackSlotQueryStall final {
+public:
+    PlaybackSlotQueryStall(std::shared_ptr<SlotWorkerState> worker,
+                           std::shared_ptr<PlaybackSlotStallState> stall);
+    ~PlaybackSlotQueryStall();
+    PlaybackSlotQueryStall(const PlaybackSlotQueryStall&) = delete;
+    PlaybackSlotQueryStall& operator=(const PlaybackSlotQueryStall&) = delete;
+    void release() noexcept;
+    // True once the worker is blocked inside the element's position query.
+    [[nodiscard]] bool query_entered(core::Milliseconds timeout) const;
+    // True once the blocked query's clock read has been let go.
+    [[nodiscard]] bool query_returned() const;
+    // True once the worker thread has finished (its element reference dropped).
+    [[nodiscard]] bool worker_exited(core::Milliseconds timeout) const;
+
+private:
+    std::shared_ptr<SlotWorkerState> worker_;
+    std::shared_ptr<PlaybackSlotStallState> stall_;
+};
+// Null when the sink is not the GStreamer routing sink, or its clock is not
+// GStreamer's monotonic system clock (the stand-in must keep its time base).
+[[nodiscard]] std::unique_ptr<PlaybackSlotQueryStall> stall_playback_slot_query_for_test(
+    ObservedAudioSink& sink);
 
 } // namespace aa::audio::detail

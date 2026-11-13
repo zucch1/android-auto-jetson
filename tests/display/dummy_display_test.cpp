@@ -10,17 +10,25 @@
 // fixture (90 access units, 1280x720@30) with fixed monotonic timestamps;
 // assertions are frame counts, dimensions, metadata carry-through and state
 // transitions - never screenshot pixels beyond a smoke render check.
+#include <aa/consumer/DecodeTelemetry.hpp>
 #include <aa/display/Display.hpp>
+#include <aa/display/TelemetryWriter.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/Contract.hpp>
 #include <aa/ipc/InputChannel.hpp>
 #include <aa/ipc/InputSocket.hpp>
+#include <aa/ipc/VideoTelemetry.hpp>
 
 #include "ProjectionWidget.hpp"
 
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
+#include "../../tools/dummy-display/pump_timer.hpp"
+#include "../../tools/dummy-display/shutdown_outcome.hpp"
+#include "../../tools/dummy-display/test_control.hpp"
 
 #include <QApplication>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QKeyEvent>
 #include <QMouseEvent>
 
@@ -194,6 +202,426 @@ TEST(DummyDisplayContractRender, PaintCompletionRetainsCorrelationAndIgnoresRepa
     EXPECT_LE(std::stoll(match[1].str()), after);
     EXPECT_EQ(output.find("video_presented", output.find("video_presented") + 1),
               std::string::npos);
+}
+
+TEST(DummyDisplayContractRender, TelemetryBlockedSinkDoesNotBlockProducersOrPainting) {
+    static_cast<void>(qt_app());
+    CountingInputSink input;
+    aa::display::qt_adapter::ProjectionWidget widget(input, VideoProfile{2, 2, 30});
+
+    std::mutex block_mutex;
+    std::condition_variable block_cv;
+    bool allow_sink = false;
+    std::atomic<bool> sink_entered{false};
+
+    auto blocking_sink = [&](const std::string&) -> bool {
+        sink_entered.store(true);
+        std::unique_lock lock(block_mutex);
+        block_cv.wait(lock, [&] { return allow_sink; });
+        return true;
+    };
+
+    aa::display::TelemetryWriter writer(blocking_sink);
+    widget.set_telemetry_writer(&writer);
+
+    // Enqueue an event to enter the blocking sink
+    EXPECT_TRUE(writer.enqueue("{\"event\":\"video_ipc_receive\"}"));
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (!sink_entered.load() && std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    ASSERT_TRUE(sink_entered.load());
+
+    // While the sink is blocked, producer enqueue and widget paint MUST NOT block
+    const auto before_paint = std::chrono::steady_clock::now();
+    aa::consumer::DecodedFrame frame{1, 1, 100000, 2, 2, {80, 80, 80, 80, 128, 128}};
+    widget.on_frame(frame);
+    static_cast<void>(widget.grab());
+    const auto after_paint = std::chrono::steady_clock::now();
+
+    // Painting must complete quickly despite the worker thread being blocked in sink
+    EXPECT_LT(after_paint - before_paint, std::chrono::milliseconds{100});
+
+    // Unblock sink and clean shutdown
+    {
+        std::lock_guard lock(block_mutex);
+        allow_sink = true;
+    }
+    block_cv.notify_all();
+    EXPECT_TRUE(writer.close(std::chrono::seconds{2}));
+}
+
+TEST(DummyDisplayContractRender, TelemetryOrderedAndTimestampPreservingDelivery) {
+    static_cast<void>(qt_app());
+    CountingInputSink input;
+    aa::display::qt_adapter::ProjectionWidget widget(input, VideoProfile{2, 2, 30});
+
+    std::mutex out_mutex;
+    std::vector<std::string> delivered;
+
+    auto recording_sink = [&](const std::string& line) -> bool {
+        std::lock_guard lock(out_mutex);
+        delivered.push_back(line);
+        return true;
+    };
+
+    aa::display::TelemetryWriter writer(recording_sink);
+    widget.set_telemetry_writer(&writer);
+
+    // Frame 1
+    aa::ipc::VideoEndpoint rx1{};
+    rx1.kind = aa::ipc::VideoEndpointKind::receive_completed;
+    rx1.frame = 1;
+    rx1.sequence = 10;
+    rx1.timestamp_ns = 5000001;
+    rx1.observed_ns = 6000001;
+    EXPECT_TRUE(writer.enqueue(aa::ipc::video_endpoint_json(rx1)));
+
+    aa::consumer::DecodeCompletion dec1{};
+    dec1.frame = 1;
+    dec1.sequence = 10;
+    dec1.timestamp_ns = 5000001;
+    dec1.submitted_ns = 6000005;
+    dec1.completed_ns = 6000020;
+    EXPECT_TRUE(writer.enqueue(aa::consumer::decode_completion_json(dec1)));
+
+    aa::consumer::DecodedFrame frame1{1, 10, 5000001, 2, 2, {80, 80, 80, 80, 128, 128}};
+    widget.on_frame(frame1);
+    static_cast<void>(widget.grab());
+
+    // Frame 2
+    aa::ipc::VideoEndpoint rx2{};
+    rx2.kind = aa::ipc::VideoEndpointKind::receive_completed;
+    rx2.frame = 2;
+    rx2.sequence = 11;
+    rx2.timestamp_ns = 5033334;
+    rx2.observed_ns = 6033334;
+    EXPECT_TRUE(writer.enqueue(aa::ipc::video_endpoint_json(rx2)));
+
+    aa::consumer::DecodeCompletion dec2{};
+    dec2.frame = 2;
+    dec2.sequence = 11;
+    dec2.timestamp_ns = 5033334;
+    dec2.submitted_ns = 6033340;
+    dec2.completed_ns = 6033360;
+    EXPECT_TRUE(writer.enqueue(aa::consumer::decode_completion_json(dec2)));
+
+    aa::consumer::DecodedFrame frame2{2, 11, 5033334, 2, 2, {80, 80, 80, 80, 128, 128}};
+    widget.on_frame(frame2);
+    static_cast<void>(widget.grab());
+
+    ASSERT_TRUE(writer.close(std::chrono::seconds{2}));
+
+    std::lock_guard lock(out_mutex);
+    ASSERT_EQ(delivered.size(), 6U);
+
+    // Verify ordering
+    EXPECT_NE(delivered[0].find("\"event\":\"video_ipc_receive\""), std::string::npos);
+    EXPECT_NE(delivered[0].find("\"timestamp_ns\":5000001"), std::string::npos);
+
+    EXPECT_NE(delivered[1].find("\"event\":\"video_decode_completed\""), std::string::npos);
+    EXPECT_NE(delivered[1].find("\"timestamp_ns\":5000001"), std::string::npos);
+
+    EXPECT_NE(delivered[2].find("\"event\":\"video_presented\""), std::string::npos);
+    EXPECT_NE(delivered[2].find("\"scheduled_ns\":5000001"), std::string::npos);
+    EXPECT_NE(delivered[2].find("\"frame\":1"), std::string::npos);
+
+    EXPECT_NE(delivered[3].find("\"event\":\"video_ipc_receive\""), std::string::npos);
+    EXPECT_NE(delivered[3].find("\"timestamp_ns\":5033334"), std::string::npos);
+
+    EXPECT_NE(delivered[4].find("\"event\":\"video_decode_completed\""), std::string::npos);
+    EXPECT_NE(delivered[4].find("\"timestamp_ns\":5033334"), std::string::npos);
+
+    EXPECT_NE(delivered[5].find("\"event\":\"video_presented\""), std::string::npos);
+    EXPECT_NE(delivered[5].find("\"scheduled_ns\":5033334"), std::string::npos);
+    EXPECT_NE(delivered[5].find("\"frame\":2"), std::string::npos);
+}
+
+TEST(DummyDisplayContractRender, TelemetryHealthyShutdownDrainsAllEvents) {
+    std::mutex out_mutex;
+    std::vector<std::string> delivered;
+    auto recording_sink = [&](const std::string& line) -> bool {
+        std::lock_guard lock(out_mutex);
+        delivered.push_back(line);
+        return true;
+    };
+
+    aa::display::TelemetryWriter writer(recording_sink);
+    constexpr std::size_t kCount = 100;
+    for (std::size_t i = 0; i < kCount; ++i) {
+        EXPECT_TRUE(writer.enqueue("{\"event\":\"test_event\",\"index\":" + std::to_string(i) + "}"));
+    }
+
+    EXPECT_TRUE(writer.close(std::chrono::seconds{2}));
+    EXPECT_FALSE(writer.failed());
+    EXPECT_EQ(writer.undelivered(), 0U);
+
+    std::lock_guard lock(out_mutex);
+    EXPECT_EQ(delivered.size(), kCount);
+}
+
+TEST(DummyDisplayContractRender, TelemetryQueueSaturationAndSinkFailureFailClosed) {
+    // 1. Sink failure fails closed
+    {
+        auto failing_sink = [&](const std::string& line) -> bool {
+            if (line.find("trigger_fail") != std::string::npos) {
+                return false;
+            }
+            return true;
+        };
+
+        aa::display::TelemetryWriter writer(failing_sink);
+        EXPECT_TRUE(writer.enqueue("{\"event\":\"ok1\"}"));
+        EXPECT_TRUE(writer.enqueue("{\"event\":\"trigger_fail\"}"));
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!writer.failed() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        EXPECT_TRUE(writer.failed());
+        // Once failed, enqueue must fail-closed
+        EXPECT_FALSE(writer.enqueue("{\"event\":\"subsequent\"}"));
+        EXPECT_FALSE(writer.close(std::chrono::seconds{1}));
+        EXPECT_GT(writer.undelivered(), 0U);
+    }
+
+    // 2. Queue saturation fails closed
+    {
+        std::mutex block_mutex;
+        std::condition_variable block_cv;
+        bool allow_sink = false;
+        std::atomic<bool> in_sink{false};
+
+        auto blocking_sink = [&](const std::string&) -> bool {
+            in_sink.store(true);
+            std::unique_lock lock(block_mutex);
+            block_cv.wait(lock, [&] { return allow_sink; });
+            return true;
+        };
+
+        // Writer with capacity 2
+        aa::display::TelemetryWriter writer(blocking_sink, 2);
+        // Line 1 is popped by worker and enters sink
+        EXPECT_TRUE(writer.enqueue("{\"event\":\"line1\"}"));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!in_sink.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        ASSERT_TRUE(in_sink.load());
+
+        // Fill remaining queue capacity (2 items in queue)
+        EXPECT_TRUE(writer.enqueue("{\"event\":\"line2\"}"));
+        EXPECT_TRUE(writer.enqueue("{\"event\":\"line3\"}"));
+
+        // Next enqueue exceeds capacity -> must return false and fail closed
+        EXPECT_FALSE(writer.enqueue("{\"event\":\"overflow\"}"));
+        EXPECT_TRUE(writer.failed());
+
+        // Subsequent enqueue fails
+        EXPECT_FALSE(writer.enqueue("{\"event\":\"line5\"}"));
+
+        // Release sink
+        {
+            std::lock_guard lock(block_mutex);
+            allow_sink = true;
+        }
+        block_cv.notify_all();
+
+        EXPECT_FALSE(writer.close(std::chrono::seconds{1}));
+        EXPECT_GT(writer.undelivered(), 0U);
+    }
+}
+
+namespace {
+
+// Blocking sink whose state is shared with the writer's worker, so a detached
+// worker can still touch it after the test body returns (no stack lifetime UB).
+struct BlockingSinkState final {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool allow{false};
+    std::atomic<bool> entered{false};
+
+    void release() {
+        {
+            std::lock_guard lock(mutex);
+            allow = true;
+        }
+        cv.notify_all();
+    }
+    [[nodiscard]] bool wait_entered() const {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!entered.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        return entered.load();
+    }
+};
+
+aa::display::TelemetryWriter::Sink blocking_sink(const std::shared_ptr<BlockingSinkState>& state) {
+    return [state](const std::string&) -> bool {
+        state->entered.store(true);
+        std::unique_lock lock(state->mutex);
+        state->cv.wait(lock, [&] { return state->allow; });
+        return true;
+    };
+}
+
+}  // namespace
+
+TEST(DummyDisplayContractRender, TelemetryBlockedShutdownBoundedWithoutMemoryError) {
+    auto sink = std::make_shared<BlockingSinkState>();
+    auto writer = std::make_unique<aa::display::TelemetryWriter>(blocking_sink(sink));
+    EXPECT_TRUE(writer->enqueue("{\"event\":\"will_block\"}"));
+    ASSERT_TRUE(sink->wait_entered());
+
+    // Bounded shutdown: close with a short timeout, then destroy; the
+    // destructor's close() must not wait again (close is idempotent).
+    const auto before_close = std::chrono::steady_clock::now();
+    testing::internal::CaptureStderr();
+    EXPECT_FALSE(writer->close(std::chrono::milliseconds{50}));
+    EXPECT_FALSE(writer->close(std::chrono::seconds{5}));
+    EXPECT_TRUE(writer->timed_out());
+    EXPECT_GT(writer->undelivered(), 0U);
+    writer.reset();
+    // The timed-out path writes nothing: stderr may share the stuck sink.
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+    EXPECT_LT(std::chrono::steady_clock::now() - before_close, std::chrono::milliseconds{500});
+
+    // The detached worker wakes after the writer is gone; it owns its state
+    // and the sink's, so this must be clean under ASan.
+    sink->release();
+}
+
+TEST(DummyDisplayContractRender, TestControlRepliesGoThroughWriterWithoutBlocking) {
+    static_cast<void>(qt_app());
+    CountingInputSink input;
+    aa::display::qt_adapter::ProjectionWidget widget(input, VideoProfile{2, 2, 30});
+    auto sink_state = std::make_shared<BlockingSinkState>();
+    std::vector<std::string> seen;
+    std::mutex seen_mutex;
+    auto sink = [sink_state, &seen, &seen_mutex](const std::string& line) -> bool {
+        {
+            std::lock_guard lock(seen_mutex);
+            seen.push_back(line);
+        }
+        return blocking_sink(sink_state)(line);
+    };
+    aa::display::TelemetryWriter writer(sink);
+    const int stdin_flags = ::fcntl(0, F_GETFL, 0);
+    {
+        // The channel announces itself on construction; with stdout stuck
+        // that must still return at once (the reply is only queued).
+        const auto before = std::chrono::steady_clock::now();
+        aa::display::testcontrol::Channel channel(widget, nullptr, &writer);
+        EXPECT_LT(std::chrono::steady_clock::now() - before, std::chrono::milliseconds{100});
+        ASSERT_TRUE(sink_state->wait_entered());
+    }
+    if (stdin_flags >= 0) {
+        static_cast<void>(::fcntl(0, F_SETFL, stdin_flags));
+    }
+    sink_state->release();
+    EXPECT_TRUE(writer.close(std::chrono::seconds{2}));
+    std::lock_guard lock(seen_mutex);
+    ASSERT_EQ(seen.size(), 1U);
+    EXPECT_EQ(seen[0], "{\"event\":\"ready\"}\n");
+}
+
+TEST(DummyDisplayContractRender, TelemetryDrainWaitsForInFlightWrite) {
+    auto sink = std::make_shared<BlockingSinkState>();
+    aa::display::TelemetryWriter writer(blocking_sink(sink));
+    EXPECT_TRUE(writer.enqueue("{\"event\":\"last\"}"));
+    ASSERT_TRUE(sink->wait_entered());
+    // The queue is empty but the only event is still inside the sink.
+    EXPECT_FALSE(writer.drain(std::chrono::milliseconds{50}));
+    sink->release();
+    EXPECT_TRUE(writer.drain(std::chrono::seconds{2}));
+    EXPECT_TRUE(writer.close(std::chrono::seconds{2}));
+}
+
+TEST(DummyDisplayContractRender, ShutdownBlockedStderrDiagnosticsExitsBoundedAndSilent) {
+    auto sink = std::make_shared<BlockingSinkState>();
+    aa::display::TelemetryWriter diagnostics(blocking_sink(sink), 4);
+    aa::display::TelemetryWriter telemetry([](const std::string&) { return true; });
+    EXPECT_TRUE(diagnostics.enqueue("stopping: Stop failed (busy)\n"));
+    ASSERT_TRUE(sink->wait_entered());
+    EXPECT_TRUE(telemetry.enqueue("{\"event\":\"ok\"}"));
+
+    std::vector<std::string> reported;
+    const auto before = std::chrono::steady_clock::now();
+    const int outcome = aa::display::shutdown::finish(
+        0, diagnostics, telemetry, [&](const std::string& line) { reported.push_back(line); },
+        std::chrono::milliseconds{50});
+    EXPECT_EQ(outcome, aa::display::shutdown::kSinkTimedOut);
+    EXPECT_TRUE(reported.empty());  // stderr is stuck: write nothing more
+    EXPECT_LT(std::chrono::steady_clock::now() - before, std::chrono::milliseconds{500});
+    sink->release();
+}
+
+TEST(DummyDisplayContractRender, ShutdownFailedStderrDiagnosticsChangesExitStatus) {
+    aa::display::TelemetryWriter diagnostics([](const std::string&) { return false; }, 4);
+    aa::display::TelemetryWriter telemetry([](const std::string&) { return true; });
+    EXPECT_TRUE(diagnostics.enqueue("stopping: Stop failed (busy)\n"));
+    EXPECT_TRUE(telemetry.enqueue("{\"event\":\"ok\"}"));
+
+    std::vector<std::string> reported;
+    const auto report = [&](const std::string& line) { reported.push_back(line); };
+    EXPECT_EQ(aa::display::shutdown::finish(0, diagnostics, telemetry, report),
+              aa::display::shutdown::kEventsUndelivered);
+    ASSERT_EQ(reported.size(), 1U);
+    EXPECT_NE(reported[0].find("diagnostic line(s) undelivered"), std::string::npos);
+
+    // A failing event loop keeps its own status.
+    aa::display::TelemetryWriter diagnostics2([](const std::string&) { return false; }, 4);
+    aa::display::TelemetryWriter telemetry2([](const std::string&) { return true; });
+    EXPECT_TRUE(diagnostics2.enqueue("x\n"));
+    EXPECT_EQ(aa::display::shutdown::finish(2, diagnostics2, telemetry2, report), 2);
+}
+
+TEST(DummyDisplayContractRender, ShutdownHealthyWritersKeepOutcome) {
+    std::vector<std::string> lines;
+    aa::display::TelemetryWriter diagnostics(
+        [&](const std::string& line) { lines.push_back(line); return true; }, 4);
+    aa::display::TelemetryWriter telemetry([](const std::string&) { return true; });
+    EXPECT_TRUE(diagnostics.enqueue("stopping: Stop failed (busy)\n"));
+    std::vector<std::string> reported;
+    EXPECT_EQ(aa::display::shutdown::finish(0, diagnostics, telemetry,
+                                            [&](const std::string& l) { reported.push_back(l); }),
+              0);
+    EXPECT_TRUE(reported.empty());
+    EXPECT_EQ(lines.size(), 1U);
+}
+
+TEST(DummyDisplayContractRender, TelemetrySaturatedQueueWithBlockedSinkDoesNotBlockPainting) {
+    static_cast<void>(qt_app());
+    CountingInputSink input;
+    aa::display::qt_adapter::ProjectionWidget widget(input, VideoProfile{2, 2, 30});
+    auto sink = std::make_shared<BlockingSinkState>();
+    aa::display::TelemetryWriter writer(blocking_sink(sink), 2);
+    widget.set_telemetry_writer(&writer);
+    EXPECT_TRUE(writer.enqueue("{\"event\":\"blocks\"}"));
+    ASSERT_TRUE(sink->wait_entered());
+
+    // Stdout is stuck and the queue overflows: every presentation after that
+    // is rejected, yet painting stays fast and writes nothing to any stream.
+    testing::internal::CaptureStderr();
+    const auto before = std::chrono::steady_clock::now();
+    for (std::uint64_t frame = 1; frame <= 8; ++frame) {
+        aa::consumer::DecodedFrame decoded{frame, frame, 100000 * frame, 2, 2,
+                                           {80, 80, 80, 80, 128, 128}};
+        widget.on_frame(decoded);
+        static_cast<void>(widget.grab());
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - before;
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+    EXPECT_LT(elapsed, std::chrono::milliseconds{500});
+    EXPECT_TRUE(writer.failed());
+    EXPECT_GT(writer.undelivered(), 0U);
+
+    widget.set_telemetry_writer(nullptr);
+    sink->release();
+    EXPECT_FALSE(writer.close(std::chrono::seconds{2}));
+    EXPECT_FALSE(writer.timed_out());
 }
 
 struct FrameRecord final {
@@ -572,6 +1000,160 @@ TEST(DummyDisplayContractInput, KeyboardAndMouseNormalizeToSeamEvents) {
     ASSERT_NE(touch_up, nullptr);
     EXPECT_EQ(*touch_up, (TouchEvent{40, 50, TouchAction::up}));
     EXPECT_EQ(widget.status_text(), QStringLiteral("projecting"));
+}
+
+TEST(DummyDisplayContractInput, LetterboxedTouchMapsIntoVideoPixels) {
+    // Given: a 1280x720 surface resized to 4:3, so the video is letterboxed
+    // into a centered 640x360 area with 60 px bars above and below.
+    qt_app();
+    CountingInputSink sink;
+    aa::display::qt_adapter::ProjectionWidget widget(sink, kCaps);
+    widget.resize(640, 480);
+    ASSERT_EQ(widget.video_rect(), QRect(0, 60, 640, 360));
+    const auto send = [&widget](QEvent::Type type, QPointF at) {
+        QMouseEvent event(type, at, at, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&widget, &event);
+    };
+
+    // When: a gesture starts in the letterbox bar, then one starts inside the
+    // video and drags past its edge.
+    send(QEvent::MouseButtonPress, QPointF(10.0, 20.0));
+    send(QEvent::MouseMove, QPointF(30.0, 30.0));
+    send(QEvent::MouseButtonRelease, QPointF(30.0, 30.0));
+    send(QEvent::MouseButtonPress, QPointF(320.0, 240.0));
+    send(QEvent::MouseMove, QPointF(700.0, 470.0));
+    send(QEvent::MouseButtonRelease, QPointF(700.0, 470.0));
+
+    // Then: the bar gesture is dropped entirely; the video gesture is scaled
+    // into absolute video pixels and clamped to the frame.
+    ASSERT_EQ(sink.events.size(), 3U);
+    EXPECT_EQ(std::get<TouchEvent>(sink.events[0]), (TouchEvent{640, 360, TouchAction::down}));
+    EXPECT_EQ(std::get<TouchEvent>(sink.events[1]), (TouchEvent{1279, 719, TouchAction::move}));
+    EXPECT_EQ(std::get<TouchEvent>(sink.events[2]), (TouchEvent{1279, 719, TouchAction::up}));
+}
+
+TEST(DummyDisplayContractInput, LostReleaseIsCancelledAndNeverPoisonsLaterGestures) {
+    // Given: a projecting surface.
+    qt_app();
+    CountingInputSink sink;
+    aa::display::qt_adapter::ProjectionWidget widget(sink, kCaps);
+    widget.set_status(DisplayState::projecting);
+    const auto mouse = [&widget](QEvent::Type type, QPointF at) {
+        QMouseEvent event(type, at, at, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(&widget, &event);
+    };
+    QFocusEvent focus_out(QEvent::FocusOut, Qt::ActiveWindowFocusReason);
+
+    // When: a drag loses focus before its release, a later gesture runs
+    // normally, another press arrives with no release before projection
+    // stops, and a repeated press interrupts a gesture without a release.
+    mouse(QEvent::MouseButtonPress, QPointF(10.0, 20.0));
+    mouse(QEvent::MouseMove, QPointF(30.0, 40.0));
+    QApplication::sendEvent(&widget, &focus_out);
+    mouse(QEvent::MouseMove, QPointF(50.0, 60.0));
+    mouse(QEvent::MouseButtonRelease, QPointF(50.0, 60.0));
+    mouse(QEvent::MouseButtonPress, QPointF(100.0, 110.0));
+    mouse(QEvent::MouseButtonRelease, QPointF(100.0, 110.0));
+    mouse(QEvent::MouseButtonPress, QPointF(200.0, 210.0));
+    widget.set_status(DisplayState::idle);
+    widget.set_status(DisplayState::projecting);
+    mouse(QEvent::MouseButtonPress, QPointF(300.0, 310.0));
+    mouse(QEvent::MouseButtonPress, QPointF(400.0, 410.0));
+    mouse(QEvent::MouseButtonRelease, QPointF(400.0, 410.0));
+
+    // Then: every lost release becomes an "up" at the last delivered point,
+    // stray post-cancel move/release events are dropped, and each new press
+    // starts a fresh gesture.
+    const std::vector<InputEvent> expected{
+        TouchEvent{10, 20, TouchAction::down},   TouchEvent{30, 40, TouchAction::move},
+        TouchEvent{30, 40, TouchAction::up},     TouchEvent{100, 110, TouchAction::down},
+        TouchEvent{100, 110, TouchAction::up},   TouchEvent{200, 210, TouchAction::down},
+        TouchEvent{200, 210, TouchAction::up},   TouchEvent{300, 310, TouchAction::down},
+        TouchEvent{300, 310, TouchAction::up},   TouchEvent{400, 410, TouchAction::down},
+        TouchEvent{400, 410, TouchAction::up},
+    };
+    EXPECT_EQ(sink.events, expected);
+}
+
+TEST(DummyDisplayContractRender, FpsReadingExpiresAfterPresentationStall) {
+    // Given: a meter fed 30 fps presentations for just over one second.
+    aa::display::qt_adapter::FpsMeter meter;
+    constexpr std::int64_t kStart = 5'000'000'000;
+    constexpr std::int64_t kPeriod = 1'000'000'000 / 30;
+    EXPECT_FALSE(meter.reading(kStart).has_value());
+    std::int64_t last = kStart;
+    for (int index = 0; index <= 31; ++index) {
+        last = kStart + index * kPeriod;
+        meter.note(last);
+    }
+
+    // Then: the rate is reported while presentations are fresh...
+    const auto fresh = meter.reading(last + kPeriod);
+    ASSERT_TRUE(fresh.has_value());
+    EXPECT_NEAR(*fresh, 30.0, 0.5);
+    EXPECT_TRUE(meter.reading(last + aa::display::qt_adapter::FpsMeter::kStaleNs - 1).has_value());
+    // ...expires once presentations stall...
+    EXPECT_FALSE(meter.reading(last + aa::display::qt_adapter::FpsMeter::kStaleNs).has_value());
+    // ...and a resumed stream starts a new window instead of averaging the stall in.
+    const std::int64_t resumed = last + 10'000'000'000;
+    meter.note(resumed);
+    EXPECT_FALSE(meter.reading(resumed).has_value());
+    for (int index = 1; index <= 31; ++index) {
+        meter.note(resumed + index * kPeriod);
+    }
+    const auto after = meter.reading(resumed + 31 * kPeriod);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_NEAR(*after, 30.0, 0.5);
+}
+
+TEST(DummyDisplayContractRender, PumpRunsAtQualifiedFiveMsPreciseCadence) {
+    // Given: a timer configured exactly as the shipped display's video pump.
+    qt_app();
+    QTimer timer;
+    aa::display::pump::configure(timer);
+
+    // Then: it carries the #60-qualified 5 ms precise cadence (display
+    // 802cd63e), never the coarse 30 ms pump that failed A/V at ~135 ms.
+    EXPECT_EQ(aa::display::pump::kInterval, std::chrono::milliseconds{5});
+    EXPECT_EQ(timer.intervalAsDuration(), std::chrono::milliseconds{5});
+    EXPECT_EQ(timer.timerType(), Qt::PreciseTimer);
+    EXPECT_FALSE(timer.isSingleShot());
+
+    // When: the real event loop runs it for 300 ms.
+    int ticks = 0;
+    QObject::connect(&timer, &QTimer::timeout, [&ticks] { ++ticks; });
+    QEventLoop loop;
+    QTimer::singleShot(std::chrono::milliseconds{300}, Qt::PreciseTimer, &loop, &QEventLoop::quit);
+    QElapsedTimer elapsed;
+    elapsed.start();
+    timer.start();
+    loop.exec();
+    timer.stop();
+
+    // Then: it fires well above the 30 ms pump's ceiling (10 ticks per
+    // 300 ms); a 5 ms pump yields about 60, so 24 leaves load headroom.
+    ASSERT_GE(elapsed.elapsed(), 300);
+    EXPECT_GE(ticks, 24) << "pump fired " << ticks << " times in " << elapsed.elapsed() << " ms";
+}
+
+TEST(DummyDisplayContractInput, ViewShortcutsStayLocal) {
+    // Given: a display surface with the HUD shown by default.
+    qt_app();
+    CountingInputSink sink;
+    aa::display::qt_adapter::ProjectionWidget widget(sink, kCaps);
+    ASSERT_TRUE(widget.hud_visible());
+
+    // When: F1 (HUD) and F11 (full screen) are pressed and released.
+    for (const int key : {Qt::Key_F1, Qt::Key_F11}) {
+        QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
+        QKeyEvent release(QEvent::KeyRelease, key, Qt::NoModifier);
+        QApplication::sendEvent(&widget, &press);
+        QApplication::sendEvent(&widget, &release);
+    }
+
+    // Then: the HUD toggled and nothing reached the phone input seam.
+    EXPECT_FALSE(widget.hud_visible());
+    EXPECT_TRUE(sink.events.empty());
 }
 
 TEST(DummyDisplayContractAbsent, ReceiverAbsentShowsUnavailableWithoutStartingHelper) {
@@ -969,10 +1551,10 @@ private:
             }
             auto message = connection_->read_message();
             if (!message.has_value()) {
-                if (message.error().code() == ErrorCode::transport_closed) {
-                    break;
+                if (message.error().code() == ErrorCode::transport_message_dropped) {
+                    continue;
                 }
-                continue;
+                break;
             }
             if (message.value().type != bus::MessageType::method_call) {
                 continue;
@@ -1015,6 +1597,152 @@ private:
     int* closes_;
     int* submits_;
     int* eofs_;
+};
+
+struct BackpressureDecoderState final {
+    int queue_full_rejections{0};
+    std::optional<ErrorCode> next_rejection{};
+    std::size_t pumps{0};
+    std::size_t closes{0};
+    std::size_t eofs{0};
+    std::vector<aa::ipc::VideoAccessUnit> submissions{};
+    std::vector<aa::ipc::VideoAccessUnit> accepted{};
+};
+
+// A deterministic decoder: byte backlog rejects every submission until pump()
+// drains one rejection. All attempts are recorded, but only successful
+// submissions enter accepted, making loss and duplicate delivery observable.
+class BackpressureSession final : public DecodeSession {
+public:
+    explicit BackpressureSession(BackpressureDecoderState& state) : state_(state) {}
+
+    [[nodiscard]] aa::core::Result<void> submit(
+        const aa::ipc::VideoAccessUnit& unit) override {
+        state_.submissions.push_back(unit);
+        if (state_.next_rejection.has_value()) {
+            const auto code = state_.next_rejection.value();
+            state_.next_rejection.reset();
+            return aa::Error{code};
+        }
+        if (state_.queue_full_rejections > 0) {
+            return aa::Error{ErrorCode::ipc_queue_full};
+        }
+        state_.accepted.push_back(unit);
+        return {};
+    }
+    [[nodiscard]] aa::core::Result<void> end_of_stream() override {
+        ++state_.eofs;
+        return {};
+    }
+    [[nodiscard]] aa::core::Result<std::size_t> pump(Milliseconds) override {
+        ++state_.pumps;
+        if (state_.queue_full_rejections > 0) {
+            --state_.queue_full_rejections;
+        }
+        return std::size_t{0};
+    }
+    void close() noexcept override { ++state_.closes; }
+
+private:
+    BackpressureDecoderState& state_;
+};
+
+DecodeSessionFactory backpressure_factory(BackpressureDecoderState& state) {
+    return [&state](const aa::consumer::DecodeConfig&)
+               -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+        return std::unique_ptr<DecodeSession>(std::make_unique<BackpressureSession>(state));
+    };
+}
+
+class BackpressureFixture final {
+public:
+    BackpressureFixture() = default;
+    ~BackpressureFixture() {
+        if (feeder.joinable()) {
+            feeder.join();
+        }
+        if (controller.has_value()) {
+            controller->shutdown();
+        }
+        if (server.has_value()) {
+            server->close();
+        }
+        if (!runtime.empty()) {
+            ::rmdir(runtime.c_str());
+        }
+    }
+
+    [[nodiscard]] bool attach(const std::string& suffix) {
+        service = ServiceHarness::start();
+        if (!service) {
+            return false;
+        }
+        auto connected = ControlBusClient::connect();
+        if (!connected.has_value()) {
+            return false;
+        }
+        client.emplace(std::move(connected.value()));
+        auto attached = DisplayController::attach(
+            DisplayController::Deps{client.value(), backpressure_factory(decoder), frames},
+            test_config(suffix));
+        if (!attached.has_value()) {
+            return false;
+        }
+        controller.emplace(std::move(attached.value()));
+        runtime = private_runtime_dir();
+        if (runtime.empty()) {
+            return false;
+        }
+        socket = aa::ipc::video_socket_path_in(runtime);
+        auto listening = aa::ipc::VideoServer::listen(
+            socket, aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
+        if (!listening.has_value()) {
+            return false;
+        }
+        server.emplace(std::move(listening.value()));
+        return true;
+    }
+
+    [[nodiscard]] bool start(const std::vector<aa::ipc::VideoAccessUnit>& units) {
+        feeder = std::thread([this, units] {
+            auto producer = server->accept_consumer(Milliseconds{10000});
+            if (!producer.has_value()) {
+                feeder_ok.store(false);
+                return;
+            }
+            for (const auto& unit : units) {
+                auto sent = producer.value().send_access_unit(aa::ipc::VideoSendRequest{
+                    unit.frame, unit.timestamp_ns, unit.idr, unit.payload});
+                if (!sent.has_value()) {
+                    feeder_ok.store(false);
+                    return;
+                }
+            }
+            producer.value().close();
+        });
+        return controller->start_projection(socket).has_value();
+    }
+
+    [[nodiscard]] bool finish_feeding() {
+        if (feeder.joinable()) {
+            feeder.join();
+        }
+        return feeder_ok.load();
+    }
+
+    BackpressureDecoderState decoder{};
+    RecordingFrameTarget frames{};
+    std::unique_ptr<ServiceHarness> service{};
+    std::optional<ControlBusClient> client{};
+    std::optional<DisplayController> controller{};
+    std::string runtime{};
+    aa::ipc::VideoSocketPath socket{};
+    std::optional<aa::ipc::VideoServer> server{};
+    std::thread feeder{};
+    std::atomic<bool> feeder_ok{true};
+
+    BackpressureFixture(const BackpressureFixture&) = delete;
+    BackpressureFixture& operator=(const BackpressureFixture&) = delete;
 };
 
 // Real video socket endpoint: start_projection() must connect the production
@@ -1140,6 +1868,120 @@ private:
 };
 
 } // namespace
+
+TEST(DummyDisplayBackpressure, RetryableRejectionIsResubmittedExactlyOnce) {
+    BackpressureFixture fixture;
+    fixture.decoder.queue_full_rejections = 1;
+    ASSERT_TRUE(fixture.attach("BackpressureRetry"));
+    const std::vector<aa::ipc::VideoAccessUnit> units{
+        {7, 70, kTimestampBaseNs, true, {0x00, 0x00, 0x01, 0x65, 0x11}}};
+    ASSERT_TRUE(fixture.start(units));
+    ASSERT_TRUE(fixture.finish_feeding());
+
+    // The first submission is byte-rejected, but the controller still pumps
+    // the decoder so its deterministic backlog drain can make space.
+    auto pumped = fixture.controller->pump(Milliseconds{0});
+    ASSERT_TRUE(pumped.has_value());
+    EXPECT_EQ(pumped.value(), 0U);
+    EXPECT_EQ(fixture.decoder.pumps, 1U);
+    ASSERT_EQ(fixture.decoder.submissions.size(), 1U);
+    EXPECT_TRUE(fixture.decoder.accepted.empty());
+    const auto rejected = fixture.decoder.submissions.front();
+
+    // The next pump retries the complete AU before observing the closed input.
+    pumped = fixture.controller->pump(Milliseconds{0});
+    ASSERT_TRUE(pumped.has_value());
+    ASSERT_EQ(fixture.decoder.submissions.size(), 2U);
+    EXPECT_EQ(fixture.decoder.submissions[1], rejected);
+    ASSERT_EQ(fixture.decoder.accepted.size(), 1U);
+    EXPECT_EQ(fixture.decoder.accepted.front(), rejected);
+    EXPECT_EQ(fixture.decoder.eofs, 1U);
+
+    // EOS and further pumping never duplicate the accepted unit.
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+    EXPECT_EQ(fixture.decoder.submissions.size(), 2U);
+    EXPECT_EQ(fixture.decoder.accepted.size(), 1U);
+    EXPECT_EQ(fixture.decoder.eofs, 1U);
+    ASSERT_TRUE(fixture.controller->stop_projection().has_value());
+    EXPECT_EQ(fixture.decoder.closes, 1U);
+    EXPECT_TRUE(fixture.feeder_ok.load());
+}
+
+TEST(DummyDisplayBackpressure, PendingUnitAppliesSourceBackpressureAndPreservesOrder) {
+    BackpressureFixture fixture;
+    fixture.decoder.queue_full_rejections = 2;
+    ASSERT_TRUE(fixture.attach("BackpressureOrder"));
+    const std::vector<aa::ipc::VideoAccessUnit> units{
+        {11, 110, kTimestampBaseNs, true, {0x00, 0x00, 0x01, 0x65, 0x21}},
+        {12, 111, kTimestampBaseNs + kFramePeriodNs, false,
+         {0x00, 0x00, 0x01, 0x41, 0x22}},
+        {13, 112, kTimestampBaseNs + 2 * kFramePeriodNs, false,
+         {0x00, 0x00, 0x01, 0x41, 0x23}}};
+    ASSERT_TRUE(fixture.start(units));
+    ASSERT_TRUE(fixture.finish_feeding());
+
+    // Capacity is exactly one pending AU. While it remains rejected, later
+    // units stay in the video socket: no receive-past, overwrite or queue
+    // growth is possible, and source backpressure is the saturation policy.
+    for (std::size_t attempt = 0; attempt < 2; ++attempt) {
+        auto pumped = fixture.controller->pump(Milliseconds{0});
+        ASSERT_TRUE(pumped.has_value());
+        ASSERT_EQ(fixture.decoder.submissions.size(), attempt + 1);
+        EXPECT_TRUE(fixture.decoder.accepted.empty());
+        for (const auto& submission : fixture.decoder.submissions) {
+            EXPECT_EQ(submission, fixture.decoder.submissions.front());
+        }
+    }
+    ASSERT_EQ(fixture.decoder.submissions.size(), 2U);
+    const auto rejected = fixture.decoder.submissions.front();
+
+    auto pumped = fixture.controller->pump(Milliseconds{0});
+    ASSERT_TRUE(pumped.has_value());
+    ASSERT_EQ(fixture.decoder.submissions.size(), 5U);
+    ASSERT_EQ(fixture.decoder.accepted.size(), units.size());
+    EXPECT_EQ(fixture.decoder.accepted.front(), rejected);
+    for (std::size_t index = 0; index < units.size(); ++index) {
+        const auto& accepted = fixture.decoder.accepted[index];
+        EXPECT_EQ(accepted, fixture.decoder.submissions[index + 2]);
+        EXPECT_EQ(accepted.frame, units[index].frame);
+        EXPECT_EQ(accepted.timestamp_ns, units[index].timestamp_ns);
+        EXPECT_EQ(accepted.payload, units[index].payload);
+    }
+    EXPECT_EQ(fixture.decoder.eofs, 1U);
+    ASSERT_TRUE(fixture.controller->stop_projection().has_value());
+    EXPECT_EQ(fixture.decoder.closes, 1U);
+    EXPECT_TRUE(fixture.feeder_ok.load());
+}
+
+TEST(DummyDisplayBackpressure, NonRetryableRejectionsAreNotRetried) {
+    for (const auto code : {ErrorCode::ipc_consumer_rejected, ErrorCode::channel_decode_failed}) {
+        SCOPED_TRACE(static_cast<std::uint16_t>(code));
+        BackpressureFixture fixture;
+        fixture.decoder.next_rejection = code;
+        ASSERT_TRUE(fixture.attach("BackpressureTerminal" +
+                                   std::to_string(static_cast<std::uint16_t>(code))));
+        const std::vector<aa::ipc::VideoAccessUnit> units{
+            {21, 210, kTimestampBaseNs, true, {0x00, 0x00, 0x01, 0x65, 0x31}}};
+        ASSERT_TRUE(fixture.start(units));
+        ASSERT_TRUE(fixture.finish_feeding());
+
+        // Waiting-for-IDR discard and terminal decode failure both retain
+        // their existing error semantics; neither becomes a pending retry.
+        const auto rejected = fixture.controller->pump(Milliseconds{0});
+        ASSERT_FALSE(rejected.has_value());
+        EXPECT_EQ(rejected.error().code(), code);
+        EXPECT_EQ(fixture.decoder.submissions.size(), 1U);
+        EXPECT_EQ(fixture.decoder.pumps, 0U);
+        EXPECT_TRUE(fixture.decoder.accepted.empty());
+
+        ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+        EXPECT_EQ(fixture.decoder.submissions.size(), 1U);
+        EXPECT_EQ(fixture.decoder.eofs, 1U);
+        ASSERT_TRUE(fixture.controller->stop_projection().has_value());
+        EXPECT_EQ(fixture.decoder.closes, 1U);
+        EXPECT_TRUE(fixture.feeder_ok.load());
+    }
+}
 
 TEST(DummyDisplayStopRecovery, RejectedStopRetainsMediaThenRetryRecovers) {
     // (a) the receiver rejects StopProjection and still reports projecting:

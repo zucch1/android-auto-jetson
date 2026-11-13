@@ -78,7 +78,7 @@ protected:
     void SetUp() override {
         ASSERT_TRUE(std::filesystem::create_directory(directory));
         ASSERT_TRUE(store.load());
-        phones.note_candidate(trust::WirelessIdentity{"fixture", "adapter"});
+        phones.note_candidate(trust::WirelessIdentity{"02:00:00:00:00:01", "adapter"});
         credentials.add_connection(caller, 1000);
         credentials.add_connection(rogue, 1000);
         credentials.set_owner(name, caller);

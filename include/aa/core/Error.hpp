@@ -32,12 +32,16 @@ enum class ErrorCode : std::uint16_t {
     transport_oversize_frame = 104,
     transport_unauthorized_peer = 105,
     transport_queue_full = 106,
+    // A complete frame was discarded without desynchronizing the transport.
+    transport_message_dropped = 107,
+    transport_plaintext_after_tls = 108,
 
     // protocol
     protocol_version_mismatch = 200,
     protocol_unsupported_channel = 201,
     protocol_negotiation_failed = 202,
     protocol_malformed_message = 203,
+    protocol_payload_oversize = 204,
 
     // session
     session_illegal_transition = 300,
@@ -75,6 +79,7 @@ enum class ErrorCode : std::uint16_t {
     // and only crash durability of the new directory entry is unconfirmed.
     // Append-only band: never renumber or repurpose.
     trust_store_not_durable = 703,
+    trust_port_only_requires_opt_in = 704,
 
     // config
     config_invalid = 800,

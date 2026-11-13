@@ -162,6 +162,7 @@ TEST(InputSensorsWireSession, RequestAndToggleUseEncryptedNegotiatedServiceAndFa
 }
 class InBandSession : public ::testing::Test {
 protected:
+    aa::wired_receiver::StdoutLogScope logging{g_running};
     SensorTrust trust;
     aa::session::SteadyClock clock;
     wiredtest::CaptureSink capture;
@@ -344,8 +345,10 @@ TEST_F(InBandSession, UnknownDataRejectReachesGetterAndExistingPollErrorLog) {
     ASSERT_TRUE(reject);
     EXPECT_EQ(reject->channel, 250);
     EXPECT_EQ(reject->msg_id, 0x8001);
+    ASSERT_FALSE(logging.log.flush());
     testing::internal::CaptureStdout();
     log_line(poll_error_json(received.error().code(), reject));
+    EXPECT_FALSE(logging.log.flush());
     const auto line = testing::internal::GetCapturedStdout();
     EXPECT_EQ(line, "{\"event\":\"err\",\"detail\":\"poll\",\"code\":\"channel_not_registered\","
                     "\"reject_channel\":250,\"reject_msg_id\":32769}\n");

@@ -20,7 +20,7 @@ namespace {
 // opened file is 0600; both are enforced on the fd (fchmod/fstat) so the
 // ambient umask can never loosen the boundary. All runtime-file operations are
 // fd-anchored and symlink-safe: no operation ever follows a symlink at the
-// store name, the temp name or the store's immediate parent directory.
+// store name, the temp name or any ancestor directory.
 constexpr mode_t kFileMode = 0600;
 constexpr mode_t kDirMode = 0700;
 
@@ -60,31 +60,6 @@ constexpr mode_t kDirMode = 0700;
     return {};
 }
 
-// Opens the store's immediate parent WITHOUT following a symlink
-// (O_DIRECTORY|O_NOFOLLOW) and validates ownership on the fd (fstat): a real
-// directory owned by the effective user. With `tighten` the directory is
-// re-asserted to 0700 via a CHECKED fchmod on the descriptor (fail closed)
-// and verified exactly 0700. All store reads and writes traverse only this
-// verified descriptor, so a symlinked parent is a rejection that mutates
-// nothing (no path-based chmod anywhere).
-[[nodiscard]] int open_verified_parent(const std::filesystem::path& parent, bool tighten) {
-    const int dirfd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (dirfd < 0) {
-        return -1;
-    }
-    struct stat info {};
-    if (::fstat(dirfd, &info) != 0 || !S_ISDIR(info.st_mode) || info.st_uid != ::geteuid()) {
-        ::close(dirfd);
-        return -1;
-    }
-    if (tighten && (::fchmod(dirfd, kDirMode) != 0 || ::fstat(dirfd, &info) != 0 ||
-                    (info.st_mode & 07777) != kDirMode)) {
-        ::close(dirfd);
-        return -1;
-    }
-    return dirfd;
-}
-
 // fsync with EINTR retry: where a spurious interrupt must not be mistaken
 // for a durability failure (the post-rename directory sync reports the
 // committed-but-not-durable outcome, so a retryable errno must retry first).
@@ -95,55 +70,77 @@ constexpr mode_t kDirMode = 0700;
     return status;
 }
 
-// Creates every missing ancestor of `parent` at 0700. mkdir applies the
-// ambient umask, so the created mode is re-asserted with a checked fchmod on
-// the opened creation descriptor (never a path-based chmod; fail closed).
-// Each newly created directory entry is made durable before anything is
-// written inside it: the new directory and its containing directory (reached
-// through the new directory's own descriptor, so no path can be redirected)
-// are fsynced. This runs pre-replacement, so a sync failure rolls the
-// creation back and fails closed with nothing else mutated.
-[[nodiscard]] core::Result<void> create_missing_ancestors(const std::filesystem::path& parent) {
-    std::filesystem::path current;
+// Resolve every component relative to the preceding descriptor. Never normalize
+// away a symlink/.. pair: reject .. before any creation or permission change.
+// Existing ancestors may be shared (e.g. /tmp); only created directories and
+// the final store parent must belong to this user; writes make it private.
+// Creation rollback is local: if verification or fsync of a newly opened
+// component fails, attempt to remove that component with unlinkat. Ancestors
+// created successfully earlier in this walk remain; a later failure does not
+// roll back the whole walk (nor change the previous store file).
+[[nodiscard]] int open_verified_parent(const std::filesystem::path& parent, bool create) {
     for (const auto& component : parent) {
-        current /= component;
-        if (current.empty()) {
-            continue;
-        }
-        struct stat info {};
-        if (::lstat(current.c_str(), &info) == 0) {
-            continue;  // pre-existing component; the store's own dir is verified separately
-        }
-        if (errno != ENOENT) {
-            return Error{ErrorCode::trust_store_io};
-        }
-        if (::mkdir(current.c_str(), kDirMode) != 0) {
-            return Error{ErrorCode::trust_store_io};
-        }
-        const int fd = ::open(current.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        if (fd < 0) {
-            (void)::rmdir(current.c_str());
-            return Error{ErrorCode::trust_store_io};
-        }
-        bool durable = ::fchmod(fd, kDirMode) == 0;
-        if (durable) {
-            durable = fsync_interruptible(fd) == 0;
-            const int containing =
-                ::openat(fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-            if (containing < 0) {
-                durable = false;
-            } else {
-                durable = durable && fsync_interruptible(containing) == 0;
-                ::close(containing);
-            }
-        }
-        ::close(fd);
-        if (!durable) {
-            (void)::rmdir(current.c_str());
-            return Error{ErrorCode::trust_store_io};
+        if (component == "..") {
+            errno = EINVAL;
+            return -1;
         }
     }
-    return {};
+    if (create && parent.is_absolute() && parent.lexically_normal() == "/") {
+        errno = EINVAL;
+        return -1;
+    }
+    int current = ::open(parent.is_absolute() ? "/" : ".",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (current < 0) {
+        return -1;
+    }
+    for (const auto& component : parent.relative_path()) {
+        if (component.empty() || component == ".") {
+            continue;
+        }
+        int next = ::openat(current, component.c_str(),
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        bool created = false;
+        if (next < 0 && errno == ENOENT && create) {
+            created = ::mkdirat(current, component.c_str(), kDirMode) == 0;
+            if (created || errno == EEXIST) {
+                next = ::openat(current, component.c_str(),
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            }
+        }
+        if (next < 0) {
+            const int failure = errno;
+            ::close(current);
+            errno = failure;
+            return -1;
+        }
+        if (created) {
+            struct stat info {};
+            const bool durable = ::fstat(next, &info) == 0 && S_ISDIR(info.st_mode) &&
+                info.st_uid == ::geteuid() && ::fchmod(next, kDirMode) == 0 &&
+                ::fstat(next, &info) == 0 && (info.st_mode & 07777) == kDirMode &&
+                fsync_interruptible(next) == 0 && fsync_interruptible(current) == 0;
+            if (!durable) {
+                ::close(next);
+                (void)::unlinkat(current, component.c_str(), AT_REMOVEDIR);
+                ::close(current);
+                errno = EIO;
+                return -1;
+            }
+        }
+        ::close(current);
+        current = next;
+    }
+    struct stat info {};
+    if (::fstat(current, &info) != 0 || !S_ISDIR(info.st_mode) ||
+        info.st_uid != ::geteuid() ||
+        (create && (::fchmod(current, kDirMode) != 0 || ::fstat(current, &info) != 0 ||
+                    (info.st_mode & 07777) != kDirMode))) {
+        ::close(current);
+        errno = EIO;
+        return -1;
+    }
+    return current;
 }
 
 // Unpredictable temp name: a pre-placed file or symlink at any predictable
@@ -172,6 +169,10 @@ core::Result<std::filesystem::path> resolve_default_path() {
 }
 
 core::Result<void> ensure_private_file(const std::filesystem::path& path) {
+    const auto filename = path.filename();
+    if (filename.empty() || filename == "." || filename == "..") {
+        return Error{ErrorCode::trust_store_io};
+    }
     const int dirfd = open_verified_parent(path.parent_path(), false);
     if (dirfd < 0) {
         return Error{ErrorCode::trust_store_io};
@@ -188,24 +189,29 @@ core::Result<void> ensure_private_file(const std::filesystem::path& path) {
 }
 
 core::Result<std::string> read_file(const std::filesystem::path& path) {
-    struct stat probe {};
-    if (::lstat(path.c_str(), &probe) != 0) {
-        if (errno == ENOENT) {
-            return std::string{};  // absent store is the empty store
-        }
+    const auto filename = path.filename();
+    if (filename.empty() || filename == "." || filename == "..") {
         return Error{ErrorCode::trust_store_io};
     }
-    // The store exists: reach it ONLY through the verified parent descriptor.
-    // A symlinked parent is a rejection, never a traversal (fail closed).
     const int dirfd = open_verified_parent(path.parent_path(), false);
     if (dirfd < 0) {
+        if (errno == ENOENT) { return std::string{}; }
         return Error{ErrorCode::trust_store_io};
     }
     const int fd = ::openat(dirfd, path.filename().c_str(),
                             O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    const int failure = errno;
+    struct stat parent_info {};
+    const bool owned = ::fstat(dirfd, &parent_info) == 0 &&
+                       parent_info.st_uid == ::geteuid();
     ::close(dirfd);
     if (fd < 0) {
+        if (failure == ENOENT) { return std::string{}; }
         return Error{ErrorCode::trust_store_io};  // includes symlink rejection (ELOOP)
+    }
+    if (!owned) {
+        ::close(fd);
+        return Error{ErrorCode::trust_store_io};
     }
     auto checked = validate_private_fd(fd);
     if (!checked.has_value()) {
@@ -243,12 +249,8 @@ core::Result<void> write_file_private(const std::filesystem::path& path, std::st
     }
     const auto parent = path.parent_path();
     const auto filename = path.filename();
-    if (parent.empty() || filename.empty()) {
+    if (parent.empty() || filename.empty() || filename == "." || filename == "..") {
         return Error{ErrorCode::trust_store_io};
-    }
-    auto created = create_missing_ancestors(parent);
-    if (!created.has_value()) {
-        return created.error();
     }
     // Anchor every operation below on the verified directory fd (real 0700
     // directory owned by the effective user, tightened via checked fchmod on

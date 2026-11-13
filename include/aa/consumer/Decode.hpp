@@ -136,6 +136,9 @@ struct DecodeConfig final {
     FrameCallback on_frame{};
     // Observed submit-entry through matched I420 copy completion, before the
     // frame callback. Unmatched/expired outputs never acquire a duration.
+    // Diagnostic stages distinguish successful push return, sink-pad
+    // observed arrival (not decoder completion/CPU), pull return and map/copy
+    // start. Arrival is optional (bounded 512 entries / 5s, ambiguous PTS lost).
     DecodeCompletionObserver on_completion{};
 };
 

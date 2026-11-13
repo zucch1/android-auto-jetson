@@ -18,7 +18,11 @@
 //
 // TRUST MODEL (see Identity.hpp): wired identity is physical-access trust,
 // NOT cryptographic proof; USB identifier spoofing is a known, documented
-// limitation of the wired trust boundary.
+// limitation of the wired trust boundary. Serial-less wired phones need
+// separate port-only consent (audit M12): the same descriptor tuple on a port
+// cannot distinguish devices. Normal pairing rejects before prompting with
+// trust_port_only_requires_opt_in and nothing pending; the weaker grant needs
+// a separate explicit call to approve_port_only().
 //
 // SNAPSHOT-ONLY PAIRING CONTRACT: approval is bound to the canonical identity
 // captured when RequestAddPhone succeeds, not to the currently connected
@@ -77,11 +81,13 @@ public:
 // Error contract (typed, fail closed):
 //   - no candidate presented at pairing_requested -> trust_unknown_phone
 //   - duplicate request binding                    -> trust_rejected
+//   - serial-less (port-only) wired candidate      -> trust_port_only_requires_opt_in
 //   - pending table full                           -> ipc_queue_full
 //   - confirm of an unbound/already-consumed id    -> trust_unknown_phone
 //   - confirm past the 60 s window                 -> session_pairing_timeout
 //     (the request is dropped and NOT persisted)
 //   - store persistence failure                    -> trust_store_io
+//   - store refusal of the bound identity          -> trust_port_only_requires_opt_in
 class PairingPolicy final : public ipc::PhoneDirectory {
 public:
     static constexpr core::Milliseconds kConfirmWindow{60'000};
@@ -95,6 +101,8 @@ public:
     // in-flight confirm approves (SNAPSHOT-ONLY PAIRING CONTRACT above).
     void note_candidate(TransportIdentity identity);
     core::Result<void> note_wireless_candidate(const helper::PeerIdentity& peer) override;
+    bool same_wireless_identity(const helper::PeerIdentity& a,
+                                const helper::PeerIdentity& b) const override;
     std::optional<helper::PeerIdentity> wireless_identity(core::PhoneId phone) const override;
     std::optional<helper::PeerIdentity> pairing_wireless_identity(core::PairingRequestId request) const override;
 

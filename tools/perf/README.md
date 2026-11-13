@@ -69,6 +69,24 @@ value. CPU uses adjacent raw tick reads without bridging missing/decreasing
 reads. Sustained CPU is duration-weighted and null unless the baseline and every
 interval exist. Startup/shutdown resource readings never contribute.
 
+The sole opt-in exception is `--thermal-policy orin-nano-cv-unavailable/1`,
+bound before launch to the exact approved Orin Nano model. It retains all nine
+raw zones and allows null only for CV0/1/2; continuous unique CPU/GPU/SoC0/1/2/TJ,
+other zones, stable inventory and cadence remain required. Numeric CV readings
+still contribute to peaks. Capture `thermal_policy` and exported
+`measurement_coverage.thermal_scope` disclose the operational approval, model,
+scope and numeric/unavailable counts. Nano results also retain a result-level
+`thermal_policy` equal to the scoped policy, independently of `thermal_scope`;
+export validation rejects either binding missing or disagreeing, even when
+intermittent CV readings yield numeric peaks. Preserve both bindings after
+removing the private capture pointer. The distinct scoped coverage policy is
+not a generic full-all-zone claim. Omission/`strict-all-zones` retains the shipped
+strict v2 layout. Offline `--thermal-policy` checks capture selection; it never
+adds a waiver. See the runbook's **Explicit owner-approved Orin Nano thermal
+availability policy** for the actual approval, precise scope and probe
+limitations. No budget changes or causal
+power-gating/sensor-absence claims are made.
+
 Video evidence has one sealed summary per active sample interval for consumption,
 IPC matches and decode. Edge-inclusive coverage retains whole-window counts,
 bytes and gaps beyond 4096 observations. A ten-second event-time reorder horizon
@@ -134,9 +152,11 @@ newline-delimited JSON event stream:
 | frame drops | receiver `decode_stats.frame_drops`: run-cumulative observed outlet AU drops admitted through the measurement cutoff; shutdown-only final flush excluded |
 | decode timing | matched `video_decode_completed` local submit-entry / I420-copy completion events |
 | IPC | correlated `video_ipc_send` / `video_ipc_receive` endpoints; consumed payload bytes over measured consumer window |
-| A/V sync | peak absolute completion delta of concurrent `video_presented` / `audio_write_completed` events |
+| A/V sync | peak absolute schedule-to-completion latency difference of concurrent `video_presented` / `audio_write_completed` events; audio completes at `presented_ns` (#60, owner-approved 2026-11-08: when the chunk starts playing, max(handoff, its slot on the sink's clock from the element's position query)). Receivers on this contract log the key on every write, `null` when the sink gave no slot; a whole legacy log without the key keeps the `completed_ns` handoff. A `null`/malformed value, or a run mixing writes with and without the key, invalidates A/V rather than mixing endpoints |
 | audio scheduling skew (informational) | `media_timing.audio_scheduling_skew_ms` |
 | audio latency | an event field `audio_latency_ms` |
+| audio stall dropouts (informational) | `audio_stall_bypass` `phase:"end"` events with outcome `write_returned` or `sink_reopened`: sink stalls survived by dropping audio (#60), and the `dropped` + `discarded` + `partial` chunks every ended stall cost (`partial`: some frames reached the sink before the rest was cancelled); in-flight chunks the blocked write fully delivered are reported as `rendered`, not lost |
+| unrecovered audio stalls (informational) | `audio_stall_bypass` ends with any other outcome (`reopen_failed`, `stopped`), plus a bypass still open when the capture ends |
 | crashes | receiver exit status (non-zero, or death before the window ends) |
 
 A metric with no source in the current build stays `null`. The wired receiver
@@ -151,9 +171,13 @@ including orderly early exits; if first consumed after the cutoff it is raw-log
 diagnostic information only. `av_sync_ms` is computed only
 from the cross-stream consumer completion events: the video's retained common
 monotonic timestamp must lie in the audio write's half-open scheduled interval.
-The collector retains the maximum absolute paint-completion / stream-write-
-completion delta among pairs admitted through the cutoff, regardless of their
-log arrival order before that cutoff. No matched pair means `null`, never a proxy
+For each pair, skew is `(video completed - video scheduled) - (audio write
+completed - audio chunk scheduled start)`: the difference between the two
+streams' schedule-to-completion latencies. The frame's position inside the audio
+chunk is therefore not counted as skew (owner-approved 2026-10-20; previously
+the raw completion delta, which added up to one chunk duration). The collector
+retains the maximum absolute skew among pairs admitted through the cutoff,
+regardless of their log arrival order before that cutoff. No matched pair means `null`, never a proxy
 or fabricated zero. These endpoints are API completion events, not photon/speaker
 observations; they do not qualify microphone input or physical output.
 Until an audio chunk is routed the fields
@@ -228,3 +252,7 @@ is host endpoint evidence only, not the 30-minute run or two-hour soak.
 `wired_perf_v2_coverage` and `wired_perf_v2_capture` cover shared evidence,
 adversarial summaries, missing resources/streams, sealing, edge gaps and synthetic
 long windows. Run these independently of readiness or the full suite.
+
+`wired_perf_v2_thermal_policy` exercises strict-vs-Nano replay, all required
+families, inventory changes, real CV peaks, nonfinite rejection, wrong models,
+budget/terminal precedence, forged exports and both real offline CLI paths.

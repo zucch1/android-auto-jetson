@@ -157,6 +157,7 @@ void WiredSession::reset_link() noexcept {
     unhandled_controls_ = 0;
     channel_closes_ = 0;
     last_reject_.reset();
+    last_queue_rejection_.reset();
     version_responses_ = 0;
     pings_answered_ = 0;
     encapsulated_ssls_ = 0;
@@ -164,6 +165,7 @@ void WiredSession::reset_link() noexcept {
 }
 
 void WiredSession::attach_cipher(std::unique_ptr<transport::HandshakingCipher> cipher) noexcept {
+    reset_owned_av();
     cipher_ = std::move(cipher);
     // P1-C: the same negotiated cipher opens inbound E=1 records. Bind it into
     // the reassembler at every cipher attach (initial link and each reconnect);
@@ -233,6 +235,39 @@ core::Result<void> WiredSession::register_av_sink(protocol::ChannelRole role,
     return {};
 }
 
+core::Result<void> WiredSession::register_deferred_av_sink(protocol::ChannelRole role,
+                                                           channels::DeferredAvDelivery delivery) {
+    if (!negotiator_ || sinks_.contains(role) || !delivery.submit) { return bad_argument(); }
+    switch (role) {
+    case protocol::ChannelRole::video:
+    case protocol::ChannelRole::media_audio:
+    case protocol::ChannelRole::guidance_audio:
+    case protocol::ChannelRole::system_audio:
+    case protocol::ChannelRole::speech_audio: break;
+    default: return Error{ErrorCode::protocol_unsupported_channel};
+    }
+    const auto service = std::find_if(descriptors_.begin(), descriptors_.end(),
+        [role](const auto &descriptor) { return descriptor.role == role; });
+    if (service == descriptors_.end()) { return not_configured(); }
+    auto wrapper = std::make_unique<channels::AvSink>(*service, std::move(delivery),
+        [this, role](std::vector<std::byte> payload) {
+            return send_channel_payload(role, std::move(payload));
+        }, av_generation_);
+    if (auto registered = registry_.register_sink(role, *wrapper); !registered) {
+        return registered.error();
+    }
+    sinks_.emplace(role, wrapper.get());
+    av_sinks_.emplace(role, std::move(wrapper));
+    return {};
+}
+
+core::Result<void> WiredSession::complete_av_delivery(channels::AvDeliveryId id,
+                                                      core::Result<void> result) {
+    const auto sink = av_sinks_.find(id.role);
+    if (sink == av_sinks_.end()) { return {}; }
+    return sink->second->complete_av_delivery(id, result);
+}
+
 void WiredSession::reset_owned_av() noexcept {
     for (auto &[role, sink] : av_sinks_) { sink->reset(); }
 }
@@ -275,7 +310,17 @@ core::Result<std::size_t> WiredSession::send_version_request(std::uint16_t major
 // ---------------------------------------------------------------------------
 
 core::Result<bool> WiredSession::poll_transport() {
+    return poll_transport_impl(std::nullopt);
+}
+
+core::Result<bool> WiredSession::poll_transport(core::Deadline::Clock::time_point until) {
+    return poll_transport_impl(until);
+}
+
+core::Result<bool> WiredSession::poll_transport_impl(
+    std::optional<core::Deadline::Clock::time_point> until) {
     last_reject_.reset();
+    last_queue_rejection_.reset();
     if (transport_ == nullptr) {
         return Error{ErrorCode::transport_unavailable};
     }
@@ -288,14 +333,22 @@ core::Result<bool> WiredSession::poll_transport() {
     if (auto opened = transport_->open(bounded.token()); !opened) {
         return io_error(opened.error(), deadline);
     }
-    auto frame = transport_->receive();
+    for (const auto& [role, sink] : av_sinks_) { (void)role; sink->observe_receive(true); }
+    auto frame = [&]() -> core::Result<std::optional<std::vector<std::byte>>> {
+        if (until) { return transport_->poll_receive(std::min(*until, deadline.until)); }
+        auto received = transport_->receive();
+        if (!received) { return received.error(); }
+        return std::optional{std::move(received).value()};
+    }();
+    for (const auto& [role, sink] : av_sinks_) { (void)role; sink->observe_receive(false); }
     if (!frame) {
         return io_error(frame.error(), deadline);
     }
     if (auto checked = deadline.check(); !checked) {
         return io_error(checked.error(), deadline);
     }
-    auto chunks = parser_.feed(frame.value());
+    if (!frame.value()) { return false; }
+    auto chunks = parser_.feed(*frame.value());
     if (!chunks) {
         return chunks.error();
     }
@@ -303,6 +356,11 @@ core::Result<bool> WiredSession::poll_transport() {
     for (const auto &chunk : chunks.value()) {
         auto message = reassembler_.push(chunk);
         if (!message) {
+            if (message.error().code() == ErrorCode::transport_plaintext_after_tls) {
+                // Terminal protocol violation; fail() emits the distinct error
+                // code and its lifecycle cleanup closes the transport once.
+                (void)fail(message.error());
+            }
             return message.error();
         }
         if (message.value().has_value()) {
@@ -379,6 +437,16 @@ core::Result<void> WiredSession::route(const transport::Message &message) {
     if (!dispatched && dispatched.error().code() == ErrorCode::channel_not_registered) {
         last_reject_ = RejectedFrame{message.channel, id};
     }
+    if (!dispatched && dispatched.error().code() == ErrorCode::ipc_queue_full) {
+        for (const auto &descriptor : descriptors_) {
+            if (descriptor.id != service) { continue; }
+            const auto sink = av_sinks_.find(descriptor.role);
+            if (sink != av_sinks_.end()) {
+                last_queue_rejection_ = sink->second->last_queue_rejection();
+            }
+            break;
+        }
+    }
     return dispatched;
 }
 
@@ -410,8 +478,11 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         // P2 phase guard: handshake chunks belong to the ssl_handshake phase
         // only. Before version_response this path used to reach drive_ssl_handshake
         // and could authenticate, bypassing version negotiation entirely.
-        // After authentication re-driven chunks are accepted and ignored (they
-        // must never re-send auth_complete).
+        // After authentication a re-driven chunk must never re-send auth_complete
+        // and never touches the handshake. Only an ENCRYPTED chunk reaches here
+        // and is accepted and ignored; a plaintext one never gets this far: the
+        // reassembler's latched post-handshake guard ends the session with
+        // transport_plaintext_after_tls (108) first.
         if (auth_phase_ == AuthPhase::awaiting_version) {
             return Error{ErrorCode::transport_unauthorized_peer};
         }
@@ -568,6 +639,10 @@ core::Result<void> WiredSession::drive_ssl_handshake() {
     }
     if (cipher_->is_active()) {
         ssl_active_ = true;
+        // Latch now (not lazily on the next inbound frame): from here on the
+        // phone may only send encrypted frames, even if the cipher later
+        // deactivates (seal failure, mid-session revoke).
+        reassembler_.require_encryption();
         // AuthResponse.status is int32; pinned MessageStatus::STATUS_SUCCESS = 0.
         auto payload = protocol::encode(protocol::AuthComplete{0});
         if (!payload) {
@@ -741,6 +816,12 @@ void WiredSession::emit(std::string_view identity_key) {
     event.fields.push_back(diagnostics::EventField::text(
         "to_state", std::string{session::to_string(lifecycle_.state())}));
     event.fields.push_back(diagnostics::EventField::text("transport", "usb"));
+    if (lifecycle_.state() == session::State::failed) {
+        if (const auto failure = lifecycle_.failure()) {
+            event.fields.push_back(diagnostics::EventField::count(
+                "error_code", static_cast<std::int64_t>(failure->code())));
+        }
+    }
     if (!identity_key.empty()) {
         // Pseudonymized by the task-19 boundary: the raw key never leaves.
         event.fields.push_back(

@@ -130,6 +130,58 @@ core::Result<std::size_t> UsbAoaEndpoint::read(std::span<std::byte> buffer,
     }
 }
 
+core::Result<std::optional<std::size_t>>
+UsbAoaEndpoint::poll_read(std::span<std::byte> buffer, const core::CancellationToken &token,
+                          core::Deadline::Clock::time_point until) {
+    if (!opened_ || terminal_ || !pipe_) {
+        return Error{ErrorCode::transport_closed};
+    }
+    if (checkpoint_) {
+        checkpoint_();
+    }
+    const core::Deadline lifetime{io_deadline_, token};
+    if (auto checked = lifetime.check(); !checked) {
+        close();
+        return checked.error();
+    }
+    if (buffer.empty()) {
+        return std::optional<std::size_t>{0};
+    }
+    // libusb uses integer milliseconds; zero means INFINITE, so yield when
+    // less than one millisecond remains rather than exceeding the poll budget.
+    const auto now = core::Deadline::Clock::now();
+    const auto transfer_until = std::min(until, io_deadline_);
+    const auto left = now >= transfer_until ? 0 :
+        std::chrono::duration_cast<std::chrono::milliseconds>(transfer_until - now).count();
+    if (left < 1) {
+        if (auto checked = lifetime.check(); !checked) {
+            close();
+            return checked.error();
+        }
+        return std::optional<std::size_t>{};
+    }
+    const auto timeout = static_cast<unsigned>(
+        std::min<std::int64_t>(left, kBulkTransferTimeoutMs));
+    auto count = pipe_->read(buffer, timeout);
+    if (checkpoint_) {
+        checkpoint_();
+    }
+    if (auto checked = lifetime.check(); !checked) {
+        close();
+        return checked.error();
+    }
+    if (!count) {
+        close();
+        return count.error();
+    }
+    // UsbBulkPipe zero is a transfer timeout, not ByteEndpoint EOF. Partial
+    // timeout progress must still reach the parser even if this slice expired.
+    if (count.value() == 0) {
+        return std::optional<std::size_t>{};
+    }
+    return std::optional<std::size_t>{count.value()};
+}
+
 core::Result<std::size_t> UsbAoaEndpoint::write(std::span<const std::byte> data,
                                                 const core::CancellationToken &token) {
     if (!opened_ || terminal_ || !pipe_) {

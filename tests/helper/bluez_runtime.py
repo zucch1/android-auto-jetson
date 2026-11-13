@@ -202,6 +202,18 @@ def bond_retry_flow(surface: Surface) -> None:
     print("PASS bond_retry_progress_with_explicitly_unavailable_ap", flush=True)
 
 
+def unknown_bond_state_flow(surface: Surface) -> None:
+    request = surface.request()
+    surface.confirm(request)
+    command(surface.mock, "paired")
+    command(surface.mock, "fail-inventory")
+    surface.cancel(request)
+    command(surface.mock, "allow-inventory")
+    assert not surface.state()["properties"]["Pairable"]
+    assert surface.state()["cancel_unpaired"] == 0
+    print("PASS failed_inventory_after_bonding_never_cancels_pairing", flush=True)
+
+
 def loss_flow(surface: Surface) -> None:
     command(surface.mock, "restore")
     request = surface.request()
@@ -222,15 +234,15 @@ def rollback_flow(surface: Surface) -> None:
     request = surface.request()
     command(surface.mock, "fail-set")
     rejected(surface.consumer, "ConfirmPhonePairing", GLib.Variant("(t)", (request,)))
-    assert surface.phone() != 0
+    assert surface.phone() == 0
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     command(surface.mock, "allow-set")
     wait(lambda: not surface.state()["properties"]["Pairable"])
-    rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (surface.phone(),)))
+    rejected(surface.consumer, "ConfirmPhonePairing", GLib.Variant("(t)", (request,)))
     assert surface.phone() == 0
-    assert command(surface.receiver, "pending-revocations") == "1"
-    assert len(surface.state()["removed"]) == 1
-    print("PASS helper_failure_keeps_committed_approval_and_closes_window", flush=True)
+    assert command(surface.receiver, "pending-revocations") == "0"
+    assert len(surface.state()["removed"]) == 0
+    print("PASS helper_failure_never_approves_and_closes_window", flush=True)
 
 
 def main() -> None:
@@ -240,7 +252,7 @@ def main() -> None:
             surface = Surface(stack, build, Path(directory))
             authorization_flow(surface)
             revocation_flow(surface)
-        for scenario in (bond_retry_flow, loss_flow, negative_comparisons):
+        for scenario in (bond_retry_flow, unknown_bond_state_flow, loss_flow, negative_comparisons):
             with contextlib.ExitStack() as stack:
                 scenario_directory = Path(directory) / scenario.__name__
                 scenario_directory.mkdir(mode=0o700)

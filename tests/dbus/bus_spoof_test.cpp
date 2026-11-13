@@ -13,6 +13,7 @@
 
 #include <unistd.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -182,6 +183,50 @@ TEST(BusSpoof, ShallowVariantChainIsSkipped) {
 
     // Then: the bounded chain is skipped exactly and the buffer is fully
     // consumed.
+    ASSERT_TRUE(skipped.has_value());
+    EXPECT_TRUE(cursor.done());
+}
+
+TEST(BusSpoof, EmptyStructArrayIsRejectedInsteadOfSpinning) {
+    // Given: a non-empty array whose invalid empty-struct element consumes no
+    // bytes. Its outer payload starts on an 8-byte boundary to exercise the
+    // historical non-progress loop directly (the CTest timeout is the guard).
+    std::array<std::uint8_t, 12> bytes{};
+    bytes[0] = 1;  // one byte of declared array payload
+    bus::Cursor cursor(bytes);
+
+    // When/Then: signature validation rejects a() before attempting to skip
+    // any elements, returning a normal malformed-frame error.
+    const auto skipped = cursor.skip_value("a()");
+    ASSERT_FALSE(skipped.has_value());
+    EXPECT_EQ(skipped.error().code(), ErrorCode::transport_malformed_frame);
+}
+
+TEST(BusSpoof, DuplicateHeaderFieldsAreRejected) {
+    // Given: two PATH fields, which previously overwrote each other last-wins.
+    bus::MessageWriter writer;
+    writer.path("/org/custom/First")
+        .path("/org/custom/Second")
+        .interface_name("org.custom.AndroidAutoReceiver1")
+        .member("Ping");
+    const auto bytes = writer.build(bus::MessageType::method_call, 1);
+
+    // When/Then: strict parsing rejects ambiguous header identity.
+    const auto parsed = bus::parse_message(bytes);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().code(), ErrorCode::transport_malformed_frame);
+}
+
+TEST(BusSpoof, NestedArrayUsesImmediateElementAlignment) {
+    // Given: aax whose outer array contains one empty inner array. The outer
+    // payload begins at offset 4; the old innermost-x alignment wrongly moved
+    // it to offset 8. Both length words are little-endian.
+    const std::array<std::uint8_t, 8> bytes{4, 0, 0, 0, 0, 0, 0, 0};
+    bus::Cursor cursor(bytes);
+
+    // When/Then: the immediate array element is 4-aligned and both arrays are
+    // consumed exactly.
+    const auto skipped = cursor.skip_value("aax");
     ASSERT_TRUE(skipped.has_value());
     EXPECT_TRUE(cursor.done());
 }

@@ -11,7 +11,8 @@ std::optional<helper::RevocationProgress> ControlService::revocation_progress(co
 }
 bool ControlService::revocation_blocks(const helper::PeerIdentity& peer) const {
     for (const auto& record : revocations_) {
-        if (helper::revocation_peer(record.snapshot) == peer) return true;
+        const auto revoked = helper::revocation_peer(record.snapshot);
+        if (revoked && phones_.same_wireless_identity(*revoked, peer)) return true;
     }
     return false;
 }

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import asdict
 import glob
 import json
@@ -45,7 +46,9 @@ from pathlib import Path
 from typing import Literal
 
 from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
-from aa_measurement_coverage import Sample, ThermalZone, VideoEvidence
+from aa_measurement_coverage import (
+    CoverageError, NANO_PROFILE, Sample, ThermalZone, VideoEvidence, thermal_policy_for_model,
+)
 
 CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
 _TERMINATE_GRACE_SECONDS = 5.0
@@ -100,9 +103,14 @@ def _cpu_ticks(pid: int) -> int | None:
         return None
 
 
-def _thermal_zones(expected: tuple[ThermalZone, ...] = ()) -> tuple[ThermalZone, ...]:
-    inventory = {os.path.basename(path) + ":" + (_read_text(os.path.join(path, "type")) or "unknown"): path
-                 for path in sorted(glob.glob("/sys/class/thermal/thermal_zone*"))}
+def _thermal_inventory() -> Mapping[str, str]:
+    return {os.path.basename(path) + ":" + (_read_text(os.path.join(path, "type")) or "unknown"): path
+            for path in sorted(glob.glob("/sys/class/thermal/thermal_zone*"))}
+
+
+def _thermal_zones(expected: tuple[ThermalZone, ...] = (),
+                   observed: Mapping[str, str] | None = None) -> tuple[ThermalZone, ...]:
+    inventory = _thermal_inventory() if observed is None else observed
     zones: list[ThermalZone] = []
     for name in sorted(set(inventory) | {zone.zone for zone in expected}):
         path = inventory.get(name)
@@ -202,6 +210,9 @@ class ProjectionProgress:
         self.last_ns = stamp
 
 
+_STALL_SURVIVED = frozenset({"write_returned", "sink_reopened"})
+
+
 class EventParser:
     """Incrementally parse newline-delimited JSON events from log files."""
 
@@ -211,8 +222,11 @@ class EventParser:
             "frame_drops": None, "decode_p50_ms": None, "decode_p95_ms": None,
             "decode_fps": None, "decode_frames": None, "ipc_throughput_mbps": None,
             "ipc_p95_added_latency_ms": None, "av_sync_ms": None, "audio_latency_ms": None,
-            "audio_scheduling_skew_ms": None,
+            "audio_scheduling_skew_ms": None, "audio_stall_dropouts": 0,
+            "audio_stall_dropped_chunks": 0, "audio_stall_unrecovered": 0,
         }
+        self.stall_open = False
+        self.stall_failed = 0
         self.video_units: int | None = None
         self.audio_chunks: int | None = None
         self.startup_ms: int | None = None
@@ -222,6 +236,9 @@ class EventParser:
         self.video_completions: deque[tuple[int, int]] = deque()
         self.av_pairs = 0
         self.audio_writes = 0
+        # The audio A/V endpoint the run's first write used (#60):
+        # "playback" (presented_ns) or "handoff" (legacy completed_ns).
+        self.audio_endpoint: str | None = None
         self.video_presentations = 0
         self.receiver_ready = False
         self.projection_active = False
@@ -242,6 +259,27 @@ class EventParser:
         scheduled, completed = event["scheduled_ns"], event["completed_ns"]
         if audio:
             end = event["scheduled_end_ns"]
+            # Owner-approved 2026-11-08 (#60): audio is "done" when it starts
+            # playing on the sink's clock (presented_ns), not at the element
+            # handoff; pulsesink commits ahead of playback. A receiver on this
+            # playback-time contract logs the key on EVERY write (null when
+            # the sink gave no slot); legacy logs never carry it and keep the
+            # handoff endpoint. One run never mixes the two: a key missing
+            # from some writes, or a null/malformed value, invalidates A/V.
+            contract = "playback" if "presented_ns" in event else "handoff"
+            if self.audio_endpoint is None:
+                self.audio_endpoint = contract
+            if contract != self.audio_endpoint:
+                self.invalid_telemetry.append("av_sync_ms")
+                self.metrics["av_sync_ms"] = None
+                return
+            if contract == "playback":
+                presented = event["presented_ns"]
+                if type(presented) is not int or presented < completed:
+                    self.invalid_telemetry.append("av_sync_ms")
+                    self.metrics["av_sync_ms"] = None
+                    return
+                completed = presented
             if end <= scheduled:
                 self.invalid_telemetry.append("av_sync_ms")
                 self.metrics["av_sync_ms"] = None
@@ -261,12 +299,17 @@ class EventParser:
         for stamp, video_done in self.video_completions:
             while self.audio_completions and self.audio_completions[0][1] <= stamp:
                 self.audio_completions.popleft()
-            match = next((done for begin, end, done in self.audio_completions
+            match = next(((begin, done) for begin, end, done in self.audio_completions
                           if begin <= stamp < end), None)
             if match is None:
                 pending.append((stamp, video_done))
             else:
-                self._number({"delta": abs(video_done - match) / 1e6}, "delta",
+                # Owner-approved 2026-10-20: A/V sync is the difference between the
+                # two streams' schedule-to-completion latencies, so the frame's
+                # position inside the audio chunk is not counted as skew.
+                audio_begin, audio_done = match
+                skew = (video_done - stamp) - (audio_done - audio_begin)
+                self._number({"delta": abs(skew) / 1e6}, "delta",
                              "av_sync_ms", peak=True)
                 self.av_pairs += 1
         self.video_completions = pending
@@ -354,6 +397,23 @@ class EventParser:
                     self._number({"invalid": None}, "invalid", target)
         if envelope == "err":
             self.terminal_errors.append({"event": "err", "code": str(event.get("code", "unknown"))})
+        # A sink stall (#60) is an audio output gap, never a silent one. Only a
+        # resumed sink counts as survived; a failed reopen, a stop during
+        # recovery or a bypass still open at the end is unrecovered.
+        if envelope == "audio_stall_bypass" and event.get("phase") == "begin":
+            self.stall_open = True
+        if envelope == "audio_stall_bypass" and event.get("phase") == "end":
+            self.stall_open = False
+            if event.get("outcome") in _STALL_SURVIVED:
+                self.metrics["audio_stall_dropouts"] = int(self.metrics["audio_stall_dropouts"] or 0) + 1
+            else:
+                self.stall_failed += 1
+            lost = sum(event[key] for key in ("dropped", "discarded", "partial")
+                       if isinstance(event.get(key), int) and not isinstance(event.get(key), bool))
+            self.metrics["audio_stall_dropped_chunks"] = (
+                int(self.metrics["audio_stall_dropped_chunks"] or 0) + lost)
+        if envelope == "audio_stall_bypass":
+            self.metrics["audio_stall_unrecovered"] = self.stall_failed + int(self.stall_open)
         if envelope == "video_sent" and isinstance(event.get("units"), int):
             self.video_units = event["units"]
         if envelope == "audio_chunks" and isinstance(event.get("count"), int):
@@ -398,6 +458,9 @@ def _terminate(proc: subprocess.Popen | None) -> Literal["clean", "forced_kill",
 
 
 def collect(args: argparse.Namespace) -> dict:
+    selected_policy = getattr(args, "thermal_policy", "strict-all-zones")
+    hardware = _target_hardware_state() if selected_policy != "strict-all-zones" else None
+    thermal_policy = thermal_policy_for_model(selected_policy, hardware.get("model") if hardware else None)
     state_dir = Path(args.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     receiver_log = state_dir / "receiver.log"
@@ -493,11 +556,16 @@ def collect(args: argparse.Namespace) -> dict:
             parser.poll(str(receiver_log))
             if display is not None:
                 parser.poll(str(display_log))
+            observed = _thermal_inventory() if thermal_policy is not None else None
+            if observed is not None and inventory and set(observed) != {zone.zone for zone in inventory}:
+                parser.invalid_telemetry.append("thermal_inventory_changed")
+            zones = (_thermal_zones(inventory, observed) if observed is not None
+                     else _thermal_zones(inventory))
             sample = Sample(
                 t_ns=time.monotonic_ns() - origin_ns,
                 receiver_rss_mb=_rss_mb(receiver.pid),
                 receiver_cpu_ticks=_cpu_ticks(receiver.pid),
-                thermal_zones=_thermal_zones(inventory),
+                thermal_zones=zones,
                 projection_active=parser.projection_active,
                 video_units=parser.video_units, audio_chunks=parser.audio_chunks,
                 video_presentations=parser.video_presentations,
@@ -565,7 +633,7 @@ def collect(args: argparse.Namespace) -> dict:
     if not stopped_by_us and not early_exit and receiver_exit is None:
         crashes = 1
 
-    return {
+    capture = {
         "schema": CAPTURE_SCHEMA,
         "mode": "wired",
         "duration_seconds": args.duration_seconds,
@@ -588,8 +656,11 @@ def collect(args: argparse.Namespace) -> dict:
         "video_evidence": asdict(video_evidence),
         "events": events,
         "video_telemetry": video_telemetry,
-        "target_hardware_state": _target_hardware_state(),
+        "target_hardware_state": hardware if hardware is not None else _target_hardware_state(),
     }
+    if thermal_policy is not None:
+        capture["thermal_policy"] = asdict(thermal_policy)
+    return capture
 
 
 def _cli(argv: list[str]) -> int:
@@ -604,6 +675,8 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--video-socket", default=None)
     parser.add_argument("--input-socket", default=None)
     parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--thermal-policy", choices=("strict-all-zones", NANO_PROFILE),
+                        default="strict-all-zones", help="explicit approved Nano CV availability exception")
     parser.add_argument("--startup-timeout-seconds", type=int,
                         default=_PROJECTION_STARTUP_TIMEOUT_SECONDS,
                         help="startup timeout, may only shorten the default 60-second grace")
@@ -623,6 +696,9 @@ def _cli(argv: list[str]) -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(3))
     try:
         capture = collect(args)
+    except CoverageError as exc:
+        print(f"contract violation: {exc}", file=sys.stderr)
+        return 4
     finally:
         signal.signal(signal.SIGTERM, old_handler)
 

@@ -77,24 +77,11 @@ no JetPack version is taken as proof of a plugin's presence. Qt consumer invento
 covers Core/Gui/Widgets/OpenGL and Qml/Quick; GStreamer covers core and app/video/
 audio/GL, runtime plugin families, software-H264 and Qt6 sink candidates.
 
-Full AASDK compilation is currently blocked by missing `libprotobuf-dev`,
-`libboost-dev`, `libboost-system-dev`, `libboost-log-dev`, `libssl-dev`, and
-`libusb-1.0-0-dev`. Consumer development additionally needs
-`libgstreamer1.0-dev` and `libgstreamer-plugins-base1.0-dev`. Nothing was installed
-to turn this inventory green. Linux AASDK later uses system protobuf with
-`SKIP_BUILD_PROTOBUF=ON` and `SKIP_BUILD_ABSL=ON`; protoc and linked protobuf must
-match. The upstream "v30.0" message is not evidence of an installed dependency.
-ABI qualification remains task 7.
+In `deps/manifest.json`, the recorded host packages describe the observation snapshot from the reference host. In CI (`.github/workflows/ci.yml`) and configured developer environments, native development packages (`libprotobuf-dev`, `libboost-system-dev`, `libboost-log-dev`, `libssl-dev`, `libusb-1.0-0-dev`, `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, `qt6-base-dev`, etc.) are installed. When present, the native host build compiles the full receiver suite including AASDK ABI (`aa_aasdk_abi`), protocol, transport, audio, display, and integration test targets. AASDK ABI qualification is implemented and verified per [aasdk-abi.md](aasdk-abi.md).
 
-The current target state is explicitly `pending-task5-extraction`, with no live
-versions and no sysroot digest. Task 5 must introduce a versioned bound-target
-schema/validator extension replacing this pending state with the actual immutable
-`toolchains/jetson-sysroot-manifest.json` SHA-256. That validator must check every
-target package name/version/architecture/source and every copied input hash before
-cross-configure. It must reject both version drift and same-version content drift.
-The current checker deliberately accepts only the current pending schema; task 5
-must extend it with tests for the bound state, rather than keeping pending forever
-or accepting a bare unverified target hash. Host versions are never target pins.
+The current target state is `bound-task5-observed` in `deps/manifest.json`. It binds the immutable sysroot manifest `toolchains/jetson-sysroot-manifest.json` (SHA-256 `aa57014c31017139b63b917878a77ee16968aa64b30a10a624f0ba5f68d8d3d9`) and 15 cross-toolchain runtime packages (`libasan8:arm64`, `libatomic1`, `libc6`, `libc6-dev`, `libgcc-13-dev`, `libgcc-s1`, `libgomp1`, `libhwasan0:arm64`, `libitm1:arm64`, `liblsan0:arm64`, `libstdc++-13-dev`, `libstdc++6`, `libtsan2:arm64`, `libubsan1:arm64`, `linux-libc-dev`).
+
+**Required development-component bindings remain unbound:** The required receiver components (`["protobuf", "Boost", "OpenSSL", "libusb", "GStreamer", "Qt6"]`) have `required_components_binding: "unbound-no-target-observations"`. The bound package set provides only the cross-toolchain compiler runtime; target packages for required receiver libraries have no target observations and remain explicitly unbound. This bound-toolchain state must not be misstated as an unqualified target-binding success. Host versions are never target pins.
 
 ## Updating dependencies
 

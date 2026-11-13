@@ -7,6 +7,7 @@
 #pragma once
 
 #include <aa/core/Cancellation.hpp>
+#include <aa/core/Deadline.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/transport/Frames.hpp>
 
@@ -14,6 +15,7 @@
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -30,9 +32,12 @@ public:
     // Write up to the span's size; returns bytes written (may be partial).
     using WriteFn = std::function<core::Result<std::size_t>(std::span<const std::byte>,
                                                             const core::CancellationToken&)>;
+    using PollReadFn = std::function<core::Result<std::optional<std::size_t>>(
+        std::span<std::byte>, const core::CancellationToken&, core::Deadline::Clock::time_point)>;
 
-    FrameStreamIO(ReadFn read_fn, WriteFn write_fn)
-        : read_fn_(std::move(read_fn)), write_fn_(std::move(write_fn)) {}
+    FrameStreamIO(ReadFn read_fn, WriteFn write_fn, PollReadFn poll_read_fn = {})
+        : read_fn_(std::move(read_fn)), write_fn_(std::move(write_fn)),
+          poll_read_fn_(std::move(poll_read_fn)) {}
 
     // Validate one complete frame then write all its bytes. A malformed or
     // oversize frame, or a write failure, is a typed error that closes the
@@ -100,15 +105,48 @@ public:
                 close();
                 return Error{ErrorCode::transport_closed};
             }
-            auto frames = parser_.feed(std::span<const std::byte>(buffer.data(), count.value()));
-            if (!frames) {
-                close();
-                return frames.error();
-            }
-            for (auto& frame : frames.value()) {
-                ready_.push_back(std::move(frame));
+            if (auto fed = feed(std::span<const std::byte>(buffer.data(), count.value())); !fed) {
+                return fed.error();
             }
         }
+    }
+
+    // At most one bounded transfer per call. The existing parser and ready queue
+    // are shared with blocking receive; an idle poll neither resets nor feeds
+    // them. One transfer also bounds work when a busy peer dribbles a frame.
+    [[nodiscard]] core::Result<std::optional<std::vector<std::byte>>>
+    poll_receive_frame(const core::CancellationToken& token,
+                       core::Deadline::Clock::time_point until) {
+        if (closed_) {
+            return Error{ErrorCode::transport_closed};
+        }
+        if (token.stop_requested()) {
+            close();
+            return Error{ErrorCode::cancelled};
+        }
+        if (!poll_read_fn_) {
+            return Error{ErrorCode::transport_unavailable};
+        }
+        if (!ready_.empty()) {
+            return pop_ready();
+        }
+        std::array<std::byte, 4096> buffer{};
+        auto count = poll_read_fn_(buffer, token, until);
+        if (!count) {
+            close();
+            return count.error();
+        }
+        if (!count.value()) {
+            return std::optional<std::vector<std::byte>>{};
+        }
+        if (*count.value() == 0) {
+            close();
+            return Error{ErrorCode::transport_closed};
+        }
+        if (auto fed = feed(std::span<const std::byte>(buffer.data(), *count.value())); !fed) {
+            return fed.error();
+        }
+        return pop_ready();
     }
 
     void close() noexcept {
@@ -120,8 +158,30 @@ public:
     [[nodiscard]] bool closed() const noexcept { return closed_; }
 
 private:
+    [[nodiscard]] std::optional<std::vector<std::byte>> pop_ready() {
+        if (ready_.empty()) {
+            return std::nullopt;
+        }
+        auto frame = std::move(ready_.front());
+        ready_.pop_front();
+        return frame;
+    }
+
+    [[nodiscard]] core::Result<void> feed(std::span<const std::byte> bytes) {
+        auto frames = parser_.feed(bytes);
+        if (!frames) {
+            close();
+            return frames.error();
+        }
+        for (auto& frame : frames.value()) {
+            ready_.push_back(std::move(frame));
+        }
+        return {};
+    }
+
     ReadFn read_fn_;
     WriteFn write_fn_;
+    PollReadFn poll_read_fn_;
     FrameStreamParser parser_{};
     std::deque<std::vector<std::byte>> ready_{};
     bool closed_{false};

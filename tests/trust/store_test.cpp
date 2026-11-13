@@ -354,4 +354,287 @@ TEST(TrustStore, ApproveStructuredNonprintableFieldIsRejected) {
     EXPECT_FALSE(std::filesystem::exists(dir.file()));
 }
 
+// Independent validation (2026-11-06): Identity.hpp advertises "the STRONGEST
+// available transport identity per phone", but validated_key() accepts a
+// WiredIdentity that carries NO serial at all (wired_has_material() is happy
+// with VID/PID + port_context alone). A phone approved in that state therefore
+// authorises EVERY other serial-less device presenting the same VID/PID on the
+// same port -- approving attacker phone A silently approves phone B. The
+// documented wired trust boundary is physical-port access, but it does not say
+// "any device, forever"; a port-only approval should be visibly weaker (or
+// refused) rather than recorded as an ordinary identity.
+TEST(TrustStore, SerialLessApprovalDoesNotAliasADifferentDevice) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+
+    trust::WiredIdentity phone_a;
+    phone_a.usb_vendor_id = "18d1";
+    phone_a.usb_product_id = "4ee1";
+    phone_a.port_context = "1-2.3";
+
+    trust::WiredIdentity phone_b;
+    phone_b.usb_vendor_id = "18d1";
+    phone_b.usb_product_id = "4ee1";
+    phone_b.port_context = "1-2.3";
+
+    // Control: the two records are structurally identical serial-less devices.
+    ASSERT_EQ(trust::identity_key(trust::TransportIdentity{phone_a}),
+              trust::identity_key(trust::TransportIdentity{phone_b}));
+
+    const auto implicit = store.approve(trust::TransportIdentity{phone_a});
+    ASSERT_FALSE(implicit.has_value());
+    EXPECT_EQ(implicit.error().code(), aa::ErrorCode::trust_port_only_requires_opt_in);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file()));
+    EXPECT_EQ(store.lookup(test::identity_of(trust::TransportIdentity{phone_b})),
+              trust::Decision::unknown);
+    EXPECT_FALSE(store.approve_once(test::identity_of(trust::TransportIdentity{phone_a})).has_value());
+
+    const auto explicit_grant = store.approve_port_only(phone_a);
+    ASSERT_TRUE(explicit_grant.has_value());
+    const auto repeated = store.approve_port_only(phone_a);
+    ASSERT_TRUE(repeated.has_value());
+    EXPECT_EQ(repeated.value(), explicit_grant.value());
+    ASSERT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(store.phones()[0].strength, trust::IdentityStrength::port_only);
+    EXPECT_NE(store.redacted_summary().find("[port-only]"), std::string::npos);
+    EXPECT_EQ(store.redacted_summary().find(phone_a.port_context), std::string::npos);
+    // Consent is to the port/descriptor tuple; it cannot distinguish these devices.
+    EXPECT_EQ(store.lookup(test::identity_of(trust::TransportIdentity{phone_b})),
+              trust::Decision::approved);
+    EXPECT_FALSE(store.approve(trust::TransportIdentity{phone_a}).has_value());
+
+    trust::ApprovedPhoneStore fresh{dir.file()};
+    ASSERT_TRUE(fresh.load().has_value());
+    ASSERT_EQ(fresh.phones().size(), 1U);
+    EXPECT_EQ(fresh.phones()[0].strength, trust::IdentityStrength::port_only);
+    EXPECT_NE(fresh.redacted_summary().find("[port-only]"), std::string::npos);
+    ASSERT_TRUE(fresh.forget_phone(explicit_grant.value()).has_value());
+    EXPECT_EQ(fresh.lookup(test::identity_of(trust::TransportIdentity{phone_b})),
+              trust::Decision::unknown);
+}
+
+TEST(TrustStore, PortOnlyApiRejectsSerialBearingIdentity) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    for (bool usb_serial : {false, true}) {
+        auto identity = test::kWired;
+        if (usb_serial) { identity.aoa_serial.clear(); }
+        else { identity.usb_serial.clear(); }
+        const auto approved = store.approve_port_only(identity);
+        ASSERT_FALSE(approved.has_value());
+        EXPECT_EQ(approved.error().code(), ErrorCode::invalid_argument);
+    }
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file()));
+}
+
+TEST(TrustStore, WhitespaceSerialsRequireCompletePortBinding) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    for (const auto& wired : {
+             trust::WiredIdentity{"", "", " ", "", "", "", ""},
+             trust::WiredIdentity{"", "", "", "", "", "   ", ""},
+             trust::WiredIdentity{"", "4ee1", " ", "", "", "", "1-2.3"},
+             trust::WiredIdentity{"18d1", "", " ", "", "", "", "1-2.3"},
+             trust::WiredIdentity{"18d1", "4ee1", " ", "", "", "", ""}}) {
+        const auto approved = store.approve_port_only(wired);
+        ASSERT_FALSE(approved.has_value());
+        EXPECT_EQ(approved.error().code(), ErrorCode::trust_unknown_phone);
+        EXPECT_FALSE(trust::validated_key(trust::TransportIdentity{wired}).has_value());
+    }
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file()));
+
+    const trust::WiredIdentity bound{"18d1", "4ee1", " ", "", "", "", "1-2.3"};
+    ASSERT_TRUE(store.approve_port_only(bound).has_value());
+    ASSERT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(store.phones()[0].strength, trust::IdentityStrength::port_only);
+}
+
+TEST(TrustStore, WhitespaceUsbSerialWithRealAoaSerialIsSerialBacked) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    const trust::WiredIdentity wired{"", "", " ", "", "", "real-aoa-serial", ""};
+    EXPECT_EQ(trust::strength_of(trust::TransportIdentity{wired}),
+              trust::IdentityStrength::serial_backed);
+    ASSERT_TRUE(store.approve(trust::TransportIdentity{wired}).has_value());
+    ASSERT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(store.phones()[0].strength, trust::IdentityStrength::serial_backed);
+    const auto port_only = store.approve_port_only(wired);
+    ASSERT_FALSE(port_only.has_value());
+    EXPECT_EQ(port_only.error().code(), ErrorCode::invalid_argument);
+}
+
+TEST(TrustStore, WhitespaceOnlySerialsRequirePortOnlyConsentWithoutChangingKey) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    auto wired = test::kWired;
+    wired.usb_serial = " ";
+    wired.aoa_serial = "   ";
+    const trust::TransportIdentity identity{wired};
+    const auto key = trust::validated_key(identity);
+    ASSERT_TRUE(key.has_value());
+    EXPECT_NE(key.value().find("1: "), std::string::npos);
+    EXPECT_EQ(trust::strength_of(identity), trust::IdentityStrength::port_only);
+    const auto implicit = store.approve(identity);
+    ASSERT_FALSE(implicit.has_value());
+    EXPECT_EQ(implicit.error().code(), ErrorCode::trust_port_only_requires_opt_in);
+    ASSERT_TRUE(store.approve_port_only(wired).has_value());
+    trust::ApprovedPhoneStore fresh{dir.file()};
+    ASSERT_TRUE(fresh.load().has_value());
+    EXPECT_EQ(fresh.lookup(trust::PhoneIdentity{key.value()}), trust::Decision::approved);
+    EXPECT_EQ(fresh.phones()[0].strength, trust::IdentityStrength::port_only);
+    wired.usb_serial = " S ";
+    EXPECT_EQ(trust::strength_of(trust::TransportIdentity{wired}),
+              trust::IdentityStrength::serial_backed);
+    wired.usb_serial = "\t\n\r\f\v";
+    EXPECT_EQ(trust::strength_of(trust::TransportIdentity{wired}),
+              trust::IdentityStrength::port_only);
+    EXPECT_FALSE(trust::validated_key(trust::TransportIdentity{wired}).has_value());
+}
+
+[[nodiscard]] trust::WiredIdentity serial_less_wired() {
+    trust::WiredIdentity wired;
+    wired.usb_vendor_id = "18d1";
+    wired.usb_product_id = "4ee1";
+    wired.aoa_manufacturer = "Google";
+    wired.aoa_model = "Pixel";
+    wired.port_context = "1-2.3";
+    return wired;
+}
+
+// Review fix (PR #93, P1): the M12 decision is made on the canonical KEY, not
+// the stored variant. A legacy/opaque record carrying a serial-less "w1:" key
+// must not authorise another serial-less device presenting the same key.
+TEST(TrustStore, OpaqueSerialLessWiredKeyDoesNotAuthoriseAnotherDevice) {
+    test::TempStoreDir dir;
+    const std::string port_only_key =
+        trust::identity_key(trust::TransportIdentity{serial_less_wired()});
+    ASSERT_EQ(trust::classify_wired_key(port_only_key), trust::WiredKeyClass::port_only);
+    write_text(dir.file(),
+               "{\"schema_version\":2,\"next_phone_id\":3,\"phones\":["
+               "{\"phone_id\":1,\"identity\":{\"kind\":\"opaque\",\"key\":\"" +
+                   port_only_key +
+                   "\"}},"
+                   "{\"phone_id\":2,\"identity\":{\"kind\":\"opaque\",\"key\":\"w1:4:18d1:9\"}}]}");
+
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(store.dropped_port_only_count(), 2U);
+
+    // Another serial-less device of the same model on the same port presents
+    // exactly the stored key.
+    const auto other_device = test::identity_of(trust::TransportIdentity{serial_less_wired()});
+    ASSERT_EQ(other_device.key, port_only_key);
+    EXPECT_EQ(store.lookup(other_device), trust::Decision::unknown);
+    EXPECT_FALSE(trust::allows_session(store.lookup(other_device)));
+    EXPECT_EQ(store.lookup(trust::PhoneIdentity{"w1:4:18d1:9"}), trust::Decision::unknown)
+        << "a malformed w1 key must fail closed";
+
+    EXPECT_TRUE(store.redacted_summary().empty());
+
+    // Re-approving the same key is refused, not answered with the legacy id.
+    const auto reapproved = store.approve(trust::TransportIdentity{serial_less_wired()});
+    ASSERT_FALSE(reapproved.has_value());
+    EXPECT_EQ(reapproved.error().code(), ErrorCode::trust_port_only_requires_opt_in);
+}
+
+TEST(TrustStore, ApproveOnceSerialLessWiredKeyIsRejected) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+
+    const auto port_only = test::identity_of(trust::TransportIdentity{serial_less_wired()});
+    const auto rejected = store.approve_once(port_only);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error().code(), ErrorCode::trust_unknown_phone);
+
+    const auto malformed = store.approve_once(trust::PhoneIdentity{"w1:not-a-canonical-key"});
+    ASSERT_FALSE(malformed.has_value());
+    EXPECT_EQ(malformed.error().code(), ErrorCode::trust_unknown_phone);
+
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_FALSE(std::filesystem::exists(dir.file())) << "a refused approval persists nothing";
+    EXPECT_EQ(store.lookup(port_only), trust::Decision::unknown);
+
+    // All opaque wired approvals require the structured seam, including serial-backed.
+    const auto strong = test::identity_of(trust::TransportIdentity{test::kWired});
+    EXPECT_FALSE(store.approve_once(strong).has_value());
+    ASSERT_TRUE(store.approve(trust::TransportIdentity{test::kWired}).has_value());
+    EXPECT_EQ(store.lookup(strong), trust::Decision::approved);
+}
+
+TEST(TrustStore, WiredKeyClassificationFailsClosed) {
+    using trust::WiredKeyClass;
+    EXPECT_EQ(trust::classify_wired_key(trust::identity_key(trust::TransportIdentity{test::kWired})),
+              WiredKeyClass::serial_bound);
+    EXPECT_EQ(trust::classify_wired_key(
+                  trust::identity_key(trust::TransportIdentity{serial_less_wired()})),
+              WiredKeyClass::port_only);
+    trust::WiredIdentity usb_only = serial_less_wired();
+    usb_only.usb_serial = "S";
+    EXPECT_EQ(trust::classify_wired_key(trust::identity_key(trust::TransportIdentity{usb_only})),
+              WiredKeyClass::serial_bound);
+    trust::WiredIdentity aoa_only = serial_less_wired();
+    aoa_only.aoa_serial = "A";
+    EXPECT_EQ(trust::classify_wired_key(trust::identity_key(trust::TransportIdentity{aoa_only})),
+              WiredKeyClass::serial_bound);
+    // A field containing ':' and digits is still parsed by its length prefix.
+    trust::WiredIdentity tricky = serial_less_wired();
+    tricky.aoa_model = "0:0:0:";
+    EXPECT_EQ(trust::classify_wired_key(trust::identity_key(trust::TransportIdentity{tricky})),
+              WiredKeyClass::port_only);
+
+    EXPECT_EQ(trust::classify_wired_key(trust::identity_key(trust::TransportIdentity{test::kWireless})),
+              WiredKeyClass::not_wired);
+    EXPECT_EQ(trust::classify_wired_key("legacy-key"), WiredKeyClass::not_wired);
+
+    const std::string canonical = trust::identity_key(trust::TransportIdentity{serial_less_wired()});
+    for (const std::string& bad : {std::string{"w1:"}, canonical + "x", canonical + "0:",
+                                   canonical.substr(0, canonical.size() - 1),
+                                   std::string{"w1:04:18d14:4ee10:0:6:Google5:Pixel0:5:1-2.3"},
+                                   std::string{"w1:4:18d14:4ee10:6:Google5:Pixel5:1-2.3"},
+                                   std::string{"w1:99999999999999999999999:x"},
+                                   std::string{"w1:x:"}}) {
+        EXPECT_EQ(trust::classify_wired_key(bad), WiredKeyClass::malformed) << bad;
+    }
+}
+
 } // namespace
+
+TEST(TrustStore, WirelessMacCaseCannotCreateAnotherApprovalOrEscapeRevocation) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load());
+    const trust::TransportIdentity lower{trust::WirelessIdentity{"aa:bb:cc:dd:ee:ff", "00:aa:bb:cc:dd:ee"}};
+    const trust::TransportIdentity upper{trust::WirelessIdentity{"AA:BB:CC:DD:EE:FF", "00:AA:BB:CC:DD:EE"}};
+    const auto first = store.approve(lower);
+    ASSERT_TRUE(first);
+    const auto second = store.approve(upper);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(first.value(), second.value());
+    EXPECT_EQ(store.phones().size(), 1U);
+    trust::ApprovedPhoneStore reloaded{dir.file()};
+    ASSERT_TRUE(reloaded.load());
+    EXPECT_EQ(reloaded.lookup(test::identity_of(upper)), trust::Decision::approved);
+    ASSERT_TRUE(reloaded.forget_phone(first.value()));
+    EXPECT_EQ(reloaded.lookup(test::identity_of(lower)), trust::Decision::unknown);
+    EXPECT_EQ(reloaded.lookup(test::identity_of(upper)), trust::Decision::unknown);
+}
+
+TEST(TrustStore, WirelessBondRequiresAColonSeparatedMac) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load());
+    for (const auto* address : {"fixture", "AA:BB:CC:DD:EE", "AA:BB:CC:DD:EE:GG", "AA-BB-CC-DD-EE-FF"}) {
+        EXPECT_FALSE(store.approve(trust::WirelessIdentity{address, "hci0"}));
+    }
+    EXPECT_TRUE(store.phones().empty());
+}

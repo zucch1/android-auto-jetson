@@ -32,6 +32,7 @@ class MockBluez(ProfileSockets):
         self.fail_remove = False
         self.fail_set = False
         self.slow_inventory = False
+        self.fail_inventory = False
         self.owner_during_inventory = False
         self.removed: list[str] = []
         self.cancel_unpaired = 0
@@ -76,6 +77,9 @@ class MockBluez(ProfileSockets):
                method: str, args: GLib.Variant, invocation: Gio.DBusMethodInvocation) -> None:
         match method:
             case "GetManagedObjects":
+                if self.fail_inventory:
+                    invocation.return_dbus_error("org.bluez.Error.Failed", "fixture inventory failure")
+                    return
                 if self.owner_during_inventory:
                     self.owner_during_inventory = False
                     self.name("ReleaseName", GLib.Variant("(s)", ("org.bluez",)))
@@ -258,6 +262,8 @@ class MockBluez(ProfileSockets):
             case "late-register-hfp": self.late_register.add(HFP)
             case "slow-inventory": self.slow_inventory = True
             case "fast-inventory": self.slow_inventory = False
+            case "fail-inventory": self.fail_inventory = True
+            case "allow-inventory": self.fail_inventory = False
             case "release-name":
                 self.name("ReleaseName", GLib.Variant("(s)", ("org.bluez",)))
                 self.profile.clear()

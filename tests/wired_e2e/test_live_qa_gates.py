@@ -39,6 +39,12 @@ import unittest
 from pathlib import Path
 
 TIMEOUT_S = 60
+# Delivery window for cases that must reach PASS. The harness loop breaks once
+# every observable is true, so a generous budget costs nothing on a pass, while
+# launch plus each ~7-round-trip fake-ssh poll iteration can exceed the short
+# default on a loaded host. Negative cases keep the short default because they
+# run to the deadline and their verdicts do not depend on its length.
+PASS_BUDGET_MS = 3000
 
 FAKE_SSH = r"""#!/usr/bin/env bash
 set -euo pipefail
@@ -59,7 +65,9 @@ case "$all_args" in
 esac
 if [[ "$cmd" == *nohup* || "$cmd" == *kill* ]]; then
     if [[ "${FAKE_PROCESSES:-0}" == 1 ]]; then
-        cmd="${cmd//\/tmp\//$FAKE_TARGET/}"
+        cmd="${cmd//\/tmp\/aa-disp.in/$FAKE_TARGET/aa-disp.in}"
+        cmd="${cmd//\/tmp\/aa-wired-receiver.log/$FAKE_TARGET/aa-wired-receiver.log}"
+        cmd="${cmd//\/tmp\/aa-wired-display.log/$FAKE_TARGET/aa-wired-display.log}"
         cmd="${cmd//\/opt\/aa\/recv/$FAKE_TARGET/recv}"
         cmd="${cmd//\/opt\/aa\/disp/$FAKE_TARGET/disp}"
         if [[ "$cmd" == *nohup*disp* && "${FAKE_LAUNCH_FAILURE:-0}" == 1 ]]; then
@@ -69,13 +77,21 @@ if [[ "$cmd" == *nohup* || "$cmd" == *kill* ]]; then
         exit $?
     fi
 fi
+if [[ "$cmd" == *'mktemp -d -p'* ]]; then
+    # The fixture root is already private and unpredictable; stand in for the
+    # target's per-run XDG_RUNTIME_DIR workspace.
+    printf '%s\n' "$FAKE_TARGET"
+    exit 0
+fi
 if [ "$cmd" = "true" ]; then
     [ "${FAKE_SSH_FAIL:-0}" = "1" ] && exit 255
     exit 0
 fi
 if [[ "$cmd" == *nohup*--test-only-autostart* ]]; then
     [[ "${FAKE_DISPLAY_LAUNCH_FAIL:-0}" == 1 ]] && exit 41
-    cmd="${cmd//\/tmp\//$FAKE_TARGET/}"
+    cmd="${cmd//\/tmp\/aa-disp.in/$FAKE_TARGET/aa-disp.in}"
+    cmd="${cmd//\/tmp\/aa-wired-receiver.log/$FAKE_TARGET/aa-wired-receiver.log}"
+    cmd="${cmd//\/tmp\/aa-wired-display.log/$FAKE_TARGET/aa-wired-display.log}"
     # Execute the launch shell/redirections, validating the actual display CLI
     # and FIFO stdin rather than accepting any command containing 'nohup'.
     bash -euc 'nohup() {
@@ -88,7 +104,9 @@ if [[ "$cmd" == *nohup*--test-only-autostart* ]]; then
 fi
 if [[ "$cmd" == *aa-disp.in* ]]; then
     [[ -f "$FAKE_TARGET/control-ready" && -p "$FAKE_TARGET/aa-disp.in" ]] || exit 97
-    cmd="${cmd//\/tmp\//$FAKE_TARGET/}"
+    cmd="${cmd//\/tmp\/aa-disp.in/$FAKE_TARGET/aa-disp.in}"
+    cmd="${cmd//\/tmp\/aa-wired-receiver.log/$FAKE_TARGET/aa-wired-receiver.log}"
+    cmd="${cmd//\/tmp\/aa-wired-display.log/$FAKE_TARGET/aa-wired-display.log}"
     # Keep a real FIFO reader open, then execute the exact remote writes/grep.
     # The status grep consumes the request before producing the fixture reply.
     bash -euc 'exec 9<>"$FAKE_TARGET/aa-disp.in"
@@ -131,7 +149,9 @@ if [[ "$cmd" == *grep* ]]; then
             printf '%s\n' "{\"event\":\"input_forwarded\",\"ok\":\"${FAKE_INPUT_OK:-true}\"}" >> "$log"
         fi
     fi
-    bash -c "${cmd//\/tmp\/aa-wired-receiver.log/$log}"
+    cmd="${cmd//\/tmp\/aa-wired-receiver.log/$log}"
+    cmd="${cmd//"$FAKE_TARGET/aa-wired-receiver.log"/$log}"
+    bash -c "$cmd"
     exit $?
 fi
 case "$cmd" in
@@ -220,7 +240,8 @@ class LiveQaGates(unittest.TestCase):
 
     # ---- F3: session activation + observable gates ----
     def test_all_observables_pass(self):
-        code, doc = self.run_qa(False, FAKE_STATE='string "projecting"', FAKE_ACTIVE="1",
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                FAKE_STATE='string "projecting"', FAKE_ACTIVE="1",
                                 FAKE_OBS_VIDEO="1", FAKE_OBS_AUDIO="1", FAKE_OBS_INPUT="1")
         self.assertEqual(code, 0, doc)
         self.assertEqual(doc["status"], "PASS")
@@ -257,8 +278,9 @@ class LiveQaGates(unittest.TestCase):
     def test_final_timing_after_failed_pump_without_chunks_is_failed(self) -> None:
         # Given a failed pump whose final timing export has no delivered chunks.
         # When all other delivery paths succeed through the normal CLI.
-        code, doc = self.run_qa(False, FAKE_OBS_AUDIO="0", FAKE_OBS_PUMP="0",
-                               FAKE_FINAL_MEDIA_TIMING="1")
+        # One full poll iteration must fit for the other observables to be seen.
+        code, doc = self.run_qa(False, projection_timeout_ms=1500, FAKE_OBS_AUDIO="0",
+                               FAKE_OBS_PUMP="0", FAKE_FINAL_MEDIA_TIMING="1")
         # Then timing alone must not produce the old false PASS.
         self.assertEqual((code, doc["status"], doc["blocked_on"]),
                          (4, "FAILED", "observable_missing"), doc)
@@ -269,7 +291,8 @@ class LiveQaGates(unittest.TestCase):
     def test_audio_chunks_and_timing_qualify_delivery(self) -> None:
         # Given successful written frames and a periodic timing measurement.
         # When the normal CLI observes both records without a final export.
-        code, doc = self.run_qa(False, FAKE_OBS_AUDIO="1", FAKE_OBS_PUMP="1",
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                               FAKE_OBS_AUDIO="1", FAKE_OBS_PUMP="1",
                                FAKE_FINAL_MEDIA_TIMING="0")
         # Then real delivery still qualifies.
         self.assertEqual((code, doc["status"]), (0, "PASS"), doc)
@@ -287,14 +310,17 @@ class LiveQaGates(unittest.TestCase):
         # Given input that succeeds only after a second key pair.
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "ssh.log"
-            # When the normal harness launches and stimulates the display.
-            code, doc = self.run_qa(False, FAKE_INPUT_AFTER_KEYS="2", FAKE_SSH_LOG=str(log))
+            # When the normal harness launches and stimulates the display across
+            # the two poll iterations this needs.
+            code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                    FAKE_INPUT_AFTER_KEYS="2", FAKE_SSH_LOG=str(log))
             # Then the real FIFO/CLI contract was used, not an unconditional input marker.
-            self.assertEqual((code, doc["status"]), (0, "PASS"))
+            self.assertEqual((code, doc["status"]), (0, "PASS"), doc)
             commands = log.read_text(encoding="utf-8")
-            self.assertIn("--test-only-autostart --test-only-control-stdin <>/tmp/aa-disp.in", commands)
-            self.assertIn(r"printf 'status\n' > /tmp/aa-disp.in", commands)
+            self.assertRegex(commands, r"--test-only-autostart --test-only-control-stdin <>/\S+/aa-disp\.in")
+            self.assertRegex(commands, r"printf 'status\\n' > /\S+/aa-disp\.in")
             self.assertGreaterEqual(commands.count(r"printf 'key a press\nkey a release\n'"), 2)
+            self.assertNotIn("/tmp/aa-disp.in", commands)
 
     def test_input_is_not_stimulated_before_active(self) -> None:
         # Given a projecting control service without an ACTIVE phone session.
@@ -335,7 +361,7 @@ class LiveQaGates(unittest.TestCase):
         # This checks eventual evidence, not a 300 ms host scheduling budget.
         with tempfile.TemporaryDirectory() as directory:
             code, doc = self.run_qa(
-                False, projection_timeout_ms=1500, FAKE_LOG_ROOT=directory,
+                False, projection_timeout_ms=PASS_BUDGET_MS, FAKE_LOG_ROOT=directory,
                 FAKE_DELAY_POLLS="4", FAKE_PROBE_DELAY_S="0.04",
             )
             self.assertEqual(code, 0, doc)
@@ -345,7 +371,8 @@ class LiveQaGates(unittest.TestCase):
     def test_teardown_terminates_and_checks_both_target_pids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "ssh.log"
-            code, doc = self.run_qa(False, FAKE_SSH_LOG=str(log))
+            code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                    FAKE_SSH_LOG=str(log))
             self.assertEqual(code, 0, doc)
             logged = log.read_text(encoding="utf-8")
             for pid in (4242, 4343):
@@ -450,7 +477,8 @@ class LiveQaGates(unittest.TestCase):
                 log = target / "commands.log"
                 try:
                     code, doc = self.run_qa(
-                        False, FAKE_PROCESSES="1", FAKE_TARGET=directory,
+                        False, projection_timeout_ms=PASS_BUDGET_MS, FAKE_PROCESSES="1",
+                        FAKE_TARGET=directory,
                         FAKE_LAUNCH_FAILURE=failure, FAKE_SSH_LOG=str(log),
                     )
                     self.assertEqual(code, 0 if failure == "0" else 55, doc)
@@ -489,6 +517,88 @@ class LiveQaGates(unittest.TestCase):
         self.assertEqual(doc["blocked_on"], "ssh_unreachable")
 
     # ---- P3: remote args escaped, host/IP values never land raw ----
+    def test_default_report_uses_private_xdg_runtime_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            shim = root / "ssh"
+            shim.write_text(FAKE_SSH, encoding="utf-8")
+            shim.chmod(0o755)
+            env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                       XDG_RUNTIME_DIR=str(runtime), FAKE_TARGET=directory,
+                       FAKE_LOG_ROOT=directory, FAKE_SSH_LOG=str(root / "ssh.log"))
+            result = subprocess.run([str(self.script), "--readiness-only"],
+                                    capture_output=True, text=True, timeout=TIMEOUT_S, env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            prefix = "wrote "
+            line = next(line for line in result.stdout.splitlines() if line.startswith(prefix))
+            output = Path(line[len(prefix):].split(" (status=", 1)[0])
+            self.assertEqual(output.parent.parent, runtime)
+            self.assertTrue(output.parent.name.startswith("aa-wired-live-qa."))
+            self.assertEqual(output.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(output.read_text())["status"], "READY")
+
+    def exercise_explicit_output(self, kind):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shim = root / "ssh"
+            shim.write_text(FAKE_SSH, encoding="utf-8")
+            shim.chmod(0o755)
+            parent = root / "reports"
+            parent.mkdir(mode=0o700)
+            output = parent / "result.json"
+            target = root / "sentinel"
+            target.write_text("untouched", encoding="utf-8")
+            if kind == "symlink":
+                output.symlink_to(target)
+            elif kind == "dangling-symlink":
+                target.unlink()
+                output.symlink_to(target)
+            elif kind == "world-writable":
+                parent.chmod(0o777)
+            elif kind == "existing":
+                output.write_text("untouched", encoding="utf-8")
+            env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                       FAKE_TARGET=directory, FAKE_LOG_ROOT=directory,
+                       FAKE_SSH_LOG=str(root / "ssh.log"))
+            result = subprocess.run([str(self.script), "--readiness-only", "--out", str(output)],
+                                    capture_output=True, text=True, timeout=TIMEOUT_S, env=env)
+            if kind == "private":
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(output.read_text())["status"], "READY")
+                self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            else:
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(str(output), result.stderr)
+                self.assertIn("Refusing report output", result.stderr)
+                if kind in ("symlink", "dangling-symlink"):
+                    self.assertTrue(output.is_symlink())
+                elif kind == "existing":
+                    self.assertEqual(output.read_text(), "untouched")
+                else:
+                    self.assertFalse(output.exists())
+            if kind == "dangling-symlink":
+                self.assertFalse(target.exists())
+            else:
+                self.assertEqual(target.read_text(), "untouched")
+
+    def test_explicit_symlink_output_is_refused(self):
+        self.exercise_explicit_output("symlink")
+
+    def test_explicit_dangling_symlink_output_is_refused(self):
+        self.exercise_explicit_output("dangling-symlink")
+
+    def test_explicit_world_writable_parent_is_refused(self):
+        self.exercise_explicit_output("world-writable")
+
+    def test_explicit_private_output_works(self):
+        self.exercise_explicit_output("private")
+
+    def test_explicit_existing_output_is_not_overwritten(self):
+        self.exercise_explicit_output("existing")
+
     def test_remote_args_are_shell_escaped(self):
         # remote() runs its command string through the TARGET shell: a
         # metacharacter in --port must arrive escaped (literal), never execute.

@@ -5,6 +5,9 @@
 // STRONGEST available transport identity per phone:
 //   - wired    : USB descriptor ids + USB serial + AOA identity + physical-port
 //                context (the qualified USB3 port path as the kernel reports it)
+//     Serial-less wired identities have a port-only strength: the descriptor
+//     tuple on that port matches every indistinguishable device. The store
+//     requires a separate explicit approval API for this weaker grant.
 //   - wireless : the BlueZ bond identity (bond address + adapter) carried as
 //                plain DATA. This module never talks to BlueZ; the transport
 //                layer hands the bond identity over.
@@ -20,7 +23,8 @@
 // bond-not-human identity).
 //
 // Matching: identity_key() is a stable, injective encoding of the full
-// structured record, so ANY difference in ANY component is a different
+// structured record (Bluetooth MAC addresses are case-insensitive), so any
+// other difference in a component is a different
 // identity and fails closed (Decision::unknown). The full record is persisted
 // for audit and revocation.
 //
@@ -31,9 +35,13 @@
 #include <aa/core/Result.hpp>
 
 #include <string>
+#include <string_view>
 #include <variant>
 
 namespace aa::trust {
+
+// Port-only identifies a descriptor tuple on a port, never a particular phone.
+enum class IdentityStrength { serial_backed, port_only, bond_backed, opaque };
 
 enum class TransportKind { wired, wireless, opaque };
 
@@ -80,6 +88,9 @@ inline constexpr std::size_t kMaxIdentityFieldBytes = 512;
 
 [[nodiscard]] TransportKind kind_of(const TransportIdentity& identity) noexcept;
 
+[[nodiscard]] IdentityStrength strength_of(const TransportIdentity& identity) noexcept;
+[[nodiscard]] std::string_view strength_name(IdentityStrength strength) noexcept;
+
 // Stable, injective canonical key of the FULL structured identity:
 //   wired    -> "w1:" + length-prefixed descriptor, serial, AOA and port fields
 //   wireless -> "b1:" + length-prefixed bond address and adapter
@@ -89,6 +100,19 @@ inline constexpr std::size_t kMaxIdentityFieldBytes = 512;
 // structured forms distinct from each other. Use validated_key() upstream: it
 // rejects identities that carry no usable identity material.
 [[nodiscard]] std::string identity_key(const TransportIdentity& identity);
+
+// Classification of a canonical key against the serial-less wired policy
+// (audit M12). It inspects the KEY, never the stored variant, so a "w1:" key
+// held as an OpaqueIdentity (approve_once(PhoneIdentity), legacy migration) is
+// judged exactly like the structured WiredIdentity that produced it.
+//   not_wired    : not a "w1:" key (wireless, or an opaque legacy key)
+//   serial_bound : a canonical "w1:" key with a USB or AOA serial
+//   port_only    : a canonical "w1:" key with BOTH serials blank
+//   malformed    : starts with "w1:" but is not exactly the seven canonical
+//                  length-prefixed fields identity_key() emits
+enum class WiredKeyClass { not_wired, serial_bound, port_only, malformed };
+
+[[nodiscard]] WiredKeyClass classify_wired_key(std::string_view key) noexcept;
 
 // Field-level validation (printable ASCII, usable material). Fail closed.
 [[nodiscard]] core::Result<std::string> validated_key(const TransportIdentity& identity);
