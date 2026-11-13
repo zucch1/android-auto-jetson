@@ -84,13 +84,17 @@ public:
             s.waiting = !s.space(charge) && !s.error && !s.closed;
             s.changed.notify_all();
 #endif
+            const bool waited = !s.error && !s.closed && !s.space(charge);
             s.changed.wait(lock, [&] { return s.error || s.closed || s.space(charge); });
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
             s.waiting = false;
 #endif
             if (s.error || s.closed) {
                 s.chunked = false;
-                return s.error ? s.error : closed_error();
+                // Admission closure wakes existing waiters with ESHUTDOWN even
+                // if finish() has already latched its owner-facing timeout.
+                if (s.error && !(waited && s.abandoned)) { return s.error; }
+                return closed_error();
             }
             // Allocate only after capacity admission; the front stays charged during I/O.
             s.push(record.substr(offset, count), charge);
@@ -187,6 +191,10 @@ public:
         return error_snapshot();
     }
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+    bool wait_for_worker_exit() {
+        std::unique_lock lock(state_->mutex);
+        return state_->changed.wait_for(lock, std::chrono::seconds{5}, [&] { return state_->exited; });
+    }
     bool wait_for_capacity_wait() {
         State &s = *state_;
         std::unique_lock lock(s.mutex);

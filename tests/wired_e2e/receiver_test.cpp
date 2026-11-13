@@ -620,7 +620,8 @@ TEST(WiredReceiver, StdoutLogMediaTelemetryNeverBlocksOnAStalledSink) {
 
 TEST(WiredReceiver, StdoutLogFinishIsBoundedWhenTheSinkNeverReturns) {
     // Given: a stalled sink, a full queue and a lossless producer waiting for space.
-    auto *probe = new LogWriteProbe; // Intentionally leaked: the abandoned worker outlives the log.
+    LogWriteProbe owned_probe;
+    auto *probe = &owned_probe;
     LogWriteProbe::active = probe;
     std::atomic<bool> running{true};
     std::error_code waiting_producer;
@@ -643,10 +644,10 @@ TEST(WiredReceiver, StdoutLogFinishIsBoundedWhenTheSinkNeverReturns) {
         EXPECT_EQ(waiting_producer.value(), ESHUTDOWN);
         EXPECT_EQ(log.submit("late").value(), ETIMEDOUT);
         EXPECT_EQ(log.finish(std::chrono::milliseconds{300}).value(), ETIMEDOUT); // Repeat is a no-op.
+        // Release and observe detached-worker exit before resetting the write seam.
+        probe->release();
+        EXPECT_TRUE(log.wait_for_worker_exit());
     }
-    // The detached worker finishes safely after the owner is gone.
-    probe->release();
-    std::this_thread::sleep_for(std::chrono::milliseconds{50});
     EXPECT_TRUE(running.load()); // Never touched the owner's flag after abandonment.
     LogWriteProbe::active = nullptr;
 }
