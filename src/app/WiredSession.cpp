@@ -356,6 +356,11 @@ core::Result<bool> WiredSession::poll_transport_impl(
     for (const auto &chunk : chunks.value()) {
         auto message = reassembler_.push(chunk);
         if (!message) {
+            if (message.error().code() == ErrorCode::transport_plaintext_after_tls) {
+                // Terminal protocol violation; fail() emits the distinct error
+                // code and its lifecycle cleanup closes the transport once.
+                (void)fail(message.error());
+            }
             return message.error();
         }
         if (message.value().has_value()) {
@@ -473,8 +478,11 @@ core::Result<void> WiredSession::handle_control(std::span<const std::byte> paylo
         // P2 phase guard: handshake chunks belong to the ssl_handshake phase
         // only. Before version_response this path used to reach drive_ssl_handshake
         // and could authenticate, bypassing version negotiation entirely.
-        // After authentication re-driven chunks are accepted and ignored (they
-        // must never re-send auth_complete).
+        // After authentication a re-driven chunk must never re-send auth_complete
+        // and never touches the handshake. Only an ENCRYPTED chunk reaches here
+        // and is accepted and ignored; a plaintext one never gets this far: the
+        // reassembler's latched post-handshake guard ends the session with
+        // transport_plaintext_after_tls (108) first.
         if (auth_phase_ == AuthPhase::awaiting_version) {
             return Error{ErrorCode::transport_unauthorized_peer};
         }
@@ -631,6 +639,10 @@ core::Result<void> WiredSession::drive_ssl_handshake() {
     }
     if (cipher_->is_active()) {
         ssl_active_ = true;
+        // Latch now (not lazily on the next inbound frame): from here on the
+        // phone may only send encrypted frames, even if the cipher later
+        // deactivates (seal failure, mid-session revoke).
+        reassembler_.require_encryption();
         // AuthResponse.status is int32; pinned MessageStatus::STATUS_SUCCESS = 0.
         auto payload = protocol::encode(protocol::AuthComplete{0});
         if (!payload) {
