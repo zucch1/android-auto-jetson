@@ -185,6 +185,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     # read timeouts, recording decode session, real video socket).
     add_test(NAME dummy_display_stop_recovery COMMAND "${AA_DBUS_RUN_SESSION}" --
         "$<TARGET_FILE:aa_dummy_display_test>" --gtest_filter=DummyDisplayStopRecovery.*)
+    add_test(NAME dummy_display_backpressure COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "$<TARGET_FILE:aa_dummy_display_test>" --gtest_filter=DummyDisplayBackpressure.*)
     # Registration-lifecycle regressions (PR #36 fix round): failed
     # registrations unwind their real-bus name acquisition, duplicates keep
     # the existing name and unregister releases it (real daemon queueing).
@@ -194,8 +196,8 @@ if(NOT CMAKE_CROSSCOMPILING)
         "$<TARGET_FILE:aa_dummy_display_test>" --gtest_filter=DummyDisplayStartupReadiness.*)
     set_tests_properties(dummy_display_contract_control dummy_display_contract_render
         dummy_display_contract_input dummy_display_contract_absent dummy_display_contract_idle
-        dummy_display_contract_autostart dummy_display_stop_recovery dummy_display_registration
-        dummy_display_startup_readiness
+        dummy_display_contract_autostart dummy_display_stop_recovery dummy_display_backpressure
+        dummy_display_registration dummy_display_startup_readiness
         PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
             TIMEOUT 180)

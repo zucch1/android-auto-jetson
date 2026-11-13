@@ -117,12 +117,23 @@ using Object = JsonValue::Object;
     return reject();
 }
 
-[[nodiscard]] core::Result<ApprovedPhone> parse_record(const JsonValue& value) {
+// Legacy opaque keys may contain the old wired encoding. Keep serial-backed
+// compatibility keys, but do not let a port-only grant escape migration by
+// being represented as opaque. Malformed reserved w1: encodings also return
+// true to fail closed and count as dropped port-only grants in v1/v2 migration.
+[[nodiscard]] bool implicit_port_key(std::string_view key) {
+    const auto classification = classify_wired_key(key);
+    return classification == WiredKeyClass::port_only || classification == WiredKeyClass::malformed;
+}
+
+[[nodiscard]] core::Result<ApprovedPhone> parse_record_impl(const JsonValue& value, bool has_strength) {
     if (!value.is_object()) {
         return Error{ErrorCode::trust_store_io};
     }
     const auto& members = value.as_object();
-    auto checked = exact_keys(members, {"phone_id", "identity"});
+    auto checked = has_strength
+        ? exact_keys(members, {"phone_id", "identity", "strength"})
+        : exact_keys(members, {"phone_id", "identity"});
     if (!checked.has_value()) {
         return checked.error();
     }
@@ -146,7 +157,37 @@ using Object = JsonValue::Object;
     if (!key.has_value()) {
         return reject();
     }
-    return ApprovedPhone{core::PhoneId{id.value()}, std::move(parsed.value())};
+    const auto strength = strength_of(parsed.value());
+    if (has_strength) {
+        const auto* opaque = std::get_if<OpaqueIdentity>(&parsed.value());
+        if (opaque != nullptr && implicit_port_key(opaque->key)) {
+            return reject();
+        }
+        auto stored = string_member(members, "strength");
+        if (!stored.has_value() || stored.value() != strength_name(strength)) {
+            return reject();
+        }
+    }
+    return ApprovedPhone{core::PhoneId{id.value()}, std::move(parsed.value()), strength};
+}
+
+[[nodiscard]] core::Result<ApprovedPhone> parse_record(const JsonValue& value) {
+    return parse_record_impl(value, true);
+}
+
+[[nodiscard]] core::Result<ApprovedPhone> parse_v2_record(const JsonValue& value) {
+    return parse_record_impl(value, false);
+}
+
+// Old documents contain no proof of consent to a port-only grant. Drop them
+// rather than silently upgrading their authority; preserve allocation counters.
+// The dropped-port-only count also includes malformed reserved w1: keys.
+void drop_implicit_port_grants(ParsedStore& store) {
+    store.dropped_port_only_count = std::erase_if(store.phones, [](const ApprovedPhone& phone) {
+        const auto* opaque = std::get_if<OpaqueIdentity>(&phone.identity);
+        return phone.strength == IdentityStrength::port_only ||
+               (opaque != nullptr && implicit_port_key(opaque->key));
+    });
 }
 
 // Legacy version-1 record: {"phone_id": N, "key": "..."}.
@@ -244,14 +285,16 @@ core::Result<ParsedStore> parse_store(std::string_view text) {
         if (!checked.has_value()) {
             return checked.error();
         }
-        return parse_records(members, &parse_legacy_record);
+        auto store = parse_records(members, &parse_legacy_record);
+        if (store.has_value()) { drop_implicit_port_grants(store.value()); }
+        return store;
     }
-    if (version.value() == kSchemaVersionCurrent) {
+    if (version.value() == 2 || version.value() == kSchemaVersionCurrent) {
         auto checked = exact_keys(members, {"schema_version", "next_phone_id", "phones"});
         if (!checked.has_value()) {
             return checked.error();
         }
-        auto store = parse_records(members, &parse_record);
+        auto store = parse_records(members, version.value() == 2 ? &parse_v2_record : &parse_record);
         if (!store.has_value()) {
             return store.error();
         }
@@ -266,6 +309,7 @@ core::Result<ParsedStore> parse_store(std::string_view text) {
             return reject();
         }
         store.value().next_phone_id = next.value();
+        if (version.value() == 2) { drop_implicit_port_grants(store.value()); }
         return store;
     }
     return reject();  // unknown version: never silently trusted

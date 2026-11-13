@@ -56,8 +56,14 @@ public:
     // channel's native_handle()): readable when read_message() will not block.
     [[nodiscard]] int native_handle() const noexcept { return fd_; }
 
-    // Reads the next message off the bus (bounded strict framing).
+    // Reads the next message off the bus (bounded strict framing). A fully
+    // drained oversize/big-endian frame returns transport_message_dropped;
+    // callers must continue rather than treating that result as bus loss.
+    // Malformed or incomplete framing closes the connection before returning.
     [[nodiscard]] core::Result<ParsedMessage> read_message(bool sensitive = false);
+
+    // Per-connection diagnostic count of complete frames drained and dropped.
+    [[nodiscard]] std::uint64_t dropped_messages() const noexcept { return dropped_messages_; }
 
     // Fire-and-forget send of one already-assembled message (signal emission
     // and test reply injection). The serial is allocated from this
@@ -87,9 +93,11 @@ private:
                                                    MessageWriter body);
     [[nodiscard]] core::Result<void> authenticate();
     [[nodiscard]] core::Result<std::string> read_line();
+    void close_connection() noexcept;
 
     int fd_{-1};
     std::uint32_t next_serial_{1};
+    std::uint64_t dropped_messages_{0};
     BusName unique_name_{};
     std::optional<std::chrono::steady_clock::time_point> deadline_;
     // Opt-in survives timeout, skipped/malformed replies and serial reuse. Only

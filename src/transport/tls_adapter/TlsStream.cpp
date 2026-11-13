@@ -34,9 +34,17 @@ core::Result<std::size_t> TlsTransport::Impl::ssl_read(
         if (token.stop_requested()) {
             return Error{ErrorCode::cancelled};
         }
+        if (now() >= io_deadline) return Error{ErrorCode::timeout};
         ERR_clear_error();
         const int count = SSL_read(ssl, buffer.data(), static_cast<int>(buffer.size()));
         if (count > 0) {
+            if (!frame_started) {
+                // First byte of a frame: the peer is alive, so swap the idle
+                // budget for the whole-frame budget. Taking min() here would
+                // truncate a frame that begins just before idle expiry.
+                frame_started = true;
+                io_deadline = now() + kFrameDeadline;
+            }
             return static_cast<std::size_t>(count);
         }
         const int error = SSL_get_error(ssl, count);
@@ -50,12 +58,13 @@ core::Result<std::size_t> TlsTransport::Impl::ssl_read(
             return Error{ErrorCode::transport_io};
         }
         switch (wait_ready(fd, error == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN,
-                           token, Deadline::max())) {
+                           token, io_deadline, now)) {
         case WaitReady::ready:
             continue;
         case WaitReady::cancelled:
             return Error{ErrorCode::cancelled};
         case WaitReady::timeout:
+            return Error{ErrorCode::timeout};
         case WaitReady::failed:
             return Error{ErrorCode::transport_io};
         }
@@ -68,6 +77,7 @@ core::Result<std::size_t> TlsTransport::Impl::ssl_write(
         if (token.stop_requested()) {
             return Error{ErrorCode::cancelled};
         }
+        if (now() >= io_deadline) return Error{ErrorCode::timeout};
         ERR_clear_error();
         const int count = SSL_write(ssl, data.data(), static_cast<int>(data.size()));
         if (count > 0) {
@@ -78,12 +88,13 @@ core::Result<std::size_t> TlsTransport::Impl::ssl_write(
             return Error{ErrorCode::transport_io};
         }
         switch (wait_ready(fd, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT,
-                           token, Deadline::max())) {
+                           token, io_deadline, now)) {
         case WaitReady::ready:
             continue;
         case WaitReady::cancelled:
             return Error{ErrorCode::cancelled};
         case WaitReady::timeout:
+            return Error{ErrorCode::timeout};
         case WaitReady::failed:
             return Error{ErrorCode::transport_io};
         }
