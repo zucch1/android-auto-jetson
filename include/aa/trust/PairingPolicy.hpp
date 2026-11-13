@@ -101,6 +101,8 @@ public:
     // in-flight confirm approves (SNAPSHOT-ONLY PAIRING CONTRACT above).
     void note_candidate(TransportIdentity identity);
     core::Result<void> note_wireless_candidate(const helper::PeerIdentity& peer) override;
+    bool same_wireless_identity(const helper::PeerIdentity& a,
+                                const helper::PeerIdentity& b) const override;
     std::optional<helper::PeerIdentity> wireless_identity(core::PhoneId phone) const override;
     std::optional<helper::PeerIdentity> pairing_wireless_identity(core::PairingRequestId request) const override;
 

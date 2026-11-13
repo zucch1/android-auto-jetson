@@ -87,6 +87,7 @@ downstream hashes without a new sanctioned record.
 |---|---|---|---|
 | `third_party/aasdk/cert/headunit.crt` | `45ad6cc4fd9f…` / `85b5043a09b1…` | `delete-credential-copy-2026-10-10` | deleted |
 | `third_party/aasdk/cert/headunit.key` | `c2b2666a8021…` / `9e837a172a1e…` | `delete-credential-copy-2026-10-10` | deleted |
+| `third_party/aasdk/cert/README.md` | `429467a2d8b8…` / `73f7d67eadd4…` | `correct-credential-documentation-2026-11-11` | blob `0e19ca804e43…`, sha256 `33b985853b77…` |
 | `third_party/aasdk/src/Messenger/Cryptor.cpp` | `71c679ff32e1…` / `af6d9f58d135…` | `strip-embedded-credential-2026-10-10` | blob `cce822d47b7e…`, sha256 `6c895a8ea672…` |
 | `third_party/compat-credentials/headunit.crt` | `45ad6cc4fd9f…` / `85b5043a09b1…` | `delete-credential-copy-2026-10-10` | deleted |
 | `third_party/compat-credentials/headunit.key` | `c2b2666a8021…` / `9e837a172a1e…` | `delete-credential-copy-2026-10-10` | deleted |

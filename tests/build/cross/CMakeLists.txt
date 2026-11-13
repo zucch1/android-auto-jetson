@@ -10,6 +10,7 @@ project(aa_cross_smoke LANGUAGES NONE)
 # both work.
 include(${CMAKE_CURRENT_LIST_DIR}/../../../cmake/SysrootGate.cmake)
 enable_language(CXX)
+include(${CMAKE_CURRENT_LIST_DIR}/../../../cmake/Hardening.cmake)
 
 find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
 set(AA_BUILD_TOOLS "${CMAKE_CURRENT_LIST_DIR}/../../../tools/build")
@@ -21,6 +22,7 @@ set_target_properties(aa_cross_smoke PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 target_compile_options(aa_cross_smoke PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
+aa_harden_project_targets()
 if(TARGET aa_sysroot_hash_gate)
     # Build-time hash gate: post-configure payload tamper blocks this target before it compiles.
     add_dependencies(aa_cross_smoke aa_sysroot_hash_gate)
@@ -36,6 +38,10 @@ add_test(NAME cross_contamination
             --compiler "${CMAKE_CXX_COMPILER}" ${AA_SYSROOT_PROVENANCE_ARGS}
             --output "$<TARGET_FILE:aa_cross_smoke>.inputs.json")
 set_tests_properties(cross_contamination PROPERTIES TIMEOUT 60)
+add_test(NAME build_hardening
+    COMMAND "${Python3_EXECUTABLE}" -B "${AA_BUILD_TOOLS}/hardening.py"
+            "$<TARGET_FILE:aa_cross_smoke>")
+set_tests_properties(build_hardening PROPERTIES TIMEOUT 60)
 
 # Fixture acceptance checks (each asserts it is NOT target acceptance). These exercise hash
 # validation, package-version drift, same-version content drift, immutable cache binding, and the

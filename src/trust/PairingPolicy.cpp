@@ -20,6 +20,12 @@ core::Result<void> PairingPolicy::note_wireless_candidate(const helper::PeerIden
     note_candidate(std::move(identity));
     return {};
 }
+bool PairingPolicy::same_wireless_identity(const helper::PeerIdentity& a,
+                                         const helper::PeerIdentity& b) const {
+    const auto first = validated_key(WirelessIdentity{a.address, a.adapter});
+    const auto second = validated_key(WirelessIdentity{b.address, b.adapter});
+    return first && second && first.value() == second.value();
+}
 std::optional<helper::PeerIdentity> PairingPolicy::wireless_identity(core::PhoneId phone) const {
     for (const auto& entry : store_.phones()) {
         if (entry.phone_id != phone) continue;

@@ -26,6 +26,26 @@ namespace {
     return true;
 }
 
+// Bluetooth addresses have one spelling for matching and revocation. Adapter
+// identifiers may also be names (hci0), so only MAC-shaped adapters are folded.
+[[nodiscard]] bool mac_address(std::string_view value) {
+    if (value.size() != 17) return false;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const char c = value[i];
+        if (i % 3 == 2) { if (c != ':') return false; }
+        else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                   (c >= 'A' && c <= 'F'))) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] std::string canonical_address(std::string value) {
+    for (char& c : value) {
+        if (c >= 'a' && c <= 'f') c = static_cast<char>(c - 'a' + 'A');
+    }
+    return value;
+}
+
 // Length-prefixed concatenation is injective: distinct field tuples always
 // produce distinct keys, so matching can never alias two records together.
 void append_field(std::string& out, std::string_view field) {
@@ -99,8 +119,8 @@ std::string identity_key(const TransportIdentity& identity) {
     }
     if (const auto* wireless = std::get_if<WirelessIdentity>(&identity)) {
         out = "b1:";
-        append_field(out, wireless->bond_address);
-        append_field(out, wireless->adapter);
+        append_field(out, canonical_address(wireless->bond_address));
+        append_field(out, mac_address(wireless->adapter) ? canonical_address(wireless->adapter) : wireless->adapter);
         return out;
     }
     const auto& opaque = std::get<OpaqueIdentity>(identity);
@@ -158,7 +178,7 @@ core::Result<std::string> validated_key(const TransportIdentity& identity) {
         return identity_key(identity);
     }
     if (const auto* wireless = std::get_if<WirelessIdentity>(&identity)) {
-        if (wireless->bond_address.empty() || !printable_ascii(wireless->bond_address) ||
+        if (!mac_address(wireless->bond_address) ||
             !printable_ascii(wireless->adapter)) {
             return Error{ErrorCode::invalid_argument};
         }

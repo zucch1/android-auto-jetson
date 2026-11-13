@@ -229,15 +229,15 @@ def rollback_flow(surface: Surface) -> None:
     request = surface.request()
     command(surface.mock, "fail-set")
     rejected(surface.consumer, "ConfirmPhonePairing", GLib.Variant("(t)", (request,)))
-    assert surface.phone() != 0
+    assert surface.phone() == 0
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     command(surface.mock, "allow-set")
     wait(lambda: not surface.state()["properties"]["Pairable"])
-    rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (surface.phone(),)))
+    rejected(surface.consumer, "ConfirmPhonePairing", GLib.Variant("(t)", (request,)))
     assert surface.phone() == 0
-    assert command(surface.receiver, "pending-revocations") == "1"
-    assert len(surface.state()["removed"]) == 1
-    print("PASS helper_failure_keeps_committed_approval_and_closes_window", flush=True)
+    assert command(surface.receiver, "pending-revocations") == "0"
+    assert len(surface.state()["removed"]) == 0
+    print("PASS helper_failure_never_approves_and_closes_window", flush=True)
 
 
 def probe_flow(surface: Surface) -> None:

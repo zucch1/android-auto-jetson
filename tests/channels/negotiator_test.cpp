@@ -188,8 +188,10 @@ TEST(ChannelServices, EveryConfiguredRoleRoutesByDynamicIdIncludingOrdinalConfli
         ASSERT_TRUE(registry.register_sink(roles[index], handlers[index]));
         if (index > 0 && index < 5) { services.push_back(audio(roles[index], ids[index])); }
     }
-    services.push_back({proto::ServiceKey{3}, proto::ChannelRole::input,
-                        proto::ButtonConfiguration{{85}}});
+    auto& input = services.emplace_back();
+    input.id = proto::ServiceKey{3};
+    input.role = proto::ChannelRole::input;
+    input.configuration.emplace<proto::ButtonConfiguration>(proto::ButtonConfiguration{{85}});
     auto config = channels::SupportConfiguration::create(std::move(services));
     ASSERT_TRUE(config);
     channels::Negotiator negotiator{std::move(config.value()), registry};

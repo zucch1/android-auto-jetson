@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(aa_decode_probe LANGUAGES CXX)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/Hardening.cmake")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -96,3 +97,4 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fixtures/media/h264_720p30_baseline_90f.h264)
     set_tests_properties(decode-probe-corrections PROPERTIES TIMEOUT 45)
 endif()
+aa_harden_project_targets()

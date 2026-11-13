@@ -23,7 +23,8 @@
 // bond-not-human identity).
 //
 // Matching: identity_key() is a stable, injective encoding of the full
-// structured record, so ANY difference in ANY component is a different
+// structured record (Bluetooth MAC addresses are case-insensitive), so any
+// other difference in a component is a different
 // identity and fails closed (Decision::unknown). The full record is persisted
 // for audit and revocation.
 //

@@ -5,16 +5,42 @@
 namespace {
 using namespace aa;
 using helper::test::HelperConfirmation;
-TEST_F(HelperConfirmation, HelperFailureDoesNotClaimTrustRollbackOrPairingOpened) {
+TEST_F(HelperConfirmation, HelperFailureNeverPersistsApprovalOrOpensPairing) {
     const auto source = control.request_add_phone(caller); ASSERT_TRUE(source);
     bridge.result = Error{ErrorCode::helper_unavailable};
     EXPECT_FALSE(control.confirm_phone_pairing(caller, source.value()));
     EXPECT_EQ(bridge.confirmations, 1);
-    EXPECT_TRUE(bridge.approved_at_call);
-    EXPECT_EQ(store.phones().size(), 1U);
+    EXPECT_FALSE(bridge.approved_at_call);
+    EXPECT_TRUE(store.phones().empty());
+    trust::ApprovedPhoneStore reloaded{directory / "store"};
+    ASSERT_TRUE(reloaded.load());
+    EXPECT_TRUE(reloaded.phones().empty());
+    EXPECT_EQ(phones.pending_count(), 0U);
+    EXPECT_FALSE(control.confirm_phone_pairing(caller, source.value()));
     EXPECT_FALSE(control.pairing_window_open());
     EXPECT_EQ(events.count_opened(), 0U);
     EXPECT_EQ(bridge.cancellations, 1);
+}
+TEST_F(HelperConfirmation, HelperSuccessPrecedesDurableApproval) {
+    const auto source = control.request_add_phone(caller); ASSERT_TRUE(source);
+    ASSERT_TRUE(control.confirm_phone_pairing(caller, source.value()));
+    EXPECT_FALSE(bridge.approved_at_call);
+    EXPECT_EQ(store.phones().size(), 1U);
+    trust::ApprovedPhoneStore reloaded{directory / "store"};
+    ASSERT_TRUE(reloaded.load());
+    EXPECT_EQ(reloaded.phones().size(), 1U);
+    EXPECT_EQ(events.count_opened(), 1U);
+}
+TEST_F(HelperConfirmation, PersistenceFailureAfterHelperSuccessCancelsWindow) {
+    const auto source = control.request_add_phone(caller); ASSERT_TRUE(source);
+    {
+        const trust::test::faults::ScopedFault fault{trust::test::faults::Fault::renameat};
+        EXPECT_FALSE(control.confirm_phone_pairing(caller, source.value()));
+    }
+    EXPECT_EQ(bridge.confirmations, 1);
+    EXPECT_EQ(bridge.cancellations, 1);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(events.count_opened(), 0U);
 }
 TEST_F(HelperConfirmation, UnauthorizedAndFailedTrustNeverReachBridge) {
     const auto source = control.request_add_phone(caller); ASSERT_TRUE(source);
@@ -36,7 +62,7 @@ TEST_F(HelperConfirmation, ShutdownAndOwnerLossNotifyLifecycle) {
     EXPECT_EQ(bridge.teardowns, 2);
 }
 TEST_F(HelperConfirmation, RepeatedFailing703RetriesKeepOriginalDurabilityError) {
-    const auto phone = store.approve(trust::WirelessIdentity{"old-bond", "old-adapter"}); ASSERT_TRUE(phone);
+    const auto phone = store.approve(trust::WirelessIdentity{"02:00:00:00:00:02", "old-adapter"}); ASSERT_TRUE(phone);
     bridge.ap = Error{ErrorCode::helper_unavailable};
     bridge.bond = Error{ErrorCode::helper_rejected};
     {
@@ -56,7 +82,7 @@ TEST_F(HelperConfirmation, RepeatedFailing703RetriesKeepOriginalDurabilityError)
     EXPECT_EQ(control.pending_revocations(), 0U);
 }
 TEST_F(HelperConfirmation, FailedApStillAttemptsBondAndDoesNotResendAcknowledgedBond) {
-    const trust::TransportIdentity identity{trust::WirelessIdentity{"old-bond", "old-adapter"}};
+    const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:02", "old-adapter"}};
     const auto phone = store.approve(identity); ASSERT_TRUE(phone);
     bridge.ap = Error{ErrorCode::helper_unavailable};
     const auto result = control.forget_phone(caller, phone.value()); ASSERT_FALSE(result);
@@ -74,7 +100,7 @@ TEST_F(HelperConfirmation, FailedApStillAttemptsBondAndDoesNotResendAcknowledged
     EXPECT_EQ(bridge.ap_attempts, 5); EXPECT_EQ(bridge.bond_attempts, 1);
 }
 TEST_F(HelperConfirmation, AcknowledgedApIsNotRepeatedDuringFailedBondRetries) {
-    const auto phone = store.approve(trust::WirelessIdentity{"old-bond", "old-adapter"}); ASSERT_TRUE(phone);
+    const auto phone = store.approve(trust::WirelessIdentity{"02:00:00:00:00:02", "old-adapter"}); ASSERT_TRUE(phone);
     bridge.bond = Error{ErrorCode::helper_rejected};
     for (int retry = 0; retry < 4; ++retry) {
         const auto result = control.forget_phone(caller, phone.value()); ASSERT_FALSE(result);
@@ -89,7 +115,7 @@ TEST_F(HelperConfirmation, AcknowledgedApIsNotRepeatedDuringFailedBondRetries) {
     EXPECT_EQ(bridge.ap_attempts, 1); EXPECT_EQ(bridge.bond_attempts, 5);
 }
 TEST_F(HelperConfirmation, DurableIncompleteApErrorPrecedesBondError) {
-    const auto phone = store.approve(trust::WirelessIdentity{"old-bond", "old-adapter"}); ASSERT_TRUE(phone);
+    const auto phone = store.approve(trust::WirelessIdentity{"02:00:00:00:00:02", "old-adapter"}); ASSERT_TRUE(phone);
     bridge.ap = Error{ErrorCode::timeout}; bridge.bond = Error{ErrorCode::helper_rejected};
     const auto initial = control.forget_phone(caller, phone.value()); ASSERT_FALSE(initial);
     EXPECT_EQ(initial.error().code(), ErrorCode::timeout);
@@ -107,7 +133,7 @@ TEST_F(HelperConfirmation, WiredAndOpaqueDeletionRequireOnlyAp) {
     EXPECT_EQ(bridge.ap_attempts, 2); EXPECT_EQ(bridge.bond_attempts, 0);
 }
 TEST_F(HelperConfirmation, PrecommitFailurePreservesTrustAndNeverReachesExternalLegs) {
-    const auto phone = store.approve(trust::WirelessIdentity{"old-bond", "old-adapter"}); ASSERT_TRUE(phone);
+    const auto phone = store.approve(trust::WirelessIdentity{"02:00:00:00:00:02", "old-adapter"}); ASSERT_TRUE(phone);
     {
         const trust::test::faults::ScopedFault fault{trust::test::faults::Fault::renameat};
         EXPECT_FALSE(control.forget_phone(caller, phone.value()));
@@ -117,15 +143,15 @@ TEST_F(HelperConfirmation, PrecommitFailurePreservesTrustAndNeverReachesExternal
     EXPECT_TRUE(control.forget_phone(caller, phone.value()));
 }
 TEST_F(HelperConfirmation, PendingExactIdentityCannotBeReapprovedAndUnrelatedCandidateRemainsUsable) {
-    const auto phone = store.approve(trust::WirelessIdentity{"old-bond", "old-adapter"}); ASSERT_TRUE(phone);
+    const auto phone = store.approve(trust::WirelessIdentity{"02:00:00:00:AA:02", "old-adapter"}); ASSERT_TRUE(phone);
     bridge.bond = Error{ErrorCode::helper_unavailable};
     EXPECT_FALSE(control.forget_phone(caller, phone.value()));
-    phones.note_candidate(trust::WirelessIdentity{"old-bond", "old-adapter"});
+    phones.note_candidate(trust::WirelessIdentity{"02:00:00:00:aa:02", "old-adapter"});
     EXPECT_FALSE(control.request_add_phone(caller));
-    bridge.prepared = helper::PeerIdentity{"old-bond", "old-adapter"};
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:aa:02", "old-adapter"};
     EXPECT_FALSE(control.request_add_phone(caller)); EXPECT_TRUE(store.phones().empty());
     EXPECT_EQ(events.count_opened(), 0U);
-    bridge.prepared = helper::PeerIdentity{"other-bond", "other-adapter"};
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:05", "other-adapter"};
     const auto request = control.request_add_phone(caller); ASSERT_TRUE(request);
     EXPECT_TRUE(control.confirm_phone_pairing(caller, request.value()));
 }
@@ -133,7 +159,7 @@ TEST_F(HelperConfirmation, CommittedForgetClosesMatchingRequestsOnceAndPreserves
     const auto open = control.request_add_phone(caller); ASSERT_TRUE(open);
     ASSERT_TRUE(control.confirm_phone_pairing(caller, open.value()));
     const auto matching = control.request_add_phone(caller); ASSERT_TRUE(matching);
-    phones.note_candidate(trust::WirelessIdentity{"other", "adapter"});
+    phones.note_candidate(trust::WirelessIdentity{"02:00:00:00:00:03", "adapter"});
     const auto unrelated = control.request_add_phone(caller); ASSERT_TRUE(unrelated);
     bridge.ap = Error{ErrorCode::helper_unavailable};
     const auto phone = store.phones().front().phone_id;
@@ -145,7 +171,7 @@ TEST_F(HelperConfirmation, CommittedForgetClosesMatchingRequestsOnceAndPreserves
     EXPECT_TRUE(control.confirm_phone_pairing(caller, unrelated.value()));
 }
 TEST_F(HelperConfirmation, UnauthorizedRetryAndConsumerTeardownPreservePendingRecord) {
-    const auto phone = store.approve(trust::WirelessIdentity{"old-bond", "old-adapter"}); ASSERT_TRUE(phone);
+    const auto phone = store.approve(trust::WirelessIdentity{"02:00:00:00:00:02", "old-adapter"}); ASSERT_TRUE(phone);
     bridge.ap = Error{ErrorCode::helper_unavailable};
     EXPECT_FALSE(control.forget_phone(caller, phone.value()));
     EXPECT_FALSE(control.forget_phone(rogue, phone.value())); EXPECT_EQ(bridge.ap_attempts, 1);

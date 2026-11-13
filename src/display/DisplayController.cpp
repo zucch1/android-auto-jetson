@@ -27,6 +27,9 @@ public:
     [[nodiscard]] core::Result<std::size_t> pump(Milliseconds wait) override {
         return helper_.pump(wait);
     }
+    [[nodiscard]] const consumer::DecodeReport& report() const noexcept override {
+        return helper_.report();
+    }
     void close() noexcept override { helper_.close(); }
 
 private:
@@ -184,6 +187,11 @@ std::uint64_t DisplayController::frames_presented() const noexcept {
 
 bool DisplayController::helper_started() const noexcept {
     return impl_ && impl_->helper_started;
+}
+
+const consumer::DecodeReport& DisplayController::decode_report() const noexcept {
+    static const consumer::DecodeReport empty{};
+    return impl_ && impl_->session ? impl_->session->report() : empty;
 }
 
 core::Result<void> DisplayController::start_projection(const ipc::VideoSocketPath& video_socket) {

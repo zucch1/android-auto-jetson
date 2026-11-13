@@ -7,6 +7,9 @@
 #include <aa/ipc/VideoSocket.hpp>
 #include <aa/protocol/Protocol.hpp>
 
+#ifdef AA_DECODE_HELPER_TEST_CLOCK
+#include <chrono>
+#endif
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -92,6 +95,12 @@ struct DecodeReport final {
     std::string negotiated_caps{};   // observed output caps (set on first frame)
     std::uint64_t frames_delivered{};
     std::uint64_t frames_unmatched{}; // outputs whose PTS matched no submitted AU
+    // Accepted AUs lost on invalidation, counted once (late unmatched samples
+    // do not count again). Cumulative for this open session, including EOS.
+    std::uint64_t frames_lost_retention{};
+    std::uint64_t frames_lost_capacity{};
+    std::uint64_t frames_lost_eos{};
+    bool awaiting_idr{}; // current recovery state; an accepted IDR clears it
 };
 
 // Pure output-path policy (no GStreamer calls): a READY-viable NVMM-only
@@ -143,7 +152,7 @@ struct DecodeConfig final {
 };
 
 // Automatic backend selection and functional software substitution occur
-// only during open(). Failures observed AFTER open() returns are terminal for
+// only during open(). Pipeline failures observed AFTER open() are terminal for
 // that helper: runtime decoder errors return channel_decode_failed (observed
 // dimension mismatch returns channel_caps_unsupported), with no automatic
 // restart or backend switch. The caller must close and reopen externally,
@@ -200,13 +209,24 @@ public:
     //  - channel_decode_failed: the pipeline rejected the data.
     [[nodiscard]] core::Result<void> submit(const ipc::VideoAccessUnit& access_unit);
 
-    // Signal end of encoded input (drain is completed by pump()).
+    // Signal end of encoded input (drain is completed by pump()). If EOS
+    // strands accepted AUs that can never produce output, the observing pump
+    // returns ipc_consumer_rejected once and records frames_lost_eos. This is
+    // intentional loss reporting, not a terminal pipeline failure.
     [[nodiscard]] core::Result<void> end_of_stream();
 
     // Pull decoded frames and deliver them to the frame callback. `wait` bounds
     // the first pull; the rest drain non-blocking. Returns frames delivered.
     // channel_caps_unsupported: observed output dimensions differ from the
     // negotiated caps. channel_decode_failed: pipeline error on the bus.
+    // ipc_consumer_rejected: accepted AUs were lost to retention/capacity or
+    // EOS. Nonterminal, reported once per loss episode observed by pump();
+    // inspect report() for cumulative counts and current awaiting_idr state.
+    // Resume at a newer IDR when awaiting_idr is true; an IDR accepted before
+    // this notice does not erase the notice. Late outputs keep their PTS and
+    // cannot acquire recovery metadata. Callbacks already delivered during
+    // this pump remain delivered even when a later iteration reports loss;
+    // frames_delivered in report() is authoritative across error returns.
     [[nodiscard]] core::Result<std::size_t> pump(core::Milliseconds wait);
 
     // Idempotent teardown; the destructor runs the same release.
@@ -218,6 +238,16 @@ public:
 private:
     struct Impl;
     explicit DecodeHelper(std::unique_ptr<Impl> impl) noexcept;
+#ifdef AA_DECODE_HELPER_TEST_CLOCK
+    // Test-only clock injection. Defined solely for the separate
+    // aareceiver-consumer-testclock library that the consumer decode test
+    // links; the production aareceiver-consumer library never defines
+    // AA_DECODE_HELPER_TEST_CLOCK, so no seam exists there (no data member,
+    // no indirection, no symbol).
+    using Now = std::function<std::chrono::steady_clock::time_point()>;
+    [[nodiscard]] static core::Result<DecodeHelper> open_with_clock(DecodeConfig config, Now now);
+    friend class DecodeHelperTestAccess;
+#endif
 
     std::unique_ptr<Impl> impl_;
 };
