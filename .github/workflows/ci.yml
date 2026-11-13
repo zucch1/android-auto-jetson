@@ -48,7 +48,7 @@ jobs:
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
             pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev valgrind \
-            g++-aarch64-linux-gnu binutils
+            g++-aarch64-linux-gnu binutils ccache
           protoc --version
           valgrind --version
           dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \
@@ -60,6 +60,28 @@ jobs:
           gst-inspect-1.0 h264parse
           gst-inspect-1.0 pipewiresink
           gst-inspect-1.0 pulsesink
+      - name: Identify compiler cache inputs
+        id: compiler
+        run: |
+          set -euo pipefail
+          identity="$( { g++ --version; sha256sum "$(readlink -f "$(command -v g++)")"; } | sha256sum | cut -d ' ' -f 1)"
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+      - name: Restore compiler objects
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', 'deps/manifest.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', 'deps/manifest.lock') }}-
+      - name: Configure compiler cache
+        run: |
+          set -euo pipefail
+          # Objects only: source staging/hash/provenance gates still run every time.
+          # Preprocessor mode rechecks headers; no sloppiness or ignored inputs.
+          echo "CCACHE_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
+          echo 'CCACHE_MAXSIZE=500M' >> "$GITHUB_ENV"
+          echo 'CCACHE_COMPILERCHECK=content' >> "$GITHUB_ENV"
+          echo 'CCACHE_NODIRECT=true' >> "$GITHUB_ENV"
       - name: Fetch and verify locked GoogleTest archive
         run: |
           set -euo pipefail
@@ -143,8 +165,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/opencode
-          cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE" -DBUILD_TESTING=ON
-          cmake --build --preset host-dev
+          cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE" -DBUILD_TESTING=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build --preset host-dev --parallel 4
           python3 -B tests/media/assert_decode_coverage.py build/host-dev
           python3 -B tests/ipc/assert_ipc_coverage.py build/host-dev
           python3 -B tests/wireless/assert_coverage.py build/host-dev
@@ -177,6 +200,7 @@ jobs:
             elif git worktree add --detach "$base_tree" "$PR_BASE_SHA" \
                 && (cd "$base_tree" && cmake --preset host-dev \
                       -DAA_GOOGLETEST_ARCHIVE="$AA_GOOGLETEST_ARCHIVE" -DBUILD_TESTING=ON \
+                      -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
                       >"$RUNNER_TEMP/ipc-bench-base-configure.log" 2>&1) \
                 && python3 -B tools/ci/ipc_bench_gate.py \
                       --base-src "$base_tree" --base-build "$base_tree/build/host-dev" \
@@ -198,7 +222,8 @@ jobs:
               echo '- `ipc-bench-happy-600`: ran in this job.'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          ctest --preset host-dev --output-on-failure -E "$exclude"
+          ctest --preset host-dev --output-on-failure --parallel 4 -E "$exclude"
+          ccache --show-stats
 
   decode-overlay-cross:
     name: ci/decode-overlay-cross
