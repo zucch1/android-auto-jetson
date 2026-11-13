@@ -608,3 +608,33 @@ TEST(TrustStore, WiredKeyClassificationFailsClosed) {
 }
 
 } // namespace
+
+TEST(TrustStore, WirelessMacCaseCannotCreateAnotherApprovalOrEscapeRevocation) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load());
+    const trust::TransportIdentity lower{trust::WirelessIdentity{"aa:bb:cc:dd:ee:ff", "00:aa:bb:cc:dd:ee"}};
+    const trust::TransportIdentity upper{trust::WirelessIdentity{"AA:BB:CC:DD:EE:FF", "00:AA:BB:CC:DD:EE"}};
+    const auto first = store.approve(lower);
+    ASSERT_TRUE(first);
+    const auto second = store.approve(upper);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(first.value(), second.value());
+    EXPECT_EQ(store.phones().size(), 1U);
+    trust::ApprovedPhoneStore reloaded{dir.file()};
+    ASSERT_TRUE(reloaded.load());
+    EXPECT_EQ(reloaded.lookup(test::identity_of(upper)), trust::Decision::approved);
+    ASSERT_TRUE(reloaded.forget_phone(first.value()));
+    EXPECT_EQ(reloaded.lookup(test::identity_of(lower)), trust::Decision::unknown);
+    EXPECT_EQ(reloaded.lookup(test::identity_of(upper)), trust::Decision::unknown);
+}
+
+TEST(TrustStore, WirelessBondRequiresAColonSeparatedMac) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load());
+    for (const auto* address : {"fixture", "AA:BB:CC:DD:EE", "AA:BB:CC:DD:EE:GG", "AA-BB-CC-DD-EE-FF"}) {
+        EXPECT_FALSE(store.approve(trust::WirelessIdentity{address, "hci0"}));
+    }
+    EXPECT_TRUE(store.phones().empty());
+}
