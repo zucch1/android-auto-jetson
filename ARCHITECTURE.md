@@ -75,6 +75,14 @@ The host-tested receiver listener and helper-owned RFCOMM bootstrap are implemen
 
 - Video: 1280x720@30 primary, 800x480@30 fallback (`aa::channels::CapabilityProfile::bench_defaults()`).
 - Video socket: 16 KiB datagram payload, 4 MiB encoded access unit, 56-byte fragment header (`aa::ipc` — the wire format).
+- The display controller retains one complete access unit rejected by the
+  decoder with `ipc_queue_full`, pumps the decoder, and retries that unit before
+  reading more video. This makes the controller lossless against retryable
+  decoder backpressure, but does not guarantee end-to-end losslessness:
+  sustained saturation can fill the bounded kernel socket buffers upstream.
+  The video producer then reports `dropped_backpressure`, drops subsequent
+  non-IDR units with `dropped_waiting_idr`, and resumes on the next IDR that
+  can be sent; the consumer resynchronizes on that IDR.
 - Audio: ≤200 ms latency, ≤50 ms A/V skew (`aa::audio`).
 - Display pump cadence: 5 ms precise timer (`tools/dummy-display/pump_timer.hpp`), bounding schedule-to-present delay to pass the 50 ms A/V gate (PR #81).
 - A/V sync formula: `abs((video_done - video_stamp) - (audio_done - audio_begin))` schedule-to-completion latency difference.

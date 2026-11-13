@@ -2,6 +2,7 @@
 #include "BusClientImpl.hpp"
 #include <algorithm>
 #include <sys/socket.h>
+#include <unistd.h>
 
 namespace aa::helper {
 BusClient::BusClient(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -44,6 +45,13 @@ core::Result<std::unique_ptr<BusClient>> BusClient::private_bus(const std::strin
     auto connection = BusConnection::connect_private(address);
     if (!connection) return Error{ErrorCode::helper_unavailable};
     return std::unique_ptr<BusClient>{new BusClient{std::make_unique<Impl>(std::move(connection.value()), store)}};
+}
+core::Result<std::unique_ptr<BusClient>> BusClient::private_bus_for_test(const std::string& address,
+                                                                     trust::ApprovedPhoneStore& store) {
+    if (::getuid() != ::geteuid()) return Error{ErrorCode::helper_rejected};
+    auto client = private_bus(address, store);
+    if (client) client.value()->impl_->helper_uid = ::getuid();
+    return client;
 }
 core::Result<void> BusClient::confirmed(core::ConsumerId generation, core::PairingRequestId source) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);

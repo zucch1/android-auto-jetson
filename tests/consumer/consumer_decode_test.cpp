@@ -13,6 +13,7 @@
 #include <aa/consumer/Decode.hpp>
 
 #include "DecodeSessionState.hpp" // GStreamer-free admission + timestamp state
+#include "DecodeTestAccess.hpp"   // internal clock injection for pump integration
 #include "DecodeArrivalProbe.hpp"
 #include "discovery.hpp"          // tools/aa-decode-probe: runtime detection oracle
 
@@ -23,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <thread>
 #include <sys/wait.h>
@@ -1044,6 +1046,319 @@ TEST(ConsumerDecodeAdmission, DuplicateLiveTimestampRejected) {
 // with controlled clocks - the SAME methods DecodeHelper::submit/pump call -
 // so the lifecycle is deterministic and never races the pipeline.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// DecodeHelper::pump integration (real software pipeline, injected clock).
+// The clock seam exists only in the aareceiver-consumer-testclock library
+// (AA_DECODE_HELPER_TEST_CLOCK); no real five-second sleep and no enlarged
+// retention is involved. `clock` is the time every helper read returns, and
+// `on_read` runs on every read while `pumping` so a test can move time (or
+// land a pipeline error) at an exact point inside pump().
+// ---------------------------------------------------------------------------
+
+struct PumpClock final {
+    using Clock = DecodeSessionState::Clock;
+    Clock::time_point submitted_at{std::chrono::seconds{100}};
+    Clock::time_point now{submitted_at};
+    bool pumping{false};
+    int pump_reads{0};
+    std::function<void(int)> on_read{};
+
+    [[nodiscard]] Clock::time_point read() {
+        if (pumping) {
+            ++pump_reads;
+            if (on_read) {
+                on_read(pump_reads);
+            }
+        }
+        return now;
+    }
+};
+
+[[nodiscard]] aa::core::Result<DecodeHelper> open_clocked(PumpClock& clock) {
+    DecodeConfig config;
+    config.caps = kPrimaryCaps;
+    config.backend = DecodeBackend::software;
+    return DecodeHelperTestAccess::open(std::move(config), [&clock] { return clock.read(); });
+}
+
+// All 90 fixture AUs accepted at clock.now: nothing can be output yet that the
+// test has not paid for with a pump() call.
+void submit_fixture(DecodeHelper& helper) {
+    const auto stream = read_file(fixture_path());
+    ASSERT_FALSE(stream.empty()) << "fixture missing: " << fixture_path();
+    const auto units = parse_annexb_units(stream);
+    ASSERT_EQ(units.size(), 90U) << "fixture grammar drift";
+    for (std::uint64_t i = 0; i < units.size(); ++i) {
+        const auto ts = kTimestampBaseNs + i * kFramePeriodNs;
+        const auto submitted = helper.submit(
+            VideoAccessUnit{i, i + 100, ts, units[i].idr, units[i].data});
+        ASSERT_TRUE(submitted) << i << ": " << static_cast<int>(submitted.error().code());
+    }
+}
+
+// The first fixture IDR (negotiates caps and decodes) followed by an accepted
+// AU that carries only AUD/SPS/PPS: it owns a correlation but the decoder can
+// never output an image for it, so clean EOS strands exactly that one AU. (A
+// parameter-only AU on its own never negotiates caps and ends in a pipeline
+// error instead of a clean EOS, so it cannot be the first AU.)
+std::vector<std::uint8_t> parameters_only_unit() {
+    const auto stream = read_file(fixture_path());
+    const auto units = parse_annexb_units(stream);
+    if (units.empty()) {
+        return {};
+    }
+    const auto& first = units[0].data;
+    for (std::size_t i = 0; i + 4 < first.size(); ++i) {
+        const std::size_t prefix = first[i] == 0 && first[i + 1] == 0 && first[i + 2] == 1 ? 3U
+            : (first[i] == 0 && first[i + 1] == 0 && first[i + 2] == 0 && first[i + 3] == 1 ? 4U : 0U);
+        if (prefix != 0U && (first[i + prefix] & 0x1F) == 5) {
+            return std::vector<std::uint8_t>(first.begin(),
+                first.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+    }
+    return {};
+}
+
+void submit_idr_then_stranded(DecodeHelper& helper, const std::vector<std::uint8_t>& parameters) {
+    const auto units = parse_annexb_units(read_file(fixture_path()));
+    ASSERT_FALSE(units.empty());
+    ASSERT_TRUE(helper.submit(VideoAccessUnit{0, 100, kTimestampBaseNs, true, units[0].data}));
+    ASSERT_TRUE(helper.submit(
+        VideoAccessUnit{1, 101, kTimestampBaseNs + kFramePeriodNs, false, parameters}));
+}
+
+// First decode slower than retention, observed by the BLOCKING PULL: the clock
+// is inside the window at pump entry (4 s) and past it when the first pull
+// returns (9 s). A pump-entry check alone passes here, so only the post-pull
+// check can report the loss. The report reference is taken BEFORE pump() to
+// prove pump itself refreshes it.
+TEST(ConsumerDecodeCorrelation, PumpBlockingPullCrossingRetentionReportsLoss) {
+    PumpClock clock;
+    auto helper = open_clocked(clock);
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+    submit_fixture(helper.value());
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    const DecodeReport& held = helper.value().report();
+    EXPECT_EQ(held.frames_lost_retention, 0U);
+
+    clock.now = clock.submitted_at + std::chrono::seconds{4};
+    clock.on_read = [&clock](int read) {
+        if (read == 2) { // first read = pump-entry check, second = pull return
+            clock.now = clock.submitted_at + std::chrono::seconds{9};
+        }
+    };
+    clock.pumping = true;
+    const auto pumped = helper.value().pump(Milliseconds{10000});
+    clock.pumping = false;
+    ASSERT_FALSE(pumped) << "accepted frames disappeared behind a successful pump";
+    EXPECT_EQ(pumped.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(clock.pump_reads, 2) << "loss must be raised by the post-pull check";
+    EXPECT_EQ(held.frames_lost_retention, 90U);
+    EXPECT_EQ(held.frames_lost_capacity, 0U);
+    EXPECT_EQ(held.frames_lost_eos, 0U);
+    EXPECT_TRUE(held.awaiting_idr);
+    EXPECT_EQ(held.frames_delivered, 0U);
+    // The late first sample is released, never delivered to the callback.
+    EXPECT_EQ(held.frames_unmatched, 1U);
+
+    // One notice per loss episode; the pump is nonterminal and the counter stays.
+    const auto resumed = helper.value().pump(Milliseconds{0});
+    EXPECT_TRUE(resumed);
+    EXPECT_EQ(held.frames_lost_retention, 90U);
+}
+
+// Same loss, observed at pump ENTRY (no pull happens before the notice): the
+// other expiry path, genuinely different from the blocking-pull one.
+TEST(ConsumerDecodeCorrelation, PumpEntryExpiryReportsLossBeforeAnyPull) {
+    PumpClock clock;
+    auto helper = open_clocked(clock);
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+    submit_fixture(helper.value());
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    const DecodeReport& held = helper.value().report();
+
+    clock.now = clock.submitted_at + std::chrono::seconds{9};
+    clock.pumping = true;
+    const auto pumped = helper.value().pump(Milliseconds{0});
+    clock.pumping = false;
+    ASSERT_FALSE(pumped);
+    EXPECT_EQ(pumped.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(clock.pump_reads, 1) << "returned before reaching the pull";
+    EXPECT_EQ(held.frames_lost_retention, 90U);
+    EXPECT_EQ(held.frames_unmatched, 0U);
+    EXPECT_TRUE(held.awaiting_idr);
+
+    // Resync: a non-IDR AU is discarded while awaiting an IDR, a recovery IDR
+    // is accepted and clears awaiting_idr on the already-held report.
+    const auto stream = read_file(fixture_path());
+    const auto units = parse_annexb_units(stream);
+    const auto next_ts = kTimestampBaseNs + 90 * kFramePeriodNs;
+    const auto discarded = helper.value().submit(
+        VideoAccessUnit{90, 190, next_ts, false, units[1].data});
+    ASSERT_FALSE(discarded);
+    EXPECT_EQ(discarded.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_TRUE(held.awaiting_idr);
+    ASSERT_TRUE(helper.value().submit(VideoAccessUnit{90, 190, next_ts, true, units[0].data}));
+    EXPECT_FALSE(held.awaiting_idr);
+    EXPECT_EQ(held.frames_lost_retention, 90U);
+}
+
+// A decoder error that lands while the blocking pull is in flight must be the
+// result of THAT pump, not of the next one, even when the same pull also
+// crossed the retention bound (the loss stays visible in the counters).
+TEST(ConsumerDecodeCorrelation, PumpPostPullDecoderErrorOutranksLossNotice) {
+    PumpClock clock;
+    auto helper = open_clocked(clock);
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+    submit_fixture(helper.value());
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    const DecodeReport& held = helper.value().report();
+
+    clock.now = clock.submitted_at + std::chrono::seconds{4};
+    clock.on_read = [&clock, &helper](int read) {
+        if (read == 2) {
+            clock.now = clock.submitted_at + std::chrono::seconds{9};
+            DecodeHelperTestAccess::post_pipeline_error(helper.value());
+        }
+    };
+    clock.pumping = true;
+    const auto pumped = helper.value().pump(Milliseconds{10000});
+    clock.pumping = false;
+    ASSERT_FALSE(pumped);
+    EXPECT_EQ(pumped.error().code(), ErrorCode::channel_decode_failed);
+    EXPECT_EQ(held.frames_lost_retention, 90U);
+    // Terminal: the next pump repeats the decode failure.
+    const auto again = helper.value().pump(Milliseconds{0});
+    ASSERT_FALSE(again);
+    EXPECT_EQ(again.error().code(), ErrorCode::channel_decode_failed);
+}
+
+// Clean EOS stranding an accepted AU is loss, counted under end_of_stream and
+// reported by exactly one failing pump (documented, intentional): the stream
+// cannot recover, but "success, zero delivered" would be the silent loss of
+// issue #76.
+TEST(ConsumerDecodeCorrelation, PumpEosStrandedAuReportsEndOfStreamLossOnce) {
+    PumpClock clock;
+    auto helper = open_clocked(clock);
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+    const auto parameters = parameters_only_unit();
+    ASSERT_FALSE(parameters.empty()) << "fixture grammar drift";
+    const DecodeReport& held = helper.value().report();
+    submit_idr_then_stranded(helper.value(), parameters);
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    ASSERT_TRUE(helper.value().end_of_stream());
+
+    clock.pumping = true;
+    const auto pumped = helper.value().pump(Milliseconds{10000});
+    clock.pumping = false;
+    ASSERT_FALSE(pumped);
+    EXPECT_EQ(pumped.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(held.frames_lost_eos, 1U);
+    EXPECT_EQ(held.frames_lost_retention, 0U);
+    EXPECT_EQ(held.frames_lost_capacity, 0U);
+    // The failing pump may already have delivered earlier output (documented).
+    EXPECT_EQ(held.frames_delivered, 1U);
+    const auto next = helper.value().pump(Milliseconds{0});
+    ASSERT_TRUE(next);
+    EXPECT_EQ(next.value(), 0U);
+    EXPECT_EQ(held.frames_lost_eos, 1U);
+}
+
+// Ordering: an AU that already aged out before EOS is counted as expiry by the
+// retention check that runs first; EOS then finds nothing stranded and must not
+// count it a second time.
+TEST(ConsumerDecodeCorrelation, PumpExpiryBeforeEosIsNotCountedAgainAsEosLoss) {
+    PumpClock clock;
+    auto helper = open_clocked(clock);
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+    const auto parameters = parameters_only_unit();
+    ASSERT_FALSE(parameters.empty()) << "fixture grammar drift";
+    const DecodeReport& held = helper.value().report();
+    submit_idr_then_stranded(helper.value(), parameters);
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    ASSERT_TRUE(helper.value().end_of_stream());
+
+    clock.now = clock.submitted_at + std::chrono::seconds{9};
+    clock.pumping = true;
+    const auto first = helper.value().pump(Milliseconds{10000});
+    ASSERT_FALSE(first);
+    EXPECT_EQ(first.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(held.frames_lost_retention, 2U);
+    EXPECT_EQ(held.frames_lost_eos, 0U);
+    const auto second = helper.value().pump(Milliseconds{10000});
+    clock.pumping = false;
+    EXPECT_TRUE(second) << "no second notice for the same AUs";
+    EXPECT_EQ(held.frames_lost_retention, 2U);
+    EXPECT_EQ(held.frames_lost_eos, 0U);
+}
+
+TEST(ConsumerDecodeCorrelation, SubmitExpiryNoticeSurvivesRecoveryIdr) {
+    const DecodeSessionState::Clock::time_point t0{};
+    DecodeSessionState state;
+    state.accept_timestamp(kTimestampBaseNs);
+    state.record_correlation(1, 10, kTimestampBaseNs, t0);
+    const auto boundary = t0 + DecodeSessionState::kCorrelationRetention;
+    EXPECT_TRUE(state.check_pump(boundary - std::chrono::nanoseconds{1}));
+    EXPECT_EQ(state.pending_count(), 1U);
+    const auto recovery_pts = kTimestampBaseNs + kFramePeriodNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, recovery_pts, true, boundary));
+    state.accept_timestamp(recovery_pts);
+    state.record_correlation(2, 20, recovery_pts, boundary);
+    EXPECT_FALSE(state.awaiting_idr);
+    const auto notice = state.check_pump(boundary);
+    ASSERT_FALSE(notice);
+    EXPECT_EQ(notice.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(state.frames_lost_retention, 1U);
+    EXPECT_FALSE(state.take_correlation(kTimestampBaseNs));
+    const auto recovered = state.take_correlation(recovery_pts);
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(recovered->frame, 2U);
+    EXPECT_EQ(recovered->sequence, 20U);
+    EXPECT_EQ(recovered->timestamp_ns, recovery_pts);
+    EXPECT_TRUE(state.check_pump(boundary));
+    EXPECT_EQ(state.frames_lost_retention, 1U);
+}
+
+TEST(ConsumerDecodeCorrelation, CapacityAndEosLossHaveSeparateAccounting) {
+    const DecodeSessionState::Clock::time_point now{};
+    DecodeSessionState state;
+    for (std::size_t i = 0; i < DecodeSessionState::kMaxPendingCorrelations; ++i) {
+        const auto ts = kTimestampBaseNs + i * kFramePeriodNs;
+        ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts, i == 0, now));
+        state.accept_timestamp(ts);
+        state.record_correlation(i, i, ts, now);
+    }
+    const auto recovery_pts = kTimestampBaseNs
+        + DecodeSessionState::kMaxPendingCorrelations * kFramePeriodNs;
+    ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, recovery_pts, true, now));
+    state.accept_timestamp(recovery_pts);
+    state.record_correlation(900, 901, recovery_pts, now);
+    const auto capacity_notice = state.check_pump(now);
+    ASSERT_FALSE(capacity_notice);
+    EXPECT_EQ(capacity_notice.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(state.frames_lost_capacity, DecodeSessionState::kMaxPendingCorrelations);
+    EXPECT_EQ(state.frames_lost_retention, 0U);
+    EXPECT_EQ(state.pending_count(), 1U);
+    state.finish_correlations();
+    const auto eos_notice = state.check_pump(now);
+    ASSERT_FALSE(eos_notice);
+    EXPECT_EQ(eos_notice.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(state.frames_lost_eos, 1U);
+    state.finish_correlations();
+    EXPECT_TRUE(state.check_pump(now));
+    EXPECT_EQ(state.frames_lost_eos, 1U);
+}
 
 TEST(ConsumerDecodeCorrelation, DroppedAuExpiresAndRequiresIdr) {
     using Clock = DecodeSessionState::Clock;

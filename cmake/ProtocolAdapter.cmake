@@ -109,4 +109,59 @@ endforeach()
 unset(case)
 unset(test_suffix)
 unset(AA_PROTOCOL_CODEGEN_CASES)
+
+add_test(NAME protocol_adapter_protobuf_audit
+    COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_SOURCE_DIR}/tools/protocol/protobuf_audit.py" --check)
+set_tests_properties(protocol_adapter_protobuf_audit PROPERTIES TIMEOUT 60)
+
+set(AA_PROTOCOL_AUDIT_CASES
+    baseline
+    drift-inventory
+    report-drift
+    missing-file
+    tampered-proto
+    unpinned-file
+    listing-tampered
+    repin-comment
+    field-number-changed
+    field-type-changed
+    enum-value-removed
+    new-unmatched-message
+    vanished-difference
+    unparsed-construct
+    finding-dangling-diff
+    uncovered-by-removal
+    duplicate-id
+    missing-field
+    invalid-disposition
+    status-mismatch
+    unexplained-deletion
+    nonlegacy-deletion
+    legacy-altered
+    citation-broken
+    absence-stale
+    crosslink-dangling
+    orphan-finding
+    mapping-dangling
+    triage-missing-diff
+    triage-dangling-diff
+    triage-invalid-disposition
+    triage-missing-metadata
+    sentinel-false-match
+    genuine-rename-still-matches
+    renamed-enums-path-only
+    zero-only-enum-false-match
+    message-path-shape-boundary)
+foreach(case IN LISTS AA_PROTOCOL_AUDIT_CASES)
+    string(REPLACE "-" "_" test_suffix "${case}")
+    add_test(NAME protocol_adapter_audit_${test_suffix}
+        COMMAND "${Python3_EXECUTABLE}" -B
+                "${CMAKE_SOURCE_DIR}/tests/protocol/audit_scenarios.py"
+                "${CMAKE_SOURCE_DIR}" "${case}")
+    set_tests_properties(protocol_adapter_audit_${test_suffix} PROPERTIES TIMEOUT 120)
+endforeach()
+unset(case)
+unset(test_suffix)
+unset(AA_PROTOCOL_AUDIT_CASES)
 unset(AA_PROTOCOL_TEST_SOURCES)
