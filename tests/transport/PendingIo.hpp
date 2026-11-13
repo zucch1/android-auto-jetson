@@ -27,6 +27,16 @@ public:
         tid_ = identity.get();
     }
 
+    bool blocked_in_poll(int backpressured_fd = -1) {
+        // Observe the syscall used by libc poll(): aarch64 has only ppoll.
+        // Keep observing the worker's kernel wait before cancelling it.
+#ifdef SYS_poll
+        return blocked(SYS_poll, backpressured_fd);
+#else
+        return blocked(SYS_ppoll, backpressured_fd);
+#endif
+    }
+
     bool blocked(long expected, int backpressured_fd = -1) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (std::chrono::steady_clock::now() < deadline) {
