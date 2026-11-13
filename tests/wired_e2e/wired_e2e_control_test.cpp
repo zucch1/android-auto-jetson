@@ -93,10 +93,10 @@ TEST_F(WiredControl, OrdinaryServicePayloadRemainsEncryptedSpecific) {
 }
 
 TEST_F(WiredControl, Unknown255ThenPingInSameReceiveContinues) {
-    auto combined = wiredtest::control_frame({std::byte{0}, std::byte{255}});
+    auto combined = wiredtest::encrypted_control_frame({std::byte{0}, std::byte{255}});
     auto ping = proto::encode(proto::PingRequest{9876, false, {std::byte{0x77}}});
     ASSERT_TRUE(ping);
-    const auto next = wiredtest::control_frame(std::move(ping).value());
+    const auto next = wiredtest::encrypted_control_frame(std::move(ping).value());
     combined.insert(combined.end(), next.begin(), next.end());
     transport.push_inbound(std::move(combined));
     const auto before = transport.sent_count();
@@ -158,9 +158,9 @@ TEST_F(WiredControl, AudioFocusGainTransientDuckAndReleaseReplyThenPingSurvives)
 
 TEST_F(WiredControl, ByeByeRepliesBeforeGracefulStopAndDoesNotRouteFollowingPing) {
     ASSERT_TRUE(session.apply(ss::Event::negotiation_succeeded));
-    auto combined = wiredtest::control_frame(
+    auto combined = wiredtest::encrypted_control_frame(
         {std::byte{0}, std::byte{15}, std::byte{8}, std::byte{1}});
-    const auto ping = wiredtest::control_frame(proto::encode(proto::PingRequest{1, false, {}}).value());
+    const auto ping = wiredtest::encrypted_control_frame(proto::encode(proto::PingRequest{1, false, {}}).value());
     combined.insert(combined.end(), ping.begin(), ping.end());
     transport.push_inbound(std::move(combined));
     const auto before = transport.sent_count();

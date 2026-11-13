@@ -29,8 +29,13 @@ inline int remaining(Deadline until) {
     return static_cast<int>(std::clamp<std::int64_t>(ms, 0, std::numeric_limits<int>::max()));
 }
 
-[[nodiscard]] inline core::Result<void> read_full(int fd, std::span<std::uint8_t> out, Deadline until = deadline()) {
+// filled_out, when supplied, reports consumed bytes on both success and error;
+// framing callers use it to distinguish an idle read from a partial header.
+[[nodiscard]] inline core::Result<void> read_full(int fd, std::span<std::uint8_t> out,
+                                                  Deadline until = deadline(),
+                                                  std::size_t* filled_out = nullptr) {
     std::size_t filled = 0;
+    if (filled_out != nullptr) *filled_out = 0;
     while (filled < out.size()) {
         if (std::chrono::steady_clock::now() >= until) return Error{ErrorCode::timeout};
         ::pollfd descriptor{fd, POLLIN, 0};
@@ -55,6 +60,7 @@ inline int remaining(Deadline until) {
             return Error{ErrorCode::transport_closed};
         }
         filled += static_cast<std::size_t>(count);
+        if (filled_out != nullptr) *filled_out = filled;
     }
     return {};
 }

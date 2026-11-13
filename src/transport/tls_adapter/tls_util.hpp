@@ -17,6 +17,9 @@ namespace aa::transport {
 using Deadline = std::chrono::steady_clock::time_point;
 inline constexpr int kPollSliceMs = 50;
 inline constexpr std::chrono::seconds kHandshakeDeadline{10};
+// Bounds a started frame (including trickled fragments) and backpressured
+// writes. Waiting for the first byte uses the separately configured ping budget.
+inline constexpr std::chrono::seconds kFrameDeadline{30};
 
 enum class WaitReady { ready, cancelled, timeout, failed };
 
@@ -25,12 +28,13 @@ enum class WaitReady { ready, cancelled, timeout, failed };
 // cancellation or the deadline. Error/hangup revents are surfaced as failed.
 [[nodiscard]] inline WaitReady wait_ready(int fd, short events,
                                           const core::CancellationToken& token,
-                                          Deadline deadline) {
+                                          Deadline deadline,
+                                          const std::function<Deadline()>& clock = [] { return std::chrono::steady_clock::now(); }) {
     for (;;) {
         if (token.stop_requested()) {
             return WaitReady::cancelled;
         }
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = clock();
         if (now >= deadline) {
             return WaitReady::timeout;
         }
