@@ -26,7 +26,7 @@ current drop); the transport also retains a per-connection lifetime counter.
 ## Task 21 Acceptance Limits
 
 Task 21 delivers the checked contract and its in-process components, not a running
-service. The following limits are explicit acceptance conditions for this task.
+service. (Note: The persistent D-Bus service export owning bus name `org.custom.AndroidAutoReceiver` and object path `/org/custom/AndroidAutoReceiver` was delivered subsequently in `aa::ipc::ControlBusService` and `aa-wired-receiver`). The following limits are explicit acceptance conditions for this task.
 
 - Task 21 delivers the checked contract, the generated introspection, the
   in-process dispatch (`aa::ipc::ControlService`), the authorization semantics,
