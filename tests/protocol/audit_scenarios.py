@@ -37,6 +37,7 @@ TOOL_DIR: Final[str] = "tools/protocol"
 INVENTORY: Final[str] = "docs/evidence/protobuf-audit-inventory.json"
 REPORT: Final[str] = "docs/evidence/protobuf-audit-report.md"
 FINDINGS: Final[str] = "docs/evidence/protobuf-audit-findings.json"
+TRIAGE: Final[str] = "docs/evidence/protobuf-audit-triage.json"
 MAPPING: Final[str] = "docs/evidence/protobuf-audit-mapping.json"
 MATRIX: Final[str] = "docs/evidence/wire-conformance-matrix.json"
 AASDK_TREE: Final[str] = "third_party/aasdk/protobuf/aap_protobuf"
@@ -202,9 +203,16 @@ def sc_finding_dangling_diff(f: Path) -> str:
 
 
 def sc_uncovered_by_removal(f: Path) -> str:
-    data = load(f, FINDINGS)
-    data["accepted"][0]["covers"].pop()  # type: ignore[index]
-    save(f, FINDINGS, data)
+    inv = load(f, INVENTORY)
+    fdoc = load(f, FINDINGS)
+    triage = load(f, TRIAGE)
+    covered_by_finding = {c for item in fdoc["findings"] for c in item.get("covers", [])}  # type: ignore[index]
+    target = next(
+        d["id"] for d in inv["differences"]  # type: ignore[index]
+        if d["class"] != "non-wire" and d["id"] not in covered_by_finding and d["id"] in triage["entries"]  # type: ignore[index]
+    )
+    del triage["entries"][target]  # type: ignore[index]
+    save(f, TRIAGE, triage)
     return "UNCOVERED_DIFFERENCE"
 
 
@@ -298,6 +306,35 @@ def sc_mapping_dangling(f: Path) -> str:
     return "MAPPING_DANGLING"
 
 
+def sc_triage_missing_diff(f: Path) -> str:
+    inv = load(f, INVENTORY)
+    triage = load(f, TRIAGE)
+    target = next(d["id"] for d in inv["differences"] if d["class"] == "non-wire")  # type: ignore[index]
+    del triage["entries"][target]  # type: ignore[index]
+    save(f, TRIAGE, triage)
+    return "TRIAGE_MISSING_DIFF"
+
+
+def sc_triage_dangling_diff(f: Path) -> str:
+    triage = load(f, TRIAGE)
+    triage["entries"]["W-000000000000"] = {  # type: ignore[index]
+        "impact": "dangling probe",
+        "disposition": "no-action",
+        "phone_evidence_status": "not-needed",
+        "rationale": "dangling probe",
+    }
+    save(f, TRIAGE, triage)
+    return "TRIAGE_DANGLING_DIFF"
+
+
+def sc_triage_invalid_disposition(f: Path) -> str:
+    triage = load(f, TRIAGE)
+    first_id = next(iter(triage["entries"]))  # type: ignore[index]
+    triage["entries"][first_id]["disposition"] = "invalid-triage-disposition"  # type: ignore[index]
+    save(f, TRIAGE, triage)
+    return "TRIAGE_INVALID"
+
+
 SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "baseline": sc_baseline,
     "drift-inventory": sc_drift_inventory,
@@ -327,6 +364,9 @@ SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "crosslink-dangling": sc_crosslink_dangling,
     "orphan-finding": sc_orphan_finding,
     "mapping-dangling": sc_mapping_dangling,
+    "triage-missing-diff": sc_triage_missing_diff,
+    "triage-dangling-diff": sc_triage_dangling_diff,
+    "triage-invalid-disposition": sc_triage_invalid_disposition,
 }
 
 
