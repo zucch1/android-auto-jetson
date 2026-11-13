@@ -12,7 +12,9 @@ receiver C++ sources (no hand-typed counts or classifications):
     extracted from .proto comments via proto_schema
 
 Human judgement lives solely in docs/evidence/protobuf-audit-triage.json
-(impact, disposition, phone_evidence_status, rationale) keyed by stable diff ID.
+(disposition, status, owner, version_applicability, evidence_tier, confidence,
+impact, phone_evidence_status, rationale) keyed by stable diff ID, with
+severity derived mechanically from wire_affecting x used_by_receiver x classification.
 """
 from __future__ import annotations
 
@@ -27,6 +29,87 @@ ALLOWED_TRIAGE_DISPOSITIONS: Final[frozenset[str]] = frozenset({
     "follow-up-issue-needed",
     "needs-phone-evidence",
 })
+ALLOWED_SEVERITIES: Final[frozenset[str]] = frozenset({
+    "high", "medium-high", "medium", "low-medium", "low",
+})
+ALLOWED_STATUSES: Final[frozenset[str]] = frozenset({
+    "resolved", "confirmed", "proposed", "deferred",
+})
+ALLOWED_TIERS: Final[frozenset[str]] = frozenset({
+    "mechanical",
+    "code-verified",
+    "oaa-claim-unverified",
+    "phone-trace-unverified",
+})
+ALLOWED_CONFIDENCES: Final[frozenset[str]] = frozenset({
+    "high", "medium", "low",
+})
+TRIAGE_DISPOSITION_STATUS: Final[dict[str, frozenset[str]]] = {
+    "no-action": frozenset({"resolved"}),
+    "needs-phone-evidence": frozenset({"proposed"}),
+    "follow-up-issue-needed": frozenset({"confirmed", "deferred", "proposed"}),
+}
+REQUIRED_TRIAGE_FIELDS: Final[tuple[str, ...]] = (
+    "severity",
+    "status",
+    "disposition",
+    "owner",
+    "version_applicability",
+    "evidence_tier",
+    "confidence",
+    "impact",
+    "phone_evidence_status",
+    "rationale",
+)
+
+SEVERITY_RULE_DOC: Final[str] = (
+    "Derived deterministically from wire_affecting x used_by_receiver x classification: "
+    "(1) wire_affecting=True & used_by_receiver=True -> 'high' for "
+    "field-number-or-type-conflict / field-added-one-side / enum-value-difference, "
+    "'medium-high' for enum-value-conflict or others; "
+    "(2) wire_affecting=True & used_by_receiver=False -> 'medium'; "
+    "(3) wire_affecting=False & used_by_receiver=True -> 'medium' for "
+    "field-number-or-type-conflict / optionality-difference / undecided-match, "
+    "'low-medium' for field-name-difference / message-missing-one-side / enum-missing-one-side, "
+    "'low' for naming-only / metadata-or-syntax; "
+    "(4) wire_affecting=False & used_by_receiver=False -> 'low-medium' for "
+    "field-number-or-type-conflict / optionality-difference / undecided-match, 'low' otherwise."
+)
+
+
+def derive_severity(wire_affecting: bool, used_by_receiver: bool, classification: str) -> str:
+    """Compute per-difference severity from wire_affecting x used_by_receiver x classification."""
+    if wire_affecting and used_by_receiver:
+        if classification in {
+            "field-number-or-type-conflict",
+            "field-added-one-side",
+            "enum-value-difference",
+        }:
+            return "high"
+        return "medium-high"
+    if wire_affecting and not used_by_receiver:
+        return "medium"
+    if not wire_affecting and used_by_receiver:
+        if classification in {
+            "field-number-or-type-conflict",
+            "optionality-difference",
+            "undecided-match",
+        }:
+            return "medium"
+        if classification in {
+            "field-name-difference",
+            "message-missing-one-side",
+            "enum-missing-one-side",
+        }:
+            return "low-medium"
+        return "low"
+    if classification in {
+        "field-number-or-type-conflict",
+        "optionality-difference",
+        "undecided-match",
+    }:
+        return "low-medium"
+    return "low"
 
 CLASSIFICATION_MAP: Final[dict[str, str]] = {
     "field-rename-normalized": "naming-only",
@@ -219,6 +302,43 @@ def derive_channel(diff: dict[str, Any], sets: dict[str, dict[str, Any]]) -> str
     raise ValueError(f"Difference {diff.get('id')} has neither AASDK nor OAA entity")
 
 
+def _field_or_value_line(
+    diff: dict[str, Any], ent: dict[str, Any] | None,
+) -> int | None:
+    if ent is None:
+        return None
+    key = diff.get("key", "")
+    if key.startswith("field "):
+        try:
+            num = int(key.split()[1])
+        except (IndexError, ValueError):
+            return ent.get("line")
+        for f in ent.get("fields", []):
+            if f.get("number") == num:
+                return f.get("line") or ent.get("line")
+    elif key.startswith("value "):
+        try:
+            num = int(key.split()[1])
+        except (IndexError, ValueError):
+            return ent.get("line")
+        for v in ent.get("values", []):
+            if v.get("number") == num:
+                return v.get("line") or ent.get("line")
+    return ent.get("line")
+
+
+def derive_source_loc(diff: dict[str, Any], sets: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    aa_ent = _entity_record("aasdk", diff.get("aasdk", ""), sets)
+    oa_ent = _entity_record("oaa", diff.get("oaa", ""), sets)
+    return {
+        "aasdk_file": aa_ent["file"] if aa_ent else "",
+        "aasdk_line": _field_or_value_line(diff, aa_ent),
+        "oaa_file": oa_ent["file"] if oa_ent else "",
+        "oaa_line": _field_or_value_line(diff, oa_ent),
+        "field_or_value": diff.get("key") or diff.get("entity_kind") or "",
+    }
+
+
 def derive_annotations(diff: dict[str, Any], sets: dict[str, dict[str, Any]]) -> dict[str, Any]:
     aa_ent = _entity_record("aasdk", diff.get("aasdk", ""), sets)
     oa_ent = _entity_record("oaa", diff.get("oaa", ""), sets)
@@ -226,7 +346,9 @@ def derive_annotations(diff: dict[str, Any], sets: dict[str, dict[str, Any]]) ->
     oa_ann = (oa_ent or {}).get("annotations", {})
     return {
         "aasdk_file": aa_ent["file"] if aa_ent else "",
+        "aasdk_line": _field_or_value_line(diff, aa_ent),
         "oaa_file": oa_ent["file"] if oa_ent else "",
+        "oaa_line": _field_or_value_line(diff, oa_ent),
         "oaa_confidence": oa_ann.get("confidence", []),
         "oaa_retracted": bool(oa_ann.get("retracted", False)),
         "oaa_retraction_note": oa_ann.get("retraction_note", ""),
@@ -714,17 +836,128 @@ def _derive_wireless_modes(
     }
 
 
+def _derive_follow_up_groups(
+    enriched: list[dict[str, Any]],
+    findings_doc: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    children = (findings_doc or {}).get("implementation_children", [])
+    findings_by_id = {f["id"]: f for f in (findings_doc or {}).get("findings", []) if f.get("id")}
+    groups: list[dict[str, Any]] = []
+    for child in children:
+        cid = child.get("id", "")
+        owned = [
+            d for d in enriched
+            if d.get("triage") and d["triage"].get("owner") == cid
+            and d["triage"].get("disposition") in ("follow-up-issue-needed", "needs-phone-evidence")
+        ]
+        confirmed = [
+            d for d in owned
+            if d["triage"].get("disposition") == "follow-up-issue-needed"
+            and d["triage"].get("status") == "confirmed"
+        ]
+        research = [
+            d for d in owned
+            if d["triage"].get("status") in ("deferred", "proposed")
+        ]
+        schema_research = [
+            d for d in research
+            if d["triage"].get("disposition") == "follow-up-issue-needed"
+        ]
+        phone_ev = [
+            d for d in research
+            if d["triage"].get("disposition") == "needs-phone-evidence"
+        ]
+
+        def _summarize_bucket(subset: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+            subset_ids = {d["id"] for d in subset}
+            f_rows: list[dict[str, Any]] = []
+            covered_in_bucket: set[str] = set()
+            for fid in child.get("linked_findings", []):
+                f = findings_by_id.get(fid)
+                if not f:
+                    continue
+                matched_ids = [did for did in f.get("covers", []) if did in subset_ids]
+                # Include finding without covers (e.g. D16-SDP-ORDER) in research_needed
+                if matched_ids or (not f.get("covers") and f.get("status") in ("deferred", "proposed") and subset is research):
+                    covered_in_bucket.update(matched_ids)
+                    f_rows.append({
+                        "id": fid,
+                        "disposition": f.get("disposition", ""),
+                        "status": f.get("status", ""),
+                        "severity": f.get("severity", ""),
+                        "diff_count": len(matched_ids),
+                    })
+            unfound_by_ch: dict[str, int] = {}
+            for d in subset:
+                if d["id"] not in covered_in_bucket:
+                    unfound_by_ch[d["channel"]] = unfound_by_ch.get(d["channel"], 0) + 1
+            return f_rows, dict(sorted(unfound_by_ch.items()))
+
+        conf_findings, conf_unfound_ch = _summarize_bucket(confirmed)
+        res_findings, res_unfound_ch = _summarize_bucket(research)
+        conf_covered = {
+            did
+            for row in conf_findings
+            for did in findings_by_id.get(row["id"], {}).get("covers", [])
+        }
+        conf_unfound_ids = sorted(d["id"] for d in confirmed if d["id"] not in conf_covered)
+        res_covered = {
+            did
+            for row in res_findings
+            for did in findings_by_id.get(row["id"], {}).get("covers", [])
+        }
+        phone_unfound_ids = sorted(d["id"] for d in phone_ev if d["id"] not in res_covered)
+
+        groups.append({
+            "child_id": cid,
+            "title": child.get("title", ""),
+            "priority": child.get("priority", ""),
+            "total_diffs": len(owned),
+            "confirmed_fix_needed": {
+                "count": len(confirmed),
+                "channels": sorted({d["channel"] for d in confirmed}),
+                "findings": conf_findings,
+                "unfound_by_channel": conf_unfound_ch,
+                "unfound_diff_ids": conf_unfound_ids,
+            },
+            "research_needed": {
+                "count": len(research),
+                "schema_research_count": len(schema_research),
+                "phone_evidence_count": len(phone_ev),
+                "channels": sorted({d["channel"] for d in research}),
+                "findings": res_findings,
+                "unfound_by_channel": res_unfound_ch,
+                "unfound_phone_evidence_ids": phone_unfound_ids,
+            },
+        })
+    return groups
+
+
 def enrich_differences(
     root: Path,
     diffs: list[dict[str, Any]],
     sets: dict[str, dict[str, Any]],
     triage_doc: dict[str, Any] | None,
+    match: dict[str, Any] | None = None,
+    findings_doc: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Compute derived triage attributes for every difference and merge human judgement."""
     scan = scan_receiver_usage(root, sets)
     entries = (triage_doc or {}).get("entries", {})
     if not isinstance(entries, dict):
         entries = {}
+
+    pair_lookup: dict[tuple[str, str, str], dict[str, Any]] = {
+        (p["kind"], p["aasdk"], p["oaa"]): p
+        for p in (match or {}).get("pairs", [])
+    }
+    findings_by_diff: dict[str, list[str]] = {}
+    for f in (findings_doc or {}).get("findings", []):
+        fid = f.get("id")
+        if not fid:
+            continue
+        for did in f.get("covers", []) or []:
+            findings_by_diff.setdefault(did, []).append(fid)
 
     enriched: list[dict[str, Any]] = []
     for d in diffs:
@@ -733,22 +966,39 @@ def enrich_differences(
         wire_aff = d["class"] == pc.CLASS_WIRE
         channel = derive_channel(d, sets)
         ann = derive_annotations(d, sets)
+        src_loc = derive_source_loc(d, sets)
         usage = derive_usage(d, scan, sets)
+        sev = derive_severity(wire_aff, usage["used_by_receiver"], cls)
+        pair = pair_lookup.get((d["entity_kind"], d["aasdk"], d["oaa"]))
+        match_evidence = {
+            "evidence": pair["evidence"] if pair else d["kind"],
+            "structural_score": pair["structural_score"] if pair else None,
+        }
         hand = entries.get(did) if isinstance(entries.get(did), dict) else {}
         enriched.append({
             **d,
             "classification": cls,
             "wire_affecting": wire_aff,
+            "severity": sev,
             "channel": channel,
             "used_by_receiver": usage["used_by_receiver"],
             "entity_used_by_receiver": usage["entity_used_by_receiver"],
             "usage_mode": usage["usage_mode"],
             "receiver_citations": usage["citations"],
             "entity_citations": usage["entity_citations"],
+            "source": src_loc,
+            "match_evidence": match_evidence,
+            "covering_findings": sorted(findings_by_diff.get(did, [])),
             "annotations": ann,
             "triage": {
-                "impact": hand.get("impact", ""),
+                "severity": hand.get("severity", ""),
+                "status": hand.get("status", ""),
                 "disposition": hand.get("disposition", ""),
+                "owner": hand.get("owner", ""),
+                "version_applicability": hand.get("version_applicability", ""),
+                "evidence_tier": hand.get("evidence_tier", ""),
+                "confidence": hand.get("confidence", ""),
+                "impact": hand.get("impact", ""),
                 "phone_evidence_status": hand.get("phone_evidence_status", ""),
                 "rationale": hand.get("rationale", ""),
             } if hand else None,
@@ -798,15 +1048,26 @@ def enrich_differences(
     # Overall triage summary
     tot_cls: dict[str, int] = {}
     tot_disp: dict[str, int] = {dp: 0 for dp in sorted(ALLOWED_TRIAGE_DISPOSITIONS)}
+    tot_sev: dict[str, int] = {sv: 0 for sv in ("high", "medium-high", "medium", "low-medium", "low")}
+    tot_status: dict[str, int] = {st: 0 for st in ("resolved", "confirmed", "deferred", "proposed")}
+    tot_owner: dict[str, int] = {}
     triaged_count = 0
     for d in enriched:
         c = d["classification"]
         tot_cls[c] = tot_cls.get(c, 0) + 1
+        sv = d["severity"]
+        tot_sev[sv] = tot_sev.get(sv, 0) + 1
         if d["triage"] is not None:
             triaged_count += 1
             dp = d["triage"]["disposition"]
             if dp in tot_disp:
                 tot_disp[dp] += 1
+            st = d["triage"]["status"]
+            if st in tot_status:
+                tot_status[st] += 1
+            ow = d["triage"]["owner"]
+            if ow:
+                tot_owner[ow] = tot_owner.get(ow, 0) + 1
 
     # Retracted OAA entities inventory (derived from .proto annotations)
     oaa_retracted_entities: list[dict[str, Any]] = []
@@ -830,7 +1091,12 @@ def enrich_differences(
         "used_by_receiver": sum(1 for d in enriched if d["used_by_receiver"]),
         "wire_and_used": sum(1 for d in enriched if d["wire_affecting"] and d["used_by_receiver"]),
         "by_classification": dict(sorted(tot_cls.items())),
+        "by_severity": tot_sev,
+        "severity_rule": SEVERITY_RULE_DOC,
         "by_disposition": tot_disp,
+        "by_status": tot_status,
+        "by_owner": dict(sorted(tot_owner.items())),
+        "follow_up_groups": _derive_follow_up_groups(enriched, findings_doc),
         "per_channel": per_channel,
         "oaa_retracted_entities": oaa_retracted_entities,
         "wireless_modes": _derive_wireless_modes(sets, enriched),
@@ -841,6 +1107,8 @@ def enrich_differences(
 def check_triage(
     triage_doc: dict[str, Any] | None,
     diffs: list[dict[str, Any]],
+    valid_child_ids: set[str] | frozenset[str] | None = None,
+    enriched: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """Validate completeness and referential integrity of protobuf-audit-triage.json."""
     errors: list[str] = []
@@ -851,6 +1119,7 @@ def check_triage(
         return ["TRIAGE_INVALID: 'entries' must be an object mapping difference IDs to triage records"]
 
     diff_ids = {d["id"] for d in diffs}
+    enriched_by_id = {d["id"]: d for d in enriched} if enriched else {}
     for did in sorted(diff_ids - set(entries)):
         errors.append(f"TRIAGE_MISSING_DIFF: difference {did} has no triage entry in protobuf-audit-triage.json")
     for tid in sorted(set(entries) - diff_ids):
@@ -861,7 +1130,7 @@ def check_triage(
         if not isinstance(rec, dict):
             errors.append(f"TRIAGE_INVALID: triage entry {tid} must be an object")
             continue
-        for req in ("impact", "disposition", "phone_evidence_status", "rationale"):
+        for req in REQUIRED_TRIAGE_FIELDS:
             val = rec.get(req)
             if not isinstance(val, str) or not val.strip():
                 errors.append(f"TRIAGE_INVALID: triage entry {tid} missing required field '{req}'")
@@ -871,4 +1140,60 @@ def check_triage(
                 f"TRIAGE_INVALID: triage entry {tid} has invalid disposition {disp!r}; "
                 f"expected one of {sorted(ALLOWED_TRIAGE_DISPOSITIONS)}"
             )
+        sev = rec.get("severity")
+        if sev not in ALLOWED_SEVERITIES:
+            errors.append(
+                f"TRIAGE_INVALID: triage entry {tid} has invalid severity {sev!r}; "
+                f"expected one of {sorted(ALLOWED_SEVERITIES)}"
+            )
+        elif tid in enriched_by_id:
+            ed = enriched_by_id[tid]
+            expected_sev = derive_severity(ed["wire_affecting"], ed["used_by_receiver"], ed["classification"])
+            if sev != expected_sev:
+                errors.append(
+                    f"TRIAGE_INVALID: triage entry {tid} has severity {sev!r}, expected derived {expected_sev!r}"
+                )
+        st = rec.get("status")
+        if st not in ALLOWED_STATUSES:
+            errors.append(
+                f"TRIAGE_INVALID: triage entry {tid} has invalid status {st!r}; "
+                f"expected one of {sorted(ALLOWED_STATUSES)}"
+            )
+        elif disp in TRIAGE_DISPOSITION_STATUS and st not in TRIAGE_DISPOSITION_STATUS[disp]:
+            errors.append(
+                f"TRIAGE_INVALID: triage entry {tid} has status {st!r} which is incompatible with "
+                f"disposition {disp!r}; expected one of {sorted(TRIAGE_DISPOSITION_STATUS[disp])}"
+            )
+        tier = rec.get("evidence_tier")
+        if tier not in ALLOWED_TIERS:
+            errors.append(
+                f"TRIAGE_INVALID: triage entry {tid} has invalid evidence_tier {tier!r}; "
+                f"expected one of {sorted(ALLOWED_TIERS)}"
+            )
+        conf = rec.get("confidence")
+        if conf not in ALLOWED_CONFIDENCES:
+            errors.append(
+                f"TRIAGE_INVALID: triage entry {tid} has invalid confidence {conf!r}; "
+                f"expected one of {sorted(ALLOWED_CONFIDENCES)}"
+            )
+        owner = rec.get("owner")
+        if isinstance(owner, str) and owner.strip():
+            if disp == "no-action":
+                if not owner.startswith("triage:"):
+                    errors.append(
+                        f"TRIAGE_INVALID: triage entry {tid} has disposition 'no-action' so owner must "
+                        f"start with 'triage:' (got {owner!r})"
+                    )
+            elif disp in ("follow-up-issue-needed", "needs-phone-evidence"):
+                if valid_child_ids is not None:
+                    if owner not in valid_child_ids:
+                        errors.append(
+                            f"TRIAGE_INVALID: triage entry {tid} owner {owner!r} is not a known "
+                            f"implementation child id ({sorted(valid_child_ids)})"
+                        )
+                elif not owner.startswith("child-"):
+                    errors.append(
+                        f"TRIAGE_INVALID: triage entry {tid} owner {owner!r} must reference an "
+                        f"implementation child id ('child-*')"
+                    )
     return errors

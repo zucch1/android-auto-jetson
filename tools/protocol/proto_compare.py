@@ -128,15 +128,101 @@ def normalized_key(kind: str, ent: dict[str, Any]) -> str:
     return k
 
 
-def name_overlap(kind: str, a: dict[str, Any], b: dict[str, Any]) -> int:
-    """Count of shared numbers whose names are equal after normalisation."""
+_SENTINEL_NAMES: Final[frozenset[str]] = frozenset({
+    "unknown", "none", "unspecified", "invalid", "unset", "undefined",
+    "default", "empty", "notset", "novalue", "uninitialized", "null",
+})
+_SENTINEL_SUFFIXES: Final[tuple[str, ...]] = (
+    "_unknown", "_none", "_unspecified", "_invalid", "_unset", "_undefined",
+    "_default", "_empty", "_not_set", "_no_value", "_uninitialized", "_null",
+)
+_PKG_STOPWORDS: Final[frozenset[str]] = frozenset({
+    "aap", "protobuf", "oaa", "proto", "service", "channel", "message", "messages",
+    "data", "enums", "enum", "ids", "common", "shared", "generic", "legacy",
+})
+_DOMAIN_SYNONYMS: Final[dict[str, str]] = {
+    "sensorsource": "sensor",
+    "navigationstatus": "navigation",
+    "inputsource": "input",
+    "phonestatus": "phone",
+    "wifiprojection": "wifi",
+    "aaw": "wifi",
+    "mediaplayback": "media",
+    "mediabrowser": "media",
+    "sink": "av",
+    "source": "av",
+    "genericnotification": "notification",
+    "vendorextension": "vendor",
+}
+
+
+def is_sentinel_identifier(raw: str, normed: str) -> bool:
+    """Return True if an identifier is a generic sentinel (UNKNOWN/NONE/UNSPECIFIED/INVALID/etc.)."""
+    low = raw.lower()
+    return normed in _SENTINEL_NAMES or low in _SENTINEL_NAMES or low.endswith(_SENTINEL_SUFFIXES)
+
+
+def path_package_tokens(ent: dict[str, Any]) -> set[str]:
+    """Extract normalized domain/channel tokens from an entity's file directory and package scope."""
+    rel_dir = ent["file"].rsplit("/", 1)[0] if "/" in ent["file"] else ""
+    pkg = ent["fqn"].rsplit(".", 1)[0] if "." in ent["fqn"] else ""
+    tokens: set[str] = set()
+    for part in re.split(r"[/._]", f"{rel_dir}.{pkg}"):
+        for tok in re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", part).lower().split("_"):
+            tok = _DOMAIN_SYNONYMS.get(tok, tok)
+            if len(tok) >= 2 and tok not in _PKG_STOPWORDS:
+                tokens.add(tok)
+    return tokens
+
+
+def path_package_overlap(a: dict[str, Any], b: dict[str, Any]) -> int:
+    """Count shared domain/channel tokens between two entities' paths and packages."""
+    return len(path_package_tokens(a) & path_package_tokens(b))
+
+
+def non_sentinel_name_overlap(
+    kind: str, a: dict[str, Any], b: dict[str, Any], *, include_zero: bool = False,
+) -> int:
+    """Count shared numbers with matching normalized non-sentinel names.
+
+    Sentinels (``UNKNOWN``, ``NONE``, ``UNSPECIFIED``, ``INVALID``, etc.) and, by
+    default, enum value ``0`` are excluded so generic placeholders cannot carry a
+    structural match.
+    """
     if kind == "message":
-        nb = {f["number"]: norm_name(f["name"]) for f in b["fields"]}
-        return sum(1 for f in a["fields"] if nb.get(f["number"]) == norm_name(f["name"]))
+        nb = {f["number"]: (f["name"], norm_name(f["name"])) for f in b["fields"]}
+        cnt = 0
+        for f in a["fields"]:
+            n = f["number"]
+            if n not in nb:
+                continue
+            na = norm_name(f["name"])
+            rb_raw, rb_norm = nb[n]
+            if (na == rb_norm
+                    and not is_sentinel_identifier(f["name"], na)
+                    and not is_sentinel_identifier(rb_raw, rb_norm)):
+                cnt += 1
+        return cnt
     pa = _snake(simple_key("enum", a))
     pb = _snake(simple_key("enum", b))
-    nb2 = {v["number"]: norm_name(v["name"], pb) for v in b["values"]}
-    return sum(1 for v in a["values"] if nb2.get(v["number"]) == norm_name(v["name"], pa))
+    nb2 = {v["number"]: (v["name"], norm_name(v["name"], pb)) for v in b["values"]}
+    cnt = 0
+    for v in a["values"]:
+        n = v["number"]
+        if (not include_zero and n == 0) or n not in nb2:
+            continue
+        na = norm_name(v["name"], pa)
+        rb_raw, rb_norm = nb2[n]
+        if (na == rb_norm
+                and not is_sentinel_identifier(v["name"], na)
+                and not is_sentinel_identifier(rb_raw, rb_norm)):
+            cnt += 1
+    return cnt
+
+
+def name_overlap(kind: str, a: dict[str, Any], b: dict[str, Any]) -> int:
+    """Count of shared numbers whose non-sentinel names are equal after normalisation."""
+    return non_sentinel_name_overlap(kind, a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -335,10 +421,15 @@ def match_sets(
                 continue
             if len(by_b[fb]) > 1 and by_b[fb][1][0] == key:
                 continue
-            # evidence strength: number+wire overlap alone is weak for small shapes
-            if kind == "enum" and key[1] < 1:
+            # evidence strength: sentinels / value 0 / numeric-only overlap cannot carry a match
+            ea, eb = sets_a[kind][fa], sets_b[kind][fb]
+            nso = key[1]
+            pkg_sim = path_package_overlap(ea, eb)
+            if nso < 1 and pkg_sim < 1:
                 continue
-            if kind == "message" and len(sets_a[kind][fa]["fields"]) < MIN_STRUCT_STRONG and key[1] < 1:
+            if kind == "enum" and nso < 1 and non_sentinel_name_overlap(kind, ea, eb, include_zero=True) < 1:
+                continue
+            if kind == "message" and len(ea["fields"]) < MIN_STRUCT_STRONG and nso < 1:
                 continue
             accepted.append((fa, fb))
         for fa, fb in accepted:

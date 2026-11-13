@@ -445,7 +445,9 @@ def build_inventory(
     triage_doc: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     match = pc.compare(sets["aasdk"], sets["oaa"], mapping)
-    diffs, triage_summary = pt.enrich_differences(root, match["diffs"], sets, triage_doc)
+    diffs, triage_summary = pt.enrich_differences(
+        root, match["diffs"], sets, triage_doc, match=match, findings_doc=findings_doc,
+    )
     legacy_by_id = {d["id"]: d for d in legacy_doc.get("discrepancies", [])}
     findings = []
     for f in findings_doc.get("findings", []):
@@ -711,7 +713,10 @@ def check_integrity(root: Path) -> list[str]:
     inv, match = build_inventory(root, sources, sets, mapping, findings_doc, legacy_doc, triage_doc)
     errors += match["errors"]
     errors += check_findings(root, findings_doc, match["diffs"], legacy_doc, registry, triage_doc)
-    errors += pt.check_triage(triage_doc, match["diffs"])
+    valid_child_ids = {c.get("id") for c in findings_doc.get("implementation_children", []) if c.get("id")}
+    errors += pt.check_triage(
+        triage_doc, match["diffs"], valid_child_ids=valid_child_ids, enriched=inv["differences"],
+    )
     inv_path, rep_path = root / INVENTORY_PATH, root / REPORT_PATH
     if not inv_path.is_file():
         errors.append(f"INVENTORY_FILE_MISSING: {INVENTORY_PATH}")
@@ -812,12 +817,16 @@ def render_report(inv: dict[str, Any]) -> str:
     w("## Per-difference triage summary\n")
     w(f"Every difference across all classes (including `non-wire`) is individually triaged in "
       f"`protobuf-audit-triage.json` with mechanically derived classification, wire-impact flag, "
-      f"channel, and receiver C++ usage citations.\n")
+      f"severity, channel, source file/line/field, match evidence, and receiver C++ usage citations.\n")
     w(f"- **Total differences**: **{ts['total_differences']}** (triaged: **{ts['triaged']}**, untriaged: **{ts['untriaged']}**)")
     w(f"- **Wire-affecting**: **{ts['wire_affecting']}** (`class == wire-affecting`)")
     w(f"- **Used by receiver**: **{ts['used_by_receiver']}** (direct field/enum usage, strict-policy unknown-tag/enum rejection, or active entity)")
     w(f"- **Wire-affecting AND used by receiver**: **{ts['wire_and_used']}**")
-    w("- **Dispositions**: " + ", ".join(f"`{k}` {v}" for k, v in ts["by_disposition"].items()) + "\n")
+    w("- **Dispositions**: " + ", ".join(f"`{k}` {v}" for k, v in ts["by_disposition"].items()))
+    w("- **Statuses**: " + ", ".join(f"`{k}` {v}" for k, v in ts["by_status"].items()))
+    w("- **Severities**: " + ", ".join(f"`{k}` {v}" for k, v in ts["by_severity"].items()))
+    w("- **Owners**: " + ", ".join(f"`{k}` {v}" for k, v in ts["by_owner"].items()) + "\n")
+    w(f"> **Severity derivation rule**: {ts['severity_rule']}\n")
     w("| Derived classification | Count | Wire-affecting | Used by receiver | Wire & used |")
     w("|---|---:|---:|---:|---:|")
     for cls_name, cnt in ts["by_classification"].items():
@@ -826,6 +835,28 @@ def render_report(inv: dict[str, Any]) -> str:
         u_cnt = sum(1 for d in sub if d["used_by_receiver"])
         wu_cnt = sum(1 for d in sub if d["wire_affecting"] and d["used_by_receiver"])
         w(f"| `{cls_name}` | {cnt} | {w_cnt} | {u_cnt} | {wu_cnt} |")
+    w("")
+    w("## Receiver-usage scanner methodology & known limitations\n")
+    w("`scan_receiver_usage()` in `tools/protocol/proto_triage.py` uses regex and alias matching "
+      "(no C++ AST or compiler symbol resolution) over `src/protocol/` and `src/helper/bluetooth_bootstrap/` "
+      "(plus `Bootstrap.proto`). Known approximation modes:\n")
+    w("- **Shared accessor names across messages (false positive)**: field accessors are matched with "
+      "`\\b(?:has_|set_|mutable_|add_|clear_)?<field>\\s*\\(` per translation unit once a message type is "
+      "used, so identically named fields on two different used messages in the same file (for example "
+      "`status`, `config`, or `channel_id`) can both be marked `direct-field` if one is accessed.")
+    w("- **Block comments, `#if 0`, and dead helpers (false positive)**: `//` line comments are stripped "
+      "before scanning, but `/* ... */` multi-line comments, disabled `#if`/`#ifdef` blocks, and uncalled "
+      "helper functions within scanned `.cpp`/`.hpp` files are still matched as code.")
+    w("- **Other C++ alias styles and indirect callers (false negative)**: only `namespace X = ...;` and "
+      "single-target `using X = ...;` aliases in files with direct `.pb.h` includes are expanded; `using "
+      "namespace ...;`, `typedef` aliases, deduced `auto`/template helpers, and transitive callers without "
+      "a `.pb.h` include are not resolved.")
+    w("- **Generated accessors outside the scanned prefixes (false negative)**: the field regex omits "
+      "`*_size()`, `release_*()`, `allocated_*()`, and `oneof_case()` accessors, so a repeated field "
+      "inspected only via `<field>_size()` would not match `direct-field`.")
+    w("- **Files outside the scanned roots (false negative)**: only `src/protocol/` and "
+      "`src/helper/bluetooth_bootstrap/` are scanned; proto usages elsewhere (for example `src/core/` or "
+      "`tests/`) are intentionally excluded from runtime receiver-usage counts.")
     w("")
     w("## Finding coverage\n")
     w(f"Differences in `MUST_COVER` classes (`wire-affecting`, `interpretation`, `unmatched`, `undecided`): **{fc['must_cover_total']}**; "
@@ -888,15 +919,17 @@ def render_report(inv: dict[str, Any]) -> str:
     )
     w(f"All **{len(wu_diffs)}** differences where `wire_affecting == true` AND `used_by_receiver == true` "
       f"(including strict `kStrictExtensionPolicy` unknown-tag/enum rejections and compile-time/runtime usages):\n")
-    w("| ID | Channel | Classification | Usage mode | AASDK ↔ OAA | Key | Receiver citations | Disposition | Phone evidence |")
-    w("|---|---|---|---|---|---|---|---|---|")
+    w("| ID | Channel | Severity | Classification | Usage mode | AASDK ↔ OAA | Key | Receiver citations | Disposition | Status | Owner | Phone evidence |")
+    w("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for d in wu_diffs:
         cites = ", ".join(f"`{Path(p).name}`" for p in d["receiver_citations"]) or "-"
         tr = d.get("triage") or {}
         disp = tr.get("disposition", "-")
+        st = tr.get("status", "-")
+        ow = tr.get("owner", "-")
         pev = tr.get("phone_evidence_status", "-")
-        w(f"| `{d['id']}` | `{d['channel']}` | `{d['classification']}` | `{d['usage_mode']}` | "
-          f"`{short(d['aasdk'])}` ↔ `{short(d['oaa'])}` | `{d['key']}` | {cites} | `{disp}` | {pev} |")
+        w(f"| `{d['id']}` | `{d['channel']}` | `{d['severity']}` | `{d['classification']}` | `{d['usage_mode']}` | "
+          f"`{short(d['aasdk'])}` ↔ `{short(d['oaa'])}` | `{d['key']}` | {cites} | `{disp}` | `{st}` | `{ow}` | {pev} |")
     w("")
     w("## Wireless modes comparison\n")
     wm = ts["wireless_modes"]
@@ -953,6 +986,34 @@ def render_report(inv: dict[str, Any]) -> str:
         w(f"- {u['kind']} `{', '.join(short(x) for x in u['aasdk'])}` ↔ "
           f"`{', '.join(short(x) for x in u['oaa'][:4])}{' …' if len(u['oaa']) > 4 else ''}`: {u['reason']}")
     w("")
+    w("## Follow-up grouping (5 domain groups: confirmed fix needed vs research needed)\n")
+    w("All actionable / pending differences (`follow-up-issue-needed` + `needs-phone-evidence`) are grouped into "
+      "the five domain groups below rather than creating one issue per difference. Within each group, items "
+      "with **confirmed fix needed** (`status = confirmed`) are separated from **research needed** "
+      "(`status = deferred | proposed`, spanning schema/capability research and real-phone evidence).\n")
+    w("| Domain group | Confirmed fix needed | Research needed (schema + phone) | Total follow-up/research |")
+    w("|---|---:|---:|---:|")
+    for grp in ts["follow_up_groups"]:
+        cf = grp["confirmed_fix_needed"]
+        rn = grp["research_needed"]
+        w(f"| `{grp['child_id']}` | {cf['count']} | {rn['count']} ({rn['schema_research_count']} schema + {rn['phone_evidence_count']} phone) | {grp['total_diffs']} |")
+    w("")
+    for grp in ts["follow_up_groups"]:
+        w(f"### {grp['child_id']}: {grp['title']}\n")
+        cf = grp["confirmed_fix_needed"]
+        rn = grp["research_needed"]
+        if cf["count"] == 0:
+            w("- **Confirmed fix needed (`0` diffs)**: none yet — all open items in this domain require research or phone verification first.")
+        else:
+            f_str = ", ".join(f"`{r['id']}` ({r['diff_count']})" for r in cf["findings"])
+            u_str = ", ".join(f"`{x}`" for x in cf["unfound_diff_ids"])
+            parts = [p for p in (f"findings: {f_str}" if f_str else "", f"strict receiver diffs: {u_str}" if u_str else "") if p]
+            w(f"- **Confirmed fix needed (`{cf['count']}` diffs)**: " + "; ".join(parts) + ".")
+        rf_str = ", ".join(f"`{r['id']}` ({r['status']}, {r['diff_count']})" for r in rn["findings"])
+        ru_str = ", ".join(f"`{ch}` ({cnt})" for ch, cnt in rn["unfound_by_channel"].items())
+        r_parts = [p for p in (f"findings: {rf_str}" if rf_str else "", f"channel clusters: {ru_str}" if ru_str else "") if p]
+        w(f"- **Research needed (`{rn['count']}` diffs = `{rn['schema_research_count']}` schema/deferred + `{rn['phone_evidence_count']}` needs-phone-evidence)**: "
+          + ("; ".join(r_parts) if r_parts else "none") + ".\n")
     w("## Implementation children (prioritized, checked against open issues)\n")
     for c in inv["implementation_children"]:
         w(f"### {c['id']}: {c['title']}\n")
@@ -1031,7 +1092,8 @@ def main(argv: list[str]) -> int:
         print(f"  differences={len(match['diffs'])} {inv['difference_summary']['by_class']} "
               f"triaged={ts['triaged']}/{ts['total_differences']} wire={ts['wire_affecting']} "
               f"used={ts['used_by_receiver']} wire_used={ts['wire_and_used']} "
-              f"uncovered={inv['findings_coverage']['uncovered']}")
+              f"dispositions={ts['by_disposition']} statuses={ts['by_status']} "
+              f"severities={ts['by_severity']} uncovered={inv['findings_coverage']['uncovered']}")
         return 0
 
     errors = check_integrity(root)
@@ -1050,6 +1112,7 @@ def main(argv: list[str]) -> int:
         f"pairs={cov['message']['matched_pairs']}m+{cov['enum']['matched_pairs']}e "
         f"differences={len(inv['differences'])} triaged={ts['triaged']}/{ts['total_differences']} "
         f"wire={ts['wire_affecting']} used={ts['used_by_receiver']} wire_used={ts['wire_and_used']} "
+        f"dispositions={ts['by_disposition']} statuses={ts['by_status']} severities={ts['by_severity']} "
         f"findings={len(inv['findings'])} uncovered={inv['findings_coverage']['uncovered']}"
     )
     return 0
