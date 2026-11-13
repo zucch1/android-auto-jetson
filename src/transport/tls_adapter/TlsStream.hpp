@@ -14,6 +14,12 @@ struct TlsTransport::Impl final {
     SSL* ssl{nullptr};
     bool handshaked{false};
     FrameStreamIO io;
+    std::function<Deadline()> now{[] { return std::chrono::steady_clock::now(); }};
+    std::optional<std::chrono::milliseconds> idle_budget;
+    Deadline io_deadline{Deadline::max()};
+    // True once a receive has seen its first decrypted byte; from then on the
+    // frame budget (kFrameDeadline) replaces the idle budget.
+    bool frame_started{false};
 
     Impl(int socket_fd, aa::tls::Policy pol);
     ~Impl();

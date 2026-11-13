@@ -7,6 +7,7 @@
 
 #include "BusConnection.hpp"
 #include "BusWire.hpp"
+#include "DropDiagnostic.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -91,6 +92,7 @@ struct ControlBusService::Impl final {
     std::optional<BusConnection> connection{};
     BusPeerLookup credentials{};
     BusSignalEmitter emitter{};
+    dbus_adapter::DropDiagnostic drop_diagnostic{};
     PairingIdSource& pairing_ids;
     PhoneDirectory& phones;
     ControlService service;
@@ -162,6 +164,13 @@ core::Result<std::size_t> ControlBusService::cycle(core::Milliseconds idle_inter
     }
     auto message = impl_->connection->read_message();
     if (!message.has_value()) {
+        if (message.error().code() == ErrorCode::transport_message_dropped) {
+            if (const auto count = impl_->drop_diagnostic.record(std::chrono::steady_clock::now())) {
+                impl_->emitter.emit(DiagnosticEmitted{
+                    DiagnosticSeverity::warning, "dbus_message_dropped", *count});
+            }
+            return std::size_t{0};
+        }
         return message.error();
     }
     const auto call = dbus_adapter::to_incoming_call(message.value());
