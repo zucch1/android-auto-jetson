@@ -697,6 +697,34 @@ TEST(WiredReceiver, StdoutLogLosslessSubmitIsBoundedOnceRunningStopsWithAStuckSi
     LogWriteProbe::active = nullptr;
 }
 
+TEST(WiredReceiver, StdoutLogShutdownDropFailsFinishAfterSinkRecoversAndDrains) {
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    std::atomic<bool> running{true};
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, &aa::wired_receiver::StdoutLog::Clock::now,
+                                      {}, std::chrono::milliseconds{200}};
+    fill_log_queue(log);
+    running.store(false);
+
+    // The lifecycle record times out while the sink is still stalled.
+    EXPECT_EQ(log.submit("{\"event\":\"stopping\"}").value(), ETIMEDOUT);
+    EXPECT_EQ(log.shutdown_drops(), 1U);
+    probe.release();
+
+    // Recovery drains all admitted records, but cannot undo the lost record.
+    EXPECT_EQ(log.finish().value(), ETIMEDOUT);
+    EXPECT_FALSE(log.timed_out());
+    EXPECT_FALSE(probe.timed_out);
+    std::string expected;
+    for (std::size_t i = 0; i < aa::wired_receiver::StdoutLog::entry_capacity; ++i) {
+        expected += "x\n";
+    }
+    EXPECT_EQ(probe.bytes, expected);
+    EXPECT_EQ(log.shutdown_drops(), 1U);
+    EXPECT_EQ(log.finish().value(), ETIMEDOUT);
+    LogWriteProbe::active = nullptr;
+}
+
 TEST(WiredReceiver, StdoutLogShutdownWaitStillDeliversOnAHealthySink) {
     // Given: a full queue behind a slow (not stuck) sink and a 5 s shutdown wait.
     LogWriteProbe probe;

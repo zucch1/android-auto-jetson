@@ -177,7 +177,8 @@ public:
 
     // Close admission and wait for the queue to drain, but only up to `timeout`.
     // On timeout the worker (stuck in the sink) is detached and the call returns
-    // ETIMEDOUT; records still queued are counted as undelivered.
+    // ETIMEDOUT; records still queued are counted as undelivered. Shutdown drops
+    // also return ETIMEDOUT, even if the sink recovers and drains the queue.
     std::error_code finish(std::chrono::milliseconds timeout = default_finish_timeout) {
         State &s = *state_;
         const std::lock_guard finishing(finishing_);
@@ -349,7 +350,10 @@ private:
     static std::error_code shutdown_error() { return {ETIMEDOUT, std::generic_category()}; }
     std::error_code error_snapshot() const {
         const std::lock_guard lock(state_->mutex);
-        return state_->error;
+        // Keep shutdown loss out of the sink-error latch so admitted records
+        // can still drain and a real sink error retains precedence.
+        if (state_->error) { return state_->error; }
+        return state_->shutdown_dropped ? shutdown_error() : std::error_code{};
     }
 
     static void fail(const std::shared_ptr<State> &state, int error) {
