@@ -286,6 +286,56 @@ TEST(DummyDisplayContractRender, DecodeLossTelemetryResetsForEqualAndGreaterSess
     }
 }
 
+TEST(DummyDisplayContractRender, DecodeLossTelemetryFlushesPendingTotalsOnSessionEndAndRestart) {
+    using Clock = DecodeLossTelemetry::Clock;
+    const Clock::time_point t0{std::chrono::seconds{100}};
+    DecodeLossTelemetry loss;
+
+    // Session A emits count 1, then reaches count 2 inside the rate-limit window (suppressed).
+    aa::consumer::DecodeReport report_a;
+    report_a.frames_lost_retention = 1;
+    report_a.awaiting_idr = true;
+    ASSERT_EQ(loss.observe(report_a, t0), (std::vector<std::string>{
+        "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":1,\"awaiting_idr\":true}"}));
+    report_a.frames_lost_retention = 2;
+    report_a.awaiting_idr = false;
+    EXPECT_TRUE(loss.observe(report_a, t0 + std::chrono::milliseconds{100}).empty());
+
+    // Session A ends: pending total 2 is emitted once; beginning Session B emits nothing more.
+    EXPECT_EQ(loss.end_session(report_a, t0 + std::chrono::milliseconds{200}),
+              (std::vector<std::string>{
+                  "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":2,"
+                  "\"awaiting_idr\":false}"}));
+    EXPECT_TRUE(loss.flush(t0 + std::chrono::milliseconds{250}).empty());
+    EXPECT_TRUE(loss.begin_session().empty());
+
+    // Session B starts from zero with no carried-over rate-limit window.
+    aa::consumer::DecodeReport report_b;
+    report_b.frames_lost_retention = 1;
+    EXPECT_EQ(loss.observe(report_b, t0 + std::chrono::milliseconds{300}),
+              (std::vector<std::string>{
+                  "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":1,"
+                  "\"awaiting_idr\":false}"}));
+
+    // Fallback: if begin_session() runs without a prior teardown flush, it still emits pending
+    // totals once before resetting state for the next session.
+    EXPECT_TRUE(loss.begin_session().empty());
+    const Clock::time_point t1{std::chrono::seconds{200}};
+    aa::consumer::DecodeReport report_c;
+    report_c.frames_lost_retention = 1;
+    ASSERT_EQ(loss.observe(report_c, t1).size(), 1U);
+    report_c.frames_lost_retention = 3;
+    EXPECT_TRUE(loss.observe(report_c, t1 + std::chrono::milliseconds{100}).empty());
+    EXPECT_EQ(loss.begin_session(), (std::vector<std::string>{
+        "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":3,\"awaiting_idr\":false}"}));
+    aa::consumer::DecodeReport report_d;
+    report_d.frames_lost_retention = 2;
+    EXPECT_EQ(loss.observe(report_d, t1 + std::chrono::milliseconds{200}),
+              (std::vector<std::string>{
+                  "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":2,"
+                  "\"awaiting_idr\":false}"}));
+}
+
 TEST(DummyDisplayContractRender, TelemetryBlockedSinkDoesNotBlockProducersOrPainting) {
     static_cast<void>(qt_app());
     CountingInputSink input;
@@ -1803,7 +1853,108 @@ private:
     std::optional<DisplayController> controller{};
 };
 
+class ReportSession final : public DecodeSession {
+public:
+    explicit ReportSession(aa::consumer::DecodeReport& report) : report_(report) {}
+
+    [[nodiscard]] aa::core::Result<void> submit(const aa::ipc::VideoAccessUnit&) override {
+        return {};
+    }
+    [[nodiscard]] aa::core::Result<void> end_of_stream() override { return {}; }
+    [[nodiscard]] aa::core::Result<std::size_t> pump(Milliseconds) override {
+        return std::size_t{0};
+    }
+    [[nodiscard]] const aa::consumer::DecodeReport& report() const noexcept override {
+        return report_;
+    }
+    void close() noexcept override {}
+
+private:
+    aa::consumer::DecodeReport& report_;
+};
+
 } // namespace
+
+TEST(DummyDisplayContractRender, DecodeLossSessionFlushesPendingTotalOnStopAndResetsOnRestart) {
+    ScriptedReceiver::Script script{};
+    script["StartProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+    VideoEndpoint video_a;
+    VideoEndpoint video_b;
+    ASSERT_TRUE(video_a.ready());
+    ASSERT_TRUE(video_b.ready());
+
+    DecodeLossTelemetry decode_loss;
+    std::vector<std::string> emitted;
+    auto record = [&](std::string line) { emitted.push_back(std::move(line)); };
+    aa::consumer::DecodeReport report_a;
+    aa::consumer::DecodeReport report_b;
+    int session_index = 0;
+    auto factory = [&](const aa::consumer::DecodeConfig&)
+        -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+        auto& report = (session_index++ == 0) ? report_a : report_b;
+        for (auto& line : decode_loss.begin_session()) {
+            record(std::move(line));
+        }
+        return std::unique_ptr<DecodeSession>(std::make_unique<LossReportingDecodeSession>(
+            std::make_unique<ReportSession>(report), decode_loss, record));
+    };
+
+    RecordingFrameTarget frames;
+    auto controller = DisplayController::attach(
+        DisplayController::Deps{client.value(), factory, frames},
+        test_config("LossStopRestart"));
+    ASSERT_TRUE(controller.has_value());
+
+    // Session A: emits expiry count 1, then reaches count 2 inside the 1s window (suppressed).
+    ASSERT_TRUE(controller.value().start_projection(video_a.socket()).has_value());
+    report_a.frames_lost_retention = 1;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}).has_value());
+    for (auto& line : decode_loss.observe(controller.value().decode_report(),
+                                          DecodeLossTelemetry::Clock::now())) {
+        record(std::move(line));
+    }
+    ASSERT_EQ(emitted.size(), 1U);
+    EXPECT_EQ(
+        emitted[0],
+        "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":1,\"awaiting_idr\":false}");
+
+    report_a.frames_lost_retention = 2;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}).has_value());
+    for (auto& line : decode_loss.observe(controller.value().decode_report(),
+                                          DecodeLossTelemetry::Clock::now())) {
+        record(std::move(line));
+    }
+    ASSERT_EQ(emitted.size(), 1U);
+
+    // Stopping projection tears down Session A and flushes pending count 2 once before reset.
+    ASSERT_TRUE(controller.value().stop_projection().has_value());
+    ASSERT_EQ(emitted.size(), 2U);
+    EXPECT_EQ(
+        emitted[1],
+        "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":2,\"awaiting_idr\":false}");
+
+    // Starting Session B does not re-emit Session A's total and starts from zero.
+    ASSERT_TRUE(controller.value().start_projection(video_b.socket()).has_value());
+    EXPECT_EQ(emitted.size(), 2U);
+    report_b.frames_lost_retention = 1;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}).has_value());
+    for (auto& line : decode_loss.observe(controller.value().decode_report(),
+                                          DecodeLossTelemetry::Clock::now())) {
+        record(std::move(line));
+    }
+    ASSERT_EQ(emitted.size(), 3U);
+    EXPECT_EQ(
+        emitted[2],
+        "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":1,\"awaiting_idr\":false}");
+
+    controller.value().shutdown();
+    EXPECT_EQ(emitted.size(), 3U);
+}
 
 TEST(DummyDisplayStopRecovery, RejectedStopRetainsMediaThenRetryRecovers) {
     // (a) the receiver rejects StopProjection and still reports projecting:

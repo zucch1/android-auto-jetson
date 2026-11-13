@@ -255,17 +255,26 @@ int main(int argc, char** argv) {
         aa::display::TestOnlyAutostart gate{};
         gate.marker = test_autostart ? aa::display::TestOnlyAutostart::kMarker : std::string_view{};
         gate.video_socket = aa::ipc::VideoSocketPath{video_socket};
-        auto factory = [errors, decoder_backend, &decode_loss,
+        auto factory = [errors, decoder_backend, &decode_loss, &telemetry,
                         inner = aa::display::helper_decode_sessions()](
-                           const aa::consumer::DecodeConfig& decode_config) {
+                           const aa::consumer::DecodeConfig& decode_config)
+            -> aa::core::Result<std::unique_ptr<aa::display::DecodeSession>> {
             errors->begin_attempt();
             auto effective_config = decode_config;
             effective_config.backend = decoder_backend;
             auto opened = inner(effective_config);
-            if (opened.has_value()) {
-                decode_loss.begin_session();
+            if (!opened.has_value()) {
+                return opened;
             }
-            return opened;
+            for (auto& line : decode_loss.begin_session()) {
+                static_cast<void>(telemetry.enqueue(std::move(line)));
+            }
+            return std::unique_ptr<aa::display::DecodeSession>(
+                std::make_unique<aa::display::LossReportingDecodeSession>(
+                    std::move(opened.value()), decode_loss,
+                    [&telemetry](std::string line) {
+                        static_cast<void>(telemetry.enqueue(std::move(line)));
+                    }));
         };
         aa::display::DisplayController::Deps deps{client.value(), std::move(factory), widget};
         auto attached = test_autostart
