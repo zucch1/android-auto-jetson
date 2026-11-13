@@ -194,6 +194,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_tests_properties(media_decode_probe_suite PROPERTIES TIMEOUT 120)
 endif()
 
+include(cmake/TlsHardening.cmake)
+
 get_property(_aa_hardened_executables GLOBAL PROPERTY AA_HARDENED_EXECUTABLES)
 if(_aa_hardened_executables)
     list(REMOVE_DUPLICATES _aa_hardened_executables)

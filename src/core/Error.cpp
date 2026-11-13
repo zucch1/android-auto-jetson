@@ -13,6 +13,7 @@ std::string_view Error::message() const noexcept {
     case ErrorCode::transport_unavailable: return "transport unavailable";
     case ErrorCode::transport_closed: return "transport closed";
     case ErrorCode::transport_io: return "transport io failure";
+    case ErrorCode::transport_plaintext_after_tls: return "plaintext frame after TLS handshake";
     case ErrorCode::transport_malformed_frame: return "malformed transport frame";
     case ErrorCode::transport_oversize_frame: return "oversize transport frame";
     case ErrorCode::transport_unauthorized_peer: return "unauthorized transport peer";
@@ -51,6 +52,7 @@ std::string_view Error::message() const noexcept {
     case ErrorCode::trust_store_io: return "trust store io failure";
     case ErrorCode::trust_unknown_phone: return "unknown phone not trusted";
     case ErrorCode::trust_rejected: return "phone rejected by trust store";
+    case ErrorCode::trust_port_only_requires_opt_in: return "port-only approval requires explicit opt-in";
     case ErrorCode::trust_store_not_durable:
         return "Trust store replaced; crash durability unconfirmed.";
 
@@ -76,6 +78,7 @@ std::string_view to_string(ErrorCode code) noexcept {
     case ErrorCode::transport_unavailable: return "transport_unavailable";
     case ErrorCode::transport_closed: return "transport_closed";
     case ErrorCode::transport_io: return "transport_io";
+    case ErrorCode::transport_plaintext_after_tls: return "transport_plaintext_after_tls";
     case ErrorCode::transport_malformed_frame: return "transport_malformed_frame";
     case ErrorCode::transport_oversize_frame: return "transport_oversize_frame";
     case ErrorCode::transport_unauthorized_peer: return "transport_unauthorized_peer";
@@ -114,6 +117,7 @@ std::string_view to_string(ErrorCode code) noexcept {
     case ErrorCode::trust_store_io: return "trust_store_io";
     case ErrorCode::trust_unknown_phone: return "trust_unknown_phone";
     case ErrorCode::trust_rejected: return "trust_rejected";
+    case ErrorCode::trust_port_only_requires_opt_in: return "trust_port_only_requires_opt_in";
     case ErrorCode::trust_store_not_durable: return "trust_store_not_durable";
 
     case ErrorCode::config_invalid: return "config_invalid";

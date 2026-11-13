@@ -27,7 +27,7 @@ void Policy::configure(SSL* ssl) const {
         SSL_set_verify(ssl, SSL_VERIFY_NONE, nullptr);
         return;
     case Mode::verified_peer_test_only:
-        SSL_set_verify(ssl, SSL_VERIFY_PEER, nullptr);
+        SSL_set_verify(ssl, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
         return;
     }
     throw Error(Failure::configuration);

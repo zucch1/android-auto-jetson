@@ -11,17 +11,9 @@
 // TRUST, NOT CRYPTOGRAPHIC PROOF. USB descriptor strings and serials can be
 // spoofed by anyone with physical access to the port; an approved wired record
 // therefore authorizes "the approved identifiers presented on the qualified
-// port", not "this specific handset". SERIAL-LESS WIRED PHONES ARE REFUSED
-// (audit M12): a wired key with neither USB nor AOA serial cannot tell one
-// phone from another of the same model on the same port, so approve() and
-// approve_once() reject it with trust_rejected and persist nothing. The check
-// is on the canonical key, so the same "w1:" key held as an opaque record is
-// refused too, and a malformed "w1:" key fails closed. A legacy serial-less
-// record already on disk is kept for audit/revocation and labelled
-// "port-only:" in diagnostics, but lookup() never returns approved for it.
-// Wireless records bind the BlueZ bond (stronger, still bond-not-human
-// identity). Unknown phones always fail closed: lookup() returns
-// Decision::unknown and allows_session() is false.
+// port", not "this specific handset". Wireless records bind the BlueZ bond
+// (stronger, still bond-not-human identity). Unknown phones always fail closed:
+// lookup() returns Decision::unknown and allows_session() is false.
 //
 // Persistence: `$XDG_STATE_HOME/android-auto-receiver/approved-phones.json`
 // (XDG fallback `~/.local/state/...`), created 0600 and re-enforced to 0600 on
@@ -56,6 +48,7 @@ namespace aa::trust {
 struct ApprovedPhone final {
     core::PhoneId phone_id{};
     TransportIdentity identity{};
+    IdentityStrength strength{IdentityStrength::opaque};
 
     [[nodiscard]] friend bool operator==(const ApprovedPhone&, const ApprovedPhone&) noexcept =
         default;
@@ -63,7 +56,7 @@ struct ApprovedPhone final {
 
 // Store document bounds (fail closed beyond these).
 inline constexpr std::size_t kMaxApprovedPhones = 256;
-inline constexpr std::uint64_t kCurrentSchemaVersion = 2;
+inline constexpr std::uint64_t kCurrentSchemaVersion = 3;
 
 // ONE coherent phone-id range shared by the loader and the allocators: record
 // ids live in [1, kMaxPhoneId]; next_phone_id is accepted in
@@ -88,18 +81,22 @@ public:
     // fails lookup() closed (Decision::unknown).
     [[nodiscard]] core::Result<void> load();
 
-    // TrustStore seam (session admission by opaque key).
+    // TrustStore seam (session admission by opaque key). approve_once rejects
+    // all opaque w1: keys; wired approvals must use the structured APIs.
     [[nodiscard]] Decision lookup(const PhoneIdentity& identity) const override;
     core::Result<void> approve_once(const PhoneIdentity& identity) override;
     core::Result<void> forget(const PhoneIdentity& identity) override;
 
     // Structured approve-once (task 27 pairing flow): persist the strongest
-    // available transport identity and allocate a stable PhoneId. A serial-less
-    // (port-only) or malformed wired key is refused with trust_rejected and
-    // nothing is persisted; approve_once() applies the same refusal by key.
-    // Approve-once semantics: re-approving an already-approved key returns the
-    // existing id and never adds a second record.
+    // available transport identity and allocate a stable PhoneId. Approve-once
+    // semantics: re-approving an already-approved key returns the existing id
+    // and never adds a second record. Serial-less wired identities are rejected
+    // with trust_port_only_requires_opt_in; use approve_port_only explicitly.
     [[nodiscard]] core::Result<core::PhoneId> approve(const TransportIdentity& identity);
+
+    // Explicit weaker grant: any device presenting the same descriptors on this
+    // port will match. Normal pairing never calls this API.
+    [[nodiscard]] core::Result<core::PhoneId> approve_port_only(const WiredIdentity& identity);
 
     // ForgetPhone path: revoke by phone id, persist the removal.
     [[nodiscard]] core::Result<void> forget_phone(core::PhoneId phone);
@@ -108,17 +105,27 @@ public:
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
     [[nodiscard]] bool usable() const noexcept { return usable_; }
 
+    // Number of unconsented port-only records dropped by the last successful
+    // load's v1/v2 migration, including malformed reserved w1: keys dropped
+    // fail-closed; zero after an empty/v3 load or a failed load.
+    [[nodiscard]] std::size_t dropped_port_only_count() const noexcept {
+        return dropped_port_only_count_;
+    }
+
     // Diagnostics-safe summary (task-19): every identity appears only as a
     // per-process pseudonym — no raw serials, Bluetooth MACs or port contexts.
     [[nodiscard]] std::string redacted_summary() const;
 
 private:
+    [[nodiscard]] core::Result<core::PhoneId> approve_impl(const TransportIdentity& identity,
+                                                        bool allow_port_only);
     [[nodiscard]] core::Result<void> persist();
     [[nodiscard]] std::optional<std::size_t> index_of_key(const std::string& key) const;
 
     std::filesystem::path path_;
     std::vector<ApprovedPhone> phones_{};
     std::uint64_t next_phone_id_{1};
+    std::size_t dropped_port_only_count_{0};
     bool loaded_{false};
     bool usable_{false};
 };

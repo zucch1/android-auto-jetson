@@ -34,6 +34,7 @@ enum class ErrorCode : std::uint16_t {
     transport_queue_full = 106,
     // A complete frame was discarded without desynchronizing the transport.
     transport_message_dropped = 107,
+    transport_plaintext_after_tls = 108,
 
     // protocol
     protocol_version_mismatch = 200,
@@ -78,6 +79,7 @@ enum class ErrorCode : std::uint16_t {
     // and only crash durability of the new directory entry is unconfirmed.
     // Append-only band: never renumber or repurpose.
     trust_store_not_durable = 703,
+    trust_port_only_requires_opt_in = 704,
 
     // config
     config_invalid = 800,
