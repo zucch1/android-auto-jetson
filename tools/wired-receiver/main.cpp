@@ -1687,6 +1687,11 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
 
+    if (store.dropped_port_only_count() != 0) {
+        log_line(std::string{"{\"event\":\"trust_store_migrated_dropped_port_only\",\"count\":"} +
+                 std::to_string(store.dropped_port_only_count()) + "}");
+    }
+
     StdoutDiagnostics sink;
     aa::diagnostics::Diagnostics diagnostics{sink};
     aa::session::SteadyClock clock{};
@@ -1794,7 +1799,14 @@ int receiver_main(int argc, char **argv) {
     std::optional<aa::app::WiredLink> link{std::move(first_link.value())};
     session.attach_transport(link->transport.get());
     if (!bind_link_cipher(link->phone)) {
-        log_line("{\"event\":\"err\",\"detail\":\"tls_cipher\"}");
+        // The factory reports why out of band (credential class, cipher
+        // configuration); without it every cause looked like a bare null cipher.
+        std::string line = "{\"event\":\"err\",\"detail\":\"tls_cipher\"";
+        if (const auto reason = aa::transport::last_handshake_cipher_failure(); !reason.empty()) {
+            line += ",\"reason\":\"" + reason + "\"";
+        }
+        line += "}";
+        log_line(line);
         return 3;
     }
     if (!session.apply(aa::session::Event::start_discovery).has_value() ||
