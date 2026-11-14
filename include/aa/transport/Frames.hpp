@@ -98,6 +98,7 @@ public:
     feed(std::span<const std::byte> bytes);
 
     [[nodiscard]] bool closed() const noexcept { return closed_; }
+    [[nodiscard]] bool has_buffered_bytes() const noexcept { return !buffer_.empty(); }
 
     void close() noexcept {
         closed_ = true;
