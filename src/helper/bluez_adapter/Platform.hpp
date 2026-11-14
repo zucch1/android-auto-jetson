@@ -83,7 +83,32 @@ struct BluezBackend::Impl {
     std::vector<PeerIdentity> awaiting;
     // Managed bonds whose demotion has started but is not yet durably complete: never admitted.
     std::vector<PeerIdentity> refused;
-    void retire_unaccepted();
+    // BlueZ removal attempts are budgeted per invocation (docs/enrolment-ordering.md, #118): at
+    // most kRemovalAttemptBudget attempts, a further one started only while the invocation has
+    // spent less than kRemovalTimeBudget, so a slow or failing BlueZ never holds the helper's
+    // single owner thread past the receiver's 500 ms reconciliation or 1 s confirm/reconnect
+    // deadlines. A failed attempt backs its identity off (1 s doubling to 30 s, from the
+    // attempt's completion); a round-robin cursor keeps one identity from starving the rest. What
+    // is not attempted stays durably owed in `pending` for a later tick.
+    static constexpr std::size_t kRemovalAttemptBudget = 2;
+    static constexpr std::chrono::milliseconds kRemovalTimeBudget{100};
+    struct RemovalRetry { PeerIdentity peer; std::uint32_t failures{}; Clock::time_point next{}; };
+    std::vector<RemovalRetry> removal_retries;
+    std::size_t removal_cursor{};
+    struct RemovalBudget {
+        Clock::time_point started{Clock::now()};
+        std::size_t attempts{};
+        bool exhausted{};
+    };
+    // Which removals an invocation may attempt: `tick` (the periodic tick) every identity whose
+    // backoff expired; `first` (reconciliation) only identities with no failed attempt in this
+    // helper run, so a reply never waits on retries; `own` only the identity passed in.
+    enum class Retire { tick, first, own };
+    enum class Removal { gone, failed, deferred };
+    // One budgeted attempt: disconnects, then RemoveDevice for each BlueZ object of the identity.
+    Removal remove_bond(const std::vector<Device>&, const PeerIdentity&, RemovalBudget&, Retire);
+    void retire_unaccepted(Retire = Retire::tick, const PeerIdentity* own = nullptr,
+                           const std::vector<Device>* known = nullptr);
     // Moves the current window's acknowledged bond to `awaiting` before the window state is cleared.
     void park();
     // Admission authority for services, reconnect and the handoff: reconciled, durably on
@@ -127,7 +152,8 @@ struct BluezBackend::Impl {
     void close_admission();
     void reject_comparison();
     void reset();
-    void pump();
+    // tick: also the budgeted removal retries. Request paths pump without them.
+    void pump(bool tick = false);
     bool exact(const Observation&, bool require_bond);
     bool permitted(const char*, bool pairing);
     std::optional<Observation> consume(std::uint64_t);

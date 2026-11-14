@@ -141,9 +141,12 @@ void BluezBackend::Impl::close_admission() {
             }
         }
     }
+    // Only the closing window's own bond is removed here (budgeted): a confirm, reconnect or
+    // ForgetPhone that closes a window never waits on other identities' removal retries.
+    const std::optional<PeerIdentity> own = allowed ? std::optional{allowed->device.identity} : std::nullopt;
     allowed.reset();
     quiet_pending = !quiet();
-    retire_unaccepted();
+    if (own) retire_unaccepted(Retire::own, &*own);
 }
 void BluezBackend::Impl::close_window() { close_connection(); close_admission(); }
 void BluezBackend::Impl::reset() {
@@ -155,9 +158,9 @@ void BluezBackend::Impl::reset() {
     observations.clear(); adapters.clear();
     registered = false; agent_registered = false;
 }
-void BluezBackend::Impl::pump() {
+void BluezBackend::Impl::pump(bool tick) {
     drain_events();
-    retire_unaccepted();
+    if (tick) retire_unaccepted(Retire::tick);
     if (comparison && now() >= comparison->deadline) close_admission();
     if (now() >= next_check) {
         const bool alive = current_owner();
@@ -244,7 +247,7 @@ core::Result<void> BluezBackend::authorize_handoff(std::uint64_t handle, bool al
     }
     return {};
 }
-void BluezBackend::tick() { impl_->pump(); }
+void BluezBackend::tick() { impl_->pump(true); }
 void BluezBackend::discard(std::uint64_t handle) { impl_->observations.erase(handle); }
 void BluezBackend::cleanup() noexcept { impl_->observations.clear(); impl_->close_window(); }
 void BluezBackend::retire_lease() noexcept { impl_->close_window(); }

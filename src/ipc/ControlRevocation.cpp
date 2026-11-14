@@ -65,7 +65,7 @@ void ControlService::reconcile_bonds() {
     reconcile_failing_ = false;
     const auto unadmitted = result.value() & 0xFFFFFFFFU;
     if (unadmitted && unadmitted != reconcile_unadmitted_)
-        events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "bond_reconcile_unadmitted", unadmitted});
+        events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "bond_reconcile_unadmitted_enrol_again", unadmitted});
     reconcile_unadmitted_ = unadmitted;
     // The helper's state now matches the store durably: a bond leg whose identity the store no
     // longer approves is complete (the helper demoted it and owns its removal), so such a record can

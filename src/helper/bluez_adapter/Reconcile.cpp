@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Bond state as a reconciled cache of the receiver's trust store (docs/enrolment-ordering.md).
 #include "Platform.hpp"
+#include <aa/diagnostics/Diagnostics.hpp>
 #include <algorithm>
+#include <iostream>
 
 namespace aa::helper {
 namespace {
@@ -17,17 +19,80 @@ bool address_valid(const std::string& address) {
     return true;
 }
 }
-// Retries RemoveDevice for every journal entry on the helper owner thread. The list is persisted,
-// so this also completes removals left pending by a restarted helper. Nothing is removed before
-// this helper run's first reconciliation (any entry may be an approval whose commit never landed),
-// an acknowledged bond awaiting the receiver's answer is kept, and a bonded device the receiver
-// approves is never removed (#74). A historical managed or revoked entry never suppresses removal.
-void BluezBackend::Impl::retire_unaccepted() {
-    if (!reconciled || pending.peers().empty() || !current_owner()) return;
-    std::vector<Device> devices;
-    if (!inventory(devices)) return;
+BluezBackend::Impl::Removal BluezBackend::Impl::remove_bond(const std::vector<Device>& devices,
+                                                             const PeerIdentity& peer, RemovalBudget& budget,
+                                                             Retire mode) {
+    const auto retry = std::find_if(removal_retries.begin(), removal_retries.end(),
+                                    [&](const RemovalRetry& item) { return item.peer == peer; });
+    const bool present = std::any_of(devices.begin(), devices.end(),
+                                     [&](const Device& device) { return device.identity == peer; });
+    if (!present) {
+        if (retry != removal_retries.end()) removal_retries.erase(retry);
+        return Removal::gone;
+    }
+    if (retry != removal_retries.end() &&
+        (mode == Retire::first || (mode == Retire::tick && now() < retry->next)))
+        return Removal::deferred;
+    if (budget.exhausted || budget.attempts >= kRemovalAttemptBudget ||
+        (budget.attempts > 0 && Clock::now() - budget.started >= kRemovalTimeBudget)) {
+        budget.exhausted = true;
+        return Removal::deferred;
+    }
+    ++budget.attempts;
+    for (const auto& device : devices) {
+        if (device.identity != peer) continue;
+        disconnect(device);
+        auto* reply = call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
+                           g_variant_new("(o)", device.path.c_str()));
+        if (reply) { g_variant_unref(reply); continue; }
+        // Backed off from the failed attempt's completion: 1 s, doubling to 30 s.
+        auto item = std::find_if(removal_retries.begin(), removal_retries.end(),
+                                 [&](const RemovalRetry& entry) { return entry.peer == peer; });
+        if (item == removal_retries.end()) {
+            if (removal_retries.size() >= 512)
+                std::erase_if(removal_retries, [&](const RemovalRetry& entry) { return !pending.contains(entry.peer); });
+            item = removal_retries.insert(removal_retries.end(), RemovalRetry{peer});
+        }
+        if (item->failures < 16) ++item->failures;
+        const auto delay = std::chrono::seconds{1U << std::min<std::uint32_t>(item->failures - 1, 5)};
+        item->next = now() + std::min<Clock::duration>(delay, std::chrono::seconds{30});
+        return Removal::failed;
+    }
+    std::erase_if(removal_retries, [&](const RemovalRetry& entry) { return entry.peer == peer; });
+    return Removal::gone;
+}
+// Retries RemoveDevice for the journal's entries on the helper owner thread, within one
+// invocation's budget (remove_bond). The list is persisted, so this also completes removals left
+// pending by a restarted helper. Nothing is removed before this helper run's first reconciliation
+// (any entry may be an approval whose commit never landed), an acknowledged bond awaiting the
+// receiver's answer is kept, and a bonded device the receiver approves is never removed (#74). A
+// historical managed or revoked entry never suppresses removal.
+void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own, const std::vector<Device>* known) {
+    if (!reconciled || pending.peers().empty()) return;
+    if (own && !pending.contains(*own)) return;
+    if (!known && mode == Retire::tick) {
+        // Nothing due (every entry parked, live or backing off): no BlueZ call at all this tick.
+        const auto due = std::any_of(pending.peers().begin(), pending.peers().end(), [&](const PeerIdentity& peer) {
+            if ((allowed && allowed->device.identity == peer) || listed(awaiting, peer)) return false;
+            const auto retry = std::find_if(removal_retries.begin(), removal_retries.end(),
+                                            [&](const RemovalRetry& item) { return item.peer == peer; });
+            return retry == removal_retries.end() || now() >= retry->next;
+        });
+        if (!due) return;
+    }
+    std::vector<Device> fetched;
+    if (!known) {
+        if (!current_owner() || !inventory(fetched)) return;
+        known = &fetched;
+    }
+    const auto& devices = *known;
+    RemovalBudget budget;
     const auto peers = pending.peers();  // forget() rewrites the list
-    for (const auto& peer : peers) {
+    const std::size_t first = removal_cursor % peers.size();
+    std::size_t cursor = first;
+    for (std::size_t step = 0; step < peers.size(); ++step) {
+        const auto& peer = peers[(first + step) % peers.size()];
+        if (own && peer != *own) continue;
         if (allowed && allowed->device.identity == peer) continue;
         if (listed(awaiting, peer)) continue;
         const bool bonded = std::any_of(devices.begin(), devices.end(),
@@ -39,18 +104,12 @@ void BluezBackend::Impl::retire_unaccepted() {
             if (revoked.contains(peer)) (void)pending.forget(peer);
             continue;
         }
-        const auto done = std::find(removal_done.begin(), removal_done.end(), peer);
-        if (done == removal_done.end()) {
-            bool removed = true;
-            for (const auto& device : devices) {
-                if (device.identity != peer) continue;
-                disconnect(device);
-                auto* reply = call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
-                                   g_variant_new("(o)", device.path.c_str()));
-                if (!reply) { removed = false; break; }
-                g_variant_unref(reply);
-            }
-            if (!removed) continue;
+        if (std::find(removal_done.begin(), removal_done.end(), peer) == removal_done.end()) {
+            const auto removal = remove_bond(devices, peer, budget, own ? Retire::own : mode);
+            if (budget.exhausted) { cursor = (first + step) % peers.size(); break; }
+            if (removal == Removal::failed) cursor = (first + step + 1) % peers.size();
+            if (removal != Removal::gone) continue;
+            cursor = (first + step + 1) % peers.size();
             // A record that cannot be rewritten must not make a later device with the same
             // address (legitimately paired again) be removed on every tick.
             removal_done.push_back(peer);
@@ -66,6 +125,7 @@ void BluezBackend::Impl::retire_unaccepted() {
             cleaned.push_back(peer);
         }
     }
+    if (!own) removal_cursor = cursor;
 }
 void BluezBackend::Impl::park() {
     if (!acknowledged || !allowed) return;
@@ -181,39 +241,40 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
     }
     // The removal obligation is derived, not only journalled: a bond whose journal entry was lost
     // (a failed write, a crash, an older helper's demotion order) is still removed. Only identities
-    // the helper's own history names count; BlueZ cannot tell the owner's other bonds apart.
+    // the helper's own history names count; BlueZ cannot tell the owner's other bonds apart. The
+    // adapter is Android-Auto-exclusive (docs/enrolment-ordering.md): a forgotten phone paired again
+    // outside Android Auto is removed again, with a warning naming its redacted address.
     for (const auto& device : devices) {
         const auto& peer = device.identity;
         if (!device.bonded || !s.revoked.contains(peer) || listed(approved, peer) || live == peer ||
             listed(unwanted, peer)) continue;
+        std::cerr << "system-helper: warning bond_removed_revoked_identity "
+                  << diagnostics::redact_identifier(peer.address)
+                  << ": this phone was forgotten in Android Auto but is bonded again (paired outside "
+                     "Android Auto); the Bluetooth adapter is Android-Auto-exclusive, so its bond is "
+                     "removed. Enrol the phone again in Android Auto to use it.\n";
         durable = s.pending.remember(peer) && durable;
         unwanted.push_back(peer);
     }
     s.reconciled = durable;
-    if (durable) s.retire_unaccepted();
-    // What cleanup could not remove (or a failed write left unrecorded) is disconnected and removed
-    // now. A bond the helper names that the receiver does not approve, that BlueZ still holds and
-    // whose removal is not durably owed fails the reconciliation, so the receiver retries. One whose
-    // removal is owed is the helper's (retried on every tick), so no receiver record pins capacity.
-    bool clean = true;
-    if (!unwanted.empty()) {
-        devices.clear();
-        if (!s.current_owner() || !s.inventory(devices)) {
-            clean = false;
-        } else {
-            for (const auto& device : devices) {
-                if (!listed(unwanted, device.identity) || (!device.bonded && !s.pending.contains(device.identity)))
-                    continue;
-                s.disconnect(device);
-                auto* reply = s.call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
-                                     g_variant_new("(o)", device.path.c_str()));
-                if (reply) g_variant_unref(reply);
-                else if (device.bonded && !s.pending.contains(device.identity)) clean = false;
-            }
-            if (durable) s.retire_unaccepted();  // drops the entries of what was removed just now
+    // One removal scan, within one invocation's budget, and never a retry of an earlier failure
+    // (those are the tick's, Impl::retire_unaccepted): the reply waits on no other identity's
+    // backoff. With every state change durable, each unwanted bond's removal is durably owed in
+    // `pending`, so what this scan does not remove is the helper's to retry and no receiver record
+    // pins capacity (finding 3).
+    if (durable) {
+        s.retire_unaccepted(Impl::Retire::first, nullptr, &devices);
+    } else {
+        // A failed write keeps the stricter state: an unwanted bond is still disconnected and
+        // removed (best effort, same budget) whether or not its obligation was recorded, and the
+        // reconciliation fails so the receiver retries.
+        Impl::RemovalBudget budget;
+        for (const auto& peer : unwanted) {
+            (void)s.remove_bond(devices, peer, budget, Impl::Retire::first);
+            if (budget.exhausted) break;
         }
+        return Error{ErrorCode::helper_unavailable};
     }
-    if (!durable || !clean) return Error{ErrorCode::helper_unavailable};
     return unadmitted | (live ? std::uint64_t{1} << 32 : 0U);
 }
 }

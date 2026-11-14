@@ -189,6 +189,7 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
         g_variant_unref(reply);
         break;
     }
+    std::erase_if(impl_->removal_retries, [&](const Impl::RemovalRetry& item) { return item.peer == identity; });
     // An incomplete demotion keeps the bond leg pending so the receiver retries it.
     if (!demoted && !impl_->demote(identity)) return Error{ErrorCode::helper_unavailable};
     // The device is gone: drop the removal obligation now, so the identity can enrol again at once
