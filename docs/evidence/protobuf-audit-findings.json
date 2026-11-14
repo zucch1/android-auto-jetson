@@ -664,12 +664,12 @@
     "citations": [
      {
       "contains": "case aap_protobuf::shared::STATUS_COMMAND_NOT_SUPPORTED:",
-      "lines": "219",
+      "lines": "227",
       "path": "src/protocol/aasdk_adapter/ControlAdapter.cpp"
      },
      {
       "contains": "return ChannelOpenResponse{ChannelOpenStatus::unsupported};",
-      "lines": "220",
+      "lines": "228",
       "path": "src/protocol/aasdk_adapter/ControlAdapter.cpp"
      }
     ],
@@ -954,7 +954,7 @@
      "evidence": [
       {
        "contains": "only the first six bytes are read and trailing bytes are tolerated.",
-       "lines": "249",
+       "lines": "257",
        "path": "src/protocol/aasdk_adapter/ControlAdapter.cpp"
       }
      ],
@@ -968,7 +968,7 @@
     "citations": [
      {
       "contains": "only the first six bytes are read and trailing bytes are tolerated.",
-      "lines": "249",
+      "lines": "257",
       "path": "src/protocol/aasdk_adapter/ControlAdapter.cpp"
      }
     ],

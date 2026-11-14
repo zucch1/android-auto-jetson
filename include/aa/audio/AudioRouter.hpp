@@ -28,7 +28,10 @@ namespace aa::audio {
 // PipeWire-capable element is usable the router degrades typed and never
 // silently misroutes. pipewiresink routes to PipeWire natively; pulsesink
 // routes via the PulseAudio-compatible layer (pipewire-pulse on a PipeWire
-// host) and is the recorded fallback.
+// host). pulsesink is the default and only supported real-time route: on the
+// target (PipeWire 1.0.5, Ubuntu noble) pipewiresink has no rate control and
+// degrades after 1.5-2.3 h, and no fixed PipeWire is packaged for noble.
+// Explicit pipewire requests are refused outright at startup (#80).
 enum class SinkBackend : std::uint8_t { automatic, pipewire, pulse };
 
 [[nodiscard]] std::string_view to_string(SinkBackend backend) noexcept;
@@ -60,8 +63,9 @@ struct SinkSelection final {
 [[nodiscard]] SinkReport probe_sinks();
 
 // Pure selection policy over a probe report. Explicit requests never
-// downgrade silently: an unsatisfiable request is unusable with a recorded
-// "disabled:" cause.
+// downgrade silently: pipewire is refused outright naming pulsesink as the
+// supported route, and automatic selects only pulsesink without falling back
+// to pipewiresink.
 [[nodiscard]] SinkSelection select_sink_backend(const SinkReport& report,
                                                 SinkBackend request);
 
@@ -202,10 +206,9 @@ struct RouterConfig final {
     // only by the wired receiver's pcm_router_config().
     LivePcmDriftPolicy live_pcm_drift{};
     std::function<void(const SinkWriteProgress&)> on_sink_write_progress{};
-    // render_step() interval bound. Each sink write costs PipeWire about one
-    // graph cycle (1024 frames) while catching up after a stall; 20 ms pieces
-    // (3 per 42.67 ms media parent) never recovered. 50 ms renders one write per
-    // observed media parent.
+    // render_step() interval bound. Keep the qualified 50 ms batching value.
+    // Production uses pulsesink; native pipewiresink is refused on PipeWire
+    // 1.0.5 / Ubuntu noble due to missing rate control and long-run degradation (#80).
     core::Nanoseconds render_quantum{core::Nanoseconds{50'000'000}};
 };
 
