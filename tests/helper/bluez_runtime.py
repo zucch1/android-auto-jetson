@@ -202,7 +202,9 @@ def bond_retry_flow(surface: Surface) -> None:
     command(surface.mock, "allow-remove")
     rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (phone,)))
     assert command(surface.receiver, "pending-revocations") == "1"
-    assert len(surface.state()["removed"]) == 1
+    # The failed removal backs off (1 s doubling to 30 s, #118); the owed removal completes on a
+    # later helper tick once BlueZ allows it.
+    wait(lambda: len(surface.state()["removed"]) == 1, 35)
     print("PASS bond_retry_progress_with_explicitly_unavailable_ap", flush=True)
 
 
