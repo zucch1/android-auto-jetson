@@ -133,7 +133,7 @@ def authorization_flow(surface: Surface) -> None:
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     surface.confirm(request)
     assert surface.state()["properties"]["Pairable"]
-    assert command(surface.mock, "RequestAuthorization") == "allowed"
+    assert command(surface.mock, "RequestAuthorization") == "rejected", "Just Works must never be accepted"
     assert command(surface.mock, "RequestAuthorization wrong") == "rejected"
     assert command(surface.mock, "RequestAuthorization rogue") == "rejected"
     affirmative(surface, request)
@@ -230,8 +230,9 @@ def loss_flow(surface: Surface) -> None:
     assert command(surface.mock, "NewConnection") == "allowed"
     surface.receiver.kill()
     surface.receiver.wait(timeout=3)
-    wait(lambda: not surface.state()["properties"]["Pairable"], 5)
-    assert command(surface.mock, "fd-eof") == "closed"
+    # Pairing already closed when the comparison was accepted: wait for the receiver-loss cleanup itself.
+    wait(lambda: command(surface.mock, "fd-eof") == "closed", 5)
+    assert not surface.state()["properties"]["Pairable"]
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     assert len(surface.state()["removed"]) == 0
     print("PASS quiet_receiver_loss_preserves_approved_bond", flush=True)

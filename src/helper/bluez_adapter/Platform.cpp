@@ -121,6 +121,7 @@ void BluezBackend::Impl::close_admission() {
     reject_comparison();
     window = {};
     pairing_enabled = false;
+    comparison_accepted = false;
     if (allowed) {
         // BlueZ turns CancelPairing without an in-flight Pair() into MGMT Unpair Device, which
         // drops the kernel link key of a just-completed bond. Only cancel pairing confirmed as
@@ -143,7 +144,8 @@ void BluezBackend::Impl::reset() {
     reject_comparison();
     ++owner_epoch;
     close_connection();
-    allowed.reset(); window = {}; pairing_enabled = false; observations.clear(); adapters.clear();
+    allowed.reset(); window = {}; pairing_enabled = false; comparison_accepted = false;
+    observations.clear(); adapters.clear();
     registered = false; agent_registered = false;
 }
 void BluezBackend::Impl::pump() {

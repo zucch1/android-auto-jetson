@@ -75,9 +75,9 @@ void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gch
         const char* uuid{}; g_variant_get_child(args, 1, "&s", &uuid);
         const bool service = std::string_view{uuid} == kAaUuid || std::string_view{uuid} == kHfpUuid;
         if (!service || !self.permitted(device, false)) { reject(); return; }
-    } else if (method == "RequestAuthorization") {
-        if (!self.permitted(device, true)) { reject(); return; }
     } else {
+        // RequestAuthorization (Just Works, no number shown), RequestPinCode and every other
+        // method are not the numeric comparison the owner is shown: never accepted.
         reject(); return;
     }
     g_dbus_method_invocation_return_value(invocation, nullptr);

@@ -12,6 +12,17 @@ routine to call `PhoneDirectory::pairing_confirmed`. The non-comparison flow
 continues to use that same persistence routine after helper confirmation (M10).
 No deadline or background callback supplies acceptance.
 
+During the whole comparison flow the helper's BlueZ agent accepts exactly one
+pairing method: the `RequestConfirmation` whose number the owner was shown.
+`RequestAuthorization` (Just Works, no number), `RequestPinCode`,
+`RequestPasskey` and every other agent method are always refused. The owner's
+acceptance is consumed once, by the reply to that `RequestConfirmation`; pairing
+(`Pairable`, `Discoverable`) closes immediately after that reply. If the genuine
+pairing then fails, no other device (for example one spoofing the phone's
+address) can pair into the window, and a bond that forms without the consumed
+acceptance is never recorded as managed. The acceptance flag is cleared whenever
+admission closes.
+
 Rejection, cancellation, expiry, consumer loss, receiver shutdown, helper failure
 and store reload discard pending identity snapshots, close the gate and emit a
 reason diagnostic. Reload attempts advance the store epoch, including failed

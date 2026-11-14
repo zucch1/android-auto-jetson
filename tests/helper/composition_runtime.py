@@ -184,9 +184,10 @@ def live_peer_after_wired_revoke(surface: ComposedSurface) -> int:
     assert command(surface.receiver, "pending-revocations") == "0"
     assert not surface.nm_state()["active"] and not surface.nm_state()["table"]
     assert surface.state()["removed"] == []
-    assert surface.state()["properties"]["Pairable"] and surface.state()["properties"]["Discoverable"]
+    # Pairing closed when the comparison was accepted; the accepted peer's services stay authorized.
+    assert not surface.state()["properties"]["Pairable"] and not surface.state()["properties"]["Discoverable"]
     assert command(surface.mock, "fd-eof") == "open"
-    assert command(surface.mock, "RequestAuthorization") == "allowed"
+    assert command(surface.mock, "AuthorizeService") == "allowed"
     return request
 
 
@@ -246,8 +247,7 @@ def pending_bind_survives_other_phone_forget(surface: ComposedSurface) -> None:
     # Then: B's exact binding still opens a usable pairing window.
     surface.confirm(request_b)
     assert surface.phone() not in (0, phone_a)
-    assert surface.state()["properties"]["Pairable"]
-    assert command(surface.mock, "RequestAuthorization") == "allowed"
+    assert command(surface.mock, "AuthorizeService") == "allowed"
     print("PASS composed_pending_bind_survives_other_phone_forget", flush=True)
 
 
@@ -265,7 +265,7 @@ def pending_ap_survives_other_phone_forget(surface: ComposedSurface) -> None:
     assert command(surface.receiver, "acquire") == "0"
     wait(lambda: surface.nm_state()["active"])
     assert surface.nm_state()["valid"] and surface.nm_state()["starts"] == 1
-    assert command(surface.mock, "RequestAuthorization") == "allowed"
+    assert command(surface.mock, "AuthorizeService") == "allowed"
     assert surface.phone() not in (0, phone_a)
     print("PASS composed_pending_ap_survives_other_phone_forget", flush=True)
 
@@ -291,8 +291,8 @@ def pending_bind_survives_lease_owner_forget(surface: ComposedSurface) -> None:
     print("A retired; confirming B's original pending observation", flush=True)
     surface.confirm(request_b, wrong=True)
     assert surface.phone() not in (0, phone_a)
-    assert command(surface.mock, "RequestAuthorization") == "rejected"
-    assert command(surface.mock, "RequestAuthorization wrong") == "allowed"
+    assert command(surface.mock, "AuthorizeService") == "rejected"
+    assert command(surface.mock, "AuthorizeService wrong") == "allowed"
     command(surface.mock, "paired")
     assert command(surface.mock, "AuthorizeService wrong") == "allowed"
     assert command(surface.mock, "NewConnection wrong") == "allowed"

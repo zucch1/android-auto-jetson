@@ -223,6 +223,13 @@ class MockBluez(ProfileSockets):
                     "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper,
                     "cancel_unpaired": self.cancel_unpaired,
                     "register_attempts": self.register_attempts})
+            case "just-works":
+                # A pairing that shows no number: BlueZ asks the agent to authorize it without
+                # a confirmation. The bond forms only if the agent allows it.
+                result = self.callback("RequestAuthorization")
+                if result == "allowed":
+                    self.paired = self.bonded = True
+                return result
             case "multiple": self.multiple = True
             case "single": self.multiple = False
             case "observe-other": self.observed_device = OTHER

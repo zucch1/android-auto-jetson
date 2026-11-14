@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import sys
 import tempfile
+import time
 from pathlib import Path
 from gi.repository import GLib
 from bluez_runtime import Surface, command, control, wait
@@ -54,6 +55,30 @@ def run(build: Path, directory: Path, failure: str) -> None:
         print(f"PASS pending_enrolment_{failure}_retires_unaccepted_bond", flush=True)
 
 
+def just_works_after_failed_pairing(build: Path, directory: Path) -> None:
+    """The comparison was accepted, the genuine pairing failed, a spoofing device then pairs without a number."""
+    with contextlib.ExitStack() as stack:
+        surface = Surface(stack, build, directory)
+        request = surface.request()
+        surface.confirm(request)
+        command(surface.mock, "comparison-start")
+        challenge = present(surface, request)
+        control(surface.consumer, "RespondPairingComparison",
+                GLib.Variant("(ttb)", (request, int(challenge["challenge_id"]), True)))
+        wait(lambda: command(surface.mock, "comparison-result") == "allowed")
+        # The genuine pairing never completes. Pairing is closed straight after the reply, and a
+        # pairing that shows no number is refused whether or not the window is still open.
+        assert command(surface.mock, "just-works") == "rejected", "a pairing without a number was accepted"
+        assert command(surface.mock, "RequestAuthorization") == "rejected"
+        assert command(surface.mock, "RequestConfirmation") == "rejected"
+        wait(lambda: not surface.state()["properties"]["Pairable"])
+        time.sleep(0.6)
+        assert surface.phone() == 0, "a bond without a consumed comparison was recorded"
+        assert not (directory / "managed-bonds").exists(), "a bond without a consumed comparison became managed"
+        assert not (directory / "store").exists()
+        print("PASS just_works_after_failed_pairing_is_refused_and_records_nothing", flush=True)
+
+
 if __name__ == "__main__":
     build = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="aa-enrolment-", dir=build) as temporary:
@@ -61,3 +86,6 @@ if __name__ == "__main__":
             directory = Path(temporary) / failure
             directory.mkdir(mode=0o700)
             run(build, directory, failure)
+        directory = Path(temporary) / "just-works"
+        directory.mkdir(mode=0o700)
+        just_works_after_failed_pairing(build, directory)

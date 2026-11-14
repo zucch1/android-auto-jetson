@@ -60,11 +60,17 @@ core::Result<void> BluezBackend::respond_comparison(ComparisonResponse response)
         impl_->now() >= captured.deadline || impl_->now() >= impl_->window) {
         impl_->close_admission(); return Error{ErrorCode::helper_rejected};
     }
+    // The acceptance is consumed here, exactly once, by the reply to the accepted
+    // RequestConfirmation (comparison_used already forbids a second challenge, and
+    // no other pairing method is ever accepted). Pairing closes right after the
+    // reply: a genuine pairing that then fails cannot be followed by another
+    // device, e.g. one spoofing the phone's address, pairing into this window.
     impl_->comparison_accepted = true;
     auto* invocation = impl_->comparison->invocation;
     impl_->comparison.reset();
     g_dbus_method_invocation_return_value(invocation, nullptr);
     g_object_unref(invocation);
+    impl_->quiet_pending = !impl_->quiet();
     return {};
 }
 }
