@@ -222,3 +222,5 @@ if(NOT CMAKE_CROSSCOMPILING)
         "${CMAKE_SOURCE_DIR}/tests/build/hardening.py")
     set_tests_properties(build_hardening_checker PROPERTIES TIMEOUT 120)
 endif()
+
+include(cmake/HostTestScheduling.cmake)
