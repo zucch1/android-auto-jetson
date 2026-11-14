@@ -107,7 +107,10 @@ requires callers to have finished. Wired clients without this dependency do not
 gain helper authority: committed forget now reports required AP work as pending,
 not implicit cleanup success. The actual `ControlService::confirm_phone_pairing`
 path invokes it only after registered-consumer UID/name authorization and
-`PairingGate::confirm`, before persisting approval. A helper failure never
+`PairingGate::confirm`, and policy validation of the live bound request/deadline,
+before persisting approval. Policy rechecks the same deadline after the helper
+RPC; expiry retires helper authority through the tracked cancellation path and
+persists nothing. A helper failure never
 persists approval. `PairingOpened` follows committed approval, including error
 703 (rename committed, directory durability uncertain); that outcome emits
 `pairing_approval_not_durable` and keeps helper confirmation consistent with
@@ -332,3 +335,15 @@ Like the TLS qualification targets, the helper is explicitly unavailable in
 that configuration; native host helper tests remain mandatory. The cross-smoke
 configuration regression verifies that no target OpenSSL lookup is attempted,
 not that the helper has been cross-built or qualified on ARM64.
+
+Wireless trust-store upgrade recovery quarantines formerly accepted printable
+non-MAC bond addresses and all records in groups differing only by bond-address
+case. None of those records remains trusted or is merged. Before rewriting the
+remaining approvals through the durable store writer, load saves the original
+bytes next to the store as `<store>.legacy-backup`, owner-only, through the
+verified descriptor path walk and exclusive creation. An existing private,
+regular backup is retained unchanged; a symlink or unsafe backup aborts recovery.
+A diagnostic reports the quarantined counts and reasons without identifiers.
+Quarantined phones require explicit pairing again. Other corruption still fails
+closed for the whole store; stop the receiver and preserve the original before
+manual recovery. The backup is for inspection, not automatic trust restoration.

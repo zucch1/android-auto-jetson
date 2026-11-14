@@ -19,10 +19,13 @@
 // missing), record ids in [1, kMaxPhoneId], one phone id per record and ONE
 // record per canonical identity key (identity_key()) — a duplicate identity
 // could otherwise survive a forget and silently keep reconnect eligibility.
-// Wireless addresses are validated and compared case-insensitively; malformed
-// addresses or two records differing only by address case reject the whole file.
-// To recover, stop the receiver, back up and remove approved-phones.json, restart
-// with an empty store, and explicitly pair each phone again.
+// Wireless addresses are compared case-insensitively. Formerly valid printable
+// non-MAC wireless records and groups differing only by bond-address case are
+// quarantined, never merged or trusted. Load first saves the original bytes in
+// an exclusive owner-only .legacy-backup beside the store (never overwriting
+// an existing safe backup), then durably rewrites the remaining approvals.
+// All other corruption still rejects the whole file. Quarantined phones need
+// explicit pairing again; diagnostics contain counts and reasons, not addresses.
 // Versions 2 and 3 additionally require next_phone_id strictly greater than every
 // record id and at most kMaxPhoneId + 1 (the shared coherent id range; see
 // Store.hpp).
@@ -44,6 +47,8 @@ struct ParsedStore final {
     std::vector<ApprovedPhone> phones{};
     std::uint64_t next_phone_id{1};
     std::size_t dropped_port_only_count{0};
+    std::size_t invalid_wireless_count{0};
+    std::size_t colliding_wireless_count{0};
 };
 
 // Parse + migrate one store document. Empty text is the empty store. Every

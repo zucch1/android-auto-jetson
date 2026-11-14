@@ -23,10 +23,11 @@ public:
     std::optional<helper::PeerIdentity> prepared;
     std::optional<std::size_t> retirement_limit;
     std::vector<std::vector<helper::RetirementSource>> retirement_batches;
-    std::function<void()> on_forget{};
+    std::function<void()> on_forget{}, on_confirm{};
     explicit Bridge(trust::ApprovedPhoneStore& approvals) : store(approvals) {}
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override {
         ++confirmations;
+        if (on_confirm) on_confirm();
         approved_at_call = !store.phones().empty();
         return result;
     }
@@ -40,7 +41,7 @@ public:
         if (on_forget) on_forget();
         ++forgets;
         snapshots.push_back(snapshot);
-        if (expect_empty_store) EXPECT_TRUE(store.phones().empty());
+        if (expect_empty_store) { EXPECT_TRUE(store.phones().empty()); }
         helper::RevocationAttempt report;
         report.ap = progress.ap == helper::RevocationLeg::complete ? core::Result<void>{} : (++ap_attempts, ap);
         if ((snapshot.phone || progress.bond) && helper::revocation_peer(snapshot))

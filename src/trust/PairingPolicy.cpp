@@ -66,9 +66,8 @@ bool PairingPolicy::has_pending(core::PairingRequestId request) const {
 std::vector<core::PairingRequestId> PairingPolicy::reap_expired() {
     expired_peers_.clear();
     std::vector<core::PairingRequestId> expired;
-    const core::Nanoseconds now = clock_.now();
     for (std::size_t index = 0; index < pending_.size();) {
-        if (now.count > pending_[index].deadline.count) {
+        if (this->expired(pending_[index])) {
             if (const auto* wireless = std::get_if<WirelessIdentity>(&pending_[index].identity)) {
                 expired_peers_.push_back({pending_[index].request,
                     helper::PeerIdentity{wireless->bond_address, wireless->adapter}});
@@ -179,18 +178,25 @@ core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId reque
     return {};
 }
 
-core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingRequestId request) {
-    committed_pairing_.reset();
-    const std::size_t index = find(request);
-    if (index >= pending_.size()) {
-        return Error{ErrorCode::trust_unknown_phone};
-    }
-    const core::Nanoseconds now = clock_.now();
-    if (now.count > pending_[index].deadline.count) {
-        drop_at(index);  // rejected and never persisted; the caller owns this
-                         // id's gate rollback and PairingClosed
+bool PairingPolicy::expired(const Pending& pending) const {
+    return clock_.now().count > pending.deadline.count;
+}
+
+core::Result<void> PairingPolicy::validate_pairing(core::PairingRequestId request) {
+    const auto index = find(request);
+    if (index >= pending_.size()) return Error{ErrorCode::trust_unknown_phone};
+    if (this->expired(pending_[index])) {
+        drop_at(index); // Caller releases the gate and emits PairingClosed.
         return Error{ErrorCode::session_pairing_timeout};
     }
+    return {};
+}
+
+core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingRequestId request) {
+    committed_pairing_.reset();
+    const auto live = validate_pairing(request);
+    if (!live) return live.error();
+    const auto index = find(request);
     // The identity bound at request time is what gets approved; the candidate
     // slot may have changed since and is never consulted here (no TOCTOU;
     // SNAPSHOT-ONLY PAIRING CONTRACT in PairingPolicy.hpp).
