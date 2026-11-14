@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,16 +32,37 @@ class NmState(TypedDict):
     quarantined: bool
 
 
+def describe_failed_start(child: subprocess.Popen[bytes], first_line: str) -> str:
+    """What the NM double printed instead of "ready", plus its exit status and stderr (for CI logs)."""
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        child.wait(timeout=1)
+    status = child.poll()
+    stderr = ""
+    if status is not None and child.stderr is not None:
+        stderr = os.read(child.stderr.fileno(), 8192).decode(errors="replace")
+    return f"NM double did not report ready: stdout line {first_line!r}, exit status {status}, stderr {stderr!r}"
+
+
 class ComposedSurface(Surface):
     def platform_options(self, stack: contextlib.ExitStack, build: Path, directory: Path) -> list[str]:
         (directory / "state").mkdir(mode=0o700)
         (directory / "ap.conf").write_text("v1 wlan-test US jurisdiction-confirmed 5277\n")
         (directory / "ap.conf").chmod(0o600)
-        socket = str(directory / "cmd")
+        # AF_UNIX paths are limited to 107 bytes (sun_path). A fixture directory under a deep CI
+        # checkout (e.g. /home/runner/work/<repo>/<repo>/build/host-dev/<run>/<case>/cmd) exceeds
+        # that, so the NM double's bind() fails and it never reports ready. Bind in a short private
+        # directory (mkdtemp is 0700, owned by this user) instead of inside the fixture directory.
+        socket_directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="aa-cmd-")))
+        socket = str(socket_directory / "cmd")
+        assert len(socket.encode()) < 100, f"command socket path too long for sun_path: {socket}"
         self.nm = stack.enter_context(process([str(build / "aa_nm_ap_test"), "--wire-double", self.address, socket], self.env))
         # The double reports ready once it owns the NetworkManager name (event-driven); the bound
         # only guards against a hung child on a loaded, parallel host.
-        assert line(self.nm, 30) == "ready"
+        try:
+            ready = line(self.nm, 30)
+        except AssertionError as error:
+            raise AssertionError(describe_failed_start(self.nm, f"<{error}>")) from error
+        assert ready == "ready", describe_failed_start(self.nm, ready)
         return ["--combined", socket]
 
     def confirm(self, request: int, wrong: bool = False) -> None:
