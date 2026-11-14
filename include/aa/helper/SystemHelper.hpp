@@ -45,7 +45,11 @@ public:
     // Backends without observations can use full cleanup.
     virtual void retire_lease() noexcept { cleanup(); }
     virtual void tick() {}
+    // Verification only: accepted comparison and an exact bonded snapshot. Records nothing.
     virtual core::Result<bool> bond_confirmed() { return Error{ErrorCode::helper_rejected}; }
+    // Records the verified bond as helper-managed. The receiver calls it only after every
+    // receiver-side check passed; nothing is recorded before it.
+    virtual core::Result<void> acknowledge_bond() { return Error{ErrorCode::helper_rejected}; }
     virtual core::Result<PairingComparison> comparison() { return Error{ErrorCode::helper_rejected}; }
     virtual core::Result<void> respond_comparison(ComparisonResponse) { return Error{ErrorCode::helper_rejected}; }
     virtual core::Result<void> revoke(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
@@ -99,6 +103,7 @@ public:
     core::Result<ObservedPeer> observe(const std::string& sender);
     core::Result<void> bind(const std::string& sender, Source source, std::uint64_t handle);
     core::Result<bool> bond_confirmed(const std::string&, Source);
+    core::Result<void> acknowledge_bond(const std::string&, Source);
     core::Result<PairingComparison> comparison(const std::string&, Source);
     core::Result<void> respond_comparison(const std::string&, Source, ComparisonResponse);
     core::Result<State> reconnect_peer(const std::string& sender, std::uint64_t handle);

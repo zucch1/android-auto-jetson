@@ -23,10 +23,11 @@ with tempfile.TemporaryDirectory(prefix="bond-restart-", dir=build) as directory
             wait(presented)
             assert rpc(f"respond {source} {challenge[0]}")[0] == 0
             assert command(surface.mock, "paired") == "ok"
+            managed = (Path(directory) / "managed-bonds").exists()
             error, bonded = rpc(f"bond {source}")
-            assert error == expected
-            if expected == 0:
-                assert bonded == 1
+            assert (error, bonded) == (0, 1), "verification of an accepted, bonded peer"
+            assert (Path(directory) / "managed-bonds").exists() == managed, "verification recorded a managed bond"
+            assert rpc(f"ack {source}")[0] == expected
         peer = "02:00:00:00:00:01 02:00:00:00:00:AA"
         assert command(surface.mock, "paired") == "ok"
         assert rpc("revoke " + peer)[0] == 1001, "unmanaged bond accepted"
@@ -93,6 +94,8 @@ with tempfile.TemporaryDirectory(prefix="bond-restart-", dir=build) as directory
             assert len(surface.state()["removed"]) == 2
         finally:
             directory_path.chmod(0o700)
+        # The failed disk is back: the stale pending-removal record is cleaned on a helper tick.
+        wait(lambda: "02:00:00:00:00:02" not in (directory_path / "pending-removals").read_text())
         assert rpc("revoke 02:00:00:00:00:02 02:00:00:00:00:AA")[0] == 1001
         assert len(surface.state()["removed"]) == 2
         print("PASS restart revokes managed bond, refuses unmanaged bond, and write failures refuse new bond acknowledgements")

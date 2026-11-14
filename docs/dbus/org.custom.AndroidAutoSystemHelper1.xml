@@ -78,12 +78,19 @@
       <arg name="error" type="u" direction="out"/>
       <arg name="state" type="t" direction="out"/>
     </method>
-    <!-- True only after explicit comparison acceptance and an exact bonded snapshot. -->
+    <!-- Verification only: true after explicit comparison acceptance and an exact bonded snapshot. Records nothing. -->
     <method name="PairingBondConfirmedV1">
       <arg name="generation" type="t" direction="in"/>
       <arg name="request" type="t" direction="in"/>
       <arg name="error" type="u" direction="out"/>
       <arg name="bonded" type="t" direction="out"/>
+    </method>
+    <!-- Records the verified bond as helper-managed; called only after every receiver-side check passed. -->
+    <method name="PairingBondAcknowledgedV1">
+      <arg name="generation" type="t" direction="in"/>
+      <arg name="request" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
     </method>
     <method name="GetPairingComparisonV1">
       <arg name="consumer_generation" type="t" direction="in"/>

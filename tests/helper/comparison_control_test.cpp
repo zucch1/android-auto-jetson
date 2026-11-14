@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "confirmation_fixture.hpp"
 #include <aa/app/WirelessConfirmation.hpp>
+#include "../trust/syscall_faults.hpp"
 
 namespace {
 struct ComparisonClock final {
@@ -264,6 +265,102 @@ TEST_F(ComparisonControl, TimeoutBeforeComparisonOpensRetiresRequest) {
     clock.now += std::chrono::seconds{61}; (void)control.state();
     expect_empty(); EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U);
     EXPECT_FALSE(control.confirm_phone_pairing(caller, request.value()));
+}
+
+// P2a: the helper records the managed bond only when the receiver asks it to acknowledge, after
+// every receiver-side check; a failure afterwards is retired through the tracked revocation.
+class AcknowledgementOrder : public ComparisonControl {
+protected:
+    ComparisonClock clock;
+    core::PairingRequestId request;
+    void SetUp() override {
+        ComparisonControl::SetUp();
+        request = enroll();
+        ASSERT_TRUE(control.pairing_comparison(caller, request));
+    }
+    void accept() { (void)control.respond_pairing_comparison(caller, request, {79, true}); }
+    void expect_retired_once() {
+        EXPECT_EQ(bridge.forgets, 1);
+        ASSERT_EQ(bridge.snapshots.size(), 1U);
+        EXPECT_FALSE(bridge.snapshots[0].phone);
+        const auto peer = helper::revocation_peer(bridge.snapshots[0]);
+        ASSERT_TRUE(peer); EXPECT_EQ(*peer, *bridge.prepared);
+        ASSERT_EQ(bridge.retirement_batches.size(), 1U);
+        ASSERT_EQ(bridge.retirement_batches[0].size(), 1U);
+        EXPECT_EQ(bridge.retirement_batches[0][0].request, request);
+        EXPECT_EQ(control.pending_revocations(), 0U);
+        EXPECT_TRUE(store.phones().empty());
+    }
+};
+TEST_F(AcknowledgementOrder, DeadlineBeforeAcknowledgementRecordsNothing) {
+    bridge.on_bond_confirmed = [&] { clock.now += std::chrono::seconds{61}; };
+    accept();
+    EXPECT_EQ(bridge.acknowledgements, 0);
+    EXPECT_EQ(bridge.forgets, 0); EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U); EXPECT_TRUE(store.phones().empty());
+}
+TEST_F(AcknowledgementOrder, ConsumerLossBeforeAcknowledgementRecordsNothing) {
+    bridge.on_bond_confirmed = [&] { credentials.remove_owner(name); };
+    accept();
+    EXPECT_EQ(bridge.acknowledgements, 0);
+    EXPECT_EQ(bridge.forgets, 0); EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_EQ(bridge.teardowns, 1); EXPECT_TRUE(store.phones().empty());
+}
+TEST_F(AcknowledgementOrder, StoreReloadBeforeAcknowledgementRecordsNothing) {
+    bridge.on_bond_confirmed = [&] { ASSERT_TRUE(store.load()); };
+    accept();
+    EXPECT_EQ(bridge.acknowledgements, 0);
+    EXPECT_EQ(bridge.forgets, 0); EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U); EXPECT_TRUE(store.phones().empty());
+}
+TEST_F(AcknowledgementOrder, FailedAcknowledgementRetiresPossiblyRecordedBond) {
+    bridge.acknowledgement = Error{ErrorCode::timeout};
+    accept();
+    EXPECT_EQ(bridge.acknowledgements, 1);
+    expect_retired_once();
+}
+TEST_F(AcknowledgementOrder, AcknowledgementHappensBeforeAnyStoreWrite) {
+    accept();
+    EXPECT_EQ(bridge.acknowledgements, 1); EXPECT_FALSE(bridge.approved_at_acknowledgement);
+    EXPECT_EQ(store.phones().size(), 1U); EXPECT_EQ(bridge.forgets, 0);
+}
+TEST_F(AcknowledgementOrder, DeadlineAfterAcknowledgementIsRetiredThroughRevocation) {
+    bridge.on_acknowledge = [&] { clock.now += std::chrono::seconds{61}; };
+    accept();
+    EXPECT_EQ(bridge.acknowledgements, 1);
+    expect_retired_once();
+}
+TEST_F(AcknowledgementOrder, ConsumerLossAfterAcknowledgementIsRetiredThroughRevocation) {
+    bridge.on_acknowledge = [&] { credentials.remove_owner(name); };
+    accept();
+    EXPECT_EQ(bridge.acknowledgements, 1);
+    expect_retired_once();
+}
+TEST_F(AcknowledgementOrder, StoreWriteFailureAfterAcknowledgementLeadsToTrackedRetirement) {
+    // Given: the bond is acknowledged, then the trust-store write fails; the bond removal also fails.
+    bridge.bond = Error{ErrorCode::helper_unavailable};
+    {
+        trust::test::faults::ScopedFault failing{trust::test::faults::Fault::temp_fsync};
+        accept();
+    }
+    // Then: nothing is stored, and the failed removal stays tracked in the existing revocation record.
+    EXPECT_EQ(bridge.acknowledgements, 1);
+    EXPECT_TRUE(store.phones().empty()); EXPECT_EQ(phones.pending_count(), 0U);
+    EXPECT_EQ(control.pending_revocations(), 1U);
+    EXPECT_EQ(bridge.bond_attempts, 1);
+    // And the identity cannot be enrolled again while its bond is still not retired.
+    const auto blocked = control.request_add_phone(caller);
+    ASSERT_FALSE(blocked); EXPECT_EQ(blocked.error().code(), ErrorCode::trust_rejected);
+    // When: the removal succeeds on a later owner reconciliation (paced, not on every call).
+    bridge.bond = {};
+    (void)control.state();
+    EXPECT_EQ(bridge.bond_attempts, 1) << "retry must be paced";
+    clock.now += std::chrono::seconds{3};
+    (void)control.state();
+    // Then: the bond is retired, the record is cleared and the phone can enrol again.
+    EXPECT_EQ(bridge.bond_attempts, 2);
+    EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_TRUE(control.request_add_phone(caller));
 }
 
 }

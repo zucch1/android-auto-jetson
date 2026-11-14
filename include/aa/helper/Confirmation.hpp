@@ -54,7 +54,13 @@ class Confirmation {
 public:
     virtual ~Confirmation() = default;
     virtual bool requires_comparison() const { return false; }
+    // Verification only; records nothing in the helper.
     virtual core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) {
+        return Error{ErrorCode::helper_rejected};
+    }
+    // The helper records the verified bond as managed. Called only after every receiver-side
+    // check passed; a later failure must retire the bond through tracked revocation.
+    virtual core::Result<void> bond_acknowledged(core::ConsumerId, core::PairingRequestId) {
         return Error{ErrorCode::helper_rejected};
     }
     virtual core::Result<PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) {

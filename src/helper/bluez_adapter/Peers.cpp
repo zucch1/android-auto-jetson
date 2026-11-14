@@ -135,8 +135,10 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     return State::active;
 }
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
+    // A bond still on the pending-removal list was admitted by an enrolment window and may or may
+    // not have been acknowledged (a lost acknowledgement reply): the receiver retires it either way.
     if (!address_valid(identity.address) || !address_valid(identity.adapter) ||
-        !impl_->managed.contains(identity)) return Error{ErrorCode::helper_rejected};
+        !(impl_->managed.contains(identity) || impl_->pending.contains(identity))) return Error{ErrorCode::helper_rejected};
     if (!impl_->current_owner()) return Error{ErrorCode::helper_unavailable};
     if ((impl_->allowed && impl_->allowed->device.identity == identity) ||
         (impl_->connected && impl_->connected->device.identity == identity)) impl_->close_window();

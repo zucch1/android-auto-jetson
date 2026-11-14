@@ -44,6 +44,8 @@ struct BluezBackend::Impl {
     // removal. Persisted (same file rules as `managed`) so a helper restart cannot lose a
     // removal that is pending retry. It is not revocation authority.
     bluez_adapter::ManagedPeers pending;
+    // Removed from BlueZ already; only the record's rewrite is still failing. Never removed again.
+    std::vector<PeerIdentity> removal_done;
     std::optional<Observation> allowed;
     Clock::time_point window{};
     bool pairing_enabled{};

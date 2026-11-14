@@ -8,6 +8,8 @@ core::Result<core::PairingRequestId> ControlService::request_add_phone(const Bus
     if (!active) return active.error();
     const auto admitted = admit(caller, active.value());
     if (!admitted) return admitted.error();
+    // Room for the one tracked retirement an enrolment can leave behind.
+    if (revocations_.size() >= 256) return Error{ErrorCode::ipc_queue_full};
     // Reap before allocation so expired requests release their admission slots.
     for (const auto expired : phones_.reap_expired()) {
         if (confirmation_ != nullptr) confirmation_->cancel(active.value().consumer, expired);
@@ -85,9 +87,14 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
 
 core::Result<void> ControlService::persist_pairing(const Registered& active, core::PairingRequestId request) {
     const bool comparison = open_pairing_ && open_pairing_->request == request && open_pairing_->awaiting_acceptance;
+    const auto compared_peer = comparison ? open_pairing_->peer : std::nullopt;
     const auto approved = phones_.pairing_confirmed(request);
     if (!approved) {
-        if (confirmation_ != nullptr) confirmation_->cancel(active.consumer, request);
+        if (confirmation_ != nullptr) {
+            // A comparison bond was acknowledged before this write: retire it with tracking.
+            if (comparison) retire_acknowledged_pairing(active.consumer, request, compared_peer);
+            else confirmation_->cancel(active.consumer, request);
+        }
         (void)gate_.cancel({active.consumer, active.name}, request);
         events_.emit(PairingClosed{request});
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});

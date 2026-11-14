@@ -7,6 +7,11 @@ core::Result<bool> SystemHelper::bond_confirmed(const std::string& sender, Sourc
         return Error{ErrorCode::helper_rejected};
     return backend_.bond_confirmed();
 }
+core::Result<void> SystemHelper::acknowledge_bond(const std::string& sender, Source source) {
+    if (!authenticate(sender) || !source.generation || !source.confirmation || !lease_ || *lease_ != source)
+        return Error{ErrorCode::helper_rejected};
+    return backend_.acknowledge_bond();
+}
 core::Result<PairingComparison> SystemHelper::comparison(const std::string& sender, Source source) {
     if (!authenticate(sender) || !source.generation || !source.confirmation || !lease_ || *lease_ != source)
         return Error{ErrorCode::helper_rejected};

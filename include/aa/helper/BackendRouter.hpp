@@ -27,6 +27,7 @@ public:
     void retire_lease() noexcept override { ap_.retire_lease(); bluetooth_.retire_lease(); }
     void tick() override { ap_.tick(); bluetooth_.tick(); }
     core::Result<bool> bond_confirmed() override { return bluetooth_.bond_confirmed(); }
+    core::Result<void> acknowledge_bond() override { return bluetooth_.acknowledge_bond(); }
     core::Result<PairingComparison> comparison() override { return bluetooth_.comparison(); }
     core::Result<void> respond_comparison(ComparisonResponse response) override { return bluetooth_.respond_comparison(response); }
     core::Result<void> revoke(std::uint64_t phone) override { return ap_.revoke(phone); }

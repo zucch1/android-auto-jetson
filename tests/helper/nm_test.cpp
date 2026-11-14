@@ -386,6 +386,7 @@ protected:
             const auto bonded = client->bond_confirmed(core::ConsumerId{generation}, core::PairingRequestId{generation});
             return bonded && bonded.value();
         }));
+        ASSERT_TRUE(client->bond_acknowledged(core::ConsumerId{generation}, core::PairingRequestId{generation}));
         core::CancellationSource cancel;
         const auto result = client->call({Operation::ensure_access_point, 36}, core::Milliseconds{1000}, cancel.get_token());
         ASSERT_TRUE(result);

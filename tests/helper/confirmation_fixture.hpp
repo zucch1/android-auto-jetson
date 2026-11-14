@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <unistd.h>
 
 namespace aa::helper::test {
@@ -25,7 +26,19 @@ public:
     bool bonded{true};
     bool fail_after_response{};
     bool approved_at_bond{};
+    // Hooks run inside the helper RPC, where owner, clock and store changes may land.
+    std::function<void()> on_bond_confirmed, on_acknowledge;
+    int acknowledgements{};
+    core::Result<void> acknowledgement{};
+    bool approved_at_acknowledgement{};
+    core::Result<void> bond_acknowledged(core::ConsumerId, core::PairingRequestId) override {
+        ++acknowledgements;
+        approved_at_acknowledgement = !store.phones().empty();
+        if (on_acknowledge) on_acknowledge();
+        return acknowledgement;
+    }
     core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) override {
+        if (on_bond_confirmed) on_bond_confirmed();
         approved_at_bond = !store.phones().empty();
         if (fail_after_response && responses) return Error{ErrorCode::helper_unavailable};
         if (!result) return result.error();

@@ -2,15 +2,39 @@
 #include <aa/ipc/ControlService.hpp>
 
 namespace aa::ipc {
-void ControlService::close_enrolment(std::string_view reason) {
+// bond_recorded: the helper may already manage the bond (acknowledgement attempted), so the
+// closure retires it through the tracked revocation instead of the plain source cancellation.
+void ControlService::close_enrolment(std::string_view reason, bool bond_recorded) {
     if (!open_pairing_ || !registered_) return;
     const auto request = open_pairing_->request;
     phones_.pairing_cancelled(request);
-    if (confirmation_) confirmation_->cancel(registered_->consumer, request);
+    if (confirmation_) {
+        if (bond_recorded) retire_acknowledged_pairing(registered_->consumer, request, open_pairing_->peer);
+        else confirmation_->cancel(registered_->consumer, request);
+    }
     (void)gate_.cancel({registered_->consumer, registered_->name}, request);
     open_pairing_.reset();
     events_.emit(PairingClosed{request});
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, reason, request.value});
+}
+// Deadline, owner and store/snapshot reconciliation. Before the helper is asked to acknowledge
+// the bond a failure only closes the enrolment (the helper has recorded nothing); afterwards the
+// bond is the helper's managed bond and a failure retires it through tracked revocation.
+bool ControlService::reconcile_enrolment(core::PairingRequestId request, bool bond_recorded) {
+    if (!open_pairing_ || !registered_ || open_pairing_->request != request) return false;
+    if (std::chrono::steady_clock::now() >= open_pairing_->deadline) {
+        close_enrolment("pairing_expired", bond_recorded); return false;
+    }
+    const auto owner = credentials_.name_owner(registered_->name);
+    if (!owner || owner.value() != registered_->connection) {
+        if (bond_recorded && confirmation_)
+            retire_acknowledged_pairing(registered_->consumer, request, open_pairing_->peer);
+        teardown("consumer_owner_lost", DiagnosticSeverity::warning); return false;
+    }
+    if (phones_.pairing_wireless_identity(request) != open_pairing_->peer) {
+        close_enrolment("pairing_snapshot_invalidated", bond_recorded); return false;
+    }
+    return true;
 }
 void ControlService::advance_enrolment() {
     if (!open_pairing_ || !open_pairing_->awaiting_acceptance || !registered_) return;
@@ -21,17 +45,13 @@ void ControlService::advance_enrolment() {
     const auto bonded = confirmation_->bond_confirmed(registered_->consumer, request);
     if (!bonded) { close_enrolment("pairing_helper_failed"); return; }
     if (!bonded.value() || !open_pairing_->accepted) return;
-    if (std::chrono::steady_clock::now() >= open_pairing_->deadline) {
-        close_enrolment("pairing_expired"); return;
-    }
-    // The helper RPC may dispatch owner/store changes. Reconcile before the only write.
-    const auto owner = credentials_.name_owner(registered_->name);
-    if (!owner || owner.value() != registered_->connection) {
-        teardown("consumer_owner_lost", DiagnosticSeverity::warning); return;
-    }
-    if (phones_.pairing_wireless_identity(request) != open_pairing_->peer) {
-        close_enrolment("pairing_snapshot_invalidated"); return;
-    }
+    // Verification recorded nothing in the helper: run every receiver-side check first.
+    if (!reconcile_enrolment(request, false)) return;
+    const auto acknowledged = confirmation_->bond_acknowledged(registered_->consumer, request);
+    // A failed or lost acknowledgement may still have recorded the bond: retire it with tracking.
+    if (!acknowledged) { close_enrolment("pairing_helper_failed", true); return; }
+    // The acknowledgement RPC may dispatch owner/store changes. Reconcile before the only write.
+    if (!reconcile_enrolment(request, true)) return;
     const auto approved = persist_pairing(*registered_, request);
     if (!approved) open_pairing_.reset();
 }

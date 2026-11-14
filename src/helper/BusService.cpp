@@ -60,6 +60,12 @@ struct BusService::Impl {
                     result = bonded ? core::Result<std::uint64_t>{bonded.value() ? 1U : 0U} :
                                       core::Result<std::uint64_t>{bonded.error()};
                 }
+            } else if (message.member == "PairingBondAcknowledgedV1" && message.signature == "tt") {
+                const auto generation = body.read_u64(); const auto request = body.read_u64();
+                if (generation && request && body.done()) {
+                    const auto recorded = helper.acknowledge_bond(message.sender, {generation.value(), request.value()});
+                    result = recorded ? core::Result<std::uint64_t>{0} : core::Result<std::uint64_t>{recorded.error()};
+                }
             } else if ((comparison_poll || message.member == "RespondPairingComparisonV1") &&
                 message.signature == (comparison_poll ? "tt" : "tttu")) {
                 const auto generation = body.read_u64(); const auto request = body.read_u64();

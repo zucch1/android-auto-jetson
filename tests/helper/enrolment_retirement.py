@@ -70,6 +70,34 @@ def run(build: Path, directory: Path, failure: str) -> None:
         print(f"PASS pending_enrolment_{failure}_retires_unaccepted_bond", flush=True)
 
 
+def store_write_failure_after_acknowledgement(build: Path, directory: Path, removal_fails: bool) -> None:
+    """The bond is acknowledged (helper-managed), then the trust-store write fails."""
+    with contextlib.ExitStack() as stack:
+        surface = Surface(stack, build, directory)
+        request = surface.request()
+        surface.confirm(request)
+        command(surface.mock, "comparison-start")
+        challenge = present(surface, request)
+        control(surface.consumer, "RespondPairingComparison",
+                GLib.Variant("(ttb)", (request, int(challenge["challenge_id"]), True)))
+        wait(lambda: command(surface.mock, "comparison-result") == "allowed")
+        assert command(surface.receiver, "fault-temp") == "0"
+        if removal_fails:
+            command(surface.mock, "fail-remove")
+        command(surface.mock, "paired")
+        wait(lambda: (directory / "managed-bonds").exists())
+        if removal_fails:
+            # The failed removal is tracked in the receiver's revocation record, not forgotten.
+            wait(lambda: command(surface.receiver, "pending-revocations") == "1")
+            assert not surface.state()["removed"]
+            command(surface.mock, "allow-remove")
+        wait(lambda: len(surface.state()["removed"]) == 1, 8)
+        wait(lambda: command(surface.receiver, "pending-revocations") == "0", 8)
+        assert surface.phone() == 0 and not (directory / "store").exists(), "a failed write stored trust"
+        assert command(surface.receiver, "fault-clear") == "0"
+        print(f"PASS store_write_failure_after_acknowledgement_retires_bond_{'with_retry' if removal_fails else 'at_once'}", flush=True)
+
+
 def just_works_after_failed_pairing(build: Path, directory: Path) -> None:
     """The comparison was accepted, the genuine pairing failed, a spoofing device then pairs without a number."""
     with contextlib.ExitStack() as stack:
@@ -104,3 +132,7 @@ if __name__ == "__main__":
         directory = Path(temporary) / "just-works"
         directory.mkdir(mode=0o700)
         just_works_after_failed_pairing(build, directory)
+        for removal_fails in (False, True):
+            directory = Path(temporary) / f"store-write-{removal_fails}"
+            directory.mkdir(mode=0o700)
+            store_write_failure_after_acknowledgement(build, directory, removal_fails)

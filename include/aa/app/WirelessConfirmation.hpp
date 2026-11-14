@@ -20,6 +20,11 @@ public:
         if (deferred_) return Error{ErrorCode::helper_rejected};
         return target_.bond_confirmed(generation, request);
     }
+    core::Result<void> bond_acknowledged(core::ConsumerId generation, core::PairingRequestId request) override {
+        flush();
+        if (deferred_) return Error{ErrorCode::helper_rejected};
+        return target_.bond_acknowledged(generation, request);
+    }
     core::Result<void> confirmed(core::ConsumerId generation, core::PairingRequestId source) override {
         flush();
         if (deferred_) return Error{ErrorCode::helper_rejected};

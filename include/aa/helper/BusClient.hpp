@@ -34,6 +34,7 @@ public:
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override;
     bool requires_comparison() const override { return true; }
     core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) override;
+    core::Result<void> bond_acknowledged(core::ConsumerId, core::PairingRequestId) override;
     core::Result<PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) override;
     core::Result<void> respond_comparison(core::ConsumerId, core::PairingRequestId, ComparisonResponse) override;
     void cancel(core::ConsumerId, core::PairingRequestId) override;

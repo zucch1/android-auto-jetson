@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Platform.hpp"
+#include <algorithm>
 
 namespace aa::helper {
 // Retry failed RemoveDevice calls on the helper owner thread. The list is persisted, so this also
@@ -11,8 +12,8 @@ void BluezBackend::Impl::retire_unaccepted() {
     const auto peers = pending.peers();  // forget() rewrites the list
     for (const auto& peer : peers) {
         if (allowed && allowed->device.identity == peer) continue;
-        // A bond acknowledged before a restart interrupted the hand-over is managed: never remove it.
-        if (!managed.contains(peer)) {
+        const auto done = std::find(removal_done.begin(), removal_done.end(), peer);
+        if (done == removal_done.end()) {
             bool removed = true;
             for (const auto& device : devices) {
                 if (device.identity != peer) continue;
@@ -22,8 +23,11 @@ void BluezBackend::Impl::retire_unaccepted() {
                 g_variant_unref(reply);
             }
             if (!removed) continue;
+            // A record that cannot be rewritten must not make a later device with the same
+            // address (legitimately paired again) be removed on every tick.
+            removal_done.push_back(peer);
         }
-        (void)pending.forget(peer);
+        if (pending.forget(peer)) std::erase(removal_done, peer);
     }
 }
 core::Result<bool> BluezBackend::bond_confirmed() {
@@ -33,9 +37,18 @@ core::Result<bool> BluezBackend::bond_confirmed() {
     if (!impl_->exact(captured, false) || !impl_->allowed) return Error{ErrorCode::helper_rejected};
     if (!impl_->comparison_accepted || !impl_->exact(captured, true)) return false;
     if (!impl_->allowed || impl_->now() >= impl_->window) return Error{ErrorCode::helper_rejected};
-    if (!impl_->managed.remember(captured.device.identity)) return Error{ErrorCode::helper_rejected};
-    (void)impl_->pending.forget(captured.device.identity);
     return true;
+}
+// The only place a bond becomes helper-managed. The receiver calls it after its own deadline,
+// owner and snapshot checks; a failed write refuses the acknowledgement and records nothing.
+core::Result<void> BluezBackend::acknowledge_bond() {
+    const auto bonded = bond_confirmed();
+    if (!bonded) return bonded.error();
+    if (!bonded.value() || !impl_->allowed) return Error{ErrorCode::helper_rejected};
+    const auto identity = impl_->allowed->device.identity;
+    if (!impl_->managed.remember(identity)) return Error{ErrorCode::helper_rejected};
+    (void)impl_->pending.forget(identity);
+    return {};
 }
 void BluezBackend::Impl::reject_comparison() {
     if (!comparison) return;

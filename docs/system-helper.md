@@ -110,8 +110,9 @@ path invokes the helper after registered-consumer UID/name authorization and
 `PairingGate::confirm`, before any phone approval is persisted. For numeric
 comparison this only opens a pending in-memory enrolment. The consumer must
 retrieve and explicitly accept the one-time comparison, and the helper must
-acknowledge the exact bond through `PairingBondConfirmedV1`, before the shared
-approval routine writes the trust store. `PairingOpened` describes admission;
+verify the exact bond through `PairingBondConfirmedV1` (which records nothing); the
+receiver then runs its own checks and records it with `PairingBondAcknowledgedV1`,
+before the shared approval routine writes the trust store. `PairingOpened` describes admission;
 listening for or forging that signal never mints grants. No session D-Bus
 method proxies Issue. A helper error retires the pending request without approval.
 Cancel,
@@ -176,8 +177,8 @@ Lost replies remain unknown outcomes: this is neither globally exactly-once nor
 crash-durable revocation. NM retains its in-flight rotation latch. BlueZ managed
 identities are durably recorded in `/var/lib/aa-system-helper/managed-bonds`
 (versioned exact address/adapter pairs, at most 256). The helper commits the
-allow-list only after explicit comparison acceptance and exact bond verification,
-before acknowledging the bond to the receiver. Pending admission never writes `managed-bonds`;
+allow-list only when the receiver calls `PairingBondAcknowledgedV1`, after explicit
+comparison acceptance, exact bond verification and every receiver-side check. Pending admission never writes `managed-bonds`;
 it records only the identity in `pending-removals` (same file rules, not revocation authority)
 so a restarted helper still removes an unaccepted bond.
 A trusted reconnect is admitted only for an
@@ -213,7 +214,8 @@ the helper does not expose Introspectable). Methods:
 | BindPeerV1 | `ttt` generation, request source, observed handle | `ut` error, zero | Snapshot binding before confirmation, no radio exposure |
 | ReconnectPeerV1 | `t` observed handle | `ut` error, state | Store-owner exact lookup followed by helper actual-bond check |
 | RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only previously managed exact identity; re-resolve BlueZ object, never accept a supplied path |
-| PairingBondConfirmedV1 | `tt` generation, request source | `ut` error, bonded boolean | Exact accepted bond and durable helper ownership, before receiver approval |
+| PairingBondConfirmedV1 | `tt` generation, request source | `ut` error, bonded boolean | Verification only: accepted comparison and exact bonded snapshot; records nothing |
+| PairingBondAcknowledgedV1 | `tt` generation, request source | `ut` error, reserved zero | Durable helper ownership of the verified bond, called only after every receiver-side check passed |
 | GetPairingComparisonV1 | `tt` generation, request source | `utuss` error, challenge ID, comparison, address, adapter | Authenticated consumer-only retrieval during explicit enrollment |
 | RespondPairingComparisonV1 | `tttu` generation, request source, challenge ID, accept | `ut` error, reserved zero | Explicit human decision after retrieval; one use, same enrollment/peer/deadline |
 

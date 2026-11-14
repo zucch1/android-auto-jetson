@@ -248,13 +248,22 @@ private:
     [[nodiscard]] core::Result<Registered> require_consumer();
     [[nodiscard]] core::Result<void> admit(const BusName& caller, const Registered& active);
     core::Result<void> persist_pairing(const Registered&, core::PairingRequestId);
-    void close_enrolment(std::string_view reason);
+    void close_enrolment(std::string_view reason, bool bond_recorded = false);
+    bool reconcile_enrolment(core::PairingRequestId, bool bond_recorded);
     void advance_enrolment();
     struct PendingRevocation {
         helper::RevocationV1 snapshot;
         helper::RevocationProgress progress;
         bool not_durable;
+        // Only enrolment retirements (no phone id) are retried from refresh_consumer_owner().
+        std::chrono::steady_clock::time_point next_attempt{std::chrono::steady_clock::time_point::min()};
     };
+    // A numeric-comparison bond the helper may already manage whose enrolment did not complete:
+    // the existing revocation record (bond leg + source retirement) removes it and blocks the
+    // identity until acknowledged. There is no second retirement mechanism.
+    void retire_acknowledged_pairing(core::ConsumerId, core::PairingRequestId,
+                                     const std::optional<helper::PeerIdentity>&);
+    void retry_enrolment_retirements();
     core::Result<void> attempt_revocation(PendingRevocation& record);
     bool revocation_blocks(const helper::PeerIdentity&) const;
 

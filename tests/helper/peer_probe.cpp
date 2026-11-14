@@ -37,6 +37,9 @@ int main(int argc, char** argv) {
         } else if (op == "bond") {
             input >> source; member = "PairingBondConfirmedV1"; signature = "tt";
             writer.put_u64(1).put_u64(source);
+        } else if (op == "ack") {
+            input >> source; member = "PairingBondAcknowledgedV1"; signature = "tt";
+            writer.put_u64(1).put_u64(source);
         } else if (op == "comparison") {
             input >> source; member = "GetPairingComparisonV1"; signature = "tt";
             writer.put_u64(1).put_u64(source);

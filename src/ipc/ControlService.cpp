@@ -43,6 +43,7 @@ void ControlService::teardown(std::string_view reason, DiagnosticSeverity severi
 }
 
 void ControlService::refresh_consumer_owner() {
+    retry_enrolment_retirements();
     if (!registered_.has_value()) {
         return;
     }
