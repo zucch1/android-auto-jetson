@@ -99,33 +99,59 @@ ManagedPeers::ManagedPeers(std::string path, std::uint32_t owner, std::string fi
             { reject("state file has an invalid or duplicate address"); return; }
         parsed.push_back(std::move(peer));
     }
-    peers_ = std::move(parsed); valid_ = true;
+    peers_ = std::move(parsed);
+    valid_ = true;
+    if (!sync_directory(dir.value)) admitted_ = 0;
 }
 // Revocation authority: the loaded list plus every entry already renamed into
-// place. It never depends on whether a later write succeeds.
+// place. It never depends on whether a later write or directory sync succeeds.
 bool ManagedPeers::contains(const PeerIdentity& peer) const {
     return valid_ && std::find(peers_.begin(), peers_.end(), peer) != peers_.end();
 }
-// Stages the complete replacement list and renames it into place. Until the rename any failure
-// leaves the old file authoritative (staging discarded); past it the new list is the state on disk.
-ManagedPeers::Write ManagedPeers::replace(int directory_fd, const std::vector<PeerIdentity>& next) {
+// Reconnect and admission authority: entries backed by a confirmed directory
+// fsync (both newly remembered entries and entries reloaded on startup).
+bool ManagedPeers::admitted(const PeerIdentity& peer) const {
+    if (!valid_) return false;
+    const auto count = static_cast<std::vector<PeerIdentity>::difference_type>(std::min(admitted_, peers_.size()));
+    const auto end = std::next(peers_.begin(), count);
+    return std::find(peers_.begin(), end, peer) != end;
+}
+bool ManagedPeers::sync_directory(int dir_fd) {
+    if (fsync_retry(dir_fd)) {
+        durable_ = false;
+        return false;
+    }
+    durable_ = true;
+    admitted_ = peers_.size();
+    return true;
+}
+bool ManagedPeers::confirm_durable() {
+    if (!valid_) return false;
+    if (durable_) return true;
+    Fd dir{directory(directory_, owner_)};
+    return dir.value >= 0 && sync_directory(dir.value);
+}
+// Stages the complete replacement list and renames it into place. True once the rename happened
+// (the new list is then the state on disk; the caller still owes a directory sync). Until the
+// rename any failure leaves the old file authoritative (staging discarded) and returns false.
+bool ManagedPeers::replace(int directory_fd, const std::vector<PeerIdentity>& next) {
     std::string data{"v1\n"};
     for (const auto& saved : next) data += saved.address + " " + saved.adapter + "\n";
     const auto temp = staging_name(file_);
     // Exclusive staging never follows or truncates a foreign/stale file.
     Fd out{::openat(directory_fd, temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600)};
-    if (out.value < 0) return Write::failed;               // nothing written
-    const auto abandon = [&] { (void)::unlinkat(directory_fd, temp.c_str(), 0); return Write::failed; };
+    if (out.value < 0) return false;                       // nothing written
+    const auto abandon = [&] { (void)::unlinkat(directory_fd, temp.c_str(), 0); return false; };
     if (::fchmod(out.value, 0600) || !write_all(out.value, data) || fsync_retry(out.value)) return abandon();
     const int closing = out.value; out.value = -1;
     if (::close(closing)) return abandon();
     int renamed;
     do { renamed = ::renameat(directory_fd, temp.c_str(), directory_fd, file_.c_str()); } while (renamed && errno == EINTR);
     if (renamed) return abandon();
-    return fsync_retry(directory_fd) ? Write::unsynced : Write::synced;
+    return true;
 }
 // Admission: true only when the entry is on disk AND its directory entry is
-// durable. Every failure refuses this admission only; contains() is unaffected.
+// durable. Every failure refuses this admission only; revocable() is unaffected.
 bool ManagedPeers::remember(const PeerIdentity& peer) {
     if (!valid_ || !address_valid(peer.address) || !address_valid(peer.adapter)) return false;
     const bool known = contains(peer);
@@ -134,38 +160,36 @@ bool ManagedPeers::remember(const PeerIdentity& peer) {
     Fd dir{directory(directory_, owner_)};
     if (dir.value < 0) return false;                       // nothing written
     if (!durable_) {                                       // renamed earlier, directory sync unconfirmed
-        if (fsync_retry(dir.value)) return false;
-        durable_ = true;
+        if (!sync_directory(dir.value)) return false;
         if (known) return true;
     }
     auto next = peers_;
     next.push_back(peer);
-    const auto written = replace(dir.value, next);
-    if (written == Write::failed) return false;
+    if (!replace(dir.value, next)) return false;
     // Past the rename the entry IS the state on disk and cannot roll back, so it
-    // counts for revocation even when the directory sync cannot be confirmed.
+    // counts for revocation even when the directory sync cannot be confirmed,
+    // while remaining unadmitted until a directory fsync succeeds.
     peers_ = std::move(next);
-    if (written == Write::unsynced) { durable_ = false; return false; }  // refuse this admission; retried next time
-    return true;
+    return sync_directory(dir.value);                      // refuse this admission; retried next time
 }
+// Removes an entry from a list that is not revocation authority. True only when the removal is
+// durable: absent with the directory sync confirmed, or rewritten, renamed and synced.
 bool ManagedPeers::forget(const PeerIdentity& peer) {
     if (!valid_) return false;
     Fd dir{directory(directory_, owner_)};
-    if (!contains(peer)) {
+    const auto at = std::find(peers_.begin(), peers_.end(), peer);
+    if (at == peers_.end()) {
         // Already gone from the list; "gone" is only durable once the rename that removed it is.
         if (durable_) return true;
-        if (dir.value < 0 || fsync_retry(dir.value)) return false;
-        durable_ = true;
-        return true;
+        return dir.value >= 0 && sync_directory(dir.value);
     }
     if (dir.value < 0) return false;
     auto next = peers_;
-    next.erase(std::find(next.begin(), next.end(), peer));
-    const auto written = replace(dir.value, next);
-    if (written == Write::failed) return false;
+    const auto index = static_cast<std::size_t>(at - peers_.begin());
+    next.erase(next.begin() + static_cast<std::ptrdiff_t>(index));
+    if (!replace(dir.value, next)) return false;
     peers_ = std::move(next);
-    if (written == Write::unsynced) { durable_ = false; return false; }  // removed in memory, not yet durable
-    durable_ = true;
-    return true;
+    if (index < admitted_) --admitted_;                    // admitted entries are the durable prefix
+    return sync_directory(dir.value);                      // removed in memory; not durable until synced
 }
 }

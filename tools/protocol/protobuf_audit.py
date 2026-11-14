@@ -240,7 +240,8 @@ def parse_sets(sources: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, 
     sets: dict[str, dict[str, Any]] = {}
     for name, src in sources.items():
         try:
-            sets[name] = ps.build_schema_set(src["texts"])
+            file_paths = {k: v["path"] for k, v in src["files"].items()}
+            sets[name] = ps.build_schema_set(src["texts"], file_paths=file_paths)
         except ps.ProtoParseError as exc:
             where = SOURCES[name]["dest"] + "/" + SOURCES[name]["prefix"] + str(exc)
             errors.append(f"PARSE_ERROR: {name}: {where}")
@@ -372,13 +373,15 @@ def build_model_view(schema: dict[str, Any]) -> dict[str, Any]:
                        for f in m["fields"]],
             "reserved_ranges": m["reserved_ranges"], "reserved_names": m["reserved_names"],
             "extension_ranges": m["extension_ranges"],
+            "annotations": m["annotations"],
         }
     enums = {}
     for fqn, e in sorted(schema["enums"].items()):
         enums[fqn] = {"file": e["file"], "line": e["line"],
                       "values": [{"name": v["name"], "number": v["number"], "line": v["line"]}
                                  for v in e["values"]],
-                      "reserved_ranges": e["reserved_ranges"], "reserved_names": e["reserved_names"]}
+                      "reserved_ranges": e["reserved_ranges"], "reserved_names": e["reserved_names"],
+                      "annotations": e["annotations"]}
     return {"messages": msgs, "enums": enums}
 
 
@@ -445,8 +448,17 @@ def build_inventory(
     triage_doc: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     match = pc.compare(sets["aasdk"], sets["oaa"], mapping)
+    schema_view = {n: build_model_view(sets[n]) for n in sets}
+    for n in sets:
+        schema_view[n]["stats"] = {
+            "files": len(sets[n]["files"]), "messages": len(sets[n]["messages"]),
+            "enums": len(sets[n]["enums"]),
+            "fields": sum(len(m["fields"]) for m in sets[n]["messages"].values()),
+            "enum_values": sum(len(e["values"]) for e in sets[n]["enums"].values()),
+        }
     diffs, triage_summary = pt.enrich_differences(
-        root, match["diffs"], sets, triage_doc, match=match, findings_doc=findings_doc,
+        root, match["diffs"], sets, triage_doc, match=match,
+        findings_doc=findings_doc, schema_view=schema_view,
     )
     legacy_by_id = {d["id"]: d for d in legacy_doc.get("discrepancies", [])}
     findings = []
@@ -470,14 +482,6 @@ def build_inventory(
                                   "package": sets[name]["files"][k]["package"],
                                   "imports": sets[name]["files"][k]["imports"]}}
                       for k, v in sorted(files.items()) if name in sets},
-        }
-    schema_view = {n: build_model_view(sets[n]) for n in sets}
-    for n in sets:
-        schema_view[n]["stats"] = {
-            "files": len(sets[n]["files"]), "messages": len(sets[n]["messages"]),
-            "enums": len(sets[n]["enums"]),
-            "fields": sum(len(m["fields"]) for m in sets[n]["messages"].values()),
-            "enum_values": sum(len(e["values"]) for e in sets[n]["enums"].values()),
         }
     inv = {
         "schema": SCHEMA_VERSION,
@@ -689,6 +693,139 @@ def iter_text_files(root: Path) -> list[str]:
     return out
 
 
+def _valid_disk_annotation_obj(ann: Any) -> bool:
+    if not isinstance(ann, dict):
+        return False
+    for key in ("confidence", "wire_msg_ids", "directions", "version_gates"):
+        if key not in ann:
+            continue
+        field = ann[key]
+        if isinstance(field, dict):
+            vals = field.get("values", [])
+            if not isinstance(vals, list) or not all(isinstance(item, dict) and "value" in item for item in vals):
+                return False
+        elif not isinstance(field, list):
+            return False
+    return True
+
+
+def _check_inventory_annotations(on_disk: Any, fresh: dict[str, Any]) -> list[str]:
+    errs: list[str] = []
+    if not isinstance(on_disk, dict):
+        return ["INVENTORY_DRIFT: inventory root must be a JSON object"]
+    disk_sets = on_disk.get("schema_sets")
+    fresh_sets = fresh["schema_sets"]
+    catalog_valid = True
+    if not isinstance(disk_sets, dict):
+        errs.append("ENTITY_ANNOTATION_MISMATCH: inventory schema_sets is missing or not an object")
+        catalog_valid = False
+    else:
+        for side in ("aasdk", "oaa"):
+            ds = disk_sets.get(side)
+            fs = fresh_sets[side]
+            if not isinstance(ds, dict):
+                errs.append(f"ENTITY_ANNOTATION_MISMATCH: schema_sets.{side} is missing or not an object")
+                catalog_valid = False
+                continue
+            for col in ("messages", "enums"):
+                dc = ds.get(col)
+                fc = fs[col]
+                if not isinstance(dc, dict):
+                    errs.append(f"ENTITY_ANNOTATION_MISMATCH: schema_sets.{side}.{col} is missing or not an object")
+                    catalog_valid = False
+                    continue
+                for fqn, d_ent in dc.items():
+                    if not isinstance(d_ent, dict) or not isinstance(d_ent.get("file"), str):
+                        errs.append(
+                            f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} is malformed or missing string 'file'"
+                        )
+                        catalog_valid = False
+                        continue
+                    if "annotations" in d_ent and not _valid_disk_annotation_obj(d_ent["annotations"]):
+                        errs.append(
+                            f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} has malformed 'annotations'"
+                        )
+                        catalog_valid = False
+                    if col == "enums":
+                        vals = d_ent.get("values")
+                        if not isinstance(vals, list) or not all(
+                            isinstance(v, dict)
+                            and isinstance(v.get("number"), int)
+                            and not isinstance(v.get("number"), bool)
+                            and isinstance(v.get("name"), str)
+                            for v in vals
+                        ):
+                            errs.append(
+                                f"ENTITY_ANNOTATION_MISMATCH: {side}.enums.{fqn} has malformed 'values'"
+                            )
+                            catalog_valid = False
+                for fqn, f_ent in fc.items():
+                    d_ent = dc.get(fqn)
+                    if not isinstance(d_ent, dict) or "annotations" not in d_ent:
+                        errs.append(f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} is missing 'annotations'")
+                        catalog_valid = False
+                        continue
+                    if not isinstance(d_ent["annotations"], dict):
+                        errs.append(f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} 'annotations' is not an object")
+                        catalog_valid = False
+                        continue
+                    if d_ent["annotations"] != f_ent["annotations"]:
+                        errs.append(
+                            f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} annotations in inventory "
+                            f"differ from parser output"
+                        )
+
+    derived_cat: dict[str, dict[str, Any]] | None = None
+    if catalog_valid and isinstance(disk_sets, dict):
+        try:
+            derived_cat = pt._derive_channel_catalog(disk_sets)
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            errs.append(f"CHANNEL_ANNOTATION_MISMATCH: malformed schema_sets for channel catalog ({exc})")
+
+    triage_summary = on_disk.get("triage_summary")
+    if not isinstance(triage_summary, dict):
+        errs.append("CHANNEL_ANNOTATION_MISMATCH: triage_summary is missing or not an object")
+        return errs
+    disk_pc = triage_summary.get("per_channel")
+    if not isinstance(disk_pc, list):
+        errs.append("CHANNEL_ANNOTATION_MISMATCH: triage_summary.per_channel is missing or not a list")
+        return errs
+
+    seen_channels: set[str] = set()
+    for row in disk_pc:
+        if not isinstance(row, dict) or not isinstance(row.get("channel"), str) or not row["channel"]:
+            errs.append("CHANNEL_ANNOTATION_MISMATCH: malformed per_channel row")
+            continue
+        ch = row["channel"]
+        if ch in seen_channels:
+            errs.append(f"CHANNEL_ANNOTATION_MISMATCH: duplicate per_channel row for '{ch}'")
+            continue
+        seen_channels.add(ch)
+        if derived_cat is not None:
+            crec = derived_cat.get(ch, {})
+            checks = (
+                ("aasdk_entities", crec.get("aasdk_entities", 0)),
+                ("oaa_entities", crec.get("oaa_entities", 0)),
+                ("wire_msg_ids", sorted(crec.get("wire_msg_ids", set()))),
+                ("directions", sorted(crec.get("directions", set()))),
+                ("version_gates", sorted(crec.get("version_gates", set()))),
+                ("oaa_confidence", sorted(crec.get("oaa_confidence", set()))),
+            )
+            for key, expected_val in checks:
+                if row.get(key) != expected_val:
+                    errs.append(
+                        f"CHANNEL_ANNOTATION_MISMATCH: channel '{ch}' {key}={row.get(key)!r} "
+                        f"disagrees with per-entity aggregation {expected_val!r}"
+                    )
+    if derived_cat is not None:
+        for missing_ch in sorted(set(derived_cat) - seen_channels):
+            errs.append(
+                f"CHANNEL_ANNOTATION_MISMATCH: channel '{missing_ch}' present in per-entity data "
+                f"is missing from per_channel summary"
+            )
+    return errs
+
+
 def check_integrity(root: Path) -> list[str]:
     errors: list[str] = []
     sources, e1 = load_sources(root)
@@ -720,9 +857,17 @@ def check_integrity(root: Path) -> list[str]:
     inv_path, rep_path = root / INVENTORY_PATH, root / REPORT_PATH
     if not inv_path.is_file():
         errors.append(f"INVENTORY_FILE_MISSING: {INVENTORY_PATH}")
-    elif inv_path.read_text(encoding="utf-8") != dump_json(inv):
-        errors.append("INVENTORY_DRIFT: on-disk inventory does not match freshly regenerated audit "
-                      "output (run --generate)")
+    else:
+        inv_text = inv_path.read_text(encoding="utf-8")
+        try:
+            on_disk_inv = json.loads(inv_text)
+        except ValueError as exc:
+            errors.append(f"INVENTORY_DRIFT: {INVENTORY_PATH} is not valid JSON ({exc})")
+        else:
+            errors += _check_inventory_annotations(on_disk_inv, inv)
+        if inv_text != dump_json(inv):
+            errors.append("INVENTORY_DRIFT: on-disk inventory does not match freshly regenerated audit "
+                          "output (run --generate)")
     if not rep_path.is_file():
         errors.append(f"REPORT_FILE_MISSING: {REPORT_PATH}")
     else:
@@ -918,6 +1063,9 @@ def render_report(inv: dict[str, Any]) -> str:
           f"{bd.get('needs-phone-evidence', 0)} | {ch['oaa_retracted_diffs']} |")
     w("")
     w("### Per-channel protocol metadata & receiver coverage\n")
+    w("Channel-level metadata below is aggregated strictly from per-entity `annotations` in "
+      "`schema_sets.<side>.messages|enums.<fqn>` (where each value records `proto_comment` "
+      "`file:line` provenance and missing attributes are marked `status: \"unknown\"`).\n")
     w("| Channel | AASDK / OAA entities | Wire msg IDs (from .proto) | Directions | Version gates | OAA confidence | Active C++ files |")
     w("|---|---:|---|---|---|---|---|")
     for ch in ts["per_channel"]:

@@ -126,6 +126,7 @@ public:
     [[nodiscard]] core::Result<void> pairing_requested(core::PairingRequestId request) override;
     [[nodiscard]] core::Result<core::PhoneId> pairing_confirmed(
         core::PairingRequestId request) override;
+    core::Result<void> validate_pairing(core::PairingRequestId request) override;
     std::optional<core::PhoneId> committed_pairing() const override { return committed_pairing_; }
     void pairing_cancelled(core::PairingRequestId request) override;
 
@@ -156,6 +157,7 @@ private:
 
     [[nodiscard]] std::size_t find(core::PairingRequestId request) const;
     void drop_at(std::size_t index);
+    [[nodiscard]] bool expired(const Pending& pending) const;
 
     ApprovedPhoneStore& store_;
     const Clock& clock_;

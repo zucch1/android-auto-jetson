@@ -130,6 +130,44 @@ def _metric(
     return entry
 
 
+def _load_logged_progress(capture: dict) -> dict[int, dict[str, dict]]:
+    """Load persisted receiver-log evidence keyed by sample t_ns.
+
+    Backward compatible with pre-#90 captures (no ``interference`` or
+    ``progress_evidence``) and initial #90 captures (evidence only inside
+    ``interference[*].logged_progress``).
+    """
+    raw_interference = capture.get("interference", [])
+    if not isinstance(raw_interference, list) or any(not isinstance(item, dict)
+                                                     for item in raw_interference):
+        raise ContractError("capture.interference must be an array of objects")
+    logged_by_ns: dict[int, dict[str, dict]] = {}
+    for item in raw_interference:
+        stamp = item.get("t_ns")
+        logged = item.get("logged_progress")
+        if type(stamp) is int and isinstance(logged, dict):
+            logged_by_ns[stamp] = logged
+    if "progress_evidence" in capture:
+        raw_evidence = capture["progress_evidence"]
+        if not isinstance(raw_evidence, list) or any(not isinstance(item, dict)
+                                                     for item in raw_evidence):
+            raise ContractError("capture.progress_evidence must be an array of objects")
+        seen: set[int] = set()
+        for item in raw_evidence:
+            stamp = item.get("t_ns")
+            logged = item.get("logged_progress")
+            if (set(item) != {"t_ns", "logged_progress"}
+                    or type(stamp) is not int or stamp < 0 or not isinstance(logged, dict)):
+                raise ContractError(
+                    "capture.progress_evidence entries must have nonnegative int t_ns and object logged_progress"
+                )
+            if stamp in seen:
+                raise ContractError(f"duplicate t_ns in capture.progress_evidence: {stamp}")
+            seen.add(stamp)
+            logged_by_ns[stamp] = logged
+    return logged_by_ns
+
+
 def build_result(capture: dict, *, duration_requested: str | None, now: str,
                  capture_path: str | None, capture_sha256: str | None,
                  provenance_override: dict | None = None,
@@ -147,9 +185,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     if crashes is not None and crashes < 0:
         raise ContractError("crashes must be nonnegative")
     samples = evidence.samples
-    progress = ProjectionProgress()
-    for sample in samples:
-        progress.observe(sample)
+    progress = ProjectionProgress.replay(samples, _load_logged_progress(capture))
     window = (Window(progress.started_ns, progress.last_ns)
               if progress.started_ns is not None else None)
     reduced = reduce_capture(evidence, window)
@@ -270,6 +306,10 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                       startup_wait_seconds=progress.started_ns / 1e9
                       if progress.started_ns is not None else None,
                       projection_failure=progress.failure)
+    if progress.interferences:
+        # Shown beside the coverage result: a gap over 10 s is why coverage:sampling
+        # fails. Omitted when empty so uninterrupted results are unchanged.
+        run_status["interference"] = progress.interferences
     run_failures = []
     if run_status["early_exit"]:
         run_failures.append("early_exit")
@@ -360,6 +400,11 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         "helper RSS is null: the wired path does not require the helper before todo 34",
         "provenance equivalence is provisional; post-package equivalence is todo 43",
     ]
+    for gap in progress.interferences:
+        notes.append(
+            f"collector sampling gap of {gap['gap_seconds']:.1f} s ending at t={gap['t_ns'] / 1e9:.1f} s "
+            "is host interference, not a receiver verdict; gaps over 10 s fail coverage:sampling, "
+            "see run_status.interference")
     if not samples:
         notes.append("capture contained no samples; gated metrics are unavailable")
     if evidence.thermal_policy is not None:

@@ -25,6 +25,11 @@ bool ControlService::reconcile_enrolment(core::PairingRequestId request, bool bo
     if (std::chrono::steady_clock::now() >= open_pairing_->deadline) {
         close_enrolment("pairing_expired", bond_recorded); return false;
     }
+    // The policy's own deadline/binding predicate, shared with confirm_phone_pairing and the
+    // final approval, so the enrolment cannot outlive the request it was opened for.
+    if (!phones_.validate_pairing(request)) {
+        close_enrolment("pairing_expired", bond_recorded); return false;
+    }
     const auto owner = credentials_.name_owner(registered_->name);
     if (!owner || owner.value() != registered_->connection) {
         if (bond_recorded && confirmation_)

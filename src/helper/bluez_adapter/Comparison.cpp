@@ -14,7 +14,7 @@ void BluezBackend::Impl::retire_unaccepted() {
         if (allowed && allowed->device.identity == peer) continue;
         // An admitted bond is never removed by cleanup, whatever the journal says: the journal
         // entry is only dropped (it is stale, e.g. an acknowledgement whose journal write failed).
-        if (managed.contains(peer)) { if (pending.forget(peer)) std::erase(removal_done, peer); continue; }
+        if (managed.revocable(peer)) { if (pending.forget(peer)) std::erase(removal_done, peer); continue; }
         const auto done = std::find(removal_done.begin(), removal_done.end(), peer);
         if (done == removal_done.end()) {
             bool removed = true;

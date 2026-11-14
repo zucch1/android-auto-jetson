@@ -5,6 +5,7 @@
 #include "StoreSchema.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <utility>
 
 namespace aa::trust {
@@ -43,6 +44,18 @@ core::Result<void> ApprovedPhoneStore::load() {
         usable_ = false;
         phones_.clear();
         return parsed.error();
+    }
+    if (parsed.value().invalid_wireless_count || parsed.value().colliding_wireless_count) {
+        auto saved = detail::backup_file_private(path_, text.value());
+        if (saved) saved = detail::write_file_private(path_, detail::write_store(parsed.value()));
+        if (!saved) {
+            usable_ = false;
+            phones_.clear();
+            return saved.error();
+        }
+        std::fprintf(stderr, "trust store: quarantined %zu invalid legacy wireless address records; "
+            "%zu address-case collision records; explicit re-pairing required\n",
+            parsed.value().invalid_wireless_count, parsed.value().colliding_wireless_count);
     }
     dropped_port_only_count_ = parsed.value().dropped_port_only_count;
     phones_ = std::move(parsed.value().phones);

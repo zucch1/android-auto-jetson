@@ -243,7 +243,7 @@ core::Result<std::string> read_file(const std::filesystem::path& path) {
     return out;
 }
 
-core::Result<void> write_file_private(const std::filesystem::path& path, std::string_view content) {
+static core::Result<void> write_private(const std::filesystem::path& path, std::string_view content, bool exclusive) {
     if (content.size() > kMaxStoreBytes) {
         return Error{ErrorCode::trust_store_io};
     }
@@ -312,7 +312,19 @@ core::Result<void> write_file_private(const std::filesystem::path& path, std::st
     // Atomic replace: rename swaps the verified 0600 regular file over the
     // target inside the verified directory. A pre-existing symlink at the
     // store name is replaced outright (never followed).
-    if (::renameat(dirfd, temp_name.c_str(), dirfd, filename.c_str()) != 0) {
+    if (exclusive) {
+        const int linked = ::linkat(dirfd, temp_name.c_str(), dirfd, filename.c_str(), 0);
+        const int failure = errno;
+        (void)::unlinkat(dirfd, temp_name.c_str(), 0);
+        if (linked != 0) {
+            const int existing = failure == EEXIST ? ::openat(dirfd, filename.c_str(),
+                O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) : -1;
+            const bool safe = existing >= 0 && validate_private_fd(existing).has_value() &&
+                fsync_interruptible(existing) == 0;
+            if (existing >= 0) ::close(existing);
+            if (!safe) { ::close(dirfd); return Error{ErrorCode::trust_store_io}; }
+        }
+    } else if (::renameat(dirfd, temp_name.c_str(), dirfd, filename.c_str()) != 0) {
         (void)::unlinkat(dirfd, temp_name.c_str(), 0);
         ::close(dirfd);
         return Error{ErrorCode::trust_store_io};
@@ -328,6 +340,14 @@ core::Result<void> write_file_private(const std::filesystem::path& path, std::st
         return Error{ErrorCode::trust_store_not_durable};
     }
     return {};
+}
+
+core::Result<void> write_file_private(const std::filesystem::path& path, std::string_view content) {
+    return write_private(path, content, false);
+}
+
+core::Result<void> backup_file_private(const std::filesystem::path& path, std::string_view content) {
+    return write_private(std::filesystem::path{path.string() + ".legacy-backup"}, content, true);
 }
 
 } // namespace aa::trust::detail

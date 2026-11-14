@@ -5,6 +5,7 @@
 #include <aa/trust/Store.hpp>
 
 #include "fakes.hpp"
+#include "syscall_faults.hpp"
 #include "../../src/trust/StoreSchema.hpp"
 
 #include <fstream>
@@ -208,6 +209,133 @@ TEST(StoreMigration, WriterDerivesStrengthFromIdentity) {
     EXPECT_EQ(parsed.value().phones[0].strength, trust::IdentityStrength::serial_backed);
     EXPECT_EQ(parsed.value().phones[1].strength, trust::IdentityStrength::bond_backed);
     EXPECT_EQ(parsed.value().phones[2].strength, trust::IdentityStrength::port_only);
+}
+
+std::string recovery_document(const std::vector<std::string>& addresses) {
+    trust::detail::ParsedStore snapshot;
+    snapshot.phones.push_back({aa::core::PhoneId{1}, test::kWired});
+    for (const auto& address : addresses)
+        snapshot.phones.push_back({aa::core::PhoneId{snapshot.phones.size() + 1},
+                                  trust::WirelessIdentity{address, "hci0"}});
+    snapshot.next_phone_id = snapshot.phones.size() + 1;
+    return trust::detail::write_store(snapshot);
+}
+std::string read_text(const std::filesystem::path& path) {
+    std::ifstream input{path};
+    return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+}
+
+TEST(StoreMigration, QuarantinesLegacyNonMacWithPrivateOneTimeBackupAndDiagnostic) {
+    for (int version : {2, 3}) {
+        test::TempStoreDir dir;
+        auto original = recovery_document({"legacy-bond", "AA:BB:CC:DD:EE:FF"});
+        if (version == 2) {
+            original.replace(original.find("schema_version\":3"), 17, "schema_version\":2");
+            // V2 has no strength member (including the wired survivor).
+            for (const std::string tier : {"serial-backed", "bond-backed"}) {
+                const auto field = ",\"strength\":\"" + tier + "\"";
+                for (auto at = original.find(field); at != std::string::npos; at = original.find(field))
+                    original.erase(at, field.size());
+            }
+        }
+        write_text(dir.file(), original);
+        trust::ApprovedPhoneStore store{dir.file()};
+        testing::internal::CaptureStderr();
+        const auto loaded = store.load();
+        const auto diagnostic = testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(loaded);
+        EXPECT_NE(diagnostic.find("1 invalid legacy wireless address records"), std::string::npos);
+        ASSERT_EQ(store.phones().size(), 2U);
+        EXPECT_EQ(store.phones()[0].phone_id, aa::core::PhoneId{1});
+        EXPECT_EQ(store.phones()[1].phone_id, aa::core::PhoneId{3});
+        const auto backup = std::filesystem::path{dir.file().string() + ".legacy-backup"};
+        EXPECT_EQ(read_text(backup), original);
+        struct stat info {};
+        ASSERT_EQ(::stat(backup.c_str(), &info), 0);
+        EXPECT_EQ(info.st_mode & 0777, 0600U);
+        EXPECT_EQ(info.st_uid, ::geteuid());
+        trust::ApprovedPhoneStore fresh{dir.file()};
+        ASSERT_TRUE(fresh.load());
+        EXPECT_EQ(fresh.phones().size(), 2U);
+        // A later legacy import cannot overwrite the first original.
+        write_text(dir.file(), recovery_document({"another-legacy-bond"}));
+        ASSERT_TRUE(fresh.load());
+        EXPECT_EQ(read_text(backup), original);
+    }
+}
+
+TEST(StoreMigration, QuarantinesEveryAddressCaseCollisionWithoutMerging) {
+    test::TempStoreDir dir;
+    const auto original = recovery_document({"aa:bb:cc:dd:ee:ff", "AA:BB:CC:DD:EE:FF", "Aa:Bb:Cc:Dd:Ee:Ff"});
+    write_text(dir.file(), original);
+    trust::ApprovedPhoneStore store{dir.file()};
+    testing::internal::CaptureStderr();
+    const auto loaded = store.load();
+    const auto diagnostic = testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(loaded);
+    ASSERT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(store.lookup(test::identity_of(test::kWired)), trust::Decision::approved);
+    EXPECT_EQ(store.lookup(test::identity_of(test::kWireless)), trust::Decision::unknown);
+    EXPECT_NE(diagnostic.find("3 address-case collision records"), std::string::npos);
+    EXPECT_EQ(read_text(dir.file().string() + ".legacy-backup"), original);
+    const auto added = store.approve(test::kWireless);
+    ASSERT_TRUE(added);
+    EXPECT_EQ(added.value(), aa::core::PhoneId{5});
+}
+
+TEST(StoreMigration, RecoveryDoesNotHideCorruptionOrFollowBackupSymlinks) {
+    test::TempStoreDir dir;
+    const auto original = recovery_document({"legacy-bond"});
+    for (const auto& text : {original + "garbage", std::string{"{bad json"},
+             recovery_document({"AA:BB:CC:DD:EE:FF", "AA:BB:CC:DD:EE:FF"})}) {
+        write_text(dir.file(), text);
+        trust::ApprovedPhoneStore store{dir.file()};
+        EXPECT_FALSE(store.load());
+        EXPECT_FALSE(store.usable());
+        EXPECT_FALSE(std::filesystem::exists(dir.file().string() + ".legacy-backup"));
+        EXPECT_EQ(read_text(dir.file()), text);
+    }
+    for (const std::string corruption : {"version", "counter", "strength", "adapter", "phone-id"}) {
+        auto text = original;
+        if (corruption == "version") text.replace(text.find("schema_version\":3"), 17, "schema_version\":9");
+        if (corruption == "counter") text.replace(text.find("next_phone_id\":3"), 16, "next_phone_id\":2");
+        if (corruption == "strength") text.replace(text.find("bond-backed"), 11, "opaque");
+        if (corruption == "adapter") text.replace(text.find("hci0"), 4, "bad\\nadapter");
+        if (corruption == "phone-id") text.replace(text.find("phone_id\":2"), 11, "phone_id\":1");
+        write_text(dir.file(), text);
+        trust::ApprovedPhoneStore store{dir.file()};
+        EXPECT_FALSE(store.load()) << corruption;
+        EXPECT_FALSE(store.usable());
+        EXPECT_FALSE(std::filesystem::exists(dir.file().string() + ".legacy-backup"));
+        EXPECT_EQ(read_text(dir.file()), text);
+    }
+    write_text(dir.file(), original);
+    const auto target = dir.dir() / "untouched";
+    write_text(target, "sentinel");
+    std::filesystem::create_symlink(target, dir.file().string() + ".legacy-backup");
+    trust::ApprovedPhoneStore store{dir.file()};
+    EXPECT_FALSE(store.load());
+    EXPECT_FALSE(store.usable());
+    EXPECT_EQ(read_text(target), "sentinel");
+    EXPECT_EQ(read_text(dir.file()), original);
+}
+
+TEST(StoreMigration, RecoveryWriteFailureKeepsOriginalUntrustedUntilRetry) {
+    test::TempStoreDir dir;
+    const auto original = recovery_document({"legacy-bond", "lEgACy-BonD"});
+    write_text(dir.file(), original);
+    trust::ApprovedPhoneStore store{dir.file()};
+    {
+        const test::faults::ScopedFault fault{test::faults::Fault::renameat};
+        EXPECT_FALSE(store.load());
+        EXPECT_FALSE(store.usable());
+        EXPECT_TRUE(store.phones().empty());
+    }
+    EXPECT_EQ(read_text(dir.file()), original);
+    EXPECT_EQ(read_text(dir.file().string() + ".legacy-backup"), original);
+    ASSERT_TRUE(store.load());
+    ASSERT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(store.lookup(test::identity_of(test::kWired)), trust::Decision::approved);
 }
 
 } // namespace

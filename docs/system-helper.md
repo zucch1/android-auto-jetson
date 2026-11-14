@@ -106,17 +106,23 @@ The helper-only operations can share the client from another thread; destruction
 requires callers to have finished. Wired clients without this dependency do not
 gain helper authority: committed forget now reports required AP work as pending,
 not implicit cleanup success. The actual `ControlService::confirm_phone_pairing`
-path invokes the helper after registered-consumer UID/name authorization and
-`PairingGate::confirm`, before any phone approval is persisted. For numeric
-comparison this only opens a pending in-memory enrolment. The consumer must
-retrieve and explicitly accept the one-time comparison, and the helper must
-verify the exact bond through `PairingBondConfirmedV1` (which records nothing); the
+path invokes the helper after registered-consumer UID/name authorization,
+`PairingGate::confirm`, and policy validation of the live bound request and
+deadline (`PairingPolicy::expired()`, the one predicate), before any phone
+approval is persisted. Policy rechecks the same predicate after the helper RPC;
+expiry retires helper authority through the tracked cancellation path and
+persists nothing. For numeric comparison this only opens a pending in-memory
+enrolment. The consumer must retrieve and explicitly accept the one-time
+comparison; the comparison-confirm path applies the same pre- and post-helper
+liveness checks before and after activating the helper. The helper must verify
+the exact bond through `PairingBondConfirmedV1` (which records nothing); the
 receiver then runs its own checks and records it with `PairingBondAcknowledgedV1`,
-before the shared approval routine writes the trust store. `PairingOpened` describes admission;
-listening for or forging that signal never mints grants. No session D-Bus
-method proxies Issue. A helper error never persists approval. Error 703 (rename
-committed, directory durability uncertain) emits `pairing_approval_not_durable` and
-keeps helper confirmation consistent with the store.
+before the shared approval routine writes the trust store. `PairingOpened`
+describes admission and follows committed approval, including error 703 (rename
+committed, directory durability uncertain), which emits
+`pairing_approval_not_durable` and keeps helper confirmation consistent with the
+store. Listening for or forging that signal never mints grants. No session D-Bus
+method proxies Issue. A helper error never persists approval.
 
 If persistence fails before commit or any pairing cancellation/expiry fails
 helper invalidation, cancellation must be acknowledged. A failed cancellation
@@ -195,7 +201,9 @@ comparison acceptance, exact bond verification and every receiver-side check. Pe
 it records only the identity in `pending-removals` (same file rules, not revocation authority)
 so a restarted helper still removes an unaccepted bond.
 A trusted reconnect is admitted only for an
-identity already on the list and never adds one. It loads
+identity already on the list whose directory entry is durable (loaded after a confirmed
+directory fsync at startup, or committed by a successful one; a pending sync is retried on
+reconnect) and never adds one. Revocation depends only on presence, never on durability. It loads
 only an owner-only regular file in a private, owner-validated directory, using
 no-follow path traversal. Writes use an exclusive, randomly named 0600 staging file (EINTR retried), file
 fsync, atomic rename and directory fsync. A write failure refuses the new bond acknowledgement; revocation of every entry already stored, or already renamed into
@@ -347,3 +355,15 @@ Like the TLS qualification targets, the helper is explicitly unavailable in
 that configuration; native host helper tests remain mandatory. The cross-smoke
 configuration regression verifies that no target OpenSSL lookup is attempted,
 not that the helper has been cross-built or qualified on ARM64.
+
+Wireless trust-store upgrade recovery quarantines formerly accepted printable
+non-MAC bond addresses and all records in groups differing only by bond-address
+case. None of those records remains trusted or is merged. Before rewriting the
+remaining approvals through the durable store writer, load saves the original
+bytes next to the store as `<store>.legacy-backup`, owner-only, through the
+verified descriptor path walk and exclusive creation. An existing private,
+regular backup is retained unchanged; a symlink or unsafe backup aborts recovery.
+A diagnostic reports the quarantined counts and reasons without identifiers.
+Quarantined phones require explicit pairing again. Other corruption still fails
+closed for the whole store; stop the receiver and preserve the original before
+manual recovery. The backup is for inspection, not automatic trust restoration.

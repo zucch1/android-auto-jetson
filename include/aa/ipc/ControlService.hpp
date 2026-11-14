@@ -130,6 +130,11 @@ public:
         core::PairingRequestId request) = 0;
     [[nodiscard]] virtual core::Result<core::PhoneId> pairing_confirmed(
         core::PairingRequestId request) = 0;
+    // Validate the bound request and expire it without persisting. Called
+    // before privileged confirmation; pairing_confirmed rechecks after RPC.
+    virtual core::Result<void> validate_pairing(core::PairingRequestId) {
+        return Error{ErrorCode::trust_unknown_phone};
+    }
     // Populated only by the last committed-but-not-durable confirmation.
     virtual std::optional<core::PhoneId> committed_pairing() const { return std::nullopt; }
     virtual void pairing_cancelled(core::PairingRequestId request) = 0;

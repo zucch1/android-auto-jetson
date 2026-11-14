@@ -69,6 +69,13 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return opened.error();
     }
+    const auto live = phones_.validate_pairing(request);
+    if (!live) {
+        retire_failed_pairing(active.value().consumer, request, peer);
+        (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+        events_.emit(PairingClosed{request});
+        return live.error();
+    }
     if (confirmation_ != nullptr) {
         const auto granted = confirmation_->confirmed(active.value().consumer, request);
         if (!granted) {
@@ -79,6 +86,17 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
             events_.emit(PairingClosed{request});
             events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_helper_failed", request.value});
             return granted.error();
+        }
+        // The helper RPC may outlive the request's deadline or its live binding. Revalidate with
+        // the same predicate before anything opens: an expired request retires the authority the
+        // helper just activated (comparison enrolment has not persisted anything yet either).
+        const auto still_live = phones_.validate_pairing(request);
+        if (!still_live) {
+            phones_.pairing_cancelled(request);
+            retire_failed_pairing(active.value().consumer, request, peer);
+            (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+            events_.emit(PairingClosed{request});
+            return still_live.error();
         }
     }
     if (confirmation_ && confirmation_->requires_comparison()) {

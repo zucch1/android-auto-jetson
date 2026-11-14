@@ -266,6 +266,34 @@ TEST_F(ComparisonControl, TimeoutBeforeComparisonOpensRetiresRequest) {
     expect_empty(); EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U);
     EXPECT_FALSE(control.confirm_phone_pairing(caller, request.value()));
 }
+TEST_F(ComparisonControl, RequestDeadlinePassingDuringHelperConfirmRetiresActivatedAuthority) {
+    // The comparison confirm path uses the policy's own deadline predicate before and after the
+    // helper call; an expiry during the call must not open an enrolment on activated authority.
+    ComparisonClock clock;
+    const auto request = control.request_add_phone(caller); ASSERT_TRUE(request);
+    bridge.on_confirm = [&] { clock.now += std::chrono::seconds{61}; };
+    const auto confirmed = control.confirm_phone_pairing(caller, request.value());
+    ASSERT_FALSE(confirmed);
+    EXPECT_EQ(confirmed.error().code(), ErrorCode::session_pairing_timeout);
+    EXPECT_EQ(bridge.confirmations, 1); EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U);
+    EXPECT_FALSE(control.pairing_window_open());
+    EXPECT_FALSE(control.pairing_comparison(caller, request.value()));
+    EXPECT_EQ(phones.pending_count(), 0U); EXPECT_TRUE(store.phones().empty());
+}
+TEST_F(ComparisonControl, RequestDeadlineBeforeAcknowledgementRecordsNothingEvenWithinEnrolmentWindow) {
+    // The request's deadline (60 s from the request) passes while the enrolment window (60 s from
+    // the confirm) is still open: the shared predicate still stops the acknowledgement.
+    ComparisonClock clock;
+    const auto request = control.request_add_phone(caller); ASSERT_TRUE(request);
+    clock.now += std::chrono::seconds{30};
+    ASSERT_TRUE(control.confirm_phone_pairing(caller, request.value()));
+    ASSERT_TRUE(control.pairing_comparison(caller, request.value()));
+    bridge.on_bond_confirmed = [&] { clock.now += std::chrono::seconds{35}; };
+    (void)control.respond_pairing_comparison(caller, request.value(), {79, true});
+    EXPECT_EQ(bridge.acknowledgements, 0);
+    EXPECT_EQ(bridge.forgets, 0); EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_EQ(bridge.cancellations, 1); EXPECT_EQ(count_closed(), 1U); EXPECT_TRUE(store.phones().empty());
+}
 
 // P2a: the helper records the managed bond only when the receiver asks it to acknowledge, after
 // every receiver-side check; a failure afterwards is retired through the tracked revocation.

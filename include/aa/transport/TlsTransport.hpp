@@ -69,6 +69,7 @@ class TlsTransport final : public Transport {
 
   private:
     friend class TlsListener;
+    friend struct TlsTransportTestAccess; // Host tests: raw fragments and socket backpressure.
 
     struct Impl;
     explicit TlsTransport(std::unique_ptr<Impl> impl) noexcept;
