@@ -727,7 +727,7 @@ TEST_F(NmDaemon, FailedShutdownRetainsRulesAndRevocationRetries) {
 TEST_F(NmDaemon, ForgetRotatesButOrdinaryInvalidateDoesNot) {
     start(); acquire(); ASSERT_TRUE(state(State::active));
     const auto before = read_text(directory / "state/ap.credentials");
-    client->cancel(core::ConsumerId{1}, core::PairingRequestId{1});
+    ASSERT_TRUE(client->cancel(core::ConsumerId{1}, core::PairingRequestId{1}));
     ASSERT_TRUE(eventually([this] { return !boundary->table; })); EXPECT_EQ(before, read_text(directory / "state/ap.credentials"));
     acquire(2); ASSERT_TRUE(state(State::active));
     const RevocationV1 snapshot{core::PhoneId{2}, trust::WirelessIdentity{"exact-bond", "adapter"}};

@@ -126,6 +126,7 @@ public:
     [[nodiscard]] core::Result<void> pairing_requested(core::PairingRequestId request) override;
     [[nodiscard]] core::Result<core::PhoneId> pairing_confirmed(
         core::PairingRequestId request) override;
+    std::optional<core::PhoneId> committed_pairing() const override { return committed_pairing_; }
     void pairing_cancelled(core::PairingRequestId request) override;
 
     // Drops pendings past the confirm window WITHOUT persisting anything and
@@ -134,6 +135,8 @@ public:
     // can release each one's PairingGate entry and emit PairingClosed before
     // admitting new requests.
     [[nodiscard]] std::vector<core::PairingRequestId> reap_expired() override;
+    std::optional<helper::PeerIdentity> take_expired_wireless_identity(
+        core::PairingRequestId request) override;
 
     // Drains the ids forget() invalidated (drain clears the buffer).
     [[nodiscard]] std::vector<core::PairingRequestId> take_invalidated_pairings() override;
@@ -158,7 +161,9 @@ private:
     std::optional<TransportIdentity> candidate_{};
     std::vector<Pending> pending_{};
     std::vector<core::PairingRequestId> invalidated_{};
+    std::vector<std::pair<core::PairingRequestId, helper::PeerIdentity>> expired_peers_{};
     std::optional<helper::RevocationV1> revocation_;
+    std::optional<core::PhoneId> committed_pairing_;
 };
 
 } // namespace aa::trust
