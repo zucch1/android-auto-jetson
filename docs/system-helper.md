@@ -123,7 +123,15 @@ bond authority: `ReconcileBondsV1` (at receiver start, on every helper incarnati
 after an enrolment ends without a commit) makes the helper's bond files match it, so a failed
 commit keeps a durable approval and reconciliation admits the bond (docs/enrolment-ordering.md).
 A failing reconciliation emits `bond_reconcile_pending` once (retried every second); approved
-identities the helper cannot admit are reported as `bond_reconcile_unadmitted` with their count. `PairingOpened`
+identities the helper cannot admit are reported as `bond_reconcile_unadmitted_enrol_again` with
+their count: the recovery is to enrol each such phone again (or ForgetPhone it). The Jetson's
+Bluetooth adapter is Android-Auto-exclusive: a phone forgotten in Android Auto that is paired
+again outside it is removed again by reconciliation, and the helper logs the warning
+`bond_removed_revoked_identity` with the redacted address each time, saying the phone was
+forgotten in Android Auto and must be enrolled again. Bond removals run under a per-invocation
+budget (two attempts, 100 ms) with per-identity exponential backoff, so a slow or failing BlueZ
+never delays another phone's reconciliation, confirm or reconnect (docs/enrolment-ordering.md,
+Removal budget). `PairingOpened`
 describes admission and follows committed approval, including error 703 (rename
 committed, directory durability uncertain), which emits
 `pairing_approval_not_durable` and keeps helper confirmation consistent with the

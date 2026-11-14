@@ -35,7 +35,7 @@ The helper makes its state match, durably and idempotently:
 | Helper state for the identity | In the approved set | Not in the approved set |
 |---|---|---|
 | on `revoked-bonds`, a fresh enrolment of it acknowledged in this helper run and awaiting its commit | admitted: history durably cleared, then `managed-bonds` synced, then the journal entry removed (the commit's own order) | device disconnected and removed, then the entry dropped |
-| on `revoked-bonds` otherwise (no committed enrolment since its revocation) | stays revoked: demotion completed, **not** admitted, bond not removed (#74); counted as unadmitted (diagnostic `bond_reconcile_unadmitted`); a stale journal entry of an unaccepted window is dropped | a bonded device is disconnected and removed: the removal is owed again in `pending-removals` first, whatever the journal held |
+| on `revoked-bonds` otherwise (no committed enrolment since its revocation) | stays revoked: demotion completed, **not** admitted, bond not removed (#74); counted as unadmitted (diagnostic `bond_reconcile_unadmitted_enrol_again`); a stale journal entry of an unaccepted window is dropped | a bonded device is disconnected and removed: the removal is owed again in `pending-removals` first, whatever the journal held |
 | on `managed-bonds` | admitted; a journal entry left beside it (commit stopped between its writes) is durably removed | demoted: the removal owed in `pending-removals`, then `revoked-bonds`, then out of `managed-bonds`; device disconnected and removed, then the entry dropped |
 | on `pending-removals` with a bonded device | admitted: `managed-bonds` synced, then the journal entry removed (the approval landed, the commit did not) | device disconnected and removed, then the entry dropped |
 | on `pending-removals`, no bonded device | counted as unadmitted; cleanup drops the stale entry once the device is gone | entry dropped once the device is gone |
@@ -45,13 +45,43 @@ The removal obligation is derived, not only journalled: a bond of an identity on
 `managed-bonds`, `pending-removals` or `revoked-bonds` that the store does not approve is
 removed whether or not its journal entry survived (a failed journal write, a crash, a
 demotion by an older helper). A bond none of the helper's files name is never touched,
-because BlueZ cannot tell an enrolment's bond from the owner's other bonds. Consequently a
-phone forgotten in Android Auto and then paired with the Jetson outside it, by the same
-adapter/address, is removed again by the next reconciliation while its history entry lasts.
+because BlueZ cannot tell an enrolment's bond from the owner's other bonds.
+
+**The Jetson's Bluetooth adapter is Android-Auto-exclusive** (owner decision, 2026-11-14).
+A phone forgotten in Android Auto and then paired with the Jetson outside it, by the same
+adapter/address, is therefore removed again by the next reconciliation while its history
+entry lasts, and the helper logs a warning each time:
+`system-helper: warning bond_removed_revoked_identity <redacted address>: this phone was
+forgotten in Android Auto but is bonded again (paired outside Android Auto); ... Enrol the
+phone again in Android Auto to use it.` The address is redacted (`id-` plus a digest keyed per helper
+run, stable within the run, never the raw address). To use such a phone again, enrol it in Android Auto.
+
 Reconciliation reports success only when every such bond is gone from BlueZ or its removal
-is durably owed in `pending-removals` (the helper retries it on every tick, so no receiver
+is durably owed in `pending-removals` (the helper retries it on its ticks, so no receiver
 record has to, finding 3); a bond still present with no durable obligation (the journal
 write failed) fails the reconciliation and the receiver retries.
+
+### Removal budget
+
+A slow or failing BlueZ must not hold the helper's single owner thread past the receiver's
+deadlines (500 ms for `ReconcileBondsV1`, 1 s for confirm, reconnect and the other calls),
+nor make one phone's stuck removal delay another phone's enrolment (#118). So every
+invocation that removes bonds is budgeted: at most two `RemoveDevice` attempts, a second one
+started only while the invocation has spent under 100 ms (each BlueZ call is bounded at
+150 ms). A failed attempt backs its identity off exponentially from the attempt's
+completion (1 s, doubling to 30 s), and a round-robin cursor over `pending-removals` keeps one
+identity from starving the rest. Who may attempt what:
+
+- the periodic helper tick: any identity whose backoff has elapsed, within the budget;
+- reconciliation: one removal scan (reusing its single BlueZ inventory), only identities with
+  no failed attempt in this helper run, within the budget; it never retries, so its reply
+  never waits on another identity's backoff;
+- closing an enrolment window (confirm, reconnect, close, timeout): only that window's own
+  bond; the confirm, comparison and reconnect paths never run other identities' removals.
+
+What a budget leaves unattempted stays durably owed in `pending-removals` and is retried by
+later ticks; the identities stay refused for admission, reconnect and services until BlueZ
+confirms the removal, so a budget never weakens the fail-closed state, it only defers work.
 
 Revoked versus approved: history is cleared only when a fresh enrolment of the identity
 reaches the committed state: the owner explicitly accepted its number, the helper verified
@@ -88,7 +118,7 @@ the receiver retries on its next pacing step.
 | Trust write fails after the acknowledgement | journal entry, bond; no approval | the enrolment's source is retired and reconciliation removes the bond; no receiver record needed |
 | Approval only committed-but-not-durable (703) | approval (maybe lost), journal entry, bond | the receiver retracts (store forget, tracked revocation) and reconciles; if the retraction cannot be written either, the approval remains and reconciliation keeps the helper consistent with it; after a power loss the next start's reconciliation decides from what survived |
 | ForgetPhone durable while the helper is down, then the receiver restarts (finding 2) | no approval; helper still on `managed-bonds` | the receiver's record is lost but not needed: its start-up reconciliation demotes and removes the bond; the phone can enrol again |
-| Forget only non-durable (703) and power lost: approval resurrected | approval; helper on `revoked-bonds` | revoked wins: not admitted, counted as unadmitted (diagnostic `bond_reconcile_unadmitted`); ForgetPhone completes |
+| Forget only non-durable (703) and power lost: approval resurrected | approval; helper on `revoked-bonds` | revoked wins: not admitted, counted as unadmitted (diagnostic `bond_reconcile_unadmitted_enrol_again`); ForgetPhone completes |
 | Demotion's renames unsynced and power lost (finding 4) | managed entry back, maybe without history | the restarted helper admits nothing before reconciliation, which demotes again and reports success only once durable |
 | Demotion stops after the removal is owed (journal written, history and managed not) | approval gone; managed and journal entries, bond | the restarted helper admits nothing; reconciliation demotes again and removes the bond |
 | Demotion stops after history (managed entry not yet dropped) | managed, journal and history entries, bond | as above |
@@ -198,7 +228,7 @@ and store reload discard pending identity snapshots, close the gate and emit a
 reason diagnostic. Reload attempts advance the store epoch, including failed
 loads. Helper lease retirement removes unaccepted devices through
 BlueZ RemoveDevice and parks provisional ones; a failed removal stays queued for retry on
-helper ticks, even if BlueZ temporarily disappears. The queue is persisted next to
+helper ticks (budgeted and backed off, see Removal budget), even if BlueZ temporarily disappears. The queue is persisted next to
 `managed-bonds` as `pending-removals` (same root-owned directory, owner-only regular file,
 no-follow traversal, exclusive staging, fsync and atomic rename, at most 256
 records) and an entry is written before any window opens, so a helper restart
