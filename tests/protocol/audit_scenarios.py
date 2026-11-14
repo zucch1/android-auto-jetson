@@ -102,6 +102,10 @@ def aasdk(fixture: Path, rel: str, mutate: Callable[[str], str], generate_must_p
     repin(fixture, AASDK_TREE, "protobuf/aap_protobuf/", rel, mutate, generate_must_pass)
 
 
+def oaa(fixture: Path, rel: str, mutate: Callable[[str], str], generate_must_pass: bool = True) -> None:
+    repin(fixture, OAA_TREE, "oaa/", rel, mutate, generate_must_pass)
+
+
 FOCUS = "service/media/video/message/VideoFocusReason.proto"
 VFRN = "service/media/video/message/VideoFocusRequestNotification.proto"
 MEDIA_STATUS = "shared/MessageStatus.proto"
@@ -586,6 +590,129 @@ def sc_message_path_shape_boundary(f: Path) -> str:
     return ""
 
 
+def sc_contrasting_entity_annotations(f: Path) -> str:
+    # Add two contrasting annotated messages AND an unannotated message to the same channel/file
+    # (oaa/input/InputEventIndicationMessage.proto), re-pin, triage new diffs, regenerate, and
+    # verify each entity keeps only its own annotations + file/line provenance or explicit unknown.
+    oaa_rel = "input/InputEventIndicationMessage.proto"
+    full_oaa_rel = f"{OAA_TREE}/{oaa_rel}"
+    addition = (
+        "\n"
+        "// Wire msg id: 0x8091, Phone->HU, AA 17.1\n"
+        "// confidence: gold\n"
+        "message InputContrastAlpha {\n"
+        "    optional int32 alpha_val = 1;\n"
+        "}\n"
+        "\n"
+        "// Wire msg id: 0x8092, Bidirectional, AA 16.1\n"
+        "// confidence: unverified\n"
+        "message InputContrastBeta {\n"
+        "    optional string beta_val = 1;\n"
+        "}\n"
+        "\n"
+        "message InputContrastUnknown {\n"
+        "    optional bool unknown_val = 1;\n"
+        "}\n"
+    )
+    oaa(f, oaa_rel, lambda t: t + addition)
+
+    inv = load(f, INVENTORY)
+    triage = load(f, TRIAGE)
+    new_fqns = {
+        "oaa.proto.messages.InputContrastAlpha",
+        "oaa.proto.messages.InputContrastBeta",
+        "oaa.proto.messages.InputContrastUnknown",
+    }
+    for d in inv["differences"]:  # type: ignore[index]
+        if d.get("oaa") in new_fqns and d["id"] not in triage["entries"]:  # type: ignore[index]
+            triage["entries"][d["id"]] = {  # type: ignore[index]
+                "confidence": "high",
+                "disposition": "no-action",
+                "evidence_tier": "mechanical",
+                "impact": f"Synthetic probe entity {d['oaa']} for per-entity annotation test.",
+                "owner": "triage:phase0-closed",
+                "phone_evidence_status": "not-needed",
+                "rationale": "Synthetic contrasting annotation probe.",
+                "severity": d["severity"],
+                "status": "resolved",
+                "version_applicability": "n/a",
+            }
+    save(f, TRIAGE, triage)
+    gen = run(f, "--generate")
+    if gen.returncode != 0:
+        raise SystemExit(f"scenario setup error: regenerate after triage failed:\n{gen.stderr}")
+
+    inv = load(f, INVENTORY)
+    msgs = inv["schema_sets"]["oaa"]["messages"]  # type: ignore[index]
+
+    def _vals(ent: dict[str, object], key: str) -> list[str]:
+        block = ent["annotations"][key]  # type: ignore[index]
+        return [item["value"] for item in block["values"]]
+
+    def _srcs(ent: dict[str, object], key: str) -> list[tuple[str, int]]:
+        block = ent["annotations"][key]  # type: ignore[index]
+        return [
+            (src["file"], src["line"])
+            for item in block["values"]
+            for src in item["sources"]
+        ]
+
+    alpha = msgs["oaa.proto.messages.InputContrastAlpha"]
+    beta = msgs["oaa.proto.messages.InputContrastBeta"]
+    unk = msgs["oaa.proto.messages.InputContrastUnknown"]
+    orig = msgs["oaa.proto.messages.InputEventIndication"]
+
+    if _vals(alpha, "wire_msg_ids") != ["0x8091"] or _vals(alpha, "directions") != ["Phone->HU"] \
+            or _vals(alpha, "version_gates") != ["AA 17.1"] or _vals(alpha, "confidence") != ["gold"]:
+        raise SystemExit(f"FAIL: InputContrastAlpha annotations bled or mismatched: {alpha['annotations']}")
+    if _vals(beta, "wire_msg_ids") != ["0x8092"] or _vals(beta, "directions") != ["Bidirectional"] \
+            or _vals(beta, "version_gates") != ["AA 16.1"] or _vals(beta, "confidence") != ["unverified"]:
+        raise SystemExit(f"FAIL: InputContrastBeta annotations bled or mismatched: {beta['annotations']}")
+    if _vals(orig, "wire_msg_ids") != ["0x8001"] or _vals(orig, "directions") != ["HU->Phone"] \
+            or orig["annotations"]["retracted"]:
+        raise SystemExit(f"FAIL: InputEventIndication annotations contaminated: {orig['annotations']}")
+
+    # Provenance must point to the exact file and distinct comment lines for Alpha vs Beta
+    alpha_srcs = _srcs(alpha, "wire_msg_ids")
+    beta_srcs = _srcs(beta, "wire_msg_ids")
+    if not alpha_srcs or alpha_srcs[0][0] != full_oaa_rel or not beta_srcs or beta_srcs[0][0] != full_oaa_rel:
+        raise SystemExit(f"FAIL: unexpected provenance files: alpha={alpha_srcs} beta={beta_srcs}")
+    if alpha_srcs[0][1] >= beta_srcs[0][1]:
+        raise SystemExit(f"FAIL: provenance line ordering wrong: alpha={alpha_srcs} beta={beta_srcs}")
+
+    # Unannotated entity must record explicit unknown status for all annotation dimensions
+    for key in ("wire_msg_ids", "directions", "version_gates", "confidence"):
+        if unk["annotations"][key] != {"status": "unknown", "values": []}:
+            raise SystemExit(f"FAIL: expected explicit unknown for {key}, got {unk['annotations'][key]}")
+
+    # Channel summary must reflect the union derived from exported per-entity annotations
+    input_ch = next(c for c in inv["triage_summary"]["per_channel"] if c["channel"] == "input")  # type: ignore[index]
+    for wid in ("0x8001", "0x8091", "0x8092"):
+        if wid not in input_ch["wire_msg_ids"]:
+            raise SystemExit(f"FAIL: {wid} missing from input channel summary: {input_ch['wire_msg_ids']}")
+    if "Bidirectional" not in input_ch["directions"] or "AA 17.1" not in input_ch["version_gates"]:
+        raise SystemExit(f"FAIL: input channel summary missing contrasting values: {input_ch}")
+    return ""
+
+
+def sc_entity_annotation_mismatch(f: Path) -> str:
+    data = load(f, INVENTORY)
+    ann = data["schema_sets"]["oaa"]["messages"]["oaa.proto.messages.InputEventIndication"]["annotations"]  # type: ignore[index]
+    ann["wire_msg_ids"]["values"][0]["value"] = "0x9999"
+    save(f, INVENTORY, data)
+    return "ENTITY_ANNOTATION_MISMATCH"
+
+
+def sc_channel_annotation_mismatch(f: Path) -> str:
+    data = load(f, INVENTORY)
+    for row in data["triage_summary"]["per_channel"]:  # type: ignore[index]
+        if row["channel"] == "input":
+            row["wire_msg_ids"].append("0xDEAD")
+            break
+    save(f, INVENTORY, data)
+    return "CHANNEL_ANNOTATION_MISMATCH"
+
+
 SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "baseline": sc_baseline,
     "drift-inventory": sc_drift_inventory,
@@ -624,6 +751,9 @@ SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "renamed-enums-path-only": sc_renamed_enums_path_only,
     "zero-only-enum-false-match": sc_zero_only_enum_false_match,
     "message-path-shape-boundary": sc_message_path_shape_boundary,
+    "contrasting-entity-annotations": sc_contrasting_entity_annotations,
+    "entity-annotation-mismatch": sc_entity_annotation_mismatch,
+    "channel-annotation-mismatch": sc_channel_annotation_mismatch,
 }
 
 
