@@ -74,15 +74,17 @@ _VER_RE: Final = re.compile(
 _DEPRECATED_CMT_RE: Final = re.compile(r"@deprecated|\bdeprecated\b", re.I)
 
 
-def _strip_comment(text: str) -> list[str]:
+def _strip_comment_lines(text: str, start_line: int) -> list[tuple[int, str]]:
     if text.startswith("//"):
-        return [text[2:].strip()]
+        return [(start_line, text[2:].strip())]
     if text.startswith("/*") and text.endswith("*/"):
-        lines: list[str] = []
-        for raw in text[2:-2].splitlines():
+        lines: list[tuple[int, str]] = []
+        raw_lines = text[2:-2].splitlines()
+        if not raw_lines:
+            return [(start_line, "")]
+        for offset, raw in enumerate(raw_lines):
             s = raw.strip().lstrip("*").strip()
-            if s:
-                lines.append(s)
+            lines.append((start_line + offset, s))
         return lines
     return []
 
@@ -98,55 +100,97 @@ def _normalize_dir(raw: str) -> str:
     return raw
 
 
-def _parse_comment_lines(lines: list[str]) -> dict[str, Any]:
-    confidences: list[str] = []
+def _format_annotation_field(sources_by_val: dict[str, set[tuple[str, str, str, int]]]) -> dict[str, Any]:
+    if not sources_by_val:
+        return {"status": "unknown", "values": []}
+    return {
+        "status": "known",
+        "values": [
+            {
+                "value": val,
+                "sources": [
+                    {"kind": kind, "scope": scope, "file": fpath, "line": ln}
+                    for kind, scope, fpath, ln in sorted(srcs, key=lambda x: (x[0], x[2], x[3], x[1]))
+                ],
+            }
+            for val, srcs in sorted(sources_by_val.items())
+        ],
+    }
+
+
+def annotation_values(ann: dict[str, Any] | None, field: str) -> list[str]:
+    """Extract sorted list of string values from either structured or legacy annotation field."""
+    if not isinstance(ann, dict):
+        return []
+    val = ann.get(field)
+    if isinstance(val, dict):
+        items = val.get("values", [])
+        if not isinstance(items, list):
+            return []
+        return [str(item["value"]) for item in items if isinstance(item, dict) and "value" in item]
+    if isinstance(val, list):
+        return [str(x) for x in val]
+    return []
+
+
+def _parse_comment_entries(
+    entries: list[tuple[int, str, str]], file_path: str,
+) -> dict[str, Any]:
+    conf_srcs: dict[str, set[tuple[str, str, str, int]]] = {}
+    id_srcs: dict[str, set[tuple[str, str, str, int]]] = {}
+    dir_srcs: dict[str, set[tuple[str, str, str, int]]] = {}
+    ver_srcs: dict[str, set[tuple[str, str, str, int]]] = {}
     retracted = False
     retraction_notes: list[str] = []
-    wire_ids: list[str] = []
-    directions: list[str] = []
-    versions: list[str] = []
+    retraction_srcs: set[tuple[str, str, str, int]] = set()
     deprecated = False
-    for line in lines:
+
+    for line_num, scope, line in entries:
+        if not line:
+            continue
+        src = ("proto_comment", scope, file_path, line_num)
         for m in _CONFIDENCE_RE.finditer(line):
             val = m.group(1).lower()
-            if val not in confidences:
-                confidences.append(val)
+            conf_srcs.setdefault(val, set()).add(src)
             if val == "retracted":
                 retracted = True
+                retraction_srcs.add(src)
         if _RETRACTED_RE.search(line):
             retracted = True
+            retraction_srcs.add(src)
             if "retraction" not in line.lower() or "retained" not in line.lower():
                 if len(retraction_notes) < 2 and line not in retraction_notes:
                     retraction_notes.append(line)
         for m in _MSG_ID_RE.finditer(line):
             raw_id = m.group(1)
             norm_id = f"0x{int(raw_id, 16):04X}" if raw_id.lower().startswith("0x") else raw_id
-            if norm_id not in wire_ids:
-                wire_ids.append(norm_id)
+            id_srcs.setdefault(norm_id, set()).add(src)
         for m in _HEX_MSG_RE.finditer(line):
             norm_id = f"0x{int(m.group(1), 16):04X}"
-            if norm_id not in wire_ids:
-                wire_ids.append(norm_id)
+            id_srcs.setdefault(norm_id, set()).add(src)
         for m in _DIR_RE.finditer(line):
             nd = _normalize_dir(m.group(1))
-            if nd not in directions:
-                directions.append(nd)
+            dir_srcs.setdefault(nd, set()).add(src)
         for m in _VER_RE.finditer(line):
             v = next((g for g in m.groups() if g), "")
             if v:
                 prefix = "PDK " if "pdk" in m.group(0).lower() else ("HAL " if "hal" in m.group(0).lower() else "AA ")
                 tag = f"{prefix}{v}"
-                if tag not in versions:
-                    versions.append(tag)
+                ver_srcs.setdefault(tag, set()).add(src)
         if _DEPRECATED_CMT_RE.search(line):
             deprecated = True
+
     return {
-        "confidence": confidences,
+        "confidence": _format_annotation_field(conf_srcs),
         "retracted": retracted,
         "retraction_note": "; ".join(retraction_notes),
-        "wire_msg_ids": sorted(wire_ids),
-        "directions": sorted(directions),
-        "version_gates": sorted(versions),
+        "retraction_sources": [
+            {"kind": kind, "scope": scope, "file": fpath, "line": ln}
+            for kind, scope, fpath, ln in sorted(retraction_srcs, key=lambda x: (x[0], x[2], x[3], x[1]))
+        ],
+        "wire_msg_ids": _format_annotation_field(id_srcs),
+        "directions": _format_annotation_field(dir_srcs),
+        "version_gates": _format_annotation_field(ver_srcs),
         "deprecated_comment": deprecated,
     }
 
@@ -154,7 +198,10 @@ def _parse_comment_lines(lines: list[str]) -> dict[str, Any]:
 def extract_file_comments(content: str, path: str) -> dict[str, Any]:
     """Extract per-line comment lines and file-level structured annotations."""
     line_comments: dict[int, list[str]] = {}
-    all_lines: list[str] = []
+    comment_lines: dict[int, list[str]] = {}
+    block_start_by_end: dict[int, int] = {}
+    code_lines: set[int] = set()
+    all_entries: list[tuple[int, str, str]] = []
     pos = 0
     line = 1
     n = len(content)
@@ -164,17 +211,29 @@ def extract_file_comments(content: str, path: str) -> dict[str, Any]:
             break
         kind = m.lastgroup or ""
         text = m.group(0)
+        span_lines = text.count("\n")
         if kind in ("lc", "bc"):
-            stripped = _strip_comment(text)
-            if stripped:
-                end_line = line + text.count("\n")
-                line_comments.setdefault(end_line, []).extend(stripped)
-                all_lines.extend(stripped)
-        line += text.count("\n")
+            stripped_with_lines = _strip_comment_lines(text, line)
+            end_line = line + span_lines
+            if kind == "bc":
+                prev = block_start_by_end.get(end_line)
+                block_start_by_end[end_line] = min(prev, line) if prev is not None else line
+            for ln, s in stripped_with_lines:
+                comment_lines.setdefault(ln, []).append(s)
+                if s:
+                    line_comments.setdefault(end_line, []).append(s)
+                    all_entries.append((ln, "file_comment", s))
+        elif kind != "ws":
+            for ln in range(line, line + span_lines + 1):
+                code_lines.add(ln)
+        line += span_lines
         pos = m.end()
     return {
-        "file_annotations": _parse_comment_lines(all_lines),
+        "file_annotations": _parse_comment_entries(all_entries, path),
         "line_comments": line_comments,
+        "comment_lines": comment_lines,
+        "block_start_by_end": block_start_by_end,
+        "code_lines": code_lines,
     }
 
 
@@ -311,11 +370,13 @@ class _Parser:
     def parse_file(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "syntax": "proto2", "package": "", "imports": [], "options": {},
-            "messages": [], "enums": [], "services": [],
+            "messages": [], "enums": [], "services": [], "first_preamble_line": None,
         }
         while self.i < len(self.t):
             tok = self.peek()
             if tok == "syntax":
+                if out["first_preamble_line"] is None and not out["messages"] and not out["enums"] and not out["services"]:
+                    out["first_preamble_line"] = self.line()
                 self.next()
                 self.expect("=")
                 out["syntax"] = self.string()
@@ -323,16 +384,22 @@ class _Parser:
                 if out["syntax"] not in ("proto2", "proto3"):
                     raise self.err(f"unsupported syntax {out['syntax']!r}")
             elif tok == "package":
+                if out["first_preamble_line"] is None and not out["messages"] and not out["enums"] and not out["services"]:
+                    out["first_preamble_line"] = self.line()
                 self.next()
                 out["package"] = self.ident()
                 self.expect(";")
             elif tok == "import":
+                if out["first_preamble_line"] is None and not out["messages"] and not out["enums"] and not out["services"]:
+                    out["first_preamble_line"] = self.line()
                 self.next()
                 if self.peek() in ("public", "weak"):
                     self.next()
                 out["imports"].append(self.string())
                 self.expect(";")
             elif tok == "option":
+                if out["first_preamble_line"] is None and not out["messages"] and not out["enums"] and not out["services"]:
+                    out["first_preamble_line"] = self.line()
                 k, v = self.option_statement()
                 out["options"][k] = v
             elif tok == "message":
@@ -447,6 +514,7 @@ class _Parser:
             else:
                 raise self.err(f"unexpected token {tok!r} in enum {name}")
         self.expect("}")
+        e["end_line"] = self.t[self.i - 1][2]
         return e
 
     # -- message ---------------------------------------------------------
@@ -525,6 +593,7 @@ class _Parser:
             else:
                 m["fields"].append(self.field(label=None))
         self.expect("}")
+        m["end_line"] = self.t[self.i - 1][2]
         return m
 
     def field(self, label: str | None) -> dict[str, Any]:
@@ -570,7 +639,7 @@ def _collect(
         if fqn in msgs or fqn in enums:
             raise ProtoParseError(file_path, e["line"], f"duplicate symbol {fqn}")
         enums[fqn] = {
-            "fqn": fqn, "rel": rel, "file": file_path, "line": e["line"],
+            "fqn": fqn, "rel": rel, "file": file_path, "line": e["line"], "end_line": e["end_line"],
             "syntax": syntax,
             "values": [{"name": v["name"], "number": v["number"], "line": v["line"],
                         "deprecated": v["options"].get("deprecated") == "true"}
@@ -584,7 +653,8 @@ def _collect(
         if fqn in msgs or fqn in enums:
             raise ProtoParseError(file_path, m["line"], f"duplicate symbol {fqn}")
         msgs[fqn] = {
-            "fqn": fqn, "rel": rel, "file": file_path, "line": m["line"], "syntax": syntax,
+            "fqn": fqn, "rel": rel, "file": file_path, "line": m["line"], "end_line": m["end_line"],
+            "syntax": syntax,
             "raw_fields": m["fields"], "oneofs": m["oneofs"],
             "reserved_ranges": m["reserved_ranges"], "reserved_names": m["reserved_names"],
             "extension_ranges": m["extension_ranges"],
@@ -607,7 +677,26 @@ def _resolve(type_name: str, scope: str, symbols: dict[str, str]) -> str | None:
         parts.pop()
 
 
-def build_schema_set(files: dict[str, str]) -> dict[str, Any]:
+def _preceding_comment_lines(cinfo: dict[str, Any], start_line: int) -> list[int]:
+    """Return sorted line numbers of the contiguous comment block directly above start_line."""
+    comment_lines = cinfo["comment_lines"]
+    block_start_by_end = cinfo["block_start_by_end"]
+    code_lines = cinfo["code_lines"]
+    collected: list[int] = []
+    cur = start_line - 1
+    while cur >= 1 and cur in comment_lines and cur not in code_lines:
+        blk_start = block_start_by_end.get(cur, cur)
+        if any(ln in code_lines for ln in range(blk_start, cur + 1)):
+            break
+        collected.extend(range(cur, blk_start - 1, -1))
+        cur = blk_start - 1
+    collected.reverse()
+    return collected
+
+
+def build_schema_set(
+    files: dict[str, str], file_paths: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Parse ``{path: text}`` into a resolved structural model.
 
     Returns ``{"files": {path: {...}}, "messages": {fqn: ...}, "enums": {fqn: ...}}``.
@@ -684,48 +773,106 @@ def build_schema_set(files: dict[str, str]) -> dict[str, Any]:
     for e in enums.values():
         e["values"].sort(key=lambda v: (v["number"], v["name"]))
 
-    comments_by_file = {path: extract_file_comments(files[path], path) for path in parsed}
-    top_entities_per_file: dict[str, int] = {}
-    for ent in (*msgs.values(), *enums.values()):
-        top_entities_per_file[ent["file"]] = top_entities_per_file.get(ent["file"], 0) + 1
+    comments_by_file = {
+        path: extract_file_comments(files[path], (file_paths or {}).get(path, path))
+        for path in parsed
+    }
+    preceding_lines_by_ent: dict[tuple[str, str], list[int]] = {}
+    for kind, col in (("message", msgs), ("enum", enums)):
+        for fqn, ent in col.items():
+            preceding_lines_by_ent[(kind, fqn)] = _preceding_comment_lines(
+                comments_by_file[ent["file"]], ent["line"],
+            )
 
-    for ent in (*msgs.values(), *enums.values()):
-        cinfo = comments_by_file[ent["file"]]
-        lc = cinfo["line_comments"]
-        raw_lines = files[ent["file"]].splitlines()
-        # Collect contiguous comment block directly above the entity declaration line
-        block: list[str] = []
-        cur = ent["line"] - 1
-        while cur >= 1:
-            if cur in lc:
-                block = lc[cur] + block
-                cur -= 1
-                continue
-            if 0 <= cur - 1 < len(raw_lines) and not raw_lines[cur - 1].strip():
-                cur -= 1
-                continue
-            break
-        # Also include file header comments (before line 1..first decl) if single-entity or top-level
-        fa = cinfo["file_annotations"]
-        ea = _parse_comment_lines(block)
-        if top_entities_per_file.get(ent["file"], 0) <= 2:
-            # Merge file-level annotations when the file represents one primary schema (or wrapper+enum)
-            merged_conf = list(dict.fromkeys([*ea["confidence"], *fa["confidence"]]))
-            merged_ret = ea["retracted"] or fa["retracted"]
-            merged_note = ea["retraction_note"] or fa["retraction_note"]
-            merged_ids = sorted(set(ea["wire_msg_ids"]) | set(fa["wire_msg_ids"]))
-            merged_dirs = sorted(set(ea["directions"]) | set(fa["directions"]))
-            merged_vers = sorted(set(ea["version_gates"]) | set(fa["version_gates"]))
-            ea = {
-                "confidence": merged_conf,
-                "retracted": merged_ret,
-                "retraction_note": merged_note,
-                "wire_msg_ids": merged_ids,
-                "directions": merged_dirs,
-                "version_gates": merged_vers,
-                "deprecated_comment": ea["deprecated_comment"] or fa["deprecated_comment"],
-            }
-        ent["annotations"] = ea
+    header_ann_by_file: dict[str, dict[str, Any]] = {}
+    for fpath, p in parsed.items():
+        first_preamble = p["first_preamble_line"]
+        if first_preamble is None:
+            continue
+        comment_lines = comments_by_file[fpath]["comment_lines"]
+        hdr_entries = [
+            (ln, "file_header", s)
+            for ln in range(1, first_preamble)
+            for s in comment_lines.get(ln, [])
+            if s
+        ]
+        prov_path = (file_paths or {}).get(fpath, fpath)
+        header_ann_by_file[fpath] = _parse_comment_entries(hdr_entries, prov_path)
+
+    for kind, col in (("message", msgs), ("enum", enums)):
+        for fqn, ent in col.items():
+            fpath = ent["file"]
+            cinfo = comments_by_file[fpath]
+            comment_lines = cinfo["comment_lines"]
+            p = parsed[fpath]
+            first_preamble = p["first_preamble_line"]
+            top_level_count = len(p["messages"]) + len(p["enums"])
+
+            seen_line_nums: set[int] = set()
+            entries: list[tuple[int, str, str]] = []
+
+            def add_line(ln: int, scope_name: str) -> None:
+                if ln in seen_line_nums:
+                    return
+                lines_at = comment_lines.get(ln)
+                if not lines_at:
+                    return
+                seen_line_nums.add(ln)
+                for s in lines_at:
+                    if s:
+                        entries.append((ln, scope_name, s))
+
+            # 1. Contiguous comment block directly above this entity declaration
+            for ln in preceding_lines_by_ent[(kind, fqn)]:
+                add_line(ln, "entity_comment")
+
+            # 2. Inline/body comments inside this entity's span, excluding nested entities
+            excluded: set[int] = set()
+            if kind == "message":
+                for nfqn in ent["nested_messages"]:
+                    nm = msgs[nfqn]
+                    excluded.update(range(nm["line"], nm["end_line"] + 1))
+                    excluded.update(preceding_lines_by_ent[("message", nfqn)])
+                for nfqn in ent["nested_enums"]:
+                    ne = enums[nfqn]
+                    excluded.update(range(ne["line"], ne["end_line"] + 1))
+                    excluded.update(preceding_lines_by_ent[("enum", nfqn)])
+            for ln in range(ent["line"], ent["end_line"] + 1):
+                if ln not in excluded:
+                    add_line(ln, "entity_body")
+
+            # 3. File-header comments (strictly before first preamble token) apply ONLY when
+            #    there is an unambiguous single primary top-level declaration (top_level_count == 1),
+            #    which covers: (a) a sole top-level message, (b) a sole top-level enum, or
+            #    (c) OAA's wrapper idiom `message Foo { enum Enum { ... } }` (empty top-level
+            #    message with no fields, no nested messages, and one nested enum).
+            is_top_level = "." not in ent["rel"]
+            is_wrapper_enum = False
+            if kind == "enum" and "." in ent["rel"]:
+                parent_fqn = fqn.rsplit(".", 1)[0]
+                pm = msgs.get(parent_fqn)
+                if (pm is not None and "." not in pm["rel"]
+                        and not pm["fields"] and not pm["nested_messages"]
+                        and len(pm["nested_enums"]) == 1):
+                    is_wrapper_enum = True
+            if first_preamble is not None and top_level_count == 1 and (is_top_level or is_wrapper_enum):
+                for ln in range(1, first_preamble):
+                    add_line(ln, "file_header")
+
+            entries.sort(key=lambda item: (item[0], item[1], item[2]))
+            prov_path = (file_paths or {}).get(fpath, fpath)
+            ann = _parse_comment_entries(entries, prov_path)
+            if first_preamble is not None and top_level_count > 1 and (is_top_level or is_wrapper_enum):
+                hdr_ann = header_ann_by_file.get(fpath, {})
+                for attr in ("wire_msg_ids", "directions", "version_gates", "confidence"):
+                    if (ann[attr]["status"] == "unknown"
+                            and isinstance(hdr_ann.get(attr), dict)
+                            and hdr_ann[attr].get("status") == "known"):
+                        ann[attr]["reason"] = (
+                            f"file-header {attr} withheld: {top_level_count} top-level declarations "
+                            f"in {prov_path} without a single primary or wrapper/enum relationship"
+                        )
+            ent["annotations"] = ann
 
     file_info = {
         path: {

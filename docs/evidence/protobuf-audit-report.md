@@ -118,28 +118,30 @@ Derived mechanically from `.proto` paths/packages, receiver C++ sources (`src/pr
 | `av-audio` | 12 | 1 | 3 | 0 | 0 | 0 | 1 | 3 | 2 | 2 | 0 | 0 | 4 | 8 | 4 | 8 | 0 | 4 | 0 |
 | `av-mic` | 9 | 0 | 6 | 1 | 0 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 9 | 1 | 7 | 0 | 2 | 0 |
 | `av-shared` | 48 | 5 | 7 | 4 | 1 | 1 | 12 | 13 | 4 | 1 | 0 | 0 | 29 | 26 | 16 | 21 | 14 | 13 | 0 |
-| `input` | 36 | 4 | 17 | 2 | 1 | 0 | 1 | 7 | 0 | 3 | 0 | 1 | 10 | 14 | 4 | 32 | 0 | 4 | 4 |
+| `input` | 36 | 4 | 17 | 2 | 1 | 0 | 1 | 7 | 0 | 3 | 0 | 1 | 10 | 14 | 4 | 32 | 0 | 4 | 0 |
 | `sensor` | 176 | 61 | 42 | 5 | 1 | 1 | 13 | 41 | 11 | 1 | 0 | 0 | 60 | 20 | 11 | 163 | 13 | 0 | 1 |
 | `bluetooth` | 17 | 6 | 1 | 2 | 0 | 2 | 3 | 2 | 0 | 0 | 1 | 0 | 7 | 1 | 0 | 10 | 4 | 3 | 0 |
 | `wifi-projection` | 31 | 9 | 5 | 1 | 1 | 0 | 3 | 3 | 6 | 3 | 0 | 0 | 7 | 18 | 4 | 23 | 0 | 8 | 3 |
 | `wireless-bootstrap` | 41 | 0 | 7 | 3 | 7 | 10 | 0 | 0 | 5 | 5 | 1 | 3 | 3 | 16 | 0 | 29 | 3 | 9 | 1 |
 | `navigation` | 72 | 0 | 16 | 2 | 6 | 3 | 13 | 2 | 23 | 2 | 0 | 5 | 20 | 0 | 0 | 20 | 52 | 0 | 0 |
-| `media-playback` | 21 | 3 | 7 | 0 | 0 | 0 | 2 | 0 | 5 | 4 | 0 | 0 | 2 | 0 | 0 | 14 | 7 | 0 | 10 |
+| `media-playback` | 21 | 3 | 7 | 0 | 0 | 0 | 2 | 0 | 5 | 4 | 0 | 0 | 2 | 0 | 0 | 14 | 7 | 0 | 2 |
 | `media-browser` | 18 | 6 | 0 | 0 | 0 | 11 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 18 | 0 | 0 | 0 |
 | `phone-status` | 9 | 0 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 8 | 1 | 0 | 0 |
 | `radio` | 133 | 17 | 0 | 0 | 7 | 39 | 0 | 28 | 30 | 6 | 0 | 6 | 28 | 1 | 0 | 56 | 77 | 0 | 0 |
 | `generic-notification` | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 2 | 0 | 2 | 0 | 1 | 0 | 8 | 0 | 0 | 0 |
-| `car-control` | 29 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 16 | 13 | 0 | 0 | 0 | 0 | 0 | 29 | 0 | 0 | 1 |
+| `car-control` | 29 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 16 | 13 | 0 | 0 | 0 | 0 | 0 | 29 | 0 | 0 | 0 |
 | `car-intent` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 |
 | `vendor-extension` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | `shared` | 50 | 37 | 0 | 0 | 0 | 0 | 2 | 3 | 3 | 4 | 0 | 1 | 5 | 3 | 1 | 46 | 4 | 0 | 0 |
 
 ### Per-channel protocol metadata & receiver coverage
 
+Channel-level metadata below is aggregated strictly from per-entity `annotations` in `schema_sets.<side>.messages|enums.<fqn>` (where each value records `proto_comment` `file:line` provenance and missing attributes are marked `status: "unknown"`).
+
 | Channel | AASDK / OAA entities | Wire msg IDs (from .proto) | Directions | Version gates | OAA confidence | Active C++ files |
 |---|---:|---|---|---|---|---|
-| `control` | 62 / 127 | 0x0009, 0x001A, 0x8001, 0x800B, 11, 12 … | Bidirectional, HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.3 | bronze, gold, retracted, silver, unverified | `ControlAdapter.cpp`, `FocusAdapter.cpp`, `MediaConfiguration.cpp`, `ServiceAdapter.cpp` |
-| `av-video` | 7 / 44 | 0x8007, 0x8008, 0x8009, 0x800A, 0x800D, 0x800E … | Bidirectional, HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.3 | bronze, gold, silver, unverified | `AvSinkAdapter.cpp`, `MediaConfiguration.cpp` |
+| `control` | 62 / 127 | 0x0009, 0x001A, 0x8000, 0x8001, 0x800B, 11 … | Bidirectional, HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.3 | bronze, gold, retracted, silver, unverified | `ControlAdapter.cpp`, `FocusAdapter.cpp`, `MediaConfiguration.cpp`, `ServiceAdapter.cpp` |
+| `av-video` | 7 / 44 | 0x8007, 0x8008, 0x8009, 0x800A, 0x800D, 0x800E … | Bidirectional, HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.1, AA 17.3 | bronze, gold, silver, unverified | `AvSinkAdapter.cpp`, `MediaConfiguration.cpp` |
 | `av-audio` | 3 / 7 | - | HU->Phone | AA 16.2, AA 17.3 | bronze, silver, unverified | `MediaConfiguration.cpp`, `ServiceAdapter.cpp` |
 | `av-mic` | 4 / 1 | 0x8006, 0x8007 | HU->Phone | AA 16.2 | bronze | `AvSinkAdapter.cpp`, `MediaConfiguration.cpp`, `MicrophoneAdapter.cpp` |
 | `av-shared` | 12 / 24 | 0x8000, 0x8001, 0x8002, 0x8003, 0x8004, 0x8010 … | Bidirectional, HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.3, PDK 5.0 | bronze, gold, silver, unverified | `AvSinkAdapter.cpp`, `MediaConfiguration.cpp`, `MicrophoneAdapter.cpp` |
@@ -149,12 +151,12 @@ Derived mechanically from `.proto` paths/packages, receiver C++ sources (`src/pr
 | `wifi-projection` | 6 / 15 | 0x8001, 0x8002 | - | AA 16.1, AA 16.2 | bronze, retracted, silver, unverified | `Bootstrap.cpp`, `MediaConfiguration.cpp`, `WifiProjectionAdapter.cpp` |
 | `wireless-bootstrap` | 9 / 23 | 0, 1, 10, 2, 3, 4 … | - | AA 16.1, AA 17.3 | bronze, silver, unverified | `Bootstrap.cpp` |
 | `navigation` | 28 / 51 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006 … | HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.3, PDK 1.6 | silver, unverified | - |
-| `media-playback` | 5 / 13 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x800C … | HU->Phone, Phone->HU | AA 16.1, AA 16.2 | gold, silver, unverified | - |
-| `media-browser` | 12 / 13 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006 | HU->Phone, Phone->HU | AA 16.1, AA 16.2 | unverified | - |
+| `media-playback` | 5 / 13 | 0x8001, 0x8002, 0x8003, 0x800C | HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.3 | gold, silver, unverified | - |
+| `media-browser` | 12 / 13 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006 | - | AA 16.1, AA 16.2 | unverified | - |
 | `phone-status` | 6 / 7 | 0x8001, 0x8002 | Phone->HU | AA 16.1, AA 16.2 | gold | - |
 | `radio` | 47 / 74 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006 … | HU->Phone, Phone->HU | AA 16.1, AA 16.2 | silver, unverified | `ServiceAdapter.cpp` |
 | `generic-notification` | 6 / 3 | - | - | AA 16.1, AA 16.2 | bronze, unverified | `ServiceAdapter.cpp` |
-| `car-control` | 0 / 37 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006 … | HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.3 | silver, unverified | - |
+| `car-control` | 0 / 37 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006 … | - | AA 16.1, AA 16.2 | gold, silver, unverified | - |
 | `car-intent` | 0 / 1 | - | HU->Phone | AA 17.3 | bronze | - |
 | `vendor-extension` | 1 / 0 | - | - | - | - | - |
 | `shared` | 4 / 24 | 0x8002 | - | AA 16.1, AA 16.2, AA 17.3 | bronze, silver, unverified | `ControlAdapter.cpp`, `MicrophoneAdapter.cpp`, `SensorAdapter.cpp` |
@@ -235,65 +237,63 @@ Wireless Android Auto uses two distinct protocol layers on top of or alongside W
 
 ## OAA retracted & contradictory entities
 
-OAA explicitly marks **64** schema entities `confidence: retracted` in its `.proto` comments (e.g., wrong channel attribution such as `oaa/video/VideoFocusNotificationMessage.proto` mapped to `0x800E` instead of `0x8008` `VideoFocusIndicationMessage.proto`, or unconfirmed `ConnectionConfiguration`). Audited diffs touching retracted OAA definitions cannot be treated as normative without phone capture:
+OAA explicitly marks **60** schema entities `confidence: retracted` in its `.proto` comments (e.g., wrong channel attribution such as `oaa/video/VideoFocusNotificationMessage.proto` mapped to `0x800E` instead of `0x8008` `VideoFocusIndicationMessage.proto`, or unconfirmed `ConnectionConfiguration`). Audited diffs touching retracted OAA definitions cannot be treated as normative without phone capture:
 
 | Kind | Channel | OAA FQN | `.proto` file | Retraction note |
 |---|---|---|---|---|
 | message | `control` | `data.CapConnBool` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapConnComplex` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapConnComplexA` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapConnComplexB` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapConnComplexC` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapConnComplex` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aafg (int + CapConnTuning)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapConnComplexA` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aaff  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapConnComplexB` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aaff  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapConnComplexC` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aaff  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.CapConnComplexD` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.CapConnEmpty` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapConnModelDetail` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapConnModelList` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapConnModelNode` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapConnModelDetail` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aagf (5 strings)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapConnModelList` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aafz (repeated string)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapConnModelNode` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aagg  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.CapConnModelPair` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.CapConnModelStrings` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapConnModelTree` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapConnTuning` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapConnValue` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapabilityConnectionConfig` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapabilityConnectionEntry` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.CapabilityEntry` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapConnModelTree` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aagh  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapConnTuning` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; enum  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapConnValue` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aaga  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapabilityConnectionConfig` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aafl (oneof with 6 alternatives)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapabilityConnectionEntry` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aafi  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.CapabilityEntry` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; 16.2: aagk  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.CapabilityFlag` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.CapabilityPair` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.CapabilityValueMsg` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.ConnectionConfiguration` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.ConnectionConfiguration` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: zyd (16.1) → zxk (16.2)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.ConnectionFeatureFlags` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.ConnectionReservedConfig` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.ConnectionSecurityConfig` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.ConnectionTransportConfig` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.ConnectionTuningConfig` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.ConnectionTransportConfig` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aajt (16.1) → aaiz (16.2)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.ConnectionTuningConfig` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aajf (16.1) → aail (16.2)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `wifi-projection` | `data.GroupOwnerInfo` | `wifi/WifiDirectConfigData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.HandwritingInputModelConfig` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.InputModelDescriptor` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.InputModelEntry` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.PhoneCapabilities` | `control/PhoneCapabilitiesMessage.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.PingConfigEntry` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.PhoneCapabilities` | `control/PhoneCapabilitiesMessage.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; 16.2: aafn  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.PingConfigEntry` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; 16.2: long (was uint32)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.PingConfigPair` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.TransportCapabilities` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.TransportCapabilityEntry` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.TransportMetadata` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.TransportMetadata` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aajs (16.1) → aaiy (16.2)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.TransportSecurityCertChain` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.TransportSecurityConfig` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.TransportSecurityDetail` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.TransportSecurityDetail` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aajg (5 strings)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.TransportSecurityEntry` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.TransportSecurityParamEntry` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.TransportSecurityParams` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.TuningEntry` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.TuningParamsA` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.TuningParamsB` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.TuningParamsC` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.TransportSecurityParams` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aaje  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.TuningEntry` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; enum  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.TuningParamsA` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aaik  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.TuningParamsB` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aaik  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.TuningParamsC` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aaik  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.TuningParamsD` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `wifi-projection` | `data.WiFiProjectionChannel` | `wifi/WifiProjectionChannelData.proto` | RETRACTED — duplicate of WifiChannelData.proto (WifiChannel); confidence: retracted [apk_static, deep_trace] |
-| message | `wifi-projection` | `data.WifiDirectConfig` | `wifi/WifiDirectConfigData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `input` | `messages.InputEventIndication` | `input/InputEventIndicationMessage.proto` | RETRACTED: AbsInputEvent (was vvh in 16.1) — vvh in 16.2 is a different proto (1 int32 field); RETRACTED: AbsoluteEvent (was vvi in 16.1) — vvi in 16.2 is BatteryStatus (3 scalar fields) |
+| message | `wifi-projection` | `data.WifiDirectConfig` | `wifi/WifiDirectConfigData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; WiFi Direct device name  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `media-playback` | `messages.MediaPlaybackCommand` | `media/MediaPlaybackCommandMessage.proto` | RETRACTED — this message does not exist in the AA protocol. |
-| message | `media-playback` | `messages.MediaPlaybackStatus` | `media/MediaPlaybackStatusMessage.proto` | RETRACTED — MediaEventIdWrapper and MediaEventId are NOT wire protocol messages.; Retracted: 2026-03-06, proto-verification pipeline |
-| message | `sensor` | `messages.SensorStartRequestMessage` | `sensor/SensorStartRequestMessage.proto` | RETRACTED: Use SensorRequestMessage (SensorRequest) instead; confidence: retracted [apk_static, cross_version] |
-| message | `av-video` | `messages.VideoFocusNotification` | `video/VideoFocusNotificationMessage.proto` | RETRACTED — see IntegratedOverlayStartNotification.proto |
+| message | `sensor` | `messages.SensorStartRequestMessage` | `sensor/SensorStartRequestMessage.proto` | RETRACTED — Duplicate of SensorRequestMessage.proto.; RETRACTED: Use SensorRequestMessage (SensorRequest) instead |
+| message | `av-video` | `messages.VideoFocusNotification` | `video/VideoFocusNotificationMessage.proto` | RETRACTED — VideoFocusNotification does not exist.; RETRACTED — see IntegratedOverlayStartNotification.proto |
 | enum | `control` | `data.CapConnTuningType` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | enum | `control` | `data.CapabilityEnum` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | enum | `control` | `data.ConnectionSecurityMode` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
@@ -301,8 +301,6 @@ OAA explicitly marks **64** schema entities `confidence: retracted` in its `.pro
 | enum | `control` | `data.PhoneIdentifierType` | `control/PhoneCapabilitiesMessage.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | enum | `control` | `data.TuningEntryType` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | enum | `media-playback` | `messages.PlaybackCommandType` | `media/MediaPlaybackCommandMessage.proto` | RETRACTED — misidentified enum. Actual class vuy is ActionTakenNotification |
-| enum | `media-playback` | `messages.PlaybackState` | `media/MediaPlaybackStatusMessage.proto` | RETRACTED — MediaEventIdWrapper and MediaEventId are NOT wire protocol messages.; Retracted: 2026-03-06, proto-verification pipeline |
-| enum | `car-control` | `messages.SideAffinity` | `carcontrol/CarControlMessages.proto` | CarControlStatus — RETRACTED |
 
 ## Findings
 

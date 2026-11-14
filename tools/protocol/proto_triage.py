@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import proto_compare as pc
+import proto_schema as ps
 
 ALLOWED_TRIAGE_DISPOSITIONS: Final[frozenset[str]] = frozenset({
     "no-action",
@@ -349,12 +350,21 @@ def derive_annotations(diff: dict[str, Any], sets: dict[str, dict[str, Any]]) ->
         "aasdk_line": _field_or_value_line(diff, aa_ent),
         "oaa_file": oa_ent["file"] if oa_ent else "",
         "oaa_line": _field_or_value_line(diff, oa_ent),
-        "oaa_confidence": oa_ann.get("confidence", []),
+        "oaa_confidence": ps.annotation_values(oa_ann, "confidence"),
         "oaa_retracted": bool(oa_ann.get("retracted", False)),
         "oaa_retraction_note": oa_ann.get("retraction_note", ""),
-        "wire_msg_ids": sorted(set(aa_ann.get("wire_msg_ids", [])) | set(oa_ann.get("wire_msg_ids", []))),
-        "directions": sorted(set(aa_ann.get("directions", [])) | set(oa_ann.get("directions", []))),
-        "version_gates": sorted(set(aa_ann.get("version_gates", [])) | set(oa_ann.get("version_gates", []))),
+        "wire_msg_ids": sorted(
+            set(ps.annotation_values(aa_ann, "wire_msg_ids"))
+            | set(ps.annotation_values(oa_ann, "wire_msg_ids"))
+        ),
+        "directions": sorted(
+            set(ps.annotation_values(aa_ann, "directions"))
+            | set(ps.annotation_values(oa_ann, "directions"))
+        ),
+        "version_gates": sorted(
+            set(ps.annotation_values(aa_ann, "version_gates"))
+            | set(ps.annotation_values(oa_ann, "version_gates"))
+        ),
     }
 
 
@@ -766,8 +776,8 @@ def derive_usage(
     }
 
 
-def _derive_channel_catalog(sets: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Aggregate msg IDs, directions, version gates, and OAA confidence across ALL entities per channel."""
+def _derive_channel_catalog(schema_models: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Aggregate msg IDs, directions, version gates, and OAA confidence from exported per-entity data."""
     cat: dict[str, dict[str, Any]] = {}
 
     def ensure(ch: str) -> dict[str, Any]:
@@ -782,25 +792,25 @@ def _derive_channel_catalog(sets: dict[str, dict[str, Any]]) -> dict[str, dict[s
         })
 
     for col in ("messages", "enums"):
-        for fqn, ent in sets["aasdk"][col].items():
+        for fqn, ent in schema_models["aasdk"][col].items():
             ch = _channel_from_aasdk_file(ent["file"])
             rec = ensure(ch)
             rec["aasdk_entities"] += 1
             ann = ent.get("annotations", {})
-            rec["wire_msg_ids"].update(ann.get("wire_msg_ids", []))
-            rec["directions"].update(ann.get("directions", []))
-            rec["version_gates"].update(ann.get("version_gates", []))
+            rec["wire_msg_ids"].update(ps.annotation_values(ann, "wire_msg_ids"))
+            rec["directions"].update(ps.annotation_values(ann, "directions"))
+            rec["version_gates"].update(ps.annotation_values(ann, "version_gates"))
             if col == "enums" and ("MessageId" in fqn or "ControlMessageType" in fqn):
                 rec["msg_id_enums"][fqn] = [f"0x{v['number']:04X}={v['name']}" for v in ent["values"][:12]]
-        for fqn, ent in sets["oaa"][col].items():
+        for fqn, ent in schema_models["oaa"][col].items():
             ch = _channel_from_oaa_file(ent["file"])
             rec = ensure(ch)
             rec["oaa_entities"] += 1
             ann = ent.get("annotations", {})
-            rec["wire_msg_ids"].update(ann.get("wire_msg_ids", []))
-            rec["directions"].update(ann.get("directions", []))
-            rec["version_gates"].update(ann.get("version_gates", []))
-            rec["oaa_confidence"].update(ann.get("confidence", []))
+            rec["wire_msg_ids"].update(ps.annotation_values(ann, "wire_msg_ids"))
+            rec["directions"].update(ps.annotation_values(ann, "directions"))
+            rec["version_gates"].update(ps.annotation_values(ann, "version_gates"))
+            rec["oaa_confidence"].update(ps.annotation_values(ann, "confidence"))
     return cat
 
 
@@ -940,6 +950,7 @@ def enrich_differences(
     triage_doc: dict[str, Any] | None,
     match: dict[str, Any] | None = None,
     findings_doc: dict[str, Any] | None = None,
+    schema_view: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Compute derived triage attributes for every difference and merge human judgement."""
     scan = scan_receiver_usage(root, sets)
@@ -1004,8 +1015,9 @@ def enrich_differences(
             } if hand else None,
         })
 
-    # Per-channel summary table (100% derived)
-    cat = _derive_channel_catalog(sets)
+    # Per-channel summary table (100% derived from exported per-entity annotations)
+    entity_models = schema_view if schema_view is not None else sets
+    cat = _derive_channel_catalog(entity_models)
     channels_present = set(d["channel"] for d in enriched) | set(cat)
     ordered_channels = [c for c in CHANNEL_ORDER if c in channels_present]
     ordered_channels.extend(sorted(channels_present - set(ordered_channels)))
@@ -1069,10 +1081,10 @@ def enrich_differences(
             if ow:
                 tot_owner[ow] = tot_owner.get(ow, 0) + 1
 
-    # Retracted OAA entities inventory (derived from .proto annotations)
+    # Retracted OAA entities inventory (derived from exported per-entity annotations)
     oaa_retracted_entities: list[dict[str, Any]] = []
     for kind, col in (("message", "messages"), ("enum", "enums")):
-        for fqn, ent in sorted(sets["oaa"][col].items()):
+        for fqn, ent in sorted(entity_models["oaa"][col].items()):
             ann = ent.get("annotations", {})
             if ann.get("retracted"):
                 oaa_retracted_entities.append({
