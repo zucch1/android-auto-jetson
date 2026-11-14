@@ -6,6 +6,12 @@ name: CI
 on:
   pull_request:
     branches: [main, 'aa/**']
+    # No `edited`: it cancels and restarts the whole run (including the 600 s ipc bench when it
+    # applies) on every title/body edit, and the validators always come from `main` now, so a
+    # retarget no longer changes what they check. After retargeting a PR, close and reopen it or
+    # push a commit to rerun CI. Do not "fix" this with job-level `if:` skips: a skipped
+    # required job counts as passing.
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
   # Manual full run (including ipc-bench-happy-600) on any branch.
@@ -235,11 +241,94 @@ jobs:
             --archive "$RUNNER_TEMP/googletest-v1.15.2.tar.gz" \
             --scratch "$RUNNER_TEMP/decode-root-cross"
 
-  provenance-lint:
-    name: ci/provenance-lint
+  # M5 (trusted validators). A SEPARATE job on a fresh runner: nothing from the PR is executed
+  # before the validators run, so a PR step cannot poison them through $GITHUB_ENV (BASH_ENV,
+  # PATH, ...), $GITHUB_PATH or a shell function. The validator CODE always comes from the
+  # repository default branch (main), never from the PR's base ref (a stacked `aa/X` base is
+  # author-pushable) and never from the PR itself; the PR tree is only passed to them as DATA (a path argument): no PR script is run, no PR
+  # file is sourced, and the interpreter is invoked by absolute path from a scrubbed environment
+  # (`env -i`, `-B -s -E`; not `-I`, because the validators import their sibling modules from
+  # the base directory). It runs on EVERY event (pull_request, push, workflow_dispatch) and the gate
+  # below accepts only `success`, so `gh workflow run ci.yml --ref <pr-branch>` cannot yield a green
+  # ci/provenance-lint without it. A PR that legitimately changes one of these
+  # validators or their pinned constants fails here by design: land the validator change on its
+  # own first (explicit owner review), then rebase the data change on it. That order does not
+  # work when a validator's pinned constant and the data it checks must change together
+  # (check_manifest.py + deps/manifest.lock): make the change backward compatible, accept a red
+  # main between two merges, or use an admin bypass.
+  # RESIDUAL: workflow files come from the PR, so a PR can edit or delete these jobs, and can
+  # ADD a new workflow under .github/workflows/ with a job named ci/provenance-lint. Anything
+  # under .github/workflows/ needs owner review; enforcing it needs pull_request_target or a
+  # ruleset, not done here. The workflow_dispatch closure (a dispatch on an old PR branch cannot
+  # turn the gate green) relied on the ruleset's strict "require branches to be up to date"
+  # setting, which is now OFF: a branch predating base-validators carries the old gate, so a
+  # dispatch on it can produce a green ci/provenance-lint without the trusted validators. The
+  # compensating practice is to merge only branches whose latest CI run used the current workflow
+  # and to check main's runs after each batch of merges.
+  base-validators:
+    name: ci/base-validators
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - name: Check out the default branch (validator code)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Literal: an empty `ref` would make actions/checkout silently fall back to the
+          # event ref (the PR merge commit).
+          ref: main
+          path: base
+          persist-credentials: false
+      - name: Check out the tree under test (data only)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: pr
+          persist-credentials: false
+      - name: Run base-revision validators against the PR tree
+        run: |
+          set -euo pipefail
+          py=/usr/bin/python3
+          run_base() {
+            # Scrubbed env; the PR tree is only ever an argument or the working directory.
+            /usr/bin/env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" LC_ALL=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 \
+              "$py" -B -s -E "$@"
+          }
+          base="$GITHUB_WORKSPACE/base"
+          pr="$GITHUB_WORKSPACE/pr"
+          # The validator checkout must really be main: on branch main, at the fetched origin/main.
+          [ "$(/usr/bin/git -C "$base" symbolic-ref --short HEAD)" = main ] \
+            || { echo "validator checkout is not on branch main"; exit 1; }
+          [ "$(/usr/bin/git -C "$base" rev-parse HEAD)" = "$(/usr/bin/git -C "$base" rev-parse refs/remotes/origin/main)" ] \
+            || { echo "validator checkout is not at origin/main"; exit 1; }
+          cd "$pr"
+          run_base "$base/tools/deps/check_manifest.py" --lock "$pr/deps/manifest.lock"
+          run_base "$base/tools/provenance/check.py" --root "$pr"
+          run_base "$base/tools/tls/scan.py" "$pr"
+
+  # The required context. It cannot pass on a pull request unless ci/base-validators passed
+  # (the first step fails the job otherwise, before any PR-controlled step runs). Its remaining
+  # steps are the existing in-tree checks, which execute PR code and are therefore not trusted
+  # on their own.
+  provenance-lint:
+    name: ci/provenance-lint
+    needs: base-validators
+    # A skipped dependency would otherwise skip this job, and GitHub counts a skipped job as
+    # passing for a required check: always run, and decide explicitly below.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require the trusted base-revision validators
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_RESULT: ${{ needs.base-validators.result }}
+        run: |
+          set -euo pipefail
+          # Only `success` passes, for every event type: a skipped, cancelled or failed
+          # base-validators job (or a dispatch/push that skipped it) never satisfies this gate.
+          case "$BASE_RESULT" in
+            success) ;;
+            *) echo "ci/base-validators result '$BASE_RESULT' on '$EVENT' does not allow ci/provenance-lint"; exit 1 ;;
+          esac
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -263,8 +352,12 @@ jobs:
             python3 -B tests/protocol/audit_scenarios.py "$PWD" "$case"
           done
 
-  arm64-cross-build:
-    name: ci/arm64-cross-build
+  # Required public ARM64 cross-build check (fixture-only). It must NEVER share the
+  # `ci/arm64-cross-build` name: that optional target-evidence context is posted solely by
+  # tools/ci/arm64-cross-relay.sh after an observed-sysroot, sandboxed build (see
+  # docs/CONTRIBUTING.md), so fixture results cannot claim observed-sysroot acceptance.
+  arm64-cross-fixture:
+    name: ci/arm64-cross-fixture
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -340,9 +433,9 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo '## ci/arm64-cross-build (fixture mode)'
+            echo '## ci/arm64-cross-fixture (fixture mode)'
             echo
-            echo 'Fixture-sysroot cross build (fixture-not-target). This is NOT target qualification — the private observed-sysroot exact-SHA smoke (sysroot jetson-r39.2.1) is the acceptance evidence (task 5 receipts / F3 later).'
+            echo 'Fixture-sysroot cross build (fixture-not-target). This satisfies the required public `ci/arm64-cross-fixture` check, NOT target qualification (`ci/arm64-cross-build`, optional target evidence posted by tools/ci/arm64-cross-relay.sh after an observed-sysroot exact-SHA smoke against sysroot jetson-r39.2.1).'
             echo
             echo "- head: \`${GITHUB_SHA}\`"
             echo '- env: AA_SYSROOT_REQUIRE_OBSERVED=OFF; fixture provenance is accepted here and always reported fixture-not-target.'
