@@ -67,9 +67,19 @@ with tempfile.TemporaryDirectory(prefix="bond-restart-", dir=build) as directory
         directory_path.chmod(0o500)
         try:
             error, handle = rpc("poll")
-            assert error == 0 and rpc(f"bind {handle} 1")[0] == 0
-            error, grant = rpc("issue 1")
-            assert error == 0 and rpc(f"open {grant}")[0] == 0, "pending admission must stay in memory"
+            assert error == 0 and rpc(f"bind {handle} 2")[0] == 0
+            error, grant = rpc("issue 2")
+            assert error == 0 and rpc(f"open {grant}")[0] != 0, "an admission whose pending removal cannot be recorded was opened"
+        finally:
+            directory_path.chmod(0o700)
+        assert rpc("close")[0] == 0
+        error, handle = rpc("poll")
+        assert error == 0 and rpc(f"bind {handle} 1")[0] == 0
+        error, grant = rpc("issue 1")
+        assert error == 0 and rpc(f"open {grant}")[0] == 0
+        assert "02:00:00:00:00:02" in (directory_path / "pending-removals").read_text(), "pending removal not persisted"
+        directory_path.chmod(0o500)
+        try:
             error, handle = rpc("poll")
             assert error == 0 and rpc(f"reconnect {handle}")[0] == 1001, "reconnect recorded a bond the helper did not create"
             consent(1, wrong=True, expected=1001)

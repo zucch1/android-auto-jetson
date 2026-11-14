@@ -177,7 +177,9 @@ crash-durable revocation. NM retains its in-flight rotation latch. BlueZ managed
 identities are durably recorded in `/var/lib/aa-system-helper/managed-bonds`
 (versioned exact address/adapter pairs, at most 256). The helper commits the
 allow-list only after explicit comparison acceptance and exact bond verification,
-before acknowledging the bond to the receiver. Pending admission writes nothing.
+before acknowledging the bond to the receiver. Pending admission never writes `managed-bonds`;
+it records only the identity in `pending-removals` (same file rules, not revocation authority)
+so a restarted helper still removes an unaccepted bond.
 A trusted reconnect is admitted only for an
 identity already on the list and never adds one. It loads
 only an owner-only regular file in a private, owner-validated directory, using

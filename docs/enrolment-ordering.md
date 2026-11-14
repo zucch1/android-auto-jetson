@@ -28,7 +28,16 @@ and store reload discard pending identity snapshots, close the gate and emit a
 reason diagnostic. Reload attempts advance the store epoch, including failed
 loads. Helper lease retirement removes unaccepted managed devices through
 BlueZ RemoveDevice; failed removal stays queued for retry on helper ticks, even
-if BlueZ temporarily disappears. Accepted, acknowledged bonds retain main's
+if BlueZ temporarily disappears. The queue is persisted next to `managed-bonds`
+as `pending-removals` (same root-owned directory, owner-only regular file,
+no-follow traversal, exclusive staging, fsync and atomic rename, at most 256
+records) and an entry is written before any window opens, so a helper restart
+completes a removal that was pending retry; an admission whose entry cannot be
+written is refused. Rebuilding the queue from BlueZ was rejected: BlueZ cannot
+distinguish a bond an enrolment window created from one the owner made, and
+removing the latter would be destructive. The list is not revocation authority;
+an entry that is already managed (acknowledged before a restart interrupted the
+hand-over) is dropped from the queue, never removed. Accepted, acknowledged bonds retain main's
 CancelPairing guards. An abrupt receiver exit triggers helper identity-loss
 cleanup. No production state or installed helper is exercised by host tests.
 

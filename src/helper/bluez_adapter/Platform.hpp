@@ -40,6 +40,10 @@ struct BluezBackend::Impl {
     std::vector<std::string> adapters;
     std::map<std::uint64_t, Observation> observations;
     bluez_adapter::ManagedPeers managed;
+    // Bonds an enrolment window may have created and the owner has not accepted, awaiting
+    // removal. Persisted (same file rules as `managed`) so a helper restart cannot lose a
+    // removal that is pending retry. It is not revocation authority.
+    bluez_adapter::ManagedPeers pending;
     std::optional<Observation> allowed;
     Clock::time_point window{};
     bool pairing_enabled{};
@@ -52,7 +56,6 @@ struct BluezBackend::Impl {
     std::optional<Comparison> comparison;
     bool comparison_used{};
     bool comparison_accepted{};
-    std::vector<PeerIdentity> unaccepted;
     void retire_unaccepted();
     bool quiet_pending{};
     int connection{-1};

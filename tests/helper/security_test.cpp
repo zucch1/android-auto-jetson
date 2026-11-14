@@ -132,6 +132,28 @@ TEST_F(ManagedBonds, UncertainDirectorySyncKeepsEntryRevocableAndRefusesAdmissio
     ManagedPeers loaded{directory, ::getuid()}; ASSERT_TRUE(loaded.valid());
     EXPECT_TRUE(loaded.contains(managed)); EXPECT_TRUE(loaded.contains(other)); EXPECT_TRUE(loaded.contains(unmanaged));
 }
+// P3b: the unaccepted-bond removal list shares the file rules but is never revocation authority.
+TEST_F(ManagedBonds, PendingRemovalListPersistsForgetsAndIsNotRevocationAuthority) {
+    using namespace trust::test::faults;
+    const auto reopen = [&] { return ManagedPeers{directory, ::getuid(), "pending-removals"}; };
+    { auto pending = reopen(); ASSERT_TRUE(pending.valid()); ASSERT_TRUE(pending.remember(managed)); ASSERT_TRUE(pending.remember(other)); }
+    auto pending = reopen();
+    ASSERT_TRUE(pending.valid()); EXPECT_EQ(pending.peers().size(), 2u) << "a restart lost a pending removal";
+    EXPECT_FALSE((ManagedPeers{directory, ::getuid()}.contains(managed))) << "pending removal became revocation authority";
+    { ScopedFault fail{Fault::renameat}; EXPECT_FALSE(pending.forget(managed)); }
+    EXPECT_TRUE(pending.contains(managed)) << "a failed rewrite dropped the entry";
+    EXPECT_TRUE(reopen().contains(managed));
+    ASSERT_TRUE(pending.forget(managed)); EXPECT_FALSE(pending.contains(managed)); EXPECT_TRUE(pending.contains(other));
+    EXPECT_TRUE(pending.forget(unmanaged)) << "forgetting an absent entry is a no-op";
+    ASSERT_TRUE(pending.forget(other));
+    const auto emptied = reopen();
+    EXPECT_TRUE(emptied.valid()); EXPECT_TRUE(emptied.peers().empty());
+    for (const auto& entry : std::filesystem::directory_iterator(directory))
+        EXPECT_NE(entry.path().filename().string().front(), '.') << "staging file left behind";
+    const auto path = directory + "/pending-removals";
+    ASSERT_EQ(::chmod(path.c_str(), 0666), 0);
+    EXPECT_FALSE(reopen().valid()) << "the same mode rules apply to the pending list";
+}
 TEST_F(ManagedBonds, OversizedStateFileFailsClosedWithReason) {
     const auto path = directory + "/managed-bonds";
     { std::ofstream out{path}; out << "v1\n" << std::string(64 * 1024, 'A'); }

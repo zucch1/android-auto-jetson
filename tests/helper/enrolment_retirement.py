@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from gi.repository import GLib
 from bluez_runtime import Surface, command, control, wait
+from private_bus import process
 from comparison_cases import present
 
 
@@ -31,6 +32,18 @@ def run(build: Path, directory: Path, failure: str) -> None:
                 surface.cancel(request)
                 assert not surface.state()["removed"]
                 command(surface.mock, "allow-remove")
+            case "helper-restart":
+                # The removal is pending retry (BlueZ refuses it) when the helper itself restarts.
+                command(surface.mock, "fail-remove")
+                surface.cancel(request)
+                assert not surface.state()["removed"]
+                assert (directory / "pending-removals").exists() and "02:00:00:00:00:01" in (directory / "pending-removals").read_text(), \
+                    "pending removal not persisted"
+                surface.daemon.terminate()
+                assert surface.daemon.wait(timeout=5) == 0
+                command(surface.mock, "allow-remove")
+                stack.enter_context(process([str(build / "aa-system-helper"), "--private-bus",
+                                             surface.address, str(directory)], surface.env))
             case "reload":
                 assert command(surface.receiver, "reload-store") == "0"
             case "disconnect":
@@ -49,6 +62,8 @@ def run(build: Path, directory: Path, failure: str) -> None:
         assert not surface.state()["properties"]["Pairable"]
         assert not (directory / "managed-bonds").exists(), "failed pending enrolment wrote managed authority"
         assert not (directory / "store").exists(), "failed pending enrolment wrote durable trust"
+        if failure == "helper-restart":
+            wait(lambda: "02:00:00:00:00:01" not in (directory / "pending-removals").read_text())
         if failure != "restart":
             assert surface.phone() == 0
             assert command(surface.receiver, "pending-pairings") == "0"
@@ -82,7 +97,7 @@ def just_works_after_failed_pairing(build: Path, directory: Path) -> None:
 if __name__ == "__main__":
     build = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="aa-enrolment-", dir=build) as temporary:
-        for failure in ("reject", "cancel-retry", "reload", "disconnect", "restart", "helper-failure"):
+        for failure in ("reject", "cancel-retry", "helper-restart", "reload", "disconnect", "restart", "helper-failure"):
             directory = Path(temporary) / failure
             directory.mkdir(mode=0o700)
             run(build, directory, failure)

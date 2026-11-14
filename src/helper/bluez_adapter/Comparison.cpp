@@ -2,22 +2,29 @@
 #include "Platform.hpp"
 
 namespace aa::helper {
-// Retry failed RemoveDevice calls on the helper owner thread. No trust-store identity is needed.
+// Retry failed RemoveDevice calls on the helper owner thread. The list is persisted, so this also
+// completes removals left pending by a restarted helper. No trust-store identity is needed.
 void BluezBackend::Impl::retire_unaccepted() {
-    if (unaccepted.empty() || !current_owner()) return;
+    if (pending.peers().empty() || !current_owner()) return;
     std::vector<Device> devices;
     if (!inventory(devices)) return;
-    std::erase_if(unaccepted, [&](const PeerIdentity& peer) {
-        if (allowed && allowed->device.identity == peer) return false;
-        for (const auto& device : devices) {
-            if (device.identity != peer) continue;
-            auto* reply = call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
-                               g_variant_new("(o)", device.path.c_str()));
-            if (!reply) return false;
-            g_variant_unref(reply);
+    const auto peers = pending.peers();  // forget() rewrites the list
+    for (const auto& peer : peers) {
+        if (allowed && allowed->device.identity == peer) continue;
+        // A bond acknowledged before a restart interrupted the hand-over is managed: never remove it.
+        if (!managed.contains(peer)) {
+            bool removed = true;
+            for (const auto& device : devices) {
+                if (device.identity != peer) continue;
+                auto* reply = call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
+                                   g_variant_new("(o)", device.path.c_str()));
+                if (!reply) { removed = false; break; }
+                g_variant_unref(reply);
+            }
+            if (!removed) continue;
         }
-        return true;
-    });
+        (void)pending.forget(peer);
+    }
 }
 core::Result<bool> BluezBackend::bond_confirmed() {
     impl_->pump();
@@ -27,7 +34,7 @@ core::Result<bool> BluezBackend::bond_confirmed() {
     if (!impl_->comparison_accepted || !impl_->exact(captured, true)) return false;
     if (!impl_->allowed || impl_->now() >= impl_->window) return Error{ErrorCode::helper_rejected};
     if (!impl_->managed.remember(captured.device.identity)) return Error{ErrorCode::helper_rejected};
-    std::erase(impl_->unaccepted, captured.device.identity);
+    (void)impl_->pending.forget(captured.device.identity);
     return true;
 }
 void BluezBackend::Impl::reject_comparison() {
