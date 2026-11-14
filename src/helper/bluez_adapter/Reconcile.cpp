@@ -32,7 +32,13 @@ void BluezBackend::Impl::retire_unaccepted() {
         if (listed(awaiting, peer)) continue;
         const bool bonded = std::any_of(devices.begin(), devices.end(),
             [&](const Device& device) { return device.identity == peer && device.bonded; });
-        if (bonded && listed(approved, peer)) continue;
+        if (bonded && listed(approved, peer)) {
+            // Approved, so the bond stays (#74). A revoked identity's approval is never admitted
+            // without a fresh committed enrolment, so its window's journal entry is not needed (the
+            // history keeps the removal authority) and must not block the identity's next enrolment.
+            if (revoked.contains(peer)) (void)pending.forget(peer);
+            continue;
+        }
         const auto done = std::find(removal_done.begin(), removal_done.end(), peer);
         if (done == removal_done.end()) {
             bool removed = true;
@@ -67,7 +73,8 @@ void BluezBackend::Impl::park() {
     if (pending.contains(identity) && !listed(awaiting, identity)) awaiting.push_back(identity);
 }
 bool BluezBackend::Impl::admitted(const PeerIdentity& peer) {
-    if (!reconciled || !pending.valid() || pending.contains(peer) || listed(awaiting, peer) || listed(refused, peer))
+    if (!reconciled || !pending.valid() || pending.contains(peer) || listed(awaiting, peer) || listed(refused, peer) ||
+        revoked.contains(peer))
         return false;
     return managed.admitted(peer) || (managed.confirm_durable() && managed.admitted(peer));
 }
@@ -80,24 +87,39 @@ bool BluezBackend::Impl::demote(const PeerIdentity& peer, bool owe_removal) {
     }
     // Refused from here on, whatever the writes below report: a failure leaves the stricter state.
     if (!listed(refused, peer)) refused.push_back(peer);
-    // History first (revocation authority never lapses), then the managed entry, then the removal
-    // obligation; each confirmed durable (rename + directory fsync) before the next. A crash
-    // between any two leaves a state reconciliation completes, never an admitted bond.
+    // The removal obligation first, then history (revocation authority never lapses), then the
+    // managed entry; each confirmed durable (rename + directory fsync) before the next. Managed
+    // state is never dropped before the obligation to remove its bond is durable, so a crash or a
+    // failed write between any two steps leaves a state reconciliation completes, never an admitted
+    // or a stranded bond. The obligation is dropped only once BlueZ confirmed the removal.
+    if (owe_removal && !pending.remember(peer)) return false;
     if (!revoked.remember(peer, true)) return false;
     if (!managed.forget(peer)) return false;
     std::erase(refused, peer);
-    return !owe_removal || pending.remember(peer);
+    return true;
+}
+bool BluezBackend::Impl::clear_revocation(const PeerIdentity& peer) {
+    return !revoked.contains(peer) || revoked.forget(peer);
 }
 // ReconcileBondsV1. The receiver's approved set decides:
-//   approved, revoked after its last commit -> stays revoked, not admitted, bond kept (#74)
-//   approved, managed                       -> admitted (a journal entry left by a commit that
-//                                              stopped between its two writes is dropped)
-//   approved, journalled, bonded            -> admitted (the approval landed, the commit did not)
-//   approved, nothing to admit              -> counted as unadmitted, nothing removed
-//   managed, not approved                   -> demoted to revoked, removal owed, device removed
-//   journalled, not approved                -> device removed, entry dropped
-// The open enrolment window's own bond is left to that window. Success only once every state
-// change is durable; on failure the stricter state stays and the receiver retries.
+//   approved, revoked, its fresh enrolment -> admitted: this helper run acknowledged a fresh
+//     acknowledged and awaiting the commit    enrolment of the identity and its approval landed
+//                                             (history cleared first, then the commit's writes)
+//   approved, revoked otherwise            -> stays revoked, not admitted, bond kept (#74),
+//                                             counted as unadmitted; a stale journal entry is
+//                                             dropped (the history keeps the removal authority)
+//   approved, managed                      -> admitted (a journal entry left by a commit that
+//                                             stopped between its two writes is dropped)
+//   approved, journalled, bonded           -> admitted (the approval landed, the commit did not)
+//   approved, nothing to admit             -> counted as unadmitted, nothing removed
+//   managed, not approved                  -> demoted (removal owed first), device removed
+//   journalled, not approved               -> device removed, entry dropped
+//   revoked, bonded, not approved          -> removal owed again and the device removed, whatever
+//                                             the journal says (a lost entry strands no bond)
+// A bond of an identity none of the helper's files name is never touched, and the open enrolment
+// window's own bond is left to that window. Success only once every state change is durable and
+// BlueZ holds no bond the helper names that the receiver does not approve; on failure the
+// stricter state stays and the receiver retries.
 core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<PeerIdentity>& approved) {
     auto& s = *impl_;
     if (!s.managed.valid() || !s.pending.valid() || !s.revoked.valid()) return Error{ErrorCode::helper_unavailable};
@@ -119,10 +141,12 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
     s.approved = approved;
     for (const auto& peer : approved) {
         if (live == peer) continue;
-        if (s.revoked.contains(peer) || listed(s.refused, peer)) {
-            // Only a new enrolment clears `revoked` (authorize), so this approval was never
-            // committed after the revocation: a resurrected or stale approval. The revocation wins.
+        if (listed(s.refused, peer) || (s.revoked.contains(peer) && !listed(s.awaiting, peer))) {
+            // Only a fresh enrolment that reached its commit clears history, so this approval was
+            // never committed after the revocation: a resurrected or stale approval, or one whose
+            // window closed without acceptance. The revocation wins.
             durable = s.demote(peer, false) && durable;
+            if (!listed(s.refused, peer) && s.pending.contains(peer)) durable = s.pending.forget(peer) && durable;
             std::erase(s.awaiting, peer);
             ++unadmitted;
             continue;
@@ -133,11 +157,13 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
             std::erase(s.awaiting, peer);
             continue;
         }
-        std::erase(s.awaiting, peer);
         if (s.pending.contains(peer) && bonded(peer)) {
-            durable = s.managed.remember(peer) && s.pending.forget(peer) && durable;
+            // A revoked identity reaches this only with its fresh enrolment acknowledged (`awaiting`).
+            durable = s.clear_revocation(peer) && s.managed.remember(peer) && s.pending.forget(peer) && durable;
+            std::erase(s.awaiting, peer);
             continue;
         }
+        std::erase(s.awaiting, peer);
         ++unadmitted;
     }
     std::vector<PeerIdentity> unwanted;
@@ -153,19 +179,40 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
         std::erase(s.awaiting, peer);
         if (!listed(unwanted, peer)) unwanted.push_back(peer);
     }
-    s.reconciled = durable;
-    if (!durable) {
-        // The stricter state stays (nothing admitted). A bond the receiver does not approve is
-        // still disconnected and removed now, even though its removal could not be recorded.
-        for (const auto& device : devices) {
-            if (!listed(unwanted, device.identity)) continue;
-            s.disconnect(device);
-            if (auto* reply = s.call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
-                                     g_variant_new("(o)", device.path.c_str()))) g_variant_unref(reply);
-        }
-        return Error{ErrorCode::helper_unavailable};
+    // The removal obligation is derived, not only journalled: a bond whose journal entry was lost
+    // (a failed write, a crash, an older helper's demotion order) is still removed. Only identities
+    // the helper's own history names count; BlueZ cannot tell the owner's other bonds apart.
+    for (const auto& device : devices) {
+        const auto& peer = device.identity;
+        if (!device.bonded || !s.revoked.contains(peer) || listed(approved, peer) || live == peer ||
+            listed(unwanted, peer)) continue;
+        durable = s.pending.remember(peer) && durable;
+        unwanted.push_back(peer);
     }
-    s.retire_unaccepted();
+    s.reconciled = durable;
+    if (durable) s.retire_unaccepted();
+    // What cleanup could not remove (or a failed write left unrecorded) is disconnected and removed
+    // now. A bond the helper names that the receiver does not approve and BlueZ still holds fails
+    // the reconciliation, so the receiver retries.
+    bool clean = true;
+    if (!unwanted.empty()) {
+        devices.clear();
+        if (!s.current_owner() || !s.inventory(devices)) {
+            clean = false;
+        } else {
+            for (const auto& device : devices) {
+                if (!listed(unwanted, device.identity) || (!device.bonded && !s.pending.contains(device.identity)))
+                    continue;
+                s.disconnect(device);
+                auto* reply = s.call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
+                                     g_variant_new("(o)", device.path.c_str()));
+                if (reply) g_variant_unref(reply);
+                else if (device.bonded) clean = false;
+            }
+            if (durable) s.retire_unaccepted();  // drops the entries of what was removed just now
+        }
+    }
+    if (!durable || !clean) return Error{ErrorCode::helper_unavailable};
     return unadmitted | (live ? std::uint64_t{1} << 32 : 0U);
 }
 }

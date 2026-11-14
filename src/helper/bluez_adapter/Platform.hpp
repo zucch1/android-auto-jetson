@@ -90,10 +90,15 @@ struct BluezBackend::Impl {
     // `managed`, no cleanup obligation, not awaiting and not being demoted. Retries an unconfirmed
     // directory sync once.
     bool admitted(const PeerIdentity&);
-    // Moves a managed bond to `revoked` (and, with owe_removal, records the device removal in
-    // `pending`). True only once every write is confirmed durable (rename + directory fsync); until
-    // then the identity is refused admission, and the next call or reconciliation completes it.
+    // Moves a managed bond to `revoked`. With owe_removal the device removal is recorded in
+    // `pending` first, before any managed state is dropped (journal, then history, then managed).
+    // True only once every write is confirmed durable (rename + directory fsync); until then the
+    // identity is refused admission, and the next call or reconciliation completes it.
     bool demote(const PeerIdentity&, bool owe_removal = true);
+    // Durably drops revocation history for an identity whose fresh enrolment reached the committed
+    // state (accepted number, acknowledged bond, the receiver's durable approval); nothing else
+    // clears it. Opening, rejecting, cancelling or timing out an enrolment never does.
+    bool clear_revocation(const PeerIdentity&);
     bool quiet_pending{};
     int connection{-1};
     std::shared_ptr<Bootstrap> bootstrap;

@@ -113,11 +113,9 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     // Durably note the pending removal before any window opens: a restart with a failed or
     // unacknowledged removal still removes the bond. A failed write refuses this admission.
     if (!impl_->pending.remember(observed->device.identity)) return Error{ErrorCode::helper_unavailable};
-    // A new enrolment is the only thing that clears revocation history, so an approved identity
-    // still on `revoked` at reconciliation is one never committed after its revocation. The
-    // journal entry keeps revocation authority while the window is open.
-    if (impl_->revoked.contains(observed->device.identity) && !impl_->revoked.forget(observed->device.identity))
-        return Error{ErrorCode::helper_unavailable};
+    // Revocation history stays: only this enrolment's commit (or reconciliation of its approval
+    // after an acknowledgement) clears it, so a window that closes without acceptance cannot turn a
+    // resurrected or stale approval into an admission.
     std::erase(impl_->cleaned, observed->device.identity);
     std::erase(impl_->awaiting, observed->device.identity);
     impl_->allowed = *observed;
@@ -176,8 +174,9 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     std::erase(impl_->approved, identity);
     std::erase(impl_->awaiting, identity);
     // Demote first: once forgotten, the bond is never admitted (services, reconnect) again and
-    // is never taken as acceptance of a later enrolment of the same identity. Every write is
-    // confirmed durable before success is reported.
+    // is never taken as acceptance of a later enrolment of the same identity. The removal is owed
+    // durably (journal) before the managed entry goes, and the journal entry is dropped only after
+    // BlueZ confirmed the removal. Every write is confirmed durable before success is reported.
     const bool demoted = impl_->demote(identity);
     std::erase_if(impl_->observations, [&](const auto& item) { return item.second.device.identity == identity; });
     std::vector<Impl::Device> devices;
