@@ -94,6 +94,8 @@ def run_gap(*, jumps: tuple[tuple[int, int], ...] = ((5, 30),), mode: str = "hea
             return
         if mode == "trailing" and gap_end - 7 < second < gap_end + 1:
             return  # healthy until 31 s, then silent for 8 s past the gap, resumes at 40 s
+        if mode == "trailing_stall" and gap_end - 7 < second < gap_end + 4:
+            return  # healthy until 31 s, silent 12 s (32..42 s), resumes at 43 s before sample at 44 s
         stamp = second * NS
         events = (
             ("receiver", {"event": "active", "startup_ms": 1000}),
@@ -338,6 +340,7 @@ def stall_after_gap() -> None:
     assert len(capture["interference"]) == 1
     assert capture["interference"][0]["projection_failure"] is None
     assert 45 + 10 < capture["observed_duration_seconds"] <= 45 + 16
+    assert report(capture)["run_status"]["projection_failure"] == capture["projection_failure"]
 
 
 def gap_trailing_silence() -> None:
@@ -384,10 +387,32 @@ def gap_trailing_silence_collect() -> None:
     capture = run_gap(mode="trailing", jumps=((5, 34),), duration=50, interval=5)
     assert capture["projection_failure"] is None, capture
     assert len(capture["interference"]) == 1
+    assert [item["t_ns"] for item in capture["progress_evidence"]] == [39 * NS, 44 * NS]
+    doc = report(capture)
+    assert doc["run_status"]["projection_failure"] == capture["projection_failure"]
+    assert doc["run_status"]["interference"] == capture["interference"]
+
+    # Post-gap short (8 s) interference while still event-anchored also persists evidence
+    # separately from interference and replays with full parity.
+    short_after = run_gap(mode="trailing", jumps=((5, 34), (39, 8)), duration=55, interval=5)
+    assert short_after["projection_failure"] is None, short_after
+    assert [gap["gap_seconds"] for gap in short_after["interference"]] == [34, 8]
+    assert "logged_progress" not in short_after["interference"][1]
+    assert [item["t_ns"] for item in short_after["progress_evidence"]] == [39 * NS, 47 * NS]
+    assert report(short_after)["run_status"]["projection_failure"] is None
+
     # A real stall: events end at 31 s; reported by the sample at 44 s, not before.
     stalled = run_gap(jumps=((5, 34),), duration=50, stop_after=31, interval=5)
     assert stalled["projection_failure"].startswith("media_stalled:"), stalled
     assert 44 - 5 <= stalled["observed_duration_seconds"] <= 44, stalled["observed_duration_seconds"]
+    assert report(stalled)["run_status"]["projection_failure"] == stalled["projection_failure"]
+
+    # A real stall where events resume at 43 s (12 s silence > 10 s) before the 44 s sample:
+    # both live collector and offline report still fail with media_stalled.
+    resumed_stall = run_gap(mode="trailing_stall", jumps=((5, 34),), duration=50, interval=5)
+    assert resumed_stall["projection_failure"].startswith("media_stalled:"), resumed_stall
+    assert [item["t_ns"] for item in resumed_stall["progress_evidence"]] == [39 * NS, 44 * NS]
+    assert report(resumed_stall)["run_status"]["projection_failure"] == resumed_stall["projection_failure"]
 
 
 def repeated_short_gaps() -> None:
@@ -395,13 +420,15 @@ def repeated_short_gaps() -> None:
     # recorded and need no log evidence; the ordinary age check still runs.
     capture = run_gap(jumps=((5, 8), (17, 8), (29, 9)), duration=40)
     assert capture["projection_failure"] is None, capture
+    assert capture["progress_evidence"] == []
     assert [gap["gap_seconds"] for gap in capture["interference"]] == [8, 8, 9]
     assert all("logged_progress" not in gap for gap in capture["interference"])
     doc = report(capture)
     assert len(doc["run_status"]["interference"]) == 3
     # Gaps at or under the threshold are ordinary sampling, not interference.
     quiet = run_gap(jumps=((5, 6),), duration=20)
-    assert quiet["interference"] == [] and quiet["projection_failure"] is None
+    assert quiet["interference"] == [] and quiet["progress_evidence"] == []
+    assert quiet["projection_failure"] is None
     assert "interference" not in report(quiet)["run_status"]
 
 
@@ -410,20 +437,39 @@ def repeated_long_gaps() -> None:
     assert capture["projection_failure"] is None, capture
     assert len(capture["interference"]) == 2
     assert all("logged_progress" in gap for gap in capture["interference"])
+    assert report(capture)["run_status"]["projection_failure"] is None
 
 
 def old_capture_replay() -> None:
-    # A capture written before this change has no interference or evidence: its long
+    # A capture written before #90 has no interference or progress_evidence: its long
     # gap replays with main's verdict, and the result stays schema-valid.
     capture = run_gap()
     capture.pop("interference")
+    capture.pop("progress_evidence")
     doc = report(capture)
     assert doc["run_status"]["projection_failure"] is not None, doc["run_status"]
     assert doc["verdict"] == "FAIL"
     assert doc["run_status"]["interference"][0]["gap_seconds"] == 30
     clean = run_gap(jumps=((5, 3),), duration=10)
     clean.pop("interference")
+    clean.pop("progress_evidence")
     assert report(clean)["run_status"]["projection_failure"] is None
+
+    # A capture written at 2511ac4 has interference[*].logged_progress but no
+    # progress_evidence field: >10 s gap evidence still loads from interference.
+    legacy_gap = run_gap()
+    legacy_gap.pop("progress_evidence")
+    assert report(legacy_gap)["run_status"]["projection_failure"] is None
+
+    # Malformed progress_evidence fails closed with ContractError.
+    bad = run_gap()
+    bad["progress_evidence"] = [{"t_ns": True, "logged_progress": {}}]
+    try:
+        report(bad)
+    except reporter.ContractError:
+        pass
+    else:
+        raise AssertionError("expected ContractError on malformed progress_evidence")
 
 
 CASES = {name: globals()[name] for name in (

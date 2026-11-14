@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict
 import glob
 import json
@@ -186,6 +186,17 @@ class ProjectionProgress:
         self.event_anchored: set[str] = set()
         self.failure: str | None = None
         self.interferences: list[dict] = []
+        self.progress_evidence: list[dict] = []
+
+    @classmethod
+    def replay(cls, samples: Iterable[Sample],
+               logged_progress_by_ns: Mapping[int, dict[str, dict]] | None = None) -> ProjectionProgress:
+        """Replay captured samples with persisted receiver-log evidence using observe()."""
+        progress = cls()
+        evidence = logged_progress_by_ns or {}
+        for sample in samples:
+            progress.observe(sample, evidence.get(sample.t_ns))
+        return progress
 
     @property
     def seconds(self) -> float:
@@ -217,9 +228,9 @@ class ProjectionProgress:
         """Fold in one sample.
 
         ``logged_progress`` is receiver-clock evidence for the window since the last
-        sample (see EventParser.logged_progress). It is consulted only when the
-        collector's own sampling gap exceeds _MEDIA_STALL_SECONDS; with no such gap
-        this is the historical age-before-resume check, unchanged.
+        sample (see EventParser.logged_progress). It is consulted when the
+        collector's sampling gap exceeds _MEDIA_STALL_SECONDS or when a stream's
+        ``advanced_ns`` is anchored to an earlier logged event after such a gap.
         """
         if self.failure:
             return
@@ -254,6 +265,11 @@ class ProjectionProgress:
                 self.interferences.append(interference)
             gap_judged = (logged_progress is not None
                           and sampling_gap_ns > _MEDIA_STALL_SECONDS * 1_000_000_000)
+            used_logged_progress = gap_judged or (
+                logged_progress is not None
+                and any(key in self.event_anchored and value > self.previous[key]
+                        for key, value in counters.items())
+            )
             if not gap_judged and (stamp <= self.last_ns
                                    or sampling_gap_ns > _MEDIA_STALL_SECONDS * 1_000_000_000):
                 self.failure = "sampling_gap"
@@ -284,6 +300,11 @@ class ProjectionProgress:
                 if value > self.previous[key]:
                     self.advanced_ns[key] = stamp
                     self.event_anchored.discard(key)
+            if used_logged_progress:
+                self.progress_evidence.append({
+                    "t_ns": stamp,
+                    "logged_progress": logged_progress,
+                })
             if interference is not None:
                 # The gap is context for, never a substitute for, the verdict.
                 interference["projection_failure"] = self.failure
@@ -799,6 +820,7 @@ def collect(args: argparse.Namespace) -> dict:
         "startup_wait_seconds": progress.started_ns / 1e9 if progress.started_ns is not None else None,
         "projection_failure": progress.failure,
         "interference": list(progress.interferences),
+        "progress_evidence": list(progress.progress_evidence),
         "measurement_origin": "live",
         "crashes": crashes,
         "early_exit": early_exit,

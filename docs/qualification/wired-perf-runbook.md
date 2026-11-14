@@ -168,6 +168,11 @@ seconds, otherwise it is reported as `media_stalled`. Either way a gap over 10
 seconds still fails `coverage:sampling`, so an interrupted run is never a PASS;
 the interference entry explains why. `video_units` and `audio_chunks` log no
 timestamp, so the video and audio completion events stand in for their timing.
+For every sample whose stall decision depended on receiver-logged evidence
+(both >10 s gaps and post-gap event-anchored samples), the collector persists
+that exact evidence keyed by `t_ns` in `progress_evidence` so offline replay
+matches the live collector; older captures without `progress_evidence` remain
+loadable (falling back to `interference[*].logged_progress` when present).
 
 ### Measurement cutoff and cleanup diagnostics
 
