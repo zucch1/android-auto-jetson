@@ -118,7 +118,7 @@ TEST_F(CompletedLifecycle, CompletedConnectedLossRequiresFreshBootstrap) {
         // Then only a fresh grant and accepted bootstrap can create new authority.
         ASSERT_TRUE(client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation}));
         ++generation; source = {generation, generation};
-        acquire(generation); ASSERT_TRUE(state(State::active));
+        forget_bond(); acquire(generation); ASSERT_TRUE(state(State::active));
         const auto fresh = accept(); ASSERT_NE(fresh, handle);
         EXPECT_FALSE(client->get_ap_credentials(source, handle));
         handle = fresh; complete(handle);
@@ -137,7 +137,7 @@ TEST_F(CompletedLifecycle, PendingChannelOrConnectedLossRetiresExchange) {
         ASSERT_EQ(bluez.command("connected-true"), "ok"); retired(handle);
         ASSERT_TRUE(client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation}));
         ++generation; source = {generation, generation};
-        acquire(generation); ASSERT_TRUE(state(State::active));
+        forget_bond(); acquire(generation); ASSERT_TRUE(state(State::active));
     }
 }
 class CompletedApLoss : public CompletedLifecycle, public ::testing::WithParamInterface<int> {};
@@ -207,6 +207,7 @@ INSTANTIATE_TEST_SUITE_P(Terminal, FailedReplacement, ::testing::Values(
 TEST_F(CompletedLifecycle, SourceTeardownRetiresCompletedButPreservesUnrelatedObservation) {
     // Given completed A and an unrelated pending observation bound to B.
     const auto handle = accept(); complete(handle); ASSERT_TRUE(client->get_ap_credentials({1, 1}, handle));
+    ASSERT_EQ(bluez.command("observe-other"), "ok");  // B is another phone; A stays admitted
     ASSERT_TRUE(client->prepare(core::ConsumerId{2}, core::PairingRequestId{2}));
     // When A's exact source is invalidated.
     ASSERT_TRUE(client->cancel(core::ConsumerId{1}, core::PairingRequestId{1})); retired(handle);
@@ -219,7 +220,7 @@ TEST_F(CompletedLifecycle, ReceiverLossCannotRestoreCompletedHandle) {
     // When that connection disappears and an identical executable reconnects.
     client.reset(); ASSERT_TRUE(eventually([&] { return !nm->active_now; }, 5000ms));
     auto connection = BusClient::private_bus_for_test(address, *store); ASSERT_TRUE(connection); client = std::move(connection.value());
-    acquire(2); ASSERT_TRUE(state(State::active));
+    forget_bond(); acquire(2); ASSERT_TRUE(state(State::active));
     // Then inventory, receiver executable and restored AP do not revive the handle.
     EXPECT_FALSE(client->get_ap_credentials({2, 2}, handle));
     EXPECT_FALSE(client->poll_bootstrap({2, 2}, failure));

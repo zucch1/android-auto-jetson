@@ -11,7 +11,7 @@ void BluezBackend::Impl::lost_path(const std::string& path) {
         return observed.device.path == path || observed.device.adapter_path == path;
     };
     std::erase_if(observations, [&](const auto& item) { return matches(item.second); });
-    if (allowed && matches(*allowed)) allowed.reset();
+    if (allowed && matches(*allowed)) { reject_comparison(); allowed.reset(); }
     if (connected && matches(*connected)) retire(handoff_handle, HandoffFailure::eligibility);
 }
 void BluezBackend::Impl::watch_continuity() {

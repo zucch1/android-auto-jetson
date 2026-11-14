@@ -24,6 +24,7 @@ struct EligibilityFixture {
     std::atomic<unsigned> denied{};
     std::atomic<std::uint64_t> observed_handle{41};
     std::atomic<unsigned> allowed{};
+    std::atomic<unsigned> initial_observations{};
     std::atomic<bool> bootstrap_complete{true};
     std::atomic<unsigned> withdrawn{};
     bool listening{};
@@ -33,6 +34,7 @@ struct EligibilityFixture {
     aa::app::HandoffEligibilityCoordinator coordinator{trust,
         {[this](aa::app::HandoffOperations::Validation request) -> aa::core::Result<aa::app::HandoffObservation> {
             const bool initial = !request.handle;
+            if (initial) ++initial_observations;
             auto observed = peer; observed.handle = observed_handle.load();
             const bool live_at_start = helper_live.load();
             const bool delayed = stalled.load();
@@ -81,6 +83,25 @@ TEST(WirelessEligibility, ListenerReadyBeforeAuthorizationAndReconnectNeedsNoAdd
     EligibilityFixture f;
     f.start();
     ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    EXPECT_TRUE(f.ordering_ok);
+    EXPECT_EQ(f.allowed.load(), 1U);
+}
+TEST(WirelessEligibility, InitialPeerAbsenceRetriesWithoutAuthorityOrEpochChange) {
+    EligibilityFixture f;
+    f.helper_live = false;
+    f.start();
+    const auto epoch = f.coordinator.epoch();
+    ASSERT_TRUE(f.eventually([&] { return f.initial_observations.load() >= 2U; }));
+    EXPECT_EQ(f.coordinator.epoch(), epoch);
+    EXPECT_FALSE(f.listening);
+    EXPECT_EQ(f.allowed.load(), 0U);
+    EXPECT_FALSE(f.coordinator.phone().has_value());
+    EXPECT_EQ(f.coordinator.snapshot_generation(), 0U);
+    EXPECT_FALSE(f.coordinator.admitting());
+    EXPECT_FALSE(f.coordinator.valid_session());
+    f.helper_live = true;
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    EXPECT_EQ(f.coordinator.epoch(), epoch);
     EXPECT_TRUE(f.ordering_ok);
     EXPECT_EQ(f.allowed.load(), 1U);
 }

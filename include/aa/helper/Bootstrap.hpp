@@ -39,6 +39,6 @@ private:
     AawDecoder decoder_;
     std::vector<std::uint8_t> output_;
     std::size_t sent_{};
-    bool seen_info_{}, seen_start_{};
+    bool seen_info_{}, seen_start_{}, modern_{};
 };
 }

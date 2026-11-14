@@ -11,11 +11,22 @@ In addition to the identity files in [system-helper.md](system-helper.md), an
 operator must provision `/etc/android-auto-receiver/ap.conf` as a root-owned,
 single-link regular file with no group/other permissions. Every directory
 component must be root-owned, non-symlink and not group/other writable. The only
-accepted schema has five whitespace-delimited fields, with no extra fields:
+accepted schema has five whitespace-delimited fields plus an optional sixth AP
+channel field, with no extra fields:
 
 ```text
 v1 wlan0 US jurisdiction-confirmed 5277
+v1 wlan0 US jurisdiction-confirmed 5277 44
 ```
+
+The channel must be a non-DFS UNII-1 channel (36, 40, 44 or 48); omitted means
+36. Start the receiver with the same `--ap-channel N`; the helper rejects any
+AP request for a different channel, so a mismatch fails closed rather than
+falling back. The setting exists because the onboard RTL8822CE vendor driver
+keeps an efuse-forced world channel plan (`alpha2 00`, chplan `0x7F`) that marks
+36/40 no-IR unless a neighbour beacon lifts it, and then moves a channel-36 AP
+to 44 (see `docs/capability-gate.md` and issue #73). Pick a channel the target radio
+operates without relocation.
 
 The example in `packaging/ap.conf.example` intentionally says
 `jurisdiction-unconfirmed` and is **not loadable**. The installer/operator must
@@ -57,11 +68,11 @@ no pre-existing active connection, and the only `iw dev` interface. This is
 deliberately conservative: no simultaneous infrastructure or P2P interface is
 accepted. `iw dev IFACE info` identifies the actual wiphy; `iw reg get` must
 report the explicitly confirmed country for every reported regulatory domain;
-that wiphy's `iw phy phyN info` must advertise5180MHz/channel36 without disabled,
+that wiphy's `iw phy phyN info` must advertise the configured channel/frequency without disabled,
 no-IR or radar restrictions. Unknown/missing/mixed country and unavailable
 channel evidence fail closed before profile activation. Regulatory eligibility
 is rechecked at least once per second while active; actual channel is monitored
-on every worker sweep. A CSA to44 is a failure, never a fallback.
+on every worker sweep. A CSA away from the configured channel is a failure, never a fallback.
 
 Before NM activation, an atomic `nft -f -` transaction installs the exclusively
 reserved `inet aa_receiver_ap` table, tagged `aa-system-helper-v1`. On the fixed
@@ -78,7 +89,7 @@ target qualification.
 The private GIO adapter calls the documented
 `AddAndActivateConnection2(a{sa{sv}},o,o,a{sv})->(o,o,a{sv})`. The fixed profile
 has a helper-specific ID/UUID, no autoconnect, the provisioned interface,
-SSID `ay`, mode`ap`, band`a`, channel36, WPA-PSK, RSN-only/CCMP-only,
+SSID `ay`, mode`ap`, band`a`, the configured channel, WPA-PSK, RSN-only/CCMP-only,
 IPv4`shared`/never-default, IPv6`disabled`, `persist=volatile` and
 `bind-activation=dbus-client`. Returned settings/active paths are retained;
 the NM unique owner is pinned. No arbitrary profiles, settings, command paths
@@ -88,7 +99,7 @@ A dedicated single worker owns all platform state; callbacks needed to open
 GIO connections use its serviced local context. Commands and D-Bus calls are
 bounded (500ms/300ms respectively); GIO connection establishment is cancellable
 at300ms. The startup deadline is five seconds from the start of the attempt;
-success is published only after NM State2 and an actual `iw` AP/channel36 check
+success is published only after NM State2 and an actual `iw` AP/configured-channel check
 before that deadline. The short control RPC queues work: pending acquire returns
 state0 and `Response.applied=false`; callers must poll AP status. State1 is
 verified active, never simply an accepted NM request. No new wire action/state
@@ -199,6 +210,6 @@ that enables fake commands in production.
 See this worktree's `.omo/evidence/composition/implementation/` for composition
 command transcripts and handoff. Host tests prove RPC/profile construction, sequencing, failure
 behavior and filesystem policy, not a physical DHCP lease or kernel firewall.
-RTL8822CE channel36, real five-second startup, phone join/revocation, effective
+RTL8822CE configured-channel operation, real five-second startup, phone join/revocation, effective
 kernel firewall isolation, Jetson RSS and installed-service/sandbox behavior
 remain **TARGET BLOCKED**. Task35 is not fully closed or target-accepted.

@@ -89,6 +89,22 @@
       <arg name="monotonic_ns" type="t" direction="out"/>
     </method>
 
+    <!-- Consumer-only retrieval during explicit enrollment. Returns challenge_id
+         (decimal uint64), comparison (six digits including leading zeroes),
+         address and adapter. No challenge is a method error. Never broadcast. -->
+    <method name="GetPairingComparison">
+      <arg name="request_id" type="t" direction="in"/>
+      <arg name="challenge" type="a{ss}" direction="out"/>
+    </method>
+    <!-- Only an explicit human decision about the retrieved number may answer.
+         ConfirmPhonePairing is NOT approval of an unseen comparison. One use;
+         consumer/request/peer/BlueZ continuity and deadlines must still hold. -->
+    <method name="RespondPairingComparison">
+      <arg name="request_id" type="t" direction="in"/>
+      <arg name="challenge_id" type="t" direction="in"/>
+      <arg name="accept" type="b" direction="in"/>
+    </method>
+
     <!-- One-time pairing request id awaiting ConfirmPhonePairing. -->
     <signal name="PairingRequest">
       <arg name="request_id" type="t"/>

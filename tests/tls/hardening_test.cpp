@@ -264,7 +264,7 @@ TEST(TlsHardening, IdlePeerHitsDerivedDeadlineWithInjectedClock) {
     ASSERT_TRUE(pair.value().client->set_peer_ping_interval(30s,
         [&] { return epoch + std::chrono::seconds{seconds.load()}; }));
     PendingIo pending([&] { return pair.value().client->receive(); });
-    EXPECT_TRUE(pending.blocked(SYS_poll));
+    EXPECT_TRUE(pending.blocked_in_poll());
     seconds = 99; // three 30s intervals + 10s margin: still healthy
     EXPECT_NE(pending.result.wait_for(100ms), std::future_status::ready);
     seconds = 101;
@@ -292,7 +292,7 @@ TEST(TlsHardening, EmptyListenerAcceptTimesOutAndCancels) {
     PendingIo pending([&] {
         return listener.value()->accept({std::chrono::steady_clock::now() + 10s, cancellation.get_token()});
     });
-    EXPECT_TRUE(pending.blocked(SYS_poll));
+    EXPECT_TRUE(pending.blocked_in_poll());
     cancellation.request_stop();
     ASSERT_EQ(pending.result.wait_for(1s), std::future_status::ready);
     const auto result = pending.result.get();

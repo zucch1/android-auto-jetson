@@ -5,9 +5,7 @@
 #include "../helper/nm_test.cpp"
 #include <aa/app/WirelessReceiver.hpp>
 #include <aa/session/Clock.hpp>
-#ifdef AA_WIRELESS_TEST_ATTESTATION
 #include "../wireless_e2e/phone.hpp"
-#endif
 
 namespace aa::helper::nm {
 namespace {
@@ -19,8 +17,6 @@ namespace {
 #include "consumer_fixture.inc"
 #include "hardkill.inc"
 #include "consumer.inc"
-#ifdef AA_WIRELESS_TEST_ATTESTATION
 #include "active.inc"
-#endif
 }
 }

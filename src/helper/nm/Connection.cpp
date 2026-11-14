@@ -169,7 +169,7 @@ bool Connection::start(const Policy& policy, const Credentials& secret, const st
         {"autoconnect", g_variant_new_boolean(FALSE)}});
     section("802-11-wireless", {{"ssid", g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, secret.ssid.data(), secret.ssid.size(), 1)},
         {"mode", g_variant_new_string("ap")}, {"band", g_variant_new_string("a")},
-        {"channel", g_variant_new_uint32(36)}, {"powersave", g_variant_new_uint32(2)}});
+        {"channel", g_variant_new_uint32(policy.channel)}, {"powersave", g_variant_new_uint32(2)}});
     const char* rsn[]{"rsn", nullptr};
     const char* ccmp[]{"ccmp", nullptr};
     section("802-11-wireless-security", {{"key-mgmt", g_variant_new_string("wpa-psk")},

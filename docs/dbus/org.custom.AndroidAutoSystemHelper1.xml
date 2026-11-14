@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <node name="/org/custom/AndroidAutoSystemHelper">
   <interface name="org.custom.AndroidAutoSystemHelper1">
-    <annotation name="org.custom.Contract.SemVer" value="1.2.0"/>
+    <annotation name="org.custom.Contract.SemVer" value="1.4.0"/>
     <method name="PollBootstrapV1">
       <arg name="consumer_generation" type="t" direction="in"/>
       <arg name="source" type="t" direction="in"/>
@@ -77,6 +77,54 @@
       <arg name="grant" type="t" direction="in"/>
       <arg name="error" type="u" direction="out"/>
       <arg name="state" type="t" direction="out"/>
+    </method>
+    <!-- Verification only: true after explicit comparison acceptance and an exact bonded snapshot. Records nothing. -->
+    <method name="PairingBondConfirmedV1">
+      <arg name="generation" type="t" direction="in"/>
+      <arg name="request" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="bonded" type="t" direction="out"/>
+    </method>
+    <!-- Marks the verified bond provisional (not admitted, cleanup kept); called only after every receiver-side check passed. -->
+    <method name="PairingBondAcknowledgedV1">
+      <arg name="generation" type="t" direction="in"/>
+      <arg name="request" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
+    </method>
+    <!-- Admits the provisional bond; called only after the receiver's durable trust write. -->
+    <method name="PairingBondCommittedV1">
+      <arg name="generation" type="t" direction="in"/>
+      <arg name="request" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
+    </method>
+    <!-- Makes the helper's bond state match the receiver's approved wireless identities (the
+         single authority, at most 256), durably and idempotently. Called at receiver start, on
+         every helper incarnation change, and after an enrolment ends without a commit.
+         admitted_info: low 32 bits, approved identities left unadmitted; bit 32, an open
+         enrolment window was left to its own outcome. -->
+    <method name="ReconcileBondsV1">
+      <arg name="approved" type="a(ss)" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="admitted_info" type="t" direction="out"/>
+    </method>
+    <method name="GetPairingComparisonV1">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="request_source" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="challenge_id" type="t" direction="out"/>
+      <arg name="comparison" type="u" direction="out"/>
+      <arg name="bond_address" type="s" direction="out"/>
+      <arg name="adapter_identity" type="s" direction="out"/>
+    </method>
+    <method name="RespondPairingComparisonV1">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="request_source" type="t" direction="in"/>
+      <arg name="challenge_id" type="t" direction="in"/>
+      <arg name="accept" type="u" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
     </method>
     <method name="Invalidate">
       <arg name="consumer_generation" type="t" direction="in"/>

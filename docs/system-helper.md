@@ -12,7 +12,7 @@ or network profiles. Bluetooth identity data is used only by the narrow
 versioned observed-peer API below. USB policy and ModemManager exclusion remain
 status seams, not policy writers. See [task36-bluez.md](task36-bluez.md) for
 the exact source evidence, authorization contract and target blockers.
-See [networkmanager-ap.md](networkmanager-ap.md) for fixed channel36, explicitly
+See [networkmanager-ap.md](networkmanager-ap.md) for the configured UNII-1 AP channel, explicitly
 confirmed jurisdiction, root-only credentials and isolation/shutdown policy.
 
 The receiver executable is the trust anchor, **not cryptographic attestation of
@@ -106,22 +106,39 @@ The helper-only operations can share the client from another thread; destruction
 requires callers to have finished. Wired clients without this dependency do not
 gain helper authority: committed forget now reports required AP work as pending,
 not implicit cleanup success. The actual `ControlService::confirm_phone_pairing`
-path invokes it only after registered-consumer UID/name authorization and
-`PairingGate::confirm`, and policy validation of the live bound request/deadline,
-before persisting approval. Policy rechecks the same deadline after the helper
-RPC; expiry retires helper authority through the tracked cancellation path and
-persists nothing. A helper failure never
-persists approval. `PairingOpened` follows committed approval, including error
-703 (rename committed, directory durability uncertain); that outcome emits
-`pairing_approval_not_durable` and keeps helper confirmation consistent with
-the store. Listening for or forging that signal never mints grants.
+path invokes the helper after registered-consumer UID/name authorization,
+`PairingGate::confirm`, and policy validation of the live bound request and
+deadline (`PairingPolicy::expired()`, the one predicate), before any phone
+approval is persisted. Policy rechecks the same predicate after the helper RPC;
+expiry retires helper authority through the tracked cancellation path and
+persists nothing. For numeric comparison this only opens a pending in-memory
+enrolment. The consumer must retrieve and explicitly accept the one-time
+comparison; the comparison-confirm path applies the same pre- and post-helper
+liveness checks before and after activating the helper. The helper must verify
+the exact bond through `PairingBondConfirmedV1` (which records nothing); the
+receiver then runs its own checks and marks it provisional with `PairingBondAcknowledgedV1`
+(no write), the shared approval routine writes the trust store, and only a durable write is
+committed with `PairingBondCommittedV1`, which admits the bond. The trust store is the single
+bond authority: `ReconcileBondsV1` (at receiver start, on every helper incarnation change and
+after an enrolment ends without a commit) makes the helper's bond files match it, so a failed
+commit keeps a durable approval and reconciliation admits the bond (docs/enrolment-ordering.md).
+A failing reconciliation emits `bond_reconcile_pending` once (retried every second); approved
+identities the helper cannot admit are reported as `bond_reconcile_unadmitted` with their count. `PairingOpened`
+describes admission and follows committed approval, including error 703 (rename
+committed, directory durability uncertain), which emits
+`pairing_approval_not_durable` and keeps helper confirmation consistent with the
+store. Listening for or forging that signal never mints grants. No session D-Bus
+method proxies Issue. A helper error never persists approval.
 
 If persistence fails before commit or any pairing cancellation/expiry fails
 helper invalidation, cancellation must be acknowledged. A failed cancellation
 emits `phone_revocation_retirement_pending` and retains the source and captured
 identity in the existing revocation progress queue, blocking new pairing for
-that identity until acknowledged `Invalidate` retirement. Source-only records
-retry with a bounded per-invocation budget and backoff during owner
+that identity until acknowledged `Invalidate` retirement. A bond the helper may
+already manage (acknowledged, then a failed store write) uses the same queue with a
+bond leg. All of these phone-less records retry through one bounded loop: a
+per-invocation budget (4 attempts or 500 ms), a round-robin cursor and exponential
+backoff of 1-30 s measured from the end of each attempt, during owner
 reconciliation (including idle calls); ordinary phone revocations retain their
 existing ForgetPhone retry path. Cancel, consumer teardown/owner loss,
 successful or committed-not-durable forget, and control-service shutdown
@@ -185,24 +202,32 @@ Lost replies remain unknown outcomes: this is neither globally exactly-once nor
 crash-durable revocation. NM retains its in-flight rotation latch. BlueZ managed
 identities are durably recorded in `/var/lib/aa-system-helper/managed-bonds`
 (versioned exact address/adapter pairs, at most 256). The helper commits the
-allow-list before enabling pairing; a trusted reconnect is admitted only for an
-identity already on the list and never adds one. It loads
+allow-list only when the receiver calls `PairingBondCommittedV1`, after explicit
+comparison acceptance, exact bond verification, every receiver-side check and the
+receiver's durable trust write. Pending admission and acknowledgement never write `managed-bonds`;
+admission records the identity in `pending-removals` (same file rules, not revocation authority)
+so a restarted helper still removes an unaccepted or provisional bond. Revocation moves an
+entry from `managed-bonds` to `revoked-bonds` (same file rules, at most 256, oldest evicted):
+revocation authority only, never admission.
+A trusted reconnect is admitted only for an
+identity already on the list whose directory entry is durable (loaded after a confirmed
+directory fsync at startup, or committed by a successful one; a pending sync is retried on
+reconnect) and never adds one. Revocation depends only on presence, never on durability. It loads
 only an owner-only regular file in a private, owner-validated directory, using
 no-follow path traversal. Writes use an exclusive, randomly named 0600 staging file (EINTR retried), file
-fsync, atomic rename and directory fsync. A write failure refuses only the NEW
-admission; revocation of every entry already stored, or already renamed into
+fsync, atomic rename and directory fsync. A write failure refuses the new bond acknowledgement; revocation of every entry already stored, or already renamed into
 place when only the directory fsync failed, keeps working. After a failed
-directory fsync that entry is not admitted again until a later fsync succeeds.
+directory fsync a new bond acknowledgement for that entry requires a later successful fsync.
 Stored state that is invalid at startup makes the helper log the reason and
 exit, so bonds are never forgotten silently; global BlueZ inventory never grants
-revocation authority. Historical entries are retained for idempotent revocation
-retries and are never removed, so the 256-entry limit is permanent until an
-operator edits the file. Bonds managed before this state format was deployed
+revocation authority. Revoked entries are retained in `revoked-bonds` for idempotent revocation
+retries; `managed-bonds` holds only currently admitted bonds, and an identity on it
+cannot open a new enrolment until it is revoked. Bonds managed before this state format was deployed
 cannot be inferred safely and need explicit operator removal; they must be
 re-paired before they can reconnect. A staging file left by a power cut has a
 random name, blocks nothing and may be deleted by an operator.
 
-## System bus API 1.1.0
+## System bus API 1.4.0
 
 Name `org.custom.AndroidAutoSystemHelper`, path
 `/org/custom/AndroidAutoSystemHelper`, interface
@@ -218,7 +243,13 @@ the helper does not expose Introspectable). Methods:
 | PollPeerV1 | empty | `utss` error, handle, address, adapter identity | Exactly one helper-observed public BR/EDR candidate, otherwise reject |
 | BindPeerV1 | `ttt` generation, request source, observed handle | `ut` error, zero | Snapshot binding before confirmation, no radio exposure |
 | ReconnectPeerV1 | `t` observed handle | `ut` error, state | Store-owner exact lookup followed by helper actual-bond check |
-| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only previously managed exact identity; re-resolve BlueZ object, never accept a supplied path |
+| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only an admitted, revoked or pending-removal exact identity (or, reporting success with nothing to do, one this helper run's cleanup already removed and no longer present); demotes an admitted bond to `revoked-bonds` and reports success only once that demotion is durable; re-resolve BlueZ object, never accept a supplied path. The fast path of ForgetPhone: reconciliation resolves a bond leg it could not complete |
+| PairingBondConfirmedV1 | `tt` generation, request source | `ut` error, bonded boolean | Verification only: accepted comparison and exact bonded snapshot; records nothing |
+| PairingBondAcknowledgedV1 | `tt` generation, request source | `ut` error, reserved zero | Marks the verified bond provisional after every receiver-side check passed; writes nothing, admits nothing |
+| PairingBondCommittedV1 | `tt` generation, request source | `ut` error, reserved zero | After the receiver's durable trust write: admits the provisional bond (confirmed `managed-bonds` sync, then durable `pending-removals` removal); any failure closes the window and parks the bond, unadmitted, for reconciliation |
+| ReconcileBondsV1 | `a(ss)` the receiver's approved wireless identities (at most 256, exact addresses, no duplicates) | `ut` error, unadmitted count (low 32 bits) and open-window flag (bit 32) | Same sender/UID/process authentication; no lease (it precedes any source) and never touches the live enrolment window's bond. Durable and idempotent; success only once every state change is confirmed (rename + directory fsync). Until the first success of a helper run nothing is admitted, no enrolment opens and no cleanup removes a bond |
+| GetPairingComparisonV1 | `tt` generation, request source | `utuss` error, challenge ID, comparison, address, adapter | Authenticated consumer-only retrieval during explicit enrollment |
+| RespondPairingComparisonV1 | `tttu` generation, request source, challenge ID, accept | `ut` error, reserved zero | Explicit human decision after retrieval; one use, same enrollment/peer/deadline |
 
 Errors: 0 success, 1000 unavailable, 1001 rejected, 1002 protocol mismatch.
 Nonzero errors carry value zero. States: 0 inactive, 1 active, 2 unavailable.
@@ -230,7 +261,7 @@ Actions (wire numbers are append-only):
 
 | Number | Action | Authorization argument |
 |---|---|---|
-| 1 | AP acquire | channel exactly 36; one-use AP grant |
+| 1 | AP acquire | channel 36/40/44/48 and equal to ap.conf (default 36); one-use AP grant |
 | 2 | Open pairing (fixed backend 60-second-window contract) | channel 0; distinct one-use pairing grant and captured peer binding |
 | 3 | AP release | channel 0, grant 0, same receiver binding |
 | 4 | AP status | channel 0, grant 0, same binding |

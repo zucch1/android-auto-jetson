@@ -16,10 +16,14 @@ add_library(aa_system_helper STATIC
     src/helper/bluetooth_bootstrap/Bootstrap.cpp
     src/helper/bluetooth_bootstrap/AawFrame.cpp
     src/helper/Identity.cpp src/helper/SystemHelper.cpp src/helper/BusService.cpp
+    src/helper/Comparison.cpp src/helper/ComparisonClient.cpp
     src/helper/BusClient.cpp src/helper/crypto_adapter/Crypto.cpp
     src/helper/bluez_adapter/Platform.cpp src/helper/bluez_adapter/Peers.cpp
     src/helper/bluez_adapter/Callbacks.cpp src/helper/bluez_adapter/Startup.cpp
-    src/helper/bluez_adapter/Continuity.cpp src/helper/bluez_adapter/ManagedPeers.cpp
+    src/helper/bluez_adapter/Continuity.cpp src/helper/bluez_adapter/Comparison.cpp
+    src/helper/bluez_adapter/Reconcile.cpp
+    src/helper/bluez_adapter/Hfp.cpp
+    src/helper/bluez_adapter/ManagedPeers.cpp
     src/helper/nm/Files.cpp src/helper/nm/Commands.cpp src/helper/nm/Connection.cpp src/helper/nm/Backend.cpp)
 target_include_directories(aa_system_helper PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aa_system_helper PUBLIC aa_ipc_dbus aa_trust OpenSSL::Crypto aa_aaw_proto)
@@ -80,12 +84,14 @@ if(NOT CMAKE_CROSSCOMPILING)
     endforeach()
     add_executable(aa_system_helper_test tests/helper/core_test.cpp tests/helper/identity_test.cpp
         tests/helper/identity_reexec_test.cpp
-        tests/helper/confirmation_test.cpp tests/helper/retirement_test.cpp tests/helper/schema_test.cpp tests/trust/syscall_faults.cpp)
+        tests/helper/confirmation_test.cpp tests/helper/comparison_control_test.cpp
+        tests/helper/retirement_test.cpp tests/helper/schema_test.cpp tests/trust/syscall_faults.cpp)
     target_compile_definitions(aa_system_helper_test PRIVATE AA_HELPER_SOURCE="${CMAKE_SOURCE_DIR}")
     add_executable(aa_identity_exec_fixture tests/helper/identity_exec_fixture.cpp)
     target_compile_definitions(aa_system_helper_test PRIVATE AA_IDENTITY_EXEC_FIXTURE="$<TARGET_FILE:aa_identity_exec_fixture>")
     add_dependencies(aa_system_helper_test aa_identity_exec_fixture)
     target_link_options(aa_system_helper_test PRIVATE -Wl,--wrap=fstat)
+    target_link_options(aa_system_helper_test PRIVATE -Wl,--wrap=_ZNSt6chrono3_V212steady_clock3nowEv)
     target_link_options(aa_system_helper_test PRIVATE -Wl,--wrap=fsync -Wl,--wrap=renameat)
     target_link_libraries(aa_system_helper_test PRIVATE aa_system_helper GTest::gtest_main)
     set_target_properties(aa_system_helper_test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES)
@@ -114,6 +120,9 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME system_helper_bluez_runtime COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/helper/bluez_runtime.py" "${CMAKE_BINARY_DIR}")
     set_tests_properties(system_helper_bluez_runtime PROPERTIES TIMEOUT 120)
+    add_test(NAME system_helper_enrolment_retirement COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/helper/enrolment_retirement.py" "${CMAKE_BINARY_DIR}")
+    set_tests_properties(system_helper_enrolment_retirement PROPERTIES TIMEOUT 300)
     add_test(NAME system_helper_composed_runtime COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/helper/composition_runtime.py" "${CMAKE_BINARY_DIR}")
     set_tests_properties(system_helper_composed_runtime PROPERTIES TIMEOUT 60)

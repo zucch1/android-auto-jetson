@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
         if (!bluetooth->available()) {
             const auto why = bluetooth->state_error();
             std::cerr << "system-helper: bluetooth unavailable: "
-                      << (why.empty() ? "cannot reach the system bus" : "managed-bonds state rejected (" + why + "); refusing to start so bonds are not forgotten")
+                      << (why.empty() ? "cannot reach the system bus" : "bond state rejected (" + why + "); refusing to start so bonds are not forgotten")
                       << '\n';
             return 1;
         }

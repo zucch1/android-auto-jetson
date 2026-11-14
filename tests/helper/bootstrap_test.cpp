@@ -39,7 +39,20 @@ protected:
     bool fence_current{true};
     void tick() { bootstrap->tick(now, [this] { return core::Result<ApSnapshot>{snapshot}; },
         [this](std::uint64_t, const std::function<void()>& send) { if (!fence_current) return false; send(); return true; }); }
-    void start() { ASSERT_TRUE(bootstrap->authorize(snapshot, true, now)); tick(); EXPECT_FALSE(read().empty()); }
+    void start() {
+        ASSERT_TRUE(bootstrap->authorize(snapshot, true, now)); tick();
+        AawDecoder decoder; decoder.feed(read()); const auto record = decoder.next();
+        ASSERT_TRUE(std::holds_alternative<AawRecord>(record)); ASSERT_EQ(std::get<AawRecord>(record).id, 4);
+        aaw::WifiVersionRequest version;
+        ASSERT_TRUE(version.ParseFromArray(std::get<AawRecord>(record).payload.data(), static_cast<int>(std::get<AawRecord>(record).payload.size())));
+        EXPECT_EQ(version.major_version(), 1); EXPECT_EQ(version.minor_version(), 0);
+        EXPECT_EQ(version.selected_channel(), aaw::CHANNEL_5GHZ_ONLY); EXPECT_EQ(version.supported_channels_size(), 0);
+    }
+    void version() {
+        aaw::WifiVersionResponse response; response.set_major_version(1); response.set_minor_version(0);
+        response.set_status(aaw::SUCCESS); response.set_selected_channel(aaw::CHANNEL_5GHZ_ONLY);
+        send(5, response.SerializeAsString());
+    }
 };
 TEST(AawPayload, SecurityAndAccessPointBytesAreNotProjectionEnum) {
     aaw::WifiInfoResponse response;
@@ -54,9 +67,47 @@ TEST_F(BootstrapTest, ReadyBeforeEndpointAndOrderedSuccess) {
     ASSERT_TRUE(std::holds_alternative<AawRecord>(record)); EXPECT_EQ(std::get<AawRecord>(record).id, 3);
     aaw::WifiInfoResponse info; ASSERT_TRUE(info.ParseFromArray(std::get<AawRecord>(record).payload.data(), static_cast<int>(std::get<AawRecord>(record).payload.size())));
     EXPECT_TRUE(info.password() == snapshot.password); EXPECT_EQ(info.security_mode(), 8); EXPECT_EQ(info.access_point_type(), 1);
+    const auto next = decoder.next(); ASSERT_TRUE(std::holds_alternative<AawRecord>(next));
+    EXPECT_EQ(std::get<AawRecord>(next).id, 1);
+    aaw::WifiStartRequest endpoint;
+    ASSERT_TRUE(endpoint.ParseFromArray(std::get<AawRecord>(next).payload.data(), static_cast<int>(std::get<AawRecord>(next).payload.size())));
+    EXPECT_EQ(endpoint.ip_address(), snapshot.ip); EXPECT_EQ(endpoint.port(), snapshot.port);
     aaw::WifiStartResponse started; started.set_status(aaw::STATUS_SUCCESS); send(7, started.SerializeAsString());
     aaw::WifiConnectStatus connected; connected.set_status(aaw::STATUS_SUCCESS); send(6, connected.SerializeAsString()); tick();
     EXPECT_EQ(bootstrap->failure(), HandoffFailure::none); EXPECT_TRUE(bootstrap->complete());
+}
+TEST_F(BootstrapTest, ModernVersionSetupStartAndTrailingSuccess) {
+    tick(); EXPECT_TRUE(read().empty()); start(); version(); tick();
+    const auto bytes = read(); ASSERT_GE(bytes.size(), 4U); EXPECT_EQ(bytes[2], 0); EXPECT_EQ(bytes[3], 11);
+    const auto size = (static_cast<std::size_t>(bytes[0]) << 8) | bytes[1]; ASSERT_GE(bytes.size(), size + 4);
+    aaw::WifiSetupInfo setup; ASSERT_TRUE(setup.ParseFromArray(bytes.data() + 4, static_cast<int>(size)));
+    EXPECT_EQ(setup.major_version(), 1); EXPECT_EQ(setup.minor_version(), 0);
+    EXPECT_EQ(setup.endpoint().ip_address(), snapshot.ip); EXPECT_EQ(setup.endpoint().port(), snapshot.port);
+    EXPECT_TRUE(setup.access_point().password() == snapshot.password); EXPECT_EQ(setup.access_point().ssid(), snapshot.ssid);
+    EXPECT_EQ(setup.access_point().bssid(), snapshot.bssid); EXPECT_EQ(setup.access_point().security_mode(), 8);
+    EXPECT_EQ(setup.access_point().channels_size(), 0);
+    AawDecoder decoder; decoder.feed(std::span<const std::uint8_t>{bytes}.subspan(size + 4));
+    const auto record = decoder.next(); ASSERT_TRUE(std::holds_alternative<AawRecord>(record));
+    EXPECT_EQ(std::get<AawRecord>(record).id, 1);
+    aaw::ModernWifiStartRequest endpoint;
+    ASSERT_TRUE(endpoint.ParseFromArray(std::get<AawRecord>(record).payload.data(), static_cast<int>(std::get<AawRecord>(record).payload.size())));
+    EXPECT_EQ(endpoint.ip_address(), snapshot.ip); EXPECT_EQ(endpoint.port(), snapshot.port); EXPECT_EQ(endpoint.reason(), 1);
+    aaw::ModernWifiStartResponse started; started.set_status(aaw::SUCCESS); send(7, started.SerializeAsString());
+    aaw::ModernWifiConnectStatus connected; connected.set_status(aaw::SUCCESS); send(6, connected.SerializeAsString()); tick();
+    EXPECT_TRUE(bootstrap->complete()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
+}
+TEST_F(BootstrapTest, ModernGenerationChangeBeforeSetupPreventsSecrets) {
+    start(); ++snapshot.generation; version(); tick();
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::snapshot); EXPECT_TRUE(read().empty());
+}
+TEST_F(BootstrapTest, ModernGenerationFenceBeforeSetupPreventsSecrets) {
+    start(); fence_current = false; version(); tick();
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::snapshot); EXPECT_TRUE(read().empty());
+}
+TEST_F(BootstrapTest, ModernRejectsLegacySuccessStatus) {
+    start(); version(); tick(); read();
+    aaw::ModernWifiStartResponse started; started.set_status(0); send(7, started.SerializeAsString()); tick();
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::phone_rejected); EXPECT_FALSE(bootstrap->complete());
 }
 TEST_F(BootstrapTest, DenyClosesWithoutPayload) {
     bootstrap->deny(HandoffFailure::denied); EXPECT_TRUE(read().empty());

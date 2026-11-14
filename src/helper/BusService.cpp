@@ -43,6 +43,8 @@ struct BusService::Impl {
         core::Result<std::uint64_t> result{Error{ErrorCode::helper_protocol_mismatch}};
         Cursor body{message.body};
         std::optional<ObservedPeer> peer;
+        std::optional<PairingComparison> comparison;
+        const bool comparison_poll = message.member == "GetPairingComparisonV1";
         const bool polling = message.member == "PollPeerV1";
         const bool bootstrap_poll = message.member == "PollBootstrapV1";
         const bool credentials = message.member == "GetAPCredentialsV1";
@@ -51,7 +53,40 @@ struct BusService::Impl {
         std::uint64_t snapshot_handle{};
         if (message.path == kObjectPath && message.interface_name == kInterface &&
             !message.sender.empty() && message.sender.front() == ':') {
-            if ((bootstrap_poll || credentials || message.member == "AuthorizeBootstrapV1") &&
+            if (message.member == "PairingBondConfirmedV1" && message.signature == "tt") {
+                const auto generation = body.read_u64(); const auto request = body.read_u64();
+                if (generation && request && body.done()) {
+                    const auto bonded = helper.bond_confirmed(message.sender, {generation.value(), request.value()});
+                    result = bonded ? core::Result<std::uint64_t>{bonded.value() ? 1U : 0U} :
+                                      core::Result<std::uint64_t>{bonded.error()};
+                }
+            } else if ((message.member == "PairingBondAcknowledgedV1" || message.member == "PairingBondCommittedV1") &&
+                       message.signature == "tt") {
+                const auto generation = body.read_u64(); const auto request = body.read_u64();
+                if (generation && request && body.done()) {
+                    const Source source{generation.value(), request.value()};
+                    const auto recorded = message.member == "PairingBondCommittedV1" ?
+                        helper.commit_bond(message.sender, source) : helper.acknowledge_bond(message.sender, source);
+                    result = recorded ? core::Result<std::uint64_t>{0} : core::Result<std::uint64_t>{recorded.error()};
+                }
+            } else if ((comparison_poll || message.member == "RespondPairingComparisonV1") &&
+                message.signature == (comparison_poll ? "tt" : "tttu")) {
+                const auto generation = body.read_u64(); const auto request = body.read_u64();
+                if (generation && request) {
+                    const Source source{generation.value(), request.value()};
+                    if (comparison_poll && body.done()) {
+                        const auto fetched = helper.comparison(message.sender, source);
+                        if (fetched) { comparison = fetched.value(); result = comparison->id; }
+                        else result = fetched.error();
+                    } else if (!comparison_poll) {
+                        const auto id = body.read_u64(); const auto accept = body.read_u32();
+                        if (id && accept && accept.value() <= 1 && body.done()) {
+                            const auto answered = helper.respond_comparison(message.sender, source, {id.value(), accept.value() != 0});
+                            result = answered ? core::Result<std::uint64_t>{0} : core::Result<std::uint64_t>{answered.error()};
+                        }
+                    }
+                }
+            } else if ((bootstrap_poll || credentials || message.member == "AuthorizeBootstrapV1") &&
                 message.signature == (bootstrap_poll ? "tt" : credentials ? "ttt" : "tttuu")) {
                 const auto generation = body.read_u64(); const auto confirmation = body.read_u64();
                 if (generation && confirmation) {
@@ -94,6 +129,24 @@ struct BusService::Impl {
                     result = connected ? core::Result<std::uint64_t>{static_cast<std::uint64_t>(connected.value())}
                                        : core::Result<std::uint64_t>{connected.error()};
                 }
+            } else if (message.member == "ReconcileBondsV1" && message.signature == "a(ss)") {
+                // Bounded before parsing (#95): at most kMaxApprovedBonds (address, adapter)
+                // structs of 17-character strings, i.e. 48 bytes each.
+                std::vector<PeerIdentity> approved;
+                const auto length = body.read_u32();
+                bool valid = length && length.value() <= SystemHelper::kMaxApprovedBonds * 48 && body.align(8);
+                const auto end = valid ? body.position() + length.value() : 0;
+                while (valid && body.position() < end) {
+                    if (approved.size() >= SystemHelper::kMaxApprovedBonds || !body.align(8)) { valid = false; break; }
+                    const auto address = body.read_string();
+                    const auto adapter = body.read_string();
+                    if (!address || !adapter || address.value().size() > 17 || adapter.value().size() > 17) { valid = false; break; }
+                    approved.push_back({address.value(), adapter.value()});
+                }
+                if (valid && body.position() == end && body.done()) {
+                    const auto reconciled = helper.reconcile_bonds(message.sender, approved);
+                    result = reconciled ? core::Result<std::uint64_t>{reconciled.value()} : core::Result<std::uint64_t>{reconciled.error()};
+                } else result = Error{ErrorCode::helper_rejected};
             } else if (message.member == "RevokePeerV1" && message.signature == "ss") {
                 const auto address = body.read_string();
                 const auto adapter = body.read_string();
@@ -140,8 +193,10 @@ struct BusService::Impl {
                 MessageWriter reply;
                 const auto wipe_body = reply.protect_body(credentials);
                 reply.destination(message.sender).reply_serial(message.serial);
-                reply.body_signature(credentials ? "utssssut" : bootstrap_poll ? "utssu" : polling ? "utss" : "ut")
+                reply.body_signature(comparison_poll ? "utuss" : credentials ? "utssssut" : bootstrap_poll ? "utssu" : polling ? "utss" : "ut")
                     .put_u32(result ? 0U : static_cast<std::uint32_t>(result.error().code())).put_u64(result ? result.value() : 0);
+                if (comparison_poll) reply.put_u32(comparison ? comparison->number : 0)
+                    .put_string(comparison ? comparison->peer.address : "").put_string(comparison ? comparison->peer.adapter : "");
                 if (polling || bootstrap_poll) reply.put_string(peer ? peer->identity.address : "").put_string(peer ? peer->identity.adapter : "");
                 if (bootstrap_poll) reply.put_u32(static_cast<std::uint32_t>(helper.handoff_failure(message.sender)));
                 if (credentials) reply.put_string(snapshot ? snapshot->ssid : "").put_string(snapshot ? std::string_view{snapshot->password} : std::string_view{})

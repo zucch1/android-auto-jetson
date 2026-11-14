@@ -49,6 +49,42 @@ private:
     const char* path_;
     bool active_{};
 };
+// Recording-backend tests exercise the non-comparison flow; real BlueZ always requires consent.
+class FixtureConfirmation final : public Confirmation {
+public:
+    FixtureConfirmation(Confirmation& target, bool comparison) : target_(target), comparison_(comparison) {}
+    bool requires_comparison() const override { return comparison_; }
+    core::Result<std::optional<PeerIdentity>> prepare(core::ConsumerId g, core::PairingRequestId r) override { return target_.prepare(g, r); }
+    core::Result<void> confirmed(core::ConsumerId g, core::PairingRequestId r) override { return target_.confirmed(g, r); }
+    core::Result<PairingComparison> comparison(core::ConsumerId g, core::PairingRequestId r) override { return target_.comparison(g, r); }
+    core::Result<void> respond_comparison(core::ConsumerId g, core::PairingRequestId r, ComparisonResponse response) override { return target_.respond_comparison(g, r, response); }
+    core::Result<bool> bond_confirmed(core::ConsumerId g, core::PairingRequestId r) override { return target_.bond_confirmed(g, r); }
+    core::Result<void> bond_acknowledged(core::ConsumerId g, core::PairingRequestId r) override {
+        const auto acknowledged = target_.bond_acknowledged(g, r);
+        // Process exit at the boundary between the helper's acknowledgement and the store commit.
+        if (acknowledged && exit_after_acknowledgement) std::_Exit(9);
+        return acknowledged;
+    }
+    core::Result<void> bond_committed(core::ConsumerId g, core::PairingRequestId r) override {
+        // Process exit after the durable trust write, before the commit is sent (crash window 1).
+        if (exit_before_commit) std::_Exit(9);
+        if (hold_commit) return Error{ErrorCode::helper_unavailable};
+        return target_.bond_committed(g, r);
+    }
+    bool reconciles() const override { return target_.reconciles(); }
+    core::Result<std::uint64_t> reconcile_bonds(const std::vector<PeerIdentity>& approved, bool force) override {
+        ++reconciliations;
+        return target_.reconcile_bonds(approved, force);
+    }
+    bool exit_after_acknowledgement{}, hold_commit{}, exit_before_commit{};
+    int reconciliations{};
+    core::Result<void> cancel(core::ConsumerId g, core::PairingRequestId r) override { return target_.cancel(g, r); }
+    void teardown(core::ConsumerId g) override { target_.teardown(g); }
+    RevocationAttempt forgotten_v1(const RevocationV1& s, const RevocationProgress& p) override { return target_.forgotten_v1(s, p); }
+private:
+    Confirmation& target_;
+    bool comparison_;
+};
 int receiver(const char* address, const std::filesystem::path& store_path, bool bluez) {
     trust::ApprovedPhoneStore store{store_path};
     if (!store.load()) return 2;
@@ -59,7 +95,8 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
     ipc::RandomPairingIdSource ids;
     auto helper = BusClient::private_bus_for_test(address, store);
     if (!helper) return 3;
-    auto service = ipc::ControlBusService::start({::getuid()}, {ids, phones, helper.value().get()});
+    FixtureConfirmation confirmation{*helper.value(), bluez};
+    auto service = ipc::ControlBusService::start({::getuid()}, {ids, phones, &confirmation});
     if (!service) return 4;
     struct Worker {
         core::CancellationSource cancellation;
@@ -127,6 +164,15 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
             if (command == "cancelled") cancellation.request_stop();
             const auto response = helper.value()->call(request, core::Milliseconds{command == "timeout" ? 0 : 1000}, cancellation.get_token());
             result = response ? core::Result<void>{} : core::Result<void>{response.error()};
+        } else if (command == "reconciliations") {
+            std::cout << confirmation.reconciliations << '\n' << std::flush;
+            continue;
+        } else if (command == "exit-after-ack" || command == "hold-commit" || command == "release-commit" ||
+                   command == "exit-before-commit") {
+            if (command == "exit-after-ack") confirmation.exit_after_acknowledgement = true;
+            else if (command == "exit-before-commit") confirmation.exit_before_commit = true;
+            else confirmation.hold_commit = command == "hold-commit";
+            result = {};
         } else if (command == "fault-dir" || command == "fault-temp" || command == "fault-clear") {
             using trust::test::faults::Fault;
             trust::test::faults::arm(command == "fault-dir" ? Fault::dir_fsync :
@@ -164,6 +210,11 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
         } else if (command == "seed-wired") {
             const auto approved = store.approve(trust::WiredIdentity{"18d1", "2d00", "wired-fixture", "Google", "AA", "wired", "1-2"});
             result = approved ? core::Result<void>{} : core::Result<void>{approved.error()};
+        } else if (command == "reload-store") {
+            result = store.load();
+        } else if (command == "pending-pairings") {
+            std::cout << phones.pending_count() << '\n' << std::flush;
+            continue;
         } else if (command == "refresh") {
             service.value().service().refresh_consumer_owner();
             result = {};

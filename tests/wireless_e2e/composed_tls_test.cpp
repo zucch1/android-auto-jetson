@@ -5,9 +5,12 @@
 
 namespace aa::helper::nm {
 namespace {
-class WirelessComposedTls : public SecretDaemon {};
-TEST_F(WirelessComposedTls, ApprovedReconnectBootstrapTlsAndAuthorizedSinks) {
-    start(); acquire(99); ASSERT_TRUE(state(State::active));
+class WirelessComposedTls : public SecretDaemon {
+protected:
+    void approved_reconnect(bool modern);
+};
+void WirelessComposedTls::approved_reconnect(bool modern) {
+    start(); acquire(99); ASSERT_TRUE(state(State::active)); ASSERT_NO_FATAL_FAILURE(adopt_activation_secret());
     const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
     ASSERT_TRUE(store->approve(identity));
     ASSERT_EQ(bluez.command("paired"), "ok");
@@ -49,37 +52,72 @@ TEST_F(WirelessComposedTls, ApprovedReconnectBootstrapTlsAndAuthorizedSinks) {
         << "epoch=" << coordinator.epoch() << " listener_started=" << snapshot.has_value();
     ASSERT_TRUE(snapshot); ASSERT_TRUE(link.listening());
     EXPECT_TRUE(snapshot->password == sentinel);
-    { const std::lock_guard lock{nm->mutex}; EXPECT_TRUE(nm->seen_psk == sentinel); }
     aaw::WifiStartRequest endpoint;
     auto bootstrap = std::async(std::launch::async, [&] {
+    // Keep coalesced records across reads, including modern SetupInfo (ID11),
+    // which is outside the legacy AawDecoder's accepted ID range.
+    std::vector<std::uint8_t> buffered;
+    std::size_t offset{};
     const auto read_record = [&](AawRecord& record) {
-        AawDecoder decoder;
         return eventually([&] {
-            decoder.feed(unhex(bluez.command("wire-read")));
-            auto decoded = decoder.next();
-            if (const auto* result = std::get_if<AawRecord>(&decoded)) { record = *result; return true; }
-            return false;
+            const auto complete = [&] {
+                if (buffered.size() - offset < 4) return false;
+                const auto size = (static_cast<std::size_t>(buffered[offset]) << 8) | buffered[offset + 1];
+                EXPECT_LE(size, 4096U);
+                if (size > 4096 || buffered.size() - offset < size + 4) return false;
+                record.id = static_cast<std::uint16_t>((static_cast<unsigned>(buffered[offset + 2]) << 8) | buffered[offset + 3]);
+                const auto payload = std::span<const std::uint8_t>{buffered}.subspan(offset + 4, size);
+                record.payload.assign(payload.begin(), payload.end()); offset += size + 4;
+                return true;
+            };
+            if (complete()) return true;
+            const auto bytes = unhex(bluez.command("wire-read"));
+            buffered.insert(buffered.end(), bytes.begin(), bytes.end());
+            return complete();
         });
     };
+    AawRecord version_record;
+    ASSERT_TRUE(read_record(version_record)); ASSERT_EQ(version_record.id, 4);
+    aaw::WifiVersionRequest version;
+    ASSERT_TRUE(version.ParseFromArray(version_record.payload.data(), static_cast<int>(version_record.payload.size())));
+    EXPECT_EQ(version.major_version(), 1); EXPECT_EQ(version.minor_version(), 0);
+    EXPECT_EQ(version.selected_channel(), aaw::CHANNEL_5GHZ_ONLY);
+    EXPECT_EQ(version.supported_channels_size(), 0);
+    ASSERT_EQ(bluez.command(modern ? "wire-send 0008000510011800280c3001" : "wire-send 00000002"), "ok");
+    AawRecord info_record;
+    ASSERT_TRUE(read_record(info_record)); ASSERT_EQ(info_record.id, modern ? 11 : 3);
+    if (modern) {
+        aaw::WifiSetupInfo info;
+        ASSERT_TRUE(info.ParseFromArray(info_record.payload.data(), static_cast<int>(info_record.payload.size())));
+        EXPECT_EQ(info.major_version(), 1); EXPECT_EQ(info.minor_version(), 0);
+        EXPECT_EQ(info.endpoint().ip_address(), snapshot->ip); EXPECT_EQ(info.endpoint().port(), snapshot->port);
+        EXPECT_TRUE(info.access_point().password() == snapshot->password);
+        EXPECT_TRUE(info.access_point().ssid() == snapshot->ssid);
+        EXPECT_EQ(info.access_point().bssid(), snapshot->bssid); EXPECT_EQ(info.access_point().security_mode(), 8);
+        EXPECT_EQ(info.access_point().channels_size(), 0);
+    } else {
+        aaw::WifiInfoResponse info;
+        ASSERT_TRUE(info.ParseFromArray(info_record.payload.data(), static_cast<int>(info_record.payload.size())));
+        EXPECT_TRUE(info.password() == snapshot->password); EXPECT_TRUE(info.ssid() == snapshot->ssid);
+        EXPECT_EQ(info.bssid(), snapshot->bssid); EXPECT_EQ(info.security_mode(), 8);
+    }
     AawRecord endpoint_record;
     ASSERT_TRUE(read_record(endpoint_record)); ASSERT_EQ(endpoint_record.id, 1);
-    ASSERT_TRUE(endpoint.ParseFromArray(endpoint_record.payload.data(), static_cast<int>(endpoint_record.payload.size())));
+    if (modern) {
+        aaw::ModernWifiStartRequest start;
+        ASSERT_TRUE(start.ParseFromArray(endpoint_record.payload.data(), static_cast<int>(endpoint_record.payload.size())));
+        EXPECT_EQ(start.reason(), aaw::DYNAMIC);
+        endpoint.set_ip_address(start.ip_address()); endpoint.set_port(start.port());
+    } else {
+        ASSERT_TRUE(endpoint.ParseFromArray(endpoint_record.payload.data(), static_cast<int>(endpoint_record.payload.size())));
+    }
     EXPECT_EQ(endpoint.ip_address(), snapshot->ip); EXPECT_EQ(endpoint.port(), snapshot->port);
-    ASSERT_EQ(bluez.command("wire-send 00000002"), "ok");
-    AawRecord info_record;
-    ASSERT_TRUE(read_record(info_record)); ASSERT_EQ(info_record.id, 3);
-    aaw::WifiInfoResponse info;
-    ASSERT_TRUE(info.ParseFromArray(info_record.payload.data(), static_cast<int>(info_record.payload.size())));
-    EXPECT_TRUE(info.password() == snapshot->password); EXPECT_TRUE(info.ssid() == snapshot->ssid);
-    EXPECT_EQ(info.bssid(), snapshot->bssid); EXPECT_EQ(info.security_mode(), 8);
-    ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
+    ASSERT_EQ(bluez.command(modern ? "wire-send 00020007200c00020006100c" : "wire-send 000200071800000200060800"), "ok");
     ASSERT_TRUE(eventually([&] { return bluez.command("wire-read") == "closed"; }));
     });
     ASSERT_TRUE(eventually([&] { coordinator.tick(); return bootstrap.wait_for(0ms) == std::future_status::ready; }, 5s));
     bootstrap.get(); ASSERT_FALSE(HasFatalFailure());
-    link.attest_for_test([&](const transport::TcpTransport&, const trust::PhoneIdentity& phone) {
-        return phone.key == trust::identity_key(identity);
-    });
+    ASSERT_TRUE(coordinator.admitting());
     auto tcp = transport::TcpTransport::connect(endpoint.ip_address().c_str(), static_cast<std::uint16_t>(endpoint.port()));
     ASSERT_TRUE(tcp); tcp.value()->set_io_deadline(Clock::now() + 5s);
     std::atomic<bool> finished{}, active{}, release_phone{};
@@ -137,9 +175,15 @@ TEST_F(WirelessComposedTls, ApprovedReconnectBootstrapTlsAndAuthorizedSinks) {
     link.stop(); coordinator.retire(); confirmation.flush(true);
     EXPECT_TRUE(scanned_active); surfaces(diagnostic_sink, control, events);
 }
+TEST_F(WirelessComposedTls, ApprovedReconnectBootstrapTlsAndAuthorizedSinks) {
+    approved_reconnect(false);
+}
+TEST_F(WirelessComposedTls, ModernApprovedReconnectBootstrapTlsAndAuthorizedSinks) {
+    approved_reconnect(true);
+}
 TEST_F(WirelessComposedTls, SnapshotDenialBeforeReleaseDoesNotDiscloseProvisionedPassword) {
-    // Given: the composed helper loaded the sentinel and a real consumer owns admission.
-    start(); acquire(99); ASSERT_TRUE(state(State::active));
+    // Given: the composed helper activated a fresh PSK and a real consumer owns admission.
+    start(); acquire(99); ASSERT_TRUE(state(State::active)); ASSERT_NO_FATAL_FAILURE(adopt_activation_secret());
     const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
     ASSERT_TRUE(store->approve(identity)); ASSERT_EQ(bluez.command("paired"), "ok");
     SecretDiagnostics diagnostic_sink;

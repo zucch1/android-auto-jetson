@@ -16311,9 +16311,11 @@
    "classification": "undecided-match",
    "covering_findings": [],
    "detail": "same name 'WifiVersionRequest' but structural overlap 0.00 < 0.25: possible name collision; same name 'wifiversionrequest' but structural overlap 0.00 < 0.25: possible name collision",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "U-fbdbc2bcc590",
    "key": "",
    "kind": "undecided-match",
@@ -16323,8 +16325,10 @@
    },
    "oaa": "oaa.proto.messages.WifiVersionRequest",
    "oaa_value": null,
-   "receiver_citations": [],
-   "severity": "low-medium",
+   "receiver_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
+   "severity": "medium",
    "source": {
     "aasdk_file": "aaw/WifiVersionRequest.proto",
     "aasdk_line": 5,
@@ -16340,12 +16344,12 @@
     "owner": "child-5-wireless-bt-radio",
     "phone_evidence_status": "unknown, needs phone evidence",
     "rationale": "Bootstrap.cpp implements core RFCOMM record IDs 1/2/3/6/7; remaining aaw.* parity requires phone RFCOMM capture.",
-    "severity": "low-medium",
+    "severity": "medium",
     "status": "proposed",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
-   "used_by_receiver": false,
+   "usage_mode": "entity-used",
+   "used_by_receiver": true,
    "wire_affecting": false
   },
   {
@@ -17071,9 +17075,11 @@
    "classification": "optionality-difference",
    "covering_findings": [],
    "detail": "required/optional/implicit presence differs (bytes identical when present)",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-049a213ec6bd",
    "key": "field 4",
    "kind": "field-presence",
@@ -17104,7 +17110,7 @@
     "status": "resolved",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-unused",
    "used_by_receiver": false,
    "wire_affecting": false
   },
@@ -20260,9 +20266,11 @@
    "classification": "field-number-or-type-conflict",
    "covering_findings": [],
    "detail": "uint32 vs int32 share wire type varint",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-1448c24f5e07",
    "key": "field 1",
    "kind": "field-varint-integer-interpretation",
@@ -20293,7 +20301,7 @@
     "status": "resolved",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-unused",
    "used_by_receiver": false,
    "wire_affecting": false
   },
@@ -22538,9 +22546,11 @@
    "classification": "field-added-one-side",
    "covering_findings": [],
    "detail": "field 5 'selected_wifi_channel_type' exists only in OAA",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-200c18c0b4da",
    "key": "field 5",
    "kind": "field-only-oaa",
@@ -22578,7 +22588,7 @@
     "status": "deferred",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-absent",
    "used_by_receiver": false,
    "wire_affecting": true
   },
@@ -26246,9 +26256,11 @@
    "classification": "field-name-difference",
    "covering_findings": [],
    "detail": "field name differs and is not a normalised rename: same number and wire type, meaning not mechanically comparable (rename or semantic change)",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-35ce7a8bc5b3",
    "key": "field 4",
    "kind": "field-rename",
@@ -26279,7 +26291,7 @@
     "status": "resolved",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-unused",
    "used_by_receiver": false,
    "wire_affecting": false
   },
@@ -33466,9 +33478,11 @@
    "classification": "field-number-or-type-conflict",
    "covering_findings": [],
    "detail": "uint32 vs int32 share wire type varint",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-616a6faef160",
    "key": "field 4",
    "kind": "field-varint-integer-interpretation",
@@ -33499,7 +33513,7 @@
     "status": "resolved",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-unused",
    "used_by_receiver": false,
    "wire_affecting": false
   },
@@ -33928,9 +33942,11 @@
    "classification": "field-number-or-type-conflict",
    "covering_findings": [],
    "detail": "uint32 vs int32 share wire type varint",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-63885a9c100b",
    "key": "field 2",
    "kind": "field-varint-integer-interpretation",
@@ -33961,7 +33977,7 @@
     "status": "resolved",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-unused",
    "used_by_receiver": false,
    "wire_affecting": false
   },
@@ -37305,9 +37321,11 @@
    "classification": "field-name-difference",
    "covering_findings": [],
    "detail": "field name differs and is not a normalised rename: same number and wire type, meaning not mechanically comparable (rename or semantic change)",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-723907d14e96",
    "key": "field 1",
    "kind": "field-rename",
@@ -37338,7 +37356,7 @@
     "status": "resolved",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-unused",
    "used_by_receiver": false,
    "wire_affecting": false
   },
@@ -41526,9 +41544,11 @@
    "classification": "optionality-difference",
    "covering_findings": [],
    "detail": "required/optional/implicit presence differs (bytes identical when present)",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-8b3828e2289d",
    "key": "field 2",
    "kind": "field-presence",
@@ -41559,7 +41579,7 @@
     "status": "resolved",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-unused",
    "used_by_receiver": false,
    "wire_affecting": false
   },
@@ -43422,9 +43442,11 @@
    "classification": "field-name-difference",
    "covering_findings": [],
    "detail": "field name differs and is not a normalised rename: same number and wire type, meaning not mechanically comparable (rename or semantic change)",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-94fb3cd48b31",
    "key": "field 3",
    "kind": "field-rename",
@@ -43455,7 +43477,7 @@
     "status": "resolved",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-unused",
    "used_by_receiver": false,
    "wire_affecting": false
   },
@@ -50850,9 +50872,11 @@
    "classification": "field-added-one-side",
    "covering_findings": [],
    "detail": "field 6 'session_info' exists only in OAA",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-b410619fc0b9",
    "key": "field 6",
    "kind": "field-only-oaa",
@@ -50890,7 +50914,7 @@
     "status": "deferred",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-absent",
    "used_by_receiver": false,
    "wire_affecting": true
   },
@@ -52826,9 +52850,11 @@
    "classification": "field-added-one-side",
    "covering_findings": [],
    "detail": "field 7 'extra_data' exists only in OAA",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-bc2d770891a2",
    "key": "field 7",
    "kind": "field-only-oaa",
@@ -52866,7 +52892,7 @@
     "status": "deferred",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-absent",
    "used_by_receiver": false,
    "wire_affecting": true
   },
@@ -57207,9 +57233,11 @@
    "classification": "field-name-difference",
    "covering_findings": [],
    "detail": "field name differs and is not a normalised rename: same number and wire type, meaning not mechanically comparable (rename or semantic change)",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-d4a4ea8adeb9",
    "key": "field 2",
    "kind": "field-rename",
@@ -57240,7 +57268,7 @@
     "status": "resolved",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-unused",
    "used_by_receiver": false,
    "wire_affecting": false
   },
@@ -64361,9 +64389,11 @@
    "classification": "optionality-difference",
    "covering_findings": [],
    "detail": "required/optional/implicit presence differs (bytes identical when present)",
-   "entity_citations": [],
+   "entity_citations": [
+    "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
+   ],
    "entity_kind": "message",
-   "entity_used_by_receiver": false,
+   "entity_used_by_receiver": true,
    "id": "W-f57f5084d03f",
    "key": "field 1",
    "kind": "field-presence",
@@ -64394,7 +64424,7 @@
     "status": "resolved",
     "version_applicability": "AA 16.1"
    },
-   "usage_mode": "unused",
+   "usage_mode": "entity-active-field-unused",
    "used_by_receiver": false,
    "wire_affecting": false
   },
@@ -160207,8 +160237,8 @@
   "by_severity": {
    "high": 26,
    "low": 571,
-   "low-medium": 186,
-   "medium": 199,
+   "low-medium": 185,
+   "medium": 200,
    "medium-high": 33
   },
   "by_status": {
@@ -161484,7 +161514,7 @@
      "src/helper/bluetooth_bootstrap/Bootstrap.cpp"
     ],
     "total": 41,
-    "used_by_receiver": 16,
+    "used_by_receiver": 17,
     "version_gates": [
      "AA 16.1",
      "AA 17.3"
@@ -161917,7 +161947,7 @@
   "total_differences": 1015,
   "triaged": 1015,
   "untriaged": 0,
-  "used_by_receiver": 191,
+  "used_by_receiver": 192,
   "wire_affecting": 238,
   "wire_and_used": 59,
   "wireless_modes": {
@@ -161959,7 +161989,7 @@
    "wifi_projection_diffs": 31,
    "wifi_projection_used": 18,
    "wireless_bootstrap_diffs": 41,
-   "wireless_bootstrap_used": 16
+   "wireless_bootstrap_used": 17
   }
  }
 }

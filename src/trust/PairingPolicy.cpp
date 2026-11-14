@@ -34,9 +34,17 @@ std::optional<helper::PeerIdentity> PairingPolicy::wireless_identity(core::Phone
     }
     return std::nullopt;
 }
+std::optional<std::vector<helper::PeerIdentity>> PairingPolicy::approved_wireless() const {
+    if (!store_.usable()) return std::nullopt;
+    std::vector<helper::PeerIdentity> approved;
+    for (const auto& entry : store_.phones())
+        if (const auto* wireless = std::get_if<WirelessIdentity>(&entry.identity))
+            approved.push_back({wireless->bond_address, wireless->adapter});
+    return approved;
+}
 std::optional<helper::PeerIdentity> PairingPolicy::pairing_wireless_identity(core::PairingRequestId request) const {
     const auto index = find(request);
-    if (index < pending_.size()) {
+    if (index < pending_.size() && pending_[index].reload_epoch == store_.reload_epoch()) {
         if (const auto* wireless = std::get_if<WirelessIdentity>(&pending_[index].identity))
             return helper::PeerIdentity{wireless->bond_address, wireless->adapter};
     }
@@ -174,12 +182,15 @@ core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId reque
     const core::Nanoseconds now = clock_.now();
     pending_.push_back(Pending{
         request, *candidate_,
-        core::Nanoseconds{now.count + core::to_nanoseconds(kConfirmWindow).count}});
+        core::Nanoseconds{now.count + core::to_nanoseconds(kConfirmWindow).count}, store_.reload_epoch()});
     return {};
 }
 
+// The single liveness predicate for a pending request: past its deadline, or its bound
+// store snapshot was invalidated by a reload. Used by the sweep, validate_pairing and
+// pairing_confirmed, so no caller can disagree about whether a request is still live.
 bool PairingPolicy::expired(const Pending& pending) const {
-    return clock_.now().count > pending.deadline.count;
+    return clock_.now().count > pending.deadline.count || pending.reload_epoch != store_.reload_epoch();
 }
 
 core::Result<void> PairingPolicy::validate_pairing(core::PairingRequestId request) {

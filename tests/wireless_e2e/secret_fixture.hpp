@@ -46,6 +46,13 @@ protected:
         ASSERT_TRUE(connection); client = std::move(connection.value());
         ASSERT_TRUE(eventually([this] { return client->status(Action::ap_status).has_value(); }));
     }
+    // Every activation generates a fresh PSK; scan for the one NM actually got.
+    void adopt_activation_secret() {
+        const std::lock_guard lock{nm->mutex};
+        ASSERT_EQ(nm->seen_psk.size(), 64U);
+        EXPECT_NE(nm->seen_psk, password) << "activation reused the provisioned PSK";
+        sentinel = nm->seen_psk;
+    }
     void absent(std::string_view bytes, const char* surface) const {
         std::string hex;
         constexpr std::string_view digits{"0123456789abcdef"};

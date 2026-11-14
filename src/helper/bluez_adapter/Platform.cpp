@@ -24,7 +24,8 @@ constexpr auto interfaces = R"(<node>
 </interface></node>)";
 }
 BluezBackend::Impl::Impl(const std::string& address, Now clock, const std::string& state, std::uint32_t state_owner)
-    : now(std::move(clock)), managed(state, state_owner) {
+    : now(std::move(clock)), managed(state, state_owner), pending(state, state_owner, "pending-removals"),
+      revoked(state, state_owner, "revoked-bonds") {
     context = g_main_context_new();
     g_main_context_push_thread_default(context);
     GError* error = nullptr;
@@ -55,9 +56,7 @@ BluezBackend::Impl::Impl(const std::string& address, Now clock, const std::strin
 }
 BluezBackend::Impl::~Impl() {
     close_window();
-    if (registered) {
-        if (auto* reply = call("/org/bluez", "org.bluez.ProfileManager1", "UnregisterProfile", g_variant_new("(o)", kProfilePath))) g_variant_unref(reply);
-    }
+    (void)unregister_profiles();
     if (agent_registered) {
         if (auto* reply = call("/org/bluez", "org.bluez.AgentManager1", "UnregisterAgent", g_variant_new("(o)", kAgentPath))) g_variant_unref(reply);
     }
@@ -85,6 +84,9 @@ GVariant* BluezBackend::Impl::call(const char* path, const char* interface, cons
         parameters, type, G_DBUS_CALL_FLAGS_NO_AUTO_START, 150, nullptr, &error);
     g_clear_error(&error);
     return result;
+}
+void BluezBackend::Impl::disconnect(const Device& device) {
+    if (auto* reply = call(device.path.c_str(), "org.bluez.Device1", "Disconnect", nullptr)) g_variant_unref(reply);
 }
 bool BluezBackend::Impl::current_owner() {
     if (!bus || g_dbus_connection_is_closed(bus)) { reset(); owner.clear(); return false; }
@@ -120,8 +122,12 @@ void BluezBackend::Impl::close_connection() {
     connected.reset(); handoff_handle = 0;
 }
 void BluezBackend::Impl::close_admission() {
+    park();
+    reject_comparison();
     window = {};
     pairing_enabled = false;
+    comparison_accepted = false;
+    acknowledged = false;
     if (allowed) {
         // BlueZ turns CancelPairing without an in-flight Pair() into MGMT Unpair Device, which
         // drops the kernel link key of a just-completed bond. Only cancel pairing confirmed as
@@ -137,16 +143,22 @@ void BluezBackend::Impl::close_admission() {
     }
     allowed.reset();
     quiet_pending = !quiet();
+    retire_unaccepted();
 }
 void BluezBackend::Impl::close_window() { close_connection(); close_admission(); }
 void BluezBackend::Impl::reset() {
+    park();
+    reject_comparison();
     ++owner_epoch;
     close_connection();
-    allowed.reset(); window = {}; pairing_enabled = false; observations.clear(); adapters.clear();
+    allowed.reset(); window = {}; pairing_enabled = false; comparison_accepted = false; acknowledged = false;
+    observations.clear(); adapters.clear();
     registered = false; agent_registered = false;
 }
 void BluezBackend::Impl::pump() {
     drain_events();
+    retire_unaccepted();
+    if (comparison && now() >= comparison->deadline) close_admission();
     if (now() >= next_check) {
         const bool alive = current_owner();
         if (alive && profile_requested && (!registered || !agent_registered)) (void)ensure();
@@ -169,34 +181,30 @@ bool BluezBackend::Impl::ensure() {
     if (!current_owner() || !profile_export || !agent_export) return false;
     if (registered && agent_registered) return true;
     std::vector<Device> devices;
-    if (!inventory(devices) || adapters.size() != 1 || !quiet()) return false;
+    if (!inventory(devices) || adapters.size() != 1) return false;
+    if ((!pairing_enabled || !allowed) && !quiet()) return false;
     if (!agent_registered) {
-        auto* reply = call("/org/bluez", "org.bluez.AgentManager1", "RegisterAgent", g_variant_new("(os)", kAgentPath, "NoInputNoOutput"));
+        auto* reply = call("/org/bluez", "org.bluez.AgentManager1", "RegisterAgent", g_variant_new("(os)", kAgentPath, "DisplayYesNo"));
         if (!reply) return false;
         g_variant_unref(reply); agent_registered = true;
     }
     auto* reply = call("/org/bluez", "org.bluez.AgentManager1", "RequestDefaultAgent", g_variant_new("(o)", kAgentPath));
     if (!reply) return false;
     g_variant_unref(reply);
-    GVariantBuilder options;
-    g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    g_variant_builder_add(&options, "{sv}", "Name", g_variant_new_string("Android Auto"));
-    g_variant_builder_add(&options, "{sv}", "Role", g_variant_new_string("server"));
-    g_variant_builder_add(&options, "{sv}", "Channel", g_variant_new_uint16(8));
-    g_variant_builder_add(&options, "{sv}", "RequireAuthentication", g_variant_new_boolean(TRUE));
-    g_variant_builder_add(&options, "{sv}", "RequireAuthorization", g_variant_new_boolean(TRUE));
-    g_variant_builder_add(&options, "{sv}", "AutoConnect", g_variant_new_boolean(FALSE));
-    if (registered) { g_variant_builder_clear(&options); return true; }
-    reply = call("/org/bluez", "org.bluez.ProfileManager1", "RegisterProfile", g_variant_new("(os@a{sv})", kProfilePath, kAaUuid, g_variant_builder_end(&options)));
-    if (!reply) return false;
-    g_variant_unref(reply); registered = true;
-    return true;
+    return register_profiles();
 }
 BluezBackend::BluezBackend(const std::string& address, Now now, const std::string& state, std::uint32_t state_owner)
     : impl_(std::make_unique<Impl>(address, std::move(now), state, state_owner)) {}
 BluezBackend::~BluezBackend() = default;
-std::string BluezBackend::state_error() const { return impl_->managed.reason(); }
-bool BluezBackend::available() const { return impl_->managed.valid() && impl_->bus && !g_dbus_connection_is_closed(impl_->bus); }
+std::string BluezBackend::state_error() const {
+    if (!impl_->managed.valid()) return "managed-bonds: " + impl_->managed.reason();
+    if (!impl_->pending.valid()) return "pending-removals: " + impl_->pending.reason();
+    return impl_->revoked.valid() ? std::string{} : "revoked-bonds: " + impl_->revoked.reason();
+}
+bool BluezBackend::available() const {
+    return impl_->managed.valid() && impl_->pending.valid() && impl_->revoked.valid() &&
+           impl_->bus && !g_dbus_connection_is_closed(impl_->bus);
+}
 core::Result<ObservedPeer> BluezBackend::handoff() {
     if (impl_->bootstrap && impl_->bootstrap->expire()) impl_->last_failure = impl_->bootstrap->failure();
     if (!impl_->bootstrap || (!impl_->bootstrap->live() && !impl_->bootstrap->complete()) || !impl_->connected) return Error{ErrorCode::helper_rejected};
@@ -253,9 +261,8 @@ core::Result<State> BluezBackend::apply(Action action, std::uint32_t channel) {
         impl_->profile_requested = false;
         cleanup();
         if (!impl_->current_owner()) return Error{ErrorCode::helper_unavailable};
-        auto* reply = impl_->call("/org/bluez", "org.bluez.ProfileManager1", "UnregisterProfile", g_variant_new("(o)", kProfilePath));
-        if (!reply) return Error{ErrorCode::helper_unavailable};
-        g_variant_unref(reply); impl_->registered = false; return State::inactive;
+        if (!impl_->unregister_profiles()) return Error{ErrorCode::helper_unavailable};
+        return State::inactive;
     }
     default: { UnavailableBackend unavailable; return unavailable.apply(action, channel); }
     }

@@ -26,6 +26,14 @@ public:
     void cleanup() noexcept override { ap_.cleanup(); bluetooth_.cleanup(); }
     void retire_lease() noexcept override { ap_.retire_lease(); bluetooth_.retire_lease(); }
     void tick() override { ap_.tick(); bluetooth_.tick(); }
+    core::Result<bool> bond_confirmed() override { return bluetooth_.bond_confirmed(); }
+    core::Result<void> acknowledge_bond() override { return bluetooth_.acknowledge_bond(); }
+    core::Result<void> commit_bond() override { return bluetooth_.commit_bond(); }
+    core::Result<std::uint64_t> reconcile_bonds(const std::vector<PeerIdentity>& approved) override {
+        return bluetooth_.reconcile_bonds(approved);
+    }
+    core::Result<PairingComparison> comparison() override { return bluetooth_.comparison(); }
+    core::Result<void> respond_comparison(ComparisonResponse response) override { return bluetooth_.respond_comparison(response); }
     core::Result<void> revoke(std::uint64_t phone) override { return ap_.revoke(phone); }
     core::Result<ObservedPeer> observe() override { return bluetooth_.observe(); }
     core::Result<State> authorize(std::uint64_t handle) override { return bluetooth_.authorize(handle); }
@@ -45,6 +53,7 @@ public:
     SnapshotDeadline handoff_deadline() const override { return bluetooth_.handoff_deadline(); }
     bool snapshot_current(std::uint64_t generation) override { return ap_.snapshot_current(generation); }
     bool with_snapshot(std::uint64_t generation, const std::function<void()>& send) override { return ap_.with_snapshot(generation, send); }
+    void rekey(std::uint64_t generation) override { ap_.rekey(generation); }
 private:
     Backend& ap_;
     Backend& bluetooth_;

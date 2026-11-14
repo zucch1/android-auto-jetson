@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -18,6 +20,7 @@ from gi.repository import Gio, GLib
 
 from bluez_runtime import Surface, command, control, rejected, wait
 from private_bus import line, process
+from comparison_cases import present
 
 
 class NmState(TypedDict):
@@ -29,16 +32,47 @@ class NmState(TypedDict):
     quarantined: bool
 
 
+def describe_failed_start(child: subprocess.Popen[bytes], first_line: str) -> str:
+    """What the NM double printed instead of "ready", plus its exit status and stderr (for CI logs)."""
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        child.wait(timeout=1)
+    status = child.poll()
+    stderr = ""
+    if status is not None and child.stderr is not None:
+        stderr = os.read(child.stderr.fileno(), 8192).decode(errors="replace")
+    return f"NM double did not report ready: stdout line {first_line!r}, exit status {status}, stderr {stderr!r}"
+
+
 class ComposedSurface(Surface):
     def platform_options(self, stack: contextlib.ExitStack, build: Path, directory: Path) -> list[str]:
         (directory / "state").mkdir(mode=0o700)
         (directory / "ap.conf").write_text("v1 wlan-test US jurisdiction-confirmed 5277\n")
         (directory / "ap.conf").chmod(0o600)
-        self.credentials = directory / "state/ap.credentials"
-        socket = str(directory / "cmd")
+        # AF_UNIX paths are limited to 107 bytes (sun_path). A fixture directory under a deep CI
+        # checkout (e.g. /home/runner/work/<repo>/<repo>/build/host-dev/<run>/<case>/cmd) exceeds
+        # that, so the NM double's bind() fails and it never reports ready. Bind in a short private
+        # directory (mkdtemp is 0700, owned by this user) instead of inside the fixture directory.
+        socket_directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="aa-cmd-")))
+        socket = str(socket_directory / "cmd")
+        assert len(socket.encode()) < 100, f"command socket path too long for sun_path: {socket}"
         self.nm = stack.enter_context(process([str(build / "aa_nm_ap_test"), "--wire-double", self.address, socket], self.env))
-        assert line(self.nm) == "ready"
+        # The double reports ready once it owns the NetworkManager name (event-driven); the bound
+        # only guards against a hung child on a loaded, parallel host.
+        try:
+            ready = line(self.nm, 30)
+        except AssertionError as error:
+            raise AssertionError(describe_failed_start(self.nm, f"<{error}>")) from error
+        assert ready == "ready", describe_failed_start(self.nm, ready)
         return ["--combined", socket]
+
+    def confirm(self, request: int, wrong: bool = False) -> None:
+        super().confirm(request)
+        command(self.mock, "comparison-start wrong" if wrong else "comparison-start")
+        challenge = present(self, request)
+        control(self.consumer, "RespondPairingComparison",
+                GLib.Variant("(ttb)", (request, int(challenge["challenge_id"]), True)))
+        command(self.mock, "paired")
+        wait(lambda: command(self.receiver, "pending-pairings") == "0")
 
     def nm_state(self) -> NmState:
         return json.loads(command(self.nm, "state"))
@@ -50,7 +84,6 @@ class ComposedSurface(Surface):
         assert command(self.receiver, "acquire") == "0"
         wait(lambda: self.nm_state()["active"])
         assert self.nm_state()["valid"] and self.nm_state()["starts"] == 1
-        assert self.credentials.exists()
         return self.phone()
 
     def forget_error(self, phone: int, expected: str) -> None:
@@ -66,26 +99,26 @@ class ComposedSurface(Surface):
 
 def ap_complete_bond_pending(surface: ComposedSurface) -> None:
     phone = surface.approve_and_acquire()
-    before = surface.credentials.read_bytes()
+    before = surface.nm_state()["deactivations"]
     command(surface.mock, "fail-remove")
     surface.forget_error(phone, "system helper unavailable")
-    rotated = surface.credentials.read_bytes()
-    assert rotated != before
+    deactivated = surface.nm_state()["deactivations"]
+    assert deactivated == before + 1
     assert not surface.nm_state()["active"] and not surface.nm_state()["table"]
-    for _ in range(3):
-        surface.forget_error(phone, "system helper unavailable")
-        assert surface.credentials.read_bytes() == rotated
-        assert command(surface.receiver, "pending-revocations") == "1"
-        assert command(surface.receiver, f"progress {phone}") == "1 0"
-        assert surface.state()["removed"] == []
-    rejected(surface.consumer, "RequestAddPhone")
-    command(surface.mock, "allow-remove")
-    surface.forget(phone)
-    assert command(surface.receiver, "pending-revocations") == "0"
+    # The store no longer approves the phone: the next reconciliation hands the bond's removal to
+    # the helper's durable journal and resolves the receiver's bond leg, so the record cannot pin
+    # capacity while BlueZ keeps refusing the removal.
+    wait(lambda: command(surface.receiver, "pending-revocations") == "0")
     assert command(surface.receiver, f"progress {phone}") == "none"
-    assert surface.credentials.read_bytes() == rotated
-    assert len(surface.state()["removed"]) == 1
-    print("PASS composed_ap_ack_bond_retries_preserve_credentials_and_block_reapproval", flush=True)
+    assert surface.nm_state()["deactivations"] == deactivated
+    assert surface.state()["removed"] == []
+    # Re-approval stays blocked by the helper's journal until the bond is really gone.
+    request = surface.request()
+    rejected(surface.consumer, "ConfirmPhonePairing", GLib.Variant("(t)", (request,)))
+    command(surface.mock, "allow-remove")
+    wait(lambda: len(surface.state()["removed"]) == 1)
+    assert surface.nm_state()["deactivations"] == deactivated
+    print("PASS composed_ap_ack_bond_owned_by_helper_journal_and_block_reapproval", flush=True)
 
 
 def bond_complete_ap_pending(surface: ComposedSurface) -> None:
@@ -94,12 +127,11 @@ def bond_complete_ap_pending(surface: ComposedSurface) -> None:
     surface.forget_error(phone, "system helper unavailable")
     assert len(surface.state()["removed"]) == 1
     assert surface.nm_state()["quarantined"] and surface.nm_state()["table"]
-    rotated = surface.credentials.read_bytes()
     for _ in range(2):
         surface.forget_error(phone, "system helper unavailable")
         assert command(surface.receiver, f"progress {phone}") == "0 1"
         assert len(surface.state()["removed"]) == 1
-        assert surface.credentials.read_bytes() == rotated
+        assert surface.nm_state()["starts"] == 1
     command(surface.nm, "allow-stop")
     wait(lambda: not surface.nm_state()["table"])
     surface.forget(phone)
@@ -110,36 +142,36 @@ def bond_complete_ap_pending(surface: ComposedSurface) -> None:
 
 def durability_and_precommit(surface: ComposedSurface) -> None:
     phone = surface.approve_and_acquire()
-    before = surface.credentials.read_bytes()
+    before = surface.nm_state()["deactivations"]
     command(surface.receiver, "fault-temp")
     surface.forget_error(phone, "trust store io failure")
-    assert surface.phone() == phone and surface.credentials.read_bytes() == before
+    assert surface.phone() == phone and surface.nm_state()["deactivations"] == before
     assert surface.state()["removed"] == [] and surface.nm_state()["active"]
     command(surface.receiver, "fault-dir")
     command(surface.nm, "fail-stop")
     command(surface.mock, "fail-remove")
     surface.forget_error(phone, "Trust store replaced; crash durability unconfirmed.")
     command(surface.receiver, "fault-clear")
-    rotated = surface.credentials.read_bytes()
-    assert surface.phone() == 0 and rotated != before
+    assert surface.phone() == 0 and surface.nm_state()["deactivations"] > before
     for _ in range(3):
         surface.forget_error(phone, "Trust store replaced; crash durability unconfirmed.")
-        assert command(surface.receiver, f"progress {phone}") == "0 0"
-        assert surface.credentials.read_bytes() == rotated
+        # AP leg pending; the bond leg is resolved by reconciliation (the helper owns the removal).
+        wait(lambda: command(surface.receiver, f"progress {phone}") == "0 1")
+        assert surface.nm_state()["starts"] == 1
         assert command(surface.receiver, "pending-revocations") == "1"
     command(surface.nm, "allow-stop")
     command(surface.mock, "allow-remove")
     wait(lambda: not surface.nm_state()["table"])
     surface.forget_error(phone, "Trust store replaced; crash durability unconfirmed.")
     assert command(surface.receiver, "pending-revocations") == "0"
-    assert len(surface.state()["removed"]) == 1
+    wait(lambda: len(surface.state()["removed"]) == 1)
     print("PASS composed_precommit_no_effects_and_703_wins_every_failed_retry", flush=True)
 
 
 def wired_ap_only(surface: ComposedSurface) -> None:
     assert command(surface.receiver, "seed-wired") == "0"
     surface.forget(surface.phone())
-    assert surface.credentials.exists()
+    assert not surface.nm_state()["active"]
     assert command(surface.receiver, "pending-revocations") == "0"
     assert surface.state()["removed"] == []
     print("PASS composed_wired_deletion_requires_ap_and_no_bond", flush=True)
@@ -178,9 +210,10 @@ def live_peer_after_wired_revoke(surface: ComposedSurface) -> int:
     assert command(surface.receiver, "pending-revocations") == "0"
     assert not surface.nm_state()["active"] and not surface.nm_state()["table"]
     assert surface.state()["removed"] == []
-    assert surface.state()["properties"]["Pairable"] and surface.state()["properties"]["Discoverable"]
+    # Pairing closed when the comparison was accepted; the accepted peer's services stay authorized.
+    assert not surface.state()["properties"]["Pairable"] and not surface.state()["properties"]["Discoverable"]
     assert command(surface.mock, "fd-eof") == "open"
-    assert command(surface.mock, "RequestAuthorization") == "allowed"
+    assert command(surface.mock, "AuthorizeService") == "allowed"
     return request
 
 
@@ -240,8 +273,7 @@ def pending_bind_survives_other_phone_forget(surface: ComposedSurface) -> None:
     # Then: B's exact binding still opens a usable pairing window.
     surface.confirm(request_b)
     assert surface.phone() not in (0, phone_a)
-    assert surface.state()["properties"]["Pairable"]
-    assert command(surface.mock, "RequestAuthorization") == "allowed"
+    assert command(surface.mock, "AuthorizeService") == "allowed"
     print("PASS composed_pending_bind_survives_other_phone_forget", flush=True)
 
 
@@ -259,7 +291,7 @@ def pending_ap_survives_other_phone_forget(surface: ComposedSurface) -> None:
     assert command(surface.receiver, "acquire") == "0"
     wait(lambda: surface.nm_state()["active"])
     assert surface.nm_state()["valid"] and surface.nm_state()["starts"] == 1
-    assert command(surface.mock, "RequestAuthorization") == "allowed"
+    assert command(surface.mock, "AuthorizeService") == "allowed"
     assert surface.phone() not in (0, phone_a)
     print("PASS composed_pending_ap_survives_other_phone_forget", flush=True)
 
@@ -283,10 +315,10 @@ def pending_bind_survives_lease_owner_forget(surface: ComposedSurface) -> None:
     assert command(surface.mock, "RequestAuthorization wrong") == "rejected"
     # Then: B's original bound observation still authorizes, without re-observing.
     print("A retired; confirming B's original pending observation", flush=True)
-    surface.confirm(request_b)
+    surface.confirm(request_b, wrong=True)
     assert surface.phone() not in (0, phone_a)
-    assert command(surface.mock, "RequestAuthorization") == "rejected"
-    assert command(surface.mock, "RequestAuthorization wrong") == "allowed"
+    assert command(surface.mock, "AuthorizeService") == "rejected"
+    assert command(surface.mock, "AuthorizeService wrong") == "allowed"
     command(surface.mock, "paired")
     assert command(surface.mock, "AuthorizeService wrong") == "allowed"
     assert command(surface.mock, "NewConnection wrong") == "allowed"

@@ -65,6 +65,8 @@ public:
     MessageWriter& put_u64(std::uint64_t value);
     MessageWriter& put_string(std::string_view value);
     MessageWriter& put_string_map(const std::map<std::string, std::string>& entries);
+    // D-Bus a(ss): same layout as a{ss} (8-aligned structs), but ordered and duplicates allowed.
+    MessageWriter& put_string_pairs(const std::vector<std::pair<std::string, std::string>>& entries);
     // Marshals `value` as a D-Bus variant holding a string: contained signature
     // "s" as a signature value, then the 4-aligned string ("v" on the wire).
     MessageWriter& put_string_variant(std::string_view value);

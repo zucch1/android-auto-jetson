@@ -28,11 +28,12 @@ foreach(test IN LISTS host_tests)
     endif()
     # Wall-clock latency/throughput gates and memcheck require an idle test host,
     # not just exclusion against other gates. Pure fake-clock/schema tests remain parallel.
-    # Helper suites with 1-1.15 s response bounds or a 59-62 s expiry window.
+    # Helper suites with 1-1.15 s response bounds or a 59-62 s expiry window. The enrolment
+    # retirement suite drives the same ComposedSurface (NM double, mock BlueZ, ~1 s bounds).
     # aa_wireless_composed only excludes other holders of that lock; these need
     # an idle host, so they also run alone.
     if(test MATCHES "^(system_helper_retirement_budget_|wireless_e2e_retirement_|system_helper_bluez_lifecycle_)" OR
-       test MATCHES "^(system_helper_bluez_runtime|wireless_e2e_helper_bluez|system_helper_composed_runtime|wireless_e2e_helper_composition)$")
+       test MATCHES "^(system_helper_bluez_runtime|wireless_e2e_helper_bluez|system_helper_composed_runtime|wireless_e2e_helper_composition|system_helper_enrolment_retirement)$")
         set_tests_properties("${test}" PROPERTIES RUN_SERIAL TRUE)
     endif()
     if(test MATCHES "^wired_perf_" OR test IN_LIST idle_host_tests)

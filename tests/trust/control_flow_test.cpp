@@ -181,7 +181,8 @@ TEST(ControlFlow, ExpiredConfirmIsRejectedAndNotPersisted) {
     const auto expired = f.service.confirm_phone_pairing(connection, request.value());
 
     ASSERT_FALSE(expired.has_value());
-    EXPECT_EQ(expired.error().code(), ErrorCode::session_pairing_timeout);
+    EXPECT_EQ(expired.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(f.policy.pending_count(), 0U);
     EXPECT_TRUE(f.store.phones().empty());
     EXPECT_FALSE(std::filesystem::exists(f.dir.file()));
     EXPECT_FALSE(f.service.pairing_window_open());
@@ -446,8 +447,10 @@ TEST(ControlFlow, BoundDeadlineCheckedBeforeAndAfterHelperRpc) {
         bridge.cancel_result = aa::Error{ErrorCode::helper_unavailable};
         const auto result = service.confirm_phone_pairing(caller, request.value());
         ASSERT_FALSE(result);
+        // Expired before the call: the expiry sweep (run on entry) already retired the request and
+        // closed its gate, so confirm reports the gate rejection; zero helper confirmations either way.
         EXPECT_EQ(result.error().code(), expiry_point == 2 ? ErrorCode::trust_unknown_phone :
-                  ErrorCode::session_pairing_timeout);
+                  expiry_point == 0 ? ErrorCode::ipc_consumer_rejected : ErrorCode::session_pairing_timeout);
         EXPECT_EQ(bridge.confirmations, during_rpc ? 1 : 0);
         EXPECT_EQ(bridge.cancellations, 1);
         EXPECT_EQ(service.pending_revocations(), 1U);

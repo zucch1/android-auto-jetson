@@ -22,6 +22,7 @@ from gi.repository import Gio, GLib
 
 from bluez_mock import connect
 from private_bus import line, process, send
+from comparison_cases import affirmative, negative_comparisons, probe_flow
 
 RECEIVER: Final = "org.custom.AndroidAutoReceiver"
 PATH: Final = "/org/custom/AndroidAutoReceiver"
@@ -33,7 +34,9 @@ class MockState(TypedDict):
     profile: list[str]
     default_agent: bool
     removed: list[str]
+    disconnected: list[str]
     helper: str
+    register_attempts: dict[str, int]
 
 
 def command(child: subprocess.Popen[bytes], text: str) -> str:
@@ -82,7 +85,7 @@ class Surface:
             (directory / filename).chmod(0o600)
         options = self.platform_options(stack, build, directory)
         self.daemon = stack.enter_context(process([str(build / "aa-system-helper"), "--private-bus", self.address, str(directory), *options], self.env))
-        wait(lambda: bool(self.state()["profile"]))
+        wait(lambda: len(self.state()["profile"]) == 1)
         args = [str(binary), self.address] if probe else [str(binary), "receiver", self.address, str(directory / "store"), "bluez"]
         self.receiver = stack.enter_context(process(args, self.env))
         assert line(self.receiver) == "ready"
@@ -131,13 +134,16 @@ def authorization_flow(surface: Surface) -> None:
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     surface.confirm(request)
     assert surface.state()["properties"]["Pairable"]
-    assert command(surface.mock, "RequestAuthorization") == "allowed"
+    assert command(surface.mock, "RequestAuthorization") == "rejected", "Just Works must never be accepted"
     assert command(surface.mock, "RequestAuthorization wrong") == "rejected"
     assert command(surface.mock, "RequestAuthorization rogue") == "rejected"
-    assert command(surface.mock, "RequestConfirmation") == "rejected"
+    affirmative(surface, request)
     assert command(surface.mock, "AuthorizeService") == "rejected"
     command(surface.mock, "paired")
+    wait(lambda: surface.phone() != 0)
     assert command(surface.mock, "AuthorizeService audio") == "rejected"
+    assert command(surface.mock, "AuthorizeService ag") == "rejected"
+    assert command(surface.mock, "AuthorizeService hfp") == "allowed"
     assert command(surface.mock, "AuthorizeService") == "allowed"
     assert command(surface.mock, "NewConnection") == "allowed"
     assert command(surface.mock, "fd-eof") == "open"
@@ -151,6 +157,7 @@ def authorization_flow(surface: Surface) -> None:
     assert command(surface.receiver, "reconnect") == "0"
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     assert command(surface.mock, "AuthorizeService") == "allowed"
+    assert command(surface.mock, "RequestConfirmation") == "rejected"
     command(surface.mock, "temporary-pair")
     assert command(surface.receiver, "reconnect") == "1001"
     assert command(surface.mock, "AuthorizeService") == "rejected"
@@ -184,7 +191,9 @@ def revocation_flow(surface: Surface) -> None:
 def bond_retry_flow(surface: Surface) -> None:
     request = surface.request()
     surface.confirm(request)
+    affirmative(surface, request)
     command(surface.mock, "paired")
+    wait(lambda: surface.phone() != 0)
     command(surface.mock, "fail-remove")
     phone = surface.phone()
     rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (phone,)))
@@ -202,7 +211,10 @@ def unknown_bond_state_flow(surface: Surface) -> None:
     surface.confirm(request)
     command(surface.mock, "paired")
     command(surface.mock, "fail-inventory")
-    surface.cancel(request)
+    try:
+        surface.cancel(request)
+    except GLib.Error:
+        pass  # the failed helper health check may already retire enrollment
     command(surface.mock, "allow-inventory")
     assert not surface.state()["properties"]["Pairable"]
     assert surface.state()["cancel_unpaired"] == 0
@@ -213,12 +225,15 @@ def loss_flow(surface: Surface) -> None:
     command(surface.mock, "restore")
     request = surface.request()
     surface.confirm(request)
+    affirmative(surface, request)
     command(surface.mock, "paired")
+    wait(lambda: surface.phone() != 0)
     assert command(surface.mock, "NewConnection") == "allowed"
     surface.receiver.kill()
     surface.receiver.wait(timeout=3)
-    wait(lambda: not surface.state()["properties"]["Pairable"], 5)
-    assert command(surface.mock, "fd-eof") == "closed"
+    # Pairing already closed when the comparison was accepted: wait for the receiver-loss cleanup itself.
+    wait(lambda: command(surface.mock, "fd-eof") == "closed", 5)
+    assert not surface.state()["properties"]["Pairable"]
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     assert len(surface.state()["removed"]) == 0
     print("PASS quiet_receiver_loss_preserves_approved_bond", flush=True)
@@ -236,52 +251,9 @@ def rollback_flow(surface: Surface) -> None:
     rejected(surface.consumer, "ConfirmPhonePairing", GLib.Variant("(t)", (request,)))
     assert surface.phone() == 0
     assert command(surface.receiver, "pending-revocations") == "0"
-    assert len(surface.state()["removed"]) == 0
+    wait(lambda: len(surface.state()["removed"]) == 1)
+    assert command(surface.receiver, "pending-pairings") == "0"
     print("PASS helper_failure_never_approves_and_closes_window", flush=True)
-
-
-def probe_flow(surface: Surface) -> None:
-    def rpc(text: str) -> tuple[int, int]:
-        values = command(surface.receiver, text).split()
-        return int(values[0]), int(values[1])
-    assert rpc("targetless")[0] == 1001
-    assert rpc("malformed")[0] == 1002
-    error, handle = rpc("poll")
-    assert error == 0 and handle
-    assert rpc(f"bind {handle} 1")[0] == 0
-    error, grant = rpc("issue 1")
-    assert error == 0 and rpc(f"open {grant}")[0] == 0
-    assert rpc(f"open {grant}")[0] == 1001
-    assert rpc("close")[0] == 0
-    assert rpc(f"bind {handle} 2")[0] == 0
-    error, grant = rpc("issue 2")
-    assert error == 0 and rpc(f"open {grant}")[0] == 1001
-    assert rpc("close")[0] == 0
-    error, stale = rpc("poll")
-    assert error == 0
-    command(surface.mock, "release-name")
-    wait(lambda: command(surface.mock, "RequestAuthorization") == "rejected")
-    command(surface.mock, "acquire-name")
-    wait(lambda: bool(surface.state()["profile"]))
-    assert rpc(f"reconnect {stale}")[0] == 1001
-    error, expiring = rpc("poll")
-    assert error == 0
-    error, fresh = rpc("poll")
-    assert error == 0 and rpc(f"bind {fresh} 3")[0] == 0
-    error, grant = rpc("issue 3")
-    assert error == 0 and rpc(f"open {grant}")[0] == 0
-    command(surface.mock, "paired")
-    assert command(surface.mock, "NewConnection") == "allowed"
-    error, expired_grant = rpc("issue 4")
-    assert error == 0
-    started = time.monotonic()
-    wait(lambda: not surface.state()["properties"]["Pairable"], 62)
-    assert 59 <= time.monotonic() - started <= 62
-    assert rpc(f"reconnect {expiring}")[0] == 1001
-    assert rpc(f"open {expired_grant}")[0] == 1001
-    assert command(surface.mock, "fd-eof") == "closed"
-    assert command(surface.mock, "RequestAuthorization") == "rejected"
-    print("PASS consumed_replayed_expired_owner_fenced_handles_and_monotonic60s_idle_expiry", flush=True)
 
 
 def main() -> None:
@@ -291,13 +263,17 @@ def main() -> None:
             surface = Surface(stack, build, Path(directory))
             authorization_flow(surface)
             revocation_flow(surface)
-        for scenario in (bond_retry_flow, unknown_bond_state_flow, loss_flow):
+        for scenario in (bond_retry_flow, unknown_bond_state_flow, loss_flow, negative_comparisons):
             with contextlib.ExitStack() as stack:
                 scenario_directory = Path(directory) / scenario.__name__
                 scenario_directory.mkdir(mode=0o700)
                 scenario(Surface(stack, build, scenario_directory))
         with contextlib.ExitStack() as stack:
-            probe_flow(Surface(stack, build, Path(directory), probe=True))
+            # Own directory: the shared one already lists this mock phone as admitted, and cleanup
+            # (rightly) never removes an admitted bond, so this flow's unaccepted bond needs a fresh list.
+            probe_directory = Path(directory) / "probe_flow"
+            probe_directory.mkdir(mode=0o700)
+            probe_flow(Surface(stack, build, probe_directory, probe=True))
         with contextlib.ExitStack() as stack:
             rollback_directory = Path(directory) / "rollback"
             rollback_directory.mkdir(mode=0o700)

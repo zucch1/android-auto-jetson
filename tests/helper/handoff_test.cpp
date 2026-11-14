@@ -11,16 +11,25 @@ public:
 class HandoffBackend final : public Backend {
 public:
     bool live{true}, allowed{}, ready{}; int snapshots{}, denies{};
-    std::uint64_t handle{123};
+    std::uint64_t handle{123}, rekeyed{};
+    std::string address{"AA:BB:CC:DD:EE:FF"};
+    HandoffFailure failed{HandoffFailure::none};
     std::function<void()> collecting;
     core::Result<State> apply(Action, std::uint32_t) override { return State::active; }
     void cleanup() noexcept override { live = false; }
     core::Result<State> reconnect_peer(std::uint64_t) override { return State::active; }
-    core::Result<ObservedPeer> handoff() override { if (!live) return Error{ErrorCode::helper_rejected}; return ObservedPeer{handle, {"AA:BB:CC:DD:EE:FF", "00:11:22:33:44:55"}}; }
+    core::Result<ObservedPeer> handoff() override { if (!live) return Error{ErrorCode::helper_rejected}; return ObservedPeer{handle, {address, "00:11:22:33:44:55"}}; }
     HandoffFailure handoff_failure() const override { return HandoffFailure::none; }
     core::Result<ApSnapshot> ap_snapshot() override { ++snapshots; if (collecting) collecting(); return ApSnapshot{{"ssid", "secret", "02:ab:cd:ef:01:23", "10.42.0.1", 5277, 1}}; }
-    void fail_handoff(std::uint64_t captured, HandoffFailure) override { if (captured == handle) live = false; }
+    void fail_handoff(std::uint64_t captured, HandoffFailure reason) override {
+        if (captured == handle && live) { live = false; failed = reason; }
+    }
     bool snapshot_current(std::uint64_t generation) override { return generation == 1; }
+    bool with_snapshot(std::uint64_t generation, const std::function<void()>& send) override {
+        if (generation != 1) return false;
+        send(); return true;
+    }
+    void rekey(std::uint64_t generation) override { rekeyed = generation; }
     core::Result<void> authorize_handoff(std::uint64_t handle, bool allow, bool listener_ready) override {
         if (handle != this->handle || !live) return Error{ErrorCode::helper_rejected};
         allowed = allow; ready = listener_ready; if (!allow) { ++denies; live = false; } return {};
@@ -77,6 +86,50 @@ TEST(HandoffAuthority, DelayedOldCollectionCannotRetireReplacementOrEraseItsSnap
     EXPECT_TRUE(helper.ap_credentials(":1.2", {7, 0}, 456));
     EXPECT_FALSE(helper.authorize_handoff(":1.2", {7, 0}, 123, false, false));
     EXPECT_TRUE(helper.authorize_handoff(":1.2", {7, 0}, 456, true, true));
+}
+// Activation binding: generation 1's PSK goes over RFCOMM to phone A only.
+struct ActivationBinding : ::testing::Test {
+    HandoffIds ids; HandoffBackend backend; SystemHelper helper{ids, backend};
+    int sends{};
+    bool transmit(std::uint64_t handle) {
+        return helper.transmit_snapshot(":1.2", {{7, 0}, handle, 1}, [this] { ++sends; });
+    }
+    void handoff(std::uint64_t handle, const char* address) {
+        backend.handle = handle; backend.address = address; backend.live = true;
+        backend.failed = HandoffFailure::none;
+        ASSERT_TRUE(helper.reconnect_peer(":1.2", 9)); ASSERT_TRUE(helper.poll_handoff(":1.2", {7, 0}));
+    }
+    void SetUp() override {
+        ASSERT_NO_FATAL_FAILURE(handoff(123, "AA:BB:CC:DD:EE:FF"));
+        ASSERT_TRUE(helper.ap_credentials(":1.2", {7, 0}, 123));
+        ASSERT_TRUE(transmit(123)); ASSERT_EQ(sends, 1);
+    }
+};
+TEST_F(ActivationBinding, SecondPhoneOnBoundActivationIsRefusedAndRekeys) {
+    // Given generation 1 bound to A; when approved B hands off on the same activation.
+    ASSERT_NO_FATAL_FAILURE(handoff(456, "11:22:33:44:55:66"));
+    // Then B gets no credentials, fails as rebind, and the activation is replaced.
+    EXPECT_FALSE(helper.ap_credentials(":1.2", {7, 0}, 456));
+    EXPECT_EQ(backend.failed, HandoffFailure::rebind);
+    EXPECT_EQ(backend.rekeyed, 1U);
+    EXPECT_EQ(sends, 1);
+}
+TEST_F(ActivationBinding, FenceRefusesSecondPhoneEvenAfterValidation) {
+    // Given B validated before the fence; when its credential send reaches the fence.
+    ASSERT_NO_FATAL_FAILURE(handoff(456, "11:22:33:44:55:66"));
+    // Then no bytes leave for B and the activation is replaced.
+    EXPECT_FALSE(transmit(456));
+    EXPECT_EQ(sends, 1);
+    EXPECT_EQ(backend.failed, HandoffFailure::rebind);
+    EXPECT_EQ(backend.rekeyed, 1U);
+}
+TEST_F(ActivationBinding, SamePhoneReconnectKeepsActivation) {
+    // When A reconnects on the same activation, then it is served without a rekey.
+    ASSERT_NO_FATAL_FAILURE(handoff(789, "AA:BB:CC:DD:EE:FF"));
+    EXPECT_TRUE(helper.ap_credentials(":1.2", {7, 0}, 789));
+    EXPECT_TRUE(transmit(789));
+    EXPECT_EQ(sends, 2);
+    EXPECT_EQ(backend.rekeyed, 0U);
 }
 }
 }

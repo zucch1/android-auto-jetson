@@ -21,9 +21,67 @@ public:
     int ap_attempts{}, bond_attempts{};
     std::vector<helper::RevocationV1> snapshots;
     std::optional<helper::PeerIdentity> prepared;
+    std::optional<helper::PairingComparison> challenge;
+    bool comparison_required{};
+    bool requires_comparison() const override { return comparison_required; }
+    bool bonded{true};
+    bool fail_after_response{};
+    bool approved_at_bond{};
+    // Hooks run inside the helper RPC, where owner, clock and store changes may land.
+    std::function<void()> on_bond_confirmed, on_acknowledge;
+    int acknowledgements{};
+    core::Result<void> acknowledgement{};
+    bool approved_at_acknowledgement{};
+    core::Result<void> bond_acknowledged(core::ConsumerId, core::PairingRequestId) override {
+        ++acknowledgements;
+        approved_at_acknowledgement = !store.phones().empty();
+        if (on_acknowledge) on_acknowledge();
+        return acknowledgement;
+    }
+    int commits{};
+    core::Result<void> commitment{};
+    bool approved_at_commit{};
+    std::function<void()> on_commit;
+    core::Result<void> bond_committed(core::ConsumerId, core::PairingRequestId) override {
+        ++commits;
+        approved_at_commit = !store.phones().empty();
+        if (on_commit) on_commit();
+        return commitment;
+    }
+    core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) override {
+        if (on_bond_confirmed) on_bond_confirmed();
+        approved_at_bond = !store.phones().empty();
+        if (fail_after_response && responses) return Error{ErrorCode::helper_unavailable};
+        if (!result) return result.error();
+        return bonded;
+    }
+    int responses{};
+    helper::ComparisonResponse response;
+    core::ConsumerId response_generation;
+    core::PairingRequestId response_request;
+    core::Result<helper::PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) override {
+        return challenge ? core::Result<helper::PairingComparison>{*challenge} :
+                           core::Result<helper::PairingComparison>{Error{ErrorCode::helper_rejected}};
+    }
+    core::Result<void> respond_comparison(core::ConsumerId generation, core::PairingRequestId request,
+                                         helper::ComparisonResponse answer) override {
+        ++responses; response = answer; response_generation = generation; response_request = request;
+        challenge.reset();
+        return {};
+    }
     std::optional<std::size_t> retirement_limit;
     std::vector<std::vector<helper::RetirementSource>> retirement_batches;
     std::function<void()> on_forget{}, on_confirm{};
+    // Bond reconciliation (off by default: the tracked-revocation path of a non-reconciling helper).
+    bool reconciling{};
+    core::Result<std::uint64_t> reconciliation{std::uint64_t{0}};
+    std::vector<std::vector<helper::PeerIdentity>> reconciled_sets;
+    std::vector<bool> reconcile_forced;
+    bool reconciles() const override { return reconciling; }
+    core::Result<std::uint64_t> reconcile_bonds(const std::vector<helper::PeerIdentity>& approved, bool force) override {
+        reconciled_sets.push_back(approved); reconcile_forced.push_back(force);
+        return reconciliation;
+    }
     explicit Bridge(trust::ApprovedPhoneStore& approvals) : store(approvals) {}
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override {
         ++confirmations;

@@ -3,14 +3,20 @@
 Task37 implements the receiver listener, helper-owned RFCOMM bootstrap, and
 shared projection-session path for host testing; task38 adds the host
 reconnect/recovery matrix. This is a reduced-scope result: scripted-peer
-success does not qualify a real phone, and production wireless admission
-remains unavailable because TCP endpoint binding is **BLOCKED** as described
-below.
+success does not qualify a real phone; real-device results are recorded
+separately. TCP endpoint binding is described below.
 
 ## Two protocol surfaces
 
 The Bluetooth AAW bootstrap and the negotiated AAP Wi-Fi service are distinct.
 They have different schemas, enum values, timing, and security boundaries.
+
+Separately, WirePlumber owns the Jetson's HFP Hands-Free unit (`0000111e`) on RFCOMM channel 7
+for Android Auto head-unit presence. The helper does not register a competing
+provider or own its socket; it authorizes that existing service only for the same
+exact approved and bonded peer. RFCOMM acceptance alone is not HFP success: the
+phone and WirePlumber must complete service-level negotiation. No call-control
+or audio/SCO behavior is added by this authorization rule.
 
 ### Helper-owned RFCOMM AAW bootstrap
 
@@ -23,20 +29,39 @@ u16 is the big-endian payload length, excluding the header; the second u16 is
 the big-endian message ID. Payloads larger than 4096 bytes are protocol
 violations. Fragmented records are accumulated and coalesced records are split.
 
-The receiver plays the head-unit role:
+The receiver plays the head-unit role. It opens with a version request, then
+follows whichever path the phone's reply selects:
 
 ```text
-receiver  WifiStartRequest=1 {ip, port}             listener already ready
+receiver  WifiVersionRequest=4 {1.0, 5GHZ_ONLY}     authorized, listener ready
+
+modern path:
+phone     WifiVersionResponse=5 {1.0, status=12}
+receiver  WifiSetupInfo=11 {endpoint {ip, port},
+                            access_point {ssid, bssid, password,
+                                          security_mode}}
+receiver  WifiStartRequest=1 {ip, port, DYNAMIC}
+phone     WifiStartResponse=7 {status field 4 = 12}
+phone     WifiConnectStatus=6 {status field 2 = 12}
+
+legacy fallback:
 phone     WifiInfoRequest=2
 receiver  WifiInfoResponse=3 {ssid, password, bssid,
                               security_mode, access_point_type}
-phone     WifiStartResponse=7
-phone     WifiConnectStatus=6
+receiver  WifiStartRequest=1 {ip, port}
+phone     WifiStartResponse=7 {status field 3 = 0}
+phone     WifiConnectStatus=6 {status field 1 = 0}
 ```
 
-The initial request is sent only after the projection listener is ready. The
-credential response is sent only after the complete eligibility chain and AP
-snapshot checks below succeed. Both trailing phone messages are validated.
+The version request is sent only after authorization and only once the
+projection listener is ready. Credentials leave the helper only in the
+modern `11` or legacy `3` record, from the pinned AP snapshot and behind the
+same snapshot fence and eligibility checks described below. Both paths then
+send the endpoint in message `1` and validate the trailing phone `7` and `6`.
+The success value differs by path: the modern layouts use status `12` in
+different field tags, while the legacy layouts use `STATUS_SUCCESS=0`. Any
+other version, status, or path mixing is a phone rejection or wrong-order
+failure.
 Completion requires the trailing-data check, including a nonblocking socket
 peek, and a deadline recheck; receiving one expected record is not enough.
 
@@ -57,14 +82,18 @@ The wire rules are reverse-engineered, not an official Google interoperability
 specification. Pinned head-unit-role references are
 `nisargjhaveri/WirelessAndroidAutoDongle` at
 `ef645221ec28e87361391b9bdcf27e31ff48cb6f` and `manio/aa-proxy-rs` at
-`b753a002b7ff19f94a861a81396eacaccfa58d5e`.
+`b753a002b7ff19f94a861a81396eacaccfa58d5e` for the legacy path, and
+`mrmees/open-android-auto` at `61eab61c5f9968154ff1a80faa8c0a427b208479` for
+the modern path. Both paths are exercised only by host tests against scripted
+peers; that is not proof of interoperability with a real phone.
 
 ### Negotiated AAP WifiProjection/WifiCredentials service
 
 The second surface runs inside the established encrypted AAP session. It is
 advertised only on the wireless path through the existing dynamic negotiated
 service ID, never through a fixed channel ordinal. Its metadata-only response
-uses that service's own `WPA2_PERSONAL=5` enum value, channel 36, and `DYNAMIC`.
+uses that service's own `WPA2_PERSONAL=5` enum value, the configured AP channel
+(`--ap-channel`, default 36), and `DYNAMIC`.
 It never carries the SSID or password. Between these two surfaces, only the
 RFCOMM bootstrap response carries those secrets; neither service may be used to
 infer the other's wire enum.
@@ -162,14 +191,31 @@ frames directly over TCP. There is no outer TLS transport. The listener binds
 only the numeric IP from the pinned AP snapshot and the provisioned port, never
 all interfaces.
 
-## TCP endpoint binding: BLOCKED
+## TCP endpoint binding
 
-A shared AP PSK cannot cryptographically bind an accepted TCP socket to the
-authorized Bluetooth peer. Production therefore rejects every unbound TCP
-connection. The host happy path uses separately compiled test-only attestation:
-`AA_WIRELESS_TEST_ATTESTATION` in `aa_wireless_attested_test_only`. That fixture
-is not production identity proof and is not compiled into the production path.
-Production wireless admission is not delivered; task37 is reduced-scope.
+Each AP activation is bound to one phone:
+
+- Every activation, including a rekey, starts with a fresh random SSID and
+  WPA2 PSK, so credentials released for an earlier activation never admit a
+  station to a later one.
+- The helper binds an activation's generation to the BlueZ identity of the
+  first handoff whose credentials pass the transmit fence. Credentials are
+  sent only over that phone's bonded RFCOMM bootstrap. A handoff for a
+  different identity on a bound activation fails with `rebind`, receives no
+  credential bytes, and the helper rekeys the AP.
+- The helper firewall drops the projection port unless it arrives on the AP
+  interface, so a connection on that port came from a station that completed
+  WPA2 with that activation's PSK.
+
+The receiver admits an accepted TCP connection only while the coordinator is
+admitting a trusted phone and its validated snapshot generation equals the
+generation the listener was started from.
+
+Limitations: the binding proves possession of the activation's PSK, not the
+phone hardware. A device with which the authorized phone shares that network
+can connect, consistent with the plan's phone identity boundary. Local root on
+the receiver host is outside the threat model. A second approved phone that
+hands off forces a rekey and ends the first phone's idle admission.
 
 ## Revocation and shared-AP disruption
 
@@ -206,8 +252,9 @@ of `WifiConnectStatus` relative to AAP negotiation remain **TARGET BLOCKED**.
 
 ## Non-goals
 
-No phone-hosted hotspot, Wi-Fi Direct/P2P, A2DP, AVRCP, SAP, or HFP is added.
-Performance and soak are task39, the wireless qualification package is task40,
+No phone-hosted hotspot, Wi-Fi Direct/P2P, A2DP, AVRCP, SAP, HSP, or HFP
+call-control/audio routing is added; the scoped HFP Hands-Free unit presence endpoint above
+must not be read as telephony qualification. Performance and soak are task39, the wireless qualification package is task40,
 and packaging is task41. The task38 host recovery matrix does not close those
-scopes, real-phone scenarios, production TCP admission, or full wireless
+scopes, real-phone scenarios, or full wireless
 qualification.

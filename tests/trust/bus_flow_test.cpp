@@ -167,11 +167,12 @@ TEST(TrustBusFlow, ExpiredConfirmOverTheWireIsRejectedNotPersisted) {
 
     ASSERT_TRUE(expired.has_value());
     ASSERT_EQ(expired.value().type, bus::MessageType::error_reply);
-    EXPECT_EQ(expired.value().error_name, "org.freedesktop.DBus.Error.Failed");
+    EXPECT_EQ(expired.value().error_name, "org.custom.AndroidAutoReceiver1.Error.ConsumerRejected");
     bus::Cursor body(expired.value().body);
     const auto message = body.read_string();
     ASSERT_TRUE(message.has_value());
-    EXPECT_EQ(message.value(), aa::Error{ErrorCode::session_pairing_timeout}.message());
+    EXPECT_EQ(message.value(), aa::Error{ErrorCode::ipc_consumer_rejected}.message());
+    EXPECT_EQ(bus_state.policy.pending_count(), 0U);
     EXPECT_TRUE(bus_state.store.phones().empty());
     EXPECT_FALSE(std::filesystem::exists(bus_state.dir.file()));
 }

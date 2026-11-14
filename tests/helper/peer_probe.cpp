@@ -34,10 +34,31 @@ int main(int argc, char** argv) {
             writer.put_u32(2).put_u32(0).put_u64(value);
         } else if (op == "reconnect") {
             input >> value; member = "ReconnectPeerV1"; signature = "t"; writer.put_u64(value);
+        } else if (op == "bond") {
+            input >> source; member = "PairingBondConfirmedV1"; signature = "tt";
+            writer.put_u64(1).put_u64(source);
+        } else if (op == "ack") {
+            input >> source; member = "PairingBondAcknowledgedV1"; signature = "tt";
+            writer.put_u64(1).put_u64(source);
+        } else if (op == "commit") {
+            input >> source; member = "PairingBondCommittedV1"; signature = "tt";
+            writer.put_u64(1).put_u64(source);
+        } else if (op == "comparison") {
+            input >> source; member = "GetPairingComparisonV1"; signature = "tt";
+            writer.put_u64(1).put_u64(source);
+        } else if (op == "respond") {
+            input >> source >> value; member = "RespondPairingComparisonV1"; signature = "tttu";
+            writer.put_u64(1).put_u64(source).put_u64(value).put_u32(1);
         } else if (op == "revoke") {
             std::string address, adapter; input >> address >> adapter;
             member = "RevokePeerV1"; signature = "ss";
             writer.put_string(address).put_string(adapter);
+        } else if (op == "reconcile") {
+            // reconcile [address adapter]...: the receiver's approved set (ReconcileBondsV1).
+            std::vector<std::pair<std::string, std::string>> approved;
+            std::string address, adapter;
+            while (input >> address >> adapter) approved.emplace_back(address, adapter);
+            member = "ReconcileBondsV1"; signature = "a(ss)"; writer.put_string_pairs(approved);
         } else if (op == "close") {
             member = "Invalidate"; signature = "tt"; writer.put_u64(0).put_u64(0);
         } else if (op == "targetless") {
