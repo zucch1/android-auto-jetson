@@ -30,6 +30,14 @@ class MockBluez(ProfileSockets):
         self.present = True
         self.observed_device = DEVICE
         self.fail_remove = False
+        # Extra helper-named bonds (path -> address) and a RemoveDevice delay seam, so one test can
+        # hold several bonds whose removal is slow and failing while another phone enrols (#118).
+        self.extras: dict[str, str] = {}
+        self.remove_delay_ms = 0
+        self.remove_attempts = 0
+        self.device_info = None
+        self.registered_extras: set[str] = set()
+        self.hide_extras = False
         self.fail_set = False
         self.slow_inventory = False
         self.fail_inventory = False
@@ -54,6 +62,7 @@ class MockBluez(ProfileSockets):
 <interface name="org.bluez.Device1"><method name="CancelPairing"/><method name="Disconnect"/></interface>
 </node>"""
         info = Gio.DBusNodeInfo.new_for_xml(xml)
+        self.device_info = info.interfaces[5]
         for index, path in enumerate(["/", "/org/bluez", "/org/bluez", ADAPTER, ADAPTER, DEVICE]):
             self.bus.register_object(path, info.interfaces[index], self.method, None, None)
         self.name("RequestName", GLib.Variant("(su)", ("org.bluez", 0)))
@@ -71,6 +80,12 @@ class MockBluez(ProfileSockets):
                 "AddressType": GLib.Variant("s", "public"), "Adapter": GLib.Variant("o", ADAPTER),
                 "Paired": GLib.Variant("b", self.paired),
                 "Bonded": GLib.Variant("b", self.bonded),
+            }}
+        for path, address in ({} if self.hide_extras else self.extras).items():
+            objects[path] = {"org.bluez.Device1": {
+                "Address": GLib.Variant("s", address), "AddressType": GLib.Variant("s", "public"),
+                "Adapter": GLib.Variant("o", ADAPTER), "Paired": GLib.Variant("b", True),
+                "Bonded": GLib.Variant("b", True),
             }}
         return GLib.Variant("(a{oa{sa{sv}}})", (objects,))
 
@@ -129,12 +144,25 @@ class MockBluez(ProfileSockets):
             case "RegisterAgent":
                 assert args.unpack() == (ROOT + "/aa_agent", "DisplayYesNo")
             case "RemoveDevice":
-                if self.fail_remove:
-                    invocation.return_dbus_error("org.bluez.Error.Failed", "fixture RemoveDevice failure")
-                    return
-                self.removed.append(args.unpack()[0])
-                self.present = False
-                self.paired = False
+                self.remove_attempts += 1
+                target = args.unpack()[0]
+                def finish() -> bool:
+                    if self.fail_remove:
+                        invocation.return_dbus_error("org.bluez.Error.Failed", "fixture RemoveDevice failure")
+                        return False
+                    self.removed.append(target)
+                    if target in self.extras:
+                        del self.extras[target]
+                    else:
+                        self.present = False
+                        self.paired = False
+                    invocation.return_value(None)
+                    return False
+                if self.remove_delay_ms:
+                    GLib.timeout_add(self.remove_delay_ms, finish)
+                else:
+                    finish()
+                return
             case "UnregisterProfile":
                 uuid = HFP if args.unpack()[0] == ROOT + "/hfp_ag_profile" else AA
                 if uuid in self.profile:
@@ -200,6 +228,14 @@ class MockBluez(ProfileSockets):
     def command(self, text: str) -> str:
         if text.startswith("hfp-wire-"):
             return self.hfp_wire(text)
+        if text.startswith("extra-bonds "):
+            for index in range(int(text.split()[1])):
+                path = ADAPTER + f"/dev_02_00_00_00_01_{index:02X}"
+                if path not in self.registered_extras:
+                    self.bus.register_object(path, self.device_info, self.method, None, None)
+                    self.registered_extras.add(path)
+                self.extras[path] = f"02:00:00:00:01:{index:02X}"
+            return "ok"
         if text.startswith("comparison-start"):
             self.comparison_result = "pending"
             callback = text.replace("comparison-start", "RequestConfirmation", 1)
@@ -226,7 +262,8 @@ class MockBluez(ProfileSockets):
                     "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper,
                     "disconnected": self.disconnected,
                     "cancel_unpaired": self.cancel_unpaired,
-                    "register_attempts": self.register_attempts})
+                    "register_attempts": self.register_attempts,
+                    "remove_attempts": self.remove_attempts, "extras": len(self.extras)})
             case "just-works":
                 # A pairing that shows no number: BlueZ asks the agent to authorize it without
                 # a confirmation. The bond forms only if the agent allows it.
@@ -264,6 +301,10 @@ class MockBluez(ProfileSockets):
             case "wire-shutdown-read":
                 assert self.peer_socket is not None
                 self.peer_socket.shutdown(socket.SHUT_RD)
+            case "hide-extras": self.hide_extras = True
+            case "show-extras": self.hide_extras = False
+            case "slow-remove": self.remove_delay_ms = 400
+            case "fast-remove": self.remove_delay_ms = 0
             case "fail-remove": self.fail_remove = True
             case "allow-remove": self.fail_remove = False
             case "fail-set": self.fail_set = True

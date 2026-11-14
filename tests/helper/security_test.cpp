@@ -6,7 +6,9 @@
 #include <aa/helper/BusService.hpp>
 #include <gtest/gtest.h>
 #include "../trust/syscall_faults.hpp"
+#include <atomic>
 #include <chrono>
+#include <iostream>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -981,6 +983,36 @@ TEST_F(ManagedBonds, ReconciliationRemovesAnUnapprovedBondWhoseJournalEntryWasLo
     }
     expect_forgotten_after_reconciliation(bus_address, mock, directory);
 }
+// The adapter is Android-Auto-exclusive: a forgotten phone paired again outside Android Auto is
+// removed by every reconciliation that finds it bonded, each time with a warning that names only
+// its redacted address and tells the owner to enrol it again.
+TEST_F(ManagedBonds, ForgottenPhonePairedOutsideAndroidAutoIsRemovedWithAWarningEachTime) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    { std::ofstream{directory + "/revoked-bonds"} << "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n"; }
+    ASSERT_EQ(::chmod((directory + "/revoked-bonds").c_str(), 0600), 0);
+    helper::BluezBackend backend{bus_address, steady(), directory, ::getuid()};
+    ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+    for (std::size_t pairing = 1; pairing <= 2; ++pairing) {
+        ASSERT_EQ(mock.command("restore"), "ok");
+        ASSERT_EQ(mock.command("paired"), "ok");  // paired again outside Android Auto
+        testing::internal::CaptureStderr();
+        const auto reconciled = backend.reconcile_bonds({});
+        const auto log = testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(reconciled);
+        EXPECT_EQ(removals(mock), pairing) << "the re-paired forgotten phone was kept";
+        EXPECT_NE(log.find("warning bond_removed_revoked_identity id-"), std::string::npos) << log;
+        EXPECT_NE(log.find("forgotten in Android Auto"), std::string::npos) << log;
+        EXPECT_NE(log.find("Enrol the phone again in Android Auto"), std::string::npos) << log;
+        EXPECT_EQ(log.find("02:00:00:00:00:01"), std::string::npos) << "the raw address was logged";
+        EXPECT_FALSE(peer_in(directory, "pending-removals"));
+    }
+    // Nothing re-paired: no warning.
+    testing::internal::CaptureStderr();
+    ASSERT_TRUE(backend.reconcile_bonds({}));
+    EXPECT_EQ(testing::internal::GetCapturedStderr().find("bond_removed_revoked_identity"), std::string::npos);
+}
 // An unrelated bond (no helper file names it) is never touched by reconciliation.
 TEST_F(ManagedBonds, ReconciliationNeverRemovesABondTheHelperDoesNotName) {
     const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
@@ -1158,6 +1190,135 @@ TEST_F(ManagedBonds, AcknowledgedReEnrolmentOfARevokedIdentityIsAdmittedOnReconc
     const auto obs = backend.observe();
     ASSERT_TRUE(obs);
     EXPECT_TRUE(backend.reconnect_peer(obs.value().handle));
+}
+
+// #118: several helper-named bonds whose BlueZ removal is slow (past the 150 ms call timeout) and
+// failing while another phone enrols, is committed and reconnects. Every call, and the periodic
+// tick the service runs before it, stays inside the receiver's deadlines (500 ms reconciliation,
+// 1 s otherwise); reconciliation and the confirm/reconnect paths make no removal attempt for the
+// failing identities once they are backing off; each tick makes at most the budgeted attempts;
+// and every removal completes once BlueZ recovers.
+std::size_t state_number(MockBluez& mock, const char* key) {
+    const auto state = mock.command("state");
+    const auto at = state.find(std::string{"\""} + key + "\": ");
+    return at == std::string::npos ? 0U : std::stoul(state.substr(at + std::string{key}.size() + 4));
+}
+TEST_F(ManagedBonds, SlowFailingRemovalsNeverDelayAnotherPhonesEnrolmentOrReconnect) {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    constexpr int kStuck = 8;
+    {
+        std::ofstream journal{directory + "/pending-removals"};
+        journal << "v1\n";
+        for (int index = 0; index < kStuck; ++index) {
+            char line[64];
+            std::snprintf(line, sizeof line, "02:00:00:00:01:%02X 02:00:00:00:00:AA\n", index);
+            journal << line;
+        }
+    }
+    ASSERT_EQ(::chmod((directory + "/pending-removals").c_str(), 0600), 0);
+    ASSERT_EQ(mock.command("extra-bonds " + std::to_string(kStuck)), "ok");
+    ASSERT_EQ(mock.command("fail-remove"), "ok");
+    ASSERT_EQ(mock.command("slow-remove"), "ok");
+    // Backoff follows the helper's injected clock; the test skips it once BlueZ recovers.
+    auto offset = std::make_shared<std::atomic<std::int64_t>>(0);
+    helper::BluezBackend backend{bus_address, [offset] { return Clock::now() + std::chrono::milliseconds{offset->load()}; },
+                                 directory, ::getuid()};
+    const auto elapsed = [](Clock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - from).count();
+    };
+    std::int64_t worst_tick = 0;
+    const auto tick = [&] {
+        const auto attempts = state_number(mock, "remove_attempts");
+        const auto started = Clock::now();
+        backend.tick();
+        const auto spent = elapsed(started);
+        worst_tick = std::max(worst_tick, spent);
+        EXPECT_LE(state_number(mock, "remove_attempts") - attempts, 2U) << "a tick exceeded its removal budget";
+        return spent;
+    };
+    // One RPC as the service runs it: the tick that precedes dispatch, then the call. The sum is
+    // what the receiver waits for. `others` is how many removal attempts the call may make itself.
+    const auto rpc = [&](const char* name, std::int64_t deadline, std::size_t others, const auto& call) {
+        const auto waited = tick();
+        const auto attempts = state_number(mock, "remove_attempts");
+        const auto started = Clock::now();
+        auto result = call();
+        const auto spent = elapsed(started);
+        EXPECT_LT(waited + spent, deadline) << name << ": " << waited << " ms tick + " << spent << " ms call";
+        EXPECT_LE(state_number(mock, "remove_attempts") - attempts, others) << name << " waited on other removals";
+        return result;
+    };
+    ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+    // First reconciliation: every stuck bond is owed durably, at most the budget is attempted.
+    ASSERT_TRUE(rpc("first reconcile", 500, 2, [&] { return backend.reconcile_bonds({}); }));
+    EXPECT_EQ(state_number(mock, "extras"), static_cast<std::size_t>(kStuck));
+    // The ticks work through the journal round-robin until every stuck bond has failed once.
+    for (int round = 0; round < 64 && state_number(mock, "remove_attempts") < static_cast<std::size_t>(kStuck); ++round) {
+        tick();
+        std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_GE(state_number(mock, "remove_attempts"), static_cast<std::size_t>(kStuck));
+    // Every stuck bond backs off now: no request path below makes any removal attempt for them.
+    ASSERT_TRUE(rpc("reconcile", 500, 0, [&] { return backend.reconcile_bonds({}); }));
+    // observe() samples exactly one nearby device: the stuck bonds are hidden for that call only.
+    const auto observe = [&] {
+        EXPECT_EQ(mock.command("hide-extras"), "ok");
+        auto observed = backend.observe();
+        EXPECT_EQ(mock.command("show-extras"), "ok");
+        return observed;
+    };
+    const auto obs = rpc("observe", 1000, 0, observe);
+    ASSERT_TRUE(obs);
+    ASSERT_TRUE(rpc("authorize", 1000, 0, [&] { return backend.authorize(obs.value().handle); }));
+    ASSERT_EQ(mock.command("comparison-start"), "ok");
+    std::optional<helper::PairingComparison> challenge;
+    for (int attempt = 0; attempt < 150 && !challenge; ++attempt) {
+        if (const auto value = rpc("comparison", 1000, 0, [&] { return backend.comparison(); })) challenge = value.value();
+        else std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_TRUE(challenge.has_value());
+    ASSERT_TRUE(rpc("respond", 1000, 0, [&] { return backend.respond_comparison({challenge->id, true}); }));
+    ASSERT_EQ(mock.command("paired"), "ok");
+    bool bonded = false;
+    for (int attempt = 0; attempt < 150 && !bonded; ++attempt) {
+        const auto confirmed = rpc("confirm", 1000, 0, [&] { return backend.bond_confirmed(); });
+        bonded = confirmed && confirmed.value();
+        if (!bonded) std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_TRUE(bonded);
+    ASSERT_TRUE(rpc("acknowledge", 1000, 0, [&] { return backend.acknowledge_bond(); }));
+    ASSERT_TRUE(rpc("commit", 1000, 0, [&] { return backend.commit_bond(); }));
+    ASSERT_TRUE(rpc("close", 1000, 0, [&] { return backend.apply(helper::Action::close_pairing, 0); }));
+    const auto settled = rpc("settle", 500, 0, [&] { return backend.reconcile_bonds({primary_peer}); });
+    ASSERT_TRUE(settled);
+    EXPECT_EQ(settled.value(), 0U);
+    const auto again = rpc("observe", 1000, 0, observe);
+    ASSERT_TRUE(again);
+    EXPECT_TRUE(rpc("reconnect", 1000, 0, [&] { return backend.reconnect_peer(again.value().handle); }))
+        << "the enrolled phone did not reconnect";
+    EXPECT_EQ(state_number(mock, "extras"), static_cast<std::size_t>(kStuck)) << "a failing removal reported success";
+    for (int index = 0; index < kStuck; ++index) {
+        char address[32];
+        std::snprintf(address, sizeof address, "02:00:00:00:01:%02X", index);
+        EXPECT_NE(file_text(directory + "/pending-removals").find(address), std::string::npos)
+            << address << " was dropped from the journal before BlueZ removed it";
+    }
+    // BlueZ recovers: the ticks complete every owed removal once each backoff elapses.
+    ASSERT_EQ(mock.command("allow-remove"), "ok");
+    ASSERT_EQ(mock.command("fast-remove"), "ok");
+    for (int round = 0; round < 64 && state_number(mock, "extras") > 0; ++round) {
+        offset->fetch_add(31000);
+        tick();
+    }
+    EXPECT_EQ(state_number(mock, "extras"), 0U) << "an owed removal never completed";
+    EXPECT_EQ(file_text(directory + "/pending-removals").find("02:00:00:00:01:"), std::string::npos);
+    EXPECT_EQ(mock.command("state").find("dev_02_00_00_00_00_01\""), std::string::npos) << "the enrolled phone was removed";
+    EXPECT_TRUE(peer_in(directory, "managed-bonds"));
+    std::cout << "worst tick " << worst_tick << " ms\n";
 }
 
 TEST(HelperOwner, NonRootOwnerIsRefusedBeforeAnyHelperCall) {
