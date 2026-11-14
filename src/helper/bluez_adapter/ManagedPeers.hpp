@@ -13,8 +13,9 @@ namespace aa::helper::bluez_adapter {
 // fsync when durability was not yet confirmed. remember(): new admissions only;
 // a failed write refuses that admission but never removes revocation of an
 // existing or renamed-into-place entry.
-// The same file-safety rules and format back a second, independent list under another file
-// name: the enrolment windows' unaccepted bonds awaiting removal (see forget()).
+// The same file-safety rules and format back two more, independent lists under other file
+// names: the enrolment windows' bonds awaiting removal (pending-removals, see forget()) and the
+// revoked bonds kept only as revocation authority (revoked-bonds, see remember(evict_oldest)).
 class ManagedPeers {
 public:
     explicit ManagedPeers(std::string directory, std::uint32_t owner = 0, std::string file = "managed-bonds");
@@ -24,7 +25,8 @@ public:
     bool revocable(const PeerIdentity& peer) const { return contains(peer); }
     bool admitted(const PeerIdentity&) const;
     bool confirm_durable();
-    bool remember(const PeerIdentity&);
+    // evict_oldest: a full list drops its oldest entry instead of refusing (history lists only).
+    bool remember(const PeerIdentity&, bool evict_oldest = false);
     // Removes an entry; for a list that is not revocation authority. True only when the entry
     // is durably gone: absent and the directory sync confirmed (a pending unsynced rename is
     // retried here), or rewritten, renamed into place and the directory synced. A transient

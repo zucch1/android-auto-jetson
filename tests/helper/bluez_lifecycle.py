@@ -59,6 +59,7 @@ def unregister_stays_off(build: Path) -> None:
             assert rpc(surface, f"respond 100 {challenge[0]}")[0] == 0
             assert rpc(surface, "bond 100") == (0, 1)
             assert rpc(surface, "ack 100") == (0, 0)
+            assert rpc(surface, "commit 100") == (0, 0)
             assert rpc(surface, "close")[0] == 0
             error, handle = rpc(surface, "poll")
             assert error == 0 and handle

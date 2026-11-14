@@ -60,9 +60,15 @@ public:
     virtual core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) {
         return Error{ErrorCode::helper_rejected};
     }
-    // The helper records the verified bond as managed. Called only after every receiver-side
-    // check passed; a later failure must retire the bond through tracked revocation.
+    // The helper marks the verified bond provisional (not admitted, cleanup obligation kept).
+    // Called only after every receiver-side check passed; a later failure must retire the bond
+    // through tracked revocation.
     virtual core::Result<void> bond_acknowledged(core::ConsumerId, core::PairingRequestId) {
+        return Error{ErrorCode::helper_rejected};
+    }
+    // The helper admits the provisional bond. Called only after the receiver's durable trust
+    // write; a failure must retract that approval (the bond is not admitted).
+    virtual core::Result<void> bond_committed(core::ConsumerId, core::PairingRequestId) {
         return Error{ErrorCode::helper_rejected};
     }
     virtual core::Result<PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) {

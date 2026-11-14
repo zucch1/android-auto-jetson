@@ -20,6 +20,14 @@ core::Result<void> BusClient::bond_acknowledged(core::ConsumerId generation, cor
     const auto result = impl_->rpc("PairingBondAcknowledgedV1", "tt", writer, until);
     return result ? core::Result<void>{} : core::Result<void>{result.error()};
 }
+core::Result<void> BusClient::bond_committed(core::ConsumerId generation, core::PairingRequestId request) {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until)) return Error{ErrorCode::timeout};
+    MessageWriter writer; writer.put_u64(generation.value).put_u64(request.value);
+    const auto result = impl_->rpc("PairingBondCommittedV1", "tt", writer, until);
+    return result ? core::Result<void>{} : core::Result<void>{result.error()};
+}
 core::Result<PairingComparison> BusClient::comparison(core::ConsumerId generation, core::PairingRequestId request) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
     std::unique_lock lock{impl_->mutex, std::defer_lock};

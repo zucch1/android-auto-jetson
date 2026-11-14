@@ -27,7 +27,9 @@ with tempfile.TemporaryDirectory(prefix="bond-restart-", dir=build) as directory
             error, bonded = rpc(f"bond {source}")
             assert (error, bonded) == (0, 1), "verification of an accepted, bonded peer"
             assert (Path(directory) / "managed-bonds").exists() == managed, "verification recorded a managed bond"
-            assert rpc(f"ack {source}")[0] == expected
+            assert rpc(f"ack {source}")[0] == 0
+            assert (Path(directory) / "managed-bonds").exists() == managed, "acknowledgement admitted a provisional bond"
+            assert rpc(f"commit {source}")[0] == expected
         peer = "02:00:00:00:00:01 02:00:00:00:00:AA"
         assert command(surface.mock, "paired") == "ok"
         assert rpc("revoke " + peer)[0] == 1001, "unmanaged bond accepted"
@@ -90,12 +92,22 @@ with tempfile.TemporaryDirectory(prefix="bond-restart-", dir=build) as directory
             command(surface.mock, "observe-first")
             error, handle = rpc("poll")
             assert error == 0 and rpc(f"reconnect {handle}")[0] == 0, "trusted reconnect of a managed bond lost"
-            assert rpc("revoke " + peer)[0] == 0, "managed revocation lost after a write failure"
-            assert len(surface.state()["removed"]) == 2
+            # The bond is removed even though its demotion to revoked-bonds cannot be written; the
+            # revocation reports failure so the receiver retries until the demotion is recorded.
+            assert rpc("revoke " + peer)[0] != 0, "a revocation whose demotion was not recorded reported success"
+            assert len(surface.state()["removed"]) == 2, "managed revocation lost after a write failure"
         finally:
             directory_path.chmod(0o700)
+        assert rpc("revoke " + peer)[0] == 0
+        assert "02:00:00:00:00:01" not in (directory_path / "managed-bonds").read_text()
+        assert "02:00:00:00:00:01" in (directory_path / "revoked-bonds").read_text()
+        assert len(surface.state()["removed"]) == 2
         # The failed disk is back: the stale pending-removal record is cleaned on a helper tick.
         wait(lambda: "02:00:00:00:00:02" not in (directory_path / "pending-removals").read_text())
+        # The cleaned record is no authority: with its address bonded again, revocation is refused.
+        command(surface.mock, "restore")
+        command(surface.mock, "observe-other")
+        command(surface.mock, "paired")
         assert rpc("revoke 02:00:00:00:00:02 02:00:00:00:00:AA")[0] == 1001
         assert len(surface.state()["removed"]) == 2
         print("PASS restart revokes managed bond, refuses unmanaged bond, and write failures refuse new bond acknowledgements")

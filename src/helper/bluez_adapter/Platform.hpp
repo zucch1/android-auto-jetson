@@ -39,13 +39,22 @@ struct BluezBackend::Impl {
     bool registered{}, agent_registered{};
     std::vector<std::string> adapters;
     std::map<std::uint64_t, Observation> observations;
+    // Bond states (docs/enrolment-ordering.md). Admitted: on `managed`, durably synced, and not
+    // on `pending`. Provisional: acknowledged in this enrolment (`acknowledged`) with its
+    // `pending` entry kept. Revoked: on `revoked` only. Cleanup follows `pending` alone.
     bluez_adapter::ManagedPeers managed;
-    // Bonds an enrolment window may have created and the owner has not accepted, awaiting
-    // removal. Persisted (same file rules as `managed`) so a helper restart cannot lose a
-    // removal that is pending retry. It is not revocation authority.
+    // Bonds an enrolment window may have created that were never admitted, awaiting removal.
+    // Persisted (same file rules as `managed`) so a helper restart cannot lose a removal: this is
+    // the durable cleanup obligation of every unaccepted or provisional bond.
     bluez_adapter::ManagedPeers pending;
+    // Forgotten bonds: revocation authority only, never admission or acceptance of a new bond.
+    bluez_adapter::ManagedPeers revoked;
     // Removed from BlueZ already; only the record's rewrite is still failing. Never removed again.
     std::vector<PeerIdentity> removal_done;
+    // Removed by cleanup in this helper run (bounded, oldest first). Their bonds are gone and
+    // their journal entries dropped; a receiver's retried revocation of one reports success
+    // while no device is present. Not authority: nothing is ever removed because of it.
+    std::vector<PeerIdentity> cleaned;
     std::optional<Observation> allowed;
     Clock::time_point window{};
     bool pairing_enabled{};
@@ -58,7 +67,14 @@ struct BluezBackend::Impl {
     std::optional<Comparison> comparison;
     bool comparison_used{};
     bool comparison_accepted{};
+    // The current enrolment's bond was acknowledged (provisional) and awaits the receiver's commit.
+    bool acknowledged{};
     void retire_unaccepted();
+    // Admission authority for services, reconnect and the handoff: durably on `managed` and no
+    // pending cleanup obligation. Retries an unconfirmed directory sync once.
+    bool admitted(const PeerIdentity&);
+    // Moves a managed bond to `revoked`; true once it is no longer on `managed` in memory.
+    bool demote(const PeerIdentity&);
     bool quiet_pending{};
     int connection{-1};
     std::shared_ptr<Bootstrap> bootstrap;

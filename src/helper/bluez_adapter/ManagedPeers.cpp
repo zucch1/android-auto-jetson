@@ -152,11 +152,11 @@ bool ManagedPeers::replace(int directory_fd, const std::vector<PeerIdentity>& ne
 }
 // Admission: true only when the entry is on disk AND its directory entry is
 // durable. Every failure refuses this admission only; revocable() is unaffected.
-bool ManagedPeers::remember(const PeerIdentity& peer) {
+bool ManagedPeers::remember(const PeerIdentity& peer, bool evict_oldest) {
     if (!valid_ || !address_valid(peer.address) || !address_valid(peer.adapter)) return false;
     const bool known = contains(peer);
     if (known && durable_) return true;
-    if (!known && peers_.size() >= kLimit) return false;
+    if (!known && peers_.size() >= kLimit && !evict_oldest) return false;
     Fd dir{directory(directory_, owner_)};
     if (dir.value < 0) return false;                       // nothing written
     if (!durable_) {                                       // renamed earlier, directory sync unconfirmed
@@ -164,12 +164,15 @@ bool ManagedPeers::remember(const PeerIdentity& peer) {
         if (known) return true;
     }
     auto next = peers_;
+    const bool evict = next.size() >= kLimit;
+    if (evict) next.erase(next.begin());
     next.push_back(peer);
     if (!replace(dir.value, next)) return false;
     // Past the rename the entry IS the state on disk and cannot roll back, so it
     // counts for revocation even when the directory sync cannot be confirmed,
     // while remaining unadmitted until a directory fsync succeeds.
     peers_ = std::move(next);
+    if (evict && admitted_) --admitted_;                   // the durable prefix lost its oldest entry
     return sync_directory(dir.value);                      // refuse this admission; retried next time
 }
 // Removes an entry from a list that is not revocation authority. True only when the removal is

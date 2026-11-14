@@ -38,6 +38,16 @@ public:
         if (on_acknowledge) on_acknowledge();
         return acknowledgement;
     }
+    int commits{};
+    core::Result<void> commitment{};
+    bool approved_at_commit{};
+    std::function<void()> on_commit;
+    core::Result<void> bond_committed(core::ConsumerId, core::PairingRequestId) override {
+        ++commits;
+        approved_at_commit = !store.phones().empty();
+        if (on_commit) on_commit();
+        return commitment;
+    }
     core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) override {
         if (on_bond_confirmed) on_bond_confirmed();
         approved_at_bond = !store.phones().empty();

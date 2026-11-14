@@ -15,6 +15,7 @@ public:
     bool available() const;
     core::Result<bool> bond_confirmed() override;
     core::Result<void> acknowledge_bond() override;
+    core::Result<void> commit_bond() override;
     core::Result<PairingComparison> comparison() override;
     core::Result<void> respond_comparison(ComparisonResponse) override;
     // Why persistent managed-bond state was rejected at startup; empty when it loaded.

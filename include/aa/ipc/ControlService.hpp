@@ -263,7 +263,11 @@ private:
 
     [[nodiscard]] core::Result<Registered> require_consumer();
     [[nodiscard]] core::Result<void> admit(const BusName& caller, const Registered& active);
-    core::Result<void> persist_pairing(const Registered&, core::PairingRequestId);
+    // durable (optional out): false when the approval landed only as a committed-but-not-durable
+    // store result (703).
+    core::Result<void> persist_pairing(const Registered&, core::PairingRequestId, bool* durable = nullptr);
+    // Revokes an approved phone: store forget plus tracked external revocation (ForgetPhone's core).
+    core::Result<void> revoke_phone(const Registered&, core::PhoneId);
     void close_enrolment(std::string_view reason, bool bond_recorded = false);
     bool reconcile_enrolment(core::PairingRequestId, bool bond_recorded);
     void advance_enrolment();

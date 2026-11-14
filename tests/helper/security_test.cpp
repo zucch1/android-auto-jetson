@@ -302,8 +302,9 @@ struct MockBluez {
 
 // Drives the enrolment up to, but not including, the acknowledgement: authorize, the helper's
 // one-time numeric comparison explicitly accepted, the exact bond verified. acknowledge_bond()
-// is the only call that admits a bond into managed-bonds, so a test injects its directory-sync
-// fault around exactly that call (authorize also needs a durable pending-removal journal write).
+// only makes the bond provisional (no write); commit_bond() is the only call that admits it into
+// managed-bonds, so a test injects its directory-sync fault around exactly that call (authorize
+// also needs a durable pending-removal journal write).
 void accept_enrolment(helper::BluezBackend& backend, MockBluez& mock, std::uint64_t handle,
                       const char* start = "comparison-start") {
     using namespace std::chrono_literals;
@@ -325,15 +326,22 @@ void accept_enrolment(helper::BluezBackend& backend, MockBluez& mock, std::uint6
     ASSERT_TRUE(bonded);
 }
 
-TEST_F(ManagedBonds, DirFsyncFailureRefusesPreBondedReconnectKeepsRevocationAndAllowsAfterSync) {
+// The receiver's commit after its durable trust write: acknowledgement, then admission.
+core::Result<void> admit(helper::BluezBackend& backend) {
+    const auto acknowledged = backend.acknowledge_bond();
+    if (!acknowledged) return acknowledged;
+    return backend.commit_bond();
+}
+
+TEST_F(ManagedBonds, DirFsyncFailureAtCommitRefusesAdmissionRemovesBondAndKeepsRevocation) {
     const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
     ASSERT_NE(bus_address, nullptr);
     MockBluez mock{bus_address};
     const helper::PeerIdentity primary{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
     const helper::PeerIdentity secondary{"02:00:00:00:00:02", "02:00:00:00:00:AA"};
 
-    // Case 1: injected dir fsync failure on remember() refuses reconnect of the
-    // pre-bonded identity, while revocation still succeeds.
+    // Case 1: an injected dir fsync failure on the commit's managed write refuses the admission;
+    // the bond stays unadmitted (no reconnect), cleanup removes it, revocation still succeeds.
     {
         const auto dir1 = directory + "/case1";
         ASSERT_EQ(::mkdir(dir1.c_str(), 0700), 0);
@@ -347,25 +355,29 @@ TEST_F(ManagedBonds, DirFsyncFailureRefusesPreBondedReconnectKeepsRevocationAndA
         {
             accept_enrolment(backend, mock, first.value().handle);
             if (HasFatalFailure()) return;
+            ASSERT_TRUE(backend.acknowledge_bond());
             using namespace trust::test::faults;
             ScopedFault fail{Fault::dir_fsync};
-            const auto auth = backend.acknowledge_bond();
+            const auto auth = backend.commit_bond();
             ASSERT_FALSE(auth);
             EXPECT_EQ(auth.error().code(), ErrorCode::helper_rejected);
-
+            // The failed commit closed the window; cleanup removed the never-admitted bond.
+            EXPECT_NE(mock.command("state").find("/org/bluez/hci0/dev_02_00_00_00_00_01"), std::string::npos)
+                << "a bond whose commit failed was not removed";
+            ASSERT_EQ(mock.command("restore"), "ok");
+            ASSERT_EQ(mock.command("paired"), "ok");
             const auto reconn_obs = backend.observe();
             ASSERT_TRUE(reconn_obs);
             const auto reconn = backend.reconnect_peer(reconn_obs.value().handle);
-            EXPECT_FALSE(reconn) << "reconnect must be refused while directory fsync fails";
+            EXPECT_FALSE(reconn) << "reconnect must be refused for a bond whose commit failed";
             if (!reconn) { EXPECT_EQ(reconn.error().code(), ErrorCode::helper_rejected); }
 
             EXPECT_TRUE(backend.revoke_peer(primary)) << "revocation must still succeed after directory fsync failure";
         }
-        EXPECT_NE(mock.command("state").find("/org/bluez/hci0/dev_02_00_00_00_00_01"), std::string::npos);
     }
 
-    // Case 2: after a later successful directory fsync (even while admitting a
-    // different peer), reconnect of the pre-bonded identity becomes allowed.
+    // Case 2: a later successful directory fsync (admitting a different peer) never turns the
+    // failed commit's remnant into an admission; only a committed bond reconnects, also after restart.
     ASSERT_EQ(mock.command("restore"), "ok");
     ASSERT_EQ(mock.command("paired"), "ok");
     {
@@ -381,41 +393,44 @@ TEST_F(ManagedBonds, DirFsyncFailureRefusesPreBondedReconnectKeepsRevocationAndA
             accept_enrolment(backend, mock, first.value().handle);
             if (HasFatalFailure()) return;
             {
+                ASSERT_TRUE(backend.acknowledge_bond());
                 using namespace trust::test::faults;
                 ScopedFault fail{Fault::dir_fsync};
-                ASSERT_FALSE(backend.acknowledge_bond());
-
-                const auto refused_obs = backend.observe();
-                ASSERT_TRUE(refused_obs);
-                EXPECT_FALSE(backend.reconnect_peer(refused_obs.value().handle));
+                ASSERT_FALSE(backend.commit_bond());
             }
 
             // Admitting another peer succeeds and confirms the directory fsync.
             ASSERT_TRUE(backend.apply(helper::Action::close_pairing, 0));
+            ASSERT_EQ(mock.command("restore"), "ok");
+            ASSERT_EQ(mock.command("paired"), "ok");
             ASSERT_EQ(mock.command("observe-other"), "ok");
             const auto other_obs = backend.observe();
             ASSERT_TRUE(other_obs);
             accept_enrolment(backend, mock, other_obs.value().handle, "comparison-start wrong");
             if (HasFatalFailure()) return;
-            ASSERT_TRUE(backend.acknowledge_bond());
+            ASSERT_TRUE(admit(backend));
             ASSERT_TRUE(backend.apply(helper::Action::close_pairing, 0));
 
             ASSERT_EQ(mock.command("observe-first"), "ok");
-            const auto allowed_obs = backend.observe();
-            ASSERT_TRUE(allowed_obs);
-            EXPECT_TRUE(backend.reconnect_peer(allowed_obs.value().handle))
-                << "reconnect should succeed once a later directory fsync confirms durability";
+            const auto refused_obs = backend.observe();
+            ASSERT_TRUE(refused_obs);
+            EXPECT_FALSE(backend.reconnect_peer(refused_obs.value().handle))
+                << "a later directory fsync must not admit the bond whose commit failed";
         }
 
-        // Across a helper restart with a working directory sync, entries loaded from disk are admitted.
+        // Across a helper restart with a working directory sync, committed entries loaded from disk are admitted.
         helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, dir2, ::getuid()};
         ASSERT_TRUE(restarted.available());
         ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+        const auto first_restart = restarted.observe();
+        ASSERT_TRUE(first_restart);
+        EXPECT_FALSE(restarted.reconnect_peer(first_restart.value().handle));
+        ASSERT_EQ(mock.command("observe-other"), "ok");
         const auto after_restart = restarted.observe();
         ASSERT_TRUE(after_restart);
         EXPECT_TRUE(restarted.reconnect_peer(after_restart.value().handle));
-        ASSERT_EQ(mock.command("observe-other"), "ok");
         EXPECT_TRUE(restarted.revoke_peer(secondary));
+        ASSERT_EQ(mock.command("observe-first"), "ok");
     }
 }
 
@@ -454,10 +469,7 @@ TEST_F(ManagedBonds, RestartWithFailingDirFsyncKeepsRevocationRefusesAdmissionAn
             ASSERT_TRUE(obs);
             accept_enrolment(initial, mock, obs.value().handle);
             if (HasFatalFailure()) return;
-            ScopedFault fail{Fault::dir_fsync};
-            const auto auth = initial.acknowledge_bond();
-            ASSERT_FALSE(auth);
-            EXPECT_EQ(auth.error().code(), ErrorCode::helper_rejected);
+            ASSERT_TRUE(admit(initial));  // committed; its durability is unconfirmed after restart
         }
         ScopedFault fail{Fault::dir_fsync};
 
@@ -513,8 +525,7 @@ TEST_F(ManagedBonds, RestartWithFailingDirFsyncAllowsReconnectOnceSyncSucceeds) 
             ASSERT_TRUE(obs);
             accept_enrolment(initial, mock, obs.value().handle);
             if (HasFatalFailure()) return;
-            ScopedFault fail{Fault::dir_fsync};
-            ASSERT_FALSE(initial.acknowledge_bond());
+            ASSERT_TRUE(admit(initial));
         }
         ScopedFault fail{Fault::dir_fsync};
 
@@ -553,7 +564,7 @@ TEST_F(ManagedBonds, NormalRestartAfterSuccessfulSyncAdmitsLoadedEntries) {
         ASSERT_TRUE(obs);
         accept_enrolment(initial, mock, obs.value().handle);
         if (HasFatalFailure()) return;
-        ASSERT_TRUE(initial.acknowledge_bond());
+        ASSERT_TRUE(admit(initial));
     }
 
     ManagedPeers reloaded{backend_dir, ::getuid()};
@@ -568,6 +579,110 @@ TEST_F(ManagedBonds, NormalRestartAfterSuccessfulSyncAdmitsLoadedEntries) {
     const auto reconn_obs = restarted.observe();
     ASSERT_TRUE(reconn_obs);
     EXPECT_TRUE(restarted.reconnect_peer(reconn_obs.value().handle));
+}
+
+std::string file_text(const std::string& path) {
+    std::ifstream in{path}; return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+std::size_t removals(MockBluez& mock) {
+    const auto state = mock.command("state");
+    const auto at = state.find("\"removed\": [");
+    if (at == std::string::npos) return 0;
+    const auto end = state.find(']', at);
+    std::size_t count = 0;
+    for (auto i = state.find("dev_", at); i != std::string::npos && i < end; i = state.find("dev_", i + 1)) ++count;
+    return count;
+}
+// Finding B: revocation demotes the admitted bond to history. A fresh enrolment of the same
+// adapter/address that is then rejected must have its new bond removed, and the journal entry
+// must leave only after that removal.
+TEST_F(ManagedBonds, RevokedHistoryNeverSuppressesCleanupOfARejectedReEnrolment) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    const helper::PeerIdentity primary{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
+    const std::string address = primary.address;
+    helper::BluezBackend backend{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
+    ASSERT_TRUE(backend.available());
+    ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+    const auto first = backend.observe();
+    ASSERT_TRUE(first);
+    accept_enrolment(backend, mock, first.value().handle);
+    if (HasFatalFailure()) return;
+    ASSERT_TRUE(admit(backend));
+    ASSERT_TRUE(backend.apply(helper::Action::close_pairing, 0));
+    EXPECT_EQ(removals(mock), 0U) << "an admitted bond was removed";
+    // Forget: removed, demoted to history.
+    ASSERT_TRUE(backend.revoke_peer(primary));
+    EXPECT_EQ(removals(mock), 1U);
+    EXPECT_EQ(file_text(directory + "/managed-bonds").find(address), std::string::npos) << "revocation left the admission";
+    EXPECT_NE(file_text(directory + "/revoked-bonds").find(address), std::string::npos) << "revocation lost its authority";
+    // Re-enrol the same identity; the owner accepts, the bond forms and is acknowledged, then the
+    // enrolment is cancelled before the commit.
+    ASSERT_EQ(mock.command("restore"), "ok");
+    ASSERT_EQ(mock.command("unpaired"), "ok");
+    const auto again = backend.observe();
+    ASSERT_TRUE(again);
+    accept_enrolment(backend, mock, again.value().handle);
+    if (HasFatalFailure()) return;
+    EXPECT_NE(file_text(directory + "/pending-removals").find(address), std::string::npos);
+    ASSERT_TRUE(backend.acknowledge_bond());
+    const auto reconnect = backend.observe();
+    ASSERT_TRUE(reconnect);
+    EXPECT_FALSE(backend.reconnect_peer(reconnect.value().handle)) << "history admitted the new bond";
+    ASSERT_TRUE(backend.apply(helper::Action::close_pairing, 0));
+    EXPECT_EQ(removals(mock), 2U) << "the rejected re-enrolment's bond was kept";
+    EXPECT_EQ(file_text(directory + "/pending-removals").find(address), std::string::npos) << "journal entry kept after removal";
+    EXPECT_EQ(file_text(directory + "/managed-bonds").find(address), std::string::npos);
+    // A retried revocation of the removed bond still completes.
+    EXPECT_TRUE(backend.revoke_peer(primary));
+}
+// Finding A at the helper boundary: a provisional bond (acknowledged, never committed) survives
+// neither receiver loss nor a helper restart. The journal entry is its durable cleanup obligation.
+TEST_F(ManagedBonds, HelperRestartRemovesAProvisionalBondWhoseCommitNeverArrived) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    {
+        helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
+        ASSERT_TRUE(initial.available());
+        ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+        const auto obs = initial.observe();
+        ASSERT_TRUE(obs);
+        accept_enrolment(initial, mock, obs.value().handle);
+        if (HasFatalFailure()) return;
+        ASSERT_TRUE(initial.acknowledge_bond());
+        ASSERT_EQ(mock.command("fail-remove"), "ok");  // the helper exits before it can remove the bond
+        ASSERT_TRUE(initial.apply(helper::Action::close_pairing, 0));
+    }
+    EXPECT_EQ(removals(mock), 0U);
+    EXPECT_FALSE(std::filesystem::exists(directory + "/managed-bonds")) << "a provisional bond was admitted";
+    EXPECT_NE(file_text(directory + "/pending-removals").find("02:00:00:00:00:01"), std::string::npos);
+    ASSERT_EQ(mock.command("allow-remove"), "ok");
+    helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
+    ASSERT_TRUE(restarted.available());
+    ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+    for (int attempt = 0; attempt < 100 && removals(mock) == 0; ++attempt) {
+        restarted.tick(); std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    }
+    EXPECT_EQ(removals(mock), 1U) << "the restarted helper kept a bond whose commit never arrived";
+    EXPECT_EQ(file_text(directory + "/pending-removals").find("02:00:00:00:00:01"), std::string::npos);
+}
+TEST_F(ManagedBonds, RevokedHistoryEvictsItsOldestEntryWhenFull) {
+    ManagedPeers history{directory, ::getuid(), "revoked-bonds"};
+    ASSERT_TRUE(history.valid());
+    auto peer = [](int i) {
+        char address[18]; std::snprintf(address, sizeof address, "02:00:00:00:%02X:%02X", i / 256, i % 256);
+        return helper::PeerIdentity{address, "00:11:22:33:44:55"};
+    };
+    for (int i = 0; i < 256; ++i) ASSERT_TRUE(history.remember(peer(i), true));
+    EXPECT_FALSE(history.remember(peer(256))) << "a full authority list must refuse without eviction";
+    ASSERT_TRUE(history.remember(peer(256), true));
+    EXPECT_FALSE(history.contains(peer(0)));
+    EXPECT_TRUE(history.contains(peer(1)) && history.contains(peer(256)));
+    EXPECT_EQ(history.peers().size(), 256U);
+    ManagedPeers reloaded{directory, ::getuid(), "revoked-bonds"};
+    EXPECT_TRUE(reloaded.valid() && reloaded.contains(peer(256)) && !reloaded.contains(peer(0)));
 }
 
 TEST(HelperOwner, NonRootOwnerIsRefusedBeforeAnyHelperCall) {

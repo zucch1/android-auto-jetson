@@ -24,7 +24,8 @@ constexpr auto interfaces = R"(<node>
 </interface></node>)";
 }
 BluezBackend::Impl::Impl(const std::string& address, Now clock, const std::string& state, std::uint32_t state_owner)
-    : now(std::move(clock)), managed(state, state_owner), pending(state, state_owner, "pending-removals") {
+    : now(std::move(clock)), managed(state, state_owner), pending(state, state_owner, "pending-removals"),
+      revoked(state, state_owner, "revoked-bonds") {
     context = g_main_context_new();
     g_main_context_push_thread_default(context);
     GError* error = nullptr;
@@ -125,6 +126,7 @@ void BluezBackend::Impl::close_admission() {
     window = {};
     pairing_enabled = false;
     comparison_accepted = false;
+    acknowledged = false;
     if (allowed) {
         // BlueZ turns CancelPairing without an in-flight Pair() into MGMT Unpair Device, which
         // drops the kernel link key of a just-completed bond. Only cancel pairing confirmed as
@@ -147,7 +149,7 @@ void BluezBackend::Impl::reset() {
     reject_comparison();
     ++owner_epoch;
     close_connection();
-    allowed.reset(); window = {}; pairing_enabled = false; comparison_accepted = false;
+    allowed.reset(); window = {}; pairing_enabled = false; comparison_accepted = false; acknowledged = false;
     observations.clear(); adapters.clear();
     registered = false; agent_registered = false;
 }
@@ -194,10 +196,12 @@ BluezBackend::BluezBackend(const std::string& address, Now now, const std::strin
 BluezBackend::~BluezBackend() = default;
 std::string BluezBackend::state_error() const {
     if (!impl_->managed.valid()) return "managed-bonds: " + impl_->managed.reason();
-    return impl_->pending.valid() ? std::string{} : "pending-removals: " + impl_->pending.reason();
+    if (!impl_->pending.valid()) return "pending-removals: " + impl_->pending.reason();
+    return impl_->revoked.valid() ? std::string{} : "revoked-bonds: " + impl_->revoked.reason();
 }
 bool BluezBackend::available() const {
-    return impl_->managed.valid() && impl_->pending.valid() && impl_->bus && !g_dbus_connection_is_closed(impl_->bus);
+    return impl_->managed.valid() && impl_->pending.valid() && impl_->revoked.valid() &&
+           impl_->bus && !g_dbus_connection_is_closed(impl_->bus);
 }
 core::Result<ObservedPeer> BluezBackend::handoff() {
     if (impl_->bootstrap && impl_->bootstrap->expire()) impl_->last_failure = impl_->bootstrap->failure();

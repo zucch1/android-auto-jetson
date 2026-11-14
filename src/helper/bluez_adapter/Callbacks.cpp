@@ -10,6 +10,9 @@ bool BluezBackend::Impl::permitted(const char* path, bool pairing) {
     if (!allowed || now() >= window) { close_admission(); return false; }
     const auto captured = *allowed;
     if (captured.device.path != path || !exact(captured, !pairing)) return false;
+    // Services (Android Auto RFCOMM, HFP) only for an admitted bond: never while it is
+    // provisional, i.e. before the receiver's commit and the confirmed managed sync.
+    if (!pairing && (!allowed || !admitted(captured.device.identity))) return false;
     return allowed && now() < window;
 }
 void BluezBackend::Impl::method(GDBusConnection*, const gchar* sender, const gchar*, const gchar*,

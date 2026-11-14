@@ -116,8 +116,10 @@ enrolment. The consumer must retrieve and explicitly accept the one-time
 comparison; the comparison-confirm path applies the same pre- and post-helper
 liveness checks before and after activating the helper. The helper must verify
 the exact bond through `PairingBondConfirmedV1` (which records nothing); the
-receiver then runs its own checks and records it with `PairingBondAcknowledgedV1`,
-before the shared approval routine writes the trust store. `PairingOpened`
+receiver then runs its own checks and marks it provisional with `PairingBondAcknowledgedV1`
+(no write), the shared approval routine writes the trust store, and only a durable write is
+committed with `PairingBondCommittedV1`, which admits the bond; a failed commit retracts the
+approval (docs/enrolment-ordering.md). `PairingOpened`
 describes admission and follows committed approval, including error 703 (rename
 committed, directory durability uncertain), which emits
 `pairing_approval_not_durable` and keeps helper confirmation consistent with the
@@ -196,10 +198,13 @@ Lost replies remain unknown outcomes: this is neither globally exactly-once nor
 crash-durable revocation. NM retains its in-flight rotation latch. BlueZ managed
 identities are durably recorded in `/var/lib/aa-system-helper/managed-bonds`
 (versioned exact address/adapter pairs, at most 256). The helper commits the
-allow-list only when the receiver calls `PairingBondAcknowledgedV1`, after explicit
-comparison acceptance, exact bond verification and every receiver-side check. Pending admission never writes `managed-bonds`;
-it records only the identity in `pending-removals` (same file rules, not revocation authority)
-so a restarted helper still removes an unaccepted bond.
+allow-list only when the receiver calls `PairingBondCommittedV1`, after explicit
+comparison acceptance, exact bond verification, every receiver-side check and the
+receiver's durable trust write. Pending admission and acknowledgement never write `managed-bonds`;
+admission records the identity in `pending-removals` (same file rules, not revocation authority)
+so a restarted helper still removes an unaccepted or provisional bond. Revocation moves an
+entry from `managed-bonds` to `revoked-bonds` (same file rules, at most 256, oldest evicted):
+revocation authority only, never admission.
 A trusted reconnect is admitted only for an
 identity already on the list whose directory entry is durable (loaded after a confirmed
 directory fsync at startup, or committed by a successful one; a pending sync is retried on
@@ -211,14 +216,14 @@ place when only the directory fsync failed, keeps working. After a failed
 directory fsync a new bond acknowledgement for that entry requires a later successful fsync.
 Stored state that is invalid at startup makes the helper log the reason and
 exit, so bonds are never forgotten silently; global BlueZ inventory never grants
-revocation authority. Historical entries are retained for idempotent revocation
-retries and are never removed, so the 256-entry limit is permanent until an
-operator edits the file. Bonds managed before this state format was deployed
+revocation authority. Revoked entries are retained in `revoked-bonds` for idempotent revocation
+retries; `managed-bonds` holds only currently admitted bonds, and an identity on it
+cannot open a new enrolment until it is revoked. Bonds managed before this state format was deployed
 cannot be inferred safely and need explicit operator removal; they must be
 re-paired before they can reconnect. A staging file left by a power cut has a
 random name, blocks nothing and may be deleted by an operator.
 
-## System bus API 1.3.0
+## System bus API 1.4.0
 
 Name `org.custom.AndroidAutoSystemHelper`, path
 `/org/custom/AndroidAutoSystemHelper`, interface
@@ -234,9 +239,10 @@ the helper does not expose Introspectable). Methods:
 | PollPeerV1 | empty | `utss` error, handle, address, adapter identity | Exactly one helper-observed public BR/EDR candidate, otherwise reject |
 | BindPeerV1 | `ttt` generation, request source, observed handle | `ut` error, zero | Snapshot binding before confirmation, no radio exposure |
 | ReconnectPeerV1 | `t` observed handle | `ut` error, state | Store-owner exact lookup followed by helper actual-bond check |
-| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only previously managed exact identity; re-resolve BlueZ object, never accept a supplied path |
+| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only an admitted, revoked or pending-removal exact identity (or, reporting success with nothing to do, one this helper run's cleanup already removed and no longer present); demotes an admitted bond to `revoked-bonds`; re-resolve BlueZ object, never accept a supplied path |
 | PairingBondConfirmedV1 | `tt` generation, request source | `ut` error, bonded boolean | Verification only: accepted comparison and exact bonded snapshot; records nothing |
-| PairingBondAcknowledgedV1 | `tt` generation, request source | `ut` error, reserved zero | Durable helper ownership of the verified bond, called only after every receiver-side check passed |
+| PairingBondAcknowledgedV1 | `tt` generation, request source | `ut` error, reserved zero | Marks the verified bond provisional after every receiver-side check passed; writes nothing, admits nothing |
+| PairingBondCommittedV1 | `tt` generation, request source | `ut` error, reserved zero | After the receiver's durable trust write: admits the provisional bond (confirmed `managed-bonds` sync, then durable `pending-removals` removal); any failure closes the window and leaves the bond to cleanup |
 | GetPairingComparisonV1 | `tt` generation, request source | `utuss` error, challenge ID, comparison, address, adapter | Authenticated consumer-only retrieval during explicit enrollment |
 | RespondPairingComparisonV1 | `tttu` generation, request source, challenge ID, accept | `ut` error, reserved zero | Explicit human decision after retrieval; one use, same enrollment/peer/deadline |
 

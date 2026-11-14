@@ -391,6 +391,39 @@ TEST_F(AcknowledgementOrder, StoreWriteFailureAfterAcknowledgementLeadsToTracked
     EXPECT_TRUE(control.request_add_phone(caller));
 }
 
+// The helper admits the bond only through the second, explicit step after the durable store write.
+TEST_F(AcknowledgementOrder, CommitFollowsTheDurableStoreWrite) {
+    accept();
+    EXPECT_EQ(bridge.acknowledgements, 1); EXPECT_EQ(bridge.commits, 1);
+    EXPECT_TRUE(bridge.approved_at_commit) << "committed before the trust write";
+    EXPECT_EQ(store.phones().size(), 1U); EXPECT_EQ(bridge.forgets, 0);
+    EXPECT_FALSE(has_diagnostic("pairing_commit_failed"));
+}
+TEST_F(AcknowledgementOrder, FailedCommitRetractsTheApproval) {
+    bridge.commitment = Error{ErrorCode::timeout};
+    accept();
+    EXPECT_EQ(bridge.commits, 1);
+    EXPECT_TRUE(has_diagnostic("pairing_commit_failed"));
+    EXPECT_TRUE(store.phones().empty()) << "an approval whose bond was not admitted stayed";
+    trust::ApprovedPhoneStore reopened{directory / "store"}; ASSERT_TRUE(reopened.load());
+    EXPECT_TRUE(reopened.phones().empty());
+    ASSERT_EQ(bridge.snapshots.size(), 1U);
+    EXPECT_TRUE(bridge.snapshots[0].phone) << "the retraction must revoke the approved phone";
+    EXPECT_EQ(helper::revocation_peer(bridge.snapshots[0]), bridge.prepared);
+    EXPECT_EQ(control.pending_revocations(), 0U);
+}
+TEST_F(AcknowledgementOrder, NotDurableApprovalIsNeverCommittedAndIsRetracted) {
+    {
+        trust::test::faults::ScopedFault uncertain{trust::test::faults::Fault::dir_fsync};
+        accept();
+    }
+    EXPECT_TRUE(has_diagnostic("pairing_approval_not_durable"));
+    EXPECT_EQ(bridge.commits, 0) << "a write that is not durable was committed to the helper";
+    EXPECT_TRUE(has_diagnostic("pairing_commit_failed"));
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(bridge.snapshots.size(), 1U);
+}
+
 // Acknowledged-then-failed enrolments leave bond-leg records. They share the bounded retry loop of
 // source-only records: a stalled helper cannot block a control call, and everything retires once
 // the helper recovers.

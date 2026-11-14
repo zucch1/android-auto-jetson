@@ -59,7 +59,17 @@ public:
     core::Result<PairingComparison> comparison(core::ConsumerId g, core::PairingRequestId r) override { return target_.comparison(g, r); }
     core::Result<void> respond_comparison(core::ConsumerId g, core::PairingRequestId r, ComparisonResponse response) override { return target_.respond_comparison(g, r, response); }
     core::Result<bool> bond_confirmed(core::ConsumerId g, core::PairingRequestId r) override { return target_.bond_confirmed(g, r); }
-    core::Result<void> bond_acknowledged(core::ConsumerId g, core::PairingRequestId r) override { return target_.bond_acknowledged(g, r); }
+    core::Result<void> bond_acknowledged(core::ConsumerId g, core::PairingRequestId r) override {
+        const auto acknowledged = target_.bond_acknowledged(g, r);
+        // Process exit at the boundary between the helper's acknowledgement and the store commit.
+        if (acknowledged && exit_after_acknowledgement) std::_Exit(9);
+        return acknowledged;
+    }
+    core::Result<void> bond_committed(core::ConsumerId g, core::PairingRequestId r) override {
+        if (hold_commit) return Error{ErrorCode::helper_unavailable};
+        return target_.bond_committed(g, r);
+    }
+    bool exit_after_acknowledgement{}, hold_commit{};
     core::Result<void> cancel(core::ConsumerId g, core::PairingRequestId r) override { return target_.cancel(g, r); }
     void teardown(core::ConsumerId g) override { target_.teardown(g); }
     RevocationAttempt forgotten_v1(const RevocationV1& s, const RevocationProgress& p) override { return target_.forgotten_v1(s, p); }
@@ -146,6 +156,10 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
             if (command == "cancelled") cancellation.request_stop();
             const auto response = helper.value()->call(request, core::Milliseconds{command == "timeout" ? 0 : 1000}, cancellation.get_token());
             result = response ? core::Result<void>{} : core::Result<void>{response.error()};
+        } else if (command == "exit-after-ack" || command == "hold-commit" || command == "release-commit") {
+            if (command == "exit-after-ack") confirmation.exit_after_acknowledgement = true;
+            else confirmation.hold_commit = command == "hold-commit";
+            result = {};
         } else if (command == "fault-dir" || command == "fault-temp" || command == "fault-clear") {
             using trust::test::faults::Fault;
             trust::test::faults::arm(command == "fault-dir" ? Fault::dir_fsync :

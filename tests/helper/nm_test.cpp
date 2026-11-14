@@ -369,10 +369,13 @@ protected:
         auto connection = BusClient::private_bus_for_test(address, *store); ASSERT_TRUE(connection); client = std::move(connection.value());
         ASSERT_TRUE(eventually([this] { return client->status(Action::ap_status).has_value(); }));
     }
-    void acquire(std::uint64_t generation = 1) {
+    // other: enrol the mock's second device. An identity still admitted from an earlier
+    // acquisition cannot open a new enrolment until it is forgotten.
+    void acquire(std::uint64_t generation = 1, bool other = false) {
+        if (other) { ASSERT_EQ(bluez.command("observe-other"), "ok"); }
         ASSERT_TRUE(client->prepare(core::ConsumerId{generation}, core::PairingRequestId{generation}));
         ASSERT_TRUE(client->confirmed(core::ConsumerId{generation}, core::PairingRequestId{generation}));
-        ASSERT_EQ(bluez.command("comparison-start"), "ok");
+        ASSERT_EQ(bluez.command(other ? "comparison-start wrong" : "comparison-start"), "ok");
         std::optional<PairingComparison> challenge;
         ASSERT_TRUE(eventually([&] {
             const auto value = client->comparison(core::ConsumerId{generation}, core::PairingRequestId{generation});
@@ -387,6 +390,7 @@ protected:
             return bonded && bonded.value();
         }));
         ASSERT_TRUE(client->bond_acknowledged(core::ConsumerId{generation}, core::PairingRequestId{generation}));
+        ASSERT_TRUE(client->bond_committed(core::ConsumerId{generation}, core::PairingRequestId{generation}));
         core::CancellationSource cancel;
         const auto result = client->call({Operation::ensure_access_point, 36}, core::Milliseconds{1000}, cancel.get_token());
         ASSERT_TRUE(result);
@@ -832,7 +836,7 @@ TEST_F(NmDaemon, ForgetRotatesButOrdinaryInvalidateDoesNot) {
     const auto before = read_text(directory / "state/ap.credentials");
     ASSERT_TRUE(client->cancel(core::ConsumerId{1}, core::PairingRequestId{1}));
     ASSERT_TRUE(eventually([this] { return !boundary->table; })); EXPECT_EQ(before, read_text(directory / "state/ap.credentials"));
-    acquire(2); ASSERT_TRUE(state(State::active));
+    acquire(2, true); ASSERT_TRUE(state(State::active));
     const RevocationV1 snapshot{core::PhoneId{2}, trust::WirelessIdentity{"exact-bond", "adapter"}};
     ASSERT_TRUE(eventually([&] { return revoke_ap(snapshot).has_value(); }));
     EXPECT_FALSE(nm->active_now); EXPECT_FALSE(boundary->table); EXPECT_NE(before, read_text(directory / "state/ap.credentials"));
@@ -887,10 +891,57 @@ TEST_F(NmDaemon, CommittedForget703ReachesRealDaemonButPrecommitDoesNot) {
     ASSERT_TRUE(eventually([&] { return !nm->active_now && !boundary->table && read_text(directory / "state/ap.credentials") != before; }));
     EXPECT_TRUE(store->phones().empty());
 }
-// A journal replacement that fails after the comparison was accepted must never end as
-// "approved and then removed": the acknowledgement fails (no approval) and cleanup, which the
-// receiver's cancel triggers, leaves the admitted bond in place.
-TEST_F(NmDaemon, JournalReplacementFailureAfterAcceptanceRefusesAckAndCleanupKeepsBond) {
+// Drives the real helper daemon through acceptance, bond verification and acknowledgement.
+// The bond is then provisional: acknowledged, not yet committed by the receiver.
+void provisional(BusClient& client, Child& bluez, core::ConsumerId consumer, core::PairingRequestId request) {
+    ASSERT_EQ(bluez.command("comparison-start"), "ok");
+    std::optional<PairingComparison> challenge;
+    ASSERT_TRUE(eventually([&] { const auto value = client.comparison(consumer, request);
+        if (value) challenge = value.value(); return challenge.has_value(); }));
+    ASSERT_TRUE(client.respond_comparison(consumer, request, {challenge->id, true}));
+    ASSERT_EQ(bluez.command("paired"), "ok");
+    ASSERT_TRUE(eventually([&] { const auto bonded = client.bond_confirmed(consumer, request); return bonded && bonded.value(); }));
+    ASSERT_TRUE(client.bond_acknowledged(consumer, request));
+}
+// Finding C: Android Auto RFCOMM, HFP and reconnect are refused while the bond is provisional,
+// even after acceptance and acknowledgement; they are allowed only once the receiver committed.
+TEST_F(NmDaemon, ProvisionalBondGetsNoServicesOrReconnectUntilCommitted) {
+    start();
+    const core::ConsumerId consumer{1}; const core::PairingRequestId request{1};
+    ASSERT_TRUE(client->prepare(consumer, request)); ASSERT_TRUE(client->confirmed(consumer, request));
+    provisional(*client, bluez, consumer, request);
+    if (HasFatalFailure()) return;
+    EXPECT_FALSE(std::filesystem::exists(directory / "managed-bonds")) << "acknowledgement admitted the bond";
+    EXPECT_NE(read_text(directory / "pending-removals").find("02:00:00:00:00:01"), std::string::npos)
+        << "acknowledgement dropped the durable cleanup obligation";
+    EXPECT_EQ(bluez.command("AuthorizeService"), "rejected") << "Android Auto RFCOMM authorized while provisional";
+    EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected") << "HFP authorized while provisional";
+    EXPECT_EQ(bluez.command("NewConnection"), "rejected");
+    ASSERT_TRUE(client->bond_committed(consumer, request));
+    EXPECT_NE(read_text(directory / "managed-bonds").find("02:00:00:00:00:01"), std::string::npos);
+    EXPECT_EQ(read_text(directory / "pending-removals").find("02:00:00:00:00:01"), std::string::npos);
+    EXPECT_EQ(bluez.command("AuthorizeService"), "allowed");
+    EXPECT_EQ(bluez.command("AuthorizeService hfp"), "allowed");
+    EXPECT_EQ(bluez.command("NewConnection"), "allowed");
+    EXPECT_FALSE(client->bond_committed(consumer, request)) << "a commit is consumed once";
+}
+TEST_F(NmDaemon, ProvisionalBondCannotReconnectAndIsRemovedWhenTheWindowCloses) {
+    start();
+    const core::ConsumerId consumer{1}; const core::PairingRequestId request{1};
+    ASSERT_TRUE(client->prepare(consumer, request)); ASSERT_TRUE(client->confirmed(consumer, request));
+    provisional(*client, bluez, consumer, request);
+    if (HasFatalFailure()) return;
+    const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
+    EXPECT_FALSE(client->reconnect(identity)) << "a provisional bond reconnected";
+    EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected");
+    (void)client->cancel(consumer, request);
+    ASSERT_TRUE(eventually([&] { return bluez.command("state").find("\"removed\": []") == std::string::npos; }))
+        << "the provisional bond was not removed";
+    EXPECT_FALSE(client->reconnect(identity));
+}
+// A journal replacement that fails at the commit leaves the bond unadmitted: the commit fails
+// (the receiver then retracts its approval), services stay refused and cleanup removes the bond.
+TEST_F(NmDaemon, JournalReplacementFailureAtCommitRefusesAdmissionAndCleanupRemovesBond) {
     start();
     constexpr std::uint64_t generation = 1;
     const core::ConsumerId consumer{generation}; const core::PairingRequestId request{generation};
@@ -899,25 +950,24 @@ TEST_F(NmDaemon, JournalReplacementFailureAfterAcceptanceRefusesAckAndCleanupKee
     ASSERT_NE(read_text(journal).find("02:00:00:00:00:01"), std::string::npos) << "entry written before the window opens";
     // The rename of the replacement list onto the journal now fails (EISDIR); staging is discarded.
     std::filesystem::remove(journal); std::filesystem::create_directory(journal);
-    ASSERT_EQ(bluez.command("comparison-start"), "ok");
-    std::optional<PairingComparison> challenge;
-    ASSERT_TRUE(eventually([&] { const auto value = client->comparison(consumer, request);
-        if (value) challenge = value.value(); return challenge.has_value(); }));
-    ASSERT_TRUE(client->respond_comparison(consumer, request, {challenge->id, true}));
-    ASSERT_EQ(bluez.command("paired"), "ok");
-    ASSERT_TRUE(eventually([&] { const auto bonded = client->bond_confirmed(consumer, request); return bonded && bonded.value(); }));
-    EXPECT_FALSE(client->bond_acknowledged(consumer, request)) << "acknowledged although the journal entry is not durably gone";
-    (void)client->cancel(consumer, request);
-    std::this_thread::sleep_for(1500ms);  // several helper ticks of cleanup
-    const auto mock = bluez.command("state");
-    EXPECT_NE(mock.find("\"removed\": []"), std::string::npos) << "cleanup removed an admitted bond: " << mock;
+    provisional(*client, bluez, consumer, request);
+    if (HasFatalFailure()) return;
+    EXPECT_FALSE(client->bond_committed(consumer, request)) << "committed although the journal entry is not durably gone";
+    EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected");
+    EXPECT_EQ(bluez.command("NewConnection"), "rejected");
+    ASSERT_TRUE(eventually([&] { return bluez.command("state").find("\"removed\": []") == std::string::npos; }))
+        << "cleanup kept a bond that was never admitted";
+    EXPECT_EQ(read_text(directory / "managed-bonds").find("02:00:00:00:00:01"), std::string::npos)
+        << "the failed commit left an admission entry";
+    EXPECT_NE(read_text(directory / "revoked-bonds").find("02:00:00:00:00:01"), std::string::npos)
+        << "the rolled-back entry lost its revocation authority";
     EXPECT_TRUE(store->phones().empty());
 }
 TEST_F(NmDaemon, SigkillRecoveryReconcilesOnlyOwnedTable) {
     start(); acquire(); ASSERT_TRUE(state(State::active));
     ::kill(daemon.pid, SIGKILL); ASSERT_EQ(::waitpid(daemon.pid, nullptr, 0), daemon.pid); daemon.pid = 0;
     ASSERT_TRUE(eventually([this] { return !nm->active_now; })); EXPECT_TRUE(boundary->table);
-    start(); acquire(2); ASSERT_TRUE(state(State::active));
+    start(); acquire(2, true); ASSERT_TRUE(state(State::active));
     EXPECT_EQ(boundary->installations, 2); EXPECT_GE(boundary->removals, 1);
 }
 TEST_F(NmDaemon, RegulatoryChangeRollsBackActiveAp) {

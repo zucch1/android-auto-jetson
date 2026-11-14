@@ -5,6 +5,9 @@
 namespace aa::helper {
 // Retry failed RemoveDevice calls on the helper owner thread. The list is persisted, so this also
 // completes removals left pending by a restarted helper. No trust-store identity is needed.
+// The journal alone decides: an entry leaves it only at a successful commit, so every entry is a
+// bond that was never admitted in its enrolment (unaccepted, provisional or rolled back), and
+// a historical managed or revoked entry for the same identity never suppresses its removal.
 void BluezBackend::Impl::retire_unaccepted() {
     if (pending.peers().empty() || !current_owner()) return;
     std::vector<Device> devices;
@@ -12,9 +15,6 @@ void BluezBackend::Impl::retire_unaccepted() {
     const auto peers = pending.peers();  // forget() rewrites the list
     for (const auto& peer : peers) {
         if (allowed && allowed->device.identity == peer) continue;
-        // An admitted bond is never removed by cleanup, whatever the journal says: the journal
-        // entry is only dropped (it is stale, e.g. an acknowledgement whose journal write failed).
-        if (managed.revocable(peer)) { if (pending.forget(peer)) std::erase(removal_done, peer); continue; }
         const auto done = std::find(removal_done.begin(), removal_done.end(), peer);
         if (done == removal_done.end()) {
             bool removed = true;
@@ -31,9 +31,30 @@ void BluezBackend::Impl::retire_unaccepted() {
             // address (legitimately paired again) be removed on every tick.
             removal_done.push_back(peer);
         }
+        // A managed entry left by a failed commit is demoted before the obligation is dropped,
+        // so a removed, never-admitted bond can never count as admitted later.
+        if (!demote(peer)) continue;
         (void)pending.forget(peer);
-        if (!pending.contains(peer)) std::erase(removal_done, peer);  // gone from memory; sync retried
+        if (!pending.contains(peer)) {                       // gone from memory; sync retried
+            std::erase(removal_done, peer);
+            std::erase(cleaned, peer);
+            if (cleaned.size() >= 256) cleaned.erase(cleaned.begin());
+            cleaned.push_back(peer);
+        }
     }
+}
+bool BluezBackend::Impl::admitted(const PeerIdentity& peer) {
+    if (!pending.valid() || pending.contains(peer)) return false;
+    return managed.admitted(peer) || (managed.confirm_durable() && managed.admitted(peer));
+}
+bool BluezBackend::Impl::demote(const PeerIdentity& peer) {
+    if (!managed.contains(peer)) return true;
+    // History first: revocation authority must never lapse between the two lists. Entries
+    // renamed into place count even while their directory sync is unconfirmed (#117).
+    (void)revoked.remember(peer, true);
+    if (!revoked.contains(peer)) return false;
+    (void)managed.forget(peer);
+    return !managed.contains(peer);
 }
 core::Result<bool> BluezBackend::bond_confirmed() {
     impl_->pump();
@@ -44,19 +65,35 @@ core::Result<bool> BluezBackend::bond_confirmed() {
     if (!impl_->allowed || impl_->now() >= impl_->window) return Error{ErrorCode::helper_rejected};
     return true;
 }
-// The only place a bond becomes helper-managed. The receiver calls it after its own deadline,
-// owner and snapshot checks; a failed write refuses the acknowledgement and records nothing.
+// Provisional: the receiver's checks passed, its trust write has not happened. Nothing durable
+// changes; the journal entry written when the window opened stays the cleanup obligation, so a
+// receiver that exits now (or a helper restart) still removes the bond. Not admitted.
 core::Result<void> BluezBackend::acknowledge_bond() {
     const auto bonded = bond_confirmed();
     if (!bonded) return bonded.error();
     if (!bonded.value() || !impl_->allowed) return Error{ErrorCode::helper_rejected};
+    if (!impl_->pending.contains(impl_->allowed->device.identity)) return Error{ErrorCode::helper_rejected};
+    impl_->acknowledged = true;
+    return {};
+}
+// The only place a bond becomes admitted: after the receiver's durable trust write. The managed
+// entry must be durably synced (#117) before the journal entry is durably removed. Any failure
+// leaves the bond unadmitted with its journal entry, closes the window (no services) and lets
+// cleanup remove it; the receiver retracts its approval.
+core::Result<void> BluezBackend::commit_bond() {
+    if (!impl_->acknowledged || !impl_->allowed) return Error{ErrorCode::helper_rejected};
     const auto identity = impl_->allowed->device.identity;
-    if (!impl_->managed.remember(identity)) return Error{ErrorCode::helper_rejected};
-    // The acknowledgement succeeds only once the pending-removal entry is durably gone (write,
-    // rename and directory fsync). Otherwise a later cleanup could remove an approved bond. A
-    // failure refuses the acknowledgement; the receiver's failure path retires the bond, and
-    // cleanup skips managed bonds meanwhile.
-    if (!impl_->pending.forget(identity)) return Error{ErrorCode::helper_rejected};
+    const auto bonded = bond_confirmed();
+    const auto fail = [&] {
+        (void)impl_->demote(identity);
+        if (!impl_->pending.contains(identity)) (void)impl_->pending.remember(identity);
+        impl_->close_window();
+        return core::Result<void>{Error{ErrorCode::helper_rejected}};
+    };
+    if (!bonded || !bonded.value() || !impl_->allowed || !impl_->acknowledged ||
+        impl_->allowed->device.identity != identity) return fail();
+    if (!impl_->managed.remember(identity) || !impl_->pending.forget(identity)) return fail();
+    impl_->acknowledged = false;
     return {};
 }
 void BluezBackend::Impl::reject_comparison() {

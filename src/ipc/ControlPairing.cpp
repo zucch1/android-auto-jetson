@@ -109,7 +109,8 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
     return persist_pairing(active.value(), request);
 }
 
-core::Result<void> ControlService::persist_pairing(const Registered& active, core::PairingRequestId request) {
+core::Result<void> ControlService::persist_pairing(const Registered& active, core::PairingRequestId request, bool* durable) {
+    if (durable) *durable = true;
     const bool comparison = open_pairing_ && open_pairing_->request == request && open_pairing_->awaiting_acceptance;
     // Captured before pairing_confirmed() consumes the pending snapshot.
     const auto compared_peer = comparison ? open_pairing_->peer : phones_.pairing_wireless_identity(request);
@@ -117,6 +118,7 @@ core::Result<void> ControlService::persist_pairing(const Registered& active, cor
     if (!approved && approved.error().code() == ErrorCode::trust_store_not_durable) {
         if (const auto committed = phones_.committed_pairing()) {
             approved = *committed;
+            if (durable) *durable = false;
             events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_approval_not_durable", request.value});
         }
     }
@@ -164,6 +166,9 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
     const auto admitted = admit(caller, active.value());
     if (!admitted) return admitted.error();
     if (!phone) return Error{ErrorCode::invalid_argument};
+    return revoke_phone(active.value(), phone);
+}
+core::Result<void> ControlService::revoke_phone(const Registered& active, core::PhoneId phone) {
     for (auto it = revocations_.begin(); it != revocations_.end(); ++it) {
         if (it->snapshot.phone != phone) continue;
         const auto retried = attempt_revocation(*it);
@@ -187,7 +192,7 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
     std::sort(closed.begin(), closed.end(), [](auto a, auto b) { return a.value < b.value; });
     closed.erase(std::unique(closed.begin(), closed.end()), closed.end());
     for (const auto request : closed) {
-        (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+        (void)gate_.cancel({active.consumer, active.name}, request);
         events_.emit(PairingClosed{request});
     }
     core::Result<void> external;
@@ -199,7 +204,7 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
             helper::RevocationProgress progress;
             if (peer) progress.bond = helper::RevocationLeg::pending;
             progress.retirements.reserve(closed.size());
-            for (const auto request : closed) progress.retirements.push_back({active.value().consumer, request});
+            for (const auto request : closed) progress.retirements.push_back({active.consumer, request});
             revocations_.push_back({*snapshot, progress, !forgotten.has_value()});
             external = attempt_revocation(revocations_.back());
             if (revocations_.back().progress.complete()) revocations_.pop_back();

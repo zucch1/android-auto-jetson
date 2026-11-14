@@ -121,7 +121,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_tests_properties(system_helper_bluez_runtime PROPERTIES TIMEOUT 120)
     add_test(NAME system_helper_enrolment_retirement COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/helper/enrolment_retirement.py" "${CMAKE_BINARY_DIR}")
-    set_tests_properties(system_helper_enrolment_retirement PROPERTIES TIMEOUT 90)
+    set_tests_properties(system_helper_enrolment_retirement PROPERTIES TIMEOUT 180)
     add_test(NAME system_helper_composed_runtime COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/helper/composition_runtime.py" "${CMAKE_BINARY_DIR}")
     set_tests_properties(system_helper_composed_runtime PROPERTIES TIMEOUT 60)

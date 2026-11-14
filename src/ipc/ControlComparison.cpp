@@ -57,8 +57,20 @@ void ControlService::advance_enrolment() {
     if (!acknowledged) { close_enrolment("pairing_helper_failed", true); return; }
     // The acknowledgement RPC may dispatch owner/store changes. Reconcile before the only write.
     if (!reconcile_enrolment(request, true)) return;
-    const auto approved = persist_pairing(*registered_, request);
-    if (!approved) open_pairing_.reset();
+    bool durable = true;
+    const auto approved = persist_pairing(*registered_, request, &durable);
+    if (!approved) { open_pairing_.reset(); return; }
+    // Second, explicit step: only a durable trust write is committed to the helper, which admits
+    // the bond (services, reconnect) and drops its cleanup obligation only now. A failed or lost
+    // commit, or a write that is not durable, retracts the approval: the bond is not admitted, so
+    // the phone must not stay approved (tracked revocation; the helper removes the bond).
+    const auto phone = open_pairing_ ? open_pairing_->phone : core::PhoneId{};
+    const auto committed = durable && phone ? confirmation_->bond_committed(registered_->consumer, request) :
+                                              core::Result<void>{Error{ErrorCode::trust_store_not_durable}};
+    if (committed || !registered_) return;
+    events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_commit_failed", request.value});
+    const auto active = *registered_;
+    if (phone) (void)revoke_phone(active, phone);
 }
 
 core::Result<std::map<std::string, std::string>> ControlService::pairing_comparison(

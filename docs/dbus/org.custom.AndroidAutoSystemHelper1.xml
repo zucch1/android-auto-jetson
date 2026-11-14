@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <node name="/org/custom/AndroidAutoSystemHelper">
   <interface name="org.custom.AndroidAutoSystemHelper1">
-    <annotation name="org.custom.Contract.SemVer" value="1.3.0"/>
+    <annotation name="org.custom.Contract.SemVer" value="1.4.0"/>
     <method name="PollBootstrapV1">
       <arg name="consumer_generation" type="t" direction="in"/>
       <arg name="source" type="t" direction="in"/>
@@ -85,8 +85,15 @@
       <arg name="error" type="u" direction="out"/>
       <arg name="bonded" type="t" direction="out"/>
     </method>
-    <!-- Records the verified bond as helper-managed; called only after every receiver-side check passed. -->
+    <!-- Marks the verified bond provisional (not admitted, cleanup kept); called only after every receiver-side check passed. -->
     <method name="PairingBondAcknowledgedV1">
+      <arg name="generation" type="t" direction="in"/>
+      <arg name="request" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="reserved" type="t" direction="out"/>
+    </method>
+    <!-- Admits the provisional bond; called only after the receiver's durable trust write. -->
+    <method name="PairingBondCommittedV1">
       <arg name="generation" type="t" direction="in"/>
       <arg name="request" type="t" direction="in"/>
       <arg name="error" type="u" direction="out"/>
