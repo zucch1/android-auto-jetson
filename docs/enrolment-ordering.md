@@ -34,19 +34,38 @@ The helper makes its state match, durably and idempotently:
 
 | Helper state for the identity | In the approved set | Not in the approved set |
 |---|---|---|
-| on `revoked-bonds` (no enrolment since its revocation) | stays revoked: demotion completed, **not** admitted, bond not removed (#74); counted as unadmitted | history only, nothing to do |
-| on `managed-bonds` | admitted; a journal entry left beside it (commit stopped between its writes) is durably removed | demoted: `revoked-bonds`, then out of `managed-bonds`, then the removal owed in `pending-removals`; device disconnected and removed |
+| on `revoked-bonds`, a fresh enrolment of it acknowledged in this helper run and awaiting its commit | admitted: history durably cleared, then `managed-bonds` synced, then the journal entry removed (the commit's own order) | device disconnected and removed, then the entry dropped |
+| on `revoked-bonds` otherwise (no committed enrolment since its revocation) | stays revoked: demotion completed, **not** admitted, bond not removed (#74); counted as unadmitted (diagnostic `bond_reconcile_unadmitted`); a stale journal entry of an unaccepted window is dropped | a bonded device is disconnected and removed: the removal is owed again in `pending-removals` first, whatever the journal held |
+| on `managed-bonds` | admitted; a journal entry left beside it (commit stopped between its writes) is durably removed | demoted: the removal owed in `pending-removals`, then `revoked-bonds`, then out of `managed-bonds`; device disconnected and removed, then the entry dropped |
 | on `pending-removals` with a bonded device | admitted: `managed-bonds` synced, then the journal entry removed (the approval landed, the commit did not) | device disconnected and removed, then the entry dropped |
 | on `pending-removals`, no bonded device | counted as unadmitted; cleanup drops the stale entry once the device is gone | entry dropped once the device is gone |
 | nothing | counted as unadmitted (approved, but no bond to admit) | an unmanaged bond is never touched |
 
-Revoked versus approved: only a new enrolment clears an identity from `revoked-bonds`
-(`authorize`, durably, before its window opens; the journal entry holds revocation
-authority meanwhile). So an approved identity still on `revoked-bonds` has no commit after
-its revocation: it is a resurrected (non-durable forget lost to power loss) or stale
-approval, and the revocation wins. A committed approval always wins, because its commit
-went through a fresh enrolment that cleared the history. The owner can ForgetPhone such a
-phone (it then completes) and enrol it again.
+The removal obligation is derived, not only journalled: a bond of an identity on
+`managed-bonds`, `pending-removals` or `revoked-bonds` that the store does not approve is
+removed whether or not its journal entry survived (a failed journal write, a crash, a
+demotion by an older helper). A bond none of the helper's files name is never touched,
+because BlueZ cannot tell an enrolment's bond from the owner's other bonds. Consequently a
+phone forgotten in Android Auto and then paired with the Jetson outside it, by the same
+adapter/address, is removed again by the next reconciliation while its history entry lasts.
+Reconciliation reports success only when BlueZ no longer holds such a bond; while a
+`RemoveDevice` keeps failing it reports failure and the receiver retries.
+
+Revoked versus approved: history is cleared only when a fresh enrolment of the identity
+reaches the committed state: the owner explicitly accepted its number, the helper verified
+and the receiver acknowledged the bond, and the receiver's durable approval arrived (its
+`PairingBondCommittedV1`, or, after an acknowledged enrolment whose commit never landed, the
+next reconciliation of this helper run that finds the approval). The commit clears history
+first, then writes `managed-bonds`, then removes the journal entry. Opening, rejecting,
+cancelling or timing out an enrolment never clears it. So an approved identity still on
+`revoked-bonds` has no commit after its revocation: it is a resurrected (non-durable forget
+lost to power loss) or stale approval, and the revocation wins. The window's journal entry is
+dropped once the window closes (the approved bond stays, #74; history keeps the removal
+authority), so the owner can enrol the phone again at once, or ForgetPhone it (it then
+completes). A committed approval always wins, because its commit cleared the history. An
+acknowledged re-enrolment whose commit never landed and whose helper also restarted is not
+admitted (the acknowledgement is in memory only); it is counted as unadmitted and the owner
+enrols again.
 
 Until the first successful reconciliation of a helper run nothing is admitted for services
 or reconnect, no enrolment window opens, and cleanup removes nothing, because any journal
@@ -69,6 +88,13 @@ the receiver retries on its next pacing step.
 | ForgetPhone durable while the helper is down, then the receiver restarts (finding 2) | no approval; helper still on `managed-bonds` | the receiver's record is lost but not needed: its start-up reconciliation demotes and removes the bond; the phone can enrol again |
 | Forget only non-durable (703) and power lost: approval resurrected | approval; helper on `revoked-bonds` | revoked wins: not admitted, counted as unadmitted (diagnostic `bond_reconcile_unadmitted`); ForgetPhone completes |
 | Demotion's renames unsynced and power lost (finding 4) | managed entry back, maybe without history | the restarted helper admits nothing before reconciliation, which demotes again and reports success only once durable |
+| Demotion stops after the removal is owed (journal written, history and managed not) | approval gone; managed and journal entries, bond | the restarted helper admits nothing; reconciliation demotes again and removes the bond |
+| Demotion stops after history (managed entry not yet dropped) | managed, journal and history entries, bond | as above |
+| Demotion stops after the managed entry is dropped, before `RemoveDevice` | journal and history entries, bond | reconciliation removes the journalled bond, then drops the entry |
+| Demotion stops after `RemoveDevice`, before the journal entry is dropped | journal and history entries, no bond | cleanup finds no device and drops the entry |
+| A journal write fails during ForgetPhone and `RemoveDevice` fails too | managed entry kept (being demoted, refused), bond | nothing is dropped before the obligation is durable; the receiver's retry or, after a restart, reconciliation completes the demotion and removes the bond (failing until BlueZ removes it) |
+| Journal entry lost after a completed demotion (older helper order, power loss) | history only, bond | the obligation is derived from history: reconciliation owes and removes the bond unless the store approves it |
+| Demotion stops after the removal is owed **and** the store's forget was lost (double fault) | approval resurrected; managed and journal entries, bond | indistinguishable from commit window 2: admitted, consistent with the store; ForgetPhone again removes it |
 | Helper restarts at any point | any of the above | reconciled false: no services, no reconnect, no enrolment, no cleanup until the receiver answers |
 
 Receiver-side revocation records for wireless bonds are not needed for correctness any
@@ -87,7 +113,7 @@ Every bond the helper knows is in exactly one state:
 | unaccepted | an enrolment window opens for the observed identity (only after the run's first reconciliation) | entry in `pending-removals` (written before the window opens) | refused | removed when the window closes |
 | provisional | the owner accepted the number, the helper verified the exact bond and the receiver acknowledged it (`PairingBondAcknowledgedV1`) | the same `pending-removals` entry, kept; the acknowledgement is an in-memory flag | refused | when the window closes without a commit the bond is parked: never removed by cleanup, decided by the next reconciliation |
 | admitted | the commit after the receiver's durable trust write, or a reconciliation that finds the approval | `managed-bonds` with a confirmed directory sync (#117), and **then** the `pending-removals` entry durably removed | allowed (Android Auto RFCOMM, HFP, `ReconnectPeerV1`) once reconciled | never removed while approved (#74) |
-| revoked | `RevokePeerV1` (ForgetPhone, a retraction), or reconciliation of an identity the store no longer approves | moved from `managed-bonds` to `revoked-bonds` (history first, then removal from managed, then the removal owed in `pending-removals`; each durable) | refused | removed by the revocation or by cleanup of the owed entry; history is revocation authority only |
+| revoked | `RevokePeerV1` (ForgetPhone, a retraction), or reconciliation of an identity the store no longer approves | moved from `managed-bonds` to `revoked-bonds` (the removal owed in `pending-removals` first, then history, then removal from managed; each durable; the entry dropped only once BlueZ confirmed the removal) | refused | removed by the revocation or by cleanup of the owed entry; reconciliation owes it again from history if the entry was lost; history is revocation authority only, cleared only by a committed fresh enrolment |
 
 Admission is checked by one predicate: reconciled in this helper run, on `managed-bonds`,
 durably synced, not on `pending-removals`, not parked and not being demoted. Cleanup follows
@@ -113,8 +139,9 @@ snapshot once more (the RPC can dispatch changes) and then calls the shared
 `persist_pairing` routine, which calls `PhoneDirectory::pairing_confirmed`. Only when
 that write is durable does the receiver send the second, explicit step,
 `PairingBondCommittedV1` (same sender, UID and lease checks as every comparison
-method). The helper re-verifies the exact bond, writes `managed-bonds` with a confirmed
-directory sync and then durably removes the journal entry; only now are services and
+method). The helper re-verifies the exact bond, durably clears any revocation history of
+the identity, writes `managed-bonds` with a confirmed directory sync and then durably removes
+the journal entry; only now are services and
 reconnect allowed. The non-comparison flow continues to use the same persistence
 routine after helper confirmation (M10).
 
@@ -174,9 +201,10 @@ helper ticks, even if BlueZ temporarily disappears. The queue is persisted next 
 no-follow traversal, exclusive staging, fsync and atomic rename, at most 256
 records) and an entry is written before any window opens, so a helper restart
 cannot lose a removal; an admission whose entry cannot be written is refused.
-Rebuilding the queue from BlueZ was rejected: BlueZ cannot distinguish a bond an
+Rebuilding the queue from BlueZ alone was rejected: BlueZ cannot distinguish a bond an
 enrolment window created from one the owner made, and removing the latter would be
-destructive; reconciliation acts only on identities the helper's files name. The
+destructive; reconciliation acts only on identities the helper's files name (including
+history, from which it rebuilds a lost entry). The
 list is not revocation authority on its own once its entry is gone. A removal that
 succeeded but whose record cannot be rewritten is remembered in memory so a device
 later paired again at that address is not removed on every tick. `revoked-bonds`
