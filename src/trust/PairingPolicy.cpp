@@ -64,10 +64,15 @@ bool PairingPolicy::has_pending(core::PairingRequestId request) const {
 }
 
 std::vector<core::PairingRequestId> PairingPolicy::reap_expired() {
+    expired_peers_.clear();
     std::vector<core::PairingRequestId> expired;
     const core::Nanoseconds now = clock_.now();
     for (std::size_t index = 0; index < pending_.size();) {
         if (now.count > pending_[index].deadline.count) {
+            if (const auto* wireless = std::get_if<WirelessIdentity>(&pending_[index].identity)) {
+                expired_peers_.push_back({pending_[index].request,
+                    helper::PeerIdentity{wireless->bond_address, wireless->adapter}});
+            }
             expired.push_back(pending_[index].request);
             drop_at(index);  // rejected and never persisted
             continue;
@@ -75,6 +80,18 @@ std::vector<core::PairingRequestId> PairingPolicy::reap_expired() {
         ++index;
     }
     return expired;
+}
+
+std::optional<helper::PeerIdentity> PairingPolicy::take_expired_wireless_identity(
+    core::PairingRequestId request) {
+    for (auto it = expired_peers_.begin(); it != expired_peers_.end(); ++it) {
+        if (it->first == request) {
+            auto peer = std::move(it->second);
+            expired_peers_.erase(it);
+            return peer;
+        }
+    }
+    return std::nullopt;
 }
 
 core::Result<void> PairingPolicy::forget(core::PhoneId phone) {

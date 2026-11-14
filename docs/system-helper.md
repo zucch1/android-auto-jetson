@@ -113,14 +113,16 @@ persists approval. `PairingOpened` follows committed approval, including error
 `pairing_approval_not_durable` and keeps helper confirmation consistent with
 the store. Listening for or forging that signal never mints grants.
 
-If persistence fails before commit, cancellation must be acknowledged. A failed
-cancellation emits `phone_revocation_retirement_pending` and retains the source
-and captured identity in the existing revocation progress queue, blocking new
-pairing for that identity until acknowledged `Invalidate` retirement. Source-only
-records retry during owner reconciliation (including idle calls); ordinary phone
-revocations retain their existing ForgetPhone retry path. Cancel,
-consumer teardown/owner loss, successful or committed-not-durable forget, and
-control-service shutdown invalidate helper authority. Committed forget invalidates
+If persistence fails before commit or any pairing cancellation/expiry fails
+helper invalidation, cancellation must be acknowledged. A failed cancellation
+emits `phone_revocation_retirement_pending` and retains the source and captured
+identity in the existing revocation progress queue, blocking new pairing for
+that identity until acknowledged `Invalidate` retirement. Source-only records
+retry with a bounded per-invocation budget and backoff during owner
+reconciliation (including idle calls); ordinary phone revocations retain their
+existing ForgetPhone retry path. Cancel, consumer teardown/owner loss,
+successful or committed-not-durable forget, and control-service shutdown
+invalidate helper authority. Committed forget invalidates
 only the retired phone's sources locally and remotely, then sends narrow revocation
 requests. `RevokeAP1` rotates/evicts AP access without clearing unrelated grants or
 bound observations: it has no phone-to-source map. Failed remote invalidation also

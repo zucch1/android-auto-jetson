@@ -254,6 +254,7 @@ TEST_F(HelperConfirmation, FailedApprovalRetirementBlocksIdentityUntilAcknowledg
     EXPECT_EQ(count_closed(), 1U);
     EXPECT_TRUE(has_diagnostic("phone_revocation_retirement_pending"));
     EXPECT_EQ(control.pending_revocations(), 1U);
+    bridge.cancel_result = {};
     bridge.retirement_limit = 0;
     // prepare() must expose the same peer: admission stays blocked while
     // the existing revocation attempt still cannot acknowledge retirement.
@@ -270,5 +271,256 @@ TEST_F(HelperConfirmation, FailedApprovalRetirementBlocksIdentityUntilAcknowledg
     EXPECT_EQ(bridge.ap_attempts, 0);
     EXPECT_EQ(bridge.bond_attempts, 0);
     EXPECT_TRUE(control.request_add_phone(caller));
+}
+} // namespace
+
+#include "../trust/fakes.hpp"
+#include <cstdio>
+#include <thread>
+
+namespace {
+using namespace aa;
+using helper::test::HelperConfirmation;
+
+TEST_F(HelperConfirmation, FailedExpiryCancellationBlocksIdentityUntilAcknowledgedRetry) {
+    trust::test::ManualClock manual_clock;
+    trust::PairingPolicy timed_phones{store, manual_clock};
+    ipc::ControlService timed_control{{1000}, {credentials, events, ids, timed_phones, &bridge}};
+    ASSERT_TRUE(timed_control.register_consumer(caller, name));
+
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:11", "adapter"};
+    const auto expired_req = timed_control.request_add_phone(caller);
+    ASSERT_TRUE(expired_req);
+
+    manual_clock.advance(core::Milliseconds{trust::PairingPolicy::kConfirmWindow.count + 1});
+    bridge.cancel_result = Error{ErrorCode::timeout};
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:12", "adapter"};
+    ASSERT_TRUE(timed_control.request_add_phone(caller));
+    bridge.cancel_result = {};
+
+    EXPECT_EQ(bridge.cancellations, 1);
+    EXPECT_TRUE(has_diagnostic("phone_revocation_retirement_pending"));
+    EXPECT_EQ(count_closed(), 1U);
+    EXPECT_EQ(timed_control.pending_revocations(), 1U);
+
+    bridge.retirement_limit = 0;
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:11", "adapter"};
+    const auto blocked = timed_control.request_add_phone(caller);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code(), ErrorCode::trust_rejected);
+    EXPECT_EQ(timed_control.pending_revocations(), 1U);
+
+    bridge.retirement_limit.reset();
+    timed_control.refresh_consumer_owner();
+    EXPECT_EQ(timed_control.pending_revocations(), 0U);
+    ASSERT_FALSE(bridge.retirement_batches.empty());
+    ASSERT_EQ(bridge.retirement_batches.back().size(), 1U);
+    EXPECT_EQ(bridge.retirement_batches.back()[0].request, expired_req.value());
+    EXPECT_TRUE(timed_control.request_add_phone(caller));
+}
+
+TEST_F(HelperConfirmation, FailedEarlyRejectionCancellationBlocksIdentityUntilAcknowledgedRetry) {
+    // Seed 1 direct policy entry + 7 control requests so PairingGate still admits
+    // the 8th request, prepare() binds the peer, and pairing_requested() rejects.
+    ASSERT_TRUE(phones.note_wireless_candidate(helper::PeerIdentity{"02:00:00:00:00:20", "adapter"}));
+    ASSERT_TRUE(phones.pairing_requested(core::PairingRequestId{9999}));
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:20", "adapter"};
+    std::vector<core::PairingRequestId> pending;
+    for (std::size_t i = 0; i < trust::PairingPolicy::kMaxPending - 1; ++i) {
+        const auto req = control.request_add_phone(caller);
+        ASSERT_TRUE(req);
+        pending.push_back(req.value());
+    }
+
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:21", "adapter"};
+    bridge.cancel_result = Error{ErrorCode::timeout};
+    const auto rejected = control.request_add_phone(caller);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), ErrorCode::ipc_queue_full);
+    EXPECT_EQ(bridge.cancellations, 1);
+    EXPECT_TRUE(has_diagnostic("phone_revocation_retirement_pending"));
+    EXPECT_EQ(control.pending_revocations(), 1U);
+
+    bridge.cancel_result = {};
+    bridge.retirement_limit = 0;
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:21", "adapter"};
+    const auto blocked = control.request_add_phone(caller);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code(), ErrorCode::trust_rejected);
+    EXPECT_EQ(control.pending_revocations(), 1U);
+
+    bridge.retirement_limit.reset();
+    control.refresh_consumer_owner();
+    EXPECT_EQ(control.pending_revocations(), 0U);
+    ASSERT_TRUE(control.cancel_phone_pairing(caller, pending.front()));
+    phones.pairing_cancelled(core::PairingRequestId{9999});
+    EXPECT_TRUE(control.request_add_phone(caller));
+}
+
+TEST_F(HelperConfirmation, FailedUserCancelBlocksIdentityUntilAcknowledgedRetry) {
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:31", "adapter"};
+    const auto source = control.request_add_phone(caller);
+    ASSERT_TRUE(source);
+
+    bridge.cancel_result = Error{ErrorCode::timeout};
+    ASSERT_TRUE(control.cancel_phone_pairing(caller, source.value()));
+    bridge.cancel_result = {};
+    EXPECT_EQ(bridge.cancellations, 1);
+    EXPECT_EQ(count_closed(), 1U);
+    EXPECT_TRUE(has_diagnostic("phone_revocation_retirement_pending"));
+    EXPECT_EQ(control.pending_revocations(), 1U);
+
+    bridge.retirement_limit = 0;
+    const auto blocked = control.request_add_phone(caller);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code(), ErrorCode::trust_rejected);
+    EXPECT_EQ(control.pending_revocations(), 1U);
+
+    bridge.retirement_limit.reset();
+    control.refresh_consumer_owner();
+    EXPECT_EQ(control.pending_revocations(), 0U);
+    ASSERT_FALSE(bridge.retirement_batches.empty());
+    ASSERT_EQ(bridge.retirement_batches.back().size(), 1U);
+    EXPECT_EQ(bridge.retirement_batches.back()[0].request, source.value());
+    EXPECT_TRUE(control.request_add_phone(caller));
+}
+
+TEST_F(HelperConfirmation, FailedConfirmHelperErrorCancellationBlocksIdentityUntilAcknowledgedRetry) {
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:41", "adapter"};
+    const auto source = control.request_add_phone(caller);
+    ASSERT_TRUE(source);
+
+    bridge.result = Error{ErrorCode::helper_unavailable};
+    bridge.cancel_result = Error{ErrorCode::timeout};
+    const auto failed = control.confirm_phone_pairing(caller, source.value());
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error().code(), ErrorCode::helper_unavailable);
+    bridge.result = {};
+    bridge.cancel_result = {};
+    EXPECT_EQ(bridge.cancellations, 1);
+    EXPECT_TRUE(has_diagnostic("phone_revocation_retirement_pending"));
+    EXPECT_EQ(control.pending_revocations(), 1U);
+
+    bridge.retirement_limit = 0;
+    const auto blocked = control.request_add_phone(caller);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code(), ErrorCode::trust_rejected);
+
+    bridge.retirement_limit.reset();
+    control.refresh_consumer_owner();
+    EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_TRUE(control.request_add_phone(caller));
+}
+
+TEST_F(HelperConfirmation, FailedOpenPairingExpiryCancellationBlocksIdentityUntilAcknowledgedRetry) {
+    auto clock_now = std::chrono::steady_clock::time_point{std::chrono::seconds{100}};
+    ipc::ControlService timed{{1000}, {credentials, events, ids, phones, &bridge,
+                                     [&] { return clock_now; }}};
+    ASSERT_TRUE(timed.register_consumer(caller, name));
+
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:51", "adapter"};
+    const auto source = timed.request_add_phone(caller);
+    ASSERT_TRUE(source);
+    ASSERT_TRUE(timed.confirm_phone_pairing(caller, source.value()));
+
+    bridge.expect_empty_store = false;
+    bridge.cancel_result = Error{ErrorCode::timeout};
+    clock_now += std::chrono::seconds{61};
+    (void)timed.state();
+    bridge.cancel_result = {};
+
+    EXPECT_EQ(bridge.cancellations, 1);
+    EXPECT_EQ(count_closed(), 1U);
+    EXPECT_TRUE(has_diagnostic("phone_revocation_retirement_pending"));
+    EXPECT_EQ(timed.pending_revocations(), 1U);
+
+    bridge.retirement_limit = 0;
+    const auto blocked = timed.request_add_phone(caller);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code(), ErrorCode::trust_rejected);
+    EXPECT_EQ(timed.pending_revocations(), 1U);
+
+    bridge.retirement_limit.reset();
+    timed.refresh_consumer_owner();
+    EXPECT_EQ(timed.pending_revocations(), 0U);
+    ASSERT_FALSE(bridge.retirement_batches.empty());
+    ASSERT_EQ(bridge.retirement_batches.back().size(), 1U);
+    EXPECT_EQ(bridge.retirement_batches.back()[0].request, source.value());
+}
+
+TEST_F(HelperConfirmation, SourceOnlyRetirementLoopRespectsBudgetBacksOffAndRecovers) {
+    auto clock_now = std::chrono::steady_clock::time_point{std::chrono::seconds{100}};
+    ipc::ControlService budgeted{{1000}, {credentials, events, ids, phones, &bridge,
+                                         [&] { return clock_now; }}};
+    ASSERT_TRUE(budgeted.register_consumer(caller, name));
+
+    bridge.cancel_result = Error{ErrorCode::timeout};
+    bridge.retirement_limit = 0;
+    for (std::size_t i = 0; i < ipc::PairingGate::kIssuedBudget; ++i) {
+        char mac[18]{};
+        std::snprintf(mac, sizeof(mac), "02:00:00:00:01:%02x", static_cast<unsigned>(i));
+        bridge.prepared = helper::PeerIdentity{mac, "adapter"};
+        const auto req = budgeted.request_add_phone(caller);
+        ASSERT_TRUE(req);
+        ASSERT_TRUE(budgeted.cancel_phone_pairing(caller, req.value()));
+    }
+    ASSERT_EQ(budgeted.pending_revocations(), ipc::PairingGate::kIssuedBudget);
+
+    // A single control call must stay within the per-invocation attempt budget (4).
+    bridge.forgets = 0;
+    (void)budgeted.state();
+    EXPECT_LE(bridge.forgets, static_cast<int>(ipc::ControlService::kSourceRetirementAttemptBudget));
+
+    // Repeated calls while the helper stays down eventually back off the entire queue.
+    for (int i = 0; i < 40; ++i) {
+        (void)budgeted.state();
+    }
+    const int before_idle_call = bridge.forgets;
+    (void)budgeted.state();
+    EXPECT_EQ(bridge.forgets, before_idle_call);
+
+    // Helper recovers: backed-off entries stay skipped until their deadline,
+    // then bounded calls drain the entire queue.
+    bridge.retirement_limit.reset();
+    bridge.cancel_result = {};
+    (void)budgeted.state();
+    EXPECT_EQ(budgeted.pending_revocations(), ipc::PairingGate::kIssuedBudget);
+
+    for (int round = 0; round < 32 && budgeted.pending_revocations() > 0; ++round) {
+        clock_now += std::chrono::seconds{30};
+        (void)budgeted.state();
+    }
+    EXPECT_EQ(budgeted.pending_revocations(), 0U);
+}
+
+TEST_F(HelperConfirmation, SourceOnlyRetirementLoopRespectsTimeBudgetOnStalledHelper) {
+    std::chrono::seconds offset{0};
+    ipc::ControlService timed{{1000}, {credentials, events, ids, phones, &bridge,
+                                     [&] { return std::chrono::steady_clock::now() + offset; }}};
+    ASSERT_TRUE(timed.register_consumer(caller, name));
+
+    bridge.cancel_result = Error{ErrorCode::timeout};
+    bridge.retirement_limit = 0;
+    for (int i = 0; i < 8; ++i) {
+        char mac[18]{};
+        std::snprintf(mac, sizeof(mac), "02:00:00:00:02:%02x", static_cast<unsigned>(i));
+        bridge.prepared = helper::PeerIdentity{mac, "adapter"};
+        const auto req = timed.request_add_phone(caller);
+        ASSERT_TRUE(req);
+        ASSERT_TRUE(timed.cancel_phone_pairing(caller, req.value()));
+    }
+    ASSERT_EQ(timed.pending_revocations(), 8U);
+
+    // Advance past any backoff accumulated during setup so all 8 are eligible.
+    offset += std::chrono::seconds{30};
+    bridge.forgets = 0;
+    bridge.on_forget = [] { std::this_thread::sleep_for(std::chrono::milliseconds{260}); };
+    const auto started = std::chrono::steady_clock::now();
+    (void)timed.state();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    // 260ms * 2 = 520ms exceeds the 500ms dispatch budget, stopping before 4 attempts.
+    EXPECT_EQ(bridge.forgets, 2);
+    EXPECT_LT(elapsed, std::chrono::milliseconds{900});
 }
 } // namespace

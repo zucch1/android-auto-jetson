@@ -42,21 +42,57 @@ void ControlService::teardown(std::string_view reason, DiagnosticSeverity severi
     events_.emit(DiagnosticEmitted{severity, reason, consumer.value});
 }
 
+std::chrono::steady_clock::time_point ControlService::now() const {
+    return clock_ ? clock_() : std::chrono::steady_clock::now();
+}
+
 void ControlService::refresh_consumer_owner() {
-    for (auto it = revocations_.begin(); it != revocations_.end();) {
-        if (it->snapshot.phone) { ++it; continue; }
-        (void)attempt_revocation(*it);
-        if (it->progress.complete()) it = revocations_.erase(it);
-        else ++it;
+    if (!revocations_.empty()) {
+        const auto started = now();
+        const auto deadline = started + kSourceRetirementTimeBudget;
+        std::size_t index = source_retry_cursor_ % revocations_.size();
+        std::size_t remaining = revocations_.size();
+        std::size_t attempts = 0;
+        while (remaining > 0 && !revocations_.empty() &&
+               attempts < kSourceRetirementAttemptBudget &&
+               (attempts == 0 || now() < deadline)) {
+            index %= revocations_.size();
+            auto& record = revocations_[index];
+            const auto attempt_now = now();
+            if (record.snapshot.phone || record.next_attempt > attempt_now) {
+                ++index;
+                --remaining;
+                continue;
+            }
+            ++attempts;
+            (void)attempt_revocation(record);
+            if (record.progress.complete()) {
+                revocations_.erase(revocations_.begin() + static_cast<std::ptrdiff_t>(index));
+                --remaining;
+            } else {
+                if (record.failures < 16) ++record.failures;
+                if (record.failures >= 2) {
+                    const auto shift = std::min<std::uint32_t>(record.failures - 2, 5);
+                    const auto delay = std::chrono::seconds{1U << shift};
+                    record.next_attempt = now() + std::min(delay, std::chrono::seconds{30});
+                } else {
+                    record.next_attempt = now();
+                }
+                ++index;
+                --remaining;
+            }
+        }
+        source_retry_cursor_ = revocations_.empty() ? 0 : (index % revocations_.size());
     }
     if (!registered_.has_value()) {
         return;
     }
-    if (open_pairing_ && std::chrono::steady_clock::now() >= open_pairing_->deadline) {
+    if (open_pairing_ && now() >= open_pairing_->deadline) {
         const auto request = open_pairing_->request;
-        if (confirmation_ != nullptr) (void)confirmation_->cancel(registered_->consumer, request);
-        (void)gate_.cancel({registered_->consumer, registered_->name}, request);
+        const auto peer = open_pairing_->peer;
         open_pairing_.reset();
+        retire_failed_pairing(registered_->consumer, request, peer);
+        (void)gate_.cancel({registered_->consumer, registered_->name}, request);
         events_.emit(PairingClosed{request});
     }
     const auto owner = credentials_.name_owner(registered_->name);

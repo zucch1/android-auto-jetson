@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <unistd.h>
 
 namespace aa::helper::test {
@@ -14,6 +15,7 @@ public:
     trust::ApprovedPhoneStore& store;
     int confirmations{}, cancellations{}, teardowns{}, forgets{};
     bool approved_at_call{};
+    bool expect_empty_store{true};
     core::Result<void> result{}, cancel_result{};
     core::Result<void> ap{}, bond{};
     int ap_attempts{}, bond_attempts{};
@@ -21,6 +23,7 @@ public:
     std::optional<helper::PeerIdentity> prepared;
     std::optional<std::size_t> retirement_limit;
     std::vector<std::vector<helper::RetirementSource>> retirement_batches;
+    std::function<void()> on_forget{};
     explicit Bridge(trust::ApprovedPhoneStore& approvals) : store(approvals) {}
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override {
         ++confirmations;
@@ -34,9 +37,10 @@ public:
     }
     helper::RevocationAttempt forgotten_v1(const helper::RevocationV1& snapshot,
                                           const helper::RevocationProgress& progress) override {
+        if (on_forget) on_forget();
         ++forgets;
         snapshots.push_back(snapshot);
-        EXPECT_TRUE(store.phones().empty());
+        if (expect_empty_store) EXPECT_TRUE(store.phones().empty());
         helper::RevocationAttempt report;
         report.ap = progress.ap == helper::RevocationLeg::complete ? core::Result<void>{} : (++ap_attempts, ap);
         if ((snapshot.phone || progress.bond) && helper::revocation_peer(snapshot))
