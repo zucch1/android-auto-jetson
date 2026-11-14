@@ -424,6 +424,66 @@ TEST_F(AcknowledgementOrder, NotDurableApprovalIsNeverCommittedAndIsRetracted) {
     EXPECT_EQ(bridge.snapshots.size(), 1U);
 }
 
+// With a reconciling helper (the production BusClient) the trust store is the single authority.
+// A failed commit after a durable write keeps the approval: the enrolment's source is retired
+// (closing the helper's window, which parks the bond) and the next reconciliation admits it.
+TEST_F(AcknowledgementOrder, FailedCommitKeepsTheDurableApprovalForReconciliation) {
+    bridge.reconciling = true;
+    bridge.commitment = Error{ErrorCode::timeout};
+    accept();
+    EXPECT_EQ(bridge.commits, 1);
+    EXPECT_TRUE(has_diagnostic("pairing_commit_failed"));
+    EXPECT_EQ(store.phones().size(), 1U) << "a durable approval was withdrawn";
+    trust::ApprovedPhoneStore reopened{directory / "store"}; ASSERT_TRUE(reopened.load());
+    EXPECT_EQ(reopened.phones().size(), 1U);
+    EXPECT_EQ(bridge.forgets, 0) << "the approval was retracted";
+    EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_GE(bridge.cancellations, 1) << "the enrolment's source was not retired";
+    EXPECT_EQ(count_closed(), 1U);
+    (void)control.state();
+    ASSERT_FALSE(bridge.reconciled_sets.empty()) << "no reconciliation after the failed commit";
+    EXPECT_EQ(bridge.reconciled_sets.back(), std::vector<helper::PeerIdentity>{*bridge.prepared});
+    EXPECT_TRUE(bridge.reconcile_forced.back());
+}
+// A trust write that fails after the acknowledgement leaves no receiver-side bond record: the
+// store does not approve the bond, and the reconciliation it requests makes the helper remove it.
+TEST_F(AcknowledgementOrder, StoreWriteFailureAfterAcknowledgementIsLeftToReconciliation) {
+    bridge.reconciling = true;
+    bridge.bond = Error{ErrorCode::helper_unavailable};
+    {
+        trust::test::faults::ScopedFault failing{trust::test::faults::Fault::temp_fsync};
+        accept();
+    }
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_EQ(bridge.bond_attempts, 0);
+    (void)control.state();
+    ASSERT_FALSE(bridge.reconciled_sets.empty());
+    EXPECT_TRUE(bridge.reconciled_sets.back().empty());
+    EXPECT_TRUE(control.request_add_phone(caller)) << "the receiver blocked a re-enrolment the helper journal decides";
+}
+// Finding 3: revocation records whose bond leg the helper keeps refusing (it has no authority left,
+// e.g. its managed state was lost) used to pin all 256 slots and block pairing and revocation. A
+// reconciliation that succeeds with the identity absent from the store resolves the bond leg.
+TEST_F(ComparisonControl, StuckBondRecordsAreResolvedByReconciliationAndNeverBlockPairing) {
+    bridge.expect_empty_store = false;
+    bridge.bond = Error{ErrorCode::helper_rejected};
+    bridge.reconciling = true;
+    for (int i = 0; i < 256; ++i) {
+        char address[18];
+        std::snprintf(address, sizeof address, "02:00:00:01:%02X:%02X", i / 256, i % 256);
+        const auto phone = store.approve(trust::WirelessIdentity{address, "02:00:00:00:00:AA"});
+        ASSERT_TRUE(phone);
+        const auto forgotten = control.forget_phone(caller, phone.value());
+        ASSERT_TRUE(forgotten || forgotten.error().code() != ErrorCode::ipc_queue_full) << "revocation blocked at " << i;
+    }
+    EXPECT_GE(bridge.bond_attempts, 256);
+    (void)control.state();
+    EXPECT_EQ(control.pending_revocations(), 0U) << "a resolved bond record pinned capacity";
+    const auto request = control.request_add_phone(caller);
+    EXPECT_TRUE(request) << "stuck records blocked pairing";
+}
+
 // Acknowledged-then-failed enrolments leave bond-leg records. They share the bounded retry loop of
 // source-only records: a stalled helper cannot block a control call, and everything retires once
 // the helper recovers.

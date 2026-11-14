@@ -91,9 +91,12 @@ def store_write_failure_after_acknowledgement(build: Path, directory: Path, remo
         assert surface.state()["disconnected"][0].endswith("dev_02_00_00_00_00_01")
         assert command(surface.mock, "AuthorizeService hfp") == "rejected", "HFP stayed authorized after the failed write"
         if removal_fails:
-            # The failed removal is tracked in the receiver's revocation record, not forgotten.
-            wait(lambda: command(surface.receiver, "pending-revocations") == "1")
+            # The receiver's store does not approve the bond: its reconciliation hands the removal
+            # to the helper's durable journal, so no receiver record is needed (or can pin capacity).
+            time.sleep(1.5)
             assert not surface.state()["removed"]
+            assert peer_in(directory, "pending-removals"), "the failed removal is not owned durably"
+            assert command(surface.receiver, "pending-revocations") == "0"
             command(surface.mock, "allow-remove")
         wait(lambda: len(surface.state()["removed"]) == 1, 8)
         wait(lambda: command(surface.receiver, "pending-revocations") == "0", 8)
@@ -116,58 +119,154 @@ def peer_in(directory: Path, name: str) -> bool:
     return path.exists() and "02:00:00:00:00:01" in path.read_text()
 
 
+def restart_receiver(stack: contextlib.ExitStack, build: Path, directory: Path, surface: Surface) -> None:
+    """A fresh receiver process on the same trust store; it reconciles the helper on start."""
+    surface.receiver = stack.enter_context(process([str(build / "aa_system_helper_fixture"), "receiver",
+                                                    surface.address, str(directory / "store"), "bluez"], surface.env))
+    assert line(surface.receiver) == "ready"
+    control(surface.consumer, "RegisterConsumer", GLib.Variant("(s)", ("org.custom.BluezConsumer",)))
+
+
+def start_helper(stack: contextlib.ExitStack, build: Path, directory: Path, surface: Surface) -> None:
+    surface.daemon = stack.enter_context(process([str(build / "aa-system-helper"), "--private-bus",
+                                                  surface.address, str(directory)], surface.env))
+
+
+def stop_helper(surface: Surface) -> None:
+    surface.daemon.terminate()
+    assert surface.daemon.wait(timeout=5) == 0
+
+
+def enrol(surface: Surface, directory: Path) -> None:
+    request = surface.request()
+    surface.confirm(request)
+    accept(surface, request)
+    command(surface.mock, "paired")
+    wait(lambda: peer_in(directory, "managed-bonds") and command(surface.receiver, "pending-pairings") == "0", 8)
+
+
 def receiver_exit_after_acknowledgement(build: Path, directory: Path, helper_restart: bool) -> None:
-    """Finding A: the receiver process exits after the helper acknowledged the bond, before its store commit."""
+    """Finding A: the receiver exits after the helper acknowledged the bond, before its store write.
+
+    The helper cannot know whether the write landed, so the bond is parked (neither admitted nor
+    removed) until the restarted receiver's reconciliation answers: nothing is approved, so it goes."""
     with contextlib.ExitStack() as stack:
         surface = Surface(stack, build, directory)
         request = surface.request()
         surface.confirm(request)
         assert command(surface.receiver, "exit-after-ack") == "0"
-        if helper_restart:
-            command(surface.mock, "fail-remove")  # the helper's cleanup cannot finish before it restarts
         accept(surface, request)
         command(surface.mock, "paired")
         assert surface.receiver.wait(timeout=5) == 9, "the receiver did not exit at the acknowledgement"
         assert not peer_in(directory, "managed-bonds"), "a provisional bond was admitted"
         assert command(surface.mock, "AuthorizeService hfp") == "rejected"
+        time.sleep(1.2)
+        assert not surface.state()["removed"], "a bond was removed before the receiver answered"
+        assert peer_in(directory, "pending-removals"), "the cleanup obligation was not durable"
         if helper_restart:
-            time.sleep(0.5)
-            assert not surface.state()["removed"]
-            assert peer_in(directory, "pending-removals"), "the cleanup obligation was not durable"
-            surface.daemon.terminate()
-            assert surface.daemon.wait(timeout=5) == 0
-            command(surface.mock, "allow-remove")
-            stack.enter_context(process([str(build / "aa-system-helper"), "--private-bus",
-                                         surface.address, str(directory)], surface.env))
+            stop_helper(surface)
+            start_helper(stack, build, directory, surface)
+            time.sleep(1.2)
+            assert not surface.state()["removed"], "the restarted helper removed a bond before reconciliation"
+        restart_receiver(stack, build, directory, surface)
         wait(lambda: len(surface.state()["removed"]) == 1, 8)
         wait(lambda: not peer_in(directory, "pending-removals"))
         assert not peer_in(directory, "managed-bonds")
-        # The restarted receiver finds nothing approved.
-        receiver = stack.enter_context(process([str(build / "aa_system_helper_fixture"), "receiver",
-                                                surface.address, str(directory / "store"), "bluez"], surface.env))
-        assert line(receiver) == "ready"
-        assert command(receiver, "phone") == "phone 0"
-        print(f"PASS receiver_exit_after_acknowledgement_removes_bond{'_across_helper_restart' if helper_restart else ''}", flush=True)
+        assert surface.phone() == 0
+        print(f"PASS receiver_exit_after_acknowledgement_parks_then_reconciliation_removes_bond{'_across_helper_restart' if helper_restart else ''}", flush=True)
 
 
-def commit_failure_retracts_approval(build: Path, directory: Path) -> None:
-    """The durable trust write succeeded but the helper commit fails: the approval is retracted."""
+def receiver_exit_before_commit(build: Path, directory: Path, helper_restart: bool) -> None:
+    """Commit crash window 1: the trust write is durable, the receiver exits before the commit."""
     with contextlib.ExitStack() as stack:
-        # Composed with the AP double, so the retraction's AP leg completes too.
-        surface = ComposedSurface(stack, build, directory)
+        surface = Surface(stack, build, directory)
         request = surface.request()
-        Surface.confirm(surface, request)
+        surface.confirm(request)
+        assert command(surface.receiver, "exit-before-commit") == "0"
+        accept(surface, request)
+        command(surface.mock, "paired")
+        assert surface.receiver.wait(timeout=5) == 9, "the receiver did not exit before the commit"
+        assert (directory / "store").exists(), "the trust write did not land before the commit"
+        assert not peer_in(directory, "managed-bonds")
+        time.sleep(1.2)
+        assert not surface.state()["removed"], "the parked, approved bond was removed"
+        if helper_restart:
+            stop_helper(surface)
+            start_helper(stack, build, directory, surface)
+        restart_receiver(stack, build, directory, surface)
+        wait(lambda: peer_in(directory, "managed-bonds") and not peer_in(directory, "pending-removals"), 8)
+        assert not surface.state()["removed"], "reconciliation removed an approved bond"
+        assert surface.phone() != 0, "the durable approval was lost"
+        assert command(surface.receiver, "reconnect") == "0", "the approved bond was not admitted"
+        print(f"PASS commit_crash_window_1_heals_on_reconciliation{'_across_helper_restart' if helper_restart else ''}", flush=True)
+
+
+def helper_exit_between_commit_writes(build: Path, directory: Path) -> None:
+    """Commit crash window 2: managed-bonds written, the journal entry not yet durably removed."""
+    with contextlib.ExitStack() as stack:
+        surface = Surface(stack, build, directory)
+        enrol(surface, directory)
+        stop_helper(surface)
+        # The durable outcome of a helper crash between the two writes of the commit.
+        (directory / "pending-removals").write_text("v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n")
+        start_helper(stack, build, directory, surface)
+        # The live receiver sees the new helper incarnation and reconciles it.
+        wait(lambda: not peer_in(directory, "pending-removals"), 8)
+        assert peer_in(directory, "managed-bonds")
+        assert not surface.state()["removed"], "restart cleanup removed an approved bond"
+        wait(lambda: command(surface.receiver, "reconnect") == "0", 4)
+        assert surface.phone() != 0
+        print("PASS commit_crash_window_2_heals_on_reconciliation", flush=True)
+
+
+def commit_failure_keeps_approval(build: Path, directory: Path) -> None:
+    """The durable trust write succeeded but the commit fails: the approval stays (it is the
+    authority) and reconciliation admits the parked bond."""
+    with contextlib.ExitStack() as stack:
+        surface = Surface(stack, build, directory)
+        request = surface.request()
+        surface.confirm(request)
         assert command(surface.receiver, "hold-commit") == "0"
         accept(surface, request)
         command(surface.mock, "paired")
+        wait(lambda: peer_in(directory, "managed-bonds") and not peer_in(directory, "pending-removals"), 8)
+        assert not surface.state()["removed"]
+        assert surface.phone() != 0, "a durable approval was withdrawn"
+        assert command(surface.receiver, "pending-revocations") == "0"
+        assert command(surface.receiver, "reconnect") == "0"
+        print("PASS commit_failure_keeps_approval_and_reconciliation_admits_bond", flush=True)
+
+
+def forget_with_helper_down_then_receiver_restart(build: Path, directory: Path) -> None:
+    """Finding 2: ForgetPhone removes trust durably while the helper is down; the receiver restarts.
+    The helper's managed authority must not survive: reconciliation removes the bond, and the phone
+    can enrol again."""
+    with contextlib.ExitStack() as stack:
+        surface = Surface(stack, build, directory)
+        enrol(surface, directory)
+        phone = surface.phone()
+        stop_helper(surface)
+        try:
+            surface.forget(phone)
+        except GLib.Error:
+            pass  # the helper is down: its legs stay pending in a record the restart loses
+        assert surface.phone() == 0, "the forget did not remove trust"
+        surface.receiver.kill()
+        surface.receiver.wait(timeout=3)
+        start_helper(stack, build, directory, surface)
+        time.sleep(1.2)
+        assert peer_in(directory, "managed-bonds") and not surface.state()["removed"], \
+            "the helper acted before the receiver answered"
+        restart_receiver(stack, build, directory, surface)
         wait(lambda: len(surface.state()["removed"]) == 1, 8)
-        assert command(surface.mock, "AuthorizeService hfp") == "rejected"
-        assert command(surface.mock, "AuthorizeService") == "rejected"
-        wait(lambda: command(surface.receiver, "pending-revocations") == "0", 8)
-        assert surface.phone() == 0, "an approval whose commit failed stayed"
-        assert not peer_in(directory, "managed-bonds") and not peer_in(directory, "pending-removals")
-        assert command(surface.receiver, "reconnect") != "0"
-        print("PASS commit_failure_retracts_approval_and_removes_bond", flush=True)
+        assert not peer_in(directory, "managed-bonds") and peer_in(directory, "revoked-bonds")
+        wait(lambda: not peer_in(directory, "pending-removals"))
+        command(surface.mock, "restore")
+        command(surface.mock, "unpaired")
+        enrol(surface, directory)
+        assert surface.phone() != 0
+        assert command(surface.receiver, "reconnect") == "0"
+        print("PASS forget_with_helper_down_then_receiver_restart_removes_bond_and_allows_reenrolment", flush=True)
 
 
 def forget_then_reenrol(build: Path, directory: Path, failure: str) -> None:
@@ -199,7 +298,9 @@ def forget_then_reenrol(build: Path, directory: Path, failure: str) -> None:
             surface.cancel(request)
         wait(lambda: len(surface.state()["removed"]) == 2, 5)
         wait(lambda: not peer_in(directory, "pending-removals"))
-        assert not peer_in(directory, "managed-bonds") and peer_in(directory, "revoked-bonds")
+        # The new enrolment cleared the history (its journal entry held the authority meanwhile), so
+        # an approval of this identity found on revoked-bonds is never one committed after it.
+        assert not peer_in(directory, "managed-bonds") and not peer_in(directory, "revoked-bonds")
         assert surface.phone() == 0
         assert command(surface.mock, "AuthorizeService hfp") == "rejected"
         print(f"PASS forget_then_reenrol_{failure}_removes_the_new_bond", flush=True)
@@ -249,7 +350,17 @@ if __name__ == "__main__":
             forget_then_reenrol(build, directory, failure)
         directory = Path(temporary) / "commit-failure"
         directory.mkdir(mode=0o700)
-        commit_failure_retracts_approval(build, directory)
+        commit_failure_keeps_approval(build, directory)
+        for helper_restart in (False, True):
+            directory = Path(temporary) / f"exit-before-commit-{helper_restart}"
+            directory.mkdir(mode=0o700)
+            receiver_exit_before_commit(build, directory, helper_restart)
+        directory = Path(temporary) / "helper-exit-between-writes"
+        directory.mkdir(mode=0o700)
+        helper_exit_between_commit_writes(build, directory)
+        directory = Path(temporary) / "forget-helper-down"
+        directory.mkdir(mode=0o700)
+        forget_with_helper_down_then_receiver_restart(build, directory)
         for removal_fails in (False, True):
             directory = Path(temporary) / f"store-write-{removal_fails}"
             directory.mkdir(mode=0o700)

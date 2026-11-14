@@ -300,6 +300,18 @@ struct MockBluez {
     }
 };
 
+std::string file_text(const std::string& path) {
+    std::ifstream in{path}; return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+std::size_t removals(MockBluez& mock) {
+    const auto state = mock.command("state");
+    const auto at = state.find("\"removed\": [");
+    if (at == std::string::npos) return 0;
+    const auto end = state.find(']', at);
+    std::size_t count = 0;
+    for (auto i = state.find("dev_", at); i != std::string::npos && i < end; i = state.find("dev_", i + 1)) ++count;
+    return count;
+}
 // Drives the enrolment up to, but not including, the acknowledgement: authorize, the helper's
 // one-time numeric comparison explicitly accepted, the exact bond verified. acknowledge_bond()
 // only makes the bond provisional (no write); commit_bond() is the only call that admits it into
@@ -348,6 +360,7 @@ TEST_F(ManagedBonds, DirFsyncFailureAtCommitRefusesAdmissionRemovesBondAndKeepsR
         helper::BluezBackend backend{bus_address, [] { return std::chrono::steady_clock::now(); }, dir1, ::getuid()};
         ASSERT_TRUE(backend.available());
         ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+        ASSERT_TRUE(backend.reconcile_bonds({}));
         ASSERT_EQ(mock.command("paired"), "ok");
 
         const auto first = backend.observe();
@@ -361,7 +374,13 @@ TEST_F(ManagedBonds, DirFsyncFailureAtCommitRefusesAdmissionRemovesBondAndKeepsR
             const auto auth = backend.commit_bond();
             ASSERT_FALSE(auth);
             EXPECT_EQ(auth.error().code(), ErrorCode::helper_rejected);
-            // The failed commit closed the window; cleanup removed the never-admitted bond.
+        }
+        {
+            // The failed commit closed the window and parked the bond: the receiver's approval may be
+            // durable, so nothing removes it before the receiver's reconciliation answers.
+            EXPECT_EQ(removals(mock), 0U) << "a parked bond was removed before the receiver answered";
+            // The receiver retracted (or never wrote) its approval: reconciliation removes the bond.
+            ASSERT_TRUE(backend.reconcile_bonds({}));
             EXPECT_NE(mock.command("state").find("/org/bluez/hci0/dev_02_00_00_00_00_01"), std::string::npos)
                 << "a bond whose commit failed was not removed";
             ASSERT_EQ(mock.command("restore"), "ok");
@@ -387,6 +406,7 @@ TEST_F(ManagedBonds, DirFsyncFailureAtCommitRefusesAdmissionRemovesBondAndKeepsR
             helper::BluezBackend backend{bus_address, [] { return std::chrono::steady_clock::now(); }, dir2, ::getuid()};
             ASSERT_TRUE(backend.available());
             ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+            ASSERT_TRUE(backend.reconcile_bonds({}));
 
             const auto first = backend.observe();
             ASSERT_TRUE(first);
@@ -418,13 +438,20 @@ TEST_F(ManagedBonds, DirFsyncFailureAtCommitRefusesAdmissionRemovesBondAndKeepsR
                 << "a later directory fsync must not admit the bond whose commit failed";
         }
 
-        // Across a helper restart with a working directory sync, committed entries loaded from disk are admitted.
+        // Across a helper restart with a working directory sync, committed entries loaded from disk are
+        // admitted once the receiver's reconciliation (approving only the committed peer) answered.
         helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, dir2, ::getuid()};
         ASSERT_TRUE(restarted.available());
         ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
         const auto first_restart = restarted.observe();
         ASSERT_TRUE(first_restart);
         EXPECT_FALSE(restarted.reconnect_peer(first_restart.value().handle));
+        ASSERT_TRUE(restarted.reconcile_bonds({secondary}));
+        // The failed commit's remnant is not approved: reconciliation demoted it and removed its bond.
+        EXPECT_EQ(file_text(dir2 + "/managed-bonds").find("02:00:00:00:00:01"), std::string::npos);
+        EXPECT_NE(file_text(dir2 + "/revoked-bonds").find("02:00:00:00:00:01"), std::string::npos);
+        ASSERT_EQ(mock.command("restore"), "ok");  // the mock models one present device at a time
+        ASSERT_EQ(mock.command("paired"), "ok");
         ASSERT_EQ(mock.command("observe-other"), "ok");
         const auto after_restart = restarted.observe();
         ASSERT_TRUE(after_restart);
@@ -465,6 +492,7 @@ TEST_F(ManagedBonds, RestartWithFailingDirFsyncKeepsRevocationRefusesAdmissionAn
             helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid()};
             ASSERT_TRUE(initial.available());
             ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+            ASSERT_TRUE(initial.reconcile_bonds({}));
             const auto obs = initial.observe();
             ASSERT_TRUE(obs);
             accept_enrolment(initial, mock, obs.value().handle);
@@ -476,13 +504,15 @@ TEST_F(ManagedBonds, RestartWithFailingDirFsyncKeepsRevocationRefusesAdmissionAn
         helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid()};
         ASSERT_TRUE(restarted.available());
         ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+        EXPECT_FALSE(restarted.reconcile_bonds({primary})) << "reconciled although the managed entry is not durable";
         const auto reconn_obs = restarted.observe();
         ASSERT_TRUE(reconn_obs);
         const auto reconn = restarted.reconnect_peer(reconn_obs.value().handle);
         EXPECT_FALSE(reconn) << "reconnect after restart must be refused while directory fsync fails";
         if (!reconn) { EXPECT_EQ(reconn.error().code(), ErrorCode::helper_rejected); }
 
-        EXPECT_TRUE(restarted.revoke_peer(primary)) << "revocation must still work when durability is unconfirmed";
+        // Finding 4: the bond is removed, but a demotion that is not durable is never reported as done.
+        EXPECT_FALSE(restarted.revoke_peer(primary)) << "revocation reported success with an unconfirmed demotion";
         EXPECT_NE(mock.command("state").find("/org/bluez/hci0/dev_02_00_00_00_00_01"), std::string::npos);
     }
 }
@@ -521,6 +551,7 @@ TEST_F(ManagedBonds, RestartWithFailingDirFsyncAllowsReconnectOnceSyncSucceeds) 
             helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid()};
             ASSERT_TRUE(initial.available());
             ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+            ASSERT_TRUE(initial.reconcile_bonds({}));
             const auto obs = initial.observe();
             ASSERT_TRUE(obs);
             accept_enrolment(initial, mock, obs.value().handle);
@@ -535,6 +566,7 @@ TEST_F(ManagedBonds, RestartWithFailingDirFsyncAllowsReconnectOnceSyncSucceeds) 
             bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid());
         ASSERT_TRUE(restarted->available());
         ASSERT_TRUE(restarted->apply(helper::Action::register_profile, 0));
+        EXPECT_FALSE(restarted->reconcile_bonds({{"02:00:00:00:00:01", "02:00:00:00:00:AA"}}));
         const auto refused_obs = restarted->observe();
         ASSERT_TRUE(refused_obs);
         const auto refused = restarted->reconnect_peer(refused_obs.value().handle);
@@ -542,6 +574,8 @@ TEST_F(ManagedBonds, RestartWithFailingDirFsyncAllowsReconnectOnceSyncSucceeds) 
         if (!refused) { EXPECT_EQ(refused.error().code(), ErrorCode::helper_rejected); }
     }
 
+    // The receiver retries its reconciliation; with the sync working it confirms durability.
+    ASSERT_TRUE(restarted->reconcile_bonds({{"02:00:00:00:00:01", "02:00:00:00:00:AA"}}));
     const auto allowed_obs = restarted->observe();
     ASSERT_TRUE(allowed_obs);
     EXPECT_TRUE(restarted->reconnect_peer(allowed_obs.value().handle))
@@ -560,6 +594,7 @@ TEST_F(ManagedBonds, NormalRestartAfterSuccessfulSyncAdmitsLoadedEntries) {
         helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid()};
         ASSERT_TRUE(initial.available());
         ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+        ASSERT_TRUE(initial.reconcile_bonds({}));
         const auto obs = initial.observe();
         ASSERT_TRUE(obs);
         accept_enrolment(initial, mock, obs.value().handle);
@@ -576,23 +611,15 @@ TEST_F(ManagedBonds, NormalRestartAfterSuccessfulSyncAdmitsLoadedEntries) {
     helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid()};
     ASSERT_TRUE(restarted.available());
     ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+    const auto early = restarted.observe();
+    ASSERT_TRUE(early);
+    EXPECT_FALSE(restarted.reconnect_peer(early.value().handle)) << "admitted before the first reconciliation";
+    ASSERT_TRUE(restarted.reconcile_bonds({primary}));
     const auto reconn_obs = restarted.observe();
     ASSERT_TRUE(reconn_obs);
     EXPECT_TRUE(restarted.reconnect_peer(reconn_obs.value().handle));
 }
 
-std::string file_text(const std::string& path) {
-    std::ifstream in{path}; return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
-}
-std::size_t removals(MockBluez& mock) {
-    const auto state = mock.command("state");
-    const auto at = state.find("\"removed\": [");
-    if (at == std::string::npos) return 0;
-    const auto end = state.find(']', at);
-    std::size_t count = 0;
-    for (auto i = state.find("dev_", at); i != std::string::npos && i < end; i = state.find("dev_", i + 1)) ++count;
-    return count;
-}
 // Finding B: revocation demotes the admitted bond to history. A fresh enrolment of the same
 // adapter/address that is then rejected must have its new bond removed, and the journal entry
 // must leave only after that removal.
@@ -605,6 +632,7 @@ TEST_F(ManagedBonds, RevokedHistoryNeverSuppressesCleanupOfARejectedReEnrolment)
     helper::BluezBackend backend{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
     ASSERT_TRUE(backend.available());
     ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+    ASSERT_TRUE(backend.reconcile_bonds({}));
     const auto first = backend.observe();
     ASSERT_TRUE(first);
     accept_enrolment(backend, mock, first.value().handle);
@@ -631,42 +659,202 @@ TEST_F(ManagedBonds, RevokedHistoryNeverSuppressesCleanupOfARejectedReEnrolment)
     ASSERT_TRUE(reconnect);
     EXPECT_FALSE(backend.reconnect_peer(reconnect.value().handle)) << "history admitted the new bond";
     ASSERT_TRUE(backend.apply(helper::Action::close_pairing, 0));
+    EXPECT_EQ(removals(mock), 1U) << "the acknowledged bond was removed before the receiver answered";
+    ASSERT_TRUE(backend.reconcile_bonds({}));  // the receiver approves nothing
     EXPECT_EQ(removals(mock), 2U) << "the rejected re-enrolment's bond was kept";
     EXPECT_EQ(file_text(directory + "/pending-removals").find(address), std::string::npos) << "journal entry kept after removal";
     EXPECT_EQ(file_text(directory + "/managed-bonds").find(address), std::string::npos);
     // A retried revocation of the removed bond still completes.
     EXPECT_TRUE(backend.revoke_peer(primary));
 }
-// Finding A at the helper boundary: a provisional bond (acknowledged, never committed) survives
-// neither receiver loss nor a helper restart. The journal entry is its durable cleanup obligation.
-TEST_F(ManagedBonds, HelperRestartRemovesAProvisionalBondWhoseCommitNeverArrived) {
+// Restart before reconciliation: an acknowledged bond whose commit never arrived is neither
+// admitted nor removed until the receiver answers; the answer alone decides (finding 1).
+class ProvisionalRestart : public ManagedBonds, public testing::WithParamInterface<bool> {};
+TEST_P(ProvisionalRestart, ReceiverAnswerDecidesAProvisionalBondAfterHelperRestart) {
+    const bool approved = GetParam();
     const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
     ASSERT_NE(bus_address, nullptr);
     MockBluez mock{bus_address};
+    const helper::PeerIdentity primary{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
     {
         helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
         ASSERT_TRUE(initial.available());
         ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+        ASSERT_TRUE(initial.reconcile_bonds({}));
         const auto obs = initial.observe();
         ASSERT_TRUE(obs);
         accept_enrolment(initial, mock, obs.value().handle);
         if (HasFatalFailure()) return;
         ASSERT_TRUE(initial.acknowledge_bond());
-        ASSERT_EQ(mock.command("fail-remove"), "ok");  // the helper exits before it can remove the bond
+        // Receiver loss (or its crash after the durable trust write, before the commit).
         ASSERT_TRUE(initial.apply(helper::Action::close_pairing, 0));
+        EXPECT_EQ(removals(mock), 0U) << "an acknowledged bond was removed before the receiver answered";
     }
-    EXPECT_EQ(removals(mock), 0U);
     EXPECT_FALSE(std::filesystem::exists(directory + "/managed-bonds")) << "a provisional bond was admitted";
     EXPECT_NE(file_text(directory + "/pending-removals").find("02:00:00:00:00:01"), std::string::npos);
-    ASSERT_EQ(mock.command("allow-remove"), "ok");
     helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
     ASSERT_TRUE(restarted.available());
     ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
-    for (int attempt = 0; attempt < 100 && removals(mock) == 0; ++attempt) {
+    for (int attempt = 0; attempt < 15; ++attempt) {
         restarted.tick(); std::this_thread::sleep_for(std::chrono::milliseconds{20});
     }
-    EXPECT_EQ(removals(mock), 1U) << "the restarted helper kept a bond whose commit never arrived";
+    EXPECT_EQ(removals(mock), 0U) << "cleanup removed a bond before the first reconciliation";
+    const auto early = restarted.observe();
+    ASSERT_TRUE(early);
+    EXPECT_FALSE(restarted.reconnect_peer(early.value().handle)) << "admitted before the first reconciliation";
+    EXPECT_FALSE(restarted.authorize(early.value().handle)) << "an enrolment opened before the first reconciliation";
+    const auto answer = approved ? restarted.reconcile_bonds({primary}) : restarted.reconcile_bonds({});
+    ASSERT_TRUE(answer);
+    EXPECT_EQ(answer.value(), 0U);
+    if (approved) {
+        // Crash window 1: the trust write landed, the commit did not. The approval is kept and the
+        // bond admitted.
+        EXPECT_EQ(removals(mock), 0U);
+        EXPECT_NE(file_text(directory + "/managed-bonds").find("02:00:00:00:00:01"), std::string::npos);
+        EXPECT_EQ(file_text(directory + "/pending-removals").find("02:00:00:00:00:01"), std::string::npos);
+        const auto obs = restarted.observe();
+        ASSERT_TRUE(obs);
+        EXPECT_TRUE(restarted.reconnect_peer(obs.value().handle)) << "the approved bond was not admitted";
+    } else {
+        EXPECT_EQ(removals(mock), 1U) << "the restarted helper kept a bond the receiver never approved";
+        EXPECT_EQ(file_text(directory + "/pending-removals").find("02:00:00:00:00:01"), std::string::npos);
+        EXPECT_FALSE(std::filesystem::exists(directory + "/managed-bonds") &&
+                     file_text(directory + "/managed-bonds").find("02:00:00:00:00:01") != std::string::npos);
+    }
+}
+INSTANTIATE_TEST_SUITE_P(Answer, ProvisionalRestart, testing::Bool());
+// Crash window 2: the helper received the commit, durably wrote managed-bonds and stopped before the
+// journal entry was durably removed. The restarted helper admits nothing until the receiver's
+// reconciliation, which (the phone approved) completes the commit and never removes the bond.
+TEST_F(ManagedBonds, CommitInterruptedBetweenItsTwoWritesHealsOnReconciliation) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    const helper::PeerIdentity primary{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
+    {
+        helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
+        ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+        ASSERT_TRUE(initial.reconcile_bonds({}));
+        const auto obs = initial.observe();
+        ASSERT_TRUE(obs);
+        accept_enrolment(initial, mock, obs.value().handle);
+        if (HasFatalFailure()) return;
+        ASSERT_TRUE(admit(initial));
+    }
+    // The durable outcome of a crash between the managed write and the journal removal.
+    {
+        std::ofstream journal{directory + "/pending-removals", std::ios::trunc};
+        journal << "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n";
+    }
+    ASSERT_EQ(::chmod((directory + "/pending-removals").c_str(), 0600), 0);
+    helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
+    ASSERT_TRUE(restarted.available());
+    ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+    for (int attempt = 0; attempt < 15; ++attempt) {
+        restarted.tick(); std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    }
+    EXPECT_EQ(removals(mock), 0U) << "restart cleanup removed an approved bond";
+    const auto early = restarted.observe();
+    ASSERT_TRUE(early);
+    EXPECT_FALSE(restarted.reconnect_peer(early.value().handle));
+    ASSERT_TRUE(restarted.reconcile_bonds({primary}));
+    EXPECT_EQ(removals(mock), 0U);
     EXPECT_EQ(file_text(directory + "/pending-removals").find("02:00:00:00:00:01"), std::string::npos);
+    const auto obs = restarted.observe();
+    ASSERT_TRUE(obs);
+    EXPECT_TRUE(restarted.reconnect_peer(obs.value().handle)) << "the committed bond was not admitted";
+}
+// Finding 4: a demotion whose writes are not durable is reported as failed, and a power loss that
+// drops its unsynced renames (simulated by restoring the files the renames replaced) cannot
+// resurrect the admission: the restarted helper admits nothing until reconciliation, which demotes
+// again, and only reports success once that demotion is durable.
+TEST_F(ManagedBonds, UnconfirmedDemotionSurvivesPowerLossWithoutResurrectingAdmission) {
+    using namespace trust::test::faults;
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    const helper::PeerIdentity primary{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
+    std::string managed_before, revoked_before;
+    {
+        helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
+        ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+        ASSERT_TRUE(initial.reconcile_bonds({}));
+        const auto obs = initial.observe();
+        ASSERT_TRUE(obs);
+        accept_enrolment(initial, mock, obs.value().handle);
+        if (HasFatalFailure()) return;
+        ASSERT_TRUE(admit(initial));
+        ASSERT_TRUE(initial.apply(helper::Action::close_pairing, 0));
+        managed_before = file_text(directory + "/managed-bonds");
+        revoked_before = std::filesystem::exists(directory + "/revoked-bonds") ? file_text(directory + "/revoked-bonds") : "";
+        ScopedFault fail{Fault::dir_fsync};
+        EXPECT_FALSE(initial.revoke_peer(primary)) << "a demotion without a confirmed directory sync reported success";
+        const auto after = initial.observe();
+        if (after) { EXPECT_FALSE(initial.reconnect_peer(after.value().handle)); }
+    }
+    // Power loss: the unsynced renames are lost.
+    {
+        std::ofstream{directory + "/managed-bonds", std::ios::trunc} << managed_before;
+        if (revoked_before.empty()) std::filesystem::remove(directory + "/revoked-bonds");
+        else std::ofstream{directory + "/revoked-bonds", std::ios::trunc} << revoked_before;
+    }
+    ASSERT_NE(file_text(directory + "/managed-bonds").find("02:00:00:00:00:01"), std::string::npos);
+    ASSERT_EQ(mock.command("restore"), "ok");
+    ASSERT_EQ(mock.command("paired"), "ok");
+    ScopedFault fail{Fault::dir_fsync};
+    helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
+    ASSERT_TRUE(restarted.available());
+    ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+    const auto early = restarted.observe();
+    ASSERT_TRUE(early);
+    EXPECT_FALSE(restarted.reconnect_peer(early.value().handle)) << "power loss resurrected the admission";
+    // The receiver's store no longer approves the phone; the demotion still cannot be made durable.
+    EXPECT_FALSE(restarted.reconcile_bonds({}));
+    const auto still = restarted.observe();
+    if (still) { EXPECT_FALSE(restarted.reconnect_peer(still.value().handle)) << "a failed demotion admitted the bond"; }
+    disarm();
+    ASSERT_TRUE(restarted.reconcile_bonds({}));
+    EXPECT_EQ(file_text(directory + "/managed-bonds").find("02:00:00:00:00:01"), std::string::npos);
+    EXPECT_NE(file_text(directory + "/revoked-bonds").find("02:00:00:00:00:01"), std::string::npos);
+}
+// The revocation outranks an approval that was never committed after it (a resurrected or stale
+// approval): the bond is not admitted, and it is not removed either (#74, it is approved).
+TEST_F(ManagedBonds, ApprovalOfARevokedBondIsNotAdmittedAndNotRemoved) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    const helper::PeerIdentity primary{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
+    {
+        std::ofstream{directory + "/revoked-bonds"} << "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n";
+    }
+    ASSERT_EQ(::chmod((directory + "/revoked-bonds").c_str(), 0600), 0);
+    ASSERT_EQ(mock.command("paired"), "ok");
+    helper::BluezBackend backend{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
+    ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+    const auto answer = backend.reconcile_bonds({primary});
+    ASSERT_TRUE(answer);
+    EXPECT_EQ(answer.value(), 1U) << "the refused approval was not reported";
+    const auto obs = backend.observe();
+    ASSERT_TRUE(obs);
+    EXPECT_FALSE(backend.reconnect_peer(obs.value().handle));
+    EXPECT_EQ(removals(mock), 0U);
+}
+TEST_F(ManagedBonds, ReconciliationRefusesMalformedOrOversizedSets) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    helper::BluezBackend backend{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
+    ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+    EXPECT_FALSE(backend.reconcile_bonds({{"not-an-address", "02:00:00:00:00:AA"}}));
+    std::vector<helper::PeerIdentity> oversized;
+    for (int i = 0; i < 257; ++i) {
+        char address[18]; std::snprintf(address, sizeof address, "02:00:00:00:%02X:%02X", i / 256, i % 256);
+        oversized.push_back({address, "02:00:00:00:00:AA"});
+    }
+    EXPECT_FALSE(backend.reconcile_bonds(oversized));
+    const auto obs = backend.observe();
+    ASSERT_TRUE(obs);
+    EXPECT_FALSE(backend.authorize(obs.value().handle)) << "a refused reconciliation counted";
 }
 TEST_F(ManagedBonds, RevokedHistoryEvictsItsOldestEntryWhenFull) {
     ManagedPeers history{directory, ::getuid(), "revoked-bonds"};

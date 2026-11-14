@@ -189,9 +189,14 @@ public:
                 G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION), nullptr, nullptr, nullptr);
             if (!bus_) { ready.set_value(false); return; }
             g_dbus_connection_set_exit_on_close(bus_, FALSE);
+            // Event-driven: wait for the bus daemon's answer (default call timeout) rather than a
+            // 500 ms wall-clock bound that a loaded, parallel test host can miss. Ready only once the
+            // name is really owned, so no client can race a missing NetworkManager.
             auto* reply = g_dbus_connection_call_sync(bus_, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-                "RequestName", g_variant_new("(su)", manager, 4U), G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, 500, nullptr, nullptr);
-            if (reply) g_variant_unref(reply);
+                "RequestName", g_variant_new("(su)", manager, 4U), G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, -1, nullptr, nullptr);
+            guint32 owned{};
+            if (reply) { g_variant_get(reply, "(u)", &owned); g_variant_unref(reply); }
+            if (owned != 1U) { ready.set_value(false); return; }
             auto* node = g_dbus_node_info_new_for_xml(xml, nullptr);
             const GDBusInterfaceVTable vtable{method, property, nullptr, {nullptr}};
             const char* paths[]{root, dev, active, profile};
@@ -684,13 +689,18 @@ TEST_F(NmDaemon, ComposedReplacementInSameAdmissionNeedsFreshHandleAuthorization
 void seed_managed_phone(const std::filesystem::path& directory) {
     save(directory / "managed-bonds", "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n");
 }
+// The receiver's start-up reconciliation: its trust store approves the seeded phone.
+const std::vector<PeerIdentity> kSeededApproval{{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
 TEST_F(NmDaemon, ExpiredHandoffRejectsOnUseWithoutPlatformTick) {
     seed_managed_phone(directory);
     const auto began = Clock::now(); std::atomic<std::int64_t> elapsed{};
     BluezBackend bluetooth{address, [&] { return began + std::chrono::milliseconds{elapsed.load()}; }, directory.string(), ::getuid()};
     ASSERT_TRUE(bluetooth.apply(Action::register_profile, 0));
     ASSERT_EQ(bluez.command("paired"), "ok"); const auto observed = bluetooth.observe(); ASSERT_TRUE(observed);
-    ASSERT_TRUE(bluetooth.reconnect_peer(observed.value().handle));
+    EXPECT_FALSE(bluetooth.reconnect_peer(observed.value().handle)) << "admitted before the first reconciliation";
+    ASSERT_TRUE(bluetooth.reconcile_bonds(kSeededApproval));
+    const auto reconciled = bluetooth.observe(); ASSERT_TRUE(reconciled);
+    ASSERT_TRUE(bluetooth.reconnect_peer(reconciled.value().handle));
     auto incoming = std::async(std::launch::async, [&] { return bluez.command("NewConnection"); });
     ASSERT_TRUE(eventually([&] { bluetooth.tick(); return incoming.wait_for(0ms) == std::future_status::ready; }));
     ASSERT_EQ(incoming.get(), "allowed"); ASSERT_TRUE(bluetooth.handoff());
@@ -751,7 +761,10 @@ TEST_F(NmDaemon, AcceptedBootstrapOutlivesAdmissionButNotItsOwnTenSeconds) {
     BluezBackend bluetooth{address, [&] { return began + std::chrono::milliseconds{elapsed.load()}; }, directory.string(), ::getuid()};
     ASSERT_TRUE(bluetooth.apply(Action::register_profile, 0));
     ASSERT_EQ(bluez.command("paired"), "ok"); const auto observed = bluetooth.observe(); ASSERT_TRUE(observed);
-    ASSERT_TRUE(bluetooth.reconnect_peer(observed.value().handle));
+    EXPECT_FALSE(bluetooth.reconnect_peer(observed.value().handle)) << "admitted before the first reconciliation";
+    ASSERT_TRUE(bluetooth.reconcile_bonds(kSeededApproval));
+    const auto reconciled = bluetooth.observe(); ASSERT_TRUE(reconciled);
+    ASSERT_TRUE(bluetooth.reconnect_peer(reconciled.value().handle));
     elapsed = 59000;
     auto incoming = std::async(std::launch::async, [&] { return bluez.command("NewConnection"); });
     ASSERT_TRUE(eventually([&] { bluetooth.tick(); return incoming.wait_for(0ms) == std::future_status::ready; }));
@@ -934,7 +947,7 @@ TEST_F(NmDaemon, ProvisionalBondGetsNoServicesOrReconnectUntilCommitted) {
     EXPECT_EQ(bluez.command("NewConnection"), "allowed");
     EXPECT_FALSE(client->bond_committed(consumer, request)) << "a commit is consumed once";
 }
-TEST_F(NmDaemon, ProvisionalBondCannotReconnectAndIsRemovedWhenTheWindowCloses) {
+TEST_F(NmDaemon, ProvisionalBondCannotReconnectAndIsRemovedByReconciliation) {
     start();
     const core::ConsumerId consumer{1}; const core::PairingRequestId request{1};
     ASSERT_TRUE(client->prepare(consumer, request)); ASSERT_TRUE(client->confirmed(consumer, request));
@@ -944,12 +957,18 @@ TEST_F(NmDaemon, ProvisionalBondCannotReconnectAndIsRemovedWhenTheWindowCloses) 
     EXPECT_FALSE(client->reconnect(identity)) << "a provisional bond reconnected";
     EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected");
     (void)client->cancel(consumer, request);
+    // Parked: the receiver's approval might already be durable, so only its answer removes it.
+    std::this_thread::sleep_for(300ms);
+    EXPECT_NE(bluez.command("state").find("\"removed\": []"), std::string::npos) << "a parked bond was removed unasked";
+    EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected");
+    ASSERT_TRUE(client->reconcile_bonds(BusClient::approved_bonds(*store), true));
     ASSERT_TRUE(eventually([&] { return bluez.command("state").find("\"removed\": []") == std::string::npos; }))
         << "the provisional bond was not removed";
     EXPECT_FALSE(client->reconnect(identity));
 }
-// A journal replacement that fails at the commit leaves the bond unadmitted: the commit fails
-// (the receiver then retracts its approval), services stay refused and cleanup removes the bond.
+// A journal replacement that fails at the commit leaves the bond unadmitted: the commit fails,
+// services stay refused, and the receiver's reconciliation (its store does not approve the phone)
+// demotes and removes the bond.
 TEST_F(NmDaemon, JournalReplacementFailureAtCommitRefusesAdmissionAndCleanupRemovesBond) {
     start();
     constexpr std::uint64_t generation = 1;
@@ -964,6 +983,9 @@ TEST_F(NmDaemon, JournalReplacementFailureAtCommitRefusesAdmissionAndCleanupRemo
     EXPECT_FALSE(client->bond_committed(consumer, request)) << "committed although the journal entry is not durably gone";
     EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected");
     EXPECT_EQ(bluez.command("NewConnection"), "rejected");
+    // The store does not approve the phone: reconciliation demotes it (the journal entry the failed
+    // rewrite left in place is its removal obligation) and removes the bond.
+    EXPECT_TRUE(client->reconcile_bonds(BusClient::approved_bonds(*store), true));
     ASSERT_TRUE(eventually([&] { return bluez.command("state").find("\"removed\": []") == std::string::npos; }))
         << "cleanup kept a bond that was never admitted";
     EXPECT_EQ(read_text(directory / "managed-bonds").find("02:00:00:00:00:01"), std::string::npos)
