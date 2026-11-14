@@ -244,6 +244,8 @@ namespace {
 
 [[nodiscard]] aa::audio::RouterConfig pcm_router_config() {
     aa::audio::RouterConfig config;
+    // Uses pulsesink: the only supported production real-time route (pipewiresink is refused, #80).
+    config.backend = aa::audio::SinkBackend::pulse;
     config.output_format = stereo_48k();
     for (auto& role : config.roles) {
         role.codec = aa::audio::Codec::pcm;
@@ -533,6 +535,9 @@ TEST_F(AudioPipelineRoute, RenderBarrierDistinguishesIngressFromRenderCompletion
 }
 
 namespace aa::audio::detail {
+[[nodiscard]] SinkOpenOutcome open_native_sink_for_test(const SinkOpenRequest& request);
+[[nodiscard]] core::Result<AudioRouter> open_router_with_native_sink_for_test(
+    const RouterConfig& config);
 [[nodiscard]] bool start_foreign_sink_traffic(std::uint32_t buffers);
 void stop_foreign_sink_traffic() noexcept;
 [[nodiscard]] std::uint64_t handoff_events_seen() noexcept;
@@ -661,6 +666,8 @@ TEST_F(AudioPipelineRoute, BackpressureTimeoutDegradesAndRefusesFurtherSubmit) {
     // the router degrades with the cause recording the timeout, and every
     // later submit is refused.
     aa::audio::detail::SinkOpenRequest request;
+    // Uses pulsesink: the only supported production real-time route (#80).
+    request.backend = aa::audio::SinkBackend::pulse;
     request.format = stereo_48k();
     request.start_timeout = aa::core::Milliseconds{2000};
     request.write_timeout = aa::core::Milliseconds{200};
@@ -716,7 +723,7 @@ TEST_F(AudioPipelineRoute, MissingDefaultOutputDegradesTypedWithRecordedCause) {
     auto config = pcm_router_config();
     config.backend = aa::audio::SinkBackend::pipewire;
     config.sink_remote = "aa-task25-no-such-output";
-    auto router = aa::audio::AudioRouter::open(config);
+    auto router = aa::audio::detail::open_router_with_native_sink_for_test(config);
     ASSERT_TRUE(router.has_value());
 
     EXPECT_EQ(router.value().state(), aa::audio::RouterState::degraded);
@@ -1287,7 +1294,7 @@ TEST_P(AudioPipelineSinkLogging, PreservesUserThresholdsWithRealHandoff) {
             std::lock_guard lock(mutex);
             latest = value;
         };
-        auto opened = aa::audio::detail::open_default_sink(request);
+        auto opened = aa::audio::detail::open_native_sink_for_test(request);
         ASSERT_TRUE(opened.sink) << opened.report.cause;
         const auto pcm = constant_pcm({kMediaLevel, 960});
         ASSERT_TRUE(opened.sink->write({stereo_48k(), now_ns(), pcm}));
@@ -1407,7 +1414,7 @@ TEST_F(AudioPipelineRoute, IsolatedBackendWithoutSinksNeverOpensActive) {
 
     auto config = pcm_router_config();
     config.backend = aa::audio::SinkBackend::pipewire;
-    auto router = aa::audio::AudioRouter::open(config);
+    auto router = aa::audio::detail::open_router_with_native_sink_for_test(config);
     ASSERT_TRUE(router.has_value());
 
     EXPECT_EQ(router.value().state(), aa::audio::RouterState::degraded);
@@ -1442,7 +1449,7 @@ TEST_F(AudioPipelineRoute, DaemonKillMidStreamDegradesTypedWithRecordedCause) {
 
     auto config = pcm_router_config();
     config.backend = aa::audio::SinkBackend::pipewire;
-    auto router = aa::audio::AudioRouter::open(config);
+    auto router = aa::audio::detail::open_router_with_native_sink_for_test(config);
     ASSERT_TRUE(router.has_value());
     ASSERT_EQ(router.value().state(), aa::audio::RouterState::active);
 
@@ -1528,7 +1535,7 @@ TEST_F(AudioPipelineRoute, OutputLossMidStreamDegradesTypedWithRecordedCause) {
 
     auto config = pcm_router_config();
     config.backend = aa::audio::SinkBackend::pipewire;
-    auto lost = aa::audio::AudioRouter::open(config);
+    auto lost = aa::audio::detail::open_router_with_native_sink_for_test(config);
     ASSERT_TRUE(lost.has_value());
     ASSERT_EQ(lost.value().state(), aa::audio::RouterState::active);
 
@@ -1884,6 +1891,109 @@ TEST(AudioPipelineSinkBackend, MissingPipeWireElementsRecordDisabledCause) {
     }
 }
 
+// #80 production policy: these tests need no audio daemon. pipewiresink is
+// refused outright (no rate control on PipeWire 1.0.5 / Ubuntu noble);
+// pulsesink is the default and only supported real-time route.
+TEST(AudioPipelineSinkPolicy, DefaultAndPulseRoutesSelectPulseSinkAndRefusePipeWire) {
+    EXPECT_EQ(aa::audio::RouterConfig{}.backend, aa::audio::SinkBackend::automatic);
+    EXPECT_EQ(aa::audio::detail::SinkOpenRequest{}.backend, aa::audio::SinkBackend::automatic);
+
+    aa::audio::SinkReport report;
+    report.candidates = {{"pipewiresink", true, true, true, "READY"},
+                         {"pulsesink", true, true, true, "READY"}};
+    const auto native = aa::audio::select_sink_backend(report, aa::audio::SinkBackend::pipewire);
+    EXPECT_FALSE(native.usable);
+    EXPECT_TRUE(native.element.empty());
+    EXPECT_NE(native.cause.find("pipewiresink_unsupported"), std::string::npos);
+    EXPECT_NE(native.cause.find("pipewiresink"), std::string::npos);
+    EXPECT_NE(native.cause.find("pulsesink"), std::string::npos);
+    EXPECT_EQ(native.cause.find("unverified"), std::string::npos);
+
+    const auto automatic = aa::audio::select_sink_backend(report, aa::audio::SinkBackend::automatic);
+    EXPECT_TRUE(automatic.usable);
+    EXPECT_EQ(automatic.element, "pulsesink");
+    EXPECT_NE(automatic.cause.find("pipewiresink_unsupported"), std::string::npos);
+    EXPECT_EQ(automatic.cause.find("unverified"), std::string::npos);
+
+    const auto pulse = aa::audio::select_sink_backend(report, aa::audio::SinkBackend::pulse);
+    EXPECT_TRUE(pulse.usable);
+    EXPECT_EQ(pulse.element, "pulsesink");
+}
+
+TEST(AudioPipelineSinkPolicy, NativeOnlyHostNeverFallsBackSilentlyToPipewireSink) {
+    aa::audio::SinkReport report;
+    report.candidates = {{"pipewiresink", true, true, true, "READY"},
+                         {"pulsesink", true, false, false, "absent"}};
+    for (const auto backend :
+         {aa::audio::SinkBackend::automatic, aa::audio::SinkBackend::pipewire,
+          aa::audio::SinkBackend::pulse}) {
+        const auto selection = aa::audio::select_sink_backend(report, backend);
+        EXPECT_FALSE(selection.usable);
+        EXPECT_TRUE(selection.element.empty());
+        EXPECT_NE(selection.cause.find("pulsesink"), std::string::npos);
+        EXPECT_EQ(selection.cause.find("unverified"), std::string::npos);
+    }
+    const auto automatic = aa::audio::select_sink_backend(report, aa::audio::SinkBackend::automatic);
+    EXPECT_NE(automatic.cause.find("pipewiresink_unsupported"), std::string::npos);
+    EXPECT_NE(automatic.cause.find("pulsesink absent"), std::string::npos);
+}
+
+TEST(AudioPipelineSinkPolicy, SinkOpenRefusesExplicitPipewireRequestBeforeRendering) {
+    aa::audio::detail::SinkOpenRequest request;
+    request.format = stereo_48k();
+    request.backend = aa::audio::SinkBackend::pipewire;
+    std::uint64_t writes = 0;
+    request.on_write_progress = [&](const auto&) { ++writes; };
+    const auto opened = aa::audio::detail::open_default_sink(request);
+    EXPECT_FALSE(opened.sink);
+    EXPECT_FALSE(opened.report.usable);
+    EXPECT_TRUE(opened.report.selected_element.empty());
+    EXPECT_NE(opened.report.cause.find("pipewiresink_unsupported"), std::string::npos);
+    EXPECT_NE(opened.report.cause.find("pulsesink"), std::string::npos);
+    EXPECT_EQ(opened.report.cause.find("unverified"), std::string::npos);
+    EXPECT_EQ(writes, 0U);
+}
+
+TEST(AudioPipelineSinkPolicy, RouterRefusesExplicitPipewireWithTypedDegradation) {
+    auto config = pcm_router_config();
+    config.backend = aa::audio::SinkBackend::pipewire;
+    auto opened = aa::audio::AudioRouter::open(config);
+    ASSERT_TRUE(opened);
+    EXPECT_EQ(opened.value().state(), aa::audio::RouterState::degraded);
+    EXPECT_FALSE(opened.value().report().sink.usable);
+    EXPECT_TRUE(opened.value().report().sink.selected_element.empty());
+    EXPECT_NE(opened.value().report().sink.cause.find("pipewiresink_unsupported"),
+              std::string::npos);
+    EXPECT_NE(opened.value().report().sink.cause.find("pulsesink"), std::string::npos);
+    EXPECT_EQ(opened.value().report().sink.cause.find("unverified"), std::string::npos);
+
+    const auto pcm = constant_pcm({kMediaLevel, 960});
+    const auto result = opened.value().submit(make_message(
+        aa::protocol::ChannelRole::media_audio, 0, now_ns(), pcm));
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::audio_sink_unavailable);
+    auto pumped = opened.value().pump();
+    ASSERT_FALSE(pumped);
+    EXPECT_EQ(pumped.error().code(), aa::ErrorCode::audio_sink_unavailable);
+    EXPECT_EQ(opened.value().report().stats.frames_written, 0U);
+}
+
+TEST(AudioPipelineSinkBackend, DefaultAutomaticOpenSelectsPulseSinkWhenRuntimeAvailable) {
+    aa::audio::detail::SinkOpenRequest request;
+    request.format = stereo_48k();
+    request.start_timeout = aa::core::Milliseconds{2000};
+    request.write_timeout = aa::core::Milliseconds{200};
+    auto outcome = aa::audio::detail::open_default_sink(request);
+    if (!outcome.sink) {
+        if (std::getenv("CI") != nullptr) {
+            FAIL() << "pulsesink runtime unavailable in CI: " << outcome.report.cause;
+        }
+        GTEST_SKIP() << "pulsesink runtime unavailable on this host: " << outcome.report.cause;
+    }
+    EXPECT_TRUE(outcome.report.usable);
+    EXPECT_EQ(outcome.report.selected_element, "pulsesink");
+}
+
 TEST(AudioPipelineSinkBackend, FullAppsrcQueueHonorsSingleWriteDeadline) {
     // Gate fix 3 regression: with the appsrc queue prefilled to its byte
     // threshold and downstream blocked after readiness, a real write() must
@@ -1892,6 +2002,8 @@ TEST(AudioPipelineSinkBackend, FullAppsrcQueueHonorsSingleWriteDeadline) {
     // into the full queue (queue levels stay exactly as prefilled), and must
     // not wait for a handoff that cannot come (no acknowledged handoffs).
     aa::audio::detail::SinkOpenRequest request;
+    // Uses pulsesink: the only supported production real-time route (#80).
+    request.backend = aa::audio::SinkBackend::pulse;
     request.format = stereo_48k();
     request.start_timeout = aa::core::Milliseconds{2000};
     request.write_timeout = aa::core::Milliseconds{200};
@@ -1981,6 +2093,8 @@ TEST(AudioPipelineSinkBackend, FrozenProgressDistinguishesPushedFromIngressAndSu
     std::condition_variable cv;
     std::optional<aa::audio::SinkWriteProgress> latest;
     aa::audio::detail::SinkOpenRequest request;
+    // Uses pulsesink: the only supported production real-time route (#80).
+    request.backend = aa::audio::SinkBackend::pulse;
     request.format = stereo_48k();
     request.write_timeout = aa::core::Milliseconds{2000};
     request.on_write_progress = [&](const aa::audio::SinkWriteProgress& value) {
@@ -2067,6 +2181,8 @@ namespace {
 
 [[nodiscard]] aa::audio::detail::SinkOpenOutcome open_slot_test_sink() {
     aa::audio::detail::SinkOpenRequest request;
+    // Uses pulsesink: the only supported production real-time route (#80).
+    request.backend = aa::audio::SinkBackend::pulse;
     request.format = stereo_48k();
     request.start_timeout = aa::core::Milliseconds{2000};
     request.write_timeout = aa::core::Milliseconds{200};

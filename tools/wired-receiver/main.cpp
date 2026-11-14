@@ -1490,10 +1490,12 @@ class InputQueue final {
     std::deque<aa::ipc::InputEvent> queue_{};
 };
 
-// Default routing element (#60): pulsesink via pipewire-pulse. On this host's
-// GStreamer PipeWire plugin (1.0.5) a pipewiresink stream degrades after
-// ~1.5-2.3 h of continuous playback into ~340 ms blocks; pulsesink ran clean
-// side by side. --audio-sink pipewire|automatic restores the old choice.
+// Default routing element (#60, #80): pulsesink via pipewire-pulse. On the
+// target (PipeWire 1.0.5, Ubuntu noble) pipewiresink has no rate control and
+// degrades after ~1.5-2.3 h of continuous playback into ~340 ms blocks, with no
+// fixed PipeWire packaged for noble; pulsesink ran clean side by side and is
+// the default and only supported real-time route (automatic also selects
+// pulsesink; explicit pipewire is refused at startup).
 aa::audio::RouterConfig pcm_router_config(
     aa::audio::SinkBackend backend = aa::audio::SinkBackend::pulse) {
     aa::audio::RouterConfig config;
@@ -1617,8 +1619,9 @@ const char *const kUsage =
     "  --require-video-consumer defers upstream negotiation until a video\n"
     "  consumer has been accepted and installed (bounded, fail closed).\n"
     "  --audio-sink picks the routing element (default pulse: pulsesink via\n"
-    "  pipewire-pulse; pipewire: pipewiresink; automatic: pipewiresink, else\n"
-    "  pulsesink).\n"
+    "  pipewire-pulse; automatic: pulsesink; pipewire: refused because\n"
+    "  pipewiresink has no rate control on PipeWire 1.0.5 / Ubuntu noble and\n"
+    "  degrades after 1.5-2.3 h; use pulse).\n"
     "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked.\n";
 
 int receiver_main(int argc, char **argv) {
@@ -1707,13 +1710,18 @@ int receiver_main(int argc, char **argv) {
 
     aa::audio::RouterConfig audio_config = pcm_router_config(audio_backend);
     ConcreteAudioRenderWorker audio_sink{audio_config};
-    if (const auto opened = audio_sink.ready(); !opened) {
+    const auto opened = audio_sink.ready();
+    // Run provenance (#60, #80): log the sink selection (including any refusal
+    // cause) before failing closed on startup.
+    if (const auto report = audio_sink.sink_report();
+        opened || !report.cause.empty() || !report.candidates.empty()) {
+        log_sink_selected(report, "open");
+    }
+    if (!opened) {
         log_line(std::string{"{\"event\":\"err\",\"detail\":\"audio_router\",\"code\":\""} +
                  std::string{aa::to_string(opened.error().code())} + "\"}");
         return 3;
     }
-    // Run provenance (#60): which routing element this session uses.
-    log_sink_selected(audio_sink.sink_report(), "open");
 
     auto video =
         aa::ipc::VideoServer::listen(aa::ipc::VideoSocketPath{video_socket},
