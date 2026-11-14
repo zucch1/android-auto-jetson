@@ -122,6 +122,23 @@ TEST(WiredReceiver, ConsumerDisconnectKeepsMediaAckAndReplacementDelivery) {
     EXPECT_EQ(logs.back(), "{\"event\":\"decode_stats\",\"frame_drops\":3}");
 }
 
+TEST(WiredReceiver, VideoOutletRoutesPeriodicRecordsToMediaLogOnly) {
+    // Given an outlet with a separate media (rate-limited) log, and no consumer.
+    std::vector<std::string> lifecycle;
+    std::vector<std::pair<std::string, std::string>> media;
+    VideoOutlet outlet{[&](const std::string& line) { lifecycle.push_back(line); },
+                       [&](std::string_view kind, const std::string& line) {
+                           media.emplace_back(std::string{kind}, line);
+                       }};
+    // When the phone's video is dropped (audit L13: phone-driven periodic records).
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 1, {}}, wiredtest::kVideoIdr}));
+    // Then they reach the media log by kind and the lifecycle log stays silent.
+    EXPECT_TRUE(lifecycle.empty());
+    ASSERT_EQ(media.size(), 2U);
+    EXPECT_EQ(media[0].first, "video_dropped");
+    EXPECT_EQ(media[1].first, "decode_stats");
+}
+
 TEST(WiredReceiver, VideoOutletUnrelatedSocketIoStillPropagates) {
     // Given a connected peer but a locally disabled producer write side.
     auto pair = videotest::make_pair({});

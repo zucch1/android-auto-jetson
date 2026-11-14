@@ -20,6 +20,11 @@ std::size_t complete_type_end(std::string_view sig, std::size_t pos, int depth) 
         return complete_type_end(sig, pos + 1, depth + 1);
     case '(': {
         std::size_t cursor = pos + 1;
+        // D-Bus structs have at least one member. Besides being invalid, an
+        // empty struct consumes no bytes and would make array skipping spin.
+        if (cursor < sig.size() && sig[cursor] == ')') {
+            return 0;
+        }
         while (cursor < sig.size() && sig[cursor] != ')') {
             cursor = complete_type_end(sig, cursor, depth + 1);
             if (cursor == 0) {
@@ -198,18 +203,15 @@ core::Result<void> Cursor::skip_value_at(std::string_view type, int depth) {
             return length.error();
         }
         const std::string_view element = type.substr(1);
-        std::size_t first = 0;
-        while (first < element.size() && element[first] == 'a') {
-            ++first;
-        }
+        // Array payload alignment comes from the IMMEDIATE element type. In
+        // particular, a nested array is 4-aligned even when its own elements
+        // require 8-byte alignment.
         std::size_t boundary = 1;
-        if (first < element.size()) {
-            switch (element[first]) {
-            case '(': case '{': case 'x': case 't': case 'd': boundary = 8; break;
-            case 'b': case 'i': case 'u': case 's': case 'o': boundary = 4; break;
-            case 'n': case 'q': boundary = 2; break;
-            default: boundary = 1; break;
-            }
+        switch (element.front()) {
+        case '(': case '{': case 'x': case 't': case 'd': boundary = 8; break;
+        case 'a': case 'b': case 'i': case 'u': case 's': case 'o': boundary = 4; break;
+        case 'n': case 'q': boundary = 2; break;
+        default: boundary = 1; break;
         }
         const auto aligned = align(boundary);
         if (!aligned.has_value()) {

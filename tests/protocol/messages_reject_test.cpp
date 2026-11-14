@@ -141,8 +141,9 @@ TEST(MessageReject, RejectsZeroAndOversizedServiceIdentity) {
     expect_malformed(proto::encode(zero_id));
     proto::ServiceDiscoveryResponse crowded;
     for (std::size_t index = 0; index <= proto::kMaxDiscoveredServices; ++index) {
-        crowded.services.push_back(
-            {proto::ServiceKey{static_cast<std::int32_t>(index) + 1}, proto::ChannelRole::sensors});
+        auto& service = crowded.services.emplace_back();
+        service.id = proto::ServiceKey{static_cast<std::int32_t>(index) + 1};
+        service.role = proto::ChannelRole::sensors;
     }
     expect_malformed(proto::encode(crowded));
 }

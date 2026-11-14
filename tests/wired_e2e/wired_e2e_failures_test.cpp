@@ -116,7 +116,7 @@ TEST(WiredE2eFailures, ShortControlPayloadFailsTyped) {
     session.attach_transport(&transport);
     drive_to_active(session, transport);
 
-    transport.push_inbound(wiredtest::control_frame({std::byte{0x00}}));
+    transport.push_inbound(wiredtest::encrypted_control_frame({std::byte{0x00}}));
     auto outcome = session.poll_transport();
     ASSERT_FALSE(outcome.has_value());
     EXPECT_EQ(outcome.error().code(), aa::ErrorCode::invalid_argument);

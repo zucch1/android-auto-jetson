@@ -53,6 +53,32 @@ TEST(ReplayRecorder, TraceDurationEnforcedAtRecordTime) {
     EXPECT_EQ(refused.error().code(), aa::ErrorCode::invalid_argument);
 }
 
+TEST(ReplayRecorder, TraceSpanLimitDoesNotCapAbsoluteMediaTimestamps) {
+    // Audit L4 review: kMaxTraceNs bounds the SPAN of a trace, not the value of
+    // a timestamp. A phone's media clock is not zero-based, and
+    // ReplayVideoCapture records live video timestamps through the same gate.
+    // Given: a recorder whose first record is three hours into a monotonic clock.
+    constexpr std::int64_t base = 3 * replay::kMaxTraceNs;
+    replay::Recorder recorder;
+    ASSERT_TRUE(recorder.record_video(
+        aa::core::Nanoseconds{base},
+        replay::VideoRecord{1, 1, aa::core::Nanoseconds{base}, true, kVideoOne}));
+    // When: later records stay within the span budget.
+    ASSERT_TRUE(recorder.record_input(
+        aa::core::Nanoseconds{base + 1'000'000'000},
+        replay::InputRecord{1, aa::core::Nanoseconds{base + 1'000'000'000}, kInputOne}));
+    ASSERT_TRUE(recorder.record_video(
+        aa::core::Nanoseconds{base + replay::kMaxTraceNs},
+        replay::VideoRecord{2, 2, aa::core::Nanoseconds{base + replay::kMaxTraceNs}, false,
+                            kVideoTwo}));
+    // Then: they were accepted, and the span budget is still enforced relative to the first record.
+    const auto refused = recorder.record_input(
+        aa::core::Nanoseconds{base + replay::kMaxTraceNs + 1},
+        replay::InputRecord{3, aa::core::Nanoseconds{base + replay::kMaxTraceNs + 1}, kInputOne});
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), aa::ErrorCode::invalid_argument);
+}
+
 TEST(ReplayRecorder, OversizedExpectationRefused) {
     // Given: an empty recorder and an expectation past the count budget.
     replay::Recorder recorder;

@@ -26,6 +26,26 @@ namespace {
     return true;
 }
 
+// Bluetooth addresses have one spelling for matching and revocation. Adapter
+// identifiers may also be names (hci0), so only MAC-shaped adapters are folded.
+[[nodiscard]] bool mac_address(std::string_view value) {
+    if (value.size() != 17) return false;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const char c = value[i];
+        if (i % 3 == 2) { if (c != ':') return false; }
+        else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                   (c >= 'A' && c <= 'F'))) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] std::string canonical_address(std::string value) {
+    for (char& c : value) {
+        if (c >= 'a' && c <= 'f') c = static_cast<char>(c - 'a' + 'A');
+    }
+    return value;
+}
+
 // Length-prefixed concatenation is injective: distinct field tuples always
 // produce distinct keys, so matching can never alias two records together.
 void append_field(std::string& out, std::string_view field) {
@@ -34,8 +54,13 @@ void append_field(std::string& out, std::string_view field) {
     out.append(field);
 }
 
+// Treat blank serials as absent while retaining their bytes in identity_key.
+[[nodiscard]] bool blank_serial(std::string_view serial) noexcept {
+    return serial.find_first_not_of(" \t\n\r\f\v") == std::string_view::npos;
+}
+
 [[nodiscard]] bool wired_has_material(const WiredIdentity& wired) {
-    if (!wired.usb_serial.empty() || !wired.aoa_serial.empty()) {
+    if (!blank_serial(wired.usb_serial) || !blank_serial(wired.aoa_serial)) {
         return true;
     }
     return !wired.usb_vendor_id.empty() && !wired.usb_product_id.empty() &&
@@ -59,6 +84,26 @@ TransportKind kind_of(const TransportIdentity& identity) noexcept {
     }
 }
 
+// Classify blank serials as absent without changing the stable identity key.
+IdentityStrength strength_of(const TransportIdentity& identity) noexcept {
+    if (const auto* wired = std::get_if<WiredIdentity>(&identity)) {
+        return blank_serial(wired->usb_serial) && blank_serial(wired->aoa_serial)
+            ? IdentityStrength::port_only : IdentityStrength::serial_backed;
+    }
+    return kind_of(identity) == TransportKind::wireless
+        ? IdentityStrength::bond_backed : IdentityStrength::opaque;
+}
+
+std::string_view strength_name(IdentityStrength strength) noexcept {
+    switch (strength) {
+    case IdentityStrength::serial_backed: return "serial-backed";
+    case IdentityStrength::port_only: return "port-only";
+    case IdentityStrength::bond_backed: return "bond-backed";
+    case IdentityStrength::opaque: return "opaque";
+    }
+    return "opaque";
+}
+
 std::string identity_key(const TransportIdentity& identity) {
     std::string out;
     if (const auto* wired = std::get_if<WiredIdentity>(&identity)) {
@@ -74,8 +119,8 @@ std::string identity_key(const TransportIdentity& identity) {
     }
     if (const auto* wireless = std::get_if<WirelessIdentity>(&identity)) {
         out = "b1:";
-        append_field(out, wireless->bond_address);
-        append_field(out, wireless->adapter);
+        append_field(out, canonical_address(wireless->bond_address));
+        append_field(out, mac_address(wireless->adapter) ? canonical_address(wireless->adapter) : wireless->adapter);
         return out;
     }
     const auto& opaque = std::get<OpaqueIdentity>(identity);
@@ -114,7 +159,7 @@ WiredKeyClass classify_wired_key(std::string_view key) noexcept {
         if (length > rest.size()) {
             return WiredKeyClass::malformed;
         }
-        if ((field == kUsbSerial || field == kAoaSerial) && length != 0) {
+        if ((field == kUsbSerial || field == kAoaSerial) && !blank_serial(rest.substr(0, length))) {
             has_serial = true;
         }
         rest.remove_prefix(length);
@@ -125,11 +170,6 @@ WiredKeyClass classify_wired_key(std::string_view key) noexcept {
     return has_serial ? WiredKeyClass::serial_bound : WiredKeyClass::port_only;
 }
 
-bool refuses_wired_authorization(std::string_view key) noexcept {
-    const WiredKeyClass klass = classify_wired_key(key);
-    return klass == WiredKeyClass::port_only || klass == WiredKeyClass::malformed;
-}
-
 core::Result<std::string> validated_key(const TransportIdentity& identity) {
     if (const auto* wired = std::get_if<WiredIdentity>(&identity)) {
         if (!all_fields_printable(*wired) || !wired_has_material(*wired)) {
@@ -138,7 +178,7 @@ core::Result<std::string> validated_key(const TransportIdentity& identity) {
         return identity_key(identity);
     }
     if (const auto* wireless = std::get_if<WirelessIdentity>(&identity)) {
-        if (wireless->bond_address.empty() || !printable_ascii(wireless->bond_address) ||
+        if (!mac_address(wireless->bond_address) ||
             !printable_ascii(wireless->adapter)) {
             return Error{ErrorCode::invalid_argument};
         }

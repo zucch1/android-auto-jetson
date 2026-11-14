@@ -3,6 +3,7 @@
 
 #include <aa/ipc/VideoChannel.hpp>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -150,7 +151,7 @@ TEST(VideoMalformed, RejectedCounterCoversHeaderDecodeFailures) {
     EXPECT_EQ(consumer.rejected(), 1U);
     EXPECT_TRUE(consumer.waiting_idr());
 
-    const std::vector<std::uint8_t> recovery{0x01, 0x02};
+    const std::array<std::uint8_t, 2> recovery{0x01, 0x02};
     ASSERT_TRUE(pair.value().producer.send_access_unit({9, 9, true, recovery}));
     for (int i = 0; i < 8; ++i) {
         const auto done = consumer.receive(aa::core::Milliseconds{500});

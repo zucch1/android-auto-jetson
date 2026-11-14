@@ -16,7 +16,8 @@ Rejects (with no exceptions anywhere in the scanned tree):
 - recognizable re-encodings of that same removed certificate/private key:
   raw DER, whitespace-stripped base64 or hex of any of the above (decoded, then
   matched again as digest or PEM armor; decodes nest),
-- any symlink.
+- any symlink outside the excluded top-level development/cache directories;
+  symlinks are reported as `symlink-present`, not misdiagnosed as credentials.
 
 The digest denylist pins the two distinct historical byte strings that were
 published in three copies each (original SHA-256 identities, recorded as the
@@ -72,7 +73,7 @@ PEM_BLOCK: Final = re.compile(
     rb'(.*?)'
     rb'-----END (?:[A-Z0-9]+ )*(?:PRIVATE KEY|CERTIFICATE)-----', re.DOTALL)
 HEX: Final = re.compile(rb'[0-9a-fA-F]+')
-EXCLUDED: Final = frozenset(('.git', '.omo', 'build', '.local'))
+EXCLUDED: Final = frozenset(('.git', '.omo', '.claude', 'build', '.local'))
 MAX_DERIVED: Final = 16
 
 
@@ -124,8 +125,8 @@ def hits(data: bytes) -> bool:
     return False
 
 
-def forbidden(root: Path) -> bool:
-    """Return True on forbidden material; fail closed on invalid or partial scans.
+def rejection(root: Path) -> str | None:
+    """Return a distinct rejection reason; fail closed on invalid/partial scans.
 
     Raises ValueError when root is missing or is not a directory, and
     propagates OSError from any traversal or read failure, so neither an
@@ -141,16 +142,19 @@ def forbidden(root: Path) -> bool:
         if directory == root:
             subdirectories[:] = [name for name in subdirectories if name not in EXCLUDED]
             files = [name for name in files if name not in EXCLUDED]
+        for name in subdirectories:
+            if (directory / name).is_symlink():
+                return 'symlink-present'
         for name in files:
             path = directory / name
             if path.is_symlink():
-                return True
+                return 'symlink-present'
             if name in FORBIDDEN_NAMES:
-                return True
+                return 'credential-material-present'
             data = path.read_bytes()
             if hits(data):
-                return True
-    return False
+                return 'credential-material-present'
+    return None
 
 
 def main() -> int:
@@ -167,15 +171,15 @@ def main() -> int:
         print('tls-key-scan: FAIL usage', file=sys.stderr)
         return 1
     try:
-        rejected = forbidden(Path(arguments[0]).resolve())
+        rejected = rejection(Path(arguments[0]).resolve())
     except ValueError:
         print('tls-key-scan: FAIL invalid-root')
         return 1
     except OSError:
         print('tls-key-scan: FAIL unreadable-source')
         return 1
-    if rejected:
-        print('tls-key-scan: FAIL credential-material-present')
+    if rejected is not None:
+        print(f'tls-key-scan: FAIL {rejected}')
         return 1
     print('tls-key-scan: PASS zero-credential-copies no-allowlist')
     return 0

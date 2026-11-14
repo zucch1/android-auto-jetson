@@ -14,8 +14,11 @@
 #
 # Usage:
 #   run-wired-live-qa.sh --receiver /opt/aa/aa-wired-receiver \
-#       --display /opt/aa/aa-dummy-display --out /tmp/task-30-live-qa.json
+#       --display /opt/aa/aa-dummy-display --out /run/user/$UID/task-30-live-qa.json
 #   run-wired-live-qa.sh --readiness-only     # bounded, read-only prerequisite check
+# Without --out, the report is written in a private mktemp directory below
+# $XDG_RUNTIME_DIR. Target-side logs and the control FIFO use a separate private
+# directory below the target's XDG_RUNTIME_DIR.
 #
 # The receiver is tools/wired-receiver (target aa-wired-receiver): it runs the
 # wired session over USB/AOA with TrustStore admission and serves the video /
@@ -30,7 +33,7 @@ HOST="${HOST:-jetson.local}"
 PORT="${PORT:-1-2.1}"
 RECEIVER=""
 DISPLAY=""
-OUT="/tmp/task-30-live-qa.json"
+OUT=""
 PROJECTION_TIMEOUT_MS=15000
 READINESS_ONLY=0
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
@@ -54,6 +57,16 @@ while (($# > 0)); do
     esac
 done
 
+if [[ -z "$OUT" ]]; then
+    if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "$XDG_RUNTIME_DIR" ]]; then
+        echo "XDG_RUNTIME_DIR must name an existing directory when --out is omitted" >&2
+        exit 2
+    fi
+    QA_WORK_DIR="$(mktemp -d -p "$XDG_RUNTIME_DIR" aa-wired-live-qa.XXXXXX)"
+    chmod 0700 "$QA_WORK_DIR"
+    OUT="$QA_WORK_DIR/result.json"
+fi
+
 # Session env for every remote command (single choke point): batch ssh has no
 # session bus address (`busctl --user` fails "Failed to get credentials") and
 # the display consumer is a Qt GUI app that aborts under xcb without DISPLAY.
@@ -62,7 +75,7 @@ done
 # remote session must also carry XAUTHORITY pointing at the authority cookie
 # of the target X server (the owning session's cookie file), or the display
 # consumer is refused with an X authentication failure. Set both together.
-REMOTE_SESSION_ENV='export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus; export DISPLAY=:1;'
+REMOTE_SESSION_ENV='export XDG_RUNTIME_DIR=/run/user/$(id -u); export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus; export DISPLAY=:1;'
 
 # Shell-quote one caller-supplied value before it enters a remote command
 # string: remote() runs that string through the TARGET shell, so a
@@ -80,8 +93,31 @@ host_tag="$(printf '%s' "$HOST" | sha256sum | cut -c1-16)"
 
 write_result() {
     local status="$1" blocked_on="$2" projection="$3" video="$4" audio="$5" input="$6" budget_ms="$7"
-    mkdir -p "$(dirname "$OUT")"
-    cat > "$OUT" <<EOF
+    # Pin the checked parent directory, then create once without following links.
+    # An existing file (including a dangling symlink) is never overwritten.
+    python3 -c '
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+try:
+    parent, name = os.path.split(os.path.abspath(path))
+    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.fstat(directory).st_mode & stat.S_IWOTH:
+            raise OSError("parent directory is world-writable; use a private directory")
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory)
+        with os.fdopen(fd, "w") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(sys.stdin.read())
+    finally:
+        os.close(directory)
+except OSError as error:
+    print(f"Refusing report output {path!r}: {error}", file=sys.stderr)
+    sys.exit(2)
+' "$OUT" <<EOF
 {
   "task": "30. Qualify wired end-to-end projection",
   "phase": "B (live device)",
@@ -165,11 +201,20 @@ if [[ -z "$RECEIVER" || -z "$DISPLAY" ]]; then
 fi
 
 # The receiver owns the D-Bus contract name; the display registers as a consumer
-# and requests projection. Both run under a bounded ssh; logs are captured on the
-# target under /tmp for later retrieval (redaction applied before export). The
-# display also runs with the shipped TEST-ONLY stdin control channel
-# (--test-only-control-stdin) wired through a FIFO so the harness can request
-# real status (painted frames) and stimulate one input event (gate P2-G).
+# and requests projection. Both run under a bounded ssh; logs and the control
+# FIFO live in a fresh mode-0700 target directory, never predictable /tmp paths.
+# The display uses the shipped TEST-ONLY stdin control channel
+# (--test-only-control-stdin) so the harness can request real status (painted
+# frames) and stimulate one input event (gate P2-G).
+REMOTE_QA_DIR="$(remote 'mktemp -d -p "$XDG_RUNTIME_DIR" aa-wired-live-qa.XXXXXX')" || {
+    write_result "BLOCKED" "target_private_workdir_unavailable" "false" "false" "false" "false" "null"
+    exit 3
+}
+if [[ -z "$REMOTE_QA_DIR" || "$REMOTE_QA_DIR" != /* || "$REMOTE_QA_DIR" == *$'\n'* ]]; then
+    write_result "BLOCKED" "target_private_workdir_invalid" "false" "false" "false" "false" "null"
+    exit 3
+fi
+REMOTE_QA_DIR_Q="$(shq "$REMOTE_QA_DIR")"
 start_ms="$(date +%s%3N)"
 receiver_pid=""; display_pid=""
 teardown() {
@@ -191,10 +236,10 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
-receiver_pid="$(remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!")"
+receiver_pid="$(remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log 2>&1 & echo \$!")"
 # Open the FIFO read/write so startup does not wait for a separate writer and
 # the test-only channel stays open between bounded status/input requests.
-display_pid="$(remote "rm -f /tmp/aa-disp.in; mkfifo /tmp/aa-disp.in && { nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>/tmp/aa-disp.in > /tmp/aa-wired-display.log 2>&1 & echo \$!; }")"
+display_pid="$(remote "mkfifo ${REMOTE_QA_DIR_Q}/aa-disp.in && { nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>${REMOTE_QA_DIR_Q}/aa-disp.in > ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>&1 & echo \$!; }")"
 
 projection="false"
 session_active="false"; video="false"; audio="false"; input="false"
@@ -210,18 +255,18 @@ while (( $(date +%s%3N) < deadline )); do
     if [[ "$state" == *"projecting"* ]]; then
         projection="true"
     fi
-    poll_remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && session_active="true"
-    if poll_remote "grep -q '\"event\":\"video_sent\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1; then
-        status="$(poll_remote "printf 'status\n' > /tmp/aa-disp.in 2>/dev/null; grep '\"event\":\"status\"' /tmp/aa-wired-display.log 2>/dev/null | tail -1" || true)"
+    poll_remote "grep -q '\"event\":\"active\"' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log" >/dev/null 2>&1 && session_active="true"
+    if poll_remote "grep -q '\"event\":\"video_sent\"' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log" >/dev/null 2>&1; then
+        status="$(poll_remote "printf 'status\n' > ${REMOTE_QA_DIR_Q}/aa-disp.in 2>/dev/null; grep '\"event\":\"status\"' ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>/dev/null | tail -1" || true)"
         if [[ "$status" =~ \"frames_painted\":([0-9]+) ]] && ((BASH_REMATCH[1] > 0)) && [[ "$status" == *'"render_ok":true'* ]]; then
             video="true"
         fi
     fi
-    poll_remote "grep -q '\"event\":\"audio_chunks\"' /tmp/aa-wired-receiver.log && grep -q '\"event\":\"media_timing\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && audio="true"
+    poll_remote "grep -q '\"event\":\"audio_chunks\"' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log && grep -q '\"event\":\"media_timing\"' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log" >/dev/null 2>&1 && audio="true"
     if [[ "$session_active" == true && "$input" != true ]]; then
-        poll_remote "printf 'key a press\nkey a release\n' > /tmp/aa-disp.in 2>/dev/null" >/dev/null 2>&1 || true
+        poll_remote "printf 'key a press\nkey a release\n' > ${REMOTE_QA_DIR_Q}/aa-disp.in 2>/dev/null" >/dev/null 2>&1 || true
     fi
-    poll_remote "grep -q '\"event\":\"input_forwarded\",\"ok\":\"true\"' /tmp/aa-wired-receiver.log" >/dev/null 2>&1 && input="true"
+    poll_remote "grep -q '\"event\":\"input_forwarded\",\"ok\":\"true\"' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log" >/dev/null 2>&1 && input="true"
     if [[ "$projection" == true && "$session_active" == true && "$video" == true && "$audio" == true && "$input" == true ]]; then
         break
     fi

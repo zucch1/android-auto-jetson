@@ -49,6 +49,9 @@ core::Result<ParsedMessage> BusConnection::await_reply(std::uint32_t serial,
     for (int skipped = 0; skipped < kMaxSkippedMessages; ++skipped) {
         auto message = read_message(sensitive);
         if (!message.has_value()) {
+            if (message.error().code() == ErrorCode::transport_message_dropped) {
+                continue;
+            }
             return saw_forged ? core::Result<ParsedMessage>{Error{ErrorCode::transport_unauthorized_peer}}
                               : core::Result<ParsedMessage>{message.error()};
         }

@@ -29,6 +29,7 @@ namespace aa::ipc {
 // records and oversize records are rejected (transport_malformed_frame /
 // transport_oversize_frame) and drive loss/resync. End of stream is the
 // producer shutting down its write side, never a zero-length record.
+inline constexpr std::size_t kMinDatagramPayload = 1024;
 inline constexpr std::size_t kMaxDatagramPayload = 16UL * 1024;
 inline constexpr std::size_t kMaxAccessUnitBytes = 4UL * 1024 * 1024;
 inline constexpr std::size_t kFrameHeaderBytes = 56;

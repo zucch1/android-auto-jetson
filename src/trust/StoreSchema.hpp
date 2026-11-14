@@ -5,19 +5,21 @@
 // safe migration path:
 //   schema_version 1 (legacy): records carried an opaque matching key only
 //                            ({"phone_id": N, "key": "..."}).
-//   schema_version 2 (current): records carry the structured strongest
+//   schema_version 2: records carry the structured strongest
 //                            transport identity (wired/wireless/opaque).
+//   schema_version 3 (current): records additionally carry identity strength.
+// Serial-less v2 grants are dropped: no explicit consent was recorded.
 // Version 1 loads by migrating each record to an OpaqueIdentity and allocating
-// next_phone_id = max(phone_id)+1; the next persist rewrites version 2.
+// next_phone_id = max(phone_id)+1; the next persist rewrites version 3.
 // Any other schema_version, malformed member or unexpected key is a typed
 // trust_store_io rejection — a store that cannot be proven safe is never
 // silently trusted.
 //
-// Record rules (BOTH versions, fail closed): exact members only (no extras, no
+// Record rules (all versions, fail closed): exact members only (no extras, no
 // missing), record ids in [1, kMaxPhoneId], one phone id per record and ONE
 // record per canonical identity key (identity_key()) — a duplicate identity
 // could otherwise survive a forget and silently keep reconnect eligibility.
-// Version 2 additionally requires next_phone_id strictly greater than every
+// Versions 2 and 3 additionally require next_phone_id strictly greater than every
 // record id and at most kMaxPhoneId + 1 (the shared coherent id range; see
 // Store.hpp).
 
@@ -32,18 +34,19 @@
 namespace aa::trust::detail {
 
 inline constexpr std::uint64_t kSchemaVersionLegacy = 1;
-inline constexpr std::uint64_t kSchemaVersionCurrent = 2;
+inline constexpr std::uint64_t kSchemaVersionCurrent = kCurrentSchemaVersion;
 
 struct ParsedStore final {
     std::vector<ApprovedPhone> phones{};
     std::uint64_t next_phone_id{1};
+    std::size_t dropped_port_only_count{0};
 };
 
 // Parse + migrate one store document. Empty text is the empty store. Every
 // rejection is trust_store_io (fail closed).
 [[nodiscard]] core::Result<ParsedStore> parse_store(std::string_view text);
 
-// Deterministic version-2 serialization (fixed member order).
+// Deterministic version-3 serialization (fixed member order).
 [[nodiscard]] std::string write_store(const ParsedStore& store);
 
 } // namespace aa::trust::detail
