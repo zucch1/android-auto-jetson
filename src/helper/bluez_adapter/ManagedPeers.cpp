@@ -150,15 +150,22 @@ bool ManagedPeers::remember(const PeerIdentity& peer) {
 }
 bool ManagedPeers::forget(const PeerIdentity& peer) {
     if (!valid_) return false;
-    if (!contains(peer)) return true;
     Fd dir{directory(directory_, owner_)};
+    if (!contains(peer)) {
+        // Already gone from the list; "gone" is only durable once the rename that removed it is.
+        if (durable_) return true;
+        if (dir.value < 0 || fsync_retry(dir.value)) return false;
+        durable_ = true;
+        return true;
+    }
     if (dir.value < 0) return false;
     auto next = peers_;
     next.erase(std::find(next.begin(), next.end(), peer));
     const auto written = replace(dir.value, next);
     if (written == Write::failed) return false;
     peers_ = std::move(next);
-    if (written == Write::unsynced) durable_ = false;
+    if (written == Write::unsynced) { durable_ = false; return false; }  // removed in memory, not yet durable
+    durable_ = true;
     return true;
 }
 }

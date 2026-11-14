@@ -67,7 +67,9 @@ written is refused. Rebuilding the queue from BlueZ was rejected: BlueZ cannot
 distinguish a bond an enrolment window created from one the owner made, and
 removing the latter would be destructive. The list is not revocation authority.
 An entry leaves it when the bond is acknowledged (the receiver then owns the retirement)
-or when its device is gone from BlueZ; a removal that succeeded but whose record cannot
+or when its device is gone from BlueZ. The acknowledgement succeeds only once its entry is
+durably gone (write, rename and directory fsync); otherwise it fails and the receiver's failure
+path retires the bond, and cleanup never removes a bond on the managed (admitted) list; a removal that succeeded but whose record cannot
 be rewritten is remembered in memory so a device later paired again at that address is
 not removed on every tick. Accepted, acknowledged bonds retain main's
 CancelPairing guards. An abrupt receiver exit triggers helper identity-loss

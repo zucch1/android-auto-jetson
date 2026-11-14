@@ -12,6 +12,9 @@ void BluezBackend::Impl::retire_unaccepted() {
     const auto peers = pending.peers();  // forget() rewrites the list
     for (const auto& peer : peers) {
         if (allowed && allowed->device.identity == peer) continue;
+        // An admitted bond is never removed by cleanup, whatever the journal says: the journal
+        // entry is only dropped (it is stale, e.g. an acknowledgement whose journal write failed).
+        if (managed.contains(peer)) { if (pending.forget(peer)) std::erase(removal_done, peer); continue; }
         const auto done = std::find(removal_done.begin(), removal_done.end(), peer);
         if (done == removal_done.end()) {
             bool removed = true;
@@ -28,7 +31,8 @@ void BluezBackend::Impl::retire_unaccepted() {
             // address (legitimately paired again) be removed on every tick.
             removal_done.push_back(peer);
         }
-        if (pending.forget(peer)) std::erase(removal_done, peer);
+        (void)pending.forget(peer);
+        if (!pending.contains(peer)) std::erase(removal_done, peer);  // gone from memory; sync retried
     }
 }
 core::Result<bool> BluezBackend::bond_confirmed() {
@@ -48,7 +52,11 @@ core::Result<void> BluezBackend::acknowledge_bond() {
     if (!bonded.value() || !impl_->allowed) return Error{ErrorCode::helper_rejected};
     const auto identity = impl_->allowed->device.identity;
     if (!impl_->managed.remember(identity)) return Error{ErrorCode::helper_rejected};
-    (void)impl_->pending.forget(identity);
+    // The acknowledgement succeeds only once the pending-removal entry is durably gone (write,
+    // rename and directory fsync). Otherwise a later cleanup could remove an approved bond. A
+    // failure refuses the acknowledgement; the receiver's failure path retires the bond, and
+    // cleanup skips managed bonds meanwhile.
+    if (!impl_->pending.forget(identity)) return Error{ErrorCode::helper_rejected};
     return {};
 }
 void BluezBackend::Impl::reject_comparison() {

@@ -269,7 +269,11 @@ def main() -> None:
                 scenario_directory.mkdir(mode=0o700)
                 scenario(Surface(stack, build, scenario_directory))
         with contextlib.ExitStack() as stack:
-            probe_flow(Surface(stack, build, Path(directory), probe=True))
+            # Own directory: the shared one already lists this mock phone as admitted, and cleanup
+            # (rightly) never removes an admitted bond, so this flow's unaccepted bond needs a fresh list.
+            probe_directory = Path(directory) / "probe_flow"
+            probe_directory.mkdir(mode=0o700)
+            probe_flow(Surface(stack, build, probe_directory, probe=True))
         with contextlib.ExitStack() as stack:
             rollback_directory = Path(directory) / "rollback"
             rollback_directory.mkdir(mode=0o700)

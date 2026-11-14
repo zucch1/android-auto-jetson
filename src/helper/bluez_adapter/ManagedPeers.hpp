@@ -17,10 +17,11 @@ public:
     const std::string& reason() const { return reason_; }
     bool contains(const PeerIdentity&) const;
     bool remember(const PeerIdentity&);
-    // Removes an entry; for a list that is not revocation authority. True when the entry is no
-    // longer in the list (absent, or the rewritten file was renamed into place). A transient
-    // failure leaves the entry for the next attempt; the directory sync is retried by the next
-    // remember(), and an entry that reappears after a crash is merely retried.
+    // Removes an entry; for a list that is not revocation authority. True only when the entry
+    // is durably gone: absent and the directory sync confirmed (a pending unsynced rename is
+    // retried here), or rewritten, renamed into place and the directory synced. A transient
+    // failure, or an unconfirmed directory sync, returns false: the entry is already out of
+    // the in-memory list after a rename, and the next forget()/remember() retries the sync.
     bool forget(const PeerIdentity&);
     const std::vector<PeerIdentity>& peers() const { return peers_; }
 private:

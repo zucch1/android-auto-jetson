@@ -154,6 +154,23 @@ TEST_F(ManagedBonds, PendingRemovalListPersistsForgetsAndIsNotRevocationAuthorit
     ASSERT_EQ(::chmod(path.c_str(), 0666), 0);
     EXPECT_FALSE(reopen().valid()) << "the same mode rules apply to the pending list";
 }
+// Journal durability: forget() is true only when the removal is durable, and the unconfirmed
+// directory sync is retried by the next forget().
+TEST_F(ManagedBonds, PendingRemovalForgetReportsSuccessOnlyOnceDurable) {
+    using namespace trust::test::faults;
+    ManagedPeers pending{directory, ::getuid(), "pending-removals"};
+    ASSERT_TRUE(pending.remember(managed)); ASSERT_TRUE(pending.remember(other));
+    { ScopedFault fail{Fault::dir_fsync};
+      EXPECT_FALSE(pending.forget(managed)) << "success reported although the directory fsync failed";
+      EXPECT_FALSE(pending.contains(managed)) << "renamed into place: gone from the in-memory list";
+      EXPECT_FALSE(pending.forget(managed)) << "still not durable while the directory fsync keeps failing"; }
+    EXPECT_TRUE(pending.forget(managed)) << "the next forget confirms the directory sync";
+    EXPECT_TRUE(pending.forget(managed));
+    EXPECT_TRUE(pending.contains(other));
+    { ScopedFault fail{Fault::renameat}; EXPECT_FALSE(pending.forget(other)); }
+    EXPECT_TRUE(pending.contains(other));
+    EXPECT_TRUE(pending.forget(other));
+}
 TEST_F(ManagedBonds, OversizedStateFileFailsClosedWithReason) {
     const auto path = directory + "/managed-bonds";
     { std::ofstream out{path}; out << "v1\n" << std::string(64 * 1024, 'A'); }

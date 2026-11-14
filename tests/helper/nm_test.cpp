@@ -887,6 +887,32 @@ TEST_F(NmDaemon, CommittedForget703ReachesRealDaemonButPrecommitDoesNot) {
     ASSERT_TRUE(eventually([&] { return !nm->active_now && !boundary->table && read_text(directory / "state/ap.credentials") != before; }));
     EXPECT_TRUE(store->phones().empty());
 }
+// A journal replacement that fails after the comparison was accepted must never end as
+// "approved and then removed": the acknowledgement fails (no approval) and cleanup, which the
+// receiver's cancel triggers, leaves the admitted bond in place.
+TEST_F(NmDaemon, JournalReplacementFailureAfterAcceptanceRefusesAckAndCleanupKeepsBond) {
+    start();
+    constexpr std::uint64_t generation = 1;
+    const core::ConsumerId consumer{generation}; const core::PairingRequestId request{generation};
+    ASSERT_TRUE(client->prepare(consumer, request)); ASSERT_TRUE(client->confirmed(consumer, request));
+    const auto journal = directory / "pending-removals";
+    ASSERT_NE(read_text(journal).find("02:00:00:00:00:01"), std::string::npos) << "entry written before the window opens";
+    // The rename of the replacement list onto the journal now fails (EISDIR); staging is discarded.
+    std::filesystem::remove(journal); std::filesystem::create_directory(journal);
+    ASSERT_EQ(bluez.command("comparison-start"), "ok");
+    std::optional<PairingComparison> challenge;
+    ASSERT_TRUE(eventually([&] { const auto value = client->comparison(consumer, request);
+        if (value) challenge = value.value(); return challenge.has_value(); }));
+    ASSERT_TRUE(client->respond_comparison(consumer, request, {challenge->id, true}));
+    ASSERT_EQ(bluez.command("paired"), "ok");
+    ASSERT_TRUE(eventually([&] { const auto bonded = client->bond_confirmed(consumer, request); return bonded && bonded.value(); }));
+    EXPECT_FALSE(client->bond_acknowledged(consumer, request)) << "acknowledged although the journal entry is not durably gone";
+    client->cancel(consumer, request);
+    std::this_thread::sleep_for(1500ms);  // several helper ticks of cleanup
+    const auto mock = bluez.command("state");
+    EXPECT_NE(mock.find("\"removed\": []"), std::string::npos) << "cleanup removed an admitted bond: " << mock;
+    EXPECT_TRUE(store->phones().empty());
+}
 TEST_F(NmDaemon, SigkillRecoveryReconcilesOnlyOwnedTable) {
     start(); acquire(); ASSERT_TRUE(state(State::active));
     ::kill(daemon.pid, SIGKILL); ASSERT_EQ(::waitpid(daemon.pid, nullptr, 0), daemon.pid); daemon.pid = 0;
