@@ -33,7 +33,7 @@ The public CI workflow (`.github/workflows/ci.yml`) executes independent, nonmat
 | `ci/arm64-cross-fixture` | Fixture-sysroot cross-build (`make_sysroot`, `AA_SYSROOT_REQUIRE_OBSERVED=OFF`, `cmake --preset jetson-aarch64`) building targets including `aa_ipc_control` and `aa_ipc_dbus`, verifying `assert_dbus_coverage.py --cross` and `build_hardening` (public **required** job, explicitly **fixture-not-target**) |
 | `ci/arm64-cross-build` | **Optional target evidence** (not a workflow job and not a required check): commit status posted only by the owner-run sandboxed relay `tools/ci/arm64-cross-relay.sh` after an observed-sysroot cross-build (`AA_SYSROOT_REQUIRE_OBSERVED=ON` against `sysroot jetson-r39.2.1`) |
 
-`.github/workflows/ci.yml` runs the five public jobs on pull requests targeting `main` or `aa/**`, on pushes to `main`, and on manual `workflow_dispatch`. Pushes to `aa/**` branches start no separate run: the PR run already reports every required context on the head commit, and a newer push to the same PR cancels the superseded PR run. There are no workflow path filters that could silently omit a required context.
+`.github/workflows/ci.yml` runs the five public jobs on pull requests targeting `main` or `aa/**`, on pushes to `main`, and on manual `workflow_dispatch`. Pushes to `aa/**` branches start no separate run: the PR run already reports every required context on the head commit, and a newer PR event (push, reopen, or edit/retarget) cancels the superseded PR run. There are no workflow path filters that could silently omit a required context.
 
 Inside `ci/host-build-test`, PR runs skip only the 600 s `ipc-bench-happy-600` throughput gate, and only when `tools/ci/ipc_bench_gate.py` shows that the PR leaves the benchmark's sources, every ninja command that builds `aa-ipc-bench` and its test registration identical to the PR base (any difference or error runs it; `ci_ipc_bench_gate` tests the classification). A PR that edits `.github/workflows/ci.yml` always runs it, since runner-image or provisioning changes do not show up in that comparison. Every other test (including `input_sensors_memory` under Valgrind memcheck) runs on every PR, and the throughput gate runs on every push to `main` and on dispatch, so a throughput regression that does not come from the PR's own changes to the benchmark build (for example runner image or toolchain drift) is caught after merge, not before. The jobs use only `contents: read`, a full-commit-pinned checkout with credential persistence disabled, and no artifact upload or cache actions.
 
@@ -61,12 +61,15 @@ step that fails unless `ci/base-validators` **succeeded**, for every event type 
 `!cancelled()`, because a *skipped* required job would otherwise count as passing; `skipped` is
 not accepted, so `gh workflow run ci.yml --ref <pr-branch>` cannot produce a green
 `ci/provenance-lint` without the trusted validators). `pull_request` runs on `opened`,
-`synchronize` and `reopened` only: `edited` would cancel and restart the whole run (including the
-600 s ipc bench when it applies) on every title or body edit, and since the validators always come
-from `main`, a retarget no longer changes what they check. **After retargeting a PR, close and
-reopen it, or push a commit, to rerun CI.** Do not replace this with job-level `if:` skipping: a
-skipped required job counts as passing. Optionally add `ci/base-validators` to the ruleset's
-required contexts after its first run.
+`synchronize`, `reopened`, and `edited` so retargeting a PR (changing its base branch)
+automatically starts a fresh CI run against the updated base/merge result instead of retaining
+stale green required checks from the previous base. `concurrency` cancels any superseded
+in-progress run on the same PR, and required jobs never use job-level `if:` skips (a skipped
+required job counts as passing). Because GitHub also emits `edited` on title or body updates,
+a title or body edit now cancels any in-progress run and reruns CI (including the 600 s
+`ipc-bench-happy-600` gate when it applies) — this is the cost of closing the retarget hole
+while strict up-to-date enforcement is off. Optionally add `ci/base-validators` to the
+ruleset's required contexts after its first run.
 
 If a PR legitimately changes one of these validators or their pinned constants, the base run
 fails by design: land the validator change on its own first (the owner reviews it explicitly),
