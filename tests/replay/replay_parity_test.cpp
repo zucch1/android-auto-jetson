@@ -12,6 +12,7 @@
 #include <aa/replay/Fixture.hpp>
 #include <aa/replay/Recorder.hpp>
 #include <aa/replay/Schema.hpp>
+#include "tamper.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -127,4 +128,53 @@ TEST(ReplayParity, NearLimitBudgetsRoundTrip) {
     expect_roundtrip(recorder);
 }
 
+} // namespace
+
+namespace {
+TEST(ReplayParity, ConfiguredScreenSurvivesFixtureExportAndLoad) {
+    replay::Recorder recorder;
+    fill_video(recorder, 32, 1);
+    proto::VideoConfiguration video{{{1280, 720, 30}}};
+    video.screen.density = 240;
+    video.screen.real_density = 210;
+    video.screen.theme = 2;
+    video.screen.width_margin = 20;
+    video.screen.height_margin = 40;
+    video.screen.pixel_aspect_ratio_e4 = 10000;
+    video.screen.decoder_additional_depth = 1;
+    video.screen.margins = aa::config::ScreenInsets{1, 2, 3, 4};
+    video.screen.content_insets = aa::config::ScreenInsets{5, 6, 7, 8};
+    video.screen.stable_content_insets = aa::config::ScreenInsets{9, 10, 11, 12};
+    ASSERT_TRUE(recorder.set_services({{proto::ServiceKey{99}, proto::ChannelRole::video, video}}));
+    const auto exported = recorder.export_fixture();
+    ASSERT_TRUE(exported);
+    const auto loaded = replay::load_fixture(exported.value().file_bytes);
+    ASSERT_TRUE(loaded);
+    ASSERT_EQ(loaded.value().services.size(), 1u);
+    EXPECT_EQ(std::get<proto::VideoConfiguration>(loaded.value().services.front().configuration), video);
+}
+} // namespace
+
+namespace {
+TEST(ReplayParity, NonCanonicalScreenObjectsAreRejectedSoRoundTripsStayStable) {
+    // The exporter omits a default screen and always writes "density" first, so
+    // a screen object that loads as the default (or lacks density) could never
+    // re-export to the same bytes. The loader refuses those instead.
+    replay::Recorder recorder;
+    fill_video(recorder, 32, 1);
+    proto::VideoConfiguration video{{{1280, 720, 30}}};
+    video.screen.density = 240;
+    ASSERT_TRUE(recorder.set_services({{proto::ServiceKey{99}, proto::ChannelRole::video, video}}));
+    const auto exported = recorder.export_fixture();
+    ASSERT_TRUE(exported);
+    ASSERT_TRUE(replay::load_fixture(exported.value().file_bytes));
+    for (const auto& [from, to] : {std::pair<const char*, const char*>{R"("screen":{"density":240})", R"("screen":{})"},
+                                   {R"("screen":{"density":240})", R"("screen":{"density":160})"},
+                                   {R"("screen":{"density":240})", R"("screen":{"real-density":210})"},
+                                   {R"("screen":{"density":240})", R"("screen":{"density":240,"density":240})"}}) {
+        const auto bad = replaytest::tamper_resealed(exported.value().file_bytes, from, to);
+        ASSERT_TRUE(bad) << to;
+        EXPECT_FALSE(replay::load_fixture(*bad)) << to;
+    }
+}
 } // namespace

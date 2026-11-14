@@ -4,6 +4,7 @@
 #include "FieldAccess.hpp"
 
 #include <aa/replay/Schema.hpp>
+#include <set>
 
 namespace aa::replay::detail {
 namespace {
@@ -26,9 +27,10 @@ core::Result<ServiceEntry> parse_service(const JsonValue& value) {
         return malformed();
     }
     if (has_video) {
-        if (const auto keys = expect_keys(value, {"id", "role", "video"}); !keys) {
-            return keys.error();
-        }
+        const auto keys = field(value, "screen").is_null()
+            ? expect_keys(value, {"id", "role", "video"})
+            : expect_keys(value, {"id", "role", "video", "screen"});
+        if (!keys) { return keys.error(); }
     } else if (has_audio) {
         if (const auto keys = expect_keys(value, {"id", "role", "audio"}); !keys) {
             return keys.error();
@@ -56,6 +58,23 @@ core::Result<ServiceEntry> parse_service(const JsonValue& value) {
             return malformed();
         }
         protocol::VideoConfiguration configuration;
+        const auto& screen = field(value, "screen");
+        if (!screen.is_null()) {
+            if (!screen.is_object()) { return malformed(); }
+            std::set<std::string> seen;
+            for (const auto& [key, raw] : screen.as_object()) {
+                const auto number = u32_of(raw);
+                if (!number || !seen.insert(key).second
+                    || !config::parse_screen_option(configuration.screen, key, std::to_string(number.value()))) {
+                    return malformed();
+                }
+            }
+            // Canonical form only, so load -> export is byte-stable: the exporter
+            // omits a default screen and always writes "density" first.
+            if (configuration.screen == config::Screen{} || !seen.contains("density")) {
+                return malformed();
+            }
+        }
         for (const auto& item : *profiles) {
             const auto* triple = array_of(item);
             if (triple == nullptr || triple->size() != 3) {
