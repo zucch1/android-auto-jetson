@@ -777,6 +777,46 @@ def sc_two_sibling_header_ambiguity(f: Path) -> str:
     return ""
 
 
+def sc_malformed_triage_summary(f: Path) -> str:
+    orig_text = (f / INVENTORY).read_text(encoding="utf-8")
+    orig_data = json.loads(orig_text)
+
+    def _assert_guard_fails(mutated: object, expected_code: str, label: str) -> None:
+        save(f, INVENTORY, mutated)
+        res = run(f, "--check")
+        if res.returncode != 1:
+            raise SystemExit(f"FAIL ({label}): expected exit 1, got {res.returncode}")
+        if "Traceback" in res.stdout or "Traceback" in res.stderr:
+            raise SystemExit(f"FAIL ({label}): guard raised an unhandled traceback:\n{res.stderr}")
+        if expected_code not in res.stderr:
+            raise SystemExit(f"FAIL ({label}): expected '{expected_code}' in stderr:\n{res.stderr}")
+
+    # 1. triage_summary as list []
+    bad_list = dict(orig_data)
+    bad_list["triage_summary"] = []
+    _assert_guard_fails(bad_list, "CHANNEL_ANNOTATION_MISMATCH", "triage_summary=[]")
+
+    # 2. per_channel row with unhashable channel value
+    bad_row = json.loads(orig_text)
+    bad_row["triage_summary"]["per_channel"] = [{"channel": ["unhashable"]}]
+    _assert_guard_fails(bad_row, "CHANNEL_ANNOTATION_MISMATCH", "unhashable per_channel row")
+
+    # 3. malformed schema_sets + null triage_summary
+    bad_sets = dict(orig_data)
+    bad_sets["schema_sets"] = {"aasdk": {"messages": [], "enums": {}}, "oaa": None}
+    bad_sets["triage_summary"] = None
+    _assert_guard_fails(bad_sets, "ENTITY_ANNOTATION_MISMATCH", "malformed schema_sets + null triage_summary")
+
+    # 4. non-object root JSON
+    _assert_guard_fails([], "INVENTORY_DRIFT", "root list []")
+
+    # 5. triage_summary as null (left on disk for main()'s final --check verification)
+    bad_null = dict(orig_data)
+    bad_null["triage_summary"] = None
+    _assert_guard_fails(bad_null, "CHANNEL_ANNOTATION_MISMATCH", "triage_summary=null")
+    return "CHANNEL_ANNOTATION_MISMATCH"
+
+
 SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "baseline": sc_baseline,
     "drift-inventory": sc_drift_inventory,
@@ -819,6 +859,7 @@ SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "entity-annotation-mismatch": sc_entity_annotation_mismatch,
     "channel-annotation-mismatch": sc_channel_annotation_mismatch,
     "two-sibling-header-ambiguity": sc_two_sibling_header_ambiguity,
+    "malformed-triage-summary": sc_malformed_triage_summary,
 }
 
 

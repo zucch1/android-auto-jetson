@@ -120,11 +120,14 @@ def _format_annotation_field(sources_by_val: dict[str, set[tuple[str, str, str, 
 
 def annotation_values(ann: dict[str, Any] | None, field: str) -> list[str]:
     """Extract sorted list of string values from either structured or legacy annotation field."""
-    if not ann:
+    if not isinstance(ann, dict):
         return []
     val = ann.get(field)
     if isinstance(val, dict):
-        return [str(item["value"]) for item in val.get("values", []) if isinstance(item, dict) and "value" in item]
+        items = val.get("values", [])
+        if not isinstance(items, list):
+            return []
+        return [str(item["value"]) for item in items if isinstance(item, dict) and "value" in item]
     if isinstance(val, list):
         return [str(x) for x in val]
     return []

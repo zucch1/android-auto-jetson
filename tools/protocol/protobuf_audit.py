@@ -693,81 +693,136 @@ def iter_text_files(root: Path) -> list[str]:
     return out
 
 
-def _check_inventory_annotations(on_disk: dict[str, Any], fresh: dict[str, Any]) -> list[str]:
+def _valid_disk_annotation_obj(ann: Any) -> bool:
+    if not isinstance(ann, dict):
+        return False
+    for key in ("confidence", "wire_msg_ids", "directions", "version_gates"):
+        if key not in ann:
+            continue
+        field = ann[key]
+        if isinstance(field, dict):
+            vals = field.get("values", [])
+            if not isinstance(vals, list) or not all(isinstance(item, dict) and "value" in item for item in vals):
+                return False
+        elif not isinstance(field, list):
+            return False
+    return True
+
+
+def _check_inventory_annotations(on_disk: Any, fresh: dict[str, Any]) -> list[str]:
     errs: list[str] = []
+    if not isinstance(on_disk, dict):
+        return ["INVENTORY_DRIFT: inventory root must be a JSON object"]
     disk_sets = on_disk.get("schema_sets")
     fresh_sets = fresh["schema_sets"]
+    catalog_valid = True
     if not isinstance(disk_sets, dict):
-        return ["ENTITY_ANNOTATION_MISMATCH: inventory schema_sets is missing or not an object"]
-    valid_sides = True
-    for side in ("aasdk", "oaa"):
-        ds = disk_sets.get(side)
-        fs = fresh_sets[side]
-        if not isinstance(ds, dict):
-            errs.append(f"ENTITY_ANNOTATION_MISMATCH: schema_sets.{side} is missing or not an object")
-            valid_sides = False
-            continue
-        for col in ("messages", "enums"):
-            dc = ds.get(col)
-            fc = fs[col]
-            if not isinstance(dc, dict):
-                errs.append(f"ENTITY_ANNOTATION_MISMATCH: schema_sets.{side}.{col} is missing or not an object")
-                valid_sides = False
+        errs.append("ENTITY_ANNOTATION_MISMATCH: inventory schema_sets is missing or not an object")
+        catalog_valid = False
+    else:
+        for side in ("aasdk", "oaa"):
+            ds = disk_sets.get(side)
+            fs = fresh_sets[side]
+            if not isinstance(ds, dict):
+                errs.append(f"ENTITY_ANNOTATION_MISMATCH: schema_sets.{side} is missing or not an object")
+                catalog_valid = False
                 continue
-            for fqn, f_ent in fc.items():
-                d_ent = dc.get(fqn)
-                if not isinstance(d_ent, dict) or "annotations" not in d_ent:
-                    errs.append(f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} is missing 'annotations'")
+            for col in ("messages", "enums"):
+                dc = ds.get(col)
+                fc = fs[col]
+                if not isinstance(dc, dict):
+                    errs.append(f"ENTITY_ANNOTATION_MISMATCH: schema_sets.{side}.{col} is missing or not an object")
+                    catalog_valid = False
                     continue
-                if d_ent["annotations"] != f_ent["annotations"]:
-                    errs.append(
-                        f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} annotations in inventory "
-                        f"differ from parser output"
-                    )
-    if (
-        valid_sides
-        and all(
-            isinstance(disk_sets[s][c], dict)
-            and all(isinstance(v, dict) and "file" in v for v in disk_sets[s][c].values())
-            for s in ("aasdk", "oaa") for c in ("messages", "enums")
-        )
-        and all(
-            isinstance(v, dict) and "values" in v
-            for s in ("aasdk", "oaa") for v in disk_sets[s]["enums"].values()
-        )
-    ):
-        derived_cat = pt._derive_channel_catalog(disk_sets)
-        disk_pc = on_disk.get("triage_summary", {}).get("per_channel")
-        if not isinstance(disk_pc, list):
-            errs.append("CHANNEL_ANNOTATION_MISMATCH: triage_summary.per_channel is missing or not a list")
-        else:
-            seen_channels: set[str] = set()
-            for row in disk_pc:
-                if not isinstance(row, dict) or "channel" not in row:
-                    errs.append("CHANNEL_ANNOTATION_MISMATCH: malformed per_channel row")
-                    continue
-                ch = row["channel"]
-                seen_channels.add(ch)
-                crec = derived_cat.get(ch, {})
-                checks = (
-                    ("aasdk_entities", crec.get("aasdk_entities", 0)),
-                    ("oaa_entities", crec.get("oaa_entities", 0)),
-                    ("wire_msg_ids", sorted(crec.get("wire_msg_ids", set()))),
-                    ("directions", sorted(crec.get("directions", set()))),
-                    ("version_gates", sorted(crec.get("version_gates", set()))),
-                    ("oaa_confidence", sorted(crec.get("oaa_confidence", set()))),
-                )
-                for key, expected_val in checks:
-                    if row.get(key) != expected_val:
+                for fqn, d_ent in dc.items():
+                    if not isinstance(d_ent, dict) or not isinstance(d_ent.get("file"), str):
                         errs.append(
-                            f"CHANNEL_ANNOTATION_MISMATCH: channel '{ch}' {key}={row.get(key)!r} "
-                            f"disagrees with per-entity aggregation {expected_val!r}"
+                            f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} is malformed or missing string 'file'"
                         )
-            for missing_ch in sorted(set(derived_cat) - seen_channels):
-                errs.append(
-                    f"CHANNEL_ANNOTATION_MISMATCH: channel '{missing_ch}' present in per-entity data "
-                    f"is missing from per_channel summary"
-                )
+                        catalog_valid = False
+                        continue
+                    if "annotations" in d_ent and not _valid_disk_annotation_obj(d_ent["annotations"]):
+                        errs.append(
+                            f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} has malformed 'annotations'"
+                        )
+                        catalog_valid = False
+                    if col == "enums":
+                        vals = d_ent.get("values")
+                        if not isinstance(vals, list) or not all(
+                            isinstance(v, dict)
+                            and isinstance(v.get("number"), int)
+                            and not isinstance(v.get("number"), bool)
+                            and isinstance(v.get("name"), str)
+                            for v in vals
+                        ):
+                            errs.append(
+                                f"ENTITY_ANNOTATION_MISMATCH: {side}.enums.{fqn} has malformed 'values'"
+                            )
+                            catalog_valid = False
+                for fqn, f_ent in fc.items():
+                    d_ent = dc.get(fqn)
+                    if not isinstance(d_ent, dict) or "annotations" not in d_ent:
+                        errs.append(f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} is missing 'annotations'")
+                        catalog_valid = False
+                        continue
+                    if not isinstance(d_ent["annotations"], dict):
+                        errs.append(f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} 'annotations' is not an object")
+                        catalog_valid = False
+                        continue
+                    if d_ent["annotations"] != f_ent["annotations"]:
+                        errs.append(
+                            f"ENTITY_ANNOTATION_MISMATCH: {side}.{col}.{fqn} annotations in inventory "
+                            f"differ from parser output"
+                        )
+
+    derived_cat: dict[str, dict[str, Any]] | None = None
+    if catalog_valid and isinstance(disk_sets, dict):
+        try:
+            derived_cat = pt._derive_channel_catalog(disk_sets)
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            errs.append(f"CHANNEL_ANNOTATION_MISMATCH: malformed schema_sets for channel catalog ({exc})")
+
+    triage_summary = on_disk.get("triage_summary")
+    if not isinstance(triage_summary, dict):
+        errs.append("CHANNEL_ANNOTATION_MISMATCH: triage_summary is missing or not an object")
+        return errs
+    disk_pc = triage_summary.get("per_channel")
+    if not isinstance(disk_pc, list):
+        errs.append("CHANNEL_ANNOTATION_MISMATCH: triage_summary.per_channel is missing or not a list")
+        return errs
+
+    seen_channels: set[str] = set()
+    for row in disk_pc:
+        if not isinstance(row, dict) or not isinstance(row.get("channel"), str) or not row["channel"]:
+            errs.append("CHANNEL_ANNOTATION_MISMATCH: malformed per_channel row")
+            continue
+        ch = row["channel"]
+        if ch in seen_channels:
+            errs.append(f"CHANNEL_ANNOTATION_MISMATCH: duplicate per_channel row for '{ch}'")
+            continue
+        seen_channels.add(ch)
+        if derived_cat is not None:
+            crec = derived_cat.get(ch, {})
+            checks = (
+                ("aasdk_entities", crec.get("aasdk_entities", 0)),
+                ("oaa_entities", crec.get("oaa_entities", 0)),
+                ("wire_msg_ids", sorted(crec.get("wire_msg_ids", set()))),
+                ("directions", sorted(crec.get("directions", set()))),
+                ("version_gates", sorted(crec.get("version_gates", set()))),
+                ("oaa_confidence", sorted(crec.get("oaa_confidence", set()))),
+            )
+            for key, expected_val in checks:
+                if row.get(key) != expected_val:
+                    errs.append(
+                        f"CHANNEL_ANNOTATION_MISMATCH: channel '{ch}' {key}={row.get(key)!r} "
+                        f"disagrees with per-entity aggregation {expected_val!r}"
+                    )
+    if derived_cat is not None:
+        for missing_ch in sorted(set(derived_cat) - seen_channels):
+            errs.append(
+                f"CHANNEL_ANNOTATION_MISMATCH: channel '{missing_ch}' present in per-entity data "
+                f"is missing from per_channel summary"
+            )
     return errs
 
 
@@ -809,8 +864,7 @@ def check_integrity(root: Path) -> list[str]:
         except ValueError as exc:
             errors.append(f"INVENTORY_DRIFT: {INVENTORY_PATH} is not valid JSON ({exc})")
         else:
-            if isinstance(on_disk_inv, dict):
-                errors += _check_inventory_annotations(on_disk_inv, inv)
+            errors += _check_inventory_annotations(on_disk_inv, inv)
         if inv_text != dump_json(inv):
             errors.append("INVENTORY_DRIFT: on-disk inventory does not match freshly regenerated audit "
                           "output (run --generate)")

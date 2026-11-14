@@ -157,7 +157,7 @@ set(AA_PROTOCOL_AUDIT_CASES
     entity-annotation-mismatch
     channel-annotation-mismatch
     two-sibling-header-ambiguity
-)
+    malformed-triage-summary)
 foreach(case IN LISTS AA_PROTOCOL_AUDIT_CASES)
     string(REPLACE "-" "_" test_suffix "${case}")
     add_test(NAME protocol_adapter_audit_${test_suffix}
