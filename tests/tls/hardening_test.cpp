@@ -364,11 +364,15 @@ struct TlsTransportTestAccess {
 
 namespace {
 std::atomic<std::size_t> decrypted_bytes{0};
+std::atomic<std::size_t> decrypted_reads{0};
 }
 extern "C" int __real_SSL_read(SSL*, void*, int);
 extern "C" int __wrap_SSL_read(SSL* ssl, void* buffer, int size) {
     const int count = __real_SSL_read(ssl, buffer, size);
-    if (count > 0) decrypted_bytes += static_cast<std::size_t>(count);
+    if (count > 0) {
+        decrypted_bytes += static_cast<std::size_t>(count);
+        ++decrypted_reads;
+    }
     return count;
 }
 
@@ -397,6 +401,7 @@ protected:
         ASSERT_TRUE(pair.client->set_peer_ping_interval(std::chrono::seconds{30},
             [&] { return epoch + std::chrono::milliseconds{milliseconds.load()}; }));
         decrypted_bytes = 0;
+        decrypted_reads = 0;
     }
 
     void fragment(std::span<const std::byte> bytes) {
@@ -461,6 +466,120 @@ TEST_F(FrameDeadlineTest, FragmentTrickleCannotExtendWholeFrameBudget) {
     }
     EXPECT_NE(pending.result.wait_for(0ms), std::future_status::ready);
     milliseconds = 30000;
+    EXPECT_TRUE(ready(pending));
+    const auto received = pending.result.get();
+    ASSERT_FALSE(received);
+    EXPECT_EQ(received.error().code(), aa::ErrorCode::timeout);
+    EXPECT_EQ(pair.client->receive().error().code(), aa::ErrorCode::transport_closed);
+}
+
+// One TLS record makes A and B's prefix arrive in the same SSL_read.
+TEST_F(FrameDeadlineTest, CoalescedPartialFrameExpiresAcrossReceives) {
+    const std::vector<std::byte> frame{std::byte{0}, std::byte{3}, std::byte{0},
+                                      std::byte{1}, std::byte{42}};
+    auto coalesced = frame;
+    coalesced.push_back(frame.front());
+    fragment(coalesced);
+    const auto first = pair.client->receive();
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first.value(), frame);
+    ASSERT_EQ(decrypted_bytes.load(), coalesced.size());
+    ASSERT_EQ(decrypted_reads.load(), 1u);
+
+    milliseconds = 30001;
+    fragment(std::span(frame).subspan(1));
+    const auto second = pair.client->receive();
+    ASSERT_FALSE(second);
+    EXPECT_EQ(second.error().code(), aa::ErrorCode::timeout);
+    EXPECT_EQ(pair.client->receive().error().code(), aa::ErrorCode::transport_closed);
+}
+
+TEST_F(FrameDeadlineTest, CoalescedPartialFrameCompletesWithinBudget) {
+    const std::vector<std::byte> frame{std::byte{0}, std::byte{3}, std::byte{0},
+                                      std::byte{1}, std::byte{42}};
+    auto coalesced = frame;
+    coalesced.push_back(frame.front());
+    fragment(coalesced);
+    const auto first = pair.client->receive();
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first.value(), frame);
+    ASSERT_EQ(decrypted_bytes.load(), coalesced.size());
+    ASSERT_EQ(decrypted_reads.load(), 1u);
+
+    milliseconds = 29999;
+    fragment(std::span(frame).subspan(1));
+    const auto second = pair.client->receive();
+    ASSERT_TRUE(second);
+    EXPECT_EQ(second.value(), frame);
+}
+
+TEST_F(FrameDeadlineTest, SendDoesNotExtendBufferedPartialFrameDeadline) {
+    const std::vector<std::byte> frame{std::byte{0}, std::byte{3}, std::byte{0},
+                                      std::byte{1}, std::byte{42}};
+    auto coalesced = frame;
+    coalesced.push_back(frame.front());
+    fragment(coalesced);
+    ASSERT_TRUE(pair.client->receive());
+    ASSERT_EQ(decrypted_bytes.load(), coalesced.size());
+    ASSERT_EQ(decrypted_reads.load(), 1u);
+    milliseconds = 20000;
+    ASSERT_TRUE(pair.client->send(frame));
+    milliseconds = 30001;
+    fragment(std::span(frame).subspan(1));
+    const auto second = pair.client->receive();
+    ASSERT_FALSE(second);
+    EXPECT_EQ(second.error().code(), aa::ErrorCode::timeout);
+    EXPECT_EQ(pair.client->receive().error().code(), aa::ErrorCode::transport_closed);
+}
+
+TEST_F(FrameDeadlineTest, NextPartialFrameGetsBudgetFromItsOwnFirstByte) {
+    const std::vector<std::byte> frame{std::byte{0}, std::byte{3}, std::byte{0},
+                                      std::byte{1}, std::byte{42}};
+    PendingIo pending([&] { return pair.client->receive(); });
+    EXPECT_TRUE(pending.blocked_in_poll());
+    fragment(std::span(frame).first(1));
+    EXPECT_TRUE(consumed(pending, 1));
+    milliseconds = 20000;
+    std::vector<std::byte> coalesced(frame.begin() + 1, frame.end());
+    coalesced.push_back(frame.front());
+    fragment(coalesced); // completes A and begins B, 20s after A started
+    EXPECT_TRUE(ready(pending));
+    const auto first = pending.result.get();
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first.value(), frame);
+    ASSERT_EQ(decrypted_bytes.load(), frame.size() + 1);
+    ASSERT_EQ(decrypted_reads.load(), 2u);
+
+    milliseconds = 49999; // inside B's budget, beyond A's budget
+    fragment(std::span(frame).subspan(1));
+    const auto second = pair.client->receive();
+    ASSERT_TRUE(second);
+    EXPECT_EQ(second.value(), frame);
+}
+
+TEST_F(FrameDeadlineTest, EmptyParserGetsFreshIdleBudgetAfterCompleteFrame) {
+    const std::vector<std::byte> frame{std::byte{0}, std::byte{3}, std::byte{0},
+                                      std::byte{1}, std::byte{42}};
+    fragment(frame);
+    ASSERT_TRUE(pair.client->receive());
+    milliseconds = 40000;
+    PendingIo pending([&] { return pair.client->receive(); });
+    EXPECT_TRUE(pending.blocked_in_poll());
+    milliseconds = 139999; // fresh 100s idle budget, long after A's frame budget
+    fragment(frame);
+    EXPECT_TRUE(ready(pending));
+    const auto received = pending.result.get();
+    ASSERT_TRUE(received);
+    EXPECT_EQ(received.value(), frame);
+}
+
+TEST_F(FrameDeadlineTest, IdleConnectionExpiresAtIdleBudget) {
+    PendingIo pending([&] { return pair.client->receive(); });
+    EXPECT_TRUE(pending.blocked_in_poll());
+    milliseconds = 99999;
+    EXPECT_NE(pending.result.wait_for(std::chrono::milliseconds{100}),
+              std::future_status::ready);
+    milliseconds = 100000;
     EXPECT_TRUE(ready(pending));
     const auto received = pending.result.get();
     ASSERT_FALSE(received);

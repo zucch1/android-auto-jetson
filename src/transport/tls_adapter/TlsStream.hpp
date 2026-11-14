@@ -16,10 +16,10 @@ struct TlsTransport::Impl final {
     FrameStreamIO io;
     std::function<Deadline()> now{[] { return std::chrono::steady_clock::now(); }};
     std::optional<std::chrono::milliseconds> idle_budget;
-    Deadline io_deadline{Deadline::max()};
-    // True once a receive has seen its first decrypted byte; from then on the
-    // frame budget (kFrameDeadline) replaces the idle budget.
-    bool frame_started{false};
+    // The read deadline follows the parser's partial frame across receives;
+    // writes must not overwrite it while an inbound frame is buffered.
+    Deadline read_deadline{Deadline::max()};
+    Deadline write_deadline{Deadline::max()};
 
     Impl(int socket_fd, aa::tls::Policy pol);
     ~Impl();
