@@ -146,6 +146,9 @@ public:
     virtual bool same_wireless_identity(const helper::PeerIdentity& a,
                                         const helper::PeerIdentity& b) const { return a == b; }
     virtual std::optional<helper::PeerIdentity> wireless_identity(core::PhoneId) const { return std::nullopt; }
+    // Every approved wireless identity (the bond authority sent to the helper's reconciliation);
+    // nullopt when the store is unusable, so nothing is reconciled and the helper stays fail-closed.
+    virtual std::optional<std::vector<helper::PeerIdentity>> approved_wireless() const { return std::nullopt; }
     virtual std::optional<helper::PeerIdentity> pairing_wireless_identity(core::PairingRequestId) const { return std::nullopt; }
     virtual std::optional<helper::PeerIdentity> take_expired_wireless_identity(core::PairingRequestId) {
         return std::nullopt;
@@ -269,6 +272,12 @@ private:
     // Revokes an approved phone: store forget plus tracked external revocation (ForgetPhone's core).
     core::Result<void> revoke_phone(const Registered&, core::PhoneId);
     void close_enrolment(std::string_view reason, bool bond_recorded = false);
+    // Bond reconciliation (docs/enrolment-ordering.md). Paced from refresh_consumer_owner(): due at
+    // start, after any helper failure and whenever an enrolment ends without a commit; otherwise a
+    // cheap owner/set check per second that reconciles a reappeared helper. A success resolves
+    // every revocation record's bond leg whose identity the store no longer approves.
+    void reconcile_bonds();
+    void request_reconcile() { reconcile_due_ = true; next_reconcile_ = std::chrono::steady_clock::time_point::min(); }
     bool reconcile_enrolment(core::PairingRequestId, bool bond_recorded);
     void advance_enrolment();
     struct PendingRevocation {
@@ -299,6 +308,10 @@ private:
     std::function<std::chrono::steady_clock::time_point()> clock_{};
     std::vector<PendingRevocation> revocations_;
     std::size_t source_retry_cursor_{0};
+    bool reconcile_due_{true};
+    bool reconcile_failing_{};
+    std::uint64_t reconcile_unadmitted_{};
+    std::chrono::steady_clock::time_point next_reconcile_{std::chrono::steady_clock::time_point::min()};
     std::optional<Registered> registered_{};
     ProjectionState projection_{ProjectionState::stopped};
     std::optional<Viewport> viewport_{};

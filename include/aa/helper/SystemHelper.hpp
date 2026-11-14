@@ -53,6 +53,11 @@ public:
     // Admits the provisional bond. The receiver calls it only after its durable trust write;
     // a failure leaves the bond unadmitted with its cleanup obligation intact.
     virtual core::Result<void> commit_bond() { return Error{ErrorCode::helper_rejected}; }
+    // Makes the helper's bond state match the receiver's approved wireless identities (the single
+    // authority), durably and idempotently. Low 32 bits: approved identities left unadmitted;
+    // bit 32: an open enrolment window was left to its own outcome (reconcile again later).
+    // A backend that keeps no bond state has nothing to reconcile.
+    virtual core::Result<std::uint64_t> reconcile_bonds(const std::vector<PeerIdentity>&) { return std::uint64_t{0}; }
     virtual core::Result<PairingComparison> comparison() { return Error{ErrorCode::helper_rejected}; }
     virtual core::Result<void> respond_comparison(ComparisonResponse) { return Error{ErrorCode::helper_rejected}; }
     virtual core::Result<void> revoke(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
@@ -108,6 +113,8 @@ public:
     core::Result<bool> bond_confirmed(const std::string&, Source);
     core::Result<void> acknowledge_bond(const std::string&, Source);
     core::Result<void> commit_bond(const std::string&, Source);
+    static constexpr std::size_t kMaxApprovedBonds = 256;
+    core::Result<std::uint64_t> reconcile_bonds(const std::string&, const std::vector<PeerIdentity>&);
     core::Result<PairingComparison> comparison(const std::string&, Source);
     core::Result<void> respond_comparison(const std::string&, Source, ComparisonResponse);
     core::Result<State> reconnect_peer(const std::string& sender, std::uint64_t handle);

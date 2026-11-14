@@ -36,6 +36,11 @@ public:
     core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) override;
     core::Result<void> bond_acknowledged(core::ConsumerId, core::PairingRequestId) override;
     core::Result<void> bond_committed(core::ConsumerId, core::PairingRequestId) override;
+    bool reconciles() const override { return true; }
+    // Must run on the store owner thread (it may be called with the store's own approvals).
+    core::Result<std::uint64_t> reconcile_bonds(const std::vector<PeerIdentity>&, bool force) override;
+    // The store's approved wireless identities, the set every reconciliation sends.
+    static std::vector<PeerIdentity> approved_bonds(const trust::ApprovedPhoneStore&);
     core::Result<PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) override;
     core::Result<void> respond_comparison(core::ConsumerId, core::PairingRequestId, ComparisonResponse) override;
     core::Result<void> cancel(core::ConsumerId, core::PairingRequestId) override;

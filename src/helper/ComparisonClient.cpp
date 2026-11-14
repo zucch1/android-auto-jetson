@@ -49,4 +49,19 @@ core::Result<void> BusClient::respond_comparison(core::ConsumerId generation, co
     const auto result = impl_->rpc("RespondPairingComparisonV1", "tttu", writer, until);
     return result ? core::Result<void>{} : core::Result<void>{result.error()};
 }
+std::vector<PeerIdentity> BusClient::approved_bonds(const trust::ApprovedPhoneStore& store) {
+    std::vector<PeerIdentity> approved;
+    for (const auto& phone : store.phones())
+        if (const auto* wireless = std::get_if<trust::WirelessIdentity>(&phone.identity))
+            approved.push_back({wireless->bond_address, wireless->adapter});
+    return approved;
+}
+// Short lock wait: this runs from the receiver's paced refresh and must not stall control calls
+// behind an in-flight helper transaction; a miss is retried on the next pacing step.
+core::Result<std::uint64_t> BusClient::reconcile_bonds(const std::vector<PeerIdentity>& approved, bool force) {
+    const auto until = Clock::now() + std::chrono::milliseconds(500);
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(std::min(until, Clock::now() + std::chrono::milliseconds(100)))) return Error{ErrorCode::timeout};
+    return impl_->reconcile(approved, force, until);
+}
 }

@@ -122,6 +122,7 @@ void BluezBackend::Impl::close_connection() {
     connected.reset(); handoff_handle = 0;
 }
 void BluezBackend::Impl::close_admission() {
+    park();
     reject_comparison();
     window = {};
     pairing_enabled = false;
@@ -146,6 +147,7 @@ void BluezBackend::Impl::close_admission() {
 }
 void BluezBackend::Impl::close_window() { close_connection(); close_admission(); }
 void BluezBackend::Impl::reset() {
+    park();
     reject_comparison();
     ++owner_epoch;
     close_connection();

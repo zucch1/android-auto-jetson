@@ -173,6 +173,7 @@ core::Result<void> ControlService::revoke_phone(const Registered& active, core::
         if (it->snapshot.phone != phone) continue;
         const auto retried = attempt_revocation(*it);
         const bool not_durable = it->not_durable;
+        if (!it->progress.complete()) request_reconcile();
         if (it->progress.complete()) revocations_.erase(it);
         return not_durable ? core::Result<void>{Error{ErrorCode::trust_store_not_durable}} : retried;
     }
@@ -208,6 +209,9 @@ core::Result<void> ControlService::revoke_phone(const Registered& active, core::
             revocations_.push_back({*snapshot, progress, !forgotten.has_value()});
             external = attempt_revocation(revocations_.back());
             if (revocations_.back().progress.complete()) revocations_.pop_back();
+            // The store no longer approves the identity: the next reconciliation (on the next
+            // refresh, whatever happened to the RevokePeerV1 fast path) resolves the bond leg.
+            else if (peer) request_reconcile();
         }
     }
     if (!forgotten) return forgotten.error();

@@ -114,6 +114,14 @@ def probe_flow(surface: Surface) -> None:
     assert rpc("malformed")[0] == 1002
     error, handle = rpc("poll")
     assert error == 0 and handle
+    assert rpc(f"bind {handle} 9")[0] == 0
+    error, grant = rpc("issue 9")
+    # No enrolment opens before the helper's first reconciliation (the receiver's start-up answer).
+    assert error == 0 and rpc(f"open {grant}")[0] == 1000, "an enrolment opened before reconciliation"
+    assert rpc("close")[0] == 0
+    assert rpc("reconcile") == (0, 0)
+    error, handle = rpc("poll")
+    assert error == 0 and handle
     assert rpc(f"bind {handle} 1")[0] == 0
     error, grant = rpc("issue 1")
     assert error == 0 and rpc(f"open {grant}")[0] == 0

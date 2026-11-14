@@ -99,6 +99,16 @@
       <arg name="error" type="u" direction="out"/>
       <arg name="reserved" type="t" direction="out"/>
     </method>
+    <!-- Makes the helper's bond state match the receiver's approved wireless identities (the
+         single authority, at most 256), durably and idempotently. Called at receiver start, on
+         every helper incarnation change, and after an enrolment ends without a commit.
+         admitted_info: low 32 bits, approved identities left unadmitted; bit 32, an open
+         enrolment window was left to its own outcome. -->
+    <method name="ReconcileBondsV1">
+      <arg name="approved" type="a(ss)" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="admitted_info" type="t" direction="out"/>
+    </method>
     <method name="GetPairingComparisonV1">
       <arg name="consumer_generation" type="t" direction="in"/>
       <arg name="request_source" type="t" direction="in"/>

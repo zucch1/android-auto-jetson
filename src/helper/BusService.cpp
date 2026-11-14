@@ -129,6 +129,24 @@ struct BusService::Impl {
                     result = connected ? core::Result<std::uint64_t>{static_cast<std::uint64_t>(connected.value())}
                                        : core::Result<std::uint64_t>{connected.error()};
                 }
+            } else if (message.member == "ReconcileBondsV1" && message.signature == "a(ss)") {
+                // Bounded before parsing (#95): at most kMaxApprovedBonds (address, adapter)
+                // structs of 17-character strings, i.e. 48 bytes each.
+                std::vector<PeerIdentity> approved;
+                const auto length = body.read_u32();
+                bool valid = length && length.value() <= SystemHelper::kMaxApprovedBonds * 48 && body.align(8);
+                const auto end = valid ? body.position() + length.value() : 0;
+                while (valid && body.position() < end) {
+                    if (approved.size() >= SystemHelper::kMaxApprovedBonds || !body.align(8)) { valid = false; break; }
+                    const auto address = body.read_string();
+                    const auto adapter = body.read_string();
+                    if (!address || !adapter || address.value().size() > 17 || adapter.value().size() > 17) { valid = false; break; }
+                    approved.push_back({address.value(), adapter.value()});
+                }
+                if (valid && body.position() == end && body.done()) {
+                    const auto reconciled = helper.reconcile_bonds(message.sender, approved);
+                    result = reconciled ? core::Result<std::uint64_t>{reconciled.value()} : core::Result<std::uint64_t>{reconciled.error()};
+                } else result = Error{ErrorCode::helper_rejected};
             } else if (message.member == "RevokePeerV1" && message.signature == "ss") {
                 const auto address = body.read_string();
                 const auto adapter = body.read_string();

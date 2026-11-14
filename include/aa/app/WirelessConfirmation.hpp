@@ -30,6 +30,11 @@ public:
         if (deferred_) return Error{ErrorCode::helper_rejected};
         return target_.bond_committed(generation, request);
     }
+    bool reconciles() const override { return target_.reconciles(); }
+    // Not consumer-bound: the trust store's approvals, independent of any deferred teardown.
+    core::Result<std::uint64_t> reconcile_bonds(const std::vector<helper::PeerIdentity>& approved, bool force) override {
+        return target_.reconcile_bonds(approved, force);
+    }
     core::Result<void> confirmed(core::ConsumerId generation, core::PairingRequestId source) override {
         flush();
         if (deferred_) return Error{ErrorCode::helper_rejected};

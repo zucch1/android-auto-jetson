@@ -34,6 +34,14 @@ std::optional<helper::PeerIdentity> PairingPolicy::wireless_identity(core::Phone
     }
     return std::nullopt;
 }
+std::optional<std::vector<helper::PeerIdentity>> PairingPolicy::approved_wireless() const {
+    if (!store_.usable()) return std::nullopt;
+    std::vector<helper::PeerIdentity> approved;
+    for (const auto& entry : store_.phones())
+        if (const auto* wireless = std::get_if<WirelessIdentity>(&entry.identity))
+            approved.push_back({wireless->bond_address, wireless->adapter});
+    return approved;
+}
 std::optional<helper::PeerIdentity> PairingPolicy::pairing_wireless_identity(core::PairingRequestId request) const {
     const auto index = find(request);
     if (index < pending_.size() && pending_[index].reload_epoch == store_.reload_epoch()) {

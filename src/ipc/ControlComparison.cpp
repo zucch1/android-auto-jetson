@@ -70,7 +70,23 @@ void ControlService::advance_enrolment() {
     if (committed || !registered_) return;
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_commit_failed", request.value});
     const auto active = *registered_;
+    if (durable && confirmation_->reconciles()) {
+        // The approval is durable and is the authority: it stays. The enrolment ends here; retiring
+        // its source closes the helper's window, which parks the provisional bond, and the next
+        // reconciliation admits it (or finds the commit landed and only its reply was lost).
+        const auto peer = open_pairing_ ? open_pairing_->peer : std::nullopt;
+        if (open_pairing_ && open_pairing_->request == request) open_pairing_.reset();
+        retire_failed_pairing(active.consumer, request, peer);
+        (void)gate_.cancel({active.consumer, active.name}, request);
+        events_.emit(PairingClosed{request});
+        request_reconcile();
+        return;
+    }
+    // A non-durable (703) approval is retracted: the store forget and the tracked revocation, then
+    // reconciliation. If the retraction cannot be written either, the approval remains in the store
+    // and reconciliation keeps the helper consistent with it.
     if (phone) (void)revoke_phone(active, phone);
+    request_reconcile();
 }
 
 core::Result<std::map<std::string, std::string>> ControlService::pairing_comparison(

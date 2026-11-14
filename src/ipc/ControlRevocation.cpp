@@ -24,6 +24,14 @@ void ControlService::retire_failed_pairing(core::ConsumerId consumer, core::Pair
 void ControlService::retire_acknowledged_pairing(core::ConsumerId consumer, core::PairingRequestId request,
                                                   const std::optional<helper::PeerIdentity>& peer) {
     if (!confirmation_) return;
+    if (confirmation_->reconciles()) {
+        // The helper's journal holds the provisional bond and the store does not approve it:
+        // retiring the source closes the helper's window (parking the bond), and the next
+        // reconciliation removes it. No receiver-side bond record is needed for correctness.
+        retire_failed_pairing(consumer, request, peer);
+        request_reconcile();
+        return;
+    }
     if (!peer) { retire_failed_pairing(consumer, request, peer); return; }
     // No phone id exists and no AP approval was ever stored: only the bond and the helper's
     // source lease remain. The captured wireless identity blocks re-pairing until both are retired.
@@ -41,6 +49,39 @@ void ControlService::retire_acknowledged_pairing(core::ConsumerId consumer, core
         revocations_.back().failures = 2;
         revocations_.back().next_attempt = now() + std::chrono::seconds{1};
     }
+}
+void ControlService::reconcile_bonds() {
+    next_reconcile_ = now() + std::chrono::seconds{1};
+    const auto approved = phones_.approved_wireless();
+    if (!approved) return;  // unusable store: no authority to send; the helper stays fail-closed
+    const auto result = confirmation_->reconcile_bonds(*approved, reconcile_due_);
+    if (!result) {
+        reconcile_due_ = true;
+        if (!reconcile_failing_) events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "bond_reconcile_pending", 0});
+        reconcile_failing_ = true;
+        return;
+    }
+    reconcile_due_ = false;
+    reconcile_failing_ = false;
+    const auto unadmitted = result.value() & 0xFFFFFFFFU;
+    if (unadmitted && unadmitted != reconcile_unadmitted_)
+        events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "bond_reconcile_unadmitted", unadmitted});
+    reconcile_unadmitted_ = unadmitted;
+    // The helper's state now matches the store durably: a bond leg whose identity the store no
+    // longer approves is complete (the helper demoted it and owns its removal), so such a record can
+    // never pin capacity (finding 3). AP legs and source retirements stay with the retry paths.
+    for (auto it = revocations_.begin(); it != revocations_.end();) {
+        const auto peer = helper::revocation_peer(it->snapshot);
+        if (peer && it->progress.bond == helper::RevocationLeg::pending &&
+            std::none_of(approved->begin(), approved->end(),
+                         [&](const helper::PeerIdentity& kept) { return phones_.same_wireless_identity(kept, *peer); }))
+            it->progress.bond = helper::RevocationLeg::complete;
+        if (it->progress.complete()) {
+            events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "phone_revocation_external_complete", it->snapshot.phone.value});
+            it = revocations_.erase(it);
+        } else ++it;
+    }
+    source_retry_cursor_ = revocations_.empty() ? 0 : source_retry_cursor_ % revocations_.size();
 }
 std::optional<helper::RevocationProgress> ControlService::revocation_progress(core::PhoneId phone) const {
     for (const auto& record : revocations_) {

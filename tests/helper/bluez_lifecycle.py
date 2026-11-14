@@ -43,6 +43,7 @@ def unregister_stays_off(build: Path) -> None:
             # Given a registered real daemon and a pending exact-peer grant.
             surface = Surface(stack, build, Path(temporary), probe=True)
             assert rpc(surface, "execute 7") == (0, 1)
+            assert rpc(surface, "reconcile") == (0, 0)  # the receiver's start-up answer: nothing approved
             command(surface.mock, "paired")
             error, handle = rpc(surface, "poll")
             assert error == 0 and handle

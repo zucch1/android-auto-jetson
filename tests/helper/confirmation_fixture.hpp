@@ -72,6 +72,16 @@ public:
     std::optional<std::size_t> retirement_limit;
     std::vector<std::vector<helper::RetirementSource>> retirement_batches;
     std::function<void()> on_forget{}, on_confirm{};
+    // Bond reconciliation (off by default: the tracked-revocation path of a non-reconciling helper).
+    bool reconciling{};
+    core::Result<std::uint64_t> reconciliation{std::uint64_t{0}};
+    std::vector<std::vector<helper::PeerIdentity>> reconciled_sets;
+    std::vector<bool> reconcile_forced;
+    bool reconciles() const override { return reconciling; }
+    core::Result<std::uint64_t> reconcile_bonds(const std::vector<helper::PeerIdentity>& approved, bool force) override {
+        reconciled_sets.push_back(approved); reconcile_forced.push_back(force);
+        return reconciliation;
+    }
     explicit Bridge(trust::ApprovedPhoneStore& approvals) : store(approvals) {}
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override {
         ++confirmations;

@@ -66,10 +66,18 @@ public:
         return acknowledged;
     }
     core::Result<void> bond_committed(core::ConsumerId g, core::PairingRequestId r) override {
+        // Process exit after the durable trust write, before the commit is sent (crash window 1).
+        if (exit_before_commit) std::_Exit(9);
         if (hold_commit) return Error{ErrorCode::helper_unavailable};
         return target_.bond_committed(g, r);
     }
-    bool exit_after_acknowledgement{}, hold_commit{};
+    bool reconciles() const override { return target_.reconciles(); }
+    core::Result<std::uint64_t> reconcile_bonds(const std::vector<PeerIdentity>& approved, bool force) override {
+        ++reconciliations;
+        return target_.reconcile_bonds(approved, force);
+    }
+    bool exit_after_acknowledgement{}, hold_commit{}, exit_before_commit{};
+    int reconciliations{};
     core::Result<void> cancel(core::ConsumerId g, core::PairingRequestId r) override { return target_.cancel(g, r); }
     void teardown(core::ConsumerId g) override { target_.teardown(g); }
     RevocationAttempt forgotten_v1(const RevocationV1& s, const RevocationProgress& p) override { return target_.forgotten_v1(s, p); }
@@ -156,8 +164,13 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
             if (command == "cancelled") cancellation.request_stop();
             const auto response = helper.value()->call(request, core::Milliseconds{command == "timeout" ? 0 : 1000}, cancellation.get_token());
             result = response ? core::Result<void>{} : core::Result<void>{response.error()};
-        } else if (command == "exit-after-ack" || command == "hold-commit" || command == "release-commit") {
+        } else if (command == "reconciliations") {
+            std::cout << confirmation.reconciliations << '\n' << std::flush;
+            continue;
+        } else if (command == "exit-after-ack" || command == "hold-commit" || command == "release-commit" ||
+                   command == "exit-before-commit") {
             if (command == "exit-after-ack") confirmation.exit_after_acknowledgement = true;
+            else if (command == "exit-before-commit") confirmation.exit_before_commit = true;
             else confirmation.hold_commit = command == "hold-commit";
             result = {};
         } else if (command == "fault-dir" || command == "fault-temp" || command == "fault-clear") {

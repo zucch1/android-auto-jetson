@@ -104,6 +104,7 @@ public:
     bool same_wireless_identity(const helper::PeerIdentity& a,
                                 const helper::PeerIdentity& b) const override;
     std::optional<helper::PeerIdentity> wireless_identity(core::PhoneId phone) const override;
+    std::optional<std::vector<helper::PeerIdentity>> approved_wireless() const override;
     std::optional<helper::PeerIdentity> pairing_wireless_identity(core::PairingRequestId request) const override;
 
     [[nodiscard]] const std::optional<TransportIdentity>& candidate() const noexcept {

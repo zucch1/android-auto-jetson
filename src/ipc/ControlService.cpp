@@ -47,6 +47,8 @@ std::chrono::steady_clock::time_point ControlService::now() const {
 }
 
 void ControlService::refresh_consumer_owner() {
+    // Reconcile first: a success resolves bond legs, so those records never reach the retry loop.
+    if (confirmation_ != nullptr && confirmation_->reconciles() && now() >= next_reconcile_) reconcile_bonds();
     if (!revocations_.empty()) {
         const auto started = now();
         const auto deadline = started + kSourceRetirementTimeBudget;

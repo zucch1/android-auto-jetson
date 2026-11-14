@@ -55,8 +55,14 @@ core::Result<std::unique_ptr<BusClient>> BusClient::private_bus_for_test(const s
 }
 core::Result<void> BusClient::confirmed(core::ConsumerId generation, core::PairingRequestId source) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    // Called by ControlService on the store owner thread, so the approvals can be read here.
+    const auto approved = approved_bonds(impl_->store);
     std::unique_lock lock{impl_->mutex, std::defer_lock};
     if (!lock.try_lock_until(until) || Clock::now() >= until) return Error{ErrorCode::timeout};
+    // The helper opens no enrolment before its first reconciliation: reconcile an incarnation this
+    // client has not reconciled yet (a no-op check otherwise), within the same budget.
+    if (const auto reconciled = impl_->reconcile(approved, false, until); !reconciled) return reconciled.error();
+    if (Clock::now() >= until) return Error{ErrorCode::timeout};
     if (impl_->pending.size() + 2 > SystemHelper::kMaxPending) return Error{ErrorCode::helper_rejected};
     for (const auto action : {Action::acquire_ap, Action::open_pairing}) {
         MessageWriter writer;
@@ -164,8 +170,12 @@ core::Result<State> BusClient::reconnect(const trust::TransportIdentity& identit
     const auto key = trust::validated_key(identity);
     if (!key || impl_->store.lookup(trust::PhoneIdentity{key.value()}) != trust::Decision::approved)
         return Error{ErrorCode::trust_unknown_phone};
+    // Runs on the store owner thread, so the approvals can be read here.
+    const auto approved = approved_bonds(impl_->store);
     std::unique_lock lock{impl_->mutex, std::defer_lock};
     if (!lock.try_lock_until(until) || Clock::now() >= until) return Error{ErrorCode::timeout};
+    // A helper incarnation this client has not reconciled admits nothing: reconcile first.
+    if (const auto reconciled = impl_->reconcile(approved, false, until); !reconciled) return reconciled.error();
     const auto peer = impl_->observe(until);
     if (!peer) return peer.error();
     const trust::TransportIdentity observed{trust::WirelessIdentity{peer.value().identity.address, peer.value().identity.adapter}};

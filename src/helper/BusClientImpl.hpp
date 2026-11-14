@@ -18,6 +18,49 @@ struct BusClient::Impl {
     std::optional<Source> ap_source;
     std::string helper_owner;
     std::uint32_t helper_uid{};
+    // The helper incarnation (unique name) that last reconciled `reconciled_set` successfully.
+    std::string reconciled_owner;
+    std::vector<PeerIdentity> reconciled_set;
+    std::uint64_t reconciled_result{};
+    core::Result<std::uint64_t> reconcile(const std::vector<PeerIdentity>& approved, bool force, Clock::time_point until) {
+        if (approved.size() > SystemHelper::kMaxApprovedBonds) return Error{ErrorCode::invalid_argument};
+        bus.deadline(until);
+        const auto owner = bus.get_name_owner(ipc::BusName{kBusName});
+        if (!owner) { reconciled_owner.clear(); return Error{Clock::now() >= until ? ErrorCode::timeout : ErrorCode::helper_unavailable}; }
+        if (!force && owner.value().value == reconciled_owner && approved == reconciled_set && !(reconciled_result >> 32))
+            return reconciled_result;
+        reconciled_owner.clear();
+        // A new helper incarnation holds none of the old one's grants; adopt it here (rpc() would
+        // refuse the first call after an owner change) once the UID check in rpc() passes.
+        if (!helper_owner.empty() && helper_owner != owner.value().value) {
+            const auto uid = bus.get_connection_unix_uid(owner.value());
+            if (!uid || uid.value() != helper_uid) return Error{ErrorCode::helper_rejected};
+            pending.clear(); active_source.reset(); ap_source.reset(); helper_owner = owner.value().value;
+        }
+        // Only exact BlueZ addresses can name a helper bond; any other stored wireless identity
+        // (never produced by the helper) matches nothing, so leaving it out changes nothing,
+        // whereas sending it would make the helper refuse the whole set.
+        const auto exact = [](const std::string& value) {
+            if (value.size() != 17) return false;
+            for (std::size_t i = 0; i < value.size(); ++i) {
+                const char c = value[i];
+                if (i % 3 == 2 ? c != ':' : !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) return false;
+            }
+            return true;
+        };
+        std::vector<std::pair<std::string, std::string>> entries;
+        entries.reserve(approved.size());
+        for (const auto& peer : approved)
+            if (exact(peer.address) && exact(peer.adapter)) entries.emplace_back(peer.address, peer.adapter);
+        MessageWriter writer;
+        writer.put_string_pairs(entries);
+        const auto result = rpc("ReconcileBondsV1", "a(ss)", writer, until);
+        if (!result) return result.error();
+        reconciled_owner = helper_owner;
+        reconciled_set = approved;
+        reconciled_result = result.value();
+        return result.value();
+    }
     Impl(BusConnection connection, trust::ApprovedPhoneStore& approvals)
         : bus(std::move(connection)), store(approvals) {}
     // All transaction helpers require mutex ownership, including failure cleanup.

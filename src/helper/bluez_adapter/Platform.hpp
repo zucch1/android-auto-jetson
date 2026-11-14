@@ -69,12 +69,31 @@ struct BluezBackend::Impl {
     bool comparison_accepted{};
     // The current enrolment's bond was acknowledged (provisional) and awaits the receiver's commit.
     bool acknowledged{};
+    // The receiver's trust store is the single authority; these files are its reconciled cache
+    // (docs/enrolment-ordering.md). Until the first successful ReconcileBondsV1 of this helper run
+    // nothing is admitted, no enrolment opens and no cleanup removes a bond.
+    bool reconciled{};
+    // The receiver's approved wireless identities as of its last reconciliation (plus commits
+    // since). Cleanup never removes a bonded device on this list (#74).
+    std::vector<PeerIdentity> approved;
+    // Acknowledged (provisional) bonds whose window closed without a commit: the receiver's trust
+    // write may already be durable, so only its next reconciliation decides. Never admitted, never
+    // removed by cleanup. A subset of `pending` in this helper run; empty after a restart, when the
+    // whole journal waits for reconciliation instead.
+    std::vector<PeerIdentity> awaiting;
+    // Managed bonds whose demotion has started but is not yet durably complete: never admitted.
+    std::vector<PeerIdentity> refused;
     void retire_unaccepted();
-    // Admission authority for services, reconnect and the handoff: durably on `managed` and no
-    // pending cleanup obligation. Retries an unconfirmed directory sync once.
+    // Moves the current window's acknowledged bond to `awaiting` before the window state is cleared.
+    void park();
+    // Admission authority for services, reconnect and the handoff: reconciled, durably on
+    // `managed`, no cleanup obligation, not awaiting and not being demoted. Retries an unconfirmed
+    // directory sync once.
     bool admitted(const PeerIdentity&);
-    // Moves a managed bond to `revoked`; true once it is no longer on `managed` in memory.
-    bool demote(const PeerIdentity&);
+    // Moves a managed bond to `revoked` (and, with owe_removal, records the device removal in
+    // `pending`). True only once every write is confirmed durable (rename + directory fsync); until
+    // then the identity is refused admission, and the next call or reconciliation completes it.
+    bool demote(const PeerIdentity&, bool owe_removal = true);
     bool quiet_pending{};
     int connection{-1};
     std::shared_ptr<Bootstrap> bootstrap;

@@ -32,7 +32,7 @@ TEST(HelperSchema, ComposedContractPreservesNarrowApAndPeerMethods) {
         {"PollBootstrapV1", {"tt", "utssu"}}, {"AuthorizeBootstrapV1", {"tttuu", "ut"}},
         {"GetAPCredentialsV1", {"ttt", "utssssut"}},
         {"PairingBondConfirmedV1", {"tt", "ut"}}, {"PairingBondAcknowledgedV1", {"tt", "ut"}},
-        {"PairingBondCommittedV1", {"tt", "ut"}},
+        {"PairingBondCommittedV1", {"tt", "ut"}}, {"ReconcileBondsV1", {"a(ss)", "ut"}},
         {"GetPairingComparisonV1", {"tt", "utuss"}}, {"RespondPairingComparisonV1", {"tttu", "ut"}}};
     EXPECT_EQ(actual, expected);
 }

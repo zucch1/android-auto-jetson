@@ -53,6 +53,12 @@ int main(int argc, char** argv) {
             std::string address, adapter; input >> address >> adapter;
             member = "RevokePeerV1"; signature = "ss";
             writer.put_string(address).put_string(adapter);
+        } else if (op == "reconcile") {
+            // reconcile [address adapter]...: the receiver's approved set (ReconcileBondsV1).
+            std::vector<std::pair<std::string, std::string>> approved;
+            std::string address, adapter;
+            while (input >> address >> adapter) approved.emplace_back(address, adapter);
+            member = "ReconcileBondsV1"; signature = "a(ss)"; writer.put_string_pairs(approved);
         } else if (op == "close") {
             member = "Invalidate"; signature = "tt"; writer.put_u64(0).put_u64(0);
         } else if (op == "targetless") {
