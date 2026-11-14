@@ -71,8 +71,12 @@ jobs:
         with:
           path: ${{ runner.temp }}/ccache
           key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', 'deps/manifest.lock') }}-${{ github.sha }}
+          # ccache validates every object by content (CCACHE_COMPILERCHECK=content,
+          # preprocessor mode), so a broader fallback key cannot produce a wrong
+          # object; it only avoids a cold build whenever any CMake file changes.
           restore-keys: |
             ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', 'deps/manifest.lock') }}-
+            ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-
       - name: Configure compiler cache
         run: |
           set -euo pipefail
