@@ -26558,7 +26558,7 @@
     "status": "deferred",
     "version_applicability": "GAL 4.3+ per OAA"
    },
-   "usage_mode": "strict-tag-checked",
+   "usage_mode": "direct-field",
    "used_by_receiver": true,
    "wire_affecting": false
   },
@@ -28880,7 +28880,7 @@
     "status": "deferred",
     "version_applicability": "GAL 4.3+ per OAA"
    },
-   "usage_mode": "strict-tag-checked",
+   "usage_mode": "direct-field",
    "used_by_receiver": true,
    "wire_affecting": true
   },
@@ -66656,12 +66656,12 @@
     "citations": [
      {
       "contains": "case ChannelRole::guidance_audio: wire->set_audio_type(sink::AUDIO_STREAM_GUIDANCE); break;",
-      "lines": "189",
+      "lines": "242",
       "path": "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
      },
      {
       "contains": "case ChannelRole::speech_audio: wire->set_audio_type(sink::AUDIO_STREAM_TELEPHONY); break;",
-      "lines": "191",
+      "lines": "244",
       "path": "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
      }
     ],
@@ -66704,7 +66704,7 @@
       },
       {
        "contains": "// 1. Static SDK ChannelId ordinal: reference mapping only",
-       "lines": "22",
+       "lines": "23",
        "path": "include/aa/protocol/Messages.hpp"
       }
      ],
@@ -66744,7 +66744,7 @@
      },
      {
       "contains": "// 1. Static SDK ChannelId ordinal: reference mapping only",
-      "lines": "22",
+      "lines": "23",
       "path": "include/aa/protocol/Messages.hpp"
      }
     ],
@@ -66796,12 +66796,12 @@
      "evidence": [
       {
        "contains": "nav_focus_request = 13,",
-       "lines": "49",
+       "lines": "50",
        "path": "include/aa/protocol/Messages.hpp"
       },
       {
        "contains": "nav_focus_notification = 14,",
-       "lines": "50",
+       "lines": "51",
        "path": "include/aa/protocol/Messages.hpp"
       }
      ],
@@ -66894,12 +66894,12 @@
     "citations": [
      {
       "contains": "// Control-channel discriminator. Values are the wire contract; new values are",
-      "lines": "35",
+      "lines": "36",
       "path": "include/aa/protocol/Messages.hpp"
      },
      {
       "contains": "unexpected_message = 255,",
-      "lines": "63",
+      "lines": "64",
       "path": "include/aa/protocol/Messages.hpp"
      }
     ],
@@ -67295,7 +67295,7 @@
     "citations": [
      {
       "contains": "audio_focus_notification = 19,",
-      "lines": "55",
+      "lines": "56",
       "path": "include/aa/protocol/Messages.hpp"
      }
     ],
@@ -67348,7 +67348,7 @@
     "citations": [
      {
       "contains": "voice_session_notification = 17,",
-      "lines": "53",
+      "lines": "54",
       "path": "include/aa/protocol/Messages.hpp"
      }
     ],
@@ -67425,7 +67425,7 @@
      },
      {
       "contains": "byebye_request = 15,",
-      "lines": "51",
+      "lines": "52",
       "path": "include/aa/protocol/Messages.hpp"
      }
     ],
@@ -67567,7 +67567,7 @@
     "citations": [
      {
       "contains": "wire->set_available_type(shared::MEDIA_CODEC_VIDEO_H264_BP);",
-      "lines": "169",
+      "lines": "208",
       "path": "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
      }
     ],

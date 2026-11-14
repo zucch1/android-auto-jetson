@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include <aa/config/Screen.hpp>
 
 #include <aa/core/Result.hpp>
 #include <aa/protocol/Protocol.hpp>
@@ -158,6 +159,7 @@ struct ChannelOpenResponse final {
 
 struct VideoConfiguration final {
     std::vector<VideoProfile> profiles{}; // ordered backend-supported preference
+    config::Screen screen{};
     [[nodiscard]] friend bool operator==(const VideoConfiguration &,
                                          const VideoConfiguration &) = default;
 };

@@ -94,3 +94,108 @@ The host-tested receiver listener and helper-owned RFCOMM bootstrap are implemen
 - This repository owns the receiver sidecar and its test consumer only; it does not own any production infotainment UI, autostart, or display activation.
 - Low-rate control/status over session D-Bus; bulk media over the `AF_UNIX` socket; no high-rate audio/video over D-Bus.
 - Dependencies are pinned and vendored with provenance and license review (GPL-3.0-or-later compatible).
+
+## Receiver screen description (single panel, issue #86)
+
+`aa-wired-receiver` accepts `--screen-<field> N` alongside its existing
+`--port`, `--store`, `--video-socket` and `--audio-sink` options. Values are
+unsigned decimal integers (no sign, whitespace or trailing characters).
+Invalid syntax, unknown screen fields or unsafe geometry exit with code 2,
+name the field on stderr, and fail before opening USB, sockets or the store.
+
+| Field | Accepted values | Default announcement | Gate |
+| --- | --- | --- | --- |
+| `density` | Android bucket: 120, 160, 240, 320, 480, 640 | 160 | – |
+| `real-density` | 40–1000 DPI, explicitly measured by installer | absent | – |
+| `pixel-aspect-ratio-e4` | 5000–20000 (10000 = square pixels) | absent | experimental unless 10000 |
+| `decoder-additional-depth` | 0–8 extra buffered frames | absent | – |
+| `width-margin` | pixels of the primary profile, below its width | absent | experimental if nonzero |
+| `height-margin` | pixels of the primary profile, below its height | absent | experimental if nonzero |
+| `theme` | 0 automatic, 1 light, 2 dark | absent | – |
+| `margins-{top,bottom,left,right}` | primary-profile pixels, each edge and opposing sum smaller than the active extent | absent | experimental if any edge nonzero |
+| `content-insets-{top,bottom,left,right}` | same bounds | absent | – |
+| `stable-content-insets-{top,bottom,left,right}` | same bounds | absent | – |
+
+The bounds are conservative receiver policy, not claimed protocol limits.
+
+**Per-profile meaning.** The receiver offers two stream profiles, 1280×720
+(primary, listed first) and 800×480. Pixel quantities (`width-margin`,
+`height-margin` and every inset edge) are **given in the primary profile's
+pixels** and are scaled **per axis** to each other offered profile and rounded
+half up: x (width margin, left, right) by 800/1280, y (height margin, top,
+bottom) by 480/720. So `--screen-height-margin 120` announces 120 in the
+1280×720 entry and 80 in the 800×480 entry: the same fraction of the panel
+whichever profile the phone picks. This follows the protocol, where margins and
+insets are "pixels from edge" of the stream the entry describes (open-android-auto
+`UiConfigMessages.proto` `Insets`; `VideoConfigData.proto` margin fields), so
+they cannot be one number shared by two stream sizes. Panel properties
+(`density`, `real-density`, `pixel-aspect-ratio-e4`, `decoder-additional-depth`,
+`theme`) are sent identically in every entry. Active extent is the stream extent
+minus the total stream margin, and the screen is validated against **every**
+offered profile after scaling (rounding can push a value that fits the primary
+profile over the bound in the other, for example `margins-left 1275` with
+`margins-right 4`); an invalid field exits 2 and names the field. A decoded
+discovery response must carry the primary entry's screen scaled into each other
+entry, otherwise it is malformed.
+
+**Experimental gate.** Cropping the stream to its margins and mapping touch
+through them do not exist yet: `TouchViewport{1280, 720}`
+(`src/input/Capability.cpp`) is unchanged and `video_rect()` letterboxes the full
+stream. A nonzero `width-margin`, `height-margin`, `margins-*` edge, or a
+`pixel-aspect-ratio-e4` other than 10000 (the display does not stretch for it)
+would therefore give a wrong touch mapping and a cropped or offset picture, so
+they are refused with exit 2 (`screen field needs --screen-experimental-geometry:
+<field>`) unless `--screen-experimental-geometry` is also given; then the
+receiver logs a `screen_experimental` warning naming the field and the
+consequence. `content-insets-*` and `stable-content-insets-*` describe areas the
+phone keeps its own interactive content out of; the display still draws the whole
+stream and touch maps over the whole stream, so a wrong value only wastes screen
+and is not gated. `density`, `real-density`, `decoder-additional-depth` and
+`theme` change only the phone's layout/buffering and are not gated either.
+
+Setting any edge creates its inset rectangle; the other edges of that rectangle
+are sent as **explicit zeros** (the proto2 default) and a decoder treats absent
+edges as zero too: per-edge presence is canonicalized, not preserved, and what
+the phone does with an absent versus zero edge is unverified. Other optional
+fields stay absent unless set, preserving the legacy discovery bytes exactly by
+default (golden test against the video entry `main` announced). A decoder
+ignores the obsolete `viewing_distance` field, as before. The `screen_description`
+startup event logs all configured fields in primary-profile pixels (null means
+not advertised). Density is an explicit bucket override; it is not automatically
+inferred from DPI. Do not substitute physical DPI for an Android density bucket.
+
+Example announcement experiment:
+
+```sh
+aa-wired-receiver --port 1-2.1 --screen-density 240 \
+  --screen-real-density 210 \
+  --screen-content-insets-left 12 --screen-theme 2 \
+  --screen-pixel-aspect-ratio-e4 10000 --screen-decoder-additional-depth 1
+```
+
+These options describe capabilities during service discovery; video setup
+continues to use the existing fixed stream profiles. The pinned schema has no
+separate panel refresh-rate or presentation-pacing field. Decoder depth is a
+phone buffering hint, **not** vsync or a frame-rate negotiation control (#79,
+#85). `theme` sets `ui_config.ui_theme`; automatic scheduling, sensor-driven
+night mode and ambient-light sources are not implemented by this option.
+
+Remaining issue #86 work: attached-panel/EDID detection, physical dimensions
+and automatic density selection, viewport/sub-area presentation, cropping
+stream margins and matching touchscreen mapping/type, and real-phone
+verification. In particular, advertising margins does not make the current
+display consumer crop them; nonzero margins stay behind
+`--screen-experimental-geometry` until those paths are completed. No multi-display support, obsolete viewing distance,
+new wire extensions, codec negotiation or hardware decode is added here.
+Phone screenshots at 120/160/240, non-16:9 coverage, accurate edge touch, and
+1800/7200-second qualification remain required before issue #86 can close.
+
+Replay video services may carry an optional `screen` object whose numeric keys
+are the same field names used after `--screen-` (pixel values in primary-profile
+pixels). Export preserves optional-field presence; default descriptions omit the
+object, keeping existing fixture bytes and hashes unchanged. The loader uses the
+same screen parser and geometry validation as discovery and rejects unknown keys
+and unsafe values. Only the canonical form is accepted, so load then export is
+byte-stable: a `screen` object that loads as the default (`{}`, `{"density":160}`)
+or lacks `density` is rejected. Fixtures are data, not command lines, so the
+experimental gate does not apply to them.
