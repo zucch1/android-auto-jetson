@@ -1,0 +1,198 @@
+{
+ "description": "Human-decided AASDK<->OAA pairings for definitions whose names or shapes do not allow an unambiguous automatic match. Every entry is checked by the guard: a pair naming a definition that no longer exists fails. Evidence for each decision is in decided_by/reason.",
+ "no_counterpart": [],
+ "pairs": [
+  {
+   "aasdk": "aap_protobuf.service.media.shared.message.Config",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R23",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.AVChannelSetupResponse",
+   "reason": "AV setup response, message id 0x8003 on both sides (matrix row R23)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.media.shared.message.Setup",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R20",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.AVChannelSetupRequest",
+   "reason": "AV setup request, message id 0x8000 (matrix row R20)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.media.shared.message.Start",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R21",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.AVChannelStartIndication",
+   "reason": "AV start, message id 0x8001 (matrix row R21)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.media.shared.message.Stop",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R22",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.AVChannelStopIndication",
+   "reason": "AV stop, message id 0x8002 (matrix row R22)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.media.video.message.VideoFocusRequestNotification",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R25",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.VideoFocusRequest",
+   "reason": "video focus request, message id 0x8007 (matrix row R25)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.AudioFocusNotification",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R13",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.AudioFocusResponse",
+   "reason": "audio focus response, control message id 0x0013 (matrix row R13)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.NavFocusRequestNotification",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R10",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.NavigationFocusRequest",
+   "reason": "navigation focus request, control message id 0x000D (matrix row R10)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.NavFocusNotification",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R11",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.NavigationFocusResponse",
+   "reason": "navigation focus response, control message id 0x000E (matrix row R11)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.VoiceSessionNotification",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R14 / D22-VOICE-NAME",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.VoiceSessionRequest",
+   "reason": "voice session, control message id 0x0011 (matrix row R14)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.ByeByeRequest",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R15 / D23-SHUTDOWN-NAME",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.ShutdownRequest",
+   "reason": "shutdown request, control message id 0x000F (matrix row R15)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.AuthResponse",
+   "decided_by": "agent review: src/protocol/aasdk_adapter/ControlAdapter.cpp:293 decodes MESSAGE_AUTH_COMPLETE (id 4) as ctl::AuthResponse",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.AuthCompleteIndication",
+   "reason": "control message id 4 (AASDK MESSAGE_AUTH_COMPLETE, OAA AUTH_COMPLETE); both are a single required int32 status at field 1."
+  },
+  {
+   "aasdk": "aap_protobuf.service.inputsource.message.InputFeedback",
+   "decided_by": "agent review: message id 32772 in InputMessageId/InputChannelMessage",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.InputBindingNotification",
+   "reason": "input feedback / binding notification, id 32772 on both sides; field 1 enum."
+  },
+  {
+   "aasdk": "aap_protobuf.service.media.shared.message.Config.Status",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R23 / D4-SETUP-STATUS",
+   "kind": "enum",
+   "oaa": "oaa.proto.enums.AVChannelSetupStatus.Enum",
+   "reason": "status enum of the AV setup response (WAIT=1/READY=2 vs NONE=0/FAIL=1/OK=2)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.AudioFocusRequestType",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R12",
+   "kind": "enum",
+   "oaa": "oaa.proto.enums.AudioFocusType.Enum",
+   "reason": "audio focus request type (matrix row R12)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.AudioFocusStateType",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R13",
+   "kind": "enum",
+   "oaa": "oaa.proto.enums.AudioFocusState.Enum",
+   "reason": "audio focus state (matrix row R13)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.NavFocusType",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R10",
+   "kind": "enum",
+   "oaa": "oaa.proto.messages.NavigationFocusType",
+   "reason": "navigation focus type (matrix row R10); same two value names NAV_FOCUS_NATIVE/NAV_FOCUS_PROJECTED."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.VoiceSessionStatus",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R14 / D22-VOICE-NAME",
+   "kind": "enum",
+   "oaa": "oaa.proto.messages.VoiceSessionType",
+   "reason": "voice session value enum (START=1 on both; 2 is VOICE_SESSION_END vs VOICE_SESSION_STOP)."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.ByeByeReason",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R15 / D23-SHUTDOWN-NAME",
+   "kind": "enum",
+   "oaa": "oaa.proto.enums.ShutdownReason.Enum",
+   "reason": "shutdown reason (matrix row R15); values 1-5 have identical names."
+  },
+  {
+   "aasdk": "aap_protobuf.service.media.sink.MediaMessageId",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json D1-800A-NAME, D2-8012-MISSING",
+   "kind": "enum",
+   "oaa": "oaa.proto.ids.AVChannelMessage.Enum",
+   "reason": "AV channel message id enum."
+  },
+  {
+   "aasdk": "aap_protobuf.service.inputsource.InputMessageId",
+   "decided_by": "agent review: both enumerate ids 32769-32772 of the input channel",
+   "kind": "enum",
+   "oaa": "oaa.proto.ids.InputChannelMessage.Enum",
+   "reason": "input channel message id enum."
+  },
+  {
+   "aasdk": "aap_protobuf.service.wifiprojection.WifiProjectionMessageId",
+   "decided_by": "agent review: both enumerate ids 32769-32770 (credentials request/response)",
+   "kind": "enum",
+   "oaa": "oaa.proto.ids.WifiChannelMessage.Enum",
+   "reason": "wifi channel message id enum."
+  },
+  {
+   "aasdk": "aap_protobuf.service.control.message.UserSwitchStatus",
+   "decided_by": "agent review: same nine error conditions in the same relative order, opposite sign and offset",
+   "kind": "enum",
+   "oaa": "oaa.proto.messages.UserSwitchStatus",
+   "reason": "user switch status: AASDK 0 and -1..-9, OAA 0..9."
+  },
+  {
+   "aasdk": "aap_protobuf.shared.MessageStatus",
+   "decided_by": "docs/evidence/wire-conformance-matrix.json R06 / D10-STATUS-EXTRA",
+   "kind": "enum",
+   "oaa": "oaa.proto.enums.Status.Enum",
+   "overrides_name_match": "aap_protobuf.aaw.Status is the wireless-bootstrap status enum (STATUS_WIFI_*, values -11..0), not the control/channel MessageStatus that oaa/common/StatusEnum.proto lists",
+   "reason": "channel/message status enum (matrix row R06 compares them); the numeric sets overlap on all AASDK values."
+  },
+  {
+   "aasdk": "aap_protobuf.service.media.sink.message.KeyBindingRequest",
+   "decided_by": "agent review: input channel message id 32770",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.InputBindingRequest",
+   "reason": "id 32770 INPUT_MESSAGE_KEY_BINDING_REQUEST / BINDING_REQUEST; repeated int32 keycodes at field 1. (oaa.proto.messages.BindingRequest in oaa/control/ is a different definition: scan_codes, no input-channel id.)"
+  },
+  {
+   "aasdk": "aap_protobuf.service.media.sink.message.KeyBindingResponse",
+   "decided_by": "agent review: input channel message id 32771",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.InputBindingResponse",
+   "reason": "id 32771 INPUT_MESSAGE_KEY_BINDING_RESPONSE / BINDING_RESPONSE; required int32 status at field 1."
+  },
+  {
+   "aasdk": "aap_protobuf.service.media.source.message.MicrophoneResponse",
+   "decided_by": "agent review: oaa/mic/MicrophoneOpenResponse.proto header says msg ID 0x8006 on the mic channel, HU->Phone",
+   "kind": "message",
+   "oaa": "oaa.proto.messages.MicrophoneOpenResponse",
+   "reason": "required int32 status=1 plus optional int32 at field 2. OAA also has av/AVInputOpenResponseMessage.proto (session, value) for the same id 0x8006: an OAA-internal contradictory definition, left unmatched."
+  },
+  {
+   "aasdk": "aap_protobuf.service.navigationstatus.message.NavigationManeuver.NavigationType",
+   "decided_by": "agent review: value names 0..42 identical",
+   "kind": "enum",
+   "oaa": "oaa.proto.enums.ManeuverType.Enum",
+   "overrides_name_match": "same simple name 'NavigationType' in oaa.proto.enums.NavigationType.Enum names a different, 3-value enum (NAVIGATION_UNKNOWN, TURN_BY_TURN, NEXT_TURN_IMAGE)",
+   "reason": "maneuver type enum: UNKNOWN=0, DEPART=1, NAME_CHANGE=2 ... identical names for the shared numbers. (oaa.proto.enums.NavigationType.Enum is a different 3-value enum with the same simple name.)"
+  }
+ ],
+ "schema": "aa-protobuf-audit-mapping-1"
+}

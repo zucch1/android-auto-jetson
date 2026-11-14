@@ -55,26 +55,28 @@ struct Endpoint final {
 
 } // namespace
 
-BusConnection::~BusConnection() {
+void BusConnection::close_connection() noexcept {
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
     }
 }
 
+BusConnection::~BusConnection() { close_connection(); }
+
 BusConnection::BusConnection(BusConnection&& other) noexcept
-    : fd_(other.fd_), next_serial_(other.next_serial_), unique_name_(std::move(other.unique_name_)), deadline_(other.deadline_),
+    : fd_(other.fd_), next_serial_(other.next_serial_), dropped_messages_(other.dropped_messages_),
+      unique_name_(std::move(other.unique_name_)), deadline_(other.deadline_),
       sensitive_receive_(other.sensitive_receive_) {
     other.fd_ = -1;
 }
 
 BusConnection& BusConnection::operator=(BusConnection&& other) noexcept {
     if (this != &other) {
-        if (fd_ >= 0) {
-            ::close(fd_);
-        }
+        close_connection();
         fd_ = other.fd_;
         next_serial_ = other.next_serial_;
+        dropped_messages_ = other.dropped_messages_;
         unique_name_ = std::move(other.unique_name_);
         deadline_ = other.deadline_;
         sensitive_receive_ = other.sensitive_receive_;
@@ -87,20 +89,51 @@ core::Result<ParsedMessage> BusConnection::read_message(bool sensitive) {
     sensitive_receive_ = sensitive_receive_ || sensitive;
     std::array<std::uint8_t, 16> head{};
     const auto until = deadline_.value_or(bus_io::deadline());
-    const auto got_head = bus_io::read_full(fd_, head, until);
+    std::size_t head_bytes = 0;
+    const auto got_head = bus_io::read_full(fd_, head, until, &head_bytes);
     if (!got_head.has_value()) {
+        // An idle timeout has not consumed anything and the next frame remains
+        // intact. A partial fixed header, however, has no recoverable boundary.
+        if (head_bytes != 0) {
+            close_connection();
+        }
         return got_head.error();
     }
-    const auto total = message_size(head);
-    if (!total.has_value()) {
-        return total.error();
+    const auto frame = inspect_frame(head);
+    if (!frame.has_value()) {
+        // Without a trustworthy declared size, closing is the only safe way
+        // to prevent every later read from starting mid-message.
+        close_connection();
+        return frame.error();
     }
-    std::vector<std::uint8_t> bytes(total.value());
+    if (frame.value().total_bytes > kMaxMessageBytes || !frame.value().little_endian) {
+        // Dropping big-endian frames is the smaller safe change: framing uses
+        // their byte order, while the strict value parser remains little-only.
+        std::size_t remaining = frame.value().total_bytes - head.size();
+        std::array<std::uint8_t, 4096> discarded{};
+        const core::SecretScope wipe_discarded{discarded, sensitive_receive_};
+        while (remaining > 0) {
+            const std::size_t chunk = std::min(remaining, discarded.size());
+            const auto got = bus_io::read_full(
+                fd_, std::span<std::uint8_t>{discarded}.first(chunk), until);
+            if (!got.has_value()) {
+                // A timeout/EOF during draining still leaves the stream
+                // mid-frame, so this connection must not be reused.
+                close_connection();
+                return got.error();
+            }
+            remaining -= chunk;
+        }
+        ++dropped_messages_;
+        return Error{ErrorCode::transport_message_dropped};
+    }
+    std::vector<std::uint8_t> bytes(frame.value().total_bytes);
     const core::SecretScope wipe_bytes{bytes, sensitive_receive_};
     std::copy(head.begin(), head.end(), bytes.begin());
     const auto got_rest =
         bus_io::read_full(fd_, std::span<std::uint8_t>{bytes}.subspan(head.size()), until);
     if (!got_rest.has_value()) {
+        close_connection();
         return got_rest.error();
     }
     return parse_message(bytes);

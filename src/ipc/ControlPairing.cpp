@@ -8,9 +8,11 @@ core::Result<core::PairingRequestId> ControlService::request_add_phone(const Bus
     if (!active) return active.error();
     const auto admitted = admit(caller, active.value());
     if (!admitted) return admitted.error();
+    if (revocations_.size() >= 256) return Error{ErrorCode::ipc_queue_full};
     // Reap before allocation so expired requests release their admission slots.
     for (const auto expired : phones_.reap_expired()) {
-        if (confirmation_ != nullptr) confirmation_->cancel(active.value().consumer, expired);
+        const auto peer = phones_.take_expired_wireless_identity(expired);
+        retire_failed_pairing(active.value().consumer, expired, peer);
         (void)gate_.cancel({active.value().consumer, active.value().name}, expired);
         events_.emit(PairingClosed{expired});
     }
@@ -19,15 +21,17 @@ core::Result<core::PairingRequestId> ControlService::request_add_phone(const Bus
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", 0});
         return request.error();
     }
+    std::optional<helper::PeerIdentity> prepared_peer;
     if (confirmation_ != nullptr) {
         const auto peer = confirmation_->prepare(active.value().consumer, request.value());
         core::Result<void> noted = peer ? core::Result<void>{} : core::Result<void>{peer.error()};
         if (peer && peer.value()) {
+            prepared_peer = *peer.value();
             noted = revocation_blocks(*peer.value()) ? core::Result<void>{Error{ErrorCode::trust_rejected}} :
                                                      phones_.note_wireless_candidate(*peer.value());
         }
         if (!noted) {
-            confirmation_->cancel(active.value().consumer, request.value());
+            retire_failed_pairing(active.value().consumer, request.value(), prepared_peer);
             (void)gate_.cancel({active.value().consumer, active.value().name}, request.value());
             return noted.error();
         }
@@ -35,7 +39,7 @@ core::Result<core::PairingRequestId> ControlService::request_add_phone(const Bus
     const auto bound = phones_.pairing_requested(request.value());
     if (!bound) {
         (void)gate_.cancel({active.value().consumer, active.value().name}, request.value());
-        if (confirmation_ != nullptr) confirmation_->cancel(active.value().consumer, request.value());
+        retire_failed_pairing(active.value().consumer, request.value(), prepared_peer);
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", 0});
         return bound.error();
     }
@@ -43,7 +47,7 @@ core::Result<core::PairingRequestId> ControlService::request_add_phone(const Bus
     if (captured_peer && revocation_blocks(*captured_peer)) {
         phones_.pairing_cancelled(request.value());
         (void)gate_.cancel({active.value().consumer, active.value().name}, request.value());
-        if (confirmation_) confirmation_->cancel(active.value().consumer, request.value());
+        retire_failed_pairing(active.value().consumer, request.value(), captured_peer);
         return Error{ErrorCode::trust_rejected};
     }
     events_.emit(PairingRequested{request.value()});
@@ -56,31 +60,48 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
     if (!active) return active.error();
     const auto admitted = admit(caller, active.value());
     if (!admitted) return admitted.error();
+    if (revocations_.size() >= 256) return Error{ErrorCode::ipc_queue_full};
+    const auto peer = phones_.pairing_wireless_identity(request);
+    if (peer && revocation_blocks(*peer)) return Error{ErrorCode::trust_rejected};
     const auto opened = gate_.confirm({active.value().consumer, active.value().name}, request);
     if (!opened) {
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return opened.error();
     }
-    const auto approved = phones_.pairing_confirmed(request);
-    if (!approved) {
-        if (confirmation_ != nullptr) confirmation_->cancel(active.value().consumer, request);
+    const auto live = phones_.validate_pairing(request);
+    if (!live) {
+        retire_failed_pairing(active.value().consumer, request, peer);
         (void)gate_.cancel({active.value().consumer, active.value().name}, request);
         events_.emit(PairingClosed{request});
-        events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
-        return approved.error();
+        return live.error();
     }
     if (confirmation_ != nullptr) {
         const auto granted = confirmation_->confirmed(active.value().consumer, request);
         if (!granted) {
-            // Approval may already be committed; helper failure is not a store rollback.
-            confirmation_->cancel(active.value().consumer, request);
+            // No approval has been persisted: retire the pending snapshot too.
+            phones_.pairing_cancelled(request);
+            retire_failed_pairing(active.value().consumer, request, peer);
             (void)gate_.cancel({active.value().consumer, active.value().name}, request);
             events_.emit(PairingClosed{request});
             return granted.error();
         }
     }
+    auto approved = phones_.pairing_confirmed(request);
+    if (!approved && approved.error().code() == ErrorCode::trust_store_not_durable) {
+        if (const auto committed = phones_.committed_pairing()) {
+            approved = *committed;
+            events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_approval_not_durable", request.value});
+        }
+    }
+    if (!approved) {
+        retire_failed_pairing(active.value().consumer, request, peer);
+        (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+        events_.emit(PairingClosed{request});
+        events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
+        return approved.error();
+    }
     open_pairing_ = OpenPairing{request, approved.value(), phones_.wireless_identity(approved.value()),
-                               std::chrono::steady_clock::now() + std::chrono::seconds(60)};
+                               now() + std::chrono::seconds(60)};
     events_.emit(PairingOpened{request});
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_opened", request.value});
     return {};
@@ -96,9 +117,11 @@ core::Result<void> ControlService::cancel_phone_pairing(const BusName& caller, c
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return closed.error();
     }
+    auto peer = phones_.pairing_wireless_identity(request);
+    if (!peer && open_pairing_ && open_pairing_->request == request) peer = open_pairing_->peer;
     phones_.pairing_cancelled(request);
     if (open_pairing_ && open_pairing_->request == request) open_pairing_.reset();
-    if (confirmation_ != nullptr) confirmation_->cancel(active.value().consumer, request);
+    retire_failed_pairing(active.value().consumer, request, peer);
     events_.emit(PairingClosed{request});
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_closed", request.value});
     return {};
@@ -124,7 +147,8 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
     const auto snapshot = phones_.take_revocation_v1();
     const auto peer = snapshot ? helper::revocation_peer(*snapshot) : std::nullopt;
     auto closed = phones_.take_invalidated_pairings();
-    if (open_pairing_ && (open_pairing_->phone == phone || (peer && open_pairing_->peer == peer))) {
+    if (open_pairing_ && (open_pairing_->phone == phone || (peer && open_pairing_->peer &&
+            phones_.same_wireless_identity(*peer, *open_pairing_->peer)))) {
         if (std::find(closed.begin(), closed.end(), open_pairing_->request) == closed.end())
             closed.push_back(open_pairing_->request);
         open_pairing_.reset();

@@ -6,6 +6,7 @@
 
 #include <aa/core/Cancellation.hpp>
 #include <aa/core/Result.hpp>
+#include "TcpIo.hpp"
 
 #include <cstddef>
 #include <span>
@@ -112,7 +113,8 @@ inline void close_fd(int& fd) noexcept {
 }
 
 // Resolve host:port and connect a TCP socket. Returns the connected fd or -1.
-[[nodiscard]] inline int connect_socket(const char* host, std::uint16_t port) {
+[[nodiscard]] inline int connect_socket(const char* host, std::uint16_t port,
+    const core::Deadline& deadline = {core::Deadline::Clock::now() + std::chrono::seconds{10}, {}}) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -123,12 +125,19 @@ inline void close_fd(int& fd) noexcept {
     }
     int fd = -1;
     for (addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
-        fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        fd = ::socket(ai->ai_family, ai->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, ai->ai_protocol);
         if (fd < 0) {
             continue;
         }
-        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
-            break;
+        if (!deadline.check()) { ::close(fd); fd = -1; break; }
+        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        if (errno == EINPROGRESS) {
+            const TcpIo bounded{deadline.until, {}};
+            if (bounded.wait(fd, POLLOUT, deadline.cancellation)) {
+                int error = 0;
+                socklen_t size = sizeof(error);
+                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == 0 && error == 0) break;
+            }
         }
         ::close(fd);
         fd = -1;
@@ -150,7 +159,7 @@ inline void close_fd(int& fd) noexcept {
     }
     int fd = -1;
     for (addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
-        fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        fd = ::socket(ai->ai_family, ai->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, ai->ai_protocol);
         if (fd < 0) {
             continue;
         }
@@ -186,14 +195,17 @@ inline void close_fd(int& fd) noexcept {
 }
 
 // Accept one connection on a listening fd. Returns the connected fd or -1.
-[[nodiscard]] inline int accept_socket(int listen_fd) {
+[[nodiscard]] inline int accept_socket(int listen_fd, sockaddr* peer = nullptr, socklen_t* length = nullptr,
+    const core::Deadline& deadline = {core::Deadline::Clock::now() + std::chrono::seconds{10}, {}}) {
     if (listen_fd < 0) {
         return -1;
     }
     for (;;) {
-        const int fd = ::accept(listen_fd, nullptr, nullptr);
+        const TcpIo bounded{deadline.until, {}};
+        if (!bounded.wait(listen_fd, POLLIN, deadline.cancellation)) return -1;
+        const int fd = ::accept4(listen_fd, peer, length, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
-            if (errno == EINTR) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
             return -1;

@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (test != "approved" && test != "verified") { return 1; }
-    const int expected = test == "verified" ? SSL_VERIFY_PEER : SSL_VERIFY_NONE;
+    const int expected = test == "verified" ? (SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT) : SSL_VERIFY_NONE;
     if (SSL_get_verify_mode(ssl.get()) != expected || SSL_get_min_proto_version(ssl.get()) != TLS1_2_VERSION) {
         return 1;
     }

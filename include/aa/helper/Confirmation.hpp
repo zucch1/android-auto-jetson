@@ -11,6 +11,8 @@
 
 namespace aa::helper {
 // Captured on the store owner before deletion; never changed during retries.
+// PhoneId{} denotes failed-approval source retirement only (AP complete, no
+// bond leg); the captured wireless identity still blocks pairing during retry.
 struct RevocationV1 final {
     core::PhoneId phone;
     trust::TransportIdentity identity;
@@ -46,14 +48,16 @@ struct RevocationAttempt final {
     std::size_t retired{}; // Acknowledged prefix of the supplied pending retirements.
     core::Result<void> retirement{Error{ErrorCode::helper_unavailable}};
 };
-// Called only by the receiver's control authorization boundary, after trust
-// approval succeeds. This is not an externally dispatched session method.
+// Called only by the receiver's control authorization boundary, before trust
+// approval is persisted. A failed confirmation must never grant admission.
+// This is not an externally dispatched session method.
 class Confirmation {
 public:
     virtual ~Confirmation() = default;
     virtual core::Result<void> confirmed(core::ConsumerId generation,
                                          core::PairingRequestId source) = 0;
-    virtual void cancel(core::ConsumerId generation, core::PairingRequestId source) = 0;
+    // Success acknowledges source retirement; failure must remain retryable.
+    virtual core::Result<void> cancel(core::ConsumerId generation, core::PairingRequestId source) = 0;
     virtual void teardown(core::ConsumerId generation) = 0;
     // One <=1000ms attempt, including mutex acquisition and associated cleanup.
     // Completed legs report success without another privileged request.

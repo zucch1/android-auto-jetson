@@ -34,6 +34,7 @@ set(FETCHCONTENT_SOURCE_DIR_GOOGLETEST "${AA_DEPENDENCY_STAGE}/googletest" CACHE
 set(AASDK_TEST ON)
 include("${AA_DEPENDENCY_STAGE}/googletest-declaration.cmake")
 enable_testing()
+include(cmake/Hardening.cmake)
 add_test(NAME provenance_check
     COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tools/provenance/check.py"
             --root "${CMAKE_SOURCE_DIR}")
@@ -144,6 +145,20 @@ add_subdirectory(tools/aa-ipc-bench)
 add_test(NAME ci_ipc_bench_gate COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_SOURCE_DIR}/tests/ci/ipc_bench_gate_test.py")
 set_tests_properties(ci_ipc_bench_gate PROPERTIES TIMEOUT 60)
+# H1: the ARM64 relay builds the untrusted PR tree only inside a sandbox and posts its status
+# outside it. Skips (exit 77) with a reason where no sandbox backend works (e.g. no usable
+# unprivileged user namespaces).
+add_test(NAME ci_relay_sandbox COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_SOURCE_DIR}/tests/ci/relay_sandbox_test.py")
+set_tests_properties(ci_relay_sandbox PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+# Review fixes: the PR head is exported as raw blobs (no .gitattributes filters / export-subst),
+# and the trusted base-revision validators live in their own job that poisoned shell state cannot reach.
+add_test(NAME ci_relay_export COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_SOURCE_DIR}/tests/ci/relay_export_test.py")
+set_tests_properties(ci_relay_export PROPERTIES TIMEOUT 60)
+add_test(NAME ci_workflow_trust COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_SOURCE_DIR}/tests/ci/ci_workflow_trust_test.py")
+set_tests_properties(ci_workflow_trust PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 
 # Task 9 is mandatory: missing development inputs must not turn CI green by omission.
 add_subdirectory(tools/aa-decode-probe)
@@ -170,6 +185,9 @@ include(cmake/WirelessRecovery.cmake)
 include(cmake/WiredRecovery.cmake)
 # Task 32 wired performance/soak measurement tooling (host-side fixtures).
 include(cmake/WiredPerf.cmake)
+# All targets created by the project-owned modules above live in this directory;
+# staged GoogleTest/AASDK targets live in their own directories and are excluded.
+aa_harden_project_targets()
 if(NOT CMAKE_CROSSCOMPILING)
     foreach(suite coverage capture thermal_policy)
         add_test(NAME wired_perf_v2_${suite} COMMAND "${Python3_EXECUTABLE}" -B
@@ -189,3 +207,20 @@ if(NOT CMAKE_CROSSCOMPILING)
                 "${CMAKE_SOURCE_DIR}/tests/fixtures/media/h264_720p30_baseline_90f.h264")
     set_tests_properties(media_decode_probe_suite PROPERTIES TIMEOUT 120)
 endif()
+
+include(cmake/TlsHardening.cmake)
+
+get_property(_aa_hardened_executables GLOBAL PROPERTY AA_HARDENED_EXECUTABLES)
+if(_aa_hardened_executables)
+    list(REMOVE_DUPLICATES _aa_hardened_executables)
+    add_test(NAME build_hardening COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tools/build/hardening.py" ${_aa_hardened_executables})
+    set_tests_properties(build_hardening PROPERTIES TIMEOUT 120)
+endif()
+if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME build_hardening_checker COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/build/hardening.py")
+    set_tests_properties(build_hardening_checker PROPERTIES TIMEOUT 120)
+endif()
+
+include(cmake/HostTestScheduling.cmake)

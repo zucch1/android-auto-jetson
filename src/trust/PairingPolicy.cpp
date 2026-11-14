@@ -20,6 +20,12 @@ core::Result<void> PairingPolicy::note_wireless_candidate(const helper::PeerIden
     note_candidate(std::move(identity));
     return {};
 }
+bool PairingPolicy::same_wireless_identity(const helper::PeerIdentity& a,
+                                         const helper::PeerIdentity& b) const {
+    const auto first = validated_key(WirelessIdentity{a.address, a.adapter});
+    const auto second = validated_key(WirelessIdentity{b.address, b.adapter});
+    return first && second && first.value() == second.value();
+}
 std::optional<helper::PeerIdentity> PairingPolicy::wireless_identity(core::PhoneId phone) const {
     for (const auto& entry : store_.phones()) {
         if (entry.phone_id != phone) continue;
@@ -58,10 +64,14 @@ bool PairingPolicy::has_pending(core::PairingRequestId request) const {
 }
 
 std::vector<core::PairingRequestId> PairingPolicy::reap_expired() {
+    expired_peers_.clear();
     std::vector<core::PairingRequestId> expired;
-    const core::Nanoseconds now = clock_.now();
     for (std::size_t index = 0; index < pending_.size();) {
-        if (now.count > pending_[index].deadline.count) {
+        if (this->expired(pending_[index])) {
+            if (const auto* wireless = std::get_if<WirelessIdentity>(&pending_[index].identity)) {
+                expired_peers_.push_back({pending_[index].request,
+                    helper::PeerIdentity{wireless->bond_address, wireless->adapter}});
+            }
             expired.push_back(pending_[index].request);
             drop_at(index);  // rejected and never persisted
             continue;
@@ -69,6 +79,18 @@ std::vector<core::PairingRequestId> PairingPolicy::reap_expired() {
         ++index;
     }
     return expired;
+}
+
+std::optional<helper::PeerIdentity> PairingPolicy::take_expired_wireless_identity(
+    core::PairingRequestId request) {
+    for (auto it = expired_peers_.begin(); it != expired_peers_.end(); ++it) {
+        if (it->first == request) {
+            auto peer = std::move(it->second);
+            expired_peers_.erase(it);
+            return peer;
+        }
+    }
+    return std::nullopt;
 }
 
 core::Result<void> PairingPolicy::forget(core::PhoneId phone) {
@@ -138,10 +160,13 @@ core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId reque
         // Fail closed: a request with no presented phone approves nothing.
         return Error{ErrorCode::trust_unknown_phone};
     }
-    if (refuses_wired_authorization(identity_key(*candidate_))) {
-        // Audit M12: a serial-less wired phone can never be approved, so the
-        // user is never prompted for a pairing that could not work.
-        return Error{ErrorCode::trust_rejected};
+    const auto wired_class = classify_wired_key(identity_key(*candidate_));
+    if (wired_class == WiredKeyClass::malformed) {
+        return Error{ErrorCode::trust_unknown_phone};
+    }
+    if (wired_class == WiredKeyClass::port_only) {
+        // Normal pairing has no separate port-only consent; reject before prompting.
+        return Error{ErrorCode::trust_port_only_requires_opt_in};
     }
     if (pending_.size() >= kMaxPending) {
         return Error{ErrorCode::ipc_queue_full};
@@ -153,23 +178,36 @@ core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId reque
     return {};
 }
 
-core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingRequestId request) {
-    const std::size_t index = find(request);
-    if (index >= pending_.size()) {
-        return Error{ErrorCode::trust_unknown_phone};
-    }
-    const core::Nanoseconds now = clock_.now();
-    if (now.count > pending_[index].deadline.count) {
-        drop_at(index);  // rejected and never persisted; the caller owns this
-                         // id's gate rollback and PairingClosed
+bool PairingPolicy::expired(const Pending& pending) const {
+    return clock_.now().count > pending.deadline.count;
+}
+
+core::Result<void> PairingPolicy::validate_pairing(core::PairingRequestId request) {
+    const auto index = find(request);
+    if (index >= pending_.size()) return Error{ErrorCode::trust_unknown_phone};
+    if (this->expired(pending_[index])) {
+        drop_at(index); // Caller releases the gate and emits PairingClosed.
         return Error{ErrorCode::session_pairing_timeout};
     }
+    return {};
+}
+
+core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingRequestId request) {
+    committed_pairing_.reset();
+    const auto live = validate_pairing(request);
+    if (!live) return live.error();
+    const auto index = find(request);
     // The identity bound at request time is what gets approved; the candidate
     // slot may have changed since and is never consulted here (no TOCTOU;
     // SNAPSHOT-ONLY PAIRING CONTRACT in PairingPolicy.hpp).
     const TransportIdentity identity = std::move(pending_[index].identity);
     drop_at(index);
-    return store_.approve(identity);
+    const auto approved = store_.approve(identity);
+    if (!approved && approved.error().code() == ErrorCode::trust_store_not_durable) {
+        for (const auto& phone : store_.phones())
+            if (identity_key(phone.identity) == identity_key(identity)) committed_pairing_ = phone.phone_id;
+    }
+    return approved;
 }
 
 void PairingPolicy::pairing_cancelled(core::PairingRequestId request) {

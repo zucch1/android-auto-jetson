@@ -98,6 +98,12 @@ public:
     [[nodiscard]] virtual core::Result<void> submit(const ipc::VideoAccessUnit& unit) = 0;
     [[nodiscard]] virtual core::Result<void> end_of_stream() = 0;
     [[nodiscard]] virtual core::Result<std::size_t> pump(core::Milliseconds wait) = 0;
+    // Live decode statistics for the display's existing telemetry/status
+    // output. Test sessions without statistics retain the zero report.
+    [[nodiscard]] virtual const consumer::DecodeReport& report() const noexcept {
+        static const consumer::DecodeReport empty{};
+        return empty;
+    }
     virtual void close() noexcept = 0;
 };
 
@@ -146,6 +152,9 @@ public:
     [[nodiscard]] core::ConsumerId consumer() const noexcept;
     [[nodiscard]] std::uint64_t frames_presented() const noexcept;
     [[nodiscard]] bool helper_started() const noexcept;
+    // Zero report when no decode session is active. The reference is valid
+    // until the next media-path release and is refreshed by decode pumping.
+    [[nodiscard]] const consumer::DecodeReport& decode_report() const noexcept;
 
     // StartProjection through the contract, then connect the todo-22 video
     // channel and open the todo-23 decode session. On any failure the
@@ -168,6 +177,12 @@ public:
 
     // Drains the video channel into the decode helper and presents decoded
     // frames to the FrameTarget; returns the frames presented this call.
+    // Retryable ipc_queue_full submission retains exactly one complete AU and
+    // resubmits it unchanged before any later receive. While that slot is
+    // occupied, later units remain in the video socket (source backpressure),
+    // never in an unbounded controller queue. IDR-resync discards and other
+    // submission failures are not retried. EOS is observed after a pending AU
+    // settles; stop/shutdown releases it with the rest of the media path.
     // Allowed in projecting and (media retained) stop_failed under the SAME
     // video/session preconditions; pump never creates a decoder or session.
     [[nodiscard]] core::Result<std::size_t> pump(core::Milliseconds wait);

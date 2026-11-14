@@ -83,6 +83,15 @@ void log_line(const std::string &json) {
     if (writer->submit(json)) { g_running.store(false); }
 }
 
+// Phone-driven media telemetry (audit L13): rate-limited per kind and never
+// blocks the calling media thread on the stdout sink. Dropped records are
+// counted and reported in-band as media_telemetry_dropped.
+void log_media(std::string_view kind, const std::string &json) {
+    auto *writer = aa::wired_receiver::active_stdout_log.load();
+    if (!writer) { std::abort(); }
+    if (writer->submit_media(kind, json)) { g_running.store(false); }
+}
+
 // Escapes free text for a JSON string value.
 std::string json_text(std::string_view text) {
     std::string out;
@@ -847,7 +856,7 @@ class ConcreteAudioRenderWorker final {
         std::optional<IdleResume> resumed;
         void publish() const {
             if (stall) {
-                log_line("{\"event\":\"audio_sink_stall\",\"blocked_from_ns\":" +
+                log_media("audio_sink_stall", "{\"event\":\"audio_sink_stall\",\"blocked_from_ns\":" +
                     std::to_string(stall->start.count) + ",\"completed_ns\":" +
                     std::to_string(stall->end.count) + ",\"stall_ns\":" +
                     std::to_string(stall->end.count - stall->start.count) + ",\"scheduled_ns\":" +
@@ -858,25 +867,25 @@ class ConcreteAudioRenderWorker final {
                     (stall->write ? sink_write_json(*stall->write) : "null") + "}");
             }
             if (resumed) {
-                log_line("{\"event\":\"audio_idle_resume\",\"id\":" + std::to_string(resumed->id) +
+                log_media("audio_idle_resume", "{\"event\":\"audio_idle_resume\",\"id\":" + std::to_string(resumed->id) +
                     ",\"start_ns\":" + std::to_string(resumed->start.count) + ",\"end_ns\":" +
                     std::to_string(resumed->end.count) + ",\"idle_ns\":" +
                     std::to_string(resumed->end.count - resumed->start.count) + ",\"reason\":\"all_role_idle\"}");
             }
             if (skipped) {
-                log_line("{\"event\":\"audio_idle_skipped\",\"id\":" + std::to_string(skipped->id) +
+                log_media("audio_idle_skipped", "{\"event\":\"audio_idle_skipped\",\"id\":" + std::to_string(skipped->id) +
                     ",\"frames_idle_skipped\":" + std::to_string(skipped->frames) +
                     ",\"frames_idle_skipped_total\":" + std::to_string(skipped->total) + "}");
             }
             for (std::size_t i = 0; i < correlated_count; ++i) {
-                log_line("{\"event\":\"audio_write_correlated\",\"scheduled_ns\":" +
+                log_media("audio_write_correlated", "{\"event\":\"audio_write_correlated\",\"scheduled_ns\":" +
                     std::to_string(completion->scheduled.count) + ",\"scheduled_end_ns\":" +
                     std::to_string(completion->scheduled_end.count) + ",\"completed_ns\":" +
                     std::to_string(completion->completed.count) + ",\"dispatch\":" +
                     audio_dispatch_json(correlated[i]) + "}");
             }
             for (std::size_t i = 0; i < credit_count; ++i) {
-                log_line("{\"event\":\"audio_credit_deferred\",\"role\":" +
+                log_media("audio_credit_deferred", "{\"event\":\"audio_credit_deferred\",\"role\":" +
                     std::to_string(static_cast<unsigned>(credits[i].id.role)) + ",\"sequence\":" +
                     std::to_string(credits[i].id.sequence) + ",\"deferred_ns\":" +
                     std::to_string(credits[i].duration) + "}");
@@ -1155,8 +1164,8 @@ class ConcreteAudioRenderWorker final {
         }
         const auto emit_media_timing = [](const auto &stats) {
             if (stats.frames_written == 0) { return; }
-            log_line(
-                "{\"event\":\"media_timing\",\"audio_scheduling_skew_ms\":" + format_ms(stats.max_completion_skew) +
+            log_media(
+                "media_timing", "{\"event\":\"media_timing\",\"audio_scheduling_skew_ms\":" + format_ms(stats.max_completion_skew) +
                 ",\"audio_latency_ms\":" + format_ms(stats.max_path_latency) + "}");
         };
         std::uint64_t chunks = 0;
@@ -1317,7 +1326,7 @@ class ConcreteAudioRenderWorker final {
             if (result && stats.frames_written > before) {
                 ++chunks;
                 if (chunks % 50 == 1) {
-                    log_line("{\"event\":\"audio_chunks\",\"count\":" + std::to_string(chunks) + "}");
+                    log_media("audio_chunks", "{\"event\":\"audio_chunks\",\"count\":" + std::to_string(chunks) + "}");
                     emit_media_timing(stats);
                 }
             }
@@ -1481,10 +1490,12 @@ class InputQueue final {
     std::deque<aa::ipc::InputEvent> queue_{};
 };
 
-// Default routing element (#60): pulsesink via pipewire-pulse. On this host's
-// GStreamer PipeWire plugin (1.0.5) a pipewiresink stream degrades after
-// ~1.5-2.3 h of continuous playback into ~340 ms blocks; pulsesink ran clean
-// side by side. --audio-sink pipewire|automatic restores the old choice.
+// Default routing element (#60, #80): pulsesink via pipewire-pulse. On the
+// target (PipeWire 1.0.5, Ubuntu noble) pipewiresink has no rate control and
+// degrades after ~1.5-2.3 h of continuous playback into ~340 ms blocks, with no
+// fixed PipeWire packaged for noble; pulsesink ran clean side by side and is
+// the default and only supported real-time route (automatic also selects
+// pulsesink; explicit pipewire is refused at startup).
 aa::audio::RouterConfig pcm_router_config(
     aa::audio::SinkBackend backend = aa::audio::SinkBackend::pulse) {
     aa::audio::RouterConfig config;
@@ -1506,7 +1517,7 @@ aa::audio::RouterConfig pcm_router_config(
         // ALWAYS present on this playback-time contract: null when the sink
         // reported no slot, so the collector invalidates A/V instead of
         // mixing in a handoff endpoint.
-        log_line("{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
+        log_media("audio_write_completed", "{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
                  std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
                  std::to_string(completion.scheduled_end.count) + ",\"completed_ns\":" +
                  std::to_string(completion.completed.count) + ",\"presented_ns\":" +
@@ -1642,8 +1653,9 @@ const char *const kUsage =
     "  --require-video-consumer defers upstream negotiation until a video\n"
     "  consumer has been accepted and installed (bounded, fail closed).\n"
     "  --audio-sink picks the routing element (default pulse: pulsesink via\n"
-    "  pipewire-pulse; pipewire: pipewiresink; automatic: pipewiresink, else\n"
-    "  pulsesink).\n"
+    "  pipewire-pulse; automatic: pulsesink; pipewire: refused because\n"
+    "  pipewiresink has no rate control on PipeWire 1.0.5 / Ubuntu noble and\n"
+    "  degrades after 1.5-2.3 h; use pulse).\n"
     "  --screen-<field> N describes the panel in service discovery. Fields:\n"
     "  density (120|160|240|320|480|640), real-density, pixel-aspect-ratio-e4,\n"
     "  decoder-additional-depth, theme (0|1|2), width-margin, height-margin,\n"
@@ -1756,6 +1768,11 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
 
+    if (store.dropped_port_only_count() != 0) {
+        log_line(std::string{"{\"event\":\"trust_store_migrated_dropped_port_only\",\"count\":"} +
+                 std::to_string(store.dropped_port_only_count()) + "}");
+    }
+
     StdoutDiagnostics sink;
     aa::diagnostics::Diagnostics diagnostics{sink};
     aa::session::SteadyClock clock{};
@@ -1763,13 +1780,18 @@ int receiver_main(int argc, char **argv) {
 
     aa::audio::RouterConfig audio_config = pcm_router_config(audio_backend);
     ConcreteAudioRenderWorker audio_sink{audio_config};
-    if (const auto opened = audio_sink.ready(); !opened) {
+    const auto opened = audio_sink.ready();
+    // Run provenance (#60, #80): log the sink selection (including any refusal
+    // cause) before failing closed on startup.
+    if (const auto report = audio_sink.sink_report();
+        opened || !report.cause.empty() || !report.candidates.empty()) {
+        log_sink_selected(report, "open");
+    }
+    if (!opened) {
         log_line(std::string{"{\"event\":\"err\",\"detail\":\"audio_router\",\"code\":\""} +
                  std::string{aa::to_string(opened.error().code())} + "\"}");
         return 3;
     }
-    // Run provenance (#60): which routing element this session uses.
-    log_sink_selected(audio_sink.sink_report(), "open");
 
     auto video =
         aa::ipc::VideoServer::listen(aa::ipc::VideoSocketPath{video_socket},
@@ -1811,7 +1833,7 @@ int receiver_main(int argc, char **argv) {
         log_line("{\"event\":\"err\",\"detail\":\"configure\"}");
         return 1;
     }
-    VideoOutlet video_outlet{log_line};
+    VideoOutlet video_outlet{log_line, log_media};
     aa::channels::InputSink input_sink;
     aa::channels::SensorSink sensor_sink{input, [&session](std::vector<std::byte> payload) {
         return session.send_channel_payload(aa::protocol::ChannelRole::sensors, std::move(payload));
@@ -1869,7 +1891,14 @@ int receiver_main(int argc, char **argv) {
     std::optional<aa::app::WiredLink> link{std::move(first_link.value())};
     session.attach_transport(link->transport.get());
     if (!bind_link_cipher(link->phone)) {
-        log_line("{\"event\":\"err\",\"detail\":\"tls_cipher\"}");
+        // The factory reports why out of band (credential class, cipher
+        // configuration); without it every cause looked like a bare null cipher.
+        std::string line = "{\"event\":\"err\",\"detail\":\"tls_cipher\"";
+        if (const auto reason = aa::transport::last_handshake_cipher_failure(); !reason.empty()) {
+            line += ",\"reason\":\"" + reason + "\"";
+        }
+        line += "}";
+        log_line(line);
         return 3;
     }
     if (!session.apply(aa::session::Event::start_discovery).has_value() ||

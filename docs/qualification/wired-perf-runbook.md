@@ -159,6 +159,21 @@ a long-lived but stalled process cannot qualify. Connection loss also invalidate
 the window. Use a continuously playing audio/video workload for qualification;
 intentional media pauses do not count as verified active projection.
 
+A collector sampling gap is host interference, not a media stall (#90). Every
+gap over 7 seconds is recorded as `interference` in the capture and in the
+result's `run_status`. After a gap over 10 seconds the collector re-polls the
+receiver log for up to 5 seconds, then judges from the receiver's own logged
+event times: every stream needs events through the gap with no silence over 10
+seconds, otherwise it is reported as `media_stalled`. Either way a gap over 10
+seconds still fails `coverage:sampling`, so an interrupted run is never a PASS;
+the interference entry explains why. `video_units` and `audio_chunks` log no
+timestamp, so the video and audio completion events stand in for their timing.
+For every sample whose stall decision depended on receiver-logged evidence
+(both >10 s gaps and post-gap event-anchored samples), the collector persists
+that exact evidence keyed by `t_ns` in `progress_evidence` so offline replay
+matches the live collector; older captures without `progress_evidence` remain
+loadable (falling back to `interference[*].logged_progress` when present).
+
 ### Measurement cutoff and cleanup diagnostics
 
 Immediately after `VideoMeasurements.finish(last_sample)`, before receiver grace

@@ -52,7 +52,7 @@ TEST(TlsLifetime, StalledHandshakeCancelsWithinDeadline) {
     ASSERT_TRUE(pair);
     aa::core::CancellationSource source;
     PendingIo pending([&] { return pair.value().client->open(source.get_token()); });
-    const bool blocked = pending.blocked(SYS_poll);
+    const bool blocked = pending.blocked_in_poll();
     // When: cancellation fires while the handshake waits for server bytes.
     source.request_stop();
     // Then: it returns cancelled promptly, well inside the 10s whole-handshake
@@ -70,7 +70,7 @@ TEST(TlsLifetime, StalledHandshakeCancelsWithinDeadline) {
 TEST(TlsLifetime, RepeatedCloseAndFdReuseDoesNoSslIo) {
     // Given: a handshaked transport whose exact socket fd is identified before
     // close via TCP getpeername (its peer is the known listener port) and /proc.
-    auto listener = tr::TlsListener::listen("127.0.0.1", 0, [] { return true; },
+    auto listener = tr::TlsListener::listen("127.0.0.1", 0, [](const tr::TlsPeerInfo& peer) { return peer.address == "127.0.0.1"; },
                                             tr::TlsMode::encryption_only_compatibility);
     ASSERT_TRUE(listener);
     const auto port = listener.value()->port();

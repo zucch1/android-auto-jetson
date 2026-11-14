@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -129,14 +130,26 @@ public:
         core::PairingRequestId request) = 0;
     [[nodiscard]] virtual core::Result<core::PhoneId> pairing_confirmed(
         core::PairingRequestId request) = 0;
+    // Validate the bound request and expire it without persisting. Called
+    // before privileged confirmation; pairing_confirmed rechecks after RPC.
+    virtual core::Result<void> validate_pairing(core::PairingRequestId) {
+        return Error{ErrorCode::trust_unknown_phone};
+    }
+    // Populated only by the last committed-but-not-durable confirmation.
+    virtual std::optional<core::PhoneId> committed_pairing() const { return std::nullopt; }
     virtual void pairing_cancelled(core::PairingRequestId request) = 0;
     [[nodiscard]] virtual std::vector<core::PairingRequestId> reap_expired() = 0;
     [[nodiscard]] virtual std::vector<core::PairingRequestId> take_invalidated_pairings() = 0;
     virtual core::Result<void> note_wireless_candidate(const helper::PeerIdentity&) {
         return Error{ErrorCode::trust_unknown_phone};
     }
+    virtual bool same_wireless_identity(const helper::PeerIdentity& a,
+                                        const helper::PeerIdentity& b) const { return a == b; }
     virtual std::optional<helper::PeerIdentity> wireless_identity(core::PhoneId) const { return std::nullopt; }
     virtual std::optional<helper::PeerIdentity> pairing_wireless_identity(core::PairingRequestId) const { return std::nullopt; }
+    virtual std::optional<helper::PeerIdentity> take_expired_wireless_identity(core::PairingRequestId) {
+        return std::nullopt;
+    }
 };
 
 // The active session user the caller's Unix UID must equal. Production fills
@@ -151,6 +164,7 @@ struct ControlServiceDeps final {
     PairingIdSource& pairing_ids;
     PhoneDirectory& phones;
     helper::Confirmation* confirmation{nullptr};
+    std::function<std::chrono::steady_clock::time_point()> clock{};
 };
 
 // Session D-Bus control dispatcher (task 21) for
@@ -169,9 +183,13 @@ struct ControlServiceDeps final {
 // status (state, capabilities, ping) stays open to every caller.
 class ControlService final {
 public:
+    static constexpr std::size_t kSourceRetirementAttemptBudget = 4;
+    static constexpr std::chrono::milliseconds kSourceRetirementTimeBudget{500};
+
     ControlService(ControlServiceConfig config, ControlServiceDeps deps)
         : config_(config), credentials_(deps.credentials), events_(deps.events),
-          phones_(deps.phones), gate_(deps.pairing_ids), confirmation_(deps.confirmation) {}
+          phones_(deps.phones), gate_(deps.pairing_ids), confirmation_(deps.confirmation),
+          clock_(std::move(deps.clock)) {}
 
     // RegisterConsumer / UnregisterConsumer.
     [[nodiscard]] core::Result<core::ConsumerId> register_consumer(const BusName& caller,
@@ -247,8 +265,14 @@ private:
         helper::RevocationV1 snapshot;
         helper::RevocationProgress progress;
         bool not_durable;
+        std::uint32_t failures{0};
+        std::chrono::steady_clock::time_point next_attempt{
+            std::chrono::steady_clock::time_point::min()};
     };
+    [[nodiscard]] std::chrono::steady_clock::time_point now() const;
     core::Result<void> attempt_revocation(PendingRevocation& record);
+    void retire_failed_pairing(core::ConsumerId, core::PairingRequestId,
+                               const std::optional<helper::PeerIdentity>&);
     bool revocation_blocks(const helper::PeerIdentity&) const;
 
     ControlServiceConfig config_{};
@@ -257,7 +281,9 @@ private:
     PhoneDirectory& phones_;
     PairingGate gate_;
     helper::Confirmation* confirmation_{};
+    std::function<std::chrono::steady_clock::time_point()> clock_{};
     std::vector<PendingRevocation> revocations_;
+    std::size_t source_retry_cursor_{0};
     std::optional<Registered> registered_{};
     ProjectionState projection_{ProjectionState::stopped};
     std::optional<Viewport> viewport_{};

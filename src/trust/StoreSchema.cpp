@@ -117,12 +117,32 @@ using Object = JsonValue::Object;
     return reject();
 }
 
-[[nodiscard]] core::Result<ApprovedPhone> parse_record(const JsonValue& value) {
+// Restrict recovery to material accepted before MAC validation. A bad adapter,
+// empty/non-printable address, or any schema defect remains fatal.
+[[nodiscard]] bool legacy_wireless(const TransportIdentity& identity) {
+    const auto* wireless = std::get_if<WirelessIdentity>(&identity);
+    return wireless && !validated_key(identity) &&
+        validated_key(OpaqueIdentity{wireless->bond_address}).has_value() &&
+        (wireless->adapter.empty() || validated_key(OpaqueIdentity{wireless->adapter}).has_value());
+}
+
+// Legacy opaque keys may contain the old wired encoding. Keep serial-backed
+// compatibility keys, but do not let a port-only grant escape migration by
+// being represented as opaque. Malformed reserved w1: encodings also return
+// true to fail closed and count as dropped port-only grants in v1/v2 migration.
+[[nodiscard]] bool implicit_port_key(std::string_view key) {
+    const auto classification = classify_wired_key(key);
+    return classification == WiredKeyClass::port_only || classification == WiredKeyClass::malformed;
+}
+
+[[nodiscard]] core::Result<ApprovedPhone> parse_record_impl(const JsonValue& value, bool has_strength) {
     if (!value.is_object()) {
         return Error{ErrorCode::trust_store_io};
     }
     const auto& members = value.as_object();
-    auto checked = exact_keys(members, {"phone_id", "identity"});
+    auto checked = has_strength
+        ? exact_keys(members, {"phone_id", "identity", "strength"})
+        : exact_keys(members, {"phone_id", "identity"});
     if (!checked.has_value()) {
         return checked.error();
     }
@@ -143,10 +163,40 @@ using Object = JsonValue::Object;
     }
     // Every record must name its phone (identity carries usable material).
     auto key = validated_key(parsed.value());
-    if (!key.has_value()) {
+    if (!key.has_value() && !legacy_wireless(parsed.value())) {
         return reject();
     }
-    return ApprovedPhone{core::PhoneId{id.value()}, std::move(parsed.value())};
+    const auto strength = strength_of(parsed.value());
+    if (has_strength) {
+        const auto* opaque = std::get_if<OpaqueIdentity>(&parsed.value());
+        if (opaque != nullptr && implicit_port_key(opaque->key)) {
+            return reject();
+        }
+        auto stored = string_member(members, "strength");
+        if (!stored.has_value() || stored.value() != strength_name(strength)) {
+            return reject();
+        }
+    }
+    return ApprovedPhone{core::PhoneId{id.value()}, std::move(parsed.value()), strength};
+}
+
+[[nodiscard]] core::Result<ApprovedPhone> parse_record(const JsonValue& value) {
+    return parse_record_impl(value, true);
+}
+
+[[nodiscard]] core::Result<ApprovedPhone> parse_v2_record(const JsonValue& value) {
+    return parse_record_impl(value, false);
+}
+
+// Old documents contain no proof of consent to a port-only grant. Drop them
+// rather than silently upgrading their authority; preserve allocation counters.
+// The dropped-port-only count also includes malformed reserved w1: keys.
+void drop_implicit_port_grants(ParsedStore& store) {
+    store.dropped_port_only_count = std::erase_if(store.phones, [](const ApprovedPhone& phone) {
+        const auto* opaque = std::get_if<OpaqueIdentity>(&phone.identity);
+        return phone.strength == IdentityStrength::port_only ||
+               (opaque != nullptr && implicit_port_key(opaque->key));
+    });
 }
 
 // Legacy version-1 record: {"phone_id": N, "key": "..."}.
@@ -200,23 +250,35 @@ using RecordParser = core::Result<ApprovedPhone> (*)(const JsonValue&);
         if (duplicate != store.phones.end()) {
             return reject();  // duplicate phone id
         }
-        // Duplicate canonical identities are rejected in BOTH schema versions:
-        // revocation is per phone id, so one identity under two ids could
-        // survive a forget and silently keep reconnect eligibility.
-        const std::string key = identity_key(record.value().identity);
-        const auto alias = std::find_if(
-            store.phones.begin(), store.phones.end(), [&key](const ApprovedPhone& existing) {
-                return identity_key(existing.identity) == key;
-            });
-        if (alias != store.phones.end()) {
-            return reject();  // duplicate canonical identity
-        }
         store.phones.push_back(std::move(record.value()));
     }
     std::uint64_t highest = 0;
     for (const ApprovedPhone& phone : store.phones) {
         highest = std::max(highest, phone.phone_id.value);
     }
+    // Validate every original record before dropping any: duplicate ids,
+    // exact duplicate identities and unrelated collisions remain corruption.
+    std::vector<bool> quarantine(store.phones.size(), false);
+    for (std::size_t i = 0; i < store.phones.size(); ++i) {
+        if (legacy_wireless(store.phones[i].identity)) {
+            quarantine[i] = true;
+            ++store.invalid_wireless_count;
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (identity_key(store.phones[i].identity) != identity_key(store.phones[j].identity)) continue;
+            const auto* a = std::get_if<WirelessIdentity>(&store.phones[i].identity);
+            const auto* b = std::get_if<WirelessIdentity>(&store.phones[j].identity);
+            if (!a || !b ||
+                (a->adapter == b->adapter && a->bond_address == b->bond_address)) return reject();
+            quarantine[i] = quarantine[j] = true;
+        }
+    }
+    std::size_t index = 0;
+    std::erase_if(store.phones, [&](const ApprovedPhone& phone) {
+        const bool drop = quarantine[index++];
+        if (drop && !legacy_wireless(phone.identity)) ++store.colliding_wireless_count;
+        return drop;
+    });
     store.next_phone_id = highest + 1;
     return store;
 }
@@ -244,14 +306,16 @@ core::Result<ParsedStore> parse_store(std::string_view text) {
         if (!checked.has_value()) {
             return checked.error();
         }
-        return parse_records(members, &parse_legacy_record);
+        auto store = parse_records(members, &parse_legacy_record);
+        if (store.has_value()) { drop_implicit_port_grants(store.value()); }
+        return store;
     }
-    if (version.value() == kSchemaVersionCurrent) {
+    if (version.value() == 2 || version.value() == kSchemaVersionCurrent) {
         auto checked = exact_keys(members, {"schema_version", "next_phone_id", "phones"});
         if (!checked.has_value()) {
             return checked.error();
         }
-        auto store = parse_records(members, &parse_record);
+        auto store = parse_records(members, version.value() == 2 ? &parse_v2_record : &parse_record);
         if (!store.has_value()) {
             return store.error();
         }
@@ -266,6 +330,7 @@ core::Result<ParsedStore> parse_store(std::string_view text) {
             return reject();
         }
         store.value().next_phone_id = next.value();
+        if (version.value() == 2) { drop_implicit_port_grants(store.value()); }
         return store;
     }
     return reject();  // unknown version: never silently trusted

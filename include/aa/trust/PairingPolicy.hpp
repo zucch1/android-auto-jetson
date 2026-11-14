@@ -18,11 +18,11 @@
 //
 // TRUST MODEL (see Identity.hpp): wired identity is physical-access trust,
 // NOT cryptographic proof; USB identifier spoofing is a known, documented
-// limitation of the wired trust boundary. Serial-less wired phones are REFUSED
-// (audit M12): such an identity cannot distinguish one device from another of
-// the same model on the same port, so pairing_requested() rejects it up front
-// (trust_rejected, nothing pending) and the user is never prompted for a
-// pairing that could not authorize a session.
+// limitation of the wired trust boundary. Serial-less wired phones need
+// separate port-only consent (audit M12): the same descriptor tuple on a port
+// cannot distinguish devices. Normal pairing rejects before prompting with
+// trust_port_only_requires_opt_in and nothing pending; the weaker grant needs
+// a separate explicit call to approve_port_only().
 //
 // SNAPSHOT-ONLY PAIRING CONTRACT: approval is bound to the canonical identity
 // captured when RequestAddPhone succeeds, not to the currently connected
@@ -81,13 +81,13 @@ public:
 // Error contract (typed, fail closed):
 //   - no candidate presented at pairing_requested -> trust_unknown_phone
 //   - duplicate request binding                    -> trust_rejected
-//   - serial-less (port-only) wired candidate      -> trust_rejected
+//   - serial-less (port-only) wired candidate      -> trust_port_only_requires_opt_in
 //   - pending table full                           -> ipc_queue_full
 //   - confirm of an unbound/already-consumed id    -> trust_unknown_phone
 //   - confirm past the 60 s window                 -> session_pairing_timeout
 //     (the request is dropped and NOT persisted)
 //   - store persistence failure                    -> trust_store_io
-//   - store refusal of the bound identity          -> trust_rejected
+//   - store refusal of the bound identity          -> trust_port_only_requires_opt_in
 class PairingPolicy final : public ipc::PhoneDirectory {
 public:
     static constexpr core::Milliseconds kConfirmWindow{60'000};
@@ -101,6 +101,8 @@ public:
     // in-flight confirm approves (SNAPSHOT-ONLY PAIRING CONTRACT above).
     void note_candidate(TransportIdentity identity);
     core::Result<void> note_wireless_candidate(const helper::PeerIdentity& peer) override;
+    bool same_wireless_identity(const helper::PeerIdentity& a,
+                                const helper::PeerIdentity& b) const override;
     std::optional<helper::PeerIdentity> wireless_identity(core::PhoneId phone) const override;
     std::optional<helper::PeerIdentity> pairing_wireless_identity(core::PairingRequestId request) const override;
 
@@ -124,6 +126,8 @@ public:
     [[nodiscard]] core::Result<void> pairing_requested(core::PairingRequestId request) override;
     [[nodiscard]] core::Result<core::PhoneId> pairing_confirmed(
         core::PairingRequestId request) override;
+    core::Result<void> validate_pairing(core::PairingRequestId request) override;
+    std::optional<core::PhoneId> committed_pairing() const override { return committed_pairing_; }
     void pairing_cancelled(core::PairingRequestId request) override;
 
     // Drops pendings past the confirm window WITHOUT persisting anything and
@@ -132,6 +136,8 @@ public:
     // can release each one's PairingGate entry and emit PairingClosed before
     // admitting new requests.
     [[nodiscard]] std::vector<core::PairingRequestId> reap_expired() override;
+    std::optional<helper::PeerIdentity> take_expired_wireless_identity(
+        core::PairingRequestId request) override;
 
     // Drains the ids forget() invalidated (drain clears the buffer).
     [[nodiscard]] std::vector<core::PairingRequestId> take_invalidated_pairings() override;
@@ -150,13 +156,16 @@ private:
 
     [[nodiscard]] std::size_t find(core::PairingRequestId request) const;
     void drop_at(std::size_t index);
+    [[nodiscard]] bool expired(const Pending& pending) const;
 
     ApprovedPhoneStore& store_;
     const Clock& clock_;
     std::optional<TransportIdentity> candidate_{};
     std::vector<Pending> pending_{};
     std::vector<core::PairingRequestId> invalidated_{};
+    std::vector<std::pair<core::PairingRequestId, helper::PeerIdentity>> expired_peers_{};
     std::optional<helper::RevocationV1> revocation_;
+    std::optional<core::PhoneId> committed_pairing_;
 };
 
 } // namespace aa::trust

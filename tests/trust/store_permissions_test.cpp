@@ -240,12 +240,11 @@ TEST(StorePermissions, PermissiveUmaskStillYields0700Ancestors) {
 TEST(StorePermissions, UnTightenableParentDirectoryFailsClosed) {
     test::TempStoreDir dir;
     const auto dangling = dir.dir() / "dangling";
-    ASSERT_EQ(::symlink((dir.dir() / "missing-target").c_str(), dangling.c_str()), 0);
-
-    // Review fix (PR #93, P2): the symlinked parent is rejected at load() too
-    // (no missing-file shortcut), and the write path still fails closed.
     trust::ApprovedPhoneStore store{dangling / "approved-phones.json"};
-    const auto loaded = store.load();
+    ASSERT_TRUE(store.load().has_value());
+    ASSERT_EQ(::symlink((dir.dir() / "missing-target").c_str(), dangling.c_str()), 0);
+    trust::ApprovedPhoneStore fresh{dangling / "approved-phones.json"};
+    const auto loaded = fresh.load();
     ASSERT_FALSE(loaded.has_value());
     EXPECT_EQ(loaded.error().code(), ErrorCode::trust_store_io);
     const auto approved = store.approve(trust::TransportIdentity{test::kWired});
@@ -313,12 +312,11 @@ TEST(StorePermissions, SymlinkedParentWriteFailsClosedWithoutMutatingTarget) {
     std::filesystem::create_directories(target);
     ASSERT_EQ(::chmod(target.c_str(), 0755), 0);
     const auto link = dir.dir() / "link";
-    ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
-
-    // Review fix (PR #93, P2): the symlinked parent is rejected at load() too
-    // (no missing-file shortcut), and the write path still fails closed.
     trust::ApprovedPhoneStore store{link / "approved-phones.json"};
-    const auto loaded = store.load();
+    ASSERT_TRUE(store.load().has_value());
+    ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
+    trust::ApprovedPhoneStore fresh{link / "approved-phones.json"};
+    const auto loaded = fresh.load();
     ASSERT_FALSE(loaded.has_value());
     EXPECT_EQ(loaded.error().code(), ErrorCode::trust_store_io);
     const auto approved = store.approve(trust::TransportIdentity{test::kWired});
@@ -411,6 +409,59 @@ TEST(StorePermissions, IntermediateSymlinkComponentCannotLoadAnExteriorStore) {
     trust::ApprovedPhoneStore store{store_path};
     EXPECT_FALSE(store.load().has_value());
     EXPECT_EQ(store.lookup(trust::PhoneIdentity{"approved-key"}), trust::Decision::unknown);
+}
+
+TEST(StorePermissions, DotDotRejectedBeforeCreatingAnyDirectory) {
+    test::TempStoreDir dir;
+    const auto path = dir.dir() / "new" / ".." / "store" / "phones.json";
+    EXPECT_FALSE(trust::detail::write_file_private(path, "{}").has_value());
+    EXPECT_FALSE(std::filesystem::exists(dir.dir() / "new"));
+    EXPECT_FALSE(trust::detail::read_file(path).has_value());
+}
+
+TEST(StorePermissions, RelativePathWalkRetainsPrivateStoreSemantics) {
+    test::TempStoreDir dir;
+    const auto previous = std::filesystem::current_path();
+    std::filesystem::current_path(dir.dir());
+    const auto written = trust::detail::write_file_private("./a/b/store.json", "{}");
+    const auto read = trust::detail::read_file("a/./b/store.json");
+    std::filesystem::current_path(previous);
+    EXPECT_TRUE(written.has_value());
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(read.value(), "{}");
+}
+
+TEST(StorePermissions, NonDirectoryAncestorRejectsReadAndWrite) {
+    test::TempStoreDir dir;
+    const auto blocker = dir.dir() / "file";
+    { std::ofstream out{blocker}; out << "untouched"; }
+    const auto path = blocker / "store" / "phones.json";
+    EXPECT_FALSE(trust::detail::read_file(path).has_value());
+    EXPECT_FALSE(trust::detail::write_file_private(path, "{}").has_value());
+    std::ifstream in{blocker};
+    std::string contents;
+    in >> contents;
+    EXPECT_EQ(contents, "untouched");
+}
+
+TEST(StorePermissions, InvalidFinalNamesFailBeforeMissingParentIsTreatedAsEmpty) {
+    test::TempStoreDir dir;
+    for (bool exists : {false, true}) {
+        const auto parent = dir.dir() / "parent";
+        if (exists) { std::filesystem::create_directory(parent); }
+        for (const auto* name : {"", ".", ".."}) {
+            const auto path = parent / name;
+            const auto read = trust::detail::read_file(path);
+            ASSERT_FALSE(read.has_value()) << path;
+            EXPECT_EQ(read.error().code(), ErrorCode::trust_store_io);
+            const auto checked = trust::detail::ensure_private_file(path);
+            ASSERT_FALSE(checked.has_value()) << path;
+            EXPECT_EQ(checked.error().code(), ErrorCode::trust_store_io);
+            trust::ApprovedPhoneStore store{path};
+            EXPECT_FALSE(store.load().has_value());
+            EXPECT_FALSE(store.usable());
+        }
+    }
 }
 
 // Review fix (PR #93, P2): read_file() used to lstat() the full path BEFORE

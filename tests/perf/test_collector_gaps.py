@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""Collector sampling-gap regressions on a virtual clock; no hardware or sleeps."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tools/perf"))
+import aa_projection_collect as collector
+import aa_perf_report as reporter
+from aa_measurement_coverage import Sample
+from test_v2_coverage import synthetic
+
+NS = 1_000_000_000
+
+
+class Process:
+    pid = os.getpid()
+
+    def __init__(self, command=(), *, stdout=None, **kwargs) -> None:
+        self.command = list(command)
+        self.returncode = None
+        if command and command[0] == "receiver":
+            stdout.write(json.dumps({"event": "ready", "state": "negotiating"}) + "\n")
+            stdout.flush()
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    def wait(self, timeout: float) -> None:
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("fixture", timeout)
+
+
+def progress_sample(second: int, av_pairs: int) -> Sample:
+    return Sample(t_ns=second * NS, receiver_rss_mb=None, receiver_cpu_ticks=None,
+                  thermal_zones=(), projection_active=True,
+                  video_units=second + 1, audio_chunks=second + 1,
+                  video_presentations=second + 1, audio_writes=second + 1,
+                  av_pairs=av_pairs)
+
+
+def run_gap(*, jumps: tuple[tuple[int, int], ...] = ((5, 30),), mode: str = "healthy",
+            duration: int = 10, stop_after: int | None = None, interval: int = 1,
+            extra_stamps: tuple[int, ...] = ()) -> dict:
+    """Freeze collector sleeps while the receiver logs on its own clock.
+
+    ``catchup`` holds the frozen window's lines in a userspace buffer until 0.5 s
+    after the first post-gap sample. ``silence`` logs only the first and last
+    seconds of that window. ``never`` stops logging at the gap.
+    """
+    clock = [0]
+    prev_clock = [0]
+    logs: dict[str, object] = {}
+    jump_index = [0]
+    last_second = [0]
+    backlog: list[tuple[str, dict]] = []
+    gap_start, gap_seconds = jumps[0]
+    gap_end = gap_start + gap_seconds
+    catchup_ns = (gap_end + 0.5) * NS
+    if mode == "never":
+        stop_after = gap_start
+
+    class LoggingProcess(Process):
+        def __init__(self, command=(), *, stdout=None, **kwargs) -> None:
+            super().__init__(command, stdout=stdout, **kwargs)
+            logs[command[0]] = stdout
+
+    def write(name: str, event: dict) -> None:
+        logs[name].write(json.dumps(event) + "\n")
+        logs[name].flush()
+
+    def emit_stamp(stamp: int, *, second: int | None = None) -> None:
+        if stamp < NS or (stop_after is not None and stamp > stop_after * NS):
+            return
+        if second is not None:
+            if mode == "silence" and gap_start + 1 < second < gap_end:
+                return
+            if mode == "trailing" and gap_end - 7 < second < gap_end + 1:
+                return  # healthy until 31 s, then silent for 8 s past the gap, resumes at 40 s
+            if mode == "trailing_stall" and gap_end - 7 < second < gap_end + 4:
+                return  # healthy until 31 s, silent 12 s (32..42 s), resumes at 43 s before sample at 44 s
+            if mode == "trailing_early" and (gap_end - 8 < second <= gap_end + 5 or second == gap_end + 12):
+                return  # healthy until 31 s, silent on integer seconds 32..44 and at 51 s
+        events = (
+            ("receiver", {"event": "active", "startup_ms": 1000}),
+            ("receiver", {"event": "video_sent", "units": stamp}),
+            ("receiver", {"event": "audio_chunks", "count": stamp}),
+            ("receiver", {"event": "audio_write_completed", "scheduled_ns": stamp,
+                           "scheduled_end_ns": stamp + 20_000_000, "completed_ns": stamp}),
+            ("display", {"event": "video_presented", "frame": stamp,
+                          "scheduled_ns": stamp, "completed_ns": stamp + 1000}),
+        )
+        if mode == "catchup" and second is not None and gap_start < second <= gap_end:
+            backlog.extend(events)
+        else:
+            for name, event in events:
+                write(name, event)
+
+    def advance(target: int) -> None:
+        start_ns = prev_clock[0]
+        clock[0] = target
+        prev_clock[0] = target
+        pending: list[tuple[int, int | None]] = [
+            (second * NS, second) for second in range(last_second[0] + 1, target // NS + 1)
+        ]
+        for stamp in extra_stamps:
+            if start_ns < stamp <= target:
+                pending.append((stamp, None))
+        for stamp, second in sorted(pending, key=lambda item: item[0]):
+            emit_stamp(stamp, second=second)
+        last_second[0] = max(last_second[0], target // NS)
+        if backlog and target >= catchup_ns:
+            for name, event in backlog:
+                write(name, event)
+            backlog.clear()
+
+    def sleep(seconds: float) -> None:
+        if (jump_index[0] < len(jumps)
+                and clock[0] >= jumps[jump_index[0]][0] * NS):
+            _, seconds_gap = jumps[jump_index[0]]
+            jump_index[0] += 1
+            advance(clock[0] + seconds_gap * NS)
+        else:
+            advance(clock[0] + round(seconds * NS))
+
+    with tempfile.TemporaryDirectory(prefix="perf-collector-gap-") as tmp:
+        args = argparse.Namespace(receiver="receiver", display="display", port="fixture",
+                                  no_display=False, duration_seconds=duration, interval=interval,
+                                  startup_timeout_seconds=6, store=None, video_socket=None,
+                                  input_socket=None, state_dir=tmp)
+        with (patch.object(collector.time, "monotonic_ns", side_effect=lambda: clock[0]),
+              patch.object(collector.time, "sleep", side_effect=sleep),
+              patch.object(collector.subprocess, "Popen", LoggingProcess),
+              patch.object(collector, "_display_connected", return_value=True),
+              patch.object(collector, "_thermal_zones", return_value=()),
+              patch.object(collector, "_target_hardware_state", return_value={})):
+            return collector.collect(args)
+
+
+def report(capture: dict) -> dict:
+    return reporter.build_result(json.loads(json.dumps(capture)), duration_requested=None,
+                                 now="2026-11-11T00:00:00Z", capture_path=None,
+                                 capture_sha256=None)
+
+
+class MainProgress:
+    """origin/main's ProjectionProgress.observe, verbatim, as the no-gap oracle."""
+
+    def __init__(self) -> None:
+        self.started_ns = None
+        self.last_ns = 0
+        self.previous = {}
+        self.advanced_ns = {}
+        self.failure = None
+
+    def observe(self, sample: Sample) -> None:
+        if self.failure:
+            return
+        stamp = sample.t_ns
+        counters = {key: value for key, value in zip(collector._PROGRESS_KEYS, (
+            sample.video_units, sample.audio_chunks, sample.video_presentations,
+            sample.audio_writes, sample.av_pairs)) if value is not None}
+        valid = (len(counters) == len(collector._PROGRESS_KEYS) and type(stamp) is int
+                 and stamp >= 0 and all(type(value) is int and value >= 0
+                                        for value in counters.values()))
+        if not valid:
+            if self.started_ns is not None:
+                self.failure = "missing_progress"
+            return
+        if self.started_ns is None:
+            if not sample.projection_active or not all(counters.values()):
+                return
+            self.started_ns = stamp
+            self.previous = counters
+            self.advanced_ns = {key: stamp for key in counters}
+        else:
+            if stamp <= self.last_ns or stamp - self.last_ns > 10 * NS:
+                self.failure = "sampling_gap"
+            if not sample.projection_active:
+                self.failure = "projection_inactive"
+            for key, value in counters.items():
+                if value < self.previous[key]:
+                    self.failure = "counter_reset:" + key
+                # Check age before accepting a resumed stream: a late recovery cannot heal a freeze.
+                if stamp - self.advanced_ns[key] > 10 * NS:
+                    self.failure = "media_stalled:" + key
+                if value > self.previous[key]:
+                    self.advanced_ns[key] = stamp
+            self.previous = counters
+        self.last_ns = stamp
+
+
+def state(progress) -> tuple:
+    return (progress.started_ns, progress.last_ns, progress.failure,
+            dict(progress.previous), dict(progress.advanced_ns))
+
+
+def no_gap_late_recovery() -> None:
+    # av_pairs last advances at 5 s, is silent for 13 s, then resumes. Main reports
+    # the stall before accepting the resume; so must this.
+    progress = collector.ProjectionProgress()
+    for second, pairs in ((0, 1), (5, 2), (10, 2), (14, 2), (18, 3)):
+        progress.observe(progress_sample(second, pairs))
+    assert progress.failure == "media_stalled:av_pairs", progress.failure
+    assert progress.interferences == []
+
+
+def no_gap_matches_main() -> None:
+    # Differential: for any sequence with no sampling gap over 10 s, behaviour (the
+    # verdict and every piece of state) is identical to origin/main, whatever
+    # receiver evidence is passed alongside.
+    rng = random.Random(90)
+    junk = {key: {"event_count": 99, "first_event_ns": 1, "last_event_ns": 2,
+                  "max_silence_ns": 0} for key in collector._PROGRESS_KEYS}
+    for _ in range(3000):
+        mine, oracle = collector.ProjectionProgress(), MainProgress()
+        stamp = 0
+        pairs = {key: 0 for key in collector._PROGRESS_KEYS}
+        for _ in range(rng.randrange(2, 14)):
+            stamp += rng.choice((0, 1, 2, 4900, 5000, 5100, 6000, 7500, 9000, 10000)) * 1_000_000
+            for key in pairs:
+                if rng.random() < 0.55:
+                    pairs[key] += rng.choice((1, 1, 2))
+                elif rng.random() < 0.02:
+                    pairs[key] -= 1
+            sample = Sample(t_ns=stamp, receiver_rss_mb=None, receiver_cpu_ticks=None,
+                            thermal_zones=(), projection_active=rng.random() > 0.03, **pairs)
+            oracle.observe(sample)
+            mine.observe(sample, junk if rng.random() < 0.5 else None)
+            assert state(mine) == state(oracle), (state(mine), state(oracle), stamp)
+
+
+def evidence(first: float, last: float, silence: float, count: int = 20) -> dict:
+    return {"event_count": count, "first_event_ns": int(first * NS),
+            "last_event_ns": int(last * NS), "max_silence_ns": int(silence * NS)}
+
+
+def gap_decision() -> None:
+    def gap(counters_after: int, logged: dict | None) -> collector.ProjectionProgress:
+        progress = collector.ProjectionProgress()
+        progress.observe(progress_sample(0, 1))
+        progress.observe(progress_sample(5, 2))
+        progress.observe(progress_sample(39, counters_after), logged)
+        return progress
+
+    every = lambda item: {key: item for key in collector._PROGRESS_KEYS}
+    # Without receiver evidence a long gap keeps main's verdict, even though every
+    # counter advanced by one: one increment cannot place progress inside the gap.
+    oracle = MainProgress()
+    for second, pairs in ((0, 1), (5, 2), (39, 3)):
+        oracle.observe(progress_sample(second, pairs))
+    assert oracle.failure is not None and gap(3, None).failure == oracle.failure
+    assert gap(3, every(evidence(0, 0, 34, count=0))).failure.startswith("media_stalled:")
+    # Receiver-clock events with no silence over 10 s through the window: continue.
+    good = gap(900, every(evidence(6, 39, 3)))
+    assert good.failure is None and len(good.interferences) == 1
+    assert good.interferences[0]["gap_seconds"] == 34
+    assert good.interferences[0]["projection_failure"] is None
+    # The same counters with a 20 s logged silence inside the window: a stall.
+    silent = gap(900, every(evidence(6, 39, 20, count=4)))
+    assert silent.failure.startswith("media_stalled:"), silent.failure
+    assert silent.interferences[0]["projection_failure"] == silent.failure
+    # A trailing silence (last event long before the window ends) is also a stall.
+    assert gap(900, every(evidence(6, 20, 19))).failure.startswith("media_stalled:")
+    # No events at all in the window, even with the counter advanced by one and
+    # evidence that claims no silence.
+    assert gap(3, every(evidence(0, 0, 34, count=0))).failure.startswith("media_stalled:")
+    assert gap(3, every(evidence(0, 0, 0, count=0))).failure.startswith("media_stalled:")
+    # Logged events without the counters having moved are not progress either.
+    assert gap(2, every(evidence(6, 39, 3))).failure.startswith("media_stalled:")
+    # One stream silent is enough, and it names that stream.
+    uneven = every(evidence(6, 39, 3))
+    uneven["audio_writes"] = evidence(6, 12, 27)
+    assert gap(900, uneven).failure == "media_stalled:audio_writes"
+
+
+def gap_progress() -> None:
+    capture = run_gap()
+    assert capture["projection_failure"] is None, capture
+    assert capture["observed_duration_seconds"] == 35, capture["observed_duration_seconds"]
+    assert len(capture["interference"]) == 1
+    gap = capture["interference"][0]
+    assert gap["classification"] == "host_interference" and gap["gap_seconds"] == 30
+    assert gap["projection_failure"] is None
+    for stream in collector._PROGRESS_KEYS:
+        logged = gap["logged_progress"][stream]
+        assert logged["event_count"] >= 29, (stream, logged)
+        assert logged["max_silence_ns"] <= collector._MEDIA_STALL_SECONDS * NS
+    doc = report(capture)
+    assert doc["run_status"]["projection_failure"] is None, doc["run_status"]
+    assert doc["run_status"]["interference"] == capture["interference"]
+    assert "coverage:sampling" in doc["named_gaps"], doc["named_gaps"]
+    assert doc["verdict"] != "PASS"
+    assert any("host interference" in note for note in doc["notes"])
+
+
+def gap_logged_silence() -> None:
+    capture = run_gap(mode="silence")
+    assert capture["projection_failure"].startswith("media_stalled:"), capture
+    gap = capture["interference"][0]
+    assert gap["projection_failure"] == capture["projection_failure"]
+    assert max(item["max_silence_ns"] for item in gap["logged_progress"].values()) > 10 * NS
+    doc = report(capture)
+    assert doc["run_status"]["projection_failure"] == capture["projection_failure"]
+    assert doc["verdict"] == "FAIL"
+
+
+def gap_log_catches_up() -> None:
+    capture = run_gap(mode="catchup")
+    assert capture["projection_failure"] is None, capture
+    assert len(capture["interference"]) == 1
+    # The grace ended as soon as the delayed lines arrived, well before its bound.
+    assert capture["interference"][0]["gap_seconds"] < 30 + collector._COLLECTOR_LOG_GRACE_SECONDS
+    assert report(capture)["run_status"]["projection_failure"] is None
+
+
+def gap_log_never_catches_up() -> None:
+    capture = run_gap(mode="never")
+    assert capture["projection_failure"].startswith("media_stalled:"), capture
+    gap = capture["interference"][0]
+    # Reported after the bounded grace: not at the first post-gap read, not later.
+    assert 0 < collector._COLLECTOR_LOG_GRACE_SECONDS <= collector._MEDIA_STALL_SECONDS / 2
+    assert (collector._COLLECTOR_LOG_GRACE_SECONDS
+            <= gap["gap_seconds"] - 30 <= collector._COLLECTOR_LOG_GRACE_SECONDS + 1), gap
+    assert report(capture)["run_status"]["projection_failure"] == capture["projection_failure"]
+
+
+def stall_after_gap() -> None:
+    # The gap is healthy; the receiver then freezes for real and is still reported.
+    capture = run_gap(duration=60, stop_after=45)
+    assert capture["projection_failure"].startswith("media_stalled:"), capture
+    assert len(capture["interference"]) == 1
+    assert capture["interference"][0]["projection_failure"] is None
+    assert 45 + 10 < capture["observed_duration_seconds"] <= 45 + 16
+    assert report(capture)["run_status"]["projection_failure"] == capture["projection_failure"]
+
+
+def gap_trailing_silence() -> None:
+    def after_gap(*samples: tuple[int, int], logged_for) -> collector.ProjectionProgress:
+        progress = collector.ProjectionProgress()
+        progress.observe(progress_sample(0, 1))
+        progress.observe(progress_sample(5, 2))
+        # t=39 s recovery: continuous events through 31 s, 8 s of trailing silence.
+        gap = {key: evidence(6, 31, 5) for key in collector._PROGRESS_KEYS}
+        progress.observe(progress_sample(39, 3), gap)
+        assert progress.failure is None, progress.failure
+        for second, pairs in samples:
+            progress.observe(progress_sample(second, pairs), logged_for(second))
+        return progress
+
+    every = lambda item: {key: item for key in collector._PROGRESS_KEYS}
+    # (a) Healthy: events resume at 39.5 and 43 s; the next sample at 44 s sees the
+    # counter up. No receiver silence exceeded 10 s (8.5, 3.5, 1 s): no stall.
+    healthy = after_gap((44, 4), logged_for=lambda _: every(evidence(39.5, 43, 8.5, count=2)))
+    assert healthy.failure is None, healthy.failure
+    # ...and later ordinary sampling is judged from the collector sample time (44 s)
+    # where continuity was confirmed: with no further progress the age passes 10 s at 55 s.
+    healthy.observe(progress_sample(54, 4))
+    assert healthy.failure is None, healthy.failure
+    healthy.observe(progress_sample(55, 4))
+    assert healthy.failure.startswith("media_stalled:"), healthy.failure
+    # Two consecutive healthy post-gap samples (event at 39.5 s seen at 44 s, next
+    # sample 7 s later at 51 s with increased counter) must not false-stall.
+    two_step = after_gap((44, 4), logged_for=lambda _: every(evidence(39.5, 39.5, 8.5, count=1)))
+    two_step.observe(progress_sample(51, 5))
+    assert two_step.failure is None, two_step.failure
+    two_step.observe(progress_sample(61, 5))
+    assert two_step.failure is None, two_step.failure
+    two_step.observe(progress_sample(62, 5))
+    assert two_step.failure.startswith("media_stalled:"), two_step.failure
+    # (b) A real stall starting in the trailing part and continuing: events end at 31 s.
+    nothing = every(evidence(0, 0, 13, count=0))
+    assert after_gap((40, 3), logged_for=lambda _: nothing).failure is None  # 9 s: not yet
+    assert after_gap((44, 3), logged_for=lambda _: nothing).failure.startswith("media_stalled:")
+    # Same at 44 s even if the counter ticked once (no logged event backs it).
+    assert after_gap((44, 4), logged_for=lambda _: nothing).failure.startswith("media_stalled:")
+    # No evidence at all: main's rule (13 s since the last accepted event) applies.
+    assert after_gap((44, 4), logged_for=lambda _: None).failure.startswith("media_stalled:")
+    # A logged silence over 10 s after the gap is a stall even with events resumed.
+    late = after_gap((44, 4), logged_for=lambda _: every(evidence(42, 43, 11, count=2)))
+    assert late.failure.startswith("media_stalled:")
+    # Stalled across two ordinary samples: still reported once age passes 10 s.
+    stuck = after_gap((40, 3), (44, 3), logged_for=lambda _: nothing)
+    assert stuck.failure.startswith("media_stalled:")
+
+
+def gap_trailing_silence_collect() -> None:
+    capture = run_gap(mode="trailing", jumps=((5, 34),), duration=50, interval=5)
+    assert capture["projection_failure"] is None, capture
+    assert len(capture["interference"]) == 1
+    assert [item["t_ns"] for item in capture["progress_evidence"]] == [39 * NS, 44 * NS]
+    doc = report(capture)
+    assert doc["run_status"]["projection_failure"] == capture["projection_failure"]
+    assert doc["run_status"]["interference"] == capture["interference"]
+
+    # Post-gap short (8 s) interference while still event-anchored also persists evidence
+    # separately from interference and replays with full parity.
+    short_after = run_gap(mode="trailing", jumps=((5, 34), (39, 8)), duration=55, interval=5)
+    assert short_after["projection_failure"] is None, short_after
+    assert [gap["gap_seconds"] for gap in short_after["interference"]] == [34, 8]
+    assert "logged_progress" not in short_after["interference"][1]
+    assert [item["t_ns"] for item in short_after["progress_evidence"]] == [39 * NS, 47 * NS]
+    assert report(short_after)["run_status"]["projection_failure"] is None
+
+    # A real stall: events end at 31 s; reported by the sample at 44 s, not before.
+    stalled = run_gap(jumps=((5, 34),), duration=50, stop_after=31, interval=5)
+    assert stalled["projection_failure"].startswith("media_stalled:"), stalled
+    assert 44 - 5 <= stalled["observed_duration_seconds"] <= 44, stalled["observed_duration_seconds"]
+    assert report(stalled)["run_status"]["projection_failure"] == stalled["projection_failure"]
+
+    # A real stall where events resume at 43 s (12 s silence > 10 s) before the 44 s sample:
+    # both live collector and offline report still fail with media_stalled.
+    resumed_stall = run_gap(mode="trailing_stall", jumps=((5, 34),), duration=50, interval=5)
+    assert resumed_stall["projection_failure"].startswith("media_stalled:"), resumed_stall
+    assert [item["t_ns"] for item in resumed_stall["progress_evidence"]] == [39 * NS, 44 * NS]
+    assert report(resumed_stall)["run_status"]["projection_failure"] == resumed_stall["projection_failure"]
+
+
+def gap_reanchor_two_post_gap_samples() -> None:
+    # Reviewer timeline: gap at t=39 (last event at 31 s); event at 39.5 s seen at
+    # t=44 (continuity valid, transition back to collector-time anchoring); events
+    # continue at 45..50 s; sample at t=51 (7 s after t=44) sees counter increased.
+    # Neither live capture nor offline replay may report media_stalled.
+    capture = run_gap(
+        mode="trailing_early",
+        jumps=((5, 34), (44, 7)),
+        duration=46,
+        interval=5,
+        extra_stamps=(39_500_000_000,),
+    )
+    assert [sample["t_ns"] for sample in capture["samples"]] == [
+        5 * NS, 39 * NS, 44 * NS, 51 * NS,
+    ], [sample["t_ns"] for sample in capture["samples"]]
+    assert capture["samples"][3]["av_pairs"] > capture["samples"][2]["av_pairs"]
+    assert capture["projection_failure"] is None, capture
+    assert [item["t_ns"] for item in capture["progress_evidence"]] == [39 * NS, 44 * NS]
+    assert capture["progress_evidence"][0]["logged_progress"]["audio_writes"]["last_event_ns"] == 31 * NS
+    assert capture["progress_evidence"][1]["logged_progress"]["audio_writes"]["last_event_ns"] == 39_500_000_000
+    doc = report(capture)
+    assert doc["run_status"]["projection_failure"] is None, doc["run_status"]
+
+    # True silence > 10 s immediately after the t=44 transition must still stall in both.
+    stall_after_44 = run_gap(
+        mode="trailing_early",
+        jumps=((5, 34), (44, 7)),
+        duration=55,
+        stop_after=40,
+        interval=5,
+        extra_stamps=(39_500_000_000,),
+    )
+    assert stall_after_44["projection_failure"].startswith("media_stalled:"), stall_after_44
+    assert (report(stall_after_44)["run_status"]["projection_failure"]
+            == stall_after_44["projection_failure"])
+
+    # True silence > 10 s after the second post-gap sample (t=51) must also stall in both.
+    stall_after_51 = run_gap(
+        mode="trailing_early",
+        jumps=((5, 34), (44, 7)),
+        duration=65,
+        stop_after=50,
+        interval=5,
+        extra_stamps=(39_500_000_000,),
+    )
+    assert stall_after_51["projection_failure"].startswith("media_stalled:"), stall_after_51
+    assert (report(stall_after_51)["run_status"]["projection_failure"]
+            == stall_after_51["projection_failure"])
+
+
+def repeated_short_gaps() -> None:
+    # Gaps over the interference threshold but under the stall threshold are all
+    # recorded and need no log evidence; the ordinary age check still runs.
+    capture = run_gap(jumps=((5, 8), (17, 8), (29, 9)), duration=40)
+    assert capture["projection_failure"] is None, capture
+    assert capture["progress_evidence"] == []
+    assert [gap["gap_seconds"] for gap in capture["interference"]] == [8, 8, 9]
+    assert all("logged_progress" not in gap for gap in capture["interference"])
+    doc = report(capture)
+    assert len(doc["run_status"]["interference"]) == 3
+    # Gaps at or under the threshold are ordinary sampling, not interference.
+    quiet = run_gap(jumps=((5, 6),), duration=20)
+    assert quiet["interference"] == [] and quiet["progress_evidence"] == []
+    assert quiet["projection_failure"] is None
+    assert "interference" not in report(quiet)["run_status"]
+
+
+def repeated_long_gaps() -> None:
+    capture = run_gap(jumps=((5, 20), (40, 25)), duration=70)
+    assert capture["projection_failure"] is None, capture
+    assert len(capture["interference"]) == 2
+    assert all("logged_progress" in gap for gap in capture["interference"])
+    assert report(capture)["run_status"]["projection_failure"] is None
+
+
+def old_capture_replay() -> None:
+    # A capture written before #90 has no interference or progress_evidence: its long
+    # gap replays with main's verdict, and the result stays schema-valid.
+    capture = run_gap()
+    capture.pop("interference")
+    capture.pop("progress_evidence")
+    doc = report(capture)
+    assert doc["run_status"]["projection_failure"] is not None, doc["run_status"]
+    assert doc["verdict"] == "FAIL"
+    assert doc["run_status"]["interference"][0]["gap_seconds"] == 30
+    clean = run_gap(jumps=((5, 3),), duration=10)
+    clean.pop("interference")
+    clean.pop("progress_evidence")
+    assert report(clean)["run_status"]["projection_failure"] is None
+
+    # A capture written at 2511ac4 has interference[*].logged_progress but no
+    # progress_evidence field: >10 s gap evidence still loads from interference.
+    legacy_gap = run_gap()
+    legacy_gap.pop("progress_evidence")
+    assert report(legacy_gap)["run_status"]["projection_failure"] is None
+
+    # Malformed progress_evidence fails closed with ContractError.
+    bad = run_gap()
+    bad["progress_evidence"] = [{"t_ns": True, "logged_progress": {}}]
+    try:
+        report(bad)
+    except reporter.ContractError:
+        pass
+    else:
+        raise AssertionError("expected ContractError on malformed progress_evidence")
+
+
+CASES = {name: globals()[name] for name in (
+    "no_gap_late_recovery", "no_gap_matches_main", "gap_decision", "gap_progress",
+    "gap_logged_silence", "gap_trailing_silence", "gap_trailing_silence_collect",
+    "gap_reanchor_two_post_gap_samples", "gap_log_catches_up", "gap_log_never_catches_up",
+    "stall_after_gap", "repeated_short_gaps", "repeated_long_gaps", "old_capture_replay")}
+
+
+if __name__ == "__main__":
+    for name in sys.argv[1:] or list(CASES):
+        CASES[name]()
+        print("PASS collector-gap-" + name)

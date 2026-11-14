@@ -11,6 +11,7 @@
 #include "../dbus/fakes.hpp"
 #include "fakes.hpp"
 #include "syscall_faults.hpp"
+#include "../helper/confirmation_fixture.hpp"
 
 #include <algorithm>
 #include <vector>
@@ -415,6 +416,53 @@ TEST(ControlFlow, ForgetPreReplacementFailureEmitsNoGateClosures) {
     EXPECT_EQ(f.store.lookup(test::identity_of(trust::TransportIdentity{test::kWired})),
               trust::Decision::approved);
     ASSERT_TRUE(f.service.confirm_phone_pairing(connection, request.value()).has_value());
+}
+
+TEST(ControlFlow, BoundDeadlineCheckedBeforeAndAfterHelperRpc) {
+    // Exercise both expiry points with the same policy-owned clock.
+    for (int expiry_point : {0, 1, 2}) {
+        const bool during_rpc = expiry_point == 1;
+        test::TempStoreDir dir;
+        trust::ApprovedPhoneStore store{dir.file()};
+        ASSERT_TRUE(store.load());
+        test::ManualClock clock;
+        trust::PairingPolicy policy{store, clock};
+        aa::ipc::test::FakePeerCredentials credentials;
+        aa::ipc::test::RecordingEventSink events;
+        aa::ipc::test::SequencePairingIds ids;
+        aa::helper::test::Bridge bridge{store};
+        ControlService service{{kSessionUid}, {credentials, events, ids, policy, &bridge}};
+        const BusName caller{":1.77"}, name{"org.custom.Consumer"};
+        credentials.add_connection(caller, kSessionUid);
+        credentials.set_owner(name, caller);
+        ASSERT_TRUE(service.register_consumer(caller, name));
+        policy.note_candidate(test::kWireless);
+        const auto request = service.request_add_phone(caller);
+        ASSERT_TRUE(request);
+        auto expire = [&] { clock.advance(aa::core::Milliseconds{60'001}); };
+        if (during_rpc) bridge.on_confirm = expire;
+        else if (expiry_point == 0) expire();
+        else policy.pairing_cancelled(request.value());
+        bridge.cancel_result = aa::Error{ErrorCode::helper_unavailable};
+        const auto result = service.confirm_phone_pairing(caller, request.value());
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code(), expiry_point == 2 ? ErrorCode::trust_unknown_phone :
+                  ErrorCode::session_pairing_timeout);
+        EXPECT_EQ(bridge.confirmations, during_rpc ? 1 : 0);
+        EXPECT_EQ(bridge.cancellations, 1);
+        EXPECT_EQ(service.pending_revocations(), 1U);
+        service.refresh_consumer_owner();
+        EXPECT_EQ(service.pending_revocations(), 0U);
+        ASSERT_EQ(bridge.retirement_batches.size(), 1U);
+        EXPECT_EQ(bridge.retirement_batches[0][0].request, request.value());
+        EXPECT_TRUE(store.phones().empty());
+        EXPECT_FALSE(std::filesystem::exists(dir.file()));
+        EXPECT_FALSE(policy.has_pending(request.value()));
+        EXPECT_FALSE(service.pairing_window_open());
+        EXPECT_EQ(std::count_if(events.events.begin(), events.events.end(), [](const auto& event) {
+            return std::holds_alternative<aa::ipc::PairingClosed>(event);
+        }), 1);
+    }
 }
 
 } // namespace

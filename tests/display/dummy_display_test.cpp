@@ -22,6 +22,7 @@
 #include "ProjectionWidget.hpp"
 
 #include "../../src/ipc/dbus_adapter/BusConnection.hpp"
+#include "../../tools/dummy-display/decode_loss.hpp"
 #include "../../tools/dummy-display/pump_timer.hpp"
 #include "../../tools/dummy-display/shutdown_outcome.hpp"
 #include "../../tools/dummy-display/test_control.hpp"
@@ -202,6 +203,137 @@ TEST(DummyDisplayContractRender, PaintCompletionRetainsCorrelationAndIgnoresRepa
     EXPECT_LE(std::stoll(match[1].str()), after);
     EXPECT_EQ(output.find("video_presented", output.find("video_presented") + 1),
               std::string::npos);
+}
+
+TEST(DummyDisplayContractRender, DecodeLossTelemetryIsCumulativeReasonedAndRateLimited) {
+    using Clock = DecodeLossTelemetry::Clock;
+    const Clock::time_point t0{std::chrono::seconds{100}};
+    DecodeLossTelemetry loss;
+    aa::consumer::DecodeReport report;
+    EXPECT_TRUE(loss.observe(report, t0).empty());
+
+    report.frames_lost_retention = 90;
+    report.awaiting_idr = true;
+    auto lines = loss.observe(report, t0);
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":90,"
+                        "\"awaiting_idr\":true}");
+    EXPECT_TRUE(loss.observe(report, t0).empty());
+
+    // A further episode inside the one-second window is coalesced, not lost.
+    report.frames_lost_retention = 91;
+    EXPECT_TRUE(loss.observe(report, t0 + std::chrono::milliseconds{100}).empty());
+    report.frames_lost_capacity = 2;
+    lines = loss.observe(report, t0 + std::chrono::milliseconds{100});
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"capacity\",\"count\":2,"
+                        "\"awaiting_idr\":true}");
+    report.frames_lost_eos = 3;
+    lines = loss.observe(report, t0 + std::chrono::milliseconds{100});
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"end_of_stream\",\"count\":3,"
+                        "\"awaiting_idr\":true}");
+
+    report.frames_lost_retention = 92;
+    report.awaiting_idr = false;
+    lines = loss.observe(report, t0 + std::chrono::milliseconds{1100});
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":92,"
+                        "\"awaiting_idr\":false}");
+
+    // Lower counters denote a new decode session, not negative loss; its first
+    // new episode is immediately visible even within the old rate-limit window.
+    EXPECT_TRUE(loss.observe(aa::consumer::DecodeReport{}, t0 + std::chrono::seconds{2}).empty());
+    aa::consumer::DecodeReport fresh;
+    fresh.frames_lost_capacity = 1;
+    lines = loss.observe(fresh, t0 + std::chrono::seconds{2});
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"capacity\",\"count\":1,"
+                        "\"awaiting_idr\":false}");
+
+    // A session replaced between two observations (new total below the old
+    // one, never seen as zero) is still reported, immediately.
+    fresh.frames_lost_capacity = 5;
+    EXPECT_EQ(loss.observe(fresh, t0 + std::chrono::seconds{10}).size(), 1U);
+    fresh.frames_lost_capacity = 1;
+    lines = loss.observe(fresh, t0 + std::chrono::seconds{10});
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_NE(lines[0].find("\"count\":1,"), std::string::npos);
+
+    // A total coalesced by the rate limit is written by the final flush.
+    fresh.frames_lost_capacity = 2;
+    EXPECT_TRUE(loss.observe(fresh, t0 + std::chrono::seconds{10}).empty());
+    lines = loss.observe(fresh, t0 + std::chrono::seconds{10}, true);
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_NE(lines[0].find("\"count\":2,"), std::string::npos);
+    EXPECT_TRUE(loss.observe(fresh, t0 + std::chrono::seconds{10}, true).empty());
+}
+
+TEST(DummyDisplayContractRender, DecodeLossTelemetryResetsForEqualAndGreaterSessionTotals) {
+    using Clock = DecodeLossTelemetry::Clock;
+    const Clock::time_point now{std::chrono::seconds{100}};
+    DecodeLossTelemetry loss;
+    // No zero-valued observation or rate-limit delay between sessions.
+    for (const std::uint64_t count : {2U, 2U, 3U}) {
+        SCOPED_TRACE(count);
+        loss.begin_session();
+        aa::consumer::DecodeReport report;
+        report.frames_lost_retention = count;
+        const auto lines = loss.observe(report, now);
+        EXPECT_EQ(lines, (std::vector<std::string>{
+            "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":" +
+            std::to_string(count) + ",\"awaiting_idr\":false}"}));
+    }
+}
+
+TEST(DummyDisplayContractRender, DecodeLossTelemetryFlushesPendingTotalsOnSessionEndAndRestart) {
+    using Clock = DecodeLossTelemetry::Clock;
+    const Clock::time_point t0{std::chrono::seconds{100}};
+    DecodeLossTelemetry loss;
+
+    // Session A emits count 1, then reaches count 2 inside the rate-limit window (suppressed).
+    aa::consumer::DecodeReport report_a;
+    report_a.frames_lost_retention = 1;
+    report_a.awaiting_idr = true;
+    ASSERT_EQ(loss.observe(report_a, t0), (std::vector<std::string>{
+        "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":1,\"awaiting_idr\":true}"}));
+    report_a.frames_lost_retention = 2;
+    report_a.awaiting_idr = false;
+    EXPECT_TRUE(loss.observe(report_a, t0 + std::chrono::milliseconds{100}).empty());
+
+    // Session A ends: pending total 2 is emitted once; beginning Session B emits nothing more.
+    EXPECT_EQ(loss.end_session(report_a, t0 + std::chrono::milliseconds{200}),
+              (std::vector<std::string>{
+                  "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":2,"
+                  "\"awaiting_idr\":false}"}));
+    EXPECT_TRUE(loss.flush(t0 + std::chrono::milliseconds{250}).empty());
+    EXPECT_TRUE(loss.begin_session().empty());
+
+    // Session B starts from zero with no carried-over rate-limit window.
+    aa::consumer::DecodeReport report_b;
+    report_b.frames_lost_retention = 1;
+    EXPECT_EQ(loss.observe(report_b, t0 + std::chrono::milliseconds{300}),
+              (std::vector<std::string>{
+                  "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":1,"
+                  "\"awaiting_idr\":false}"}));
+
+    // Fallback: if begin_session() runs without a prior teardown flush, it still emits pending
+    // totals once before resetting state for the next session.
+    EXPECT_TRUE(loss.begin_session().empty());
+    const Clock::time_point t1{std::chrono::seconds{200}};
+    aa::consumer::DecodeReport report_c;
+    report_c.frames_lost_retention = 1;
+    ASSERT_EQ(loss.observe(report_c, t1).size(), 1U);
+    report_c.frames_lost_retention = 3;
+    EXPECT_TRUE(loss.observe(report_c, t1 + std::chrono::milliseconds{100}).empty());
+    EXPECT_EQ(loss.begin_session(), (std::vector<std::string>{
+        "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":3,\"awaiting_idr\":false}"}));
+    aa::consumer::DecodeReport report_d;
+    report_d.frames_lost_retention = 2;
+    EXPECT_EQ(loss.observe(report_d, t1 + std::chrono::milliseconds{200}),
+              (std::vector<std::string>{
+                  "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":2,"
+                  "\"awaiting_idr\":false}"}));
 }
 
 TEST(DummyDisplayContractRender, TelemetryBlockedSinkDoesNotBlockProducersOrPainting) {
@@ -1551,10 +1683,10 @@ private:
             }
             auto message = connection_->read_message();
             if (!message.has_value()) {
-                if (message.error().code() == ErrorCode::transport_closed) {
-                    break;
+                if (message.error().code() == ErrorCode::transport_message_dropped) {
+                    continue;
                 }
-                continue;
+                break;
             }
             if (message.value().type != bus::MessageType::method_call) {
                 continue;
@@ -1597,6 +1729,163 @@ private:
     int* closes_;
     int* submits_;
     int* eofs_;
+};
+
+struct BackpressureDecoderState final {
+    int queue_full_rejections{0};
+    std::optional<ErrorCode> next_rejection{};
+    std::size_t pumps{0};
+    std::size_t closes{0};
+    std::size_t live_sessions{0};
+    std::size_t eofs{0};
+    std::vector<aa::ipc::VideoAccessUnit> submissions{};
+    std::vector<aa::ipc::VideoAccessUnit> accepted{};
+};
+
+// A deterministic decoder: byte backlog rejects every submission until pump()
+// drains one rejection. All attempts are recorded, but only successful
+// submissions enter accepted, making loss and duplicate delivery observable.
+class BackpressureSession final : public DecodeSession {
+public:
+    explicit BackpressureSession(BackpressureDecoderState& state) : state_(state) {
+        ++state_.live_sessions;
+    }
+    ~BackpressureSession() override { --state_.live_sessions; }
+
+    [[nodiscard]] aa::core::Result<void> submit(
+        const aa::ipc::VideoAccessUnit& unit) override {
+        state_.submissions.push_back(unit);
+        if (state_.next_rejection.has_value()) {
+            const auto code = state_.next_rejection.value();
+            state_.next_rejection.reset();
+            return aa::Error{code};
+        }
+        if (state_.queue_full_rejections > 0) {
+            return aa::Error{ErrorCode::ipc_queue_full};
+        }
+        state_.accepted.push_back(unit);
+        return {};
+    }
+    [[nodiscard]] aa::core::Result<void> end_of_stream() override {
+        ++state_.eofs;
+        return {};
+    }
+    [[nodiscard]] aa::core::Result<std::size_t> pump(Milliseconds) override {
+        ++state_.pumps;
+        if (state_.queue_full_rejections > 0) {
+            --state_.queue_full_rejections;
+        }
+        return std::size_t{0};
+    }
+    void close() noexcept override { ++state_.closes; }
+
+private:
+    BackpressureDecoderState& state_;
+};
+
+DecodeSessionFactory backpressure_factory(BackpressureDecoderState& state) {
+    return [&state](const aa::consumer::DecodeConfig&)
+               -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+        return std::unique_ptr<DecodeSession>(std::make_unique<BackpressureSession>(state));
+    };
+}
+
+class BackpressureFixture final {
+public:
+    BackpressureFixture() = default;
+    ~BackpressureFixture() {
+        if (feeder.joinable()) {
+            feeder.join();
+        }
+        if (controller.has_value()) {
+            controller->shutdown();
+        }
+        if (server.has_value()) {
+            server->close();
+        }
+        if (!runtime.empty()) {
+            ::rmdir(runtime.c_str());
+        }
+    }
+
+    [[nodiscard]] bool attach(const std::string& suffix, aa::ipc::NegotiatedLimits limits = {}) {
+        service = ServiceHarness::start();
+        if (!service) {
+            return false;
+        }
+        auto connected = ControlBusClient::connect();
+        if (!connected.has_value()) {
+            return false;
+        }
+        client.emplace(std::move(connected.value()));
+        auto attached = DisplayController::attach(
+            DisplayController::Deps{client.value(), backpressure_factory(decoder), frames},
+            test_config(suffix));
+        if (!attached.has_value()) {
+            return false;
+        }
+        controller.emplace(std::move(attached.value()));
+        runtime = private_runtime_dir();
+        if (runtime.empty()) {
+            return false;
+        }
+        socket = aa::ipc::video_socket_path_in(runtime);
+        auto listening = aa::ipc::VideoServer::listen(
+            socket, aa::ipc::VideoServerOptions{limits, aa::ipc::current_uid()});
+        if (!listening.has_value()) {
+            return false;
+        }
+        server.emplace(std::move(listening.value()));
+        return true;
+    }
+
+    [[nodiscard]] bool start(const std::vector<aa::ipc::VideoAccessUnit>& units,
+                             bool keep_open = false) {
+        feeder = std::thread([this, units, keep_open] {
+            auto producer = server->accept_consumer(Milliseconds{10000});
+            if (!producer.has_value()) {
+                feeder_ok.store(false);
+                return;
+            }
+            for (const auto& unit : units) {
+                auto sent = producer.value().send_access_unit(aa::ipc::VideoSendRequest{
+                    unit.frame, unit.timestamp_ns, unit.idr, unit.payload});
+                if (!sent.has_value()) {
+                    feeder_ok.store(false);
+                    return;
+                }
+            }
+            if (keep_open) {
+                live_producer.emplace(std::move(producer.value()));
+            } else {
+                producer.value().close();
+            }
+        });
+        return controller->start_projection(socket).has_value();
+    }
+
+    [[nodiscard]] bool finish_feeding() {
+        if (feeder.joinable()) {
+            feeder.join();
+        }
+        return feeder_ok.load();
+    }
+
+    // Only read by the test after finish_feeding() joins the handshake thread.
+    std::optional<aa::ipc::VideoProducer> live_producer{};
+    BackpressureDecoderState decoder{};
+    RecordingFrameTarget frames{};
+    std::unique_ptr<ServiceHarness> service{};
+    std::optional<ControlBusClient> client{};
+    std::optional<DisplayController> controller{};
+    std::string runtime{};
+    aa::ipc::VideoSocketPath socket{};
+    std::optional<aa::ipc::VideoServer> server{};
+    std::thread feeder{};
+    std::atomic<bool> feeder_ok{true};
+
+    BackpressureFixture(const BackpressureFixture&) = delete;
+    BackpressureFixture& operator=(const BackpressureFixture&) = delete;
 };
 
 // Real video socket endpoint: start_projection() must connect the production
@@ -1721,7 +2010,394 @@ private:
     std::optional<DisplayController> controller{};
 };
 
+class ReportSession final : public DecodeSession {
+public:
+    explicit ReportSession(aa::consumer::DecodeReport& report) : report_(report) {}
+
+    [[nodiscard]] aa::core::Result<void> submit(const aa::ipc::VideoAccessUnit&) override {
+        return {};
+    }
+    [[nodiscard]] aa::core::Result<void> end_of_stream() override { return {}; }
+    [[nodiscard]] aa::core::Result<std::size_t> pump(Milliseconds) override {
+        return std::size_t{0};
+    }
+    [[nodiscard]] const aa::consumer::DecodeReport& report() const noexcept override {
+        return report_;
+    }
+    void close() noexcept override {}
+
+private:
+    aa::consumer::DecodeReport& report_;
+};
+
 } // namespace
+
+TEST(DummyDisplayContractRender, DecodeLossSessionFlushesPendingTotalOnStopAndResetsOnRestart) {
+    ScriptedReceiver::Script script{};
+    script["StartProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+    VideoEndpoint video_a;
+    VideoEndpoint video_b;
+    ASSERT_TRUE(video_a.ready());
+    ASSERT_TRUE(video_b.ready());
+
+    DecodeLossTelemetry decode_loss;
+    std::vector<std::string> emitted;
+    auto record = [&](std::string line) { emitted.push_back(std::move(line)); };
+    aa::consumer::DecodeReport report_a;
+    aa::consumer::DecodeReport report_b;
+    int session_index = 0;
+    auto factory = [&](const aa::consumer::DecodeConfig&)
+        -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+        auto& report = (session_index++ == 0) ? report_a : report_b;
+        for (auto& line : decode_loss.begin_session()) {
+            record(std::move(line));
+        }
+        return std::unique_ptr<DecodeSession>(std::make_unique<LossReportingDecodeSession>(
+            std::make_unique<ReportSession>(report), decode_loss, record));
+    };
+
+    RecordingFrameTarget frames;
+    auto controller = DisplayController::attach(
+        DisplayController::Deps{client.value(), factory, frames},
+        test_config("LossStopRestart"));
+    ASSERT_TRUE(controller.has_value());
+
+    // Session A: emits expiry count 1, then reaches count 2 inside the 1s window (suppressed).
+    ASSERT_TRUE(controller.value().start_projection(video_a.socket()).has_value());
+    report_a.frames_lost_retention = 1;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}).has_value());
+    for (auto& line : decode_loss.observe(controller.value().decode_report(),
+                                          DecodeLossTelemetry::Clock::now())) {
+        record(std::move(line));
+    }
+    ASSERT_EQ(emitted.size(), 1U);
+    EXPECT_EQ(
+        emitted[0],
+        "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":1,\"awaiting_idr\":false}");
+
+    report_a.frames_lost_retention = 2;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}).has_value());
+    for (auto& line : decode_loss.observe(controller.value().decode_report(),
+                                          DecodeLossTelemetry::Clock::now())) {
+        record(std::move(line));
+    }
+    ASSERT_EQ(emitted.size(), 1U);
+
+    // Stopping projection tears down Session A and flushes pending count 2 once before reset.
+    ASSERT_TRUE(controller.value().stop_projection().has_value());
+    ASSERT_EQ(emitted.size(), 2U);
+    EXPECT_EQ(
+        emitted[1],
+        "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":2,\"awaiting_idr\":false}");
+
+    // Starting Session B does not re-emit Session A's total and starts from zero.
+    ASSERT_TRUE(controller.value().start_projection(video_b.socket()).has_value());
+    EXPECT_EQ(emitted.size(), 2U);
+    report_b.frames_lost_retention = 1;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}).has_value());
+    for (auto& line : decode_loss.observe(controller.value().decode_report(),
+                                          DecodeLossTelemetry::Clock::now())) {
+        record(std::move(line));
+    }
+    ASSERT_EQ(emitted.size(), 3U);
+    EXPECT_EQ(
+        emitted[2],
+        "{\"event\":\"decode_loss\",\"reason\":\"expiry\",\"count\":1,\"awaiting_idr\":false}");
+
+    controller.value().shutdown();
+    EXPECT_EQ(emitted.size(), 3U);
+}
+
+TEST(DummyDisplayBackpressure, RetryableRejectionIsResubmittedExactlyOnce) {
+    BackpressureFixture fixture;
+    fixture.decoder.queue_full_rejections = 1;
+    ASSERT_TRUE(fixture.attach("BackpressureRetry"));
+    const std::vector<aa::ipc::VideoAccessUnit> units{
+        {7, 70, kTimestampBaseNs, true, {0x00, 0x00, 0x01, 0x65, 0x11}}};
+    ASSERT_TRUE(fixture.start(units));
+    ASSERT_TRUE(fixture.finish_feeding());
+
+    // The first submission is byte-rejected, but the controller still pumps
+    // the decoder so its deterministic backlog drain can make space.
+    auto pumped = fixture.controller->pump(Milliseconds{0});
+    ASSERT_TRUE(pumped.has_value());
+    EXPECT_EQ(pumped.value(), 0U);
+    EXPECT_EQ(fixture.decoder.pumps, 1U);
+    ASSERT_EQ(fixture.decoder.submissions.size(), 1U);
+    EXPECT_TRUE(fixture.decoder.accepted.empty());
+    const auto rejected = fixture.decoder.submissions.front();
+
+    // The next pump retries the complete AU before observing the closed input.
+    pumped = fixture.controller->pump(Milliseconds{0});
+    ASSERT_TRUE(pumped.has_value());
+    ASSERT_EQ(fixture.decoder.submissions.size(), 2U);
+    EXPECT_EQ(fixture.decoder.submissions[1], rejected);
+    ASSERT_EQ(fixture.decoder.accepted.size(), 1U);
+    EXPECT_EQ(fixture.decoder.accepted.front(), rejected);
+    EXPECT_EQ(fixture.decoder.eofs, 1U);
+
+    // EOS and further pumping never duplicate the accepted unit.
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+    EXPECT_EQ(fixture.decoder.submissions.size(), 2U);
+    EXPECT_EQ(fixture.decoder.accepted.size(), 1U);
+    EXPECT_EQ(fixture.decoder.eofs, 1U);
+    ASSERT_TRUE(fixture.controller->stop_projection().has_value());
+    EXPECT_EQ(fixture.decoder.closes, 1U);
+    EXPECT_TRUE(fixture.feeder_ok.load());
+}
+
+TEST(DummyDisplayBackpressure, PendingUnitAppliesSourceBackpressureAndPreservesOrder) {
+    BackpressureFixture fixture;
+    fixture.decoder.queue_full_rejections = 2;
+    ASSERT_TRUE(fixture.attach("BackpressureOrder"));
+    const std::vector<aa::ipc::VideoAccessUnit> units{
+        {11, 110, kTimestampBaseNs, true, {0x00, 0x00, 0x01, 0x65, 0x21}},
+        {12, 111, kTimestampBaseNs + kFramePeriodNs, false,
+         {0x00, 0x00, 0x01, 0x41, 0x22}},
+        {13, 112, kTimestampBaseNs + 2 * kFramePeriodNs, false,
+         {0x00, 0x00, 0x01, 0x41, 0x23}}};
+    ASSERT_TRUE(fixture.start(units));
+    ASSERT_TRUE(fixture.finish_feeding());
+
+    // Capacity is exactly one pending AU. While it remains rejected, later
+    // units stay in the video socket: no receive-past, overwrite or queue
+    // growth is possible, and source backpressure is the saturation policy.
+    for (std::size_t attempt = 0; attempt < 2; ++attempt) {
+        auto pumped = fixture.controller->pump(Milliseconds{0});
+        ASSERT_TRUE(pumped.has_value());
+        ASSERT_EQ(fixture.decoder.submissions.size(), attempt + 1);
+        EXPECT_TRUE(fixture.decoder.accepted.empty());
+        for (const auto& submission : fixture.decoder.submissions) {
+            EXPECT_EQ(submission, fixture.decoder.submissions.front());
+        }
+    }
+    ASSERT_EQ(fixture.decoder.submissions.size(), 2U);
+    const auto rejected = fixture.decoder.submissions.front();
+
+    auto pumped = fixture.controller->pump(Milliseconds{0});
+    ASSERT_TRUE(pumped.has_value());
+    ASSERT_EQ(fixture.decoder.submissions.size(), 5U);
+    ASSERT_EQ(fixture.decoder.accepted.size(), units.size());
+    EXPECT_EQ(fixture.decoder.accepted.front(), rejected);
+    for (std::size_t index = 0; index < units.size(); ++index) {
+        const auto& accepted = fixture.decoder.accepted[index];
+        EXPECT_EQ(accepted, fixture.decoder.submissions[index + 2]);
+        EXPECT_EQ(accepted.frame, units[index].frame);
+        EXPECT_EQ(accepted.timestamp_ns, units[index].timestamp_ns);
+        EXPECT_EQ(accepted.payload, units[index].payload);
+    }
+    EXPECT_EQ(fixture.decoder.eofs, 1U);
+    ASSERT_TRUE(fixture.controller->stop_projection().has_value());
+    EXPECT_EQ(fixture.decoder.closes, 1U);
+    EXPECT_TRUE(fixture.feeder_ok.load());
+}
+
+TEST(DummyDisplayBackpressure, NonRetryableRejectionsAreNotRetried) {
+    for (const auto code : {ErrorCode::ipc_consumer_rejected, ErrorCode::channel_decode_failed}) {
+        SCOPED_TRACE(static_cast<std::uint16_t>(code));
+        BackpressureFixture fixture;
+        fixture.decoder.next_rejection = code;
+        ASSERT_TRUE(fixture.attach("BackpressureTerminal" +
+                                   std::to_string(static_cast<std::uint16_t>(code))));
+        const std::vector<aa::ipc::VideoAccessUnit> units{
+            {21, 210, kTimestampBaseNs, true, {0x00, 0x00, 0x01, 0x65, 0x31}}};
+        ASSERT_TRUE(fixture.start(units));
+        ASSERT_TRUE(fixture.finish_feeding());
+
+        // Waiting-for-IDR discard and terminal decode failure both retain
+        // their existing error semantics; neither becomes a pending retry.
+        const auto rejected = fixture.controller->pump(Milliseconds{0});
+        ASSERT_FALSE(rejected.has_value());
+        EXPECT_EQ(rejected.error().code(), code);
+        EXPECT_EQ(fixture.decoder.submissions.size(), 1U);
+        EXPECT_EQ(fixture.decoder.pumps, 0U);
+        EXPECT_TRUE(fixture.decoder.accepted.empty());
+
+        ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+        EXPECT_EQ(fixture.decoder.submissions.size(), 1U);
+        EXPECT_EQ(fixture.decoder.eofs, 1U);
+        ASSERT_TRUE(fixture.controller->stop_projection().has_value());
+        EXPECT_EQ(fixture.decoder.closes, 1U);
+        EXPECT_TRUE(fixture.feeder_ok.load());
+    }
+}
+
+TEST(DummyDisplayBackpressure, StopAndShutdownReleasePendingUnit) {
+    for (const bool shutdown : {false, true}) {
+        SCOPED_TRACE(shutdown);
+        BackpressureFixture fixture;
+        fixture.decoder.queue_full_rejections = 1;
+        ASSERT_TRUE(fixture.attach(shutdown ? "PendingShutdown" : "PendingStop"));
+        const std::vector<aa::ipc::VideoAccessUnit> units{
+            {31, 310, kTimestampBaseNs, true, {0x00, 0x00, 0x01, 0x65, 0x41}}};
+        ASSERT_TRUE(fixture.start(units));
+        ASSERT_TRUE(fixture.finish_feeding());
+        ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+        ASSERT_EQ(fixture.decoder.submissions.size(), 1U);
+        ASSERT_TRUE(fixture.decoder.accepted.empty());
+        ASSERT_EQ(fixture.decoder.live_sessions, 1U);
+
+        // The decoder can now accept, but teardown must discard the pending AU.
+        if (shutdown) {
+            fixture.controller->shutdown();
+            EXPECT_EQ(fixture.controller->state(), DisplayState::unavailable);
+            EXPECT_EQ(fixture.controller->consumer(), aa::core::ConsumerId{});
+        } else {
+            ASSERT_TRUE(fixture.controller->stop_projection().has_value());
+            EXPECT_EQ(fixture.controller->state(), DisplayState::idle);
+        }
+        EXPECT_EQ(fixture.decoder.closes, 1U);
+        EXPECT_EQ(fixture.decoder.live_sessions, 0U);
+        const auto after_stop = fixture.controller->pump(Milliseconds{0});
+        ASSERT_FALSE(after_stop.has_value());
+        EXPECT_EQ(after_stop.error().code(), ErrorCode::session_illegal_transition);
+        EXPECT_EQ(fixture.decoder.submissions.size(), 1U);
+        EXPECT_EQ(fixture.decoder.eofs, 0U);
+        EXPECT_TRUE(fixture.decoder.accepted.empty());
+
+        if (!shutdown) {
+            // A fresh projection must not inherit or replay the discarded AU.
+            auto fresh = units;
+            fresh.front().frame = 32;
+            fresh.front().payload.back() = 0x42;
+            ASSERT_TRUE(fixture.start(fresh));
+            ASSERT_TRUE(fixture.finish_feeding());
+            ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+            ASSERT_EQ(fixture.decoder.accepted.size(), 1U);
+            EXPECT_EQ(fixture.decoder.accepted.front().frame, 32U);
+            EXPECT_EQ(fixture.decoder.accepted.front().payload, fresh.front().payload);
+            EXPECT_EQ(fixture.decoder.submissions.size(), 2U);
+        }
+        fixture.controller->shutdown();
+        fixture.controller->shutdown();
+        EXPECT_EQ(fixture.decoder.live_sessions, 0U);
+        EXPECT_EQ(fixture.decoder.closes, shutdown ? 1U : 2U);
+        EXPECT_EQ(fixture.controller->state(), DisplayState::unavailable);
+        EXPECT_EQ(fixture.controller->consumer(), aa::core::ConsumerId{});
+    }
+}
+
+TEST(DummyDisplayBackpressure, RetryBecomesNonRetryableAndReleasesPendingUnit) {
+    for (const auto code : {ErrorCode::ipc_consumer_rejected, ErrorCode::channel_decode_failed}) {
+        SCOPED_TRACE(static_cast<std::uint16_t>(code));
+        BackpressureFixture fixture;
+        fixture.decoder.queue_full_rejections = 1;
+        ASSERT_TRUE(
+            fixture.attach("PendingTerminal" + std::to_string(static_cast<std::uint16_t>(code))));
+        const std::vector<aa::ipc::VideoAccessUnit> units{
+            {41, 410, kTimestampBaseNs, true, {0x00, 0x00, 0x01, 0x65, 0x51}},
+            {42, 411, kTimestampBaseNs + kFramePeriodNs, true, {0x00, 0x00, 0x01, 0x65, 0x52}}};
+        ASSERT_TRUE(fixture.start(units));
+        ASSERT_TRUE(fixture.finish_feeding());
+        ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+        ASSERT_EQ(fixture.decoder.submissions.size(), 1U);
+        fixture.decoder.next_rejection = code;
+
+        const auto failed = fixture.controller->pump(Milliseconds{0});
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error().code(), code);
+        ASSERT_EQ(fixture.decoder.submissions.size(), 2U);
+        EXPECT_EQ(fixture.decoder.submissions[0], fixture.decoder.submissions[1]);
+        EXPECT_TRUE(fixture.decoder.accepted.empty());
+        EXPECT_EQ(fixture.decoder.pumps, 1U);
+
+        ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+        ASSERT_EQ(fixture.decoder.accepted.size(), 1U);
+        EXPECT_EQ(fixture.decoder.accepted.front().frame, 42U);
+        EXPECT_EQ(fixture.decoder.submissions.size(), 3U);
+        EXPECT_EQ(fixture.decoder.eofs, 1U);
+        ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+        EXPECT_EQ(fixture.decoder.submissions.size(), 3U);
+        ASSERT_TRUE(fixture.controller->stop_projection().has_value());
+        EXPECT_EQ(fixture.decoder.live_sessions, 0U);
+    }
+}
+
+TEST(DummyDisplayBackpressure, SaturationDropsUpstreamThenRecoversOnNextIdr) {
+    using aa::ipc::SendStatus;
+    BackpressureFixture fixture;
+    fixture.decoder.queue_full_rejections = 2;
+    aa::ipc::NegotiatedLimits limits{};
+    limits.socket_budget_bytes = 16384;
+    ASSERT_TRUE(fixture.attach("PendingProducerDrops", limits));
+    const std::vector<aa::ipc::VideoAccessUnit> units{
+        {1, 0, kTimestampBaseNs, true, {0x00, 0x00, 0x01, 0x65, 0x61}}};
+    ASSERT_TRUE(fixture.start(units, true));
+    ASSERT_TRUE(fixture.finish_feeding());
+    ASSERT_TRUE(fixture.live_producer.has_value());
+    auto& producer = fixture.live_producer.value();
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+    ASSERT_EQ(fixture.decoder.submissions.size(), 1U);
+    ASSERT_TRUE(fixture.decoder.accepted.empty());
+
+    // One datagram per AU avoids partial-fragment ambiguity. No consumer
+    // reads occur while the controller owns its single rejected AU.
+    const std::vector<std::uint8_t> payload(1024, 0x7a);
+    std::uint64_t frame = 2;
+    std::size_t sent = 0;
+    bool dropped = false;
+    for (; frame < 1024; ++frame) {
+        const auto result = producer.send_access_unit({frame, frame, false, payload});
+        ASSERT_TRUE(result.has_value());
+        if (result.value() == SendStatus::dropped_backpressure) {
+            dropped = true;
+            break;
+        }
+        ASSERT_EQ(result.value(), SendStatus::sent);
+        ++sent;
+    }
+    ASSERT_TRUE(dropped);
+    EXPECT_GT(sent, 0U);
+    EXPECT_EQ(producer.backpressure_events(), 1U);
+    EXPECT_EQ(producer.dropped(), 1U);
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+    ASSERT_EQ(fixture.decoder.submissions.size(), 2U);
+    EXPECT_EQ(fixture.decoder.submissions[0], fixture.decoder.submissions[1]);
+    EXPECT_TRUE(fixture.decoder.accepted.empty());
+
+    // The retained AU and all fully queued AUs drain exactly once in order.
+    for (std::size_t attempt = 0; attempt < sent + 2 && fixture.decoder.accepted.size() < sent + 1;
+         ++attempt) {
+        ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+    }
+    ASSERT_EQ(fixture.decoder.accepted.size(), sent + 1);
+    for (std::size_t index = 0; index < sent + 1; ++index) {
+        EXPECT_EQ(fixture.decoder.accepted[index].frame, index + 1);
+    }
+    const auto suppressed = producer.send_access_unit({++frame, frame, false, payload});
+    ASSERT_TRUE(suppressed.has_value());
+    EXPECT_EQ(suppressed.value(), SendStatus::dropped_waiting_idr);
+    EXPECT_EQ(producer.dropped(), 2U);
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+    EXPECT_EQ(fixture.decoder.accepted.size(), sent + 1);
+
+    const auto idr_frame = ++frame;
+    const auto recovered = producer.send_access_unit({idr_frame, idr_frame, true, payload});
+    ASSERT_TRUE(recovered.has_value());
+    ASSERT_EQ(recovered.value(), SendStatus::sent);
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+    ASSERT_EQ(fixture.decoder.accepted.size(), sent + 2);
+    EXPECT_EQ(fixture.decoder.accepted.back().frame, idr_frame);
+    EXPECT_TRUE(fixture.decoder.accepted.back().idr);
+    EXPECT_EQ(fixture.decoder.accepted.back().payload, payload);
+
+    const auto resumed = producer.send_access_unit({++frame, frame, false, payload});
+    ASSERT_TRUE(resumed.has_value());
+    ASSERT_EQ(resumed.value(), SendStatus::sent);
+    producer.close();
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}).has_value());
+    ASSERT_EQ(fixture.decoder.accepted.size(), sent + 3);
+    EXPECT_EQ(fixture.decoder.accepted.back().frame, frame);
+    EXPECT_FALSE(fixture.decoder.accepted.back().idr);
+    EXPECT_EQ(fixture.decoder.eofs, 1U);
+    ASSERT_TRUE(fixture.controller->stop_projection().has_value());
+    EXPECT_EQ(fixture.decoder.live_sessions, 0U);
+}
 
 TEST(DummyDisplayStopRecovery, RejectedStopRetainsMediaThenRetryRecovers) {
     // (a) the receiver rejects StopProjection and still reports projecting:

@@ -18,7 +18,7 @@ TEST(InFlightCancellation, TcpReceiveObservedInsidePoll) {
     aa::core::CancellationSource source;
     ASSERT_TRUE(pair.value().client->open(source.get_token()));
     PendingIo pending([&] { return pair.value().client->receive(); });
-    const bool blocked = pending.blocked(SYS_poll);
+    const bool blocked = pending.blocked_in_poll();
     // When: cancellation fires after the kernel wait is observed.
     source.request_stop();
     // Then: the pending read is cancelled within a bounded interval.
@@ -128,7 +128,7 @@ TEST(InFlightCancellation, TcpSendObservedUnderBackpressure) {
             ++completed;
         }
     });
-    const bool blocked = pending.blocked(SYS_poll, client_fd);
+    const bool blocked = pending.blocked_in_poll(client_fd);
     // When: stopping a send observed in poll while its socket is not writable.
     source.request_stop();
     // Then: actual backpressure is cancelled, not an immediate pre-start stop.

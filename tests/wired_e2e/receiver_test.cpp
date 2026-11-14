@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exercise the actual harness adapters, not copies of their logging logic.
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
+#include <future>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -213,6 +215,7 @@ class ObservedSessionMutex {
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <sstream>
+#include <tuple>
 #include <unistd.h>
 #include <poll.h>
 #include <sys/syscall.h>
@@ -539,6 +542,278 @@ TEST(WiredReceiver, StdoutLogFinishWaitsForFrontAndJoinsOnlyOnce) {
     EXPECT_EQ(harness.probe.bytes, "final\n");
     EXPECT_FALSE(harness.log.finish());
     EXPECT_EQ(harness.log.submit("closed").value(), ESHUTDOWN);
+}
+
+// ---- Audit L13: phone-driven telemetry must not consume the sink or block shutdown ----
+
+std::atomic<std::int64_t> g_log_fake_ns{0};
+aa::wired_receiver::StdoutLog::Clock::time_point log_fake_now() {
+    return aa::wired_receiver::StdoutLog::Clock::time_point{std::chrono::nanoseconds{g_log_fake_ns.load()}};
+}
+std::size_t count_substr(const std::string &text, const std::string &needle) {
+    std::size_t count = 0;
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) { ++count; }
+    return count;
+}
+std::uint64_t sum_reported(const std::string &text, const std::string &field) {
+    std::uint64_t total = 0;
+    const std::string key = "\"" + field + "\":";
+    for (auto at = text.find("media_telemetry_dropped"); at != std::string::npos;
+         at = text.find("media_telemetry_dropped", at + 1)) {
+        const auto value = text.find(key, at);
+        total += std::stoull(text.substr(value + key.size()));
+    }
+    return total;
+}
+
+TEST(WiredReceiver, StdoutLogMediaTelemetryIsRateLimitedPerKindAndCounted) {
+    // Given: a 10/s, burst-20 limiter on a controllable clock and a free-flowing sink.
+    LogWriteProbe probe;
+    probe.released = true;
+    LogWriteProbe::active = &probe;
+    std::atomic<bool> running{true};
+    g_log_fake_ns = 0;
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {10.0, 20.0}};
+    // When: a phone floods one media kind in a single instant.
+    for (int i = 0; i < 1000; ++i) { EXPECT_FALSE(log.submit_media("audio_write_completed", "{\"event\":\"audio_write_completed\"}")); }
+    // Then: only the burst is admitted; the rest is counted, none of it errors.
+    EXPECT_EQ(log.media_drops().rate_limited, 980U);
+    EXPECT_EQ(log.media_drops().backpressure, 0U);
+    // And a different kind has its own bucket.
+    for (int i = 0; i < 20; ++i) { EXPECT_FALSE(log.submit_media("video_sent", "{\"event\":\"video_sent\"}")); }
+    EXPECT_EQ(log.media_drops().rate_limited, 980U);
+    // When: a second passes the bucket refills at the sustained rate (10 tokens).
+    g_log_fake_ns = 1'000'000'000;
+    for (int i = 0; i < 100; ++i) { EXPECT_FALSE(log.submit_media("audio_write_completed", "{\"event\":\"audio_write_completed\"}")); }
+    EXPECT_EQ(log.media_drops().rate_limited, 980U + 90U);
+    // Lossless lifecycle records are unaffected by the media limiter.
+    EXPECT_FALSE(log.submit("{\"event\":\"ready\"}"));
+    EXPECT_FALSE(log.finish());
+    LogWriteProbe::active = nullptr;
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_write_completed\""), 30U);
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"video_sent\""), 20U);
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"ready\""), 1U);
+    // And the loss is reported in-band, exactly once accounted.
+    EXPECT_EQ(sum_reported(probe.bytes, "rate_limited"), 980U + 90U);
+}
+
+TEST(WiredReceiver, StdoutLogMediaTelemetryNeverBlocksOnAStalledSink) {
+    // Given: a sink that never returns and an unlimited rate, so only capacity bounds admission.
+    auto *probe = new LogWriteProbe; // Intentionally leaked: a worker may outlive this test.
+    LogWriteProbe::active = probe;
+    std::atomic<bool> running{true};
+    g_log_fake_ns = 0;
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {1e9, 1e9}};
+    constexpr std::size_t total = aa::wired_receiver::StdoutLog::entry_capacity + 904;
+    // When: media threads submit more than the queue holds.
+    auto flood = std::async(std::launch::async, [&] {
+        for (std::size_t i = 0; i < total; ++i) { EXPECT_FALSE(log.submit_media("audio_write_completed", "{}")); }
+    });
+    // Then: they return promptly (no waiting for space) and the overflow is counted.
+    ASSERT_EQ(flood.wait_for(std::chrono::seconds{2}), std::future_status::ready);
+    EXPECT_EQ(log.media_drops().backpressure, 904U);
+    EXPECT_EQ(log.media_drops().rate_limited, 0U);
+    probe->release();
+    EXPECT_FALSE(log.finish());
+    EXPECT_FALSE(probe->timed_out);
+    LogWriteProbe::active = nullptr;
+}
+
+TEST(WiredReceiver, StdoutLogFinishIsBoundedWhenTheSinkNeverReturns) {
+    // Given: a stalled sink, a full queue and a lossless producer waiting for space.
+    LogWriteProbe owned_probe;
+    auto *probe = &owned_probe;
+    LogWriteProbe::active = probe;
+    std::atomic<bool> running{true};
+    std::error_code waiting_producer;
+    {
+        aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write};
+        for (std::size_t i = 0; i < aa::wired_receiver::StdoutLog::entry_capacity; ++i) {
+            ASSERT_FALSE(log.submit("x"));
+        }
+        std::thread producer([&] { waiting_producer = log.submit("blocked"); });
+        ASSERT_TRUE(log.wait_for_capacity_wait());
+        // When: shutdown asks for a 300 ms flush.
+        const auto started = std::chrono::steady_clock::now();
+        const auto error = log.finish(std::chrono::milliseconds{300});
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        producer.join();
+        // Then: it gives up inside the bound, reports the timeout, and wakes the producer.
+        EXPECT_EQ(error.value(), ETIMEDOUT);
+        EXPECT_LT(elapsed, std::chrono::milliseconds{1500});
+        EXPECT_TRUE(log.timed_out());
+        EXPECT_EQ(waiting_producer.value(), ESHUTDOWN);
+        EXPECT_EQ(log.submit("late").value(), ETIMEDOUT);
+        EXPECT_EQ(log.finish(std::chrono::milliseconds{300}).value(), ETIMEDOUT); // Repeat is a no-op.
+        // Release and observe detached-worker exit before resetting the write seam.
+        probe->release();
+        EXPECT_TRUE(log.wait_for_worker_exit());
+    }
+    EXPECT_TRUE(running.load()); // Never touched the owner's flag after abandonment.
+    LogWriteProbe::active = nullptr;
+}
+
+// Fills a stalled log to its entry capacity (front entry held in the native write).
+void fill_log_queue(aa::wired_receiver::StdoutLog &log) {
+    for (std::size_t i = 0; i < aa::wired_receiver::StdoutLog::entry_capacity; ++i) {
+        ASSERT_FALSE(log.submit("x"));
+    }
+}
+
+TEST(WiredReceiver, StdoutLogLosslessSubmitIsBoundedOnceRunningStopsWithAStuckSink) {
+    // Given: a stalled sink, a full queue, and a log whose shutdown wait is 200 ms.
+    LogWriteProbe owned_probe;
+    auto *probe = &owned_probe;
+    LogWriteProbe::active = probe;
+    std::atomic<bool> running{true};
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, &aa::wired_receiver::StdoutLog::Clock::now,
+                                      {}, std::chrono::milliseconds{200}};
+    fill_log_queue(log);
+    // When: shutdown begins (running false) and lossless records keep arriving.
+    running.store(false);
+    auto submitted = std::async(std::launch::async, [&] {
+        const auto started = LogClock::now();
+        const auto first = log.submit("{\"event\":\"stopping\"}");
+        const auto first_took = LogClock::now() - started;
+        const auto second_started = LogClock::now();
+        const auto second = log.submit("{\"event\":\"decode_stats\"}");
+        return std::make_tuple(first, first_took, second, LogClock::now() - second_started);
+    });
+    const bool bounded = submitted.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+    if (!bounded) { probe->release(); }
+    ASSERT_TRUE(bounded) << "LOSSLESS_SUBMIT_BLOCKED_AFTER_SHUTDOWN_BEGAN";
+    const auto [first, first_took, second, second_took] = submitted.get();
+    // Then: the first waits about the bound and gives up, later ones do not wait at all.
+    EXPECT_EQ(first.value(), ETIMEDOUT);
+    EXPECT_GE(first_took, std::chrono::milliseconds{150});
+    EXPECT_LT(first_took, std::chrono::milliseconds{2000});
+    EXPECT_EQ(second.value(), ETIMEDOUT);
+    EXPECT_LT(second_took, std::chrono::milliseconds{100});
+    EXPECT_EQ(log.shutdown_drops(), 2U);
+    // And the stuck sink still bounds finish(), whose worker is abandoned.
+    EXPECT_EQ(log.finish(std::chrono::milliseconds{200}).value(), ETIMEDOUT);
+    probe->release();
+    EXPECT_TRUE(log.wait_for_worker_exit());
+    LogWriteProbe::active = nullptr;
+}
+
+TEST(WiredReceiver, StdoutLogShutdownDropFailsFinishAfterSinkRecoversAndDrains) {
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    std::atomic<bool> running{true};
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, &aa::wired_receiver::StdoutLog::Clock::now,
+                                      {}, std::chrono::milliseconds{200}};
+    fill_log_queue(log);
+    running.store(false);
+
+    // The lifecycle record times out while the sink is still stalled.
+    EXPECT_EQ(log.submit("{\"event\":\"stopping\"}").value(), ETIMEDOUT);
+    EXPECT_EQ(log.shutdown_drops(), 1U);
+    probe.release();
+
+    // Recovery drains all admitted records, but cannot undo the lost record.
+    EXPECT_EQ(log.finish().value(), ETIMEDOUT);
+    EXPECT_FALSE(log.timed_out());
+    EXPECT_FALSE(probe.timed_out);
+    std::string expected;
+    for (std::size_t i = 0; i < aa::wired_receiver::StdoutLog::entry_capacity; ++i) {
+        expected += "x\n";
+    }
+    EXPECT_EQ(probe.bytes, expected);
+    EXPECT_EQ(log.shutdown_drops(), 1U);
+    EXPECT_EQ(log.finish().value(), ETIMEDOUT);
+    LogWriteProbe::active = nullptr;
+}
+
+TEST(WiredReceiver, StdoutLogShutdownWaitStillDeliversOnAHealthySink) {
+    // Given: a full queue behind a slow (not stuck) sink and a 5 s shutdown wait.
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    std::atomic<bool> running{true};
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, &aa::wired_receiver::StdoutLog::Clock::now,
+                                      {}, std::chrono::seconds{5}};
+    fill_log_queue(log);
+    running.store(false);
+    // When: a lifecycle record is submitted during shutdown, and the sink resumes 100 ms later.
+    std::thread resume([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        probe.release();
+    });
+    const auto result = log.submit("{\"event\":\"stopping\"}");
+    resume.join();
+    // Then: it is delivered in order, nothing is dropped.
+    EXPECT_FALSE(result);
+    EXPECT_FALSE(log.finish());
+    EXPECT_EQ(log.shutdown_drops(), 0U);
+    const std::string stopping = "{\"event\":\"stopping\"}\n";
+    ASSERT_GE(probe.bytes.size(), stopping.size());
+    EXPECT_EQ(probe.bytes.substr(probe.bytes.size() - stopping.size()), stopping);
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"stopping\""), 1U);
+    LogWriteProbe::active = nullptr;
+}
+
+TEST(WiredReceiver, VideoOutletPerAccessUnitObserverNeverBlocksOnAFullStalledStdoutQueue) {
+    // Given: the real producer observer bound to a log with a full queue and a stalled sink.
+    LogWriteProbe owned_probe;
+    auto *probe = &owned_probe;
+    LogWriteProbe::active = probe;
+    std::atomic<bool> running{true};
+    aa::wired_receiver::StdoutLog owned_log{running, LogWriteProbe::write};
+    auto *log = &owned_log;
+    fill_log_queue(*log);
+    VideoOutlet outlet{[&](const std::string &line) { (void)log->submit(line); },
+                       [&](std::string_view kind, const std::string &line) { (void)log->submit_media(kind, line); }};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    constexpr int units = 600;
+    // When: an admitted phone sends one access unit per frame (each fires the observer).
+    auto sent = std::async(std::launch::async, [&] {
+        int ok = 0;
+        for (int i = 0; i < units; ++i) {
+            if (outlet.on_message({{aa::protocol::ChannelRole::video, 1, {}}, wiredtest::kVideoIdr})) { ++ok; }
+            if (!pair.value().consumer.receive(aa::core::Milliseconds{500})) { break; }
+        }
+        return ok;
+    });
+    const bool bounded = sent.wait_for(std::chrono::seconds{2}) == std::future_status::ready;
+    if (!bounded) { probe->release(); }
+    ASSERT_TRUE(bounded) << "PER_AU_VIDEO_OBSERVER_BLOCKED_ON_STALLED_STDOUT";
+    // Then: every unit was processed; each per-AU observation (plus the periodic
+    // video_sent / decode_stats records) was admitted or counted as dropped.
+    EXPECT_EQ(sent.get(), units);
+    const auto drops = log->media_drops();
+    EXPECT_GE(drops.rate_limited + drops.backpressure, static_cast<std::uint64_t>(units));
+    EXPECT_GT(drops.backpressure, 0U);
+    probe->release(); // Healthy again: the final lossless stats record is then delivered.
+    outlet.close();
+    EXPECT_FALSE(log->finish());
+    LogWriteProbe::active = nullptr;
+}
+
+TEST(WiredReceiver, ReceiverLogMediaPathIsRateLimitedAndAccountedThroughTheRealCallSite) {
+    // Given: the receiver's real log_media call site bound to a real scope, capturing stdout.
+    g_running.store(true);
+    constexpr int total = 50'000;
+    capture_receiver_stdout();
+    std::uint64_t dropped = 0;
+    {
+        ReceiverLogScope logging{g_running};
+        // When: a phone drives far more audio completions than the limit in a tight burst.
+        for (int i = 0; i < total; ++i) {
+            log_media("audio_write_completed", "{\"event\":\"audio_write_completed\",\"scheduled_ns\":1}");
+        }
+        dropped = logging.log.media_drops().rate_limited + logging.log.media_drops().backpressure;
+        EXPECT_FALSE(logging.log.finish());
+    }
+    const auto output = captured_receiver_stdout();
+    // Then: every record is either written or counted as dropped, and most were dropped.
+    const auto written = count_substr(output, "\"event\":\"audio_write_completed\"");
+    EXPECT_EQ(written + dropped, static_cast<std::uint64_t>(total));
+    EXPECT_LT(written, 2'000U);
+    EXPECT_GT(dropped, 40'000U);
+    EXPECT_EQ(sum_reported(output, "rate_limited") + sum_reported(output, "backpressure"), dropped);
+    EXPECT_TRUE(g_running.load());
 }
 
 TEST(WiredReceiver, StdoutLogRequiresExplicitBinding) {
@@ -1167,7 +1442,7 @@ class RuntimeTransport final : public aa::transport::Transport {
                 shutdown_observation->record("final-receive");
             }
             ++shutdown_observation->pings;
-            return wiredtest::control_frame(
+            return wiredtest::encrypted_control_frame(
                 aa::protocol::encode(aa::protocol::PingRequest{1, {}}).value());
         }
         if (drops_ && !runtime_quiet) {
@@ -1704,6 +1979,67 @@ TEST(WiredReceiver, StdoutLogFailureConvertsCleanMainExitAndPreservesEarlyFailur
         EXPECT_FALSE(g_running.load());
     }
     ::close(full);
+    EXPECT_EQ(aa::wired_receiver::active_stdout_log.load(), nullptr);
+    g_running.store(true);
+}
+
+TEST(WiredReceiver, ReceiverShutdownIsBoundedWithAFullQueueAndAStalledStdout) {
+    // Given: stdout becomes a pipe nobody reads and that is already full, so the
+    // native write stalls; the receiver is then run until the test stops it.
+    int stalled[2]{-1, -1};
+    ASSERT_EQ(::pipe(stalled), 0);
+    const int flags = ::fcntl(stalled[1], F_GETFL);
+    ASSERT_EQ(::fcntl(stalled[1], F_SETFL, flags | O_NONBLOCK), 0);
+    const std::string junk(4096, 'j');
+    while (::write(stalled[1], junk.data(), junk.size()) > 0) {}
+    ASSERT_EQ(::fcntl(stalled[1], F_SETFL, flags), 0);
+    std::atomic<bool> stdout_stalled{false};
+    std::atomic<bool> queue_full{false};
+    runtime_sink_request_override = [&](const auto &) -> aa::audio::detail::SinkOpenOutcome {
+        EXPECT_EQ(::dup2(stalled[1], STDOUT_FILENO), STDOUT_FILENO);
+        stdout_stalled.store(true);
+        return {std::make_unique<wiredtest::RecordingObservedSink>(
+            std::make_shared<wiredtest::AudioObs>()), {}};
+    };
+    // And a stop signal that arrives once the log queue is full.
+    std::thread stopper([&] {
+        const auto give_up = LogClock::now() + std::chrono::seconds{20};
+        while (LogClock::now() < give_up && !stdout_stalled.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        aa::wired_receiver::StdoutLog *log = nullptr;
+        while (LogClock::now() < give_up && (log = aa::wired_receiver::active_stdout_log.load()) == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        // Distinct kinds: each has its own token bucket, and media never blocks.
+        for (int round = 0; log && round < 200 && log->outstanding().second < aa::wired_receiver::StdoutLog::entry_capacity;
+             ++round) {
+            for (int kind = 0; kind < 32; ++kind) {
+                const auto name = "fill" + std::to_string(kind);
+                for (int i = 0; i < 100; ++i) { (void)log->submit_media(name, "{}"); }
+            }
+        }
+        queue_full.store(log && log->outstanding().second == aa::wired_receiver::StdoutLog::entry_capacity);
+        g_running.store(false);
+    });
+    // When: the receiver shuts down (video_outlet.close(), `stopping`, finish()).
+    auto run = std::async(std::launch::async, [] { return run_runtime(false, 0, true); });
+    const bool returned = run.wait_for(std::chrono::seconds{30}) == std::future_status::ready;
+    if (!returned) {
+        ::close(stalled[0]); // EPIPE latches the sink error and unwinds every waiter.
+        stalled[0] = -1;
+    }
+    const auto result = run.get();
+    stopper.join();
+    runtime_sink_request_override = {};
+    ::close(stalled[1]);
+    if (stalled[0] >= 0) { ::close(stalled[0]); }
+    // Then: shutdown is bounded (about 2 s per bounded stage) and reports the lost logs.
+    ASSERT_TRUE(returned) << "RECEIVER_SHUTDOWN_BLOCKED_ON_STALLED_STDOUT";
+    EXPECT_TRUE(stdout_stalled.load());
+    EXPECT_TRUE(queue_full.load());
+    EXPECT_LT(result.elapsed, std::chrono::seconds{12});
+    EXPECT_NE(result.code, 0);
     EXPECT_EQ(aa::wired_receiver::active_stdout_log.load(), nullptr);
     g_running.store(true);
 }
@@ -4187,6 +4523,7 @@ TEST(WiredReceiver, RealGstReversibleBlockSeparatesPairAdmissionFromMarkerHandof
         ConcreteAudioRenderWorker audio{pcm_router_config(), [&](const auto &config) {
             detail::SinkOpenRequest request;
             request.format = config.output_format;
+            request.backend = config.backend;
             auto outcome = real_runtime_sink(request);
             sink = outcome.sink.get();
             return detail::open_router_with_sink_for_test(config, std::move(outcome.sink));
@@ -5773,15 +6110,102 @@ TEST(WiredReceiver, RealGstMidStreamStallRecoversToRealTime) {
     EXPECT_LE(run.tail_sink_lag, 20'000'000);
 }
 
-// #60: the receiver routes through pulsesink by default (pipewiresink streams
-// degrade after ~1.5-2.3 h on this host's PipeWire 1.0.5 plugin); the flag
-// restores pipewiresink or the automatic choice.
+// #60/#80: the receiver routes through pulsesink by default (pipewiresink has
+// no rate control on PipeWire 1.0.5 / Ubuntu noble and degrades after ~1.5-2.3 h);
+// the flag preserves the requested backend and the production opener refuses
+// pipewire at startup without silent fallback.
 TEST(WiredReceiver, AudioSinkDefaultsToPulseAndFlagSelectsBackend) {
     EXPECT_EQ(pcm_router_config().backend, aa::audio::SinkBackend::pulse);
     EXPECT_EQ(pcm_router_config(aa::audio::SinkBackend::pipewire).backend,
               aa::audio::SinkBackend::pipewire);
     EXPECT_EQ(pcm_router_config(aa::audio::SinkBackend::automatic).backend,
               aa::audio::SinkBackend::automatic);
+    EXPECT_EQ(aa::audio::RouterConfig{}.backend, aa::audio::SinkBackend::automatic);
+
+    aa::audio::SinkReport report;
+    report.candidates = {{"pipewiresink", true, true, true, "READY"},
+                         {"pulsesink", true, true, true, "READY"}};
+    const auto automatic = aa::audio::select_sink_backend(report, aa::audio::SinkBackend::automatic);
+    EXPECT_TRUE(automatic.usable);
+    EXPECT_EQ(automatic.element, "pulsesink");
+}
+
+TEST(WiredReceiver, NativeRefusalReasonIsLoggedForOpenAndReopen) {
+    // Synthetic factory results exercise production selection and the actual
+    // receiver log formatter without any audio server or physical device.
+    aa::audio::SinkReport report;
+    report.candidates = {{"pipewiresink", true, true, true, "READY"},
+                         {"pulsesink", true, true, true, "READY"}};
+    ReceiverLogScope logs{g_running};
+    for (const auto backend : {aa::audio::SinkBackend::pipewire,
+                               aa::audio::SinkBackend::automatic}) {
+        const auto selection = aa::audio::select_sink_backend(report, backend);
+        report.requested = backend;
+        report.selected_element = selection.element;
+        report.usable = selection.usable;
+        report.cause = selection.cause;
+        capture_receiver_stdout();
+        log_sink_selected(report, "open");
+        log_sink_selected(report, "reopen");
+        const auto output = captured_receiver_stdout();
+        EXPECT_NE(output.find("pipewiresink"), std::string::npos);
+        EXPECT_NE(output.find("pulsesink"), std::string::npos);
+        EXPECT_EQ(output.find("unverified"), std::string::npos);
+        EXPECT_NE(output.find("\"origin\":\"open\""), std::string::npos);
+        EXPECT_NE(output.find("\"origin\":\"reopen\""), std::string::npos);
+        EXPECT_EQ(selection.usable, backend == aa::audio::SinkBackend::automatic);
+    }
+}
+
+TEST(WiredReceiver, ExplicitPipewireFlagFailsAtStartupWithTypedErrorAndCause) {
+    char directory[] = "/tmp/wired-pipewire-refusal-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto store_path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore store{store_path};
+    ASSERT_TRUE(store.load().has_value());
+
+    struct Guard final {
+        const std::filesystem::path &root;
+        ~Guard() {
+            runtime_sink_request_override = {};
+            g_running.store(true);
+            std::error_code ec;
+            std::filesystem::remove_all(root, ec);
+        }
+    } guard{root};
+
+    runtime_sink_request_override = [](const aa::audio::detail::SinkOpenRequest &request) {
+        return real_runtime_sink(request);
+    };
+    runtime_connects.store(0);
+    g_running.store(true);
+
+    std::vector<std::string> args{
+        "receiver", "--port", "1-2.1", "--no-bus",
+        "--store", store_path.string(),
+        "--video-socket", (root / "video").string(),
+        "--input-socket", (root / "input").string(),
+        "--audio-sink", "pipewire"};
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (auto &arg : args) { argv.push_back(arg.data()); }
+
+    capture_receiver_stdout();
+    const int code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+    const auto output = captured_receiver_stdout();
+
+    EXPECT_EQ(code, 3) << output;
+    EXPECT_EQ(runtime_connects.load(), 0);
+    EXPECT_NE(output.find("\"event\":\"audio_sink_selected\",\"origin\":\"open\","
+                          "\"requested\":\"pipewire\",\"element\":\"\""),
+              std::string::npos) << output;
+    EXPECT_NE(output.find("pipewiresink"), std::string::npos) << output;
+    EXPECT_NE(output.find("pulsesink"), std::string::npos) << output;
+    EXPECT_NE(output.find("\"event\":\"err\",\"detail\":\"audio_router\","
+                          "\"code\":\"audio_sink_unavailable\""),
+              std::string::npos) << output;
+    EXPECT_EQ(output.find("\"event\":\"audio_write_completed\""), std::string::npos) << output;
+    EXPECT_EQ(output.find("\"event\":\"audio_chunks\""), std::string::npos) << output;
 }
 
 TEST(WiredReceiver, InvalidOrMissingAudioSinkValueIsUsageError) {

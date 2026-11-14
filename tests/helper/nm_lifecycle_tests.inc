@@ -13,7 +13,7 @@ protected:
     Source source{1, 1};
     void SetUp() override {
         NmDaemon::SetUp();
-        bluetooth = std::make_unique<BluezBackend>(address, [this] { return began + std::chrono::milliseconds{elapsed.load()}; });
+        bluetooth = std::make_unique<BluezBackend>(address, [this] { return began + std::chrono::milliseconds{elapsed.load()}; }, directory.string(), ::getuid());
         ap = std::make_unique<Backend>(Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,
             private_commands((directory / "commands").string()));
         router = std::make_unique<BackendRouter>(BackendRouter::Routes{*ap, *bluetooth});
@@ -21,7 +21,7 @@ protected:
         auto created = BusService::private_bus(address, {::getuid(), digest.substr(0, 64)}, *router); ASSERT_TRUE(created);
         service.emplace(std::move(created.value()));
         pump = std::jthread{[this](const std::stop_token& stop) { while (!stop.stop_requested()) if (!service->cycle()) return; }};
-        auto connection = BusClient::private_bus(address, *store); ASSERT_TRUE(connection); client = std::move(connection.value());
+        auto connection = BusClient::private_bus_for_test(address, *store); ASSERT_TRUE(connection); client = std::move(connection.value());
         acquire(); ASSERT_TRUE(state(State::active)); ASSERT_EQ(bluez.command("paired"), "ok");
     }
     void TearDown() override {
@@ -116,7 +116,7 @@ TEST_F(CompletedLifecycle, CompletedConnectedLossRequiresFreshBootstrap) {
         ASSERT_EQ(bluez.command("connected-true"), "ok"); retired(handle);
         EXPECT_EQ(bluez.command("NewConnection"), "rejected");
         // Then only a fresh grant and accepted bootstrap can create new authority.
-        client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation});
+        ASSERT_TRUE(client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation}));
         ++generation; source = {generation, generation};
         acquire(generation); ASSERT_TRUE(state(State::active));
         const auto fresh = accept(); ASSERT_NE(fresh, handle);
@@ -135,7 +135,7 @@ TEST_F(CompletedLifecycle, PendingChannelOrConnectedLossRetiresExchange) {
         retired(handle); EXPECT_EQ(failure, HandoffFailure::eligibility);
         EXPECT_EQ(bluez.command("wire-read"), "closed");
         ASSERT_EQ(bluez.command("connected-true"), "ok"); retired(handle);
-        client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation});
+        ASSERT_TRUE(client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation}));
         ++generation; source = {generation, generation};
         acquire(generation); ASSERT_TRUE(state(State::active));
     }
@@ -209,7 +209,7 @@ TEST_F(CompletedLifecycle, SourceTeardownRetiresCompletedButPreservesUnrelatedOb
     const auto handle = accept(); complete(handle); ASSERT_TRUE(client->get_ap_credentials({1, 1}, handle));
     ASSERT_TRUE(client->prepare(core::ConsumerId{2}, core::PairingRequestId{2}));
     // When A's exact source is invalidated.
-    client->cancel(core::ConsumerId{1}, core::PairingRequestId{1}); retired(handle);
+    ASSERT_TRUE(client->cancel(core::ConsumerId{1}, core::PairingRequestId{1})); retired(handle);
     // Then B remains usable for a fresh pairing grant/admission.
     EXPECT_TRUE(client->confirmed(core::ConsumerId{2}, core::PairingRequestId{2}));
 }
@@ -218,7 +218,7 @@ TEST_F(CompletedLifecycle, ReceiverLossCannotRestoreCompletedHandle) {
     const auto handle = accept(); complete(handle); ASSERT_TRUE(client->get_ap_credentials({1, 1}, handle));
     // When that connection disappears and an identical executable reconnects.
     client.reset(); ASSERT_TRUE(eventually([&] { return !nm->active_now; }, 5000ms));
-    auto connection = BusClient::private_bus(address, *store); ASSERT_TRUE(connection); client = std::move(connection.value());
+    auto connection = BusClient::private_bus_for_test(address, *store); ASSERT_TRUE(connection); client = std::move(connection.value());
     acquire(2); ASSERT_TRUE(state(State::active));
     // Then inventory, receiver executable and restored AP do not revive the handle.
     EXPECT_FALSE(client->get_ap_credentials({2, 2}, handle));

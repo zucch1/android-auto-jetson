@@ -3,6 +3,23 @@
 #include <iterator>
 
 namespace aa::ipc {
+void ControlService::retire_failed_pairing(core::ConsumerId consumer, core::PairingRequestId request,
+                                            const std::optional<helper::PeerIdentity>& peer) {
+    if (!confirmation_) return;
+    const auto retired = confirmation_->cancel(consumer, request);
+    if (retired) return;
+    // No phone id was allocated. Reuse identity blocking and acknowledged
+    // retirement progress. Invalidate retires the source-bound helper lease;
+    // there is no stored phone/AP approval to revoke.
+    helper::RevocationProgress progress;
+    progress.ap = helper::RevocationLeg::complete;
+    progress.retirements.push_back({consumer, request});
+    trust::TransportIdentity identity = peer ?
+        trust::TransportIdentity{trust::WirelessIdentity{peer->address, peer->adapter}} :
+        trust::TransportIdentity{trust::OpaqueIdentity{""}};
+    revocations_.push_back({{core::PhoneId{}, std::move(identity)}, std::move(progress), false});
+    events_.emit(DiagnosticEmitted{DiagnosticSeverity::error, "phone_revocation_retirement_pending", request.value});
+}
 std::optional<helper::RevocationProgress> ControlService::revocation_progress(core::PhoneId phone) const {
     for (const auto& record : revocations_) {
         if (record.snapshot.phone == phone) return record.progress;
@@ -11,7 +28,8 @@ std::optional<helper::RevocationProgress> ControlService::revocation_progress(co
 }
 bool ControlService::revocation_blocks(const helper::PeerIdentity& peer) const {
     for (const auto& record : revocations_) {
-        if (helper::revocation_peer(record.snapshot) == peer) return true;
+        const auto revoked = helper::revocation_peer(record.snapshot);
+        if (revoked && phones_.same_wireless_identity(*revoked, peer)) return true;
     }
     return false;
 }

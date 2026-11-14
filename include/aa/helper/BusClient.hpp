@@ -19,6 +19,10 @@ public:
     static core::Result<std::unique_ptr<BusClient>> system(trust::ApprovedPhoneStore& store);
     static core::Result<std::unique_ptr<BusClient>> private_bus(const std::string& address,
                                                                trust::ApprovedPhoneStore& store);
+    // Host-only private-bus fixtures can explicitly trust this process's UID.
+    // system() and private_bus() always require a root-owned helper.
+    static core::Result<std::unique_ptr<BusClient>> private_bus_for_test(const std::string& address,
+                                                                       trust::ApprovedPhoneStore& store);
     ~BusClient() override;
     core::Result<Response> call(const Request&, core::Milliseconds, core::CancellationToken) override;
     core::Result<State> status(Action action);
@@ -28,7 +32,7 @@ public:
     core::Result<void> authorize_bootstrap(Source, std::uint64_t handle, bool allow, bool listener_ready);
     core::Result<ApSnapshot> get_ap_credentials(Source, std::uint64_t handle);
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override;
-    void cancel(core::ConsumerId, core::PairingRequestId) override;
+    core::Result<void> cancel(core::ConsumerId, core::PairingRequestId) override;
     void teardown(core::ConsumerId) override;
     RevocationAttempt forgotten_v1(const RevocationV1&, const RevocationProgress&) override;
     core::Result<std::optional<PeerIdentity>> prepare(core::ConsumerId, core::PairingRequestId) override;

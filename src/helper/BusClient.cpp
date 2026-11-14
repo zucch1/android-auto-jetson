@@ -2,6 +2,7 @@
 #include "BusClientImpl.hpp"
 #include <algorithm>
 #include <sys/socket.h>
+#include <unistd.h>
 
 namespace aa::helper {
 BusClient::BusClient(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -44,6 +45,13 @@ core::Result<std::unique_ptr<BusClient>> BusClient::private_bus(const std::strin
     auto connection = BusConnection::connect_private(address);
     if (!connection) return Error{ErrorCode::helper_unavailable};
     return std::unique_ptr<BusClient>{new BusClient{std::make_unique<Impl>(std::move(connection.value()), store)}};
+}
+core::Result<std::unique_ptr<BusClient>> BusClient::private_bus_for_test(const std::string& address,
+                                                                     trust::ApprovedPhoneStore& store) {
+    if (::getuid() != ::geteuid()) return Error{ErrorCode::helper_rejected};
+    auto client = private_bus(address, store);
+    if (client) client.value()->impl_->helper_uid = ::getuid();
+    return client;
 }
 core::Result<void> BusClient::confirmed(core::ConsumerId generation, core::PairingRequestId source) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
@@ -91,16 +99,17 @@ core::Result<State> BusClient::acquire_ap(Source source) {
     impl_->ap_source = source;
     return result;
 }
-void BusClient::cancel(core::ConsumerId generation, core::PairingRequestId source) {
-    impl_->invalidate({generation.value, source.value});
+core::Result<void> BusClient::cancel(core::ConsumerId generation, core::PairingRequestId source) {
+    return impl_->invalidate({generation.value, source.value});
 }
-void BusClient::teardown(core::ConsumerId generation) { impl_->invalidate({generation.value, 0}); }
+void BusClient::teardown(core::ConsumerId generation) { impl_->invalidate_for_teardown({generation.value, 0}); }
 RevocationAttempt BusClient::forgotten_v1(const RevocationV1& snapshot, const RevocationProgress& progress) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
     const auto peer = revocation_peer(snapshot);
     RevocationAttempt report;
     if (progress.ap == RevocationLeg::complete) report.ap = {};
-    if (peer) report.bond = progress.bond == RevocationLeg::complete ? core::Result<void>{} :
+    const bool needs_bond = peer && (snapshot.phone || progress.bond.has_value());
+    if (needs_bond) report.bond = progress.bond == RevocationLeg::complete ? core::Result<void>{} :
                                                                         core::Result<void>{Error{ErrorCode::timeout}};
     report.retirement = progress.retirements.empty() ? core::Result<void>{} :
                                                      core::Result<void>{Error{ErrorCode::timeout}};
@@ -111,7 +120,7 @@ RevocationAttempt BusClient::forgotten_v1(const RevocationV1& snapshot, const Re
     }
     // ControlService derives retirements from the snapshot's identity. Their
     // invalidate_locked calls below clear only that phone's local authority.
-    const bool bond_pending = peer && progress.bond != RevocationLeg::complete;
+    const bool bond_pending = needs_bond && progress.bond != RevocationLeg::complete;
     if (!progress.retirements.empty()) {
         const auto now = Clock::now();
         const int slices = 1 + (progress.ap != RevocationLeg::complete ? 1 : 0) + (bond_pending ? 1 : 0);

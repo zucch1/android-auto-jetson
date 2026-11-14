@@ -28,6 +28,7 @@
         "active_projection_seconds": {"type": ["number", "null"], "minimum": 0},
         "startup_wait_seconds": {"type": ["number", "null"], "minimum": 0},
         "projection_failure": {"type": ["string", "null"]},
+        "interference": {"type": "array", "items": {"type": "object"}},
         "terminal_errors": {"type": ["array", "null"], "items": {"type": "object"}},
         "startup_ms": {"$ref": "#/$defs/bound"},
         "video_units": {"$ref": "#/$defs/bound"},

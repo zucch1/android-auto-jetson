@@ -2,10 +2,12 @@
 #include <aa/tls/Credentials.hpp>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -15,6 +17,7 @@
 
 namespace aa::tls {
 const char* Error::what() const noexcept {
+    if (!detail_.empty()) return detail_.c_str();
     switch (failure_) {
     case Failure::unset: return "tls-credential-unset: set HU_KEY_PATH to an owner-only PEM bundle";
     case Failure::unreadable: return "tls-credential-unreadable";
@@ -30,6 +33,7 @@ const char* Error::what() const noexcept {
 }
 
 namespace {
+constexpr int kMinimumSecurityBits = 112;
 struct Descriptor {
     int value;
     ~Descriptor() { if (value >= 0) { ::close(value); } }
@@ -38,8 +42,11 @@ int reject_password(char*, int, int, void*) { return 0; }
 struct ClearErrors {
     ~ClearErrors() { ERR_clear_error(); }
 };
-struct CloseFile {
-    void operator()(FILE* file) const noexcept { std::fclose(file); }
+struct PemBuffer {
+    // One fixed allocation avoids secret copies from string growth/reallocation.
+    // The extra byte detects growth beyond the file-size limit during reading.
+    std::unique_ptr<char[]> bytes{new char[65537]{}};
+    ~PemBuffer() { OPENSSL_cleanse(bytes.get(), 65537); }
 };
 }
 
@@ -58,21 +65,21 @@ Credentials load_credentials() {
         throw Error(Failure::insecure);
     }
     if (metadata.st_size <= 0 || metadata.st_size > 65536) { throw Error(Failure::malformed); }
-    std::unique_ptr<FILE, CloseFile> file(::fdopen(descriptor.value, "r"));
-    if (!file) { throw Error(Failure::unreadable); }
-    descriptor.value = -1;
-    std::string content;
-    {
-        char buffer[4096];
-        for (;;) {
-            const std::size_t count = std::fread(buffer, 1, sizeof(buffer), file.get());
-            if (count == 0) { break; }
-            content.append(buffer, count);
-            if (content.size() > 65536) { throw Error(Failure::malformed); }
+    PemBuffer pem;
+    std::size_t size = 0;
+    for (;;) {
+        const ssize_t count = ::read(descriptor.value, pem.bytes.get() + size, 65537 - size);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            throw Error(Failure::unreadable);
         }
-        if (std::ferror(file.get()) != 0) { throw Error(Failure::unreadable); }
+        if (count == 0) break;
+        size += static_cast<std::size_t>(count);
+        if (size > 65536) throw Error(Failure::malformed);
     }
-    struct Block { std::string name; std::string text; };
+    const std::string_view content(pem.bytes.get(), size);
+    // Non-owning views keep private-key text in the one cleansing allocation.
+    struct Block { std::string_view name; std::string_view text; };
     std::vector<Block> blocks;
     std::size_t position = 0;
     while (position < content.size()) {
@@ -90,14 +97,17 @@ Credentials load_credentials() {
         if (name_end == std::string::npos || name_end == name_start) {
             throw Error(Failure::malformed);
         }
-        const std::string name = content.substr(name_start, name_end - name_start);
-        if (name.find('-') != std::string::npos) { throw Error(Failure::malformed); }
+        const std::string_view name = content.substr(name_start, name_end - name_start);
+        if (name != "CERTIFICATE" && name != "X509 CERTIFICATE" &&
+            name != "PRIVATE KEY" && name != "RSA PRIVATE KEY" && name != "EC PRIVATE KEY") {
+            throw Error(Failure::malformed);
+        }
         std::size_t cursor = name_end + 5;
         if (cursor < content.size() && content[cursor] == '\r') { ++cursor; }
         if (cursor >= content.size() || content[cursor] != '\n') {
             throw Error(Failure::malformed);
         }
-        const std::string end_tag = "-----END " + name + "-----";
+        const std::string end_tag = "-----END " + std::string(name) + "-----";
         const std::size_t end_line = content.find(end_tag, cursor);
         if (end_line == std::string::npos) { throw Error(Failure::malformed); }
         std::size_t after = end_line + end_tag.size();
@@ -112,7 +122,7 @@ Credentials load_credentials() {
             throw Error(Failure::malformed);
         }
     }
-    const std::string &key_name = blocks.back().name;
+    const std::string_view &key_name = blocks.back().name;
     if (key_name != "PRIVATE KEY" && key_name != "RSA PRIVATE KEY" && key_name != "EC PRIVATE KEY") {
         throw Error(Failure::malformed);
     }
@@ -136,6 +146,35 @@ Credentials load_credentials() {
     }
     if (X509_check_private_key(certificate.get(), key.get()) != 1) {
         throw Error(Failure::mismatch);
+    }
+    // Security bits compare different key families fairly: RSA-2048 and
+    // P-256 both meet this floor; RSA-1024 does not.
+    if (EVP_PKEY_security_bits(key.get()) < kMinimumSecurityBits) {
+        throw Error(Failure::insecure,
+            "tls-credential-insecure: certificate[0] private-key-below-security-floor");
+    }
+    const auto check_certificate = [](X509* cert, std::size_t index) {
+        PrivateKey public_key(X509_get_pubkey(cert), &EVP_PKEY_free);
+        if (!public_key || EVP_PKEY_security_bits(public_key.get()) < kMinimumSecurityBits) {
+            throw Error(Failure::insecure, "tls-credential-insecure: certificate[" +
+                std::to_string(index) + "] public-key-below-security-floor");
+        }
+        int digest = 0, signature_key = 0, security_bits = 0;
+        std::uint32_t flags = 0;
+        if (X509_get_signature_info(cert, &digest, &signature_key, &security_bits, &flags) != 1 ||
+            security_bits < kMinimumSecurityBits || digest == NID_sha1 || digest == NID_md5) {
+            throw Error(Failure::insecure);
+        }
+        const int expiry = X509_cmp_current_time(X509_get0_notAfter(cert));
+        if (expiry == 0) { throw Error(Failure::malformed); }
+        // Android Auto HU identity is not a Web PKI server identity. Rejecting
+        // an expired compatibility credential can disable otherwise working
+        // phones; emit a stable, redacted warning on every load instead.
+        if (expiry < 0) std::fputs("tls-credential-warning: certificate-expired\n", stderr);
+    };
+    check_certificate(certificate.get(), 0);
+    for (std::size_t index = 0; index < chain.size(); ++index) {
+        check_certificate(chain[index].get(), index + 1);
     }
     return Credentials{std::move(certificate), std::move(key), std::move(chain)};
 }

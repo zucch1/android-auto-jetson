@@ -124,6 +124,7 @@ private:
 
 class RecordingPhoneDirectory final : public PhoneDirectory {
 public:
+    core::Result<void> validate_pairing(core::PairingRequestId) override { return {}; }
     [[nodiscard]] core::Result<void> forget(core::PhoneId phone) override {
         forgotten.push_back(phone);
         return {};
