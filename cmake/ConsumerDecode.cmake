@@ -82,9 +82,31 @@ endif()
 
 set(AA_CONSUMER_WARN_TARGETS aareceiver-consumer)
 if(NOT CMAKE_CROSSCOMPILING)
+    # Test-only twin of aareceiver-consumer: the same source compiled with
+    # AA_DECODE_HELPER_TEST_CLOCK, which adds an injectable clock so pump
+    # retention can be driven without a real five-second wait. Only
+    # aa_consumer_decode_test links it; the production library and everything
+    # that ships link aareceiver-consumer, which is built without the seam.
+    add_library(aareceiver-consumer-testclock STATIC ${AA_CONSUMER_SOURCES})
+    set_target_properties(aareceiver-consumer-testclock PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO
+        POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(aareceiver-consumer-testclock PUBLIC "${CMAKE_SOURCE_DIR}/include")
+    target_compile_definitions(aareceiver-consumer-testclock PUBLIC AA_DECODE_HELPER_TEST_CLOCK=1)
+    target_link_libraries(aareceiver-consumer-testclock PUBLIC aa_core PRIVATE PkgConfig::AA_CONSUMER_GST)
+    if(AA_CONSUMER_GST_LIBRARY_DIRS)
+        target_link_directories(aareceiver-consumer-testclock PUBLIC ${AA_CONSUMER_GST_LIBRARY_DIRS})
+    endif()
+    if(TARGET aa_sysroot_hash_gate)
+        add_dependencies(aareceiver-consumer-testclock aa_sysroot_hash_gate)
+    endif()
+    if(TARGET aa_decode_overlay_hash_gate)
+        add_dependencies(aareceiver-consumer-testclock aa_decode_overlay_hash_gate)
+    endif()
+    list(APPEND AA_CONSUMER_WARN_TARGETS aareceiver-consumer-testclock)
     add_executable(aa_consumer_decode_test ${AA_CONSUMER_TEST_SOURCES})
     target_link_libraries(aa_consumer_decode_test PRIVATE
-        aareceiver-consumer aa_core PkgConfig::AA_CONSUMER_GST pthread GTest::gtest_main)
+        aareceiver-consumer-testclock aa_core PkgConfig::AA_CONSUMER_GST pthread GTest::gtest_main)
     set_target_properties(aa_consumer_decode_test PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     # The tests cross-check runtime detection against the existing aa-decode-probe

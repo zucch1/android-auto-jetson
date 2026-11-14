@@ -43,9 +43,15 @@ int main(int argc, char **argv) {
                     : aa::helper::nm::production_commands());
     }
     if (!fixture || argc != 5) {
-        bluetooth = std::make_unique<aa::helper::BluezBackend>(bus_address);
-        if (!bluetooth->available())
+        bluetooth = std::make_unique<aa::helper::BluezBackend>(bus_address, std::chrono::steady_clock::now,
+            fixture ? directory : "/var/lib/aa-system-helper", fixture ? ::getuid() : 0);
+        if (!bluetooth->available()) {
+            const auto why = bluetooth->state_error();
+            std::cerr << "system-helper: bluetooth unavailable: "
+                      << (why.empty() ? "cannot reach the system bus" : "managed-bonds state rejected (" + why + "); refusing to start so bonds are not forgotten")
+                      << '\n';
             return 1;
+        }
     }
     aa::helper::BackendRouter backend{{.ap = ap ? *ap : unavailable,
         .bluetooth = bluetooth ? static_cast<aa::helper::Backend&>(*bluetooth) : unavailable}};

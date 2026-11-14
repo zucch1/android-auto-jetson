@@ -46,8 +46,9 @@ struct RevocationAttempt final {
     std::size_t retired{}; // Acknowledged prefix of the supplied pending retirements.
     core::Result<void> retirement{Error{ErrorCode::helper_unavailable}};
 };
-// Called only by the receiver's control authorization boundary, after trust
-// approval succeeds. This is not an externally dispatched session method.
+// Called only by the receiver's control authorization boundary, before trust
+// approval is persisted. A failed confirmation must never grant admission.
+// This is not an externally dispatched session method.
 class Confirmation {
 public:
     virtual ~Confirmation() = default;

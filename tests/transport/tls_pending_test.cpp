@@ -28,7 +28,7 @@ using namespace std::chrono_literals;
 TEST(TlsInFlight, SendObservedUnderBackpressure) {
     // Given: a handshaked TLS session whose peer never consumes frames, with the
     // client socket shrunk so backpressure is deterministic and quick.
-    auto listener = tr::TlsListener::listen("127.0.0.1", 0, [] { return true; },
+    auto listener = tr::TlsListener::listen("127.0.0.1", 0, [](const tr::TlsPeerInfo& peer) { return peer.address == "127.0.0.1"; },
                                             tr::TlsMode::encryption_only_compatibility);
     ASSERT_TRUE(listener);
     const auto port = listener.value()->port();
@@ -86,7 +86,7 @@ TEST(TlsInFlight, SendObservedUnderBackpressure) {
             ++completed;
         }
     });
-    const bool blocked = pending.blocked(SYS_poll, client_fd);
+    const bool blocked = pending.blocked_in_poll(client_fd);
     // When: stopping a send observed in poll while its socket is not writable.
     source.request_stop();
     // Then: the backpressured TLS send is cancelled with a typed error within
@@ -116,7 +116,7 @@ TEST(TlsInFlight, ReceiveObservedInsidePoll) {
     ASSERT_TRUE(client_ok && server_ok);
     ASSERT_FALSE(source.stop_requested());
     PendingIo pending([&] { return pair.value().client->receive(); });
-    const bool blocked = pending.blocked(SYS_poll);
+    const bool blocked = pending.blocked_in_poll();
     // When: cancellation fires after the kernel wait is observed.
     source.request_stop();
     // Then: the pending TLS read is cancelled within a bounded interval.

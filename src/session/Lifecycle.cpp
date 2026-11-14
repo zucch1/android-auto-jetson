@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/session/Lifecycle.hpp>
+#include <limits>
 
 namespace aa::session {
 namespace {
@@ -73,7 +74,12 @@ core::Result<void> Lifecycle::begin_transport() {
 void Lifecycle::arm_deadline(std::optional<core::Nanoseconds>& slot,
                              core::Milliseconds budget, core::Nanoseconds at) {
     if (budget.count > 0) {
-        slot = core::Nanoseconds{at.count + core::to_nanoseconds(budget).count};
+        const auto budget_ns = core::to_nanoseconds(budget).count;
+        if (at.count > std::numeric_limits<std::int64_t>::max() - budget_ns) {
+            slot = core::Nanoseconds{std::numeric_limits<std::int64_t>::max()};
+        } else {
+            slot = core::Nanoseconds{at.count + budget_ns};
+        }
     } else {
         slot.reset();
     }

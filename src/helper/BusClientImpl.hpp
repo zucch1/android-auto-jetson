@@ -17,6 +17,7 @@ struct BusClient::Impl {
     std::optional<Source> active_source;
     std::optional<Source> ap_source;
     std::string helper_owner;
+    std::uint32_t helper_uid{};
     Impl(BusConnection connection, trust::ApprovedPhoneStore& approvals)
         : bus(std::move(connection)), store(approvals) {}
     // All transaction helpers require mutex ownership, including failure cleanup.
@@ -27,6 +28,11 @@ struct BusClient::Impl {
         bus.deadline(until);
         const auto owner = bus.get_name_owner(ipc::BusName{kBusName});
         if (!owner) return Error{Clock::now() >= until ? ErrorCode::timeout : ErrorCode::helper_unavailable};
+        const auto uid = bus.get_connection_unix_uid(owner.value());
+        if (!uid || uid.value() != helper_uid) {
+            pending.clear(); active_source.reset(); ap_source.reset(); helper_owner.clear();
+            return Error{Clock::now() >= until ? ErrorCode::timeout : ErrorCode::helper_rejected};
+        }
         if (!helper_owner.empty() && helper_owner != owner.value().value) {
             pending.clear(); active_source.reset(); ap_source.reset(); helper_owner = owner.value().value;
             return Error{ErrorCode::helper_rejected};

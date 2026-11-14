@@ -145,6 +145,9 @@ struct ControlBusClient::Impl final {
         for (int skipped = 0; skipped < kMaxSkippedMessages; ++skipped) {
             auto message = connection->read_message();
             if (!message.has_value()) {
+                if (message.error().code() == ErrorCode::transport_message_dropped) {
+                    continue;
+                }
                 return saw_forged ? core::Result<ParsedMessage>{Error{
                                         ErrorCode::transport_unauthorized_peer}}
                                   : core::Result<ParsedMessage>{message.error()};
@@ -388,6 +391,9 @@ core::Result<ControlBusClient::ContractSignal> ControlBusClient::wait_signal(
         }
         auto message = impl_->connection->read_message();
         if (!message.has_value()) {
+            if (message.error().code() == ErrorCode::transport_message_dropped) {
+                continue;
+            }
             return message.error();
         }
         if (message.value().type == MessageType::signal) {

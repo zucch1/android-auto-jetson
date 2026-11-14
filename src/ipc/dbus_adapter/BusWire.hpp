@@ -22,6 +22,10 @@
 
 namespace aa::ipc::dbus_adapter {
 
+// Contract maximum, independent of the distro bus daemon's much larger
+// forwarding limit. The checked control contract carries only scalar/string
+// calls, small capability/property maps and its roughly 5 KiB introspection XML;
+// audio, video and other high-rate payloads never use this connection.
 inline constexpr std::size_t kMaxMessageBytes = 64UL * 1024;
 inline constexpr std::size_t kMaxHeaderFields = 16;
 
@@ -129,8 +133,18 @@ private:
 // computed by message_size() before reading the rest off the socket).
 [[nodiscard]] core::Result<ParsedMessage> parse_message(std::span<const std::uint8_t> bytes);
 
-// Total message size from the first 16 bytes, or a typed error when the
-// framing is malformed/oversize.
+struct FrameHeader final {
+    std::size_t total_bytes{};
+    bool little_endian{};
+};
+
+// Size and byte order from a syntactically valid fixed header. The total is
+// deliberately not capped here: BusConnection needs it to drain oversize and
+// big-endian frames exactly before reporting a non-fatal drop.
+[[nodiscard]] core::Result<FrameHeader> inspect_frame(std::span<const std::uint8_t> head16);
+
+// Total little-endian message size within the contract ceiling, or a typed
+// error when framing is malformed/oversize. Used by the strict full parser.
 [[nodiscard]] core::Result<std::size_t> message_size(std::span<const std::uint8_t> head16);
 
 // Strict typed body readers for method-return replies: the declared signature

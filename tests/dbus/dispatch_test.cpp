@@ -221,6 +221,10 @@ TEST(CallBoundary, NonMethodCallMessagesAreDroppedNotDispatched) {
         call_from(":1.40", "RegisterConsumer", "s", marshal_string(name.value)));
     ASSERT_TRUE(registered.has_value());
     ASSERT_FALSE(registered->is_error);
+    // The identity issued at registration. A successful StartProjection alone would also
+    // pass if the rejected traffic had swapped in a different consumer on this connection.
+    const auto original_consumer = fixture.service.state().consumer;
+    ASSERT_NE(original_consumer, aa::core::ConsumerId{});
 
     // When: a signal, a method return and an error reply all name the
     // StartProjection member on the contract interface and path.
@@ -240,6 +244,18 @@ TEST(CallBoundary, NonMethodCallMessagesAreDroppedNotDispatched) {
     ASSERT_TRUE(ping.has_value());
     EXPECT_FALSE(ping->is_error);
     EXPECT_TRUE(std::holds_alternative<std::uint64_t>(ping->body));
+
+    // And: the original consumer registration is preserved and still holds authority.
+    EXPECT_EQ(fixture.service.state().consumer, original_consumer);
+    const auto start = fixture.dispatcher.handle(call_from(":1.40", "StartProjection"));
+    ASSERT_TRUE(start.has_value());
+    EXPECT_FALSE(start->is_error);
+    EXPECT_EQ(fixture.service.state().projection, ProjectionState::projecting);
+
+    const auto stop = fixture.dispatcher.handle(call_from(":1.40", "StopProjection"));
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_FALSE(stop->is_error);
+    EXPECT_EQ(fixture.service.state().projection, ProjectionState::stopped);
 }
 
 TEST(CallBoundary, RejectsForeignObjectPathsWithoutDispatching) {
@@ -253,6 +269,10 @@ TEST(CallBoundary, RejectsForeignObjectPathsWithoutDispatching) {
         call_from(":1.41", "RegisterConsumer", "s", marshal_string(name.value)));
     ASSERT_TRUE(registered.has_value());
     ASSERT_FALSE(registered->is_error);
+    // The identity issued at registration. A successful StartProjection alone would also
+    // pass if the rejected traffic had swapped in a different consumer on this connection.
+    const auto original_consumer = fixture.service.state().consumer;
+    ASSERT_NE(original_consumer, aa::core::ConsumerId{});
 
     // When: a real method call targets a foreign object path.
     IncomingCall call{BusName{":1.41"}, WireType::method_call,
@@ -272,6 +292,18 @@ TEST(CallBoundary, RejectsForeignObjectPathsWithoutDispatching) {
     ASSERT_TRUE(ping.has_value());
     EXPECT_FALSE(ping->is_error);
     EXPECT_TRUE(std::holds_alternative<std::uint64_t>(ping->body));
+
+    // And: the original consumer registration is preserved and still holds authority.
+    EXPECT_EQ(fixture.service.state().consumer, original_consumer);
+    const auto start = fixture.dispatcher.handle(call_from(":1.41", "StartProjection"));
+    ASSERT_TRUE(start.has_value());
+    EXPECT_FALSE(start->is_error);
+    EXPECT_EQ(fixture.service.state().projection, ProjectionState::projecting);
+
+    const auto stop = fixture.dispatcher.handle(call_from(":1.41", "StopProjection"));
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_FALSE(stop->is_error);
+    EXPECT_EQ(fixture.service.state().projection, ProjectionState::stopped);
 }
 
 TEST(CallBoundary, PairingFlowRoutesThroughTheBoundary) {

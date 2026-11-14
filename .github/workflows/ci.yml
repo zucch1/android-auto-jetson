@@ -255,6 +255,13 @@ jobs:
           for case in baseline overlay content header extra generated license gpl inventory listing symlink missing mode; do
             python3 -B tests/provenance/scenarios.py "$PWD" "$case"
           done
+      - name: Verify protobuf audit inventory and guard against schema drift
+        run: |
+          set -euo pipefail
+          python3 -B tools/protocol/protobuf_audit.py --check
+          for case in baseline drift-inventory report-drift missing-file tampered-proto unpinned-file listing-tampered repin-comment field-number-changed field-type-changed enum-value-removed new-unmatched-message vanished-difference unparsed-construct finding-dangling-diff uncovered-by-removal duplicate-id missing-field invalid-disposition status-mismatch unexplained-deletion nonlegacy-deletion legacy-altered citation-broken absence-stale crosslink-dangling orphan-finding mapping-dangling triage-missing-diff triage-dangling-diff triage-invalid-disposition triage-missing-metadata sentinel-false-match genuine-rename-still-matches renamed-enums-path-only zero-only-enum-false-match message-path-shape-boundary; do
+            python3 -B tests/protocol/audit_scenarios.py "$PWD" "$case"
+          done
 
   arm64-cross-build:
     name: ci/arm64-cross-build
@@ -325,6 +332,10 @@ jobs:
           set -euo pipefail
           cmake --build --preset jetson-aarch64 --target aa_ipc_control aa_ipc_dbus
           python3 -B tests/dbus/assert_dbus_coverage.py --cross build/jetson-aarch64
+      - name: Verify hardening of every project-owned cross executable
+        run: |
+          set -euo pipefail
+          ctest --test-dir build/jetson-aarch64 --no-tests=error --output-on-failure -R '^build_hardening$'
       - name: State fixture-not-target scope in the step summary
         run: |
           set -euo pipefail

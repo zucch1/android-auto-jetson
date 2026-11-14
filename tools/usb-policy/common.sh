@@ -24,11 +24,25 @@
 # umask is: the trust checks above reject group/other-writable directories.
 umask 022
 
-# test_hook NAME - test-only fault injection. Evaluated ONLY in fake-root mode
-# (AA_USB_POLICY_ROOT non-empty) when NAME is listed in
+# validate_test_environment - fake roots and command fault injection are only
+# for the unprivileged test suite. Reject them for root before either script
+# reads or mutates policy state, so a preserved environment can never reach eval.
+validate_test_environment() {
+    # The test override can only force refusal, never mask the real EUID.
+    # This covers the guard even on CI hosts that disable user namespaces.
+    if { [ "${EUID}" -eq 0 ] || [ "${AA_USB_POLICY_TEST_EUID_ZERO:-}" = 1 ]; } &&
+            { [ -n "${ROOT:-}" ] ||
+            [ -n "${AA_USB_POLICY_TEST_HOOKS:-}" ] ||
+            [ -n "${AA_USB_POLICY_TEST_HOOK_CMD:-}" ]; }; then
+        die "AA_USB_POLICY_ROOT/test hooks are forbidden when euid is 0"
+    fi
+}
+
+# test_hook NAME - test-only fault injection. Evaluated ONLY in non-root
+# fake-root mode (AA_USB_POLICY_ROOT non-empty) when NAME is listed in
 # AA_USB_POLICY_TEST_HOOKS; the code in AA_USB_POLICY_TEST_HOOK_CMD runs in
 # the current shell so it can exit mid-sequence (simulated crash) or mutate
-# paths (simulated TOCTOU swap). Never active on a live root.
+# paths (simulated TOCTOU swap). Never active on a live root or as root.
 test_hook() {
     [ -n "${ROOT:-}" ] || return 0
     case " ${AA_USB_POLICY_TEST_HOOKS:-} " in

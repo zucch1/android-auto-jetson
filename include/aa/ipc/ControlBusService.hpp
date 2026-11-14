@@ -62,8 +62,9 @@ public:
     // and answers method calls through the dispatch boundary; a window that
     // expires with no traffic reconciles the consumer owner (idle cleanup) and
     // counts one idle_refresh(). Non-method traffic is dropped unexecuted.
-    // Returns the number of messages dispatched. timeout / transport errors
-    // are typed; a closed export yields transport_closed.
+    // Returns the number of messages dispatched. Fully drained oversize or
+    // big-endian traffic returns zero and emits dbus_message_dropped; timeout /
+    // transport errors are typed; a closed export yields transport_closed.
     [[nodiscard]] core::Result<std::size_t> cycle(core::Milliseconds idle_interval);
 
     // Releases the bus name and connection; idempotent.
