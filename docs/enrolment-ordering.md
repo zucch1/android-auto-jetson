@@ -48,8 +48,10 @@ demotion by an older helper). A bond none of the helper's files name is never to
 because BlueZ cannot tell an enrolment's bond from the owner's other bonds. Consequently a
 phone forgotten in Android Auto and then paired with the Jetson outside it, by the same
 adapter/address, is removed again by the next reconciliation while its history entry lasts.
-Reconciliation reports success only when BlueZ no longer holds such a bond; while a
-`RemoveDevice` keeps failing it reports failure and the receiver retries.
+Reconciliation reports success only when every such bond is gone from BlueZ or its removal
+is durably owed in `pending-removals` (the helper retries it on every tick, so no receiver
+record has to, finding 3); a bond still present with no durable obligation (the journal
+write failed) fails the reconciliation and the receiver retries.
 
 Revoked versus approved: history is cleared only when a fresh enrolment of the identity
 reaches the committed state: the owner explicitly accepted its number, the helper verified

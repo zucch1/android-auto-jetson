@@ -118,8 +118,8 @@ bool BluezBackend::Impl::clear_revocation(const PeerIdentity& peer) {
 //                                             the journal says (a lost entry strands no bond)
 // A bond of an identity none of the helper's files name is never touched, and the open enrolment
 // window's own bond is left to that window. Success only once every state change is durable and
-// BlueZ holds no bond the helper names that the receiver does not approve; on failure the
-// stricter state stays and the receiver retries.
+// every bond the helper names that the receiver does not approve is gone from BlueZ or its removal
+// durably owed in the journal; on failure the stricter state stays and the receiver retries.
 core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<PeerIdentity>& approved) {
     auto& s = *impl_;
     if (!s.managed.valid() || !s.pending.valid() || !s.revoked.valid()) return Error{ErrorCode::helper_unavailable};
@@ -192,8 +192,9 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
     s.reconciled = durable;
     if (durable) s.retire_unaccepted();
     // What cleanup could not remove (or a failed write left unrecorded) is disconnected and removed
-    // now. A bond the helper names that the receiver does not approve and BlueZ still holds fails
-    // the reconciliation, so the receiver retries.
+    // now. A bond the helper names that the receiver does not approve, that BlueZ still holds and
+    // whose removal is not durably owed fails the reconciliation, so the receiver retries. One whose
+    // removal is owed is the helper's (retried on every tick), so no receiver record pins capacity.
     bool clean = true;
     if (!unwanted.empty()) {
         devices.clear();
@@ -207,7 +208,7 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
                 auto* reply = s.call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
                                      g_variant_new("(o)", device.path.c_str()));
                 if (reply) g_variant_unref(reply);
-                else if (device.bonded) clean = false;
+                else if (device.bonded && !s.pending.contains(device.identity)) clean = false;
             }
             if (durable) s.retire_unaccepted();  // drops the entries of what was removed just now
         }

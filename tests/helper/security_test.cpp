@@ -915,8 +915,8 @@ void expect_forgotten_after_reconciliation(const char* bus_address, MockBluez& m
     EXPECT_FALSE(restarted.reconnect_peer(obs.value().handle)) << "a forgotten phone reconnected";
 }
 // ForgetPhone's helper leg (RevokePeerV1) while the journal write fails and so does BlueZ's
-// RemoveDevice; the helper then restarts. Reconciliation must still remove the bond and report
-// failure for as long as BlueZ refuses the removal.
+// RemoveDevice; the helper then restarts. Reconciliation must own the removal durably while BlueZ
+// refuses it, and remove the bond once BlueZ allows it.
 TEST_F(ManagedBonds, ForgetWithFailedJournalWriteAndFailedRemovalIsCompletedByReconciliation) {
     using namespace trust::test::faults;
     const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
@@ -945,13 +945,16 @@ TEST_F(ManagedBonds, ForgetWithFailedJournalWriteAndFailedRemovalIsCompletedByRe
         EXPECT_FALSE(backend.reconnect_peer(obs.value().handle)) << "a phone being forgotten reconnected";
     }
     {
-        // Restarted helper, BlueZ still refusing: never reported as reconciled while the bond stays.
+        // Nothing was dropped before the removal was owed: the managed entry is still there.
+        EXPECT_TRUE(peer_in(directory, "managed-bonds") || peer_in(directory, "pending-removals"))
+            << "managed state was dropped before the removal was owed";
+        // Restarted helper, BlueZ still refusing: success only with the removal durably owed.
         helper::BluezBackend restarted{bus_address, steady(), directory, ::getuid()};
         ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
-        EXPECT_FALSE(restarted.reconcile_bonds({})) << "reconciliation succeeded while BlueZ kept an unapproved bond";
+        EXPECT_TRUE(restarted.reconcile_bonds({}));
         EXPECT_EQ(removals(mock), 0U);
-        EXPECT_FALSE(peer_in(directory, "managed-bonds") && !peer_in(directory, "pending-removals"))
-            << "managed state was dropped before the removal was owed";
+        EXPECT_FALSE(peer_in(directory, "managed-bonds"));
+        EXPECT_TRUE(peer_in(directory, "pending-removals")) << "an unapproved, unremoved bond is not owed";
     }
     ASSERT_EQ(mock.command("allow-remove"), "ok");
     expect_forgotten_after_reconciliation(bus_address, mock, directory);
