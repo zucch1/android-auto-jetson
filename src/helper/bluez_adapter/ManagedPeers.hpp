@@ -9,9 +9,10 @@ namespace aa::helper::bluez_adapter {
 // valid(): the stored state loaded cleanly; it gates revocation and admission
 // and never changes afterwards. revocable(): present on disk or renamed into
 // place (used by revoke). admitted(): durably committed on disk (used by
-// reconnect and admission). remember(): new admissions only; a failed write
-// refuses that admission but never removes revocation of an existing or
-// renamed-into-place entry.
+// reconnect and admission). confirm_durable(): retries a pending directory
+// fsync when durability was not yet confirmed. remember(): new admissions only;
+// a failed write refuses that admission but never removes revocation of an
+// existing or renamed-into-place entry.
 class ManagedPeers {
 public:
     explicit ManagedPeers(std::string directory, std::uint32_t owner = 0);
@@ -19,8 +20,10 @@ public:
     const std::string& reason() const { return reason_; }
     bool revocable(const PeerIdentity&) const;
     bool admitted(const PeerIdentity&) const;
+    bool confirm_durable();
     bool remember(const PeerIdentity&);
 private:
+    bool sync_directory(int dir_fd);
     std::string directory_;
     std::uint32_t owner_;
     bool valid_{};

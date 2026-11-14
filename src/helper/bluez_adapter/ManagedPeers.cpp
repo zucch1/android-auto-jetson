@@ -100,20 +100,37 @@ ManagedPeers::ManagedPeers(std::string path, std::uint32_t owner)
             { reject("managed-bonds has an invalid or duplicate address"); return; }
         parsed.push_back(std::move(peer));
     }
-    peers_ = std::move(parsed); admitted_ = peers_.size(); valid_ = true;
+    peers_ = std::move(parsed);
+    valid_ = true;
+    if (!sync_directory(dir.value)) admitted_ = 0;
 }
 // Revocation authority: the loaded list plus every entry already renamed into
 // place. It never depends on whether a later write or directory sync succeeds.
 bool ManagedPeers::revocable(const PeerIdentity& peer) const {
     return valid_ && std::find(peers_.begin(), peers_.end(), peer) != peers_.end();
 }
-// Reconnect and admission authority: entries loaded from disk on startup or
-// backed by a confirmed directory fsync.
+// Reconnect and admission authority: entries backed by a confirmed directory
+// fsync (both newly remembered entries and entries reloaded on startup).
 bool ManagedPeers::admitted(const PeerIdentity& peer) const {
     if (!valid_) return false;
     const auto count = static_cast<std::vector<PeerIdentity>::difference_type>(std::min(admitted_, peers_.size()));
     const auto end = std::next(peers_.begin(), count);
     return std::find(peers_.begin(), end, peer) != end;
+}
+bool ManagedPeers::sync_directory(int dir_fd) {
+    if (fsync_retry(dir_fd)) {
+        durable_ = false;
+        return false;
+    }
+    durable_ = true;
+    admitted_ = peers_.size();
+    return true;
+}
+bool ManagedPeers::confirm_durable() {
+    if (!valid_) return false;
+    if (durable_) return true;
+    Fd dir{directory(directory_, owner_)};
+    return dir.value >= 0 && sync_directory(dir.value);
 }
 // Admission: true only when the entry is on disk AND its directory entry is
 // durable. Every failure refuses this admission only; revocable() is unaffected.
@@ -125,9 +142,7 @@ bool ManagedPeers::remember(const PeerIdentity& peer) {
     Fd dir{directory(directory_, owner_)};
     if (dir.value < 0) return false;                       // nothing written
     if (!durable_) {                                       // renamed earlier, directory sync unconfirmed
-        if (fsync_retry(dir.value)) return false;
-        durable_ = true;
-        admitted_ = peers_.size();
+        if (!sync_directory(dir.value)) return false;
         if (known) return true;
     }
     std::string data{"v1\n"};
@@ -149,8 +164,6 @@ bool ManagedPeers::remember(const PeerIdentity& peer) {
     // counts for revocation even when the directory sync cannot be confirmed,
     // while remaining unadmitted until a directory fsync succeeds.
     peers_.push_back(peer);
-    if (fsync_retry(dir.value)) { durable_ = false; return false; }  // refuse this admission; retried next time
-    admitted_ = peers_.size();
-    return true;
+    return sync_directory(dir.value);                      // refuse this admission; retried next time
 }
 }

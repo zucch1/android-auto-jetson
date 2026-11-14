@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <poll.h>
 #include <spawn.h>
 #include <sys/stat.h>
@@ -268,15 +269,15 @@ TEST_F(ManagedBonds, DirFsyncFailureRefusesPreBondedReconnectKeepsRevocationAndA
             const auto auth = backend.authorize(first.value().handle);
             ASSERT_FALSE(auth);
             EXPECT_EQ(auth.error().code(), ErrorCode::helper_rejected);
+
+            const auto reconn_obs = backend.observe();
+            ASSERT_TRUE(reconn_obs);
+            const auto reconn = backend.reconnect_peer(reconn_obs.value().handle);
+            EXPECT_FALSE(reconn) << "reconnect must be refused while directory fsync fails";
+            if (!reconn) { EXPECT_EQ(reconn.error().code(), ErrorCode::helper_rejected); }
+
+            EXPECT_TRUE(backend.revoke_peer(primary)) << "revocation must still succeed after directory fsync failure";
         }
-
-        const auto reconn_obs = backend.observe();
-        ASSERT_TRUE(reconn_obs);
-        const auto reconn = backend.reconnect_peer(reconn_obs.value().handle);
-        EXPECT_FALSE(reconn) << "reconnect must be refused when directory fsync failed";
-        if (!reconn) { EXPECT_EQ(reconn.error().code(), ErrorCode::helper_rejected); }
-
-        EXPECT_TRUE(backend.revoke_peer(primary)) << "revocation must still succeed after directory fsync failure";
         EXPECT_NE(mock.command("state").find("/org/bluez/hci0/dev_02_00_00_00_00_01"), std::string::npos);
     }
 
@@ -298,11 +299,11 @@ TEST_F(ManagedBonds, DirFsyncFailureRefusesPreBondedReconnectKeepsRevocationAndA
                 using namespace trust::test::faults;
                 ScopedFault fail{Fault::dir_fsync};
                 ASSERT_FALSE(backend.authorize(first.value().handle));
-            }
 
-            const auto refused_obs = backend.observe();
-            ASSERT_TRUE(refused_obs);
-            EXPECT_FALSE(backend.reconnect_peer(refused_obs.value().handle));
+                const auto refused_obs = backend.observe();
+                ASSERT_TRUE(refused_obs);
+                EXPECT_FALSE(backend.reconnect_peer(refused_obs.value().handle));
+            }
 
             // Admitting another peer succeeds and confirms the directory fsync.
             ASSERT_EQ(mock.command("observe-other"), "ok");
@@ -318,7 +319,7 @@ TEST_F(ManagedBonds, DirFsyncFailureRefusesPreBondedReconnectKeepsRevocationAndA
                 << "reconnect should succeed once a later directory fsync confirms durability";
         }
 
-        // Across a helper restart, entries loaded from disk are admitted.
+        // Across a helper restart with a working directory sync, entries loaded from disk are admitted.
         helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, dir2, ::getuid()};
         ASSERT_TRUE(restarted.available());
         ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
@@ -328,6 +329,149 @@ TEST_F(ManagedBonds, DirFsyncFailureRefusesPreBondedReconnectKeepsRevocationAndA
         ASSERT_EQ(mock.command("observe-other"), "ok");
         EXPECT_TRUE(restarted.revoke_peer(secondary));
     }
+}
+
+TEST_F(ManagedBonds, RestartWithFailingDirFsyncKeepsRevocationRefusesAdmissionAndReconnect) {
+    using namespace trust::test::faults;
+    const auto peers_dir = directory + "/peers";
+    ASSERT_EQ(::mkdir(peers_dir.c_str(), 0700), 0);
+    {
+        ScopedFault fail{Fault::dir_fsync};
+        ManagedPeers before{peers_dir, ::getuid()};
+        ASSERT_TRUE(before.valid());
+        EXPECT_FALSE(before.remember(managed));
+        EXPECT_TRUE(before.revocable(managed));
+        EXPECT_FALSE(before.admitted(managed));
+
+        ManagedPeers restarted{peers_dir, ::getuid()};
+        ASSERT_TRUE(restarted.valid());
+        EXPECT_TRUE(restarted.revocable(managed));
+        EXPECT_FALSE(restarted.admitted(managed))
+            << "reloaded entry must stay unadmitted while directory fsync fails";
+    }
+
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    const helper::PeerIdentity primary{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
+    const auto backend_dir = directory + "/backend";
+    ASSERT_EQ(::mkdir(backend_dir.c_str(), 0700), 0);
+    ASSERT_EQ(mock.command("paired"), "ok");
+    {
+        ScopedFault fail{Fault::dir_fsync};
+        {
+            helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid()};
+            ASSERT_TRUE(initial.available());
+            ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+            const auto obs = initial.observe();
+            ASSERT_TRUE(obs);
+            const auto auth = initial.authorize(obs.value().handle);
+            ASSERT_FALSE(auth);
+            EXPECT_EQ(auth.error().code(), ErrorCode::helper_rejected);
+        }
+
+        helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid()};
+        ASSERT_TRUE(restarted.available());
+        ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+        const auto reconn_obs = restarted.observe();
+        ASSERT_TRUE(reconn_obs);
+        const auto reconn = restarted.reconnect_peer(reconn_obs.value().handle);
+        EXPECT_FALSE(reconn) << "reconnect after restart must be refused while directory fsync fails";
+        if (!reconn) { EXPECT_EQ(reconn.error().code(), ErrorCode::helper_rejected); }
+
+        EXPECT_TRUE(restarted.revoke_peer(primary)) << "revocation must still work when durability is unconfirmed";
+        EXPECT_NE(mock.command("state").find("/org/bluez/hci0/dev_02_00_00_00_00_01"), std::string::npos);
+    }
+}
+
+TEST_F(ManagedBonds, RestartWithFailingDirFsyncAllowsReconnectOnceSyncSucceeds) {
+    using namespace trust::test::faults;
+    const auto peers_dir = directory + "/peers";
+    ASSERT_EQ(::mkdir(peers_dir.c_str(), 0700), 0);
+    std::unique_ptr<ManagedPeers> reloaded;
+    {
+        ScopedFault fail{Fault::dir_fsync};
+        ManagedPeers before{peers_dir, ::getuid()};
+        ASSERT_TRUE(before.valid());
+        EXPECT_FALSE(before.remember(managed));
+
+        reloaded = std::make_unique<ManagedPeers>(peers_dir, ::getuid());
+        ASSERT_TRUE(reloaded->valid());
+        EXPECT_TRUE(reloaded->revocable(managed));
+        EXPECT_FALSE(reloaded->admitted(managed));
+        EXPECT_FALSE(reloaded->confirm_durable());
+        EXPECT_FALSE(reloaded->admitted(managed));
+    }
+    EXPECT_TRUE(reloaded->confirm_durable());
+    EXPECT_TRUE(reloaded->admitted(managed));
+
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    const auto backend_dir = directory + "/backend";
+    ASSERT_EQ(::mkdir(backend_dir.c_str(), 0700), 0);
+    ASSERT_EQ(mock.command("paired"), "ok");
+
+    std::unique_ptr<helper::BluezBackend> restarted;
+    {
+        ScopedFault fail{Fault::dir_fsync};
+        {
+            helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid()};
+            ASSERT_TRUE(initial.available());
+            ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+            const auto obs = initial.observe();
+            ASSERT_TRUE(obs);
+            ASSERT_FALSE(initial.authorize(obs.value().handle));
+        }
+
+        // Restart while the directory fsync is still failing; reconnect must be refused,
+        // then allowed on the next reconnect attempt once the directory fsync succeeds.
+        restarted = std::make_unique<helper::BluezBackend>(
+            bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid());
+        ASSERT_TRUE(restarted->available());
+        ASSERT_TRUE(restarted->apply(helper::Action::register_profile, 0));
+        const auto refused_obs = restarted->observe();
+        ASSERT_TRUE(refused_obs);
+        const auto refused = restarted->reconnect_peer(refused_obs.value().handle);
+        EXPECT_FALSE(refused);
+        if (!refused) { EXPECT_EQ(refused.error().code(), ErrorCode::helper_rejected); }
+    }
+
+    const auto allowed_obs = restarted->observe();
+    ASSERT_TRUE(allowed_obs);
+    EXPECT_TRUE(restarted->reconnect_peer(allowed_obs.value().handle))
+        << "next reconnect attempt must confirm durability and succeed without a new pairing";
+}
+
+TEST_F(ManagedBonds, NormalRestartAfterSuccessfulSyncAdmitsLoadedEntries) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    const auto backend_dir = directory + "/backend";
+    ASSERT_EQ(::mkdir(backend_dir.c_str(), 0700), 0);
+    ASSERT_EQ(mock.command("paired"), "ok");
+
+    {
+        helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid()};
+        ASSERT_TRUE(initial.available());
+        ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+        const auto obs = initial.observe();
+        ASSERT_TRUE(obs);
+        ASSERT_TRUE(initial.authorize(obs.value().handle));
+    }
+
+    ManagedPeers reloaded{backend_dir, ::getuid()};
+    ASSERT_TRUE(reloaded.valid());
+    const helper::PeerIdentity primary{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
+    EXPECT_TRUE(reloaded.revocable(primary));
+    EXPECT_TRUE(reloaded.admitted(primary));
+
+    helper::BluezBackend restarted{bus_address, [] { return std::chrono::steady_clock::now(); }, backend_dir, ::getuid()};
+    ASSERT_TRUE(restarted.available());
+    ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+    const auto reconn_obs = restarted.observe();
+    ASSERT_TRUE(reconn_obs);
+    EXPECT_TRUE(restarted.reconnect_peer(reconn_obs.value().handle));
 }
 
 TEST(HelperOwner, NonRootOwnerIsRefusedBeforeAnyHelperCall) {
