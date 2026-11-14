@@ -49,9 +49,11 @@ ships no receiver service unit to apply that directive to.
 Files are bounded to 64 KiB. OpenSSL parses certificate and key, encrypted-key
 password prompts are disabled, the public/private components must match, and
 non-whitespace trailing content is rejected. Typed errors contain only stable
-failure classes; unset/empty credentials additionally explain HU_KEY_PATH.
+failure classes; key-strength errors also identify the zero-based certificate
+index (leaf is 0), and unset/empty credentials explain HU_KEY_PATH.
 No full path, phone identifier or PEM material enters the new diagnostics.
-Keys and certificate signatures must provide at least 112 security bits
+The private key, every bundled certificate public key (including intermediates),
+and certificate signatures must provide at least 112 security bits
 (RSA at least 2048 bits); SHA-1/MD5 certificate signatures are rejected.
 Expired head-unit certificates emit `tls-credential-warning: certificate-expired`
 on stderr at every load, without a pathname or certificate identity. They remain
@@ -175,7 +177,8 @@ with a 10-second default and accept an explicit cancellation/deadline. DNS
 resolution through `getaddrinfo` remains synchronous; numeric endpoint addresses
 avoid that resolver wait. TLS handshake retains its existing whole-operation
 10-second deadline. TCP keepalive and a 30-second unacknowledged-data timeout
-are enabled. Writes and a frame after its first decrypted bytes share a
+are enabled. The timeout applies to unacknowledged data/probes; keepalive uses
+system probe timing and does not guarantee detection after 30 seconds idle. Writes and a frame after its first decrypted bytes share a
 30-second whole-frame deadline, so fragment progress does not restart the budget.
 
 The protocol code only answers phone `PingRequest`s (`WiredSession.cpp`); it
