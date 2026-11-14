@@ -2,6 +2,8 @@
 #include "BusWire.hpp"
 
 #include <algorithm>
+#include <array>
+#include <limits>
 
 namespace aa::ipc::dbus_adapter {
 
@@ -12,29 +14,49 @@ constexpr std::uint32_t kProtocolVersion = 1;
 
 } // namespace
 
-core::Result<std::size_t> message_size(std::span<const std::uint8_t> head16) {
-    if (head16.size() < kFixedHeaderBytes || head16[0] != 'l' ||
-        head16[3] != kProtocolVersion) {
+core::Result<FrameHeader> inspect_frame(std::span<const std::uint8_t> head16) {
+    if (head16.size() < kFixedHeaderBytes ||
+        (head16[0] != 'l' && head16[0] != 'B') || head16[3] != kProtocolVersion) {
         return Error{ErrorCode::transport_malformed_frame};
     }
     if (head16[1] < 1 || head16[1] > 4) {
         return Error{ErrorCode::transport_malformed_frame};
     }
-    const auto le32 = [&head16](std::size_t offset) -> std::uint32_t {
-        return static_cast<std::uint32_t>(head16[offset]) |
-               (static_cast<std::uint32_t>(head16[offset + 1]) << 8U) |
-               (static_cast<std::uint32_t>(head16[offset + 2]) << 16U) |
-               (static_cast<std::uint32_t>(head16[offset + 3]) << 24U);
+    const bool little_endian = head16[0] == 'l';
+    const auto read32 = [&head16, little_endian](std::size_t offset) -> std::uint32_t {
+        if (little_endian) {
+            return static_cast<std::uint32_t>(head16[offset]) |
+                   (static_cast<std::uint32_t>(head16[offset + 1]) << 8U) |
+                   (static_cast<std::uint32_t>(head16[offset + 2]) << 16U) |
+                   (static_cast<std::uint32_t>(head16[offset + 3]) << 24U);
+        }
+        return (static_cast<std::uint32_t>(head16[offset]) << 24U) |
+               (static_cast<std::uint32_t>(head16[offset + 1]) << 16U) |
+               (static_cast<std::uint32_t>(head16[offset + 2]) << 8U) |
+               static_cast<std::uint32_t>(head16[offset + 3]);
     };
-    const std::uint32_t body_len = le32(4);
-    const std::uint32_t fields_len = le32(12);
-    std::size_t total = kFixedHeaderBytes + fields_len;
-    total += (8 - (total % 8)) % 8;
-    total += body_len;
-    if (total > kMaxMessageBytes || total < kFixedHeaderBytes) {
+    const std::uint64_t body_len = read32(4);
+    const std::uint64_t fields_len = read32(12);
+    const std::uint64_t fields_end = kFixedHeaderBytes + fields_len;
+    const std::uint64_t total = fields_end + (8 - (fields_end % 8)) % 8 + body_len;
+    if (total > std::numeric_limits<std::size_t>::max()) {
+        return Error{ErrorCode::transport_malformed_frame};
+    }
+    return FrameHeader{static_cast<std::size_t>(total), little_endian};
+}
+
+core::Result<std::size_t> message_size(std::span<const std::uint8_t> head16) {
+    const auto frame = inspect_frame(head16);
+    if (!frame.has_value()) {
+        return frame.error();
+    }
+    if (!frame.value().little_endian) {
+        return Error{ErrorCode::transport_malformed_frame};
+    }
+    if (frame.value().total_bytes > kMaxMessageBytes) {
         return Error{ErrorCode::transport_oversize_frame};
     }
-    return total;
+    return frame.value().total_bytes;
 }
 
 core::Result<ParsedMessage> parse_message(std::span<const std::uint8_t> bytes) {
@@ -68,6 +90,7 @@ core::Result<ParsedMessage> parse_message(std::span<const std::uint8_t> bytes) {
         return Error{ErrorCode::transport_malformed_frame};
     }
     std::size_t field_count = 0;
+    std::array<bool, 256> seen_fields{};
     while (cursor.position() < fields_end) {
         if (++field_count > kMaxHeaderFields) {
             return Error{ErrorCode::transport_malformed_frame};
@@ -78,6 +101,11 @@ core::Result<ParsedMessage> parse_message(std::span<const std::uint8_t> bytes) {
         if (!padded.has_value() || !code.has_value() || !sig.has_value()) {
             return Error{ErrorCode::transport_malformed_frame};
         }
+        const auto field_index = static_cast<std::size_t>(code.value());
+        if (seen_fields[field_index]) {
+            return Error{ErrorCode::transport_malformed_frame};
+        }
+        seen_fields[field_index] = true;
         switch (code.value()) {
         case 1:
         case 2:

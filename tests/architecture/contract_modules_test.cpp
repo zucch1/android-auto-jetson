@@ -17,6 +17,9 @@
 #include <utility>
 #include <vector>
 
+#include <clocale>
+#include <string>
+
 #include <gtest/gtest.h>
 
 namespace {
@@ -163,6 +166,69 @@ TEST(Config, ConfirmedBenchConfigValidates) {
     EXPECT_EQ(result.value().wireless.channel, 36);
     EXPECT_FALSE(result.value().microphone_enabled);
     EXPECT_FALSE(result.value().sensors_enabled);
+}
+
+TEST(Config, MalformedJurisdictionFailsClosed) {
+    for (const auto &bad_jurisdiction : {"USA", "us", "U", "", "U1", "12", "U$"}) {
+        aa::config::Config candidate{};
+        candidate.credential_path = "/etc/aa/hu.pem";
+        candidate.wireless.jurisdiction = bad_jurisdiction;
+        candidate.wireless.jurisdiction_confirmed = true;
+        const auto result = aa::config::validate(std::move(candidate));
+        ASSERT_FALSE(result.has_value()) << "Expected rejection for jurisdiction: " << bad_jurisdiction;
+        EXPECT_EQ(result.error().code(), aa::ErrorCode::config_invalid);
+    }
+}
+
+TEST(Config, JurisdictionCheckIsAsciiOnlyAndLocaleIndependent) {
+    // I3: std::isupper() is locale-dependent; under a Latin-1 locale 0xC9 ('E' with
+    // acute) is "upper". Try to select such a locale (it may not be installed:
+    // the assertions hold either way).
+    const char* previous = std::setlocale(LC_CTYPE, nullptr);
+    const std::string restore = previous != nullptr ? previous : "C";
+    for (const char* name : {"en_US.ISO-8859-1", "de_DE.ISO-8859-1", "fr_FR.ISO-8859-1"}) {
+        if (std::setlocale(LC_CTYPE, name) != nullptr) {
+            break;
+        }
+    }
+    for (const char* bad : {"\xC9\xC9", "U\xC9", "\xD6S"}) {
+        aa::config::Config candidate{};
+        candidate.credential_path = "/etc/aa/hu.pem";
+        candidate.wireless.jurisdiction = bad;
+        candidate.wireless.jurisdiction_confirmed = true;
+        const auto result = aa::config::validate(std::move(candidate));
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code(), aa::ErrorCode::config_invalid);
+    }
+    aa::config::Config good{};
+    good.credential_path = "/etc/aa/hu.pem";
+    good.wireless.jurisdiction = "US";
+    good.wireless.jurisdiction_confirmed = true;
+    EXPECT_TRUE(aa::config::validate(std::move(good)).has_value());
+    std::setlocale(LC_CTYPE, restore.c_str());
+}
+
+TEST(Config, EnabledExtrasFailClosed) {
+    {
+        aa::config::Config candidate{};
+        candidate.credential_path = "/etc/aa/hu.pem";
+        candidate.wireless.jurisdiction = "US";
+        candidate.wireless.jurisdiction_confirmed = true;
+        candidate.microphone_enabled = true;
+        const auto result = aa::config::validate(std::move(candidate));
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code(), aa::ErrorCode::config_invalid);
+    }
+    {
+        aa::config::Config candidate{};
+        candidate.credential_path = "/etc/aa/hu.pem";
+        candidate.wireless.jurisdiction = "US";
+        candidate.wireless.jurisdiction_confirmed = true;
+        candidate.sensors_enabled = true;
+        const auto result = aa::config::validate(std::move(candidate));
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code(), aa::ErrorCode::config_invalid);
+    }
 }
 
 TEST(Transport, FramedInterfaceIsImplementableAndTyped) {

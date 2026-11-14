@@ -134,7 +134,8 @@ decode_limits_record(std::span<const std::uint8_t> record) noexcept {
     if (get<4>(record, 24) != 0) {
         return malformed();
     }
-    if (limits.max_datagram_payload == 0 || limits.max_datagram_payload > kMaxDatagramPayload ||
+    if (limits.max_datagram_payload < kMinDatagramPayload ||
+        limits.max_datagram_payload > kMaxDatagramPayload ||
         limits.max_access_unit_bytes == 0 || limits.max_access_unit_bytes > kMaxAccessUnitBytes ||
         limits.socket_budget_bytes == 0 ||
         limits.socket_budget_bytes > static_cast<std::uint32_t>(kSocketBudgetBytes)) {
@@ -149,7 +150,7 @@ negotiate_limits(const NegotiatedLimits& local, const NegotiatedLimits& peer) no
     agreed.max_datagram_payload = std::min(local.max_datagram_payload, peer.max_datagram_payload);
     agreed.max_access_unit_bytes = std::min(local.max_access_unit_bytes, peer.max_access_unit_bytes);
     agreed.socket_budget_bytes = std::min(local.socket_budget_bytes, peer.socket_budget_bytes);
-    if (agreed.max_datagram_payload == 0 || agreed.max_access_unit_bytes == 0 ||
+    if (agreed.max_datagram_payload < kMinDatagramPayload || agreed.max_access_unit_bytes == 0 ||
         agreed.socket_budget_bytes == 0) {
         return Error{ErrorCode::protocol_negotiation_failed};
     }

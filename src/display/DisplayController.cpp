@@ -27,6 +27,9 @@ public:
     [[nodiscard]] core::Result<std::size_t> pump(Milliseconds wait) override {
         return helper_.pump(wait);
     }
+    [[nodiscard]] const consumer::DecodeReport& report() const noexcept override {
+        return helper_.report();
+    }
     void close() noexcept override { helper_.close(); }
 
 private:
@@ -73,6 +76,10 @@ struct DisplayController::Impl final {
     bool eof{false};
     std::optional<ipc::VideoConsumer> video{};
     std::unique_ptr<DecodeSession> session{};
+    // Exactly one rejected AU is retained. While occupied, receive() is not
+    // called: saturation applies source backpressure instead of dropping or
+    // queueing later units, and this AU's metadata remains untouched.
+    std::optional<ipc::VideoAccessUnit> pending_unit{};
 
     void on_decoded(const consumer::DecodedFrame& frame) {
         ++frames_presented;
@@ -80,6 +87,7 @@ struct DisplayController::Impl final {
     }
 
     void release_media() noexcept {
+        pending_unit.reset();
         if (session) {
             session->close();
             session.reset();
@@ -181,6 +189,11 @@ bool DisplayController::helper_started() const noexcept {
     return impl_ && impl_->helper_started;
 }
 
+const consumer::DecodeReport& DisplayController::decode_report() const noexcept {
+    static const consumer::DecodeReport empty{};
+    return impl_ && impl_->session ? impl_->session->report() : empty;
+}
+
 core::Result<void> DisplayController::start_projection(const ipc::VideoSocketPath& video_socket) {
     if (!impl_) {
         return Error{ErrorCode::transport_closed};
@@ -251,6 +264,21 @@ core::Result<std::size_t> DisplayController::pump(Milliseconds wait) {
         return Error{ErrorCode::session_illegal_transition};
     }
     for (std::size_t step = 0; step < kReceiveBudget; ++step) {
+        if (impl_->pending_unit.has_value()) {
+            const auto retried = impl_->session->submit(impl_->pending_unit.value());
+            if (!retried.has_value()) {
+                const auto code = retried.error().code();
+                if (code == ErrorCode::ipc_queue_full) {
+                    // Still full: keep the sole pending AU and drain below.
+                    break;
+                }
+                // IDR-resync discard and terminal failures are settled, not
+                // retryable backpressure; never replay this AU on later pumps.
+                impl_->pending_unit.reset();
+                return retried.error();
+            }
+            impl_->pending_unit.reset();
+        }
         const auto status =
             impl_->video->receive(step == 0 ? wait : Milliseconds{0});
         if (!status.has_value()) {
@@ -275,7 +303,13 @@ core::Result<std::size_t> DisplayController::pump(Milliseconds wait) {
         }
         const auto submitted = impl_->session->submit(impl_->video->access_unit());
         if (!submitted.has_value()) {
-            return submitted.error();
+            if (submitted.error().code() != ErrorCode::ipc_queue_full) {
+                return submitted.error();
+            }
+            // Copy before any subsequent receive can overwrite the consumer's
+            // stable complete() state, then drain instead of reading ahead.
+            impl_->pending_unit = impl_->video->access_unit();
+            break;
         }
     }
     auto frames = impl_->session->pump(wait);

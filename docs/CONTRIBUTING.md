@@ -20,33 +20,24 @@ CODEOWNERS, a merge queue, or mandatory Conventional Commits.
   Do not commit, push, open a PR, or change repository rules without explicit
   authorization.
 
-## CI contexts and private ARM64 companion
+## CI contexts and ARM64 cross-build
 
-The planned merge gate consists of three exact, stable contexts:
+The public CI workflow (`.github/workflows/ci.yml`) executes independent, nonmatrix public jobs. The workflow file is the authority for their names; today they are:
 
-| Context | Implementation in this change |
+| Context | Implementation in `.github/workflows/ci.yml` (or owner relay) |
 |---|---|
-| `ci/host-build-test` | Ubuntu 24.04 host foundation configure/build/CTest including the task-5 target-safety suite (public job) |
-| `ci/provenance-lint` | Source/notice and dependency-lock checks plus scratch mutation tests (public job) |
-| `ci/arm64-cross-build` | Posted only by the owner-run sandboxed relay `tools/ci/arm64-cross-relay.sh` (see below); the public Actions job is `ci/arm64-cross-fixture` and cannot satisfy it |
+| `ci/host-build-test` | Ubuntu 24.04 host build and test suite, including AASDK ABI, IPC, protocol, transport, audio, display, wired E2E, recovery, target-safety, and binary hardening suites (public required job) |
+| `ci/decode-overlay-cross` | Synthetic cross fixture dependencies, AArch64 ELF verification, and external overlay provenance check (public job) |
+| `ci/base-validators` | Runs `tools/deps/check_manifest.py`, `tools/provenance/check.py`, and `tools/tls/scan.py` from `main` against the PR tree in a separate fresh-runner scrubbed environment; gates `ci/provenance-lint` (public job; optionally required in the ruleset) |
+| `ci/provenance-lint` | Requires `ci/base-validators` to have succeeded, then runs in-tree dependency lock checks (`check_manifest.py`), source/notice verification (`tools/provenance/check.sh`), scratch mutation tests, and protobuf audit verification (`protobuf_audit.py --check`, `audit_scenarios.py`) (public required job) |
+| `ci/arm64-cross-fixture` | Fixture-sysroot cross-build (`make_sysroot`, `AA_SYSROOT_REQUIRE_OBSERVED=OFF`, `cmake --preset jetson-aarch64`) building targets including `aa_ipc_control` and `aa_ipc_dbus`, verifying `assert_dbus_coverage.py --cross` and `build_hardening` (public **required** job, explicitly **fixture-not-target**) |
+| `ci/arm64-cross-build` | **Optional target evidence** (not a workflow job and not a required check): commit status posted only by the owner-run sandboxed relay `tools/ci/arm64-cross-relay.sh` after an observed-sysroot cross-build (`AA_SYSROOT_REQUIRE_OBSERVED=ON` against `sysroot jetson-r39.2.1`) |
 
-`.github/workflows/ci.yml` runs the independent nonmatrix public jobs (the two public required contexts plus `ci/decode-overlay-cross` and the fixture-only `ci/arm64-cross-fixture`) on pull
-requests targeting `main` or `aa/**`, on pushes to `main`, and on manual
-`workflow_dispatch`. Pushes to `aa/**` branches start no separate run: the
-PR run already reports every required context on the head commit, and a newer push
-to the same PR cancels the superseded PR run. There are no workflow path filters
-that could silently omit a required context. Inside `ci/host-build-test`, PR runs
-skip only the 600 s `ipc-bench-happy-600` throughput gate, and only when
-`tools/ci/ipc_bench_gate.py` shows that the PR leaves the benchmark's sources, every
-ninja command that builds `aa-ipc-bench` and its test registration identical to the
-PR base (any difference or error runs it; `ci_ipc_bench_gate` tests the
-classification). A PR that edits `.github/workflows/ci.yml` always runs it, since
-runner-image or provisioning changes do not show up in that comparison. Every other test runs on every PR, and the gate runs on every
-push to `main` and on dispatch, so a throughput regression that does not
-come from the PR's own changes to the benchmark build (for example runner image or
-toolchain drift) is caught after merge, not before. Both jobs use only
-`contents: read`, a full-commit-pinned checkout with credential persistence
-disabled, and no artifact upload or cache actions.
+`.github/workflows/ci.yml` runs the five public jobs on pull requests targeting `main` or `aa/**`, on pushes to `main`, and on manual `workflow_dispatch`. Pushes to `aa/**` branches start no separate run: the PR run already reports every required context on the head commit, and a newer push to the same PR cancels the superseded PR run. There are no workflow path filters that could silently omit a required context.
+
+Inside `ci/host-build-test`, PR runs skip only the 600 s `ipc-bench-happy-600` throughput gate, and only when `tools/ci/ipc_bench_gate.py` shows that the PR leaves the benchmark's sources, every ninja command that builds `aa-ipc-bench` and its test registration identical to the PR base (any difference or error runs it; `ci_ipc_bench_gate` tests the classification). A PR that edits `.github/workflows/ci.yml` always runs it, since runner-image or provisioning changes do not show up in that comparison. Every other test (including `input_sensors_memory` under Valgrind memcheck) runs on every PR, and the throughput gate runs on every push to `main` and on dispatch, so a throughput regression that does not come from the PR's own changes to the benchmark build (for example runner image or toolchain drift) is caught after merge, not before. The jobs use only `contents: read`, a full-commit-pinned checkout with credential persistence disabled, and no artifact upload or cache actions.
+
+The host build downloads the exact GoogleTest v1.15.2 archive specified by `deps/manifest.json` outside configure, then verifies it against `deps/manifest.lock` and the checker's independently anchored source identity before staging. The release tag resolves to `b514bdc898e2951020cbdca1304b75f5950d1f59`; its exact archive SHA-256 is `7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926`. A moved tag or altered archive must fail verification, not update the lock. Checkout v4.2.2 was verified against the upstream tag as `11bd71901bbe5b1630ceea73d27597364c9af683`. Review and independently verify upstream identity before changing any action or source pin.
 
 ### Validators run from the default branch on every run
 
@@ -64,7 +55,8 @@ only ever a path argument, nothing from it is executed or sourced) and runs the 
 with `/usr/bin/python3 -B -s -E` from a scrubbed `env -i`.
 
 Which job produces which required status: the required context `ci/provenance-lint` keeps
-its name and its existing in-tree steps, and now has `needs: base-validators` plus a first
+its name and its existing in-tree steps (including the protobuf audit and scenario checks),
+and now has `needs: base-validators` plus a first
 step that fails unless `ci/base-validators` **succeeded**, for every event type (the job runs under
 `!cancelled()`, because a *skipped* required job would otherwise count as passing; `skipped` is
 not accepted, so `gh workflow run ci.yml --ref <pr-branch>` cannot produce a green
@@ -78,7 +70,7 @@ required contexts after its first run.
 
 If a PR legitimately changes one of these validators or their pinned constants, the base run
 fails by design: land the validator change on its own first (the owner reviews it explicitly),
-then rebase the data change on it. That does not work when a validator's pinned constant and
+then rebase the data change on it. That order does not work when a validator's pinned constant and
 the data it checks must change together (`check_manifest.py` + `deps/manifest.lock`): make the
 change backward compatible (the old validator must accept the new data, or the new validator the
 old data) so the two can land in either order, or accept a red `main` between two merges, or use
@@ -86,54 +78,45 @@ an admin bypass for that merge.
 
 **Residuals.** (a) Any file under `.github/workflows/` comes from the PR, not just `ci.yml`: a PR
 can edit or delete these jobs, and can add a *new* workflow with a job named `ci/provenance-lint`
-(or `ci/base-validators`). Any change under `.github/workflows/` needs explicit owner review
-(enforcing it needs `pull_request_target`/ruleset work, not done here). (b) The
-`workflow_dispatch` closure (a dispatch on an old PR branch cannot turn the gate green) relies on
-the ruleset's **strict "require branches to be up to date before merging"** setting: an old PR
-branch carries the old gate until `main` is merged into it. Turning strict off reopens that hole.
-`tests/ci/ci_workflow_trust_test.py` (ctest `ci_workflow_trust`) guards this structure.
+(or `ci/base-validators` or `ci/arm64-cross-fixture`). Any change under `.github/workflows/` needs
+explicit owner review (enforcing it needs `pull_request_target`/ruleset work, not done here).
+(b) The `workflow_dispatch` closure (a dispatch on an old PR branch cannot turn the gate green)
+relied on the ruleset's **strict "require branches to be up to date before merging"** setting.
+**Strict is now turned OFF** to make merges faster, which reopens that hole: a branch that
+predates the `ci/base-validators` job carries the old gate, so a manual `workflow_dispatch` on
+it can produce a green `ci/provenance-lint` without running the trusted validators. As the
+compensating practice, the orchestrator merges only branches whose latest CI run used the
+current workflow, and checks `main`'s runs after each batch of merges.
+`tests/ci/ci_workflow_trust_test.py` (ctest `ci_workflow_trust`) guards the workflow structure.
 
-The host build downloads the exact GoogleTest v1.15.2 archive specified by
-`deps/manifest.json` outside configure, then verifies it against
-`deps/manifest.lock` and the checker's independently anchored source identity
-before staging. The release tag resolves to
-`b514bdc898e2951020cbdca1304b75f5950d1f59`; its exact archive SHA-256 is
-`7b42b4d6ed48810c5362c265a17faebe90dc2373c885e5216439d37927f02926`.
-A moved tag or altered archive must fail verification, not update the lock.
-Checkout v4.2.2 was verified against the upstream tag as
-`11bd71901bbe5b1630ceea73d27597364c9af683`. Review and independently verify
-upstream identity before changing any action or source pin.
+### ARM64 fixture check and optional observed-sysroot relay
 
-Task 5's final acceptance is PASS per the task-6 handoff. The private ARM64
-cross-build is now provisioned as a companion workflow, not a public job. The
-companion repository `zucch1/android-auto-jetson-ci-private` runs
-`.github/workflows/arm64-cross-build.yml` (workflow_dispatch only, Ubuntu 24.04
-hosted) against the reviewed public head SHA using a qualified private sysroot
-bundle. Access is gated by a reviewed exact-SHA allowlist (`reviewed-shas.txt`):
-only a public SHA that the owner has reviewed and explicitly listed may build;
-unlisted, malformed, or injection-shaped SHAs are rejected before any install or
-download. No raw sysroot, cache archive, or credential is committed to the public
-tree or uploaded to public artifacts.
+No required CI check depends on the owner. The required context for the ARM64 cross-build is
+`ci/arm64-cross-fixture`, posted by GitHub Actions. It executes against a synthetic fixture
+sysroot generated in `RUNNER_TEMP` (`tests/media/decode_cross_fixture.py`,
+`AA_SYSROOT_REQUIRE_OBSERVED=OFF`), builds `cmake --preset jetson-aarch64` plus `aa_ipc_control`
+and `aa_ipc_dbus`, and verifies toolchain invocation, compilation, cross inventory
+(`assert_dbus_coverage.py --cross`), and executable hardening (`build_hardening`). This public
+cross-build is explicitly **fixture-not-target**: it is NOT physical target qualification.
 
-The public `ci/arm64-cross-build` status is not published automatically: no
-narrow status GitHub App is provisioned, so the companion's `GITHUB_TOKEN`
-cannot write public commit statuses. The initial relay is manual: the owner or
-parent verifies the exact private workflow head, owner/actor, dispatch, approved
-public SHA, run attempt, and completed build/test logs, then POSTs the
-`ci/arm64-cross-build` status through the existing authorized local `gh`
-channel. A passing local reproduction is not a substitute for that reviewed
-live run. The public workflow's fixture job is named `ci/arm64-cross-fixture`, never
-`ci/arm64-cross-build`, so only an owner-posted status can satisfy the required
-context. Green public jobs are not full task-6 acceptance or authorization to
-merge. Hardware evidence is not replaced by host smoke tests.
+`ci/arm64-cross-build`, posted only by the owner-run sandboxed relay
+(`tools/ci/arm64-cross-relay.sh`), is **optional target evidence**, not a required CI check.
+What this gives up: `main` can accept a change that was only cross-built against the synthetic
+fixture sysroot, never against the real Jetson sysroot (`sysroot jetson-r39.2.1`). The relay
+remains the way to obtain that observed-sysroot proof (`AA_SYSROOT_REQUIRE_OBSERVED=ON`) for a
+reviewed exact commit SHA. Acceptance of observed-sysroot evidence is bound to the exact SHA:
+after any squash merge, rebase, or sync, the head SHA changes and the smoke must be re-run and
+re-posted for the new SHA — never relay a stale SHA. Passing a local reproduction or synthetic
+fixture run is not a substitute for that reviewed exact-SHA run; green public jobs (including
+`ci/arm64-cross-fixture`) are not target acceptance or authorization to skip hardware evidence.
 
 ### Owner-run sandboxed relay
 
 Where the observed sysroot is on the owner machine, `tools/ci/arm64-cross-relay.sh`
-produces and posts the same status directly (it replaces running the PR tree's own
-build with the owner's credentials). The observed-sysroot ARM64 cross-build is relayed
-at a reviewed, exact head SHA, just before the squash merge. The relay treats the
-PR tree as untrusted code:
+produces and posts the optional `ci/arm64-cross-build` commit status directly (it replaces
+running the PR tree's own build with the owner's credentials). The observed-sysroot ARM64
+cross-build is relayed at a reviewed, exact head SHA when target-sysroot proof is desired. The
+relay treats the PR tree as untrusted code:
 
 - Run it from your own checkout of `main`, never from the PR branch. It fetches
   `origin/main` into a base worktree and runs `tools/build/validate_sysroot.py` from
@@ -177,7 +160,7 @@ PR tree as untrusted code:
   (the daemon must answer and list no such container) before it hashes logs or posts a
   status. If that cannot be confirmed it posts nothing, leaves the scratch tree in place
   and exits 70: investigate before reusing the machine state.
-- Only after the sandbox has exited does the trusted script post the
+- Only after the sandbox has exited does the trusted script post the optional
   `ci/arm64-cross-build` commit status for that exact SHA with `gh`, using your own
   auth, outside the sandbox. Re-run for the new SHA after every push or sync.
 - With a PR number the relay first checks that the SHA is that PR's head and that the
@@ -257,21 +240,29 @@ The target-safety suites retain scratch fixtures under `/tmp/opencode` and are
 exercised by `ctest` as `target_safety_*`; the subset that is not registered is
 enumerated with a per-suite reason in `tests/target_safety/assert_coverage.py`.
 
-Reproduce the independent provenance job without a sysroot or source download:
+Reproduce the independent provenance job (`ci/base-validators` + `ci/provenance-lint`)
+without a sysroot or source download:
 
 ```bash
 set -euo pipefail
 python3 -B tools/deps/check_manifest.py --lock deps/manifest.lock
 tools/provenance/check.sh
+python3 -B tools/tls/scan.py "$PWD"
 for case in baseline overlay content header extra generated license gpl inventory listing symlink missing mode; do
   python3 -B tests/provenance/scenarios.py "$PWD" "$case"
+done
+python3 -B tools/protocol/protobuf_audit.py --check
+for case in baseline drift-inventory report-drift missing-file tampered-proto unpinned-file listing-tampered repin-comment field-number-changed field-type-changed enum-value-removed new-unmatched-message vanished-difference unparsed-construct finding-dangling-diff uncovered-by-removal duplicate-id missing-field invalid-disposition status-mismatch unexplained-deletion nonlegacy-deletion legacy-altered citation-broken absence-stale crosslink-dangling orphan-finding mapping-dangling triage-missing-diff triage-dangling-diff triage-invalid-disposition triage-missing-metadata sentinel-false-match genuine-rename-still-matches renamed-enums-path-only zero-only-enum-false-match message-path-shape-boundary; do
+  python3 -B tests/protocol/audit_scenarios.py "$PWD" "$case"
 done
 ```
 
 The mutation suite uses existing isolated, retained scratch fixtures; it never
-modifies the vendored sources in the working tree. The host build compiles
-GoogleTest/GoogleMock and the C++20 smoke target, not the full AASDK or a Jetson
-runtime. Keep private `.local/` content, evidence, sysroots, logs, caches, phone
-data, and credentials out of commits, PR attachments, and public CI uploads.
+modifies the vendored sources in the working tree. The native presets (`host-dev`,
+`host-release`, `host-asan`) build upstream AASDK (`cmake/AasdkAbi.cmake`), the
+receiver, and test targets; this establishes host and ABI compatibility, but
+does not establish Jetson qualification. Keep private `.local/` content, evidence,
+sysroots, logs, caches, phone data, and credentials out of commits, PR attachments,
+and public CI uploads.
 Review the exact staged file list before any authorized commit; do not use a
 blanket add of a dirty worktree. Preserve historical evidence locally.

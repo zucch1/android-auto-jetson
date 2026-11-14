@@ -176,6 +176,22 @@ core::Result<NegotiatedLimits> exchange_limits(int fd, const NegotiatedLimits& l
     return negotiate_limits(local, peer.value());
 }
 
+// Audit L11: the limits handshake is a short exchange of one fixed-size record.
+// A peer that connects and then says nothing must not hold the accept loop for
+// the caller's whole (up to 60 s, or unbounded) timeout, so every handshake is
+// capped at kHandshakeTimeout. The accept loop is single-threaded and the
+// listener has a backlog of one, so the worst case for a silent same-UID peer is
+// one kHandshakeTimeout of delay per attempt, after which it is closed and the
+// next consumer is accepted. A fully non-blocking pending-handshake table would
+// remove even that delay but adds per-peer state to an endpoint that admits one
+// same-UID consumer at a time; the bounded block is the deliberate trade-off.
+constexpr core::Milliseconds kHandshakeTimeout{2000};
+
+core::Milliseconds bounded_handshake_timeout(core::Milliseconds requested) noexcept {
+    return (requested.count >= 0 && requested.count < kHandshakeTimeout.count) ? requested
+                                                                              : kHandshakeTimeout;
+}
+
 // Identity of the endpoint node bound at a path. Captured at bind time so a
 // later teardown can prove it still owns the node before unlinking it.
 struct EndpointIdentity final {
@@ -362,6 +378,12 @@ core::Result<EndpointIdentity> bind_path(int fd, const std::string& path) noexce
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    // Audit L11: the endpoint must end up 0600, but umask() is process-global
+    // and would hand a concurrently created file (any other thread) the wrong
+    // mode. Instead rely on the directory boundary: prepare_video_socket_path
+    // already refused anything but a real, caller-owned, exact-0700 directory,
+    // so between bind() and the chmod below the new node is unreachable to any
+    // other user whatever mode the kernel gave it. The chmod is fail-closed.
     if (::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
         return Error{ErrorCode::transport_unavailable};
     }
@@ -917,7 +939,8 @@ core::Result<VideoProducer> VideoServer::accept_consumer(core::Milliseconds time
         ::close(fd);
         return authorized.error();
     }
-    auto negotiated = exchange_limits(fd, impl_->options.local_limits, timeout);
+    auto negotiated =
+        exchange_limits(fd, impl_->options.local_limits, bounded_handshake_timeout(timeout));
     if (!negotiated) {
         ::close(fd);
         return negotiated.error();
@@ -965,7 +988,8 @@ core::Result<VideoConsumer> connect_video_consumer(const VideoSocketPath& path,
         ::close(fd);
         return authorized.error();
     }
-    auto negotiated = exchange_limits(fd, options.local_limits, options.timeout);
+    auto negotiated =
+        exchange_limits(fd, options.local_limits, bounded_handshake_timeout(options.timeout));
     if (!negotiated) {
         ::close(fd);
         return negotiated.error();

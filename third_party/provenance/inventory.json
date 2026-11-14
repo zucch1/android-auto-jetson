@@ -584,7 +584,8 @@
           "original_git_object_oid": "429467a2d8b89609dd1e9029d24672832bc51a01",
           "original_object_type": "blob",
           "original_git_blob_oid": "429467a2d8b89609dd1e9029d24672832bc51a01",
-          "sha256": "73f7d67eadd4619276d655a4597529e14c9be79d27994bfb2d2f67b27e3c3bcd",
+          "sha256": "33b985853b7743f93aa57102ad2698eddb1ef9200284a71b0dd92c90da30ee2a",
+          "sanitization": "correct-credential-documentation-2026-11-11",
           "notice_lines": []
         },
         {
@@ -29240,6 +29241,18 @@
     "your copyrighted material outside their relationship with you.": 1
   },
   "downstream_patches": [
+    {
+      "path": "cert/README.md",
+      "component": "aasdk",
+      "upstream_tracked": true,
+      "transformation": "correct-credential-documentation-2026-11-11",
+      "original_git_blob_oid": "429467a2d8b89609dd1e9029d24672832bc51a01",
+      "original_sha256": "73f7d67eadd4619276d655a4597529e14c9be79d27994bfb2d2f67b27e3c3bcd",
+      "resulting": "sanitized",
+      "resulting_git_blob_oid": "0e19ca804e43a4dc42ba033f235ddcbd70f14c2c",
+      "resulting_sha256": "33b985853b7743f93aa57102ad2698eddb1ef9200284a71b0dd92c90da30ee2a",
+      "note": "Obsolete bundled/embedded credential and insecure installation instructions replaced with the fail-closed HU_KEY_PATH-only contract."
+    },
     {
       "path": "cert/headunit.crt",
       "component": "aasdk",

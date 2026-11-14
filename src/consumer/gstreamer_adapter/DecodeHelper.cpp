@@ -7,6 +7,9 @@
 #include <aa/protocol/Messages.hpp> // protocol::valid_video_profile (budget profile)
 
 #include "DecodeSessionState.hpp" // GStreamer-free admission + timestamp state
+#ifdef AA_DECODE_HELPER_TEST_CLOCK
+#include "DecodeTestAccess.hpp"
+#endif
 #include "DecodeArrivalProbe.hpp"
 
 #include <gst/app/gstappsink.h>
@@ -169,6 +172,14 @@ struct DecodeHelper::Impl final {
     DecodeCompletionObserver on_completion{};
     std::uint64_t session_ns{};
     std::uint64_t frame_duration_ns{};
+#ifdef AA_DECODE_HELPER_TEST_CLOCK
+    DecodeHelper::Now clock_fn{DecodeSessionState::Clock::now};
+    [[nodiscard]] DecodeSessionState::Clock::time_point now() const { return clock_fn(); }
+#else
+    [[nodiscard]] static DecodeSessionState::Clock::time_point now() noexcept {
+        return DecodeSessionState::Clock::now();
+    }
+#endif
 
     GstElement* pipeline{nullptr};
     GstElement* appsrc{nullptr};
@@ -213,6 +224,21 @@ struct DecodeHelper::Impl final {
         session.clear_correlations();
     }
 
+    void refresh_loss_report() noexcept {
+        report.frames_lost_retention = session.frames_lost_retention;
+        report.frames_lost_capacity = session.frames_lost_capacity;
+        report.frames_lost_eos = session.frames_lost_eos;
+        report.awaiting_idr = session.awaiting_idr;
+    }
+
+    [[nodiscard]] core::Result<void> check_pump(DecodeSessionState::Clock::time_point at) {
+        auto status = session.check_pump(at);
+        // Keep even a previously retained report reference current when pump
+        // observes loss or an accepted recovery IDR clears awaiting_idr.
+        refresh_loss_report();
+        return status;
+    }
+
     [[nodiscard]] core::Result<void> fail_terminal(ErrorCode code) noexcept {
         session.latch_terminal(code);
         return core::Result<void>{Error{code}};
@@ -246,6 +272,15 @@ struct DecodeHelper::Impl final {
 };
 
 DecodeHelper::DecodeHelper(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+
+#ifdef AA_DECODE_HELPER_TEST_CLOCK
+void DecodeHelperTestAccess::post_pipeline_error(DecodeHelper& helper) {
+    GError* error = g_error_new_literal(GST_STREAM_ERROR, GST_STREAM_ERROR_FAILED, "injected");
+    gst_element_post_message(helper.impl_->pipeline,
+        gst_message_new_error(GST_OBJECT(helper.impl_->pipeline), error, "test"));
+    g_error_free(error);
+}
+#endif
 
 DecodeHelper::~DecodeHelper() = default;
 
@@ -370,7 +405,15 @@ core::Result<void> DecodeHelper::Impl::build_pipeline(const std::string& decoder
     return core::Result<void>{};
 }
 
+#ifdef AA_DECODE_HELPER_TEST_CLOCK
 core::Result<DecodeHelper> DecodeHelper::open(DecodeConfig config) {
+    return open_with_clock(std::move(config), DecodeSessionState::Clock::now);
+}
+
+core::Result<DecodeHelper> DecodeHelper::open_with_clock(DecodeConfig config, Now now) {
+#else
+core::Result<DecodeHelper> DecodeHelper::open(DecodeConfig config) {
+#endif
     ensure_gstreamer_initialized();
 
     // Caps negotiation against the channel budget profile: anything outside
@@ -391,8 +434,10 @@ core::Result<DecodeHelper> DecodeHelper::open(DecodeConfig config) {
     impl->caps = config.caps;
     impl->on_frame = std::move(config.on_frame);
     impl->on_completion = std::move(config.on_completion);
-    impl->session_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        DecodeSessionState::Clock::now().time_since_epoch()).count());
+#ifdef AA_DECODE_HELPER_TEST_CLOCK
+    impl->clock_fn = std::move(now);
+#endif
+    impl->session_ns = steady_ns(impl->now());
     impl->frame_duration_ns = 1'000'000'000ULL / static_cast<std::uint64_t>(config.caps.fps);
 
     const auto needs_nvmm_conversion = [&](const std::string& element) {
@@ -461,14 +506,17 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
     // All checks run before any buffer is allocated or pushed, and a rejected
     // AU acquires no correlation mapping and does not consume its timestamp
     // (byte rejections retry with the same timestamp after a drain).
-    const DecodeSessionState::Clock::time_point now = DecodeSessionState::Clock::now();
+    const DecodeSessionState::Clock::time_point now = impl_->now();
     if (auto admitted = impl_->session.admit_submission(
             FeedLoad{gst_app_src_get_current_level_bytes(GST_APP_SRC(impl_->appsrc)),
                      access_unit.payload.size()},
             access_unit.timestamp_ns, access_unit.idr, now);
         !admitted.has_value()) {
+        // Submit-side expiry/capacity loss counts are visible on a held report.
+        impl_->refresh_loss_report();
         return admitted;
     }
+    impl_->refresh_loss_report();
     if (auto failed = impl_->bus_error(); !failed.has_value()) {
         return failed;
     }
@@ -489,13 +537,14 @@ core::Result<void> DecodeHelper::submit(const ipc::VideoAccessUnit& access_unit)
     }
 
     const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(impl_->appsrc), buffer);
-    const auto push_returned = DecodeSessionState::Clock::now();
+    const auto push_returned = impl_->now();
     if (flow != GST_FLOW_OK) {
         return impl_->fail_terminal(ErrorCode::channel_decode_failed);
     }
     impl_->session.accept_timestamp(access_unit.timestamp_ns);
     impl_->session.record_correlation(access_unit.frame, access_unit.sequence,
                                       access_unit.timestamp_ns, now, push_returned);
+    impl_->refresh_loss_report(); // an accepted recovery IDR clears awaiting_idr
     return core::Result<void>{};
 }
 
@@ -538,33 +587,49 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         // Retention-bound evaluation during the pump: stale correlations are
         // invalidated (and the session armed for an IDR resync) even when this
         // iteration ends up pulling nothing.
-        impl_->session.expire_stale_correlations(DecodeSessionState::Clock::now());
+        if (auto status = impl_->check_pump(impl_->now()); !status) {
+            return core::Result<std::size_t>{status.error()};
+        }
         const std::uint64_t timeout = first_pull ? first_timeout : 0ULL;
         first_pull = false;
         GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(impl_->appsink), timeout);
-        const auto pull_returned = DecodeSessionState::Clock::now();
+        const auto pull_returned = impl_->now();
+        // A blocking pull can cross retention even when it returns no sample.
+        // Release any late sample before surfacing the recoverable loss notice.
+        if (auto status = impl_->check_pump(pull_returned); !status) {
+            if (sample != nullptr) {
+                ++impl_->report.frames_unmatched;
+                gst_sample_unref(sample);
+            }
+            // A decoder error that arrived during the blocking pull is
+            // terminal and outranks the recoverable loss notice; the loss
+            // stays visible in the cumulative counters.
+            if (auto failed = impl_->bus_error(); !failed.has_value()) {
+                return core::Result<std::size_t>{failed.error()};
+            }
+            return core::Result<std::size_t>{status.error()};
+        }
         if (sample == nullptr) {
             // The pull may have raced the error message; re-check before returning.
             if (auto failed = impl_->bus_error(); !failed.has_value()) {
                 return core::Result<std::size_t>{failed.error()};
             }
             if (gst_app_sink_is_eos(GST_APP_SINK(impl_->appsink))) {
-                // EOS: undelivered correlations can never be matched now.
-                impl_->session.clear_correlations();
+                // Intentional: accepted AUs stranded by a clean EOS are lost
+                // and must fail this pump once rather than look successful.
+                // Entries already expired were counted as expiry above.
+                impl_->session.finish_correlations();
+                if (auto status = impl_->check_pump(pull_returned); !status) {
+                    return core::Result<std::size_t>{status.error()};
+                }
             }
             break;
         }
-        // The first pull may have blocked up to `wait`: re-evaluate the
-        // retention bound BEFORE correlating this sample, so a long pump(wait)
-        // never delivers expired metadata. Expired/invalidated/late samples
-        // find no mapping and are released without a callback.
-        impl_->session.expire_stale_correlations(DecodeSessionState::Clock::now());
-
         GstCaps* caps = gst_sample_get_caps(sample);
         GstBuffer* buffer = gst_sample_get_buffer(sample);
         GstVideoInfo info;
         GstVideoFrame video_frame;
-        const auto map_copy_started = DecodeSessionState::Clock::now();
+        const auto map_copy_started = impl_->now();
         const bool mapped = caps != nullptr && buffer != nullptr
             && gst_video_info_from_caps(&info, caps)
             && GST_VIDEO_INFO_FORMAT(&info) == GST_VIDEO_FORMAT_I420
@@ -629,7 +694,7 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         // Late pre-recovery outputs find no mapping: counted unmatched,
         // released, and never handed to the callback (frames keep their real
         // metadata; nothing is relabeled).
-        const auto completed = DecodeSessionState::Clock::now();
+        const auto completed = impl_->now();
         const auto meta = impl_->session.take_correlation(pts);
         const auto arrival = impl_->arrivals.take(pts, meta ? meta->submitted_at : pull_returned,
                                                 pull_returned);
@@ -681,7 +746,11 @@ bool DecodeHelper::closed() const noexcept {
 
 const DecodeReport& DecodeHelper::report() const noexcept {
     static const DecodeReport empty{};
-    return impl_ ? impl_->report : empty;
+    if (!impl_) {
+        return empty;
+    }
+    impl_->refresh_loss_report();
+    return impl_->report;
 }
 
 } // namespace aa::consumer

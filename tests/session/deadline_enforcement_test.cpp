@@ -10,6 +10,7 @@
 #include <aa/session/Lifecycle.hpp>
 
 #include <functional>
+#include <limits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -123,6 +124,21 @@ struct DeadlineCase final {
          [](test::Harness& h) { return h.lc.apply(ss::Event::cleanup_finished); },
          ErrorCode::timeout, ss::State::failed, ss::State::disconnected},
     };
+}
+TEST(DeadlineEnforcement, LargeTimestampNearInt64MaxDoesNotOverflowOrSpuriouslyExpire) {
+    // L4 regression: fixture or monotonic timestamp near INT64_MAX must not cause
+    // signed integer overflow in arm_deadline or spuriously trigger deadline expiry.
+    ss::LifecycleConfig config{{}, ss::LinkKind::wired};
+    test::Harness h(config);
+    ASSERT_TRUE(h.drive_to(ss::State::active));
+    const auto near_max = core::Nanoseconds{std::numeric_limits<std::int64_t>::max() - 1000};
+    h.clock.set(near_max);
+    step(h.lc.apply(ss::Event::link_lost));
+    EXPECT_EQ(h.lc.state(), ss::State::reconnecting);
+    // At the same timestamp (elapsed = 0), reconnect budget (5s) must not have expired.
+    h.lc.tick();
+    EXPECT_EQ(h.lc.state(), ss::State::reconnecting);
+    EXPECT_FALSE(h.lc.failure().has_value());
 }
 
 } // namespace

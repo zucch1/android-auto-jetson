@@ -30,12 +30,12 @@
 #
 # GitHub check-run creation requires GitHub App auth (HTTP 403 for user tokens). This
 # helper therefore posts a commit status — the same task-7 relay mechanism recorded in
-# delivery-arm64-relay.json. Ruleset 24193601 accepts it by context name; arm64 has no
-# integration_id bound to the required check.
+# delivery-arm64-relay.json.
 #
-# The public Actions job is named `ci/arm64-cross-fixture` and reports FIXTURE mode only
-# (fixture-not-target). Only this relay posts `ci/arm64-cross-build`, so that required
-# context always means an observed-sysroot result produced here.
+# The public Actions job is named `ci/arm64-cross-fixture` (the required public ARM64
+# cross-build check, fixture-not-target). Only this relay posts `ci/arm64-cross-build`,
+# which is optional target evidence and always means an observed-sysroot result produced
+# here.
 #
 # Usage: tools/ci/arm64-cross-relay.sh [--sandbox auto|podman|bwrap|docker]
 #            [--allow-author LOGIN]... <head-sha> [pr-number]

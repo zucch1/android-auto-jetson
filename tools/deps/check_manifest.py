@@ -51,7 +51,7 @@ SOURCES: Final = (
 PATCH_SHA256: Final = 'd27b1c7099041042ad255c2cd16b7d61588b6b6aaa93b4c7d1b0c0ffb35b7091'
 PATCH_PATH: Final = 'patches/aasdk-googletest.patch'
 TLS_PATCH_PATH: Final = 'patches/aasdk-tls-credentials.patch'
-TLS_PATCH_SHA256: Final = 'b5b3751f405aca3a4d2d90833253f23655bed6316197c8a82b9eda36218695da'
+TLS_PATCH_SHA256: Final = '1c0c02d505d07ccb8b5ce101523a676a6304e83f8cbe2ed25a71b332098448cf'
 PACKAGES: Final = frozenset((
     'protobuf-compiler', 'libprotobuf-dev', 'libprotobuf32t64', 'libboost-dev',
     'libboost-system-dev', 'libboost-log-dev', 'libssl-dev', 'libssl3t64',

@@ -34,6 +34,7 @@ set(FETCHCONTENT_SOURCE_DIR_GOOGLETEST "${AA_DEPENDENCY_STAGE}/googletest" CACHE
 set(AASDK_TEST ON)
 include("${AA_DEPENDENCY_STAGE}/googletest-declaration.cmake")
 enable_testing()
+include(cmake/Hardening.cmake)
 add_test(NAME provenance_check
     COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tools/provenance/check.py"
             --root "${CMAKE_SOURCE_DIR}")
@@ -184,6 +185,9 @@ include(cmake/WirelessRecovery.cmake)
 include(cmake/WiredRecovery.cmake)
 # Task 32 wired performance/soak measurement tooling (host-side fixtures).
 include(cmake/WiredPerf.cmake)
+# All targets created by the project-owned modules above live in this directory;
+# staged GoogleTest/AASDK targets live in their own directories and are excluded.
+aa_harden_project_targets()
 if(NOT CMAKE_CROSSCOMPILING)
     foreach(suite coverage capture thermal_policy)
         add_test(NAME wired_perf_v2_${suite} COMMAND "${Python3_EXECUTABLE}" -B
@@ -202,4 +206,19 @@ if(NOT CMAKE_CROSSCOMPILING)
                 "$<TARGET_FILE:aa-decode-probe>"
                 "${CMAKE_SOURCE_DIR}/tests/fixtures/media/h264_720p30_baseline_90f.h264")
     set_tests_properties(media_decode_probe_suite PROPERTIES TIMEOUT 120)
+endif()
+
+include(cmake/TlsHardening.cmake)
+
+get_property(_aa_hardened_executables GLOBAL PROPERTY AA_HARDENED_EXECUTABLES)
+if(_aa_hardened_executables)
+    list(REMOVE_DUPLICATES _aa_hardened_executables)
+    add_test(NAME build_hardening COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tools/build/hardening.py" ${_aa_hardened_executables})
+    set_tests_properties(build_hardening PROPERTIES TIMEOUT 120)
+endif()
+if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME build_hardening_checker COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/build/hardening.py")
+    set_tests_properties(build_hardening_checker PROPERTIES TIMEOUT 120)
 endif()

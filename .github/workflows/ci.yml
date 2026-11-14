@@ -260,9 +260,11 @@ jobs:
   # ADD a new workflow under .github/workflows/ with a job named ci/provenance-lint. Anything
   # under .github/workflows/ needs owner review; enforcing it needs pull_request_target or a
   # ruleset, not done here. The workflow_dispatch closure (a dispatch on an old PR branch cannot
-  # turn the gate green) additionally relies on the ruleset's strict "require branches to be up
-  # to date" setting: an old PR branch carries the old gate until main is merged into it, and
-  # turning strict off reopens that.
+  # turn the gate green) relied on the ruleset's strict "require branches to be up to date"
+  # setting, which is now OFF: a branch predating base-validators carries the old gate, so a
+  # dispatch on it can produce a green ci/provenance-lint without the trusted validators. The
+  # compensating practice is to merge only branches whose latest CI run used the current workflow
+  # and to check main's runs after each batch of merges.
   base-validators:
     name: ci/base-validators
     runs-on: ubuntu-24.04
@@ -342,10 +344,18 @@ jobs:
           for case in baseline overlay content header extra generated license gpl inventory listing symlink missing mode; do
             python3 -B tests/provenance/scenarios.py "$PWD" "$case"
           done
+      - name: Verify protobuf audit inventory and guard against schema drift
+        run: |
+          set -euo pipefail
+          python3 -B tools/protocol/protobuf_audit.py --check
+          for case in baseline drift-inventory report-drift missing-file tampered-proto unpinned-file listing-tampered repin-comment field-number-changed field-type-changed enum-value-removed new-unmatched-message vanished-difference unparsed-construct finding-dangling-diff uncovered-by-removal duplicate-id missing-field invalid-disposition status-mismatch unexplained-deletion nonlegacy-deletion legacy-altered citation-broken absence-stale crosslink-dangling orphan-finding mapping-dangling triage-missing-diff triage-dangling-diff triage-invalid-disposition triage-missing-metadata sentinel-false-match genuine-rename-still-matches renamed-enums-path-only zero-only-enum-false-match message-path-shape-boundary; do
+            python3 -B tests/protocol/audit_scenarios.py "$PWD" "$case"
+          done
 
-  # Fixture-only job. It must NEVER share the `ci/arm64-cross-build` name: that required
-  # context is posted solely by tools/ci/arm64-cross-relay.sh after an observed-sysroot,
-  # sandboxed build (see docs/CONTRIBUTING.md), so fixture results cannot satisfy it.
+  # Required public ARM64 cross-build check (fixture-only). It must NEVER share the
+  # `ci/arm64-cross-build` name: that optional target-evidence context is posted solely by
+  # tools/ci/arm64-cross-relay.sh after an observed-sysroot, sandboxed build (see
+  # docs/CONTRIBUTING.md), so fixture results cannot claim observed-sysroot acceptance.
   arm64-cross-fixture:
     name: ci/arm64-cross-fixture
     runs-on: ubuntu-24.04
@@ -415,13 +425,17 @@ jobs:
           set -euo pipefail
           cmake --build --preset jetson-aarch64 --target aa_ipc_control aa_ipc_dbus
           python3 -B tests/dbus/assert_dbus_coverage.py --cross build/jetson-aarch64
+      - name: Verify hardening of every project-owned cross executable
+        run: |
+          set -euo pipefail
+          ctest --test-dir build/jetson-aarch64 --no-tests=error --output-on-failure -R '^build_hardening$'
       - name: State fixture-not-target scope in the step summary
         run: |
           set -euo pipefail
           {
             echo '## ci/arm64-cross-fixture (fixture mode)'
             echo
-            echo 'Fixture-sysroot cross build (fixture-not-target). This is NOT target qualification and does not satisfy `ci/arm64-cross-build`: the private observed-sysroot exact-SHA smoke (sysroot jetson-r39.2.1), relayed by tools/ci/arm64-cross-relay.sh, is the acceptance evidence.'
+            echo 'Fixture-sysroot cross build (fixture-not-target). This satisfies the required public `ci/arm64-cross-fixture` check, NOT target qualification (`ci/arm64-cross-build`, optional target evidence posted by tools/ci/arm64-cross-relay.sh after an observed-sysroot exact-SHA smoke against sysroot jetson-r39.2.1).'
             echo
             echo "- head: \`${GITHUB_SHA}\`"
             echo '- env: AA_SYSROOT_REQUIRE_OBSERVED=OFF; fixture provenance is accepted here and always reported fixture-not-target.'
