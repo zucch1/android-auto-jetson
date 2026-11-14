@@ -93,7 +93,8 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
 
 core::Result<void> ControlService::persist_pairing(const Registered& active, core::PairingRequestId request) {
     const bool comparison = open_pairing_ && open_pairing_->request == request && open_pairing_->awaiting_acceptance;
-    const auto compared_peer = comparison ? open_pairing_->peer : std::nullopt;
+    // Captured before pairing_confirmed() consumes the pending snapshot.
+    const auto compared_peer = comparison ? open_pairing_->peer : phones_.pairing_wireless_identity(request);
     auto approved = phones_.pairing_confirmed(request);
     if (!approved && approved.error().code() == ErrorCode::trust_store_not_durable) {
         if (const auto committed = phones_.committed_pairing()) {

@@ -363,4 +363,50 @@ TEST_F(AcknowledgementOrder, StoreWriteFailureAfterAcknowledgementLeadsToTracked
     EXPECT_TRUE(control.request_add_phone(caller));
 }
 
+// Acknowledged-then-failed enrolments leave bond-leg records. They share the bounded retry loop of
+// source-only records: a stalled helper cannot block a control call, and everything retires once
+// the helper recovers.
+TEST_F(ComparisonControl, StalledHelperBondRetirementsAreBoundedPerCallAndAllRetireOnRecovery) {
+    using namespace std::chrono_literals;
+    constexpr int kRecords = 40;
+    auto fake_now = std::chrono::steady_clock::time_point{std::chrono::seconds{1000}};
+    ipc::ControlService budgeted{{1000}, {credentials, events, ids, phones, &bridge, [&] { return fake_now; }}};
+    ASSERT_TRUE(budgeted.register_consumer(caller, name));
+    bridge.bond = Error{ErrorCode::helper_unavailable};
+    bridge.acknowledgement = Error{ErrorCode::timeout};
+    for (int i = 0; i < kRecords; ++i) {
+        char address[18]; std::snprintf(address, sizeof address, "02:00:00:00:10:%02X", i);
+        bridge.prepared = helper::PeerIdentity{address, "02:00:00:00:00:AA"};
+        bridge.challenge = helper::PairingComparison{79, 42, *bridge.prepared};
+        const auto request = budgeted.request_add_phone(caller); ASSERT_TRUE(request);
+        ASSERT_TRUE(budgeted.confirm_phone_pairing(caller, request.value()));
+        ASSERT_TRUE(budgeted.pairing_comparison(caller, request.value()));
+        (void)budgeted.respond_pairing_comparison(caller, request.value(), {79, true});
+    }
+    ASSERT_EQ(budgeted.pending_revocations(), static_cast<std::size_t>(kRecords));
+    // A stalled helper: every attempt burns one second, so one control call makes one attempt.
+    fake_now += 60s;
+    bridge.on_forget = [&] { fake_now += 1s; };
+    int before = bridge.forgets;
+    (void)budgeted.state();
+    EXPECT_EQ(bridge.forgets - before, 1) << "the time budget must stop the pass after the first stalled attempt";
+    // A fast-failing helper: the attempt budget bounds a pass.
+    bridge.on_forget = nullptr;
+    fake_now += 60s;
+    before = bridge.forgets;
+    (void)budgeted.state();
+    EXPECT_EQ(bridge.forgets - before, static_cast<int>(ipc::ControlService::kSourceRetirementAttemptBudget));
+    // Recovery: every record retires; each pass stays within the budget.
+    bridge.bond = {};
+    int rounds = 0;
+    while (budgeted.pending_revocations() != 0 && rounds++ < 3 * kRecords) {
+        fake_now += 60s;
+        before = bridge.forgets;
+        (void)budgeted.state();
+        EXPECT_LE(bridge.forgets - before, static_cast<int>(ipc::ControlService::kSourceRetirementAttemptBudget));
+    }
+    EXPECT_EQ(budgeted.pending_revocations(), 0U);
+    EXPECT_LE(rounds, kRecords / 4 + 3) << "the round-robin cursor must reach every record";
+}
+
 }
