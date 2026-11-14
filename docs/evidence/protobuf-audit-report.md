@@ -63,11 +63,11 @@ Every difference across all classes (including `non-wire`) is individually triag
 
 - **Total differences**: **1015** (triaged: **1015**, untriaged: **0**)
 - **Wire-affecting**: **238** (`class == wire-affecting`)
-- **Used by receiver**: **191** (direct field/enum usage, strict-policy unknown-tag/enum rejection, or active entity)
+- **Used by receiver**: **192** (direct field/enum usage, strict-policy unknown-tag/enum rejection, or active entity)
 - **Wire-affecting AND used by receiver**: **59**
 - **Dispositions**: `follow-up-issue-needed` 203, `needs-phone-evidence` 56, `no-action` 756
 - **Statuses**: `resolved` 756, `confirmed` 10, `deferred` 193, `proposed` 56
-- **Severities**: `high` 26, `medium-high` 33, `medium` 199, `low-medium` 186, `low` 571
+- **Severities**: `high` 26, `medium-high` 33, `medium` 200, `low-medium` 185, `low` 571
 - **Owners**: `child-1-control-sdp` 23, `child-2-av-media-focus` 31, `child-3-display-ui-theming` 26, `child-4-input-nav-sensors` 69, `child-5-wireless-bt-radio` 110, `triage:phase0-closed` 756
 
 > **Severity derivation rule**: Derived deterministically from wire_affecting x used_by_receiver x classification: (1) wire_affecting=True & used_by_receiver=True -> 'high' for field-number-or-type-conflict / field-added-one-side / enum-value-difference, 'medium-high' for enum-value-conflict or others; (2) wire_affecting=True & used_by_receiver=False -> 'medium'; (3) wire_affecting=False & used_by_receiver=True -> 'medium' for field-number-or-type-conflict / optionality-difference / undecided-match, 'low-medium' for field-name-difference / message-missing-one-side / enum-missing-one-side, 'low' for naming-only / metadata-or-syntax; (4) wire_affecting=False & used_by_receiver=False -> 'low-medium' for field-number-or-type-conflict / optionality-difference / undecided-match, 'low' otherwise.
@@ -84,7 +84,7 @@ Every difference across all classes (including `non-wire`) is individually triag
 | `metadata-or-syntax` | 18 | 0 | 1 | 0 |
 | `naming-only` | 210 | 0 | 35 | 0 |
 | `optionality-difference` | 87 | 0 | 13 | 0 |
-| `undecided-match` | 19 | 0 | 0 | 0 |
+| `undecided-match` | 19 | 0 | 1 | 0 |
 
 ## Receiver-usage scanner methodology & known limitations
 
@@ -122,7 +122,7 @@ Derived mechanically from `.proto` paths/packages, receiver C++ sources (`src/pr
 | `sensor` | 176 | 61 | 42 | 5 | 1 | 1 | 13 | 41 | 11 | 1 | 0 | 0 | 60 | 20 | 11 | 163 | 13 | 0 | 1 |
 | `bluetooth` | 17 | 6 | 1 | 2 | 0 | 2 | 3 | 2 | 0 | 0 | 1 | 0 | 7 | 1 | 0 | 10 | 4 | 3 | 0 |
 | `wifi-projection` | 31 | 9 | 5 | 1 | 1 | 0 | 3 | 3 | 6 | 3 | 0 | 0 | 7 | 18 | 4 | 23 | 0 | 8 | 3 |
-| `wireless-bootstrap` | 41 | 0 | 7 | 3 | 7 | 10 | 0 | 0 | 5 | 5 | 1 | 3 | 3 | 16 | 0 | 29 | 3 | 9 | 1 |
+| `wireless-bootstrap` | 41 | 0 | 7 | 3 | 7 | 10 | 0 | 0 | 5 | 5 | 1 | 3 | 3 | 17 | 0 | 29 | 3 | 9 | 1 |
 | `navigation` | 72 | 0 | 16 | 2 | 6 | 3 | 13 | 2 | 23 | 2 | 0 | 5 | 20 | 0 | 0 | 20 | 52 | 0 | 0 |
 | `media-playback` | 21 | 3 | 7 | 0 | 0 | 0 | 2 | 0 | 5 | 4 | 0 | 0 | 2 | 0 | 0 | 14 | 7 | 0 | 10 |
 | `media-browser` | 18 | 6 | 0 | 0 | 0 | 11 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 18 | 0 | 0 | 0 |
@@ -229,7 +229,7 @@ All **59** differences where `wire_affecting == true` AND `used_by_receiver == t
 
 Wireless Android Auto uses two distinct protocol layers on top of or alongside Wired USB/TLS:
 
-1. **BT RFCOMM Wireless Bootstrap (`wireless-bootstrap`)**: Out-of-band pairing/Wi-Fi credential setup via `aap_protobuf.aaw.*` (`src/helper/bluetooth_bootstrap/Bootstrap.proto` & `Bootstrap.cpp`). AASDK defines **7** messages; OAA documents **18** counterpart messages under `oaa/wifi/` (`WifiStartRequest`/`Response`, `WifiVersionRequest`/`Response`, `WifiInfoRequest`/`Response`, `WifiConnectStatus`, `WifiPing*`, `WifiSetupInfo`). Generated diffs: **41** (used by receiver: **16**). **Critical unverified discrepancy**: in `aaw.WifiInfoResponse`, AASDK has tag 2=`password` / tag 3=`bssid` whereas OAA (`apk_static`) has tag 2=`bssid` / tag 3=`passphrase` (`W-f24dea872f3b`, `W-749177e5f357` — same string wire type, semantic swap; unknown, needs phone evidence); tag 4 `WifiSecurityMode` also differs (AASDK dense `0=UNKNOWN_SECURITY_MODE, 1=OPEN, 2=WEP_64, 3=WEP_128, 4=WPA_PERSONAL, 5=WPA2_PERSONAL …` vs OAA `WifiSecurityMode.Enum` bitmask `0=UNKNOWN_SECURITY_MODE, 1=OPEN, 2=WEP_64, 3=WEP_128, 4=WPA_PERSONAL …`, `W-7cb6ace88645`).
+1. **BT RFCOMM Wireless Bootstrap (`wireless-bootstrap`)**: Out-of-band pairing/Wi-Fi credential setup via `aap_protobuf.aaw.*` (`src/helper/bluetooth_bootstrap/Bootstrap.proto` & `Bootstrap.cpp`). AASDK defines **7** messages; OAA documents **18** counterpart messages under `oaa/wifi/` (`WifiStartRequest`/`Response`, `WifiVersionRequest`/`Response`, `WifiInfoRequest`/`Response`, `WifiConnectStatus`, `WifiPing*`, `WifiSetupInfo`). Generated diffs: **41** (used by receiver: **17**). **Critical unverified discrepancy**: in `aaw.WifiInfoResponse`, AASDK has tag 2=`password` / tag 3=`bssid` whereas OAA (`apk_static`) has tag 2=`bssid` / tag 3=`passphrase` (`W-f24dea872f3b`, `W-749177e5f357` — same string wire type, semantic swap; unknown, needs phone evidence); tag 4 `WifiSecurityMode` also differs (AASDK dense `0=UNKNOWN_SECURITY_MODE, 1=OPEN, 2=WEP_64, 3=WEP_128, 4=WPA_PERSONAL, 5=WPA2_PERSONAL …` vs OAA `WifiSecurityMode.Enum` bitmask `0=UNKNOWN_SECURITY_MODE, 1=OPEN, 2=WEP_64, 3=WEP_128, 4=WPA_PERSONAL …`, `W-7cb6ace88645`).
 2. **Wi-Fi Projection GAL Channel (`wifi-projection`)**: In-band GAL service (`0x8001` `WifiCredentialsRequest`, `0x8002` `WifiCredentialsResponse`) exercised in `src/protocol/aasdk_adapter/WifiProjectionAdapter.cpp` and `MediaConfiguration.cpp`. Generated diffs: **31** (used by receiver: **18**). See `D27-WIFI-CRED-STATUS` for `WifiCredentialsResponse` field 5 (`access_point_type` vs `WifiCredentialStatus`) and security-mode encoding differences.
 3. **Wired USB/TLS**: Does not use `wireless-bootstrap`; negotiates GAL control + active service channels directly over USB AoA + TLS. OAA `WifiChannelType.Enum`: `0=CHANNEL_TYPE_UNKNOWN, 1=CHANNEL_TYPE_5GHZ_ONLY, 2=CHANNEL_TYPE_24GHZ_ONLY, 3=CHANNEL_TYPE_DUAL_BAND`.
 
