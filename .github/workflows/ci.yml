@@ -6,12 +6,12 @@ name: CI
 on:
   pull_request:
     branches: [main, 'aa/**']
-    # No `edited`: it cancels and restarts the whole run (including the 600 s ipc bench when it
-    # applies) on every title/body edit, and the validators always come from `main` now, so a
-    # retarget no longer changes what they check. After retargeting a PR, close and reopen it or
-    # push a commit to rerun CI. Do not "fix" this with job-level `if:` skips: a skipped
-    # required job counts as passing.
-    types: [opened, synchronize, reopened]
+    # Include `edited` so retargeting a PR triggers a fresh run against the new base/merge
+    # result rather than retaining stale green required checks from the previous base (strict
+    # up-to-date is off). Title/body edits also emit `edited` and rerun CI; `concurrency`
+    # below cancels any superseded in-progress run. Never filter `edited` with job-level `if:`
+    # skips on required jobs: a skipped required job counts as passing.
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
   # Manual full run (including ipc-bench-happy-600) on any branch.
@@ -20,8 +20,8 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same PR cancels the superseded PR run. Runs on main
-# pushes and dispatches each get a unique group and are never cancelled.
+# A newer PR event (push, reopen, edit/retarget) cancels the superseded PR run. Runs on
+# main pushes and dispatches each get a unique group and are never cancelled.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

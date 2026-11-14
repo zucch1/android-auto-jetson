@@ -41,17 +41,20 @@ def main() -> int:
     doc = yaml.safe_load(WORKFLOW.read_text(encoding='utf-8'))
     jobs = doc['jobs']
 
-    trusted = jobs.get('base-validators')
-    check(trusted is not None, 'ci.yml has no separate `base-validators` job for the trusted validators')
-    check('needs' not in trusted, 'the trusted job must not depend on a job that runs PR code first')
-    check('if' not in trusted, 'the trusted job must run on EVERY event (pull_request, push, workflow_dispatch): '
-          'a skipped base-validators job is the workflow_dispatch bypass')
+    for job_id in ('host-build-test', 'base-validators', 'arm64-cross-fixture'):
+        job = jobs.get(job_id)
+        check(job is not None, f'ci.yml is missing required/gating job {job_id!r}')
+        check('needs' not in job,
+              f'job {job_id!r} must not depend on a job that runs PR code or could skip it')
+        check('if' not in job,
+              f'job {job_id!r} must not have a job-level `if:` (a skipped required job counts as passing)')
+    trusted = jobs['base-validators']
     triggers = doc.get('on', doc.get(True))
     check({'pull_request', 'push', 'workflow_dispatch'} <= set(triggers), 'unexpected trigger set', str(triggers))
     pr_types = set(triggers['pull_request'].get('types', []))
-    check(pr_types == {'opened', 'synchronize', 'reopened'},
-          'pull_request types must be exactly opened/synchronize/reopened: `edited` restarts full CI on every '
-          'title/body edit (retarget: close+reopen or push), and no job-level `if:` skip may replace it')
+    check(pr_types == {'opened', 'synchronize', 'reopened', 'edited'},
+          'pull_request types must include `edited` (opened/synchronize/reopened/edited) so retargeting '
+          'reruns CI instead of reusing stale green required checks, without job-level `if:` skips')
     steps = trusted['steps']
     runs = [s for s in steps if 'run' in s]
     uses = [s for s in steps if 'uses' in s]
@@ -75,8 +78,9 @@ def main() -> int:
     gate = jobs['provenance-lint']
     check(gate.get('needs') == 'base-validators' or 'base-validators' in gate.get('needs', []),
           'ci/provenance-lint must depend on the trusted job')
-    check('!cancelled()' in str(gate.get('if', '')),
-          'ci/provenance-lint must always run and decide explicitly (a skipped dependency would count as passing)')
+    gate_if = str(gate.get('if', '')).strip()
+    check(gate_if in ('!cancelled()', '${{ !cancelled() }}'),
+          'ci/provenance-lint `if:` must be exactly `!cancelled()` so it always runs and never skips on edited/retarget')
     first = gate['steps'][0]
     check('needs.base-validators.result' in str(first.get('env', {})) and 'run' in first,
           'the first step of ci/provenance-lint must check the trusted job result before any PR code runs')
