@@ -362,6 +362,34 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          # Fetch both parents of the synthetic PR merge commit for HEAD^1 / HEAD^2 verification.
+          fetch-depth: 2
+      - name: Verify PR merge checkout parents match event base and head
+        if: github.event_name == 'pull_request'
+        env:
+          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse HEAD)"
+          actual_p1="$(git rev-parse --verify --quiet 'HEAD^1' || true)"
+          actual_p2="$(git rev-parse --verify --quiet 'HEAD^2' || true)"
+          actual_p3="$(git rev-parse --verify --quiet 'HEAD^3' || true)"
+          if [ -z "${EXPECTED_BASE_SHA:-}" ] || [ -z "${EXPECTED_HEAD_SHA:-}" ] \
+              || [ -z "$actual_p1" ] || [ -z "$actual_p2" ] || [ -n "$actual_p3" ] \
+              || [ "$actual_p1" != "$EXPECTED_BASE_SHA" ] \
+              || [ "$actual_p2" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error::PR merge checkout HEAD ($actual_head) does not match event base/head parents" >&2
+            echo "expected base (HEAD^1): ${EXPECTED_BASE_SHA:-<unset>}" >&2
+            echo "actual   base (HEAD^1): ${actual_p1:-<missing>}" >&2
+            echo "expected head (HEAD^2): ${EXPECTED_HEAD_SHA:-<unset>}" >&2
+            echo "actual   head (HEAD^2): ${actual_p2:-<missing>}" >&2
+            if [ -n "$actual_p3" ]; then
+              echo "unexpected parent 3 (HEAD^3): $actual_p3" >&2
+            fi
+            exit 1
+          fi
+          echo "Verified PR merge checkout $actual_head: HEAD^1=$actual_p1 HEAD^2=$actual_p2"
       - name: Verify provenance and dependency identities
         run: |
           set -euo pipefail
