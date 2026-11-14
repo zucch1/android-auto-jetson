@@ -85,7 +85,12 @@ def store_write_failure_after_acknowledgement(build: Path, directory: Path, remo
         if removal_fails:
             command(surface.mock, "fail-remove")
         command(surface.mock, "paired")
+        # Accepted but not yet stored: the peer's services are authorized, and HFP is connected.
         wait(lambda: (directory / "managed-bonds").exists())
+        # The failed write must disconnect the device, even when the removal itself keeps failing.
+        wait(lambda: bool(surface.state()["disconnected"]), 8)
+        assert surface.state()["disconnected"][0].endswith("dev_02_00_00_00_00_01")
+        assert command(surface.mock, "AuthorizeService hfp") == "rejected", "HFP stayed authorized after the failed write"
         if removal_fails:
             # The failed removal is tracked in the receiver's revocation record, not forgotten.
             wait(lambda: command(surface.receiver, "pending-revocations") == "1")

@@ -34,6 +34,7 @@ class MockState(TypedDict):
     profile: list[str]
     default_agent: bool
     removed: list[str]
+    disconnected: list[str]
     helper: str
     register_attempts: dict[str, int]
 

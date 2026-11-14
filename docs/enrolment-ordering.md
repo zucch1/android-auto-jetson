@@ -34,6 +34,14 @@ was not merged when this was written.
 
 No deadline or background callback supplies acceptance.
 
+After the owner's acceptance the helper authorizes the peer's HFP service and the
+Android Auto RFCOMM channel, which is before the trust-store write. Whenever the
+enrolment then fails to complete, the helper disconnects the device (BlueZ
+`Device1.Disconnect`) before it removes the bond, on both retirement paths
+(unaccepted removal and `RevokePeerV1`), so a removal that keeps failing cannot
+leave an unaccepted phone's HFP link connected. The disconnect is best effort and
+is retried with each removal attempt.
+
 During the whole comparison flow the helper's BlueZ agent accepts exactly one
 pairing method: the `RequestConfirmation` whose number the owner was shown.
 `RequestAuthorization` (Just Works, no number), `RequestPinCode`,

@@ -84,6 +84,9 @@ GVariant* BluezBackend::Impl::call(const char* path, const char* interface, cons
     g_clear_error(&error);
     return result;
 }
+void BluezBackend::Impl::disconnect(const Device& device) {
+    if (auto* reply = call(device.path.c_str(), "org.bluez.Device1", "Disconnect", nullptr)) g_variant_unref(reply);
+}
 bool BluezBackend::Impl::current_owner() {
     if (!bus || g_dbus_connection_is_closed(bus)) { reset(); owner.clear(); return false; }
     GError* error = nullptr;

@@ -35,6 +35,7 @@ class MockBluez(ProfileSockets):
         self.fail_inventory = False
         self.owner_during_inventory = False
         self.removed: list[str] = []
+        self.disconnected: list[str] = []
         self.cancel_unpaired = 0
         self.properties = {"Pairable": True, "Discoverable": True}
         self.profile: list[str] = []
@@ -50,7 +51,7 @@ class MockBluez(ProfileSockets):
 <interface name="org.bluez.AgentManager1"><method name="RegisterAgent"><arg type="o" direction="in"/><arg type="s" direction="in"/></method><method name="RequestDefaultAgent"><arg type="o" direction="in"/></method><method name="UnregisterAgent"><arg type="o" direction="in"/></method></interface>
 <interface name="org.freedesktop.DBus.Properties"><method name="Set"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/></method></interface>
 <interface name="org.bluez.Adapter1"><method name="RemoveDevice"><arg type="o" direction="in"/></method></interface>
-<interface name="org.bluez.Device1"><method name="CancelPairing"/></interface>
+<interface name="org.bluez.Device1"><method name="CancelPairing"/><method name="Disconnect"/></interface>
 </node>"""
         info = Gio.DBusNodeInfo.new_for_xml(xml)
         for index, path in enumerate(["/", "/org/bluez", "/org/bluez", ADAPTER, ADAPTER, DEVICE]):
@@ -139,6 +140,8 @@ class MockBluez(ProfileSockets):
                 if uuid in self.profile:
                     self.profile.remove(uuid)
                 self.profile_senders.pop(uuid, None)
+            case "Disconnect":
+                self.disconnected.append(_path)
             case "CancelPairing":
                 # BlueZ answers CancelPairing without an in-flight Pair() with MGMT Unpair Device.
                 if self.paired:
@@ -221,6 +224,7 @@ class MockBluez(ProfileSockets):
             case "state":
                 return json.dumps({"properties": self.properties, "profile": self.profile,
                     "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper,
+                    "disconnected": self.disconnected,
                     "cancel_unpaired": self.cancel_unpaired,
                     "register_attempts": self.register_attempts})
             case "just-works":

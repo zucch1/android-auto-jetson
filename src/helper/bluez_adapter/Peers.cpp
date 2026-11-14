@@ -147,6 +147,7 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     if (!impl_->inventory(devices)) return Error{ErrorCode::helper_unavailable};
     for (const auto& device : devices) {
         if (device.identity != identity) continue;
+        impl_->disconnect(device);
         auto* reply = impl_->call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice", g_variant_new("(o)", device.path.c_str()));
         if (!reply) return Error{ErrorCode::helper_unavailable};
         g_variant_unref(reply);

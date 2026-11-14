@@ -71,6 +71,9 @@ struct BluezBackend::Impl {
     Impl(const std::string&, Now, const std::string&, std::uint32_t);
     ~Impl();
     GVariant* call(const char*, const char*, const char*, GVariant*, const GVariantType* = nullptr);
+    // Best effort: tears the link down (HFP and the AA channel included) before the bond is removed,
+    // so a removal that fails can never leave an unaccepted device connected.
+    void disconnect(const Device&);
     bool current_owner();
     bool ensure();
     bool inventory(std::vector<Device>&);

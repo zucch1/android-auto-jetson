@@ -17,6 +17,7 @@ void BluezBackend::Impl::retire_unaccepted() {
             bool removed = true;
             for (const auto& device : devices) {
                 if (device.identity != peer) continue;
+                disconnect(device);
                 auto* reply = call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
                                    g_variant_new("(o)", device.path.c_str()));
                 if (!reply) { removed = false; break; }
