@@ -141,6 +141,7 @@ if(NOT CMAKE_CROSSCOMPILING)
         -DCMAKE_CROSSCOMPILING=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE
         -P "${CMAKE_SOURCE_DIR}/cmake/SystemHelper.cmake")
     add_executable(aa_helper_security_test tests/helper/security_test.cpp tests/trust/syscall_faults.cpp)
+    target_compile_definitions(aa_helper_security_test PRIVATE AA_HELPER_SOURCE="${CMAKE_SOURCE_DIR}")
     target_link_options(aa_helper_security_test PRIVATE -Wl,--wrap=fsync -Wl,--wrap=renameat)
     target_link_libraries(aa_helper_security_test PRIVATE aa_system_helper GTest::gtest_main)
     set_target_properties(aa_helper_security_test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES)

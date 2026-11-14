@@ -116,10 +116,16 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
 }
 core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     const auto observed = impl_->consume(handle);
-    // Only a bond this helper itself admitted may reconnect: a reconnect never
-    // creates revocation authority for a bond the helper did not create, and it
-    // needs no write, so it keeps working when state persistence is failing.
-    if (!observed || !impl_->exact(*observed, true) || !impl_->managed.contains(observed->device.identity)) return Error{ErrorCode::helper_rejected};
+    // Only a bond this helper itself durably admitted may reconnect: a reconnect
+    // never creates revocation authority for a bond the helper did not create.
+    // Already-admitted bonds need no write or fsync, so they keep working when
+    // persistence later fails; if durability is still unconfirmed, retry the
+    // directory fsync once before refusing.
+    if (!observed || !impl_->exact(*observed, true)) return Error{ErrorCode::helper_rejected};
+    if (!impl_->managed.admitted(observed->device.identity) &&
+        (!impl_->managed.confirm_durable() || !impl_->managed.admitted(observed->device.identity))) {
+        return Error{ErrorCode::helper_rejected};
+    }
     impl_->close_window();
     impl_->allowed = *observed;
     impl_->window = impl_->now() + std::chrono::seconds(60);
@@ -129,7 +135,7 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
 }
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     if (!address_valid(identity.address) || !address_valid(identity.adapter) ||
-        !impl_->managed.contains(identity)) return Error{ErrorCode::helper_rejected};
+        !impl_->managed.revocable(identity)) return Error{ErrorCode::helper_rejected};
     if (!impl_->current_owner()) return Error{ErrorCode::helper_unavailable};
     if ((impl_->allowed && impl_->allowed->device.identity == identity) ||
         (impl_->connected && impl_->connected->device.identity == identity)) impl_->close_window();
