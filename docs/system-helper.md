@@ -118,8 +118,12 @@ liveness checks before and after activating the helper. The helper must verify
 the exact bond through `PairingBondConfirmedV1` (which records nothing); the
 receiver then runs its own checks and marks it provisional with `PairingBondAcknowledgedV1`
 (no write), the shared approval routine writes the trust store, and only a durable write is
-committed with `PairingBondCommittedV1`, which admits the bond; a failed commit retracts the
-approval (docs/enrolment-ordering.md). `PairingOpened`
+committed with `PairingBondCommittedV1`, which admits the bond. The trust store is the single
+bond authority: `ReconcileBondsV1` (at receiver start, on every helper incarnation change and
+after an enrolment ends without a commit) makes the helper's bond files match it, so a failed
+commit keeps a durable approval and reconciliation admits the bond (docs/enrolment-ordering.md).
+A failing reconciliation emits `bond_reconcile_pending` once (retried every second); approved
+identities the helper cannot admit are reported as `bond_reconcile_unadmitted` with their count. `PairingOpened`
 describes admission and follows committed approval, including error 703 (rename
 committed, directory durability uncertain), which emits
 `pairing_approval_not_durable` and keeps helper confirmation consistent with the
@@ -239,10 +243,11 @@ the helper does not expose Introspectable). Methods:
 | PollPeerV1 | empty | `utss` error, handle, address, adapter identity | Exactly one helper-observed public BR/EDR candidate, otherwise reject |
 | BindPeerV1 | `ttt` generation, request source, observed handle | `ut` error, zero | Snapshot binding before confirmation, no radio exposure |
 | ReconnectPeerV1 | `t` observed handle | `ut` error, state | Store-owner exact lookup followed by helper actual-bond check |
-| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only an admitted, revoked or pending-removal exact identity (or, reporting success with nothing to do, one this helper run's cleanup already removed and no longer present); demotes an admitted bond to `revoked-bonds`; re-resolve BlueZ object, never accept a supplied path |
+| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only an admitted, revoked or pending-removal exact identity (or, reporting success with nothing to do, one this helper run's cleanup already removed and no longer present); demotes an admitted bond to `revoked-bonds` and reports success only once that demotion is durable; re-resolve BlueZ object, never accept a supplied path. The fast path of ForgetPhone: reconciliation resolves a bond leg it could not complete |
 | PairingBondConfirmedV1 | `tt` generation, request source | `ut` error, bonded boolean | Verification only: accepted comparison and exact bonded snapshot; records nothing |
 | PairingBondAcknowledgedV1 | `tt` generation, request source | `ut` error, reserved zero | Marks the verified bond provisional after every receiver-side check passed; writes nothing, admits nothing |
-| PairingBondCommittedV1 | `tt` generation, request source | `ut` error, reserved zero | After the receiver's durable trust write: admits the provisional bond (confirmed `managed-bonds` sync, then durable `pending-removals` removal); any failure closes the window and leaves the bond to cleanup |
+| PairingBondCommittedV1 | `tt` generation, request source | `ut` error, reserved zero | After the receiver's durable trust write: admits the provisional bond (confirmed `managed-bonds` sync, then durable `pending-removals` removal); any failure closes the window and parks the bond, unadmitted, for reconciliation |
+| ReconcileBondsV1 | `a(ss)` the receiver's approved wireless identities (at most 256, exact addresses, no duplicates) | `ut` error, unadmitted count (low 32 bits) and open-window flag (bit 32) | Same sender/UID/process authentication; no lease (it precedes any source) and never touches the live enrolment window's bond. Durable and idempotent; success only once every state change is confirmed (rename + directory fsync). Until the first success of a helper run nothing is admitted, no enrolment opens and no cleanup removes a bond |
 | GetPairingComparisonV1 | `tt` generation, request source | `utuss` error, challenge ID, comparison, address, adapter | Authenticated consumer-only retrieval during explicit enrollment |
 | RespondPairingComparisonV1 | `tttu` generation, request source, challenge ID, accept | `ut` error, reserved zero | Explicit human decision after retrieval; one use, same enrollment/peer/deadline |
 
