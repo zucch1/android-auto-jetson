@@ -395,6 +395,15 @@ protected:
         const auto result = client->call({Operation::ensure_access_point, 36}, core::Milliseconds{1000}, cancel.get_token());
         ASSERT_TRUE(result);
     }
+    // Forgets the mock phone's admitted bond at the helper (bond leg only, AP untouched) so the
+    // same identity can be enrolled again from scratch, as after ForgetPhone.
+    void forget_bond() {
+        const RevocationV1 snapshot{core::PhoneId{}, trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
+        RevocationProgress progress; progress.ap = RevocationLeg::complete; progress.bond = RevocationLeg::pending;
+        const auto report = client->forgotten_v1(snapshot, progress);
+        ASSERT_TRUE(report.bond.has_value()); ASSERT_TRUE(*report.bond);
+        ASSERT_EQ(bluez.command("restore"), "ok");
+    }
     bool state(State expected) {
         return eventually([this, expected] { const auto result = client->status(Action::ap_status); return result && result.value() == expected; }, 6500ms);
     }
