@@ -60,7 +60,8 @@ def progress_sample(second: int, av_pairs: int) -> Sample:
 
 
 def run_gap(*, jumps: tuple[tuple[int, int], ...] = ((5, 30),), mode: str = "healthy",
-            duration: int = 10, stop_after: int | None = None, interval: int = 1) -> dict:
+            duration: int = 10, stop_after: int | None = None, interval: int = 1,
+            extra_stamps: tuple[int, ...] = ()) -> dict:
     """Freeze collector sleeps while the receiver logs on its own clock.
 
     ``catchup`` holds the frozen window's lines in a userspace buffer until 0.5 s
@@ -68,6 +69,7 @@ def run_gap(*, jumps: tuple[tuple[int, int], ...] = ((5, 30),), mode: str = "hea
     seconds of that window. ``never`` stops logging at the gap.
     """
     clock = [0]
+    prev_clock = [0]
     logs: dict[str, object] = {}
     jump_index = [0]
     last_second = [0]
@@ -87,16 +89,18 @@ def run_gap(*, jumps: tuple[tuple[int, int], ...] = ((5, 30),), mode: str = "hea
         logs[name].write(json.dumps(event) + "\n")
         logs[name].flush()
 
-    def emit(second: int) -> None:
-        if second < 1 or (stop_after is not None and second > stop_after):
+    def emit_stamp(stamp: int, *, second: int | None = None) -> None:
+        if stamp < NS or (stop_after is not None and stamp > stop_after * NS):
             return
-        if mode == "silence" and gap_start + 1 < second < gap_end:
-            return
-        if mode == "trailing" and gap_end - 7 < second < gap_end + 1:
-            return  # healthy until 31 s, then silent for 8 s past the gap, resumes at 40 s
-        if mode == "trailing_stall" and gap_end - 7 < second < gap_end + 4:
-            return  # healthy until 31 s, silent 12 s (32..42 s), resumes at 43 s before sample at 44 s
-        stamp = second * NS
+        if second is not None:
+            if mode == "silence" and gap_start + 1 < second < gap_end:
+                return
+            if mode == "trailing" and gap_end - 7 < second < gap_end + 1:
+                return  # healthy until 31 s, then silent for 8 s past the gap, resumes at 40 s
+            if mode == "trailing_stall" and gap_end - 7 < second < gap_end + 4:
+                return  # healthy until 31 s, silent 12 s (32..42 s), resumes at 43 s before sample at 44 s
+            if mode == "trailing_early" and (gap_end - 8 < second <= gap_end + 5 or second == gap_end + 12):
+                return  # healthy until 31 s, silent on integer seconds 32..44 and at 51 s
         events = (
             ("receiver", {"event": "active", "startup_ms": 1000}),
             ("receiver", {"event": "video_sent", "units": stamp}),
@@ -106,16 +110,24 @@ def run_gap(*, jumps: tuple[tuple[int, int], ...] = ((5, 30),), mode: str = "hea
             ("display", {"event": "video_presented", "frame": stamp,
                           "scheduled_ns": stamp, "completed_ns": stamp + 1000}),
         )
-        if mode == "catchup" and gap_start < second <= gap_end:
+        if mode == "catchup" and second is not None and gap_start < second <= gap_end:
             backlog.extend(events)
         else:
             for name, event in events:
                 write(name, event)
 
     def advance(target: int) -> None:
+        start_ns = prev_clock[0]
         clock[0] = target
-        for second in range(last_second[0] + 1, target // NS + 1):
-            emit(second)
+        prev_clock[0] = target
+        pending: list[tuple[int, int | None]] = [
+            (second * NS, second) for second in range(last_second[0] + 1, target // NS + 1)
+        ]
+        for stamp in extra_stamps:
+            if start_ns < stamp <= target:
+                pending.append((stamp, None))
+        for stamp, second in sorted(pending, key=lambda item: item[0]):
+            emit_stamp(stamp, second=second)
         last_second[0] = max(last_second[0], target // NS)
         if backlog and target >= catchup_ns:
             for name, event in backlog:
@@ -361,12 +373,21 @@ def gap_trailing_silence() -> None:
     # counter up. No receiver silence exceeded 10 s (8.5, 3.5, 1 s): no stall.
     healthy = after_gap((44, 4), logged_for=lambda _: every(evidence(39.5, 43, 8.5, count=2)))
     assert healthy.failure is None, healthy.failure
-    # ...and later ordinary sampling is judged from the real last event (43 s): with
-    # no further progress the age passes 10 s at 54 s.
-    healthy.observe(progress_sample(53, 4))
-    assert healthy.failure is None, healthy.failure
+    # ...and later ordinary sampling is judged from the collector sample time (44 s)
+    # where continuity was confirmed: with no further progress the age passes 10 s at 55 s.
     healthy.observe(progress_sample(54, 4))
+    assert healthy.failure is None, healthy.failure
+    healthy.observe(progress_sample(55, 4))
     assert healthy.failure.startswith("media_stalled:"), healthy.failure
+    # Two consecutive healthy post-gap samples (event at 39.5 s seen at 44 s, next
+    # sample 7 s later at 51 s with increased counter) must not false-stall.
+    two_step = after_gap((44, 4), logged_for=lambda _: every(evidence(39.5, 39.5, 8.5, count=1)))
+    two_step.observe(progress_sample(51, 5))
+    assert two_step.failure is None, two_step.failure
+    two_step.observe(progress_sample(61, 5))
+    assert two_step.failure is None, two_step.failure
+    two_step.observe(progress_sample(62, 5))
+    assert two_step.failure.startswith("media_stalled:"), two_step.failure
     # (b) A real stall starting in the trailing part and continuing: events end at 31 s.
     nothing = every(evidence(0, 0, 13, count=0))
     assert after_gap((40, 3), logged_for=lambda _: nothing).failure is None  # 9 s: not yet
@@ -413,6 +434,56 @@ def gap_trailing_silence_collect() -> None:
     assert resumed_stall["projection_failure"].startswith("media_stalled:"), resumed_stall
     assert [item["t_ns"] for item in resumed_stall["progress_evidence"]] == [39 * NS, 44 * NS]
     assert report(resumed_stall)["run_status"]["projection_failure"] == resumed_stall["projection_failure"]
+
+
+def gap_reanchor_two_post_gap_samples() -> None:
+    # Reviewer timeline: gap at t=39 (last event at 31 s); event at 39.5 s seen at
+    # t=44 (continuity valid, transition back to collector-time anchoring); events
+    # continue at 45..50 s; sample at t=51 (7 s after t=44) sees counter increased.
+    # Neither live capture nor offline replay may report media_stalled.
+    capture = run_gap(
+        mode="trailing_early",
+        jumps=((5, 34), (44, 7)),
+        duration=46,
+        interval=5,
+        extra_stamps=(39_500_000_000,),
+    )
+    assert [sample["t_ns"] for sample in capture["samples"]] == [
+        5 * NS, 39 * NS, 44 * NS, 51 * NS,
+    ], [sample["t_ns"] for sample in capture["samples"]]
+    assert capture["samples"][3]["av_pairs"] > capture["samples"][2]["av_pairs"]
+    assert capture["projection_failure"] is None, capture
+    assert [item["t_ns"] for item in capture["progress_evidence"]] == [39 * NS, 44 * NS]
+    assert capture["progress_evidence"][0]["logged_progress"]["audio_writes"]["last_event_ns"] == 31 * NS
+    assert capture["progress_evidence"][1]["logged_progress"]["audio_writes"]["last_event_ns"] == 39_500_000_000
+    doc = report(capture)
+    assert doc["run_status"]["projection_failure"] is None, doc["run_status"]
+
+    # True silence > 10 s immediately after the t=44 transition must still stall in both.
+    stall_after_44 = run_gap(
+        mode="trailing_early",
+        jumps=((5, 34), (44, 7)),
+        duration=55,
+        stop_after=40,
+        interval=5,
+        extra_stamps=(39_500_000_000,),
+    )
+    assert stall_after_44["projection_failure"].startswith("media_stalled:"), stall_after_44
+    assert (report(stall_after_44)["run_status"]["projection_failure"]
+            == stall_after_44["projection_failure"])
+
+    # True silence > 10 s after the second post-gap sample (t=51) must also stall in both.
+    stall_after_51 = run_gap(
+        mode="trailing_early",
+        jumps=((5, 34), (44, 7)),
+        duration=65,
+        stop_after=50,
+        interval=5,
+        extra_stamps=(39_500_000_000,),
+    )
+    assert stall_after_51["projection_failure"].startswith("media_stalled:"), stall_after_51
+    assert (report(stall_after_51)["run_status"]["projection_failure"]
+            == stall_after_51["projection_failure"])
 
 
 def repeated_short_gaps() -> None:
@@ -474,7 +545,8 @@ def old_capture_replay() -> None:
 
 CASES = {name: globals()[name] for name in (
     "no_gap_late_recovery", "no_gap_matches_main", "gap_decision", "gap_progress",
-    "gap_logged_silence", "gap_trailing_silence", "gap_trailing_silence_collect", "gap_log_catches_up", "gap_log_never_catches_up",
+    "gap_logged_silence", "gap_trailing_silence", "gap_trailing_silence_collect",
+    "gap_reanchor_two_post_gap_samples", "gap_log_catches_up", "gap_log_never_catches_up",
     "stall_after_gap", "repeated_short_gaps", "repeated_long_gaps", "old_capture_replay")}
 
 

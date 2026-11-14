@@ -288,10 +288,13 @@ class ProjectionProgress:
                 if (key in self.event_anchored and logged_progress is not None
                         and value > self.previous[key]
                         and self._continuous(key, value, stamp, logged_progress)):
-                    # First progress after a gap judged from the log: advanced_ns is the
-                    # last real event, so the age to this sample overstates the silence.
-                    # The log shows none over the limit from that event onward.
-                    self.advanced_ns[key] = logged_progress[key]["last_event_ns"]
+                    # Rule: when leaving event anchoring, re-anchor advanced_ns[key] to
+                    # this collector sample time (stamp), never to an older receiver-event
+                    # last_event_ns. Receiver-clock continuity confirmed no silence over
+                    # _MEDIA_STALL_SECONDS from the old event anchor through stamp and the
+                    # counter advanced, so subsequent collector-time age checks must measure
+                    # from stamp rather than comparing collector time against event time.
+                    self.advanced_ns[key] = stamp
                     self.event_anchored.discard(key)
                     continue
                 # Check age before accepting a resumed stream: a late recovery cannot heal a freeze.
