@@ -151,7 +151,7 @@ Channel-level metadata below is aggregated strictly from per-entity `annotations
 | `wifi-projection` | 6 / 15 | 0x8001, 0x8002 | - | AA 16.1, AA 16.2 | bronze, retracted, silver, unverified | `Bootstrap.cpp`, `MediaConfiguration.cpp`, `WifiProjectionAdapter.cpp` |
 | `wireless-bootstrap` | 9 / 23 | 0, 1, 10, 2, 3, 4 … | - | AA 16.1, AA 17.3 | bronze, silver, unverified | `Bootstrap.cpp` |
 | `navigation` | 28 / 51 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006 … | HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.3, PDK 1.6 | silver, unverified | - |
-| `media-playback` | 5 / 13 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x800C … | HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.3 | gold, silver, unverified | - |
+| `media-playback` | 5 / 13 | 0x8001, 0x8002, 0x8003, 0x800C | HU->Phone, Phone->HU | AA 16.1, AA 16.2, AA 17.3 | gold, silver, unverified | - |
 | `media-browser` | 12 / 13 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006 | - | AA 16.1, AA 16.2 | unverified | - |
 | `phone-status` | 6 / 7 | 0x8001, 0x8002 | Phone->HU | AA 16.1, AA 16.2 | gold | - |
 | `radio` | 47 / 74 | 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006 … | HU->Phone, Phone->HU | AA 16.1, AA 16.2 | silver, unverified | `ServiceAdapter.cpp` |
@@ -268,11 +268,11 @@ OAA explicitly marks **60** schema entities `confidence: retracted` in its `.pro
 | message | `control` | `data.ConnectionSecurityConfig` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.ConnectionTransportConfig` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aajt (16.1) → aaiz (16.2)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.ConnectionTuningConfig` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aajf (16.1) → aail (16.2)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `wifi-projection` | `data.GroupOwnerInfo` | `wifi/WifiDirectConfigData.proto` | RETRACTED: was/wtf/xla are RadioSongMetadata, not Wi-Fi Direct connection; confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `wifi-projection` | `data.GroupOwnerInfo` | `wifi/WifiDirectConfigData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.HandwritingInputModelConfig` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.InputModelDescriptor` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.InputModelEntry` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `control` | `data.PhoneCapabilities` | `control/PhoneCapabilitiesMessage.proto` | RETRACTED: aafx/aayu/abup are Google Surveys client-context protos, not the; confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `control` | `data.PhoneCapabilities` | `control/PhoneCapabilitiesMessage.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; 16.2: aafn  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.PingConfigEntry` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; 16.2: long (was uint32)  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.PingConfigPair` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.TransportCapabilities` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
@@ -290,17 +290,17 @@ OAA explicitly marks **60** schema entities `confidence: retracted` in its `.pro
 | message | `control` | `data.TuningParamsC` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; APK: aaik  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `control` | `data.TuningParamsD` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | message | `wifi-projection` | `data.WiFiProjectionChannel` | `wifi/WifiProjectionChannelData.proto` | RETRACTED — duplicate of WifiChannelData.proto (WifiChannel); confidence: retracted [apk_static, deep_trace] |
-| message | `wifi-projection` | `data.WifiDirectConfig` | `wifi/WifiDirectConfigData.proto` | RETRACTED: was/wtf/xla are RadioSongMetadata, not Wi-Fi Direct connection; confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| message | `media-playback` | `messages.MediaPlaybackCommand` | `media/MediaPlaybackCommandMessage.proto` | RETRACTED — The class vuy is NOT a media playback command.; RETRACTED — this message does not exist in the AA protocol. |
+| message | `wifi-projection` | `data.WifiDirectConfig` | `wifi/WifiDirectConfigData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version]; WiFi Direct device name  // confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| message | `media-playback` | `messages.MediaPlaybackCommand` | `media/MediaPlaybackCommandMessage.proto` | RETRACTED — this message does not exist in the AA protocol. |
 | message | `sensor` | `messages.SensorStartRequestMessage` | `sensor/SensorStartRequestMessage.proto` | RETRACTED — Duplicate of SensorRequestMessage.proto.; RETRACTED: Use SensorRequestMessage (SensorRequest) instead |
 | message | `av-video` | `messages.VideoFocusNotification` | `video/VideoFocusNotificationMessage.proto` | RETRACTED — VideoFocusNotification does not exist.; RETRACTED — see IntegratedOverlayStartNotification.proto |
 | enum | `control` | `data.CapConnTuningType` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | enum | `control` | `data.CapabilityEnum` | `control/CapabilityData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | enum | `control` | `data.ConnectionSecurityMode` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | enum | `control` | `data.InputModelEnum` | `control/InputModelData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| enum | `control` | `data.PhoneIdentifierType` | `control/PhoneCapabilitiesMessage.proto` | RETRACTED: aafx/aayu/abup are Google Surveys client-context protos, not the; confidence: retracted [apk_deep_trace, apk_static, cross_version] |
+| enum | `control` | `data.PhoneIdentifierType` | `control/PhoneCapabilitiesMessage.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
 | enum | `control` | `data.TuningEntryType` | `control/ConnectionConfigurationData.proto` | confidence: retracted [apk_deep_trace, apk_static, cross_version] |
-| enum | `media-playback` | `messages.PlaybackCommandType` | `media/MediaPlaybackCommandMessage.proto` | RETRACTED — The class vuy is NOT a media playback command.; RETRACTED — misidentified enum. Actual class vuy is ActionTakenNotification |
+| enum | `media-playback` | `messages.PlaybackCommandType` | `media/MediaPlaybackCommandMessage.proto` | RETRACTED — misidentified enum. Actual class vuy is ActionTakenNotification |
 
 ## Findings
 

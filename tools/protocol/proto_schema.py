@@ -781,6 +781,21 @@ def build_schema_set(
                 comments_by_file[ent["file"]], ent["line"],
             )
 
+    header_ann_by_file: dict[str, dict[str, Any]] = {}
+    for fpath, p in parsed.items():
+        first_preamble = p["first_preamble_line"]
+        if first_preamble is None:
+            continue
+        comment_lines = comments_by_file[fpath]["comment_lines"]
+        hdr_entries = [
+            (ln, "file_header", s)
+            for ln in range(1, first_preamble)
+            for s in comment_lines.get(ln, [])
+            if s
+        ]
+        prov_path = (file_paths or {}).get(fpath, fpath)
+        header_ann_by_file[fpath] = _parse_comment_entries(hdr_entries, prov_path)
+
     for kind, col in (("message", msgs), ("enum", enums)):
         for fqn, ent in col.items():
             fpath = ent["file"]
@@ -823,8 +838,11 @@ def build_schema_set(
                 if ln not in excluded:
                     add_line(ln, "entity_body")
 
-            # 3. File-header comments (strictly before first preamble token) when the file
-            #    defines at most two top-level entities and this entity is top-level or wrapper.Enum
+            # 3. File-header comments (strictly before first preamble token) apply ONLY when
+            #    there is an unambiguous single primary top-level declaration (top_level_count == 1),
+            #    which covers: (a) a sole top-level message, (b) a sole top-level enum, or
+            #    (c) OAA's wrapper idiom `message Foo { enum Enum { ... } }` (empty top-level
+            #    message with no fields, no nested messages, and one nested enum).
             is_top_level = "." not in ent["rel"]
             is_wrapper_enum = False
             if kind == "enum" and "." in ent["rel"]:
@@ -834,13 +852,24 @@ def build_schema_set(
                         and not pm["fields"] and not pm["nested_messages"]
                         and len(pm["nested_enums"]) == 1):
                     is_wrapper_enum = True
-            if first_preamble is not None and top_level_count <= 2 and (is_top_level or is_wrapper_enum):
+            if first_preamble is not None and top_level_count == 1 and (is_top_level or is_wrapper_enum):
                 for ln in range(1, first_preamble):
                     add_line(ln, "file_header")
 
             entries.sort(key=lambda item: (item[0], item[1], item[2]))
             prov_path = (file_paths or {}).get(fpath, fpath)
-            ent["annotations"] = _parse_comment_entries(entries, prov_path)
+            ann = _parse_comment_entries(entries, prov_path)
+            if first_preamble is not None and top_level_count > 1 and (is_top_level or is_wrapper_enum):
+                hdr_ann = header_ann_by_file.get(fpath, {})
+                for attr in ("wire_msg_ids", "directions", "version_gates", "confidence"):
+                    if (ann[attr]["status"] == "unknown"
+                            and isinstance(hdr_ann.get(attr), dict)
+                            and hdr_ann[attr].get("status") == "known"):
+                        ann[attr]["reason"] = (
+                            f"file-header {attr} withheld: {top_level_count} top-level declarations "
+                            f"in {prov_path} without a single primary or wrapper/enum relationship"
+                        )
+            ent["annotations"] = ann
 
     file_info = {
         path: {

@@ -59,13 +59,8 @@
     "oaa_line": 22,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
-    "wire_msg_ids": [
-     "7",
-     "8"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "wireless-bootstrap",
    "class": "unmatched",
@@ -680,12 +675,8 @@
     "oaa_line": 44,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.2"
-    ],
-    "wire_msg_ids": [
-     "0x8002"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "media-playback",
    "class": "unmatched",
@@ -1368,9 +1359,7 @@
    "annotations": {
     "aasdk_file": "",
     "aasdk_line": null,
-    "directions": [
-     "HU->Phone"
-    ],
+    "directions": [],
     "oaa_confidence": [
      "bronze"
     ],
@@ -1378,9 +1367,7 @@
     "oaa_line": 24,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 17.3"
-    ],
+    "version_gates": [],
     "wire_msg_ids": []
    },
    "channel": "av-audio",
@@ -1625,11 +1612,8 @@
     "oaa_file": "control/PhoneCapabilitiesMessage.proto",
     "oaa_line": 29,
     "oaa_retracted": true,
-    "oaa_retraction_note": "RETRACTED: aafx/aayu/abup are Google Surveys client-context protos, not the; confidence: retracted [apk_deep_trace, apk_static, cross_version]",
-    "version_gates": [
-     "AA 16.1",
-     "AA 16.2"
-    ],
+    "oaa_retraction_note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]",
+    "version_gates": [],
     "wire_msg_ids": []
    },
    "channel": "control",
@@ -1745,9 +1729,7 @@
     "oaa_line": 27,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
+    "version_gates": [],
     "wire_msg_ids": []
    },
    "channel": "navigation",
@@ -1798,27 +1780,17 @@
    "annotations": {
     "aasdk_file": "",
     "aasdk_line": null,
-    "directions": [
-     "HU->Phone",
-     "Phone->HU"
-    ],
+    "directions": [],
     "oaa_confidence": [
      "unverified"
     ],
     "oaa_file": "media/MediaPlaybackCommandMessage.proto",
     "oaa_line": 46,
     "oaa_retracted": true,
-    "oaa_retraction_note": "RETRACTED \u2014 The class vuy is NOT a media playback command.; RETRACTED \u2014 misidentified enum. Actual class vuy is ActionTakenNotification",
-    "version_gates": [
-     "AA 16.1",
-     "AA 16.2"
-    ],
+    "oaa_retraction_note": "RETRACTED \u2014 misidentified enum. Actual class vuy is ActionTakenNotification",
+    "version_gates": [],
     "wire_msg_ids": [
-     "0x8002",
-     "0x8004",
-     "0x8005",
-     "0x800C",
-     "0x800D"
+     "0x800C"
     ]
    },
    "channel": "media-playback",
@@ -3530,10 +3502,8 @@
     "oaa_file": "wifi/WifiDirectConfigData.proto",
     "oaa_line": 19,
     "oaa_retracted": true,
-    "oaa_retraction_note": "RETRACTED: was/wtf/xla are RadioSongMetadata, not Wi-Fi Direct connection; confidence: retracted [apk_deep_trace, apk_static, cross_version]",
-    "version_gates": [
-     "AA 16.1"
-    ],
+    "oaa_retraction_note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]; WiFi Direct device name  // confidence: retracted [apk_deep_trace, apk_static, cross_version]",
+    "version_gates": [],
     "wire_msg_ids": []
    },
    "channel": "wifi-projection",
@@ -4078,10 +4048,8 @@
     "oaa_file": "wifi/WifiDirectConfigData.proto",
     "oaa_line": 32,
     "oaa_retracted": true,
-    "oaa_retraction_note": "RETRACTED: was/wtf/xla are RadioSongMetadata, not Wi-Fi Direct connection; confidence: retracted [apk_deep_trace, apk_static, cross_version]",
-    "version_gates": [
-     "AA 16.1"
-    ],
+    "oaa_retraction_note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]",
+    "version_gates": [],
     "wire_msg_ids": []
    },
    "channel": "wifi-projection",
@@ -7654,13 +7622,8 @@
     "oaa_line": 17,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
-    "wire_msg_ids": [
-     "7",
-     "8"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "wireless-bootstrap",
    "class": "unmatched",
@@ -11738,9 +11701,7 @@
    "annotations": {
     "aasdk_file": "",
     "aasdk_line": null,
-    "directions": [
-     "HU->Phone"
-    ],
+    "directions": [],
     "oaa_confidence": [
      "silver"
     ],
@@ -11748,14 +11709,8 @@
     "oaa_line": 37,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1",
-     "AA 16.2"
-    ],
-    "wire_msg_ids": [
-     "0x8013",
-     "0x8014"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "av-shared",
    "class": "unmatched",
@@ -12308,7 +12263,7 @@
     "oaa_file": "control/PhoneCapabilitiesMessage.proto",
     "oaa_line": 34,
     "oaa_retracted": true,
-    "oaa_retraction_note": "RETRACTED: aafx/aayu/abup are Google Surveys client-context protos, not the; confidence: retracted [apk_deep_trace, apk_static, cross_version]",
+    "oaa_retraction_note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]; 16.2: aafn  // confidence: retracted [apk_deep_trace, apk_static, cross_version]",
     "version_gates": [
      "AA 16.1",
      "AA 16.2"
@@ -13168,28 +13123,16 @@
    "annotations": {
     "aasdk_file": "",
     "aasdk_line": null,
-    "directions": [
-     "HU->Phone",
-     "Phone->HU"
-    ],
+    "directions": [],
     "oaa_confidence": [
      "unverified"
     ],
     "oaa_file": "media/MediaPlaybackCommandMessage.proto",
     "oaa_line": 54,
     "oaa_retracted": true,
-    "oaa_retraction_note": "RETRACTED \u2014 The class vuy is NOT a media playback command.; RETRACTED \u2014 this message does not exist in the AA protocol.",
-    "version_gates": [
-     "AA 16.1",
-     "AA 16.2"
-    ],
-    "wire_msg_ids": [
-     "0x8002",
-     "0x8004",
-     "0x8005",
-     "0x800C",
-     "0x800D"
-    ]
+    "oaa_retraction_note": "RETRACTED \u2014 this message does not exist in the AA protocol.",
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "media-playback",
    "class": "unmatched",
@@ -14054,9 +13997,7 @@
     "oaa_line": 18,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
+    "version_gates": [],
     "wire_msg_ids": []
    },
    "channel": "navigation",
@@ -17310,7 +17251,6 @@
     "oaa_retracted": false,
     "oaa_retraction_note": "",
     "version_gates": [
-     "AA 16.1",
      "AA 16.2"
     ],
     "wire_msg_ids": []
@@ -19869,10 +19809,7 @@
     "oaa_line": 33,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1",
-     "AA 16.2"
-    ],
+    "version_gates": [],
     "wire_msg_ids": []
    },
    "channel": "sensor",
@@ -24859,7 +24796,6 @@
     "oaa_retracted": false,
     "oaa_retraction_note": "",
     "version_gates": [
-     "AA 16.1",
      "AA 16.2"
     ],
     "wire_msg_ids": []
@@ -25713,12 +25649,8 @@
     "oaa_line": 58,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
-    "wire_msg_ids": [
-     "0x8001"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "media-playback",
    "class": "interpretation",
@@ -27753,12 +27685,8 @@
     "oaa_line": 60,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
-    "wire_msg_ids": [
-     "0x8001"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "media-playback",
    "class": "interpretation",
@@ -32927,12 +32855,8 @@
     "oaa_line": 39,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
-    "wire_msg_ids": [
-     "0x8001"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "media-playback",
    "class": "non-wire",
@@ -33065,7 +32989,6 @@
     "oaa_retracted": false,
     "oaa_retraction_note": "",
     "version_gates": [
-     "AA 16.1",
      "AA 16.2"
     ],
     "wire_msg_ids": []
@@ -33393,9 +33316,7 @@
     "oaa_line": 36,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.2"
-    ],
+    "version_gates": [],
     "wire_msg_ids": [
      "13"
     ]
@@ -42835,12 +42756,8 @@
     "oaa_line": 41,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
-    "wire_msg_ids": [
-     "0x8001"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "media-playback",
    "class": "wire-affecting",
@@ -48709,10 +48626,7 @@
     "oaa_line": 32,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1",
-     "AA 16.2"
-    ],
+    "version_gates": [],
     "wire_msg_ids": []
    },
    "channel": "sensor",
@@ -49669,12 +49583,8 @@
     "oaa_line": 38,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
-    "wire_msg_ids": [
-     "0x8001"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "media-playback",
    "class": "non-wire",
@@ -52784,12 +52694,8 @@
     "oaa_line": 56,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
-    "wire_msg_ids": [
-     "0x8001"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "media-playback",
    "class": "interpretation",
@@ -53607,12 +53513,8 @@
     "oaa_line": 40,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
-    "wire_msg_ids": [
-     "0x8001"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "media-playback",
    "class": "non-wire",
@@ -64044,7 +63946,6 @@
     "oaa_retracted": false,
     "oaa_retraction_note": "",
     "version_gates": [
-     "AA 16.1",
      "AA 16.2"
     ],
     "wire_msg_ids": []
@@ -65130,12 +65031,8 @@
     "oaa_line": 37,
     "oaa_retracted": false,
     "oaa_retraction_note": "",
-    "version_gates": [
-     "AA 16.1"
-    ],
-    "wire_msg_ids": [
-     "0x8001"
-    ]
+    "version_gates": [],
+    "wire_msg_ids": []
    },
    "channel": "media-playback",
    "class": "wire-affecting",
@@ -92179,6 +92076,7 @@
        }
       ],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 22 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/InputModelData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -92369,6 +92267,7 @@
        }
       ],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 22 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/InputModelData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -92454,6 +92353,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/AdditionalVideoConfigData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -92513,14 +92413,8 @@
        "values": []
       },
       "retracted": true,
-      "retraction_note": "RETRACTED: aafx/aayu/abup are Google Surveys client-context protos, not the; confidence: retracted [apk_deep_trace, apk_static, cross_version]",
+      "retraction_note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]",
       "retraction_sources": [
-       {
-        "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto",
-        "kind": "proto_comment",
-        "line": 5,
-        "scope": "file_header"
-       },
        {
         "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto",
         "kind": "proto_comment",
@@ -92529,31 +92423,9 @@
        }
       ],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto",
-           "kind": "proto_comment",
-           "line": 11,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto",
-           "kind": "proto_comment",
-           "line": 11,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.2"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
        "status": "unknown",
@@ -92686,6 +92558,7 @@
        }
       ],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 22 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ConnectionConfigurationData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -92848,6 +92721,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/AdditionalVideoConfigData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -92905,6 +92779,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 4 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/VehicleEnergyModelData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -100157,39 +100032,17 @@
       },
       "deprecated_comment": false,
       "directions": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/BufferedMediaSinkMessage.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          }
-         ],
-         "value": "HU->Phone"
-        }
-       ]
+       "reason": "file-header directions withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/BufferedMediaSinkMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "retracted": false,
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/BufferedMediaSinkMessage.proto",
-           "kind": "proto_comment",
-           "line": 6,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 17.3"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/BufferedMediaSinkMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
        "status": "unknown",
@@ -100255,6 +100108,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 17 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarPropertyData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -100322,6 +100176,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 17 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarPropertyData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -100387,6 +100242,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -100394,10 +100250,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -100439,6 +100297,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -100462,6 +100321,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -100508,6 +100368,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/CarLocalMediaPlaybackStatusMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -100542,6 +100403,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/CarLocalMediaPlaybackStatusMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -100604,6 +100466,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/CarLocalMediaPlaybackStatusMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -100627,6 +100490,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/CarLocalMediaPlaybackStatusMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -100690,6 +100554,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 17 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarPropertyData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -100752,6 +100617,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 17 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarPropertyData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -101023,6 +100889,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 17 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarPropertyData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -101189,10 +101056,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 8 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationTurnEventMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 8 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationTurnEventMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -101264,6 +101133,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -101271,10 +101141,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -101328,6 +101200,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -101448,10 +101321,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GoogleDiagnosticsMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GoogleDiagnosticsMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -101493,6 +101368,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -101500,6 +101376,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -101582,10 +101459,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -101651,10 +101530,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -101723,10 +101604,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -101890,10 +101773,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -101962,10 +101847,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -102019,10 +101906,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -102064,6 +101953,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -102071,6 +101961,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -102143,36 +102034,14 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusEventMessage.proto",
-           "kind": "proto_comment",
-           "line": 10,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.2"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusEventMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusEventMessage.proto",
-           "kind": "proto_comment",
-           "line": 6,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8002"
-        }
-       ]
+       "reason": "file-header wire_msg_ids withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusEventMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       }
      },
      "file": "media/MediaPlaybackStatusEventMessage.proto",
@@ -102267,24 +102136,6 @@
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto",
            "kind": "proto_comment",
-           "line": 11,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto",
-           "kind": "proto_comment",
-           "line": 15,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto",
-           "kind": "proto_comment",
-           "line": 16,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto",
-           "kind": "proto_comment",
            "line": 24,
            "scope": "entity_comment"
           }
@@ -102294,20 +102145,9 @@
        ]
       },
       "wire_msg_ids": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          }
-         ],
-         "value": "13"
-        }
-       ]
+       "reason": "file-header wire_msg_ids withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       }
      },
      "file": "navigation/NavigationFocusRequestMessage.proto",
@@ -102432,6 +102272,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/phone/PhoneStatusInputMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -102466,6 +102307,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/phone/PhoneStatusInputMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -102537,41 +102379,13 @@
       },
       "deprecated_comment": false,
       "directions": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 12,
-           "scope": "file_header"
-          }
-         ],
-         "value": "HU->Phone"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 28,
-           "scope": "file_header"
-          }
-         ],
-         "value": "Phone->HU"
-        }
-       ]
+       "reason": "file-header directions withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "retracted": true,
-      "retraction_note": "RETRACTED \u2014 The class vuy is NOT a media playback command.; RETRACTED \u2014 misidentified enum. Actual class vuy is ActionTakenNotification",
+      "retraction_note": "RETRACTED \u2014 misidentified enum. Actual class vuy is ActionTakenNotification",
       "retraction_sources": [
-       {
-        "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-        "kind": "proto_comment",
-        "line": 6,
-        "scope": "file_header"
-       },
        {
         "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
         "kind": "proto_comment",
@@ -102580,31 +102394,9 @@
        }
       ],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 14,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 13,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.2"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
        "status": "known",
@@ -102614,73 +102406,11 @@
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
            "kind": "proto_comment",
-           "line": 8,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 12,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 18,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8002"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 21,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8004"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 21,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8005"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 17,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
            "line": 44,
            "scope": "entity_comment"
           }
          ],
          "value": "0x800C"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 21,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x800D"
         }
        ]
       }
@@ -102734,42 +102464,14 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusMessage.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusMessage.proto",
-           "kind": "proto_comment",
-           "line": 6,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusMessage.proto",
-           "kind": "proto_comment",
-           "line": 22,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8001"
-        }
-       ]
+       "reason": "file-header wire_msg_ids withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       }
      },
      "file": "media/MediaPlaybackStatusMessage.proto",
@@ -102824,6 +102526,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -102858,6 +102561,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -102939,6 +102643,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -102973,6 +102678,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -103019,6 +102725,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -103053,6 +102760,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -103109,6 +102817,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -103116,10 +102825,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -103223,6 +102934,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/UiConfigMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -103230,10 +102942,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/UiConfigMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/UiConfigMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -103280,6 +102994,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 6 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ConnectedDevicesMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -103287,6 +103002,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 6 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ConnectedDevicesMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -103415,6 +103131,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 5 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/VehicleAreaEnums.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -103502,6 +103219,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 5 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/VehicleAreaEnums.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -103612,6 +103330,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 5 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/VehicleAreaEnums.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -103699,6 +103418,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 5 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/VehicleAreaEnums.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -103814,6 +103534,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 5 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/VehicleAreaEnums.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -104051,6 +103772,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -104058,10 +103780,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -104153,6 +103877,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -104160,10 +103885,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -110850,12 +110577,6 @@
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ControlChannelConfigData.proto",
            "kind": "proto_comment",
-           "line": 13,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ControlChannelConfigData.proto",
-           "kind": "proto_comment",
            "line": 29,
            "scope": "entity_comment"
           },
@@ -110870,12 +110591,6 @@
         },
         {
          "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ControlChannelConfigData.proto",
-           "kind": "proto_comment",
-           "line": 13,
-           "scope": "file_header"
-          },
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ControlChannelConfigData.proto",
            "kind": "proto_comment",
@@ -110978,12 +110693,6 @@
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ControlChannelConfigData.proto",
            "kind": "proto_comment",
-           "line": 13,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ControlChannelConfigData.proto",
-           "kind": "proto_comment",
            "line": 19,
            "scope": "entity_comment"
           }
@@ -110992,12 +110701,6 @@
         },
         {
          "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ControlChannelConfigData.proto",
-           "kind": "proto_comment",
-           "line": 13,
-           "scope": "file_header"
-          },
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ControlChannelConfigData.proto",
            "kind": "proto_comment",
@@ -111450,6 +111153,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/AdditionalVideoConfigData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -112354,37 +112058,9 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/GpsSatelliteData.proto",
-           "kind": "proto_comment",
-           "line": 10,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/GpsSatelliteData.proto",
-           "kind": "proto_comment",
-           "line": 10,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/GpsSatelliteData.proto",
-           "kind": "proto_comment",
-           "line": 11,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.2"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/GpsSatelliteData.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
        "status": "unknown",
@@ -112503,29 +112179,6 @@
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/GpsSatelliteData.proto",
            "kind": "proto_comment",
-           "line": 10,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/GpsSatelliteData.proto",
-           "kind": "proto_comment",
-           "line": 10,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/GpsSatelliteData.proto",
-           "kind": "proto_comment",
-           "line": 11,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/GpsSatelliteData.proto",
-           "kind": "proto_comment",
            "line": 18,
            "scope": "entity_comment"
           }
@@ -112637,14 +112290,8 @@
        "values": []
       },
       "retracted": true,
-      "retraction_note": "RETRACTED: was/wtf/xla are RadioSongMetadata, not Wi-Fi Direct connection; confidence: retracted [apk_deep_trace, apk_static, cross_version]",
+      "retraction_note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]",
       "retraction_sources": [
-       {
-        "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiDirectConfigData.proto",
-        "kind": "proto_comment",
-        "line": 5,
-        "scope": "file_header"
-       },
        {
         "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiDirectConfigData.proto",
         "kind": "proto_comment",
@@ -112653,20 +112300,9 @@
        }
       ],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiDirectConfigData.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiDirectConfigData.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
        "status": "unknown",
@@ -114303,20 +113939,9 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationChannelConfigData.proto",
-           "kind": "proto_comment",
-           "line": 6,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationChannelConfigData.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
        "status": "unknown",
@@ -114637,20 +114262,9 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationChannelConfigData.proto",
-           "kind": "proto_comment",
-           "line": 6,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationChannelConfigData.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
        "status": "unknown",
@@ -115306,14 +114920,8 @@
        "values": []
       },
       "retracted": true,
-      "retraction_note": "RETRACTED: aafx/aayu/abup are Google Surveys client-context protos, not the; confidence: retracted [apk_deep_trace, apk_static, cross_version]",
+      "retraction_note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]; 16.2: aafn  // confidence: retracted [apk_deep_trace, apk_static, cross_version]",
       "retraction_sources": [
-       {
-        "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto",
-        "kind": "proto_comment",
-        "line": 5,
-        "scope": "file_header"
-       },
        {
         "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto",
         "kind": "proto_comment",
@@ -115359,12 +114967,6 @@
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto",
            "kind": "proto_comment",
-           "line": 11,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto",
-           "kind": "proto_comment",
            "line": 41,
            "scope": "entity_body"
           }
@@ -115373,12 +114975,6 @@
         },
         {
          "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto",
-           "kind": "proto_comment",
-           "line": 11,
-           "scope": "file_header"
-          },
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/PhoneCapabilitiesMessage.proto",
            "kind": "proto_comment",
@@ -117147,12 +116743,6 @@
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/SensorChannelConfigData.proto",
            "kind": "proto_comment",
-           "line": 6,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/SensorChannelConfigData.proto",
-           "kind": "proto_comment",
            "line": 19,
            "scope": "entity_comment"
           }
@@ -117374,12 +116964,6 @@
        "values": [
         {
          "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/SensorChannelConfigData.proto",
-           "kind": "proto_comment",
-           "line": 6,
-           "scope": "file_header"
-          },
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/SensorChannelConfigData.proto",
            "kind": "proto_comment",
@@ -120299,6 +119883,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/AdditionalVideoConfigData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -120552,6 +120137,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 4 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/sensor/VehicleEnergyModelData.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -121876,14 +121462,8 @@
        "values": []
       },
       "retracted": true,
-      "retraction_note": "RETRACTED: was/wtf/xla are RadioSongMetadata, not Wi-Fi Direct connection; confidence: retracted [apk_deep_trace, apk_static, cross_version]",
+      "retraction_note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]; WiFi Direct device name  // confidence: retracted [apk_deep_trace, apk_static, cross_version]",
       "retraction_sources": [
-       {
-        "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiDirectConfigData.proto",
-        "kind": "proto_comment",
-        "line": 5,
-        "scope": "file_header"
-       },
        {
         "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiDirectConfigData.proto",
         "kind": "proto_comment",
@@ -121928,20 +121508,9 @@
        }
       ],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiDirectConfigData.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiDirectConfigData.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
        "status": "unknown",
@@ -126345,83 +125914,22 @@
       },
       "deprecated_comment": false,
       "directions": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 10,
-           "scope": "file_header"
-          }
-         ],
-         "value": "HU->Phone"
-        }
-       ]
+       "reason": "file-header directions withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "retracted": false,
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 8,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 8,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.2"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 10,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 12,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8013"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 11,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8014"
-        }
-       ]
+       "reason": "file-header wire_msg_ids withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       }
      },
      "extension_ranges": [],
@@ -128655,12 +128163,6 @@
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/BufferedMediaSinkMessage.proto",
            "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/BufferedMediaSinkMessage.proto",
-           "kind": "proto_comment",
            "line": 32,
            "scope": "entity_comment"
           }
@@ -128677,12 +128179,6 @@
        "values": [
         {
          "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/BufferedMediaSinkMessage.proto",
-           "kind": "proto_comment",
-           "line": 6,
-           "scope": "file_header"
-          },
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/BufferedMediaSinkMessage.proto",
            "kind": "proto_comment",
@@ -129087,6 +128583,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -129121,6 +128618,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -129259,6 +128757,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -129556,6 +129055,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 6 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ConnectedDevicesMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -129629,6 +129129,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 6 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ConnectedDevicesMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -129741,6 +129242,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -129775,6 +129277,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -129904,6 +129407,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -129944,6 +129448,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -130028,6 +129533,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -130062,6 +129568,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -130127,6 +129634,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -130707,6 +130215,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/CarLocalMediaPlaybackStatusMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -130741,6 +130250,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/CarLocalMediaPlaybackStatusMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -131073,6 +130583,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -132303,6 +131814,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 6 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ConnectedDevicesMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -132310,6 +131822,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 6 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ConnectedDevicesMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -132570,6 +132083,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -132593,6 +132107,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -132686,6 +132201,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 8 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationTurnEventMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -132776,6 +132292,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -132799,6 +132316,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -132889,6 +132407,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -132912,6 +132431,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -133089,6 +132609,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133172,6 +132693,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133221,6 +132743,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133278,6 +132801,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133333,6 +132857,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133409,6 +132934,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133478,6 +133004,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133548,6 +133075,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133597,6 +133125,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133660,6 +133189,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133735,6 +133265,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 12 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GalVerificationMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -133824,10 +133355,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GoogleDiagnosticsMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GoogleDiagnosticsMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -133893,10 +133426,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GoogleDiagnosticsMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/verification/GoogleDiagnosticsMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -134509,6 +134044,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/UiConfigMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -134516,10 +134052,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/UiConfigMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/UiConfigMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -135449,6 +134987,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -135562,6 +135101,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -135655,6 +135195,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -135761,6 +135302,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -135873,6 +135415,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -135986,6 +135529,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -136091,6 +135635,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -136217,6 +135762,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -136316,6 +135862,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -136417,10 +135964,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -136486,10 +136035,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -136598,10 +136149,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -136775,10 +136328,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -136952,10 +136507,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -137111,10 +136668,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -137231,6 +136790,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -137343,6 +136903,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -137674,10 +137235,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -137828,10 +137391,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -138066,10 +137631,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -138148,6 +137715,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -138227,6 +137795,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -138345,6 +137914,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -138503,10 +138073,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -138611,6 +138183,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -138717,10 +138290,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -138867,10 +138442,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -139064,6 +138641,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -139202,6 +138780,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -139327,6 +138906,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -139446,6 +139026,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -139546,6 +139127,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -139633,10 +139215,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -139734,10 +139318,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -139823,6 +139409,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -139922,6 +139509,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140041,6 +139629,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140141,10 +139730,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -140254,6 +139845,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140373,6 +139965,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 46 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/LegacyRadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140540,6 +140133,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140547,6 +140141,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140634,6 +140229,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140641,6 +140237,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140753,6 +140350,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140760,6 +140358,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140873,6 +140472,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140880,6 +140480,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -140987,41 +140588,13 @@
       },
       "deprecated_comment": false,
       "directions": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 12,
-           "scope": "file_header"
-          }
-         ],
-         "value": "HU->Phone"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 28,
-           "scope": "file_header"
-          }
-         ],
-         "value": "Phone->HU"
-        }
-       ]
+       "reason": "file-header directions withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "retracted": true,
-      "retraction_note": "RETRACTED \u2014 The class vuy is NOT a media playback command.; RETRACTED \u2014 this message does not exist in the AA protocol.",
+      "retraction_note": "RETRACTED \u2014 this message does not exist in the AA protocol.",
       "retraction_sources": [
-       {
-        "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-        "kind": "proto_comment",
-        "line": 6,
-        "scope": "file_header"
-       },
        {
         "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
         "kind": "proto_comment",
@@ -141030,103 +140603,14 @@
        }
       ],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 14,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 13,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.2"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 8,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 12,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 18,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8002"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 21,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8004"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 21,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8005"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 17,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x800C"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto",
-           "kind": "proto_comment",
-           "line": 21,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x800D"
-        }
-       ]
+       "reason": "file-header wire_msg_ids withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackCommandMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       }
      },
      "extension_ranges": [],
@@ -141421,42 +140905,14 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusMessage.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusMessage.proto",
-           "kind": "proto_comment",
-           "line": 6,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusMessage.proto",
-           "kind": "proto_comment",
-           "line": 22,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8001"
-        }
-       ]
+       "reason": "file-header wire_msg_ids withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       }
      },
      "extension_ranges": [],
@@ -141579,36 +141035,14 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusEventMessage.proto",
-           "kind": "proto_comment",
-           "line": 10,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.2"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusEventMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusEventMessage.proto",
-           "kind": "proto_comment",
-           "line": 6,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8002"
-        }
-       ]
+       "reason": "file-header wire_msg_ids withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/media/MediaPlaybackStatusEventMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       }
      },
      "extension_ranges": [],
@@ -141665,6 +141099,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -141672,6 +141107,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -141771,6 +141207,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -141778,6 +141215,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -141885,6 +141323,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -141892,6 +141331,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -141998,6 +141438,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -142005,6 +141446,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -142105,6 +141547,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -142112,6 +141555,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 11 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/mediabrowser/MediaBrowserMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -142926,44 +142370,15 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto",
-           "kind": "proto_comment",
-           "line": 11,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto",
-           "kind": "proto_comment",
-           "line": 15,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto",
-           "kind": "proto_comment",
-           "line": 16,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.2"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
        "status": "known",
        "values": [
         {
          "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          },
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationFocusRequestMessage.proto",
            "kind": "proto_comment",
@@ -143787,10 +143202,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 8 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationTurnEventMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 8 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationTurnEventMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -144237,6 +143654,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 8 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationTurnEventMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -144407,10 +143825,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 8 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationTurnEventMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 8 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationTurnEventMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -144748,10 +144168,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 8 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationTurnEventMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 8 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/NavigationTurnEventMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -144985,6 +144407,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/phone/PhoneStatusInputMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -145019,6 +144442,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/phone/PhoneStatusInputMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -145083,6 +144507,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/phone/PhoneStatusInputMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -145613,6 +145038,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -145711,6 +145137,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -145809,6 +145236,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -145843,6 +145271,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -145967,6 +145396,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -146001,6 +145431,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -146209,6 +145640,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -146307,6 +145739,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -146411,6 +145844,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -146445,6 +145879,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -146516,6 +145951,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -146550,6 +145986,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -146627,6 +146064,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -146751,6 +146189,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -146855,6 +146294,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -146889,6 +146329,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -146960,6 +146401,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -146994,6 +146436,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -147059,6 +146502,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -147176,6 +146620,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -147210,6 +146655,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -147327,6 +146773,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -147425,6 +146872,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -147523,6 +146971,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 20 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/radio/RadioMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -147621,6 +147070,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -147708,6 +147158,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -149973,6 +149424,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -150007,6 +149459,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -150084,6 +149537,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -150226,6 +149680,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 15 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/carcontrol/CarControlMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -150480,20 +149935,9 @@
       },
       "deprecated_comment": false,
       "directions": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 10,
-           "scope": "file_header"
-          }
-         ],
-         "value": "HU->Phone"
-        }
-       ]
+       "reason": "file-header directions withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "retracted": false,
       "retraction_note": "",
@@ -150503,12 +149947,6 @@
        "values": [
         {
          "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 8,
-           "scope": "file_header"
-          },
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
            "kind": "proto_comment",
@@ -150523,12 +149961,6 @@
           {
            "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
            "kind": "proto_comment",
-           "line": 8,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
            "line": 27,
            "scope": "entity_comment"
           }
@@ -150538,37 +149970,9 @@
        ]
       },
       "wire_msg_ids": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 10,
-           "scope": "file_header"
-          },
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 12,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8013"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto",
-           "kind": "proto_comment",
-           "line": 11,
-           "scope": "file_header"
-          }
-         ],
-         "value": "0x8014"
-        }
-       ]
+       "reason": "file-header wire_msg_ids withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/AVChannelMediaStatsMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       }
      },
      "extension_ranges": [],
@@ -150664,6 +150068,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -150687,6 +150092,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -150770,6 +150176,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/UiConfigMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -150777,10 +150184,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/UiConfigMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/av/UiConfigMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -150878,6 +150287,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 4 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UiConfigRequestMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -150918,6 +150328,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 4 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UiConfigRequestMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -150989,6 +150400,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 4 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UiConfigRequestMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -151029,6 +150441,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 4 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UiConfigRequestMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -151094,6 +150507,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 4 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UiConfigRequestMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -151128,6 +150542,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 4 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UiConfigRequestMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -151180,6 +150595,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 4 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UiConfigRequestMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -151203,6 +150619,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 4 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/video/UiConfigRequestMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -151573,6 +150990,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 6 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ConnectedDevicesMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -151654,6 +151072,7 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 6 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/control/ConnectedDevicesMessages.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -151753,6 +151172,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -151776,6 +151196,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -151893,6 +151314,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 7 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/navigation/VehicleEnergyForecastMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -152629,6 +152051,7 @@
       },
       "deprecated_comment": false,
       "directions": {
+       "reason": "file-header directions withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
@@ -152652,6 +152075,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiCredentialsResponseMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -152956,10 +152380,12 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
+       "reason": "file-header version_gates withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiSetupInfoMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiSetupInfoMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -153071,47 +152497,14 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiPingMessage.proto",
-           "kind": "proto_comment",
-           "line": 8,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiPingMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiPingMessage.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          }
-         ],
-         "value": "7"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiPingMessage.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          }
-         ],
-         "value": "8"
-        }
-       ]
+       "reason": "file-header wire_msg_ids withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiPingMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       }
      },
      "extension_ranges": [],
@@ -153169,47 +152562,14 @@
       "retraction_note": "",
       "retraction_sources": [],
       "version_gates": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiPingMessage.proto",
-           "kind": "proto_comment",
-           "line": 8,
-           "scope": "file_header"
-          }
-         ],
-         "value": "AA 16.1"
-        }
-       ]
+       "reason": "file-header version_gates withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiPingMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       },
       "wire_msg_ids": {
-       "status": "known",
-       "values": [
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiPingMessage.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          }
-         ],
-         "value": "7"
-        },
-        {
-         "sources": [
-          {
-           "file": "third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiPingMessage.proto",
-           "kind": "proto_comment",
-           "line": 9,
-           "scope": "file_header"
-          }
-         ],
-         "value": "8"
-        }
-       ]
+       "reason": "file-header wire_msg_ids withheld: 2 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiPingMessage.proto without a single primary or wrapper/enum relationship",
+       "status": "unknown",
+       "values": []
       }
      },
      "extension_ranges": [],
@@ -153301,6 +152661,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiSetupInfoMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -153619,6 +152980,7 @@
        ]
       },
       "wire_msg_ids": {
+       "reason": "file-header wire_msg_ids withheld: 3 top-level declarations in third_party/reference/open-android-auto/61eab61c5f9968154ff1a80faa8c0a427b208479/oaa/wifi/WifiSetupInfoMessage.proto without a single primary or wrapper/enum relationship",
        "status": "unknown",
        "values": []
       }
@@ -161408,7 +160770,7 @@
     "file": "wifi/WifiDirectConfigData.proto",
     "fqn": "oaa.proto.data.GroupOwnerInfo",
     "kind": "message",
-    "note": "RETRACTED: was/wtf/xla are RadioSongMetadata, not Wi-Fi Direct connection; confidence: retracted [apk_deep_trace, apk_static, cross_version]"
+    "note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]"
    },
    {
     "channel": "control",
@@ -161436,7 +160798,7 @@
     "file": "control/PhoneCapabilitiesMessage.proto",
     "fqn": "oaa.proto.data.PhoneCapabilities",
     "kind": "message",
-    "note": "RETRACTED: aafx/aayu/abup are Google Surveys client-context protos, not the; confidence: retracted [apk_deep_trace, apk_static, cross_version]"
+    "note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]; 16.2: aafn  // confidence: retracted [apk_deep_trace, apk_static, cross_version]"
    },
    {
     "channel": "control",
@@ -161562,14 +160924,14 @@
     "file": "wifi/WifiDirectConfigData.proto",
     "fqn": "oaa.proto.data.WifiDirectConfig",
     "kind": "message",
-    "note": "RETRACTED: was/wtf/xla are RadioSongMetadata, not Wi-Fi Direct connection; confidence: retracted [apk_deep_trace, apk_static, cross_version]"
+    "note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]; WiFi Direct device name  // confidence: retracted [apk_deep_trace, apk_static, cross_version]"
    },
    {
     "channel": "media-playback",
     "file": "media/MediaPlaybackCommandMessage.proto",
     "fqn": "oaa.proto.messages.MediaPlaybackCommand",
     "kind": "message",
-    "note": "RETRACTED \u2014 The class vuy is NOT a media playback command.; RETRACTED \u2014 this message does not exist in the AA protocol."
+    "note": "RETRACTED \u2014 this message does not exist in the AA protocol."
    },
    {
     "channel": "sensor",
@@ -161618,7 +160980,7 @@
     "file": "control/PhoneCapabilitiesMessage.proto",
     "fqn": "oaa.proto.data.PhoneIdentifierType",
     "kind": "enum",
-    "note": "RETRACTED: aafx/aayu/abup are Google Surveys client-context protos, not the; confidence: retracted [apk_deep_trace, apk_static, cross_version]"
+    "note": "confidence: retracted [apk_deep_trace, apk_static, cross_version]"
    },
    {
     "channel": "control",
@@ -161632,7 +160994,7 @@
     "file": "media/MediaPlaybackCommandMessage.proto",
     "fqn": "oaa.proto.messages.PlaybackCommandType",
     "kind": "enum",
-    "note": "RETRACTED \u2014 The class vuy is NOT a media playback command.; RETRACTED \u2014 misidentified enum. Actual class vuy is ActionTakenNotification"
+    "note": "RETRACTED \u2014 misidentified enum. Actual class vuy is ActionTakenNotification"
    }
   ],
   "per_channel": [
@@ -161897,7 +161259,6 @@
      "0x8004",
      "0x8010",
      "0x8011",
-     "0x8013",
      "0x8014"
     ]
    },
@@ -162237,10 +161598,7 @@
      "0x8001",
      "0x8002",
      "0x8003",
-     "0x8004",
-     "0x8005",
-     "0x800C",
-     "0x800D"
+     "0x800C"
     ]
    },
    {

@@ -155,7 +155,9 @@ set(AA_PROTOCOL_AUDIT_CASES
     message-path-shape-boundary
     contrasting-entity-annotations
     entity-annotation-mismatch
-    channel-annotation-mismatch)
+    channel-annotation-mismatch
+    two-sibling-header-ambiguity
+)
 foreach(case IN LISTS AA_PROTOCOL_AUDIT_CASES)
     string(REPLACE "-" "_" test_suffix "${case}")
     add_test(NAME protocol_adapter_audit_${test_suffix}

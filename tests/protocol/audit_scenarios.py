@@ -713,6 +713,70 @@ def sc_channel_annotation_mismatch(f: Path) -> str:
     return "CHANNEL_ANNOTATION_MISMATCH"
 
 
+def sc_two_sibling_header_ambiguity(f: Path) -> str:
+    sys.path.insert(0, str(f / TOOL_DIR))
+    import proto_schema as ps  # type: ignore[import-not-found]
+
+    two_siblings = ps.build_schema_set({
+        "TwoSiblings.proto": (
+            "// Wire msg id: 0x8001\n"
+            'syntax = "proto2";\n'
+            "message First {}\n"
+            "message Second {}\n"
+        ),
+    })
+    for name in ("First", "Second"):
+        wids = two_siblings["messages"][name]["annotations"]["wire_msg_ids"]
+        if wids.get("status") != "unknown" or wids.get("values") != [] or not wids.get("reason"):
+            raise SystemExit(
+                f"FAIL: two-sibling top-level message {name} must not inherit header wire ID: {wids}"
+            )
+
+    msg_plus_enum = ps.build_schema_set({
+        "MsgPlusEnum.proto": (
+            "// Wire msg id: 0x8001\n"
+            'syntax = "proto2";\n'
+            "message Primary {}\n"
+            "enum SiblingEnum { ZERO = 0; }\n"
+        ),
+    })
+    for block in (
+        msg_plus_enum["messages"]["Primary"]["annotations"]["wire_msg_ids"],
+        msg_plus_enum["enums"]["SiblingEnum"]["annotations"]["wire_msg_ids"],
+    ):
+        if block.get("status") != "unknown" or block.get("values") != [] or not block.get("reason"):
+            raise SystemExit(f"FAIL: msg+sibling-enum must not inherit header wire ID: {block}")
+
+    wrapper_set = ps.build_schema_set({
+        "WrapperEnum.proto": (
+            "// Wire msg id: 0x8002\n"
+            'syntax = "proto2";\n'
+            "message Wrapper {\n"
+            "  enum Enum {\n"
+            "    ZERO = 0;\n"
+            "  }\n"
+            "}\n"
+        ),
+    })
+    for block in (
+        wrapper_set["messages"]["Wrapper"]["annotations"]["wire_msg_ids"],
+        wrapper_set["enums"]["Wrapper.Enum"]["annotations"]["wire_msg_ids"],
+    ):
+        if block.get("status") != "known" or [v["value"] for v in block["values"]] != ["0x8002"]:
+            raise SystemExit(f"FAIL: OAA Foo/Foo.Enum wrapper idiom lost header wire ID: {block}")
+
+    # End-to-end repin on a real two-sibling OAA file: adding a file-header wire ID
+    # must leave both sibling top-level messages with status='unknown' and a reason.
+    oaa(f, "wifi/WifiPingMessage.proto", lambda t: "// Wire msg id: 0x8099\n" + t)
+    inv = load(f, INVENTORY)
+    oaa_msgs = inv["schema_sets"]["oaa"]["messages"]  # type: ignore[index]
+    for fqn in ("oaa.proto.messages.WifiPingRequest", "oaa.proto.messages.WifiPingResponse"):
+        wids = oaa_msgs[fqn]["annotations"]["wire_msg_ids"]
+        if wids.get("status") != "unknown" or wids.get("values") != [] or not wids.get("reason"):
+            raise SystemExit(f"FAIL: {fqn} inherited ambiguous file-header wire ID: {wids}")
+    return ""
+
+
 SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "baseline": sc_baseline,
     "drift-inventory": sc_drift_inventory,
@@ -754,6 +818,7 @@ SCENARIOS: Final[dict[str, Callable[[Path], str]]] = {
     "contrasting-entity-annotations": sc_contrasting_entity_annotations,
     "entity-annotation-mismatch": sc_entity_annotation_mismatch,
     "channel-annotation-mismatch": sc_channel_annotation_mismatch,
+    "two-sibling-header-ambiguity": sc_two_sibling_header_ambiguity,
 }
 
 
