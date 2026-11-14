@@ -35,6 +35,13 @@ foreach(test IN LISTS host_tests)
        test MATCHES "^(system_helper_bluez_runtime|wireless_e2e_helper_bluez|system_helper_composed_runtime|wireless_e2e_helper_composition)$")
         set_tests_properties("${test}" PROPERTIES RUN_SERIAL TRUE)
     endif()
+    # Target-safety guards watch every ancestor of their /tmp/opencode fixtures
+    # and block on any identity change of /tmp itself (ancestor_setup_race in
+    # tools/target_safety/coverage.py). Any parallel test creating a file in
+    # /tmp changes it, so these must run alone.
+    if(test MATCHES "^target_safety_")
+        set_tests_properties("${test}" PROPERTIES RUN_SERIAL TRUE)
+    endif()
     if(test MATCHES "^wired_perf_" OR test IN_LIST idle_host_tests)
         set_tests_properties("${test}" PROPERTIES RUN_SERIAL TRUE)
     endif()
