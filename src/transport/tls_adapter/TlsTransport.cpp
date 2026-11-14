@@ -148,7 +148,7 @@ core::Result<void> TlsTransport::send(std::span<const std::byte> frame) {
         close();
         return tls_adapter::map_tls_error(error);
     }
-    impl_->io_deadline = impl_->now() + kFrameDeadline;
+    impl_->write_deadline = impl_->now() + kFrameDeadline;
     auto sent = impl_->io.send_frame(frame, token_);
     if (!sent) {
         close();
@@ -166,9 +166,12 @@ core::Result<std::vector<std::byte>> TlsTransport::receive() {
         close();
         return tls_adapter::map_tls_error(error);
     }
-    impl_->frame_started = false;
-    impl_->io_deadline = impl_->idle_budget
-        ? impl_->now() + *impl_->idle_budget : Deadline::max();
+    // Only an empty parser is idle. A prefix retained after returning another
+    // frame keeps the deadline established when that prefix first arrived.
+    if (!impl_->io.has_partial_frame()) {
+        impl_->read_deadline = impl_->idle_budget
+            ? impl_->now() + *impl_->idle_budget : Deadline::max();
+    }
     auto got = impl_->io.receive_frame(token_);
     if (!got) {
         close();

@@ -63,7 +63,13 @@ not accepted, so `gh workflow run ci.yml --ref <pr-branch>` cannot produce a gre
 `ci/provenance-lint` without the trusted validators). `pull_request` runs on `opened`,
 `synchronize`, `reopened`, and `edited` so retargeting a PR (changing its base branch)
 automatically starts a fresh CI run against the updated base/merge result instead of retaining
-stale green required checks from the previous base. `concurrency` cancels any superseded
+stale green required checks from the previous base. Because a fresh `edited` event alone does
+not prove GitHub supplied an up-to-date synthetic PR merge checkout after a retarget,
+`ci/provenance-lint` checks out with `fetch-depth: 2` and runs a `pull_request`-only step
+immediately after checkout (before any in-tree scripts) that fails — printing both expected and
+actual SHAs — unless `HEAD` is a two-parent merge commit whose `HEAD^1` equals
+`github.event.pull_request.base.sha` and `HEAD^2` equals `github.event.pull_request.head.sha`
+(passed via `env:`). `concurrency` cancels any superseded
 in-progress run on the same PR, and required jobs never use job-level `if:` skips (a skipped
 required job counts as passing). Because GitHub also emits `edited` on title or body updates,
 a title or body edit now cancels any in-progress run and reruns CI (including the 600 s

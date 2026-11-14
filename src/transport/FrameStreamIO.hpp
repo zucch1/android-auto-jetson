@@ -35,9 +35,15 @@ public:
     using PollReadFn = std::function<core::Result<std::optional<std::size_t>>(
         std::span<std::byte>, const core::CancellationToken&, core::Deadline::Clock::time_point)>;
 
-    FrameStreamIO(ReadFn read_fn, WriteFn write_fn, PollReadFn poll_read_fn = {})
+    // Called after a feed leaves the beginning of a new incomplete frame.
+    // Completing one frame and buffering the next prefix starts a new budget.
+    using PartialFrameStartedFn = std::function<void()>;
+
+    FrameStreamIO(ReadFn read_fn, WriteFn write_fn, PollReadFn poll_read_fn = {},
+                  PartialFrameStartedFn partial_frame_started = {})
         : read_fn_(std::move(read_fn)), write_fn_(std::move(write_fn)),
-          poll_read_fn_(std::move(poll_read_fn)) {}
+          poll_read_fn_(std::move(poll_read_fn)),
+          partial_frame_started_(std::move(partial_frame_started)) {}
 
     // Validate one complete frame then write all its bytes. A malformed or
     // oversize frame, or a write failure, is a typed error that closes the
@@ -156,6 +162,9 @@ public:
     }
 
     [[nodiscard]] bool closed() const noexcept { return closed_; }
+    // Reads are bounded to 4096 bytes, below the parser's output cap, so its
+    // retained bytes belong to one incomplete frame, never a complete frame.
+    [[nodiscard]] bool has_partial_frame() const noexcept { return parser_.has_buffered_bytes(); }
 
 private:
     [[nodiscard]] std::optional<std::vector<std::byte>> pop_ready() {
@@ -168,10 +177,15 @@ private:
     }
 
     [[nodiscard]] core::Result<void> feed(std::span<const std::byte> bytes) {
+        const bool had_partial_frame = has_partial_frame();
         auto frames = parser_.feed(bytes);
         if (!frames) {
             close();
             return frames.error();
+        }
+        if (has_partial_frame() && (!had_partial_frame || !frames.value().empty()) &&
+            partial_frame_started_) {
+            partial_frame_started_();
         }
         for (auto& frame : frames.value()) {
             ready_.push_back(std::move(frame));
@@ -182,6 +196,7 @@ private:
     ReadFn read_fn_;
     WriteFn write_fn_;
     PollReadFn poll_read_fn_;
+    PartialFrameStartedFn partial_frame_started_;
     FrameStreamParser parser_{};
     std::deque<std::vector<std::byte>> ready_{};
     bool closed_{false};

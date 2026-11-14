@@ -107,6 +107,125 @@ def main() -> int:
                           capture_output=True, text=True, check=False)
     check(done.returncode != 0, 'workflow_dispatch on a PR branch with base-validators skipped must fail the gate')
 
+    # Merge-parent verification in ci/provenance-lint (after trusted gate and checkout, before PR scripts).
+    checkout = gate['steps'][1]
+    check(checkout.get('uses', '').startswith('actions/checkout@')
+          and (checkout.get('with') or {}).get('ref') is None,
+          'step 2 of ci/provenance-lint must check out the PR merge ref without a ref override')
+    fetch_depth = (checkout.get('with') or {}).get('fetch-depth')
+    check(isinstance(fetch_depth, int) and not isinstance(fetch_depth, bool)
+          and (fetch_depth == 0 or fetch_depth >= 2),
+          'ci/provenance-lint checkout must set fetch-depth >= 2 (or 0) so HEAD^1 and HEAD^2 exist')
+
+    verify = gate['steps'][2]
+    verify_if = str(verify.get('if', '')).strip()
+    check(verify_if in ("github.event_name == 'pull_request'", "${{ github.event_name == 'pull_request' }}"),
+          'merge-parent verification step must run only on pull_request events')
+    verify_env = verify.get('env') or {}
+    base_keys = [k for k, v in verify_env.items() if str(v).strip() == '${{ github.event.pull_request.base.sha }}']
+    head_keys = [k for k, v in verify_env.items() if str(v).strip() == '${{ github.event.pull_request.head.sha }}']
+    check(len(base_keys) == 1 and len(head_keys) == 1,
+          'merge-parent verification step must pass github.event.pull_request.base.sha and head.sha through env:')
+    base_env_key, head_env_key = base_keys[0], head_keys[0]
+    verify_script = verify.get('run', '')
+    check(bool(verify_script) and '${{' not in verify_script,
+          'merge-parent verification script must not interpolate ${{ }} directly into the shell body')
+    for needle in ('HEAD^1', 'HEAD^2'):
+        check(needle in verify_script, f'merge-parent verification script is missing {needle!r}', verify_script)
+
+    with tempfile.TemporaryDirectory(prefix='ci-merge-parents-test-') as mt:
+        mp = Path(mt)
+        remote = mp / 'remote'
+        remote.mkdir()
+        rgit = ['git', '-C', str(remote), '-c', 'user.name=t', '-c', 'user.email=t@example.invalid']
+        subprocess.run([*rgit, 'init', '-q', '-b', 'main'], check=True)
+        (remote / 'f.txt').write_text('base1\n', encoding='utf-8')
+        subprocess.run([*rgit, 'add', 'f.txt'], check=True)
+        subprocess.run([*rgit, 'commit', '-q', '-m', 'base1'], check=True)
+        base1 = subprocess.run([*rgit, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+
+        subprocess.run([*rgit, 'checkout', '-q', '-b', 'pr-head'], check=True)
+        (remote / 'pr.txt').write_text('head1\n', encoding='utf-8')
+        subprocess.run([*rgit, 'add', 'pr.txt'], check=True)
+        subprocess.run([*rgit, 'commit', '-q', '-m', 'head1'], check=True)
+        head1 = subprocess.run([*rgit, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+
+        subprocess.run([*rgit, 'checkout', '-q', 'main'], check=True)
+        (remote / 'f.txt').write_text('base2\n', encoding='utf-8')
+        subprocess.run([*rgit, 'add', 'f.txt'], check=True)
+        subprocess.run([*rgit, 'commit', '-q', '-m', 'base2'], check=True)
+        base2 = subprocess.run([*rgit, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+
+        subprocess.run([*rgit, 'checkout', '-q', '--detach', base1], check=True)
+        subprocess.run([*rgit, 'merge', '-q', '--no-ff', '-m', 'pr merge', head1], check=True)
+        merge_ok = subprocess.run([*rgit, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+        subprocess.run([*rgit, 'update-ref', 'refs/pull/1/merge', merge_ok], check=True)
+
+        subprocess.run([*rgit, 'checkout', '-q', '--detach', base1], check=True)
+        subprocess.run([*rgit, 'merge', '-q', '--no-ff', '-m', 'octopus', head1, base2], check=True)
+        merge_octopus = subprocess.run([*rgit, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+        subprocess.run([*rgit, 'update-ref', 'refs/pull/2/merge', merge_octopus], check=True)
+
+        def make_checkout(name: str, ref: str, depth: int) -> Path:
+            cdir = mp / name
+            cdir.mkdir()
+            cgit = ['git', '-C', str(cdir)]
+            subprocess.run([*cgit, 'init', '-q'], check=True)
+            subprocess.run([*cgit, 'remote', 'add', 'origin', f'file://{remote}'], check=True)
+            subprocess.run([*cgit, 'fetch', '-q', '--no-tags', f'--depth={depth}', 'origin', f'+{ref}:{ref}'], check=True)
+            subprocess.run([*cgit, 'checkout', '-q', '--detach', ref], check=True)
+            return cdir
+
+        def run_verify(cdir: Path, exp_base: str, exp_head: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', verify_script],
+                env={'PATH': '/usr/bin:/bin', base_env_key: exp_base, head_env_key: exp_head},
+                cwd=cdir, capture_output=True, text=True, check=False,
+            )
+
+        c_ok = make_checkout('ok-d2', 'refs/pull/1/merge', 2)
+        res = run_verify(c_ok, base1, head1)
+        check(res.returncode == 0, 'matching depth=2 PR merge checkout must pass', res.stdout + res.stderr)
+
+        # Stale base after retarget (expected base2, actual base1)
+        res = run_verify(c_ok, base2, head1)
+        out = res.stdout + res.stderr
+        check(res.returncode != 0 and base2 in out and base1 in out,
+              'stale base SHA must fail and print both expected and actual SHAs', out)
+
+        # Stale head (expected base2, actual head1)
+        res = run_verify(c_ok, base1, base2)
+        out = res.stdout + res.stderr
+        check(res.returncode != 0 and base2 in out and head1 in out,
+              'stale head SHA must fail and print both expected and actual SHAs', out)
+
+        # Swapped parents
+        res = run_verify(c_ok, head1, base1)
+        out = res.stdout + res.stderr
+        check(res.returncode != 0 and head1 in out and base1 in out,
+              'swapped parent SHAs must fail and print expected/actual SHAs', out)
+
+        # Empty expected SHA
+        res = run_verify(c_ok, '', head1)
+        check(res.returncode != 0, 'empty expected SHA must fail', res.stdout + res.stderr)
+
+        # Non-merge commit (only 1 parent)
+        c_nonmerge = make_checkout('nonmerge-d2', 'refs/heads/pr-head', 2)
+        res = run_verify(c_nonmerge, base1, head1)
+        out = res.stdout + res.stderr
+        check(res.returncode != 0 and base1 in out and head1 in out,
+              'non-merge commit must fail and print expected/actual info', out)
+
+        # 3-parent octopus merge
+        c_oct = make_checkout('octopus-d2', 'refs/pull/2/merge', 2)
+        res = run_verify(c_oct, base1, head1)
+        check(res.returncode != 0, '3-parent merge commit must fail', res.stdout + res.stderr)
+
+        # Shallow depth=1 graft (parents unavailable)
+        c_d1 = make_checkout('shallow-d1', 'refs/pull/1/merge', 1)
+        res = run_verify(c_d1, base1, head1)
+        check(res.returncode != 0, 'depth=1 shallow merge checkout without parents must fail', res.stdout + res.stderr)
+
     # Executable check: poison the shell the way a PR step could and run the real script.
     with tempfile.TemporaryDirectory(prefix='ci-trust-test-') as t:
         tmp = Path(t)
