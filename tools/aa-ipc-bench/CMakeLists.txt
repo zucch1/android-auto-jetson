@@ -15,12 +15,13 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
     # intentionally registered without a fast-only label so the unfiltered host-dev CI
     # run keeps it as a visible mandatory gate; CI budget accounts for it explicitly.
     add_test(NAME ipc-bench-happy-600 COMMAND aa-ipc-bench --profile 1280x720@30 --duration 600)
-    set_tests_properties(ipc-bench-happy-600 PROPERTIES TIMEOUT 630 LABELS "ipc;long")
+    set_tests_properties(ipc-bench-happy-600 PROPERTIES RUN_SERIAL TRUE TIMEOUT 630 LABELS "ipc;long")
     add_test(NAME ipc-bench-slow-consumer COMMAND aa-ipc-bench --failure-scenario)
     set_tests_properties(ipc-bench-slow-consumer PROPERTIES TIMEOUT 20 LABELS ipc)
     add_test(NAME ipc-bench-cli COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/ipc/cli.py" "$<TARGET_FILE:aa-ipc-bench>")
-    set_tests_properties(ipc-bench-cli PROPERTIES TIMEOUT 20 LABELS ipc)
+    # Even the short CLI smoke asserts measured throughput and p95 latency.
+    set_tests_properties(ipc-bench-cli PROPERTIES RUN_SERIAL TRUE TIMEOUT 20 LABELS ipc)
 endif()
 foreach(_target IN LISTS _ipc_targets)
     set_target_properties(${_target} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)

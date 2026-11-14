@@ -114,10 +114,23 @@ verify the exact bond through `PairingBondConfirmedV1` (which records nothing); 
 receiver then runs its own checks and records it with `PairingBondAcknowledgedV1`,
 before the shared approval routine writes the trust store. `PairingOpened` describes admission;
 listening for or forging that signal never mints grants. No session D-Bus
-method proxies Issue. A helper error retires the pending request without approval.
-Cancel,
-consumer teardown/owner loss, successful or committed-not-durable forget, and
-control-service shutdown invalidate helper authority. Committed forget invalidates
+method proxies Issue. A helper error never persists approval. Error 703 (rename
+committed, directory durability uncertain) emits `pairing_approval_not_durable` and
+keeps helper confirmation consistent with the store.
+
+If persistence fails before commit or any pairing cancellation/expiry fails
+helper invalidation, cancellation must be acknowledged. A failed cancellation
+emits `phone_revocation_retirement_pending` and retains the source and captured
+identity in the existing revocation progress queue, blocking new pairing for
+that identity until acknowledged `Invalidate` retirement. A bond the helper may
+already manage (acknowledged, then a failed store write) uses the same queue with a
+bond leg. All of these phone-less records retry through one bounded loop: a
+per-invocation budget (4 attempts or 500 ms), a round-robin cursor and exponential
+backoff of 1-30 s measured from the end of each attempt, during owner
+reconciliation (including idle calls); ordinary phone revocations retain their
+existing ForgetPhone retry path. Cancel, consumer teardown/owner loss,
+successful or committed-not-durable forget, and control-service shutdown
+invalidate helper authority. Committed forget invalidates
 only the retired phone's sources locally and remotely, then sends narrow revocation
 requests. `RevokeAP1` rotates/evicts AP access without clearing unrelated grants or
 bound observations: it has no phone-to-source map. Failed remote invalidation also

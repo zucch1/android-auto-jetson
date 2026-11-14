@@ -37,7 +37,7 @@ public:
     core::Result<void> bond_acknowledged(core::ConsumerId, core::PairingRequestId) override;
     core::Result<PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) override;
     core::Result<void> respond_comparison(core::ConsumerId, core::PairingRequestId, ComparisonResponse) override;
-    void cancel(core::ConsumerId, core::PairingRequestId) override;
+    core::Result<void> cancel(core::ConsumerId, core::PairingRequestId) override;
     void teardown(core::ConsumerId) override;
     RevocationAttempt forgotten_v1(const RevocationV1&, const RevocationProgress&) override;
     core::Result<std::optional<PeerIdentity>> prepare(core::ConsumerId, core::PairingRequestId) override;

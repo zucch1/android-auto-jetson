@@ -830,7 +830,7 @@ TEST_F(NmDaemon, FailedShutdownRetainsRulesAndRevocationRetries) {
 TEST_F(NmDaemon, ForgetRotatesButOrdinaryInvalidateDoesNot) {
     start(); acquire(); ASSERT_TRUE(state(State::active));
     const auto before = read_text(directory / "state/ap.credentials");
-    client->cancel(core::ConsumerId{1}, core::PairingRequestId{1});
+    ASSERT_TRUE(client->cancel(core::ConsumerId{1}, core::PairingRequestId{1}));
     ASSERT_TRUE(eventually([this] { return !boundary->table; })); EXPECT_EQ(before, read_text(directory / "state/ap.credentials"));
     acquire(2); ASSERT_TRUE(state(State::active));
     const RevocationV1 snapshot{core::PhoneId{2}, trust::WirelessIdentity{"exact-bond", "adapter"}};
@@ -907,7 +907,7 @@ TEST_F(NmDaemon, JournalReplacementFailureAfterAcceptanceRefusesAckAndCleanupKee
     ASSERT_EQ(bluez.command("paired"), "ok");
     ASSERT_TRUE(eventually([&] { const auto bonded = client->bond_confirmed(consumer, request); return bonded && bonded.value(); }));
     EXPECT_FALSE(client->bond_acknowledged(consumer, request)) << "acknowledged although the journal entry is not durably gone";
-    client->cancel(consumer, request);
+    (void)client->cancel(consumer, request);
     std::this_thread::sleep_for(1500ms);  // several helper ticks of cleanup
     const auto mock = bluez.command("state");
     EXPECT_NE(mock.find("\"removed\": []"), std::string::npos) << "cleanup removed an admitted bond: " << mock;

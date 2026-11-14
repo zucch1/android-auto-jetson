@@ -12,6 +12,8 @@
 
 namespace aa::helper {
 // Captured on the store owner before deletion; never changed during retries.
+// PhoneId{} denotes failed-approval source retirement only (AP complete, no
+// bond leg); the captured wireless identity still blocks pairing during retry.
 struct RevocationV1 final {
     core::PhoneId phone;
     trust::TransportIdentity identity;
@@ -71,7 +73,8 @@ public:
     }
     virtual core::Result<void> confirmed(core::ConsumerId generation,
                                          core::PairingRequestId source) = 0;
-    virtual void cancel(core::ConsumerId generation, core::PairingRequestId source) = 0;
+    // Success acknowledges source retirement; failure must remain retryable.
+    virtual core::Result<void> cancel(core::ConsumerId generation, core::PairingRequestId source) = 0;
     virtual void teardown(core::ConsumerId generation) = 0;
     // One <=1000ms attempt, including mutex acquisition and associated cleanup.
     // Completed legs report success without another privileged request.

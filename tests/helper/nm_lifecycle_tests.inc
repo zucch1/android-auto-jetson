@@ -116,7 +116,7 @@ TEST_F(CompletedLifecycle, CompletedConnectedLossRequiresFreshBootstrap) {
         ASSERT_EQ(bluez.command("connected-true"), "ok"); retired(handle);
         EXPECT_EQ(bluez.command("NewConnection"), "rejected");
         // Then only a fresh grant and accepted bootstrap can create new authority.
-        client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation});
+        ASSERT_TRUE(client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation}));
         ++generation; source = {generation, generation};
         acquire(generation); ASSERT_TRUE(state(State::active));
         const auto fresh = accept(); ASSERT_NE(fresh, handle);
@@ -135,7 +135,7 @@ TEST_F(CompletedLifecycle, PendingChannelOrConnectedLossRetiresExchange) {
         retired(handle); EXPECT_EQ(failure, HandoffFailure::eligibility);
         EXPECT_EQ(bluez.command("wire-read"), "closed");
         ASSERT_EQ(bluez.command("connected-true"), "ok"); retired(handle);
-        client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation});
+        ASSERT_TRUE(client->cancel(core::ConsumerId{generation}, core::PairingRequestId{generation}));
         ++generation; source = {generation, generation};
         acquire(generation); ASSERT_TRUE(state(State::active));
     }
@@ -209,7 +209,7 @@ TEST_F(CompletedLifecycle, SourceTeardownRetiresCompletedButPreservesUnrelatedOb
     const auto handle = accept(); complete(handle); ASSERT_TRUE(client->get_ap_credentials({1, 1}, handle));
     ASSERT_TRUE(client->prepare(core::ConsumerId{2}, core::PairingRequestId{2}));
     // When A's exact source is invalidated.
-    client->cancel(core::ConsumerId{1}, core::PairingRequestId{1}); retired(handle);
+    ASSERT_TRUE(client->cancel(core::ConsumerId{1}, core::PairingRequestId{1})); retired(handle);
     // Then B remains usable for a fresh pairing grant/admission.
     EXPECT_TRUE(client->confirmed(core::ConsumerId{2}, core::PairingRequestId{2}));
 }

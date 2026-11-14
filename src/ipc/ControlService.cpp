@@ -42,18 +42,59 @@ void ControlService::teardown(std::string_view reason, DiagnosticSeverity severi
     events_.emit(DiagnosticEmitted{severity, reason, consumer.value});
 }
 
+std::chrono::steady_clock::time_point ControlService::now() const {
+    return clock_ ? clock_() : std::chrono::steady_clock::now();
+}
+
 void ControlService::refresh_consumer_owner() {
-    retry_enrolment_retirements();
+    if (!revocations_.empty()) {
+        const auto started = now();
+        const auto deadline = started + kSourceRetirementTimeBudget;
+        std::size_t index = source_retry_cursor_ % revocations_.size();
+        std::size_t remaining = revocations_.size();
+        std::size_t attempts = 0;
+        while (remaining > 0 && !revocations_.empty() &&
+               attempts < kSourceRetirementAttemptBudget &&
+               (attempts == 0 || now() < deadline)) {
+            index %= revocations_.size();
+            auto& record = revocations_[index];
+            const auto attempt_now = now();
+            if (record.snapshot.phone || record.next_attempt > attempt_now) {
+                ++index;
+                --remaining;
+                continue;
+            }
+            ++attempts;
+            (void)attempt_revocation(record);
+            if (record.progress.complete()) {
+                revocations_.erase(revocations_.begin() + static_cast<std::ptrdiff_t>(index));
+                --remaining;
+            } else {
+                if (record.failures < 16) ++record.failures;
+                if (record.failures >= 2) {
+                    const auto shift = std::min<std::uint32_t>(record.failures - 2, 5);
+                    const auto delay = std::chrono::seconds{1U << shift};
+                    record.next_attempt = now() + std::min(delay, std::chrono::seconds{30});
+                } else {
+                    record.next_attempt = now();
+                }
+                ++index;
+                --remaining;
+            }
+        }
+        source_retry_cursor_ = revocations_.empty() ? 0 : (index % revocations_.size());
+    }
     if (!registered_.has_value()) {
         return;
     }
-    if (open_pairing_ && std::chrono::steady_clock::now() >= open_pairing_->deadline) {
+    if (open_pairing_ && now() >= open_pairing_->deadline) {
         phones_.pairing_cancelled(open_pairing_->request);
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_expired", open_pairing_->request.value});
         const auto request = open_pairing_->request;
-        if (confirmation_ != nullptr) confirmation_->cancel(registered_->consumer, request);
-        (void)gate_.cancel({registered_->consumer, registered_->name}, request);
+        const auto peer = open_pairing_->peer;
         open_pairing_.reset();
+        retire_failed_pairing(registered_->consumer, request, peer);
+        (void)gate_.cancel({registered_->consumer, registered_->name}, request);
         events_.emit(PairingClosed{request});
     }
     const auto owner = credentials_.name_owner(registered_->name);
@@ -64,7 +105,8 @@ void ControlService::refresh_consumer_owner() {
         advance_enrolment();
         if (!registered_) return;
         for (const auto request : phones_.reap_expired()) {
-            if (confirmation_) confirmation_->cancel(registered_->consumer, request);
+            const auto peer = phones_.take_expired_wireless_identity(request);
+            retire_failed_pairing(registered_->consumer, request, peer);
             (void)gate_.cancel({registered_->consumer, registered_->name}, request);
             if (open_pairing_ && open_pairing_->request == request) open_pairing_.reset();
             events_.emit(PairingClosed{request});

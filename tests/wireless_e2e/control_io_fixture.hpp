@@ -15,7 +15,7 @@ enum class ControlOperation { forget, owner_loss, forget703 };
 struct ControlHelper final : aa::helper::Confirmation {
     unsigned revocations{}, teardowns{};
     aa::core::Result<void> confirmed(aa::core::ConsumerId, aa::core::PairingRequestId) override { return {}; }
-    void cancel(aa::core::ConsumerId, aa::core::PairingRequestId) override {}
+    aa::core::Result<void> cancel(aa::core::ConsumerId, aa::core::PairingRequestId) override { return {}; }
     void teardown(aa::core::ConsumerId) override { ++teardowns; }
     aa::helper::RevocationAttempt forgotten_v1(const aa::helper::RevocationV1&,
                                                const aa::helper::RevocationProgress&) override {

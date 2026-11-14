@@ -10,7 +10,7 @@ void ControlService::close_enrolment(std::string_view reason, bool bond_recorded
     phones_.pairing_cancelled(request);
     if (confirmation_) {
         if (bond_recorded) retire_acknowledged_pairing(registered_->consumer, request, open_pairing_->peer);
-        else confirmation_->cancel(registered_->consumer, request);
+        else retire_failed_pairing(registered_->consumer, request, open_pairing_->peer);
     }
     (void)gate_.cancel({registered_->consumer, registered_->name}, request);
     open_pairing_.reset();

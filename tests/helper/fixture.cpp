@@ -60,7 +60,7 @@ public:
     core::Result<void> respond_comparison(core::ConsumerId g, core::PairingRequestId r, ComparisonResponse response) override { return target_.respond_comparison(g, r, response); }
     core::Result<bool> bond_confirmed(core::ConsumerId g, core::PairingRequestId r) override { return target_.bond_confirmed(g, r); }
     core::Result<void> bond_acknowledged(core::ConsumerId g, core::PairingRequestId r) override { return target_.bond_acknowledged(g, r); }
-    void cancel(core::ConsumerId g, core::PairingRequestId r) override { target_.cancel(g, r); }
+    core::Result<void> cancel(core::ConsumerId g, core::PairingRequestId r) override { return target_.cancel(g, r); }
     void teardown(core::ConsumerId g) override { target_.teardown(g); }
     RevocationAttempt forgotten_v1(const RevocationV1& s, const RevocationProgress& p) override { return target_.forgotten_v1(s, p); }
 private:

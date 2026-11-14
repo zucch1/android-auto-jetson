@@ -49,8 +49,8 @@ public:
         return target_.respond_comparison(generation, source, response);
     }
 
-    void cancel(core::ConsumerId generation, core::PairingRequestId source) override {
-        target_.cancel(generation, source);
+    core::Result<void> cancel(core::ConsumerId generation, core::PairingRequestId source) override {
+        return target_.cancel(generation, source);
     }
     void teardown(core::ConsumerId generation) override {
         const bool retain = active_();

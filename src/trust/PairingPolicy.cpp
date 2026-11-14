@@ -64,10 +64,15 @@ bool PairingPolicy::has_pending(core::PairingRequestId request) const {
 }
 
 std::vector<core::PairingRequestId> PairingPolicy::reap_expired() {
+    expired_peers_.clear();
     std::vector<core::PairingRequestId> expired;
     const core::Nanoseconds now = clock_.now();
     for (std::size_t index = 0; index < pending_.size();) {
         if (now.count > pending_[index].deadline.count || pending_[index].reload_epoch != store_.reload_epoch()) {
+            if (const auto* wireless = std::get_if<WirelessIdentity>(&pending_[index].identity)) {
+                expired_peers_.push_back({pending_[index].request,
+                    helper::PeerIdentity{wireless->bond_address, wireless->adapter}});
+            }
             expired.push_back(pending_[index].request);
             drop_at(index);  // rejected and never persisted
             continue;
@@ -75,6 +80,18 @@ std::vector<core::PairingRequestId> PairingPolicy::reap_expired() {
         ++index;
     }
     return expired;
+}
+
+std::optional<helper::PeerIdentity> PairingPolicy::take_expired_wireless_identity(
+    core::PairingRequestId request) {
+    for (auto it = expired_peers_.begin(); it != expired_peers_.end(); ++it) {
+        if (it->first == request) {
+            auto peer = std::move(it->second);
+            expired_peers_.erase(it);
+            return peer;
+        }
+    }
+    return std::nullopt;
 }
 
 core::Result<void> PairingPolicy::forget(core::PhoneId phone) {
@@ -163,6 +180,7 @@ core::Result<void> PairingPolicy::pairing_requested(core::PairingRequestId reque
 }
 
 core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingRequestId request) {
+    committed_pairing_.reset();
     const std::size_t index = find(request);
     if (index >= pending_.size()) {
         return Error{ErrorCode::trust_unknown_phone};
@@ -178,7 +196,12 @@ core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingReques
     // SNAPSHOT-ONLY PAIRING CONTRACT in PairingPolicy.hpp).
     const TransportIdentity identity = std::move(pending_[index].identity);
     drop_at(index);
-    return store_.approve(identity);
+    const auto approved = store_.approve(identity);
+    if (!approved && approved.error().code() == ErrorCode::trust_store_not_durable) {
+        for (const auto& phone : store_.phones())
+            if (identity_key(phone.identity) == identity_key(identity)) committed_pairing_ = phone.phone_id;
+    }
+    return approved;
 }
 
 void PairingPolicy::pairing_cancelled(core::PairingRequestId request) {
