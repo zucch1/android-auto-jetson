@@ -17,6 +17,7 @@
 
 namespace aa::tls {
 const char* Error::what() const noexcept {
+    if (!detail_.empty()) return detail_.c_str();
     switch (failure_) {
     case Failure::unset: return "tls-credential-unset: set HU_KEY_PATH to an owner-only PEM bundle";
     case Failure::unreadable: return "tls-credential-unreadable";
@@ -32,6 +33,7 @@ const char* Error::what() const noexcept {
 }
 
 namespace {
+constexpr int kMinimumSecurityBits = 112;
 struct Descriptor {
     int value;
     ~Descriptor() { if (value >= 0) { ::close(value); } }
@@ -147,12 +149,20 @@ Credentials load_credentials() {
     }
     // Security bits compare different key families fairly: RSA-2048 and
     // P-256 both meet this floor; RSA-1024 does not.
-    if (EVP_PKEY_security_bits(key.get()) < 112) { throw Error(Failure::insecure); }
-    const auto check_certificate = [](X509* cert) {
+    if (EVP_PKEY_security_bits(key.get()) < kMinimumSecurityBits) {
+        throw Error(Failure::insecure,
+            "tls-credential-insecure: certificate[0] private-key-below-security-floor");
+    }
+    const auto check_certificate = [](X509* cert, std::size_t index) {
+        PrivateKey public_key(X509_get_pubkey(cert), &EVP_PKEY_free);
+        if (!public_key || EVP_PKEY_security_bits(public_key.get()) < kMinimumSecurityBits) {
+            throw Error(Failure::insecure, "tls-credential-insecure: certificate[" +
+                std::to_string(index) + "] public-key-below-security-floor");
+        }
         int digest = 0, signature_key = 0, security_bits = 0;
         std::uint32_t flags = 0;
         if (X509_get_signature_info(cert, &digest, &signature_key, &security_bits, &flags) != 1 ||
-            security_bits < 112 || digest == NID_sha1 || digest == NID_md5) {
+            security_bits < kMinimumSecurityBits || digest == NID_sha1 || digest == NID_md5) {
             throw Error(Failure::insecure);
         }
         const int expiry = X509_cmp_current_time(X509_get0_notAfter(cert));
@@ -162,8 +172,10 @@ Credentials load_credentials() {
         // phones; emit a stable, redacted warning on every load instead.
         if (expiry < 0) std::fputs("tls-credential-warning: certificate-expired\n", stderr);
     };
-    check_certificate(certificate.get());
-    for (const auto& intermediate : chain) check_certificate(intermediate.get());
+    check_certificate(certificate.get(), 0);
+    for (std::size_t index = 0; index < chain.size(); ++index) {
+        check_certificate(chain[index].get(), index + 1);
+    }
     return Credentials{std::move(certificate), std::move(key), std::move(chain)};
 }
 }

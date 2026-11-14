@@ -22,6 +22,8 @@ TlsTransport::build_impl(int fd, ApprovedPredicate approved, TlsMode mode, bool 
     if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         return Error{ErrorCode::transport_io};
     }
+    // TCP_USER_TIMEOUT bounds unacknowledged data/probes. SO_KEEPALIVE uses
+    // system probe timing; this does not guarantee detection after 30s idle.
     const int enabled = 1;
     const int unacked_timeout_ms = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(kFrameDeadline).count());
