@@ -427,10 +427,16 @@ TEST_F(AcknowledgementOrder, NotDurableApprovalIsNeverCommittedAndIsRetracted) {
 // Acknowledged-then-failed enrolments leave bond-leg records. They share the bounded retry loop of
 // source-only records: a stalled helper cannot block a control call, and everything retires once
 // the helper recovers.
-TEST_F(ComparisonControl, StalledHelperBondRetirementsAreBoundedPerCallAndAllRetireOnRecovery) {
+// The injected clock is the only clock the enrolment reads, so the outcome cannot depend on how
+// the host's steady clock compares with it (it used to: the enrolment deadline came from the real
+// clock and was swept against the injected one, so a host up for less than ~940 s failed).
+class StalledHelperRetirements : public ComparisonControl, public ::testing::WithParamInterface<bool> {};
+TEST_P(StalledHelperRetirements, AreBoundedPerCallAndAllRetireOnRecovery) {
     using namespace std::chrono_literals;
     constexpr int kRecords = 40;
-    auto fake_now = std::chrono::steady_clock::time_point{std::chrono::seconds{1000}};
+    // false: far behind the host clock; true: an hour ahead of it (a freshly booted host).
+    auto fake_now = GetParam() ? real_steady_now() + std::chrono::hours{1} :
+                                 std::chrono::steady_clock::time_point{std::chrono::seconds{1000}};
     ipc::ControlService budgeted{{1000}, {credentials, events, ids, phones, &bridge, [&] { return fake_now; }}};
     ASSERT_TRUE(budgeted.register_consumer(caller, name));
     bridge.bond = Error{ErrorCode::helper_unavailable};
@@ -469,5 +475,7 @@ TEST_F(ComparisonControl, StalledHelperBondRetirementsAreBoundedPerCallAndAllRet
     EXPECT_EQ(budgeted.pending_revocations(), 0U);
     EXPECT_LE(rounds, kRecords / 4 + 3) << "the round-robin cursor must reach every record";
 }
+INSTANTIATE_TEST_SUITE_P(ClockOrdering, StalledHelperRetirements, ::testing::Bool(),
+    [](const auto& info) { return info.param ? std::string{"InjectedClockAheadOfHost"} : std::string{"InjectedClockBehindHost"}; });
 
 }

@@ -101,7 +101,7 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
     }
     if (confirmation_ && confirmation_->requires_comparison()) {
         open_pairing_ = OpenPairing{request, {}, phones_.pairing_wireless_identity(request),
-            std::chrono::steady_clock::now() + std::chrono::seconds(60)};
+            now() + std::chrono::seconds(60)};
         open_pairing_->awaiting_acceptance = true;
         events_.emit(PairingOpened{request});
         return {};

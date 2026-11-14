@@ -22,7 +22,7 @@ void ControlService::close_enrolment(std::string_view reason, bool bond_recorded
 // bond is the helper's managed bond and a failure retires it through tracked revocation.
 bool ControlService::reconcile_enrolment(core::PairingRequestId request, bool bond_recorded) {
     if (!open_pairing_ || !registered_ || open_pairing_->request != request) return false;
-    if (std::chrono::steady_clock::now() >= open_pairing_->deadline) {
+    if (now() >= open_pairing_->deadline) {
         close_enrolment("pairing_expired", bond_recorded); return false;
     }
     // The policy's own deadline/binding predicate, shared with confirm_phone_pairing and the
@@ -80,7 +80,7 @@ core::Result<std::map<std::string, std::string>> ControlService::pairing_compari
     const auto admitted = admit(caller, active.value());
     if (!admitted) return admitted.error();
     if (!confirmation_ || !open_pairing_ || open_pairing_->request != request || !open_pairing_->peer ||
-        std::chrono::steady_clock::now() >= open_pairing_->deadline) return Error{ErrorCode::trust_rejected};
+        now() >= open_pairing_->deadline) return Error{ErrorCode::trust_rejected};
     const auto value = confirmation_->comparison(active.value().consumer, request);
     if (!value) {
         if (value.error().code() != ErrorCode::helper_rejected) close_enrolment("pairing_helper_failed");
@@ -88,7 +88,7 @@ core::Result<std::map<std::string, std::string>> ControlService::pairing_compari
     }
     if (!value.value().id || value.value().number > 999999 || value.value().peer != *open_pairing_->peer ||
         phones_.pairing_wireless_identity(request) != open_pairing_->peer ||
-        std::chrono::steady_clock::now() >= open_pairing_->deadline) {
+        now() >= open_pairing_->deadline) {
         close_enrolment("pairing_comparison_failed");
         return Error{ErrorCode::trust_rejected};
     }
@@ -98,7 +98,7 @@ core::Result<std::map<std::string, std::string>> ControlService::pairing_compari
     if (!open_pairing_ || open_pairing_->request != request || !open_pairing_->peer ||
         value.value().peer != *open_pairing_->peer ||
         phones_.pairing_wireless_identity(request) != open_pairing_->peer ||
-        std::chrono::steady_clock::now() >= open_pairing_->deadline)
+        now() >= open_pairing_->deadline)
         return Error{ErrorCode::trust_rejected};
     open_pairing_->presented_comparison = value.value().id;
     const auto number = std::to_string(value.value().number);
@@ -115,11 +115,11 @@ core::Result<void> ControlService::respond_pairing_comparison(const BusName& cal
     if (!confirmation_ || !open_pairing_ || open_pairing_->request != request || !response.id ||
         open_pairing_->presented_comparison != response.id || !open_pairing_->peer ||
         phones_.pairing_wireless_identity(request) != open_pairing_->peer ||
-        std::chrono::steady_clock::now() >= open_pairing_->deadline) return Error{ErrorCode::trust_rejected};
+        now() >= open_pairing_->deadline) return Error{ErrorCode::trust_rejected};
     open_pairing_->presented_comparison.reset();
     const auto current = confirmation_->comparison(active.value().consumer, request);
     if (!current || current.value().id != response.id || current.value().peer != *open_pairing_->peer ||
-        std::chrono::steady_clock::now() >= open_pairing_->deadline) {
+        now() >= open_pairing_->deadline) {
         close_enrolment("pairing_comparison_failed");
         return Error{ErrorCode::trust_rejected};
     }
@@ -130,7 +130,7 @@ core::Result<void> ControlService::respond_pairing_comparison(const BusName& cal
     if (!open_pairing_ || open_pairing_->request != request || !open_pairing_->peer ||
         current.value().peer != *open_pairing_->peer ||
         phones_.pairing_wireless_identity(request) != open_pairing_->peer ||
-        std::chrono::steady_clock::now() >= open_pairing_->deadline) {
+        now() >= open_pairing_->deadline) {
         close_enrolment("pairing_comparison_failed");
         return Error{ErrorCode::trust_rejected};
     }
