@@ -117,6 +117,15 @@ using Object = JsonValue::Object;
     return reject();
 }
 
+// Restrict recovery to material accepted before MAC validation. A bad adapter,
+// empty/non-printable address, or any schema defect remains fatal.
+[[nodiscard]] bool legacy_wireless(const TransportIdentity& identity) {
+    const auto* wireless = std::get_if<WirelessIdentity>(&identity);
+    return wireless && !validated_key(identity) &&
+        validated_key(OpaqueIdentity{wireless->bond_address}).has_value() &&
+        (wireless->adapter.empty() || validated_key(OpaqueIdentity{wireless->adapter}).has_value());
+}
+
 // Legacy opaque keys may contain the old wired encoding. Keep serial-backed
 // compatibility keys, but do not let a port-only grant escape migration by
 // being represented as opaque. Malformed reserved w1: encodings also return
@@ -154,7 +163,7 @@ using Object = JsonValue::Object;
     }
     // Every record must name its phone (identity carries usable material).
     auto key = validated_key(parsed.value());
-    if (!key.has_value()) {
+    if (!key.has_value() && !legacy_wireless(parsed.value())) {
         return reject();
     }
     const auto strength = strength_of(parsed.value());
@@ -241,23 +250,35 @@ using RecordParser = core::Result<ApprovedPhone> (*)(const JsonValue&);
         if (duplicate != store.phones.end()) {
             return reject();  // duplicate phone id
         }
-        // Duplicate canonical identities are rejected in BOTH schema versions:
-        // revocation is per phone id, so one identity under two ids could
-        // survive a forget and silently keep reconnect eligibility.
-        const std::string key = identity_key(record.value().identity);
-        const auto alias = std::find_if(
-            store.phones.begin(), store.phones.end(), [&key](const ApprovedPhone& existing) {
-                return identity_key(existing.identity) == key;
-            });
-        if (alias != store.phones.end()) {
-            return reject();  // duplicate canonical identity
-        }
         store.phones.push_back(std::move(record.value()));
     }
     std::uint64_t highest = 0;
     for (const ApprovedPhone& phone : store.phones) {
         highest = std::max(highest, phone.phone_id.value);
     }
+    // Validate every original record before dropping any: duplicate ids,
+    // exact duplicate identities and unrelated collisions remain corruption.
+    std::vector<bool> quarantine(store.phones.size(), false);
+    for (std::size_t i = 0; i < store.phones.size(); ++i) {
+        if (legacy_wireless(store.phones[i].identity)) {
+            quarantine[i] = true;
+            ++store.invalid_wireless_count;
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (identity_key(store.phones[i].identity) != identity_key(store.phones[j].identity)) continue;
+            const auto* a = std::get_if<WirelessIdentity>(&store.phones[i].identity);
+            const auto* b = std::get_if<WirelessIdentity>(&store.phones[j].identity);
+            if (!a || !b ||
+                (a->adapter == b->adapter && a->bond_address == b->bond_address)) return reject();
+            quarantine[i] = quarantine[j] = true;
+        }
+    }
+    std::size_t index = 0;
+    std::erase_if(store.phones, [&](const ApprovedPhone& phone) {
+        const bool drop = quarantine[index++];
+        if (drop && !legacy_wireless(phone.identity)) ++store.colliding_wireless_count;
+        return drop;
+    });
     store.next_phone_id = highest + 1;
     return store;
 }

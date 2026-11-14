@@ -68,4 +68,10 @@ inline constexpr std::size_t kMaxStoreBytes = std::size_t{256} * 1024;
 [[nodiscard]] core::Result<void> write_file_private(const std::filesystem::path& path,
                                                     std::string_view content);
 
+// Save original bytes once at path + ".legacy-backup". Uses the same verified
+// path walk and private temporary file, published with exclusive linkat.
+// An existing backup must be a safe private regular file and is never replaced.
+[[nodiscard]] core::Result<void> backup_file_private(const std::filesystem::path& path,
+                                                     std::string_view content);
+
 } // namespace aa::trust::detail

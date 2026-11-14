@@ -68,6 +68,13 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return opened.error();
     }
+    const auto live = phones_.validate_pairing(request);
+    if (!live) {
+        retire_failed_pairing(active.value().consumer, request, peer);
+        (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+        events_.emit(PairingClosed{request});
+        return live.error();
+    }
     if (confirmation_ != nullptr) {
         const auto granted = confirmation_->confirmed(active.value().consumer, request);
         if (!granted) {
