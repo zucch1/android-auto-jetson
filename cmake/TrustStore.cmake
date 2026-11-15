@@ -37,6 +37,7 @@ set(AA_TRUST_TEST_SOURCES
     tests/trust/store_test.cpp
     tests/trust/store_permissions_test.cpp
     tests/trust/store_migration_test.cpp
+    tests/trust/store_port_test.cpp
     tests/trust/store_schema_test.cpp
     tests/trust/pairing_policy_test.cpp
     tests/trust/pairing_expiry_test.cpp

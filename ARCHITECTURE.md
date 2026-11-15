@@ -20,7 +20,7 @@
 | channels | `include/aa/channels/*` | capability advertisement, service dispatch, AV/input/sensor/microphone sinks | implemented (`src/channels/*`) |
 | ipc | `include/aa/ipc/*` | D-Bus control surface contract (`org.custom.AndroidAutoReceiver1`), pairing gate, video socket, input socket | implemented (`src/ipc/*`, `src/ipc/video`, `src/ipc/dbus_adapter`) |
 | audio | `include/aa/audio/*` | multi-role PCM audio routing and sink boundary, A/V sync gating; `pulsesink` is the default and only supported real-time route (`pipewiresink` is refused on PipeWire 1.0.5 / Ubuntu noble) | implemented (`src/audio/*`, `src/audio/gstreamer_adapter`) |
-| trust | `include/aa/trust/*` | persistent identity allowlist, atomic persistence, fail-closed admission (wired identifiers are spoofable) | implemented (`src/trust/*`) |
+| trust | `include/aa/trust/*` | persistent identity allowlist, atomic persistence, fail-closed admission (wired identifiers are spoofable; serial-backed wired approvals match on any port) | implemented (`src/trust/*`) |
 | config | `include/aa/config/*` | typed validated configuration boundary, fail-closed jurisdiction rules | implemented (`src/config/*`) |
 | diagnostics | `include/aa/diagnostics/*` | structured JSON events, privacy redaction (salted pseudonyms), ring buffers | implemented (`src/diagnostics/*`) |
 | helper | `include/aa/helper/*` | privileged helper client/service, NetworkManager AP worker, BlueZ AA RFCOMM bootstrap | implemented (`src/helper/*`, `src/helper/bluez_adapter`, `src/helper/nm`) |
@@ -64,6 +64,21 @@ The scanner matches include directives with full `#`/`include` whitespace tolera
 
 1. Wired USB / Android Open Accessory.
 2. Receiver-hosted wireless via a dedicated fixed-channel 5 GHz access point (explicit jurisdiction handling; fail-closed channel validation; jurisdiction must be install-time confirmed or the AP never starts).
+
+## Wired trust
+
+The approved-phones store (`include/aa/trust/Store.hpp`) admits a wired phone
+by its captured identity: USB descriptor ids, USB serial, AOA identity and the
+port it was captured on. Since #133 a **serial-backed** identity matches on the
+phone, not the port (`trust::match_key()` drops the port field), so an approved
+phone is admitted in any hub socket. The recorded port stays in the store for
+audit. A **port-only** (serial-less) identity can only be granted through the
+explicit `approve_port_only()` call and matches only its own port. It is never
+widened. Existing store files load unchanged, with no schema bump or rewrite.
+Forget removes every record that matches the same phone. The udev policy
+(`tools/usb-policy/`) grants device-node access to the approved ids on any
+port. Node access is not trust: the store decides admission. Wired identity is
+physical-access trust, not cryptographic proof (USB ids are spoofable).
 
 ## Wireless handoff
 

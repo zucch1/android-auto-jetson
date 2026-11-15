@@ -6,7 +6,7 @@
 #   - if no rules file existed before install: the installed file is removed,
 #   - if a different rules file existed before: its recorded bytes are
 #     restored (sha256-verified before and after),
-#   - udev is reloaded and the qualified port's device tree is re-triggered so
+#   - udev is reloaded and every attached approved-id device tree is re-triggered so
 #     rule-derived udev properties (e.g. ID_MM_DEVICE_IGNORE) are re-evaluated
 #     and cleared with the removed rules; named-user ACLs are NOT claimed to
 #     be revoked by reload+trigger (see README "Rollback" for the exact
@@ -28,7 +28,6 @@ set -euo pipefail
 
 RULES_NAME="70-android-auto-receiver.rules"
 STATE_SCHEMA="aa-usb-policy-state/1"
-QUALIFIED_PORT_SYSNAME="1-2.1"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
@@ -61,17 +60,14 @@ reload_and_trigger() {
         die "udevadm not available on a live root; refusing to roll back without clearing device state"
     fi
     timeout 60 udevadm control --reload || die "udevadm control --reload failed"
-    local syspath
-    if syspath="$(readlink -f "/sys/bus/usb/devices/${QUALIFIED_PORT_SYSNAME}" 2>/dev/null)" \
-        && [ -n "$syspath" ] && [ -d "$syspath" ]; then
-        timeout 60 udevadm trigger --action=change --parent-match="$syspath" \
-            || die "udevadm trigger failed"
-        timeout 30 udevadm settle --timeout=10 || die "udevadm settle failed"
-        log "udev-reloaded: re-triggered device tree of ${QUALIFIED_PORT_SYSNAME}" \
+    local triggered
+    triggered="$(trigger_approved_devices)" || die "udevadm trigger of approved-id devices failed"
+    if [ "${triggered}" -gt 0 ]; then
+        log "udev-reloaded: re-triggered ${triggered} approved-id device tree(s) (any port)" \
             "(rule-derived properties like ID_MM_DEVICE_IGNORE are re-evaluated;" \
             "named-user ACLs are NOT revoked by this tooling - see README 'Rollback')"
     else
-        log "udev-reloaded: qualified port ${QUALIFIED_PORT_SYSNAME} absent; no trigger needed"
+        log "udev-reloaded: no approved-id device attached; no trigger needed"
     fi
 }
 

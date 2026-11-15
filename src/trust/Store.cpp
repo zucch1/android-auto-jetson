@@ -81,8 +81,10 @@ core::Result<void> ApprovedPhoneStore::persist() {
 }
 
 std::optional<std::size_t> ApprovedPhoneStore::index_of_key(const std::string& key) const {
+    // Port-independent for serial-bound wired keys, exact otherwise (#133).
+    const std::string wanted = match_key(key);
     for (std::size_t index = 0; index < phones_.size(); ++index) {
-        if (identity_key(phones_[index].identity) == key) {
+        if (match_key(phones_[index].identity) == wanted) {
             return index;
         }
     }
@@ -180,14 +182,14 @@ core::Result<void> ApprovedPhoneStore::forget_phone(core::PhoneId phone) {
         return Error{ErrorCode::trust_unknown_phone};
     }
     // Identity-safe revocation: forget removes EVERY record carrying the same
-    // canonical identity, so the identity cannot remain approved under a
-    // second phone id (defense in depth; the loader already rejects stores
-    // containing such duplicates).
-    const std::string key = identity_key(index->identity);
+    // matching identity (match_key: a serial-backed wired phone recorded on
+    // two ports is ONE phone), so the identity cannot remain approved under a
+    // second phone id or a second port record.
+    const std::string key = match_key(index->identity);
     const std::vector<ApprovedPhone> before = phones_;
     phones_.erase(std::remove_if(phones_.begin(), phones_.end(),
                                  [&key](const ApprovedPhone& entry) {
-                                     return identity_key(entry.identity) == key;
+                                     return match_key(entry.identity) == key;
                                  }),
                   phones_.end());
     auto saved = persist();

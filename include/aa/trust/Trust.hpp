@@ -11,8 +11,9 @@ namespace aa::trust {
 // fail-closed unknown-device behaviour.
 //
 // Identity limits (documented limitation, plan "Phone identity boundary"):
-// wired trust binds physical-port access, USB identifiers, AOA identity and
-// TLS session state but is NOT cryptographic proof against a spoofed USB
+// wired trust binds physical access to a receiver USB port (any port for a
+// serial-backed identity, the approved port for a port-only one, #133), USB
+// identifiers, AOA identity and TLS session state but is NOT cryptographic proof against a spoofed USB
 // identifier; wireless trust binds the BlueZ bond plus stored Bluetooth
 // identity. A phone is "unknown" when its transport identity is not in the
 // approved store.

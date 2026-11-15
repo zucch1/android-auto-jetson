@@ -103,7 +103,7 @@ std::optional<helper::PeerIdentity> PairingPolicy::take_expired_wireless_identit
 
 core::Result<void> PairingPolicy::forget(core::PhoneId phone) {
     // The revocation invalidates every outstanding request bound to the SAME
-    // canonical identity. Matching is by identity_key (never variant equality
+    // canonical identity. Matching is by match_key (never variant equality
     // or phone id) and is prepared BEFORE persistence: the ids are dropped
     // and exposed only after the revocation lands (durable success or the
     // committed-but-not-durable error), so a pre-replacement failure leaves
@@ -113,7 +113,7 @@ core::Result<void> PairingPolicy::forget(core::PhoneId phone) {
     revocation_.reset();
     for (const auto& entry : store_.phones()) {
         if (entry.phone_id == phone) {
-            key = identity_key(entry.identity);
+            key = match_key(entry.identity);
             snapshot = helper::RevocationV1{phone, entry.identity};
             break;
         }
@@ -121,7 +121,7 @@ core::Result<void> PairingPolicy::forget(core::PhoneId phone) {
     std::vector<core::PairingRequestId> doomed;
     if (key.has_value()) {
         for (const auto& pending : pending_) {
-            if (identity_key(pending.identity) == key.value()) {
+            if (match_key(pending.identity) == key.value()) {
                 doomed.push_back(pending.request);
             }
         }
@@ -216,7 +216,7 @@ core::Result<core::PhoneId> PairingPolicy::pairing_confirmed(core::PairingReques
     const auto approved = store_.approve(identity);
     if (!approved && approved.error().code() == ErrorCode::trust_store_not_durable) {
         for (const auto& phone : store_.phones())
-            if (identity_key(phone.identity) == identity_key(identity)) committed_pairing_ = phone.phone_id;
+            if (match_key(phone.identity) == match_key(identity)) committed_pairing_ = phone.phone_id;
     }
     return approved;
 }

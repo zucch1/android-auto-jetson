@@ -3,11 +3,16 @@
 
 // Typed transport identity for approved phones (task 27). The store keeps the
 // STRONGEST available transport identity per phone:
-//   - wired    : USB descriptor ids + USB serial + AOA identity + physical-port
-//                context (the qualified USB3 port path as the kernel reports it)
+//   - wired    : USB descriptor ids + USB serial + AOA identity, plus the
+//                physical-port context (the USB port path as the kernel
+//                reports it) the phone was captured on. A serial-backed wired
+//                identity MATCHES ON THE PHONE, NOT THE PORT (#133, see
+//                match_key()): the same phone is admitted on any host port.
+//                The port is still recorded for audit.
 //     Serial-less wired identities have a port-only strength: the descriptor
-//     tuple on that port matches every indistinguishable device. The store
-//     requires a separate explicit approval API for this weaker grant.
+//     tuple on that port matches every indistinguishable device, so it keeps
+//     matching on that port only and is never widened to other ports. The
+//     store requires a separate explicit approval API for this weaker grant.
 //   - wireless : the BlueZ bond identity (bond address + adapter) carried as
 //                plain DATA. This module never talks to BlueZ; the transport
 //                layer hands the bond identity over.
@@ -15,16 +20,18 @@
 // TRUST MODEL — WIRED IDENTITY IS PHYSICAL-ACCESS TRUST, NOT CRYPTOGRAPHIC
 // PROOF. USB descriptor strings and serials are attacker-controlled data: a
 // device presenting a spoofed USB identifier matches an approved record and is
-// indistinguishable at this layer. An approved wired record therefore
-// authorizes "the approved identifiers presented on the qualified port", not
-// "this specific handset". This is a known, accepted limitation of the wired
-// trust boundary and is deliberately NOT claimed as cryptographic device
-// attestation. Wireless trust binds the BlueZ bond (stronger, still
-// bond-not-human identity).
+// indistinguishable at this layer. An approved serial-backed wired record
+// therefore authorizes "the approved identifiers presented on any receiver
+// USB port", not "this specific handset". Binding it to one port added no
+// security (a spoofing device can use the approved port as easily as any
+// other). This is a known, accepted limitation of the wired trust boundary and
+// is deliberately NOT claimed as cryptographic device attestation. Wireless
+// trust binds the BlueZ bond (stronger, still bond-not-human identity).
 //
 // Matching: identity_key() is a stable, injective encoding of the full
-// structured record (Bluetooth MAC addresses are case-insensitive), so any
-// other difference in a component is a different
+// structured record (Bluetooth MAC addresses are case-insensitive). The store
+// matches on match_key(identity_key()), which only drops the port of a
+// serial-bound wired key; any other difference in a component is a different
 // identity and fails closed (Decision::unknown). The full record is persisted
 // for audit and revocation.
 //
@@ -113,6 +120,17 @@ inline constexpr std::size_t kMaxIdentityFieldBytes = 512;
 enum class WiredKeyClass { not_wired, serial_bound, port_only, malformed };
 
 [[nodiscard]] WiredKeyClass classify_wired_key(std::string_view key) noexcept;
+
+// Trust-matching key (#133). A serial-bound wired key matches on the PHONE
+// (descriptor ids + USB serial + AOA identity), not on the port: the port
+// field is replaced by the empty field, so the same serial-backed phone is the
+// same approval on every host port. Every other key is returned verbatim, so a
+// port-only (serial-less) key still matches ONLY on its own port, and a
+// malformed "w1:" key never collapses onto another record. The store matches,
+// re-approves and revokes by this key; identity_key() stays the persisted,
+// audited full record (the port the phone was approved on is kept).
+[[nodiscard]] std::string match_key(std::string_view key);
+[[nodiscard]] std::string match_key(const TransportIdentity& identity);
 
 // Field-level validation (printable ASCII, usable material). Fail closed.
 [[nodiscard]] core::Result<std::string> validated_key(const TransportIdentity& identity);

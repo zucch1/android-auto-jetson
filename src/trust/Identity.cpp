@@ -170,6 +170,33 @@ WiredKeyClass classify_wired_key(std::string_view key) noexcept {
     return has_serial ? WiredKeyClass::serial_bound : WiredKeyClass::port_only;
 }
 
+std::string match_key(std::string_view key) {
+    if (classify_wired_key(key) != WiredKeyClass::serial_bound) {
+        return std::string{key};  // port-only, malformed, wireless, opaque: exact
+    }
+    // Canonical and serial-bound (classify_wired_key proved the seven
+    // length-prefixed fields): the port context is the LAST field. Replace it
+    // with the empty field so the same phone matches on every port.
+    std::string_view rest = key.substr(3);
+    std::size_t consumed = 3;
+    for (int field = 0; field < 6; ++field) {
+        const std::size_t colon = rest.find(':');
+        std::size_t length = 0;
+        for (std::size_t i = 0; i < colon; ++i) {
+            length = length * 10 + static_cast<std::size_t>(rest[i] - '0');
+        }
+        consumed += colon + 1 + length;
+        rest.remove_prefix(colon + 1 + length);
+    }
+    std::string out{key.substr(0, consumed)};
+    out += "0:";
+    return out;
+}
+
+std::string match_key(const TransportIdentity& identity) {
+    return match_key(identity_key(identity));
+}
+
 core::Result<std::string> validated_key(const TransportIdentity& identity) {
     if (const auto* wired = std::get_if<WiredIdentity>(&identity)) {
         if (!all_fields_printable(*wired) || !wired_has_material(*wired)) {

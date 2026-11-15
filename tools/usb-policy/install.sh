@@ -29,9 +29,6 @@ set -euo pipefail
 
 RULES_NAME="70-android-auto-receiver.rules"
 STATE_SCHEMA="aa-usb-policy-state/1"
-# Must match the port constraint inside ${RULES_NAME}; the trigger is scoped
-# to this one port's device tree (device + interfaces + tty ports) only.
-QUALIFIED_PORT_SYSNAME="1-2.1"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
@@ -65,18 +62,12 @@ reload_and_trigger() {
         die "udevadm not available on a live root; refusing to install without a reload path"
     fi
     timeout 60 udevadm control --reload || die "udevadm control --reload failed"
-    local syspath
-    if syspath="$(readlink -f "/sys/bus/usb/devices/${QUALIFIED_PORT_SYSNAME}" 2>/dev/null)" \
-        && [ -n "$syspath" ] && [ -d "$syspath" ]; then
-        # --parent-match covers the port device and every descendant
-        # (interfaces, tty ports); nothing outside the qualified tree is
-        # reprocessed.
-        timeout 60 udevadm trigger --action=change --parent-match="$syspath" \
-            || die "udevadm trigger failed"
-        timeout 30 udevadm settle --timeout=10 || die "udevadm settle failed"
-        log "udev-reloaded: triggered device tree of ${QUALIFIED_PORT_SYSNAME}"
+    local triggered
+    triggered="$(trigger_approved_devices)" || die "udevadm trigger of approved-id devices failed"
+    if [ "${triggered}" -gt 0 ]; then
+        log "udev-reloaded: triggered ${triggered} approved-id device tree(s) (any port)"
     else
-        log "udev-reloaded: qualified port ${QUALIFIED_PORT_SYSNAME} absent; no trigger needed"
+        log "udev-reloaded: no approved-id device attached; no trigger needed"
     fi
 }
 
