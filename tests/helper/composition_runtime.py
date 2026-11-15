@@ -101,43 +101,38 @@ def ap_complete_bond_pending(surface: ComposedSurface) -> None:
     phone = surface.approve_and_acquire()
     before = surface.nm_state()["deactivations"]
     command(surface.mock, "fail-remove")
-    surface.forget_error(phone, "system helper unavailable")
+    # The bond leg needs no BlueZ removal (shared adapter, #136), so a refusing BlueZ cannot hold
+    # the forget: both legs complete at once, and the bond stays paired, refused.
+    surface.forget(phone)
     deactivated = surface.nm_state()["deactivations"]
     assert deactivated == before + 1
     assert not surface.nm_state()["active"] and not surface.nm_state()["table"]
-    # The store no longer approves the phone: the next reconciliation hands the bond's removal to
-    # the helper's durable journal and resolves the receiver's bond leg, so the record cannot pin
-    # capacity while BlueZ keeps refusing the removal.
-    wait(lambda: command(surface.receiver, "pending-revocations") == "0")
+    assert command(surface.receiver, "pending-revocations") == "0"
     assert command(surface.receiver, f"progress {phone}") == "none"
+    assert surface.state()["removed"] == [] and surface.state()["remove_attempts"] == 0
+    assert command(surface.mock, "NewConnection") == "rejected"
+    assert command(surface.mock, "AuthorizeService hfp") == "rejected"
     assert surface.nm_state()["deactivations"] == deactivated
-    assert surface.state()["removed"] == []
-    # Re-approval stays blocked by the helper's journal until the bond is really gone.
-    request = surface.request()
-    rejected(surface.consumer, "ConfirmPhonePairing", GLib.Variant("(t)", (request,)))
-    command(surface.mock, "allow-remove")
-    wait(lambda: len(surface.state()["removed"]) == 1)
-    assert surface.nm_state()["deactivations"] == deactivated
-    print("PASS composed_ap_ack_bond_owned_by_helper_journal_and_block_reapproval", flush=True)
+    print("PASS composed_forget_keeps_bond_refused_without_any_removal", flush=True)
 
 
 def bond_complete_ap_pending(surface: ComposedSurface) -> None:
     phone = surface.approve_and_acquire()
     command(surface.nm, "fail-stop")
     surface.forget_error(phone, "system helper unavailable")
-    assert len(surface.state()["removed"]) == 1
+    assert surface.state()["removed"] == []  # kept (shared adapter, #136)
     assert surface.nm_state()["quarantined"] and surface.nm_state()["table"]
     for _ in range(2):
         surface.forget_error(phone, "system helper unavailable")
         assert command(surface.receiver, f"progress {phone}") == "0 1"
-        assert len(surface.state()["removed"]) == 1
+        assert surface.state()["removed"] == []
         assert surface.nm_state()["starts"] == 1
     command(surface.nm, "allow-stop")
     wait(lambda: not surface.nm_state()["table"])
     surface.forget(phone)
     assert command(surface.receiver, "pending-revocations") == "0"
-    assert len(surface.state()["removed"]) == 1
-    print("PASS composed_bond_ack_ap_retries_do_not_remove_bond_again", flush=True)
+    assert surface.state()["removed"] == []
+    print("PASS composed_bond_ack_ap_retries_never_remove_the_bond", flush=True)
 
 
 def durability_and_precommit(surface: ComposedSurface) -> None:
@@ -164,7 +159,7 @@ def durability_and_precommit(surface: ComposedSurface) -> None:
     wait(lambda: not surface.nm_state()["table"])
     surface.forget_error(phone, "Trust store replaced; crash durability unconfirmed.")
     assert command(surface.receiver, "pending-revocations") == "0"
-    wait(lambda: len(surface.state()["removed"]) == 1)
+    assert surface.state()["removed"] == []  # the forgotten bond is kept (shared adapter, #136)
     print("PASS composed_precommit_no_effects_and_703_wins_every_failed_retry", flush=True)
 
 
@@ -305,11 +300,11 @@ def pending_bind_survives_lease_owner_forget(surface: ComposedSurface) -> None:
     request_b = surface.request()
     command(surface.mock, "observe-first")
     command(surface.mock, "multiple")
-    # When: retiring A closes its lease and removes only A's actual BlueZ bond.
+    # When: retiring A closes its lease; A's BlueZ bond is kept (shared adapter, #136).
     surface.forget(phone_a)
     assert command(surface.receiver, "pending-revocations") == "0"
     assert surface.phone() == 0
-    assert surface.state()["removed"] == ["/org/bluez/hci0/dev_02_00_00_00_00_01"]
+    assert surface.state()["removed"] == []
     assert not surface.state()["properties"]["Pairable"] and not surface.nm_state()["active"]
     assert command(surface.mock, "fd-eof") == "closed"
     assert command(surface.mock, "RequestAuthorization wrong") == "rejected"

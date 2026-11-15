@@ -101,17 +101,17 @@ with tempfile.TemporaryDirectory(prefix="bond-restart-", dir=build) as directory
             command(surface.mock, "observe-first")
             error, handle = rpc("poll")
             assert error == 0 and rpc(f"reconnect {handle}")[0] == 0, "trusted reconnect of a managed bond lost"
-            # The bond is removed even though its demotion to revoked-bonds cannot be written; the
-            # revocation reports failure so the receiver retries until the demotion is recorded.
+            # The demotion to revoked-bonds cannot be written: the revocation reports failure so the
+            # receiver retries until it is recorded. The bond is kept either way (shared adapter, #136).
             assert rpc("revoke " + peer)[0] != 0, "a revocation whose demotion was not recorded reported success"
-            # The failed enrolment's bond is parked for the receiver's answer; the revoked one is gone.
-            assert len(surface.state()["removed"]) == 1, "managed revocation lost after a write failure"
+            # The failed enrolment's bond is parked for the receiver's answer; the revoked one is kept.
+            assert not surface.state()["removed"], "a forgotten bond was deleted outside an enrolment window"
         finally:
             directory_path.chmod(0o700)
         assert rpc("revoke " + peer)[0] == 0
         assert "02:00:00:00:00:01" not in (directory_path / "managed-bonds").read_text()
         assert "02:00:00:00:00:01" in (directory_path / "revoked-bonds").read_text()
-        assert len(surface.state()["removed"]) == 1
+        assert not surface.state()["removed"], "a forgotten bond was deleted outside an enrolment window"
         # The failed disk is back and the receiver, approving nothing now, reconciles: the parked
         # journal entry of the failed enrolment is cleaned.
         assert rpc("reconcile") == (0, 0)
@@ -121,5 +121,5 @@ with tempfile.TemporaryDirectory(prefix="bond-restart-", dir=build) as directory
         command(surface.mock, "observe-other")
         command(surface.mock, "paired")
         assert rpc("revoke 02:00:00:00:00:02 02:00:00:00:00:AA")[0] == 1001
-        assert len(surface.state()["removed"]) == 1
-        print("PASS restart revokes managed bond, refuses unmanaged bond, and write failures refuse new bond acknowledgements")
+        assert not surface.state()["removed"]
+        print("PASS restart revokes (and keeps) managed bond, refuses unmanaged bond, and write failures refuse new bond acknowledgements")

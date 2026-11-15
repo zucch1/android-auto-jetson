@@ -110,7 +110,7 @@ void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own,
         if (bonded && listed(approved, peer)) {
             // Approved, so the bond stays (#74). A revoked identity's approval is never admitted
             // without a fresh committed enrolment, so its window's journal entry is not needed (the
-            // history keeps the removal authority) and must not block the identity's next enrolment.
+            // history keeps the refusal) and must not block the identity's next enrolment.
             if (revoked.contains(peer)) (void)pending.forget(peer);
             continue;
         }
@@ -126,7 +126,7 @@ void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own,
         }
         // A managed entry left by an interrupted commit is demoted before the obligation is
         // dropped, so a removed, never-admitted bond can never count as admitted later.
-        if (!demote(peer, false)) continue;
+        if (!demote(peer)) continue;
         (void)pending.forget(peer);
         if (!pending.contains(peer)) {                       // gone from memory; sync retried
             std::erase(removal_done, peer);
@@ -148,7 +148,7 @@ bool BluezBackend::Impl::admitted(const PeerIdentity& peer) {
         return false;
     return managed.admitted(peer) || (managed.confirm_durable() && managed.admitted(peer));
 }
-bool BluezBackend::Impl::demote(const PeerIdentity& peer, bool owe_removal) {
+bool BluezBackend::Impl::demote(const PeerIdentity& peer) {
     if (!managed.contains(peer)) {
         // Absent in memory; that absence is durable only once the rename that removed it is.
         if (!managed.forget(peer)) return false;
@@ -157,12 +157,10 @@ bool BluezBackend::Impl::demote(const PeerIdentity& peer, bool owe_removal) {
     }
     // Refused from here on, whatever the writes below report: a failure leaves the stricter state.
     if (!listed(refused, peer)) refused.push_back(peer);
-    // The removal obligation first, then history (revocation authority never lapses), then the
-    // managed entry; each confirmed durable (rename + directory fsync) before the next. Managed
-    // state is never dropped before the obligation to remove its bond is durable, so a crash or a
-    // failed write between any two steps leaves a state reconciliation completes, never an admitted
-    // or a stranded bond. The obligation is dropped only once BlueZ confirmed the removal.
-    if (owe_removal && !pending.remember(peer)) return false;
+    // History first (revocation authority never lapses), then the managed entry, each confirmed
+    // durable (rename + directory fsync) before the next, so a crash or a failed write between the
+    // two leaves a state reconciliation completes, never an admitted bond. No removal is owed: on
+    // the shared adapter a demoted bond stays in BlueZ, refused (docs/enrolment-ordering.md, #136).
     if (!revoked.remember(peer, true)) return false;
     if (!managed.forget(peer)) return false;
     std::erase(refused, peer);
@@ -177,19 +175,22 @@ bool BluezBackend::Impl::clear_revocation(const PeerIdentity& peer) {
 //                                             (history cleared first, then the commit's writes)
 //   approved, revoked otherwise            -> stays revoked, not admitted, bond kept (#74),
 //                                             counted as unadmitted; a stale journal entry is
-//                                             dropped (the history keeps the removal authority)
+//                                             dropped (the history keeps the refusal)
 //   approved, managed                      -> admitted (a journal entry left by a commit that
 //                                             stopped between its two writes is dropped)
 //   approved, journalled, bonded           -> admitted (the approval landed, the commit did not)
 //   approved, nothing to admit             -> counted as unadmitted, nothing removed
-//   managed, not approved                  -> demoted (removal owed first), device removed
-//   journalled, not approved               -> device removed, entry dropped
-//   revoked, bonded, not approved          -> removal owed again and the device removed, whatever
-//                                             the journal says (a lost entry strands no bond)
-// A bond of an identity none of the helper's files name is never touched, and the open enrolment
+//   managed, not approved                  -> demoted to revoked: refused, bond kept (#136)
+//   journalled, not approved               -> device removed, entry dropped (enrolment cleanup)
+//   revoked, bonded, not approved          -> refused, bond kept, a warning with the redacted
+//                                             address (#136)
+// The Bluetooth adapter is shared (docs/enrolment-ordering.md, #136): only an enrolment's own
+// journal entry (`pending`) ever leads to a removal; a bond outside it is never deleted, because
+// BlueZ cannot remove a bond conditionally on it still being the one the helper decided about. A
+// bond of an identity none of the helper's files name is never touched, and the open enrolment
 // window's own bond is left to that window. Success only once every state change is durable and
-// every bond the helper names that the receiver does not approve is gone from BlueZ or its removal
-// durably owed in the journal; on failure the stricter state stays and the receiver retries.
+// every journalled bond the receiver does not approve is gone from BlueZ or its removal still
+// durably owed; on failure the stricter state stays and the receiver retries.
 core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<PeerIdentity>& approved) {
     auto& s = *impl_;
     if (!s.managed.valid() || !s.pending.valid() || !s.revoked.valid()) return Error{ErrorCode::helper_unavailable};
@@ -217,7 +218,7 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
             // Only a fresh enrolment that reached its commit clears history, so this approval was
             // never committed after the revocation: a resurrected or stale approval, or one whose
             // window closed without acceptance. The revocation wins.
-            durable = s.demote(peer, false) && durable;
+            durable = s.demote(peer) && durable;
             if (!listed(s.refused, peer) && s.pending.contains(peer)) durable = s.pending.forget(peer) && durable;
             std::erase(s.awaiting, peer);
             ++unadmitted;
@@ -243,43 +244,40 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
         if (listed(approved, peer)) continue;
         if ((s.allowed && s.allowed->device.identity == peer) || (s.connected && s.connected->device.identity == peer))
             s.close_window();
+        // Refused from now on; its bond stays in BlueZ (a journal entry beside it, left by an
+        // interrupted commit, is still the enrolment's cleanup below).
         durable = s.demote(peer) && durable;
-        unwanted.push_back(peer);
     }
     for (const auto& peer : std::vector<PeerIdentity>{s.pending.peers()}) {
         if (listed(approved, peer) || live == peer) continue;
         std::erase(s.awaiting, peer);
         if (!listed(unwanted, peer)) unwanted.push_back(peer);
     }
-    // The removal obligation is derived, not only journalled: a bond whose journal entry was lost
-    // (a failed write, a crash, an older helper's demotion order) is still removed. Only identities
-    // the helper's own history names count; BlueZ cannot tell the owner's other bonds apart. The
-    // adapter is Android-Auto-exclusive (docs/enrolment-ordering.md): a forgotten phone paired again
-    // outside Android Auto is removed again, with a warning naming its redacted address.
+    // The adapter is shared (docs/enrolment-ordering.md, #136): a forgotten phone that is still,
+    // or again, bonded is refused (admitted() never passes a revoked identity), never removed, and
+    // a warning names its redacted address.
     for (const auto& device : devices) {
         const auto& peer = device.identity;
         if (!device.bonded || !s.revoked.contains(peer) || listed(approved, peer) || live == peer ||
             listed(unwanted, peer)) continue;
-        std::cerr << "system-helper: warning bond_removed_revoked_identity "
+        std::cerr << "system-helper: warning bond_kept_revoked_identity "
                   << diagnostics::redact_identifier(peer.address)
-                  << ": this phone was forgotten in Android Auto but is bonded again (paired outside "
-                     "Android Auto); the Bluetooth adapter is Android-Auto-exclusive, so its bond is "
-                     "removed. Enrol the phone again in Android Auto to use it.\n";
-        durable = s.pending.remember(peer) && durable;
-        unwanted.push_back(peer);
+                  << ": this phone was forgotten in Android Auto but is still paired in Bluetooth; the "
+                     "Bluetooth adapter is shared, so its pairing is kept and Android Auto refuses the "
+                     "phone. Enrol the phone again in Android Auto to use it.\n";
     }
     s.reconciled = durable;
     // One removal scan, within one invocation's budget, and never a retry of an earlier failure
     // (those are the tick's, Impl::retire_unaccepted): the reply waits on no other identity's
-    // backoff. With every state change durable, each unwanted bond's removal is durably owed in
+    // backoff. With every state change durable, each unwanted (journalled) bond's removal is owed in
     // `pending`, so what this scan does not remove is the helper's to retry and no receiver record
     // pins capacity (finding 3).
     if (durable) {
         s.retire_unaccepted(Impl::Retire::first, nullptr, &devices);
     } else {
-        // A failed write keeps the stricter state: an unwanted bond is still disconnected and
-        // removed (best effort, same budget) whether or not its obligation was recorded, and the
-        // reconciliation fails so the receiver retries.
+        // A failed write keeps the stricter state: an unwanted journalled bond is still
+        // disconnected and removed (best effort, same budget), and the reconciliation fails so the
+        // receiver retries.
         Impl::RemovalBudget budget{s};
         for (const auto& peer : unwanted) {
             (void)s.remove_bond(devices, peer, budget, Impl::Retire::first);

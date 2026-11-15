@@ -152,6 +152,7 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     // Authority: an admitted bond, a revoked (historical) one, or one still on the pending-removal
     // list (unaccepted or provisional; the receiver retires it after a failed write or commit).
+    // Only the last is ever removed from BlueZ (#136).
     if (!address_valid(identity.address) || !address_valid(identity.adapter)) return Error{ErrorCode::helper_rejected};
     const bool authority = impl_->managed.revocable(identity) || impl_->revoked.contains(identity) ||
                            impl_->pending.contains(identity);
@@ -173,10 +174,20 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
         (impl_->connected && impl_->connected->device.identity == identity)) impl_->close_window();
     std::erase(impl_->approved, identity);
     std::erase(impl_->awaiting, identity);
+    // The Bluetooth adapter is shared (docs/enrolment-ordering.md, #136): only a bond on the
+    // enrolment journal (unaccepted, provisional, or left by an interrupted commit) is removed
+    // here, as that enrolment's cleanup. Any other bond (admitted or already revoked) is demoted to
+    // history and kept in BlueZ: from then on it is refused for admission, the Android Auto
+    // profile, HFP authorization and reconnect, and only the owner (or infotainment) unpairs it.
+    if (!impl_->pending.contains(identity)) {
+        const bool demoted = impl_->demote(identity);
+        std::erase_if(impl_->observations, [&](const auto& item) { return item.second.device.identity == identity; });
+        return demoted ? core::Result<void>{} : core::Result<void>{Error{ErrorCode::helper_unavailable}};
+    }
     // Demote first: once forgotten, the bond is never admitted (services, reconnect) again and
     // is never taken as acceptance of a later enrolment of the same identity. The removal is owed
-    // durably (journal) before the managed entry goes, and the journal entry is dropped only after
-    // BlueZ confirmed the removal. Every write is confirmed durable before success is reported.
+    // durably (journal) already, and the journal entry is dropped only after BlueZ confirmed the
+    // removal. Every write is confirmed durable before success is reported.
     const bool demoted = impl_->demote(identity);
     std::erase_if(impl_->observations, [&](const auto& item) { return item.second.device.identity == identity; });
     std::vector<Impl::Device> devices;

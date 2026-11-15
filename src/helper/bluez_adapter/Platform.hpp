@@ -43,11 +43,13 @@ struct BluezBackend::Impl {
     // on `pending`. Provisional: acknowledged in this enrolment (`acknowledged`) with its
     // `pending` entry kept. Revoked: on `revoked` only. Cleanup follows `pending` alone.
     bluez_adapter::ManagedPeers managed;
-    // Bonds an enrolment window may have created that were never admitted, awaiting removal.
+    // Bonds an enrolment window may have created that were never admitted, awaiting removal. The
+    // only source of BlueZ removals: a bond outside it is never deleted (shared adapter, #136).
     // Persisted (same file rules as `managed`) so a helper restart cannot lose a removal: this is
     // the durable cleanup obligation of every unaccepted or provisional bond.
     bluez_adapter::ManagedPeers pending;
-    // Forgotten bonds: revocation authority only, never admission or acceptance of a new bond.
+    // Forgotten bonds: refused for every Android Auto path, their BlueZ bond kept (#136). Never
+    // admission or acceptance of a new bond.
     bluez_adapter::ManagedPeers revoked;
     // Removed from BlueZ already; only the record's rewrite is still failing. Never removed again.
     std::vector<PeerIdentity> removal_done;
@@ -138,11 +140,11 @@ struct BluezBackend::Impl {
     // `managed`, no cleanup obligation, not awaiting and not being demoted. Retries an unconfirmed
     // directory sync once.
     bool admitted(const PeerIdentity&);
-    // Moves a managed bond to `revoked`. With owe_removal the device removal is recorded in
-    // `pending` first, before any managed state is dropped (journal, then history, then managed).
-    // True only once every write is confirmed durable (rename + directory fsync); until then the
-    // identity is refused admission, and the next call or reconciliation completes it.
-    bool demote(const PeerIdentity&, bool owe_removal = true);
+    // Moves a managed bond to `revoked` (history, then out of `managed`). Never owes a removal:
+    // on the shared adapter the bond stays in BlueZ, refused (#136). True only once every write is
+    // confirmed durable (rename + directory fsync); until then the identity is refused admission,
+    // and the next call or reconciliation completes it.
+    bool demote(const PeerIdentity&);
     // Durably drops revocation history for an identity whose fresh enrolment reached the committed
     // state (accepted number, acknowledged bond, the receiver's durable approval); nothing else
     // clears it. Opening, rejecting, cancelling or timing out an enrolment never does.

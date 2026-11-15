@@ -125,10 +125,12 @@ commit keeps a durable approval and reconciliation admits the bond (docs/enrolme
 A failing reconciliation emits `bond_reconcile_pending` once (retried every second); approved
 identities the helper cannot admit are reported as `bond_reconcile_unadmitted_enrol_again` with
 their count: the recovery is to enrol each such phone again (or ForgetPhone it). The Jetson's
-Bluetooth adapter is Android-Auto-exclusive: a phone forgotten in Android Auto that is paired
-again outside it is removed again by reconciliation, and the helper logs the warning
-`bond_removed_revoked_identity` with the redacted address each time, saying the phone was
-forgotten in Android Auto and must be enrolled again. Bond removals run under a per-invocation
+Bluetooth adapter is shared (#136): Android Auto never deletes a Bluetooth pairing outside an
+active enrolment window. A phone forgotten in Android Auto keeps its pairing, as does one paired
+again outside it; both are refused on every Android Auto path (admission, RFCOMM bootstrap, HFP,
+`ReconnectPeerV1`), and each reconciliation that finds such a bond logs the warning
+`bond_kept_revoked_identity` with the redacted address, saying the phone was forgotten in
+Android Auto and must be enrolled again. Enrolment-window bond removals run under a per-invocation
 budget (two attempts, 100 ms) with per-identity exponential backoff, so a slow or failing BlueZ
 never delays another phone's reconciliation, confirm or reconnect (docs/enrolment-ordering.md,
 Removal budget). `PairingOpened`
@@ -251,7 +253,7 @@ the helper does not expose Introspectable). Methods:
 | PollPeerV1 | empty | `utss` error, handle, address, adapter identity | Exactly one helper-observed public BR/EDR candidate, otherwise reject |
 | BindPeerV1 | `ttt` generation, request source, observed handle | `ut` error, zero | Snapshot binding before confirmation, no radio exposure |
 | ReconnectPeerV1 | `t` observed handle | `ut` error, state | Store-owner exact lookup followed by helper actual-bond check |
-| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only an admitted, revoked or pending-removal exact identity (or, reporting success with nothing to do, one this helper run's cleanup already removed and no longer present); demotes an admitted bond to `revoked-bonds` and reports success only once that demotion is durable; re-resolve BlueZ object, never accept a supplied path. The fast path of ForgetPhone: reconciliation resolves a bond leg it could not complete |
+| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only an admitted, revoked or pending-removal exact identity (or, reporting success with nothing to do, one this helper run's cleanup already removed and no longer present); demotes an admitted bond to `revoked-bonds` and reports success only once that demotion is durable; removes a BlueZ bond only for a pending-removal (enrolment) identity, otherwise keeps it paired and refused (#136); re-resolve BlueZ object, never accept a supplied path. The fast path of ForgetPhone: reconciliation resolves a bond leg it could not complete |
 | PairingBondConfirmedV1 | `tt` generation, request source | `ut` error, bonded boolean | Verification only: accepted comparison and exact bonded snapshot; records nothing |
 | PairingBondAcknowledgedV1 | `tt` generation, request source | `ut` error, reserved zero | Marks the verified bond provisional after every receiver-side check passed; writes nothing, admits nothing |
 | PairingBondCommittedV1 | `tt` generation, request source | `ut` error, reserved zero | After the receiver's durable trust write: admits the provisional bond (confirmed `managed-bonds` sync, then durable `pending-removals` removal); any failure closes the window and parks the bond, unadmitted, for reconciliation |

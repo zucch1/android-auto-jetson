@@ -176,14 +176,15 @@ def revocation_flow(surface: Surface) -> None:
     assert surface.phone() == phone and surface.state()["removed"] == []
     assert command(surface.receiver, "fault-dir") == "0"
     rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (phone,)))
-    assert surface.phone() == 0 and len(surface.state()["removed"]) == 1
+    # The helper leg demotes and keeps the bond (shared adapter, #136).
+    assert surface.phone() == 0 and surface.state()["removed"] == []
     assert command(surface.receiver, "fault-clear") == "0"
     assert command(surface.receiver, "pending-revocations") == "1"
     command(surface.mock, "restore")
     rejected(surface.consumer, "RequestAddPhone")
     for _ in range(3):
         rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (phone,)))
-        assert len(surface.state()["removed"]) == 1
+        assert surface.state()["removed"] == []
     assert command(surface.receiver, "pending-revocations") == "1"
     print("PASS revoke703_precommit_and_missing_ap_remains_pending_without_reapproval", flush=True)
 
@@ -202,9 +203,11 @@ def bond_retry_flow(surface: Surface) -> None:
     command(surface.mock, "allow-remove")
     rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (phone,)))
     assert command(surface.receiver, "pending-revocations") == "1"
-    # The failed removal backs off (1 s doubling to 30 s, #118); the owed removal completes on a
-    # later helper tick once BlueZ allows it.
-    wait(lambda: len(surface.state()["removed"]) == 1, 35)
+    # The bond leg never needs BlueZ: the forgotten bond is kept and refused (shared adapter, #136).
+    time.sleep(1.2)
+    assert surface.state()["removed"] == [] and surface.state()["remove_attempts"] == 0
+    assert command(surface.receiver, "reconnect") != "0", "a forgotten phone reconnected"
+    assert command(surface.mock, "AuthorizeService hfp") == "rejected"
     print("PASS bond_retry_progress_with_explicitly_unavailable_ap", flush=True)
 
 

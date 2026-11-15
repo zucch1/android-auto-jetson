@@ -239,8 +239,8 @@ def commit_failure_keeps_approval(build: Path, directory: Path) -> None:
 
 def forget_with_helper_down_then_receiver_restart(build: Path, directory: Path) -> None:
     """Finding 2: ForgetPhone removes trust durably while the helper is down; the receiver restarts.
-    The helper's managed authority must not survive: reconciliation removes the bond, and the phone
-    can enrol again."""
+    The helper's managed authority must not survive: reconciliation demotes and refuses the phone but
+    keeps its bond (shared adapter, #136), and once the owner unpairs it, it can enrol again."""
     with contextlib.ExitStack() as stack:
         surface = Surface(stack, build, directory)
         enrol(surface, directory)
@@ -258,15 +258,18 @@ def forget_with_helper_down_then_receiver_restart(build: Path, directory: Path) 
         assert peer_in(directory, "managed-bonds") and not surface.state()["removed"], \
             "the helper acted before the receiver answered"
         restart_receiver(stack, build, directory, surface)
-        wait(lambda: len(surface.state()["removed"]) == 1, 8)
-        assert not peer_in(directory, "managed-bonds") and peer_in(directory, "revoked-bonds")
-        wait(lambda: not peer_in(directory, "pending-removals"))
-        command(surface.mock, "restore")
-        command(surface.mock, "unpaired")
+        wait(lambda: not peer_in(directory, "managed-bonds") and peer_in(directory, "revoked-bonds"), 8)
+        time.sleep(1.2)
+        assert not surface.state()["removed"], "a forgotten bond was deleted outside an enrolment window"
+        assert not peer_in(directory, "pending-removals"), "the forget owes a removal"
+        assert command(surface.receiver, "reconnect") != "0", "a forgotten phone reconnected"
+        assert command(surface.mock, "AuthorizeService hfp") == "rejected"
+        assert command(surface.mock, "NewConnection") == "rejected"
+        command(surface.mock, "unpaired")  # the owner unpairs it outside Android Auto
         enrol(surface, directory)
         assert surface.phone() != 0
         assert command(surface.receiver, "reconnect") == "0"
-        print("PASS forget_with_helper_down_then_receiver_restart_removes_bond_and_allows_reenrolment", flush=True)
+        print("PASS forget_with_helper_down_then_receiver_restart_keeps_bond_refused_and_allows_reenrolment", flush=True)
 
 
 def forget_then_reenrol(build: Path, directory: Path, failure: str) -> None:
@@ -280,11 +283,10 @@ def forget_then_reenrol(build: Path, directory: Path, failure: str) -> None:
         assert peer_in(directory, "managed-bonds") and not peer_in(directory, "pending-removals")
         phone = surface.phone()
         surface.forget(phone)
-        assert len(surface.state()["removed"]) == 1
+        assert not surface.state()["removed"], "a forgotten bond was deleted outside an enrolment window"
         assert not peer_in(directory, "managed-bonds") and peer_in(directory, "revoked-bonds")
         wait(lambda: command(surface.receiver, "pending-revocations") == "0")
-        command(surface.mock, "restore")
-        command(surface.mock, "unpaired")
+        command(surface.mock, "unpaired")  # the owner unpairs it outside Android Auto
         request = surface.request()
         Surface.confirm(surface, request)  # opens the window only; no acceptance
         assert peer_in(directory, "pending-removals"), "the new enrolment has no cleanup obligation"
@@ -296,7 +298,7 @@ def forget_then_reenrol(build: Path, directory: Path, failure: str) -> None:
                     GLib.Variant("(ttb)", (request, int(challenge["challenge_id"]), False)))
         else:
             surface.cancel(request)
-        wait(lambda: len(surface.state()["removed"]) == 2, 5)
+        wait(lambda: len(surface.state()["removed"]) == 1, 5)  # the enrolment's own cleanup
         wait(lambda: not peer_in(directory, "pending-removals"))
         # Only a committed enrolment clears the history: one rejected or cancelled before any
         # accepted number leaves it in place, so a later approval of this identity is never admitted.
@@ -307,9 +309,9 @@ def forget_then_reenrol(build: Path, directory: Path, failure: str) -> None:
 
 
 def forget_with_failed_journal_and_removal(build: Path, directory: Path) -> None:
-    """P2-1 through the real ForgetPhone: the helper's journal write fails and BlueZ refuses the
-    removal; the helper restarts. Managed state is never dropped before the removal is owed, and
-    the restarted helper's reconciliation removes the bond (failing while BlueZ still refuses)."""
+    """#136 through the real ForgetPhone: the helper's journal cannot be written and BlueZ refuses
+    every removal. Neither is needed: the forget demotes and refuses the phone at once, keeps its
+    bond, owes no removal, and a restarted helper's reconciliation keeps it that way."""
     with contextlib.ExitStack() as stack:
         surface = ComposedSurface(stack, build, directory)
         request = surface.request()
@@ -318,33 +320,28 @@ def forget_with_failed_journal_and_removal(build: Path, directory: Path) -> None
         assert peer_in(directory, "managed-bonds")
         phone = surface.phone()
         # The journal can no longer be replaced (a directory now sits at its name), so every
-        # pending-removals write fails while the other files stay writable.
+        # pending-removals write would fail while the other files stay writable.
         journal = directory / "pending-removals"
         journal.unlink(missing_ok=True)
         journal.mkdir(mode=0o700)
         command(surface.mock, "fail-remove")
-        with contextlib.suppress(GLib.Error):
-            surface.forget(phone)  # the helper leg fails; trust is removed regardless
+        surface.forget(phone)
         assert surface.phone() == 0, "the forget did not remove trust"
-        assert not surface.state()["removed"]
-        assert command(surface.receiver, "reconnect") != "0", "a phone being forgotten reconnected"
-        stop_helper(surface)
-        journal.rmdir()
-        if peer_in(directory, "revoked-bonds"):
-            assert peer_in(directory, "managed-bonds") or peer_in(directory, "pending-removals"), \
-                "managed state was dropped before the removal was owed"
-        start_helper(stack, build, directory, surface)
-        time.sleep(2.5)  # the live receiver reconciles the new incarnation; BlueZ still refuses
-        assert not surface.state()["removed"]
-        command(surface.mock, "allow-remove")
-        wait(lambda: len(surface.state()["removed"]) == 1, 8)
-        wait(lambda: not peer_in(directory, "pending-removals"), 4)
         assert not peer_in(directory, "managed-bonds") and peer_in(directory, "revoked-bonds")
         wait(lambda: command(surface.receiver, "pending-revocations") == "0", 8)
-        command(surface.mock, "restore")
-        command(surface.mock, "paired")
+        assert surface.state()["remove_attempts"] == 0, "the forget tried to delete the bond"
         assert command(surface.receiver, "reconnect") != "0", "a forgotten phone reconnected"
-        print("PASS forget_with_failed_journal_and_failed_removal_is_completed_by_reconciliation", flush=True)
+        stop_helper(surface)
+        journal.rmdir()
+        command(surface.mock, "allow-remove")
+        start_helper(stack, build, directory, surface)
+        time.sleep(2.5)  # the live receiver reconciles the new incarnation
+        assert surface.state()["remove_attempts"] == 0, "reconciliation tried to delete a forgotten bond"
+        assert not peer_in(directory, "pending-removals"), "a removal is owed outside an enrolment"
+        assert not peer_in(directory, "managed-bonds") and peer_in(directory, "revoked-bonds")
+        assert command(surface.receiver, "reconnect") != "0", "a forgotten phone reconnected"
+        assert command(surface.mock, "AuthorizeService hfp") == "rejected"
+        print("PASS forget_with_failed_journal_and_failed_removal_keeps_the_bond_refused", flush=True)
 
 
 def resurrected_approval_after_unaccepted_enrolment(build: Path, directory: Path, failure: str) -> None:
@@ -359,15 +356,14 @@ def resurrected_approval_after_unaccepted_enrolment(build: Path, directory: Path
         store = directory / "store"
         approved = store.read_bytes()
         surface.forget(surface.phone())
-        assert len(surface.state()["removed"]) == 1
+        assert not surface.state()["removed"], "a forgotten bond was deleted outside an enrolment window"
         assert peer_in(directory, "revoked-bonds")
         wait(lambda: command(surface.receiver, "pending-revocations") == "0")
         # Power loss drops the forget: the approval is back in the receiver's store.
         store.write_bytes(approved)
         assert command(surface.receiver, "reload-store") == "0"
         assert surface.phone() != 0
-        command(surface.mock, "restore")
-        command(surface.mock, "unpaired")
+        command(surface.mock, "unpaired")  # the owner unpairs it outside Android Auto
         request = surface.request()
         Surface.confirm(surface, request)  # opens the window only
         assert peer_in(directory, "revoked-bonds"), "opening an enrolment cleared the revocation"
