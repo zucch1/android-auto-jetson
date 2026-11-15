@@ -48,6 +48,18 @@ struct PemBuffer {
     std::unique_ptr<char[]> bytes{new char[65537]{}};
     ~PemBuffer() { OPENSSL_cleanse(bytes.get(), 65537); }
 };
+
+int validity_relative_to_now(const ASN1_TIME* value) {
+    int days = 0, seconds = 0;
+    // Unlike X509_cmp_current_time's RFC 5280-only comparison, OpenSSL's
+    // ASN.1 parser also validates legacy HU times with explicit UTC offsets
+    // (and optional seconds), converting them to UTC before subtraction.
+    if (ASN1_TIME_diff(&days, &seconds, nullptr, value) != 1) {
+        throw Error(Failure::malformed);
+    }
+    if (days != 0) return days < 0 ? -1 : 1;
+    return seconds <= 0 ? -1 : 1;
+}
 }
 
 Credentials load_credentials() {
@@ -165,8 +177,10 @@ Credentials load_credentials() {
             security_bits < kMinimumSecurityBits || digest == NID_sha1 || digest == NID_md5) {
             throw Error(Failure::insecure);
         }
-        const int expiry = X509_cmp_current_time(X509_get0_notAfter(cert));
-        if (expiry == 0) { throw Error(Failure::malformed); }
+        // Validate both fields on every certificate. Preserve the existing HU
+        // compatibility policy: a future notBefore is not a fatal condition.
+        (void)validity_relative_to_now(X509_get0_notBefore(cert));
+        const int expiry = validity_relative_to_now(X509_get0_notAfter(cert));
         // Android Auto HU identity is not a Web PKI server identity. Rejecting
         // an expired compatibility credential can disable otherwise working
         // phones; emit a stable, redacted warning on every load instead.

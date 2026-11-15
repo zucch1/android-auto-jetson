@@ -61,6 +61,7 @@ TEST(TlsHardening, VerifiedServerRejectsUntrustedCertificate) {
 }
 
 #include <cstdlib>
+#include <ctime>
 #include <string>
 #include <unistd.h>
 #include <openssl/pem.h>
@@ -118,6 +119,108 @@ TEST(TlsHardening, RejectsSha1Signature) {
     Bundle bundle(credential.certificate.get(), credential.private_key.get());
     expect_insecure();
 }
+
+namespace {
+// Mutate only fresh synthetic test certificates, before re-signing them.
+void set_raw_time(ASN1_TIME* field, int type, const std::string& value) {
+    field->type = type;
+    ASSERT_EQ(ASN1_STRING_set(field, value.data(), static_cast<int>(value.size())), 1);
+}
+
+class CredentialValidity : public testing::TestWithParam<bool> {};
+
+void expect_malformed() {
+    try {
+        (void)aa::tls::load_credentials();
+        FAIL() << "malformed validity was accepted";
+    } catch (const aa::tls::Error& error) {
+        EXPECT_EQ(error.failure(), aa::tls::Failure::malformed);
+    }
+}
+}
+
+TEST_P(CredentialValidity, LegacyOffsetValidity) {
+    struct Case {
+        int type;
+        const char* before;
+        const char* after;
+        bool expired;
+    };
+    const Case cases[] = {
+        {V_ASN1_UTCTIME, "140704000000-0700", "450429142838-0700", false},
+        {V_ASN1_UTCTIME, "1407040000+0530", "4504291428+0530", false},
+        {V_ASN1_UTCTIME, "140704000000-0700", "150429142838-0700", true},
+        {V_ASN1_GENERALIZEDTIME, "20140704000000-0700", "21450429142838-0700", false},
+        {V_ASN1_GENERALIZEDTIME, "201407040000+0530", "201504291428+0530", true},
+        {V_ASN1_UTCTIME, "140704000000Z", "450429142838Z", false},
+        {V_ASN1_GENERALIZEDTIME, "20140704000000Z", "21450429142838Z", false},
+        // Preserve the pre-existing policy for not-yet-valid HU identities.
+        {V_ASN1_UTCTIME, "440704000000-0700", "450429142838-0700", false},
+    };
+    for (const auto& item : cases) {
+        SCOPED_TRACE(item.after);
+        auto leaf = aa::tls::load_credentials();
+        aa::tls::Certificate changed(X509_dup(leaf.certificate.get()), X509_free);
+        set_raw_time(X509_getm_notBefore(changed.get()), item.type, item.before);
+        set_raw_time(X509_getm_notAfter(changed.get()), item.type, item.after);
+        ASSERT_GT(X509_sign(changed.get(), leaf.private_key.get(), EVP_sha256()), 0);
+        Bundle bundle(GetParam() ? leaf.certificate.get() : changed.get(),
+                      leaf.private_key.get(), false, GetParam() ? changed.get() : nullptr);
+        testing::internal::CaptureStderr();
+        EXPECT_NO_THROW((void)aa::tls::load_credentials());
+        EXPECT_EQ(testing::internal::GetCapturedStderr(), item.expired ?
+            "tls-credential-warning: certificate-expired\n" : "");
+    }
+}
+
+TEST_P(CredentialValidity, OffsetIsAppliedBeforeExpiryComparison) {
+    // A wall-clock time one hour ahead is expired with +0200; a time one
+    // hour behind remains valid with -0200. This catches ignored/reversed offsets.
+    for (const bool expired : {false, true}) {
+        auto leaf = aa::tls::load_credentials();
+        aa::tls::Certificate changed(X509_dup(leaf.certificate.get()), X509_free);
+        ASN1_TIME* after = X509_getm_notAfter(changed.get());
+        ASSERT_NE(ASN1_TIME_set(after, std::time(nullptr) + (expired ? 3600 : -3600)), nullptr);
+        std::string value(reinterpret_cast<const char*>(ASN1_STRING_get0_data(after)),
+                          static_cast<std::size_t>(ASN1_STRING_length(after)));
+        ASSERT_EQ(value.back(), 'Z');
+        value.pop_back();
+        value += expired ? "+0200" : "-0200";
+        set_raw_time(after, ASN1_STRING_type(after), value);
+        ASSERT_GT(X509_sign(changed.get(), leaf.private_key.get(), EVP_sha256()), 0);
+        Bundle bundle(GetParam() ? leaf.certificate.get() : changed.get(),
+                      leaf.private_key.get(), false, GetParam() ? changed.get() : nullptr);
+        testing::internal::CaptureStderr();
+        EXPECT_NO_THROW((void)aa::tls::load_credentials());
+        EXPECT_EQ(testing::internal::GetCapturedStderr(), expired ?
+            "tls-credential-warning: certificate-expired\n" : "");
+    }
+}
+
+TEST_P(CredentialValidity, RejectsMalformedValidity) {
+    for (const int type : {V_ASN1_UTCTIME, V_ASN1_GENERALIZEDTIME}) {
+        for (const char* value : {"garbage", "450429142838-2400", "450429142838+0060",
+                                  "450230142838-0700", "450429242838-0700",
+                                  "450429142860-0700", "450429142838-07x0",
+                                  "450429142838-0700trailing"}) {
+            for (const bool before : {false, true}) {
+                SCOPED_TRACE(value);
+                auto leaf = aa::tls::load_credentials();
+                aa::tls::Certificate changed(X509_dup(leaf.certificate.get()), X509_free);
+                std::string time = value;
+                if (type == V_ASN1_GENERALIZEDTIME && time != "garbage") time = "20" + time;
+                set_raw_time(before ? X509_getm_notBefore(changed.get()) :
+                                      X509_getm_notAfter(changed.get()), type, time);
+                ASSERT_GT(X509_sign(changed.get(), leaf.private_key.get(), EVP_sha256()), 0);
+                Bundle bundle(GetParam() ? leaf.certificate.get() : changed.get(),
+                              leaf.private_key.get(), false, GetParam() ? changed.get() : nullptr);
+                expect_malformed();
+            }
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(LeafAndChain, CredentialValidity, testing::Bool());
 
 TEST(TlsHardening, ExpiredHeadUnitCertificateWarnsAndLoads) {
     auto credential = aa::tls::load_credentials();
