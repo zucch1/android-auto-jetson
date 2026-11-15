@@ -129,7 +129,7 @@ def restart_receiver(stack: contextlib.ExitStack, build: Path, directory: Path, 
 
 def start_helper(stack: contextlib.ExitStack, build: Path, directory: Path, surface: Surface) -> None:
     surface.daemon = stack.enter_context(process([str(build / "aa-system-helper"), "--private-bus",
-                                                  surface.address, str(directory)], surface.env))
+                                                  surface.address, str(directory), *surface.platform_arguments], surface.env))
 
 
 def stop_helper(surface: Surface) -> None:
@@ -484,8 +484,12 @@ def lost_remove_reply_outside_rebond(build: Path, directory: Path) -> None:
         # do not require a transient pending/P journal state to remain visible.
         command(surface.mock, "normal-remove-reply")
 
+        previous_helper = surface.state()["helper"]
         stop_helper(surface)
         start_helper(stack, build, directory, surface)
+        # A cleared journal may predate restart. Wait for the new helper's
+        # agent/profile registration before calling back through the BlueZ mock.
+        wait(lambda: (state := surface.state())["helper"] != previous_helper and len(state["profile"]) == 1, 8)
         wait(lambda: not peer_in(directory, "pending-removals"), 8)
         assert len(surface.state()["removed"]) == 1, "stale pending removal deleted a newer outside bond"
         assert "02:00:00:00:00:01 02:00:00:00:00:AA R\n" in (directory / "revoked-bonds").read_text()
@@ -494,6 +498,10 @@ def lost_remove_reply_outside_rebond(build: Path, directory: Path) -> None:
         assert command(surface.mock, "AuthorizeService") == "rejected"
         assert command(surface.mock, "NewConnection") == "rejected"
 
+        # The receiver also has to finish its lost-reply source/AP retirement
+        # before a fresh request for this identity can be admitted.
+        wait(lambda: command(surface.receiver, "pending-revocations") == "0", 8)
+        time.sleep(1.5)  # live receiver's 1 s helper-incarnation refresh, as in the case above
         # Fresh AA re-enrolment still works cleanly.
         command(surface.mock, "unpaired")
         request = surface.request()

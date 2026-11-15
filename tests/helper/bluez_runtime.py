@@ -84,8 +84,8 @@ class Surface:
         (directory / "receiver.sha256").write_text(hashlib.sha256(binary.read_bytes()).hexdigest() + "\n")
         for filename in ("session.uid", "receiver.sha256"):
             (directory / filename).chmod(0o600)
-        options = self.platform_options(stack, build, directory)
-        self.daemon = stack.enter_context(process([str(build / "aa-system-helper"), "--private-bus", self.address, str(directory), *options], self.env))
+        self.platform_arguments = self.platform_options(stack, build, directory)
+        self.daemon = stack.enter_context(process([str(build / "aa-system-helper"), "--private-bus", self.address, str(directory), *self.platform_arguments], self.env))
         wait(lambda: len(self.state()["profile"]) == 1)
         args = [str(binary), self.address] if probe else [str(binary), "receiver", self.address, str(directory / "store"), "bluez"]
         self.receiver = stack.enter_context(process(args, self.env))
