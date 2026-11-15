@@ -11,6 +11,7 @@ fixtures/tests and the phase-B runbook; the actual 30-minute performance run and
 tools/perf/
   aa-projection-perf.sh            entry point (strict CLI, fail-closed)
   aa_projection_collect.py         on-target collector (launched over ssh)
+  aa_build_guard.py                refuses a stage from an unoptimized build
   aa_video_measurements.py         bounded side-band video endpoint reducer
   aa_measurement_coverage.py       shared typed active-window evidence contract
   aa_perf_report.py                capture -> result document + budget verdict
@@ -44,6 +45,19 @@ Exit codes: `0` PASS, `1` FAIL (budget violation), `2` usage error, `3` BLOCKED
 (prerequisite or gated metric unavailable), `4` internal contract violation.
 A green run without measured values is never a pass: if a gated metric cannot be
 measured the run is BLOCKED.
+
+## Build guard
+
+The run measures the deployed binaries, so the build type is part of the
+measurement. Before the receiver or the display starts, `aa_build_guard.py`
+reads `CMAKE_BUILD_TYPE` from the `CMakeCache.txt` of the build directory named
+by `--build-dir` (or `AA_BUILD_DIR`) and refuses an unoptimized build with
+`BLOCKED unoptimized_build` (exit 3). An unoptimized pixel conversion on the GUI
+thread delays paint and the 5 ms display pump enough to fail the 50 ms A/V gate
+on its own. `Release`, `RelWithDebInfo` and `MinSizeRelWithDebInfo` pass;
+`Debug`, an unset value, an unreadable cache and a missing build directory are
+refused. `--allow-unoptimized-build` is a debugging override: it prints a
+warning and its runs are not qualification results. No budget value changes.
 
 ## V2 active-window completeness
 

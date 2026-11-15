@@ -10,6 +10,24 @@ is the **phase-B procedure**: it qualifies the real approved phone over USB/AOA 
 > Jetson display is DP-1 DISCONNECTED). No projection claim is made until the
 > live record below is produced.
 
+## Build
+
+Phase B must run an optimized build: `cmake --preset host-release` on the
+Jetson, or `jetson-aarch64` for cross builds; `RelWithDebInfo` is acceptable
+when symbols are needed. Never the Debug `host-dev` or `host-asan` preset: a
+Debug build is not a slower measurement of the same code — building only the
+projection widget's pixel conversion unoptimized reproduced a 106.8 ms A/V
+failure against the 50 ms gate, where the same commit measured 16.2-30.1 ms
+optimized, because that conversion runs on the GUI thread and delays paint and
+the 5 ms display pump. Record the `CMAKE_BUILD_TYPE` and the effective C++
+compiler flags (the build directory's `CMakeCache.txt`) in the run report.
+
+The task-32 performance collector enforces this and refuses to start a stage
+without that proof (`BLOCKED unoptimized_build`, see
+`docs/qualification/wired-perf-runbook.md`); `--allow-unoptimized-build` there is
+a tooling-debugging override, never a qualification run. This harness's own
+`projection_timeout_ms` budget and every gate value are unchanged.
+
 ## Components wired on the target
 
 | Stage | Module | Evidence |
@@ -39,7 +57,11 @@ composes the modules above and reimplements none of them.
    `DISPLAY=:1` for the remote display consumer; X11 clients also need
    `XAUTHORITY` pointing at the authority cookie of the target X server (the
    owning session's cookie file) - without it the X connection is refused with
-   an authentication failure.
+   an authentication failure. With GDM automatic login the owner's session is on
+   display `:0` with its cookie at `/run/user/<uid>/gdm/Xauthority`, and `:1` is
+   the display of a manually started second session: the qualification needs the
+   display the owner's screen session is actually on, so export that session's
+   `DISPLAY`/`XAUTHORITY` for the run.
 5. A wired receiver binary on the target: `aa-wired-receiver`
    (`tools/wired-receiver/main.cpp`), which runs `aa::app::WiredSession` over
    the real `aa_transport_usb` endpoint with `transport::admit_via(TrustStore)`

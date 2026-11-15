@@ -20,6 +20,12 @@ The capture is the raw record; budget verdicts are produced by
 ``aa_perf_report.py``. A metric the collector cannot observe is emitted as
 ``null`` -- never faked. Every subprocess wait is bounded.
 
+A live qualification stage is refused before anything is launched unless the
+build directory that produced the binaries proves an optimized build (see
+``aa_build_guard.py``): a Debug build delays GUI-thread paint and the display
+pump enough to fail the A/V gate on its own. ``--allow-unoptimized-build`` is a
+debugging override only.
+
 This tool does not modify target state (no installs, no udev, no kernel
 changes); it only launches the supplied binaries and reads procfs/sysfs.
 """
@@ -48,6 +54,9 @@ from typing import Literal
 from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
 from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Sample, ThermalZone, VideoEvidence, thermal_policy_for_model,
+)
+from aa_build_guard import (
+    BuildGuardError, REFUSAL_PREFIX, describe_build, require_optimized_build,
 )
 
 CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
@@ -863,6 +872,11 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--startup-timeout-seconds", type=int,
                         default=_PROJECTION_STARTUP_TIMEOUT_SECONDS,
                         help="startup timeout, may only shorten the default 60-second grace")
+    parser.add_argument("--build-dir", default=os.environ.get("AA_BUILD_DIR"),
+                        help="build directory (CMakeCache.txt) that produced the launched binaries; "
+                             "required for a live qualification stage")
+    parser.add_argument("--allow-unoptimized-build", action="store_true",
+                        help="debugging override: start even without an optimized build")
     args = parser.parse_args(argv)
 
     if args.duration_seconds <= 0:
@@ -874,6 +888,17 @@ def _cli(argv: list[str]) -> int:
     if not math.isfinite(args.interval) or args.interval <= 0:
         print("error: --interval must be positive", file=sys.stderr)
         return 2
+
+    # The build guard runs here, before collect() launches the receiver or the
+    # display: an unoptimized build is refused instead of being measured.
+    try:
+        build_type = require_optimized_build(
+            args.build_dir, allow_unoptimized=args.allow_unoptimized_build)
+    except BuildGuardError as exc:
+        print(f"{REFUSAL_PREFIX} {exc}", file=sys.stderr)
+        return 2
+    # The capture is stdout, so the run-report record goes to stderr.
+    print(describe_build(args.build_dir, build_type), file=sys.stderr)
 
     old_handler = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(3))

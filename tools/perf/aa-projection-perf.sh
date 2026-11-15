@@ -3,8 +3,8 @@
 #
 # Task-32 wired projection performance + soak measurement CLI.
 #
-#   aa-projection-perf.sh --mode wired --duration 30m --out result.json
-#   aa-projection-perf.sh --mode wired --duration 2h  --out soak.json
+#   aa-projection-perf.sh --mode wired --duration 30m --build-dir BUILD --out result.json
+#   aa-projection-perf.sh --mode wired --duration 2h  --build-dir BUILD --out soak.json
 #   aa-projection-perf.sh --mode wired --capture capture.json --out result.json
 #   Optional approved model-only policy: --thermal-policy orin-nano-cv-unavailable/1
 #   aa-projection-perf.sh --readiness-only [--out readiness.json]
@@ -18,6 +18,12 @@
 # values is never a pass (misleading_success_output). Budgets are fixed in
 # tools/perf/aa-projection-perf.schema.json and never weakened here.
 #
+# A live stage is refused (BLOCKED unoptimized_build) unless --build-dir names
+# the build that produced the launched binaries and its CMakeCache.txt records
+# an optimized CMAKE_BUILD_TYPE (Release/RelWithDebInfo); an unoptimized pixel
+# conversion on the GUI thread fails the A/V gate by itself. --allow-unoptimized-build
+# is a debugging override only, never for a recorded qualification run.
+#
 # Exit codes: 0 PASS, 1 FAIL (budget violation), 2 usage error,
 #             3 BLOCKED (prerequisite or metric unavailable), 4 internal error.
 #
@@ -26,7 +32,7 @@
 # installed receiver/display binary. Every ssh is wrapped in `timeout`.
 #
 # Environment overrides: AA_PERF_HOST (default jetson.local), AA_PERF_PORT
-# (default 1-2.1).
+# (default 1-2.1), AA_BUILD_DIR (default for --build-dir).
 
 set -euo pipefail
 
@@ -51,11 +57,13 @@ INTERVAL=5
 NOW=""
 READINESS_ONLY=0
 THERMAL_POLICY=""
+BUILD_DIR="${AA_BUILD_DIR:-}"
+ALLOW_UNOPTIMIZED=0
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 
 usage() {
-    sed -n '4,30p' "$0"
+    sed -n '4,35p' "$0"
     exit 2
 }
 
@@ -96,6 +104,8 @@ while (($# > 0)); do
         --provenance) require_value "$@"; PROVENANCE="$2"; shift 2 ;;
         --interval) require_value "$@"; INTERVAL="$2"; shift 2 ;;
         --thermal-policy) require_value "$@"; THERMAL_POLICY="$2"; shift 2 ;;
+        --build-dir) require_value "$@"; BUILD_DIR="$2"; shift 2 ;;
+        --allow-unoptimized-build) ALLOW_UNOPTIMIZED=1; shift ;;
         --now) require_value "$@"; NOW="$2"; shift 2 ;;
         --readiness-only) READINESS_ONLY=1; shift ;;
         -h | --help) usage ;;
@@ -110,6 +120,24 @@ esac
 thermal_args=()
 if [[ -n "$THERMAL_POLICY" ]]; then
     thermal_args=(--thermal-policy "$THERMAL_POLICY")
+fi
+
+# Build guard arguments, forwarded verbatim into the on-target collector so the
+# refusal happens before the receiver or display is launched there.
+build_args=()
+if [[ -n "$BUILD_DIR" ]]; then
+    if [[ "$BUILD_DIR" == *"'"* ]]; then
+        echo "usage error: --build-dir must not contain a single quote" >&2
+        exit 2
+    fi
+    build_args+=(--build-dir "$BUILD_DIR")
+fi
+if ((ALLOW_UNOPTIMIZED)); then
+    build_args+=(--allow-unoptimized-build)
+fi
+build_args_remote=""
+if ((${#build_args[@]})); then
+    printf -v build_args_remote ' %q' "${build_args[@]}"
 fi
 
 if ((!READINESS_ONLY)) && [[ "$MODE" != "wired" ]]; then
@@ -293,7 +321,7 @@ import pathlib, sys
 root = pathlib.Path(sys.argv[1])
 collector = (root / "aa_projection_collect.py").read_text()
 print("import sys, types")
-for name in ("aa_measurement_coverage", "aa_video_measurements"):
+for name in ("aa_measurement_coverage", "aa_video_measurements", "aa_build_guard"):
     source = (root / (name + ".py")).read_text()
     print("module = types.ModuleType(" + repr(name) + ")")
     print("sys.modules[module.__name__] = module")
@@ -304,8 +332,16 @@ collector_timeout=$((duration_secs + 120))
 if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port '${PORT}' \
         --duration-seconds ${duration_secs} --interval ${INTERVAL} \
         ${THERMAL_POLICY:+--thermal-policy '${THERMAL_POLICY}'} \
-        ${DISPLAY:+--display '${DISPLAY}'} ${STORE:+--store '${STORE}'}" \
+        ${DISPLAY:+--display '${DISPLAY}'} ${STORE:+--store '${STORE}'}${build_args_remote}" \
         <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err"; then
+    # The on-target collector refuses to start a stage from an unoptimized
+    # build; report that as its own BLOCKED reason, never a generic failure.
+    if grep -q '^error: unoptimized_build:' "$BUFFER/collector.err"; then
+        echo "BLOCKED: unoptimized_build" >&2
+        sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
+        blocked_result "unoptimized_build"
+        exit 3
+    fi
     echo "BLOCKED: collector_failed" >&2
     sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
     blocked_result "collector_failed"
