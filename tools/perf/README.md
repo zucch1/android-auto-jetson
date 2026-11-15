@@ -312,3 +312,36 @@ and foreign build refused, cross-build derivation), an override run reported
 `NOT_QUALIFYING` instead of `PASS`, and the launcher's display-environment
 resolution — all against real `CMakeCache.txt` fixtures and a PATH-local ssh
 stand-in; no target is touched.
+
+### Audio playback-slot diagnostics
+
+Current receiver `audio_write_completed` events follow
+[`audio-write-completed.schema.json`](audio-write-completed.schema.json).
+`presented_ns` remains the real playback slot clamped to handoff completion;
+null still invalidates A/V. The additive `playback_slot_absence` field is null
+when a slot exists, otherwise one of:
+
+| Reason | Meaning |
+| --- | --- |
+| `worker_busy` | Earlier position query is still in flight; no new query queued |
+| `worker_stopped` | Query worker stopped or exited |
+| `deadline_missed` | No matching answer within min(original write deadline, now + 20 ms), or budget already spent |
+| `query_failed` | Sink missing or position query failed |
+| `negative_position` | Position query returned a negative position |
+| `invalid_pts` | PTS absent or outside the signed position domain |
+| `unavailable` | Sink implementation supplies no playback endpoint |
+
+The collector retains diagnostic counts as `playback_slot_absences` in the
+capture, including unknown future reason strings. Historical events without
+this field remain readable. Reasons never substitute a handoff endpoint or
+change interval matching, null invalidation, or the 50 ms maximum A/V gate.
+
+The audio route uses initial preroll at PTS zero (readiness retries use running
+time once the clock settles), then requires settled PLAYING
+and an identity TIME segment before admitting media. Its media epoch is
+`base_steady = steady_now - (gst_clock_now - pipeline_base_time)`, with the
+steady reading bracketing the clock sample; `PTS = scheduled_steady - base_steady`.
+The mapping is checked before every media buffer and sampled again when the
+pipeline base time or clock changes. Rebuilt routes establish a fresh mapping;
+unsupported segments/states fail the route instead of guessing an epoch.
+See [GStreamer's clock and segment model](https://gstreamer.freedesktop.org/documentation/application-development/advanced/clocks.html).

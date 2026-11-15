@@ -80,6 +80,26 @@ struct RoleStreamConfig final {
     AudioFormat input_format{};
 };
 
+// Diagnostic only: absence never falls back to a handoff A/V endpoint.
+enum class PlaybackSlotAbsence : std::uint8_t {
+    none, unavailable, worker_busy, worker_stopped, deadline_missed,
+    query_failed, negative_position, invalid_pts
+};
+
+[[nodiscard]] constexpr std::string_view to_string(PlaybackSlotAbsence reason) noexcept {
+    switch (reason) {
+    case PlaybackSlotAbsence::none: return "none";
+    case PlaybackSlotAbsence::unavailable: return "unavailable";
+    case PlaybackSlotAbsence::worker_busy: return "worker_busy";
+    case PlaybackSlotAbsence::worker_stopped: return "worker_stopped";
+    case PlaybackSlotAbsence::deadline_missed: return "deadline_missed";
+    case PlaybackSlotAbsence::query_failed: return "query_failed";
+    case PlaybackSlotAbsence::negative_position: return "negative_position";
+    case PlaybackSlotAbsence::invalid_pts: return "invalid_pts";
+    }
+    return "unavailable";
+}
+
 // Common monotonic scheduled interval and consumer-side stream-write completion.
 // Completion follows the handoff-confirmed RenderBarrier; not speaker output.
 struct WriteCompletion final {
@@ -92,6 +112,7 @@ struct WriteCompletion final {
     // (ring-buffer commit), pipewiresink near the slot. Absent when the sink
     // reported no position.
     std::optional<core::Nanoseconds> presented{};
+    PlaybackSlotAbsence playback_slot_absence{PlaybackSlotAbsence::unavailable};
 };
 
 struct RenderStep final {

@@ -672,7 +672,7 @@ TEST_F(AudioPipelineRoute, BackpressureTimeoutDegradesAndRefusesFurtherSubmit) {
     request.start_timeout = aa::core::Milliseconds{2000};
     request.write_timeout = aa::core::Milliseconds{200};
     auto outcome = aa::audio::detail::open_default_sink(request);
-    ASSERT_TRUE(outcome.sink != nullptr);
+    ASSERT_TRUE(outcome.sink != nullptr) << outcome.report.cause;
 
     // Releases the downstream block on EVERY exit path (including assertion
     // failures) and only then lets the router release the sink: the harness
@@ -2014,7 +2014,7 @@ TEST(AudioPipelineSinkBackend, FullAppsrcQueueHonorsSingleWriteDeadline) {
         progress = value;
     };
     auto outcome = aa::audio::detail::open_default_sink(request);
-    ASSERT_TRUE(outcome.sink != nullptr);
+    ASSERT_TRUE(outcome.sink != nullptr) << outcome.report.cause;
 
     // Releases the downstream block on EVERY exit path, including assertion
     // failures: the guard is declared after the sink so it runs first.
@@ -2217,13 +2217,69 @@ private:
 
 } // namespace
 
+TEST(AudioPipelineSinkBackend, DelayedPlayingDoesNotBecomeMediaPresentationOffset) {
+    for (const auto delay_ms : {75, 25}) {
+        SCOPED_TRACE(delay_ms);
+        aa::audio::detail::SinkOpenRequest request;
+        request.backend = aa::audio::SinkBackend::pulse;
+        request.format = stereo_48k();
+        request.readiness_delay_for_test = aa::core::Milliseconds{delay_ms};
+        std::optional<aa::audio::SinkWriteProgress> latest;
+        request.on_write_progress = [&](const auto& progress) { latest = progress; };
+        const auto started = now_ns();
+        auto outcome = aa::audio::detail::open_default_sink(request);
+        ASSERT_TRUE(outcome.sink) << outcome.report.cause;
+        EXPECT_GE(now_ns().count - started.count, delay_ms * 1'000'000);
+        ASSERT_TRUE(latest);
+        EXPECT_TRUE(latest->readiness_probe);
+        ASSERT_TRUE(latest->pts_ns);
+        const auto pcm = constant_pcm({kMediaLevel, 960});
+        for (int epoch = 0; epoch < 2; ++epoch) {
+            // A future sample avoids measuring already-late data/clamping.
+            const aa::core::Nanoseconds scheduled{now_ns().count + 80'000'000};
+            ASSERT_TRUE(outcome.sink->write({stereo_48k(), scheduled, pcm}));
+            ASSERT_TRUE(outcome.sink->last_playback_slot());
+            EXPECT_LT(std::abs(outcome.sink->last_playback_slot()->count - scheduled.count),
+                      10'000'000);
+            ASSERT_TRUE(latest->pts_origin_ns);
+            ASSERT_TRUE(latest->pts_ns);
+            EXPECT_EQ(*latest->pts_ns, static_cast<std::uint64_t>(
+                scheduled.count - *latest->pts_origin_ns));
+            if (epoch == 0) {
+                ASSERT_TRUE(aa::audio::detail::replay_sink_for_test(
+                    *outcome.sink, aa::core::Milliseconds{75}));
+            }
+        }
+    }
+}
+
+TEST(AudioPipelineSinkBackend, PlaybackSlotQueryAbsenceReasons) {
+    using Reason = aa::audio::PlaybackSlotAbsence;
+    using aa::audio::detail::query_playback_slot_for_test;
+    EXPECT_EQ(query_playback_slot_for_test(0, UINT64_MAX), Reason::invalid_pts);
+    EXPECT_EQ(query_playback_slot_for_test(0, static_cast<std::uint64_t>(INT64_MAX) + 1),
+              Reason::invalid_pts);
+    EXPECT_EQ(query_playback_slot_for_test(0, static_cast<std::uint64_t>(INT64_MAX)),
+              Reason::invalid_pts);
+    EXPECT_EQ(query_playback_slot_for_test(std::nullopt, 0), Reason::query_failed);
+    EXPECT_EQ(query_playback_slot_for_test(-1, 0), Reason::negative_position);
+    EXPECT_EQ(query_playback_slot_for_test(0, 0), Reason::none);
+    auto outcome = open_slot_test_sink();
+    ASSERT_TRUE(outcome.sink);
+    EXPECT_EQ(aa::audio::detail::request_playback_slot_for_test(
+        *outcome.sink, 0, aa::core::Milliseconds{0}), Reason::deadline_missed);
+    aa::audio::detail::stop_playback_slot_worker_for_test(*outcome.sink);
+    EXPECT_EQ(aa::audio::detail::request_playback_slot_for_test(
+        *outcome.sink, 0, aa::core::Milliseconds{100}), Reason::worker_stopped);
+}
+
 TEST(AudioPipelineSinkBackend, StalledPlaybackSlotQueryNeverExtendsTheWrite) {
     // #60 review regression: the element's position query (the playback-slot
     // telemetry) must not hold an acknowledged write. With the query blocked
     // inside the element, writes still succeed within their ONE deadline and
     // report no slot; once released, slots come back.
     auto outcome = open_slot_test_sink();
-    ASSERT_TRUE(outcome.sink != nullptr);
+    ASSERT_TRUE(outcome.sink != nullptr) << outcome.report.cause;
     SlotWriter writer{*outcome.sink};
     ASSERT_TRUE(writer.slot_returns_within(10));
 
@@ -2236,6 +2292,9 @@ TEST(AudioPipelineSinkBackend, StalledPlaybackSlotQueryNeverExtendsTheWrite) {
         const auto elapsed = std::chrono::steady_clock::now() - started;
         ASSERT_TRUE(written.has_value()) << "write " << i;
         EXPECT_FALSE(outcome.sink->last_playback_slot()) << "write " << i;
+        EXPECT_EQ(outcome.sink->last_playback_slot_absence(),
+                  i == 0 ? aa::audio::PlaybackSlotAbsence::deadline_missed
+                         : aa::audio::PlaybackSlotAbsence::worker_busy);
         // Bounded by the write's own deadline, never by the blocked query.
         EXPECT_LT(elapsed, std::chrono::milliseconds{200}) << "write " << i;
     }
@@ -2253,7 +2312,7 @@ TEST(AudioPipelineSinkBackend, TeardownAndReopenNeverWaitOnBlockedPlaybackSlotQu
     // blocked worker is left behind with its own element reference and
     // finishes once the query returns, after its sink is gone.
     auto outcome = open_slot_test_sink();
-    ASSERT_TRUE(outcome.sink != nullptr);
+    ASSERT_TRUE(outcome.sink != nullptr) << outcome.report.cause;
     SlotWriter writer{*outcome.sink};
     ASSERT_TRUE(writer.slot_returns_within(10));
 
@@ -2549,6 +2608,7 @@ struct RecordingSinkState final {
     bool fail_write{false};
     std::function<void()> during_write{};
     std::optional<aa::core::Nanoseconds> playback_slot{};
+    aa::audio::PlaybackSlotAbsence slot_absence{aa::audio::PlaybackSlotAbsence::unavailable};
 };
 
 class RecordingAudioSink final : public aa::audio::detail::ObservedAudioSink {
@@ -2578,6 +2638,9 @@ public:
     }
     std::optional<aa::core::Nanoseconds> last_playback_slot() const override {
         return state->playback_slot;
+    }
+    aa::audio::PlaybackSlotAbsence last_playback_slot_absence() const override {
+        return state->playback_slot ? aa::audio::PlaybackSlotAbsence::none : state->slot_absence;
     }
 };
 
@@ -2651,6 +2714,37 @@ TEST_F(AudioPipelineRoute, CompletionPresentedIsLaterOfHandoffAndPlaybackSlot) {
     EXPECT_EQ(late.presented->count, late.completed.count);
     // No position reported: no presented time is invented.
     EXPECT_FALSE(run(std::nullopt).presented);
+}
+
+TEST_F(AudioPipelineRoute, CompletionPreservesEveryPlaybackSlotAbsenceReason) {
+    using Reason = aa::audio::PlaybackSlotAbsence;
+    for (const auto reason : {Reason::unavailable, Reason::worker_busy, Reason::worker_stopped,
+                             Reason::deadline_missed, Reason::query_failed,
+                             Reason::negative_position, Reason::invalid_pts}) {
+        for (const bool queued : {false, true}) {
+            SCOPED_TRACE(std::string{aa::audio::to_string(reason)});
+            SCOPED_TRACE(queued);
+            auto sink = std::make_unique<RecordingAudioSink>();
+            sink->state->slot_absence = reason;
+            auto config = pcm_router_config();
+            std::optional<aa::audio::WriteCompletion> completion;
+            config.on_write_completed = [&](const auto& value) { completion = value; };
+            auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+            ASSERT_TRUE(opened);
+            auto& router = opened.value();
+            const auto pcm = constant_pcm({kMediaLevel, 960});
+            ASSERT_TRUE(router.submit(make_message(aa::protocol::ChannelRole::media_audio,
+                                                   1, now_ns(), pcm)));
+            if (queued) {
+                ASSERT_TRUE(router.render_step());
+            } else {
+                ASSERT_TRUE(router.pump());
+            }
+            ASSERT_TRUE(completion);
+            EXPECT_FALSE(completion->presented);
+            EXPECT_EQ(completion->playback_slot_absence, reason);
+        }
+    }
 }
 
 TEST_F(AudioPipelineRoute, PendingRunRejectionRecordsBoundedOccupancyUntilNextSubmitOrClose) {

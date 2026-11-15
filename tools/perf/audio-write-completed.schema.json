@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Receiver audio_write_completed event",
+  "type": "object",
+  "required": [
+    "event",
+    "scheduled_ns",
+    "scheduled_end_ns",
+    "completed_ns",
+    "presented_ns",
+    "playback_slot_absence"
+  ],
+  "properties": {
+    "event": {
+      "const": "audio_write_completed"
+    },
+    "scheduled_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "scheduled_end_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "completed_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "presented_ns": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "playback_slot_absence": {
+      "enum": [
+        null,
+        "unavailable",
+        "worker_busy",
+        "worker_stopped",
+        "deadline_missed",
+        "query_failed",
+        "negative_position",
+        "invalid_pts"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "presented_ns": {
+          "type": "integer"
+        },
+        "playback_slot_absence": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "properties": {
+        "presented_ns": {
+          "type": "null"
+        },
+        "playback_slot_absence": {
+          "type": "string"
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

@@ -66,6 +66,9 @@ public:
     [[nodiscard]] virtual std::optional<core::Nanoseconds> last_playback_slot() const {
         return std::nullopt;
     }
+    [[nodiscard]] virtual PlaybackSlotAbsence last_playback_slot_absence() const {
+        return last_playback_slot() ? PlaybackSlotAbsence::none : PlaybackSlotAbsence::unavailable;
+    }
 };
 
 struct SinkOpenRequest final {
@@ -74,6 +77,8 @@ struct SinkOpenRequest final {
     std::string target{}; // empty = current default output
     core::Milliseconds start_timeout{core::Milliseconds{2000}};
     core::Milliseconds write_timeout{core::Milliseconds{2000}};
+    // Test-only: holds initial readiness before preroll/PLAYING completes.
+    core::Milliseconds readiness_delay_for_test{0};
     // Test-only fault injection (gate r2 F1 regression): drops the nonempty
     // data buffer at the routing element's ingress while the chain-return
     // marker proceeds, proving the handoff barrier can never acknowledge
@@ -111,6 +116,15 @@ struct SinkOpenOutcome final {
 [[nodiscard]] bool start_foreign_sink_traffic(std::uint32_t buffers);
 void stop_foreign_sink_traffic() noexcept;
 [[nodiscard]] std::uint64_t handoff_events_seen() noexcept;
+
+// Test-only clock/query regressions. These exercise the adapter's real
+// GStreamer position-query and worker paths without exposing GStreamer types.
+[[nodiscard]] PlaybackSlotAbsence query_playback_slot_for_test(
+    std::optional<std::int64_t> position, std::uint64_t pts);
+[[nodiscard]] PlaybackSlotAbsence request_playback_slot_for_test(
+    ObservedAudioSink& sink, std::uint64_t pts, core::Milliseconds timeout);
+void stop_playback_slot_worker_for_test(ObservedAudioSink& sink);
+[[nodiscard]] bool replay_sink_for_test(ObservedAudioSink& sink, core::Milliseconds pause);
 
 // ---- Test-only queue admission hooks (gate fix 3) ----
 // Private test seams only: they let the audio_pipeline tests block the route's
