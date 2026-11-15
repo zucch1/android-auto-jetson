@@ -84,21 +84,44 @@ struct BluezBackend::Impl {
     // Managed bonds whose demotion has started but is not yet durably complete: never admitted.
     std::vector<PeerIdentity> refused;
     // BlueZ removal attempts are budgeted per invocation (docs/enrolment-ordering.md, #118): at
-    // most kRemovalAttemptBudget attempts, a further one started only while the invocation has
-    // spent less than kRemovalTimeBudget, so a slow or failing BlueZ never holds the helper's
-    // single owner thread past the receiver's 500 ms reconciliation or 1 s confirm/reconnect
-    // deadlines. A failed attempt backs its identity off (1 s doubling to 30 s, from the
-    // attempt's completion); a round-robin cursor keeps one identity from starving the rest. What
-    // is not attempted stays durably owed in `pending` for a later tick.
+    // most kRemovalAttemptBudget attempts, and every Disconnect and RemoveDevice of the invocation
+    // shares one deadline, kRemovalTimeBudget after the invocation started (the tick, the
+    // reconciliation, or the request whose window closes): each call is given only the time left,
+    // and no attempt starts with less than kRemovalMinimumAttempt left. So a periodic tick plus the
+    // reconciliation queued behind it on the helper's single owner thread stay well inside the
+    // receiver's 500 ms reconciliation deadline (and the 1 s confirm/reconnect deadlines) however
+    // slow BlueZ is. An attempt that fails or runs out of time backs its identity off (1 s doubling
+    // to 30 s, from the attempt's completion); a round-robin cursor keeps one identity from
+    // starving the rest. What is not attempted stays durably owed in `pending` for a later tick.
     static constexpr std::size_t kRemovalAttemptBudget = 2;
     static constexpr std::chrono::milliseconds kRemovalTimeBudget{100};
+    static constexpr std::chrono::milliseconds kRemovalMinimumAttempt{30};
     struct RemovalRetry { PeerIdentity peer; std::uint32_t failures{}; Clock::time_point next{}; };
     std::vector<RemovalRetry> removal_retries;
     std::size_t removal_cursor{};
+    // The deadline of the invocation in progress, set once by its outermost CleanupScope; every
+    // removal budget created while it is set (nested window closes included) shares it.
+    std::optional<Clock::time_point> cleanup_deadline;
+    struct CleanupScope {
+        Impl& impl; bool outer;
+        explicit CleanupScope(Impl& owner) : impl(owner), outer(!owner.cleanup_deadline) {
+            if (outer) impl.cleanup_deadline = Clock::now() + kRemovalTimeBudget;
+        }
+        ~CleanupScope() { if (outer) impl.cleanup_deadline.reset(); }
+        CleanupScope(const CleanupScope&) = delete;
+        CleanupScope& operator=(const CleanupScope&) = delete;
+    };
     struct RemovalBudget {
-        Clock::time_point started{Clock::now()};
+        Clock::time_point deadline;
         std::size_t attempts{};
         bool exhausted{};
+        explicit RemovalBudget(const Impl& impl)
+            : deadline(impl.cleanup_deadline.value_or(Clock::now() + kRemovalTimeBudget)) {}
+        // Milliseconds left before the deadline (0 once it has passed).
+        int remaining() const {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+            return left > 0 ? static_cast<int>(left) : 0;
+        }
     };
     // Which removals an invocation may attempt: `tick` (the periodic tick) every identity whose
     // backoff expired; `first` (reconciliation) only identities with no failed attempt in this
@@ -135,10 +158,11 @@ struct BluezBackend::Impl {
     Clock::time_point next_check{};
     Impl(const std::string&, Now, const std::string&, std::uint32_t);
     ~Impl();
-    GVariant* call(const char*, const char*, const char*, GVariant*, const GVariantType* = nullptr);
+    // Bounded at timeout_ms (150 ms unless a cleanup budget passes less).
+    GVariant* call(const char*, const char*, const char*, GVariant*, const GVariantType* = nullptr, int timeout_ms = 150);
     // Best effort: tears the link down (HFP and the AA channel included) before the bond is removed,
     // so a removal that fails can never leave an unaccepted device connected.
-    void disconnect(const Device&);
+    void disconnect(const Device&, int timeout_ms = 150);
     bool current_owner();
     bool ensure();
     bool inventory(std::vector<Device>&);

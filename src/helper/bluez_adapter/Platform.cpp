@@ -74,19 +74,20 @@ BluezBackend::Impl::~Impl() {
     g_main_context_unref(context);
 }
 GVariant* BluezBackend::Impl::call(const char* path, const char* interface, const char* member,
-                                 GVariant* parameters, const GVariantType* type) {
+                                 GVariant* parameters, const GVariantType* type, int timeout_ms) {
     if (!bus || owner.empty()) {
         if (parameters) { g_variant_ref_sink(parameters); g_variant_unref(parameters); }
         return nullptr;
     }
     GError* error = nullptr;
     auto* result = g_dbus_connection_call_sync(bus, owner.c_str(), path, interface, member,
-        parameters, type, G_DBUS_CALL_FLAGS_NO_AUTO_START, 150, nullptr, &error);
+        parameters, type, G_DBUS_CALL_FLAGS_NO_AUTO_START, std::max(timeout_ms, 1), nullptr, &error);
     g_clear_error(&error);
     return result;
 }
-void BluezBackend::Impl::disconnect(const Device& device) {
-    if (auto* reply = call(device.path.c_str(), "org.bluez.Device1", "Disconnect", nullptr)) g_variant_unref(reply);
+void BluezBackend::Impl::disconnect(const Device& device, int timeout_ms) {
+    if (auto* reply = call(device.path.c_str(), "org.bluez.Device1", "Disconnect", nullptr, nullptr, timeout_ms))
+        g_variant_unref(reply);
 }
 bool BluezBackend::Impl::current_owner() {
     if (!bus || g_dbus_connection_is_closed(bus)) { reset(); owner.clear(); return false; }
@@ -159,6 +160,9 @@ void BluezBackend::Impl::reset() {
     registered = false; agent_registered = false;
 }
 void BluezBackend::Impl::pump(bool tick) {
+    // A tick's removals share one deadline from the tick's start (drain_events included).
+    std::optional<CleanupScope> scope;
+    if (tick) scope.emplace(*this);
     drain_events();
     if (tick) retire_unaccepted(Retire::tick);
     if (comparison && now() >= comparison->deadline) close_admission();
