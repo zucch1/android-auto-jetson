@@ -161,7 +161,7 @@ def case_real_check(root: Path) -> int:
     if result.returncode != 0:
         print(f"real-check: expected exit 0\n{result.stdout}{result.stderr}")
         return 1
-    if PASS_SUMMARY not in result.stdout or "methods=15 signals=5 properties=1" not in result.stdout:
+    if PASS_SUMMARY not in result.stdout or f"methods={len(METHOD_NAMES)} signals=5 properties=1" not in result.stdout:
         print(f"real-check: missing PASS summary\n{result.stdout}")
         return 1
     return 0
