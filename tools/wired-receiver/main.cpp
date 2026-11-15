@@ -1700,9 +1700,10 @@ int receiver_main(int argc, char **argv) {
         } else if (std::strcmp(argv[index], "--decoder") == 0 && index + 1 < argc) {
             if (!aa::tools::parse_decoder(argv[++index],video_decoder)) { std::fputs("invalid --decoder\n",stderr); return 2; }
         } else if (std::strcmp(argv[index], "--video-profiles") == 0 && index + 1 < argc) {
-            auto parsed = aa::config::parse_video_profiles(argv[++index]);
-            if (!parsed) { std::fputs("invalid --video-profiles\n", stderr); return 2; }
-            video_profiles = std::move(parsed.value());
+            if (!aa::config::parse_video_profiles_option(argv[++index], video_profiles)) {
+                std::fputs("invalid --video-profiles\n", stderr);
+                return 2;
+            }
         } else if (std::strcmp(argv[index], "--video-socket") == 0 && index + 1 < argc) {
             video_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--input-socket") == 0 && index + 1 < argc) {

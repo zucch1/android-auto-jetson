@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <charconv>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace aa::config {
 inline std::vector<protocol::VideoProfile> default_video_profiles() {
@@ -41,5 +43,14 @@ inline core::Result<std::vector<protocol::VideoProfile>> parse_video_profiles(st
     }
     if (profiles.empty()) { return Error{ErrorCode::config_invalid}; }
     return profiles;
+}
+// The `--video-profiles` option as both receivers accept it: atomic, so a bad
+// value leaves the configured profiles untouched. Callers own the diagnostic.
+inline bool parse_video_profiles_option(std::string_view text,
+                                        std::vector<protocol::VideoProfile>& profiles) {
+    auto parsed = parse_video_profiles(text);
+    if (!parsed) { return false; }
+    profiles = std::move(parsed.value());
+    return true;
 }
 } // namespace aa::config

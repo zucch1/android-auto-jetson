@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "ServiceDescription.hpp"
 #include <aa/app/WirelessLink.hpp>
 #include <aa/audio/AudioRouter.hpp>
 #include <aa/channels/InputSink.hpp>
 #include <aa/channels/MicrophoneSink.hpp>
 #include <aa/channels/SensorSink.hpp>
+#include <aa/config/VideoProfiles.hpp>
 #include <aa/diagnostics/Diagnostics.hpp>
 #include "../wired-receiver/VideoOutlet.hpp"
 #include <cstdio>
+#include <utility>
 
 namespace aa::wireless_receiver {
 inline void log_line(const std::string& line) {
@@ -63,26 +66,13 @@ struct Media final {
         return send(protocol::ChannelRole::microphone, std::move(payload));
     }};
     explicit Media(audio::AudioRouter& router) : audio(router) {}
-    app::WirelessLink::Config config() {
+    app::WirelessLink::Config config(
+        std::vector<protocol::VideoProfile> profiles = aa::config::default_video_profiles()) {
         using protocol::ChannelRole;
         app::WirelessLink::Config config;
         config.session.input_enabled = true;
         config.session.input = capabilities;
-        config.services = {
-            {protocol::ServiceKey{99}, ChannelRole::video,
-                protocol::VideoConfiguration{{{1280, 720, 30}, {800, 480, 30}}}},
-            {protocol::ServiceKey{100}, ChannelRole::media_audio,
-                protocol::AudioConfiguration{{{48000, 16, 2}}}},
-            {protocol::ServiceKey{101}, ChannelRole::guidance_audio,
-                protocol::AudioConfiguration{{{16000, 16, 1}}}},
-            {protocol::ServiceKey{102}, ChannelRole::system_audio,
-                protocol::AudioConfiguration{{{16000, 16, 1}}}},
-            {protocol::ServiceKey{104}, ChannelRole::input,
-                protocol::ButtonConfiguration{capabilities.keycodes()}},
-            {protocol::ServiceKey{105}, ChannelRole::sensors,
-                protocol::SensorConfiguration{{protocol::SensorKind::night_mode}}},
-            {protocol::ServiceKey{106}, ChannelRole::microphone,
-                protocol::MicrophoneConfiguration{{16000, 16, 1}}}};
+        config.services = service_descriptors(capabilities, std::move(profiles));
         config.sinks = {{ChannelRole::input, &input}, {ChannelRole::sensors, &sensors},
             {ChannelRole::microphone, &microphone}};
         return config;

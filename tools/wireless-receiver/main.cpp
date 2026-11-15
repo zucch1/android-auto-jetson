@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Runtime.hpp"
+#include <aa/config/VideoProfiles.hpp>
 #include <aa/trust/PairingPolicy.hpp>
 #include <aa/tls/Credentials.hpp>
 #include <charconv>
@@ -18,8 +19,10 @@ constexpr const char* usage =
     "usage: aa-wireless-receiver --store-dir PATH (--phone-id N | --pairing-only) [options]\n"
     "  PATH contains approved-phones.json; N selects an approved wireless phone.\n"
     "  --pairing-only       run only the authenticated control/pairing API; no projection.\n"
-    "  --video-socket PATH   encoded H.264 consumer socket\n"
+    "  --video-socket PATH   encoded video consumer socket\n"
     "  --input-socket PATH   normalized display input socket\n"
+    "  --video-profiles WxH@FPS:CODEC,...  offered video profiles (same syntax as\n"
+    "                       the wired receiver; default 1280x720@30:h264,800x480@30:h264)\n"
     "  --helper-bus-address ADDRESS  explicit alternate helper bus (default: system bus)\n"
     "  --diagnostics        emit redacted diagnostic JSON to stdout\n"
     "  --duration-ms N      bounded run (1..86400000 ms; omitted: until signal)\n"
@@ -38,6 +41,7 @@ struct Options final {
     std::string video_socket{ipc::production_video_socket_path().value};
     std::string input_socket{ipc::production_input_socket_path().value};
     std::string helper_address;
+    std::vector<protocol::VideoProfile> video_profiles{config::default_video_profiles()};
     std::int64_t duration_ms{};
     std::uint32_t ap_channel{36};
     bool diagnostics{};
@@ -56,6 +60,10 @@ std::optional<Options> parse_options(int argc, char** argv) {
         if (arg == "--store-dir") options.store_dir = value;
         else if (arg == "--video-socket") options.video_socket = value;
         else if (arg == "--input-socket") options.input_socket = value;
+        else if (arg == "--video-profiles") {
+            if (!aa::config::parse_video_profiles_option(value, options.video_profiles))
+                return std::nullopt;
+        }
         else if (arg == "--helper-bus-address") options.helper_address = value;
         else if (arg == "--ap-channel") {
             std::uint32_t number{};
@@ -164,7 +172,7 @@ int main(int argc, char** argv) {
     Media media{router.value()};
     // Receiver precedes ControlService so its confirmation observer is valid
     // throughout bus dispatch and the bus's final owner teardown.
-    auto link_config = media.config();
+    auto link_config = media.config(options->video_profiles);
     link_config.ap_channel = options->ap_channel;
     aa::app::WirelessReceiver receiver{{store, clock, diagnostics}, *helper.value(), std::move(link_config)};
     media.send = [&receiver](aa::protocol::ChannelRole role, std::vector<std::byte> payload) {

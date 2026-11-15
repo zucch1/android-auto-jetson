@@ -17,8 +17,8 @@ namespace aa::channels {
 // Defaults describe preferred video sizes but advertise nothing without an
 // explicitly supplied backend configuration and registered handler.
 struct CapabilityProfile final {
-    protocol::VideoProfile primary{};   // 1280x720@30
-    protocol::VideoProfile fallback{};  // 800x480@30
+    protocol::VideoProfile primary{};   // config::default_video_profiles() front
+    protocol::VideoProfile fallback{};  // config::default_video_profiles() second
     std::vector<protocol::ChannelRole> advertised{};
 
     [[nodiscard]] static CapabilityProfile bench_defaults();
