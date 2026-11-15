@@ -57,7 +57,7 @@ public:
         }
         if (header.frame != current_.frame || header.index != next_ ||
             header.count != current_.count || header.frame_bytes != current_.frame_bytes ||
-            header.idr != current_.idr || header.timestamp_ns != current_.timestamp_ns) {
+            header.profile != current_.profile || header.idr != current_.idr || header.timestamp_ns != current_.timestamp_ns) {
             ++rejected_;
             loss();
             return Error{ErrorCode::transport_malformed_frame};
@@ -77,6 +77,7 @@ public:
         unit_.frame = current_.frame;
         unit_.sequence = current_.sequence;
         unit_.timestamp_ns = current_.timestamp_ns;
+        unit_.profile = current_.profile;
         unit_.idr = current_.idr;
         unit_.payload.resize(used_);
         if (waiting_idr_) {

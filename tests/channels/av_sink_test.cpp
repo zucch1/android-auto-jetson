@@ -590,3 +590,37 @@ TEST_F(AvSinkWire, DeferredReplacementUsesSessionOwnedGenerationInsteadOfReusing
     EXPECT_EQ(sent.size(), before + 1);
 }
 } // namespace
+
+TEST_F(AvSinkWire, AnnouncedFallbackIndexCarriesSelectedProfileAndCannotChangeInSession) {
+    auto descriptor = video();
+    std::get<p::VideoConfiguration>(descriptor.configuration).profiles = {{1920,1080,60},{800,480,30}};
+    aa::channels::AvSink v{descriptor, raw, send};
+    auto call = [&](const Bytes& b) { return v.on_message({{p::ChannelRole::video,0,{}},b}); };
+    ASSERT_TRUE(call(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    EXPECT_FALSE(call(p::encode(p::AvSinkStart{1,2}).value()));
+    ASSERT_TRUE(call(p::encode(p::AvSinkStart{1,1}).value()));
+    ASSERT_TRUE(call(data()));
+    EXPECT_EQ(raw.header.video_profile, (p::VideoProfile{800,480,30}));
+    EXPECT_FALSE(call(p::encode(p::AvSinkStart{1,0}).value()));
+    ASSERT_TRUE(call(p::encode(p::AvSinkStart{2,0}).value()));
+    ASSERT_TRUE(call(data()));
+    EXPECT_EQ(raw.header.video_profile, (p::VideoProfile{1920,1080,60}));
+    v.reset();
+    EXPECT_FALSE(call(p::encode(p::AvSinkStart{3,0}).value()));
+}
+
+TEST_F(AvSinkWire, SetupCodecRestrictsReadyMembershipToConfiguredProfiles) {
+    auto descriptor = video();
+    std::get<p::VideoConfiguration>(descriptor.configuration).profiles = {
+        {1920,1080,60}, {1920,1080,30,p::VideoCodec::h265}};
+    aa::channels::AvSink v{descriptor,raw,send};
+    auto call = [&](const Bytes& b) { return v.on_message({{p::ChannelRole::video,0,{}},b}); };
+    ASSERT_TRUE(call(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    EXPECT_FALSE(call(p::encode(p::AvSinkStart{1,1}).value()));
+    ASSERT_TRUE(call(p::encode(p::AvSinkSetup{p::AvSinkCodec::h265}).value()));
+    EXPECT_FALSE(call(p::encode(p::AvSinkStart{2,0}).value()));
+    ASSERT_TRUE(call(p::encode(p::AvSinkStart{2,1}).value()));
+    ASSERT_TRUE(call(data()));
+    ASSERT_TRUE(raw.header.video_profile);
+    EXPECT_EQ(raw.header.video_profile->codec,p::VideoCodec::h265);
+}

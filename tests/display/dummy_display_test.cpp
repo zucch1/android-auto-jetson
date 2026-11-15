@@ -1738,6 +1738,7 @@ struct BackpressureDecoderState final {
     std::size_t closes{0};
     std::size_t live_sessions{0};
     std::size_t eofs{0};
+    std::vector<aa::consumer::DecodeConfig> opened_configs{};
     std::vector<aa::ipc::VideoAccessUnit> submissions{};
     std::vector<aa::ipc::VideoAccessUnit> accepted{};
 };
@@ -1784,8 +1785,9 @@ private:
 };
 
 DecodeSessionFactory backpressure_factory(BackpressureDecoderState& state) {
-    return [&state](const aa::consumer::DecodeConfig&)
+    return [&state](const aa::consumer::DecodeConfig& config)
                -> aa::core::Result<std::unique_ptr<DecodeSession>> {
+        state.opened_configs.push_back(config);
         return std::unique_ptr<DecodeSession>(std::make_unique<BackpressureSession>(state));
     };
 }
@@ -1849,7 +1851,7 @@ public:
             }
             for (const auto& unit : units) {
                 auto sent = producer.value().send_access_unit(aa::ipc::VideoSendRequest{
-                    unit.frame, unit.timestamp_ns, unit.idr, unit.payload});
+                    unit.frame, unit.timestamp_ns, unit.idr, unit.payload, unit.profile});
                 if (!sent.has_value()) {
                     feeder_ok.store(false);
                     return;
@@ -2969,4 +2971,54 @@ TEST(DummyDisplayRegistration, DuplicateRegistrationKeepsExistingNameAndUnregist
     const auto still = client->register_consumer(BusName{"org.custom.DummyDisplayTestRegD3"});
     ASSERT_FALSE(still.has_value());
     EXPECT_EQ(still.error().code(), ErrorCode::session_illegal_transition);
+}
+
+#include "../../tools/dummy-display/pipeline_options.hpp"
+TEST(DummyDisplayContractControl, PipelineOptionsValidateAndRefuseUnavailableModes) {
+    aa::consumer::DecodeReport host;
+    host.backends.push_back({"openh264dec",false,false,true,true,{}});
+    PipelineOptions o;
+    EXPECT_FALSE(check_pipeline(o,host));
+    EXPECT_FALSE(parse_pipeline_option(o,"--decoder","typo"));
+    ASSERT_TRUE(parse_pipeline_option(o,"--decoder","hardware"));
+    auto refusal = check_pipeline(o,host);
+    ASSERT_TRUE(refusal);
+    EXPECT_EQ(refusal->code,ErrorCode::channel_decode_unavailable);
+    EXPECT_NE(refusal->message.find("nvv4l2decoder"),std::string_view::npos);
+    host.backends.push_back({"nvv4l2decoder",true,true,true,true,{}});
+    EXPECT_FALSE(check_pipeline(o,host));
+    o = {};
+    ASSERT_TRUE(parse_pipeline_option(o,"--decoder","auto"));
+    EXPECT_FALSE(check_pipeline(o,host));
+    for (auto option : {"--presentation", "--media-thread"}) {
+        o = {};
+        ASSERT_TRUE(parse_pipeline_option(o,option,std::string_view{option} == "--presentation" ? "gpu" : "worker"));
+        ASSERT_TRUE(check_pipeline(o,host));
+        EXPECT_NE(check_pipeline(o,host)->message.find("not yet implemented"),std::string_view::npos);
+    }
+    o = {};
+    ASSERT_TRUE(parse_pipeline_option(o,"--presentation","zerocopy"));
+    EXPECT_EQ(check_pipeline(o,host)->code,ErrorCode::config_invalid);
+}
+TEST(DummyDisplayBackpressure, PhoneProfileCrossesVideoSocketAndReconfiguresDecoder) {
+    BackpressureFixture fixture;
+    ASSERT_TRUE(fixture.attach("NegotiatedVideoProfile"));
+    aa::ipc::VideoAccessUnit unit{7,70,kTimestampBaseNs,true,{0,0,1,0x65,0x11}};
+    unit.profile = VideoProfile{1920,1080,60};
+    ASSERT_TRUE(fixture.start({unit}));
+    ASSERT_TRUE(fixture.finish_feeding());
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    ASSERT_EQ(fixture.decoder.opened_configs.size(),2u);
+    EXPECT_EQ(fixture.decoder.opened_configs.back().caps,*unit.profile);
+    ASSERT_EQ(fixture.decoder.accepted.size(),1u);
+    EXPECT_EQ(fixture.decoder.accepted.front().profile,unit.profile);
+}
+TEST(DummyDisplayContractRender, NegotiatedFrameDimensionsReplaceLegacyDisplaySize) {
+    static_cast<void>(qt_app());
+    CountingInputSink input;
+    aa::display::qt_adapter::ProjectionWidget widget(input,kCaps);
+    aa::consumer::DecodedFrame frame{1,1,1000,800,480,std::vector<std::uint8_t>(800*480*3/2,128)};
+    widget.on_frame(frame);
+    static_cast<void>(widget.grab());
+    EXPECT_EQ(widget.frames_painted(),1u);
 }

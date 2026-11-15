@@ -240,3 +240,18 @@ TEST(WiredReceiver, AcceptConsumerTimesOutWhenLimitsRecordAbsent) {
     retire_video_runtime_dir(runtime_dir);
 }
 } // namespace
+
+TEST(WiredReceiver, CodecSpecificRandomAccessDetection) {
+    using aa::wired_receiver::is_idr_au;
+    EXPECT_TRUE(is_idr_au({0,0,1,0x65,1},p::VideoCodec::h264));
+    EXPECT_TRUE(is_idr_au({0,0,1,0x26,1},p::VideoCodec::h265));
+    EXPECT_TRUE(is_idr_au({0x82,0x49,0x83,0x42},p::VideoCodec::vp9));
+    EXPECT_FALSE(is_idr_au({0x86,0x49,0x83,0x42},p::VideoCodec::vp9));
+    EXPECT_FALSE(is_idr_au({0x82,0x49},p::VideoCodec::vp9));
+    bool reduced = false;
+    EXPECT_TRUE(is_idr_au({0x0a,1,0,0x32,1,0},p::VideoCodec::av1,&reduced));
+    EXPECT_FALSE(is_idr_au({0x32,1,0x20},p::VideoCodec::av1,&reduced));
+    EXPECT_FALSE(is_idr_au({0x32,1,0x80},p::VideoCodec::av1,&reduced));
+    EXPECT_FALSE(is_idr_au({0x32,127,0},p::VideoCodec::av1,&reduced));
+    EXPECT_TRUE(is_idr_au({0x0a,1,8,0x32,1,0x80},p::VideoCodec::av1,&reduced));
+}

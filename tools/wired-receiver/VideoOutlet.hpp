@@ -16,7 +16,53 @@
 
 namespace aa::wired_receiver {
 
-inline bool is_idr_au(const std::vector<std::uint8_t>& payload) {
+inline bool is_idr_au(const std::vector<std::uint8_t>& payload, protocol::VideoCodec codec = protocol::VideoCodec::h264, bool* av1_reduced = nullptr) {
+    // VP9 uncompressed-header syntax (WebM bitstream specification section 6.2).
+    if (codec == protocol::VideoCodec::vp9) {
+        std::size_t bit = 0;
+        const auto read = [&](unsigned n) -> std::optional<unsigned> {
+            if (bit + n > payload.size()*8) { return {}; }
+            unsigned value = 0;
+            while (n--) { value = (value << 1U) | ((payload[bit/8] >> (7-bit%8)) & 1U); ++bit; }
+            return value;
+        };
+        if (read(2) != 2U) { return false; }
+        const auto low = read(1), high = read(1);
+        if (!low || !high) { return false; }
+        if ((*low | (*high << 1U)) == 3U && !read(1)) { return false; }
+        if (read(1) != 0U || read(1) != 0U || !read(2)) { return false; }
+        return read(24) == 0x498342U;
+    }
+    // AV1 low-overhead OBU stream: bounded OBU sizes, sequence header state,
+    // then show_existing_frame/frame_type (AV1 specification section 5.9.2).
+    if (codec == protocol::VideoCodec::av1) {
+        bool reduced = av1_reduced && *av1_reduced;
+        for (std::size_t pos = 0; pos < payload.size();) {
+            const auto header = payload[pos++];
+            if ((header & 0x81U) != 0) { return false; }
+            const auto type = (header >> 3U) & 15U;
+            if (header & 4U) { if (pos == payload.size()) { return false; } ++pos; }
+            std::size_t length = payload.size()-pos;
+            if (header & 2U) {
+                length = 0;
+                bool complete = false;
+                for (unsigned i = 0; i < 8 && pos < payload.size(); ++i) {
+                    const auto byte = payload[pos++];
+                    length |= static_cast<std::size_t>(byte & 127U) << (i*7U);
+                    if (!(byte & 128U)) { complete = true; break; }
+                }
+                if (!complete) { return false; }
+            }
+            if (length > payload.size()-pos) { return false; }
+            if (type == 1 && length) { reduced = (payload[pos] & 8U) != 0; if (av1_reduced) { *av1_reduced = reduced; } }
+            if ((type == 3 || type == 6) && length) {
+                return reduced || ((payload[pos] & 0x80U) == 0 && ((payload[pos] >> 5U) & 3U) == 0);
+            }
+            pos += length;
+        }
+        return false;
+    }
+
     for (std::size_t index = 0; index + 4 < payload.size(); ++index) {
         if (payload[index] != 0 || payload[index + 1] != 0) {
             continue;
@@ -29,7 +75,9 @@ inline bool is_idr_au(const std::vector<std::uint8_t>& payload) {
         } else {
             continue;
         }
-        if (nal < payload.size() && (payload[nal] & 0x1FU) == 5U) {
+        if (nal < payload.size() && (codec == protocol::VideoCodec::h264
+            ? (payload[nal] & 0x1FU) == 5U
+            : ((payload[nal] >> 1U) & 0x3FU) >= 16U && ((payload[nal] >> 1U) & 0x3FU) <= 21U)) {
             return true;
         }
     }
@@ -54,14 +102,25 @@ public:
             record_drop("no_consumer");
             return {};
         }
+        if (message.header.video_profile != profile_ || message.header.video_session != session_ || message.header.video_generation != generation_) {
+            profile_ = message.header.video_profile;
+            session_ = message.header.video_session;
+            generation_ = message.header.video_generation;
+            av1_reduced_ = false;
+            if (profile_) {
+                log_("{\"event\":\"video_profile\",\"width\":" + std::to_string(profile_->width)
+                    + ",\"height\":" + std::to_string(profile_->height) + ",\"fps\":" + std::to_string(profile_->fps)
+                    + ",\"codec\":\"" + protocol::codec_name(profile_->codec) + "\"}");
+            }
+        }
         std::vector<std::uint8_t> payload;
         payload.reserve(message.payload.size());
         for (const std::byte byte : message.payload) {
             payload.push_back(std::to_integer<std::uint8_t>(byte));
         }
         const auto sent = producer_->send_access_unit(ipc::VideoSendRequest{
-            ++sequence_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr_au(payload),
-            payload});
+            ++sequence_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr_au(payload, profile_ ? profile_->codec : protocol::VideoCodec::h264, &av1_reduced_),
+            payload, message.header.video_profile});
         if (!sent) {
             // Error erases errno; confirm peer hangup rather than hiding every I/O failure.
             if (sent.error().code() == ErrorCode::transport_io) {
@@ -160,6 +219,10 @@ private:
     MediaLog media_log_;
     std::mutex mutex_{};
     std::optional<ipc::VideoProducer> producer_{};
+    std::optional<protocol::VideoProfile> profile_;
+    std::optional<std::int32_t> session_;
+    std::optional<std::uint64_t> generation_;
+    bool av1_reduced_{};
     std::uint64_t sequence_{};
     std::uint64_t units_{};
     std::uint64_t dropped_{};

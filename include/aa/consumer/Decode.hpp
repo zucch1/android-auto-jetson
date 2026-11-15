@@ -18,7 +18,7 @@
 
 namespace aa::consumer {
 
-// Consumer-side GStreamer H.264 decode helper (libaareceiver-consumer). It
+// Consumer-side GStreamer video decode helper (libaareceiver-consumer). It
 // consumes reassembled encoded access units as delivered by the task-22 video
 // channel (aa::ipc::VideoAccessUnit) and hands decoded frames back through a
 // caller-supplied callback, carrying the channel's monotonic A/V correlation
@@ -49,17 +49,14 @@ namespace aa::consumer {
 // NVIDIA path's qualification claim stays limited to what the todo-9 probe
 // certified.
 //
-// Caps negotiation: exactly the channel budget profile
-// (protocol::valid_video_profile): 1280x720@30 primary, 800x480@30 fallback.
-// Anything else fails negotiation with channel_caps_unsupported before a
-// pipeline is built; observed output dimensions that differ from the
-// negotiated caps also fail typed, never silently falling back to wrong
-// dimensions.
+// Caps negotiation accepts every resolution/rate/codec defined by the protocol.
+// Runtime element discovery decides codec availability. Observed output
+// dimensions must match the selected profile; no throughput limit is imposed.
 
 // Decoder backend selection policy for open().
 enum class DecodeBackend {
     automatic, // NVIDIA when viable, otherwise software
-    software,  // host software H.264 decoder only
+    software,  // host software decoder for the selected codec
     nvidia,    // NVIDIA (nvv4l2decoder) only; typed error when not viable
 };
 
@@ -101,6 +98,8 @@ struct DecodeReport final {
     std::uint64_t frames_lost_capacity{};
     std::uint64_t frames_lost_eos{};
     bool awaiting_idr{}; // current recovery state; an accepted IDR clears it
+    bool software_path_available{true};
+    std::string software_path_cause{};
 };
 
 // Pure output-path policy (no GStreamer calls): a READY-viable NVMM-only
@@ -135,6 +134,7 @@ struct DecodedFrame final {
     std::uint16_t width{};
     std::uint16_t height{};
     std::vector<std::uint8_t> i420{};
+    std::uint8_t fps{30};
 };
 
 using FrameCallback = std::function<void(const DecodedFrame&)>;
@@ -149,6 +149,7 @@ struct DecodeConfig final {
     // observed arrival (not decoder completion/CPU), pull return and map/copy
     // start. Arrival is optional (bounded 512 entries / 5s, ambiguous PTS lost).
     DecodeCompletionObserver on_completion{};
+
 };
 
 // Automatic backend selection and functional software substitution occur
@@ -165,7 +166,7 @@ public:
     // Runtime decoder detection over the probe's known candidate table
     // (nvv4l2decoder, openh264dec, avdec_h264, nvh264dec): no pipeline is
     // built, nothing is selected. Always safe to call before open().
-    [[nodiscard]] static DecodeReport probe_backends();
+    [[nodiscard]] static DecodeReport probe_backends(protocol::VideoCodec codec = protocol::VideoCodec::h264);
 
     // Caps negotiation + backend selection + pipeline construction.
     // channel_caps_unsupported: caps outside the channel budget profile.

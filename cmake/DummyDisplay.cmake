@@ -202,6 +202,12 @@ if(NOT CMAKE_CROSSCOMPILING)
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
             TIMEOUT 180)
 
+    add_test(NAME dummy_display_pipeline_matrix COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tools/dummy-display/pipeline_matrix.py"
+        --display "$<TARGET_FILE:aa-dummy-display>")
+    set_tests_properties(dummy_display_pipeline_matrix PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 300)
+
     # Executable-level QA (task 24 gate round 2): the SHIPPED aa-dummy-display and
     # the runnable aa-test-receiver run end-to-end on a private bus. replay
     # asserts the real event loop pumps/renders (F1); flow asserts start -> render

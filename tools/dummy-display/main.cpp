@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "pipeline_options.hpp"
+#include "../video_capabilities.hpp"
+#include <aa/config/VideoProfiles.hpp>
 // Dummy display application (task 24): a Qt 6 test consumer for the REAL
 // todo-21 session D-Bus contract. TEST-ONLY autostart is available solely via
 // the explicit --test-only-autostart flag (aa::display::TestOnlyAutostart);
@@ -167,7 +170,10 @@ aa::display::testcontrol::Status probe_status() {
 
 void print_usage(std::FILE* stream) {
     std::fputs("usage: aa-dummy-display [--video-socket PATH] [--input-socket PATH]\n"
-               "                        [--decoder-backend automatic|software|nvidia]\n"
+               "                        [--decoder software|hardware|auto] [--presentation cpu|gpu|zerocopy]\n"
+               "                        [--media-thread gui|worker] [--check-pipeline] [--list-video-capabilities]\n"
+               "                        [--decoder-backend software|nvidia|automatic (legacy flag)]\n"
+               "                        [--video-profiles WxH@FPS:CODEC,...]\n"
                "                        [--test-only-autostart] [--test-only-control-stdin]\n"
                "\n"
                "TEST-ONLY Android Auto projection consumer.\n"
@@ -180,7 +186,6 @@ void print_usage(std::FILE* stream) {
 } // namespace
 
 int main(int argc, char** argv) {
-    QApplication app(argc, argv);
     auto errors = std::make_shared<ErrorReporter>();
 
     bool test_autostart = false;
@@ -189,7 +194,9 @@ int main(int argc, char** argv) {
         aa::ipc::production_video_socket_path().value;
     std::string input_socket =
         aa::ipc::production_input_socket_path().value;
-    aa::consumer::DecodeBackend decoder_backend = aa::consumer::DecodeBackend::automatic;
+    aa::display::PipelineOptions pipeline;
+    bool check_only = false;
+    auto video_profiles = aa::config::default_video_profiles();
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--test-only-autostart") == 0) {
             test_autostart = true;
@@ -199,20 +206,24 @@ int main(int argc, char** argv) {
             video_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--input-socket") == 0 && index + 1 < argc) {
             input_socket = argv[++index];
-        } else if (std::strcmp(argv[index], "--decoder-backend") == 0 && index + 1 < argc) {
-            const char* backend_val = argv[++index];
-            if (std::strcmp(backend_val, "automatic") == 0) {
-                decoder_backend = aa::consumer::DecodeBackend::automatic;
-            } else if (std::strcmp(backend_val, "software") == 0) {
-                decoder_backend = aa::consumer::DecodeBackend::software;
-            } else if (std::strcmp(backend_val, "nvidia") == 0) {
-                decoder_backend = aa::consumer::DecodeBackend::nvidia;
-            } else {
-                std::fprintf(stderr, "aa-dummy-display: invalid --decoder-backend '%s'\n",
-                             backend_val);
+        } else if ((std::strcmp(argv[index], "--decoder-backend") == 0
+                    || std::strcmp(argv[index], "--decoder") == 0
+                    || std::strcmp(argv[index], "--presentation") == 0
+                    || std::strcmp(argv[index], "--media-thread") == 0) && index + 1 < argc) {
+            const std::string_view option{argv[index]};
+            if (!aa::display::parse_pipeline_option(pipeline, option, argv[++index])) {
+                std::fputs("aa-dummy-display: config_invalid: invalid pipeline option value\n", stderr);
                 print_usage(stderr);
                 return 2;
             }
+        } else if (std::strcmp(argv[index], "--list-video-capabilities") == 0) {
+            aa::tools::list_video_capabilities(); return 0;
+        } else if (std::strcmp(argv[index], "--video-profiles") == 0 && index + 1 < argc) {
+            auto parsed = aa::config::parse_video_profiles(argv[++index]);
+            if (!parsed) { std::fputs("config_invalid: invalid --video-profiles\n",stderr); return 2; }
+            video_profiles = std::move(parsed.value());
+        } else if (std::strcmp(argv[index], "--check-pipeline") == 0) {
+            check_only = true;
         } else if (std::strcmp(argv[index], "--help") == 0 || std::strcmp(argv[index], "-h") == 0) {
             print_usage(stdout);
             return 0;
@@ -223,6 +234,20 @@ int main(int argc, char** argv) {
         }
     }
 
+    const auto decoder_backend = pipeline.decoder == aa::display::Decoder::hardware
+        ? aa::consumer::DecodeBackend::nvidia : pipeline.decoder == aa::display::Decoder::automatic
+        ? aa::consumer::DecodeBackend::automatic : aa::consumer::DecodeBackend::software;
+    if (!pipeline.legacy_decoder_backend) {
+        const auto refusal = aa::tools::unavailable_profiles(video_profiles,decoder_backend);
+        if (!refusal.empty()) { std::fprintf(stderr,"%s\n",refusal.c_str()); return 2; }
+    }
+    if (const auto refusal = aa::display::check_pipeline(pipeline,
+            aa::consumer::DecodeHelper::probe_backends(video_profiles.front().codec))) {
+        std::fprintf(stderr,"%.*s: %.*s\n",static_cast<int>(aa::to_string(refusal->code).size()),aa::to_string(refusal->code).data(),
+            static_cast<int>(refusal->message.size()),refusal->message.data()); return 2;
+    }
+    if (check_only) { std::puts("pipeline_available"); return 0; }
+    QApplication app(argc, argv);
     aa::ipc::InputSender sender{};
     sender.attach(aa::ipc::InputSocketPath{input_socket}, aa::ipc::current_uid());
     g_sender = &sender;
@@ -230,7 +255,7 @@ int main(int argc, char** argv) {
     aa::display::DisplayConfig config{};
     config.consumer_name = aa::ipc::BusName{"org.custom.DummyDisplay1"};
     config.viewport = aa::ipc::Viewport{1280, 720, 160};
-    config.caps = aa::protocol::VideoProfile{1280, 720, 30};
+    config.caps = video_profiles.front();
     // Endpoint, decode and presentation telemetry is written by a background
     // thread: a slow stdout write must never stall the GUI thread that pumps,
     // decodes and paints (a stalled GUI thread shows up as a frozen display).
@@ -245,6 +270,7 @@ int main(int argc, char** argv) {
     };
 
     aa::display::qt_adapter::ProjectionWidget widget(sender, config.caps);
+    widget.set_input_viewport(static_cast<std::uint16_t>(config.viewport.width),static_cast<std::uint16_t>(config.viewport.height));
     g_widget = &widget;
     widget.set_telemetry_writer(&telemetry);
     widget.set_status(DisplayState::unavailable);

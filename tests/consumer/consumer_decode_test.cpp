@@ -305,20 +305,20 @@ TEST(ConsumerDecodeCaps, FallbackProfileNegotiates) {
     EXPECT_TRUE(helper.value().closed());
 }
 
-TEST(ConsumerDecodeCaps, UnsupportedDimensionsFailTyped) {
+TEST(ConsumerDecodeCaps, FullHdIsAValidDecoderConfiguration) {
     DecodeConfig config;
     config.caps = VideoProfile{1920, 1080, 30};
     auto helper = DecodeHelper::open(std::move(config));
-    ASSERT_FALSE(helper);
-    EXPECT_EQ(helper.error().code(), ErrorCode::channel_caps_unsupported);
+    ASSERT_TRUE(helper);
+    EXPECT_FALSE(helper.value().report().selected_element.empty());
 }
 
-TEST(ConsumerDecodeCaps, UnsupportedFrameRateFailsTyped) {
+TEST(ConsumerDecodeCaps, SixtyFpsIsAValidDecoderConfiguration) {
     DecodeConfig config;
     config.caps = VideoProfile{1280, 720, 60};
     auto helper = DecodeHelper::open(std::move(config));
-    ASSERT_FALSE(helper);
-    EXPECT_EQ(helper.error().code(), ErrorCode::channel_caps_unsupported);
+    ASSERT_TRUE(helper);
+    EXPECT_FALSE(helper.value().report().selected_element.empty());
 }
 
 TEST(ConsumerDecodeCaps, EmptyCapsFailTyped) {
@@ -1944,4 +1944,89 @@ TEST(ConsumerDecodeTiming, RealSinkPadObservesBufferListPtsWithoutPulling) {
     ASSERT_NE(received, nullptr);
     EXPECT_EQ(gst_buffer_list_length(received), 2U);
     gst_sample_unref(sample);
+}
+
+TEST(ConsumerDecodeCaps, ExplicitExtendedProfilesOpenSoftwareDecoder) {
+    for (const auto caps : {VideoProfile{1920,1080,60},VideoProfile{2560,1440,30},VideoProfile{800,480,60}}) {
+        DecodeConfig config;
+        config.caps = caps;
+        config.backend = aa::consumer::DecodeBackend::software;
+        auto helper = DecodeHelper::open(config);
+        ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+        EXPECT_FALSE(helper.value().report().selected_element.empty());
+    }
+    DecodeConfig hevc;
+    hevc.caps = {1920,1080,60,aa::protocol::VideoCodec::h265};
+    const auto report = DecodeHelper::probe_backends(hevc.caps.codec);
+    auto opened = DecodeHelper::open(hevc);
+    EXPECT_EQ(opened.has_value(),report.software_path_available && aa::consumer::select_backend(report,hevc.backend).usable);
+    if (!opened) { EXPECT_EQ(opened.error().code(),ErrorCode::channel_decode_unavailable); }
+}
+
+TEST(ConsumerDecodeCaps, InstalledSoftwareCodecsDecodeSyntheticSingleFrame) {
+    const std::pair<aa::protocol::VideoCodec,const char*> fixtures[] = {
+        {aa::protocol::VideoCodec::h265,"h265_480p30_gray_1f.hevc"},
+        {aa::protocol::VideoCodec::vp9,"vp9_480p30_gray_1f.ivf"},
+        {aa::protocol::VideoCodec::av1,"av1_480p30_gray_1f.ivf"}};
+    for (const auto& [codec,name] : fixtures) {
+        SCOPED_TRACE(name);
+        const auto report = DecodeHelper::probe_backends(codec);
+        DecodeConfig config;
+        config.caps = {800,480,30,codec};
+        config.backend = aa::consumer::DecodeBackend::software;
+        unsigned frames = 0;
+        config.on_frame = [&](const aa::consumer::DecodedFrame& frame) {
+            ++frames;
+            EXPECT_EQ(frame.width,800);
+            EXPECT_EQ(frame.height,480);
+            EXPECT_EQ(frame.fps,30);
+            EXPECT_EQ(frame.i420.size(),800u*480u*3u/2u);
+        };
+        auto helper = DecodeHelper::open(config);
+        const bool available = report.software_path_available && aa::consumer::select_backend(report,config.backend).usable;
+        ASSERT_EQ(helper.has_value(),available);
+        if (!available) { EXPECT_EQ(helper.error().code(),ErrorCode::channel_decode_unavailable); continue; }
+        const auto base = fixture_path();
+        auto payload = read_file(base.substr(0,base.find_last_of('/')+1)+name);
+        ASSERT_FALSE(payload.empty());
+        if (codec != aa::protocol::VideoCodec::h265) {
+            ASSERT_GT(payload.size(),44u); // one IVF file header and frame header
+            payload.erase(payload.begin(),payload.begin()+44);
+        }
+        ASSERT_TRUE(helper.value().submit(VideoAccessUnit{1,1,1,true,std::move(payload)}));
+        ASSERT_TRUE(helper.value().end_of_stream());
+        const auto until = std::chrono::steady_clock::now()+std::chrono::seconds{3};
+        while (frames == 0 && std::chrono::steady_clock::now() < until) {
+            auto result = helper.value().pump(Milliseconds{20});
+            ASSERT_TRUE(result) << aa::to_string(result.error().code());
+        }
+        EXPECT_EQ(frames,1u);
+    }
+}
+
+#include "../../tools/video_capabilities.hpp"
+TEST(ConsumerDecodeCaps, RuntimeCodecAdmissionNamesMissingElementsAndHonorsSelection) {
+    const std::pair<aa::protocol::VideoCodec,const char*> codecs[] = {
+        {aa::protocol::VideoCodec::h264,"avdec_h264"}, {aa::protocol::VideoCodec::h265,"avdec_h265"},
+        {aa::protocol::VideoCodec::vp9,"vp9dec"}, {aa::protocol::VideoCodec::av1,"dav1ddec"}};
+    for (const auto& [codec,element] : codecs) {
+        DecodeReport report;
+        report.backends = {{"nvv4l2decoder",true,true,false,false,"factory absent"},
+                           {element,false,false,false,false,"factory absent"}};
+        auto error = aa::tools::unavailable_codec(codec,aa::consumer::DecodeBackend::software,report);
+        EXPECT_NE(error.find(aa::protocol::codec_name(codec)),std::string::npos);
+        EXPECT_NE(error.find(element),std::string::npos);
+        report.backends[1].available = report.backends[1].viable = true;
+        EXPECT_TRUE(aa::tools::unavailable_codec(codec,aa::consumer::DecodeBackend::software,report).empty());
+        EXPECT_TRUE(aa::tools::unavailable_codec(codec,aa::consumer::DecodeBackend::automatic,report).empty());
+        EXPECT_NE(aa::tools::unavailable_codec(codec,aa::consumer::DecodeBackend::nvidia,report).find("nvv4l2decoder"),std::string::npos);
+        report.backends[0].available = report.backends[0].viable = true;
+        EXPECT_TRUE(aa::tools::unavailable_codec(codec,aa::consumer::DecodeBackend::nvidia,report).empty());
+        report.backends[0].viable = false;
+        report.backends[0].cause = "sink caps reject codec";
+        EXPECT_NE(aa::tools::unavailable_codec(codec,aa::consumer::DecodeBackend::nvidia,report).find("sink caps reject codec"),std::string::npos);
+        report.software_path_available = false;
+        report.software_path_cause = "codec parser absent";
+        EXPECT_NE(aa::tools::unavailable_codec(codec,aa::consumer::DecodeBackend::software,report).find("parser absent"),std::string::npos);
+    }
 }

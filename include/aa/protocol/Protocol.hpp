@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <optional>
 
 namespace aa::protocol {
 
@@ -35,10 +36,33 @@ enum class ChannelRole {
 
 // Negotiable video shape. The bench contract is 1280x720@30 primary with an
 // 800x480 fallback (plan "Contract budgets").
+enum class VideoCodec : std::uint8_t { h264 = 3, vp9 = 5, av1 = 6, h265 = 7 };
+struct VideoResolution final { std::uint16_t width, height; };
+// Wire enum order, including landscape and portrait. No throughput policy here.
+inline constexpr VideoResolution kVideoResolutions[] = {
+    {800,480}, {1280,720}, {1920,1080}, {2560,1440}, {3840,2160},
+    {720,1280}, {1080,1920}, {1440,2560}, {2160,3840}};
+inline constexpr VideoCodec kVideoCodecs[] = {VideoCodec::h264,VideoCodec::h265,VideoCodec::vp9,VideoCodec::av1};
+constexpr std::uint8_t video_resolution_index(std::uint16_t width, std::uint16_t height) {
+    for (std::uint8_t i = 0; i < 9; ++i) {
+        if (kVideoResolutions[i].width == width && kVideoResolutions[i].height == height) { return i+1; }
+    }
+    return 0;
+}
+constexpr const char* codec_name(VideoCodec codec) {
+    switch (codec) {
+    case VideoCodec::h264: return "h264";
+    case VideoCodec::h265: return "h265";
+    case VideoCodec::vp9: return "vp9";
+    case VideoCodec::av1: return "av1";
+    }
+    return "unknown";
+}
 struct VideoProfile final {
     std::uint16_t width{};
     std::uint16_t height{};
     std::uint8_t fps{};
+    VideoCodec codec{VideoCodec::h264};
 
     [[nodiscard]] friend constexpr bool operator==(const VideoProfile&,
                                                    const VideoProfile&) noexcept = default;
@@ -68,6 +92,9 @@ struct MessageHeader final {
     ChannelRole channel{};
     std::uint64_t sequence{};
     core::Nanoseconds timestamp{};
+    std::optional<VideoProfile> video_profile{};
+    std::optional<std::int32_t> video_session{};
+    std::optional<std::uint64_t> video_generation{};
 };
 
 // Non-owning view; the payload is valid only for the duration of the call.

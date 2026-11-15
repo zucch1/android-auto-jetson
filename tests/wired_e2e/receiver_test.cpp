@@ -6408,3 +6408,42 @@ TEST(WiredReceiver, ActualMainAnnouncesExperimentalMarginsPerProfileAndWarns) {
     EXPECT_NE(announced.run.output.find("width-margin is advertised but the display does not crop", warning),
               std::string::npos);
 }
+
+TEST(WiredReceiver, ActualMainOffersExtendedProfilesOnlyWhenExplicitlyConfigured) {
+    namespace video = aap_protobuf::service::media::sink::message;
+    const auto defaults = announce_with({});
+    ASSERT_EQ(defaults.run.code,0) << defaults.run.output;
+    ASSERT_EQ(defaults.video.size(),2u);
+    EXPECT_EQ(defaults.video[0].codec_resolution(),video::VIDEO_1280x720);
+    EXPECT_EQ(defaults.video[1].codec_resolution(),video::VIDEO_800x480);
+    EXPECT_EQ(defaults.video[0].frame_rate(),video::VIDEO_FPS_30);
+    EXPECT_EQ(defaults.video[1].frame_rate(),video::VIDEO_FPS_30);
+    const auto configured = announce_with({"--video-profiles","2560x1440@60:h264,1920x1080@30:h264,800x480@30:h264",
+                                          "--screen-content-insets-left","256"});
+    ASSERT_EQ(configured.run.code,0) << configured.run.output;
+    ASSERT_EQ(configured.video.size(),3u);
+    EXPECT_EQ(configured.video[0].codec_resolution(),video::VIDEO_2560x1440);
+    EXPECT_EQ(configured.video[0].frame_rate(),video::VIDEO_FPS_60);
+    EXPECT_EQ(configured.video[1].codec_resolution(),video::VIDEO_1920x1080);
+    EXPECT_EQ(configured.video[1].frame_rate(),video::VIDEO_FPS_30);
+    EXPECT_EQ(configured.video[0].ui_config().content_insets().left(),256u);
+    EXPECT_EQ(configured.video[1].ui_config().content_insets().left(),192u);
+    EXPECT_EQ(configured.video[2].ui_config().content_insets().left(),80u);
+}
+
+TEST(WiredReceiver, HevcAvailabilityIsDeterminedByInstalledElements) {
+    testing::internal::CaptureStderr();
+    const auto result = announce_with({"--video-profiles","1920x1080@60:h265,1280x720@30:h264"});
+    const auto error = testing::internal::GetCapturedStderr();
+    const auto report = aa::consumer::DecodeHelper::probe_backends(aa::protocol::VideoCodec::h265);
+    if (report.software_path_available && aa::consumer::select_backend(report,aa::consumer::DecodeBackend::software).usable) {
+        ASSERT_EQ(result.run.code,0) << error;
+        ASSERT_EQ(result.video.size(),2u);
+        EXPECT_EQ(result.video[0].video_codec_type(),aap_protobuf::service::media::shared::message::MEDIA_CODEC_VIDEO_H265);
+    } else {
+        EXPECT_EQ(result.run.code,2);
+        EXPECT_TRUE(result.video.empty());
+        EXPECT_NE(error.find("h265 not available on this host"),std::string::npos) << error;
+        EXPECT_NE(error.find("avdec_h265"),std::string::npos) << error;
+    }
+}

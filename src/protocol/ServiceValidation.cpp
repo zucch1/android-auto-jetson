@@ -7,8 +7,10 @@
 namespace aa::protocol {
 
 bool valid_video_profile(VideoProfile profile) noexcept {
-    return profile.fps == 30 && ((profile.width == 1280 && profile.height == 720)
-                                || (profile.width == 800 && profile.height == 480));
+    return (profile.fps == 30 || profile.fps == 60)
+        && (profile.codec == VideoCodec::h264 || profile.codec == VideoCodec::h265
+            || profile.codec == VideoCodec::vp9 || profile.codec == VideoCodec::av1)
+        && video_resolution_index(profile.width, profile.height) != 0;
 }
 
 bool valid_audio_profile(AudioProfile profile) noexcept {
@@ -24,7 +26,7 @@ core::Result<void> validate_service(const ServiceDescriptor& service) {
     case ChannelRole::video: {
         const auto* config = std::get_if<VideoConfiguration>(&service.configuration);
         if (config == nullptr || config->profiles.empty()
-            || config->profiles.size() > kMaxMediaProfiles) { return malformed; }
+            || config->profiles.size() > kMaxVideoProfiles) { return malformed; }
         std::vector<VideoProfile> seen;
         std::vector<config::ScreenExtent> extents;
         for (const auto profile : config->profiles) {

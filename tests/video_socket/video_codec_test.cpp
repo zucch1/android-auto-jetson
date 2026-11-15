@@ -170,3 +170,28 @@ TEST(VideoCodec, AuthorizePeerIsSameUidOnly) {
     ASSERT_FALSE(rejected);
     EXPECT_EQ(rejected.error().code(), aa::ErrorCode::transport_unauthorized_peer);
 }
+
+TEST(VideoCodec, NegotiatedProfileMetadataRoundTripsAndRejectsInvalidFps) {
+    auto h = sample_header();
+    h.profile = aa::protocol::VideoProfile{2560,1440,60,aa::protocol::VideoCodec::h265};
+    auto record = encode(h);
+    auto parsed = decode_frame_header(record, NegotiatedLimits{});
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ(parsed.value().profile,h.profile);
+    record[54] = 25;
+    EXPECT_FALSE(decode_frame_header(record, NegotiatedLimits{}));
+}
+
+TEST(VideoCodec, EveryProtocolProfileSurvivesVideoMetadata) {
+    for (const auto resolution : aa::protocol::kVideoResolutions) {
+        for (const auto fps : {30,60}) {
+            for (const auto codec : aa::protocol::kVideoCodecs) {
+                auto header = sample_header();
+                header.profile = aa::protocol::VideoProfile{resolution.width,resolution.height,static_cast<std::uint8_t>(fps),codec};
+                const auto parsed = decode_frame_header(encode(header),NegotiatedLimits{});
+                ASSERT_TRUE(parsed);
+                EXPECT_EQ(parsed.value().profile,header.profile);
+            }
+        }
+    }
+}

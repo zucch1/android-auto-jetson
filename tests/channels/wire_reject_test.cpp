@@ -54,7 +54,7 @@ TEST(ChannelWireReject, RejectsWireDuplicateIdsRolesAndBounds) {
     }
 }
 
-TEST(ChannelWireReject, RejectsMissingVideoFieldsMarginsCodecAndProfileFlood) {
+TEST(ChannelWireReject, RejectsMalformedWireAndRoundTripsConfiguredProfiles) {
     // Given: configurations malformed independently of the project encoder.
     for (const int scenario : {0, 1, 2, 3, 4, 5, 6}) {
         auto wire = wire_video();
@@ -63,10 +63,10 @@ TEST(ChannelWireReject, RejectsMissingVideoFieldsMarginsCodecAndProfileFlood) {
         switch (scenario) {
         case 0: config->clear_codec_resolution(); break;
         case 1: config->clear_frame_rate(); break;
-        case 2: config->set_video_codec_type(shared::MEDIA_CODEC_VIDEO_VP9); break;
+        case 2: config->set_video_codec_type(shared::MEDIA_CODEC_AUDIO_PCM); break;
         case 3: config->set_width_margin(1280); break;
-        case 4: config->set_codec_resolution(sink::VIDEO_1920x1080); break;
-        case 5: config->set_frame_rate(sink::VIDEO_FPS_60); break;
+        case 4: config->clear_codec_resolution(); config->mutable_unknown_fields()->AddVarint(1,10); break;
+        case 5: config->clear_frame_rate(); config->mutable_unknown_fields()->AddVarint(2, 3); break;
         case 6:
             for (std::size_t i = 0; i < proto::kMaxMediaProfiles; ++i) {
                 *media->add_video_configs() = media->video_configs(0);
@@ -79,6 +79,21 @@ TEST(ChannelWireReject, RejectsMissingVideoFieldsMarginsCodecAndProfileFlood) {
         ASSERT_FALSE(decoded) << scenario;
         EXPECT_EQ(decoded.error().code(), aa::ErrorCode::protocol_malformed_message);
     }
+    for (const auto r : proto::kVideoResolutions) {
+        for (const auto fps : {30,60}) {
+            for (const auto codec : proto::kVideoCodecs) {
+                proto::ServiceDescriptor descriptor{proto::ServiceKey{99},proto::ChannelRole::video,proto::VideoConfiguration{{{1280,720,30}}}};
+                auto& cfg = std::get<proto::VideoConfiguration>(descriptor.configuration);
+                cfg.profiles = {{r.width,r.height,static_cast<std::uint8_t>(fps),codec}};
+                auto encoded = proto::encode(proto::ServiceDiscoveryResponse{{descriptor}});
+                ASSERT_TRUE(encoded);
+                auto decoded = proto::decode_service_discovery_response(encoded.value());
+                ASSERT_TRUE(decoded);
+                EXPECT_EQ(decoded.value().services.front(),descriptor);
+            }
+        }
+    }
+
 }
 
 TEST(ChannelWireReject, RejectsMissingAudioFieldsAndOutOfRangeNumbers) {
@@ -104,11 +119,11 @@ TEST(ChannelWireReject, RejectsMissingAudioFieldsAndOutOfRangeNumbers) {
     }
 }
 
-TEST(ChannelWireReject, RejectsPlaceholderAndDuplicateProjectConfigurations) {
+TEST(ChannelWireReject, RejectsMalformedProjectConfigurationsAndAcceptsDefinedProfiles) {
     // Given: role/config mismatches and malformed typed configurations.
     const std::vector<proto::ServiceDescriptor> bad{
         {proto::ServiceKey{99}, proto::ChannelRole::video},
-        {proto::ServiceKey{99}, proto::ChannelRole::video, proto::VideoConfiguration{{{1280, 720, 60}}}},
+        {proto::ServiceKey{99}, proto::ChannelRole::video, proto::VideoConfiguration{{{1280, 720, 25}}}},
         {proto::ServiceKey{99}, proto::ChannelRole::video,
          proto::VideoConfiguration{{{1280, 720, 30}, {1280, 720, 30}}}},
         {proto::ServiceKey{99}, proto::ChannelRole::media_audio, proto::AudioConfiguration{{{0, 16, 2}}}},
@@ -120,6 +135,13 @@ TEST(ChannelWireReject, RejectsPlaceholderAndDuplicateProjectConfigurations) {
         EXPECT_FALSE(aa::channels::SupportConfiguration::create({descriptor}));
         EXPECT_FALSE(proto::encode(proto::ServiceDiscoveryResponse{{descriptor}}));
     }
+    for (const auto p : {proto::VideoProfile{1920,1080,60},proto::VideoProfile{2560,1440,60}}) {
+        proto::ServiceDescriptor descriptor{proto::ServiceKey{99},proto::ChannelRole::video,proto::VideoConfiguration{{{1280,720,30}}}};
+        std::get<proto::VideoConfiguration>(descriptor.configuration).profiles = {p};
+        EXPECT_TRUE(aa::channels::SupportConfiguration::create({descriptor}));
+        EXPECT_TRUE(proto::encode(proto::ServiceDiscoveryResponse{{descriptor}}));
+    }
+
 }
 
 TEST(ChannelWireReject, RefusesUnqualifiedHardwareAndLocalDiagnosticsOnWire) {

@@ -34353,8 +34353,10 @@
    "oaa_value": [
     "_60"
    ],
-   "receiver_citations": [],
-   "severity": "medium",
+   "receiver_citations": [
+    "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
+   ],
+   "severity": "medium-high",
    "source": {
     "aasdk_file": "service/media/sink/message/VideoFrameRateType.proto",
     "aasdk_line": 6,
@@ -34366,16 +34368,16 @@
     "confidence": "high",
     "disposition": "no-action",
     "evidence_tier": "mechanical",
-    "impact": "Numeric value is identical on wire; identifier naming differs on an unused enum value (value 1).",
+    "impact": "Numeric value is identical on wire; naming differs for VIDEO_FPS_60, now used by the receiver.",
     "owner": "triage:phase0-closed",
     "phone_evidence_status": "not-needed",
-    "rationale": "Wire value identical and enum constant not referenced in receiver C++.",
-    "severity": "medium",
+    "rationale": "Wire value is identical; receiver explicitly maps both 30 and 60 fps.",
+    "severity": "medium-high",
     "status": "resolved",
     "version_applicability": "AA 16.2"
    },
-   "usage_mode": "entity-active-value-unused",
-   "used_by_receiver": false,
+   "usage_mode": "direct-enum-value",
+   "used_by_receiver": true,
    "wire_affecting": true
   },
   {
@@ -66101,7 +66103,7 @@
      "evidence": [
       {
        "contains": "wire.set_status(shared::Config::STATUS_READY);",
-       "lines": "171",
+       "lines": "186",
        "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
       }
      ],
@@ -66121,12 +66123,12 @@
     "citations": [
      {
       "contains": "wire.set_status(shared::Config::STATUS_READY);",
-      "lines": "171",
+      "lines": "186",
       "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
      },
      {
       "contains": "static_assert(shared::Config::STATUS_READY == 2);",
-      "lines": "31",
+      "lines": "32",
       "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
      }
     ],
@@ -66193,7 +66195,7 @@
     "citations": [
      {
       "contains": "constexpr int tags[] = {1, 2, 3};",
-      "lines": "104",
+      "lines": "116",
       "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
      },
      {
@@ -66244,7 +66246,7 @@
      "evidence": [
       {
        "contains": "constexpr int tags[] = {1, 2, 3};",
-       "lines": "104",
+       "lines": "116",
        "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
       }
      ],
@@ -66262,7 +66264,7 @@
     "citations": [
      {
       "contains": "if (wire.has_mode()) { request.mode = static_cast<VideoFocusMode>(wire.mode()); }",
-      "lines": "109",
+      "lines": "121",
       "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
      }
     ],
@@ -66656,12 +66658,12 @@
     "citations": [
      {
       "contains": "case ChannelRole::guidance_audio: wire->set_audio_type(sink::AUDIO_STREAM_GUIDANCE); break;",
-      "lines": "242",
+      "lines": "248",
       "path": "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
      },
      {
       "contains": "case ChannelRole::speech_audio: wire->set_audio_type(sink::AUDIO_STREAM_TELEPHONY); break;",
-      "lines": "244",
+      "lines": "250",
       "path": "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
      }
     ],
@@ -67232,12 +67234,12 @@
     "citations": [
      {
       "contains": "static_assert(ids::MEDIA_MESSAGE_VIDEO_FOCUS_REQUEST == 0x8007);",
-      "lines": "27",
+      "lines": "28",
       "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
      },
      {
       "contains": "static_assert(ids::MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION == 0x8008);",
-      "lines": "28",
+      "lines": "29",
       "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
      }
     ],
@@ -67567,7 +67569,7 @@
     "citations": [
      {
       "contains": "wire->set_available_type(shared::MEDIA_CODEC_VIDEO_H264_BP);",
-      "lines": "208",
+      "lines": "215",
       "path": "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
      }
     ],
@@ -160238,8 +160240,8 @@
    "high": 26,
    "low": 571,
    "low-medium": 185,
-   "medium": 200,
-   "medium-high": 33
+   "medium": 199,
+   "medium-high": 34
   },
   "by_status": {
    "confirmed": 10,
@@ -161134,7 +161136,7 @@
      "src/protocol/aasdk_adapter/MediaConfiguration.cpp"
     ],
     "total": 47,
-    "used_by_receiver": 22,
+    "used_by_receiver": 23,
     "version_gates": [
      "AA 16.1",
      "AA 16.2",
@@ -161142,7 +161144,7 @@
      "AA 17.3"
     ],
     "wire_affecting": 10,
-    "wire_and_used": 7,
+    "wire_and_used": 8,
     "wire_msg_ids": [
      "0x8007",
      "0x8008",
@@ -161947,9 +161949,9 @@
   "total_differences": 1015,
   "triaged": 1015,
   "untriaged": 0,
-  "used_by_receiver": 192,
+  "used_by_receiver": 193,
   "wire_affecting": 238,
-  "wire_and_used": 59,
+  "wire_and_used": 60,
   "wireless_modes": {
    "aasdk_bootstrap_message_count": 7,
    "aasdk_security_mode_values": [

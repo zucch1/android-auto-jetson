@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "../video_capabilities.hpp"
 //
 // Wired end-to-end receiver entry point (task 30 phase-B harness driver): the
 // composed receiver for the real approved phone over USB/AOA. It wires the
@@ -38,6 +39,7 @@
 #include <aa/ipc/VideoSocket.hpp>
 #include <aa/protocol/Messages.hpp>
 #include <aa/protocol/Protocol.hpp>
+#include <aa/config/VideoProfiles.hpp>
 #include <aa/session/Events.hpp>
 #include <aa/session/Session.hpp>
 #include <aa/transport/TlsTransport.hpp>
@@ -1531,12 +1533,11 @@ aa::audio::RouterConfig pcm_router_config(
 // Backend-supported video profiles, preferred first. The first is the primary
 // profile: --screen-* pixel quantities are given in its pixels and scaled to
 // the others (aa::config::Screen).
-constexpr aa::protocol::VideoProfile kOfferedVideoProfiles[] = {{1280, 720, 30}, {800, 480, 30}};
-
 std::vector<aa::protocol::ServiceDescriptor>
 service_descriptors(const aa::input::CapabilityDescriptor &input,
-                    const aa::config::Screen &screen = {}) {
-    const aa::protocol::VideoConfiguration video{{kOfferedVideoProfiles[0], kOfferedVideoProfiles[1]},
+                    const aa::config::Screen &screen = {},
+                    const std::vector<aa::protocol::VideoProfile>& profiles = aa::config::default_video_profiles()) {
+    const aa::protocol::VideoConfiguration video{profiles,
                                                  screen};
     const aa::protocol::AudioConfiguration media_audio{{{48000, 16, 2}}};
     const aa::protocol::AudioConfiguration voice_audio{{{16000, 16, 1}}};
@@ -1660,13 +1661,17 @@ const char *const kUsage =
     "  density (120|160|240|320|480|640), real-density, pixel-aspect-ratio-e4,\n"
     "  decoder-additional-depth, theme (0|1|2), width-margin, height-margin,\n"
     "  {margins,content-insets,stable-content-insets}-{top,bottom,left,right}.\n"
-    "  Pixel values are in 1280x720 (primary profile) pixels and scaled to the\n"
-    "  800x480 offer. width-margin, height-margin, margins-* and a\n"
+    "  --decoder software|hardware|auto; --list-video-capabilities\n"
+    "  --video-profiles WxH@FPS:CODEC,... (default 1280x720@30:h264,800x480@30:h264)\n"
+    "  Pixel values are in the first offered profile pixels (default\n"
+    "  1280x720 (primary profile)) and scaled to every fallback offer. width-margin, height-margin, margins-* and a\n"
     "  pixel-aspect-ratio-e4 other than 10000 need --screen-experimental-geometry:\n"
     "  the display does not crop or map touch for them yet. See ARCHITECTURE.md.\n"
     "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked.\n";
 
 int receiver_main(int argc, char **argv) {
+    auto video_profiles = aa::config::default_video_profiles();
+    auto video_decoder = aa::consumer::DecodeBackend::software;
     aa::config::Screen screen;
     bool experimental_geometry = false;
     std::string port;
@@ -1690,6 +1695,14 @@ int receiver_main(int argc, char **argv) {
             }
         } else if (std::strcmp(argv[index], "--store") == 0 && index + 1 < argc) {
             store_path = argv[++index];
+        } else if (std::strcmp(argv[index], "--list-video-capabilities") == 0) {
+            aa::tools::list_video_capabilities(); return 0;
+        } else if (std::strcmp(argv[index], "--decoder") == 0 && index + 1 < argc) {
+            if (!aa::tools::parse_decoder(argv[++index],video_decoder)) { std::fputs("invalid --decoder\n",stderr); return 2; }
+        } else if (std::strcmp(argv[index], "--video-profiles") == 0 && index + 1 < argc) {
+            auto parsed = aa::config::parse_video_profiles(argv[++index]);
+            if (!parsed) { std::fputs("invalid --video-profiles\n", stderr); return 2; }
+            video_profiles = std::move(parsed.value());
         } else if (std::strcmp(argv[index], "--video-socket") == 0 && index + 1 < argc) {
             video_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--input-socket") == 0 && index + 1 < argc) {
@@ -1725,7 +1738,9 @@ int receiver_main(int argc, char **argv) {
     // The description is given in the primary profile's pixels and must stay
     // valid once scaled into every offered profile.
     std::vector<aa::config::ScreenExtent> extents;
-    for (const auto &profile : kOfferedVideoProfiles) { extents.push_back({profile.width, profile.height}); }
+    const auto refusal = aa::tools::unavailable_profiles(video_profiles,video_decoder);
+    if (!refusal.empty()) { std::fprintf(stderr,"%s\n",refusal.c_str()); return 2; }
+    for (const auto &profile : video_profiles) { extents.push_back({profile.width,profile.height}); }
     if (const auto field = aa::config::invalid_screen_field(screen, extents); !field.empty()) {
         std::fprintf(stderr, "invalid screen field: %.*s\n", static_cast<int>(field.size()), field.data());
         return 2;
@@ -1829,7 +1844,7 @@ int receiver_main(int argc, char **argv) {
                  + " is advertised but the display does not crop to it and touch is not mapped through it; "
                    "expect a wrong touch mapping and a cropped or offset picture\"}");
     }
-    if (!session.configure(service_descriptors(input, screen)).has_value()) {
+    if (!session.configure(service_descriptors(input, screen, video_profiles)).has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"configure\"}");
         return 1;
     }

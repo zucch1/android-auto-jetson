@@ -31,7 +31,7 @@ Error oversize() noexcept { return Error{ErrorCode::transport_oversize_frame}; }
 void encode_frame_header(std::span<std::uint8_t> record_prefix,
                          const VideoFrameHeader& header) noexcept {
     put(record_prefix, 0, kVideoFrameMagic, 4);
-    put(record_prefix, 4, kVideoProtocolVersion, 2);
+    put(record_prefix, 4, header.profile ? 2 : kVideoProtocolVersion, 2);
     put(record_prefix, 6, kFrameHeaderBytes, 2);
     put(record_prefix, 8, header.idr ? 1 : 0, 4);
     put(record_prefix, 12, header.frame, 8);
@@ -41,7 +41,13 @@ void encode_frame_header(std::span<std::uint8_t> record_prefix,
     put(record_prefix, 36, header.timestamp_ns, 8);
     put(record_prefix, 44, header.frame_bytes, 4);
     put(record_prefix, 48, header.payload_bytes, 4);
-    put(record_prefix, 52, 0, 4);
+    std::uint32_t metadata = 0;
+    if (header.profile) {
+        const auto& p = *header.profile;
+        const unsigned resolution = protocol::video_resolution_index(p.width, p.height);
+        metadata = (resolution << 16) | (static_cast<unsigned>(p.fps) << 8) | static_cast<unsigned>(p.codec);
+    }
+    put(record_prefix, 52, metadata, 4);
 }
 
 core::Result<VideoFrameHeader>
@@ -54,13 +60,21 @@ decode_frame_header(std::span<const std::uint8_t> record,
         return oversize();
     }
     if (get<4>(record, 0) != kVideoFrameMagic || get<2>(record, 6) != kFrameHeaderBytes ||
-        get<4>(record, 8) > 1 || get<4>(record, 52) != 0) {
+        get<4>(record, 8) > 1 || (get<2>(record, 4) == 1 && get<4>(record, 52) != 0)) {
         return malformed();
     }
-    if (get<2>(record, 4) != kVideoProtocolVersion) {
+    if (get<2>(record, 4) != kVideoProtocolVersion && get<2>(record, 4) != 2) {
         return Error{ErrorCode::protocol_version_mismatch};
     }
     VideoFrameHeader header{};
+    if (get<2>(record, 4) == 2) {
+        const auto bits = get<4>(record, 52);
+        const auto resolution = bits >> 16;
+        const auto fps = (bits >> 8) & 255;
+        const auto codec = bits & 255;
+        if (resolution < 1 || resolution > 9 || (fps != 30 && fps != 60) || (codec != 3 && codec != 5 && codec != 6 && codec != 7)) { return malformed(); }
+        header.profile = protocol::VideoProfile{protocol::kVideoResolutions[resolution-1].width, protocol::kVideoResolutions[resolution-1].height, static_cast<std::uint8_t>(fps), static_cast<protocol::VideoCodec>(codec)};
+    }
     header.frame = get<8>(record, 12);
     header.index = static_cast<std::uint32_t>(get<4>(record, 20));
     header.count = static_cast<std::uint32_t>(get<4>(record, 24));

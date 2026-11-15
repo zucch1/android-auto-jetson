@@ -87,8 +87,10 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
     case ChannelRole::video: {
         const auto& wire = entry.media_sink_service();
         if (wire.audio_configs_size() != 0 || wire.has_audio_type()
-            || wire.available_type() != shared::MEDIA_CODEC_VIDEO_H264_BP
-            || wire.video_configs_size() > static_cast<int>(kMaxMediaProfiles)) {
+            || (wire.available_type() != shared::MEDIA_CODEC_VIDEO_H264_BP
+                && wire.available_type() != shared::MEDIA_CODEC_VIDEO_H265
+                && wire.available_type() != shared::MEDIA_CODEC_VIDEO_VP9 && wire.available_type() != shared::MEDIA_CODEC_VIDEO_AV1)
+            || wire.video_configs_size() > static_cast<int>(kMaxVideoProfiles)) {
             return malformed();
         }
         VideoConfiguration config;
@@ -96,8 +98,10 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
             if (rejects_unknown(video, kVideoConfigurationTags)
                 || !video.has_codec_resolution() || !video.has_frame_rate()
                 || !video.has_video_codec_type()
-                || video.video_codec_type() != shared::MEDIA_CODEC_VIDEO_H264_BP
-                || video.frame_rate() != sink::VIDEO_FPS_30) {
+                || (video.video_codec_type() != shared::MEDIA_CODEC_VIDEO_H264_BP
+                    && video.video_codec_type() != shared::MEDIA_CODEC_VIDEO_H265
+                    && video.video_codec_type() != shared::MEDIA_CODEC_VIDEO_VP9 && video.video_codec_type() != shared::MEDIA_CODEC_VIDEO_AV1)
+                || (video.frame_rate() != sink::VIDEO_FPS_30 && video.frame_rate() != sink::VIDEO_FPS_60)) {
                 return malformed();
             }
             config::Screen screen;
@@ -122,11 +126,12 @@ read_configuration(const aap_protobuf::service::Service& entry, ChannelRole role
                 if (ui.has_ui_theme()) { screen.theme = static_cast<std::uint32_t>(ui.ui_theme()); }
             }
             VideoProfile profile{};
-            switch (video.codec_resolution()) {
-            case sink::VIDEO_1280x720: profile = {1280, 720, 30}; break;
-            case sink::VIDEO_800x480: profile = {800, 480, 30}; break;
-            default: return malformed();
-            }
+            const auto resolution = static_cast<unsigned>(video.codec_resolution());
+            if (resolution < 1 || resolution > 9) { return malformed(); }
+            profile.width = kVideoResolutions[resolution-1].width;
+            profile.height = kVideoResolutions[resolution-1].height;
+            profile.fps = video.frame_rate() == sink::VIDEO_FPS_60 ? 60 : 30;
+            profile.codec = static_cast<VideoCodec>(video.video_codec_type());
             // The first entry defines the screen in its own pixels; every later
             // entry must carry exactly that screen scaled into its pixels.
             // Obsolete viewing_distance (field 7) is deliberately ignored.
@@ -205,14 +210,15 @@ core::Result<void> put_configuration(aap_protobuf::service::Service& entry,
         return {};
     case ChannelRole::video: {
         auto* wire = entry.mutable_media_sink_service();
-        wire->set_available_type(shared::MEDIA_CODEC_VIDEO_H264_BP);
         const auto& configuration = std::get<VideoConfiguration>(descriptor.configuration);
+        if (configuration.profiles.front().codec == VideoCodec::h264) {
+            wire->set_available_type(shared::MEDIA_CODEC_VIDEO_H264_BP);
+        } else { wire->set_available_type(static_cast<shared::MediaCodecType>(configuration.profiles.front().codec)); }
         for (const auto profile : configuration.profiles) {
             auto* video = wire->add_video_configs();
-            video->set_codec_resolution(profile.width == 1280 ? sink::VIDEO_1280x720
-                                                             : sink::VIDEO_800x480);
-            video->set_frame_rate(sink::VIDEO_FPS_30);
-            video->set_video_codec_type(shared::MEDIA_CODEC_VIDEO_H264_BP);
+            video->set_codec_resolution(static_cast<sink::VideoCodecResolutionType>(video_resolution_index(profile.width, profile.height)));
+            video->set_frame_rate(profile.fps == 60 ? sink::VIDEO_FPS_60 : sink::VIDEO_FPS_30);
+            video->set_video_codec_type(static_cast<shared::MediaCodecType>(profile.codec));
             const auto screen = config::scale_screen(
                 configuration.screen,
                 {configuration.profiles.front().width, configuration.profiles.front().height},

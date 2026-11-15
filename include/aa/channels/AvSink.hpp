@@ -79,6 +79,8 @@ private:
     AvObservation current_observation_{};
     AvObservation pending_observation_{};
     std::optional<diagnostics::QueueRejection> last_queue_rejection_;
+    std::vector<std::uint32_t> announced_;
+    std::optional<protocol::VideoProfile> selected_profile_;
     bool ready_{};
     std::optional<std::int32_t> session_;
     std::optional<std::uint64_t> peer_timestamp_;

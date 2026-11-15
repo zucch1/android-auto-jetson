@@ -458,3 +458,60 @@ TEST(MediaWire, UnsafeScreenCannotBeAnnounced) {
     EXPECT_TRUE(proto::encode(proto::ServiceDiscoveryResponse{{descriptor}}));
 }
 } // namespace
+
+#include <aa/config/VideoProfiles.hpp>
+TEST(MediaWire, VideoProfileListIsStrictOrderedAndAtomic) {
+    auto p = aa::config::parse_video_profiles("2560x1440@60:h264,1920x1080@30:h265,800x480@60:h264");
+    ASSERT_TRUE(p);
+    EXPECT_EQ(p.value()[0], (proto::VideoProfile{2560,1440,60}));
+    EXPECT_EQ(p.value()[1].codec, proto::VideoCodec::h265);
+    for (auto bad : {"", "1920x1080@59:h264", "1920x1080@60:unknown", "1x1@30:h264", "1280x720@30:h264,", "1280x720@30:h264,1280x720@30:h264", "65536x720@30:h264"}) {
+        EXPECT_FALSE(aa::config::parse_video_profiles(bad)) << bad;
+    }
+    EXPECT_EQ(aa::config::default_video_profiles(), (std::vector<proto::VideoProfile>{{1280,720,30},{800,480,30}}));
+}
+TEST(MediaWire, ExtendedProfilesAnnounceExactOrderedEnumsAndScaledScreen) {
+    auto service = video();
+    auto& cfg = std::get<proto::VideoConfiguration>(service.configuration);
+    cfg.profiles = {{2560,1440,60}, {1920,1080,30,proto::VideoCodec::h265}, {800,480,60}};
+    cfg.screen.content_insets = aa::config::ScreenInsets{100,100,100,100};
+    const auto encoded = proto::encode(proto::ServiceDiscoveryResponse{{service}});
+    ASSERT_TRUE(encoded);
+    ctl::ServiceDiscoveryResponse wire;
+    ASSERT_TRUE(wire.ParseFromArray(encoded.value().data()+2, static_cast<int>(encoded.value().size()-2)));
+    const auto& media = wire.channels(0).media_sink_service();
+    ASSERT_EQ(media.video_configs_size(),3);
+    EXPECT_EQ(media.video_configs(0).codec_resolution(), sink::VIDEO_2560x1440);
+    EXPECT_EQ(media.video_configs(0).frame_rate(), sink::VIDEO_FPS_60);
+    EXPECT_EQ(media.video_configs(1).codec_resolution(), sink::VIDEO_1920x1080);
+    EXPECT_EQ(media.video_configs(1).video_codec_type(), shared::MEDIA_CODEC_VIDEO_H265);
+    auto decoded = proto::decode_service_discovery_response(encoded.value());
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded.value().services.front(),service);
+}
+
+TEST(MediaWire, ExtendedProfilesAreRejectedUnlessConfiguredAndAnnounced) {
+    aa::channels::ServiceRegistry registry;
+    Sink handler;
+    ASSERT_TRUE(registry.register_sink(proto::ChannelRole::video,handler));
+    const auto defaults = video();
+    auto configured = defaults;
+    std::get<proto::VideoConfiguration>(configured.configuration).profiles = {{1920,1080,60},{1280,720,30}};
+    const std::array requested{proto::VideoProfile{1920,1080,60}};
+    for (const bool enabled : {false,true}) {
+        auto service = enabled ? configured : defaults;
+        auto support = aa::channels::SupportConfiguration::create({service});
+        ASSERT_TRUE(support);
+        aa::channels::Negotiator negotiator{std::move(support.value()),registry};
+        auto announced = negotiator.start();
+        const auto encoded = proto::encode(announced);
+        ASSERT_TRUE(encoded);
+        auto decoded = proto::decode_service_discovery_response(encoded.value());
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded.value().services.front(),service);
+        ASSERT_TRUE(negotiator.open({1,service.id}));
+        auto selected = negotiator.select_video(service.id,requested);
+        EXPECT_EQ(selected.has_value(),enabled);
+        if (enabled) { EXPECT_EQ(selected.value(),requested.front()); }
+    }
+}
