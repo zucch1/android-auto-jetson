@@ -320,6 +320,8 @@ TEST_P(WirelessVideoIdr, PartialFocusRestoreFailureRetiresWirelessSessionWithout
     std::atomic<bool> active{}, video_ready{}, send_keepalive_ping{}, keepalive_acked{};
     std::mutex ping_mutex;
     std::condition_variable ping_cv;
+    std::atomic<std::uint64_t> ready_ping_count{};
+    bool owner_observed_ready_ping{}; // protected by ping_mutex
     std::vector<std::vector<std::byte>> phone_video_messages;
     std::optional<aa::ErrorCode> phone_close_error;
     auto phone = std::async(std::launch::async, [&] {
@@ -354,11 +356,13 @@ TEST_P(WirelessVideoIdr, PartialFocusRestoreFailureRetiresWirelessSessionWithout
         ASSERT_TRUE(receive(*tcp.value(), &cipher));
         ASSERT_TRUE(send(*tcp.value(), 73, {std::byte{0x80}, std::byte{0x01}}, &cipher));
         ASSERT_TRUE(receive(*tcp.value(), &cipher));
+        std::uint64_t bootstrap_pings{};
         for (int round = 0; round < 100 && !active.load(); ++round) {
             ASSERT_TRUE(send(*tcp.value(), 0, proto::encode(proto::PingRequest{round, false, {}}).value(), &cipher));
             auto ping = receive(*tcp.value(), &cipher);
             ASSERT_TRUE(ping);
             ASSERT_TRUE(proto::decode_ping_response(ping.value().payload));
+            ++bootstrap_pings;
             std::this_thread::sleep_for(std::chrono::milliseconds{5});
         }
         ASSERT_TRUE(active.load());
@@ -372,11 +376,19 @@ TEST_P(WirelessVideoIdr, PartialFocusRestoreFailureRetiresWirelessSessionWithout
             ASSERT_TRUE(send(*tcp.value(), 99, proto::encode(proto::VideoFocusRequest{initial_mode}).value(), &cipher));
             ASSERT_TRUE(receive(*tcp.value(), &cipher)); // VideoFocusNotification(projected_no_input_focus, false)
         }
+        ready_ping_count = bootstrap_pings + 1;
         ASSERT_TRUE(send(*tcp.value(), 0, proto::encode(proto::PingRequest{999, false, {}}).value(), &cipher));
         auto ready_ping = receive(*tcp.value(), &cipher);
         ASSERT_TRUE(ready_ping);
         ASSERT_TRUE(proto::decode_ping_response(ready_ping.value().payload));
-        video_ready = true;
+        {
+            std::unique_lock lock(ping_mutex);
+            // Force the formerly racy ordering: the phone cannot publish readiness
+            // until the owner has observed its own synchronous ping response.
+            ASSERT_TRUE(ping_cv.wait_for(lock, 2s, [&] { return owner_observed_ready_ping; }));
+            video_ready = true;
+        }
+        ping_cv.notify_all();
 
         {
             std::unique_lock lock(ping_mutex);
@@ -426,11 +438,28 @@ TEST_P(WirelessVideoIdr, PartialFocusRestoreFailureRetiresWirelessSessionWithout
         }
     };
 
+    // A phone-thread flag cannot end an idle TCP read. Once its response is
+    // written, the phone waits for this owner; polling again can deadlock both.
+    // Stop on the owner's ping counter, which advances before poll returns.
+    const auto ready_ping_answered = [&] {
+        const auto expected = ready_ping_count.load();
+        const auto* session = fix.link.session();
+        return expected != 0 && session && session->pings_answered() >= expected;
+    };
     const auto until = ControlIoFixture::Clock::now() + 4s;
-    while (!video_ready.load() && ControlIoFixture::Clock::now() < until) {
+    while (!ready_ping_answered() && ControlIoFixture::Clock::now() < until) {
         ASSERT_TRUE(fix.link.poll(fix.coordinator, ensure_video_sink));
     }
-    ASSERT_TRUE(video_ready.load());
+    ASSERT_TRUE(ready_ping_answered());
+    {
+        std::lock_guard lock(ping_mutex);
+        owner_observed_ready_ping = true;
+    }
+    ping_cv.notify_all();
+    {
+        std::unique_lock lock(ping_mutex);
+        ASSERT_TRUE(ping_cv.wait_for(lock, 2s, [&] { return video_ready.load(); }));
+    }
     ASSERT_NE(fix.link.session(), nullptr);
     ASSERT_TRUE(fix.link.session()->video_projecting());
 
