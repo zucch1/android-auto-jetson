@@ -1964,8 +1964,8 @@ EnrolmentResult run_enrolment_child(const char* answer, const char* filter) {
     return result;
 }
 
-TEST(WiredReceiver, EnrolmentExplicitYesApprovesTheRefusedPhone) {
-    const auto result = run_enrolment_child("y", "WiredReceiver.EnrolmentExplicitYesApprovesTheRefusedPhone");
+TEST(WiredReceiverEnrolment, ExplicitYesApprovesTheRefusedPhone) {
+    const auto result = run_enrolment_child("y", "WiredReceiverEnrolment.ExplicitYesApprovesTheRefusedPhone");
     ASSERT_FALSE(result.watchdog_fired) << result.output;
     ASSERT_TRUE(WIFEXITED(result.status)) << result.status;
     EXPECT_EQ(WEXITSTATUS(result.status), 0) << result.output;
@@ -1983,8 +1983,8 @@ TEST(WiredReceiver, EnrolmentExplicitYesApprovesTheRefusedPhone) {
     }
 }
 
-TEST(WiredReceiver, EnrolmentExplicitNoWritesNothing) {
-    const auto result = run_enrolment_child("n", "WiredReceiver.EnrolmentExplicitNoWritesNothing");
+TEST(WiredReceiverEnrolment, ExplicitNoWritesNothing) {
+    const auto result = run_enrolment_child("n", "WiredReceiverEnrolment.ExplicitNoWritesNothing");
     ASSERT_FALSE(result.watchdog_fired) << result.output;
     ASSERT_TRUE(WIFEXITED(result.status)) << result.status;
     EXPECT_EQ(WEXITSTATUS(result.status), 3) << result.output;

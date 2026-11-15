@@ -145,6 +145,11 @@ if(NOT CMAKE_CROSSCOMPILING)
         $<TARGET_FILE:aa_wired_e2e_test> --gtest_filter=WiredReceiver.*:ReceiverAudioDispatch.*)
     add_test(NAME wired_enrolment COMMAND aa_wired_e2e_test --gtest_filter=WiredEnrolment.*:WiredEnrolFlow.*)
     set_tests_properties(wired_enrolment PROPERTIES TIMEOUT 60)
+    # #133 receiver enrolment end to end over a real session bus (own budget:
+    # wired_receiver already runs close to its 120 s timeout).
+    add_test(NAME wired_receiver_enrolment COMMAND dbus-run-session --
+        $<TARGET_FILE:aa_wired_e2e_test> --gtest_filter=WiredReceiverEnrolment.*)
+    set_tests_properties(wired_receiver_enrolment PROPERTIES TIMEOUT 90)
     add_test(NAME wired_deadline COMMAND aa_wired_e2e_test --gtest_filter=WiredDeadline.*)
     set_tests_properties(wired_deadline PROPERTIES TIMEOUT 30)
     set_tests_properties(wired_receiver PROPERTIES TIMEOUT 120)
