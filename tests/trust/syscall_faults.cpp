@@ -79,6 +79,11 @@ extern "C" int wrap_fsync(int fd) {
                 errno = EINTR;
                 return -1;
             }
+            if (fault == faults::Fault::dir_fsync_eio_once && is_dir &&
+                faults::consume_eintr_once()) {
+                errno = EIO;
+                return -1;
+            }
         }
     }
     return real_fsync(fd);

@@ -169,6 +169,9 @@ public:
         presented.push_back(request);
         return candidate;
     }
+    bool presents_candidates() const override { return presents; }
+
+    bool presents{true};
 
     std::vector<core::PhoneId> forgotten{};
     std::vector<core::PairingRequestId> presented{};

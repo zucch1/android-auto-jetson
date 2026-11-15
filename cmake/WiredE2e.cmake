@@ -143,7 +143,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_recovery COMMAND aa_wired_e2e_test --gtest_filter=WiredRecovery.*)
     add_test(NAME wired_receiver COMMAND dbus-run-session --
         $<TARGET_FILE:aa_wired_e2e_test> --gtest_filter=WiredReceiver.*:ReceiverAudioDispatch.*)
-    add_test(NAME wired_enrolment COMMAND aa_wired_e2e_test --gtest_filter=WiredEnrolment.*:WiredEnrolFlow.*)
+    add_test(NAME wired_enrolment COMMAND aa_wired_e2e_test --gtest_filter=WiredEnrolment.*:WiredEnrolFlow.*:WiredEnrolAnswerReader.*)
     set_tests_properties(wired_enrolment PROPERTIES TIMEOUT 60)
     # #133 receiver enrolment end to end over a real session bus (own budget:
     # wired_receiver already runs close to its 120 s timeout).
@@ -208,6 +208,12 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_target_properties(aa-wired-enrol PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_link_libraries(aa-wired-enrol PRIVATE aa_ipc_dbus aa_ipc_control aa_core)
+    # The receiver enrolment cases drive the real executable over a pipe (#141 B3).
+    if(TARGET aa_wired_e2e_test)
+        add_dependencies(aa_wired_e2e_test aa-wired-enrol)
+        target_compile_definitions(aa_wired_e2e_test PRIVATE
+            AA_WIRED_ENROL_EXE="$<TARGET_FILE:aa-wired-enrol>")
+    endif()
     if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
         target_compile_options(aa-wired-enrol PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)

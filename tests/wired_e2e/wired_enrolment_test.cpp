@@ -11,9 +11,11 @@
 
 #include "../dbus/fakes.hpp"
 #include "../trust/fakes.hpp"
+#include "../trust/syscall_faults.hpp"
 
 #include <algorithm>
 #include <filesystem>
+#include <system_error>
 
 #include <gtest/gtest.h>
 
@@ -99,7 +101,10 @@ TEST(WiredEnrolment, RefusedThenRequestThenExplicitYesIsAdmittedDurably) {
         EXPECT_EQ(value.find("1-2.3"), std::string::npos) << name;
     }
 
+    ASSERT_FALSE(f.enrolment.completion().has_value());
     ASSERT_TRUE(f.service.confirm_phone_pairing(f.consumer, request.value()).has_value());
+    ASSERT_TRUE(f.enrolment.completion().has_value());
+    EXPECT_TRUE(f.enrolment.completion()->durable);
     EXPECT_TRUE(f.admitted(kPhone));
     EXPECT_TRUE(f.admitted(on_port(kPhone, "1-2.1")));  // #133: any port
     EXPECT_FALSE(f.admitted(kOther));
@@ -113,6 +118,57 @@ TEST(WiredEnrolment, RefusedThenRequestThenExplicitYesIsAdmittedDurably) {
     EXPECT_FALSE(f.service.confirm_phone_pairing(f.consumer, request.value()).has_value());
     ASSERT_TRUE(f.service.cancel_phone_pairing(f.consumer, request.value()).has_value());
     EXPECT_EQ(f.store.phones().size(), 1U);
+}
+
+// #141 B2: a rename that landed with a failed directory sync is never a
+// durable-success reply. The committed record is kept; the bounded retry
+// fails too, so ConfirmPhonePairing reports trust_store_not_durable, the
+// request closes without PairingOpened, and completion() says not durable.
+TEST(WiredEnrolment, DirectorySyncFailureIsReportedNotDurable) {
+    Fixture f;
+    // An existing private store directory: the only directory sync is the
+    // one after the rename (no fsync of a newly created ancestor).
+    std::filesystem::create_directories(f.dir.file().parent_path());
+    std::filesystem::permissions(f.dir.file().parent_path(), std::filesystem::perms::owner_all);
+    ASSERT_TRUE(f.refuse(kPhone));
+    const auto request = f.service.request_add_phone(f.consumer);
+    ASSERT_TRUE(request.has_value());
+    ASSERT_TRUE(f.service.pairing_candidate(f.consumer, request.value()).has_value());
+    {
+        const ttest::faults::ScopedFault fault{ttest::faults::Fault::dir_fsync};
+        const auto confirmed = f.service.confirm_phone_pairing(f.consumer, request.value());
+        ASSERT_FALSE(confirmed.has_value());
+        EXPECT_EQ(confirmed.error().code(), ErrorCode::trust_store_not_durable);
+    }
+    EXPECT_EQ(f.events.count_opened(), 0U);
+    EXPECT_EQ(f.closed(request.value()), 1U);
+    ASSERT_TRUE(f.enrolment.completion().has_value());
+    EXPECT_FALSE(f.enrolment.completion()->durable);
+    // Committed, not rolled back: memory matches the renamed file.
+    ASSERT_EQ(f.store.phones().size(), 1U);
+    EXPECT_EQ(f.enrolment.completion()->phone, f.store.phones()[0].phone_id);
+    // The spent id approves nothing more and cannot be turned into a success.
+    EXPECT_FALSE(f.service.confirm_phone_pairing(f.consumer, request.value()).has_value());
+}
+
+TEST(WiredEnrolment, TransientDirectorySyncFailureIsRetriedToDurableSuccess) {
+    Fixture f;
+    std::filesystem::create_directories(f.dir.file().parent_path());
+    std::filesystem::permissions(f.dir.file().parent_path(), std::filesystem::perms::owner_all);
+    ASSERT_TRUE(f.refuse(kPhone));
+    const auto request = f.service.request_add_phone(f.consumer);
+    ASSERT_TRUE(request.has_value());
+    ASSERT_TRUE(f.service.pairing_candidate(f.consumer, request.value()).has_value());
+    {
+        const ttest::faults::ScopedFault fault{ttest::faults::Fault::dir_fsync_eio_once};
+        ASSERT_TRUE(f.service.confirm_phone_pairing(f.consumer, request.value()).has_value());
+    }
+    EXPECT_EQ(f.events.count_opened(), 1U);
+    ASSERT_TRUE(f.enrolment.completion().has_value());
+    EXPECT_TRUE(f.enrolment.completion()->durable);
+    trust::ApprovedPhoneStore fresh{f.dir.file()};
+    ASSERT_TRUE(fresh.load().has_value());
+    EXPECT_TRUE(aa::transport::admit_via(fresh)(kPhone));
 }
 
 TEST(WiredEnrolment, ExplicitNoWritesNothing) {

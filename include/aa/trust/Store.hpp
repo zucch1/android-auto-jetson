@@ -106,6 +106,13 @@ public:
     // ForgetPhone path: revoke by phone id, persist the removal.
     [[nodiscard]] core::Result<void> forget_phone(core::PhoneId phone);
 
+    // Retry the crash-durability half of a mutation that returned
+    // trust_store_not_durable: sync the store's containing directory again.
+    // Success means the committed replacement is now durable; failure is
+    // trust_store_not_durable (trust_store_io when the store is unusable).
+    // Changes nothing in memory or on disk.
+    [[nodiscard]] core::Result<void> sync_directory() const;
+
     [[nodiscard]] const std::vector<ApprovedPhone>& phones() const noexcept { return phones_; }
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
     [[nodiscard]] bool usable() const noexcept { return usable_; }

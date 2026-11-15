@@ -19,7 +19,7 @@ from typing import Final
 
 INTERFACE: Final[str] = "org.custom.AndroidAutoReceiver1"
 OBJECT_PATH: Final[str] = "/org/custom/AndroidAutoReceiver"
-SEMVER: Final[str] = "1.0.0"
+SEMVER: Final[str] = "1.1.0"
 SEMVER_ANNOTATION: Final[str] = "org.custom.AndroidAutoReceiver1.ContractSemVer"
 INTERFACE_PREFIX: Final[str] = "org.custom.AndroidAutoReceiver"
 

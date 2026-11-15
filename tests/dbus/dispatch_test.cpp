@@ -374,6 +374,42 @@ TEST(CallBoundary, PairingCandidateRoutesThroughTheBoundaryForTheOwnerOnly) {
     EXPECT_TRUE(unknown->is_error);
 }
 
+// Contract 1.1.0: a directory without wired candidates (wireless) answers
+// GetPairingCandidate with the typed NotWiredCandidate error and leaves the
+// request pending (#141 B1); a not-durable wired confirm is Error.NotDurable.
+TEST(CallBoundary, PairingCandidateAndConfirmUseTheTypedEnrolmentErrors) {
+    BoundaryFixture fixture;
+    const BusName name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(BusName{":1.20"}, kSessionUid);
+    fixture.credentials.set_owner(name, BusName{":1.20"});
+    ASSERT_FALSE(fixture.dispatcher
+                     .handle(call_from(":1.20", "RegisterConsumer", "s", marshal_string(name.value)))
+                     ->is_error);
+    fixture.phones.presents = false;
+    const auto request = fixture.dispatcher.handle(call_from(":1.20", "RequestAddPhone"));
+    ASSERT_TRUE(request.has_value());
+    ASSERT_FALSE(request->is_error);
+    const std::uint64_t request_id = std::get<std::uint64_t>(request->body);
+
+    const auto refused = fixture.dispatcher.handle(
+        call_from(":1.20", "GetPairingCandidate", "t", marshal_u64(request_id)));
+    ASSERT_TRUE(refused.has_value());
+    ASSERT_TRUE(refused->is_error);
+    EXPECT_EQ(refused->error_name, "org.custom.AndroidAutoReceiver1.Error.NotWiredCandidate");
+    EXPECT_TRUE(fixture.phones.presented.empty());
+    EXPECT_TRUE(fixture.phones.cancelled.empty());
+
+    // Still pending and usable: the confirm reaches the directory, whose
+    // not-durable result has its own error name.
+    fixture.phones.confirm_result = aa::Error{aa::ErrorCode::trust_store_not_durable};
+    const auto confirmed = fixture.dispatcher.handle(
+        call_from(":1.20", "ConfirmPhonePairing", "t", marshal_u64(request_id)));
+    ASSERT_TRUE(confirmed.has_value());
+    ASSERT_TRUE(confirmed->is_error);
+    EXPECT_EQ(confirmed->error_name, "org.custom.AndroidAutoReceiver1.Error.NotDurable");
+    EXPECT_EQ(fixture.phones.confirmed.size(), 1U);
+}
+
 TEST(CallBoundary, IntrospectionServesCheckedSchemaBytes) {
     // Given: a boundary over a live service.
     BoundaryFixture fixture;
@@ -407,7 +443,7 @@ TEST(CallBoundary, PropertiesGetReturnsStringVariant) {
     ASSERT_TRUE(reply.has_value());
     ASSERT_FALSE(reply->is_error);
     ASSERT_TRUE(std::holds_alternative<aa::ipc::StringPropertyValue>(reply->body));
-    EXPECT_EQ(std::get<aa::ipc::StringPropertyValue>(reply->body).value, "1.0.0");
+    EXPECT_EQ(std::get<aa::ipc::StringPropertyValue>(reply->body).value, "1.1.0");
     EXPECT_EQ(fixture.service.state().consumer, aa::core::ConsumerId{});
 }
 
@@ -434,7 +470,7 @@ TEST(CallBoundary, PropertiesGetAllReturnsContractMetadata) {
         ASSERT_TRUE(std::holds_alternative<aa::ipc::PropertyDictionary>((*reply)->body));
         const auto& dictionary = std::get<aa::ipc::PropertyDictionary>((*reply)->body);
         ASSERT_EQ(dictionary.entries.size(), 1U);
-        EXPECT_EQ(dictionary.entries.at("ContractSemVer"), "1.0.0");
+        EXPECT_EQ(dictionary.entries.at("ContractSemVer"), "1.1.0");
     }
 }
 
@@ -456,7 +492,7 @@ TEST(CallBoundary, PropertiesSetRejectsReadOnlyProperty) {
     ASSERT_TRUE(reply.has_value());
     EXPECT_TRUE(reply->is_error);
     EXPECT_EQ(reply->error_name, "org.freedesktop.DBus.Error.PropertyReadOnly");
-    EXPECT_EQ(aa::ipc::contract_semver(), "1.0.0");
+    EXPECT_EQ(aa::ipc::contract_semver(), "1.1.0");
 }
 
 TEST(CallBoundary, PropertiesRejectInvalidArguments) {

@@ -85,7 +85,8 @@ A refused wired phone can be approved through the D-Bus control contract:
 registered consumer then calls `RequestAddPhone`, `GetPairingCandidate`, and
 either `ConfirmPhonePairing` (yes) or `CancelPhonePairing` (no). The request is
 one-time, expires after 60 s, and is bound to the refused attempt's captured
-identity. Only a yes writes the store. `aa-wired-enrol` is the terminal y/N
+identity. Only a yes writes the store, and only a durable write (directory
+sync confirmed) counts as approved. `aa-wired-enrol` is the terminal y/N
 reference consumer. See [wired-enrolment.md](docs/wired-enrolment.md).
 
 ## Wireless handoff

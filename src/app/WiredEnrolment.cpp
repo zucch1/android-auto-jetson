@@ -90,11 +90,23 @@ core::Result<core::PhoneId> WiredEnrolment::pairing_confirmed(core::PairingReque
         return Error{ErrorCode::trust_rejected};
     }
     untrack(request);
-    return policy_.pairing_confirmed(request);
-}
-
-std::optional<core::PhoneId> WiredEnrolment::committed_pairing() const {
-    return policy_.committed_pairing();
+    auto approved = policy_.pairing_confirmed(request);
+    if (approved) {
+        completion_ = Completion{approved.value(), true};
+        return approved;
+    }
+    const auto committed = policy_.committed_pairing();
+    if (approved.error().code() != ErrorCode::trust_store_not_durable || !committed) return approved;
+    // The rename landed; only the directory sync failed. Keep the record and
+    // retry the sync (bounded) before calling this a completed enrolment.
+    for (int attempt = 0; attempt < kDirectorySyncAttempts; ++attempt) {
+        if (store_.sync_directory()) {
+            completion_ = Completion{*committed, true};
+            return *committed;
+        }
+    }
+    completion_ = Completion{*committed, false};
+    return approved;
 }
 
 void WiredEnrolment::pairing_cancelled(core::PairingRequestId request) {

@@ -467,7 +467,7 @@ TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
     ASSERT_EQ(reply.value().type, bus::MessageType::method_return);
     ASSERT_EQ(reply.value().signature, "v");
     const std::vector<std::uint8_t> expected{0x01, 0x73, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
-                                             0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00};
+                                             0x31, 0x2e, 0x31, 0x2e, 0x30, 0x00};
     EXPECT_EQ(reply.value().body, expected);
     bus::Cursor cursor(reply.value().body);
     const auto contained = cursor.read_signature();
@@ -475,7 +475,7 @@ TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
     ASSERT_TRUE(contained.has_value());
     EXPECT_EQ(contained.value(), "s");
     ASSERT_TRUE(value.has_value());
-    EXPECT_EQ(value.value(), "1.0.0");
+    EXPECT_EQ(value.value(), "1.1.0");
     EXPECT_TRUE(cursor.done());
 }
 
@@ -499,7 +499,7 @@ TEST(BusBoundary, PropertiesGetAllUsesVariantDictionaryEncoding) {
     const std::vector<std::uint8_t> expected{
         0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x43,
         0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x53, 0x65, 0x6d, 0x56, 0x65, 0x72,
-        0x00, 0x01, 0x73, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x31, 0x2e, 0x30,
+        0x00, 0x01, 0x73, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x31, 0x2e, 0x31,
         0x2e, 0x30, 0x00};
     EXPECT_EQ(reply.value().body, expected);
     bus::Cursor cursor(reply.value().body);
@@ -517,7 +517,7 @@ TEST(BusBoundary, PropertiesGetAllUsesVariantDictionaryEncoding) {
     EXPECT_EQ(contained.value(), "s");
     const auto value = cursor.read_string();
     ASSERT_TRUE(value.has_value());
-    EXPECT_EQ(value.value(), "1.0.0");
+    EXPECT_EQ(value.value(), "1.1.0");
     EXPECT_TRUE(cursor.done());
 }
 
@@ -540,7 +540,7 @@ TEST(BusBoundary, PropertiesSetReturnsPropertyReadOnly) {
     ASSERT_TRUE(reply.has_value());
     EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
     EXPECT_EQ(reply.value().error_name, "org.freedesktop.DBus.Error.PropertyReadOnly");
-    EXPECT_EQ(bus_state.service->capabilities().at("contract.semver"), "1.0.0");
+    EXPECT_EQ(bus_state.service->capabilities().at("contract.semver"), "1.1.0");
 }
 
 TEST(BusBoundary, OversizeCallIsDrainedAndTheNextCallSurvives) {

@@ -148,6 +148,10 @@ core::Result<std::map<std::string, std::string>> ControlService::pairing_candida
     if (!admitted) return admitted.error();
     const auto held = gate_.pending({active.value().consumer, active.value().name}, request);
     if (!held) return held.error();
+    // A wireless request has no wired candidate. Refuse without touching it:
+    // cancelling here would spend the gate id and drop the policy snapshot
+    // without retiring the helper binding prepare() made (#141 B1).
+    if (!phones_.presents_candidates()) return Error{ErrorCode::trust_not_wired_candidate};
     // The policy's liveness predicate: an expired request presents nothing (ConfirmPhonePairing
     // then reports the timeout and closes it through the usual path).
     const auto live = phones_.validate_pairing(request);

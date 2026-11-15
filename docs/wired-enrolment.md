@@ -24,7 +24,11 @@ candidate only when admission has refused it.
    and `strength` (`serial-backed`). The label is the receiver's per-process
    pseudonym, and the receiver's refusal log line shows the same value as
    `phone_id`. It never carries a raw serial, AOA string or port. Only the
-   consumer holding the request can call it, and nothing is broadcast.
+   consumer holding the request can call it, and nothing is broadcast. A
+   wireless request has no wired candidate: the call fails with
+   `Error.NotWiredCandidate` (`trust_not_wired_candidate`) and leaves that
+   request pending and untouched. The method and its errors arrived in
+   contract 1.1.0 (see `docs/dbus/README.md`).
 4. Show the label and ask a human yes or no. A yes is `ConfirmPhonePairing(t)`.
    A no is `CancelPhonePairing(t)`, which writes nothing.
 5. A confirm before step 3 is refused (`trust_rejected`) and the request
@@ -34,6 +38,12 @@ candidate only when admission has refused it.
 6. A confirmed yes writes the bound identity to the store durably
    (`ApprovedPhoneStore::approve`, atomic replace) and emits `PairingOpened`.
    Close the window afterwards with `CancelPhonePairing(t)`; the approval stays.
+7. Durable means the directory sync after the rename succeeded. If the rename
+   lands but that sync fails, the receiver keeps the written record and
+   retries the sync up to 3 times. If it still fails, `ConfirmPhonePairing`
+   fails with `Error.NotDurable` (`trust_store_not_durable`), the request
+   closes, and the consumer must not report an approval. The record may still
+   be on disk; whether it survives a crash is unknown.
 
 Consumer loss (name owner change, `UnregisterConsumer`) closes every
 outstanding request without writing anything.
@@ -47,7 +57,11 @@ outstanding request without writing anything.
   `{"event":"wired_enrolment_open","phone_id":"<label>","window_ms":120000}`.
   It then serves the contract on the store-owner thread (`app::WiredEnrolment`
   is the `PhoneDirectory`).
-- On an approval it logs `wired_enrolment_approved` and exits 0. The refused
+- It ends on the enrolment's own completion result, not on whether the
+  store now admits the phone. A durable approval logs
+  `wired_enrolment_approved` and exits 0. An approval that is written but not
+  durable (step 7) logs `wired_enrolment_not_durable` and exits 1. After a
+  durable approval the refused
   link is not reused: the phone is still in accessory mode, so its captured
   descriptor ids no longer match. Replug the phone (or reset its USB functions)
   and start the receiver again; the approved phone is then admitted on any port
@@ -63,11 +77,16 @@ and the bus refuses `RequestAddPhone`.
 
 ## Reference consumer: `aa-wired-enrol`
 
-`aa-wired-enrol [--consumer-name NAME]` is for tests and owner bring-up. It
-registers, requests, shows the candidate and asks `Approve this phone? [y/N]`
-on the terminal. Only `y` or `yes` approves. An empty line, any other text,
-EOF, or no answer within 50 s declines. Exit codes: 0 approved, 1 declined,
-2 usage, 3 failed. It must run as the receiver's user on the same session bus.
+`aa-wired-enrol [--consumer-name NAME] [--answer-budget-ms N]` is for tests
+and owner bring-up. It registers, requests, shows the candidate and asks
+`Approve this phone? [y/N]` on the terminal. Only `y` or `yes` followed by a
+newline approves. An empty line, any other text, EOF, a partial line with no
+newline, more than 64 bytes, or no complete line within the budget (default
+50 s, `--answer-budget-ms` 1..50000) declines and cancels the request. The
+answer is read incrementally against one deadline, so a writer that sends a
+partial line and keeps the input open cannot hold the tool past it. Exit
+codes: 0 approved, 1 declined, 2 usage, 3 failed (including a not-durable
+approval). It must run as the receiver's user on the same session bus.
 
 Owner bring-up:
 

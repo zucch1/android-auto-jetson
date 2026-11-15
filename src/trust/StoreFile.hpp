@@ -68,6 +68,12 @@ inline constexpr std::size_t kMaxStoreBytes = std::size_t{256} * 1024;
 [[nodiscard]] core::Result<void> write_file_private(const std::filesystem::path& path,
                                                     std::string_view content);
 
+// Re-sync the store's containing directory (verified walk, no creation): the
+// retry for a write that returned trust_store_not_durable. Success confirms
+// the earlier rename's directory entry is durable; any failure (including a
+// directory that no longer verifies) is trust_store_not_durable.
+[[nodiscard]] core::Result<void> sync_parent_directory(const std::filesystem::path& path);
+
 // Save original bytes once at path + ".legacy-backup". Uses the same verified
 // path walk and private temporary file, published with exclusive linkat.
 // An existing backup must be a safe private regular file and is never replaced.

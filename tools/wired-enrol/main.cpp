@@ -5,42 +5,51 @@
 // y/N on the terminal. Only an explicit "y" approves. The production consumer
 // is the infotainment UI, which drives the same contract calls.
 //
-// Usage: aa-wired-enrol [--consumer-name NAME]
+// Usage: aa-wired-enrol [--consumer-name NAME] [--answer-budget-ms N]
 //   needs aa-wired-receiver --wired-enrolment running on the same session bus
-//   and as the same Unix user. exit: 0 approved, 1 declined, 2 usage,
-//   3 failed (no receiver, no refused phone, refused approval).
+//   and as the same Unix user. --answer-budget-ms (1..50000, default 50000)
+//   bounds the y/N answer. exit: 0 approved, 1 declined (or no complete answer
+//   line in time), 2 usage, 3 failed (no receiver, no refused phone, refused
+//   or not-durable approval).
+#include "AnswerReader.hpp"
 #include "EnrolFlow.hpp"
 
 #include <aa/ipc/ControlBusClient.hpp>
 
-#include <poll.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
 
 namespace {
 
-std::optional<std::string> read_line(aa::core::Milliseconds budget) {
-    ::pollfd input{STDIN_FILENO, POLLIN, 0};
-    const int ready = ::poll(&input, 1, static_cast<int>(budget.count));
-    if (ready <= 0) return std::nullopt;
-    std::string line;
-    if (!std::getline(std::cin, line)) return std::nullopt;
-    return line;
-}
+constexpr const char* kUsage = "usage: aa-wired-enrol [--consumer-name NAME] [--answer-budget-ms N]\n";
 
 } // namespace
 
 int main(int argc, char** argv) {
     aa::ipc::BusName consumer_name{"org.custom.WiredEnrol1"};
+    aa::core::Milliseconds budget = aa::tools::enrol::kAnswerBudget;
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--consumer-name") == 0 && index + 1 < argc) {
             consumer_name = aa::ipc::BusName{argv[++index]};
+        } else if (std::strcmp(argv[index], "--answer-budget-ms") == 0 && index + 1 < argc) {
+            char* end = nullptr;
+            errno = 0;
+            const long long value = std::strtoll(argv[++index], &end, 10);
+            if (errno != 0 || end == argv[index] || *end != '\0' || value < 1 ||
+                value > aa::tools::enrol::kAnswerBudget.count) {
+                std::fputs(kUsage, stderr);
+                return 2;
+            }
+            budget = aa::core::Milliseconds{static_cast<std::int64_t>(value)};
         } else {
-            std::fputs("usage: aa-wired-enrol [--consumer-name NAME]\n", stderr);
+            std::fputs(kUsage, stderr);
             return 2;
         }
     }
@@ -56,5 +65,9 @@ int main(int argc, char** argv) {
                    stderr);
         return 3;
     }
-    return static_cast<int>(aa::tools::enrol::run(client.value(), consumer_name, std::cout, read_line));
+    const auto read_line = [](aa::core::Milliseconds left) {
+        return aa::tools::enrol::read_answer_line(STDIN_FILENO, left);
+    };
+    return static_cast<int>(
+        aa::tools::enrol::run(client.value(), consumer_name, std::cout, read_line, budget));
 }

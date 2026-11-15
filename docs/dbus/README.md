@@ -61,9 +61,28 @@ service. (Note: The persistent D-Bus service export owning bus name `org.custom.
 `GetPairingCandidate(t) -> a{ss}` (#133) presents the redacted phone a pending
 request is bound to, so a human can answer before `ConfirmPhonePairing` (yes)
 or `CancelPhonePairing` (no). The wired directory refuses a confirm whose
-candidate was never retrieved. See `docs/wired-enrolment.md`. Adding the method
-keeps `ContractSemVer` at 1.0.0, following the precedent set when
-`GetPairingComparison` was added.
+candidate was never retrieved. See `docs/wired-enrolment.md`.
+
+Typed errors added with the method:
+
+- `org.custom.AndroidAutoReceiver1.Error.NotWiredCandidate` from
+  `GetPairingCandidate` when the pending request has no wired candidate (a
+  wireless request). The request is not touched: it stays pending and is
+  confirmed or cancelled as usual.
+- `org.custom.AndroidAutoReceiver1.Error.NotDurable` from
+  `ConfirmPhonePairing` when a wired approval was written but its directory
+  sync still failed after a bounded retry. The request is spent; the consumer
+  must not report the phone as approved.
+
+## Contract versioning
+
+`ContractSemVer` is `1.1.0`. The major version is carried in the interface
+name (`org.custom.AndroidAutoReceiver1`); the minor version grows when methods
+or typed errors are added compatibly. 1.1.0 adds `GetPairingCandidate` and the
+two errors above. Consumers feature-detect by minor version: read
+`ContractSemVer` (or `contract.semver` in `GetCapabilities`) and call
+`GetPairingCandidate` only when the minor version is at least 1. An older
+receiver (1.0.x) answers the call with `org.freedesktop.DBus.Error.UnknownMethod`.
 
 ## Validation
 

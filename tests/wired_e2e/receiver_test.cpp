@@ -1862,13 +1862,77 @@ struct EnrolmentResult {
     std::string consumer_output;
     bool approved = false;
     bool other_approved = false;
+    // Executable consumer only (aa-wired-enrol over a stdin pipe).
+    int consumer_status{-1};
+    std::chrono::milliseconds consumer_elapsed{};
+    bool consumer_cancelled = false;
 };
 
 const aa::trust::WiredIdentity kEnrolPhone{
     "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
     "SECOND-PRIVATE-AOA", "1-2.2"};
 
-EnrolmentResult run_enrolment_child(const char* answer, const char* filter) {
+struct EnrolmentCase {
+    const char* filter{};
+    const char* answer{"n"};        // in-process EnrolFlow answer
+    const char* duration_ms{"3000"};
+    bool dir_fsync_fault = false;   // receiver: every directory fsync fails (#141 B2)
+    bool executable_partial = false;  // real aa-wired-enrol fed "y" with no newline (#141 B3)
+};
+
+// Runs the real aa-wired-enrol with stdin on a pipe that receives a partial
+// line and stays open. A short --answer-budget-ms must decline and cancel.
+void run_partial_line_consumer(const std::filesystem::path& root, EnrolmentResult& result) {
+    auto observer = aa::ipc::ControlBusClient::connect();
+    EXPECT_TRUE(observer.has_value());
+    int input[2]{-1, -1};
+    EXPECT_EQ(::pipe2(input, O_CLOEXEC), 0);
+    const int output_fd = ::open((root / "consumer").c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    EXPECT_GE(output_fd, 0);
+    std::string executable = AA_WIRED_ENROL_EXE;
+    std::string name_flag = "--consumer-name", name = "org.custom.WiredEnrolTest1";
+    std::string budget_flag = "--answer-budget-ms", budget = "300";
+    char* argv[]{executable.data(), name_flag.data(), name.data(), budget_flag.data(), budget.data(), nullptr};
+    const auto started = std::chrono::steady_clock::now();
+    std::fflush(nullptr);
+    const pid_t consumer = ::fork();
+    EXPECT_GE(consumer, 0);
+    if (consumer == 0) {
+        if (::dup2(input[0], STDIN_FILENO) < 0 || ::dup2(output_fd, STDOUT_FILENO) < 0) ::_exit(90);
+        ::execve(executable.c_str(), argv, ::environ);
+        ::_exit(91);
+    }
+    ::close(input[0]);
+    if (output_fd >= 0) ::close(output_fd);
+    EXPECT_EQ(::write(input[1], "y", 1), 1);  // partial line; the writer stays open
+    const auto watchdog = started + std::chrono::seconds{10};
+    for (;;) {
+        const auto waited = ::waitpid(consumer, &result.consumer_status, WNOHANG);
+        if (waited == consumer) break;
+        if (waited < 0 || std::chrono::steady_clock::now() >= watchdog) {
+            result.watchdog_fired = true;
+            (void)::kill(consumer, SIGKILL);
+            (void)::waitpid(consumer, &result.consumer_status, 0);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    result.consumer_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    ::close(input[1]);
+    std::ifstream capture(root / "consumer");
+    result.consumer_output = std::string{std::istreambuf_iterator<char>{capture}, {}};
+    if (!observer.has_value()) return;
+    // CancelPhonePairing is the only path that emits the pairing_closed diagnostic.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+    while (!result.consumer_cancelled && std::chrono::steady_clock::now() < until) {
+        const auto signal = observer.value().wait_signal(aa::core::Milliseconds{200});
+        if (signal && signal.value().member == "DiagnosticEvent" && signal.value().event == "pairing_closed")
+            result.consumer_cancelled = true;
+    }
+}
+
+EnrolmentResult run_enrolment_child(const EnrolmentCase& run) {
     if (const char* child_root = std::getenv("AA_TEST_ENROL_ROOT")) {
         const std::filesystem::path root{child_root};
         runtime_real_admission = true;
@@ -1877,6 +1941,9 @@ EnrolmentResult run_enrolment_child(const char* answer, const char* filter) {
         runtime_connects.store(0);
         shutdown_observation = nullptr;
         g_running.store(true);
+        if (std::getenv("AA_TEST_ENROL_DIR_FSYNC_FAULT") != nullptr) {
+            aa::trust::test::faults::arm(aa::trust::test::faults::Fault::dir_fsync);
+        }
         std::vector<std::string> args{"receiver", "--port", "1-2.2", "--wired-enrolment", "--store",
             (root / "approved.json").string(), "--video-socket", (root / "video").string(),
             "--input-socket", (root / "input").string(), "--duration-ms",
@@ -1900,16 +1967,17 @@ EnrolmentResult run_enrolment_child(const char* answer, const char* filter) {
             "04e8", "6860", "FIRST-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
             "FIRST-PRIVATE-AOA", "1-2.1"}}).has_value());
     }
-    const bool yes = std::string{answer} == "y";
     std::string root_env = "AA_TEST_ENROL_ROOT=" + root.string();
-    std::string duration_env = std::string{"AA_TEST_ENROL_DURATION="} + (yes ? "20000" : "3000");
+    std::string duration_env = std::string{"AA_TEST_ENROL_DURATION="} + run.duration_ms;
+    std::string fault_env = "AA_TEST_ENROL_DIR_FSYNC_FAULT=1";
     std::vector<char*> environment;
     for (char** entry = ::environ; *entry != nullptr; ++entry) environment.push_back(*entry);
     environment.push_back(root_env.data());
     environment.push_back(duration_env.data());
+    if (run.dir_fsync_fault) environment.push_back(fault_env.data());
     environment.push_back(nullptr);
     std::string executable = "/proc/self/exe";
-    std::string gtest_filter = std::string{"--gtest_filter="} + filter;
+    std::string gtest_filter = std::string{"--gtest_filter="} + run.filter;
     char* child_argv[]{executable.data(), gtest_filter.data(), nullptr};
     const int capture_fd = ::open((root / "stdout").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     EXPECT_GE(capture_fd, 0);
@@ -1932,14 +2000,19 @@ EnrolmentResult run_enrolment_child(const char* answer, const char* filter) {
            std::chrono::steady_clock::now() < watchdog && ::waitpid(child, nullptr, WNOHANG) == 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds{20});
     }
-    auto client = aa::ipc::ControlBusClient::connect();
-    EXPECT_TRUE(client.has_value());
-    if (client.has_value()) {
-        std::ostringstream consumer;
-        result.outcome = aa::tools::enrol::run(
-            client.value(), aa::ipc::BusName{"org.custom.WiredEnrolTest1"}, consumer,
-            [answer](aa::core::Milliseconds) { return std::optional<std::string>{answer}; });
-        result.consumer_output = consumer.str();
+    if (run.executable_partial) {
+        run_partial_line_consumer(root, result);
+    } else {
+        auto client = aa::ipc::ControlBusClient::connect();
+        EXPECT_TRUE(client.has_value());
+        if (client.has_value()) {
+            std::ostringstream consumer;
+            const std::string answer = run.answer;
+            result.outcome = aa::tools::enrol::run(
+                client.value(), aa::ipc::BusName{"org.custom.WiredEnrolTest1"}, consumer,
+                [answer](aa::core::Milliseconds) { return std::optional<std::string>{answer}; });
+            result.consumer_output = consumer.str();
+        }
     }
     for (;;) {
         const auto waited = ::waitpid(child, &result.status, WNOHANG);
@@ -1965,7 +2038,9 @@ EnrolmentResult run_enrolment_child(const char* answer, const char* filter) {
 }
 
 TEST(WiredReceiverEnrolment, ExplicitYesApprovesTheRefusedPhone) {
-    const auto result = run_enrolment_child("y", "WiredReceiverEnrolment.ExplicitYesApprovesTheRefusedPhone");
+    const auto result = run_enrolment_child(
+        {.filter = "WiredReceiverEnrolment.ExplicitYesApprovesTheRefusedPhone", .answer = "y",
+         .duration_ms = "20000"});
     ASSERT_FALSE(result.watchdog_fired) << result.output;
     ASSERT_TRUE(WIFEXITED(result.status)) << result.status;
     EXPECT_EQ(WEXITSTATUS(result.status), 0) << result.output;
@@ -1984,7 +2059,8 @@ TEST(WiredReceiverEnrolment, ExplicitYesApprovesTheRefusedPhone) {
 }
 
 TEST(WiredReceiverEnrolment, ExplicitNoWritesNothing) {
-    const auto result = run_enrolment_child("n", "WiredReceiverEnrolment.ExplicitNoWritesNothing");
+    const auto result = run_enrolment_child(
+        {.filter = "WiredReceiverEnrolment.ExplicitNoWritesNothing", .answer = "n"});
     ASSERT_FALSE(result.watchdog_fired) << result.output;
     ASSERT_TRUE(WIFEXITED(result.status)) << result.status;
     EXPECT_EQ(WEXITSTATUS(result.status), 3) << result.output;
@@ -1992,6 +2068,48 @@ TEST(WiredReceiverEnrolment, ExplicitNoWritesNothing) {
     EXPECT_FALSE(result.approved);
     EXPECT_NE(result.output.find("\"event\":\"wired_enrolment_closed\""), std::string::npos)
         << result.output;
+}
+
+// #141 B2 through the receiver loop: the directory sync after the store rename
+// fails (and keeps failing through the bounded retry). The yes is not a
+// durable success anywhere: the consumer gets NotDurable, the receiver logs
+// wired_enrolment_not_durable (never wired_enrolment_approved) and exits 1,
+// even though the renamed file now admits the phone.
+TEST(WiredReceiverEnrolment, DirectorySyncFailureIsNotADurableApproval) {
+    const auto result = run_enrolment_child(
+        {.filter = "WiredReceiverEnrolment.DirectorySyncFailureIsNotADurableApproval", .answer = "y",
+         .duration_ms = "20000", .dir_fsync_fault = true});
+    ASSERT_FALSE(result.watchdog_fired) << result.output;
+    ASSERT_TRUE(WIFEXITED(result.status)) << result.status;
+    EXPECT_EQ(WEXITSTATUS(result.status), 1) << result.output;
+    EXPECT_EQ(result.outcome, aa::tools::enrol::Outcome::failed) << result.consumer_output;
+    EXPECT_NE(result.consumer_output.find("trust_store_not_durable"), std::string::npos)
+        << result.consumer_output;
+    EXPECT_EQ(result.consumer_output.find("approved:"), std::string::npos) << result.consumer_output;
+    EXPECT_NE(result.output.find("\"event\":\"wired_enrolment_not_durable\""), std::string::npos)
+        << result.output;
+    EXPECT_EQ(result.output.find("\"event\":\"wired_enrolment_approved\""), std::string::npos)
+        << result.output;
+    EXPECT_EQ(result.output.find("\"event\":\"ready\""), std::string::npos) << result.output;
+    EXPECT_TRUE(result.approved) << "the committed record is kept, not rolled back";
+}
+
+// #141 B3 at executable level: the real aa-wired-enrol, stdin a pipe holding
+// "y" with no newline and never closed, a 300 ms answer budget. It must
+// decline (exit 1) promptly and cancel the request; nothing is approved.
+TEST(WiredReceiverEnrolment, PartialAnswerLineOnAnOpenPipeDeclinesInTime) {
+    const auto result = run_enrolment_child(
+        {.filter = "WiredReceiverEnrolment.PartialAnswerLineOnAnOpenPipeDeclinesInTime",
+         .duration_ms = "4000", .executable_partial = true});
+    ASSERT_FALSE(result.watchdog_fired) << result.output << result.consumer_output;
+    ASSERT_TRUE(WIFEXITED(result.consumer_status)) << result.consumer_status;
+    EXPECT_EQ(WEXITSTATUS(result.consumer_status), 1) << result.consumer_output;
+    EXPECT_LT(result.consumer_elapsed, std::chrono::seconds{5}) << result.consumer_output;
+    EXPECT_NE(result.consumer_output.find("not approved"), std::string::npos) << result.consumer_output;
+    EXPECT_TRUE(result.consumer_cancelled) << "CancelPhonePairing was not observed";
+    ASSERT_TRUE(WIFEXITED(result.status)) << result.status;
+    EXPECT_EQ(WEXITSTATUS(result.status), 3) << result.output;
+    EXPECT_FALSE(result.approved);
 }
 
 TEST(WiredReceiver, PreAdmissionFailureEmitsNoAttemptAttribution) {

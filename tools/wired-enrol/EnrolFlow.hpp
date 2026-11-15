@@ -10,8 +10,9 @@
 //   -> yes: ConfirmPhonePairing, then CancelPhonePairing (closes the window;
 //      the approval is already durable)    no/timeout: CancelPhonePairing
 //
-// Only an explicit "y"/"yes" approves. Anything else, an empty line, EOF or
-// no answer before the deadline is a no.
+// Only an explicit "y"/"yes" approves. Anything else, an empty line, EOF, a
+// partial line or no complete answer before the deadline is a no. A
+// not-durable approval (trust_store_not_durable) is a failure, never "approved".
 
 #include <aa/core/Ids.hpp>
 #include <aa/core/Result.hpp>
@@ -46,7 +47,7 @@ using ReadAnswer = std::function<std::optional<std::string>(core::Milliseconds)>
 
 template <class Client>
 [[nodiscard]] Outcome run(Client& client, const ipc::BusName& consumer_name, std::ostream& out,
-                          const ReadAnswer& read_answer) {
+                          const ReadAnswer& read_answer, core::Milliseconds budget = kAnswerBudget) {
     if (const auto registered = client.register_consumer(consumer_name); !registered) {
         out << "error: could not register as the receiver consumer ("
             << to_string(registered.error().code()) << ")\n";
@@ -78,7 +79,7 @@ template <class Client>
         << "  strength:  " << field("strength") << "\n"
         << "The label matches the phone_id in the receiver's refusal log line.\n"
         << "Approve this phone? [y/N] " << std::flush;
-    const auto answer = read_answer(kAnswerBudget);
+    const auto answer = read_answer(budget);
     if (!answer || !explicit_yes(*answer)) {
         out << (answer ? "\n" : "\nno answer; ") << "not approved\n";
         (void)client.cancel_phone_pairing(request.value());
@@ -87,7 +88,12 @@ template <class Client>
     }
     const auto confirmed = client.confirm_phone_pairing(request.value());
     if (!confirmed) {
-        out << "error: approval refused (" << to_string(confirmed.error().code()) << ")\n";
+        if (confirmed.error().code() == ErrorCode::trust_store_not_durable) {
+            out << "error: the receiver wrote the approval but could not make it durable "
+                   "(trust_store_not_durable); check the receiver's store directory, then retry\n";
+        } else {
+            out << "error: approval refused (" << to_string(confirmed.error().code()) << ")\n";
+        }
         (void)client.cancel_phone_pairing(request.value());
         (void)client.unregister_consumer();
         return Outcome::failed;

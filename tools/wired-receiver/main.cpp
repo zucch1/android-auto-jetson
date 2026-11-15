@@ -1649,9 +1649,12 @@ std::string screen_description_event(const aa::config::Screen &screen) {
 
 // #133: serve the control contract on this (store-owner) thread while the
 // refused phone may be approved by the registered consumer. Nothing is
-// approved here; only the consumer's explicit confirm writes the store.
+// approved here; only the consumer's explicit confirm writes the store. The
+// loop ends on the enrolment's own completion result, never on store
+// admission: a committed-but-not-durable approval admits in memory yet is not
+// a completed enrolment (#141 B2), so it logs wired_enrolment_not_durable and
+// exits 1.
 int run_wired_enrolment(aa::ipc::ControlBusService &bus, aa::app::WiredEnrolment &enrolment,
-                        const aa::trust::ApprovedPhoneStore &store,
                         const aa::trust::WiredIdentity &refused,
                         std::chrono::steady_clock::time_point deadline) {
     const std::string label = aa::trust::redacted_label(aa::trust::TransportIdentity{refused});
@@ -1659,8 +1662,7 @@ int run_wired_enrolment(aa::ipc::ControlBusService &bus, aa::app::WiredEnrolment
     const auto until = std::min(deadline, std::chrono::steady_clock::now() + window);
     log_line("{\"event\":\"wired_enrolment_open\",\"phone_id\":\"" + label +
              "\",\"window_ms\":" + std::to_string(window.count()) + "}");
-    const auto admitted = [&] { return aa::transport::admit_via(store)(refused); };
-    while (g_running.load() && std::chrono::steady_clock::now() < until && !admitted()) {
+    while (g_running.load() && std::chrono::steady_clock::now() < until && !enrolment.completion()) {
         const auto left = std::chrono::ceil<std::chrono::milliseconds>(
             until - std::chrono::steady_clock::now()).count();
         const auto step = bus.cycle(Milliseconds{std::clamp<std::int64_t>(left, 0, 1000)});
@@ -1669,11 +1671,16 @@ int run_wired_enrolment(aa::ipc::ControlBusService &bus, aa::app::WiredEnrolment
             break;
         }
     }
-    const bool approved = admitted();
+    const auto completion = enrolment.completion();
     enrolment.close();
     // Close any request still outstanding (PairingClosed) before leaving.
     bus.service().refresh_consumer_owner();
-    if (approved) {
+    if (completion && !completion->durable) {
+        log_line("{\"event\":\"wired_enrolment_not_durable\",\"phone_id\":\"" + label +
+                 "\",\"detail\":\"store directory sync failed; approval may not survive a crash\"}");
+        return 1;
+    }
+    if (completion) {
         log_line("{\"event\":\"wired_enrolment_approved\",\"phone_id\":\"" + label +
                  "\",\"next\":\"replug the phone, then start the receiver again\"}");
         return 0;
@@ -1965,7 +1972,7 @@ int receiver_main(int argc, char **argv) {
             first_link.error().code() == aa::ErrorCode::transport_unauthorized_peer &&
             !attempted_identity.port_context.empty() &&
             enrolment.note_refused(attempted_identity).has_value()) {
-            return run_wired_enrolment(bus.value(), enrolment, store, attempted_identity, deadline);
+            return run_wired_enrolment(bus.value(), enrolment, attempted_identity, deadline);
         }
         return 3;
     }

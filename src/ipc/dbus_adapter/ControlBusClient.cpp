@@ -38,6 +38,12 @@ constexpr int kMaxSkippedMessages = 32;
     if (error_name == "org.custom.AndroidAutoReceiver1.Error.IllegalTransition") {
         return ErrorCode::session_illegal_transition;
     }
+    if (error_name == "org.custom.AndroidAutoReceiver1.Error.NotWiredCandidate") {
+        return ErrorCode::trust_not_wired_candidate;
+    }
+    if (error_name == "org.custom.AndroidAutoReceiver1.Error.NotDurable") {
+        return ErrorCode::trust_store_not_durable;
+    }
     if (error_name == "org.custom.AndroidAutoReceiver1.Error.MalformedRequest" ||
         error_name == "org.custom.AndroidAutoReceiver1.Error.UnsupportedContractMajor" ||
         error_name == "org.freedesktop.DBus.Error.InvalidArgs" ||
