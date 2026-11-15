@@ -23,9 +23,9 @@ the caller must treat the file as invalid.
 
 Syntax validity alone is NOT a license to install: the ``verify`` CLI command
 is the installer's gate and additionally enforces the EXACT approved policy
-(:func:`verify_exact_policy`): the six reviewed rules, the three qualified
-ids on port ``1-2.1``, the permitted assignment names/values and zero extra
-rules. Anything else - a weakened value, an appended rule, a dropped rule -
+(:func:`verify_exact_policy`): the six reviewed rules, the three approved
+vendor:product ids on any host port (#133: no port constraint), the
+permitted assignment names/values and zero extra rules. Anything else - a weakened value, an appended rule, a dropped rule -
 raises :class:`PolicyError` and the installer must refuse before touching
 any destination or state.
 
@@ -204,16 +204,16 @@ def parse_rules(text: str) -> list[Rule]:
 # rule or a rewritten match is refused before any install/rollback mutation.
 
 _APPROVED_POLICY_TEXT = """\
-KERNELS=="1-2.1", SUBSYSTEMS=="usb", ATTRS{idVendor}=="04e8", ATTRS{idProduct}=="6860", ENV{ID_MM_DEVICE_IGNORE}="1"
-KERNELS=="1-2.1", SUBSYSTEMS=="usb", ATTRS{idVendor}=="18d1", ATTRS{idProduct}=="2d00", ENV{ID_MM_DEVICE_IGNORE}="1"
-KERNELS=="1-2.1", SUBSYSTEMS=="usb", ATTRS{idVendor}=="18d1", ATTRS{idProduct}=="2d01", ENV{ID_MM_DEVICE_IGNORE}="1"
-SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="1-2.1", ATTR{idVendor}=="04e8", ATTR{idProduct}=="6860", GROUP="plugdev", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="1-2.1", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00", GROUP="plugdev", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="1-2.1", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d01", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="04e8", ATTRS{idProduct}=="6860", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="18d1", ATTRS{idProduct}=="2d00", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="18d1", ATTRS{idProduct}=="2d01", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="04e8", ATTR{idProduct}=="6860", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d01", GROUP="plugdev", MODE="0660", TAG+="uaccess"
 """
 
 _APPROVED_RULES: tuple[Rule, ...] = tuple(parse_rules(_APPROVED_POLICY_TEXT))
-_APPROVED_POLICY_SHA256 = "549be61638a94ca7cca55240bb26069982ffa187bcb448664356980f29c1836a"
+_APPROVED_POLICY_SHA256 = "6de50d0e94265269bd8cc1d359f404e641f672c0278341584ddb7b4af820e7b9"
 
 
 def verify_exact_policy(rules: list[Rule] | tuple[Rule, ...]) -> None:

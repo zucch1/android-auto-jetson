@@ -9,9 +9,11 @@
 //
 // TRUST MODEL (documented limitation): a wired identity is PHYSICAL-ACCESS
 // TRUST, NOT CRYPTOGRAPHIC PROOF. USB descriptor strings and serials can be
-// spoofed by anyone with physical access to the port; an approved wired record
-// therefore authorizes "the approved identifiers presented on the qualified
-// port", not "this specific handset". Wireless records bind the BlueZ bond
+// spoofed by anyone with physical access to a receiver USB port; an approved
+// serial-backed wired record therefore authorizes "the approved identifiers
+// presented on any receiver port" (matching is port-independent, #133; see
+// match_key() in Identity.hpp), not "this specific handset". A port-only
+// (serial-less) record still matches only on the port it was approved on. Wireless records bind the BlueZ bond
 // (stronger, still bond-not-human identity). Unknown phones always fail closed:
 // lookup() returns Decision::unknown and allows_session() is false.
 //
@@ -82,7 +84,8 @@ public:
     [[nodiscard]] core::Result<void> load();
     std::uint64_t reload_epoch() const { return reload_epoch_; }
 
-    // TrustStore seam (session admission by opaque key). approve_once rejects
+    // TrustStore seam (session admission by opaque key). lookup/forget match
+    // by match_key(): a serial-backed wired key matches its phone on any port. approve_once rejects
     // all opaque w1: keys; wired approvals must use the structured APIs.
     [[nodiscard]] Decision lookup(const PhoneIdentity& identity) const override;
     core::Result<void> approve_once(const PhoneIdentity& identity) override;
@@ -90,13 +93,14 @@ public:
 
     // Structured approve-once (task 27 pairing flow): persist the strongest
     // available transport identity and allocate a stable PhoneId. Approve-once
-    // semantics: re-approving an already-approved key returns the existing id
-    // and never adds a second record. Serial-less wired identities are rejected
+    // semantics: re-approving an already-approved key (by match_key, so the
+    // same serial-backed phone on another port) returns the existing id and
+    // never adds a second record. Serial-less wired identities are rejected
     // with trust_port_only_requires_opt_in; use approve_port_only explicitly.
     [[nodiscard]] core::Result<core::PhoneId> approve(const TransportIdentity& identity);
 
     // Explicit weaker grant: any device presenting the same descriptors on this
-    // port will match. Normal pairing never calls this API.
+    // port will match (on this port ONLY; never widened to other ports). Normal pairing never calls this API.
     [[nodiscard]] core::Result<core::PhoneId> approve_port_only(const WiredIdentity& identity);
 
     // ForgetPhone path: revoke by phone id, persist the removal.

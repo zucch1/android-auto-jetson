@@ -7,9 +7,9 @@
 """Host-side USB policy fixtures: no host udev state is ever modified.
 
 Covers the task-29 udev policy boundaries:
-- structural matching of 70-android-auto-receiver.rules (qualified ids + port
-  path match; same ids on another port, HID dongles, usb-serial devices and
-  hubs never match),
+- structural matching of 70-android-auto-receiver.rules (approved ids match
+  on every port (#133); other ids, HID dongles, usb-serial devices and hubs
+  never match),
 - fail-closed handling of malformed rule text (parser AND `udevadm verify`),
 - install/rollback state machine in a fake root (idempotent, exact restore),
 - parsing of recorded `udevadm test` output (matched vs unmatched evidence).
@@ -38,7 +38,7 @@ POLICY_DIR = ROOT / "tools/usb-policy"
 FIXTURES = ROOT / "tests/usb/fixtures/usb_policy"
 MM_IGNORE = "ENV{ID_MM_DEVICE_IGNORE}"
 
-# Qualified identities (the only things the rules may ever match on).
+# Approved identities (the only things the rules may ever match on, any port).
 PHONE = ("04e8", "6860")
 AOA = ("18d1", "2d00")
 AOA_ADB = ("18d1", "2d01")
@@ -102,12 +102,56 @@ class Rules(unittest.TestCase):
                 self.assertEqual(result["MODE"], "0660")
                 self.assertEqual(result["TAG"], "uaccess")
 
-    def test_same_ids_on_other_ports_never_match(self) -> None:
-        # The reviewer's lever: identical ids on a different port path.
-        for kernel in ("1-2.2", "1-2.4", "1-3", "2-1.1", "1-2", "1-2.10", "1-2.11"):
+    def test_approved_ids_match_on_every_port(self) -> None:
+        # #133: the approved ids get the same policy on ANY host port (the
+        # old 1-2.1 pin added no security and stranded a phone moved to
+        # another hub socket).
+        expected = self.apply(usb_device(PORT, *PHONE))
+        for kernel in ("1-2.1", "1-2.2", "1-2.3", "1-2.4", "1-3", "2-1.1", "1-2", "1-2.10",
+                       "1-2.4.1"):
             for vendor, product in (PHONE, AOA, AOA_ADB):
                 with self.subTest(port=kernel, id=f"{vendor}:{product}"):
+                    self.assertEqual(self.apply(usb_device(kernel, vendor, product)), expected)
+
+    def test_tty_child_on_another_port_gets_mm_ignore_only(self) -> None:
+        phone = usb_device("1-2.3", *PHONE)
+        interface = child_of(phone, "1-2.3:1.1", "usb", DEVTYPE="usb_interface")
+        self.assertEqual(self.apply(child_of(interface, "ttyACM0", "tty")), {MM_IGNORE: "1"})
+
+    def test_unapproved_ids_never_match_on_any_port(self) -> None:
+        near_misses = (("04e8", "6861"), ("04e8", "686"), ("18d1", "2d02"), ("18d1", "4ee1"),
+                       ("18d1", "2d0"), ("04E8", "6860"), ("6860", "04e8"), ("2d00", "18d1"))
+        for kernel in ("1-2.1", "1-2.3", "2-1"):
+            for vendor, product in near_misses:
+                with self.subTest(port=kernel, id=f"{vendor}:{product}"):
                     self.assertEqual(self.apply(usb_device(kernel, vendor, product)), {})
+
+    def test_rules_carry_no_port_constraint(self) -> None:
+        for rule in self.rules:
+            for match in rule.matches:
+                self.assertNotIn(match.key, {"KERNEL", "KERNELS"}, rule.describe())
+
+    def test_policy_gate_rejects_a_reintroduced_port_pin(self) -> None:
+        lines = [ln for ln in RULES_FILE.read_text(encoding="utf-8").splitlines()
+                 if ln.strip() and not ln.startswith("#")]
+        pinned = ['KERNELS=="1-2.1", ' + lines[0]] + lines[1:]
+        with self.assertRaises(rules_check.PolicyError):
+            rules_check.verify_exact_policy(rules_check.parse_rules("\n".join(pinned) + "\n"))
+
+    def test_installer_trigger_ids_match_the_rules(self) -> None:
+        common = (POLICY_DIR / "common.sh").read_text(encoding="utf-8")
+        line = next(ln for ln in common.splitlines() if ln.startswith("APPROVED_USB_IDS="))
+        installer_ids = set(line.split("=", 1)[1].strip('"').split())
+        rule_ids = set()
+        for rule in self.rules:
+            values = {m.arg: m.value for m in rule.matches if m.arg in {"idVendor", "idProduct"}}
+            rule_ids.add(f"{values['idVendor']}:{values['idProduct']}")
+        self.assertEqual(installer_ids, rule_ids)
+        self.assertEqual(rule_ids, {":".join(PHONE), ":".join(AOA), ":".join(AOA_ADB)})
+        for script in ("install.sh", "rollback.sh"):
+            text = (POLICY_DIR / script).read_text(encoding="utf-8")
+            self.assertNotIn("1-2.1", text, script)
+            self.assertIn("trigger_approved_devices", text, script)
 
     def test_dongle_never_matches(self) -> None:
         device = usb_device(DONGLE_PORT, *DONGLE)

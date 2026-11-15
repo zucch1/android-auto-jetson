@@ -114,7 +114,7 @@ public:
     // ipc::PhoneDirectory — driven by ControlService after the task-21 gate.
     //
     // Revocation invalidates EVERY outstanding request bound to the forgotten
-    // identity: forget() matches pending entries by canonical identity_key
+    // identity: forget() matches pending entries by canonical match_key
     // (never variant equality or phone id — migrated opaque records and
     // structured records can carry one canonical key), prepares the matching
     // request ids BEFORE persistence, and drops them only after the
