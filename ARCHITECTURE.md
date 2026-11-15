@@ -80,6 +80,14 @@ Forget removes every record that matches the same phone. The udev policy
 port. Node access is not trust: the store decides admission. Wired identity is
 physical-access trust, not cryptographic proof (USB ids are spoofable).
 
+A refused wired phone can be approved through the D-Bus control contract:
+`aa-wired-receiver --wired-enrolment` holds the refused attempt open. The
+registered consumer then calls `RequestAddPhone`, `GetPairingCandidate`, and
+either `ConfirmPhonePairing` (yes) or `CancelPhonePairing` (no). The request is
+one-time, expires after 60 s, and is bound to the refused attempt's captured
+identity. Only a yes writes the store. `aa-wired-enrol` is the terminal y/N
+reference consumer. See [wired-enrolment.md](docs/wired-enrolment.md).
+
 ## Wireless handoff
 
 The host-tested receiver listener and helper-owned RFCOMM bootstrap are implemented. The helper alone handles AAW framing and credentials; the receiver uses authenticated bootstrap RPCs and a fenced NetworkManager AP snapshot. A negotiated AAP WifiCredentials service is metadata-only and distinct from that bootstrap. Each accepted TCP link reuses a fresh `WiredSession` with AAP encapsulated TLS, not an outer TLS transport. See [wireless-handoff.md](docs/wireless-handoff.md) for authorization, lifetimes, and revocation.

@@ -199,6 +199,8 @@ class ObservedSessionMutex {
 #undef AA_WIRED_RECEIVER_SHUTDOWN_TEST
 
 #include "harness.hpp"
+#include "../../tools/wired-enrol/EnrolFlow.hpp"
+#include <aa/ipc/ControlBusClient.hpp>
 #include "../session/Fakes.hpp"
 #include "../video_socket/pair.hpp"
 #include "../trust/syscall_faults.hpp"
@@ -1847,6 +1849,149 @@ TEST(WiredReceiver, RejectedAttemptEmitsCapturedPseudonymAndPort) {
                             second.aoa_model, key.value(), std::string{"FIRST-PRIVATE"}}) {
         EXPECT_EQ(result.output.find(raw), std::string::npos) << "raw identity leaked: " << raw;
     }
+}
+
+// #133 end to end over the real session bus: the receiver refuses an unknown
+// phone, holds enrolment open, and only the registered consumer's explicit
+// yes on the presented candidate writes that exact phone to the store.
+struct EnrolmentResult {
+    int status{};
+    bool watchdog_fired = false;
+    std::string output;
+    aa::tools::enrol::Outcome outcome{aa::tools::enrol::Outcome::failed};
+    std::string consumer_output;
+    bool approved = false;
+    bool other_approved = false;
+};
+
+const aa::trust::WiredIdentity kEnrolPhone{
+    "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
+    "SECOND-PRIVATE-AOA", "1-2.2"};
+
+EnrolmentResult run_enrolment_child(const char* answer, const char* filter) {
+    if (const char* child_root = std::getenv("AA_TEST_ENROL_ROOT")) {
+        const std::filesystem::path root{child_root};
+        runtime_real_admission = true;
+        runtime_fail_before_admission = false;
+        admission_state = std::make_shared<aa::test::usb_aoa::LinkState>();
+        runtime_connects.store(0);
+        shutdown_observation = nullptr;
+        g_running.store(true);
+        std::vector<std::string> args{"receiver", "--port", "1-2.2", "--wired-enrolment", "--store",
+            (root / "approved.json").string(), "--video-socket", (root / "video").string(),
+            "--input-socket", (root / "input").string(), "--duration-ms",
+            std::getenv("AA_TEST_ENROL_DURATION")};
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        const int code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+        std::fflush(stdout);
+        ::_exit(code);
+    }
+    EnrolmentResult result;
+    char directory[] = "/tmp/wired-enrol-XXXXXX";
+    const char* created = ::mkdtemp(directory);
+    EXPECT_NE(created, nullptr);
+    if (!created) return result;
+    const std::filesystem::path root{created};
+    {
+        aa::trust::ApprovedPhoneStore initial{root / "approved.json"};
+        EXPECT_TRUE(initial.load().has_value());
+        EXPECT_TRUE(initial.approve(aa::trust::TransportIdentity{aa::trust::WiredIdentity{
+            "04e8", "6860", "FIRST-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
+            "FIRST-PRIVATE-AOA", "1-2.1"}}).has_value());
+    }
+    const bool yes = std::string{answer} == "y";
+    std::string root_env = "AA_TEST_ENROL_ROOT=" + root.string();
+    std::string duration_env = std::string{"AA_TEST_ENROL_DURATION="} + (yes ? "20000" : "3000");
+    std::vector<char*> environment;
+    for (char** entry = ::environ; *entry != nullptr; ++entry) environment.push_back(*entry);
+    environment.push_back(root_env.data());
+    environment.push_back(duration_env.data());
+    environment.push_back(nullptr);
+    std::string executable = "/proc/self/exe";
+    std::string gtest_filter = std::string{"--gtest_filter="} + filter;
+    char* child_argv[]{executable.data(), gtest_filter.data(), nullptr};
+    const int capture_fd = ::open((root / "stdout").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    EXPECT_GE(capture_fd, 0);
+    std::fflush(nullptr);
+    const pid_t child = ::fork();
+    EXPECT_GE(child, 0);
+    if (child == 0) {
+        if (capture_fd < 0 || ::dup2(capture_fd, STDOUT_FILENO) < 0) ::_exit(90);
+        ::close(capture_fd);
+        ::execve(executable.c_str(), child_argv, environment.data());
+        ::_exit(91);
+    }
+    if (capture_fd >= 0) ::close(capture_fd);
+    const auto read_output = [&] {
+        std::ifstream capture(root / "stdout");
+        return std::string{std::istreambuf_iterator<char>{capture}, {}};
+    };
+    const auto watchdog = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (read_output().find("\"event\":\"wired_enrolment_open\"") == std::string::npos &&
+           std::chrono::steady_clock::now() < watchdog && ::waitpid(child, nullptr, WNOHANG) == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    }
+    auto client = aa::ipc::ControlBusClient::connect();
+    EXPECT_TRUE(client.has_value());
+    if (client.has_value()) {
+        std::ostringstream consumer;
+        result.outcome = aa::tools::enrol::run(
+            client.value(), aa::ipc::BusName{"org.custom.WiredEnrolTest1"}, consumer,
+            [answer](aa::core::Milliseconds) { return std::optional<std::string>{answer}; });
+        result.consumer_output = consumer.str();
+    }
+    for (;;) {
+        const auto waited = ::waitpid(child, &result.status, WNOHANG);
+        if (waited == child) break;
+        if (waited < 0 || std::chrono::steady_clock::now() >= watchdog) {
+            result.watchdog_fired = true;
+            (void)::kill(child, SIGKILL);
+            (void)::waitpid(child, &result.status, 0);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    result.output = read_output();
+    aa::trust::ApprovedPhoneStore after{root / "approved.json"};
+    EXPECT_TRUE(after.load().has_value());
+    result.approved = aa::transport::admit_via(after)(kEnrolPhone);
+    auto elsewhere = kEnrolPhone;
+    elsewhere.usb_serial = "THIRD-PRIVATE-USB";
+    elsewhere.aoa_serial = "THIRD-PRIVATE-AOA";
+    result.other_approved = aa::transport::admit_via(after)(elsewhere);
+    std::filesystem::remove_all(root);
+    return result;
+}
+
+TEST(WiredReceiver, EnrolmentExplicitYesApprovesTheRefusedPhone) {
+    const auto result = run_enrolment_child("y", "WiredReceiver.EnrolmentExplicitYesApprovesTheRefusedPhone");
+    ASSERT_FALSE(result.watchdog_fired) << result.output;
+    ASSERT_TRUE(WIFEXITED(result.status)) << result.status;
+    EXPECT_EQ(WEXITSTATUS(result.status), 0) << result.output;
+    EXPECT_EQ(result.outcome, aa::tools::enrol::Outcome::approved) << result.consumer_output;
+    EXPECT_TRUE(result.approved);
+    EXPECT_FALSE(result.other_approved);
+    const auto label = aa::trust::redacted_label(aa::trust::TransportIdentity{kEnrolPhone});
+    EXPECT_NE(result.output.find("\"event\":\"wired_enrolment_approved\""), std::string::npos)
+        << result.output;
+    EXPECT_EQ(result.output.find("\"event\":\"ready\""), std::string::npos)
+        << "an enrolment approval must not start a session on the refused link";
+    for (const std::string raw : {"SECOND-PRIVATE-USB", "SECOND-PRIVATE-AOA"}) {
+        EXPECT_EQ(result.output.find(raw), std::string::npos) << raw;
+        EXPECT_EQ(result.consumer_output.find(raw), std::string::npos) << raw;
+    }
+}
+
+TEST(WiredReceiver, EnrolmentExplicitNoWritesNothing) {
+    const auto result = run_enrolment_child("n", "WiredReceiver.EnrolmentExplicitNoWritesNothing");
+    ASSERT_FALSE(result.watchdog_fired) << result.output;
+    ASSERT_TRUE(WIFEXITED(result.status)) << result.status;
+    EXPECT_EQ(WEXITSTATUS(result.status), 3) << result.output;
+    EXPECT_EQ(result.outcome, aa::tools::enrol::Outcome::declined) << result.consumer_output;
+    EXPECT_FALSE(result.approved);
+    EXPECT_NE(result.output.find("\"event\":\"wired_enrolment_closed\""), std::string::npos)
+        << result.output;
 }
 
 TEST(WiredReceiver, PreAdmissionFailureEmitsNoAttemptAttribution) {

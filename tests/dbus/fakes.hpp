@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -163,7 +164,15 @@ public:
         return drained;
     }
 
+    std::optional<std::map<std::string, std::string>> pairing_candidate(
+        core::PairingRequestId request) override {
+        presented.push_back(request);
+        return candidate;
+    }
+
     std::vector<core::PhoneId> forgotten{};
+    std::vector<core::PairingRequestId> presented{};
+    std::optional<std::map<std::string, std::string>> candidate{};
     std::vector<core::PairingRequestId> requested{};
     std::vector<core::PairingRequestId> confirmed{};
     std::vector<core::PairingRequestId> cancelled{};

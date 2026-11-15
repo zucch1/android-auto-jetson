@@ -158,6 +158,13 @@ constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properti
         return from_void(service.respond_pairing_comparison(sender, core::PairingRequestId{request.value()},
             {id.value(), accept.value() != 0}));
     }
+    case 14: {
+        const auto id = cursor.read_u64();
+        if (!id || !body_consumed(cursor)) return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        const auto value = service.pairing_candidate(sender, core::PairingRequestId{id.value()});
+        if (!value) return error_reply(error_name_for(value.error().code()), value.error().message());
+        return ok(value.value());
+    }
     default: {
         if (!body_consumed(cursor)) {
             return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");

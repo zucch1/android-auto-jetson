@@ -334,6 +334,46 @@ TEST(CallBoundary, PairingFlowRoutesThroughTheBoundary) {
     EXPECT_TRUE(fixture.service.pairing_window_open());
 }
 
+TEST(CallBoundary, PairingCandidateRoutesThroughTheBoundaryForTheOwnerOnly) {
+    BoundaryFixture fixture;
+    const BusName name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(BusName{":1.20"}, kSessionUid);
+    fixture.credentials.add_connection(BusName{":1.21"}, kSessionUid + 1);
+    fixture.credentials.set_owner(name, BusName{":1.20"});
+    ASSERT_FALSE(fixture.dispatcher
+                     .handle(call_from(":1.20", "RegisterConsumer", "s", marshal_string(name.value)))
+                     ->is_error);
+    fixture.phones.candidate = std::map<std::string, std::string>{
+        {"transport", "wired"}, {"label", "id-1"}, {"strength", "serial-backed"}};
+    const auto request = fixture.dispatcher.handle(call_from(":1.20", "RequestAddPhone"));
+    ASSERT_TRUE(request.has_value());
+    ASSERT_FALSE(request->is_error);
+    const std::uint64_t request_id = std::get<std::uint64_t>(request->body);
+
+    const auto intruder = fixture.dispatcher.handle(
+        call_from(":1.21", "GetPairingCandidate", "t", marshal_u64(request_id)));
+    ASSERT_TRUE(intruder.has_value());
+    EXPECT_TRUE(intruder->is_error);
+    EXPECT_TRUE(fixture.phones.presented.empty());
+    const auto wrong_signature = fixture.dispatcher.handle(
+        call_from(":1.20", "GetPairingCandidate", "s", marshal_string("x")));
+    ASSERT_TRUE(wrong_signature.has_value());
+    EXPECT_TRUE(wrong_signature->is_error);
+
+    const auto candidate = fixture.dispatcher.handle(
+        call_from(":1.20", "GetPairingCandidate", "t", marshal_u64(request_id)));
+    ASSERT_TRUE(candidate.has_value());
+    ASSERT_FALSE(candidate->is_error);
+    const auto& map = std::get<std::map<std::string, std::string>>(candidate->body);
+    EXPECT_EQ(map.at("transport"), "wired");
+    EXPECT_EQ(fixture.phones.presented.size(), 1U);
+
+    const auto unknown = fixture.dispatcher.handle(
+        call_from(":1.20", "GetPairingCandidate", "t", marshal_u64(request_id + 99)));
+    ASSERT_TRUE(unknown.has_value());
+    EXPECT_TRUE(unknown->is_error);
+}
+
 TEST(CallBoundary, IntrospectionServesCheckedSchemaBytes) {
     // Given: a boundary over a live service.
     BoundaryFixture fixture;

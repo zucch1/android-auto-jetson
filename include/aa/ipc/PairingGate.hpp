@@ -80,6 +80,11 @@ public:
     // ids stay remembered (one-time for the gate lifetime).
     [[nodiscard]] std::vector<core::PairingRequestId> close_all();
 
+    // Read-only check that `request` is a live, not-yet-opened request owned
+    // by `consumer` (same error mapping as confirm; nothing changes state).
+    [[nodiscard]] core::Result<void> pending(const BoundConsumer& consumer,
+                                             core::PairingRequestId request) const;
+
     [[nodiscard]] bool window_open() const noexcept { return open_.has_value(); }
     [[nodiscard]] std::optional<core::PairingRequestId> open_request() const { return open_; }
 

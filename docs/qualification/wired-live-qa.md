@@ -56,6 +56,8 @@ composes the modules above and reimplements none of them.
 3. Approved-phone trust store loaded (task 27) for the phone's wired identity.
    A serial-backed wired approval matches the phone on any port (#133); a
    port-only (serial-less) approval matches only the port it was approved on.
+   Approve a new phone with `aa-wired-receiver --wired-enrolment` plus
+   `aa-wired-enrol` (docs/wired-enrolment.md), never by hand-editing the store.
 4. Display connected (DP-1 or HDMI-A-1 `connected`) and a PipeWire output sink
    present (`pactl list short sinks` or `pw-cli`). The perf harness
    (`tools/perf/aa-projection-perf.sh`) exports the X session it is told about

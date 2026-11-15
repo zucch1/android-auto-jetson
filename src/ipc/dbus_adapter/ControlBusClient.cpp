@@ -353,6 +353,81 @@ core::Result<std::uint64_t> ControlBusClient::ping() {
     return stamp.value();
 }
 
+core::Result<core::PairingRequestId> ControlBusClient::request_add_phone() {
+    if (!impl_) {
+        return Error{ErrorCode::transport_closed};
+    }
+    MessageWriter body;
+    auto reply = impl_->exchange("RequestAddPhone", "", body);
+    if (!reply.has_value()) {
+        return reply.error();
+    }
+    if (reply.value().type == MessageType::error_reply) {
+        return Error{error_code_for(reply.value().error_name)};
+    }
+    Cursor cursor(reply.value().body);
+    auto id = cursor.read_u64();
+    if (!id.has_value() || !cursor.done() || id.value() == 0) {
+        return Error{ErrorCode::ipc_malformed_request};
+    }
+    return core::PairingRequestId{id.value()};
+}
+
+core::Result<std::map<std::string, std::string>> ControlBusClient::pairing_candidate(
+    core::PairingRequestId request) {
+    if (!impl_) {
+        return Error{ErrorCode::transport_closed};
+    }
+    MessageWriter body;
+    body.put_u64(request.value);
+    auto reply = impl_->exchange("GetPairingCandidate", "t", body);
+    if (!reply.has_value()) {
+        return reply.error();
+    }
+    if (reply.value().type == MessageType::error_reply) {
+        return Error{error_code_for(reply.value().error_name)};
+    }
+    // a{ss}: u32 byte length, pad to 8, then 8-aligned (s, s) dict entries.
+    Cursor cursor(reply.value().body);
+    const auto length = cursor.read_u32();
+    if (!length.has_value() || length.value() > 4096 || !cursor.align(8)) {
+        return Error{ErrorCode::ipc_malformed_request};
+    }
+    const std::size_t end = cursor.position() + length.value();
+    std::map<std::string, std::string> entries;
+    while (cursor.position() < end) {
+        if (!cursor.align(8)) return Error{ErrorCode::ipc_malformed_request};
+        auto key = cursor.read_string();
+        auto value = cursor.read_string();
+        if (!key.has_value() || !value.has_value() || entries.size() >= 16) {
+            return Error{ErrorCode::ipc_malformed_request};
+        }
+        entries.insert_or_assign(std::move(key.value()), std::move(value.value()));
+    }
+    if (cursor.position() != end || !cursor.done()) {
+        return Error{ErrorCode::ipc_malformed_request};
+    }
+    return entries;
+}
+
+core::Result<void> ControlBusClient::confirm_phone_pairing(core::PairingRequestId request) {
+    if (!impl_) {
+        return Error{ErrorCode::transport_closed};
+    }
+    MessageWriter body;
+    body.put_u64(request.value);
+    return impl_->exchange_void("ConfirmPhonePairing", "t", body);
+}
+
+core::Result<void> ControlBusClient::cancel_phone_pairing(core::PairingRequestId request) {
+    if (!impl_) {
+        return Error{ErrorCode::transport_closed};
+    }
+    MessageWriter body;
+    body.put_u64(request.value);
+    return impl_->exchange_void("CancelPhonePairing", "t", body);
+}
+
 core::Result<ControlBusClient::ContractSignal> ControlBusClient::wait_signal(
     core::Milliseconds timeout) {
     if (!impl_) {

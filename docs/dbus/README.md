@@ -56,11 +56,20 @@ service. (Note: The persistent D-Bus service export owning bus name `org.custom.
   running receiver is a separate future design that must preserve id
   unpredictability.
 
+## Wired enrolment
+
+`GetPairingCandidate(t) -> a{ss}` (#133) presents the redacted phone a pending
+request is bound to, so a human can answer before `ConfirmPhonePairing` (yes)
+or `CancelPhonePairing` (no). The wired directory refuses a confirm whose
+candidate was never retrieved. See `docs/wired-enrolment.md`. Adding the method
+keeps `ContractSemVer` at 1.0.0, following the precedent set when
+`GetPairingComparison` was added.
+
 ## Validation
 
 - `tools/ipc/dbus_contract.py` runs in `check` (validate the checked XML) and
   `generate` (validate, then emit the introspection header) modes.
-- Validation is a structural allowlist: exactly fourteen methods, five signals and
+- Validation is a structural allowlist: exactly fifteen methods, five signals and
   one read-only property, with argument types restricted to scalars and the string
   map so bulk or high-rate payload shapes are rejected.
 - Violations print named `DBUS_CONTRACT_*` diagnostics, exit nonzero, and produce
