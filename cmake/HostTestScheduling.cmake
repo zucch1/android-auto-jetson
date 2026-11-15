@@ -34,10 +34,13 @@ foreach(test IN LISTS host_tests)
     # an idle host, so they also run alone.
     # BusClient::confirmed()'s 1000 ms budget also bounds the NM AP private-bus suite and the
     # composed admission e2e (both timed out under parallel load); the security suite asserts the
-    # 500 ms / 1 s helper deadlines under slow, failing BlueZ removals (#118).
+    # 500 ms / 1 s helper deadlines under slow, failing BlueZ removals (#118). The two-bus
+    # acceptance suite drives the same confirmed() budget through real dbus-daemons, where the
+    # helper re-hashes the receiver executable on every authenticated call (a Debug fixture under
+    # parallel load exhausted it), and it measures receiver-loss cleanup under a 4 s flood.
     if(test MATCHES "^(system_helper_retirement_budget_|wireless_e2e_retirement_|system_helper_bluez_lifecycle_)" OR
        test MATCHES "^(system_helper_bluez_runtime|wireless_e2e_helper_bluez|system_helper_composed_runtime|wireless_e2e_helper_composition|system_helper_enrolment_retirement)$" OR
-       test MATCHES "^(system_helper_nm_ap_private_bus|wireless_e2e_composed_admission|system_helper_security)$")
+       test MATCHES "^(system_helper_nm_ap_private_bus|wireless_e2e_composed_admission|system_helper_security|system_helper_private_bus)$")
         set_tests_properties("${test}" PROPERTIES RUN_SERIAL TRUE)
     endif()
     # Target-safety guards watch every ancestor of their /tmp/opencode fixtures
