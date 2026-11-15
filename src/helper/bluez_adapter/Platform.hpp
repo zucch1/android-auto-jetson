@@ -21,6 +21,9 @@ struct BluezBackend::Impl {
         std::string path, adapter_path;
         PeerIdentity identity;
         bool bonded{};
+        // Any pairing state at all (Paired or Bonded): a device this helper must treat as
+        // already paired when an enrolment window opens for it (#136).
+        bool paired_any{};
     };
     struct Observation {
         Device device; std::string owner; Clock::time_point expires;
@@ -48,6 +51,12 @@ struct BluezBackend::Impl {
     // Persisted (same file rules as `managed`) so a helper restart cannot lose a removal: this is
     // the durable cleanup obligation of every unaccepted or provisional bond.
     bluez_adapter::ManagedPeers pending;
+    // Journal entries whose window opened with no pairing of the device in BlueZ, so a bond present
+    // for them was created by that window (#136). Written after the `pending` entry (a crash
+    // between them leaves an unmarked entry, kept) and dropped after it. Removal needs both: a `pending` entry without this marker (a bond that existed when its
+    // window opened, or a legacy entry an older helper journalled) is released, its bond kept. A
+    // marker without its entry is no authority and is dropped (reconciliation, or the next window).
+    bluez_adapter::ManagedPeers created;
     // Forgotten bonds: refused for every Android Auto path, their BlueZ bond kept (#136). Never
     // admission or acceptance of a new bond.
     bluez_adapter::ManagedPeers revoked;
@@ -134,6 +143,12 @@ struct BluezBackend::Impl {
     Removal remove_bond(const std::vector<Device>&, const PeerIdentity&, RemovalBudget&, Retire);
     void retire_unaccepted(Retire = Retire::tick, const PeerIdentity* own = nullptr,
                            const std::vector<Device>* known = nullptr);
+    // The helper may remove the identity's bond: journalled by an enrolment window that opened
+    // with no pairing of the device (`pending` and `created`). Nothing else is ever removed.
+    bool owns(const PeerIdentity& peer) const { return pending.contains(peer) && created.contains(peer); }
+    // Drops the identity's journal entry: the `pending` entry, then (best effort) its `created`
+    // marker. True once the entry is durably gone; a marker left behind is harmless.
+    bool drop_journal(const PeerIdentity&);
     // Moves the current window's acknowledged bond to `awaiting` before the window state is cleared.
     void park();
     // Admission authority for services, reconnect and the handoff: reconciled, durably on

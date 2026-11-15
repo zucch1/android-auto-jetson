@@ -374,7 +374,8 @@ TEST_F(ManagedBonds, DirFsyncFailureAtCommitRefusesAdmissionRemovesBondAndKeepsR
         ASSERT_TRUE(backend.available());
         ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
         ASSERT_TRUE(backend.reconcile_bonds({}));
-        ASSERT_EQ(mock.command("paired"), "ok");
+        // Unpaired when the window opens: the bond the enrolment creates is that window's (#136).
+        ASSERT_EQ(mock.command("unpaired"), "ok");
 
         const auto first = backend.observe();
         ASSERT_TRUE(first);
@@ -832,7 +833,8 @@ TEST_F(ManagedBonds, UnconfirmedDemotionSurvivesPowerLossWithoutResurrectingAdmi
     EXPECT_NE(file_text(directory + "/revoked-bonds").find("02:00:00:00:00:01"), std::string::npos);
 }
 // The revocation outranks an approval that was never committed after it (a resurrected or stale
-// approval): the bond is not admitted, and it is not removed either (#74, it is approved).
+// approval): the bond is not admitted, and it is not removed either (#74, it is approved). The
+// refusal is reported like every other kept revoked bond: a warning naming only the redacted address.
 TEST_F(ManagedBonds, ApprovalOfARevokedBondIsNotAdmittedAndNotRemoved) {
     const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
     ASSERT_NE(bus_address, nullptr);
@@ -845,9 +847,13 @@ TEST_F(ManagedBonds, ApprovalOfARevokedBondIsNotAdmittedAndNotRemoved) {
     ASSERT_EQ(mock.command("paired"), "ok");
     helper::BluezBackend backend{bus_address, [] { return std::chrono::steady_clock::now(); }, directory, ::getuid()};
     ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+    testing::internal::CaptureStderr();
     const auto answer = backend.reconcile_bonds({primary});
+    const auto log = testing::internal::GetCapturedStderr();
     ASSERT_TRUE(answer);
     EXPECT_EQ(answer.value(), 1U) << "the refused approval was not reported";
+    EXPECT_NE(log.find("warning bond_kept_revoked_identity id-"), std::string::npos) << log;
+    EXPECT_EQ(log.find(primary.address), std::string::npos) << "the raw address was logged";
     const auto obs = backend.observe();
     ASSERT_TRUE(obs);
     EXPECT_FALSE(backend.reconnect_peer(obs.value().handle));
@@ -928,6 +934,9 @@ void expect_refused_everywhere(helper::BluezBackend& backend, MockBluez& mock) {
     EXPECT_EQ(bluez_callback(backend, mock, "AuthorizeService hfp"), "rejected")
         << "a forgotten phone got HFP via Android Auto";
     EXPECT_EQ(removals(mock), 0U) << "a forgotten bond was deleted outside an enrolment window";
+    EXPECT_EQ(state_number(mock, "remove_attempts"), 0U) << "a forgotten bond was targeted for removal";
+    EXPECT_NE(mock.command("state").find("\"disconnected\": []"), std::string::npos)
+        << "a forgotten phone was disconnected outside an enrolment window";
 }
 // After a restart the receiver no longer approves the phone: no admission may remain and nothing
 // may be owed, but its bond stays in BlueZ (shared adapter, #136), refused, with a warning that
@@ -1036,10 +1045,15 @@ TEST_F(ManagedBonds, ForgottenPhonePairedOutsideAndroidAutoIsRefusedAndKeptWithA
             // The owner unpairs and pairs the phone again outside Android Auto.
             ASSERT_EQ(mock.command("unpaired"), "ok");
             ASSERT_EQ(mock.command("paired"), "ok");
+            // The second time the receiver's store still (stale) approves the phone: it is refused
+            // and reported all the same.
+            const auto approval = pairing == 2 ? std::vector<helper::PeerIdentity>{primary_peer}
+                                               : std::vector<helper::PeerIdentity>{};
             testing::internal::CaptureStderr();
-            const auto reconciled = backend.reconcile_bonds({});
+            const auto reconciled = backend.reconcile_bonds(approval);
             const auto log = testing::internal::GetCapturedStderr();
             ASSERT_TRUE(reconciled);
+            EXPECT_EQ(reconciled.value(), approval.size()) << "the refused approval was not reported";
             EXPECT_NE(log.find("warning bond_kept_revoked_identity id-"), std::string::npos) << log;
             EXPECT_NE(log.find("forgotten in Android Auto"), std::string::npos) << log;
             EXPECT_NE(log.find("Enrol the phone again in Android Auto"), std::string::npos) << log;
@@ -1057,6 +1071,153 @@ TEST_F(ManagedBonds, ForgottenPhonePairedOutsideAndroidAutoIsRefusedAndKeptWithA
         ASSERT_EQ(mock.command("paired"), "ok");
     }
     expect_forgotten_and_kept(bus_address, mock, directory);
+}
+// F1 (#136): an enrolment window that opens for a phone BlueZ already has paired (here a forgotten
+// phone whose bond was kept) never owns that pairing. Whether the window is cancelled, its number
+// rejected, its adapter setup fails, or the helper stops with the window open and restarts, the bond
+// is never disconnected or removed, the journal entry is released, and the phone stays refused.
+enum class PreBondedEnd { cancel, reject, setup_failure, restart };
+class PreExistingBond : public ManagedBonds, public testing::WithParamInterface<PreBondedEnd> {};
+TEST_P(PreExistingBond, SurvivesAnEnrolmentThatIsCancelledOrFails) {
+    using namespace std::chrono_literals;
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    enrol_admitted(bus_address, mock, directory);
+    if (HasFatalFailure()) return;
+    std::string journal, marker;
+    {
+        helper::BluezBackend backend{bus_address, steady(), directory, ::getuid()};
+        ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+        ASSERT_TRUE(backend.reconcile_bonds({primary_peer}));
+        ASSERT_TRUE(backend.revoke_peer(primary_peer));  // ForgetPhone: the bond is kept
+        ASSERT_TRUE(backend.reconcile_bonds({}));
+        const auto obs = backend.observe();
+        ASSERT_TRUE(obs);
+        if (GetParam() == PreBondedEnd::setup_failure) {
+            ASSERT_EQ(mock.command("fail-set"), "ok");
+            EXPECT_FALSE(backend.authorize(obs.value().handle)) << "an enrolment opened with a failing adapter";
+            ASSERT_EQ(mock.command("allow-set"), "ok");
+        } else {
+            ASSERT_TRUE(backend.authorize(obs.value().handle)) << "re-enrolment of a kept bond refused";
+            EXPECT_TRUE(peer_in(directory, "pending-removals"));
+            EXPECT_FALSE(peer_in(directory, "window-created-bonds")) << "the window claimed a pre-existing bond";
+            ASSERT_EQ(mock.command("comparison-start"), "ok");
+            std::optional<helper::PairingComparison> challenge;
+            for (int attempt = 0; attempt < 150 && !challenge; ++attempt) {
+                if (const auto value = backend.comparison()) challenge = value.value(); else std::this_thread::sleep_for(20ms);
+            }
+            ASSERT_TRUE(challenge.has_value());
+            switch (GetParam()) {
+            case PreBondedEnd::cancel: ASSERT_TRUE(backend.apply(helper::Action::close_pairing, 0)); break;
+            case PreBondedEnd::reject: ASSERT_TRUE(backend.respond_comparison({challenge->id, false})); break;
+            default:
+                // The helper stops with the window open: the durable journal is what a crash leaves.
+                journal = file_text(directory + "/pending-removals");
+                marker = std::filesystem::exists(directory + "/window-created-bonds")
+                             ? file_text(directory + "/window-created-bonds") : "";
+                break;
+            }
+        }
+        for (int attempt = 0; attempt < 5; ++attempt) backend.tick();
+        if (GetParam() != PreBondedEnd::restart) {
+            ASSERT_TRUE(backend.reconcile_bonds({}));
+            for (int attempt = 0; attempt < 5; ++attempt) backend.tick();
+            EXPECT_FALSE(peer_in(directory, "pending-removals")) << "the released entry is still journalled";
+            expect_refused_everywhere(backend, mock);
+        }
+    }
+    if (GetParam() == PreBondedEnd::restart) {
+        std::ofstream{directory + "/pending-removals", std::ios::trunc} << journal;
+        if (marker.empty()) std::filesystem::remove(directory + "/window-created-bonds");
+        else std::ofstream{directory + "/window-created-bonds", std::ios::trunc} << marker;
+        ASSERT_TRUE(peer_in(directory, "pending-removals"));
+    }
+    helper::BluezBackend restarted{bus_address, steady(), directory, ::getuid()};
+    ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+    for (int attempt = 0; attempt < 5; ++attempt) restarted.tick();
+    testing::internal::CaptureStderr();
+    const auto reconciled = restarted.reconcile_bonds({});
+    const auto log = testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(reconciled);
+    EXPECT_EQ(log.find(primary_peer.address), std::string::npos) << "the raw address was logged";
+    for (int attempt = 0; attempt < 5; ++attempt) restarted.tick();
+    EXPECT_FALSE(peer_in(directory, "pending-removals")) << "the released entry is still journalled";
+    EXPECT_TRUE(peer_in(directory, "revoked-bonds"));
+    expect_refused_everywhere(restarted, mock);
+}
+INSTANTIATE_TEST_SUITE_P(EachEnd, PreExistingBond,
+                         testing::Values(PreBondedEnd::cancel, PreBondedEnd::reject, PreBondedEnd::setup_failure,
+                                         PreBondedEnd::restart));
+// F2 (#136): journal entries an older, exclusive-adapter helper wrote (its demotion journalled the
+// removal first) carry no window-created marker. After an upgrade, with no enrolment window open,
+// none of them may lead to a Disconnect or RemoveDevice: not on ticks, reconciliation, RevokePeerV1
+// or another restart. Each is released, the bond kept, the phone refused, the address redacted.
+enum class Legacy { journal_only, journal_and_managed, journal_and_history };
+class LegacyJournal : public ManagedBonds, public testing::WithParamInterface<Legacy> {};
+TEST_P(LegacyJournal, EntryNeverRemovesABondAfterAnUpgrade) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    const auto seed = [&](const char* file) {
+        std::ofstream{directory + "/" + file} << "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n";
+        ASSERT_EQ(::chmod((directory + "/" + file).c_str(), 0600), 0);
+    };
+    seed("pending-removals");
+    if (GetParam() == Legacy::journal_and_managed) seed("managed-bonds");
+    if (GetParam() == Legacy::journal_and_history) seed("revoked-bonds");
+    ASSERT_EQ(mock.command("paired"), "ok");
+    for (int run = 0; run < 2; ++run) {
+        helper::BluezBackend backend{bus_address, steady(), directory, ::getuid()};
+        ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+        for (int attempt = 0; attempt < 5; ++attempt) backend.tick();
+        testing::internal::CaptureStderr();
+        const auto reconciled = backend.reconcile_bonds({});
+        const auto log = testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(reconciled);
+        if (run == 0) {
+            const char* warning = GetParam() == Legacy::journal_only ? "warning bond_kept_unowned_enrolment id-"
+                                                                     : "warning bond_kept_revoked_identity id-";
+            EXPECT_NE(log.find(warning), std::string::npos) << log;
+        }
+        EXPECT_EQ(log.find(primary_peer.address), std::string::npos) << "the raw address was logged";
+        for (int attempt = 0; attempt < 5; ++attempt) backend.tick();
+        (void)backend.revoke_peer(primary_peer);
+        ASSERT_TRUE(backend.reconcile_bonds({}));
+        EXPECT_FALSE(peer_in(directory, "pending-removals")) << "the legacy entry is still journalled";
+        EXPECT_FALSE(peer_in(directory, "managed-bonds")) << "an unapproved legacy bond stayed admitted";
+        expect_refused_everywhere(backend, mock);
+        if (HasFatalFailure()) return;
+    }
+}
+INSTANTIATE_TEST_SUITE_P(EachShape, LegacyJournal,
+                         testing::Values(Legacy::journal_only, Legacy::journal_and_managed, Legacy::journal_and_history));
+// The window-created marker is what keeps cleanup working for a bond an enrolment window really
+// created: an unpaired phone, then the bond forms in the window, then the enrolment is cancelled and
+// the helper restarts before the receiver answers. The marker survives the restart; the bond goes.
+TEST_F(ManagedBonds, WindowCreatedBondIsStillRemovedAfterACancelledEnrolmentAndRestart) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    {
+        helper::BluezBackend backend{bus_address, steady(), directory, ::getuid()};
+        ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+        ASSERT_TRUE(backend.reconcile_bonds({}));
+        const auto obs = backend.observe();
+        ASSERT_TRUE(obs);
+        accept_enrolment(backend, mock, obs.value().handle);
+        if (HasFatalFailure()) return;
+        EXPECT_TRUE(peer_in(directory, "window-created-bonds")) << "the window's own bond is not marked";
+        ASSERT_TRUE(backend.acknowledge_bond());
+        ASSERT_TRUE(backend.apply(helper::Action::close_pairing, 0));  // parked for the receiver's answer
+        EXPECT_EQ(removals(mock), 0U);
+    }
+    helper::BluezBackend restarted{bus_address, steady(), directory, ::getuid()};
+    ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+    ASSERT_TRUE(restarted.reconcile_bonds({}));
+    EXPECT_EQ(removals(mock), 1U) << "the window's own, unapproved bond was kept";
+    EXPECT_FALSE(peer_in(directory, "pending-removals"));
+    EXPECT_FALSE(peer_in(directory, "window-created-bonds")) << "the marker outlived its journal entry";
 }
 // An unrelated bond (no helper file names it) is never touched by reconciliation.
 TEST_F(ManagedBonds, ReconciliationNeverRemovesABondTheHelperDoesNotName) {
@@ -1267,6 +1428,9 @@ TEST_P(SlowFailingRemovals, NeverDelayAnotherPhonesEnrolmentOrReconnect) {
         }
     }
     ASSERT_EQ(::chmod((directory + "/pending-removals").c_str(), 0600), 0);
+    // Entries this helper's enrolment windows own: each window opened with no pairing (#136).
+    std::filesystem::copy_file(directory + "/pending-removals", directory + "/window-created-bonds");
+    ASSERT_EQ(::chmod((directory + "/window-created-bonds").c_str(), 0600), 0);
     ASSERT_EQ(mock.command("extra-bonds " + std::to_string(kStuck)), "ok");
     ASSERT_EQ(mock.command("fail-remove"), "ok");
     ASSERT_EQ(mock.command("slow-remove " + std::to_string(GetParam().remove_ms)), "ok");

@@ -74,7 +74,9 @@ BluezBackend::Impl::Removal BluezBackend::Impl::remove_bond(const std::vector<De
 // pending by a restarted helper. Nothing is removed before this helper run's first reconciliation
 // (any entry may be an approval whose commit never landed), an acknowledged bond awaiting the
 // receiver's answer is kept, and a bonded device the receiver approves is never removed (#74). A
-// historical managed or revoked entry never suppresses removal.
+// historical managed or revoked entry never suppresses removal. Only an entry the helper owns
+// (owns(): its window opened with no pairing of the device) is ever removed from BlueZ; any other
+// entry is released, its bond kept (shared adapter, #136).
 void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own, const std::vector<Device>* known) {
     if (!reconciled || pending.peers().empty()) return;
     if (own && !pending.contains(*own)) return;
@@ -111,10 +113,21 @@ void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own,
             // Approved, so the bond stays (#74). A revoked identity's approval is never admitted
             // without a fresh committed enrolment, so its window's journal entry is not needed (the
             // history keeps the refusal) and must not block the identity's next enrolment.
-            if (revoked.contains(peer)) (void)pending.forget(peer);
+            if (revoked.contains(peer)) (void)drop_journal(peer);
             continue;
         }
-        if (std::find(removal_done.begin(), removal_done.end(), peer) == removal_done.end()) {
+        const bool owned = owns(peer);
+        if (!owned) {
+            // Not provably created by its window: a bond that existed when the window opened, or
+            // an entry an older (exclusive-adapter) helper journalled. Released without any BlueZ
+            // call; a revoked identity is refused and reported by reconciliation instead.
+            if (bonded && !revoked.contains(peer))
+                std::cerr << "system-helper: warning bond_kept_unowned_enrolment "
+                          << diagnostics::redact_identifier(peer.address)
+                          << ": this phone was already paired in Bluetooth when its Android Auto enrolment "
+                             "opened, or was queued by an older helper; the Bluetooth adapter is shared, so its "
+                             "pairing is kept and Android Auto does not admit the phone.\n";
+        } else if (std::find(removal_done.begin(), removal_done.end(), peer) == removal_done.end()) {
             const auto removal = remove_bond(devices, peer, budget, own ? Retire::own : mode);
             if (budget.exhausted) { cursor = (first + step) % peers.size(); break; }
             if (removal == Removal::failed) cursor = (first + step + 1) % peers.size();
@@ -127,8 +140,8 @@ void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own,
         // A managed entry left by an interrupted commit is demoted before the obligation is
         // dropped, so a removed, never-admitted bond can never count as admitted later.
         if (!demote(peer)) continue;
-        (void)pending.forget(peer);
-        if (!pending.contains(peer)) {                       // gone from memory; sync retried
+        (void)drop_journal(peer);
+        if (owned && !pending.contains(peer)) {              // gone from memory; sync retried
             std::erase(removal_done, peer);
             std::erase(cleaned, peer);
             if (cleaned.size() >= 256) cleaned.erase(cleaned.begin());
@@ -166,6 +179,13 @@ bool BluezBackend::Impl::demote(const PeerIdentity& peer) {
     std::erase(refused, peer);
     return true;
 }
+bool BluezBackend::Impl::drop_journal(const PeerIdentity& peer) {
+    if (pending.contains(peer) && !pending.forget(peer)) return false;
+    // A marker left behind is no authority (owns() needs the journal entry too); reconciliation
+    // drops it, and a window that opens for an already paired device drops it first.
+    if (created.contains(peer)) (void)created.forget(peer);
+    return true;
+}
 bool BluezBackend::Impl::clear_revocation(const PeerIdentity& peer) {
     return !revoked.contains(peer) || revoked.forget(peer);
 }
@@ -193,7 +213,8 @@ bool BluezBackend::Impl::clear_revocation(const PeerIdentity& peer) {
 // durably owed; on failure the stricter state stays and the receiver retries.
 core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<PeerIdentity>& approved) {
     auto& s = *impl_;
-    if (!s.managed.valid() || !s.pending.valid() || !s.revoked.valid()) return Error{ErrorCode::helper_unavailable};
+    if (!s.managed.valid() || !s.pending.valid() || !s.revoked.valid() || !s.created.valid())
+        return Error{ErrorCode::helper_unavailable};
     if (approved.size() > SystemHelper::kMaxApprovedBonds) return Error{ErrorCode::helper_rejected};
     for (const auto& peer : approved)
         if (!address_valid(peer.address) || !address_valid(peer.adapter)) return Error{ErrorCode::helper_rejected};
@@ -219,20 +240,20 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
             // never committed after the revocation: a resurrected or stale approval, or one whose
             // window closed without acceptance. The revocation wins.
             durable = s.demote(peer) && durable;
-            if (!listed(s.refused, peer) && s.pending.contains(peer)) durable = s.pending.forget(peer) && durable;
+            if (!listed(s.refused, peer) && s.pending.contains(peer)) durable = s.drop_journal(peer) && durable;
             std::erase(s.awaiting, peer);
             ++unadmitted;
             continue;
         }
         if (s.managed.contains(peer)) {
             durable = s.managed.confirm_durable() && durable;
-            if (s.pending.contains(peer)) durable = s.pending.forget(peer) && durable;
+            if (s.pending.contains(peer)) durable = s.drop_journal(peer) && durable;
             std::erase(s.awaiting, peer);
             continue;
         }
         if (s.pending.contains(peer) && bonded(peer)) {
             // A revoked identity reaches this only with its fresh enrolment acknowledged (`awaiting`).
-            durable = s.clear_revocation(peer) && s.managed.remember(peer) && s.pending.forget(peer) && durable;
+            durable = s.clear_revocation(peer) && s.managed.remember(peer) && s.drop_journal(peer) && durable;
             std::erase(s.awaiting, peer);
             continue;
         }
@@ -248,18 +269,24 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
         // interrupted commit, is still the enrolment's cleanup below).
         durable = s.demote(peer) && durable;
     }
+    // A marker whose journal entry is gone (a crash between the two writes) is no authority: drop it.
+    for (const auto& peer : std::vector<PeerIdentity>{s.created.peers()})
+        if (!s.pending.contains(peer)) (void)s.created.forget(peer);
+    // Only the helper's own enrolment bonds are unwanted (removed); every other unapproved journal
+    // entry is released by the cleanup scan below without any BlueZ call (#136).
     for (const auto& peer : std::vector<PeerIdentity>{s.pending.peers()}) {
         if (listed(approved, peer) || live == peer) continue;
         std::erase(s.awaiting, peer);
-        if (!listed(unwanted, peer)) unwanted.push_back(peer);
+        if (s.owns(peer) && !listed(unwanted, peer)) unwanted.push_back(peer);
     }
     // The adapter is shared (docs/enrolment-ordering.md, #136): a forgotten phone that is still,
     // or again, bonded is refused (admitted() never passes a revoked identity), never removed, and
-    // a warning names its redacted address.
+    // a warning names its redacted address, whether or not the store still (stale) approves it. An
+    // identity whose fresh enrolment was admitted above has no history left; the live window's
+    // identity is that window's to decide.
     for (const auto& device : devices) {
         const auto& peer = device.identity;
-        if (!device.bonded || !s.revoked.contains(peer) || listed(approved, peer) || live == peer ||
-            listed(unwanted, peer)) continue;
+        if (!device.bonded || !s.revoked.contains(peer) || live == peer || listed(unwanted, peer)) continue;
         std::cerr << "system-helper: warning bond_kept_revoked_identity "
                   << diagnostics::redact_identifier(peer.address)
                   << ": this phone was forgotten in Android Auto but is still paired in Bluetooth; the "

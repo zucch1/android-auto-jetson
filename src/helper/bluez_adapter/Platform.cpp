@@ -25,7 +25,7 @@ constexpr auto interfaces = R"(<node>
 }
 BluezBackend::Impl::Impl(const std::string& address, Now clock, const std::string& state, std::uint32_t state_owner)
     : now(std::move(clock)), managed(state, state_owner), pending(state, state_owner, "pending-removals"),
-      revoked(state, state_owner, "revoked-bonds") {
+      created(state, state_owner, "window-created-bonds"), revoked(state, state_owner, "revoked-bonds") {
     context = g_main_context_new();
     g_main_context_push_thread_default(context);
     GError* error = nullptr;
@@ -206,10 +206,11 @@ BluezBackend::~BluezBackend() = default;
 std::string BluezBackend::state_error() const {
     if (!impl_->managed.valid()) return "managed-bonds: " + impl_->managed.reason();
     if (!impl_->pending.valid()) return "pending-removals: " + impl_->pending.reason();
+    if (!impl_->created.valid()) return "window-created-bonds: " + impl_->created.reason();
     return impl_->revoked.valid() ? std::string{} : "revoked-bonds: " + impl_->revoked.reason();
 }
 bool BluezBackend::available() const {
-    return impl_->managed.valid() && impl_->pending.valid() && impl_->revoked.valid() &&
+    return impl_->managed.valid() && impl_->pending.valid() && impl_->revoked.valid() && impl_->created.valid() &&
            impl_->bus && !g_dbus_connection_is_closed(impl_->bus);
 }
 core::Result<ObservedPeer> BluezBackend::handoff() {

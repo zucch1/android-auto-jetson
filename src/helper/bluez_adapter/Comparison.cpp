@@ -42,7 +42,7 @@ core::Result<void> BluezBackend::commit_bond() {
         impl_->allowed->device.identity != identity) return fail();
     // History first: a crash after it leaves a journalled, approved bond that reconciliation admits
     // as an interrupted commit; clearing it after the managed write could demote a genuine commit.
-    if (!impl_->clear_revocation(identity) || !impl_->managed.remember(identity) || !impl_->pending.forget(identity))
+    if (!impl_->clear_revocation(identity) || !impl_->managed.remember(identity) || !impl_->drop_journal(identity))
         return fail();
     impl_->acknowledged = false;
     std::erase(impl_->awaiting, identity);
