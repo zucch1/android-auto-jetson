@@ -368,28 +368,67 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          if [ -z "${BASE_REF:-}" ] \
+              || [[ ! "$BASE_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] \
+              || ! git check-ref-format "refs/heads/${BASE_REF}" >/dev/null 2>&1; then
+            echo "::error::Invalid or unset pull request base ref: ${BASE_REF:-<unset>}" >&2
+            exit 1
+          fi
+          remote_url=""
+          if [ -z "${GITHUB_ACTIONS+x}" ] \
+              && [ "${CI_MERGE_PARENT_TEST_MODE:-}" = "1" ] \
+              && [ -n "${CI_MERGE_PARENT_TEST_REMOTE:-}" ] \
+              && [[ "$CI_MERGE_PARENT_TEST_REMOTE" != -* ]]; then
+            remote_url="$CI_MERGE_PARENT_TEST_REMOTE"
+          else
+            if [ -z "${GITHUB_REPOSITORY:-}" ] \
+                || [[ ! "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::GITHUB_REPOSITORY is missing or invalid: ${GITHUB_REPOSITORY:-<unset>}" >&2
+              exit 1
+            fi
+            remote_url="https://github.com/${GITHUB_REPOSITORY}"
+          fi
+          ls_remote_out=""
+          if ! ls_remote_out="$(GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$remote_url" "refs/heads/${BASE_REF}")"; then
+            echo "::error::Failed to read current base tip for refs/heads/${BASE_REF} from ${remote_url}" >&2
+            exit 1
+          fi
+          current_base_tip=""
+          match_count=0
+          while IFS=$'\t' read -r sha ref; do
+            if [ "$ref" = "refs/heads/${BASE_REF}" ]; then
+              current_base_tip="$sha"
+              match_count=$((match_count + 1))
+            fi
+          done <<< "$ls_remote_out"
+          if [ "$match_count" -ne 1 ] || [[ ! "$current_base_tip" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+            echo "::error::Could not resolve unique current base tip for refs/heads/${BASE_REF} from ${remote_url} (matches=${match_count})" >&2
+            exit 1
+          fi
           actual_head="$(git rev-parse HEAD)"
           actual_p1="$(git rev-parse --verify --quiet 'HEAD^1' || true)"
           actual_p2="$(git rev-parse --verify --quiet 'HEAD^2' || true)"
           actual_p3="$(git rev-parse --verify --quiet 'HEAD^3' || true)"
           if [ -z "${EXPECTED_BASE_SHA:-}" ] || [ -z "${EXPECTED_HEAD_SHA:-}" ] \
               || [ -z "$actual_p1" ] || [ -z "$actual_p2" ] || [ -n "$actual_p3" ] \
-              || [ "$actual_p1" != "$EXPECTED_BASE_SHA" ] \
+              || { [ "$actual_p1" != "$EXPECTED_BASE_SHA" ] && [ "$actual_p1" != "$current_base_tip" ]; } \
               || [ "$actual_p2" != "$EXPECTED_HEAD_SHA" ]; then
-            echo "::error::PR merge checkout HEAD ($actual_head) does not match event base/head parents" >&2
-            echo "expected base (HEAD^1): ${EXPECTED_BASE_SHA:-<unset>}" >&2
-            echo "actual   base (HEAD^1): ${actual_p1:-<missing>}" >&2
-            echo "expected head (HEAD^2): ${EXPECTED_HEAD_SHA:-<unset>}" >&2
-            echo "actual   head (HEAD^2): ${actual_p2:-<missing>}" >&2
+            echo "::error::PR merge checkout HEAD ($actual_head) does not match event base/current base tip and head parents" >&2
+            echo "expected event base (HEAD^1): ${EXPECTED_BASE_SHA:-<unset>}" >&2
+            echo "current  base tip   (HEAD^1): ${current_base_tip}" >&2
+            echo "actual   base       (HEAD^1): ${actual_p1:-<missing>}" >&2
+            echo "expected head       (HEAD^2): ${EXPECTED_HEAD_SHA:-<unset>}" >&2
+            echo "actual   head       (HEAD^2): ${actual_p2:-<missing>}" >&2
             if [ -n "$actual_p3" ]; then
               echo "unexpected parent 3 (HEAD^3): $actual_p3" >&2
             fi
             exit 1
           fi
-          echo "Verified PR merge checkout $actual_head: HEAD^1=$actual_p1 HEAD^2=$actual_p2"
+          echo "Verified PR merge checkout $actual_head: HEAD^1=$actual_p1 (event_base=$EXPECTED_BASE_SHA, current_tip=$current_base_tip) HEAD^2=$actual_p2"
       - name: Verify provenance and dependency identities
         run: |
           set -euo pipefail

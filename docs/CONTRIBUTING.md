@@ -66,10 +66,12 @@ automatically starts a fresh CI run against the updated base/merge result instea
 stale green required checks from the previous base. Because a fresh `edited` event alone does
 not prove GitHub supplied an up-to-date synthetic PR merge checkout after a retarget,
 `ci/provenance-lint` checks out with `fetch-depth: 2` and runs a `pull_request`-only step
-immediately after checkout (before any in-tree scripts) that fails — printing both expected and
-actual SHAs — unless `HEAD` is a two-parent merge commit whose `HEAD^1` equals
-`github.event.pull_request.base.sha` and `HEAD^2` equals `github.event.pull_request.head.sha`
-(passed via `env:`). `concurrency` cancels any superseded
+immediately after checkout (before any in-tree scripts) that fails — printing expected event
+base, current base tip, expected head, and actual parent SHAs — unless `HEAD` is a two-parent
+merge commit whose `HEAD^1` equals `github.event.pull_request.base.sha` or the base branch's
+current tip (read at run time via `git ls-remote` on `github.event.pull_request.base.ref`,
+failing closed if unreadable, so a moved base is accepted when `HEAD^1` is the current base
+tip) and `HEAD^2` equals `github.event.pull_request.head.sha` (passed via `env:`). `concurrency` cancels any superseded
 in-progress run on the same PR, and required jobs never use job-level `if:` skips (a skipped
 required job counts as passing). Because GitHub also emits `edited` on title or body updates,
 a title or body edit now cancels any in-progress run and reruns CI (including the 600 s
