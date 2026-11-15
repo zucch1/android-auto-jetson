@@ -11,6 +11,49 @@ and the separate 2-hour soak on `jetson.local`.
 > **No performance or soak number is claimed until the two live runs below
 > produce result documents.** A green host test is not a live measurement.
 
+## Build
+
+Qualification and soak runs measure the deployed binaries themselves, so the
+build type is part of the measurement: **both runs require an optimized build.**
+
+```bash
+# On the Jetson (native aarch64):
+cmake --preset host-release && cmake --build --preset host-release
+# Cross build: cmake --preset jetson-aarch64
+```
+
+Never the Debug `host-dev` or `host-asan` preset. `RelWithDebInfo` is acceptable
+when a run needs symbols: it keeps optimization and only adds debug info.
+Why: on one known-good commit, Debug runs measured 173.3 ms and 142.9 ms A/V
+sync where the same commit measured 16.2 ms, 30.1 ms and 21.5 ms optimized, and
+building only the projection widget's pixel conversion unoptimized reproduced a
+106.8 ms failure against the 50 ms gate — that conversion runs on the GUI thread
+and delays paint and the 5 ms display pump.
+
+The collector enforces this: before it launches the receiver or the display it
+reads `CMAKE_BUILD_TYPE` from the `CMakeCache.txt` of the build directory named
+by `--build-dir` (or `AA_BUILD_DIR`) and refuses with `BLOCKED
+unoptimized_build` when that build is not optimized, when no build directory is
+given, or when the cache is unreadable. `Release`, `RelWithDebInfo` and
+`MinSizeRel` are the optimized types (case-insensitive). `--allow-unoptimized-build`
+exists only to debug the tooling: it prints a warning, its run is reported
+`NOT_QUALIFYING: unoptimized_build` (and never `PASS`), and it is not a
+qualification result. Record the `CMAKE_BUILD_TYPE` and the effective C++
+compiler flags (`CMAKE_CXX_FLAGS*` from the same cache) in the run report.
+
+The build directory must also be the one that produced the binaries the run
+launches. Each of `--receiver`/`--display` is accepted when it lies inside
+`--build-dir` (symlinks resolved) or is byte-identical to a binary that build
+produced; anything else is `BLOCKED build_dir_mismatch`. So either launch the
+receivers out of the build tree, or install an unchanged copy of exactly that
+build. A cross build (`jetson-aarch64`) may name the build tree on the host that
+built it: the launcher verifies that local `CMakeCache.txt`, derives each
+launched binary from the tree, and the capture records
+`build.verified_on: "host"`. Every capture and result records
+`build.build_type`, `build.build_dir`, `build.allow_unoptimized_build` and
+`build.verified_on`; keep them when copying a result into the receipt, and check
+`build.non_qualifying` is `null` before claiming a qualification run.
+
 ## Tool
 
 `tools/perf/aa-projection-perf.sh` (see `tools/perf/README.md`). It launches the
@@ -28,10 +71,10 @@ never weakened.
    AOA switch; `18d1:2d00`/`18d1:2d01` after) with Android Auto / USB debugging
    as needed, and the approved-phone trust store loaded (task 27).
 3. Display connected (positive `connected` evidence from a DRM connector status
-   **or** a connected output in `xrandr --query` on the session `DISPLAY=:1`)
-   and a PipeWire output sink
-    present (`pactl list short sinks` or `pw-cli`) — required for the audio-latency and
-   A/V-sync budgets to be meaningful.
+   **or** a connected output in `xrandr --query` on the session display named by
+   `--display-env` — see the display-session note below) and a PipeWire output
+   sink present (`pactl list short sinks` or `pw-cli`) — required for the
+   audio-latency and A/V-sync budgets to be meaningful.
    nvidia-drm may leave sysfs at `disconnected` despite a working session output;
    xrandr's positive evidence is accepted. Absent/failed probes or all sources
    disconnected provide no positive evidence and BLOCK on `display_disconnected`.
@@ -46,6 +89,27 @@ never weakened.
    `display_connected: false` and a `display_disconnected` run violation even if
    the display process survives. Missing connection evidence blocks live qualification.
 
+Display session: with GDM automatic login the owner's session is on display
+`:0`, with its X authority cookie at `/run/user/<uid>/gdm/Xauthority`. The
+launcher resolves the remote X session in this order: `--display-env
+DISPLAY[,XAUTHORITY]`, then `AA_DISPLAY`/`AA_XAUTHORITY`, then the caller's
+exported `DISPLAY`/`XAUTHORITY`; `:1` is only the fallback, and it is the display
+of a manually started second X session, not the owner's session. Qualification
+needs the display the owner's screen session is actually on, so name it
+explicitly:
+
+```bash
+tools/perf/aa-projection-perf.sh --mode wired --duration 30m \
+    --display-env ":0,/run/user/1000/gdm/Xauthority" \
+    --build-dir "$AA_BUILD_DIR" --out /tmp/task-32-perf-30m.json
+```
+
+and confirm the positive `xrandr --query` evidence comes from that session
+before starting (`--readiness-only` uses the same environment). A
+`DISPLAY`/`XAUTHORITY` value that is not a plain session path is a usage error;
+the values are embedded in the remote command, so they are never passed through
+a shell unquoted.
+
 ## Exact invocations
 
 From the development checkout (bounded ssh, fail-closed):
@@ -54,18 +118,25 @@ From the development checkout (bounded ssh, fail-closed):
 # Bound, read-only prerequisite check (safe to run anytime).
 tools/perf/aa-projection-perf.sh --readiness-only --out /tmp/task-32-readiness.json
 
-# 30-minute performance run.
+# 30-minute performance run (optimized build, see Build).
 tools/perf/aa-projection-perf.sh --mode wired --duration 30m \
+    --build-dir "$AA_BUILD_DIR" \
     --out /tmp/task-32-perf-30m.json --capture-out /tmp/task-32-capture-30m.json
 
 # Separate 2-hour soak run (fresh invocation; do not reuse the 30m capture).
 tools/perf/aa-projection-perf.sh --mode wired --duration 2h \
+    --build-dir "$AA_BUILD_DIR" \
     --out /tmp/task-32-soak-2h.json --capture-out /tmp/task-32-capture-2h.json
 ```
 
 Optional overrides: `--host` (default `jetson.local`), `--port` (default
 `1-2.1`), `--receiver` (default `/opt/aa/aa-wired-receiver`), `--display`
-(default `/opt/aa/aa-dummy-display`), `--store`, `--interval`.
+(default `/opt/aa/aa-dummy-display`), `--store`, `--interval`, `--build-dir`
+(default `AA_BUILD_DIR`), `--display-env DISPLAY[,XAUTHORITY]` (default: the
+caller's `DISPLAY`/`XAUTHORITY`, else `:1`). `--build-dir` names the build
+directory that produced the launched receiver/display — the run is BLOCKED
+without it, and BLOCKED with `build_dir_mismatch` when those binaries are not
+that build's (see Build).
 
 ### Explicit owner-approved Orin Nano thermal availability policy
 
@@ -132,8 +203,10 @@ finding. Future real CV measurements must be retained, not overridden by null.
 
 If a prerequisite is absent the tool writes a `BLOCKED` result and exits 3, with
 `blocked_on` naming the reason (`ssh_unreachable`, `receiver_binary_absent`,
-`display_disconnected`, `no_audio_sink`, `collector_failed`,
-`collector_produced_no_capture`, or `unavailable_metric:<name>`). The display or
+`display_disconnected`, `no_audio_sink`, `unoptimized_build`,
+`build_dir_mismatch`, `collector_failed`, `collector_produced_no_capture`,
+`unavailable_metric:<name>`, or `NOT_QUALIFYING: unoptimized_build` for a run
+the qualification override admitted). The display or
 phone being absent is therefore an explicit, non-zero BLOCKED outcome — never a
 green smoke.
 

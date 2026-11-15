@@ -47,10 +47,14 @@ from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Window, coverage_gaps, coverage_to_json, parse_capture, reduce_capture,
 )
 from aa_projection_collect import ProjectionProgress
+from aa_build_guard import is_optimized
 
 TASK = "32. Measure wired performance and two-hour soak"
 SCHEMA_VERSION = "aa-projection-perf/2"
 CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
+# Marker recorded on a run the build guard admitted only through its debugging
+# override: the measured values stay visible, the run is never a PASS.
+NOT_QUALIFYING_UNOPTIMIZED = "NOT_QUALIFYING: unoptimized_build"
 EVENT_METRICS = ("frame_drops", "decode_p50_ms", "decode_p95_ms", "decode_fps",
                  "decode_frames", "ipc_throughput_mbps", "ipc_p95_added_latency_ms")
 
@@ -166,6 +170,44 @@ def _load_logged_progress(capture: dict) -> dict[int, dict[str, dict]]:
             seen.add(stamp)
             logged_by_ns[stamp] = logged
     return logged_by_ns
+
+
+def _build_record(capture: dict) -> dict:
+    """The capture's build provenance, normalised for the result document.
+
+    Older captures carry no ``build`` block: they report an unknown type and no
+    build directory, never an assumed optimized build.
+    """
+    raw = capture.get("build")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ContractError("capture.build must be an object")
+    build_type = raw.get("build_type")
+    if build_type is not None and not isinstance(build_type, str):
+        raise ContractError("capture.build.build_type must be a string or null")
+    build_dir = raw.get("build_dir")
+    if build_dir is not None and not isinstance(build_dir, str):
+        raise ContractError("capture.build.build_dir must be a string or null")
+    allow_unoptimized = raw.get("allow_unoptimized_build", False)
+    if not isinstance(allow_unoptimized, bool):
+        raise ContractError("capture.build.allow_unoptimized_build must be a boolean")
+    verified_on = raw.get("verified_on") or ("target" if build_dir else "none")
+    if verified_on not in ("target", "host", "none"):
+        raise ContractError("capture.build.verified_on must be target, host or none")
+    binaries = raw.get("binaries") or {}
+    if not isinstance(binaries, dict):
+        raise ContractError("capture.build.binaries must be an object")
+    record = {
+        "build_type": build_type,
+        "build_dir": build_dir,
+        "allow_unoptimized_build": allow_unoptimized,
+        "verified_on": verified_on,
+        "non_qualifying": None,
+    }
+    if binaries:
+        record["binaries"] = binaries
+    return record
 
 
 def build_result(capture: dict, *, duration_requested: str | None, now: str,
@@ -394,6 +436,19 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         verdict = "BLOCKED"
         blocked_on = blocked_on_override
 
+    # A run the build guard admitted only through its debugging override measured
+    # something other than the qualified build, so it is never a PASS: the values
+    # stay visible, the qualification verdict does not.
+    build = _build_record(capture)
+    unoptimized_run = (build["allow_unoptimized_build"]
+                       or (build["build_type"] is not None
+                           and not is_optimized(build["build_type"])))
+    if unoptimized_run:
+        build["non_qualifying"] = NOT_QUALIFYING_UNOPTIMIZED
+        if verdict == "PASS":
+            verdict = "BLOCKED"
+            blocked_on = NOT_QUALIFYING_UNOPTIMIZED
+
     notes = [
         "decode timing is recorded informationally; the p95 <=33 ms budget is WITHDRAWN "
         "by task-9 owner sign-off and is NOT asserted by this tool",
@@ -407,6 +462,11 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
             "see run_status.interference")
     if not samples:
         notes.append("capture contained no samples; gated metrics are unavailable")
+    if unoptimized_run:
+        notes.append(
+            f"{NOT_QUALIFYING_UNOPTIMIZED}: the build guard was overridden, so the measured "
+            "values are informational and this run is not a qualification result; "
+            "re-run against an optimized build")
     if evidence.thermal_policy is not None:
         notes.append("Nano-specific owner-approved CV availability exception; not full-all-zone thermal qualification. "
                      "CV nulls mean unavailable, not measured temperatures; cause unproven. "
@@ -436,6 +496,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         "violations": violations,
         "provenance": provenance,
         "notes": notes,
+        "build": build,
     }
     if evidence.thermal_policy is not None:
         result["thermal_policy"] = asdict(evidence.thermal_policy)

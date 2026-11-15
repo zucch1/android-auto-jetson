@@ -20,6 +20,12 @@ The capture is the raw record; budget verdicts are produced by
 ``aa_perf_report.py``. A metric the collector cannot observe is emitted as
 ``null`` -- never faked. Every subprocess wait is bounded.
 
+A live qualification stage is refused before anything is launched unless the
+build directory that produced the binaries proves an optimized build (see
+``aa_build_guard.py``): a Debug build delays GUI-thread paint and the display
+pump enough to fail the A/V gate on its own. ``--allow-unoptimized-build`` is a
+debugging override only.
+
 This tool does not modify target state (no installs, no udev, no kernel
 changes); it only launches the supplied binaries and reads procfs/sysfs.
 """
@@ -48,6 +54,10 @@ from typing import Literal
 from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
 from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Sample, ThermalZone, VideoEvidence, thermal_policy_for_model,
+)
+from aa_build_guard import (
+    BINARY_REFUSAL_PREFIX, BuildDirMismatchError, BuildGuardError, REFUSAL_PREFIX,
+    describe_build, require_optimized_build, require_optimized_type, verify_launched_binaries,
 )
 
 CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
@@ -615,7 +625,24 @@ def _terminate(proc: subprocess.Popen | None) -> Literal["clean", "forced_kill",
     return "clean"
 
 
-def collect(args: argparse.Namespace) -> dict:
+def build_record(args: argparse.Namespace, build_type: str | None = None,
+                 verified_on: str | None = None,
+                 binaries: Mapping[str, dict] | None = None) -> dict:
+    """The capture's ``build`` block: what was measured, and how it was verified."""
+    build_dir = getattr(args, "build_dir", None)
+    record = {
+        "build_type": build_type,
+        "build_dir": str(build_dir) if build_dir else None,
+        "allow_unoptimized_build": bool(getattr(args, "allow_unoptimized_build", False)),
+        "verified_on": verified_on if verified_on is not None else
+        ("target" if build_dir else "none"),
+    }
+    if binaries:
+        record["binaries"] = binaries
+    return record
+
+
+def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     selected_policy = getattr(args, "thermal_policy", "strict-all-zones")
     hardware = _target_hardware_state() if selected_policy != "strict-all-zones" else None
     thermal_policy = thermal_policy_for_model(selected_policy, hardware.get("model") if hardware else None)
@@ -841,6 +868,10 @@ def collect(args: argparse.Namespace) -> dict:
         "video_telemetry": video_telemetry,
         "target_hardware_state": hardware if hardware is not None else _target_hardware_state(),
     }
+    # Provenance of the measured binaries: the build type the guard verified, the
+    # build directory it checked and whether the qualification override was used,
+    # so no run can be read as a qualification result it is not.
+    capture["build"] = build if build is not None else build_record(args)
     if thermal_policy is not None:
         capture["thermal_policy"] = asdict(thermal_policy)
     return capture
@@ -863,6 +894,15 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--startup-timeout-seconds", type=int,
                         default=_PROJECTION_STARTUP_TIMEOUT_SECONDS,
                         help="startup timeout, may only shorten the default 60-second grace")
+    parser.add_argument("--build-dir", default=os.environ.get("AA_BUILD_DIR"),
+                        help="build directory (CMakeCache.txt) that produced the launched binaries; "
+                             "required for a live qualification stage")
+    parser.add_argument("--build-dir-verified-locally", default=None, metavar="BUILD_TYPE",
+                        help="cross build: the host that built the binaries already verified "
+                             "--build-dir and derived the launched binaries from it, so this "
+                             "target must not re-read a path it cannot see")
+    parser.add_argument("--allow-unoptimized-build", action="store_true",
+                        help="debugging override: start even without an optimized build")
     args = parser.parse_args(argv)
 
     if args.duration_seconds <= 0:
@@ -875,10 +915,57 @@ def _cli(argv: list[str]) -> int:
         print("error: --interval must be positive", file=sys.stderr)
         return 2
 
+    # The build guard runs here, before collect() launches the receiver or the
+    # display: an unoptimized build is refused instead of being measured.
+    host_verified = args.build_dir_verified_locally
+    if host_verified is not None:
+        # Cross build: the build tree lives on the host that built these
+        # binaries, so the target cannot read its cache; the host verified it and
+        # the value is recorded as such (never as a target-verified build).
+        if not (args.build_dir and str(args.build_dir).strip()):
+            print("error: --build-dir-verified-locally requires --build-dir", file=sys.stderr)
+            return 2
+        if not re.fullmatch(r"[A-Za-z0-9_+.-]+", host_verified):
+            print("error: --build-dir-verified-locally must name a CMAKE_BUILD_TYPE value",
+                  file=sys.stderr)
+            return 2
+        try:
+            build_type = require_optimized_type(
+                host_verified, allow_unoptimized=args.allow_unoptimized_build,
+                source=f"{args.build_dir} (verified on the host that built the binaries)")
+        except BuildGuardError as exc:
+            print(f"{REFUSAL_PREFIX} {exc}", file=sys.stderr)
+            return 2
+        build = build_record(args, build_type, verified_on="host")
+    else:
+        try:
+            build_type = require_optimized_build(
+                args.build_dir, allow_unoptimized=args.allow_unoptimized_build)
+        except BuildGuardError as exc:
+            print(f"{REFUSAL_PREFIX} {exc}", file=sys.stderr)
+            return 2
+        binaries: dict[str, dict] = {}
+        if args.build_dir and str(args.build_dir).strip():
+            # Tie the binaries that will actually be launched to the build that
+            # was just verified: another build's binaries must not run here.
+            try:
+                binaries = verify_launched_binaries(args.build_dir, {
+                    "receiver": args.receiver,
+                    "display": None if args.no_display else args.display,
+                })
+            except BuildDirMismatchError as exc:
+                print(f"{BINARY_REFUSAL_PREFIX} {exc}", file=sys.stderr)
+                return 2
+        build = build_record(args, build_type, binaries=binaries)
+    # The capture is stdout, so the run-report record goes to stderr.
+    print(describe_build(args.build_dir, build_type), file=sys.stderr)
+    for role, entry in sorted(build.get("binaries", {}).items()):
+        print(f"build binary: {role} {entry['verified']} {entry['build_path']}", file=sys.stderr)
+
     old_handler = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(3))
     try:
-        capture = collect(args)
+        capture = collect(args, build=build)
     except CoverageError as exc:
         print(f"contract violation: {exc}", file=sys.stderr)
         return 4

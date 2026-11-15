@@ -4,7 +4,7 @@
   "title": "Wired active-window measurement result v2",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "task", "generated_at_utc", "mode", "duration_seconds", "verdict", "crashes", "budgets", "metrics", "thermal_state", "measurement_coverage", "violations", "provenance", "notes", "measurement_origin", "qualification_status", "named_gaps", "provenance_gaps", "invalid_telemetry", "run_status"],
+  "required": ["schema", "task", "generated_at_utc", "mode", "duration_seconds", "verdict", "crashes", "budgets", "metrics", "thermal_state", "measurement_coverage", "violations", "provenance", "notes", "measurement_origin", "qualification_status", "named_gaps", "provenance_gaps", "invalid_telemetry", "run_status", "build"],
   "properties": {
     "schema": {"const": "aa-projection-perf/2"},
     "task": {"type": "string", "minLength": 1},
@@ -62,7 +62,19 @@
     "provenance": {"$ref": "#/$defs/provenance"},
     "capture": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"],
       "properties": {"path": {"type": ["string", "null"]}, "sha256": {"type": ["string", "null"]}}},
-    "notes": {"$ref": "#/$defs/strings"}
+    "notes": {"$ref": "#/$defs/strings"},
+    "build": {
+      "type": "object", "additionalProperties": false,
+      "required": ["build_type", "build_dir", "allow_unoptimized_build", "verified_on", "non_qualifying"],
+      "properties": {
+        "build_type": {"type": ["string", "null"]},
+        "build_dir": {"type": ["string", "null"]},
+        "allow_unoptimized_build": {"type": "boolean"},
+        "verified_on": {"enum": ["target", "host", "none"]},
+        "non_qualifying": {"type": ["string", "null"]},
+        "binaries": {"type": "object", "additionalProperties": {"type": "object"}}
+      }
+    }
   },
   "$defs": {
     "count": {"type": "integer", "minimum": 0},

@@ -56,7 +56,9 @@ def finite(tmp: Path) -> None:
                                "--receiver", str(ROOT / "tests/perf/fixtures/wired_perf/fake_receiver.py"),
                                 "--port", "fixture", "--no-display", "--duration-seconds", "1",
                                 "--startup-timeout-seconds", "1",
-                               "--interval", "0.1", "--state-dir", str(tmp / ("raw-" + token))],
+                               "--interval", "0.1", "--state-dir", str(tmp / ("raw-" + token)),
+                               # Synthetic receiver is not a CMake build: skip the build guard.
+                               "--allow-unoptimized-build"],
                               env=env, capture_output=True, text=True, timeout=15)
         assert proc.returncode == 0, proc.stderr
         collected = json.loads(proc.stdout)
@@ -231,7 +233,9 @@ while True: time.sleep(0.01)
                            "--receiver", str(receiver), "--port", "fixture", "--no-display",
                            "--duration-seconds", "1", "--interval", "0.1",
                            "--startup-timeout-seconds", "1",
-                           "--state-dir", str(tmp / "state")], capture_output=True, text=True, timeout=15)
+                           "--state-dir", str(tmp / "state"),
+                           # Synthetic receiver is not a CMake build: skip the build guard.
+                           "--allow-unoptimized-build"], capture_output=True, text=True, timeout=15)
     assert proc.returncode == 0, proc.stderr
     capture = json.loads(proc.stdout)
     assert capture["events"]["av_sync_ms"] is None, capture

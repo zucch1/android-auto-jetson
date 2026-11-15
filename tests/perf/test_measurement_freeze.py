@@ -209,7 +209,9 @@ def test_real_cli_shutdown() -> None:
             command = [sys.executable, "-B", str(ROOT / "tools/perf/aa_projection_collect.py"),
                        "--receiver", str(receiver), "--port", "synthetic-host", "--no-display",
                        "--duration-seconds", "1", "--startup-timeout-seconds", "1",
-                       "--interval", "0.1", "--state-dir", tmp]
+                       "--interval", "0.1", "--state-dir", tmp,
+                       # Synthetic fixture receiver, not a CMake build: skip the build guard.
+                       "--allow-unoptimized-build"]
             # When the real CLI reaches cutoff and sends SIGTERM, it must reap the child.
             with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
                 try:
@@ -219,7 +221,13 @@ def test_real_cli_shutdown() -> None:
                     proc.communicate(timeout=12)
                     raise
             assert proc.returncode == 0, stderr
-            assert not stderr, stderr
+            # The synthetic receiver is not a CMake build, so the build guard's
+            # override notice and its build record are the only expected stderr
+            # lines; no other diagnostics may appear.
+            noise = [line for line in stderr.splitlines()
+                     if not line.startswith(("warning: unoptimized_build:",
+                                             "build: CMAKE_BUILD_TYPE="))]
+            assert not noise, noise
             capture = json.loads(stdout)
             doc = helper.result(capture, "1s")
             log = [json.loads(line) for line in (Path(tmp) / "receiver.log").read_text().splitlines()]
