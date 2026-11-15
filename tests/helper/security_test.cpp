@@ -1192,18 +1192,25 @@ TEST_F(ManagedBonds, AcknowledgedReEnrolmentOfARevokedIdentityIsAdmittedOnReconc
     EXPECT_TRUE(backend.reconnect_peer(obs.value().handle));
 }
 
-// #118: several helper-named bonds whose BlueZ removal is slow (past the 150 ms call timeout) and
-// failing while another phone enrols, is committed and reconnects. Every call, and the periodic
-// tick the service runs before it, stays inside the receiver's deadlines (500 ms reconciliation,
-// 1 s otherwise); reconciliation and the confirm/reconnect paths make no removal attempt for the
-// failing identities once they are backing off; each tick makes at most the budgeted attempts;
-// and every removal completes once BlueZ recovers.
+// #118: several helper-named bonds whose BlueZ removal is slow (Disconnect, RemoveDevice or both
+// past the 150 ms call timeout) and failing while another phone enrols, is committed and
+// reconnects. Every call, and the periodic tick the service runs before it on the same owner
+// thread (a reconciliation that arrives mid-tick waits for it), stays inside the receiver's
+// deadlines (500 ms reconciliation, 1 s otherwise): the tick's and the call's BlueZ cleanup each
+// share one deadline, so their sum does too. Reconciliation and the confirm/reconnect paths make no
+// removal attempt for the failing identities once they are backing off; each tick makes at most
+// the budgeted attempts; and every removal completes once BlueZ recovers.
 std::size_t state_number(MockBluez& mock, const char* key) {
     const auto state = mock.command("state");
     const auto at = state.find(std::string{"\""} + key + "\": ");
     return at == std::string::npos ? 0U : std::stoul(state.substr(at + std::string{key}.size() + 4));
 }
-TEST_F(ManagedBonds, SlowFailingRemovalsNeverDelayAnotherPhonesEnrolmentOrReconnect) {
+struct SlowBluez { int remove_ms, disconnect_ms; };
+void PrintTo(const SlowBluez& value, std::ostream* out) {
+    *out << "RemoveDevice " << value.remove_ms << " ms, Disconnect " << value.disconnect_ms << " ms";
+}
+class SlowFailingRemovals : public ManagedBonds, public testing::WithParamInterface<SlowBluez> {};
+TEST_P(SlowFailingRemovals, NeverDelayAnotherPhonesEnrolmentOrReconnect) {
     using namespace std::chrono_literals;
     using Clock = std::chrono::steady_clock;
     const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
@@ -1222,7 +1229,8 @@ TEST_F(ManagedBonds, SlowFailingRemovalsNeverDelayAnotherPhonesEnrolmentOrReconn
     ASSERT_EQ(::chmod((directory + "/pending-removals").c_str(), 0600), 0);
     ASSERT_EQ(mock.command("extra-bonds " + std::to_string(kStuck)), "ok");
     ASSERT_EQ(mock.command("fail-remove"), "ok");
-    ASSERT_EQ(mock.command("slow-remove"), "ok");
+    ASSERT_EQ(mock.command("slow-remove " + std::to_string(GetParam().remove_ms)), "ok");
+    ASSERT_EQ(mock.command("slow-disconnect " + std::to_string(GetParam().disconnect_ms)), "ok");
     // Backoff follows the helper's injected clock; the test skips it once BlueZ recovers.
     auto offset = std::make_shared<std::atomic<std::int64_t>>(0);
     helper::BluezBackend backend{bus_address, [offset] { return Clock::now() + std::chrono::milliseconds{offset->load()}; },
@@ -1249,6 +1257,7 @@ TEST_F(ManagedBonds, SlowFailingRemovalsNeverDelayAnotherPhonesEnrolmentOrReconn
         auto result = call();
         const auto spent = elapsed(started);
         EXPECT_LT(waited + spent, deadline) << name << ": " << waited << " ms tick + " << spent << " ms call";
+        std::cout << "LATENCY " << name << " tick=" << waited << " call=" << spent << " total=" << waited + spent << " ms\n";
         EXPECT_LE(state_number(mock, "remove_attempts") - attempts, others) << name << " waited on other removals";
         return result;
     };
@@ -1256,6 +1265,9 @@ TEST_F(ManagedBonds, SlowFailingRemovalsNeverDelayAnotherPhonesEnrolmentOrReconn
     // First reconciliation: every stuck bond is owed durably, at most the budget is attempted.
     ASSERT_TRUE(rpc("first reconcile", 500, 2, [&] { return backend.reconcile_bonds({}); }));
     EXPECT_EQ(state_number(mock, "extras"), static_cast<std::size_t>(kStuck));
+    // A reconciliation queued behind a tick that is still working through due removals: the
+    // tick's and the reconciliation's BlueZ calls together stay inside the 500 ms deadline.
+    ASSERT_TRUE(rpc("second reconcile", 500, 2, [&] { return backend.reconcile_bonds({}); }));
     // The ticks work through the journal round-robin until every stuck bond has failed once.
     for (int round = 0; round < 64 && state_number(mock, "remove_attempts") < static_cast<std::size_t>(kStuck); ++round) {
         tick();
@@ -1318,8 +1330,17 @@ TEST_F(ManagedBonds, SlowFailingRemovalsNeverDelayAnotherPhonesEnrolmentOrReconn
     EXPECT_EQ(file_text(directory + "/pending-removals").find("02:00:00:00:01:"), std::string::npos);
     EXPECT_EQ(mock.command("state").find("dev_02_00_00_00_00_01\""), std::string::npos) << "the enrolled phone was removed";
     EXPECT_TRUE(peer_in(directory, "managed-bonds"));
+    // Coarse guard (scheduling noise included): the tick's cleanup deadline is 100 ms.
+    EXPECT_LT(worst_tick, 400) << "a tick's BlueZ cleanup overran its deadline";
     std::cout << "worst tick " << worst_tick << " ms\n";
 }
+INSTANTIATE_TEST_SUITE_P(ManagedBonds, SlowFailingRemovals,
+                         testing::Values(SlowBluez{400, 0}, SlowBluez{0, 400}, SlowBluez{200, 200},
+                                         SlowBluez{400, 400}),
+                         [](const testing::TestParamInfo<SlowBluez>& info) {
+                             return "Remove" + std::to_string(info.param.remove_ms) + "msDisconnect" +
+                                    std::to_string(info.param.disconnect_ms) + "ms";
+                         });
 
 TEST(HelperOwner, NonRootOwnerIsRefusedBeforeAnyHelperCall) {
     if (::getuid() == 0) GTEST_SKIP() << "requires non-root bus owner";

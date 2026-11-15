@@ -34,17 +34,12 @@ BluezBackend::Impl::Removal BluezBackend::Impl::remove_bond(const std::vector<De
         (mode == Retire::first || (mode == Retire::tick && now() < retry->next)))
         return Removal::deferred;
     if (budget.exhausted || budget.attempts >= kRemovalAttemptBudget ||
-        (budget.attempts > 0 && Clock::now() - budget.started >= kRemovalTimeBudget)) {
+        budget.remaining() < kRemovalMinimumAttempt.count()) {
         budget.exhausted = true;
         return Removal::deferred;
     }
     ++budget.attempts;
-    for (const auto& device : devices) {
-        if (device.identity != peer) continue;
-        disconnect(device);
-        auto* reply = call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
-                           g_variant_new("(o)", device.path.c_str()));
-        if (reply) { g_variant_unref(reply); continue; }
+    const auto back_off = [&] {
         // Backed off from the failed attempt's completion: 1 s, doubling to 30 s.
         auto item = std::find_if(removal_retries.begin(), removal_retries.end(),
                                  [&](const RemovalRetry& entry) { return entry.peer == peer; });
@@ -57,6 +52,19 @@ BluezBackend::Impl::Removal BluezBackend::Impl::remove_bond(const std::vector<De
         const auto delay = std::chrono::seconds{1U << std::min<std::uint32_t>(item->failures - 1, 5)};
         item->next = now() + std::min<Clock::duration>(delay, std::chrono::seconds{30});
         return Removal::failed;
+    };
+    for (const auto& device : devices) {
+        if (device.identity != peer) continue;
+        // Disconnect gets at most half of what is left, so a slow Disconnect cannot starve the
+        // RemoveDevice that follows; RemoveDevice gets the rest, never past the deadline. An attempt
+        // that runs out of time is a failed one (backed off); the obligation stays durable.
+        disconnect(device, budget.remaining() / 2);
+        const int left = budget.remaining();
+        if (left <= 0) return back_off();
+        auto* reply = call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice",
+                           g_variant_new("(o)", device.path.c_str()), nullptr, left);
+        if (!reply) return back_off();
+        g_variant_unref(reply);
     }
     std::erase_if(removal_retries, [&](const RemovalRetry& entry) { return entry.peer == peer; });
     return Removal::gone;
@@ -70,6 +78,8 @@ BluezBackend::Impl::Removal BluezBackend::Impl::remove_bond(const std::vector<De
 void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own, const std::vector<Device>* known) {
     if (!reconciled || pending.peers().empty()) return;
     if (own && !pending.contains(*own)) return;
+    // Not even one attempt fits before this invocation's deadline: no BlueZ call at all.
+    if (RemovalBudget{*this}.remaining() < kRemovalMinimumAttempt.count()) return;
     if (!known && mode == Retire::tick) {
         // Nothing due (every entry parked, live or backing off): no BlueZ call at all this tick.
         const auto due = std::any_of(pending.peers().begin(), pending.peers().end(), [&](const PeerIdentity& peer) {
@@ -86,7 +96,7 @@ void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own,
         known = &fetched;
     }
     const auto& devices = *known;
-    RemovalBudget budget;
+    RemovalBudget budget{*this};
     const auto peers = pending.peers();  // forget() rewrites the list
     const std::size_t first = removal_cursor % peers.size();
     std::size_t cursor = first;
@@ -186,6 +196,8 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
     if (approved.size() > SystemHelper::kMaxApprovedBonds) return Error{ErrorCode::helper_rejected};
     for (const auto& peer : approved)
         if (!address_valid(peer.address) || !address_valid(peer.adapter)) return Error{ErrorCode::helper_rejected};
+    // Every removal of this reconciliation (window closes included) shares one deadline from here.
+    const Impl::CleanupScope scope{s};
     s.drain_events();
     if (!s.current_owner()) return Error{ErrorCode::helper_unavailable};
     std::vector<Impl::Device> devices;
@@ -268,7 +280,7 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
         // A failed write keeps the stricter state: an unwanted bond is still disconnected and
         // removed (best effort, same budget) whether or not its obligation was recorded, and the
         // reconciliation fails so the receiver retries.
-        Impl::RemovalBudget budget;
+        Impl::RemovalBudget budget{s};
         for (const auto& peer : unwanted) {
             (void)s.remove_bond(devices, peer, budget, Impl::Retire::first);
             if (budget.exhausted) break;

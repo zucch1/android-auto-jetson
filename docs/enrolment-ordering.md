@@ -66,9 +66,14 @@ write failed) fails the reconciliation and the receiver retries.
 A slow or failing BlueZ must not hold the helper's single owner thread past the receiver's
 deadlines (500 ms for `ReconcileBondsV1`, 1 s for confirm, reconnect and the other calls),
 nor make one phone's stuck removal delay another phone's enrolment (#118). So every
-invocation that removes bonds is budgeted: at most two `RemoveDevice` attempts, a second one
-started only while the invocation has spent under 100 ms (each BlueZ call is bounded at
-150 ms). A failed attempt backs its identity off exponentially from the attempt's
+invocation that removes bonds is budgeted: at most two removal attempts, and every
+`Device1.Disconnect` and `Adapter1.RemoveDevice` of the invocation shares one deadline, 100 ms
+after the invocation (the tick, the reconciliation, or the request whose window closes) started.
+Each call gets only the time left (Disconnect at most half of it, so RemoveDevice is never
+starved), and no attempt starts with under 30 ms left. The service runs the periodic tick and
+the calls on one owner thread, so a reconciliation that arrives mid-tick waits for that tick; with
+both bounded, tick plus reconciliation stays near 200 ms of BlueZ time however slow BlueZ is. An
+attempt that fails or runs out of time backs its identity off exponentially from the attempt's
 completion (1 s, doubling to 30 s), and a round-robin cursor over `pending-removals` keeps one
 identity from starving the rest. Who may attempt what:
 
