@@ -189,6 +189,10 @@ class WiredSession final {
     [[nodiscard]] core::Result<void>
     send_channel_payload(protocol::ChannelRole role, std::vector<std::byte> payload);
 
+    [[nodiscard]] bool video_projecting() const noexcept;
+    [[nodiscard]] std::optional<protocol::VideoProfile> selected_video_profile() const noexcept;
+    [[nodiscard]] core::Result<void> request_video_idr();
+
     // Observed counters (diagnostics/tests). The negotiation counters
     // (channel_opens, version_responses, pings_answered, encapsulated_ssls,
     // auth_completes, unhandled_controls) are PER-LINK: attach_transport() zeroes them with the

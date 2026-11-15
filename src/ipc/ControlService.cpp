@@ -38,6 +38,7 @@ void ControlService::teardown(std::string_view reason, DiagnosticSeverity severi
     registered_.reset();
     open_pairing_.reset();
     viewport_.reset();
+    idr_recovery_requested_.store(false);
     events_.emit(StateChanged{ProjectionState::stopped, core::ConsumerId{}});
     events_.emit(DiagnosticEmitted{severity, reason, consumer.value});
 }
@@ -210,8 +211,27 @@ core::Result<void> ControlService::stop_projection(const BusName& caller) {
         return Error{ErrorCode::session_illegal_transition};
     }
     projection_ = ProjectionState::stopped;
+    idr_recovery_requested_.store(false);
     events_.emit(StateChanged{ProjectionState::stopped, active.value().consumer});
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "projection_stopped",
+                                   active.value().consumer.value});
+    return {};
+}
+
+core::Result<void> ControlService::request_idr_recovery(const BusName& caller) {
+    const auto active = require_consumer();
+    if (!active.has_value()) {
+        return active.error();
+    }
+    const auto admitted = admit(caller, active.value());
+    if (!admitted.has_value()) {
+        return admitted.error();
+    }
+    if (projection_ != ProjectionState::projecting) {
+        return Error{ErrorCode::session_illegal_transition};
+    }
+    idr_recovery_requested_.store(true);
+    events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "idr_recovery_requested",
                                    active.value().consumer.value});
     return {};
 }

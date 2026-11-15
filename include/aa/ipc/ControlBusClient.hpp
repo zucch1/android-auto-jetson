@@ -57,6 +57,7 @@ public:
     [[nodiscard]] core::Result<void> unregister_consumer();
     [[nodiscard]] core::Result<void> start_projection();
     [[nodiscard]] core::Result<void> stop_projection();
+    [[nodiscard]] core::Result<void> request_idr_recovery();
     [[nodiscard]] core::Result<void> set_display_viewport(Viewport viewport);
     [[nodiscard]] core::Result<StateSnapshot> get_state();
     [[nodiscard]] core::Result<std::uint64_t> ping();

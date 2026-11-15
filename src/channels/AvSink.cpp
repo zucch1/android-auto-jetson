@@ -78,6 +78,19 @@ bool AvSink::input_focus_allowed() const noexcept {
         && focus_ == protocol::VideoFocusMode::projected;
 }
 
+bool AvSink::video_projecting() const noexcept {
+    return service_.role == protocol::ChannelRole::video && ready_ && session_.has_value()
+        && (focus_ == protocol::VideoFocusMode::projected
+            || focus_ == protocol::VideoFocusMode::projected_no_input_focus);
+}
+
+core::Result<void> AvSink::request_video_idr() {
+    if (!video_projecting()) {
+        return Error{ErrorCode::session_illegal_transition};
+    }
+    return send(protocol::encode(protocol::VideoFocusNotification{focus_, true}));
+}
+
 core::Result<void> AvSink::setup(std::span<const std::byte> payload) {
     constexpr protocol::AvSinkCodec codecs[] = {protocol::AvSinkCodec::pcm, protocol::AvSinkCodec::h264, protocol::AvSinkCodec::h265, protocol::AvSinkCodec::vp9, protocol::AvSinkCodec::av1};
     const auto request = protocol::decode_av_sink_setup_for_codecs(payload, codecs);

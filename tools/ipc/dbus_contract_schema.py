@@ -39,6 +39,7 @@ METHODS: Final[dict[str, tuple[str, str]]] = {
     "Ping": ("", "t"),
     "GetPairingComparison": ("t", "a{ss}"),
     "RespondPairingComparison": ("ttb", ""),
+    "RequestIdrRecovery": ("", ""),
 }
 # name -> full signal argument signature
 SIGNALS: Final[dict[str, str]] = {

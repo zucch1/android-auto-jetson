@@ -36,6 +36,16 @@ inline constexpr std::size_t kMaxDatagramPayload = 16UL * 1024;
 inline constexpr std::size_t kMaxAccessUnitBytes = 4UL * 1024 * 1024;
 inline constexpr std::size_t kFrameHeaderBytes = 56;
 inline constexpr int kSocketBudgetBytes = 256 * 1024;
+inline constexpr std::uint32_t kMinSocketBufferBytes = 256U * 1024U;
+inline constexpr std::uint32_t kMaxSocketBufferBytes = 4U * 1024U * 1024U;
+
+struct SocketBufferResult final {
+    std::uint32_t requested_bytes{};
+    std::uint32_t granted_bytes{};
+
+    [[nodiscard]] friend constexpr bool operator==(const SocketBufferResult&,
+                                                   const SocketBufferResult&) noexcept = default;
+};
 
 // Protocol version carried in every record (task-10 layout, header offset 4).
 // A record with a different version is rejected protocol_version_mismatch.
@@ -141,5 +151,8 @@ negotiate_limits(const NegotiatedLimits& local, const NegotiatedLimits& peer) no
 // transport_unauthorized_peer on any mismatch.
 [[nodiscard]] core::Result<PeerCredentials>
 authorize_peer(const PeerCredentials& peer, std::uint32_t expected_uid) noexcept;
+
+[[nodiscard]] std::uint32_t
+recommended_socket_buffer_bytes(const protocol::VideoProfile& profile) noexcept;
 
 } // namespace aa::ipc

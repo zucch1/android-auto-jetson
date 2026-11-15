@@ -524,3 +524,86 @@ TEST(VideoStream, ConcurrentConsumersAreIndependent) {
     ::rmdir((runtime + "/android-auto-receiver").c_str());
     ::rmdir(runtime.c_str());
 }
+
+TEST(VideoChannel, RecommendedSocketBufferScalesWithProfileAndClampsToBounds) {
+    using aa::ipc::kMaxSocketBufferBytes;
+    using aa::ipc::kMinSocketBufferBytes;
+    using aa::ipc::recommended_socket_buffer_bytes;
+    using aa::protocol::VideoCodec;
+    using aa::protocol::VideoProfile;
+
+    const auto low = recommended_socket_buffer_bytes(VideoProfile{800, 480, 30, VideoCodec::h264});
+    EXPECT_EQ(low, kMinSocketBufferBytes);
+
+    const auto p720 = recommended_socket_buffer_bytes(VideoProfile{1280, 720, 30, VideoCodec::h264});
+    EXPECT_GE(p720, kMinSocketBufferBytes);
+    EXPECT_LE(p720, kMaxSocketBufferBytes);
+
+    const auto p1080 = recommended_socket_buffer_bytes(VideoProfile{1920, 1080, 60, VideoCodec::h264});
+    EXPECT_GT(p1080, p720);
+    EXPECT_LT(p1080, kMaxSocketBufferBytes);
+
+    const auto p4k = recommended_socket_buffer_bytes(VideoProfile{3840, 2160, 60, VideoCodec::h265});
+    EXPECT_EQ(p4k, kMaxSocketBufferBytes);
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    const auto send_sized =
+        pair.value().producer.configure_send_buffer(VideoProfile{1920, 1080, 60, VideoCodec::h264});
+    ASSERT_TRUE(send_sized);
+    EXPECT_EQ(send_sized.value().requested_bytes, p1080);
+    EXPECT_GT(send_sized.value().granted_bytes, 0);
+
+    const auto recv_sized =
+        pair.value().consumer.configure_receive_buffer(VideoProfile{1920, 1080, 60, VideoCodec::h264});
+    ASSERT_TRUE(recv_sized);
+    EXPECT_EQ(recv_sized.value().requested_bytes, p1080);
+    EXPECT_GT(recv_sized.value().granted_bytes, 0);
+
+    pair.value().producer.close();
+    EXPECT_FALSE(pair.value().producer.configure_send_buffer(VideoProfile{1280, 720, 30}).has_value());
+}
+
+TEST(VideoChannel, ProducerWaitingIdrTracksBackpressureAndResetsOnIdr) {
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    EXPECT_FALSE(pair.value().producer.waiting_idr());
+
+    const int small_buf = 32768;
+    ASSERT_EQ(::setsockopt(pair.value().producer.native_handle(), SOL_SOCKET, SO_SNDBUF,
+                           &small_buf, sizeof(small_buf)), 0);
+    ASSERT_EQ(::setsockopt(pair.value().consumer.native_handle(), SOL_SOCKET, SO_RCVBUF,
+                           &small_buf, sizeof(small_buf)), 0);
+
+    std::vector<std::uint8_t> chunk(16384, 0x22);
+    aa::ipc::SendStatus status = aa::ipc::SendStatus::sent;
+    std::uint64_t frame = 1;
+    for (int i = 0; i < 128 && status == aa::ipc::SendStatus::sent; ++i) {
+        const auto sent = pair.value().producer.send_access_unit(
+            {frame, frame * 1000, frame == 1, chunk, std::nullopt});
+        ASSERT_TRUE(sent) << aa::to_string(sent.error().code());
+        status = sent.value();
+        ++frame;
+    }
+    ASSERT_EQ(status, aa::ipc::SendStatus::dropped_backpressure);
+    EXPECT_TRUE(pair.value().producer.waiting_idr());
+
+    const auto still_waiting = pair.value().producer.send_access_unit(
+        {frame++, frame * 1000, false, std::vector<std::uint8_t>{0x00, 0x00, 0x01, 0x41}, std::nullopt});
+    ASSERT_TRUE(still_waiting);
+    EXPECT_EQ(still_waiting.value(), aa::ipc::SendStatus::dropped_waiting_idr);
+    EXPECT_TRUE(pair.value().producer.waiting_idr());
+
+    for (;;) {
+        const auto got = pair.value().consumer.receive(aa::core::Milliseconds{0});
+        if (!got) {
+            break;
+        }
+    }
+
+    const auto recovered = pair.value().producer.send_access_unit(
+        {frame++, frame * 1000, true, std::vector<std::uint8_t>{0x00, 0x00, 0x01, 0x65}, std::nullopt});
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(recovered.value(), aa::ipc::SendStatus::sent);
+    EXPECT_FALSE(pair.value().producer.waiting_idr());
+}

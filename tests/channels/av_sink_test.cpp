@@ -642,3 +642,50 @@ TEST_F(AvSinkWire, SetupAndStartAcceptMoreThanEightAnnouncedProfilesAndIndexAtOr
     ASSERT_TRUE(call(data()));
     EXPECT_EQ(raw.header.video_profile, profiles[9]);
 }
+
+TEST_F(AvSinkWire, RequestVideoIdrResendsProjectedVideoFocusNotificationOnlyWhenProjecting) {
+    auto descriptor = video();
+    std::get<p::VideoConfiguration>(descriptor.configuration).profiles = {
+        {1920, 1080, 60, p::VideoCodec::h264}, {1280, 720, 30, p::VideoCodec::h264}};
+    aa::channels::AvSink v{descriptor, raw, send};
+    auto call = [&](const Bytes& b) { return v.on_message({{p::ChannelRole::video, 0, {}}, b}); };
+
+    EXPECT_FALSE(v.video_projecting());
+    EXPECT_FALSE(v.selected_profile().has_value());
+    const auto before_ready = v.request_video_idr();
+    ASSERT_FALSE(before_ready);
+    EXPECT_EQ(before_ready.error().code(), aa::ErrorCode::session_illegal_transition);
+    EXPECT_TRUE(sent.empty());
+
+    ASSERT_TRUE(call(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    EXPECT_FALSE(v.video_projecting());
+    const auto before_start = v.request_video_idr();
+    ASSERT_FALSE(before_start);
+    EXPECT_EQ(before_start.error().code(), aa::ErrorCode::session_illegal_transition);
+
+    ASSERT_TRUE(call(p::encode(p::AvSinkStart{1, 1}).value()));
+    EXPECT_TRUE(v.video_projecting());
+    ASSERT_TRUE(v.selected_profile().has_value());
+    EXPECT_EQ(*v.selected_profile(), (p::VideoProfile{1280, 720, 30, p::VideoCodec::h264}));
+    const auto initial_count = sent.size();
+    ASSERT_GE(initial_count, 2u);
+
+    ASSERT_TRUE(v.request_video_idr());
+    ASSERT_EQ(sent.size(), initial_count + 1u);
+    const auto expected_focus =
+        p::encode(p::VideoFocusNotification{p::VideoFocusMode::projected, true}).value();
+    EXPECT_EQ(sent.back(), expected_focus);
+
+    ASSERT_TRUE(call(p::encode(p::VideoFocusRequest{p::VideoFocusMode::native}).value()));
+    EXPECT_FALSE(v.video_projecting());
+    const auto count_after_native = sent.size();
+    const auto while_native = v.request_video_idr();
+    ASSERT_FALSE(while_native);
+    EXPECT_EQ(while_native.error().code(), aa::ErrorCode::session_illegal_transition);
+    EXPECT_EQ(sent.size(), count_after_native);
+
+    ASSERT_TRUE(call(p::encode(p::VideoFocusRequest{p::VideoFocusMode::projected}).value()));
+    EXPECT_TRUE(v.video_projecting());
+    ASSERT_TRUE(v.request_video_idr());
+    EXPECT_EQ(sent.size(), count_after_native + 2u);
+}

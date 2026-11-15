@@ -32,6 +32,7 @@
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/ControlService.hpp>
+#include <aa/ipc/IdrRecovery.hpp>
 #include <aa/ipc/InputChannel.hpp>
 #include <aa/ipc/InputSocket.hpp>
 #include <aa/ipc/PairingGate.hpp>
@@ -1663,6 +1664,8 @@ const char *const kUsage =
     "  {margins,content-insets,stable-content-insets}-{top,bottom,left,right}.\n"
     "  --decoder software|hardware|auto; --list-video-capabilities\n"
     "  --video-profiles WxH@FPS:CODEC,... (default 1280x720@30:h264,800x480@30:h264)\n"
+    "  --exact-video-profiles offer only --video-profiles without appending the\n"
+    "  1280x720@30:h264 fallback profile.\n"
     "  Pixel values are in the first offered profile pixels (default\n"
     "  1280x720 (primary profile)) and scaled to every fallback offer. width-margin, height-margin, margins-* and a\n"
     "  pixel-aspect-ratio-e4 other than 10000 need --screen-experimental-geometry:\n"
@@ -1671,6 +1674,7 @@ const char *const kUsage =
 
 int receiver_main(int argc, char **argv) {
     auto video_profiles = aa::config::default_video_profiles();
+    bool exact_video_profiles = false;
     auto video_decoder = aa::consumer::DecodeBackend::software;
     aa::config::Screen screen;
     bool experimental_geometry = false;
@@ -1704,6 +1708,8 @@ int receiver_main(int argc, char **argv) {
                 std::fputs("invalid --video-profiles\n", stderr);
                 return 2;
             }
+        } else if (std::strcmp(argv[index], "--exact-video-profiles") == 0) {
+            exact_video_profiles = true;
         } else if (std::strcmp(argv[index], "--video-socket") == 0 && index + 1 < argc) {
             video_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--input-socket") == 0 && index + 1 < argc) {
@@ -1735,6 +1741,8 @@ int receiver_main(int argc, char **argv) {
         std::fputs(kUsage, stderr);
         return 2;
     }
+
+    aa::config::ensure_fallback_video_profile(video_profiles, exact_video_profiles);
 
     // The description is given in the primary profile's pixels and must stay
     // valid once scaled into every offered profile.
@@ -1850,6 +1858,11 @@ int receiver_main(int argc, char **argv) {
         return 1;
     }
     VideoOutlet video_outlet{log_line, log_media};
+    video_outlet.set_idr_recovery({
+        [&session] { return session.video_projecting(); },
+        [&session] { return session.request_video_idr(); },
+        {},
+    });
     aa::channels::InputSink input_sink;
     aa::channels::SensorSink sensor_sink{input, [&session](std::vector<std::byte> payload) {
         return session.send_channel_payload(aa::protocol::ChannelRole::sensors, std::move(payload));
@@ -2079,6 +2092,20 @@ int receiver_main(int argc, char **argv) {
 #endif
             }
         }
+        aa::ipc::VideoSelectionWatchdog selection_watchdog{};
+        auto service_video_recovery = [&] {
+            if (bus && bus->service().consume_idr_recovery_request()) {
+                (void)video_outlet.request_idr_external("consumer_ipc");
+            }
+            const bool session_ready =
+                session.state() == aa::session::State::active && session.authenticated();
+            const bool has_selection = session.selected_video_profile().has_value();
+            if (selection_watchdog.check(session_ready, has_selection,
+                                         std::chrono::steady_clock::now())) {
+                log_line(aa::ipc::video_selection_timeout_json(
+                    aa::ipc::kVideoSelectionWarningTimeout, video_profiles.size()));
+            }
+        };
         while (g_running.load()) {
             aa::core::Result<void> audio_service{};
             {
@@ -2096,6 +2123,7 @@ int receiver_main(int argc, char **argv) {
                     g_running.store(false);
                     break;
                 }
+                service_video_recovery();
                 while (auto event = input_queue.pop()) {
                     const auto outcome = session.submit_input(*event);
                     if (service_control()) {
@@ -2160,6 +2188,7 @@ int receiver_main(int argc, char **argv) {
                     log_line("{\"event\":\"active\",\"startup_ms\":" + std::to_string(elapsed) +
                              "}");
                 }
+                service_video_recovery();
             }
         }
         std::lock_guard lock(session_mutex);

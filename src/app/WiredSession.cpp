@@ -948,4 +948,28 @@ void WiredSession::emit_recovery(const char *reason, RecoveryStatus status,
     ++diagnostics_emitted_;
 }
 
+bool WiredSession::video_projecting() const noexcept {
+    if (lifecycle_.state() != session::State::active || !authenticated()) {
+        return false;
+    }
+    const auto video = av_sinks_.find(protocol::ChannelRole::video);
+    return video != av_sinks_.end() && video->second->video_projecting();
+}
+
+std::optional<protocol::VideoProfile> WiredSession::selected_video_profile() const noexcept {
+    const auto video = av_sinks_.find(protocol::ChannelRole::video);
+    if (video == av_sinks_.end()) {
+        return std::nullopt;
+    }
+    return video->second->selected_profile();
+}
+
+core::Result<void> WiredSession::request_video_idr() {
+    if (!video_projecting()) {
+        return Error{ErrorCode::session_illegal_transition};
+    }
+    const auto video = av_sinks_.find(protocol::ChannelRole::video);
+    return video->second->request_video_idr();
+}
+
 } // namespace aa::app

@@ -3,6 +3,7 @@
 #include "Media.hpp"
 #include <aa/app/WirelessReceiver.hpp>
 #include <aa/ipc/ControlBusService.hpp>
+#include <aa/ipc/IdrRecovery.hpp>
 #include <aa/ipc/InputChannel.hpp>
 #include <aa/ipc/VideoChannel.hpp>
 #include <algorithm>
@@ -34,6 +35,8 @@ struct Runtime final {
     std::chrono::milliseconds backoff{250};
     bool attempting{}, failed{}, stopping{};
     app::WiredSession* configured{};
+    std::size_t offered_video_profiles{};
+    ipc::VideoSelectionWatchdog selection_watchdog{};
 
     void checkpoint() {
         if (auto* session = receiver.session(); session && session != configured) {
@@ -47,6 +50,18 @@ struct Runtime final {
             report("session bus dispatch", step.error().code()); failed = true; stopping = true;
         }
         const auto state = bus.service().state();
+        if (bus.service().consume_idr_recovery_request()) {
+            (void)media.video.request_idr_external("consumer_ipc");
+        }
+        auto* live_session = receiver.session();
+        const bool session_ready = live_session &&
+            live_session->state() == session::State::active && live_session->authenticated();
+        const bool has_selection =
+            live_session && live_session->selected_video_profile().has_value();
+        if (selection_watchdog.check(session_ready, has_selection, Clock::now())) {
+            log_line(ipc::video_selection_timeout_json(
+                ipc::kVideoSelectionWarningTimeout, offered_video_profiles));
+        }
         // Owner loss is handled by WirelessConfirmation's confirmed-ACTIVE grace.
         // An explicit StopProjection by the still-live owner is immediate.
         if (stopping || (state.consumer.value && state.projection == ipc::ProjectionState::stopped)) {

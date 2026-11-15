@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <aa/ipc/IdrRecovery.hpp>
 #include <aa/ipc/VideoChannel.hpp>
 #include <aa/protocol/Protocol.hpp>
 
 #include <cerrno>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -88,6 +90,12 @@ class VideoOutlet final : public protocol::MessageSink {
 public:
     using MediaLog = std::function<void(std::string_view kind, const std::string&)>;
 
+    struct IdrRecoveryHooks final {
+        std::function<bool()> projecting{};
+        std::function<core::Result<void>()> request_idr{};
+        std::function<std::chrono::steady_clock::time_point()> clock{};
+    };
+
     // `log` carries lifecycle records (endpoint events, final stats). `media_log`
     // (audit L13) carries the periodic, phone-driven records (video_sent,
     // video_dropped, running decode_stats): the receiver binds it to a
@@ -95,6 +103,21 @@ public:
     explicit VideoOutlet(std::function<void(const std::string&)> log, MediaLog media_log = {})
         : log_(std::move(log)), media_log_(std::move(media_log)) {}
     ~VideoOutlet() override { close(); }
+
+    void set_idr_recovery(IdrRecoveryHooks hooks) {
+        std::lock_guard lock(mutex_);
+        idr_hooks_ = std::move(hooks);
+    }
+
+    [[nodiscard]] bool request_idr_external(std::string_view reason) {
+        std::lock_guard lock(mutex_);
+        if (!idr_hooks_.request_idr || !projecting_locked()) {
+            return false;
+        }
+        const auto now = now_locked();
+        idr_coordinator_.begin_wait(now);
+        return dispatch_idr_request_locked(now, reason);
+    }
 
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override {
         std::lock_guard lock(mutex_);
@@ -111,6 +134,7 @@ public:
                 log_("{\"event\":\"video_profile\",\"width\":" + std::to_string(profile_->width)
                     + ",\"height\":" + std::to_string(profile_->height) + ",\"fps\":" + std::to_string(profile_->fps)
                     + ",\"codec\":\"" + protocol::codec_name(profile_->codec) + "\"}");
+                configure_buffer_locked(*profile_);
             }
         }
         std::vector<std::uint8_t> payload;
@@ -118,8 +142,10 @@ public:
         for (const std::byte byte : message.payload) {
             payload.push_back(std::to_integer<std::uint8_t>(byte));
         }
+        const bool is_idr = is_idr_au(
+            payload, profile_ ? profile_->codec : protocol::VideoCodec::h264, &av1_reduced_);
         const auto sent = producer_->send_access_unit(ipc::VideoSendRequest{
-            ++sequence_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr_au(payload, profile_ ? profile_->codec : protocol::VideoCodec::h264, &av1_reduced_),
+            ++sequence_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr,
             payload, message.header.video_profile});
         if (!sent) {
             // Error erases errno; confirm peer hangup rather than hiding every I/O failure.
@@ -132,6 +158,8 @@ public:
                 if (ready > 0 && (peer.revents & POLLHUP) != 0) {
                     producer_->close();
                     producer_.reset();
+                    idr_coordinator_.reset();
+                    had_backpressure_ = false;
                     record_drop("consumer_disconnected", frame_cadence(profile_));
                     return {};
                 }
@@ -140,12 +168,26 @@ public:
         }
         switch (sent.value()) {
         case ipc::SendStatus::dropped_backpressure:
+            had_backpressure_ = true;
             record_drop("backpressure", frame_cadence(profile_));
+            maybe_request_idr_locked("backpressure");
             return {};
         case ipc::SendStatus::dropped_waiting_idr:
             record_drop("waiting_idr", frame_cadence(profile_));
+            if (had_backpressure_ || units_ > 0 || replaced_consumer_) {
+                maybe_request_idr_locked("waiting_idr");
+            }
             return {};
         case ipc::SendStatus::sent:
+            had_backpressure_ = false;
+            replaced_consumer_ = false;
+            if (is_idr && idr_coordinator_.waiting()) {
+                const auto recovered = idr_coordinator_.on_idr_delivered(now_locked());
+                if (recovered.recovered) {
+                    log_(ipc::idr_recovered_json("producer", recovered.latency_ms,
+                                                 idr_coordinator_.requests_sent()));
+                }
+            }
             break;
         }
         ++units_;
@@ -174,12 +216,22 @@ public:
         if (producer_.has_value()) {
             producer_->close();
         }
+        if (had_producer_) {
+            replaced_consumer_ = true;
+        }
+        had_producer_ = true;
         producer_.emplace(std::move(producer));
+        if (profile_) {
+            configure_buffer_locked(*profile_);
+        }
     }
 
     void close() noexcept {
         std::lock_guard lock(mutex_);
         emit_drops(true);
+        idr_coordinator_.reset();
+        had_backpressure_ = false;
+        replaced_consumer_ = false;
         if (producer_.has_value()) {
             producer_->close();
             producer_.reset();
@@ -230,14 +282,60 @@ private:
         }
     }
 
+    [[nodiscard]] std::chrono::steady_clock::time_point now_locked() const {
+        return idr_hooks_.clock ? idr_hooks_.clock() : std::chrono::steady_clock::now();
+    }
+
+    [[nodiscard]] bool projecting_locked() const {
+        return idr_hooks_.projecting ? idr_hooks_.projecting() : false;
+    }
+
+    void configure_buffer_locked(const protocol::VideoProfile& profile) {
+        if (!producer_.has_value()) {
+            return;
+        }
+        if (const auto sized = producer_->configure_send_buffer(profile); sized.has_value()) {
+            log_(ipc::video_socket_buffer_json("producer", sized.value().requested_bytes,
+                                               sized.value().granted_bytes, profile));
+        }
+    }
+
+    void maybe_request_idr_locked(std::string_view reason) {
+        if (!idr_hooks_.request_idr) {
+            return;
+        }
+        const auto now = now_locked();
+        idr_coordinator_.begin_wait(now);
+        (void)dispatch_idr_request_locked(now, reason);
+    }
+
+    [[nodiscard]] bool dispatch_idr_request_locked(std::chrono::steady_clock::time_point now,
+                                                   std::string_view reason) {
+        const auto prev = idr_coordinator_.last_request_at();
+        if (!idr_coordinator_.try_request(now, projecting_locked())) {
+            return false;
+        }
+        if (!idr_hooks_.request_idr()) {
+            idr_coordinator_.cancel_last_request(prev);
+            return false;
+        }
+        log_(ipc::idr_requested_json("producer", reason));
+        return true;
+    }
+
     std::function<void(const std::string&)> log_;
     MediaLog media_log_;
+    IdrRecoveryHooks idr_hooks_{};
+    ipc::IdrRecoveryCoordinator idr_coordinator_{};
     std::mutex mutex_{};
     std::optional<ipc::VideoProducer> producer_{};
     std::optional<protocol::VideoProfile> profile_;
     std::optional<std::int32_t> session_;
     std::optional<std::uint64_t> generation_;
     bool av1_reduced_{};
+    bool had_producer_{};
+    bool replaced_consumer_{};
+    bool had_backpressure_{};
     std::uint64_t sequence_{};
     std::uint64_t units_{};
     std::uint64_t last_sent_report_unit_{};

@@ -572,4 +572,41 @@ TEST(ControlService, OwnerLossDoesNotResetPairingIdHistory) {
     EXPECT_EQ(reissued.error().code(), ErrorCode::internal);
 }
 
+TEST(ControlService, RequestIdrRecoveryRequiresProjectingActiveConsumer) {
+    Fixture fixture;
+    const BusName connection{":1.109"};
+    const BusName consumer_name{"org.custom.ConsumerA"};
+    const BusName intruder{":1.110"};
+    const BusName intruder_name{"org.custom.ConsumerB"};
+    fixture.credentials.add_connection(connection, kSessionUid);
+    fixture.credentials.set_owner(consumer_name, connection);
+    fixture.credentials.add_connection(intruder, kSessionUid);
+    fixture.credentials.set_owner(intruder_name, intruder);
+
+    const auto unregistered = fixture.service.request_idr_recovery(connection);
+    ASSERT_FALSE(unregistered.has_value());
+    EXPECT_EQ(unregistered.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_FALSE(fixture.service.consume_idr_recovery_request());
+
+    ASSERT_TRUE(fixture.service.register_consumer(connection, consumer_name).has_value());
+    const auto while_stopped = fixture.service.request_idr_recovery(connection);
+    ASSERT_FALSE(while_stopped.has_value());
+    EXPECT_EQ(while_stopped.error().code(), ErrorCode::session_illegal_transition);
+    EXPECT_FALSE(fixture.service.consume_idr_recovery_request());
+
+    ASSERT_TRUE(fixture.service.start_projection(connection).has_value());
+    const auto unauthorized = fixture.service.request_idr_recovery(intruder);
+    ASSERT_FALSE(unauthorized.has_value());
+    EXPECT_EQ(unauthorized.error().code(), ErrorCode::ipc_peer_unauthorized);
+    EXPECT_FALSE(fixture.service.consume_idr_recovery_request());
+
+    ASSERT_TRUE(fixture.service.request_idr_recovery(connection).has_value());
+    EXPECT_TRUE(fixture.service.consume_idr_recovery_request());
+    EXPECT_FALSE(fixture.service.consume_idr_recovery_request());
+
+    ASSERT_TRUE(fixture.service.request_idr_recovery(connection).has_value());
+    ASSERT_TRUE(fixture.service.stop_projection(connection).has_value());
+    EXPECT_FALSE(fixture.service.consume_idr_recovery_request());
+}
+
 } // namespace

@@ -528,4 +528,32 @@ TEST(CallBoundary, PropertiesPreserveEnvelopeGates) {
     EXPECT_EQ(rejected->error_name, "org.freedesktop.DBus.Error.UnknownObject");
 }
 
+TEST(CallBoundary, DispatchesRequestIdrRecoveryAndPingDistinctly) {
+    BoundaryFixture fixture;
+    const BusName name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(BusName{":1.60"}, kSessionUid);
+    fixture.credentials.set_owner(name, BusName{":1.60"});
+    ASSERT_FALSE(fixture.dispatcher.handle(call_from(":1.60", "RegisterConsumer", "s",
+                                                     marshal_string(name.value)))
+                     ->is_error);
+
+    const auto ping = fixture.dispatcher.handle(call_from(":1.60", "Ping"));
+    ASSERT_TRUE(ping.has_value());
+    EXPECT_FALSE(ping->is_error);
+    EXPECT_TRUE(std::holds_alternative<std::uint64_t>(ping->body));
+
+    const auto before_start = fixture.dispatcher.handle(call_from(":1.60", "RequestIdrRecovery"));
+    ASSERT_TRUE(before_start.has_value());
+    EXPECT_TRUE(before_start->is_error);
+    EXPECT_EQ(before_start->error_name,
+              "org.custom.AndroidAutoReceiver1.Error.IllegalTransition");
+
+    ASSERT_FALSE(fixture.dispatcher.handle(call_from(":1.60", "StartProjection"))->is_error);
+    const auto while_projecting =
+        fixture.dispatcher.handle(call_from(":1.60", "RequestIdrRecovery"));
+    ASSERT_TRUE(while_projecting.has_value());
+    EXPECT_FALSE(while_projecting->is_error);
+    EXPECT_TRUE(fixture.service.consume_idr_recovery_request());
+}
+
 } // namespace

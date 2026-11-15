@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/display/Display.hpp>
+#include <aa/ipc/IdrRecovery.hpp>
 
 #include <utility>
 
@@ -81,6 +82,55 @@ struct DisplayController::Impl final {
     // called: saturation applies source backpressure instead of dropping or
     // queueing later units, and this AU's metadata remains untouched.
     std::optional<ipc::VideoAccessUnit> pending_unit{};
+    bool saw_video_unit{false};
+    ipc::IdrRecoveryCoordinator idr_recovery{};
+
+    [[nodiscard]] std::chrono::steady_clock::time_point now() const {
+        return config.clock ? config.clock() : std::chrono::steady_clock::now();
+    }
+
+    void emit_diagnostic(std::string line) const {
+        if (config.on_diagnostic) {
+            config.on_diagnostic(std::move(line));
+        }
+    }
+
+    void configure_receive_buffer(ipc::VideoConsumer& consumer,
+                                  const protocol::VideoProfile& caps) const {
+        if (const auto sized = consumer.configure_receive_buffer(caps); sized.has_value()) {
+            emit_diagnostic(ipc::video_socket_buffer_json(
+                "consumer", sized.value().requested_bytes, sized.value().granted_bytes, caps));
+        }
+    }
+
+    void observe_idr_recovery() {
+        const auto current_time = now();
+        const bool awaiting = session && session->report().awaiting_idr;
+        const bool socket_waiting =
+            video.has_value() && video->waiting_idr() &&
+            (saw_video_unit || video->rejected() > 0 || video->suppressed() > 0);
+        if (awaiting || socket_waiting) {
+            idr_recovery.begin_wait(current_time);
+            const auto prev = idr_recovery.last_request_at();
+            if (idr_recovery.try_request(current_time, state == DisplayState::projecting)) {
+                const auto requested = control.request_idr_recovery();
+                if (!requested.has_value()) {
+                    idr_recovery.cancel_last_request(prev);
+                } else {
+                    emit_diagnostic(ipc::idr_requested_json(
+                        "consumer", awaiting ? "decode_awaiting_idr" : "video_consumer_waiting_idr"));
+                }
+            }
+            return;
+        }
+        if (idr_recovery.waiting()) {
+            const auto recovered = idr_recovery.on_idr_delivered(current_time);
+            if (recovered.recovered) {
+                emit_diagnostic(ipc::idr_recovered_json("consumer", recovered.latency_ms,
+                                                        idr_recovery.requests_sent()));
+            }
+        }
+    }
 
     void on_decoded(const consumer::DecodedFrame& frame) {
         ++frames_presented;
@@ -89,6 +139,8 @@ struct DisplayController::Impl final {
 
     void release_media() noexcept {
         pending_unit.reset();
+        saw_video_unit = false;
+        idr_recovery.reset();
         if (session) {
             session->close();
             session.reset();
@@ -228,6 +280,9 @@ core::Result<void> DisplayController::start_projection(const ipc::VideoSocketPat
         return connected.error();
     }
     connected.value().set_observer(impl_->config.on_video_endpoint);
+    impl_->configure_receive_buffer(connected.value(), impl_->active_caps);
+    impl_->saw_video_unit = false;
+    impl_->idr_recovery.reset();
     impl_->video.emplace(std::move(connected.value()));
     impl_->session = std::move(session.value());
     impl_->helper_started = true;
@@ -277,6 +332,7 @@ core::Result<std::size_t> DisplayController::pump(Milliseconds wait) {
                 // IDR-resync discard and terminal failures are settled, not
                 // retryable backpressure; never replay this AU on later pumps.
                 impl_->pending_unit.reset();
+                impl_->observe_idr_recovery();
                 return retried.error();
             }
             impl_->pending_unit.reset();
@@ -298,11 +354,13 @@ core::Result<std::size_t> DisplayController::pump(Milliseconds wait) {
                 }
                 break;
             }
+            impl_->observe_idr_recovery();
             return status.error();
         }
         if (status.value() != ipc::ReceiveStatus::complete) {
             continue;
         }
+        impl_->saw_video_unit = true;
         const auto& unit = impl_->video->access_unit();
         if (unit.profile && *unit.profile != impl_->active_caps) {
             if (!unit.idr) { return Error{ErrorCode::channel_caps_unsupported}; }
@@ -315,10 +373,12 @@ core::Result<std::size_t> DisplayController::pump(Milliseconds wait) {
             impl_->session->close();
             impl_->session = std::move(opened.value());
             impl_->active_caps = *unit.profile;
+            impl_->configure_receive_buffer(*impl_->video, impl_->active_caps);
         }
         const auto submitted = impl_->session->submit(unit);
         if (!submitted.has_value()) {
             if (submitted.error().code() != ErrorCode::ipc_queue_full) {
+                impl_->observe_idr_recovery();
                 return submitted.error();
             }
             // Copy before any subsequent receive can overwrite the consumer's
@@ -328,6 +388,7 @@ core::Result<std::size_t> DisplayController::pump(Milliseconds wait) {
         }
     }
     auto frames = impl_->session->pump(wait);
+    impl_->observe_idr_recovery();
     if (!frames.has_value()) {
         return frames.error();
     }

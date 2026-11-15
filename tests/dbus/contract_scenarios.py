@@ -35,7 +35,8 @@ PASS_SUMMARY: Final[str] = "dbus-contract PASS interface=org.custom.AndroidAutoR
 METHOD_NAMES: Final[tuple[str, ...]] = (
     "RegisterConsumer", "UnregisterConsumer", "StartProjection", "StopProjection",
     "RequestAddPhone", "ConfirmPhonePairing", "CancelPhonePairing", "ForgetPhone",
-    "GetState", "GetCapabilities", "SetDisplayViewport", "Ping", "GetPairingComparison", "RespondPairingComparison",
+    "GetState", "GetCapabilities", "SetDisplayViewport", "Ping", "GetPairingComparison",
+    "RespondPairingComparison", "RequestIdrRecovery",
 )
 PROBE_SOURCE: Final[str] = """#include <aa/ipc/dbus_contract.generated.hpp>
 #include <cstdio>
@@ -160,7 +161,7 @@ def case_real_check(root: Path) -> int:
     if result.returncode != 0:
         print(f"real-check: expected exit 0\n{result.stdout}{result.stderr}")
         return 1
-    if PASS_SUMMARY not in result.stdout or "methods=14 signals=5 properties=1" not in result.stdout:
+    if PASS_SUMMARY not in result.stdout or "methods=15 signals=5 properties=1" not in result.stdout:
         print(f"real-check: missing PASS summary\n{result.stdout}")
         return 1
     return 0

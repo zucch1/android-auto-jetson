@@ -118,7 +118,11 @@ public:
     // end of stream.
     void close() noexcept;
 
+    [[nodiscard]] core::Result<SocketBufferResult> configure_send_buffer(
+        const protocol::VideoProfile& profile) noexcept;
+
     [[nodiscard]] bool closed() const noexcept;
+    [[nodiscard]] bool waiting_idr() const noexcept;
     [[nodiscard]] const NegotiatedLimits& limits() const noexcept;
     [[nodiscard]] std::uint64_t dropped() const noexcept;
     [[nodiscard]] std::uint64_t backpressure_events() const noexcept;
@@ -155,6 +159,9 @@ public:
     void set_observer(VideoEndpointObserver observer);
 
     void close() noexcept;
+
+    [[nodiscard]] core::Result<SocketBufferResult> configure_receive_buffer(
+        const protocol::VideoProfile& profile) noexcept;
 
     [[nodiscard]] bool closed() const noexcept;
     [[nodiscard]] bool waiting_idr() const noexcept;

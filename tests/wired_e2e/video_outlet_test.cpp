@@ -391,3 +391,208 @@ TEST(WiredReceiver, SessionNegotiatingEachCodecLogsWithoutRedactionOrRejection) 
                   outlet_logs.end());
     }
 }
+
+TEST(WiredReceiver, VideoOutletRequestsIdrOnBackpressureRespectsRateLimitAndTracksRecovery) {
+    aa::session::test::MapTrustStore trust;
+    const aa::trust::PhoneIdentity phone{"idr-recovery-phone"};
+    trust.set(phone, aa::trust::Decision::approved);
+    aa::session::test::ManualClock clock;
+    wiredtest::CaptureSink capture;
+    aa::diagnostics::Diagnostics diagnostics{capture};
+    wiredtest::ScriptedTransport transport;
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{10}};
+
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    const int producer_fd = pair.value().producer.native_handle();
+    const int consumer_fd = pair.value().consumer.native_handle();
+    outlet.install(std::move(pair.value().producer));
+
+    aa::app::WiredSession session{{trust, clock, diagnostics}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()));
+    ASSERT_TRUE(session.register_av_sink(p::ChannelRole::video, outlet));
+    outlet.set_idr_recovery({
+        [&session] { return session.video_projecting(); },
+        [&session] { return session.request_video_idr(); },
+        [&steady_now] { return steady_now; },
+    });
+
+    session.attach_transport(&transport);
+    auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    auto* cipher = owned.get();
+    session.attach_cipher(std::move(owned));
+    ASSERT_TRUE(session.apply(aa::session::Event::start_discovery));
+    ASSERT_TRUE(session.phone_discovered(phone));
+    ASSERT_TRUE(session.apply(aa::session::Event::transport_ready));
+    wiredtest::walk_auth(session, transport);
+    ASSERT_TRUE(session.authenticated());
+    ASSERT_TRUE(session.announce_services());
+
+    const auto receive = [&](std::vector<std::byte> payload) -> aa::core::Result<bool> {
+        auto frames = tr::encode_message({99, tr::MessageKind::specific, std::move(payload)},
+                                         tr::Encryption::encrypted, cipher);
+        if (!frames) { return frames.error(); }
+        aa::core::Result<bool> polled{false};
+        for (auto& frame : frames.value()) {
+            transport.push_inbound(std::move(frame));
+            polled = session.poll_transport();
+            if (!polled) { return polled.error(); }
+        }
+        return polled;
+    };
+    ASSERT_TRUE(receive(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    ASSERT_TRUE(receive(p::encode(p::AvSinkStart{1, 0}).value()));
+    ASSERT_TRUE(session.apply(aa::session::Event::negotiation_succeeded));
+    ASSERT_TRUE(session.video_projecting());
+
+    // Initial IDR establishes profile and triggers socket buffer sizing.
+    auto idr_payload = std::vector<std::byte>(10, std::byte{0});
+    idr_payload.insert(idr_payload.end(), wiredtest::kVideoIdr.begin(), wiredtest::kVideoIdr.end());
+    ASSERT_TRUE(receive(idr_payload));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& line) {
+        return line.find("\"event\":\"video_socket_buffer\"") != std::string::npos &&
+               line.find("\"side\":\"producer\"") != std::string::npos;
+    }), logs.end());
+
+    // Shrink socket buffers so non-IDR frames deterministically trigger EAGAIN (not EMSGSIZE).
+    const int tiny_buf = 32768;
+    ASSERT_EQ(::setsockopt(producer_fd, SOL_SOCKET, SO_SNDBUF, &tiny_buf, sizeof(tiny_buf)), 0);
+    ASSERT_EQ(::setsockopt(consumer_fd, SOL_SOCKET, SO_RCVBUF, &tiny_buf, sizeof(tiny_buf)), 0);
+
+    auto big_non_idr = std::vector<std::byte>(10, std::byte{0});
+    big_non_idr.push_back(std::byte{0x00});
+    big_non_idr.push_back(std::byte{0x00});
+    big_non_idr.push_back(std::byte{0x01});
+    big_non_idr.push_back(std::byte{0x41});
+    big_non_idr.resize(16384, std::byte{0x55});
+
+    auto count_logs = [&](const std::string& needle) {
+        return static_cast<std::size_t>(std::count_if(logs.begin(), logs.end(), [&](const std::string& s) {
+            return s.find(needle) != std::string::npos;
+        }));
+    };
+
+    const auto sent_before_bp = transport.sent_count();
+    for (int i = 0; i < 128 && count_logs("\"event\":\"idr_requested\"") == 0; ++i) {
+        const auto res = receive(big_non_idr);
+        ASSERT_TRUE(res) << aa::to_string(res.error().code()) << ": " << res.error().message();
+    }
+    ASSERT_EQ(count_logs("\"event\":\"idr_requested\""), 1u);
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_requested\",\"source\":\"producer\",\"reason\":\"backpressure\"}"),
+              logs.end());
+
+    // Confirm the wire frame sent to the phone is VideoFocusNotification(projected).
+    const auto expected_focus =
+        p::encode(p::VideoFocusNotification{p::VideoFocusMode::projected, true}).value();
+    bool saw_focus_notification = false;
+    for (std::size_t i = sent_before_bp; i < transport.sent_count(); ++i) {
+        const auto frame = tr::decode_frame(transport.sent_frames()[i]);
+        ASSERT_TRUE(frame);
+        if (frame.value().header.channel == 99 &&
+            frame.value().header.encryption == tr::Encryption::encrypted) {
+            const auto opened = cipher->open(frame.value().payload);
+            ASSERT_TRUE(opened);
+            if (opened.value() == expected_focus) {
+                saw_focus_notification = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw_focus_notification);
+
+    // Inside the 250 ms cooldown window: waiting_idr drops do NOT resend.
+    steady_now += std::chrono::milliseconds{100};
+    ASSERT_TRUE(receive(big_non_idr));
+    EXPECT_EQ(count_logs("\"event\":\"idr_requested\""), 1u);
+
+    // At +250 ms: waiting_idr drop triggers a second IDR request.
+    steady_now += std::chrono::milliseconds{150};
+    ASSERT_TRUE(receive(big_non_idr));
+    EXPECT_EQ(count_logs("\"event\":\"idr_requested\""), 2u);
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_requested\",\"source\":\"producer\",\"reason\":\"waiting_idr\"}"),
+              logs.end());
+
+    // Drain consumer so the recovery IDR succeeds and clears waiting_idr.
+    for (;;) {
+        if (!pair.value().consumer.receive(Milliseconds{0})) {
+            break;
+        }
+    }
+    steady_now += std::chrono::milliseconds{150}; // Total 400 ms since begin_wait.
+    ASSERT_TRUE(receive(idr_payload));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    EXPECT_EQ(count_logs("\"event\":\"idr_recovered\""), 1u);
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_recovered\",\"source\":\"producer\",\"latency_ms\":400,\"requests\":2}"),
+              logs.end());
+}
+
+TEST(WiredReceiver, VideoOutletSuppressesIdrRequestsWhenNotProjecting) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{5}};
+    bool projecting = false;
+    std::size_t requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [&projecting] { return projecting; },
+        [&requests]() -> aa::core::Result<void> { ++requests; return {}; },
+        [&steady_now] { return steady_now; },
+    });
+
+    EXPECT_FALSE(outlet.request_idr_external("consumer_ipc"));
+    EXPECT_EQ(requests, 0u);
+    EXPECT_TRUE(logs.empty());
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    const int tiny_buf = 8192;
+    ASSERT_EQ(::setsockopt(pair.value().producer.native_handle(), SOL_SOCKET, SO_SNDBUF,
+                           &tiny_buf, sizeof(tiny_buf)), 0);
+    ASSERT_EQ(::setsockopt(pair.value().consumer.native_handle(), SOL_SOCKET, SO_RCVBUF,
+                           &tiny_buf, sizeof(tiny_buf)), 0);
+    outlet.install(std::move(pair.value().producer));
+
+    std::vector<std::byte> non_idr(16384, std::byte{0x41});
+    non_idr[0] = std::byte{0x00};
+    non_idr[1] = std::byte{0x00};
+    non_idr[2] = std::byte{0x01};
+    non_idr[3] = std::byte{0x41};
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, static_cast<std::uint64_t>(i + 1), {100}}, non_idr}));
+    }
+    EXPECT_EQ(requests, 0u);
+
+    projecting = true;
+    EXPECT_TRUE(outlet.request_idr_external("consumer_ipc"));
+    EXPECT_EQ(requests, 1u);
+    EXPECT_FALSE(outlet.request_idr_external("consumer_ipc"));
+    EXPECT_EQ(requests, 1u);
+
+    steady_now += aa::ipc::kIdrRequestMinInterval;
+    EXPECT_TRUE(outlet.request_idr_external("consumer_ipc"));
+    EXPECT_EQ(requests, 2u);
+}
+
+TEST(WiredReceiver, VideoSelectionWatchdogEmitsOnceAfterTimeoutAndResets) {
+    using aa::ipc::kVideoSelectionWarningTimeout;
+    using aa::ipc::VideoSelectionWatchdog;
+    VideoSelectionWatchdog watchdog;
+    auto t0 = std::chrono::steady_clock::time_point{std::chrono::seconds{1}};
+
+    EXPECT_FALSE(watchdog.check(false, false, t0));
+    EXPECT_FALSE(watchdog.check(true, false, t0));
+    EXPECT_FALSE(watchdog.check(true, false, t0 + kVideoSelectionWarningTimeout - std::chrono::milliseconds{1}));
+    EXPECT_TRUE(watchdog.check(true, false, t0 + kVideoSelectionWarningTimeout));
+    EXPECT_TRUE(watchdog.warned());
+    EXPECT_FALSE(watchdog.check(true, false, t0 + kVideoSelectionWarningTimeout + std::chrono::seconds{2}));
+
+    // Selecting a profile resets the watchdog so a future session/relink starts clean.
+    EXPECT_FALSE(watchdog.check(true, true, t0 + std::chrono::seconds{10}));
+    EXPECT_FALSE(watchdog.warned());
+    EXPECT_FALSE(watchdog.check(true, false, t0 + std::chrono::seconds{11}));
+    EXPECT_TRUE(watchdog.check(true, false, t0 + std::chrono::seconds{11} + kVideoSelectionWarningTimeout));
+}

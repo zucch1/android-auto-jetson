@@ -179,4 +179,15 @@ core::Result<PeerCredentials> authorize_peer(const PeerCredentials& peer,
     return peer;
 }
 
+std::uint32_t recommended_socket_buffer_bytes(const protocol::VideoProfile& profile) noexcept {
+    // ~250 ms burst headroom at a conservative 0.5 bpp rate:
+    // (width * height * fps * 0.5 / 8) * 0.25 = (pixels_per_sec / 64).
+    const auto pixels_per_sec = static_cast<std::uint64_t>(profile.width) *
+                                static_cast<std::uint64_t>(profile.height) *
+                                static_cast<std::uint64_t>(profile.fps);
+    const auto target = pixels_per_sec / 64ULL;
+    const auto clamped = std::clamp<std::uint64_t>(target, kMinSocketBufferBytes, kMaxSocketBufferBytes);
+    return static_cast<std::uint32_t>(clamped);
+}
+
 } // namespace aa::ipc

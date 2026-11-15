@@ -42,6 +42,21 @@ core::Result<void> set_budget(int fd, std::uint32_t budget) noexcept {
     return {};
 }
 
+core::Result<SocketBufferResult> configure_socket_buffer(
+    int fd, int option, const protocol::VideoProfile& profile) noexcept {
+    const auto requested = recommended_socket_buffer_bytes(profile);
+    const int value = static_cast<int>(requested);
+    if (::setsockopt(fd, SOL_SOCKET, option, &value, sizeof(value)) != 0) {
+        return io_error();
+    }
+    int actual = 0;
+    socklen_t length = sizeof(actual);
+    if (::getsockopt(fd, SOL_SOCKET, option, &actual, &length) != 0 || actual < 0) {
+        return io_error();
+    }
+    return SocketBufferResult{requested, static_cast<std::uint32_t>(actual)};
+}
+
 core::Result<PeerCredentials> read_peer(int fd) noexcept {
     ucred creds{};
     socklen_t length = sizeof(creds);
@@ -668,7 +683,16 @@ void VideoProducer::close() noexcept {
     }
 }
 
+core::Result<SocketBufferResult> VideoProducer::configure_send_buffer(
+    const protocol::VideoProfile& profile) noexcept {
+    if (!impl_ || impl_->closed || impl_->fd < 0) {
+        return closed_error();
+    }
+    return configure_socket_buffer(impl_->fd, SO_SNDBUF, profile);
+}
+
 bool VideoProducer::closed() const noexcept { return !impl_ || impl_->closed; }
+bool VideoProducer::waiting_idr() const noexcept { return !impl_ || impl_->waiting_idr; }
 const NegotiatedLimits& VideoProducer::limits() const noexcept { return impl_->limits; }
 std::uint64_t VideoProducer::dropped() const noexcept { return impl_->dropped; }
 std::uint64_t VideoProducer::backpressure_events() const noexcept { return impl_->backpressure; }
@@ -804,6 +828,14 @@ void VideoConsumer::close() noexcept {
     if (impl_) {
         impl_->release();
     }
+}
+
+core::Result<SocketBufferResult> VideoConsumer::configure_receive_buffer(
+    const protocol::VideoProfile& profile) noexcept {
+    if (!impl_ || impl_->closed || impl_->fd < 0) {
+        return closed_error();
+    }
+    return configure_socket_buffer(impl_->fd, SO_RCVBUF, profile);
 }
 
 bool VideoConsumer::closed() const noexcept { return !impl_ || impl_->closed; }

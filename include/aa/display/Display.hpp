@@ -10,9 +10,11 @@
 #include <aa/ipc/VideoChannel.hpp>
 #include <aa/protocol/Protocol.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <variant>
 
@@ -119,6 +121,8 @@ struct DisplayConfig final {
     protocol::VideoProfile caps{1280, 720, 30};
     ipc::VideoEndpointObserver on_video_endpoint{};
     consumer::DecodeCompletionObserver on_decode_completion{};
+    std::function<void(std::string)> on_diagnostic{};
+    std::function<std::chrono::steady_clock::time_point()> clock{};
 };
 
 // Dummy display consumer (task 24). Projection control ALWAYS travels the

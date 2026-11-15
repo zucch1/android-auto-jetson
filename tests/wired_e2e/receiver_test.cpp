@@ -6418,17 +6418,26 @@ TEST(WiredReceiver, ActualMainOffersExtendedProfilesOnlyWhenExplicitlyConfigured
     EXPECT_EQ(defaults.video[1].codec_resolution(),video::VIDEO_800x480);
     EXPECT_EQ(defaults.video[0].frame_rate(),video::VIDEO_FPS_30);
     EXPECT_EQ(defaults.video[1].frame_rate(),video::VIDEO_FPS_30);
-    const auto configured = announce_with({"--video-profiles","2560x1440@60:h264,1920x1080@30:h264,800x480@30:h264",
-                                          "--screen-content-insets-left","256"});
-    ASSERT_EQ(configured.run.code,0) << configured.run.output;
-    ASSERT_EQ(configured.video.size(),3u);
-    EXPECT_EQ(configured.video[0].codec_resolution(),video::VIDEO_2560x1440);
-    EXPECT_EQ(configured.video[0].frame_rate(),video::VIDEO_FPS_60);
-    EXPECT_EQ(configured.video[1].codec_resolution(),video::VIDEO_1920x1080);
-    EXPECT_EQ(configured.video[1].frame_rate(),video::VIDEO_FPS_30);
-    EXPECT_EQ(configured.video[0].ui_config().content_insets().left(),256u);
-    EXPECT_EQ(configured.video[1].ui_config().content_insets().left(),192u);
-    EXPECT_EQ(configured.video[2].ui_config().content_insets().left(),80u);
+    const auto exact = announce_with({"--video-profiles","2560x1440@60:h264,1920x1080@30:h264,800x480@30:h264",
+                                      "--exact-video-profiles",
+                                      "--screen-content-insets-left","256"});
+    ASSERT_EQ(exact.run.code,0) << exact.run.output;
+    ASSERT_EQ(exact.video.size(),3u);
+    EXPECT_EQ(exact.video[0].codec_resolution(),video::VIDEO_2560x1440);
+    EXPECT_EQ(exact.video[0].frame_rate(),video::VIDEO_FPS_60);
+    EXPECT_EQ(exact.video[1].codec_resolution(),video::VIDEO_1920x1080);
+    EXPECT_EQ(exact.video[1].frame_rate(),video::VIDEO_FPS_30);
+    EXPECT_EQ(exact.video[0].ui_config().content_insets().left(),256u);
+    EXPECT_EQ(exact.video[1].ui_config().content_insets().left(),192u);
+    EXPECT_EQ(exact.video[2].ui_config().content_insets().left(),80u);
+
+    const auto with_fallback = announce_with({"--video-profiles","2560x1440@60:h264,1920x1080@30:h264,800x480@30:h264"});
+    ASSERT_EQ(with_fallback.run.code,0) << with_fallback.run.output;
+    ASSERT_EQ(with_fallback.video.size(),4u);
+    EXPECT_EQ(with_fallback.video[3].codec_resolution(),video::VIDEO_1280x720);
+    EXPECT_EQ(with_fallback.video[3].frame_rate(),video::VIDEO_FPS_30);
+    EXPECT_EQ(with_fallback.video[3].video_codec_type(),
+              aap_protobuf::service::media::shared::message::MEDIA_CODEC_VIDEO_H264_BP);
 }
 
 TEST(WiredReceiver, HevcAvailabilityIsDeterminedByInstalledElements) {

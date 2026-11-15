@@ -105,6 +105,11 @@
       <arg name="accept" type="b" direction="in"/>
     </method>
 
+    <!-- Requests video IDR keyframe recovery from the active phone session
+         while projection is active. -->
+    <method name="RequestIdrRecovery">
+    </method>
+
     <!-- One-time pairing request id awaiting ConfirmPhonePairing. -->
     <signal name="PairingRequest">
       <arg name="request_id" type="t"/>

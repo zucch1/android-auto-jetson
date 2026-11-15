@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <aa/protocol/Messages.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 
 namespace aa::ipc {
 
@@ -46,6 +49,18 @@ inline std::string video_endpoint_json(const VideoEndpoint& event) {
         std::to_string(event.timestamp_ns) + ",\"observed_ns\":" +
         std::to_string(event.observed_ns) + ",\"payload_bytes\":" +
         std::to_string(event.payload_bytes) + "}";
+}
+
+inline std::string video_socket_buffer_json(std::string_view side, std::uint32_t requested_bytes,
+                                            std::uint32_t granted_bytes,
+                                            const protocol::VideoProfile& profile) {
+    return std::string{"{\"event\":\"video_socket_buffer\",\"side\":\""} + std::string{side} +
+           "\",\"requested_bytes\":" + std::to_string(requested_bytes) +
+           ",\"granted_bytes\":" + std::to_string(granted_bytes) +
+           ",\"width\":" + std::to_string(profile.width) +
+           ",\"height\":" + std::to_string(profile.height) +
+           ",\"fps\":" + std::to_string(profile.fps) +
+           ",\"codec\":\"" + std::string{protocol::codec_name(profile.codec)} + "\"}";
 }
 
 } // namespace aa::ipc
