@@ -41,7 +41,9 @@ using aa::ipc::ControlMethod;
                                        ControlMethod::get_state,
                                        ControlMethod::get_capabilities,
                                        ControlMethod::set_display_viewport,
-                                       ControlMethod::ping}) {
+                                       ControlMethod::ping,
+                                       ControlMethod::get_pairing_comparison,
+                                       ControlMethod::respond_pairing_comparison}) {
         names.insert(aa::ipc::wire_name(method));
     }
     return names;

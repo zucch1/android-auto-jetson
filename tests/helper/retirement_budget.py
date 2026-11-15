@@ -58,7 +58,8 @@ def stalled_forget(build: Path, not_durable: bool) -> None:
             assert elapsed < 1.15, elapsed
             assert surface.phone() == 0
             assert command(surface.receiver, "pending-revocations") == "1"
-            assert command(surface.receiver, f"progress {phone}") == "0 0"
+            # The AP leg stays pending; the resumed helper's reconciliation resolves the bond leg.
+            wait(lambda: command(surface.receiver, f"progress {phone}") == "0 1")
             assert command(surface.receiver, f"retirements {phone}") == "1"
             wait(lambda: not surface.nm_state()["table"] and len(surface.state()["removed"]) == 1)
         assert command(surface.receiver, "fault-clear") == "0"
@@ -132,7 +133,8 @@ def contended_forget(build: Path) -> None:
         assert bounded and elapsed < 1.15
         assert "success" != error
         assert command(receiver, "pending-revocations") == "1"
-        assert command(receiver, f"progress {phone}") == "0 0"
+        # The AP leg stays pending; once the mutex is free, reconciliation resolves the bond leg.
+        wait(lambda: command(receiver, f"progress {phone}") == "0 1")
         assert command(receiver, f"retirements {phone}") == "1"
         rejected(consumer, "CancelPhonePairing", GLib.Variant("(t)", (request,)))
         # join-first joins the timed-out caller, not the helper's queued RPCs.

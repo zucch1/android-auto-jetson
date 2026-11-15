@@ -144,6 +144,20 @@ constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properti
                                 static_cast<std::uint16_t>(height.value()), dpi.value()};
         return from_void(service.set_display_viewport(sender, viewport));
     }
+    case 12: {
+        const auto id = cursor.read_u64();
+        if (!id || !body_consumed(cursor)) return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        const auto value = service.pairing_comparison(sender, core::PairingRequestId{id.value()});
+        if (!value) return error_reply(error_name_for(value.error().code()), value.error().message());
+        return ok(value.value());
+    }
+    case 13: {
+        const auto request = cursor.read_u64(); const auto id = cursor.read_u64(); const auto accept = cursor.read_u32();
+        if (!request || !id || !accept || accept.value() > 1 || !body_consumed(cursor))
+            return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        return from_void(service.respond_pairing_comparison(sender, core::PairingRequestId{request.value()},
+            {id.value(), accept.value() != 0}));
+    }
     default: {
         if (!body_consumed(cursor)) {
             return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");

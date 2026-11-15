@@ -23,6 +23,7 @@ core::Result<std::filesystem::path> ApprovedPhoneStore::default_path() {
 }
 
 core::Result<void> ApprovedPhoneStore::load() {
+    ++reload_epoch_;
     dropped_port_only_count_ = 0;
     auto text = detail::read_file(path_);
     if (!text.has_value()) {

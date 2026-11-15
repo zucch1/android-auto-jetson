@@ -80,6 +80,7 @@ public:
     // version is a typed error; the store then refuses every mutation and
     // fails lookup() closed (Decision::unknown).
     [[nodiscard]] core::Result<void> load();
+    std::uint64_t reload_epoch() const { return reload_epoch_; }
 
     // TrustStore seam (session admission by opaque key). approve_once rejects
     // all opaque w1: keys; wired approvals must use the structured APIs.
@@ -127,6 +128,7 @@ private:
     std::uint64_t next_phone_id_{1};
     std::size_t dropped_port_only_count_{0};
     bool loaded_{false};
+    std::uint64_t reload_epoch_{};
     bool usable_{false};
 };
 

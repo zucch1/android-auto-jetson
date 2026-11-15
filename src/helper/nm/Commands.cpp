@@ -127,10 +127,13 @@ bool eligible(const Policy& policy, Commands& commands) {
     }
     if (!confirmed) return false;
     const auto capabilities = commands.run({"/usr/sbin/iw", "phy", phy, "info"});
+    const auto frequency = std::to_string(ap_frequency_mhz(policy.channel));
+    const auto channel = "[" + std::to_string(policy.channel) + "]";
     if (!capabilities) return false;
     std::istringstream frequencies{capabilities.value()};
     while (std::getline(frequencies, line)) {
-        if (line.find("5180 MHz [36]") == std::string::npos) continue;
+        if (line.find(frequency + " MHz " + channel) == std::string::npos &&
+            line.find(frequency + ".0 MHz " + channel) == std::string::npos) continue;
         return line.find("disabled") == std::string::npos && line.find("no IR") == std::string::npos &&
                line.find("radar") == std::string::npos && line.find("NO-IR") == std::string::npos;
     }
@@ -139,13 +142,17 @@ bool eligible(const Policy& policy, Commands& commands) {
 bool actual_channel(const Policy& policy, Commands& commands) {
     const auto info = commands.run({"/usr/sbin/iw", "dev", policy.interface, "info"});
     return info && info.value().find("type AP\n") != std::string::npos &&
-           info.value().find("channel 36 (5180 MHz)") != std::string::npos;
+           info.value().find("channel " + std::to_string(policy.channel) + " (" +
+                             std::to_string(ap_frequency_mhz(policy.channel)) + " MHz)") != std::string::npos;
 }
 std::string firewall(const Policy& policy) {
     const auto match = "iifname \"" + policy.interface + "\" ";
     return "create table inet aa_receiver_ap { comment \"aa-system-helper-v1\"; }\n"
            "add chain inet aa_receiver_ap input { type filter hook input priority -200; policy accept; }\n"
            "add chain inet aa_receiver_ap forward { type filter hook forward priority -200; policy accept; }\n"
+           // The projection port is reachable only from stations of this AP.
+           "add rule inet aa_receiver_ap input iifname != \"" + policy.interface + "\" tcp dport " +
+               std::to_string(policy.port) + " drop\n"
            "add rule inet aa_receiver_ap input " + match + "udp sport 68 udp dport 67 accept\n"
            "add rule inet aa_receiver_ap input " + match + "tcp dport " + std::to_string(policy.port) + " accept\n"
            "add rule inet aa_receiver_ap input " + match + "drop\n"

@@ -8,6 +8,7 @@ core::Result<core::PairingRequestId> ControlService::request_add_phone(const Bus
     if (!active) return active.error();
     const auto admitted = admit(caller, active.value());
     if (!admitted) return admitted.error();
+    // Room for the one tracked retirement an enrolment can leave behind.
     if (revocations_.size() >= 256) return Error{ErrorCode::ipc_queue_full};
     // Reap before allocation so expired requests release their admission slots.
     for (const auto expired : phones_.reap_expired()) {
@@ -83,27 +84,59 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
             retire_failed_pairing(active.value().consumer, request, peer);
             (void)gate_.cancel({active.value().consumer, active.value().name}, request);
             events_.emit(PairingClosed{request});
+            events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_helper_failed", request.value});
             return granted.error();
         }
+        // The helper RPC may outlive the request's deadline or its live binding. Revalidate with
+        // the same predicate before anything opens: an expired request retires the authority the
+        // helper just activated (comparison enrolment has not persisted anything yet either).
+        const auto still_live = phones_.validate_pairing(request);
+        if (!still_live) {
+            phones_.pairing_cancelled(request);
+            retire_failed_pairing(active.value().consumer, request, peer);
+            (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+            events_.emit(PairingClosed{request});
+            return still_live.error();
+        }
     }
+    if (confirmation_ && confirmation_->requires_comparison()) {
+        open_pairing_ = OpenPairing{request, {}, phones_.pairing_wireless_identity(request),
+            now() + std::chrono::seconds(60)};
+        open_pairing_->awaiting_acceptance = true;
+        events_.emit(PairingOpened{request});
+        return {};
+    }
+    return persist_pairing(active.value(), request);
+}
+
+core::Result<void> ControlService::persist_pairing(const Registered& active, core::PairingRequestId request, bool* durable) {
+    if (durable) *durable = true;
+    const bool comparison = open_pairing_ && open_pairing_->request == request && open_pairing_->awaiting_acceptance;
+    // Captured before pairing_confirmed() consumes the pending snapshot.
+    const auto compared_peer = comparison ? open_pairing_->peer : phones_.pairing_wireless_identity(request);
     auto approved = phones_.pairing_confirmed(request);
     if (!approved && approved.error().code() == ErrorCode::trust_store_not_durable) {
         if (const auto committed = phones_.committed_pairing()) {
             approved = *committed;
+            if (durable) *durable = false;
             events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_approval_not_durable", request.value});
         }
     }
     if (!approved) {
-        retire_failed_pairing(active.value().consumer, request, peer);
-        (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+        if (confirmation_ != nullptr) {
+            // A comparison bond was acknowledged before this write: retire it with tracking.
+            if (comparison) retire_acknowledged_pairing(active.consumer, request, compared_peer);
+            else retire_failed_pairing(active.consumer, request, compared_peer);
+        }
+        (void)gate_.cancel({active.consumer, active.name}, request);
         events_.emit(PairingClosed{request});
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return approved.error();
     }
     open_pairing_ = OpenPairing{request, approved.value(), phones_.wireless_identity(approved.value()),
                                now() + std::chrono::seconds(60)};
-    events_.emit(PairingOpened{request});
-    events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_opened", request.value});
+    if (!comparison) events_.emit(PairingOpened{request});
+    events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, comparison ? "pairing_approved" : "pairing_opened", request.value});
     return {};
 }
 
@@ -133,10 +166,14 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
     const auto admitted = admit(caller, active.value());
     if (!admitted) return admitted.error();
     if (!phone) return Error{ErrorCode::invalid_argument};
+    return revoke_phone(active.value(), phone);
+}
+core::Result<void> ControlService::revoke_phone(const Registered& active, core::PhoneId phone) {
     for (auto it = revocations_.begin(); it != revocations_.end(); ++it) {
         if (it->snapshot.phone != phone) continue;
         const auto retried = attempt_revocation(*it);
         const bool not_durable = it->not_durable;
+        if (!it->progress.complete()) request_reconcile();
         if (it->progress.complete()) revocations_.erase(it);
         return not_durable ? core::Result<void>{Error{ErrorCode::trust_store_not_durable}} : retried;
     }
@@ -156,7 +193,7 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
     std::sort(closed.begin(), closed.end(), [](auto a, auto b) { return a.value < b.value; });
     closed.erase(std::unique(closed.begin(), closed.end()), closed.end());
     for (const auto request : closed) {
-        (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+        (void)gate_.cancel({active.consumer, active.name}, request);
         events_.emit(PairingClosed{request});
     }
     core::Result<void> external;
@@ -168,10 +205,13 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
             helper::RevocationProgress progress;
             if (peer) progress.bond = helper::RevocationLeg::pending;
             progress.retirements.reserve(closed.size());
-            for (const auto request : closed) progress.retirements.push_back({active.value().consumer, request});
+            for (const auto request : closed) progress.retirements.push_back({active.consumer, request});
             revocations_.push_back({*snapshot, progress, !forgotten.has_value()});
             external = attempt_revocation(revocations_.back());
             if (revocations_.back().progress.complete()) revocations_.pop_back();
+            // The store no longer approves the identity: the next reconciliation (on the next
+            // refresh, whatever happened to the RevokePeerV1 fast path) resolves the bond leg.
+            else if (peer) request_reconcile();
         }
     }
     if (!forgotten) return forgotten.error();

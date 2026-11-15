@@ -47,6 +47,6 @@ using SnapshotProvider = std::function<core::Result<ApSnapshot>()>;
 using SnapshotFence = std::function<bool(std::uint64_t, const std::function<void()>&)>;
 enum class HandoffFailure : std::uint32_t {
     none, denied, eligibility, eof, unknown_id, wrong_order, duplicate,
-    oversize, truncated, protobuf, phone_rejected, timeout, write, snapshot
+    oversize, truncated, protobuf, phone_rejected, timeout, write, snapshot, rebind
 };
 }

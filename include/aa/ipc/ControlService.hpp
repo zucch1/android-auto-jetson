@@ -146,6 +146,9 @@ public:
     virtual bool same_wireless_identity(const helper::PeerIdentity& a,
                                         const helper::PeerIdentity& b) const { return a == b; }
     virtual std::optional<helper::PeerIdentity> wireless_identity(core::PhoneId) const { return std::nullopt; }
+    // Every approved wireless identity (the bond authority sent to the helper's reconciliation);
+    // nullopt when the store is unusable, so nothing is reconciled and the helper stays fail-closed.
+    virtual std::optional<std::vector<helper::PeerIdentity>> approved_wireless() const { return std::nullopt; }
     virtual std::optional<helper::PeerIdentity> pairing_wireless_identity(core::PairingRequestId) const { return std::nullopt; }
     virtual std::optional<helper::PeerIdentity> take_expired_wireless_identity(core::PairingRequestId) {
         return std::nullopt;
@@ -168,7 +171,7 @@ struct ControlServiceDeps final {
 };
 
 // Session D-Bus control dispatcher (task 21) for
-// org.custom.AndroidAutoReceiver1: the twelve contract methods with their
+// org.custom.AndroidAutoReceiver1: the fourteen contract methods with their
 // authorization semantics, the one-time pairing request-id gate, and the
 // typed event stream behind the contract's signals.
 //
@@ -222,6 +225,8 @@ public:
     [[nodiscard]] core::Result<void> cancel_phone_pairing(const BusName& caller,
                                                           core::PairingRequestId request);
     [[nodiscard]] core::Result<void> forget_phone(const BusName& caller, core::PhoneId phone);
+    core::Result<std::map<std::string, std::string>> pairing_comparison(const BusName&, core::PairingRequestId);
+    core::Result<void> respond_pairing_comparison(const BusName&, core::PairingRequestId, helper::ComparisonResponse);
 
     // GetState / GetCapabilities / Ping (open to every caller). state()
     // reconciles the incumbent owner before snapshotting and can emit the
@@ -261,6 +266,20 @@ private:
 
     [[nodiscard]] core::Result<Registered> require_consumer();
     [[nodiscard]] core::Result<void> admit(const BusName& caller, const Registered& active);
+    // durable (optional out): false when the approval landed only as a committed-but-not-durable
+    // store result (703).
+    core::Result<void> persist_pairing(const Registered&, core::PairingRequestId, bool* durable = nullptr);
+    // Revokes an approved phone: store forget plus tracked external revocation (ForgetPhone's core).
+    core::Result<void> revoke_phone(const Registered&, core::PhoneId);
+    void close_enrolment(std::string_view reason, bool bond_recorded = false);
+    // Bond reconciliation (docs/enrolment-ordering.md). Paced from refresh_consumer_owner(): due at
+    // start, after any helper failure and whenever an enrolment ends without a commit; otherwise a
+    // cheap owner/set check per second that reconciles a reappeared helper. A success resolves
+    // every revocation record's bond leg whose identity the store no longer approves.
+    void reconcile_bonds();
+    void request_reconcile() { reconcile_due_ = true; next_reconcile_ = std::chrono::steady_clock::time_point::min(); }
+    bool reconcile_enrolment(core::PairingRequestId, bool bond_recorded);
+    void advance_enrolment();
     struct PendingRevocation {
         helper::RevocationV1 snapshot;
         helper::RevocationProgress progress;
@@ -270,6 +289,11 @@ private:
             std::chrono::steady_clock::time_point::min()};
     };
     [[nodiscard]] std::chrono::steady_clock::time_point now() const;
+    // A numeric-comparison bond the helper may already manage whose enrolment did not complete:
+    // the existing revocation record (bond leg + source retirement) removes it and blocks the
+    // identity until acknowledged. It is retried by the same bounded loop as source-only records.
+    void retire_acknowledged_pairing(core::ConsumerId, core::PairingRequestId,
+                                     const std::optional<helper::PeerIdentity>&);
     core::Result<void> attempt_revocation(PendingRevocation& record);
     void retire_failed_pairing(core::ConsumerId, core::PairingRequestId,
                                const std::optional<helper::PeerIdentity>&);
@@ -284,6 +308,10 @@ private:
     std::function<std::chrono::steady_clock::time_point()> clock_{};
     std::vector<PendingRevocation> revocations_;
     std::size_t source_retry_cursor_{0};
+    bool reconcile_due_{true};
+    bool reconcile_failing_{};
+    std::uint64_t reconcile_unadmitted_{};
+    std::chrono::steady_clock::time_point next_reconcile_{std::chrono::steady_clock::time_point::min()};
     std::optional<Registered> registered_{};
     ProjectionState projection_{ProjectionState::stopped};
     std::optional<Viewport> viewport_{};
@@ -293,6 +321,9 @@ private:
         core::PhoneId phone;
         std::optional<helper::PeerIdentity> peer;
         std::chrono::steady_clock::time_point deadline;
+        std::optional<std::uint64_t> presented_comparison{};
+        bool awaiting_acceptance{};
+        bool accepted{};
     };
     std::optional<OpenPairing> open_pairing_;
 };

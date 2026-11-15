@@ -3,6 +3,7 @@
 #include <aa/core/Ids.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/helper/ObservedPeer.hpp>
+#include <aa/helper/PairingComparison.hpp>
 #include <aa/trust/Identity.hpp>
 #include <cstddef>
 #include <optional>
@@ -54,6 +55,38 @@ struct RevocationAttempt final {
 class Confirmation {
 public:
     virtual ~Confirmation() = default;
+    virtual bool requires_comparison() const { return false; }
+    // Verification only; records nothing in the helper.
+    virtual core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) {
+        return Error{ErrorCode::helper_rejected};
+    }
+    // The helper marks the verified bond provisional (not admitted, cleanup obligation kept).
+    // Called only after every receiver-side check passed; a later failure must retire the bond
+    // through tracked revocation.
+    virtual core::Result<void> bond_acknowledged(core::ConsumerId, core::PairingRequestId) {
+        return Error{ErrorCode::helper_rejected};
+    }
+    // The helper admits the provisional bond. Called only after the receiver's durable trust
+    // write; a failure must retract that approval (the bond is not admitted).
+    virtual core::Result<void> bond_committed(core::ConsumerId, core::PairingRequestId) {
+        return Error{ErrorCode::helper_rejected};
+    }
+    // Bond reconciliation (docs/enrolment-ordering.md): the receiver's trust store is the single
+    // authority and the helper's bond files are its reconciled cache. reconciles() is false for a
+    // confirmation without a bond-managing helper; ControlService then never calls reconcile_bonds.
+    virtual bool reconciles() const { return false; }
+    // Sends the approved wireless identities (at most 256). force=false may skip the exchange when
+    // this helper incarnation already reconciled exactly this set. Low 32 bits of the value: approved
+    // identities the helper left unadmitted; bit 32: an open enrolment window was left alone.
+    virtual core::Result<std::uint64_t> reconcile_bonds(const std::vector<PeerIdentity>&, bool /*force*/) {
+        return Error{ErrorCode::helper_protocol_mismatch};
+    }
+    virtual core::Result<PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) {
+        return Error{ErrorCode::helper_rejected};
+    }
+    virtual core::Result<void> respond_comparison(core::ConsumerId, core::PairingRequestId, ComparisonResponse) {
+        return Error{ErrorCode::helper_rejected};
+    }
     virtual core::Result<void> confirmed(core::ConsumerId generation,
                                          core::PairingRequestId source) = 0;
     // Success acknowledges source retirement; failure must remain retryable.

@@ -3,6 +3,7 @@
 #include <aa/helper/Identity.hpp>
 #include <aa/helper/ObservedPeer.hpp>
 #include <aa/helper/ApSnapshot.hpp>
+#include <aa/helper/PairingComparison.hpp>
 #include <chrono>
 #include <optional>
 #include <vector>
@@ -13,6 +14,12 @@ enum class Action : std::uint32_t {
     modem_status, register_profile, unregister_profile, reconnect, close_pairing
 };
 enum class State : std::uint32_t { inactive, active, unavailable };
+// AP channels the helper may operate: non-DFS UNII-1. The exact channel is the
+// operator's ap.conf choice; the receiver must request that same channel.
+constexpr bool ap_channel_allowed(std::uint32_t channel) {
+    return channel == 36 || channel == 40 || channel == 44 || channel == 48;
+}
+constexpr std::uint32_t ap_frequency_mhz(std::uint32_t channel) { return 5000 + 5 * channel; }
 struct Invocation final {
     Action action{};
     std::uint32_t channel{};
@@ -38,6 +45,21 @@ public:
     // Backends without observations can use full cleanup.
     virtual void retire_lease() noexcept { cleanup(); }
     virtual void tick() {}
+    // Verification only: accepted comparison and an exact bonded snapshot. Records nothing.
+    virtual core::Result<bool> bond_confirmed() { return Error{ErrorCode::helper_rejected}; }
+    // Marks the verified bond provisional: the receiver's checks passed, its trust write has not
+    // happened yet. Records nothing durable; the pending-removal journal entry stays in place.
+    virtual core::Result<void> acknowledge_bond() { return Error{ErrorCode::helper_rejected}; }
+    // Admits the provisional bond. The receiver calls it only after its durable trust write;
+    // a failure leaves the bond unadmitted with its cleanup obligation intact.
+    virtual core::Result<void> commit_bond() { return Error{ErrorCode::helper_rejected}; }
+    // Makes the helper's bond state match the receiver's approved wireless identities (the single
+    // authority), durably and idempotently. Low 32 bits: approved identities left unadmitted;
+    // bit 32: an open enrolment window was left to its own outcome (reconcile again later).
+    // A backend that keeps no bond state has nothing to reconcile.
+    virtual core::Result<std::uint64_t> reconcile_bonds(const std::vector<PeerIdentity>&) { return std::uint64_t{0}; }
+    virtual core::Result<PairingComparison> comparison() { return Error{ErrorCode::helper_rejected}; }
+    virtual core::Result<void> respond_comparison(ComparisonResponse) { return Error{ErrorCode::helper_rejected}; }
     virtual core::Result<void> revoke(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
     virtual core::Result<ObservedPeer> observe() { return Error{ErrorCode::helper_unavailable}; }
     virtual core::Result<State> authorize(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
@@ -55,6 +77,8 @@ public:
     virtual SnapshotDeadline handoff_deadline() const { return {}; }
     virtual bool snapshot_current(std::uint64_t) { return false; }
     virtual bool with_snapshot(std::uint64_t, const std::function<void()>&) { return false; }
+    // Replace the current activation's credentials with a new activation.
+    virtual void rekey(std::uint64_t) {}
 };
 class UnavailableBackend final : public Backend {
 public:
@@ -86,6 +110,13 @@ public:
     core::Result<void> revoke(const std::string& sender, std::uint64_t phone);
     core::Result<ObservedPeer> observe(const std::string& sender);
     core::Result<void> bind(const std::string& sender, Source source, std::uint64_t handle);
+    core::Result<bool> bond_confirmed(const std::string&, Source);
+    core::Result<void> acknowledge_bond(const std::string&, Source);
+    core::Result<void> commit_bond(const std::string&, Source);
+    static constexpr std::size_t kMaxApprovedBonds = 256;
+    core::Result<std::uint64_t> reconcile_bonds(const std::string&, const std::vector<PeerIdentity>&);
+    core::Result<PairingComparison> comparison(const std::string&, Source);
+    core::Result<void> respond_comparison(const std::string&, Source, ComparisonResponse);
     core::Result<State> reconnect_peer(const std::string& sender, std::uint64_t handle);
     core::Result<void> revoke_peer(const std::string& sender, const PeerIdentity& identity);
     core::Result<ObservedPeer> poll_handoff(const std::string&, Source);
@@ -129,8 +160,16 @@ private:
     std::vector<Binding> bindings_;
     std::optional<Binding> handoff_binding_;
     std::optional<ApSnapshot> handoff_snapshot_;
+    // An activation's credentials are released over RFCOMM to one phone only.
+    struct ActivationOwner { std::uint64_t generation; PeerIdentity peer; };
+    std::optional<ActivationOwner> activation_owner_;
+    bool owned_by_other(std::uint64_t generation, const PeerIdentity& peer) const {
+        return activation_owner_ && activation_owner_->generation == generation && activation_owner_->peer != peer;
+    }
+    void rebind(std::uint64_t handle, std::uint64_t generation);
     bool handoff_owned(const std::string&, Source, std::uint64_t);
     bool handoff_bound(Source, std::uint64_t);
+    std::optional<PeerIdentity> bound_peer(Source, std::uint64_t);
     core::Result<ApSnapshot> validated_snapshot(Source, std::uint64_t);
     void retire_handoff(std::uint64_t, HandoffFailure);
 };

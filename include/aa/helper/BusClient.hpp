@@ -27,11 +27,22 @@ public:
     core::Result<Response> call(const Request&, core::Milliseconds, core::CancellationToken) override;
     core::Result<State> status(Action action);
     core::Result<State> reconnect(const trust::TransportIdentity& identity);
-    core::Result<State> acquire_ap(Source source);
+    core::Result<State> acquire_ap(Source source, std::uint32_t channel = 36);
     core::Result<ObservedPeer> poll_bootstrap(Source, HandoffFailure&);
     core::Result<void> authorize_bootstrap(Source, std::uint64_t handle, bool allow, bool listener_ready);
     core::Result<ApSnapshot> get_ap_credentials(Source, std::uint64_t handle);
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override;
+    bool requires_comparison() const override { return true; }
+    core::Result<bool> bond_confirmed(core::ConsumerId, core::PairingRequestId) override;
+    core::Result<void> bond_acknowledged(core::ConsumerId, core::PairingRequestId) override;
+    core::Result<void> bond_committed(core::ConsumerId, core::PairingRequestId) override;
+    bool reconciles() const override { return true; }
+    // Must run on the store owner thread (it may be called with the store's own approvals).
+    core::Result<std::uint64_t> reconcile_bonds(const std::vector<PeerIdentity>&, bool force) override;
+    // The store's approved wireless identities, the set every reconciliation sends.
+    static std::vector<PeerIdentity> approved_bonds(const trust::ApprovedPhoneStore&);
+    core::Result<PairingComparison> comparison(core::ConsumerId, core::PairingRequestId) override;
+    core::Result<void> respond_comparison(core::ConsumerId, core::PairingRequestId, ComparisonResponse) override;
     core::Result<void> cancel(core::ConsumerId, core::PairingRequestId) override;
     void teardown(core::ConsumerId) override;
     RevocationAttempt forgotten_v1(const RevocationV1&, const RevocationProgress&) override;

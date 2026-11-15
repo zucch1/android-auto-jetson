@@ -14,17 +14,51 @@ public:
                          std::function<void(core::ConsumerId)> lost)
         : target_(target), active_(std::move(active)), lost_(std::move(lost)) {}
     ~WirelessConfirmation() override { flush(true); }
+    bool requires_comparison() const override { return target_.requires_comparison(); }
+    core::Result<bool> bond_confirmed(core::ConsumerId generation, core::PairingRequestId request) override {
+        flush();
+        if (deferred_) return Error{ErrorCode::helper_rejected};
+        return target_.bond_confirmed(generation, request);
+    }
+    core::Result<void> bond_acknowledged(core::ConsumerId generation, core::PairingRequestId request) override {
+        flush();
+        if (deferred_) return Error{ErrorCode::helper_rejected};
+        return target_.bond_acknowledged(generation, request);
+    }
+    core::Result<void> bond_committed(core::ConsumerId generation, core::PairingRequestId request) override {
+        flush();
+        if (deferred_) return Error{ErrorCode::helper_rejected};
+        return target_.bond_committed(generation, request);
+    }
+    bool reconciles() const override { return target_.reconciles(); }
+    // Not consumer-bound: the trust store's approvals, independent of any deferred teardown.
+    core::Result<std::uint64_t> reconcile_bonds(const std::vector<helper::PeerIdentity>& approved, bool force) override {
+        return target_.reconcile_bonds(approved, force);
+    }
     core::Result<void> confirmed(core::ConsumerId generation, core::PairingRequestId source) override {
         flush();
         if (deferred_) return Error{ErrorCode::helper_rejected};
         return target_.confirmed(generation, source);
     }
     core::Result<std::optional<helper::PeerIdentity>> prepare(core::ConsumerId generation,
-                                                           core::PairingRequestId source) override {
+                                                            core::PairingRequestId source) override {
         flush();
         if (deferred_) return Error{ErrorCode::helper_rejected};
         return target_.prepare(generation, source);
     }
+    core::Result<helper::PairingComparison> comparison(core::ConsumerId generation,
+                                                        core::PairingRequestId source) override {
+        flush();
+        if (deferred_) return Error{ErrorCode::helper_rejected};
+        return target_.comparison(generation, source);
+    }
+    core::Result<void> respond_comparison(core::ConsumerId generation, core::PairingRequestId source,
+                                          helper::ComparisonResponse response) override {
+        flush();
+        if (deferred_) return Error{ErrorCode::helper_rejected};
+        return target_.respond_comparison(generation, source, response);
+    }
+
     core::Result<void> cancel(core::ConsumerId generation, core::PairingRequestId source) override {
         return target_.cancel(generation, source);
     }

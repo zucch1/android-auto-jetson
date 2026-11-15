@@ -13,6 +13,12 @@ public:
                           std::uint32_t state_owner = 0);
     ~BluezBackend() override;
     bool available() const;
+    core::Result<bool> bond_confirmed() override;
+    core::Result<void> acknowledge_bond() override;
+    core::Result<void> commit_bond() override;
+    core::Result<std::uint64_t> reconcile_bonds(const std::vector<PeerIdentity>&) override;
+    core::Result<PairingComparison> comparison() override;
+    core::Result<void> respond_comparison(ComparisonResponse) override;
     // Why persistent managed-bond state was rejected at startup; empty when it loaded.
     std::string state_error() const;
     core::Result<State> apply(Action, std::uint32_t) override;

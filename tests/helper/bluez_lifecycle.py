@@ -43,14 +43,36 @@ def unregister_stays_off(build: Path) -> None:
             # Given a registered real daemon and a pending exact-peer grant.
             surface = Surface(stack, build, Path(temporary), probe=True)
             assert rpc(surface, "execute 7") == (0, 1)
+            assert rpc(surface, "reconcile") == (0, 0)  # the receiver's start-up answer: nothing approved
             command(surface.mock, "paired")
+            error, handle = rpc(surface, "poll")
+            assert error == 0 and handle
+            # Establish a managed bond through explicit consent before testing trusted reconnect.
+            assert rpc(surface, f"bind {handle} 100")[0] == 0
+            error, enrolled = rpc(surface, "issue 100")
+            assert error == 0 and rpc(surface, f"open {enrolled}")[0] == 0
+            command(surface.mock, "comparison-start")
+            challenge = [0]
+            def presented():
+                error, challenge[0] = rpc(surface, "comparison 100")
+                return error == 0 and challenge[0] != 0
+            wait(presented)
+            assert rpc(surface, f"respond 100 {challenge[0]}")[0] == 0
+            assert rpc(surface, "bond 100") == (0, 1)
+            assert rpc(surface, "ack 100") == (0, 0)
+            assert rpc(surface, "commit 100") == (0, 0)
+            assert rpc(surface, "close")[0] == 0
             error, handle = rpc(surface, "poll")
             assert error == 0 and handle
             assert rpc(surface, f"bind {handle} 1")[0] == 0
             error, grant = rpc(surface, "issue 1")
             assert error == 0 and grant
             # When the authenticated receiver explicitly unregisters.
+            error, fresh = rpc(surface, "poll")
+            assert error == 0 and fresh
+            assert rpc(surface, f"reconnect {fresh}")[0] == 0
             assert rpc(surface, "execute 8") == (0, 0)
+            assert command(surface.mock, "AuthorizeService hfp") == "rejected"
             # Then idle, observations, consumed grants and owner changes stay off.
             stays_unregistered(surface)
             assert rpc(surface, "poll")[0] == 1000
@@ -72,7 +94,7 @@ def unregister_stays_off(build: Path) -> None:
             assert len(surface.state()["profile"]) == 1
             command(surface.mock, "release-name")
             command(surface.mock, "acquire-name")
-            wait(lambda: bool(surface.state()["profile"]))
+            wait(lambda: len(surface.state()["profile"]) == 1)
             assert rpc(surface, "poll")[0] == 0
             assert surface.state()["removed"] == []
             print("PASS unregister persists across idle, peer operations and owner changes; explicit register restores", flush=True)

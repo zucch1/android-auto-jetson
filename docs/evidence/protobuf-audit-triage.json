@@ -3165,7 +3165,7 @@
    "owner": "child-5-wireless-bt-radio",
    "phone_evidence_status": "unknown, needs phone evidence",
    "rationale": "Bootstrap.cpp implements core RFCOMM record IDs 1/2/3/6/7; remaining aaw.* parity requires phone RFCOMM capture.",
-   "severity": "low-medium",
+   "severity": "medium",
    "status": "proposed",
    "version_applicability": "AA 16.1"
   },

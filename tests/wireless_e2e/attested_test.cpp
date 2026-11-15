@@ -10,11 +10,24 @@ namespace tr = aa::transport;
 
 using wireless_test::walk_phone;
 
-TEST(WirelessAttested, TestOnlyAssertionReachesActiveAapAndWifiOverRealTls) {
+TEST(WirelessAttested, ListenerOutsideValidatedActivationNeverCreatesAapSession) {
     wireless_test::Fixture f;
-    f.link.attest_for_test([&](const tr::TcpTransport&, const aa::trust::PhoneIdentity& identity) {
-        return identity.key == f.identity.key;
-    });
+    f.start();
+    auto listener_snapshot = f.snapshot;
+    listener_snapshot.generation = 2; // a listener not started from the validated activation
+    ASSERT_TRUE(f.link.listen(listener_snapshot));
+    auto phone = f.connect();
+    ASSERT_TRUE(phone);
+    const auto result = f.link.poll(f.coordinator);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::transport_unauthorized_peer);
+    EXPECT_EQ(f.link.session(), nullptr);
+    phone.value()->set_io_deadline(std::chrono::steady_clock::now() + 1s);
+    EXPECT_FALSE(phone.value()->receive());
+}
+
+TEST(WirelessAttested, ProductionAdmissionReachesActiveAapAndWifiOverRealTls) {
+    wireless_test::Fixture f;
     f.start();
     auto tcp = f.connect();
     ASSERT_TRUE(tcp);
@@ -50,7 +63,6 @@ TEST(WirelessAttested, TestOnlyAssertionReachesActiveAapAndWifiOverRealTls) {
 
 TEST(WirelessAttested, SilentAuthenticationExpiresWithinTenSeconds) {
     wireless_test::Fixture f;
-    f.link.attest_for_test([](const tr::TcpTransport&, const aa::trust::PhoneIdentity&) { return true; });
     f.start();
     auto tcp = f.connect();
     ASSERT_TRUE(tcp);
@@ -64,7 +76,6 @@ TEST(WirelessAttested, SilentAuthenticationExpiresWithinTenSeconds) {
 
 TEST(WirelessAttested, SilentAuthenticationHelperLossAndTeardownAreBounded) {
     wireless_test::Fixture f;
-    f.link.attest_for_test([](const tr::TcpTransport&, const aa::trust::PhoneIdentity&) { return true; });
     f.start();
     auto tcp = f.connect();
     ASSERT_TRUE(tcp);
@@ -74,5 +85,14 @@ TEST(WirelessAttested, SilentAuthenticationHelperLossAndTeardownAreBounded) {
     EXPECT_FALSE(f.link.poll(f.coordinator));
     EXPECT_FALSE(f.link.listening());
     EXPECT_LT(std::chrono::steady_clock::now() - began, 1s);
+}TEST(WirelessAttested, FirstSocketOnValidatedActivationAdmitsAndClosesAdmission) {
+    wireless_test::Fixture f;
+    f.start();
+    auto first = f.connect(); ASSERT_TRUE(first);
+    auto duplicate = f.connect(); ASSERT_TRUE(duplicate);
+    const auto result = f.link.poll(f.coordinator);
+    ASSERT_TRUE(result) << static_cast<int>(result.error().code());
+    EXPECT_NE(f.link.session(), nullptr);
+    EXPECT_FALSE(f.link.listening());
 }
 }
