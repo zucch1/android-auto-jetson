@@ -255,3 +255,139 @@ TEST(WiredReceiver, CodecSpecificRandomAccessDetection) {
     EXPECT_FALSE(is_idr_au({0x32,127,0},p::VideoCodec::av1,&reduced));
     EXPECT_TRUE(is_idr_au({0x0a,1,8,0x32,1,0x80},p::VideoCodec::av1,&reduced));
 }
+
+#include <aa/diagnostics/SafeLogSink.hpp>
+
+TEST(WiredReceiver, VideoOutletLogsAtNegotiatedSixtyFpsCadence) {
+    // Given: an outlet without a consumer receiving 60 fps metadata.
+    std::vector<std::string> drop_logs;
+    VideoOutlet drop_outlet{[&](const std::string& line) { drop_logs.push_back(line); }};
+    p::MessageHeader header60{p::ChannelRole::video, 1, {100}};
+    header60.video_profile = p::VideoProfile{1920, 1080, 60};
+    for (int i = 0; i < 62; ++i) {
+        ASSERT_TRUE(drop_outlet.on_message({header60, wiredtest::kVideoIdr}));
+    }
+    EXPECT_NE(std::find(drop_logs.begin(), drop_logs.end(),
+                        "{\"event\":\"video_dropped\",\"reason\":\"no_consumer\",\"count\":1}"),
+              drop_logs.end());
+    EXPECT_EQ(std::find(drop_logs.begin(), drop_logs.end(),
+                        "{\"event\":\"video_dropped\",\"reason\":\"no_consumer\",\"count\":31}"),
+              drop_logs.end());
+    EXPECT_NE(std::find(drop_logs.begin(), drop_logs.end(),
+                        "{\"event\":\"video_dropped\",\"reason\":\"no_consumer\",\"count\":61}"),
+              drop_logs.end());
+
+    // And: an outlet with a consumer sending 60 fps frames emits video_sent every 60 frames.
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    std::vector<std::string> sent_logs;
+    VideoOutlet send_outlet{[&](const std::string& line) { sent_logs.push_back(line); }};
+    send_outlet.install(std::move(pair.value().producer));
+    for (int i = 1; i <= 62; ++i) {
+        header60.sequence = static_cast<std::uint64_t>(i);
+        header60.timestamp = aa::core::Nanoseconds{i * 100};
+        ASSERT_TRUE(send_outlet.on_message({header60, wiredtest::kVideoIdr}));
+        ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    }
+    EXPECT_NE(std::find(sent_logs.begin(), sent_logs.end(), "{\"event\":\"video_sent\",\"units\":1}"),
+              sent_logs.end());
+    EXPECT_EQ(std::find(sent_logs.begin(), sent_logs.end(), "{\"event\":\"video_sent\",\"units\":31}"),
+              sent_logs.end());
+    EXPECT_NE(std::find(sent_logs.begin(), sent_logs.end(), "{\"event\":\"video_sent\",\"units\":61}"),
+              sent_logs.end());
+}
+
+TEST(WiredReceiver, SessionNegotiatingEachCodecLogsWithoutRedactionOrRejection) {
+    struct LogCapture final : aa::core::LogSink {
+        std::string message;
+        std::vector<aa::core::LogField> fields;
+        void write(const aa::core::LogEvent& event) override {
+            message = event.message;
+            fields = event.fields;
+        }
+    };
+    for (const auto codec : p::kVideoCodecs) {
+        SCOPED_TRACE(p::codec_name(codec));
+        aa::session::test::MapTrustStore trust;
+        const aa::trust::PhoneIdentity phone{"codec-log-test-phone"};
+        trust.set(phone, aa::trust::Decision::approved);
+        aa::session::test::ManualClock clock;
+        wiredtest::CaptureSink capture;
+        aa::diagnostics::Diagnostics diagnostics{capture};
+        LogCapture log_capture;
+        aa::diagnostics::SafeLogSink safe_log{log_capture};
+        wiredtest::ScriptedTransport transport;
+        std::vector<std::string> outlet_logs;
+        VideoOutlet outlet{[&](const std::string& line) { outlet_logs.push_back(line); }};
+        auto pair = videotest::make_pair({});
+        ASSERT_TRUE(pair);
+        outlet.install(std::move(pair.value().producer));
+
+        auto services = wiredtest::golden_services();
+        std::get<p::VideoConfiguration>(services.front().configuration).profiles = {
+            {1280, 720, 30, codec}};
+        aa::app::WiredSession session{{trust, clock, diagnostics}};
+        ASSERT_TRUE(session.configure(services));
+        ASSERT_TRUE(session.register_av_sink(p::ChannelRole::video, outlet));
+        session.attach_transport(&transport);
+        auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+        auto* cipher = owned.get();
+        session.attach_cipher(std::move(owned));
+        ASSERT_TRUE(session.apply(aa::session::Event::start_discovery));
+        ASSERT_TRUE(session.phone_discovered(phone));
+        ASSERT_TRUE(session.apply(aa::session::Event::transport_ready));
+        wiredtest::walk_auth(session, transport);
+        ASSERT_TRUE(session.authenticated());
+        ASSERT_TRUE(session.announce_services());
+
+        const auto receive = [&](std::vector<std::byte> payload) -> aa::core::Result<bool> {
+            auto frames = tr::encode_message({99, tr::MessageKind::specific, std::move(payload)},
+                                             tr::Encryption::encrypted, cipher);
+            if (!frames) { return frames.error(); }
+            for (auto& frame : frames.value()) { transport.push_inbound(std::move(frame)); }
+            return session.poll_transport();
+        };
+        ASSERT_TRUE(receive(p::encode(p::AvSinkSetup{static_cast<p::AvSinkCodec>(codec)}).value()));
+        ASSERT_TRUE(receive(p::encode(p::AvSinkStart{1, 0}).value()));
+        const std::vector<std::byte> idr = [&] {
+            std::vector<std::byte> bytes(10, std::byte{0});
+            switch (codec) {
+            case p::VideoCodec::h264:
+                bytes.insert(bytes.end(), wiredtest::kVideoIdr.begin(), wiredtest::kVideoIdr.end());
+                break;
+            case p::VideoCodec::h265:
+                bytes.insert(bytes.end(), {std::byte{0}, std::byte{0}, std::byte{1}, std::byte{0x26}, std::byte{1}});
+                break;
+            case p::VideoCodec::vp9:
+                bytes.insert(bytes.end(), {std::byte{0x82}, std::byte{0x49}, std::byte{0x83}, std::byte{0x42}});
+                break;
+            case p::VideoCodec::av1:
+                bytes.insert(bytes.end(), {std::byte{0x0a}, std::byte{1}, std::byte{0}, std::byte{0x32}, std::byte{1}, std::byte{0}});
+                break;
+            }
+            return bytes;
+        }();
+        ASSERT_TRUE(receive(idr));
+        ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+        const auto negotiated = pair.value().consumer.access_unit().profile;
+        ASSERT_TRUE(negotiated);
+        EXPECT_EQ(negotiated->codec, codec);
+        const std::string codec_str{p::codec_name(negotiated->codec)};
+
+        aa::diagnostics::Event event{};
+        event.kind = aa::diagnostics::EventKind::capability_negotiated;
+        event.fields.push_back(aa::diagnostics::EventField::text("codec", codec_str));
+        diagnostics.emit(event);
+        EXPECT_TRUE(capture.contains(std::string{"\"codec\":\""} + codec_str + "\""));
+        EXPECT_FALSE(capture.contains("[redacted]"));
+
+        safe_log.write({aa::core::LogLevel::info, "capability_negotiated", {{"codec", codec_str}}});
+        EXPECT_EQ(log_capture.message, "capability_negotiated");
+        ASSERT_EQ(log_capture.fields.size(), 1u);
+        EXPECT_EQ(log_capture.fields[0].value, codec_str);
+        EXPECT_NE(std::find(outlet_logs.begin(), outlet_logs.end(),
+                            "{\"event\":\"video_profile\",\"width\":1280,\"height\":720,\"fps\":30,\"codec\":\""
+                                + codec_str + "\"}"),
+                  outlet_logs.end());
+    }
+}

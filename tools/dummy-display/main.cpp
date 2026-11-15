@@ -237,12 +237,19 @@ int main(int argc, char** argv) {
     const auto decoder_backend = pipeline.decoder == aa::display::Decoder::hardware
         ? aa::consumer::DecodeBackend::nvidia : pipeline.decoder == aa::display::Decoder::automatic
         ? aa::consumer::DecodeBackend::automatic : aa::consumer::DecodeBackend::software;
-    if (!pipeline.legacy_decoder_backend) {
-        const auto refusal = aa::tools::unavailable_profiles(video_profiles,decoder_backend);
-        if (!refusal.empty()) { std::fprintf(stderr,"%s\n",refusal.c_str()); return 2; }
+    std::vector<std::pair<aa::protocol::VideoCodec, aa::consumer::DecodeReport>> codec_reports;
+    if (pipeline.legacy_decoder_backend) {
+        const auto codec = video_profiles.front().codec;
+        codec_reports.emplace_back(codec, aa::consumer::DecodeHelper::probe_backends(codec));
+    } else {
+        for (const auto& profile : video_profiles) {
+            if (std::none_of(codec_reports.begin(), codec_reports.end(),
+                    [&](const auto& item) { return item.first == profile.codec; })) {
+                codec_reports.emplace_back(profile.codec, aa::consumer::DecodeHelper::probe_backends(profile.codec));
+            }
+        }
     }
-    if (const auto refusal = aa::display::check_pipeline(pipeline,
-            aa::consumer::DecodeHelper::probe_backends(video_profiles.front().codec))) {
+    if (const auto refusal = aa::display::check_pipeline(pipeline, codec_reports)) {
         std::fprintf(stderr,"%.*s: %.*s\n",static_cast<int>(aa::to_string(refusal->code).size()),aa::to_string(refusal->code).data(),
             static_cast<int>(refusal->message.size()),refusal->message.data()); return 2;
     }

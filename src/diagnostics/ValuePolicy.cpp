@@ -64,7 +64,7 @@ struct ValueValidator {
         case TelemetryType::decision:
             return one_of(value, {"allow", "deny", "accept", "reject", "retry", "stop"});
         case TelemetryType::transport: return one_of(value, {"usb", "tcp", "wired", "wireless"});
-        case TelemetryType::codec: return one_of(value, {"h264", "pcm", "aac"});
+        case TelemetryType::codec: return one_of(value, {"h264", "h265", "vp9", "av1", "pcm", "aac"});
         case TelemetryType::unknown:
         case TelemetryType::count:
         case TelemetryType::number:

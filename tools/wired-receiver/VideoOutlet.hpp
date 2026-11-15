@@ -99,7 +99,7 @@ public:
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override {
         std::lock_guard lock(mutex_);
         if (!producer_.has_value()) {
-            record_drop("no_consumer");
+            record_drop("no_consumer", frame_cadence(message.header.video_profile));
             return {};
         }
         if (message.header.video_profile != profile_ || message.header.video_session != session_ || message.header.video_generation != generation_) {
@@ -132,7 +132,7 @@ public:
                 if (ready > 0 && (peer.revents & POLLHUP) != 0) {
                     producer_->close();
                     producer_.reset();
-                    record_drop("consumer_disconnected");
+                    record_drop("consumer_disconnected", frame_cadence(profile_));
                     return {};
                 }
             }
@@ -140,16 +140,18 @@ public:
         }
         switch (sent.value()) {
         case ipc::SendStatus::dropped_backpressure:
-            record_drop("backpressure");
+            record_drop("backpressure", frame_cadence(profile_));
             return {};
         case ipc::SendStatus::dropped_waiting_idr:
-            record_drop("waiting_idr");
+            record_drop("waiting_idr", frame_cadence(profile_));
             return {};
         case ipc::SendStatus::sent:
             break;
         }
         ++units_;
-        if (units_ % 30 == 1) {
+        if (!has_sent_report_ || units_ - last_sent_report_unit_ >= frame_cadence(profile_)) {
+            has_sent_report_ = true;
+            last_sent_report_unit_ = units_;
             media("video_sent", "{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
             emit_drops(false);
         }
@@ -185,6 +187,17 @@ public:
     }
 
 private:
+    [[nodiscard]] std::uint64_t frame_cadence(
+        const std::optional<protocol::VideoProfile>& profile) const noexcept {
+        if (profile && profile->fps > 0) {
+            return static_cast<std::uint64_t>(profile->fps);
+        }
+        if (profile_ && profile_->fps > 0) {
+            return static_cast<std::uint64_t>(profile_->fps);
+        }
+        return 30ULL;
+    }
+
     void media(std::string_view kind, const std::string& line) {
         if (media_log_) {
             media_log_(kind, line);
@@ -206,9 +219,11 @@ private:
         }
     }
 
-    void record_drop(const char* reason) {
+    void record_drop(const char* reason, std::uint64_t cadence) {
         ++dropped_;
-        if (dropped_ % 30 == 1) {
+        if (!has_drop_report_ || dropped_ - last_drop_report_count_ >= cadence) {
+            has_drop_report_ = true;
+            last_drop_report_count_ = dropped_;
             media("video_dropped", std::string{"{\"event\":\"video_dropped\",\"reason\":\""} + reason +
                                        "\",\"count\":" + std::to_string(dropped_) + "}");
             emit_drops(false);
@@ -225,7 +240,11 @@ private:
     bool av1_reduced_{};
     std::uint64_t sequence_{};
     std::uint64_t units_{};
+    std::uint64_t last_sent_report_unit_{};
+    bool has_sent_report_{};
     std::uint64_t dropped_{};
+    std::uint64_t last_drop_report_count_{};
+    bool has_drop_report_{};
     std::uint64_t exported_observations_{};
 };
 

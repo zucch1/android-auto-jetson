@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -100,6 +101,7 @@ struct DecodeReport final {
     bool awaiting_idr{}; // current recovery state; an accepted IDR clears it
     bool software_path_available{true};
     std::string software_path_cause{};
+    std::optional<protocol::VideoCodec> codec{};
 };
 
 // Pure output-path policy (no GStreamer calls): a READY-viable NVMM-only

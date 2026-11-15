@@ -201,19 +201,20 @@ def case_replay(args):
         assert any(event.get("event") == "ready" for event in events), (backend, events)
     # The new options admit capabilities at startup; the legacy flag above
     # intentionally defers decoder admission until projection starts.
-    for option, value, message in (("--decoder", "hardware", None),
-
-                                   ("--presentation", "gpu", "not available on this host"),
-                                   ("--presentation", "zerocopy", "requires --decoder hardware"),
-                                   ("--media-thread", "worker", "not yet implemented")):
+    for option, value, expected, forbidden in (("--decoder", "hardware", None, None),
+                                               ("--presentation", "gpu", "not available on this host", "zerocopy"),
+                                               ("--presentation", "zerocopy", "config_invalid: zerocopy requires --decoder hardware", "nvv4l2decoder"),
+                                               ("--media-thread", "worker", "not yet implemented", None)):
         result = subprocess.run([args.display, option, value, "--check-pipeline"],
                                 capture_output=True, text=True, timeout=15)
         assert result.returncode == 2, (option, value, result)
-        if message:
-            assert message in result.stderr, result
+        if expected:
+            assert expected in result.stderr, result
         else:
             assert ("channel_decode_unavailable" in result.stderr and "nvv4l2decoder" in result.stderr
                     or "channel_unsupported_capability" in result.stderr and "not yet implemented" in result.stderr), result
+        if forbidden:
+            assert forbidden not in result.stderr, result
     automatic = subprocess.run([args.display,"--decoder","auto","--check-pipeline"],capture_output=True,text=True,timeout=15)
     assert automatic.returncode == 0, automatic
     capabilities = subprocess.run([args.display,"--list-video-capabilities"],capture_output=True,text=True,timeout=15)

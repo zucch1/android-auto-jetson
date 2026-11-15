@@ -327,6 +327,7 @@ DecodeHelper& DecodeHelper::operator=(DecodeHelper&& other) noexcept = default;
 DecodeReport DecodeHelper::probe_backends(protocol::VideoCodec codec) {
     ensure_gstreamer_initialized();
     DecodeReport report;
+    report.codec = codec;
     for (const auto* name : {"appsrc", codec_parser(codec), "videoconvert", "appsink"}) {
         auto* factory = gst_element_factory_find(name);
         if (factory) { gst_object_unref(factory); }

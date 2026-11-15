@@ -624,3 +624,21 @@ TEST_F(AvSinkWire, SetupCodecRestrictsReadyMembershipToConfiguredProfiles) {
     ASSERT_TRUE(raw.header.video_profile);
     EXPECT_EQ(raw.header.video_profile->codec,p::VideoCodec::h265);
 }
+
+TEST_F(AvSinkWire, SetupAndStartAcceptMoreThanEightAnnouncedProfilesAndIndexAtOrAboveEight) {
+    auto descriptor = video();
+    auto& profiles = std::get<p::VideoConfiguration>(descriptor.configuration).profiles;
+    profiles.clear();
+    for (const auto r : p::kVideoResolutions) {
+        for (const auto fps : {std::uint8_t{30}, std::uint8_t{60}}) {
+            profiles.push_back({r.width, r.height, fps, p::VideoCodec::h264});
+        }
+    }
+    ASSERT_GT(profiles.size(), 10u);
+    aa::channels::AvSink v{descriptor, raw, send};
+    auto call = [&](const Bytes& b) { return v.on_message({{p::ChannelRole::video, 0, {}}, b}); };
+    ASSERT_TRUE(call(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    ASSERT_TRUE(call(p::encode(p::AvSinkStart{1, 9}).value()));
+    ASSERT_TRUE(call(data()));
+    EXPECT_EQ(raw.header.video_profile, profiles[9]);
+}

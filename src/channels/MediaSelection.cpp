@@ -6,7 +6,7 @@ namespace aa::channels {
 core::Result<protocol::VideoProfile>
 Negotiator::select_video(protocol::ServiceKey service,
                          std::span<const protocol::VideoProfile> offered) const {
-    if (offered.empty() || offered.size() > protocol::kMaxMediaProfiles
+    if (offered.empty() || offered.size() > protocol::kMaxVideoProfiles
         || !std::all_of(offered.begin(), offered.end(), protocol::valid_video_profile)) {
         return Error{ErrorCode::protocol_malformed_message};
     }

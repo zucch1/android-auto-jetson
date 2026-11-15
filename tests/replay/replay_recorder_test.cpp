@@ -206,4 +206,21 @@ TEST(ReplayRecorder, LargeButtonKeycodesAccepted) {
     EXPECT_EQ(buttons->keycodes, (std::vector<std::int32_t>{300, 65535}));
 }
 
+TEST(ReplayRecorder, NegotiatedVideoCodecMetadataAcceptedWithoutRejection) {
+    for (const char* codec : {"h264", "h265", "vp9", "av1"}) {
+        SCOPED_TRACE(codec);
+        replay::Recorder recorder;
+        replay::Expectation expect;
+        expect.states = {"disconnected"};
+        ASSERT_TRUE(recorder.set_expectation(expect));
+        ASSERT_TRUE(recorder.set_metadata(aa::diagnostics::EventField::text("codec", codec)));
+        ASSERT_TRUE(recorder.record_input(
+            aa::core::Nanoseconds{0}, replay::InputRecord{1, aa::core::Nanoseconds{0}, kInputOne}));
+        const auto exported = recorder.export_fixture();
+        ASSERT_TRUE(exported);
+        const auto loaded = replay::load_fixture(exported.value().file_bytes);
+        ASSERT_TRUE(loaded);
+    }
+}
+
 } // namespace

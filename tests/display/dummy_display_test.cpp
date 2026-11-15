@@ -2980,11 +2980,68 @@ TEST(DummyDisplayContractControl, PipelineOptionsValidateAndRefuseUnavailableMod
     PipelineOptions o;
     EXPECT_FALSE(check_pipeline(o,host));
     EXPECT_FALSE(parse_pipeline_option(o,"--decoder","typo"));
-    ASSERT_TRUE(parse_pipeline_option(o,"--decoder","hardware"));
+
+    // Combination validity (config_invalid) precedes host availability on non-NVIDIA hosts.
+    o = {};
+    ASSERT_TRUE(parse_pipeline_option(o,"--presentation","zerocopy"));
     auto refusal = check_pipeline(o,host);
     ASSERT_TRUE(refusal);
+    EXPECT_EQ(refusal->code,ErrorCode::config_invalid);
+    EXPECT_NE(refusal->message.find("zerocopy requires --decoder hardware"),std::string::npos);
+    EXPECT_EQ(refusal->message.find("nvv4l2decoder"),std::string::npos);
+
+    // Generic GPU presentation refusal on non-NVIDIA host must not mention zerocopy.
+    o = {};
+    ASSERT_TRUE(parse_pipeline_option(o,"--presentation","gpu"));
+    refusal = check_pipeline(o,host);
+    ASSERT_TRUE(refusal);
     EXPECT_EQ(refusal->code,ErrorCode::channel_decode_unavailable);
-    EXPECT_NE(refusal->message.find("nvv4l2decoder"),std::string_view::npos);
+    EXPECT_NE(refusal->message.find("nvv4l2decoder"),std::string::npos);
+    EXPECT_EQ(refusal->message.find("zerocopy"),std::string::npos);
+
+    // Valid zerocopy + hardware combination checks host availability on non-NVIDIA host.
+    o = {};
+    ASSERT_TRUE(parse_pipeline_option(o,"--decoder","hardware"));
+    ASSERT_TRUE(parse_pipeline_option(o,"--presentation","zerocopy"));
+    refusal = check_pipeline(o,host);
+    ASSERT_TRUE(refusal);
+    EXPECT_EQ(refusal->code,ErrorCode::channel_decode_unavailable);
+    EXPECT_NE(refusal->message.find("nvv4l2decoder"),std::string::npos);
+
+    // Fallback codec refusal names actual codec(s) and missing element(s), not H.264.
+    o = {};
+    aa::consumer::DecodeReport h265_missing;
+    h265_missing.codec = aa::protocol::VideoCodec::h265;
+    h265_missing.software_path_available = false;
+    h265_missing.software_path_cause = "h265parse absent; ";
+    h265_missing.backends.push_back({"avdec_h265",false,false,false,false,"Element not found in GStreamer registry"});
+    refusal = check_pipeline(o,h265_missing);
+    ASSERT_TRUE(refusal);
+    EXPECT_EQ(refusal->code,ErrorCode::channel_decode_unavailable);
+    EXPECT_NE(refusal->message.find("h265"),std::string::npos);
+    EXPECT_NE(refusal->message.find("h265parse"),std::string::npos);
+    EXPECT_NE(refusal->message.find("avdec_h265"),std::string::npos);
+    EXPECT_EQ(refusal->message.find("H.264"),std::string::npos);
+    EXPECT_EQ(refusal->message.find("h264"),std::string::npos);
+
+    aa::consumer::DecodeReport vp9_missing;
+    vp9_missing.codec = aa::protocol::VideoCodec::vp9;
+    vp9_missing.backends.push_back({"vp9dec",false,false,false,false,"Element not found in GStreamer registry"});
+    const std::pair<aa::protocol::VideoCodec,aa::consumer::DecodeReport> multi[] = {
+        {aa::protocol::VideoCodec::h265,h265_missing},{aa::protocol::VideoCodec::vp9,vp9_missing}};
+    refusal = check_pipeline(o,multi);
+    ASSERT_TRUE(refusal);
+    EXPECT_EQ(refusal->code,ErrorCode::channel_decode_unavailable);
+    EXPECT_NE(refusal->message.find("h265"),std::string::npos);
+    EXPECT_NE(refusal->message.find("vp9"),std::string::npos);
+    EXPECT_NE(refusal->message.find("vp9dec"),std::string::npos);
+
+    o = {};
+    ASSERT_TRUE(parse_pipeline_option(o,"--decoder","hardware"));
+    refusal = check_pipeline(o,host);
+    ASSERT_TRUE(refusal);
+    EXPECT_EQ(refusal->code,ErrorCode::channel_decode_unavailable);
+    EXPECT_NE(refusal->message.find("nvv4l2decoder"),std::string::npos);
     host.backends.push_back({"nvv4l2decoder",true,true,true,true,{}});
     EXPECT_FALSE(check_pipeline(o,host));
     o = {};
@@ -2994,7 +3051,7 @@ TEST(DummyDisplayContractControl, PipelineOptionsValidateAndRefuseUnavailableMod
         o = {};
         ASSERT_TRUE(parse_pipeline_option(o,option,std::string_view{option} == "--presentation" ? "gpu" : "worker"));
         ASSERT_TRUE(check_pipeline(o,host));
-        EXPECT_NE(check_pipeline(o,host)->message.find("not yet implemented"),std::string_view::npos);
+        EXPECT_NE(check_pipeline(o,host)->message.find("not yet implemented"),std::string::npos);
     }
     o = {};
     ASSERT_TRUE(parse_pipeline_option(o,"--presentation","zerocopy"));

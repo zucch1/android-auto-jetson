@@ -515,3 +515,71 @@ TEST(MediaWire, ExtendedProfilesAreRejectedUnlessConfiguredAndAnnounced) {
         if (enabled) { EXPECT_EQ(selected.value(),requested.front()); }
     }
 }
+
+TEST(MediaWire, SelectsMoreThanEightAnnouncedProfilesIncludingIndexAtOrAboveEight) {
+    aa::channels::ServiceRegistry registry;
+    Sink handler;
+    ASSERT_TRUE(registry.register_sink(proto::ChannelRole::video, handler));
+    std::vector<proto::VideoProfile> announced_profiles;
+    for (const auto r : proto::kVideoResolutions) {
+        for (const auto fps : {std::uint8_t{30}, std::uint8_t{60}}) {
+            for (const auto codec : proto::kVideoCodecs) {
+                announced_profiles.push_back({r.width, r.height, fps, codec});
+            }
+        }
+    }
+    ASSERT_EQ(announced_profiles.size(), proto::kMaxVideoProfiles);
+    auto service = video();
+    std::get<proto::VideoConfiguration>(service.configuration).profiles = announced_profiles;
+    auto support = aa::channels::SupportConfiguration::create({service});
+    ASSERT_TRUE(support);
+    aa::channels::Negotiator negotiator{std::move(support.value()), registry};
+    const auto discovery = negotiator.start();
+    const auto encoded = proto::encode(discovery);
+    ASSERT_TRUE(encoded);
+    const auto decoded = proto::decode_service_discovery_response(encoded.value());
+    ASSERT_TRUE(decoded);
+    ASSERT_EQ(std::get<proto::VideoConfiguration>(decoded.value().services.front().configuration).profiles.size(),
+              proto::kMaxVideoProfiles);
+    ASSERT_TRUE(negotiator.open({1, service.id}));
+
+    // Offering all 72 profiles succeeds, and offering > 72 is rejected.
+    const auto all_selected = negotiator.select_video(service.id, announced_profiles);
+    ASSERT_TRUE(all_selected);
+    EXPECT_EQ(all_selected.value(), announced_profiles.front());
+    auto over_limit = announced_profiles;
+    over_limit.push_back(announced_profiles.front());
+    const auto rejected_video = negotiator.select_video(service.id, over_limit);
+    ASSERT_FALSE(rejected_video);
+    EXPECT_EQ(rejected_video.error().code(), aa::ErrorCode::protocol_malformed_message);
+
+    // Offering 12 profiles where only announced index 10 (>= 8) matches succeeds.
+    std::vector<proto::VideoProfile> late_offer;
+    for (std::size_t i = 0; i < 11; ++i) {
+        late_offer.push_back(announced_profiles[i]);
+    }
+    late_offer.erase(late_offer.begin(), late_offer.begin() + 10);
+    // Pad offer to > 8 distinct valid profiles using reversed high-index profiles.
+    for (std::size_t i = 60; i < 72; ++i) {
+        late_offer.push_back(announced_profiles[i]);
+    }
+    // Note: index 10 comes earlier in configured preference than 60..71, so index 10 wins.
+    const auto chosen_late = negotiator.select_video(service.id, late_offer);
+    ASSERT_TRUE(chosen_late);
+    EXPECT_EQ(chosen_late.value(), announced_profiles[10]);
+
+    // Audio selection still caps offered profiles at kMaxMediaProfiles (8).
+    Sink audio_handler;
+    ASSERT_TRUE(registry.register_sink(proto::ChannelRole::media_audio, audio_handler));
+    auto audio_support = aa::channels::SupportConfiguration::create(
+        {audio(proto::ChannelRole::media_audio, 21)});
+    ASSERT_TRUE(audio_support);
+    aa::channels::Negotiator audio_negotiator{std::move(audio_support.value()), registry};
+    ASSERT_EQ(audio_negotiator.start().services.size(), 1u);
+    ASSERT_TRUE(audio_negotiator.open({1, proto::ServiceKey{21}}));
+    const std::vector<proto::AudioProfile> too_many_audio(
+        proto::kMaxMediaProfiles + 1, proto::AudioProfile{48000, 16, 2});
+    const auto rejected_audio = audio_negotiator.select_audio(proto::ServiceKey{21}, too_many_audio);
+    ASSERT_FALSE(rejected_audio);
+    EXPECT_EQ(rejected_audio.error().code(), aa::ErrorCode::protocol_malformed_message);
+}
