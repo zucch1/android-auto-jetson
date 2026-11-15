@@ -42,6 +42,11 @@ namespace aa::audio::detail {
 // thread, so a worker stuck inside the element's position query can be left
 // behind at teardown without touching the destroyed sink: it owns its own
 // reference on the routing element, released when the worker exits.
+struct PlaybackSlotResult final {
+    std::optional<core::Nanoseconds> slot{};
+    PlaybackSlotAbsence reason{PlaybackSlotAbsence::unavailable};
+};
+
 struct SlotWorkerState final {
     std::mutex mutex{};
     std::condition_variable cv{};
@@ -53,7 +58,7 @@ struct SlotWorkerState final {
     std::uint64_t request_sequence{0};
     std::uint64_t answer_sequence{0};
     GstClockTime request_pts{GST_CLOCK_TIME_NONE};
-    std::optional<core::Nanoseconds> answer{};
+    PlaybackSlotResult answer{};
 };
 
 } // namespace aa::audio::detail
@@ -562,16 +567,24 @@ constexpr std::chrono::milliseconds kSlotWorkerStopWait{100};
 // ahead of this slot, pipewiresink hands off near it; on the Jetson's sink
 // monitor both played a click within 2.5 ms of the slot. Runs on the slot
 // worker only.
-[[nodiscard]] std::optional<core::Nanoseconds> query_playback_slot(GstElement* element,
-                                                                   GstClockTime pts) {
+[[nodiscard]] detail::PlaybackSlotResult query_playback_slot(GstElement* element,
+                                                              GstClockTime pts) {
+    if (!GST_CLOCK_TIME_IS_VALID(pts) || pts > G_MAXINT64) {
+        return {{}, PlaybackSlotAbsence::invalid_pts};
+    }
     gint64 position = -1;
-    if (element == nullptr || !GST_CLOCK_TIME_IS_VALID(pts)
-        || !gst_element_query_position(element, GST_FORMAT_TIME, &position)
-        || position < 0) {
-        return std::nullopt;
+    if (element == nullptr || !gst_element_query_position(element, GST_FORMAT_TIME, &position)) {
+        return {{}, PlaybackSlotAbsence::query_failed};
+    }
+    if (position < 0) {
+        return {{}, PlaybackSlotAbsence::negative_position};
     }
     const auto now = observation_time();
-    return core::Nanoseconds{now.count + (static_cast<std::int64_t>(pts) - position)};
+    const auto delta = static_cast<std::int64_t>(pts) - position;
+    if (delta > G_MAXINT64 - now.count || delta < -now.count) {
+        return {{}, PlaybackSlotAbsence::invalid_pts};
+    }
+    return {core::Nanoseconds{now.count + delta}, PlaybackSlotAbsence::none};
 }
 
 void run_slot_worker(const std::shared_ptr<detail::SlotWorkerState>& state) {
@@ -664,7 +677,7 @@ public:
                                                   bool readiness_probe) {
         const auto entered = std::chrono::steady_clock::now();
         const auto deadline = entered + std::chrono::milliseconds(timeout.count);
-        playback_slot_.reset();
+        playback_slot_ = {};
         SinkWriteProgress value;
         value.readiness_probe = readiness_probe;
         value.effective_scheduled = chunk.timestamp;
@@ -796,11 +809,19 @@ public:
         }
         std::memcpy(map.data, chunk.pcm.data(), chunk.pcm.size());
         gst_buffer_unmap(buffer, &map);
-        GST_BUFFER_PTS(buffer) = chunk_pts(chunk.timestamp);
+        // A startup probe must allow preroll to finish before we can sample
+        // the established clock. Real media always uses that clock's epoch.
+        const bool clock_mapped = establish_clock_mapping();
+        if (!readiness_probe && !clock_mapped) {
+            gst_buffer_unref(buffer);
+            return fail_write(outcome, Error{ErrorCode::audio_sink_unavailable}, false);
+        }
+        GST_BUFFER_PTS(buffer) = clock_mapped ? chunk_pts(chunk.timestamp) : 0;
         const GstClockTime data_pts = GST_BUFFER_PTS(buffer);
+        last_buffer_pts_ = data_pts;
         progress_.update(observation_sequence, [&](auto& value) {
             value.pts_ns = GST_BUFFER_PTS(buffer);
-            value.pts_origin_ns = pts_origin_ns_;
+            if (pts_origin_set_) { value.pts_origin_ns = pts_origin_ns_; }
         });
 
         // Chain-return observation: the zero-length marker behind the data
@@ -886,7 +907,11 @@ public:
     }
 
     [[nodiscard]] std::optional<core::Nanoseconds> last_playback_slot() const override {
-        return playback_slot_;
+        return playback_slot_.slot;
+    }
+
+    [[nodiscard]] PlaybackSlotAbsence last_playback_slot_absence() const override {
+        return playback_slot_.reason;
     }
 
     [[nodiscard]] std::shared_ptr<detail::SlotWorkerState> slot_state() const {
@@ -902,12 +927,18 @@ public:
     // Hands one query to the slot worker and waits for its answer until
     // `until`. A worker still busy with an earlier query (a blocked element)
     // is never queued behind: the slot is reported absent at once.
-    [[nodiscard]] std::optional<core::Nanoseconds> request_playback_slot(
+    [[nodiscard]] detail::PlaybackSlotResult request_playback_slot(
         GstClockTime pts, std::chrono::steady_clock::time_point until) {
         auto& state = *slot_state_;
         std::unique_lock<std::mutex> lock(state.mutex);
-        if (state.stop || state.exited || state.busy) {
-            return std::nullopt;
+        if (state.stop || state.exited) {
+            return {{}, PlaybackSlotAbsence::worker_stopped};
+        }
+        if (state.busy) {
+            return {{}, PlaybackSlotAbsence::worker_busy};
+        }
+        if (std::chrono::steady_clock::now() >= until) {
+            return {{}, PlaybackSlotAbsence::deadline_missed};
         }
         const std::uint64_t sequence = ++state.request_sequence;
         state.request_pts = pts;
@@ -915,8 +946,11 @@ public:
         state.busy = true;
         state.cv.notify_all();
         if (!state.cv.wait_until(lock, until,
-                                 [&] { return state.answer_sequence == sequence; })) {
-            return std::nullopt;
+                                 [&] { return state.stop || state.exited || state.answer_sequence == sequence; })) {
+            return {{}, PlaybackSlotAbsence::deadline_missed};
+        }
+        if (state.stop || state.exited) {
+            return {{}, PlaybackSlotAbsence::worker_stopped};
         }
         return state.answer;
     }
@@ -972,9 +1006,8 @@ public:
                 static_cast<std::size_t>(format_.channels) * sizeof(std::int16_t), std::byte{0});
             MixedChunk probe_chunk;
             probe_chunk.format = format_;
-            // Same monotonic clock the router stamps chunks with: this probe
-            // anchors the stream-relative PTS origin, and a zero origin here
-            // would push every later chunk into the far future under sync=TRUE.
+            // The initial preroll uses PTS zero. Once PLAYING settles,
+            // retries use running time, never a probe-defined media epoch.
             probe_chunk.timestamp = core::Nanoseconds{
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now().time_since_epoch())
@@ -1110,21 +1143,99 @@ public:
             gst_object_unref(pipeline_);
             pipeline_ = nullptr;
         }
+        if (mapping_clock_ != nullptr) {
+            gst_object_unref(mapping_clock_);
+            mapping_clock_ = nullptr;
+        }
+        pts_origin_set_ = false;
         appsrc_ = nullptr;
         sink_element_ = nullptr;
         probe_id_ = 0;
     }
 
-private:
-    // Stream-relative PTS: the routing element clock-syncs (sync=TRUE) and
-    // the receiver timestamps are epoch-scale A/V clock values the pipeline
-    // clock cannot schedule against. The first write anchors the origin.
-    [[nodiscard]] GstClockTime chunk_pts(core::Nanoseconds timestamp) {
-        if (!pts_origin_set_) {
-            pts_origin_set_ = true;
-            pts_origin_ns_ = timestamp.count;
+    [[nodiscard]] bool replay_for_test(core::Milliseconds pause) {
+        if (gst_element_set_state(pipeline_, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE) {
+            return false;
         }
+        // Non-live appsrc needs fresh preroll to complete PAUSED. Supply a
+        // one-frame silent buffer at the previous PTS (never regress PTS).
+        GstBuffer* preroll = gst_buffer_new_allocate(nullptr,
+            static_cast<gsize>(format_.channels) * sizeof(std::int16_t), nullptr);
+        gst_buffer_memset(preroll, 0, 0, gst_buffer_get_size(preroll));
+        GST_BUFFER_PTS(preroll) = last_buffer_pts_;
+        if (gst_app_src_push_buffer(GST_APP_SRC(appsrc_), preroll) != GST_FLOW_OK) {
+            return false;
+        }
+        GstState state;
+        GstState pending;
+        if (gst_element_get_state(pipeline_, &state, &pending, GST_SECOND)
+            != GST_STATE_CHANGE_SUCCESS) { return false; }
+        std::this_thread::sleep_for(std::chrono::milliseconds{pause.count});
+        if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            return false;
+        }
+        return gst_element_get_state(pipeline_, &state, &pending, GST_SECOND)
+            == GST_STATE_CHANGE_SUCCESS;
+    }
+
+    // Readiness provides preroll. Only a settled PLAYING pipeline with the
+    // appsrc's identity TIME segment can translate receiver steady timestamps.
+    // Refresh before every media buffer: re-PLAY/base/clock changes therefore
+    // cannot retain a stale epoch. A rebuilt route starts without a mapping.
+    [[nodiscard]] bool establish_clock_mapping(bool resample = false) {
+        GstState state = GST_STATE_NULL;
+        GstState pending = GST_STATE_VOID_PENDING;
+        if (gst_element_get_state(pipeline_, &state, &pending, 0) != GST_STATE_CHANGE_SUCCESS
+            || state != GST_STATE_PLAYING || pending != GST_STATE_VOID_PENDING) {
+            return false;
+        }
+        GstEvent* event = gst_pad_get_sticky_event(pad_, GST_EVENT_SEGMENT, 0);
+        if (event == nullptr) { return false; }
+        const GstSegment* segment = nullptr;
+        gst_event_parse_segment(event, &segment);
+        // query_position reports stream time; PTS and running time coincide
+        // only on this route's rate-1, zero-origin segment. Fail closed on an
+        // unsupported seek/segment rather than silently schedule in its domain.
+        const bool identity = segment != nullptr && segment->format == GST_FORMAT_TIME
+            && segment->rate == 1.0 && segment->applied_rate == 1.0
+            && segment->start == 0 && segment->time == 0 && segment->base == 0
+            && segment->offset == 0;
+        gst_event_unref(event);
+        if (!identity) { return false; }
+        GstClock* clock = gst_element_get_clock(pipeline_);
+        if (clock == nullptr) { return false; }
+        const auto base = gst_element_get_base_time(pipeline_);
+        if (!resample && pts_origin_set_ && mapping_clock_ == clock && mapping_base_ == base) {
+            gst_object_unref(clock);
+            return true;
+        }
+        pts_origin_set_ = false;
+        const auto before = observation_time().count;
+        const auto clock_now = gst_clock_get_time(clock);
+        const auto after = observation_time().count;
+        if (!GST_CLOCK_TIME_IS_VALID(base) || !GST_CLOCK_TIME_IS_VALID(clock_now)
+            || clock_now < base || clock_now - base > G_MAXINT64
+            || after - before > 5'000'000
+            || gst_element_get_base_time(pipeline_) != base) {
+            gst_object_unref(clock);
+            return false;
+        }
+        // base_steady = base_clock - (clock_now - steady_now). Bracket the
+        // clock read to bound sampling error rather than assume equal epochs.
+        pts_origin_ns_ = before + (after - before) / 2
+            - static_cast<std::int64_t>(clock_now - base);
+        if (mapping_clock_ != nullptr) { gst_object_unref(mapping_clock_); }
+        mapping_clock_ = clock;
+        mapping_base_ = base;
+        pts_origin_set_ = true;
+        return true;
+    }
+
+private:
+    [[nodiscard]] GstClockTime chunk_pts(core::Nanoseconds timestamp) const {
         const std::int64_t delta = timestamp.count - pts_origin_ns_;
+        // Already-late schedules before pipeline running-time zero render at
+        // zero; never wrap an unsigned PTS into the distant future.
         return static_cast<GstClockTime>(delta > 0 ? delta : 0);
     }
 
@@ -1303,9 +1414,12 @@ private:
     PadProbe probe_;
     bool pending_drop_nonempty_{false};
     bool pending_drop_after_window_{false};
+    GstClockTime last_buffer_pts_{0};
+    GstClock* mapping_clock_{nullptr};
+    GstClockTime mapping_base_{GST_CLOCK_TIME_NONE};
     bool pts_origin_set_{false};
     std::int64_t pts_origin_ns_{0};
-    std::optional<core::Nanoseconds> playback_slot_{};
+    detail::PlaybackSlotResult playback_slot_{};
     // Playback-slot worker (#60 review): the element's position query never
     // runs on the write path, and teardown never waits on it unboundedly.
     std::shared_ptr<detail::SlotWorkerState> slot_state_{
@@ -1485,6 +1599,52 @@ namespace {
     return dynamic_cast<GstSink*>(&sink);
 }
 } // namespace
+
+namespace {
+struct AaSlotTestElement { GstElement parent; std::optional<std::int64_t>* position; };
+struct AaSlotTestElementClass { GstElementClass parent_class; };
+G_DEFINE_TYPE(AaSlotTestElement, aa_slot_test_element, GST_TYPE_ELEMENT)
+
+void aa_slot_test_element_init(AaSlotTestElement* self) { self->position = nullptr; }
+void aa_slot_test_element_class_init(AaSlotTestElementClass* klass) {
+    GST_ELEMENT_CLASS(klass)->query = [](GstElement* element, GstQuery* query) -> gboolean {
+        auto* self = reinterpret_cast<AaSlotTestElement*>(element);
+        if (GST_QUERY_TYPE(query) != GST_QUERY_POSITION || !self->position
+            || !self->position->has_value()) { return FALSE; }
+        gst_query_set_position(query, GST_FORMAT_TIME, **self->position);
+        return TRUE;
+    };
+}
+} // namespace
+
+PlaybackSlotAbsence query_playback_slot_for_test(std::optional<std::int64_t> position,
+                                                std::uint64_t pts) {
+    ensure_gstreamer_initialized();
+    auto* element = reinterpret_cast<AaSlotTestElement*>(
+        g_object_new(aa_slot_test_element_get_type(), nullptr));
+    element->position = &position;
+    const auto result = query_playback_slot(GST_ELEMENT(element), pts);
+    gst_object_unref(element);
+    return result.reason;
+}
+
+PlaybackSlotAbsence request_playback_slot_for_test(ObservedAudioSink& sink,
+                                                  std::uint64_t pts,
+                                                  core::Milliseconds timeout) {
+    auto* impl = gstreamer_sink_of(sink);
+    return impl ? impl->request_playback_slot(pts, std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds{timeout.count}).reason
+                : PlaybackSlotAbsence::unavailable;
+}
+
+void stop_playback_slot_worker_for_test(ObservedAudioSink& sink) {
+    if (auto* impl = gstreamer_sink_of(sink)) { impl->stop_slot_worker(); }
+}
+
+bool replay_sink_for_test(ObservedAudioSink& sink, core::Milliseconds pause) {
+    auto* impl = gstreamer_sink_of(sink);
+    return impl && impl->replay_for_test(pause);
+}
 
 bool block_downstream_for_test(ObservedAudioSink& sink) {
     GstSink* gstreamer_sink = gstreamer_sink_of(sink);
@@ -1811,6 +1971,18 @@ static SinkOpenOutcome open_sink(const SinkOpenRequest& request, bool native_qua
         return outcome;
     }
 
+    if (request.readiness_delay_for_test.count > 0) {
+        GstPad* sink_pad = gst_element_get_static_pad(sink, "sink");
+        auto* delay = new core::Milliseconds{request.readiness_delay_for_test};
+        gst_pad_add_probe(sink_pad, GST_PAD_PROBE_TYPE_BUFFER,
+            [](GstPad*, GstPadProbeInfo*, gpointer data) -> GstPadProbeReturn {
+                const auto duration = *static_cast<core::Milliseconds*>(data);
+                std::this_thread::sleep_for(std::chrono::milliseconds{duration.count});
+                return GST_PAD_PROBE_REMOVE;
+            }, delay, [](gpointer data) { delete static_cast<core::Milliseconds*>(data); });
+        gst_object_unref(sink_pad);
+    }
+
     if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
         handle->release();
         outcome.report.usable = false;
@@ -1839,7 +2011,14 @@ static SinkOpenOutcome open_sink(const SinkOpenRequest& request, bool native_qua
     GstState pending = GST_STATE_NULL;
     const GstClockTime timeout_ns =
         static_cast<GstClockTime>(request.start_timeout.count) * 1000ULL * 1000ULL;
-    (void)gst_element_get_state(pipeline, &state, &pending, timeout_ns);
+    const auto settled = gst_element_get_state(pipeline, &state, &pending, timeout_ns);
+    if (settled != GST_STATE_CHANGE_SUCCESS || state != GST_STATE_PLAYING
+        || pending != GST_STATE_VOID_PENDING || !handle->establish_clock_mapping(true)) {
+        handle->release();
+        outcome.report.usable = false;
+        outcome.report.cause = "disabled: PLAYING clock/base-time/segment mapping not established";
+        return outcome;
+    }
 
     outcome.sink = std::move(handle);
     return outcome;

@@ -5154,7 +5154,10 @@ void expect_post_completion_idle_order(CompletionIdleOrder order) {
             std::to_string(completion.scheduled_end.count) + ",\"completed_ns\":" +
             std::to_string(completion.completed.count) + ",\"presented_ns\":" +
             (completion.presented ? std::to_string(completion.presented->count)
-                                  : std::string{"null"}) + "}";
+                                  : std::string{"null"}) +
+            ",\"playback_slot_absence\":" +
+            (completion.presented ? std::string{"null"}
+                : "\"" + std::string{aa::audio::to_string(completion.playback_slot_absence)} + "\"") + "}";
         const auto first = output.find(event);
         ASSERT_NE(first, std::string::npos);
         EXPECT_EQ(output.find(event, first + 1), std::string::npos);

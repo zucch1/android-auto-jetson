@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools/perf"))
 import aa_projection_collect as collector
+import aa_perf_schema
 
 
 def av_sync() -> None:
@@ -81,6 +82,27 @@ def av_sync() -> None:
                                     "completed_ns": 4_970_000_000, "presented_ns": bad}))
         assert broken.metrics["av_sync_ms"] is None, bad
         assert "av_sync_ms" in broken.invalid_telemetry, bad
+
+    # Current event schema requires a reason exactly when the slot is null.
+    event_schema = json.loads((ROOT / "tools/perf/audio-write-completed.schema.json").read_text())
+    valid_event = {"event": "audio_write_completed", "scheduled_ns": 5_000_000_000,
+                   "scheduled_end_ns": 5_020_000_000, "completed_ns": 4_970_000_000,
+                   "presented_ns": 5_001_000_000, "playback_slot_absence": None}
+    assert not aa_perf_schema.validate(valid_event, event_schema)
+    assert aa_perf_schema.validate(valid_event | {"playback_slot_absence": "worker_busy"}, event_schema)
+    assert aa_perf_schema.validate(valid_event | {"presented_ns": None}, event_schema)
+    # Failure diagnostics never rescue a null slot or change a valid slot.
+    for reason in ("unavailable", "worker_busy", "worker_stopped", "deadline_missed",
+                   "query_failed", "negative_position", "invalid_pts", "future_reason"):
+        event = valid_event | {"presented_ns": None, "playback_slot_absence": reason}
+        if reason != "future_reason":
+            assert not aa_perf_schema.validate(event, event_schema)
+        broken = collector.EventParser()
+        broken._consume(json.dumps(event))
+        assert broken.playback_slot_absences == {reason: 1}
+        assert broken.metrics["av_sync_ms"] is None
+        assert "av_sync_ms" in broken.invalid_telemetry
+    assert early.playback_slot_absences == {}
 
     # #60 review: one run never mixes playback-time and handoff-time audio
     # endpoints, in either order. A write without presented_ns in a run whose

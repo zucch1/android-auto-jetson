@@ -853,7 +853,8 @@ core::Result<void> AudioRouter::pump() {
                 impl_->config.on_write_completed(WriteCompletion{
                     to_write.timestamp, core::Nanoseconds{end_ns},
                     core::Nanoseconds{write_done_ns},
-                    presented_at(impl_->sink->last_playback_slot(), write_done_ns)});
+                    presented_at(impl_->sink->last_playback_slot(), write_done_ns),
+                    impl_->sink->last_playback_slot_absence()});
             }
             impl_->report.stats.frames_output += piece_frames;
             if (!any_input) {
@@ -1288,7 +1289,8 @@ core::Result<RenderStep> AudioRouter::render_step() {
         if (impl_->config.on_write_completed) {
             impl_->config.on_write_completed(WriteCompletion{core::Nanoseconds{scheduled_ns},
                 core::Nanoseconds{end_ns}, core::Nanoseconds{done},
-                presented_at(impl_->sink->last_playback_slot(), done)});
+                presented_at(impl_->sink->last_playback_slot(), done),
+                impl_->sink->last_playback_slot_absence()});
         }
     } else { stats.frames_silence += frames; }
     lock.lock();
