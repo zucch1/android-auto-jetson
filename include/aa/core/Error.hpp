@@ -81,6 +81,9 @@ enum class ErrorCode : std::uint16_t {
     // Append-only band: never renumber or repurpose.
     trust_store_not_durable = 703,
     trust_port_only_requires_opt_in = 704,
+    // 705 (#133): GetPairingCandidate on a request whose directory presents
+    // no wired candidate (a wireless request). The request is left untouched.
+    trust_not_wired_candidate = 705,
 
     // config
     config_invalid = 800,

@@ -342,6 +342,23 @@ static core::Result<void> write_private(const std::filesystem::path& path, std::
     return {};
 }
 
+core::Result<void> sync_parent_directory(const std::filesystem::path& path) {
+    const auto parent = path.parent_path();
+    if (parent.empty()) {
+        return Error{ErrorCode::trust_store_io};
+    }
+    const int dirfd = open_verified_parent(parent, false);
+    if (dirfd < 0) {
+        return Error{ErrorCode::trust_store_not_durable};
+    }
+    const int synced = fsync_interruptible(dirfd);
+    ::close(dirfd);
+    if (synced != 0) {
+        return Error{ErrorCode::trust_store_not_durable};
+    }
+    return {};
+}
+
 core::Result<void> write_file_private(const std::filesystem::path& path, std::string_view content) {
     return write_private(path, content, false);
 }

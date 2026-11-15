@@ -1257,8 +1257,20 @@ TEST(ConsumerDecodeCorrelation, PumpEosStrandedAuReportsEndOfStreamLossOnce) {
     }
     ASSERT_TRUE(helper.value().end_of_stream());
 
+    // The decoded IDR and the EOS reach the appsink on GStreamer's streaming
+    // thread. Only pump()'s first pull blocks; the pump that delivers the
+    // frame sees the EOS only if it is already queued behind it (under load it
+    // often is not). That pump then succeeds with exactly the frame and no loss
+    // counted, and the next blocking pump waits for the EOS itself (the pull
+    // returns at EOS), so the notice comes from the first or the second pump,
+    // never from neither and never twice.
     clock.pumping = true;
-    const auto pumped = helper.value().pump(Milliseconds{10000});
+    auto pumped = helper.value().pump(Milliseconds{10000});
+    if (pumped) {
+        EXPECT_EQ(pumped.value(), 1U) << "a pump before EOS must have delivered the frame";
+        EXPECT_EQ(held.frames_lost_eos, 0U) << "loss counted by a successful pump";
+        pumped = helper.value().pump(Milliseconds{10000});
+    }
     clock.pumping = false;
     ASSERT_FALSE(pumped);
     EXPECT_EQ(pumped.error().code(), ErrorCode::ipc_consumer_rejected);

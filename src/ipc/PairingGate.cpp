@@ -104,6 +104,30 @@ core::Result<void> PairingGate::cancel(const BoundConsumer& consumer,
     return Error{ErrorCode::ipc_malformed_request};
 }
 
+core::Result<void> PairingGate::pending(const BoundConsumer& consumer,
+                                        core::PairingRequestId request) const {
+    if (!request) {
+        return Error{ErrorCode::ipc_malformed_request};
+    }
+    for (std::size_t index = 0; index < count_; ++index) {
+        const Entry& entry = entries_[index];
+        if (entry.request != request) {
+            continue;
+        }
+        if (!(entry.consumer == consumer)) {
+            return Error{ErrorCode::ipc_peer_unauthorized};
+        }
+        if (entry.open) {
+            return Error{ErrorCode::ipc_consumer_rejected};
+        }
+        return {};
+    }
+    if (issued(request)) {
+        return Error{ErrorCode::ipc_consumer_rejected};
+    }
+    return Error{ErrorCode::ipc_malformed_request};
+}
+
 std::vector<core::PairingRequestId> PairingGate::close_all() {
     std::vector<core::PairingRequestId> closed;
     closed.reserve(count_);

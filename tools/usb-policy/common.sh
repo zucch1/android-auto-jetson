@@ -24,6 +24,33 @@
 # umask is: the trust checks above reject group/other-writable directories.
 umask 022
 
+# Approved vendor:product ids; must match ${RULES_NAME} (#133: any host port).
+APPROVED_USB_IDS="04e8:6860 18d1:2d00 18d1:2d01"
+
+# Live-root only: re-trigger the device tree (device + interfaces + tty ports)
+# of every currently attached USB device carrying an approved id, on whatever
+# port it is attached to. Nothing else is reprocessed. Prints the number of
+# trees triggered; dies through the caller's die() on any udevadm failure.
+trigger_approved_devices() {
+    local node vendor product id count=0
+    for node in /sys/bus/usb/devices/*; do
+        [ -r "${node}/idVendor" ] && [ -r "${node}/idProduct" ] || continue
+        vendor="$(cat "${node}/idVendor" 2>/dev/null)" || continue
+        product="$(cat "${node}/idProduct" 2>/dev/null)" || continue
+        for id in ${APPROVED_USB_IDS}; do
+            [ "${vendor}:${product}" = "${id}" ] || continue
+            # --parent-match covers this device and every descendant.
+            timeout 60 udevadm trigger --action=change --parent-match="$(readlink -f "${node}")" \
+                >&2 || die "udevadm trigger failed"
+            count=$((count + 1))
+        done
+    done
+    if [ "${count}" -gt 0 ]; then
+        timeout 30 udevadm settle --timeout=10 >&2 || die "udevadm settle failed"
+    fi
+    printf '%s\n' "${count}"
+}
+
 # validate_test_environment - fake roots and command fault injection are only
 # for the unprivileged test suite. Reject them for root before either script
 # reads or mutates policy state, so a preserved environment can never reach eval.

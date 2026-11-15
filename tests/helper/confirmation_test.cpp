@@ -21,6 +21,44 @@ TEST_F(HelperConfirmation, HelperFailureNeverPersistsApprovalOrOpensPairing) {
     EXPECT_EQ(events.count_opened(), 0U);
     EXPECT_EQ(bridge.cancellations, 1);
 }
+// #141 B1: GetPairingCandidate on a wireless request is refused without
+// touching it. The request (and the helper binding prepare() made) stays
+// live, so it is still confirmed or cancelled through the retirement paths.
+TEST_F(HelperConfirmation, WirelessCandidateRetrievalIsRefusedAndTheRequestStaysUsable) {
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:01", "adapter"};
+    bridge.binding_slots = 16;
+    const auto source = control.request_add_phone(caller); ASSERT_TRUE(source);
+    ASSERT_EQ(bridge.bindings.size(), 1U);
+    const auto candidate = control.pairing_candidate(caller, source.value());
+    ASSERT_FALSE(candidate);
+    EXPECT_EQ(candidate.error().code(), ErrorCode::trust_not_wired_candidate);
+    EXPECT_EQ(count_closed(), 0U);
+    EXPECT_EQ(bridge.cancellations, 0);
+    EXPECT_EQ(phones.pending_count(), 1U);
+    ASSERT_TRUE(control.confirm_phone_pairing(caller, source.value()));
+    EXPECT_EQ(bridge.confirmations, 1);
+    EXPECT_EQ(store.phones().size(), 1U);
+}
+TEST_F(HelperConfirmation, RepeatedWirelessCandidateRetrievalNeverExhaustsHelperBindings) {
+    bridge.prepared = helper::PeerIdentity{"02:00:00:00:00:01", "adapter"};
+    bridge.binding_slots = 16;
+    constexpr int kAttempts = 20;  // beyond the helper's 16 binding slots
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        const auto source = control.request_add_phone(caller);
+        ASSERT_TRUE(source) << "attempt " << attempt;
+        const auto candidate = control.pairing_candidate(caller, source.value());
+        ASSERT_FALSE(candidate);
+        EXPECT_EQ(candidate.error().code(), ErrorCode::trust_not_wired_candidate);
+        // The id is still held, so the consumer's cancel retires the binding.
+        ASSERT_TRUE(control.cancel_phone_pairing(caller, source.value())) << "attempt " << attempt;
+    }
+    EXPECT_TRUE(bridge.bindings.empty());
+    EXPECT_EQ(bridge.cancellations, kAttempts);
+    EXPECT_EQ(phones.pending_count(), 0U);
+    const auto last = control.request_add_phone(caller); ASSERT_TRUE(last);
+    ASSERT_TRUE(control.confirm_phone_pairing(caller, last.value()));
+    EXPECT_EQ(store.phones().size(), 1U);
+}
 TEST_F(HelperConfirmation, HelperSuccessPrecedesDurableApproval) {
     const auto source = control.request_add_phone(caller); ASSERT_TRUE(source);
     ASSERT_TRUE(control.confirm_phone_pairing(caller, source.value()));

@@ -48,10 +48,16 @@ composes the modules above and reimplements none of them.
 ## Prerequisites (once per target)
 
 1. Task-29 udev policy installed:
-   `sudo -n bash tools/usb-policy/install.sh` (matched ids on port `1-2.1`).
-2. Approved phone connected on port `1-2.1` (phone mode `04e8:6860` before the
-   AOA switch; `18d1:2d00`/`18d1:2d01` after).
+   `sudo -n bash tools/usb-policy/install.sh` (matched ids on any host port,
+   #133).
+2. Approved phone connected on any host USB port (phone mode `04e8:6860`
+   before the AOA switch; `18d1:2d00`/`18d1:2d01` after). Pass that port to the
+   receiver with `--port`; the qualified rig uses `1-2.1`.
 3. Approved-phone trust store loaded (task 27) for the phone's wired identity.
+   A serial-backed wired approval matches the phone on any port (#133); a
+   port-only (serial-less) approval matches only the port it was approved on.
+   Approve a new phone with `aa-wired-receiver --wired-enrolment` plus
+   `aa-wired-enrol` (docs/wired-enrolment.md), never by hand-editing the store.
 4. Display connected (DP-1 or HDMI-A-1 `connected`) and a PipeWire output sink
    present (`pactl list short sinks` or `pw-cli`). The perf harness
    (`tools/perf/aa-projection-perf.sh`) exports the X session it is told about

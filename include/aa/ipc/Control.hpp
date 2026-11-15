@@ -36,6 +36,7 @@ enum class ControlMethod {
     ping,
     get_pairing_comparison,
     respond_pairing_comparison,
+    get_pairing_candidate,
     request_idr_recovery,
 };
 
@@ -56,6 +57,7 @@ enum class ControlMethod {
     case ControlMethod::ping: return "Ping";
     case ControlMethod::get_pairing_comparison: return "GetPairingComparison";
     case ControlMethod::respond_pairing_comparison: return "RespondPairingComparison";
+    case ControlMethod::get_pairing_candidate: return "GetPairingCandidate";
     case ControlMethod::request_idr_recovery: return "RequestIdrRecovery";
     }
     return {};

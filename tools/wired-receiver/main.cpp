@@ -22,6 +22,7 @@
 // main thread owns the D-Bus dispatch loop, video-consumer accept and the run
 // budget. The session thread is the only caller of WiredSession methods.
 
+#include <aa/app/WiredEnrolment.hpp>
 #include <aa/app/WiredLink.hpp>
 #include <aa/app/WiredPhoneControl.hpp>
 #include <aa/app/WiredSession.hpp>
@@ -44,6 +45,7 @@
 #include <aa/session/Events.hpp>
 #include <aa/session/Session.hpp>
 #include <aa/transport/TlsTransport.hpp>
+#include <aa/trust/PairingPolicy.hpp>
 #include <aa/trust/Store.hpp>
 
 #include <array>
@@ -1526,6 +1528,9 @@ aa::audio::RouterConfig pcm_router_config(
                  std::to_string(completion.completed.count) + ",\"presented_ns\":" +
                  (completion.presented ? std::to_string(completion.presented->count)
                                        : std::string{"null"}) +
+                 ",\"playback_slot_absence\":" +
+                 (completion.presented ? std::string{"null"}
+                     : "\"" + std::string{aa::audio::to_string(completion.playback_slot_absence)} + "\"") +
                  "}");
     };
     return config;
@@ -1643,15 +1648,63 @@ std::string screen_description_event(const aa::config::Screen &screen) {
     return screen_event + "}";
 }
 
+// #133: serve the control contract on this (store-owner) thread while the
+// refused phone may be approved by the registered consumer. Nothing is
+// approved here; only the consumer's explicit confirm writes the store. The
+// loop ends on the enrolment's own completion result, never on store
+// admission: a committed-but-not-durable approval admits in memory yet is not
+// a completed enrolment (#141 B2), so it logs wired_enrolment_not_durable and
+// exits 1.
+int run_wired_enrolment(aa::ipc::ControlBusService &bus, aa::app::WiredEnrolment &enrolment,
+                        const aa::trust::WiredIdentity &refused,
+                        std::chrono::steady_clock::time_point deadline) {
+    const std::string label = aa::trust::redacted_label(aa::trust::TransportIdentity{refused});
+    const auto window = std::chrono::milliseconds{aa::app::WiredEnrolment::kCandidateFreshness.count};
+    const auto until = std::min(deadline, std::chrono::steady_clock::now() + window);
+    log_line("{\"event\":\"wired_enrolment_open\",\"phone_id\":\"" + label +
+             "\",\"window_ms\":" + std::to_string(window.count()) + "}");
+    while (g_running.load() && std::chrono::steady_clock::now() < until && !enrolment.completion()) {
+        const auto left = std::chrono::ceil<std::chrono::milliseconds>(
+            until - std::chrono::steady_clock::now()).count();
+        const auto step = bus.cycle(Milliseconds{std::clamp<std::int64_t>(left, 0, 1000)});
+        if (!step.has_value()) {
+            log_line("{\"event\":\"err\",\"detail\":\"dbus\"}");
+            break;
+        }
+    }
+    const auto completion = enrolment.completion();
+    enrolment.close();
+    // Close any request still outstanding (PairingClosed) before leaving.
+    bus.service().refresh_consumer_owner();
+    if (completion && !completion->durable) {
+        log_line("{\"event\":\"wired_enrolment_not_durable\",\"phone_id\":\"" + label +
+                 "\",\"detail\":\"store directory sync failed; approval may not survive a crash\"}");
+        return 1;
+    }
+    if (completion) {
+        log_line("{\"event\":\"wired_enrolment_approved\",\"phone_id\":\"" + label +
+                 "\",\"next\":\"replug the phone, then start the receiver again\"}");
+        return 0;
+    }
+    log_line("{\"event\":\"wired_enrolment_closed\",\"phone_id\":\"" + label + "\"}");
+    return 3;
+}
+
 const char *const kUsage =
     "usage: aa-wired-receiver --port <usb-port-context> [--store PATH]\n"
     "                         [--video-socket PATH] [--input-socket PATH]\n"
     "                         [--duration-ms N] [--no-bus]\n"
-    "                         [--require-video-consumer]\n"
+    "                         [--require-video-consumer] [--wired-enrolment]\n"
     "                         [--screen-<field> N]... [--screen-experimental-geometry]\n"
     "                         [--audio-sink pulse|pipewire|automatic]\n"
     "  runs the wired session over USB/AOA with TrustStore admission;\n"
     "  the approved-phones store must already contain the phone (fail closed).\n"
+    "  --wired-enrolment: when admission refuses the phone, keep the D-Bus\n"
+    "  contract up for 120 s so the registered consumer can approve that exact\n"
+    "  refused phone (RequestAddPhone, GetPairingCandidate, then\n"
+    "  ConfirmPhonePairing = yes or CancelPhonePairing = no; aa-wired-enrol is\n"
+    "  the terminal reference). An approval exits 0 (replug to connect); no\n"
+    "  approval exits 3. Needs the bus (not with --no-bus).\n"
     "  --require-video-consumer defers upstream negotiation until a video\n"
     "  consumer has been accepted and installed (bounded, fail closed).\n"
     "  --audio-sink picks the routing element (default pulse: pulsesink via\n"
@@ -1687,6 +1740,7 @@ int receiver_main(int argc, char **argv) {
     std::int64_t duration_ms = 0;
     bool no_bus = false;
     bool require_video_consumer = false;
+    bool wired_enrolment = false;
     aa::audio::SinkBackend audio_backend = aa::audio::SinkBackend::pulse;
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--port") == 0 && index + 1 < argc) {
@@ -1727,6 +1781,8 @@ int receiver_main(int argc, char **argv) {
             no_bus = true;
         } else if (std::strcmp(argv[index], "--require-video-consumer") == 0) {
             require_video_consumer = true;
+        } else if (std::strcmp(argv[index], "--wired-enrolment") == 0) {
+            wired_enrolment = true;
         } else if (std::strcmp(argv[index], "--audio-sink") == 0 && index + 1 < argc) {
             const std::string_view value{argv[++index]};
             if (value == "pulse") {
@@ -1744,7 +1800,7 @@ int receiver_main(int argc, char **argv) {
             return 2;
         }
     }
-    if (port.empty() || duration_ms < 0) {
+    if (port.empty() || duration_ms < 0 || (wired_enrolment && no_bus)) {
         std::fputs(kUsage, stderr);
         return 2;
     }
@@ -1843,11 +1899,21 @@ int receiver_main(int argc, char **argv) {
     aa::app::WiredPhoneControl control{store, session};
     aa::ipc::RandomPairingIdSource ids;
     StorePhones phones{control};
+    // #133 wired enrolment: before a session owns the store (this thread runs
+    // the bus until then), the bus directory is the enrolment state machine;
+    // close() hands pairing refusal and ForgetPhone back to `phones`.
+    aa::trust::SteadyClock enrolment_clock{};
+    aa::app::WiredEnrolment enrolment{store, enrolment_clock, phones};
+    if (!wired_enrolment) {
+        enrolment.close();
+    }
     std::optional<aa::ipc::ControlBusService> bus{};
     if (!no_bus) {
         auto started_bus = aa::ipc::ControlBusService::start(
             aa::ipc::ControlBusService::Config{aa::ipc::current_uid()},
-            aa::ipc::ControlBusService::Deps{ids, phones});
+            aa::ipc::ControlBusService::Deps{ids, wired_enrolment
+                                                      ? static_cast<aa::ipc::PhoneDirectory &>(enrolment)
+                                                      : static_cast<aa::ipc::PhoneDirectory &>(phones)});
         if (!started_bus.has_value()) {
             log_line("{\"event\":\"err\",\"detail\":\"dbus\"}");
             return 3;
@@ -1924,8 +1990,15 @@ int receiver_main(int argc, char **argv) {
         }
         line += "}";
         log_line(line);
+        if (wired_enrolment && bus.has_value() &&
+            first_link.error().code() == aa::ErrorCode::transport_unauthorized_peer &&
+            !attempted_identity.port_context.empty() &&
+            enrolment.note_refused(attempted_identity).has_value()) {
+            return run_wired_enrolment(bus.value(), enrolment, attempted_identity, deadline);
+        }
         return 3;
     }
+    enrolment.close();  // a session now owns the store; pairing is refused again
     std::optional<aa::app::WiredLink> link{std::move(first_link.value())};
     session.attach_transport(link->transport.get());
     if (!bind_link_cipher(link->phone)) {

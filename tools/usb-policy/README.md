@@ -1,9 +1,9 @@
-# Scoped USB / ModemManager device policy (task 29)
+# Scoped USB / ModemManager device policy (task 29, #133)
 
-Narrowly matched udev policy for the qualified Android Auto phone on the
-qualified port of the qualified Jetson. It gives the unprivileged receiver
-session user access to that one device's accessory bulk-pipe node and makes
-ModemManager ignore exactly that one device (the task-11 finding: MM probes
+Narrowly matched udev policy for the approved Android Auto phone ids on any
+host USB port of the qualified Jetson. It gives the unprivileged receiver
+session user access to the matched device's accessory bulk-pipe node and makes
+ModemManager ignore exactly the matched device (the task-11 finding: MM probes
 the phone's CDC-ACM/`ttyACM` modem ports). Nothing else is matched, granted or
 disabled.
 
@@ -23,32 +23,28 @@ tools/usb-policy/
 
 ## Scope: what matches
 
-Exactly one physical port on the qualified Jetson, and exactly the qualified
-identities on that port:
+Exactly the approved identities, on **any** host USB port:
 
-| Mode | idVendor:idProduct | Port |
-| --- | --- | --- |
-| Phone (MTP), Samsung Galaxy S24 Ultra | `04e8:6860` | `1-2.1` |
-| AOA accessory | `18d1:2d00` | `1-2.1` |
-| AOA + ADB accessory (post-switch enumeration) | `18d1:2d01` | `1-2.1` |
+| Mode | idVendor:idProduct |
+| --- | --- |
+| Phone (MTP), Samsung Galaxy S24 Ultra | `04e8:6860` |
+| AOA accessory | `18d1:2d00` |
+| AOA + ADB accessory (post-switch enumeration) | `18d1:2d01` |
 
-The same ids on **any other port do not match** - the port path is part of
-every rule. No rule exists for any other vendor/product, port, hub, the
-Bluetooth radio, HID dongles or the usb-serial class at large. There is no
-world-readable mode, no blanket group access and no system-wide ModemManager
-disable.
+No rule exists for any other vendor/product, hub, the Bluetooth radio, HID
+dongles or the usb-serial class at large. There is no world-readable mode, no
+blanket group access and no system-wide ModemManager disable.
 
-## Port-path encoding (kernel 6.8.12-1021-tegra, verified on target)
+## No port constraint (#133)
 
-Verified with `udevadm info -a /sys/bus/usb/devices/1-2.1` on the qualified target:
-
-- `KERNEL=="1-2.1"` / `KERNELS=="1-2.1"` - the device's kernel name **is** the
-  bus-qualified stable topology path (bus 1 -> root port 2 -> hub port 1).
-  `KERNEL` pins the device node; `KERNELS` pins the device or any descendant
-  (interfaces, tty ports) of that one port.
-- `ATTR{devpath}=="2.1"` - the hub-relative tail **without** the bus prefix.
-  Deliberately not used: two buses on this target can both expose a `2.1`
-  port, so `devpath` alone is not globally unique.
+Until #133 every rule also pinned `KERNEL(S)=="1-2.1"`. The owner decided on
+2026-11-15 to drop the pin: USB ids are spoofable, so a spoofing device could
+use the pinned port as easily as any other, and the pin only stranded the
+approved phone when it was plugged into another hub socket. Device-node access
+is not trust. The receiver's approved-phones store decides admission:
+serial-backed wired identities match on any port, and a port-only
+(serial-less) approval still matches only its own port (see
+`include/aa/trust/Identity.hpp`).
 
 ## Access control (device node, matched device only)
 
@@ -70,14 +66,14 @@ node for the three identities above:
 Note: the distro's broad `51-android.rules` (`adb_user` + vendor-wide
 `04e8`/`18d1` matches) independently grants the same node access on this
 image. That file is out of scope for this task and is not modified; these
-rules stand alone on ids + port.
+rules stand alone on ids.
 
 ## ModemManager (matched device tree only)
 
 `ENV{ID_MM_DEVICE_IGNORE}="1"` is set on **exactly the matched device tree**:
 the usb device node, its interfaces and its tty ports (rule shape follows
 ModemManager's own `77-mm-*-device-blacklist.rules`: id match via `ATTRS` on
-the parent chain, plus the port constraint). Effect: MM never probes the
+the parent chain). Effect: MM never probes the
 phone's CDC-ACM/`ttyACM` ports. Every other device stays visible to
 ModemManager at default policy; the MM service is never stopped, masked or
 globally disabled.
@@ -113,9 +109,10 @@ Idempotent and fail-closed:
 3. Installs the rules file to `/etc/udev/rules.d/70-android-auto-receiver.rules`
    (mode 0644) via staged temp + atomic rename - the destination is never
    reopened for writing or chmod - and reloads udev, then re-triggers **only**
-   the qualified port's device tree (`udevadm trigger --action=change
-   --parent-match=<syspath of 1-2.1>`; dry-run verified on target to select
-   exactly that tree).
+   the device trees of attached devices carrying an approved id, on whatever
+   port they are on (`udevadm trigger --action=change --parent-match=<syspath>`
+   per device; the id list is `APPROVED_USB_IDS` in `common.sh`, which a test
+   keeps equal to the rules file).
 4. Re-running with no change is a no-op besides the reload; re-running after
    drift repairs the installed file while keeping the FIRST install's
    prior-state record authoritative for rollback. `install.sh` and
@@ -146,7 +143,7 @@ Restores the **exact** prior state recorded by the first install:
 - no file existed before -> the installed rules file is removed;
 - a different file existed before -> its recorded bytes are restored
   (`sha256`-verified before and after);
-- udev is reloaded and the qualified port's device tree is re-triggered:
+- udev is reloaded and every attached approved-id device tree is re-triggered:
   rule-derived udev properties - `ID_MM_DEVICE_IGNORE` above all - are
   re-evaluated and disappear with the removed rules (verified on target, see
   the evidence receipt);
@@ -183,7 +180,8 @@ ctest --preset host-dev -R usb_policy --output-on-failure
 ```
 
 Registers `usb_policy_rules` (structural match decisions, including the
-negative same-ids-other-port case and malformed-input fail-closed),
+approved ids on every port, unapproved near-miss ids on every port, no port
+pin, and malformed-input fail-closed),
 `usb_policy_rollback` (install/rollback state machine in a fake root) and
 `usb_policy_udevadm` (recorded `udevadm test` output parsing). The fixtures in
 `tests/usb/fixtures/usb_policy/` freeze the target-side `udevadm test` runs

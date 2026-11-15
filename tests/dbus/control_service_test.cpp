@@ -76,7 +76,7 @@ TEST(ControlService, StateCapabilitiesAndPingStayOpenToAnyCaller) {
     EXPECT_EQ(snapshot.projection, ProjectionState::stopped);
     EXPECT_EQ(snapshot.consumer, aa::core::ConsumerId{});
     EXPECT_EQ(caps.at("contract.interface"), aa::ipc::kContractInterface);
-    EXPECT_EQ(caps.at("contract.semver"), "1.0.0");
+    EXPECT_EQ(caps.at("contract.semver"), "1.1.0");
     EXPECT_GT(stamp, 0U);
 }
 

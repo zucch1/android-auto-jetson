@@ -154,6 +154,20 @@ public:
     virtual std::optional<helper::PeerIdentity> take_expired_wireless_identity(core::PairingRequestId) {
         return std::nullopt;
     }
+    // GetPairingCandidate (#133): the redacted description of the phone a
+    // pending request is bound to, for the explicit human yes/no. A directory
+    // that requires the candidate to be presented before ConfirmPhonePairing
+    // (the wired enrolment) records the presentation here. nullopt: nothing to
+    // present (unknown/expired request).
+    virtual std::optional<std::map<std::string, std::string>> pairing_candidate(core::PairingRequestId) {
+        return std::nullopt;
+    }
+    // True only for a directory whose requests carry a wired candidate (the
+    // wired enrolment). Otherwise GetPairingCandidate is refused with
+    // trust_not_wired_candidate BEFORE any liveness check, and the live request
+    // (with any helper binding a wireless prepare() made) stays untouched: it
+    // is still confirmed or cancelled through the usual retirement paths.
+    virtual bool presents_candidates() const { return false; }
 };
 
 // The active session user the caller's Unix UID must equal. Production fills
@@ -172,7 +186,7 @@ struct ControlServiceDeps final {
 };
 
 // Session D-Bus control dispatcher (task 21) for
-// org.custom.AndroidAutoReceiver1: the fourteen contract methods with their
+// org.custom.AndroidAutoReceiver1: the fifteen contract methods with their
 // authorization semantics, the one-time pairing request-id gate, and the
 // typed event stream behind the contract's signals.
 //
@@ -231,6 +245,9 @@ public:
                                                           core::PairingRequestId request);
     [[nodiscard]] core::Result<void> forget_phone(const BusName& caller, core::PhoneId phone);
     core::Result<std::map<std::string, std::string>> pairing_comparison(const BusName&, core::PairingRequestId);
+    // GetPairingCandidate: consumer-only, for a request this consumer holds
+    // pending (not yet confirmed). Never broadcast; the reply is redacted.
+    core::Result<std::map<std::string, std::string>> pairing_candidate(const BusName&, core::PairingRequestId);
     core::Result<void> respond_pairing_comparison(const BusName&, core::PairingRequestId, helper::ComparisonResponse);
 
     // GetState / GetCapabilities / Ping (open to every caller). state()

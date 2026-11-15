@@ -21,7 +21,7 @@
 -->
 <node name="/org/custom/AndroidAutoReceiver">
   <interface name="org.custom.AndroidAutoReceiver1">
-    <annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.0.0"/>
+    <annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.1.0"/>
 
     <!-- Registers caller as THE session consumer. Caller must own
          consumer_name and match the active session user; only one consumer
@@ -51,7 +51,9 @@
     </method>
 
     <!-- Opens the pairing window for a pending request id. Only the same
-         consumer that requested it, for the same id. -->
+         consumer that requested it, for the same id. Since 1.1.0 a wired
+         approval whose store write could not be made durable fails with
+         Error.NotDurable (the request is spent). -->
     <method name="ConfirmPhonePairing">
       <arg name="request_id" type="t" direction="in"/>
     </method>
@@ -103,6 +105,22 @@
       <arg name="request_id" type="t" direction="in"/>
       <arg name="challenge_id" type="t" direction="in"/>
       <arg name="accept" type="b" direction="in"/>
+    </method>
+
+    <!-- Consumer-only description of the phone a pending request is bound
+         to (#133), for the explicit human yes/no before ConfirmPhonePairing
+         (yes) or CancelPhonePairing (no). Returns transport ("wired"), label
+         (per-receiver-process pseudonym, never a raw serial or port) and
+         strength. A wired request is bound to the identity of the attempt
+         admission last refused and must be retrieved here before
+         ConfirmPhonePairing, or the confirm is refused and the request
+         closes. Only for a request this consumer holds pending. Never
+         broadcast. Since contract 1.1.0. A request with no wired candidate
+         (a wireless request) fails with Error.NotWiredCandidate and is left
+         pending and unchanged. -->
+    <method name="GetPairingCandidate">
+      <arg name="request_id" type="t" direction="in"/>
+      <arg name="candidate" type="a{ss}" direction="out"/>
     </method>
 
     <!-- Requests video IDR keyframe recovery from the active phone session
