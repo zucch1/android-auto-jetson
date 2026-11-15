@@ -11,7 +11,7 @@ set(idle_host_tests
     input_sensors_memory
     video_socket_bench video_socket_backpressure video_socket_stream video_socket_ownership
     audio_pipeline_route audio_pipeline_decode audio_pipeline_sink
-    wired_receiver wired_deadline wired_recovery
+    wired_receiver wired_deadline wired_recovery wired_e2e_idr_io
     tls_hardening wireless_e2e_attested wireless_e2e_composed_tls
     wireless_e2e_eligibility wireless_e2e_control_io wireless_e2e_tcp
     system_helper_nm_retry system_helper_nm_startup_private_bus system_helper_bootstrap

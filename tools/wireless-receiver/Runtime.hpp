@@ -50,7 +50,14 @@ struct Runtime final {
             report("session bus dispatch", step.error().code()); failed = true; stopping = true;
         }
         const auto state = bus.service().state();
-        if (!media.video.idr_dispatching() && bus.service().consume_idr_recovery_request()) {
+        auto* recovery_session = receiver.session();
+        if (recovery_session && !recovery_session->outbound_in_progress()) {
+            if (auto pending = recovery_session->service_pending_video_idr(); !pending) {
+                report("idr recovery", pending.error().code());
+            }
+        }
+        if ((!recovery_session || !recovery_session->outbound_in_progress()) &&
+            !media.video.idr_dispatching() && bus.service().consume_idr_recovery_request()) {
             const auto idr = media.video.request_idr_external("consumer_ipc");
             if (!idr) {
                 report("idr recovery", idr.error().code());

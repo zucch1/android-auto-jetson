@@ -116,7 +116,7 @@ core::Result<void> WiredSession::send_frame(std::span<const std::byte> frame) {
         return io_error(checked.error(), deadline);
     }
     core::DeadlineCancellation bounded{deadline};
-    const PollIoRestore restore_poll_io(*this);
+    const IoScope restore_io(*this);
     if (auto opened = open_io(deadline.until, bounded.token()); !opened) {
         return io_error(opened.error(), deadline);
     }
@@ -143,6 +143,7 @@ void WiredSession::attach_transport(transport::Transport *transport) noexcept {
 // impossible until attach_cipher() binds a fresh cipher and its handshake
 // completes (channels::Negotiator::reset() contract).
 void WiredSession::reset_link() noexcept {
+    pending_video_idr_.reset();
     reset_owned_av();
     parser_ = transport::FrameStreamParser{};
     reassembler_ = transport::MessageReassembler{};
@@ -288,6 +289,7 @@ core::Result<std::size_t> WiredSession::send_version_request(std::uint16_t major
     }
     transport::Message message{std::uint8_t{0}, transport::MessageKind::specific,
                                std::move(payload).value()};
+    const OutboundScope outbound(*this);
     auto frames = transport::encode_message(message, transport::Encryption::plain, nullptr);
     if (!frames) {
         return frames.error();
@@ -319,6 +321,7 @@ core::Result<bool> WiredSession::poll_transport(core::Deadline::Clock::time_poin
 
 core::Result<bool> WiredSession::poll_transport_impl(
     std::optional<core::Deadline::Clock::time_point> until) {
+    if (auto pending = service_pending_video_idr(); !pending) { return pending.error(); }
     last_reject_.reset();
     last_queue_rejection_.reset();
     if (transport_ == nullptr) {
@@ -329,7 +332,7 @@ core::Result<bool> WiredSession::poll_transport_impl(
         return io_error(checked.error(), deadline);
     }
     core::DeadlineCancellation bounded{deadline};
-    const PollIoScope poll_io_scope(*this, deadline.until, bounded.token());
+    const IoScope restore_io(*this);
     if (auto opened = open_io(deadline.until, bounded.token()); !opened) {
         return io_error(opened.error(), deadline);
     }
@@ -704,6 +707,7 @@ core::Result<std::size_t> WiredSession::send_frames(std::vector<std::byte> paylo
         encryption = transport::Encryption::encrypted;
         cipher = cipher_.get();
     }
+    const OutboundScope outbound(*this);
     auto frames = transport::encode_message(message, encryption, cipher);
     if (!frames) {
         return frames.error();
@@ -729,6 +733,7 @@ core::Result<void> WiredSession::send_service_payload(std::uint8_t channel,
     // Service open replies use CONTROL; ordinary service payloads stay SPECIFIC.
     // D19's SPECIFIC evidence applies to control channel 0, not service opens.
     transport::Message message{channel, kind, std::move(payload)};
+    const OutboundScope outbound(*this);
     auto frames = transport::encode_message(message, transport::Encryption::encrypted, cipher_.get());
     if (!frames) { return frames.error(); }
     for (const auto& frame : frames.value()) {
@@ -788,6 +793,7 @@ core::Result<void> WiredSession::forward_input(const input::NormalizedInput &eve
     }
     transport::Message message{*channel, transport::MessageKind::specific,
                                std::move(payload).value()};
+    const OutboundScope outbound(*this);
     auto frames =
         transport::encode_message(message, transport::Encryption::encrypted, cipher_.get());
     if (!frames) {
@@ -968,6 +974,10 @@ core::Result<void> WiredSession::request_video_idr(bool focus_transition) {
     if (!video_projecting()) {
         return Error{ErrorCode::session_illegal_transition};
     }
+    if (outbound_in_progress()) {
+        pending_video_idr_ = pending_video_idr_.value_or(false) || focus_transition;
+        return {};
+    }
     const auto video = av_sinks_.find(protocol::ChannelRole::video);
     const auto result = video->second->request_video_idr(focus_transition);
     if (!result && result.error().code() == ErrorCode::channel_focus_restore_failed) {
@@ -978,8 +988,18 @@ core::Result<void> WiredSession::request_video_idr(bool focus_transition) {
     return result;
 }
 
+core::Result<void> WiredSession::service_pending_video_idr() {
+    if (outbound_in_progress() || !pending_video_idr_) { return {}; }
+    const bool transition = *pending_video_idr_;
+    pending_video_idr_.reset();
+    if (!video_projecting()) { return {}; }
+    return request_video_idr(transition);
+}
+
 core::Result<void> WiredSession::open_io(core::Deadline::Clock::time_point deadline,
                                          const core::CancellationToken &token) {
+    active_io_deadline_ = deadline;
+    active_io_token_ = token;
     transport_->set_io_deadline(deadline);
     return transport_->open(token);
 }

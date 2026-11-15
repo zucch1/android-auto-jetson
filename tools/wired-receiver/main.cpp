@@ -2060,7 +2060,7 @@ int receiver_main(int argc, char **argv) {
     bool in_video_recovery = false;
     bool in_receive_poll = false;
     auto service_video_recovery = [&]() -> bool {
-        if (in_video_recovery) {
+        if (in_video_recovery || session.outbound_in_progress()) {
             return true;
         }
         in_video_recovery = true;
@@ -2068,6 +2068,14 @@ int receiver_main(int argc, char **argv) {
             bool &active;
             ~Guard() { active = false; }
         } guard{in_video_recovery};
+        if (auto pending = session.service_pending_video_idr(); !pending) {
+            log_line(poll_error_json(pending.error().code(), session, audio_sink));
+            if (session.failure()) {
+                session_failed.store(true);
+                g_running.store(false);
+                return false;
+            }
+        }
         if (bus && !video_outlet.idr_dispatching() &&
             bus->service().consume_idr_recovery_request()) {
             const auto idr = video_outlet.request_idr_external("consumer_ipc");
