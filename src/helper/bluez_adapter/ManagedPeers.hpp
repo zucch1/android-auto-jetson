@@ -3,6 +3,7 @@
 #include <aa/helper/SystemHelper.hpp>
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 namespace aa::helper::bluez_adapter {
 // Root-owned state is the authority, not BlueZ's global bond inventory.
@@ -13,8 +14,9 @@ namespace aa::helper::bluez_adapter {
 // fsync when durability was not yet confirmed. remember(): new admissions only;
 // a failed write refuses that admission but never removes revocation of an
 // existing or renamed-into-place entry.
-// The same file-safety rules and format back two more, independent lists under other file
-// names: the enrolment windows' bonds awaiting removal (pending-removals, see forget()) and the
+// The same file-safety rules and format back three more, independent lists under other file
+// names: the enrolment windows' bonds awaiting removal (pending-removals, see forget()),
+// stale-approved owed removals parked across #74 (owed-removals), and the
 // revoked bonds kept only as revocation authority (revoked-bonds, see remember(evict_oldest)).
 class ManagedPeers {
 public:
@@ -25,10 +27,14 @@ public:
     bool revocable(const PeerIdentity& peer) const { return contains(peer); }
     bool admitted(const PeerIdentity&) const;
     bool retired(const PeerIdentity&) const;
+    std::string digest(const PeerIdentity&) const;
+    bool from_disk(const PeerIdentity&) const;
     bool confirm_durable();
     // evict_oldest: a full list drops its oldest entry instead of refusing (history lists only).
     // retired: for revoked-bonds only, records that BlueZ confirmed no bond after revocation.
-    bool remember(const PeerIdentity&, bool evict_oldest = false, bool retired = false);
+    // digest: for pending-removals / owed-removals, optional 64-hex keyed bond digest.
+    bool remember(const PeerIdentity&, bool evict_oldest = false, bool retired = false,
+                  std::string_view digest = {});
     // Removes an entry; for a list that is not revocation authority. True only when the entry
     // is durably gone: absent and the directory sync confirmed (a pending unsynced rename is
     // retried here), or rewritten, renamed into place and the directory synced. A transient
@@ -37,17 +43,21 @@ public:
     bool forget(const PeerIdentity&);
     const std::vector<PeerIdentity>& peers() const { return peers_; }
 private:
-    bool replace(int directory, const std::vector<PeerIdentity>&, const std::vector<bool>&);
+    bool replace(int directory, const std::vector<PeerIdentity>&, const std::vector<bool>&,
+                 const std::vector<std::string>&);
     bool sync_directory(int dir_fd);
     std::string directory_;
     std::string file_;
     std::uint32_t owner_;
     bool stateful_{};
+    bool digest_tracked_{};
     bool valid_{};
     bool durable_{true};
     std::size_t admitted_{};
     std::string reason_;
     std::vector<PeerIdentity> peers_;
     std::vector<bool> retired_;
+    std::vector<std::string> digests_;
+    std::vector<bool> loaded_from_disk_;
 };
 }

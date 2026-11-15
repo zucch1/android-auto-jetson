@@ -10,7 +10,8 @@ public:
     using Now = std::function<std::chrono::steady_clock::time_point()>;
     explicit BluezBackend(const std::string& bus_address, Now now = std::chrono::steady_clock::now,
                           const std::string& state_directory = "/var/lib/aa-system-helper",
-                          std::uint32_t state_owner = 0);
+                          std::uint32_t state_owner = 0,
+                          const std::string& bluetooth_directory = {});
     ~BluezBackend() override;
     bool available() const;
     core::Result<bool> bond_confirmed() override;

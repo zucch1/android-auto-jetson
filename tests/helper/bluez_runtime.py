@@ -76,7 +76,8 @@ class Surface:
         self.env["DBUS_SESSION_BUS_ADDRESS"] = session
         self.consumer = connect(session)
         self.rogue = connect(session)
-        self.mock = stack.enter_context(process([sys.executable, "-B", str(Path(__file__).with_name("bluez_mock.py")), self.address], self.env))
+        self.mock = stack.enter_context(process([sys.executable, "-B", str(Path(__file__).with_name("bluez_mock.py")),
+            self.address, str(directory / "bluetooth")], self.env))
         assert line(self.mock) == "ready"
         binary = build / ("aa_bluez_peer_probe" if probe else "aa_system_helper_fixture")
         (directory / "session.uid").write_text(f"{os.getuid()}\n")

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <aa/helper/BluezBackend.hpp>
+#include "BondDigest.hpp"
 #include "ManagedPeers.hpp"
 #include <aa/helper/Bootstrap.hpp>
 #include <gio/gio.h>
@@ -38,17 +39,32 @@ struct BluezBackend::Impl {
     bool profile_requested{true};
     bool registered{}, agent_registered{};
     std::vector<std::string> adapters;
+    std::map<std::string, PeerIdentity> device_paths;
     std::map<std::uint64_t, Observation> observations;
     // Bond states (docs/enrolment-ordering.md). Admitted: on `managed`, durably synced, and not
     // on `pending`. Provisional: acknowledged in this enrolment (`acknowledged`) with its
     // `pending` entry kept. Revoked: on `revoked` only. Cleanup follows `pending` alone.
     bluez_adapter::ManagedPeers managed;
     // Bonds an enrolment window may have created that were never admitted, awaiting removal.
-    // Persisted (same file rules as `managed`) so a helper restart cannot lose a removal: this is
-    // the durable cleanup obligation of every unaccepted or provisional bond.
+    // Persisted (same file rules as `managed`, with keyed bond digest) so a helper restart cannot
+    // lose a removal or misattribute a newer outside bond: this is the durable cleanup obligation
+    // of every unaccepted or provisional bond.
     bluez_adapter::ManagedPeers pending;
+    // Owed AA bond removals parked while a stale receiver approval temporarily kept the bond (#74).
+    // Preserves the keyed bond digest so a repeated ForgetPhone or later unapproved reconciliation
+    // still removes the original AA bond while never blocking fresh enrolment.
+    bluez_adapter::ManagedPeers owed_removals;
     // Forgotten bonds: revocation authority only, never admission or acceptance of a new bond.
     bluez_adapter::ManagedPeers revoked;
+    // Keyed HMAC-SHA256 digest of BlueZ persistent keys used to distinguish original AA bonds from
+    // newer outside bonds across crashes, restarts, or lost RemoveDevice replies.
+    bluez_adapter::BondDigest bond_digest;
+    // Identities whose removal obligation was loaded from disk at startup; stays set across
+    // owed-removals <-> pending-removals moves so digest verification cannot be bypassed.
+    std::vector<PeerIdentity> disk_owed;
+    // Identities for which RemoveDevice has already been attempted in this helper run; any second
+    // attempt (e.g. after a lost D-Bus reply) requires digest verification first.
+    std::vector<PeerIdentity> removal_attempted;
     // Removed from BlueZ already; only the record's rewrite is still failing. Never removed again.
     std::vector<PeerIdentity> removal_done;
     // Removed by cleanup in this helper run (bounded, oldest first). Their bonds are gone and
@@ -86,6 +102,7 @@ struct BluezBackend::Impl {
     // Revoked identities currently bonded in BlueZ whose non-removal warning has been logged in
     // this helper run; cleared once unbonded or when a committed enrolment clears history.
     std::vector<PeerIdentity> refused_bond_warned;
+    Clock::time_point next_warning_check{};
     // BlueZ removal attempts are budgeted per invocation (docs/enrolment-ordering.md, #118): at
     // most kRemovalAttemptBudget attempts, and every Disconnect and RemoveDevice of the invocation
     // shares one deadline, kRemovalTimeBudget after the invocation started (the tick, the
@@ -130,7 +147,13 @@ struct BluezBackend::Impl {
     // backoff expired; `first` (reconciliation) only identities with no failed attempt in this
     // helper run, so a reply never waits on retries; `own` only the identity passed in.
     enum class Retire { tick, first, own };
-    enum class Removal { gone, failed, deferred };
+    enum class Removal { gone, failed, deferred, kept_refused };
+    enum class BondVerification { verified_original, outside_rebond, ambiguous };
+    void mark_disk_owed(const PeerIdentity&);
+    void capture_pending_digest(const PeerIdentity&);
+    BondVerification verify_bonded_removal(const PeerIdentity&);
+    bool resolve_unremovable_bond(const PeerIdentity&, BondVerification, const std::vector<Device>&);
+    void warn_revoked_bonded_peers(const std::vector<Device>&);
     // One budgeted attempt: disconnects, then RemoveDevice for each BlueZ object of the identity.
     Removal remove_bond(const std::vector<Device>&, const PeerIdentity&, RemovalBudget&, Retire);
     void retire_unaccepted(Retire = Retire::tick, const PeerIdentity* own = nullptr,
@@ -159,7 +182,7 @@ struct BluezBackend::Impl {
     SnapshotFence fence;
     HandoffFailure last_failure{HandoffFailure::none};
     Clock::time_point next_check{};
-    Impl(const std::string&, Now, const std::string&, std::uint32_t);
+    Impl(const std::string&, Now, const std::string&, std::uint32_t, const std::string&);
     ~Impl();
     // Bounded at timeout_ms (150 ms unless a cleanup budget passes less).
     GVariant* call(const char*, const char*, const char*, GVariant*, const GVariantType* = nullptr, int timeout_ms = 150);

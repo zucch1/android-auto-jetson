@@ -19,6 +19,79 @@ bool address_valid(const std::string& address) {
     return true;
 }
 }
+void BluezBackend::Impl::mark_disk_owed(const PeerIdentity& peer) {
+    if (!listed(disk_owed, peer)) disk_owed.push_back(peer);
+}
+void BluezBackend::Impl::capture_pending_digest(const PeerIdentity& peer) {
+    if (!pending.contains(peer)) return;
+    if (pending.from_disk(peer) || listed(disk_owed, peer) || listed(removal_attempted, peer)) return;
+    if (!pending.digest(peer).empty()) return;
+    if (const auto digest = bond_digest.compute(peer)) (void)pending.remember(peer, false, false, *digest);
+}
+BluezBackend::Impl::BondVerification BluezBackend::Impl::verify_bonded_removal(const PeerIdentity& peer) {
+    std::string stored = pending.digest(peer);
+    if (stored.empty()) stored = owed_removals.digest(peer);
+    const bool must_verify = pending.from_disk(peer) || owed_removals.from_disk(peer) || listed(disk_owed, peer);
+    if (stored.empty() && !must_verify) {
+        capture_pending_digest(peer);
+        stored = pending.digest(peer);
+        if (stored.empty() && owed_removals.contains(peer) && !owed_removals.from_disk(peer)) {
+            if (const auto digest = bond_digest.compute(peer)) {
+                (void)owed_removals.remember(peer, false, false, *digest);
+                stored = owed_removals.digest(peer);
+            }
+        }
+    }
+    if (!stored.empty()) {
+        const auto current = bond_digest.compute(peer);
+        if (!current) return BondVerification::ambiguous;
+        return *current == stored ? BondVerification::verified_original : BondVerification::outside_rebond;
+    }
+    return must_verify ? BondVerification::ambiguous : BondVerification::verified_original;
+}
+bool BluezBackend::Impl::resolve_unremovable_bond(const PeerIdentity& peer, BondVerification verdict,
+                                                   const std::vector<Device>& devices) {
+    const bool retired = (verdict == BondVerification::outside_rebond) || revoked.retired(peer);
+    if (!revoked.remember(peer, true, retired)) return false;
+    if (managed.contains(peer) && !managed.forget(peer)) return false;
+    if (!pending.forget(peer)) return false;
+    if (!owed_removals.forget(peer)) return false;
+    std::erase(disk_owed, peer);
+    std::erase(removal_attempted, peer);
+    std::erase(removal_done, peer);
+    std::erase(awaiting, peer);
+    std::erase(refused, peer);
+    std::erase_if(removal_retries, [&](const RemovalRetry& entry) { return entry.peer == peer; });
+    warn_revoked_bonded_peers(devices);
+    return true;
+}
+void BluezBackend::Impl::warn_revoked_bonded_peers(const std::vector<Device>& devices) {
+    const auto is_bonded = [&](const PeerIdentity& peer) {
+        return std::any_of(devices.begin(), devices.end(),
+            [&](const Device& device) { return device.identity == peer && device.bonded; });
+    };
+    std::erase_if(refused_bond_warned, [&](const PeerIdentity& peer) { return !is_bonded(peer); });
+    std::optional<PeerIdentity> live;
+    if (allowed && pending.contains(allowed->device.identity)) live = allowed->device.identity;
+    for (const auto& device : devices) {
+        const auto& peer = device.identity;
+        if (!device.bonded || !revoked.contains(peer) || live == peer || listed(awaiting, peer) ||
+            listed(refused, peer) || pending.contains(peer) || owed_removals.contains(peer))
+            continue;
+        if (!listed(refused_bond_warned, peer)) {
+            std::cerr << "system-helper: warning bond_refused_revoked_identity "
+                      << diagnostics::redact_identifier(peer.address)
+                      << (revoked.retired(peer)
+                              ? ": this phone was forgotten in Android Auto and is bonded again "
+                                "(paired outside Android Auto); keeping the shared adapter bond "
+                                "and refusing Android Auto use. Enrol the phone again in Android Auto to use it.\n"
+                              : ": this phone was forgotten in Android Auto and its bond history "
+                                "is ambiguous; keeping the shared adapter bond and refusing Android "
+                                "Auto use. Enrol the phone again in Android Auto to use it.\n");
+            refused_bond_warned.push_back(peer);
+        }
+    }
+}
 BluezBackend::Impl::Removal BluezBackend::Impl::remove_bond(const std::vector<Device>& devices,
                                                              const PeerIdentity& peer, RemovalBudget& budget,
                                                              Retire mode) {
@@ -38,7 +111,6 @@ BluezBackend::Impl::Removal BluezBackend::Impl::remove_bond(const std::vector<De
         budget.exhausted = true;
         return Removal::deferred;
     }
-    ++budget.attempts;
     const auto back_off = [&] {
         // Backed off from the failed attempt's completion: 1 s, doubling to 30 s.
         auto item = std::find_if(removal_retries.begin(), removal_retries.end(),
@@ -53,6 +125,16 @@ BluezBackend::Impl::Removal BluezBackend::Impl::remove_bond(const std::vector<De
         item->next = now() + std::min<Clock::duration>(delay, std::chrono::seconds{30});
         return Removal::failed;
     };
+    const bool bonded = std::any_of(devices.begin(), devices.end(),
+                                    [&](const Device& device) { return device.identity == peer && device.bonded; });
+    if (bonded) {
+        const auto verdict = verify_bonded_removal(peer);
+        if (verdict != BondVerification::verified_original) {
+            return resolve_unremovable_bond(peer, verdict, devices) ? Removal::kept_refused : back_off();
+        }
+        if (!listed(removal_attempted, peer)) removal_attempted.push_back(peer);
+    }
+    ++budget.attempts;
     for (const auto& device : devices) {
         if (device.identity != peer) continue;
         // Disconnect gets at most half of what is left, so a slow Disconnect cannot starve the
@@ -107,20 +189,35 @@ void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own,
         if (listed(awaiting, peer)) continue;
         if (revoked.retired(peer)) {
             (void)pending.forget(peer);
+            if (!pending.contains(peer)) {
+                std::erase(disk_owed, peer);
+                std::erase(removal_attempted, peer);
+            }
             continue;
         }
         const bool bonded = std::any_of(devices.begin(), devices.end(),
             [&](const Device& device) { return device.identity == peer && device.bonded; });
         if (bonded && listed(approved, peer)) {
-            // Approved, so the bond stays (#74). A revoked identity's approval is never admitted
-            // without a fresh committed enrolment, so its window's journal entry is not needed (the
-            // history keeps the removal authority) and must not block the identity's next enrolment.
-            if (revoked.contains(peer)) (void)pending.forget(peer);
+            // Approved, so the bond stays (#74). If revoked already owes removal of an AA bond,
+            // park the digest-tracked obligation in owed_removals before dropping pending-removals
+            // so a repeated ForgetPhone or later unapproved reconciliation still removes the bond
+            // while not blocking a fresh enrolment.
+            if (revoked.contains(peer)) {
+                std::string digest = pending.digest(peer);
+                if (digest.empty()) digest = owed_removals.digest(peer);
+                if (digest.empty() && !pending.from_disk(peer) && !owed_removals.from_disk(peer) &&
+                    !listed(disk_owed, peer) && !listed(removal_attempted, peer)) {
+                    if (const auto computed = bond_digest.compute(peer)) digest = *computed;
+                }
+                if (pending.from_disk(peer)) mark_disk_owed(peer);
+                if (owed_removals.remember(peer, false, false, digest)) (void)pending.forget(peer);
+            }
             continue;
         }
         if (std::find(removal_done.begin(), removal_done.end(), peer) == removal_done.end()) {
             const auto removal = remove_bond(devices, peer, budget, own ? Retire::own : mode);
             if (budget.exhausted) { cursor = (first + step) % peers.size(); break; }
+            if (removal == Removal::kept_refused) { cursor = (first + step + 1) % peers.size(); continue; }
             if (removal == Removal::failed) cursor = (first + step + 1) % peers.size();
             if (removal != Removal::gone) continue;
             cursor = (first + step + 1) % peers.size();
@@ -137,6 +234,8 @@ void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own,
         (void)pending.forget(peer);
         if (!pending.contains(peer)) {                       // gone from memory; sync retried
             std::erase(removal_done, peer);
+            std::erase(disk_owed, peer);
+            std::erase(removal_attempted, peer);
             std::erase(cleaned, peer);
             if (cleaned.size() >= 256) cleaned.erase(cleaned.begin());
             cleaned.push_back(peer);
@@ -150,8 +249,8 @@ void BluezBackend::Impl::park() {
     if (pending.contains(identity) && !listed(awaiting, identity)) awaiting.push_back(identity);
 }
 bool BluezBackend::Impl::admitted(const PeerIdentity& peer) {
-    if (!reconciled || !pending.valid() || pending.contains(peer) || listed(awaiting, peer) || listed(refused, peer) ||
-        revoked.contains(peer))
+    if (!reconciled || !pending.valid() || !owed_removals.valid() || pending.contains(peer) ||
+        listed(awaiting, peer) || listed(refused, peer) || revoked.contains(peer))
         return false;
     return managed.admitted(peer) || (managed.confirm_durable() && managed.admitted(peer));
 }
@@ -164,12 +263,21 @@ bool BluezBackend::Impl::demote(const PeerIdentity& peer, bool owe_removal) {
     }
     // Refused from here on, whatever the writes below report: a failure leaves the stricter state.
     if (!listed(refused, peer)) refused.push_back(peer);
-    // The removal obligation first, then history (revocation authority never lapses), then the
-    // managed entry; each confirmed durable (rename + directory fsync) before the next. Managed
-    // state is never dropped before the obligation to remove its bond is durable, so a crash or a
-    // failed write between any two steps leaves a state reconciliation completes, never an admitted
-    // or a stranded bond. The obligation is dropped only once BlueZ confirmed the removal.
-    if (owe_removal && !pending.remember(peer)) return false;
+    // The removal obligation (with keyed bond digest) first, then history (revocation authority
+    // never lapses), then the managed entry; each confirmed durable (rename + directory fsync)
+    // before the next. Managed state is never dropped before the obligation to remove its bond is
+    // durable, so a crash or a failed write between any two steps leaves a state reconciliation
+    // completes, never an admitted or a stranded bond. The obligation is dropped only once BlueZ
+    // confirmed the removal (or verified as outside re-bond / ambiguous).
+    if (owe_removal) {
+        std::string digest = pending.digest(peer);
+        if (digest.empty()) digest = owed_removals.digest(peer);
+        if (digest.empty() && !pending.from_disk(peer) && !owed_removals.from_disk(peer) &&
+            !listed(disk_owed, peer) && !listed(removal_attempted, peer)) {
+            if (const auto computed = bond_digest.compute(peer)) digest = *computed;
+        }
+        if (!pending.remember(peer, false, false, digest)) return false;
+    }
     if (!revoked.remember(peer, true, false)) return false;
     if (!managed.forget(peer)) return false;
     std::erase(refused, peer);
@@ -177,7 +285,11 @@ bool BluezBackend::Impl::demote(const PeerIdentity& peer, bool owe_removal) {
 }
 bool BluezBackend::Impl::clear_revocation(const PeerIdentity& peer) {
     if (revoked.contains(peer) && !revoked.forget(peer)) return false;
+    if (owed_removals.contains(peer) && !owed_removals.forget(peer)) return false;
     std::erase(refused_bond_warned, peer);
+    std::erase(disk_owed, peer);
+    std::erase(removal_attempted, peer);
+    std::erase(removal_done, peer);
     return true;
 }
 // ReconcileBondsV1. The receiver's approved set decides:
@@ -185,24 +297,31 @@ bool BluezBackend::Impl::clear_revocation(const PeerIdentity& peer) {
 //     acknowledged and awaiting the commit    enrolment of the identity and its approval landed
 //                                             (history cleared first, then the commit's writes)
 //   approved, revoked otherwise            -> stays revoked, not admitted, bond kept (#74),
-//                                             counted as unadmitted; a stale journal entry is
-//                                             dropped (the history keeps the removal authority)
+//                                             counted as unadmitted; if still bonded, an owed
+//                                             removal is parked in `owed-removals` (digest kept)
+//                                             and the journal entry dropped so re-enrolment works;
+//                                             non-owed revoked bonded peers also log once
 //   approved, managed                      -> admitted (a journal entry left by a commit that
 //                                             stopped between its two writes is dropped)
 //   approved, journalled, bonded           -> admitted (the approval landed, the commit did not)
 //   approved, nothing to admit             -> counted as unadmitted, nothing removed
 //   managed, not approved                  -> demoted (removal owed first), device removed
-//   journalled, not approved, not retired  -> device removed, history retired, entry dropped
+//   owed-removals, not approved            -> moved back to `pending-removals` (if bonded & not
+//                                             retired) for digest-verified removal
+//   journalled, not approved, not retired  -> digest-verified device removal (D_cur == D_stored),
+//                                             or outside rebond (R) / ambiguous (P) kept & warned
 //   journalled, not approved, retired      -> stale post-removal journal entry dropped; bond kept
-//   revoked, bonded, not approved,         -> outside re-bond or ambiguous history: bond kept
-//     not journalled                          on shared adapter, refused for AA, warning logged
+//   revoked, bonded, not journalled        -> outside re-bond or ambiguous history: bond kept
+//                                             on shared adapter, refused for AA, warning logged
 // A bond of an identity none of the helper's files name is never touched, and the open enrolment
 // window's own bond is left to that window. Success only once every state change is durable and
 // every bond Android Auto still owes removal for is gone from BlueZ or its removal durably owed
-// in the journal; on failure the stricter state stays and the receiver retries.
+// in the journal / owed-removals; on failure the stricter state stays and the receiver retries.
 core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<PeerIdentity>& approved) {
     auto& s = *impl_;
-    if (!s.managed.valid() || !s.pending.valid() || !s.revoked.valid()) return Error{ErrorCode::helper_unavailable};
+    if (!s.managed.valid() || !s.pending.valid() || !s.owed_removals.valid() ||
+        !s.revoked.valid() || !s.bond_digest.valid())
+        return Error{ErrorCode::helper_unavailable};
     if (approved.size() > SystemHelper::kMaxApprovedBonds) return Error{ErrorCode::helper_rejected};
     for (const auto& peer : approved)
         if (!address_valid(peer.address) || !address_valid(peer.adapter)) return Error{ErrorCode::helper_rejected};
@@ -228,7 +347,39 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
             // never committed after the revocation: a resurrected or stale approval, or one whose
             // window closed without acceptance. The revocation wins.
             durable = s.demote(peer, false) && durable;
-            if (!listed(s.refused, peer) && s.pending.contains(peer)) durable = s.pending.forget(peer) && durable;
+            if (!listed(s.refused, peer) && (s.pending.contains(peer) || s.owed_removals.contains(peer))) {
+                if (s.revoked.retired(peer)) {
+                    durable = s.pending.forget(peer) && durable;
+                    durable = s.owed_removals.forget(peer) && durable;
+                    if (!s.pending.contains(peer) && !s.owed_removals.contains(peer)) {
+                        std::erase(s.disk_owed, peer);
+                        std::erase(s.removal_attempted, peer);
+                    }
+                } else if (!bonded(peer)) {
+                    durable = s.revoked.remember(peer, true, true) && durable;
+                    if (s.revoked.retired(peer)) {
+                        durable = s.pending.forget(peer) && durable;
+                        durable = s.owed_removals.forget(peer) && durable;
+                        if (!s.pending.contains(peer) && !s.owed_removals.contains(peer)) {
+                            std::erase(s.disk_owed, peer);
+                            std::erase(s.removal_attempted, peer);
+                        }
+                    }
+                } else if (s.pending.contains(peer)) {
+                    std::string digest = s.pending.digest(peer);
+                    if (digest.empty()) digest = s.owed_removals.digest(peer);
+                    if (digest.empty() && !s.pending.from_disk(peer) && !s.owed_removals.from_disk(peer) &&
+                        !listed(s.disk_owed, peer) && !listed(s.removal_attempted, peer)) {
+                        if (const auto computed = s.bond_digest.compute(peer)) digest = *computed;
+                    }
+                    if (s.pending.from_disk(peer)) s.mark_disk_owed(peer);
+                    if (s.owed_removals.remember(peer, false, false, digest)) {
+                        durable = s.pending.forget(peer) && durable;
+                    } else {
+                        durable = false;
+                    }
+                }
+            }
             std::erase(s.awaiting, peer);
             ++unadmitted;
             continue;
@@ -236,6 +387,11 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
         if (s.managed.contains(peer)) {
             durable = s.managed.confirm_durable() && durable;
             if (s.pending.contains(peer)) durable = s.pending.forget(peer) && durable;
+            if (s.owed_removals.contains(peer)) durable = s.owed_removals.forget(peer) && durable;
+            if (!s.pending.contains(peer) && !s.owed_removals.contains(peer)) {
+                std::erase(s.disk_owed, peer);
+                std::erase(s.removal_attempted, peer);
+            }
             std::erase(s.awaiting, peer);
             continue;
         }
@@ -256,6 +412,39 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
         durable = s.demote(peer) && durable;
         unwanted.push_back(peer);
     }
+    for (const auto& peer : std::vector<PeerIdentity>{s.owed_removals.peers()}) {
+        if (listed(approved, peer) || live == peer) continue;
+        std::erase(s.awaiting, peer);
+        if (s.revoked.retired(peer)) {
+            durable = s.owed_removals.forget(peer) && durable;
+            if (!s.owed_removals.contains(peer) && !s.pending.contains(peer)) {
+                std::erase(s.disk_owed, peer);
+                std::erase(s.removal_attempted, peer);
+            }
+            continue;
+        }
+        if (!bonded(peer)) {
+            if (s.revoked.contains(peer)) durable = s.revoked.remember(peer, true, true) && durable;
+            if (!s.revoked.contains(peer) || s.revoked.retired(peer)) {
+                durable = s.owed_removals.forget(peer) && durable;
+                if (!s.owed_removals.contains(peer) && !s.pending.contains(peer)) {
+                    std::erase(s.disk_owed, peer);
+                    std::erase(s.removal_attempted, peer);
+                }
+            }
+            continue;
+        }
+        if (s.owed_removals.from_disk(peer)) s.mark_disk_owed(peer);
+        if (!s.pending.contains(peer) ||
+            (s.pending.digest(peer).empty() && !s.owed_removals.digest(peer).empty())) {
+            if (!s.pending.remember(peer, false, false, s.owed_removals.digest(peer))) {
+                if (!listed(unwanted, peer)) unwanted.push_back(peer);
+                durable = false;
+                continue;
+            }
+        }
+        durable = s.owed_removals.forget(peer) && durable;
+    }
     for (const auto& peer : std::vector<PeerIdentity>{s.pending.peers()}) {
         if (listed(approved, peer) || live == peer) continue;
         std::erase(s.awaiting, peer);
@@ -264,36 +453,19 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
             // pending-removals: removal already completed, so drop the stale journal entry without
             // removing any bond created outside Android Auto since.
             durable = s.pending.forget(peer) && durable;
+            if (!s.pending.contains(peer)) {
+                std::erase(s.disk_owed, peer);
+                std::erase(s.removal_attempted, peer);
+            }
             continue;
         }
         if (!listed(unwanted, peer)) unwanted.push_back(peer);
     }
-    // Reset non-removal warning state once a device is no longer bonded so a subsequent outside
-    // re-bond warns again.
-    std::erase_if(s.refused_bond_warned, [&](const PeerIdentity& peer) { return !bonded(peer); });
-    // Shared-adapter policy (owner decision, 2026-11-15, docs/enrolment-ordering.md): only bonds
-    // that Android Auto itself still owes removal for (managed-bonds or pending-removals without a
-    // retired revocation marker) are in `unwanted` and removed. A bonded device on `revoked-bonds`
-    // not in `unwanted` is either a post-revocation outside re-bond (marked retired) or ambiguous
-    // (legacy v1 / lost journal): fail safe by keeping the bond, refusing Android Auto use, and
-    // logging a non-removal warning naming only its redacted address.
-    for (const auto& device : devices) {
-        const auto& peer = device.identity;
-        if (!device.bonded || !s.revoked.contains(peer) || listed(approved, peer) || live == peer ||
-            listed(unwanted, peer)) continue;
-        if (!listed(s.refused_bond_warned, peer)) {
-            std::cerr << "system-helper: warning bond_refused_revoked_identity "
-                      << diagnostics::redact_identifier(peer.address)
-                      << (s.revoked.retired(peer)
-                              ? ": this phone was forgotten in Android Auto and is bonded again "
-                                "(paired outside Android Auto); keeping the shared adapter bond "
-                                "and refusing Android Auto use. Enrol the phone again in Android Auto to use it.\n"
-                              : ": this phone was forgotten in Android Auto and its bond history "
-                                "is ambiguous; keeping the shared adapter bond and refusing Android "
-                                "Auto use. Enrol the phone again in Android Auto to use it.\n");
-            s.refused_bond_warned.push_back(peer);
-        }
-    }
+    // Emit non-removal warnings (even when a stale approval keeps the bond under #74) and suppress
+    // repeats within the same bonded span. Outside re-bonds/ambiguous entries resolved below also
+    // emit via resolve_unremovable_bond.
+    s.warn_revoked_bonded_peers(devices);
+    s.next_warning_check = s.now() + std::chrono::seconds(1);
     s.reconciled = durable;
     // One removal scan, within one invocation's budget, and never a retry of an earlier failure
     // (those are the tick's, Impl::retire_unaccepted): the reply waits on no other identity's
@@ -304,8 +476,8 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
         s.retire_unaccepted(Impl::Retire::first, nullptr, &devices);
     } else {
         // A failed write keeps the stricter state: an unwanted bond is still disconnected and
-        // removed (best effort, same budget) whether or not its obligation was recorded, and the
-        // reconciliation fails so the receiver retries.
+        // removed (best effort, same budget, digest-verified) whether or not its obligation was
+        // recorded, and the reconciliation fails so the receiver retries.
         Impl::RemovalBudget budget{s};
         for (const auto& peer : unwanted) {
             (void)s.remove_bond(devices, peer, budget, Impl::Retire::first);

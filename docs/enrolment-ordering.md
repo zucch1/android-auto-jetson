@@ -3,8 +3,9 @@
 ## Authority rule
 
 Two processes keep durable bond state: the receiver's trust store
-(`approved-phones.json`) and the helper's `managed-bonds`, `pending-removals` and
-`revoked-bonds`. They cannot be committed atomically together, so exactly one of them
+(`approved-phones.json`) and the helper's `managed-bonds`, `pending-removals`,
+`owed-removals` and `revoked-bonds` (plus the local secret `bond-digest.key`). They cannot
+be committed atomically together, so exactly one of them
 is the authority: **the receiver's trust store decides which wireless bonds exist and are
 admitted. The helper's files are a cache of that decision**, reconciled to it and never
 trusted beyond it. Every crash window between the two writes is healed the same way: the
@@ -34,11 +35,11 @@ The helper makes its state match, durably and idempotently:
 
 | Helper state for the identity | In the approved set | Not in the approved set |
 |---|---|---|
-| on `revoked-bonds`, a fresh enrolment of it acknowledged in this helper run and awaiting its commit | admitted: history durably cleared, then `managed-bonds` synced, then the journal entry removed (the commit's own order) | device disconnected and removed, then the entry dropped |
-| on `revoked-bonds` otherwise (no committed enrolment since its revocation) | stays revoked: demotion completed, **not** admitted, bond not removed (#74); counted as unadmitted (diagnostic `bond_reconcile_unadmitted_enrol_again`); a stale journal entry of an unaccepted window is dropped | if Android Auto still owes removal (on `pending-removals` without a retired `R` marker), the device is disconnected and removed, `revoked-bonds` is durably marked retired (`R`), and the journal entry is dropped; otherwise (already retired `R`, or ambiguous history without `pending-removals`) the bond is kept, Android Auto use is refused, `bond_refused_revoked_identity` is logged, and any stale post-removal journal entry after `R` is dropped |
-| on `managed-bonds` | admitted; a journal entry left beside it (commit stopped between its writes) is durably removed | demoted: the removal owed in `pending-removals`, then `revoked-bonds` (`P`), then out of `managed-bonds`; device disconnected and removed, then `revoked-bonds` marked `R`, then the entry dropped |
-| on `pending-removals` with a bonded device | admitted: `managed-bonds` synced, then the journal entry removed (the approval landed, the commit did not) | if `revoked-bonds` is marked retired (`R`), drop the stale post-removal journal entry and keep the outside bond (refused); otherwise device disconnected and removed, `revoked-bonds` marked `R` if present, then the entry dropped |
-| on `pending-removals`, no bonded device | counted as unadmitted; cleanup drops the stale entry once the device is gone | `revoked-bonds` marked `R` if present, then entry dropped once the device is gone |
+| on `revoked-bonds`, a fresh enrolment of it acknowledged in this helper run and awaiting its commit | admitted: history and any `owed-removals` entry durably cleared, then `managed-bonds` synced, then the journal entry removed (the commit's own order) | device disconnected and removed, then the entry dropped |
+| on `revoked-bonds` otherwise (no committed enrolment since its revocation) | stays revoked: demotion completed, **not** admitted, bond not removed (#74); counted as unadmitted (diagnostic `bond_reconcile_unadmitted_enrol_again`); if still bonded and still owed in `pending-removals` (not retired `R`), the obligation and its bond digest are parked in `owed-removals` before dropping `pending-removals` so repeated `ForgetPhone` or later unapproved reconciliation still removes the original AA bond while fresh re-enrolment is not blocked; non-owed revoked bonded peers log `bond_refused_revoked_identity` even under stale approval | if `owed-removals` holds a parked obligation (and not retired `R`), it moves back to `pending-removals`; if Android Auto still owes removal (`pending-removals` without `R`), BlueZ removal verifies the keyed bond digest first: verified match is disconnected and removed and marked `R`, digest mismatch keeps the outside bond and marks `R`, and unverifiable `from-disk`/attempted entries keep the bond as ambiguous (`P`); otherwise (already retired `R`, or ambiguous history without `pending-removals`/`owed-removals`) the bond is kept, Android Auto use is refused, `bond_refused_revoked_identity` is logged, and any stale post-removal journal entry after `R` is dropped |
+| on `managed-bonds` | admitted; a journal entry left beside it (commit stopped between its writes) is durably removed | demoted: the removal (with keyed bond digest) owed in `pending-removals`, then `revoked-bonds` (`P`), then out of `managed-bonds`; device disconnected and removed, then `revoked-bonds` marked `R`, then the entry dropped |
+| on `pending-removals` with a bonded device | admitted: `managed-bonds` synced, then the journal entry removed (the approval landed, the commit did not) | if `revoked-bonds` is marked retired (`R`), drop the stale post-removal journal entry and keep the outside bond (refused); otherwise digest-verified removal (`D_cur == D_stored` -> remove and mark `R`; mismatch -> keep and mark `R`; unverifiable across restart/attempt -> keep and keep `P`), then entry dropped |
+| on `pending-removals` or `owed-removals`, no bonded device | counted as unadmitted; cleanup drops the stale entry once the device is gone | `revoked-bonds` marked `R` if present, then entry dropped once the device is gone |
 | nothing | counted as unadmitted (approved, but no bond to admit) | an unmanaged bond is never touched |
 
 **The Jetson's Bluetooth adapter is shared with the car infotainment system** (owner decision,
@@ -48,48 +49,65 @@ path. A bond none of the helper's files name is never touched, because BlueZ can
 enrolment's bond from the owner's other bonds.
 
 To separate Android Auto's own leftover bonds still owed removal from bonds created outside
-Android Auto after revocation (which may belong to infotainment), `revoked-bonds` (`v2`)
-records per-identity retirement state durably alongside `pending-removals`: `P` (removal
-owed / not yet confirmed gone from BlueZ) vs `R` (retired: BlueZ confirmed no bond after the
-revocation or last failed Android Auto enrolment window committed). Legacy `v1` entries load
-as `P` (non-retired). Every transition is persisted with exclusive staging, file fsync,
-atomic rename and directory fsync, so it survives helper restarts and crashes:
+Android Auto after revocation (which may belong to infotainment), the helper combines
+`revoked-bonds` (`v2`, storing `P` pending vs `R` retired, loading `v1` as `P`),
+`pending-removals` (`v2`, recording the bond's keyed HMAC-SHA256 digest), `owed-removals`
+(`v2`, preserving the digest-tracked obligation when a stale `#74` approval temporarily keeps
+the bond), and `<state_dir>/bond-digest.key` (a 32-byte root-only random HMAC key):
 
-- **Android Auto still owes removal**: an identity on `managed-bonds` (demotion incomplete)
-  or on `pending-removals` without `R` in `revoked-bonds` (unaccepted/provisional window,
-  or `RevokePeerV1` / demotion before `RemoveDevice` completed). These bonds keep being
-  disconnected and removed; once BlueZ confirms the bond is gone, `revoked-bonds` is durably
-  marked `R` before `pending-removals` is dropped.
+- **Keyed bond-digest verification (`BondDigest`)**: when capturing an obligation (at
+  acknowledgement, demotion, or just before `RemoveDevice`), the helper computes
+  `HMAC-SHA256(bond-digest.key, <LinkKey/LTK keys>)` from BlueZ's read-only persistent key
+  file (`/var/lib/bluetooth/<adapter>/<device>/info`, sections `[LinkKey]`, `[LongTermKey]`,
+  `[PeripheralLongTermKey]`, `[SlaveLongTermKey]`, `Key=`; zeroed in memory with
+  `OPENSSL_cleanse` and never persisted or logged in raw form). Never write `R` before
+  `RemoveDevice`. When `pending-removals` or `owed-removals` came from disk across a
+  restart (`from-disk` / `disk_owed`) or after a `RemoveDevice` attempt whose reply may have
+  been lost (`removal_attempted`), bonded removal requires digest verification:
+  - `D_cur == D_stored`: the present bond is still the original Android Auto bond — run
+    `Disconnect` + `RemoveDevice`, then write `R`, then drop the obligation.
+  - `D_cur != D_stored`: `RemoveDevice` already ran and a new outside bond was created
+    afterwards — never delete the bond; mark `revoked-bonds` `R`, drop `pending-removals` /
+    `owed-removals`, refuse Android Auto use, and log `bond_refused_revoked_identity`.
+  - Unverifiable (`info` missing/unreadable, or legacy `v1` / empty digest when verification is
+    required): fail safe as **ambiguous** — keep the bond untouched, keep `revoked-bonds` `P`,
+    drop the obligation, refuse Android Auto use, and log `bond_refused_revoked_identity`.
+- **Owed removal across stale-approval parking (`owed-removals`)**: when reconciliation finds a
+  revoked, still-bonded peer whose `pending-removals` obligation is not retired (`P`) while a
+  stale receiver approval keeps the bond (`#74`), it parks the obligation and its digest into
+  `owed-removals` before dropping `pending-removals`. That leaves `pending-removals` clear so
+  fresh re-enrolment works at once, while preserving durable proof for a repeated `ForgetPhone`
+  (`RevokePeerV1`) or a later unapproved reconciliation (same run or after helper restart) to
+  remove the original Android Auto bond (with the same digest verification). Fresh committed
+  re-enrolment clears both `revoked-bonds` and `owed-removals`.
 - **Outside re-bond after revocation**: an identity on `revoked-bonds` marked `R` with no
-  active Android Auto enrolment (either `pending-removals` is absent, or a stale
-  `pending-removals` entry survived a crash between writing `R` and dropping the journal;
-  opening a new Android Auto enrolment clears `R` back to `P` before writing
-  `pending-removals`). Because `RemoveDevice` already completed before `R` was written, any
-  bonded device now in BlueZ was created outside Android Auto afterwards. The helper drops
-  any stale post-removal journal entry, leaves the BlueZ bond untouched, and refuses all
-  Android Auto use.
-- **Ambiguous history**: an identity on `revoked-bonds` in state `P` or legacy `v1` with no
-  `managed-bonds` and no `pending-removals` entry (for example a lost journal entry or a
-  crash between clearing `R` and writing `pending-removals` when opening an enrolment).
-  Failing safe means never removing a bond that may belong to infotainment, and never
-  admitting a revoked identity into Android Auto: the bond is kept untouched and Android Auto
-  use is refused.
+  active Android Auto enrolment (opening a new Android Auto enrolment clears `R` back to `P`
+  before writing `pending-removals`). Any bonded device now in BlueZ was created outside
+  Android Auto; the helper leaves it untouched and refuses all Android Auto use.
+- **Ambiguous history**: an identity on `revoked-bonds` in state `P` (or legacy `v1`) with no
+  `managed-bonds`, `pending-removals`, or `owed-removals` entry (or whose `pending-removals`
+  / `owed-removals` bond fails verification due to missing `info` / missing digest). Failing
+  safe keeps the bond untouched and refuses Android Auto use.
 
-Whenever reconciliation finds a bonded revoked identity whose removal Android Auto does not
-owe, it leaves the bond alone, refuses admission, RFCOMM bootstrap, HFP via Android Auto,
-and `ReconnectPeerV1`, counts any stale store approval as unadmitted, and logs a warning
-once while the bond remains present:
+Whenever a bonded revoked identity is kept on the shared adapter (whether unapproved or under
+a stale receiver approval, once no active `pending-removals` or `owed-removals` obligation
+remains), the helper leaves the bond alone, refuses admission, RFCOMM bootstrap, HFP via
+Android Auto, and `ReconnectPeerV1`, counts any stale store approval as unadmitted, and logs
+a warning once per bonded span:
 `system-helper: warning bond_refused_revoked_identity <redacted address>: this phone was
 forgotten in Android Auto and ...; keeping the shared adapter bond and refusing Android Auto
 use. Enrol the phone again in Android Auto to use it.` The address is redacted (`id-` plus a
-digest keyed per helper run, stable within the run, never the raw address). Re-enrolling the
-phone through the normal Android Auto flow works and its commit durably clears
-`revoked-bonds` as before.
+digest keyed per helper run, stable within the run, never the raw address). Only actual bond
+loss (`Device1` `Paired=false`, `Bonded=false`, invalidated `Paired`/`Bonded`, or
+`InterfacesRemoved` for `Device1`/`Adapter1` — never `Connected=false`) clears that span, and
+a bounded 1 s tick check re-evaluates revoked bonded peers so unbond-then-rebond events between
+reconciliations still warn once for the new span. Re-enrolling the phone through the normal
+Android Auto flow works and its commit durably clears `revoked-bonds` and `owed-removals`.
 
 Reconciliation reports success only when every bond Android Auto still owes removal for is
-gone from BlueZ or its removal is durably owed in `pending-removals` (the helper retries it
-on its ticks, so no receiver record has to, finding 3); a bond still owed removal with no
-durable obligation (the journal write failed) fails the reconciliation and the receiver retries.
+gone from BlueZ or its removal is durably owed in `pending-removals` (or parked under `#74`
+in `owed-removals`); a bond still owed removal with no durable obligation (the write failed)
+fails the reconciliation and the receiver retries.
 
 ### Removal budget
 
@@ -123,13 +141,13 @@ reaches the committed state: the owner explicitly accepted its number, the helpe
 and the receiver acknowledged the bond, and the receiver's durable approval arrived (its
 `PairingBondCommittedV1`, or, after an acknowledged enrolment whose commit never landed, the
 next reconciliation of this helper run that finds the approval). The commit clears history
-first, then writes `managed-bonds`, then removes the journal entry. Opening, rejecting,
+and any `owed-removals` first, then writes `managed-bonds`, then removes the journal entry. Opening, rejecting,
 cancelling or timing out an enrolment never clears it. So an approved identity still on
 `revoked-bonds` has no commit after its revocation: it is a resurrected (non-durable forget
-lost to power loss) or stale approval, and the revocation wins. The window's journal entry is
-dropped once the window closes (the approved bond stays, #74; history keeps the removal
-authority), so the owner can enrol the phone again at once, or ForgetPhone it (it then
-completes). A committed approval always wins, because its commit cleared the history. An
+lost to power loss) or stale approval, and the revocation wins. Any pending-removal journal
+entry is parked in `owed-removals` (preserving any digest) once the window closes so the
+approved bond stays (`#74`) and the owner can still enrol again at once or complete a repeated
+`ForgetPhone`. A committed approval always wins, because its commit cleared the history. An
 acknowledged re-enrolment whose commit never landed and whose helper also restarted is not
 admitted (the acknowledgement is in memory only); it is counted as unadmitted and the owner
 enrols again.
@@ -153,15 +171,16 @@ the receiver retries on its next pacing step.
 | Trust write fails after the acknowledgement | journal entry, bond; no approval | the enrolment's source is retired and reconciliation removes the bond; no receiver record needed |
 | Approval only committed-but-not-durable (703) | approval (maybe lost), journal entry, bond | the receiver retracts (store forget, tracked revocation) and reconciles; if the retraction cannot be written either, the approval remains and reconciliation keeps the helper consistent with it; after a power loss the next start's reconciliation decides from what survived |
 | ForgetPhone durable while the helper is down, then the receiver restarts (finding 2) | no approval; helper still on `managed-bonds` | the receiver's record is lost but not needed: its start-up reconciliation demotes and removes the bond; the phone can enrol again |
-| Forget only non-durable (703) and power lost: approval resurrected | approval; helper on `revoked-bonds` | revoked wins: not admitted, counted as unadmitted (diagnostic `bond_reconcile_unadmitted_enrol_again`); ForgetPhone completes |
+| Forget only non-durable (703) and power lost: approval resurrected | approval; helper on `revoked-bonds` (plus `owed-removals` if AA bond was still unremoved) | revoked wins: not admitted, counted as unadmitted (diagnostic `bond_reconcile_unadmitted_enrol_again`); repeated `ForgetPhone` removes the owed bond via `owed-removals` |
 | Demotion's renames unsynced and power lost (finding 4) | managed entry back, maybe without history | the restarted helper admits nothing before reconciliation, which demotes again and reports success only once durable |
-| Demotion stops after the removal is owed (journal written, history and managed not) | approval gone; managed and journal entries, bond | the restarted helper admits nothing; reconciliation demotes again and removes the bond |
+| Demotion stops after the removal is owed (journal written with digest, history and managed not) | approval gone; managed and journal entries, bond | the restarted helper admits nothing; reconciliation demotes again and removes the bond |
 | Demotion stops after history (managed entry not yet dropped) | managed, journal and history entries, bond | as above |
-| Demotion stops after the managed entry is dropped, before `RemoveDevice` | journal and history entries, bond | reconciliation removes the journalled bond, then drops the entry |
-| Demotion stops after `RemoveDevice`, before `revoked-bonds` is marked `R` | journal and `revoked-bonds` (`P`), no bond | cleanup finds no device, marks `revoked-bonds` `R`, and drops the entry |
+| Demotion stops after the managed entry is dropped, before `RemoveDevice` | journal (with digest) and history (`P`), bond | reconciliation verifies `D_cur == D_stored`, removes the original bond, marks `R`, and drops the entry |
+| Demotion stops after `RemoveDevice` (or lost D-Bus reply), before `revoked-bonds` is marked `R`, and no re-bond happened | journal and `revoked-bonds` (`P`), no bond | cleanup finds no device, marks `revoked-bonds` `R`, and drops the entry |
+| Demotion stops after `RemoveDevice` (or lost reply), before `R`, and phone re-bonded outside AA while helper was down | journal (`D_old`) and `revoked-bonds` (`P`), new outside bond (`D_new`) | `D_cur == D_new != D_old` proves outside re-bond: new bond kept untouched, `revoked-bonds` marked `R`, journal dropped, AA refused, warning logged |
 | Demotion stops after `revoked-bonds` is marked `R`, before the journal entry is dropped | `pending-removals` and `revoked-bonds` (`R`) | reconciliation sees `R` and drops the stale journal entry without removing any outside bond created since |
 | A journal write fails during ForgetPhone and `RemoveDevice` fails too | managed entry kept (being demoted, refused), bond | nothing is dropped before the obligation is durable; the receiver's retry or, after a restart, reconciliation completes the demotion and removes the bond (failing until BlueZ removes it) |
-| Journal entry lost or legacy `v1` history without `pending-removals` | history (`P` or `v1`) only, bond | ambiguous history: fail safe by keeping the bond (it may belong to infotainment), refusing Android Auto use, and logging `bond_refused_revoked_identity` |
+| Journal entry lost or legacy `v1` history without `pending-removals`, or missing `info` on restart | history (`P` or `v1`) / unverifiable entry, bond | ambiguous history: fail safe by keeping the bond (it may belong to infotainment), keeping `P`, dropping any unverifiable obligation, refusing AA use, and logging `bond_refused_revoked_identity` |
 | Demotion stops after the removal is owed **and** the store's forget was lost (double fault) | approval resurrected; managed and journal entries, bond | indistinguishable from commit window 2: admitted, consistent with the store; ForgetPhone again removes it |
 | Helper restarts at any point | any of the above | reconciled false: no services, no reconnect, no enrolment, no cleanup until the receiver answers |
 
@@ -178,19 +197,20 @@ Every bond the helper knows is in exactly one state:
 
 | State | How it is entered | Persisted as | Services / reconnect | Cleanup |
 |---|---|---|---|---|
-| unaccepted | an enrolment window opens for the observed identity (only after the run's first reconciliation) | entry in `pending-removals` (written before the window opens) | refused | removed when the window closes |
-| provisional | the owner accepted the number, the helper verified the exact bond and the receiver acknowledged it (`PairingBondAcknowledgedV1`) | the same `pending-removals` entry, kept; the acknowledgement is an in-memory flag | refused | when the window closes without a commit the bond is parked: never removed by cleanup, decided by the next reconciliation |
-| admitted | the commit after the receiver's durable trust write, or a reconciliation that finds the approval | `managed-bonds` with a confirmed directory sync (#117), and **then** the `pending-removals` entry durably removed | allowed (Android Auto RFCOMM, HFP, `ReconnectPeerV1`) once reconciled | never removed while approved (#74) |
-| revoked | `RevokePeerV1` (ForgetPhone, a retraction), or reconciliation of an identity the store no longer approves | moved from `managed-bonds` to `revoked-bonds` (`v2`, reading `v1` too): `pending-removals` first, then history as `P`, then removal from managed; once BlueZ confirms removal, history is marked `R` (retired) before `pending-removals` is dropped | refused | removed while `pending-removals` still owes removal without `R`; once `R` is set (outside re-bond) or when history without `pending-removals` is ambiguous (`P`/`v1`), the bond is kept and refused (`bond_refused_revoked_identity`); history is revocation authority only, cleared only by a committed fresh enrolment |
+| unaccepted | an enrolment window opens for the observed identity (only after the run's first reconciliation) | entry in `pending-removals` (`v2`, digest captured at acknowledgement/demotion/removal) | refused | removed when the window closes |
+| provisional | the owner accepted the number, the helper verified the exact bond and the receiver acknowledged it (`PairingBondAcknowledgedV1`) | the same `pending-removals` entry, kept (with bond digest); the acknowledgement is an in-memory flag | refused | when the window closes without a commit the bond is parked: never removed by cleanup, decided by the next reconciliation |
+| admitted | the commit after the receiver's durable trust write, or a reconciliation that finds the approval | `managed-bonds` with a confirmed directory sync (#117), and **then** `pending-removals` durably removed | allowed (Android Auto RFCOMM, HFP, `ReconnectPeerV1`) once reconciled | never removed while approved (#74) |
+| revoked | `RevokePeerV1` (ForgetPhone, a retraction), or reconciliation of an identity the store no longer approves | moved from `managed-bonds` to `revoked-bonds` (`v2`, reading `v1` as `P`): `pending-removals` (with keyed bond digest) first, then history as `P`, then removal from managed; parked in `owed-removals` if a stale `#74` approval keeps the bond; once BlueZ confirms removal (or outside re-bond is verified by digest mismatch), history is marked `R` before `pending-removals`/`owed-removals` is dropped | refused | digest-verified removal while `pending-removals` or `owed-removals` owes removal without `R`; once `R` is set (outside re-bond) or when history/digest is ambiguous (`P`/`v1`), the bond is kept and refused (`bond_refused_revoked_identity`); cleared only by a committed fresh enrolment |
 
 Admission is checked by one predicate: reconciled in this helper run, on `managed-bonds`,
 durably synced, not on `pending-removals`, not parked and not being demoted. Cleanup follows
 `pending-removals`, but never before the first reconciliation, never for a parked bond,
 never for an identity whose `revoked-bonds` entry is already marked `R`, and never for a
 bonded device the receiver approves. A `managed-bonds` or `revoked-bonds` entry for the
-same adapter/address never suppresses removal of an owed `pending-removals` entry (finding B:
-a forgotten phone's history is never taken as acceptance of a new bond). An identity that
-is currently on `managed-bonds` cannot open a new enrolment window; it must be forgotten first.
+same adapter/address never suppresses removal of an owed `pending-removals` or
+`owed-removals` entry (finding B: a forgotten phone's history is never taken as acceptance
+of a new bond). An identity that is currently on `managed-bonds` cannot open a new enrolment
+window; it must be forgotten first.
 
 ## Order
 

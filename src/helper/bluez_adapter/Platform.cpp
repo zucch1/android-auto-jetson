@@ -23,9 +23,17 @@ constexpr auto interfaces = R"(<node>
 <method name="DisplayPasskey"><arg type="o" direction="in"/><arg type="u" direction="in"/><arg type="q" direction="in"/></method>
 </interface></node>)";
 }
-BluezBackend::Impl::Impl(const std::string& address, Now clock, const std::string& state, std::uint32_t state_owner)
+BluezBackend::Impl::Impl(const std::string& address, Now clock, const std::string& state,
+                         std::uint32_t state_owner, const std::string& bluetooth_directory)
     : now(std::move(clock)), managed(state, state_owner), pending(state, state_owner, "pending-removals"),
-      revoked(state, state_owner, "revoked-bonds") {
+      owed_removals(state, state_owner, "owed-removals"), revoked(state, state_owner, "revoked-bonds"),
+      bond_digest(state, state_owner, bluetooth_directory) {
+    if (pending.valid()) {
+        for (const auto& peer : pending.peers()) mark_disk_owed(peer);
+    }
+    if (owed_removals.valid()) {
+        for (const auto& peer : owed_removals.peers()) mark_disk_owed(peer);
+    }
     context = g_main_context_new();
     g_main_context_push_thread_default(context);
     GError* error = nullptr;
@@ -156,7 +164,7 @@ void BluezBackend::Impl::reset() {
     ++owner_epoch;
     close_connection();
     allowed.reset(); window = {}; pairing_enabled = false; comparison_accepted = false; acknowledged = false;
-    observations.clear(); adapters.clear();
+    observations.clear(); adapters.clear(); refused_bond_warned.clear(); next_warning_check = {};
     registered = false; agent_registered = false;
 }
 void BluezBackend::Impl::pump(bool tick) {
@@ -174,6 +182,13 @@ void BluezBackend::Impl::pump(bool tick) {
             close_admission();
         }
         next_check = now() + std::chrono::milliseconds(100);
+    }
+    if (tick && reconciled && !revoked.peers().empty() && now() >= next_warning_check) {
+        next_warning_check = now() + std::chrono::seconds(1);
+        if (current_owner()) {
+            std::vector<Device> devices;
+            if (inventory(devices)) warn_revoked_bonded_peers(devices);
+        }
     }
     std::erase_if(observations, [this](const auto& item) { return now() >= item.second.expires; });
     if (bootstrap && bootstrap->live()) {
@@ -200,16 +215,20 @@ bool BluezBackend::Impl::ensure() {
     g_variant_unref(reply);
     return register_profiles();
 }
-BluezBackend::BluezBackend(const std::string& address, Now now, const std::string& state, std::uint32_t state_owner)
-    : impl_(std::make_unique<Impl>(address, std::move(now), state, state_owner)) {}
+BluezBackend::BluezBackend(const std::string& address, Now now, const std::string& state,
+                           std::uint32_t state_owner, const std::string& bluetooth_directory)
+    : impl_(std::make_unique<Impl>(address, std::move(now), state, state_owner, bluetooth_directory)) {}
 BluezBackend::~BluezBackend() = default;
 std::string BluezBackend::state_error() const {
     if (!impl_->managed.valid()) return "managed-bonds: " + impl_->managed.reason();
     if (!impl_->pending.valid()) return "pending-removals: " + impl_->pending.reason();
-    return impl_->revoked.valid() ? std::string{} : "revoked-bonds: " + impl_->revoked.reason();
+    if (!impl_->owed_removals.valid()) return "owed-removals: " + impl_->owed_removals.reason();
+    if (!impl_->revoked.valid()) return "revoked-bonds: " + impl_->revoked.reason();
+    return impl_->bond_digest.valid() ? std::string{} : "bond-digest: " + impl_->bond_digest.reason();
 }
 bool BluezBackend::available() const {
-    return impl_->managed.valid() && impl_->pending.valid() && impl_->revoked.valid() &&
+    return impl_->managed.valid() && impl_->pending.valid() && impl_->owed_removals.valid() &&
+           impl_->revoked.valid() && impl_->bond_digest.valid() &&
            impl_->bus && !g_dbus_connection_is_closed(impl_->bus);
 }
 core::Result<ObservedPeer> BluezBackend::handoff() {

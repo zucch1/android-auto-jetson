@@ -58,6 +58,8 @@ bool BluezBackend::Impl::inventory(std::vector<Device>& devices) {
         if (adapter != adapter_ids.end()) device.identity.adapter = adapter->second;
     }
     std::erase_if(devices, [](const Device& device) { return device.identity.adapter.empty(); });
+    if (device_paths.size() >= 512) device_paths.clear();
+    for (const auto& device : devices) device_paths[device.path] = device.identity;
     g_variant_unref(objects); g_variant_unref(reply);
     return true;
 }
@@ -107,7 +109,9 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     // No enrolment opens before this helper run's first reconciliation: until the receiver has
     // answered, the journal may hold an approved bond whose commit never landed.
     if (!impl_->reconciled) return Error{ErrorCode::helper_unavailable};
-    if (!impl_->pending.valid() || !impl_->revoked.valid() || impl_->pending.peers().size() >= 256 ||
+    if (!impl_->pending.valid() || !impl_->owed_removals.valid() || !impl_->revoked.valid() ||
+        !impl_->bond_digest.valid() || impl_->pending.peers().size() >= 256 ||
+        impl_->owed_removals.peers().size() >= 256 ||
         impl_->pending.contains(observed->device.identity) || impl_->managed.contains(observed->device.identity))
         return Error{ErrorCode::helper_rejected};
     // Durably note the pending removal before any window opens: a restart with a failed or
@@ -124,6 +128,7 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     // resurrected or stale approval into an admission.
     std::erase(impl_->cleaned, observed->device.identity);
     std::erase(impl_->awaiting, observed->device.identity);
+    std::erase(impl_->removal_attempted, observed->device.identity);
     impl_->allowed = *observed;
     impl_->pairing_enabled = true;
     impl_->comparison_used = false;
@@ -156,11 +161,12 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     return State::active;
 }
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
-    // Authority: an admitted bond, a revoked (historical) one, or one still on the pending-removal
-    // list (unaccepted or provisional; the receiver retires it after a failed write or commit).
+    // Authority: an admitted bond, a revoked (historical) one, or one still owed removal
+    // (pending-removals or parked under #74 in owed-removals).
     if (!address_valid(identity.address) || !address_valid(identity.adapter)) return Error{ErrorCode::helper_rejected};
     const bool owed = impl_->managed.revocable(identity) ||
-                      (impl_->pending.contains(identity) && !impl_->revoked.retired(identity));
+                      ((impl_->pending.contains(identity) || impl_->owed_removals.contains(identity)) &&
+                       !impl_->revoked.retired(identity));
     const bool authority = owed || impl_->revoked.contains(identity);
     if (!impl_->current_owner()) return Error{ErrorCode::helper_unavailable};
     if (!authority) {
@@ -183,18 +189,34 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     std::erase_if(impl_->observations, [&](const auto& item) { return item.second.device.identity == identity; });
     if (!owed) {
         // Already retired (or ambiguous history with no owed removal): never touch any BlueZ bond
-        // on the shared adapter; only drop a stale post-removal journal entry if one remained.
+        // on the shared adapter; only drop any stale post-removal journal entries if present.
         std::erase_if(impl_->removal_retries, [&](const Impl::RemovalRetry& item) { return item.peer == identity; });
+        std::erase(impl_->disk_owed, identity);
+        std::erase(impl_->removal_attempted, identity);
         if (impl_->pending.contains(identity)) (void)impl_->pending.forget(identity);
+        if (impl_->owed_removals.contains(identity)) (void)impl_->owed_removals.forget(identity);
         return {};
     }
     // Demote first: once forgotten, the bond is never admitted (services, reconnect) again and
     // is never taken as acceptance of a later enrolment of the same identity. The removal is owed
-    // durably (journal) before the managed entry goes, and the journal entry is dropped only after
-    // BlueZ confirmed the removal. Every write is confirmed durable before success is reported.
+    // durably (journal + digest) before the managed entry goes, and the journal entry is dropped
+    // only after BlueZ confirmed the removal. Every write is confirmed durable before success.
     const bool demoted = impl_->demote(identity);
     std::vector<Impl::Device> devices;
     if (!impl_->inventory(devices)) return Error{ErrorCode::helper_unavailable};
+    const bool has_bonded = std::any_of(devices.begin(), devices.end(),
+        [&](const Impl::Device& device) { return device.identity == identity && device.bonded; });
+    if (has_bonded) {
+        const auto verdict = impl_->verify_bonded_removal(identity);
+        if (verdict != Impl::BondVerification::verified_original) {
+            if (!impl_->resolve_unremovable_bond(identity, verdict, devices))
+                return Error{ErrorCode::helper_unavailable};
+            return {};
+        }
+        if (std::find(impl_->removal_attempted.begin(), impl_->removal_attempted.end(), identity) ==
+            impl_->removal_attempted.end())
+            impl_->removal_attempted.push_back(identity);
+    }
     for (const auto& device : devices) {
         if (device.identity != identity) continue;
         impl_->disconnect(device);
@@ -215,14 +237,15 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     }
     // The device is gone: drop the removal obligation now, so the identity can enrol again at once
     // (a failed rewrite leaves it to cleanup, which finds no device).
-    if (impl_->pending.contains(identity)) {
-        (void)impl_->pending.forget(identity);
-        if (!impl_->pending.contains(identity)) {
-            std::erase(impl_->removal_done, identity);
-            std::erase(impl_->cleaned, identity);
-            if (impl_->cleaned.size() >= 256) impl_->cleaned.erase(impl_->cleaned.begin());
-            impl_->cleaned.push_back(identity);
-        }
+    if (impl_->pending.contains(identity)) (void)impl_->pending.forget(identity);
+    if (impl_->owed_removals.contains(identity)) (void)impl_->owed_removals.forget(identity);
+    if (!impl_->pending.contains(identity) && !impl_->owed_removals.contains(identity)) {
+        std::erase(impl_->removal_done, identity);
+        std::erase(impl_->disk_owed, identity);
+        std::erase(impl_->removal_attempted, identity);
+        std::erase(impl_->cleaned, identity);
+        if (impl_->cleaned.size() >= 256) impl_->cleaned.erase(impl_->cleaned.begin());
+        impl_->cleaned.push_back(identity);
     }
     return {};
 }

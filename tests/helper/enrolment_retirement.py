@@ -464,6 +464,86 @@ def outside_rebond_kept_and_refused(build: Path, directory: Path) -> None:
         print("PASS outside_rebond_kept_and_refused_across_restart_and_reenrols", flush=True)
 
 
+def lost_remove_reply_outside_rebond(build: Path, directory: Path) -> None:
+    """B1: RemoveDevice succeeds on BlueZ before its reply is lost, then phone re-bonds outside AA."""
+    with contextlib.ExitStack() as stack:
+        surface = ComposedSurface(stack, build, directory)
+        request = surface.request()
+        surface.confirm(request)
+        wait(lambda: surface.phone() != 0)
+        assert peer_in(directory, "managed-bonds")
+        phone = surface.phone()
+
+        command(surface.mock, "lost-remove-reply")
+        with contextlib.suppress(GLib.Error):
+            surface.forget(phone)
+        assert surface.phone() == 0
+        assert len(surface.state()["removed"]) == 1
+        assert peer_in(directory, "pending-removals")
+        assert "02:00:00:00:00:01 02:00:00:00:00:AA P\n" in (directory / "revoked-bonds").read_text()
+
+        # Phone pairs outside Android Auto before helper finishes or restarts.
+        command(surface.mock, "normal-remove-reply")
+        command(surface.mock, "restore")
+        command(surface.mock, "paired")
+
+        stop_helper(surface)
+        start_helper(stack, build, directory, surface)
+        wait(lambda: not peer_in(directory, "pending-removals"), 8)
+        assert len(surface.state()["removed"]) == 1, "stale pending removal deleted a newer outside bond"
+        assert "02:00:00:00:00:01 02:00:00:00:00:AA R\n" in (directory / "revoked-bonds").read_text()
+        assert command(surface.receiver, "reconnect") != "0"
+        assert command(surface.mock, "AuthorizeService hfp") == "rejected"
+        assert command(surface.mock, "AuthorizeService") == "rejected"
+        assert command(surface.mock, "NewConnection") == "rejected"
+
+        # Fresh AA re-enrolment still works cleanly.
+        command(surface.mock, "unpaired")
+        request = surface.request()
+        surface.confirm(request)
+        wait(lambda: peer_in(directory, "managed-bonds") and not peer_in(directory, "revoked-bonds"), 8)
+        assert command(surface.receiver, "reconnect") == "0"
+        print("PASS lost_remove_reply_outside_rebond_keeps_newer_bond", flush=True)
+
+
+def owed_removal_after_stale_approval_parking(build: Path, directory: Path) -> None:
+    """B2: Owed AA removal parked across a stale approval is still removed on repeated ForgetPhone."""
+    with contextlib.ExitStack() as stack:
+        surface = ComposedSurface(stack, build, directory)
+        request = surface.request()
+        surface.confirm(request)
+        wait(lambda: surface.phone() != 0)
+        store = directory / "store"
+        approved = store.read_bytes()
+        phone = surface.phone()
+
+        command(surface.mock, "fail-remove")
+        with contextlib.suppress(GLib.Error):
+            surface.forget(phone)
+        assert surface.phone() == 0
+        assert not surface.state()["removed"]
+        assert peer_in(directory, "pending-removals")
+
+        # Stale approval returns (e.g. non-durable forget) and helper restarts; reconciliation
+        # keeps the bond under #74 and preserves the owed removal in owed-removals.
+        stop_helper(surface)
+        store.write_bytes(approved)
+        assert command(surface.receiver, "reload-store") == "0"
+        assert surface.phone() != 0
+        start_helper(stack, build, directory, surface)
+        wait(lambda: peer_in(directory, "owed-removals") and not peer_in(directory, "pending-removals"), 8)
+        assert not surface.state()["removed"]
+
+        # BlueZ recovers and repeated ForgetPhone removes the original AA bond.
+        command(surface.mock, "allow-remove")
+        surface.forget(surface.phone())
+        wait(lambda: command(surface.receiver, "pending-revocations") == "0", 8)
+        assert len(surface.state()["removed"]) == 1, "repeated ForgetPhone after stale-approval parking did not remove AA bond"
+        assert not peer_in(directory, "owed-removals")
+        assert "02:00:00:00:00:01 02:00:00:00:00:AA R\n" in (directory / "revoked-bonds").read_text()
+        print("PASS owed_removal_after_stale_approval_parking_removed_on_retry", flush=True)
+
+
 if __name__ == "__main__":
     build = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="aa-enrolment-", dir=build) as temporary:
@@ -509,3 +589,9 @@ if __name__ == "__main__":
         directory = Path(temporary) / "outside-rebond"
         directory.mkdir(mode=0o700)
         outside_rebond_kept_and_refused(build, directory)
+        directory = Path(temporary) / "lost-remove-reply"
+        directory.mkdir(mode=0o700)
+        lost_remove_reply_outside_rebond(build, directory)
+        directory = Path(temporary) / "owed-removal-parking"
+        directory.mkdir(mode=0o700)
+        owed_removal_after_stale_approval_parking(build, directory)

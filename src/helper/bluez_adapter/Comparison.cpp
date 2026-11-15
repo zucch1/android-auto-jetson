@@ -20,6 +20,7 @@ core::Result<void> BluezBackend::acknowledge_bond() {
     if (!bonded) return bonded.error();
     if (!bonded.value() || !impl_->allowed) return Error{ErrorCode::helper_rejected};
     if (!impl_->pending.contains(impl_->allowed->device.identity)) return Error{ErrorCode::helper_rejected};
+    impl_->capture_pending_digest(impl_->allowed->device.identity);
     impl_->acknowledged = true;
     return {};
 }

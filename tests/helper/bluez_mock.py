@@ -6,6 +6,9 @@
 # Run: python3 -B tests/helper/bluez_runtime.py build/host-dev
 from __future__ import annotations
 import json
+import os
+from pathlib import Path
+import secrets
 import socket
 import sys
 import threading
@@ -20,9 +23,11 @@ def connect(address: str) -> Gio.DBusConnection:
 
 
 class MockBluez(ProfileSockets):
-    def __init__(self, address: str) -> None:
+    def __init__(self, address: str, bluetooth_dir: str | None = None) -> None:
         self.bus = connect(address)
         self.rogue = connect(address)
+        self.bluetooth_dir: Path | None = Path(bluetooth_dir) if bluetooth_dir else None
+        self.lost_remove_reply: str | None = None
         self.helper = ""
         self.paired = False
         self.bonded = False
@@ -71,6 +76,37 @@ class MockBluez(ProfileSockets):
     def name(self, method: str, args: GLib.Variant) -> None:
         self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
                            method, args, None, FLAGS, 1000, None)
+
+    def address_for_path(self, path: str) -> str | None:
+        if path == DEVICE:
+            return "02:00:00:00:00:01"
+        if path == OTHER:
+            return "02:00:00:00:00:02"
+        return self.extras.get(path)
+
+    def write_info(self, peer_address: str) -> None:
+        if self.bluetooth_dir is None:
+            return
+        adapter_dir = self.bluetooth_dir / "02:00:00:00:00:AA"
+        dev_dir = adapter_dir / peer_address
+        dev_dir.mkdir(parents=True, exist_ok=True)
+        for directory in (self.bluetooth_dir, adapter_dir, dev_dir):
+            os.chmod(directory, 0o755)
+        info = dev_dir / "info"
+        info.write_text(f"[General]\nName=Pixel\n\n[LinkKey]\nKey={secrets.token_hex(16).upper()}\nType=4\nPINLength=0\n")
+        os.chmod(info, 0o600)
+
+    def remove_info(self, peer_address: str) -> None:
+        if self.bluetooth_dir is None:
+            return
+        dev_dir = self.bluetooth_dir / "02:00:00:00:00:AA" / peer_address
+        info = dev_dir / "info"
+        info.unlink(missing_ok=True)
+        if dev_dir.exists():
+            try:
+                dev_dir.rmdir()
+            except OSError:
+                pass
 
     def inventory(self) -> GLib.Variant:
         objects = {ADAPTER: {"org.bluez.Adapter1": {"Address": GLib.Variant("s", "02:00:00:00:00:AA")}}}
@@ -152,11 +188,23 @@ class MockBluez(ProfileSockets):
                         invocation.return_dbus_error("org.bluez.Error.Failed", "fixture RemoveDevice failure")
                         return False
                     self.removed.append(target)
+                    addr = self.address_for_path(target)
+                    if addr:
+                        self.remove_info(addr)
                     if target in self.extras:
                         del self.extras[target]
                     else:
                         self.present = False
                         self.paired = False
+                        self.bonded = False
+                    if self.lost_remove_reply:
+                        if self.lost_remove_reply == "rebond" and addr:
+                            self.present = True
+                            self.paired = True
+                            self.bonded = True
+                            self.write_info(addr)
+                        invocation.return_dbus_error("org.bluez.Error.Failed", "fixture lost RemoveDevice reply")
+                        return False
                     invocation.return_value(None)
                     return False
                 if self.remove_delay_ms:
@@ -180,6 +228,8 @@ class MockBluez(ProfileSockets):
                     self.cancel_unpaired += 1
                 self.paired = False
                 self.bonded = False
+                self.remove_info("02:00:00:00:00:01")
+                self.remove_info("02:00:00:00:00:02")
             case "UnregisterAgent":
                 pass
             case _:
@@ -243,7 +293,9 @@ class MockBluez(ProfileSockets):
                 if path not in self.registered_extras:
                     self.bus.register_object(path, self.device_info, self.method, None, None)
                     self.registered_extras.add(path)
-                self.extras[path] = f"02:00:00:00:01:{index:02X}"
+                addr = f"02:00:00:00:01:{index:02X}"
+                self.extras[path] = addr
+                self.write_info(addr)
             return "ok"
         if text.startswith("comparison-start"):
             self.comparison_result = "pending"
@@ -279,14 +331,29 @@ class MockBluez(ProfileSockets):
                 result = self.callback("RequestAuthorization")
                 if result == "allowed":
                     self.paired = self.bonded = True
+                    addr = self.address_for_path(self.observed_device)
+                    if addr:
+                        self.write_info(addr)
                 return result
             case "multiple": self.multiple = True
             case "single": self.multiple = False
             case "observe-other": self.observed_device = OTHER
             case "observe-first": self.observed_device = DEVICE
-            case "paired": self.paired = True; self.bonded = True
+            case "paired":
+                self.paired = True
+                self.bonded = True
+                self.write_info("02:00:00:00:00:01" if self.observed_device == DEVICE else "02:00:00:00:00:02")
+                if self.multiple and self.observed_device == DEVICE:
+                    self.write_info("02:00:00:00:00:02")
+                self.bus.emit_signal(None, self.observed_device, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                     GLib.Variant("(sa{sv}as)", ("org.bluez.Device1",
+                                         {"Paired": GLib.Variant("b", True), "Bonded": GLib.Variant("b", True)}, [])))
             case "temporary-pair": self.paired = True; self.bonded = False
-            case "unpaired": self.paired = False; self.bonded = False
+            case "unpaired":
+                self.paired = False
+                self.bonded = False
+                self.remove_info("02:00:00:00:00:01")
+                self.remove_info("02:00:00:00:00:02")
             case "restore": self.present = True
             case "remove": self.present = False
             case "owner-during-inventory": self.owner_during_inventory = True
@@ -316,6 +383,8 @@ class MockBluez(ProfileSockets):
             case "fast-remove": self.remove_delay_ms = 0; self.disconnect_delay_ms = 0
             case "fail-remove": self.fail_remove = True
             case "allow-remove": self.fail_remove = False
+            case "lost-remove-reply": self.lost_remove_reply = True
+            case "normal-remove-reply": self.lost_remove_reply = False
             case "fail-set": self.fail_set = True
             case "allow-set": self.fail_set = False
             case "fail-register-hfp": self.fail_register.add(HFP)
@@ -339,7 +408,7 @@ class MockBluez(ProfileSockets):
                 return self.callback(text)
         return "ok"
 def main() -> None:
-    mock = MockBluez(sys.argv[1])
+    mock = MockBluez(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
     loop = GLib.MainLoop()
     worker = threading.Thread(target=loop.run, daemon=True)
     worker.start()

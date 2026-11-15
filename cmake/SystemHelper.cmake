@@ -24,6 +24,7 @@ add_library(aa_system_helper STATIC
     src/helper/bluez_adapter/Reconcile.cpp
     src/helper/bluez_adapter/Hfp.cpp
     src/helper/bluez_adapter/ManagedPeers.cpp
+    src/helper/bluez_adapter/BondDigest.cpp
     src/helper/nm/Files.cpp src/helper/nm/Commands.cpp src/helper/nm/Connection.cpp src/helper/nm/Backend.cpp)
 target_include_directories(aa_system_helper PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(aa_system_helper PUBLIC aa_ipc_dbus aa_trust OpenSSL::Crypto aa_aaw_proto)
