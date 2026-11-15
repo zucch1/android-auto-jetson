@@ -170,9 +170,17 @@ fi
 # Build guard arguments, forwarded verbatim into the on-target collector so the
 # refusal happens before the receiver or display is launched there.
 build_args=()
+if [[ "$RECEIVER" == *"'"* || "$RECEIVER" == *$'\n'* ]]; then
+    echo "usage error: --receiver must not contain a single quote or newline" >&2
+    exit 2
+fi
+if [[ -n "$DISPLAY_BIN" ]] && [[ "$DISPLAY_BIN" == *"'"* || "$DISPLAY_BIN" == *$'\n'* ]]; then
+    echo "usage error: --display must not contain a single quote or newline" >&2
+    exit 2
+fi
 if [[ -n "$BUILD_DIR" ]]; then
-    if [[ "$BUILD_DIR" == *"'"* ]]; then
-        echo "usage error: --build-dir must not contain a single quote" >&2
+    if [[ "$BUILD_DIR" == *"'"* || "$BUILD_DIR" == *$'\n'* ]]; then
+        echo "usage error: --build-dir must not contain a single quote or newline" >&2
         exit 2
     fi
     build_args+=(--build-dir "$BUILD_DIR")
@@ -408,7 +416,45 @@ if [[ -n "$BUILD_DIR" ]]; then
             echo "internal error: the build guard produced no build type" >&2
             exit 4
         fi
-        build_args_remote=" --build-dir '${BUILD_DIR}' --build-dir-verified-locally '${build_type_known}'"
+        sha_cmd="sha256sum -- '${RECEIVER}'"
+        verify_remote_args=(--verify-remote "$BUFFER/build-check.json"
+            --remote-sha256-file "$BUFFER/remote-sha256.txt"
+            --remote-binary "receiver=${RECEIVER}" --json)
+        if [[ -n "$DISPLAY_BIN" ]]; then
+            sha_cmd+=" '${DISPLAY_BIN}'"
+            verify_remote_args+=(--remote-binary "display=${DISPLAY_BIN}")
+        fi
+        if ! remote "$sha_cmd" >"$BUFFER/remote-sha256.txt" 2>"$BUFFER/remote-sha256.err"; then
+            echo "BLOCKED: build_dir_mismatch" >&2
+            echo "error: build_dir_mismatch: failed to compute SHA-256 of remote binary over ssh" >&2
+            sed -n '1,20p' "$BUFFER/remote-sha256.err" >&2 || true
+            blocked_result "build_dir_mismatch" "$build_type_known" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+            exit 3
+        fi
+        if ! "$PY" -B "$TOOL_DIR/aa_build_guard.py" "${verify_remote_args[@]}" \
+                >"$BUFFER/verified-binaries.json" 2>"$BUFFER/remote-verify.err"; then
+            echo "BLOCKED: build_dir_mismatch" >&2
+            sed -n '1,20p' "$BUFFER/remote-verify.err" >&2 || true
+            blocked_result "build_dir_mismatch" "$build_type_known" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+            exit 3
+        fi
+        sed -n '1,20p' "$BUFFER/remote-verify.err" >&2 || true
+        extra_binary_args="$("$PY" -B - "$BUFFER/verified-binaries.json" <<'PY'
+import json, shlex, sys
+binaries = json.load(open(sys.argv[1], encoding="utf-8"))["binaries"]
+parts = []
+for role in sorted(binaries):
+    entry = binaries[role]
+    parts.append("--expected-binary-sha256 " + shlex.quote(f"{role}={entry['local_sha256']}"))
+    parts.append("--expected-binary-build-path " + shlex.quote(f"{role}={entry['build_path']}"))
+print(" ".join(parts))
+PY
+)"
+        if [[ -z "$extra_binary_args" ]]; then
+            echo "internal error: the build guard produced no verified binary hashes" >&2
+            exit 4
+        fi
+        build_args_remote=" --build-dir '${BUILD_DIR}' --build-dir-verified-locally '${build_type_known}' ${extra_binary_args}"
         if ((ALLOW_UNOPTIMIZED)); then
             build_args_remote+=" --allow-unoptimized-build"
         fi
@@ -473,6 +519,55 @@ if [[ ! -s "$capture_file" ]]; then
     echo "BLOCKED: collector_produced_no_capture" >&2
     blocked_result "collector_produced_no_capture" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
+fi
+if [[ -s "$BUFFER/verified-binaries.json" ]]; then
+    if ! "$PY" -B - "$capture_file" "$BUFFER/verified-binaries.json" \
+            "$BUILD_DIR" "$build_type_known" "$ALLOW_UNOPTIMIZED" 2>"$BUFFER/capture-verify.err" <<'PY'
+import json, sys
+capture_path, verified_path, build_dir, build_type, allow_unopt = sys.argv[1:6]
+try:
+    capture = json.loads(open(capture_path, encoding="utf-8").read())
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"error: build_dir_mismatch: invalid capture JSON: {exc}", file=sys.stderr)
+    sys.exit(2)
+if not isinstance(capture, dict):
+    print("error: build_dir_mismatch: capture must be a JSON object", file=sys.stderr)
+    sys.exit(2)
+verified = json.load(open(verified_path, encoding="utf-8"))["binaries"]
+build = capture.get("build")
+if build is None:
+    build = {}
+    capture["build"] = build
+if not isinstance(build, dict):
+    print("error: build_dir_mismatch: capture.build must be an object", file=sys.stderr)
+    sys.exit(2)
+existing = build.get("binaries")
+if isinstance(existing, dict) and existing:
+    for role, expected in verified.items():
+        got = existing.get(role)
+        if (not isinstance(got, dict)
+                or got.get("local_sha256") != expected["local_sha256"]
+                or got.get("remote_sha256") != expected["remote_sha256"]):
+            print(f"error: build_dir_mismatch: target capture binaries[{role!r}] "
+                  f"did not match host-verified SHA-256", file=sys.stderr)
+            sys.exit(2)
+        got.setdefault("build_path", expected["build_path"])
+else:
+    build["binaries"] = verified
+    build["build_dir"] = build_dir
+    build.setdefault("build_type", build_type)
+    build["allow_unoptimized_build"] = allow_unopt == "1"
+    build["verified_on"] = "host"
+with open(capture_path, "w", encoding="utf-8") as handle:
+    json.dump(capture, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+    then
+        echo "BLOCKED: build_dir_mismatch" >&2
+        sed -n '1,20p' "$BUFFER/capture-verify.err" >&2 || true
+        blocked_result "build_dir_mismatch" "$build_type_known" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        exit 3
+    fi
 fi
 if [[ -n "$CAPTURE_OUT" ]]; then
     cp "$capture_file" "$CAPTURE_OUT"

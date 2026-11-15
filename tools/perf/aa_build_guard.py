@@ -39,6 +39,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -246,12 +247,21 @@ def verify_launched_binaries(build_dir: str | os.PathLike[str] | None,
     return records
 
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA256SUM_LINE_RE = re.compile(r"^([0-9a-f]{64}) [ *](.+)$")
+
+
+def is_sha256(value: object) -> bool:
+    return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+
+
 def derive_binaries_in_build_dir(build_dir: str | os.PathLike[str] | None,
                                  expected: Mapping[str, str]) -> dict[str, dict]:
-    """Cross build: derive each launched binary from the build directory's own tree.
+    """Cross build: derive each launched binary and its SHA-256 from the local build tree.
 
-    Used where the build tree is not visible (the host that built it), so the
-    build directory proves it produced a binary with the launched name.
+    Used where the build tree is on the host that built it, so the build
+    directory proves it produced a readable executable with the launched name and
+    supplies its SHA-256 for pre-launch comparison against the remote target.
     """
     if build_dir is None or not str(build_dir).strip():
         raise BuildDirMismatchError(f"no build directory given, so the launched binaries cannot be "
@@ -265,8 +275,134 @@ def derive_binaries_in_build_dir(build_dir: str | os.PathLike[str] | None,
         if not candidates:
             problems.append(f"{root} contains no executable named {name} for {role}")
             continue
-        records[role] = {"launched": name, "build_path": str(candidates[0]),
-                         "verified": "derived_from_build_dir"}
+        build_path = candidates[0]
+        digest = _sha256(Path(os.path.realpath(str(build_path))))
+        if digest is None:
+            problems.append(f"{role} {build_path} in {root} cannot be read, so its SHA-256 "
+                            f"cannot be verified")
+            continue
+        records[role] = {"launched": name, "build_path": str(build_path),
+                         "local_sha256": digest, "verified": "derived_from_build_dir"}
+    if problems:
+        raise BuildDirMismatchError("; ".join(problems) + f"; {BINARY_HINT}")
+    return records
+
+
+def parse_sha256sum_output(text: str) -> dict[str, str]:
+    """Parse GNU sha256sum output strictly; fail closed on malformed or empty output."""
+    hashes: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        if not raw_line:
+            continue
+        match = _SHA256SUM_LINE_RE.fullmatch(raw_line)
+        if match is None:
+            raise BuildDirMismatchError(f"malformed remote sha256sum line: {raw_line!r}; {BINARY_HINT}")
+        digest, path = match.groups()
+        if path in hashes and hashes[path] != digest:
+            raise BuildDirMismatchError(f"conflicting remote sha256sum entries for {path}; {BINARY_HINT}")
+        hashes[path] = digest
+    if not hashes:
+        raise BuildDirMismatchError(f"remote sha256sum returned no hashes; {BINARY_HINT}")
+    return hashes
+
+
+def verify_remote_hashes(
+    derived: Mapping[str, Mapping[str, object]],
+    remote_paths: Mapping[str, str],
+    sha256sum_output: str,
+) -> dict[str, dict]:
+    """Cross build (host side): match local build SHA-256s against remote sha256sum output."""
+    if not remote_paths:
+        raise BuildDirMismatchError(f"no remote binaries specified for SHA-256 verification; {BINARY_HINT}")
+    remote_hashes = parse_sha256sum_output(sha256sum_output)
+    expected_remote_paths = set(remote_paths.values())
+    if set(remote_hashes) != expected_remote_paths:
+        missing = sorted(expected_remote_paths - set(remote_hashes))
+        extra = sorted(set(remote_hashes) - expected_remote_paths)
+        details: list[str] = []
+        if missing:
+            details.append("missing remote hash(es) for " + ", ".join(missing))
+        if extra:
+            details.append("unexpected remote hash(es) for " + ", ".join(extra))
+        raise BuildDirMismatchError("; ".join(details) + f"; {BINARY_HINT}")
+    records: dict[str, dict] = {}
+    problems: list[str] = []
+    for role in sorted(remote_paths):
+        remote_path = remote_paths[role]
+        remote_sha256 = remote_hashes.get(remote_path)
+        if not is_sha256(remote_sha256):
+            problems.append(f"remote {role} {remote_path} has no valid SHA-256")
+            continue
+        local_entry = derived.get(role)
+        if not isinstance(local_entry, Mapping):
+            problems.append(f"local build output for {role} was not derived")
+            continue
+        local_sha256 = local_entry.get("local_sha256")
+        build_path = local_entry.get("build_path")
+        if not is_sha256(local_sha256) or not isinstance(build_path, str) or not build_path:
+            problems.append(f"local {role} build record lacks a valid SHA-256")
+            continue
+        if remote_sha256 != local_sha256:
+            problems.append(
+                f"{role} {remote_path} (sha256:{remote_sha256}) does not match local build "
+                f"output {build_path} (sha256:{local_sha256})"
+            )
+            continue
+        records[role] = {
+            "launched": remote_path,
+            "build_path": build_path,
+            "local_sha256": local_sha256,
+            "remote_sha256": remote_sha256,
+            "verified": "remote_sha256",
+        }
+    if problems:
+        raise BuildDirMismatchError("; ".join(problems) + f"; {BINARY_HINT}")
+    return records
+
+
+def verify_expected_binary_hashes(
+    binaries: Mapping[str, str | None],
+    expected_hashes: Mapping[str, str],
+    build_paths: Mapping[str, str] | None = None,
+) -> dict[str, dict]:
+    """Cross build (target side): verify each launched binary against its expected local SHA-256."""
+    records: dict[str, dict] = {}
+    problems: list[str] = []
+    for role in sorted(binaries):
+        path = binaries[role]
+        if path is None or not str(path).strip():
+            continue
+        expected = expected_hashes.get(role)
+        if not is_sha256(expected):
+            problems.append(f"no valid expected SHA-256 provided for {role} ({path})")
+            continue
+        launched = os.path.realpath(str(path))
+        launched_path = Path(launched)
+        if not launched_path.is_file():
+            problems.append(f"{role} {path} is missing or not a regular file")
+            continue
+        if not os.access(launched, os.X_OK):
+            problems.append(f"{role} {path} is not executable")
+            continue
+        actual = _sha256(launched_path)
+        if actual is None:
+            problems.append(f"{role} {path} cannot be read, so its SHA-256 cannot be verified")
+            continue
+        if actual != expected:
+            problems.append(
+                f"{role} {path} (sha256:{actual}) does not match local build output "
+                f"(sha256:{expected})"
+            )
+            continue
+        entry: dict[str, str] = {
+            "launched": str(path),
+            "local_sha256": expected,
+            "remote_sha256": actual,
+            "verified": "remote_sha256",
+        }
+        if build_paths and role in build_paths:
+            entry["build_path"] = build_paths[role]
+        records[role] = entry
     if problems:
         raise BuildDirMismatchError("; ".join(problems) + f"; {BINARY_HINT}")
     return records
@@ -282,15 +418,55 @@ def _cli(argv: list[str]) -> int:
                         help="a binary that will be launched; it must belong to this build")
     parser.add_argument("--expect", action="append", default=[], metavar="ROLE=NAME",
                         help="derive the launched binary from the build directory (cross builds)")
+    parser.add_argument("--verify-remote", default=None, metavar="BUILD_CHECK_JSON",
+                        help="verify remote sha256sum output against local hashes from --json output")
+    parser.add_argument("--remote-sha256-file", default=None, metavar="PATH",
+                        help="file containing stdout from remote sha256sum")
+    parser.add_argument("--remote-binary", action="append", default=[], metavar="ROLE=REMOTE_PATH",
+                        help="exact remote executable path for a role (with --verify-remote)")
     parser.add_argument("--json", action="store_true",
                         help="write the verified build record to stdout")
     args = parser.parse_args(argv)
     try:
-        launched = _pairs(args.binary, "--binary")
-        expected = _pairs(args.expect, "--expect")
+        launched = parse_role_pairs(args.binary, "--binary")
+        expected = parse_role_pairs(args.expect, "--expect")
+        remote_binaries = parse_role_pairs(args.remote_binary, "--remote-binary")
     except ValueError as exc:
         print(f"usage error: {exc}", file=sys.stderr)
         return 2
+    if args.verify_remote is not None:
+        if not args.remote_sha256_file:
+            print("usage error: --verify-remote requires --remote-sha256-file", file=sys.stderr)
+            return 2
+        try:
+            local_doc = json.loads(Path(args.verify_remote).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"{BINARY_REFUSAL_PREFIX} cannot read local build record {args.verify_remote}: {exc}",
+                  file=sys.stderr)
+            return 2
+        try:
+            sha256_text = Path(args.remote_sha256_file).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"{BINARY_REFUSAL_PREFIX} cannot read remote sha256sum output "
+                  f"{args.remote_sha256_file}: {exc}", file=sys.stderr)
+            return 2
+        derived = local_doc.get("binaries") if isinstance(local_doc, dict) else None
+        if not isinstance(derived, Mapping):
+            print(f"{BINARY_REFUSAL_PREFIX} local build record has no derived binaries", file=sys.stderr)
+            return 2
+        try:
+            verified = verify_remote_hashes(derived, remote_binaries, sha256_text)
+        except BuildDirMismatchError as exc:
+            print(f"{BINARY_REFUSAL_PREFIX} {exc}", file=sys.stderr)
+            return 2
+        for role, entry in sorted(verified.items()):
+            print(f"build binary: {role} {entry['verified']} {entry['launched']} "
+                  f"local_sha256={entry['local_sha256']} remote_sha256={entry['remote_sha256']}",
+                  file=sys.stderr)
+        if args.json:
+            json.dump({"binaries": verified}, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+        return 0
     try:
         build_type = require_optimized_build(args.build_dir,
                                             allow_unoptimized=args.allow_unoptimized_build)
@@ -313,21 +489,29 @@ def _cli(argv: list[str]) -> int:
         record["binaries"] = binaries
     print(describe_build(args.build_dir, build_type), file=sys.stderr)
     for role, entry in sorted(binaries.items()):
-        print(f"build binary: {role} {entry['verified']} {entry['build_path']}", file=sys.stderr)
+        sha_note = f" local_sha256={entry['local_sha256']}" if "local_sha256" in entry else ""
+        print(f"build binary: {role} {entry['verified']} {entry['build_path']}{sha_note}", file=sys.stderr)
     if args.json:
         json.dump(record, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
     return 0
 
 
-def _pairs(values: list[str], flag: str) -> dict[str, str]:
+def parse_role_pairs(values: list[str], flag: str) -> dict[str, str]:
     pairs: dict[str, str] = {}
     for value in values:
         role, separator, name = value.partition("=")
-        if not separator or not role.strip() or not name.strip():
+        key = role.strip()
+        val = name.strip()
+        if not separator or not key or not val:
             raise ValueError(f"{flag} expects ROLE=VALUE, got {value!r}")
-        pairs[role.strip()] = name.strip()
+        if key in pairs:
+            raise ValueError(f"{flag} duplicate role {key!r}")
+        pairs[key] = val
     return pairs
+
+
+_pairs = parse_role_pairs
 
 
 if __name__ == "__main__":

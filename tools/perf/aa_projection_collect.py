@@ -57,7 +57,8 @@ from aa_measurement_coverage import (
 )
 from aa_build_guard import (
     BINARY_REFUSAL_PREFIX, BuildDirMismatchError, BuildGuardError, REFUSAL_PREFIX,
-    describe_build, require_optimized_build, require_optimized_type, verify_launched_binaries,
+    describe_build, parse_role_pairs, require_optimized_build, require_optimized_type,
+    verify_expected_binary_hashes, verify_launched_binaries,
 )
 
 CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
@@ -901,6 +902,12 @@ def _cli(argv: list[str]) -> int:
                         help="cross build: the host that built the binaries already verified "
                              "--build-dir and derived the launched binaries from it, so this "
                              "target must not re-read a path it cannot see")
+    parser.add_argument("--expected-binary-sha256", action="append", default=[],
+                        metavar="ROLE=SHA256",
+                        help="cross build: expected SHA-256 of each launched binary from the local build")
+    parser.add_argument("--expected-binary-build-path", action="append", default=[],
+                        metavar="ROLE=PATH",
+                        help="cross build: local build output path for each launched binary")
     parser.add_argument("--allow-unoptimized-build", action="store_true",
                         help="debugging override: start even without an optimized build")
     args = parser.parse_args(argv)
@@ -914,6 +921,13 @@ def _cli(argv: list[str]) -> int:
     if not math.isfinite(args.interval) or args.interval <= 0:
         print("error: --interval must be positive", file=sys.stderr)
         return 2
+    try:
+        expected_hashes = parse_role_pairs(args.expected_binary_sha256, "--expected-binary-sha256")
+        expected_build_paths = parse_role_pairs(
+            args.expected_binary_build_path, "--expected-binary-build-path")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     # The build guard runs here, before collect() launches the receiver or the
     # display: an unoptimized build is refused instead of being measured.
@@ -921,7 +935,7 @@ def _cli(argv: list[str]) -> int:
     if host_verified is not None:
         # Cross build: the build tree lives on the host that built these
         # binaries, so the target cannot read its cache; the host verified it and
-        # the value is recorded as such (never as a target-verified build).
+        # the target verifies each launched executable against its local SHA-256.
         if not (args.build_dir and str(args.build_dir).strip()):
             print("error: --build-dir-verified-locally requires --build-dir", file=sys.stderr)
             return 2
@@ -936,7 +950,24 @@ def _cli(argv: list[str]) -> int:
         except BuildGuardError as exc:
             print(f"{REFUSAL_PREFIX} {exc}", file=sys.stderr)
             return 2
-        build = build_record(args, build_type, verified_on="host")
+        launched_map = {
+            "receiver": args.receiver,
+            "display": None if args.no_display else args.display,
+        }
+        active_roles = {role for role, path in launched_map.items()
+                        if path is not None and str(path).strip()}
+        extra_roles = sorted(set(expected_hashes) - active_roles)
+        if extra_roles:
+            print(f"{BINARY_REFUSAL_PREFIX} unexpected --expected-binary-sha256 role(s): "
+                  f"{', '.join(extra_roles)}", file=sys.stderr)
+            return 2
+        try:
+            binaries = verify_expected_binary_hashes(
+                launched_map, expected_hashes, build_paths=expected_build_paths)
+        except BuildDirMismatchError as exc:
+            print(f"{BINARY_REFUSAL_PREFIX} {exc}", file=sys.stderr)
+            return 2
+        build = build_record(args, build_type, verified_on="host", binaries=binaries)
     else:
         try:
             build_type = require_optimized_build(
@@ -944,7 +975,7 @@ def _cli(argv: list[str]) -> int:
         except BuildGuardError as exc:
             print(f"{REFUSAL_PREFIX} {exc}", file=sys.stderr)
             return 2
-        binaries: dict[str, dict] = {}
+        binaries = {}
         if args.build_dir and str(args.build_dir).strip():
             # Tie the binaries that will actually be launched to the build that
             # was just verified: another build's binaries must not run here.
@@ -960,7 +991,10 @@ def _cli(argv: list[str]) -> int:
     # The capture is stdout, so the run-report record goes to stderr.
     print(describe_build(args.build_dir, build_type), file=sys.stderr)
     for role, entry in sorted(build.get("binaries", {}).items()):
-        print(f"build binary: {role} {entry['verified']} {entry['build_path']}", file=sys.stderr)
+        location = entry.get("build_path") or entry["launched"]
+        sha_note = (f" local_sha256={entry['local_sha256']} remote_sha256={entry['remote_sha256']}"
+                    if "local_sha256" in entry and "remote_sha256" in entry else "")
+        print(f"build binary: {role} {entry['verified']} {location}{sha_note}", file=sys.stderr)
 
     old_handler = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(3))

@@ -47,7 +47,7 @@ from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Window, coverage_gaps, coverage_to_json, parse_capture, reduce_capture,
 )
 from aa_projection_collect import ProjectionProgress
-from aa_build_guard import is_optimized
+from aa_build_guard import is_optimized, is_sha256
 
 TASK = "32. Measure wired performance and two-hour soak"
 SCHEMA_VERSION = "aa-projection-perf/2"
@@ -198,6 +198,20 @@ def _build_record(capture: dict) -> dict:
     binaries = raw.get("binaries") or {}
     if not isinstance(binaries, dict):
         raise ContractError("capture.build.binaries must be an object")
+    for role, entry in binaries.items():
+        if not isinstance(entry, dict):
+            raise ContractError(f"capture.build.binaries[{role!r}] must be an object")
+        if "local_sha256" in entry or "remote_sha256" in entry:
+            local_sha = entry.get("local_sha256")
+            remote_sha = entry.get("remote_sha256")
+            if not is_sha256(local_sha) or not is_sha256(remote_sha):
+                raise ContractError(
+                    f"capture.build.binaries[{role!r}] sha256 fields must be 64-hex digests"
+                )
+            if local_sha != remote_sha:
+                raise ContractError(
+                    f"capture.build.binaries[{role!r}] local_sha256 does not match remote_sha256"
+                )
     record = {
         "build_type": build_type,
         "build_dir": build_dir,
@@ -440,6 +454,21 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     # something other than the qualified build, so it is never a PASS: the values
     # stay visible, the qualification verdict does not.
     build = _build_record(capture)
+    if origin == "live" and build["verified_on"] == "host" and blocked_on_override is None:
+        binaries_map = build.get("binaries") or {}
+        required_roles = ["receiver"]
+        if run_status["display_survived"] is not None:
+            required_roles.append("display")
+        for role in required_roles:
+            entry = binaries_map.get(role)
+            if not isinstance(entry, dict) or not (
+                is_sha256(entry.get("local_sha256"))
+                and is_sha256(entry.get("remote_sha256"))
+                and entry.get("local_sha256") == entry.get("remote_sha256")
+            ):
+                raise ContractError(
+                    f"live host-verified capture must record matching sha256 hashes for {role}"
+                )
     unoptimized_run = (build["allow_unoptimized_build"]
                        or (build["build_type"] is not None
                            and not is_optimized(build["build_type"])))

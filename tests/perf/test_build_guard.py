@@ -349,6 +349,11 @@ def test_binary_from_another_build_is_refused() -> None:
         assert verified["verified"] == "identical_copy", verified
 
 
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_cross_build_binaries_are_derived_from_the_local_build_dir() -> None:
     # Given a cross build: the tree is on this host, the binaries run elsewhere.
     with tempfile.TemporaryDirectory(prefix="guard-cross-") as base:
@@ -361,26 +366,88 @@ def test_cross_build_binaries_are_derived_from_the_local_build_dir() -> None:
             assert "aa-wired-receiver" in str(error) and "no executable" in str(error), str(error)
         else:
             raise AssertionError("a binary absent from the build tree was derived")
-        # ...while a produced one resolves to its path in that tree.
-        install_receiver(build, "aa-wired-receiver")
+        # ...while a produced one resolves to its path and local SHA-256 in that tree...
+        local_receiver = install_receiver(build, "aa-wired-receiver")
+        expected_sha = _sha256_file(local_receiver)
         record = guard.derive_binaries_in_build_dir(build, {"receiver": "aa-wired-receiver"})
         assert record["receiver"]["verified"] == "derived_from_build_dir", record
         assert str(build) in record["receiver"]["build_path"], record
+        assert record["receiver"]["local_sha256"] == expected_sha, record
+        # ...and an unreadable local build output is refused (only when not root).
+        if os.geteuid() != 0:
+            local_receiver.chmod(0o111)
+            try:
+                guard.derive_binaries_in_build_dir(build, {"receiver": "aa-wired-receiver"})
+            except guard.BuildDirMismatchError as error:
+                assert "cannot be read" in str(error), str(error)
+            else:
+                raise AssertionError("an unreadable local binary was derived")
+            finally:
+                local_receiver.chmod(0o755)
         # The same derivation through the guard CLI is a machine-readable record.
         checked = subprocess.run(
             [sys.executable, "-B", str(GUARD), "--build-dir", str(build),
              "--expect", "receiver=aa-wired-receiver", "--json"],
             capture_output=True, text=True, timeout=30, check=False)
         assert checked.returncode == 0, checked.stderr
-        assert json.loads(checked.stdout)["build_type"] == "Release", checked.stdout
-        # The target records the host-side verification, never a target-verified one.
-        host_verified = collector_cli(
-            install_receiver(build), root / "state-host",
+        checked_doc = json.loads(checked.stdout)
+        assert checked_doc["build_type"] == "Release", checked.stdout
+        assert checked_doc["binaries"]["receiver"]["local_sha256"] == expected_sha, checked_doc
+
+        # Target collector refuses --build-dir-verified-locally without expected hashes...
+        marker = root / "receiver-started"
+        marked = marker_receiver(root, directory=root / "marked", name="aa-wired-receiver")
+        missing_hash = collector_cli(
+            marked, root / "state-no-hash",
             "--build-dir", str(build), "--build-dir-verified-locally", "Release")
+        assert missing_hash.returncode == 2, missing_hash.stderr
+        assert missing_hash.stderr.startswith(MISMATCH), missing_hash.stderr
+        assert not marker.exists(), "collector launched without expected SHA-256"
+
+        # ...and refuses when the target binary has a different SHA-256...
+        wrong_hash = collector_cli(
+            marked, root / "state-wrong-hash",
+            "--build-dir", str(build), "--build-dir-verified-locally", "Release",
+            "--expected-binary-sha256", f"receiver={expected_sha}")
+        assert wrong_hash.returncode == 2, wrong_hash.stderr
+        assert wrong_hash.stderr.startswith(MISMATCH), wrong_hash.stderr
+        assert not marker.exists(), "collector launched mismatched binary"
+
+        # ...and refuses an unreadable target binary (execute-only).
+        if os.geteuid() != 0:
+            unreadable = root / "unreadable" / "aa-wired-receiver"
+            unreadable.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(local_receiver, unreadable)
+            unreadable.chmod(0o111)
+            refused_unreadable = collector_cli(
+                unreadable, root / "state-unreadable",
+                "--build-dir", str(build), "--build-dir-verified-locally", "Release",
+                "--expected-binary-sha256", f"receiver={expected_sha}")
+            assert refused_unreadable.returncode == 2, refused_unreadable.stderr
+            assert refused_unreadable.stderr.startswith(MISMATCH), refused_unreadable.stderr
+
+        # When the expected hash matches, the target records host-side verification
+        # along with both local and remote SHA-256s.
+        deployed = root / "deployed" / "aa-wired-receiver"
+        deployed.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local_receiver, deployed)
+        deployed.chmod(0o755)
+        host_verified = collector_cli(
+            deployed, root / "state-host",
+            "--build-dir", str(build), "--build-dir-verified-locally", "Release",
+            "--expected-binary-sha256", f"receiver={expected_sha}",
+            "--expected-binary-build-path", f"receiver={local_receiver}")
         assert host_verified.returncode == 0, host_verified.stderr
         recorded = json.loads(host_verified.stdout)["build"]
         assert recorded["verified_on"] == "host", recorded
         assert recorded["build_type"] == "Release", recorded
+        assert recorded["binaries"]["receiver"] == {
+            "launched": str(deployed),
+            "build_path": str(local_receiver),
+            "local_sha256": expected_sha,
+            "remote_sha256": expected_sha,
+            "verified": "remote_sha256",
+        }, recorded
 
 
 def test_cross_build_host_verification_still_refuses_debug() -> None:
@@ -388,9 +455,11 @@ def test_cross_build_host_verification_still_refuses_debug() -> None:
     with tempfile.TemporaryDirectory(prefix="guard-cross-debug-") as base:
         root = Path(base)
         receiver = install_receiver(debug(root))
+        receiver_sha = _sha256_file(receiver)
         refused = collector_cli(receiver, root / "state",
                                 "--build-dir", "/host/build-debug",
-                                "--build-dir-verified-locally", "Debug")
+                                "--build-dir-verified-locally", "Debug",
+                                "--expected-binary-sha256", f"receiver={receiver_sha}")
         # Then the target refuses it without the override, and records it with.
         assert refused.returncode == 2, refused.stderr
         assert refused.stderr.startswith(REFUSAL), refused.stderr
@@ -398,11 +467,14 @@ def test_cross_build_host_verification_still_refuses_debug() -> None:
         overridden = collector_cli(receiver, root / "state",
                                    "--build-dir", "/host/build-debug",
                                    "--build-dir-verified-locally", "Debug",
+                                   "--expected-binary-sha256", f"receiver={receiver_sha}",
                                    "--allow-unoptimized-build")
         assert overridden.returncode == 0, overridden.stderr
         recorded = json.loads(overridden.stdout)["build"]
         assert recorded["allow_unoptimized_build"] is True, recorded
         assert recorded["verified_on"] == "host", recorded
+        assert recorded["binaries"]["receiver"]["local_sha256"] == receiver_sha, recorded
+        assert recorded["binaries"]["receiver"]["remote_sha256"] == receiver_sha, recorded
 
 
 def test_override_run_is_recorded_and_never_qualifies() -> None:
@@ -519,6 +591,25 @@ printf '%s\\n' "$*" >> {str(log)!r}
 command_line="$*"
 case "$command_line" in
     *CMakeCache*) [ -n "${{STUB_CACHE:-}}" ] && [ -f "$STUB_CACHE" ] && exit 0 || exit 1 ;;
+    *sha256sum*)
+        [ -n "${{STUB_SHA256_FAIL:-}}" ] && exit 1
+        if [ -n "${{STUB_SHA256_STDOUT+x}}" ]; then
+            printf '%s\\n' "$STUB_SHA256_STDOUT"
+            exit 0
+        fi
+        [ -n "${{STUB_REMOTE_DIR:-}}" ] || exit 1
+        python3 - "$command_line" "$STUB_REMOTE_DIR" <<'PY'
+import hashlib, os, shlex, sys
+from pathlib import Path
+cmd, remote_dir = sys.argv[1], Path(sys.argv[2])
+tokens = shlex.split(cmd)
+idx = tokens.index("--")
+for remote_path in tokens[idx + 1:]:
+    mapped = remote_dir / os.path.basename(remote_path)
+    data = mapped.read_bytes()
+    print(f"{{hashlib.sha256(data).hexdigest()}}  {{remote_path}}")
+PY
+        exit $? ;;
     *"python3 -"*) [ -n "${{STUB_CAPTURE:-}}" ] || exit 1
                    cat "$STUB_CAPTURE"
                    printf '%s\\n' "${{STUB_BUILD_LINE:-}}" >&2
@@ -540,11 +631,14 @@ def test_launcher_records_the_build_and_never_passes_an_override_run() -> None:
         root = Path(base)
         stub_dir, log = stub_ssh(root)
 
-        def launcher(capture: Path, build_line: str, cache: str, *extra: str
+        def launcher(capture: Path, build_line: str, cache: str, *extra: str,
+                     env_extra: dict[str, str] | None = None
                      ) -> subprocess.CompletedProcess:
             env = {"PATH": f"{stub_dir}:/usr/bin:/bin", "AA_PERF_HOST": "fake.local",
                    "AA_DISPLAY": ":0", "STUB_CAPTURE": str(capture),
                    "STUB_BUILD_LINE": build_line, "STUB_CACHE": cache}
+            if env_extra:
+                env.update(env_extra)
             return subprocess.run(
                 ["bash", str(SHELL), "--mode", "wired", "--duration", "1s",
                  "--out", str(root / "result.json"), "--now", NOW, *extra],
@@ -583,28 +677,234 @@ def test_launcher_records_the_build_and_never_passes_an_override_run() -> None:
         assert doc["metrics"]["av_sync_ms"]["value"] is not None, doc["metrics"]
 
         # When the build tree is only on this host (cross build), the launcher
-        # verifies it locally and the target records the host-side check.
+        # verifies local and remote binary SHA-256s before launch and records both.
         log.unlink()
         cross_build = release(root / "cross")
-        install_receiver(cross_build, "aa-wired-receiver")
-        install_receiver(cross_build, "aa-dummy-display")  # the display is measured too
+        local_rec = install_receiver(cross_build, "aa-wired-receiver")
+        local_disp = install_receiver(cross_build, "aa-dummy-display")
+        remote_dir = root / "remote-opt-aa"
+        remote_dir.mkdir()
+        shutil.copy2(local_rec, remote_dir / "aa-wired-receiver")
+        shutil.copy2(local_disp, remote_dir / "aa-dummy-display")
+        cross_cap = root / "cross-capture.json"
         cross = launcher(live_capture(root, build_type="Release"), "", str(root / "absent"),
-                         "--build-dir", str(cross_build))
+                         "--build-dir", str(cross_build), "--capture-out", str(cross_cap),
+                         env_extra={"STUB_REMOTE_DIR": str(remote_dir)})
         assert cross.returncode == 0, cross.stdout + cross.stderr
-        assert json.loads((root / "result.json").read_text(encoding="utf-8"))["verdict"] == "PASS"
+        cross_result = json.loads((root / "result.json").read_text(encoding="utf-8"))
+        assert cross_result["verdict"] == "PASS"
+        assert cross_result["qualification_status"] == "COMPLETE_LIVE"
         recorded = log.read_text(encoding="utf-8")
+        assert "sha256sum" in recorded, recorded
         assert f"--build-dir-verified-locally 'Release'" in recorded, recorded
+        assert "--expected-binary-sha256" in recorded, recorded
+        for doc_name, loaded in (("capture", json.loads(cross_cap.read_text(encoding="utf-8"))),
+                                 ("result", cross_result)):
+            assert loaded["build"]["verified_on"] == "host", (doc_name, loaded["build"])
+            for role, local_bin, remote_path in (
+                ("receiver", local_rec, "/opt/aa/aa-wired-receiver"),
+                ("display", local_disp, "/opt/aa/aa-dummy-display"),
+            ):
+                expected_sha = _sha256_file(local_bin)
+                entry = loaded["build"]["binaries"][role]
+                assert entry["launched"] == remote_path, (doc_name, entry)
+                assert entry["build_path"] == str(local_bin), (doc_name, entry)
+                assert entry["local_sha256"] == expected_sha, (doc_name, entry)
+                assert entry["remote_sha256"] == expected_sha, (doc_name, entry)
+                assert entry["verified"] == "remote_sha256", (doc_name, entry)
+
         # And a local build tree that did not produce the launched binaries is
         # refused before anything runs on the target.
         log.unlink()
         empty_build = release(root / "cross-empty")
         refused = launcher(live_capture(root, build_type="Release"), "", str(root / "absent"),
-                           "--build-dir", str(empty_build))
+                           "--build-dir", str(empty_build),
+                           env_extra={"STUB_REMOTE_DIR": str(remote_dir)})
         assert refused.returncode == 3, refused.stdout + refused.stderr
         assert "BLOCKED: build_dir_mismatch" in refused.stderr, refused.stderr
         assert json.loads((root / "result.json").read_text(encoding="utf-8"))["blocked_on"] == \
             "build_dir_mismatch"
         assert "python3 -" not in log.read_text(encoding="utf-8"), "the stage was launched anyway"
+
+
+def test_cross_build_remote_binary_hash_is_verified_before_launch() -> None:
+    # Reproduce the post-merge cross-build bypass: local Release build tree vs
+    # stale/different, unreadable, or missing remote binaries on the target.
+    with tempfile.TemporaryDirectory(prefix="guard-cross-hash-") as base:
+        root = Path(base)
+        stub_dir, log = stub_ssh(root)
+        cross_build = release(root / "cross")
+        local_rec = install_receiver(cross_build, "aa-wired-receiver")
+        local_disp = install_receiver(cross_build, "aa-dummy-display")
+        # Distinguish display from receiver so each role's hash is verified independently.
+        local_disp.write_text(local_disp.read_text(encoding="utf-8") + "\n# display\n",
+                              encoding="utf-8")
+        local_disp.chmod(0o755)
+        capture = live_capture(root, build_type="Release")
+
+        def run_cross(remote_dir: Path, *extra: str,
+                      env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+            if log.exists():
+                log.unlink()
+            env = {"PATH": f"{stub_dir}:/usr/bin:/bin", "AA_PERF_HOST": "fake.local",
+                   "AA_DISPLAY": ":0", "STUB_CAPTURE": str(capture),
+                   "STUB_CACHE": str(root / "absent"), "STUB_REMOTE_DIR": str(remote_dir)}
+            if env_extra:
+                env.update(env_extra)
+            return subprocess.run(
+                ["bash", str(SHELL), "--mode", "wired", "--duration", "1s",
+                 "--build-dir", str(cross_build), "--out", str(root / "result.json"),
+                 "--now", NOW, *extra],
+                capture_output=True, text=True, timeout=120, env=env, check=False)
+
+        def stage_remote(name: str, *, receiver_bytes: bytes | None = None,
+                         display_bytes: bytes | None = None) -> Path:
+            rdir = root / name
+            rdir.mkdir()
+            if receiver_bytes is not None:
+                p = rdir / "aa-wired-receiver"
+                p.write_bytes(receiver_bytes)
+                p.chmod(0o755)
+            if display_bytes is not None:
+                p = rdir / "aa-dummy-display"
+                p.write_bytes(display_bytes)
+                p.chmod(0o755)
+            return rdir
+
+        # 1. Stale Debug receiver binary on target alongside local Release build:
+        #    MUST be refused with build_dir_mismatch before launching collector.
+        stale_rec_dir = stage_remote(
+            "remote-stale-rec",
+            receiver_bytes=local_rec.read_bytes() + b"\n# stale debug build\n",
+            display_bytes=local_disp.read_bytes(),
+        )
+        res = run_cross(stale_rec_dir)
+        assert res.returncode == 3, res.stdout + res.stderr
+        assert "BLOCKED: build_dir_mismatch" in res.stderr, res.stderr
+        assert json.loads((root / "result.json").read_text(encoding="utf-8"))["blocked_on"] == \
+            "build_dir_mismatch"
+        assert "python3 -" not in log.read_text(encoding="utf-8"), "stale receiver was launched"
+
+        # 2. Stale/different display binary on target: MUST also be refused.
+        stale_disp_dir = stage_remote(
+            "remote-stale-disp",
+            receiver_bytes=local_rec.read_bytes(),
+            display_bytes=local_disp.read_bytes() + b"\n# stale display\n",
+        )
+        res = run_cross(stale_disp_dir)
+        assert res.returncode == 3, res.stdout + res.stderr
+        assert "BLOCKED: build_dir_mismatch" in res.stderr, res.stderr
+        assert json.loads((root / "result.json").read_text(encoding="utf-8"))["blocked_on"] == \
+            "build_dir_mismatch"
+        assert "python3 -" not in log.read_text(encoding="utf-8"), "stale display was launched"
+
+        # 3. Missing remote display binary: MUST be refused before launch.
+        missing_disp_dir = stage_remote(
+            "remote-missing-disp",
+            receiver_bytes=local_rec.read_bytes(),
+            display_bytes=None,
+        )
+        res = run_cross(missing_disp_dir)
+        assert res.returncode == 3, res.stdout + res.stderr
+        assert "BLOCKED: build_dir_mismatch" in res.stderr, res.stderr
+        assert json.loads((root / "result.json").read_text(encoding="utf-8"))["blocked_on"] == \
+            "build_dir_mismatch"
+        assert "python3 -" not in log.read_text(encoding="utf-8")
+
+        # 4. Unreadable remote binaries (0111 receiver, 0000 display): MUST be refused.
+        if os.geteuid() != 0:
+            unreadable_rec_dir = stage_remote(
+                "remote-unreadable-rec",
+                receiver_bytes=local_rec.read_bytes(),
+                display_bytes=local_disp.read_bytes(),
+            )
+            (unreadable_rec_dir / "aa-wired-receiver").chmod(0o111)
+            res = run_cross(unreadable_rec_dir)
+            assert res.returncode == 3, res.stdout + res.stderr
+            assert "BLOCKED: build_dir_mismatch" in res.stderr, res.stderr
+            assert "python3 -" not in log.read_text(encoding="utf-8")
+
+            unreadable_disp_dir = stage_remote(
+                "remote-unreadable-disp",
+                receiver_bytes=local_rec.read_bytes(),
+                display_bytes=local_disp.read_bytes(),
+            )
+            (unreadable_disp_dir / "aa-dummy-display").chmod(0o000)
+            res = run_cross(unreadable_disp_dir)
+            assert res.returncode == 3, res.stdout + res.stderr
+            assert "BLOCKED: build_dir_mismatch" in res.stderr, res.stderr
+            assert "python3 -" not in log.read_text(encoding="utf-8")
+
+        # 5. Remote sha256sum command error / empty / malformed stdout: MUST fail closed.
+        good_dir = stage_remote(
+            "remote-good",
+            receiver_bytes=local_rec.read_bytes(),
+            display_bytes=local_disp.read_bytes(),
+        )
+        for label, bad_env in (
+            ("ssh_fail", {"STUB_SHA256_FAIL": "1"}),
+            ("empty_stdout", {"STUB_SHA256_STDOUT": ""}),
+            ("garbage_stdout", {"STUB_SHA256_STDOUT": "not-a-sha256 /opt/aa/aa-wired-receiver"}),
+        ):
+            res = run_cross(good_dir, env_extra=bad_env)
+            assert res.returncode == 3, (label, res.stdout, res.stderr)
+            assert "BLOCKED: build_dir_mismatch" in res.stderr, (label, res.stderr)
+            assert "python3 -" not in log.read_text(encoding="utf-8"), label
+
+        # 6. Reporter itself refuses a live host-verified capture missing hashes
+        #    or with mismatched local/remote hashes.
+        forged_no_hashes = json.loads(capture.read_text(encoding="utf-8"))
+        forged_no_hashes["build"] = {
+            "build_dir": str(cross_build), "build_type": "Release",
+            "allow_unoptimized_build": False, "verified_on": "host",
+        }
+        no_hash_path = root / "forged-no-hash.json"
+        no_hash_path.write_text(json.dumps(forged_no_hashes), encoding="utf-8")
+        assert report_capture(no_hash_path, root / "forged-out-1.json", "--live").returncode == 4
+
+        forged_mismatch = copy.deepcopy(forged_no_hashes)
+        forged_mismatch["build"]["binaries"] = {
+            "receiver": {
+                "launched": "/opt/aa/aa-wired-receiver",
+                "local_sha256": "a" * 64,
+                "remote_sha256": "b" * 64,
+                "verified": "remote_sha256",
+            },
+        }
+        mismatch_path = root / "forged-mismatch.json"
+        mismatch_path.write_text(json.dumps(forged_mismatch), encoding="utf-8")
+        assert report_capture(mismatch_path, root / "forged-out-2.json", "--live").returncode == 4
+
+
+def test_verify_remote_hashes_fails_closed() -> None:
+    rec_sha = "1" * 64
+    disp_sha = "2" * 64
+    derived = {
+        "receiver": {"launched": "aa-wired-receiver", "build_path": "/build/aa-wired-receiver",
+                     "local_sha256": rec_sha, "verified": "derived_from_build_dir"},
+        "display": {"launched": "aa-dummy-display", "build_path": "/build/aa-dummy-display",
+                    "local_sha256": disp_sha, "verified": "derived_from_build_dir"},
+    }
+    remote_paths = {"receiver": "/opt/aa/aa-wired-receiver", "display": "/opt/aa/aa-dummy-display"}
+    good_out = f"{rec_sha}  /opt/aa/aa-wired-receiver\n{disp_sha}  /opt/aa/aa-dummy-display\n"
+    verified = guard.verify_remote_hashes(derived, remote_paths, good_out)
+    assert verified["receiver"]["local_sha256"] == rec_sha
+    assert verified["receiver"]["remote_sha256"] == rec_sha
+    assert verified["display"]["local_sha256"] == disp_sha
+    assert verified["display"]["remote_sha256"] == disp_sha
+    for bad_out in (
+        "",
+        "bad-line\n",
+        f"{rec_sha}  /opt/aa/aa-wired-receiver\n",
+        f"{rec_sha}  /opt/aa/aa-wired-receiver\n{'3' * 64}  /opt/aa/aa-dummy-display\n",
+        f"{rec_sha}  /opt/aa/aa-wired-receiver\n{disp_sha}  /opt/aa/aa-dummy-display\n{rec_sha}  /extra\n",
+    ):
+        try:
+            guard.verify_remote_hashes(derived, remote_paths, bad_out)
+        except guard.BuildDirMismatchError:
+            pass
+        else:
+            raise AssertionError(f"verify_remote_hashes accepted bad output: {bad_out!r}")
 
 
 def test_launcher_honours_the_callers_display_environment() -> None:
