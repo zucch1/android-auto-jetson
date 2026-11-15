@@ -383,8 +383,9 @@ class MockBluez(ProfileSockets):
             case "fast-remove": self.remove_delay_ms = 0; self.disconnect_delay_ms = 0
             case "fail-remove": self.fail_remove = True
             case "allow-remove": self.fail_remove = False
-            case "lost-remove-reply": self.lost_remove_reply = True
-            case "normal-remove-reply": self.lost_remove_reply = False
+            case "lost-remove-reply": self.lost_remove_reply = "lost"
+            case "lost-remove-reply-rebond": self.lost_remove_reply = "rebond"
+            case "normal-remove-reply": self.lost_remove_reply = None
             case "fail-set": self.fail_set = True
             case "allow-set": self.fail_set = False
             case "fail-register-hfp": self.fail_register.add(HFP)

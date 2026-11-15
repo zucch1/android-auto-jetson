@@ -379,7 +379,8 @@ protected:
     void acquire(std::uint64_t generation = 1, bool other = false) {
         if (other) { ASSERT_EQ(bluez.command("observe-other"), "ok"); }
         ASSERT_TRUE(client->prepare(core::ConsumerId{generation}, core::PairingRequestId{generation}));
-        ASSERT_TRUE(client->confirmed(core::ConsumerId{generation}, core::PairingRequestId{generation}));
+        const auto confirmation = client->confirmed(core::ConsumerId{generation}, core::PairingRequestId{generation});
+        ASSERT_TRUE(confirmation) << (confirmation ? "" : confirmation.error().message());
         ASSERT_EQ(bluez.command(other ? "comparison-start wrong" : "comparison-start"), "ok");
         std::optional<PairingComparison> challenge;
         ASSERT_TRUE(eventually([&] {
