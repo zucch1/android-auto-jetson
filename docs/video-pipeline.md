@@ -182,16 +182,23 @@ keyframe from the phone while projecting:
 `VideoConsumer::configure_receive_buffer()` request a profile-scaled buffer target
 from `recommended_socket_buffer_bytes()` (`256 KiB`–`4 MiB`) using `setsockopt`
 without mutating sysctls or using `SO_SNDBUFFORCE`. On Linux/Jetson kernels with
-stock sysctls (`net.core.wmem_max = net.core.rmem_max = 212992`), kernel clamping
-limits `SO_SNDBUF` to `212992` effective bytes (`getsockopt()` returns the
-doubled accounting value `granted_raw_bytes = 425984`, while `granted_bytes`
-reports `granted_raw_bytes / 2 = 212992`), and `SO_RCVBUF` has no queueing effect
-on `AF_UNIX` `SOCK_SEQPACKET` beyond the sender buffer. Whenever `granted_bytes <
-requested_bytes` or `setsockopt()` fails, `video_socket_buffer` records the raw
-and effective counts alongside a non-fatal `video_socket_buffer_warning` event.
-Extra IPC burst headroom above `212992` bytes is not available on stock sysctls
-and requires an explicit administrator setting such as `net.core.wmem_max=4194304`
-(4 MiB).
+stock sysctls (`net.core.wmem_max = net.core.rmem_max = 212992`), the kernel
+clamps the requested option above at `wmem_max`/`rmem_max` and floors the
+doubled accounting value below at `SOCK_MIN_SNDBUF`/`SOCK_MIN_RCVBUF`:
+`getsockopt()` returns the authoritative `granted_raw_bytes` kernel option value
+(`max(2 * min(requested, sysctl_max), SOCK_MIN_*)`, e.g., `425984` when capped at
+`212992`), while `granted_bytes` reports the normalized Linux option value
+(`granted_raw_bytes / 2`, e.g., `212992`). Because `getsockopt()` returns the
+unchanged socket option even when `setsockopt()` fails, `granted_bytes` only
+reflects the applied grant when `setsockopt_errno == 0 && getsockopt_errno == 0`,
+and `granted_raw_bytes` plus the errno fields remain authoritative. In addition,
+`SO_RCVBUF` has no queueing effect on `AF_UNIX` `SOCK_SEQPACKET` beyond the sender
+buffer. Whenever `short_grant()` (`setsockopt_errno == 0 && getsockopt_errno == 0
+&& granted_bytes < requested_bytes`) or a socket option error occurs,
+`video_socket_buffer` records the raw and normalized option counts alongside a
+non-fatal `video_socket_buffer_warning` event. Extra IPC burst headroom above
+`212992` bytes is not available on stock sysctls and requires an explicit
+administrator setting such as `net.core.wmem_max=4194304` (4 MiB).
 
 ## Following PRs and qualification
 

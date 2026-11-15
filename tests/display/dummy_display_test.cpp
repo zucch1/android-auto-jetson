@@ -3176,12 +3176,53 @@ TEST(DummyDisplayBackpressure, ConsumerRequestsIdrWhenWaitingPastStartupGraceBef
     ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
     EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
 
-    now += aa::ipc::kIdrStartupGrace;
+    // At kIdrStartupGrace - 1 ms, still inside grace window: no request.
+    now += aa::ipc::kIdrStartupGrace - std::chrono::milliseconds{1};
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+
+    // At exact kIdrStartupGrace (+1 ms): emits the startup-grace IDR request.
+    now += std::chrono::milliseconds{1};
     ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
     EXPECT_TRUE(fixture.service->service->service().consume_idr_recovery_request());
-    EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
-                        "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"video_consumer_waiting_idr\"}"),
-              diagnostics.end());
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"video_consumer_waiting_idr\"}"),
+              1);
+
+    // Repeated same-time pump() is rate-limited and emits no second request.
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"video_consumer_waiting_idr\"}"),
+              1);
+
+    if (fixture.live_producer.has_value()) {
+        fixture.live_producer->close();
+    }
+    ASSERT_TRUE(fixture.finish_feeding());
+}
+
+TEST(DummyDisplayBackpressure, InitialIdrBeforeStartupGraceClearsWaitingState) {
+    std::vector<std::string> diagnostics;
+    auto now = std::chrono::steady_clock::time_point{std::chrono::seconds{40}};
+    BackpressureFixture fixture;
+    ASSERT_TRUE(fixture.attach(
+        "ConsumerPreGraceIdr", {},
+        [&diagnostics](const std::string& line) { diagnostics.push_back(line); },
+        [&now] { return now; }));
+
+    aa::ipc::VideoAccessUnit idr{1, 10, kTimestampBaseNs, true, {0, 0, 1, 0x65, 0x11}};
+    idr.profile = VideoProfile{1920, 1080, 60};
+    ASSERT_TRUE(fixture.start({idr}, /*keep_open=*/true));
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{50}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+
+    now += aa::ipc::kIdrStartupGrace + std::chrono::seconds{1};
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"video_consumer_waiting_idr\"}"),
+              0);
 
     if (fixture.live_producer.has_value()) {
         fixture.live_producer->close();

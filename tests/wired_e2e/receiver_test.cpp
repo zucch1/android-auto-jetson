@@ -1295,6 +1295,10 @@ aa::trust::PhoneIdentity runtime_phone;
 bool runtime_real_admission = false;
 bool runtime_fail_before_admission = false;
 bool runtime_send_audio = false;
+bool runtime_send_video = false;
+std::optional<int> runtime_fail_video_focus_send;
+std::atomic<int> runtime_video_focus_sends{0};
+std::atomic<int> runtime_video_native_sends{0};
 // Extra receiver arguments and the discovery response the receiver put on the
 // (synthetic) wire, for tests that prove a command-line value reaches the phone.
 std::vector<std::string> runtime_extra_args;
@@ -1340,7 +1344,7 @@ class RuntimeTransport final : public aa::transport::Transport {
             aa::protocol::encode(aa::protocol::VersionResponse{1, 6, 0}).value()));
         frames_.push_back(wiredtest::control_frame(
             aa::protocol::encode(aa::protocol::EncapsulatedSsl{{std::byte{1}}}).value()));
-        if (runtime_send_audio) { frames_.push_back(wiredtest::discovery_request_frame()); }
+        if (runtime_send_audio || runtime_send_video) { frames_.push_back(wiredtest::discovery_request_frame()); }
         frames_.push_back(wiredtest::open_request_frame(99));
         if (runtime_send_audio) {
             wiredtest::FakeHandshakeCipher cipher;
@@ -1356,6 +1360,19 @@ class RuntimeTransport final : public aa::transport::Transport {
                 if (runtime_pcm_source && payload == data) { continue; }
                 auto encoded = aa::transport::encode_message(
                     {100, aa::transport::MessageKind::specific, std::move(payload)},
+                    aa::transport::Encryption::encrypted, &cipher);
+                for (auto &frame : encoded.value()) { frames_.push_back(std::move(frame)); }
+            }
+        }
+        if (runtime_send_video) {
+            wiredtest::FakeHandshakeCipher cipher;
+            (void)cipher.step_handshake();
+            (void)cipher.step_handshake();
+            for (auto payload : {aa::protocol::encode(aa::protocol::AvSinkSetup{
+                                      aa::protocol::AvSinkCodec::h264}).value(),
+                                  aa::protocol::encode(aa::protocol::AvSinkStart{1, 0}).value()}) {
+                auto encoded = aa::transport::encode_message(
+                    {99, aa::transport::MessageKind::specific, std::move(payload)},
                     aa::transport::Encryption::encrypted, &cipher);
                 for (auto &frame : encoded.value()) { frames_.push_back(std::move(frame)); }
             }
@@ -1397,6 +1414,29 @@ class RuntimeTransport final : public aa::transport::Transport {
                         runtime_pcm_source->acks.push_back(runtime_pcm_source->elapsed_ns());
                     }
                     if (runtime_ack_send_failure) { return aa::Error{aa::ErrorCode::transport_io}; }
+                }
+            }
+        }
+        if (runtime_send_video) {
+            const auto frame = aa::transport::decode_frame(bytes);
+            if (frame && frame.value().header.channel == 99 &&
+                frame.value().header.encryption == aa::transport::Encryption::encrypted) {
+                std::vector<std::byte> plain;
+                for (auto byte : frame.value().payload) {
+                    plain.push_back(static_cast<std::byte>(~std::to_integer<unsigned char>(byte)));
+                }
+                const auto native_msg = aa::protocol::encode(aa::protocol::VideoFocusNotification{
+                    aa::protocol::VideoFocusMode::native, true}).value();
+                const auto proj_msg = aa::protocol::encode(aa::protocol::VideoFocusNotification{
+                    aa::protocol::VideoFocusMode::projected, true}).value();
+                if (plain == native_msg || plain == proj_msg) {
+                    const int idx = ++runtime_video_focus_sends;
+                    if (runtime_fail_video_focus_send && idx == *runtime_fail_video_focus_send) {
+                        return aa::Error{aa::ErrorCode::transport_io};
+                    }
+                    if (plain == native_msg) {
+                        ++runtime_video_native_sends;
+                    }
                 }
             }
         }
@@ -1464,6 +1504,9 @@ class RuntimeTransport final : public aa::transport::Transport {
                 checkpoint_();
             }
             lock.lock();
+            if (token_.stop_requested()) {
+                break;
+            }
             cv.wait_for(lock, token_, std::chrono::milliseconds{20}, [] { return false; });
         }
         close();
@@ -6456,3 +6499,178 @@ TEST(WiredReceiver, HevcAvailabilityIsDeterminedByInstalledElements) {
         EXPECT_NE(error.find("avdec_h265"),std::string::npos) << error;
     }
 }
+
+namespace {
+struct DbusIdrOwnerRun {
+    int code{-1};
+    std::string output;
+    std::chrono::steady_clock::duration elapsed{};
+    bool was_quiet{false};
+    bool registered{false};
+    bool projection_started{false};
+    bool idr_reply_ok{false};
+    bool closed{false};
+    bool watchdog_fired{false};
+    int focus_sends{0};
+    int native_sends{0};
+};
+
+DbusIdrOwnerRun run_dbus_idr_owner_loop(std::optional<int> fail_focus_send_index,
+                                        std::int64_t duration_ms) {
+    namespace bus = aa::ipc::dbus_adapter;
+    DbusIdrOwnerRun run;
+    char directory[] = "/tmp/wired-idr-owner-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore initial{path};
+    if (!initial.load().has_value()) {
+        std::filesystem::remove_all(root);
+        return run;
+    }
+    const aa::trust::WiredIdentity identity{
+        "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+    if (!initial.approve(aa::trust::TransportIdentity{identity}).has_value()) {
+        std::filesystem::remove_all(root);
+        return run;
+    }
+    runtime_phone = aa::app::wired_phone_identity(identity).value();
+    runtime_quiet = true;
+    runtime_recovers = false;
+    runtime_send_audio = false;
+    runtime_send_video = true;
+    runtime_fail_video_focus_send = fail_focus_send_index;
+    runtime_video_focus_sends.store(0);
+    runtime_video_native_sends.store(0);
+    runtime_connects.store(0);
+    runtime_ciphers.store(0);
+    runtime_waiting.store(false);
+    runtime_closed.store(false);
+    g_running.store(true);
+
+    std::vector<std::string> args{
+        "receiver", "--port", "1-2.1", "--store", path.string(),
+        "--video-socket", (root / "video").string(),
+        "--input-socket", (root / "input").string(),
+        "--idr-recovery", "transition",
+        "--duration-ms", std::to_string(duration_ms)};
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (auto &arg : args) { argv.push_back(arg.data()); }
+
+    capture_receiver_stdout();
+    const auto began = std::chrono::steady_clock::now();
+    std::thread receiver([&] {
+        run.code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+    });
+    std::atomic<bool> watchdog_fired{false};
+    std::jthread watchdog([&](const std::stop_token &stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, stop, std::chrono::seconds{8}, [] { return false; });
+        if (!stop.stop_requested()) {
+            watchdog_fired.store(true);
+            g_running.store(false);
+        }
+    });
+
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+    while (!runtime_waiting.load() && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    run.was_quiet = runtime_waiting.load();
+
+    auto client = bus::BusConnection::connect_session();
+    if (client && run.was_quiet) {
+        const aa::ipc::BusName consumer{"org.custom.AndroidAutoReceiverTest.IdrConsumer"};
+        const aa::ipc::BusName service{"org.custom.AndroidAutoReceiver"};
+        const auto named = client.value().request_name(consumer);
+        auto owner = client.value().get_name_owner(service);
+        const auto owner_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!owner && std::chrono::steady_clock::now() < owner_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            owner = client.value().get_name_owner(service);
+        }
+        if (named && owner) {
+            const auto call = [&](const char *member, const std::function<void(bus::MessageWriter &)> &fill = {}) {
+                bus::MessageWriter writer;
+                writer.destination(service.value).path("/org/custom/AndroidAutoReceiver")
+                    .interface_name("org.custom.AndroidAutoReceiver1").member(member);
+                if (fill) { fill(writer); }
+                auto serial = client.value().send_message(bus::MessageType::method_call, writer);
+                if (!serial) { return false; }
+                auto reply = client.value().await_reply(serial.value(), owner.value());
+                return reply.has_value() && reply.value().type == bus::MessageType::method_return;
+            };
+            run.registered = call("RegisterConsumer", [&](bus::MessageWriter &w) {
+                w.body_signature("s").put_string(consumer.value);
+            });
+            if (run.registered) {
+                run.projection_started = call("StartProjection");
+            }
+            if (run.projection_started) {
+                run.idr_reply_ok = call("RequestIdrRecovery");
+            }
+        }
+    }
+    if (!run.idr_reply_ok) {
+        g_running.store(false);
+    }
+
+    receiver.join();
+    run.elapsed = std::chrono::steady_clock::now() - began;
+    watchdog.request_stop();
+    watchdog.join();
+    run.output = captured_receiver_stdout();
+    run.closed = runtime_closed.load();
+    run.watchdog_fired = watchdog_fired.load();
+    run.focus_sends = runtime_video_focus_sends.load();
+    run.native_sends = runtime_video_native_sends.load();
+
+    runtime_send_video = false;
+    runtime_fail_video_focus_send.reset();
+    runtime_quiet = false;
+    std::filesystem::remove_all(root);
+    return run;
+}
+} // namespace
+
+TEST(WiredReceiver, DbusIdrPartialFocusRestoreFailureExitsImmediatelyWithoutLaterVideo) {
+    // Focus send #1 = AvSinkSetup(projected), #2 = transition native (succeeds),
+    // #3 = transition restore projected (fails -> channel_focus_restore_failed).
+    const auto run = run_dbus_idr_owner_loop(3, 5000);
+    EXPECT_FALSE(run.watchdog_fired) << run.output;
+    EXPECT_TRUE(run.was_quiet);
+    EXPECT_TRUE(run.registered);
+    EXPECT_TRUE(run.projection_started);
+    EXPECT_TRUE(run.idr_reply_ok);
+    EXPECT_EQ(run.code, 1) << run.output;
+    EXPECT_TRUE(run.closed);
+    EXPECT_LT(run.elapsed, std::chrono::milliseconds{3000}) << run.output;
+    EXPECT_EQ(run.native_sends, 1);
+    EXPECT_EQ(run.focus_sends, 3);
+    EXPECT_NE(run.output.find("\"event\":\"idr_transition_failed\""), std::string::npos) << run.output;
+    EXPECT_NE(run.output.find("\"step\":\"restore_focus\""), std::string::npos) << run.output;
+    EXPECT_NE(run.output.find("\"error\":\"channel_focus_restore_failed\""), std::string::npos) << run.output;
+    EXPECT_NE(run.output.find("\"to_state\":\"failed\""), std::string::npos) << run.output;
+    EXPECT_NE(run.output.find("\"error_code\":406"), std::string::npos) << run.output;
+    EXPECT_EQ(run.output.find("\"to_state\":\"reconnecting\""), std::string::npos) << run.output;
+}
+
+TEST(WiredReceiver, DbusIdrFirstSendFailureKeepsSessionActiveWithoutTeardown) {
+    // Focus send #1 = AvSinkSetup(projected), #2 = transition native (fails).
+    // First-send failure must keep the session alive until normal duration shutdown.
+    const auto run = run_dbus_idr_owner_loop(2, 700);
+    EXPECT_FALSE(run.watchdog_fired) << run.output;
+    EXPECT_TRUE(run.was_quiet);
+    EXPECT_TRUE(run.registered);
+    EXPECT_TRUE(run.projection_started);
+    EXPECT_TRUE(run.idr_reply_ok);
+    EXPECT_EQ(run.code, 0) << run.output;
+    EXPECT_EQ(run.native_sends, 0);
+    EXPECT_EQ(run.focus_sends, 2);
+    EXPECT_EQ(run.output.find("\"event\":\"idr_transition_failed\""), std::string::npos) << run.output;
+    EXPECT_EQ(run.output.find("\"to_state\":\"failed\""), std::string::npos) << run.output;
+    EXPECT_EQ(run.output.find("channel_focus_restore_failed"), std::string::npos) << run.output;
+}
+

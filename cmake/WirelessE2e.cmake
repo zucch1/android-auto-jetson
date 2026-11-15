@@ -27,8 +27,9 @@ if(NOT CMAKE_CROSSCOMPILING)
         "${CMAKE_SOURCE_DIR}/tests/transport/tls_run.py" "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:aa_wireless_attested_test>")
     set_tests_properties(wireless_e2e_attested PROPERTIES TIMEOUT 60)
     add_executable(aa_wireless_control_io_test tests/wireless_e2e/control_io_test.cpp tests/wireless_e2e/control_active_test.cpp tests/trust/syscall_faults.cpp)
-    target_link_options(aa_wireless_control_io_test PRIVATE -Wl,--wrap=fsync -Wl,--wrap=renameat)
-    target_link_libraries(aa_wireless_control_io_test PRIVATE aa_wireless GTest::gtest_main)
+    target_link_options(aa_wireless_control_io_test PRIVATE -Wl,--wrap=fsync -Wl,--wrap=renameat
+        -Wl,--wrap=_ZN2aa9transport14encode_messageERKNS0_7MessageENS0_10EncryptionEPNS0_13PayloadCipherE)
+    target_link_libraries(aa_wireless_control_io_test PRIVATE aa_wireless aa_video GTest::gtest_main)
     target_compile_options(aa_wireless_control_io_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
     add_test(NAME wireless_e2e_control_io COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/transport/tls_run.py" "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:aa_wireless_control_io_test>")

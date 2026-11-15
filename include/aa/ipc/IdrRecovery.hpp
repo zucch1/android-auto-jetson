@@ -312,6 +312,20 @@ private:
            ",\"total_requests\":" + std::to_string(total_requests) + "}";
 }
 
+[[nodiscard]] inline std::string idr_transition_failed_json(std::string_view source,
+                                                            std::string_view step,
+                                                            std::string_view reason,
+                                                            std::uint64_t episode_requests,
+                                                            std::uint64_t total_requests,
+                                                            std::string_view error) {
+    return std::string{"{\"event\":\"idr_transition_failed\",\"source\":\""} + std::string{source} +
+           "\",\"step\":\"" + std::string{step} +
+           "\",\"reason\":\"" + std::string{reason} +
+           "\",\"error\":\"" + std::string{error} +
+           "\",\"episode_requests\":" + std::to_string(episode_requests) +
+           ",\"total_requests\":" + std::to_string(total_requests) + "}";
+}
+
 // Producer `latency_ms` tracks wait -> IPC socket send (`SendStatus::sent`);
 // consumer `latency_ms` tracks wait -> decoder exit of `awaiting_idr`.
 [[nodiscard]] inline std::string idr_recovered_json(std::string_view source,

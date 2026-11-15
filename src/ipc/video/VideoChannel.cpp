@@ -56,6 +56,9 @@ core::Result<SocketBufferResult> configure_socket_buffer(
     if (::getsockopt(fd, SOL_SOCKET, option, &actual, &length) != 0 || actual < 0) {
         result.getsockopt_errno = (actual < 0) ? EINVAL : errno;
     } else {
+        // Record the authoritative raw kernel getsockopt() option value alongside
+        // its normalized half on Linux; when setsockopt() fails, getsockopt() still
+        // returns the prior option value and short_grant() ignores granted_bytes.
         result.granted_raw_bytes = static_cast<std::uint32_t>(actual);
         result.granted_bytes = result.granted_raw_bytes / 2U;
     }

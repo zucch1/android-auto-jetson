@@ -100,7 +100,14 @@ core::Result<void> AvSink::request_video_idr(bool focus_transition) {
         !to_native) {
         return to_native.error();
     }
-    return send(protocol::encode(protocol::VideoFocusNotification{prior_focus, true}));
+    if (auto restore = send(protocol::encode(protocol::VideoFocusNotification{prior_focus, true}));
+        !restore) {
+        // The phone may have already received native focus while restore failed;
+        // do not claim projected focus or allow replay — escalate as terminal.
+        focus_ = protocol::VideoFocusMode::native;
+        return Error{ErrorCode::channel_focus_restore_failed};
+    }
+    return {};
 }
 
 core::Result<void> AvSink::setup(std::span<const std::byte> payload) {

@@ -80,6 +80,10 @@ void WirelessLink::checkpoint(HandoffEligibilityCoordinator& coordinator, const 
 core::Result<bool> WirelessLink::poll(HandoffEligibilityCoordinator& coordinator, std::function<void()> work) {
     coordinator_ = &coordinator;
     checkpoint(coordinator, work);
+    if (session_ && session_->failure()) {
+        const auto error = *session_->failure();
+        stop(); coordinator.retire(); return error;
+    }
     if (!session_) {
         if (!listener_ || !coordinator.admitting()) return false;
         // The checkpoint can retire admission, but cannot destroy the listener
@@ -109,8 +113,9 @@ core::Result<bool> WirelessLink::poll(HandoffEligibilityCoordinator& coordinator
     }
     auto result = session_->poll_transport();
     session_->tick();
-    if (!result || session_->token().stop_requested() || !coordinator.valid_session()) {
-        const auto error = result ? Error{ErrorCode::cancelled} : result.error();
+    if (!result || session_->failure() || session_->token().stop_requested() || !coordinator.valid_session()) {
+        const auto error = session_->failure() ? *session_->failure()
+                           : (result ? Error{ErrorCode::cancelled} : result.error());
         stop(); coordinator.retire(); return error;
     }
     if (session_->authenticated() && session_->channel_opens() && session_->state() == session::State::negotiating) {

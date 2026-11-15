@@ -230,6 +230,37 @@ class WiredSession final {
 
   private:
     class InputForwarder;
+    struct PollIoScope {
+        WiredSession &session;
+        PollIoScope(WiredSession &owner, core::Deadline::Clock::time_point deadline,
+                    const core::CancellationToken &token) noexcept
+            : session(owner) {
+            session.active_poll_deadline_ = deadline;
+            session.active_poll_token_ = token;
+        }
+        ~PollIoScope() {
+            session.active_poll_deadline_.reset();
+            session.active_poll_token_.reset();
+        }
+    };
+    struct PollIoRestore {
+        WiredSession &session;
+        transport::Transport *original;
+        std::optional<core::Deadline::Clock::time_point> deadline;
+        std::optional<core::CancellationToken> token;
+        explicit PollIoRestore(WiredSession &owner) noexcept
+            : session(owner), original(owner.transport_), deadline(owner.active_poll_deadline_),
+              token(owner.active_poll_token_) {}
+        ~PollIoRestore() {
+            if (session.transport_ == original && original != nullptr &&
+                deadline.has_value() && token.has_value()) {
+                original->set_io_deadline(*deadline);
+                (void)original->open(*token);
+            }
+        }
+    };
+    [[nodiscard]] core::Result<void> open_io(core::Deadline::Clock::time_point deadline,
+                                             const core::CancellationToken &token);
     [[nodiscard]] core::Result<void> send_frame(std::span<const std::byte> frame);
     [[nodiscard]] Error io_error(Error reason, const core::Deadline &deadline);
     [[nodiscard]] core::Result<bool>
@@ -278,6 +309,8 @@ class WiredSession final {
     std::unique_ptr<InputForwarder> input_forwarder_{};
     std::optional<input::InputService> input_service_{};
     transport::Transport *transport_{nullptr};
+    std::optional<core::Deadline::Clock::time_point> active_poll_deadline_{};
+    std::optional<core::CancellationToken> active_poll_token_{};
     std::unique_ptr<transport::HandshakingCipher> cipher_{};
     AuthPhase auth_phase_{AuthPhase::awaiting_version};
     bool ssl_active_{false};

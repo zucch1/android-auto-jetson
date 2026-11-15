@@ -41,8 +41,15 @@ inline constexpr std::uint32_t kMaxSocketBufferBytes = 4U * 1024U * 1024U;
 
 struct SocketBufferResult final {
     std::uint32_t requested_bytes{};
-    std::uint32_t granted_raw_bytes{}; // getsockopt() kernel doubled accounting value (2 * clamped)
-    std::uint32_t granted_bytes{};     // effective byte budget (granted_raw_bytes / 2 on Linux)
+    // Authoritative raw `getsockopt()` kernel option value (Linux typically
+    // returns `2 * clamped`, subject to `SOCK_MIN_SNDBUF`/`SOCK_MIN_RCVBUF`
+    // floors and `net.core.wmem_max`/`rmem_max` ceilings).
+    std::uint32_t granted_raw_bytes{};
+    // Normalized Linux option value (`granted_raw_bytes / 2`) for comparison
+    // with `requested_bytes`; only reflects the applied grant when
+    // `setsockopt_errno == 0 && getsockopt_errno == 0` (`granted_raw_bytes` and
+    // the errno fields remain authoritative, not a guaranteed capacity).
+    std::uint32_t granted_bytes{};
     int setsockopt_errno{0};
     int getsockopt_errno{0};
 

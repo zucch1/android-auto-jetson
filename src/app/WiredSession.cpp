@@ -116,8 +116,8 @@ core::Result<void> WiredSession::send_frame(std::span<const std::byte> frame) {
         return io_error(checked.error(), deadline);
     }
     core::DeadlineCancellation bounded{deadline};
-    transport_->set_io_deadline(deadline.until);
-    if (auto opened = transport_->open(bounded.token()); !opened) {
+    const PollIoRestore restore_poll_io(*this);
+    if (auto opened = open_io(deadline.until, bounded.token()); !opened) {
         return io_error(opened.error(), deadline);
     }
     if (auto sent = transport_->send(frame); !sent) {
@@ -329,8 +329,8 @@ core::Result<bool> WiredSession::poll_transport_impl(
         return io_error(checked.error(), deadline);
     }
     core::DeadlineCancellation bounded{deadline};
-    transport_->set_io_deadline(deadline.until);
-    if (auto opened = transport_->open(bounded.token()); !opened) {
+    const PollIoScope poll_io_scope(*this, deadline.until, bounded.token());
+    if (auto opened = open_io(deadline.until, bounded.token()); !opened) {
         return io_error(opened.error(), deadline);
     }
     for (const auto& [role, sink] : av_sinks_) { (void)role; sink->observe_receive(true); }
@@ -969,7 +969,19 @@ core::Result<void> WiredSession::request_video_idr(bool focus_transition) {
         return Error{ErrorCode::session_illegal_transition};
     }
     const auto video = av_sinks_.find(protocol::ChannelRole::video);
-    return video->second->request_video_idr(focus_transition);
+    const auto result = video->second->request_video_idr(focus_transition);
+    if (!result && result.error().code() == ErrorCode::channel_focus_restore_failed) {
+        // Phone may be stranded in native focus; tear the session down rather than
+        // continuing with dead projection.
+        (void)fail(result.error());
+    }
+    return result;
+}
+
+core::Result<void> WiredSession::open_io(core::Deadline::Clock::time_point deadline,
+                                         const core::CancellationToken &token) {
+    transport_->set_io_deadline(deadline);
+    return transport_->open(token);
 }
 
 } // namespace aa::app

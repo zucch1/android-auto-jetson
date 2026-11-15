@@ -1983,6 +1983,51 @@ int receiver_main(int argc, char **argv) {
         return false;
     };
 
+    aa::ipc::VideoSelectionWatchdog selection_watchdog{};
+    bool in_video_recovery = false;
+    bool in_receive_poll = false;
+    auto service_video_recovery = [&]() -> bool {
+        if (in_video_recovery) {
+            return true;
+        }
+        in_video_recovery = true;
+        struct Guard {
+            bool &active;
+            ~Guard() { active = false; }
+        } guard{in_video_recovery};
+        if (bus && !video_outlet.idr_dispatching() &&
+            bus->service().consume_idr_recovery_request()) {
+            const auto idr = video_outlet.request_idr_external("consumer_ipc");
+            if (!idr) {
+                log_line(poll_error_json(idr.error().code(), session, audio_sink));
+                if (idr.error().code() == aa::ErrorCode::channel_focus_restore_failed) {
+                    if (!session.failure()) {
+                        (void)session.fail(idr.error());
+                    }
+                    session_failed.store(true);
+                    g_running.store(false);
+                    return false;
+                }
+            }
+        }
+        const bool session_ready =
+            session.state() == aa::session::State::active && session.authenticated();
+        const bool has_selection = session.selected_video_profile().has_value();
+        if (selection_watchdog.check(session_ready, has_selection,
+                                     std::chrono::steady_clock::now())) {
+            log_line(aa::ipc::video_selection_timeout_json(
+                aa::ipc::kVideoSelectionWarningTimeout, video_profiles.size()));
+        }
+        return true;
+    };
+
+    auto io_checkpoint = [&] {
+        control.checkpoint();
+        if (in_receive_poll && !session.failure() && g_running.load()) {
+            (void)service_video_recovery();
+        }
+    };
+
     auto reconnect = [&]() -> aa::core::Result<void> {
         if (service_control()) {
             return aa::Error{aa::ErrorCode::cancelled};
@@ -2009,7 +2054,7 @@ int receiver_main(int argc, char **argv) {
                 }
                 link.emplace(std::move(relink.value()));
                 control.bind_phone(link->phone);
-                link->transport->set_io_checkpoint([&] { control.checkpoint(); });
+                link->transport->set_io_checkpoint(io_checkpoint);
                 session.attach_transport(link->transport.get());
                 if (!bind_link_cipher(link->phone)) {
                     return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
@@ -2049,7 +2094,7 @@ int receiver_main(int argc, char **argv) {
     std::thread session_thread([&] {
         control.bind_owner();
         control.bind_phone(link->phone);
-        link->transport->set_io_checkpoint([&] { control.checkpoint(); });
+        link->transport->set_io_checkpoint(io_checkpoint);
         if (require_video_consumer) {
             while (!admitted.load() && g_running.load()) {
                 {
@@ -2101,20 +2146,6 @@ int receiver_main(int argc, char **argv) {
 #endif
             }
         }
-        aa::ipc::VideoSelectionWatchdog selection_watchdog{};
-        auto service_video_recovery = [&] {
-            if (bus && bus->service().consume_idr_recovery_request()) {
-                (void)video_outlet.request_idr_external("consumer_ipc");
-            }
-            const bool session_ready =
-                session.state() == aa::session::State::active && session.authenticated();
-            const bool has_selection = session.selected_video_profile().has_value();
-            if (selection_watchdog.check(session_ready, has_selection,
-                                         std::chrono::steady_clock::now())) {
-                log_line(aa::ipc::video_selection_timeout_json(
-                    aa::ipc::kVideoSelectionWarningTimeout, video_profiles.size()));
-            }
-        };
         while (g_running.load()) {
             aa::core::Result<void> audio_service{};
             {
@@ -2132,7 +2163,9 @@ int receiver_main(int argc, char **argv) {
                     g_running.store(false);
                     break;
                 }
-                service_video_recovery();
+                if (!service_video_recovery()) {
+                    break;
+                }
                 while (auto event = input_queue.pop()) {
                     const auto outcome = session.submit_input(*event);
                     if (service_control()) {
@@ -2145,11 +2178,18 @@ int receiver_main(int argc, char **argv) {
             if (!g_running.load()) {
                 break;
             }
+            in_receive_poll = true;
             auto polled = audio_service ? receive_with_audio(session, audio_sink)
                                         : aa::core::Result<bool>{audio_service.error()};
+            in_receive_poll = false;
             {
                 std::lock_guard lock(session_mutex);
                 if (service_control()) {
+                    break;
+                }
+                if (session.failure()) {
+                    session_failed.store(true);
+                    g_running.store(false);
                     break;
                 }
                 if (polled) {
@@ -2197,7 +2237,9 @@ int receiver_main(int argc, char **argv) {
                     log_line("{\"event\":\"active\",\"startup_ms\":" + std::to_string(elapsed) +
                              "}");
                 }
-                service_video_recovery();
+                if (!service_video_recovery()) {
+                    break;
+                }
             }
         }
         std::lock_guard lock(session_mutex);

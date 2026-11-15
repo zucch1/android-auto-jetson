@@ -5,6 +5,7 @@
 #include <aa/ipc/VideoChannel.hpp>
 #include <aa/protocol/Protocol.hpp>
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <functional>
@@ -112,18 +113,28 @@ public:
         idr_hooks_ = std::move(hooks);
     }
 
-    [[nodiscard]] bool request_idr_external(std::string_view reason) {
+    [[nodiscard]] bool idr_dispatching() const noexcept {
+        return idr_dispatching_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] ipc::IdrRecoveryCoordinator::RequestSnapshot idr_snapshot() const {
         std::lock_guard lock(mutex_);
-        if (!has_idr_request_hook_locked() || !projecting_locked()) {
+        return idr_coordinator_.snapshot();
+    }
+
+    [[nodiscard]] core::Result<bool> request_idr_external(std::string_view reason) {
+        std::unique_lock lock(mutex_);
+        if (idr_dispatching_.load(std::memory_order_acquire) ||
+            !has_idr_request_hook_locked() || !projecting_locked()) {
             return false;
         }
         const auto now = now_locked();
         idr_coordinator_.begin_wait(now);
-        return dispatch_idr_request_locked(now, reason);
+        return dispatch_idr_request_locked(lock, now, reason);
     }
 
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override {
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
         if (!producer_.has_value()) {
             ++dropped_before_consumer_;
             record_drop("no_consumer", frame_cadence(message.header.video_profile));
@@ -176,7 +187,9 @@ public:
         case ipc::SendStatus::dropped_backpressure:
             had_backpressure_ = true;
             record_drop("backpressure", frame_cadence(profile_));
-            maybe_request_idr_locked("backpressure");
+            if (auto idr = maybe_request_idr_locked(lock, "backpressure"); !idr) {
+                return idr.error();
+            }
             return {};
         case ipc::SendStatus::dropped_waiting_idr: {
             record_drop("waiting_idr", frame_cadence(profile_));
@@ -185,7 +198,9 @@ public:
                 (now_locked() - *producer_installed_at_) >= ipc::kIdrStartupGrace;
             if (had_backpressure_ || units_ > 0 || replaced_consumer_ ||
                 armed_late_consumer_ || past_startup_grace) {
-                maybe_request_idr_locked("waiting_idr");
+                if (auto idr = maybe_request_idr_locked(lock, "waiting_idr"); !idr) {
+                    return idr.error();
+                }
             }
             return {};
         }
@@ -328,35 +343,56 @@ private:
         }
     }
 
-    void maybe_request_idr_locked(std::string_view reason) {
-        if (!has_idr_request_hook_locked()) {
-            return;
+    [[nodiscard]] core::Result<void> maybe_request_idr_locked(
+        std::unique_lock<std::mutex>& lock, std::string_view reason) {
+        if (idr_dispatching_.load(std::memory_order_acquire) || !has_idr_request_hook_locked()) {
+            return {};
         }
         const auto now = now_locked();
         idr_coordinator_.begin_wait(now);
-        (void)dispatch_idr_request_locked(now, reason);
+        const auto dispatched = dispatch_idr_request_locked(lock, now, reason);
+        if (!dispatched && dispatched.error().code() == ErrorCode::channel_focus_restore_failed) {
+            return dispatched.error();
+        }
+        return {};
     }
 
-    [[nodiscard]] bool dispatch_idr_request_locked(std::chrono::steady_clock::time_point now,
-                                                   std::string_view reason) {
+    [[nodiscard]] core::Result<bool> dispatch_idr_request_locked(
+        std::unique_lock<std::mutex>& lock,
+        std::chrono::steady_clock::time_point now,
+        std::string_view reason) {
         const auto prev = idr_coordinator_.snapshot();
         const auto step = idr_coordinator_.try_request_step(now, projecting_locked());
         if (step == ipc::IdrRecoveryStep::none) {
             return false;
         }
         const bool use_transition = (step == ipc::IdrRecoveryStep::focus_transition);
-        const auto sent = idr_hooks_.request_idr_with_mode
-            ? idr_hooks_.request_idr_with_mode(use_transition)
-            : idr_hooks_.request_idr();
+        const auto hook_with_mode = idr_hooks_.request_idr_with_mode;
+        const auto hook = idr_hooks_.request_idr;
+        const auto ep_requests = idr_coordinator_.episode_requests();
+        const auto tot_requests = idr_coordinator_.total_requests();
+        idr_dispatching_.store(true, std::memory_order_release);
+        lock.unlock();
+        const auto sent = hook_with_mode ? hook_with_mode(use_transition) : hook();
+        lock.lock();
+        idr_dispatching_.store(false, std::memory_order_release);
         if (!sent) {
+            if (sent.error().code() == ErrorCode::channel_focus_restore_failed) {
+                // Phone may have received the preceding `native` focus notification;
+                // preserve cooldown, request counts, and escalated_ state so native
+                // is never replayed, and propagate the terminal failure.
+                log_(ipc::idr_transition_failed_json("producer", "restore_focus", reason,
+                                                     ep_requests, tot_requests,
+                                                     to_string(sent.error().code())));
+                return sent.error();
+            }
             idr_coordinator_.restore_snapshot(prev);
-            return false;
+            return sent.error();
         }
         log_(ipc::idr_requested_json("producer", reason));
         if (use_transition) {
             log_(ipc::idr_escalated_json("producer", ipc::idr_recovery_step_name(step), reason,
-                                         idr_coordinator_.episode_requests(),
-                                         idr_coordinator_.total_requests()));
+                                         ep_requests, tot_requests));
         }
         return true;
     }
@@ -365,7 +401,8 @@ private:
     MediaLog media_log_;
     IdrRecoveryHooks idr_hooks_{};
     ipc::IdrRecoveryCoordinator idr_coordinator_{};
-    std::mutex mutex_{};
+    mutable std::mutex mutex_{};
+    std::atomic<bool> idr_dispatching_{false};
     std::optional<ipc::VideoProducer> producer_{};
     std::optional<protocol::VideoProfile> profile_;
     std::optional<std::int32_t> session_;

@@ -50,8 +50,16 @@ struct Runtime final {
             report("session bus dispatch", step.error().code()); failed = true; stopping = true;
         }
         const auto state = bus.service().state();
-        if (bus.service().consume_idr_recovery_request()) {
-            (void)media.video.request_idr_external("consumer_ipc");
+        if (!media.video.idr_dispatching() && bus.service().consume_idr_recovery_request()) {
+            const auto idr = media.video.request_idr_external("consumer_ipc");
+            if (!idr) {
+                report("idr recovery", idr.error().code());
+                if (idr.error().code() == ErrorCode::channel_focus_restore_failed) {
+                    if (auto* live = receiver.session(); live && !live->failure()) {
+                        (void)live->fail(idr.error());
+                    }
+                }
+            }
         }
         auto* live_session = receiver.session();
         const bool session_ready = live_session &&
