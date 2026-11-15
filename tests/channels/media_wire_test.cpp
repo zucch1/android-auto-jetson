@@ -458,3 +458,128 @@ TEST(MediaWire, UnsafeScreenCannotBeAnnounced) {
     EXPECT_TRUE(proto::encode(proto::ServiceDiscoveryResponse{{descriptor}}));
 }
 } // namespace
+
+#include <aa/config/VideoProfiles.hpp>
+TEST(MediaWire, VideoProfileListIsStrictOrderedAndAtomic) {
+    auto p = aa::config::parse_video_profiles("2560x1440@60:h264,1920x1080@30:h265,800x480@60:h264");
+    ASSERT_TRUE(p);
+    EXPECT_EQ(p.value()[0], (proto::VideoProfile{2560,1440,60}));
+    EXPECT_EQ(p.value()[1].codec, proto::VideoCodec::h265);
+    for (auto bad : {"", "1920x1080@59:h264", "1920x1080@60:unknown", "1x1@30:h264", "1280x720@30:h264,", "1280x720@30:h264,1280x720@30:h264", "65536x720@30:h264"}) {
+        EXPECT_FALSE(aa::config::parse_video_profiles(bad)) << bad;
+    }
+    EXPECT_EQ(aa::config::default_video_profiles(), (std::vector<proto::VideoProfile>{{1280,720,30},{800,480,30}}));
+}
+TEST(MediaWire, ExtendedProfilesAnnounceExactOrderedEnumsAndScaledScreen) {
+    auto service = video();
+    auto& cfg = std::get<proto::VideoConfiguration>(service.configuration);
+    cfg.profiles = {{2560,1440,60}, {1920,1080,30,proto::VideoCodec::h265}, {800,480,60}};
+    cfg.screen.content_insets = aa::config::ScreenInsets{100,100,100,100};
+    const auto encoded = proto::encode(proto::ServiceDiscoveryResponse{{service}});
+    ASSERT_TRUE(encoded);
+    ctl::ServiceDiscoveryResponse wire;
+    ASSERT_TRUE(wire.ParseFromArray(encoded.value().data()+2, static_cast<int>(encoded.value().size()-2)));
+    const auto& media = wire.channels(0).media_sink_service();
+    ASSERT_EQ(media.video_configs_size(),3);
+    EXPECT_EQ(media.video_configs(0).codec_resolution(), sink::VIDEO_2560x1440);
+    EXPECT_EQ(media.video_configs(0).frame_rate(), sink::VIDEO_FPS_60);
+    EXPECT_EQ(media.video_configs(1).codec_resolution(), sink::VIDEO_1920x1080);
+    EXPECT_EQ(media.video_configs(1).video_codec_type(), shared::MEDIA_CODEC_VIDEO_H265);
+    auto decoded = proto::decode_service_discovery_response(encoded.value());
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded.value().services.front(),service);
+}
+
+TEST(MediaWire, ExtendedProfilesAreRejectedUnlessConfiguredAndAnnounced) {
+    aa::channels::ServiceRegistry registry;
+    Sink handler;
+    ASSERT_TRUE(registry.register_sink(proto::ChannelRole::video,handler));
+    const auto defaults = video();
+    auto configured = defaults;
+    std::get<proto::VideoConfiguration>(configured.configuration).profiles = {{1920,1080,60},{1280,720,30}};
+    const std::array requested{proto::VideoProfile{1920,1080,60}};
+    for (const bool enabled : {false,true}) {
+        auto service = enabled ? configured : defaults;
+        auto support = aa::channels::SupportConfiguration::create({service});
+        ASSERT_TRUE(support);
+        aa::channels::Negotiator negotiator{std::move(support.value()),registry};
+        auto announced = negotiator.start();
+        const auto encoded = proto::encode(announced);
+        ASSERT_TRUE(encoded);
+        auto decoded = proto::decode_service_discovery_response(encoded.value());
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded.value().services.front(),service);
+        ASSERT_TRUE(negotiator.open({1,service.id}));
+        auto selected = negotiator.select_video(service.id,requested);
+        EXPECT_EQ(selected.has_value(),enabled);
+        if (enabled) { EXPECT_EQ(selected.value(),requested.front()); }
+    }
+}
+
+TEST(MediaWire, SelectsMoreThanEightAnnouncedProfilesIncludingIndexAtOrAboveEight) {
+    aa::channels::ServiceRegistry registry;
+    Sink handler;
+    ASSERT_TRUE(registry.register_sink(proto::ChannelRole::video, handler));
+    std::vector<proto::VideoProfile> announced_profiles;
+    for (const auto r : proto::kVideoResolutions) {
+        for (const auto fps : {std::uint8_t{30}, std::uint8_t{60}}) {
+            for (const auto codec : proto::kVideoCodecs) {
+                announced_profiles.push_back({r.width, r.height, fps, codec});
+            }
+        }
+    }
+    ASSERT_EQ(announced_profiles.size(), proto::kMaxVideoProfiles);
+    auto service = video();
+    std::get<proto::VideoConfiguration>(service.configuration).profiles = announced_profiles;
+    auto support = aa::channels::SupportConfiguration::create({service});
+    ASSERT_TRUE(support);
+    aa::channels::Negotiator negotiator{std::move(support.value()), registry};
+    const auto discovery = negotiator.start();
+    const auto encoded = proto::encode(discovery);
+    ASSERT_TRUE(encoded);
+    const auto decoded = proto::decode_service_discovery_response(encoded.value());
+    ASSERT_TRUE(decoded);
+    ASSERT_EQ(std::get<proto::VideoConfiguration>(decoded.value().services.front().configuration).profiles.size(),
+              proto::kMaxVideoProfiles);
+    ASSERT_TRUE(negotiator.open({1, service.id}));
+
+    // Offering all 72 profiles succeeds, and offering > 72 is rejected.
+    const auto all_selected = negotiator.select_video(service.id, announced_profiles);
+    ASSERT_TRUE(all_selected);
+    EXPECT_EQ(all_selected.value(), announced_profiles.front());
+    auto over_limit = announced_profiles;
+    over_limit.push_back(announced_profiles.front());
+    const auto rejected_video = negotiator.select_video(service.id, over_limit);
+    ASSERT_FALSE(rejected_video);
+    EXPECT_EQ(rejected_video.error().code(), aa::ErrorCode::protocol_malformed_message);
+
+    // Offering 12 profiles where only announced index 10 (>= 8) matches succeeds.
+    std::vector<proto::VideoProfile> late_offer;
+    for (std::size_t i = 0; i < 11; ++i) {
+        late_offer.push_back(announced_profiles[i]);
+    }
+    late_offer.erase(late_offer.begin(), late_offer.begin() + 10);
+    // Pad offer to > 8 distinct valid profiles using reversed high-index profiles.
+    for (std::size_t i = 60; i < 72; ++i) {
+        late_offer.push_back(announced_profiles[i]);
+    }
+    // Note: index 10 comes earlier in configured preference than 60..71, so index 10 wins.
+    const auto chosen_late = negotiator.select_video(service.id, late_offer);
+    ASSERT_TRUE(chosen_late);
+    EXPECT_EQ(chosen_late.value(), announced_profiles[10]);
+
+    // Audio selection still caps offered profiles at kMaxMediaProfiles (8).
+    Sink audio_handler;
+    ASSERT_TRUE(registry.register_sink(proto::ChannelRole::media_audio, audio_handler));
+    auto audio_support = aa::channels::SupportConfiguration::create(
+        {audio(proto::ChannelRole::media_audio, 21)});
+    ASSERT_TRUE(audio_support);
+    aa::channels::Negotiator audio_negotiator{std::move(audio_support.value()), registry};
+    ASSERT_EQ(audio_negotiator.start().services.size(), 1u);
+    ASSERT_TRUE(audio_negotiator.open({1, proto::ServiceKey{21}}));
+    const std::vector<proto::AudioProfile> too_many_audio(
+        proto::kMaxMediaProfiles + 1, proto::AudioProfile{48000, 16, 2});
+    const auto rejected_audio = audio_negotiator.select_audio(proto::ServiceKey{21}, too_many_audio);
+    ASSERT_FALSE(rejected_audio);
+    EXPECT_EQ(rejected_audio.error().code(), aa::ErrorCode::protocol_malformed_message);
+}

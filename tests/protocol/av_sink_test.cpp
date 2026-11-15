@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 
 namespace {
@@ -178,3 +179,25 @@ TEST(AvSink, DataTimestampIsUnsignedBigEndianAndBodyIsBorrowed) {
     EXPECT_FALSE(p::decode_av_sink_data(payload));
 }
 } // namespace
+
+TEST(AvSink, ReadyAnnouncesAllExplicitIndicesInOrder) {
+    std::array<std::uint32_t,3> indices{0,2,5};
+    auto encoded = p::encode_av_sink_ready(indices);
+    ASSERT_TRUE(encoded);
+    aap_protobuf::service::media::shared::message::Config wire;
+    read_reply(wire, encoded.value(), 0x8003);
+    ASSERT_EQ(wire.configuration_indices_size(),3);
+    EXPECT_EQ(wire.configuration_indices(0),0);
+    EXPECT_EQ(wire.configuration_indices(1),2);
+    EXPECT_EQ(wire.configuration_indices(2),5);
+}
+
+TEST(AvSink, ExplicitCodecPolicyEnablesHevcWithoutChangingLegacyDecodePolicy) {
+    const auto payload = p::encode(p::AvSinkSetup{p::AvSinkCodec::h265});
+    ASSERT_TRUE(payload);
+    EXPECT_FALSE(p::decode_av_sink_setup(payload.value()));
+    constexpr p::AvSinkCodec supported[] = {p::AvSinkCodec::h264,p::AvSinkCodec::h265};
+    const auto parsed = p::decode_av_sink_setup_for_codecs(payload.value(),supported);
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ(parsed.value().codec,p::AvSinkCodec::h265);
+}

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/ipc/VideoChannel.hpp>
+#include <aa/protocol/Messages.hpp>
 #include <aa/ipc/VideoSocket.hpp>
 
 #include "VideoReassembler.hpp"
@@ -596,6 +597,9 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
     if (!impl_ || impl_->closed) {
         return closed_error();
     }
+    if (request.profile && !protocol::valid_video_profile(*request.profile)) {
+        return Error{ErrorCode::channel_caps_unsupported};
+    }
     if (request.payload.empty()) {
         return Error{ErrorCode::invalid_argument};
     }
@@ -618,7 +622,7 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
         VideoFrameHeader header{request.frame, impl_->sequence++, request.timestamp_ns,
                                 index,          count,
                                 static_cast<std::uint32_t>(request.payload.size()),
-                                static_cast<std::uint32_t>(length), request.idr};
+                                static_cast<std::uint32_t>(length), request.idr, request.profile};
         encode_frame_header(std::span<std::uint8_t>{impl_->packet.data(), kFrameHeaderBytes},
                             header);
         std::memcpy(impl_->packet.data() + kFrameHeaderBytes,

@@ -200,6 +200,7 @@ struct ServiceDescriptor final {
 };
 
 inline constexpr std::size_t kMaxMediaProfiles = 8;
+inline constexpr std::size_t kMaxVideoProfiles = 72;
 inline constexpr std::size_t kMaxButtonKeycodes = 64;
 [[nodiscard]] core::Result<void> validate_service(const ServiceDescriptor &service);
 [[nodiscard]] bool valid_video_profile(VideoProfile profile) noexcept;

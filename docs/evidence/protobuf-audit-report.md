@@ -63,11 +63,11 @@ Every difference across all classes (including `non-wire`) is individually triag
 
 - **Total differences**: **1015** (triaged: **1015**, untriaged: **0**)
 - **Wire-affecting**: **238** (`class == wire-affecting`)
-- **Used by receiver**: **192** (direct field/enum usage, strict-policy unknown-tag/enum rejection, or active entity)
-- **Wire-affecting AND used by receiver**: **59**
+- **Used by receiver**: **193** (direct field/enum usage, strict-policy unknown-tag/enum rejection, or active entity)
+- **Wire-affecting AND used by receiver**: **60**
 - **Dispositions**: `follow-up-issue-needed` 203, `needs-phone-evidence` 56, `no-action` 756
 - **Statuses**: `resolved` 756, `confirmed` 10, `deferred` 193, `proposed` 56
-- **Severities**: `high` 26, `medium-high` 33, `medium` 200, `low-medium` 185, `low` 571
+- **Severities**: `high` 26, `medium-high` 34, `medium` 199, `low-medium` 185, `low` 571
 - **Owners**: `child-1-control-sdp` 23, `child-2-av-media-focus` 31, `child-3-display-ui-theming` 26, `child-4-input-nav-sensors` 69, `child-5-wireless-bt-radio` 110, `triage:phase0-closed` 756
 
 > **Severity derivation rule**: Derived deterministically from wire_affecting x used_by_receiver x classification: (1) wire_affecting=True & used_by_receiver=True -> 'high' for field-number-or-type-conflict / field-added-one-side / enum-value-difference, 'medium-high' for enum-value-conflict or others; (2) wire_affecting=True & used_by_receiver=False -> 'medium'; (3) wire_affecting=False & used_by_receiver=True -> 'medium' for field-number-or-type-conflict / optionality-difference / undecided-match, 'low-medium' for field-name-difference / message-missing-one-side / enum-missing-one-side, 'low' for naming-only / metadata-or-syntax; (4) wire_affecting=False & used_by_receiver=False -> 'low-medium' for field-number-or-type-conflict / optionality-difference / undecided-match, 'low' otherwise.
@@ -75,7 +75,7 @@ Every difference across all classes (including `non-wire`) is individually triag
 | Derived classification | Count | Wire-affecting | Used by receiver | Wire & used |
 |---|---:|---:|---:|---:|
 | `enum-missing-one-side` | 65 | 0 | 1 | 0 |
-| `enum-value-conflict` | 112 | 112 | 33 | 33 |
+| `enum-value-conflict` | 112 | 112 | 34 | 34 |
 | `enum-value-difference` | 80 | 80 | 10 | 10 |
 | `field-added-one-side` | 34 | 34 | 12 | 12 |
 | `field-name-difference` | 170 | 0 | 71 | 0 |
@@ -114,7 +114,7 @@ Derived mechanically from `.proto` paths/packages, receiver C++ sources (`src/pr
 | Channel | Diffs | naming | fld-name | fld-add | fld-num/type | opt | enum-val | enum-conf | msg-miss | enum-miss | meta/syn | undec | Wire-aff | Used | Wire&Used | no-action | follow-up | phone-ev | OAA-ret |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | `control` | 257 | 57 | 41 | 12 | 10 | 18 | 25 | 8 | 58 | 12 | 16 | 0 | 52 | 52 | 11 | 231 | 17 | 9 | 50 |
-| `av-video` | 47 | 4 | 10 | 2 | 2 | 0 | 5 | 2 | 16 | 6 | 0 | 0 | 10 | 22 | 7 | 33 | 11 | 3 | 3 |
+| `av-video` | 47 | 4 | 10 | 2 | 2 | 0 | 5 | 2 | 16 | 6 | 0 | 0 | 10 | 23 | 8 | 33 | 11 | 3 | 3 |
 | `av-audio` | 12 | 1 | 3 | 0 | 0 | 0 | 1 | 3 | 2 | 2 | 0 | 0 | 4 | 8 | 4 | 8 | 0 | 4 | 0 |
 | `av-mic` | 9 | 0 | 6 | 1 | 0 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 9 | 1 | 7 | 0 | 2 | 0 |
 | `av-shared` | 48 | 5 | 7 | 4 | 1 | 1 | 12 | 13 | 4 | 1 | 0 | 0 | 29 | 26 | 16 | 21 | 14 | 13 | 0 |
@@ -163,7 +163,7 @@ Channel-level metadata below is aggregated strictly from per-entity `annotations
 
 ## Wire-affecting differences used by receiver
 
-All **59** differences where `wire_affecting == true` AND `used_by_receiver == true` (including strict `kStrictExtensionPolicy` unknown-tag/enum rejections and compile-time/runtime usages):
+All **60** differences where `wire_affecting == true` AND `used_by_receiver == true` (including strict `kStrictExtensionPolicy` unknown-tag/enum rejections and compile-time/runtime usages):
 
 | ID | Channel | Severity | Classification | Usage mode | AASDK ↔ OAA | Key | Receiver citations | Disposition | Status | Owner | Phone evidence |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -182,6 +182,7 @@ All **59** differences where `wire_affecting == true` AND `used_by_receiver == t
 | `W-463ef8374642` | `av-video` | `high` | `field-number-or-type-conflict` | `direct-field` | `service.media.sink.message.VideoConfiguration` ↔ `data.VideoConfig` | `field 11` | `MediaConfiguration.cpp` | `follow-up-issue-needed` | `deferred` | `child-3-display-ui-theming` | unknown, needs phone evidence |
 | `W-4801587e1e2b` | `av-video` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.sink.message.VideoFrameRateType` ↔ `enums.VideoFPS.Enum` | `value 0` | `MediaConfiguration.cpp` | `needs-phone-evidence` | `proposed` | `child-2-av-media-focus` | unknown, needs phone evidence |
 | `W-50287e37691c` | `av-video` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.message.VideoFrameRateType` ↔ `enums.VideoFPS.Enum` | `value 2` | `MediaConfiguration.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
+| `W-644c7f4b389b` | `av-video` | `medium-high` | `enum-value-conflict` | `direct-enum-value` | `service.media.sink.message.VideoFrameRateType` ↔ `enums.VideoFPS.Enum` | `value 1` | `MediaConfiguration.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
 | `W-949db16a2268` | `av-video` | `high` | `enum-value-difference` | `strict-unknown-enum-reject` | `service.media.sink.message.VideoCodecResolutionType` ↔ `enums.VideoResolution.Enum` | `value 0` | `MediaConfiguration.cpp` | `needs-phone-evidence` | `proposed` | `child-2-av-media-focus` | unknown, needs phone evidence |
 | `W-9576eeab98f5` | `av-video` | `high` | `field-added-one-side` | `direct-field` | `service.media.video.message.VideoFocusNotification` ↔ `messages.VideoFocusNotification` | `field 2` | `AvSinkAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |
 | `W-b23ba1b03817` | `av-video` | `high` | `field-added-one-side` | `strict-tag-checked` | `service.media.video.message.VideoFocusRequestNotification` ↔ `messages.VideoFocusRequest` | `field 1` | `AvSinkAdapter.cpp` | `no-action` | `resolved` | `triage:phase0-closed` | not-needed |

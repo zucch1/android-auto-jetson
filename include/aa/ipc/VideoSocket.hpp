@@ -3,6 +3,8 @@
 
 #include <aa/core/Result.hpp>
 #include <aa/core/Time.hpp>
+#include <aa/protocol/Protocol.hpp>
+#include <optional>
 
 #include <array>
 #include <cstddef>
@@ -55,6 +57,7 @@ struct VideoFrameHeader final {
     std::uint32_t frame_bytes{};   // full access-unit size
     std::uint32_t payload_bytes{}; // bytes in this fragment
     bool idr{};                    // access unit is an IDR
+    std::optional<protocol::VideoProfile> profile{};
 };
 
 // Peer credential gate: only the registered consumer (UID check via
@@ -101,6 +104,7 @@ struct VideoAccessUnit final {
     std::uint64_t timestamp_ns{};
     bool idr{};
     std::vector<std::uint8_t> payload{};
+    std::optional<protocol::VideoProfile> profile{};
 
     [[nodiscard]] friend bool operator==(const VideoAccessUnit&,
                                          const VideoAccessUnit&) noexcept = default;
@@ -112,6 +116,7 @@ struct VideoSendRequest final {
     std::uint64_t timestamp_ns{};
     bool idr{};
     std::span<const std::uint8_t> payload{};
+    std::optional<protocol::VideoProfile> profile{};
 };
 
 // Pure wire codec (no sockets). Every decode failure is a typed error; no

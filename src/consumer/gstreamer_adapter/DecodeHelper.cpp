@@ -59,6 +59,42 @@ constexpr KnownDecoder kKnownDecoders[] = {
 
 constexpr const char* kNvmmConversionElement = "nvvidconv";
 
+const char* codec_caps(protocol::VideoCodec codec) {
+    switch (codec) {
+    case protocol::VideoCodec::h264: return "video/x-h264";
+    case protocol::VideoCodec::h265: return "video/x-h265";
+    case protocol::VideoCodec::vp9: return "video/x-vp9";
+    case protocol::VideoCodec::av1: return "video/x-av1";
+    }
+    return "video/unknown";
+}
+const char* codec_parser(protocol::VideoCodec codec) {
+    switch (codec) {
+    case protocol::VideoCodec::h264: return "h264parse";
+    case protocol::VideoCodec::h265: return "h265parse";
+    case protocol::VideoCodec::vp9: return "vp9parse";
+    case protocol::VideoCodec::av1: return "av1parse";
+    }
+    return "unknownparse";
+}
+bool accepts_codec(const char* element, protocol::VideoCodec codec) {
+    auto* factory = gst_element_factory_find(element);
+    if (!factory) { return false; }
+    auto* desired = gst_caps_from_string(codec_caps(codec));
+    bool accepts = false;
+    for (auto* item = gst_element_factory_get_static_pad_templates(factory); item; item = item->next) {
+        auto* pad = static_cast<GstStaticPadTemplate*>(item->data);
+        if (pad->direction != GST_PAD_SINK) { continue; }
+        auto* caps = gst_static_pad_template_get_caps(pad);
+        accepts = accepts || gst_caps_can_intersect(caps, desired);
+        gst_caps_unref(caps);
+    }
+    gst_caps_unref(desired);
+    gst_object_unref(factory);
+    return accepts;
+}
+
+
 [[nodiscard]] BackendCandidate probe_candidate(const KnownDecoder& known) {
     BackendCandidate candidate;
     candidate.element = known.element;
@@ -288,18 +324,37 @@ DecodeHelper::DecodeHelper(DecodeHelper&& other) noexcept = default;
 
 DecodeHelper& DecodeHelper::operator=(DecodeHelper&& other) noexcept = default;
 
-DecodeReport DecodeHelper::probe_backends() {
+DecodeReport DecodeHelper::probe_backends(protocol::VideoCodec codec) {
     ensure_gstreamer_initialized();
     DecodeReport report;
+    report.codec = codec;
+    for (const auto* name : {"appsrc", codec_parser(codec), "videoconvert", "appsink"}) {
+        auto* factory = gst_element_factory_find(name);
+        if (factory) { gst_object_unref(factory); }
+        else {
+            report.software_path_available = false;
+            report.software_path_cause += std::string{name} + " absent; ";
+        }
+    }
 
     const BackendCandidate conversion =
         probe_candidate(KnownDecoder{kNvmmConversionElement, false, false});
     report.nvmm_conversion_available = conversion.available && conversion.viable;
     report.nvmm_conversion_cause = conversion.cause;
 
-    report.backends.reserve(std::size(kKnownDecoders));
-    for (const auto& known : kKnownDecoders) {
-        BackendCandidate candidate = probe_candidate(known);
+    std::vector<KnownDecoder> known;
+    switch (codec) {
+    case protocol::VideoCodec::h264: known.assign(std::begin(kKnownDecoders),std::end(kKnownDecoders)); break;
+    case protocol::VideoCodec::h265: known = {{"nvv4l2decoder",true,true},{"avdec_h265",false,false}}; break;
+    case protocol::VideoCodec::vp9: known = {{"nvv4l2decoder",true,true},{"vp9dec",false,false},{"avdec_vp9",false,false}}; break;
+    case protocol::VideoCodec::av1: known = {{"nvv4l2decoder",true,true},{"dav1ddec",false,false},{"av1dec",false,false}}; break;
+    }
+    for (const auto& entry : known) {
+        BackendCandidate candidate = probe_candidate(entry);
+        if (candidate.available && !accepts_codec(entry.element,codec)) {
+            candidate.viable = false;
+            candidate.cause = "installed element sink caps do not accept " + std::string{protocol::codec_name(codec)};
+        }
         apply_output_path_policy(candidate, report.nvmm_conversion_available);
         report.backends.push_back(std::move(candidate));
     }
@@ -314,7 +369,7 @@ core::Result<void> DecodeHelper::Impl::build_pipeline(const std::string& decoder
                                                       bool needs_nvmm_conversion) {
     GstElement* pipeline = gst_pipeline_new("aa_consumer_decode");
     GstElement* source = gst_element_factory_make("appsrc", "src");
-    GstElement* parser = gst_element_factory_make("h264parse", "parser");
+    GstElement* parser = gst_element_factory_make(codec_parser(caps.codec), "parser");
     GstElement* decoder = gst_element_factory_make(decoder_element.c_str(), "decoder");
     GstElement* nvmm_convert =
         needs_nvmm_conversion ? gst_element_factory_make(kNvmmConversionElement, "nvmm_convert")
@@ -349,14 +404,15 @@ core::Result<void> DecodeHelper::Impl::build_pipeline(const std::string& decoder
         return core::Result<void>{Error{ErrorCode::channel_decode_failed}};
     }
 
-    GstCaps* src_caps = gst_caps_new_simple("video/x-h264",
-                                            "stream-format", G_TYPE_STRING, "byte-stream",
-                                            "alignment", G_TYPE_STRING, "au",
+    GstCaps* src_caps = gst_caps_new_simple(codec_caps(caps.codec),
                                             "width", G_TYPE_INT, static_cast<int>(caps.width),
                                             "height", G_TYPE_INT, static_cast<int>(caps.height),
                                             "framerate", GST_TYPE_FRACTION,
                                             static_cast<int>(caps.fps), 1,
                                             nullptr);
+    if (caps.codec == protocol::VideoCodec::h264 || caps.codec == protocol::VideoCodec::h265) {
+        gst_caps_set_simple(src_caps, "stream-format", G_TYPE_STRING, "byte-stream", "alignment", G_TYPE_STRING, "au", nullptr);
+    }
     g_object_set(source,
                  "caps", src_caps,
                  "format", GST_FORMAT_TIME,
@@ -416,13 +472,11 @@ core::Result<DecodeHelper> DecodeHelper::open(DecodeConfig config) {
 #endif
     ensure_gstreamer_initialized();
 
-    // Caps negotiation against the channel budget profile: anything outside
-    // 1280x720@30 / 800x480@30 fails typed before any pipeline is built.
     if (!protocol::valid_video_profile(config.caps)) {
-        return core::Result<DecodeHelper>{Error{ErrorCode::channel_caps_unsupported}};
+        return Error{ErrorCode::channel_caps_unsupported};
     }
-
-    DecodeReport report = probe_backends();
+    DecodeReport report = probe_backends(config.caps.codec);
+    if (!report.software_path_available) { return Error{ErrorCode::channel_decode_unavailable}; }
     report.requested = config.backend;
 
     BackendSelection selection = select_backend(report, config.backend);
@@ -664,6 +718,7 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         DecodedFrame frame;
         frame.width = static_cast<std::uint16_t>(width);
         frame.height = static_cast<std::uint16_t>(height);
+        frame.fps = impl_->caps.fps;
         const std::size_t plane_width = width;
         const std::size_t plane_height = height;
         const std::size_t chroma_width = plane_width / 2;

@@ -69,6 +69,7 @@ struct DisplayController::Impl final {
     DecodeSessionFactory decode_sessions;
     FrameTarget& frames;
     DisplayConfig config{};
+    protocol::VideoProfile active_caps{};
     DisplayState state{DisplayState::unavailable};
     core::ConsumerId consumer{};
     std::uint64_t frames_presented{0};
@@ -208,6 +209,7 @@ core::Result<void> DisplayController::start_projection(const ipc::VideoSocketPat
     consumer::DecodeConfig decode_config{};
     decode_config.on_completion = impl_->config.on_decode_completion;
     decode_config.caps = impl_->config.caps;
+    impl_->active_caps = decode_config.caps;
     decode_config.backend = consumer::DecodeBackend::automatic;
     Impl* impl = impl_.get();
     decode_config.on_frame = [impl](const consumer::DecodedFrame& frame) {
@@ -301,7 +303,20 @@ core::Result<std::size_t> DisplayController::pump(Milliseconds wait) {
         if (status.value() != ipc::ReceiveStatus::complete) {
             continue;
         }
-        const auto submitted = impl_->session->submit(impl_->video->access_unit());
+        const auto& unit = impl_->video->access_unit();
+        if (unit.profile && *unit.profile != impl_->active_caps) {
+            if (!unit.idr) { return Error{ErrorCode::channel_caps_unsupported}; }
+            consumer::DecodeConfig config{};
+            config.caps = *unit.profile;
+            config.on_completion = impl_->config.on_decode_completion;
+            config.on_frame = [impl = impl_.get()](const consumer::DecodedFrame& frame) { impl->on_decoded(frame); };
+            auto opened = impl_->decode_sessions(config);
+            if (!opened) { return opened.error(); }
+            impl_->session->close();
+            impl_->session = std::move(opened.value());
+            impl_->active_caps = *unit.profile;
+        }
+        const auto submitted = impl_->session->submit(unit);
         if (!submitted.has_value()) {
             if (submitted.error().code() != ErrorCode::ipc_queue_full) {
                 return submitted.error();

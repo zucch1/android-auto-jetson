@@ -49,6 +49,7 @@ public:
                               QWidget* parent = nullptr);
 
     void on_frame(const consumer::DecodedFrame& frame) override;
+    void set_input_viewport(std::uint16_t width, std::uint16_t height) { input_width_ = width; input_height_ = height; }
 
     void set_status(DisplayState state);
     [[nodiscard]] QString status_text() const;
@@ -128,6 +129,8 @@ private:
     std::uint16_t width_{};
     std::uint16_t height_{};
     std::uint8_t fps_cap_{};
+    // Input coordinate space stays the viewport registered with the receiver.
+    std::uint16_t input_width_{}, input_height_{};
 };
 
 } // namespace aa::display::qt_adapter

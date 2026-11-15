@@ -199,6 +199,27 @@ def case_replay(args):
         assert result.returncode == 0, (backend, result)
         events = [json.loads(line) for line in result.stdout.splitlines()]
         assert any(event.get("event") == "ready" for event in events), (backend, events)
+    # The new options admit capabilities at startup; the legacy flag above
+    # intentionally defers decoder admission until projection starts.
+    for option, value, expected, forbidden in (("--decoder", "hardware", None, None),
+                                               ("--presentation", "gpu", "not available on this host", "zerocopy"),
+                                               ("--presentation", "zerocopy", "config_invalid: zerocopy requires --decoder hardware", "nvv4l2decoder"),
+                                               ("--media-thread", "worker", "not yet implemented", None)):
+        result = subprocess.run([args.display, option, value, "--check-pipeline"],
+                                capture_output=True, text=True, timeout=15)
+        assert result.returncode == 2, (option, value, result)
+        if expected:
+            assert expected in result.stderr, result
+        else:
+            assert ("channel_decode_unavailable" in result.stderr and "nvv4l2decoder" in result.stderr
+                    or "channel_unsupported_capability" in result.stderr and "not yet implemented" in result.stderr), result
+        if forbidden:
+            assert forbidden not in result.stderr, result
+    automatic = subprocess.run([args.display,"--decoder","auto","--check-pipeline"],capture_output=True,text=True,timeout=15)
+    assert automatic.returncode == 0, automatic
+    capabilities = subprocess.run([args.display,"--list-video-capabilities"],capture_output=True,text=True,timeout=15)
+    assert capabilities.returncode == 0, capabilities
+    assert {json.loads(line)["codec"] for line in capabilities.stdout.splitlines()} == {"h264","h265","vp9","av1"}
     for values in (["unknown"], [""], [], ["--help"]):
         result = subprocess.run(
             [args.display, "--decoder-backend", *values],
@@ -566,7 +587,14 @@ def case_diagnostics(args: argparse.Namespace) -> None:
             os.mkdir(plugins)
             env.update(GST_PLUGIN_SYSTEM_PATH_1_0=plugins, GST_PLUGIN_PATH_1_0=plugins,
                        GST_REGISTRY_1_0=os.path.join(runtime, "registry.bin"))
-        display = start_display(args, video, input_sock, False, env)
+            early = subprocess.run([args.display, "--decoder", "software", "--check-pipeline"],
+                                   capture_output=True, text=True, env=env, timeout=15)
+            assert early.returncode == 2 and "channel_decode_unavailable" in early.stderr, early
+            assert "h264parse" in early.stderr, early
+        # Exercise the original lazy factory seam even though new options
+        # now refuse missing plugins before attachment.
+        display = start_display(args, video, input_sock, False, env,
+                                decoder_backend="software" if args.case == "diagnostics-factory" else None)
         children.callback(display.stop)
         if args.case == "diagnostics-bootstrap":
             # Given no receiver, no request can invoke the helper factory.

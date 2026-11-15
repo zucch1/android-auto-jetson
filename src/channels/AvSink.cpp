@@ -63,6 +63,8 @@ core::Result<void> AvSink::complete_av_delivery(AvDeliveryId id, core::Result<vo
 
 void AvSink::reset() noexcept {
     ready_ = false;
+    announced_.clear();
+    selected_profile_.reset();
     session_.reset();
     peer_timestamp_.reset();
     codec_cache_.clear();
@@ -77,14 +79,16 @@ bool AvSink::input_focus_allowed() const noexcept {
 }
 
 core::Result<void> AvSink::setup(std::span<const std::byte> payload) {
-    const auto request = protocol::decode_av_sink_setup(payload);
+    constexpr protocol::AvSinkCodec codecs[] = {protocol::AvSinkCodec::pcm, protocol::AvSinkCodec::h264, protocol::AvSinkCodec::h265, protocol::AvSinkCodec::vp9, protocol::AvSinkCodec::av1};
+    const auto request = protocol::decode_av_sink_setup_for_codecs(payload, codecs);
     if (!request) { return request.error(); }
     if (auto valid = protocol::validate_service(service_); !valid) { return valid.error(); }
     const bool video = service_.role == protocol::ChannelRole::video;
     if (video) {
         const auto* configuration = std::get_if<protocol::VideoConfiguration>(&service_.configuration);
         if (!configuration || configuration->profiles.empty()
-            || request.value().codec != protocol::AvSinkCodec::h264) { return malformed(); }
+            || std::none_of(configuration->profiles.begin(), configuration->profiles.end(),
+                [&](const auto& p) { return static_cast<unsigned>(p.codec) == static_cast<unsigned>(request.value().codec); })) { return malformed(); }
     } else {
         switch (service_.role) {
         case protocol::ChannelRole::media_audio:
@@ -98,7 +102,13 @@ core::Result<void> AvSink::setup(std::span<const std::byte> payload) {
             || request.value().codec != protocol::AvSinkCodec::pcm) { return malformed(); }
     }
     reset();
-    const auto result = send(protocol::encode_av_sink_ready());
+    if (video) {
+        const auto& profiles = std::get<protocol::VideoConfiguration>(service_.configuration).profiles;
+        for (std::uint32_t i = 0; i < profiles.size(); ++i) {
+            if (static_cast<unsigned>(profiles[i].codec) == static_cast<unsigned>(request.value().codec)) { announced_.push_back(i); }
+        }
+    } else { announced_.push_back(0); }
+    const auto result = send(protocol::encode_av_sink_ready(announced_));
     observe(AvCreditEvent::ready, result ? std::nullopt : std::optional{result.error().code()}, 1);
     if (!result) { return result.error(); }
     if (video) {
@@ -113,7 +123,12 @@ core::Result<void> AvSink::setup(std::span<const std::byte> payload) {
 core::Result<void> AvSink::start(std::span<const std::byte> payload) {
     const auto request = protocol::decode_av_sink_start(payload);
     if (!request) { return request.error(); }
-    if (!ready_ || request.value().configuration_index != 0) { return malformed(); }
+    if (!ready_ || std::find(announced_.begin(), announced_.end(), request.value().configuration_index) == announced_.end()) { return malformed(); }
+    if (service_.role == protocol::ChannelRole::video) {
+        const auto profile = std::get<protocol::VideoConfiguration>(service_.configuration).profiles[request.value().configuration_index];
+        if (session_ == request.value().session_id && selected_profile_ != profile) { return malformed(); }
+        selected_profile_ = profile;
+    }
     if (session_ == request.value().session_id) { return {}; }
     if (session_) {
         codec_cache_.clear();
@@ -174,6 +189,10 @@ core::Result<void> AvSink::data(const protocol::MessageView& message) {
     const bool present = !video || focus_ == protocol::VideoFocusMode::projected
         || focus_ == protocol::VideoFocusMode::projected_no_input_focus;
     if (present) {
+        auto header = message.header;
+        header.video_profile = selected_profile_;
+        header.video_session = session_;
+        header.video_generation = generation_;
         auto media = body;
         if (!combined.empty()) {
             const auto cached_size = combined.size();
@@ -191,7 +210,7 @@ core::Result<void> AvSink::data(const protocol::MessageView& message) {
             pending_ = id;
             current_observation_.delivery.sequence = id.sequence;
             pending_observation_ = current_observation_;
-            if (auto submitted = deferred_->submit({message.header, media}, id); !submitted) {
+            if (auto submitted = deferred_->submit({header, media}, id); !submitted) {
                 if (submitted.error().code() == ErrorCode::ipc_queue_full && deferred_->rejection) {
                     last_queue_rejection_ = deferred_->rejection();
                 }
@@ -200,7 +219,7 @@ core::Result<void> AvSink::data(const protocol::MessageView& message) {
             }
             return {};
         }
-        if (auto delivered = raw_->on_message({message.header, media}); !delivered) { return delivered.error(); }
+        if (auto delivered = raw_->on_message({header, media}); !delivered) { return delivered.error(); }
     }
     return send_ack(*session_, AckFor::data);
 }

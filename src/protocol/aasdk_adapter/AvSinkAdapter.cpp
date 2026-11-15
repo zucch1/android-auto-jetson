@@ -3,6 +3,7 @@
 #include "UnknownFields.hpp"
 
 #include <aa/protocol/AvSink.hpp>
+#include <algorithm>
 #include <aa/transport/Frames.hpp>
 
 #include <aap_protobuf/service/media/shared/message/Setup.pb.h>
@@ -31,6 +32,7 @@ static_assert(ids::MEDIA_MESSAGE_CODEC_CONFIG == 0x0001);
 static_assert(shared::Config::STATUS_READY == 2);
 static_assert(static_cast<int>(AvSinkCodec::pcm) == shared::MEDIA_CODEC_AUDIO_PCM);
 static_assert(static_cast<int>(AvSinkCodec::h264) == shared::MEDIA_CODEC_VIDEO_H264_BP);
+static_assert(static_cast<int>(AvSinkCodec::h265) == shared::MEDIA_CODEC_VIDEO_H265);
 static_assert(static_cast<int>(VideoFocusMode::projected) == video::VIDEO_FOCUS_PROJECTED);
 static_assert(static_cast<int>(VideoFocusMode::native) == video::VIDEO_FOCUS_NATIVE);
 static_assert(static_cast<int>(VideoFocusMode::native_transient) == video::VIDEO_FOCUS_NATIVE_TRANSIENT);
@@ -70,14 +72,24 @@ core::Result<std::span<const std::byte>> media_body(std::span<const std::byte> p
 } // namespace
 
 core::Result<AvSinkSetup> decode_av_sink_setup(std::span<const std::byte> payload) {
+    constexpr AvSinkCodec legacy[] = {AvSinkCodec::pcm, AvSinkCodec::h264};
+    return decode_av_sink_setup_for_codecs(payload, legacy);
+}
+
+core::Result<AvSinkSetup> decode_av_sink_setup_for_codecs(std::span<const std::byte> payload,
+                                                       std::span<const AvSinkCodec> supported) {
     shared::Setup wire;
     constexpr int tags[] = {1};
     if (auto parsed = parse(wire, payload, ids::MEDIA_MESSAGE_SETUP, tags); !parsed) {
         return parsed.error();
     }
+    if (std::find(supported.begin(), supported.end(), static_cast<AvSinkCodec>(wire.type())) == supported.end()) { return aasdk_adapter::malformed(); }
     switch (wire.type()) {
     case shared::MEDIA_CODEC_AUDIO_PCM: return AvSinkSetup{AvSinkCodec::pcm};
     case shared::MEDIA_CODEC_VIDEO_H264_BP: return AvSinkSetup{AvSinkCodec::h264};
+    case shared::MEDIA_CODEC_VIDEO_H265: return AvSinkSetup{AvSinkCodec::h265};
+    case shared::MEDIA_CODEC_VIDEO_VP9: return AvSinkSetup{AvSinkCodec::vp9};
+    case shared::MEDIA_CODEC_VIDEO_AV1: return AvSinkSetup{AvSinkCodec::av1};
     default: return aasdk_adapter::malformed();
     }
 }
@@ -131,6 +143,9 @@ core::Result<std::vector<std::byte>> encode(const AvSinkSetup& setup) {
     switch (setup.codec) {
     case AvSinkCodec::pcm: wire.set_type(shared::MEDIA_CODEC_AUDIO_PCM); break;
     case AvSinkCodec::h264: wire.set_type(shared::MEDIA_CODEC_VIDEO_H264_BP); break;
+    case AvSinkCodec::h265: wire.set_type(shared::MEDIA_CODEC_VIDEO_H265); break;
+    case AvSinkCodec::vp9: wire.set_type(shared::MEDIA_CODEC_VIDEO_VP9); break;
+    case AvSinkCodec::av1: wire.set_type(shared::MEDIA_CODEC_VIDEO_AV1); break;
     default: return aasdk_adapter::malformed();
     }
     return aasdk_adapter::framed_id(ids::MEDIA_MESSAGE_SETUP, wire);
@@ -166,11 +181,12 @@ core::Result<std::vector<std::byte>> encode(const VideoFocusNotification& notifi
     return aasdk_adapter::framed_id(ids::MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION, wire);
 }
 
-core::Result<std::vector<std::byte>> encode_av_sink_ready() {
+core::Result<std::vector<std::byte>> encode_av_sink_ready(std::span<const std::uint32_t> indices) {
     shared::Config wire;
     wire.set_status(shared::Config::STATUS_READY);
     wire.set_max_unacked(1);
-    wire.add_configuration_indices(0);
+    if (indices.empty()) { wire.add_configuration_indices(0); }
+    else { for (auto index : indices) { wire.add_configuration_indices(index); } }
     return aasdk_adapter::framed_id(ids::MEDIA_MESSAGE_CONFIG, wire);
 }
 

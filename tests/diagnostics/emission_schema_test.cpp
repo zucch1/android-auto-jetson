@@ -179,4 +179,24 @@ TEST(DiagnosticsEmissionSchema, ScrubsKnownShapesWithoutClaimingOpaqueSecretDete
     EXPECT_EQ(out.find("hunter2-secret"), std::string::npos);
     EXPECT_EQ(diag::scrub_text("8F3A22B19C0D77EE"), "8F3A22B19C0D77EE");
 }
+
+TEST(DiagnosticsEmissionSchema, AllowsAllNegotiatedVideoCodecsWithoutRedaction) {
+    CaptureLogSink capture;
+    diag::SafeLogSink safe{capture};
+    for (const char* codec : {"h264", "h265", "vp9", "av1"}) {
+        SCOPED_TRACE(codec);
+        diag::Event event{};
+        event.kind = diag::EventKind::capability_negotiated;
+        event.fields.push_back(diag::EventField::text("codec", codec));
+        const std::string json = diag::to_json(event);
+        EXPECT_EQ(json.find("[redacted]"), std::string::npos) << json;
+        EXPECT_NE(json.find(std::string{"\"codec\":\""} + codec + "\""), std::string::npos) << json;
+
+        safe.write({aa::core::LogLevel::info, "capability_negotiated", {{"codec", codec}}});
+        EXPECT_EQ(capture.message, "capability_negotiated");
+        ASSERT_EQ(capture.fields.size(), std::size_t{1});
+        EXPECT_EQ(capture.fields[0].key, "codec");
+        EXPECT_EQ(capture.fields[0].value, codec);
+    }
+}
 } // namespace

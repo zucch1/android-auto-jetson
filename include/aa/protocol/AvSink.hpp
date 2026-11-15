@@ -11,7 +11,7 @@
 
 namespace aa::protocol {
 
-enum class AvSinkCodec : std::uint8_t { pcm = 1, h264 = 3 };
+enum class AvSinkCodec : std::uint8_t { pcm = 1, h264 = 3, vp9 = 5, av1 = 6, h265 = 7 };
 struct AvSinkSetup final { AvSinkCodec codec{AvSinkCodec::pcm}; };
 struct AvSinkStart final {
     std::int32_t session_id{};
@@ -37,6 +37,9 @@ struct AvSinkData final {
 };
 
 [[nodiscard]] core::Result<AvSinkSetup> decode_av_sink_setup(std::span<const std::byte>);
+// Explicit codec policy for configured channels; legacy decoding stays PCM/H.264.
+[[nodiscard]] core::Result<AvSinkSetup> decode_av_sink_setup_for_codecs(
+    std::span<const std::byte>, std::span<const AvSinkCodec>);
 [[nodiscard]] core::Result<AvSinkStart> decode_av_sink_start(std::span<const std::byte>);
 [[nodiscard]] core::Result<AvSinkStop> decode_av_sink_stop(std::span<const std::byte>);
 [[nodiscard]] core::Result<VideoFocusRequest> decode_video_focus_request(std::span<const std::byte>);
@@ -47,8 +50,8 @@ struct AvSinkData final {
 [[nodiscard]] core::Result<std::vector<std::byte>> encode(const AvSinkStop&);
 [[nodiscard]] core::Result<std::vector<std::byte>> encode(const VideoFocusRequest&);
 [[nodiscard]] core::Result<std::vector<std::byte>> encode(const VideoFocusNotification&);
-// The sole supported READY configuration is index 0 with one credit.
-[[nodiscard]] core::Result<std::vector<std::byte>> encode_av_sink_ready();
+// READY carries explicit channel indices and one credit; the legacy default is index 0.
+[[nodiscard]] core::Result<std::vector<std::byte>> encode_av_sink_ready(std::span<const std::uint32_t> indices = {});
 [[nodiscard]] core::Result<std::vector<std::byte>> encode_av_sink_ack(std::int32_t session_id);
 
 } // namespace aa::protocol

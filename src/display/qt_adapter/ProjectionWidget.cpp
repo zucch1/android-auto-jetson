@@ -139,7 +139,8 @@ std::optional<double> FpsMeter::reading(std::int64_t now_ns) const noexcept {
 void FpsMeter::reset() noexcept { *this = FpsMeter{}; }
 
 ProjectionWidget::ProjectionWidget(InputSink& input, protocol::VideoProfile caps, QWidget* parent)
-    : QWidget(parent), input_(input), width_(caps.width), height_(caps.height), fps_cap_(caps.fps) {
+    : QWidget(parent), input_(input), width_(caps.width), height_(caps.height), fps_cap_(caps.fps),
+      input_width_(caps.width), input_height_(caps.height) {
     resize(static_cast<int>(caps.width), static_cast<int>(caps.height));
     setMinimumSize(std::max(1, static_cast<int>(caps.width) / 4),
                    std::max(1, static_cast<int>(caps.height) / 4));
@@ -157,9 +158,9 @@ void ProjectionWidget::expire_stale_fps() {
 }
 
 void ProjectionWidget::on_frame(const consumer::DecodedFrame& frame) {
-    if (frame.width != width_ || frame.height != height_) {
-        return;
-    }
+    width_ = frame.width;
+    height_ = frame.height;
+    fps_cap_ = frame.fps;
     pending_ = frame.i420;
     pending_frame_ = frame.frame;
     pending_timestamp_ns_ = frame.timestamp_ns;
@@ -495,17 +496,17 @@ void ProjectionWidget::deliver_key(QKeyEvent* event, bool pressed) {
 
 void ProjectionWidget::deliver_touch(QMouseEvent* event, TouchAction action) {
     const QRect area = video_rect();
-    if (area.isEmpty() || width_ == 0 || height_ == 0) {
+    if (area.isEmpty() || input_width_ == 0 || input_height_ == 0) {
         return;
     }
     const QPointF local = event->position() - QPointF(area.topLeft());
-    const QPointF position(local.x() * static_cast<double>(width_) / static_cast<double>(area.width()),
-                           local.y() * static_cast<double>(height_) /
+    const QPointF position(local.x() * static_cast<double>(input_width_) / static_cast<double>(area.width()),
+                           local.y() * static_cast<double>(input_height_) /
                                static_cast<double>(area.height()));
     const auto x = static_cast<std::uint32_t>(
-        std::clamp(static_cast<int>(position.x()), 0, static_cast<int>(width_) - 1));
+        std::clamp(static_cast<int>(position.x()), 0, static_cast<int>(input_width_) - 1));
     const auto y = static_cast<std::uint32_t>(
-        std::clamp(static_cast<int>(position.y()), 0, static_cast<int>(height_) - 1));
+        std::clamp(static_cast<int>(position.y()), 0, static_cast<int>(input_height_) - 1));
     touch_x_ = x;
     touch_y_ = y;
     input_.on_input(TouchEvent{x, y, action});
