@@ -84,11 +84,23 @@ bool AvSink::video_projecting() const noexcept {
             || focus_ == protocol::VideoFocusMode::projected_no_input_focus);
 }
 
-core::Result<void> AvSink::request_video_idr() {
+core::Result<void> AvSink::request_video_idr(bool focus_transition) {
     if (!video_projecting()) {
         return Error{ErrorCode::session_illegal_transition};
     }
-    return send(protocol::encode(protocol::VideoFocusNotification{focus_, true}));
+    if (!focus_transition) {
+        return send(protocol::encode(protocol::VideoFocusNotification{focus_, true}));
+    }
+    // Workaround for phones/encoders that ignore a repeated projected focus
+    // notification: perform an ordered native -> prior projected focus
+    // transition (see aa-proxy/aa-proxy-rs commit 2af9270, issue #142).
+    const auto prior_focus = focus_;
+    if (auto to_native = send(protocol::encode(
+            protocol::VideoFocusNotification{protocol::VideoFocusMode::native, true}));
+        !to_native) {
+        return to_native.error();
+    }
+    return send(protocol::encode(protocol::VideoFocusNotification{prior_focus, true}));
 }
 
 core::Result<void> AvSink::setup(std::span<const std::byte> payload) {

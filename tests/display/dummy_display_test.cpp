@@ -15,6 +15,7 @@
 #include <aa/display/TelemetryWriter.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/Contract.hpp>
+#include <aa/ipc/IdrRecovery.hpp>
 #include <aa/ipc/InputChannel.hpp>
 #include <aa/ipc/InputSocket.hpp>
 #include <aa/ipc/VideoTelemetry.hpp>
@@ -3134,7 +3135,52 @@ TEST(DummyDisplayBackpressure, ConsumerAwaitingIdrTriggersRateLimitedDbusRecover
     fixture.decoder.report.awaiting_idr = false;
     ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
     EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
-                        "{\"event\":\"idr_recovered\",\"source\":\"consumer\",\"latency_ms\":400,\"requests\":2}"),
+                        "{\"event\":\"idr_recovered\",\"source\":\"consumer\",\"latency_ms\":400,\"episode_requests\":2,\"total_requests\":2}"),
+              diagnostics.end());
+
+    // Episode 2 starts only 50 ms after the last request (+250 ms): 250 ms cooldown holds across episodes.
+    now += std::chrono::milliseconds{50};
+    fixture.decoder.report.awaiting_idr = true;
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+
+    // At +250 ms from episode 1's last request (+50 + 50 ms here), episode 2 sends its first request.
+    now += std::chrono::milliseconds{50};
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_TRUE(fixture.service->service->service().consume_idr_recovery_request());
+
+    now += std::chrono::milliseconds{100};
+    fixture.decoder.report.awaiting_idr = false;
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
+                        "{\"event\":\"idr_recovered\",\"source\":\"consumer\",\"latency_ms\":150,\"episode_requests\":1,\"total_requests\":3}"),
+              diagnostics.end());
+
+    if (fixture.live_producer.has_value()) {
+        fixture.live_producer->close();
+    }
+    ASSERT_TRUE(fixture.finish_feeding());
+}
+
+TEST(DummyDisplayBackpressure, ConsumerRequestsIdrWhenWaitingPastStartupGraceBeforeFirstUnit) {
+    std::vector<std::string> diagnostics;
+    auto now = std::chrono::steady_clock::time_point{std::chrono::seconds{30}};
+    BackpressureFixture fixture;
+    ASSERT_TRUE(fixture.attach(
+        "ConsumerStartupGrace", {},
+        [&diagnostics](const std::string& line) { diagnostics.push_back(line); },
+        [&now] { return now; }));
+
+    // Phone sent no IDR to this consumer yet (e.g., initial IDR arrived before attach).
+    ASSERT_TRUE(fixture.start({}, /*keep_open=*/true));
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+
+    now += aa::ipc::kIdrStartupGrace;
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_TRUE(fixture.service->service->service().consume_idr_recovery_request());
+    EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
+                        "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"video_consumer_waiting_idr\"}"),
               diagnostics.end());
 
     if (fixture.live_producer.has_value()) {

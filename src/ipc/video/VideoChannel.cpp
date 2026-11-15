@@ -46,15 +46,20 @@ core::Result<SocketBufferResult> configure_socket_buffer(
     int fd, int option, const protocol::VideoProfile& profile) noexcept {
     const auto requested = recommended_socket_buffer_bytes(profile);
     const int value = static_cast<int>(requested);
+    SocketBufferResult result{};
+    result.requested_bytes = requested;
     if (::setsockopt(fd, SOL_SOCKET, option, &value, sizeof(value)) != 0) {
-        return io_error();
+        result.setsockopt_errno = errno;
     }
     int actual = 0;
     socklen_t length = sizeof(actual);
     if (::getsockopt(fd, SOL_SOCKET, option, &actual, &length) != 0 || actual < 0) {
-        return io_error();
+        result.getsockopt_errno = (actual < 0) ? EINVAL : errno;
+    } else {
+        result.granted_raw_bytes = static_cast<std::uint32_t>(actual);
+        result.granted_bytes = result.granted_raw_bytes / 2U;
     }
-    return SocketBufferResult{requested, static_cast<std::uint32_t>(actual)};
+    return result;
 }
 
 core::Result<PeerCredentials> read_peer(int fd) noexcept {

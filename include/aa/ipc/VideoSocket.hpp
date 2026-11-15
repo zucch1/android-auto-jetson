@@ -41,7 +41,17 @@ inline constexpr std::uint32_t kMaxSocketBufferBytes = 4U * 1024U * 1024U;
 
 struct SocketBufferResult final {
     std::uint32_t requested_bytes{};
-    std::uint32_t granted_bytes{};
+    std::uint32_t granted_raw_bytes{}; // getsockopt() kernel doubled accounting value (2 * clamped)
+    std::uint32_t granted_bytes{};     // effective byte budget (granted_raw_bytes / 2 on Linux)
+    int setsockopt_errno{0};
+    int getsockopt_errno{0};
+
+    [[nodiscard]] constexpr bool short_grant() const noexcept {
+        return setsockopt_errno == 0 && getsockopt_errno == 0 && granted_bytes < requested_bytes;
+    }
+    [[nodiscard]] constexpr bool has_warning() const noexcept {
+        return setsockopt_errno != 0 || getsockopt_errno != 0 || short_grant();
+    }
 
     [[nodiscard]] friend constexpr bool operator==(const SocketBufferResult&,
                                                    const SocketBufferResult&) noexcept = default;

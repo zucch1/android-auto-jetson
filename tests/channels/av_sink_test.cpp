@@ -689,3 +689,66 @@ TEST_F(AvSinkWire, RequestVideoIdrResendsProjectedVideoFocusNotificationOnlyWhen
     ASSERT_TRUE(v.request_video_idr());
     EXPECT_EQ(sent.size(), count_after_native + 2u);
 }
+
+TEST_F(AvSinkWire, RequestVideoIdrTransitionTogglesNativeThenRestoresExactPriorFocus) {
+    aa::channels::AvSink v{video(), raw, send};
+    auto call = [&](const Bytes& b) { return v.on_message({{p::ChannelRole::video, 0, {}}, b}); };
+
+    ASSERT_TRUE(call(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    ASSERT_TRUE(call(p::encode(p::AvSinkStart{1, 0}).value()));
+    ASSERT_TRUE(v.video_projecting());
+    ASSERT_TRUE(v.input_focus_allowed());
+
+    // Nudge sends only the unchanged focus mode.
+    const auto before_nudge = sent.size();
+    ASSERT_TRUE(v.request_video_idr(false));
+    ASSERT_EQ(sent.size(), before_nudge + 1u);
+    EXPECT_EQ(sent.back(), p::encode(p::VideoFocusNotification{p::VideoFocusMode::projected, true}).value());
+
+    // Transition sends native followed by projected in order.
+    const auto before_transition = sent.size();
+    ASSERT_TRUE(v.request_video_idr(true));
+    ASSERT_EQ(sent.size(), before_transition + 2u);
+    EXPECT_EQ(sent[before_transition],
+              p::encode(p::VideoFocusNotification{p::VideoFocusMode::native, true}).value());
+    EXPECT_EQ(sent[before_transition + 1],
+              p::encode(p::VideoFocusNotification{p::VideoFocusMode::projected, true}).value());
+    EXPECT_TRUE(v.video_projecting());
+    EXPECT_TRUE(v.input_focus_allowed());
+
+    // Preserve projected_no_input_focus across transition too.
+    ASSERT_TRUE(call(p::encode(p::VideoFocusRequest{p::VideoFocusMode::projected_no_input_focus}).value()));
+    ASSERT_TRUE(v.video_projecting());
+    EXPECT_FALSE(v.input_focus_allowed());
+    const auto before_no_input = sent.size();
+    ASSERT_TRUE(v.request_video_idr(true));
+    ASSERT_EQ(sent.size(), before_no_input + 2u);
+    EXPECT_EQ(sent[before_no_input],
+              p::encode(p::VideoFocusNotification{p::VideoFocusMode::native, true}).value());
+    EXPECT_EQ(sent[before_no_input + 1],
+              p::encode(p::VideoFocusNotification{p::VideoFocusMode::projected_no_input_focus, true}).value());
+    EXPECT_TRUE(v.video_projecting());
+    EXPECT_FALSE(v.input_focus_allowed());
+
+    // Send failure on first transition frame aborts without sending second.
+    bool fail_next = false;
+    aa::channels::AvSink failing_v{video(), raw, [&](Bytes payload) -> aa::core::Result<void> {
+        if (fail_next) {
+            fail_next = false;
+            return aa::Error{aa::ErrorCode::transport_io};
+        }
+        sent.push_back(std::move(payload));
+        return {};
+    }};
+    auto call_failing = [&](const Bytes& b) {
+        return failing_v.on_message({{p::ChannelRole::video, 0, {}}, b});
+    };
+    ASSERT_TRUE(call_failing(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    ASSERT_TRUE(call_failing(p::encode(p::AvSinkStart{1, 0}).value()));
+    const auto before_fail = sent.size();
+    fail_next = true;
+    const auto failed = failing_v.request_video_idr(true);
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(failed.error().code(), aa::ErrorCode::transport_io);
+    EXPECT_EQ(sent.size(), before_fail);
+}

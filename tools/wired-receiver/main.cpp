@@ -1663,6 +1663,7 @@ const char *const kUsage =
     "  decoder-additional-depth, theme (0|1|2), width-margin, height-margin,\n"
     "  {margins,content-insets,stable-content-insets}-{top,bottom,left,right}.\n"
     "  --decoder software|hardware|auto; --list-video-capabilities\n"
+    "  --idr-recovery auto|nudge|transition  IDR recovery strategy (default auto)\n"
     "  --video-profiles WxH@FPS:CODEC,... (default 1280x720@30:h264,800x480@30:h264)\n"
     "  --exact-video-profiles offer only --video-profiles without appending the\n"
     "  1280x720@30:h264 fallback profile.\n"
@@ -1676,6 +1677,7 @@ int receiver_main(int argc, char **argv) {
     auto video_profiles = aa::config::default_video_profiles();
     bool exact_video_profiles = false;
     auto video_decoder = aa::consumer::DecodeBackend::software;
+    auto idr_strategy = aa::ipc::IdrRecoveryStrategy::auto_escalate;
     aa::config::Screen screen;
     bool experimental_geometry = false;
     std::string port;
@@ -1703,6 +1705,11 @@ int receiver_main(int argc, char **argv) {
             aa::tools::list_video_capabilities(); return 0;
         } else if (std::strcmp(argv[index], "--decoder") == 0 && index + 1 < argc) {
             if (!aa::tools::parse_decoder(argv[++index],video_decoder)) { std::fputs("invalid --decoder\n",stderr); return 2; }
+        } else if (std::strcmp(argv[index], "--idr-recovery") == 0 && index + 1 < argc) {
+            if (!aa::ipc::parse_idr_recovery_strategy(argv[++index], idr_strategy)) {
+                std::fputs("invalid --idr-recovery\n", stderr);
+                return 2;
+            }
         } else if (std::strcmp(argv[index], "--video-profiles") == 0 && index + 1 < argc) {
             if (!aa::config::parse_video_profiles_option(argv[++index], video_profiles)) {
                 std::fputs("invalid --video-profiles\n", stderr);
@@ -1862,6 +1869,8 @@ int receiver_main(int argc, char **argv) {
         [&session] { return session.video_projecting(); },
         [&session] { return session.request_video_idr(); },
         {},
+        [&session](bool focus_transition) { return session.request_video_idr(focus_transition); },
+        idr_strategy,
     });
     aa::channels::InputSink input_sink;
     aa::channels::SensorSink sensor_sink{input, [&session](std::vector<std::byte> payload) {

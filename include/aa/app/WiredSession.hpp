@@ -191,7 +191,7 @@ class WiredSession final {
 
     [[nodiscard]] bool video_projecting() const noexcept;
     [[nodiscard]] std::optional<protocol::VideoProfile> selected_video_profile() const noexcept;
-    [[nodiscard]] core::Result<void> request_video_idr();
+    [[nodiscard]] core::Result<void> request_video_idr(bool focus_transition = false);
 
     // Observed counters (diagnostics/tests). The negotiation counters
     // (channel_opens, version_responses, pings_answered, encapsulated_ssls,

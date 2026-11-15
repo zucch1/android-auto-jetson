@@ -55,7 +55,7 @@ public:
     [[nodiscard]] std::optional<protocol::VideoProfile> selected_profile() const noexcept {
         return selected_profile_;
     }
-    [[nodiscard]] core::Result<void> request_video_idr();
+    [[nodiscard]] core::Result<void> request_video_idr(bool focus_transition = false);
     [[nodiscard]] std::optional<std::uint64_t> peer_timestamp() const noexcept { return peer_timestamp_; }
     [[nodiscard]] std::optional<diagnostics::QueueRejection> last_queue_rejection() const noexcept {
         return last_queue_rejection_;

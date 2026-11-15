@@ -964,12 +964,12 @@ std::optional<protocol::VideoProfile> WiredSession::selected_video_profile() con
     return video->second->selected_profile();
 }
 
-core::Result<void> WiredSession::request_video_idr() {
+core::Result<void> WiredSession::request_video_idr(bool focus_transition) {
     if (!video_projecting()) {
         return Error{ErrorCode::session_illegal_transition};
     }
     const auto video = av_sinks_.find(protocol::ChannelRole::video);
-    return video->second->request_video_idr();
+    return video->second->request_video_idr(focus_transition);
 }
 
 } // namespace aa::app

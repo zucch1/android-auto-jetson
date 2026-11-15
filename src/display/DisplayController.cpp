@@ -83,6 +83,7 @@ struct DisplayController::Impl final {
     // queueing later units, and this AU's metadata remains untouched.
     std::optional<ipc::VideoAccessUnit> pending_unit{};
     bool saw_video_unit{false};
+    std::optional<std::chrono::steady_clock::time_point> projection_started_at{};
     ipc::IdrRecoveryCoordinator idr_recovery{};
 
     [[nodiscard]] std::chrono::steady_clock::time_point now() const {
@@ -98,24 +99,29 @@ struct DisplayController::Impl final {
     void configure_receive_buffer(ipc::VideoConsumer& consumer,
                                   const protocol::VideoProfile& caps) const {
         if (const auto sized = consumer.configure_receive_buffer(caps); sized.has_value()) {
-            emit_diagnostic(ipc::video_socket_buffer_json(
-                "consumer", sized.value().requested_bytes, sized.value().granted_bytes, caps));
+            emit_diagnostic(ipc::video_socket_buffer_json("consumer", sized.value(), caps));
+            if (sized.value().has_warning()) {
+                emit_diagnostic(ipc::video_socket_buffer_warning_json("consumer", sized.value(), caps));
+            }
         }
     }
 
     void observe_idr_recovery() {
         const auto current_time = now();
         const bool awaiting = session && session->report().awaiting_idr;
+        const bool past_startup_grace =
+            projection_started_at.has_value() &&
+            (current_time - *projection_started_at) >= ipc::kIdrStartupGrace;
         const bool socket_waiting =
             video.has_value() && video->waiting_idr() &&
-            (saw_video_unit || video->rejected() > 0 || video->suppressed() > 0);
+            (saw_video_unit || video->rejected() > 0 || video->suppressed() > 0 || past_startup_grace);
         if (awaiting || socket_waiting) {
             idr_recovery.begin_wait(current_time);
-            const auto prev = idr_recovery.last_request_at();
+            const auto prev = idr_recovery.snapshot();
             if (idr_recovery.try_request(current_time, state == DisplayState::projecting)) {
                 const auto requested = control.request_idr_recovery();
                 if (!requested.has_value()) {
-                    idr_recovery.cancel_last_request(prev);
+                    idr_recovery.restore_snapshot(prev);
                 } else {
                     emit_diagnostic(ipc::idr_requested_json(
                         "consumer", awaiting ? "decode_awaiting_idr" : "video_consumer_waiting_idr"));
@@ -127,7 +133,8 @@ struct DisplayController::Impl final {
             const auto recovered = idr_recovery.on_idr_delivered(current_time);
             if (recovered.recovered) {
                 emit_diagnostic(ipc::idr_recovered_json("consumer", recovered.latency_ms,
-                                                        idr_recovery.requests_sent()));
+                                                        recovered.episode_requests,
+                                                        recovered.total_requests));
             }
         }
     }
@@ -140,6 +147,7 @@ struct DisplayController::Impl final {
     void release_media() noexcept {
         pending_unit.reset();
         saw_video_unit = false;
+        projection_started_at.reset();
         idr_recovery.reset();
         if (session) {
             session->close();
@@ -282,7 +290,9 @@ core::Result<void> DisplayController::start_projection(const ipc::VideoSocketPat
     connected.value().set_observer(impl_->config.on_video_endpoint);
     impl_->configure_receive_buffer(connected.value(), impl_->active_caps);
     impl_->saw_video_unit = false;
+    impl_->projection_started_at = impl_->now();
     impl_->idr_recovery.reset();
+    impl_->idr_recovery.set_strategy(ipc::IdrRecoveryStrategy::nudge);
     impl_->video.emplace(std::move(connected.value()));
     impl_->session = std::move(session.value());
     impl_->helper_started = true;

@@ -552,13 +552,35 @@ TEST(VideoChannel, RecommendedSocketBufferScalesWithProfileAndClampsToBounds) {
         pair.value().producer.configure_send_buffer(VideoProfile{1920, 1080, 60, VideoCodec::h264});
     ASSERT_TRUE(send_sized);
     EXPECT_EQ(send_sized.value().requested_bytes, p1080);
-    EXPECT_GT(send_sized.value().granted_bytes, 0);
+    EXPECT_EQ(send_sized.value().setsockopt_errno, 0);
+    EXPECT_EQ(send_sized.value().getsockopt_errno, 0);
+    EXPECT_GT(send_sized.value().granted_raw_bytes, 0u);
+    EXPECT_EQ(send_sized.value().granted_bytes, send_sized.value().granted_raw_bytes / 2U);
+    EXPECT_EQ(send_sized.value().short_grant(),
+              send_sized.value().granted_bytes < send_sized.value().requested_bytes);
+    EXPECT_EQ(send_sized.value().has_warning(), send_sized.value().short_grant());
 
     const auto recv_sized =
         pair.value().consumer.configure_receive_buffer(VideoProfile{1920, 1080, 60, VideoCodec::h264});
     ASSERT_TRUE(recv_sized);
     EXPECT_EQ(recv_sized.value().requested_bytes, p1080);
-    EXPECT_GT(recv_sized.value().granted_bytes, 0);
+    EXPECT_EQ(recv_sized.value().setsockopt_errno, 0);
+    EXPECT_EQ(recv_sized.value().getsockopt_errno, 0);
+    EXPECT_GT(recv_sized.value().granted_raw_bytes, 0u);
+    EXPECT_EQ(recv_sized.value().granted_bytes, recv_sized.value().granted_raw_bytes / 2U);
+
+    // Warning telemetry reflects errno or short_grant without altering SocketBufferResult contract.
+    aa::ipc::SocketBufferResult simulated_err{};
+    simulated_err.requested_bytes = p1080;
+    simulated_err.granted_raw_bytes = 425984;
+    simulated_err.granted_bytes = 212992;
+    simulated_err.setsockopt_errno = EPERM;
+    EXPECT_TRUE(simulated_err.has_warning());
+    EXPECT_FALSE(simulated_err.short_grant());
+    const auto err_warn = aa::ipc::video_socket_buffer_warning_json(
+        "producer", simulated_err, VideoProfile{1920, 1080, 60, VideoCodec::h264});
+    EXPECT_NE(err_warn.find("\"event\":\"video_socket_buffer_warning\""), std::string::npos);
+    EXPECT_NE(err_warn.find("\"reason\":\"setsockopt_failed\""), std::string::npos);
 
     pair.value().producer.close();
     EXPECT_FALSE(pair.value().producer.configure_send_buffer(VideoProfile{1280, 720, 30}).has_value());
@@ -567,7 +589,22 @@ TEST(VideoChannel, RecommendedSocketBufferScalesWithProfileAndClampsToBounds) {
 TEST(VideoChannel, ProducerWaitingIdrTracksBackpressureAndResetsOnIdr) {
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
+    // Fresh producer starts awaiting its initial IDR before any keyframe is sent.
+    EXPECT_TRUE(pair.value().producer.waiting_idr());
+
+    std::uint64_t frame = 1;
+    const auto pre_idr = pair.value().producer.send_access_unit(
+        {frame++, frame * 1000, false, std::vector<std::uint8_t>{0x00, 0x00, 0x01, 0x41}, std::nullopt});
+    ASSERT_TRUE(pre_idr);
+    EXPECT_EQ(pre_idr.value(), aa::ipc::SendStatus::dropped_waiting_idr);
+    EXPECT_TRUE(pair.value().producer.waiting_idr());
+
+    const auto initial_idr = pair.value().producer.send_access_unit(
+        {frame++, frame * 1000, true, std::vector<std::uint8_t>{0x00, 0x00, 0x01, 0x65}, std::nullopt});
+    ASSERT_TRUE(initial_idr);
+    EXPECT_EQ(initial_idr.value(), aa::ipc::SendStatus::sent);
     EXPECT_FALSE(pair.value().producer.waiting_idr());
+    ASSERT_TRUE(pair.value().consumer.receive(aa::core::Milliseconds{500}));
 
     const int small_buf = 32768;
     ASSERT_EQ(::setsockopt(pair.value().producer.native_handle(), SOL_SOCKET, SO_SNDBUF,
@@ -577,10 +614,9 @@ TEST(VideoChannel, ProducerWaitingIdrTracksBackpressureAndResetsOnIdr) {
 
     std::vector<std::uint8_t> chunk(16384, 0x22);
     aa::ipc::SendStatus status = aa::ipc::SendStatus::sent;
-    std::uint64_t frame = 1;
     for (int i = 0; i < 128 && status == aa::ipc::SendStatus::sent; ++i) {
         const auto sent = pair.value().producer.send_access_unit(
-            {frame, frame * 1000, frame == 1, chunk, std::nullopt});
+            {frame, frame * 1000, false, chunk, std::nullopt});
         ASSERT_TRUE(sent) << aa::to_string(sent.error().code());
         status = sent.value();
         ++frame;

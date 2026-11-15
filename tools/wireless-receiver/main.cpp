@@ -26,6 +26,7 @@ constexpr const char* usage =
     "  --exact-video-profiles offer only --video-profiles without appending the\n"
     "                       1280x720@30:h264 fallback profile\n"
     "  --helper-bus-address ADDRESS  explicit alternate helper bus (default: system bus)\n"
+    "  --idr-recovery auto|nudge|transition  IDR recovery strategy (default auto)\n"
     "  --diagnostics        emit redacted diagnostic JSON to stdout\n"
     "  --duration-ms N      bounded run (1..86400000 ms; omitted: until signal)\n"
     "  --ap-channel N       AP channel; must equal ap.conf (36, 40, 44 or 48; default 36)\n"
@@ -44,6 +45,7 @@ struct Options final {
     std::string input_socket{ipc::production_input_socket_path().value};
     std::string helper_address;
     std::vector<protocol::VideoProfile> video_profiles{config::default_video_profiles()};
+    ipc::IdrRecoveryStrategy idr_recovery{ipc::IdrRecoveryStrategy::auto_escalate};
     std::int64_t duration_ms{};
     std::uint32_t ap_channel{36};
     bool exact_video_profiles{};
@@ -66,6 +68,10 @@ std::optional<Options> parse_options(int argc, char** argv) {
         else if (arg == "--input-socket") options.input_socket = value;
         else if (arg == "--video-profiles") {
             if (!aa::config::parse_video_profiles_option(value, options.video_profiles))
+                return std::nullopt;
+        }
+        else if (arg == "--idr-recovery") {
+            if (!aa::ipc::parse_idr_recovery_strategy(value, options.idr_recovery))
                 return std::nullopt;
         }
         else if (arg == "--helper-bus-address") options.helper_address = value;
@@ -196,6 +202,12 @@ int main(int argc, char** argv) {
                            : aa::core::Result<void>{aa::Error{aa::ErrorCode::transport_closed}};
         },
         {},
+        [&receiver](bool focus_transition) {
+            auto* session = receiver.session();
+            return session ? session->request_video_idr(focus_transition)
+                           : aa::core::Result<void>{aa::Error{aa::ErrorCode::transport_closed}};
+        },
+        options->idr_recovery,
     });
     auto bus = aa::ipc::ControlBusService::start({aa::ipc::current_uid()},
         {ids, phones, &receiver.confirmation()});
