@@ -86,7 +86,21 @@
     },
     "provenance": { "$ref": "#/$defs/provenance" },
     "capture": { "$ref": "#/$defs/capture" },
-    "notes": { "type": "array", "items": { "type": "string" } }
+    "notes": { "type": "array", "items": { "type": "string" } },
+    "build": {
+      "description": "Build provenance of the measured binaries; optional so historical documents stay valid.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["build_type", "build_dir", "allow_unoptimized_build", "verified_on", "non_qualifying"],
+      "properties": {
+        "build_type": { "type": ["string", "null"] },
+        "build_dir": { "type": ["string", "null"] },
+        "allow_unoptimized_build": { "type": "boolean" },
+        "verified_on": { "enum": ["target", "host", "none"] },
+        "non_qualifying": { "type": ["string", "null"] },
+        "binaries": { "type": "object", "additionalProperties": { "type": "object" } }
+      }
+    }
   },
   "$defs": {
     "budgets": {

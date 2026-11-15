@@ -53,15 +53,20 @@ composes the modules above and reimplements none of them.
    AOA switch; `18d1:2d00`/`18d1:2d01` after).
 3. Approved-phone trust store loaded (task 27) for the phone's wired identity.
 4. Display connected (DP-1 or HDMI-A-1 `connected`) and a PipeWire output sink
-   present (`pactl list short sinks` or `pw-cli`). The harness exports
-   `DISPLAY=:1` for the remote display consumer; X11 clients also need
+   present (`pactl list short sinks` or `pw-cli`). The perf harness
+   (`tools/perf/aa-projection-perf.sh`) exports the X session it is told about
+   with `--display-env DISPLAY[,XAUTHORITY]`; it falls back to the caller's
+   exported `DISPLAY`/`XAUTHORITY` and only then to `:1`. X11 clients also need
    `XAUTHORITY` pointing at the authority cookie of the target X server (the
    owning session's cookie file) - without it the X connection is refused with
    an authentication failure. With GDM automatic login the owner's session is on
    display `:0` with its cookie at `/run/user/<uid>/gdm/Xauthority`, and `:1` is
    the display of a manually started second session: the qualification needs the
-   display the owner's screen session is actually on, so export that session's
-   `DISPLAY`/`XAUTHORITY` for the run.
+   display the owner's screen session is actually on, so pass it explicitly,
+   e.g. `--display-env ":0,/run/user/<uid>/gdm/Xauthority"` (or export
+   `AA_DISPLAY`/`AA_XAUTHORITY`, or that session's `DISPLAY`/`XAUTHORITY` for
+   the run). Read `--help` and the runbook's display-session note; a value that
+   is not a plain session path is a usage error.
 5. A wired receiver binary on the target: `aa-wired-receiver`
    (`tools/wired-receiver/main.cpp`), which runs `aa::app::WiredSession` over
    the real `aa_transport_usb` endpoint with `transport::admit_via(TrustStore)`

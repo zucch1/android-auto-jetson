@@ -7,6 +7,7 @@
 #   aa-projection-perf.sh --mode wired --duration 2h  --build-dir BUILD --out soak.json
 #   aa-projection-perf.sh --mode wired --capture capture.json --out result.json
 #   Optional approved model-only policy: --thermal-policy orin-nano-cv-unavailable/1
+#   Optional X session: --display-env DISPLAY[,XAUTHORITY] (default :1)
 #   aa-projection-perf.sh --readiness-only [--out readiness.json]
 #
 # This tool measures CPU/RSS, thermal state, frame drops, decode/IPC timing,
@@ -20,9 +21,19 @@
 #
 # A live stage is refused (BLOCKED unoptimized_build) unless --build-dir names
 # the build that produced the launched binaries and its CMakeCache.txt records
-# an optimized CMAKE_BUILD_TYPE (Release/RelWithDebInfo); an unoptimized pixel
-# conversion on the GUI thread fails the A/V gate by itself. --allow-unoptimized-build
-# is a debugging override only, never for a recorded qualification run.
+# an optimized CMAKE_BUILD_TYPE (Release/RelWithDebInfo/MinSizeRel); an
+# unoptimized pixel conversion on the GUI thread fails the A/V gate by itself.
+# Every run records that build type, the build directory and whether
+# --allow-unoptimized-build was used; a run that override admits is reported
+# NOT_QUALIFYING: unoptimized_build and is never a PASS.
+#
+# The launched binaries must come from that build: a binary inside the build
+# directory is accepted, a copy deployed elsewhere only when it is byte-identical
+# to a binary that build produced; anything else is BLOCKED build_dir_mismatch.
+# A cross build names the build tree on the host that built it: the host verifies
+# its local CMakeCache.txt and derives each binary from the tree, and the target
+# records that verification as host-side. The guard's own lines are kept in the
+# run output whether the stage starts or is refused.
 #
 # Exit codes: 0 PASS, 1 FAIL (budget violation), 2 usage error,
 #             3 BLOCKED (prerequisite or metric unavailable), 4 internal error.
@@ -32,7 +43,9 @@
 # installed receiver/display binary. Every ssh is wrapped in `timeout`.
 #
 # Environment overrides: AA_PERF_HOST (default jetson.local), AA_PERF_PORT
-# (default 1-2.1), AA_BUILD_DIR (default for --build-dir).
+# (default 1-2.1), AA_BUILD_DIR (default for --build-dir), AA_DISPLAY and
+# AA_XAUTHORITY (default for --display-env; the caller's DISPLAY/XAUTHORITY are
+# honoured after those, and :1 is only the fallback).
 
 set -euo pipefail
 
@@ -47,7 +60,7 @@ DURATION_SET=0
 HOST="${AA_PERF_HOST:-jetson.local}"
 PORT="${AA_PERF_PORT:-1-2.1}"
 RECEIVER="/opt/aa/aa-wired-receiver"
-DISPLAY="/opt/aa/aa-dummy-display"
+DISPLAY_BIN="/opt/aa/aa-dummy-display"
 STORE=""
 OUT=""
 CAPTURE=""
@@ -59,11 +72,12 @@ READINESS_ONLY=0
 THERMAL_POLICY=""
 BUILD_DIR="${AA_BUILD_DIR:-}"
 ALLOW_UNOPTIMIZED=0
+DISPLAY_ENV="${AA_DISPLAY_ENV:-}"
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 
 usage() {
-    sed -n '4,35p' "$0"
+    sed -n '6,11p' "$0"
     exit 2
 }
 
@@ -96,7 +110,7 @@ while (($# > 0)); do
         --host) require_value "$@"; HOST="$2"; shift 2 ;;
         --port) require_value "$@"; PORT="$2"; shift 2 ;;
         --receiver) require_value "$@"; RECEIVER="$2"; shift 2 ;;
-        --display) require_value "$@"; DISPLAY="$2"; shift 2 ;;
+        --display) require_value "$@"; DISPLAY_BIN="$2"; shift 2 ;;
         --store) require_value "$@"; STORE="$2"; shift 2 ;;
         --out) require_value "$@"; OUT="$2"; shift 2 ;;
         --capture) require_value "$@"; CAPTURE="$2"; shift 2 ;;
@@ -105,6 +119,7 @@ while (($# > 0)); do
         --interval) require_value "$@"; INTERVAL="$2"; shift 2 ;;
         --thermal-policy) require_value "$@"; THERMAL_POLICY="$2"; shift 2 ;;
         --build-dir) require_value "$@"; BUILD_DIR="$2"; shift 2 ;;
+        --display-env) require_value "$@"; DISPLAY_ENV="$2"; shift 2 ;;
         --allow-unoptimized-build) ALLOW_UNOPTIMIZED=1; shift ;;
         --now) require_value "$@"; NOW="$2"; shift 2 ;;
         --readiness-only) READINESS_ONLY=1; shift ;;
@@ -120,6 +135,36 @@ esac
 thermal_args=()
 if [[ -n "$THERMAL_POLICY" ]]; then
     thermal_args=(--thermal-policy "$THERMAL_POLICY")
+fi
+
+# X session for every remote command: --display-env wins, then the tool's own
+# AA_DISPLAY/AA_XAUTHORITY, then the caller's DISPLAY/XAUTHORITY, and :1 is only
+# the fallback. The qualified display is the display of the owner's session, so
+# the script must never silently overrule a caller that names one. Both values
+# are embedded in a remote shell command, so they are restricted to characters
+# that need no quoting.
+check_display_value() {
+    local label="$1" value="$2"
+    if [[ ! "$value" =~ ^[A-Za-z0-9:/._,@+-]+$ ]]; then
+        echo "usage error: ${label} '${value}' is not a plain DISPLAY/XAUTHORITY value" >&2
+        exit 2
+    fi
+}
+if [[ -n "$DISPLAY_ENV" ]]; then
+    DISPLAY_TARGET="${DISPLAY_ENV%%,*}"
+    if [[ "$DISPLAY_ENV" == *,* ]]; then
+        XAUTHORITY_TARGET="${DISPLAY_ENV#*,}"
+    else
+        XAUTHORITY_TARGET="${AA_XAUTHORITY:-${XAUTHORITY:-}}"
+    fi
+else
+    DISPLAY_TARGET="${AA_DISPLAY:-${DISPLAY:-}}"
+    XAUTHORITY_TARGET="${AA_XAUTHORITY:-${XAUTHORITY:-}}"
+fi
+DISPLAY_TARGET="${DISPLAY_TARGET:-:1}"
+check_display_value "--display-env DISPLAY" "$DISPLAY_TARGET"
+if [[ -n "$XAUTHORITY_TARGET" ]]; then
+    check_display_value "--display-env XAUTHORITY" "$XAUTHORITY_TARGET"
 fi
 
 # Build guard arguments, forwarded verbatim into the on-target collector so the
@@ -157,7 +202,11 @@ trap 'rm -rf "${BUFFER:?}"' EXIT
 # consumers abort without DISPLAY. The export prologue (rather than a bare
 # VAR= prefix) keeps compound remote commands working, and $(id -u) must
 # expand on the target, never locally.
-REMOTE_ENV='export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"; export DISPLAY=:1;'
+REMOTE_ENV='export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus";'
+REMOTE_ENV+=" export DISPLAY=${DISPLAY_TARGET};"
+if [[ -n "$XAUTHORITY_TARGET" ]]; then
+    REMOTE_ENV+=" export XAUTHORITY=${XAUTHORITY_TARGET};"
+fi
 
 remote() { timeout 30 ssh "${SSH_OPTS[@]}" "$HOST" "${REMOTE_ENV} $*"; }
 
@@ -213,24 +262,37 @@ PY
 }
 
 # Emit a schema-valid BLOCKED result via the reporter (no samples -> every
-# gated metric is UNAVAILABLE) and return the reporter's exit code.
+# gated metric is UNAVAILABLE) and return the reporter's exit code. The build
+# provenance known at that point is recorded too (arguments: reason,
+# build type, build directory, override used), so a blocked run still says which
+# build it was about and whether the qualification override was in play.
 blocked_result() {
     local reason="$1"
     local capture="$BUFFER/blocked-capture.json"
-    "$PY" -B - "$capture" <<'PY'
-import json, sys
+    AA_BLOCK_BUILD_TYPE="${2:-}" AA_BLOCK_BUILD_DIR="${3:-}" \
+        AA_BLOCK_ALLOW_UNOPTIMIZED="${4:-0}" "$PY" -B - "$capture" <<'PY'
+import json, os, sys
+build_type = os.environ.get("AA_BLOCK_BUILD_TYPE") or None
+build_dir = os.environ.get("AA_BLOCK_BUILD_DIR") or None
+doc = {
+    "schema": "aa-projection-perf-capture/2",
+    "monotonic_origin_ns": 0,
+    "cpu_ticks_per_second": 1,
+    "video_evidence": {"blocks": [], "ipc_latency_ns": [], "decode_latency_ns": []},
+    "mode": "wired",
+    "duration_seconds": 0,
+    "crashes": 0,
+    "samples": [],
+    "events": {"helper_rss_mb": None},
+    "build": {
+        "build_type": build_type,
+        "build_dir": build_dir,
+        "allow_unoptimized_build": os.environ.get("AA_BLOCK_ALLOW_UNOPTIMIZED") == "1",
+        "verified_on": "none",
+    },
+}
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
-    json.dump({
-        "schema": "aa-projection-perf-capture/2",
-        "monotonic_origin_ns": 0,
-        "cpu_ticks_per_second": 1,
-        "video_evidence": {"blocks": [], "ipc_latency_ns": [], "decode_latency_ns": []},
-        "mode": "wired",
-        "duration_seconds": 0,
-        "crashes": 0,
-        "samples": [],
-        "events": {"helper_rss_mb": None},
-    }, handle)
+    json.dump(doc, handle)
 PY
     "$PY" -B "$REPORTER" --live --capture "$capture" --out "$OUT" \
         --duration-requested "${DURATION:-}" --now "${NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
@@ -304,8 +366,53 @@ fi
 
 if ! check_readiness; then
     echo "BLOCKED: ${ready_reason}" >&2
-    blocked_result "$ready_reason"
+    blocked_result "$ready_reason" "" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
+fi
+
+# ---- build provenance (which build produced the binaries that will run) -----
+# A build directory on the target is re-verified there, together with the
+# binaries this run actually launches. A build directory only this host can see
+# is the cross-build case: the host checks its own CMakeCache.txt and derives
+# each launched binary from that tree before anything is launched remotely, and
+# the target records that the check was host-side.
+build_type_known=""
+if [[ -n "$BUILD_DIR" ]]; then
+    if remote "test -f '${BUILD_DIR}/CMakeCache.txt'" >/dev/null 2>&1; then
+        : # target-side verification: the collector re-reads this cache
+    elif [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+        guard_args=(--build-dir "$BUILD_DIR" --json --expect "receiver=$(basename "$RECEIVER")")
+        if [[ -n "$DISPLAY_BIN" ]]; then
+            guard_args+=(--expect "display=$(basename "$DISPLAY_BIN")")
+        fi
+        if ((ALLOW_UNOPTIMIZED)); then
+            guard_args+=(--allow-unoptimized-build)
+        fi
+        if ! "$PY" -B "$TOOL_DIR/aa_build_guard.py" "${guard_args[@]}" \
+                >"$BUFFER/build-check.json" 2>"$BUFFER/build-guard.err"; then
+            if grep -q '^error: build_dir_mismatch:' "$BUFFER/build-guard.err"; then
+                echo "BLOCKED: build_dir_mismatch" >&2
+                sed -n '1,20p' "$BUFFER/build-guard.err" >&2 || true
+                blocked_result "build_dir_mismatch" "" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+                exit 3
+            fi
+            echo "BLOCKED: unoptimized_build" >&2
+            sed -n '1,20p' "$BUFFER/build-guard.err" >&2 || true
+            blocked_result "unoptimized_build" "" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+            exit 3
+        fi
+        sed -n '1,20p' "$BUFFER/build-guard.err" >&2
+        build_type_known="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["build_type"] or "")' \
+            "$BUFFER/build-check.json")"
+        if [[ -z "$build_type_known" ]]; then
+            echo "internal error: the build guard produced no build type" >&2
+            exit 4
+        fi
+        build_args_remote=" --build-dir '${BUILD_DIR}' --build-dir-verified-locally '${build_type_known}'"
+        if ((ALLOW_UNOPTIMIZED)); then
+            build_args_remote+=" --allow-unoptimized-build"
+        fi
+    fi
 fi
 
 # Provenance: computed locally where possible, bounded remote hashes otherwise.
@@ -329,27 +436,42 @@ for name in ("aa_measurement_coverage", "aa_video_measurements", "aa_build_guard
 print("exec(compile(" + repr(collector) + ", 'aa_projection_collect.py', 'exec'))")
 PY
 collector_timeout=$((duration_secs + 120))
+blocked_type=""
 if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port '${PORT}' \
         --duration-seconds ${duration_secs} --interval ${INTERVAL} \
         ${THERMAL_POLICY:+--thermal-policy '${THERMAL_POLICY}'} \
-        ${DISPLAY:+--display '${DISPLAY}'} ${STORE:+--store '${STORE}'}${build_args_remote}" \
+        ${DISPLAY_BIN:+--display '${DISPLAY_BIN}'} ${STORE:+--store '${STORE}'}${build_args_remote}" \
         <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err"; then
-    # The on-target collector refuses to start a stage from an unoptimized
-    # build; report that as its own BLOCKED reason, never a generic failure.
+    # The on-target collector refuses to start a stage from an unoptimized build
+    # or from binaries another build produced; report each as its own BLOCKED
+    # reason, never a generic failure.
+    blocked_type="$(sed -n 's/.*CMAKE_BUILD_TYPE=\([A-Za-z0-9_+.-]*\).*/\1/p' "$BUFFER/collector.err" | head -1)"
+    if grep -q '^error: build_dir_mismatch:' "$BUFFER/collector.err"; then
+        echo "BLOCKED: build_dir_mismatch" >&2
+        sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
+        blocked_result "build_dir_mismatch" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        exit 3
+    fi
     if grep -q '^error: unoptimized_build:' "$BUFFER/collector.err"; then
         echo "BLOCKED: unoptimized_build" >&2
         sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-        blocked_result "unoptimized_build"
+        blocked_result "unoptimized_build" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
         exit 3
     fi
     echo "BLOCKED: collector_failed" >&2
     sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-    blocked_result "collector_failed"
+    blocked_result "collector_failed" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
+fi
+# The collector writes the build record it verified to stderr; keep those lines
+# in the run output even when the stage started, so an override can never be
+# silent in a green-looking log.
+if [[ -s "$BUFFER/collector.err" ]]; then
+    sed -n '1,40p' "$BUFFER/collector.err" >&2 || true
 fi
 if [[ ! -s "$capture_file" ]]; then
     echo "BLOCKED: collector_produced_no_capture" >&2
-    blocked_result "collector_produced_no_capture"
+    blocked_result "collector_produced_no_capture" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
 fi
 if [[ -n "$CAPTURE_OUT" ]]; then

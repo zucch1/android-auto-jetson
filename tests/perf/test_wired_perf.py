@@ -121,6 +121,14 @@ def case_schema(tmp: Path) -> None:
         "equivalence_not_provisional": lambda d: d["provenance"].__setitem__(
             "equivalence_status", "established"),
         "thermal_zone_missing_temp": lambda d: d["thermal_state"]["zones"][0].pop("temp_c"),
+        # The build provenance is required and pinned: a result that hides which
+        # build was measured (or whether the qualification override was used)
+        # is not a valid document.
+        "missing_build": lambda d: d.pop("build"),
+        "build_bad_verified_on": lambda d: d["build"].__setitem__("verified_on", "elsewhere"),
+        "build_override_not_boolean": lambda d: d["build"].__setitem__(
+            "allow_unoptimized_build", "yes"),
+        "build_missing_non_qualifying": lambda d: d["build"].pop("non_qualifying"),
     }
     for name, mutate in mutations.items():
         doc = copy.deepcopy(base)
@@ -187,6 +195,11 @@ def case_nominal(tmp: Path) -> None:
     assert doc["provenance"]["package_digest"] is None
     assert doc["provenance"]["equivalence_status"] == "provisional"
     assert doc["thermal_state"]["peak_c"] == 52.0
+    # A fixture capture carries no build provenance, so the result says so
+    # instead of assuming an optimized build.
+    assert doc["build"] == {"build_type": None, "build_dir": None,
+                            "allow_unoptimized_build": False, "verified_on": "none",
+                            "non_qualifying": None}, doc["build"]
     assert run([sys.executable, "-B", str(VALIDATOR), "validate", str(SCHEMA), str(out)]).returncode == 0
 
     cli_out = tmp / "cli-nominal.json"

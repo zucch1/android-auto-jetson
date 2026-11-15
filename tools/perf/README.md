@@ -11,13 +11,14 @@ fixtures/tests and the phase-B runbook; the actual 30-minute performance run and
 tools/perf/
   aa-projection-perf.sh            entry point (strict CLI, fail-closed)
   aa_projection_collect.py         on-target collector (launched over ssh)
-  aa_build_guard.py                refuses a stage from an unoptimized build
+  aa_build_guard.py                refuses a stage from an unoptimized build or a
+                                   binary that build did not produce
   aa_video_measurements.py         bounded side-band video endpoint reducer
   aa_measurement_coverage.py       shared typed active-window evidence contract
   aa_perf_report.py                capture -> result document + budget verdict
   aa_perf_schema.py                stdlib JSON Schema validator (own output)
   aa-projection-perf-v2.schema.json current result-document contract
-  aa-projection-perf.schema.json   unchanged historical v1 validation only
+  aa-projection-perf.schema.json   historical v1 validation only (build block optional)
   README.md                        this file
 ```
 
@@ -54,10 +55,31 @@ reads `CMAKE_BUILD_TYPE` from the `CMakeCache.txt` of the build directory named
 by `--build-dir` (or `AA_BUILD_DIR`) and refuses an unoptimized build with
 `BLOCKED unoptimized_build` (exit 3). An unoptimized pixel conversion on the GUI
 thread delays paint and the 5 ms display pump enough to fail the 50 ms A/V gate
-on its own. `Release`, `RelWithDebInfo` and `MinSizeRelWithDebInfo` pass;
-`Debug`, an unset value, an unreadable cache and a missing build directory are
-refused. `--allow-unoptimized-build` is a debugging override: it prints a
-warning and its runs are not qualification results. No budget value changes.
+on its own. `Release`, `RelWithDebInfo` and `MinSizeRel` pass
+(case-insensitively); `Debug`, an unset value, an unreadable cache and a missing
+build directory are refused. `--allow-unoptimized-build` is a debugging
+override: it prints a warning and its runs are not qualification results. No
+budget value changes.
+
+Naming a build directory is not enough by itself: the guard also ties it to the
+binaries this run launches. A binary inside the build directory (symlinks
+resolved) is accepted; a copy deployed elsewhere is accepted only when it is
+byte-identical to a binary that build produced; anything else is
+`BLOCKED build_dir_mismatch` (exit 3). A cross build names the build tree on the
+host that built it: `aa-projection-perf.sh` checks that local `CMakeCache.txt`
+and derives each launched binary from the tree before anything is launched
+remotely, and the capture records `build.verified_on: "host"` instead of a
+target-side check it could not make.
+
+Every run records the build in the capture and in the result JSON:
+`build.build_type`, `build.build_dir`, `build.allow_unoptimized_build`,
+`build.verified_on` and `build.non_qualifying`, plus the resolved binary paths
+when they were verified. A run the override admitted is
+`build.non_qualifying: "NOT_QUALIFYING: unoptimized_build"`, is reported
+`BLOCKED` with that `blocked_on` instead of `PASS` (a measured budget miss still
+`FAIL`s), and keeps its measured values visible. The collector writes those
+lines to stderr and the launcher keeps them in the run output even on success, so
+the build record is never silent.
 
 ## V2 active-window completeness
 
@@ -154,6 +176,12 @@ usage error (exit 2). `--mode` must be `wired`. `--host` (default
 `jetson.local`) and `--port` (default `1-2.1`) select the target; `--receiver`
 and `--display` name the installed binaries. Every ssh is wrapped in `timeout`.
 
+The remote X session comes from `--display-env DISPLAY[,XAUTHORITY]`, then
+`AA_DISPLAY`/`AA_XAUTHORITY`, then the caller's `DISPLAY`/`XAUTHORITY`; `:1` is
+only the fallback (it is the display of a manually started second session, not
+the owner's session). The same environment is used by `--readiness-only`, so the
+`xrandr` evidence and the measured display are the same one.
+
 ## Measurement sources
 
 The collector runs on the target and reads only procfs/sysfs plus the receiver's
@@ -234,7 +262,12 @@ managed display the receiver runs unchanged and no consumer gate is requested.
 
 ## Result document and provenance
 
-The result embeds a `provenance` block with the source digest, build-artifact
+The result embeds a `build` block with the verified `build_type`, the
+`build_dir` it was read from, `allow_unoptimized_build`, `verified_on`
+(`target`/`host`/`none`) and `non_qualifying` (the `NOT_QUALIFYING:` marker on a
+run the debugging override admitted; such a run is never `PASS`).
+
+It also embeds a `provenance` block with the source digest, build-artifact
 digest, configuration digest, service definitions, dependency versions and the
 target hardware state. `package_digest` is forced to `null` and
 `equivalence_status` to `"provisional"`: post-package equivalence belongs to
@@ -270,3 +303,12 @@ long windows. Run these independently of readiness or the full suite.
 `wired_perf_v2_thermal_policy` exercises strict-vs-Nano replay, all required
 families, inventory changes, real CV peaks, nonfinite rejection, wrong models,
 budget/terminal precedence, forged exports and both real offline CLI paths.
+
+`wired_perf_build_guard` covers the qualification build guard: Debug/unset/
+unreadable builds refused before anything launches, Release/RelWithDebInfo/
+MinSizeRel accepted, the debug override admitted and recorded, launched binaries
+tied to the build directory (in-tree, identical deployed copy, symlink escape
+and foreign build refused, cross-build derivation), an override run reported
+`NOT_QUALIFYING` instead of `PASS`, and the launcher's display-environment
+resolution — all against real `CMakeCache.txt` fixtures and a PATH-local ssh
+stand-in; no target is touched.
