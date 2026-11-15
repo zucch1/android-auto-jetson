@@ -83,6 +83,9 @@ struct BluezBackend::Impl {
     std::vector<PeerIdentity> awaiting;
     // Managed bonds whose demotion has started but is not yet durably complete: never admitted.
     std::vector<PeerIdentity> refused;
+    // Revoked identities currently bonded in BlueZ whose non-removal warning has been logged in
+    // this helper run; cleared once unbonded or when a committed enrolment clears history.
+    std::vector<PeerIdentity> refused_bond_warned;
     // BlueZ removal attempts are budgeted per invocation (docs/enrolment-ordering.md, #118): at
     // most kRemovalAttemptBudget attempts, and every Disconnect and RemoveDevice of the invocation
     // shares one deadline, kRemovalTimeBudget after the invocation started (the tick, the

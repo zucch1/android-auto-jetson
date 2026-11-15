@@ -105,6 +105,10 @@ void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own,
         if (own && peer != *own) continue;
         if (allowed && allowed->device.identity == peer) continue;
         if (listed(awaiting, peer)) continue;
+        if (revoked.retired(peer)) {
+            (void)pending.forget(peer);
+            continue;
+        }
         const bool bonded = std::any_of(devices.begin(), devices.end(),
             [&](const Device& device) { return device.identity == peer && device.bonded; });
         if (bonded && listed(approved, peer)) {
@@ -127,6 +131,9 @@ void BluezBackend::Impl::retire_unaccepted(Retire mode, const PeerIdentity* own,
         // A managed entry left by an interrupted commit is demoted before the obligation is
         // dropped, so a removed, never-admitted bond can never count as admitted later.
         if (!demote(peer, false)) continue;
+        // Mark revocation history retired BEFORE dropping the journal entry, so a crash between
+        // the two writes never loses the proof that removal already completed.
+        if (revoked.contains(peer) && !revoked.remember(peer, true, true)) continue;
         (void)pending.forget(peer);
         if (!pending.contains(peer)) {                       // gone from memory; sync retried
             std::erase(removal_done, peer);
@@ -163,13 +170,15 @@ bool BluezBackend::Impl::demote(const PeerIdentity& peer, bool owe_removal) {
     // failed write between any two steps leaves a state reconciliation completes, never an admitted
     // or a stranded bond. The obligation is dropped only once BlueZ confirmed the removal.
     if (owe_removal && !pending.remember(peer)) return false;
-    if (!revoked.remember(peer, true)) return false;
+    if (!revoked.remember(peer, true, false)) return false;
     if (!managed.forget(peer)) return false;
     std::erase(refused, peer);
     return true;
 }
 bool BluezBackend::Impl::clear_revocation(const PeerIdentity& peer) {
-    return !revoked.contains(peer) || revoked.forget(peer);
+    if (revoked.contains(peer) && !revoked.forget(peer)) return false;
+    std::erase(refused_bond_warned, peer);
+    return true;
 }
 // ReconcileBondsV1. The receiver's approved set decides:
 //   approved, revoked, its fresh enrolment -> admitted: this helper run acknowledged a fresh
@@ -183,13 +192,14 @@ bool BluezBackend::Impl::clear_revocation(const PeerIdentity& peer) {
 //   approved, journalled, bonded           -> admitted (the approval landed, the commit did not)
 //   approved, nothing to admit             -> counted as unadmitted, nothing removed
 //   managed, not approved                  -> demoted (removal owed first), device removed
-//   journalled, not approved               -> device removed, entry dropped
-//   revoked, bonded, not approved          -> removal owed again and the device removed, whatever
-//                                             the journal says (a lost entry strands no bond)
+//   journalled, not approved, not retired  -> device removed, history retired, entry dropped
+//   journalled, not approved, retired      -> stale post-removal journal entry dropped; bond kept
+//   revoked, bonded, not approved,         -> outside re-bond or ambiguous history: bond kept
+//     not journalled                          on shared adapter, refused for AA, warning logged
 // A bond of an identity none of the helper's files name is never touched, and the open enrolment
 // window's own bond is left to that window. Success only once every state change is durable and
-// every bond the helper names that the receiver does not approve is gone from BlueZ or its removal
-// durably owed in the journal; on failure the stricter state stays and the receiver retries.
+// every bond Android Auto still owes removal for is gone from BlueZ or its removal durably owed
+// in the journal; on failure the stricter state stays and the receiver retries.
 core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<PeerIdentity>& approved) {
     auto& s = *impl_;
     if (!s.managed.valid() || !s.pending.valid() || !s.revoked.valid()) return Error{ErrorCode::helper_unavailable};
@@ -249,24 +259,40 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
     for (const auto& peer : std::vector<PeerIdentity>{s.pending.peers()}) {
         if (listed(approved, peer) || live == peer) continue;
         std::erase(s.awaiting, peer);
+        if (s.revoked.retired(peer)) {
+            // Crash after marking revoked-bonds retired (post-RemoveDevice) and before forgetting
+            // pending-removals: removal already completed, so drop the stale journal entry without
+            // removing any bond created outside Android Auto since.
+            durable = s.pending.forget(peer) && durable;
+            continue;
+        }
         if (!listed(unwanted, peer)) unwanted.push_back(peer);
     }
-    // The removal obligation is derived, not only journalled: a bond whose journal entry was lost
-    // (a failed write, a crash, an older helper's demotion order) is still removed. Only identities
-    // the helper's own history names count; BlueZ cannot tell the owner's other bonds apart. The
-    // adapter is Android-Auto-exclusive (docs/enrolment-ordering.md): a forgotten phone paired again
-    // outside Android Auto is removed again, with a warning naming its redacted address.
+    // Reset non-removal warning state once a device is no longer bonded so a subsequent outside
+    // re-bond warns again.
+    std::erase_if(s.refused_bond_warned, [&](const PeerIdentity& peer) { return !bonded(peer); });
+    // Shared-adapter policy (owner decision, 2026-11-15, docs/enrolment-ordering.md): only bonds
+    // that Android Auto itself still owes removal for (managed-bonds or pending-removals without a
+    // retired revocation marker) are in `unwanted` and removed. A bonded device on `revoked-bonds`
+    // not in `unwanted` is either a post-revocation outside re-bond (marked retired) or ambiguous
+    // (legacy v1 / lost journal): fail safe by keeping the bond, refusing Android Auto use, and
+    // logging a non-removal warning naming only its redacted address.
     for (const auto& device : devices) {
         const auto& peer = device.identity;
         if (!device.bonded || !s.revoked.contains(peer) || listed(approved, peer) || live == peer ||
             listed(unwanted, peer)) continue;
-        std::cerr << "system-helper: warning bond_removed_revoked_identity "
-                  << diagnostics::redact_identifier(peer.address)
-                  << ": this phone was forgotten in Android Auto but is bonded again (paired outside "
-                     "Android Auto); the Bluetooth adapter is Android-Auto-exclusive, so its bond is "
-                     "removed. Enrol the phone again in Android Auto to use it.\n";
-        durable = s.pending.remember(peer) && durable;
-        unwanted.push_back(peer);
+        if (!listed(s.refused_bond_warned, peer)) {
+            std::cerr << "system-helper: warning bond_refused_revoked_identity "
+                      << diagnostics::redact_identifier(peer.address)
+                      << (s.revoked.retired(peer)
+                              ? ": this phone was forgotten in Android Auto and is bonded again "
+                                "(paired outside Android Auto); keeping the shared adapter bond "
+                                "and refusing Android Auto use. Enrol the phone again in Android Auto to use it.\n"
+                              : ": this phone was forgotten in Android Auto and its bond history "
+                                "is ambiguous; keeping the shared adapter bond and refusing Android "
+                                "Auto use. Enrol the phone again in Android Auto to use it.\n");
+            s.refused_bond_warned.push_back(peer);
+        }
     }
     s.reconciled = durable;
     // One removal scan, within one invocation's budget, and never a retry of an earlier failure

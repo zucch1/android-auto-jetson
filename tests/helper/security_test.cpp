@@ -878,6 +878,51 @@ TEST_F(ManagedBonds, RevokedHistoryEvictsItsOldestEntryWhenFull) {
     ManagedPeers reloaded{directory, ::getuid(), "revoked-bonds"};
     EXPECT_TRUE(reloaded.valid() && reloaded.contains(peer(256)) && !reloaded.contains(peer(0)));
 }
+TEST_F(ManagedBonds, RevokedHistorySupportsV2StateTransitionsAtCapacityAndRejectsMalformedV2) {
+    auto peer = [](int i) {
+        char address[18]; std::snprintf(address, sizeof address, "02:00:00:00:%02X:%02X", i / 256, i % 256);
+        return helper::PeerIdentity{address, "00:11:22:33:44:55"};
+    };
+    {
+        ManagedPeers history{directory, ::getuid(), "revoked-bonds"};
+        ASSERT_TRUE(history.valid());
+        for (int i = 0; i < 256; ++i) ASSERT_TRUE(history.remember(peer(i), true, (i % 2) == 0));
+        // Updating retired state of an existing entry at full capacity must not evict peer(0).
+        ASSERT_TRUE(history.remember(peer(1), true, true));
+        ASSERT_TRUE(history.remember(peer(2), true, false));
+        EXPECT_EQ(history.peers().size(), 256U);
+        EXPECT_TRUE(history.contains(peer(0)) && history.retired(peer(0)));
+        EXPECT_TRUE(history.retired(peer(1)));
+        EXPECT_FALSE(history.retired(peer(2)));
+    }
+    {
+        ManagedPeers reloaded{directory, ::getuid(), "revoked-bonds"};
+        ASSERT_TRUE(reloaded.valid());
+        EXPECT_TRUE(reloaded.retired(peer(0)));
+        EXPECT_TRUE(reloaded.retired(peer(1)));
+        EXPECT_FALSE(reloaded.retired(peer(2)));
+    }
+    const auto path = directory + "/revoked-bonds";
+    // Legacy v1 entries load cleanly as non-retired (ambiguous history, never retired).
+    { std::ofstream out{path}; out << "v1\nAA:BB:CC:DD:EE:FF 00:11:22:33:44:55\n"; }
+    ASSERT_EQ(::chmod(path.c_str(), 0600), 0);
+    {
+        ManagedPeers v1{directory, ::getuid(), "revoked-bonds"};
+        ASSERT_TRUE(v1.valid());
+        EXPECT_TRUE(v1.contains(managed));
+        EXPECT_FALSE(v1.retired(managed));
+    }
+    // Malformed v2 records must fail closed.
+    for (const auto& bad : {
+             std::string{"v2\nAA:BB:CC:DD:EE:FF 00:11:22:33:44:55 X\n"},
+             std::string{"v2\nAA:BB:CC:DD:EE:FF 00:11:22:33:44:55\n"},
+             std::string{"v2\nAA:BB:CC:DD:EE:FF 00:11:22:33:44:55 P\nAA:BB:CC:DD:EE:FF 00:11:22:33:44:55 R\n"},
+         }) {
+        { std::ofstream out{path}; out << bad; }
+        ASSERT_EQ(::chmod(path.c_str(), 0600), 0);
+        EXPECT_FALSE((ManagedPeers{directory, ::getuid(), "revoked-bonds"}.valid()));
+    }
+}
 
 // --- Demotion order (P2-1): the removal obligation is durable before managed state is dropped. ---
 const helper::PeerIdentity primary_peer{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
@@ -961,57 +1006,147 @@ TEST_F(ManagedBonds, ForgetWithFailedJournalWriteAndFailedRemovalIsCompletedByRe
     ASSERT_EQ(mock.command("allow-remove"), "ok");
     expect_forgotten_after_reconciliation(bus_address, mock, directory);
 }
-// A journal entry lost after the demotion (the state an older helper's order, a failed journal
-// write or a power loss leaves): history only, the bond still in BlueZ. Reconciliation derives
-// the obligation from the history and removes the bond; the receiver's approval keeps it.
-TEST_F(ManagedBonds, ReconciliationRemovesAnUnapprovedBondWhoseJournalEntryWasLost) {
+// Case (d): ambiguous history (revoked-bonds in v1 or v2 P without pending-removals or managed-bonds)
+// fails safe on a shared adapter: the bond is never removed (it may belong to infotainment) and
+// Android Auto never admits or uses it, whether approved in a stale store or not.
+TEST_F(ManagedBonds, AmbiguousRevokedHistoryKeepsBondRefusesUseAndLogsRedactedWarning) {
     const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
     ASSERT_NE(bus_address, nullptr);
     MockBluez mock{bus_address};
-    {
-        std::ofstream{directory + "/revoked-bonds"} << "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n";
-    }
-    ASSERT_EQ(::chmod((directory + "/revoked-bonds").c_str(), 0600), 0);
-    ASSERT_EQ(mock.command("paired"), "ok");
-    {
+    for (const char* record : {"v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n",
+                               "v2\n02:00:00:00:00:01 02:00:00:00:00:AA P\n"}) {
+        ASSERT_EQ(mock.command("restore"), "ok");
+        ASSERT_EQ(mock.command("paired"), "ok");
+        std::filesystem::remove(directory + "/managed-bonds");
+        std::filesystem::remove(directory + "/pending-removals");
+        { std::ofstream{directory + "/revoked-bonds", std::ios::trunc} << record; }
+        ASSERT_EQ(::chmod((directory + "/revoked-bonds").c_str(), 0600), 0);
+
         helper::BluezBackend backend{bus_address, steady(), directory, ::getuid()};
         ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+
+        // Even with a stale approval (#74), it stays unadmitted and the bond is kept.
         const auto kept = backend.reconcile_bonds({primary_peer});
         ASSERT_TRUE(kept);
         EXPECT_EQ(kept.value(), 1U);
-        EXPECT_EQ(removals(mock), 0U) << "an approved bond was removed (#74)";
-    }
-    expect_forgotten_after_reconciliation(bus_address, mock, directory);
-}
-// The adapter is Android-Auto-exclusive: a forgotten phone paired again outside Android Auto is
-// removed by every reconciliation that finds it bonded, each time with a warning that names only
-// its redacted address and tells the owner to enrol it again.
-TEST_F(ManagedBonds, ForgottenPhonePairedOutsideAndroidAutoIsRemovedWithAWarningEachTime) {
-    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
-    ASSERT_NE(bus_address, nullptr);
-    MockBluez mock{bus_address};
-    { std::ofstream{directory + "/revoked-bonds"} << "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n"; }
-    ASSERT_EQ(::chmod((directory + "/revoked-bonds").c_str(), 0600), 0);
-    helper::BluezBackend backend{bus_address, steady(), directory, ::getuid()};
-    ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
-    for (std::size_t pairing = 1; pairing <= 2; ++pairing) {
-        ASSERT_EQ(mock.command("restore"), "ok");
-        ASSERT_EQ(mock.command("paired"), "ok");  // paired again outside Android Auto
+        EXPECT_EQ(removals(mock), 0U) << "an ambiguous/approved bond was removed";
+
         testing::internal::CaptureStderr();
         const auto reconciled = backend.reconcile_bonds({});
         const auto log = testing::internal::GetCapturedStderr();
         ASSERT_TRUE(reconciled);
-        EXPECT_EQ(removals(mock), pairing) << "the re-paired forgotten phone was kept";
-        EXPECT_NE(log.find("warning bond_removed_revoked_identity id-"), std::string::npos) << log;
-        EXPECT_NE(log.find("forgotten in Android Auto"), std::string::npos) << log;
+        EXPECT_EQ(reconciled.value(), 0U);
+        EXPECT_EQ(removals(mock), 0U) << "ambiguous revoked history removed a shared-adapter bond";
+        EXPECT_NE(log.find("system-helper: warning bond_refused_revoked_identity id-"), std::string::npos) << log;
+        EXPECT_NE(log.find("keeping the shared adapter bond and refusing Android Auto use"), std::string::npos) << log;
+        EXPECT_EQ(log.find("02:00:00:00:00:01"), std::string::npos) << "the raw address was logged";
+        EXPECT_FALSE(peer_in(directory, "managed-bonds"));
+
+        const auto obs = backend.observe();
+        ASSERT_TRUE(obs);
+        EXPECT_FALSE(backend.reconnect_peer(obs.value().handle)) << "ambiguous revoked bond reconnected";
+    }
+}
+// Cases (b), (c-restart), (e), (f): Shared-adapter policy (owner decision 2026-11-15).
+// A phone forgotten in Android Auto (completed revocation -> retired R) and later bonded again
+// outside Android Auto is kept on the shared adapter, refused Android Auto admission/bootstrap/HFP/
+// reconnect, logged once while bonded with a redacted warning (also across helper restart), and
+// can still be re-enrolled through the normal Android Auto flow (which clears history).
+TEST_F(ManagedBonds, OutsideRebondAfterRevocationIsKeptRefusedAcrossRestartAndAllowsReenrolment) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    enrol_admitted(bus_address, mock, directory);
+    if (HasFatalFailure()) return;
+    {
+        helper::BluezBackend backend{bus_address, steady(), directory, ::getuid()};
+        ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+        ASSERT_TRUE(backend.reconcile_bonds({primary_peer}));
+        ASSERT_TRUE(backend.revoke_peer(primary_peer));
+        EXPECT_EQ(removals(mock), 1U);
+        EXPECT_NE(file_text(directory + "/revoked-bonds").find("02:00:00:00:00:01 02:00:00:00:00:AA R\n"),
+                  std::string::npos);
+        EXPECT_FALSE(peer_in(directory, "pending-removals"));
+
+        // Re-bonded outside Android Auto: kept, refused, warned once while bonded.
+        ASSERT_EQ(mock.command("restore"), "ok");
+        ASSERT_EQ(mock.command("paired"), "ok");
+        testing::internal::CaptureStderr();
+        const auto first = backend.reconcile_bonds({});
+        const auto log = testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(first);
+        EXPECT_EQ(first.value(), 0U);
+        EXPECT_EQ(removals(mock), 1U) << "outside re-bond was removed";
+        EXPECT_NE(log.find("system-helper: warning bond_refused_revoked_identity id-"), std::string::npos) << log;
+        EXPECT_NE(log.find("paired outside Android Auto"), std::string::npos) << log;
         EXPECT_NE(log.find("Enrol the phone again in Android Auto"), std::string::npos) << log;
         EXPECT_EQ(log.find("02:00:00:00:00:01"), std::string::npos) << "the raw address was logged";
+        EXPECT_FALSE(peer_in(directory, "managed-bonds"));
         EXPECT_FALSE(peer_in(directory, "pending-removals"));
+
+        // Staying bonded does not spam the warning; stale approval counts as unadmitted and keeps bond.
+        testing::internal::CaptureStderr();
+        const auto stale = backend.reconcile_bonds({primary_peer});
+        const auto repeat_log = testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(stale);
+        EXPECT_EQ(stale.value(), 1U);
+        EXPECT_EQ(removals(mock), 1U);
+        EXPECT_EQ(repeat_log.find("bond_refused_revoked_identity"), std::string::npos);
+
+        // No admission or reconnect.
+        const auto obs = backend.observe();
+        ASSERT_TRUE(obs);
+        EXPECT_FALSE(backend.reconnect_peer(obs.value().handle));
+
+        // Unpairing and re-bonding again outside AA warns once more.
+        ASSERT_EQ(mock.command("unpaired"), "ok");
+        testing::internal::CaptureStderr();
+        ASSERT_TRUE(backend.reconcile_bonds({}));
+        EXPECT_EQ(testing::internal::GetCapturedStderr().find("bond_refused_revoked_identity"), std::string::npos);
+        ASSERT_EQ(mock.command("paired"), "ok");
+        testing::internal::CaptureStderr();
+        ASSERT_TRUE(backend.reconcile_bonds({}));
+        EXPECT_NE(testing::internal::GetCapturedStderr().find("warning bond_refused_revoked_identity id-"),
+                  std::string::npos);
+        EXPECT_EQ(removals(mock), 1U);
     }
-    // Nothing re-paired: no warning.
-    testing::internal::CaptureStderr();
-    ASSERT_TRUE(backend.reconcile_bonds({}));
-    EXPECT_EQ(testing::internal::GetCapturedStderr().find("bond_removed_revoked_identity"), std::string::npos);
+
+    // Across helper restart: the outside re-bond stays kept, refused, and logged once.
+    {
+        helper::BluezBackend restarted{bus_address, steady(), directory, ::getuid()};
+        ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+        testing::internal::CaptureStderr();
+        const auto reconciled = restarted.reconcile_bonds({});
+        const auto log = testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(reconciled);
+        EXPECT_EQ(reconciled.value(), 0U);
+        EXPECT_EQ(removals(mock), 1U) << "restarted helper removed an outside re-bond";
+        EXPECT_NE(log.find("system-helper: warning bond_refused_revoked_identity id-"), std::string::npos) << log;
+        EXPECT_EQ(log.find("02:00:00:00:00:01"), std::string::npos);
+        EXPECT_FALSE(peer_in(directory, "managed-bonds"));
+
+        const auto obs = restarted.observe();
+        ASSERT_TRUE(obs);
+        EXPECT_FALSE(restarted.reconnect_peer(obs.value().handle));
+
+        // Normal re-enrolment works and clears revocation history.
+        ASSERT_EQ(mock.command("unpaired"), "ok");
+        const auto enrol_obs = restarted.observe();
+        ASSERT_TRUE(enrol_obs);
+        accept_enrolment(restarted, mock, enrol_obs.value().handle);
+        if (HasFatalFailure()) return;
+        ASSERT_TRUE(admit(restarted));
+        ASSERT_TRUE(restarted.apply(helper::Action::close_pairing, 0));
+        EXPECT_FALSE(peer_in(directory, "revoked-bonds"));
+        EXPECT_TRUE(peer_in(directory, "managed-bonds"));
+        const auto settled = restarted.reconcile_bonds({primary_peer});
+        ASSERT_TRUE(settled);
+        EXPECT_EQ(settled.value(), 0U);
+        const auto conn_obs = restarted.observe();
+        ASSERT_TRUE(conn_obs);
+        EXPECT_TRUE(restarted.reconnect_peer(conn_obs.value().handle));
+        ASSERT_TRUE(restarted.apply(helper::Action::close_pairing, 0));
+    }
 }
 // An unrelated bond (no helper file names it) is never touched by reconciliation.
 TEST_F(ManagedBonds, ReconciliationNeverRemovesABondTheHelperDoesNotName) {
@@ -1025,9 +1160,9 @@ TEST_F(ManagedBonds, ReconciliationNeverRemovesABondTheHelperDoesNotName) {
     EXPECT_EQ(removals(mock), 0U);
 }
 // Process exit between each step of the demotion order (journal, history, managed, RemoveDevice,
-// journal drop). The child is this test binary, re-executed with the crash point in its environment;
-// the trust test's fsync/renameat seam observes every step and exits the process at that point.
-enum class CrashPoint { journalled, history, managed, removed };
+// retired marker, journal drop). The child is this test binary, re-executed with the crash point in
+// its environment; the trust test's fsync/renameat seam observes every step and exits at that point.
+enum class CrashPoint { journalled, history, managed, removed, retired };
 TEST(DemotionCrashChild, ForgetsUntilTheCrashPoint) {
     const char* dir = std::getenv("AA_DEMOTION_CRASH_DIR");
     const char* point = std::getenv("AA_DEMOTION_CRASH_POINT");
@@ -1041,26 +1176,22 @@ TEST(DemotionCrashChild, ForgetsUntilTheCrashPoint) {
     trust::test::faults::set_observer([directory, crash, seen] {
         const bool journal = peer_in(directory, "pending-removals"), history = peer_in(directory, "revoked-bonds"),
                    managed_entry = peer_in(directory, "managed-bonds");
+        const bool retired_entry = history && file_text(directory + "/revoked-bonds").find(" R\n") != std::string::npos;
         bool at = false;
         switch (crash) {
         case CrashPoint::journalled: at = journal && !history && managed_entry && ++*seen == 2; break;
         case CrashPoint::history: at = journal && history && managed_entry && ++*seen == 2; break;
         case CrashPoint::managed: at = !managed_entry && ++*seen == 1; break;  // before RemoveDevice
-        case CrashPoint::removed: at = !managed_entry && ++*seen == 2; break;  // after it, before the drop
+        case CrashPoint::removed: at = !managed_entry && ++*seen == 2; break;  // after it, before retired R
+        case CrashPoint::retired: at = !managed_entry && retired_entry && ++*seen == 1; break;  // R set, before drop
         }
         if (at) ::_exit(9);
     });
     (void)backend.revoke_peer(primary_peer);
     ::_exit(0);  // the crash point was never reached: the parent fails
 }
-class DemotionCrash : public ManagedBonds, public testing::WithParamInterface<int> {};
-TEST_P(DemotionCrash, RestartAndReconciliationLeaveNoBondAndNoApproval) {
-    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
-    ASSERT_NE(bus_address, nullptr);
-    MockBluez mock{bus_address};
-    enrol_admitted(bus_address, mock, directory);
-    if (HasFatalFailure()) return;
-    const auto point = std::to_string(GetParam());
+static int spawn_demotion_crash_child(const std::string& directory, CrashPoint crash_point) {
+    const auto point = std::to_string(static_cast<int>(crash_point));
     const std::string env_dir = "AA_DEMOTION_CRASH_DIR=" + directory, env_point = "AA_DEMOTION_CRASH_POINT=" + point;
     std::vector<std::string> env;
     for (char** item = environ; *item; ++item) env.emplace_back(*item);
@@ -1073,15 +1204,61 @@ TEST_P(DemotionCrash, RestartAndReconciliationLeaveNoBondAndNoApproval) {
     std::string filter = "--gtest_filter=DemotionCrashChild.ForgetsUntilTheCrashPoint";
     char* argv[]{self.data(), filter.data(), nullptr};
     pid_t child{};
-    ASSERT_EQ(::posix_spawn(&child, self.c_str(), nullptr, nullptr, argv, envp.data()), 0);
+    if (::posix_spawn(&child, self.c_str(), nullptr, nullptr, argv, envp.data()) != 0) return -1;
     int status{};
-    ASSERT_EQ(::waitpid(child, &status, 0), child);
-    ASSERT_TRUE(WIFEXITED(status));
-    ASSERT_EQ(WEXITSTATUS(status), 9) << "the helper never reached crash point " << point;
-    EXPECT_EQ(removals(mock), GetParam() == static_cast<int>(CrashPoint::removed) ? 1U : 0U);
+    if (::waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+class DemotionCrash : public ManagedBonds, public testing::WithParamInterface<int> {};
+TEST_P(DemotionCrash, RestartAndReconciliationLeaveNoBondAndNoApproval) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    enrol_admitted(bus_address, mock, directory);
+    if (HasFatalFailure()) return;
+    const auto crash_point = static_cast<CrashPoint>(GetParam());
+    ASSERT_EQ(spawn_demotion_crash_child(directory, crash_point), 9)
+        << "the helper never reached crash point " << GetParam();
+    const bool already_removed =
+        crash_point == CrashPoint::removed || crash_point == CrashPoint::retired;
+    EXPECT_EQ(removals(mock), already_removed ? 1U : 0U);
     expect_forgotten_after_reconciliation(bus_address, mock, directory);
 }
-INSTANTIATE_TEST_SUITE_P(EachStep, DemotionCrash, testing::Range(0, 4));
+INSTANTIATE_TEST_SUITE_P(EachStep, DemotionCrash, testing::Range(0, 5));
+// Case (c-crash): if the helper crashes after RemoveDevice + writing retired `R` in revoked-bonds
+// and before dropping pending-removals, and the phone re-bonds outside Android Auto while the helper
+// is down, reconciliation drops the stale journal entry, keeps the bond, and refuses Android Auto.
+TEST_F(ManagedBonds, CrashAfterRetiredBeforeJournalDropKeepsOutsideRebondAndClearsStaleJournal) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    enrol_admitted(bus_address, mock, directory);
+    if (HasFatalFailure()) return;
+    ASSERT_EQ(spawn_demotion_crash_child(directory, CrashPoint::retired), 9);
+    EXPECT_EQ(removals(mock), 1U);
+    EXPECT_TRUE(peer_in(directory, "pending-removals"));
+    EXPECT_NE(file_text(directory + "/revoked-bonds").find(" R\n"), std::string::npos);
+
+    // Outside pairing while the helper is down.
+    ASSERT_EQ(mock.command("restore"), "ok");
+    ASSERT_EQ(mock.command("paired"), "ok");
+
+    helper::BluezBackend restarted{bus_address, steady(), directory, ::getuid()};
+    ASSERT_TRUE(restarted.apply(helper::Action::register_profile, 0));
+    testing::internal::CaptureStderr();
+    const auto reconciled = restarted.reconcile_bonds({});
+    const auto log = testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(reconciled);
+    EXPECT_EQ(reconciled.value(), 0U);
+    EXPECT_EQ(removals(mock), 1U) << "stale post-removal journal removed a subsequent outside bond";
+    EXPECT_FALSE(peer_in(directory, "pending-removals")) << "stale journal entry was not dropped";
+    EXPECT_FALSE(peer_in(directory, "managed-bonds"));
+    EXPECT_NE(log.find("system-helper: warning bond_refused_revoked_identity id-"), std::string::npos) << log;
+    EXPECT_EQ(log.find("02:00:00:00:00:01"), std::string::npos);
+    const auto obs = restarted.observe();
+    ASSERT_TRUE(obs);
+    EXPECT_FALSE(restarted.reconnect_peer(obs.value().handle));
+}
 
 // --- Revocation wins until a fresh enrolment commits (P2-2). ---
 enum class Unaccepted { reject, cancel, timeout };

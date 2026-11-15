@@ -70,7 +70,7 @@ bool write_all(int fd, const std::string& data) {
 }
 }
 ManagedPeers::ManagedPeers(std::string path, std::uint32_t owner, std::string file)
-    : directory_(std::move(path)), file_(std::move(file)), owner_(owner) {
+    : directory_(std::move(path)), file_(std::move(file)), owner_(owner), stateful_(file_ == "revoked-bonds") {
     const auto reject = [this](const char* why) { reason_ = why; };
     Fd dir{directory(directory_, owner_)};
     if (dir.value < 0) { reject("state directory is missing, not private to its owner, or reached through a symlink"); return; }
@@ -83,23 +83,43 @@ ManagedPeers::ManagedPeers(std::string path, std::uint32_t owner, std::string fi
     if (::fstat(input.value, &st) || !S_ISREG(st.st_mode) || st.st_uid != owner_ ||
         (st.st_mode & 07777) != 0600 || st.st_nlink != 1)
         { reject("state file is not a single-link regular 0600 file owned by the helper user"); return; }
-    if (st.st_size < 3 || st.st_size > 9220) { reject("state file has an invalid size"); return; }
-    std::array<char, 9221> buffer{};
+    const off_t max_size = stateful_ ? 9732 : 9220;
+    if (st.st_size < 3 || st.st_size > max_size) { reject("state file has an invalid size"); return; }
+    std::array<char, 9733> buffer{};
     ssize_t n;
     do { n = ::read(input.value, buffer.data(), buffer.size()); } while (n < 0 && errno == EINTR);
     if (n != st.st_size) { reject("state file could not be read completely"); return; }
     const std::string text{buffer.data(), static_cast<std::size_t>(n)};
-    if (!text.starts_with("v1\n") || text.back() != '\n') { reject("state file has an unknown version or a truncated record"); return; }
+    if (text.back() != '\n') { reject("state file has an unknown version or a truncated record"); return; }
     std::vector<PeerIdentity> parsed;
-    for (std::size_t offset = 3; offset < text.size(); offset += 36) {
-        if (offset + 36 > text.size() || text[offset + 17] != ' ' || text[offset + 35] != '\n' || parsed.size() >= kLimit)
-            { reject("state file has a malformed or excess record"); return; }
-        PeerIdentity peer{text.substr(offset, 17), text.substr(offset + 18, 17)};
-        if (!address_valid(peer.address) || !address_valid(peer.adapter) || std::find(parsed.begin(), parsed.end(), peer) != parsed.end())
-            { reject("state file has an invalid or duplicate address"); return; }
-        parsed.push_back(std::move(peer));
+    std::vector<bool> parsed_retired;
+    if (text.starts_with("v1\n")) {
+        for (std::size_t offset = 3; offset < text.size(); offset += 36) {
+            if (offset + 36 > text.size() || text[offset + 17] != ' ' || text[offset + 35] != '\n' || parsed.size() >= kLimit)
+                { reject("state file has a malformed or excess record"); return; }
+            PeerIdentity peer{text.substr(offset, 17), text.substr(offset + 18, 17)};
+            if (!address_valid(peer.address) || !address_valid(peer.adapter) || std::find(parsed.begin(), parsed.end(), peer) != parsed.end())
+                { reject("state file has an invalid or duplicate address"); return; }
+            parsed.push_back(std::move(peer));
+            parsed_retired.push_back(false);
+        }
+    } else if (stateful_ && text.starts_with("v2\n")) {
+        for (std::size_t offset = 3; offset < text.size(); offset += 38) {
+            if (offset + 38 > text.size() || text[offset + 17] != ' ' || text[offset + 35] != ' ' ||
+                (text[offset + 36] != 'P' && text[offset + 36] != 'R') || text[offset + 37] != '\n' ||
+                parsed.size() >= kLimit)
+                { reject("state file has a malformed or excess record"); return; }
+            PeerIdentity peer{text.substr(offset, 17), text.substr(offset + 18, 17)};
+            if (!address_valid(peer.address) || !address_valid(peer.adapter) || std::find(parsed.begin(), parsed.end(), peer) != parsed.end())
+                { reject("state file has an invalid or duplicate address"); return; }
+            parsed.push_back(std::move(peer));
+            parsed_retired.push_back(text[offset + 36] == 'R');
+        }
+    } else {
+        reject("state file has an unknown version or a truncated record"); return;
     }
     peers_ = std::move(parsed);
+    retired_ = std::move(parsed_retired);
     valid_ = true;
     if (!sync_directory(dir.value)) admitted_ = 0;
 }
@@ -115,6 +135,13 @@ bool ManagedPeers::admitted(const PeerIdentity& peer) const {
     const auto count = static_cast<std::vector<PeerIdentity>::difference_type>(std::min(admitted_, peers_.size()));
     const auto end = std::next(peers_.begin(), count);
     return std::find(peers_.begin(), end, peer) != end;
+}
+bool ManagedPeers::retired(const PeerIdentity& peer) const {
+    if (!valid_ || !stateful_) return false;
+    const auto at = std::find(peers_.begin(), peers_.end(), peer);
+    if (at == peers_.end()) return false;
+    const auto index = static_cast<std::size_t>(at - peers_.begin());
+    return index < retired_.size() && retired_[index];
 }
 bool ManagedPeers::sync_directory(int dir_fd) {
     if (fsync_retry(dir_fd)) {
@@ -134,9 +161,13 @@ bool ManagedPeers::confirm_durable() {
 // Stages the complete replacement list and renames it into place. True once the rename happened
 // (the new list is then the state on disk; the caller still owes a directory sync). Until the
 // rename any failure leaves the old file authoritative (staging discarded) and returns false.
-bool ManagedPeers::replace(int directory_fd, const std::vector<PeerIdentity>& next) {
-    std::string data{"v1\n"};
-    for (const auto& saved : next) data += saved.address + " " + saved.adapter + "\n";
+bool ManagedPeers::replace(int directory_fd, const std::vector<PeerIdentity>& next, const std::vector<bool>& next_retired) {
+    std::string data{stateful_ ? "v2\n" : "v1\n"};
+    for (std::size_t i = 0; i < next.size(); ++i) {
+        data += next[i].address + " " + next[i].adapter;
+        if (stateful_) data += (i < next_retired.size() && next_retired[i]) ? " R" : " P";
+        data += "\n";
+    }
     const auto temp = staging_name(file_);
     // Exclusive staging never follows or truncates a foreign/stale file.
     Fd out{::openat(directory_fd, temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600)};
@@ -152,26 +183,48 @@ bool ManagedPeers::replace(int directory_fd, const std::vector<PeerIdentity>& ne
 }
 // Admission: true only when the entry is on disk AND its directory entry is
 // durable. Every failure refuses this admission only; revocable() is unaffected.
-bool ManagedPeers::remember(const PeerIdentity& peer, bool evict_oldest) {
+bool ManagedPeers::remember(const PeerIdentity& peer, bool evict_oldest, bool retired) {
     if (!valid_ || !address_valid(peer.address) || !address_valid(peer.adapter)) return false;
-    const bool known = contains(peer);
-    if (known && durable_) return true;
-    if (!known && peers_.size() >= kLimit && !evict_oldest) return false;
+    const bool desired_retired = stateful_ && retired;
+    const auto at = std::find(peers_.begin(), peers_.end(), peer);
+    const bool known = at != peers_.end();
+    if (known) {
+        const auto index = static_cast<std::size_t>(at - peers_.begin());
+        const bool same_state = !stateful_ || (index < retired_.size() && retired_[index] == desired_retired);
+        if (same_state && durable_) return true;
+        Fd dir{directory(directory_, owner_)};
+        if (dir.value < 0) return false;
+        if (same_state) return sync_directory(dir.value);
+        if (!durable_ && !sync_directory(dir.value)) return false;
+        auto next = peers_;
+        auto next_retired = retired_;
+        if (next_retired.size() < next.size()) next_retired.resize(next.size(), false);
+        next_retired[index] = desired_retired;
+        if (!replace(dir.value, next, next_retired)) return false;
+        peers_ = std::move(next);
+        retired_ = std::move(next_retired);
+        return sync_directory(dir.value);
+    }
+    if (peers_.size() >= kLimit && !evict_oldest) return false;
     Fd dir{directory(directory_, owner_)};
     if (dir.value < 0) return false;                       // nothing written
-    if (!durable_) {                                       // renamed earlier, directory sync unconfirmed
-        if (!sync_directory(dir.value)) return false;
-        if (known) return true;
-    }
+    if (!durable_ && !sync_directory(dir.value)) return false;
     auto next = peers_;
+    auto next_retired = retired_;
+    if (next_retired.size() < next.size()) next_retired.resize(next.size(), false);
     const bool evict = next.size() >= kLimit;
-    if (evict) next.erase(next.begin());
+    if (evict) {
+        next.erase(next.begin());
+        next_retired.erase(next_retired.begin());
+    }
     next.push_back(peer);
-    if (!replace(dir.value, next)) return false;
+    next_retired.push_back(desired_retired);
+    if (!replace(dir.value, next, next_retired)) return false;
     // Past the rename the entry IS the state on disk and cannot roll back, so it
     // counts for revocation even when the directory sync cannot be confirmed,
     // while remaining unadmitted until a directory fsync succeeds.
     peers_ = std::move(next);
+    retired_ = std::move(next_retired);
     if (evict && admitted_) --admitted_;                   // the durable prefix lost its oldest entry
     return sync_directory(dir.value);                      // refuse this admission; retried next time
 }
@@ -188,10 +241,13 @@ bool ManagedPeers::forget(const PeerIdentity& peer) {
     }
     if (dir.value < 0) return false;
     auto next = peers_;
+    auto next_retired = retired_;
     const auto index = static_cast<std::size_t>(at - peers_.begin());
     next.erase(next.begin() + static_cast<std::ptrdiff_t>(index));
-    if (!replace(dir.value, next)) return false;
+    if (index < next_retired.size()) next_retired.erase(next_retired.begin() + static_cast<std::ptrdiff_t>(index));
+    if (!replace(dir.value, next, next_retired)) return false;
     peers_ = std::move(next);
+    retired_ = std::move(next_retired);
     if (index < admitted_) --admitted_;                    // admitted entries are the durable prefix
     return sync_directory(dir.value);                      // removed in memory; not durable until synced
 }

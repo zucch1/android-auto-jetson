@@ -419,6 +419,51 @@ def just_works_after_failed_pairing(build: Path, directory: Path) -> None:
         print("PASS just_works_after_failed_pairing_is_refused_and_records_nothing", flush=True)
 
 
+def outside_rebond_kept_and_refused(build: Path, directory: Path) -> None:
+    """Shared-adapter policy: a forgotten phone paired outside Android Auto is kept and refused."""
+    with contextlib.ExitStack() as stack:
+        surface = ComposedSurface(stack, build, directory)
+        request = surface.request()
+        surface.confirm(request)
+        wait(lambda: surface.phone() != 0)
+        assert peer_in(directory, "managed-bonds")
+        surface.forget(surface.phone())
+        wait(lambda: command(surface.receiver, "pending-revocations") == "0")
+        assert len(surface.state()["removed"]) == 1
+        assert "02:00:00:00:00:01 02:00:00:00:00:AA R\n" in (directory / "revoked-bonds").read_text()
+        assert not peer_in(directory, "pending-removals")
+
+        # Paired again outside Android Auto: refused before and across a helper restart, never removed.
+        command(surface.mock, "restore")
+        command(surface.mock, "paired")
+        assert command(surface.receiver, "reconnect") != "0"
+        assert command(surface.mock, "AuthorizeService hfp") == "rejected"
+        assert command(surface.mock, "AuthorizeService") == "rejected"
+        assert command(surface.mock, "NewConnection") == "rejected"
+        assert len(surface.state()["removed"]) == 1
+
+        stop_helper(surface)
+        start_helper(stack, build, directory, surface)
+        time.sleep(1.5)  # live receiver reconciles the restarted helper incarnation
+        assert len(surface.state()["removed"]) == 1, "restarted helper removed an outside re-bond"
+        assert not peer_in(directory, "managed-bonds")
+        assert command(surface.receiver, "reconnect") != "0"
+        assert command(surface.mock, "AuthorizeService hfp") == "rejected"
+        assert command(surface.mock, "AuthorizeService") == "rejected"
+        assert command(surface.mock, "NewConnection") == "rejected"
+
+        # Normal Android Auto re-enrolment succeeds and clears revocation history.
+        command(surface.mock, "unpaired")
+        request = surface.request()
+        surface.confirm(request)
+        wait(lambda: peer_in(directory, "managed-bonds") and not peer_in(directory, "revoked-bonds"), 8)
+        assert command(surface.receiver, "reconnect") == "0"
+        assert command(surface.mock, "AuthorizeService hfp") == "allowed"
+        assert command(surface.mock, "AuthorizeService") == "allowed"
+        assert command(surface.mock, "NewConnection") == "allowed"
+        print("PASS outside_rebond_kept_and_refused_across_restart_and_reenrols", flush=True)
+
+
 if __name__ == "__main__":
     build = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="aa-enrolment-", dir=build) as temporary:
@@ -461,3 +506,6 @@ if __name__ == "__main__":
             directory = Path(temporary) / f"store-write-{removal_fails}"
             directory.mkdir(mode=0o700)
             store_write_failure_after_acknowledgement(build, directory, removal_fails)
+        directory = Path(temporary) / "outside-rebond"
+        directory.mkdir(mode=0o700)
+        outside_rebond_kept_and_refused(build, directory)

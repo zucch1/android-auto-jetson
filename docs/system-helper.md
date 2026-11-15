@@ -125,10 +125,12 @@ commit keeps a durable approval and reconciliation admits the bond (docs/enrolme
 A failing reconciliation emits `bond_reconcile_pending` once (retried every second); approved
 identities the helper cannot admit are reported as `bond_reconcile_unadmitted_enrol_again` with
 their count: the recovery is to enrol each such phone again (or ForgetPhone it). The Jetson's
-Bluetooth adapter is Android-Auto-exclusive: a phone forgotten in Android Auto that is paired
-again outside it is removed again by reconciliation, and the helper logs the warning
-`bond_removed_revoked_identity` with the redacted address each time, saying the phone was
-forgotten in Android Auto and must be enrolled again. Bond removals run under a per-invocation
+Bluetooth adapter is shared with the car infotainment system (owner decision, 2026-11-15):
+a phone forgotten in Android Auto that is paired again outside it (or whose revocation history
+is ambiguous without an owed `pending-removals` entry) is left alone on the adapter, refused
+Android Auto use, and logged once while bonded with `bond_refused_revoked_identity` and the
+redacted address, saying the phone was forgotten in Android Auto and must be enrolled again.
+Bonds that Android Auto itself still owes removal for still run under a per-invocation
 budget (two attempts, 100 ms) with per-identity exponential backoff, so a slow or failing BlueZ
 never delays another phone's reconciliation, confirm or reconnect (docs/enrolment-ordering.md,
 Removal budget). `PairingOpened`
@@ -215,8 +217,9 @@ comparison acceptance, exact bond verification, every receiver-side check and th
 receiver's durable trust write. Pending admission and acknowledgement never write `managed-bonds`;
 admission records the identity in `pending-removals` (same file rules, not revocation authority)
 so a restarted helper still removes an unaccepted or provisional bond. Revocation moves an
-entry from `managed-bonds` to `revoked-bonds` (same file rules, at most 256, oldest evicted):
-revocation authority only, never admission.
+entry from `managed-bonds` to `revoked-bonds` (`v2`, storing `P` pending vs `R` retired so outside
+re-bonds after completed removal can be distinguished safely, while reading legacy `v1` as `P`;
+same file rules, at most 256, oldest evicted): revocation authority only, never admission.
 A trusted reconnect is admitted only for an
 identity already on the list whose directory entry is durable (loaded after a confirmed
 directory fsync at startup, or committed by a successful one; a pending sync is retried on

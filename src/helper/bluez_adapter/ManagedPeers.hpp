@@ -24,9 +24,11 @@ public:
     bool contains(const PeerIdentity&) const;   // present in the list, durable or not
     bool revocable(const PeerIdentity& peer) const { return contains(peer); }
     bool admitted(const PeerIdentity&) const;
+    bool retired(const PeerIdentity&) const;
     bool confirm_durable();
     // evict_oldest: a full list drops its oldest entry instead of refusing (history lists only).
-    bool remember(const PeerIdentity&, bool evict_oldest = false);
+    // retired: for revoked-bonds only, records that BlueZ confirmed no bond after revocation.
+    bool remember(const PeerIdentity&, bool evict_oldest = false, bool retired = false);
     // Removes an entry; for a list that is not revocation authority. True only when the entry
     // is durably gone: absent and the directory sync confirmed (a pending unsynced rename is
     // retried here), or rewritten, renamed into place and the directory synced. A transient
@@ -35,15 +37,17 @@ public:
     bool forget(const PeerIdentity&);
     const std::vector<PeerIdentity>& peers() const { return peers_; }
 private:
-    bool replace(int directory, const std::vector<PeerIdentity>&);
+    bool replace(int directory, const std::vector<PeerIdentity>&, const std::vector<bool>&);
     bool sync_directory(int dir_fd);
     std::string directory_;
     std::string file_;
     std::uint32_t owner_;
+    bool stateful_{};
     bool valid_{};
     bool durable_{true};
     std::size_t admitted_{};
     std::string reason_;
     std::vector<PeerIdentity> peers_;
+    std::vector<bool> retired_;
 };
 }
