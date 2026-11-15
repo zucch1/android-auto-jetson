@@ -42,6 +42,49 @@ protected:
     }
     void TearDown() override { std::filesystem::remove_all(directory); }
 };
+TEST_F(ManagedBonds, BondDigestPersistsCanonicalEvidenceAndRejectsUnsafeOrMalformedInputs) {
+    const auto device = std::filesystem::path{directory} / "bluetooth" / managed.adapter / managed.address;
+    std::filesystem::create_directories(device);
+    const auto write_info = [&](const std::string& key) {
+        std::ofstream{device / "info", std::ios::trunc} << "[LinkKey]\nKey=" << key << "\n";
+        ASSERT_EQ(::chmod((device / "info").c_str(), 0600), 0);
+    };
+    // Synthetic test material only; never read a host BlueZ directory.
+    write_info(std::string(32, 'A'));
+    std::optional<std::string> original;
+    {
+        helper::bluez_adapter::BondDigest digest{directory, ::getuid()};
+        ASSERT_TRUE(digest.valid());
+        original = digest.compute(managed);
+        ASSERT_TRUE(original.has_value());
+        ASSERT_EQ(original->size(), 64U);
+    }
+    struct stat st{};
+    ASSERT_EQ(::stat((directory + "/bond-digest.key").c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & 0777, 0600);
+    EXPECT_EQ(st.st_size, 32);
+    helper::bluez_adapter::BondDigest restarted{directory, ::getuid()};
+    ASSERT_TRUE(restarted.valid());
+    write_info(std::string(32, 'a'));  // Hex case is irrelevant to bond identity.
+    EXPECT_TRUE(restarted.compute(managed) == original);
+    write_info(std::string(32, 'b'));
+    const auto changed = restarted.compute(managed);
+    ASSERT_TRUE(changed.has_value());
+    EXPECT_TRUE(changed != original);
+    for (const auto size : {16U, 30U, 34U, 128U}) {
+        write_info(std::string(size, 'a'));
+        EXPECT_FALSE(restarted.compute(managed).has_value());
+    }
+    write_info(std::string(32, 'z'));
+    EXPECT_FALSE(restarted.compute(managed).has_value());
+    write_info(std::string(32, 'a'));
+    ASSERT_EQ(::chmod((device / "info").c_str(), 0666), 0);
+    EXPECT_FALSE(restarted.compute(managed).has_value());
+    ASSERT_TRUE(std::filesystem::remove(device / "info"));
+    ASSERT_EQ(::symlink("/dev/null", (device / "info").c_str()), 0);
+    EXPECT_FALSE(restarted.compute(managed).has_value());
+}
+
 TEST_F(ManagedBonds, RestartKeepsRevocationAuthorityAndRefusesUnmanagedBond) {
     { ManagedPeers before{directory, ::getuid()}; ASSERT_TRUE(before.valid()); ASSERT_TRUE(before.remember(managed));
       EXPECT_TRUE(before.revocable(managed)); EXPECT_TRUE(before.admitted(managed)); }
@@ -990,6 +1033,12 @@ TEST_F(ManagedBonds, ForgetWithFailedJournalWriteAndFailedRemovalIsCompletedByRe
         });
         ASSERT_EQ(mock.command("fail-remove"), "ok");
         EXPECT_FALSE(backend.revoke_peer(primary_peer)) << "a forget whose removal failed reported success";
+        // Repeated receiver retries while the journal is still unwritable must
+        // preserve original evidence and managed authority, rather than resolving
+        // the surviving AA bond as ambiguous and losing the removal obligation.
+        EXPECT_FALSE(backend.revoke_peer(primary_peer));
+        EXPECT_FALSE(backend.reconcile_bonds({}));
+        EXPECT_TRUE(peer_in(directory, "managed-bonds"));
         set_observer(nullptr);
         disarm();
         EXPECT_EQ(removals(mock), 0U);
@@ -1649,6 +1698,40 @@ TEST_F(ManagedBonds, LostRemoveDeviceReplyWithOutsideRebondNeverDeletesNewerBond
     EXPECT_NE(log.find("system-helper: warning bond_refused_revoked_identity id-"), std::string::npos) << log;
 }
 
+// A lost reply is ambiguous even without a digest: do not adopt a later outside
+// bond's key as evidence for the original obligation within the same helper run.
+class UncapturedRemoval : public ManagedBonds, public testing::WithParamInterface<bool> {};
+TEST_P(UncapturedRemoval, LostReplyKeepsOutsideRebondInSameRun) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address, directory + "/bluetooth"};
+    enrol_admitted(bus_address, mock, directory);
+    if (HasFatalFailure()) return;
+    helper::BluezBackend backend{bus_address, steady(), directory, ::getuid()};
+    ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
+    ASSERT_TRUE(backend.reconcile_bonds({primary_peer}));
+    if (GetParam()) {
+        ASSERT_EQ(mock.command("unpaired"), "ok");
+    } else {
+        ASSERT_TRUE(std::filesystem::remove(directory + "/bluetooth/02:00:00:00:00:AA/02:00:00:00:00:01/info"));
+    }
+    ASSERT_EQ(mock.command("lost-remove-reply"), "ok");
+    EXPECT_FALSE(backend.revoke_peer(primary_peer));
+    ASSERT_EQ(mock.command("normal-remove-reply"), "ok");
+    ASSERT_EQ(removals(mock), 1U);
+    ASSERT_EQ(mock.command("restore"), "ok");
+    ASSERT_EQ(mock.command("paired"), "ok");
+    testing::internal::CaptureStderr();
+    EXPECT_TRUE(backend.revoke_peer(primary_peer));
+    const auto log = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(removals(mock), 1U);
+    EXPECT_NE(log.find("bond history is ambiguous"), std::string::npos) << log;
+    EXPECT_FALSE(peer_in(directory, "pending-removals"));
+    EXPECT_NE(file_text(directory + "/revoked-bonds").find(" P\n"), std::string::npos);
+}
+
+INSTANTIATE_TEST_SUITE_P(BondVisibility, UncapturedRemoval, testing::Bool());
+
 // B1 (P1): missing/unreadable BlueZ key info on restart or legacy v1 pending-removals cannot
 // verify whether the present bond is the original AA bond -> fail safe as ambiguous (kept, P).
 TEST_F(ManagedBonds, UnverifiablePendingRemovalAfterRestartOrLegacyV1IsTreatedAsAmbiguousAndKept) {
@@ -1720,10 +1803,17 @@ TEST_F(ManagedBonds, OwedRemovalPreservedAcrossStaleApprovalParkingAndRemovedOnR
         ASSERT_EQ(mock.command("fail-remove"), "ok");
         EXPECT_FALSE(backend.revoke_peer(primary_peer));
         EXPECT_TRUE(peer_in(directory, "pending-removals"));
+    }
+    {
+        helper::BluezBackend backend{bus_address, steady(), directory, ::getuid()};
+        ASSERT_TRUE(backend.apply(helper::Action::register_profile, 0));
 
         // Resurrected/stale approval parks the owed removal into owed-removals and keeps bond (#74).
+        testing::internal::CaptureStderr();
         const auto parked = backend.reconcile_bonds({primary_peer});
+        const auto parked_log = testing::internal::GetCapturedStderr();
         ASSERT_TRUE(parked);
+        EXPECT_NE(parked_log.find("warning bond_refused_revoked_identity id-"), std::string::npos) << parked_log;
         EXPECT_EQ(parked.value(), 1U);
         EXPECT_FALSE(peer_in(directory, "pending-removals"));
         EXPECT_TRUE(peer_in(directory, "owed-removals"));
@@ -1800,7 +1890,9 @@ TEST_F(ManagedBonds, OwedRemovalPreservedAcrossStaleApprovalParkingAndRemovedOnR
         EXPECT_EQ(removals(mock), 2U) << "parked owed removal deleted a newer outside re-bond";
         EXPECT_FALSE(peer_in(directory, "owed-removals"));
         EXPECT_NE(file_text(directory + "/revoked-bonds").find(" R\n"), std::string::npos);
-        EXPECT_NE(log.find("paired outside Android Auto"), std::string::npos) << log;
+        // The mock did not emit bond loss between these calls, so the warning
+        // already emitted for the parked bond remains suppressed in this span.
+        EXPECT_EQ(log.find("bond_refused_revoked_identity"), std::string::npos) << log;
     }
 
     // Fresh AA re-enrolment while owed-removals is parked works cleanly and clears owed-removals.

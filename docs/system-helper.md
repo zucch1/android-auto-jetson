@@ -224,7 +224,17 @@ of BlueZ link/LTK material using `/var/lib/aa-system-helper/bond-digest.key`, re
 `OPENSSL_cleanse` and never persisted or logged; same file rules, not revocation authority)
 so a restarted helper still removes an unaccepted or provisional bond while verifying against
 `bond-digest.key` that a newer outside bond is never deleted after a crash or lost `RemoveDevice`
-reply. When a stale `#74` receiver approval temporarily keeps a revoked AA bond, reconciliation
+reply. The installed unit runs as root: `ProtectSystem=strict` makes BlueZ's tree read-only,
+`ProtectHome=yes` does not hide `/var/lib/bluetooth`, and no `InaccessiblePaths` rule hides it.
+No sandbox relaxation or Bluetooth-directory write permission is needed. The helper opens each
+component with `O_NOFOLLOW` and validates ownership and write permissions. Missing/unreadable
+key material or a legacy obligation without evidence after restart (or a possibly successful
+removal attempt) keeps the visible bond as ambiguous, refuses AA, and warns. It never captures
+a replacement key after an uncertain removal to authorize another removal.
+If the pending journal cannot be replaced during demotion, the independent owed journal
+retains the original evidence while managed authority stays in place and demotion reports
+failure. This preserves retries after an uncertain best-effort removal.
+When a stale `#74` receiver approval temporarily keeps a revoked AA bond, reconciliation
 parks the obligation and digest in `owed-removals` (`v2`, same file rules) so a repeated
 `ForgetPhone` (`RevokePeerV1`) or later unapproved reconciliation still removes the original AA
 bond while not blocking fresh re-enrolment. Revocation moves an

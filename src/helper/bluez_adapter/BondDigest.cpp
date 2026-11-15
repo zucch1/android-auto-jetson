@@ -86,7 +86,8 @@ std::string_view trim_ascii(std::string_view s) {
 }
 
 bool valid_hex_key(std::string_view s) {
-    if (s.size() < 16 || s.size() > 128 || (s.size() % 2) != 0) return false;
+    // BlueZ LinkKey and LTK values are 128 bits. Reject truncated or excess material.
+    if (s.size() != 32) return false;
     for (const char c : s) {
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
             return false;

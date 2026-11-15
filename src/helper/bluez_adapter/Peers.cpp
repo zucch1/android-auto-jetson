@@ -213,10 +213,10 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
                 return Error{ErrorCode::helper_unavailable};
             return {};
         }
-        if (std::find(impl_->removal_attempted.begin(), impl_->removal_attempted.end(), identity) ==
-            impl_->removal_attempted.end())
-            impl_->removal_attempted.push_back(identity);
     }
+    if (std::find(impl_->removal_attempted.begin(), impl_->removal_attempted.end(), identity) ==
+        impl_->removal_attempted.end())
+        impl_->removal_attempted.push_back(identity);
     for (const auto& device : devices) {
         if (device.identity != identity) continue;
         impl_->disconnect(device);

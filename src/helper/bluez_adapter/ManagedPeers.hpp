@@ -31,7 +31,8 @@ public:
     bool from_disk(const PeerIdentity&) const;
     bool confirm_durable();
     // evict_oldest: a full list drops its oldest entry instead of refusing (history lists only).
-    // retired: for revoked-bonds only, records that BlueZ confirmed no bond after revocation.
+    // retired: for revoked-bonds only, the original obligation ended (confirmed removal
+    // or a verified different bond); a later bond must be kept and refused.
     // digest: for pending-removals / owed-removals, optional 64-hex keyed bond digest.
     bool remember(const PeerIdentity&, bool evict_oldest = false, bool retired = false,
                   std::string_view digest = {});
