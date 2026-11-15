@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -60,6 +61,14 @@ public:
     [[nodiscard]] core::Result<void> set_display_viewport(Viewport viewport);
     [[nodiscard]] core::Result<StateSnapshot> get_state();
     [[nodiscard]] core::Result<std::uint64_t> ping();
+
+    // Enrolment (RequestAddPhone / GetPairingCandidate / ConfirmPhonePairing /
+    // CancelPhonePairing): the consumer side of the add-phone flow (#133).
+    [[nodiscard]] core::Result<core::PairingRequestId> request_add_phone();
+    [[nodiscard]] core::Result<std::map<std::string, std::string>> pairing_candidate(
+        core::PairingRequestId request);
+    [[nodiscard]] core::Result<void> confirm_phone_pairing(core::PairingRequestId request);
+    [[nodiscard]] core::Result<void> cancel_phone_pairing(core::PairingRequestId request);
 
     // Waits for the next declared contract signal (parked ones first). An
     // expired wait is the typed error `timeout`.

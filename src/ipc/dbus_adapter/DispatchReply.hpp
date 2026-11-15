@@ -28,6 +28,10 @@ inline constexpr std::string_view kMalformedRequestError =
 inline constexpr std::string_view kQueueFullError = "org.custom.AndroidAutoReceiver1.Error.QueueFull";
 inline constexpr std::string_view kIllegalTransitionError =
     "org.custom.AndroidAutoReceiver1.Error.IllegalTransition";
+// Contract 1.1.0 (#133): typed wired-enrolment failures.
+inline constexpr std::string_view kNotWiredCandidateError =
+    "org.custom.AndroidAutoReceiver1.Error.NotWiredCandidate";
+inline constexpr std::string_view kNotDurableError = "org.custom.AndroidAutoReceiver1.Error.NotDurable";
 
 [[nodiscard]] inline OutboundReply error_reply(std::string_view name, std::string_view message) {
     return OutboundReply{true, std::string{name}, std::string{message}};

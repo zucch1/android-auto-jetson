@@ -205,6 +205,13 @@ core::Result<void> ApprovedPhoneStore::forget_phone(core::PhoneId phone) {
     return {};
 }
 
+core::Result<void> ApprovedPhoneStore::sync_directory() const {
+    if (!usable_) {
+        return Error{ErrorCode::trust_store_io};
+    }
+    return detail::sync_parent_directory(path_);
+}
+
 std::string ApprovedPhoneStore::redacted_summary() const {
     std::string out;
     for (const ApprovedPhone& phone : phones_) {

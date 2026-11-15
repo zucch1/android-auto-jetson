@@ -43,7 +43,8 @@ using aa::ipc::ControlMethod;
                                        ControlMethod::set_display_viewport,
                                        ControlMethod::ping,
                                        ControlMethod::get_pairing_comparison,
-                                       ControlMethod::respond_pairing_comparison}) {
+                                       ControlMethod::respond_pairing_comparison,
+                                       ControlMethod::get_pairing_candidate}) {
         names.insert(aa::ipc::wire_name(method));
     }
     return names;
@@ -83,7 +84,7 @@ TEST(Introspection, InterfaceConstantsMatchGeneratedContract) {
     EXPECT_EQ(aa::ipc::kContractInterface, aa::ipc::dbus_contract::kInterfaceName);
     EXPECT_EQ(aa::ipc::kContractObjectPath, aa::ipc::dbus_contract::kObjectPath);
     EXPECT_EQ(aa::ipc::contract_semver(), aa::ipc::dbus_contract::kContractSemVer);
-    EXPECT_EQ(aa::ipc::contract_semver(), "1.0.0");
+    EXPECT_EQ(aa::ipc::contract_semver(), "1.1.0");
     EXPECT_EQ(aa::ipc::kContractMajor, 1U);
     const auto major = aa::ipc::contract_major(aa::ipc::kContractInterface);
     ASSERT_TRUE(major.has_value());
@@ -176,7 +177,7 @@ TEST(Introspection, SemVerMetadataIsPresentOnTheInterface) {
     // When/Then: both SemVer carriers (annotation and property) are present
     // and name the same contract version.
     const std::string_view annotation =
-        "org.custom.AndroidAutoReceiver1.ContractSemVer\" value=\"1.0.0\"";
+        "org.custom.AndroidAutoReceiver1.ContractSemVer\" value=\"1.1.0\"";
     const std::string_view property = "name=\"ContractSemVer\" type=\"s\" access=\"read\"";
     EXPECT_NE(xml.find(annotation), std::string_view::npos);
     EXPECT_NE(xml.find(property), std::string_view::npos);

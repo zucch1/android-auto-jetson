@@ -24,6 +24,7 @@ constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properti
     case ErrorCode::ipc_malformed_request: return kMalformedRequestError;
     case ErrorCode::ipc_queue_full: return kQueueFullError;
     case ErrorCode::session_illegal_transition: return kIllegalTransitionError;
+    case ErrorCode::trust_not_wired_candidate: return kNotWiredCandidateError;
     case ErrorCode::invalid_argument: return "org.freedesktop.DBus.Error.InvalidArgs";
     default: return "org.freedesktop.DBus.Error.Failed";
     }
@@ -33,6 +34,15 @@ constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properti
     return result.has_value() ? ok(std::monostate{})
                               : error_reply(error_name_for(result.error().code()),
                                             result.error().message());
+}
+
+// ConfirmPhonePairing only: a wired approval whose directory sync failed
+// (#133, contract 1.1.0). Other methods keep their generic error names.
+[[nodiscard]] OutboundReply from_confirm(const core::Result<void>& result) {
+    if (!result.has_value() && result.error().code() == ErrorCode::trust_store_not_durable) {
+        return error_reply(kNotDurableError, result.error().message());
+    }
+    return from_void(result);
 }
 
 [[nodiscard]] bool is_unique_name(std::string_view name) {
@@ -101,7 +111,7 @@ constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properti
         if (!id.has_value() || !body_consumed(cursor)) {
             return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
         }
-        return from_void(
+        return from_confirm(
             service.confirm_phone_pairing(sender, core::PairingRequestId{id.value()}));
     }
     case 6: {
@@ -157,6 +167,13 @@ constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properti
             return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
         return from_void(service.respond_pairing_comparison(sender, core::PairingRequestId{request.value()},
             {id.value(), accept.value() != 0}));
+    }
+    case 14: {
+        const auto id = cursor.read_u64();
+        if (!id || !body_consumed(cursor)) return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        const auto value = service.pairing_candidate(sender, core::PairingRequestId{id.value()});
+        if (!value) return error_reply(error_name_for(value.error().code()), value.error().message());
+        return ok(value.value());
     }
     default: {
         if (!body_consumed(cursor)) {

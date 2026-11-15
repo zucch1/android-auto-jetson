@@ -36,6 +36,7 @@ METHOD_NAMES: Final[tuple[str, ...]] = (
     "RegisterConsumer", "UnregisterConsumer", "StartProjection", "StopProjection",
     "RequestAddPhone", "ConfirmPhonePairing", "CancelPhonePairing", "ForgetPhone",
     "GetState", "GetCapabilities", "SetDisplayViewport", "Ping", "GetPairingComparison", "RespondPairingComparison",
+    "GetPairingCandidate",
 )
 PROBE_SOURCE: Final[str] = """#include <aa/ipc/dbus_contract.generated.hpp>
 #include <cstdio>
@@ -160,7 +161,7 @@ def case_real_check(root: Path) -> int:
     if result.returncode != 0:
         print(f"real-check: expected exit 0\n{result.stdout}{result.stderr}")
         return 1
-    if PASS_SUMMARY not in result.stdout or "methods=14 signals=5 properties=1" not in result.stdout:
+    if PASS_SUMMARY not in result.stdout or "methods=15 signals=5 properties=1" not in result.stdout:
         print(f"real-check: missing PASS summary\n{result.stdout}")
         return 1
     return 0
@@ -177,7 +178,7 @@ def case_real_generate(root: Path) -> int:
     if 'kInterfaceName = "org.custom.AndroidAutoReceiver1"' not in generated:
         print("real-generate: missing interface metadata")
         return 1
-    if 'kContractSemVer = "1.0.0"' not in generated:
+    if 'kContractSemVer = "1.1.0"' not in generated:
         print("real-generate: missing SemVer metadata")
         return 1
     if "kMethodInSignatures" not in generated or "kMethodOutSignatures" not in generated:
@@ -257,7 +258,7 @@ def case_neg_semver_mismatch(root: Path) -> int:
     return reject(
         root,
         lambda text: text.replace(
-            'name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.0.0"',
+            'name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.1.0"',
             'name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="2.0.0"'),
         "neg-semver-mismatch", ("DBUS_CONTRACT_SEMVER_MISMATCH",))
 
@@ -353,7 +354,7 @@ def case_embedding_crlf(root: Path) -> int:
 
 # --- structural-allowlist regressions (round 3 review) ------------------------
 
-ANNOTATION_TAG = '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.0.0"/>'
+ANNOTATION_TAG = '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.1.0"/>'
 PROPERTY_TAG = '<property name="ContractSemVer" type="s" access="read"/>'
 NODE_OPEN = '<node name="/org/custom/AndroidAutoReceiver">'
 INTERFACE_OPEN = '<interface name="org.custom.AndroidAutoReceiver1">'
@@ -431,7 +432,7 @@ def case_neg_unexpected_nested_element(root: Path) -> int:
          ("DBUS_CONTRACT_UNEXPECTED_ELEMENT",)),
         (ANNOTATION_TAG,
          '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
-         ' value="1.0.0"><bogus/></annotation>',
+         ' value="1.1.0"><bogus/></annotation>',
          ("DBUS_CONTRACT_UNEXPECTED_ELEMENT",)),
     )
     for label, (original, replaced, markers) in zip(
@@ -458,7 +459,7 @@ def case_neg_unexpected_attribute(root: Path) -> int:
          '<arg name="consumer_name" type="s" direction="in" role="x"/>'),
         (ANNOTATION_TAG,
          '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
-         ' value="1.0.0" role="x"/>'),
+         ' value="1.1.0" role="x"/>'),
     )
     for label, (original, replaced) in zip(
             ("node", "interface", "method", "signal", "property", "arg", "annotation"),
@@ -511,7 +512,7 @@ def case_neg_unexpected_text(root: Path) -> int:
 
 
 def case_neg_duplicate_annotation(root: Path) -> int:
-    conflicting = ANNOTATION_TAG.replace('value="1.0.0"', 'value="2.0.0"')
+    conflicting = ANNOTATION_TAG.replace('value="1.1.0"', 'value="2.0.0"')
     for label, replacements in (
             ("identical", ANNOTATION_TAG + "\n    " + ANNOTATION_TAG),
             ("conflicting", ANNOTATION_TAG + "\n    " + conflicting),
@@ -530,7 +531,7 @@ def case_neg_duplicate_annotation(root: Path) -> int:
 def case_neg_unexpected_annotation(root: Path) -> int:
     for label, original, replaced in (
             ("renamed", ANNOTATION_TAG,
-             '<annotation name="org.freedesktop.DBus.GLib.CSymbol" value="1.0.0"/>'),
+             '<annotation name="org.freedesktop.DBus.GLib.CSymbol" value="1.1.0"/>'),
             ("nested", '<method name="Ping">',
              '<method name="Ping">\n      ' + ANNOTATION_TAG)):
         verdict = reject(
@@ -611,7 +612,7 @@ def case_neg_invalid_preserves_existing_header(root: Path) -> int:
         ("extra-attribute",
          base.replace(ANNOTATION_TAG,
                       '<annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer"'
-                      ' value="1.0.0" role="x"/>', 1),
+                      ' value="1.1.0" role="x"/>', 1),
          ("DBUS_CONTRACT_UNEXPECTED_ATTRIBUTE",)),
         ("lexical-bypass",
          base.replace(NODE_OPEN,

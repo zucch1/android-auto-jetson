@@ -140,6 +140,33 @@ core::Result<void> ControlService::persist_pairing(const Registered& active, cor
     return {};
 }
 
+core::Result<std::map<std::string, std::string>> ControlService::pairing_candidate(
+    const BusName& caller, core::PairingRequestId request) {
+    const auto active = require_consumer();
+    if (!active) return active.error();
+    const auto admitted = admit(caller, active.value());
+    if (!admitted) return admitted.error();
+    const auto held = gate_.pending({active.value().consumer, active.value().name}, request);
+    if (!held) return held.error();
+    // A wireless request has no wired candidate. Refuse without touching it:
+    // cancelling here would spend the gate id and drop the policy snapshot
+    // without retiring the helper binding prepare() made (#141 B1).
+    if (!phones_.presents_candidates()) return Error{ErrorCode::trust_not_wired_candidate};
+    // The policy's liveness predicate: an expired request presents nothing (ConfirmPhonePairing
+    // then reports the timeout and closes it through the usual path).
+    const auto live = phones_.validate_pairing(request);
+    auto candidate = live ? phones_.pairing_candidate(request) : std::nullopt;
+    if (!candidate) {
+        // Expired or unbound: close the one-time request now so its gate slot is released.
+        phones_.pairing_cancelled(request);
+        (void)gate_.cancel({active.value().consumer, active.value().name}, request);
+        events_.emit(PairingClosed{request});
+        return live ? Error{ErrorCode::trust_unknown_phone} : live.error();
+    }
+    events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_candidate_presented", request.value});
+    return std::move(*candidate);
+}
+
 core::Result<void> ControlService::cancel_phone_pairing(const BusName& caller, core::PairingRequestId request) {
     const auto active = require_consumer();
     if (!active) return active.error();

@@ -89,9 +89,21 @@ public:
         approved_at_call = !store.phones().empty();
         return result;
     }
-    core::Result<void> cancel(core::ConsumerId, core::PairingRequestId) override { ++cancellations; return cancel_result; }
+    // Opt-in model of the helper's bounded binding table (SystemHelper: 16
+    // slots, no expiry): prepare() binds the source, only cancel() frees it.
+    std::optional<std::size_t> binding_slots;
+    std::vector<core::PairingRequestId> bindings;
+    core::Result<void> cancel(core::ConsumerId, core::PairingRequestId source) override {
+        ++cancellations;
+        if (cancel_result) std::erase(bindings, source);
+        return cancel_result;
+    }
     void teardown(core::ConsumerId) override { ++teardowns; }
-    core::Result<std::optional<helper::PeerIdentity>> prepare(core::ConsumerId, core::PairingRequestId) override {
+    core::Result<std::optional<helper::PeerIdentity>> prepare(core::ConsumerId, core::PairingRequestId source) override {
+        if (binding_slots) {
+            if (bindings.size() >= *binding_slots) return Error{ErrorCode::helper_rejected};
+            bindings.push_back(source);
+        }
         return prepared;
     }
     helper::RevocationAttempt forgotten_v1(const helper::RevocationV1& snapshot,

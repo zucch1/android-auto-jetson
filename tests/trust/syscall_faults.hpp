@@ -18,6 +18,7 @@ enum class Fault {
     dir_fsync,             // fail fsync() on directory fds
     renameat,              // fail renameat() (pre-rename)
     dir_fsync_eintr_once,  // EINTR once on the next directory fsync, then pass
+    dir_fsync_eio_once,    // EIO once on the next directory fsync, then pass
 };
 
 void arm(Fault fault) noexcept;
