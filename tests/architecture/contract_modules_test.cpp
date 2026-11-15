@@ -5,6 +5,7 @@
 // interface are usable exactly as documented.
 #include <aa/channels/Services.hpp>
 #include <aa/config/Config.hpp>
+#include <aa/config/VideoProfiles.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/ipc/Control.hpp>
 #include <aa/session/Session.hpp>
@@ -90,6 +91,30 @@ TEST(Channels, BenchDefaultsOmitUnsupportedCapabilities) {
     EXPECT_FALSE(profile.advertises(aa::protocol::ChannelRole::sensors));
     EXPECT_EQ(profile.primary, (aa::protocol::VideoProfile{1280, 720, 30}));
     EXPECT_EQ(profile.fallback, (aa::protocol::VideoProfile{800, 480, 30}));
+}
+
+TEST(Channels, BenchDefaultsTakeTheirVideoShapeFromTheSharedDefault) {
+    // Given: the single default the wired and wireless receivers also offer.
+    const auto defaults = aa::config::default_video_profiles();
+    ASSERT_EQ(defaults.size(), 2u);
+    // When: the bench capability profile is built.
+    const auto profile = aa::channels::CapabilityProfile::bench_defaults();
+    // Then: it carries that default rather than a second hard-coded pair, so
+    // changing the shared default moves the bench profile with it.
+    EXPECT_EQ(profile.primary, defaults.front());
+    EXPECT_EQ(profile.fallback, defaults[1]);
+}
+
+TEST(Config, VideoProfileOptionIsAtomicAndAcceptsNonDefaultProfiles) {
+    // Given: the shared --video-profiles option value both receivers parse.
+    std::vector<aa::protocol::VideoProfile> profiles{{1280, 720, 30}};
+    // When: a non-default profile is applied.
+    ASSERT_TRUE(aa::config::parse_video_profiles_option("1920x1080@60:h264", profiles));
+    // Then: it replaces the configured list verbatim.
+    EXPECT_EQ(profiles, (std::vector<aa::protocol::VideoProfile>{{1920, 1080, 60}}));
+    // And a bad value leaves the configured list untouched.
+    EXPECT_FALSE(aa::config::parse_video_profiles_option("1920x1080@60", profiles));
+    EXPECT_EQ(profiles, (std::vector<aa::protocol::VideoProfile>{{1920, 1080, 60}}));
 }
 
 TEST(Channels, LocalDiagnosticsRoutesWithoutExposingWireDispatch) {

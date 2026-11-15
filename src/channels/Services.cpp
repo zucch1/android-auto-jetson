@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/channels/Services.hpp>
 
+#include <aa/config/VideoProfiles.hpp>
+
 #include <algorithm>
 #include <limits>
 
 namespace aa::channels {
 
 CapabilityProfile CapabilityProfile::bench_defaults() {
-    using protocol::VideoProfile;
+    // The bench shape is the shared video-profile default, so the wired and
+    // wireless receivers and this profile cannot drift apart.
+    const auto profiles = config::default_video_profiles();
     return CapabilityProfile{
-        VideoProfile{1280, 720, 30},
-        VideoProfile{800, 480, 30},
+        profiles.front(),
+        profiles.size() > 1 ? profiles[1] : protocol::VideoProfile{},
         {},
     };
 }

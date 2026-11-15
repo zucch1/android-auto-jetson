@@ -87,6 +87,7 @@ core::Result<ServiceEntry> parse_service(const JsonValue& value) {
                 return malformed();
             }
             configuration.profiles.push_back(
+                // Fixture triples are pre-negotiation captures: the codec stays the H.264 default.
                 protocol::VideoProfile{width.value(), height.value(), fps.value()});
         }
         entry.configuration = std::move(configuration);

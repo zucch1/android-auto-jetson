@@ -9,11 +9,14 @@ rejected for performance reasons.
 
 ```
 aa-wired-receiver --port PORT --decoder software --video-profiles 2560x1440@60:h264,1920x1080@60:h265,1280x720@30:h264
+aa-wireless-receiver --store-dir DIR --phone-id N --video-profiles 1920x1080@60:h264,1280x720@30:h264
 aa-dummy-display --decoder software --presentation cpu --media-thread gui --video-profiles 2560x1440@60:h264,1920x1080@60:h265,1280x720@30:h264
 ```
 
 `--video-profiles` accepts comma-separated `WIDTHxHEIGHT@FPS:CODEC`, without
-spaces. Every video combination in the vendored protocol is valid:
+spaces. Both receivers parse it with the same `aa::config` helper, so a wireless
+service offer names the profiles it was configured with. Every video combination
+in the vendored protocol is valid:
 
 | Axis | Protocol values |
 | --- | --- |
