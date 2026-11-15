@@ -34,6 +34,7 @@ class MockBluez(ProfileSockets):
         # hold several bonds whose removal is slow and failing while another phone enrols (#118).
         self.extras: dict[str, str] = {}
         self.remove_delay_ms = 0
+        self.disconnect_delay_ms = 0
         self.remove_attempts = 0
         self.device_info = None
         self.registered_extras: set[str] = set()
@@ -170,6 +171,9 @@ class MockBluez(ProfileSockets):
                 self.profile_senders.pop(uuid, None)
             case "Disconnect":
                 self.disconnected.append(_path)
+                if self.disconnect_delay_ms:
+                    GLib.timeout_add(self.disconnect_delay_ms, lambda: (invocation.return_value(None), False)[1])
+                    return
             case "CancelPairing":
                 # BlueZ answers CancelPairing without an in-flight Pair() with MGMT Unpair Device.
                 if self.paired:
@@ -228,6 +232,11 @@ class MockBluez(ProfileSockets):
     def command(self, text: str) -> str:
         if text.startswith("hfp-wire-"):
             return self.hfp_wire(text)
+        if text.startswith("slow-remove ") or text.startswith("slow-disconnect "):
+            # Delays (ms) for RemoveDevice or Device1.Disconnect replies, for the cleanup deadline (#118).
+            name, value = text.split()
+            setattr(self, "remove_delay_ms" if name == "slow-remove" else "disconnect_delay_ms", int(value))
+            return "ok"
         if text.startswith("extra-bonds "):
             for index in range(int(text.split()[1])):
                 path = ADAPTER + f"/dev_02_00_00_00_01_{index:02X}"
@@ -304,7 +313,7 @@ class MockBluez(ProfileSockets):
             case "hide-extras": self.hide_extras = True
             case "show-extras": self.hide_extras = False
             case "slow-remove": self.remove_delay_ms = 400
-            case "fast-remove": self.remove_delay_ms = 0
+            case "fast-remove": self.remove_delay_ms = 0; self.disconnect_delay_ms = 0
             case "fail-remove": self.fail_remove = True
             case "allow-remove": self.fail_remove = False
             case "fail-set": self.fail_set = True
