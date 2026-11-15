@@ -353,6 +353,7 @@ class EventParser:
         self.video_completions: deque[tuple[int, int]] = deque()
         self.av_pairs = 0
         self.audio_writes = 0
+        self.playback_slot_absences: dict[str, int] = {}
         # Receiver-clock times (the receiver's own monotonic stamps) of the events
         # behind each progress counter, kept only since the last accepted sample,
         # plus the newest earlier event per stream so a window's leading silence is
@@ -423,6 +424,12 @@ class EventParser:
             return
         scheduled, completed = event["scheduled_ns"], event["completed_ns"]
         if audio:
+            # Additive failure diagnostics; null presented_ns below still
+            # invalidates A/V regardless of the reason (including unknown
+            # future reasons). Older captures need no new field.
+            reason = event.get("playback_slot_absence")
+            if event.get("presented_ns", 0) is None and isinstance(reason, str):
+                self.playback_slot_absences[reason] = self.playback_slot_absences.get(reason, 0) + 1
             end = event["scheduled_end_ns"]
             # Owner-approved 2026-11-08 (#60): audio is "done" when it starts
             # playing on the sink's clock (presented_ns), not at the element
@@ -859,6 +866,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         "display_survived": display_survived,
         "display_connected": display_connected,
         "terminal_errors": parser.terminal_errors,
+        "playback_slot_absences": dict(parser.playback_slot_absences),
         "invalid_telemetry": invalid_telemetry,
         "monotonic_origin_ns": origin_ns,
         "cpu_ticks_per_second": clk,
