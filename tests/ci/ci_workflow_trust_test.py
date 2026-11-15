@@ -123,14 +123,16 @@ def main() -> int:
           'merge-parent verification step must run only on pull_request events')
     verify_env = verify.get('env') or {}
     base_keys = [k for k, v in verify_env.items() if str(v).strip() == '${{ github.event.pull_request.base.sha }}']
+    base_ref_keys = [k for k, v in verify_env.items() if str(v).strip() == '${{ github.event.pull_request.base.ref }}']
     head_keys = [k for k, v in verify_env.items() if str(v).strip() == '${{ github.event.pull_request.head.sha }}']
-    check(len(base_keys) == 1 and len(head_keys) == 1,
-          'merge-parent verification step must pass github.event.pull_request.base.sha and head.sha through env:')
-    base_env_key, head_env_key = base_keys[0], head_keys[0]
+    check(len(base_keys) == 1 and len(base_ref_keys) == 1 and len(head_keys) == 1,
+          'merge-parent verification step must pass github.event.pull_request.base.sha, base.ref, and head.sha through env:')
+    base_env_key, base_ref_env_key, head_env_key = base_keys[0], base_ref_keys[0], head_keys[0]
     verify_script = verify.get('run', '')
     check(bool(verify_script) and '${{' not in verify_script,
           'merge-parent verification script must not interpolate ${{ }} directly into the shell body')
-    for needle in ('HEAD^1', 'HEAD^2'):
+    for needle in ('HEAD^1', 'HEAD^2', 'git ls-remote --heads', 'https://github.com/${GITHUB_REPOSITORY}',
+                   'refs/heads/', 'check-ref-format', 'GITHUB_ACTIONS'):
         check(needle in verify_script, f'merge-parent verification script is missing {needle!r}', verify_script)
 
     with tempfile.TemporaryDirectory(prefix='ci-merge-parents-test-') as mt:
@@ -166,6 +168,11 @@ def main() -> int:
         merge_octopus = subprocess.run([*rgit, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
         subprocess.run([*rgit, 'update-ref', 'refs/pull/2/merge', merge_octopus], check=True)
 
+        subprocess.run([*rgit, 'checkout', '-q', '--detach', base2], check=True)
+        subprocess.run([*rgit, 'merge', '-q', '--no-ff', '-m', 'moved base pr merge', head1], check=True)
+        merge_moved = subprocess.run([*rgit, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+        subprocess.run([*rgit, 'update-ref', 'refs/pull/3/merge', merge_moved], check=True)
+
         def make_checkout(name: str, ref: str, depth: int) -> Path:
             cdir = mp / name
             cdir.mkdir()
@@ -176,18 +183,37 @@ def main() -> int:
             subprocess.run([*cgit, 'checkout', '-q', '--detach', ref], check=True)
             return cdir
 
-        def run_verify(cdir: Path, exp_base: str, exp_head: str) -> subprocess.CompletedProcess[str]:
+        def run_verify(cdir: Path, exp_base: str, exp_head: str, *,
+                       base_ref: str = 'main',
+                       remote_override: str | None = None,
+                       test_mode: str | None = '1',
+                       github_actions: str | None = None,
+                       github_repo: str | None = None) -> subprocess.CompletedProcess[str]:
+            env = {
+                'PATH': '/usr/bin:/bin',
+                base_env_key: exp_base,
+                base_ref_env_key: base_ref,
+                head_env_key: exp_head,
+            }
+            if test_mode is not None:
+                env['CI_MERGE_PARENT_TEST_MODE'] = test_mode
+            target_remote = f'file://{remote}' if remote_override is None else remote_override
+            if target_remote:
+                env['CI_MERGE_PARENT_TEST_REMOTE'] = target_remote
+            if github_actions is not None:
+                env['GITHUB_ACTIONS'] = github_actions
+            if github_repo is not None:
+                env['GITHUB_REPOSITORY'] = github_repo
             return subprocess.run(
                 ['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', verify_script],
-                env={'PATH': '/usr/bin:/bin', base_env_key: exp_base, head_env_key: exp_head},
-                cwd=cdir, capture_output=True, text=True, check=False,
+                env=env, cwd=cdir, capture_output=True, text=True, check=False,
             )
 
         c_ok = make_checkout('ok-d2', 'refs/pull/1/merge', 2)
         res = run_verify(c_ok, base1, head1)
         check(res.returncode == 0, 'matching depth=2 PR merge checkout must pass', res.stdout + res.stderr)
 
-        # Stale base after retarget (expected base2, actual base1)
+        # Stale base after retarget (expected base2, current tip base2, actual base1)
         res = run_verify(c_ok, base2, head1)
         out = res.stdout + res.stderr
         check(res.returncode != 0 and base2 in out and base1 in out,
@@ -225,6 +251,42 @@ def main() -> int:
         c_d1 = make_checkout('shallow-d1', 'refs/pull/1/merge', 1)
         res = run_verify(c_d1, base1, head1)
         check(res.returncode != 0, 'depth=1 shallow merge checkout without parents must fail', res.stdout + res.stderr)
+
+        # (a) HEAD^1 = newer base tip (base moved from base1 to base2 after event) -> pass
+        c_moved = make_checkout('moved-base-d2', 'refs/pull/3/merge', 2)
+        res = run_verify(c_moved, base1, head1)
+        check(res.returncode == 0,
+              'PR merge checkout with HEAD^1 matching current base tip must pass when base moved after event',
+              res.stdout + res.stderr)
+
+        # (b) HEAD^1 = some other commit (base2) that is neither event base (base1) nor current tip (base3) -> fail
+        subprocess.run([*rgit, 'checkout', '-q', 'main'], check=True)
+        (remote / 'f.txt').write_text('base3\n', encoding='utf-8')
+        subprocess.run([*rgit, 'add', 'f.txt'], check=True)
+        subprocess.run([*rgit, 'commit', '-q', '-m', 'base3'], check=True)
+        base3 = subprocess.run([*rgit, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+
+        res = run_verify(c_moved, base1, head1)
+        out = res.stdout + res.stderr
+        check(res.returncode != 0 and base1 in out and base3 in out and base2 in out and head1 in out,
+              'HEAD^1 matching neither event base nor current tip must fail and print event base, current tip, and actual parents',
+              out)
+
+        # (c) Tip unreadable -> fail closed (missing remote, missing branch, bad BASE_REF, GITHUB_ACTIONS set)
+        res = run_verify(c_ok, base1, head1, remote_override=f'file://{mp / "missing-remote"}')
+        check(res.returncode != 0, 'unreadable remote tip must fail closed', res.stdout + res.stderr)
+
+        res = run_verify(c_ok, base1, head1, base_ref='no-such-branch')
+        check(res.returncode != 0, 'missing remote base ref must fail closed', res.stdout + res.stderr)
+
+        for bad_ref in ('', '../evil', 'main*', '--upload-pack=x', 'a b', 'aa..bb', 'aa/foo.lock'):
+            res = run_verify(c_ok, base1, head1, base_ref=bad_ref)
+            check(res.returncode != 0, f'invalid BASE_REF {bad_ref!r} must fail closed', res.stdout + res.stderr)
+
+        res = run_verify(c_moved, base1, head1, github_actions='true', github_repo=None)
+        check(res.returncode != 0,
+              'test remote override must be ignored when GITHUB_ACTIONS is set',
+              res.stdout + res.stderr)
 
     # Executable check: poison the shell the way a PR step could and run the real script.
     with tempfile.TemporaryDirectory(prefix='ci-trust-test-') as t:
