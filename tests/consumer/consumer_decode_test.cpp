@@ -1475,6 +1475,57 @@ TEST(ConsumerDecodeCorrelation, PumpPartialLateBatchCountsExactlyTheUndeliveredA
     }
 }
 
+// Through-pump ordering (review P3 on #150): pump() must take the in-window
+// correlation for the output in hand BEFORE the whole-set expiry check
+// invalidates the rest. An older parameter-only AU (accepted, never output)
+// is submitted at t, the 90 decodable AUs at t + 2 s. Pump entry is at 4 s;
+// the first pull returns at exactly 5 s, so the older AU reaches the bound
+// while the first younger output is 3 s old. That output must be delivered
+// with its own metadata; the other 90 accepted AUs are lost and reported.
+// Without the early correlation the frame is released as unmatched instead.
+TEST(ConsumerDecodeCorrelation, PumpDeliversYoungerOutputWhenOlderAuExpiresInSamePull) {
+    PumpClock clock;
+    std::vector<DecodedFrame> frames;
+    auto helper = open_clocked_counting(clock, frames);
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+    const auto parameters = parameters_only_unit();
+    ASSERT_FALSE(parameters.empty()) << "fixture grammar drift";
+    ASSERT_TRUE(helper.value().submit(VideoAccessUnit{0, 100, kTimestampBaseNs, true, parameters}));
+
+    clock.now = clock.submitted_at + std::chrono::seconds{2};
+    const auto units = parse_annexb_units(read_file(fixture_path()));
+    ASSERT_EQ(units.size(), 90U) << "fixture grammar drift";
+    for (std::uint64_t i = 0; i < units.size(); ++i) {
+        const auto submitted = helper.value().submit(VideoAccessUnit{
+            i + 1, i + 101, kTimestampBaseNs + (i + 1) * kFramePeriodNs, units[i].idr,
+            units[i].data});
+        ASSERT_TRUE(submitted) << i << ": " << static_cast<int>(submitted.error().code());
+    }
+    ASSERT_TRUE(helper.value().end_of_stream());
+    const DecodeReport& held = helper.value().report();
+
+    clock.now = clock.submitted_at + std::chrono::seconds{4};
+    clock.on_read = [&clock](int read) {
+        if (read == 2) { // first read = pump-entry check, second = pull return
+            clock.now = clock.submitted_at + DecodeSessionState::kCorrelationRetention;
+        }
+    };
+    clock.pumping = true;
+    const auto pumped = helper.value().pump(Milliseconds{10000});
+    clock.pumping = false;
+    clock.on_read = nullptr;
+    ASSERT_FALSE(pumped) << "older AU expired without a loss notice";
+    EXPECT_EQ(pumped.error().code(), ErrorCode::ipc_consumer_rejected);
+    ASSERT_EQ(frames.size(), 1U) << "in-window younger output was not delivered";
+    EXPECT_EQ(frames[0].frame, 1U);
+    EXPECT_EQ(frames[0].sequence, 101U);
+    EXPECT_EQ(frames[0].timestamp_ns, kTimestampBaseNs + kFramePeriodNs);
+    EXPECT_EQ(held.frames_delivered, 1U);
+    EXPECT_EQ(held.frames_unmatched, 0U);
+    EXPECT_EQ(held.frames_lost_retention, 90U) << "91 accepted, 1 delivered";
+    EXPECT_TRUE(held.awaiting_idr);
+}
+
 // State level, exact boundary: an output whose own AU is inside its window is
 // correlated even when an OLDER AU (never output by the decoder) expires the
 // rest of the set in the same check; an output past its own window is not.
