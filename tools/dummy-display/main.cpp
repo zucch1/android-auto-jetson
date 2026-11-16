@@ -149,6 +149,8 @@ aa::display::testcontrol::Status probe_status() {
     status.frames_lost_retention = decode.frames_lost_retention;
     status.frames_lost_capacity = decode.frames_lost_capacity;
     status.frames_lost_eos = decode.frames_lost_eos;
+    status.frames_lost_close = decode.frames_lost_close;
+    status.frames_discarded_awaiting_idr = decode.frames_discarded_awaiting_idr;
     status.awaiting_idr = decode.awaiting_idr;
     if (g_sender != nullptr) {
         status.input_sent = g_sender->sent();

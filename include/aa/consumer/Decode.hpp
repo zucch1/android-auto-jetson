@@ -98,6 +98,13 @@ struct DecodeReport final {
     std::uint64_t frames_lost_retention{};
     std::uint64_t frames_lost_capacity{};
     std::uint64_t frames_lost_eos{};
+    // Accepted AUs still undelivered at close(): teardown or a mid-stream
+    // decoder replacement. Counted only; close() cannot fail a pump.
+    std::uint64_t frames_lost_close{};
+    // Non-IDR AUs discarded by submit() (ipc_consumer_rejected) while
+    // awaiting a recovery IDR. Never accepted, so not "lost", but counted so
+    // the recovery gap stays visible after the one-shot loss notice.
+    std::uint64_t frames_discarded_awaiting_idr{};
     bool awaiting_idr{}; // current recovery state; an accepted IDR clears it
     bool software_path_available{true};
     std::string software_path_cause{};
@@ -230,9 +237,15 @@ public:
     // cannot acquire recovery metadata. Callbacks already delivered during
     // this pump remain delivered even when a later iteration reports loss;
     // frames_delivered in report() is authoritative across error returns.
+    // An output whose own AU is still inside the retention window when its
+    // pull returns is delivered even if that same pull expired an older AU;
+    // the rest of the outstanding set is then lost as above. An output past
+    // its own window is never delivered (no late delivery beyond retention).
     [[nodiscard]] core::Result<std::size_t> pump(core::Milliseconds wait);
 
-    // Idempotent teardown; the destructor runs the same release.
+    // Idempotent teardown; the destructor runs the same release. Accepted AUs
+    // still undelivered are counted in report().frames_lost_close, which
+    // stays readable after close().
     void close() noexcept;
 
     [[nodiscard]] bool closed() const noexcept;

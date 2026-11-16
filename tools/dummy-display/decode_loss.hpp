@@ -37,6 +37,8 @@ public:
         flush_one(retention_, "expiry", now, lines);
         flush_one(capacity_, "capacity", now, lines);
         flush_one(eos_, "end_of_stream", now, lines);
+        flush_one(close_, "session_closed", now, lines);
+        flush_one(discarded_, "discarded_awaiting_idr", now, lines);
         return lines;
     }
 
@@ -60,6 +62,10 @@ public:
         observe_one(capacity_, "capacity", report.frames_lost_capacity,
                     report.awaiting_idr, now, final_flush, lines);
         observe_one(eos_, "end_of_stream", report.frames_lost_eos,
+                    report.awaiting_idr, now, final_flush, lines);
+        observe_one(close_, "session_closed", report.frames_lost_close,
+                    report.awaiting_idr, now, final_flush, lines);
+        observe_one(discarded_, "discarded_awaiting_idr", report.frames_discarded_awaiting_idr,
                     report.awaiting_idr, now, final_flush, lines);
         return lines;
     }
@@ -122,6 +128,8 @@ private:
     ReasonState retention_{};
     ReasonState capacity_{};
     ReasonState eos_{};
+    ReasonState close_{};
+    ReasonState discarded_{};
 };
 
 // Wraps a DecodeSession so media-session teardown flushes any pending
@@ -148,10 +156,12 @@ public:
         return inner_->report();
     }
     void close() noexcept override {
-        flush_on_teardown();
+        // Close first: it counts AUs it strands (frames_lost_close), and the
+        // report stays readable afterwards for the final flush.
         if (inner_) {
             inner_->close();
         }
+        flush_on_teardown();
     }
 
 private:

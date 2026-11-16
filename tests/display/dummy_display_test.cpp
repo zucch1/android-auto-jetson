@@ -2126,6 +2126,61 @@ TEST(DummyDisplayContractRender, DecodeLossSessionFlushesPendingTotalOnStopAndRe
     EXPECT_EQ(emitted.size(), 3U);
 }
 
+// Issue #76: the two counters that are not pump notices still reach
+// telemetry: non-IDR AUs discarded while awaiting the recovery IDR, and
+// accepted AUs a close() strands. Close runs BEFORE the teardown flush, so a
+// count that close() itself produces is emitted, not dropped with the session.
+class ClosingReportSession final : public DecodeSession {
+public:
+    ClosingReportSession(aa::consumer::DecodeReport& report, std::uint64_t stranded)
+        : report_(report), stranded_(stranded) {}
+
+    [[nodiscard]] aa::core::Result<void> submit(const aa::ipc::VideoAccessUnit&) override {
+        return {};
+    }
+    [[nodiscard]] aa::core::Result<void> end_of_stream() override { return {}; }
+    [[nodiscard]] aa::core::Result<std::size_t> pump(Milliseconds) override {
+        return std::size_t{0};
+    }
+    [[nodiscard]] const aa::consumer::DecodeReport& report() const noexcept override {
+        return report_;
+    }
+    void close() noexcept override { report_.frames_lost_close += stranded_; stranded_ = 0; }
+
+private:
+    aa::consumer::DecodeReport& report_;
+    std::uint64_t stranded_;
+};
+
+TEST(DummyDisplayContractRender, DecodeLossReportsDiscardsAndCloseStrandedAus) {
+    using Clock = DecodeLossTelemetry::Clock;
+    const Clock::time_point t0{std::chrono::seconds{100}};
+    DecodeLossTelemetry loss;
+    aa::consumer::DecodeReport report;
+    report.frames_discarded_awaiting_idr = 4;
+    report.awaiting_idr = true;
+    auto lines = loss.observe(report, t0);
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0], "{\"event\":\"decode_loss\",\"reason\":\"discarded_awaiting_idr\","
+                        "\"count\":4,\"awaiting_idr\":true}");
+    // Rate-limited like every reason, never lost: coalesced into the flush.
+    report.frames_discarded_awaiting_idr = 9;
+    EXPECT_TRUE(loss.observe(report, t0 + std::chrono::milliseconds{10}).empty());
+
+    std::vector<std::string> emitted;
+    {
+        LossReportingDecodeSession session(
+            std::make_unique<ClosingReportSession>(report, 3), loss,
+            [&emitted](std::string line) { emitted.push_back(std::move(line)); });
+        session.close();
+    }
+    EXPECT_EQ(emitted, (std::vector<std::string>{
+        "{\"event\":\"decode_loss\",\"reason\":\"session_closed\",\"count\":3,"
+        "\"awaiting_idr\":true}",
+        "{\"event\":\"decode_loss\",\"reason\":\"discarded_awaiting_idr\",\"count\":9,"
+        "\"awaiting_idr\":true}"}));
+}
+
 TEST(DummyDisplayBackpressure, RetryableRejectionIsResubmittedExactlyOnce) {
     BackpressureFixture fixture;
     fixture.decoder.queue_full_rejections = 1;

@@ -1315,6 +1315,226 @@ TEST(ConsumerDecodeCorrelation, PumpExpiryBeforeEosIsNotCountedAgainAsEosLoss) {
     EXPECT_EQ(held.frames_lost_eos, 0U);
 }
 
+// ---- Issue #76: deliver what is inside the bound, count everything else ----
+
+[[nodiscard]] aa::core::Result<DecodeHelper> open_clocked_counting(PumpClock& clock,
+                                                                  std::vector<DecodedFrame>& out) {
+    DecodeConfig config;
+    config.caps = kPrimaryCaps;
+    config.backend = DecodeBackend::software;
+    config.on_frame = [&out](const DecodedFrame& frame) { out.push_back(frame); };
+    return DecodeHelperTestAccess::open(std::move(config), [&clock] { return clock.read(); });
+}
+
+// Normal output just inside the boundary: every AU was accepted at the same
+// instant and the clock stays 1 ns short of the retention bound for every
+// read the pump makes, however long the real decoder takes. All 90 frames
+// must be delivered with their exact metadata, and nothing counted lost.
+TEST(ConsumerDecodeCorrelation, PumpOutputJustInsideRetentionIsDeliveredWithoutLoss) {
+    PumpClock clock;
+    std::vector<DecodedFrame> frames;
+    auto helper = open_clocked_counting(clock, frames);
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+    submit_fixture(helper.value());
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    ASSERT_TRUE(helper.value().end_of_stream());
+    const DecodeReport& held = helper.value().report();
+
+    clock.now = clock.submitted_at + DecodeSessionState::kCorrelationRetention
+        - std::chrono::nanoseconds{1};
+    clock.pumping = true;
+    for (int poll = 0; poll < 200 && frames.size() < 90U; ++poll) {
+        const auto pumped = helper.value().pump(Milliseconds{100});
+        ASSERT_TRUE(pumped) << "loss reported inside the bound, code "
+                            << static_cast<int>(pumped.error().code());
+    }
+    clock.pumping = false;
+    ASSERT_EQ(frames.size(), 90U);
+    for (std::uint64_t i = 0; i < frames.size(); ++i) {
+        EXPECT_EQ(frames[i].frame, i);
+        EXPECT_EQ(frames[i].sequence, i + 100);
+        EXPECT_EQ(frames[i].timestamp_ns, kTimestampBaseNs + i * kFramePeriodNs);
+    }
+    EXPECT_EQ(held.frames_delivered, 90U);
+    EXPECT_EQ(held.frames_unmatched, 0U);
+    EXPECT_EQ(held.frames_lost_retention, 0U);
+    EXPECT_FALSE(held.awaiting_idr);
+}
+
+// First output after 5 s (the recorded #76 failure): no frame is delivered
+// with expired metadata, the whole batch is counted once, the session arms
+// the IDR resync, non-IDR AUs submitted while waiting are counted as
+// discards, and a recovery IDR is delivered with its own metadata.
+TEST(ConsumerDecodeCorrelation, PumpFirstOutputAfterRetentionCountsBatchThenRecoveryIdrDelivers) {
+    PumpClock clock;
+    std::vector<DecodedFrame> frames;
+    auto helper = open_clocked_counting(clock, frames);
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+    submit_fixture(helper.value());
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    const DecodeReport& held = helper.value().report();
+
+    // Entry inside the window, first pull returns 9 s after submission (the
+    // recorded 9.248719339 s, rounded): its own AU is past the bound too.
+    clock.now = clock.submitted_at + std::chrono::seconds{4};
+    clock.on_read = [&clock](int read) {
+        if (read == 2) {
+            clock.now = clock.submitted_at + std::chrono::seconds{9};
+        }
+    };
+    clock.pumping = true;
+    const auto lost = helper.value().pump(Milliseconds{10000});
+    clock.pumping = false;
+    clock.on_read = nullptr;
+    ASSERT_FALSE(lost) << "accepted frames disappeared behind a successful pump";
+    EXPECT_EQ(lost.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_TRUE(frames.empty());
+    EXPECT_EQ(held.frames_lost_retention, 90U);
+    EXPECT_TRUE(held.awaiting_idr);
+
+    const auto units = parse_annexb_units(read_file(fixture_path()));
+    ASSERT_EQ(units.size(), 90U);
+    const auto discard_ts = kTimestampBaseNs + 90 * kFramePeriodNs;
+    for (std::uint64_t i = 0; i < 3; ++i) {
+        const auto discarded = helper.value().submit(
+            VideoAccessUnit{90 + i, 190 + i, discard_ts + i * kFramePeriodNs, false,
+                            units[1 + i].data});
+        ASSERT_FALSE(discarded);
+        EXPECT_EQ(discarded.error().code(), ErrorCode::ipc_consumer_rejected);
+    }
+    EXPECT_EQ(held.frames_discarded_awaiting_idr, 3U);
+    EXPECT_EQ(held.frames_lost_retention, 90U) << "discards are not retention loss";
+
+    const auto recovery_ts = discard_ts + 3 * kFramePeriodNs;
+    ASSERT_TRUE(helper.value().submit(VideoAccessUnit{93, 193, recovery_ts, true, units[0].data}));
+    EXPECT_FALSE(held.awaiting_idr);
+    ASSERT_TRUE(helper.value().end_of_stream());
+    clock.pumping = true;
+    for (int poll = 0; poll < 200 && frames.empty(); ++poll) {
+        const auto pumped = helper.value().pump(Milliseconds{100});
+        ASSERT_TRUE(pumped) << static_cast<int>(pumped.error().code());
+    }
+    clock.pumping = false;
+    ASSERT_EQ(frames.size(), 1U);
+    EXPECT_EQ(frames[0].frame, 93U);
+    EXPECT_EQ(frames[0].sequence, 193U);
+    EXPECT_EQ(frames[0].timestamp_ns, recovery_ts);
+    // Every late pre-recovery output was released, never relabeled.
+    EXPECT_EQ(held.frames_unmatched, 90U);
+    EXPECT_EQ(held.frames_lost_retention, 90U);
+}
+
+// Partial late batch: the first 30 outputs arrive inside the window, then the
+// clock jumps past it. Exactly the 60 undelivered AUs are counted lost, the
+// delivered ones are not counted again, and delivered + lost covers every
+// accepted AU.
+TEST(ConsumerDecodeCorrelation, PumpPartialLateBatchCountsExactlyTheUndeliveredAus) {
+    PumpClock clock;
+    std::vector<DecodedFrame> frames;
+    auto helper = open_clocked_counting(clock, frames);
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+    submit_fixture(helper.value());
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    ASSERT_TRUE(helper.value().end_of_stream());
+    const DecodeReport& held = helper.value().report();
+
+    clock.now = clock.submitted_at + std::chrono::seconds{1};
+    clock.on_read = [&clock, &frames](int) {
+        if (frames.size() >= 30U) {
+            clock.now = clock.submitted_at + std::chrono::seconds{9};
+        }
+    };
+    clock.pumping = true;
+    bool reported = false;
+    for (int poll = 0; poll < 200 && !reported; ++poll) {
+        const auto pumped = helper.value().pump(Milliseconds{100});
+        if (!pumped) {
+            EXPECT_EQ(pumped.error().code(), ErrorCode::ipc_consumer_rejected);
+            reported = true;
+        }
+    }
+    ASSERT_TRUE(reported) << "late remainder vanished without a loss notice";
+    for (int poll = 0; poll < 50; ++poll) {
+        ASSERT_TRUE(helper.value().pump(Milliseconds{20})) << "one notice per episode";
+    }
+    clock.pumping = false;
+    EXPECT_EQ(frames.size(), 30U);
+    EXPECT_EQ(held.frames_delivered, 30U);
+    EXPECT_EQ(held.frames_lost_retention, 60U);
+    EXPECT_EQ(held.frames_delivered + held.frames_lost_retention, 90U);
+    EXPECT_EQ(held.frames_lost_eos, 0U) << "expired AUs are not counted again at EOS";
+    EXPECT_TRUE(held.awaiting_idr);
+    for (std::uint64_t i = 0; i < frames.size(); ++i) {
+        EXPECT_EQ(frames[i].timestamp_ns, kTimestampBaseNs + i * kFramePeriodNs);
+    }
+}
+
+// State level, exact boundary: an output whose own AU is inside its window is
+// correlated even when an OLDER AU (never output by the decoder) expires the
+// rest of the set in the same check; an output past its own window is not.
+TEST(ConsumerDecodeCorrelation, InWindowOutputSurvivesOlderExpiryButLateOutputDoesNot) {
+    using Clock = DecodeSessionState::Clock;
+    const Clock::time_point t0{};
+    DecodeSessionState state;
+    const std::uint64_t ts_hole = kTimestampBaseNs;
+    const std::uint64_t ts_in = ts_hole + kFramePeriodNs;
+    const std::uint64_t ts_rest = ts_in + kFramePeriodNs;
+    const auto record = [&state](std::uint64_t frame, std::uint64_t ts, Clock::time_point at) {
+        ASSERT_TRUE(state.admit_submission(FeedLoad{0, 64}, ts, frame == 0, at));
+        state.accept_timestamp(ts);
+        state.record_correlation(frame, frame + 10, ts, at);
+    };
+    record(0, ts_hole, t0);
+    record(1, ts_in, t0 + std::chrono::seconds{1});
+    record(2, ts_rest, t0 + std::chrono::seconds{2});
+
+    const auto bound = t0 + DecodeSessionState::kCorrelationRetention;
+    const auto in = state.take_in_window_correlation(ts_in, bound);
+    ASSERT_TRUE(in.has_value());
+    EXPECT_EQ(in->frame, 1U);
+    EXPECT_EQ(in->sequence, 11U);
+    EXPECT_EQ(in->timestamp_ns, ts_in);
+    const auto notice = state.check_pump(bound);
+    ASSERT_FALSE(notice);
+    EXPECT_EQ(notice.error().code(), ErrorCode::ipc_consumer_rejected);
+    EXPECT_EQ(state.frames_lost_retention, 2U) << "hole + undelivered rest, not the delivered one";
+    EXPECT_TRUE(state.awaiting_idr);
+
+    // Exactly at its own bound an output is late: no metadata, nothing extended.
+    DecodeSessionState late;
+    ASSERT_TRUE(late.admit_submission(FeedLoad{0, 64}, ts_hole, true, t0));
+    late.accept_timestamp(ts_hole);
+    late.record_correlation(0, 10, ts_hole, t0);
+    EXPECT_FALSE(late.take_in_window_correlation(ts_hole, bound).has_value());
+    EXPECT_TRUE(late.take_in_window_correlation(ts_hole, bound - std::chrono::nanoseconds{1})
+                    .has_value());
+}
+
+// Close strands accepted AUs (teardown or a mid-stream decoder replacement):
+// they are counted in frames_lost_close and the report stays readable.
+TEST(ConsumerDecodeCorrelation, CloseCountsStrandedAcceptedAus) {
+    PumpClock clock;
+    auto helper = open_clocked(clock);
+    ASSERT_TRUE(helper) << static_cast<int>(helper.error().code());
+    submit_fixture(helper.value());
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    const DecodeReport& held = helper.value().report();
+    EXPECT_EQ(held.frames_lost_close, 0U);
+    helper.value().close();
+    EXPECT_EQ(helper.value().report().frames_lost_close, 90U);
+    EXPECT_EQ(held.frames_lost_retention, 0U);
+    helper.value().close();
+    EXPECT_EQ(helper.value().report().frames_lost_close, 90U) << "idempotent";
+}
+
 TEST(ConsumerDecodeCorrelation, SubmitExpiryNoticeSurvivesRecoveryIdr) {
     const DecodeSessionState::Clock::time_point t0{};
     DecodeSessionState state;
