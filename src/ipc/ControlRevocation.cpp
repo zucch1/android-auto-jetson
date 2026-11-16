@@ -68,7 +68,7 @@ void ControlService::reconcile_bonds() {
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "bond_reconcile_unadmitted_enrol_again", unadmitted});
     reconcile_unadmitted_ = unadmitted;
     // The helper's state now matches the store durably: a bond leg whose identity the store no
-    // longer approves is complete (the helper demoted it and owns its removal), so such a record can
+    // longer approves is complete (the helper demoted it; its bond is kept, refused), so such a record can
     // never pin capacity (finding 3). AP legs and source retirements stay with the retry paths.
     for (auto it = revocations_.begin(); it != revocations_.end();) {
         const auto peer = helper::revocation_peer(it->snapshot);

@@ -419,7 +419,13 @@ protected:
         return report.ap;
     }
     void TearDown() override {
-        client.reset(); daemon.stop(); bluez.stop(); nm.reset(); boundary.reset(); store.reset(); bus.stop();
+        client.reset(); daemon.stop();
+        // The adapter is shared (#136): no scenario may remove, cancel or disconnect a pairing.
+        if (const auto state = bluez.pid > 0 && ::waitpid(bluez.pid, nullptr, WNOHANG) == 0 ? bluez.command("state") : "";
+            state.find("\"destructive\": ") != std::string::npos) {
+            EXPECT_NE(state.find("\"destructive\": 0,"), std::string::npos) << state;
+        }
+        bluez.stop(); nm.reset(); boundary.reset(); store.reset(); bus.stop();
         std::filesystem::remove_all(directory);
     }
 };
@@ -947,7 +953,7 @@ TEST_F(NmDaemon, ProvisionalBondGetsNoServicesOrReconnectUntilCommitted) {
     EXPECT_EQ(bluez.command("NewConnection"), "allowed");
     EXPECT_FALSE(client->bond_committed(consumer, request)) << "a commit is consumed once";
 }
-TEST_F(NmDaemon, ProvisionalBondCannotReconnectAndIsRemovedByReconciliation) {
+TEST_F(NmDaemon, ProvisionalBondCannotReconnectAndReconciliationKeepsItRefused) {
     start();
     const core::ConsumerId consumer{1}; const core::PairingRequestId request{1};
     ASSERT_TRUE(client->prepare(consumer, request)); ASSERT_TRUE(client->confirmed(consumer, request));
@@ -957,19 +963,22 @@ TEST_F(NmDaemon, ProvisionalBondCannotReconnectAndIsRemovedByReconciliation) {
     EXPECT_FALSE(client->reconnect(identity)) << "a provisional bond reconnected";
     EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected");
     (void)client->cancel(consumer, request);
-    // Parked: the receiver's approval might already be durable, so only its answer removes it.
+    // Parked: the receiver's approval might already be durable, so only its answer decides.
     std::this_thread::sleep_for(300ms);
-    EXPECT_NE(bluez.command("state").find("\"removed\": []"), std::string::npos) << "a parked bond was removed unasked";
+    EXPECT_NE(read_text(directory / "pending-removals").find("02:00:00:00:00:01"), std::string::npos);
     EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected");
+    // Not approved: the entry is released and the bond kept in BlueZ, refused (#136).
     ASSERT_TRUE(client->reconcile_bonds(BusClient::approved_bonds(*store), true));
-    ASSERT_TRUE(eventually([&] { return bluez.command("state").find("\"removed\": []") == std::string::npos; }))
-        << "the provisional bond was not removed";
+    ASSERT_TRUE(eventually([&] { return read_text(directory / "pending-removals").find("02:00:00:00:00:01") == std::string::npos; }));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_NE(bluez.command("state").find("\"destructive\": 0,"), std::string::npos) << "the bond was removed";
     EXPECT_FALSE(client->reconnect(identity));
+    EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected");
 }
 // A journal replacement that fails at the commit leaves the bond unadmitted: the commit fails,
 // services stay refused, and the receiver's reconciliation (its store does not approve the phone)
-// demotes and removes the bond.
-TEST_F(NmDaemon, JournalReplacementFailureAtCommitRefusesAdmissionAndCleanupRemovesBond) {
+// demotes it and keeps the bond, refused (#136).
+TEST_F(NmDaemon, JournalReplacementFailureAtCommitRefusesAdmissionAndKeepsTheBondRefused) {
     start();
     constexpr std::uint64_t generation = 1;
     const core::ConsumerId consumer{generation}; const core::PairingRequestId request{generation};
@@ -983,11 +992,12 @@ TEST_F(NmDaemon, JournalReplacementFailureAtCommitRefusesAdmissionAndCleanupRemo
     EXPECT_FALSE(client->bond_committed(consumer, request)) << "committed although the journal entry is not durably gone";
     EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected");
     EXPECT_EQ(bluez.command("NewConnection"), "rejected");
-    // The store does not approve the phone: reconciliation demotes it (the journal entry the failed
-    // rewrite left in place is its removal obligation) and removes the bond.
+    // The store does not approve the phone: reconciliation demotes it; the bond stays in BlueZ.
     EXPECT_TRUE(client->reconcile_bonds(BusClient::approved_bonds(*store), true));
-    ASSERT_TRUE(eventually([&] { return bluez.command("state").find("\"removed\": []") == std::string::npos; }))
-        << "cleanup kept a bond that was never admitted";
+    std::this_thread::sleep_for(300ms);
+    EXPECT_NE(bluez.command("state").find("\"destructive\": 0,"), std::string::npos) << "the bond was removed";
+    EXPECT_EQ(bluez.command("AuthorizeService hfp"), "rejected");
+    EXPECT_FALSE(client->reconnect(trust::TransportIdentity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}}));
     EXPECT_EQ(read_text(directory / "managed-bonds").find("02:00:00:00:00:01"), std::string::npos)
         << "the failed commit left an admission entry";
     EXPECT_NE(read_text(directory / "revoked-bonds").find("02:00:00:00:00:01"), std::string::npos)

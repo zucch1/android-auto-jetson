@@ -46,6 +46,7 @@ class MockBluez(ProfileSockets):
         self.removed: list[str] = []
         self.disconnected: list[str] = []
         self.cancel_unpaired = 0
+        self.cancel_calls = 0
         self.properties = {"Pairable": True, "Discoverable": True}
         self.profile: list[str] = []
         self.profile_senders: dict[str, str] = {}
@@ -175,6 +176,7 @@ class MockBluez(ProfileSockets):
                     GLib.timeout_add(self.disconnect_delay_ms, lambda: (invocation.return_value(None), False)[1])
                     return
             case "CancelPairing":
+                self.cancel_calls += 1
                 # BlueZ answers CancelPairing without an in-flight Pair() with MGMT Unpair Device.
                 if self.paired:
                     self.cancel_unpaired += 1
@@ -271,6 +273,11 @@ class MockBluez(ProfileSockets):
                     "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper,
                     "disconnected": self.disconnected,
                     "cancel_unpaired": self.cancel_unpaired,
+                    # Every pairing-destructive call the helper made: RemoveDevice, CancelPairing
+                    # and Disconnect. The adapter is shared (#136), so this must stay 0.
+                    "destructive": self.remove_attempts + self.cancel_calls + len(self.disconnected),
+                    "bonded": self.present and self.paired and self.bonded,
+                    "paired": self.present and self.paired,
                     "register_attempts": self.register_attempts,
                     "remove_attempts": self.remove_attempts, "extras": len(self.extras)})
             case "just-works":

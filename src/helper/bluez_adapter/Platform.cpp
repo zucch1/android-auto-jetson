@@ -25,7 +25,7 @@ constexpr auto interfaces = R"(<node>
 }
 BluezBackend::Impl::Impl(const std::string& address, Now clock, const std::string& state, std::uint32_t state_owner)
     : now(std::move(clock)), managed(state, state_owner), pending(state, state_owner, "pending-removals"),
-      created(state, state_owner, "window-created-bonds"), revoked(state, state_owner, "revoked-bonds") {
+      revoked(state, state_owner, "revoked-bonds") {
     context = g_main_context_new();
     g_main_context_push_thread_default(context);
     GError* error = nullptr;
@@ -74,20 +74,16 @@ BluezBackend::Impl::~Impl() {
     g_main_context_unref(context);
 }
 GVariant* BluezBackend::Impl::call(const char* path, const char* interface, const char* member,
-                                 GVariant* parameters, const GVariantType* type, int timeout_ms) {
+                                 GVariant* parameters, const GVariantType* type) {
     if (!bus || owner.empty()) {
         if (parameters) { g_variant_ref_sink(parameters); g_variant_unref(parameters); }
         return nullptr;
     }
     GError* error = nullptr;
     auto* result = g_dbus_connection_call_sync(bus, owner.c_str(), path, interface, member,
-        parameters, type, G_DBUS_CALL_FLAGS_NO_AUTO_START, std::max(timeout_ms, 1), nullptr, &error);
+        parameters, type, G_DBUS_CALL_FLAGS_NO_AUTO_START, 150, nullptr, &error);
     g_clear_error(&error);
     return result;
-}
-void BluezBackend::Impl::disconnect(const Device& device, int timeout_ms) {
-    if (auto* reply = call(device.path.c_str(), "org.bluez.Device1", "Disconnect", nullptr, nullptr, timeout_ms))
-        g_variant_unref(reply);
 }
 bool BluezBackend::Impl::current_owner() {
     if (!bus || g_dbus_connection_is_closed(bus)) { reset(); owner.clear(); return false; }
@@ -129,25 +125,16 @@ void BluezBackend::Impl::close_admission() {
     pairing_enabled = false;
     comparison_accepted = false;
     acknowledged = false;
+    // A pending comparison was rejected through the agent's reply above. No pairing is ever
+    // cancelled or removed (#136): CancelPairing can unpair a just-completed or pre-existing bond.
+    // A bond the window made stays in BlueZ, refused (never admitted without a commit).
     if (allowed) {
-        // BlueZ turns CancelPairing without an in-flight Pair() into MGMT Unpair Device, which
-        // drops the kernel link key of a just-completed bond. Only cancel pairing confirmed as
-        // unbonded; an unknown bond state (failed inventory) must not risk unpairing.
         std::vector<Device> devices;
-        if (inventory(devices)) {
-            const bool bonded = std::any_of(devices.begin(), devices.end(),
-                [&](const Device& device) { return device.path == allowed->device.path && device.bonded; });
-            if (!bonded) {
-                if (auto* reply = call(allowed->device.path.c_str(), "org.bluez.Device1", "CancelPairing", nullptr)) g_variant_unref(reply);
-            }
-        }
+        if (!inventory(devices)) devices.clear();
+        release_window(devices);
     }
-    // Only the closing window's own bond is removed here (budgeted): a confirm, reconnect or
-    // ForgetPhone that closes a window never waits on other identities' removal retries.
-    const std::optional<PeerIdentity> own = allowed ? std::optional{allowed->device.identity} : std::nullopt;
     allowed.reset();
     quiet_pending = !quiet();
-    if (own) retire_unaccepted(Retire::own, &*own);
 }
 void BluezBackend::Impl::close_window() { close_connection(); close_admission(); }
 void BluezBackend::Impl::reset() {
@@ -155,16 +142,13 @@ void BluezBackend::Impl::reset() {
     reject_comparison();
     ++owner_epoch;
     close_connection();
+    release_window();
     allowed.reset(); window = {}; pairing_enabled = false; comparison_accepted = false; acknowledged = false;
     observations.clear(); adapters.clear();
     registered = false; agent_registered = false;
 }
-void BluezBackend::Impl::pump(bool tick) {
-    // A tick's removals share one deadline from the tick's start (drain_events included).
-    std::optional<CleanupScope> scope;
-    if (tick) scope.emplace(*this);
+void BluezBackend::Impl::pump() {
     drain_events();
-    if (tick) retire_unaccepted(Retire::tick);
     if (comparison && now() >= comparison->deadline) close_admission();
     if (now() >= next_check) {
         const bool alive = current_owner();
@@ -206,11 +190,10 @@ BluezBackend::~BluezBackend() = default;
 std::string BluezBackend::state_error() const {
     if (!impl_->managed.valid()) return "managed-bonds: " + impl_->managed.reason();
     if (!impl_->pending.valid()) return "pending-removals: " + impl_->pending.reason();
-    if (!impl_->created.valid()) return "window-created-bonds: " + impl_->created.reason();
     return impl_->revoked.valid() ? std::string{} : "revoked-bonds: " + impl_->revoked.reason();
 }
 bool BluezBackend::available() const {
-    return impl_->managed.valid() && impl_->pending.valid() && impl_->revoked.valid() && impl_->created.valid() &&
+    return impl_->managed.valid() && impl_->pending.valid() && impl_->revoked.valid() &&
            impl_->bus && !g_dbus_connection_is_closed(impl_->bus);
 }
 core::Result<ObservedPeer> BluezBackend::handoff() {
@@ -252,7 +235,7 @@ core::Result<void> BluezBackend::authorize_handoff(std::uint64_t handle, bool al
     }
     return {};
 }
-void BluezBackend::tick() { impl_->pump(true); }
+void BluezBackend::tick() { impl_->pump(); }
 void BluezBackend::discard(std::uint64_t handle) { impl_->observations.erase(handle); }
 void BluezBackend::cleanup() noexcept { impl_->observations.clear(); impl_->close_window(); }
 void BluezBackend::retire_lease() noexcept { impl_->close_window(); }
