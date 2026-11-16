@@ -110,6 +110,89 @@ before starting (`--readiness-only` uses the same environment). A
 the values are embedded in the remote command, so they are never passed through
 a shell unquoted.
 
+## Drive smoke before any soak (#137)
+
+The soak workload is a near-static screen with a tone on one phone. The S24
+Ultra video freeze (#134) showed up only with a moving map, so no soak stage
+could catch it. **No soak stage (60, 1800 or 7200 s) starts without a passing
+ten-minute moving-map drive smoke on the same build.**
+
+`tools/wired-qa/aa_drive_smoke.py run` runs on the Jetson the phone is plugged
+into. It refuses to start (`BLOCKED`, exit 3) on an unoptimized build, on
+binaries that the named build did not produce, while a compiler or another
+receiver or display is running, or when the phone is not on `--port`. It
+then opens Google Maps on the phone with a `geo:` intent and launches
+`aa-wired-receiver` and `aa-dummy-display` (on the owner's session display).
+While the window runs it drags the map once a second over the display's test
+control channel. Media is optional: pass it so A/V gets checked.
+
+```bash
+HU_KEY_PATH=<credential path> tools/wired-qa/aa_drive_smoke.py run \
+    --serial <adb serial> --port 1-2.1 --build-dir "$AA_BUILD_DIR" \
+    --display-env ":0,/run/user/$(id -u)/gdm/Xauthority" \
+    --media-uri file:///sdcard/Music/<tone>.opus --media-type audio/ogg \
+    --media-component org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity \
+    --out "$XDG_RUNTIME_DIR/drive-smoke-$(date +%Y%m%dT%H%M%S)"
+```
+
+The drive is 600 s by default (`--duration`), measured from the first painted
+frame. There is no first-paint deadline: the latency from `active` to the
+first paint is reported as `measured.startup_to_first_paint_s`. The run writes
+`receiver.log`, `display.log`, `idr-events.jsonl` (`idr_*` lines stamped on
+arrival, because they carry no time), `run.json` and `result.json`.
+`aa_drive_smoke.py analyze DIR` re-evaluates a directory offline. The pass
+criteria are named constants in the tool:
+
+| Constant | Criterion |
+| --- | --- |
+| `PAINTED_FPS_MIN_RATIO` = 0.90, `WINDOW_S` = 10, `FPS_STARTUP_GRACE_S` = 10 | every full 10 s window from first paint + 10 s to the end of the drive paints >= 90 % of the **negotiated** fps (59 windows in 600 s) |
+| `WAITING_IDR_MAX_S` = 1.0 | no `waiting_idr` episode (producer or consumer; first `idr_requested` to `idr_recovered`, the longer of the stamped span and `latency_ms`, or to window end if unrecovered) lasts > 1 s |
+| — | no session drop: both processes alive at window end, the full window ran, no `disconnected` session state and no `terminal_error` inside it |
+| `AV_SYNC_MAX_MS` = the existing 50 ms budget | max A/V paint-vs-audio-write difference <= 50 ms, **where valid**: only when matched pairs exist (media playing); otherwise reported `n/a` |
+
+**Startup grace (fps only).** The first 10 s after the first paint are
+excluded from the fps check, and only from it. The waiting_idr, session-drop
+and A/V checks still cover the whole run from `active`. Why: in the 2026-11-16
+A26 drive smoke the phone's encoder paused for 853 ms 0.1 s after the first
+frame. It sent 267 frames in the first 10 s, and all 267 were received, decoded
+and painted (26.7 fps against the 27 fps floor). Windows 1–59 painted
+29.8–30.1 fps. A research run the same day painted 28.4 fps in that first
+window, so without the grace the phone's start-up ramp decides the verdict by
+chance. **This deviates from the #137 issue text ("per 10 s window"); the owner
+may veto it.**
+
+**The gate qualifies the receiver's default video offer**, whose primary
+profile is `1280x720@30:h264` and which the soak stages also negotiate. Healthy
+A26 runs on 2026-11-16 painted 29.8–30.1 fps per window at 720p30 after the
+grace. At 1080p60
+and 1440p60 the Orin Nano paints only about 50 and 36 fps even when healthy
+(#79, #85), so the unchanged 90 % rule fails those profiles. A run with
+`--video-profiles` is analyzed and reported as usual, but it can never satisfy
+the soak gate.
+
+The soak launcher enforces the gate. Every live `aa-projection-perf.sh` stage
+needs `--drive-smoke <result.json>` (or `AA_DRIVE_SMOKE`). Before the collector
+starts, the launcher hashes the receiver and display it is about to launch, on
+the target, and requires:
+
+- the record's verdict to be `PASS`;
+- the same receiver and display sha256;
+- the default video offer and the full 600 s duration;
+- `finished_utc` within `RECORD_MAX_AGE_S` = 24 h. The 60+1800+7200 s chain
+  takes about 2.6 h, so this is a same-day rule that an overnight phone or
+  Maps update cannot slip past.
+
+Otherwise the stage is `BLOCKED` with `drive_smoke_missing`,
+`drive_smoke_not_passed`, `drive_smoke_build_mismatch`, `drive_smoke_profile`,
+`drive_smoke_short` or `drive_smoke_stale`. Offline `--capture` replay and
+`--readiness-only` do not need a record.
+
+Gate budget (one gate out for each gate in): this gate proposes **retiring the
+60 s soak stage**. It is a one-minute shakedown of the same static workload
+that the 1800 s stage then repeats. The drive smoke now runs first, on the same
+build, for ten minutes, with a moving workload. The 60 s stage stays in place
+until the owner confirms the retirement.
+
 ## Exact invocations
 
 From the development checkout (bounded ssh, fail-closed):
@@ -120,12 +203,12 @@ tools/perf/aa-projection-perf.sh --readiness-only --out /tmp/task-32-readiness.j
 
 # 30-minute performance run (optimized build, see Build).
 tools/perf/aa-projection-perf.sh --mode wired --duration 30m \
-    --build-dir "$AA_BUILD_DIR" \
+    --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
     --out /tmp/task-32-perf-30m.json --capture-out /tmp/task-32-capture-30m.json
 
 # Separate 2-hour soak run (fresh invocation; do not reuse the 30m capture).
 tools/perf/aa-projection-perf.sh --mode wired --duration 2h \
-    --build-dir "$AA_BUILD_DIR" \
+    --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
     --out /tmp/task-32-soak-2h.json --capture-out /tmp/task-32-capture-2h.json
 ```
 
@@ -204,7 +287,7 @@ finding. Future real CV measurements must be retained, not overridden by null.
 If a prerequisite is absent the tool writes a `BLOCKED` result and exits 3, with
 `blocked_on` naming the reason (`ssh_unreachable`, `receiver_binary_absent`,
 `display_disconnected`, `no_audio_sink`, `unoptimized_build`,
-`build_dir_mismatch`, `collector_failed`, `collector_produced_no_capture`,
+`build_dir_mismatch`, `drive_smoke_*` (see Drive smoke), `collector_failed`, `collector_produced_no_capture`,
 `unavailable_metric:<name>`, or `NOT_QUALIFYING: unoptimized_build` for a run
 the qualification override admitted). The display or
 phone being absent is therefore an explicit, non-zero BLOCKED outcome — never a

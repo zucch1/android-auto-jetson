@@ -523,6 +523,7 @@ case "$command_line" in
                    cat "$STUB_CAPTURE"
                    printf '%s\\n' "${{STUB_BUILD_LINE:-}}" >&2
                    exit 0 ;;
+    *sha256sum*) printf '%s  r\n%s  d\n' "${{STUB_RECEIVER_SHA:-}}" "${{STUB_DISPLAY_SHA:-}}"; exit 0 ;;
     *"test -x"*) exit 0 ;;
     *xrandr* | *drm*) printf 'connected\\n'; exit 0 ;;
     *pactl* | *pw-cli*) printf '0\\tfake\\tPipeWire\\ts32le 2ch 48000Hz\\tIDLE\\n'; exit 0 ;;
@@ -533,21 +534,35 @@ exit 0
     return stub_dir, log
 
 
+def drive_smoke_record(root: Path) -> Path:
+    """A passing #137 drive smoke for the stub's binary hashes (the soak gate)."""
+    path = root / "drive-smoke.json"
+    path.write_text(json.dumps({
+        "schema": "aa-drive-smoke/1", "verdict": "PASS", "duration_s": 600,
+        "video_profiles": None, "finished_utc": "2026-10-12T20:00:00+00:00",
+        "binaries": {"receiver": {"sha256": "a" * 64}, "display": {"sha256": "b" * 64}}}),
+        encoding="utf-8")
+    return path
+
+
 def test_launcher_records_the_build_and_never_passes_an_override_run() -> None:
     # Given a target whose ssh is a stand-in that serves a PASSing capture and
     # records the remote command it was handed.
     with tempfile.TemporaryDirectory(prefix="guard-launcher-") as base:
         root = Path(base)
         stub_dir, log = stub_ssh(root)
+        smoke = drive_smoke_record(root)
 
         def launcher(capture: Path, build_line: str, cache: str, *extra: str
                      ) -> subprocess.CompletedProcess:
             env = {"PATH": f"{stub_dir}:/usr/bin:/bin", "AA_PERF_HOST": "fake.local",
                    "AA_DISPLAY": ":0", "STUB_CAPTURE": str(capture),
-                   "STUB_BUILD_LINE": build_line, "STUB_CACHE": cache}
+                   "STUB_BUILD_LINE": build_line, "STUB_CACHE": cache,
+                   "STUB_RECEIVER_SHA": "a" * 64, "STUB_DISPLAY_SHA": "b" * 64}
             return subprocess.run(
                 ["bash", str(SHELL), "--mode", "wired", "--duration", "1s",
-                 "--out", str(root / "result.json"), "--now", NOW, *extra],
+                 "--out", str(root / "result.json"), "--now", NOW,
+                 "--drive-smoke", str(smoke), *extra],
                 capture_output=True, text=True, timeout=120, env=env, check=False)
 
         # When the stage runs from the build directory that produced the binaries.
