@@ -12,6 +12,7 @@ from common import DIGEST, Document, EvidenceError, require
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'perf'))
 import aa_perf_schema
 from aa_measurement_coverage import CoverageError, coverage_gaps, parse_coverage
+from aa_moving_map import MIN_DRAG_RATE_HZ
 
 RECOVERY: Final = {
     'usb_unplug_replug': 'dip+frames+pump+input',
@@ -212,6 +213,11 @@ def signed_av(doc: Document, metrics: Document) -> None:
         require(metrics.child(name).number('value') == contract.number(key), 'PERF_AV_CONTRACT:' + name)
     require(metrics.child('av_window_mean_abs_ms').number('value')
             == abs(contract.number('worst_window_mean_ms')), 'PERF_AV_CONTRACT:av_window_mean_abs_ms')
+    # The moving-map stimulus must have run for the stage (#137): started, and
+    # at least MIN_DRAG_RATE_HZ completed drags per active second.
     workload = doc.child('workload')
     workload.equal('kind', 'moving-map')
+    workload.equal('stimulus_started', True)
+    active = doc.child('run_status').number('active_projection_seconds')
+    require(workload.integer('drags') >= MIN_DRAG_RATE_HZ * active, 'PERF_WORKLOAD_DRAGS')
     require(workload.integer('media_relaunches') >= 0, 'PERF_WORKLOAD')

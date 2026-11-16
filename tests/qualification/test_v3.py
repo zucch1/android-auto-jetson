@@ -14,6 +14,13 @@ class V3PackageTests(PackageTest):
     def setUp(self) -> None:
         super().setUp()
         self.manifest = make_package(self.root, version=3)
+        # Building a package is slow; tampering cases restore these bytes instead.
+        self.pristine = {name: (self.root / name).read_bytes()
+                         for name in ('perf.json', 'soak.json', 'wired.json')}
+
+    def restore(self) -> None:
+        for name, data in self.pristine.items():
+            (self.root / name).write_bytes(data)
 
     def tamper(self, field: str, change) -> None:
         name = 'perf.json' if field == 'perf_30m' else 'soak.json'
@@ -28,6 +35,13 @@ class V3PackageTests(PackageTest):
         check(self.manifest)
         self.assertEqual(self.cli('check_wired.py').returncode, 0)
 
+    def test_both_results_without_stimulus_are_rejected(self) -> None:
+        # The review's reproduction: both stages disclose that no stimulus ran.
+        for field in ('perf_30m', 'soak_2h'):
+            self.tamper(field, lambda d: d['workload'].update(drags=0, stimulus_started=False))
+        with self.assertRaises(EvidenceError):
+            check(self.manifest)
+
     def test_v3_contract_fields_must_agree_and_pass(self) -> None:
         cases = {
             'p99 metric differs from the contract block':
@@ -37,12 +51,16 @@ class V3PackageTests(PackageTest):
             'coverage below the floor': lambda d: d['metrics']['av_coverage_pct'].update(value=80.0),
             'coverage floor weakened': lambda d: d['metrics']['av_coverage_pct'].update(budget_min=50.0),
             'static workload': lambda d: d['workload'].update(kind='none'),
+            'stimulus never ran (review repro)':
+                lambda d: d['workload'].update(drags=0, stimulus_started=False),
+            'stimulus started, too few drags':
+                lambda d: d['workload'].update(drags=int(0.25 * d['run_status']['active_projection_seconds']) - 1),
             'av_sync_ms gated again': lambda d: d['metrics']['av_sync_ms'].update(gated=True),
         }
         for label, change in cases.items():
             for field in ('perf_30m', 'soak_2h'):
                 with self.subTest(case=label, field=field):
-                    self.setUp()
+                    self.restore()
                     self.tamper(field, change)
                     with self.assertRaises(EvidenceError):
                         check(self.manifest)

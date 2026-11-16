@@ -125,6 +125,31 @@ def test_live_v3_requires_the_moving_map_workload() -> None:
     assert "run_evidence:moving_map_workload" not in (result(v3(1800), live=True)["blocked_on"] or "")
 
 
+def test_live_v3_requires_proof_that_the_stimulus_ran() -> None:
+    # The workload label alone is not evidence: started, enough drags, media count.
+    base = {"kind": "moving-map", "media_relaunches": 0, "drags": 1800, "stimulus_started": True}
+    cases = {
+        "run_evidence:moving_map_stimulus": [{**base, "stimulus_started": False, "drags": 0},
+                                             {**base, "stimulus_started": False},
+                                             {"kind": "moving-map"}],
+        # 1800 s at the 0.25 Hz floor needs 450 drags (about 0.65 Hz nominal).
+        "run_evidence:moving_map_drags": [{**base, "drags": 0}, {**base, "drags": 449}],
+    }
+    for reason, workloads in cases.items():
+        for workload in workloads:
+            doc = result(v3(1800, workload=workload), live=True)
+            assert doc["verdict"] == "BLOCKED", (workload, doc["verdict"])
+            assert reason in doc["blocked_on"], (workload, doc["blocked_on"])
+            # The result records the evidence it saw, every field present.
+            assert set(doc["workload"]) == {"kind", "media_relaunches", "drags", "stimulus_started"}
+    ok = result(v3(1800, workload={**base, "drags": 450}), live=True)
+    assert "moving_map" not in (ok["blocked_on"] or ""), ok["blocked_on"]
+    # The v3 schema requires the evidence fields for a moving-map record.
+    bare = copy.deepcopy(result(v3(60)))
+    bare["workload"] = {"kind": "moving-map"}
+    assert schema.validate(bare, schema.load_schema(schema.SCHEMA_V3))
+
+
 def test_malformed_series_is_a_contract_violation() -> None:
     for change in ({"pair_t_ns": [1, 2], "pair_skew_ns": [1]},
                    {"pair_t_ns": [1.5], "pair_skew_ns": [1]},

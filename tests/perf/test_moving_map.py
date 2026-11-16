@@ -136,6 +136,62 @@ def test_audio_watch_sees_only_new_audio_lines() -> None:
         assert watch.poll() == first
 
 
+def test_no_phone_intent_after_restore_even_mid_relaunch() -> None:
+    # Given a stimulus whose media relaunch is blocked inside adb (the review's
+    # reproduction), and a stop + restore arriving while it is blocked.
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def adb(*args: str) -> None:
+        line = " ".join(args)
+        if "fixture.opus" in line and not release.is_set():
+            entered.set()
+            release.wait(10)
+        calls.append(line)
+
+    work = workload(adb)
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    stimulus = mm.SoakStimulus(work, write_fd, "/nonexistent/receiver.log",
+                               since_ns=time.monotonic_ns() - 60 * 10**9)
+    work._relaunched_ns = time.monotonic_ns() - 60 * 10**9
+    try:
+        stimulus.start()
+        assert entered.wait(10), "the relaunch never started"
+        # When the collector stops the stimulus and restores the phone meanwhile.
+        stopper = threading.Thread(target=stimulus.stop)
+        stopper.start()
+        restorer = threading.Thread(target=work.restore_phone)
+        restorer.start()
+        time.sleep(0.3)
+        assert restorer.is_alive(), "restore ran while a phone command was in flight"
+        release.set()
+        restorer.join(10)
+        stopper.join(60)
+        assert not stimulus.is_alive()
+        # Then the media intent finished first, the restore came next, and no
+        # intent (no Maps relaunch) was sent after it, then or later.
+        restore = calls.index("shell svc usb setFunctions mtp")
+        assert all("am start" not in line for line in calls[restore:]), calls
+        assert not any(mm.MAPS_PACKAGE in line for line in calls), calls
+        assert not work.start_maps() and not work.start_media()
+        assert calls[-1] == "shell am force-stop org.example.player", calls
+    finally:
+        release.set()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_relaunch_honours_a_stop_between_its_intents() -> None:
+    adb = Adb()
+    work = workload(adb)
+    work._relaunched_ns = 0
+    flags = iter([False, True])  # not stopped before media, stopped before Maps
+    assert not work.keep_media_playing(time.monotonic_ns(), None, 0, lambda: next(flags, True))
+    assert adb.intents("fixture.opus") == 1 and adb.intents(mm.MAPS_PACKAGE) == 0
+
+
 DISPLAY = """#!/usr/bin/env python3
 import os, sys
 with open(os.environ["FAKE_DISPLAY_INPUT"], "a") as out:

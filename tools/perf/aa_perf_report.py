@@ -52,6 +52,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aa_perf_schema  # noqa: E402
 import aa_av_contract as av_contract  # noqa: E402
+from aa_moving_map import MIN_DRAG_RATE_HZ  # noqa: E402
 from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Window, coverage_gaps, coverage_to_json, parse_capture, reduce_capture,
 )
@@ -438,9 +439,15 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                 unavailable.append("run_evidence:" + name)
         if "observed_duration_seconds" not in capture:
             unavailable.append("run_evidence:observed_duration_seconds")
-        if version3 and (capture.get("workload") or {}).get("kind") != "moving-map":
-            # v3 soak stages qualify the moving-map workload (#137).
-            unavailable.append("run_evidence:moving_map_workload")
+        if version3:
+            # v3 soak stages qualify the moving-map workload (#137), and the
+            # capture must prove it ran: stimulus started and enough completed
+            # drags over the active window. Missing or insufficient evidence is
+            # BLOCKED (the required workload was not measured), never a PASS;
+            # a stimulus that stalled is already a FAIL (display_control_stalled).
+            gap = workload_gap(capture.get("workload"), progress.seconds if window else None)
+            if gap is not None:
+                unavailable.append("run_evidence:" + gap)
 
     provenance_source = provenance_override if provenance_override is not None else capture.get("provenance")
     provenance_source, provenance_numeric_errors = aa_perf_schema.finite_numbers(provenance_source)
@@ -611,16 +618,31 @@ def _signed_av(capture: dict, window: Window | None, *, invalid: bool) -> tuple[
     return block, metrics
 
 
+def workload_gap(raw: object, active_seconds: float | None) -> str | None:
+    """Why a v3 workload record does not prove the moving map ran, or None."""
+    if not isinstance(raw, dict) or raw.get("kind") != "moving-map":
+        return "moving_map_workload"
+    drags = raw.get("drags")
+    if raw.get("stimulus_started") is not True or not isinstance(drags, int) or isinstance(drags, bool):
+        return "moving_map_stimulus"
+    if active_seconds is None or drags < MIN_DRAG_RATE_HZ * active_seconds:
+        return "moving_map_drags"
+    relaunches = raw.get("media_relaunches")
+    if not isinstance(relaunches, int) or isinstance(relaunches, bool) or relaunches < 0:
+        return "moving_map_media"
+    return None
+
+
 def _workload_record(raw: object) -> dict:
-    if not isinstance(raw, dict) or raw.get("kind") not in ("none", "moving-map"):
+    """The result's workload record. For moving-map every evidence field is present;
+    a missing or malformed one is recorded as not proven (0 drags, not started),
+    and ``workload_gap`` then keeps the stage from qualifying."""
+    if not isinstance(raw, dict) or raw.get("kind") != "moving-map":
         return {"kind": "none"}
-    record = {"kind": raw["kind"]}
-    for key in ("media_relaunches", "drags"):
-        if isinstance(raw.get(key), int) and not isinstance(raw.get(key), bool) and raw[key] >= 0:
-            record[key] = raw[key]
-    if isinstance(raw.get("stimulus_started"), bool):
-        record["stimulus_started"] = raw["stimulus_started"]
-    return record
+    count = lambda key: (raw[key] if isinstance(raw.get(key), int)  # noqa: E731
+                         and not isinstance(raw.get(key), bool) and raw[key] >= 0 else 0)
+    return {"kind": "moving-map", "media_relaunches": count("media_relaunches"),
+            "drags": count("drags"), "stimulus_started": raw.get("stimulus_started") is True}
 
 
 def _digest(value: str | None) -> bool:

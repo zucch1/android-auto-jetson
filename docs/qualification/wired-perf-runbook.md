@@ -340,9 +340,28 @@ audio write, counting each relaunch in `workload.media_relaunches`. A display
 that stops accepting control input for `CONTROL_WRITE_TIMEOUT_S` ends the stage
 with terminal error `display_control_stalled`. After cleanup the phone's USB
 mode is reset and the media player stopped. Every live stage needs
-`--media-uri` (optional `--media-type`, `--media-component`, `--geo-uri`); a
-live v3 capture without the moving-map workload is BLOCKED
-`run_evidence:moving_map_workload`.
+`--media-uri` (optional `--media-type`, `--media-component`, `--geo-uri`).
+
+Every phone command goes through one lock with a closed gate. The phone
+restore waits for an in-flight command, closes the gate and restores, so no
+intent (in particular no Maps relaunch) can reach the phone after its restore,
+whatever the stimulus thread is doing. A relaunch also checks the stop flag
+between its media and Maps intents, and the collector stops and joins the
+stimulus before it restores the phone.
+
+**Workload evidence.** A live v3 stage must prove the workload ran, both in
+the reporter and in the qualification checker. The record must be
+`kind: moving-map` with `stimulus_started: true`, and it must have at least
+`MIN_DRAG_RATE_HZ` (0.25) completed drags per active second. The nominal rate
+is about 0.65 Hz (one drag per second plus the drag's own ~0.5 s), so the floor
+leaves room for adb relaunches. Media presence is already gated by the A/V
+coverage floor. Missing or insufficient evidence is **BLOCKED**:
+`run_evidence:moving_map_workload`, `run_evidence:moving_map_stimulus` or
+`run_evidence:moving_map_drags`. It means the required workload was not shown
+to have been measured, which is an evidence gap, like every other
+`run_evidence:*` rule, and never a PASS. A stimulus that started and then
+stalled is a FAIL (`display_control_stalled`). The v3 schema requires all four
+workload fields for a moving-map record.
 
 **A/V (signed contract).** The collector keeps every pair's paint-completion
 time and signed skew, and the merged union of valid audio slots' scheduled
@@ -400,7 +419,15 @@ kept beside past runs. It waits for `--quiet-seconds` (default 300) without a
 compiler, then runs the 1800 s and 7200 s stages through
 `aa-projection-perf.sh` with the moving-map workload, `--phone-serial` and
 `--drive-smoke`. It stops at the first stage that does not PASS and writes
-`stage-<N>s-not-run.json` for the rest:
+`stage-<N>s-not-run.json` for the rest.
+
+The chain handles SIGTERM/SIGINT with a stop flag, as the drive smoke does.
+Each stage runs in its own process group (the launcher, ssh and the collector
+under it). On a stop, the group gets TERM, and KILL after `STOP_GRACE_S`
+(60 s). That is long enough for the collector to stop its receiver and display
+and restore the phone. The interrupted stage and every later one get a
+not-run marker, and the chain exits 128+signal. A stop during the idle gate
+starts no stage:
 
 ```bash
 tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" \

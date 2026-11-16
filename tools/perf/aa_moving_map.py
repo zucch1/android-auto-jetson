@@ -43,6 +43,11 @@ DRAG_STEP_S = 0.06
 CONTROL_WRITE_TIMEOUT_S = 2.0
 # After this long without an audio write the media intent is re-sent.
 MEDIA_RELAUNCH_SILENCE_S = 5.0
+# Evidence floor for a v3 soak stage: the stimulus must have started and
+# completed at least this many drags per second of active window. Nominal is
+# about 0.65 Hz (one drag per STIMULUS_PERIOD_S plus its own ~0.5 s); the floor
+# leaves room for adb relaunches and still proves the map moved all stage.
+MIN_DRAG_RATE_HZ = 0.25
 MAPS_PACKAGE = "com.google.android.apps.maps"
 DEFAULT_GEO_URI = "geo:0,0?q=Atlanta"
 AUDIO_LINE = b'{"event":"audio_write_completed"'
@@ -111,20 +116,32 @@ class MovingMap:
         self.drags = 0
         self._last_drag = None
         self._relaunched_ns = time.monotonic_ns()
+        # Every phone command goes through _phone under this lock. restore_phone
+        # takes it, waits for an in-flight command, closes the gate and restores:
+        # nothing is ever sent to the phone after its restore.
+        self._lock = threading.Lock()
+        self._closed = False
 
-    def start_media(self) -> None:
-        self.adb("shell", "am", "start", "-a", "android.intent.action.VIEW", *self.media)
+    def _phone(self, *args: str) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            self.adb(*args)
+            return True
 
-    def start_maps(self) -> None:
-        self.adb("shell", "am", "start", "-a", "android.intent.action.VIEW",
-                 "-d", self.geo_uri, "-p", MAPS_PACKAGE)
+    def start_media(self) -> bool:
+        return self._phone("shell", "am", "start", "-a", "android.intent.action.VIEW", *self.media)
+
+    def start_maps(self) -> bool:
+        return self._phone("shell", "am", "start", "-a", "android.intent.action.VIEW",
+                           "-d", self.geo_uri, "-p", MAPS_PACKAGE)
 
     def prepare_phone(self, sleep: Callable[[float], bool]) -> bool:
         """USB reset, wake, media, then Maps in front. False if ``sleep`` was stopped."""
-        self.adb("shell", "svc", "usb", "setFunctions", "mtp")
+        self._phone("shell", "svc", "usb", "setFunctions", "mtp")
         if not sleep(3):
             return False
-        self.adb("shell", "input", "keyevent", "KEYCODE_WAKEUP")
+        self._phone("shell", "input", "keyevent", "KEYCODE_WAKEUP")
         self.start_media()
         if not sleep(4):
             return False
@@ -133,16 +150,23 @@ class MovingMap:
         return True
 
     def restore_phone(self) -> None:
-        self.adb("shell", "svc", "usb", "setFunctions", "mtp")
-        if self.media_package:
-            self.adb("shell", "am", "force-stop", self.media_package)
+        """Close the intent gate (after any in-flight command), then restore. Idempotent."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.adb("shell", "svc", "usb", "setFunctions", "mtp")
+            if self.media_package:
+                self.adb("shell", "am", "force-stop", self.media_package)
 
-    def keep_media_playing(self, now_ns: int, last_audio_ns: int | None, since_ns: int) -> bool:
+    def keep_media_playing(self, now_ns: int, last_audio_ns: int | None, since_ns: int,
+                           stopped: Callable[[], bool] = lambda: False) -> bool:
         """Re-send media then Maps after MEDIA_RELAUNCH_SILENCE_S without audio."""
         silence = int(MEDIA_RELAUNCH_SILENCE_S * 10**9)
         heard = last_audio_ns if last_audio_ns is not None else since_ns
-        if now_ns - heard > silence and now_ns - self._relaunched_ns > silence:
-            self.start_media()
+        if now_ns - heard > silence and now_ns - self._relaunched_ns > silence and not stopped():
+            if not self.start_media() or stopped():
+                return False  # stopping (or restored): never Maps after that
             self.start_maps()
             self._relaunched_ns = time.monotonic_ns()
             self.media_relaunches += 1
@@ -156,7 +180,9 @@ class MovingMap:
         Returns the control outcome ("sent", "stalled", "stopped", "closed"),
         or "idle" when no drag was due.
         """
-        self.keep_media_playing(time.monotonic_ns(), last_audio_ns, since_ns)
+        self.keep_media_playing(time.monotonic_ns(), last_audio_ns, since_ns, stopped)
+        if stopped():
+            return "stopped"
         if self._last_drag is not None and time.monotonic() - self._last_drag < STIMULUS_PERIOD_S:
             return "idle"
         outcome = "sent"
@@ -206,8 +232,13 @@ class SoakStimulus(threading.Thread):
         self.failure: str | None = None
 
     def stop(self) -> None:
+        """Stop and join; bounded by the adb timeout of the commands one step can make.
+
+        The collector restores the phone after this; MovingMap's intent gate
+        keeps that ordering even if the join had to give up.
+        """
         self.halt.set()
-        self.join(timeout=10)
+        self.join(timeout=2 * 20.0 + CONTROL_WRITE_TIMEOUT_S + 5)
 
     def _sleep(self, seconds: float) -> bool:
         return not self.halt.wait(seconds)

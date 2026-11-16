@@ -500,28 +500,44 @@
       }
     },
     "workload": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind"
-      ],
-      "properties": {
-        "kind": {
-          "enum": [
-            "none",
-            "moving-map"
-          ]
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "none"
+            }
+          }
         },
-        "media_relaunches": {
-          "$ref": "#/$defs/count"
-        },
-        "drags": {
-          "$ref": "#/$defs/count"
-        },
-        "stimulus_started": {
-          "type": "boolean"
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "media_relaunches",
+            "drags",
+            "stimulus_started"
+          ],
+          "properties": {
+            "kind": {
+              "const": "moving-map"
+            },
+            "media_relaunches": {
+              "$ref": "#/$defs/count"
+            },
+            "drags": {
+              "$ref": "#/$defs/count"
+            },
+            "stimulus_started": {
+              "type": "boolean"
+            }
+          }
         }
-      }
+      ]
     }
   },
   "$defs": {
