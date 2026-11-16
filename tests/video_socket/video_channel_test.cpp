@@ -727,3 +727,33 @@ TEST(VideoChannel, TrySendAccessUnitResumesMidAuFragmentWithoutSequenceGapOrLoss
     EXPECT_EQ(pair.value().consumer.suppressed(), 0U);
     EXPECT_EQ(pair.value().consumer.resyncs(), 1U); // Only the initial startup IDR resync.
 }
+
+TEST(VideoChannel, AbandonPartialSendForcesWaitingIdrWithoutPartialEscape) {
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+
+    const std::vector<std::uint8_t> idr{0x00, 0x00, 0x01, 0x65};
+    ASSERT_EQ(pair.value().producer.try_send_access_unit({1, 100, true, idr, std::nullopt}).value(),
+              aa::ipc::TrySendStatus::sent);
+    ASSERT_TRUE(pair.value().consumer.receive(aa::core::Milliseconds{500}));
+    EXPECT_FALSE(pair.value().producer.waiting_idr());
+
+    // Even when no mid-AU partial state is active (e.g., fragment-0 EAGAIN),
+    // abandoning a held AU on a retained producer must restore waiting_idr.
+    pair.value().producer.abandon_partial_send();
+    EXPECT_TRUE(pair.value().producer.waiting_idr());
+
+    const std::vector<std::uint8_t> non_idr{0x00, 0x00, 0x01, 0x41};
+    const auto suppressed =
+        pair.value().producer.try_send_access_unit({2, 200, false, non_idr, std::nullopt});
+    ASSERT_TRUE(suppressed);
+    EXPECT_EQ(suppressed.value(), aa::ipc::TrySendStatus::dropped_waiting_idr);
+
+    const auto fresh_idr =
+        pair.value().producer.try_send_access_unit({3, 300, true, idr, std::nullopt});
+    ASSERT_TRUE(fresh_idr);
+    EXPECT_EQ(fresh_idr.value(), aa::ipc::TrySendStatus::sent);
+    EXPECT_FALSE(pair.value().producer.waiting_idr());
+    ASSERT_TRUE(pair.value().consumer.receive(aa::core::Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().frame, 3U);
+}

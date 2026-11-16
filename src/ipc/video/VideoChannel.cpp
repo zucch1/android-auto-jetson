@@ -810,7 +810,7 @@ void VideoProducer::enter_waiting_idr_on_backpressure() noexcept {
 }
 
 void VideoProducer::abandon_partial_send() noexcept {
-    if (!impl_ || !impl_->partial.active) {
+    if (!impl_) {
         return;
     }
     impl_->partial.active = false;

@@ -183,9 +183,13 @@ struct Runtime final {
                     if (!sent) { report("input forwarding", sent.error().code()); break; }
                 }
             }
-            // poll itself checkpoints blocking TCP I/O every 25ms. Never add a
-            // second full wait after a blocking poll; idle owner turns are 10ms,
-            // tightened to 5ms while held video frames await socket space.
+            // TcpTransport::poll_receive() is intentionally unsupported, so
+            // WirelessLink::poll() calls blocking session_->poll_transport(), which
+            // runs this checkpoint() on TcpIo's 25ms poll slices while TCP is idle.
+            // Thus when TCP is quiet, held video servicing/expiry runs on ~25ms
+            // checkpoint slices and can overshoot nominal max_age by up to ~25ms.
+            // Tightening the outer sleep from 10ms to 5ms while frames are held
+            // avoids adding a full idle sleep on non-blocked/active turns.
             const auto poll_step = media.video.has_pending() ? std::chrono::milliseconds{5}
                                                              : std::chrono::milliseconds{10};
             std::this_thread::sleep_until(std::min(deadline, turn + poll_step));

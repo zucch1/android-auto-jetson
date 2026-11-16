@@ -165,7 +165,7 @@ public:
 
     void reset() noexcept {
         std::lock_guard lock(mutex_);
-        clear_pending_locked(/*abandon_partial=*/true);
+        clear_pending_locked(/*abandon_partial=*/true, "reset");
         idr_coordinator_.reset();
         had_backpressure_ = false;
         replaced_consumer_ = false;
@@ -185,9 +185,10 @@ public:
         }
         if (message.header.video_profile != profile_ || message.header.video_session != session_ || message.header.video_generation != generation_) {
             if (!pending_queue_.empty()) {
-                // Stream epoch/profile changed while AUs were held: drop held frames
-                // cleanly so stale frames from the superseded stream never interleave.
-                clear_pending_locked(/*abandon_partial=*/true);
+                // Stream epoch/profile changed while AUs were held: drop held frames,
+                // record lifecycle drops, and force waiting_idr on the retained producer
+                // so non-IDR frames from the new epoch cannot splice in.
+                clear_pending_locked(/*abandon_partial=*/true, "stream_reset");
             }
             profile_ = message.header.video_profile;
             session_ = message.header.video_session;
@@ -278,7 +279,7 @@ public:
 
     void install(ipc::VideoProducer producer) {
         std::lock_guard lock(mutex_);
-        reset_pending_state_locked();
+        clear_pending_locked(/*abandon_partial=*/false, "consumer_replaced");
         // send_started fires once per access unit the phone sends (audit L13), so
         // it is media telemetry: rate-limited and never waiting for the sink. Any
         // other endpoint event is a lifecycle record and stays lossless.
@@ -311,7 +312,7 @@ public:
 
     void close() noexcept {
         std::lock_guard lock(mutex_);
-        reset_pending_state_locked();
+        clear_pending_locked(/*abandon_partial=*/false, "closed");
         emit_drops(true);
         idr_coordinator_.reset();
         had_backpressure_ = false;
@@ -350,10 +351,16 @@ private:
         hold_episode_units_ = 0;
     }
 
-    void clear_pending_locked(bool abandon_partial) noexcept {
-        const bool had_pending = !pending_queue_.empty();
+    void clear_pending_locked(bool abandon_partial, const char* drop_reason) noexcept {
+        const auto dropped_units = pending_queue_.size();
+        const auto cadence = frame_cadence(profile_);
         reset_pending_state_locked();
-        if (abandon_partial && had_pending && producer_.has_value()) {
+        if (dropped_units > 0 && drop_reason != nullptr) {
+            for (std::size_t i = 0; i < dropped_units; ++i) {
+                record_drop(drop_reason, cadence);
+            }
+        }
+        if (abandon_partial && dropped_units > 0 && producer_.has_value()) {
             producer_->abandon_partial_send();
         }
     }

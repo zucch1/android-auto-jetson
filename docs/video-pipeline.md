@@ -225,14 +225,24 @@ occurs mid-AU without breaking `VideoReassembler`'s monotonic sequence contract)
     sustained downstream stall.
 - **Draining**: Held frames flush in strict FIFO order on the next incoming AU
   (`VideoOutlet::on_message`) and periodically via `VideoOutlet::service_pending()`
-  under the existing outbound-message and `idr_dispatching` guards (with a 5 ms
-  receiver poll bound while frames are held).
+  under the existing outbound-message and `idr_dispatching` guards. On wired USB,
+  `receive_with_audio()` bounds `poll_transport()` to `5 ms` while frames are
+  held. On wireless TCP, `TcpTransport::poll_receive()` is intentionally
+  unsupported so `WirelessLink::poll()` still runs blocking `poll_transport()`,
+  which services `Runtime::checkpoint()` in `25 ms` `TcpIo` slices when TCP is
+  idle (`Runtime.hpp` also shortens its outer sleep to `5 ms` on non-blocked
+  turns); accordingly, when TCP is quiet during a hold, drain/expiry on wireless
+  can overshoot the nominal `max_age` by up to one `~25 ms` slice (still
+  strictly finite).
 - **Overflow & reset**: Exceeding either `max_age` or `max_bytes` drops all held AUs
   (and the overflowing AU if any), logs `video_dropped` with `reason: "backpressure"`,
   enters `waiting_idr` (`enter_waiting_idr_on_backpressure()`), and triggers IDR
   recovery identically to the prior drop-and-report policy. Consumer disconnect,
   consumer replacement (`install`), stream profile/session/generation change, session
-  `reset()`, and `close()` clear the pending queue immediately.
+  `reset()`, and `close()` clear the pending queue immediately (without emitting
+  `video_backpressure_released`), account for discarded held AUs, and force
+  `waiting_idr` on any retained producer regardless of whether any fragment of the
+  held AU escaped.
 - **Telemetry**: Emits `video_backpressure_held` (`held_units`, `held_bytes`,
   `age_ms`, `max_bytes`, `max_age_ms`) on entering a hold episode and
   `video_backpressure_released` (`held_units`, `held_bytes`, `age_ms`) once the

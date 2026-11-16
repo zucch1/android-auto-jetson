@@ -133,8 +133,9 @@ public:
     // terminal waiting-for-IDR drop state and counts one backpressure drop.
     void enter_waiting_idr_on_backpressure() noexcept;
 
-    // Clears any mid-AU partial send state and forces waiting_idr (used when a
-    // partially-sent AU must be evicted on reset/disconnect).
+    // Clears any mid-AU partial send state and forces waiting_idr (used whenever
+    // held or partially-sent AUs are invalidated on reset or stream/epoch change
+    // on a retained producer, even if no fragment of the head AU escaped).
     void abandon_partial_send() noexcept;
 
     // Test-only seam to inject synthetic EAGAIN/short writes on individual
