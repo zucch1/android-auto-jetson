@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -523,7 +524,8 @@ case "$command_line" in
                    cat "$STUB_CAPTURE"
                    printf '%s\\n' "${{STUB_BUILD_LINE:-}}" >&2
                    exit 0 ;;
-    *sha256sum*) printf '%s  r\n%s  d\n' "${{STUB_RECEIVER_SHA:-}}" "${{STUB_DISPLAY_SHA:-}}"; exit 0 ;;
+    *sha256sum*aa-dummy-display*) printf '%s  d\\n' "${{STUB_DISPLAY_SHA:-}}"; exit 0 ;;
+    *sha256sum*) printf '%s  r\\n' "${{STUB_RECEIVER_SHA:-}}"; exit 0 ;;
     *"test -x"*) exit 0 ;;
     *xrandr* | *drm*) printf 'connected\\n'; exit 0 ;;
     *pactl* | *pw-cli*) printf '0\\tfake\\tPipeWire\\ts32le 2ch 48000Hz\\tIDLE\\n'; exit 0 ;;
@@ -539,7 +541,9 @@ def drive_smoke_record(root: Path) -> Path:
     path = root / "drive-smoke.json"
     path.write_text(json.dumps({
         "schema": "aa-drive-smoke/1", "verdict": "PASS", "duration_s": 600,
-        "video_profiles": None, "finished_utc": "2026-10-12T20:00:00+00:00",
+        "video_profiles": None,
+        # Live freshness uses the real clock (the launcher never forwards --now).
+        "finished_utc": datetime.now(timezone.utc).isoformat(),
         "binaries": {"receiver": {"sha256": "a" * 64}, "display": {"sha256": "b" * 64}}}),
         encoding="utf-8")
     return path

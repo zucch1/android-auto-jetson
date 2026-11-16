@@ -38,7 +38,10 @@ import argparse
 import bisect
 import hashlib
 import json
+import math
 import os
+import re
+import signal
 import subprocess
 import sys
 import threading
@@ -120,30 +123,42 @@ def _criterion(name: str, passed: bool | None, **detail) -> dict:
     return {"name": name, "passed": passed, **detail}
 
 
-def waiting_idr_episodes(stamped: list[dict], end_ns: int) -> list[dict]:
+def waiting_idr_episodes(stamped: list[dict], end_ns: int, run_start_ns: int | None) -> list[dict]:
     """Episodes from the runner-stamped ``idr_*`` lines (the lines carry no time).
 
     An episode opens at a source's first ``idr_requested`` and closes at its
-    ``idr_recovered``. Its length is the longer of the stamped span and the
-    binary's own ``latency_ms``, which starts at the wait itself. An episode
-    still open at ``end_ns`` lasts until ``end_ns``.
+    ``idr_recovered``. The binary's own ``latency_ms`` starts at the wait itself,
+    so the episode starts at the earlier of the first stamped request and
+    (recovery - latency_ms). A recovery without a logged request still counts:
+    the display emits ``idr_recovered`` even when every request failed. Without
+    a usable latency it is taken as open since ``run_start_ns`` (fail closed).
+    Episodes are clipped to ``end_ns``; one still open there lasts until it.
     """
     episodes, open_at = [], {}
+
+    def add(source: str, start: int | None, stop: int, recovered: bool) -> None:
+        if start is None:
+            episodes.append({"source": source, "start_ns": None, "duration_s": math.inf,
+                             "recovered": recovered})
+        elif start <= end_ns:
+            episodes.append({"source": source, "start_ns": start,
+                             "duration_s": max(0, min(stop, end_ns) - start) / 1e9,
+                             "recovered": recovered})
+
     for item in sorted(stamped, key=lambda x: x["observed_ns"]):
         event, t = item["event"], item["observed_ns"]
         source = event.get("source", "unknown")
         if event.get("event") == "idr_requested" and t <= end_ns:
             open_at.setdefault(source, t)
-        elif event.get("event") == "idr_recovered" and source in open_at:
-            start = open_at.pop(source)
-            span = (t - start) / 1e9
+        elif event.get("event") == "idr_recovered":
+            requested = open_at.pop(source, None)
             latency = event.get("latency_ms")
-            seconds = max(span, latency / 1000) if isinstance(latency, (int, float)) else span
-            episodes.append({"source": source, "start_ns": start, "duration_s": seconds,
-                             "recovered": True})
+            by_latency = (t - int(latency * 10**6) if _finite_number(latency) and latency >= 0
+                          else None)
+            candidates = [x for x in (requested, by_latency) if x is not None]
+            add(source, min(candidates) if candidates else run_start_ns, t, True)
     for source, start in open_at.items():
-        episodes.append({"source": source, "start_ns": start, "duration_s": (end_ns - start) / 1e9,
-                         "recovered": False})
+        add(source, start, end_ns, False)
     return episodes
 
 
@@ -208,7 +223,7 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
 
     # 2. waiting_idr episodes.
     cutoff = end_ns or stopped_ns or 0
-    episodes = waiting_idr_episodes(stamped, cutoff) if cutoff else []
+    episodes = waiting_idr_episodes(stamped, cutoff, active_ns) if cutoff else []
     long = [e for e in episodes if e["duration_s"] > WAITING_IDR_MAX_S]
     criteria.append(_criterion("waiting_idr_max", not long and bool(cutoff),
                                max_s=WAITING_IDR_MAX_S, episodes=len(episodes),
@@ -271,30 +286,63 @@ def analyze_dir(out: Path) -> dict:
 
 # ---- Soak gate --------------------------------------------------------------
 
-def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: str | None,
+DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def _finite_number(value: object) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _reject_constant(name: str):
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def load_record(text: str) -> dict | None:
+    """Strict JSON: NaN/Infinity are refused, and the result must be an object."""
+    value = json.loads(text, parse_constant=_reject_constant)
+    return value if isinstance(value, dict) else None
+
+
+def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: str,
                  now: datetime) -> tuple[str | None, str]:
-    """Return (blocked reason, detail); reason None means the soak may start."""
+    """Return (blocked reason, detail); reason None means the soak may start.
+
+    Both launched binaries must have been hashed (64 lowercase hex digits) and
+    both must match the smoke's; every field the gate uses is type-checked.
+    """
     if not isinstance(record, dict) or record.get("schema") != SCHEMA:
         return "drive_smoke_missing", "no aa-drive-smoke/1 result document"
-    if record.get("verdict") != "PASS":
-        return "drive_smoke_not_passed", f"verdict {record.get('verdict')!r}"
-    binaries = record.get("binaries") or {}
-    want = {"receiver": receiver_sha256}
-    if display_sha256:
-        want["display"] = display_sha256
-    for role, digest in want.items():
-        if (binaries.get(role) or {}).get("sha256") != digest:
+    for role, digest in (("receiver", receiver_sha256), ("display", display_sha256)):
+        if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
+            return "drive_smoke_hash_failed", (f"the launched {role} could not be hashed "
+                                               f"(or none is configured)")
+    binaries = record.get("binaries")
+    duration = record.get("duration_s")
+    finished_text = record.get("finished_utc")
+    if (not isinstance(record.get("verdict"), str) or not isinstance(binaries, dict)
+            or not all(isinstance(binaries.get(r), dict)
+                       and isinstance(binaries[r].get("sha256"), str)
+                       and DIGEST.fullmatch(binaries[r]["sha256"]) for r in ("receiver", "display"))
+            or not _finite_number(duration) or not isinstance(finished_text, str)
+            or not (record.get("video_profiles") is None or isinstance(record["video_profiles"], str))):
+        return "drive_smoke_malformed", "the result lacks a well-typed verdict, binaries, " \
+            "duration_s, finished_utc or video_profiles"
+    if record["verdict"] != "PASS":
+        return "drive_smoke_not_passed", f"verdict {record['verdict']!r}"
+    for role, digest in (("receiver", receiver_sha256), ("display", display_sha256)):
+        if binaries[role]["sha256"] != digest:
             return "drive_smoke_build_mismatch", f"{role} sha256 differs from the smoke's"
-    if record.get("video_profiles") is not None:
+    if record["video_profiles"] is not None:
         return "drive_smoke_profile", "the smoke overrode the default video offer"
-    if (record.get("duration_s") or 0) < DEFAULT_DURATION_S:
-        return "drive_smoke_short", f"duration {record.get('duration_s')} s < {DEFAULT_DURATION_S} s"
+    if duration < DEFAULT_DURATION_S:
+        return "drive_smoke_short", f"duration {duration} s < {DEFAULT_DURATION_S} s"
     try:
-        finished = datetime.fromisoformat(record["finished_utc"])
-    except (KeyError, TypeError, ValueError):
-        return "drive_smoke_missing", "no finished_utc"
+        finished = datetime.fromisoformat(finished_text)
+    except ValueError:
+        return "drive_smoke_malformed", "finished_utc is not an ISO-8601 time"
     if finished.tzinfo is None:
-        return "drive_smoke_missing", "finished_utc has no time zone"
+        return "drive_smoke_malformed", "finished_utc has no time zone"
     age = (now - finished).total_seconds()
     if age > RECORD_MAX_AGE_S or age < -RECORD_FUTURE_SKEW_S:
         return "drive_smoke_stale", f"finished {age / 3600:.1f} h ago (limit {RECORD_MAX_AGE_S // 3600} h)"
@@ -303,9 +351,11 @@ def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: s
 
 def _check_cli(args) -> int:
     try:
-        record = json.loads(Path(args.record).read_text())
+        record = load_record(Path(args.record).read_text())
     except (OSError, ValueError):
         record = None
+    # --now exists only for deterministic tests and offline review. The soak
+    # launcher never passes it, so live freshness uses the real clock.
     now = datetime.fromisoformat(args.now) if args.now else datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -378,14 +428,45 @@ def _adb(serial: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["adb", "-s", serial, *args], capture_output=True, text=True, timeout=20)
 
 
+class Interrupted(Exception):
+    """SIGTERM/SIGINT reached the runner; unwind through the cleanup."""
+
+    def __init__(self, signum: int):
+        super().__init__(signal.Signals(signum).name)
+        self.signum = signum
+
+
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
 def _stop(process) -> None:
-    if process and process.poll() is None:
-        process.terminate()
+    """Stop a child started with start_new_session: its whole process group."""
+    if process is None:
+        return
+    for sig, wait in ((signal.SIGTERM, 8), (signal.SIGKILL, 5)):
         try:
-            process.wait(timeout=8)
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            process.wait(timeout=wait)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+            continue
+        if sig == signal.SIGTERM:
+            try:  # the leader is gone; take any member it left behind too
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        return
+
+
+def _spawn(command: list[str], **kwargs) -> subprocess.Popen:
+    """Popen with the stop signals blocked, so no child escapes before it is tracked."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        return subprocess.Popen(command, start_new_session=True, **kwargs)
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
 
 
 def _wait(predicate, timeout: float, *alive) -> bool:
@@ -463,6 +544,12 @@ def _run_cli(args) -> int:
     receiver = display = None
     lock = threading.Lock()
     loggers: list[Logger] = []
+    interrupted: int | None = None
+
+    def on_signal(signum, _frame):
+        raise Interrupted(signum)
+
+    previous = {sig: signal.signal(sig, on_signal) for sig in STOP_SIGNALS}
     try:
         _adb(args.serial, "shell", "svc", "usb", "setFunctions", "mtp")
         time.sleep(3)
@@ -475,15 +562,14 @@ def _run_cli(args) -> int:
         _adb(args.serial, "shell", "am", "start", "-a", "android.intent.action.VIEW",
              "-d", args.geo_uri, "-p", "com.google.android.apps.maps")
         with (out / "idr-events.jsonl").open("w") as stamped:
-            receiver = subprocess.Popen(receiver_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        env=env, text=True, start_new_session=True)
+            receiver = _spawn(receiver_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              env=env, text=True)
             loggers.append(Logger(receiver.stdout, out / "receiver.log", stamped, lock, "receiver"))
             loggers[-1].start()
             rx = loggers[0].seen
             if _wait(lambda: "ready" in rx, READY_TIMEOUT_S, receiver):
-                display = subprocess.Popen(display_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                           stderr=subprocess.STDOUT, env=env, text=True,
-                                           start_new_session=True)
+                display = _spawn(display_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, env=env, text=True)
                 loggers.append(Logger(display.stdout, out / "display.log", stamped, lock, "display"))
                 loggers[-1].start()
                 dx = loggers[1].seen
@@ -521,12 +607,27 @@ def _run_cli(args) -> int:
             _stop(receiver)
             for logger in loggers:
                 logger.join(timeout=5)
+    except Interrupted as stop:
+        interrupted = stop.signum
+        print(f"drive smoke: interrupted by {stop}; cleaning up", file=sys.stderr, flush=True)
     finally:
-        _stop(display)
-        _stop(receiver)
-        _adb(args.serial, "shell", "svc", "usb", "setFunctions", "mtp")
-        if args.media_uri and args.media_component:
-            _adb(args.serial, "shell", "am", "force-stop", args.media_component.split("/")[0])
+        # A second signal must not strand a child or skip restoring the phone.
+        for sig in STOP_SIGNALS:
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            _stop(display)
+            _stop(receiver)
+            _adb(args.serial, "shell", "svc", "usb", "setFunctions", "mtp")
+            if args.media_uri and args.media_component:
+                _adb(args.serial, "shell", "am", "force-stop", args.media_component.split("/")[0])
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+    if interrupted is not None:
+        run["interrupted"] = signal.Signals(interrupted).name
+        (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
+        _blocked(out, base, "interrupted")
+        return 128 + interrupted
     run.update(receiver_exit=receiver.returncode if receiver else None,
                display_exit=display.returncode if display else None)
     (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
@@ -577,8 +678,8 @@ def main(argv: list[str]) -> int:
     check = sub.add_parser("check", help="soak gate: is there a fresh PASS for these bytes?")
     check.add_argument("--record", required=True)
     check.add_argument("--receiver-sha256", required=True)
-    check.add_argument("--display-sha256")
-    check.add_argument("--now", help="ISO-8601 time (tests)")
+    check.add_argument("--display-sha256", required=True)
+    check.add_argument("--now", help="ISO-8601 time; tests and offline review only, never live")
     args = parser.parse_args(argv)
     if args.command == "check":
         return _check_cli(args)

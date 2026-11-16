@@ -421,21 +421,21 @@ fi
 
 # ---- drive smoke gate (#137) ---------------------------------------------
 # No soak stage starts without a passing moving-map drive smoke on the same
-# build: the launched receiver/display bytes (hashed where they run) must match
-# the smoke's, and the smoke must be fresh (aa_drive_smoke.py RECORD_MAX_AGE_S).
-smoke_hashes=""
-if [[ -n "$DRIVE_SMOKE" ]]; then
-    smoke_hashes="$(remote "sha256sum -- '${RECEIVER}'${DISPLAY_BIN:+ '${DISPLAY_BIN}'}" 2>/dev/null || true)"
-fi
-smoke_args=(check --record "${DRIVE_SMOKE:-/nonexistent}"
-    --receiver-sha256 "$(awk 'NR == 1 {print $1}' <<<"$smoke_hashes")")
-if [[ -n "$DISPLAY_BIN" ]]; then
-    smoke_args+=(--display-sha256 "$(awk 'NR == 2 {print $1}' <<<"$smoke_hashes")")
-fi
-if [[ -n "$NOW" ]]; then
-    smoke_args+=(--now "$NOW")
-fi
-if ! smoke_reason="$("$PY" -B "$TOOL_DIR/../wired-qa/aa_drive_smoke.py" "${smoke_args[@]}")"; then
+# build: both launched binaries are hashed where they run and must match the
+# smoke's. A binary that cannot be hashed (or no display at all) blocks the
+# stage. Freshness (aa_drive_smoke.py RECORD_MAX_AGE_S) uses the real clock:
+# --now only dates the result document and is never forwarded to the gate.
+remote_sha256() {
+    local path="$1" line=""
+    [[ -n "$path" ]] || return 0
+    line="$(remote "sha256sum -- '${path}'" 2>/dev/null)" || return 0
+    awk 'NR == 1 {print $1}' <<<"$line"
+}
+receiver_sha="$(remote_sha256 "$RECEIVER")"
+display_sha="$(remote_sha256 "$DISPLAY_BIN")"
+if ! smoke_reason="$("$PY" -B "$TOOL_DIR/../wired-qa/aa_drive_smoke.py" check \
+        --record "${DRIVE_SMOKE:-/nonexistent}" \
+        --receiver-sha256 "$receiver_sha" --display-sha256 "$display_sha")"; then
     smoke_reason="${smoke_reason:-drive_smoke_missing}"
     blocked_result "$smoke_reason" "$build_type_known" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3

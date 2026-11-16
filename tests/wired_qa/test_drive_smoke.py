@@ -12,9 +12,12 @@ A26 runs) with synthetic times; they carry no phone identifiers.
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -202,20 +205,65 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "FAIL")
         self.assertIn("reason", criterion(result, "painted_fps_per_window"))
 
+    def test_recovery_without_a_logged_request_still_counts(self) -> None:
+        # Given consumer recoveries whose requests all failed (none logged), as
+        # DisplayController emits them: one reports 1500 ms, one no latency.
+        with_latency, without = Run(), Run()
+        with_latency.stamped.append({"observed_ns": with_latency.first + 3 * S, "event": {
+            "event": "idr_recovered", "source": "consumer", "latency_ms": 1500,
+            "episode_requests": 0, "total_requests": 0}})
+        without.stamped.append({"observed_ns": without.first + 3 * S, "event": {
+            "event": "idr_recovered", "source": "consumer"}})
+        # Then both fail: the first by its own latency, the second as open since active.
+        first = criterion(self.analyze(with_latency), "waiting_idr_max")
+        self.assertFalse(first["passed"])
+        self.assertAlmostEqual(first["longest_s"], 1.5)
+        second = criterion(self.analyze(without), "waiting_idr_max")
+        self.assertFalse(second["passed"])
+        self.assertAlmostEqual(second["longest_s"], 5.0)
+
+    def test_episode_is_clipped_to_the_drive_window(self) -> None:
+        # Given a request 0.2 s before the drive ends that recovers 2 s later.
+        result = self.analyze(Run().idr("producer", 599.8, 2.0))
+        # Then only the 0.2 s inside the window counts.
+        idr = criterion(result, "waiting_idr_max")
+        self.assertTrue(idr["passed"], idr)
+        self.assertAlmostEqual(idr["longest_s"], 0.2, places=3)
+
+    def test_null_audio_endpoint_is_excluded_and_counted(self) -> None:
+        # Given the live run-2 shape: one audio slot whose presented_ns is null.
+        run = Run().media(12.0)
+        run.receiver.append({"event": "audio_write_completed", "scheduled_ns": run.first,
+                             "scheduled_end_ns": run.first + 42_666_666,
+                             "completed_ns": run.first, "presented_ns": None})
+        av = criterion(self.analyze(run), "av_sync_within_ceiling")
+        # Then the slot is skipped ("where valid") but reported.
+        self.assertTrue(av["passed"])
+        self.assertEqual(av["invalid_audio_slots"], 1)
+
 
 NOW = datetime(2026, 11, 16, 12, tzinfo=timezone.utc)
+A, B = "a" * 64, "b" * 64
 
 
-def record(**changes) -> dict:
+def record(finished: datetime = NOW - timedelta(hours=2), **changes) -> dict:
     doc = {"schema": smoke.SCHEMA, "verdict": "PASS", "duration_s": 600, "video_profiles": None,
-           "finished_utc": (NOW - timedelta(hours=2)).isoformat(),
-           "binaries": {"receiver": {"sha256": "a" * 64}, "display": {"sha256": "b" * 64}}}
+           "finished_utc": finished.isoformat(),
+           "binaries": {"receiver": {"sha256": A}, "display": {"sha256": B}}}
     doc.update(changes)
     return doc
 
 
+def run_check(path: Path, receiver: str = A, display: str = B,
+              now: str | None = "2026-11-16T12:00:00Z") -> subprocess.CompletedProcess:
+    command = [sys.executable, "-B", str(SMOKE), "check", "--record", str(path),
+               "--receiver-sha256", receiver, "--display-sha256", display]
+    return subprocess.run(command + (["--now", now] if now else []),
+                          capture_output=True, text=True, check=False)
+
+
 class GateTests(unittest.TestCase):
-    def check(self, doc, receiver="a" * 64, display="b" * 64):
+    def check(self, doc, receiver=A, display=B):
         return smoke.check_record(doc, receiver_sha256=receiver, display_sha256=display, now=NOW)[0]
 
     def test_fresh_pass_for_the_same_bytes_admits_the_soak(self) -> None:
@@ -223,10 +271,9 @@ class GateTests(unittest.TestCase):
 
     def test_refusals_are_named(self) -> None:
         cases = {
-            "drive_smoke_missing": [None, {"schema": "other"}, record(finished_utc="2026-11-16")],
+            "drive_smoke_missing": [None, {"schema": "other"}],
             "drive_smoke_not_passed": [record(verdict="FAIL"), record(verdict="BLOCKED")],
-            "drive_smoke_stale": [record(finished_utc=(NOW - timedelta(hours=25)).isoformat()),
-                                  record(finished_utc=(NOW + timedelta(hours=1)).isoformat())],
+            "drive_smoke_stale": [record(NOW - timedelta(hours=25)), record(NOW + timedelta(hours=1))],
             "drive_smoke_profile": [record(video_profiles="1920x1080@60:h264")],
             "drive_smoke_short": [record(duration_s=120)],
         }
@@ -237,22 +284,50 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.check(record(), receiver="c" * 64), "drive_smoke_build_mismatch")
         self.assertEqual(self.check(record(), display="c" * 64), "drive_smoke_build_mismatch")
 
+    def test_malformed_and_nonfinite_fields_are_refused(self) -> None:
+        bad = [record(duration_s=float("nan")), record(duration_s=float("inf")),
+               record(duration_s="600"), record(duration_s=True), record(duration_s=None),
+               record(verdict=None), record(finished_utc="2026-11-16"),
+               record(finished_utc="yesterday"), record(finished_utc=0),
+               record(video_profiles=0), record(binaries=[]),
+               record(binaries={"receiver": {"sha256": A}}),
+               record(binaries={"receiver": {"sha256": A}, "display": {"sha256": "B" * 64}})]
+        for doc in bad:
+            with self.subTest(doc=doc):
+                self.assertEqual(self.check(doc), "drive_smoke_malformed")
+
+    def test_both_launched_hashes_are_required(self) -> None:
+        for receiver, display in (("", B), (A, ""), (A, None), (A, "xyz"), (A, B.upper())):
+            with self.subTest(receiver=receiver, display=display):
+                self.assertEqual(self.check(record(), receiver, display), "drive_smoke_hash_failed")
+
     def test_cli_exit_codes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="drive-smoke-gate-") as directory:
             path = Path(directory) / "result.json"
             path.write_text(json.dumps(record()))
-            base = [sys.executable, "-B", str(SMOKE), "check", "--record", str(path),
-                    "--display-sha256", "b" * 64, "--now", "2026-11-16T12:00:00Z"]
-            ok = subprocess.run(base + ["--receiver-sha256", "a" * 64], capture_output=True, text=True)
-            bad = subprocess.run(base + ["--receiver-sha256", "c" * 64], capture_output=True, text=True)
+            ok, bad = run_check(path), run_check(path, receiver="c" * 64)
+            empty = run_check(path, display="")
         self.assertEqual(ok.returncode, 0, ok.stderr)
         self.assertEqual((bad.returncode, bad.stdout.strip()), (3, "drive_smoke_build_mismatch"))
+        self.assertEqual((empty.returncode, empty.stdout.strip()), (3, "drive_smoke_hash_failed"))
+
+    def test_cli_refuses_nan_and_infinity_json(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-gate-") as directory:
+            path = Path(directory) / "result.json"
+            for constant in ("NaN", "Infinity", "-Infinity"):
+                with self.subTest(constant=constant):
+                    path.write_text(json.dumps(record()).replace('"duration_s": 600',
+                                                                 f'"duration_s": {constant}'))
+                    result = run_check(path)
+                    self.assertEqual(result.returncode, 3, result.stderr)
+                    self.assertTrue(result.stdout.startswith("drive_smoke_"), result.stdout)
 
 
 class LauncherGateTests(unittest.TestCase):
     """The perf launcher refuses every live stage before the collector starts."""
 
-    def launch(self, root: Path, *extra: str) -> tuple[subprocess.CompletedProcess, str]:
+    def launch(self, root: Path, *extra: str, fail_display_hash: bool = False
+               ) -> tuple[subprocess.CompletedProcess, str]:
         stub_dir = root / "bin"
         stub_dir.mkdir(exist_ok=True)
         log = root / "ssh.log"
@@ -261,43 +336,179 @@ class LauncherGateTests(unittest.TestCase):
 printf '%s\\n' "$*" >> {str(log)!r}
 case "$*" in
     *"python3 -"*) exit 1 ;;
-    *sha256sum*) printf '%s  r\\n%s  d\\n' {"a" * 64} {"b" * 64}; exit 0 ;;
+    *sha256sum*aa-wired-receiver*) printf '%s  r\\n' {A}; exit 0 ;;
+    *sha256sum*aa-dummy-display*) [ -n "${{FAIL_DISPLAY_HASH:-}}" ] && exit 1
+                                  printf '%s  d\\n' {B}; exit 0 ;;
     *xrandr* | *drm*) printf 'connected\\n'; exit 0 ;;
     *pactl* | *pw-cli*) printf '0\\tfake\\tPipeWire\\n'; exit 0 ;;
 esac
 exit 0
 ''')
         (stub_dir / "ssh").chmod(0o755)
+        env = {"PATH": f"{stub_dir}:/usr/bin:/bin", "AA_PERF_HOST": "fake.local", "AA_DISPLAY": ":0"}
+        if fail_display_hash:
+            env["FAIL_DISPLAY_HASH"] = "1"
         process = subprocess.run(
             ["bash", str(LAUNCHER), "--mode", "wired", "--duration", "60s",
-             "--out", str(root / "out.json"), "--now", "2026-11-16T12:00:00Z", *extra],
-            capture_output=True, text=True, timeout=120, check=False,
-            env={"PATH": f"{stub_dir}:/usr/bin:/bin", "AA_PERF_HOST": "fake.local", "AA_DISPLAY": ":0"})
+             "--out", str(root / "out.json"), *extra],
+            capture_output=True, text=True, timeout=120, check=False, env=env)
         return process, log.read_text()
+
+    def assert_blocked(self, root: Path, reason: str, *extra: str, **kwargs) -> None:
+        process, ssh = self.launch(root, *extra, **kwargs)
+        self.assertEqual(process.returncode, 3, process.stderr)
+        self.assertEqual(json.loads((root / "out.json").read_text())["blocked_on"], reason,
+                         process.stderr)
+        self.assertNotIn("python3 -", ssh, "the stage started without a valid drive smoke")
+
+    def write(self, root: Path, name: str, doc: dict) -> str:
+        path = root / name
+        path.write_text(json.dumps(doc))
+        return str(path)
 
     def test_no_or_wrong_smoke_blocks_before_the_collector(self) -> None:
         with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:
             root = Path(directory)
-            mismatch = root / "mismatch.json"
-            mismatch.write_text(json.dumps(record(binaries={"receiver": {"sha256": "c" * 64}})))
-            for extra, reason in (((), "drive_smoke_missing"),
-                                  (("--drive-smoke", str(mismatch)), "drive_smoke_build_mismatch")):
-                with self.subTest(reason=reason):
-                    process, ssh = self.launch(root, *extra)
-                    self.assertEqual(process.returncode, 3, process.stderr)
-                    self.assertEqual(json.loads((root / "out.json").read_text())["blocked_on"], reason)
-                    self.assertNotIn("python3 -", ssh, "the stage started without a drive smoke")
+            now = datetime.now(timezone.utc)
+            self.assert_blocked(root, "drive_smoke_missing")
+            mismatch = record(now, binaries={"receiver": {"sha256": "c" * 64}, "display": {"sha256": B}})
+            self.assert_blocked(root, "drive_smoke_build_mismatch",
+                                "--drive-smoke", self.write(root, "mismatch.json", mismatch))
+
+    def test_unhashable_or_absent_display_blocks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:
+            root = Path(directory)
+            good = self.write(root, "good.json", record(datetime.now(timezone.utc)))
+            # Given a display the target cannot hash (sha256sum fails for it only).
+            self.assert_blocked(root, "drive_smoke_hash_failed", "--drive-smoke", good,
+                                fail_display_hash=True)
+            # Given no display configured at all.
+            self.assert_blocked(root, "drive_smoke_hash_failed", "--drive-smoke", good,
+                                "--display", "")
+
+    def test_live_freshness_ignores_now(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:
+            root = Path(directory)
+            finished = datetime.now(timezone.utc) - timedelta(hours=30)
+            old = self.write(root, "old.json", record(finished))
+            # Given --now set to an hour after the stale smoke: live stays on the real clock.
+            near = (finished + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.assert_blocked(root, "drive_smoke_stale", "--drive-smoke", old, "--now", near)
 
     def test_matching_smoke_reaches_the_collector(self) -> None:
         with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:
             root = Path(directory)
-            good = root / "good.json"
-            good.write_text(json.dumps(record()))
-            process, ssh = self.launch(root, "--drive-smoke", str(good))
+            good = self.write(root, "good.json", record(datetime.now(timezone.utc)))
+            process, ssh = self.launch(root, "--drive-smoke", good)
             # The stub collector fails, so the stage is BLOCKED on that, not on the gate.
             self.assertEqual(json.loads((root / "out.json").read_text())["blocked_on"],
                              "collector_failed", process.stderr)
             self.assertIn("python3 -", ssh)
+
+
+FAKE_RECEIVER = """#!/usr/bin/env python3
+import os, subprocess, time
+directory = os.environ["FAKE_DIR"]
+grandchild = subprocess.Popen(["sleep", "300"])
+with open(os.path.join(directory, "receiver.pids"), "w") as handle:
+    handle.write(f"{os.getpid()} {grandchild.pid}")
+print('{"event":"ready"}', flush=True)
+time.sleep(0.5)
+print('{"event":"active"}', flush=True)
+print('{"event":"video_profile","width":1280,"height":720,"fps":30,"codec":"h264"}', flush=True)
+time.sleep(300)
+"""
+
+FAKE_DISPLAY = """#!/usr/bin/env python3
+import os, sys, time
+with open(os.path.join(os.environ["FAKE_DIR"], "display.pids"), "w") as handle:
+    handle.write(str(os.getpid()))
+print('{"event":"video_presented","frame":1,"scheduled_ns":%d,"completed_ns":%d,"count":1}'
+      % (time.monotonic_ns() - 30000000, time.monotonic_ns()), flush=True)
+for _ in sys.stdin:
+    pass
+time.sleep(300)
+"""
+
+FAKE_ADB = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$FAKE_DIR/adb.log"
+case "$*" in
+    "devices -l") printf 'List of devices attached\\nFAKESERIAL device usb:9-9 model:FAKE\\n' ;;
+esac
+exit 0
+"""
+
+# Run the real runner in a child Python with only the host-wide process scan
+# stubbed (a compiler elsewhere on this machine must not block the test).
+DRIVER = """import sys
+sys.path.insert(0, sys.argv[1])
+import aa_drive_smoke
+aa_drive_smoke._comms = lambda: []
+sys.exit(aa_drive_smoke.main(sys.argv[2:]))
+"""
+
+
+def alive(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
+class RunnerSignalTests(unittest.TestCase):
+    def test_sigterm_stops_both_children_and_their_groups(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-sigterm-") as directory:
+            root = Path(directory)
+            build, bin_dir, out = root / "build", root / "bin", root / "out"
+            build.mkdir()
+            bin_dir.mkdir()
+            (build / "CMakeCache.txt").write_text("CMAKE_BUILD_TYPE:STRING=Release\n")
+            for path, body in ((build / "aa-wired-receiver", FAKE_RECEIVER),
+                               (build / "aa-dummy-display", FAKE_DISPLAY), (bin_dir / "adb", FAKE_ADB)):
+                path.write_text(body)
+                path.chmod(0o755)
+            (root / "store.json").write_text("{}")
+            env = dict(os.environ, FAKE_DIR=str(root), PATH=f"{bin_dir}:/usr/bin:/bin")
+            # Given the runner mid-drive with both fake children running.
+            runner = subprocess.Popen(
+                [sys.executable, "-B", "-c", DRIVER, str(SMOKE.parent), "run",
+                 "--serial", "FAKESERIAL", "--port", "9-9", "--build-dir", str(build),
+                 "--store", str(root / "store.json"), "--display-env", ":99",
+                 "--out", str(out)], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True)
+            pids: list[int] = []
+            try:
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline and not (
+                        (root / "receiver.pids").exists() and (root / "display.pids").exists()):
+                    time.sleep(0.2)
+                time.sleep(1.5)
+                pids = [int(x) for x in (root / "receiver.pids").read_text().split()]
+                pids.append(int((root / "display.pids").read_text()))
+                self.assertTrue(all(alive(pid) for pid in pids), pids)
+                # When the runner is sent SIGTERM.
+                runner.send_signal(signal.SIGTERM)
+                output, _ = runner.communicate(timeout=60)
+                # Then it unwinds through cleanup: the receiver, its grandchild and
+                # the display are gone, the phone is restored, and the run is BLOCKED.
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and any(alive(pid) for pid in pids):
+                    time.sleep(0.1)
+                self.assertEqual(runner.returncode, 128 + signal.SIGTERM, output)
+                self.assertFalse([pid for pid in pids if alive(pid)], output)
+                self.assertEqual(json.loads((out / "result.json").read_text())["blocked_on"],
+                                 "interrupted")
+                adb = (root / "adb.log").read_text().splitlines()
+                self.assertEqual(adb[-1], "-s FAKESERIAL shell svc usb setFunctions mtp", adb)
+            finally:
+                if runner.poll() is None:
+                    runner.kill()
+                for pid in pids:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
 
 if __name__ == "__main__":

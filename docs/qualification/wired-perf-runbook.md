@@ -140,15 +140,18 @@ frame. There is no first-paint deadline: the latency from `active` to the
 first paint is reported as `measured.startup_to_first_paint_s`. The run writes
 `receiver.log`, `display.log`, `idr-events.jsonl` (`idr_*` lines stamped on
 arrival, because they carry no time), `run.json` and `result.json`.
-`aa_drive_smoke.py analyze DIR` re-evaluates a directory offline. The pass
-criteria are named constants in the tool:
+`aa_drive_smoke.py analyze DIR` re-evaluates a directory offline. SIGTERM or
+SIGINT unwinds through the same cleanup as a normal finish: it stops each
+child's whole process group, restores the phone's USB mode and records the run
+as `BLOCKED interrupted` (exit 128+signal). The pass criteria are named
+constants in the tool:
 
 | Constant | Criterion |
 | --- | --- |
 | `PAINTED_FPS_MIN_RATIO` = 0.90, `WINDOW_S` = 10, `FPS_STARTUP_GRACE_S` = 10 | every full 10 s window from first paint + 10 s to the end of the drive paints >= 90 % of the **negotiated** fps (59 windows in 600 s) |
-| `WAITING_IDR_MAX_S` = 1.0 | no `waiting_idr` episode (producer or consumer; first `idr_requested` to `idr_recovered`, the longer of the stamped span and `latency_ms`, or to window end if unrecovered) lasts > 1 s |
+| `WAITING_IDR_MAX_S` = 1.0 | no `waiting_idr` episode (producer or consumer) lasts > 1 s inside the drive. An episode starts at the earlier of its first stamped `idr_requested` and (`idr_recovered` − `latency_ms`). A recovery with no logged request still counts: the display emits one even when every request failed. Without a usable latency it is taken as open since `active`. An unrecovered episode runs to the window end, and every episode is clipped at that end |
 | — | no session drop: both processes alive at window end, the full window ran, no `disconnected` session state and no `terminal_error` inside it |
-| `AV_SYNC_MAX_MS` = the existing 50 ms budget | max A/V paint-vs-audio-write difference <= 50 ms, **where valid**: only when matched pairs exist (media playing); otherwise reported `n/a` |
+| `AV_SYNC_MAX_MS` = the existing 50 ms budget | max A/V paint-vs-audio-write difference <= 50 ms, **where valid**: only when matched pairs exist (media playing); otherwise reported `n/a`. An audio slot whose `presented_ns` is null is skipped and counted in `invalid_audio_slots`. This differs from the perf collector, which invalidates the whole A/V metric for such a slot; the soak stages keep that stricter rule |
 
 **Startup grace (fps only).** The first 10 s after the first paint are
 excluded from the fps check, and only from it. The waiting_idr, session-drop
@@ -178,13 +181,21 @@ the target, and requires:
 - the record's verdict to be `PASS`;
 - the same receiver and display sha256;
 - the default video offer and the full 600 s duration;
-- `finished_utc` within `RECORD_MAX_AGE_S` = 24 h. The 60+1800+7200 s chain
-  takes about 2.6 h, so this is a same-day rule that an overnight phone or
-  Maps update cannot slip past.
+- `finished_utc` within `RECORD_MAX_AGE_S` = 24 h **by the real clock**. The
+  launcher's `--now` only dates the result document and is never used for
+  this check; `aa_drive_smoke.py check --now` exists for tests and offline
+  review only. The 60+1800+7200 s chain takes about 2.6 h, so this is a
+  same-day rule that an overnight phone or Maps update cannot slip past.
+
+The record is strict JSON (`NaN` and `Infinity` are refused), and every field
+the gate reads must have the right type. Both binaries must hash on the target
+to a 64-hex-digit sha256. A display that cannot be hashed, or a stage with no
+display, is blocked.
 
 Otherwise the stage is `BLOCKED` with `drive_smoke_missing`,
-`drive_smoke_not_passed`, `drive_smoke_build_mismatch`, `drive_smoke_profile`,
-`drive_smoke_short` or `drive_smoke_stale`. Offline `--capture` replay and
+`drive_smoke_malformed`, `drive_smoke_hash_failed`, `drive_smoke_not_passed`,
+`drive_smoke_build_mismatch`, `drive_smoke_profile`, `drive_smoke_short` or
+`drive_smoke_stale`. Offline `--capture` replay and
 `--readiness-only` do not need a record.
 
 Gate budget (one gate out for each gate in): this gate proposes **retiring the
