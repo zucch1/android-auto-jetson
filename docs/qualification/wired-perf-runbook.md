@@ -145,7 +145,12 @@ SIGINT only sets a stop flag, which the runner checks at every wait point. It
 then runs the same single cleanup as a normal finish: it stops each registered
 child's whole process group (TERM, then KILL), restores the phone's USB mode
 and records the run as `BLOCKED interrupted` (exit 128+the first signal). A
-second signal cannot interrupt that cleanup. The pass criteria are named
+second signal cannot interrupt that cleanup. Touch control goes to the
+display through a non-blocking pipe, so a display whose GUI thread stops
+draining it cannot block the runner: if no control input is accepted for
+`CONTROL_WRITE_TIMEOUT_S` (2 s), the run ends as FAIL with
+`failure: display control input stalled`, and any runner-detected failure
+turns a PASS from the analyzer into FAIL. The pass criteria are named
 constants in the tool:
 
 | Constant | Criterion |

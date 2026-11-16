@@ -41,6 +41,7 @@ import json
 import math
 import os
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -89,6 +90,10 @@ AV_SYNC_MAX_MS = BUDGETS["av_sync_ms_max"]
 FIRST_PAINT_WAIT_S = 15.0
 READY_TIMEOUT_S = 25.0
 STIMULUS_PERIOD_S = 1.0
+# A display that accepts no touch-control input for this long has stalled its
+# GUI thread (tools/dummy-display drains stdin on a GUI-thread timer). The run
+# fails instead of blocking the runner, which must stay responsive to stops.
+CONTROL_WRITE_TIMEOUT_S = 2.0
 # The soak gate. Same bytes are checked by hash. The age bound keeps the phone,
 # its Android Auto / Maps versions and the target's state close to what the
 # smoke saw: the 60+1800+7200 s chain takes about 2.6 h, so one day is a
@@ -499,6 +504,33 @@ def _spawn(children: list, command: list[str], **kwargs) -> subprocess.Popen:
     return process
 
 
+def _send_control(fd: int, data: bytes, stop: StopFlag,
+                  timeout: float = CONTROL_WRITE_TIMEOUT_S) -> str:
+    """Write to the display's non-blocking control pipe without ever blocking.
+
+    Returns "sent", "stopped" (a stop was requested), "stalled" (the pipe
+    stayed full for `timeout`) or "closed" (the display's stdin is gone; the
+    drive loop then sees the display exit).
+    """
+    view = memoryview(data)
+    deadline = time.monotonic() + timeout
+    while view:
+        if stop:
+            return "stopped"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "stalled"
+        try:
+            _, writable, _ = select.select([], [fd], [], min(0.1, remaining))
+            if writable:
+                view = view[os.write(fd, view):]
+        except BlockingIOError:
+            continue
+        except OSError:
+            return "closed"
+    return "sent"
+
+
 def _wait(predicate, timeout: float, stop: StopFlag, *alive) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and not stop:
@@ -603,6 +635,8 @@ def _run_cli(args) -> int:
             return
         display = _spawn(children, display_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, env=env, text=True)
+        control = display.stdin.fileno()
+        os.set_blocking(control, False)  # writes go through _send_control only
         loggers.append(Logger(display.stdout, out / "display.log", stamped, lock, "display"))
         loggers[-1].start()
         dx = loggers[1].seen
@@ -623,13 +657,14 @@ def _run_cli(args) -> int:
                 a, b = (440, 700) if step % 2 == 0 else (700, 440)
                 lines = [f"touch down {a} 260"]
                 lines += [f"touch move {int(a + (b - a) * j / 6)} 260" for j in range(1, 7)]
-                try:
-                    for entry in lines + [f"touch up {b} 260"]:
-                        display.stdin.write(entry + "\n")
-                        display.stdin.flush()
-                        time.sleep(0.06)
-                except (BrokenPipeError, OSError):
-                    pass
+                outcome = "sent"
+                for entry in lines + [f"touch up {b} 260"]:
+                    outcome = _send_control(control, (entry + "\n").encode(), stop)
+                    if outcome != "sent" or not stop.sleep(0.06):
+                        break
+                if outcome == "stalled":
+                    run["failure"] = "display control input stalled"
+                    break
                 step, last = step + 1, time.monotonic()
             time.sleep(0.1)
         run["window_end_ns"] = time.monotonic_ns()
@@ -666,6 +701,8 @@ def _run_cli(args) -> int:
     result = {**base, **analyze_dir(out), "finished_utc": datetime.now(timezone.utc).isoformat()}
     if run.get("failure"):
         result["failure"] = run["failure"]
+        if result["verdict"] == "PASS":  # a runner-detected failure never passes
+            result["verdict"] = "FAIL"
     store_after = sha256(store) if store.exists() else None
     result["trust_store_unchanged"] = store_before == store_after
     if not result["trust_store_unchanged"]:

@@ -471,8 +471,9 @@ with open(os.path.join(os.environ["FAKE_DIR"], "display.pids"), "w") as handle:
     handle.write(str(os.getpid()))
 print('{"event":"video_presented","frame":1,"scheduled_ns":%d,"completed_ns":%d,"count":1}'
       % (time.monotonic_ns() - 30000000, time.monotonic_ns()), flush=True)
-for _ in sys.stdin:
-    pass
+if not os.environ.get("FAKE_DISPLAY_STALL"):
+    for _ in sys.stdin:
+        pass
 time.sleep(300)
 """
 
@@ -530,6 +531,26 @@ elif hook == "cleanup":
         return previous
     aa_drive_smoke._stop = hooked_stop
     aa_drive_smoke.signal.signal = hooked_signal
+elif hook == "stall":
+    # The fake display never reads stdin (FAKE_DISPLAY_STALL). Shrink its pipe
+    # and fill it, then hand the runner a blocking fd, as a stalled GUI would.
+    import fcntl
+    real_spawn = aa_drive_smoke._spawn
+    def hooked_spawn(children, command, **kwargs):
+        process = real_spawn(children, command, **kwargs)
+        if kwargs.get("stdin") is subprocess.PIPE:
+            fd = process.stdin.fileno()
+            fcntl.fcntl(fd, 1031, 4096)  # F_SETPIPE_SZ
+            os.set_blocking(fd, False)
+            try:
+                while True:
+                    os.write(fd, b"x" * 4096)
+            except BlockingIOError:
+                pass
+            os.set_blocking(fd, True)
+            open(os.path.join(fake, "pipe.full"), "w").close()
+        return process
+    aa_drive_smoke._spawn = hooked_spawn
 sys.exit(aa_drive_smoke.main(sys.argv[2:]))
 """
 
@@ -556,6 +577,8 @@ class RunnerSignalTests(unittest.TestCase):
             path.chmod(0o755)
         (root / "store.json").write_text("{}")
         env = dict(os.environ, FAKE_DIR=str(root), DRIVE_HOOK=hook, PATH=f"{bin_dir}:/usr/bin:/bin")
+        if hook == "stall":
+            env["FAKE_DISPLAY_STALL"] = "1"
         return subprocess.Popen(
             [sys.executable, "-B", "-c", DRIVER, str(SMOKE.parent), "run",
              "--serial", "FAKESERIAL", "--port", "9-9", "--build-dir", str(build),
@@ -635,6 +658,56 @@ class RunnerSignalTests(unittest.TestCase):
             # Then cleanup still completes and the first signal is the one reported.
             self.finish(root, runner, signal.SIGTERM)
         self.scenario("cleanup", True, check)
+
+    def test_sigterm_while_display_control_pipe_is_full(self) -> None:
+        def check(root: Path, runner: subprocess.Popen) -> None:
+            # Given a display that stopped draining its full control pipe.
+            self.wait_for(root / "receiver.pids", root / "display.pids", root / "pipe.full")
+            time.sleep(0.5)
+            # When the runner is sent SIGTERM mid-write.
+            runner.send_signal(signal.SIGTERM)
+            # Then it still reaches cleanup promptly.
+            self.finish(root, runner, signal.SIGTERM)
+        self.scenario("stall", True, check)
+
+    def test_stalled_display_control_fails_the_run(self) -> None:
+        def check(root: Path, runner: subprocess.Popen) -> None:
+            # Given a full control pipe and no stop, the run ends as FAIL within the stall timeout.
+            output, _ = runner.communicate(timeout=60)
+            self.assertEqual(runner.returncode, 1, output)
+            result = json.loads((root / "out" / "result.json").read_text())
+            self.assertEqual(result["failure"], "display control input stalled")
+            self.assertEqual(result["verdict"], "FAIL")
+            self.assertFalse([pid for pid in self.pids(root) if alive(pid)], output)
+        self.scenario("stall", False, check)
+
+
+class SendControlTests(unittest.TestCase):
+    def test_full_pipe_returns_stalled_or_stopped_without_blocking(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            os.set_blocking(write_fd, False)
+            try:
+                while True:
+                    os.write(write_fd, b"x" * 4096)
+            except BlockingIOError:
+                pass
+            stop = smoke.StopFlag()
+            started = time.monotonic()
+            self.assertEqual(smoke._send_control(write_fd, b"touch up 1 1\n", stop, timeout=0.3), "stalled")
+            self.assertLess(time.monotonic() - started, 1.0)
+            stop(signal.SIGTERM, None)
+            self.assertEqual(smoke._send_control(write_fd, b"touch up 1 1\n", stop), "stopped")
+            os.read(read_fd, 65536)
+            self.assertEqual(smoke._send_control(write_fd, b"touch up 1 1\n", smoke.StopFlag()), "sent")
+            os.close(read_fd)
+            read_fd = -1
+            self.assertEqual(smoke._send_control(write_fd, b"x", smoke.StopFlag()), "closed")
+        finally:
+            for fd in (read_fd, write_fd):
+                if fd >= 0:
+                    os.close(fd)
+
 
 if __name__ == "__main__":
     unittest.main()
