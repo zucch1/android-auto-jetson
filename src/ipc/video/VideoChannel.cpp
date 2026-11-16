@@ -574,6 +574,15 @@ core::Result<void> prepare_video_socket_path(const VideoSocketPath& path) {
 std::uint32_t current_uid() noexcept { return static_cast<std::uint32_t>(::getuid()); }
 
 struct VideoProducer::Impl final {
+    struct PartialSend final {
+        bool active{false};
+        std::uint64_t frame{};
+        std::uint32_t next_index{};
+        std::uint32_t count{};
+        std::uint64_t first_sequence{};
+        std::uint64_t send_started_ns{};
+    };
+
     int fd{-1};
     NegotiatedLimits limits{};
     std::array<std::uint8_t, kFrameHeaderBytes + kMaxDatagramPayload> packet{};
@@ -582,8 +591,10 @@ struct VideoProducer::Impl final {
     std::uint64_t backpressure{};
     bool waiting_idr{true};
     bool closed{false};
+    PartialSend partial{};
     VideoEndpoint endpoint{};
     VideoEndpointObserver observer{};
+    DatagramSend datagram_send{};
 
     Impl() = default;
     ~Impl() { release(); }
@@ -597,6 +608,7 @@ struct VideoProducer::Impl final {
             return;
         }
         closed = true;
+        partial.active = false;
         if (fd >= 0) {
             ::shutdown(fd, SHUT_WR);
             ::close(fd);
@@ -630,6 +642,7 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
     if (request.payload.size() > cap) {
         return Error{ErrorCode::transport_oversize_frame};
     }
+    impl_->partial.active = false;
     if (impl_->waiting_idr && !request.idr) {
         ++impl_->dropped;
         return SendStatus::dropped_waiting_idr;
@@ -650,18 +663,26 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
                             header);
         std::memcpy(impl_->packet.data() + kFrameHeaderBytes,
                     request.payload.data() + static_cast<std::size_t>(index) * datagram, length);
-        ssize_t sent;
+        std::ptrdiff_t sent;
+        int send_errno = 0;
         if (index == 0) {
             send_started_ns = video_monotonic_ns();
         }
         do {
-            sent = ::send(impl_->fd, impl_->packet.data(), kFrameHeaderBytes + length,
-                          MSG_DONTWAIT | MSG_NOSIGNAL);
-        } while (sent < 0 && errno == EINTR);
+            if (impl_->datagram_send) {
+                sent = impl_->datagram_send(impl_->fd, impl_->packet.data(),
+                                            kFrameHeaderBytes + length,
+                                            MSG_DONTWAIT | MSG_NOSIGNAL, send_errno);
+            } else {
+                sent = ::send(impl_->fd, impl_->packet.data(), kFrameHeaderBytes + length,
+                              MSG_DONTWAIT | MSG_NOSIGNAL);
+                send_errno = (sent < 0) ? errno : 0;
+            }
+        } while (sent < 0 && send_errno == EINTR);
         if (sent != static_cast<ssize_t>(kFrameHeaderBytes + length)) {
             impl_->waiting_idr = true;
             ++impl_->dropped;
-            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (sent < 0 && (send_errno == EAGAIN || send_errno == EWOULDBLOCK)) {
                 ++impl_->backpressure;
                 return SendStatus::dropped_backpressure;
             }
@@ -679,6 +700,127 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
         impl_->observer(event);
     }
     return SendStatus::sent;
+}
+
+core::Result<TrySendStatus> VideoProducer::try_send_access_unit(const VideoSendRequest& request) {
+    if (!impl_ || impl_->closed) {
+        return closed_error();
+    }
+    if (request.profile && !protocol::valid_video_profile(*request.profile)) {
+        return Error{ErrorCode::channel_caps_unsupported};
+    }
+    if (request.payload.empty()) {
+        return Error{ErrorCode::invalid_argument};
+    }
+    const auto cap = static_cast<std::size_t>(impl_->limits.max_access_unit_bytes);
+    if (request.payload.size() > cap) {
+        return Error{ErrorCode::transport_oversize_frame};
+    }
+    if (impl_->waiting_idr && !request.idr) {
+        impl_->partial.active = false;
+        ++impl_->dropped;
+        return TrySendStatus::dropped_waiting_idr;
+    }
+    const std::size_t datagram = impl_->limits.max_datagram_payload;
+    const auto count =
+        static_cast<std::uint32_t>((request.payload.size() + datagram - 1) / datagram);
+
+    std::uint32_t start_index = 0;
+    std::uint64_t first_sequence = impl_->sequence;
+    std::uint64_t send_started_ns{};
+    if (impl_->partial.active) {
+        if (impl_->partial.frame != request.frame || impl_->partial.count != count) {
+            impl_->partial.active = false;
+            impl_->waiting_idr = true;
+            ++impl_->dropped;
+            if (!request.idr) {
+                return TrySendStatus::dropped_waiting_idr;
+            }
+        } else {
+            start_index = impl_->partial.next_index;
+            first_sequence = impl_->partial.first_sequence;
+            send_started_ns = impl_->partial.send_started_ns;
+        }
+    }
+
+    for (std::uint32_t index = start_index; index < count; ++index) {
+        const auto length = std::min<std::size_t>(
+            datagram, request.payload.size() - static_cast<std::size_t>(index) * datagram);
+        VideoFrameHeader header{request.frame, impl_->sequence, request.timestamp_ns,
+                                index,          count,
+                                static_cast<std::uint32_t>(request.payload.size()),
+                                static_cast<std::uint32_t>(length), request.idr, request.profile};
+        encode_frame_header(std::span<std::uint8_t>{impl_->packet.data(), kFrameHeaderBytes},
+                            header);
+        std::memcpy(impl_->packet.data() + kFrameHeaderBytes,
+                    request.payload.data() + static_cast<std::size_t>(index) * datagram, length);
+        if (index == 0) {
+            send_started_ns = video_monotonic_ns();
+        }
+        std::ptrdiff_t sent;
+        int send_errno = 0;
+        do {
+            if (impl_->datagram_send) {
+                sent = impl_->datagram_send(impl_->fd, impl_->packet.data(),
+                                            kFrameHeaderBytes + length,
+                                            MSG_DONTWAIT | MSG_NOSIGNAL, send_errno);
+            } else {
+                sent = ::send(impl_->fd, impl_->packet.data(), kFrameHeaderBytes + length,
+                              MSG_DONTWAIT | MSG_NOSIGNAL);
+                send_errno = (sent < 0) ? errno : 0;
+            }
+        } while (sent < 0 && send_errno == EINTR);
+        if (sent == static_cast<ssize_t>(kFrameHeaderBytes + length)) {
+            ++impl_->sequence;
+            continue;
+        }
+        if (sent < 0 && (send_errno == EAGAIN || send_errno == EWOULDBLOCK)) {
+            if (index > 0) {
+                impl_->partial = {true, request.frame, index, count, first_sequence, send_started_ns};
+            }
+            return TrySendStatus::would_block;
+        }
+        impl_->partial.active = false;
+        impl_->waiting_idr = true;
+        ++impl_->dropped;
+        return io_error();
+    }
+    impl_->partial.active = false;
+    impl_->waiting_idr = false;
+    if (impl_->observer) {
+        auto event = impl_->endpoint;
+        event.frame = request.frame;
+        event.sequence = first_sequence;
+        event.timestamp_ns = request.timestamp_ns;
+        event.observed_ns = send_started_ns;
+        event.payload_bytes = request.payload.size();
+        impl_->observer(event);
+    }
+    return TrySendStatus::sent;
+}
+
+void VideoProducer::enter_waiting_idr_on_backpressure() noexcept {
+    if (!impl_) {
+        return;
+    }
+    impl_->partial.active = false;
+    impl_->waiting_idr = true;
+    ++impl_->dropped;
+    ++impl_->backpressure;
+}
+
+void VideoProducer::abandon_partial_send() noexcept {
+    if (!impl_ || !impl_->partial.active) {
+        return;
+    }
+    impl_->partial.active = false;
+    impl_->waiting_idr = true;
+}
+
+void VideoProducer::set_datagram_send_for_test(DatagramSend send_fn) {
+    if (impl_) {
+        impl_->datagram_send = std::move(send_fn);
+    }
 }
 
 void VideoProducer::set_observer(VideoEndpointObserver observer) {

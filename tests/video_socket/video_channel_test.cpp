@@ -643,3 +643,87 @@ TEST(VideoChannel, ProducerWaitingIdrTracksBackpressureAndResetsOnIdr) {
     EXPECT_EQ(recovered.value(), aa::ipc::SendStatus::sent);
     EXPECT_FALSE(pair.value().producer.waiting_idr());
 }
+
+TEST(VideoChannel, RecommendedBackpressureBudgetScalesByProfileAndClamps) {
+    using aa::ipc::kMinSocketBufferBytes;
+    using aa::ipc::recommended_backpressure_budget;
+    using aa::protocol::VideoCodec;
+    using aa::protocol::VideoProfile;
+
+    const auto fallback = recommended_backpressure_budget(std::nullopt);
+    EXPECT_EQ(fallback.max_bytes, kMinSocketBufferBytes);
+    EXPECT_EQ(fallback.max_age, std::chrono::milliseconds{67});
+
+    const auto sd30 = recommended_backpressure_budget(VideoProfile{800, 480, 30, VideoCodec::h264});
+    EXPECT_EQ(sd30.max_bytes, kMinSocketBufferBytes);
+    EXPECT_EQ(sd30.max_age, std::chrono::milliseconds{67});
+
+    const auto hd1080p60 = recommended_backpressure_budget(VideoProfile{1920, 1080, 60, VideoCodec::h264});
+    EXPECT_EQ(hd1080p60.max_bytes, 486'000U);
+    EXPECT_EQ(hd1080p60.max_age, std::chrono::milliseconds{50});
+
+    const auto qhd1440p60 = recommended_backpressure_budget(VideoProfile{2560, 1440, 60, VideoCodec::h265});
+    EXPECT_EQ(qhd1440p60.max_bytes, 864'000U);
+    EXPECT_EQ(qhd1440p60.max_age, std::chrono::milliseconds{50});
+
+    const auto uhd4k60 = recommended_backpressure_budget(VideoProfile{3840, 2160, 60, VideoCodec::h265});
+    EXPECT_EQ(uhd4k60.max_bytes, 1024U * 1024U);
+    EXPECT_EQ(uhd4k60.max_age, std::chrono::milliseconds{50});
+}
+
+TEST(VideoChannel, TrySendAccessUnitResumesMidAuFragmentWithoutSequenceGapOrLoss) {
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+
+    // Clear initial waiting_idr with a small IDR.
+    const std::vector<std::uint8_t> idr{0x00, 0x00, 0x01, 0x65};
+    ASSERT_EQ(pair.value().producer.try_send_access_unit({1, 100, true, idr, std::nullopt}).value(),
+              aa::ipc::TrySendStatus::sent);
+    ASSERT_TRUE(pair.value().consumer.receive(aa::core::Milliseconds{500}));
+
+    // Multi-fragment P-frame (40 KB -> 3 fragments at 16 KB datagram limit).
+    std::vector<std::uint8_t> p_frame(40 * 1024);
+    for (std::size_t i = 0; i < p_frame.size(); ++i) {
+        p_frame[i] = static_cast<std::uint8_t>((i * 37U + 11U) & 0xFFU);
+    }
+
+    // Allow fragment 0, then return EAGAIN on fragment 1 to exercise mid-AU partial hold.
+    std::size_t calls = 0;
+    pair.value().producer.set_datagram_send_for_test(
+        [&calls](int fd, const void* buf, std::size_t len, int flags, int& out_errno) -> std::ptrdiff_t {
+            ++calls;
+            if (calls == 2) {
+                out_errno = EAGAIN;
+                return -1;
+            }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+
+    const auto held = pair.value().producer.try_send_access_unit({2, 200, false, p_frame, std::nullopt});
+    ASSERT_TRUE(held);
+    EXPECT_EQ(held.value(), aa::ipc::TrySendStatus::would_block);
+    EXPECT_FALSE(pair.value().producer.waiting_idr());
+    EXPECT_EQ(pair.value().producer.dropped(), 0U);
+    EXPECT_EQ(pair.value().producer.backpressure_events(), 0U);
+
+    // Retry resumes seamlessly from fragment 1 without resending fragment 0.
+    const auto resumed = pair.value().producer.try_send_access_unit({2, 200, false, p_frame, std::nullopt});
+    ASSERT_TRUE(resumed);
+    EXPECT_EQ(resumed.value(), aa::ipc::TrySendStatus::sent);
+    EXPECT_EQ(calls, 4U); // fragment 0, blocked fragment 1, retried fragment 1, fragment 2
+
+    aa::ipc::ReceiveStatus rx = aa::ipc::ReceiveStatus::waiting;
+    for (int i = 0; i < 8 && rx != aa::ipc::ReceiveStatus::complete; ++i) {
+        const auto step = pair.value().consumer.receive(aa::core::Milliseconds{500});
+        ASSERT_TRUE(step);
+        rx = step.value();
+    }
+    ASSERT_EQ(rx, aa::ipc::ReceiveStatus::complete);
+    EXPECT_EQ(pair.value().consumer.access_unit().frame, 2U);
+    EXPECT_EQ(pair.value().consumer.access_unit().payload, p_frame);
+    EXPECT_EQ(pair.value().consumer.rejected(), 0U);
+    EXPECT_EQ(pair.value().consumer.suppressed(), 0U);
+    EXPECT_EQ(pair.value().consumer.resyncs(), 1U); // Only the initial startup IDR resync.
+}

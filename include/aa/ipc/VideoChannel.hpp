@@ -6,7 +6,9 @@
 #include <aa/ipc/VideoSocket.hpp>
 #include <aa/ipc/VideoTelemetry.hpp>
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -78,6 +80,12 @@ enum class SendStatus : std::uint8_t {
     dropped_waiting_idr,
 };
 
+enum class TrySendStatus : std::uint8_t {
+    sent,
+    would_block,
+    dropped_waiting_idr,
+};
+
 enum class ReceiveStatus : std::uint8_t {
     fragment,
     complete,
@@ -98,6 +106,9 @@ public:
 
 class VideoProducer final {
 public:
+    using DatagramSend =
+        std::function<std::ptrdiff_t(int fd, const void* buf, std::size_t len, int flags, int& out_errno)>;
+
     VideoProducer();
     VideoProducer(const VideoProducer&) = delete;
     VideoProducer& operator=(const VideoProducer&) = delete;
@@ -109,6 +120,26 @@ public:
     // transport_oversize_frame. drop-to-IDR state suppresses non-IDR units
     // (dropped_waiting_idr) after any backpressure drop.
     [[nodiscard]] core::Result<SendStatus> send_access_unit(const VideoSendRequest& request);
+
+    // Non-dropping send variant used by bounded producer-side hold (#144):
+    // returns `would_block` on EAGAIN/EWOULDBLOCK without entering
+    // `waiting_idr` or incrementing `dropped`/`backpressure`. If a multi-fragment
+    // AU hits EAGAIN mid-AU, prefix fragments already written are remembered so
+    // the next call for the same AU resumes cleanly at the failed fragment index
+    // without breaking VideoReassembler's monotonic sequence invariant.
+    [[nodiscard]] core::Result<TrySendStatus> try_send_access_unit(const VideoSendRequest& request);
+
+    // Escalates a held backpressure episode that exceeded its budget into the
+    // terminal waiting-for-IDR drop state and counts one backpressure drop.
+    void enter_waiting_idr_on_backpressure() noexcept;
+
+    // Clears any mid-AU partial send state and forces waiting_idr (used when a
+    // partially-sent AU must be evicted on reset/disconnect).
+    void abandon_partial_send() noexcept;
+
+    // Test-only seam to inject synthetic EAGAIN/short writes on individual
+    // datagrams without timing sleeps.
+    void set_datagram_send_for_test(DatagramSend send_fn);
 
     // Called after a successful full AU send, with the timestamp sampled just
     // before its first send syscall. Failed/partial sends acquire no sample.
