@@ -1699,6 +1699,7 @@ const char *const kUsage =
     "                         [--require-video-consumer] [--wired-enrolment]\n"
     "                         [--screen-<field> N]... [--screen-experimental-geometry]\n"
     "                         [--audio-sink pulse|pipewire|automatic]\n"
+    "                         [--require-usb-serial SERIAL]\n"
     "  runs the wired session over USB/AOA with TrustStore admission;\n"
     "  the approved-phones store must already contain the phone (fail closed).\n"
     "  --wired-enrolment: when admission refuses the phone, keep the D-Bus\n"
@@ -1707,6 +1708,9 @@ const char *const kUsage =
     "  ConfirmPhonePairing = yes or CancelPhonePairing = no; aa-wired-enrol is\n"
     "  the terminal reference). An approval exits 0 (replug to connect); no\n"
     "  approval exits 3. Needs the bus (not with --no-bus).\n"
+    "  --require-usb-serial pins the run to one physical phone: the first link\n"
+    "  and every reconnect must carry this pre-switch USB serial (the adb\n"
+    "  serial), else err code phone_serial_mismatch and exit 3 (qualification).\n"
     "  --require-video-consumer defers upstream negotiation until a video\n"
     "  consumer has been accepted and installed (bounded, fail closed).\n"
     "  --audio-sink picks the routing element (default pulse: pulsesink via\n"
@@ -1743,6 +1747,7 @@ int receiver_main(int argc, char **argv) {
     bool no_bus = false;
     bool require_video_consumer = false;
     bool wired_enrolment = false;
+    std::string required_usb_serial;
     aa::audio::SinkBackend audio_backend = aa::audio::SinkBackend::pulse;
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--port") == 0 && index + 1 < argc) {
@@ -1785,6 +1790,12 @@ int receiver_main(int argc, char **argv) {
             require_video_consumer = true;
         } else if (std::strcmp(argv[index], "--wired-enrolment") == 0) {
             wired_enrolment = true;
+        } else if (std::strcmp(argv[index], "--require-usb-serial") == 0 && index + 1 < argc) {
+            required_usb_serial = argv[++index];
+            if (required_usb_serial.empty()) {
+                std::fputs("invalid --require-usb-serial\n", stderr);
+                return 2;
+            }
         } else if (std::strcmp(argv[index], "--audio-sink") == 0 && index + 1 < argc) {
             const std::string_view value{argv[++index]};
             if (value == "pulse") {
@@ -1975,6 +1986,15 @@ int receiver_main(int argc, char **argv) {
         return true;
     };
 
+    // --require-usb-serial: the admitted link must be the one expected phone.
+    // Checked on the admitted identity, before any session use of the link.
+    auto pinned = [&required_usb_serial](const aa::trust::PhoneIdentity &phone) {
+        return required_usb_serial.empty() ||
+               aa::trust::wired_key_usb_serial(phone.key) == required_usb_serial;
+    };
+    constexpr std::string_view kSerialMismatch =
+        "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"phone_serial_mismatch\"}";
+
     aa::trust::WiredIdentity attempted_identity{};
     auto first_link = aa::app::open_wired_link(selector, accessory, store, {}, &attempted_identity);
     if (!first_link.has_value()) {
@@ -1998,6 +2018,10 @@ int receiver_main(int argc, char **argv) {
             enrolment.note_refused(attempted_identity).has_value()) {
             return run_wired_enrolment(bus.value(), enrolment, attempted_identity, deadline);
         }
+        return 3;
+    }
+    if (!pinned(first_link.value().phone)) {
+        log_line(std::string{kSerialMismatch});
         return 3;
     }
     enrolment.close();  // a session now owns the store; pairing is refused again
@@ -2144,6 +2168,10 @@ int receiver_main(int argc, char **argv) {
                 return aa::Error{aa::ErrorCode::cancelled};
             }
             if (relink) {
+                if (!pinned(relink.value().phone)) {
+                    log_line(std::string{kSerialMismatch});
+                    return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
+                }
                 if (relink.value().phone.key != link->phone.key) {
                     return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
                 }

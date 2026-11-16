@@ -256,7 +256,8 @@ occurs mid-AU without breaking `VideoReassembler`'s monotonic sequence contract)
 3. Implement GPU YUV textures and shader presentation.
 4. Implement NVMM/DMABUF to EGLImage to GL_TEXTURE_EXTERNAL_OES zero-copy.
 5. Benchmark every available combination at every configured profile through
-   the existing 60 s, 1800 s and 7200 s stages: A/V skew <=50 ms, audio latency
+   the existing 1800 s and 7200 s stages (the 60 s stage is retired; a
+   same-phone drive smoke gates them): A/V skew <=50 ms, audio latency
    <=200 ms, receiver CPU <=50% of one core, RSS <=250 MB and growth <10%, zero
    crashes, and the existing Orin Nano thermal policy. Record copy/upload costs,
    frame loss and per-thread load. Decode p95 remains informational. Choose the

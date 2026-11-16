@@ -525,6 +525,7 @@ case "$command_line" in
                    printf '%s\\n' "${{STUB_BUILD_LINE:-}}" >&2
                    exit 0 ;;
     *sha256sum*aa-dummy-display*) printf '%s  d\\n' "${{STUB_DISPLAY_SHA:-}}"; exit 0 ;;
+    *"adb devices -l"*) printf 'List of devices attached\\nTESTPHONE01 device usb:1-2.1 model:FAKE\\n'; exit 0 ;;
     *sha256sum*) printf '%s  r\\n' "${{STUB_RECEIVER_SHA:-}}"; exit 0 ;;
     *"test -x"*) exit 0 ;;
     *xrandr* | *drm*) printf 'connected\\n'; exit 0 ;;
@@ -540,8 +541,10 @@ def drive_smoke_record(root: Path) -> Path:
     """A passing #137 drive smoke for the stub's binary hashes (the soak gate)."""
     path = root / "drive-smoke.json"
     path.write_text(json.dumps({
-        "schema": "aa-drive-smoke/1", "verdict": "PASS", "duration_s": 600,
-        "video_profiles": None,
+        "schema": "aa-drive-smoke/2", "verdict": "PASS", "duration_s": 600,
+        "video_profiles": None, "phone_serial": "TESTPHONE01",
+        "configuration": {"receiver_flags": [], "display_flags": [], "receiver_decoder": "default",
+                          "display_decoder": "default", "presentation": "default"},
         # Live freshness uses the real clock (the launcher never forwards --now).
         "finished_utc": datetime.now(timezone.utc).isoformat(),
         "binaries": {"receiver": {"sha256": "a" * 64}, "display": {"sha256": "b" * 64}}}),
@@ -566,7 +569,7 @@ def test_launcher_records_the_build_and_never_passes_an_override_run() -> None:
             return subprocess.run(
                 ["bash", str(SHELL), "--mode", "wired", "--duration", "1s",
                  "--out", str(root / "result.json"), "--now", NOW,
-                 "--drive-smoke", str(smoke), *extra],
+                 "--drive-smoke", str(smoke), "--phone-serial", "TESTPHONE01", *extra],
                 capture_output=True, text=True, timeout=120, env=env, check=False)
 
         # When the stage runs from the build directory that produced the binaries.

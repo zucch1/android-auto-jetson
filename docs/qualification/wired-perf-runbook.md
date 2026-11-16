@@ -114,7 +114,7 @@ a shell unquoted.
 
 The soak workload is a near-static screen with a tone on one phone. The S24
 Ultra video freeze (#134) showed up only with a moving map, so no soak stage
-could catch it. **No soak stage (60, 1800 or 7200 s) starts without a passing
+could catch it. **No soak stage (1800 or 7200 s) starts without a passing
 ten-minute moving-map drive smoke on the same build.**
 
 `tools/wired-qa/aa_drive_smoke.py run` runs on the Jetson the phone is plugged
@@ -124,7 +124,20 @@ receiver or display is running, or when the phone is not on `--port`. It
 then opens Google Maps on the phone with a `geo:` intent and launches
 `aa-wired-receiver` and `aa-dummy-display` (on the owner's session display).
 While the window runs it drags the map once a second over the display's test
-control channel. Media is optional: pass it so A/V gets checked.
+control channel. Media is required (`--media-uri`): the A/V contract needs
+audio across the whole drive.
+
+**Media for the whole drive.** When no audio write has arrived for
+`MEDIA_RELAUNCH_SILENCE_S` (5 s) during the drive, the runner re-sends the
+media intent and then the Maps intent, so Maps stays in front. It does this at
+most once per 5 s and counts the relaunches in `media_relaunches`. A
+relaunch was chosen over the alternatives because it is the only one that
+works with any player and any clip using what the runner already has: VIEW
+intents carry no portable loop option (VLC and Samsung's player differ), and
+the host cannot check a clip's length on the phone without extra tooling. A
+clip that ends is restarted. (In the S24 run of 2026-11-16, audio telemetry
+stopped at 243 s; why is unproven.) The coverage clause still judges what
+actually played, so restart gaps count against it.
 
 ```bash
 HU_KEY_PATH=<credential path> tools/wired-qa/aa_drive_smoke.py run \
@@ -158,7 +171,79 @@ constants in the tool:
 | `PAINTED_FPS_MIN_RATIO` = 0.90, `WINDOW_S` = 10, `FPS_STARTUP_GRACE_S` = 10 | every full 10 s window from first paint + 10 s to the end of the drive paints >= 90 % of the **negotiated** fps (59 windows in 600 s) |
 | `WAITING_IDR_MAX_S` = 1.0 | no `waiting_idr` episode (producer or consumer) lasts > 1 s inside the drive. An episode starts at the earlier of its first stamped `idr_requested` and (`idr_recovered` − `latency_ms`). A recovery with no logged request still counts: the display emits one even when every request failed. When `latency_ms` is absent, negative, nonfinite or not a number, the episode is taken as open since `active`, even with a logged request, because the wait can predate its first successful request. An unrecovered episode runs from its first request to the window end. Every episode is intersected with [`active`, window end] |
 | — | no session drop: both processes alive at window end, the full window ran, no `disconnected` session state and no `terminal_error` inside it |
-| `AV_SYNC_MAX_MS` = the existing 50 ms budget | max A/V paint-vs-audio-write difference <= 50 ms, **where valid**: only when matched pairs exist (media playing); otherwise reported `n/a`. An audio slot whose `presented_ns` is null is skipped and counted in `invalid_audio_slots`. This differs from the perf collector, which invalidates the whole A/V metric for such a slot; the soak stages keep that stricter rule |
+| `AV_MEAN_WINDOW_S` = 5, `AV_MEAN_MAX_ABS_MS` = 40 | (a) the signed mean skew of every full 5 s window in the drive is within ±40 ms |
+| `AV_P99_ABS_MAX_MS` = 50 | (b) the nearest-rank 99th percentile of \|skew\| is <= 50 ms |
+| `AV_MAX_ABS_MS` = 90 | (c) the maximum \|skew\| is <= 90 ms |
+| `AV_COVERAGE_MIN` = 0.90 | audio covers >= 90 % of the drive; no audio, or too little, is a FAIL, never `n/a` |
+
+### Signed A/V contract (owner decision 2026-11-16)
+
+This replaces the drive smoke's former "max \|skew\| <= 50 ms where pairs
+exist" rule (#71 asked for an owner-approved A/V qualification contract). All
+three clauses and coverage must pass.
+
+- **Skew** is signed: (video `completed_ns` − video `scheduled_ns`) −
+  (audio `presented_ns` − audio `scheduled_ns`), in ms. Positive means the
+  video endpoint is later than the audio endpoint. A frame pairs with the audio
+  slot whose half-open scheduled interval `[scheduled_ns, scheduled_end_ns)`
+  holds the frame's `scheduled_ns`. The population is every painted frame whose
+  paint completed between `active` and first paint + duration. A slot without
+  an integer `presented_ns`, or with an empty interval, is skipped and counted
+  in `invalid_audio_slots`. That differs from the perf collector, which
+  invalidates the whole A/V metric for such a slot.
+- **5 s mean (a):** for every full half-open window `[t, t + 5 s)` inside the
+  drive `[first paint, first paint + duration]`, the sample mean of the skews of
+  pairs whose paint completed inside it: a pair exactly at `t` is inside, one
+  exactly at `t + 5 s` is not, and only full windows inside the drive count.
+  The sweep evaluates the drive start and every change point, where a pair
+  enters (`t = p − 5 s + 1 ns`) or leaves (`t = p + 1 ns`), so every distinct
+  window is visited. A window with a single pair has that pair's skew as its
+  mean. Windows without pairs have no mean; missing audio is judged by
+  coverage.
+- **Coverage:** the duration of the union of the valid audio slots' scheduled
+  intervals, intersected with the drive `[first paint, first paint +
+  duration]`, divided by the drive length. It shows that valid audio telemetry
+  existed, not that a speaker played.
+- **Result fields** (`av_signed_contract` criterion): `signed_p1_ms`,
+  `signed_p50_ms`, `signed_p99_ms`, `signed_min_ms`, `signed_max_ms`,
+  `abs_p99_ms`, `abs_max_ms`, `window_mean_min_ms`, `window_mean_max_ms`,
+  `worst_window_mean_ms` (the larger in magnitude), `over_50_ms`, `pairs`,
+  `invalid_audio_slots`, `coverage` and the per-clause `clauses`.
+
+Rationale for each limit. These are engineering policy: the standards below
+are about sustained, constant offsets between light and sound, and none of
+them prescribes a p99, a rolling mean or a coverage rule.
+
+- **±40 ms sustained:** EBU R37-2007 limits the end-to-end emission output to
+  40 ms sound before picture and 60 ms after (and 5 ms / 15 ms per stage). The
+  tighter side is used both ways until the physical offset is known.
+- **p99 <= 50 ms:** keeps the previous contract's number, now as a tail
+  statistic; 50 ms is 1.5 frame periods at 30 fps. A maximum has no stable pass
+  probability over long runs: #71 records runs failed by 1 frame in 54,200,
+  72,277 and 215,896 pairs.
+- **max <= 90 ms:** ITU-R BT.1359-1 (1998) gives approximate average
+  thresholds of 45 ms (sound early) / 125 ms (sound late) for detectability and
+  90 ms / 185 ms for acceptability. 90 ms is its sound-early acceptability
+  bound. Known real regressions (unoptimized builds at 106.8–173.3 ms, the
+  30 ms display pump at 135.4 ms) exceed it.
+- **Coverage >= 90 %:** without it, the easiest way to pass is for the media
+  not to play; the S24 run of 2026-11-16 was judged on 33.8 % of its drive.
+- **Internal-metric caveat:** both endpoints are software stamps. Video stops
+  at the end of the Qt paint (`ProjectionWidget`), before the X server,
+  scan-out and panel. Audio is the sink's playback slot (`presented_ns`), not
+  speaker output. The physical offset, and even its sign, are unmeasured until
+  #58. Keep the bounds symmetric until then; #58 may justify an asymmetric
+  window.
+
+Re-analysis of the 2026-11-16 evidence under this contract:
+
+| Run | Pairs | Coverage | Signed p50 / p99 ms | Max \|skew\| ms | Worst 5 s mean ms | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| S24 drive smoke | 5,892 | 33.83 % (FAIL) | 23.21 / 51.02 (FAIL) | 74.95 | 32.57 | FAIL |
+| A26 run2 | 17,895 | 99.49 % | 21.40 / 33.35 | 43.21 | 26.34 | PASS |
+
+The soak stages still use their own unchanged contractual budget (A/V max
+<= 50 ms, `aa_perf_report.BUDGETS`); this contract applies to the drive smoke.
 
 **Startup grace (fps only).** The first 10 s after the first paint are
 excluded from the fps check, and only from it. The waiting_idr, session-drop
@@ -187,30 +272,55 @@ the target, and requires:
 
 - the record's verdict to be `PASS`;
 - the same receiver and display sha256;
+- **the same phone**: the stage's `--phone-serial` (or `AA_PHONE_SERIAL`)
+  must be attached on `--port` of the target (`adb devices -l` shows it as
+  `device` with `usb:<port>`), and must equal the record's `phone_serial`.
+  Soaks run on a test phone, normally the A26, so a smoke from another phone
+  (including the owner's) never unlocks them. That adb check is only a fast
+  pre-check: a phone swapped in after it would otherwise be measured. **The
+  identity is bound where the port is used.** The launcher hands the verified
+  serial to the on-target collector, which starts the receiver with
+  `--require-usb-serial`. The receiver checks the admitted link's pre-switch USB
+  serial (on Android, the adb serial) at the first link and at every reconnect,
+  before the link carries a session. Another phone makes it log `err` code
+  `phone_serial_mismatch` and stop; the collector then emits no capture, and
+  the stage is `BLOCKED phone_identity_mismatch`. A mid-stage reconnect from a
+  different phone was already refused by the receiver's same-key rule; it now
+  gets this named reason too;
+- **the default configuration**: the record's `configuration` (flags beyond
+  the harness's own sockets, port, store, lifetime and control channel, plus
+  the receiver and display decoder and the presentation mode) must be the
+  default, which is what every soak stage launches;
 - the default video offer and the full 600 s duration;
 - `finished_utc` within `RECORD_MAX_AGE_S` = 24 h **by the real clock**. The
   launcher's `--now` only dates the result document and is never used for
   this check; `aa_drive_smoke.py check --now` exists for tests and offline
-  review only. The 60+1800+7200 s chain takes about 2.6 h, so this is a
+  review only. The 1800+7200 s chain takes about 2.5 h, so this is a
   same-day rule that an overnight phone or Maps update cannot slip past.
 
 The record is strict JSON (`NaN` and `Infinity` are refused), and every field
 the gate reads must be present with the right type (`video_profiles` must be
-present and `null`). Both binaries must hash on the target
+present and `null`; `phone_serial` and all `configuration` keys must be
+present). The record schema is `aa-drive-smoke/2`: records written before the
+signed A/V contract are refused as `drive_smoke_missing`. Both binaries must hash on the target
 to a 64-hex-digit sha256. A display that cannot be hashed, or a stage with no
 display, is blocked.
 
 Otherwise the stage is `BLOCKED` with `drive_smoke_missing`,
 `drive_smoke_malformed`, `drive_smoke_hash_failed`, `drive_smoke_not_passed`,
-`drive_smoke_build_mismatch`, `drive_smoke_profile`, `drive_smoke_short` or
-`drive_smoke_stale`. Offline `--capture` replay and
+`drive_smoke_build_mismatch`, `drive_smoke_phone_unverified`,
+`drive_smoke_phone_mismatch`, `drive_smoke_configuration`,
+`drive_smoke_profile`, `drive_smoke_short` or `drive_smoke_stale`; and a stage
+whose receiver found another phone on the port is `BLOCKED
+phone_identity_mismatch`. Offline `--capture` replay and
 `--readiness-only` do not need a record.
 
-Gate budget (one gate out for each gate in): this gate proposes **retiring the
-60 s soak stage**. It is a one-minute shakedown of the same static workload
-that the 1800 s stage then repeats. The drive smoke now runs first, on the same
-build, for ten minutes, with a moving workload. The 60 s stage stays in place
-until the owner confirms the retirement.
+Gate budget (one gate out for each gate in): the **60 s soak stage is
+retired** (owner decision 2026-11-16) as the gate out for #137. It was a
+one-minute shakedown of the same static workload that the 1800 s stage then
+repeats. The drive smoke now runs first, on the same build, for ten minutes,
+with a moving workload. The soak chain is the 1800 s stage, then the 7200 s
+stage.
 
 ## Exact invocations
 
@@ -223,11 +333,13 @@ tools/perf/aa-projection-perf.sh --readiness-only --out /tmp/task-32-readiness.j
 # 30-minute performance run (optimized build, see Build).
 tools/perf/aa-projection-perf.sh --mode wired --duration 30m \
     --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
+    --phone-serial "$SOAK_PHONE_SERIAL" \
     --out /tmp/task-32-perf-30m.json --capture-out /tmp/task-32-capture-30m.json
 
 # Separate 2-hour soak run (fresh invocation; do not reuse the 30m capture).
 tools/perf/aa-projection-perf.sh --mode wired --duration 2h \
     --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
+    --phone-serial "$SOAK_PHONE_SERIAL" \
     --out /tmp/task-32-soak-2h.json --capture-out /tmp/task-32-capture-2h.json
 ```
 
@@ -517,6 +629,8 @@ never claim live qualification.
 ## Privacy
 
 Device serials/MACs/IPs are never written to committed content or the receipt.
+The drive-smoke record carries `phone_serial` so the soak gate can bind to the
+phone; it is a local file and must not be committed or exported.
 The collector records only target hardware state (machine, kernel, model, L4T
 release, power mode, governor), not identifiers; raw captures stay under `/tmp`
 on the host.

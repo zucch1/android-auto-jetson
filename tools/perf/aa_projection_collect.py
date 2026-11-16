@@ -77,6 +77,10 @@ _COLLECTOR_INTERFERENCE_SECONDS = 7
 # receiver is still reported, and a bounded addition to the observed gap.
 _COLLECTOR_LOG_GRACE_SECONDS = 5.0
 _COLLECTOR_LOG_POLL_SECONDS = 0.25
+# Receiver err code for a link from another phone than --phone-serial, and the
+# stderr marker the launcher maps to BLOCKED phone_identity_mismatch.
+PHONE_MISMATCH_CODE = "phone_serial_mismatch"
+PHONE_REFUSAL_PREFIX = "error: phone_identity_mismatch:"
 _PROGRESS_KEYS = ("video_units", "audio_chunks", "video_presentations", "audio_writes", "av_pairs")
 
 # Diagnostic keys the receiver/display event stream may carry (task-19
@@ -670,6 +674,11 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         receiver_cmd += ["--video-socket", video_socket]
     if input_socket:
         receiver_cmd += ["--input-socket", input_socket]
+    phone_serial = getattr(args, "phone_serial", None)
+    if phone_serial:
+        # Same-phone binding at the point of use (#137): the receiver itself
+        # refuses a first link or reconnect from any other physical phone.
+        receiver_cmd += ["--require-usb-serial", phone_serial]
     if managed_display:
         # Contract: --require-video-consumer makes the receiver emit "ready"
         # after listeners/control init and BEFORE version negotiation.
@@ -897,6 +906,8 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--video-socket", default=None)
     parser.add_argument("--input-socket", default=None)
     parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--phone-serial", default=None,
+                        help="pin the run to this phone (receiver --require-usb-serial)")
     parser.add_argument("--thermal-policy", choices=("strict-all-zones", NANO_PROFILE),
                         default="strict-all-zones", help="explicit approved Nano CV availability exception")
     parser.add_argument("--startup-timeout-seconds", type=int,
@@ -980,6 +991,12 @@ def _cli(argv: list[str]) -> int:
     finally:
         signal.signal(signal.SIGTERM, old_handler)
 
+    if any(error.get("code") == PHONE_MISMATCH_CODE for error in capture.get("terminal_errors", [])):
+        # The run measured some other phone than the soak's: no capture at all.
+        print(f"{PHONE_REFUSAL_PREFIX} the phone on --port {args.port} is not --phone-serial "
+              f"(at the first link or a reconnect); the stage measured nothing qualifying",
+              file=sys.stderr)
+        return 2
     json.dump(capture, sys.stdout, indent=2, sort_keys=True, allow_nan=False)
     sys.stdout.write("\n")
     return 0

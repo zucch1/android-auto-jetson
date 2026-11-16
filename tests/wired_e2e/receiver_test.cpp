@@ -1294,6 +1294,8 @@ std::atomic<bool> runtime_closed{false};
 std::mutex runtime_owner_mutex;
 std::thread::id runtime_io_owner;
 aa::trust::PhoneIdentity runtime_phone;
+// When set, reconnects (attempt >= 4) admit this phone instead (#137 swap test).
+aa::trust::PhoneIdentity runtime_reconnect_phone;
 bool runtime_real_admission = false;
 bool runtime_fail_before_admission = false;
 bool runtime_send_audio = false;
@@ -1686,7 +1688,9 @@ runtime_open_link(const aa::transport::UsbDeviceSelector &selector,
         return aa::app::WiredLink{std::move(transport), runtime_phone};
     }
     if (attempt == 1 || (runtime_recovers && attempt >= 4)) {
-        return aa::app::WiredLink{std::make_unique<RuntimeTransport>(attempt == 1), runtime_phone};
+        const auto &phone = attempt >= 4 && !runtime_reconnect_phone.key.empty()
+                                ? runtime_reconnect_phone : runtime_phone;
+        return aa::app::WiredLink{std::make_unique<RuntimeTransport>(attempt == 1), phone};
     }
     return aa::Error{aa::ErrorCode::transport_unavailable};
 }
@@ -2359,6 +2363,53 @@ TEST(WiredReceiver, TransientLinkLossRetriesUntilFreshSessionRecovers) {
     ASSERT_NE(active, std::string::npos) << result.output;
     EXPECT_NE(result.output.find("\"to_state\":\"active\"", active + 1), std::string::npos)
         << result.output;
+}
+
+TEST(WiredReceiver, RequiredUsbSerialAdmitsTheSamePhoneAcrossReconnects) {
+    // Given the qualification pin naming the attached phone's USB serial.
+    runtime_extra_args = {"--require-usb-serial", "SYNTHETIC"};
+    const auto result = run_runtime(true);
+    runtime_extra_args.clear();
+    // Then the run and its reconnect proceed as without the pin.
+    EXPECT_EQ(result.code, 0) << result.output;
+    EXPECT_EQ(runtime_ciphers.load(), 2);
+    EXPECT_EQ(result.output.find("phone_serial_mismatch"), std::string::npos) << result.output;
+}
+
+TEST(WiredReceiver, RequiredUsbSerialRefusesAnotherPhoneAtTheFirstLink) {
+    // Given a pin for another phone than the one on the port.
+    runtime_extra_args = {"--require-usb-serial", "OTHERPHONE9"};
+    const auto result = run_runtime(false, 300, true);
+    runtime_extra_args.clear();
+    // Then the link is refused before any session (no cipher), with a named code.
+    EXPECT_EQ(result.code, 3) << result.output;
+    EXPECT_EQ(runtime_ciphers.load(), 0);
+    EXPECT_NE(result.output.find("\"code\":\"phone_serial_mismatch\""), std::string::npos)
+        << result.output;
+    EXPECT_EQ(result.output.find("OTHERPHONE9"), std::string::npos) << "serial leaked to the log";
+}
+
+TEST(WiredReceiver, RequiredUsbSerialRefusesAPhoneSwappedInAtReconnect) {
+    // Given the pinned phone at the first link and another phone at the reconnect.
+    const aa::trust::WiredIdentity other{
+        "04e8", "6860", "SWAPPED", "TEST", "TEST", "SWAPPED", "1-2.1"};
+    runtime_reconnect_phone = aa::app::wired_phone_identity(other).value();
+    runtime_extra_args = {"--require-usb-serial", "SYNTHETIC"};
+    const auto result = run_runtime(true);
+    runtime_extra_args.clear();
+    runtime_reconnect_phone = {};
+    // Then the reconnect is refused with the named code and the run fails.
+    EXPECT_NE(result.code, 0) << result.output;
+    EXPECT_EQ(runtime_ciphers.load(), 1);
+    EXPECT_NE(result.output.find("\"code\":\"phone_serial_mismatch\""), std::string::npos)
+        << result.output;
+}
+
+TEST(WiredReceiver, RequiredUsbSerialMustNotBeEmpty) {
+    runtime_extra_args = {"--require-usb-serial", ""};
+    const auto result = run_runtime(false, 300, true);
+    runtime_extra_args.clear();
+    EXPECT_EQ(result.code, 2) << result.output;
 }
 
 TEST(WiredReceiver, PermanentLinkLossExitsNonzeroWithinWiredRecoveryBudget) {

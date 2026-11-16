@@ -170,6 +170,27 @@ WiredKeyClass classify_wired_key(std::string_view key) noexcept {
     return has_serial ? WiredKeyClass::serial_bound : WiredKeyClass::port_only;
 }
 
+std::optional<std::string> wired_key_usb_serial(std::string_view key) {
+    const WiredKeyClass kind = classify_wired_key(key);
+    if (kind != WiredKeyClass::serial_bound && kind != WiredKeyClass::port_only) {
+        return std::nullopt;
+    }
+    // Canonical (proved above): skip "w1:", vid and pid; field 2 is the serial.
+    std::string_view rest = key.substr(3);
+    for (int field = 0;; ++field) {
+        const std::size_t colon = rest.find(':');
+        std::size_t length = 0;
+        for (std::size_t i = 0; i < colon; ++i) {
+            length = length * 10 + static_cast<std::size_t>(rest[i] - '0');
+        }
+        rest.remove_prefix(colon + 1);
+        if (field == 2) {
+            return std::string{rest.substr(0, length)};
+        }
+        rest.remove_prefix(length);
+    }
+}
+
 std::string match_key(std::string_view key) {
     if (classify_wired_key(key) != WiredKeyClass::serial_bound) {
         return std::string{key};  // port-only, malformed, wireless, opaque: exact
