@@ -264,6 +264,8 @@ struct DecodeHelper::Impl final {
         report.frames_lost_retention = session.frames_lost_retention;
         report.frames_lost_capacity = session.frames_lost_capacity;
         report.frames_lost_eos = session.frames_lost_eos;
+        report.frames_lost_close = session.frames_lost_close;
+        report.frames_discarded_awaiting_idr = session.frames_discarded_awaiting_idr;
         report.awaiting_idr = session.awaiting_idr;
     }
 
@@ -648,20 +650,40 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         first_pull = false;
         GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(impl_->appsink), timeout);
         const auto pull_returned = impl_->now();
-        // A blocking pull can cross retention even when it returns no sample.
-        // Release any late sample before surfacing the recoverable loss notice.
-        if (auto status = impl_->check_pump(pull_returned); !status) {
-            if (sample != nullptr) {
-                ++impl_->report.frames_unmatched;
-                gst_sample_unref(sample);
+        // The output in hand keeps its correlation when its OWN AU is still
+        // inside retention at pull return, even if an older AU expires the
+        // rest of the set in the check below (#76: deliver what is safe).
+        std::optional<DecodeSessionState::PendingCorrelation> in_hand{};
+        if (sample != nullptr) {
+            if (GstBuffer* pulled = gst_sample_get_buffer(sample);
+                pulled != nullptr && GST_BUFFER_PTS_IS_VALID(pulled)) {
+                in_hand = impl_->session.take_in_window_correlation(
+                    static_cast<std::uint64_t>(GST_BUFFER_PTS(pulled)), pull_returned);
             }
+        }
+        // A blocking pull can cross retention even when it returns no sample.
+        // A late sample (past its own window) is released before surfacing the
+        // recoverable loss notice; an in-window one is delivered first.
+        std::optional<Error> loss_notice{};
+        if (auto status = impl_->check_pump(pull_returned); !status) {
             // A decoder error that arrived during the blocking pull is
             // terminal and outranks the recoverable loss notice; the loss
             // stays visible in the cumulative counters.
             if (auto failed = impl_->bus_error(); !failed.has_value()) {
+                if (sample != nullptr) {
+                    ++impl_->report.frames_unmatched;
+                    gst_sample_unref(sample);
+                }
                 return core::Result<std::size_t>{failed.error()};
             }
-            return core::Result<std::size_t>{status.error()};
+            if (!in_hand.has_value()) {
+                if (sample != nullptr) {
+                    ++impl_->report.frames_unmatched;
+                    gst_sample_unref(sample);
+                }
+                return core::Result<std::size_t>{status.error()};
+            }
+            loss_notice = status.error();
         }
         if (sample == nullptr) {
             // The pull may have raced the error message; re-check before returning.
@@ -750,7 +772,7 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
         // released, and never handed to the callback (frames keep their real
         // metadata; nothing is relabeled).
         const auto completed = impl_->now();
-        const auto meta = impl_->session.take_correlation(pts);
+        const auto meta = in_hand.has_value() ? in_hand : impl_->session.take_correlation(pts);
         const auto arrival = impl_->arrivals.take(pts, meta ? meta->submitted_at : pull_returned,
                                                 pull_returned);
         if (!meta.has_value()) {
@@ -784,6 +806,10 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
             ++delivered;
         }
         gst_sample_unref(sample);
+        if (loss_notice.has_value()) {
+            // The in-window output was delivered; the rest of the set is lost.
+            return core::Result<std::size_t>{*loss_notice};
+        }
     }
 
     return core::Result<std::size_t>{delivered};
@@ -791,6 +817,10 @@ core::Result<std::size_t> DecodeHelper::pump(core::Milliseconds wait) {
 
 void DecodeHelper::close() noexcept {
     if (impl_) {
+        if (impl_->pipeline != nullptr && !impl_->session.terminal()) {
+            impl_->session.close_correlations();
+            impl_->refresh_loss_report();
+        }
         impl_->release();
     }
 }

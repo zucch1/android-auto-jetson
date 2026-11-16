@@ -90,6 +90,14 @@ struct DecodeSessionState final {
     std::uint64_t frames_lost_retention{};
     std::uint64_t frames_lost_capacity{};
     std::uint64_t frames_lost_eos{};
+    // Accepted AUs still undelivered when the session is closed (teardown or
+    // a mid-stream decoder replacement): counted, never reported by a pump.
+    std::uint64_t frames_lost_close{};
+    // Non-IDR AUs discarded at submit() while awaiting the recovery IDR. They
+    // were never accepted (each discard already fails its own submit()), but
+    // they are video the caller received and will not see; the count keeps
+    // the recovery gap visible after the one-shot loss notice.
+    std::uint64_t frames_discarded_awaiting_idr{};
     bool loss_unreported{};
 
     // Terminal runtime failure latch (contract on Decode.hpp): the first
@@ -204,6 +212,31 @@ struct DecodeSessionState final {
         return core::Result<void>{};
     }
 
+    // Close strands whatever is still pending. Nothing can pump afterwards, so
+    // this is counted for telemetry only (no notice is raised).
+    void close_correlations() noexcept {
+        frames_lost_close += pending.size();
+        clear_correlations();
+    }
+
+    // Correlate the output already in hand when it is inside ITS OWN retention
+    // window (now - submitted_at < kCorrelationRetention), BEFORE the
+    // whole-set expiry check runs for the rest. An older entry that aged out
+    // (a decoder that never produced its output) still expires every other
+    // outstanding entry and arms the IDR resync; it no longer also discards
+    // an output that met its own bound. Outputs past their own bound get
+    // nullopt and are left to expiry: the bound is not extended.
+    [[nodiscard]] std::optional<PendingCorrelation> take_in_window_correlation(
+        std::uint64_t timestamp_ns, Clock::time_point now) noexcept {
+        const auto it = pending.find(timestamp_ns);
+        if (it == pending.end() || now - it->second.submitted_at >= kCorrelationRetention) {
+            return std::nullopt;
+        }
+        const PendingCorrelation meta = it->second;
+        pending.erase(it);
+        return meta;
+    }
+
     // EOS can strand accepted AUs too; report those independently of expiry.
     void finish_correlations() noexcept {
         frames_lost_eos += pending.size();
@@ -239,6 +272,7 @@ struct DecodeSessionState final {
             invalidate_correlations();
         }
         if (awaiting_idr && !idr) {
+            ++frames_discarded_awaiting_idr;
             return core::Result<void>{Error{ErrorCode::ipc_consumer_rejected}};
         }
         return admit(load, timestamp_ns);

@@ -18,12 +18,46 @@ callbacks; `frames_delivered` is the cumulative delivery count. Clean EOS with
 stranded accepted AUs intentionally produces the same one-shot nonterminal
 notice; no further input or IDR recovery is expected on that ended stream.
 
+## Late output: deliver inside the bound, report and recover outside it
+
+An output is delivered when **its own** AU is still inside the five-second
+window when the pull that returned it comes back, even if that same pull
+expires an older AU (one the decoder never produced output for). The older
+AU still invalidates the rest of the outstanding set and arms the IDR resync;
+it no longer also throws away an output that met its own bound. The pump then
+returns the loss notice after that delivery.
+
+An output past its own window is never delivered. Late delivery beyond the
+bound was rejected for three reasons: the loss has already been reported (a
+pump notice and a cumulative counter), and a later delivery would make the
+counts wrong or need a retraction; keeping metadata past five seconds is a
+retention-contract change that this issue does not authorize; and a
+multi-second backlog shown on a live projection and then replaced by the
+recovery IDR is worse than recovering directly. Recovery is the existing
+path: `DisplayController` sees `awaiting_idr` after the pump and sends a
+rate-limited `RequestIdrRecovery` (`idr_requested` with reason
+`decode_awaiting_idr`, then `idr_recovered`).
+
+Two more counters close the remaining paths that had no count:
+
+- `frames_discarded_awaiting_idr`: non-IDR AUs that `submit()` discarded
+  (`ipc_consumer_rejected`) while waiting for the recovery IDR. They were
+  never accepted, and each discard already fails its own submit, but the
+  display reports pump errors through a capped, deduplicated channel, so
+  without this count the length of the recovery gap was invisible after the
+  first notice.
+- `frames_lost_close`: accepted AUs still undelivered when `close()` runs
+  (teardown, or the mid-stream decoder replacement on a profile change). The
+  report stays readable after `close()`; the display's teardown flush now runs
+  after the inner close so this count is emitted.
+
 The dummy display reads these live counters after every controller pump. Its
 existing telemetry writer emits a `decode_loss` JSON line for each changed loss
-reason (`expiry`, `capacity`, or `end_of_stream`) with the cumulative count and
+reason (`expiry`, `capacity`, `end_of_stream`, `session_closed`, or
+`discarded_awaiting_idr`) with the cumulative count and
 IDR state. Repeated episodes within one second per reason coalesce into the
 next line without losing the final total. The existing test-control `status`
-response also carries all three cumulative counters and `awaiting_idr`; neither
+response also carries all five cumulative counters and `awaiting_idr`; neither
 the four-event `display_error` cap nor repeated-error suppression applies to
 these loss lines.
 
@@ -78,6 +112,22 @@ library that `aa_consumer_decode_test` links. The production
 data member, no indirection, no symbol (checked with `nm`). The display and all
 shipped targets link the production library. `DecodeTestAccess.hpp` refuses to
 compile without the macro.
+
+Added for the late-output handling (#76 follow-up):
+
+- `PumpOutputJustInsideRetentionIsDeliveredWithoutLoss`: the clock stays 1 ns
+  short of the bound for every pump read; all 90 frames are delivered with
+  their exact metadata and nothing is counted lost.
+- `PumpFirstOutputAfterRetentionCountsBatchThenRecoveryIdrDelivers`: the
+  recorded failure shape (first pull returns 9 s after submission). No frame
+  is delivered with expired metadata, 90 are counted once, three non-IDR AUs
+  submitted while waiting are counted as discards, and the recovery IDR is
+  delivered with its own metadata; all 90 late outputs are released unmatched.
+- `PumpPartialLateBatchCountsExactlyTheUndeliveredAus`: 30 outputs inside the
+  window, then the clock jumps; exactly 60 are lost and 30 + 60 = 90.
+- `InWindowOutputSurvivesOlderExpiryButLateOutputDoesNot` (state level) and
+  `CloseCountsStrandedAcceptedAus`; on the display side
+  `DecodeLossReportsDiscardsAndCloseStrandedAus`.
 
 State-level tests cover the exact retention boundary, IDR recovery, unchanged
 PTS identity, capacity/EOS accounting and notice persistence; display tests

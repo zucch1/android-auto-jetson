@@ -40,6 +40,8 @@ struct Status final {
     std::uint64_t frames_lost_retention{};
     std::uint64_t frames_lost_capacity{};
     std::uint64_t frames_lost_eos{};
+    std::uint64_t frames_lost_close{};
+    std::uint64_t frames_discarded_awaiting_idr{};
     bool awaiting_idr{};
     bool helper_started{};
     std::uint64_t input_sent{};
@@ -147,6 +149,9 @@ private:
         out += ",\"frames_lost_retention\":" + std::to_string(s.frames_lost_retention);
         out += ",\"frames_lost_capacity\":" + std::to_string(s.frames_lost_capacity);
         out += ",\"frames_lost_eos\":" + std::to_string(s.frames_lost_eos);
+        out += ",\"frames_lost_close\":" + std::to_string(s.frames_lost_close);
+        out += ",\"frames_discarded_awaiting_idr\":"
+            + std::to_string(s.frames_discarded_awaiting_idr);
         out += ",\"awaiting_idr\":";
         out += s.awaiting_idr ? "true" : "false";
         out += ",\"helper_started\":";
