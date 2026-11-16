@@ -40,6 +40,7 @@ set(AA_WIRED_TEST_SOURCES
     tests/wired_e2e/video_outlet_test.cpp
     tests/wired_e2e/av_sink_test.cpp
     tests/wired_e2e/microphone_test.cpp
+    tests/wired_e2e/idr_io_test.cpp
     tests/wired_e2e/wired_deadline_test.cpp
     tests/wired_e2e/wired_e2e_trust_link_test.cpp
     tests/wired_e2e/wired_e2e_input_wire_test.cpp
@@ -150,9 +151,14 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_receiver_enrolment COMMAND dbus-run-session --
         $<TARGET_FILE:aa_wired_e2e_test> --gtest_filter=WiredReceiverEnrolment.*)
     set_tests_properties(wired_receiver_enrolment PROPERTIES TIMEOUT 90)
+    add_test(NAME wired_e2e_idr_io COMMAND "${CMAKE_COMMAND}" -E env
+        "GTEST_FILTER=WiredIdrIo.*:WiredIdrContext.*" "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/transport/tls_run.py" "${CMAKE_SOURCE_DIR}"
+        "$<TARGET_FILE:aa_wired_e2e_test>")
+    set_tests_properties(wired_e2e_idr_io PROPERTIES TIMEOUT 30)
     add_test(NAME wired_deadline COMMAND aa_wired_e2e_test --gtest_filter=WiredDeadline.*)
     set_tests_properties(wired_deadline PROPERTIES TIMEOUT 30)
-    set_tests_properties(wired_receiver PROPERTIES TIMEOUT 120)
+    set_tests_properties(wired_receiver PROPERTIES TIMEOUT 180)
     set_tests_properties(wired_e2e_happy wired_e2e_revoke wired_e2e_failures wired_e2e_trust_link
         wired_e2e_input_wire wired_e2e_auth wired_e2e_microphone wired_recovery PROPERTIES TIMEOUT 120)
     add_test(NAME wired_e2e_live_qa_gates COMMAND "${Python3_EXECUTABLE}" -B

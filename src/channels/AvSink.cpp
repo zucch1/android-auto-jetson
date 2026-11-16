@@ -78,6 +78,38 @@ bool AvSink::input_focus_allowed() const noexcept {
         && focus_ == protocol::VideoFocusMode::projected;
 }
 
+bool AvSink::video_projecting() const noexcept {
+    return service_.role == protocol::ChannelRole::video && ready_ && session_.has_value()
+        && (focus_ == protocol::VideoFocusMode::projected
+            || focus_ == protocol::VideoFocusMode::projected_no_input_focus);
+}
+
+core::Result<void> AvSink::request_video_idr(bool focus_transition) {
+    if (!video_projecting()) {
+        return Error{ErrorCode::session_illegal_transition};
+    }
+    if (!focus_transition) {
+        return send(protocol::encode(protocol::VideoFocusNotification{focus_, true}));
+    }
+    // Workaround for phones/encoders that ignore a repeated projected focus
+    // notification: perform an ordered native -> prior projected focus
+    // transition (see aa-proxy/aa-proxy-rs commit 2af9270, issue #142).
+    const auto prior_focus = focus_;
+    if (auto to_native = send(protocol::encode(
+            protocol::VideoFocusNotification{protocol::VideoFocusMode::native, true}));
+        !to_native) {
+        return to_native.error();
+    }
+    if (auto restore = send(protocol::encode(protocol::VideoFocusNotification{prior_focus, true}));
+        !restore) {
+        // The phone may have already received native focus while restore failed;
+        // do not claim projected focus or allow replay — escalate as terminal.
+        focus_ = protocol::VideoFocusMode::native;
+        return Error{ErrorCode::channel_focus_restore_failed};
+    }
+    return {};
+}
+
 core::Result<void> AvSink::setup(std::span<const std::byte> payload) {
     constexpr protocol::AvSinkCodec codecs[] = {protocol::AvSinkCodec::pcm, protocol::AvSinkCodec::h264, protocol::AvSinkCodec::h265, protocol::AvSinkCodec::vp9, protocol::AvSinkCodec::av1};
     const auto request = protocol::decode_av_sink_setup_for_codecs(payload, codecs);

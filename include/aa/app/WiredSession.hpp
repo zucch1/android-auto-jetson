@@ -189,6 +189,15 @@ class WiredSession final {
     [[nodiscard]] core::Result<void>
     send_channel_payload(protocol::ChannelRole role, std::vector<std::byte> payload);
 
+    [[nodiscard]] bool video_projecting() const noexcept;
+    [[nodiscard]] std::optional<protocol::VideoProfile> selected_video_profile() const noexcept;
+    // During an outbound message, success admits a coalesced pending request;
+    // a transition takes precedence over a nudge. Owner/read checkpoints drain it.
+    [[nodiscard]] core::Result<void> request_video_idr(bool focus_transition = false);
+    [[nodiscard]] bool outbound_in_progress() const noexcept { return outbound_depth_ != 0; }
+    // Owner loop or read checkpoint only; never drain from an outbound scope destructor.
+    [[nodiscard]] core::Result<void> service_pending_video_idr();
+
     // Observed counters (diagnostics/tests). The negotiation counters
     // (channel_opens, version_responses, pings_answered, encapsulated_ssls,
     // auth_completes, unhandled_controls) are PER-LINK: attach_transport() zeroes them with the
@@ -226,6 +235,35 @@ class WiredSession final {
 
   private:
     class InputForwarder;
+    // Covers encoding and every frame of a message, including write checkpoints.
+    struct OutboundScope {
+        unsigned &depth;
+        explicit OutboundScope(WiredSession &owner) noexcept : depth(owner.outbound_depth_) {
+            ++depth;
+        }
+        ~OutboundScope() { --depth; }
+    };
+    // Declared after DeadlineCancellation: the suspended caller's timer/source
+    // stays alive until this scope restores its exact installed context.
+    struct IoScope {
+        WiredSession &session;
+        transport::Transport *original;
+        std::optional<core::Deadline::Clock::time_point> deadline;
+        std::optional<core::CancellationToken> token;
+        explicit IoScope(WiredSession &owner) noexcept
+            : session(owner), original(owner.transport_), deadline(owner.active_io_deadline_),
+              token(owner.active_io_token_) {}
+        ~IoScope() {
+            session.active_io_deadline_ = deadline;
+            session.active_io_token_ = token;
+            if (session.transport_ == original && original != nullptr && deadline && token) {
+                original->set_io_deadline(*deadline);
+                (void)original->open(*token);
+            }
+        }
+    };
+    [[nodiscard]] core::Result<void> open_io(core::Deadline::Clock::time_point deadline,
+                                             const core::CancellationToken &token);
     [[nodiscard]] core::Result<void> send_frame(std::span<const std::byte> frame);
     [[nodiscard]] Error io_error(Error reason, const core::Deadline &deadline);
     [[nodiscard]] core::Result<bool>
@@ -274,6 +312,10 @@ class WiredSession final {
     std::unique_ptr<InputForwarder> input_forwarder_{};
     std::optional<input::InputService> input_service_{};
     transport::Transport *transport_{nullptr};
+    unsigned outbound_depth_{};
+    std::optional<bool> pending_video_idr_{};
+    std::optional<core::Deadline::Clock::time_point> active_io_deadline_{};
+    std::optional<core::CancellationToken> active_io_token_{};
     std::unique_ptr<transport::HandshakingCipher> cipher_{};
     AuthPhase auth_phase_{AuthPhase::awaiting_version};
     bool ssl_active_{false};

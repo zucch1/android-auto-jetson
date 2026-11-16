@@ -305,6 +305,14 @@ core::Result<void> ControlBusClient::stop_projection() {
     return impl_->exchange_void("StopProjection", "", body);
 }
 
+core::Result<void> ControlBusClient::request_idr_recovery() {
+    if (!impl_) {
+        return Error{ErrorCode::transport_closed};
+    }
+    MessageWriter body;
+    return impl_->exchange_void("RequestIdrRecovery", "", body);
+}
+
 core::Result<void> ControlBusClient::set_display_viewport(Viewport viewport) {
     if (!impl_) {
         return Error{ErrorCode::transport_closed};

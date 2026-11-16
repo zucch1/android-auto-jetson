@@ -78,6 +78,7 @@ class ScriptedTransport final : public aa::transport::Transport {
 
     [[nodiscard]] std::size_t sent_count() const noexcept { return sent_.size(); }
     [[nodiscard]] const std::vector<std::byte> &last_sent() const noexcept { return sent_.back(); }
+    [[nodiscard]] const std::vector<std::vector<std::byte>> &sent_frames() const noexcept { return sent_; }
     [[nodiscard]] int open_calls() const noexcept { return open_calls_; }
     [[nodiscard]] int close_calls() const noexcept { return close_calls_; }
     [[nodiscard]] bool is_open() const noexcept { return open_; }

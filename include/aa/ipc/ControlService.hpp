@@ -8,8 +8,9 @@
 #include <aa/ipc/PairingGate.hpp>
 #include <aa/ipc/PeerCredentials.hpp>
 
-#include <cstdint>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
@@ -228,9 +229,13 @@ public:
         if (registered_) teardown("consumer_unregistered", DiagnosticSeverity::info);
     }
 
-    // StartProjection / StopProjection.
+    // StartProjection / StopProjection / RequestIdrRecovery.
     [[nodiscard]] core::Result<void> start_projection(const BusName& caller);
     [[nodiscard]] core::Result<void> stop_projection(const BusName& caller);
+    [[nodiscard]] core::Result<void> request_idr_recovery(const BusName& caller);
+    [[nodiscard]] bool consume_idr_recovery_request() noexcept {
+        return idr_recovery_requested_.exchange(false);
+    }
 
     // Pairing flow: one-time request ids, window opens only on confirm.
     [[nodiscard]] core::Result<core::PairingRequestId> request_add_phone(const BusName& caller);
@@ -332,6 +337,7 @@ private:
     std::optional<Registered> registered_{};
     ProjectionState projection_{ProjectionState::stopped};
     std::optional<Viewport> viewport_{};
+    std::atomic<bool> idr_recovery_requested_{false};
     std::uint64_t next_consumer_id_{1};
     struct OpenPairing {
         core::PairingRequestId request;

@@ -33,6 +33,7 @@
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/ControlService.hpp>
+#include <aa/ipc/IdrRecovery.hpp>
 #include <aa/ipc/InputChannel.hpp>
 #include <aa/ipc/InputSocket.hpp>
 #include <aa/ipc/PairingGate.hpp>
@@ -1715,7 +1716,10 @@ const char *const kUsage =
     "  decoder-additional-depth, theme (0|1|2), width-margin, height-margin,\n"
     "  {margins,content-insets,stable-content-insets}-{top,bottom,left,right}.\n"
     "  --decoder software|hardware|auto; --list-video-capabilities\n"
+    "  --idr-recovery auto|nudge|transition  IDR recovery strategy (default auto)\n"
     "  --video-profiles WxH@FPS:CODEC,... (default 1280x720@30:h264,800x480@30:h264)\n"
+    "  --exact-video-profiles offer only --video-profiles without appending the\n"
+    "  1280x720@30:h264 fallback profile.\n"
     "  Pixel values are in the first offered profile pixels (default\n"
     "  1280x720 (primary profile)) and scaled to every fallback offer. width-margin, height-margin, margins-* and a\n"
     "  pixel-aspect-ratio-e4 other than 10000 need --screen-experimental-geometry:\n"
@@ -1724,7 +1728,9 @@ const char *const kUsage =
 
 int receiver_main(int argc, char **argv) {
     auto video_profiles = aa::config::default_video_profiles();
+    bool exact_video_profiles = false;
     auto video_decoder = aa::consumer::DecodeBackend::software;
+    auto idr_strategy = aa::ipc::IdrRecoveryStrategy::auto_escalate;
     aa::config::Screen screen;
     bool experimental_geometry = false;
     std::string port;
@@ -1753,11 +1759,18 @@ int receiver_main(int argc, char **argv) {
             aa::tools::list_video_capabilities(); return 0;
         } else if (std::strcmp(argv[index], "--decoder") == 0 && index + 1 < argc) {
             if (!aa::tools::parse_decoder(argv[++index],video_decoder)) { std::fputs("invalid --decoder\n",stderr); return 2; }
+        } else if (std::strcmp(argv[index], "--idr-recovery") == 0 && index + 1 < argc) {
+            if (!aa::ipc::parse_idr_recovery_strategy(argv[++index], idr_strategy)) {
+                std::fputs("invalid --idr-recovery\n", stderr);
+                return 2;
+            }
         } else if (std::strcmp(argv[index], "--video-profiles") == 0 && index + 1 < argc) {
             if (!aa::config::parse_video_profiles_option(argv[++index], video_profiles)) {
                 std::fputs("invalid --video-profiles\n", stderr);
                 return 2;
             }
+        } else if (std::strcmp(argv[index], "--exact-video-profiles") == 0) {
+            exact_video_profiles = true;
         } else if (std::strcmp(argv[index], "--video-socket") == 0 && index + 1 < argc) {
             video_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--input-socket") == 0 && index + 1 < argc) {
@@ -1791,6 +1804,8 @@ int receiver_main(int argc, char **argv) {
         std::fputs(kUsage, stderr);
         return 2;
     }
+
+    aa::config::ensure_fallback_video_profile(video_profiles, exact_video_profiles);
 
     // The description is given in the primary profile's pixels and must stay
     // valid once scaled into every offered profile.
@@ -1916,6 +1931,13 @@ int receiver_main(int argc, char **argv) {
         return 1;
     }
     VideoOutlet video_outlet{log_line, log_media};
+    video_outlet.set_idr_recovery({
+        [&session] { return session.video_projecting(); },
+        [&session] { return session.request_video_idr(); },
+        {},
+        [&session](bool focus_transition) { return session.request_video_idr(focus_transition); },
+        idr_strategy,
+    });
     aa::channels::InputSink input_sink;
     aa::channels::SensorSink sensor_sink{input, [&session](std::vector<std::byte> payload) {
         return session.send_channel_payload(aa::protocol::ChannelRole::sensors, std::move(payload));
@@ -2034,6 +2056,59 @@ int receiver_main(int argc, char **argv) {
         return false;
     };
 
+    aa::ipc::VideoSelectionWatchdog selection_watchdog{};
+    bool in_video_recovery = false;
+    bool in_receive_poll = false;
+    auto service_video_recovery = [&]() -> bool {
+        if (in_video_recovery || session.outbound_in_progress()) {
+            return true;
+        }
+        in_video_recovery = true;
+        struct Guard {
+            bool &active;
+            ~Guard() { active = false; }
+        } guard{in_video_recovery};
+        if (auto pending = session.service_pending_video_idr(); !pending) {
+            log_line(poll_error_json(pending.error().code(), session, audio_sink));
+            if (session.failure()) {
+                session_failed.store(true);
+                g_running.store(false);
+                return false;
+            }
+        }
+        if (bus && !video_outlet.idr_dispatching() &&
+            bus->service().consume_idr_recovery_request()) {
+            const auto idr = video_outlet.request_idr_external("consumer_ipc");
+            if (!idr) {
+                log_line(poll_error_json(idr.error().code(), session, audio_sink));
+                if (idr.error().code() == aa::ErrorCode::channel_focus_restore_failed) {
+                    if (!session.failure()) {
+                        (void)session.fail(idr.error());
+                    }
+                    session_failed.store(true);
+                    g_running.store(false);
+                    return false;
+                }
+            }
+        }
+        const bool session_ready =
+            session.state() == aa::session::State::active && session.authenticated();
+        const bool has_selection = session.selected_video_profile().has_value();
+        if (selection_watchdog.check(session_ready, has_selection,
+                                     std::chrono::steady_clock::now())) {
+            log_line(aa::ipc::video_selection_timeout_json(
+                aa::ipc::kVideoSelectionWarningTimeout, video_profiles.size()));
+        }
+        return true;
+    };
+
+    auto io_checkpoint = [&] {
+        control.checkpoint();
+        if (in_receive_poll && !session.failure() && g_running.load()) {
+            (void)service_video_recovery();
+        }
+    };
+
     auto reconnect = [&]() -> aa::core::Result<void> {
         if (service_control()) {
             return aa::Error{aa::ErrorCode::cancelled};
@@ -2060,7 +2135,7 @@ int receiver_main(int argc, char **argv) {
                 }
                 link.emplace(std::move(relink.value()));
                 control.bind_phone(link->phone);
-                link->transport->set_io_checkpoint([&] { control.checkpoint(); });
+                link->transport->set_io_checkpoint(io_checkpoint);
                 session.attach_transport(link->transport.get());
                 if (!bind_link_cipher(link->phone)) {
                     return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
@@ -2100,7 +2175,7 @@ int receiver_main(int argc, char **argv) {
     std::thread session_thread([&] {
         control.bind_owner();
         control.bind_phone(link->phone);
-        link->transport->set_io_checkpoint([&] { control.checkpoint(); });
+        link->transport->set_io_checkpoint(io_checkpoint);
         if (require_video_consumer) {
             while (!admitted.load() && g_running.load()) {
                 {
@@ -2169,6 +2244,9 @@ int receiver_main(int argc, char **argv) {
                     g_running.store(false);
                     break;
                 }
+                if (!service_video_recovery()) {
+                    break;
+                }
                 while (auto event = input_queue.pop()) {
                     const auto outcome = session.submit_input(*event);
                     if (service_control()) {
@@ -2181,11 +2259,18 @@ int receiver_main(int argc, char **argv) {
             if (!g_running.load()) {
                 break;
             }
+            in_receive_poll = true;
             auto polled = audio_service ? receive_with_audio(session, audio_sink)
                                         : aa::core::Result<bool>{audio_service.error()};
+            in_receive_poll = false;
             {
                 std::lock_guard lock(session_mutex);
                 if (service_control()) {
+                    break;
+                }
+                if (session.failure()) {
+                    session_failed.store(true);
+                    g_running.store(false);
                     break;
                 }
                 if (polled) {
@@ -2232,6 +2317,9 @@ int receiver_main(int argc, char **argv) {
                     active_ms.store(elapsed);
                     log_line("{\"event\":\"active\",\"startup_ms\":" + std::to_string(elapsed) +
                              "}");
+                }
+                if (!service_video_recovery()) {
+                    break;
                 }
             }
         }

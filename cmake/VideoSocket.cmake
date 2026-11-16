@@ -90,6 +90,7 @@ endif()
 
 if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME video_socket_codec COMMAND aa_video_socket_test --gtest_filter=VideoCodec.*)
+    add_test(NAME video_socket_channel COMMAND aa_video_socket_test --gtest_filter=VideoChannel.*)
     add_test(NAME video_socket_stream COMMAND aa_video_socket_test --gtest_filter=VideoStream.*)
     add_test(NAME video_socket_peer COMMAND aa_video_socket_test --gtest_filter=VideoPeer.*)
     add_test(NAME video_socket_backpressure COMMAND aa_video_socket_test --gtest_filter=VideoBackpressure.*)
@@ -97,7 +98,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME video_socket_replay COMMAND aa_video_socket_test --gtest_filter=VideoReplay.*)
     add_test(NAME video_socket_bench COMMAND aa_video_socket_test --gtest_filter=VideoBench.*)
     add_test(NAME video_socket_ownership COMMAND aa_video_socket_test --gtest_filter=VideoOwnership.*)
-    set_tests_properties(video_socket_codec video_socket_stream video_socket_peer
+    set_tests_properties(video_socket_codec video_socket_channel video_socket_stream video_socket_peer
         video_socket_backpressure video_socket_malformed video_socket_replay video_socket_bench
         video_socket_ownership
         PROPERTIES TIMEOUT 120)

@@ -391,3 +391,961 @@ TEST(WiredReceiver, SessionNegotiatingEachCodecLogsWithoutRedactionOrRejection) 
                   outlet_logs.end());
     }
 }
+
+TEST(WiredReceiver, VideoOutletRequestsIdrOnBackpressureRespectsRateLimitAndTracksRecovery) {
+    aa::session::test::MapTrustStore trust;
+    const aa::trust::PhoneIdentity phone{"idr-recovery-phone"};
+    trust.set(phone, aa::trust::Decision::approved);
+    aa::session::test::ManualClock clock;
+    wiredtest::CaptureSink capture;
+    aa::diagnostics::Diagnostics diagnostics{capture};
+    wiredtest::ScriptedTransport transport;
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{10}};
+
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    const int producer_fd = pair.value().producer.native_handle();
+    const int consumer_fd = pair.value().consumer.native_handle();
+    outlet.install(std::move(pair.value().producer));
+
+    aa::app::WiredSession session{{trust, clock, diagnostics}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()));
+    ASSERT_TRUE(session.register_av_sink(p::ChannelRole::video, outlet));
+    outlet.set_idr_recovery({
+        [&session] { return session.video_projecting(); },
+        [&session] { return session.request_video_idr(); },
+        [&steady_now] { return steady_now; },
+    });
+
+    session.attach_transport(&transport);
+    auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    auto* cipher = owned.get();
+    session.attach_cipher(std::move(owned));
+    ASSERT_TRUE(session.apply(aa::session::Event::start_discovery));
+    ASSERT_TRUE(session.phone_discovered(phone));
+    ASSERT_TRUE(session.apply(aa::session::Event::transport_ready));
+    wiredtest::walk_auth(session, transport);
+    ASSERT_TRUE(session.authenticated());
+    ASSERT_TRUE(session.announce_services());
+
+    const auto receive = [&](std::vector<std::byte> payload) -> aa::core::Result<bool> {
+        auto frames = tr::encode_message({99, tr::MessageKind::specific, std::move(payload)},
+                                         tr::Encryption::encrypted, cipher);
+        if (!frames) { return frames.error(); }
+        aa::core::Result<bool> polled{false};
+        for (auto& frame : frames.value()) {
+            transport.push_inbound(std::move(frame));
+            polled = session.poll_transport();
+            if (!polled) { return polled.error(); }
+        }
+        return polled;
+    };
+    ASSERT_TRUE(receive(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    ASSERT_TRUE(receive(p::encode(p::AvSinkStart{1, 0}).value()));
+    ASSERT_TRUE(session.apply(aa::session::Event::negotiation_succeeded));
+    ASSERT_TRUE(session.video_projecting());
+
+    // Initial IDR establishes profile and triggers socket buffer sizing.
+    auto idr_payload = std::vector<std::byte>(10, std::byte{0});
+    idr_payload.insert(idr_payload.end(), wiredtest::kVideoIdr.begin(), wiredtest::kVideoIdr.end());
+    ASSERT_TRUE(receive(idr_payload));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& line) {
+        return line.find("\"event\":\"video_socket_buffer\"") != std::string::npos &&
+               line.find("\"side\":\"producer\"") != std::string::npos;
+    }), logs.end());
+
+    // Shrink socket buffers so non-IDR frames deterministically trigger EAGAIN (not EMSGSIZE).
+    const int tiny_buf = 32768;
+    ASSERT_EQ(::setsockopt(producer_fd, SOL_SOCKET, SO_SNDBUF, &tiny_buf, sizeof(tiny_buf)), 0);
+    ASSERT_EQ(::setsockopt(consumer_fd, SOL_SOCKET, SO_RCVBUF, &tiny_buf, sizeof(tiny_buf)), 0);
+
+    auto big_non_idr = std::vector<std::byte>(10, std::byte{0});
+    big_non_idr.push_back(std::byte{0x00});
+    big_non_idr.push_back(std::byte{0x00});
+    big_non_idr.push_back(std::byte{0x01});
+    big_non_idr.push_back(std::byte{0x41});
+    big_non_idr.resize(16384, std::byte{0x55});
+
+    auto count_logs = [&](const std::string& needle) {
+        return static_cast<std::size_t>(std::count_if(logs.begin(), logs.end(), [&](const std::string& s) {
+            return s.find(needle) != std::string::npos;
+        }));
+    };
+
+    const auto sent_before_bp = transport.sent_count();
+    for (int i = 0; i < 128 && count_logs("\"event\":\"idr_requested\"") == 0; ++i) {
+        const auto res = receive(big_non_idr);
+        ASSERT_TRUE(res) << aa::to_string(res.error().code()) << ": " << res.error().message();
+    }
+    ASSERT_EQ(count_logs("\"event\":\"idr_requested\""), 1u);
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_requested\",\"source\":\"producer\",\"reason\":\"backpressure\"}"),
+              logs.end());
+
+    // Confirm the wire frame sent to the phone is VideoFocusNotification(projected).
+    const auto expected_focus =
+        p::encode(p::VideoFocusNotification{p::VideoFocusMode::projected, true}).value();
+    bool saw_focus_notification = false;
+    for (std::size_t i = sent_before_bp; i < transport.sent_count(); ++i) {
+        const auto frame = tr::decode_frame(transport.sent_frames()[i]);
+        ASSERT_TRUE(frame);
+        if (frame.value().header.channel == 99 &&
+            frame.value().header.encryption == tr::Encryption::encrypted) {
+            const auto opened = cipher->open(frame.value().payload);
+            ASSERT_TRUE(opened);
+            if (opened.value() == expected_focus) {
+                saw_focus_notification = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw_focus_notification);
+
+    // Inside the 250 ms cooldown window: waiting_idr drops do NOT resend.
+    steady_now += std::chrono::milliseconds{100};
+    ASSERT_TRUE(receive(big_non_idr));
+    EXPECT_EQ(count_logs("\"event\":\"idr_requested\""), 1u);
+
+    // At +250 ms: waiting_idr drop triggers a second IDR request.
+    steady_now += std::chrono::milliseconds{150};
+    ASSERT_TRUE(receive(big_non_idr));
+    EXPECT_EQ(count_logs("\"event\":\"idr_requested\""), 2u);
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_requested\",\"source\":\"producer\",\"reason\":\"waiting_idr\"}"),
+              logs.end());
+
+    // Drain consumer so the recovery IDR succeeds and clears waiting_idr.
+    for (;;) {
+        if (!pair.value().consumer.receive(Milliseconds{0})) {
+            break;
+        }
+    }
+    steady_now += std::chrono::milliseconds{150}; // Total 400 ms since begin_wait.
+    ASSERT_TRUE(receive(idr_payload));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    EXPECT_EQ(count_logs("\"event\":\"idr_recovered\""), 1u);
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_recovered\",\"source\":\"producer\",\"latency_ms\":400,\"episode_requests\":2,\"total_requests\":2}"),
+              logs.end());
+}
+
+TEST(WiredReceiver, VideoOutletRequestsIdrWhenLateFirstConsumerMissesInitialIdr) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{50}};
+    std::vector<std::string> logs;
+    std::vector<bool> request_modes;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        {},
+        [&steady_now] { return steady_now; },
+        [&request_modes](bool focus_transition) -> aa::core::Result<void> {
+            request_modes.push_back(focus_transition);
+            return {};
+        },
+        aa::ipc::IdrRecoveryStrategy::auto_escalate,
+    });
+
+    // Phone starts and emits initial IDR while no consumer is installed yet.
+    std::vector<std::byte> idr_bytes(10, std::byte{0});
+    idr_bytes.insert(idr_bytes.end(), wiredtest::kVideoIdr.begin(), wiredtest::kVideoIdr.end());
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 1, {100}}, idr_bytes}));
+
+    // First consumer installs later; units_ == 0 and had_backpressure_ == false.
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+
+    // Phone continues with P-frames only; consumer would stay black unless IDR recovery fires.
+    std::vector<std::byte> p_frame(16, std::byte{0x41});
+    p_frame[0] = std::byte{0x00};
+    p_frame[1] = std::byte{0x00};
+    p_frame[2] = std::byte{0x01};
+    p_frame[3] = std::byte{0x41};
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 2, {200}}, p_frame}));
+
+    ASSERT_EQ(request_modes.size(), 1u);
+    EXPECT_FALSE(request_modes.front()); // First step is cheap nudge.
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_requested\",\"source\":\"producer\",\"reason\":\"waiting_idr\"}"),
+              logs.end());
+
+    // Subsequent recovery IDR arrives and finishes episode 1.
+    steady_now += std::chrono::milliseconds{120};
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 3, {300}}, idr_bytes}));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_recovered\",\"source\":\"producer\",\"latency_ms\":120,\"episode_requests\":1,\"total_requests\":1}"),
+              logs.end());
+}
+
+TEST(WiredReceiver, IdrRecoveryCoordinatorHoldsCooldownAcrossEpisodesAndInterleavedDbus) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{10}};
+    std::size_t requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&requests]() -> aa::core::Result<void> { ++requests; return {}; },
+        [&steady_now] { return steady_now; },
+    });
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+
+    std::vector<std::byte> idr_bytes(10, std::byte{0});
+    idr_bytes.insert(idr_bytes.end(), wiredtest::kVideoIdr.begin(), wiredtest::kVideoIdr.end());
+
+    // Episode 1: D-Bus request triggers at t=10.000s, IDR recovers at t=10.050s.
+    {
+        const auto res = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(res);
+        EXPECT_TRUE(res.value());
+    }
+    EXPECT_EQ(requests, 1u);
+    steady_now += std::chrono::milliseconds{50};
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 1, {100}}, idr_bytes}));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_recovered\",\"source\":\"producer\",\"latency_ms\":50,\"episode_requests\":1,\"total_requests\":1}"),
+              logs.end());
+
+    // Episode 2: Interleaved D-Bus RequestIdrRecovery at t=10.100s (100 ms since last request < 250 ms) is suppressed.
+    steady_now += std::chrono::milliseconds{50};
+    {
+        const auto res = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(res);
+        EXPECT_FALSE(res.value());
+    }
+    EXPECT_EQ(requests, 1u);
+
+    // At t=10.250s (250 ms since last request), the new wait succeeds.
+    steady_now += std::chrono::milliseconds{150};
+    {
+        const auto res = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(res);
+        EXPECT_TRUE(res.value());
+    }
+    EXPECT_EQ(requests, 2u);
+
+    steady_now += std::chrono::milliseconds{40};
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 2, {200}}, idr_bytes}));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_recovered\",\"source\":\"producer\",\"latency_ms\":190,\"episode_requests\":1,\"total_requests\":2}"),
+              logs.end());
+}
+
+TEST(WiredReceiver, VideoOutletEscalatesOrderAndEnforcesTransitionCooldown) {
+    aa::session::test::MapTrustStore trust;
+    const aa::trust::PhoneIdentity phone{"idr-escalation-phone"};
+    trust.set(phone, aa::trust::Decision::approved);
+    aa::session::test::ManualClock clock;
+    wiredtest::CaptureSink capture;
+    aa::diagnostics::Diagnostics diagnostics{capture};
+    wiredtest::ScriptedTransport transport;
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{100}};
+
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+
+    aa::app::WiredSession session{{trust, clock, diagnostics}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()));
+    ASSERT_TRUE(session.register_av_sink(p::ChannelRole::video, outlet));
+    outlet.set_idr_recovery({
+        [&session] { return session.video_projecting(); },
+        [&session] { return session.request_video_idr(); },
+        [&steady_now] { return steady_now; },
+        [&session](bool focus_transition) { return session.request_video_idr(focus_transition); },
+        aa::ipc::IdrRecoveryStrategy::auto_escalate,
+    });
+
+    session.attach_transport(&transport);
+    auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    auto* cipher = owned.get();
+    session.attach_cipher(std::move(owned));
+    ASSERT_TRUE(session.apply(aa::session::Event::start_discovery));
+    ASSERT_TRUE(session.phone_discovered(phone));
+    ASSERT_TRUE(session.apply(aa::session::Event::transport_ready));
+    wiredtest::walk_auth(session, transport);
+    ASSERT_TRUE(session.authenticated());
+    ASSERT_TRUE(session.announce_services());
+
+    const auto receive = [&](std::vector<std::byte> payload) -> aa::core::Result<bool> {
+        auto frames = tr::encode_message({99, tr::MessageKind::specific, std::move(payload)},
+                                         tr::Encryption::encrypted, cipher);
+        if (!frames) { return frames.error(); }
+        aa::core::Result<bool> polled{false};
+        for (auto& frame : frames.value()) {
+            transport.push_inbound(std::move(frame));
+            polled = session.poll_transport();
+            if (!polled) { return polled.error(); }
+        }
+        return polled;
+    };
+    ASSERT_TRUE(receive(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    ASSERT_TRUE(receive(p::encode(p::AvSinkStart{1, 0}).value()));
+    ASSERT_TRUE(session.apply(aa::session::Event::negotiation_succeeded));
+    ASSERT_TRUE(session.video_projecting());
+
+    const auto decode_focus_notifications_since = [&](std::size_t start_idx) {
+        std::vector<p::VideoFocusMode> modes;
+        const auto n_proj = p::encode(p::VideoFocusNotification{p::VideoFocusMode::projected, true}).value();
+        const auto n_nat = p::encode(p::VideoFocusNotification{p::VideoFocusMode::native, true}).value();
+        const auto n_no_inp = p::encode(p::VideoFocusNotification{p::VideoFocusMode::projected_no_input_focus, true}).value();
+        for (std::size_t i = start_idx; i < transport.sent_count(); ++i) {
+            const auto frame = tr::decode_frame(transport.sent_frames()[i]);
+            if (frame && frame.value().header.channel == 99 &&
+                frame.value().header.encryption == tr::Encryption::encrypted) {
+                const auto opened = cipher->open(frame.value().payload);
+                if (opened && opened.value() == n_proj) { modes.push_back(p::VideoFocusMode::projected); }
+                else if (opened && opened.value() == n_nat) { modes.push_back(p::VideoFocusMode::native); }
+                else if (opened && opened.value() == n_no_inp) { modes.push_back(p::VideoFocusMode::projected_no_input_focus); }
+            }
+        }
+        return modes;
+    };
+
+    const std::size_t mark0 = transport.sent_count();
+    {
+        const auto r1 = outlet.request_idr_external("consumer_ipc"); // t=0: nudge #1
+        ASSERT_TRUE(r1); EXPECT_TRUE(r1.value());
+        steady_now += aa::ipc::kIdrRequestMinInterval;
+        const auto r2 = outlet.request_idr_external("consumer_ipc"); // t=250ms: nudge #2
+        ASSERT_TRUE(r2); EXPECT_TRUE(r2.value());
+        steady_now += aa::ipc::kIdrRequestMinInterval;
+        const auto r3 = outlet.request_idr_external("consumer_ipc"); // t=500ms: nudge #3
+        ASSERT_TRUE(r3); EXPECT_TRUE(r3.value());
+    }
+    EXPECT_EQ(decode_focus_notifications_since(mark0),
+              (std::vector<p::VideoFocusMode>{p::VideoFocusMode::projected,
+                                              p::VideoFocusMode::projected,
+                                              p::VideoFocusMode::projected}));
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"idr_escalated\"") != std::string::npos;
+    }), 0);
+
+    // t=750ms (max nudges reached): escalates to native -> projected focus transition.
+    steady_now += aa::ipc::kIdrRequestMinInterval;
+    const std::size_t mark_esc = transport.sent_count();
+    {
+        const auto res = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(res);
+        EXPECT_TRUE(res.value());
+    }
+    EXPECT_EQ(decode_focus_notifications_since(mark_esc),
+              (std::vector<p::VideoFocusMode>{p::VideoFocusMode::native,
+                                              p::VideoFocusMode::projected}));
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_escalated\",\"source\":\"producer\",\"step\":\"focus_transition\",\"reason\":\"consumer_ipc\",\"episode_requests\":4,\"total_requests\":4}"),
+              logs.end());
+
+    // Inside kIdrTransitionCooldown (5000 ms), subsequent requests fall back to cheap nudge without repeating transition.
+    steady_now += std::chrono::milliseconds{1000};
+    const std::size_t mark_cool = transport.sent_count();
+    {
+        const auto res = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(res);
+        EXPECT_TRUE(res.value());
+    }
+    EXPECT_EQ(decode_focus_notifications_since(mark_cool),
+              (std::vector<p::VideoFocusMode>{p::VideoFocusMode::projected}));
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"idr_escalated\"") != std::string::npos;
+    }), 1);
+
+    // After kIdrTransitionCooldown elapses since t=750ms (+4000ms here -> +5000ms total), transition runs again.
+    steady_now += std::chrono::milliseconds{4000};
+    const std::size_t mark_esc2 = transport.sent_count();
+    {
+        const auto res = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(res);
+        EXPECT_TRUE(res.value());
+    }
+    EXPECT_EQ(decode_focus_notifications_since(mark_esc2),
+              (std::vector<p::VideoFocusMode>{p::VideoFocusMode::native,
+                                              p::VideoFocusMode::projected}));
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"idr_escalated\"") != std::string::npos;
+    }), 2);
+}
+
+TEST(WiredReceiver, VideoOutletPartialFocusRestoreFailureFailsSessionAndPreservesSnapshot) {
+    for (const auto initial_mode :
+         {p::VideoFocusMode::projected, p::VideoFocusMode::projected_no_input_focus}) {
+        SCOPED_TRACE(initial_mode == p::VideoFocusMode::projected ? "projected" : "projected_no_input_focus");
+        aa::session::test::MapTrustStore trust;
+        const aa::trust::PhoneIdentity phone{"idr-restore-fail-phone"};
+        trust.set(phone, aa::trust::Decision::approved);
+        aa::session::test::ManualClock clock;
+        wiredtest::CaptureSink capture;
+        aa::diagnostics::Diagnostics diagnostics{capture};
+        wiredtest::ScriptedTransport transport;
+        auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{200}};
+
+        std::vector<std::string> logs;
+        VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+        auto pair = videotest::make_pair({});
+        ASSERT_TRUE(pair);
+        outlet.install(std::move(pair.value().producer));
+
+        aa::app::WiredSession session{{trust, clock, diagnostics}};
+        ASSERT_TRUE(session.configure(wiredtest::golden_services()));
+        ASSERT_TRUE(session.register_av_sink(p::ChannelRole::video, outlet));
+        outlet.set_idr_recovery({
+            [&session] { return session.video_projecting(); },
+            [&session] { return session.request_video_idr(); },
+            [&steady_now] { return steady_now; },
+            [&session](bool focus_transition) { return session.request_video_idr(focus_transition); },
+            aa::ipc::IdrRecoveryStrategy::auto_escalate,
+        });
+
+        session.attach_transport(&transport);
+        auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+        auto* cipher = owned.get();
+        session.attach_cipher(std::move(owned));
+        ASSERT_TRUE(session.apply(aa::session::Event::start_discovery));
+        ASSERT_TRUE(session.phone_discovered(phone));
+        ASSERT_TRUE(session.apply(aa::session::Event::transport_ready));
+        wiredtest::walk_auth(session, transport);
+        ASSERT_TRUE(session.authenticated());
+        ASSERT_TRUE(session.announce_services());
+
+        const auto receive = [&](std::vector<std::byte> payload) -> aa::core::Result<bool> {
+            auto frames = tr::encode_message({99, tr::MessageKind::specific, std::move(payload)},
+                                             tr::Encryption::encrypted, cipher);
+            if (!frames) { return frames.error(); }
+            aa::core::Result<bool> polled{false};
+            for (auto& frame : frames.value()) {
+                transport.push_inbound(std::move(frame));
+                polled = session.poll_transport();
+                if (!polled) { return polled.error(); }
+            }
+            return polled;
+        };
+        ASSERT_TRUE(receive(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+        ASSERT_TRUE(receive(p::encode(p::AvSinkStart{1, 0}).value()));
+        if (initial_mode == p::VideoFocusMode::projected_no_input_focus) {
+            ASSERT_TRUE(receive(p::encode(p::VideoFocusRequest{initial_mode}).value()));
+        }
+        ASSERT_TRUE(session.apply(aa::session::Event::negotiation_succeeded));
+        ASSERT_TRUE(session.video_projecting());
+        EXPECT_EQ(session.state(), aa::session::State::active);
+
+        // Escalate through 3 nudges (t=0, 250ms, 500ms).
+        for (int i = 0; i < 3; ++i) {
+            const auto res = outlet.request_idr_external("consumer_ipc");
+            ASSERT_TRUE(res);
+            EXPECT_TRUE(res.value());
+            steady_now += aa::ipc::kIdrRequestMinInterval;
+        }
+
+        // First-send failure when trying focus_transition leaves session active and rolls back snapshot.
+        transport.fail_send_at(transport.sent_count());
+        const auto first_fail = outlet.request_idr_external("consumer_ipc");
+        ASSERT_FALSE(first_fail);
+        EXPECT_EQ(first_fail.error().code(), aa::ErrorCode::transport_io);
+        EXPECT_EQ(session.state(), aa::session::State::active);
+        EXPECT_FALSE(session.failure());
+        EXPECT_TRUE(session.video_projecting());
+        EXPECT_FALSE(outlet.idr_snapshot().escalated);
+        EXPECT_EQ(outlet.idr_snapshot().episode_requests, 3u);
+        EXPECT_FALSE(outlet.idr_snapshot().last_transition_at.has_value());
+
+        // Failure starts retry backoff; immediate retry is throttled, then after kIdrRequestMinInterval
+        // the second-send failure after native succeeds fails session and preserves snapshot.
+        const auto throttled = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(throttled);
+        EXPECT_FALSE(throttled.value());
+        steady_now += aa::ipc::kIdrRequestMinInterval;
+        const std::size_t before_partial = transport.sent_count();
+        transport.fail_send_at(before_partial + 1); // 1st send (native) succeeds; 2nd send (restore) fails.
+        const auto partial_fail = outlet.request_idr_external("consumer_ipc");
+        ASSERT_FALSE(partial_fail);
+        EXPECT_EQ(partial_fail.error().code(), aa::ErrorCode::channel_focus_restore_failed);
+
+        EXPECT_EQ(session.state(), aa::session::State::failed);
+        ASSERT_TRUE(session.failure().has_value());
+        EXPECT_EQ(session.failure()->code(), aa::ErrorCode::channel_focus_restore_failed);
+        EXPECT_TRUE(session.token().stop_requested());
+        EXPECT_GE(transport.close_calls(), 1);
+        EXPECT_FALSE(transport.is_open());
+        EXPECT_FALSE(session.video_projecting());
+        EXPECT_EQ(transport.sent_count(), before_partial + 1);
+        EXPECT_TRUE(capture.contains("\"to_state\":\"failed\""));
+        EXPECT_TRUE(capture.contains("\"error_code\":406"));
+        EXPECT_NE(std::find(logs.begin(), logs.end(),
+                            aa::ipc::idr_transition_failed_json(
+                                "producer", "restore_focus", "consumer_ipc", 4, 4,
+                                "channel_focus_restore_failed")),
+                  logs.end());
+
+        const auto snap = outlet.idr_snapshot();
+        EXPECT_TRUE(snap.escalated);
+        EXPECT_EQ(snap.episode_requests, 4u);
+        EXPECT_EQ(snap.total_requests, 4u);
+        EXPECT_EQ(snap.last_request_at, steady_now);
+        EXPECT_EQ(snap.last_transition_at, steady_now);
+
+        // Retrying later never replays native.
+        transport.fail_send_at(std::nullopt);
+        const auto sent_after = transport.sent_count();
+        steady_now += aa::ipc::kIdrTransitionCooldown;
+        const auto after = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(after);
+        EXPECT_FALSE(after.value());
+        EXPECT_EQ(transport.sent_count(), sent_after);
+    }
+}
+
+TEST(WiredReceiver, VideoOutletOnMessagePropagatesPartialFocusRestoreFailure) {
+    aa::session::test::MapTrustStore trust;
+    const aa::trust::PhoneIdentity phone{"idr-msg-fail-phone"};
+    trust.set(phone, aa::trust::Decision::approved);
+    aa::session::test::ManualClock clock;
+    wiredtest::CaptureSink capture;
+    aa::diagnostics::Diagnostics diagnostics{capture};
+    wiredtest::ScriptedTransport transport;
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{300}};
+
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    const int producer_fd = pair.value().producer.native_handle();
+    const int consumer_fd = pair.value().consumer.native_handle();
+    outlet.install(std::move(pair.value().producer));
+
+    aa::app::WiredSession session{{trust, clock, diagnostics}};
+    ASSERT_TRUE(session.configure(wiredtest::golden_services()));
+    ASSERT_TRUE(session.register_av_sink(p::ChannelRole::video, outlet));
+    outlet.set_idr_recovery({
+        [&session] { return session.video_projecting(); },
+        [&session] { return session.request_video_idr(); },
+        [&steady_now] { return steady_now; },
+        [&session](bool focus_transition) { return session.request_video_idr(focus_transition); },
+        aa::ipc::IdrRecoveryStrategy::auto_escalate,
+    });
+
+    session.attach_transport(&transport);
+    auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+    auto* cipher = owned.get();
+    session.attach_cipher(std::move(owned));
+    ASSERT_TRUE(session.apply(aa::session::Event::start_discovery));
+    ASSERT_TRUE(session.phone_discovered(phone));
+    ASSERT_TRUE(session.apply(aa::session::Event::transport_ready));
+    wiredtest::walk_auth(session, transport);
+    ASSERT_TRUE(session.authenticated());
+    ASSERT_TRUE(session.announce_services());
+
+    const auto receive = [&](std::vector<std::byte> payload) -> aa::core::Result<bool> {
+        auto frames = tr::encode_message({99, tr::MessageKind::specific, std::move(payload)},
+                                         tr::Encryption::encrypted, cipher);
+        if (!frames) { return frames.error(); }
+        aa::core::Result<bool> polled{false};
+        for (auto& frame : frames.value()) {
+            transport.push_inbound(std::move(frame));
+            polled = session.poll_transport();
+            if (!polled) { return polled.error(); }
+        }
+        return polled;
+    };
+    ASSERT_TRUE(receive(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+    ASSERT_TRUE(receive(p::encode(p::AvSinkStart{1, 0}).value()));
+    ASSERT_TRUE(session.apply(aa::session::Event::negotiation_succeeded));
+    ASSERT_TRUE(session.video_projecting());
+
+    // Initial IDR establishes profile and runs configure_buffer_locked before shrinking buffers.
+    auto idr_payload = std::vector<std::byte>(10, std::byte{0});
+    idr_payload.insert(idr_payload.end(), wiredtest::kVideoIdr.begin(), wiredtest::kVideoIdr.end());
+    ASSERT_TRUE(receive(idr_payload));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+
+    const int tiny_buf = 32768;
+    ASSERT_EQ(::setsockopt(producer_fd, SOL_SOCKET, SO_SNDBUF, &tiny_buf, sizeof(tiny_buf)), 0);
+    ASSERT_EQ(::setsockopt(consumer_fd, SOL_SOCKET, SO_RCVBUF, &tiny_buf, sizeof(tiny_buf)), 0);
+
+    // Saturate the tiny UNIX socket buffer with non-IDR packets so nudge #1..#3 fire via
+    // on_message(), guaranteeing the buffer is already full before the escalated step.
+    std::vector<std::byte> big_non_idr(10 + 16384, std::byte{0x41});
+    big_non_idr[0] = big_non_idr[1] = std::byte{0};
+    big_non_idr[10] = std::byte{0x00};
+    big_non_idr[11] = std::byte{0x00};
+    big_non_idr[12] = std::byte{0x01};
+    big_non_idr[13] = std::byte{0x41};
+    bool saturated = false;
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_TRUE(receive(big_non_idr));
+        if (outlet.idr_snapshot().episode_requests >= 1u) {
+            saturated = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(saturated);
+    for (int nudge = 2; nudge <= 3; ++nudge) {
+        steady_now += aa::ipc::kIdrRequestMinInterval;
+        ASSERT_TRUE(receive(big_non_idr));
+        EXPECT_EQ(outlet.idr_snapshot().episode_requests, static_cast<std::size_t>(nudge));
+    }
+
+    // Next drop escalates to focus_transition inside on_message(); fail the restore send
+    // (2nd send after native) and verify channel_focus_restore_failed fails the session.
+    steady_now += aa::ipc::kIdrRequestMinInterval;
+    const std::size_t before_esc = transport.sent_count();
+    transport.fail_send_at(before_esc + 1);
+    const auto polled = receive(big_non_idr);
+    ASSERT_FALSE(polled);
+    EXPECT_EQ(polled.error().code(), aa::ErrorCode::channel_focus_restore_failed);
+    EXPECT_EQ(session.state(), aa::session::State::failed);
+    ASSERT_TRUE(session.failure().has_value());
+    EXPECT_EQ(session.failure()->code(), aa::ErrorCode::channel_focus_restore_failed);
+    EXPECT_EQ(transport.sent_count(), before_esc + 1);
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        aa::ipc::idr_transition_failed_json(
+                            "producer", "restore_focus", "waiting_idr", 4, 4,
+                            "channel_focus_restore_failed")),
+              logs.end());
+}
+
+TEST(WiredReceiver, IdrRecoveryStrategyParserAndModes) {
+    using aa::ipc::IdrRecoveryCoordinator;
+    using aa::ipc::IdrRecoveryStep;
+    using aa::ipc::IdrRecoveryStrategy;
+    using aa::ipc::parse_idr_recovery_strategy;
+
+    IdrRecoveryStrategy parsed{};
+    EXPECT_TRUE(parse_idr_recovery_strategy("auto", parsed));
+    EXPECT_EQ(parsed, IdrRecoveryStrategy::auto_escalate);
+    EXPECT_TRUE(parse_idr_recovery_strategy("nudge", parsed));
+    EXPECT_EQ(parsed, IdrRecoveryStrategy::nudge);
+    EXPECT_TRUE(parse_idr_recovery_strategy("transition", parsed));
+    EXPECT_EQ(parsed, IdrRecoveryStrategy::transition);
+    EXPECT_FALSE(parse_idr_recovery_strategy("invalid", parsed));
+
+    const auto t0 = std::chrono::steady_clock::time_point{std::chrono::seconds{1}};
+    IdrRecoveryCoordinator nudge_only{IdrRecoveryCoordinator::Config{
+        aa::ipc::kIdrRequestMinInterval, aa::ipc::kIdrEscalationDelay,
+        aa::ipc::kIdrEscalationMaxNudges, aa::ipc::kIdrTransitionCooldown,
+        IdrRecoveryStrategy::nudge}};
+    nudge_only.begin_wait(t0);
+    EXPECT_EQ(nudge_only.try_request_step(t0, true), IdrRecoveryStep::nudge);
+    EXPECT_EQ(nudge_only.try_request_step(t0 + std::chrono::seconds{10}, true),
+              IdrRecoveryStep::nudge);
+
+    IdrRecoveryCoordinator trans_only{IdrRecoveryCoordinator::Config{
+        aa::ipc::kIdrRequestMinInterval, aa::ipc::kIdrEscalationDelay,
+        aa::ipc::kIdrEscalationMaxNudges, aa::ipc::kIdrTransitionCooldown,
+        IdrRecoveryStrategy::transition}};
+    trans_only.begin_wait(t0);
+    EXPECT_EQ(trans_only.try_request_step(t0, true), IdrRecoveryStep::focus_transition);
+    EXPECT_EQ(trans_only.try_request_step(t0 + std::chrono::seconds{1}, true),
+              IdrRecoveryStep::none);
+    EXPECT_EQ(trans_only.try_request_step(t0 + aa::ipc::kIdrTransitionCooldown, true),
+              IdrRecoveryStep::focus_transition);
+}
+
+TEST(WiredReceiver, IdrRecoveryCoordinatorHoldsCooldownThroughIdrDeliveredAndReset) {
+    using aa::ipc::IdrRecoveryCoordinator;
+    using aa::ipc::IdrRecoveryStep;
+    using aa::ipc::IdrRecoveryStrategy;
+
+    const auto t0 = std::chrono::steady_clock::time_point{std::chrono::seconds{50}};
+    IdrRecoveryCoordinator coord{IdrRecoveryCoordinator::Config{
+        aa::ipc::kIdrRequestMinInterval,
+        aa::ipc::kIdrEscalationDelay,
+        aa::ipc::kIdrEscalationMaxNudges,
+        aa::ipc::kIdrTransitionCooldown,
+        IdrRecoveryStrategy::auto_escalate}};
+
+    // Episode 1 escalates to focus_transition at t_trans = t0 + 750ms.
+    coord.begin_wait(t0);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(coord.try_request_step(t0 + i * aa::ipc::kIdrRequestMinInterval, true),
+                  IdrRecoveryStep::nudge);
+    }
+    const auto t_trans1 = t0 + 3 * aa::ipc::kIdrRequestMinInterval;
+    EXPECT_EQ(coord.try_request_step(t_trans1, true), IdrRecoveryStep::focus_transition);
+
+    // IDR is delivered during cooldown; Episode 2 starts and escalates before cooldown expires.
+    const auto recovered = coord.on_idr_delivered(t_trans1 + std::chrono::milliseconds{200});
+    EXPECT_TRUE(recovered.recovered);
+    EXPECT_EQ(recovered.episode_requests, 4u);
+    EXPECT_EQ(recovered.total_requests, 4u);
+    const auto t_ep2 = t_trans1 + std::chrono::milliseconds{500};
+    coord.begin_wait(t_ep2);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(coord.try_request_step(t_ep2 + i * aa::ipc::kIdrRequestMinInterval, true),
+                  IdrRecoveryStep::nudge);
+    }
+    EXPECT_EQ(coord.try_request_step(
+                  t_trans1 + aa::ipc::kIdrTransitionCooldown - aa::ipc::kIdrRequestMinInterval, true),
+              IdrRecoveryStep::nudge);
+    const auto t_trans2 = t_trans1 + aa::ipc::kIdrTransitionCooldown;
+    EXPECT_EQ(coord.try_request_step(t_trans2, true), IdrRecoveryStep::focus_transition);
+
+    // reset() during kIdrTransitionCooldown clears episode state without lifting cooldown.
+    coord.reset();
+    const auto t_ep3 = t_trans2 + aa::ipc::kIdrRequestMinInterval;
+    coord.begin_wait(t_ep3);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(coord.try_request_step(t_ep3 + i * aa::ipc::kIdrRequestMinInterval, true),
+                  IdrRecoveryStep::nudge);
+    }
+    EXPECT_EQ(coord.try_request_step(
+                  t_trans2 + aa::ipc::kIdrTransitionCooldown - aa::ipc::kIdrRequestMinInterval, true),
+              IdrRecoveryStep::nudge);
+    EXPECT_EQ(coord.try_request_step(t_trans2 + aa::ipc::kIdrTransitionCooldown, true),
+              IdrRecoveryStep::focus_transition);
+}
+
+TEST(WiredReceiver, IdrRecoveryCoordinatorBacksOffFailedRequestsWithoutCountingThem) {
+    using aa::ipc::IdrRecoveryCoordinator;
+    using aa::ipc::IdrRecoveryStep;
+    using aa::ipc::IdrRecoveryStrategy;
+
+    const auto t0 = std::chrono::steady_clock::time_point{std::chrono::seconds{60}};
+    IdrRecoveryCoordinator coord{IdrRecoveryCoordinator::Config{
+        aa::ipc::kIdrRequestMinInterval,
+        aa::ipc::kIdrEscalationDelay,
+        aa::ipc::kIdrEscalationMaxNudges,
+        aa::ipc::kIdrTransitionCooldown,
+        IdrRecoveryStrategy::auto_escalate}};
+
+    coord.begin_wait(t0);
+    ASSERT_EQ(coord.try_request_step(t0, true), IdrRecoveryStep::nudge);
+    coord.note_request_failed(t0);
+
+    // Counters and timestamps stay rolled back, while backoff blocks retries inside min_interval.
+    EXPECT_EQ(coord.episode_requests(), 0u);
+    EXPECT_EQ(coord.total_requests(), 0u);
+    EXPECT_FALSE(coord.last_request_at().has_value());
+    EXPECT_FALSE(coord.last_transition_at().has_value());
+    EXPECT_FALSE(coord.escalated());
+    EXPECT_EQ(coord.consecutive_failures(), 1u);
+    EXPECT_EQ(coord.try_request_step(t0 + std::chrono::milliseconds{249}, true),
+              IdrRecoveryStep::none);
+
+    // After 250 ms, next attempt runs; a second failure doubles backoff to 500 ms (capped at 2000 ms).
+    const auto t1 = t0 + aa::ipc::kIdrRequestMinInterval;
+    ASSERT_EQ(coord.try_request_step(t1, true), IdrRecoveryStep::nudge);
+    coord.note_request_failed(t1);
+    EXPECT_EQ(coord.episode_requests(), 0u);
+    EXPECT_EQ(coord.total_requests(), 0u);
+    EXPECT_EQ(coord.consecutive_failures(), 2u);
+    EXPECT_EQ(coord.try_request_step(t1 + std::chrono::milliseconds{499}, true),
+              IdrRecoveryStep::none);
+
+    // A successful request at t2 clears the failure backoff (next failure starts at 250 ms again).
+    const auto t2 = t1 + std::chrono::milliseconds{500};
+    ASSERT_EQ(coord.try_request_step(t2, true), IdrRecoveryStep::nudge);
+    EXPECT_EQ(coord.consecutive_failures(), 0u);
+    EXPECT_FALSE(coord.retry_after().has_value());
+    EXPECT_EQ(coord.episode_requests(), 1u);
+    EXPECT_EQ(coord.total_requests(), 1u);
+
+    const auto t3 = t2 + aa::ipc::kIdrRequestMinInterval;
+    ASSERT_EQ(coord.try_request_step(t3, true), IdrRecoveryStep::nudge);
+    coord.note_request_failed(t3);
+    EXPECT_EQ(coord.consecutive_failures(), 1u);
+    EXPECT_EQ(coord.episode_requests(), 1u);
+    EXPECT_EQ(coord.total_requests(), 1u);
+
+    // on_idr_delivered() clears failure backoff immediately for a subsequent episode.
+    const auto delivered = coord.on_idr_delivered(t3 + std::chrono::milliseconds{10});
+    EXPECT_TRUE(delivered.recovered);
+    EXPECT_EQ(delivered.episode_requests, 1u);
+    EXPECT_EQ(delivered.total_requests, 1u);
+    EXPECT_EQ(coord.consecutive_failures(), 0u);
+    EXPECT_FALSE(coord.retry_after().has_value());
+    // t3 + 20 ms is 270 ms after t2 (>= min_interval), and only succeeds because
+    // on_idr_delivered cleared the t3 failure backoff (which would have held until t3 + 250 ms).
+    const auto t4 = t3 + std::chrono::milliseconds{20};
+    coord.begin_wait(t4);
+    EXPECT_EQ(coord.try_request_step(t4, true), IdrRecoveryStep::nudge);
+
+    // reset() also clears failure backoff even before retry_after expires.
+    const auto t5 = t4 + aa::ipc::kIdrRequestMinInterval;
+    ASSERT_EQ(coord.try_request_step(t5, true), IdrRecoveryStep::nudge);
+    coord.note_request_failed(t5);
+    EXPECT_EQ(coord.consecutive_failures(), 1u);
+    EXPECT_EQ(coord.try_request_step(t5 + std::chrono::milliseconds{10}, true),
+              IdrRecoveryStep::none);
+    coord.reset();
+    EXPECT_EQ(coord.consecutive_failures(), 0u);
+    EXPECT_FALSE(coord.retry_after().has_value());
+    coord.begin_wait(t5 + std::chrono::milliseconds{10});
+    EXPECT_EQ(coord.try_request_step(t5 + std::chrono::milliseconds{10}, true),
+              IdrRecoveryStep::nudge);
+
+    // Repeated failures cap exponential backoff at kIdrFailureBackoffCap (2000 ms) without escalating.
+    coord.reset();
+    auto t_cap = t5 + std::chrono::milliseconds{10} + aa::ipc::kIdrRequestMinInterval;
+    coord.begin_wait(t_cap);
+    using std::chrono::milliseconds;
+    const milliseconds expected_delays[] = {milliseconds{250}, milliseconds{500}, milliseconds{1000},
+                                            milliseconds{2000}, milliseconds{2000}, milliseconds{2000}};
+    static_assert(aa::ipc::kIdrFailureBackoffCap == milliseconds{2000});
+    for (const auto expected : expected_delays) {
+        ASSERT_EQ(coord.try_request_step(t_cap, true), IdrRecoveryStep::nudge);
+        coord.note_request_failed(t_cap);
+        ASSERT_TRUE(coord.retry_after().has_value());
+        EXPECT_EQ(std::chrono::duration_cast<milliseconds>(*coord.retry_after() - t_cap), expected);
+        EXPECT_EQ(coord.episode_requests(), 0u);
+        EXPECT_EQ(coord.try_request_step(*coord.retry_after() - milliseconds{1}, true),
+                  IdrRecoveryStep::none);
+        t_cap = *coord.retry_after();
+    }
+    EXPECT_EQ(coord.total_requests(), 3u);
+}
+
+TEST(WiredReceiver, VideoOutletSuppressesIdrRequestsWhenNotProjecting) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{5}};
+    bool projecting = false;
+    std::size_t requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [&projecting] { return projecting; },
+        [&requests]() -> aa::core::Result<void> { ++requests; return {}; },
+        [&steady_now] { return steady_now; },
+    });
+
+    {
+        const auto res = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(res);
+        EXPECT_FALSE(res.value());
+    }
+    EXPECT_EQ(requests, 0u);
+    EXPECT_TRUE(logs.empty());
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    const int tiny_buf = 8192;
+    ASSERT_EQ(::setsockopt(pair.value().producer.native_handle(), SOL_SOCKET, SO_SNDBUF,
+                           &tiny_buf, sizeof(tiny_buf)), 0);
+    ASSERT_EQ(::setsockopt(pair.value().consumer.native_handle(), SOL_SOCKET, SO_RCVBUF,
+                           &tiny_buf, sizeof(tiny_buf)), 0);
+    outlet.install(std::move(pair.value().producer));
+
+    std::vector<std::byte> non_idr(16384, std::byte{0x41});
+    non_idr[0] = std::byte{0x00};
+    non_idr[1] = std::byte{0x00};
+    non_idr[2] = std::byte{0x01};
+    non_idr[3] = std::byte{0x41};
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, static_cast<std::uint64_t>(i + 1), {100}}, non_idr}));
+    }
+    EXPECT_EQ(requests, 0u);
+
+    projecting = true;
+    {
+        const auto res = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(res);
+        EXPECT_TRUE(res.value());
+    }
+    EXPECT_EQ(requests, 1u);
+    {
+        const auto res = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(res);
+        EXPECT_FALSE(res.value());
+    }
+    EXPECT_EQ(requests, 1u);
+
+    steady_now += aa::ipc::kIdrRequestMinInterval;
+    {
+        const auto res = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(res);
+        EXPECT_TRUE(res.value());
+    }
+    EXPECT_EQ(requests, 2u);
+}
+
+TEST(WiredReceiver, VideoOutletThrottlesFailedFocusNotificationAcrossDroppedAus) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{15}};
+    std::size_t failed_hook_calls = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&failed_hook_calls]() -> aa::core::Result<void> {
+            ++failed_hook_calls;
+            return aa::Error{aa::ErrorCode::transport_io};
+        },
+        [&steady_now] { return steady_now; },
+    });
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    const int tiny_buf = 32768;
+    ASSERT_EQ(::setsockopt(pair.value().producer.native_handle(), SOL_SOCKET, SO_SNDBUF,
+                           &tiny_buf, sizeof(tiny_buf)), 0);
+    ASSERT_EQ(::setsockopt(pair.value().consumer.native_handle(), SOL_SOCKET, SO_RCVBUF,
+                           &tiny_buf, sizeof(tiny_buf)), 0);
+    outlet.install(std::move(pair.value().producer));
+
+    // Send an initial IDR so VideoProducer leaves initial waiting_idr state before saturating.
+    std::uint64_t ts = 100;
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, ++ts, {100}}, wiredtest::kVideoIdr}));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+
+    std::vector<std::byte> non_idr(16384, std::byte{0x41});
+    non_idr[0] = std::byte{0x00};
+    non_idr[1] = std::byte{0x00};
+    non_idr[2] = std::byte{0x01};
+    non_idr[3] = std::byte{0x41};
+
+    // Saturate the tiny socket buffer so VideoOutlet enters dropped_backpressure / dropped_waiting_idr.
+    bool saw_first_failure = false;
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, ++ts, {100}}, non_idr}));
+        if (failed_hook_calls == 1u) {
+            saw_first_failure = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(saw_first_failure);
+    EXPECT_EQ(outlet.idr_snapshot().episode_requests, 0u);
+    EXPECT_EQ(outlet.idr_snapshot().total_requests, 0u);
+
+    // Many dropped AUs within the 250 ms failure backoff must not invoke the hook again.
+    for (int i = 0; i < 24; ++i) {
+        steady_now += std::chrono::milliseconds{10};
+        ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, ++ts, {100}}, non_idr}));
+    }
+    EXPECT_EQ(failed_hook_calls, 1u);
+    EXPECT_EQ(outlet.idr_snapshot().episode_requests, 0u);
+    EXPECT_EQ(outlet.idr_snapshot().total_requests, 0u);
+
+    // Once the 250 ms failure backoff elapses (+10 ms -> 250 ms total), one more attempt runs.
+    steady_now += std::chrono::milliseconds{10};
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, ++ts, {100}}, non_idr}));
+    EXPECT_EQ(failed_hook_calls, 2u);
+    EXPECT_EQ(outlet.idr_snapshot().episode_requests, 0u);
+    EXPECT_EQ(outlet.idr_snapshot().total_requests, 0u);
+}
+
+TEST(WiredReceiver, VideoSelectionWatchdogEmitsOnceAfterTimeoutAndResets) {
+    using aa::ipc::kVideoSelectionWarningTimeout;
+    using aa::ipc::VideoSelectionWatchdog;
+    VideoSelectionWatchdog watchdog;
+    auto t0 = std::chrono::steady_clock::time_point{std::chrono::seconds{1}};
+
+    EXPECT_FALSE(watchdog.check(false, false, t0));
+    EXPECT_FALSE(watchdog.check(true, false, t0));
+    EXPECT_FALSE(watchdog.check(true, false, t0 + kVideoSelectionWarningTimeout - std::chrono::milliseconds{1}));
+    EXPECT_TRUE(watchdog.check(true, false, t0 + kVideoSelectionWarningTimeout));
+    EXPECT_TRUE(watchdog.warned());
+    EXPECT_FALSE(watchdog.check(true, false, t0 + kVideoSelectionWarningTimeout + std::chrono::seconds{2}));
+
+    // Selecting a profile resets the watchdog so a future session/relink starts clean.
+    EXPECT_FALSE(watchdog.check(true, true, t0 + std::chrono::seconds{10}));
+    EXPECT_FALSE(watchdog.warned());
+    EXPECT_FALSE(watchdog.check(true, false, t0 + std::chrono::seconds{11}));
+    EXPECT_TRUE(watchdog.check(true, false, t0 + std::chrono::seconds{11} + kVideoSelectionWarningTimeout));
+}
+

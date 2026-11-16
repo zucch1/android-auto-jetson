@@ -44,6 +44,29 @@ inline core::Result<std::vector<protocol::VideoProfile>> parse_video_profiles(st
     if (profiles.empty()) { return Error{ErrorCode::config_invalid}; }
     return profiles;
 }
+inline constexpr protocol::VideoProfile kFallbackVideoProfile{
+    1280, 720, 30, protocol::VideoCodec::h264};
+
+// Ensures the offered list always ends with 1280x720@30:h264 so phones that
+// reject all higher/custom profiles still have a universally accepted config,
+// unless the caller requested exact profiles only.
+inline void ensure_fallback_video_profile(std::vector<protocol::VideoProfile>& profiles,
+                                          bool exact_profiles_only = false) {
+    if (exact_profiles_only) {
+        return;
+    }
+    if (std::find(profiles.begin(), profiles.end(), kFallbackVideoProfile) != profiles.end()) {
+        return;
+    }
+    if (profiles.size() < protocol::kMaxVideoProfiles) {
+        profiles.push_back(kFallbackVideoProfile);
+    } else if (!profiles.empty()) {
+        profiles.back() = kFallbackVideoProfile;
+    } else {
+        profiles.push_back(kFallbackVideoProfile);
+    }
+}
+
 // The `--video-profiles` option as both receivers accept it: atomic, so a bad
 // value leaves the configured profiles untouched. Callers own the diagnostic.
 inline bool parse_video_profiles_option(std::string_view text,

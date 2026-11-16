@@ -154,6 +154,12 @@ constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properti
                                 static_cast<std::uint16_t>(height.value()), dpi.value()};
         return from_void(service.set_display_viewport(sender, viewport));
     }
+    case 11: {
+        if (!body_consumed(cursor)) {
+            return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        }
+        return ok(service.ping());
+    }
     case 12: {
         const auto id = cursor.read_u64();
         if (!id || !body_consumed(cursor)) return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
@@ -175,12 +181,13 @@ constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properti
         if (!value) return error_reply(error_name_for(value.error().code()), value.error().message());
         return ok(value.value());
     }
-    default: {
+    case 15: {
         if (!body_consumed(cursor)) {
             return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
         }
-        return ok(service.ping());
+        return from_void(service.request_idr_recovery(sender));
     }
+    default: return error_reply("org.freedesktop.DBus.Error.UnknownMethod", "unknown member");
     }
 }
 

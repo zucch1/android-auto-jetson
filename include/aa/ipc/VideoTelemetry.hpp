@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <aa/ipc/VideoSocket.hpp>
+#include <aa/protocol/Messages.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 
 namespace aa::ipc {
 
@@ -46,6 +50,41 @@ inline std::string video_endpoint_json(const VideoEndpoint& event) {
         std::to_string(event.timestamp_ns) + ",\"observed_ns\":" +
         std::to_string(event.observed_ns) + ",\"payload_bytes\":" +
         std::to_string(event.payload_bytes) + "}";
+}
+
+inline std::string video_socket_buffer_json(std::string_view side,
+                                            const SocketBufferResult& sized,
+                                            const protocol::VideoProfile& profile) {
+    return std::string{"{\"event\":\"video_socket_buffer\",\"side\":\""} + std::string{side} +
+           "\",\"requested_bytes\":" + std::to_string(sized.requested_bytes) +
+           ",\"granted_bytes\":" + std::to_string(sized.granted_bytes) +
+           ",\"granted_raw_bytes\":" + std::to_string(sized.granted_raw_bytes) +
+           ",\"short_grant\":" + (sized.short_grant() ? "true" : "false") +
+           ",\"setsockopt_errno\":" + std::to_string(sized.setsockopt_errno) +
+           ",\"getsockopt_errno\":" + std::to_string(sized.getsockopt_errno) +
+           ",\"width\":" + std::to_string(profile.width) +
+           ",\"height\":" + std::to_string(profile.height) +
+           ",\"fps\":" + std::to_string(profile.fps) +
+           ",\"codec\":\"" + std::string{protocol::codec_name(profile.codec)} + "\"}";
+}
+
+inline std::string video_socket_buffer_warning_json(std::string_view side,
+                                                    const SocketBufferResult& sized,
+                                                    const protocol::VideoProfile& profile) {
+    const std::string_view reason =
+        sized.setsockopt_errno != 0 ? "setsockopt_failed"
+        : (sized.getsockopt_errno != 0 ? "getsockopt_failed" : "short_grant");
+    return std::string{"{\"event\":\"video_socket_buffer_warning\",\"side\":\""} +
+           std::string{side} + "\",\"reason\":\"" + std::string{reason} +
+           "\",\"requested_bytes\":" + std::to_string(sized.requested_bytes) +
+           ",\"granted_bytes\":" + std::to_string(sized.granted_bytes) +
+           ",\"granted_raw_bytes\":" + std::to_string(sized.granted_raw_bytes) +
+           ",\"setsockopt_errno\":" + std::to_string(sized.setsockopt_errno) +
+           ",\"getsockopt_errno\":" + std::to_string(sized.getsockopt_errno) +
+           ",\"width\":" + std::to_string(profile.width) +
+           ",\"height\":" + std::to_string(profile.height) +
+           ",\"fps\":" + std::to_string(profile.fps) +
+           ",\"codec\":\"" + std::string{protocol::codec_name(profile.codec)} + "\"}";
 }
 
 } // namespace aa::ipc

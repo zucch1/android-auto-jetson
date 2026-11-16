@@ -23,7 +23,10 @@ constexpr const char* usage =
     "  --input-socket PATH   normalized display input socket\n"
     "  --video-profiles WxH@FPS:CODEC,...  offered video profiles (same syntax as\n"
     "                       the wired receiver; default 1280x720@30:h264,800x480@30:h264)\n"
+    "  --exact-video-profiles offer only --video-profiles without appending the\n"
+    "                       1280x720@30:h264 fallback profile\n"
     "  --helper-bus-address ADDRESS  explicit alternate helper bus (default: system bus)\n"
+    "  --idr-recovery auto|nudge|transition  IDR recovery strategy (default auto)\n"
     "  --diagnostics        emit redacted diagnostic JSON to stdout\n"
     "  --duration-ms N      bounded run (1..86400000 ms; omitted: until signal)\n"
     "  --ap-channel N       AP channel; must equal ap.conf (36, 40, 44 or 48; default 36)\n"
@@ -42,8 +45,10 @@ struct Options final {
     std::string input_socket{ipc::production_input_socket_path().value};
     std::string helper_address;
     std::vector<protocol::VideoProfile> video_profiles{config::default_video_profiles()};
+    ipc::IdrRecoveryStrategy idr_recovery{ipc::IdrRecoveryStrategy::auto_escalate};
     std::int64_t duration_ms{};
     std::uint32_t ap_channel{36};
+    bool exact_video_profiles{};
     bool diagnostics{};
     bool pairing_only{};
 };
@@ -54,6 +59,7 @@ std::optional<Options> parse_options(int argc, char** argv) {
         const std::string_view arg{argv[i]};
         if (arg == "--diagnostics") { options.diagnostics = true; continue; }
         if (arg == "--pairing-only") { options.pairing_only = true; continue; }
+        if (arg == "--exact-video-profiles") { options.exact_video_profiles = true; continue; }
         if (i + 1 == argc) return std::nullopt;
         const std::string_view value{argv[++i]};
         if (value.empty() || value.starts_with("--")) return std::nullopt;
@@ -62,6 +68,10 @@ std::optional<Options> parse_options(int argc, char** argv) {
         else if (arg == "--input-socket") options.input_socket = value;
         else if (arg == "--video-profiles") {
             if (!aa::config::parse_video_profiles_option(value, options.video_profiles))
+                return std::nullopt;
+        }
+        else if (arg == "--idr-recovery") {
+            if (!aa::ipc::parse_idr_recovery_strategy(value, options.idr_recovery))
                 return std::nullopt;
         }
         else if (arg == "--helper-bus-address") options.helper_address = value;
@@ -89,6 +99,7 @@ std::optional<Options> parse_options(int argc, char** argv) {
         !options.store_dir.is_absolute() || !std::filesystem::path{options.video_socket}.is_absolute() ||
         !std::filesystem::path{options.input_socket}.is_absolute() || options.video_socket == options.input_socket)
         return std::nullopt;
+    aa::config::ensure_fallback_video_profile(options.video_profiles, options.exact_video_profiles);
     return options;
 }
 }
@@ -180,6 +191,24 @@ int main(int argc, char** argv) {
         return session ? session->send_channel_payload(role, std::move(payload))
             : aa::core::Result<void>{aa::Error{aa::ErrorCode::transport_closed}};
     };
+    media.video.set_idr_recovery({
+        [&receiver] {
+            auto* session = receiver.session();
+            return session && session->video_projecting();
+        },
+        [&receiver] {
+            auto* session = receiver.session();
+            return session ? session->request_video_idr()
+                           : aa::core::Result<void>{aa::Error{aa::ErrorCode::transport_closed}};
+        },
+        {},
+        [&receiver](bool focus_transition) {
+            auto* session = receiver.session();
+            return session ? session->request_video_idr(focus_transition)
+                           : aa::core::Result<void>{aa::Error{aa::ErrorCode::transport_closed}};
+        },
+        options->idr_recovery,
+    });
     auto bus = aa::ipc::ControlBusService::start({aa::ipc::current_uid()},
         {ids, phones, &receiver.confirmation()});
     if (!bus) { report("session control bus", bus.error().code()); return 3; }
@@ -199,6 +228,7 @@ int main(int argc, char** argv) {
         : Runtime::Clock::time_point::max();
     Runtime runtime{receiver, *helper.value(), bus.value(), video.value(), input.value(), media,
         *identity, deadline, std::nullopt, {}, std::nullopt};
+    runtime.offered_video_profiles = options->video_profiles.size();
     log_line("{\"event\":\"ready\",\"state\":\"waiting_for_consumer\"}");
     return runtime.run();
 }

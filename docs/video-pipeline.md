@@ -142,6 +142,64 @@ older displays reject version 2. Legacy producers without metadata retain
 DisplayConfig caps. Protocol validity and observed output-dimension validation
 remain enforced; the old 720p30-only decoder guard is removed.
 
+## Video IDR recovery
+
+When video frames are dropped (`backpressure`, `waiting_idr`, `no_consumer` before
+first attachment, consumer disconnect/reattach, or decoder `awaiting_idr`), the
+pipeline suppresses non-IDR access units until a fresh IDR arrives and requests a
+keyframe from the phone while projecting:
+
+- `--idr-recovery auto|nudge|transition` (default `auto`) configures the wired
+  and wireless receivers' recovery step policy:
+  - `auto`: sends an unchanged projected `VideoFocusNotification` (`unsolicited=true`)
+    as the first cheap nudge (rate-limited at `kIdrRequestMinInterval = 250 ms`),
+    and escalates to an ordered focus transition (`native` followed by the prior
+    projected mode, `projected` or `projected_no_input_focus`) if no IDR arrives
+    within `kIdrEscalationDelay` (`1000 ms`) or `kIdrEscalationMaxNudges` (`3` nudges),
+    following the focus-toggle workaround documented in
+    `aa-proxy/aa-proxy-rs@2af9270` (#142).
+  - `nudge`: only sends projected `VideoFocusNotification` nudges.
+  - `transition`: performs the ordered `native` -> prior focus transition directly,
+    bounded by `kIdrTransitionCooldown` (`5000 ms`).
+- Escalation emits `idr_escalated` naming `step` (`focus_transition`). Focus
+  transitions are rate-limited by `kIdrTransitionCooldown` (`5000 ms`), and both
+  per-request and transition cooldown timestamps persist across episode
+  boundaries so rapid IDR/drop cycles or interleaved D-Bus `RequestIdrRecovery`
+  calls cannot burst focus notifications.
+- Late consumer attachment arms recovery if frames arrived before the first
+  consumer connected (or after `kIdrStartupGrace = 1000 ms` waiting for an initial
+  IDR on either endpoint).
+- `idr_recovered` reports both `episode_requests` and lifetime `total_requests`.
+  Endpoint `latency_ms` differs intentionally by endpoint:
+  - `source: "producer"`: time from entering wait (`begin_wait()`) until the
+    producer dispatches the recovery IDR onto the IPC socket (`SendStatus::sent`).
+  - `source: "consumer"`: time from entering wait (`begin_wait()`) until the
+    display decoder exits `awaiting_idr` and socket resync clears.
+
+## Video IPC socket buffer sizing
+
+`VideoProducer::configure_send_buffer()` and
+`VideoConsumer::configure_receive_buffer()` request a profile-scaled buffer target
+from `recommended_socket_buffer_bytes()` (`256 KiB`–`4 MiB`) using `setsockopt`
+without mutating sysctls or using `SO_SNDBUFFORCE`. On Linux/Jetson kernels with
+stock sysctls (`net.core.wmem_max = net.core.rmem_max = 212992`), the kernel
+clamps the requested option above at `wmem_max`/`rmem_max` and floors the
+doubled accounting value below at `SOCK_MIN_SNDBUF`/`SOCK_MIN_RCVBUF`:
+`getsockopt()` returns the authoritative `granted_raw_bytes` kernel option value
+(`max(2 * min(requested, sysctl_max), SOCK_MIN_*)`, e.g., `425984` when capped at
+`212992`), while `granted_bytes` reports the normalized Linux option value
+(`granted_raw_bytes / 2`, e.g., `212992`). Because `getsockopt()` returns the
+unchanged socket option even when `setsockopt()` fails, `granted_bytes` only
+reflects the applied grant when `setsockopt_errno == 0 && getsockopt_errno == 0`,
+and `granted_raw_bytes` plus the errno fields remain authoritative. In addition,
+`SO_RCVBUF` has no queueing effect on `AF_UNIX` `SOCK_SEQPACKET` beyond the sender
+buffer. Whenever `short_grant()` (`setsockopt_errno == 0 && getsockopt_errno == 0
+&& granted_bytes < requested_bytes`) or a socket option error occurs,
+`video_socket_buffer` records the raw and normalized option counts alongside a
+non-fatal `video_socket_buffer_warning` event. Extra IPC burst headroom above
+`212992` bytes is not available on stock sysctls and requires an explicit
+administrator setting such as `net.core.wmem_max=4194304` (4 MiB).
+
 ## Following PRs and qualification
 
 1. Implement/optimize and qualify the Jetson hardware decode path.

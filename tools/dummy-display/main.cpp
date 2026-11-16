@@ -275,6 +275,9 @@ int main(int argc, char** argv) {
     config.on_decode_completion = [&telemetry](const aa::consumer::DecodeCompletion& event) {
         static_cast<void>(telemetry.enqueue(aa::consumer::decode_completion_json(event)));
     };
+    config.on_diagnostic = [&telemetry](std::string line) {
+        static_cast<void>(telemetry.enqueue(std::move(line)));
+    };
 
     aa::display::qt_adapter::ProjectionWidget widget(sender, config.caps);
     widget.set_input_viewport(static_cast<std::uint16_t>(config.viewport.width),static_cast<std::uint16_t>(config.viewport.height));

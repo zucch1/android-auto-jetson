@@ -40,6 +40,7 @@ METHODS: Final[dict[str, tuple[str, str]]] = {
     "GetPairingComparison": ("t", "a{ss}"),
     "RespondPairingComparison": ("ttb", ""),
     "GetPairingCandidate": ("t", "a{ss}"),
+    "RequestIdrRecovery": ("", ""),
 }
 # name -> full signal argument signature
 SIGNALS: Final[dict[str, str]] = {

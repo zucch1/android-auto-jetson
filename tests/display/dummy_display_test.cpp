@@ -15,6 +15,7 @@
 #include <aa/display/TelemetryWriter.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/Contract.hpp>
+#include <aa/ipc/IdrRecovery.hpp>
 #include <aa/ipc/InputChannel.hpp>
 #include <aa/ipc/InputSocket.hpp>
 #include <aa/ipc/VideoTelemetry.hpp>
@@ -1738,6 +1739,7 @@ struct BackpressureDecoderState final {
     std::size_t closes{0};
     std::size_t live_sessions{0};
     std::size_t eofs{0};
+    aa::consumer::DecodeReport report{};
     std::vector<aa::consumer::DecodeConfig> opened_configs{};
     std::vector<aa::ipc::VideoAccessUnit> submissions{};
     std::vector<aa::ipc::VideoAccessUnit> accepted{};
@@ -1778,6 +1780,9 @@ public:
         }
         return std::size_t{0};
     }
+    [[nodiscard]] const aa::consumer::DecodeReport& report() const noexcept override {
+        return state_.report;
+    }
     void close() noexcept override { ++state_.closes; }
 
 private:
@@ -1810,7 +1815,10 @@ public:
         }
     }
 
-    [[nodiscard]] bool attach(const std::string& suffix, aa::ipc::NegotiatedLimits limits = {}) {
+    [[nodiscard]] bool attach(
+        const std::string& suffix, aa::ipc::NegotiatedLimits limits = {},
+        std::function<void(const std::string&)> on_diagnostic = {},
+        std::function<std::chrono::steady_clock::time_point()> clock = {}) {
         service = ServiceHarness::start();
         if (!service) {
             return false;
@@ -1820,9 +1828,12 @@ public:
             return false;
         }
         client.emplace(std::move(connected.value()));
+        auto config = test_config(suffix);
+        config.on_diagnostic = std::move(on_diagnostic);
+        config.clock = std::move(clock);
         auto attached = DisplayController::attach(
             DisplayController::Deps{client.value(), backpressure_factory(decoder), frames},
-            test_config(suffix));
+            std::move(config));
         if (!attached.has_value()) {
             return false;
         }
@@ -3078,4 +3089,277 @@ TEST(DummyDisplayContractRender, NegotiatedFrameDimensionsReplaceLegacyDisplaySi
     widget.on_frame(frame);
     static_cast<void>(widget.grab());
     EXPECT_EQ(widget.frames_painted(),1u);
+}
+
+TEST(DummyDisplayBackpressure, ConsumerAwaitingIdrTriggersRateLimitedDbusRecoveryAndEmitsLatency) {
+    std::vector<std::string> diagnostics;
+    auto now = std::chrono::steady_clock::time_point{std::chrono::seconds{20}};
+    BackpressureFixture fixture;
+    ASSERT_TRUE(fixture.attach(
+        "ConsumerIdrRecovery", {},
+        [&diagnostics](const std::string& line) { diagnostics.push_back(line); },
+        [&now] { return now; }));
+
+    aa::ipc::VideoAccessUnit idr{1, 10, kTimestampBaseNs, true, {0, 0, 1, 0x65, 0x11}};
+    idr.profile = VideoProfile{1920, 1080, 60};
+    ASSERT_TRUE(fixture.start({idr}, /*keep_open=*/true));
+
+    // Pump until initial IDR is consumed; verify consumer socket buffer diagnostic emitted.
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{50}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+    EXPECT_GE(std::count_if(diagnostics.begin(), diagnostics.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_socket_buffer\"") != std::string::npos &&
+               s.find("\"side\":\"consumer\"") != std::string::npos;
+    }), 1);
+
+    // Enter awaiting_idr: DisplayController requests IDR over D-Bus immediately.
+    fixture.decoder.report.awaiting_idr = true;
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_TRUE(fixture.service->service->service().consume_idr_recovery_request());
+    EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
+                        "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}"),
+              diagnostics.end());
+
+    // Inside 250 ms cooldown window: no duplicate D-Bus request.
+    now += std::chrono::milliseconds{100};
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+
+    // At +250 ms: second IDR request is sent.
+    now += std::chrono::milliseconds{150};
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_TRUE(fixture.service->service->service().consume_idr_recovery_request());
+
+    // Decode exits awaiting_idr after IDR delivery: idr_recovered emits total latency.
+    now += std::chrono::milliseconds{150};
+    fixture.decoder.report.awaiting_idr = false;
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
+                        "{\"event\":\"idr_recovered\",\"source\":\"consumer\",\"latency_ms\":400,\"episode_requests\":2,\"total_requests\":2}"),
+              diagnostics.end());
+
+    // Episode 2 starts only 50 ms after the last request (+250 ms): 250 ms cooldown holds across episodes.
+    now += std::chrono::milliseconds{50};
+    fixture.decoder.report.awaiting_idr = true;
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+
+    // At +250 ms from episode 1's last request (+50 + 50 ms here), episode 2 sends its first request.
+    now += std::chrono::milliseconds{50};
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_TRUE(fixture.service->service->service().consume_idr_recovery_request());
+
+    now += std::chrono::milliseconds{100};
+    fixture.decoder.report.awaiting_idr = false;
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
+                        "{\"event\":\"idr_recovered\",\"source\":\"consumer\",\"latency_ms\":150,\"episode_requests\":1,\"total_requests\":3}"),
+              diagnostics.end());
+
+    if (fixture.live_producer.has_value()) {
+        fixture.live_producer->close();
+    }
+    ASSERT_TRUE(fixture.finish_feeding());
+}
+
+TEST(DummyDisplayBackpressure, ConsumerRequestsIdrWhenWaitingPastStartupGraceBeforeFirstUnit) {
+    std::vector<std::string> diagnostics;
+    auto now = std::chrono::steady_clock::time_point{std::chrono::seconds{30}};
+    BackpressureFixture fixture;
+    ASSERT_TRUE(fixture.attach(
+        "ConsumerStartupGrace", {},
+        [&diagnostics](const std::string& line) { diagnostics.push_back(line); },
+        [&now] { return now; }));
+
+    // Phone sent no IDR to this consumer yet (e.g., initial IDR arrived before attach).
+    ASSERT_TRUE(fixture.start({}, /*keep_open=*/true));
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+
+    // At kIdrStartupGrace - 1 ms, still inside grace window: no request.
+    now += aa::ipc::kIdrStartupGrace - std::chrono::milliseconds{1};
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+
+    // At exact kIdrStartupGrace (+1 ms): emits the startup-grace IDR request.
+    now += std::chrono::milliseconds{1};
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_TRUE(fixture.service->service->service().consume_idr_recovery_request());
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"video_consumer_waiting_idr\"}"),
+              1);
+
+    // Repeated same-time pump() is rate-limited and emits no second request.
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"video_consumer_waiting_idr\"}"),
+              1);
+
+    if (fixture.live_producer.has_value()) {
+        fixture.live_producer->close();
+    }
+    ASSERT_TRUE(fixture.finish_feeding());
+}
+
+TEST(DummyDisplayBackpressure, InitialIdrBeforeStartupGraceClearsWaitingState) {
+    std::vector<std::string> diagnostics;
+    auto now = std::chrono::steady_clock::time_point{std::chrono::seconds{40}};
+    BackpressureFixture fixture;
+    ASSERT_TRUE(fixture.attach(
+        "ConsumerPreGraceIdr", {},
+        [&diagnostics](const std::string& line) { diagnostics.push_back(line); },
+        [&now] { return now; }));
+
+    aa::ipc::VideoAccessUnit idr{1, 10, kTimestampBaseNs, true, {0, 0, 1, 0x65, 0x11}};
+    idr.profile = VideoProfile{1920, 1080, 60};
+    ASSERT_TRUE(fixture.start({idr}, /*keep_open=*/true));
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{50}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+
+    now += aa::ipc::kIdrStartupGrace + std::chrono::seconds{1};
+    ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
+    EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"video_consumer_waiting_idr\"}"),
+              0);
+
+    if (fixture.live_producer.has_value()) {
+        fixture.live_producer->close();
+    }
+    ASSERT_TRUE(fixture.finish_feeding());
+}
+
+TEST(DummyDisplayBackpressure, ConsumerSuppressesIdrRecoveryWhenNotProjecting) {
+    OwnedRuntime runtime;
+    ASSERT_FALSE(runtime.path().empty());
+    ScriptedReceiver::Script script{};
+    script["StartProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    script["StopProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::error}};
+    script["GetState"] = {ScriptedReply{.consumer = 1, .projecting = true}};
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+
+    auto server_socket = aa::ipc::video_socket_path_in(runtime.path());
+    auto server = aa::ipc::VideoServer::listen(
+        server_socket, aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
+    ASSERT_TRUE(server.has_value());
+    std::optional<aa::ipc::VideoProducer> producer;
+    std::thread acceptor([&] {
+        auto accepted = server.value().accept_consumer(Milliseconds{5000});
+        if (accepted.has_value()) {
+            producer.emplace(std::move(accepted.value()));
+        }
+    });
+
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+    BackpressureDecoderState decoder{};
+    RecordingFrameTarget frames{};
+    auto config = test_config("ConsumerSuppressIdr");
+    auto controller = DisplayController::attach(
+        DisplayController::Deps{client.value(), backpressure_factory(decoder), frames},
+        std::move(config));
+    ASSERT_TRUE(controller.has_value());
+    ASSERT_TRUE(controller.value().start_projection(server_socket).has_value());
+    acceptor.join();
+    ASSERT_TRUE(producer.has_value());
+
+    // StopProjection fails -> state becomes DisplayState::stop_failed (not projecting).
+    ASSERT_FALSE(controller.value().stop_projection().has_value());
+    ASSERT_EQ(controller.value().state(), DisplayState::stop_failed);
+
+    decoder.report.awaiting_idr = true;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 0u);
+
+    producer->close();
+    controller.value().shutdown();
+    server.value().close();
+}
+
+TEST(DummyDisplayBackpressure, ConsumerThrottlesPersistentDbusIdrRecoveryFailure) {
+    OwnedRuntime runtime;
+    ASSERT_FALSE(runtime.path().empty());
+    ScriptedReceiver::Script script{};
+    script["StartProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    script["RequestIdrRecovery"] = {
+        ScriptedReply{.kind = ScriptedReply::Kind::error},
+        ScriptedReply{.kind = ScriptedReply::Kind::error},
+        ScriptedReply{.kind = ScriptedReply::Kind::ok},
+    };
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+
+    auto server_socket = aa::ipc::video_socket_path_in(runtime.path());
+    auto server = aa::ipc::VideoServer::listen(
+        server_socket, aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
+    ASSERT_TRUE(server.has_value());
+    std::optional<aa::ipc::VideoProducer> producer;
+    std::thread acceptor([&] {
+        auto accepted = server.value().accept_consumer(Milliseconds{5000});
+        if (accepted.has_value()) {
+            producer.emplace(std::move(accepted.value()));
+        }
+    });
+
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+    BackpressureDecoderState decoder{};
+    RecordingFrameTarget frames{};
+    auto now = std::chrono::steady_clock::time_point{std::chrono::seconds{50}};
+    std::vector<std::string> diagnostics;
+    auto config = test_config("ConsumerDbusFailThrottle");
+    config.on_diagnostic = [&diagnostics](const std::string& line) {
+        diagnostics.push_back(line);
+    };
+    config.clock = [&now] { return now; };
+    auto controller = DisplayController::attach(
+        DisplayController::Deps{client.value(), backpressure_factory(decoder), frames},
+        std::move(config));
+    ASSERT_TRUE(controller.has_value());
+    ASSERT_TRUE(controller.value().start_projection(server_socket).has_value());
+    acceptor.join();
+    ASSERT_TRUE(producer.has_value());
+
+    // Enter awaiting_idr: first D-Bus call fails; 24 pumps within 250 ms make no extra calls.
+    decoder.report.awaiting_idr = true;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 1u);
+    for (int i = 0; i < 24; ++i) {
+        now += std::chrono::milliseconds{10};
+        ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    }
+    EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 1u);
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}"),
+              0);
+
+    // At +250 ms: second D-Bus call runs (and fails).
+    now += std::chrono::milliseconds{10};
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 2u);
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}"),
+              0);
+
+    // After the 2nd-failure backoff elapses (+500 ms), the 3rd attempt succeeds and counters
+    // remain unpolluted by the two failed calls.
+    now += std::chrono::milliseconds{500};
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 3u);
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}"),
+              1);
+
+    now += std::chrono::milliseconds{50};
+    decoder.report.awaiting_idr = false;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
+                        "{\"event\":\"idr_recovered\",\"source\":\"consumer\",\"latency_ms\":800,\"episode_requests\":1,\"total_requests\":1}"),
+              diagnostics.end());
+
+    producer->close();
+    controller.value().shutdown();
+    server.value().close();
 }

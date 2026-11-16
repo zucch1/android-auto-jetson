@@ -36,6 +36,33 @@ inline constexpr std::size_t kMaxDatagramPayload = 16UL * 1024;
 inline constexpr std::size_t kMaxAccessUnitBytes = 4UL * 1024 * 1024;
 inline constexpr std::size_t kFrameHeaderBytes = 56;
 inline constexpr int kSocketBudgetBytes = 256 * 1024;
+inline constexpr std::uint32_t kMinSocketBufferBytes = 256U * 1024U;
+inline constexpr std::uint32_t kMaxSocketBufferBytes = 4U * 1024U * 1024U;
+
+struct SocketBufferResult final {
+    std::uint32_t requested_bytes{};
+    // Authoritative raw `getsockopt()` kernel option value (Linux typically
+    // returns `2 * clamped`, subject to `SOCK_MIN_SNDBUF`/`SOCK_MIN_RCVBUF`
+    // floors and `net.core.wmem_max`/`rmem_max` ceilings).
+    std::uint32_t granted_raw_bytes{};
+    // Normalized Linux option value (`granted_raw_bytes / 2`) for comparison
+    // with `requested_bytes`; only reflects the applied grant when
+    // `setsockopt_errno == 0 && getsockopt_errno == 0` (`granted_raw_bytes` and
+    // the errno fields remain authoritative, not a guaranteed capacity).
+    std::uint32_t granted_bytes{};
+    int setsockopt_errno{0};
+    int getsockopt_errno{0};
+
+    [[nodiscard]] constexpr bool short_grant() const noexcept {
+        return setsockopt_errno == 0 && getsockopt_errno == 0 && granted_bytes < requested_bytes;
+    }
+    [[nodiscard]] constexpr bool has_warning() const noexcept {
+        return setsockopt_errno != 0 || getsockopt_errno != 0 || short_grant();
+    }
+
+    [[nodiscard]] friend constexpr bool operator==(const SocketBufferResult&,
+                                                   const SocketBufferResult&) noexcept = default;
+};
 
 // Protocol version carried in every record (task-10 layout, header offset 4).
 // A record with a different version is rejected protocol_version_mismatch.
@@ -141,5 +168,8 @@ negotiate_limits(const NegotiatedLimits& local, const NegotiatedLimits& peer) no
 // transport_unauthorized_peer on any mismatch.
 [[nodiscard]] core::Result<PeerCredentials>
 authorize_peer(const PeerCredentials& peer, std::uint32_t expected_uid) noexcept;
+
+[[nodiscard]] std::uint32_t
+recommended_socket_buffer_bytes(const protocol::VideoProfile& profile) noexcept;
 
 } // namespace aa::ipc
