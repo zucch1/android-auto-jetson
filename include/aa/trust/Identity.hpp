@@ -41,6 +41,7 @@
 
 #include <aa/core/Result.hpp>
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -120,6 +121,12 @@ inline constexpr std::size_t kMaxIdentityFieldBytes = 512;
 enum class WiredKeyClass { not_wired, serial_bound, port_only, malformed };
 
 [[nodiscard]] WiredKeyClass classify_wired_key(std::string_view key) noexcept;
+
+// The pre-switch USB serial (iSerialNumber; on Android the adb serial) of a
+// canonical "w1:" key, or nullopt for any other key. The qualification
+// receiver uses it to pin a run to one physical phone (#137); the value is a
+// raw identifier, so never log it.
+[[nodiscard]] std::optional<std::string> wired_key_usb_serial(std::string_view key);
 
 // Trust-matching key (#133). A serial-bound wired key matches on the PHONE
 // (descriptor ids + USB serial + AOA identity), not on the port: the port

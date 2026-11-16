@@ -31,6 +31,11 @@ Env knobs for the test:
                          (BLOCKED), never fabricate a 0. Without the knob the
                          fields are absent and the collector keeps them null
                          -> BLOCKED (fail closed).
+  --require-usb-serial S emulates the receiver's same-phone pin (#137):
+  FAKE_RECEIVER_ATTACHED_SERIAL (default S) is the phone on the port. A
+  different one fails the first link (err code phone_serial_mismatch, exit 3,
+  before ready); FAKE_RECEIVER_SWAP_AFTER_MS swaps in "OTHERPHONE9" after
+  that long, so the reconnect fails the same way (exit 1).
 """
 from __future__ import annotations
 
@@ -63,9 +68,25 @@ def _duration_ms(argv: list[str]) -> int:
     return DEFAULT_MS
 
 
+def _option(argv: list[str], name: str) -> str | None:
+    for index, token in enumerate(argv):
+        if token == name and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
+MISMATCH = '{"event":"err","detail":"link","code":"phone_serial_mismatch"}'
+
+
 def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     duration_ms = _duration_ms(sys.argv[1:])
+    required = _option(sys.argv[1:], "--require-usb-serial")
+    attached = os.environ.get("FAKE_RECEIVER_ATTACHED_SERIAL", required or "")
+    swap_after = os.environ.get("FAKE_RECEIVER_SWAP_AFTER_MS")
+    if required is not None and attached != required:
+        print(MISMATCH, flush=True)
+        return 3
     grow = os.environ.get("FAKE_RECEIVER_GROW") == "1"
     crash = os.environ.get("FAKE_RECEIVER_CRASH") == "1"
     media_timing = os.environ.get("FAKE_RECEIVER_MEDIA_TIMING") == "1"
@@ -87,6 +108,10 @@ def main() -> int:
         tick += 1
         if crash and (time.monotonic() - start) > 0.6:
             return 2
+        if (required is not None and swap_after is not None
+                and (time.monotonic() - start) * 1000 >= int(swap_after)):
+            print(MISMATCH, flush=True)  # the reconnect found another phone
+            return 1
         if grow and tick % 2 == 0:
             ballast.append(bytearray(256 * 1024))
         if tick % 5 == 0:

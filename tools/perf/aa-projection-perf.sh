@@ -485,7 +485,8 @@ blocked_type=""
 if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port '${PORT}' \
         --duration-seconds ${duration_secs} --interval ${INTERVAL} \
         ${THERMAL_POLICY:+--thermal-policy '${THERMAL_POLICY}'} \
-        ${DISPLAY_BIN:+--display '${DISPLAY_BIN}'} ${STORE:+--store '${STORE}'}${build_args_remote}" \
+        ${DISPLAY_BIN:+--display '${DISPLAY_BIN}'} ${STORE:+--store '${STORE}'}${build_args_remote} \
+        ${verified_serial:+--phone-serial '${verified_serial}'}" \
         <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err"; then
     # The on-target collector refuses to start a stage from an unoptimized build
     # or from binaries another build produced; report each as its own BLOCKED
@@ -495,6 +496,14 @@ if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port
         echo "BLOCKED: build_dir_mismatch" >&2
         sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
         blocked_result "build_dir_mismatch" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        exit 3
+    fi
+    # The receiver saw another phone than the gate verified, at the first link
+    # or a reconnect (the identity is bound where the port is used, #137).
+    if grep -q '^error: phone_identity_mismatch:' "$BUFFER/collector.err"; then
+        echo "BLOCKED: phone_identity_mismatch" >&2
+        sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
+        blocked_result "phone_identity_mismatch" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
         exit 3
     fi
     if grep -q '^error: unoptimized_build:' "$BUFFER/collector.err"; then

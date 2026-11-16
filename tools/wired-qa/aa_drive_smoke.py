@@ -244,8 +244,13 @@ def window_means(pairs: list[tuple[int, float]], start_ns: int, end_ns: int,
                  width_s: float) -> tuple[float, float] | None:
     """(min, max) sample mean over every full half-open window [t, t+width) in the drive.
 
-    Windows are anchored on paint completion and slide through every point where
-    a pair enters or leaves; windows without pairs have no mean.
+    Windows are anchored on paint completion. A window is ``[t, t + width)``:
+    a pair completed exactly at ``t`` is inside, one exactly at ``t + width`` is
+    not. Only full windows inside the drive count: ``start_ns <= t`` and
+    ``t + width <= end_ns``. A window's membership is constant between change
+    points, so evaluating ``start_ns`` and every change point visits every
+    distinct window: a pair at ``p`` enters at ``t = p - width + 1`` and leaves
+    at ``t = p + 1`` (integer nanoseconds). Windows without pairs have no mean.
     """
     width = int(width_s * 10**9)
     if not pairs or end_ns - start_ns < width:
@@ -256,8 +261,10 @@ def window_means(pairs: list[tuple[int, float]], start_ns: int, end_ns: int,
         prefix.append(prefix[-1] + skew)
     latest = end_ns - width
     candidates = {start_ns}
-    candidates.update(t for t in times if start_ns <= t <= latest)
-    candidates.update(t - width + 1 for t in times if start_ns <= t - width + 1 <= latest)
+    for p in times:
+        for t in (p - width + 1, p + 1):  # p enters / p leaves
+            if start_ns <= t <= latest:
+                candidates.add(t)
     low, high = None, None
     for t in candidates:
         i, j = bisect.bisect_left(times, t), bisect.bisect_left(times, t + width)

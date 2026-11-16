@@ -135,8 +135,9 @@ relaunch was chosen over the alternatives because it is the only one that
 works with any player and any clip using what the runner already has: VIEW
 intents carry no portable loop option (VLC and Samsung's player differ), and
 the host cannot check a clip's length on the phone without extra tooling. A
-clip that ends, as the S24's MP3 did at 243 s, is restarted. The coverage
-clause still judges what actually played, so restart gaps count against it.
+clip that ends is restarted. (In the S24 run of 2026-11-16, audio telemetry
+stopped at 243 s; why is unproven.) The coverage clause still judges what
+actually played, so restart gaps count against it.
 
 ```bash
 HU_KEY_PATH=<credential path> tools/wired-qa/aa_drive_smoke.py run \
@@ -192,9 +193,13 @@ three clauses and coverage must pass.
   invalidates the whole A/V metric for such a slot.
 - **5 s mean (a):** for every full half-open window `[t, t + 5 s)` inside the
   drive `[first paint, first paint + duration]`, the sample mean of the skews of
-  pairs whose paint completed inside it. The sweep visits every point where a
-  pair enters or leaves a window. Windows without pairs have no mean; missing
-  audio is judged by coverage.
+  pairs whose paint completed inside it: a pair exactly at `t` is inside, one
+  exactly at `t + 5 s` is not, and only full windows inside the drive count.
+  The sweep evaluates the drive start and every change point, where a pair
+  enters (`t = p − 5 s + 1 ns`) or leaves (`t = p + 1 ns`), so every distinct
+  window is visited. A window with a single pair has that pair's skew as its
+  mean. Windows without pairs have no mean; missing audio is judged by
+  coverage.
 - **Coverage:** the duration of the union of the valid audio slots' scheduled
   intervals, intersected with the drive `[first paint, first paint +
   duration]`, divided by the drive length. It shows that valid audio telemetry
@@ -271,7 +276,17 @@ the target, and requires:
   must be attached on `--port` of the target (`adb devices -l` shows it as
   `device` with `usb:<port>`), and must equal the record's `phone_serial`.
   Soaks run on a test phone, normally the A26, so a smoke from another phone
-  (including the owner's) never unlocks them;
+  (including the owner's) never unlocks them. That adb check is only a fast
+  pre-check: a phone swapped in after it would otherwise be measured. **The
+  identity is bound where the port is used.** The launcher hands the verified
+  serial to the on-target collector, which starts the receiver with
+  `--require-usb-serial`. The receiver checks the admitted link's pre-switch USB
+  serial (on Android, the adb serial) at the first link and at every reconnect,
+  before the link carries a session. Another phone makes it log `err` code
+  `phone_serial_mismatch` and stop; the collector then emits no capture, and
+  the stage is `BLOCKED phone_identity_mismatch`. A mid-stage reconnect from a
+  different phone was already refused by the receiver's same-key rule; it now
+  gets this named reason too;
 - **the default configuration**: the record's `configuration` (flags beyond
   the harness's own sockets, port, store, lifetime and control channel, plus
   the receiver and display decoder and the presentation mode) must be the
@@ -295,7 +310,9 @@ Otherwise the stage is `BLOCKED` with `drive_smoke_missing`,
 `drive_smoke_malformed`, `drive_smoke_hash_failed`, `drive_smoke_not_passed`,
 `drive_smoke_build_mismatch`, `drive_smoke_phone_unverified`,
 `drive_smoke_phone_mismatch`, `drive_smoke_configuration`,
-`drive_smoke_profile`, `drive_smoke_short` or `drive_smoke_stale`. Offline `--capture` replay and
+`drive_smoke_profile`, `drive_smoke_short` or `drive_smoke_stale`; and a stage
+whose receiver found another phone on the port is `BLOCKED
+phone_identity_mismatch`. Offline `--capture` replay and
 `--readiness-only` do not need a record.
 
 Gate budget (one gate out for each gate in): the **60 s soak stage is

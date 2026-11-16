@@ -7,6 +7,7 @@
 #include "fakes.hpp"
 
 #include <fstream>
+#include <optional>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -569,6 +570,27 @@ TEST(TrustStore, ApproveOnceSerialLessWiredKeyIsRejected) {
     EXPECT_FALSE(store.approve_once(strong).has_value());
     ASSERT_TRUE(store.approve(trust::TransportIdentity{test::kWired}).has_value());
     EXPECT_EQ(store.lookup(strong), trust::Decision::approved);
+}
+
+TEST(TrustStore, WiredKeyUsbSerialReadsOnlyCanonicalWiredKeys) {
+    // The qualification receiver pins a run to the pre-switch USB serial (#137).
+    EXPECT_EQ(trust::wired_key_usb_serial(trust::identity_key(trust::TransportIdentity{test::kWired})),
+              std::optional<std::string>{"SERIAL-42"});
+    // Length prefixes, not separators, delimit fields: ':' and digits inside survive.
+    trust::WiredIdentity tricky = test::kWired;
+    tricky.usb_vendor_id = "1:2";
+    tricky.usb_serial = "7:R5:X";
+    EXPECT_EQ(trust::wired_key_usb_serial(trust::identity_key(trust::TransportIdentity{tricky})),
+              std::optional<std::string>{"7:R5:X"});
+    // A port-only key has an empty USB serial; every non-canonical key has none.
+    EXPECT_EQ(trust::wired_key_usb_serial(
+                  trust::identity_key(trust::TransportIdentity{serial_less_wired()})),
+              std::optional<std::string>{""});
+    for (const std::string &key : {std::string{"b1:17:AA:BB:CC:DD:EE:FF4:hci0"}, std::string{"w1:4:18d1"},
+                                  std::string{"w1:04:18d14:4ee10:6:Google5:Pixel0:5:1-2.3"},
+                                  std::string{"opaque"}, std::string{}}) {
+        EXPECT_EQ(trust::wired_key_usb_serial(key), std::nullopt) << key;
+    }
 }
 
 TEST(TrustStore, WiredKeyClassificationFailsClosed) {

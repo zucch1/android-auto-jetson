@@ -25,6 +25,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SMOKE = ROOT / "tools" / "wired-qa" / "aa_drive_smoke.py"
 LAUNCHER = ROOT / "tools" / "perf" / "aa-projection-perf.sh"
+COLLECTOR = ROOT / "tools" / "perf" / "aa_projection_collect.py"
+PERF_FAKE_RECEIVER = ROOT / "tests" / "perf" / "fixtures" / "wired_perf" / "fake_receiver.py"
 sys.path.insert(0, str(SMOKE.parent))
 import aa_drive_smoke as smoke  # noqa: E402
 
@@ -261,6 +263,29 @@ class AnalyzerTests(unittest.TestCase):
         low, high = smoke.window_means(pairs, 0, 10 * S, 5)
         self.assertEqual((low, high), (2.0, 7.0))  # [0,5) -> 0..4 ; [5,10) -> 5..9
 
+    def test_window_means_visit_departures(self) -> None:
+        # The PR #151 review's counterexample: the full window [1 ns, 5 s + 1 ns)
+        # holds only the 80 ms pair, once the pair at 0 has left.
+        for sign in (1, -1):
+            with self.subTest(sign=sign):
+                pairs = [(0, 0.0), (2 * S, 80.0 * sign), (6 * S, 0.0)]
+                low, high = smoke.window_means(pairs, 0, 10 * S, 5)
+                self.assertEqual(high if sign > 0 else low, 80.0 * sign)
+        # Irregular spacing: the lone pair between two departures is still seen.
+        pairs = [(0, 10.0), (int(0.7 * S), 10.0), (int(3.1 * S), 90.0), (int(5.9 * S), 10.0)]
+        self.assertEqual(smoke.window_means(pairs, 0, 9 * S, 5)[1], 90.0)
+
+    def test_window_bounds_are_half_open_and_full_windows_only(self) -> None:
+        # A drive exactly one window long has the single window [0, 5 s): a pair
+        # at its start is inside, a pair exactly at 5 s is not.
+        self.assertEqual(smoke.window_means([(0, 10.0), (5 * S, 100.0)], 0, 5 * S, 5), (10.0, 10.0))
+        # One pair alone is a window mean of its own.
+        self.assertEqual(smoke.window_means([(2 * S, -33.0)], 0, 5 * S, 5), (-33.0, -33.0))
+        # A pair exactly on the last window's end is outside every full window.
+        self.assertIsNone(smoke.window_means([(5 * S, 100.0)], 0, 5 * S, 5))
+        # A drive shorter than a window has no full window.
+        self.assertIsNone(smoke.window_means([(S, 1.0)], 0, 4 * S, 5))
+
     def test_first_paint_latency_is_reported_not_gated(self) -> None:
         # Given the first paint 22 s after active (there is no first-paint deadline).
         run = Run()
@@ -494,6 +519,7 @@ class LauncherGateTests(unittest.TestCase):
     """The perf launcher refuses every live stage before the collector starts."""
 
     def launch(self, root: Path, *extra: str, fail_display_hash: bool = False,
+               swapped: bool = False,
                adb_line: str = f"{PHONE}              device usb:1-2.1 product:x model:FAKE",
                phone: str | None = PHONE) -> tuple[subprocess.CompletedProcess, str]:
         stub_dir = root / "bin"
@@ -503,7 +529,12 @@ class LauncherGateTests(unittest.TestCase):
         (stub_dir / "ssh").write_text(f'''#!/usr/bin/env bash
 printf '%s\\n' "$*" >> {str(log)!r}
 case "$*" in
-    *"python3 -"*) exit 1 ;;
+    *"python3 -"*) if [ -n "${{STUB_COLLECTOR_SWAPPED:-}}" ]; then
+                       printf '%s\\n' "$*" | grep -q -- "--phone-serial '{PHONE}'" || exit 1
+                       echo "error: phone_identity_mismatch: another phone on --port" >&2
+                       exit 2
+                   fi
+                   exit 1 ;;
     *sha256sum*aa-wired-receiver*) printf '%s  r\\n' {A}; exit 0 ;;
     *sha256sum*aa-dummy-display*) [ -n "${{FAIL_DISPLAY_HASH:-}}" ] && exit 1
                                   printf '%s  d\\n' {B}; exit 0 ;;
@@ -518,6 +549,8 @@ exit 0
                "STUB_ADB_LINE": adb_line}
         if fail_display_hash:
             env["FAIL_DISPLAY_HASH"] = "1"
+        if swapped:
+            env["STUB_COLLECTOR_SWAPPED"] = "1"
         process = subprocess.run(
             ["bash", str(LAUNCHER), "--mode", "wired", "--duration", "1800s",
              "--out", str(root / "out.json"),
@@ -583,6 +616,21 @@ exit 0
             self.assert_blocked(root, "drive_smoke_phone_unverified", "--drive-smoke", good,
                                 phone=None)
 
+    def test_swap_after_the_check_is_caught_where_the_port_is_used(self) -> None:
+        # Given the adb check passing for the soak phone, and then another phone
+        # on the port when the collector's receiver opens its link (emulated by
+        # the stub collector, which only reports it when it was handed the serial).
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:
+            root = Path(directory)
+            good = self.write(root, "good.json", record(datetime.now(timezone.utc)))
+            process, ssh = self.launch(root, "--drive-smoke", good, swapped=True)
+            # Then the verified serial was carried into the collector, and the
+            # stage is BLOCKED with its own reason.
+            self.assertEqual(process.returncode, 3, process.stderr)
+            self.assertIn(f"--phone-serial '{PHONE}'", ssh)
+            self.assertEqual(json.loads((root / "out.json").read_text())["blocked_on"],
+                             "phone_identity_mismatch", process.stderr)
+
     def test_matching_smoke_reaches_the_collector(self) -> None:
         with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:
             root = Path(directory)
@@ -593,6 +641,47 @@ exit 0
                              "collector_failed", process.stderr)
             self.assertIn("python3 -", ssh)
 
+
+
+class CollectorPhoneBindingTests(unittest.TestCase):
+    """The soak collector pins its receiver to the gate-verified phone (#137)."""
+
+    def collect(self, root: Path, *extra: str, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-B", str(COLLECTOR), "--receiver", str(PERF_FAKE_RECEIVER),
+             "--port", "1-2.1", "--duration-seconds", "3", "--interval", "1",
+             "--startup-timeout-seconds", "2", "--no-display", "--state-dir", str(root / "state"),
+             "--allow-unoptimized-build", *extra],
+            capture_output=True, text=True, timeout=120, check=False, env={**os.environ, **env})
+
+    def test_same_phone_collects(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="collector-phone-") as directory:
+            result = self.collect(Path(directory), "--phone-serial", PHONE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["schema"], "aa-projection-perf-capture/2")
+
+    def test_other_phone_at_the_first_link_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="collector-phone-") as directory:
+            result = self.collect(Path(directory), "--phone-serial", PHONE,
+                                  FAKE_RECEIVER_ATTACHED_SERIAL="OTHERPHONE9")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("error: phone_identity_mismatch:", result.stderr)
+        self.assertEqual(result.stdout, "", "no capture for a run on another phone")
+
+    def test_swap_mid_stage_is_refused(self) -> None:
+        # Given the soak phone at the start and another phone at a reconnect.
+        with tempfile.TemporaryDirectory(prefix="collector-phone-") as directory:
+            result = self.collect(Path(directory), "--phone-serial", PHONE,
+                                  FAKE_RECEIVER_SWAP_AFTER_MS="1500")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("error: phone_identity_mismatch:", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_without_a_serial_the_receiver_is_not_pinned(self) -> None:
+        # (The live launcher always passes one; offline/tooling runs need not.)
+        with tempfile.TemporaryDirectory(prefix="collector-phone-") as directory:
+            result = self.collect(Path(directory), FAKE_RECEIVER_ATTACHED_SERIAL="OTHERPHONE9")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 FAKE_RECEIVER = """#!/usr/bin/env python3
 import os, subprocess, time
