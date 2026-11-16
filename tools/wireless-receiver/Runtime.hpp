@@ -57,6 +57,15 @@ struct Runtime final {
             }
         }
         if ((!recovery_session || !recovery_session->outbound_in_progress()) &&
+            !media.video.idr_dispatching()) {
+            if (auto pending_video = media.video.service_pending(); !pending_video) {
+                report("video pending flush", pending_video.error().code());
+                if (auto* live = receiver.session(); live && !live->failure()) {
+                    (void)live->fail(pending_video.error());
+                }
+            }
+        }
+        if ((!recovery_session || !recovery_session->outbound_in_progress()) &&
             !media.video.idr_dispatching() && bus.service().consume_idr_recovery_request()) {
             const auto idr = media.video.request_idr_external("consumer_ipc");
             if (!idr) {
@@ -101,14 +110,14 @@ struct Runtime final {
         }
     }
     void defer() {
-        receiver.stop(); configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
+        receiver.stop(); media.video.reset(); configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
         retry = Clock::now() + backoff;
         backoff = std::min(backoff * 2, std::chrono::milliseconds{5000});
     }
     core::Result<void> admit(ipc::StateSnapshot state) {
         // Stop the previous epoch before synchronous, bounded helper operations:
         // there is no live admission lease while these calls run.
-        receiver.stop(); configured = nullptr;
+        receiver.stop(); media.video.reset(); configured = nullptr;
         if (auto result = receiver.reconnect(bus.service(), identity); !result) return result.error();
         auto status = helper.status(helper::Action::ap_status);
         if (!status) return status.error();
@@ -116,7 +125,7 @@ struct Runtime final {
             if (confirmation == std::numeric_limits<std::uint64_t>::max())
                 return Error{ErrorCode::invalid_argument};
             const helper::Source source{state.consumer.value, ++confirmation};
-            receiver.stop();
+            receiver.stop(); media.video.reset();
             const auto acquired = receiver.acquire_ap(bus.service(), source);
             if (!acquired) return acquired.error();
             // No reconnect here: acquisition owns the helper lease from now on.
@@ -136,12 +145,14 @@ struct Runtime final {
             const auto state = bus.service().state();
             const bool wants = state.consumer.value && state.projection == ipc::ProjectionState::projecting;
             if (wants && owner != state.consumer) {
-                receiver.stop(); configured = nullptr; owner = state.consumer; attempting = false;
+                receiver.stop(); media.video.reset(); configured = nullptr; owner = state.consumer; attempting = false;
                 acquisition.reset(); queued_input.clear();
                 retry = turn; backoff = std::chrono::milliseconds{250};
             }
             if (!wants && state.consumer.value) {
-                receiver.stop(); configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
+                receiver.stop();
+                if (configured || media.video.has_pending()) media.video.reset();
+                configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
             }
             if (wants && attempting && !receiver.session() && turn >= attempt_until) defer();
             if (wants && !receiver.session() && !attempting && turn >= retry) {
@@ -172,11 +183,18 @@ struct Runtime final {
                     if (!sent) { report("input forwarding", sent.error().code()); break; }
                 }
             }
-            // poll itself checkpoints blocking TCP I/O every 25ms. Never add a
-            // second full wait after a blocking poll; idle owner turns are 10ms.
-            std::this_thread::sleep_until(std::min(deadline, turn + std::chrono::milliseconds{10}));
+            // TcpTransport::poll_receive() is intentionally unsupported, so
+            // WirelessLink::poll() calls blocking session_->poll_transport(), which
+            // runs this checkpoint() on TcpIo's 25ms poll slices while TCP is idle.
+            // Thus when TCP is quiet, held video servicing/expiry runs on ~25ms
+            // checkpoint slices and can overshoot nominal max_age by up to ~25ms.
+            // Tightening the outer sleep from 10ms to 5ms while frames are held
+            // avoids adding a full idle sleep on non-blocked/active turns.
+            const auto poll_step = media.video.has_pending() ? std::chrono::milliseconds{5}
+                                                             : std::chrono::milliseconds{10};
+            std::this_thread::sleep_until(std::min(deadline, turn + poll_step));
         }
-        bus.service().shutdown(); receiver.stop();
+        bus.service().shutdown(); receiver.stop(); media.video.reset();
         log_line("{\"event\":\"stopping\"}");
         return failed ? 1 : 0;
     }

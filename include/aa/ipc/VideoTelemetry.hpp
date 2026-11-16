@@ -87,4 +87,26 @@ inline std::string video_socket_buffer_warning_json(std::string_view side,
            ",\"codec\":\"" + std::string{protocol::codec_name(profile.codec)} + "\"}";
 }
 
+inline std::string video_backpressure_held_json(std::size_t held_units,
+                                                std::size_t held_bytes,
+                                                std::int64_t age_ms,
+                                                std::size_t max_bytes,
+                                                std::int64_t max_age_ms) {
+    return std::string{"{\"event\":\"video_backpressure_held\",\"held_units\":"} +
+           std::to_string(held_units) +
+           ",\"held_bytes\":" + std::to_string(held_bytes) +
+           ",\"age_ms\":" + std::to_string(age_ms) +
+           ",\"max_bytes\":" + std::to_string(max_bytes) +
+           ",\"max_age_ms\":" + std::to_string(max_age_ms) + "}";
+}
+
+inline std::string video_backpressure_released_json(std::size_t held_units,
+                                                    std::size_t held_bytes,
+                                                    std::int64_t age_ms) {
+    return std::string{"{\"event\":\"video_backpressure_released\",\"held_units\":"} +
+           std::to_string(held_units) +
+           ",\"held_bytes\":" + std::to_string(held_bytes) +
+           ",\"age_ms\":" + std::to_string(age_ms) + "}";
+}
+
 } // namespace aa::ipc

@@ -1349,3 +1349,758 @@ TEST(WiredReceiver, VideoSelectionWatchdogEmitsOnceAfterTimeoutAndResets) {
     EXPECT_TRUE(watchdog.check(true, false, t0 + std::chrono::seconds{11} + kVideoSelectionWarningTimeout));
 }
 
+namespace {
+
+std::vector<std::byte> make_h265_au(bool idr, std::size_t payload_bytes, std::byte fill) {
+    std::vector<std::byte> bytes(std::max<std::size_t>(payload_bytes, 6U), fill);
+    bytes[0] = std::byte{0x00};
+    bytes[1] = std::byte{0x00};
+    bytes[2] = std::byte{0x01};
+    // H.265 NAL header: IRAP IDR_W_RADL (type 19 -> 0x26) vs TRAIL_R P-frame (type 1 -> 0x02).
+    bytes[3] = static_cast<std::byte>(idr ? 0x26U : 0x02U);
+    bytes[4] = std::byte{0x01};
+    return bytes;
+}
+
+std::vector<std::uint8_t> to_u8(const std::vector<std::byte>& src) {
+    std::vector<std::uint8_t> out;
+    out.reserve(src.size());
+    for (const auto b : src) {
+        out.push_back(std::to_integer<std::uint8_t>(b));
+    }
+    return out;
+}
+
+std::optional<aa::ipc::VideoAccessUnit> receive_complete_au(aa::ipc::VideoConsumer& consumer) {
+    for (int i = 0; i < 64; ++i) {
+        const auto step = consumer.receive(Milliseconds{500});
+        if (!step) {
+            return std::nullopt;
+        }
+        if (step.value() == aa::ipc::ReceiveStatus::complete) {
+            return consumer.access_unit();
+        }
+    }
+    return std::nullopt;
+}
+
+void drain_available_aus(aa::ipc::VideoConsumer& consumer,
+                         std::vector<aa::ipc::VideoAccessUnit>& out) {
+    for (;;) {
+        const auto step = consumer.receive(Milliseconds{0});
+        if (!step) {
+            break;
+        }
+        if (step.value() == aa::ipc::ReceiveStatus::complete) {
+            out.push_back(consumer.access_unit());
+        }
+    }
+}
+
+std::vector<std::byte> make_unique_h265_au(bool idr, std::size_t payload_bytes, std::uint8_t tag) {
+    auto bytes = make_h265_au(idr, payload_bytes, std::byte{tag});
+    for (std::size_t i = 5; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<std::byte>((tag + i * 17U) & 0xFFU);
+    }
+    return bytes;
+}
+
+} // namespace
+
+TEST(WiredReceiver, VideoOutletHoldsTransientBackpressureAcrossLargeIdrAndSmallAusInOrder) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{100}};
+    std::size_t idr_requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&steady_now] { return steady_now; },
+    });
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+
+    // Trigger EAGAIN once on the 1st datagram after the large ~214 KB IDR, then accept.
+    const auto profile = p::VideoProfile{2560, 1440, 60, p::VideoCodec::h265};
+    const auto large_idr = make_h265_au(true, 214 * 1024, std::byte{0x61});
+    const auto small_p1 = make_h265_au(false, 20 * 1024, std::byte{0x21});
+    const auto small_p2 = make_h265_au(false, 24 * 1024, std::byte{0x31});
+
+    const std::size_t idr_datagrams =
+        (large_idr.size() + aa::ipc::kMaxDatagramPayload - 1) / aa::ipc::kMaxDatagramPayload;
+    std::size_t call_index = 0;
+    bool block_once = false;
+    pair.value().producer.set_datagram_send_for_test(
+        [&](int fd, const void* buf, std::size_t len, int flags, int& out_errno) -> std::ptrdiff_t {
+            ++call_index;
+            if (call_index == idr_datagrams + 1 && !block_once) {
+                block_once = true;
+                out_errno = EAGAIN;
+                return -1;
+            }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+
+    outlet.install(std::move(pair.value().producer));
+
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {1'000'000}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+    ASSERT_TRUE(outlet.on_message({hdr, large_idr}));
+    EXPECT_FALSE(outlet.has_pending());
+
+    // First small P-frame immediately after the IDR sees one EAGAIN and is held.
+    steady_now += std::chrono::milliseconds{4};
+    hdr.sequence = 2;
+    hdr.timestamp = aa::core::Nanoseconds{16'666'667};
+    ASSERT_TRUE(outlet.on_message({hdr, small_p1}));
+    EXPECT_TRUE(block_once);
+    EXPECT_TRUE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 1U);
+    EXPECT_EQ(outlet.pending_bytes(), small_p1.size());
+    EXPECT_EQ(idr_requests, 0U);
+
+    // Next small P-frame arrives 16 ms later: fake socket accepts again, so
+    // P1 flushes cleanly ahead of P2, preserving strict AU order.
+    steady_now += std::chrono::milliseconds{16};
+    hdr.sequence = 3;
+    hdr.timestamp = aa::core::Nanoseconds{33'333'334};
+    ASSERT_TRUE(outlet.on_message({hdr, small_p2}));
+    EXPECT_FALSE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 0U);
+    EXPECT_EQ(outlet.pending_bytes(), 0U);
+    EXPECT_EQ(idr_requests, 0U);
+
+    // Zero drops and zero waiting_idr transitions; hold + release telemetry emitted.
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_dropped\"") != std::string::npos;
+    }), 0);
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_backpressure_held\"") != std::string::npos &&
+               s.find("\"held_units\":1") != std::string::npos;
+    }), logs.end());
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_backpressure_released\"") != std::string::npos &&
+               s.find("\"age_ms\":16") != std::string::npos;
+    }), logs.end());
+
+    const auto rx_idr = receive_complete_au(pair.value().consumer);
+    ASSERT_TRUE(rx_idr.has_value());
+    EXPECT_EQ(rx_idr->frame, 1U);
+    EXPECT_EQ(rx_idr->payload, to_u8(large_idr));
+
+    const auto rx_p1 = receive_complete_au(pair.value().consumer);
+    ASSERT_TRUE(rx_p1.has_value());
+    EXPECT_EQ(rx_p1->frame, 2U);
+    EXPECT_EQ(rx_p1->payload, to_u8(small_p1));
+
+    const auto rx_p2 = receive_complete_au(pair.value().consumer);
+    ASSERT_TRUE(rx_p2.has_value());
+    EXPECT_EQ(rx_p2->frame, 3U);
+    EXPECT_EQ(rx_p2->payload, to_u8(small_p2));
+
+    EXPECT_FALSE(pair.value().consumer.waiting_idr());
+    EXPECT_EQ(pair.value().consumer.rejected(), 0U);
+    EXPECT_EQ(pair.value().consumer.suppressed(), 0U);
+}
+
+TEST(WiredReceiver, VideoOutletRealSocketShortGrantHoldsAndReleasesWithoutDrop) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{150}};
+    std::size_t idr_requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&steady_now] { return steady_now; },
+    });
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    const int producer_fd = pair.value().producer.native_handle();
+    const int consumer_fd = pair.value().consumer.native_handle();
+    outlet.install(std::move(pair.value().producer));
+
+    struct ExpectedFrame final {
+        std::uint64_t frame{};
+        bool idr{};
+        std::vector<std::uint8_t> payload{};
+    };
+    std::vector<ExpectedFrame> expected;
+    std::vector<aa::ipc::VideoAccessUnit> received;
+
+    // Frame 1: small IDR establishes profile (configure_buffer_locked) and clears startup gate.
+    const auto profile = p::VideoProfile{2560, 1440, 60, p::VideoCodec::h265};
+    const auto initial_idr = make_unique_h265_au(true, 4 * 1024, 0x11U);
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+    ASSERT_TRUE(outlet.on_message({hdr, initial_idr}));
+    expected.push_back({1U, true, to_u8(initial_idr)});
+    drain_available_aus(pair.value().consumer, received);
+    ASSERT_EQ(received.size(), 1U);
+
+    // Shrink socket buffers to simulate a Jetson wmem_max short grant, then send a large
+    // recovery/refresh IDR (~128 KiB) that partially/mostly fills the short-granted socket,
+    // followed by distinct P-frames until real kernel EAGAIN occurs.
+    const int short_buf = 98304;
+    ASSERT_EQ(::setsockopt(producer_fd, SOL_SOCKET, SO_SNDBUF, &short_buf, sizeof(short_buf)), 0);
+    ASSERT_EQ(::setsockopt(consumer_fd, SOL_SOCKET, SO_RCVBUF, &short_buf, sizeof(short_buf)), 0);
+
+    std::uint64_t seq = 2;
+    const auto large_refresh_idr = make_unique_h265_au(true, 128 * 1024, 0x22U);
+    hdr.sequence = seq;
+    hdr.timestamp = aa::core::Nanoseconds{static_cast<std::int64_t>(seq) * 16'000'000};
+    ASSERT_TRUE(outlet.on_message({hdr, large_refresh_idr}));
+    expected.push_back({seq, true, to_u8(large_refresh_idr)});
+    ++seq;
+
+    for (unsigned i = 0; i < 32U && !outlet.has_pending(); ++i) {
+        steady_now += std::chrono::milliseconds{4};
+        const auto p_frame = make_unique_h265_au(false, 24 * 1024, static_cast<std::uint8_t>(0x30U + i));
+        hdr.sequence = seq;
+        hdr.timestamp = aa::core::Nanoseconds{static_cast<std::int64_t>(seq) * 16'000'000};
+        ASSERT_TRUE(outlet.on_message({hdr, p_frame}));
+        expected.push_back({seq, false, to_u8(p_frame)});
+        ++seq;
+    }
+    ASSERT_TRUE(outlet.has_pending());
+    // Queue one additional distinct P-frame while held to prove FIFO release across multiple units.
+    {
+        const auto extra_p = make_unique_h265_au(false, 16 * 1024, 0x7EU);
+        hdr.sequence = seq;
+        hdr.timestamp = aa::core::Nanoseconds{static_cast<std::int64_t>(seq) * 16'000'000};
+        ASSERT_TRUE(outlet.on_message({hdr, extra_p}));
+        expected.push_back({seq, false, to_u8(extra_p)});
+        ++seq;
+    }
+    EXPECT_GE(outlet.pending_units(), 2U);
+    EXPECT_EQ(idr_requests, 0U);
+
+    // Scripted draining + injected clock service_pending() without any sleeps.
+    for (int pump = 0; pump < 8; ++pump) {
+        drain_available_aus(pair.value().consumer, received);
+        if (!outlet.has_pending()) {
+            break;
+        }
+        steady_now += std::chrono::milliseconds{2};
+        ASSERT_TRUE(outlet.service_pending());
+    }
+    drain_available_aus(pair.value().consumer, received);
+
+    EXPECT_FALSE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 0U);
+    EXPECT_EQ(outlet.pending_bytes(), 0U);
+    EXPECT_EQ(idr_requests, 0U);
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_dropped\"") != std::string::npos;
+    }), 0);
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_backpressure_held\"") != std::string::npos;
+    }), logs.end());
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_backpressure_released\"") != std::string::npos;
+    }), logs.end());
+
+    ASSERT_EQ(received.size(), expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(received[i].frame, expected[i].frame) << "frame mismatch at index " << i;
+        EXPECT_EQ(received[i].idr, expected[i].idr) << "idr mismatch at index " << i;
+        EXPECT_EQ(received[i].payload, expected[i].payload) << "payload mismatch at index " << i;
+    }
+    EXPECT_FALSE(pair.value().consumer.waiting_idr());
+    EXPECT_EQ(pair.value().consumer.rejected(), 0U);
+    EXPECT_EQ(pair.value().consumer.suppressed(), 0U);
+    EXPECT_EQ(pair.value().consumer.resyncs(), 1U);
+}
+
+TEST(WiredReceiver, VideoOutletSustainedBackpressureOverflowEntersWaitingIdrAndRequestsIdr) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{200}};
+    std::size_t idr_requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&steady_now] { return steady_now; },
+    });
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+
+    bool force_would_block = false;
+    pair.value().producer.set_datagram_send_for_test(
+        [&force_would_block](int fd, const void* buf, std::size_t len, int flags,
+                             int& out_errno) -> std::ptrdiff_t {
+            if (force_would_block) {
+                out_errno = EAGAIN;
+                return -1;
+            }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+    outlet.install(std::move(pair.value().producer));
+
+    const auto profile = p::VideoProfile{1920, 1080, 60, p::VideoCodec::h265};
+    const auto budget = aa::ipc::recommended_backpressure_budget(profile); // 486,000 B, 50 ms
+    const auto idr = make_h265_au(true, 16 * 1024, std::byte{0x10});
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+    ASSERT_TRUE(outlet.on_message({hdr, idr}));
+    ASSERT_TRUE(receive_complete_au(pair.value().consumer).has_value());
+
+    // Stall socket indefinitely and push 100 KB P-frames until byte budget overflows.
+    force_would_block = true;
+    const auto chunk = make_h265_au(false, 100 * 1024, std::byte{0x22});
+    std::uint64_t seq = 2;
+    for (int i = 0; i < 4; ++i) {
+        hdr.sequence = seq++;
+        hdr.timestamp = aa::core::Nanoseconds{static_cast<std::int64_t>(seq) * 16'000'000};
+        ASSERT_TRUE(outlet.on_message({hdr, chunk}));
+        EXPECT_LE(outlet.pending_bytes(), budget.max_bytes);
+        EXPECT_EQ(idr_requests, 0U);
+    }
+    EXPECT_EQ(outlet.pending_units(), 4U);
+    EXPECT_EQ(outlet.pending_bytes(), 400U * 1024U);
+
+    // 5th 100 KB P-frame exceeds 486,000 B bound -> drop, backpressure IDR request, waiting_idr.
+    hdr.sequence = seq++;
+    hdr.timestamp = aa::core::Nanoseconds{static_cast<std::int64_t>(seq) * 16'000'000};
+    ASSERT_TRUE(outlet.on_message({hdr, chunk}));
+    EXPECT_FALSE(outlet.has_pending());
+    EXPECT_EQ(idr_requests, 1U);
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_dropped\",\"reason\":\"backpressure\"") != std::string::npos;
+    }), logs.end());
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_requested\",\"source\":\"producer\",\"reason\":\"backpressure\"}"),
+              logs.end());
+
+    // Next P-frame while socket is now writable is suppressed as waiting_idr until fresh IDR arrives.
+    force_would_block = false;
+    hdr.sequence = seq++;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(false, 1024, std::byte{0x33})}));
+    const auto none = pair.value().consumer.receive(Milliseconds{0});
+    EXPECT_FALSE(none);
+
+    steady_now += std::chrono::milliseconds{80};
+    hdr.sequence = seq++;
+    ASSERT_TRUE(outlet.on_message({hdr, idr}));
+    const auto recovered = receive_complete_au(pair.value().consumer);
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_TRUE(recovered->idr);
+}
+
+TEST(WiredReceiver, VideoOutletResetAndConsumerReplacementClearHeldAccessUnits) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{300}};
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({[] { return true; }, {}, [&steady_now] { return steady_now; }});
+
+    auto pair1 = videotest::make_pair({});
+    ASSERT_TRUE(pair1);
+    bool force_would_block = false;
+    pair1.value().producer.set_datagram_send_for_test(
+        [&force_would_block](int fd, const void* buf, std::size_t len, int flags,
+                             int& out_errno) -> std::ptrdiff_t {
+            if (force_would_block) {
+                out_errno = EAGAIN;
+                return -1;
+            }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+    outlet.install(std::move(pair1.value().producer));
+
+    const auto profile = p::VideoProfile{2560, 1440, 60, p::VideoCodec::h265};
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(true, 1024, std::byte{0x10})}));
+    ASSERT_TRUE(receive_complete_au(pair1.value().consumer).has_value());
+
+    // 1) Reset clears held AUs and must not deliver old held frames when stream resumes.
+    force_would_block = true;
+    hdr.sequence = 2;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(false, 2048, std::byte{0xaa})}));
+    hdr.sequence = 3;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(false, 2048, std::byte{0xbb})}));
+    EXPECT_EQ(outlet.pending_units(), 2U);
+    EXPECT_EQ(outlet.pending_bytes(), 4096U);
+
+    outlet.reset();
+    EXPECT_FALSE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 0U);
+    EXPECT_EQ(outlet.pending_bytes(), 0U);
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_backpressure_released\"") != std::string::npos;
+    }), 0);
+
+    force_would_block = false;
+    const auto fresh_idr_after_reset = make_h265_au(true, 1024, std::byte{0x55});
+    hdr.sequence = 4;
+    hdr.video_session = 2;
+    ASSERT_TRUE(outlet.on_message({hdr, fresh_idr_after_reset}));
+    const auto after_reset = receive_complete_au(pair1.value().consumer);
+    ASSERT_TRUE(after_reset.has_value());
+    EXPECT_EQ(after_reset->payload, to_u8(fresh_idr_after_reset));
+
+    // 2) Consumer replacement clears held AUs queued for the prior consumer.
+    force_would_block = true;
+    hdr.sequence = 5;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(false, 2048, std::byte{0xcc})}));
+    EXPECT_EQ(outlet.pending_units(), 1U);
+
+    auto pair2 = videotest::make_pair({});
+    ASSERT_TRUE(pair2);
+    outlet.install(std::move(pair2.value().producer));
+    EXPECT_FALSE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 0U);
+    EXPECT_EQ(outlet.pending_bytes(), 0U);
+
+    const auto replacement_idr = make_h265_au(true, 1024, std::byte{0x77});
+    hdr.sequence = 6;
+    ASSERT_TRUE(outlet.on_message({hdr, replacement_idr}));
+    const auto got2 = receive_complete_au(pair2.value().consumer);
+    ASSERT_TRUE(got2.has_value());
+    EXPECT_EQ(got2->payload, to_u8(replacement_idr));
+}
+
+TEST(WiredReceiver, VideoOutletBackpressureAgeBoundUsesInjectedClock) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{400}};
+    std::size_t idr_requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&steady_now] { return steady_now; },
+    });
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    bool force_would_block = false;
+    pair.value().producer.set_datagram_send_for_test(
+        [&force_would_block](int fd, const void* buf, std::size_t len, int flags,
+                             int& out_errno) -> std::ptrdiff_t {
+            if (force_would_block) {
+                out_errno = EAGAIN;
+                return -1;
+            }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+    outlet.install(std::move(pair.value().producer));
+
+    const auto profile = p::VideoProfile{2560, 1440, 60, p::VideoCodec::h265};
+    const auto budget = aa::ipc::recommended_backpressure_budget(profile);
+    ASSERT_EQ(budget.max_age, std::chrono::milliseconds{50});
+
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(true, 1024, std::byte{0x10})}));
+    ASSERT_TRUE(receive_complete_au(pair.value().consumer).has_value());
+
+    // Hold a single small P-frame well below max_bytes.
+    force_would_block = true;
+    hdr.sequence = 2;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(false, 4096, std::byte{0x20})}));
+    ASSERT_EQ(outlet.pending_units(), 1U);
+    EXPECT_EQ(idr_requests, 0U);
+
+    // At max_age - 1 ms according to injected clock: must still be held.
+    steady_now += budget.max_age - std::chrono::milliseconds{1};
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_TRUE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 1U);
+    EXPECT_EQ(idr_requests, 0U);
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_dropped\"") != std::string::npos;
+    }), 0);
+
+    // Reaching max_age (+1 ms) expires the hold and triggers drop + IDR request.
+    steady_now += std::chrono::milliseconds{1};
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_FALSE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 0U);
+    EXPECT_EQ(outlet.pending_bytes(), 0U);
+    EXPECT_EQ(idr_requests, 1U);
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_dropped\",\"reason\":\"backpressure\"") != std::string::npos;
+    }), logs.end());
+}
+
+TEST(WiredReceiver, VideoOutletResetAfterHeldAccessUnitRestoresWaitingIdr) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{500}};
+    std::size_t idr_requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&steady_now] { return steady_now; },
+    });
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+
+    std::size_t fail_from_datagram = 0; // 0 = allow all, 1 = fail datagram 0, 2 = fail datagram 2+
+    std::size_t au_datagram_index = 0;
+    pair.value().producer.set_datagram_send_for_test(
+        [&](int fd, const void* buf, std::size_t len, int flags,
+            int& out_errno) -> std::ptrdiff_t {
+            ++au_datagram_index;
+            if (fail_from_datagram != 0 && au_datagram_index >= fail_from_datagram) {
+                out_errno = EAGAIN;
+                return -1;
+            }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+    outlet.install(std::move(pair.value().producer));
+
+    const auto profile = p::VideoProfile{2560, 1440, 60, p::VideoCodec::h265};
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+
+    const auto initial_idr = make_unique_h265_au(true, 4 * 1024, 0x11U);
+    ASSERT_TRUE(outlet.on_message({hdr, initial_idr}));
+    const auto got_init = receive_complete_au(pair.value().consumer);
+    ASSERT_TRUE(got_init.has_value());
+    EXPECT_EQ(got_init->frame, 1U);
+
+    // Phase A: EAGAIN on fragment 0 (partial.active == false) holds a P-frame, then reset().
+    fail_from_datagram = 1;
+    au_datagram_index = 0;
+    hdr.sequence = 2;
+    hdr.timestamp = aa::core::Nanoseconds{16'666'667};
+    ASSERT_TRUE(outlet.on_message({hdr, make_unique_h265_au(false, 4 * 1024, 0x22U)}));
+    EXPECT_TRUE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 1U);
+
+    outlet.reset();
+    EXPECT_FALSE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 0U);
+    EXPECT_EQ(outlet.pending_bytes(), 0U);
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_dropped\",\"reason\":\"reset\"") != std::string::npos;
+    }), logs.end());
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_backpressure_released\"") != std::string::npos;
+    }), 0);
+
+    // Unblock socket and send a non-IDR first in the resumed session: must be suppressed + request IDR.
+    fail_from_datagram = 0;
+    std::vector<aa::ipc::VideoAccessUnit> suppressed_drain;
+    hdr.video_profile = profile;
+    hdr.video_session = 2;
+    hdr.video_generation = 1;
+    hdr.sequence = 3;
+    hdr.timestamp = aa::core::Nanoseconds{33'333'334};
+    ASSERT_TRUE(outlet.on_message({hdr, make_unique_h265_au(false, 4 * 1024, 0x33U)}));
+    drain_available_aus(pair.value().consumer, suppressed_drain);
+    EXPECT_TRUE(suppressed_drain.empty());
+    EXPECT_EQ(idr_requests, 1U);
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_requested\",\"source\":\"producer\",\"reason\":\"waiting_idr\"}"),
+              logs.end());
+
+    // Subsequent fresh IDR delivers and clears waiting_idr.
+    const auto fresh_idr_a = make_unique_h265_au(true, 8 * 1024, 0x44U);
+    hdr.sequence = 4;
+    hdr.timestamp = aa::core::Nanoseconds{50'000'001};
+    ASSERT_TRUE(outlet.on_message({hdr, fresh_idr_a}));
+    const auto got_a = receive_complete_au(pair.value().consumer);
+    ASSERT_TRUE(got_a.has_value());
+    EXPECT_TRUE(got_a->idr);
+    EXPECT_EQ(got_a->payload, to_u8(fresh_idr_a));
+
+    // Phase B: EAGAIN mid-AU (partial.active == true after datagram 1 was sent) -> reset().
+    steady_now += std::chrono::seconds{5};
+    fail_from_datagram = 2;
+    au_datagram_index = 0;
+    hdr.sequence = 5;
+    hdr.timestamp = aa::core::Nanoseconds{66'666'668};
+    ASSERT_TRUE(outlet.on_message({hdr, make_unique_h265_au(false, 100 * 1024, 0x55U)}));
+    EXPECT_TRUE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 1U);
+
+    outlet.reset();
+    EXPECT_FALSE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 0U);
+    EXPECT_EQ(outlet.pending_bytes(), 0U);
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_backpressure_released\"") != std::string::npos;
+    }), 0);
+
+    // Non-IDR in new session is still suppressed, partial fragment is ignored on recovery, and IDR wins.
+    fail_from_datagram = 0;
+    suppressed_drain.clear();
+    drain_available_aus(pair.value().consumer, suppressed_drain);
+    EXPECT_TRUE(suppressed_drain.empty());
+
+    hdr.video_profile = profile;
+    hdr.video_session = 3;
+    hdr.sequence = 6;
+    hdr.timestamp = aa::core::Nanoseconds{83'333'335};
+    ASSERT_TRUE(outlet.on_message({hdr, make_unique_h265_au(false, 4 * 1024, 0x66U)}));
+    drain_available_aus(pair.value().consumer, suppressed_drain);
+    EXPECT_TRUE(suppressed_drain.empty());
+    EXPECT_EQ(idr_requests, 2U);
+
+    const auto fresh_idr_b = make_unique_h265_au(true, 8 * 1024, 0x77U);
+    hdr.sequence = 7;
+    hdr.timestamp = aa::core::Nanoseconds{100'000'002};
+    ASSERT_TRUE(outlet.on_message({hdr, fresh_idr_b}));
+    const auto got_b = receive_complete_au(pair.value().consumer);
+    ASSERT_TRUE(got_b.has_value());
+    EXPECT_TRUE(got_b->idr);
+    EXPECT_EQ(got_b->payload, to_u8(fresh_idr_b));
+    EXPECT_FALSE(pair.value().consumer.waiting_idr());
+
+    outlet.close();
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_backpressure_released\"") != std::string::npos;
+    }), 0);
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"decode_stats\",\"frame_drops\":4") != std::string::npos;
+    }), logs.end());
+}
+
+TEST(WiredReceiver, VideoOutletEpochChangeWhileHeldRestoresWaitingIdrAndDropsStaleFrames) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{600}};
+    std::size_t idr_requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&steady_now] { return steady_now; },
+    });
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+
+    std::size_t fail_from_datagram = 0;
+    std::size_t au_datagram_index = 0;
+    pair.value().producer.set_datagram_send_for_test(
+        [&](int fd, const void* buf, std::size_t len, int flags,
+            int& out_errno) -> std::ptrdiff_t {
+            ++au_datagram_index;
+            if (fail_from_datagram != 0 && au_datagram_index >= fail_from_datagram) {
+                out_errno = EAGAIN;
+                return -1;
+            }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+    outlet.install(std::move(pair.value().producer));
+
+    const auto profile = p::VideoProfile{2560, 1440, 60, p::VideoCodec::h265};
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+
+    ASSERT_TRUE(outlet.on_message({hdr, make_unique_h265_au(true, 4 * 1024, 0x11U)}));
+    ASSERT_TRUE(receive_complete_au(pair.value().consumer).has_value());
+
+    // Phase A: EAGAIN on fragment 0 (partial.active == false) holds stale frame from session 1.
+    fail_from_datagram = 1;
+    au_datagram_index = 0;
+    hdr.sequence = 2;
+    hdr.timestamp = aa::core::Nanoseconds{16'666'667};
+    ASSERT_TRUE(outlet.on_message({hdr, make_unique_h265_au(false, 4 * 1024, 0x22U)}));
+    EXPECT_TRUE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 1U);
+
+    // Socket recovers simultaneously with an epoch change carrying a non-IDR frame:
+    // held frame must be dropped ("stream_reset") and new non-IDR suppressed + IDR requested.
+    fail_from_datagram = 0;
+    std::vector<aa::ipc::VideoAccessUnit> suppressed_drain;
+    hdr.video_session = 2;
+    hdr.sequence = 3;
+    hdr.timestamp = aa::core::Nanoseconds{33'333'334};
+    ASSERT_TRUE(outlet.on_message({hdr, make_unique_h265_au(false, 4 * 1024, 0x33U)}));
+    EXPECT_FALSE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 0U);
+    drain_available_aus(pair.value().consumer, suppressed_drain);
+    EXPECT_TRUE(suppressed_drain.empty());
+    EXPECT_EQ(idr_requests, 1U);
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_dropped\",\"reason\":\"stream_reset\"") != std::string::npos;
+    }), logs.end());
+    EXPECT_NE(std::find(logs.begin(), logs.end(),
+                        "{\"event\":\"idr_requested\",\"source\":\"producer\",\"reason\":\"waiting_idr\"}"),
+              logs.end());
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_backpressure_released\"") != std::string::npos;
+    }), 0);
+
+    // Fresh IDR in session 2 succeeds.
+    const auto fresh_idr_a = make_unique_h265_au(true, 8 * 1024, 0x44U);
+    hdr.sequence = 4;
+    hdr.timestamp = aa::core::Nanoseconds{50'000'001};
+    ASSERT_TRUE(outlet.on_message({hdr, fresh_idr_a}));
+    const auto got_a = receive_complete_au(pair.value().consumer);
+    ASSERT_TRUE(got_a.has_value());
+    EXPECT_TRUE(got_a->idr);
+    EXPECT_EQ(got_a->payload, to_u8(fresh_idr_a));
+
+    // Phase B: EAGAIN mid-AU (partial.active == true) holds stale frame in session 2, then epoch 3 non-IDR.
+    steady_now += std::chrono::seconds{5};
+    fail_from_datagram = 2;
+    au_datagram_index = 0;
+    hdr.sequence = 5;
+    hdr.timestamp = aa::core::Nanoseconds{66'666'668};
+    ASSERT_TRUE(outlet.on_message({hdr, make_unique_h265_au(false, 100 * 1024, 0x55U)}));
+    EXPECT_TRUE(outlet.has_pending());
+    EXPECT_EQ(outlet.pending_units(), 1U);
+
+    fail_from_datagram = 0;
+    suppressed_drain.clear();
+    hdr.video_session = 3;
+    hdr.sequence = 6;
+    hdr.timestamp = aa::core::Nanoseconds{83'333'335};
+    ASSERT_TRUE(outlet.on_message({hdr, make_unique_h265_au(false, 4 * 1024, 0x66U)}));
+    EXPECT_FALSE(outlet.has_pending());
+    drain_available_aus(pair.value().consumer, suppressed_drain);
+    EXPECT_TRUE(suppressed_drain.empty());
+    EXPECT_EQ(idr_requests, 2U);
+
+    // Fresh IDR in session 3 recovers cleanly.
+    const auto fresh_idr_b = make_unique_h265_au(true, 8 * 1024, 0x77U);
+    hdr.sequence = 7;
+    hdr.timestamp = aa::core::Nanoseconds{100'000'002};
+    ASSERT_TRUE(outlet.on_message({hdr, fresh_idr_b}));
+    const auto got_b = receive_complete_au(pair.value().consumer);
+    ASSERT_TRUE(got_b.has_value());
+    EXPECT_TRUE(got_b->idr);
+    EXPECT_EQ(got_b->payload, to_u8(fresh_idr_b));
+    EXPECT_FALSE(pair.value().consumer.waiting_idr());
+
+    outlet.close();
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"video_backpressure_released\"") != std::string::npos;
+    }), 0);
+    EXPECT_NE(std::find_if(logs.begin(), logs.end(), [](const std::string& s) {
+        return s.find("\"event\":\"decode_stats\",\"frame_drops\":4") != std::string::npos;
+    }), logs.end());
+}

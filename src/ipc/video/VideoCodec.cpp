@@ -190,4 +190,30 @@ std::uint32_t recommended_socket_buffer_bytes(const protocol::VideoProfile& prof
     return static_cast<std::uint32_t>(clamped);
 }
 
+VideoBackpressureBudget
+recommended_backpressure_budget(const std::optional<protocol::VideoProfile>& profile) noexcept {
+    // Transient backpressure hold bounds (#144):
+    // - Age: ~2 frame intervals (ceil(2000 / fps) ms), clamped to [50 ms, 100 ms]
+    //   (50 ms at 60 fps, 67 ms at 30 fps). On Jetson 1440p60 GUI presentation
+    //   (~36 painted fps = ~28 ms paint cycle) with a 5 ms display pump timer,
+    //   50 ms rides out one paint/drain cycle + jitter without masking real
+    //   stalls or exceeding the 50-100 ms interactive latency / A/V skew range.
+    // - Bytes: ~1/4 of recommended_socket_buffer_bytes(profile) (~62.5 ms at
+    //   0.5 bpp, matching the ~50-67 ms age bound), clamped to [256 KiB, 1 MiB]
+    //   (256 KiB at <=1080p30, ~486 KB at 1080p60, ~864 KB at 1440p60, 1 MiB at
+    //   4K60). Even on stock Jetson wmem_max = 212,992 B, this accommodates a
+    //   full ~214-306 KB recovery IDR plus trailing P-frames while capping
+    //   userspace buffering strictly at <= 1 MiB.
+    const std::uint32_t fps = (profile && profile->fps > 0) ? profile->fps : 30U;
+    const std::uint32_t two_frames_ms = (2000U + fps - 1U) / fps;
+    const auto max_age = std::chrono::milliseconds{std::clamp<std::uint32_t>(two_frames_ms, 50U, 100U)};
+    constexpr std::size_t kMaxHoldBytes = 1024U * 1024U;
+    std::size_t max_bytes = kMinSocketBufferBytes;
+    if (profile && profile->width > 0 && profile->height > 0 && profile->fps > 0) {
+        const auto quarter_socket = static_cast<std::size_t>(recommended_socket_buffer_bytes(*profile)) / 4U;
+        max_bytes = std::clamp<std::size_t>(quarter_socket, kMinSocketBufferBytes, kMaxHoldBytes);
+    }
+    return {max_bytes, max_age};
+}
+
 } // namespace aa::ipc

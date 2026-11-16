@@ -1608,12 +1608,14 @@ aa::core::Result<void> service_audio_completions(aa::app::WiredSession &session,
 }
 
 aa::core::Result<bool> receive_with_audio(aa::app::WiredSession &session,
-                                         ConcreteAudioRenderWorker &audio) {
+                                         ConcreteAudioRenderWorker &audio,
+                                         const VideoOutlet *video = nullptr) {
     const bool had_audio = audio.outstanding();
+    const bool has_pending_video = video != nullptr && video->has_pending();
     if (auto serviced = service_audio_completions(session, audio); !serviced) {
         return serviced.error();
     }
-    auto received = (had_audio || audio.outstanding())
+    auto received = (had_audio || audio.outstanding() || has_pending_video)
         ? session.poll_transport(aa::core::Deadline::Clock::now() + std::chrono::milliseconds{5})
         : session.poll_transport();
     if (auto serviced = service_audio_completions(session, audio); !serviced) {
@@ -2068,6 +2070,17 @@ int receiver_main(int argc, char **argv) {
             bool &active;
             ~Guard() { active = false; }
         } guard{in_video_recovery};
+        if (!video_outlet.idr_dispatching()) {
+            if (auto flushed = video_outlet.service_pending(); !flushed) {
+                log_line(poll_error_json(flushed.error().code(), session, audio_sink));
+                if (!session.failure()) {
+                    (void)session.fail(flushed.error());
+                }
+                session_failed.store(true);
+                g_running.store(false);
+                return false;
+            }
+        }
         if (auto pending = session.service_pending_video_idr(); !pending) {
             log_line(poll_error_json(pending.error().code(), session, audio_sink));
             if (session.failure()) {
@@ -2116,6 +2129,7 @@ int receiver_main(int argc, char **argv) {
         if (auto lost = session.apply(aa::session::Event::link_lost); !lost) {
             return lost.error();
         }
+        video_outlet.reset();
         const auto budget = session.io_deadline();
         while (g_running.load()) {
             if (service_control()) {
@@ -2260,7 +2274,7 @@ int receiver_main(int argc, char **argv) {
                 break;
             }
             in_receive_poll = true;
-            auto polled = audio_service ? receive_with_audio(session, audio_sink)
+            auto polled = audio_service ? receive_with_audio(session, audio_sink, &video_outlet)
                                         : aa::core::Result<bool>{audio_service.error()};
             in_receive_poll = false;
             {

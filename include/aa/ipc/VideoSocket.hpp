@@ -7,6 +7,7 @@
 #include <optional>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -169,7 +170,22 @@ negotiate_limits(const NegotiatedLimits& local, const NegotiatedLimits& peer) no
 [[nodiscard]] core::Result<PeerCredentials>
 authorize_peer(const PeerCredentials& peer, std::uint32_t expected_uid) noexcept;
 
+// Bounded producer-side tolerance for transient EAGAIN backpressure (#144).
+// Prevents a single brief socket-full window immediately after a large AU
+// from throwing the stream into waiting_idr while keeping both memory and
+// queueing latency strictly bounded.
+struct VideoBackpressureBudget final {
+    std::size_t max_bytes{};
+    std::chrono::milliseconds max_age{};
+
+    [[nodiscard]] friend constexpr bool operator==(const VideoBackpressureBudget&,
+                                                   const VideoBackpressureBudget&) noexcept = default;
+};
+
 [[nodiscard]] std::uint32_t
 recommended_socket_buffer_bytes(const protocol::VideoProfile& profile) noexcept;
+
+[[nodiscard]] VideoBackpressureBudget
+recommended_backpressure_budget(const std::optional<protocol::VideoProfile>& profile) noexcept;
 
 } // namespace aa::ipc

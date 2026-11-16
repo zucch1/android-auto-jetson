@@ -200,6 +200,55 @@ non-fatal `video_socket_buffer_warning` event. Extra IPC burst headroom above
 `212992` bytes is not available on stock sysctls and requires an explicit
 administrator setting such as `net.core.wmem_max=4194304` (4 MiB).
 
+## Transient backpressure hold
+
+When a large IDR keyframe (e.g., ~214 KB at 1440p60 H.265) fills a short-granted
+`212992`-byte kernel `SO_SNDBUF`, the next P-frame ~4 ms later can hit
+`EAGAIN`/`EWOULDBLOCK` before the display consumer completes its 5 ms pump /
+~28 ms Jetson paint cycle. Immediately dropping that P-frame into `waiting_idr`
+forces a periodic IDR recovery loop even though the socket drains momentarily.
+
+Both wired and wireless receivers share `aa::wired_receiver::VideoOutlet`, which
+holds whole access units in a strictly bounded FIFO pending queue via non-dropping
+`VideoProducer::try_send_access_unit()` (resuming mid-AU fragment index if `EAGAIN`
+occurs mid-AU without breaking `VideoReassembler`'s monotonic sequence contract):
+
+- **Bounds (`aa::ipc::recommended_backpressure_budget`)**:
+  - **Age (`max_age`)**: `clamp(ceil(2000 / fps), 50 ms, 100 ms)` — `50 ms` at 60 fps,
+    `67 ms` at 30 fps, capped at `100 ms`. This rides out one display pump + paint
+    jitter window (~33 ms on Jetson at ~36 fps) while keeping worst-case queueing
+    bounded before escalating to keyframe recovery.
+  - **Bytes (`max_bytes`)**: `clamp(recommended_socket_buffer_bytes(profile) / 4, 256 KiB, 1 MiB)`
+    (`256 KiB` up to 1080p30, `486,000 B` at 1080p60, `864,000 B` at 1440p60, `1 MiB`
+    at 4K60, `256 KiB` when profile metadata is absent) — roughly one recovery
+    keyframe / ~3–4 P-frames so memory stays strictly bounded and cannot absorb a
+    sustained downstream stall.
+- **Draining**: Held frames flush in strict FIFO order on the next incoming AU
+  (`VideoOutlet::on_message`) and periodically via `VideoOutlet::service_pending()`
+  under the existing outbound-message and `idr_dispatching` guards. On wired USB,
+  `receive_with_audio()` bounds `poll_transport()` to `5 ms` while frames are
+  held. On wireless TCP, `TcpTransport::poll_receive()` is intentionally
+  unsupported so `WirelessLink::poll()` still runs blocking `poll_transport()`,
+  which services `Runtime::checkpoint()` in `25 ms` `TcpIo` slices when TCP is
+  idle (`Runtime.hpp` also shortens its outer sleep to `5 ms` on non-blocked
+  turns); accordingly, when TCP is quiet during a hold, drain/expiry on wireless
+  can overshoot the nominal `max_age` by up to one `~25 ms` slice (still
+  strictly finite).
+- **Overflow & reset**: Exceeding either `max_age` or `max_bytes` drops all held AUs
+  (and the overflowing AU if any), logs `video_dropped` with `reason: "backpressure"`,
+  enters `waiting_idr` (`enter_waiting_idr_on_backpressure()`), and triggers IDR
+  recovery identically to the prior drop-and-report policy. Consumer disconnect,
+  consumer replacement (`install`), stream profile/session/generation change, session
+  `reset()`, and `close()` clear the pending queue immediately (without emitting
+  `video_backpressure_released`), account for discarded held AUs, and force
+  `waiting_idr` on any retained producer regardless of whether any fragment of the
+  held AU escaped.
+- **Telemetry**: Emits `video_backpressure_held` (`held_units`, `held_bytes`,
+  `age_ms`, `max_bytes`, `max_age_ms`) on entering a hold episode and
+  `video_backpressure_released` (`held_units`, `held_bytes`, `age_ms`) once the
+  held queue drains onto the socket. Real overflows still emit `video_dropped`
+  (`reason: "backpressure"`).
+
 ## Following PRs and qualification
 
 1. Implement/optimize and qualify the Jetson hardware decode path.

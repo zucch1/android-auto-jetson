@@ -5,9 +5,11 @@
 #include <aa/ipc/VideoChannel.hpp>
 #include <aa/protocol/Protocol.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -117,6 +119,21 @@ public:
         return idr_dispatching_.load(std::memory_order_acquire);
     }
 
+    [[nodiscard]] bool has_pending() const {
+        std::lock_guard lock(mutex_);
+        return !pending_queue_.empty();
+    }
+
+    [[nodiscard]] std::size_t pending_units() const {
+        std::lock_guard lock(mutex_);
+        return pending_queue_.size();
+    }
+
+    [[nodiscard]] std::size_t pending_bytes() const {
+        std::lock_guard lock(mutex_);
+        return pending_bytes_;
+    }
+
     [[nodiscard]] ipc::IdrRecoveryCoordinator::RequestSnapshot idr_snapshot() const {
         std::lock_guard lock(mutex_);
         return idr_coordinator_.snapshot();
@@ -133,6 +150,32 @@ public:
         return dispatch_idr_request_locked(lock, now, reason);
     }
 
+    [[nodiscard]] core::Result<void> service_pending() {
+        std::unique_lock lock(mutex_);
+        if (idr_dispatching_.load(std::memory_order_acquire) ||
+            pending_queue_.empty() || !producer_.has_value()) {
+            return {};
+        }
+        const auto drained = drain_pending_locked(lock);
+        if (!drained) {
+            return drained.error();
+        }
+        return {};
+    }
+
+    void reset() noexcept {
+        std::lock_guard lock(mutex_);
+        clear_pending_locked(/*abandon_partial=*/true, "reset");
+        idr_coordinator_.reset();
+        had_backpressure_ = false;
+        replaced_consumer_ = false;
+        armed_late_consumer_ = false;
+        profile_.reset();
+        session_.reset();
+        generation_.reset();
+        av1_reduced_ = false;
+    }
+
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override {
         std::unique_lock lock(mutex_);
         if (!producer_.has_value()) {
@@ -141,6 +184,12 @@ public:
             return {};
         }
         if (message.header.video_profile != profile_ || message.header.video_session != session_ || message.header.video_generation != generation_) {
+            if (!pending_queue_.empty()) {
+                // Stream epoch/profile changed while AUs were held: drop held frames,
+                // record lifecycle drops, and force waiting_idr on the retained producer
+                // so non-IDR frames from the new epoch cannot splice in.
+                clear_pending_locked(/*abandon_partial=*/true, "stream_reset");
+            }
             profile_ = message.header.video_profile;
             session_ = message.header.video_session;
             generation_ = message.header.video_generation;
@@ -152,6 +201,21 @@ public:
                 configure_buffer_locked(*profile_);
             }
         }
+        // Flush any held AUs before admitting the new AU so access-unit order is
+        // strictly preserved. If draining overflows, waiting_idr is entered and
+        // the incoming AU obeys waiting_idr below.
+        if (!pending_queue_.empty()) {
+            const auto drained = drain_pending_locked(lock);
+            if (!drained) {
+                return drained.error();
+            }
+            if (!producer_.has_value()) {
+                ++dropped_before_consumer_;
+                record_drop("no_consumer", frame_cadence(message.header.video_profile));
+                return {};
+            }
+        }
+
         std::vector<std::uint8_t> payload;
         payload.reserve(message.payload.size());
         for (const std::byte byte : message.payload) {
@@ -159,43 +223,45 @@ public:
         }
         const bool is_idr = is_idr_au(
             payload, profile_ ? profile_->codec : protocol::VideoCodec::h264, &av1_reduced_);
-        const auto sent = producer_->send_access_unit(ipc::VideoSendRequest{
-            ++sequence_, static_cast<std::uint64_t>(message.header.timestamp.count), is_idr,
-            payload, message.header.video_profile});
+        const std::uint64_t frame_id = ++sequence_;
+        const std::uint64_t timestamp_ns =
+            static_cast<std::uint64_t>(message.header.timestamp.count);
+        const auto now = now_locked();
+        const auto effective_profile =
+            message.header.video_profile ? message.header.video_profile : profile_;
+        const auto budget = ipc::recommended_backpressure_budget(effective_profile);
+
+        if (!pending_queue_.empty()) {
+            const auto age = now - pending_queue_.front().enqueued_at;
+            if (age >= budget.max_age || pending_bytes_ + payload.size() > budget.max_bytes) {
+                return overflow_backpressure_locked(lock, /*extra_drops=*/1);
+            }
+            enqueue_pending_locked(frame_id, timestamp_ns, is_idr, std::move(payload),
+                                   message.header.video_profile, now, budget);
+            return {};
+        }
+
+        const auto sent = producer_->try_send_access_unit(ipc::VideoSendRequest{
+            frame_id, timestamp_ns, is_idr, payload, message.header.video_profile});
         if (!sent) {
-            // Error erases errno; confirm peer hangup rather than hiding every I/O failure.
-            if (sent.error().code() == ErrorCode::transport_io) {
-                pollfd peer{producer_->native_handle(), 0, 0};
-                int ready;
-                do {
-                    ready = ::poll(&peer, 1, 0);
-                } while (ready < 0 && errno == EINTR);
-                if (ready > 0 && (peer.revents & POLLHUP) != 0) {
-                    producer_->close();
-                    producer_.reset();
-                    idr_coordinator_.reset();
-                    had_backpressure_ = false;
-                    armed_late_consumer_ = false;
-                    producer_installed_at_.reset();
-                    record_drop("consumer_disconnected", frame_cadence(profile_));
-                    return {};
-                }
+            if (handle_transport_error_locked(sent.error(), /*extra_drops=*/1)) {
+                return {};
             }
             return sent.error();
         }
         switch (sent.value()) {
-        case ipc::SendStatus::dropped_backpressure:
-            had_backpressure_ = true;
-            record_drop("backpressure", frame_cadence(profile_));
-            if (auto idr = maybe_request_idr_locked(lock, "backpressure"); !idr) {
-                return idr.error();
+        case ipc::TrySendStatus::would_block:
+            if (payload.size() > budget.max_bytes) {
+                return overflow_backpressure_locked(lock, /*extra_drops=*/1);
             }
+            enqueue_pending_locked(frame_id, timestamp_ns, is_idr, std::move(payload),
+                                   message.header.video_profile, now, budget);
             return {};
-        case ipc::SendStatus::dropped_waiting_idr: {
+        case ipc::TrySendStatus::dropped_waiting_idr: {
             record_drop("waiting_idr", frame_cadence(profile_));
             const bool past_startup_grace =
                 producer_installed_at_.has_value() &&
-                (now_locked() - *producer_installed_at_) >= ipc::kIdrStartupGrace;
+                (now - *producer_installed_at_) >= ipc::kIdrStartupGrace;
             if (had_backpressure_ || units_ > 0 || replaced_consumer_ ||
                 armed_late_consumer_ || past_startup_grace) {
                 if (auto idr = maybe_request_idr_locked(lock, "waiting_idr"); !idr) {
@@ -204,32 +270,16 @@ public:
             }
             return {};
         }
-        case ipc::SendStatus::sent:
-            had_backpressure_ = false;
-            replaced_consumer_ = false;
-            armed_late_consumer_ = false;
-            if (is_idr && idr_coordinator_.waiting()) {
-                const auto recovered = idr_coordinator_.on_idr_delivered(now_locked());
-                if (recovered.recovered) {
-                    log_(ipc::idr_recovered_json("producer", recovered.latency_ms,
-                                                 recovered.episode_requests,
-                                                 recovered.total_requests));
-                }
-            }
+        case ipc::TrySendStatus::sent:
+            note_au_sent_locked(is_idr, now);
             break;
-        }
-        ++units_;
-        if (!has_sent_report_ || units_ - last_sent_report_unit_ >= frame_cadence(profile_)) {
-            has_sent_report_ = true;
-            last_sent_report_unit_ = units_;
-            media("video_sent", "{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
-            emit_drops(false);
         }
         return {};
     }
 
     void install(ipc::VideoProducer producer) {
         std::lock_guard lock(mutex_);
+        clear_pending_locked(/*abandon_partial=*/false, "consumer_replaced");
         // send_started fires once per access unit the phone sends (audit L13), so
         // it is media telemetry: rate-limited and never waiting for the sink. Any
         // other endpoint event is a lifecycle record and stays lossless.
@@ -252,6 +302,7 @@ public:
             dropped_before_consumer_ = 0;
         }
         had_producer_ = true;
+        had_backpressure_ = false;
         producer_installed_at_ = now_locked();
         producer_.emplace(std::move(producer));
         if (profile_) {
@@ -261,6 +312,7 @@ public:
 
     void close() noexcept {
         std::lock_guard lock(mutex_);
+        clear_pending_locked(/*abandon_partial=*/false, "closed");
         emit_drops(true);
         idr_coordinator_.reset();
         had_backpressure_ = false;
@@ -275,6 +327,193 @@ public:
     }
 
 private:
+    struct PendingAccessUnit final {
+        std::uint64_t sequence{};
+        std::uint64_t timestamp_ns{};
+        bool idr{false};
+        std::vector<std::uint8_t> payload{};
+        std::optional<protocol::VideoProfile> profile{};
+        std::chrono::steady_clock::time_point enqueued_at{};
+    };
+
+    enum class DrainOutcome : std::uint8_t {
+        empty,
+        still_held,
+        overflowed,
+        disconnected,
+    };
+
+    void reset_pending_state_locked() noexcept {
+        pending_queue_.clear();
+        pending_bytes_ = 0;
+        hold_episode_started_at_ = {};
+        hold_peak_bytes_ = 0;
+        hold_episode_units_ = 0;
+    }
+
+    void clear_pending_locked(bool abandon_partial, const char* drop_reason) noexcept {
+        const auto dropped_units = pending_queue_.size();
+        const auto cadence = frame_cadence(profile_);
+        reset_pending_state_locked();
+        if (dropped_units > 0 && drop_reason != nullptr) {
+            for (std::size_t i = 0; i < dropped_units; ++i) {
+                record_drop(drop_reason, cadence);
+            }
+        }
+        if (abandon_partial && dropped_units > 0 && producer_.has_value()) {
+            producer_->abandon_partial_send();
+        }
+    }
+
+    void enqueue_pending_locked(std::uint64_t sequence,
+                                std::uint64_t timestamp_ns,
+                                bool is_idr,
+                                std::vector<std::uint8_t> payload,
+                                const std::optional<protocol::VideoProfile>& profile,
+                                std::chrono::steady_clock::time_point now,
+                                const ipc::VideoBackpressureBudget& budget) {
+        const bool starting_hold = pending_queue_.empty();
+        pending_bytes_ += payload.size();
+        pending_queue_.push_back(PendingAccessUnit{
+            sequence, timestamp_ns, is_idr, std::move(payload), profile, now});
+        ++hold_episode_units_;
+        hold_peak_bytes_ = std::max(hold_peak_bytes_, pending_bytes_);
+        if (starting_hold) {
+            hold_episode_started_at_ = now;
+            media("video_backpressure_held",
+                  ipc::video_backpressure_held_json(
+                      pending_queue_.size(), pending_bytes_, 0, budget.max_bytes,
+                      budget.max_age.count()));
+        }
+    }
+
+    void note_au_sent_locked(bool is_idr, std::chrono::steady_clock::time_point now) {
+        had_backpressure_ = false;
+        replaced_consumer_ = false;
+        armed_late_consumer_ = false;
+        if (is_idr && idr_coordinator_.waiting()) {
+            const auto recovered = idr_coordinator_.on_idr_delivered(now);
+            if (recovered.recovered) {
+                log_(ipc::idr_recovered_json("producer", recovered.latency_ms,
+                                             recovered.episode_requests,
+                                             recovered.total_requests));
+            }
+        }
+        ++units_;
+        if (!has_sent_report_ || units_ - last_sent_report_unit_ >= frame_cadence(profile_)) {
+            has_sent_report_ = true;
+            last_sent_report_unit_ = units_;
+            media("video_sent", "{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
+            emit_drops(false);
+        }
+    }
+
+    [[nodiscard]] bool handle_transport_error_locked(const Error& err, std::size_t extra_drops) {
+        // Error erases errno; confirm peer hangup rather than hiding every I/O failure.
+        if (err.code() != ErrorCode::transport_io || !producer_.has_value()) {
+            return false;
+        }
+        pollfd peer{producer_->native_handle(), 0, 0};
+        int ready;
+        do {
+            ready = ::poll(&peer, 1, 0);
+        } while (ready < 0 && errno == EINTR);
+        if (ready <= 0 || (peer.revents & POLLHUP) == 0) {
+            return false;
+        }
+        const std::size_t lost_units = pending_queue_.size() + extra_drops;
+        reset_pending_state_locked();
+        producer_->close();
+        producer_.reset();
+        idr_coordinator_.reset();
+        had_backpressure_ = false;
+        armed_late_consumer_ = false;
+        producer_installed_at_.reset();
+        const auto cadence = frame_cadence(profile_);
+        for (std::size_t i = 0; i < lost_units; ++i) {
+            record_drop("consumer_disconnected", cadence);
+        }
+        return true;
+    }
+
+    [[nodiscard]] core::Result<void> overflow_backpressure_locked(
+        std::unique_lock<std::mutex>& lock, std::size_t extra_drops) {
+        const std::size_t dropped_units = pending_queue_.size() + extra_drops;
+        reset_pending_state_locked();
+        if (producer_.has_value()) {
+            producer_->enter_waiting_idr_on_backpressure();
+        }
+        had_backpressure_ = true;
+        const auto cadence = frame_cadence(profile_);
+        for (std::size_t i = 0; i < dropped_units; ++i) {
+            record_drop("backpressure", cadence);
+        }
+        if (auto idr = maybe_request_idr_locked(lock, "backpressure"); !idr) {
+            return idr.error();
+        }
+        return {};
+    }
+
+    [[nodiscard]] core::Result<DrainOutcome> drain_pending_locked(
+        std::unique_lock<std::mutex>& lock) {
+        while (!pending_queue_.empty() && producer_.has_value()) {
+            const auto now = now_locked();
+            const auto& front = pending_queue_.front();
+            const auto budget =
+                ipc::recommended_backpressure_budget(front.profile ? front.profile : profile_);
+            if ((now - front.enqueued_at) >= budget.max_age) {
+                if (auto overflow = overflow_backpressure_locked(lock, /*extra_drops=*/0);
+                    !overflow) {
+                    return overflow.error();
+                }
+                return DrainOutcome::overflowed;
+            }
+            const auto sent = producer_->try_send_access_unit(ipc::VideoSendRequest{
+                front.sequence, front.timestamp_ns, front.idr, front.payload, front.profile});
+            if (!sent) {
+                if (handle_transport_error_locked(sent.error(), /*extra_drops=*/0)) {
+                    return DrainOutcome::disconnected;
+                }
+                return sent.error();
+            }
+            switch (sent.value()) {
+            case ipc::TrySendStatus::would_block:
+                return DrainOutcome::still_held;
+            case ipc::TrySendStatus::dropped_waiting_idr:
+                pending_bytes_ -= front.payload.size();
+                pending_queue_.pop_front();
+                record_drop("waiting_idr", frame_cadence(profile_));
+                if (pending_queue_.empty()) {
+                    hold_episode_units_ = 0;
+                    hold_peak_bytes_ = 0;
+                    hold_episode_started_at_ = {};
+                }
+                break;
+            case ipc::TrySendStatus::sent: {
+                const bool was_idr = front.idr;
+                pending_bytes_ -= front.payload.size();
+                pending_queue_.pop_front();
+                note_au_sent_locked(was_idr, now);
+                if (pending_queue_.empty()) {
+                    const auto held_units = hold_episode_units_;
+                    const auto held_bytes = hold_peak_bytes_;
+                    const auto age_ms = std::max<std::int64_t>(
+                        0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                               now - hold_episode_started_at_).count());
+                    hold_episode_units_ = 0;
+                    hold_peak_bytes_ = 0;
+                    hold_episode_started_at_ = {};
+                    media("video_backpressure_released",
+                          ipc::video_backpressure_released_json(
+                              held_units, held_bytes, age_ms));
+                }
+                break;
+            }
+            }
+        }
+        return DrainOutcome::empty;
+    }
+
     [[nodiscard]] std::uint64_t frame_cadence(
         const std::optional<protocol::VideoProfile>& profile) const noexcept {
         if (profile && profile->fps > 0) {
@@ -413,6 +652,11 @@ private:
     bool armed_late_consumer_{};
     std::uint64_t dropped_before_consumer_{};
     std::optional<std::chrono::steady_clock::time_point> producer_installed_at_{};
+    std::deque<PendingAccessUnit> pending_queue_{};
+    std::size_t pending_bytes_{0};
+    std::chrono::steady_clock::time_point hold_episode_started_at_{};
+    std::size_t hold_peak_bytes_{0};
+    std::uint64_t hold_episode_units_{0};
     std::uint64_t sequence_{};
     std::uint64_t units_{};
     std::uint64_t last_sent_report_unit_{};
