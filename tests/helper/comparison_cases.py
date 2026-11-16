@@ -170,5 +170,8 @@ def probe_flow(surface: Surface) -> None:
     assert rpc(f"open {expired_grant}")[0] == 1001
     # NewConnection was rejected above: the mock never created a profile socket.
     assert command(surface.mock, "RequestAuthorization") == "rejected"
-    wait(lambda: len(surface.state()["removed"]) == removed_before + 1)
+    # The comparison was rejected through the agent's reply; the bond is kept, refused (#136).
+    assert len(surface.state()["removed"]) == removed_before and surface.state()["bonded"]
+    assert command(surface.mock, "AuthorizeService hfp") == "rejected"
+    assert command(surface.mock, "NewConnection") == "rejected"
     print("PASS comparison_timeout_wrong_source_and_monotonic60s_idle_expiry", flush=True)

@@ -103,20 +103,20 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     const auto observed = impl_->consume(handle);
     if (!observed || impl_->allowed) return Error{ErrorCode::helper_rejected};
     // A currently managed identity is enrolled already (it reconnects); it must be forgotten
-    // (demoted to revoked) before a new enrolment, whose cleanup would otherwise apply to it.
+    // (demoted to revoked) before a new enrolment, whose release would otherwise apply to it.
     // No enrolment opens before this helper run's first reconciliation: until the receiver has
     // answered, the journal may hold an approved bond whose commit never landed.
     if (!impl_->reconciled) return Error{ErrorCode::helper_unavailable};
     if (!impl_->pending.valid() || !impl_->revoked.valid() || impl_->pending.peers().size() >= 256 ||
         impl_->pending.contains(observed->device.identity) || impl_->managed.contains(observed->device.identity))
         return Error{ErrorCode::helper_rejected};
-    // Durably note the pending removal before any window opens: a restart with a failed or
-    // unacknowledged removal still removes the bond. A failed write refuses this admission.
+    // Durably note the enrolment before any window opens: until its commit it is never admitted,
+    // and after a restart the receiver's reconciliation decides (an approval whose commit never
+    // landed is admitted; anything else is released, its bond kept). A failed write refuses it.
     if (!impl_->pending.remember(observed->device.identity)) return Error{ErrorCode::helper_unavailable};
     // Revocation history stays: only this enrolment's commit (or reconciliation of its approval
     // after an acknowledgement) clears it, so a window that closes without acceptance cannot turn a
     // resurrected or stale approval into an admission.
-    std::erase(impl_->cleaned, observed->device.identity);
     std::erase(impl_->awaiting, observed->device.identity);
     impl_->allowed = *observed;
     impl_->pairing_enabled = true;
@@ -150,58 +150,28 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     return State::active;
 }
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
-    // Authority: an admitted bond, a revoked (historical) one, or one still on the pending-removal
-    // list (unaccepted or provisional; the receiver retires it after a failed write or commit).
+    // Authority: an admitted bond, a revoked (historical) one, or an open enrolment's journal entry
+    // (unaccepted or provisional; the receiver retires it after a failed write or commit). Without
+    // it nothing is touched. The Bluetooth adapter is shared (docs/enrolment-ordering.md, #136): a
+    // revocation never removes or disconnects a bond. A managed bond is demoted to history and its
+    // journal entry dropped; from then on it is refused for admission, the Android Auto profile, HFP
+    // authorization and reconnect, and only the owner (or infotainment) unpairs it.
     if (!address_valid(identity.address) || !address_valid(identity.adapter)) return Error{ErrorCode::helper_rejected};
     const bool authority = impl_->managed.revocable(identity) || impl_->revoked.contains(identity) ||
                            impl_->pending.contains(identity);
     if (!impl_->current_owner()) return Error{ErrorCode::helper_unavailable};
-    if (!authority) {
-        // Without authority nothing is touched. A bond this helper's cleanup already removed
-        // (for example a provisional bond, before the receiver's retry) reports success while no
-        // device is present, so the receiver's record can complete.
-        if (std::find(impl_->cleaned.begin(), impl_->cleaned.end(), identity) == impl_->cleaned.end())
-            return Error{ErrorCode::helper_rejected};
-        std::vector<Impl::Device> devices;
-        if (!impl_->inventory(devices)) return Error{ErrorCode::helper_unavailable};
-        const bool present = std::any_of(devices.begin(), devices.end(),
-            [&](const Impl::Device& device) { return device.identity == identity; });
-        return present ? core::Result<void>{Error{ErrorCode::helper_rejected}} : core::Result<void>{};
-    }
-    // The receiver revokes it: no longer approved, and no longer awaiting its answer.
+    if (!authority) return Error{ErrorCode::helper_rejected};
+    // The receiver revokes it: no longer awaiting its answer.
     if ((impl_->allowed && impl_->allowed->device.identity == identity) ||
         (impl_->connected && impl_->connected->device.identity == identity)) impl_->close_window();
-    std::erase(impl_->approved, identity);
     std::erase(impl_->awaiting, identity);
-    // Demote first: once forgotten, the bond is never admitted (services, reconnect) again and
-    // is never taken as acceptance of a later enrolment of the same identity. The removal is owed
-    // durably (journal) before the managed entry goes, and the journal entry is dropped only after
-    // BlueZ confirmed the removal. Every write is confirmed durable before success is reported.
+    // Demoted first: once forgotten, the bond is never admitted (services, reconnect) again and is
+    // never taken as acceptance of a later enrolment of the same identity. Success only once every
+    // write is confirmed durable; otherwise the receiver retries.
     const bool demoted = impl_->demote(identity);
     std::erase_if(impl_->observations, [&](const auto& item) { return item.second.device.identity == identity; });
-    std::vector<Impl::Device> devices;
-    if (!impl_->inventory(devices)) return Error{ErrorCode::helper_unavailable};
-    for (const auto& device : devices) {
-        if (device.identity != identity) continue;
-        impl_->disconnect(device);
-        auto* reply = impl_->call(device.adapter_path.c_str(), "org.bluez.Adapter1", "RemoveDevice", g_variant_new("(o)", device.path.c_str()));
-        if (!reply) return Error{ErrorCode::helper_unavailable};
-        g_variant_unref(reply);
-        break;
-    }
-    std::erase_if(impl_->removal_retries, [&](const Impl::RemovalRetry& item) { return item.peer == identity; });
-    // An incomplete demotion keeps the bond leg pending so the receiver retries it.
-    if (!demoted && !impl_->demote(identity)) return Error{ErrorCode::helper_unavailable};
-    // The device is gone: drop the removal obligation now, so the identity can enrol again at once
-    // (a failed rewrite leaves it to cleanup, which finds no device).
-    if (impl_->pending.contains(identity)) {
-        (void)impl_->pending.forget(identity);
-        if (!impl_->pending.contains(identity)) {
-            std::erase(impl_->cleaned, identity);
-            if (impl_->cleaned.size() >= 256) impl_->cleaned.erase(impl_->cleaned.begin());
-            impl_->cleaned.push_back(identity);
-        }
-    }
+    if (!demoted || (impl_->pending.contains(identity) && !impl_->pending.forget(identity)))
+        return Error{ErrorCode::helper_unavailable};
     return {};
 }
 }

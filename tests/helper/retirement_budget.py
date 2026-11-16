@@ -61,7 +61,8 @@ def stalled_forget(build: Path, not_durable: bool) -> None:
             # The AP leg stays pending; the resumed helper's reconciliation resolves the bond leg.
             wait(lambda: command(surface.receiver, f"progress {phone}") == "0 1")
             assert command(surface.receiver, f"retirements {phone}") == "1"
-            wait(lambda: not surface.nm_state()["table"] and len(surface.state()["removed"]) == 1)
+            wait(lambda: not surface.nm_state()["table"])
+            assert surface.state()["removed"] == []  # the forgotten bond is kept (shared adapter, #136)
         assert command(surface.receiver, "fault-clear") == "0"
 
         def finish() -> bool:

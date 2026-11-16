@@ -125,13 +125,17 @@ commit keeps a durable approval and reconciliation admits the bond (docs/enrolme
 A failing reconciliation emits `bond_reconcile_pending` once (retried every second); approved
 identities the helper cannot admit are reported as `bond_reconcile_unadmitted_enrol_again` with
 their count: the recovery is to enrol each such phone again (or ForgetPhone it). The Jetson's
-Bluetooth adapter is Android-Auto-exclusive: a phone forgotten in Android Auto that is paired
-again outside it is removed again by reconciliation, and the helper logs the warning
-`bond_removed_revoked_identity` with the redacted address each time, saying the phone was
-forgotten in Android Auto and must be enrolled again. Bond removals run under a per-invocation
-budget (two attempts, 100 ms) with per-identity exponential backoff, so a slow or failing BlueZ
-never delays another phone's reconciliation, confirm or reconnect (docs/enrolment-ordering.md,
-Removal budget). `PairingOpened`
+Bluetooth adapter is shared (#136): Android Auto never deletes or cancels a Bluetooth pairing
+(no `RemoveDevice`, `CancelPairing` or `Disconnect`), including after a cancelled, failed or
+timed-out enrolment window and after a restart. A pending pairing comparison is rejected through
+the helper agent's reply. A phone forgotten in Android Auto keeps its pairing, as does one paired
+again outside it and one an unfinished enrolment left behind; all are refused on every Android
+Auto path (admission, RFCOMM bootstrap, HFP, `ReconnectPeerV1`) and logged with the redacted
+address: `bond_kept_revoked_identity` at each reconciliation for a forgotten phone, and
+`bond_kept_unowned_enrolment` when an unfinished enrolment's entry is released (also any entry an
+older helper journalled as a removal). Only the owner, or infotainment under its future system
+contract, removes such a pairing; to use such a phone again, the owner unpairs it in Bluetooth
+settings first and then enrols it again in Android Auto (docs/enrolment-ordering.md). `PairingOpened`
 describes admission and follows committed approval, including error 703 (rename
 committed, directory durability uncertain), which emits
 `pairing_approval_not_durable` and keeps helper confirmation consistent with the
@@ -213,8 +217,9 @@ identities are durably recorded in `/var/lib/aa-system-helper/managed-bonds`
 allow-list only when the receiver calls `PairingBondCommittedV1`, after explicit
 comparison acceptance, exact bond verification, every receiver-side check and the
 receiver's durable trust write. Pending admission and acknowledgement never write `managed-bonds`;
-admission records the identity in `pending-removals` (same file rules, not revocation authority)
-so a restarted helper still removes an unaccepted or provisional bond. Revocation moves an
+admission records the identity in `pending-removals` (the enrolment journal; same file rules, not
+revocation authority, never a removal) so a restarted helper still lets the receiver's
+reconciliation decide an unaccepted or provisional bond. Revocation moves an
 entry from `managed-bonds` to `revoked-bonds` (same file rules, at most 256, oldest evicted):
 revocation authority only, never admission.
 A trusted reconnect is admitted only for an
@@ -251,11 +256,11 @@ the helper does not expose Introspectable). Methods:
 | PollPeerV1 | empty | `utss` error, handle, address, adapter identity | Exactly one helper-observed public BR/EDR candidate, otherwise reject |
 | BindPeerV1 | `ttt` generation, request source, observed handle | `ut` error, zero | Snapshot binding before confirmation, no radio exposure |
 | ReconnectPeerV1 | `t` observed handle | `ut` error, state | Store-owner exact lookup followed by helper actual-bond check |
-| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only an admitted, revoked or pending-removal exact identity (or, reporting success with nothing to do, one this helper run's cleanup already removed and no longer present); demotes an admitted bond to `revoked-bonds` and reports success only once that demotion is durable; re-resolve BlueZ object, never accept a supplied path. The fast path of ForgetPhone: reconciliation resolves a bond leg it could not complete |
+| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only an admitted, revoked or journalled (`pending-removals`) exact identity; demotes an admitted bond to `revoked-bonds` and releases a journal entry, reporting success only once both are durable; never removes, cancels or disconnects a pairing: the bond stays paired and refused (#136). The fast path of ForgetPhone: reconciliation resolves a bond leg it could not complete |
 | PairingBondConfirmedV1 | `tt` generation, request source | `ut` error, bonded boolean | Verification only: accepted comparison and exact bonded snapshot; records nothing |
 | PairingBondAcknowledgedV1 | `tt` generation, request source | `ut` error, reserved zero | Marks the verified bond provisional after every receiver-side check passed; writes nothing, admits nothing |
 | PairingBondCommittedV1 | `tt` generation, request source | `ut` error, reserved zero | After the receiver's durable trust write: admits the provisional bond (confirmed `managed-bonds` sync, then durable `pending-removals` removal); any failure closes the window and parks the bond, unadmitted, for reconciliation |
-| ReconcileBondsV1 | `a(ss)` the receiver's approved wireless identities (at most 256, exact addresses, no duplicates) | `ut` error, unadmitted count (low 32 bits) and open-window flag (bit 32) | Same sender/UID/process authentication; no lease (it precedes any source) and never touches the live enrolment window's bond. Durable and idempotent; success only once every state change is confirmed (rename + directory fsync). Until the first success of a helper run nothing is admitted, no enrolment opens and no cleanup removes a bond |
+| ReconcileBondsV1 | `a(ss)` the receiver's approved wireless identities (at most 256, exact addresses, no duplicates) | `ut` error, unadmitted count (low 32 bits) and open-window flag (bit 32) | Same sender/UID/process authentication; no lease (it precedes any source) and never touches the live enrolment window's bond. Durable and idempotent; success only once every state change is confirmed (rename + directory fsync). Until the first success of a helper run nothing is admitted, no enrolment opens and no journal entry is released; no bond is ever removed |
 | GetPairingComparisonV1 | `tt` generation, request source | `utuss` error, challenge ID, comparison, address, adapter | Authenticated consumer-only retrieval during explicit enrollment |
 | RespondPairingComparisonV1 | `tttu` generation, request source, challenge ID, accept | `ut` error, reserved zero | Explicit human decision after retrieval; one use, same enrollment/peer/deadline |
 

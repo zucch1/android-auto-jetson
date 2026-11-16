@@ -100,8 +100,8 @@ Invalidate/teardown quiets the adapter and closes sockets but never RemoveDevice
 Before deletion, PairingPolicy/WiredPhoneControl captures the immutable full identity
 on the store-owner thread. Only durable success or committed-not-durable703 sends
 RevokeAP1 and, for wireless, RevokePeerV1. Precommit failures preserve trust and external bonds. The backend
-accepts revocation only for an identity it managed, resolves the CURRENT object,
-and calls Adapter1.RemoveDevice only for that exact peer. External failures emit
+accepts revocation only for an identity it managed and demotes it; the BlueZ bond
+stays paired and refused, never removed (shared adapter, #136). External failures emit
 per-leg pending diagnostics and retain snapshot/progress in ControlService alone.
 Authenticated ForgetPhone retries one phone without deleting again or resending
 acknowledged legs; original703 wins every retry. The client owns no separate queue.

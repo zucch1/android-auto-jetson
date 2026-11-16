@@ -13,9 +13,10 @@ namespace aa::helper::bluez_adapter {
 // fsync when durability was not yet confirmed. remember(): new admissions only;
 // a failed write refuses that admission but never removes revocation of an
 // existing or renamed-into-place entry.
-// The same file-safety rules and format back two more, independent lists under other file
-// names: the enrolment windows' bonds awaiting removal (pending-removals, see forget()) and the
-// revoked bonds kept only as revocation authority (revoked-bonds, see remember(evict_oldest)).
+// The same file-safety rules and format back two more, independent lists under other file names:
+// the open enrolments not yet committed or released (pending-removals, a legacy name: never a
+// removal, #136, see forget()), and the revoked bonds kept only as refusal history (revoked-bonds,
+// see remember(evict_oldest)).
 class ManagedPeers {
 public:
     explicit ManagedPeers(std::string directory, std::uint32_t owner = 0, std::string file = "managed-bonds");

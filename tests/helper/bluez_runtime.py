@@ -35,6 +35,8 @@ class MockState(TypedDict):
     default_agent: bool
     removed: list[str]
     disconnected: list[str]
+    destructive: int
+    bonded: bool
     helper: str
     register_attempts: dict[str, int]
 
@@ -78,6 +80,14 @@ class Surface:
         self.rogue = connect(session)
         self.mock = stack.enter_context(process([sys.executable, "-B", str(Path(__file__).with_name("bluez_mock.py")), self.address], self.env))
         assert line(self.mock) == "ready"
+
+        def never_destructive(exc_type: object, _exc: object, _tb: object) -> bool:
+            # The adapter is shared (#136): no scenario may remove, cancel or disconnect a pairing.
+            if exc_type is None and self.mock.poll() is None:
+                state = self.state()
+                assert state["destructive"] == 0, f"the helper removed, cancelled or disconnected a pairing: {state}"
+            return False
+        stack.push(never_destructive)
         binary = build / ("aa_bluez_peer_probe" if probe else "aa_system_helper_fixture")
         (directory / "session.uid").write_text(f"{os.getuid()}\n")
         (directory / "receiver.sha256").write_text(hashlib.sha256(binary.read_bytes()).hexdigest() + "\n")
@@ -176,14 +186,15 @@ def revocation_flow(surface: Surface) -> None:
     assert surface.phone() == phone and surface.state()["removed"] == []
     assert command(surface.receiver, "fault-dir") == "0"
     rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (phone,)))
-    assert surface.phone() == 0 and len(surface.state()["removed"]) == 1
+    # The helper leg demotes and keeps the bond (shared adapter, #136).
+    assert surface.phone() == 0 and surface.state()["removed"] == []
     assert command(surface.receiver, "fault-clear") == "0"
     assert command(surface.receiver, "pending-revocations") == "1"
     command(surface.mock, "restore")
     rejected(surface.consumer, "RequestAddPhone")
     for _ in range(3):
         rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (phone,)))
-        assert len(surface.state()["removed"]) == 1
+        assert surface.state()["removed"] == []
     assert command(surface.receiver, "pending-revocations") == "1"
     print("PASS revoke703_precommit_and_missing_ap_remains_pending_without_reapproval", flush=True)
 
@@ -202,9 +213,11 @@ def bond_retry_flow(surface: Surface) -> None:
     command(surface.mock, "allow-remove")
     rejected(surface.consumer, "ForgetPhone", GLib.Variant("(t)", (phone,)))
     assert command(surface.receiver, "pending-revocations") == "1"
-    # The failed removal backs off (1 s doubling to 30 s, #118); the owed removal completes on a
-    # later helper tick once BlueZ allows it.
-    wait(lambda: len(surface.state()["removed"]) == 1, 35)
+    # The bond leg never needs BlueZ: the forgotten bond is kept and refused (shared adapter, #136).
+    time.sleep(1.2)
+    assert surface.state()["removed"] == [] and surface.state()["remove_attempts"] == 0
+    assert command(surface.receiver, "reconnect") != "0", "a forgotten phone reconnected"
+    assert command(surface.mock, "AuthorizeService hfp") == "rejected"
     print("PASS bond_retry_progress_with_explicitly_unavailable_ap", flush=True)
 
 
@@ -253,8 +266,10 @@ def rollback_flow(surface: Surface) -> None:
     rejected(surface.consumer, "ConfirmPhonePairing", GLib.Variant("(t)", (request,)))
     assert surface.phone() == 0
     assert command(surface.receiver, "pending-revocations") == "0"
-    wait(lambda: len(surface.state()["removed"]) == 1)
     assert command(surface.receiver, "pending-pairings") == "0"
+    # The failed window's device is never removed (shared adapter, #136) and never admitted.
+    assert surface.state()["removed"] == []
+    assert command(surface.receiver, "reconnect") != "0"
     print("PASS helper_failure_never_approves_and_closes_window", flush=True)
 
 

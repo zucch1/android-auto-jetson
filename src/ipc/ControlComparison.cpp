@@ -61,9 +61,9 @@ void ControlService::advance_enrolment() {
     const auto approved = persist_pairing(*registered_, request, &durable);
     if (!approved) { open_pairing_.reset(); return; }
     // Second, explicit step: only a durable trust write is committed to the helper, which admits
-    // the bond (services, reconnect) and drops its cleanup obligation only now. A failed or lost
+    // the bond (services, reconnect) and drops its journal entry only now. A failed or lost
     // commit, or a write that is not durable, retracts the approval: the bond is not admitted, so
-    // the phone must not stay approved (tracked revocation; the helper removes the bond).
+    // the phone must not stay approved (tracked revocation; the helper keeps the bond refused, #136).
     const auto phone = open_pairing_ ? open_pairing_->phone : core::PhoneId{};
     const auto committed = durable && phone ? confirmation_->bond_committed(registered_->consumer, request) :
                                               core::Result<void>{Error{ErrorCode::trust_store_not_durable}};

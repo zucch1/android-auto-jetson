@@ -13,8 +13,8 @@ core::Result<bool> BluezBackend::bond_confirmed() {
     return true;
 }
 // Provisional: the receiver's checks passed, its trust write has not happened. Nothing durable
-// changes; the journal entry written when the window opened stays the cleanup obligation, so a
-// receiver that exits now (or a helper restart) still removes the bond. Not admitted.
+// changes; the journal entry written when the window opened stays, so after a receiver exit (or a
+// helper restart) the receiver's next reconciliation decides. Not admitted; never removed (#136).
 core::Result<void> BluezBackend::acknowledge_bond() {
     const auto bonded = bond_confirmed();
     if (!bonded) return bonded.error();
@@ -46,8 +46,6 @@ core::Result<void> BluezBackend::commit_bond() {
         return fail();
     impl_->acknowledged = false;
     std::erase(impl_->awaiting, identity);
-    if (std::find(impl_->approved.begin(), impl_->approved.end(), identity) == impl_->approved.end())
-        impl_->approved.push_back(identity);
     return {};
 }
 void BluezBackend::Impl::reject_comparison() {
