@@ -210,37 +210,45 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
 esac
 """
 
-CLOCK_SHIM = r"""#!/usr/bin/env python3
-import os
-import pathlib
-import sys
-if sys.argv[1:] != ['-c', 'import time; print(time.monotonic_ns())']:
-    os.execv(os.environ['REAL_PYTHON'], [os.environ['REAL_PYTHON'], *sys.argv[1:]])
-state = pathlib.Path(os.environ['FAKE_SSH_STATE'])
-state.mkdir(exist_ok=True)
-clock = state / 'clock'
-now = int(clock.read_text()) if clock.exists() else 1000000000
-countdown = state / 'terminal_countdown'
-if countdown.exists():
-    count = int(countdown.read_text()) - 1
-    countdown.write_text(str(count))
-    if count <= 0:
-        now = 1000000000 + int(os.environ['FAKE_TERMINAL_MS']) * 1000000
-        countdown.unlink()
-clock.write_text(str(now))
-print(now)
+# Injected host clock (issue #147). The harness reads its monotonic clock only
+# through `python3 -c 'import time; print(time.monotonic_ns())'` and waits only
+# through `sleep`, so these PATH shims make every deadline a function of the
+# scripted sleeps alone: process start-up cost on a slow or loaded runner can no
+# longer consume an evidence window. They are bash, not Python, because the
+# harness reads the clock hundreds of times per run and a Python start-up per
+# read dominated the suite's runtime on the Jetson. Every other python3 call is
+# handed to the real interpreter unchanged.
+CLOCK_SHIM = r"""#!/usr/bin/env bash
+if [ "$#" != 2 ] || [ "$1" != -c ] || [ "$2" != 'import time; print(time.monotonic_ns())' ]; then
+    exec "$REAL_PYTHON" "$@"
+fi
+state="$FAKE_SSH_STATE"
+mkdir -p "$state"
+now=1000000000
+[ ! -f "$state/clock" ] || now="$(< "$state/clock")"
+if [ -f "$state/terminal_countdown" ]; then
+    count=$(( $(< "$state/terminal_countdown") - 1 ))
+    printf '%s' "$count" > "$state/terminal_countdown"
+    if (( count <= 0 )); then
+        now=$(( 1000000000 + FAKE_TERMINAL_MS * 1000000 ))
+        rm -f "$state/terminal_countdown"
+    fi
+fi
+printf '%s' "$now" > "$state/clock"
+printf '%s\n' "$now"
 """
 
-SLEEP_SHIM = r"""#!/usr/bin/env python3
-import os
-import pathlib
-import sys
-state = pathlib.Path(os.environ['FAKE_SSH_STATE'])
-clock = state / 'clock'
-now = int(clock.read_text()) if clock.exists() else 1000000000
-if os.environ.get('FAKE_FREEZE_SLEEP') != '1':
-    now += int(float(sys.argv[1]) * 1000000000)
-clock.write_text(str(now))
+SLEEP_SHIM = r"""#!/usr/bin/env bash
+set -eu
+[[ "$1" =~ ^([0-9]+)(\.([0-9]{0,9}))?$ ]] || { echo "fake sleep: unsupported duration: $1" >&2; exit 2; }
+whole="${BASH_REMATCH[1]}" frac="${BASH_REMATCH[3]}000000000"
+state="$FAKE_SSH_STATE"
+now=1000000000
+[ ! -f "$state/clock" ] || now="$(< "$state/clock")"
+if [ "${FAKE_FREEZE_SLEEP:-}" != 1 ]; then
+    now=$(( now + 10#$whole * 1000000000 + 10#${frac:0:9} ))
+fi
+printf '%s' "$now" > "$state/clock"
 """
 
 
@@ -382,14 +390,18 @@ class RecoveryQaGates(unittest.TestCase):
                 if scenario == "usb_unplug_replug":
                     self.assertIn("drivers/usb/bind", self.last_calls)
 
+    # The two real-late reproductions keep the host clock on purpose: they prove
+    # the coreutils `timeout` wrapper really kills a probe that overruns the
+    # budget. Their verdict is a FAILURE either way, so runner speed cannot
+    # turn them green.
     def test_real_late_media_reproduction(self):
-        env = self.passing_env() | {"FAKE_MEDIA_DELAY": "5.2"}
+        env = self.passing_env() | {"FAKE_MEDIA_DELAY": "5.2", "FAKE_CLOCK": "0"}
         code, doc = self.run_qa(["--only", "consumer_restart"], **env)
         self.assert_budget_failure(code, doc)
         self.assertIsNone(doc["scenarios"][0]["recovery_ms"])
 
     def test_real_late_admission_reproduction(self):
-        env = self.passing_env() | {"FAKE_ATTEMPT_DELAY": "5.2"}
+        env = self.passing_env() | {"FAKE_ATTEMPT_DELAY": "5.2", "FAKE_CLOCK": "0"}
         code, doc = self.run_qa(["--only", "unknown_phone"], **env)
         self.assert_budget_failure(code, doc)
         self.assertIsNone(doc["scenarios"][0]["recovery_ms"])
@@ -484,11 +496,13 @@ class RecoveryQaGates(unittest.TestCase):
             shim = root / "ssh"
             shim.write_text(FAKE_SSH, encoding="utf-8")
             shim.chmod(0o755)
-            if env.get("FAKE_CLOCK") == "1":
+            if env.get("FAKE_CLOCK", "1") != "0":
                 # PATH, not a production timestamp override, owns the test clock.
+                # It is the default so no verdict depends on runner speed; only
+                # the real-timeout reproductions opt out with FAKE_CLOCK="0".
                 for name, text in (("python3", CLOCK_SHIM), ("sleep", SLEEP_SHIM)):
                     path = root / name
-                    path.write_text(text.replace("#!/usr/bin/env python3", f"#!{sys.executable}", 1), encoding="utf-8")
+                    path.write_text(text, encoding="utf-8")
                     path.chmod(0o755)
             out = root / "result.json"
             command = [str(self.script), "--out", str(out)]
