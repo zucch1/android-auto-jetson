@@ -1055,7 +1055,7 @@ TEST_F(ManagedBonds, ForgottenPhonePairedOutsideAndroidAutoIsRefusedAndKeptWithA
             EXPECT_EQ(reconciled.value(), approval.size()) << "the refused approval was not reported";
             EXPECT_NE(log.find("warning bond_kept_revoked_identity id-"), std::string::npos) << log;
             EXPECT_NE(log.find("forgotten in Android Auto"), std::string::npos) << log;
-            EXPECT_NE(log.find("Enrol the phone again in Android Auto"), std::string::npos) << log;
+            EXPECT_NE(log.find("unpair it in Bluetooth settings first, then enrol it again"), std::string::npos) << log;
             EXPECT_EQ(log.find("02:00:00:00:00:01"), std::string::npos) << "the raw address was logged";
             EXPECT_FALSE(peer_in(directory, "pending-removals")) << "a removal is owed outside an enrolment";
             for (int attempt = 0; attempt < 5; ++attempt) backend.tick();
@@ -1169,7 +1169,7 @@ TEST_P(LegacyJournal, EntryNeverRemovesABondAfterAnUpgrade) {
         for (int attempt = 0; attempt < 5; ++attempt) backend.tick();
         if (run == 1) {
             // RevokePeerV1 while the legacy entry is still journalled: the entry is authority, the
-            // revocation completes without any BlueZ call.
+            // revocation completes without removing, cancelling or disconnecting the pairing.
             ASSERT_TRUE(peer_in(directory, "pending-removals"));
             EXPECT_TRUE(backend.revoke_peer(primary_peer));
             EXPECT_FALSE(peer_in(directory, "pending-removals")) << "the revoked legacy entry is still journalled";
@@ -1314,6 +1314,58 @@ TEST_P(WindowBond, IsKeptAndRefusedWhateverEndsTheWindow) {
 INSTANTIATE_TEST_SUITE_P(EachEnd, WindowBond,
                          testing::Values(WindowEnd::cancel, WindowEnd::reject, WindowEnd::timeout,
                                          WindowEnd::acknowledged_restart, WindowEnd::crash_restart));
+// A device continuity loss (BlueZ reports Connected=false) between the acknowledgement and the
+// commit: the receiver's approval may already be durable, so the acknowledged bond is parked, its
+// journal entry kept, and it stays refused until the receiver's reconciliation decides, in this
+// helper run or after a restart. An approval admits it; an empty set releases it, the bond kept.
+enum class AfterLoss { approved, restart_approved, restart_unapproved };
+class ContinuityLoss : public ManagedBonds, public testing::WithParamInterface<AfterLoss> {};
+TEST_P(ContinuityLoss, ParksAnAcknowledgedBondForTheReceiversAnswer) {
+    const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+    ASSERT_NE(bus_address, nullptr);
+    MockBluez mock{bus_address};
+    auto backend = std::make_unique<helper::BluezBackend>(bus_address, steady(), directory, ::getuid());
+    ASSERT_TRUE(backend->apply(helper::Action::register_profile, 0));
+    ASSERT_TRUE(backend->reconcile_bonds({}));
+    const auto obs = backend->observe();
+    ASSERT_TRUE(obs);
+    accept_enrolment(*backend, mock, obs.value().handle);
+    if (HasFatalFailure()) return;
+    ASSERT_TRUE(backend->acknowledge_bond());
+    // The receiver's trust write lands, then the link drops before its commit arrives.
+    ASSERT_EQ(mock.command("connected-false"), "ok");
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        backend->tick(); std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    EXPECT_FALSE(backend->commit_bond()) << "a commit after the continuity loss was accepted";
+    EXPECT_TRUE(peer_in(directory, "pending-removals")) << "the continuity loss released an acknowledged bond";
+    EXPECT_FALSE(peer_in(directory, "managed-bonds"));
+    expect_refused_everywhere(*backend, mock);
+    if (HasFatalFailure()) return;
+    if (GetParam() != AfterLoss::approved) {
+        backend.reset();
+        backend = std::make_unique<helper::BluezBackend>(bus_address, steady(), directory, ::getuid());
+        ASSERT_TRUE(backend->apply(helper::Action::register_profile, 0));
+        EXPECT_TRUE(peer_in(directory, "pending-removals")) << "the restart lost the parked journal entry";
+    }
+    const bool approved = GetParam() != AfterLoss::restart_unapproved;
+    const auto answer = approved ? backend->reconcile_bonds({primary_peer}) : backend->reconcile_bonds({});
+    ASSERT_TRUE(answer);
+    EXPECT_EQ(answer.value(), 0U);
+    EXPECT_FALSE(peer_in(directory, "pending-removals"));
+    if (approved) {
+        EXPECT_TRUE(peer_in(directory, "managed-bonds")) << "the durable approval was not recovered";
+        const auto reconnect = backend->observe();
+        ASSERT_TRUE(reconnect);
+        EXPECT_TRUE(backend->reconnect_peer(reconnect.value().handle)) << "the recovered bond does not reconnect";
+    } else {
+        EXPECT_FALSE(peer_in(directory, "managed-bonds"));
+        expect_refused_everywhere(*backend, mock);
+    }
+    EXPECT_EQ(state_number(mock, "destructive"), 0U);
+}
+INSTANTIATE_TEST_SUITE_P(EachAnswer, ContinuityLoss,
+                         testing::Values(AfterLoss::approved, AfterLoss::restart_approved, AfterLoss::restart_unapproved));
 // A device BlueZ holds in a temporary pairing (Paired, not Bonded) when an enrolment window for it
 // closes: BlueZ turns CancelPairing without an in-flight Pair() into an unpair, so the helper never
 // sends it (#136); the pending comparison is rejected through the agent's reply instead.

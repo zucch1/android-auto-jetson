@@ -34,7 +34,8 @@ void BluezBackend::Impl::release(const PeerIdentity& peer, const std::vector<Dev
                   << diagnostics::redact_identifier(peer.address)
                   << ": this phone is paired in Bluetooth but its Android Auto enrolment did not "
                      "complete; the Bluetooth adapter is shared, so its pairing is kept and Android "
-                     "Auto refuses the phone. Enrol the phone again in Android Auto to use it.\n";
+                     "Auto refuses the phone. To use it, unpair it in Bluetooth settings first, then "
+                     "enrol it again in Android Auto.\n";
 }
 void BluezBackend::Impl::release_window(const std::vector<Device>& devices) {
     if (allowed && !listed(awaiting, allowed->device.identity)) release(allowed->device.identity, devices);
@@ -162,7 +163,8 @@ core::Result<std::uint64_t> BluezBackend::reconcile_bonds(const std::vector<Peer
                   << diagnostics::redact_identifier(peer.address)
                   << ": this phone was forgotten in Android Auto but is still paired in Bluetooth; the "
                      "Bluetooth adapter is shared, so its pairing is kept and Android Auto refuses the "
-                     "phone. Enrol the phone again in Android Auto to use it.\n";
+                     "phone. To use it, unpair it in Bluetooth settings first, then enrol it again in "
+                     "Android Auto.\n";
     }
     s.reconciled = durable;
     if (!durable) return Error{ErrorCode::helper_unavailable};

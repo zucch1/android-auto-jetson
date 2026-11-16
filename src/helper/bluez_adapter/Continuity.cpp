@@ -11,7 +11,11 @@ void BluezBackend::Impl::lost_path(const std::string& path) {
         return observed.device.path == path || observed.device.adapter_path == path;
     };
     std::erase_if(observations, [&](const auto& item) { return matches(item.second); });
-    if (allowed && matches(*allowed)) { reject_comparison(); release_window(); allowed.reset(); }
+    // An acknowledged bond is parked first (as on close and reset): the receiver's approval may be
+    // durable, so its journal entry stays for reconciliation. Only an unacknowledged one is released.
+    if (allowed && matches(*allowed)) {
+        park(); reject_comparison(); release_window(); allowed.reset(); acknowledged = false;
+    }
     if (connected && matches(*connected)) retire(handoff_handle, HandoffFailure::eligibility);
 }
 void BluezBackend::Impl::watch_continuity() {

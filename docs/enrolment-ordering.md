@@ -58,7 +58,8 @@ The only provable rule is never to delete. Instead:
   Android Auto connection the helper itself holds for that phone (its RFCOMM socket and handoff) is
   closed.
 - An enrolment window that ends without a commit (cancel, reject, timeout, adapter setup failure,
-  consumer or receiver loss, a BlueZ restart, the device object disappearing) rejects a pending
+  consumer or receiver loss, a BlueZ restart, the device object disappearing or a continuity loss
+  such as `Connected=false`) rejects a pending
   numeric comparison through the helper agent's reply (`org.bluez.Error.Rejected`), closes
   `Pairable`/`Discoverable` and releases its journal entry. A pairing it leaves behind (one the
   window made, one that existed before, or one an outside pairing completed meanwhile) stays paired.
@@ -73,10 +74,11 @@ The only provable rule is never to delete. Instead:
   stable within the run, never the raw address). Every reconciliation that finds a revoked
   identity still bonded logs `system-helper: warning bond_kept_revoked_identity <redacted address>:
   this phone was forgotten in Android Auto but is still paired in Bluetooth; the Bluetooth adapter
-  is shared, so its pairing is kept and Android Auto refuses the phone. Enrol the phone again in
-  Android Auto to use it.` A released journal entry whose device is still bonded logs `system-helper:
-  warning bond_kept_unowned_enrolment <redacted address>: this phone is paired in Bluetooth but its
-  Android Auto enrolment did not complete; ...` (when the window closes, or at the reconciliation
+  is shared, so its pairing is kept and Android Auto refuses the phone. To use it, unpair it in
+  Bluetooth settings first, then enrol it again in Android Auto.` A released journal entry whose
+  device is still bonded logs `system-helper: warning bond_kept_unowned_enrolment <redacted
+  address>: this phone is paired in Bluetooth but its Android Auto enrolment did not complete; ...`
+  with the same advice (when the window closes, or at the reconciliation
   that releases it). An entry released at a BlueZ restart or a removed device object is not logged
   (no inventory is read then).
 - The pairing stays until the owner removes it in Bluetooth settings, or the infotainment system
@@ -134,7 +136,7 @@ step.
 | Demotion's renames unsynced and power lost (finding 4) | managed entry back, maybe without history | the restarted helper admits nothing before reconciliation, which demotes again and reports success only once durable |
 | Demotion stops after history (managed entry not yet dropped) | managed and history entries, bond | the restarted helper admits nothing; reconciliation demotes again; the bond is kept (#136) |
 | Demotion stops after the managed entry is dropped | history entry, bond | refused; the bond is kept (#136) |
-| Demotion left a journal entry by an older (exclusive-adapter) helper | journal entry, maybe managed or history entries, maybe a bond | reconciliation demotes a managed entry, releases the journal entry without any BlueZ call, keeps and logs the bond |
+| Demotion left a journal entry by an older (exclusive-adapter) helper | journal entry, maybe managed or history entries, maybe a bond | reconciliation demotes a managed entry, releases the journal entry, never removes, cancels or disconnects the pairing, keeps and logs the bond |
 | Helper stops or crashes with an enrolment window open | journal entry (an orderly stop releases it at once), maybe a bond | reconciliation releases the entry unless approved; the bond is kept, refused and logged |
 | A leftover `window-created-bonds` file (a pre-release build of #143) | that file | never read; ignored |
 | Demotion stops after history **and** the store's forget was lost (double fault) | approval resurrected; managed and history entries, bond | the revocation wins: not admitted, counted as unadmitted; ForgetPhone again completes the demotion |
@@ -206,10 +208,10 @@ the receiver retracts it through the same path as `ForgetPhone` (store forget pl
 tracked `RevokePeerV1`) and reconciles. A receiver crash after its store write and
 before the commit is healed by its start-up reconciliation (crash window 1).
 
-`RevokePeerV1` accepts an admitted, revoked or journalled identity and never makes a BlueZ call
-(#136): it closes the identity's open window or Android Auto connection, demotes a managed
-identity to history and releases its journal entry, each durable before it reports success. The
-bond stays paired, refused. Every other identity is refused.
+`RevokePeerV1` accepts an admitted, revoked or journalled identity and never removes, cancels or
+disconnects a pairing (#136): it closes the identity's open window (quieting the adapter, as every
+window close does) or Android Auto connection, demotes a managed identity to history and releases
+its journal entry, each durable before it reports success. The bond stays paired, refused. Every other identity is refused.
 
 No deadline or background callback supplies acceptance.
 

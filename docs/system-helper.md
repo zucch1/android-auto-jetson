@@ -134,7 +134,8 @@ Auto path (admission, RFCOMM bootstrap, HFP, `ReconnectPeerV1`) and logged with 
 address: `bond_kept_revoked_identity` at each reconciliation for a forgotten phone, and
 `bond_kept_unowned_enrolment` when an unfinished enrolment's entry is released (also any entry an
 older helper journalled as a removal). Only the owner, or infotainment under its future system
-contract, removes such a pairing (docs/enrolment-ordering.md). `PairingOpened`
+contract, removes such a pairing; to use such a phone again, the owner unpairs it in Bluetooth
+settings first and then enrols it again in Android Auto (docs/enrolment-ordering.md). `PairingOpened`
 describes admission and follows committed approval, including error 703 (rename
 committed, directory durability uncertain), which emits
 `pairing_approval_not_durable` and keeps helper confirmation consistent with the
@@ -255,7 +256,7 @@ the helper does not expose Introspectable). Methods:
 | PollPeerV1 | empty | `utss` error, handle, address, adapter identity | Exactly one helper-observed public BR/EDR candidate, otherwise reject |
 | BindPeerV1 | `ttt` generation, request source, observed handle | `ut` error, zero | Snapshot binding before confirmation, no radio exposure |
 | ReconnectPeerV1 | `t` observed handle | `ut` error, state | Store-owner exact lookup followed by helper actual-bond check |
-| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only an admitted, revoked or journalled (`pending-removals`) exact identity; demotes an admitted bond to `revoked-bonds` and releases a journal entry, reporting success only once both are durable; never makes a BlueZ call: the bond stays paired and refused (#136). The fast path of ForgetPhone: reconciliation resolves a bond leg it could not complete |
+| RevokePeerV1 | `ss` immutable removed address, adapter identity | `ut` error, zero | Only an admitted, revoked or journalled (`pending-removals`) exact identity; demotes an admitted bond to `revoked-bonds` and releases a journal entry, reporting success only once both are durable; never removes, cancels or disconnects a pairing: the bond stays paired and refused (#136). The fast path of ForgetPhone: reconciliation resolves a bond leg it could not complete |
 | PairingBondConfirmedV1 | `tt` generation, request source | `ut` error, bonded boolean | Verification only: accepted comparison and exact bonded snapshot; records nothing |
 | PairingBondAcknowledgedV1 | `tt` generation, request source | `ut` error, reserved zero | Marks the verified bond provisional after every receiver-side check passed; writes nothing, admits nothing |
 | PairingBondCommittedV1 | `tt` generation, request source | `ut` error, reserved zero | After the receiver's durable trust write: admits the provisional bond (confirmed `managed-bonds` sync, then durable `pending-removals` removal); any failure closes the window and parks the bond, unadmitted, for reconciliation |
