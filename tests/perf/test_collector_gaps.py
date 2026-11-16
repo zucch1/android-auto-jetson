@@ -59,7 +59,7 @@ def progress_sample(second: int, av_pairs: int) -> Sample:
                   av_pairs=av_pairs)
 
 
-def run_gap(*, jumps: tuple[tuple[int, int], ...] = ((5, 30),), mode: str = "healthy",
+def run_gap(*, jumps: tuple[tuple[float, float], ...] = ((5, 30),), mode: str = "healthy",
             duration: int = 10, stop_after: int | None = None, interval: int = 1,
             extra_stamps: tuple[int, ...] = ()) -> dict:
     """Freeze collector sleeps while the receiver logs on its own clock.
@@ -74,9 +74,9 @@ def run_gap(*, jumps: tuple[tuple[int, int], ...] = ((5, 30),), mode: str = "hea
     jump_index = [0]
     last_second = [0]
     backlog: list[tuple[str, dict]] = []
-    gap_start, gap_seconds = jumps[0]
+    gap_start, gap_seconds = jumps[0] if jumps else (0, 0)
     gap_end = gap_start + gap_seconds
-    catchup_ns = (gap_end + 0.5) * NS
+    catchup_ns = round((gap_end + 0.5) * NS)
     if mode == "never":
         stop_after = gap_start
 
@@ -136,10 +136,10 @@ def run_gap(*, jumps: tuple[tuple[int, int], ...] = ((5, 30),), mode: str = "hea
 
     def sleep(seconds: float) -> None:
         if (jump_index[0] < len(jumps)
-                and clock[0] >= jumps[jump_index[0]][0] * NS):
+                and clock[0] >= round(jumps[jump_index[0]][0] * NS)):
             _, seconds_gap = jumps[jump_index[0]]
             jump_index[0] += 1
-            advance(clock[0] + seconds_gap * NS)
+            advance(clock[0] + round(seconds_gap * NS))
         else:
             advance(clock[0] + round(seconds * NS))
 
@@ -543,11 +543,68 @@ def old_capture_replay() -> None:
         raise AssertionError("expected ContractError on malformed progress_evidence")
 
 
+def gap_33_7s_healthy_continues() -> None:
+    # Issue #90 exact timeline: a 33.7 s collector self-gap with healthy receiver
+    # counters during and after it records host interference, does not stop the
+    # receiver early for staleness, and never yields a clean qualification PASS.
+    capture = run_gap(jumps=((5, 33.7),), duration=50, interval=5)
+    assert capture["projection_failure"] is None, capture
+    assert capture["crashes"] == 0, capture
+    assert capture["active_projection_seconds"] == 50.0, capture["active_projection_seconds"]
+    assert len(capture["interference"]) == 1, capture["interference"]
+    gap = capture["interference"][0]
+    assert gap["reason"] == "collector_sampling_gap", gap
+    assert gap["classification"] == "host_interference", gap
+    assert gap["gap_seconds"] == 33.7, gap
+    assert gap["gap_ns"] == 33_700_000_000, gap
+    assert gap["projection_failure"] is None, gap
+    doc = report(capture)
+    assert doc["verdict"] == "BLOCKED", doc["verdict"]
+    assert doc["qualification_status"] == "INCOMPLETE", doc["qualification_status"]
+    assert "coverage:sampling" in doc["named_gaps"], doc["named_gaps"]
+    assert doc["run_status"]["projection_failure"] is None, doc["run_status"]
+    assert doc["run_status"]["interference"] == capture["interference"]
+    assert any("33.7 s" in note and "host interference" in note for note in doc["notes"]), doc["notes"]
+
+
+def real_media_stall_on_time() -> None:
+    # Real media stall with on-time 5 s sampling: no interference is recorded,
+    # _MEDIA_STALL_SECONDS (10 s) still stops the run at t=25 s with media_stalled.
+    capture = run_gap(jumps=(), duration=30, stop_after=10, interval=5)
+    assert capture["interference"] == [], capture["interference"]
+    assert capture["projection_failure"].startswith("media_stalled:"), capture
+    assert capture["observed_duration_seconds"] == 25, capture["observed_duration_seconds"]
+    assert capture["active_projection_seconds"] == 20, capture["active_projection_seconds"]
+    doc = report(capture)
+    assert doc["verdict"] == "FAIL", doc["verdict"]
+    assert doc["run_status"]["projection_failure"] == capture["projection_failure"]
+    assert "interference" not in doc["run_status"], doc["run_status"]
+
+
+def gap_33_7s_followed_by_real_stall() -> None:
+    # A 33.7 s collector self-gap survives with interference recorded; a subsequent
+    # real media stall at t=45 s still triggers media_stalled and stops the run.
+    capture = run_gap(jumps=((5, 33.7),), duration=70, stop_after=45, interval=5)
+    assert len(capture["interference"]) == 1, capture["interference"]
+    gap = capture["interference"][0]
+    assert gap["reason"] == "collector_sampling_gap", gap
+    assert gap["classification"] == "host_interference", gap
+    assert gap["gap_seconds"] == 33.7, gap
+    assert gap["projection_failure"] is None, gap
+    assert capture["projection_failure"].startswith("media_stalled:"), capture
+    assert capture["observed_duration_seconds"] == 63.7, capture["observed_duration_seconds"]
+    doc = report(capture)
+    assert doc["verdict"] == "FAIL", doc["verdict"]
+    assert doc["run_status"]["projection_failure"] == capture["projection_failure"]
+    assert doc["run_status"]["interference"] == capture["interference"]
+
+
 CASES = {name: globals()[name] for name in (
     "no_gap_late_recovery", "no_gap_matches_main", "gap_decision", "gap_progress",
     "gap_logged_silence", "gap_trailing_silence", "gap_trailing_silence_collect",
     "gap_reanchor_two_post_gap_samples", "gap_log_catches_up", "gap_log_never_catches_up",
-    "stall_after_gap", "repeated_short_gaps", "repeated_long_gaps", "old_capture_replay")}
+    "stall_after_gap", "repeated_short_gaps", "repeated_long_gaps", "old_capture_replay",
+    "gap_33_7s_healthy_continues", "real_media_stall_on_time", "gap_33_7s_followed_by_real_stall")}
 
 
 if __name__ == "__main__":
