@@ -141,15 +141,17 @@ first paint is reported as `measured.startup_to_first_paint_s`. The run writes
 `receiver.log`, `display.log`, `idr-events.jsonl` (`idr_*` lines stamped on
 arrival, because they carry no time), `run.json` and `result.json`.
 `aa_drive_smoke.py analyze DIR` re-evaluates a directory offline. SIGTERM or
-SIGINT unwinds through the same cleanup as a normal finish: it stops each
-child's whole process group, restores the phone's USB mode and records the run
-as `BLOCKED interrupted` (exit 128+signal). The pass criteria are named
+SIGINT only sets a stop flag, which the runner checks at every wait point. It
+then runs the same single cleanup as a normal finish: it stops each registered
+child's whole process group (TERM, then KILL), restores the phone's USB mode
+and records the run as `BLOCKED interrupted` (exit 128+the first signal). A
+second signal cannot interrupt that cleanup. The pass criteria are named
 constants in the tool:
 
 | Constant | Criterion |
 | --- | --- |
 | `PAINTED_FPS_MIN_RATIO` = 0.90, `WINDOW_S` = 10, `FPS_STARTUP_GRACE_S` = 10 | every full 10 s window from first paint + 10 s to the end of the drive paints >= 90 % of the **negotiated** fps (59 windows in 600 s) |
-| `WAITING_IDR_MAX_S` = 1.0 | no `waiting_idr` episode (producer or consumer) lasts > 1 s inside the drive. An episode starts at the earlier of its first stamped `idr_requested` and (`idr_recovered` − `latency_ms`). A recovery with no logged request still counts: the display emits one even when every request failed. Without a usable latency it is taken as open since `active`. An unrecovered episode runs to the window end, and every episode is clipped at that end |
+| `WAITING_IDR_MAX_S` = 1.0 | no `waiting_idr` episode (producer or consumer) lasts > 1 s inside the drive. An episode starts at the earlier of its first stamped `idr_requested` and (`idr_recovered` − `latency_ms`). A recovery with no logged request still counts: the display emits one even when every request failed. When `latency_ms` is absent, negative, nonfinite or not a number, the episode is taken as open since `active`, even with a logged request, because the wait can predate its first successful request. An unrecovered episode runs from its first request to the window end. Every episode is intersected with [`active`, window end] |
 | — | no session drop: both processes alive at window end, the full window ran, no `disconnected` session state and no `terminal_error` inside it |
 | `AV_SYNC_MAX_MS` = the existing 50 ms budget | max A/V paint-vs-audio-write difference <= 50 ms, **where valid**: only when matched pairs exist (media playing); otherwise reported `n/a`. An audio slot whose `presented_ns` is null is skipped and counted in `invalid_audio_slots`. This differs from the perf collector, which invalidates the whole A/V metric for such a slot; the soak stages keep that stricter rule |
 
@@ -188,7 +190,8 @@ the target, and requires:
   same-day rule that an overnight phone or Maps update cannot slip past.
 
 The record is strict JSON (`NaN` and `Infinity` are refused), and every field
-the gate reads must have the right type. Both binaries must hash on the target
+the gate reads must be present with the right type (`video_profiles` must be
+present and `null`). Both binaries must hash on the target
 to a 64-hex-digit sha256. A display that cannot be hashed, or a stage with no
 display, is blocked.
 

@@ -222,6 +222,41 @@ class AnalyzerTests(unittest.TestCase):
         self.assertFalse(second["passed"])
         self.assertAlmostEqual(second["longest_s"], 5.0)
 
+    def recovery(self, request_s: float | None, recovered_s: float, **fields) -> dict:
+        """Analyze a run with one consumer episode, times relative to `active`."""
+        run = Run()
+        if request_s is not None:
+            run.stamped.append({"observed_ns": ACTIVE + int(request_s * S), "event": {
+                "event": "idr_requested", "source": "consumer", "reason": "video_consumer_waiting_idr"}})
+        run.stamped.append({"observed_ns": ACTIVE + int(recovered_s * S), "event": {
+            "event": "idr_recovered", "source": "consumer", **fields}})
+        return criterion(self.analyze(run), "waiting_idr_max")
+
+    def test_unusable_latency_starts_at_active_even_with_a_request(self) -> None:
+        # Given a request 0.2 s before recovery at active+5 s: the wait may
+        # predate the request, so without a usable latency it counts from active.
+        for latency in ({}, {"latency_ms": -1}, {"latency_ms": float("nan")},
+                        {"latency_ms": float("inf")}, {"latency_ms": "200"}, {"latency_ms": True},
+                        {"latency_ms": None}):
+            with self.subTest(latency=latency):
+                idr = self.recovery(4.8, 5.0, **latency)
+                self.assertFalse(idr["passed"], idr)
+                self.assertAlmostEqual(idr["longest_s"], 5.0, places=3)
+        # A usable latency establishes the start (control).
+        idr = self.recovery(4.8, 5.0, latency_ms=200)
+        self.assertTrue(idr["passed"], idr)
+        self.assertAlmostEqual(idr["longest_s"], 0.2, places=3)
+
+    def test_episode_is_clipped_at_active(self) -> None:
+        # A recovery at active+0.5 s with latency 1500 counts only its 0.5 s after active.
+        idr = self.recovery(None, 0.5, latency_ms=1500)
+        self.assertTrue(idr["passed"], idr)
+        self.assertAlmostEqual(idr["longest_s"], 0.5, places=3)
+        # An episode wholly before active counts 0.
+        idr = self.recovery(-3.0, -2.0, latency_ms=1500)
+        self.assertTrue(idr["passed"], idr)
+        self.assertEqual(idr["longest_s"], 0.0)
+
     def test_episode_is_clipped_to_the_drive_window(self) -> None:
         # Given a request 0.2 s before the drive ends that recovers 2 s later.
         result = self.analyze(Run().idr("producer", 599.8, 2.0))
@@ -296,6 +331,17 @@ class GateTests(unittest.TestCase):
             with self.subTest(doc=doc):
                 self.assertEqual(self.check(doc), "drive_smoke_malformed")
 
+    def test_missing_video_profiles_key_is_malformed(self) -> None:
+        doc = record()
+        del doc["video_profiles"]
+        self.assertEqual(self.check(doc), "drive_smoke_malformed")
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-gate-") as directory:
+            path = Path(directory) / "result.json"
+            path.write_text(json.dumps(doc))
+            result = run_check(path)
+        self.assertEqual((result.returncode, result.stdout.strip()), (3, "drive_smoke_malformed"))
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_both_launched_hashes_are_required(self) -> None:
         for receiver, display in (("", B), (A, ""), (A, None), (A, "xyz"), (A, B.upper())):
             with self.subTest(receiver=receiver, display=display):
@@ -320,7 +366,7 @@ class GateTests(unittest.TestCase):
                                                                  f'"duration_s": {constant}'))
                     result = run_check(path)
                     self.assertEqual(result.returncode, 3, result.stderr)
-                    self.assertTrue(result.stdout.startswith("drive_smoke_"), result.stdout)
+                    self.assertEqual(result.stdout.strip(), "drive_smoke_malformed", result.stderr)
 
 
 class LauncherGateTests(unittest.TestCase):
@@ -440,10 +486,50 @@ exit 0
 
 # Run the real runner in a child Python with only the host-wide process scan
 # stubbed (a compiler elsewhere on this machine must not block the test).
-DRIVER = """import sys
+# DRIVE_HOOK reproduces the two re-review races:
+#   spawn    SIGTERM queued inside Popen, right after the receiver exists and
+#            before the runner has its handle (records the child's SigBlk);
+#   cleanup  SIGINT delivered at cleanup entry (first SIG_IGN install or first
+#            child stop), after a mid-drive SIGTERM.
+DRIVER = """import os, signal, subprocess, sys, time
 sys.path.insert(0, sys.argv[1])
 import aa_drive_smoke
 aa_drive_smoke._comms = lambda: []
+hook, fake = os.environ.get("DRIVE_HOOK", ""), os.environ["FAKE_DIR"]
+fired = []
+if hook == "spawn":
+    class Hooked(subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            if kwargs.get("start_new_session") and not fired:
+                fired.append(self.pid)
+                pids = os.path.join(fake, "receiver.pids")
+                deadline = time.monotonic() + 10
+                while not os.path.exists(pids) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                status = open(f"/proc/{self.pid}/status").read()
+                with open(os.path.join(fake, "sigblk"), "w") as handle:
+                    handle.write(next(l for l in status.splitlines() if l.startswith("SigBlk:")))
+                os.kill(os.getpid(), signal.SIGTERM)
+    subprocess.Popen = Hooked
+elif hook == "cleanup":
+    # Fire at whichever cleanup entry point comes first: a handler change to
+    # SIG_IGN (the gap the re-review reproduced) or stopping the first child.
+    def second_signal():
+        if not fired:
+            fired.append(1)
+            os.kill(os.getpid(), signal.SIGINT)
+    real_stop, real_signal = aa_drive_smoke._stop, signal.signal
+    def hooked_stop(process):
+        second_signal()
+        real_stop(process)
+    def hooked_signal(signum, handler):
+        previous = real_signal(signum, handler)
+        if handler is signal.SIG_IGN:
+            second_signal()
+        return previous
+    aa_drive_smoke._stop = hooked_stop
+    aa_drive_smoke.signal.signal = hooked_signal
 sys.exit(aa_drive_smoke.main(sys.argv[2:]))
 """
 
@@ -457,59 +543,98 @@ def alive(pid: int) -> bool:
 
 
 class RunnerSignalTests(unittest.TestCase):
-    def test_sigterm_stops_both_children_and_their_groups(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="drive-smoke-sigterm-") as directory:
+    """SIGTERM/SIGINT only set a flag; the runner always reaches its one cleanup."""
+
+    def start(self, root: Path, hook: str = "") -> subprocess.Popen:
+        build, bin_dir = root / "build", root / "bin"
+        build.mkdir()
+        bin_dir.mkdir()
+        (build / "CMakeCache.txt").write_text("CMAKE_BUILD_TYPE:STRING=Release\n")
+        for path, body in ((build / "aa-wired-receiver", FAKE_RECEIVER),
+                           (build / "aa-dummy-display", FAKE_DISPLAY), (bin_dir / "adb", FAKE_ADB)):
+            path.write_text(body)
+            path.chmod(0o755)
+        (root / "store.json").write_text("{}")
+        env = dict(os.environ, FAKE_DIR=str(root), DRIVE_HOOK=hook, PATH=f"{bin_dir}:/usr/bin:/bin")
+        return subprocess.Popen(
+            [sys.executable, "-B", "-c", DRIVER, str(SMOKE.parent), "run",
+             "--serial", "FAKESERIAL", "--port", "9-9", "--build-dir", str(build),
+             "--store", str(root / "store.json"), "--display-env", ":99",
+             "--out", str(root / "out")], env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True)
+
+    def wait_for(self, *paths: Path) -> None:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not all(p.exists() for p in paths):
+            time.sleep(0.1)
+        self.assertTrue(all(p.exists() for p in paths), paths)
+
+    def pids(self, root: Path) -> list[int]:
+        out = [int(x) for x in (root / "receiver.pids").read_text().split()]
+        if (root / "display.pids").exists():
+            out.append(int((root / "display.pids").read_text()))
+        return out
+
+    def finish(self, root: Path, runner: subprocess.Popen, signum: int) -> None:
+        """Then: exit 128+signum, every child and grandchild gone, USB restored, result written."""
+        output, _ = runner.communicate(timeout=60)
+        pids = self.pids(root)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and any(alive(pid) for pid in pids):
+            time.sleep(0.1)
+        self.assertEqual(runner.returncode, 128 + signum, output)
+        self.assertFalse([pid for pid in pids if alive(pid)], output)
+        result = json.loads((root / "out" / "result.json").read_text())
+        self.assertEqual((result["verdict"], result["blocked_on"]), ("BLOCKED", "interrupted"))
+        adb = (root / "adb.log").read_text().splitlines()
+        self.assertEqual(adb[-1], "-s FAKESERIAL shell svc usb setFunctions mtp", adb)
+
+    def scenario(self, hook: str, external_sigterm: bool, check) -> None:
+        with tempfile.TemporaryDirectory(prefix=f"drive-smoke-signal-{hook or 'mid'}-") as directory:
             root = Path(directory)
-            build, bin_dir, out = root / "build", root / "bin", root / "out"
-            build.mkdir()
-            bin_dir.mkdir()
-            (build / "CMakeCache.txt").write_text("CMAKE_BUILD_TYPE:STRING=Release\n")
-            for path, body in ((build / "aa-wired-receiver", FAKE_RECEIVER),
-                               (build / "aa-dummy-display", FAKE_DISPLAY), (bin_dir / "adb", FAKE_ADB)):
-                path.write_text(body)
-                path.chmod(0o755)
-            (root / "store.json").write_text("{}")
-            env = dict(os.environ, FAKE_DIR=str(root), PATH=f"{bin_dir}:/usr/bin:/bin")
-            # Given the runner mid-drive with both fake children running.
-            runner = subprocess.Popen(
-                [sys.executable, "-B", "-c", DRIVER, str(SMOKE.parent), "run",
-                 "--serial", "FAKESERIAL", "--port", "9-9", "--build-dir", str(build),
-                 "--store", str(root / "store.json"), "--display-env", ":99",
-                 "--out", str(out)], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True)
-            pids: list[int] = []
+            runner = self.start(root, hook)
             try:
-                deadline = time.monotonic() + 30
-                while time.monotonic() < deadline and not (
-                        (root / "receiver.pids").exists() and (root / "display.pids").exists()):
-                    time.sleep(0.2)
-                time.sleep(1.5)
-                pids = [int(x) for x in (root / "receiver.pids").read_text().split()]
-                pids.append(int((root / "display.pids").read_text()))
-                self.assertTrue(all(alive(pid) for pid in pids), pids)
-                # When the runner is sent SIGTERM.
-                runner.send_signal(signal.SIGTERM)
-                output, _ = runner.communicate(timeout=60)
-                # Then it unwinds through cleanup: the receiver, its grandchild and
-                # the display are gone, the phone is restored, and the run is BLOCKED.
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline and any(alive(pid) for pid in pids):
-                    time.sleep(0.1)
-                self.assertEqual(runner.returncode, 128 + signal.SIGTERM, output)
-                self.assertFalse([pid for pid in pids if alive(pid)], output)
-                self.assertEqual(json.loads((out / "result.json").read_text())["blocked_on"],
-                                 "interrupted")
-                adb = (root / "adb.log").read_text().splitlines()
-                self.assertEqual(adb[-1], "-s FAKESERIAL shell svc usb setFunctions mtp", adb)
+                check(root, runner)
             finally:
                 if runner.poll() is None:
                     runner.kill()
-                for pid in pids:
+                for pid in (self.pids(root) if (root / "receiver.pids").exists() else []):
                     try:
                         os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
 
+    def test_sigterm_mid_drive_stops_both_children_and_their_groups(self) -> None:
+        def check(root: Path, runner: subprocess.Popen) -> None:
+            # Given the runner mid-drive with both fake children running.
+            self.wait_for(root / "receiver.pids", root / "display.pids")
+            time.sleep(1.5)
+            self.assertTrue(all(alive(pid) for pid in self.pids(root)))
+            # When it is sent SIGTERM.
+            runner.send_signal(signal.SIGTERM)
+            self.finish(root, runner, signal.SIGTERM)
+        self.scenario("", True, check)
+
+    def test_signal_queued_right_after_child_creation(self) -> None:
+        def check(root: Path, runner: subprocess.Popen) -> None:
+            # Given SIGTERM arriving inside Popen, before _spawn returns the handle.
+            self.finish(root, runner, signal.SIGTERM)
+            # Then the receiver was still tracked and stopped; the display never started;
+            # and the child ran with the stop signals unblocked.
+            self.assertFalse((root / "display.pids").exists())
+            mask = int((root / "sigblk").read_text().split()[1], 16)
+            self.assertEqual(mask & ((1 << (signal.SIGTERM - 1)) | (1 << (signal.SIGINT - 1))), 0)
+        self.scenario("spawn", False, check)
+
+    def test_second_signal_during_cleanup_entry(self) -> None:
+        def check(root: Path, runner: subprocess.Popen) -> None:
+            # Given SIGTERM mid-drive and SIGINT as cleanup stops its first child.
+            self.wait_for(root / "receiver.pids", root / "display.pids")
+            time.sleep(1.5)
+            runner.send_signal(signal.SIGTERM)
+            # Then cleanup still completes and the first signal is the one reported.
+            self.finish(root, runner, signal.SIGTERM)
+        self.scenario("cleanup", True, check)
 
 if __name__ == "__main__":
     unittest.main()

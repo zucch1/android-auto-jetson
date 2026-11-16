@@ -127,23 +127,26 @@ def waiting_idr_episodes(stamped: list[dict], end_ns: int, run_start_ns: int | N
     """Episodes from the runner-stamped ``idr_*`` lines (the lines carry no time).
 
     An episode opens at a source's first ``idr_requested`` and closes at its
-    ``idr_recovered``. The binary's own ``latency_ms`` starts at the wait itself,
-    so the episode starts at the earlier of the first stamped request and
-    (recovery - latency_ms). A recovery without a logged request still counts:
-    the display emits ``idr_recovered`` even when every request failed. Without
-    a usable latency it is taken as open since ``run_start_ns`` (fail closed).
-    Episodes are clipped to ``end_ns``; one still open there lasts until it.
+    ``idr_recovered``. The binary's own ``latency_ms`` starts at the wait
+    itself, which can precede the first successful request, so a recovery
+    starts at the earlier of that request and (recovery - latency_ms). When
+    latency_ms is absent, negative, nonfinite or not a number, the start cannot
+    be established and is taken as ``run_start_ns`` (``active``), even with a
+    logged request: fail closed. A recovery without a logged request still
+    counts (the display emits one even when every request failed). An episode
+    still open at ``end_ns`` runs from its first request to ``end_ns``. Every
+    episode is intersected with [run_start_ns, end_ns]; without a known
+    ``run_start_ns`` its length is infinite.
     """
     episodes, open_at = [], {}
 
-    def add(source: str, start: int | None, stop: int, recovered: bool) -> None:
-        if start is None:
-            episodes.append({"source": source, "start_ns": None, "duration_s": math.inf,
-                             "recovered": recovered})
-        elif start <= end_ns:
-            episodes.append({"source": source, "start_ns": start,
-                             "duration_s": max(0, min(stop, end_ns) - start) / 1e9,
-                             "recovered": recovered})
+    def add(source: str, start: int, stop: int, recovered: bool) -> None:
+        if run_start_ns is None:
+            seconds = math.inf
+        else:
+            seconds = max(0, min(stop, end_ns) - max(start, run_start_ns)) / 1e9
+        episodes.append({"source": source, "start_ns": start, "duration_s": seconds,
+                         "recovered": recovered})
 
     for item in sorted(stamped, key=lambda x: x["observed_ns"]):
         event, t = item["event"], item["observed_ns"]
@@ -153,10 +156,12 @@ def waiting_idr_episodes(stamped: list[dict], end_ns: int, run_start_ns: int | N
         elif event.get("event") == "idr_recovered":
             requested = open_at.pop(source, None)
             latency = event.get("latency_ms")
-            by_latency = (t - int(latency * 10**6) if _finite_number(latency) and latency >= 0
-                          else None)
-            candidates = [x for x in (requested, by_latency) if x is not None]
-            add(source, min(candidates) if candidates else run_start_ns, t, True)
+            if _finite_number(latency) and latency >= 0:
+                by_latency = t - int(latency * 10**6)
+                start = by_latency if requested is None else min(requested, by_latency)
+            else:
+                start = run_start_ns if run_start_ns is not None else t
+            add(source, start, t, True)
     for source, start in open_at.items():
         add(source, start, end_ns, False)
     return episodes
@@ -325,7 +330,8 @@ def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: s
                        and isinstance(binaries[r].get("sha256"), str)
                        and DIGEST.fullmatch(binaries[r]["sha256"]) for r in ("receiver", "display"))
             or not _finite_number(duration) or not isinstance(finished_text, str)
-            or not (record.get("video_profiles") is None or isinstance(record["video_profiles"], str))):
+            or "video_profiles" not in record
+            or not (record["video_profiles"] is None or isinstance(record["video_profiles"], str))):
         return "drive_smoke_malformed", "the result lacks a well-typed verdict, binaries, " \
             "duration_s, finished_utc or video_profiles"
     if record["verdict"] != "PASS":
@@ -350,10 +356,13 @@ def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: s
 
 
 def _check_cli(args) -> int:
+    malformed = False
     try:
         record = load_record(Path(args.record).read_text())
-    except (OSError, ValueError):
+    except OSError:
         record = None
+    except ValueError:  # not strict JSON (including NaN/Infinity)
+        record, malformed = None, True
     # --now exists only for deterministic tests and offline review. The soak
     # launcher never passes it, so live freshness uses the real clock.
     now = datetime.fromisoformat(args.now) if args.now else datetime.now(timezone.utc)
@@ -361,6 +370,8 @@ def _check_cli(args) -> int:
         now = now.replace(tzinfo=timezone.utc)
     reason, detail = check_record(record, receiver_sha256=args.receiver_sha256,
                                   display_sha256=args.display_sha256, now=now)
+    if malformed:
+        reason, detail = "drive_smoke_malformed", "the result is not strict JSON"
     if reason:
         print(reason)
         print(f"BLOCKED: {reason}: {detail}; run tools/wired-qa/aa_drive_smoke.py run "
@@ -428,15 +439,36 @@ def _adb(serial: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["adb", "-s", serial, *args], capture_output=True, text=True, timeout=20)
 
 
-class Interrupted(Exception):
-    """SIGTERM/SIGINT reached the runner; unwind through the cleanup."""
-
-    def __init__(self, signum: int):
-        super().__init__(signal.Signals(signum).name)
-        self.signum = signum
-
-
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
+class StopFlag:
+    """SIGTERM/SIGINT handler that only records the first signal; it never raises.
+
+    The runner polls it at every wait point and unwinds through its normal
+    control flow, so a signal can never skip registering a child or interrupt
+    cleanup: a second signal just finds the flag already set.
+    """
+
+    def __init__(self) -> None:
+        self.signum: int | None = None
+
+    def __call__(self, signum: int, _frame) -> None:
+        if self.signum is None:
+            self.signum = signum
+
+    def __bool__(self) -> bool:
+        return self.signum is not None
+
+    def sleep(self, seconds: float) -> bool:
+        """Sleep in short steps; False as soon as a stop is requested."""
+        deadline = time.monotonic() + seconds
+        while not self:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.1, remaining))
+        return False
 
 
 def _stop(process) -> None:
@@ -460,24 +492,22 @@ def _stop(process) -> None:
         return
 
 
-def _spawn(command: list[str], **kwargs) -> subprocess.Popen:
-    """Popen with the stop signals blocked, so no child escapes before it is tracked."""
-    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
-    try:
-        return subprocess.Popen(command, start_new_session=True, **kwargs)
-    finally:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+def _spawn(children: list, command: list[str], **kwargs) -> subprocess.Popen:
+    """Start a child in its own session and register it for cleanup at once."""
+    process = subprocess.Popen(command, start_new_session=True, **kwargs)
+    children.append(process)
+    return process
 
 
-def _wait(predicate, timeout: float, *alive) -> bool:
+def _wait(predicate, timeout: float, stop: StopFlag, *alive) -> bool:
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline and not stop:
         if predicate():
             return True
         if any(p.poll() is not None for p in alive):
             return False
         time.sleep(0.1)
-    return predicate()
+    return predicate() and not stop
 
 
 def _blocked(out: Path, base: dict, reason: str) -> int:
@@ -541,93 +571,95 @@ def _run_cli(args) -> int:
                    "--video-socket", socket + ".video", "--input-socket", socket + ".input", *profiles]
     run = {"duration_s": args.duration, "receiver_command": receiver_cmd, "display_command": display_cmd,
            "started_utc": datetime.now(timezone.utc).isoformat()}
-    receiver = display = None
     lock = threading.Lock()
     loggers: list[Logger] = []
-    interrupted: int | None = None
+    children: list[subprocess.Popen] = []
+    stop = StopFlag()
+    previous = {sig: signal.signal(sig, stop) for sig in STOP_SIGNALS}
+    stamped = (out / "idr-events.jsonl").open("w")
 
-    def on_signal(signum, _frame):
-        raise Interrupted(signum)
-
-    previous = {sig: signal.signal(sig, on_signal) for sig in STOP_SIGNALS}
-    try:
+    def drive() -> None:
         _adb(args.serial, "shell", "svc", "usb", "setFunctions", "mtp")
-        time.sleep(3)
+        if not stop.sleep(3):
+            return
         _adb(args.serial, "shell", "input", "keyevent", "KEYCODE_WAKEUP")
         if args.media_uri:
             media = ["-d", args.media_uri] + (["-t", args.media_type] if args.media_type else [])
             media += ["-n", args.media_component] if args.media_component else []
             _adb(args.serial, "shell", "am", "start", "-a", "android.intent.action.VIEW", *media)
-            time.sleep(4)
+            if not stop.sleep(4):
+                return
         _adb(args.serial, "shell", "am", "start", "-a", "android.intent.action.VIEW",
              "-d", args.geo_uri, "-p", "com.google.android.apps.maps")
-        with (out / "idr-events.jsonl").open("w") as stamped:
-            receiver = _spawn(receiver_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              env=env, text=True)
-            loggers.append(Logger(receiver.stdout, out / "receiver.log", stamped, lock, "receiver"))
-            loggers[-1].start()
-            rx = loggers[0].seen
-            if _wait(lambda: "ready" in rx, READY_TIMEOUT_S, receiver):
-                display = _spawn(display_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, env=env, text=True)
-                loggers.append(Logger(display.stdout, out / "display.log", stamped, lock, "display"))
-                loggers[-1].start()
-                dx = loggers[1].seen
-                if _wait(lambda: "active" in rx, READY_TIMEOUT_S, receiver, display):
-                    run["active_ns"] = rx["active"]
-                    _wait(lambda: "first_paint" in dx, FIRST_PAINT_WAIT_S, receiver, display)
-                    span = int(args.duration * 1e9) + 5 * 10**8
-                    end = dx.get("first_paint", time.monotonic_ns()) + span
-                    step, last = 0, 0.0
-                    print(f"drive smoke: active, window {args.duration} s", file=sys.stderr, flush=True)
-                    while time.monotonic_ns() < end and receiver.poll() is None and display.poll() is None:
-                        if "first_paint" in dx:  # a late first paint restarts the drive clock
-                            end = max(end, dx["first_paint"] + span)
-                        if time.monotonic() - last >= STIMULUS_PERIOD_S:
-                            a, b = (440, 700) if step % 2 == 0 else (700, 440)
-                            lines = [f"touch down {a} 260"]
-                            lines += [f"touch move {int(a + (b - a) * j / 6)} 260" for j in range(1, 7)]
-                            try:
-                                for entry in lines + [f"touch up {b} 260"]:
-                                    display.stdin.write(entry + "\n")
-                                    display.stdin.flush()
-                                    time.sleep(0.06)
-                            except (BrokenPipeError, OSError):
-                                pass
-                            step, last = step + 1, time.monotonic()
-                        time.sleep(0.1)
-                    run["window_end_ns"] = time.monotonic_ns()
-                else:
-                    run["failure"] = "no active session within the startup budget"
-            else:
-                run["failure"] = "receiver not ready"
-            run["receiver_alive_at_end"] = receiver.poll() is None
-            run["display_alive_at_end"] = display is not None and display.poll() is None
-            _stop(display)
-            _stop(receiver)
-            for logger in loggers:
-                logger.join(timeout=5)
-    except Interrupted as stop:
-        interrupted = stop.signum
-        print(f"drive smoke: interrupted by {stop}; cleaning up", file=sys.stderr, flush=True)
+        if stop:
+            return
+        receiver = _spawn(children, receiver_cmd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, env=env, text=True)
+        loggers.append(Logger(receiver.stdout, out / "receiver.log", stamped, lock, "receiver"))
+        loggers[-1].start()
+        rx = loggers[0].seen
+        if not _wait(lambda: "ready" in rx, READY_TIMEOUT_S, stop, receiver):
+            run["failure"] = "receiver not ready"
+            return
+        display = _spawn(children, display_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, env=env, text=True)
+        loggers.append(Logger(display.stdout, out / "display.log", stamped, lock, "display"))
+        loggers[-1].start()
+        dx = loggers[1].seen
+        if not _wait(lambda: "active" in rx, READY_TIMEOUT_S, stop, receiver, display):
+            run["failure"] = "no active session within the startup budget"
+            return
+        run["active_ns"] = rx["active"]
+        _wait(lambda: "first_paint" in dx, FIRST_PAINT_WAIT_S, stop, receiver, display)
+        span = int(args.duration * 1e9) + 5 * 10**8
+        end = dx.get("first_paint", time.monotonic_ns()) + span
+        step, last = 0, 0.0
+        print(f"drive smoke: active, window {args.duration} s", file=sys.stderr, flush=True)
+        while (not stop and time.monotonic_ns() < end
+               and receiver.poll() is None and display.poll() is None):
+            if "first_paint" in dx:  # a late first paint restarts the drive clock
+                end = max(end, dx["first_paint"] + span)
+            if time.monotonic() - last >= STIMULUS_PERIOD_S:
+                a, b = (440, 700) if step % 2 == 0 else (700, 440)
+                lines = [f"touch down {a} 260"]
+                lines += [f"touch move {int(a + (b - a) * j / 6)} 260" for j in range(1, 7)]
+                try:
+                    for entry in lines + [f"touch up {b} 260"]:
+                        display.stdin.write(entry + "\n")
+                        display.stdin.flush()
+                        time.sleep(0.06)
+                except (BrokenPipeError, OSError):
+                    pass
+                step, last = step + 1, time.monotonic()
+            time.sleep(0.1)
+        run["window_end_ns"] = time.monotonic_ns()
+        run["receiver_alive_at_end"] = receiver.poll() is None
+        run["display_alive_at_end"] = display.poll() is None
+
+    try:
+        drive()
     finally:
-        # A second signal must not strand a child or skip restoring the phone.
-        for sig in STOP_SIGNALS:
-            signal.signal(sig, signal.SIG_IGN)
-        try:
-            _stop(display)
-            _stop(receiver)
-            _adb(args.serial, "shell", "svc", "usb", "setFunctions", "mtp")
-            if args.media_uri and args.media_component:
-                _adb(args.serial, "shell", "am", "force-stop", args.media_component.split("/")[0])
-        finally:
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
-    if interrupted is not None:
-        run["interrupted"] = signal.Signals(interrupted).name
+        # The single cleanup, reached by normal flow (signals only set the flag)
+        # or by an exception: every registered child's group, then the phone.
+        for process in reversed(children):
+            _stop(process)
+        for logger in loggers:
+            logger.join(timeout=5)
+        stamped.close()
+        _adb(args.serial, "shell", "svc", "usb", "setFunctions", "mtp")
+        if args.media_uri and args.media_component:
+            _adb(args.serial, "shell", "am", "force-stop", args.media_component.split("/")[0])
+    receiver = children[0] if children else None
+    display = children[1] if len(children) > 1 else None
+    if stop:
+        print(f"drive smoke: interrupted by {signal.Signals(stop.signum).name}; cleaned up",
+              file=sys.stderr, flush=True)
+        run["interrupted"] = signal.Signals(stop.signum).name
         (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
         _blocked(out, base, "interrupted")
-        return 128 + interrupted
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        return 128 + stop.signum
     run.update(receiver_exit=receiver.returncode if receiver else None,
                display_exit=display.returncode if display else None)
     (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
@@ -640,6 +672,8 @@ def _run_cli(args) -> int:
         result["verdict"] = "FAIL"
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     _print_summary(result)
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
     return 0 if result["verdict"] == "PASS" else 1
 
 
