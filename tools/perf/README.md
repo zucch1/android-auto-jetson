@@ -171,11 +171,14 @@ tools/perf/aa-projection-perf.sh --mode wired --duration 30m \
     --capture capture.json --out result.json     # offline: report a capture
 ```
 
-Every live stage also needs `--drive-smoke RESULT` (or `AA_DRIVE_SMOKE`): a
-passing `tools/wired-qa/aa_drive_smoke.py` result for the same receiver/display
-sha256, the default video offer and the full 600 s, at most 24 h old (#137).
-Without one the stage is `BLOCKED drive_smoke_*` (exit 3) before the collector
-starts. See the runbook's **Drive smoke before any soak**.
+Every live stage also needs `--drive-smoke RESULT` (or `AA_DRIVE_SMOKE`) and
+`--phone-serial SERIAL` (or `AA_PHONE_SERIAL`): a passing
+`tools/wired-qa/aa_drive_smoke.py` result from that same phone (attached on
+`--port`), for the same receiver/display sha256, the default video offer and
+configuration and the full 600 s, at most 24 h old (#137). Without one the
+stage is `BLOCKED drive_smoke_*` (exit 3) before the collector starts. See the
+runbook's **Drive smoke before any soak**. The soak chain is the 1800 s and
+7200 s stages; the 60 s stage is retired.
 
 `--duration` is strict: `<int>[smh]?` (no unit = seconds). Anything else is a
 usage error (exit 2). `--mode` must be `wired`. `--host` (default

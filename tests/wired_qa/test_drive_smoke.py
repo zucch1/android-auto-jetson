@@ -51,7 +51,9 @@ class Run:
         rate = painted_fps or fps
         count = int((duration + 1) * rate)
         self.paints = [self.first + int(i * S / rate) for i in range(count)]
-        self.av_delay_ns = None
+        # Media plays for the whole drive by default with a constant +12 ms skew.
+        self.media_on, self.skew_ms = True, (lambda at_s: 12.0)
+        self.audio_from_s, self.audio_until_s = -1.0, None
 
     def freeze(self, at_s: float, seconds: float) -> "Run":
         lo, hi = self.first + int(at_s * S), self.first + int((at_s + seconds) * S)
@@ -69,23 +71,37 @@ class Run:
                 "episode_requests": 1, "total_requests": 1}})
         return self
 
-    def media(self, av_delay_ms: float) -> "Run":
-        self.av_delay_ns = int(av_delay_ms * 1e6)
+    def no_media(self) -> "Run":
+        self.media_on = False
+        return self
+
+    def skew(self, function) -> "Run":
+        """Signed skew (ms) of the frame painted ``at_s`` seconds after first paint."""
+        self.skew_ms = function
+        return self
+
+    def audio(self, from_s: float, until_s: float | None) -> "Run":
+        """Audio slots only between these offsets from first paint."""
+        self.audio_from_s, self.audio_until_s = from_s, until_s
         return self
 
     def write(self, directory: Path) -> Path:
+        # Audio playback delay is 10 ms, video delay 10 ms + skew: signed skew = skew.
         display = list(self.display)
         for frame, t in enumerate(self.paints):
-            display.append({"event": "video_presented", "frame": frame, "scheduled_ns": t - 30_000_000,
+            delay = 10_000_000 + int(self.skew_ms((t - self.first) / S) * 1e6)
+            display.append({"event": "video_presented", "frame": frame, "scheduled_ns": t - delay,
                             "completed_ns": t, "count": 1})
         receiver = list(self.receiver)
-        if self.av_delay_ns is not None:
+        if self.media_on and self.paints:
             slot = 42_666_666
-            start = self.first - S
-            while start < self.paints[-1]:
+            start = self.first + int(self.audio_from_s * S)
+            stop = (self.first + int(self.audio_until_s * S) if self.audio_until_s is not None
+                    else self.paints[-1])
+            while start < stop:
                 receiver.append({"event": "audio_write_completed", "scheduled_ns": start,
                                  "scheduled_end_ns": start + slot, "completed_ns": start,
-                                 "presented_ns": start + 30_000_000 + self.av_delay_ns})
+                                 "presented_ns": start + 10_000_000})
                 start += slot
         for name, lines in (("receiver.log", receiver), ("display.log", display)):
             (directory / name).write_text("\n".join(
@@ -108,12 +124,15 @@ class AnalyzerTests(unittest.TestCase):
     def test_healthy_default_profile_passes_every_window(self) -> None:
         # Given ten minutes of 720p30 painting at the negotiated rate.
         result = self.analyze(Run())
-        # Then the 59 windows after the 10 s startup grace clear the 27 fps floor;
-        # A/V is not valid without media, so it is reported n/a and not failed.
+        # Then the 59 windows after the 10 s startup grace clear the 27 fps floor
+        # and the signed A/V contract passes with full audio coverage.
         fps = criterion(result, "painted_fps_per_window")
         self.assertEqual(result["verdict"], "PASS", result["criteria"])
         self.assertEqual((fps["windows"], fps["expected_windows"], fps["floor_fps"]), (59, 59, 27.0))
-        self.assertIsNone(criterion(result, "av_sync_within_ceiling")["passed"])
+        av = criterion(result, "av_signed_contract")
+        self.assertTrue(av["passed"], av)
+        self.assertAlmostEqual(av["coverage"], 1.0, places=3)
+        self.assertAlmostEqual(av["signed_p50_ms"], 12.0, places=3)
 
     def test_one_second_freeze_fails_its_window(self) -> None:
         # Given a 1.2 s paint gap 305 s into the drive (the #134 shape).
@@ -181,13 +200,66 @@ class AnalyzerTests(unittest.TestCase):
             with self.subTest(passed=passed):
                 self.assertIs(criterion(self.analyze(run), "no_session_drop")["passed"], passed)
 
-    def test_av_is_gated_by_the_existing_ceiling_when_media_plays(self) -> None:
-        good = self.analyze(Run().media(12.0))
-        bad = self.analyze(Run().media(65.0))
-        self.assertTrue(criterion(good, "av_sync_within_ceiling")["passed"])
-        self.assertEqual(criterion(good, "av_sync_within_ceiling")["ceiling_ms"], 50.0)
-        self.assertFalse(criterion(bad, "av_sync_within_ceiling")["passed"])
-        self.assertEqual(bad["verdict"], "FAIL")
+    def av(self, run: Run) -> dict:
+        return criterion(self.analyze(run), "av_signed_contract")
+
+    def assert_only_clause_fails(self, av: dict, clause: str) -> None:
+        self.assertFalse(av["passed"], av)
+        self.assertEqual([k for k, ok in av["clauses"].items() if not ok], [clause], av)
+
+    def test_sustained_offset_fails_the_5_s_mean_in_either_direction(self) -> None:
+        # Given 5.5 s of +45 ms (or -45 ms) skew: under 1 % of the pairs, so the
+        # tail and the cap pass, but a whole 5 s window averages beyond 40 ms.
+        for sign in (1, -1):
+            with self.subTest(sign=sign):
+                av = self.av(Run().skew(lambda at, s=sign: 45.0 * s if 300 <= at < 305.5 else 12.0))
+                self.assert_only_clause_fails(av, "window_mean")
+                self.assertAlmostEqual(av["worst_window_mean_ms"], 45.0 * sign, places=3)
+        # 39 ms sustained stays inside +/-40 ms.
+        self.assertTrue(self.av(Run().skew(lambda at: 39.0 if 300 <= at < 320 else 12.0))["passed"])
+
+    def test_tail_fails_the_p99(self) -> None:
+        # Given every 40th frame (2.5 %) 60 ms late: the 5 s means stay near 13 ms.
+        frames = Run()
+        late = set(frames.paints[::40])
+        av = self.av(frames.skew(lambda at: 60.0 if frames.first + int(at * S) in late else 12.0))
+        self.assert_only_clause_fails(av, "p99_abs")
+        self.assertAlmostEqual(av["abs_p99_ms"], 60.0, places=3)
+        self.assertGreater(av["over_50_ms"], 0)
+
+    def test_single_frame_beyond_the_cap_fails_max(self) -> None:
+        av = self.av(Run().skew(lambda at: 95.0 if 200.0 <= at < 200.03 else 12.0))
+        self.assert_only_clause_fails(av, "max_abs")
+        self.assertAlmostEqual(av["abs_max_ms"], 95.0, places=3)
+        # The same frame at 85 ms is within the 90 ms cap.
+        self.assertTrue(self.av(Run().skew(lambda at: 85.0 if 200.0 <= at < 200.03 else 12.0))["passed"])
+
+    def test_audio_must_cover_90_percent_of_the_drive(self) -> None:
+        # No media at all is a FAIL, never n/a.
+        none = self.av(Run().no_media())
+        self.assertFalse(none["passed"])
+        self.assertEqual((none["pairs"], none["coverage"]), (0, 0.0))
+        self.assertFalse(none["clauses"]["coverage"])
+        # Audio that stops at 243 s (the S24 shape) fails coverage alone.
+        short = self.av(Run().audio(-1.0, 243.0))
+        self.assert_only_clause_fails(short, "coverage")
+        self.assertAlmostEqual(short["coverage"], 243 / 600, places=2)
+        # Audio from 50 s to the end covers 91.7 % and passes; from 70 s, 88.3 % fails.
+        self.assertTrue(self.av(Run().audio(50.0, None))["passed"])
+        self.assert_only_clause_fails(self.av(Run().audio(70.0, None)), "coverage")
+
+    def test_coverage_is_the_union_of_slots_clipped_to_the_drive(self) -> None:
+        # Overlapping and out-of-drive slots count once, and only inside the drive.
+        slots = [{"scheduled_ns": 0, "scheduled_end_ns": 10, "presented_ns": 0},
+                 {"scheduled_ns": 5, "scheduled_end_ns": 30, "presented_ns": 5},
+                 {"scheduled_ns": 50, "scheduled_end_ns": 200, "presented_ns": 50}]
+        self.assertAlmostEqual(smoke.audio_coverage(slots, 20, 120), (10 + 70) / 100)
+
+    def test_window_means_slide_over_every_membership_change(self) -> None:
+        # Pairs at 0..9 s, one per second; a 5 s window holds at most 5 of them.
+        pairs = [(i * S, float(i)) for i in range(10)]
+        low, high = smoke.window_means(pairs, 0, 10 * S, 5)
+        self.assertEqual((low, high), (2.0, 7.0))  # [0,5) -> 0..4 ; [5,10) -> 5..9
 
     def test_first_paint_latency_is_reported_not_gated(self) -> None:
         # Given the first paint 22 s after active (there is no first-paint deadline).
@@ -267,11 +339,11 @@ class AnalyzerTests(unittest.TestCase):
 
     def test_null_audio_endpoint_is_excluded_and_counted(self) -> None:
         # Given the live run-2 shape: one audio slot whose presented_ns is null.
-        run = Run().media(12.0)
+        run = Run()
         run.receiver.append({"event": "audio_write_completed", "scheduled_ns": run.first,
                              "scheduled_end_ns": run.first + 42_666_666,
                              "completed_ns": run.first, "presented_ns": None})
-        av = criterion(self.analyze(run), "av_sync_within_ceiling")
+        av = criterion(self.analyze(run), "av_signed_contract")
         # Then the slot is skipped ("where valid") but reported.
         self.assertTrue(av["passed"])
         self.assertEqual(av["invalid_audio_slots"], 1)
@@ -281,32 +353,38 @@ NOW = datetime(2026, 11, 16, 12, tzinfo=timezone.utc)
 A, B = "a" * 64, "b" * 64
 
 
+PHONE = "TESTPHONE01"  # synthetic serial; no real phone identifiers in fixtures
+
+
 def record(finished: datetime = NOW - timedelta(hours=2), **changes) -> dict:
     doc = {"schema": smoke.SCHEMA, "verdict": "PASS", "duration_s": 600, "video_profiles": None,
-           "finished_utc": finished.isoformat(),
+           "finished_utc": finished.isoformat(), "phone_serial": PHONE,
+           "configuration": dict(smoke.DEFAULT_CONFIGURATION),
            "binaries": {"receiver": {"sha256": A}, "display": {"sha256": B}}}
     doc.update(changes)
     return doc
 
 
-def run_check(path: Path, receiver: str = A, display: str = B,
+def run_check(path: Path, receiver: str = A, display: str = B, phone: str = PHONE,
               now: str | None = "2026-11-16T12:00:00Z") -> subprocess.CompletedProcess:
     command = [sys.executable, "-B", str(SMOKE), "check", "--record", str(path),
-               "--receiver-sha256", receiver, "--display-sha256", display]
+               "--receiver-sha256", receiver, "--display-sha256", display, "--phone-serial", phone]
     return subprocess.run(command + (["--now", now] if now else []),
                           capture_output=True, text=True, check=False)
 
 
 class GateTests(unittest.TestCase):
-    def check(self, doc, receiver=A, display=B):
-        return smoke.check_record(doc, receiver_sha256=receiver, display_sha256=display, now=NOW)[0]
+    def check(self, doc, receiver=A, display=B, phone=PHONE):
+        return smoke.check_record(doc, receiver_sha256=receiver, display_sha256=display,
+                                  phone_serial=phone, now=NOW)[0]
 
     def test_fresh_pass_for_the_same_bytes_admits_the_soak(self) -> None:
         self.assertIsNone(self.check(record()))
 
     def test_refusals_are_named(self) -> None:
         cases = {
-            "drive_smoke_missing": [None, {"schema": "other"}],
+            "drive_smoke_missing": [None, {"schema": "other"},
+                                    record(schema="aa-drive-smoke/1")],  # pre-contract records
             "drive_smoke_not_passed": [record(verdict="FAIL"), record(verdict="BLOCKED")],
             "drive_smoke_stale": [record(NOW - timedelta(hours=25)), record(NOW + timedelta(hours=1))],
             "drive_smoke_profile": [record(video_profiles="1920x1080@60:h264")],
@@ -330,6 +408,49 @@ class GateTests(unittest.TestCase):
         for doc in bad:
             with self.subTest(doc=doc):
                 self.assertEqual(self.check(doc), "drive_smoke_malformed")
+
+    def test_only_the_soak_phone_is_accepted(self) -> None:
+        # The A26 smoke must not unlock a soak on another phone, and vice versa.
+        self.assertEqual(self.check(record(), phone="OTHERPHONE9"), "drive_smoke_phone_mismatch")
+        # A serial the launcher could not verify on the soak's port blocks too.
+        for phone in ("", None, "bad serial;id"):
+            with self.subTest(phone=phone):
+                self.assertEqual(self.check(record(), phone=phone), "drive_smoke_phone_unverified")
+
+    def test_only_the_default_configuration_is_accepted(self) -> None:
+        for change in ({"display_flags": ["--presentation", "gpu"], "presentation": "gpu"},
+                       {"display_flags": ["--decoder", "hardware"], "display_decoder": "hardware"},
+                       {"receiver_flags": ["--idr-recovery", "nudge"]}):
+            with self.subTest(change=change):
+                configuration = {**smoke.DEFAULT_CONFIGURATION, **change}
+                self.assertEqual(self.check(record(configuration=configuration)),
+                                 "drive_smoke_configuration")
+
+    def test_missing_phone_or_configuration_fails_closed(self) -> None:
+        for field in ("phone_serial", "configuration"):
+            with self.subTest(field=field):
+                doc = record()
+                del doc[field]
+                self.assertEqual(self.check(doc), "drive_smoke_malformed")
+        partial = dict(smoke.DEFAULT_CONFIGURATION)
+        del partial["presentation"]
+        for doc in (record(phone_serial=""), record(phone_serial=7), record(configuration=[]),
+                    record(configuration=partial)):
+            with self.subTest(doc=doc):
+                self.assertEqual(self.check(doc), "drive_smoke_malformed")
+
+    def test_configuration_reads_the_launched_commands(self) -> None:
+        receiver = ["aa-wired-receiver", "--port", "1-2.1", "--store", "s.json",
+                    "--require-video-consumer", "--video-socket", "v", "--input-socket", "i",
+                    "--duration-ms", "1"]
+        display = ["aa-dummy-display", "--test-only-autostart", "--test-only-control-stdin",
+                   "--video-socket", "v", "--input-socket", "i"]
+        self.assertEqual(smoke.configuration(receiver, display), smoke.DEFAULT_CONFIGURATION)
+        tuned = smoke.configuration(receiver + ["--decoder", "hardware"],
+                                    display + ["--presentation", "zerocopy", "--decoder", "auto"])
+        self.assertEqual((tuned["receiver_decoder"], tuned["display_decoder"], tuned["presentation"]),
+                         ("hardware", "auto", "zerocopy"))
+        self.assertEqual(tuned["display_flags"], ["--presentation", "zerocopy", "--decoder", "auto"])
 
     def test_missing_video_profiles_key_is_malformed(self) -> None:
         doc = record()
@@ -372,8 +493,9 @@ class GateTests(unittest.TestCase):
 class LauncherGateTests(unittest.TestCase):
     """The perf launcher refuses every live stage before the collector starts."""
 
-    def launch(self, root: Path, *extra: str, fail_display_hash: bool = False
-               ) -> tuple[subprocess.CompletedProcess, str]:
+    def launch(self, root: Path, *extra: str, fail_display_hash: bool = False,
+               adb_line: str = f"{PHONE}              device usb:1-2.1 product:x model:FAKE",
+               phone: str | None = PHONE) -> tuple[subprocess.CompletedProcess, str]:
         stub_dir = root / "bin"
         stub_dir.mkdir(exist_ok=True)
         log = root / "ssh.log"
@@ -385,18 +507,21 @@ case "$*" in
     *sha256sum*aa-wired-receiver*) printf '%s  r\\n' {A}; exit 0 ;;
     *sha256sum*aa-dummy-display*) [ -n "${{FAIL_DISPLAY_HASH:-}}" ] && exit 1
                                   printf '%s  d\\n' {B}; exit 0 ;;
+    *"adb devices -l"*) printf 'List of devices attached\\n%s\\n' "${{STUB_ADB_LINE:-}}"; exit 0 ;;
     *xrandr* | *drm*) printf 'connected\\n'; exit 0 ;;
     *pactl* | *pw-cli*) printf '0\\tfake\\tPipeWire\\n'; exit 0 ;;
 esac
 exit 0
 ''')
         (stub_dir / "ssh").chmod(0o755)
-        env = {"PATH": f"{stub_dir}:/usr/bin:/bin", "AA_PERF_HOST": "fake.local", "AA_DISPLAY": ":0"}
+        env = {"PATH": f"{stub_dir}:/usr/bin:/bin", "AA_PERF_HOST": "fake.local", "AA_DISPLAY": ":0",
+               "STUB_ADB_LINE": adb_line}
         if fail_display_hash:
             env["FAIL_DISPLAY_HASH"] = "1"
         process = subprocess.run(
-            ["bash", str(LAUNCHER), "--mode", "wired", "--duration", "60s",
-             "--out", str(root / "out.json"), *extra],
+            ["bash", str(LAUNCHER), "--mode", "wired", "--duration", "1800s",
+             "--out", str(root / "out.json"),
+             *(["--phone-serial", phone] if phone is not None else []), *extra],
             capture_output=True, text=True, timeout=120, check=False, env=env)
         return process, log.read_text()
 
@@ -440,6 +565,23 @@ exit 0
             # Given --now set to an hour after the stale smoke: live stays on the real clock.
             near = (finished + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
             self.assert_blocked(root, "drive_smoke_stale", "--drive-smoke", old, "--now", near)
+
+    def test_soak_phone_must_be_the_smoke_phone_and_on_the_port(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:
+            root = Path(directory)
+            good = self.write(root, "good.json", record(datetime.now(timezone.utc)))
+            # Given a smoke from another phone than the soak's.
+            other = self.write(root, "other.json",
+                               record(datetime.now(timezone.utc), phone_serial="OTHERPHONE9"))
+            self.assert_blocked(root, "drive_smoke_phone_mismatch", "--drive-smoke", other)
+            # Given the soak's serial not attached, attached on another port, offline, or absent.
+            for adb_line in ("", f"{PHONE} device usb:1-2.3 model:FAKE",
+                             f"{PHONE} offline usb:1-2.1"):
+                with self.subTest(adb_line=adb_line):
+                    self.assert_blocked(root, "drive_smoke_phone_unverified", "--drive-smoke", good,
+                                        adb_line=adb_line)
+            self.assert_blocked(root, "drive_smoke_phone_unverified", "--drive-smoke", good,
+                                phone=None)
 
     def test_matching_smoke_reaches_the_collector(self) -> None:
         with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:
@@ -566,7 +708,7 @@ def alive(pid: int) -> bool:
 class RunnerSignalTests(unittest.TestCase):
     """SIGTERM/SIGINT only set a flag; the runner always reaches its one cleanup."""
 
-    def start(self, root: Path, hook: str = "") -> subprocess.Popen:
+    def start(self, root: Path, hook: str = "", *extra: str) -> subprocess.Popen:
         build, bin_dir = root / "build", root / "bin"
         build.mkdir()
         bin_dir.mkdir()
@@ -583,6 +725,7 @@ class RunnerSignalTests(unittest.TestCase):
             [sys.executable, "-B", "-c", DRIVER, str(SMOKE.parent), "run",
              "--serial", "FAKESERIAL", "--port", "9-9", "--build-dir", str(build),
              "--store", str(root / "store.json"), "--display-env", ":99",
+             "--media-uri", "file:///sdcard/Music/fake.opus", *extra,
              "--out", str(root / "out")], env=env, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True)
 
@@ -637,6 +780,33 @@ class RunnerSignalTests(unittest.TestCase):
             runner.send_signal(signal.SIGTERM)
             self.finish(root, runner, signal.SIGTERM)
         self.scenario("", True, check)
+
+    def test_media_is_relaunched_when_audio_stops(self) -> None:
+        # Given a 12 s drive whose (fake) receiver never logs an audio write.
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-media-") as directory:
+            root = Path(directory)
+            runner = self.start(root, "", "--duration", "12")
+            try:
+                output, _ = runner.communicate(timeout=90)
+            finally:
+                if runner.poll() is None:
+                    runner.kill()
+                if (root / "receiver.pids").exists():
+                    for pid in self.pids(root):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+            # Then the media intent was re-sent during the drive, Maps brought back
+            # each time, and the run still fails on coverage (no audio arrived).
+            adb = (root / "adb.log").read_text().splitlines()
+            media = [line for line in adb if "-d file:///sdcard/Music/fake.opus" in line]
+            maps = [line for line in adb if "com.google.android.apps.maps" in line]
+            result = json.loads((root / "out" / "result.json").read_text())
+            self.assertGreaterEqual(result["media_relaunches"], 1, output)
+            self.assertEqual(len(media), 1 + result["media_relaunches"], adb)
+            self.assertEqual(len(maps), 1 + result["media_relaunches"], adb)
+            self.assertFalse(criterion(result, "av_signed_contract")["clauses"]["coverage"])
 
     def test_signal_queued_right_after_child_creation(self) -> None:
         def check(root: Path, runner: subprocess.Popen) -> None:

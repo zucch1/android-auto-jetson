@@ -11,7 +11,9 @@ freeze (#134) happened only with a moving map, so no soak stage could see it.
 This smoke projects Google Maps for ten minutes on the phone named by
 ``--serial``/``--port``. It opens a ``geo:`` intent and pans the map over the
 display's test control channel once a second, so the phone keeps encoding new
-frames. Optionally it also plays media.
+frames. It also plays the media named by ``--media-uri`` for the whole drive
+(re-sending the intent when audio stops), because the signed A/V contract
+requires audio across at least 90 % of the drive.
 
 Subcommands:
 
@@ -21,9 +23,11 @@ Subcommands:
              3 BLOCKED (a prerequisite was missing; nothing was measured).
 ``analyze``  Re-run the analysis on a ``run`` output directory (no phone needed).
 ``check``    The soak gate. ``tools/perf/aa-projection-perf.sh`` calls it before
-             any live stage: the record must be a PASS for the same receiver
-             and display bytes (sha256), for the default video offer, for the
-             full duration, and no older than ``RECORD_MAX_AGE_S``.
+             any live stage: the record must be a PASS from the soak's own
+             phone (serial, verified on its port), for the same receiver and
+             display bytes (sha256), for the default video offer and
+             decode/presentation configuration, for the full duration, and no
+             older than ``RECORD_MAX_AGE_S``.
 
 The pass criteria are the named constants below. The gate qualifies the
 receiver's **default video offer**, whose primary profile is
@@ -54,9 +58,8 @@ TOOLS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS / "perf"))
 from aa_build_guard import (  # noqa: E402
     BuildDirMismatchError, BuildGuardError, require_optimized_build, verify_launched_binaries)
-from aa_perf_report import BUDGETS  # noqa: E402
 
-SCHEMA = "aa-drive-smoke/1"
+SCHEMA = "aa-drive-smoke/2"
 
 # ---- Pass criteria (#137). Do not edit to make a run pass. ------------------
 DEFAULT_DURATION_S = 600
@@ -80,9 +83,31 @@ FPS_STARTUP_GRACE_S = 10
 # No waiting_idr episode (producer or consumer, first request to recovery, or
 # to the end of the window when it never recovers) may last longer than this.
 WAITING_IDR_MAX_S = 1.0
-# The existing contractual A/V ceiling. It is checked only where it is valid:
-# when the run has matched video-paint/audio-write pairs (media playing).
-AV_SYNC_MAX_MS = BUDGETS["av_sync_ms_max"]
+# Signed A/V contract (owner decision 2026-11-16, replacing max |skew| <= 50 ms;
+# see docs/qualification/wired-perf-runbook.md for the full rationale).
+# skew = (video paint completed - video scheduled) - (audio presented - audio
+# scheduled), in ms: positive means the video endpoint is later than the audio
+# endpoint. These are internal software endpoints (Qt paint end, sink playback
+# slot), not light and sound; the physical offset and its sign are #58.
+# (a) Sustained offset: the mean skew of every full half-open 5 s window in the
+#     drive, anchored on paint completion, is within +/-40 ms. 40 ms is EBU R37's
+#     tighter (sound-early) end-to-end bound; symmetric until #58 measures the
+#     physical offset.
+AV_MEAN_WINDOW_S = 5
+AV_MEAN_MAX_ABS_MS = 40.0
+# (b) Tail: the nearest-rank 99th percentile of |skew| is <= 50 ms, the number
+#     the previous contract used; 1.5 frame periods at 30 fps.
+AV_P99_ABS_MAX_MS = 50.0
+# (c) Cap: max |skew| <= 90 ms, ITU-R BT.1359-1's acceptability bound for sound
+#     early (detectability is 45 ms early / 125 ms late).
+AV_MAX_ABS_MS = 90.0
+# Coverage: the union of valid audio slots' scheduled intervals, intersected
+# with the drive [first paint, first paint + duration], must cover this share
+# of the drive. No audio, or too little, is a FAIL, never "n/a".
+AV_COVERAGE_MIN = 0.90
+# The runner keeps media playing: when no audio write has arrived for this long
+# during the drive, it re-sends the media intent (at most once per interval).
+MEDIA_RELAUNCH_SILENCE_S = 5.0
 # Operational bounds, not pass criteria. There is no first-paint deadline: the
 # runner waits this long before it starts the drive clock, and it restarts the
 # clock at the first paint if that comes later. Its latency is reported as
@@ -96,7 +121,7 @@ STIMULUS_PERIOD_S = 1.0
 CONTROL_WRITE_TIMEOUT_S = 2.0
 # The soak gate. Same bytes are checked by hash. The age bound keeps the phone,
 # its Android Auto / Maps versions and the target's state close to what the
-# smoke saw: the 60+1800+7200 s chain takes about 2.6 h, so one day is a
+# smoke saw: the 1800+7200 s chain takes about 2.5 h, so one day is a
 # same-day rule that an overnight phone app update cannot slip past.
 RECORD_MAX_AGE_S = 24 * 3600
 RECORD_FUTURE_SKEW_S = 300
@@ -172,20 +197,79 @@ def waiting_idr_episodes(stamped: list[dict], end_ns: int, run_start_ns: int | N
     return episodes
 
 
-def av_pairs_ms(presented: list[dict], audio: list[dict]) -> tuple[list[float], int]:
-    """|video paint delay - audio write delay| for each video frame inside an audio slot."""
-    valid = sorted((a for a in audio if isinstance(a.get("presented_ns"), int)),
-                   key=lambda a: a["scheduled_ns"])
-    invalid = sum(1 for a in audio if not isinstance(a.get("presented_ns"), int))
-    starts = [a["scheduled_ns"] for a in valid]
+def _valid_audio(audio: list[dict]) -> tuple[list[dict], int]:
+    """Audio slots with a usable playback endpoint, by schedule; and the count of the rest."""
+    valid, invalid = [], 0
+    for slot in audio:
+        if all(type(slot.get(k)) is int for k in ("scheduled_ns", "scheduled_end_ns", "presented_ns")) \
+                and slot["scheduled_end_ns"] > slot["scheduled_ns"]:
+            valid.append(slot)
+        else:
+            invalid += 1
+    valid.sort(key=lambda slot: slot["scheduled_ns"])
+    return valid, invalid
+
+
+def av_pairs(presented: list[dict], valid_audio: list[dict]) -> list[tuple[int, float]]:
+    """(paint completion ns, signed skew ms) for each frame whose schedule lies in a slot.
+
+    A frame pairs with the audio slot whose half-open scheduled interval holds
+    the frame's scheduled time; skew is video delay minus audio delay.
+    """
+    starts = [slot["scheduled_ns"] for slot in valid_audio]
     out = []
     for frame in presented:
         j = bisect.bisect_right(starts, frame["scheduled_ns"]) - 1
-        if j >= 0 and frame["scheduled_ns"] < valid[j]["scheduled_end_ns"]:
-            slot = valid[j]
-            out.append(abs((frame["completed_ns"] - frame["scheduled_ns"])
-                           - (slot["presented_ns"] - slot["scheduled_ns"])) / 1e6)
-    return out, invalid
+        if j >= 0 and frame["scheduled_ns"] < valid_audio[j]["scheduled_end_ns"]:
+            slot = valid_audio[j]
+            out.append((frame["completed_ns"],
+                        ((frame["completed_ns"] - frame["scheduled_ns"])
+                         - (slot["presented_ns"] - slot["scheduled_ns"])) / 1e6))
+    return out
+
+
+def audio_coverage(valid_audio: list[dict], start_ns: int, end_ns: int) -> float:
+    """Share of [start_ns, end_ns] covered by the union of valid scheduled audio intervals."""
+    covered, cursor = 0, start_ns
+    for slot in valid_audio:  # sorted by scheduled_ns
+        lo, hi = max(slot["scheduled_ns"], cursor), min(slot["scheduled_end_ns"], end_ns)
+        if hi > lo:
+            covered += hi - lo
+            cursor = hi
+        cursor = max(cursor, min(slot["scheduled_end_ns"], end_ns))
+    return covered / (end_ns - start_ns) if end_ns > start_ns else 0.0
+
+
+def window_means(pairs: list[tuple[int, float]], start_ns: int, end_ns: int,
+                 width_s: float) -> tuple[float, float] | None:
+    """(min, max) sample mean over every full half-open window [t, t+width) in the drive.
+
+    Windows are anchored on paint completion and slide through every point where
+    a pair enters or leaves; windows without pairs have no mean.
+    """
+    width = int(width_s * 10**9)
+    if not pairs or end_ns - start_ns < width:
+        return None
+    times = [t for t, _ in pairs]
+    prefix = [0.0]
+    for _, skew in pairs:
+        prefix.append(prefix[-1] + skew)
+    latest = end_ns - width
+    candidates = {start_ns}
+    candidates.update(t for t in times if start_ns <= t <= latest)
+    candidates.update(t - width + 1 for t in times if start_ns <= t - width + 1 <= latest)
+    low, high = None, None
+    for t in candidates:
+        i, j = bisect.bisect_left(times, t), bisect.bisect_left(times, t + width)
+        if j > i:
+            mean = (prefix[j] - prefix[i]) / (j - i)
+            low = mean if low is None else min(low, mean)
+            high = mean if high is None else max(high, mean)
+    return None if low is None else (low, high)
+
+
+def _rank(sorted_values: list[float], fraction: float) -> float:
+    return sorted_values[max(0, math.ceil(fraction * len(sorted_values)) - 1)]
 
 
 def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run: dict) -> dict:
@@ -252,21 +336,42 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
                                full_window=full, processes_survived=survived,
                                disconnects=len(dropped), terminal_errors=terminal[:5]))
 
-    # 4. A/V within the existing ceiling where valid.
+    # 4. Signed A/V contract: sustained mean, tail, cap, and audio coverage.
     window_paints = [e for e in paints if active_ns and active_ns <= e["completed_ns"] <= cutoff
                      and isinstance(e.get("scheduled_ns"), int)]
-    audio = [e for e in receiver if e.get("event") == "audio_write_completed"
-             and isinstance(e.get("scheduled_ns"), int) and isinstance(e.get("scheduled_end_ns"), int)]
-    pairs, invalid_audio = av_pairs_ms(window_paints, audio)
-    if pairs:
-        worst = max(pairs)
-        criteria.append(_criterion("av_sync_within_ceiling", worst <= AV_SYNC_MAX_MS,
-                                   ceiling_ms=AV_SYNC_MAX_MS, max_ms=worst, pairs=len(pairs),
-                                   invalid_audio_slots=invalid_audio))
-    else:
-        criteria.append(_criterion("av_sync_within_ceiling", None, ceiling_ms=AV_SYNC_MAX_MS,
-                                   pairs=0, invalid_audio_slots=invalid_audio,
-                                   reason="not valid: no matched video/audio pairs (no media)"))
+    audio = [e for e in receiver if e.get("event") == "audio_write_completed"]
+    valid_audio, invalid_audio = _valid_audio(audio)
+    pairs = av_pairs(window_paints, valid_audio)
+    coverage = audio_coverage(valid_audio, start_ns, end_ns) if start_ns else 0.0
+    skews = sorted(skew for _, skew in pairs)
+    magnitudes = sorted(abs(skew) for skew in skews)
+    means = window_means(pairs, start_ns, end_ns, AV_MEAN_WINDOW_S) if start_ns else None
+    worst_mean = max(means, key=abs) if means else None
+    av = {
+        "pairs": len(pairs), "invalid_audio_slots": invalid_audio, "coverage": coverage,
+        "signed_p1_ms": _rank(skews, 0.01) if skews else None,
+        "signed_p50_ms": _rank(skews, 0.50) if skews else None,
+        "signed_p99_ms": _rank(skews, 0.99) if skews else None,
+        "signed_min_ms": skews[0] if skews else None,
+        "signed_max_ms": skews[-1] if skews else None,
+        "abs_p99_ms": _rank(magnitudes, 0.99) if magnitudes else None,
+        "abs_max_ms": magnitudes[-1] if magnitudes else None,
+        "window_mean_min_ms": means[0] if means else None,
+        "window_mean_max_ms": means[1] if means else None,
+        "worst_window_mean_ms": worst_mean,
+        "over_50_ms": sum(1 for x in magnitudes if x > 50.0),
+    }
+    clauses = {
+        "coverage": coverage >= AV_COVERAGE_MIN,
+        "window_mean": worst_mean is not None and abs(worst_mean) <= AV_MEAN_MAX_ABS_MS,
+        "p99_abs": bool(magnitudes) and av["abs_p99_ms"] <= AV_P99_ABS_MAX_MS,
+        "max_abs": bool(magnitudes) and av["abs_max_ms"] <= AV_MAX_ABS_MS,
+    }
+    criteria.append(_criterion(
+        "av_signed_contract", all(clauses.values()), clauses=clauses,
+        limits={"window_s": AV_MEAN_WINDOW_S, "window_mean_abs_ms": AV_MEAN_MAX_ABS_MS,
+                "p99_abs_ms": AV_P99_ABS_MAX_MS, "max_abs_ms": AV_MAX_ABS_MS,
+                "coverage_min": AV_COVERAGE_MIN}, **av))
 
     verdict = "PASS" if all(c["passed"] is not False for c in criteria) else "FAIL"
     seconds = (min(cutoff, stopped_ns or cutoff) - start_ns) / 1e9 if start_ns and cutoff else None
@@ -297,6 +402,42 @@ def analyze_dir(out: Path) -> dict:
 # ---- Soak gate --------------------------------------------------------------
 
 DIGEST = re.compile(r"[0-9a-f]{64}")
+SERIAL = re.compile(r"[A-Za-z0-9._:-]+")
+# Harness-only options (sockets, port, store, lifetime, the test control
+# channel). Anything else on a command line is configuration: decoder,
+# presentation, video profiles, IDR strategy, audio sink, screen geometry...
+HARNESS_FLAGS = {
+    "receiver": {"--port": 1, "--store": 1, "--require-video-consumer": 0, "--video-socket": 1,
+                 "--input-socket": 1, "--duration-ms": 1},
+    "display": {"--test-only-autostart": 0, "--test-only-control-stdin": 0, "--video-socket": 1,
+                "--input-socket": 1},
+}
+DEFAULT_CONFIGURATION = {"receiver_flags": [], "display_flags": [], "receiver_decoder": "default",
+                         "display_decoder": "default", "presentation": "default"}
+
+
+def configuration(receiver_cmd: list[str], display_cmd: list[str]) -> dict:
+    """The decode/presentation-relevant configuration of the two launched commands."""
+    flags: dict[str, list[str]] = {}
+    for role, command in (("receiver", receiver_cmd), ("display", display_cmd)):
+        harness, rest, i = HARNESS_FLAGS[role], [], 1
+        while i < len(command):
+            if command[i] in harness:
+                i += 1 + harness[command[i]]
+            else:
+                rest.append(command[i])
+                i += 1
+        flags[role] = rest
+
+    def value(args: list[str], *names: str) -> str:
+        for i, arg in enumerate(args):
+            if arg in names:
+                return args[i + 1] if i + 1 < len(args) else ""
+        return "default"
+    return {"receiver_flags": flags["receiver"], "display_flags": flags["display"],
+            "receiver_decoder": value(flags["receiver"], "--decoder"),
+            "display_decoder": value(flags["display"], "--decoder", "--decoder-backend"),
+            "presentation": value(flags["display"], "--presentation")}
 
 
 def _finite_number(value: object) -> bool:
@@ -315,14 +456,18 @@ def load_record(text: str) -> dict | None:
 
 
 def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: str,
-                 now: datetime) -> tuple[str | None, str]:
+                 phone_serial: str, now: datetime) -> tuple[str | None, str]:
     """Return (blocked reason, detail); reason None means the soak may start.
 
     Both launched binaries must have been hashed (64 lowercase hex digits) and
-    both must match the smoke's; every field the gate uses is type-checked.
+    both must match the smoke's. The smoke must come from the soak's own phone
+    (``phone_serial``, verified on the soak's port by the launcher; empty when
+    it could not be) and must have run the default decode/presentation
+    configuration, which is the one every soak stage runs. Every field the gate
+    uses must be present and well typed; anything missing fails closed.
     """
     if not isinstance(record, dict) or record.get("schema") != SCHEMA:
-        return "drive_smoke_missing", "no aa-drive-smoke/1 result document"
+        return "drive_smoke_missing", f"no {SCHEMA} result document"
     for role, digest in (("receiver", receiver_sha256), ("display", display_sha256)):
         if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
             return "drive_smoke_hash_failed", (f"the launched {role} could not be hashed "
@@ -336,14 +481,25 @@ def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: s
                        and DIGEST.fullmatch(binaries[r]["sha256"]) for r in ("receiver", "display"))
             or not _finite_number(duration) or not isinstance(finished_text, str)
             or "video_profiles" not in record
-            or not (record["video_profiles"] is None or isinstance(record["video_profiles"], str))):
+            or not (record["video_profiles"] is None or isinstance(record["video_profiles"], str))
+            or not isinstance(record.get("phone_serial"), str)
+            or not SERIAL.fullmatch(record["phone_serial"])
+            or not isinstance(record.get("configuration"), dict)
+            or set(record["configuration"]) != set(DEFAULT_CONFIGURATION)):
         return "drive_smoke_malformed", "the result lacks a well-typed verdict, binaries, " \
-            "duration_s, finished_utc or video_profiles"
+            "duration_s, finished_utc, video_profiles, phone_serial or configuration"
     if record["verdict"] != "PASS":
         return "drive_smoke_not_passed", f"verdict {record['verdict']!r}"
     for role, digest in (("receiver", receiver_sha256), ("display", display_sha256)):
         if binaries[role]["sha256"] != digest:
             return "drive_smoke_build_mismatch", f"{role} sha256 differs from the smoke's"
+    if not isinstance(phone_serial, str) or not SERIAL.fullmatch(phone_serial):
+        return "drive_smoke_phone_unverified", "the soak's phone serial is not verified on its port"
+    if record["phone_serial"] != phone_serial:
+        return "drive_smoke_phone_mismatch", "the smoke ran on a different phone than the soak's"
+    if record["configuration"] != DEFAULT_CONFIGURATION:
+        return "drive_smoke_configuration", ("the smoke ran a non-default decode/presentation "
+                                             "configuration; the soak runs the default")
     if record["video_profiles"] is not None:
         return "drive_smoke_profile", "the smoke overrode the default video offer"
     if duration < DEFAULT_DURATION_S:
@@ -357,7 +513,7 @@ def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: s
     age = (now - finished).total_seconds()
     if age > RECORD_MAX_AGE_S or age < -RECORD_FUTURE_SKEW_S:
         return "drive_smoke_stale", f"finished {age / 3600:.1f} h ago (limit {RECORD_MAX_AGE_S // 3600} h)"
-    return None, f"PASS {age / 3600:.1f} h ago on the same receiver/display bytes"
+    return None, f"PASS {age / 3600:.1f} h ago on the same phone and receiver/display bytes"
 
 
 def _check_cli(args) -> int:
@@ -374,7 +530,8 @@ def _check_cli(args) -> int:
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     reason, detail = check_record(record, receiver_sha256=args.receiver_sha256,
-                                  display_sha256=args.display_sha256, now=now)
+                                  display_sha256=args.display_sha256,
+                                  phone_serial=args.phone_serial, now=now)
     if malformed:
         reason, detail = "drive_smoke_malformed", "the result is not strict JSON"
     if reason:
@@ -421,6 +578,8 @@ class Logger(threading.Thread):
                 out.write(line)
                 if not line.startswith("{"):
                     continue
+                if line.startswith('{"event":"audio_write_completed"'):
+                    self.seen["last_audio"] = now  # media keep-alive (MEDIA_RELAUNCH_SILENCE_S)
                 if any(f'{{"event":"{n}"' in line for n in PER_FRAME) and not (
                         "first_paint" not in self.seen and '{"event":"video_presented"' in line):
                     continue  # per-frame lines are analyzed from the log afterwards
@@ -558,7 +717,10 @@ def _run_cli(args) -> int:
                   "video_profiles": args.video_profiles, "criteria_constants": {
                       "window_s": WINDOW_S, "painted_fps_min_ratio": PAINTED_FPS_MIN_RATIO,
                       "fps_startup_grace_s": FPS_STARTUP_GRACE_S,
-                      "waiting_idr_max_s": WAITING_IDR_MAX_S, "av_sync_max_ms": AV_SYNC_MAX_MS},
+                      "waiting_idr_max_s": WAITING_IDR_MAX_S,
+                      "av_mean_window_s": AV_MEAN_WINDOW_S, "av_mean_max_abs_ms": AV_MEAN_MAX_ABS_MS,
+                      "av_p99_abs_max_ms": AV_P99_ABS_MAX_MS, "av_max_abs_ms": AV_MAX_ABS_MS,
+                      "av_coverage_min": AV_COVERAGE_MIN},
                   "qualified_profile": QUALIFIED_PROFILE if args.video_profiles is None else None}
     try:
         build_type = require_optimized_build(args.build_dir)
@@ -582,6 +744,9 @@ def _run_cli(args) -> int:
     if " device " not in f" {line} " or f"usb:{args.port}" not in line.split():
         return _blocked(out, base, "phone_absent_on_port")
     base["phone_model"] = _adb(args.serial, "shell", "getprop", "ro.product.model").stdout.strip()
+    # The soak gate binds to this phone. The record is a local file and must not
+    # be committed or exported (runbook, Privacy).
+    base["phone_serial"] = args.serial
     store_before = sha256(store) if store.exists() else None
 
     env = os.environ.copy()
@@ -601,8 +766,9 @@ def _run_cli(args) -> int:
                     str(int((2 * args.duration + READY_TIMEOUT_S * 2 + FIRST_PAINT_WAIT_S + 30) * 1000))]
     display_cmd = [str(display_bin), "--test-only-autostart", "--test-only-control-stdin",
                    "--video-socket", socket + ".video", "--input-socket", socket + ".input", *profiles]
+    base["configuration"] = configuration(receiver_cmd, display_cmd)
     run = {"duration_s": args.duration, "receiver_command": receiver_cmd, "display_command": display_cmd,
-           "started_utc": datetime.now(timezone.utc).isoformat()}
+           "started_utc": datetime.now(timezone.utc).isoformat(), "media_relaunches": 0}
     lock = threading.Lock()
     loggers: list[Logger] = []
     children: list[subprocess.Popen] = []
@@ -615,14 +781,19 @@ def _run_cli(args) -> int:
         if not stop.sleep(3):
             return
         _adb(args.serial, "shell", "input", "keyevent", "KEYCODE_WAKEUP")
-        if args.media_uri:
-            media = ["-d", args.media_uri] + (["-t", args.media_type] if args.media_type else [])
-            media += ["-n", args.media_component] if args.media_component else []
+        media = ["-d", args.media_uri] + (["-t", args.media_type] if args.media_type else [])
+        media += ["-n", args.media_component] if args.media_component else []
+
+        def start_media() -> None:
             _adb(args.serial, "shell", "am", "start", "-a", "android.intent.action.VIEW", *media)
-            if not stop.sleep(4):
-                return
-        _adb(args.serial, "shell", "am", "start", "-a", "android.intent.action.VIEW",
-             "-d", args.geo_uri, "-p", "com.google.android.apps.maps")
+
+        def start_maps() -> None:
+            _adb(args.serial, "shell", "am", "start", "-a", "android.intent.action.VIEW",
+                 "-d", args.geo_uri, "-p", "com.google.android.apps.maps")
+        start_media()
+        if not stop.sleep(4):
+            return
+        start_maps()
         if stop:
             return
         receiver = _spawn(children, receiver_cmd, stdout=subprocess.PIPE,
@@ -648,11 +819,23 @@ def _run_cli(args) -> int:
         span = int(args.duration * 1e9) + 5 * 10**8
         end = dx.get("first_paint", time.monotonic_ns()) + span
         step, last = 0, 0.0
+        relaunched = time.monotonic_ns()
         print(f"drive smoke: active, window {args.duration} s", file=sys.stderr, flush=True)
         while (not stop and time.monotonic_ns() < end
                and receiver.poll() is None and display.poll() is None):
             if "first_paint" in dx:  # a late first paint restarts the drive clock
                 end = max(end, dx["first_paint"] + span)
+            # Keep media playing for the whole drive: a clip that ends (or a
+            # player that stops) gets its intent re-sent, then Maps is brought
+            # back to the front. Coverage (AV_COVERAGE_MIN) still judges the gaps.
+            silence = MEDIA_RELAUNCH_SILENCE_S * 10**9
+            now_ns = time.monotonic_ns()
+            if (now_ns - rx.get("last_audio", run["active_ns"]) > silence
+                    and now_ns - relaunched > silence):
+                start_media()
+                start_maps()
+                relaunched = time.monotonic_ns()
+                run["media_relaunches"] += 1
             if time.monotonic() - last >= STIMULUS_PERIOD_S:
                 a, b = (440, 700) if step % 2 == 0 else (700, 440)
                 lines = [f"touch down {a} 260"]
@@ -682,7 +865,7 @@ def _run_cli(args) -> int:
             logger.join(timeout=5)
         stamped.close()
         _adb(args.serial, "shell", "svc", "usb", "setFunctions", "mtp")
-        if args.media_uri and args.media_component:
+        if args.media_component:
             _adb(args.serial, "shell", "am", "force-stop", args.media_component.split("/")[0])
     receiver = children[0] if children else None
     display = children[1] if len(children) > 1 else None
@@ -699,6 +882,7 @@ def _run_cli(args) -> int:
                display_exit=display.returncode if display else None)
     (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
     result = {**base, **analyze_dir(out), "finished_utc": datetime.now(timezone.utc).isoformat()}
+    result["media_relaunches"] = run["media_relaunches"]
     if run.get("failure"):
         result["failure"] = run["failure"]
         if result["verdict"] == "PASS":  # a runner-detected failure never passes
@@ -718,8 +902,9 @@ def _print_summary(result: dict) -> None:
     print(f"drive smoke: {result['verdict']}")
     for c in result.get("criteria", []):
         state = {True: "pass", False: "FAIL", None: "n/a"}[c["passed"]]
-        extra = {k: v for k, v in c.items() if k in ("min_fps", "floor_fps", "longest_s", "max_ms",
-                                                     "pairs", "reason", "windows")}
+        extra = {k: v for k, v in c.items() if k in (
+            "min_fps", "floor_fps", "longest_s", "pairs", "reason", "windows", "clauses",
+            "coverage", "abs_p99_ms", "abs_max_ms", "worst_window_mean_ms")}
         print(f"  {state:4} {c['name']} {json.dumps(extra)}")
 
 
@@ -740,7 +925,8 @@ def main(argv: list[str]) -> int:
     run.add_argument("--display-env", help="DISPLAY[,XAUTHORITY] of the owner's session")
     run.add_argument("--video-profiles", help="diagnostic override; such a run never satisfies the gate")
     run.add_argument("--geo-uri", default="geo:0,0?q=Atlanta")
-    run.add_argument("--media-uri", help="optional media to play on the phone (validates A/V)")
+    run.add_argument("--media-uri", required=True,
+                     help="media to play on the phone for the whole drive (A/V coverage is gated)")
     run.add_argument("--media-type")
     run.add_argument("--media-component", help="explicit PKG/ACTIVITY for --media-uri")
     run.add_argument("--out", required=True, help="new private directory for logs and result.json")
@@ -750,6 +936,8 @@ def main(argv: list[str]) -> int:
     check.add_argument("--record", required=True)
     check.add_argument("--receiver-sha256", required=True)
     check.add_argument("--display-sha256", required=True)
+    check.add_argument("--phone-serial", required=True,
+                       help="the soak phone's serial, verified on its port; empty if it could not be")
     check.add_argument("--now", help="ISO-8601 time; tests and offline review only, never live")
     args = parser.parse_args(argv)
     if args.command == "check":

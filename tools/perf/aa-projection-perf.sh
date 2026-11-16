@@ -9,8 +9,10 @@
 #   Optional approved model-only policy: --thermal-policy orin-nano-cv-unavailable/1
 #   Optional X session: --display-env DISPLAY[,XAUTHORITY] (default :1)
 #   aa-projection-perf.sh --readiness-only [--out readiness.json]
-#   Every live stage needs --drive-smoke RESULT (or AA_DRIVE_SMOKE): a passing
-#   tools/wired-qa/aa_drive_smoke.py result for the same binaries (#137).
+#   Every live stage needs --drive-smoke RESULT (or AA_DRIVE_SMOKE) and
+#   --phone-serial SERIAL (or AA_PHONE_SERIAL): a passing
+#   tools/wired-qa/aa_drive_smoke.py result from that same phone, attached on
+#   --port, for the same binaries and the default configuration (#137).
 #
 # This tool measures CPU/RSS, thermal state, frame drops, decode/IPC timing,
 # A/V sync and audio latency during wired projection on the qualified Jetson,
@@ -76,11 +78,12 @@ BUILD_DIR="${AA_BUILD_DIR:-}"
 ALLOW_UNOPTIMIZED=0
 DISPLAY_ENV="${AA_DISPLAY_ENV:-}"
 DRIVE_SMOKE="${AA_DRIVE_SMOKE:-}"
+PHONE_SERIAL="${AA_PHONE_SERIAL:-}"
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 
 usage() {
-    sed -n '6,13p' "$0"
+    sed -n '6,15p' "$0"
     exit 2
 }
 
@@ -124,6 +127,7 @@ while (($# > 0)); do
         --build-dir) require_value "$@"; BUILD_DIR="$2"; shift 2 ;;
         --display-env) require_value "$@"; DISPLAY_ENV="$2"; shift 2 ;;
         --drive-smoke) require_value "$@"; DRIVE_SMOKE="$2"; shift 2 ;;
+        --phone-serial) require_value "$@"; PHONE_SERIAL="$2"; shift 2 ;;
         --allow-unoptimized-build) ALLOW_UNOPTIMIZED=1; shift ;;
         --now) require_value "$@"; NOW="$2"; shift 2 ;;
         --readiness-only) READINESS_ONLY=1; shift ;;
@@ -425,6 +429,8 @@ fi
 # smoke's. A binary that cannot be hashed (or no display at all) blocks the
 # stage. Freshness (aa_drive_smoke.py RECORD_MAX_AGE_S) uses the real clock:
 # --now only dates the result document and is never forwarded to the gate.
+# The soak stages launch the receiver and display with default decode and
+# presentation flags, so only a default-configuration smoke is accepted.
 remote_sha256() {
     local path="$1" line=""
     [[ -n "$path" ]] || return 0
@@ -433,9 +439,22 @@ remote_sha256() {
 }
 receiver_sha="$(remote_sha256 "$RECEIVER")"
 display_sha="$(remote_sha256 "$DISPLAY_BIN")"
+# The smoke must come from the soak's own phone: --phone-serial must be attached
+# (adb state "device") on --port of the target, or it is passed on empty and the
+# gate blocks with drive_smoke_phone_unverified.
+verified_serial=""
+if [[ "$PHONE_SERIAL" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+    devices="$(remote "adb devices -l" 2>/dev/null || true)"
+    if awk -v serial="$PHONE_SERIAL" -v port="usb:${PORT}" '
+            $1 == serial && $2 == "device" { for (i = 3; i <= NF; i++) if ($i == port) found = 1 }
+            END { exit found ? 0 : 1 }' <<<"$devices"; then
+        verified_serial="$PHONE_SERIAL"
+    fi
+fi
 if ! smoke_reason="$("$PY" -B "$TOOL_DIR/../wired-qa/aa_drive_smoke.py" check \
         --record "${DRIVE_SMOKE:-/nonexistent}" \
-        --receiver-sha256 "$receiver_sha" --display-sha256 "$display_sha")"; then
+        --receiver-sha256 "$receiver_sha" --display-sha256 "$display_sha" \
+        --phone-serial "$verified_serial")"; then
     smoke_reason="${smoke_reason:-drive_smoke_missing}"
     blocked_result "$smoke_reason" "$build_type_known" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
