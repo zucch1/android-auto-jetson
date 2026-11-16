@@ -1186,12 +1186,18 @@ TEST(WiredReceiver, IdrRecoveryCoordinatorBacksOffFailedRequestsWithoutCountingT
     coord.reset();
     auto t_cap = t5 + std::chrono::milliseconds{10} + aa::ipc::kIdrRequestMinInterval;
     coord.begin_wait(t_cap);
-    for (int i = 0; i < 6; ++i) {
+    using std::chrono::milliseconds;
+    const milliseconds expected_delays[] = {milliseconds{250}, milliseconds{500}, milliseconds{1000},
+                                            milliseconds{2000}, milliseconds{2000}, milliseconds{2000}};
+    static_assert(aa::ipc::kIdrFailureBackoffCap == milliseconds{2000});
+    for (const auto expected : expected_delays) {
         ASSERT_EQ(coord.try_request_step(t_cap, true), IdrRecoveryStep::nudge);
         coord.note_request_failed(t_cap);
         ASSERT_TRUE(coord.retry_after().has_value());
-        EXPECT_LE(*coord.retry_after() - t_cap, aa::ipc::kIdrFailureBackoffCap);
+        EXPECT_EQ(std::chrono::duration_cast<milliseconds>(*coord.retry_after() - t_cap), expected);
         EXPECT_EQ(coord.episode_requests(), 0u);
+        EXPECT_EQ(coord.try_request_step(*coord.retry_after() - milliseconds{1}, true),
+                  IdrRecoveryStep::none);
         t_cap = *coord.retry_after();
     }
     EXPECT_EQ(coord.total_requests(), 3u);

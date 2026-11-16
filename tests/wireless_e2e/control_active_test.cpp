@@ -501,6 +501,15 @@ TEST_P(WirelessVideoIdr, PartialFocusRestoreFailureRetiresWirelessSessionWithout
         ASSERT_TRUE(ping_cv.wait_for(lock, 2s, [&] { return keepalive_acked.load(); }));
     }
 
+    // The failed first send starts retry backoff: an immediate retry is throttled
+    // without touching the phone, and the next attempt waits kIdrRequestMinInterval.
+    const int throttled_focus_sends = fault.focus_sends();
+    const auto throttled = outlet.request_idr_external("consumer_ipc");
+    ASSERT_TRUE(throttled);
+    EXPECT_FALSE(throttled.value());
+    EXPECT_EQ(fault.focus_sends(), throttled_focus_sends);
+    steady_now += aa::ipc::kIdrRequestMinInterval;
+
     // Step 4b: Inside the owner-loop checkpoint (no subsequent video AUs), fail SECOND send (restore) after
     // native succeeds; Runtime/owner forwards channel_focus_restore_failed and WirelessLink::poll exits immediately.
     bool partial_dispatched = false;
