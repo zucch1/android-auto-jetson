@@ -361,7 +361,6 @@ private:
         std::unique_lock<std::mutex>& lock,
         std::chrono::steady_clock::time_point now,
         std::string_view reason) {
-        const auto prev = idr_coordinator_.snapshot();
         const auto step = idr_coordinator_.try_request_step(now, projecting_locked());
         if (step == ipc::IdrRecoveryStep::none) {
             return false;
@@ -386,7 +385,7 @@ private:
                                                      to_string(sent.error().code())));
                 return sent.error();
             }
-            idr_coordinator_.restore_snapshot(prev);
+            idr_coordinator_.note_request_failed(now);
             return sent.error();
         }
         log_(ipc::idr_requested_json("producer", reason));

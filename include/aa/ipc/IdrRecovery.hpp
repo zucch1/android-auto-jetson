@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -10,6 +12,7 @@
 namespace aa::ipc {
 
 inline constexpr std::chrono::milliseconds kIdrRequestMinInterval{250};
+inline constexpr std::chrono::milliseconds kIdrFailureBackoffCap{2000};
 inline constexpr std::chrono::milliseconds kIdrEscalationDelay{1000};
 inline constexpr std::uint64_t kIdrEscalationMaxNudges{3};
 inline constexpr std::chrono::milliseconds kIdrTransitionCooldown{5000};
@@ -135,6 +138,9 @@ public:
         if (last_request_at_.has_value() && (now - *last_request_at_) < config_.min_interval) {
             return IdrRecoveryStep::none;
         }
+        if (retry_after_.has_value() && now < *retry_after_) {
+            return IdrRecoveryStep::none;
+        }
 
         const bool transition_ready =
             !last_transition_at_.has_value() ||
@@ -165,6 +171,9 @@ public:
         }
         }
 
+        pending_attempt_ = PendingAttempt{snapshot(), consecutive_failures_};
+        consecutive_failures_ = 0;
+        retry_after_.reset();
         last_request_at_ = now;
         ++episode_requests_;
         ++total_requests_;
@@ -197,9 +206,33 @@ public:
         episode_nudges_ = prev.episode_nudges;
         total_requests_ = prev.total_requests;
         escalated_ = prev.escalated;
+        pending_attempt_.reset();
+    }
+
+    void note_request_failed(Clock::time_point now) noexcept {
+        if (pending_attempt_.has_value()) {
+            const auto attempt = *pending_attempt_;
+            restore_snapshot(attempt.snapshot);
+            consecutive_failures_ = attempt.prior_failures;
+        } else if (!waiting_) {
+            return;
+        }
+        const std::uint32_t shift = std::min<std::uint32_t>(consecutive_failures_, 3U);
+        const auto cap = std::max(config_.min_interval, kIdrFailureBackoffCap);
+        auto backoff = config_.min_interval;
+        for (std::uint32_t i = 0; i < shift && backoff < cap; ++i) {
+            backoff = (backoff <= cap / 2) ? (backoff * 2) : cap;
+        }
+        if (consecutive_failures_ < std::numeric_limits<std::uint32_t>::max()) {
+            ++consecutive_failures_;
+        }
+        retry_after_ = now + backoff;
     }
 
     [[nodiscard]] RecoveryResult on_idr_delivered(Clock::time_point now) noexcept {
+        pending_attempt_.reset();
+        consecutive_failures_ = 0;
+        retry_after_.reset();
         if (!waiting_) {
             return {};
         }
@@ -226,6 +259,9 @@ public:
         episode_requests_ = 0;
         episode_nudges_ = 0;
         escalated_ = false;
+        pending_attempt_.reset();
+        consecutive_failures_ = 0;
+        retry_after_.reset();
     }
 
     [[nodiscard]] bool waiting() const noexcept { return waiting_; }
@@ -239,17 +275,31 @@ public:
     [[nodiscard]] std::optional<Clock::time_point> last_transition_at() const noexcept {
         return last_transition_at_;
     }
+    [[nodiscard]] std::optional<Clock::time_point> retry_after() const noexcept {
+        return retry_after_;
+    }
+    [[nodiscard]] std::uint32_t consecutive_failures() const noexcept {
+        return consecutive_failures_;
+    }
 
 private:
+    struct PendingAttempt final {
+        RequestSnapshot snapshot{};
+        std::uint32_t prior_failures{0};
+    };
+
     Config config_{};
     bool waiting_{false};
     Clock::time_point wait_started_at_{};
     std::optional<Clock::time_point> last_request_at_{};
     std::optional<Clock::time_point> first_nudge_at_{};
     std::optional<Clock::time_point> last_transition_at_{};
+    std::optional<Clock::time_point> retry_after_{};
+    std::optional<PendingAttempt> pending_attempt_{};
     std::uint64_t episode_requests_{0};
     std::uint64_t episode_nudges_{0};
     std::uint64_t total_requests_{0};
+    std::uint32_t consecutive_failures_{0};
     bool escalated_{false};
 };
 

@@ -117,11 +117,10 @@ struct DisplayController::Impl final {
             (saw_video_unit || video->rejected() > 0 || video->suppressed() > 0 || past_startup_grace);
         if (awaiting || socket_waiting) {
             idr_recovery.begin_wait(current_time);
-            const auto prev = idr_recovery.snapshot();
             if (idr_recovery.try_request(current_time, state == DisplayState::projecting)) {
                 const auto requested = control.request_idr_recovery();
                 if (!requested.has_value()) {
-                    idr_recovery.restore_snapshot(prev);
+                    idr_recovery.note_request_failed(current_time);
                 } else {
                     emit_diagnostic(ipc::idr_requested_json(
                         "consumer", awaiting ? "decode_awaiting_idr" : "video_consumer_waiting_idr"));

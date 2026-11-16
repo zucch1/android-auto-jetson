@@ -3277,3 +3277,89 @@ TEST(DummyDisplayBackpressure, ConsumerSuppressesIdrRecoveryWhenNotProjecting) {
     controller.value().shutdown();
     server.value().close();
 }
+
+TEST(DummyDisplayBackpressure, ConsumerThrottlesPersistentDbusIdrRecoveryFailure) {
+    OwnedRuntime runtime;
+    ASSERT_FALSE(runtime.path().empty());
+    ScriptedReceiver::Script script{};
+    script["StartProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
+    script["RequestIdrRecovery"] = {
+        ScriptedReply{.kind = ScriptedReply::Kind::error},
+        ScriptedReply{.kind = ScriptedReply::Kind::error},
+        ScriptedReply{.kind = ScriptedReply::Kind::ok},
+    };
+    auto receiver = ScriptedReceiver::start(script);
+    ASSERT_NE(receiver, nullptr);
+
+    auto server_socket = aa::ipc::video_socket_path_in(runtime.path());
+    auto server = aa::ipc::VideoServer::listen(
+        server_socket, aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
+    ASSERT_TRUE(server.has_value());
+    std::optional<aa::ipc::VideoProducer> producer;
+    std::thread acceptor([&] {
+        auto accepted = server.value().accept_consumer(Milliseconds{5000});
+        if (accepted.has_value()) {
+            producer.emplace(std::move(accepted.value()));
+        }
+    });
+
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+    BackpressureDecoderState decoder{};
+    RecordingFrameTarget frames{};
+    auto now = std::chrono::steady_clock::time_point{std::chrono::seconds{50}};
+    std::vector<std::string> diagnostics;
+    auto config = test_config("ConsumerDbusFailThrottle");
+    config.on_diagnostic = [&diagnostics](const std::string& line) {
+        diagnostics.push_back(line);
+    };
+    config.clock = [&now] { return now; };
+    auto controller = DisplayController::attach(
+        DisplayController::Deps{client.value(), backpressure_factory(decoder), frames},
+        std::move(config));
+    ASSERT_TRUE(controller.has_value());
+    ASSERT_TRUE(controller.value().start_projection(server_socket).has_value());
+    acceptor.join();
+    ASSERT_TRUE(producer.has_value());
+
+    // Enter awaiting_idr: first D-Bus call fails; 24 pumps within 250 ms make no extra calls.
+    decoder.report.awaiting_idr = true;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 1u);
+    for (int i = 0; i < 24; ++i) {
+        now += std::chrono::milliseconds{10};
+        ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    }
+    EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 1u);
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}"),
+              0);
+
+    // At +250 ms: second D-Bus call runs (and fails).
+    now += std::chrono::milliseconds{10};
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 2u);
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}"),
+              0);
+
+    // After the 2nd-failure backoff elapses (+500 ms), the 3rd attempt succeeds and counters
+    // remain unpolluted by the two failed calls.
+    now += std::chrono::milliseconds{500};
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 3u);
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
+                         "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}"),
+              1);
+
+    now += std::chrono::milliseconds{50};
+    decoder.report.awaiting_idr = false;
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
+                        "{\"event\":\"idr_recovered\",\"source\":\"consumer\",\"latency_ms\":800,\"episode_requests\":1,\"total_requests\":1}"),
+              diagnostics.end());
+
+    producer->close();
+    controller.value().shutdown();
+    server.value().close();
+}

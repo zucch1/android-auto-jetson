@@ -857,7 +857,12 @@ TEST(WiredReceiver, VideoOutletPartialFocusRestoreFailureFailsSessionAndPreserve
         EXPECT_EQ(outlet.idr_snapshot().episode_requests, 3u);
         EXPECT_FALSE(outlet.idr_snapshot().last_transition_at.has_value());
 
-        // Second-send failure after native succeeds fails session and preserves snapshot.
+        // Failure starts retry backoff; immediate retry is throttled, then after kIdrRequestMinInterval
+        // the second-send failure after native succeeds fails session and preserves snapshot.
+        const auto throttled = outlet.request_idr_external("consumer_ipc");
+        ASSERT_TRUE(throttled);
+        EXPECT_FALSE(throttled.value());
+        steady_now += aa::ipc::kIdrRequestMinInterval;
         const std::size_t before_partial = transport.sent_count();
         transport.fail_send_at(before_partial + 1); // 1st send (native) succeeds; 2nd send (restore) fails.
         const auto partial_fail = outlet.request_idr_external("consumer_ipc");
@@ -1098,6 +1103,100 @@ TEST(WiredReceiver, IdrRecoveryCoordinatorHoldsCooldownThroughIdrDeliveredAndRes
               IdrRecoveryStep::focus_transition);
 }
 
+TEST(WiredReceiver, IdrRecoveryCoordinatorBacksOffFailedRequestsWithoutCountingThem) {
+    using aa::ipc::IdrRecoveryCoordinator;
+    using aa::ipc::IdrRecoveryStep;
+    using aa::ipc::IdrRecoveryStrategy;
+
+    const auto t0 = std::chrono::steady_clock::time_point{std::chrono::seconds{60}};
+    IdrRecoveryCoordinator coord{IdrRecoveryCoordinator::Config{
+        aa::ipc::kIdrRequestMinInterval,
+        aa::ipc::kIdrEscalationDelay,
+        aa::ipc::kIdrEscalationMaxNudges,
+        aa::ipc::kIdrTransitionCooldown,
+        IdrRecoveryStrategy::auto_escalate}};
+
+    coord.begin_wait(t0);
+    ASSERT_EQ(coord.try_request_step(t0, true), IdrRecoveryStep::nudge);
+    coord.note_request_failed(t0);
+
+    // Counters and timestamps stay rolled back, while backoff blocks retries inside min_interval.
+    EXPECT_EQ(coord.episode_requests(), 0u);
+    EXPECT_EQ(coord.total_requests(), 0u);
+    EXPECT_FALSE(coord.last_request_at().has_value());
+    EXPECT_FALSE(coord.last_transition_at().has_value());
+    EXPECT_FALSE(coord.escalated());
+    EXPECT_EQ(coord.consecutive_failures(), 1u);
+    EXPECT_EQ(coord.try_request_step(t0 + std::chrono::milliseconds{249}, true),
+              IdrRecoveryStep::none);
+
+    // After 250 ms, next attempt runs; a second failure doubles backoff to 500 ms (capped at 2000 ms).
+    const auto t1 = t0 + aa::ipc::kIdrRequestMinInterval;
+    ASSERT_EQ(coord.try_request_step(t1, true), IdrRecoveryStep::nudge);
+    coord.note_request_failed(t1);
+    EXPECT_EQ(coord.episode_requests(), 0u);
+    EXPECT_EQ(coord.total_requests(), 0u);
+    EXPECT_EQ(coord.consecutive_failures(), 2u);
+    EXPECT_EQ(coord.try_request_step(t1 + std::chrono::milliseconds{499}, true),
+              IdrRecoveryStep::none);
+
+    // A successful request at t2 clears the failure backoff (next failure starts at 250 ms again).
+    const auto t2 = t1 + std::chrono::milliseconds{500};
+    ASSERT_EQ(coord.try_request_step(t2, true), IdrRecoveryStep::nudge);
+    EXPECT_EQ(coord.consecutive_failures(), 0u);
+    EXPECT_FALSE(coord.retry_after().has_value());
+    EXPECT_EQ(coord.episode_requests(), 1u);
+    EXPECT_EQ(coord.total_requests(), 1u);
+
+    const auto t3 = t2 + aa::ipc::kIdrRequestMinInterval;
+    ASSERT_EQ(coord.try_request_step(t3, true), IdrRecoveryStep::nudge);
+    coord.note_request_failed(t3);
+    EXPECT_EQ(coord.consecutive_failures(), 1u);
+    EXPECT_EQ(coord.episode_requests(), 1u);
+    EXPECT_EQ(coord.total_requests(), 1u);
+
+    // on_idr_delivered() clears failure backoff immediately for a subsequent episode.
+    const auto delivered = coord.on_idr_delivered(t3 + std::chrono::milliseconds{10});
+    EXPECT_TRUE(delivered.recovered);
+    EXPECT_EQ(delivered.episode_requests, 1u);
+    EXPECT_EQ(delivered.total_requests, 1u);
+    EXPECT_EQ(coord.consecutive_failures(), 0u);
+    EXPECT_FALSE(coord.retry_after().has_value());
+    // t3 + 20 ms is 270 ms after t2 (>= min_interval), and only succeeds because
+    // on_idr_delivered cleared the t3 failure backoff (which would have held until t3 + 250 ms).
+    const auto t4 = t3 + std::chrono::milliseconds{20};
+    coord.begin_wait(t4);
+    EXPECT_EQ(coord.try_request_step(t4, true), IdrRecoveryStep::nudge);
+
+    // reset() also clears failure backoff even before retry_after expires.
+    const auto t5 = t4 + aa::ipc::kIdrRequestMinInterval;
+    ASSERT_EQ(coord.try_request_step(t5, true), IdrRecoveryStep::nudge);
+    coord.note_request_failed(t5);
+    EXPECT_EQ(coord.consecutive_failures(), 1u);
+    EXPECT_EQ(coord.try_request_step(t5 + std::chrono::milliseconds{10}, true),
+              IdrRecoveryStep::none);
+    coord.reset();
+    EXPECT_EQ(coord.consecutive_failures(), 0u);
+    EXPECT_FALSE(coord.retry_after().has_value());
+    coord.begin_wait(t5 + std::chrono::milliseconds{10});
+    EXPECT_EQ(coord.try_request_step(t5 + std::chrono::milliseconds{10}, true),
+              IdrRecoveryStep::nudge);
+
+    // Repeated failures cap exponential backoff at kIdrFailureBackoffCap (2000 ms) without escalating.
+    coord.reset();
+    auto t_cap = t5 + std::chrono::milliseconds{10} + aa::ipc::kIdrRequestMinInterval;
+    coord.begin_wait(t_cap);
+    for (int i = 0; i < 6; ++i) {
+        ASSERT_EQ(coord.try_request_step(t_cap, true), IdrRecoveryStep::nudge);
+        coord.note_request_failed(t_cap);
+        ASSERT_TRUE(coord.retry_after().has_value());
+        EXPECT_LE(*coord.retry_after() - t_cap, aa::ipc::kIdrFailureBackoffCap);
+        EXPECT_EQ(coord.episode_requests(), 0u);
+        t_cap = *coord.retry_after();
+    }
+    EXPECT_EQ(coord.total_requests(), 3u);
+}
+
 TEST(WiredReceiver, VideoOutletSuppressesIdrRequestsWhenNotProjecting) {
     auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{5}};
     bool projecting = false;
@@ -1158,6 +1257,70 @@ TEST(WiredReceiver, VideoOutletSuppressesIdrRequestsWhenNotProjecting) {
         EXPECT_TRUE(res.value());
     }
     EXPECT_EQ(requests, 2u);
+}
+
+TEST(WiredReceiver, VideoOutletThrottlesFailedFocusNotificationAcrossDroppedAus) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{15}};
+    std::size_t failed_hook_calls = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&failed_hook_calls]() -> aa::core::Result<void> {
+            ++failed_hook_calls;
+            return aa::Error{aa::ErrorCode::transport_io};
+        },
+        [&steady_now] { return steady_now; },
+    });
+
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    const int tiny_buf = 32768;
+    ASSERT_EQ(::setsockopt(pair.value().producer.native_handle(), SOL_SOCKET, SO_SNDBUF,
+                           &tiny_buf, sizeof(tiny_buf)), 0);
+    ASSERT_EQ(::setsockopt(pair.value().consumer.native_handle(), SOL_SOCKET, SO_RCVBUF,
+                           &tiny_buf, sizeof(tiny_buf)), 0);
+    outlet.install(std::move(pair.value().producer));
+
+    // Send an initial IDR so VideoProducer leaves initial waiting_idr state before saturating.
+    std::uint64_t ts = 100;
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, ++ts, {100}}, wiredtest::kVideoIdr}));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+
+    std::vector<std::byte> non_idr(16384, std::byte{0x41});
+    non_idr[0] = std::byte{0x00};
+    non_idr[1] = std::byte{0x00};
+    non_idr[2] = std::byte{0x01};
+    non_idr[3] = std::byte{0x41};
+
+    // Saturate the tiny socket buffer so VideoOutlet enters dropped_backpressure / dropped_waiting_idr.
+    bool saw_first_failure = false;
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, ++ts, {100}}, non_idr}));
+        if (failed_hook_calls == 1u) {
+            saw_first_failure = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(saw_first_failure);
+    EXPECT_EQ(outlet.idr_snapshot().episode_requests, 0u);
+    EXPECT_EQ(outlet.idr_snapshot().total_requests, 0u);
+
+    // Many dropped AUs within the 250 ms failure backoff must not invoke the hook again.
+    for (int i = 0; i < 24; ++i) {
+        steady_now += std::chrono::milliseconds{10};
+        ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, ++ts, {100}}, non_idr}));
+    }
+    EXPECT_EQ(failed_hook_calls, 1u);
+    EXPECT_EQ(outlet.idr_snapshot().episode_requests, 0u);
+    EXPECT_EQ(outlet.idr_snapshot().total_requests, 0u);
+
+    // Once the 250 ms failure backoff elapses (+10 ms -> 250 ms total), one more attempt runs.
+    steady_now += std::chrono::milliseconds{10};
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, ++ts, {100}}, non_idr}));
+    EXPECT_EQ(failed_hook_calls, 2u);
+    EXPECT_EQ(outlet.idr_snapshot().episode_requests, 0u);
+    EXPECT_EQ(outlet.idr_snapshot().total_requests, 0u);
 }
 
 TEST(WiredReceiver, VideoSelectionWatchdogEmitsOnceAfterTimeoutAndResets) {
