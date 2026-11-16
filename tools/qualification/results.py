@@ -21,6 +21,7 @@ RECOVERY: Final = {
     'phone_aa_restart': 'dip+frames+pump+input',
     'unknown_phone': 'attributed_rejection',
 }
+# Historical v2 results keep the contract they were measured under.
 GATES: Final = {
     'receiver_rss_peak_mb': (250, 'MB'),
     'receiver_cpu_sustained_pct_one_core': (50, '% of one core'),
@@ -28,6 +29,19 @@ GATES: Final = {
     'av_sync_ms': (50, 'ms'),
     'audio_latency_ms': (200, 'ms'),
 }
+# v3 (#137): the signed A/V contract replaces av_sync_ms <= 50 ms; coverage is
+# a floor (op ge) and av_sync_ms is informational.
+GATES_V3: Final = {
+    'receiver_rss_peak_mb': (250, 'MB'),
+    'receiver_cpu_sustained_pct_one_core': (50, '% of one core'),
+    'rss_growth_pct': (10, '%'),
+    'audio_latency_ms': (200, 'ms'),
+    'av_window_mean_abs_ms': (40, 'ms'),
+    'av_p99_abs_ms': (50, 'ms'),
+    'av_max_abs_ms': (90, 'ms'),
+}
+AV_COVERAGE_MIN_PCT: Final = 90
+AV_CONTRACT_METRICS: Final = {'av_p99_abs_ms': 'abs_p99_ms', 'av_max_abs_ms': 'abs_max_ms'}
 RECORDED: Final = ('receiver_rss_mean_mb', 'receiver_cpu_peak_pct_one_core',
                    'frame_drops', 'decode_p50_ms', 'decode_p95_ms', 'decode_fps',
                    'decode_frames', 'ipc_throughput_mbps', 'ipc_p95_added_latency_ms',
@@ -97,9 +111,11 @@ def recovery(doc: Document) -> None:
 def performance(doc: Document, seconds: int) -> None:
     doc.equal('task', '32. Measure wired performance and two-hour soak')
     require('capture' not in doc.values, 'RAW_CAPTURE_REFERENCE')
-    doc.equal('schema', 'aa-projection-perf/2')
-    schema = aa_perf_schema.load_schema(aa_perf_schema.DEFAULT_SCHEMA)
+    version = doc.text('schema')
+    require(version in ('aa-projection-perf/2', 'aa-projection-perf/3'), 'PERF_SCHEMA_VERSION')
+    schema = aa_perf_schema.load_schema(aa_perf_schema.schema_for(version))
     require(not aa_perf_schema.validate(doc.values, schema), 'PERF_SCHEMA')
+    version3 = version == 'aa-projection-perf/3'
     doc.equal('measurement_origin', 'live')
     doc.equal('qualification_status', 'COMPLETE_LIVE')
     doc.equal('verdict', 'PASS')
@@ -128,7 +144,7 @@ def performance(doc: Document, seconds: int) -> None:
     for name in ('video_units', 'audio_chunks'):
         require(run.integer(name) > 0, 'MISSING_MEDIA_PROGRESS')
     metrics = doc.child('metrics')
-    for name, (ceiling, unit) in GATES.items():
+    for name, (ceiling, unit) in (GATES_V3 if version3 else GATES).items():
         metric = metrics.child(name)
         value = metric.number('value')
         require(value < ceiling if name == 'rss_growth_pct' else 0 <= value <= ceiling,
@@ -141,6 +157,8 @@ def performance(doc: Document, seconds: int) -> None:
             metric.equal('op', 'lt')
         else:
             require(metric.values.get('op', 'le') == 'le', 'PERF_METRIC_OPERATOR')
+    if version3:
+        signed_av(doc, metrics)
     helper = metrics.child('helper_rss_mb')
     helper.equal('value', None)
     helper.equal('status', 'NOT_REQUIRED')
@@ -167,3 +185,33 @@ def performance(doc: Document, seconds: int) -> None:
         require(math.isclose(metrics.child(name).number('value'), numerator * scale / duration,
                              rel_tol=1e-12, abs_tol=1e-12), 'PERF_RATE:' + name)
     provenance(doc.child('provenance'))
+
+
+def signed_av(doc: Document, metrics: Document) -> None:
+    """v3: coverage floor, the passed contract block, and the moving-map workload."""
+    coverage = metrics.child('av_coverage_pct')
+    require(AV_COVERAGE_MIN_PCT <= coverage.number('value') <= 100, 'PERF_BUDGET:av_coverage_pct')
+    require(coverage.number('budget_min') == AV_COVERAGE_MIN_PCT, 'PERF_METRIC_BUDGET')
+    coverage.equal('op', 'ge')
+    coverage.equal('gated', True)
+    coverage.equal('status', 'PASS')
+    coverage.equal('unit', '%')
+    sync = metrics.child('av_sync_ms')
+    sync.equal('gated', False)
+    sync.number('value')
+    contract = doc.child('av_contract')
+    contract.equal('valid', True)
+    contract.equal('passed', True)
+    clauses = contract.child('clauses')
+    for name in ('coverage', 'window_mean', 'p99_abs', 'max_abs'):
+        clauses.equal(name, True)
+    require(contract.integer('pairs') > 0, 'PERF_AV_PAIRS')
+    require(math.isclose(contract.number('coverage') * 100, coverage.number('value'),
+                         rel_tol=1e-12, abs_tol=1e-9), 'PERF_AV_COVERAGE')
+    for name, key in AV_CONTRACT_METRICS.items():
+        require(metrics.child(name).number('value') == contract.number(key), 'PERF_AV_CONTRACT:' + name)
+    require(metrics.child('av_window_mean_abs_ms').number('value')
+            == abs(contract.number('worst_window_mean_ms')), 'PERF_AV_CONTRACT:av_window_mean_abs_ms')
+    workload = doc.child('workload')
+    workload.equal('kind', 'moving-map')
+    require(workload.integer('media_relaunches') >= 0, 'PERF_WORKLOAD')

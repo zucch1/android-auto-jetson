@@ -13,6 +13,9 @@
 #   --phone-serial SERIAL (or AA_PHONE_SERIAL): a passing
 #   tools/wired-qa/aa_drive_smoke.py result from that same phone, attached on
 #   --port, for the same binaries and the default configuration (#137).
+#   Every live stage drives the moving-map workload and needs --media-uri URI
+#   (optional --media-type, --media-component, --geo-uri): media for the whole
+#   stage, Google Maps dragged once a second (tools/perf/aa_moving_map.py).
 #
 # This tool measures CPU/RSS, thermal state, frame drops, decode/IPC timing,
 # A/V sync and audio latency during wired projection on the qualified Jetson,
@@ -55,7 +58,6 @@ set -euo pipefail
 
 TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PYTHON:-python3}"
-SCHEMA="$TOOL_DIR/aa-projection-perf-v2.schema.json"
 REPORTER="$TOOL_DIR/aa_perf_report.py"
 
 MODE=""
@@ -79,11 +81,15 @@ ALLOW_UNOPTIMIZED=0
 DISPLAY_ENV="${AA_DISPLAY_ENV:-}"
 DRIVE_SMOKE="${AA_DRIVE_SMOKE:-}"
 PHONE_SERIAL="${AA_PHONE_SERIAL:-}"
+MEDIA_URI="${AA_MEDIA_URI:-}"
+MEDIA_TYPE="${AA_MEDIA_TYPE:-}"
+MEDIA_COMPONENT="${AA_MEDIA_COMPONENT:-}"
+GEO_URI="${AA_GEO_URI:-}"
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 
 usage() {
-    sed -n '6,15p' "$0"
+    sed -n '6,18p' "$0"
     exit 2
 }
 
@@ -128,6 +134,10 @@ while (($# > 0)); do
         --display-env) require_value "$@"; DISPLAY_ENV="$2"; shift 2 ;;
         --drive-smoke) require_value "$@"; DRIVE_SMOKE="$2"; shift 2 ;;
         --phone-serial) require_value "$@"; PHONE_SERIAL="$2"; shift 2 ;;
+        --media-uri) require_value "$@"; MEDIA_URI="$2"; shift 2 ;;
+        --media-type) require_value "$@"; MEDIA_TYPE="$2"; shift 2 ;;
+        --media-component) require_value "$@"; MEDIA_COMPONENT="$2"; shift 2 ;;
+        --geo-uri) require_value "$@"; GEO_URI="$2"; shift 2 ;;
         --allow-unoptimized-build) ALLOW_UNOPTIMIZED=1; shift ;;
         --now) require_value "$@"; NOW="$2"; shift 2 ;;
         --readiness-only) READINESS_ONLY=1; shift ;;
@@ -283,7 +293,9 @@ import json, os, sys
 build_type = os.environ.get("AA_BLOCK_BUILD_TYPE") or None
 build_dir = os.environ.get("AA_BLOCK_BUILD_DIR") or None
 doc = {
-    "schema": "aa-projection-perf-capture/2",
+    "schema": "aa-projection-perf-capture/3",
+    "av_series": {"pair_t_ns": [], "pair_skew_ns": [], "audio_intervals_ns": []},
+    "workload": {"kind": "none"},
     "monotonic_origin_ns": 0,
     "cpu_ticks_per_second": 1,
     "video_evidence": {"blocks": [], "ipc_latency_ns": [], "decode_latency_ns": []},
@@ -308,8 +320,10 @@ PY
     return 3
 }
 
+# Each result is validated against its own version's schema (a v2 capture
+# replays to a v2 result; live stages produce v3).
 validate_result() {
-    "$PY" -B "$TOOL_DIR/aa_perf_schema.py" validate "$SCHEMA" "$OUT" >/dev/null
+    "$PY" -B "$TOOL_DIR/aa_perf_schema.py" validate-auto "$OUT" >/dev/null
 }
 
 # ---- readiness-only --------------------------------------------------------
@@ -371,6 +385,19 @@ if [[ -z "$duration_secs" ]]; then
     echo "usage error: --duration is required for a live run" >&2
     exit 2
 fi
+# The soak workload (#137): every live stage drags a moving map with media
+# playing for the whole stage. The values reach the remote collector inside
+# single quotes, so they may not contain one.
+if [[ -z "$MEDIA_URI" ]]; then
+    echo "usage error: --media-uri is required for a live stage (moving-map workload)" >&2
+    exit 2
+fi
+for value in "$MEDIA_URI" "$MEDIA_TYPE" "$MEDIA_COMPONENT" "$GEO_URI"; do
+    if [[ "$value" == *"'"* ]]; then
+        echo "usage error: --media-uri/--media-type/--media-component/--geo-uri must not contain a single quote" >&2
+        exit 2
+    fi
+done
 
 if ! check_readiness; then
     echo "BLOCKED: ${ready_reason}" >&2
@@ -473,7 +500,7 @@ import pathlib, sys
 root = pathlib.Path(sys.argv[1])
 collector = (root / "aa_projection_collect.py").read_text()
 print("import sys, types")
-for name in ("aa_measurement_coverage", "aa_video_measurements", "aa_build_guard"):
+for name in ("aa_measurement_coverage", "aa_video_measurements", "aa_build_guard", "aa_moving_map"):
     source = (root / (name + ".py")).read_text()
     print("module = types.ModuleType(" + repr(name) + ")")
     print("sys.modules[module.__name__] = module")
@@ -486,7 +513,9 @@ if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port
         --duration-seconds ${duration_secs} --interval ${INTERVAL} \
         ${THERMAL_POLICY:+--thermal-policy '${THERMAL_POLICY}'} \
         ${DISPLAY_BIN:+--display '${DISPLAY_BIN}'} ${STORE:+--store '${STORE}'}${build_args_remote} \
-        ${verified_serial:+--phone-serial '${verified_serial}'}" \
+        ${verified_serial:+--phone-serial '${verified_serial}'} \
+        --workload moving-map --media-uri '${MEDIA_URI}' ${MEDIA_TYPE:+--media-type '${MEDIA_TYPE}'} \
+        ${MEDIA_COMPONENT:+--media-component '${MEDIA_COMPONENT}'} ${GEO_URI:+--geo-uri '${GEO_URI}'}" \
         <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err"; then
     # The on-target collector refuses to start a stage from an unoptimized build
     # or from binaries another build produced; report each as its own BLOCKED

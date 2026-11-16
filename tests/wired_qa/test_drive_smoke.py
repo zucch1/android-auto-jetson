@@ -252,10 +252,8 @@ class AnalyzerTests(unittest.TestCase):
 
     def test_coverage_is_the_union_of_slots_clipped_to_the_drive(self) -> None:
         # Overlapping and out-of-drive slots count once, and only inside the drive.
-        slots = [{"scheduled_ns": 0, "scheduled_end_ns": 10, "presented_ns": 0},
-                 {"scheduled_ns": 5, "scheduled_end_ns": 30, "presented_ns": 5},
-                 {"scheduled_ns": 50, "scheduled_end_ns": 200, "presented_ns": 50}]
-        self.assertAlmostEqual(smoke.audio_coverage(slots, 20, 120), (10 + 70) / 100)
+        slots = [(0, 10), (5, 30), (50, 200)]
+        self.assertAlmostEqual(smoke.av_contract.coverage(slots, 20, 120), (10 + 70) / 100)
 
     def test_window_means_slide_over_every_membership_change(self) -> None:
         # Pairs at 0..9 s, one per second; a 5 s window holds at most 5 of them.
@@ -553,7 +551,7 @@ exit 0
             env["STUB_COLLECTOR_SWAPPED"] = "1"
         process = subprocess.run(
             ["bash", str(LAUNCHER), "--mode", "wired", "--duration", "1800s",
-             "--out", str(root / "out.json"),
+             "--out", str(root / "out.json"), "--media-uri", "file:///sdcard/Music/fixture.opus",
              *(["--phone-serial", phone] if phone is not None else []), *extra],
             capture_output=True, text=True, timeout=120, check=False, env=env)
         return process, log.read_text()
@@ -640,6 +638,21 @@ exit 0
             self.assertEqual(json.loads((root / "out.json").read_text())["blocked_on"],
                              "collector_failed", process.stderr)
             self.assertIn("python3 -", ssh)
+            # The stage drives the moving-map workload with its media (#137).
+            self.assertIn("--workload moving-map --media-uri 'file:///sdcard/Music/fixture.opus'", ssh)
+
+    def test_a_live_stage_needs_media_for_the_moving_map_workload(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:
+            root = Path(directory)
+            for extra in ((), ("--media-uri", "file:///x'y")):
+                process = subprocess.run(
+                    ["bash", str(LAUNCHER), "--mode", "wired", "--duration", "1800s",
+                     "--out", str(root / "out.json"), *extra],
+                    capture_output=True, text=True, timeout=60, check=False,
+                    env={"PATH": "/usr/bin:/bin", "AA_PERF_HOST": "fake.local"})
+                self.assertEqual(process.returncode, 2, process.stderr)
+                self.assertIn("usage error", process.stderr)
+                self.assertFalse((root / "out.json").exists())
 
 
 
@@ -658,7 +671,7 @@ class CollectorPhoneBindingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="collector-phone-") as directory:
             result = self.collect(Path(directory), "--phone-serial", PHONE)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["schema"], "aa-projection-perf-capture/2")
+        self.assertEqual(json.loads(result.stdout)["schema"], "aa-projection-perf-capture/3")
 
     def test_other_phone_at_the_first_link_is_refused(self) -> None:
         with tempfile.TemporaryDirectory(prefix="collector-phone-") as directory:

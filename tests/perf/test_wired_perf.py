@@ -151,8 +151,13 @@ def case_schema(tmp: Path) -> None:
     except aa_perf_schema.SchemaError:
         pass
 
-    schema_budgets = schema["$defs"]["budgets"]["properties"]
+    v3_budgets = json.loads((TOOL / "aa-projection-perf-v3.schema.json").read_text())[
+        "$defs"]["budgets"]["properties"]
     for name, value in aa_perf_report.BUDGETS.items():
+        assert v3_budgets[name].get("const") == value, f"v3 schema does not pin {name} to {value}"
+    assert "av_sync_ms_max" not in v3_budgets, "v3 replaces the A/V max <= 50 ms budget"
+    schema_budgets = schema["$defs"]["budgets"]["properties"]
+    for name, value in aa_perf_report.BUDGETS_V2.items():
         assert name in schema_budgets, f"budget {name} missing from schema"
         assert schema_budgets[name].get("const") == value, (
             f"schema does not pin {name} to the contractual value {value}; "
@@ -329,6 +334,20 @@ def _collect(tmp: Path, state_dir: Path, seconds: int, env: dict | None = None) 
                 "--allow-unoptimized-build"], env=env, timeout=120)
 
 
+def as_v2(path: Path) -> Path:
+    """Report a collector capture under the historical v2 contract (A/V max <= 50 ms).
+
+    The collector writes capture /3; v2 captures stay reportable under their own
+    budgets (#137), so the v2 budget paths keep their regression coverage.
+    """
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["schema"] = "aa-projection-perf-capture/2"
+    doc.pop("av_series", None)
+    doc.pop("workload", None)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
 def case_collector(tmp: Path) -> None:
     gate.shutdown(tmp)
     env = os.environ.copy()
@@ -338,7 +357,9 @@ def case_collector(tmp: Path) -> None:
     capture_path = tmp / "capture.json"
     capture_path.write_text(res.stdout, encoding="utf-8")
     capture = load(capture_path)
-    assert capture["schema"] == "aa-projection-perf-capture/2"
+    assert capture["schema"] == "aa-projection-perf-capture/3"
+    assert set(capture["av_series"]) == {"pair_t_ns", "pair_skew_ns", "audio_intervals_ns"}
+    assert capture["workload"] == {"kind": "none"}
     assert len(capture["samples"]) >= 2, capture["samples"]
     assert all(s["receiver_rss_mb"] and s["receiver_rss_mb"] > 0 for s in capture["samples"])
     assert capture["crashes"] == 0
@@ -346,9 +367,18 @@ def case_collector(tmp: Path) -> None:
     assert capture["events"]["video_units"] is not None
     assert "machine" in capture["target_hardware_state"]
 
+    # v3: no active projection window was measured, so the signed A/V metrics
+    # are unavailable and the run BLOCKS (a measured no-audio window FAILs:
+    # tests/perf/test_v3_av_contract.py).
     live_out = tmp / "live.json"
     assert report(capture_path, live_out).returncode == 3, "a live capture without gated metrics must BLOCK"
-    assert load(live_out)["verdict"] == "BLOCKED"
+    unmeasured = load(live_out)
+    assert unmeasured["verdict"] == "BLOCKED" and unmeasured["schema"] == "aa-projection-perf/3"
+    assert unmeasured["metrics"]["av_coverage_pct"]["status"] == "UNAVAILABLE"
+    # v2 (history): the same capture without gated metrics BLOCKS, as before.
+    v2_out = tmp / "live-v2.json"
+    assert report(as_v2(capture_path), v2_out).returncode == 3, "a live v2 capture without gated metrics must BLOCK"
+    assert load(v2_out)["verdict"] == "BLOCKED"
 
     crash_env = os.environ.copy()
     crash_env["FAKE_RECEIVER_CRASH"] = "1"
@@ -389,6 +419,7 @@ def case_media_timing(tmp: Path) -> None:
 
     capture_path = tmp / "timing-capture.json"
     capture_path.write_text(first.stdout, encoding="utf-8")
+    as_v2(capture_path)  # this case tests the v2 av_sync_ms budget
     out = tmp / "timing-result.json"
     assert report(capture_path, out).returncode == 3, "incomplete live provenance/IPC must BLOCK"
     doc = load(out)
@@ -412,6 +443,7 @@ def case_media_timing(tmp: Path) -> None:
     assert varied["events"]["av_sync_ms"] != capture["events"]["av_sync_ms"]
     varied_path = tmp / "varied-capture.json"
     varied_path.write_text(second.stdout, encoding="utf-8")
+    as_v2(varied_path)
     varied_out = tmp / "varied-result.json"
     assert report(varied_path, varied_out).returncode == 3, "incomplete live capture must BLOCK"
     varied_doc = load(varied_out)
@@ -438,6 +470,7 @@ def case_media_timing(tmp: Path) -> None:
     over = _collect(tmp, tmp / "state-over", 3, over_env)
     over_capture = tmp / "over-capture.json"
     over_capture.write_text(over.stdout, encoding="utf-8")
+    as_v2(over_capture)
     over_out = tmp / "over-result.json"
     assert report(over_capture, over_out).returncode == 1, "breaching av_sync must FAIL"
     over_doc = load(over_out)
@@ -465,6 +498,7 @@ def case_media_timing(tmp: Path) -> None:
     assert garbage["events"]["audio_latency_ms"] is None, garbage["events"]
     garbage_path = tmp / "garbage-capture.json"
     garbage_path.write_text(json.dumps(garbage), encoding="utf-8")
+    as_v2(garbage_path)
     garbage_out = tmp / "garbage-result.json"
     assert report(garbage_path, garbage_out).returncode == 3, "garbage measurement must BLOCK"
     garbage_doc = load(garbage_out)

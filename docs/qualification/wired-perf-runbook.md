@@ -239,11 +239,12 @@ Re-analysis of the 2026-11-16 evidence under this contract:
 
 | Run | Pairs | Coverage | Signed p50 / p99 ms | Max \|skew\| ms | Worst 5 s mean ms | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
-| S24 drive smoke | 5,892 | 33.83 % (FAIL) | 23.21 / 51.02 (FAIL) | 74.95 | 32.57 | FAIL |
+| S24 drive smoke | 5,892 | 33.83 % (FAIL) | 23.21 / 51.02 (FAIL) | 74.95 | 32.61 | FAIL |
 | A26 run2 | 17,895 | 99.49 % | 21.40 / 33.35 | 43.21 | 26.34 | PASS |
 
-The soak stages still use their own unchanged contractual budget (A/V max
-<= 50 ms, `aa_perf_report.BUDGETS`); this contract applies to the drive smoke.
+The same contract judges the soak stages from result version 3 on (see **Soak
+stages: moving-map workload and signed A/V (v3)**). The math and the limits
+live once, in `tools/perf/aa_av_contract.py`, for both.
 
 **Startup grace (fps only).** The first 10 s after the first paint are
 excluded from the fps check, and only from it. The waiting_idr, session-drop
@@ -322,6 +323,95 @@ repeats. The drive smoke now runs first, on the same build, for ten minutes,
 with a moving workload. The soak chain is the 1800 s stage, then the 7200 s
 stage.
 
+## Soak stages: moving-map workload and signed A/V (v3)
+
+From capture `aa-projection-perf-capture/3` and result `aa-projection-perf/3`
+on (#137), every live soak stage (1800 s, then 7200 s) runs the drive smoke's
+workload and is judged by its A/V contract.
+
+**Workload.** `tools/perf/aa_moving_map.py` is the one implementation, shared
+with the drive smoke. Before the receiver starts, the collector resets the
+phone's USB mode, wakes it, starts the media and then Google Maps, so Maps is
+in front. Every phone command is `adb -s <--phone-serial>` on the target. The
+managed display is started with `--test-only-control-stdin`. From projection
+`active` on, a stimulus thread drags the map once a second, and it re-sends
+the media intent, then Maps, after `MEDIA_RELAUNCH_SILENCE_S` (5 s) without an
+audio write, counting each relaunch in `workload.media_relaunches`. A display
+that stops accepting control input for `CONTROL_WRITE_TIMEOUT_S` ends the stage
+with terminal error `display_control_stalled`. After cleanup the phone's USB
+mode is reset and the media player stopped. Every live stage needs
+`--media-uri` (optional `--media-type`, `--media-component`, `--geo-uri`); a
+live v3 capture without the moving-map workload is BLOCKED
+`run_evidence:moving_map_workload`.
+
+**A/V (signed contract).** The collector keeps every pair's paint-completion
+time and signed skew, and the merged union of valid audio slots' scheduled
+intervals, in `av_series` (ns from the monotonic origin, frozen at the
+measurement cutoff like every other measurement). The reporter judges them over
+its own replayed active window with the four clauses above. They are the
+gated metrics `av_window_mean_abs_ms` (<= 40), `av_p99_abs_ms` (<= 50),
+`av_max_abs_ms` (<= 90) and `av_coverage_pct` (>= 90, `op: ge`), and the
+`av_contract` block carries the signed distribution. `av_sync_ms` (the
+run-cumulative maximum) stays as an informational metric. Two rules differ
+from the drive smoke, on purpose:
+
+- **No audio is a FAIL** in a measured window: coverage is measured as 0 %.
+  A run with no active window at all is still BLOCKED, as nothing was measured.
+- **Invalid A/V telemetry still BLOCKS.** The soak keeps its stricter rule: a
+  null `presented_ns`, mixed endpoint contracts or a malformed endpoint
+  invalidates A/V for the stage (the drive smoke instead skips such a slot).
+
+Everything else in the soak contract is unchanged: RSS, CPU, RSS growth, audio
+latency, crashes, coverage, continuity, provenance and the build guard.
+
+**Conflicts with the new workload.** None found in the gates themselves. Two
+operational effects to expect:
+
+- A media relaunch restarts the clip. The collector's 10 s stream-silence rule
+  (`_MEDIA_STALL_SECONDS`) is unchanged, and a relaunch fires after 5 s of
+  silence, so a player that stops is restarted well before a stall. A player
+  that takes longer than about 5 s to resume would still be judged a stall;
+  this is intended.
+- The control channel adds per-touch `ok` lines to the display log, and drags
+  add GUI-thread work on the dummy display during every stage. Both are part
+  of the measured candidate, as in the drive smoke.
+
+**Migration and history.** The version is bumped explicitly; nothing is
+reinterpreted:
+
+- A capture `/2` replays to a result `/2` under `aa_perf_report.BUDGETS_V2`
+  (A/V max <= 50 ms, gated), byte for byte what the origin/main reporter gives
+  (checked on the 2026-11-15 1800 s PASS, FAIL and BLOCKED captures).
+- `aa-projection-perf-v2.schema.json` validates v2 results unchanged;
+  `aa-projection-perf-v3.schema.json` validates v3; `aa_perf_schema.py
+  validate-auto` picks the schema from the document's own `schema`.
+- The qualification checker (`tools/qualification/results.py`) judges each
+  result by its own version: v2 by the v2 gates, v3 by the v3 gates plus a
+  passed `av_contract` that agrees with the metrics, coverage >= 90 % and the
+  moving-map workload. A package may hold either version per result.
+- Live stages from this version on produce v3 only.
+- One limitation of history, unchanged by this: results written before the
+  `build` block existed (for example the 2026-11-15 `av-outlier` 1800 s PASS)
+  do not validate against the current v2 schema. Their captures still replay to
+  their original verdict.
+
+**The chain.** `tools/perf/aa_soak_chain.py` replaces the ad-hoc chain scripts
+kept beside past runs. It waits for `--quiet-seconds` (default 300) without a
+compiler, then runs the 1800 s and 7200 s stages through
+`aa-projection-perf.sh` with the moving-map workload, `--phone-serial` and
+`--drive-smoke`. It stops at the first stage that does not PASS and writes
+`stage-<N>s-not-run.json` for the rest:
+
+```bash
+tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" \
+    --phone-serial "$SOAK_PHONE_SERIAL" --drive-smoke "$DRIVE_SMOKE_RESULT" \
+    --media-uri file:///sdcard/Music/<tone>.opus --media-type audio/ogg \
+    --media-component org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity \
+    --receiver "$AA_BUILD_DIR/aa-wired-receiver" --display "$AA_BUILD_DIR/aa-dummy-display" \
+    --build-dir "$AA_BUILD_DIR" --store "$STORE" --thermal-policy orin-nano-cv-unavailable/1 \
+    --provenance "$RUN_DIR/provenance.json" --display-env ":0,/run/user/$(id -u)/gdm/Xauthority"
+```
+
 ## Exact invocations
 
 From the development checkout (bounded ssh, fail-closed):
@@ -333,13 +423,13 @@ tools/perf/aa-projection-perf.sh --readiness-only --out /tmp/task-32-readiness.j
 # 30-minute performance run (optimized build, see Build).
 tools/perf/aa-projection-perf.sh --mode wired --duration 30m \
     --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
-    --phone-serial "$SOAK_PHONE_SERIAL" \
+    --phone-serial "$SOAK_PHONE_SERIAL" --media-uri "$SOAK_MEDIA_URI" \
     --out /tmp/task-32-perf-30m.json --capture-out /tmp/task-32-capture-30m.json
 
 # Separate 2-hour soak run (fresh invocation; do not reuse the 30m capture).
 tools/perf/aa-projection-perf.sh --mode wired --duration 2h \
     --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
-    --phone-serial "$SOAK_PHONE_SERIAL" \
+    --phone-serial "$SOAK_PHONE_SERIAL" --media-uri "$SOAK_MEDIA_URI" \
     --out /tmp/task-32-soak-2h.json --capture-out /tmp/task-32-capture-2h.json
 ```
 
@@ -487,11 +577,13 @@ shutdown-only over-budget value changes neither metrics nor verdict, whereas a
 genuine failure during cleanup can still produce FAIL.
 
 Both runs write a result document (validated against
-`tools/perf/aa-projection-perf-v2.schema.json`) whose gated metrics are compared to
-the contractual budgets:
+`tools/perf/aa-projection-perf-v3.schema.json`; historical v2 results against
+`-v2`) whose gated metrics are compared to the contractual budgets:
 
 - receiver RSS peak <= 250 MB; receiver CPU sustained <= 50 % of one core;
-- RSS growth < 10 %; A/V sync <= 50 ms; audio latency <= 200 ms; zero crashes;
+- RSS growth < 10 %; audio latency <= 200 ms; zero crashes;
+- the signed A/V contract: every 5 s mean within ±40 ms, p99 \|skew\| <= 50 ms,
+  max \|skew\| <= 90 ms, audio coverage >= 90 % (v2: A/V sync <= 50 ms);
 - helper RSS recorded `null`;
 - frame drops, decode timing, IPC timing and thermal state recorded
   informationally.
@@ -590,8 +682,9 @@ the withdrawn 33 ms gate is **not** restored.
 
 ## Provenance and equivalence
 
-Both runs require capture `aa-projection-perf-capture/2` and result
-`aa-projection-perf/2`, with `measurement_coverage` policy
+Both runs require capture `aa-projection-perf-capture/3` and result
+`aa-projection-perf/3` (historical runs: `/2`, judged by the v2 contract), with
+`measurement_coverage` policy
 `active-window-coverage/1`. V1 results remain explicitly validatable against
 their unchanged schema, not automatically qualified as v2. Independently parse
 coverage after export removes the capture: labels/hashes alone prove neither

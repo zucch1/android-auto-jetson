@@ -12,9 +12,20 @@ the receiver (and optionally the dummy display), samples the receiver process
 and the thermal zones for the requested duration, parses the receiver/display
 JSON event stream, and writes ONE capture document to stdout:
 
-  {"schema":"aa-projection-perf-capture/2","mode":"wired",
+  {"schema":"aa-projection-perf-capture/3","mode":"wired",
    "duration_seconds":N,"crashes":0,"samples":[...],"events":{...},
-   "target_hardware_state":{...}}
+   "av_series":{...},"workload":{...},"target_hardware_state":{...}}
+
+Capture /3 (signed A/V contract, #137) adds ``av_series``: every A/V pair's
+paint-completion time and signed skew, and the merged union of valid audio
+slots' scheduled intervals, all in ns relative to ``monotonic_origin_ns`` and
+frozen at the measurement cutoff, so the reporter judges the four clauses over
+its own replayed active window (tools/perf/aa_av_contract.py).
+
+With ``--workload moving-map`` (the soak workload, #137) the collector prepares
+the phone (``adb -s --phone-serial``: USB reset, media, then Google Maps),
+gives the managed display its test control channel, and drags the map and
+keeps the media playing for the whole stage (tools/perf/aa_moving_map.py).
 
 The capture is the raw record; budget verdicts are produced by
 ``aa_perf_report.py``. A metric the collector cannot observe is emitted as
@@ -27,7 +38,8 @@ pump enough to fail the A/V gate on its own. ``--allow-unoptimized-build`` is a
 debugging override only.
 
 This tool does not modify target state (no installs, no udev, no kernel
-changes); it only launches the supplied binaries and reads procfs/sysfs.
+changes); it only launches the supplied binaries, reads procfs/sysfs and, with
+the moving-map workload, sends adb intents to the named phone.
 """
 from __future__ import annotations
 
@@ -48,10 +60,12 @@ import signal
 import subprocess
 import sys
 import time
+from array import array
 from pathlib import Path
 from typing import Literal
 
 from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
+import aa_moving_map as moving_map
 from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Sample, ThermalZone, VideoEvidence, thermal_policy_for_model,
 )
@@ -60,7 +74,10 @@ from aa_build_guard import (
     describe_build, require_optimized_build, require_optimized_type, verify_launched_binaries,
 )
 
-CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
+CAPTURE_SCHEMA = "aa-projection-perf-capture/3"
+# Retention bound of the signed A/V series (a 7200 s stage at 60 fps is 432,000
+# pairs); past it the series is incomplete and A/V is invalid, never truncated.
+_AV_SERIES_LIMIT = 1_000_000
 _TERMINATE_GRACE_SECONDS = 5.0
 _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
 _MEDIA_STALL_SECONDS = 10
@@ -356,6 +373,11 @@ class EventParser:
         self.audio_completions: deque[tuple[int, int, int]] = deque()
         self.video_completions: deque[tuple[int, int]] = deque()
         self.av_pairs = 0
+        # Signed A/V series (capture /3): absolute paint-completion ns and
+        # signed skew ns per pair, and the merged union of valid audio slots.
+        self.av_pair_times = array("q")
+        self.av_pair_skews = array("q")
+        self.audio_union: list[list[int]] = []
         self.audio_writes = 0
         self.playback_slot_absences: dict[str, int] = {}
         # Receiver-clock times (the receiver's own monotonic stamps) of the events
@@ -463,6 +485,10 @@ class EventParser:
             if scheduled <= self.last_audio_scheduled:
                 return
             self.last_audio_scheduled = scheduled
+            if self.audio_union and scheduled <= self.audio_union[-1][1]:
+                self.audio_union[-1][1] = max(self.audio_union[-1][1], end)
+            else:
+                self.audio_union.append([scheduled, end])
             self.audio_writes += 1
             self._record_progress(("audio_chunks", "audio_writes"), event["completed_ns"])
             self.audio_completions.append((scheduled, end, completed))
@@ -490,6 +516,11 @@ class EventParser:
                 self._number({"delta": abs(skew) / 1e6}, "delta",
                              "av_sync_ms", peak=True)
                 self.av_pairs += 1
+                if len(self.av_pair_times) < _AV_SERIES_LIMIT:
+                    self.av_pair_times.append(video_done)
+                    self.av_pair_skews.append(skew)
+                elif "av_sync_ms" not in self.invalid_telemetry:
+                    self.invalid_telemetry.append("av_sync_ms")
                 self._record_progress(("av_pairs",), event["completed_ns"])
         self.video_completions = pending
         # Bound retention even if a stream disappears. Missing pairs never become zero.
@@ -499,6 +530,13 @@ class EventParser:
             self.video_completions.popleft()
             self.invalid_telemetry.append("av_sync_ms")
             self.metrics["av_sync_ms"] = None
+
+    def av_series(self, origin_ns: int) -> dict:
+        """The signed A/V series relative to ``origin_ns`` (capture /3)."""
+        return {"pair_t_ns": [t - origin_ns for t in self.av_pair_times],
+                "pair_skew_ns": list(self.av_pair_skews),
+                "audio_intervals_ns": [[lo - origin_ns, hi - origin_ns]
+                                       for lo, hi in self.audio_union]}
 
     def _number(self, event: dict, key: str, target: str, *, integer: bool = False,
                 peak: bool = False) -> None:
@@ -689,6 +727,17 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     progress = ProjectionProgress()
     receiver: subprocess.Popen | None = None
     display: subprocess.Popen | None = None
+    # The moving-map soak workload (#137): phone intents and map drags through
+    # the display's test control channel, media kept playing for the stage.
+    workload = None
+    stimulus: moving_map.SoakStimulus | None = None
+    if getattr(args, "workload", "none") == "moving-map":
+        workload = moving_map.MovingMap(
+            moving_map.adb_runner(phone_serial), media_uri=args.media_uri,
+            media_type=getattr(args, "media_type", None),
+            media_component=getattr(args, "media_component", None),
+            geo_uri=getattr(args, "geo_uri", None) or moving_map.DEFAULT_GEO_URI)
+    av_series: dict = {"pair_t_ns": [], "pair_skew_ns": [], "audio_intervals_ns": []}
     rec_file = None
     disp_file = None
     crashes = 0
@@ -728,6 +777,12 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         )
 
     try:
+        if workload is not None:
+            workload.prepare_phone(lambda seconds: (time.sleep(seconds), True)[1])
+            # The phone setup is not part of the startup budget.
+            origin_ns = time.monotonic_ns()
+            start = origin_ns / 1e9
+            deadline = start + startup_timeout
         rec_file = open(receiver_log, "w", encoding="utf-8")
         receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
                                     start_new_session=True)
@@ -751,13 +806,19 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                     and not early_exit and not parser.terminal_errors):
                 disp_file = open(display_log, "w", encoding="utf-8")
                 display_cmd = [args.display, "--test-only-autostart"]
+                if workload is not None:
+                    display_cmd += ["--test-only-control-stdin"]  # the map drags
                 if video_socket:
                     display_cmd += ["--video-socket", video_socket]
                 if input_socket:
                     display_cmd += ["--input-socket", input_socket]
                 if time.monotonic_ns() / 1e9 < deadline:
-                    display = subprocess.Popen(display_cmd, stdout=disp_file, stderr=subprocess.STDOUT,
-                                               start_new_session=True)
+                    display = subprocess.Popen(
+                        display_cmd, stdout=disp_file, stderr=subprocess.STDOUT,
+                        stdin=subprocess.PIPE if workload is not None else None,
+                        start_new_session=True)
+                    if workload is not None and display.stdin is not None:
+                        os.set_blocking(display.stdin.fileno(), False)
 
         while True:
             now = time.monotonic_ns() / 1e9
@@ -774,6 +835,14 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                 display_survived = False
                 break
             if parser.terminal_errors:
+                break
+            if (workload is not None and stimulus is None and display is not None
+                    and display.stdin is not None and parser.projection_active):
+                stimulus = moving_map.SoakStimulus(workload, display.stdin.fileno(), receiver_log,
+                                                   since_ns=time.monotonic_ns())
+                stimulus.start()
+            if stimulus is not None and stimulus.failure:
+                parser.terminal_errors.append({"event": "err", "code": stimulus.failure})
                 break
             time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
             sample = read_sample()
@@ -814,6 +883,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         events["video_units"] = parser.video_units
         events["audio_chunks"] = parser.audio_chunks
         events["startup_ms"] = parser.startup_ms
+        av_series = parser.av_series(origin_ns)
         invalid_telemetry = sorted(set(parser.invalid_telemetry) | set(parser.video_measurements.issues))
         video_telemetry = {
             "ipc_matched": parser.video_measurements.ipc_matched,
@@ -836,6 +906,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         raise SystemExit(f"error: cannot launch receiver: {exc}") from exc
     finally:
         parser.video_measurements.frozen = True
+        if stimulus is not None:
+            stimulus.stop()
         if display is not None and display.poll() is not None:
             display_survived = False
         for name, proc in (("display", display), ("receiver", receiver)):
@@ -846,6 +918,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             rec_file.close()
         if disp_file is not None:
             disp_file.close()
+        if workload is not None:
+            workload.restore_phone()
         parser.poll(str(receiver_log))
         if display is not None:
             parser.poll(str(display_log))
@@ -882,6 +956,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         "samples": [asdict(sample) for sample in samples],
         "video_evidence": asdict(video_evidence),
         "events": events,
+        "av_series": av_series,
         "video_telemetry": video_telemetry,
         "target_hardware_state": hardware if hardware is not None else _target_hardware_state(),
     }
@@ -889,6 +964,9 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     # build directory it checked and whether the qualification override was used,
     # so no run can be read as a qualification result it is not.
     capture["build"] = build if build is not None else build_record(args)
+    capture["workload"] = ({"kind": "moving-map", "media_relaunches": workload.media_relaunches,
+                            "drags": workload.drags, "stimulus_started": stimulus is not None}
+                           if workload is not None else {"kind": "none"})
     if thermal_policy is not None:
         capture["thermal_policy"] = asdict(thermal_policy)
     return capture
@@ -908,6 +986,13 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--phone-serial", default=None,
                         help="pin the run to this phone (receiver --require-usb-serial)")
+    parser.add_argument("--workload", choices=("none", "moving-map"), default="none",
+                        help="moving-map: drive Maps and keep media playing (needs --phone-serial, "
+                             "--media-uri and a managed --display)")
+    parser.add_argument("--media-uri", default=None)
+    parser.add_argument("--media-type", default=None)
+    parser.add_argument("--media-component", default=None)
+    parser.add_argument("--geo-uri", default=None)
     parser.add_argument("--thermal-policy", choices=("strict-all-zones", NANO_PROFILE),
                         default="strict-all-zones", help="explicit approved Nano CV availability exception")
     parser.add_argument("--startup-timeout-seconds", type=int,
@@ -926,6 +1011,11 @@ def _cli(argv: list[str]) -> int:
 
     if args.duration_seconds <= 0:
         print("error: --duration-seconds must be positive", file=sys.stderr)
+        return 2
+    if args.workload == "moving-map" and (not args.phone_serial or not args.media_uri
+                                          or not args.display or args.no_display):
+        print("error: --workload moving-map needs --phone-serial, --media-uri and a managed "
+              "--display", file=sys.stderr)
         return 2
     if not 0 < args.startup_timeout_seconds <= _PROJECTION_STARTUP_TIMEOUT_SECONDS:
         print("error: --startup-timeout-seconds must be in [1, 60]", file=sys.stderr)

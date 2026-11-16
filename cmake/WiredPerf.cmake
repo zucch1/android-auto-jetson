@@ -48,6 +48,13 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_perf_build_guard COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_build_guard.py")
     set_tests_properties(wired_perf_build_guard PROPERTIES TIMEOUT 120)
+    # #137 soak: v3 signed A/V contract and v2 history, the shared moving-map
+    # workload (alone and inside the collector), and the in-repo soak chain.
+    foreach(suite v3_av_contract moving_map soak_chain)
+        add_test(NAME wired_perf_${suite} COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_SOURCE_DIR}/tests/perf/test_${suite}.py")
+        set_tests_properties(wired_perf_${suite} PROPERTIES TIMEOUT 180)
+    endforeach()
     # #137 moving-map drive smoke: analyzer, pass/fail logic and the soak gate.
     add_test(NAME wired_drive_smoke COMMAND "${Python3_EXECUTABLE}" -B
         -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/wired_qa" -v)

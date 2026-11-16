@@ -543,6 +543,18 @@ def old_capture_replay() -> None:
         raise AssertionError("expected ContractError on malformed progress_evidence")
 
 
+def not_qualifying(doc: dict) -> bool:
+    """BLOCKED, or (v3) a FAIL whose only violations are signed A/V metrics.
+
+    Collector fixtures emit no continuous audio, so under the v3 contract their
+    A/V coverage is a measured FAIL (#137); every other gate must still behave
+    exactly as it did under v2.
+    """
+    return doc["verdict"] == "BLOCKED" or (
+        doc["verdict"] == "FAIL" and bool(doc["violations"])
+        and all(v["metric"].startswith("av_") for v in doc["violations"]))
+
+
 def gap_33_7s_healthy_continues() -> None:
     # Issue #90 exact timeline: a 33.7 s collector self-gap with healthy receiver
     # counters during and after it records host interference, does not stop the
@@ -559,7 +571,7 @@ def gap_33_7s_healthy_continues() -> None:
     assert gap["gap_ns"] == 33_700_000_000, gap
     assert gap["projection_failure"] is None, gap
     doc = report(capture)
-    assert doc["verdict"] == "BLOCKED", doc["verdict"]
+    assert not_qualifying(doc), doc["verdict"]
     assert doc["qualification_status"] == "INCOMPLETE", doc["qualification_status"]
     assert "coverage:sampling" in doc["named_gaps"], doc["named_gaps"]
     assert doc["run_status"]["projection_failure"] is None, doc["run_status"]

@@ -284,7 +284,7 @@ def test_collector_starts_a_stage_from_an_optimized_build() -> None:
         assert started.returncode == 0, started.stderr
         assert "build: CMAKE_BUILD_TYPE=Release" in started.stderr, started.stderr
         capture = json.loads(started.stdout)
-        assert capture["schema"] == "aa-projection-perf-capture/2"
+        assert capture["schema"] == "aa-projection-perf-capture/3"
         assert capture["samples"], capture["samples"]
         # And the capture records which build produced the measured binaries.
         recorded = capture["build"]
@@ -309,7 +309,7 @@ def test_collector_override_admits_a_debug_build_for_debugging() -> None:
         assert "warning: unoptimized_build:" in started.stderr, started.stderr
         assert "build: CMAKE_BUILD_TYPE=Debug" in started.stderr, started.stderr
         capture = json.loads(started.stdout)
-        assert capture["schema"] == "aa-projection-perf-capture/2"
+        assert capture["schema"] == "aa-projection-perf-capture/3"
         assert capture["build"]["build_type"] == "Debug", capture["build"]
         assert capture["build"]["allow_unoptimized_build"] is True, capture["build"]
 
@@ -569,7 +569,8 @@ def test_launcher_records_the_build_and_never_passes_an_override_run() -> None:
             return subprocess.run(
                 ["bash", str(SHELL), "--mode", "wired", "--duration", "1s",
                  "--out", str(root / "result.json"), "--now", NOW,
-                 "--drive-smoke", str(smoke), "--phone-serial", "TESTPHONE01", *extra],
+                 "--drive-smoke", str(smoke), "--phone-serial", "TESTPHONE01",
+                 "--media-uri", "file:///sdcard/Music/fixture.opus", *extra],
                 capture_output=True, text=True, timeout=120, env=env, check=False)
 
         # When the stage runs from the build directory that produced the binaries.
