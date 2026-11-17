@@ -2,14 +2,36 @@
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/diagnostics/SafeLogSink.hpp>
 
+#include <cctype>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 namespace {
 namespace diag = aa::diagnostics;
+
+// Salted pseudonyms ("id-" + 16 lowercase hex digits) are random per process,
+// so a digit-only raw value such as 424242 can occur inside one by chance. Mask
+// them before negative substring checks; the "id-" prefix stays for positive ones.
+std::string without_pseudonyms(std::string text) {
+    static constexpr std::string_view kHex = "0123456789abcdef";
+    for (std::size_t at = text.find("id-"); at != std::string::npos; at = text.find("id-", at + 3)) {
+        const std::size_t start = at + 3;
+        // Only an exact pseudonym token: not preceded or followed by another
+        // identifier character, so an overlong raw value after "id-" stays visible.
+        const bool starts_token = at == 0 || std::isalnum(static_cast<unsigned char>(text[at - 1])) == 0;
+        const bool ends_token = text.size() == start + 16 ||
+                                (text.size() > start + 16 &&
+                                 std::isalnum(static_cast<unsigned char>(text[start + 16])) == 0);
+        if (starts_token && ends_token && text.find_first_not_of(kHex, start) >= start + 16) {
+            text.replace(start, 16, "<pseudonym>");
+        }
+    }
+    return text;
+}
 
 struct CaptureLogSink final : aa::core::LogSink {
     std::string message;
@@ -38,7 +60,7 @@ TEST(DiagnosticsEmissionSchema, HidesOpaqueStringsWhenOnKnownSerializerKeys) {
         event.fields.push_back(diag::EventField::text(key, "8F3A22B19C0D77EE"));
     }
     // When: the serializer enforces the value schema.
-    const std::string out = diag::to_json(event);
+    const std::string out = without_pseudonyms(diag::to_json(event));
     // Then: none of the opaque strings survives.
     EXPECT_EQ(out.find("8F3A22B19C0D77EE"), std::string::npos);
 }
@@ -65,7 +87,7 @@ TEST(DiagnosticsEmissionSchema, DropsOpaqueKeyWhenSerialized) {
     event.fields.push_back(diag::EventField::text("password8F3A22B19C0D77EE", "secret"));
     event.fields.push_back(diag::EventField::count("f_r_a_m_e_s", 30));
     // When: the boundary serializes unknown and disguised keys.
-    const std::string out = diag::to_json(event);
+    const std::string out = without_pseudonyms(diag::to_json(event));
     // Then: no dynamic key spelling can leak.
     EXPECT_EQ(out, "{\"kind\":\"session_state_changed\",\"session\":0,\"mono_ns\":0}");
 }
@@ -89,7 +111,7 @@ TEST(DiagnosticsEmissionSchema, HidesNumericSensitiveVariantsWhenOnSafeKeys) {
                     {"count", diag::Sensitivity::identifier, std::int64_t{123456789012345}},
                     {"ok", diag::Sensitivity::credential, true}};
     // When: all variants cross emission.
-    const std::string out = diag::to_json(event);
+    const std::string out = without_pseudonyms(diag::to_json(event));
     // Then: neither raw numbers nor booleans survive.
     EXPECT_EQ(out.find("424242"), std::string::npos);
     EXPECT_EQ(out.find("37.7749"), std::string::npos);
@@ -108,7 +130,7 @@ TEST(DiagnosticsEmissionSchema, HidesInvalidValuesWhenTypesOrVersionFormatsMisma
                     diag::EventField::text("version", "999999999999999999.1"),
                     diag::EventField::count("count", -1)};
     // When: the typed schema validates the values.
-    const std::string out = diag::to_json(event);
+    const std::string out = without_pseudonyms(diag::to_json(event));
     // Then: all invalid values are redacted.
     EXPECT_EQ(out.find("424242"), std::string::npos);
     EXPECT_EQ(out.find("8F3A22B19C0D77EE"), std::string::npos);

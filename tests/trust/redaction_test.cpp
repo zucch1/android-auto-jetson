@@ -27,9 +27,14 @@ TEST(TrustRedaction, RedactedLabelOmitsRawIdentifiers) {
     EXPECT_FALSE(label.empty());
     EXPECT_FALSE(contains(label, "SERIAL-42"));
     EXPECT_FALSE(contains(label, "AOA-42"));
-    EXPECT_FALSE(contains(label, "18d1"));
     EXPECT_FALSE(contains(label, "1-2.3"));
-    EXPECT_TRUE(contains(label, "id-"));
+    // The label is exactly "id-" plus a salted 64-bit FNV-1a digest in hex, so
+    // no raw field can appear outside the digest. Hex-only identifiers such as
+    // the vendor id "18d1" are not checked by substring: a per-process salted
+    // digest contains any given 4-hex-digit string by chance (~13/65536 runs).
+    ASSERT_EQ(label.size(), 3u + 16u) << label;
+    EXPECT_EQ(label.substr(0, 3), "id-");
+    EXPECT_EQ(label.find_first_not_of("0123456789abcdef", 3), std::string::npos) << label;
 }
 
 TEST(TrustRedaction, RedactedLabelOmitsBluetoothAddress) {

@@ -8,6 +8,7 @@
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/diagnostics/SafeLogSink.hpp>
 
+#include <cctype>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -33,6 +34,26 @@ struct CaptureLogSink final : aa::core::LogSink {
     }
 };
 
+// Salted pseudonyms ("id-" + 16 lowercase hex digits) are random per process,
+// so a digit-only raw value such as 424242 can occur inside one by chance. Mask
+// them before negative substring checks; the "id-" prefix stays for positive ones.
+std::string without_pseudonyms(std::string text) {
+    static constexpr std::string_view kHex = "0123456789abcdef";
+    for (std::size_t at = text.find("id-"); at != std::string::npos; at = text.find("id-", at + 3)) {
+        const std::size_t start = at + 3;
+        // Only an exact pseudonym token: not preceded or followed by another
+        // identifier character, so an overlong raw value after "id-" stays visible.
+        const bool starts_token = at == 0 || std::isalnum(static_cast<unsigned char>(text[at - 1])) == 0;
+        const bool ends_token = text.size() == start + 16 ||
+                                (text.size() > start + 16 &&
+                                 std::isalnum(static_cast<unsigned char>(text[start + 16])) == 0);
+        if (starts_token && ends_token && text.find_first_not_of(kHex, start) >= start + 16) {
+            text.replace(start, 16, "<pseudonym>");
+        }
+    }
+    return text;
+}
+
 bool contains(std::string_view hay, std::string_view needle) {
     return hay.find(needle) != std::string_view::npos;
 }
@@ -53,7 +74,7 @@ TEST(DiagnosticsPrivacyGaps, SensitiveKeyFieldRedactsUnlabelledPlainValue) {
     event.kind = diag::EventKind::pairing_requested;
     event.fields.push_back(diag::EventField::text("password", "unlabelled-secret"));
     // When: the boundary serializes it.
-    const std::string out = diag::to_json(event);
+    const std::string out = without_pseudonyms(diag::to_json(event));
     // Then: the unlabelled secret cannot survive on a sensitive key.
     EXPECT_EQ(out.find("unlabelled-secret"), std::string::npos);
     EXPECT_TRUE(contains(out, "\"password\":\"[redacted]\""));
@@ -73,7 +94,7 @@ TEST(DiagnosticsPrivacyGaps, TypedSensitiveFieldsHideEveryValueVariant) {
     event.fields.push_back(
         diag::EventField{"imei", diag::Sensitivity::identifier, std::int64_t{123456789012345}});
     // When: the boundary serializes it.
-    const std::string out = diag::to_json(event);
+    const std::string out = without_pseudonyms(diag::to_json(event));
     // Then: every variant is hidden; identifiers pseudonymize, secrets drop.
     EXPECT_TRUE(contains(out, "\"gps\":\"[redacted]\""));
     EXPECT_TRUE(contains(out, "\"psk\":\"[redacted]\""));
@@ -85,6 +106,17 @@ TEST(DiagnosticsPrivacyGaps, TypedSensitiveFieldsHideEveryValueVariant) {
     EXPECT_EQ(out.find("\"secret_flag\":true"), std::string::npos);
 }
 
+TEST(DiagnosticsPrivacyGaps, PseudonymMaskOnlyHidesExactTokens) {
+    // The test-only mask must never hide a raw value that merely follows "id-".
+    EXPECT_EQ(without_pseudonyms("\"id-0123456789abcdef\""), "\"id-<pseudonym>\"");
+    EXPECT_EQ(without_pseudonyms("id-0123456789abcdef"), "id-<pseudonym>");
+    EXPECT_EQ(without_pseudonyms("id-0123456789abcdef0"), "id-0123456789abcdef0");
+    EXPECT_EQ(without_pseudonyms("id-0123456789abcdefZ"), "id-0123456789abcdefZ");
+    EXPECT_EQ(without_pseudonyms("xid-0123456789abcdef"), "xid-0123456789abcdef");
+    EXPECT_EQ(without_pseudonyms("id-0123456789ABCDEF"), "id-0123456789ABCDEF");
+    EXPECT_EQ(without_pseudonyms("id-424242"), "id-424242");
+}
+
 TEST(DiagnosticsPrivacyGaps, UnknownKeysAndValuesAreDroppedByDefault) {
     // Given: opaque identifiers and a numeric location under keys the safe
     // telemetry schema does not know.
@@ -94,7 +126,7 @@ TEST(DiagnosticsPrivacyGaps, UnknownKeysAndValuesAreDroppedByDefault) {
     event.fields.push_back(diag::EventField::count("peer", 123456789012345));
     event.fields.push_back(diag::EventField::real("lat", 37.7749));
     // When: the boundary serializes it.
-    const std::string out = diag::to_json(event);
+    const std::string out = without_pseudonyms(diag::to_json(event));
     // Then: nothing survives on an unknown key, string or scalar alike.
     EXPECT_EQ(out.find("opaque_id"), std::string::npos);
     EXPECT_EQ(out.find("\"peer\""), std::string::npos);
@@ -115,7 +147,7 @@ TEST(DiagnosticsPrivacyGaps, ReservedEnvelopeKeysCannotBeOverriddenByFields) {
     event.fields.push_back(diag::EventField::text("session", "999"));
     event.fields.push_back(diag::EventField::text("mono_ns", "1"));
     // When: the boundary serializes it.
-    const std::string out = diag::to_json(event);
+    const std::string out = without_pseudonyms(diag::to_json(event));
     // Then: exactly one envelope key each, typed values, hostile ones dropped.
     EXPECT_EQ(count_occurrences(out, "\"kind\":"), std::size_t{1});
     EXPECT_EQ(count_occurrences(out, "\"session\":"), std::size_t{1});
@@ -143,7 +175,7 @@ TEST(DiagnosticsPrivacyGaps, InvalidUtf8RepairsInScrubAndFailsClosedAtEmission) 
     event.fields.push_back(diag::EventField::text(bad_key, "x"));
     // When: the pattern layer repairs the text and emission rejects freeform values.
     const std::string repaired = diag::scrub_text(bad_value);
-    const std::string out = diag::to_json(event);
+    const std::string out = without_pseudonyms(diag::to_json(event));
     // Then: repair stays available, but no unvalidated content crosses emission.
     for (const char c : out) {
         EXPECT_NE(static_cast<unsigned char>(c), 0xFFU);
