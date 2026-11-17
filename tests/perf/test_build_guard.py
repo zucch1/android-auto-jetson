@@ -519,6 +519,7 @@ def stub_ssh(root: Path) -> tuple[Path, Path]:
 printf '%s\\n' "$*" >> {str(log)!r}
 command_line="$*"
 case "$command_line" in
+    *"bash -s -- "*) eval "${{@: -1}}"; exit $? ;;  # the remote stop, run on this "target"
     *CMakeCache*) [ -n "${{STUB_CACHE:-}}" ] && [ -f "$STUB_CACHE" ] && exit 0 || exit 1 ;;
     *"python3 -"*) [ -n "${{STUB_CAPTURE:-}}" ] || exit 1
                    cat "$STUB_CAPTURE"
@@ -570,7 +571,8 @@ def test_launcher_records_the_build_and_never_passes_an_override_run() -> None:
                 ["bash", str(SHELL), "--mode", "wired", "--duration", "1s",
                  "--out", str(root / "result.json"), "--now", NOW,
                  "--drive-smoke", str(smoke), "--phone-serial", "TESTPHONE01",
-                 "--media-uri", "file:///sdcard/Music/fixture.opus", *extra],
+                 "--media-uri", "file:///sdcard/Music/fixture.opus",
+                 "--media-component", "org.example.player/.Play", *extra],
                 capture_output=True, text=True, timeout=120, env=env, check=False)
 
         # When the stage runs from the build directory that produced the binaries.

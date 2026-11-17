@@ -475,12 +475,45 @@ def test_collector_runs_the_workload_for_the_stage() -> None:
     assert capture["schema"] == "aa-projection-perf-capture/3"
 
 
+class LastIntervalClose(mm.SoakStimulus):
+    """Drags normally; its display control pipe closes during the final interval,
+    after the collector's last in-loop failure check (seen only at the join)."""
+
+    def run(self) -> None:
+        self.halt.wait(60)  # still dragging until the collector stops it...
+        self.failure = "display_control_closed"  # ...the close lands in that last interval
+
+
+def test_a_control_failure_in_the_final_interval_is_not_dropped() -> None:
+    # Given a stimulus whose control pipe closes in the last interval, which the
+    # loop can no longer see (its deadline is reached first).
+    with tempfile.TemporaryDirectory(prefix="soak-moving-map-") as directory:
+        with patch.object(mm, "SoakStimulus", LastIntervalClose):
+            capture = run_collector(Path(directory))
+    # Then the collector reports it as a terminal error after the join, and
+    # the stage FAILs on it.
+    codes = [error.get("code") for error in capture["terminal_errors"]]
+    assert codes.count("display_control_closed") == 1, codes
+    import aa_perf_report as reporter
+    import json
+    doc = reporter.build_result(json.loads(json.dumps(capture)), duration_requested=None, now="2026-11-17T00:00:00Z",
+                                capture_path=None, capture_sha256=None)
+    assert doc["verdict"] == "FAIL" and "terminal_errors" in {v["metric"] for v in doc["violations"]}, \
+        doc["violations"]
+
+
 def test_collector_refuses_a_workload_without_its_inputs() -> None:
     for argv in (["--workload", "moving-map", "--display", "d", "--media-uri", "m"],
                  ["--workload", "moving-map", "--display", "d", "--phone-serial", "S"],
                  ["--workload", "moving-map", "--media-uri", "m", "--phone-serial", "S"],
                  ["--workload", "moving-map", "--media-uri", "m", "--phone-serial", "S",
-                  "--display", "d", "--no-display"]):
+                  "--display", "d", "--no-display"],
+                 # No media component (or one without a package): the player
+                 # could not be stopped and verified after the stage.
+                 ["--workload", "moving-map", "--media-uri", "m", "--phone-serial", "S",
+                  "--display", "d"],
+                 ["--workload", "moving-map", "--media-uri", "m", "--phone-serial", "S",
+                  "--display", "d", "--media-component", "player"]):
         code = collector._cli(["--receiver", "r", "--port", "1-2.1", "--duration-seconds", "1", *argv])
         assert code == 2, (argv, code)
 

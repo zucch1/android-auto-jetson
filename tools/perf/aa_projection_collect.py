@@ -1030,6 +1030,11 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         parser.video_measurements.frozen = True
         if stimulus is not None:
             stimulus.stop()
+            # A control failure in the final interval is only seen after the
+            # join (the loop may have reached its deadline first): never drop it.
+            if stimulus.failure and not any(error.get("code") == stimulus.failure
+                                            for error in parser.terminal_errors):
+                parser.terminal_errors.append({"event": "err", "code": stimulus.failure})
         if display is not None and display.poll() is not None:
             display_survived = False
         for name, proc in (("display", display), ("receiver", receiver)):
@@ -1180,6 +1185,10 @@ def _run(args: argparse.Namespace) -> int:
                                           or not args.display or args.no_display):
         print("error: --workload moving-map needs --phone-serial, --media-uri and a managed "
               "--display", file=sys.stderr)
+        return 2
+    if args.workload == "moving-map" and not moving_map.media_package(args.media_component):
+        print("error: --workload moving-map needs --media-component PKG/ACTIVITY, so the media "
+              "player can be stopped and verified after the stage", file=sys.stderr)
         return 2
     if not 0 < args.startup_timeout_seconds <= _PROJECTION_STARTUP_TIMEOUT_SECONDS:
         print("error: --startup-timeout-seconds must be in [1, 60]", file=sys.stderr)

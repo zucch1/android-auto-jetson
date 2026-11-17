@@ -248,7 +248,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--drive-smoke", required=True, help="that phone's passing drive-smoke result")
     parser.add_argument("--media-uri", required=True, help="media played for every whole stage")
     parser.add_argument("--media-type")
-    parser.add_argument("--media-component")
+    parser.add_argument("--media-component", required=True,
+                        help="PKG/ACTIVITY playing --media-uri; required: each stage's cleanup "
+                             "stops and verifies this player before the next stage")
     parser.add_argument("--geo-uri")
     parser.add_argument("--port", default="1-2.1")
     parser.add_argument("--host", default="localhost")

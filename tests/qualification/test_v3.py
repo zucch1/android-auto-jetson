@@ -69,6 +69,8 @@ class V3PackageTests(PackageTest):
             'excursion clause failed': lambda d: d['av_contract']['clauses'].update(excursions=False),
             'cap variant instead of the soak rate': lambda d: d['av_contract'].update(max_clause='cap'),
             'max |skew| gated again': lambda d: d['metrics']['av_max_abs_ms'].update(gated=True),
+            'player not shown stopped': lambda d: d['workload'].update(
+                cleanup_failures=['media_stop_unverified: org.example.player after 3 attempts']),
             'a phone command failed': lambda d: d['workload'].update(phone_failure='media: exit 1'),
             'phone failure not recorded': lambda d: d['workload'].pop('phone_failure'),
             'drags stopped mid-stage': lambda d: d['workload'].update(max_drag_gap_s=600.0),

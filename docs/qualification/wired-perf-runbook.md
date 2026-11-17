@@ -365,13 +365,27 @@ A step that fails or cannot be verified is a named entry in
 smoke's result has the same field):
 
 - `media_stop_unverified: <pkg> after 3 attempts: <why>`;
-- `media_stop_unavailable` (no `--media-component`, so the player is
-  unknown);
-- `usb_reset_failed: <why>`.
+- `media_stop_unavailable` (no media package; live runs refuse this case
+  up front, below);
+- `usb_reset_failed: <why>`;
+- `phone_restore_not_reached` (the collector ended before its restore).
 
-The restore runs after the measurement, so it does not change the verdict. It
-is recorded, never silent. Pass `--media-component` so the player can be
-stopped.
+**A failed restore fails closed.** `--media-component PKG/ACTIVITY` is required
+for every live moving-map run: the launcher, the chain, the collector and the
+drive smoke all refuse a missing component, or one without a package, before
+the phone is touched. The restore stops and verifies exactly that package.
+
+Any cleanup failure makes a live v3 stage that would otherwise pass
+**BLOCKED** by name, so the chain never starts the next stage after it:
+
+- `cleanup:media_not_stopped`;
+- `cleanup:usb_not_restored`;
+- `cleanup:phone_restore_not_reached`;
+- `cleanup:not_recorded` (a capture without the record).
+
+A measured budget miss stays a FAIL. The drive smoke's result is BLOCKED the
+same way (exit 3), so the soak gate refuses it. The qualification checker
+requires `workload.cleanup_failures` to be `[]`.
 
 Every phone command goes through one lock with a closed gate. The phone
 restore waits for an in-flight command, closes the gate and restores, so no
@@ -598,6 +612,35 @@ the stop explicit:
      `remote-stop: failed: forced: ...` naming each problem and exits 1. The
      launcher reports that the remote stop reported a failure.
 5. The launcher then drops its own ssh client and exits 143 (130 for INT).
+
+**Every collector exit is confirmed on the target.** The collector's ssh bound
+is the sum of three named budgets in the launcher, each justified there:
+
+- `COLLECTOR_STARTUP_BUDGET_S` = 180: ssh connect, the four bounded adb setup
+  commands and their waits (about 87 s), and the 60 s receiver/display
+  startup bound;
+- the requested window plus `COLLECTOR_MEASUREMENT_SLACK_S` = 30: one
+  sampling interval of overshoot and the frozen-collector log grace;
+- `COLLECTOR_CLEANUP_BUDGET_S` = 240: the stimulus join (up to 47 s), the
+  display and receiver terminations (about 20 s), the media stop (3 attempts
+  of two 20 s adb commands, about 123 s) and the USB switch (20 s).
+
+However the collector ends (a normal exit, a refusal, a dropped link or that
+bound expiring with exit 124), the launcher then runs `aa_remote_stop.sh`
+with no wait for the run file to appear:
+
+- A finished run's cleanup report is relayed and removed
+  (`remote-stop: finished`, or `failed: finished with cleanup failures`).
+- A collector that is still running, for example during a stalled adb
+  cleanup, is stopped and its cleanup confirmed, or the script falls back to
+  KILL plus a direct restore.
+
+On a timeout the stage is BLOCKED `collector_timeout`, never
+`collector_failed` or a PASS. When the target cannot be confirmed clean,
+every BLOCKED reason gains `,remote_cleanup_unconfirmed`. A normal exit whose
+target is unconfirmed is BLOCKED `remote_cleanup_unconfirmed`. A finished
+run's own cleanup failures are in its capture, and the reporter blocks them
+by name.
 
 The stop's ssh is bounded at 75 s, inside the chain's 120 s grace. An explicit
 stop with an acknowledgement is used rather than tying the collector to the

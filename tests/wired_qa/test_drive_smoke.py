@@ -537,6 +537,7 @@ class LauncherGateTests(unittest.TestCase):
         (stub_dir / "ssh").write_text(f'''#!/usr/bin/env bash
 printf '%s\\n' "$*" >> {str(log)!r}
 case "$*" in
+    *"bash -s -- "*) eval "${{@: -1}}"; exit $? ;;  # the remote stop, run on this "target"
     *"python3 -"*) if [ -n "${{STUB_COLLECTOR_SWAPPED:-}}" ]; then
                        printf '%s\\n' "$*" | grep -q -- "--phone-serial '{PHONE}'" || exit 1
                        echo "error: phone_identity_mismatch: another phone on --port" >&2
@@ -568,6 +569,7 @@ exit 0
         process = subprocess.run(
             ["bash", str(LAUNCHER), "--mode", "wired", "--duration", "1800s",
              "--out", str(root / "out.json"), "--media-uri", "file:///sdcard/Music/fixture.opus",
+             "--media-component", "org.example.player/.Play",
              *(["--phone-serial", phone] if phone is not None else []), *extra],
             capture_output=True, text=True, timeout=120, check=False, env=env)
         return process, log.read_text()
@@ -817,6 +819,9 @@ elif hook == "stall":
             open(os.path.join(fake, "pipe.full"), "w").close()
         return process
     aa_drive_smoke._spawn = hooked_spawn
+elif hook == "passing":
+    # The drive's own analysis passes, so only the cleanup can stop a PASS.
+    aa_drive_smoke.analyze_dir = lambda out: {"verdict": "PASS", "criteria": []}
 sys.exit(aa_drive_smoke.main(sys.argv[2:]))
 """
 
@@ -832,7 +837,8 @@ def alive(pid: int) -> bool:
 class RunnerSignalTests(unittest.TestCase):
     """SIGTERM/SIGINT only set a flag; the runner always reaches its one cleanup."""
 
-    def start(self, root: Path, hook: str = "", *extra: str) -> subprocess.Popen:
+    def start(self, root: Path, hook: str = "", *extra: str,
+              component: str | None = "org.example.player/.Play", **env_extra: str) -> subprocess.Popen:
         build, bin_dir = root / "build", root / "bin"
         build.mkdir()
         bin_dir.mkdir()
@@ -846,6 +852,9 @@ class RunnerSignalTests(unittest.TestCase):
                    FAKE_ADB_LOG=str(root / "adb.log"))
         if hook == "stall":
             env["FAKE_DISPLAY_STALL"] = "1"
+        env.update(env_extra)
+        if component is not None:
+            extra = ("--media-component", component, *extra)
         return subprocess.Popen(
             [sys.executable, "-B", "-c", DRIVER, str(SMOKE.parent), "run",
              "--serial", "FAKESERIAL", "--port", "9-9", "--build-dir", str(build),
@@ -879,9 +888,8 @@ class RunnerSignalTests(unittest.TestCase):
         self.assertEqual((result["verdict"], result["blocked_on"]), ("BLOCKED", "interrupted"))
         adb = (root / "adb.log").read_text().splitlines()
         self.assertEqual(adb[-1], "-s FAKESERIAL shell svc usb setFunctions mtp", adb)
-        # Without --media-component the player is unknown: recorded, never silent.
-        self.assertEqual(result["cleanup_failures"],
-                         ["media_stop_unavailable: no media component, the player is unknown"])
+        # The player was stopped and verified before the USB switch.
+        self.assertEqual(result["cleanup_failures"], [], adb)
 
     def scenario(self, hook: str, external_sigterm: bool, check) -> None:
         with tempfile.TemporaryDirectory(prefix=f"drive-smoke-signal-{hook or 'mid'}-") as directory:
@@ -913,8 +921,7 @@ class RunnerSignalTests(unittest.TestCase):
         # Given a drive with an explicit media component (the player is known).
         with tempfile.TemporaryDirectory(prefix="drive-smoke-cleanup-") as directory:
             root = Path(directory)
-            runner = self.start(root, "", "--duration", "3",
-                                "--media-component", "org.example.player/.Play")
+            runner = self.start(root, "", "--duration", "3")
             try:
                 output, _ = runner.communicate(timeout=90)
             finally:
@@ -935,6 +942,50 @@ class RunnerSignalTests(unittest.TestCase):
                                     "-s FAKESERIAL shell svc usb setFunctions mtp"], output)
         self.assertFalse(running, adb)
         self.assertEqual(result["cleanup_failures"], [], output)
+
+    def run_to_end(self, root: Path, *args, **kwargs) -> tuple[subprocess.CompletedProcess, str]:
+        runner = self.start(root, *args, **kwargs)
+        try:
+            output, _ = runner.communicate(timeout=90)
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+            if (root / "receiver.pids").exists():
+                for pid in self.pids(root):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        return runner, output
+
+    def test_an_omitted_media_component_is_refused_before_the_phone_is_touched(self) -> None:
+        for component in (None, "org.example.player", "player/.Play", "a/b/c"):
+            with self.subTest(component=component), \
+                    tempfile.TemporaryDirectory(prefix="drive-smoke-component-") as directory:
+                root = Path(directory)
+                runner, output = self.run_to_end(root, "", "--duration", "3", component=component)
+                self.assertEqual(runner.returncode, 2, output)
+                self.assertFalse((root / "adb.log").exists(), "the phone was touched")
+                self.assertFalse((root / "out" / "result.json").exists())
+
+    def test_a_player_that_is_not_shown_stopped_blocks_a_passing_drive(self) -> None:
+        # Given a drive whose analysis passes, and a player that never stops.
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-stuck-") as directory:
+            root = Path(directory)
+            runner, output = self.run_to_end(root, "passing", "--duration", "3",
+                                             FAKE_ADB_STUCK="org.example.player")
+            result = json.loads((root / "out" / "result.json").read_text())
+        # Then the drive is BLOCKED by name (exit 3), so the soak gate refuses it.
+        self.assertEqual(runner.returncode, 3, output)
+        self.assertEqual((result["verdict"], result["blocked_on"]),
+                         ("BLOCKED", "cleanup:media_not_stopped"), output)
+        self.assertTrue(result["cleanup_failures"][0].startswith("media_stop_unverified"))
+        self.assertEqual(smoke.check_record(result, receiver_sha256=A, display_sha256=B,
+                                            phone_serial="FAKESERIAL", now=NOW)[0] is None, False)
+        # And the same drive with a player that does stop passes.
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-stuck-") as directory:
+            runner, output = self.run_to_end(Path(directory), "passing", "--duration", "3")
+        self.assertEqual(runner.returncode, 0, output)
 
     def test_media_is_relaunched_when_audio_stops(self) -> None:
         # Given a 12 s drive whose (fake) receiver never logs an audio write.

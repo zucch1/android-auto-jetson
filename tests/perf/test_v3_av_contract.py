@@ -259,19 +259,32 @@ def test_live_v3_requires_drags_across_the_whole_window() -> None:
     assert result(v3(1800), live=True)["workload"]["max_drag_gap_s"] == 1.5
 
 
-def test_cleanup_failures_are_recorded_never_silent() -> None:
-    # The phone restore runs after the measurement: a media stop it could not
-    # verify is recorded in the result (and validated), not hidden.
+def test_a_cleanup_failure_blocks_the_stage_by_name() -> None:
+    # The phone restore must be shown complete: a player left running (or a USB
+    # mode not restored) BLOCKS a stage that would otherwise pass, by name, so
+    # the chain stops before the next stage.
     failure = "media_stop_unverified: org.example.player after 3 attempts: still running (pid 1)"
-    doc = result(v3(1800, workload=moving_map(1800, cleanup_failures=[failure])), live=True)
-    assert doc["workload"]["cleanup_failures"] == [failure]
-    assert not schema.validate(doc, schema.load_schema(schema.SCHEMA_V3))
-    assert result(v3(1800), live=True)["workload"]["cleanup_failures"] == []
-    # A capture that does not record its restore says so.
+    cases = {
+        (failure,): "cleanup:media_not_stopped",
+        ("media_stop_unavailable: no media component, the player is unknown",): "cleanup:media_not_stopped",
+        ("usb_reset_failed: exit 1",): "cleanup:usb_not_restored",
+        ("phone_restore_not_reached",): "cleanup:phone_restore_not_reached",
+    }
+    for failures, reason in cases.items():
+        doc = result(v3(1800, workload=moving_map(1800, cleanup_failures=list(failures))), live=True)
+        assert doc["verdict"] == "BLOCKED" and reason in doc["blocked_on"], (failures, doc["blocked_on"])
+        assert doc["workload"]["cleanup_failures"] == list(failures)
+        assert not schema.validate(doc, schema.load_schema(schema.SCHEMA_V3))
+    assert result(v3(1800), live=True)["verdict"] == "PASS"
+    # A capture that does not record its restore is not proven clean either.
     record = moving_map(1800)
     del record["cleanup_failures"]
-    assert result(v3(1800, workload=record), live=True)["workload"]["cleanup_failures"] == [
-        "cleanup not recorded"]
+    doc = result(v3(1800, workload=record), live=True)
+    assert doc["workload"]["cleanup_failures"] == ["cleanup not recorded"]
+    assert doc["verdict"] == "BLOCKED" and "cleanup:not_recorded" in doc["blocked_on"], doc["blocked_on"]
+    # A measured budget miss stays a FAIL (a BLOCKED reason never hides it).
+    raw = v3(1800, audio=None, workload=moving_map(1800, cleanup_failures=[failure]))
+    assert result(raw, live=True)["verdict"] == "FAIL"
 
 
 def test_live_v3_blocks_a_build_during_the_stage() -> None:

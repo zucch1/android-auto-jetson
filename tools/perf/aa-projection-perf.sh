@@ -392,6 +392,13 @@ if [[ -z "$MEDIA_URI" ]]; then
     echo "usage error: --media-uri is required for a live stage (moving-map workload)" >&2
     exit 2
 fi
+# The player must be known to be stopped after the stage (its package is the
+# component's PKG part): without it the restore cannot be verified.
+if [[ ! "$MEDIA_COMPONENT" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+/[A-Za-z0-9_.$]+$ ]]; then
+    echo "usage error: --media-component PKG/ACTIVITY is required for a live stage, so the" \
+         "media player can be stopped and verified after it (got '${MEDIA_COMPONENT}')" >&2
+    exit 2
+fi
 for value in "$MEDIA_URI" "$MEDIA_TYPE" "$MEDIA_COMPONENT" "$GEO_URI"; do
     if [[ "$value" == *"'"* ]]; then
         echo "usage error: --media-uri/--media-type/--media-component/--geo-uri must not contain a single quote" >&2
@@ -507,7 +514,25 @@ for name in ("aa_measurement_coverage", "aa_video_measurements", "aa_build_guard
     print("exec(" + repr(source) + ", module.__dict__)")
 print("exec(compile(" + repr(collector) + ", 'aa_projection_collect.py', 'exec'))")
 PY
-collector_timeout=$((duration_secs + 120))
+# The collector's ssh is bounded by three explicit budgets (#137):
+# - startup: ssh connect (10 s), the phone setup (four adb commands bounded at
+#   20 s each plus 7 s of waits, ~87 s) and the receiver/display startup
+#   (the collector's own 60 s bound): ~157 s, so 180 s;
+# - measurement: the requested window plus the collector's sampling overshoot
+#   (one interval, <= 5 s) and its log grace for a frozen collector (5 s),
+#   so duration + 30 s;
+# - cleanup: the stimulus join (<= 47 s), the display and receiver
+#   terminations (5 s + KILL each, ~20 s), the media stop (3 attempts of two
+#   adb commands bounded at 20 s, ~123 s) and the USB switch (20 s): ~210 s,
+#   so 240 s.
+# Whatever ends the collector (a normal exit, a refusal, this timeout, a
+# dropped link), remote_stop then confirms the target: it stops a collector
+# that is still running and relays its cleanup report (aa_remote_stop.sh).
+COLLECTOR_STARTUP_BUDGET_S=180
+COLLECTOR_MEASUREMENT_SLACK_S=30
+COLLECTOR_CLEANUP_BUDGET_S=240
+collector_timeout=$((COLLECTOR_STARTUP_BUDGET_S + duration_secs + COLLECTOR_MEASUREMENT_SLACK_S
+                     + COLLECTOR_CLEANUP_BUDGET_S))
 blocked_type=""
 # A stop (TERM/INT, e.g. from tools/perf/aa_soak_chain.py) must reach the
 # collector on the target: ending this side's ssh client does not signal a
@@ -518,6 +543,21 @@ blocked_type=""
 run_id="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 RUN_FILE="/tmp/aa-perf-run-${run_id}"
 REMOTE_STOP_ACK_S="${AA_REMOTE_STOP_ACK_S:-30}"
+remote_stop_line="" remote_stop_rc=0
+# remote_stop APPEAR_SECONDS: run aa_remote_stop.sh on the target. Its one-line
+# outcome goes to stderr and remote_stop_line; remote_stop_rc is nonzero when it
+# could not confirm the target clean (a failure it reported, or no answer).
+remote_stop() {
+    local out="$BUFFER/remote-stop.out"
+    remote_stop_rc=0
+    timeout $((REMOTE_STOP_ACK_S + 45)) ssh "${SSH_OPTS[@]}" "$HOST" \
+        "bash -s -- '${RUN_FILE}' ${REMOTE_STOP_ACK_S} $1" <"$TOOL_DIR/aa_remote_stop.sh" \
+        >"$out" 2>&1 || remote_stop_rc=$?
+    remote_stop_line="$(grep -m1 '^remote-stop: ' "$out" || echo "remote-stop: no answer (rc ${remote_stop_rc})")"
+    [[ "$remote_stop_line" == "remote-stop: no answer"* ]] && remote_stop_rc=$((remote_stop_rc ? remote_stop_rc : 1))
+    echo "$remote_stop_line" >&2
+    ((remote_stop_rc == 0)) || echo "remote cleanup: the remote stop reported a failure (rc ${remote_stop_rc})" >&2
+}
 stop_signal=""
 trap 'stop_signal=TERM' TERM
 trap 'stop_signal=INT' INT
@@ -543,12 +583,7 @@ done
 if [[ -n "$stop_signal" ]]; then
     trap '' TERM INT  # the stop itself is not interrupted
     echo "stopping: ${stop_signal}; stopping the collector on ${HOST}" >&2
-    stop_rc=0
-    timeout $((REMOTE_STOP_ACK_S + 45)) ssh "${SSH_OPTS[@]}" "$HOST" \
-        "bash -s -- '${RUN_FILE}' ${REMOTE_STOP_ACK_S}" <"$TOOL_DIR/aa_remote_stop.sh" >&2 || stop_rc=$?
-    # rc 1: the stop finished but reported a problem (a survivor, or a restore
-    # step such as the media stop that could not be done or verified).
-    ((stop_rc == 0)) || echo "stopping: the remote stop reported a failure (rc ${stop_rc})" >&2
+    remote_stop 15  # the collector may still be starting
     # The remote command has ended (or was killed): drop the local client.
     kill -TERM "$collector_job" 2>/dev/null || true
     wait "$collector_job" 2>/dev/null || true
@@ -556,6 +591,22 @@ if [[ -n "$stop_signal" ]]; then
     exit 143
 fi
 trap - TERM INT
+# The collector has ended, however it ended. A timeout (124) or a dropped link
+# can leave it, its receiver/display and the phone running on the target:
+# confirm the target either way (a finished run only has its report relayed).
+if ((collector_rc == 124)); then
+    echo "collector: the ssh bound of ${collector_timeout} s expired; stopping the collector on ${HOST}" >&2
+fi
+remote_stop 0
+# A stage whose target cleanup is not confirmed is never a PASS.
+cleanup_suffix=""
+((remote_stop_rc == 0)) || cleanup_suffix=",remote_cleanup_unconfirmed"
+if ((collector_rc == 124)); then
+    echo "BLOCKED: collector_timeout" >&2
+    sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
+    blocked_result "collector_timeout${cleanup_suffix}" "" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+    exit 3
+fi
 if ((collector_rc != 0)); then
     # The on-target collector refuses to start a stage from an unoptimized build
     # or from binaries another build produced; report each as its own BLOCKED
@@ -564,7 +615,7 @@ if ((collector_rc != 0)); then
     if grep -q '^error: build_dir_mismatch:' "$BUFFER/collector.err"; then
         echo "BLOCKED: build_dir_mismatch" >&2
         sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-        blocked_result "build_dir_mismatch" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        blocked_result "build_dir_mismatch${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
         exit 3
     fi
     # The receiver saw another phone than the gate verified, at the first link
@@ -572,7 +623,7 @@ if ((collector_rc != 0)); then
     if grep -q '^error: phone_identity_mismatch:' "$BUFFER/collector.err"; then
         echo "BLOCKED: phone_identity_mismatch" >&2
         sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-        blocked_result "phone_identity_mismatch" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        blocked_result "phone_identity_mismatch${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
         exit 3
     fi
     # A required phone command (USB reset, wake, media or Maps launch) failed
@@ -581,18 +632,18 @@ if ((collector_rc != 0)); then
     if grep -q '^error: phone_setup_failed:' "$BUFFER/collector.err"; then
         echo "BLOCKED: phone_setup_failed" >&2
         sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-        blocked_result "phone_setup_failed" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        blocked_result "phone_setup_failed${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
         exit 3
     fi
     if grep -q '^error: unoptimized_build:' "$BUFFER/collector.err"; then
         echo "BLOCKED: unoptimized_build" >&2
         sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-        blocked_result "unoptimized_build" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        blocked_result "unoptimized_build${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
         exit 3
     fi
     echo "BLOCKED: collector_failed" >&2
     sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-    blocked_result "collector_failed" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+    blocked_result "collector_failed${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
 fi
 # The collector writes the build record it verified to stderr; keep those lines
@@ -603,7 +654,16 @@ if [[ -s "$BUFFER/collector.err" ]]; then
 fi
 if [[ ! -s "$capture_file" ]]; then
     echo "BLOCKED: collector_produced_no_capture" >&2
-    blocked_result "collector_produced_no_capture" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+    blocked_result "collector_produced_no_capture${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+    exit 3
+fi
+if ((remote_stop_rc != 0)) && [[ "$remote_stop_line" != *"finished with cleanup failures"* ]]; then
+    # The collector exited 0 with a capture, but the target could not be
+    # confirmed clean (a run still recorded, no answer): BLOCKED. A finished
+    # run's own cleanup failures are in its capture, and the reporter BLOCKS
+    # them by name (cleanup:*).
+    echo "BLOCKED: remote_cleanup_unconfirmed (${remote_stop_line})" >&2
+    blocked_result "remote_cleanup_unconfirmed" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
 fi
 if [[ -n "$CAPTURE_OUT" ]]; then

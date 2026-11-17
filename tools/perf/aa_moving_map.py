@@ -33,6 +33,7 @@ thread for the whole stage. Every phone command goes through ``adb -s SERIAL``.
 from __future__ import annotations
 
 import os
+import re
 import select
 import subprocess
 import threading
@@ -145,6 +146,51 @@ def max_drag_gap_s(drags_ns: object, start_ns: int, end_ns: int) -> float | None
     return max(b - a for a, b in zip(points, points[1:])) / 1e9
 
 
+# Every restore failure maps to one named BLOCKED reason.
+CLEANUP_REASONS = {
+    "media_stop_unverified": "cleanup:media_not_stopped",
+    "media_stop_unavailable": "cleanup:media_not_stopped",
+    "usb_reset_failed": "cleanup:usb_not_restored",
+    "phone_restore_not_reached": "cleanup:phone_restore_not_reached",
+}
+
+
+def cleanup_gaps(raw: object) -> list[str]:
+    """The named BLOCKED reasons (cleanup:*) for a run's cleanup failures.
+
+    ``raw`` is a soak capture's moving-map workload record, or a plain list
+    (the drive smoke). A missing or malformed record is "cleanup:not_recorded".
+    """
+    if isinstance(raw, dict) and raw.get("kind") != "moving-map":
+        return []
+    failures = raw.get("cleanup_failures") if isinstance(raw, dict) else raw
+    if not isinstance(failures, list) or not all(isinstance(item, str) for item in failures):
+        return ["cleanup:not_recorded"]
+    reasons = []
+    for item in failures:
+        name = item.split(":", 1)[0].strip()
+        reason = CLEANUP_REASONS.get(name, "cleanup:" + (re.sub(r"[^a-z0-9_]+", "_", name.lower()) or "unknown"))
+        if reason not in reasons:
+            reasons.append(reason)
+    return reasons
+
+
+def media_package(component: str | None) -> str | None:
+    """The package of an explicit PKG/ACTIVITY component, or None if it has none.
+
+    Live moving-map runs require it: the restore force-stops and verifies
+    exactly this package, so without it the player cannot be shown stopped.
+    """
+    if not isinstance(component, str) or component.count("/") != 1:
+        return None
+    package, activity = component.split("/")
+    parts = package.split(".")
+    if (len(parts) < 2 or not activity or not parts[0][:1].isalpha()
+            or not all(part and all(c.isalnum() or c == "_" for c in part) for part in parts)):
+        return None
+    return package
+
+
 def drag_lines(step: int) -> list[str]:
     """The touch-control lines of drag number ``step`` (alternating direction)."""
     a, b = DRAG_POINTS if step % 2 == 0 else DRAG_POINTS[::-1]
@@ -165,7 +211,7 @@ class MovingMap:
         self.adb = adb
         self.media = ["-d", media_uri] + (["-t", media_type] if media_type else [])
         self.media += ["-n", media_component] if media_component else []
-        self.media_package = media_component.split("/")[0] if media_component else None
+        self.media_package = media_package(media_component)
         self.geo_uri = geo_uri
         self.media_relaunches = 0
         self.drags = 0

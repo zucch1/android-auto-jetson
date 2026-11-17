@@ -35,7 +35,8 @@
 # breaks adb for a moment (a force-stop sent after it is lost).
 #
 # Prints one line and exits 0 for "remote-stop: no-run", "remote-stop:
-# acknowledged" or "remote-stop: forced". Otherwise it prints "remote-stop:
+# finished" (the run had already ended cleanly; its report is relayed),
+# "remote-stop: acknowledged" or "remote-stop: forced". Otherwise it prints "remote-stop:
 # failed: ..." naming each problem (survivors of the KILL, a restore step the
 # collector or this script could not do or verify, a missing cleanup report)
 # and exits 1; the phone restore is still attempted.
@@ -107,7 +108,20 @@ wait_until() {  # wait_until SECONDS COMMAND...: poll every 0.1 s
 gone() { [[ ! -e "$run_file" ]]; }
 present() { [[ -e "$run_file" ]]; }
 
+cleanup_report="${run_file}.cleanup"
 if ! wait_until "$appear_seconds" present; then
+    # No run, or one that already finished (after its cleanup): relay a
+    # finished run's cleanup report, if any.
+    if [[ -f "$cleanup_report" ]]; then
+        mapfile -t failures < "$cleanup_report"
+        rm -f -- "$cleanup_report"
+        if ((${#failures[@]})); then
+            echo "remote-stop: failed: finished with cleanup failures: $(IFS=';'; echo "${failures[*]}")"
+            exit 1
+        fi
+        echo "remote-stop: finished"
+        exit 0
+    fi
     echo "remote-stop: no-run"
     exit 0
 fi
@@ -116,7 +130,6 @@ collector_pid="$(field collector 2)"
 collector_start="$(field collector 3)"
 serial="$(field phone 2)"
 package="$(field media_package 2)"
-cleanup_report="${run_file}.cleanup"
 if same_process "$collector_pid" "$collector_start"; then
     kill -TERM "$collector_pid" 2>/dev/null
     if wait_until "$ack_seconds" gone; then

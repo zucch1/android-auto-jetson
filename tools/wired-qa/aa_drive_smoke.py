@@ -20,7 +20,8 @@ Subcommands:
 ``run``      Launch a Release ``aa-wired-receiver`` + ``aa-dummy-display`` pair
              on this machine, drive the workload, then analyze and write
              ``result.json`` in ``--out``. Exit 0 PASS, 1 FAIL, 2 usage,
-             3 BLOCKED (a prerequisite was missing; nothing was measured).
+             3 BLOCKED (a prerequisite was missing and nothing was measured,
+             or the phone was not shown restored afterwards: cleanup:*).
 ``analyze``  Re-run the analysis on a ``run`` output directory (no phone needed).
 ``check``    The soak gate. ``tools/perf/aa-projection-perf.sh`` calls it before
              any live stage: the record must be a PASS from the soak's own
@@ -604,6 +605,11 @@ def _blocked(out: Path, base: dict, reason: str) -> int:
 
 
 def _run_cli(args) -> int:
+    if not moving_map.media_package(args.media_component):
+        # The cleanup must be able to stop and verify the player (#137).
+        print("usage error: --media-component PKG/ACTIVITY is required, so the media player "
+              "can be stopped and verified after the drive", file=sys.stderr)
+        return 2
     out = Path(args.out)
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
     receiver_bin, display_bin = Path(args.receiver), Path(args.display)
@@ -774,11 +780,16 @@ def _run_cli(args) -> int:
     result["trust_store_unchanged"] = store_before == store_after
     if not result["trust_store_unchanged"]:
         result["verdict"] = "FAIL"
+    cleanup = moving_map.cleanup_gaps(run["cleanup_failures"])
+    if cleanup and result["verdict"] == "PASS":
+        # The phone was not shown restored (the player still running, or USB not
+        # reset): never a PASS, so the soak gate refuses it. A FAIL stays a FAIL.
+        result.update(verdict="BLOCKED", blocked_on=",".join(cleanup))
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     _print_summary(result)
     for sig, handler in previous.items():
         signal.signal(sig, handler)
-    return 0 if result["verdict"] == "PASS" else 1
+    return {"PASS": 0, "BLOCKED": 3}.get(result["verdict"], 1)
 
 
 def _print_summary(result: dict) -> None:
@@ -811,7 +822,9 @@ def main(argv: list[str]) -> int:
     run.add_argument("--media-uri", required=True,
                      help="media to play on the phone for the whole drive (A/V coverage is gated)")
     run.add_argument("--media-type")
-    run.add_argument("--media-component", help="explicit PKG/ACTIVITY for --media-uri")
+    run.add_argument("--media-component", required=True,
+                     help="explicit PKG/ACTIVITY for --media-uri; required: the cleanup stops "
+                          "and verifies exactly this player")
     run.add_argument("--out", required=True, help="new private directory for logs and result.json")
     analyze_p = sub.add_parser("analyze", help="re-analyze a run directory")
     analyze_p.add_argument("dir")

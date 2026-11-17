@@ -252,5 +252,7 @@ def signed_av(doc: Document, metrics: Document) -> None:
     require(workload.integer('drags') >= MIN_DRAG_RATE_HZ * active, 'PERF_WORKLOAD_DRAGS')
     require(0 <= workload.number('max_drag_gap_s') <= MAX_DRAG_GAP_S, 'PERF_WORKLOAD_DRAG_GAP')
     require(workload.integer('media_relaunches') >= 0, 'PERF_WORKLOAD')
+    # The phone was restored: the media player stopped and verified, USB reset.
+    require(workload.get('cleanup_failures') == [], 'PERF_CLEANUP')
     # The stage ran on a quiet host: the target saw no build during it.
     require(run_status.get('concurrent_builds') == [], 'PERF_CONCURRENT_BUILD')

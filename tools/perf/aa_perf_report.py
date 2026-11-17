@@ -52,7 +52,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aa_perf_schema  # noqa: E402
 import aa_av_contract as av_contract  # noqa: E402
-from aa_moving_map import MAX_DRAG_GAP_S, MIN_DRAG_RATE_HZ, max_drag_gap_s  # noqa: E402
+from aa_moving_map import MAX_DRAG_GAP_S, MIN_DRAG_RATE_HZ, cleanup_gaps, max_drag_gap_s  # noqa: E402
 from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Window, coverage_gaps, coverage_to_json, parse_capture, reduce_capture,
 )
@@ -464,6 +464,11 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
             gap = workload_gap(capture.get("workload"), window)
             if gap is not None:
                 unavailable.append("run_evidence:" + gap)
+            # The phone restore after the stage must be shown complete (media
+            # player stopped and verified, USB restored): a stage that leaves the
+            # player running is never a PASS, and a non-PASS stops the chain
+            # before the next stage. Named BLOCKED reasons (cleanup:*).
+            unavailable.extend(cleanup_gaps(capture.get("workload")))
             # A build on the target during the stage contends for CPU and memory:
             # the stage measured something else than the quiet host it claims.
             # Interference, not a product FAIL: it BLOCKS a stage that would
@@ -695,7 +700,7 @@ def _workload_record(raw: object, window: Window | None) -> dict:
                          and not isinstance(raw.get(key), bool) and raw[key] >= 0 else 0)
     failure = raw.get("phone_failure", "not recorded")
     # The phone restore after the stage (media stopped and verified, then USB
-    # mode): recorded, never silent. It does not change the measured verdict.
+    # mode): recorded, and a failure BLOCKS a live stage (cleanup_gaps).
     cleanup = raw.get("cleanup_failures")
     cleanup = ([str(item)[:300] for item in cleanup] if isinstance(cleanup, list)
                else ["cleanup not recorded"])

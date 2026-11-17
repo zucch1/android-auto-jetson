@@ -220,6 +220,45 @@ def test_a_descendant_that_never_finishes_is_killed_when_the_grace_expires() -> 
     assert outcome == "killed" and 1.5 <= elapsed < 10.0 and not left, (outcome, elapsed)
 
 
+REPORTING_STUB = """#!/usr/bin/env bash
+# The stage's result comes from the real reporter on a prepared capture.
+printf '%s\\n' "$*" >> "$STUB_LOG"
+while [ $# -gt 0 ]; do
+    case "$1" in --out) out="$2"; shift 2 ;; *) shift ;; esac
+done
+python3 -B "$REPORTER" --live --capture "$STUB_CAPTURE" --out "$out" --now 2026-11-17T00:00:00Z
+"""
+
+
+def test_a_stage_whose_player_was_not_stopped_blocks_the_chain() -> None:
+    # Given an 1800 s stage that measured a PASS but whose restore could not
+    # verify the media player stopped (the 2026-11-17 VLC case).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_v3_av_contract import moving_map, v3
+    failure = "media_stop_unverified: org.example.player after 3 attempts: still running (pid 1)"
+    reporter = str(ROOT / "tools/perf/aa_perf_report.py")
+    with tempfile.TemporaryDirectory(prefix="soak-chain-cleanup-") as directory:
+        root = Path(directory)
+        (root / "stuck.json").write_text(json.dumps(
+            v3(1800, workload=moving_map(1800, cleanup_failures=[failure]))))
+        code, output = run(root, env={"REPORTER": reporter, "STUB_CAPTURE": str(root / "stuck.json")},
+                           stub_text=REPORTING_STUB)
+        result = json.loads((root / "chain" / "stage-1800s-result.json").read_text())
+        # Then the stage is BLOCKED by name, and the 7200 s stage never starts.
+        assert code == 3, output
+        assert result["verdict"] == "BLOCKED" and "cleanup:media_not_stopped" in result["blocked_on"]
+        assert len(calls(root)) == 1, calls(root)
+        marker = json.loads((root / "chain" / "stage-7200s-not-run.json").read_text())
+        assert "stage-1800s did not pass (rc 3)" in marker["reason"], marker
+    # The same stage with a verified restore lets the chain continue.
+    with tempfile.TemporaryDirectory(prefix="soak-chain-cleanup-") as directory:
+        root = Path(directory)
+        (root / "clean.json").write_text(json.dumps(v3(1800, workload=moving_map(1800))))
+        code, output = run(root, env={"REPORTER": reporter, "STUB_CAPTURE": str(root / "clean.json")},
+                           stub_text=REPORTING_STUB)
+        assert code == 0 and len(calls(root)) == 2, output
+
+
 def test_every_chain_gets_a_new_directory() -> None:
     with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
         root = Path(directory)
@@ -277,7 +316,8 @@ def start_chain(root: Path, *extra: str, ignore_term: bool = False):
     return subprocess.Popen(
         [sys.executable, "-B", "-c", DRIVER, str(ROOT / "tools/perf"), "--out", str(root / "chain"),
          "--phone-serial", "TESTPHONE01", "--drive-smoke", str(root / "smoke.json"),
-         "--media-uri", "file:///sdcard/Music/tone.opus", "--launcher", str(stub), *extra],
+         "--media-uri", "file:///sdcard/Music/tone.opus",
+         "--media-component", "org.example.player/.Play", "--launcher", str(stub), *extra],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
