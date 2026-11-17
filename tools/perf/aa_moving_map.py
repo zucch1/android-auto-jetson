@@ -69,12 +69,19 @@ MAX_DRAG_GAP_S = 10.0
 # still-running player it is retried this many times, this far apart.
 MEDIA_STOP_ATTEMPTS = 3
 MEDIA_STOP_RETRY_S = 1.0
+# Every adb command's bound (adb_runner).
+ADB_TIMEOUT_S = 20.0
+# The whole restore (media stop attempts and the USB switch) stays within this:
+# a media-stop attempt (force-stop + pidof, after its pause) starts only while it
+# and the USB switch still fit, so the USB switch always has its ADB_TIMEOUT_S.
+# Out of budget, the media stop is recorded as not done (cleanup:media_not_stopped).
+RESTORE_BUDGET_S = 90.0
 MAPS_PACKAGE = "com.google.android.apps.maps"
 DEFAULT_GEO_URI = "geo:0,0?q=Atlanta"
 AUDIO_LINE = b'{"event":"audio_write_completed"'
 
 
-def adb_runner(serial: str, timeout: float = 20.0) -> Callable[..., subprocess.CompletedProcess]:
+def adb_runner(serial: str, timeout: float = ADB_TIMEOUT_S) -> Callable[..., subprocess.CompletedProcess]:
     """``adb -s SERIAL ...`` with a bound; a missing or hung adb never raises.
 
     A timeout or a missing adb comes back as a failed CompletedProcess (exit 1).
@@ -265,7 +272,8 @@ class MovingMap:
         self._relaunched_ns = time.monotonic_ns()
         return True
 
-    def restore_phone(self, sleep: Callable[[float], object] = time.sleep) -> list[str]:
+    def restore_phone(self, sleep: Callable[[float], object] = time.sleep,
+                      clock: Callable[[], float] = time.monotonic) -> list[str]:
         """Close the intent gate (after any in-flight command), then restore. Idempotent.
 
         Order: the gate is closed first (no media or Maps intent can follow),
@@ -280,7 +288,7 @@ class MovingMap:
             self._closed = True
             failures = []
             if self.media_package:
-                failure = self._stop_media(sleep)
+                failure = self._stop_media(sleep, clock, clock() + RESTORE_BUDGET_S)
                 if failure is not None:
                     failures.append(failure)
             else:
@@ -291,12 +299,23 @@ class MovingMap:
             self.cleanup_failures = failures
             return list(failures)
 
-    def _stop_media(self, sleep: Callable[[float], object]) -> str | None:
-        """Force-stop the media package until ``pidof`` shows no process (bounded)."""
+    def _stop_media(self, sleep: Callable[[float], object], clock: Callable[[], float],
+                    deadline: float) -> str | None:
+        """Force-stop the media package until ``pidof`` shows no process.
+
+        Bounded by MEDIA_STOP_ATTEMPTS and by ``deadline`` (RESTORE_BUDGET_S),
+        always leaving the USB switch its ADB_TIMEOUT_S.
+        """
         why = "not attempted"
+        attempts = 0
         for attempt in range(MEDIA_STOP_ATTEMPTS):
-            if attempt:
-                sleep(MEDIA_STOP_RETRY_S)
+            pause = MEDIA_STOP_RETRY_S if attempt else 0.0
+            if deadline - clock() < pause + 3 * ADB_TIMEOUT_S:
+                why = f"restore budget exhausted; last: {why}"
+                break
+            if pause:
+                sleep(pause)
+            attempts = attempt + 1
             stop = command_failure(self.adb("shell", "am", "force-stop", self.media_package))
             if stop is not None:
                 why = f"force-stop {stop}"
@@ -310,7 +329,7 @@ class MovingMap:
                 return None  # pidof found no process: the player is gone
             why = (f"still running (pid {output})" if check.returncode == 0 and output
                    else f"pidof: {command_failure(check) or 'unexpected output ' + output[:80]}")
-        return (f"media_stop_unverified: {self.media_package} after {MEDIA_STOP_ATTEMPTS} "
+        return (f"media_stop_unverified: {self.media_package} after {attempts} "
                 f"attempts: {why}"[:300])
 
     def keep_media_playing(self, now_ns: int, last_audio_ns: int | None, since_ns: int,

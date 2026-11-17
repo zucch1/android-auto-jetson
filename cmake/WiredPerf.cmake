@@ -56,6 +56,8 @@ if(NOT CMAKE_CROSSCOMPILING)
             "${CMAKE_SOURCE_DIR}/tests/perf/test_${suite}.py")
         set_tests_properties(wired_perf_${suite} PROPERTIES TIMEOUT 180)
     endforeach()
+    # Its slow-adb regressions run the production stop budgets (~110 s).
+    set_tests_properties(wired_perf_remote_stop PROPERTIES TIMEOUT 300)
     # #137 moving-map drive smoke: analyzer, pass/fail logic and the soak gate.
     add_test(NAME wired_drive_smoke COMMAND "${Python3_EXECUTABLE}" -B
         -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/wired_qa" -v)

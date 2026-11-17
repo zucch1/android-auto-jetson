@@ -51,11 +51,10 @@ STAGES = (1800, 7200)  # the 60 s stage is retired (#137)
 WATCH_PERIOD_S = 5
 # On a stop, the stage's process group gets TERM, then KILL after this grace,
 # which the whole group gets, whether or not its leader has already exited. The
-# launcher's TERM handler stops the collector on the target over its own ssh
-# (aa_remote_stop.sh: up to AA_REMOTE_STOP_ACK_S = 30 s for the collector's
-# acknowledgement, then its fallback; that ssh is bounded at 75 s), so the
-# grace covers that with margin.
-STOP_GRACE_S = 120.0
+# launcher's TERM handler stops the collector on the target over its own ssh,
+# bounded at aa_remote_stop.sh --worst-case 30 15 (117 s) plus its 15 s
+# connect margin: 132 s. The grace covers that with margin (a test checks it).
+STOP_GRACE_S = 180.0
 KILL_WAIT_S = 10.0
 GROUP_POLL_S = 0.1
 LAUNCHER = Path(__file__).resolve().parent / "aa-projection-perf.sh"

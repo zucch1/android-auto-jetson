@@ -351,7 +351,10 @@ the soak.
 2. The media package (from `--media-component`) is force-stopped, and
    `pidof` must then show no process. A failed command or a player that is
    still running is retried, up to `MEDIA_STOP_ATTEMPTS` (3) times, 1 s
-   apart.
+   apart. The whole restore stays within `RESTORE_BUDGET_S` (90 s): an
+   attempt starts only while it (two adb commands of `ADB_TIMEOUT_S` = 20 s)
+   and the USB switch still fit. Otherwise the restore goes straight to the
+   USB switch and records the media stop as not done.
 3. Only then is the USB mode reset (`svc usb setFunctions mtp`). That switch
    re-enumerates USB and breaks adb for a moment, so a command sent right
    after it is lost.
@@ -566,7 +569,7 @@ killing the stage would lose that named result.
 
 The chain handles SIGTERM/SIGINT with a stop flag, as the drive smoke does.
 Each stage runs in its own local process group: the launcher and its local
-helpers. On a stop, the group gets TERM. The grace, `STOP_GRACE_S` (120 s),
+helpers. On a stop, the group gets TERM. The grace, `STOP_GRACE_S` (180 s),
 applies to the whole group: the chain polls the group until it is empty, even
 after the launcher itself has exited, and KILLs only what is left when the
 grace expires. The interrupted stage and every later one get a not-run marker,
@@ -604,7 +607,7 @@ the stop explicit:
      start time. A reused PID is never signalled.
    - It waits until every killed group is empty, then restores the phone
      itself in the same order: force-stop the media player and verify it with
-     `pidof` (3 attempts), then `svc usb setFunctions mtp`. It prints
+     `pidof` (up to 3 attempts), then `svc usb setFunctions mtp`. It prints
      `remote-stop: forced`. Nothing the collector started can send an intent
      after that restore.
    - If a process survives the KILL, or a restore step fails or cannot be
@@ -642,7 +645,30 @@ target is unconfirmed is BLOCKED `remote_cleanup_unconfirmed`. A finished
 run's own cleanup failures are in its capture, and the reporter blocks them
 by name.
 
-The stop's ssh is bounded at 75 s, inside the chain's 120 s grace. An explicit
+**The stop is bounded, and its bound is derived.** Every wait and retry in
+`aa_remote_stop.sh` comes out of named budgets:
+
+- the run file's appearance (15 s on a signal, 0 after an exit) and the
+  acknowledgement (`AA_REMOTE_STOP_ACK_S`, 30 s);
+- `GROUP_WAIT_S` (10 s) for all the KILLed groups together;
+- `RESTORE_BUDGET_S` (60 s) for the media stop and the USB restore, with
+  `ADB_COMMAND_S` (15 s) per adb command;
+- `REPORT_RESERVE_S` (2 s).
+
+The worst case is the sum of those, 117 s on a signal. The script prints it
+with `--worst-case ACK APPEAR`, run locally. The launcher bounds the stop's
+ssh at that plus `REMOTE_STOP_SSH_MARGIN_S` (15 s: the 10 s connect timeout
+plus 5 s), so its limit is strictly larger. The chain's 180 s grace covers the
+132 s.
+
+A media-stop attempt starts only while it and the USB restore fit in what is
+left of `RESTORE_BUDGET_S`. Otherwise the script goes straight to the USB
+restore and reports the media stop as not done (`media_stop_unverified: ...
+restore budget exhausted`, which is `cleanup:media_not_stopped`). So even
+with every adb call stalling to its bound, USB is restored and the outcome
+reported inside the limit.
+
+An explicit
 stop with an acknowledgement is used rather than tying the collector to the
 ssh session (SIGHUP or stdin EOF): the collector reads its own source from
 stdin, a non-PTY session sends no SIGHUP, and a dropped link would look the

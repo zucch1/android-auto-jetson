@@ -20,6 +20,8 @@
 #   FAKE_ADB_SLOW=FILE        a media launch (fixture.opus) writes its PID to
 #                             FILE and stays in flight for 4 s before landing
 #   FAKE_ADB_DEVICE_LINE      the `devices -l` line (default FAKESERIAL on 9-9)
+#   FAKE_ADB_STALL_FILE=FILE  while FILE exists, every command is logged and
+#                             then hangs (until the caller's timeout kills it)
 set -u
 log="${FAKE_ADB_LOG:?}"
 state="${FAKE_PHONE_STATE:-${log}.phone}"
@@ -29,6 +31,9 @@ case "$args" in *fixture.opus*)
     if [ -n "${FAKE_ADB_SLOW:-}" ]; then echo "$$" > "$FAKE_ADB_SLOW"; sleep 4; fi ;;
 esac
 printf '%s\n' "$args" >> "$log"
+if [ -n "${FAKE_ADB_STALL_FILE:-}" ] && [ -e "$FAKE_ADB_STALL_FILE" ]; then
+    exec sleep 600
+fi
 
 now_ms=$(( $(date +%s%N) / 1000000 ))
 if [ -f "$state/reenumerating" ] && [ "$now_ms" -lt "$(cat "$state/reenumerating")" ]; then

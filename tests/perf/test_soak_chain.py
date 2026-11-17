@@ -259,6 +259,20 @@ def test_a_stage_whose_player_was_not_stopped_blocks_the_chain() -> None:
         assert code == 0 and len(calls(root)) == 2, output
 
 
+def test_the_stop_grace_covers_the_launchers_remote_stop() -> None:
+    # The launcher's stop on a signal is bounded at the stop script's worst case
+    # (appearance 15 s, acknowledgement 30 s) plus its ssh margin; the chain
+    # must not KILL the stage before that bound can expire.
+    import re
+    import subprocess
+    worst = int(subprocess.run(["bash", str(ROOT / "tools/perf/aa_remote_stop.sh"), "--worst-case",
+                                "30", "15"], capture_output=True, text=True, check=True).stdout)
+    launcher = (ROOT / "tools/perf/aa-projection-perf.sh").read_text()
+    margin = int(re.search(r"^REMOTE_STOP_SSH_MARGIN_S=(\d+)$", launcher, re.M).group(1))
+    assert re.search(r'^REMOTE_STOP_ACK_S="\$\{AA_REMOTE_STOP_ACK_S:-30\}"$', launcher, re.M)
+    assert chain.STOP_GRACE_S > worst + margin, (chain.STOP_GRACE_S, worst, margin)
+
+
 def test_every_chain_gets_a_new_directory() -> None:
     with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
         root = Path(directory)

@@ -40,8 +40,29 @@
 # failed: ..." naming each problem (survivors of the KILL, a restore step the
 # collector or this script could not do or verify, a missing cleanup report)
 # and exits 1; the phone restore is still attempted.
+#
+# Bounded (#137). Every wait and retry comes out of the budgets below, so the
+# script's run time never exceeds
+#     APPEAR_SECONDS + ACK_SECONDS + GROUP_WAIT_S + RESTORE_BUDGET_S + REPORT_RESERVE_S
+# which `aa_remote_stop.sh --worst-case ACK_SECONDS APPEAR_SECONDS` prints
+# (run locally, no target): the launcher's bound on this ssh call is that plus
+# its connect margin, strictly larger. Inside RESTORE_BUDGET_S a media-stop
+# attempt starts only if it and the USB restore still fit; otherwise the
+# script goes straight to the USB restore and records the media stop as not
+# done (cleanup:media_not_stopped). The USB restore and this report always fit.
 set -u
 set -f  # no globbing of /proc fields (the scan's own glob is under set +f below)
+
+ADB_COMMAND_S=15      # bound of every adb command
+GROUP_WAIT_S=10       # all the waits for KILLed groups (and the collector) together
+RESTORE_BUDGET_S=60   # media stop (attempts of force-stop + pidof) and the USB restore
+MEDIA_RETRY_S=1       # pause before a further media-stop attempt
+REPORT_RESERVE_S=2    # removing the run file and printing the outcome
+
+if [[ "${1:-}" == --worst-case ]]; then
+    echo $(( ${3:-15} + ${2:-30} + GROUP_WAIT_S + RESTORE_BUDGET_S + REPORT_RESERVE_S ))
+    exit 0
+fi
 
 run_file="${1:?usage: aa_remote_stop.sh RUN_FILE [ACK_SECONDS] [APPEAR_SECONDS]}"
 ack_seconds="${2:-30}"
@@ -96,15 +117,19 @@ kill_group() {
 collector_gone() { ! same_process "$collector_pid" "$collector_start"; }
 group_empty() { PGID_Q="$1" SID_Q="$2"; [[ -z "$(group_members)" ]]; }
 field() { awk -v key="$1" -v n="$2" '$1 == key { print $n; exit }' "$run_file" 2>/dev/null; }
-wait_until() {  # wait_until SECONDS COMMAND...: poll every 0.1 s
-    local ticks=$(( $1 * 10 ))
+now_us() { local t="$EPOCHREALTIME"; echo "${t/./}"; }
+# wait_until SECONDS COMMAND...: poll every 0.1 s until COMMAND succeeds or the
+# deadline (wall clock, so slow polls cannot stretch it) passes.
+wait_until() {
+    local deadline=$(( $(now_us) + $1 * 1000000 ))
     shift
-    while ((ticks-- > 0)); do
+    while (( $(now_us) < deadline )); do
         "$@" && return 0
         sleep 0.1
     done
     "$@"
 }
+seconds_left() { local left=$(( ($1 - $(now_us)) / 1000000 )); echo $(( left > 0 ? left : 0 )); }
 gone() { [[ ! -e "$run_file" ]]; }
 present() { [[ -e "$run_file" ]]; }
 
@@ -161,32 +186,45 @@ for role in receiver display; do
     pid="$(field "$role" 2)"
     kill_group "$pid" "$pid" "$(field "$role" 3)"
 done
-# Nothing of those groups may outlive the restore: wait until each is empty.
+# Nothing of those groups may outlive the restore: wait until each is empty,
+# all of it within one GROUP_WAIT_S deadline.
 survivors=()
+group_deadline=$(( $(now_us) + GROUP_WAIT_S * 1000000 ))
 for group in "${killed_groups[@]}"; do
-    if ! wait_until 5 group_empty "${group%%:*}" "${group##*:}"; then
+    if ! wait_until "$(seconds_left "$group_deadline")" group_empty "${group%%:*}" "${group##*:}"; then
         PGID_Q="${group%%:*}" SID_Q="${group##*:}"
         mapfile -t left < <(group_members)
         survivors+=("${left[@]}")
     fi
 done
 if same_process "$collector_pid" "$collector_start" \
-        && ! wait_until 5 collector_gone && [[ " ${survivors[*]} " != *" $collector_pid "* ]]; then
+        && ! wait_until "$(seconds_left "$group_deadline")" collector_gone \
+        && [[ " ${survivors[*]} " != *" $collector_pid "* ]]; then
     survivors+=("$collector_pid")
 fi
-# The restore: media first, verified; the USB function change last.
+# The restore, within RESTORE_BUDGET_S: media first, verified; the USB function
+# change last. A media-stop attempt (and its pause) starts only while it and the
+# USB restore still fit; the USB restore always has its ADB_COMMAND_S.
 problems=()
 ((${#survivors[@]})) && problems+=("survivors ${survivors[*]}")
+restore_deadline=$(( $(now_us) + RESTORE_BUDGET_S * 1000000 ))
+fits() { (( $(seconds_left "$restore_deadline") >= $1 )); }
 if [[ -n "$serial" ]]; then
     if [[ -n "$package" ]]; then
-        media_stopped=0 why="not attempted"
+        media_stopped=0 attempts=0 why="restore budget exhausted before an attempt"
         for attempt in 1 2 3; do
-            ((attempt > 1)) && sleep 1
-            if ! timeout 15 adb -s "$serial" shell am force-stop "$package" >/dev/null 2>&1; then
+            pause=$(( attempt > 1 ? MEDIA_RETRY_S : 0 ))
+            if ! fits $(( pause + 3 * ADB_COMMAND_S )); then
+                why="restore budget exhausted; last: ${why}"
+                break
+            fi
+            ((pause)) && sleep "$pause"
+            attempts=$attempt
+            if ! timeout "$ADB_COMMAND_S" adb -s "$serial" shell am force-stop "$package" >/dev/null 2>&1; then
                 why="force-stop failed"
                 continue
             fi
-            pids="$(timeout 15 adb -s "$serial" shell pidof "$package" 2>&1)"
+            pids="$(timeout "$ADB_COMMAND_S" adb -s "$serial" shell pidof "$package" 2>&1)"
             rc=$?
             if ((rc == 1)) && [[ -z "$pids" ]]; then
                 media_stopped=1
@@ -194,11 +232,11 @@ if [[ -n "$serial" ]]; then
             fi
             why="still running or unverified (pidof rc ${rc}: ${pids:0:80})"
         done
-        ((media_stopped)) || problems+=("media_stop_unverified: ${package} after 3 attempts: ${why}")
+        ((media_stopped)) || problems+=("media_stop_unverified: ${package} after ${attempts} attempts: ${why}")
     else
         problems+=("media_stop_unavailable: no media package recorded")
     fi
-    timeout 15 adb -s "$serial" shell svc usb setFunctions mtp >/dev/null 2>&1 \
+    timeout "$ADB_COMMAND_S" adb -s "$serial" shell svc usb setFunctions mtp >/dev/null 2>&1 \
         || problems+=("usb_reset_failed")
 fi
 rm -f -- "$run_file" "$cleanup_report"

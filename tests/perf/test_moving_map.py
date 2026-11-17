@@ -160,6 +160,31 @@ def test_restore_records_a_media_stop_it_cannot_verify() -> None:
     assert work.restore_phone() == ["usb_reset_failed: exit 1"], work.cleanup_failures
 
 
+def test_restore_stays_within_its_budget_when_every_adb_call_stalls() -> None:
+    # Given adb calls that each run to their ADB_TIMEOUT_S bound (simulated clock).
+    now = [0.0]
+    calls = []
+
+    def stalled(*args: str) -> subprocess.CompletedProcess:
+        calls.append(" ".join(args))
+        now[0] += mm.ADB_TIMEOUT_S
+        return subprocess.CompletedProcess(args, 1, "", "timed out")
+
+    work = workload(stalled)
+    failures = work.restore_phone(sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                                  clock=lambda: now[0])
+    # Then a media-stop attempt runs only while it and the USB switch fit, the
+    # USB switch still comes last, and the whole restore fits RESTORE_BUDGET_S.
+    assert calls[-1] == "shell svc usb setFunctions mtp", calls
+    assert now[0] <= mm.RESTORE_BUDGET_S, (now[0], calls)
+    assert failures[0].startswith("media_stop_unverified: org.example.player after 2 attempts: "
+                                  "restore budget exhausted"), failures
+    assert failures[1].startswith("usb_reset_failed"), failures
+    import aa_perf_report as reporter
+    assert reporter.cleanup_gaps({"kind": "moving-map", "cleanup_failures": failures}) == [
+        "cleanup:media_not_stopped", "cleanup:usb_not_restored"]
+
+
 def test_media_relaunch_after_silence_only() -> None:
     adb = Adb()
     work = workload(adb)

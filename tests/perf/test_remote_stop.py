@@ -99,6 +99,8 @@ if mode == "adb-stall":
     mark("started")
     time.sleep(1)
     mark("cleanup_began")
+    if os.environ.get("FAKE_ADB_STALL_FILE"):  # from now on every adb call hangs
+        open(os.environ["FAKE_ADB_STALL_FILE"], "w").close()
     child = subprocess.Popen(["sleep", "300"])  # the stalled adb command, in our group
     open(os.path.join(marks, "adb_child"), "w").write(str(child.pid))
     child.wait()
@@ -220,9 +222,10 @@ def test_a_hung_remote_collector_is_killed_and_the_phone_restored_anyway() -> No
     assert seen["outcome"] == "terminated" and seen["rc"] == 143, seen
 
 
-def short_budget_launcher(root: Path) -> Path:
+def short_budget_launcher(root: Path, stop_budgets: bool = False) -> Path:
     """A copy of the launcher (and the tools it runs) whose three collector
-    budgets are seconds, not minutes: only those lines differ."""
+    budgets are seconds, not minutes: only those lines differ. With
+    ``stop_budgets`` the remote stop's budgets are shortened the same way."""
     tools = root / "tools"
     shutil.copytree(ROOT / "tools/perf", tools / "perf", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(ROOT / "tools/wired-qa", tools / "wired-qa", ignore=shutil.ignore_patterns("__pycache__"))
@@ -234,17 +237,31 @@ def short_budget_launcher(root: Path) -> Path:
         assert text.count(line + "\n") == 1, line
         text = text.replace(line + "\n", short + "\n")
     launcher.write_text(text)
+    if stop_budgets:
+        stop = tools / "perf/aa_remote_stop.sh"
+        text = stop.read_text()
+        for line, short in (("ADB_COMMAND_S=15 ", "ADB_COMMAND_S=2 "), ("GROUP_WAIT_S=10 ", "GROUP_WAIT_S=2 "),
+                            ("RESTORE_BUDGET_S=60 ", "RESTORE_BUDGET_S=8 ")):
+            assert text.count(line) == 1, line
+            text = text.replace(line, short)
+        stop.write_text(text)
     return launcher
 
 
-def run_launcher_past_its_budget(mode: str, **extra_env: str) -> dict:
+def run_launcher_past_its_budget(mode: str, stop_budgets: bool = False, **extra_env: str) -> dict:
     """Run a 1 s stage whose remote collector outlives the (shortened) ssh bound."""
     with tempfile.TemporaryDirectory(prefix="remote-stop-timeout-") as directory:
         root = Path(directory)
         bin_dir = stubs(root)
         marks = root / "marks"
         marks.mkdir()
-        launcher_path = short_budget_launcher(root)
+        launcher_path = short_budget_launcher(root, stop_budgets)
+        if "FAKE_ADB_STALL_FILE" in extra_env:
+            extra_env = {**extra_env, "FAKE_ADB_STALL_FILE": str(root / extra_env["FAKE_ADB_STALL_FILE"])}
+        stop_limit = int(subprocess.run(
+            ["bash", str(launcher_path.parent / "aa_remote_stop.sh"), "--worst-case",
+             extra_env.get("AA_REMOTE_STOP_ACK_S", "2"), "0"],
+            capture_output=True, text=True, check=True).stdout) + 15
         smoke_record = root / "smoke.json"
         smoke_record.write_text(json.dumps({
             "schema": smoke.SCHEMA, "verdict": "PASS", "duration_s": 600, "video_profiles": None,
@@ -267,6 +284,7 @@ def run_launcher_past_its_budget(mode: str, **extra_env: str) -> dict:
         remote_pid = int((marks / "started").read_text()) if (marks / "started").exists() else None
         adb_child = int((marks / "adb_child").read_text()) if (marks / "adb_child").exists() else None
         seen = {"rc": run.returncode, "output": run.stdout + run.stderr, "elapsed": elapsed,
+                "stop_limit": stop_limit,
                 "remote_alive": remote_pid is not None and alive(remote_pid),
                 "adb_child_alive": adb_child is not None and alive(adb_child),
                 "marks": sorted(path.name for path in marks.iterdir()),
@@ -319,8 +337,10 @@ def test_an_acknowledged_stop_relays_the_collectors_cleanup_failures() -> None:
     assert "cleanup_not_reported" in seen["output"], seen["output"]
 
 
-def forced_restore(**knobs: str) -> tuple[subprocess.CompletedProcess, list[str], bool]:
-    """The fallback restore alone: the recorded collector is already gone."""
+def forced_restore(stall: bool = False, **knobs: str) -> tuple[subprocess.CompletedProcess, list[str], bool]:
+    """The fallback restore alone: the recorded collector is already gone.
+
+    With ``stall`` every adb call of the stop hangs until its own timeout."""
     with tempfile.TemporaryDirectory(prefix="remote-stop-restore-") as directory:
         root = Path(directory)
         bin_dir = root / "bin"
@@ -334,10 +354,50 @@ def forced_restore(**knobs: str) -> tuple[subprocess.CompletedProcess, list[str]
                         "-n", "org.example.player/.Play"], env=env, check=True)
         run_file = root / "run"
         run_file.write_text(f"collector 999999999 1\nphone {PHONE}\nmedia_package org.example.player\n")
-        stop = subprocess.run(["bash", str(STOP), str(run_file), "1", "1"], capture_output=True,
-                              text=True, timeout=120, env=env)
+        if stall:
+            (root / "stall").touch()
+            env["FAKE_ADB_STALL_FILE"] = str(root / "stall")
+        # Under the launcher's own bound for this call (its worst case + 15 s).
+        limit = int(subprocess.run(["bash", str(STOP), "--worst-case", "1", "1"], capture_output=True,
+                                   text=True, check=True).stdout) + 15
+        started = time.monotonic()
+        stop = subprocess.run(["timeout", str(limit), "bash", str(STOP), str(run_file), "1", "1"],
+                              capture_output=True, text=True, timeout=limit + 30, env=env)
+        stop.elapsed, stop.limit = time.monotonic() - started, limit
         running = (root / "adb.log.phone" / "running.org.example.player").exists()
         return stop, log.read_text().splitlines()[1:], running
+
+
+def test_every_adb_call_stalling_still_restores_usb_and_reports_within_the_limit() -> None:
+    # Sol's reproduction: every adb call hangs until its own timeout. With the
+    # production budgets, the stop still issues the USB restore last and
+    # reports, inside its own worst case (so strictly inside the launcher's).
+    stop, adb, running = forced_restore(stall=True)
+    worst = stop.limit - 15
+    assert stop.returncode == 1, (stop.returncode, stop.stdout, stop.stderr, stop.elapsed)
+    assert stop.elapsed < worst, (stop.elapsed, worst)
+    assert adb[-1] == f"-s {PHONE} shell svc usb setFunctions mtp", adb
+    assert stop.stdout.startswith("remote-stop: failed: forced: media_stop_unverified: "
+                                  "org.example.player after 1 attempts: restore budget exhausted"), stop.stdout
+    assert "usb_reset_failed" in stop.stdout, stop.stdout  # (the stalled switch itself timed out)
+    assert running
+
+
+def test_the_launcher_bounds_its_stop_above_the_scripts_worst_case() -> None:
+    # Given a collector past its ssh bound whose cleanup adb stalls, and a fake
+    # phone on which every later adb call stalls too (shortened stop budgets).
+    seen = run_launcher_past_its_budget("adb-stall", stop_budgets=True, FAKE_ADB_STALL_FILE="stall")
+    # Then the stop still restored USB and reported, before the launcher's bound.
+    assert "restore budget exhausted" in seen["output"], seen["output"]
+    assert seen["adb"][-1] == f"-s {PHONE} shell svc usb setFunctions mtp", seen["adb"]
+    assert "no answer" not in seen["output"], seen["output"]
+    assert seen["result"]["blocked_on"] == "collector_timeout,remote_cleanup_unconfirmed", seen["result"]
+    assert seen["elapsed"] < 5 + seen["stop_limit"] + 10, seen
+    assert not seen["remote_alive"] and not seen["adb_child_alive"], seen
+    # The production launcher's bound is the production script's worst case + 15 s.
+    launcher = LAUNCHER.read_text()
+    assert "REMOTE_STOP_SSH_MARGIN_S=15\n" in launcher
+    assert 'timeout $((worst + REMOTE_STOP_SSH_MARGIN_S)) ssh' in launcher
 
 
 def test_the_fallback_stops_and_verifies_media_before_the_usb_switch() -> None:
