@@ -29,6 +29,10 @@ same builds itself (``run_status.concurrent_builds``) and the reporter BLOCKS
 the stage with ``interference:concurrent_build``; killing it would lose that
 named result and its evidence. Exit: the first non-PASS stage's launcher code
 (3 for a disqualified one), else 0; 128+signal when stopped; 2 on usage errors.
+
+A stop TERMs the stage's process group and gives the whole group
+STOP_GRACE_S, even after the launcher itself exits; the launcher stops the
+collector on the target over its own ssh (tools/perf/aa_remote_stop.sh).
 """
 from __future__ import annotations
 
@@ -45,11 +49,15 @@ from aa_projection_collect import ancestors, build_processes
 
 STAGES = (1800, 7200)  # the 60 s stage is retired (#137)
 WATCH_PERIOD_S = 5
-# On a stop, the stage's process group gets TERM, then KILL after this grace:
-# long enough for the collector (TERM -> exit 3) to stop its receiver/display
-# and restore the phone before anything is killed.
-STOP_GRACE_S = 60.0
+# On a stop, the stage's process group gets TERM, then KILL after this grace,
+# which the whole group gets, whether or not its leader has already exited. The
+# launcher's TERM handler stops the collector on the target over its own ssh
+# (aa_remote_stop.sh: up to AA_REMOTE_STOP_ACK_S = 30 s for the collector's
+# acknowledgement, then its fallback; that ssh is bounded at 75 s), so the
+# grace covers that with margin.
+STOP_GRACE_S = 120.0
 KILL_WAIT_S = 10.0
+GROUP_POLL_S = 0.1
 LAUNCHER = Path(__file__).resolve().parent / "aa-projection-perf.sh"
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
@@ -82,23 +90,47 @@ class StopFlag:
         return False
 
 
+def group_alive(pgid: int) -> bool:
+    """Whether any process is left in the group (a zombie leader counts until reaped)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_group(process: subprocess.Popen, seconds: float) -> bool:
+    """Reap the leader and wait until the whole group is empty; False on timeout."""
+    deadline = time.monotonic() + seconds
+    while True:
+        process.poll()  # reap the leader as soon as it exits
+        if not group_alive(process.pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(GROUP_POLL_S)
+
+
 def stop_group(process: subprocess.Popen) -> str:
-    """TERM the stage's whole process group, KILL it after STOP_GRACE_S; reap."""
-    for sig, wait in ((signal.SIGTERM, STOP_GRACE_S), (signal.SIGKILL, KILL_WAIT_S)):
-        try:
-            os.killpg(process.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            process.wait(timeout=wait)
-        except subprocess.TimeoutExpired:
-            continue
-        try:  # the leader exited: take whatever it left in its group too
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        return "terminated" if sig == signal.SIGTERM else "killed"
-    return "unreaped"
+    """TERM the stage's whole process group; KILL only what is left after STOP_GRACE_S.
+
+    The grace is for the group: a leader that exits at once does not cut short
+    a descendant that is still cleaning up. Returns "terminated" (the group
+    emptied within the grace), "killed" (KILL was needed) or "unreaped".
+    """
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if _wait_group(process, STOP_GRACE_S):
+        return "terminated"
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    return "killed" if _wait_group(process, KILL_WAIT_S) else "unreaped"
 
 
 def builds() -> list[str]:

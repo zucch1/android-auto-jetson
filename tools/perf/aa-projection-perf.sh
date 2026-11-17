@@ -509,14 +509,52 @@ print("exec(compile(" + repr(collector) + ", 'aa_projection_collect.py', 'exec')
 PY
 collector_timeout=$((duration_secs + 120))
 blocked_type=""
-if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port '${PORT}' \
+# A stop (TERM/INT, e.g. from tools/perf/aa_soak_chain.py) must reach the
+# collector on the target: ending this side's ssh client does not signal a
+# non-PTY remote command. The collector records its run in RUN_FILE on the
+# target; on a stop, a separate ssh runs aa_remote_stop.sh, which TERMs it and
+# waits for its acknowledgement (the run file removed after cleanup and phone
+# restore), else KILLs the recorded processes and restores the phone itself.
+run_id="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+RUN_FILE="/tmp/aa-perf-run-${run_id}"
+REMOTE_STOP_ACK_S="${AA_REMOTE_STOP_ACK_S:-30}"
+stop_signal=""
+trap 'stop_signal=TERM' TERM
+trap 'stop_signal=INT' INT
+timeout "$collector_timeout" ssh "${SSH_OPTS[@]}" "$HOST" "${REMOTE_ENV} python3 - --receiver '${RECEIVER}' --port '${PORT}' \
         --duration-seconds ${duration_secs} --interval ${INTERVAL} \
         ${THERMAL_POLICY:+--thermal-policy '${THERMAL_POLICY}'} \
         ${DISPLAY_BIN:+--display '${DISPLAY_BIN}'} ${STORE:+--store '${STORE}'}${build_args_remote} \
         ${verified_serial:+--phone-serial '${verified_serial}'} \
         --workload moving-map --media-uri '${MEDIA_URI}' ${MEDIA_TYPE:+--media-type '${MEDIA_TYPE}'} \
-        ${MEDIA_COMPONENT:+--media-component '${MEDIA_COMPONENT}'} ${GEO_URI:+--geo-uri '${GEO_URI}'}" \
-        <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err"; then
+        ${MEDIA_COMPONENT:+--media-component '${MEDIA_COMPONENT}'} ${GEO_URI:+--geo-uri '${GEO_URI}'} \
+        --run-file '${RUN_FILE}'" \
+        <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err" &
+collector_job=$!
+collector_rc=0
+while :; do
+    set +e
+    wait "$collector_job"
+    collector_rc=$?
+    set -e
+    [[ -n "$stop_signal" ]] && break
+    kill -0 "$collector_job" 2>/dev/null || break
+done
+if [[ -n "$stop_signal" ]]; then
+    trap '' TERM INT  # the stop itself is not interrupted
+    echo "stopping: ${stop_signal}; stopping the collector on ${HOST}" >&2
+    stop_rc=0
+    timeout $((REMOTE_STOP_ACK_S + 45)) ssh "${SSH_OPTS[@]}" "$HOST" \
+        "bash -s -- '${RUN_FILE}' ${REMOTE_STOP_ACK_S}" <"$TOOL_DIR/aa_remote_stop.sh" >&2 || stop_rc=$?
+    ((stop_rc == 0)) || echo "stopping: the remote stop failed (rc ${stop_rc})" >&2
+    # The remote command has ended (or was killed): drop the local client.
+    kill -TERM "$collector_job" 2>/dev/null || true
+    wait "$collector_job" 2>/dev/null || true
+    [[ "$stop_signal" == INT ]] && exit 130
+    exit 143
+fi
+trap - TERM INT
+if ((collector_rc != 0)); then
     # The on-target collector refuses to start a stage from an unoptimized build
     # or from binaries another build produced; report each as its own BLOCKED
     # reason, never a generic failure.

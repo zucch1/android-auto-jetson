@@ -474,12 +474,45 @@ records the same builds and its result is BLOCKED with the evidence, while
 killing the stage would lose that named result.
 
 The chain handles SIGTERM/SIGINT with a stop flag, as the drive smoke does.
-Each stage runs in its own process group (the launcher, ssh and the collector
-under it). On a stop, the group gets TERM, and KILL after `STOP_GRACE_S`
-(60 s). That is long enough for the collector to stop its receiver and display
-and restore the phone. The interrupted stage and every later one get a
-not-run marker, and the chain exits 128+signal. A stop during the idle gate
-starts no stage:
+Each stage runs in its own local process group: the launcher and its local
+helpers. On a stop, the group gets TERM. The grace, `STOP_GRACE_S` (120 s),
+applies to the whole group: the chain polls the group until it is empty, even
+after the launcher itself has exited, and KILLs only what is left when the
+grace expires. The interrupted stage and every later one get a not-run marker,
+and the chain exits 128+signal. A stop during the idle gate starts no stage.
+
+**The stop reaches the target.** The collector runs on the far side of the
+launcher's ssh session. Ending a non-PTY ssh client does not signal the remote
+command, so the local group alone could leave the collector, receiver, display
+and stimulus running, and the phone unrestored. The launcher therefore makes
+the stop explicit:
+
+1. It starts the collector with `--run-file /tmp/aa-perf-run-<random>`. The
+   collector creates that file exclusively (mode 0600). It records its own
+   PID and those of the receiver and display, each with its `/proc` start
+   time, plus the phone serial and media package.
+2. On TERM/INT, the launcher runs `tools/perf/aa_remote_stop.sh` on the
+   target over a separate ssh call.
+3. The script TERMs the collector, which runs its normal cleanup: stimulus,
+   display, receiver, then the phone restore. Only then does the collector
+   remove the run file. That removal, within `AA_REMOTE_STOP_ACK_S` (30 s), is
+   the acknowledgement (`remote-stop: acknowledged`).
+4. Without an acknowledgement (a hung cleanup, or a collector already gone),
+   the script falls back independently. It KILLs each recorded process that is
+   still the same process (a PID with a different start time is never
+   signalled), taking the receiver and display by process group. It then
+   restores the phone itself (`svc usb setFunctions mtp`, then force-stop the
+   media player) and prints `remote-stop: forced`.
+5. The launcher then drops its own ssh client and exits 143 (130 for INT).
+
+The stop's ssh is bounded at 75 s, inside the chain's 120 s grace. An explicit
+stop with an acknowledgement is used rather than tying the collector to the
+ssh session (SIGHUP or stdin EOF): the collector reads its own source from
+stdin, a non-PTY session sends no SIGHUP, and a dropped link would look the
+same as a stop. The explicit call also confirms the cleanup and has a fallback
+when the cleanup does not finish.
+
+Running the chain:
 
 ```bash
 tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" \

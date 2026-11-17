@@ -148,6 +148,78 @@ def test_build_scan_sees_a_real_build_process_and_skips_its_own_ancestors() -> N
             process.wait()
 
 
+CLEANUP_LEADER = """#!/usr/bin/env bash
+# A descendant in the leader's group that needs CLEANUP_S to clean up on TERM
+# (or ignores TERM entirely); the leader itself exits at once on TERM.
+python3 -c '
+import os, signal, sys, time
+marks, cleanup = sys.argv[1], float(sys.argv[2])
+def on_term(*_):
+    open(os.path.join(marks, "cleanup_began"), "w").close()
+    if cleanup < 0:
+        return
+    time.sleep(cleanup)
+    open(os.path.join(marks, "restored"), "w").close()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, on_term)
+open(os.path.join(marks, "child_ready"), "w").write(str(os.getpid()))
+while True:
+    time.sleep(0.1)
+' "$MARKS" "$CLEANUP_S" &
+trap 'exit 0' TERM
+while :; do sleep 0.1; done
+"""
+
+
+def stop_leader_with_cleaning_child(cleanup_s: float, grace_s: float) -> tuple[str, float, set, bool]:
+    import subprocess
+    import time
+    with tempfile.TemporaryDirectory(prefix="soak-chain-grace-") as directory:
+        root = Path(directory)
+        (root / "leader").write_text(CLEANUP_LEADER)
+        (root / "leader").chmod(0o755)
+        process = subprocess.Popen([str(root / "leader")], start_new_session=True,
+                                   env={**os.environ, "MARKS": str(root), "CLEANUP_S": str(cleanup_s)})
+        try:
+            deadline = time.monotonic() + 20
+            while not (root / "child_ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            child = int((root / "child_ready").read_text())
+            started = time.monotonic()
+            with patch.object(chain, "STOP_GRACE_S", grace_s):
+                outcome = chain.stop_group(process)
+            elapsed = time.monotonic() - started
+            marks = {path.name for path in root.iterdir()}
+            return outcome, elapsed, marks, group_left(process.pid) or os.path.exists(f"/proc/{child}")
+        finally:
+            if group_left(process.pid):
+                os.killpg(process.pid, 9)
+            process.wait()
+
+
+def group_left(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_the_grace_holds_for_descendants_after_the_leader_exits() -> None:
+    # Given a launcher that exits at once on TERM and a child still cleaning up
+    # for 1 s (the review's reproduction, which was KILLed after 0.003 s).
+    outcome, elapsed, marks, left = stop_leader_with_cleaning_child(cleanup_s=1.0, grace_s=10.0)
+    # Then the child finished its cleanup inside the grace; nothing was killed.
+    assert "restored" in marks, (outcome, elapsed, marks)
+    assert outcome == "terminated" and 1.0 <= elapsed < 10.0 and not left, (outcome, elapsed)
+
+
+def test_a_descendant_that_never_finishes_is_killed_when_the_grace_expires() -> None:
+    outcome, elapsed, marks, left = stop_leader_with_cleaning_child(cleanup_s=-1, grace_s=1.5)
+    assert "cleanup_began" in marks and "restored" not in marks, marks
+    assert outcome == "killed" and 1.5 <= elapsed < 10.0 and not left, (outcome, elapsed)
+
+
 def test_every_chain_gets_a_new_directory() -> None:
     with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
         root = Path(directory)

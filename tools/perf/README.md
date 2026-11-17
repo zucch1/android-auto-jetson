@@ -20,6 +20,8 @@ tools/perf/
   aa_av_contract.py                signed A/V contract (shared with the drive smoke)
   aa_moving_map.py                 moving-map workload (shared with the drive smoke)
   aa_soak_chain.py                 the 1800 s + 7200 s soak chain
+  aa_remote_stop.sh                stops a collector run on the target and confirms
+                                   its cleanup (phone restore fallback)
   aa-projection-perf-v3.schema.json current result-document contract (v3)
   aa-projection-perf-v2.schema.json historical v2 results (A/V max <= 50 ms)
   aa-projection-perf.schema.json   historical v1 validation only (build block optional)

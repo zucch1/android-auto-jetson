@@ -34,6 +34,12 @@ time (``workload.drag_t_ns``) for the reporter's continuity check, and the
 build/compiler processes seen on this host during the stage
 (``concurrent_builds``), which disqualify it (#137).
 
+With ``--run-file PATH`` the collector records, for a remote stop
+(tools/perf/aa_remote_stop.sh), its own PID and the receiver's and display's,
+each with its /proc start time, plus the phone serial and media package. It
+removes the file only after its own cleanup, phone restore included, so the
+file's removal is the stop's acknowledgement.
+
 The capture is the raw record; budget verdicts are produced by
 ``aa_perf_report.py``. A metric the collector cannot observe is emitted as
 ``null`` -- never faked. Every subprocess wait is bounded.
@@ -111,6 +117,50 @@ PHONE_SETUP_PREFIX = "error: phone_setup_failed:"
 # stage disqualifies it; the soak chain's quiet gate uses the same list.
 BUILD_NAMES = ("cmake", "ninja", "make", "c++", "g++", "gcc", "cc1plus", "ctest", "nvcc", "ld")
 _BUILD_RECORDS_LIMIT = 256
+
+
+class RunFile:
+    """The remote-stop record (``--run-file``): one ``ROLE VALUE [START]`` line each.
+
+    Created exclusively (0600, never through an existing path); removed by the
+    collector after its cleanup and phone restore, which acknowledges a stop.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        self._handle = os.fdopen(fd, "w", encoding="utf-8")
+
+    def process(self, role: str, pid: int) -> None:
+        self.line(role, str(pid), str(proc_starttime(pid)))
+
+    def line(self, *fields: str) -> None:
+        if any(not field or any(c.isspace() for c in field) for field in fields):
+            return  # nothing a stop could misparse
+        self._handle.write(" ".join(fields) + "\n")
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+
+    def remove(self) -> None:
+        self._handle.close()
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def proc_starttime(pid: int) -> int | None:
+    """A process's start time (clock ticks since boot, /proc/PID/stat field 22)."""
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _record_process(args: argparse.Namespace, role: str, pid: int) -> None:
+    run_file = getattr(args, "run_file_record", None)
+    if run_file is not None:
+        run_file.process(role, pid)
 
 
 class PhoneSetupError(RuntimeError):
@@ -838,6 +888,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         rec_file = open(receiver_log, "w", encoding="utf-8")
         receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
                                     start_new_session=True)
+        _record_process(args, "receiver", receiver.pid)
         if managed_display:
             # Bounded receiver-ready observation: the managed display launches on
             # THIS receiver's "ready" event, never on a fixed sleep. The wait is
@@ -869,6 +920,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                         display_cmd, stdout=disp_file, stderr=subprocess.STDOUT,
                         stdin=subprocess.PIPE if workload is not None else None,
                         start_new_session=True)
+                    _record_process(args, "display", display.pid)
                     if workload is not None and display.stdin is not None:
                         os.set_blocking(display.stdin.fileno(), False)
 
@@ -1065,7 +1117,31 @@ def _cli(argv: list[str]) -> int:
                              "target must not re-read a path it cannot see")
     parser.add_argument("--allow-unoptimized-build", action="store_true",
                         help="debugging override: start even without an optimized build")
+    parser.add_argument("--run-file", default=None,
+                        help="new file recording this run's processes for a remote stop "
+                             "(tools/perf/aa_remote_stop.sh); removed after cleanup")
     args = parser.parse_args(argv)
+    args.run_file_record = None
+    if args.run_file:
+        try:
+            args.run_file_record = RunFile(args.run_file)
+        except OSError as exc:
+            print(f"error: cannot create --run-file: {exc}", file=sys.stderr)
+            return 2
+        args.run_file_record.process("collector", os.getpid())
+        if args.phone_serial:
+            args.run_file_record.line("phone", args.phone_serial)
+        if args.media_component:
+            args.run_file_record.line("media_package", args.media_component.split("/")[0])
+    try:
+        return _run(args)
+    finally:
+        # After collect()'s own cleanup and phone restore: the stop's acknowledgement.
+        if args.run_file_record is not None:
+            args.run_file_record.remove()
+
+
+def _run(args: argparse.Namespace) -> int:
 
     if args.duration_seconds <= 0:
         print("error: --duration-seconds must be positive", file=sys.stderr)
