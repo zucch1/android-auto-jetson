@@ -225,6 +225,8 @@
         "av_window_mean_abs_ms",
         "av_p99_abs_ms",
         "av_max_abs_ms",
+        "av_excursions",
+        "av_hard_cap_pairs",
         "av_coverage_pct"
       ]
     },
@@ -394,7 +396,10 @@
             "window_s",
             "window_mean_abs_ms",
             "p99_abs_ms",
-            "max_abs_ms",
+            "excursion_ms",
+            "excursions_per_s",
+            "excursion_period_s",
+            "hard_cap_ms",
             "coverage_min"
           ],
           "properties": {
@@ -407,8 +412,17 @@
             "p99_abs_ms": {
               "const": 50.0
             },
-            "max_abs_ms": {
+            "excursion_ms": {
               "const": 90.0
+            },
+            "excursions_per_s": {
+              "const": 0.0005555555555555556
+            },
+            "excursion_period_s": {
+              "const": 1800
+            },
+            "hard_cap_ms": {
+              "const": 150.0
             },
             "coverage_min": {
               "const": 0.9
@@ -431,7 +445,8 @@
             "coverage",
             "window_mean",
             "p99_abs",
-            "max_abs"
+            "excursions",
+            "hard_cap"
           ],
           "properties": {
             "coverage": {
@@ -443,7 +458,10 @@
             "p99_abs": {
               "type": "boolean"
             },
-            "max_abs": {
+            "excursions": {
+              "type": "boolean"
+            },
+            "hard_cap": {
               "type": "boolean"
             }
           }
@@ -518,6 +536,42 @@
             "number",
             "null"
           ]
+        },
+        "max_clause": {
+          "const": "soak_rate"
+        },
+        "excursions": {
+          "$ref": "#/$defs/count"
+        },
+        "excursion_allowance": {
+          "$ref": "#/$defs/count"
+        },
+        "over_hard_cap": {
+          "$ref": "#/$defs/count"
+        },
+        "excursion_pairs_truncated": {
+          "type": "boolean"
+        },
+        "excursion_pairs": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "offset_s",
+              "skew_ms"
+            ],
+            "properties": {
+              "offset_s": {
+                "type": "number",
+                "minimum": 0
+              },
+              "skew_ms": {
+                "type": "number"
+              }
+            }
+          }
         }
       }
     },
@@ -607,7 +661,9 @@
         "receiver_cpu_pct_one_core_max",
         "av_window_mean_abs_ms_max",
         "av_p99_abs_ms_max",
-        "av_max_abs_ms_max",
+        "av_excursion_ms",
+        "av_excursions_per_s",
+        "av_hard_cap_ms",
         "av_coverage_pct_min",
         "audio_latency_ms_max",
         "rss_growth_pct_max",
@@ -639,11 +695,17 @@
         "av_p99_abs_ms_max": {
           "const": 50.0
         },
-        "av_max_abs_ms_max": {
-          "const": 90.0
-        },
         "av_coverage_pct_min": {
           "const": 90.0
+        },
+        "av_excursion_ms": {
+          "const": 90.0
+        },
+        "av_excursions_per_s": {
+          "const": 0.0005555555555555556
+        },
+        "av_hard_cap_ms": {
+          "const": 150.0
         }
       }
     },

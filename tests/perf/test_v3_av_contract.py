@@ -103,8 +103,10 @@ def test_each_clause_fails_alone() -> None:
                                   lambda at: -45.0 if 600 <= at < 605.5 else 12.0],
         # Every 40th frame 60 ms late: p99 over 50 ms, means near 13 ms.
         "av_p99_abs_ms": [lambda at: 60.0 if round(at * NS / FRAME_NS) % 40 == 0 else 12.0],
-        # One frame at 95 ms: over the 90 ms cap.
-        "av_max_abs_ms": [lambda at: 95.0 if 900.0 <= at < 900.04 else 12.0],
+        # Two frames at 95 ms in 1800 s: over the allowance of one excursion.
+        "av_excursions": [spikes(95.0, 27_000, 40_000), spikes(-95.0, 27_000, 40_000)],
+        # One frame at 150.1 ms: a single excursion is allowed, the hard cap is not.
+        "av_hard_cap_pairs": [spikes(150.1, 27_000), spikes(-150.1, 27_000)],
     }
     for metric, functions in cases.items():
         for function in functions:
@@ -116,7 +118,53 @@ def test_each_clause_fails_alone() -> None:
     assert result(v3(1800, audio=(144.0, None)))["verdict"] == "PASS"
     # In-bound controls: 39 ms sustained and an 85 ms single frame pass.
     assert result(v3(1800, skew_ms=lambda at: 39.0 if 600 <= at < 620 else 12.0))["verdict"] == "PASS"
-    assert result(v3(1800, skew_ms=lambda at: 85.0 if 900.0 <= at < 900.04 else 12.0))["verdict"] == "PASS"
+    assert result(v3(1800, skew_ms=spikes(85.0, 27_000)))["verdict"] == "PASS"
+
+
+def spikes(ms: float, *frames: int):
+    """skew_ms(at): ``ms`` on the given frame indices (30 fps), 12 ms elsewhere."""
+    hit = set(frames)
+    return lambda at: ms if round(at * NS / FRAME_NS) in hit else 12.0
+
+
+def test_soak_max_is_a_rate_of_excursions_with_a_hard_cap() -> None:
+    # Owner decision 2026-11-17: at most floor(active s / 1800) pairs over 90 ms,
+    # none over 150 ms; max |skew| is informational.
+    cases = [  # (seconds, skew, verdict, excursions, allowance)
+        (1800, lambda at: 12.0, "PASS", 0, 1),
+        (1800, spikes(95.0, 11_577), "PASS", 1, 1),
+        (1800, spikes(95.0, 11_577, 30_000), "FAIL", 2, 1),
+        # Consecutive pairs of one spike count separately.
+        (1800, spikes(95.0, 11_577, 11_578), "FAIL", 2, 1),
+        (7200, spikes(95.0, 10_000, 50_000, 100_000, 200_000), "PASS", 4, 4),
+        (7200, spikes(-95.0, 10_000, 50_000, 100_000, 150_000, 200_000), "FAIL", 5, 4),
+        (1800, spikes(150.1, 11_577), "FAIL", 1, 1),
+        (1800, spikes(150.0, 11_577), "PASS", 1, 1),  # the cap itself is allowed
+    ]
+    for seconds, skew, verdict, excursions, allowance in cases:
+        doc = result(v3(seconds, skew_ms=skew))
+        contract = doc["av_contract"]
+        label = (seconds, verdict, excursions)
+        assert doc["verdict"] == verdict, (label, doc["violations"], doc["blocked_on"])
+        assert not schema.validate(doc, schema.load_schema(schema.SCHEMA_V3)), label
+        assert contract["max_clause"] == "soak_rate" and "max_abs" not in contract["clauses"], label
+        assert (contract["excursions"], contract["excursion_allowance"]) == (excursions, allowance), label
+        assert doc["metrics"]["av_excursions"]["value"] == excursions, label
+        assert doc["metrics"]["av_excursions"]["budget_max"] == allowance, label
+        assert doc["metrics"]["av_max_abs_ms"]["gated"] is False, label  # informational
+        assert len(contract["excursion_pairs"]) == excursions, label
+        if verdict == "FAIL":
+            assert violations(doc) <= {"av_excursions", "av_hard_cap_pairs"}, (label, doc["violations"])
+    # Every excursion is reported with its offset into the window and its value.
+    doc = result(v3(1800, skew_ms=spikes(95.0, 11_577)))
+    [pair] = doc["av_contract"]["excursion_pairs"]
+    assert abs(pair["offset_s"] - 11_577 * FRAME_NS / NS) < 1e-9 and pair["skew_ms"] == 95.0, pair
+    assert doc["metrics"]["av_max_abs_ms"]["value"] == 95.0
+    # The 150.1 ms pair fails the hard cap alone (one excursion is allowed).
+    doc = result(v3(1800, skew_ms=spikes(150.1, 11_577)))
+    assert violations(doc) == {"av_hard_cap_pairs"}, doc["violations"]
+    assert doc["av_contract"]["clauses"] == {"coverage": True, "window_mean": True, "p99_abs": True,
+                                             "excursions": True, "hard_cap": False}
 
 
 def test_invalid_av_telemetry_still_blocks() -> None:
@@ -284,8 +332,8 @@ def test_v2_history_keeps_its_contract() -> None:
 def test_schema_pins_the_v3_budgets_and_validate_auto() -> None:
     doc = result(v3(60))
     loaded = schema.load_schema(schema.SCHEMA_V3)
-    for name in ("av_window_mean_abs_ms_max", "av_p99_abs_ms_max", "av_max_abs_ms_max",
-                 "av_coverage_pct_min"):
+    for name in ("av_window_mean_abs_ms_max", "av_p99_abs_ms_max", "av_excursion_ms",
+                 "av_excursions_per_s", "av_hard_cap_ms", "av_coverage_pct_min"):
         weakened = copy.deepcopy(doc)
         weakened["budgets"][name] += 1
         assert schema.validate(weakened, loaded), f"v3 schema accepted a weakened {name}"

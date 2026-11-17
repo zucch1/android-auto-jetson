@@ -236,6 +236,16 @@ class AnalyzerTests(unittest.TestCase):
         # The same frame at 85 ms is within the 90 ms cap.
         self.assertTrue(self.av(Run().skew(lambda at: 85.0 if 200.0 <= at < 200.03 else 12.0))["passed"])
 
+    def test_the_drive_smoke_keeps_the_plain_90_ms_cap(self) -> None:
+        # The soak's excursion rate (owner decision 2026-11-17) is soak-only: one
+        # pair at 90.1 ms still FAILs the 10-minute drive smoke.
+        av = self.av(Run().skew(lambda at: 90.1 if 200.0 <= at < 200.03 else 12.0))
+        self.assert_only_clause_fails(av, "max_abs")
+        self.assertEqual(av["max_clause"], "cap")
+        self.assertEqual(av["excursions"], 1)
+        self.assertNotIn("excursions", av["clauses"])
+        self.assertNotIn("hard_cap", av["clauses"])
+
     def test_audio_must_cover_90_percent_of_the_drive(self) -> None:
         # No media at all is a FAIL, never n/a.
         none = self.av(Run().no_media())

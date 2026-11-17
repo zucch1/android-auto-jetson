@@ -441,10 +441,13 @@ intervals, in `av_series` (ns from the monotonic origin, frozen at the
 measurement cutoff like every other measurement). The reporter judges them over
 its own replayed active window with the four clauses above. They are the
 gated metrics `av_window_mean_abs_ms` (<= 40), `av_p99_abs_ms` (<= 50),
-`av_max_abs_ms` (<= 90) and `av_coverage_pct` (>= 90, `op: ge`), and the
-`av_contract` block carries the signed distribution. `av_sync_ms` (the
-run-cumulative maximum) stays as an informational metric. Two rules differ
-from the drive smoke, on purpose:
+`av_excursions` and `av_hard_cap_pairs` (the soak's maximum, below) and
+`av_coverage_pct` (>= 90, `op: ge`), and the `av_contract` block carries the
+signed distribution. `av_max_abs_ms` and `av_sync_ms` (the run-cumulative
+maximum) are informational. Three rules differ from the drive smoke, on
+purpose:
+
+- **The maximum is a rate, not a cap** (owner decision 2026-11-17; below).
 
 - **No audio is a FAIL** in a measured window: coverage is measured as 0 %.
   A run with no active window at all is still BLOCKED, as nothing was measured.
@@ -454,6 +457,51 @@ from the drive smoke, on purpose:
 
 Everything else in the soak contract is unchanged: RSS, CPU, RSS growth, audio
 latency, crashes, coverage, continuity, provenance and the build guard.
+
+**Soak A/V maximum: an excursion rate (owner decision 2026-11-17).** For v3
+soak stages, "max |skew| <= 90 ms" is replaced by:
+
+- An *excursion* is an A/V pair with |skew| > `AV_SOAK_EXCURSION_MS` (90 ms).
+  Every pair counts, so consecutive pairs of one spike count separately.
+- A stage may have at most floor(active window s /
+  `AV_SOAK_EXCURSION_PERIOD_S`) excursions (`AV_SOAK_EXCURSIONS_PER_S` =
+  1/1800): **1** in the 1800 s stage, **4** in the 7200 s stage.
+- Hard cap: no pair may exceed `AV_SOAK_HARD_CAP_MS` (150 ms).
+- Unchanged: the 5 s window mean (±40 ms), p99 (<= 50 ms) and coverage
+  (>= 90 %).
+
+The constants are in `tools/perf/aa_av_contract.py`. The v3 schema pins them
+in `budgets` and `av_contract.limits`. `aa_av_contract.evaluate(...,
+max_clause="soak_rate")` judges the stage, and the same math with
+`max_clause="cap"` judges the drive smoke. The result reports:
+
+- the `av_excursions` count against its allowance (`budget_max`);
+- `av_hard_cap_pairs` (budget 0);
+- every excursion's offset into the active window and its signed value
+  (`av_contract.excursion_pairs`; at most 1000 are listed, and
+  `excursion_pairs_truncated` says when there are more, while the count is
+  always exact);
+- the max |skew| as an informational `av_max_abs_ms`.
+
+The qualification checker requires the allowance to be the one the stage's
+own active window gives.
+
+Rationale:
+
+- A maximum over a fixed limit grows with run length: the longer the stage,
+  the likelier one stray pair crosses it, whatever the system's quality. A
+  rate keeps one imperceptible frame from failing a long stage.
+- The 150 ms cap still fails any single gross error. The 5 s mean, the p99
+  and coverage still catch sustained offset, a heavy tail and missing audio.
+- The first live 1800 s moving-map soak
+  (`~/aa-research/pr152-live-evidence-2026-11-17`) had exactly one pair over
+  90 ms: 90.577 ms, 385.9 s into the window, with p99 31.3 ms and coverage
+  99.97 %. Under the cap it FAILed. Re-analysed under this rule, the same
+  capture has 1 excursion of an allowance of 1, none over 150 ms, and PASSes
+  (`~/aa-research/pr152-av-rate-reanalysis-2026-11-17`).
+
+The 10-minute drive smoke keeps the plain max |skew| <= 90 ms: a single pair
+at 90.1 ms still FAILs it. v2 history is unchanged.
 
 **Conflicts with the new workload.** None found in the gates themselves. Two
 operational effects to expect:
@@ -741,7 +789,8 @@ Both runs write a result document (validated against
 - receiver RSS peak <= 250 MB; receiver CPU sustained <= 50 % of one core;
 - RSS growth < 10 %; audio latency <= 200 ms; zero crashes;
 - the signed A/V contract: every 5 s mean within ±40 ms, p99 \|skew\| <= 50 ms,
-  max \|skew\| <= 90 ms, audio coverage >= 90 % (v2: A/V sync <= 50 ms);
+  at most floor(active s / 1800) pairs over 90 ms and none over 150 ms
+  (owner decision 2026-11-17), audio coverage >= 90 % (v2: A/V sync <= 50 ms);
 - helper RSS recorded `null`;
 - frame drops, decode timing, IPC timing and thermal state recorded
   informationally.

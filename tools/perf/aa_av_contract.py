@@ -32,7 +32,21 @@ AV_MEAN_MAX_ABS_MS = 40.0
 #     contract's number; 1.5 frame periods at 30 fps).
 AV_P99_ABS_MAX_MS = 50.0
 # (c) Cap: max |skew| <= 90 ms (ITU-R BT.1359-1's sound-early acceptability bound).
+#     The drive smoke's clause (max_clause="cap").
 AV_MAX_ABS_MS = 90.0
+# (c') Soak stages (max_clause="soak_rate", owner decision 2026-11-17): a
+#     maximum over a fixed limit grows with run length, so a long stage judges
+#     the rate of excursions instead. An excursion is a pair with
+#     |skew| > AV_SOAK_EXCURSION_MS; every pair counts, consecutive pairs of one
+#     spike separately. A stage may have floor(active window /
+#     AV_SOAK_EXCURSION_PERIOD_S) of them (1 in 1800 s, 4 in 7200 s), and no
+#     pair may exceed the hard cap AV_SOAK_HARD_CAP_MS.
+AV_SOAK_EXCURSION_MS = 90.0
+AV_SOAK_EXCURSION_PERIOD_S = 1800
+AV_SOAK_EXCURSIONS_PER_S = 1 / AV_SOAK_EXCURSION_PERIOD_S
+AV_SOAK_HARD_CAP_MS = 150.0
+# At most this many excursions are listed one by one (the count is always exact).
+EXCURSIONS_LISTED_MAX = 1000
 # Coverage: the union of valid audio slots' scheduled intervals, intersected
 # with the judged window, must cover this share of it. No audio, or too
 # little, is a FAIL, never "n/a".
@@ -41,6 +55,19 @@ AV_COVERAGE_MIN = 0.90
 LIMITS = {"window_s": AV_MEAN_WINDOW_S, "window_mean_abs_ms": AV_MEAN_MAX_ABS_MS,
           "p99_abs_ms": AV_P99_ABS_MAX_MS, "max_abs_ms": AV_MAX_ABS_MS,
           "coverage_min": AV_COVERAGE_MIN}
+SOAK_LIMITS = {"window_s": AV_MEAN_WINDOW_S, "window_mean_abs_ms": AV_MEAN_MAX_ABS_MS,
+               "p99_abs_ms": AV_P99_ABS_MAX_MS, "excursion_ms": AV_SOAK_EXCURSION_MS,
+               "excursions_per_s": AV_SOAK_EXCURSIONS_PER_S,
+               "excursion_period_s": AV_SOAK_EXCURSION_PERIOD_S,
+               "hard_cap_ms": AV_SOAK_HARD_CAP_MS, "coverage_min": AV_COVERAGE_MIN}
+MAX_CLAUSES = {"cap": LIMITS, "soak_rate": SOAK_LIMITS}
+
+
+def excursion_allowance(start_ns: int | None, end_ns: int | None) -> int:
+    """floor(window seconds / AV_SOAK_EXCURSION_PERIOD_S), exact on integer ns."""
+    if start_ns is None or end_ns is None or end_ns <= start_ns:
+        return 0
+    return (end_ns - start_ns) // (AV_SOAK_EXCURSION_PERIOD_S * 10**9)
 
 
 def merge_intervals(intervals: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -109,12 +136,19 @@ def rank(sorted_values: Sequence[float], fraction: float) -> float:
 
 
 def evaluate(pairs: Sequence[tuple[int, float]], intervals: Iterable[tuple[int, int]],
-             start_ns: int | None, end_ns: int | None) -> dict:
-    """Judge pairs and audio intervals over [start_ns, end_ns] with all four clauses.
+             start_ns: int | None, end_ns: int | None, *, max_clause: str = "cap") -> dict:
+    """Judge pairs and audio intervals over [start_ns, end_ns].
 
-    Only pairs whose paint completed inside the window count. Returns the
-    signed distribution, coverage, per-clause results and ``passed``.
+    Coverage, the 5 s window mean and p99 are always judged. The maximum is
+    judged by ``max_clause``: "cap" (the drive smoke) is max |skew| <=
+    AV_MAX_ABS_MS; "soak_rate" (soak stages) is at most excursion_allowance()
+    pairs over AV_SOAK_EXCURSION_MS ("excursions") and none over
+    AV_SOAK_HARD_CAP_MS ("hard_cap"). Only pairs whose paint completed inside
+    the window count. Returns the signed distribution, coverage, the
+    excursions, per-clause results and ``passed``.
     """
+    if max_clause not in MAX_CLAUSES:
+        raise ValueError(f"unknown max_clause {max_clause!r}")
     if start_ns is None or end_ns is None or end_ns <= start_ns:
         inside: list[tuple[int, float]] = []
         share = 0.0
@@ -139,10 +173,23 @@ def evaluate(pairs: Sequence[tuple[int, float]], intervals: Iterable[tuple[int, 
         "worst_window_mean_ms": worst,
         "over_50_ms": sum(1 for x in magnitudes if x > 50.0),
     }
+    # Excursions: every pair over AV_SOAK_EXCURSION_MS (= AV_MAX_ABS_MS), with
+    # its offset into the window; reported for both variants.
+    over = [(t, skew) for t, skew in inside if abs(skew) > AV_SOAK_EXCURSION_MS]
+    stats["excursions"] = len(over)
+    stats["excursion_pairs"] = [{"offset_s": (t - start_ns) / 1e9, "skew_ms": skew}
+                                for t, skew in over[:EXCURSIONS_LISTED_MAX]]
+    stats["excursion_pairs_truncated"] = len(over) > EXCURSIONS_LISTED_MAX
+    stats["over_hard_cap"] = sum(1 for x in magnitudes if x > AV_SOAK_HARD_CAP_MS)
     clauses = {
         "coverage": share >= AV_COVERAGE_MIN,
         "window_mean": worst is not None and abs(worst) <= AV_MEAN_MAX_ABS_MS,
         "p99_abs": bool(magnitudes) and stats["abs_p99_ms"] <= AV_P99_ABS_MAX_MS,
-        "max_abs": bool(magnitudes) and stats["abs_max_ms"] <= AV_MAX_ABS_MS,
     }
-    return {"passed": all(clauses.values()), "clauses": clauses, **stats}
+    if max_clause == "cap":
+        clauses["max_abs"] = bool(magnitudes) and stats["abs_max_ms"] <= AV_MAX_ABS_MS
+    else:
+        stats["excursion_allowance"] = excursion_allowance(start_ns, end_ns)
+        clauses["excursions"] = bool(magnitudes) and stats["excursions"] <= stats["excursion_allowance"]
+        clauses["hard_cap"] = bool(magnitudes) and stats["over_hard_cap"] == 0
+    return {"passed": all(clauses.values()), "clauses": clauses, "max_clause": max_clause, **stats}

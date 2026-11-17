@@ -41,7 +41,9 @@ diagnostics-suppressing flag does not exist:
 | RSS growth over the run | < 10 % | FAIL on miss |
 | A/V, every 5 s window mean | within ±40 ms (`av_window_mean_abs_ms`) | FAIL on miss |
 | A/V, p99 \|skew\| | <= 50 ms (`av_p99_abs_ms`) | FAIL on miss |
-| A/V, max \|skew\| | <= 90 ms (`av_max_abs_ms`) | FAIL on miss |
+| A/V excursions (\|skew\| > 90 ms) | at most floor(active s / 1800) pairs (`av_excursions`) | FAIL on miss |
+| A/V hard cap | no pair over 150 ms (`av_hard_cap_pairs`) | FAIL on any |
+| A/V, max \|skew\| | (`av_max_abs_ms`) | informational in v3 (owner decision 2026-11-17) |
 | A/V audio coverage | >= 90 % of the active window (`av_coverage_pct`) | FAIL on miss, including no audio |
 | audio path latency | <= 200 ms | FAIL on miss |
 | crashes | 0 | FAIL on any |

@@ -75,13 +75,17 @@ EVENT_METRICS = ("frame_drops", "decode_p50_ms", "decode_p95_ms", "decode_fps",
 # Contractual budgets (plan "Contract budgets" line + task-32 acceptance).
 # Do NOT edit to make a run pass.
 # BUDGETS is the current (v3) contract: the signed A/V contract replaces the
-# A/V max <= 50 ms budget (owner decision 2026-11-16; aa_av_contract.py).
+# A/V max <= 50 ms budget (owner decision 2026-11-16; aa_av_contract.py). Its
+# maximum is the soak rate rule (owner decision 2026-11-17): at most one pair
+# over 90 ms per 1800 s of active window, none over 150 ms.
 BUDGETS = {
     "receiver_rss_mb_max": 250.0,
     "receiver_cpu_pct_one_core_max": 50.0,
     "av_window_mean_abs_ms_max": av_contract.AV_MEAN_MAX_ABS_MS,
     "av_p99_abs_ms_max": av_contract.AV_P99_ABS_MAX_MS,
-    "av_max_abs_ms_max": av_contract.AV_MAX_ABS_MS,
+    "av_excursion_ms": av_contract.AV_SOAK_EXCURSION_MS,
+    "av_excursions_per_s": av_contract.AV_SOAK_EXCURSIONS_PER_S,
+    "av_hard_cap_ms": av_contract.AV_SOAK_HARD_CAP_MS,
     "av_coverage_pct_min": av_contract.AV_COVERAGE_MIN * 100,
     "audio_latency_ms_max": 200.0,
     "rss_growth_pct_max": 10.0,  # strict: growth must be < 10 %
@@ -308,7 +312,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         ) if not version3 else _metric(
             _as_float(events.get("av_sync_ms")), "ms",
             note="run-cumulative max |skew| through the measurement cutoff; v3 gates the "
-                 "signed contract (av_window_mean_abs_ms, av_p99_abs_ms, av_max_abs_ms, "
+                 "signed contract (av_window_mean_abs_ms, av_p99_abs_ms, av_excursions, av_hard_cap_pairs, "
                  "av_coverage_pct) instead")),
         "audio_latency_ms": _metric(
             _as_float(events.get("audio_latency_ms")), "ms",
@@ -613,7 +617,7 @@ def _signed_av(capture: dict, window: Window | None, *, invalid: bool) -> tuple[
                 and all(isinstance(i, list) and len(i) == 2 and integer_list(i) for i in intervals)):
             pairs = [(t, skew / 1e6) for t, skew in zip(times, skews)]
             stats = av_contract.evaluate(pairs, [tuple(i) for i in intervals],
-                                         window.start_ns, window.end_ns)
+                                         window.start_ns, window.end_ns, max_clause="soak_rate")
         else:
             raise ContractError("capture.av_series must hold integer pair_t_ns/pair_skew_ns of equal "
                                 "length and [start, end] audio_intervals_ns")
@@ -627,14 +631,22 @@ def _signed_av(capture: dict, window: Window | None, *, invalid: bool) -> tuple[
             note="largest |mean signed skew| over every full 5 s window of the active window"),
         "av_p99_abs_ms": _metric(value("abs_p99_ms"), "ms", budget_max=BUDGETS["av_p99_abs_ms_max"],
                                  gated=True, note="nearest-rank p99 of |signed skew|"),
-        "av_max_abs_ms": _metric(value("abs_max_ms"), "ms", budget_max=BUDGETS["av_max_abs_ms_max"],
-                                 gated=True, note="max |signed skew| in the active window"),
+        "av_max_abs_ms": _metric(value("abs_max_ms"), "ms",
+                                 note="max |signed skew| in the active window; informational "
+                                      "(the soak judges the excursion rate and the hard cap)"),
+        "av_excursions": _metric(
+            value("excursions"), "pairs", budget_max=value("excursion_allowance"), gated=True,
+            note=f"pairs with |signed skew| > {BUDGETS['av_excursion_ms']:g} ms; allowance "
+                 f"floor(active s / {av_contract.AV_SOAK_EXCURSION_PERIOD_S})"),
+        "av_hard_cap_pairs": _metric(
+            value("over_hard_cap"), "pairs", budget_max=0, gated=True,
+            note=f"pairs with |signed skew| > {BUDGETS['av_hard_cap_ms']:g} ms (hard cap)"),
         "av_coverage_pct": _metric(
             coverage * 100 if coverage is not None else None, "%",
             budget_min=BUDGETS["av_coverage_pct_min"], op="ge", gated=True,
             note="valid audio slots' scheduled union over the active window"),
     }
-    block = {"limits": dict(av_contract.LIMITS), "valid": stats is not None,
+    block = {"limits": dict(av_contract.SOAK_LIMITS), "valid": stats is not None,
              **({key: stats[key] for key in stats} if stats is not None else {"passed": None})}
     return block, metrics
 

@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'perf'))
 import aa_perf_schema
 from aa_measurement_coverage import CoverageError, coverage_gaps, parse_coverage
 from aa_moving_map import MAX_DRAG_GAP_S, MIN_DRAG_RATE_HZ
+import aa_av_contract
 
 RECOVERY: Final = {
     'usb_unplug_replug': 'dip+frames+pump+input',
@@ -31,7 +32,9 @@ GATES: Final = {
     'audio_latency_ms': (200, 'ms'),
 }
 # v3 (#137): the signed A/V contract replaces av_sync_ms <= 50 ms; coverage is
-# a floor (op ge) and av_sync_ms is informational.
+# a floor (op ge) and av_sync_ms is informational. Its maximum is the soak rate
+# rule (owner decision 2026-11-17): av_excursions within the stage's allowance
+# and av_hard_cap_pairs == 0; av_max_abs_ms is informational.
 GATES_V3: Final = {
     'receiver_rss_peak_mb': (250, 'MB'),
     'receiver_cpu_sustained_pct_one_core': (50, '% of one core'),
@@ -39,10 +42,10 @@ GATES_V3: Final = {
     'audio_latency_ms': (200, 'ms'),
     'av_window_mean_abs_ms': (40, 'ms'),
     'av_p99_abs_ms': (50, 'ms'),
-    'av_max_abs_ms': (90, 'ms'),
 }
 AV_COVERAGE_MIN_PCT: Final = 90
-AV_CONTRACT_METRICS: Final = {'av_p99_abs_ms': 'abs_p99_ms', 'av_max_abs_ms': 'abs_max_ms'}
+AV_CONTRACT_METRICS: Final = {'av_p99_abs_ms': 'abs_p99_ms', 'av_max_abs_ms': 'abs_max_ms',
+                               'av_excursions': 'excursions', 'av_hard_cap_pairs': 'over_hard_cap'}
 RECORDED: Final = ('receiver_rss_mean_mb', 'receiver_cpu_peak_pct_one_core',
                    'frame_drops', 'decode_p50_ms', 'decode_p95_ms', 'decode_fps',
                    'decode_frames', 'ipc_throughput_mbps', 'ipc_p95_added_latency_ms',
@@ -203,9 +206,33 @@ def signed_av(doc: Document, metrics: Document) -> None:
     contract = doc.child('av_contract')
     contract.equal('valid', True)
     contract.equal('passed', True)
+    contract.equal('max_clause', 'soak_rate')
+    limits = contract.child('limits')
+    for name, limit in aa_av_contract.SOAK_LIMITS.items():
+        limits.equal(name, limit)
     clauses = contract.child('clauses')
-    for name in ('coverage', 'window_mean', 'p99_abs', 'max_abs'):
+    for name in ('coverage', 'window_mean', 'p99_abs', 'excursions', 'hard_cap'):
         clauses.equal(name, True)
+    # The maximum (owner decision 2026-11-17): at most floor(active s / 1800)
+    # pairs over 90 ms, none over 150 ms; max |skew| itself is informational.
+    active_s = doc.child('run_status').number('active_projection_seconds')
+    allowance = math.floor(active_s / aa_av_contract.AV_SOAK_EXCURSION_PERIOD_S)
+    require(contract.integer('excursion_allowance') == allowance, 'PERF_AV_EXCURSION_ALLOWANCE')
+    excursions = metrics.child('av_excursions')
+    excursions.equal('gated', True)
+    excursions.equal('status', 'PASS')
+    excursions.equal('unit', 'pairs')
+    require(excursions.number('budget_max') == allowance, 'PERF_METRIC_BUDGET')
+    require(0 <= excursions.number('value') <= allowance, 'PERF_BUDGET:av_excursions')
+    require(contract.integer('excursions') == len(contract.array('excursion_pairs'))
+            or contract.get('excursion_pairs_truncated') is True, 'PERF_AV_EXCURSIONS')
+    cap = metrics.child('av_hard_cap_pairs')
+    cap.equal('gated', True)
+    cap.equal('status', 'PASS')
+    cap.equal('value', 0)
+    require(cap.number('budget_max') == 0, 'PERF_METRIC_BUDGET')
+    require(contract.number('abs_max_ms') <= aa_av_contract.AV_SOAK_HARD_CAP_MS, 'PERF_AV_HARD_CAP')
+    metrics.child('av_max_abs_ms').equal('gated', False)
     require(contract.integer('pairs') > 0, 'PERF_AV_PAIRS')
     require(math.isclose(contract.number('coverage') * 100, coverage.number('value'),
                          rel_tol=1e-12, abs_tol=1e-9), 'PERF_AV_COVERAGE')

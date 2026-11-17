@@ -284,7 +284,7 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
     valid_audio, invalid_audio = _valid_audio(audio)
     av = av_contract.evaluate(av_pairs(window_paints, valid_audio),
                               [(slot["scheduled_ns"], slot["scheduled_end_ns"]) for slot in valid_audio],
-                              start_ns, end_ns)
+                              start_ns, end_ns, max_clause="cap")  # the smoke keeps max <= 90 ms
     criteria.append(_criterion("av_signed_contract", av.pop("passed"), limits=av_contract.LIMITS,
                                invalid_audio_slots=invalid_audio, **av))
 

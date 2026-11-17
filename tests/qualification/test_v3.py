@@ -56,6 +56,19 @@ class V3PackageTests(PackageTest):
             'stimulus started, too few drags':
                 lambda d: d['workload'].update(drags=int(0.25 * d['run_status']['active_projection_seconds']) - 1),
             'av_sync_ms gated again': lambda d: d['metrics']['av_sync_ms'].update(gated=True),
+            'excursions over the allowance': lambda d: (
+                d['metrics']['av_excursions'].update(value=d['metrics']['av_excursions']['budget_max'] + 1),
+                d['av_contract'].update(excursions=d['av_contract']['excursion_allowance'] + 1)),
+            'excursion allowance raised': lambda d: (
+                d['metrics']['av_excursions'].update(budget_max=99),
+                d['av_contract'].update(excursion_allowance=99)),
+            'a pair over the hard cap': lambda d: (
+                d['metrics']['av_hard_cap_pairs'].update(value=1),
+                d['av_contract'].update(over_hard_cap=1)),
+            'hard cap limit loosened': lambda d: d['av_contract']['limits'].update(hard_cap_ms=200.0),
+            'excursion clause failed': lambda d: d['av_contract']['clauses'].update(excursions=False),
+            'cap variant instead of the soak rate': lambda d: d['av_contract'].update(max_clause='cap'),
+            'max |skew| gated again': lambda d: d['metrics']['av_max_abs_ms'].update(gated=True),
             'a phone command failed': lambda d: d['workload'].update(phone_failure='media: exit 1'),
             'phone failure not recorded': lambda d: d['workload'].pop('phone_failure'),
             'drags stopped mid-stage': lambda d: d['workload'].update(max_drag_gap_s=600.0),
