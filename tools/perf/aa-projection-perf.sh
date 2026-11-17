@@ -14,8 +14,9 @@
 #   tools/wired-qa/aa_drive_smoke.py result from that same phone, attached on
 #   --port, for the same binaries and the default configuration (#137).
 #   Every live stage drives the moving-map workload and needs --media-uri URI
-#   (optional --media-type, --media-component, --geo-uri): media for the whole
-#   stage, Google Maps dragged once a second (tools/perf/aa_moving_map.py).
+#   and --media-component PKG/ACTIVITY (the player the cleanup stops and
+#   verifies; optional --media-type, --geo-uri): media for the whole stage,
+#   Google Maps dragged once a second (tools/perf/aa_moving_map.py).
 #
 # This tool measures CPU/RSS, thermal state, frame drops, decode/IPC timing,
 # A/V sync and audio latency during wired projection on the qualified Jetson,
@@ -547,6 +548,8 @@ REMOTE_STOP_ACK_S="${AA_REMOTE_STOP_ACK_S:-30}"
 # (aa_remote_stop.sh --worst-case: appearance + acknowledgement + group waits +
 # restore budget + report), by the ssh connect timeout (10 s) plus 5 s.
 REMOTE_STOP_SSH_MARGIN_S=15
+# Both long ssh calls are hard-bounded: TERM at their limit, KILL this much later.
+SSH_KILL_GRACE_S=5
 remote_stop_line="" remote_stop_rc=0
 # remote_stop APPEAR_SECONDS: run aa_remote_stop.sh on the target. Its one-line
 # outcome goes to stderr and remote_stop_line; remote_stop_rc is nonzero when it
@@ -556,7 +559,7 @@ remote_stop() {
     local worst
     remote_stop_rc=0
     worst="$(bash "$TOOL_DIR/aa_remote_stop.sh" --worst-case "$REMOTE_STOP_ACK_S" "$1")"
-    timeout $((worst + REMOTE_STOP_SSH_MARGIN_S)) ssh "${SSH_OPTS[@]}" "$HOST" \
+    timeout -k "$SSH_KILL_GRACE_S" $((worst + REMOTE_STOP_SSH_MARGIN_S)) ssh "${SSH_OPTS[@]}" "$HOST" \
         "bash -s -- '${RUN_FILE}' ${REMOTE_STOP_ACK_S} $1" <"$TOOL_DIR/aa_remote_stop.sh" \
         >"$out" 2>&1 || remote_stop_rc=$?
     remote_stop_line="$(grep -m1 '^remote-stop: ' "$out" || echo "remote-stop: no answer (rc ${remote_stop_rc})")"
@@ -567,7 +570,7 @@ remote_stop() {
 stop_signal=""
 trap 'stop_signal=TERM' TERM
 trap 'stop_signal=INT' INT
-timeout "$collector_timeout" ssh "${SSH_OPTS[@]}" "$HOST" "${REMOTE_ENV} python3 - --receiver '${RECEIVER}' --port '${PORT}' \
+timeout -k "$SSH_KILL_GRACE_S" "$collector_timeout" ssh "${SSH_OPTS[@]}" "$HOST" "${REMOTE_ENV} python3 - --receiver '${RECEIVER}' --port '${PORT}' \
         --duration-seconds ${duration_secs} --interval ${INTERVAL} \
         ${THERMAL_POLICY:+--thermal-policy '${THERMAL_POLICY}'} \
         ${DISPLAY_BIN:+--display '${DISPLAY_BIN}'} ${STORE:+--store '${STORE}'}${build_args_remote} \

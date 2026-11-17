@@ -185,6 +185,54 @@ def test_restore_stays_within_its_budget_when_every_adb_call_stalls() -> None:
         "cleanup:media_not_stopped", "cleanup:usb_not_restored"]
 
 
+def test_adb_runner_is_hard_bounded_even_if_adb_ignores_term() -> None:
+    # Given an adb that ignores TERM and leaves a grandchild holding its pipes.
+    with tempfile.TemporaryDirectory(prefix="moving-map-adb-") as directory:
+        hung = Path(directory) / "adb"
+        grandchild = Path(directory) / "grandchild"
+        hung.write_text("#!/usr/bin/env bash\ntrap '' TERM\nsleep 600 &\n"
+                        f"echo $! > {grandchild}\nexec sleep 600\n")
+        hung.chmod(0o755)
+        try:
+            with patch.dict(os.environ, {"PATH": f"{directory}:{os.environ['PATH']}"}):
+                started = time.monotonic()
+                result = mm.adb_runner("TESTPHONE01", timeout=0.5)("shell", "true")
+                elapsed = time.monotonic() - started
+        finally:
+            if grandchild.exists():
+                try:
+                    os.kill(int(grandchild.read_text()), 9)
+                except (ProcessLookupError, ValueError):
+                    pass
+    # Then it returns a failure within TERM + KILL grace + reap.
+    assert result.returncode == 1 and "timed out" in result.stderr, result
+    assert elapsed < 0.5 + mm.ADB_KILL_GRACE_S + 2 * mm.ADB_REAP_S + 0.5, elapsed
+
+
+def test_restore_budget_ignores_wall_clock_jumps() -> None:
+    # Given wall-clock steps of an hour forward and backward on every read
+    # during the restore, the budget (on time.monotonic) is unaffected.
+    for step in (3600.0, -3600.0):
+        wall = [time.time()]
+
+        def jumping() -> float:
+            wall[0] += step
+            return wall[0]
+
+        adb = Adb()
+        work = workload(adb)
+        with patch.object(mm.time, "time", jumping), \
+                patch.object(mm.time, "time_ns", lambda: int(jumping() * 1e9)):
+            failures = work.restore_phone(sleep=lambda seconds: None)
+        assert failures == [], (step, failures)
+        assert adb.calls[-3:] == [("shell", "am", "force-stop", "org.example.player"),
+                                  ("shell", "pidof", "org.example.player"),
+                                  ("shell", "svc", "usb", "setFunctions", "mtp")], adb.calls
+    # The default clock is the monotonic one.
+    import inspect
+    assert inspect.signature(mm.MovingMap.restore_phone).parameters["clock"].default is time.monotonic
+
+
 def test_media_relaunch_after_silence_only() -> None:
     adb = Adb()
     work = workload(adb)

@@ -383,6 +383,64 @@ def test_every_adb_call_stalling_still_restores_usb_and_reports_within_the_limit
     assert running
 
 
+def test_a_term_resistant_adb_is_killed_and_the_restore_still_completes() -> None:
+    # Sol's reproduction: every adb call hangs and ignores TERM (only KILL ends
+    # it). With the production budgets, each call is KILLed ADB_KILL_GRACE_S after
+    # its TERM, the USB restore is still issued last and the outcome reported,
+    # inside the script's own worst case.
+    stop, adb, running = forced_restore(stall=True, FAKE_ADB_IGNORE_TERM="1")
+    worst = stop.limit - 15
+    assert stop.returncode == 1 and stop.elapsed < worst, (stop.returncode, stop.elapsed, worst, stop.stdout)
+    assert adb[-1] == f"-s {PHONE} shell svc usb setFunctions mtp", adb
+    assert stop.stdout.startswith("remote-stop: failed: forced: media_stop_unverified: "
+                                  "org.example.player after 1 attempts: restore budget exhausted"), stop.stdout
+    assert "usb_reset_failed" in stop.stdout, stop.stdout
+
+
+def monotonic_copy(root: Path) -> tuple[Path, Path]:
+    """A copy of the stop script whose one clock source is a file the test writes."""
+    clock = root / "uptime"
+    script = root / "aa_remote_stop.sh"
+    text = STOP.read_text()
+    assert text.count("MONOTONIC_SOURCE=/proc/uptime ") == 1
+    script.write_text(text.replace("MONOTONIC_SOURCE=/proc/uptime ", f"MONOTONIC_SOURCE={clock} "))
+    return script, clock
+
+
+def test_every_deadline_uses_the_monotonic_clock() -> None:
+    # The script reads no wall clock: bash's EPOCHREALTIME/EPOCHSECONDS/SECONDS
+    # are gettimeofday()-based and `date` is wall time; /proc/uptime is the
+    # kernel's boot-time clock, which settimeofday/NTP steps never move.
+    text = STOP.read_text()
+    code = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+    for wall in ("EPOCHREALTIME", "EPOCHSECONDS", "$SECONDS", "${SECONDS", "date ", "printf '%("):
+        assert wall not in code, wall
+    assert "MONOTONIC_SOURCE=/proc/uptime " in text and code.count("$MONOTONIC_SOURCE") == 1
+    # And the deadlines move with that source only: frozen, a 1 s wait does not
+    # end however much real time passes; a simulated step forward or backward
+    # of anything else changes nothing; advancing the source ends it.
+    import threading
+    with tempfile.TemporaryDirectory(prefix="remote-stop-clock-") as directory:
+        root = Path(directory)
+        script, clock = monotonic_copy(root)
+        clock.write_text("1000.00 0.00\n")
+        stop = subprocess.Popen(["bash", str(script), str(root / "missing"), "1", "1"],
+                                stdout=subprocess.PIPE, text=True)
+        time.sleep(2.5)  # 2.5 s of real (and wall) time: the frozen source has not moved
+        assert stop.poll() is None, "a deadline followed something other than its clock"
+        clock.write_text("1000.50 0.00\n")
+        time.sleep(0.5)
+        assert stop.poll() is None, "ended before its 1 s on the source"
+        clock.write_text("1001.20 0.00\n")
+        out, _ = stop.communicate(timeout=10)
+        assert out.strip() == "remote-stop: no-run", out
+    # The real source: a 1 s appearance wait takes about 1 s.
+    started = time.monotonic()
+    stop = subprocess.run(["bash", str(STOP), "/nonexistent/aa-run", "1", "1"],
+                          capture_output=True, text=True, timeout=30)
+    assert stop.stdout.strip() == "remote-stop: no-run" and 0.9 < time.monotonic() - started < 3
+
+
 def test_the_launcher_bounds_its_stop_above_the_scripts_worst_case() -> None:
     # Given a collector past its ssh bound whose cleanup adb stalls, and a fake
     # phone on which every later adb call stalls too (shortened stop budgets).
@@ -397,7 +455,7 @@ def test_the_launcher_bounds_its_stop_above_the_scripts_worst_case() -> None:
     # The production launcher's bound is the production script's worst case + 15 s.
     launcher = LAUNCHER.read_text()
     assert "REMOTE_STOP_SSH_MARGIN_S=15\n" in launcher
-    assert 'timeout $((worst + REMOTE_STOP_SSH_MARGIN_S)) ssh' in launcher
+    assert 'timeout -k "$SSH_KILL_GRACE_S" $((worst + REMOTE_STOP_SSH_MARGIN_S)) ssh' in launcher
 
 
 def test_the_fallback_stops_and_verifies_media_before_the_usb_switch() -> None:

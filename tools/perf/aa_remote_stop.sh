@@ -50,10 +50,19 @@
 # attempt starts only if it and the USB restore still fit; otherwise the
 # script goes straight to the USB restore and records the media stop as not
 # done (cleanup:media_not_stopped). The USB restore and this report always fit.
+#
+# Every adb command is hard-bounded: TERM at ADB_COMMAND_S, KILL
+# ADB_KILL_GRACE_S later (`timeout -k`), so one costs at most ADB_CALL_S even
+# if it ignores TERM. Every deadline is on the kernel's boot-time clock
+# (MONOTONIC_SOURCE, /proc/uptime), which wall-clock steps never move; bash's
+# EPOCHREALTIME and SECONDS are wall-clock and are not used.
 set -u
 set -f  # no globbing of /proc fields (the scan's own glob is under set +f below)
 
-ADB_COMMAND_S=15      # bound of every adb command
+ADB_COMMAND_S=15      # TERM bound of every adb command
+ADB_KILL_GRACE_S=2    # then KILL: a TERM-resistant command still ends
+ADB_CALL_S=$((ADB_COMMAND_S + ADB_KILL_GRACE_S))  # the most one adb command can take
+MONOTONIC_SOURCE=/proc/uptime  # seconds since boot (centiseconds); never stepped
 GROUP_WAIT_S=10       # all the waits for KILLed groups (and the collector) together
 RESTORE_BUDGET_S=60   # media stop (attempts of force-stop + pidof) and the USB restore
 MEDIA_RETRY_S=1       # pause before a further media-stop attempt
@@ -117,7 +126,15 @@ kill_group() {
 collector_gone() { ! same_process "$collector_pid" "$collector_start"; }
 group_empty() { PGID_Q="$1" SID_Q="$2"; [[ -z "$(group_members)" ]]; }
 field() { awk -v key="$1" -v n="$2" '$1 == key { print $n; exit }' "$run_file" 2>/dev/null; }
-now_us() { local t="$EPOCHREALTIME"; echo "${t/./}"; }
+now_us() {  # microseconds on MONOTONIC_SOURCE (a builtin read: no fork)
+    local up _
+    read -r up _ < "$MONOTONIC_SOURCE"
+    local whole="${up%.*}" frac="${up#*.}"
+    [[ "$up" == *.* ]] || frac=0
+    frac="${frac}000000"
+    echo $(( 10#$whole * 1000000 + 10#${frac:0:6} ))
+}
+adb_bounded() { timeout -k "$ADB_KILL_GRACE_S" "$ADB_COMMAND_S" adb "$@"; }
 # wait_until SECONDS COMMAND...: poll every 0.1 s until COMMAND succeeds or the
 # deadline (wall clock, so slow polls cannot stretch it) passes.
 wait_until() {
@@ -204,7 +221,7 @@ if same_process "$collector_pid" "$collector_start" \
 fi
 # The restore, within RESTORE_BUDGET_S: media first, verified; the USB function
 # change last. A media-stop attempt (and its pause) starts only while it and the
-# USB restore still fit; the USB restore always has its ADB_COMMAND_S.
+# USB restore still fit; the USB restore always has its ADB_CALL_S.
 problems=()
 ((${#survivors[@]})) && problems+=("survivors ${survivors[*]}")
 restore_deadline=$(( $(now_us) + RESTORE_BUDGET_S * 1000000 ))
@@ -214,18 +231,22 @@ if [[ -n "$serial" ]]; then
         media_stopped=0 attempts=0 why="restore budget exhausted before an attempt"
         for attempt in 1 2 3; do
             pause=$(( attempt > 1 ? MEDIA_RETRY_S : 0 ))
-            if ! fits $(( pause + 3 * ADB_COMMAND_S )); then
+            if ! fits $(( pause + 3 * ADB_CALL_S )); then
                 why="restore budget exhausted; last: ${why}"
                 break
             fi
             ((pause)) && sleep "$pause"
             attempts=$attempt
-            if ! timeout "$ADB_COMMAND_S" adb -s "$serial" shell am force-stop "$package" >/dev/null 2>&1; then
+            if ! adb_bounded -s "$serial" shell am force-stop "$package" >/dev/null 2>&1; then
                 why="force-stop failed"
                 continue
             fi
-            pids="$(timeout "$ADB_COMMAND_S" adb -s "$serial" shell pidof "$package" 2>&1)"
+            # Into a file, not $(...): a lingering grandchild holding the pipe
+            # cannot then outlive the bound.
+            adb_bounded -s "$serial" shell pidof "$package" >"${run_file}.pidof" 2>&1
             rc=$?
+            pids="$(<"${run_file}.pidof")"
+            rm -f -- "${run_file}.pidof"
             if ((rc == 1)) && [[ -z "$pids" ]]; then
                 media_stopped=1
                 break
@@ -236,7 +257,7 @@ if [[ -n "$serial" ]]; then
     else
         problems+=("media_stop_unavailable: no media package recorded")
     fi
-    timeout "$ADB_COMMAND_S" adb -s "$serial" shell svc usb setFunctions mtp >/dev/null 2>&1 \
+    adb_bounded -s "$serial" shell svc usb setFunctions mtp >/dev/null 2>&1 \
         || problems+=("usb_reset_failed")
 fi
 rm -f -- "$run_file" "$cleanup_report"

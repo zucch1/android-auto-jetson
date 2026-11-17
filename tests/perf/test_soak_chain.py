@@ -269,8 +269,10 @@ def test_the_stop_grace_covers_the_launchers_remote_stop() -> None:
                                 "30", "15"], capture_output=True, text=True, check=True).stdout)
     launcher = (ROOT / "tools/perf/aa-projection-perf.sh").read_text()
     margin = int(re.search(r"^REMOTE_STOP_SSH_MARGIN_S=(\d+)$", launcher, re.M).group(1))
+    kill_grace = int(re.search(r"^SSH_KILL_GRACE_S=(\d+)$", launcher, re.M).group(1))
     assert re.search(r'^REMOTE_STOP_ACK_S="\$\{AA_REMOTE_STOP_ACK_S:-30\}"$', launcher, re.M)
-    assert chain.STOP_GRACE_S > worst + margin, (chain.STOP_GRACE_S, worst, margin)
+    # Hard bound of that ssh: TERM at worst + margin, KILL kill_grace later.
+    assert chain.STOP_GRACE_S > worst + margin + kill_grace, (chain.STOP_GRACE_S, worst, margin)
 
 
 def test_every_chain_gets_a_new_directory() -> None:

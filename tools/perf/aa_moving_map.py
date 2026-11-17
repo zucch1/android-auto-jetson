@@ -35,6 +35,7 @@ from __future__ import annotations
 import os
 import re
 import select
+import signal
 import subprocess
 import threading
 import time
@@ -69,11 +70,16 @@ MAX_DRAG_GAP_S = 10.0
 # still-running player it is retried this many times, this far apart.
 MEDIA_STOP_ATTEMPTS = 3
 MEDIA_STOP_RETRY_S = 1.0
-# Every adb command's bound (adb_runner).
+# Every adb command's bound (adb_runner): TERM at ADB_TIMEOUT_S, KILL
+# ADB_KILL_GRACE_S later, then at most ADB_REAP_S to collect its output, so one
+# command takes at most ADB_CALL_S even if it ignores TERM.
 ADB_TIMEOUT_S = 20.0
+ADB_KILL_GRACE_S = 2.0
+ADB_REAP_S = 1.0
+ADB_CALL_S = ADB_TIMEOUT_S + ADB_KILL_GRACE_S + ADB_REAP_S
 # The whole restore (media stop attempts and the USB switch) stays within this:
 # a media-stop attempt (force-stop + pidof, after its pause) starts only while it
-# and the USB switch still fit, so the USB switch always has its ADB_TIMEOUT_S.
+# and the USB switch still fit, so the USB switch always has its ADB_CALL_S.
 # Out of budget, the media stop is recorded as not done (cleanup:media_not_stopped).
 RESTORE_BUDGET_S = 90.0
 MAPS_PACKAGE = "com.google.android.apps.maps"
@@ -87,11 +93,38 @@ def adb_runner(serial: str, timeout: float = ADB_TIMEOUT_S) -> Callable[..., sub
     A timeout or a missing adb comes back as a failed CompletedProcess (exit 1).
     """
     def run(*args: str) -> subprocess.CompletedProcess:
+        command = ["adb", "-s", serial, *args]
         try:
-            return subprocess.run(["adb", "-s", serial, *args], capture_output=True, text=True,
-                                  timeout=timeout)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            return subprocess.CompletedProcess(["adb", *args], 1, "", str(error))
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True)
+        except OSError as error:
+            return subprocess.CompletedProcess(command, 1, "", str(error))
+        try:
+            out, err = process.communicate(timeout=timeout)
+            return subprocess.CompletedProcess(command, process.returncode, out, err)
+        except subprocess.TimeoutExpired:
+            pass
+        # Hard bound: TERM, KILL after the grace, then a bounded reap. A pipe a
+        # lingering grandchild still holds is abandoned, never waited on.
+        for sig, wait in ((signal.SIGTERM, ADB_KILL_GRACE_S), (signal.SIGKILL, ADB_REAP_S)):
+            try:
+                process.send_signal(sig)
+                process.communicate(timeout=wait)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+            except OSError:
+                break
+        for pipe in (process.stdout, process.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=ADB_REAP_S)
+        except subprocess.TimeoutExpired:
+            pass
+        return subprocess.CompletedProcess(command, 1, "", f"timed out after {timeout} s")
     return run
 
 
@@ -303,14 +336,14 @@ class MovingMap:
                     deadline: float) -> str | None:
         """Force-stop the media package until ``pidof`` shows no process.
 
-        Bounded by MEDIA_STOP_ATTEMPTS and by ``deadline`` (RESTORE_BUDGET_S),
-        always leaving the USB switch its ADB_TIMEOUT_S.
+        Bounded by MEDIA_STOP_ATTEMPTS and by ``deadline`` (RESTORE_BUDGET_S,
+        on the monotonic clock), always leaving the USB switch its ADB_CALL_S.
         """
         why = "not attempted"
         attempts = 0
         for attempt in range(MEDIA_STOP_ATTEMPTS):
             pause = MEDIA_STOP_RETRY_S if attempt else 0.0
-            if deadline - clock() < pause + 3 * ADB_TIMEOUT_S:
+            if deadline - clock() < pause + 3 * ADB_CALL_S:
                 why = f"restore budget exhausted; last: {why}"
                 break
             if pause:

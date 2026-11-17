@@ -340,8 +340,9 @@ audio write, counting each relaunch in `workload.media_relaunches`. A display
 that stops accepting control input for `CONTROL_WRITE_TIMEOUT_S` ends the stage
 with terminal error `display_control_stalled`, and one whose control input
 closes ends it with `display_control_closed` (both FAIL: the display is part of
-the product under test). Every live stage needs
-`--media-uri` (optional `--media-type`, `--media-component`, `--geo-uri`).
+the product under test). Every live stage needs `--media-uri` and
+`--media-component PKG/ACTIVITY` (the player the cleanup stops and verifies);
+`--media-type` and `--geo-uri` are optional.
 
 **Phone restore order.** Every cleanup path restores the phone the same way:
 the normal end, an acknowledged stop, the forced fallback, the drive smoke and

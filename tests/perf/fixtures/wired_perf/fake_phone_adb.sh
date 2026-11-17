@@ -22,6 +22,8 @@
 #   FAKE_ADB_DEVICE_LINE      the `devices -l` line (default FAKESERIAL on 9-9)
 #   FAKE_ADB_STALL_FILE=FILE  while FILE exists, every command is logged and
 #                             then hangs (until the caller's timeout kills it)
+#   FAKE_ADB_IGNORE_TERM=1    such a hung command also ignores TERM (only KILL
+#                             ends it)
 set -u
 log="${FAKE_ADB_LOG:?}"
 state="${FAKE_PHONE_STATE:-${log}.phone}"
@@ -32,6 +34,8 @@ case "$args" in *fixture.opus*)
 esac
 printf '%s\n' "$args" >> "$log"
 if [ -n "${FAKE_ADB_STALL_FILE:-}" ] && [ -e "$FAKE_ADB_STALL_FILE" ]; then
+    # An ignored TERM survives the exec: the sleep itself ignores it.
+    [ -n "${FAKE_ADB_IGNORE_TERM:-}" ] && trap '' TERM
     exec sleep 600
 fi
 
