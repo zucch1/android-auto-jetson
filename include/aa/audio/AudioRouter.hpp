@@ -172,11 +172,22 @@ struct SinkWriteProgress final {
 // by the RETAINED frames only. Trimmed audio is dropped, never resynthesized;
 // timestamps are never rebased to "now". Only the wired receiver's
 // pcm_router_config() enables this.
+//
+// Catch-up (#154, opt-in): a sink stall withholds credit, and the phone then
+// delivers its backlog in a burst stamped at arrival. Sequentialized after
+// the cursor, that burst places audio far behind its arrival - past the
+// 200 ms late-arrival cap, which ends the session - and the bounded max_trim
+// drains it at only ~117 ms/s. When catch_up_watermark > 0 and a run's phase
+// exceeds it, the whole excess above `target` is trimmed from the run's head
+// at once (bounded by the run). Only audio already more than the watermark
+// behind its arrival is dropped; it is counted in frames_trimmed and,
+// separately, frames_caught_up.
 struct LivePcmDriftPolicy final {
     bool enabled{false};
     core::Nanoseconds high_watermark{core::Nanoseconds{20'000'000LL}};
     core::Nanoseconds target{core::Nanoseconds{15'000'000LL}};
     core::Nanoseconds max_trim{core::Nanoseconds{5'000'000LL}};
+    core::Nanoseconds catch_up_watermark{core::Nanoseconds{0}}; // 0 disables catch-up
 
     [[nodiscard]] friend constexpr bool operator==(const LivePcmDriftPolicy&,
                                                    const LivePcmDriftPolicy&) noexcept = default;
@@ -185,7 +196,9 @@ struct LivePcmDriftPolicy final {
 // Pure trim decision for one decoded run about to be committed: `phase` is
 // planned start minus the run's original scheduled timestamp. Returns the
 // frames to drop from the HEAD of the run (0 = lossless), never more than the
-// run holds. Extraction point for the long-run drift simulations.
+// run holds. caught_up_frames() is the part of trim_frames() beyond the
+// bounded max_trim, i.e. what the catch-up alone dropped.
+// Extraction point for the long-run drift simulations.
 class LivePcmDriftCorrector final {
 public:
     LivePcmDriftCorrector() noexcept = default;
@@ -193,8 +206,13 @@ public:
 
     [[nodiscard]] std::uint64_t trim_frames(core::Nanoseconds phase,
                                             std::uint64_t run_frames) const noexcept;
+    [[nodiscard]] std::uint64_t caught_up_frames(core::Nanoseconds phase,
+                                                 std::uint64_t run_frames) const noexcept;
 
 private:
+    [[nodiscard]] std::uint64_t trim(core::Nanoseconds phase, std::uint64_t run_frames,
+                                     bool catch_up) const noexcept;
+
     LivePcmDriftPolicy policy_{};
     std::uint64_t rate_{};
 };
@@ -265,6 +283,10 @@ struct RouterStats final {
     std::uint64_t frames_decoded{};
     std::uint64_t frames_retained{};
     std::uint64_t frames_trimmed{};
+    // Subset of frames_trimmed dropped by the catch-up (#154) beyond the
+    // bounded drift trim: audio already more than the watermark behind its
+    // arrival.
+    std::uint64_t frames_caught_up{};
     std::uint64_t frames_silence{};
     std::uint64_t frames_output{};
     std::uint64_t frames_skipped{};

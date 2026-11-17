@@ -3649,7 +3649,7 @@ TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst)
         CadencedPcmSource source;
         source.burst = stall_ms < 0; // Deliberately ACK-paced worst-case, NOT normal PCM cadence.
         // 8 chunks put the last arrival only ~200 ms behind the cursor (step-size
-        // dependent); 16 exceed the cap unambiguously.
+        // dependent); 16 exceeded the cap unambiguously before the #154 catch-up.
         if (source.burst) { source.chunks = 16; }
         auto gate = std::make_shared<RenderGate>();
         gate->first_write_delay = std::chrono::milliseconds{std::abs(stall_ms)};
@@ -3670,12 +3670,16 @@ TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst)
         EXPECT_EQ(result.output.find("\"event\":\"audio_credit_deferred\"") != std::string::npos,
                   deferred) << result.output;
         if (source.burst) {
-            // Credit pacing holds the queue, but an unpaced source still runs
-            // >200 ms ahead of the cursor: the router's unchanged late-arrival
-            // cap, not queue overflow, ends this deliberately unrealistic case.
-            EXPECT_EQ(result.code, 1) << result.output;
-            EXPECT_NE(result.output.find("\"detail\":\"audio_sink_failure\",\"code\":\"invalid_argument\""),
+            // Credit pacing holds the queue, but an unpaced source places its
+            // chunks ever further behind their arrival. Phones do burst like
+            // this after a sink stall (#154, live), so the catch-up drops the
+            // part more than 90 ms behind arrival instead of letting a later
+            // chunk fail the 200 ms late-arrival cap and end the session.
+            EXPECT_EQ(result.code, 0) << result.output;
+            EXPECT_EQ(result.output.find("\"event\":\"err\""), std::string::npos) << result.output;
+            EXPECT_NE(result.output.find("{\"event\":\"audio_catch_up\",\"frames\":"),
                       std::string::npos) << result.output;
+            EXPECT_EQ(source.acks.size(), source.arrivals.size()) << result.output;
             std::cout << "STALL_RESULT mode=worst_case_burst stall_ms=" << std::abs(stall_ms)
                       << " exit=" << result.code << " arrivals=" << source.arrivals.size()
                       << " acks=" << source.acks.size() << '\n' << result.output;
@@ -5883,6 +5887,46 @@ TEST(WiredReceiver, WorkerSinkStallPastScheduledEndSkipsElapsedGapInsteadOfFaili
     const auto event = output.find("{\"event\":\"audio_sink_stall\",");
     ASSERT_NE(event, std::string::npos) << output;
     EXPECT_EQ(output.find("\"event\":\"audio_sink_stall\"", event + 2), std::string::npos) << output;
+}
+
+// #154: after a sink stall the phone delivers its withheld backlog in a burst,
+// stamped at about one arrival. The production policy drops the part of that
+// burst more than 90 ms behind its arrival, so the next real-time arrival is
+// placed normally. Before the catch-up the burst was carried ~600 ms behind
+// its arrival and that arrival failed the 200 ms late cap: an
+// audio_sink_failure that ended the session (live: 500 ms pipewire-pulse pause).
+TEST(WiredReceiver, WorkerStallBurstCatchesUpInsteadOfEndingTheSession) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(8192, std::byte{1}); // one 42.67 ms phone chunk
+    const auto arrival = steady_ns();
+    for (std::uint64_t sequence = 1; sequence <= 16; ++sequence) {
+        ASSERT_TRUE(audio.submit({{role, sequence, {arrival}}, pcm}, {role, 0, sequence, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        ASSERT_FALSE(audio.failure()) << sequence;
+    }
+    ASSERT_TRUE(audio.submit({{role, 17, {arrival + 100'000'000}}, pcm}, {role, 0, 17, 7}));
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    const bool failed = audio.failure().has_value();
+    const bool finished = audio.finish().has_value();
+    const auto output = capture.release();
+    ASSERT_FALSE(failed) << output;
+    ASSERT_TRUE(finished) << output;
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+    EXPECT_NE(output.find("{\"event\":\"audio_catch_up\",\"frames\":"), std::string::npos) << output;
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    EXPECT_FALSE(report->render_failure);
+    // The resumed chunk is written whole, at most 90 ms + one chunk behind its arrival.
+    std::lock_guard lock(gate->mutex);
+    ASSERT_FALSE(gate->timestamps.empty());
+    EXPECT_EQ(gate->pcm.back(), pcm);
+    EXPECT_LE(gate->timestamps.back().count, arrival + 100'000'000 + 90'000'000);
 }
 
 TEST(WiredReceiver, WorkerStartupInflightAndOtherRolePendingNeverAuthorizeIdle) {

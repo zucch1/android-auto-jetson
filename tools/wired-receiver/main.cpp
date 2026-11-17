@@ -844,6 +844,7 @@ class ConcreteAudioRenderWorker final {
         struct Credit { aa::channels::AvDeliveryId id; std::int64_t duration; };
         struct IdleSkip { std::uint64_t id; std::uint64_t frames; std::uint64_t total; };
         struct IdleResume { std::uint64_t id; aa::core::Nanoseconds start; aa::core::Nanoseconds end; };
+        struct CatchUp { std::uint64_t frames; std::uint64_t total; };
         struct SinkStall {
             aa::core::Nanoseconds start;
             aa::core::Nanoseconds end;
@@ -859,6 +860,7 @@ class ConcreteAudioRenderWorker final {
         std::optional<SinkStall> stall;
         std::optional<IdleSkip> skipped;
         std::optional<IdleResume> resumed;
+        std::optional<CatchUp> caught_up;
         void publish() const {
             if (stall) {
                 log_media("audio_sink_stall", "{\"event\":\"audio_sink_stall\",\"blocked_from_ns\":" +
@@ -876,6 +878,10 @@ class ConcreteAudioRenderWorker final {
                     ",\"start_ns\":" + std::to_string(resumed->start.count) + ",\"end_ns\":" +
                     std::to_string(resumed->end.count) + ",\"idle_ns\":" +
                     std::to_string(resumed->end.count - resumed->start.count) + ",\"reason\":\"all_role_idle\"}");
+            }
+            if (caught_up) {
+                log_media("audio_catch_up", "{\"event\":\"audio_catch_up\",\"frames\":" +
+                    std::to_string(caught_up->frames) + ",\"frames_total\":" + std::to_string(caught_up->total) + "}");
             }
             if (skipped) {
                 log_media("audio_idle_skipped", "{\"event\":\"audio_idle_skipped\",\"id\":" + std::to_string(skipped->id) +
@@ -1210,6 +1216,7 @@ class ConcreteAudioRenderWorker final {
             step_started_ = idle_clock_();
             const auto before = router_.report().stats.frames_written;
             const auto idle_before = router_.report().stats.frames_idle_skipped;
+            const auto caught_up_before = router_.report().stats.frames_caught_up;
             lock.unlock();
             const auto step_started = monotonic_now();
             const auto result = router_.render_step();
@@ -1240,6 +1247,10 @@ class ConcreteAudioRenderWorker final {
             }
             in_flight_ = false;
             const auto stats = router_.report().stats;
+            if (stats.frames_caught_up > caught_up_before) {
+                diagnostics.caught_up = SettlementDiagnostics::CatchUp{
+                    stats.frames_caught_up - caught_up_before, stats.frames_caught_up};
+            }
             if (idle_resume_id_) {
                 idle_resume_frames_ += stats.frames_idle_skipped - idle_before;
                 if (result && !result.value().contributors.empty()) { complete_idle_resume(diagnostics); }
@@ -1516,6 +1527,13 @@ aa::audio::RouterConfig pcm_router_config(
     // media clock disagrees with the output clock (~100-200 ppm); without
     // bounded head trims the preserved backlog grows without bound.
     config.live_pcm_drift.enabled = true;
+    // #154: after a sink stall the phone bursts its withheld backlog, which is
+    // placed after the cursor far behind its arrival; past 90 ms (the A/V
+    // excursion bound) the excess is dropped at once instead of 5 ms per
+    // chunk, so audio is never carried further behind its arrival and a long
+    // stall's burst can no longer push a later arrival past the router's
+    // 200 ms late cap (a session-ending audio_sink_failure).
+    config.live_pcm_drift.catch_up_watermark = aa::core::Nanoseconds{90'000'000};
     config.on_write_completed = [](const aa::audio::WriteCompletion &completion) {
         // presented_ns (#60): when the chunk starts playing on the sink's
         // clock; the A/V gate uses it in place of the element handoff. It is

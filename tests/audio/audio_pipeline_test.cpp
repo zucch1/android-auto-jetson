@@ -4085,6 +4085,161 @@ TEST_F(AudioPipelineRoute, IncrementalDriftTrimIsOncePerParentAndRetainsAbsolute
     EXPECT_EQ(observed->write_ns.back(), base.count + 45'000'000);
 }
 
+// #154: the catch-up drops a run's whole excess above target once its phase
+// passes the watermark; below it (and with the watermark unset) the bounded
+// 5 ms trim is unchanged.
+TEST_F(AudioPipelineRoute, DriftPolicyCatchUpDropsTheWholeExcessOnlyAboveItsWatermark) {
+    aa::audio::LivePcmDriftPolicy policy;
+    policy.enabled = true;
+    policy.catch_up_watermark = aa::core::Nanoseconds{90'000'000LL};
+    const aa::audio::LivePcmDriftCorrector corrector{policy, 48000};
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{30'000'000LL}, 4800), 240U);
+    EXPECT_EQ(corrector.caught_up_frames(aa::core::Nanoseconds{30'000'000LL}, 4800), 0U);
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{90'000'000LL}, 4800), 240U);
+    EXPECT_EQ(corrector.caught_up_frames(aa::core::Nanoseconds{90'000'000LL}, 4800), 0U);
+    // 100 ms behind: everything above the 15 ms target (85 ms = 4080 frames).
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{100'000'000LL}, 4800), 4080U);
+    EXPECT_EQ(corrector.caught_up_frames(aa::core::Nanoseconds{100'000'000LL}, 4800), 3840U);
+    // Never more than the run holds.
+    EXPECT_EQ(corrector.trim_frames(aa::core::Nanoseconds{300'000'000LL}, 2048), 2048U);
+    EXPECT_EQ(corrector.caught_up_frames(aa::core::Nanoseconds{300'000'000LL}, 2048), 1808U);
+    aa::audio::LivePcmDriftPolicy bounded;
+    bounded.enabled = true;
+    const aa::audio::LivePcmDriftCorrector unchanged{bounded, 48000};
+    EXPECT_EQ(unchanged.trim_frames(aa::core::Nanoseconds{300'000'000LL}, 4800), 240U);
+    EXPECT_EQ(unchanged.caught_up_frames(aa::core::Nanoseconds{300'000'000LL}, 4800), 0U);
+    aa::audio::LivePcmDriftPolicy lossless;
+    lossless.catch_up_watermark = aa::core::Nanoseconds{90'000'000LL};
+    const aa::audio::LivePcmDriftCorrector disabled{lossless, 48000};
+    EXPECT_EQ(disabled.trim_frames(aa::core::Nanoseconds{300'000'000LL}, 4800), 0U);
+}
+
+namespace {
+
+// One drift-enabled incremental route on a recording sink, rendering in the
+// production 50 ms quantum; catch_up_ns = 0 keeps the bounded trim only.
+struct BurstRoute final {
+    std::shared_ptr<RecordingSinkState> observed;
+    std::optional<aa::audio::AudioRouter> route;
+
+    explicit BurstRoute(std::int64_t catch_up_ns) {
+        auto config = pcm_router_config();
+        config.live_pcm_drift.enabled = true;
+        config.live_pcm_drift.catch_up_watermark = aa::core::Nanoseconds{catch_up_ns};
+        config.render_quantum = aa::core::Nanoseconds{50'000'000};
+        auto sink = std::make_unique<RecordingAudioSink>();
+        observed = sink->state;
+        auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+        if (opened) { route.emplace(std::move(opened).value()); }
+    }
+
+    // Renders until nothing is pending; returns the first failure, if any.
+    [[nodiscard]] aa::core::Result<void> drain() {
+        for (int i = 0; i < 256; ++i) {
+            auto stepped = route->render_step();
+            if (!stepped) { return stepped.error(); }
+            if (!stepped.value().pending) { return {}; }
+        }
+        return aa::Error{aa::ErrorCode::timeout};
+    }
+};
+
+} // namespace
+
+// #154: a sink stall withholds credit, then the phone bursts its backlog, all
+// stamped at about one arrival. Sequentialized after the cursor, the burst
+// used to be placed ever further behind its arrival (5 ms trimmed per chunk),
+// so the next real-time arrival fell more than 200 ms behind the cursor: a
+// "late" rejection, which the receiver latches as a session-ending
+// audio_sink_failure (reproduced live after a 500 ms pipewire-pulse pause).
+// With the catch-up, a chunk more than 90 ms behind its arrival is dropped
+// and the resumed arrival plays 18 ms behind it.
+TEST_F(AudioPipelineRoute, IncrementalStallBurstCatchesUpInsteadOfRejectingTheNextArrival) {
+    BurstRoute burst{90'000'000};
+    ASSERT_TRUE(burst.route);
+    auto& route = *burst.route;
+    const auto chunk = constant_pcm({1000, 2048}); // one 42.67 ms phone chunk
+    for (std::uint64_t i = 0; i < 16; ++i) {
+        ASSERT_TRUE(route.submit(make_message(media, i, base, chunk)));
+    }
+    ASSERT_TRUE(burst.drain());
+    const auto resumed = aa::core::Nanoseconds{base.count + 100'000'000};
+    ASSERT_TRUE(route.submit(make_message(media, 16, resumed, constant_pcm({2000, 2048}))));
+
+    const auto drained = burst.drain();
+
+    ASSERT_TRUE(drained) << aa::to_string(drained.error().code());
+    EXPECT_EQ(route.state(), aa::audio::RouterState::active);
+    const auto& stats = route.report().stats;
+    // Chunks 2 and 3 keep the bounded 5 ms trim (phase 42.7 and 80.3 ms);
+    // chunks 4-16 start 118 ms behind their arrival and are dropped whole.
+    EXPECT_EQ(stats.frames_trimmed, 2U * 240U + 13U * 2048U);
+    EXPECT_EQ(stats.frames_caught_up, 13U * (2048U - 240U));
+    EXPECT_EQ(stats.frames_retained, 2048U + 2U * 1808U + 2048U);
+    ASSERT_FALSE(burst.observed->write_ns.empty());
+    EXPECT_EQ(burst.observed->write_ns.back(), base.count + 118'000'000);
+    EXPECT_EQ(flatten_i16({burst.observed->writes.back()}), std::vector<std::int16_t>(4096, 2000));
+}
+
+// The same burst without the catch-up is the pre-#154 behaviour: the burst is
+// carried ~600 ms behind its arrival and the next arrival is rejected late.
+TEST_F(AudioPipelineRoute, IncrementalStallBurstWithoutCatchUpRejectsTheNextArrivalLate) {
+    BurstRoute burst{0};
+    ASSERT_TRUE(burst.route);
+    auto& route = *burst.route;
+    const auto chunk = constant_pcm({1000, 2048});
+    for (std::uint64_t i = 0; i < 16; ++i) {
+        ASSERT_TRUE(route.submit(make_message(media, i, base, chunk)));
+    }
+    ASSERT_TRUE(burst.drain());
+    EXPECT_EQ(route.report().stats.frames_caught_up, 0U);
+    ASSERT_TRUE(route.submit(make_message(media, 16, aa::core::Nanoseconds{base.count + 100'000'000},
+                                          constant_pcm({2000, 2048}))));
+
+    const auto drained = burst.drain();
+
+    ASSERT_FALSE(drained);
+    EXPECT_EQ(drained.error().code(), aa::ErrorCode::invalid_argument);
+    ASSERT_TRUE(route.report().render_failure);
+    EXPECT_EQ(route.report().render_failure->reason, aa::audio::RenderFailureReason::late);
+}
+
+// Voice uses the same policy: a guidance burst far behind its arrival is
+// caught up too, so a stall during a prompt cannot end the session either.
+TEST_F(AudioPipelineRoute, IncrementalGuidanceStallBurstIsCaughtUpLikeMedia) {
+    BurstRoute burst{90'000'000};
+    ASSERT_TRUE(burst.route);
+    auto& route = *burst.route;
+    const auto chunk = constant_pcm({1000, 2048});
+    for (std::uint64_t i = 0; i < 16; ++i) {
+        ASSERT_TRUE(route.submit(make_message(guidance, i, base, chunk)));
+    }
+    ASSERT_TRUE(burst.drain());
+    ASSERT_TRUE(route.submit(make_message(guidance, 16, aa::core::Nanoseconds{base.count + 100'000'000},
+                                          constant_pcm({2000, 2048}))));
+
+    ASSERT_TRUE(burst.drain());
+    EXPECT_EQ(route.report().stats.frames_caught_up, 13U * (2048U - 240U));
+    EXPECT_EQ(burst.observed->write_ns.back(), base.count + 118'000'000);
+}
+
+// Ordinary jitter never reaches the watermark: two chunks delivered together
+// (phase 42.7 ms) keep the bounded trim and lose nothing to the catch-up.
+TEST_F(AudioPipelineRoute, IncrementalOrdinaryJitterNeverTriggersTheCatchUp) {
+    BurstRoute burst{90'000'000};
+    ASSERT_TRUE(burst.route);
+    auto& route = *burst.route;
+    const auto chunk = constant_pcm({1000, 2048});
+    for (std::uint64_t i = 0; i < 40; i += 2) {
+        const aa::core::Nanoseconds arrival{base.count + static_cast<std::int64_t>(i) * 42'666'667};
+        ASSERT_TRUE(route.submit(make_message(media, i, arrival, chunk)));
+        ASSERT_TRUE(route.submit(make_message(media, i + 1, arrival, chunk)));
+        ASSERT_TRUE(burst.drain());
+    }
+    EXPECT_EQ(route.report().stats.frames_caught_up, 0U);
+    EXPECT_GT(route.report().stats.frames_trimmed, 0U);
+}
+
 TEST_F(AudioPipelineRoute, IncrementalQueuedParentsDoNotBecomeLateArrivalsBetweenSteps) {
     open_incremental();
     for (std::uint64_t i = 0; i < 12; ++i) { enqueue(media, i, {1000, 960}); }

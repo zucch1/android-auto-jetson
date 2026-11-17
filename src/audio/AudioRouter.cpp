@@ -84,6 +84,9 @@ struct ScheduledRun final {
     const Run* run{nullptr};
     std::optional<std::int64_t> intended{};
     std::uint64_t role_end_before{};
+    // Part of head_trim_frames dropped by the catch-up (#154), counted when
+    // the run is placed.
+    std::uint64_t caught_up_frames{0};
 };
 
 } // namespace
@@ -98,11 +101,26 @@ LivePcmDriftCorrector::LivePcmDriftCorrector(LivePcmDriftPolicy policy,
 // a zero-drift stream never lose a frame.
 std::uint64_t LivePcmDriftCorrector::trim_frames(core::Nanoseconds phase,
                                                  std::uint64_t run_frames) const noexcept {
+    return trim(phase, run_frames, true);
+}
+
+std::uint64_t LivePcmDriftCorrector::caught_up_frames(core::Nanoseconds phase,
+                                                      std::uint64_t run_frames) const noexcept {
+    return trim(phase, run_frames, true) - trim(phase, run_frames, false);
+}
+
+std::uint64_t LivePcmDriftCorrector::trim(core::Nanoseconds phase, std::uint64_t run_frames,
+                                          bool catch_up) const noexcept {
     if (!policy_.enabled || rate_ == 0 || phase <= policy_.high_watermark) {
         return 0;
     }
     const core::Nanoseconds excess{phase.count - policy_.target.count};
-    const core::Nanoseconds budget = excess < policy_.max_trim ? excess : policy_.max_trim;
+    // #154 catch-up: a post-stall burst far behind its arrival drops the whole
+    // excess at once instead of max_trim per run (bounded by the run below).
+    const bool catching_up = catch_up && policy_.catch_up_watermark.count > 0
+        && phase > policy_.catch_up_watermark;
+    const core::Nanoseconds budget =
+        catching_up || excess < policy_.max_trim ? excess : policy_.max_trim;
     if (budget.count <= 0) {
         return 0;
     }
@@ -623,6 +641,7 @@ core::Result<void> AudioRouter::pump() {
     std::array<std::uint64_t, kRoleCount> new_role_ends = impl_->role_end_frames;
     std::uint64_t planned_retained = 0;
     std::uint64_t planned_trimmed = 0;
+    std::uint64_t planned_caught_up = 0;
     bool schedule_ok = true;
     for (std::size_t i = 0; i < kRoleCount; ++i) {
         std::uint64_t role_end = impl_->role_end_frames[i];
@@ -657,6 +676,7 @@ core::Result<void> AudioRouter::pump() {
             // advances by the retained frames only.
             const core::Nanoseconds phase{planned_ns - run.timestamp.count};
             entry.head_trim_frames = impl_->drift.trim_frames(phase, run.frames);
+            entry.caught_up_frames = impl_->drift.caught_up_frames(phase, run.frames);
             const std::uint64_t retained = run.frames - entry.head_trim_frames;
             if (retained > UINT64_MAX - entry.start_frame) {
                 schedule_ok = false;
@@ -673,6 +693,7 @@ core::Result<void> AudioRouter::pump() {
             entry.run = &run;
             planned_retained += retained;
             planned_trimmed += entry.head_trim_frames;
+            planned_caught_up += entry.caught_up_frames;
             scheduled.push_back(entry);
         }
     }
@@ -900,6 +921,7 @@ core::Result<void> AudioRouter::pump() {
     impl_->role_end_frames = new_role_ends;
     impl_->report.stats.frames_retained += planned_retained;
     impl_->report.stats.frames_trimmed += planned_trimmed;
+    impl_->report.stats.frames_caught_up += planned_caught_up;
     for (auto& queue : impl_->pending) {
         queue.clear();
     }
@@ -1061,8 +1083,9 @@ core::Result<RenderStep> AudioRouter::render_step() {
                     valid = false;
                     break;
                 }
-                entry.head_trim_frames = impl_->drift.trim_frames(
-                    core::Nanoseconds{placed_ns - run.timestamp.count}, run.frames);
+                const core::Nanoseconds phase{placed_ns - run.timestamp.count};
+                entry.head_trim_frames = impl_->drift.trim_frames(phase, run.frames);
+                entry.caught_up_frames = impl_->drift.caught_up_frames(phase, run.frames);
             }
             const auto remaining = run.frames - entry.head_trim_frames;
             diagnostic.start = entry.start_frame;
@@ -1163,6 +1186,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
         auto& queue = impl_->pending[role];
         if (head.start_frame == head.end_frame) {
             impl_->report.stats.frames_trimmed += head.head_trim_frames;
+            impl_->report.stats.frames_caught_up += head.caught_up_frames;
             impl_->role_end_frames[role] = head.end_frame;
             result.completed.push_back(queue.front().header);
             queue.pop_front();
@@ -1228,6 +1252,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
             run.placed = head.start_frame;
             run.trimmed = head.head_trim_frames;
             impl_->report.stats.frames_trimmed += run.trimmed;
+            impl_->report.stats.frames_caught_up += head.caught_up_frames;
         }
         materialized[role] = PcmChunk{static_cast<Role>(role), impl_->config.output_format,
             core::Nanoseconds{scheduled_ns}, std::span<const std::byte>{run.pcm}.subspan(
