@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -89,7 +90,9 @@ def main() -> int:
         print(f"PASS: Test 1 ({len(lines)} lines are valid JSON)")
 
     # Test 2: no raw secret/MAC/location/credential appears in any output line.
-    all_output = stdout
+    # Salted pseudonyms ("id-" + 16 hex digits) are random per process; mask them so a
+    # digit-only raw value such as 424242 cannot match inside one by chance.
+    all_output = re.sub(r"id-[0-9a-f]{16}", "id-<pseudonym>", stdout)
     leaked = [s for s in RAW_SECRETS if s in all_output]
     if leaked:
         failures.append(f"Test 2: raw values leaked into JSON: {leaked}")
