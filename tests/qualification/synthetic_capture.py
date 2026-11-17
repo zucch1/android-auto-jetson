@@ -61,6 +61,7 @@ def capture_v3(seconds: int, provenance: dict[str, JSON]) -> dict[str, JSON]:
                         'audio_intervals_ns': [[0, end + 1_000_000_000]]}
     drags = list(range(500_000_000, end + 5_000_000_000, 1_500_000_000))
     raw['workload'] = {'kind': 'moving-map', 'media_relaunches': 0, 'drags': len(drags),
-                       'stimulus_started': True, 'phone_failure': None, 'drag_t_ns': drags}
+                       'stimulus_started': True, 'phone_failure': None, 'drag_t_ns': drags,
+                       'cleanup_failures': []}
     raw['concurrent_builds'] = []
     return raw

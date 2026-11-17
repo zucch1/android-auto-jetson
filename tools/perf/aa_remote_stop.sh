@@ -18,19 +18,27 @@
 #     for it: the stop may race a collector that is still starting.
 #  2. TERM the collector. Its own handler stops the stimulus, the display and
 #     the receiver, restores the phone and then removes the run file: that
-#     removal, within ACK_SECONDS (default 30), is the acknowledgement.
+#     removal, within ACK_SECONDS (default 30), is the acknowledgement. Just
+#     before it, the collector writes RUN_FILE.cleanup: one line per restore
+#     step it could not do or verify (empty: clean). Those are relayed.
 #  3. Otherwise (no acknowledgement, or the collector is already gone without
 #     one), the independent fallback: KILL the collector's whole process group
 #     (its in-flight adb commands included) and the receiver's and display's
 #     groups, wait until every one of those groups is empty, and only then
-#     restore the phone directly (USB mode mtp, stop the media player). A
+#     restore the phone directly. A
 #     group is only signalled while it is still the recorded one: same PGID
 #     and session, and, if a process leads it, the recorded leader (start time).
 #
+# Every restore here and in the collector has the same order: no more intents,
+# force-stop the media package and verify with pidof (bounded retries), then
+# and only then `svc usb setFunctions mtp`, which re-enumerates USB and
+# breaks adb for a moment (a force-stop sent after it is lost).
+#
 # Prints one line and exits 0 for "remote-stop: no-run", "remote-stop:
-# acknowledged" or "remote-stop: forced". If a process of a killed group
-# survives the KILL, it still restores the phone but prints "remote-stop:
-# failed: survivors PID..." and exits 1.
+# acknowledged" or "remote-stop: forced". Otherwise it prints "remote-stop:
+# failed: ..." naming each problem (survivors of the KILL, a restore step the
+# collector or this script could not do or verify, a missing cleanup report)
+# and exits 1; the phone restore is still attempted.
 set -u
 set -f  # no globbing of /proc fields (the scan's own glob is under set +f below)
 
@@ -106,17 +114,30 @@ fi
 
 collector_pid="$(field collector 2)"
 collector_start="$(field collector 3)"
+serial="$(field phone 2)"
+package="$(field media_package 2)"
+cleanup_report="${run_file}.cleanup"
 if same_process "$collector_pid" "$collector_start"; then
     kill -TERM "$collector_pid" 2>/dev/null
     if wait_until "$ack_seconds" gone; then
+        # The collector's own restore: relay what it could not do or verify.
+        failures=()
+        if [[ -f "$cleanup_report" ]]; then
+            mapfile -t failures < "$cleanup_report"
+            rm -f -- "$cleanup_report"
+        elif [[ -n "$serial" ]]; then
+            failures=("cleanup_not_reported: the collector removed its run file without a report")
+        fi
+        if ((${#failures[@]})); then
+            echo "remote-stop: failed: acknowledged with cleanup failures: $(IFS=';'; echo "${failures[*]}")"
+            exit 1
+        fi
         echo "remote-stop: acknowledged"
         exit 0
     fi
 fi
 
 # Fallback: the collector did not confirm its cleanup in time.
-serial="$(field phone 2)"
-package="$(field media_package 2)"
 # The collector's group (its adb children too), then the receiver's and the
 # display's (each leads its own session: PGID = SID = PID).
 kill_group "$(field group 2)" "$(field group 3)" "$collector_start"
@@ -137,18 +158,39 @@ for group in "${killed_groups[@]}"; do
     fi
 done
 if same_process "$collector_pid" "$collector_start" \
-        && ! wait_until 5 collector_gone; then
+        && ! wait_until 5 collector_gone && [[ " ${survivors[*]} " != *" $collector_pid "* ]]; then
     survivors+=("$collector_pid")
 fi
+# The restore: media first, verified; the USB function change last.
+problems=()
+((${#survivors[@]})) && problems+=("survivors ${survivors[*]}")
 if [[ -n "$serial" ]]; then
-    timeout 15 adb -s "$serial" shell svc usb setFunctions mtp >/dev/null 2>&1 || true
     if [[ -n "$package" ]]; then
-        timeout 15 adb -s "$serial" shell am force-stop "$package" >/dev/null 2>&1 || true
+        media_stopped=0 why="not attempted"
+        for attempt in 1 2 3; do
+            ((attempt > 1)) && sleep 1
+            if ! timeout 15 adb -s "$serial" shell am force-stop "$package" >/dev/null 2>&1; then
+                why="force-stop failed"
+                continue
+            fi
+            pids="$(timeout 15 adb -s "$serial" shell pidof "$package" 2>&1)"
+            rc=$?
+            if ((rc == 1)) && [[ -z "$pids" ]]; then
+                media_stopped=1
+                break
+            fi
+            why="still running or unverified (pidof rc ${rc}: ${pids:0:80})"
+        done
+        ((media_stopped)) || problems+=("media_stop_unverified: ${package} after 3 attempts: ${why}")
+    else
+        problems+=("media_stop_unavailable: no media package recorded")
     fi
+    timeout 15 adb -s "$serial" shell svc usb setFunctions mtp >/dev/null 2>&1 \
+        || problems+=("usb_reset_failed")
 fi
-rm -f -- "$run_file"
-if ((${#survivors[@]})); then
-    echo "remote-stop: failed: survivors ${survivors[*]}"
+rm -f -- "$run_file" "$cleanup_report"
+if ((${#problems[@]})); then
+    echo "remote-stop: failed: forced: $(IFS=';'; echo "${problems[*]}")"
     exit 1
 fi
 echo "remote-stop: forced"

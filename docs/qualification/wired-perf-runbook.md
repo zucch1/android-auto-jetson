@@ -340,9 +340,38 @@ audio write, counting each relaunch in `workload.media_relaunches`. A display
 that stops accepting control input for `CONTROL_WRITE_TIMEOUT_S` ends the stage
 with terminal error `display_control_stalled`, and one whose control input
 closes ends it with `display_control_closed` (both FAIL: the display is part of
-the product under test). After cleanup the phone's USB
-mode is reset and the media player stopped. Every live stage needs
+the product under test). Every live stage needs
 `--media-uri` (optional `--media-type`, `--media-component`, `--geo-uri`).
+
+**Phone restore order.** Every cleanup path restores the phone the same way:
+the normal end, an acknowledged stop, the forced fallback, the drive smoke and
+the soak.
+
+1. The intent gate is closed, so no media or Maps intent can follow.
+2. The media package (from `--media-component`) is force-stopped, and
+   `pidof` must then show no process. A failed command or a player that is
+   still running is retried, up to `MEDIA_STOP_ATTEMPTS` (3) times, 1 s
+   apart.
+3. Only then is the USB mode reset (`svc usb setFunctions mtp`). That switch
+   re-enumerates USB and breaks adb for a moment, so a command sent right
+   after it is lost.
+
+The 2026-11-17 A26 run hit exactly this. The old order switched USB first,
+the force-stop that followed got "device not found", and VLC stayed alive
+(paused).
+
+A step that fails or cannot be verified is a named entry in
+`workload.cleanup_failures`, in the capture and in the v3 result (the drive
+smoke's result has the same field):
+
+- `media_stop_unverified: <pkg> after 3 attempts: <why>`;
+- `media_stop_unavailable` (no `--media-component`, so the player is
+  unknown);
+- `usb_reset_failed: <why>`.
+
+The restore runs after the measurement, so it does not change the verdict. It
+is recorded, never silent. Pass `--media-component` so the player can be
+stopped.
 
 Every phone command goes through one lock with a closed gate. The phone
 restore waits for an in-flight command, closes the gate and restores, so no
@@ -498,7 +527,12 @@ the stop explicit:
 3. The script TERMs the collector, which runs its normal cleanup: stimulus,
    display, receiver, then the phone restore. Only then does the collector
    remove the run file. That removal, within `AA_REMOTE_STOP_ACK_S` (30 s), is
-   the acknowledgement (`remote-stop: acknowledged`).
+   the acknowledgement. Just before it, the collector writes
+   `<run file>.cleanup`, with one line per restore step it could not do or
+   verify. The script relays it:
+   - `remote-stop: acknowledged` only for an empty report;
+   - otherwise, or with no report at all, `remote-stop: failed: acknowledged
+     with cleanup failures: ...` and exit 1.
 4. Without an acknowledgement (a hung cleanup, or a collector already gone),
    the script falls back independently:
    - It KILLs the collector's whole process group, so an in-flight adb command
@@ -507,12 +541,14 @@ the stop explicit:
      PGID and session and, if a live process leads it, the recorded leader by
      start time. A reused PID is never signalled.
    - It waits until every killed group is empty, then restores the phone
-     itself (`svc usb setFunctions mtp`, then force-stop the media player) and
-     prints `remote-stop: forced`. Nothing the collector started can send an
-     intent after that restore.
-   - If a process survives the KILL, the script still restores the phone but
-     prints `remote-stop: failed: survivors <PID>...` and exits 1, and the
-     launcher reports the remote stop as failed.
+     itself in the same order: force-stop the media player and verify it with
+     `pidof` (3 attempts), then `svc usb setFunctions mtp`. It prints
+     `remote-stop: forced`. Nothing the collector started can send an intent
+     after that restore.
+   - If a process survives the KILL, or a restore step fails or cannot be
+     verified, the script still attempts the restore but prints
+     `remote-stop: failed: forced: ...` naming each problem and exits 1. The
+     launcher reports that the remote stop reported a failure.
 5. The launcher then drops its own ssh client and exits 143 (130 for INT).
 
 The stop's ssh is bounded at 75 s, inside the chain's 120 s grace. An explicit

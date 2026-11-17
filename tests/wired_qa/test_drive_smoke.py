@@ -738,13 +738,8 @@ if not os.environ.get("FAKE_DISPLAY_STALL"):
 time.sleep(300)
 """
 
-FAKE_ADB = """#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$FAKE_DIR/adb.log"
-case "$*" in
-    "devices -l") printf 'List of devices attached\\nFAKESERIAL device usb:9-9 model:FAKE\\n' ;;
-esac
-exit 0
-"""
+# The fake phone: media player state, pidof, USB re-enumeration after setFunctions.
+FAKE_ADB = (ROOT / "tests/perf/fixtures/wired_perf/fake_phone_adb.sh").read_text()
 
 # Run the real runner in a child Python with only the host-wide process scan
 # stubbed (a compiler elsewhere on this machine must not block the test).
@@ -837,7 +832,8 @@ class RunnerSignalTests(unittest.TestCase):
             path.write_text(body)
             path.chmod(0o755)
         (root / "store.json").write_text("{}")
-        env = dict(os.environ, FAKE_DIR=str(root), DRIVE_HOOK=hook, PATH=f"{bin_dir}:/usr/bin:/bin")
+        env = dict(os.environ, FAKE_DIR=str(root), DRIVE_HOOK=hook, PATH=f"{bin_dir}:/usr/bin:/bin",
+                   FAKE_ADB_LOG=str(root / "adb.log"))
         if hook == "stall":
             env["FAKE_DISPLAY_STALL"] = "1"
         return subprocess.Popen(
@@ -873,6 +869,9 @@ class RunnerSignalTests(unittest.TestCase):
         self.assertEqual((result["verdict"], result["blocked_on"]), ("BLOCKED", "interrupted"))
         adb = (root / "adb.log").read_text().splitlines()
         self.assertEqual(adb[-1], "-s FAKESERIAL shell svc usb setFunctions mtp", adb)
+        # Without --media-component the player is unknown: recorded, never silent.
+        self.assertEqual(result["cleanup_failures"],
+                         ["media_stop_unavailable: no media component, the player is unknown"])
 
     def scenario(self, hook: str, external_sigterm: bool, check) -> None:
         with tempfile.TemporaryDirectory(prefix=f"drive-smoke-signal-{hook or 'mid'}-") as directory:
@@ -899,6 +898,33 @@ class RunnerSignalTests(unittest.TestCase):
             runner.send_signal(signal.SIGTERM)
             self.finish(root, runner, signal.SIGTERM)
         self.scenario("", True, check)
+
+    def test_cleanup_stops_and_verifies_the_player_before_the_usb_switch(self) -> None:
+        # Given a drive with an explicit media component (the player is known).
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-cleanup-") as directory:
+            root = Path(directory)
+            runner = self.start(root, "", "--duration", "3",
+                                "--media-component", "org.example.player/.Play")
+            try:
+                output, _ = runner.communicate(timeout=90)
+            finally:
+                if runner.poll() is None:
+                    runner.kill()
+                if (root / "receiver.pids").exists():
+                    for pid in self.pids(root):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+            adb = (root / "adb.log").read_text().splitlines()
+            result = json.loads((root / "out" / "result.json").read_text())
+            running = (root / "adb.log.phone" / "running.org.example.player").exists()
+        # Then the player was force-stopped and verified gone, then USB switched.
+        self.assertEqual(adb[-3:], ["-s FAKESERIAL shell am force-stop org.example.player",
+                                    "-s FAKESERIAL shell pidof org.example.player",
+                                    "-s FAKESERIAL shell svc usb setFunctions mtp"], output)
+        self.assertFalse(running, adb)
+        self.assertEqual(result["cleanup_failures"], [], output)
 
     def test_media_is_relaunched_when_audio_stops(self) -> None:
         # Given a 12 s drive whose (fake) receiver never logs an audio write.

@@ -56,7 +56,8 @@ def moving_map(seconds: int, **change) -> dict:
     """A healthy moving-map record: drags every 1.5 s past the window's end."""
     times = list(range(DRAG_NS // 2, (seconds + 10) * NS, DRAG_NS))
     return {"kind": "moving-map", "media_relaunches": 0, "drags": len(times),
-            "stimulus_started": True, "phone_failure": None, "drag_t_ns": times, **change}
+            "stimulus_started": True, "phone_failure": None, "drag_t_ns": times,
+            "cleanup_failures": [], **change}
 
 
 def result(raw: dict, *, live: bool = False) -> dict:
@@ -152,7 +153,7 @@ def test_live_v3_requires_proof_that_the_stimulus_ran() -> None:
             assert reason in doc["blocked_on"], (workload, doc["blocked_on"])
             # The result records the evidence it saw, every field present.
             assert set(doc["workload"]) == {"kind", "media_relaunches", "drags", "stimulus_started",
-                                            "phone_failure", "max_drag_gap_s"}
+                                            "phone_failure", "max_drag_gap_s", "cleanup_failures"}
     ok = result(v3(1800, workload={**base, "drags": 450}), live=True)
     assert "moving_map" not in (ok["blocked_on"] or ""), ok["blocked_on"]
     # The v3 schema requires the evidence fields for a moving-map record.
@@ -208,6 +209,21 @@ def test_live_v3_requires_drags_across_the_whole_window() -> None:
         assert "run_evidence:moving_map_drag_gap" in doc["blocked_on"], (bad, doc["blocked_on"])
         assert doc["workload"]["max_drag_gap_s"] is None
     assert result(v3(1800), live=True)["workload"]["max_drag_gap_s"] == 1.5
+
+
+def test_cleanup_failures_are_recorded_never_silent() -> None:
+    # The phone restore runs after the measurement: a media stop it could not
+    # verify is recorded in the result (and validated), not hidden.
+    failure = "media_stop_unverified: org.example.player after 3 attempts: still running (pid 1)"
+    doc = result(v3(1800, workload=moving_map(1800, cleanup_failures=[failure])), live=True)
+    assert doc["workload"]["cleanup_failures"] == [failure]
+    assert not schema.validate(doc, schema.load_schema(schema.SCHEMA_V3))
+    assert result(v3(1800), live=True)["workload"]["cleanup_failures"] == []
+    # A capture that does not record its restore says so.
+    record = moving_map(1800)
+    del record["cleanup_failures"]
+    assert result(v3(1800, workload=record), live=True)["workload"]["cleanup_failures"] == [
+        "cleanup not recorded"]
 
 
 def test_live_v3_blocks_a_build_during_the_stage() -> None:

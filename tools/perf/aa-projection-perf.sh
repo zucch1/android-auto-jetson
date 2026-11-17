@@ -546,7 +546,9 @@ if [[ -n "$stop_signal" ]]; then
     stop_rc=0
     timeout $((REMOTE_STOP_ACK_S + 45)) ssh "${SSH_OPTS[@]}" "$HOST" \
         "bash -s -- '${RUN_FILE}' ${REMOTE_STOP_ACK_S}" <"$TOOL_DIR/aa_remote_stop.sh" >&2 || stop_rc=$?
-    ((stop_rc == 0)) || echo "stopping: the remote stop failed (rc ${stop_rc})" >&2
+    # rc 1: the stop finished but reported a problem (a survivor, or a restore
+    # step such as the media stop that could not be done or verified).
+    ((stop_rc == 0)) || echo "stopping: the remote stop reported a failure (rc ${stop_rc})" >&2
     # The remote command has ended (or was killed): drop the local client.
     kill -TERM "$collector_job" 2>/dev/null || true
     wait "$collector_job" 2>/dev/null || true

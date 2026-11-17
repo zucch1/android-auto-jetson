@@ -682,10 +682,15 @@ def _workload_record(raw: object, window: Window | None) -> dict:
     count = lambda key: (raw[key] if isinstance(raw.get(key), int)  # noqa: E731
                          and not isinstance(raw.get(key), bool) and raw[key] >= 0 else 0)
     failure = raw.get("phone_failure", "not recorded")
+    # The phone restore after the stage (media stopped and verified, then USB
+    # mode): recorded, never silent. It does not change the measured verdict.
+    cleanup = raw.get("cleanup_failures")
+    cleanup = ([str(item)[:300] for item in cleanup] if isinstance(cleanup, list)
+               else ["cleanup not recorded"])
     return {"kind": "moving-map", "media_relaunches": count("media_relaunches"),
             "drags": count("drags"), "stimulus_started": raw.get("stimulus_started") is True,
             "phone_failure": failure if failure is None else str(failure)[:300],
-            "max_drag_gap_s": _drag_gap(raw, window)}
+            "max_drag_gap_s": _drag_gap(raw, window), "cleanup_failures": cleanup}
 
 
 def _digest(value: str | None) -> bool:

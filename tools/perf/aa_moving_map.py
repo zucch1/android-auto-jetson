@@ -15,7 +15,11 @@ One implementation of the phone and display choreography:
   the media playing: after ``MEDIA_RELAUNCH_SILENCE_S`` without an audio write
   the media intent is re-sent, then Maps (at most once per interval), counted
   in ``media_relaunches``;
-* ``restore_phone``: reset the USB mode and stop the media player.
+* ``restore_phone``: close the intent gate (no media or Maps intent after
+  it), force-stop the media player and verify it is gone (``pidof``, bounded
+  retries), and only then reset the USB mode: ``svc usb setFunctions``
+  re-enumerates USB and breaks adb for a moment, so nothing may follow it.
+  Every step that cannot be verified is a named ``cleanup_failures`` entry.
 
 Every required phone command is checked: a nonzero exit, a timeout or an
 ``am start`` that reports ``Error`` sets ``phone_failure`` and ends the
@@ -60,6 +64,10 @@ MIN_DRAG_RATE_HZ = 0.25
 # still catches a stimulus that stopped (closed pipe, dead thread) mid-stage,
 # which the aggregate MIN_DRAG_RATE_HZ alone cannot.
 MAX_DRAG_GAP_S = 10.0
+# The media force-stop is verified with ``pidof``; on a failed command or a
+# still-running player it is retried this many times, this far apart.
+MEDIA_STOP_ATTEMPTS = 3
+MEDIA_STOP_RETRY_S = 1.0
 MAPS_PACKAGE = "com.google.android.apps.maps"
 DEFAULT_GEO_URI = "geo:0,0?q=Atlanta"
 AUDIO_LINE = b'{"event":"audio_write_completed"'
@@ -166,6 +174,8 @@ class MovingMap:
         # The first required phone command that failed ("<step>: <why>"): the
         # workload is over; nothing more is sent but the restore.
         self.phone_failure: str | None = None
+        # What restore_phone could not do or verify (empty: a clean restore).
+        self.cleanup_failures: list[str] = []
         self._last_drag = None
         self._relaunched_ns = time.monotonic_ns()
         # Every phone command goes through _phone under this lock. restore_phone
@@ -209,15 +219,53 @@ class MovingMap:
         self._relaunched_ns = time.monotonic_ns()
         return True
 
-    def restore_phone(self) -> None:
-        """Close the intent gate (after any in-flight command), then restore. Idempotent."""
+    def restore_phone(self, sleep: Callable[[float], object] = time.sleep) -> list[str]:
+        """Close the intent gate (after any in-flight command), then restore. Idempotent.
+
+        Order: the gate is closed first (no media or Maps intent can follow),
+        then the media player is force-stopped and verified gone, and the USB
+        function change comes last, because it re-enumerates USB and breaks
+        adb for a moment. Returns (and keeps in ``cleanup_failures``) every
+        step that failed or could not be verified; empty means a clean restore.
+        """
         with self._lock:
             if self._closed:
-                return
+                return list(self.cleanup_failures)
             self._closed = True
-            self.adb("shell", "svc", "usb", "setFunctions", "mtp")
+            failures = []
             if self.media_package:
-                self.adb("shell", "am", "force-stop", self.media_package)
+                failure = self._stop_media(sleep)
+                if failure is not None:
+                    failures.append(failure)
+            else:
+                failures.append("media_stop_unavailable: no media component, the player is unknown")
+            usb = command_failure(self.adb("shell", "svc", "usb", "setFunctions", "mtp"))
+            if usb is not None:
+                failures.append(f"usb_reset_failed: {usb}")
+            self.cleanup_failures = failures
+            return list(failures)
+
+    def _stop_media(self, sleep: Callable[[float], object]) -> str | None:
+        """Force-stop the media package until ``pidof`` shows no process (bounded)."""
+        why = "not attempted"
+        for attempt in range(MEDIA_STOP_ATTEMPTS):
+            if attempt:
+                sleep(MEDIA_STOP_RETRY_S)
+            stop = command_failure(self.adb("shell", "am", "force-stop", self.media_package))
+            if stop is not None:
+                why = f"force-stop {stop}"
+                continue
+            check = self.adb("shell", "pidof", self.media_package)
+            if not isinstance(check, subprocess.CompletedProcess):
+                why = "pidof: no result"
+                continue
+            output = (check.stdout or "").strip()
+            if check.returncode == 1 and not output and not (check.stderr or "").strip():
+                return None  # pidof found no process: the player is gone
+            why = (f"still running (pid {output})" if check.returncode == 0 and output
+                   else f"pidof: {command_failure(check) or 'unexpected output ' + output[:80]}")
+        return (f"media_stop_unverified: {self.media_package} after {MEDIA_STOP_ATTEMPTS} "
+                f"attempts: {why}"[:300])
 
     def keep_media_playing(self, now_ns: int, last_audio_ns: int | None, since_ns: int,
                            stopped: Callable[[], bool] = lambda: False) -> bool:

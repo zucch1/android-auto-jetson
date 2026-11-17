@@ -544,7 +544,8 @@
             "drags",
             "stimulus_started",
             "phone_failure",
-            "max_drag_gap_s"
+            "max_drag_gap_s",
+            "cleanup_failures"
           ],
           "properties": {
             "kind": {
@@ -571,6 +572,9 @@
                 "null"
               ],
               "minimum": 0
+            },
+            "cleanup_failures": {
+              "$ref": "#/$defs/strings"
             }
           }
         }

@@ -37,6 +37,8 @@ class Adb:
         self.calls.append(args)
         if self.fail is not None and self.fail in " ".join(args):
             return subprocess.CompletedProcess(args, self.returncode, self.stdout, "")
+        if args[:2] == ("shell", "pidof"):  # nothing running: toybox exits 1, silent
+            return subprocess.CompletedProcess(args, 1, "", "")
         return subprocess.CompletedProcess(args, 0, "Starting: Intent { ... }", "")
 
     def intents(self, needle: str) -> int:
@@ -77,9 +79,85 @@ def test_prepare_and_restore_the_phone() -> None:
     stopped = Adb()
     assert not workload(stopped).prepare_phone(lambda seconds: False)
     assert stopped.intents(mm.MAPS_PACKAGE) == 0
-    work.restore_phone()
-    assert adb.calls[-2:] == [("shell", "svc", "usb", "setFunctions", "mtp"),
-                              ("shell", "am", "force-stop", "org.example.player")]
+    assert work.restore_phone() == []
+    # Media stopped and verified first; the USB function change last.
+    assert adb.calls[-3:] == [("shell", "am", "force-stop", "org.example.player"),
+                              ("shell", "pidof", "org.example.player"),
+                              ("shell", "svc", "usb", "setFunctions", "mtp")]
+
+
+FAKE_PHONE = ROOT / "tests/perf/fixtures/wired_perf/fake_phone_adb.sh"
+
+
+def phone_restore(**knobs: str) -> tuple[list[str], list[str], bool]:
+    """Set up and restore a fake phone through the real adb_runner.
+
+    Returns (restore failures, adb argv log, whether the player still runs)."""
+    with tempfile.TemporaryDirectory(prefix="moving-map-phone-") as directory:
+        root = Path(directory)
+        (root / "adb").symlink_to(FAKE_PHONE)
+        log = root / "adb.log"
+        env = {"PATH": f"{root}:{os.environ['PATH']}", "FAKE_ADB_LOG": str(log), **knobs}
+        with patch.dict(os.environ, env):
+            work = mm.MovingMap(mm.adb_runner("TESTPHONE01"), media_uri="file:///sdcard/Music/fixture.opus",
+                                media_component=knobs.get("COMPONENT", "org.example.player/.Play"))
+            assert work.prepare_phone(lambda seconds: REAL_SLEEP(0.4) or True)
+            failures = work.restore_phone(sleep=lambda seconds: None)
+            running = (root / "adb.log.phone" / "running.org.example.player").exists()
+        return failures, log.read_text().splitlines(), running
+
+
+def restore_order(adb: list[str]) -> list[str]:
+    tail = adb[next(i for i, line in enumerate(adb) if "force-stop" in line or
+                    ("setFunctions" in line and i > 0)):]
+    return [" ".join(line.split()[3:5]) for line in tail]
+
+
+def test_the_live_defect_usb_switch_first_loses_the_force_stop() -> None:
+    # The 2026-11-17 A26 interruption: setFunctions then force-stop. The switch
+    # re-enumerates USB, the force-stop gets "device not found", VLC lives on.
+    with tempfile.TemporaryDirectory(prefix="moving-map-phone-") as directory:
+        root = Path(directory)
+        (root / "adb").symlink_to(FAKE_PHONE)
+        with patch.dict(os.environ, {"PATH": f"{root}:{os.environ['PATH']}",
+                                     "FAKE_ADB_LOG": str(root / "adb.log")}):
+            adb = mm.adb_runner("TESTPHONE01")
+            adb("shell", "am", "start", "-d", "x", "-n", "org.example.player/.Play")
+            adb("shell", "svc", "usb", "setFunctions", "mtp")
+            stop = adb("shell", "am", "force-stop", "org.example.player")
+        assert stop.returncode == 1 and "not found" in stop.stderr, stop
+        assert (root / "adb.log.phone" / "running.org.example.player").exists()
+
+
+def test_restore_stops_and_verifies_media_before_the_usb_switch() -> None:
+    failures, adb, running = phone_restore()
+    assert failures == [] and not running, (failures, adb)
+    assert restore_order(adb) == ["am force-stop", "pidof org.example.player",
+                                  "svc usb"], adb
+    assert adb[-1] == "-s TESTPHONE01 shell svc usb setFunctions mtp", adb
+
+
+def test_restore_retries_a_player_that_respawns() -> None:
+    failures, adb, running = phone_restore(FAKE_ADB_RESPAWN="org.example.player:2")
+    assert failures == [] and not running, (failures, adb)
+    assert restore_order(adb) == ["am force-stop", "pidof org.example.player"] * 3 + ["svc usb"], adb
+
+
+def test_restore_records_a_media_stop_it_cannot_verify() -> None:
+    # Given a player that never goes away: bounded attempts, a named failure,
+    # and the USB switch still comes last.
+    failures, adb, running = phone_restore(FAKE_ADB_STUCK="org.example.player")
+    assert running and len(failures) == 1, failures
+    assert failures[0].startswith("media_stop_unverified: org.example.player after 3 attempts: "
+                                  "still running (pid 20941)"), failures
+    assert restore_order(adb) == ["am force-stop", "pidof org.example.player"] * 3 + ["svc usb"], adb
+    # Without a media component the player is unknown: recorded, not silent.
+    work = mm.MovingMap(Adb(), media_uri="file:///sdcard/Music/fixture.opus")
+    assert work.restore_phone() == ["media_stop_unavailable: no media component, the player is unknown"]
+    # A failed USB switch is named too.
+    adb_fails = Adb(fail="setFunctions")
+    work = workload(adb_fails)
+    assert work.restore_phone() == ["usb_reset_failed: exit 1"], work.cleanup_failures
 
 
 def test_media_relaunch_after_silence_only() -> None:
@@ -182,7 +260,9 @@ def test_no_phone_intent_after_restore_even_mid_relaunch() -> None:
         assert all("am start" not in line for line in calls[restore:]), calls
         assert not any(mm.MAPS_PACKAGE in line for line in calls), calls
         assert not work.start_maps() and not work.start_media()
-        assert calls[-1] == "shell am force-stop org.example.player", calls
+        assert calls[-3:] == ["shell am force-stop org.example.player",
+                              "shell pidof org.example.player",
+                              "shell svc usb setFunctions mtp"], calls
     finally:
         release.set()
         os.close(read_fd)
@@ -235,8 +315,9 @@ def test_failed_setup_command_stops_the_setup() -> None:
         assert not work.start_media() and not work.start_maps()
         calls = len(adb.calls)
         work.restore_phone()
-        assert adb.calls[calls:] == [("shell", "svc", "usb", "setFunctions", "mtp"),
-                                     ("shell", "am", "force-stop", "org.example.player")]
+        assert adb.calls[calls:] == [("shell", "am", "force-stop", "org.example.player"),
+                                     ("shell", "pidof", "org.example.player"),
+                                     ("shell", "svc", "usb", "setFunctions", "mtp")]
 
 
 def test_failed_relaunch_ends_the_workload() -> None:
@@ -304,19 +385,7 @@ with open(os.environ["FAKE_DISPLAY_INPUT"], "a") as out:
         out.write(line)
         out.flush()
 """
-ADB = """#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$FAKE_ADB_LOG"
-# FAKE_ADB_FAIL=NEEDLE[:N]: the Nth (default 1st) and later commands containing
-# NEEDLE fail as am start does when an activity cannot be started.
-if [ -n "${FAKE_ADB_FAIL:-}" ]; then
-    needle="${FAKE_ADB_FAIL%%:*}"; nth="${FAKE_ADB_FAIL#*:}"; [ "$nth" = "$FAKE_ADB_FAIL" ] && nth=1
-    case "$*" in *"$needle"*)
-        seen=$(grep -c -- "$needle" "$FAKE_ADB_LOG")
-        if [ "$seen" -ge "$nth" ]; then echo "Error: Activity not started"; exit 1; fi ;;
-    esac
-fi
-exit 0
-"""
+ADB = (ROOT / "tests/perf/fixtures/wired_perf/fake_phone_adb.sh").read_text()
 
 
 def run_collector(root: Path, **env_extra: str) -> dict:
@@ -334,7 +403,8 @@ def run_collector(root: Path, **env_extra: str) -> dict:
         port="1-2.1", duration_seconds=4, interval=1, startup_timeout_seconds=5, store=None,
         video_socket=None, input_socket=None, state_dir=str(root / "state"),
         phone_serial="TESTPHONE01", workload="moving-map",
-        media_uri="file:///sdcard/Music/fixture.opus", media_type=None, media_component=None,
+        media_uri="file:///sdcard/Music/fixture.opus", media_type=None,
+        media_component="org.example.player/.Play",
         geo_uri=None, thermal_policy="strict-all-zones")
     with patch.dict(os.environ, env), \
             patch.object(collector, "_display_connected", return_value=True), \
@@ -390,7 +460,10 @@ def test_collector_runs_the_workload_for_the_stage() -> None:
     # receiver logs no audio), and the capture is v3 with the workload record.
     assert all(line.startswith("-s TESTPHONE01 ") for line in adb), adb
     assert adb[0] == "-s TESTPHONE01 shell svc usb setFunctions mtp", adb
-    assert adb[-1] == "-s TESTPHONE01 shell svc usb setFunctions mtp", adb
+    # The restore: media force-stopped and verified gone, then the USB switch.
+    assert adb[-3:] == ["-s TESTPHONE01 shell am force-stop org.example.player",
+                        "-s TESTPHONE01 shell pidof org.example.player",
+                        "-s TESTPHONE01 shell svc usb setFunctions mtp"], adb
     assert any(mm.MAPS_PACKAGE in line for line in adb), adb
     assert drags and drags[:len(mm.drag_lines(0))] == mm.drag_lines(0), drags[:10]
     record = capture["workload"]

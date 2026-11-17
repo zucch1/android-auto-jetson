@@ -733,7 +733,11 @@ def _run_cli(args) -> int:
         for logger in loggers:
             logger.join(timeout=5)
         stamped.close()
-        workload.restore_phone()
+        # Media stopped and verified first, USB mode last (it re-enumerates USB).
+        run["cleanup_failures"] = workload.restore_phone()
+        base["cleanup_failures"] = run["cleanup_failures"]  # in every result, BLOCKED too
+        for failure in run["cleanup_failures"]:
+            print(f"drive smoke: cleanup failure: {failure}", file=sys.stderr)
         run["media_relaunches"] = workload.media_relaunches
         run["phone_failure"] = workload.phone_failure
     receiver = children[0] if children else None
@@ -761,6 +765,7 @@ def _run_cli(args) -> int:
         return _blocked(out, base, "phone_command_failed")
     result = {**base, **analyze_dir(out), "finished_utc": datetime.now(timezone.utc).isoformat()}
     result["media_relaunches"] = run["media_relaunches"]
+    result["cleanup_failures"] = run["cleanup_failures"]
     if run.get("failure"):
         result["failure"] = run["failure"]
         if result["verdict"] == "PASS":  # a runner-detected failure never passes

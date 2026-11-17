@@ -82,16 +82,19 @@ def on_term(*_):
     time.sleep(1)
     mark("restored")
     if run_file:
+        # As the real collector: the cleanup report, then the acknowledgement.
+        report = os.environ.get("FAKE_REMOTE_CLEANUP", "")
+        if os.environ.get("FAKE_REMOTE_NO_REPORT") != "1":
+            with open(run_file + ".cleanup", "w") as out:
+                out.write(report + "\n" if report else "")
         os.unlink(run_file)
     sys.exit(3)
 signal.signal(signal.SIGTERM, on_term)
 mark("started")
 time.sleep(300)
 """
-ADB = """#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$FAKE_ADB_LOG"
-exit 0
-"""
+# The fake phone (media player state, pidof, USB re-enumeration after setFunctions).
+ADB = (ROOT / "tests/perf/fixtures/wired_perf/fake_phone_adb.sh").read_text()
 
 
 def alive(pid: int) -> bool:
@@ -120,7 +123,7 @@ def stubs(root: Path) -> Path:
     return bin_dir
 
 
-def stop_launcher_mid_stage(mode: str, ack_seconds: str = "30") -> dict:
+def stop_launcher_mid_stage(mode: str, ack_seconds: str = "30", **extra_env: str) -> dict:
     with tempfile.TemporaryDirectory(prefix="remote-stop-") as directory:
         root = Path(directory)
         bin_dir = stubs(root)
@@ -136,7 +139,7 @@ def stop_launcher_mid_stage(mode: str, ack_seconds: str = "30") -> dict:
                "SSH_LOG": str(root / "ssh.log"), "FAKE_REMOTE": str(bin_dir / "fake-remote"),
                "FAKE_REMOTE_MARKS": str(marks), "FAKE_REMOTE_MODE": mode,
                "FAKE_ADB_LOG": str(root / "adb.log"), "HASH_A": A, "HASH_B": B, "PHONE": PHONE,
-               "AA_REMOTE_STOP_ACK_S": ack_seconds}
+               "AA_REMOTE_STOP_ACK_S": ack_seconds, **extra_env}
         launcher = subprocess.Popen(
             ["bash", str(LAUNCHER), "--mode", "wired", "--duration", "1800s",
              "--out", str(root / "out.json"), "--media-uri", "file:///sdcard/Music/fixture.opus",
@@ -196,9 +199,64 @@ def test_a_hung_remote_collector_is_killed_and_the_phone_restored_anyway() -> No
     assert "remote-stop: forced" in seen["output"], seen["output"]
     assert seen["run_file"] is not None and not seen["run_file_left"], seen
     assert "restored" not in seen["marks"] and "cleanup_began" in seen["marks"], seen
-    assert seen["adb"] == [f"-s {PHONE} shell svc usb setFunctions mtp",
-                           f"-s {PHONE} shell am force-stop org.example.player"], seen["adb"]
+    # Media force-stopped and verified first, the USB switch last.
+    assert seen["adb"] == [f"-s {PHONE} shell am force-stop org.example.player",
+                           f"-s {PHONE} shell pidof org.example.player",
+                           f"-s {PHONE} shell svc usb setFunctions mtp"], seen["adb"]
     assert seen["outcome"] == "terminated" and seen["rc"] == 143, seen
+
+
+def test_an_acknowledged_stop_relays_the_collectors_cleanup_failures() -> None:
+    # Given a collector whose own restore could not verify the media stop.
+    seen = stop_launcher_mid_stage("clean", FAKE_REMOTE_CLEANUP="media_stop_unverified: x")
+    # Then the stop is not reported clean: named, rc 1, and the launcher says so.
+    assert ("remote-stop: failed: acknowledged with cleanup failures: media_stop_unverified: x"
+            in seen["output"]), seen["output"]
+    assert "the remote stop reported a failure (rc 1)" in seen["output"], seen["output"]
+    assert not seen["remote_alive"] and seen["rc"] == 143, seen
+    # A collector that acknowledges without any cleanup report is not clean either.
+    seen = stop_launcher_mid_stage("clean", FAKE_REMOTE_NO_REPORT="1")
+    assert "cleanup_not_reported" in seen["output"], seen["output"]
+
+
+def forced_restore(**knobs: str) -> tuple[subprocess.CompletedProcess, list[str], bool]:
+    """The fallback restore alone: the recorded collector is already gone."""
+    with tempfile.TemporaryDirectory(prefix="remote-stop-restore-") as directory:
+        root = Path(directory)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "adb").write_text(ADB)
+        (bin_dir / "adb").chmod(0o755)
+        log = root / "adb.log"
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "FAKE_ADB_LOG": str(log),
+               **knobs}
+        subprocess.run([str(bin_dir / "adb"), "-s", PHONE, "shell", "am", "start", "-d", "x",
+                        "-n", "org.example.player/.Play"], env=env, check=True)
+        run_file = root / "run"
+        run_file.write_text(f"collector 999999999 1\nphone {PHONE}\nmedia_package org.example.player\n")
+        stop = subprocess.run(["bash", str(STOP), str(run_file), "1", "1"], capture_output=True,
+                              text=True, timeout=120, env=env)
+        running = (root / "adb.log.phone" / "running.org.example.player").exists()
+        return stop, log.read_text().splitlines()[1:], running
+
+
+def test_the_fallback_stops_and_verifies_media_before_the_usb_switch() -> None:
+    stop, adb, running = forced_restore()
+    assert stop.returncode == 0 and stop.stdout.strip() == "remote-stop: forced", stop
+    assert not running
+    assert adb == [f"-s {PHONE} shell am force-stop org.example.player",
+                   f"-s {PHONE} shell pidof org.example.player",
+                   f"-s {PHONE} shell svc usb setFunctions mtp"], adb
+    # A player that re-spawns is stopped again (bounded), still before the switch.
+    stop, adb, running = forced_restore(FAKE_ADB_RESPAWN="org.example.player:1")
+    assert stop.returncode == 0 and not running, stop
+    assert [line.split()[3] for line in adb] == ["am", "pidof", "am", "pidof", "svc"], adb
+    # One that never goes away is a named failure (rc 1), the USB switch still last.
+    stop, adb, running = forced_restore(FAKE_ADB_STUCK="org.example.player")
+    assert stop.returncode == 1 and running, stop
+    assert stop.stdout.startswith("remote-stop: failed: forced: media_stop_unverified: "
+                                  "org.example.player after 3 attempts"), stop.stdout
+    assert [line.split()[3] for line in adb] == ["am", "pidof"] * 3 + ["svc"], adb
 
 
 DISPLAY = """#!/usr/bin/env python3
@@ -253,23 +311,16 @@ def test_the_real_collector_acknowledges_a_remote_stop_after_its_cleanup() -> No
             assert not run_file.exists()
             assert not [pid for pid in children if alive(pid)], children
             adb = (root / "adb.log").read_text().splitlines()
-            assert adb[-2:] == [f"-s {PHONE} shell svc usb setFunctions mtp",
-                                f"-s {PHONE} shell am force-stop org.example.player"], adb
+            assert adb[-3:] == [f"-s {PHONE} shell am force-stop org.example.player",
+                                f"-s {PHONE} shell pidof org.example.player",
+                                f"-s {PHONE} shell svc usb setFunctions mtp"], adb
         finally:
             if collector.poll() is None:
                 os.killpg(collector.pid, signal.SIGKILL)
                 collector.wait()
 
 
-SLOW_ADB = """#!/usr/bin/env bash
-# The media launch is in flight for 4 s, then lands (logged on completion,
-# as the intent reaches the phone).
-case "$*" in *fixture.opus*)
-    if [ -n "${FAKE_ADB_SLOW:-}" ]; then echo "$$" > "$FAKE_ADB_SLOW"; sleep 4; fi ;;
-esac
-printf '%s\\n' "$*" >> "$FAKE_ADB_LOG"
-exit 0
-"""
+SLOW_ADB = ADB  # FAKE_ADB_SLOW: the media launch stays in flight for 4 s
 
 
 def test_a_forced_stop_kills_an_in_flight_adb_command_before_restoring() -> None:
@@ -317,8 +368,9 @@ def test_a_forced_stop_kills_an_in_flight_adb_command_before_restoring() -> None
             # And nothing reaches the phone after the restore, then or later.
             time.sleep(5)  # past the moment the adb child would have landed
             adb = adb_log.read_text().splitlines()
-            assert adb[-2:] == [f"-s {PHONE} shell svc usb setFunctions mtp",
-                                f"-s {PHONE} shell am force-stop org.example.player"], adb
+            assert adb[-3:] == [f"-s {PHONE} shell am force-stop org.example.player",
+                                f"-s {PHONE} shell pidof org.example.player",
+                                f"-s {PHONE} shell svc usb setFunctions mtp"], adb
             assert len(adb) == restored_at and not any("fixture.opus" in line for line in adb), adb
         finally:
             for pid in (collector_pid, adb_pid):
@@ -370,7 +422,7 @@ def test_a_survivor_of_the_kill_is_reported_as_a_failure() -> None:
             stop = subprocess.run(["bash", str(no_signal), str(run_file), "1", "1"], capture_output=True,
                                   text=True, timeout=60, env=env)
             assert stop.returncode == 1, stop
-            assert stop.stdout.startswith("remote-stop: failed: survivors"), stop.stdout
+            assert stop.stdout.startswith("remote-stop: failed: forced: survivors"), stop.stdout
             assert str(child) in stop.stdout and str(collector.pid) in stop.stdout, stop.stdout
         finally:
             try:

@@ -144,8 +144,19 @@ class RunFile:
         self._handle.flush()
         os.fsync(self._handle.fileno())
 
-    def remove(self) -> None:
+    def remove(self, cleanup_failures: list[str] | None = None) -> None:
+        """Remove the run file (the stop's acknowledgement). With a moving-map
+        workload, first write ``PATH.cleanup``: one line per restore step that
+        could not be done or verified (empty: a clean restore)."""
         self._handle.close()
+        if cleanup_failures is not None:
+            try:
+                fd = os.open(f"{self.path}.cleanup",
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as report:
+                    report.writelines(" ".join(item.split()) + "\n" for item in cleanup_failures)
+            except OSError as exc:
+                print(f"cleanup failure: cannot write the cleanup report: {exc}", file=sys.stderr)
         try:
             self.path.unlink()
         except FileNotFoundError:
@@ -838,6 +849,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             media_type=getattr(args, "media_type", None),
             media_component=getattr(args, "media_component", None),
             geo_uri=getattr(args, "geo_uri", None) or moving_map.DEFAULT_GEO_URI)
+        args.cleanup_failures = ["phone_restore_not_reached"]  # until restore_phone runs
     av_series: dict = {"pair_t_ns": [], "pair_skew_ns": [], "audio_intervals_ns": []}
     rec_file = None
     disp_file = None
@@ -1029,7 +1041,10 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         if disp_file is not None:
             disp_file.close()
         if workload is not None:
-            workload.restore_phone()
+            # Media stopped and verified first, USB mode last (it re-enumerates USB).
+            for failure in workload.restore_phone():
+                print(f"cleanup failure: {failure}", file=sys.stderr)
+            args.cleanup_failures = list(workload.cleanup_failures)  # for --run-file
         parser.poll(str(receiver_log))
         if display is not None:
             parser.poll(str(display_log))
@@ -1077,6 +1092,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     capture["workload"] = ({"kind": "moving-map", "media_relaunches": workload.media_relaunches,
                             "drags": workload.drags, "stimulus_started": stimulus is not None,
                             "phone_failure": workload.phone_failure,
+                            "cleanup_failures": list(workload.cleanup_failures),
                             "drag_t_ns": [t - origin_ns for t in workload.drag_ns][:_AV_SERIES_LIMIT]}
                            if workload is not None else {"kind": "none"})
     capture["concurrent_builds"] = concurrent_builds
@@ -1125,6 +1141,7 @@ def _cli(argv: list[str]) -> int:
                              "(tools/perf/aa_remote_stop.sh); removed after cleanup")
     args = parser.parse_args(argv)
     args.run_file_record = None
+    args.cleanup_failures = []  # nothing has touched the phone yet
     if args.run_file:
         # Lead a process group of our own (already true for a session leader):
         # every phone command we start is in it, and nothing else is.
@@ -1151,7 +1168,7 @@ def _cli(argv: list[str]) -> int:
     finally:
         # After collect()'s own cleanup and phone restore: the stop's acknowledgement.
         if args.run_file_record is not None:
-            args.run_file_record.remove()
+            args.run_file_record.remove(getattr(args, "cleanup_failures", None))
 
 
 def _run(args: argparse.Namespace) -> int:
