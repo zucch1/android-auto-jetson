@@ -361,8 +361,14 @@ def test_a_survivor_of_the_kill_is_reported_as_a_failure() -> None:
         try:
             assert wait_for(lambda: run_file.exists() and "child" in run_file.read_text())
             child = int(run_file.read_text().split("child ")[1].split()[0])
-            stop = subprocess.run(["bash", str(STOP), str(run_file), "1", "1"], capture_output=True,
-                                  text=True, timeout=60, env={**env, "AA_REMOTE_STOP_SIGNAL": "0"})
+            # Model survival with a copy whose fallback sends no signal; the
+            # production script's signal is fixed (see the test below).
+            production = STOP.read_text()
+            assert production.count("\nkill_signal=KILL\n") == 1
+            no_signal = root / "aa_remote_stop_no_signal.sh"
+            no_signal.write_text(production.replace("\nkill_signal=KILL\n", "\nkill_signal=0\n"))
+            stop = subprocess.run(["bash", str(no_signal), str(run_file), "1", "1"], capture_output=True,
+                                  text=True, timeout=60, env=env)
             assert stop.returncode == 1, stop
             assert stop.stdout.startswith("remote-stop: failed: survivors"), stop.stdout
             assert str(child) in stop.stdout and str(collector.pid) in stop.stdout, stop.stdout
@@ -372,6 +378,14 @@ def test_a_survivor_of_the_kill_is_reported_as_a_failure() -> None:
             except ProcessLookupError:
                 pass
             collector.wait()
+
+
+def test_production_stop_signal_cannot_be_overridden_from_the_environment() -> None:
+    # The fallback must always KILL: no inherited variable may weaken it.
+    production = STOP.read_text()
+    assert "\nkill_signal=KILL\n" in production
+    assert "AA_REMOTE_STOP_SIGNAL" not in production
+    assert "kill_signal=\"$" not in production and "kill_signal=${" not in production
 
 
 def test_stop_script_never_signals_a_reused_pid_and_reports_no_run() -> None:

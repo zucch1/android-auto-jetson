@@ -38,9 +38,9 @@ run_file="${1:?usage: aa_remote_stop.sh RUN_FILE [ACK_SECONDS] [APPEAR_SECONDS]}
 ack_seconds="${2:-30}"
 appear_seconds="${3:-15}"
 
-# The fallback's signal; tests set 0 (no signal) to model a process that
-# survives the KILL.
-kill_signal="${AA_REMOTE_STOP_SIGNAL:-KILL}"
+# The fallback's signal. Fixed: nothing in the environment can weaken it. The
+# survivor test runs a copy of this script with this one line rewritten.
+kill_signal=KILL
 
 # /proc reads use builtins only (no fork per process): a scan stays cheap.
 STAT=()
