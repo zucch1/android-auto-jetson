@@ -155,6 +155,28 @@
         },
         "audio_chunks": {
           "$ref": "#/$defs/bound"
+        },
+        "concurrent_builds": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "t_s",
+              "processes"
+            ],
+            "properties": {
+              "t_s": {
+                "type": "number"
+              },
+              "processes": {
+                "$ref": "#/$defs/strings"
+              }
+            }
+          }
         }
       }
     },
@@ -520,7 +542,9 @@
             "kind",
             "media_relaunches",
             "drags",
-            "stimulus_started"
+            "stimulus_started",
+            "phone_failure",
+            "max_drag_gap_s"
           ],
           "properties": {
             "kind": {
@@ -534,6 +558,19 @@
             },
             "stimulus_started": {
               "type": "boolean"
+            },
+            "phone_failure": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_drag_gap_s": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
             }
           }
         }

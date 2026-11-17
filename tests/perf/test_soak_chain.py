@@ -34,9 +34,10 @@ exit "$rc"
 """
 
 
-def run(root: Path, *extra: str, env: dict[str, str] | None = None, builds=lambda: []) -> tuple[int, str]:
+def run(root: Path, *extra: str, env: dict[str, str] | None = None, builds=lambda: [],
+        stub_text: str = STUB) -> tuple[int, str]:
     stub = root / "stub-launcher"
-    stub.write_text(STUB)
+    stub.write_text(stub_text)
     stub.chmod(0o755)
     argv = ["--out", str(root / "chain"), "--phone-serial", "TESTPHONE01",
             "--drive-smoke", str(root / "smoke.json"), "--media-uri", "file:///sdcard/Music/tone.opus",
@@ -90,6 +91,61 @@ def test_a_build_before_a_stage_blocks_it() -> None:
         assert code == 3 and "BLOCKED" in output, output
         assert calls(root) == [], "a stage launched while a build was running"
         assert (root / "chain" / "stage-7200s-not-run.json").exists()
+
+
+BUILD_STUB = STUB.replace('printf \'{"verdict"', '''[ -n "${STUB_BUILD_FLAG:-}" ] && [ "${duration%s}" = 1800 ] && touch "$STUB_BUILD_FLAG" && sleep 1
+printf \'{"verdict"''', 1)
+
+
+def test_a_build_during_a_stage_disqualifies_it() -> None:
+    # Given a quiet host at the gate and before the stage, and a compiler that
+    # starts while the 1800 s stage runs (the review's P2), for a stage whose
+    # own result would PASS and one whose result FAILs.
+    for rc, verdict, code in (("0", "PASS", 3), ("1", "FAIL", 1)):
+        with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+            root = Path(directory)
+            flag = root / "build-started"
+            with patch.object(chain, "WATCH_PERIOD_S", 0.2):
+                code_seen, output = run(root, env={"STUB_BUILD_FLAG": str(flag), "STUB_RC_1800": rc},
+                                        builds=lambda: ["4242 cc1plus"] if flag.exists() else [],
+                                        stub_text=BUILD_STUB)
+            out = root / "chain"
+            # Then the stage is never a PASS: a would-be PASS is BLOCKED (3) and
+            # its result moved aside; a FAIL stays a FAIL. The evidence is
+            # recorded, and the chain stops before the 7200 s stage.
+            assert code_seen == code, (verdict, code_seen, output)
+            assert "DISQUALIFIED: build_during_stage" in output, output
+            record = json.loads((out / "stage-1800s-interference.json").read_text())
+            assert record["reason"] == "build_during_stage" and record["result_verdict"] == verdict
+            assert record["observations"] and record["observations"][0]["builds"] == ["4242 cc1plus"]
+            assert (out / "stage-1800s-result.json").exists() is (verdict != "PASS")
+            assert (out / "stage-1800s-result.disqualified.json").exists() is (verdict == "PASS")
+            assert len(calls(root)) == 1 and (out / "stage-7200s-not-run.json").exists()
+            watch = [json.loads(line) for line in
+                     (out / "stage-1800s-build-watch.jsonl").read_text().splitlines()]
+            assert any(sample["builds"] for sample in watch), watch
+
+
+def test_build_scan_sees_a_real_build_process_and_skips_its_own_ancestors() -> None:
+    import subprocess
+    import time
+    with tempfile.TemporaryDirectory(prefix="soak-chain-scan-") as directory:
+        ninja = Path(directory) / "ninja"
+        ninja.symlink_to("/bin/sleep")
+        process = subprocess.Popen([str(ninja), "30"])
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and f"{process.pid} ninja" not in chain.builds():
+                time.sleep(0.05)
+            assert f"{process.pid} ninja" in chain.builds()
+            # Our own ancestors (e.g. ctest running this test) never count.
+            import aa_projection_collect as collect
+            own = collect.ancestors()
+            assert os.getpid() in own
+            assert not [entry for entry in chain.builds() if int(entry.split()[0]) in own]
+        finally:
+            process.kill()
+            process.wait()
 
 
 def test_every_chain_gets_a_new_directory() -> None:

@@ -517,7 +517,7 @@ class LauncherGateTests(unittest.TestCase):
     """The perf launcher refuses every live stage before the collector starts."""
 
     def launch(self, root: Path, *extra: str, fail_display_hash: bool = False,
-               swapped: bool = False,
+               swapped: bool = False, phone_setup_fails: bool = False,
                adb_line: str = f"{PHONE}              device usb:1-2.1 product:x model:FAKE",
                phone: str | None = PHONE) -> tuple[subprocess.CompletedProcess, str]:
         stub_dir = root / "bin"
@@ -530,6 +530,10 @@ case "$*" in
     *"python3 -"*) if [ -n "${{STUB_COLLECTOR_SWAPPED:-}}" ]; then
                        printf '%s\\n' "$*" | grep -q -- "--phone-serial '{PHONE}'" || exit 1
                        echo "error: phone_identity_mismatch: another phone on --port" >&2
+                       exit 2
+                   fi
+                   if [ -n "${{STUB_COLLECTOR_PHONE_SETUP:-}}" ]; then
+                       echo "error: phone_setup_failed: maps: Error: Activity not started" >&2
                        exit 2
                    fi
                    exit 1 ;;
@@ -549,6 +553,8 @@ exit 0
             env["FAIL_DISPLAY_HASH"] = "1"
         if swapped:
             env["STUB_COLLECTOR_SWAPPED"] = "1"
+        if phone_setup_fails:
+            env["STUB_COLLECTOR_PHONE_SETUP"] = "1"
         process = subprocess.run(
             ["bash", str(LAUNCHER), "--mode", "wired", "--duration", "1800s",
              "--out", str(root / "out.json"), "--media-uri", "file:///sdcard/Music/fixture.opus",
@@ -628,6 +634,17 @@ exit 0
             self.assertIn(f"--phone-serial '{PHONE}'", ssh)
             self.assertEqual(json.loads((root / "out.json").read_text())["blocked_on"],
                              "phone_identity_mismatch", process.stderr)
+
+    def test_a_failed_phone_setup_blocks_with_its_own_reason(self) -> None:
+        # Given a collector whose required adb setup (here the Maps launch) failed.
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:
+            root = Path(directory)
+            good = self.write(root, "good.json", record(datetime.now(timezone.utc)))
+            process, _ = self.launch(root, "--drive-smoke", good, phone_setup_fails=True)
+            # Then the stage is BLOCKED phone_setup_failed, never collector_failed or a PASS.
+            self.assertEqual(process.returncode, 3, process.stderr)
+            self.assertEqual(json.loads((root / "out.json").read_text())["blocked_on"],
+                             "phone_setup_failed", process.stderr)
 
     def test_matching_smoke_reaches_the_collector(self) -> None:
         with tempfile.TemporaryDirectory(prefix="drive-smoke-launcher-") as directory:

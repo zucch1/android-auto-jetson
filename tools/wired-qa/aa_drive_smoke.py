@@ -515,7 +515,8 @@ class Logger(threading.Thread):
 
 
 def _adb(serial: str, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["adb", "-s", serial, *args], capture_output=True, text=True, timeout=20)
+    """``adb -s SERIAL`` bounded at 20 s; a timeout or missing adb is a failed result."""
+    return moving_map.adb_runner(serial)(*args)
 
 
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
@@ -712,6 +713,11 @@ def _run_cli(args) -> int:
             if outcome == "stalled":
                 run["failure"] = "display control input stalled"
                 break
+            if outcome == "closed":
+                run["failure"] = "display control input closed"
+                break
+            if outcome == "phone_failed":
+                break  # workload.phone_failure: BLOCKED below
             time.sleep(0.1)
         run["window_end_ns"] = time.monotonic_ns()
         run["receiver_alive_at_end"] = receiver.poll() is None
@@ -729,6 +735,7 @@ def _run_cli(args) -> int:
         stamped.close()
         workload.restore_phone()
         run["media_relaunches"] = workload.media_relaunches
+        run["phone_failure"] = workload.phone_failure
     receiver = children[0] if children else None
     display = children[1] if len(children) > 1 else None
     if stop:
@@ -743,6 +750,15 @@ def _run_cli(args) -> int:
     run.update(receiver_exit=receiver.returncode if receiver else None,
                display_exit=display.returncode if display else None)
     (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
+    if workload.phone_failure is not None:
+        # A required phone command (setup or media relaunch) failed: the harness
+        # lost the phone, so the drive was not the one the gate asks for.
+        # BLOCKED (nothing qualifying was measured), never a PASS or a FAIL.
+        print(f"drive smoke: phone command failed: {workload.phone_failure}", file=sys.stderr)
+        base["phone_failure"] = workload.phone_failure
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        return _blocked(out, base, "phone_command_failed")
     result = {**base, **analyze_dir(out), "finished_utc": datetime.now(timezone.utc).isoformat()}
     result["media_relaunches"] = run["media_relaunches"]
     if run.get("failure"):

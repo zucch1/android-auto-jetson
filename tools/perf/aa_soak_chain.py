@@ -18,8 +18,17 @@ Everything for a stage lands in ``--out``: ``stage-<N>s-command.json``,
 ``-console.log``, ``-build-watch.jsonl`` (5 s process watch while the stage
 runs), ``-result.json``, ``-capture.json`` and ``-logs/`` (exported as
 ``SOAK_STATE_DIR`` for a local ssh adapter that sets the collector's state
-directory). Exit: the first non-PASS
-stage's launcher code, else 0; 2 on usage errors.
+directory).
+
+A build seen by the watch while the stage runs disqualifies it (interference,
+not a product FAIL): the chain writes ``stage-<N>s-interference.json`` with
+every observation, a PASS result is moved to ``-result.disqualified.json`` so
+no qualifying file remains, a would-be PASS counts as BLOCKED (3; a FAIL
+stays a FAIL) and the chain stops. The stage is not cut short: the collector on the target records the
+same builds itself (``run_status.concurrent_builds``) and the reporter BLOCKS
+the stage with ``interference:concurrent_build``; killing it would lose that
+named result and its evidence. Exit: the first non-PASS stage's launcher code
+(3 for a disqualified one), else 0; 128+signal when stopped; 2 on usage errors.
 """
 from __future__ import annotations
 
@@ -32,8 +41,9 @@ import sys
 import time
 from pathlib import Path
 
+from aa_projection_collect import ancestors, build_processes
+
 STAGES = (1800, 7200)  # the 60 s stage is retired (#137)
-BUILD_NAMES = ("cmake", "ninja", "make", "c++", "g++", "gcc", "cc1plus", "ctest", "nvcc", "ld")
 WATCH_PERIOD_S = 5
 # On a stop, the stage's process group gets TERM, then KILL after this grace:
 # long enough for the collector (TERM -> exit 3) to stop its receiver/display
@@ -92,16 +102,9 @@ def stop_group(process: subprocess.Popen) -> str:
 
 
 def builds() -> list[str]:
-    """Running compiler/build processes (exact /proc comm names)."""
-    found = []
-    for path in Path("/proc").glob("[0-9]*/comm"):
-        try:
-            name = path.read_text().strip()
-        except OSError:
-            continue
-        if name in BUILD_NAMES:
-            found.append(f"{path.parent.name} {name}")
-    return found
+    """Running compiler/build processes (BUILD_NAMES, exact /proc comm names),
+    other than the chain and its own ancestors."""
+    return build_processes(ancestors())
 
 
 def wait_quiet(seconds: float, log: Path, sleep=time.sleep, clock=time.monotonic) -> bool:
@@ -158,9 +161,13 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
         process = subprocess.Popen(command, stdout=console, stderr=subprocess.STDOUT, env=env,
                                    start_new_session=True)
         children.append(process)
+        seen: list[dict] = []
         while process.poll() is None and not stop:
-            watch.write(json.dumps({"time": time.time(), "builds": builds()}) + "\n")
+            running = builds()
+            watch.write(json.dumps({"time": time.time(), "builds": running}) + "\n")
             watch.flush()
+            if running:
+                seen.append({"time": time.time(), "builds": running})
             deadline = time.monotonic() + WATCH_PERIOD_S
             while process.poll() is None and not stop and time.monotonic() < deadline:
                 try:
@@ -175,7 +182,31 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
     result = args.out / f"{name}-result.json"
     verdict = json.loads(result.read_text()).get("verdict") if result.exists() else None
     print(f"{name} END rc={process.returncode} verdict={verdict}", flush=True)
+    if seen:
+        return _disqualify(args, name, seen, result, verdict, process.returncode)
     return process.returncode
+
+
+def _disqualify(args: argparse.Namespace, name: str, seen: list[dict], result: Path,
+                verdict: object, code: int) -> int:
+    """A build ran during the stage: record it; the stage is never a PASS.
+
+    A would-be PASS becomes BLOCKED (3). A FAIL stays a FAIL (1), as in the
+    reporter, where interference never hides a measured budget miss; its
+    interference record says the miss was measured on a contended host.
+    """
+    moved = None
+    if verdict == "PASS":
+        moved = result.with_name(f"{name}-result.disqualified.json")
+        result.rename(moved)
+    (args.out / f"{name}-interference.json").write_text(json.dumps({
+        "reason": "build_during_stage", "verdict": "BLOCKED" if code == 0 else verdict,
+        "launcher_rc": code,
+        "result_verdict": verdict, "result_moved_to": moved.name if moved else None,
+        "observations": seen}, indent=2) + "\n")
+    print(f"{name} DISQUALIFIED: build_during_stage ({len(seen)} watch sample(s) saw a build)",
+          flush=True)
+    return 3 if code == 0 else code
 
 
 def main(argv: list[str]) -> int:

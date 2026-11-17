@@ -338,7 +338,9 @@ managed display is started with `--test-only-control-stdin`. From projection
 the media intent, then Maps, after `MEDIA_RELAUNCH_SILENCE_S` (5 s) without an
 audio write, counting each relaunch in `workload.media_relaunches`. A display
 that stops accepting control input for `CONTROL_WRITE_TIMEOUT_S` ends the stage
-with terminal error `display_control_stalled`. After cleanup the phone's USB
+with terminal error `display_control_stalled`, and one whose control input
+closes ends it with `display_control_closed` (both FAIL: the display is part of
+the product under test). After cleanup the phone's USB
 mode is reset and the media player stopped. Every live stage needs
 `--media-uri` (optional `--media-type`, `--media-component`, `--geo-uri`).
 
@@ -349,19 +351,60 @@ whatever the stimulus thread is doing. A relaunch also checks the stop flag
 between its media and Maps intents, and the collector stops and joins the
 stimulus before it restores the phone.
 
+**Phone commands are checked.** Every required phone command (the USB reset,
+the wake key, the media and Maps launches, and each relaunch) must exit 0
+within the 20 s adb bound, and an `am start` must not report `Error` (it can
+exit 0 for an activity it did not start). The first failure ends the workload:
+nothing more is sent to the phone but the restore.
+
+- During the setup, before the receiver starts, the collector refuses the
+  stage (`error: phone_setup_failed: <step>: <why>`) and the launcher reports
+  **BLOCKED** `phone_setup_failed`.
+- Later (a failed relaunch), the capture records `workload.phone_failure` and
+  the reporter BLOCKS the stage with `run_evidence:moving_map_phone`. The stage
+  still runs to its end: cutting it short would turn the harness failure into
+  an `incomplete_active_window` FAIL.
+
+BLOCKED, not FAIL, because adb and the phone's apps are the test harness, not
+the receiver or display under test: a failed intent means the required
+workload was not set up, the same evidence gap as the other `run_evidence:*`
+rules. The drive smoke applies the same rule (BLOCKED `phone_command_failed`).
+
 **Workload evidence.** A live v3 stage must prove the workload ran, both in
 the reporter and in the qualification checker. The record must be
 `kind: moving-map` with `stimulus_started: true`, and it must have at least
 `MIN_DRAG_RATE_HZ` (0.25) completed drags per active second. The nominal rate
 is about 0.65 Hz (one drag per second plus the drag's own ~0.5 s), so the floor
-leaves room for adb relaunches. Media presence is already gated by the A/V
-coverage floor. Missing or insufficient evidence is **BLOCKED**:
-`run_evidence:moving_map_workload`, `run_evidence:moving_map_stimulus` or
-`run_evidence:moving_map_drags`. It means the required workload was not shown
-to have been measured, which is an evidence gap, like every other
-`run_evidence:*` rule, and never a PASS. A stimulus that started and then
-stalled is a FAIL (`display_control_stalled`). The v3 schema requires all four
-workload fields for a moving-map record.
+leaves room for adb relaunches.
+
+The aggregate alone would accept a run that drags early and then stops, so the
+drags must also be continuous. The capture records every completed drag's time
+(`workload.drag_t_ns`), and no stretch of the active window, its edges
+included, may go longer than `MAX_DRAG_GAP_S` (10 s) without one. The result
+records the longest stretch as `workload.max_drag_gap_s`. Nominal spacing is
+about 1.4 s. A media relaunch puts two `am start` calls (about 1-3 s each)
+between two drags, so a healthy run stays under about 8 s; 10 s keeps that
+margin and still catches a stimulus that stopped.
+
+Media presence is already gated by the A/V coverage floor. Missing or
+insufficient evidence is **BLOCKED**: `run_evidence:moving_map_workload`,
+`_stimulus`, `_phone`, `_drags` or `_drag_gap`. It means the required workload
+was not shown to have been measured, which is an evidence gap, like every
+other `run_evidence:*` rule, and never a PASS. A stimulus whose display control
+input stalled or closed is a FAIL. The v3 schema requires every workload field
+(`media_relaunches`, `drags`, `stimulus_started`, `phone_failure`,
+`max_drag_gap_s`) for a moving-map record.
+
+**No build during a stage.** The collector scans the target's processes at
+every sample for the compiler and build tools the chain's quiet gate waits on
+(`BUILD_NAMES`; its own ancestors excluded). Every observation goes into
+`concurrent_builds` in the capture and `run_status.concurrent_builds` in the
+v3 result. Any observation makes a stage that would otherwise pass
+**BLOCKED** `interference:concurrent_build`: the stage did not run on the quiet
+host it claims. A capture without the watch is BLOCKED
+`run_evidence:concurrent_build_watch`. As with every BLOCKED reason, a measured
+budget miss is still a FAIL. The qualification checker requires
+`run_status.concurrent_builds` to be `[]`.
 
 **A/V (signed contract).** The collector keeps every pair's paint-completion
 time and signed skew, and the merged union of valid audio slots' scheduled
@@ -420,6 +463,15 @@ compiler, then runs the 1800 s and 7200 s stages through
 `aa-projection-perf.sh` with the moving-map workload, `--phone-serial` and
 `--drive-smoke`. It stops at the first stage that does not PASS and writes
 `stage-<N>s-not-run.json` for the rest.
+
+The chain also checks for builds itself, every 5 s while a stage runs
+(`stage-<N>s-build-watch.jsonl`). If any are seen, it writes
+`stage-<N>s-interference.json` with every observation. A stage that would PASS
+then counts as BLOCKED (exit 3), and its result is moved to
+`stage-<N>s-result.disqualified.json`, so no qualifying file remains. A FAIL
+stays a FAIL. The chain stops there. The stage is not cut short: the collector
+records the same builds and its result is BLOCKED with the evidence, while
+killing the stage would lose that named result.
 
 The chain handles SIGTERM/SIGINT with a stop flag, as the drive smoke does.
 Each stage runs in its own process group (the launcher, ssh and the collector

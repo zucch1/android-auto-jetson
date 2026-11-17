@@ -52,7 +52,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aa_perf_schema  # noqa: E402
 import aa_av_contract as av_contract  # noqa: E402
-from aa_moving_map import MIN_DRAG_RATE_HZ  # noqa: E402
+from aa_moving_map import MAX_DRAG_GAP_S, MIN_DRAG_RATE_HZ, max_drag_gap_s  # noqa: E402
 from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Window, coverage_gaps, coverage_to_json, parse_capture, reduce_capture,
 )
@@ -396,6 +396,17 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                       startup_wait_seconds=progress.started_ns / 1e9
                       if progress.started_ns is not None else None,
                       projection_failure=progress.failure)
+    if version3:
+        # Build/compiler processes the collector saw on the target during the
+        # stage (#137); null when the capture carries no watch at all.
+        builds_seen = capture.get("concurrent_builds")
+        run_status["concurrent_builds"] = (
+            [{"t_s": item["t_ns"] / 1e9, "processes": [str(p) for p in item["processes"]]}
+             for item in builds_seen]
+            if isinstance(builds_seen, list) and all(
+                isinstance(item, dict) and isinstance(item.get("t_ns"), int)
+                and isinstance(item.get("processes"), list) for item in builds_seen)
+            else None)
     if progress.interferences:
         # Shown beside the coverage result: a gap over 10 s is why coverage:sampling
         # fails. Omitted when empty so uninterrupted results are unchanged.
@@ -444,10 +455,20 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
             # capture must prove it ran: stimulus started and enough completed
             # drags over the active window. Missing or insufficient evidence is
             # BLOCKED (the required workload was not measured), never a PASS;
-            # a stimulus that stalled is already a FAIL (display_control_stalled).
-            gap = workload_gap(capture.get("workload"), progress.seconds if window else None)
+            # a stimulus whose display control input stalled or closed is
+            # already a FAIL (display_control_stalled / display_control_closed).
+            gap = workload_gap(capture.get("workload"), window)
             if gap is not None:
                 unavailable.append("run_evidence:" + gap)
+            # A build on the target during the stage contends for CPU and memory:
+            # the stage measured something else than the quiet host it claims.
+            # Interference, not a product FAIL: it BLOCKS a stage that would
+            # otherwise pass (a measured budget miss still FAILs, as for every
+            # BLOCKED reason). A capture without the watch is not proven quiet.
+            if run_status["concurrent_builds"] is None:
+                unavailable.append("run_evidence:concurrent_build_watch")
+            elif run_status["concurrent_builds"]:
+                unavailable.append("interference:concurrent_build")
 
     provenance_source = provenance_override if provenance_override is not None else capture.get("provenance")
     provenance_source, provenance_numeric_errors = aa_perf_schema.finite_numbers(provenance_source)
@@ -559,7 +580,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         result["thermal_policy"] = asdict(evidence.thermal_policy)
     if version3:
         result["av_contract"] = av_block
-        result["workload"] = _workload_record(capture.get("workload"))
+        result["workload"] = _workload_record(capture.get("workload"), window)
     if capture_path is not None:
         result["capture"] = {"path": capture_path, "sha256": capture_sha256}
 
@@ -618,31 +639,53 @@ def _signed_av(capture: dict, window: Window | None, *, invalid: bool) -> tuple[
     return block, metrics
 
 
-def workload_gap(raw: object, active_seconds: float | None) -> str | None:
-    """Why a v3 workload record does not prove the moving map ran, or None."""
+def workload_gap(raw: object, window: Window | None) -> str | None:
+    """Why a v3 workload record does not prove the moving map ran, or None.
+
+    In order: no moving-map record; the stimulus never started; a required
+    phone command failed (the harness lost the phone: BLOCKED, not FAIL); fewer
+    than MIN_DRAG_RATE_HZ drags per active second; a stretch of the active
+    window longer than MAX_DRAG_GAP_S without a drag (or no drag evidence); a
+    malformed media relaunch count.
+    """
     if not isinstance(raw, dict) or raw.get("kind") != "moving-map":
         return "moving_map_workload"
     drags = raw.get("drags")
     if raw.get("stimulus_started") is not True or not isinstance(drags, int) or isinstance(drags, bool):
         return "moving_map_stimulus"
-    if active_seconds is None or drags < MIN_DRAG_RATE_HZ * active_seconds:
+    if "phone_failure" not in raw or raw["phone_failure"] is not None:
+        return "moving_map_phone"
+    if window is None or drags < MIN_DRAG_RATE_HZ * (window.end_ns - window.start_ns) / 1e9:
         return "moving_map_drags"
+    gap = _drag_gap(raw, window)
+    if gap is None or gap > MAX_DRAG_GAP_S:
+        return "moving_map_drag_gap"
     relaunches = raw.get("media_relaunches")
     if not isinstance(relaunches, int) or isinstance(relaunches, bool) or relaunches < 0:
         return "moving_map_media"
     return None
 
 
-def _workload_record(raw: object) -> dict:
+def _drag_gap(raw: dict, window: Window | None) -> float | None:
+    if window is None:
+        return None
+    return max_drag_gap_s(raw.get("drag_t_ns"), window.start_ns, window.end_ns)
+
+
+def _workload_record(raw: object, window: Window | None) -> dict:
     """The result's workload record. For moving-map every evidence field is present;
-    a missing or malformed one is recorded as not proven (0 drags, not started),
-    and ``workload_gap`` then keeps the stage from qualifying."""
+    a missing or malformed one is recorded as not proven (0 drags, not started,
+    an unknown phone failure, no drag gap), and ``workload_gap`` then keeps the
+    stage from qualifying."""
     if not isinstance(raw, dict) or raw.get("kind") != "moving-map":
         return {"kind": "none"}
     count = lambda key: (raw[key] if isinstance(raw.get(key), int)  # noqa: E731
                          and not isinstance(raw.get(key), bool) and raw[key] >= 0 else 0)
+    failure = raw.get("phone_failure", "not recorded")
     return {"kind": "moving-map", "media_relaunches": count("media_relaunches"),
-            "drags": count("drags"), "stimulus_started": raw.get("stimulus_started") is True}
+            "drags": count("drags"), "stimulus_started": raw.get("stimulus_started") is True,
+            "phone_failure": failure if failure is None else str(failure)[:300],
+            "max_drag_gap_s": _drag_gap(raw, window)}
 
 
 def _digest(value: str | None) -> bool:

@@ -12,7 +12,7 @@ from common import DIGEST, Document, EvidenceError, require
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'perf'))
 import aa_perf_schema
 from aa_measurement_coverage import CoverageError, coverage_gaps, parse_coverage
-from aa_moving_map import MIN_DRAG_RATE_HZ
+from aa_moving_map import MAX_DRAG_GAP_S, MIN_DRAG_RATE_HZ
 
 RECOVERY: Final = {
     'usb_unplug_replug': 'dip+frames+pump+input',
@@ -213,11 +213,17 @@ def signed_av(doc: Document, metrics: Document) -> None:
         require(metrics.child(name).number('value') == contract.number(key), 'PERF_AV_CONTRACT:' + name)
     require(metrics.child('av_window_mean_abs_ms').number('value')
             == abs(contract.number('worst_window_mean_ms')), 'PERF_AV_CONTRACT:av_window_mean_abs_ms')
-    # The moving-map stimulus must have run for the stage (#137): started, and
-    # at least MIN_DRAG_RATE_HZ completed drags per active second.
+    # The moving-map stimulus must have run for the whole stage (#137): started,
+    # no failed phone command, at least MIN_DRAG_RATE_HZ completed drags per
+    # active second and no stretch over MAX_DRAG_GAP_S without one.
     workload = doc.child('workload')
     workload.equal('kind', 'moving-map')
     workload.equal('stimulus_started', True)
-    active = doc.child('run_status').number('active_projection_seconds')
+    workload.equal('phone_failure', None)
+    run_status = doc.child('run_status')
+    active = run_status.number('active_projection_seconds')
     require(workload.integer('drags') >= MIN_DRAG_RATE_HZ * active, 'PERF_WORKLOAD_DRAGS')
+    require(0 <= workload.number('max_drag_gap_s') <= MAX_DRAG_GAP_S, 'PERF_WORKLOAD_DRAG_GAP')
     require(workload.integer('media_relaunches') >= 0, 'PERF_WORKLOAD')
+    # The stage ran on a quiet host: the target saw no build during it.
+    require(run_status.get('concurrent_builds') == [], 'PERF_CONCURRENT_BUILD')

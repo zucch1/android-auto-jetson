@@ -17,6 +17,11 @@ One implementation of the phone and display choreography:
   in ``media_relaunches``;
 * ``restore_phone``: reset the USB mode and stop the media player.
 
+Every required phone command is checked: a nonzero exit, a timeout or an
+``am start`` that reports ``Error`` sets ``phone_failure`` and ends the
+workload (no further intent or drag). The phone is harness, not the product,
+so the soak reporter BLOCKS such a stage (``run_evidence:moving_map_phone``).
+
 tools/wired-qa/aa_drive_smoke.py drives it from its run loop; the soak
 collector (tools/perf/aa_projection_collect.py) runs it in a ``SoakStimulus``
 thread for the whole stage. Every phone command goes through ``adb -s SERIAL``.
@@ -48,13 +53,23 @@ MEDIA_RELAUNCH_SILENCE_S = 5.0
 # about 0.65 Hz (one drag per STIMULUS_PERIOD_S plus its own ~0.5 s); the floor
 # leaves room for adb relaunches and still proves the map moved all stage.
 MIN_DRAG_RATE_HZ = 0.25
+# Continuity: no stretch of the active window may go longer than this without a
+# completed drag. Nominal spacing is ~1.4 s (STIMULUS_PERIOD_S plus the drag's
+# own ~0.4 s); a media relaunch adds two ``am start`` calls (about 1-3 s each)
+# between drags, so a healthy run stays under ~8 s. 10 s keeps that margin and
+# still catches a stimulus that stopped (closed pipe, dead thread) mid-stage,
+# which the aggregate MIN_DRAG_RATE_HZ alone cannot.
+MAX_DRAG_GAP_S = 10.0
 MAPS_PACKAGE = "com.google.android.apps.maps"
 DEFAULT_GEO_URI = "geo:0,0?q=Atlanta"
 AUDIO_LINE = b'{"event":"audio_write_completed"'
 
 
 def adb_runner(serial: str, timeout: float = 20.0) -> Callable[..., subprocess.CompletedProcess]:
-    """``adb -s SERIAL ...`` with a bound; a missing or hung adb never raises."""
+    """``adb -s SERIAL ...`` with a bound; a missing or hung adb never raises.
+
+    A timeout or a missing adb comes back as a failed CompletedProcess (exit 1).
+    """
     def run(*args: str) -> subprocess.CompletedProcess:
         try:
             return subprocess.run(["adb", "-s", serial, *args], capture_output=True, text=True,
@@ -62,6 +77,24 @@ def adb_runner(serial: str, timeout: float = 20.0) -> Callable[..., subprocess.C
         except (OSError, subprocess.TimeoutExpired) as error:
             return subprocess.CompletedProcess(["adb", *args], 1, "", str(error))
     return run
+
+
+def command_failure(result: object) -> str | None:
+    """Why an adb command failed, or None when it succeeded.
+
+    Anything but a CompletedProcess with exit 0 fails (fail closed), and so does
+    output with a line starting ``Error`` (``am start`` can report an activity
+    it did not start on stdout with exit 0).
+    """
+    if not isinstance(result, subprocess.CompletedProcess):
+        return "no result"
+    output = "\n".join(text for text in (result.stdout, result.stderr) if isinstance(text, str))
+    error = next((line.strip() for line in output.splitlines() if line.strip().startswith("Error")),
+                 None)
+    if result.returncode != 0:
+        detail = error or next((line.strip() for line in output.splitlines() if line.strip()), "")
+        return f"exit {result.returncode}" + (f": {detail[:200]}" if detail else "")
+    return error[:200] if error else None
 
 
 def send_control(fd: int, data: bytes, stopped: Callable[[], bool],
@@ -90,6 +123,20 @@ def send_control(fd: int, data: bytes, stopped: Callable[[], bool],
     return "sent"
 
 
+def max_drag_gap_s(drags_ns: object, start_ns: int, end_ns: int) -> float | None:
+    """Longest stretch of [start_ns, end_ns] without a completed drag, in seconds.
+
+    The edges count (window start to the first drag, the last drag to the end).
+    None when the evidence is not a nondecreasing list of integers.
+    """
+    if (not isinstance(drags_ns, list) or end_ns < start_ns
+            or any(not isinstance(t, int) or isinstance(t, bool) for t in drags_ns)
+            or any(b < a for a, b in zip(drags_ns, drags_ns[1:]))):
+        return None
+    points = [start_ns, *(t for t in drags_ns if start_ns < t < end_ns), end_ns]
+    return max(b - a for a, b in zip(points, points[1:])) / 1e9
+
+
 def drag_lines(step: int) -> list[str]:
     """The touch-control lines of drag number ``step`` (alternating direction)."""
     a, b = DRAG_POINTS if step % 2 == 0 else DRAG_POINTS[::-1]
@@ -114,6 +161,11 @@ class MovingMap:
         self.geo_uri = geo_uri
         self.media_relaunches = 0
         self.drags = 0
+        # Monotonic time of every completed drag (continuity evidence).
+        self.drag_ns: list[int] = []
+        # The first required phone command that failed ("<step>: <why>"): the
+        # workload is over; nothing more is sent but the restore.
+        self.phone_failure: str | None = None
         self._last_drag = None
         self._relaunched_ns = time.monotonic_ns()
         # Every phone command goes through _phone under this lock. restore_phone
@@ -122,30 +174,38 @@ class MovingMap:
         self._lock = threading.Lock()
         self._closed = False
 
-    def _phone(self, *args: str) -> bool:
+    def _phone(self, step: str, *args: str) -> bool:
+        """Run one required phone command; False if the gate is closed or it failed."""
         with self._lock:
-            if self._closed:
+            if self._closed or self.phone_failure is not None:
                 return False
-            self.adb(*args)
+            failure = command_failure(self.adb(*args))
+            if failure is not None:
+                self.phone_failure = f"{step}: {failure}"
+                return False
             return True
 
     def start_media(self) -> bool:
-        return self._phone("shell", "am", "start", "-a", "android.intent.action.VIEW", *self.media)
+        return self._phone("media", "shell", "am", "start", "-a", "android.intent.action.VIEW",
+                           *self.media)
 
     def start_maps(self) -> bool:
-        return self._phone("shell", "am", "start", "-a", "android.intent.action.VIEW",
+        return self._phone("maps", "shell", "am", "start", "-a", "android.intent.action.VIEW",
                            "-d", self.geo_uri, "-p", MAPS_PACKAGE)
 
     def prepare_phone(self, sleep: Callable[[float], bool]) -> bool:
-        """USB reset, wake, media, then Maps in front. False if ``sleep`` was stopped."""
-        self._phone("shell", "svc", "usb", "setFunctions", "mtp")
-        if not sleep(3):
+        """USB reset, wake, media, then Maps in front.
+
+        False if ``sleep`` was stopped or a command failed (``phone_failure``).
+        """
+        if not self._phone("usb_reset", "shell", "svc", "usb", "setFunctions", "mtp") or not sleep(3):
             return False
-        self._phone("shell", "input", "keyevent", "KEYCODE_WAKEUP")
-        self.start_media()
-        if not sleep(4):
+        if not self._phone("wake", "shell", "input", "keyevent", "KEYCODE_WAKEUP"):
             return False
-        self.start_maps()
+        if not self.start_media() or not sleep(4):
+            return False
+        if not self.start_maps():
+            return False
         self._relaunched_ns = time.monotonic_ns()
         return True
 
@@ -166,8 +226,9 @@ class MovingMap:
         heard = last_audio_ns if last_audio_ns is not None else since_ns
         if now_ns - heard > silence and now_ns - self._relaunched_ns > silence and not stopped():
             if not self.start_media() or stopped():
-                return False  # stopping (or restored): never Maps after that
-            self.start_maps()
+                return False  # failed, stopping or restored: never Maps after that
+            if not self.start_maps():
+                return False
             self._relaunched_ns = time.monotonic_ns()
             self.media_relaunches += 1
             return True
@@ -178,9 +239,12 @@ class MovingMap:
         """One tick: media keep-alive, and a drag when one is due.
 
         Returns the control outcome ("sent", "stalled", "stopped", "closed"),
-        or "idle" when no drag was due.
+        "phone_failed" once a required phone command failed (the workload is
+        over), or "idle" when no drag was due.
         """
         self.keep_media_playing(time.monotonic_ns(), last_audio_ns, since_ns, stopped)
+        if self.phone_failure is not None:
+            return "phone_failed"
         if stopped():
             return "stopped"
         if self._last_drag is not None and time.monotonic() - self._last_drag < STIMULUS_PERIOD_S:
@@ -192,6 +256,7 @@ class MovingMap:
                 break
         if outcome == "sent":
             self.drags += 1
+            self.drag_ns.append(time.monotonic_ns())
         self._last_drag = time.monotonic()
         return outcome
 
@@ -248,9 +313,16 @@ class SoakStimulus(threading.Thread):
             outcome = self.workload.step(self.control_fd, last_audio_ns=self.audio.poll(),
                                          since_ns=self.since_ns, stopped=self.halt.is_set,
                                          sleep=self._sleep)
+            # The display's control input is part of the product under test: a
+            # stalled or unexpectedly closed pipe is a terminal FAIL. A failed
+            # phone command ends the workload too; MovingMap.phone_failure
+            # carries it (BLOCKED: the harness, not the product).
             if outcome == "stalled":
                 self.failure = "display_control_stalled"
                 return
             if outcome == "closed":
+                self.failure = "display_control_closed"
+                return
+            if outcome == "phone_failed":
                 return
             self.halt.wait(0.1)

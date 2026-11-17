@@ -56,6 +56,15 @@ class V3PackageTests(PackageTest):
             'stimulus started, too few drags':
                 lambda d: d['workload'].update(drags=int(0.25 * d['run_status']['active_projection_seconds']) - 1),
             'av_sync_ms gated again': lambda d: d['metrics']['av_sync_ms'].update(gated=True),
+            'a phone command failed': lambda d: d['workload'].update(phone_failure='media: exit 1'),
+            'phone failure not recorded': lambda d: d['workload'].pop('phone_failure'),
+            'drags stopped mid-stage': lambda d: d['workload'].update(max_drag_gap_s=600.0),
+            'drag gap just over the limit': lambda d: d['workload'].update(max_drag_gap_s=10.01),
+            'no drag continuity evidence': lambda d: d['workload'].update(max_drag_gap_s=None),
+            'build during the stage': lambda d: d['run_status'].update(
+                concurrent_builds=[{'t_s': 600.0, 'processes': ['4242 cc1plus']}]),
+            'no build watch': lambda d: d['run_status'].update(concurrent_builds=None),
+            'build watch dropped': lambda d: d['run_status'].pop('concurrent_builds'),
         }
         for label, change in cases.items():
             for field in ('perf_30m', 'soak_2h'):

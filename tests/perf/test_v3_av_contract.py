@@ -44,9 +44,19 @@ def v3(seconds: int = 1800, skew_ms=lambda at_s: 12.0, audio=(0.0, None),
         inside = [t for t in times if lo <= t < hi]
         raw["av_series"]["pair_t_ns"] = inside
         raw["av_series"]["pair_skew_ns"] = [int(skew_ms(t / NS) * 1e6) for t in inside]
-    raw["workload"] = workload or {"kind": "moving-map", "media_relaunches": 0, "drags": seconds,
-                                   "stimulus_started": True}
+    raw["workload"] = workload or moving_map(seconds)
+    raw["concurrent_builds"] = []
     return raw
+
+
+DRAG_NS = 1_500_000_000  # a drag every 1.5 s, as the live stimulus does
+
+
+def moving_map(seconds: int, **change) -> dict:
+    """A healthy moving-map record: drags every 1.5 s past the window's end."""
+    times = list(range(DRAG_NS // 2, (seconds + 10) * NS, DRAG_NS))
+    return {"kind": "moving-map", "media_relaunches": 0, "drags": len(times),
+            "stimulus_started": True, "phone_failure": None, "drag_t_ns": times, **change}
 
 
 def result(raw: dict, *, live: bool = False) -> dict:
@@ -127,7 +137,7 @@ def test_live_v3_requires_the_moving_map_workload() -> None:
 
 def test_live_v3_requires_proof_that_the_stimulus_ran() -> None:
     # The workload label alone is not evidence: started, enough drags, media count.
-    base = {"kind": "moving-map", "media_relaunches": 0, "drags": 1800, "stimulus_started": True}
+    base = moving_map(1800, drags=1800)
     cases = {
         "run_evidence:moving_map_stimulus": [{**base, "stimulus_started": False, "drags": 0},
                                              {**base, "stimulus_started": False},
@@ -141,13 +151,87 @@ def test_live_v3_requires_proof_that_the_stimulus_ran() -> None:
             assert doc["verdict"] == "BLOCKED", (workload, doc["verdict"])
             assert reason in doc["blocked_on"], (workload, doc["blocked_on"])
             # The result records the evidence it saw, every field present.
-            assert set(doc["workload"]) == {"kind", "media_relaunches", "drags", "stimulus_started"}
+            assert set(doc["workload"]) == {"kind", "media_relaunches", "drags", "stimulus_started",
+                                            "phone_failure", "max_drag_gap_s"}
     ok = result(v3(1800, workload={**base, "drags": 450}), live=True)
     assert "moving_map" not in (ok["blocked_on"] or ""), ok["blocked_on"]
     # The v3 schema requires the evidence fields for a moving-map record.
     bare = copy.deepcopy(result(v3(60)))
     bare["workload"] = {"kind": "moving-map"}
     assert schema.validate(bare, schema.load_schema(schema.SCHEMA_V3))
+
+
+def test_live_v3_blocks_a_failed_phone_command() -> None:
+    # Given a stage whose media relaunch (or setup) adb command failed: the
+    # harness lost the phone, the moving map is not proven -> BLOCKED, never PASS.
+    for failure in ("media: exit 1: error: device offline", "maps: Error: Activity not started"):
+        doc = result(v3(1800, workload=moving_map(1800, phone_failure=failure)), live=True)
+        assert doc["verdict"] == "BLOCKED", (failure, doc["verdict"])
+        assert "run_evidence:moving_map_phone" in doc["blocked_on"], doc["blocked_on"]
+        assert doc["workload"]["phone_failure"] == failure
+    # A record that does not say whether a phone command failed proves nothing.
+    record = moving_map(1800)
+    del record["phone_failure"]
+    doc = result(v3(1800, workload=record), live=True)
+    assert "run_evidence:moving_map_phone" in doc["blocked_on"], doc["blocked_on"]
+    assert doc["workload"]["phone_failure"] == "not recorded"
+
+
+def test_live_v3_requires_drags_across_the_whole_window() -> None:
+    # The review's case: plenty of early drags (1800 in the first 1200 s, over
+    # the 0.25 Hz aggregate floor), then the control pipe is lost for 600 s.
+    early = [t for t in range(0, 1200 * NS, 666_666_666)][:1800]
+    doc = result(v3(1800, workload=moving_map(1800, drags=len(early), drag_t_ns=early)), live=True)
+    assert len(early) >= 0.25 * 1800
+    assert doc["verdict"] == "BLOCKED", doc["verdict"]
+    assert "run_evidence:moving_map_drag_gap" in doc["blocked_on"], doc["blocked_on"]
+    assert doc["workload"]["max_drag_gap_s"] > 590
+    # One hole just over MAX_DRAG_GAP_S blocks; one just under passes.
+    for hole_s, blocked in ((10.5, True), (9.5, False)):
+        times = [t for t in moving_map(1800)["drag_t_ns"] if not 900 * NS < t < (900 + hole_s) * NS]
+        times = sorted({*times, 900 * NS, int((900 + hole_s) * NS)})
+        doc = result(v3(1800, workload=moving_map(1800, drags=len(times), drag_t_ns=times)), live=True)
+        assert abs(doc["workload"]["max_drag_gap_s"] - hole_s) < 1e-9, doc["workload"]
+        assert ("run_evidence:moving_map_drag_gap" in (doc["blocked_on"] or "")) is blocked, \
+            (hole_s, doc["blocked_on"])
+    # The window's edges count: no drag in the last 11 s blocks.
+    tail = [t for t in moving_map(1800)["drag_t_ns"] if t < 1789 * NS]
+    doc = result(v3(1800, workload=moving_map(1800, drags=len(tail), drag_t_ns=tail)), live=True)
+    assert "run_evidence:moving_map_drag_gap" in doc["blocked_on"], doc["blocked_on"]
+    # Missing or malformed drag times are no continuity evidence.
+    for bad in (None, [3, 2], [1.5], "x"):
+        record = moving_map(1800)
+        record["drag_t_ns"] = bad
+        if bad is None:
+            del record["drag_t_ns"]
+        doc = result(v3(1800, workload=record), live=True)
+        assert "run_evidence:moving_map_drag_gap" in doc["blocked_on"], (bad, doc["blocked_on"])
+        assert doc["workload"]["max_drag_gap_s"] is None
+    assert result(v3(1800), live=True)["workload"]["max_drag_gap_s"] == 1.5
+
+
+def test_live_v3_blocks_a_build_during_the_stage() -> None:
+    # Given a capture whose on-target watch saw a compiler during the stage.
+    raw = v3(1800)
+    raw["concurrent_builds"] = [{"t_ns": 600 * NS, "processes": ["4242 cc1plus", "4240 ninja"]}]
+    doc = result(raw, live=True)
+    # Then the stage is BLOCKED (interference), with the evidence in the result.
+    assert doc["verdict"] == "BLOCKED", doc["verdict"]
+    assert "interference:concurrent_build" in doc["blocked_on"], doc["blocked_on"]
+    assert doc["run_status"]["concurrent_builds"] == [
+        {"t_s": 600.0, "processes": ["4242 cc1plus", "4240 ninja"]}]
+    assert not schema.validate(doc, schema.load_schema(schema.SCHEMA_V3))
+    # A capture without the watch is not proven quiet.
+    del raw["concurrent_builds"]
+    doc = result(raw, live=True)
+    assert "run_evidence:concurrent_build_watch" in doc["blocked_on"], doc["blocked_on"]
+    assert doc["run_status"]["concurrent_builds"] is None
+    # A measured budget miss is still a FAIL under interference (never hidden).
+    raw = v3(1800, audio=None)
+    raw["concurrent_builds"] = [{"t_ns": 600 * NS, "processes": ["4242 cc1plus"]}]
+    assert result(raw, live=True)["verdict"] == "FAIL"
+    # The quiet control: an empty watch.
+    assert result(v3(1800), live=True)["run_status"]["concurrent_builds"] == []
 
 
 def test_malformed_series_is_a_contract_violation() -> None:

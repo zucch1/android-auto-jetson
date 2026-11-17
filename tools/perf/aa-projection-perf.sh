@@ -535,6 +535,15 @@ if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port
         blocked_result "phone_identity_mismatch" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
         exit 3
     fi
+    # A required phone command (USB reset, wake, media or Maps launch) failed
+    # before the stage started: the harness never set up the moving map, so
+    # nothing was measured (#137).
+    if grep -q '^error: phone_setup_failed:' "$BUFFER/collector.err"; then
+        echo "BLOCKED: phone_setup_failed" >&2
+        sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
+        blocked_result "phone_setup_failed" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        exit 3
+    fi
     if grep -q '^error: unoptimized_build:' "$BUFFER/collector.err"; then
         echo "BLOCKED: unoptimized_build" >&2
         sed -n '1,20p' "$BUFFER/collector.err" >&2 || true

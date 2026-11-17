@@ -295,9 +295,11 @@ capture) before returning.
 Versions (#137): a v2 capture replays to a v2 result under the v2 contract
 (A/V max <= 50 ms), never reinterpreted. Live stages write capture `/3`, whose
 `av_series` (signed pairs and audio coverage) the reporter judges with the
-signed A/V contract, and whose `workload` must be the moving-map workload
-(`--media-uri` is required for every live stage). See the runbook's **Soak
-stages: moving-map workload and signed A/V (v3)**.
+signed A/V contract, and whose `workload` must prove the moving-map workload
+ran: it started, no phone command failed, the drag rate met the floor, and no
+gap was over 10 s. `--media-uri` is required for every live stage. A build seen
+on the target during a stage (`concurrent_builds`) BLOCKS it. See the runbook's
+**Soak stages: moving-map workload and signed A/V (v3)**.
 
 ## Tests
 

@@ -26,6 +26,13 @@ With ``--workload moving-map`` (the soak workload, #137) the collector prepares
 the phone (``adb -s --phone-serial``: USB reset, media, then Google Maps),
 gives the managed display its test control channel, and drags the map and
 keeps the media playing for the whole stage (tools/perf/aa_moving_map.py).
+A required phone command that fails during the setup refuses the stage before
+the receiver starts (``error: phone_setup_failed:``, BLOCKED by the launcher);
+one that fails later ends the workload and is recorded in
+``workload.phone_failure``. The capture also records every completed drag's
+time (``workload.drag_t_ns``) for the reporter's continuity check, and the
+build/compiler processes seen on this host during the stage
+(``concurrent_builds``), which disqualify it (#137).
 
 The capture is the raw record; budget verdicts are produced by
 ``aa_perf_report.py``. A metric the collector cannot observe is emitted as
@@ -98,6 +105,47 @@ _COLLECTOR_LOG_POLL_SECONDS = 0.25
 # stderr marker the launcher maps to BLOCKED phone_identity_mismatch.
 PHONE_MISMATCH_CODE = "phone_serial_mismatch"
 PHONE_REFUSAL_PREFIX = "error: phone_identity_mismatch:"
+# stderr marker the launcher maps to BLOCKED phone_setup_failed.
+PHONE_SETUP_PREFIX = "error: phone_setup_failed:"
+# Compiler/build processes (exact /proc comm names) whose presence during a
+# stage disqualifies it; the soak chain's quiet gate uses the same list.
+BUILD_NAMES = ("cmake", "ninja", "make", "c++", "g++", "gcc", "cc1plus", "ctest", "nvcc", "ld")
+_BUILD_RECORDS_LIMIT = 256
+
+
+class PhoneSetupError(RuntimeError):
+    """A required phone command failed before the stage started."""
+
+
+def ancestors(pid: int | None = None) -> set[int]:
+    """This process and its ancestors (a stage launched from a build tool is not
+    competing with itself)."""
+    seen: set[int] = set()
+    pid = os.getpid() if pid is None else pid
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return seen
+
+
+def build_processes(exclude: Iterable[int] = ()) -> list[str]:
+    """Running compiler/build processes ("PID COMM"), skipping ``exclude``."""
+    skip = set(exclude)
+    found = []
+    for path in Path("/proc").glob("[0-9]*/comm"):
+        try:
+            if int(path.parent.name) in skip:
+                continue
+            name = path.read_text().strip()
+        except (OSError, ValueError):
+            continue
+        if name in BUILD_NAMES:
+            found.append(f"{path.parent.name} {name}")
+    return sorted(found, key=lambda entry: int(entry.split()[0]))
 _PROGRESS_KEYS = ("video_units", "audio_chunks", "video_presentations", "audio_writes", "av_pairs")
 
 # Diagnostic keys the receiver/display event stream may carry (task-19
@@ -776,9 +824,13 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             audio_writes=parser.audio_writes, av_pairs=parser.av_pairs,
         )
 
+    concurrent_builds: list[dict] = []
+    own_processes = ancestors()
     try:
         if workload is not None:
-            workload.prepare_phone(lambda seconds: (time.sleep(seconds), True)[1])
+            if not workload.prepare_phone(lambda seconds: (time.sleep(seconds), True)[1]):
+                # Nothing is launched; the finally restores the phone.
+                raise PhoneSetupError(workload.phone_failure or "phone setup did not complete")
             # The phone setup is not part of the startup budget.
             origin_ns = time.monotonic_ns()
             start = origin_ns / 1e9
@@ -864,6 +916,9 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                     time.sleep(_COLLECTOR_LOG_POLL_SECONDS)
                     sample = read_sample()
             samples.append(sample)
+            running = build_processes(own_processes)
+            if running and len(concurrent_builds) < _BUILD_RECORDS_LIMIT:
+                concurrent_builds.append({"t_ns": sample.t_ns, "processes": running[:16]})
             was_started = progress.started_ns is not None
             progress.observe(sample, logged_progress)
             parser.progress_sampled(sample.t_ns, origin_ns)
@@ -965,8 +1020,11 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     # so no run can be read as a qualification result it is not.
     capture["build"] = build if build is not None else build_record(args)
     capture["workload"] = ({"kind": "moving-map", "media_relaunches": workload.media_relaunches,
-                            "drags": workload.drags, "stimulus_started": stimulus is not None}
+                            "drags": workload.drags, "stimulus_started": stimulus is not None,
+                            "phone_failure": workload.phone_failure,
+                            "drag_t_ns": [t - origin_ns for t in workload.drag_ns][:_AV_SERIES_LIMIT]}
                            if workload is not None else {"kind": "none"})
+    capture["concurrent_builds"] = concurrent_builds
     if thermal_policy is not None:
         capture["thermal_policy"] = asdict(thermal_policy)
     return capture
@@ -1075,6 +1133,10 @@ def _cli(argv: list[str]) -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(3))
     try:
         capture = collect(args, build=build)
+    except PhoneSetupError as exc:
+        print(f"{PHONE_SETUP_PREFIX} {exc}; the phone was restored and nothing was measured",
+              file=sys.stderr)
+        return 2
     except CoverageError as exc:
         print(f"contract violation: {exc}", file=sys.stderr)
         return 4
