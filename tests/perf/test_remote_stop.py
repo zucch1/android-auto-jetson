@@ -39,6 +39,8 @@ PHONE = "TESTPHONE01"
 A, B = "a" * 64, "b" * 64
 
 SSH = r"""#!/usr/bin/env bash
+# FAKE_SSH_IGNORE_TERM models an ssh client that ignores TERM (timeout -k then KILLs it).
+[[ -n "${FAKE_SSH_IGNORE_TERM:-}" ]] && trap '' TERM
 cmd="${@: -1}"
 printf '%s\n' "$cmd" >> "$SSH_LOG"
 case "$cmd" in
@@ -301,6 +303,16 @@ def test_a_collector_timeout_runs_the_remote_stop() -> None:
     seen = run_launcher_past_its_budget("clean")
     # Then the launcher stopped it on the target and confirmed its cleanup, and
     # the stage is BLOCKED collector_timeout (never collector_failed, never PASS).
+    assert "the ssh bound of 5 s expired" in seen["output"], seen["output"]
+    assert "remote-stop: acknowledged" in seen["output"], seen["output"]
+    assert not seen["remote_alive"] and "restored" in seen["marks"], seen
+    assert seen["rc"] == 3 and seen["result"]["blocked_on"] == "collector_timeout", seen
+
+
+def test_a_term_resistant_ssh_past_its_bound_is_still_a_collector_timeout() -> None:
+    # Given an ssh client that ignores TERM, so timeout's KILL grace expires (exit 137).
+    seen = run_launcher_past_its_budget("clean", FAKE_SSH_IGNORE_TERM="1")
+    # Then it is classified as the ssh bound expiring, and the target is still cleaned up.
     assert "the ssh bound of 5 s expired" in seen["output"], seen["output"]
     assert "remote-stop: acknowledged" in seen["output"], seen["output"]
     assert not seen["remote_alive"] and "restored" in seen["marks"], seen

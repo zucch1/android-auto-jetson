@@ -570,6 +570,9 @@ remote_stop() {
 stop_signal=""
 trap 'stop_signal=TERM' TERM
 trap 'stop_signal=INT' INT
+# Monotonic seconds (wall-clock steps never move /proc/uptime).
+monotonic_s() { local up _rest; read -r up _rest </proc/uptime; printf '%s\n' "${up%%.*}"; }
+collector_started_s="$(monotonic_s)"
 timeout -k "$SSH_KILL_GRACE_S" "$collector_timeout" ssh "${SSH_OPTS[@]}" "$HOST" "${REMOTE_ENV} python3 - --receiver '${RECEIVER}' --port '${PORT}' \
         --duration-seconds ${duration_secs} --interval ${INTERVAL} \
         ${THERMAL_POLICY:+--thermal-policy '${THERMAL_POLICY}'} \
@@ -600,6 +603,11 @@ if [[ -n "$stop_signal" ]]; then
     exit 143
 fi
 trap - TERM INT
+# GNU timeout exits 137, not 124, when its KILL grace expires because the ssh
+# client ignored TERM. That is still the ssh bound expiring: classify it as one.
+if ((collector_rc == 137 && $(monotonic_s) - collector_started_s >= collector_timeout)); then
+    collector_rc=124
+fi
 # The collector has ended, however it ended. A timeout (124) or a dropped link
 # can leave it, its receiver/display and the phone running on the target:
 # confirm the target either way (a finished run only has its report relayed).
