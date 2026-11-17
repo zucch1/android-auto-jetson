@@ -63,10 +63,15 @@ REMOTE = r"""#!/usr/bin/env python3
 import os, signal, sys, time
 run_file, marks, mode = sys.argv[1], os.environ["FAKE_REMOTE_MARKS"], os.environ["FAKE_REMOTE_MODE"]
 start = open(f"/proc/{os.getpid()}/stat").read().rsplit(")", 1)[1].split()[19]
+try:
+    os.setpgid(0, 0)  # as the real collector: lead its own group
+except PermissionError:
+    pass
 if run_file:  # (a launcher without --run-file still starts the remote side)
     fd = os.open(run_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as out:
-        out.write(f"collector {os.getpid()} {start}\nphone TESTPHONE01\nmedia_package org.example.player\n")
+        out.write(f"collector {os.getpid()} {start}\ngroup {os.getpgid(0)} {os.getsid(0)}\n"
+                  "phone TESTPHONE01\nmedia_package org.example.player\n")
 def mark(name):
     open(os.path.join(marks, name), "w").write(str(os.getpid()))
 def on_term(*_):
@@ -234,6 +239,7 @@ def test_the_real_collector_acknowledges_a_remote_stop_after_its_cleanup() -> No
                 collector.stderr.read() if collector.poll() is not None else "no display yet"
             record = {line.split()[0]: line.split()[1:] for line in run_file.read_text().splitlines()}
             assert record["collector"][0] == str(collector.pid) and record["phone"] == [PHONE]
+            assert record["group"][0] == str(collector.pid), record  # leads its own group
             assert record["media_package"] == ["org.example.player"]
             children = [int(record[role][0]) for role in ("receiver", "display")]
             assert all(alive(pid) for pid in children)
@@ -253,6 +259,119 @@ def test_the_real_collector_acknowledges_a_remote_stop_after_its_cleanup() -> No
             if collector.poll() is None:
                 os.killpg(collector.pid, signal.SIGKILL)
                 collector.wait()
+
+
+SLOW_ADB = """#!/usr/bin/env bash
+# The media launch is in flight for 4 s, then lands (logged on completion,
+# as the intent reaches the phone).
+case "$*" in *fixture.opus*)
+    if [ -n "${FAKE_ADB_SLOW:-}" ]; then echo "$$" > "$FAKE_ADB_SLOW"; sleep 4; fi ;;
+esac
+printf '%s\\n' "$*" >> "$FAKE_ADB_LOG"
+exit 0
+"""
+
+
+def test_a_forced_stop_kills_an_in_flight_adb_command_before_restoring() -> None:
+    # Sol's reproduction: the real collector, started as sshd would (under a
+    # shell in its own session, so the collector must make its own group), is
+    # frozen while its media-launch adb child is in flight.
+    with tempfile.TemporaryDirectory(prefix="remote-stop-adb-") as directory:
+        root = Path(directory)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        for name, body in (("adb", SLOW_ADB), ("fake-display", DISPLAY), ("xrandr", XRANDR)):
+            (bin_dir / name).write_text(body)
+            (bin_dir / name).chmod(0o755)
+        run_file, adb_marker, adb_log = root / "run", root / "adb-child", root / "adb.log"
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "FAKE_ADB_LOG": str(adb_log),
+               "FAKE_ADB_SLOW": str(adb_marker)}
+        collector_cmd = " ".join(f"'{part}'" for part in (
+            sys.executable, "-B", str(COLLECTOR_DIR / "aa_projection_collect.py"),
+            "--receiver", str(FAKE_RECEIVER), "--display", str(bin_dir / "fake-display"),
+            "--port", "1-2.1", "--duration-seconds", "120", "--interval", "1",
+            "--state-dir", str(root / "state"), "--allow-unoptimized-build",
+            "--phone-serial", PHONE, "--workload", "moving-map",
+            "--media-uri", "file:///sdcard/Music/fixture.opus",
+            "--media-component", "org.example.player/.Play", "--run-file", str(run_file)))
+        session = subprocess.Popen(["bash", "-c", f"{collector_cmd} >/dev/null 2>&1; exit 7"],
+                                   env=env, start_new_session=True)
+        collector_pid = adb_pid = None
+        try:
+            assert wait_for(lambda: adb_marker.exists() and adb_marker.read_text().strip(), 30)
+            adb_pid = int(adb_marker.read_text())
+            record = {line.split()[0]: line.split()[1:] for line in run_file.read_text().splitlines()}
+            collector_pid = int(record["collector"][0])
+            assert collector_pid != session.pid and record["group"][0] == str(collector_pid)
+            assert record["group"][1] == str(session.pid)  # the shell's session, not its group
+            os.kill(collector_pid, signal.SIGSTOP)  # the hung collector
+            stop = subprocess.run(["bash", str(STOP), str(run_file), "2", "5"],
+                                  capture_output=True, text=True, timeout=90, env=env)
+            restored_at = len(adb_log.read_text().splitlines()) if adb_log.exists() else 0
+            # Then the in-flight adb command died with the collector's group,
+            # before the restore; the session's shell was not touched.
+            assert stop.returncode == 0 and stop.stdout.strip() == "remote-stop: forced", stop
+            assert not alive(adb_pid), "the in-flight adb command survived the forced stop"
+            assert not run_file.exists()
+            assert session.wait(timeout=10) == 7, "the ssh session's shell was killed"
+            # And nothing reaches the phone after the restore, then or later.
+            time.sleep(5)  # past the moment the adb child would have landed
+            adb = adb_log.read_text().splitlines()
+            assert adb[-2:] == [f"-s {PHONE} shell svc usb setFunctions mtp",
+                                f"-s {PHONE} shell am force-stop org.example.player"], adb
+            assert len(adb) == restored_at and not any("fixture.opus" in line for line in adb), adb
+        finally:
+            for pid in (collector_pid, adb_pid):
+                if pid is not None and alive(pid):
+                    os.kill(pid, signal.SIGKILL)
+            if session.poll() is None:
+                os.killpg(session.pid, signal.SIGKILL)
+                session.wait()
+
+
+GROUP_COLLECTOR = r"""#!/usr/bin/env python3
+import os, signal, subprocess, sys, time
+run_file = sys.argv[1]
+os.setpgid(0, 0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)  # hung: never acknowledges
+child = subprocess.Popen(["sleep", "60"])  # an in-flight command in its group
+start = open(f"/proc/{os.getpid()}/stat").read().rsplit(")", 1)[1].split()[19]
+with open(run_file, "w") as out:
+    out.write(f"collector {os.getpid()} {start}\ngroup {os.getpgid(0)} {os.getsid(0)}\n"
+              f"phone TESTPHONE01\nchild {child.pid}\n")
+time.sleep(60)
+"""
+
+
+def test_a_survivor_of_the_kill_is_reported_as_a_failure() -> None:
+    # Given a hung collector group whose processes survive the KILL (modelled
+    # by sending no signal), the stop must not report success.
+    with tempfile.TemporaryDirectory(prefix="remote-stop-survivor-") as directory:
+        root = Path(directory)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "adb").write_text(ADB)
+        (bin_dir / "adb").chmod(0o755)
+        (root / "collector").write_text(GROUP_COLLECTOR)
+        (root / "collector").chmod(0o755)
+        run_file = root / "run"
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
+               "FAKE_ADB_LOG": str(root / "adb.log")}
+        collector = subprocess.Popen([str(root / "collector"), str(run_file)], env=env)
+        try:
+            assert wait_for(lambda: run_file.exists() and "child" in run_file.read_text())
+            child = int(run_file.read_text().split("child ")[1].split()[0])
+            stop = subprocess.run(["bash", str(STOP), str(run_file), "1", "1"], capture_output=True,
+                                  text=True, timeout=60, env={**env, "AA_REMOTE_STOP_SIGNAL": "0"})
+            assert stop.returncode == 1, stop
+            assert stop.stdout.startswith("remote-stop: failed: survivors"), stop.stdout
+            assert str(child) in stop.stdout and str(collector.pid) in stop.stdout, stop.stdout
+        finally:
+            try:
+                os.killpg(collector.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            collector.wait()
 
 
 def test_stop_script_never_signals_a_reused_pid_and_reports_no_run() -> None:

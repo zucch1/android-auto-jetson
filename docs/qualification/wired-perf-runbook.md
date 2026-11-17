@@ -490,7 +490,9 @@ the stop explicit:
 1. It starts the collector with `--run-file /tmp/aa-perf-run-<random>`. The
    collector creates that file exclusively (mode 0600). It records its own
    PID and those of the receiver and display, each with its `/proc` start
-   time, plus the phone serial and media package.
+   time, plus the phone serial and media package. It also makes itself the
+   leader of its own process group and records it (`group PGID SID`). Its adb
+   commands are in that group; the ssh session's shell is not.
 2. On TERM/INT, the launcher runs `tools/perf/aa_remote_stop.sh` on the
    target over a separate ssh call.
 3. The script TERMs the collector, which runs its normal cleanup: stimulus,
@@ -498,11 +500,19 @@ the stop explicit:
    remove the run file. That removal, within `AA_REMOTE_STOP_ACK_S` (30 s), is
    the acknowledgement (`remote-stop: acknowledged`).
 4. Without an acknowledgement (a hung cleanup, or a collector already gone),
-   the script falls back independently. It KILLs each recorded process that is
-   still the same process (a PID with a different start time is never
-   signalled), taking the receiver and display by process group. It then
-   restores the phone itself (`svc usb setFunctions mtp`, then force-stop the
-   media player) and prints `remote-stop: forced`.
+   the script falls back independently:
+   - It KILLs the collector's whole process group, so an in-flight adb command
+     dies with it, then the receiver's and display's groups.
+   - A group is signalled only while it is still the recorded one: the same
+     PGID and session and, if a live process leads it, the recorded leader by
+     start time. A reused PID is never signalled.
+   - It waits until every killed group is empty, then restores the phone
+     itself (`svc usb setFunctions mtp`, then force-stop the media player) and
+     prints `remote-stop: forced`. Nothing the collector started can send an
+     intent after that restore.
+   - If a process survives the KILL, the script still restores the phone but
+     prints `remote-stop: failed: survivors <PID>...` and exits 1, and the
+     launcher reports the remote stop as failed.
 5. The launcher then drops its own ssh client and exits 143 (130 for INT).
 
 The stop's ssh is bounded at 75 s, inside the chain's 120 s grace. An explicit

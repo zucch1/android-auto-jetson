@@ -38,7 +38,10 @@ With ``--run-file PATH`` the collector records, for a remote stop
 (tools/perf/aa_remote_stop.sh), its own PID and the receiver's and display's,
 each with its /proc start time, plus the phone serial and media package. It
 removes the file only after its own cleanup, phone restore included, so the
-file's removal is the stop's acknowledgement.
+file's removal is the stop's acknowledgement. With a run file the collector
+also leads its own process group (recorded as ``group PGID SID``): its adb
+commands share it, so a forced stop can kill them with it before it restores
+the phone, without touching the ssh session's shell.
 
 The capture is the raw record; budget verdicts are produced by
 ``aa_perf_report.py``. A metric the collector cannot observe is emitted as
@@ -1123,12 +1126,22 @@ def _cli(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     args.run_file_record = None
     if args.run_file:
+        # Lead a process group of our own (already true for a session leader):
+        # every phone command we start is in it, and nothing else is.
+        try:
+            os.setpgid(0, 0)
+        except PermissionError:
+            pass
+        if os.getpgid(0) != os.getpid():
+            print("error: --run-file: cannot lead a process group of our own", file=sys.stderr)
+            return 2
         try:
             args.run_file_record = RunFile(args.run_file)
         except OSError as exc:
             print(f"error: cannot create --run-file: {exc}", file=sys.stderr)
             return 2
         args.run_file_record.process("collector", os.getpid())
+        args.run_file_record.line("group", str(os.getpgid(0)), str(os.getsid(0)))
         if args.phone_serial:
             args.run_file_record.line("phone", args.phone_serial)
         if args.media_component:
