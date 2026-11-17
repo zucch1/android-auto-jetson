@@ -8,6 +8,7 @@
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/diagnostics/SafeLogSink.hpp>
 
+#include <cctype>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -40,7 +41,13 @@ std::string without_pseudonyms(std::string text) {
     static constexpr std::string_view kHex = "0123456789abcdef";
     for (std::size_t at = text.find("id-"); at != std::string::npos; at = text.find("id-", at + 3)) {
         const std::size_t start = at + 3;
-        if (text.size() >= start + 16 && text.find_first_not_of(kHex, start) >= start + 16) {
+        // Only an exact pseudonym token: not preceded or followed by another
+        // identifier character, so an overlong raw value after "id-" stays visible.
+        const bool starts_token = at == 0 || std::isalnum(static_cast<unsigned char>(text[at - 1])) == 0;
+        const bool ends_token = text.size() == start + 16 ||
+                                (text.size() > start + 16 &&
+                                 std::isalnum(static_cast<unsigned char>(text[start + 16])) == 0);
+        if (starts_token && ends_token && text.find_first_not_of(kHex, start) >= start + 16) {
             text.replace(start, 16, "<pseudonym>");
         }
     }
@@ -97,6 +104,17 @@ TEST(DiagnosticsPrivacyGaps, TypedSensitiveFieldsHideEveryValueVariant) {
     EXPECT_EQ(out.find("424242"), std::string::npos);
     EXPECT_EQ(out.find("123456789012345"), std::string::npos);
     EXPECT_EQ(out.find("\"secret_flag\":true"), std::string::npos);
+}
+
+TEST(DiagnosticsPrivacyGaps, PseudonymMaskOnlyHidesExactTokens) {
+    // The test-only mask must never hide a raw value that merely follows "id-".
+    EXPECT_EQ(without_pseudonyms("\"id-0123456789abcdef\""), "\"id-<pseudonym>\"");
+    EXPECT_EQ(without_pseudonyms("id-0123456789abcdef"), "id-<pseudonym>");
+    EXPECT_EQ(without_pseudonyms("id-0123456789abcdef0"), "id-0123456789abcdef0");
+    EXPECT_EQ(without_pseudonyms("id-0123456789abcdefZ"), "id-0123456789abcdefZ");
+    EXPECT_EQ(without_pseudonyms("xid-0123456789abcdef"), "xid-0123456789abcdef");
+    EXPECT_EQ(without_pseudonyms("id-0123456789ABCDEF"), "id-0123456789ABCDEF");
+    EXPECT_EQ(without_pseudonyms("id-424242"), "id-424242");
 }
 
 TEST(DiagnosticsPrivacyGaps, UnknownKeysAndValuesAreDroppedByDefault) {

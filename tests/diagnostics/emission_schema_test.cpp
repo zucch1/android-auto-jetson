@@ -2,6 +2,7 @@
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/diagnostics/SafeLogSink.hpp>
 
+#include <cctype>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -19,7 +20,13 @@ std::string without_pseudonyms(std::string text) {
     static constexpr std::string_view kHex = "0123456789abcdef";
     for (std::size_t at = text.find("id-"); at != std::string::npos; at = text.find("id-", at + 3)) {
         const std::size_t start = at + 3;
-        if (text.size() >= start + 16 && text.find_first_not_of(kHex, start) >= start + 16) {
+        // Only an exact pseudonym token: not preceded or followed by another
+        // identifier character, so an overlong raw value after "id-" stays visible.
+        const bool starts_token = at == 0 || std::isalnum(static_cast<unsigned char>(text[at - 1])) == 0;
+        const bool ends_token = text.size() == start + 16 ||
+                                (text.size() > start + 16 &&
+                                 std::isalnum(static_cast<unsigned char>(text[start + 16])) == 0);
+        if (starts_token && ends_token && text.find_first_not_of(kHex, start) >= start + 16) {
             text.replace(start, 16, "<pseudonym>");
         }
     }
