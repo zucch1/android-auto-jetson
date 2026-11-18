@@ -47,8 +47,8 @@ jobs:
       - name: Provision host-only AASDK and decode smoke dependencies
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y ninja-build cmake g++ \
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --no-install-recommends -y ninja-build cmake g++ \
             libprotobuf-dev protobuf-compiler libboost-system-dev libboost-log-dev \
             libssl-dev libusb-1.0-0-dev pkg-config libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
@@ -247,8 +247,8 @@ jobs:
       - name: Provision public synthetic cross fixture dependencies
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y ninja-build cmake \
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --no-install-recommends -y ninja-build cmake \
             g++-aarch64-linux-gnu pkg-config binutils libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev
       - name: Require AVAILABLE probe, AArch64 ELF and bound overlay provenance
@@ -464,8 +464,8 @@ jobs:
       - name: Provision aarch64 cross toolchain for the fixture cross build
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y ninja-build cmake \
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --no-install-recommends -y ninja-build cmake \
             g++-aarch64-linux-gnu pkg-config binutils
           aarch64-linux-gnu-g++ --version
       - name: Fetch and verify locked GoogleTest archive
