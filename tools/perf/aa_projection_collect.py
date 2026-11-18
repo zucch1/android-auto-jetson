@@ -12,9 +12,36 @@ the receiver (and optionally the dummy display), samples the receiver process
 and the thermal zones for the requested duration, parses the receiver/display
 JSON event stream, and writes ONE capture document to stdout:
 
-  {"schema":"aa-projection-perf-capture/2","mode":"wired",
+  {"schema":"aa-projection-perf-capture/3","mode":"wired",
    "duration_seconds":N,"crashes":0,"samples":[...],"events":{...},
-   "target_hardware_state":{...}}
+   "av_series":{...},"workload":{...},"target_hardware_state":{...}}
+
+Capture /3 (signed A/V contract, #137) adds ``av_series``: every A/V pair's
+paint-completion time and signed skew, and the merged union of valid audio
+slots' scheduled intervals, all in ns relative to ``monotonic_origin_ns`` and
+frozen at the measurement cutoff, so the reporter judges the four clauses over
+its own replayed active window (tools/perf/aa_av_contract.py).
+
+With ``--workload moving-map`` (the soak workload, #137) the collector prepares
+the phone (``adb -s --phone-serial``: USB reset, media, then Google Maps),
+gives the managed display its test control channel, and drags the map and
+keeps the media playing for the whole stage (tools/perf/aa_moving_map.py).
+A required phone command that fails during the setup refuses the stage before
+the receiver starts (``error: phone_setup_failed:``, BLOCKED by the launcher);
+one that fails later ends the workload and is recorded in
+``workload.phone_failure``. The capture also records every completed drag's
+time (``workload.drag_t_ns``) for the reporter's continuity check, and the
+build/compiler processes seen on this host during the stage
+(``concurrent_builds``), which disqualify it (#137).
+
+With ``--run-file PATH`` the collector records, for a remote stop
+(tools/perf/aa_remote_stop.sh), its own PID and the receiver's and display's,
+each with its /proc start time, plus the phone serial and media package. It
+removes the file only after its own cleanup, phone restore included, so the
+file's removal is the stop's acknowledgement. With a run file the collector
+also leads its own process group (recorded as ``group PGID SID``): its adb
+commands share it, so a forced stop can kill them with it before it restores
+the phone, without touching the ssh session's shell.
 
 The capture is the raw record; budget verdicts are produced by
 ``aa_perf_report.py``. A metric the collector cannot observe is emitted as
@@ -27,7 +54,8 @@ pump enough to fail the A/V gate on its own. ``--allow-unoptimized-build`` is a
 debugging override only.
 
 This tool does not modify target state (no installs, no udev, no kernel
-changes); it only launches the supplied binaries and reads procfs/sysfs.
+changes); it only launches the supplied binaries, reads procfs/sysfs and, with
+the moving-map workload, sends adb intents to the named phone.
 """
 from __future__ import annotations
 
@@ -48,10 +76,12 @@ import signal
 import subprocess
 import sys
 import time
+from array import array
 from pathlib import Path
 from typing import Literal
 
 from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
+import aa_moving_map as moving_map
 from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Sample, ThermalZone, VideoEvidence, thermal_policy_for_model,
 )
@@ -60,7 +90,10 @@ from aa_build_guard import (
     describe_build, require_optimized_build, require_optimized_type, verify_launched_binaries,
 )
 
-CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
+CAPTURE_SCHEMA = "aa-projection-perf-capture/3"
+# Retention bound of the signed A/V series (a 7200 s stage at 60 fps is 432,000
+# pairs); past it the series is incomplete and A/V is invalid, never truncated.
+_AV_SERIES_LIMIT = 1_000_000
 _TERMINATE_GRACE_SECONDS = 5.0
 _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
 _MEDIA_STALL_SECONDS = 10
@@ -81,6 +114,102 @@ _COLLECTOR_LOG_POLL_SECONDS = 0.25
 # stderr marker the launcher maps to BLOCKED phone_identity_mismatch.
 PHONE_MISMATCH_CODE = "phone_serial_mismatch"
 PHONE_REFUSAL_PREFIX = "error: phone_identity_mismatch:"
+# stderr marker the launcher maps to BLOCKED phone_setup_failed.
+PHONE_SETUP_PREFIX = "error: phone_setup_failed:"
+# Compiler/build processes (exact /proc comm names) whose presence during a
+# stage disqualifies it; the soak chain's quiet gate uses the same list.
+BUILD_NAMES = ("cmake", "ninja", "make", "c++", "g++", "gcc", "cc1plus", "ctest", "nvcc", "ld")
+_BUILD_RECORDS_LIMIT = 256
+
+
+class RunFile:
+    """The remote-stop record (``--run-file``): one ``ROLE VALUE [START]`` line each.
+
+    Created exclusively (0600, never through an existing path); removed by the
+    collector after its cleanup and phone restore, which acknowledges a stop.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        self._handle = os.fdopen(fd, "w", encoding="utf-8")
+
+    def process(self, role: str, pid: int) -> None:
+        self.line(role, str(pid), str(proc_starttime(pid)))
+
+    def line(self, *fields: str) -> None:
+        if any(not field or any(c.isspace() for c in field) for field in fields):
+            return  # nothing a stop could misparse
+        self._handle.write(" ".join(fields) + "\n")
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+
+    def remove(self, cleanup_failures: list[str] | None = None) -> None:
+        """Remove the run file (the stop's acknowledgement). With a moving-map
+        workload, first write ``PATH.cleanup``: one line per restore step that
+        could not be done or verified (empty: a clean restore)."""
+        self._handle.close()
+        if cleanup_failures is not None:
+            try:
+                fd = os.open(f"{self.path}.cleanup",
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as report:
+                    report.writelines(" ".join(item.split()) + "\n" for item in cleanup_failures)
+            except OSError as exc:
+                print(f"cleanup failure: cannot write the cleanup report: {exc}", file=sys.stderr)
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def proc_starttime(pid: int) -> int | None:
+    """A process's start time (clock ticks since boot, /proc/PID/stat field 22)."""
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _record_process(args: argparse.Namespace, role: str, pid: int) -> None:
+    run_file = getattr(args, "run_file_record", None)
+    if run_file is not None:
+        run_file.process(role, pid)
+
+
+class PhoneSetupError(RuntimeError):
+    """A required phone command failed before the stage started."""
+
+
+def ancestors(pid: int | None = None) -> set[int]:
+    """This process and its ancestors (a stage launched from a build tool is not
+    competing with itself)."""
+    seen: set[int] = set()
+    pid = os.getpid() if pid is None else pid
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return seen
+
+
+def build_processes(exclude: Iterable[int] = ()) -> list[str]:
+    """Running compiler/build processes ("PID COMM"), skipping ``exclude``."""
+    skip = set(exclude)
+    found = []
+    for path in Path("/proc").glob("[0-9]*/comm"):
+        try:
+            if int(path.parent.name) in skip:
+                continue
+            name = path.read_text().strip()
+        except (OSError, ValueError):
+            continue
+        if name in BUILD_NAMES:
+            found.append(f"{path.parent.name} {name}")
+    return sorted(found, key=lambda entry: int(entry.split()[0]))
 _PROGRESS_KEYS = ("video_units", "audio_chunks", "video_presentations", "audio_writes", "av_pairs")
 
 # Diagnostic keys the receiver/display event stream may carry (task-19
@@ -356,6 +485,11 @@ class EventParser:
         self.audio_completions: deque[tuple[int, int, int]] = deque()
         self.video_completions: deque[tuple[int, int]] = deque()
         self.av_pairs = 0
+        # Signed A/V series (capture /3): absolute paint-completion ns and
+        # signed skew ns per pair, and the merged union of valid audio slots.
+        self.av_pair_times = array("q")
+        self.av_pair_skews = array("q")
+        self.audio_union: list[list[int]] = []
         self.audio_writes = 0
         self.playback_slot_absences: dict[str, int] = {}
         # Receiver-clock times (the receiver's own monotonic stamps) of the events
@@ -463,6 +597,10 @@ class EventParser:
             if scheduled <= self.last_audio_scheduled:
                 return
             self.last_audio_scheduled = scheduled
+            if self.audio_union and scheduled <= self.audio_union[-1][1]:
+                self.audio_union[-1][1] = max(self.audio_union[-1][1], end)
+            else:
+                self.audio_union.append([scheduled, end])
             self.audio_writes += 1
             self._record_progress(("audio_chunks", "audio_writes"), event["completed_ns"])
             self.audio_completions.append((scheduled, end, completed))
@@ -490,6 +628,11 @@ class EventParser:
                 self._number({"delta": abs(skew) / 1e6}, "delta",
                              "av_sync_ms", peak=True)
                 self.av_pairs += 1
+                if len(self.av_pair_times) < _AV_SERIES_LIMIT:
+                    self.av_pair_times.append(video_done)
+                    self.av_pair_skews.append(skew)
+                elif "av_sync_ms" not in self.invalid_telemetry:
+                    self.invalid_telemetry.append("av_sync_ms")
                 self._record_progress(("av_pairs",), event["completed_ns"])
         self.video_completions = pending
         # Bound retention even if a stream disappears. Missing pairs never become zero.
@@ -499,6 +642,13 @@ class EventParser:
             self.video_completions.popleft()
             self.invalid_telemetry.append("av_sync_ms")
             self.metrics["av_sync_ms"] = None
+
+    def av_series(self, origin_ns: int) -> dict:
+        """The signed A/V series relative to ``origin_ns`` (capture /3)."""
+        return {"pair_t_ns": [t - origin_ns for t in self.av_pair_times],
+                "pair_skew_ns": list(self.av_pair_skews),
+                "audio_intervals_ns": [[lo - origin_ns, hi - origin_ns]
+                                       for lo, hi in self.audio_union]}
 
     def _number(self, event: dict, key: str, target: str, *, integer: bool = False,
                 peak: bool = False) -> None:
@@ -689,6 +839,18 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     progress = ProjectionProgress()
     receiver: subprocess.Popen | None = None
     display: subprocess.Popen | None = None
+    # The moving-map soak workload (#137): phone intents and map drags through
+    # the display's test control channel, media kept playing for the stage.
+    workload = None
+    stimulus: moving_map.SoakStimulus | None = None
+    if getattr(args, "workload", "none") == "moving-map":
+        workload = moving_map.MovingMap(
+            moving_map.adb_runner(phone_serial), media_uri=args.media_uri,
+            media_type=getattr(args, "media_type", None),
+            media_component=getattr(args, "media_component", None),
+            geo_uri=getattr(args, "geo_uri", None) or moving_map.DEFAULT_GEO_URI)
+        args.cleanup_failures = ["phone_restore_not_reached"]  # until restore_phone runs
+    av_series: dict = {"pair_t_ns": [], "pair_skew_ns": [], "audio_intervals_ns": []}
     rec_file = None
     disp_file = None
     crashes = 0
@@ -727,10 +889,21 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             audio_writes=parser.audio_writes, av_pairs=parser.av_pairs,
         )
 
+    concurrent_builds: list[dict] = []
+    own_processes = ancestors()
     try:
+        if workload is not None:
+            if not workload.prepare_phone(lambda seconds: (time.sleep(seconds), True)[1]):
+                # Nothing is launched; the finally restores the phone.
+                raise PhoneSetupError(workload.phone_failure or "phone setup did not complete")
+            # The phone setup is not part of the startup budget.
+            origin_ns = time.monotonic_ns()
+            start = origin_ns / 1e9
+            deadline = start + startup_timeout
         rec_file = open(receiver_log, "w", encoding="utf-8")
         receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
                                     start_new_session=True)
+        _record_process(args, "receiver", receiver.pid)
         if managed_display:
             # Bounded receiver-ready observation: the managed display launches on
             # THIS receiver's "ready" event, never on a fixed sleep. The wait is
@@ -751,13 +924,20 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                     and not early_exit and not parser.terminal_errors):
                 disp_file = open(display_log, "w", encoding="utf-8")
                 display_cmd = [args.display, "--test-only-autostart"]
+                if workload is not None:
+                    display_cmd += ["--test-only-control-stdin"]  # the map drags
                 if video_socket:
                     display_cmd += ["--video-socket", video_socket]
                 if input_socket:
                     display_cmd += ["--input-socket", input_socket]
                 if time.monotonic_ns() / 1e9 < deadline:
-                    display = subprocess.Popen(display_cmd, stdout=disp_file, stderr=subprocess.STDOUT,
-                                               start_new_session=True)
+                    display = subprocess.Popen(
+                        display_cmd, stdout=disp_file, stderr=subprocess.STDOUT,
+                        stdin=subprocess.PIPE if workload is not None else None,
+                        start_new_session=True)
+                    _record_process(args, "display", display.pid)
+                    if workload is not None and display.stdin is not None:
+                        os.set_blocking(display.stdin.fileno(), False)
 
         while True:
             now = time.monotonic_ns() / 1e9
@@ -774,6 +954,14 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                 display_survived = False
                 break
             if parser.terminal_errors:
+                break
+            if (workload is not None and stimulus is None and display is not None
+                    and display.stdin is not None and parser.projection_active):
+                stimulus = moving_map.SoakStimulus(workload, display.stdin.fileno(), receiver_log,
+                                                   since_ns=time.monotonic_ns())
+                stimulus.start()
+            if stimulus is not None and stimulus.failure:
+                parser.terminal_errors.append({"event": "err", "code": stimulus.failure})
                 break
             time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
             sample = read_sample()
@@ -795,6 +983,9 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                     time.sleep(_COLLECTOR_LOG_POLL_SECONDS)
                     sample = read_sample()
             samples.append(sample)
+            running = build_processes(own_processes)
+            if running and len(concurrent_builds) < _BUILD_RECORDS_LIMIT:
+                concurrent_builds.append({"t_ns": sample.t_ns, "processes": running[:16]})
             was_started = progress.started_ns is not None
             progress.observe(sample, logged_progress)
             parser.progress_sampled(sample.t_ns, origin_ns)
@@ -814,6 +1005,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         events["video_units"] = parser.video_units
         events["audio_chunks"] = parser.audio_chunks
         events["startup_ms"] = parser.startup_ms
+        av_series = parser.av_series(origin_ns)
         invalid_telemetry = sorted(set(parser.invalid_telemetry) | set(parser.video_measurements.issues))
         video_telemetry = {
             "ipc_matched": parser.video_measurements.ipc_matched,
@@ -836,6 +1028,13 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         raise SystemExit(f"error: cannot launch receiver: {exc}") from exc
     finally:
         parser.video_measurements.frozen = True
+        if stimulus is not None:
+            stimulus.stop()
+            # A control failure in the final interval is only seen after the
+            # join (the loop may have reached its deadline first): never drop it.
+            if stimulus.failure and not any(error.get("code") == stimulus.failure
+                                            for error in parser.terminal_errors):
+                parser.terminal_errors.append({"event": "err", "code": stimulus.failure})
         if display is not None and display.poll() is not None:
             display_survived = False
         for name, proc in (("display", display), ("receiver", receiver)):
@@ -846,6 +1045,11 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             rec_file.close()
         if disp_file is not None:
             disp_file.close()
+        if workload is not None:
+            # Media stopped and verified first, USB mode last (it re-enumerates USB).
+            for failure in workload.restore_phone():
+                print(f"cleanup failure: {failure}", file=sys.stderr)
+            args.cleanup_failures = list(workload.cleanup_failures)  # for --run-file
         parser.poll(str(receiver_log))
         if display is not None:
             parser.poll(str(display_log))
@@ -882,6 +1086,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         "samples": [asdict(sample) for sample in samples],
         "video_evidence": asdict(video_evidence),
         "events": events,
+        "av_series": av_series,
         "video_telemetry": video_telemetry,
         "target_hardware_state": hardware if hardware is not None else _target_hardware_state(),
     }
@@ -889,6 +1094,13 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     # build directory it checked and whether the qualification override was used,
     # so no run can be read as a qualification result it is not.
     capture["build"] = build if build is not None else build_record(args)
+    capture["workload"] = ({"kind": "moving-map", "media_relaunches": workload.media_relaunches,
+                            "drags": workload.drags, "stimulus_started": stimulus is not None,
+                            "phone_failure": workload.phone_failure,
+                            "cleanup_failures": list(workload.cleanup_failures),
+                            "drag_t_ns": [t - origin_ns for t in workload.drag_ns][:_AV_SERIES_LIMIT]}
+                           if workload is not None else {"kind": "none"})
+    capture["concurrent_builds"] = concurrent_builds
     if thermal_policy is not None:
         capture["thermal_policy"] = asdict(thermal_policy)
     return capture
@@ -908,6 +1120,13 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--phone-serial", default=None,
                         help="pin the run to this phone (receiver --require-usb-serial)")
+    parser.add_argument("--workload", choices=("none", "moving-map"), default="none",
+                        help="moving-map: drive Maps and keep media playing (needs --phone-serial, "
+                             "--media-uri and a managed --display)")
+    parser.add_argument("--media-uri", default=None)
+    parser.add_argument("--media-type", default=None)
+    parser.add_argument("--media-component", default=None)
+    parser.add_argument("--geo-uri", default=None)
     parser.add_argument("--thermal-policy", choices=("strict-all-zones", NANO_PROFILE),
                         default="strict-all-zones", help="explicit approved Nano CV availability exception")
     parser.add_argument("--startup-timeout-seconds", type=int,
@@ -922,10 +1141,54 @@ def _cli(argv: list[str]) -> int:
                              "target must not re-read a path it cannot see")
     parser.add_argument("--allow-unoptimized-build", action="store_true",
                         help="debugging override: start even without an optimized build")
+    parser.add_argument("--run-file", default=None,
+                        help="new file recording this run's processes for a remote stop "
+                             "(tools/perf/aa_remote_stop.sh); removed after cleanup")
     args = parser.parse_args(argv)
+    args.run_file_record = None
+    args.cleanup_failures = []  # nothing has touched the phone yet
+    if args.run_file:
+        # Lead a process group of our own (already true for a session leader):
+        # every phone command we start is in it, and nothing else is.
+        try:
+            os.setpgid(0, 0)
+        except PermissionError:
+            pass
+        if os.getpgid(0) != os.getpid():
+            print("error: --run-file: cannot lead a process group of our own", file=sys.stderr)
+            return 2
+        try:
+            args.run_file_record = RunFile(args.run_file)
+        except OSError as exc:
+            print(f"error: cannot create --run-file: {exc}", file=sys.stderr)
+            return 2
+        args.run_file_record.process("collector", os.getpid())
+        args.run_file_record.line("group", str(os.getpgid(0)), str(os.getsid(0)))
+        if args.phone_serial:
+            args.run_file_record.line("phone", args.phone_serial)
+        if args.media_component:
+            args.run_file_record.line("media_package", args.media_component.split("/")[0])
+    try:
+        return _run(args)
+    finally:
+        # After collect()'s own cleanup and phone restore: the stop's acknowledgement.
+        if args.run_file_record is not None:
+            args.run_file_record.remove(getattr(args, "cleanup_failures", None))
+
+
+def _run(args: argparse.Namespace) -> int:
 
     if args.duration_seconds <= 0:
         print("error: --duration-seconds must be positive", file=sys.stderr)
+        return 2
+    if args.workload == "moving-map" and (not args.phone_serial or not args.media_uri
+                                          or not args.display or args.no_display):
+        print("error: --workload moving-map needs --phone-serial, --media-uri and a managed "
+              "--display", file=sys.stderr)
+        return 2
+    if args.workload == "moving-map" and not moving_map.media_package(args.media_component):
+        print("error: --workload moving-map needs --media-component PKG/ACTIVITY, so the media "
+              "player can be stopped and verified after the stage", file=sys.stderr)
         return 2
     if not 0 < args.startup_timeout_seconds <= _PROJECTION_STARTUP_TIMEOUT_SECONDS:
         print("error: --startup-timeout-seconds must be in [1, 60]", file=sys.stderr)
@@ -985,6 +1248,10 @@ def _cli(argv: list[str]) -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(3))
     try:
         capture = collect(args, build=build)
+    except PhoneSetupError as exc:
+        print(f"{PHONE_SETUP_PREFIX} {exc}; the phone was restored and nothing was measured",
+              file=sys.stderr)
+        return 2
     except CoverageError as exc:
         print(f"contract violation: {exc}", file=sys.stderr)
         return 4

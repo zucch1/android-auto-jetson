@@ -48,10 +48,20 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_perf_build_guard COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_build_guard.py")
     set_tests_properties(wired_perf_build_guard PROPERTIES TIMEOUT 120)
+    # #137 soak: v3 signed A/V contract and v2 history, the shared moving-map
+    # workload (alone and inside the collector), the in-repo soak chain and the
+    # remote collector stop.
+    foreach(suite v3_av_contract moving_map soak_chain remote_stop)
+        add_test(NAME wired_perf_${suite} COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_SOURCE_DIR}/tests/perf/test_${suite}.py")
+        set_tests_properties(wired_perf_${suite} PROPERTIES TIMEOUT 180)
+    endforeach()
+    # Its slow-adb regressions run the production stop budgets (~110 s).
+    set_tests_properties(wired_perf_remote_stop PROPERTIES TIMEOUT 300)
     # #137 moving-map drive smoke: analyzer, pass/fail logic and the soak gate.
     add_test(NAME wired_drive_smoke COMMAND "${Python3_EXECUTABLE}" -B
         -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/wired_qa" -v)
-    set_tests_properties(wired_drive_smoke PROPERTIES TIMEOUT 120)
+    set_tests_properties(wired_drive_smoke PROPERTIES TIMEOUT 300)
     foreach(case schema nominal budget_fail duration contract collector media_timing readiness)
         add_test(NAME wired_perf_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_wired_perf.py" ${case})

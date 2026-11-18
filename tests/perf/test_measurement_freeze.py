@@ -115,16 +115,28 @@ def virtual(mode: str) -> dict:
             startup_timeout_seconds=4), events, Process)
 
 
+def not_qualifying(doc: dict) -> bool:
+    """BLOCKED, or (v3) a FAIL whose only violations are signed A/V metrics.
+
+    Collector fixtures emit no continuous audio, so under the v3 contract their
+    A/V coverage is a measured FAIL (#137); every other gate must still behave
+    exactly as it did under v2.
+    """
+    return doc["verdict"] == "BLOCKED" or (
+        doc["verdict"] == "FAIL" and bool(doc["violations"])
+        and all(v["metric"].startswith("av_") for v in doc["violations"]))
+
+
 def test_drain_cannot_mutate_any_measurement_field() -> None:
     # Given identical samples, compare termination, grace-wait and malformed drains.
     baseline = virtual("baseline")
-    fields = ("events", "invalid_telemetry", "video_telemetry", "samples", "video_evidence",
+    fields = ("events", "invalid_telemetry", "video_telemetry", "samples", "video_evidence", "av_series",
               "active_projection_seconds", "startup_wait_seconds", "projection_failure")
     for mode in ("late", "wait", "malformed", "whole"):
         # When the actual collector seals then drains, all measurement exports stay equal.
         capture = virtual(mode)
         assert {key: capture[key] for key in fields} == {key: baseline[key] for key in fields}, mode
-        assert helper.result(capture, "3s")["verdict"] == "BLOCKED", mode
+        assert not_qualifying(helper.result(capture, "3s")), mode
 
 
 def test_late_activation_and_backdated_pair_cannot_heal() -> None:
@@ -138,7 +150,7 @@ def test_late_activation_and_backdated_pair_cannot_heal() -> None:
             assert capture["events"]["video_units"] == 4
         else:
             assert capture["events"]["av_sync_ms"] is None
-        assert helper.result(capture, "3s")["verdict"] == "BLOCKED"
+        assert not_qualifying(helper.result(capture, "3s"))
 
 
 def test_lifecycle_failures_remain_live() -> None:
@@ -161,7 +173,8 @@ def test_lifecycle_failures_remain_live() -> None:
                 ("forced_kill" if mode == "forced" else "unreaped")}]
     owned = virtual("owned_display")
     assert owned["display_survived"] is True and owned["crashes"] == 0
-    assert not helper.result(owned, "3s")["violations"]
+    # (v3: only the fixture's missing audio coverage may be a violation, #137.)
+    assert all(v["metric"].startswith("av_") for v in helper.result(owned, "3s")["violations"])
 
 
 def test_admitted_startup_peaks_are_not_reset_at_active_start() -> None:
@@ -246,7 +259,10 @@ def test_real_cli_shutdown() -> None:
             assert actual == expected, (mode, actual)
             assert capture["events"]["video_units"] == capture["events"]["audio_chunks"] == 1
             assert capture["active_projection_seconds"] == 0
-            assert doc["verdict"] == ("BLOCKED" if mode in {"baseline", "late", "av75"} else "FAIL")
+            if mode in {"baseline", "late", "av75"}:
+                assert not_qualifying(doc), (mode, doc["verdict"])
+            else:
+                assert doc["verdict"] == "FAIL", mode
             assert doc["qualification_status"] == "INCOMPLETE"
             print("CLI", mode, actual, doc["verdict"], flush=True)
 

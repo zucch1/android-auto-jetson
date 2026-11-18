@@ -239,11 +239,12 @@ Re-analysis of the 2026-11-16 evidence under this contract:
 
 | Run | Pairs | Coverage | Signed p50 / p99 ms | Max \|skew\| ms | Worst 5 s mean ms | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
-| S24 drive smoke | 5,892 | 33.83 % (FAIL) | 23.21 / 51.02 (FAIL) | 74.95 | 32.57 | FAIL |
+| S24 drive smoke | 5,892 | 33.83 % (FAIL) | 23.21 / 51.02 (FAIL) | 74.95 | 32.61 | FAIL |
 | A26 run2 | 17,895 | 99.49 % | 21.40 / 33.35 | 43.21 | 26.34 | PASS |
 
-The soak stages still use their own unchanged contractual budget (A/V max
-<= 50 ms, `aa_perf_report.BUDGETS`); this contract applies to the drive smoke.
+The same contract judges the soak stages from result version 3 on (see **Soak
+stages: moving-map workload and signed A/V (v3)**). The math and the limits
+live once, in `tools/perf/aa_av_contract.py`, for both.
 
 **Startup grace (fps only).** The first 10 s after the first paint are
 excluded from the fps check, and only from it. The waiting_idr, session-drop
@@ -322,6 +323,371 @@ repeats. The drive smoke now runs first, on the same build, for ten minutes,
 with a moving workload. The soak chain is the 1800 s stage, then the 7200 s
 stage.
 
+## Soak stages: moving-map workload and signed A/V (v3)
+
+From capture `aa-projection-perf-capture/3` and result `aa-projection-perf/3`
+on (#137), every live soak stage (1800 s, then 7200 s) runs the drive smoke's
+workload and is judged by its A/V contract.
+
+**Workload.** `tools/perf/aa_moving_map.py` is the one implementation, shared
+with the drive smoke. Before the receiver starts, the collector resets the
+phone's USB mode, wakes it, starts the media and then Google Maps, so Maps is
+in front. Every phone command is `adb -s <--phone-serial>` on the target. The
+managed display is started with `--test-only-control-stdin`. From projection
+`active` on, a stimulus thread drags the map once a second, and it re-sends
+the media intent, then Maps, after `MEDIA_RELAUNCH_SILENCE_S` (5 s) without an
+audio write, counting each relaunch in `workload.media_relaunches`. A display
+that stops accepting control input for `CONTROL_WRITE_TIMEOUT_S` ends the stage
+with terminal error `display_control_stalled`, and one whose control input
+closes ends it with `display_control_closed` (both FAIL: the display is part of
+the product under test). Every live stage needs `--media-uri` and
+`--media-component PKG/ACTIVITY` (the player the cleanup stops and verifies);
+`--media-type` and `--geo-uri` are optional.
+
+**Phone restore order.** Every cleanup path restores the phone the same way:
+the normal end, an acknowledged stop, the forced fallback, the drive smoke and
+the soak.
+
+1. The intent gate is closed, so no media or Maps intent can follow.
+2. The media package (from `--media-component`) is force-stopped, and
+   `pidof` must then show no process. A failed command or a player that is
+   still running is retried, up to `MEDIA_STOP_ATTEMPTS` (3) times, 1 s
+   apart. The whole restore stays within `RESTORE_BUDGET_S` (90 s): an
+   attempt starts only while it (two adb commands of `ADB_TIMEOUT_S` = 20 s)
+   and the USB switch still fit. Otherwise the restore goes straight to the
+   USB switch and records the media stop as not done.
+3. Only then is the USB mode reset (`svc usb setFunctions mtp`). That switch
+   re-enumerates USB and breaks adb for a moment, so a command sent right
+   after it is lost.
+
+The 2026-11-17 A26 run hit exactly this. The old order switched USB first,
+the force-stop that followed got "device not found", and VLC stayed alive
+(paused).
+
+A step that fails or cannot be verified is a named entry in
+`workload.cleanup_failures`, in the capture and in the v3 result (the drive
+smoke's result has the same field):
+
+- `media_stop_unverified: <pkg> after 3 attempts: <why>`;
+- `media_stop_unavailable` (no media package; live runs refuse this case
+  up front, below);
+- `usb_reset_failed: <why>`;
+- `phone_restore_not_reached` (the collector ended before its restore).
+
+**A failed restore fails closed.** `--media-component PKG/ACTIVITY` is required
+for every live moving-map run: the launcher, the chain, the collector and the
+drive smoke all refuse a missing component, or one without a package, before
+the phone is touched. The restore stops and verifies exactly that package.
+
+Any cleanup failure makes a live v3 stage that would otherwise pass
+**BLOCKED** by name, so the chain never starts the next stage after it:
+
+- `cleanup:media_not_stopped`;
+- `cleanup:usb_not_restored`;
+- `cleanup:phone_restore_not_reached`;
+- `cleanup:not_recorded` (a capture without the record).
+
+A measured budget miss stays a FAIL. The drive smoke's result is BLOCKED the
+same way (exit 3), so the soak gate refuses it. The qualification checker
+requires `workload.cleanup_failures` to be `[]`.
+
+Every phone command goes through one lock with a closed gate. The phone
+restore waits for an in-flight command, closes the gate and restores, so no
+intent (in particular no Maps relaunch) can reach the phone after its restore,
+whatever the stimulus thread is doing. A relaunch also checks the stop flag
+between its media and Maps intents, and the collector stops and joins the
+stimulus before it restores the phone.
+
+**Phone commands are checked.** Every required phone command (the USB reset,
+the wake key, the media and Maps launches, and each relaunch) must exit 0
+within the 20 s adb bound, and an `am start` must not report `Error` (it can
+exit 0 for an activity it did not start). The first failure ends the workload:
+nothing more is sent to the phone but the restore.
+
+- During the setup, before the receiver starts, the collector refuses the
+  stage (`error: phone_setup_failed: <step>: <why>`) and the launcher reports
+  **BLOCKED** `phone_setup_failed`.
+- Later (a failed relaunch), the capture records `workload.phone_failure` and
+  the reporter BLOCKS the stage with `run_evidence:moving_map_phone`. The stage
+  still runs to its end: cutting it short would turn the harness failure into
+  an `incomplete_active_window` FAIL.
+
+BLOCKED, not FAIL, because adb and the phone's apps are the test harness, not
+the receiver or display under test: a failed intent means the required
+workload was not set up, the same evidence gap as the other `run_evidence:*`
+rules. The drive smoke applies the same rule (BLOCKED `phone_command_failed`).
+
+**Workload evidence.** A live v3 stage must prove the workload ran, both in
+the reporter and in the qualification checker. The record must be
+`kind: moving-map` with `stimulus_started: true`, and it must have at least
+`MIN_DRAG_RATE_HZ` (0.25) completed drags per active second. The nominal rate
+is about 0.65 Hz (one drag per second plus the drag's own ~0.5 s), so the floor
+leaves room for adb relaunches.
+
+The aggregate alone would accept a run that drags early and then stops, so the
+drags must also be continuous. The capture records every completed drag's time
+(`workload.drag_t_ns`), and no stretch of the active window, its edges
+included, may go longer than `MAX_DRAG_GAP_S` (10 s) without one. The result
+records the longest stretch as `workload.max_drag_gap_s`. Nominal spacing is
+about 1.4 s. A media relaunch puts two `am start` calls (about 1-3 s each)
+between two drags, so a healthy run stays under about 8 s; 10 s keeps that
+margin and still catches a stimulus that stopped.
+
+Media presence is already gated by the A/V coverage floor. Missing or
+insufficient evidence is **BLOCKED**: `run_evidence:moving_map_workload`,
+`_stimulus`, `_phone`, `_drags` or `_drag_gap`. It means the required workload
+was not shown to have been measured, which is an evidence gap, like every
+other `run_evidence:*` rule, and never a PASS. A stimulus whose display control
+input stalled or closed is a FAIL. The v3 schema requires every workload field
+(`media_relaunches`, `drags`, `stimulus_started`, `phone_failure`,
+`max_drag_gap_s`) for a moving-map record.
+
+**No build during a stage.** The collector scans the target's processes at
+every sample for the compiler and build tools the chain's quiet gate waits on
+(`BUILD_NAMES`; its own ancestors excluded). Every observation goes into
+`concurrent_builds` in the capture and `run_status.concurrent_builds` in the
+v3 result. Any observation makes a stage that would otherwise pass
+**BLOCKED** `interference:concurrent_build`: the stage did not run on the quiet
+host it claims. A capture without the watch is BLOCKED
+`run_evidence:concurrent_build_watch`. As with every BLOCKED reason, a measured
+budget miss is still a FAIL. The qualification checker requires
+`run_status.concurrent_builds` to be `[]`.
+
+**A/V (signed contract).** The collector keeps every pair's paint-completion
+time and signed skew, and the merged union of valid audio slots' scheduled
+intervals, in `av_series` (ns from the monotonic origin, frozen at the
+measurement cutoff like every other measurement). The reporter judges them over
+its own replayed active window with the four clauses above. They are the
+gated metrics `av_window_mean_abs_ms` (<= 40), `av_p99_abs_ms` (<= 50),
+`av_excursions` and `av_hard_cap_pairs` (the soak's maximum, below) and
+`av_coverage_pct` (>= 90, `op: ge`), and the `av_contract` block carries the
+signed distribution. `av_max_abs_ms` and `av_sync_ms` (the run-cumulative
+maximum) are informational. Three rules differ from the drive smoke, on
+purpose:
+
+- **The maximum is a rate, not a cap** (owner decision 2026-11-17; below).
+
+- **No audio is a FAIL** in a measured window: coverage is measured as 0 %.
+  A run with no active window at all is still BLOCKED, as nothing was measured.
+- **Invalid A/V telemetry still BLOCKS.** The soak keeps its stricter rule: a
+  null `presented_ns`, mixed endpoint contracts or a malformed endpoint
+  invalidates A/V for the stage (the drive smoke instead skips such a slot).
+
+Everything else in the soak contract is unchanged: RSS, CPU, RSS growth, audio
+latency, crashes, coverage, continuity, provenance and the build guard.
+
+**Soak A/V maximum: an excursion rate (owner decision 2026-11-17).** For v3
+soak stages, "max |skew| <= 90 ms" is replaced by:
+
+- An *excursion* is an A/V pair with |skew| > `AV_SOAK_EXCURSION_MS` (90 ms).
+  Every pair counts, so consecutive pairs of one spike count separately.
+- A stage may have at most floor(active window s /
+  `AV_SOAK_EXCURSION_PERIOD_S`) excursions (`AV_SOAK_EXCURSIONS_PER_S` =
+  1/1800): **1** in the 1800 s stage, **4** in the 7200 s stage.
+- Hard cap: no pair may exceed `AV_SOAK_HARD_CAP_MS` (150 ms).
+- Unchanged: the 5 s window mean (±40 ms), p99 (<= 50 ms) and coverage
+  (>= 90 %).
+
+The constants are in `tools/perf/aa_av_contract.py`. The v3 schema pins them
+in `budgets` and `av_contract.limits`. `aa_av_contract.evaluate(...,
+max_clause="soak_rate")` judges the stage, and the same math with
+`max_clause="cap"` judges the drive smoke. The result reports:
+
+- the `av_excursions` count against its allowance (`budget_max`);
+- `av_hard_cap_pairs` (budget 0);
+- every excursion's offset into the active window and its signed value
+  (`av_contract.excursion_pairs`; at most 1000 are listed, and
+  `excursion_pairs_truncated` says when there are more, while the count is
+  always exact);
+- the max |skew| as an informational `av_max_abs_ms`.
+
+The qualification checker requires the allowance to be the one the stage's
+own active window gives.
+
+Rationale:
+
+- A maximum over a fixed limit grows with run length: the longer the stage,
+  the likelier one stray pair crosses it, whatever the system's quality. A
+  rate keeps one imperceptible frame from failing a long stage.
+- The 150 ms cap still fails any single gross error. The 5 s mean, the p99
+  and coverage still catch sustained offset, a heavy tail and missing audio.
+- The first live 1800 s moving-map soak
+  (`~/aa-research/pr152-live-evidence-2026-11-17`) had exactly one pair over
+  90 ms: 90.577 ms, 385.9 s into the window, with p99 31.3 ms and coverage
+  99.97 %. Under the cap it FAILed. Re-analysed under this rule, the same
+  capture has 1 excursion of an allowance of 1, none over 150 ms, and PASSes
+  (`~/aa-research/pr152-av-rate-reanalysis-2026-11-17`).
+
+The 10-minute drive smoke keeps the plain max |skew| <= 90 ms: a single pair
+at 90.1 ms still FAILs it. v2 history is unchanged.
+
+**Conflicts with the new workload.** None found in the gates themselves. Two
+operational effects to expect:
+
+- A media relaunch restarts the clip. The collector's 10 s stream-silence rule
+  (`_MEDIA_STALL_SECONDS`) is unchanged, and a relaunch fires after 5 s of
+  silence, so a player that stops is restarted well before a stall. A player
+  that takes longer than about 5 s to resume would still be judged a stall;
+  this is intended.
+- The control channel adds per-touch `ok` lines to the display log, and drags
+  add GUI-thread work on the dummy display during every stage. Both are part
+  of the measured candidate, as in the drive smoke.
+
+**Migration and history.** The version is bumped explicitly; nothing is
+reinterpreted:
+
+- A capture `/2` replays to a result `/2` under `aa_perf_report.BUDGETS_V2`
+  (A/V max <= 50 ms, gated), byte for byte what the origin/main reporter gives
+  (checked on the 2026-11-15 1800 s PASS, FAIL and BLOCKED captures).
+- `aa-projection-perf-v2.schema.json` validates v2 results unchanged;
+  `aa-projection-perf-v3.schema.json` validates v3; `aa_perf_schema.py
+  validate-auto` picks the schema from the document's own `schema`.
+- The qualification checker (`tools/qualification/results.py`) judges each
+  result by its own version: v2 by the v2 gates, v3 by the v3 gates plus a
+  passed `av_contract` that agrees with the metrics, coverage >= 90 % and the
+  moving-map workload. A package may hold either version per result.
+- Live stages from this version on produce v3 only.
+- One limitation of history, unchanged by this: results written before the
+  `build` block existed (for example the 2026-11-15 `av-outlier` 1800 s PASS)
+  do not validate against the current v2 schema. Their captures still replay to
+  their original verdict.
+
+**The chain.** `tools/perf/aa_soak_chain.py` replaces the ad-hoc chain scripts
+kept beside past runs. It waits for `--quiet-seconds` (default 300) without a
+compiler, then runs the 1800 s and 7200 s stages through
+`aa-projection-perf.sh` with the moving-map workload, `--phone-serial` and
+`--drive-smoke`. It stops at the first stage that does not PASS and writes
+`stage-<N>s-not-run.json` for the rest.
+
+The chain also checks for builds itself, every 5 s while a stage runs
+(`stage-<N>s-build-watch.jsonl`). If any are seen, it writes
+`stage-<N>s-interference.json` with every observation. A stage that would PASS
+then counts as BLOCKED (exit 3), and its result is moved to
+`stage-<N>s-result.disqualified.json`, so no qualifying file remains. A FAIL
+stays a FAIL. The chain stops there. The stage is not cut short: the collector
+records the same builds and its result is BLOCKED with the evidence, while
+killing the stage would lose that named result.
+
+The chain handles SIGTERM/SIGINT with a stop flag, as the drive smoke does.
+Each stage runs in its own local process group: the launcher and its local
+helpers. On a stop, the group gets TERM. The grace, `STOP_GRACE_S` (180 s),
+applies to the whole group: the chain polls the group until it is empty, even
+after the launcher itself has exited, and KILLs only what is left when the
+grace expires. The interrupted stage and every later one get a not-run marker,
+and the chain exits 128+signal. A stop during the idle gate starts no stage.
+
+**The stop reaches the target.** The collector runs on the far side of the
+launcher's ssh session. Ending a non-PTY ssh client does not signal the remote
+command, so the local group alone could leave the collector, receiver, display
+and stimulus running, and the phone unrestored. The launcher therefore makes
+the stop explicit:
+
+1. It starts the collector with `--run-file /tmp/aa-perf-run-<random>`. The
+   collector creates that file exclusively (mode 0600). It records its own
+   PID and those of the receiver and display, each with its `/proc` start
+   time, plus the phone serial and media package. It also makes itself the
+   leader of its own process group and records it (`group PGID SID`). Its adb
+   commands are in that group; the ssh session's shell is not.
+2. On TERM/INT, the launcher runs `tools/perf/aa_remote_stop.sh` on the
+   target over a separate ssh call.
+3. The script TERMs the collector, which runs its normal cleanup: stimulus,
+   display, receiver, then the phone restore. Only then does the collector
+   remove the run file. That removal, within `AA_REMOTE_STOP_ACK_S` (30 s), is
+   the acknowledgement. Just before it, the collector writes
+   `<run file>.cleanup`, with one line per restore step it could not do or
+   verify. The script relays it:
+   - `remote-stop: acknowledged` only for an empty report;
+   - otherwise, or with no report at all, `remote-stop: failed: acknowledged
+     with cleanup failures: ...` and exit 1.
+4. Without an acknowledgement (a hung cleanup, or a collector already gone),
+   the script falls back independently:
+   - It KILLs the collector's whole process group, so an in-flight adb command
+     dies with it, then the receiver's and display's groups.
+   - A group is signalled only while it is still the recorded one: the same
+     PGID and session and, if a live process leads it, the recorded leader by
+     start time. A reused PID is never signalled.
+   - It waits until every killed group is empty, then restores the phone
+     itself in the same order: force-stop the media player and verify it with
+     `pidof` (up to 3 attempts), then `svc usb setFunctions mtp`. It prints
+     `remote-stop: forced`. Nothing the collector started can send an intent
+     after that restore.
+   - If a process survives the KILL, or a restore step fails or cannot be
+     verified, the script still attempts the restore but prints
+     `remote-stop: failed: forced: ...` naming each problem and exits 1. The
+     launcher reports that the remote stop reported a failure.
+5. The launcher then drops its own ssh client and exits 143 (130 for INT).
+
+**Every collector exit is confirmed on the target.** The collector's ssh bound
+is the sum of three named budgets in the launcher, each justified there:
+
+- `COLLECTOR_STARTUP_BUDGET_S` = 180: ssh connect, the four bounded adb setup
+  commands and their waits (about 87 s), and the 60 s receiver/display
+  startup bound;
+- the requested window plus `COLLECTOR_MEASUREMENT_SLACK_S` = 30: one
+  sampling interval of overshoot and the frozen-collector log grace;
+- `COLLECTOR_CLEANUP_BUDGET_S` = 240: the stimulus join (up to 47 s), the
+  display and receiver terminations (about 20 s), the media stop (3 attempts
+  of two 20 s adb commands, about 123 s) and the USB switch (20 s).
+
+However the collector ends (a normal exit, a refusal, a dropped link or that
+bound expiring with exit 124), the launcher then runs `aa_remote_stop.sh`
+with no wait for the run file to appear:
+
+- A finished run's cleanup report is relayed and removed
+  (`remote-stop: finished`, or `failed: finished with cleanup failures`).
+- A collector that is still running, for example during a stalled adb
+  cleanup, is stopped and its cleanup confirmed, or the script falls back to
+  KILL plus a direct restore.
+
+On a timeout the stage is BLOCKED `collector_timeout`, never
+`collector_failed` or a PASS. When the target cannot be confirmed clean,
+every BLOCKED reason gains `,remote_cleanup_unconfirmed`. A normal exit whose
+target is unconfirmed is BLOCKED `remote_cleanup_unconfirmed`. A finished
+run's own cleanup failures are in its capture, and the reporter blocks them
+by name.
+
+**The stop is bounded, and its bound is derived.** Every wait and retry in
+`aa_remote_stop.sh` comes out of named budgets:
+
+- the run file's appearance (15 s on a signal, 0 after an exit) and the
+  acknowledgement (`AA_REMOTE_STOP_ACK_S`, 30 s);
+- `GROUP_WAIT_S` (10 s) for all the KILLed groups together;
+- `RESTORE_BUDGET_S` (60 s) for the media stop and the USB restore, with
+  `ADB_COMMAND_S` (15 s) per adb command;
+- `REPORT_RESERVE_S` (2 s).
+
+The worst case is the sum of those, 117 s on a signal. The script prints it
+with `--worst-case ACK APPEAR`, run locally. The launcher bounds the stop's
+ssh at that plus `REMOTE_STOP_SSH_MARGIN_S` (15 s: the 10 s connect timeout
+plus 5 s), so its limit is strictly larger. The chain's 180 s grace covers the
+132 s.
+
+A media-stop attempt starts only while it and the USB restore fit in what is
+left of `RESTORE_BUDGET_S`. Otherwise the script goes straight to the USB
+restore and reports the media stop as not done (`media_stop_unverified: ...
+restore budget exhausted`, which is `cleanup:media_not_stopped`). So even
+with every adb call stalling to its bound, USB is restored and the outcome
+reported inside the limit.
+
+An explicit
+stop with an acknowledgement is used rather than tying the collector to the
+ssh session (SIGHUP or stdin EOF): the collector reads its own source from
+stdin, a non-PTY session sends no SIGHUP, and a dropped link would look the
+same as a stop. The explicit call also confirms the cleanup and has a fallback
+when the cleanup does not finish.
+
+Running the chain:
+
+```bash
+tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" \
+    --phone-serial "$SOAK_PHONE_SERIAL" --drive-smoke "$DRIVE_SMOKE_RESULT" \
+    --media-uri file:///sdcard/Music/<tone>.opus --media-type audio/ogg \
+    --media-component org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity \
+    --receiver "$AA_BUILD_DIR/aa-wired-receiver" --display "$AA_BUILD_DIR/aa-dummy-display" \
+    --build-dir "$AA_BUILD_DIR" --store "$STORE" --thermal-policy orin-nano-cv-unavailable/1 \
+    --provenance "$RUN_DIR/provenance.json" --display-env ":0,/run/user/$(id -u)/gdm/Xauthority"
+```
+
 ## Exact invocations
 
 From the development checkout (bounded ssh, fail-closed):
@@ -333,13 +699,13 @@ tools/perf/aa-projection-perf.sh --readiness-only --out /tmp/task-32-readiness.j
 # 30-minute performance run (optimized build, see Build).
 tools/perf/aa-projection-perf.sh --mode wired --duration 30m \
     --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
-    --phone-serial "$SOAK_PHONE_SERIAL" \
+    --phone-serial "$SOAK_PHONE_SERIAL" --media-uri "$SOAK_MEDIA_URI" \
     --out /tmp/task-32-perf-30m.json --capture-out /tmp/task-32-capture-30m.json
 
 # Separate 2-hour soak run (fresh invocation; do not reuse the 30m capture).
 tools/perf/aa-projection-perf.sh --mode wired --duration 2h \
     --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
-    --phone-serial "$SOAK_PHONE_SERIAL" \
+    --phone-serial "$SOAK_PHONE_SERIAL" --media-uri "$SOAK_MEDIA_URI" \
     --out /tmp/task-32-soak-2h.json --capture-out /tmp/task-32-capture-2h.json
 ```
 
@@ -487,11 +853,14 @@ shutdown-only over-budget value changes neither metrics nor verdict, whereas a
 genuine failure during cleanup can still produce FAIL.
 
 Both runs write a result document (validated against
-`tools/perf/aa-projection-perf-v2.schema.json`) whose gated metrics are compared to
-the contractual budgets:
+`tools/perf/aa-projection-perf-v3.schema.json`; historical v2 results against
+`-v2`) whose gated metrics are compared to the contractual budgets:
 
 - receiver RSS peak <= 250 MB; receiver CPU sustained <= 50 % of one core;
-- RSS growth < 10 %; A/V sync <= 50 ms; audio latency <= 200 ms; zero crashes;
+- RSS growth < 10 %; audio latency <= 200 ms; zero crashes;
+- the signed A/V contract: every 5 s mean within ±40 ms, p99 \|skew\| <= 50 ms,
+  at most floor(active s / 1800) pairs over 90 ms and none over 150 ms
+  (owner decision 2026-11-17), audio coverage >= 90 % (v2: A/V sync <= 50 ms);
 - helper RSS recorded `null`;
 - frame drops, decode timing, IPC timing and thermal state recorded
   informationally.
@@ -590,8 +959,9 @@ the withdrawn 33 ms gate is **not** restored.
 
 ## Provenance and equivalence
 
-Both runs require capture `aa-projection-perf-capture/2` and result
-`aa-projection-perf/2`, with `measurement_coverage` policy
+Both runs require capture `aa-projection-perf-capture/3` and result
+`aa-projection-perf/3` (historical runs: `/2`, judged by the v2 contract), with
+`measurement_coverage` policy
 `active-window-coverage/1`. V1 results remain explicitly validatable against
 their unchanged schema, not automatically qualified as v2. Independently parse
 coverage after export removes the capture: labels/hashes alone prove neither

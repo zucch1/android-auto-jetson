@@ -17,22 +17,34 @@ tools/perf/
   aa_measurement_coverage.py       shared typed active-window evidence contract
   aa_perf_report.py                capture -> result document + budget verdict
   aa_perf_schema.py                stdlib JSON Schema validator (own output)
-  aa-projection-perf-v2.schema.json current result-document contract
+  aa_av_contract.py                signed A/V contract (shared with the drive smoke)
+  aa_moving_map.py                 moving-map workload (shared with the drive smoke)
+  aa_soak_chain.py                 the 1800 s + 7200 s soak chain
+  aa_remote_stop.sh                stops a collector run on the target and confirms
+                                   its cleanup (phone restore fallback)
+  aa-projection-perf-v3.schema.json current result-document contract (v3)
+  aa-projection-perf-v2.schema.json historical v2 results (A/V max <= 50 ms)
   aa-projection-perf.schema.json   historical v1 validation only (build block optional)
   README.md                        this file
 ```
 
 ## Contractual budgets
 
-Fixed in `aa-projection-perf-v2.schema.json` and `aa_perf_report.py`. They are
-never weakened and a diagnostics-suppressing flag does not exist:
+Fixed in `aa-projection-perf-v3.schema.json` and `aa_perf_report.py` (`BUDGETS`;
+v2 results keep `BUDGETS_V2` and the v2 schema). They are never weakened and a
+diagnostics-suppressing flag does not exist:
 
 | Metric | Budget | Gate |
 | --- | --- | --- |
 | receiver RSS | <= 250 MB (peak) | FAIL on miss |
 | receiver CPU | <= 50 % of one core (sustained) | FAIL on miss |
 | RSS growth over the run | < 10 % | FAIL on miss |
-| A/V sync | <= 50 ms | FAIL on miss |
+| A/V, every 5 s window mean | within ±40 ms (`av_window_mean_abs_ms`) | FAIL on miss |
+| A/V, p99 \|skew\| | <= 50 ms (`av_p99_abs_ms`) | FAIL on miss |
+| A/V excursions (\|skew\| > 90 ms) | at most floor(active s / 1800) pairs (`av_excursions`) | FAIL on miss |
+| A/V hard cap | no pair over 150 ms (`av_hard_cap_pairs`) | FAIL on any |
+| A/V, max \|skew\| | (`av_max_abs_ms`) | informational in v3 (owner decision 2026-11-17) |
+| A/V audio coverage | >= 90 % of the active window (`av_coverage_pct`) | FAIL on miss, including no audio |
 | audio path latency | <= 200 ms | FAIL on miss |
 | crashes | 0 | FAIL on any |
 | helper RSS | `null` | recorded `null` (wired path needs no helper before todo 34) |
@@ -164,8 +176,8 @@ evidence. Neither proves a live run or hardware authenticity.
 ## Usage
 
 ```sh
-tools/perf/aa-projection-perf.sh --mode wired --duration 30m --out /tmp/perf-30m.json
-tools/perf/aa-projection-perf.sh --mode wired --duration 2h  --out /tmp/soak-2h.json
+tools/perf/aa-projection-perf.sh --mode wired --duration 30m --media-uri "$MEDIA" --out /tmp/perf-30m.json
+tools/perf/aa-projection-perf.sh --mode wired --duration 2h  --media-uri "$MEDIA" --out /tmp/soak-2h.json
 tools/perf/aa-projection-perf.sh --readiness-only --out /tmp/readiness.json
 tools/perf/aa-projection-perf.sh --mode wired --duration 30m \
     --capture capture.json --out result.json     # offline: report a capture
@@ -281,8 +293,17 @@ digest, configuration digest, service definitions, dependency versions and the
 target hardware state. `package_digest` is forced to `null` and
 `equivalence_status` to `"provisional"`: post-package equivalence belongs to
 todo 43, and the tool rejects a capture that claims otherwise. The report
-validates its own output against `aa-projection-perf-v2.schema.json` before
-returning.
+validates its own output against its version's schema (v3, or v2 for a v2
+capture) before returning.
+
+Versions (#137): a v2 capture replays to a v2 result under the v2 contract
+(A/V max <= 50 ms), never reinterpreted. Live stages write capture `/3`, whose
+`av_series` (signed pairs and audio coverage) the reporter judges with the
+signed A/V contract, and whose `workload` must prove the moving-map workload
+ran: it started, no phone command failed, the drag rate met the floor, and no
+gap was over 10 s. `--media-uri` is required for every live stage. A build seen
+on the target during a stage (`concurrent_builds`) BLOCKS it. See the runbook's
+**Soak stages: moving-map workload and signed A/V (v3)**.
 
 ## Tests
 

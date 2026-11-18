@@ -193,9 +193,9 @@ def test_wrapper_blocked_capture_is_reportable_v2_without_live_readiness() -> No
                                  "--live", "--blocked-on", "fixture_absent"],
                                 text=True, capture_output=True, timeout=5)
         document = json.loads(output.read_text())
-    # Then missing prerequisites produce v2 BLOCKED, not malformed evidence or a live pass.
+    # Then missing prerequisites produce a (v3) BLOCKED, not malformed evidence or a live pass.
     assert result.returncode == 3, result.stderr
-    assert document["schema"] == "aa-projection-perf/2"
+    assert document["schema"] == "aa-projection-perf/3"
     assert document["verdict"] == "BLOCKED"
     assert document["measurement_coverage"]["window"] is None
 
