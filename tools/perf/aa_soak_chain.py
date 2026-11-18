@@ -340,6 +340,7 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
                 outcome = stop_group(process)
             print(f"{name} INTERRUPTED by {signal.Signals(stop.signum).name}: stage {outcome}",
                   flush=True)
+            _retire_interrupted(args, name, seen, process.returncode)
             return 128 + stop.signum
     if preflight is not None:  # informational: host nodes after the receiver is gone
         preflight["pipewire_err_counters"]["end"] = {**host_counters(args), "phase": "after_stage"}
@@ -350,6 +351,27 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
     if seen:
         return _disqualify(args, name, seen, result, verdict, process.returncode)
     return process.returncode
+
+
+def _result_verdict(result: Path) -> object:
+    try:
+        return json.loads(result.read_text()).get("verdict") if result.exists() else None
+    except (OSError, ValueError, AttributeError):
+        return "unreadable"
+
+
+def _retire_interrupted(args: argparse.Namespace, name: str, seen: list[dict], code: int | None) -> None:
+    """An interrupted stage never leaves a qualifying result.
+
+    A build the watch saw is disqualified first, as for a finished stage, so
+    interference always wins over PASS; a PASS still on disk after that is
+    moved to ``-result.interrupted.json``.
+    """
+    result = args.out / f"{name}-result.json"
+    if seen:
+        _disqualify(args, name, seen, result, _result_verdict(result), code if code is not None else -1)
+    if _result_verdict(result) == "PASS":
+        result.rename(result.with_name(f"{name}-result.interrupted.json"))
 
 
 def _disqualify(args: argparse.Namespace, name: str, seen: list[dict], result: Path,

@@ -515,6 +515,36 @@ def test_a_stop_during_the_sampler_shutdown_still_writes_the_markers() -> None:
         assert "stage-1800s INTERRUPTED by SIGTERM" in output, output
         assert "interrupted" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
         assert (out / "stage-7200s-not-run.json").exists()
+        # The stub wrote PASS before the TERM: it is moved aside, never left qualifying.
+        assert not (out / "stage-1800s-result.json").exists()
+        assert json.loads((out / "stage-1800s-result.interrupted.json").read_text())["verdict"] == "PASS"
+
+
+def test_an_interrupted_stage_with_a_build_is_disqualified_not_pass() -> None:
+    # A PASS on disk, a build seen by the watch, then TERM during the sampler's
+    # shutdown: interference wins, and nothing qualifying is left.
+    import signal
+    real_finish = chain.CounterSampler.finish
+    count = {"n": 0}
+
+    def builds() -> list[str]:  # idle, before the stage, after the preflight: none; the watch: a build
+        count["n"] += 1
+        return ["4242 ninja"] if count["n"] > 3 else []
+
+    def finish(self) -> dict:
+        os.kill(os.getpid(), signal.SIGTERM)
+        return real_finish(self)
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        with patch.object(chain.CounterSampler, "finish", finish):
+            code, output = run(root, builds=builds, stub_text=STUB.replace('exit "$rc"', 'sleep 0.3\nexit "$rc"'))
+        out = root / "chain"
+        assert code == 128 + signal.SIGTERM, (code, output)
+        interference = json.loads((out / "stage-1800s-interference.json").read_text())
+        assert interference["reason"] == "build_during_stage" and interference["result_verdict"] == "PASS"
+        assert not (out / "stage-1800s-result.json").exists()
+        assert (out / "stage-1800s-result.disqualified.json").exists()
+        assert (out / "stage-1800s-not-run.json").exists() and (out / "stage-7200s-not-run.json").exists()
 
 
 def test_every_chain_gets_a_new_directory() -> None:

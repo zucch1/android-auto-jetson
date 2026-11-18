@@ -508,7 +508,8 @@ def read_pw_top(run: Runner, uid: str, receiver: str | None = None, now: float |
     # start the daemon: read only from a daemon that is already running.
     running = run(["pgrep", "-u", uid, "-x", "pipewire"])
     if running.rc != 0 or not running.stdout.split():
-        return {**record, "skipped": "pipewire_not_running" if running.rc == 1 else "pgrep failed"}
+        skipped = "pipewire_not_running" if running.rc in (0, 1) else transport_failure(running) or "pgrep failed"
+        return {**record, "skipped": skipped}
     out = run(["env", f"XDG_RUNTIME_DIR=/run/user/{uid}", "pw-top", "-b", "-n", "2"],
               timeout=PW_TOP_TIMEOUT_S)
     if out.rc != 0:
@@ -550,12 +551,14 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
     timers; a second, non-waiting maintenance read; and the timers again, from
     a fresh host clock, so neither gate is aged by the other.
 
-    With a positive ``maintenance_wait_s`` every maintenance probe, the first
-    included, shares one deadline on ``monotonic`` (each command's whole
-    budget, ssh connection included, is the time left), and a probe that
-    completes after it is rejected (BLOCKED
-    ``host_maintenance:wait_limit_exceeded``) whatever it saw. 0 is a single
-    observation with the commands' own bounds. ``sleep`` returns False when the
+    A positive ``maintenance_wait_s`` is one monotonic envelope around the
+    whole preflight, from before ``id -u`` to the verdict: the guarantee is
+    the last step, which BLOCKs (``host_preflight:preflight_deadline_exceeded``)
+    when the elapsed time exceeds it. Each command's budget is also capped to
+    the time left, and a maintenance poll that completes late is rejected
+    (``host_maintenance:wait_limit_exceeded``), but only to fail early. 0 is a
+    single maintenance observation, every command with its own bound, and no
+    envelope. ``sleep`` returns False when the
     chain is stopped; the wait then ends and the record is BLOCKED
     ``host_maintenance:wait_interrupted``.
 
@@ -566,7 +569,17 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
     """
     margin_s = finite_seconds(margin_s, "timer margin")
     maintenance_wait_s = finite_seconds(maintenance_wait_s, "maintenance wait")
+    began = monotonic()  # the envelope starts before the first command
+    deadline = began + maintenance_wait_s
+    bounded = maintenance_wait_s > 0
+    budget = (lambda: deadline - monotonic()) if bounded else (lambda: None)
     record: dict = {"schema": SCHEMA, "stage_s": stage_s, "started_epoch": now()}
+    unbounded_run = run
+
+    def run(argv, timeout=None) -> Output:  # noqa: F811 - every command, capped to the time left
+        left = budget()
+        return unbounded_run(argv, timeout=timeout if left is None else
+                             left if timeout is None else min(timeout, left))
     if uid is None:
         uid, failure = soak_uid(run)
         if uid is None:
@@ -583,10 +596,6 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
             transport.append(failure)
         return out
 
-    began = monotonic()
-    deadline = began + maintenance_wait_s
-    bounded = maintenance_wait_s > 0
-    budget = (lambda: deadline - monotonic()) if bounded else (lambda: None)
     maintenance = check_package_maintenance(gate, timeout=budget)
     late = bounded and monotonic() > deadline
     interrupted = False
@@ -622,8 +631,13 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
     if maintenance["ok"]:
         reasons += [f"{reason} (at the final check)" for reason in final["reasons"]]
     reasons += [reason for reason in final_timers["reasons"] if reason not in reasons]
+    elapsed = monotonic() - began
+    if bounded and elapsed > maintenance_wait_s:  # the guarantee: nothing admitted past the bound
+        reasons.append(f"host_preflight:preflight_deadline_exceeded "
+                       f"({elapsed:.1f} s > {maintenance_wait_s:.1f} s)")
     record.update(package_maintenance=maintenance, pipewire_scheduling=scheduling, apt_timers=timers,
                   package_maintenance_final=final, apt_timers_final=final_timers,
                   pipewire_err_counters={"start": {**counters, "phase": "before_launch"}},
-                  checked_epoch=now(), verdict="OK" if not reasons else "BLOCKED", reasons=reasons)
+                  checked_epoch=now(), elapsed_s=round(elapsed, 3), deadline_s=maintenance_wait_s or None,
+                  verdict="OK" if not reasons else "BLOCKED", reasons=reasons)
     return record

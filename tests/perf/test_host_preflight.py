@@ -277,11 +277,11 @@ def test_the_wait_is_bounded_on_the_monotonic_clock() -> None:
     assert "host_maintenance:wait_interrupted" not in record["reasons"]
     # A poll's commands get the time left as their whole budget (here 5 s, never
     # the default), and once the bound is spent no probe runs that could admit the
-    # stage late; the final read before launch has its own default bound.
+    # stage late.
     host = Host(processes=IDLE + "  4242 dpkg\n")
     check(host, maintenance_wait_s=15)
     probes = [t for c, t in host.calls if c == "ps -e -o pid=,comm="]
-    assert probes == [15.0, 5.0, None], probes  # the first probe shares the deadline too
+    assert probes == [15.0, 5.0, 0.0], probes  # one envelope: the final read gets what is left (none)
 
 
 def test_a_poll_that_ends_after_the_deadline_is_rejected() -> None:
@@ -574,18 +574,98 @@ def test_a_later_ssh_failure_keeps_its_transport_label() -> None:
         "host_transport:ssh_failed"), record
 
 
+def _alive(pid: int) -> bool:
+    """A live (not zombie) process."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (FileNotFoundError, IndexError):
+        return False
+    return state != "Z"
+
+
+def _gone(pid: int, within: float = 2.0) -> bool:
+    end = time.monotonic() + within
+    while time.monotonic() < end:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def test_cancelling_kills_helpers_and_never_waits_on_inherited_pipes() -> None:
-    for command in (["sh", "-c", "sleep 37.1 & sleep 37.1"],  # a helper in the command's group
-                    ["sh", "-c", "setsid sleep 37.1 & sleep 37.1"]):  # a detached helper holding the pipes
-        cancel = threading.Event()
-        threading.Timer(0.2, cancel.set).start()
-        began = time.monotonic()
-        out = hp.cancellable_runner(cancel)(command, timeout=60)
-        assert out.rc is None and time.monotonic() - began < 1.8, (command, time.monotonic() - began)
-    subprocess.run(["pkill", "-f", "-x", "sleep 37.1"], check=False)  # the detached one, if any
+    import os
+    import signal
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="hp-cancel-") as directory:
+        pids = Path(directory) / "pids"
+        started: list[int] = []
+        try:
+            for detached in (False, True):
+                # The shell records its own pid and its helper's; the helper is in
+                # the command's group, or detached (setsid) still holding the pipes.
+                helper = "setsid sleep 37.1" if detached else "sleep 37.1"
+                script = f'{helper} & echo "$$ $!" > {pids}; sleep 37.1'
+                cancel = threading.Event()
+                threading.Timer(0.3, cancel.set).start()
+                began = time.monotonic()
+                out = hp.cancellable_runner(cancel)(["sh", "-c", script], timeout=60)
+                elapsed = time.monotonic() - began
+                shell, child = (int(pid) for pid in pids.read_text().split())
+                started += [shell, child]
+                assert out.rc is None and elapsed < 1.8, (detached, elapsed)
+                assert _gone(shell), f"the command itself survived ({shell})"
+                if not detached:
+                    assert _gone(child), f"its in-group helper survived ({child})"
+        finally:  # only what this test started
+            for pid in started:
+                if _alive(pid):
+                    os.kill(pid, signal.SIGKILL)
     began = time.monotonic()
     assert hp.local_runner(["sh", "-c", "sleep 37.1 & echo"], timeout=0.5).rc is None
     assert time.monotonic() - began < 1.8
+
+
+def test_the_whole_preflight_is_one_deadline() -> None:
+    # A 15 s bound; a 16 s delay in any one phase, a probe at a time, BLOCKs at the end.
+    phases = (("uid", lambda a: a == ["id", "-u"]),
+              ("first package read", lambda a: a[:2] == ["ps", "-e"]),
+              ("scheduling", lambda a: a[:2] == ["ps", "-L"]),
+              ("counters", lambda a: "pw-top" in a),
+              ("timers", lambda a: "NextElapseUSecRealtime" in a),
+              ("final package read", lambda a: a[:2] == ["systemctl", "is-active"]),
+              ("final timer clock", lambda a: a[0] == "python3"))
+    for phase, matches in phases:
+        host = Host()
+        seen = {"n": 0}
+        last = phase.startswith("final")
+
+        def slow(argv, timeout=None, matches=matches, last=last):
+            if matches(argv):
+                seen["n"] += 1
+                if seen["n"] == (2 if last else 1):
+                    host.advance(16.0)
+            return host(argv, timeout)
+        record = check(slow, host=host, maintenance_wait_s=15)
+        assert record["verdict"] == "BLOCKED", (phase, record["reasons"])
+        assert any(r.startswith("host_preflight:preflight_deadline_exceeded (16.0 s > 15.0 s)")
+                   for r in record["reasons"]), (phase, record["reasons"])
+    assert check(Host(), maintenance_wait_s=15)["verdict"] == "OK"  # on time: admitted
+
+
+def test_the_counter_pid_guard_keeps_the_transport_label() -> None:
+    host = Host()
+    broken = hp.Output(255, "", "ssh: connect to host 127.0.0.1 port 22: Connection refused\n")
+    calls = {"n": 0}
+
+    def run(argv, timeout=None):
+        if argv[:4] == ["pgrep", "-u", UID, "-x"] and argv[-1] == "pipewire":
+            calls["n"] += 1
+            if calls["n"] == 2:  # the counters' guard (after the scheduling pgrep)
+                return broken
+        return host(argv, timeout)
+    record = check(run, host=host)
+    assert record["pipewire_err_counters"]["start"]["skipped"] == \
+        "host_transport:ssh_failed (ssh: connect to host 127.0.0.1 port 22: Connection refused)", record
 
 
 def test_counters_never_start_pipewire() -> None:
