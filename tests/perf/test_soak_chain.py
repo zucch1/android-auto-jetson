@@ -13,7 +13,7 @@ import json
 import os
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -313,7 +313,9 @@ def test_the_preflight_runs_before_each_stage_and_records_the_err_counters() -> 
         for seconds in chain.STAGES:
             record = json.loads((root / "chain" / f"stage-{seconds}s-host-preflight.json").read_text())
             # start counters from the preflight, end counters added after the stage
-            assert record["verdict"] == "OK" and set(record["pipewire_err_counters"]) == {"start", "end"}, record
+            assert record["verdict"] == "OK", record
+            assert set(record["pipewire_err_counters"]) == {"start", "during", "end"}, record
+            assert record["pipewire_err_counters"]["end"]["phase"] == "after_stage"
 
 
 def test_the_second_stage_is_preflighted_on_its_own_clock() -> None:
@@ -343,6 +345,97 @@ def test_a_stop_during_the_maintenance_wait_starts_no_stage() -> None:
         code, _ = run(root, host=host)
         assert code == 128 + signal.SIGTERM and calls(root) == []
         assert (root / "chain" / "stage-1800s-not-run.json").exists()
+
+
+def test_a_preflight_that_raises_blocks_and_still_writes_the_markers() -> None:
+    def broken(_args, _seconds, _stop) -> dict:
+        raise ValueError("day is out of range for month")
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        code, output = run(root, host=broken)
+        out = root / "chain"
+        assert code == 3 and calls(root) == [], output
+        record = json.loads((out / "stage-1800s-host-preflight.json").read_text())
+        assert record["verdict"] == "BLOCKED" and "host_preflight:error (ValueError" in record["reasons"][0]
+        assert "host_preflight:error" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+        assert (out / "stage-7200s-not-run.json").exists()
+
+
+def test_a_build_that_starts_during_the_preflight_blocks_the_launch() -> None:
+    # The build check is repeated right after the (possibly long) preflight.
+    state = {"preflighted": False}
+
+    def host(args, seconds, stop) -> dict:
+        state["preflighted"] = True
+        return preflight_ok(args, seconds, stop)
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        code, output = run(root, host=host, builds=lambda: ["4242 ninja"] if state["preflighted"] else [])
+        assert code == 3 and calls(root) == [], output
+        assert "a build started during the host preflight" in output
+        record = json.loads((root / "chain" / "stage-1800s-host-preflight.json").read_text())
+        assert record["verdict"] == "BLOCKED" and record["reasons"] == ["interference:build_started_during_preflight"]
+        assert (root / "chain" / "stage-1800s-not-run.json").exists()
+
+
+def test_non_finite_preflight_bounds_are_usage_errors() -> None:
+    for flag in ("--maintenance-wait-s", "--timer-margin-s"):
+        for value in ("inf", "nan", "-1"):
+            with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+                root = Path(directory)
+                try:
+                    with redirect_stderr(io.StringIO()):
+                        run(root, flag, value)
+                except SystemExit as exit_:
+                    assert exit_.code == 2, (flag, value)
+                else:
+                    raise AssertionError(f"{flag} {value} accepted")
+                assert not (root / "chain").exists()
+
+
+def test_the_preflight_uses_the_launchers_ssh_even_for_localhost() -> None:
+    # An ssh config may map localhost to another User: the preflight must ask that user.
+    seen = []
+
+    def local(argv, timeout=None):
+        seen.append(argv)
+        return chain.aa_host_preflight.Output(0, "1001\n")
+    with patch.object(chain.aa_host_preflight.ssh_runner, "__defaults__", (local,)):
+        assert chain.aa_host_preflight.soak_uid(chain.host_runner("localhost")) == "1001"
+    assert seen == [["ssh", *chain.aa_host_preflight.SSH_OPTS, "localhost", "id -u"]], seen
+
+
+SLOW_STUB = STUB.replace('printf \'%s\\n\' "$*" >> "$STUB_LOG"\n', 'printf \'%s\\n\' "$*" >> "$STUB_LOG"\nsleep 0.6\n')
+
+
+def test_err_counters_are_sampled_while_the_receiver_stream_exists() -> None:
+    samples = []
+
+    def counters(_args) -> dict:
+        samples.append(1)
+        return {"time": 0, "receiver_streams": [{"id": 71, "name": "aa-wired-receiver", "err": 2}],
+                "sinks": [], "nodes": []}
+    assert SLOW_STUB != STUB
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        with patch.object(chain, "COUNTER_FIRST_S", 0.05), patch.object(chain, "COUNTER_PERIOD_S", 0.1), \
+                patch.object(chain, "STAGES", (1800,)):
+            stub = root / "stub-launcher"
+            stub.write_text(SLOW_STUB)
+            stub.chmod(0o755)
+            argv = ["--out", str(root / "chain"), "--phone-serial", "TESTPHONE01",
+                    "--drive-smoke", str(root / "smoke.json"), "--media-uri", "file:///x.opus",
+                    "--media-component", "org.example.player/.Play", "--quiet-seconds", "0",
+                    "--launcher", str(stub)]
+            with patch.dict(os.environ, {"STUB_LOG": str(root / "calls.log")}), \
+                    patch.object(chain, "builds", lambda: []), patch.object(chain, "host_preflight", preflight_ok), \
+                    patch.object(chain, "host_counters", counters), redirect_stdout(io.StringIO()):
+                assert chain.main(argv) == 0
+        during = json.loads((root / "chain" / "stage-1800s-host-preflight.json").read_text())[
+            "pipewire_err_counters"]["during"]
+        assert during["samples"] >= 2 and during["receiver_stream_seen"], during
+        assert during["latest_with_receiver"]["receiver_streams"][0]["err"] == 2
+        assert during["first_with_receiver"]["phase"] == "during_stage"
 
 
 def test_every_chain_gets_a_new_directory() -> None:
@@ -379,6 +472,7 @@ import aa_soak_chain as chain
 chain.builds = lambda: []
 chain.host_preflight = lambda a, s, stop: {"verdict": "OK", "reasons": []}
 chain.host_counters = lambda a: {}
+chain.COUNTER_FIRST_S = 3600.0
 chain.STOP_GRACE_S = 1.0
 sys.exit(chain.main(sys.argv[2:]))
 """

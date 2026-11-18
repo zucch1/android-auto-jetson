@@ -572,36 +572,49 @@ killing the stage would lose that named result.
 conditions that stalled the PipeWire Pulse server for ~400 ms in an 1800 s
 stage and so made its audio unqualifiable. It does not change a threshold; a
 host that fails a check cannot qualify audio, so the stage is not run. The
-code is `tools/perf/aa_host_preflight.py`; every check is a read-only
-`ps`/`systemctl` query, run on `--host` (locally when that is this machine,
-else over bounded key-only ssh).
+code is `tools/perf/aa_host_preflight.py`; every check is read-only. Every
+command goes over the launcher's own ssh transport and options to `--host`,
+also for `localhost`, so the uid and the PipeWire session checked are the ones
+the soak runs as, even when an ssh config maps the host to another `User`.
+
+The checks run in this order, so the ones a launch depends on are the freshest:
 
 | Check | Reads | Result |
 | --- | --- | --- |
-| PipeWire real-time | `ps -L -o cls,rtprio,comm -p PID` for every `pipewire` and `pipewire-pulse` process of the user | Every `pw-data-loop` thread must be `RR` or `FF`. A process that is not running, has no data-loop thread, or has any other class (`TS` is SCHED_OTHER) is BLOCKED. |
-| Package maintenance | processes `apt`, `apt-get`, `dpkg`, `unattended-upgr(ades)`, `packagekitd`, `apt.systemd.dai(ly)`; `systemctl is-active apt-daily.service apt-daily-upgrade.service` | Transient, so the chain **waits** for it, up to `--maintenance-wait-s` (default 900 s; 0 = BLOCKED at once), then BLOCKED. |
-| apt timers | `systemctl show -p NextElapseUSecRealtime` for `apt-daily.timer` and `apt-daily-upgrade.timer` | An elapse at or before the stage's start + duration + `--timer-margin-s` (default 900 s: the launcher's setup and cleanup) is **refused**: BLOCKED, with the earliest safe start in the reason. It does not wait, because the wait could be hours. An overdue timer counts as inside; an unparsable or unreadable elapse is BLOCKED; a timer with no next elapse cannot fire. |
+| Package maintenance | processes `apt`, `apt-get`, `dpkg`, `unattended-upgr(ades)`, `apt.systemd.dai(ly)`; `systemctl is-active apt-daily.service apt-daily-upgrade.service`; PackageKit over `busctl` | Transient, so the chain **waits** for it, up to `--maintenance-wait-s` (default 900 s; 0 = BLOCKED at once) on a monotonic clock, with each probe's timeout capped to the time left; then BLOCKED. PackageKit is busy only with a transaction (`GetTransactionList`) or the package lock (`Locked`): an idle resident `packagekitd` does not block. The bus name is checked with `NameHasOwner` and the daemon is then addressed by its unique name, so the query never D-Bus-activates PackageKit. Unreadable state is BLOCKED. |
+| PipeWire real-time | `ps -L -o cls,rtprio,comm -p PID` for every `pipewire` and `pipewire-pulse` process of the soak user | Every `pw-data-loop` thread must be `RR` or `FF`. A process that is not running, has no data-loop thread, or has any other class (`TS` is SCHED_OTHER) is BLOCKED. |
+| apt timers | `systemctl show -p NextElapseUSecRealtime -p NextElapseUSecMonotonic` for `apt-daily.timer` and `apt-daily-upgrade.timer`; the host's monotonic and realtime clocks | The earlier of the calendar and the monotonic (`OnBootSec=`, `OnUnitActiveSec=`, ...) elapse, at or before the host's now (read after the queries) + duration + `--timer-margin-s` (default 900 s: the launcher's setup and cleanup), is **refused**: BLOCKED, with the earliest safe start in the reason. It does not wait, because the wait could be hours. An overdue timer counts as inside. A missing property, an unparsable or impossible value, or an unreadable host clock is BLOCKED; an empty, `n/a` or `0` value means no next elapse. |
 
-A check that cannot be made (command failed) is BLOCKED, not skipped. A BLOCKED
-stage exits 3, writes `stage-<N>s-not-run.json` naming every reason
-(`host_audio:...`, `host_maintenance:...`) and the later stages get theirs.
-The host is expected to keep `zucchi` in the `pipewire` group (limits.d grants
-rtprio 95) and to pin the timers outside the stage window, as the owner has
+The chain's build check is repeated right after the preflight, immediately
+before the launch: the only gap left is that `/proc` scan and the launcher's
+start, and the stage's own build watch samples from its first second.
+`--maintenance-wait-s` and `--timer-margin-s` must be finite and >= 0.
+
+A check that cannot be made (command failed), or a preflight that raises, is
+BLOCKED, not skipped. A BLOCKED stage exits 3, writes
+`stage-<N>s-not-run.json` naming every reason (`host_audio:...`,
+`host_maintenance:...`, `host_preflight:error`, `interference:...`) and the
+later stages get theirs. The host is expected to keep `zucchi` in the
+`pipewire` group (limits.d grants rtprio 95) and to pin the timers outside the
+stage window, as the owner has
 (`/etc/systemd/system/apt-daily*.timer.d/zz-aa-soak-window.conf`, 04:00 and
 04:30 daily, no random delay); the preflight only notices when that comes
 undone, it changes nothing.
 
 Each stage's record is `stage-<N>s-host-preflight.json` (schema
-`aa-host-preflight/1`): the scheduling rows, the maintenance state and how long
-the chain waited, the timers' elapses and the window used, and the verdict. It
-is a sidecar like `stage-<N>s-interference.json` because the capture is
-sha256-bound into the result and must not be edited. It also carries, informationally
-and never gated, the ERR counters of every PipeWire node from `pw-top -b -n 2`
-at the stage's start and end (`pipewire_err_counters.start` / `.end`: the
-receiver's streams, the `*_output.*` sinks and the nodes). Compare the two to
-see whether a host audio problem happened during the stage. Only the chain runs
-the preflight; a direct `aa-projection-perf.sh` invocation does not, so check
-the host by hand before one.
+`aa-host-preflight/2`): the maintenance state and how long the chain waited,
+the scheduling rows, both timer elapses and the window used, and the verdict.
+It is a sidecar like `stage-<N>s-interference.json` because the capture is
+sha256-bound into the result and must not be edited. It also carries,
+informationally and never gated, PipeWire ERR counters from `pw-top -b -n 2`
+(the receiver's streams, the `*_output.*` sinks and the nodes):
+`pipewire_err_counters.start` (before the launch) and `.end` (after the stage)
+are host-node snapshots only, because the receiver's stream does not exist
+then; `.during` is sampled while the stage runs (first 120 s after the launch,
+then every 300 s) and keeps the first and latest sample that saw the
+receiver's stream, so compare those two for the stream and `start`/`end` for
+the sinks. Only the chain runs the preflight; a direct `aa-projection-perf.sh`
+invocation does not, so check the host by hand before one.
 
 The chain handles SIGTERM/SIGINT with a stop flag, as the drive smoke does.
 Each stage runs in its own local process group: the launcher and its local
