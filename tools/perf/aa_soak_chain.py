@@ -30,6 +30,17 @@ the stage with ``interference:concurrent_build``; killing it would lose that
 named result and its evidence. Exit: the first non-PASS stage's launcher code
 (3 for a disqualified one), else 0; 128+signal when stopped; 2 on usage errors.
 
+Before each stage the chain also checks the host (``aa_host_preflight``, #154):
+PipeWire's ``pw-data-loop`` threads must be real-time (RR/FF), no apt, dpkg,
+unattended-upgrades or PackageKit work may be running (it waits up to
+``--maintenance-wait-s``, then BLOCKs), and neither apt timer may elapse inside
+the stage's planned window plus ``--timer-margin-s`` (refused, not waited
+for). A failed check BLOCKs the stage (exit 3): it is not run, and
+``stage-<N>s-not-run.json`` says why. Every stage's record, with the PipeWire
+ERR counters read at its start and end (informational), is
+``stage-<N>s-host-preflight.json``: a sidecar, because the capture is
+sha256-bound into the result.
+
 A stop TERMs the stage's process group and gives the whole group
 STOP_GRACE_S, even after the launcher itself exits; the launcher stops the
 collector on the target over its own ssh (tools/perf/aa_remote_stop.sh).
@@ -40,11 +51,13 @@ import argparse
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import aa_host_preflight
 from aa_projection_collect import ancestors, build_processes
 
 STAGES = (1800, 7200)  # the 60 s stage is retired (#137)
@@ -158,6 +171,27 @@ def wait_quiet(seconds: float, log: Path, sleep=time.sleep, clock=time.monotonic
                 return False
 
 
+def host_runner(host: str) -> aa_host_preflight.Runner:
+    """Host commands run here when the soak host is this machine, else over bounded ssh."""
+    local = {"localhost", "127.0.0.1", "::1", socket.gethostname(), socket.getfqdn()}
+    return aa_host_preflight.local_runner if host in local else aa_host_preflight.ssh_runner(host)
+
+
+def host_preflight(args: argparse.Namespace, seconds: int, stop: StopFlag) -> dict:
+    """The stage's host audio / package-maintenance preflight (a test patches this)."""
+    return aa_host_preflight.preflight(
+        host_runner(args.host), seconds, sleep=stop.sleep, margin_s=args.timer_margin_s,
+        maintenance_wait_s=args.maintenance_wait_s, receiver=args.receiver)
+
+
+def host_counters(args: argparse.Namespace) -> dict:
+    """PipeWire ERR counters now (informational; a test patches this)."""
+    runner = host_runner(args.host)
+    uid = runner(["id", "-u"]).stdout.strip()
+    return aa_host_preflight.read_pw_top(runner, uid, args.receiver) if uid.isdigit() \
+        else {"error": "id -u failed"}
+
+
 def stage_command(args: argparse.Namespace, seconds: int) -> list[str]:
     name = f"stage-{seconds}s"
     command = [str(args.launcher), "--mode", "wired", "--duration", f"{seconds}s",
@@ -177,7 +211,7 @@ def stage_command(args: argparse.Namespace, seconds: int) -> list[str]:
 
 
 def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
-              children: list[subprocess.Popen]) -> int:
+              children: list[subprocess.Popen], preflight: dict | None = None) -> int:
     name = f"stage-{seconds}s"
     command = stage_command(args, seconds)
     (args.out / f"{name}-command.json").write_text(json.dumps(command, indent=2) + "\n")
@@ -210,6 +244,9 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
             print(f"{name} INTERRUPTED by {signal.Signals(stop.signum).name}: stage {outcome}",
                   flush=True)
             return 128 + stop.signum
+    if preflight is not None:  # informational: the ERR counters at the stage's end
+        preflight.setdefault("pipewire_err_counters", {})["end"] = host_counters(args)
+        (args.out / f"{name}-host-preflight.json").write_text(json.dumps(preflight, indent=2) + "\n")
     result = args.out / f"{name}-result.json"
     verdict = json.loads(result.read_text()).get("verdict") if result.exists() else None
     print(f"{name} END rc={process.returncode} verdict={verdict}", flush=True)
@@ -262,6 +299,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--display-env")
     parser.add_argument("--interval", type=int, default=5)
     parser.add_argument("--quiet-seconds", type=float, default=300)
+    parser.add_argument("--maintenance-wait-s", type=float,
+                        default=aa_host_preflight.DEFAULT_MAINTENANCE_WAIT_S,
+                        help="wait at most this long for apt/dpkg/PackageKit to finish before a "
+                             "stage (then BLOCKED; 0 = BLOCKED at once)")
+    parser.add_argument("--timer-margin-s", type=float, default=aa_host_preflight.DEFAULT_TIMER_MARGIN_S,
+                        help="refuse a stage if an apt timer elapses within its duration plus this")
     parser.add_argument("--launcher", type=Path, default=LAUNCHER, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
@@ -290,21 +333,43 @@ def _not_run(args: argparse.Namespace, stages: tuple[int, ...], reason: str) -> 
             json.dumps({"reason": reason}, indent=2) + "\n")
 
 
+def _preflight(args: argparse.Namespace, seconds: int, stop: StopFlag) -> tuple[int, dict]:
+    """(0, record) to run the stage; (3, record) BLOCKED; (128+signal, record) when stopped."""
+    name = f"stage-{seconds}s"
+    record = host_preflight(args, seconds, stop)
+    (args.out / f"{name}-host-preflight.json").write_text(json.dumps(record, indent=2) + "\n")
+    if stop:
+        return 128 + stop.signum, record
+    if record["verdict"] != "OK":
+        print(f"{name} BLOCKED: host preflight: " + "; ".join(record["reasons"]), flush=True)
+        return 3, record
+    print(f"{name} host preflight OK", flush=True)
+    return 0, record
+
+
 def _chain(args: argparse.Namespace, stop: StopFlag, children: list[subprocess.Popen]) -> int:
     if not wait_quiet(args.quiet_seconds, args.out / "pre-soak-idle.jsonl", sleep=stop.sleep) or stop:
         _not_run(args, STAGES, "chain interrupted before the first stage")
         return 128 + (stop.signum or signal.SIGTERM)
     print("PRE-SOAK IDLE PASS", flush=True)
     for index, seconds in enumerate(STAGES):
+        blocked_here, record = False, {}
         if stop:
             code = 128 + stop.signum
         elif builds():
             code = 3
             print(f"stage-{seconds}s BLOCKED: a build started before the stage", flush=True)
         else:
-            code = run_stage(args, seconds, stop, children)
+            code, record = _preflight(args, seconds, stop)
+            if code == 0:
+                code = run_stage(args, seconds, stop, children, record)
+            elif code == 3:
+                blocked_here = True
         if code != 0:
             interrupted = code > 128 and stop
+            if blocked_here:
+                _not_run(args, (seconds,), f"stage-{seconds}s BLOCKED by the host preflight: "
+                         + "; ".join(record["reasons"]))
             if interrupted:
                 _not_run(args, (seconds,), f"stage-{seconds}s interrupted "
                          f"({signal.Signals(stop.signum).name}); its stage was stopped")

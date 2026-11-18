@@ -137,7 +137,7 @@ def rank(sorted_values: Sequence[float], fraction: float) -> float:
 
 def evaluate(pairs: Sequence[tuple[int, float]], intervals: Iterable[tuple[int, int]],
              start_ns: int | None, end_ns: int | None, *, max_clause: str = "cap") -> dict:
-    """Judge pairs and audio intervals over [start_ns, end_ns].
+    """Judge pairs and audio intervals over the half-open window [start_ns, end_ns).
 
     Coverage, the 5 s window mean and p99 are always judged. The maximum is
     judged by ``max_clause``: "cap" (the drive smoke) is max |skew| <=
@@ -153,7 +153,7 @@ def evaluate(pairs: Sequence[tuple[int, float]], intervals: Iterable[tuple[int, 
         inside: list[tuple[int, float]] = []
         share = 0.0
     else:
-        inside = sorted((t, skew) for t, skew in pairs if start_ns <= t <= end_ns)
+        inside = sorted((t, skew) for t, skew in pairs if start_ns <= t < end_ns)
         share = coverage(intervals, start_ns, end_ns)
     skews = sorted(skew for _, skew in inside)
     magnitudes = sorted(abs(skew) for skew in skews)

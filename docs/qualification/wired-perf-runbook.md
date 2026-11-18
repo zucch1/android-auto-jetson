@@ -568,6 +568,41 @@ stays a FAIL. The chain stops there. The stage is not cut short: the collector
 records the same builds and its result is BLOCKED with the evidence, while
 killing the stage would lose that named result.
 
+**Host preflight (#154).** Before each stage the chain checks two host
+conditions that stalled the PipeWire Pulse server for ~400 ms in an 1800 s
+stage and so made its audio unqualifiable. It does not change a threshold; a
+host that fails a check cannot qualify audio, so the stage is not run. The
+code is `tools/perf/aa_host_preflight.py`; every check is a read-only
+`ps`/`systemctl` query, run on `--host` (locally when that is this machine,
+else over bounded key-only ssh).
+
+| Check | Reads | Result |
+| --- | --- | --- |
+| PipeWire real-time | `ps -L -o cls,rtprio,comm -p PID` for every `pipewire` and `pipewire-pulse` process of the user | Every `pw-data-loop` thread must be `RR` or `FF`. A process that is not running, has no data-loop thread, or has any other class (`TS` is SCHED_OTHER) is BLOCKED. |
+| Package maintenance | processes `apt`, `apt-get`, `dpkg`, `unattended-upgr(ades)`, `packagekitd`, `apt.systemd.dai(ly)`; `systemctl is-active apt-daily.service apt-daily-upgrade.service` | Transient, so the chain **waits** for it, up to `--maintenance-wait-s` (default 900 s; 0 = BLOCKED at once), then BLOCKED. |
+| apt timers | `systemctl show -p NextElapseUSecRealtime` for `apt-daily.timer` and `apt-daily-upgrade.timer` | An elapse at or before the stage's start + duration + `--timer-margin-s` (default 900 s: the launcher's setup and cleanup) is **refused**: BLOCKED, with the earliest safe start in the reason. It does not wait, because the wait could be hours. An overdue timer counts as inside; an unparsable or unreadable elapse is BLOCKED; a timer with no next elapse cannot fire. |
+
+A check that cannot be made (command failed) is BLOCKED, not skipped. A BLOCKED
+stage exits 3, writes `stage-<N>s-not-run.json` naming every reason
+(`host_audio:...`, `host_maintenance:...`) and the later stages get theirs.
+The host is expected to keep `zucchi` in the `pipewire` group (limits.d grants
+rtprio 95) and to pin the timers outside the stage window, as the owner has
+(`/etc/systemd/system/apt-daily*.timer.d/zz-aa-soak-window.conf`, 04:00 and
+04:30 daily, no random delay); the preflight only notices when that comes
+undone, it changes nothing.
+
+Each stage's record is `stage-<N>s-host-preflight.json` (schema
+`aa-host-preflight/1`): the scheduling rows, the maintenance state and how long
+the chain waited, the timers' elapses and the window used, and the verdict. It
+is a sidecar like `stage-<N>s-interference.json` because the capture is
+sha256-bound into the result and must not be edited. It also carries, informationally
+and never gated, the ERR counters of every PipeWire node from `pw-top -b -n 2`
+at the stage's start and end (`pipewire_err_counters.start` / `.end`: the
+receiver's streams, the `*_output.*` sinks and the nodes). Compare the two to
+see whether a host audio problem happened during the stage. Only the chain runs
+the preflight; a direct `aa-projection-perf.sh` invocation does not, so check
+the host by hand before one.
+
 The chain handles SIGTERM/SIGINT with a stop flag, as the drive smoke does.
 Each stage runs in its own local process group: the launcher and its local
 helpers. On a stop, the group gets TERM. The grace, `STOP_GRACE_S` (180 s),
@@ -693,6 +728,10 @@ tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" \
 From the development checkout (bounded ssh, fail-closed):
 
 ```bash
+# SOAK_MEDIA_COMPONENT is PKG/ACTIVITY playing $SOAK_MEDIA_URI (required: the
+# cleanup stops and verifies this player), e.g.
+# org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity.
+
 # Bound, read-only prerequisite check (safe to run anytime).
 tools/perf/aa-projection-perf.sh --readiness-only --out /tmp/task-32-readiness.json
 
@@ -700,12 +739,14 @@ tools/perf/aa-projection-perf.sh --readiness-only --out /tmp/task-32-readiness.j
 tools/perf/aa-projection-perf.sh --mode wired --duration 30m \
     --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
     --phone-serial "$SOAK_PHONE_SERIAL" --media-uri "$SOAK_MEDIA_URI" \
+    --media-component "$SOAK_MEDIA_COMPONENT" \
     --out /tmp/task-32-perf-30m.json --capture-out /tmp/task-32-capture-30m.json
 
 # Separate 2-hour soak run (fresh invocation; do not reuse the 30m capture).
 tools/perf/aa-projection-perf.sh --mode wired --duration 2h \
     --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
     --phone-serial "$SOAK_PHONE_SERIAL" --media-uri "$SOAK_MEDIA_URI" \
+    --media-component "$SOAK_MEDIA_COMPONENT" \
     --out /tmp/task-32-soak-2h.json --capture-out /tmp/task-32-capture-2h.json
 ```
 
