@@ -31,6 +31,9 @@ Env knobs for the test:
                          (BLOCKED), never fabricate a 0. Without the knob the
                          fields are absent and the collector keeps them null
                          -> BLOCKED (fail closed).
+  FAKE_RECEIVER_RAW_TELEMETRY  raw receiver lines (newline-separated) printed
+                         verbatim after ``active``, behind one healthy
+                         ``media_timing`` line.
   --require-usb-serial S emulates the receiver's same-phone pin (#137):
   FAKE_RECEIVER_ATTACHED_SERIAL (default S) is the phone on the port. A
   different one fails the first link (err code phone_serial_mismatch, exit 3,
@@ -99,7 +102,8 @@ def main() -> int:
     raw_telemetry = os.environ.get("FAKE_RECEIVER_RAW_TELEMETRY")
     if raw_telemetry is not None:
         print('{"event":"media_timing","av_sync_ms":12,"audio_latency_ms":40}', flush=True)
-        print(raw_telemetry, flush=True)
+        for line in raw_telemetry.split("\n"):  # one raw event per line
+            print(line, flush=True)
 
     start = time.monotonic()
     tick = 0

@@ -204,6 +204,89 @@
       "additionalProperties": {
         "$ref": "#/$defs/metric"
       },
+      "properties": {
+        "audio_catch_up_events": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/metric"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "events"
+                },
+                "gated": {
+                  "const": false
+                },
+                "status": {
+                  "const": "INFORMATIONAL"
+                },
+                "value": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "minimum": 0
+                }
+              }
+            }
+          ]
+        },
+        "audio_catch_up_frames": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/metric"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "frames"
+                },
+                "gated": {
+                  "const": false
+                },
+                "status": {
+                  "const": "INFORMATIONAL"
+                },
+                "value": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "minimum": 0
+                }
+              }
+            }
+          ]
+        },
+        "audio_catch_up_ms": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/metric"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "ms"
+                },
+                "gated": {
+                  "const": false
+                },
+                "status": {
+                  "const": "INFORMATIONAL"
+                },
+                "value": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "minimum": 0
+                }
+              }
+            }
+          ]
+        }
+      },
       "required": [
         "receiver_rss_peak_mb",
         "receiver_rss_mean_mb",

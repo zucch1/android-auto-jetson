@@ -474,7 +474,12 @@ class EventParser:
             "ipc_p95_added_latency_ms": None, "av_sync_ms": None, "audio_latency_ms": None,
             "audio_scheduling_skew_ms": None, "audio_stall_dropouts": 0,
             "audio_stall_dropped_chunks": 0, "audio_stall_unrecovered": 0,
+            "audio_catch_up_events": 0, "audio_catch_up_frames": 0, "audio_catch_up_ms": 0.0,
         }
+        # Catch-up loss (#154): frames per logged output rate, so the duration
+        # is exact; null once any event is malformed, since a partial sum
+        # would understate the loss.
+        self.catch_up_frames: dict[int, int] | None = {}
         self.stall_open = False
         self.stall_failed = 0
         self.video_units: int | None = None
@@ -509,6 +514,32 @@ class EventParser:
         self.last_audio_scheduled = -1
         self.last_video_scheduled = -1
         self.video_measurements = VideoMeasurements()
+
+    def _catch_up(self, event: dict) -> None:
+        """Account one ``audio_catch_up`` event (#154): router audio dropped at once.
+
+        A placement backlog past the catch-up watermark is trimmed to the drift
+        target in one run instead of 5 ms per run. It is neither a sink stall
+        nor an ``audio_stall_bypass``, so it never feeds the ``audio_stall_*``
+        counters. ``frames`` is the event's own increment, at ``rate`` output
+        frames per second, beyond the ordinary bounded drift trim; summing
+        increments (never ``frames_total``) survives the router counter reset
+        on a sink reopen. Frames and the event count stay separate units.
+        """
+        if self.catch_up_frames is None:
+            return
+        frames, rate = event.get("frames"), event.get("rate")
+        if not all(isinstance(value, int) and not isinstance(value, bool) and value > 0
+                   for value in (frames, rate)):
+            self.catch_up_frames = None
+            for key in ("audio_catch_up_events", "audio_catch_up_frames", "audio_catch_up_ms"):
+                self.metrics[key] = None
+            return
+        self.catch_up_frames[rate] = self.catch_up_frames.get(rate, 0) + frames
+        self.metrics["audio_catch_up_events"] = int(self.metrics["audio_catch_up_events"]) + 1
+        self.metrics["audio_catch_up_frames"] = int(self.metrics["audio_catch_up_frames"]) + frames
+        self.metrics["audio_catch_up_ms"] = round(
+            sum(count * 1000 / hz for hz, count in self.catch_up_frames.items()), 6)
 
     def _record_progress(self, keys: tuple[str, ...], stamp: int) -> None:
         for key in keys:
@@ -743,6 +774,8 @@ class EventParser:
                 int(self.metrics["audio_stall_dropped_chunks"] or 0) + lost)
         if envelope == "audio_stall_bypass":
             self.metrics["audio_stall_unrecovered"] = self.stall_failed + int(self.stall_open)
+        if envelope == "audio_catch_up":
+            self._catch_up(event)
         if envelope == "video_sent" and isinstance(event.get("units"), int):
             self.video_units = event["units"]
         if envelope == "audio_chunks" and isinstance(event.get("count"), int):

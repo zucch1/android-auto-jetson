@@ -133,6 +133,49 @@ def _as_int(value: object) -> int | None:
     return value
 
 
+CATCH_UP_METRICS = ("audio_catch_up_events", "audio_catch_up_frames", "audio_catch_up_ms")
+
+
+def _catch_up_metrics(events: dict) -> dict:
+    """Informational catch-up loss (#154), never gated and never a stall dropout.
+
+    The wired receiver drops a placement backlog past its 90 ms catch-up
+    watermark in one run (``audio_catch_up``); the A/V metrics cannot see it
+    (they measure from the placed slot), so the loss is reported on its own.
+    A v3 capture recorded before the event existed carries none of the three
+    keys and reports null; a capture carrying only some, or values that are
+    negative or disagree about whether any catch-up happened, is malformed.
+    """
+    present = [name in events for name in CATCH_UP_METRICS]
+    if any(present) and not all(present):
+        raise ContractError("capture.events must carry all or none of " + ", ".join(CATCH_UP_METRICS))
+    count = _as_int(events.get("audio_catch_up_events"))
+    frames = _as_int(events.get("audio_catch_up_frames"))
+    duration = _as_float(events.get("audio_catch_up_ms"))
+    values = (count, frames, duration)
+    if any(value is not None and value < 0 for value in values):
+        raise ContractError("catch-up counters must be nonnegative")
+    if None not in values and len({value == 0 for value in values}) != 1:
+        raise ContractError("catch-up events, frames and ms must agree on whether any catch-up happened")
+    return {
+        "audio_catch_up_events": _metric(
+            count, "events",
+            note="audio_catch_up events (#154): render steps that dropped a placement backlog past "
+                 "the 90 ms catch-up watermark; not sink stalls, so never in audio_stall_*",
+        ),
+        "audio_catch_up_frames": _metric(
+            frames, "frames",
+            note="output-rate frames catch-up dropped beyond the ordinary bounded (5 ms per run) "
+                 "drift trim; each run's ordinary drift-trim allowance is not included",
+        ),
+        "audio_catch_up_ms": _metric(
+            duration, "ms",
+            note="audio_catch_up_frames as audio duration at the logged output rate: audio the "
+                 "phone sent that is never played, invisible to the A/V metrics",
+        ),
+    }
+
+
 def _metric(
     value: float | None,
     unit: str,
@@ -349,6 +392,9 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         ),
         "thermal_peak_c": _metric(values["thermal_peak_c"], "C"),
     }
+
+    if version3:
+        metrics.update(_catch_up_metrics(events))
 
     av_block = None
     if version3:

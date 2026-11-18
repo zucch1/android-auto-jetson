@@ -216,6 +216,7 @@ class ObservedSessionMutex {
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <regex>
 #include <sstream>
 #include <tuple>
 #include <unistd.h>
@@ -5922,10 +5923,75 @@ TEST(WiredReceiver, WorkerStallBurstCatchesUpInsteadOfEndingTheSession) {
     const auto report = audio.final_report();
     ASSERT_TRUE(report);
     EXPECT_FALSE(report->render_failure);
+    // The qualification collector sums each event's own increment at its
+    // logged rate (#154 review): together they account every catch-up frame.
+    const std::regex catch_up{
+        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000\})"};
+    std::uint64_t logged{};
+    std::uint64_t last_total{};
+    std::size_t events{};
+    for (auto it = std::sregex_iterator(output.begin(), output.end(), catch_up); it != std::sregex_iterator{}; ++it) {
+        logged += std::stoull((*it)[1].str());
+        last_total = std::stoull((*it)[2].str());
+        ++events;
+    }
+    EXPECT_GT(events, 0U) << output;
+    EXPECT_EQ(logged, report->stats.frames_caught_up) << output;
+    EXPECT_EQ(last_total, report->stats.frames_caught_up) << output;
     // The resumed chunk is written whole, at most 90 ms + one chunk behind its arrival.
     std::lock_guard lock(gate->mutex);
     ASSERT_FALSE(gate->timestamps.empty());
     EXPECT_EQ(gate->pcm.back(), pcm);
+    EXPECT_LE(gate->timestamps.back().count, arrival + 100'000'000 + 90'000'000);
+}
+
+// Guidance in its production format (16 kHz mono, resampled to the 48 kHz
+// output) takes the same catch-up path: a prompt burst after a sink stall is
+// trimmed instead of pushing the resumed arrival past the 200 ms late cap.
+TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    const auto config = pcm_router_config();
+    const auto guidance_format =
+        config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format;
+    ASSERT_EQ(guidance_format, (aa::audio::AudioFormat{16000, 1, 16}));
+    ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto role = aa::protocol::ChannelRole::guidance_audio;
+    const std::vector<std::byte> pcm(2048, std::byte{1}); // 1024 mono frames: 64 ms at 16 kHz
+    const auto arrival = steady_ns();
+    for (std::uint64_t sequence = 1; sequence <= 16; ++sequence) {
+        ASSERT_TRUE(audio.submit({{role, sequence, {arrival}}, pcm}, {role, 0, sequence, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        ASSERT_FALSE(audio.failure()) << sequence;
+    }
+    ASSERT_TRUE(audio.submit({{role, 17, {arrival + 100'000'000}}, pcm}, {role, 0, 17, 7}));
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    const bool failed = audio.failure().has_value();
+    const bool finished = audio.finish().has_value();
+    const auto output = capture.release();
+    ASSERT_FALSE(failed) << output;
+    ASSERT_TRUE(finished) << output;
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    EXPECT_FALSE(report->render_failure);
+    // Logged at the 48 kHz output rate, never the 16 kHz input rate.
+    const std::regex catch_up{
+        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000\})"};
+    std::uint64_t logged{};
+    std::size_t events{};
+    for (auto it = std::sregex_iterator(output.begin(), output.end(), catch_up); it != std::sregex_iterator{}; ++it) {
+        logged += std::stoull((*it)[1].str());
+        ++events;
+    }
+    EXPECT_GT(events, 0U) << output;
+    EXPECT_GT(report->stats.frames_caught_up, 0U);
+    EXPECT_EQ(logged, report->stats.frames_caught_up) << output;
+    std::lock_guard lock(gate->mutex);
+    ASSERT_FALSE(gate->timestamps.empty());
     EXPECT_LE(gate->timestamps.back().count, arrival + 100'000'000 + 90'000'000);
 }
 
