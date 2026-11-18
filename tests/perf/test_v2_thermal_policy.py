@@ -191,6 +191,18 @@ def test_budget_and_terminal_failures_still_fail() -> None:
         assert result(raw)["verdict"] == "FAIL", fault
 
 
+def not_qualifying(doc: dict) -> bool:
+    """BLOCKED, or (v3) a FAIL whose only violations are signed A/V metrics.
+
+    Collector fixtures emit no continuous audio, so under the v3 contract their
+    A/V coverage is a measured FAIL (#137); every other gate must still behave
+    exactly as it did under v2.
+    """
+    return doc["verdict"] == "BLOCKED" or (
+        doc["verdict"] == "FAIL" and bool(doc["violations"])
+        and all(v["metric"].startswith("av_") for v in doc["violations"]))
+
+
 def test_collector_discloses_policy_and_latches_disappearing_cv_inventory() -> None:
     # Given approved hardware and otherwise continuous progress on the existing virtual clock.
     clock, logs = [0], []
@@ -228,7 +240,7 @@ def test_collector_discloses_policy_and_latches_disappearing_cv_inventory() -> N
     assert raw["thermal_policy"] == POLICY
     assert len(coverage.parse_capture(json.loads(json.dumps(raw))).samples[1].thermal_zones) == 9
     assert "thermal_inventory_changed" in raw["invalid_telemetry"]
-    assert result(json.loads(json.dumps(raw)))["verdict"] == "BLOCKED"
+    assert not_qualifying(result(json.loads(json.dumps(raw))))
 
 
 def test_export_cannot_relabel_nano_as_strict_or_erase_availability() -> None:

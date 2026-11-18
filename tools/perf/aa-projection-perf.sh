@@ -13,6 +13,10 @@
 #   --phone-serial SERIAL (or AA_PHONE_SERIAL): a passing
 #   tools/wired-qa/aa_drive_smoke.py result from that same phone, attached on
 #   --port, for the same binaries and the default configuration (#137).
+#   Every live stage drives the moving-map workload and needs --media-uri URI
+#   and --media-component PKG/ACTIVITY (the player the cleanup stops and
+#   verifies; optional --media-type, --geo-uri): media for the whole stage,
+#   Google Maps dragged once a second (tools/perf/aa_moving_map.py).
 #
 # This tool measures CPU/RSS, thermal state, frame drops, decode/IPC timing,
 # A/V sync and audio latency during wired projection on the qualified Jetson,
@@ -55,7 +59,6 @@ set -euo pipefail
 
 TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PYTHON:-python3}"
-SCHEMA="$TOOL_DIR/aa-projection-perf-v2.schema.json"
 REPORTER="$TOOL_DIR/aa_perf_report.py"
 
 MODE=""
@@ -79,11 +82,15 @@ ALLOW_UNOPTIMIZED=0
 DISPLAY_ENV="${AA_DISPLAY_ENV:-}"
 DRIVE_SMOKE="${AA_DRIVE_SMOKE:-}"
 PHONE_SERIAL="${AA_PHONE_SERIAL:-}"
+MEDIA_URI="${AA_MEDIA_URI:-}"
+MEDIA_TYPE="${AA_MEDIA_TYPE:-}"
+MEDIA_COMPONENT="${AA_MEDIA_COMPONENT:-}"
+GEO_URI="${AA_GEO_URI:-}"
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 
 usage() {
-    sed -n '6,15p' "$0"
+    sed -n '6,18p' "$0"
     exit 2
 }
 
@@ -128,6 +135,10 @@ while (($# > 0)); do
         --display-env) require_value "$@"; DISPLAY_ENV="$2"; shift 2 ;;
         --drive-smoke) require_value "$@"; DRIVE_SMOKE="$2"; shift 2 ;;
         --phone-serial) require_value "$@"; PHONE_SERIAL="$2"; shift 2 ;;
+        --media-uri) require_value "$@"; MEDIA_URI="$2"; shift 2 ;;
+        --media-type) require_value "$@"; MEDIA_TYPE="$2"; shift 2 ;;
+        --media-component) require_value "$@"; MEDIA_COMPONENT="$2"; shift 2 ;;
+        --geo-uri) require_value "$@"; GEO_URI="$2"; shift 2 ;;
         --allow-unoptimized-build) ALLOW_UNOPTIMIZED=1; shift ;;
         --now) require_value "$@"; NOW="$2"; shift 2 ;;
         --readiness-only) READINESS_ONLY=1; shift ;;
@@ -283,7 +294,9 @@ import json, os, sys
 build_type = os.environ.get("AA_BLOCK_BUILD_TYPE") or None
 build_dir = os.environ.get("AA_BLOCK_BUILD_DIR") or None
 doc = {
-    "schema": "aa-projection-perf-capture/2",
+    "schema": "aa-projection-perf-capture/3",
+    "av_series": {"pair_t_ns": [], "pair_skew_ns": [], "audio_intervals_ns": []},
+    "workload": {"kind": "none"},
     "monotonic_origin_ns": 0,
     "cpu_ticks_per_second": 1,
     "video_evidence": {"blocks": [], "ipc_latency_ns": [], "decode_latency_ns": []},
@@ -308,8 +321,10 @@ PY
     return 3
 }
 
+# Each result is validated against its own version's schema (a v2 capture
+# replays to a v2 result; live stages produce v3).
 validate_result() {
-    "$PY" -B "$TOOL_DIR/aa_perf_schema.py" validate "$SCHEMA" "$OUT" >/dev/null
+    "$PY" -B "$TOOL_DIR/aa_perf_schema.py" validate-auto "$OUT" >/dev/null
 }
 
 # ---- readiness-only --------------------------------------------------------
@@ -371,6 +386,26 @@ if [[ -z "$duration_secs" ]]; then
     echo "usage error: --duration is required for a live run" >&2
     exit 2
 fi
+# The soak workload (#137): every live stage drags a moving map with media
+# playing for the whole stage. The values reach the remote collector inside
+# single quotes, so they may not contain one.
+if [[ -z "$MEDIA_URI" ]]; then
+    echo "usage error: --media-uri is required for a live stage (moving-map workload)" >&2
+    exit 2
+fi
+# The player must be known to be stopped after the stage (its package is the
+# component's PKG part): without it the restore cannot be verified.
+if [[ ! "$MEDIA_COMPONENT" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+/[A-Za-z0-9_.$]+$ ]]; then
+    echo "usage error: --media-component PKG/ACTIVITY is required for a live stage, so the" \
+         "media player can be stopped and verified after it (got '${MEDIA_COMPONENT}')" >&2
+    exit 2
+fi
+for value in "$MEDIA_URI" "$MEDIA_TYPE" "$MEDIA_COMPONENT" "$GEO_URI"; do
+    if [[ "$value" == *"'"* ]]; then
+        echo "usage error: --media-uri/--media-type/--media-component/--geo-uri must not contain a single quote" >&2
+        exit 2
+    fi
+done
 
 if ! check_readiness; then
     echo "BLOCKED: ${ready_reason}" >&2
@@ -473,21 +508,123 @@ import pathlib, sys
 root = pathlib.Path(sys.argv[1])
 collector = (root / "aa_projection_collect.py").read_text()
 print("import sys, types")
-for name in ("aa_measurement_coverage", "aa_video_measurements", "aa_build_guard"):
+for name in ("aa_measurement_coverage", "aa_video_measurements", "aa_build_guard", "aa_moving_map"):
     source = (root / (name + ".py")).read_text()
     print("module = types.ModuleType(" + repr(name) + ")")
     print("sys.modules[module.__name__] = module")
     print("exec(" + repr(source) + ", module.__dict__)")
 print("exec(compile(" + repr(collector) + ", 'aa_projection_collect.py', 'exec'))")
 PY
-collector_timeout=$((duration_secs + 120))
+# The collector's ssh is bounded by three explicit budgets (#137):
+# - startup: ssh connect (10 s), the phone setup (four adb commands bounded at
+#   20 s each plus 7 s of waits, ~87 s) and the receiver/display startup
+#   (the collector's own 60 s bound): ~157 s, so 180 s;
+# - measurement: the requested window plus the collector's sampling overshoot
+#   (one interval, <= 5 s) and its log grace for a frozen collector (5 s),
+#   so duration + 30 s;
+# - cleanup: the stimulus join (<= 47 s), the display and receiver
+#   terminations (5 s + KILL each, ~20 s) and the phone restore
+#   (aa_moving_map.RESTORE_BUDGET_S = 90 s, media stop and USB switch
+#   included): ~157 s, so 240 s.
+# Whatever ends the collector (a normal exit, a refusal, this timeout, a
+# dropped link), remote_stop then confirms the target: it stops a collector
+# that is still running and relays its cleanup report (aa_remote_stop.sh).
+COLLECTOR_STARTUP_BUDGET_S=180
+COLLECTOR_MEASUREMENT_SLACK_S=30
+COLLECTOR_CLEANUP_BUDGET_S=240
+collector_timeout=$((COLLECTOR_STARTUP_BUDGET_S + duration_secs + COLLECTOR_MEASUREMENT_SLACK_S
+                     + COLLECTOR_CLEANUP_BUDGET_S))
 blocked_type=""
-if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port '${PORT}' \
+# A stop (TERM/INT, e.g. from tools/perf/aa_soak_chain.py) must reach the
+# collector on the target: ending this side's ssh client does not signal a
+# non-PTY remote command. The collector records its run in RUN_FILE on the
+# target; on a stop, a separate ssh runs aa_remote_stop.sh, which TERMs it and
+# waits for its acknowledgement (the run file removed after cleanup and phone
+# restore), else KILLs the recorded processes and restores the phone itself.
+run_id="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+RUN_FILE="/tmp/aa-perf-run-${run_id}"
+REMOTE_STOP_ACK_S="${AA_REMOTE_STOP_ACK_S:-30}"
+# The stop's ssh is bounded strictly above the script's own worst case
+# (aa_remote_stop.sh --worst-case: appearance + acknowledgement + group waits +
+# restore budget + report), by the ssh connect timeout (10 s) plus 5 s.
+REMOTE_STOP_SSH_MARGIN_S=15
+# Both long ssh calls are hard-bounded: TERM at their limit, KILL this much later.
+SSH_KILL_GRACE_S=5
+remote_stop_line="" remote_stop_rc=0
+# remote_stop APPEAR_SECONDS: run aa_remote_stop.sh on the target. Its one-line
+# outcome goes to stderr and remote_stop_line; remote_stop_rc is nonzero when it
+# could not confirm the target clean (a failure it reported, or no answer).
+remote_stop() {
+    local out="$BUFFER/remote-stop.out"
+    local worst
+    remote_stop_rc=0
+    worst="$(bash "$TOOL_DIR/aa_remote_stop.sh" --worst-case "$REMOTE_STOP_ACK_S" "$1")"
+    timeout -k "$SSH_KILL_GRACE_S" $((worst + REMOTE_STOP_SSH_MARGIN_S)) ssh "${SSH_OPTS[@]}" "$HOST" \
+        "bash -s -- '${RUN_FILE}' ${REMOTE_STOP_ACK_S} $1" <"$TOOL_DIR/aa_remote_stop.sh" \
+        >"$out" 2>&1 || remote_stop_rc=$?
+    remote_stop_line="$(grep -m1 '^remote-stop: ' "$out" || echo "remote-stop: no answer (rc ${remote_stop_rc})")"
+    [[ "$remote_stop_line" == "remote-stop: no answer"* ]] && remote_stop_rc=$((remote_stop_rc ? remote_stop_rc : 1))
+    echo "$remote_stop_line" >&2
+    ((remote_stop_rc == 0)) || echo "remote cleanup: the remote stop reported a failure (rc ${remote_stop_rc})" >&2
+}
+stop_signal=""
+trap 'stop_signal=TERM' TERM
+trap 'stop_signal=INT' INT
+# Monotonic seconds (wall-clock steps never move /proc/uptime).
+monotonic_s() { local up _rest; read -r up _rest </proc/uptime; printf '%s\n' "${up%%.*}"; }
+collector_started_s="$(monotonic_s)"
+timeout -k "$SSH_KILL_GRACE_S" "$collector_timeout" ssh "${SSH_OPTS[@]}" "$HOST" "${REMOTE_ENV} python3 - --receiver '${RECEIVER}' --port '${PORT}' \
         --duration-seconds ${duration_secs} --interval ${INTERVAL} \
         ${THERMAL_POLICY:+--thermal-policy '${THERMAL_POLICY}'} \
         ${DISPLAY_BIN:+--display '${DISPLAY_BIN}'} ${STORE:+--store '${STORE}'}${build_args_remote} \
-        ${verified_serial:+--phone-serial '${verified_serial}'}" \
-        <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err"; then
+        ${verified_serial:+--phone-serial '${verified_serial}'} \
+        --workload moving-map --media-uri '${MEDIA_URI}' ${MEDIA_TYPE:+--media-type '${MEDIA_TYPE}'} \
+        ${MEDIA_COMPONENT:+--media-component '${MEDIA_COMPONENT}'} ${GEO_URI:+--geo-uri '${GEO_URI}'} \
+        --run-file '${RUN_FILE}'" \
+        <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err" &
+collector_job=$!
+collector_rc=0
+while :; do
+    set +e
+    wait "$collector_job"
+    collector_rc=$?
+    set -e
+    [[ -n "$stop_signal" ]] && break
+    kill -0 "$collector_job" 2>/dev/null || break
+done
+if [[ -n "$stop_signal" ]]; then
+    trap '' TERM INT  # the stop itself is not interrupted
+    echo "stopping: ${stop_signal}; stopping the collector on ${HOST}" >&2
+    remote_stop 15  # the collector may still be starting
+    # The remote command has ended (or was killed): drop the local client.
+    kill -TERM "$collector_job" 2>/dev/null || true
+    wait "$collector_job" 2>/dev/null || true
+    [[ "$stop_signal" == INT ]] && exit 130
+    exit 143
+fi
+trap - TERM INT
+# GNU timeout exits 137, not 124, when its KILL grace expires because the ssh
+# client ignored TERM. That is still the ssh bound expiring: classify it as one.
+if ((collector_rc == 137 && $(monotonic_s) - collector_started_s >= collector_timeout)); then
+    collector_rc=124
+fi
+# The collector has ended, however it ended. A timeout (124) or a dropped link
+# can leave it, its receiver/display and the phone running on the target:
+# confirm the target either way (a finished run only has its report relayed).
+if ((collector_rc == 124)); then
+    echo "collector: the ssh bound of ${collector_timeout} s expired; stopping the collector on ${HOST}" >&2
+fi
+remote_stop 0
+# A stage whose target cleanup is not confirmed is never a PASS.
+cleanup_suffix=""
+((remote_stop_rc == 0)) || cleanup_suffix=",remote_cleanup_unconfirmed"
+if ((collector_rc == 124)); then
+    echo "BLOCKED: collector_timeout" >&2
+    sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
+    blocked_result "collector_timeout${cleanup_suffix}" "" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+    exit 3
+fi
+if ((collector_rc != 0)); then
     # The on-target collector refuses to start a stage from an unoptimized build
     # or from binaries another build produced; report each as its own BLOCKED
     # reason, never a generic failure.
@@ -495,7 +632,7 @@ if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port
     if grep -q '^error: build_dir_mismatch:' "$BUFFER/collector.err"; then
         echo "BLOCKED: build_dir_mismatch" >&2
         sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-        blocked_result "build_dir_mismatch" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        blocked_result "build_dir_mismatch${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
         exit 3
     fi
     # The receiver saw another phone than the gate verified, at the first link
@@ -503,18 +640,27 @@ if ! remote_long "$collector_timeout" "python3 - --receiver '${RECEIVER}' --port
     if grep -q '^error: phone_identity_mismatch:' "$BUFFER/collector.err"; then
         echo "BLOCKED: phone_identity_mismatch" >&2
         sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-        blocked_result "phone_identity_mismatch" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        blocked_result "phone_identity_mismatch${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        exit 3
+    fi
+    # A required phone command (USB reset, wake, media or Maps launch) failed
+    # before the stage started: the harness never set up the moving map, so
+    # nothing was measured (#137).
+    if grep -q '^error: phone_setup_failed:' "$BUFFER/collector.err"; then
+        echo "BLOCKED: phone_setup_failed" >&2
+        sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
+        blocked_result "phone_setup_failed${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
         exit 3
     fi
     if grep -q '^error: unoptimized_build:' "$BUFFER/collector.err"; then
         echo "BLOCKED: unoptimized_build" >&2
         sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-        blocked_result "unoptimized_build" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+        blocked_result "unoptimized_build${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
         exit 3
     fi
     echo "BLOCKED: collector_failed" >&2
     sed -n '1,20p' "$BUFFER/collector.err" >&2 || true
-    blocked_result "collector_failed" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+    blocked_result "collector_failed${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
 fi
 # The collector writes the build record it verified to stderr; keep those lines
@@ -525,7 +671,16 @@ if [[ -s "$BUFFER/collector.err" ]]; then
 fi
 if [[ ! -s "$capture_file" ]]; then
     echo "BLOCKED: collector_produced_no_capture" >&2
-    blocked_result "collector_produced_no_capture" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+    blocked_result "collector_produced_no_capture${cleanup_suffix}" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
+    exit 3
+fi
+if ((remote_stop_rc != 0)) && [[ "$remote_stop_line" != *"finished with cleanup failures"* ]]; then
+    # The collector exited 0 with a capture, but the target could not be
+    # confirmed clean (a run still recorded, no answer): BLOCKED. A finished
+    # run's own cleanup failures are in its capture, and the reporter BLOCKS
+    # them by name (cleanup:*).
+    echo "BLOCKED: remote_cleanup_unconfirmed (${remote_stop_line})" >&2
+    blocked_result "remote_cleanup_unconfirmed" "$blocked_type" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
 fi
 if [[ -n "$CAPTURE_OUT" ]]; then

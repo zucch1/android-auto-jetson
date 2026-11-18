@@ -41,7 +41,16 @@ from datetime import datetime
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-DEFAULT_SCHEMA = _HERE / "aa-projection-perf-v2.schema.json"
+DEFAULT_SCHEMA = _HERE / "aa-projection-perf-v2.schema.json"  # historical v2 results
+SCHEMA_V3 = _HERE / "aa-projection-perf-v3.schema.json"  # signed A/V contract (#137)
+SCHEMAS = {"aa-projection-perf/2": DEFAULT_SCHEMA, "aa-projection-perf/3": SCHEMA_V3}
+
+
+def schema_for(version: object) -> Path:
+    """The schema file of a result document's own version (v2 stays v2)."""
+    if version not in SCHEMAS:
+        raise SchemaError(f"unknown result schema version: {version!r}")
+    return SCHEMAS[version]
 
 # Keywords this validator understands. Any other keyword is a hard error.
 _KNOWN_KEYWORDS = frozenset(
@@ -262,8 +271,9 @@ def validate(instance: object, schema: dict, root: dict | None = None) -> list[s
         raise SchemaError("schema must be a JSON object")
     _, numeric_errors = finite_numbers(instance)
     errors = numeric_errors + _validate(instance, schema, root if root is not None else schema, "$", 0)
-    if (not errors and isinstance(instance, dict) and instance.get("schema") == "aa-projection-perf/2"
-            and schema.get("properties", {}).get("schema", {}).get("const") == "aa-projection-perf/2"):
+    version = instance.get("schema") if isinstance(instance, dict) else None
+    if (not errors and version in SCHEMAS
+            and schema.get("properties", {}).get("schema", {}).get("const") == version):
         from aa_measurement_coverage import CoverageError, parse_coverage, validate_thermal_export
         try:
             coverage = parse_coverage(instance.get("measurement_coverage"))
@@ -316,6 +326,7 @@ def _cli(argv: list[str]) -> int:
         print(__doc__.splitlines()[0], file=sys.stderr)
         print("usage: aa_perf_schema.py validate <schema> <document>", file=sys.stderr)
         print("       aa_perf_schema.py validate-default <document>", file=sys.stderr)
+        print("       aa_perf_schema.py validate-auto <document>", file=sys.stderr)
         return 2
     command = argv[0]
     if command == "validate":
@@ -328,6 +339,16 @@ def _cli(argv: list[str]) -> int:
             print("usage: aa_perf_schema.py validate-default <document>", file=sys.stderr)
             return 2
         schema_path, document_path = DEFAULT_SCHEMA, Path(argv[1])
+    elif command == "validate-auto":
+        if len(argv) != 2:
+            print("usage: aa_perf_schema.py validate-auto <document>", file=sys.stderr)
+            return 2
+        document_path = Path(argv[1])
+        try:
+            schema_path = schema_for(json.loads(document_path.read_text(encoding="utf-8")).get("schema"))
+        except (OSError, json.JSONDecodeError, AttributeError, SchemaError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     else:
         print(f"unknown command: {command}", file=sys.stderr)
         return 2

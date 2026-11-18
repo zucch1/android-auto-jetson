@@ -22,8 +22,16 @@ event-derived observations. This reporter:
   claims otherwise is rejected,
 * records ``helper_rss_mb`` as ``null`` (the wired path does not require the
   helper before todo 34); a non-null value is rejected,
-* validates the document it produced against ``aa-projection-perf-v2.schema.json``
-  before writing it, so the tool can never emit an off-schema document.
+* validates the document it produced against its version's schema before
+  writing it, so the tool can never emit an off-schema document.
+
+Versions (#137): a capture ``aa-projection-perf-capture/2`` reports to an
+``aa-projection-perf/2`` result under the historical budgets (``BUDGETS_V2``:
+A/V max <= 50 ms), byte-for-byte the contract it was measured under, so history
+is never reinterpreted. A capture ``/3`` (with ``av_series``) reports to an
+``aa-projection-perf/3`` result under ``BUDGETS``: the signed A/V contract of
+tools/perf/aa_av_contract.py over the replayed active window, and, live, the
+moving-map workload.
 
 Exit: 0 PASS, 1 FAIL (budget violation), 3 BLOCKED (prerequisite/metric
 unavailable), 2 usage or I/O error, 4 internal contract violation.
@@ -43,6 +51,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aa_perf_schema  # noqa: E402
+import aa_av_contract as av_contract  # noqa: E402
+from aa_moving_map import MAX_DRAG_GAP_S, MIN_DRAG_RATE_HZ, cleanup_gaps, max_drag_gap_s  # noqa: E402
 from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Window, coverage_gaps, coverage_to_json, parse_capture, reduce_capture,
 )
@@ -50,8 +60,12 @@ from aa_projection_collect import ProjectionProgress
 from aa_build_guard import is_optimized
 
 TASK = "32. Measure wired performance and two-hour soak"
-SCHEMA_VERSION = "aa-projection-perf/2"
-CAPTURE_SCHEMA = "aa-projection-perf-capture/2"
+SCHEMA_VERSION = "aa-projection-perf/3"
+CAPTURE_SCHEMA = "aa-projection-perf-capture/3"
+# Historical v2: replayed under its own contract, never promoted or relabelled.
+SCHEMA_VERSION_V2 = "aa-projection-perf/2"
+CAPTURE_SCHEMA_V2 = "aa-projection-perf-capture/2"
+RESULT_FOR_CAPTURE = {CAPTURE_SCHEMA_V2: SCHEMA_VERSION_V2, CAPTURE_SCHEMA: SCHEMA_VERSION}
 # Marker recorded on a run the build guard admitted only through its debugging
 # override: the measured values stay visible, the run is never a PASS.
 NOT_QUALIFYING_UNOPTIMIZED = "NOT_QUALIFYING: unoptimized_build"
@@ -60,7 +74,26 @@ EVENT_METRICS = ("frame_drops", "decode_p50_ms", "decode_p95_ms", "decode_fps",
 
 # Contractual budgets (plan "Contract budgets" line + task-32 acceptance).
 # Do NOT edit to make a run pass.
+# BUDGETS is the current (v3) contract: the signed A/V contract replaces the
+# A/V max <= 50 ms budget (owner decision 2026-11-16; aa_av_contract.py). Its
+# maximum is the soak rate rule (owner decision 2026-11-17): at most one pair
+# over 90 ms per 1800 s of active window, none over 150 ms.
 BUDGETS = {
+    "receiver_rss_mb_max": 250.0,
+    "receiver_cpu_pct_one_core_max": 50.0,
+    "av_window_mean_abs_ms_max": av_contract.AV_MEAN_MAX_ABS_MS,
+    "av_p99_abs_ms_max": av_contract.AV_P99_ABS_MAX_MS,
+    "av_excursion_ms": av_contract.AV_SOAK_EXCURSION_MS,
+    "av_excursions_per_s": av_contract.AV_SOAK_EXCURSIONS_PER_S,
+    "av_hard_cap_ms": av_contract.AV_SOAK_HARD_CAP_MS,
+    "av_coverage_pct_min": av_contract.AV_COVERAGE_MIN * 100,
+    "audio_latency_ms_max": 200.0,
+    "rss_growth_pct_max": 10.0,  # strict: growth must be < 10 %
+    "crashes_max": 0,
+    "helper_rss_mb_max": 32.0,
+}
+# The historical v2 contract, applied only to v2 captures (never edit).
+BUDGETS_V2 = {
     "receiver_rss_mb_max": 250.0,
     "receiver_cpu_pct_one_core_max": 50.0,
     "av_sync_ms_max": 50.0,
@@ -105,6 +138,7 @@ def _metric(
     unit: str,
     *,
     budget_max: float | None = None,
+    budget_min: float | None = None,
     op: str = "le",
     gated: bool = False,
     status: str | None = None,
@@ -118,7 +152,10 @@ def _metric(
         elif value is None:
             status = "UNAVAILABLE"
         else:
-            failed = value > budget_max if op == "le" else value >= budget_max
+            if op == "ge":
+                failed = value < budget_min
+            else:
+                failed = value > budget_max if op == "le" else value >= budget_max
             status = "FAIL" if failed else "PASS"
     entry: dict = {
         "value": value,
@@ -127,6 +164,8 @@ def _metric(
         "gated": gated,
         "status": status,
     }
+    if budget_min is not None:
+        entry["budget_min"] = budget_min
     if op != "le":
         entry["op"] = op
     if note is not None:
@@ -216,8 +255,10 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                  blocked_on_override: str | None = None) -> dict:
     if not isinstance(capture, dict):
         raise ContractError("capture must be a JSON object")
-    if capture.get("schema") != CAPTURE_SCHEMA:
+    if capture.get("schema") not in RESULT_FOR_CAPTURE:
         raise ContractError(f"unexpected capture schema: {capture.get('schema')!r}")
+    version3 = capture["schema"] == CAPTURE_SCHEMA
+    budgets = BUDGETS if version3 else BUDGETS_V2
     evidence = parse_capture(capture)
     capture, numeric_errors = aa_perf_schema.finite_numbers(capture)
     if capture.get("mode") != "wired":
@@ -254,30 +295,34 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
 
     metrics = {
         "receiver_rss_peak_mb": _metric(
-            values["receiver_rss_peak_mb"], "MB", budget_max=BUDGETS["receiver_rss_mb_max"], gated=True
+            values["receiver_rss_peak_mb"], "MB", budget_max=budgets["receiver_rss_mb_max"], gated=True
         ),
         "receiver_rss_mean_mb": _metric(values["receiver_rss_mean_mb"], "MB"),
         "receiver_cpu_sustained_pct_one_core": _metric(
             values["receiver_cpu_sustained_pct_one_core"], "% of one core",
-            budget_max=BUDGETS["receiver_cpu_pct_one_core_max"], gated=True,
+            budget_max=budgets["receiver_cpu_pct_one_core_max"], gated=True,
         ),
         "receiver_cpu_peak_pct_one_core": _metric(values["receiver_cpu_peak_pct_one_core"], "% of one core"),
         "rss_growth_pct": _metric(
-            values["rss_growth_pct"], "%", budget_max=BUDGETS["rss_growth_pct_max"], op="lt", gated=True
+            values["rss_growth_pct"], "%", budget_max=budgets["rss_growth_pct_max"], op="lt", gated=True
         ),
-        "av_sync_ms": _metric(
-            _as_float(events.get("av_sync_ms")), "ms", budget_max=BUDGETS["av_sync_ms_max"],
+        "av_sync_ms": (_metric(
+            _as_float(events.get("av_sync_ms")), "ms", budget_max=budgets["av_sync_ms_max"],
             gated=True,
-        ),
+        ) if not version3 else _metric(
+            _as_float(events.get("av_sync_ms")), "ms",
+            note="run-cumulative max |skew| through the measurement cutoff; v3 gates the "
+                 "signed contract (av_window_mean_abs_ms, av_p99_abs_ms, av_excursions, av_hard_cap_pairs, "
+                 "av_coverage_pct) instead")),
         "audio_latency_ms": _metric(
             _as_float(events.get("audio_latency_ms")), "ms",
-            budget_max=BUDGETS["audio_latency_ms_max"], gated=True,
+            budget_max=budgets["audio_latency_ms_max"], gated=True,
         ),
         "audio_scheduling_skew_ms": _metric(
             _as_float(events.get("audio_scheduling_skew_ms")), "ms",
             note="audio write completion minus scheduled audio presentation; not A/V sync",
         ),
-        "helper_rss_mb": _metric(None, "MB", budget_max=BUDGETS["helper_rss_mb_max"],
+        "helper_rss_mb": _metric(None, "MB", budget_max=budgets["helper_rss_mb_max"],
                                  status="NOT_REQUIRED",
                                  note="wired path does not require the helper before todo 34"),
         "frame_drops": _metric(_as_int(events.get("frame_drops")), "frames"),
@@ -305,6 +350,12 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         "thermal_peak_c": _metric(values["thermal_peak_c"], "C"),
     }
 
+    av_block = None
+    if version3:
+        av_block, av_metrics = _signed_av(capture, window, invalid=(
+            "av_sync_ms" in (capture.get("invalid_telemetry") or [])))
+        metrics.update(av_metrics)
+
     # Violations + verdict. A measured violation is a definite FAIL; an
     # unavailable gated metric is BLOCKED (never a pass).
     violations: list[dict] = []
@@ -315,24 +366,25 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         if entry["value"] is None:
             unavailable.append(name)
         elif entry["status"] == "FAIL":
+            bound = entry["budget_min"] if entry.get("op") == "ge" else entry["budget_max"]
             violations.append(
                 {
                     "metric": name,
                     "value": entry["value"],
-                    "budget_max": entry["budget_max"],
+                    "budget_max": bound,
                     "detail": f"{entry['value']} {entry['unit']} violates budget "
-                    f"{entry['budget_max']} ({entry.get('op', 'le')})",
+                    f"{bound} ({entry.get('op', 'le')})",
                 }
             )
     if crashes is None:
         unavailable.append("crashes")
-    elif crashes > BUDGETS["crashes_max"]:
+    elif crashes > budgets["crashes_max"]:
         violations.append(
             {
                 "metric": "crashes",
                 "value": float(crashes),
-                "budget_max": float(BUDGETS["crashes_max"]),
-                "detail": f"{crashes} crash(es); budget is {BUDGETS['crashes_max']}",
+                "budget_max": float(budgets["crashes_max"]),
+                "detail": f"{crashes} crash(es); budget is {budgets['crashes_max']}",
             }
         )
 
@@ -348,6 +400,17 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                       startup_wait_seconds=progress.started_ns / 1e9
                       if progress.started_ns is not None else None,
                       projection_failure=progress.failure)
+    if version3:
+        # Build/compiler processes the collector saw on the target during the
+        # stage (#137); null when the capture carries no watch at all.
+        builds_seen = capture.get("concurrent_builds")
+        run_status["concurrent_builds"] = (
+            [{"t_s": item["t_ns"] / 1e9, "processes": [str(p) for p in item["processes"]]}
+             for item in builds_seen]
+            if isinstance(builds_seen, list) and all(
+                isinstance(item, dict) and isinstance(item.get("t_ns"), int)
+                and isinstance(item.get("processes"), list) for item in builds_seen)
+            else None)
     if progress.interferences:
         # Shown beside the coverage result: a gap over 10 s is why coverage:sampling
         # fails. Omitted when empty so uninterrupted results are unchanged.
@@ -391,6 +454,30 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                 unavailable.append("run_evidence:" + name)
         if "observed_duration_seconds" not in capture:
             unavailable.append("run_evidence:observed_duration_seconds")
+        if version3:
+            # v3 soak stages qualify the moving-map workload (#137), and the
+            # capture must prove it ran: stimulus started and enough completed
+            # drags over the active window. Missing or insufficient evidence is
+            # BLOCKED (the required workload was not measured), never a PASS;
+            # a stimulus whose display control input stalled or closed is
+            # already a FAIL (display_control_stalled / display_control_closed).
+            gap = workload_gap(capture.get("workload"), window)
+            if gap is not None:
+                unavailable.append("run_evidence:" + gap)
+            # The phone restore after the stage must be shown complete (media
+            # player stopped and verified, USB restored): a stage that leaves the
+            # player running is never a PASS, and a non-PASS stops the chain
+            # before the next stage. Named BLOCKED reasons (cleanup:*).
+            unavailable.extend(cleanup_gaps(capture.get("workload")))
+            # A build on the target during the stage contends for CPU and memory:
+            # the stage measured something else than the quiet host it claims.
+            # Interference, not a product FAIL: it BLOCKS a stage that would
+            # otherwise pass (a measured budget miss still FAILs, as for every
+            # BLOCKED reason). A capture without the watch is not proven quiet.
+            if run_status["concurrent_builds"] is None:
+                unavailable.append("run_evidence:concurrent_build_watch")
+            elif run_status["concurrent_builds"]:
+                unavailable.append("interference:concurrent_build")
 
     provenance_source = provenance_override if provenance_override is not None else capture.get("provenance")
     provenance_source, provenance_numeric_errors = aa_perf_schema.finite_numbers(provenance_source)
@@ -473,7 +560,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
                      "Continuous CPU/GPU/SoC0/SoC1/SoC2/TJ and stable inventory remain required.")
 
     result = {
-        "schema": SCHEMA_VERSION,
+        "schema": RESULT_FOR_CAPTURE[capture["schema"]],
         "task": TASK,
         "generated_at_utc": now,
         "mode": "wired",
@@ -489,7 +576,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         "verdict": verdict,
         "blocked_on": blocked_on,
         "crashes": crashes if crashes is not None else 0,
-        "budgets": dict(BUDGETS),
+        "budgets": dict(budgets),
         "metrics": metrics,
         "measurement_coverage": coverage_to_json(reduced.measurement_coverage),
         "thermal_state": thermal_state,
@@ -500,14 +587,127 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     }
     if evidence.thermal_policy is not None:
         result["thermal_policy"] = asdict(evidence.thermal_policy)
+    if version3:
+        result["av_contract"] = av_block
+        result["workload"] = _workload_record(capture.get("workload"), window)
     if capture_path is not None:
         result["capture"] = {"path": capture_path, "sha256": capture_sha256}
 
     # Never emit an off-schema document: validate before returning.
-    errors = aa_perf_schema.validate(result, aa_perf_schema.load_schema(aa_perf_schema.DEFAULT_SCHEMA))
+    errors = aa_perf_schema.validate(result, aa_perf_schema.load_schema(
+        aa_perf_schema.schema_for(result["schema"])))
     if errors:
         raise ContractError("internal: produced document is off-schema: " + "; ".join(errors))
     return result
+
+
+def _signed_av(capture: dict, window: Window | None, *, invalid: bool) -> tuple[dict, dict]:
+    """The v3 signed A/V contract over the replayed active window.
+
+    Pairs and audio intervals come from the capture's ``av_series`` (ns relative
+    to the monotonic origin, frozen at the measurement cutoff). Invalid A/V
+    telemetry, a missing series or no active window leave every A/V metric
+    unavailable (BLOCKED, as v2); measured coverage below the floor, including
+    no audio at all, is a FAIL.
+    """
+    series = capture.get("av_series")
+    stats = None
+    if not invalid and window is not None and isinstance(series, dict):
+        times, skews = series.get("pair_t_ns"), series.get("pair_skew_ns")
+        intervals = series.get("audio_intervals_ns")
+        integer_list = lambda v: isinstance(v, list) and all(  # noqa: E731
+            isinstance(x, int) and not isinstance(x, bool) for x in v)
+        if (integer_list(times) and integer_list(skews) and len(times) == len(skews)
+                and isinstance(intervals, list)
+                and all(isinstance(i, list) and len(i) == 2 and integer_list(i) for i in intervals)):
+            pairs = [(t, skew / 1e6) for t, skew in zip(times, skews)]
+            stats = av_contract.evaluate(pairs, [tuple(i) for i in intervals],
+                                         window.start_ns, window.end_ns, max_clause="soak_rate")
+        else:
+            raise ContractError("capture.av_series must hold integer pair_t_ns/pair_skew_ns of equal "
+                                "length and [start, end] audio_intervals_ns")
+    value = (lambda key: stats[key] if stats is not None else None)
+    worst = value("worst_window_mean_ms")
+    coverage = value("coverage")
+    metrics = {
+        "av_window_mean_abs_ms": _metric(
+            abs(worst) if worst is not None else None, "ms",
+            budget_max=BUDGETS["av_window_mean_abs_ms_max"], gated=True,
+            note="largest |mean signed skew| over every full 5 s window of the active window"),
+        "av_p99_abs_ms": _metric(value("abs_p99_ms"), "ms", budget_max=BUDGETS["av_p99_abs_ms_max"],
+                                 gated=True, note="nearest-rank p99 of |signed skew|"),
+        "av_max_abs_ms": _metric(value("abs_max_ms"), "ms",
+                                 note="max |signed skew| in the active window; informational "
+                                      "(the soak judges the excursion rate and the hard cap)"),
+        "av_excursions": _metric(
+            value("excursions"), "pairs", budget_max=value("excursion_allowance"), gated=True,
+            note=f"pairs with |signed skew| > {BUDGETS['av_excursion_ms']:g} ms; allowance "
+                 f"floor(active s / {av_contract.AV_SOAK_EXCURSION_PERIOD_S})"),
+        "av_hard_cap_pairs": _metric(
+            value("over_hard_cap"), "pairs", budget_max=0, gated=True,
+            note=f"pairs with |signed skew| > {BUDGETS['av_hard_cap_ms']:g} ms (hard cap)"),
+        "av_coverage_pct": _metric(
+            coverage * 100 if coverage is not None else None, "%",
+            budget_min=BUDGETS["av_coverage_pct_min"], op="ge", gated=True,
+            note="valid audio slots' scheduled union over the active window"),
+    }
+    block = {"limits": dict(av_contract.SOAK_LIMITS), "valid": stats is not None,
+             **({key: stats[key] for key in stats} if stats is not None else {"passed": None})}
+    return block, metrics
+
+
+def workload_gap(raw: object, window: Window | None) -> str | None:
+    """Why a v3 workload record does not prove the moving map ran, or None.
+
+    In order: no moving-map record; the stimulus never started; a required
+    phone command failed (the harness lost the phone: BLOCKED, not FAIL); fewer
+    than MIN_DRAG_RATE_HZ drags per active second; a stretch of the active
+    window longer than MAX_DRAG_GAP_S without a drag (or no drag evidence); a
+    malformed media relaunch count.
+    """
+    if not isinstance(raw, dict) or raw.get("kind") != "moving-map":
+        return "moving_map_workload"
+    drags = raw.get("drags")
+    if raw.get("stimulus_started") is not True or not isinstance(drags, int) or isinstance(drags, bool):
+        return "moving_map_stimulus"
+    if "phone_failure" not in raw or raw["phone_failure"] is not None:
+        return "moving_map_phone"
+    if window is None or drags < MIN_DRAG_RATE_HZ * (window.end_ns - window.start_ns) / 1e9:
+        return "moving_map_drags"
+    gap = _drag_gap(raw, window)
+    if gap is None or gap > MAX_DRAG_GAP_S:
+        return "moving_map_drag_gap"
+    relaunches = raw.get("media_relaunches")
+    if not isinstance(relaunches, int) or isinstance(relaunches, bool) or relaunches < 0:
+        return "moving_map_media"
+    return None
+
+
+def _drag_gap(raw: dict, window: Window | None) -> float | None:
+    if window is None:
+        return None
+    return max_drag_gap_s(raw.get("drag_t_ns"), window.start_ns, window.end_ns)
+
+
+def _workload_record(raw: object, window: Window | None) -> dict:
+    """The result's workload record. For moving-map every evidence field is present;
+    a missing or malformed one is recorded as not proven (0 drags, not started,
+    an unknown phone failure, no drag gap), and ``workload_gap`` then keeps the
+    stage from qualifying."""
+    if not isinstance(raw, dict) or raw.get("kind") != "moving-map":
+        return {"kind": "none"}
+    count = lambda key: (raw[key] if isinstance(raw.get(key), int)  # noqa: E731
+                         and not isinstance(raw.get(key), bool) and raw[key] >= 0 else 0)
+    failure = raw.get("phone_failure", "not recorded")
+    # The phone restore after the stage (media stopped and verified, then USB
+    # mode): recorded, and a failure BLOCKS a live stage (cleanup_gaps).
+    cleanup = raw.get("cleanup_failures")
+    cleanup = ([str(item)[:300] for item in cleanup] if isinstance(cleanup, list)
+               else ["cleanup not recorded"])
+    return {"kind": "moving-map", "media_relaunches": count("media_relaunches"),
+            "drags": count("drags"), "stimulus_started": raw.get("stimulus_started") is True,
+            "phone_failure": failure if failure is None else str(failure)[:300],
+            "max_drag_gap_s": _drag_gap(raw, window), "cleanup_failures": cleanup}
 
 
 def _digest(value: str | None) -> bool:

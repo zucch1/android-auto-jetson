@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / 'tools/qualification'))
 sys.path.insert(0, str(ROOT / 'tools/perf'))
 from common import JSON, Document
 from aa_perf_report import build_result
-from synthetic_capture import capture
+from synthetic_capture import capture, capture_v3
 
 
 class PackageTest(unittest.TestCase):
@@ -40,7 +40,7 @@ def binding(path: Path) -> dict[str, JSON]:
     return {'path': path.name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-def make_package(root: Path) -> Path:
+def make_package(root: Path, version: int = 2) -> Path:
     provenance: dict[str, JSON] = {
         'source_digest': 'a' * 64, 'build_artifact_digest': 'b' * 64,
         'configuration_digest': 'c' * 64,
@@ -80,7 +80,8 @@ def make_package(root: Path) -> Path:
     write(root / 'recovery.json', recovery)
     for name, seconds, stamp in (('perf.json', 1800, '2026-01-01T00:30:00Z'),
                                  ('soak.json', 7200, '2026-01-01T02:30:00Z')):
-        result = build_result(capture(seconds, provenance), duration_requested=None, now=stamp,
+        raw = (capture_v3 if version == 3 else capture)(seconds, provenance)
+        result = build_result(raw, duration_requested=None, now=stamp,
                                capture_path=None, capture_sha256=None)
         result['notes'].append('SYNTHETIC TEST ONLY; not observed on hardware')
         write(root / name, result)
