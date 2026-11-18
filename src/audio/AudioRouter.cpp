@@ -69,6 +69,10 @@ struct Run final {
     std::uint64_t trimmed{};
     std::uint64_t consumed{};
     bool preflighted{};
+    // The parent's PCM duration in output frames (its input byte count at the
+    // role's input format), at least `frames`. The decoder's resampler may
+    // return only part of a parent now and the rest with a later one.
+    std::uint64_t content_frames{};
 };
 
 // One run placed on the sample timeline at an effective (non-overlapping)
@@ -87,7 +91,31 @@ struct ScheduledRun final {
     // Part of head_trim_frames dropped by the catch-up (#154), counted when
     // the run is placed.
     std::uint64_t caught_up_frames{0};
+    // The run's phase takes the catch-up trim (#154).
+    bool catching_up{false};
 };
+
+// Late-arrival discontinuity check (200 ms cap). Raw lateness is how far
+// the run's start lies behind the playback cursor. A caught-up run (#154) is
+// judged after its head trim instead: by the oldest sample it still plays
+// or, when it is dropped whole, by the end of its parent's PCM. The trimmed
+// audio is never placed late, so a burst of long parents (200 ms guidance)
+// whose predecessor carried the cursor a full parent past its arrival
+// survives, while a parent whose every sample is over the cap behind the
+// cursor - real lag such as a timestamp jump, not a burst - is still
+// rejected. Runs the catch-up does not take keep the raw check unchanged.
+[[nodiscard]] bool late_beyond_cap(std::uint64_t cursor, std::int64_t intended,
+                                   const Run& run, const ScheduledRun& entry,
+                                   std::uint64_t cap) noexcept {
+    if (intended >= static_cast<std::int64_t>(cursor)) { return false; }
+    auto late = static_cast<std::uint64_t>(static_cast<std::int64_t>(cursor) - intended);
+    if (entry.catching_up) {
+        const auto credit = entry.head_trim_frames < run.frames
+            ? entry.head_trim_frames : std::max(run.frames, run.content_frames);
+        late -= std::min(late, credit);
+    }
+    return late > cap;
+}
 
 } // namespace
 
@@ -107,6 +135,12 @@ std::uint64_t LivePcmDriftCorrector::trim_frames(core::Nanoseconds phase,
 std::uint64_t LivePcmDriftCorrector::caught_up_frames(core::Nanoseconds phase,
                                                       std::uint64_t run_frames) const noexcept {
     return trim(phase, run_frames, true) - trim(phase, run_frames, false);
+}
+
+bool LivePcmDriftCorrector::catches_up(core::Nanoseconds phase) const noexcept {
+    return policy_.enabled && rate_ != 0 && phase > policy_.high_watermark
+        && policy_.catch_up_watermark.count > 0 && phase > policy_.catch_up_watermark
+        && phase > policy_.target;
 }
 
 std::uint64_t LivePcmDriftCorrector::trim(core::Nanoseconds phase, std::uint64_t run_frames,
@@ -567,6 +601,18 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
     const std::uint64_t frame_bytes =
         static_cast<std::uint64_t>(impl_->config.output_format.channels) * sizeof(std::int16_t);
     run.frames = frame_bytes == 0 ? 0 : run.pcm.size() / frame_bytes;
+    run.content_frames = run.frames;
+    if (chunk.codec == Codec::pcm) {
+        const auto& input = chunk.input_format;
+        const std::uint64_t input_frame_bytes =
+            static_cast<std::uint64_t>(input.channels) * (input.bits_per_sample / 8U);
+        if (input_frame_bytes != 0 && input.sample_rate_hz != 0) {
+            // Bounded by kMaxAudioPayloadBytes: no overflow at any supported rate.
+            const std::uint64_t input_frames = message.payload.size() / input_frame_bytes;
+            run.content_frames = std::max(run.frames,
+                input_frames * impl_->config.output_format.sample_rate_hz / input.sample_rate_hz);
+        }
+    }
     run.submitted_at_ns = submitted_at_ns;
     if (run.frames == 0) {
         return Error{ErrorCode::audio_format_unsupported};
@@ -653,13 +699,6 @@ core::Result<void> AudioRouter::pump() {
                 schedule_ok = false;
                 continue;
             }
-            if (intended < static_cast<std::int64_t>(cursor)) {
-                const auto late =
-                    static_cast<std::uint64_t>(static_cast<std::int64_t>(cursor) - intended);
-                if (late > cap_frames) {
-                    schedule_ok = false;
-                }
-            }
             ScheduledRun entry;
             entry.role = i;
             const std::int64_t placed = std::max<int64_t>(
@@ -678,6 +717,10 @@ core::Result<void> AudioRouter::pump() {
             const core::Nanoseconds phase{planned_ns - run.timestamp.count};
             entry.head_trim_frames = impl_->drift.trim_frames(phase, run.frames);
             entry.caught_up_frames = impl_->drift.caught_up_frames(phase, run.frames);
+            entry.catching_up = impl_->drift.catches_up(phase);
+            if (late_beyond_cap(cursor, intended, run, entry, cap_frames)) {
+                schedule_ok = false;
+            }
             const std::uint64_t retained = run.frames - entry.head_trim_frames;
             if (retained > UINT64_MAX - entry.start_frame) {
                 schedule_ok = false;
@@ -1068,12 +1111,6 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 }
                 diagnostic.intended = intended;
                 entry.intended = intended;
-                if (!run.preflighted && intended < static_cast<std::int64_t>(cursor)
-                    && static_cast<std::uint64_t>(static_cast<std::int64_t>(cursor) - intended) > cap) {
-                    fail(RenderFailureReason::late);
-                    valid = false;
-                    break;
-                }
                 entry.start_frame = static_cast<std::uint64_t>(std::max<std::int64_t>(
                     intended, static_cast<std::int64_t>(std::max(cursor, role_end))));
                 diagnostic.start = entry.start_frame;
@@ -1087,6 +1124,13 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 const core::Nanoseconds phase{placed_ns - run.timestamp.count};
                 entry.head_trim_frames = impl_->drift.trim_frames(phase, run.frames);
                 entry.caught_up_frames = impl_->drift.caught_up_frames(phase, run.frames);
+                entry.catching_up = impl_->drift.catches_up(phase);
+                if (!run.preflighted && late_beyond_cap(cursor, intended, run, entry, cap)) {
+                    diagnostic.start.reset();
+                    fail(RenderFailureReason::late);
+                    valid = false;
+                    break;
+                }
             }
             const auto remaining = run.frames - entry.head_trim_frames;
             diagnostic.start = entry.start_frame;

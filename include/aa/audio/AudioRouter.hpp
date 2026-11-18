@@ -188,6 +188,10 @@ struct SinkWriteProgress final {
 // ~15 ms late). A phase at or below the watermark gets the ordinary bounded
 // trim. Every trimmed frame counts in frames_trimmed; frames_caught_up counts
 // only the part beyond what the bounded max_trim policy would have removed.
+// The router's 200 ms late-arrival cap judges a caught-up run after its trim:
+// it fails only when even the oldest retained sample is more than 200 ms
+// behind the cursor or, for a run dropped whole, when the end of its parent's
+// PCM (by input duration, not the decoder's possibly partial output) is.
 struct LivePcmDriftPolicy final {
     bool enabled{false};
     core::Nanoseconds high_watermark{core::Nanoseconds{20'000'000LL}};
@@ -214,6 +218,8 @@ public:
                                             std::uint64_t run_frames) const noexcept;
     [[nodiscard]] std::uint64_t caught_up_frames(core::Nanoseconds phase,
                                                  std::uint64_t run_frames) const noexcept;
+    // True when a run at this phase takes the catch-up trim (#154).
+    [[nodiscard]] bool catches_up(core::Nanoseconds phase) const noexcept;
 
 private:
     [[nodiscard]] std::uint64_t trim(core::Nanoseconds phase, std::uint64_t run_frames,
