@@ -219,7 +219,9 @@ if ((!READINESS_ONLY)) && [[ "$MODE" != "wired" && "$MODE" != "wireless" ]]; the
 fi
 if [[ "$MODE" == "wireless" ]]; then
     if [[ -n "$CAPTURE" ]]; then
-        : # a replayed capture carries its own mode
+        # Live stages only: a replay is judged by the mode its capture records.
+        echo "usage error: --mode wireless is for live stages; replay a capture with --mode wired" >&2
+        exit 2
     elif [[ ! "$PHONE_ID" =~ ^[1-9][0-9]*$ || "$(basename -- "${STORE:-x}")" != "approved-phones.json" ]]; then
         echo "usage error: --mode wireless needs --phone-id N and --store DIR/approved-phones.json" >&2
         exit 2

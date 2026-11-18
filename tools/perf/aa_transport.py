@@ -91,7 +91,7 @@ def parse_wifi_status(text: str | None) -> dict:
     rssi, frequency = _RSSI.search(text), _FREQUENCY.search(text)
     mhz = int(frequency.group(1)) if frequency else None
     rssi_dbm = int(rssi.group(1)) if rssi else None
-    if rssi_dbm is not None and not -127 <= rssi_dbm <= 0:
+    if rssi_dbm is not None and not -127 < rssi_dbm <= 0:
         rssi_dbm = None  # Android reports -127 for "invalid"; anything else is not a reading
     return {"connected": ("is connected" in text.lower()) if text else None,
             "frequency_mhz": mhz, "channel": frequency_to_channel(mhz), "rssi_dbm": rssi_dbm}

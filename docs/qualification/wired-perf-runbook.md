@@ -688,6 +688,39 @@ tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" \
     --provenance "$RUN_DIR/provenance.json" --display-env ":0,/run/user/$(id -u)/gdm/Xauthority"
 ```
 
+## Wireless sessions (`--transport wireless`)
+
+Wireless is the product's primary path. The drive smoke
+(`aa_drive_smoke.py run --transport wireless --phone-id N`), the soak chain
+(`aa_soak_chain.py --transport wireless --phone-id N --store DIR/approved-phones.json`)
+and the launcher (`aa-projection-perf.sh --mode wireless`) run the **same**
+criteria, A/V contract, gates and interference rules as wired. Only the
+session setup differs (tools/perf/aa_transport.py):
+
+- `aa-wireless-receiver --store-dir DIR --phone-id N --diagnostics` is
+  launched; it acquires the system helper's AP and bootstraps the phone over
+  Bluetooth when the display asks to project, and releases both on stop. The
+  harness never touches Wi-Fi, Bluetooth, NetworkManager or the helper.
+- adb (the moving-map stimulus) may use the cable; the session must not. The
+  phone's USB functions (`getprop sys.usb.config`) must be known and not AOA
+  before the run (else BLOCKED `usb_in_aoa` / `usb_functions_unknown`, nothing
+  launched) and after it (else `cleanup:usb_in_aoa`). The workload never
+  switches USB for wireless (no AOA, no mtp reset).
+- The record carries `transport` and `link.before`/`link.after`: USB
+  functions, Wi-Fi frequency/channel/RSSI (`cmd wifi status`, numbers only)
+  and `bluetooth_on`. SSIDs, BSSIDs and addresses are never recorded.
+- The wireless receiver logs no `active` line; its `session_state_changed`
+  diagnostic to `active` is the marker (`run.json` `active_marker`).
+- `check --transport` refuses a smoke of the other transport
+  (`drive_smoke_transport_mismatch`); a record without `transport` is wired.
+  A soak result's `mode` is its transport.
+
+**Known gap: a wireless run cannot PASS today.** `aa-wireless-receiver` plays
+audio through `AudioRouter` and logs no `audio_write_completed` (no playback
+endpoint), so the A/V contract's coverage clause fails closed. Porting the
+wired receiver's scheduled-PCM sink and its telemetry is a separate receiver
+change; until then a wireless smoke or stage is a FAIL, never a PASS.
+
 ## Exact invocations
 
 From the development checkout (bounded ssh, fail-closed):
