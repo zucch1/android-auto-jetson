@@ -35,7 +35,7 @@ exit "$rc"
 
 
 def preflight_ok(_args, seconds, _stop) -> dict:
-    return {"schema": "aa-host-preflight/1", "stage_s": seconds, "verdict": "OK", "reasons": [],
+    return {"schema": "aa-host-preflight/2", "stage_s": seconds, "verdict": "OK", "reasons": [],
             "pipewire_err_counters": {"start": {"nodes": []}}}
 
 
@@ -51,7 +51,7 @@ def run(root: Path, *extra: str, env: dict[str, str] | None = None, builds=lambd
     output = io.StringIO()
     with patch.dict(os.environ, {"STUB_LOG": str(root / "calls.log"), **(env or {})}), \
             patch.object(chain, "builds", builds), patch.object(chain, "host_preflight", host), \
-            patch.object(chain, "host_counters", lambda _args: {"nodes": []}), redirect_stdout(output):
+            patch.object(chain, "host_counters", lambda _args, _cancel=None: {"nodes": []}), redirect_stdout(output):
         code = chain.main(argv)
     return code, output.getvalue()
 
@@ -287,14 +287,16 @@ def test_a_blocked_host_preflight_runs_no_stage_and_says_why() -> None:
     reasons = ["host_audio:pipewire-pulse[200]:pw-data-loop_not_realtime (cls=TS rtprio=-)"]
 
     def blocked(_args, seconds, _stop) -> dict:
-        return {"schema": "aa-host-preflight/1", "stage_s": seconds, "verdict": "BLOCKED", "reasons": reasons}
+        return {"schema": "aa-host-preflight/2", "stage_s": seconds, "verdict": "BLOCKED", "reasons": reasons}
     with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
         root = Path(directory)
         code, output = run(root, host=blocked)
         out = root / "chain"
         assert code == 3 and "stage-1800s BLOCKED: host preflight: host_audio:pipewire-pulse" in output, output
         assert calls(root) == [], "a stage launched on a blocked host"
-        assert json.loads((out / "stage-1800s-host-preflight.json").read_text())["reasons"] == reasons
+        record = json.loads((out / "stage-1800s-host-preflight.json").read_text())
+        assert record == {"schema": "aa-host-preflight/2", "stage_s": 1800, "verdict": "BLOCKED",
+                          "reasons": reasons}, record
         assert "pw-data-loop_not_realtime" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
         assert (out / "stage-7200s-not-run.json").exists()
         assert not (out / "stage-1800s-result.json").exists() and not (out / "stage-1800s-logs").exists()
@@ -313,7 +315,7 @@ def test_the_preflight_runs_before_each_stage_and_records_the_err_counters() -> 
         for seconds in chain.STAGES:
             record = json.loads((root / "chain" / f"stage-{seconds}s-host-preflight.json").read_text())
             # start counters from the preflight, end counters added after the stage
-            assert record["verdict"] == "OK", record
+            assert record["verdict"] == "OK" and record["schema"] == "aa-host-preflight/2", record
             assert set(record["pipewire_err_counters"]) == {"start", "during", "end"}, record
             assert record["pipewire_err_counters"]["end"]["phase"] == "after_stage"
 
@@ -401,7 +403,7 @@ def test_the_preflight_uses_the_launchers_ssh_even_for_localhost() -> None:
         seen.append(argv)
         return chain.aa_host_preflight.Output(0, "1001\n")
     with patch.object(chain.aa_host_preflight.ssh_runner, "__defaults__", (local,)):
-        assert chain.aa_host_preflight.soak_uid(chain.host_runner("localhost")) == "1001"
+        assert chain.aa_host_preflight.soak_uid(chain.host_runner("localhost")) == ("1001", None)
     assert seen == [["ssh", *chain.aa_host_preflight.SSH_OPTS, "localhost", "id -u"]], seen
 
 
@@ -411,7 +413,7 @@ SLOW_STUB = STUB.replace('printf \'%s\\n\' "$*" >> "$STUB_LOG"\n', 'printf \'%s\
 def test_err_counters_are_sampled_while_the_receiver_stream_exists() -> None:
     samples = []
 
-    def counters(_args) -> dict:
+    def counters(_args, _cancel=None) -> dict:
         samples.append(1)
         return {"time": 0, "receiver_streams": [{"id": 71, "name": "aa-wired-receiver", "err": 2}],
                 "sinks": [], "nodes": []}
@@ -436,6 +438,64 @@ def test_err_counters_are_sampled_while_the_receiver_stream_exists() -> None:
         assert during["samples"] >= 2 and during["receiver_stream_seen"], during
         assert during["latest_with_receiver"]["receiver_streams"][0]["err"] == 2
         assert during["first_with_receiver"]["phase"] == "during_stage"
+
+
+def test_a_record_that_is_not_strict_json_blocks_the_stage() -> None:
+    def host(args, seconds, stop) -> dict:
+        record = preflight_ok(args, seconds, stop)
+        record["apt_timers"] = {"window_end_epoch": float("inf")}
+        return record
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        code, output = run(root, host=host)
+        text = (root / "chain" / "stage-1800s-host-preflight.json").read_text()
+        record = json.loads(text, parse_constant=lambda name: (_ for _ in ()).throw(ValueError(name)))
+        assert code == 3 and calls(root) == [] and record["verdict"] == "BLOCKED", (output, record)
+        assert record["reasons"][0].startswith("host_preflight:invalid_record"), record
+
+
+def test_a_stop_kills_an_in_flight_counter_sample_and_terms_the_stage_first() -> None:
+    import signal
+    import threading
+    import time
+    events: list[str] = []
+    in_flight, termed = threading.Event(), threading.Event()
+
+    def counters(_args, cancel=None) -> dict:  # a pw-top over ssh that hangs until cancelled
+        in_flight.set()
+        threading.Timer(0.2, os.kill, (os.getpid(), signal.SIGTERM)).start()
+        assert cancel is not None and cancel.wait(30), "the sample was never cancelled"
+        termed.wait(10)  # returns only once the stage has been TERMed: TERM never waits for it
+        events.append("sample_cancelled")
+        return {"error": "cancelled"}
+    real_stop_group = chain.stop_group
+
+    def stop_group(process):
+        events.append("stage_termed" + ("_while_sampling" if in_flight.is_set() and not events else ""))
+        termed.set()
+        return real_stop_group(process)
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        stub_path = root / "stub-launcher"
+        stub_path.write_text(STUB.replace('exit "$rc"', 'sleep 30 & wait $!\nexit "$rc"'))
+        stub_path.chmod(0o755)
+        argv = ["--out", str(root / "chain"), "--phone-serial", "TESTPHONE01",
+                "--drive-smoke", str(root / "smoke.json"), "--media-uri", "file:///x.opus",
+                "--media-component", "org.example.player/.Play", "--quiet-seconds", "0",
+                "--launcher", str(stub_path)]
+        began = time.monotonic()
+        with patch.dict(os.environ, {"STUB_LOG": str(root / "calls.log")}), \
+                patch.object(chain, "builds", lambda: []), patch.object(chain, "host_preflight", preflight_ok), \
+                patch.object(chain, "host_counters", counters), patch.object(chain, "COUNTER_FIRST_S", 0.05), \
+                patch.object(chain, "stop_group", stop_group), redirect_stdout(io.StringIO()):
+            code = chain.main(argv)
+        elapsed = time.monotonic() - began
+        assert code == 128 + signal.SIGTERM, code
+        assert events[:2] == ["stage_termed_while_sampling", "sample_cancelled"], events
+        assert elapsed < 4.5, elapsed  # no sampler join (5 s) before the TERM, no 30 s hang
+        during = json.loads((root / "chain" / "stage-1800s-host-preflight.json").read_text())[
+            "pipewire_err_counters"]["during"]
+        assert during["samples"] == 0, during  # the cut-short sample is not recorded as one
 
 
 def test_every_chain_gets_a_new_directory() -> None:

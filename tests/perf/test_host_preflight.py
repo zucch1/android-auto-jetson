@@ -12,8 +12,12 @@ here reads the real ps, systemctl or busctl.
 """
 from __future__ import annotations
 
+import json
 import math
+import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,11 +73,11 @@ class Host:
 
     def __init__(self, *, ps_pipewire=PS_RR, ps_pulse=PS_RR_PULSE, processes=IDLE, services="inactive\ninactive\n",
                  timers=(NOW + 3 * 3600, NOW + 3.5 * 3600), monotonic=(None, None), timer_text=None,
-                 packagekit=PK_IDLE, pw_top=PW_TOP, pw_top_delay=0.0) -> None:
+                 packagekit=PK_IDLE, pk_raw=None, pw_top=PW_TOP, pw_top_delay=0.0) -> None:
         self.ps = {"100": seq(ps_pipewire), "200": seq(ps_pulse)}
         self.processes, self.services, self.packagekit = seq(processes), seq(services), seq(packagekit)
         self.timers, self.monotonic, self.timer_text = list(timers), list(monotonic), timer_text
-        self.pw_top, self.pw_top_delay = pw_top, pw_top_delay
+        self.pw_top, self.pw_top_delay, self.pk_raw = pw_top, pw_top_delay, dict(pk_raw or {})
         self.calls: list[tuple[str, float | None]] = []
         self.pids = {"pipewire": "100\n", "pipewire-pulse": "200\n"}
         self.state = {"now": NOW, "mono": NOW - BOOT, "slept": []}
@@ -116,17 +120,21 @@ class Host:
         pk = self.take(self.packagekit)
         if pk is None:
             return hp.Output(1, "")
+        assert argv[:3] == ["busctl", "--system", "--auto-start=no"], argv
         method = argv[-1] if argv[-2] != "s" else argv[-3]
+        if method in self.pk_raw:
+            return hp.Output(0, self.take(seq(self.pk_raw[method])))
         if method == "NameHasOwner":
             return hp.Output(0, f"b {'true' if pk['owner'] else 'false'}\n")
         if method == "GetNameOwner":
             return hp.Output(0, 's ":1.87376"\n') if pk["owner"] else hp.Output(1, "")
-        assert argv[3] == ":1.87376", f"PackageKit addressed by its activatable name: {argv}"
+        assert argv[4] == ":1.87376", f"PackageKit addressed by its activatable name: {argv}"
         if method == "GetTransactionList":
             paths = " ".join(f'"/{n}_abc"' for n in range(pk["transactions"]))
             return hp.Output(0, f"ao {pk['transactions']} {paths}".rstrip() + "\n")
         if method == "Locked":
-            return hp.Output(0, f"b {'true' if pk['locked'] else 'false'}\n")
+            assert argv[6:9] == ["org.freedesktop.DBus.Properties", "Get", "ss"], argv
+            return hp.Output(0, f"v b {'true' if pk['locked'] else 'false'}\n")
         raise AssertionError(argv)
 
     def advance(self, seconds: float, wall: float | None = None) -> None:
@@ -142,8 +150,10 @@ class Host:
 def check(run, stage_s: int = 1800, sleep=None, host: Host | None = None, **kwargs) -> dict:
     """The preflight over ``run`` on ``host``'s fake clock (``run`` itself when it is a Host)."""
     host = host or run
-    return hp.preflight(run, stage_s, now=lambda: host.state["now"],
-                        monotonic=lambda: host.state["mono"], sleep=sleep or host.sleep, **kwargs)
+    record = hp.preflight(run, stage_s, now=lambda: host.state["now"],
+                          monotonic=lambda: host.state["mono"], sleep=sleep or host.sleep, **kwargs)
+    json.dumps(record, allow_nan=False)  # every record is strict JSON
+    return record
 
 
 def wrap(host: Host, override):
@@ -200,7 +210,8 @@ def test_scheduling_is_read_after_the_maintenance_wait() -> None:
     assert host.state["slept"] == [10.0] and record["verdict"] == "BLOCKED", record["reasons"]
     assert any("pipewire-pulse[200]:pw-data-loop_not_realtime" in r for r in record["reasons"])
     order = [line.split()[0] + (" " + line.split()[1] if line.startswith("ps") else "") for line, _ in host.calls]
-    assert order.index("ps -L") > max(i for i, c in enumerate(order) if c == "ps -e"), order
+    polls = [i for i, c in enumerate(order) if c == "ps -e"]
+    assert polls[0] < polls[1] < order.index("ps -L") < polls[-1], order  # the wait, RT, the final read
 
 
 # ---- package maintenance --------------------------------------------------------
@@ -231,8 +242,8 @@ def test_an_idle_resident_packagekitd_does_not_block() -> None:
     # No daemon on the bus: idle, and only NameHasOwner was asked (nothing activated).
     host = Host(packagekit=PK_GONE)
     assert check(host)["verdict"] == "OK"
-    assert [c for c, _ in host.calls if c.startswith("busctl")] == [
-        "busctl --system call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus NameHasOwner s "
+    assert [c for c, _ in host.calls if c.startswith("busctl")] == 2 * [
+        "busctl --system --auto-start=no call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus NameHasOwner s "
         "org.freedesktop.PackageKit"]
     # It exits on idle between NameHasOwner and GetNameOwner: idle too.
     host = Host(packagekit=[PK_IDLE, PK_GONE])
@@ -264,12 +275,61 @@ def test_the_wait_is_bounded_on_the_monotonic_clock() -> None:
     record = check(host, sleep=sleep, maintenance_wait_s=20)
     assert record["verdict"] == "BLOCKED" and sum(host.state["slept"]) == 20, host.state["slept"]
     assert "host_maintenance:wait_interrupted" not in record["reasons"]
-    # A probe after a poll is capped to the time left (here 5 s, never the 15 s default),
-    # and once the bound is spent no probe runs that could admit the stage late.
+    # A poll's commands get the time left as their whole budget (here 5 s, never
+    # the default), and once the bound is spent no probe runs that could admit the
+    # stage late; the final read before launch has its own default bound.
     host = Host(processes=IDLE + "  4242 dpkg\n")
     check(host, maintenance_wait_s=15)
     probes = [t for c, t in host.calls if c == "ps -e -o pid=,comm="]
-    assert probes == [None, 5.0], probes
+    assert probes == [None, 5.0, None], probes
+
+
+def test_a_poll_that_ends_after_the_deadline_is_rejected() -> None:
+    # The review's replay: a 15 s limit, the poll starts at 10 s and each of its
+    # commands takes 4 s; it sees idle, but only at 30+ s: BLOCKED, not admitted.
+    host = Host(processes=[IDLE + "  4242 dpkg\n", IDLE])
+    budgets = []
+
+    def run(argv, timeout=None):
+        if host.state["slept"] and (argv[0] in ("ps", "busctl") and "-L" not in argv
+                                    or argv[:2] == ["systemctl", "is-active"]):
+            budgets.append(timeout)
+            host.advance(4.0)
+        return host(argv, timeout)
+    record = check(run, host=host, maintenance_wait_s=15)
+    assert record["verdict"] == "BLOCKED" and "host_maintenance:wait_limit_exceeded" in record["reasons"], \
+        record["reasons"]
+    assert record["package_maintenance"]["processes"] == [] and record["package_maintenance"]["ok"] is False
+    assert budgets[:3] == [5.0, 1.0, -3.0], budgets  # one shared deadline: each command gets what is left
+
+
+def test_maintenance_that_starts_during_the_other_checks_blocks() -> None:
+    # Idle at the first look; apt-daily.service is active by the final read.
+    host = Host(services=["inactive\ninactive\n", "active\ninactive\n"])
+    record = check(host)
+    assert record["verdict"] == "BLOCKED", record["reasons"]
+    assert "host_maintenance:apt-daily.service_active (at the final check)" in record["reasons"]
+    assert record["package_maintenance"]["ok"] and not record["package_maintenance_final"]["ok"]
+    calls = [c for c, _ in host.calls]
+    assert max(i for i, c in enumerate(calls) if c.startswith("systemctl is-active")) > \
+        max(i for i, c in enumerate(calls) if "NextElapseUSec" in c), "the final read is last"
+
+
+def test_malformed_packagekit_replies_fail_closed_and_never_name_the_activatable_service() -> None:
+    for raw in ({"GetNameOwner": 's "org.freedesktop.PackageKit"\n'},
+                {"GetNameOwner": 's ":1.87376" extra\n'},
+                {"GetNameOwner": 's ":abc"\n'},
+                {"NameHasOwner": "b unknown\n"},
+                {"NameHasOwner": "b true false\n"},
+                {"GetTransactionList": 'ao 2 "/1_abc"\n'},
+                {"Locked": "b false\n"}):  # a Properties.Get reply is a variant: "v b false"
+        host = Host(pk_raw=raw)
+        record = check(host, maintenance_wait_s=600)
+        assert record["verdict"] == "BLOCKED" and host.state["slept"] == [], (raw, record["reasons"])
+        assert "host_maintenance:packagekit:unverifiable (busctl failed)" in record["reasons"], raw
+        for line, _ in host.calls:
+            if line.startswith("busctl") and "org.freedesktop.DBus " not in line + " ":
+                assert line.split()[4] == ":1.87376", line
 
 
 def test_zero_wait_blocks_at_once_and_a_stop_ends_the_wait() -> None:
@@ -347,6 +407,16 @@ def test_a_monotonic_timer_trigger_counts() -> None:
     assert hp.parse_monotonic("0") == ("none", None) and hp.parse_monotonic("2 fortnights")[0] == "unparsable"
 
 
+def test_an_oversized_monotonic_value_blocks_and_the_record_stays_strict_json() -> None:
+    for value in ("1" + "0" * 400 + "s", "99999999999y", "1" * 13 + "s"):
+        assert hp.parse_monotonic(value)[0] == "unparsable", value
+        text = f"NextElapseUSecRealtime=\nNextElapseUSecMonotonic={value}\n"
+        record = check(Host(timer_text=text))  # check() also asserts json.dumps(allow_nan=False)
+        assert record["verdict"] == "BLOCKED" and \
+            "host_maintenance:apt-daily.timer:next_elapse_monotonic_unparsable" in record["reasons"]
+    assert hp.parse_monotonic("36500d")[0] == "time"  # a century is still a value
+
+
 def test_timer_elapse_parsing_and_failure_modes() -> None:
     assert hp.parse_realtime("Wed 2026-11-18 09:00:00 UTC") == \
         ("time", datetime(2026, 11, 18, 9, tzinfo=timezone.utc).timestamp())
@@ -382,13 +452,38 @@ def test_the_ssh_runner_uses_the_launchers_transport_and_bounds() -> None:
         seen.append((argv, timeout))
         return hp.Output(0, "1000\n")
     run = hp.ssh_runner("localhost", local)
-    assert hp.soak_uid(run) == UID
+    assert hp.soak_uid(run) == (UID, None)
     argv, timeout = seen[0]
     launcher = (ROOT / "tools/perf/aa-projection-perf.sh").read_text()
     assert "SSH_OPTS=(" + " ".join(hp.SSH_OPTS) + ")" in launcher, "keep the launcher's ssh options"
     assert argv == ["ssh", *hp.SSH_OPTS, "localhost", "id -u"] and timeout == hp.COMMAND_TIMEOUT_S + 10
     run(["pw-top"], timeout=hp.PW_TOP_TIMEOUT_S)
-    assert seen[-1][1] == hp.PW_TOP_TIMEOUT_S + 10
+    assert seen[-1][1] == hp.PW_TOP_TIMEOUT_S  # a given budget is the whole one, connection included
+
+
+def test_an_ssh_failure_is_reported_as_one() -> None:
+    for out, reason in (
+            (hp.Output(255, "", "Host key verification failed.\n"),
+             "host_transport:ssh_failed (Host key verification failed.)"),
+            (hp.Output(255, "", "zucchi@127.0.0.1: Permission denied (publickey).\n"),
+             "host_transport:ssh_failed (zucchi@127.0.0.1: Permission denied (publickey).)"),
+            (hp.Output(None), "host_transport:unreachable (no answer within the bound)"),
+            (hp.Output(1, "", "id: oops\n"), "host_audio:unverifiable (id -u failed)")):
+        record = check(lambda argv, timeout=None, out=out: out, host=Host())
+        assert record["verdict"] == "BLOCKED" and record["reasons"] == [reason], (out, record["reasons"])
+
+
+def test_a_cancelled_command_is_killed_at_once() -> None:
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    began = time.monotonic()
+    out = hp.cancellable_runner(cancel)(["sleep", "30"], timeout=60)
+    assert out.rc is None and time.monotonic() - began < 2.0, out
+    left = subprocess.run(["pgrep", "-f", "^sleep 30$", "-P", str(__import__("os").getpid())],
+                          capture_output=True, text=True)
+    assert left.stdout == "", left.stdout
+    assert hp.local_runner(["true"], timeout=0).rc is None  # no budget left: nothing runs
+    assert hp.local_runner(["sh", "-c", "echo hi; echo err >&2"]) == hp.Output(0, "hi\n", "err\n")
 
 
 # ---- informational PipeWire ERR counters -------------------------------------------
@@ -409,9 +504,17 @@ def test_pw_top_err_counters_are_recorded_and_never_gate() -> None:
     assert check(Host(pw_top=big))["verdict"] == "OK"
 
 
-def test_an_unreadable_user_blocks() -> None:
-    record = check(lambda argv, timeout=None: hp.Output(None), host=Host())
-    assert record["verdict"] == "BLOCKED" and record["reasons"] == ["host_audio:unverifiable (id -u failed)"]
+def test_counters_never_start_pipewire() -> None:
+    # No running pipewire: pw-top (which would socket-activate it) is never run.
+    host = Host()
+    host.pids["pipewire"] = ""
+    record = check(host)
+    assert record["pipewire_err_counters"]["start"]["skipped"] == "pipewire_not_running"
+    assert not any("pw-top" in line for line, _ in host.calls), host.calls
+    assert "host_audio:pipewire:not_running" in record["reasons"]
+    calls = [line for line, _ in host.calls]
+    guard = calls.index("pgrep -u 1000 -x pipewire")
+    assert guard < min([i for i, c in enumerate(calls) if "pw-top" in c] or [len(calls)])
 
 
 if __name__ == "__main__":

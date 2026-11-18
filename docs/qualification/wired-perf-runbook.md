@@ -577,13 +577,18 @@ command goes over the launcher's own ssh transport and options to `--host`,
 also for `localhost`, so the uid and the PipeWire session checked are the ones
 the soak runs as, even when an ssh config maps the host to another `User`.
 
-The checks run in this order, so the ones a launch depends on are the freshest:
+The checks run in this order, so the ones a launch depends on are the
+freshest; package maintenance is read once more, without waiting, as the very
+last read, so work that began during the others BLOCKs the launch
+(`... (at the final check)`):
 
 | Check | Reads | Result |
 | --- | --- | --- |
-| Package maintenance | processes `apt`, `apt-get`, `dpkg`, `unattended-upgr(ades)`, `apt.systemd.dai(ly)`; `systemctl is-active apt-daily.service apt-daily-upgrade.service`; PackageKit over `busctl` | Transient, so the chain **waits** for it, up to `--maintenance-wait-s` (default 900 s; 0 = BLOCKED at once) on a monotonic clock, with each probe's timeout capped to the time left; then BLOCKED. PackageKit is busy only with a transaction (`GetTransactionList`) or the package lock (`Locked`): an idle resident `packagekitd` does not block. The bus name is checked with `NameHasOwner` and the daemon is then addressed by its unique name, so the query never D-Bus-activates PackageKit. Unreadable state is BLOCKED. |
+| Package maintenance | processes `apt`, `apt-get`, `dpkg`, `unattended-upgr(ades)`, `apt.systemd.dai(ly)`; `systemctl is-active apt-daily.service apt-daily-upgrade.service`; PackageKit over `busctl --auto-start=no` | Transient, so the chain **waits** for it: after one first observation, polls share one monotonic deadline of `--maintenance-wait-s` (default 900 s; 0 = that one observation only), each command's whole budget (ssh included) is the time left, and a poll that completes after the deadline is rejected (`host_maintenance:wait_limit_exceeded`); still busy is BLOCKED. PackageKit is busy only with a transaction (`GetTransactionList`) or the package lock (`Locked`): an idle resident `packagekitd` does not block. The bus name is checked with `NameHasOwner` and the daemon then addressed by its validated unique name (`:N.M`), so the query never D-Bus-activates PackageKit; a reply without its exact shape is BLOCKED. |
+| PipeWire ERR counters (informational) | `pw-top -b -n 2`, only when a `pipewire` process of the soak user already runs | Never gated. Skipped (`pipewire_not_running`) otherwise, because connecting to a listening `pipewire.socket` would start PipeWire. |
 | PipeWire real-time | `ps -L -o cls,rtprio,comm -p PID` for every `pipewire` and `pipewire-pulse` process of the soak user | Every `pw-data-loop` thread must be `RR` or `FF`. A process that is not running, has no data-loop thread, or has any other class (`TS` is SCHED_OTHER) is BLOCKED. |
-| apt timers | `systemctl show -p NextElapseUSecRealtime -p NextElapseUSecMonotonic` for `apt-daily.timer` and `apt-daily-upgrade.timer`; the host's monotonic and realtime clocks | The earlier of the calendar and the monotonic (`OnBootSec=`, `OnUnitActiveSec=`, ...) elapse, at or before the host's now (read after the queries) + duration + `--timer-margin-s` (default 900 s: the launcher's setup and cleanup), is **refused**: BLOCKED, with the earliest safe start in the reason. It does not wait, because the wait could be hours. An overdue timer counts as inside. A missing property, an unparsable or impossible value, or an unreadable host clock is BLOCKED; an empty, `n/a` or `0` value means no next elapse. |
+| apt timers | `systemctl show -p NextElapseUSecRealtime -p NextElapseUSecMonotonic` for `apt-daily.timer` and `apt-daily-upgrade.timer`; the host's monotonic and realtime clocks | The earlier of the calendar and the monotonic (`OnBootSec=`, `OnUnitActiveSec=`, ...) elapse, at or before the host's now (read after the queries) + duration + `--timer-margin-s` (default 900 s: the launcher's setup and cleanup), is **refused**: BLOCKED, with the earliest safe start in the reason. It does not wait, because the wait could be hours. An overdue timer counts as inside. A missing property, an unparsable, impossible or out-of-range (over a century) value, or an unreadable host clock is BLOCKED; an empty, `n/a` or `0` value means no next elapse. |
+| Package maintenance (final) | as the first row, once, no wait | Any work seen now BLOCKs the launch. |
 
 The chain's build check is repeated right after the preflight, immediately
 before the launch: the only gap left is that `/proc` scan and the launcher's
@@ -593,7 +598,9 @@ start, and the stage's own build watch samples from its first second.
 A check that cannot be made (command failed), or a preflight that raises, is
 BLOCKED, not skipped. A BLOCKED stage exits 3, writes
 `stage-<N>s-not-run.json` naming every reason (`host_audio:...`,
-`host_maintenance:...`, `host_preflight:error`, `interference:...`) and the
+`host_maintenance:...`, `host_transport:...`, `host_preflight:error`,
+`host_preflight:invalid_record`, `interference:...`). The sidecar is strict
+JSON: a record that would hold NaN or Infinity is replaced by a BLOCKED one. and the
 later stages get theirs. The host is expected to keep `zucchi` in the
 `pipewire` group (limits.d grants rtprio 95) and to pin the timers outside the
 stage window, as the owner has
@@ -613,8 +620,11 @@ are host-node snapshots only, because the receiver's stream does not exist
 then; `.during` is sampled while the stage runs (first 120 s after the launch,
 then every 300 s) and keeps the first and latest sample that saw the
 receiver's stream, so compare those two for the stream and `start`/`end` for
-the sinks. Only the chain runs the preflight; a direct `aa-projection-perf.sh`
-invocation does not, so check the host by hand before one.
+the sinks. Every snapshot is taken only from a PipeWire that is already
+running. On a stop the chain TERMs the stage first and kills an in-flight
+sample's ssh; it never waits for a sample before forwarding the TERM. Only
+the chain runs the preflight; a direct `aa-projection-perf.sh` invocation
+does not, so check the host by hand before one.
 
 The chain handles SIGTERM/SIGINT with a stop flag, as the drive smoke does.
 Each stage runs in its own local process group: the launcher and its local
@@ -724,10 +734,20 @@ stdin, a non-PTY session sends no SIGHUP, and a dropped link would look the
 same as a stop. The explicit call also confirms the cleanup and has a fallback
 when the cleanup does not finish.
 
-Running the chain:
+Running the chain. **Prerequisite: an authenticated ssh target.** The
+launcher, and so the host preflight, reaches the soak host only over
+`ssh -o BatchMode=yes`, also when the chain runs on the Jetson itself. Pass
+`--host` explicitly as a key-authenticated target whose host key is already
+trusted, e.g. `--host zucchi@127.0.0.1` on the Jetson (the recorded Jetson
+chains used exactly that); check it first with
+`ssh -o BatchMode=yes "$SOAK_SSH_HOST" id -u`. The default `localhost` works
+only when that is set up for `localhost` too. When ssh fails, the stage is
+BLOCKED with `host_transport:ssh_failed (<ssh's message>)` or
+`host_transport:unreachable`, not run.
 
 ```bash
-tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" \
+SOAK_SSH_HOST=zucchi@127.0.0.1   # on the Jetson; else the Jetson's ssh target
+tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" --host "$SOAK_SSH_HOST" \
     --phone-serial "$SOAK_PHONE_SERIAL" --drive-smoke "$DRIVE_SMOKE_RESULT" \
     --media-uri file:///sdcard/Music/<tone>.opus --media-type audio/ogg \
     --media-component org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity \

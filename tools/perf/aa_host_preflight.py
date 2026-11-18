@@ -15,7 +15,8 @@ A/V or audio gate threshold is involved: a host that fails a check cannot
 qualify the audio at all, so the stage is BLOCKED, not run.
 
 Three checks, all read-only (``ps``, ``systemctl show/is-active``, ``busctl``
-calls addressed so they never D-Bus-activate a service):
+with ``--auto-start=no`` and validated unique names, so no service is ever
+started), run in this order:
 
 1. **Package maintenance** (first, because it may wait). No ``apt``,
    ``apt-get``, ``dpkg``, ``unattended-upgrades`` or ``apt.systemd.daily``
@@ -23,34 +24,40 @@ calls addressed so they never D-Bus-activate a service):
    active, and PackageKit idle. PackageKit counts as busy only when it is
    actually working: its bus name has an owner and that daemon reports a
    transaction (``GetTransactionList``) or holds the package lock
-   (``Locked``). An idle resident ``packagekitd`` does not count; one whose
-   state cannot be read is BLOCKED. The bus name is checked with
-   ``NameHasOwner`` and the daemon is then addressed by its unique name, so the
-   query never starts PackageKit. This check is transient, so the chain
-   **waits** for it: at most ``maintenance_wait_s`` (default 900 s,
-   0 = BLOCK at once) on a monotonic clock, polling every ``POLL_S``, with
-   each probe's timeout capped to the time left. Still busy after that is
-   BLOCKED.
-2. **Scheduling.** Checked after the wait, so a change during the wait is
-   seen. Every ``pw-data-loop`` thread of every ``pipewire`` and
-   ``pipewire-pulse`` process of the soak user must be SCHED_RR or SCHED_FF
-   (``ps -L -o cls,rtprio,comm -p PID``). A missing process, a missing
-   thread or any other class is BLOCKED.
-3. **Timers** (last). For ``apt-daily.timer`` and ``apt-daily-upgrade.timer``
-   both next elapses are read: ``NextElapseUSecRealtime`` (OnCalendar=) and
+   (``Locked``). An idle resident ``packagekitd`` does not count. The bus
+   name is checked with ``NameHasOwner`` and the daemon then addressed by its
+   unique name (``:N.M``, validated); any reply that does not have its exact
+   shape is unverifiable, so BLOCKED. Busy is transient, so the chain
+   **waits**: after one first observation, polls every ``POLL_S`` share one
+   monotonic deadline of ``maintenance_wait_s`` (default 900 s, 0 = that one
+   observation only); each command's whole budget is the time left, and a
+   poll that completes after the deadline is rejected. Still busy, or late,
+   is BLOCKED.
+2. **Informational counters, then scheduling.** ``pw-top`` runs only when a
+   ``pipewire`` process of the soak user already exists (a listening
+   ``pipewire.socket`` would otherwise start the daemon). Every
+   ``pw-data-loop`` thread of every ``pipewire`` and ``pipewire-pulse``
+   process must be SCHED_RR or SCHED_FF (``ps -L -o cls,rtprio,comm -p
+   PID``); a missing process, a missing thread or any other class is BLOCKED.
+3. **Timers.** For ``apt-daily.timer`` and ``apt-daily-upgrade.timer`` both
+   next elapses are read: ``NextElapseUSecRealtime`` (OnCalendar=) and
    ``NextElapseUSecMonotonic`` (OnBootSec=, OnUnitActiveSec=, ...; converted
-   through the host's own monotonic and realtime clocks). The earlier one
-   must be later than the stage's planned end plus a margin (default 900 s,
-   covering the launcher's setup and cleanup), counted from the host clock
-   read after the timer queries. Otherwise the stage is **refused**
-   (BLOCKED), with the earliest safe start in the reason; it does not wait,
-   because the wait could be hours. An overdue timer counts as inside the
-   window. A missing property, an unparsable or impossible value, or an
-   unreadable host clock is BLOCKED; an empty, ``n/a`` or ``0`` value means
-   that trigger has no next elapse.
+   through the host's own monotonic and realtime clocks, and bounded to a
+   century). The earlier one must be later than the stage's planned end plus
+   a margin (default 900 s, covering the launcher's setup and cleanup),
+   counted from the host clock read after the timer queries. Otherwise the
+   stage is **refused** (BLOCKED), with the earliest safe start in the
+   reason; it does not wait, because the wait could be hours. An overdue
+   timer counts as inside the window. A missing property, an unparsable,
+   impossible or out-of-range value, or an unreadable host clock is BLOCKED;
+   an empty, ``n/a`` or ``0`` value means that trigger has no next elapse.
+4. **Package maintenance again**, without waiting, as the very last read: work
+   that began during 2 and 3 BLOCKs the launch.
 
-Every command goes through an injected runner, so the checks are tested with
-canned output. Informational only: ``pw-top -b -n 2`` ERR counters per node
+The first command (``id -u``) also proves the transport: an ssh failure is
+reported as ``host_transport:...``, not as a uid problem. Every command goes
+through an injected runner, so the checks are tested with canned output.
+Informational only: ``pw-top -b -n 2`` ERR counters per node
 (``read_pw_top``), never gated.
 """
 from __future__ import annotations
@@ -59,6 +66,7 @@ import math
 import re
 import shlex
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -80,7 +88,6 @@ DEFAULT_TIMER_MARGIN_S = 900.0
 DEFAULT_MAINTENANCE_WAIT_S = 900.0
 POLL_S = 10.0
 COMMAND_TIMEOUT_S = 15.0
-MIN_PROBE_TIMEOUT_S = 1.0
 PW_TOP_TIMEOUT_S = 30.0
 SSH_CONNECT_TIMEOUT_S = 10
 # The launcher's own ssh options (aa-projection-perf.sh SSH_OPTS): the same
@@ -97,10 +104,13 @@ class Output:
     """One command's result; ``rc`` is None when it could not run or timed out."""
     rc: int | None
     stdout: str = ""
+    stderr: str = ""
 
 
-# runner(argv, timeout=None) -> Output; timeout None means the command's default.
+# runner(argv, timeout=None) -> Output. ``timeout`` is the whole subprocess
+# budget (for ssh: connection included); None means the command's default.
 Runner = Callable[..., Output]
+SSH_FAILED = 255  # ssh's own exit status: connection, host key or authentication
 
 
 def finite_seconds(value: float, name: str) -> float:
@@ -111,22 +121,59 @@ def finite_seconds(value: float, name: str) -> float:
     return value
 
 
-def local_runner(argv: Sequence[str], timeout: float | None = None) -> Output:
-    try:
-        done = subprocess.run(list(argv), capture_output=True, text=True, check=False,
-                              timeout=COMMAND_TIMEOUT_S if timeout is None else timeout)
-    except (OSError, subprocess.SubprocessError):
+def local_runner(argv: Sequence[str], timeout: float | None = None,
+                 cancel: threading.Event | None = None) -> Output:
+    """Run a command, bounded by ``timeout``; a set ``cancel`` kills it at once."""
+    budget = COMMAND_TIMEOUT_S if timeout is None else timeout
+    if budget <= 0 or (cancel is not None and cancel.is_set()):
         return Output(None)
-    return Output(done.returncode, done.stdout)
+    try:
+        process = subprocess.Popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   stdin=subprocess.DEVNULL, text=True)
+    except OSError:
+        return Output(None)
+    deadline = time.monotonic() + budget
+    while True:
+        step = min(0.2, deadline - time.monotonic())
+        try:
+            stdout, stderr = process.communicate(timeout=max(step, 0.01))
+            return Output(process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline or (cancel is not None and cancel.is_set()):
+                process.kill()
+                process.communicate()
+                return Output(None)
+
+
+def cancellable_runner(cancel: threading.Event) -> Runner:
+    """``local_runner`` that stops its command as soon as ``cancel`` is set."""
+    def run(argv: Sequence[str], timeout: float | None = None) -> Output:
+        return local_runner(argv, timeout, cancel)
+    return run
 
 
 def ssh_runner(host: str, local: Runner = local_runner) -> Runner:
-    """The launcher's transport: bounded, key-only ssh to ``host`` (also for localhost)."""
+    """The launcher's transport: bounded, key-only ssh to ``host`` (also for localhost).
+
+    A given ``timeout`` is the whole budget, connection included; the default
+    is the command's own budget plus the connection timeout.
+    """
     def run(argv: Sequence[str], timeout: float | None = None) -> Output:
         command = " ".join(shlex.quote(part) for part in argv)
-        budget = (COMMAND_TIMEOUT_S if timeout is None else timeout) + SSH_CONNECT_TIMEOUT_S
+        budget = COMMAND_TIMEOUT_S + SSH_CONNECT_TIMEOUT_S if timeout is None else timeout
         return local(["ssh", *SSH_OPTS, host, command], timeout=budget)
     return run
+
+
+def transport_failure(out: Output) -> str | None:
+    """A reason when ``out`` is ssh failing (exit 255), not the remote command."""
+    if out.rc is None:
+        return "host_transport:unreachable (no answer within the bound)"
+    if out.rc != SSH_FAILED:
+        return None
+    lines = [line.strip() for line in out.stderr.splitlines() if line.strip()]
+    detail = lines[-1][:160] if lines else "connection, host key or authentication"
+    return f"host_transport:ssh_failed ({detail})"
 
 
 # ---- PipeWire scheduling -----------------------------------------------------
@@ -167,19 +214,45 @@ def check_pipewire_scheduling(run: Runner, uid: str) -> dict:
 
 
 # ---- package maintenance -------------------------------------------------------
-def _busctl_value(text: str, signature: str) -> list[str] | None:
-    """``busctl`` text output ("b true", "ao 0", 's ":1.5"') -> its words after the signature."""
-    parts = text.split()
-    return parts[1:] if parts and parts[0] == signature else None
+_UNIQUE_NAME = re.compile(r'^":[0-9]+\.[0-9]+"$')
 
 
-def check_packagekit(run: Runner, timeout: float | None = None) -> dict:
-    """PackageKit is busy only with a transaction or the package lock; never activates it."""
+def _busctl_bool(out: Output, *prefix: str) -> bool | None:
+    """Exactly ``[prefix...] b true|false``; anything else is None (fail closed)."""
+    parts = out.stdout.split() if out.rc == 0 else []
+    if parts[:-1] != [*prefix, "b"] or parts[-1] not in ("true", "false"):
+        return None
+    return parts[-1] == "true"
+
+
+def _busctl_unique_name(out: Output) -> str | None:
+    """Exactly ``s ":N.M"``: a unique bus name, which a message can never activate."""
+    parts = out.stdout.split() if out.rc == 0 else []
+    return parts[1].strip('"') if len(parts) == 2 and parts[0] == "s" and _UNIQUE_NAME.match(parts[1]) else None
+
+
+def _busctl_paths(out: Output) -> int | None:
+    """Exactly ``ao N path...`` with N paths: the count, else None."""
+    parts = out.stdout.split() if out.rc == 0 else []
+    if len(parts) < 2 or parts[0] != "ao" or not parts[1].isdigit() or len(parts) != 2 + int(parts[1]):
+        return None
+    return int(parts[1])
+
+
+BUSCTL = ("busctl", "--system", "--auto-start=no")
+
+
+def check_packagekit(run: Runner, timeout: Callable[[], float | None] = lambda: None) -> dict:
+    """PackageKit is busy only with a transaction or the package lock; never activates it.
+
+    Every reply must have its exact shape, and the daemon is addressed only by
+    a validated unique name (``:N.M``), with ``--auto-start=no`` on every call
+    as well; a malformed reply is unverifiable (BLOCKED), never a pass.
+    """
     def owner_present() -> bool | None:
-        out = run(["busctl", "--system", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
-                   "org.freedesktop.DBus", "NameHasOwner", "s", PACKAGEKIT_NAME], timeout=timeout)
-        value = _busctl_value(out.stdout, "b") if out.rc == 0 else None
-        return None if not value else value[0] == "true"
+        return _busctl_bool(run([*BUSCTL, "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                 "org.freedesktop.DBus", "NameHasOwner", "s", PACKAGEKIT_NAME],
+                                timeout=timeout()))
 
     unverifiable = {"ok": False, "unverifiable": True,
                     "reasons": ["host_maintenance:packagekit:unverifiable (busctl failed)"]}
@@ -188,33 +261,32 @@ def check_packagekit(run: Runner, timeout: float | None = None) -> dict:
         return unverifiable
     if not present:
         return {"ok": True, "unverifiable": False, "reasons": [], "daemon": False}
-    owner = run(["busctl", "--system", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
-                 "org.freedesktop.DBus", "GetNameOwner", "s", PACKAGEKIT_NAME], timeout=timeout)
-    unique = _busctl_value(owner.stdout, "s") if owner.rc == 0 else None
-    if not unique:  # it may just have exited on idle
+    owner = run([*BUSCTL, "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                 "org.freedesktop.DBus", "GetNameOwner", "s", PACKAGEKIT_NAME], timeout=timeout())
+    name = _busctl_unique_name(owner)
+    if name is None:  # it may just have exited on idle; a malformed reply is unverifiable
         return {"ok": True, "unverifiable": False, "reasons": [], "daemon": False} \
-            if owner_present() is False else unverifiable
-    name = unique[0].strip('"')  # a unique name: a message to it can never activate a service
-    transactions = run(["busctl", "--system", "call", name, PACKAGEKIT_PATH, PACKAGEKIT_NAME,
-                        "GetTransactionList"], timeout=timeout)
-    locked = run(["busctl", "--system", "get-property", name, PACKAGEKIT_PATH, PACKAGEKIT_NAME,
-                  "Locked"], timeout=timeout)
-    listed = _busctl_value(transactions.stdout, "ao") if transactions.rc == 0 else None
-    lock = _busctl_value(locked.stdout, "b") if locked.rc == 0 else None
-    if not listed or not listed[0].isdigit() or not lock or lock[0] not in ("true", "false"):
+            if owner.rc != 0 and owner_present() is False else unverifiable
+    count = _busctl_paths(run([*BUSCTL, "call", name, PACKAGEKIT_PATH, PACKAGEKIT_NAME,
+                               "GetTransactionList"], timeout=timeout()))
+    is_locked = _busctl_bool(run([*BUSCTL, "call", name, PACKAGEKIT_PATH, "org.freedesktop.DBus.Properties",
+                                  "Get", "ss", PACKAGEKIT_NAME, "Locked"], timeout=timeout()), "v")
+    if count is None or is_locked is None:
         return unverifiable
-    count, is_locked = int(listed[0]), lock[0] == "true"
     reasons = ([f"host_maintenance:packagekit_transactions ({count})"] if count else []) + \
         (["host_maintenance:packagekit_locked"] if is_locked else [])
     return {"ok": not reasons, "unverifiable": False, "reasons": reasons, "daemon": True,
             "transactions": count, "locked": is_locked}
 
 
-def check_package_maintenance(run: Runner, timeout: float | None = None) -> dict:
-    """Maintenance processes running, an apt-daily service active, or PackageKit working."""
+def check_package_maintenance(run: Runner, timeout: Callable[[], float | None] = lambda: None) -> dict:
+    """Maintenance processes running, an apt-daily service active, or PackageKit working.
+
+    ``timeout()`` is asked before every command, so a poll shares one deadline.
+    """
     reasons, running, active = [], [], []
     unverifiable = False
-    ps = run(["ps", "-e", "-o", "pid=,comm="], timeout=timeout)
+    ps = run(["ps", "-e", "-o", "pid=,comm="], timeout=timeout())
     if ps.rc != 0:
         unverifiable = True
         reasons.append("host_maintenance:unverifiable (ps failed)")
@@ -223,7 +295,7 @@ def check_package_maintenance(run: Runner, timeout: float | None = None) -> dict
             parts = line.split(None, 1)
             if len(parts) == 2 and parts[1].strip() in MAINTENANCE_PROCESSES:
                 running.append({"pid": int(parts[0]), "comm": parts[1].strip()})
-    states = run(["systemctl", "is-active", *MAINTENANCE_SERVICES], timeout=timeout)
+    states = run(["systemctl", "is-active", *MAINTENANCE_SERVICES], timeout=timeout())
     lines = states.stdout.split()
     if states.rc is None or len(lines) != len(MAINTENANCE_SERVICES):
         unverifiable = True
@@ -246,7 +318,8 @@ _ELAPSE = re.compile(r"^(?:[A-Z][a-z]{2} )?(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2
 _SPAN_UNITS = {"us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3, "s": 1.0, "sec": 1.0,
                "m": 60.0, "min": 60.0, "h": 3600.0, "hr": 3600.0, "d": 86400.0,
                "w": 604800.0, "M": 2629800.0, "month": 2629800.0, "y": 31557600.0}
-_SPAN_PART = re.compile(r"(\d+(?:\.\d+)?)([a-zA-Z]+)")
+_SPAN_PART = re.compile(r"(\d{1,12}(?:\.\d{1,9})?)([a-zA-Z]+)")
+MONOTONIC_MAX_S = 100 * 31557600.0  # a CLOCK_MONOTONIC point beyond a century is not a real elapse
 _NONE_VALUES = ("", "n/a", "0", "infinity")
 
 
@@ -289,6 +362,8 @@ def parse_monotonic(value: str) -> tuple[str, float | None]:
         if not match or match.group(2) not in _SPAN_UNITS:
             return "unparsable", None
         total += float(match.group(1)) * _SPAN_UNITS[match.group(2)]
+    if not math.isfinite(total) or total > MONOTONIC_MAX_S:
+        return "unparsable", None
     return "time", total
 
 
@@ -345,6 +420,10 @@ def check_apt_timers(run: Runner, stage_s: float, margin_s: float = DEFAULT_TIME
             elapses.append(item["realtime"]["value"])
         if item["monotonic"]["state"] == "time":  # a CLOCK_MONOTONIC point: map it to the epoch
             elapses.append(host_now + item["monotonic"]["value"] - host_mono)
+        if not all(math.isfinite(value) for value in elapses):  # never write a non-JSON value
+            item["next_elapse_epoch"] = None
+            reasons.append(f"host_maintenance:{item['unit']}:next_elapse_not_finite")
+            continue
         item["next_elapse_epoch"] = min(elapses) if elapses else None
         epoch = item["next_elapse_epoch"]
         if epoch is not None and epoch <= window_end:
@@ -387,9 +466,14 @@ def read_pw_top(run: Runner, uid: str, receiver: str | None = None, now: float |
     name contains the receiver binary's name (or ``aa-wired-receiver``); a sink is
     a node named ``*_output.*``. Failure to read is recorded, not raised.
     """
+    record: dict = {"time": time.time() if now is None else now, "source": "pw-top -b -n 2"}
+    # pw-top connects to the PipeWire socket, and a listening pipewire.socket would
+    # start the daemon: read only from a daemon that is already running.
+    running = run(["pgrep", "-u", uid, "-x", "pipewire"])
+    if running.rc != 0 or not running.stdout.split():
+        return {**record, "skipped": "pipewire_not_running" if running.rc == 1 else "pgrep failed"}
     out = run(["env", f"XDG_RUNTIME_DIR=/run/user/{uid}", "pw-top", "-b", "-n", "2"],
               timeout=PW_TOP_TIMEOUT_S)
-    record: dict = {"time": time.time() if now is None else now, "source": "pw-top -b -n 2"}
     if out.rc != 0:
         return {**record, "error": "pw-top failed" if out.rc is not None else "pw-top could not run"}
     rows = parse_pw_top(out.stdout)
@@ -402,11 +486,16 @@ def read_pw_top(run: Runner, uid: str, receiver: str | None = None, now: float |
             "nodes": rows[:COUNTER_ROWS_MAX], "nodes_truncated": len(rows) > COUNTER_ROWS_MAX}
 
 
-def soak_uid(run: Runner) -> str | None:
-    """The uid the runner's commands run as: the soak's user when it is the launcher's transport."""
+def soak_uid(run: Runner) -> tuple[str | None, str | None]:
+    """(uid, None) for the user the runner's commands run as, else (None, reason).
+
+    The first command over the transport: an ssh failure is reported as one.
+    """
     out = run(["id", "-u"])
     uid = out.stdout.strip()
-    return uid if out.rc == 0 and uid.isdigit() else None
+    if out.rc == 0 and uid.isdigit():
+        return uid, None
+    return None, transport_failure(out) or "host_audio:unverifiable (id -u failed)"
 
 
 # ---- the preflight -----------------------------------------------------------------
@@ -418,25 +507,33 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
               receiver: str | None = None) -> dict:
     """Run the checks; the record says OK or BLOCKED.
 
-    Order: the (possibly waiting) maintenance check first, then the
-    informational counters, then the scheduling and timer checks, so the ones
-    a launch depends on are as fresh as possible when the chain launches.
+    Order: the maintenance check, waiting while it is busy; the informational
+    counters (only from a PipeWire that is already running); scheduling; the
+    timers; and last a second, non-waiting maintenance read, so work that
+    began during the earlier reads is seen right before the chain launches.
+
+    The wait is bounded on ``monotonic``: every poll after the first
+    observation shares one deadline (each command's whole budget, ssh
+    connection included, is the time left), and a poll that completes after
+    the deadline is rejected (BLOCKED ``host_maintenance:wait_limit_exceeded``)
+    whatever it saw. ``maintenance_wait_s`` 0 is that single first observation.
     ``sleep`` returns False when the chain is stopped; the wait then ends and
     the record is BLOCKED ``host_maintenance:wait_interrupted``.
     """
     margin_s = finite_seconds(margin_s, "timer margin")
     maintenance_wait_s = finite_seconds(maintenance_wait_s, "maintenance wait")
     record: dict = {"schema": SCHEMA, "stage_s": stage_s, "started_epoch": now()}
-    uid = uid if uid is not None else soak_uid(run)
     if uid is None:
-        record.update(verdict="BLOCKED", reasons=["host_audio:unverifiable (id -u failed)"])
-        return record
+        uid, failure = soak_uid(run)
+        if uid is None:
+            record.update(verdict="BLOCKED", reasons=[failure])
+            return record
     record["uid"] = uid
 
     began = monotonic()
     deadline = began + maintenance_wait_s
-    maintenance = check_package_maintenance(run)
-    interrupted = False
+    maintenance = check_package_maintenance(run)  # the single first observation, default bounds
+    interrupted = late = False
     while not maintenance["ok"] and not maintenance["unverifiable"]:  # busy: wait, bounded
         remaining = deadline - monotonic()
         if remaining <= 0:
@@ -444,21 +541,29 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
         if sleep(min(POLL_S, remaining)) is False:
             interrupted = True
             break
-        remaining = deadline - monotonic()
-        if remaining <= 0:  # the bound is spent: no probe that could admit the stage late
+        if deadline - monotonic() <= 0:  # the bound is spent: no probe that could admit the stage late
             break
-        maintenance = check_package_maintenance(
-            run, timeout=max(MIN_PROBE_TIMEOUT_S, min(COMMAND_TIMEOUT_S, remaining)))
+        maintenance = check_package_maintenance(run, timeout=lambda: deadline - monotonic())
+        if monotonic() > deadline:  # finished late: what it saw no longer counts
+            late = True
+            break
     maintenance["waited_s"] = round(monotonic() - began, 3)
     maintenance["wait_limit_s"] = maintenance_wait_s
+    if late:
+        maintenance.update(ok=False)
+        maintenance["reasons"].append("host_maintenance:wait_limit_exceeded")
     if interrupted and not maintenance["ok"]:
         maintenance["reasons"].append("host_maintenance:wait_interrupted")
 
     counters = read_pw_top(run, uid, receiver, now())  # informational, before the fresh checks
     scheduling = check_pipewire_scheduling(run, uid)
     timers = check_apt_timers(run, stage_s, margin_s)
+    final = check_package_maintenance(run)  # last: nothing may have started since
     reasons = maintenance["reasons"] + scheduling["reasons"] + timers["reasons"]
+    if maintenance["ok"]:
+        reasons += [f"{reason} (at the final check)" for reason in final["reasons"]]
     record.update(package_maintenance=maintenance, pipewire_scheduling=scheduling, apt_timers=timers,
+                  package_maintenance_final=final,
                   pipewire_err_counters={"start": {**counters, "phase": "before_launch"}},
                   checked_epoch=now(), verdict="OK" if not reasons else "BLOCKED", reasons=reasons)
     return record
