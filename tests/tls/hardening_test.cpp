@@ -462,6 +462,10 @@ namespace aa::transport {
 struct TlsTransportTestAccess {
     static SSL* ssl(TlsTransport& transport) { return transport.impl_->ssl; }
     static int fd(TlsTransport& transport) { return transport.impl_->fd; }
+    // Inject a clock without configuring a ping cadence, to observe the default.
+    static void set_clock(TlsTransport& transport, std::function<Deadline()> now) {
+        transport.impl_->now = std::move(now);
+    }
 };
 }
 
@@ -714,4 +718,72 @@ TEST_F(FrameDeadlineTest, BackpressuredSendExpiresWithoutCancellation) {
     EXPECT_EQ(sent.error().code(), aa::ErrorCode::timeout);
     EXPECT_FALSE(cancellation.get_token().stop_requested());
     EXPECT_EQ(pair.client->send(frame).error().code(), aa::ErrorCode::transport_closed);
+}
+
+// Audit #89 L1: an unconfigured ping cadence must not leave an empty parser
+// waiting forever. The default is three 30 s intervals plus 10 s margin.
+TEST(TlsHardening, UnconfiguredIdlePeerHitsDefaultDeadline) {
+    namespace tr = aa::transport;
+    using namespace std::chrono_literals;
+    auto pair = tr::make_tls_loopback([] { return true; },
+        tr::TlsMode::encryption_only_compatibility);
+    ASSERT_TRUE(pair);
+    aa::core::CancellationSource cancellation;
+    bool client_open = false;
+    std::thread thread([&] { client_open = pair.value().client->open(cancellation.get_token()).has_value(); });
+    const auto server_open = pair.value().server->open({});
+    thread.join();
+    ASSERT_TRUE(client_open && server_open.has_value());
+    const auto epoch = std::chrono::steady_clock::now();
+    std::atomic<int> seconds{0};
+    tr::TlsTransportTestAccess::set_clock(*pair.value().client,
+        [&] { return epoch + std::chrono::seconds{seconds.load()}; });
+    PendingIo pending([&] { return pair.value().client->receive(); });
+    EXPECT_TRUE(pending.blocked_in_poll());
+    seconds = 99;
+    EXPECT_NE(pending.result.wait_for(100ms), std::future_status::ready);
+    seconds = 101;
+    const bool timed_out = pending.result.wait_for(500ms) == std::future_status::ready;
+    // Bound the negative control against the old unbounded wait.
+    if (!timed_out) cancellation.request_stop();
+    const auto result = pending.result.get();
+    EXPECT_TRUE(timed_out);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), aa::ErrorCode::timeout);
+}
+
+// Audit #89 L1: getaddrinfo name lookup is synchronous and escapes the
+// connect deadline and cancellation, so the TLS transport refuses hostnames.
+TEST(TlsHardening, ConnectAndListenRefuseHostnames) {
+    namespace tr = aa::transport;
+    using namespace std::chrono_literals;
+    auto hostname_listener = tr::TlsListener::listen("localhost", 0,
+        [](const tr::TlsPeerInfo&) { return true; },
+        tr::TlsMode::encryption_only_compatibility);
+    ASSERT_FALSE(hostname_listener);
+    EXPECT_EQ(hostname_listener.error().code(), aa::ErrorCode::transport_unavailable);
+    auto listener = tr::TlsListener::listen("127.0.0.1", 0,
+        [](const tr::TlsPeerInfo&) { return true; },
+        tr::TlsMode::encryption_only_compatibility);
+    ASSERT_TRUE(listener);
+    const auto port = listener.value()->port();
+    for (const auto mode : {tr::TlsMode::encryption_only_compatibility,
+                            tr::TlsMode::verified_peer_test_only}) {
+        auto client = tr::TlsTransport::connect("localhost", port, [] { return true; }, mode,
+            {std::chrono::steady_clock::now() + 2s, {}});
+        ASSERT_FALSE(client);
+        EXPECT_EQ(client.error().code(), aa::ErrorCode::transport_unavailable);
+    }
+    // Numeric IPv4 and IPv6 literals still connect.
+    auto numeric = tr::TlsTransport::connect("127.0.0.1", port, [] { return true; },
+        tr::TlsMode::encryption_only_compatibility);
+    EXPECT_TRUE(numeric);
+    auto v6_listener = tr::TlsListener::listen("::1", 0,
+        [](const tr::TlsPeerInfo&) { return true; },
+        tr::TlsMode::encryption_only_compatibility);
+    if (v6_listener) {
+        auto v6 = tr::TlsTransport::connect("::1", v6_listener.value()->port(),
+            [] { return true; }, tr::TlsMode::encryption_only_compatibility);
+        EXPECT_TRUE(v6);
+    }
 }

@@ -42,6 +42,8 @@ class TlsTransport final : public Transport {
     // false/throwing predicate makes every session step fail closed.
     using ApprovedPredicate = std::function<bool()>;
 
+    // `host` must be a numeric IPv4/IPv6 address: name lookup cannot honour
+    // the deadline or cancellation, so a hostname fails transport_unavailable.
     [[nodiscard]] static core::Result<std::unique_ptr<TlsTransport>>
     connect(const char *host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode);
 
@@ -52,9 +54,11 @@ class TlsTransport final : public Transport {
     ~TlsTransport() override;
 
     // No ping cadence is guaranteed by the protocol adapter: WiredSession only
-    // answers incoming pings. Enable idle expiry only when the caller knows
-    // the peer's maximum ping interval. Allow three missed intervals plus 10s
-    // scheduling margin; do not infer a cadence from a quiet phone.
+    // answers incoming pings. Idle expiry is always on: waiting for the next
+    // frame allows three missed ping intervals plus 10s scheduling margin.
+    // Until this is called the interval defaults to 30s (a 100s idle bound);
+    // a caller whose peer pings less often must set its maximum interval
+    // (up to 1h) rather than infer a cadence from a quiet phone.
     // The injected monotonic clock permits deterministic deadline tests.
     core::Result<void> set_peer_ping_interval(std::chrono::milliseconds interval,
         std::function<std::chrono::steady_clock::time_point()> now = {});
@@ -93,6 +97,7 @@ class TlsListener final {
   public:
     using ApprovedPredicate = std::function<bool(const TlsPeerInfo&)>;
 
+    // `host` must be a numeric address, as for TlsTransport::connect().
     [[nodiscard]] static core::Result<std::unique_ptr<TlsListener>>
     listen(const char *host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode);
 
