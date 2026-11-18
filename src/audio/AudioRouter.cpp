@@ -115,8 +115,9 @@ std::uint64_t LivePcmDriftCorrector::trim(core::Nanoseconds phase, std::uint64_t
         return 0;
     }
     const core::Nanoseconds excess{phase.count - policy_.target.count};
-    // #154 catch-up: a post-stall burst far behind its arrival drops the whole
-    // excess at once instead of max_trim per run (bounded by the run below).
+    // #154 catch-up: a run whose initial phase exceeds the catch-up watermark
+    // loses the whole excess above target at once instead of max_trim
+    // (bounded by the run below); the watermark gates the run, not each sample.
     const bool catching_up = catch_up && policy_.catch_up_watermark.count > 0
         && phase > policy_.catch_up_watermark;
     const core::Nanoseconds budget =

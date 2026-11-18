@@ -177,11 +177,17 @@ struct SinkWriteProgress final {
 // delivers its backlog in a burst stamped at arrival. Sequentialized after
 // the cursor, that burst places audio far behind its arrival - past the
 // 200 ms late-arrival cap, which ends the session - and the bounded max_trim
-// drains it at only ~117 ms/s. When catch_up_watermark > 0 and a run's phase
-// exceeds it, the whole excess above `target` is trimmed from the run's head
-// at once (bounded by the run). Only audio already more than the watermark
-// behind its arrival is dropped; it is counted in frames_trimmed and,
-// separately, frames_caught_up.
+// drains it at only ~117 ms/s. When catch_up_watermark > 0, the trigger is
+// run-level: a run whose initial phase (how far behind its arrival its first
+// sample would be placed) strictly exceeds the watermark has the whole excess
+// above `target` trimmed from its head at once, bounded by the run's length.
+// The watermark is therefore not a per-sample drop bound: the trim runs down
+// to `target`, so later dropped samples were less late than the watermark
+// (with a 90 ms watermark, a 4800-frame run at 100 ms phase loses 85 ms, of
+// which only the first 10 ms was over 90 ms late; its last dropped sample was
+// ~15 ms late). A phase at or below the watermark gets the ordinary bounded
+// trim. Every trimmed frame counts in frames_trimmed; frames_caught_up counts
+// only the part beyond what the bounded max_trim policy would have removed.
 struct LivePcmDriftPolicy final {
     bool enabled{false};
     core::Nanoseconds high_watermark{core::Nanoseconds{20'000'000LL}};
@@ -283,9 +289,10 @@ struct RouterStats final {
     std::uint64_t frames_decoded{};
     std::uint64_t frames_retained{};
     std::uint64_t frames_trimmed{};
-    // Subset of frames_trimmed dropped by the catch-up (#154) beyond the
-    // bounded drift trim: audio already more than the watermark behind its
-    // arrival.
+    // Subset of frames_trimmed: in runs whose initial phase exceeded the
+    // catch-up watermark (#154), the frames removed beyond the bounded
+    // max_trim drift trim the run would otherwise have had. That ordinary
+    // allowance stays in frames_trimmed only.
     std::uint64_t frames_caught_up{};
     std::uint64_t frames_silence{};
     std::uint64_t frames_output{};

@@ -4152,8 +4152,9 @@ struct BurstRoute final {
 // so the next real-time arrival fell more than 200 ms behind the cursor: a
 // "late" rejection, which the receiver latches as a session-ending
 // audio_sink_failure (reproduced live after a 500 ms pipewire-pulse pause).
-// With the catch-up, a chunk more than 90 ms behind its arrival is dropped
-// and the resumed arrival plays 18 ms behind it.
+// With the catch-up, a run placed more than 90 ms behind its arrival is
+// trimmed down to the 15 ms target at once (here each 42.7 ms chunk is
+// dropped whole) and the resumed arrival plays 18 ms behind it.
 TEST_F(AudioPipelineRoute, IncrementalStallBurstCatchesUpInsteadOfRejectingTheNextArrival) {
     BurstRoute burst{90'000'000};
     ASSERT_TRUE(burst.route);
@@ -4221,6 +4222,41 @@ TEST_F(AudioPipelineRoute, IncrementalGuidanceStallBurstIsCaughtUpLikeMedia) {
     ASSERT_TRUE(burst.drain());
     EXPECT_EQ(route.report().stats.frames_caught_up, 13U * (2048U - 240U));
     EXPECT_EQ(burst.observed->write_ns.back(), base.count + 118'000'000);
+}
+
+// The catch-up removes a partly retained run's head, not its tail: the oldest,
+// latest-placed samples go and the newest are kept, in order. Three chunks
+// leave the cursor 118 ms behind their shared arrival; a 200 ms ramp arriving
+// then is trimmed to the 15 ms target (103 ms = 4944 frames, 4704 of them
+// beyond the bounded 240-frame trim) and plays from frame 4944 onward.
+TEST_F(AudioPipelineRoute, IncrementalCatchUpTrimsTheRunHeadAndKeepsItsTail) {
+    BurstRoute burst{90'000'000};
+    ASSERT_TRUE(burst.route);
+    auto& route = *burst.route;
+    const auto chunk = constant_pcm({1000, 2048});
+    for (std::uint64_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(route.submit(make_message(media, i, base, chunk)));
+    }
+    std::vector<std::byte> ramp;
+    for (std::int16_t i = 0; i < 9600; ++i) {
+        const auto frame = constant_pcm({i, 1});
+        ramp.insert(ramp.end(), frame.begin(), frame.end());
+    }
+    ASSERT_TRUE(route.submit(make_message(media, 3, base, ramp)));
+
+    ASSERT_TRUE(burst.drain());
+
+    const auto& stats = route.report().stats;
+    EXPECT_EQ(stats.frames_trimmed, 2U * 240U + 4944U);
+    EXPECT_EQ(stats.frames_caught_up, 4944U - 240U);
+    EXPECT_EQ(stats.frames_retained, 2048U + 2U * 1808U + 4656U);
+    const auto flat = flatten_i16(burst.observed->writes);
+    constexpr std::size_t lead = 2048 + 2 * 1808;
+    ASSERT_EQ(flat.size(), (lead + 4656U) * 2U);
+    for (std::size_t i = 0; i < 4656; ++i) {
+        ASSERT_EQ(flat[(lead + i) * 2], static_cast<std::int16_t>(4944 + i)) << i;
+        ASSERT_EQ(flat[(lead + i) * 2 + 1], static_cast<std::int16_t>(4944 + i)) << i;
+    }
 }
 
 // Ordinary jitter never reaches the watermark: two chunks delivered together
