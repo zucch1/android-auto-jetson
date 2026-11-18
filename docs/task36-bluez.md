@@ -85,8 +85,10 @@ human-mediated during explicit enrollment only, never automatically approved.
    the explicit window. Approved reconnect still requires a fresh observation,
    exact full store lookup on its owner thread and actual BlueZ Paired=true AND
    Bonded=true. Missing Bonded is rejected, never treated as an implicit bond.
-   It enables only incoming AA service authorization, never re-pairing and never
-   generic Device1.Connect. Targetless action9 is rejected.
+   It enables incoming AA service authorization and pages that phone's HFP Audio
+   Gateway (`Device1.ConnectProfile(0000111f)`, fire and forget): a bonded phone's
+   Android Auto dials the AA RFCOMM profile only over a live link (Jetson windows
+   2/3, 2026-11-18). Never re-pairing and never generic Device1.Connect. Targetless action9 is rejected.
 6. NewConnection validates the real Unix-FD index, duplicates and owns one socket,
    rejects wrong/duplicate connections, and closes it on RequestDisconnection,
    cancel, idle expiry, owner change, receiver loss and teardown. Task37 now
