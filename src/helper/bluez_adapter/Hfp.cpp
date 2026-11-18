@@ -50,6 +50,18 @@ bool BluezBackend::Impl::unregister_profiles() {
     registered = false;
     return true;
 }
+// A bonded phone does not page the head unit by itself: its Android Auto dials the AA RFCOMM
+// profile only while it has a live link to us (it did so every ~5 s while the enrolment's HFP
+// link was up, and never after that link dropped). An approved reconnect therefore pages the
+// phone's HFP Audio Gateway from WirePlumber's Hands-Free unit: the one scoped audio profile the
+// AA flow already authorizes, never generic Device1.Connect. Fire and forget: paging takes
+// seconds, so no reply is awaited; success shows as the phone's AA NewConnection, and an
+// already-connected phone just answers AlreadyConnected.
+void BluezBackend::Impl::connect_hands_free(const std::string& device) {
+    if (!bus || owner.empty() || device.empty()) return;
+    g_dbus_connection_call(bus, owner.c_str(), device.c_str(), "org.bluez.Device1", "ConnectProfile",
+        g_variant_new("(s)", kHfpAgUuid), nullptr, G_DBUS_CALL_FLAGS_NO_AUTO_START, -1, nullptr, nullptr, nullptr);
+}
 int BluezBackend::Impl::socket_fd(GDBusMethodInvocation* invocation) {
     gint index{};
     g_variant_get_child(g_dbus_method_invocation_get_parameters(invocation), 1, "h", &index);

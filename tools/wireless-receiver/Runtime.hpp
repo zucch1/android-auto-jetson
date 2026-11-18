@@ -154,7 +154,12 @@ struct Runtime final {
                 if (configured || media.video.has_pending()) media.video.reset();
                 configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
             }
-            if (wants && attempting && !receiver.session() && turn >= attempt_until) defer();
+            if (wants && attempting && !receiver.session() && turn >= attempt_until) {
+                // Not an error code: the phone never reached the TCP listener in time (no RFCOMM
+                // bootstrap, or it never joined the AP). Say so instead of retrying silently.
+                log_line("{\"event\":\"wireless_admission_expired\",\"reason\":\"no_phone_connection\"}");
+                defer();
+            }
             if (wants && !receiver.session() && !attempting && turn >= retry) {
                 if (auto admitted = admit(state); !admitted) {
                     report("approved wireless admission", admitted.error().code()); defer();

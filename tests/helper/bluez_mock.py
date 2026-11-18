@@ -45,6 +45,8 @@ class MockBluez(ProfileSockets):
         self.owner_during_inventory = False
         self.removed: list[str] = []
         self.disconnected: list[str] = []
+        # Device1.ConnectProfile calls (path, uuid): an approved reconnect pages the phone's HFP AG.
+        self.paged: list[list[str]] = []
         self.cancel_unpaired = 0
         self.cancel_calls = 0
         self.properties = {"Pairable": True, "Discoverable": True}
@@ -61,7 +63,7 @@ class MockBluez(ProfileSockets):
 <interface name="org.bluez.AgentManager1"><method name="RegisterAgent"><arg type="o" direction="in"/><arg type="s" direction="in"/></method><method name="RequestDefaultAgent"><arg type="o" direction="in"/></method><method name="UnregisterAgent"><arg type="o" direction="in"/></method></interface>
 <interface name="org.freedesktop.DBus.Properties"><method name="Set"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/></method></interface>
 <interface name="org.bluez.Adapter1"><method name="RemoveDevice"><arg type="o" direction="in"/></method></interface>
-<interface name="org.bluez.Device1"><method name="CancelPairing"/><method name="Disconnect"/></interface>
+<interface name="org.bluez.Device1"><method name="CancelPairing"/><method name="Disconnect"/><method name="ConnectProfile"><arg type="s" direction="in"/></method></interface>
 </node>"""
         info = Gio.DBusNodeInfo.new_for_xml(xml)
         self.device_info = info.interfaces[5]
@@ -175,6 +177,8 @@ class MockBluez(ProfileSockets):
                 if self.disconnect_delay_ms:
                     GLib.timeout_add(self.disconnect_delay_ms, lambda: (invocation.return_value(None), False)[1])
                     return
+            case "ConnectProfile":
+                self.paged.append([_path, args.unpack()[0]])
             case "CancelPairing":
                 self.cancel_calls += 1
                 # BlueZ answers CancelPairing without an in-flight Pair() with MGMT Unpair Device.
@@ -272,6 +276,7 @@ class MockBluez(ProfileSockets):
                 return json.dumps({"properties": self.properties, "profile": self.profile,
                     "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper,
                     "disconnected": self.disconnected,
+                    "paged": self.paged,
                     "cancel_unpaired": self.cancel_unpaired,
                     # Every pairing-destructive call the helper made: RemoveDevice, CancelPairing
                     # and Disconnect. The adapter is shared (#136), so this must stay 0.

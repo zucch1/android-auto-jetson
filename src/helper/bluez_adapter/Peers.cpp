@@ -145,8 +145,10 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     impl_->close_window();
     impl_->allowed = *observed;
     impl_->window = impl_->now() + std::chrono::seconds(60);
-    // The AA profile is a server: the bonded phone initiates RFCOMM. No generic
-    // Device1.Connect (which could activate unrelated audio profiles) is used.
+    // The AA profile is a server: the bonded phone initiates RFCOMM, but only over a live
+    // link, so the window pages the phone's HFP Audio Gateway (scoped ConnectProfile). No
+    // generic Device1.Connect (which could activate unrelated audio profiles) is used.
+    impl_->connect_hands_free(observed->device.path);
     return State::active;
 }
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {

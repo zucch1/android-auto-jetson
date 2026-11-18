@@ -334,6 +334,21 @@ std::size_t state_number(MockBluez& mock, const char* key) {
     const auto at = state.find(std::string{"\""} + key + "\": ");
     return at == std::string::npos ? 0U : std::stoul(state.substr(at + std::string{key}.size() + 4));
 }
+// Device1.ConnectProfile(HFP Audio Gateway) pages of the primary device the mock received. The
+// helper sends them without awaiting a reply, so a positive count is polled for.
+std::size_t hands_free_pages(MockBluez& mock, std::size_t at_least = 0) {
+    using namespace std::chrono_literals;
+    const std::string page = "[\"/org/bluez/hci0/dev_02_00_00_00_00_01\", \"0000111f-0000-1000-8000-00805f9b34fb\"]";
+    std::size_t count = 0;
+    for (int attempt = 0; attempt < (at_least ? 100 : 5); ++attempt) {
+        const auto state = mock.command("state");
+        count = 0;
+        for (auto i = state.find(page); i != std::string::npos; i = state.find(page, i + 1)) ++count;
+        if (at_least && count >= at_least) return count;
+        std::this_thread::sleep_for(20ms);
+    }
+    return count;
+}
 const helper::PeerIdentity primary_peer{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
 bool peer_in(const std::string& directory, const char* file) {
     return std::filesystem::exists(directory + "/" + file) &&
@@ -353,6 +368,7 @@ void expect_refused_everywhere(helper::BluezBackend& backend, MockBluez& mock) {
     const auto obs = backend.observe();
     ASSERT_TRUE(obs);
     EXPECT_FALSE(backend.reconnect_peer(obs.value().handle)) << "a forgotten phone reconnected";
+    EXPECT_EQ(hands_free_pages(mock), 0U) << "a forgotten phone was paged";
     EXPECT_EQ(bluez_callback(backend, mock, "NewConnection"), "rejected")
         << "a forgotten phone got the Android Auto profile";
     EXPECT_EQ(bluez_callback(backend, mock, "AuthorizeService"), "rejected")
@@ -657,10 +673,14 @@ TEST_F(ManagedBonds, NormalRestartAfterSuccessfulSyncAdmitsLoadedEntries) {
     const auto early = restarted.observe();
     ASSERT_TRUE(early);
     EXPECT_FALSE(restarted.reconnect_peer(early.value().handle)) << "admitted before the first reconciliation";
+    EXPECT_EQ(hands_free_pages(mock), 0U) << "a refused reconnect paged the phone";
     ASSERT_TRUE(restarted.reconcile_bonds({primary}));
     const auto reconn_obs = restarted.observe();
     ASSERT_TRUE(reconn_obs);
     EXPECT_TRUE(restarted.reconnect_peer(reconn_obs.value().handle));
+    // A bonded phone's Android Auto dials the AA RFCOMM profile only over a live link: the
+    // approved reconnect pages exactly that phone's HFP Audio Gateway, never generic Connect.
+    EXPECT_EQ(hands_free_pages(mock, 1), 1U) << mock.command("state");
 }
 
 // Finding B: revocation demotes the admitted bond to history and keeps it in BlueZ (#136). A fresh
