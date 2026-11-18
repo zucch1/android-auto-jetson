@@ -200,3 +200,19 @@ def stall_dropouts() -> None:
 if __name__ == "__main__":
     globals()[sys.argv[1]]()
     print(f"PASS review-{sys.argv[1]}")
+
+
+def test_lost_receiver_state_records_invalidate_the_capture():
+    # #90 review: under a stalled stdout the receiver parks gate-relevant state
+    # records (active, err, audio_stall_bypass, video_profile, idr_*). A summary
+    # naming lost state records makes the capture invalid; droppable runtime
+    # records alone feed no collector metric and do not.
+    lost = collector.EventParser()
+    lost._consume(json.dumps({"event": "runtime_log_dropped", "backpressure": 9, "state_overflow": 2}))
+    assert "state_log_dropped" in lost.invalid_telemetry
+    legacy = collector.EventParser()  # a summary without the field cannot vouch for state
+    legacy._consume(json.dumps({"event": "runtime_log_dropped", "backpressure": 9}))
+    assert "state_log_dropped" in legacy.invalid_telemetry
+    benign = collector.EventParser()
+    benign._consume(json.dumps({"event": "runtime_log_dropped", "backpressure": 9, "state_overflow": 0}))
+    assert "state_log_dropped" not in benign.invalid_telemetry

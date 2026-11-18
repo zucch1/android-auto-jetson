@@ -290,9 +290,22 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
                                invalid_audio_slots=invalid_audio, **av))
 
     verdict = "PASS" if all(c["passed"] is not False for c in criteria) else "FAIL"
+    # #90 review: the criteria above read video_profile, idr_* and
+    # session_state_changed. If the receiver lost any of these state records
+    # (runtime_log_dropped.state_overflow > 0, or a summary without the field),
+    # neither PASS nor FAIL is evidenced: BLOCKED.
+    lost = [e for e in receiver if e.get("event") == "runtime_log_dropped"
+            and not (isinstance(e.get("state_overflow"), int)
+                     and not isinstance(e.get("state_overflow"), bool)
+                     and e["state_overflow"] == 0)]
+    blocked_on = None
+    if lost:
+        verdict, blocked_on = "BLOCKED", "receiver_state_log_dropped"
     seconds = (min(cutoff, stopped_ns or cutoff) - start_ns) / 1e9 if start_ns and cutoff else None
     return {
         "verdict": verdict,
+        **({"blocked_on": blocked_on} if blocked_on else {}),
+        "receiver_state_log_lost": len(lost),
         "criteria": criteria,
         "negotiated_profile": profile and {k: profile.get(k) for k in ("width", "height", "fps", "codec")},
         "measured": {

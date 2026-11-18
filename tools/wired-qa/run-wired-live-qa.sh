@@ -288,6 +288,28 @@ fi
 # requires an ACTIVE session AND all three delivery paths observed: painted
 # frames with render_ok, successful-pump audio_chunks plus media_timing, and
 # input_forwarded ok:true. Final media_timing alone can follow a failed pump.
+# Fail closed on an incomplete receiver log (#90 review): lost state records
+# (state_overflow > 0, e.g. `active`) make any verdict BLOCKED; dropped runtime
+# records (input_forwarded) can only hide evidence, so a would-be FAILED is
+# BLOCKED. A PASS rests on positive evidence and stands.
+log_drop_records=0; log_state_lost=0
+log_drops="$(remote "grep -o '\"event\":\"runtime_log_dropped\"[^}]*' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log 2>/dev/null" || true)"
+while IFS= read -r line; do
+    [[ "$line" == *runtime_log_dropped* ]] || continue
+    log_drop_records=$(( log_drop_records + 1 ))
+    if [[ "$line" =~ \"state_overflow\":(0|[1-9][0-9]{0,17}) ]]; then
+        log_state_lost=$(( log_state_lost + BASH_REMATCH[1] ))
+    fi
+done <<< "$log_drops"
+if (( log_state_lost > 0 )); then
+    write_result "BLOCKED" "receiver_state_log_dropped" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 3
+fi
+if (( log_drop_records > 0 )) && [[ "$projection" != "true" || "$session_active" != "true" ||
+      "$video" != "true" || "$audio" != "true" || "$input" != "true" ]]; then
+    write_result "BLOCKED" "receiver_runtime_log_dropped" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 3
+fi
 if [[ "$projection" != "true" || "$session_active" != "true" ]]; then
     write_result "FAILED" "session_not_active" "$projection" "$video" "$audio" "$input" "$budget_ms"
     exit 4

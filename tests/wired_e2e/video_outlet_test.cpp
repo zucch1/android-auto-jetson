@@ -139,6 +139,26 @@ TEST(WiredReceiver, VideoOutletRoutesPeriodicRecordsToMediaLogOnly) {
     EXPECT_EQ(media[1].first, "decode_stats");
 }
 
+TEST(WiredReceiver, VideoOutletFinalDecodeStatsReachLifecycleSinkAfterAPeriodicCopy) {
+    // Given the periodic decode_stats for the current count already went to the
+    // lossy media sink (which a stalled stdout may have dropped).
+    std::vector<std::string> lifecycle;
+    std::vector<std::pair<std::string, std::string>> media;
+    VideoOutlet outlet{[&](const std::string& line) { lifecycle.push_back(line); },
+                       [&](std::string_view kind, const std::string& line) {
+                           media.emplace_back(std::string{kind}, line);
+                       }};
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 1, {}}, wiredtest::kVideoIdr}));
+    ASSERT_EQ(media.size(), 2U);
+    ASSERT_EQ(media[1].second, "{\"event\":\"decode_stats\",\"frame_drops\":1}");
+    // When the outlet closes (twice: explicit close, then the destructor's).
+    outlet.close();
+    outlet.close();
+    // Then the final cumulative count reaches the lifecycle sink exactly once.
+    ASSERT_EQ(lifecycle.size(), 1U);
+    EXPECT_EQ(lifecycle.back(), "{\"event\":\"decode_stats\",\"frame_drops\":1}");
+}
+
 TEST(WiredReceiver, VideoOutletUnrelatedSocketIoStillPropagates) {
     // Given a connected peer but a locally disabled producer write side.
     auto pair = videotest::make_pair({});

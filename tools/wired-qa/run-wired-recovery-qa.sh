@@ -342,6 +342,24 @@ log_since() {
     remote "tail -c +$(( $1 + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null" || true
 }
 
+# Receiver log completeness (#90 review). Under a stalled stdout the receiver
+# drops only droppable runtime records and reports them in-band as
+# runtime_log_dropped; gate-relevant state records are parked and delivered
+# unless the bounded slot overflowed ("state_overflow":N > 0). Prints
+# "<runtime drop records> <state records lost>".
+receiver_log_loss() {
+    local drops line records=0 lost=0
+    drops="$(remote "grep -o '\"event\":\"runtime_log_dropped\"[^}]*' /tmp/aa-wired-receiver.log 2>/dev/null" || true)"
+    while IFS= read -r line; do
+        [[ "$line" == *runtime_log_dropped* ]] || continue
+        records=$(( records + 1 ))
+        if [[ "$line" =~ \"state_overflow\":(0|[1-9][0-9]{0,17}) ]]; then
+            lost=$(( lost + BASH_REMATCH[1] ))
+        fi
+    done <<< "$drops"
+    printf '%s %s\n' "$records" "$lost"
+}
+
 # The receiver's run-cumulative reconnect-attempt counter ("retries":N).
 retries_total() {
     remote "grep -o '\"retries\":[0-9]*' /tmp/aa-wired-receiver.log 2>/dev/null | grep -o '[0-9]*' | sort -n | tail -1" || true
@@ -1092,6 +1110,19 @@ while IFS='|' read -r name status recovery retries evidence detail frames_baseli
         *) overall="FAILED"; blocked_on="${blocked_on:+${blocked_on},}${name}:${detail}" ;;
     esac
 done < "${RESULTS_TSV}"
+
+# Fail closed on an incomplete receiver log (#90 review): lost state records
+# (reconnect / session_state / err / idr) can fake or hide any verdict, so the
+# run is BLOCKED; dropped runtime records (input_forwarded evidence) can only
+# fake a FAILED, so a FAILED becomes BLOCKED. Original details stay listed.
+read -r log_drop_records log_state_lost < <(receiver_log_loss)
+if (( log_state_lost > 0 )); then
+    overall="BLOCKED"
+    blocked_on="receiver_log:state_log_dropped${blocked_on:+,${blocked_on}}"
+elif (( log_drop_records > 0 )) && [[ "$overall" == FAILED ]]; then
+    overall="BLOCKED"
+    blocked_on="receiver_log:runtime_log_dropped${blocked_on:+,${blocked_on}}"
+fi
 
 write_result "$overall" "$blocked_on"
 if [[ -n "${ONLY}" ]]; then

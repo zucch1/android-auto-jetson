@@ -42,8 +42,13 @@ namespace aa::wired_receiver {
 //     FIFO side slot (state_capacity records) and promoted into the queue, in
 //     order and ahead of later records, as soon as the drain frees space.
 //     Lossless submit() waits behind parked records, so a transition is never
-//     overtaken by `stopping`. Only overflowing the side slot drops (counted
-//     as runtime drops).
+//     overtaken by `stopping`. Only overflowing the side slot drops: counted as
+//     runtime drops and, separately, as runtime_log_dropped.state_overflow, the
+//     field gate consumers fail closed on.
+//   * Drop summaries (media_telemetry_dropped, runtime_log_dropped) are
+//     bookkeeping: before finish() they only take space that still leaves a slot
+//     for the next real record and never overtake a parked state record, so a
+//     freed slot goes to the event, not the summary (#90 review P3).
 //   * submit_media(): phone-driven media telemetry (audio completions, periodic
 //     video events). Audit L13: a hostile or merely chatty phone can sustain
 //     media traffic, so these records are rate-limited per kind with a token
@@ -148,7 +153,6 @@ public:
             return {};
         }
         s.promote_parked();
-        s.report_drops_if_due(at, false);
         const auto charge = record.size() + 1;
         // A chunked oversize record must stay contiguous, and a full queue must
         // never make a media thread wait for the sink.
@@ -156,7 +160,10 @@ public:
             ++s.drops.backpressure;
             return {};
         }
+        // The record takes the freed slot first; a due drop summary only follows
+        // it when headroom remains (#90 review P3).
         s.push(record, charge);
+        s.report_drops_if_due(at, false);
         s.changed.notify_all();
         return {};
     }
@@ -171,13 +178,13 @@ public:
         if (s.error) { return s.error; }
         if (s.closed) { return closed_error(); }
         s.promote_parked();
-        s.report_runtime_drops_if_due(s.now(), false);
         const auto charge = record.size() + 1;
         if (s.chunked || record.size() >= byte_capacity || !s.space(charge)) {
             ++s.runtime_dropped;
             return {};
         }
         s.push(record, charge);
+        s.report_runtime_drops_if_due(s.now(), false);
         s.changed.notify_all();
         return {};
     }
@@ -197,7 +204,10 @@ public:
             return {};
         }
         if (record.size() >= byte_capacity || s.parked.size() >= state_capacity) {
+            // Gate-relevant loss: reported separately as state_overflow so a
+            // consumer can fail closed (#90 review).
             ++s.runtime_dropped;
+            ++s.state_dropped;
             return {};
         }
         s.parked.emplace_back(record);
@@ -218,6 +228,12 @@ public:
     [[nodiscard]] std::uint64_t runtime_drops() const {
         const std::lock_guard lock(state_->mutex);
         return state_->runtime_dropped;
+    }
+
+    // State records lost because the parked slot overflowed (subset of runtime_drops()).
+    [[nodiscard]] std::uint64_t state_overflow_drops() const {
+        const std::lock_guard lock(state_->mutex);
+        return state_->state_dropped;
     }
 
     [[nodiscard]] MediaDrops media_drops() const {
@@ -331,6 +347,8 @@ private:
         std::uint64_t shutdown_dropped = 0;
         std::uint64_t runtime_dropped = 0;
         std::uint64_t runtime_reported = 0;
+        std::uint64_t state_dropped = 0;
+        std::uint64_t state_reported = 0;
         Clock::time_point last_runtime_report{};
         bool runtime_reported_once = false;
         MediaDrops drops{0, 0};
@@ -346,6 +364,15 @@ private:
             return charge <= byte_capacity - bytes && queue.size() < entry_capacity;
         }
         bool stopping() const { return running && !running->load(); }
+        // A drop summary is bookkeeping: outside finish() it may only use space
+        // that leaves a slot for the next real record, and it never overtakes a
+        // parked state record (#90 review P3).
+        bool summary_fits(std::size_t charge, bool final) const {
+            if (chunked) { return false; }
+            if (final) { return space(charge); }
+            return parked.empty() && charge <= byte_capacity - bytes &&
+                   queue.size() + 1 < entry_capacity;
+        }
         // Waits for room for `charge`. Unbounded while the owner is running
         // (issue #60); bounded by `shutdown_wait` once it is not. Returns false
         // only when the shutdown bound expired with the queue still full.
@@ -428,7 +455,7 @@ private:
             const std::string line = "{\"event\":\"media_telemetry_dropped\",\"rate_limited\":" +
                                      std::to_string(rate) + ",\"backpressure\":" +
                                      std::to_string(pressure) + "}";
-            if (chunked || !space(line.size() + 1)) { return; }
+            if (!summary_fits(line.size() + 1, final)) { return; }
             push(line, line.size() + 1);
             reported = drops;
             last_report = at;
@@ -444,10 +471,12 @@ private:
                 return;
             }
             const std::string line = "{\"event\":\"runtime_log_dropped\",\"backpressure\":" +
-                                     std::to_string(pressure) + "}";
-            if (chunked || !space(line.size() + 1)) { return; }
+                                     std::to_string(pressure) + ",\"state_overflow\":" +
+                                     std::to_string(state_dropped - state_reported) + "}";
+            if (!summary_fits(line.size() + 1, final)) { return; }
             push(line, line.size() + 1);
             runtime_reported = runtime_dropped;
+            state_reported = state_dropped;
             last_runtime_report = at;
             runtime_reported_once = true;
             changed.notify_all();

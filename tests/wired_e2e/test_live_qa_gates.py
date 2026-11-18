@@ -149,6 +149,7 @@ if [[ "$cmd" == *grep* ]]; then
             printf '%s\n' "{\"event\":\"input_forwarded\",\"ok\":\"${FAKE_INPUT_OK:-true}\"}" >> "$log"
         fi
     fi
+    [[ -z "${FAKE_LOG_DROPS:-}" ]] || printf '%s\n' "$FAKE_LOG_DROPS" >> "$log"
     cmd="${cmd//\/tmp\/aa-wired-receiver.log/$log}"
     cmd="${cmd//"$FAKE_TARGET/aa-wired-receiver.log"/$log}"
     bash -c "$cmd"
@@ -248,6 +249,27 @@ class LiveQaGates(unittest.TestCase):
         obs = doc["observables"]
         self.assertTrue(obs["projection_reached"] and obs["video_present"]
                         and obs["audio_present"] and obs["input_evidence"])
+
+    def test_lost_receiver_state_records_block_even_a_pass(self) -> None:
+        # Given: every observable seen, but the receiver lost state records
+        # (#90 review: e.g. `active`) under a stalled stdout.
+        drops = '{"event":"runtime_log_dropped","backpressure":2,"state_overflow":1}'
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                FAKE_STATE='string "projecting"', FAKE_LOG_DROPS=drops)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        self.assertEqual(doc["blocked_on"], "receiver_state_log_dropped")
+
+    def test_droppable_runtime_loss_blocks_missing_input_but_keeps_a_pass(self) -> None:
+        drops = '{"event":"runtime_log_dropped","backpressure":2,"state_overflow":0}'
+        # Given: input_forwarded may have been dropped: missing input is not a FAILED.
+        code, doc = self.run_qa(False, FAKE_OBS_INPUT="0", FAKE_LOG_DROPS=drops)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["blocked_on"], "receiver_runtime_log_dropped")
+        # And: a PASS on positive evidence stands.
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                FAKE_STATE='string "projecting"', FAKE_LOG_DROPS=drops)
+        self.assertEqual(code, 0, doc)
 
     def test_failed_input_attempt_is_not_delivery(self) -> None:
         code, doc = self.run_qa(False, FAKE_INPUT_OK="false")

@@ -726,6 +726,14 @@ class EventParser:
                     self._number({"invalid": None}, "invalid", target)
         if envelope == "err":
             self.terminal_errors.append({"event": "err", "code": str(event.get("code", "unknown"))})
+        # #90 review: lost gate-relevant state records (active / err /
+        # audio_stall_bypass / video_profile / idr_*) invalidate the capture;
+        # droppable runtime records alone do not feed any collector metric.
+        if envelope == "runtime_log_dropped":
+            lost = event.get("state_overflow")
+            if (not isinstance(lost, int) or isinstance(lost, bool) or lost > 0) and \
+                    "state_log_dropped" not in self.invalid_telemetry:
+                self.invalid_telemetry.append("state_log_dropped")
         # A sink stall (#60) is an audio output gap, never a silent one. Only a
         # resumed sink counts as survived; a failed reopen, a stop during
         # recovery or a bypass still open at the end is unrecovered.

@@ -411,8 +411,14 @@ struct LogWriteProbe {
     bool zero = false;
     int error = 0;
     int calls = 0;
+    int allow = 0; // writes admitted while not released (each frees one record)
     std::string bytes;
     static inline LogWriteProbe *active = nullptr;
+    void allow_one() {
+        const std::lock_guard lock(mutex);
+        ++allow;
+        cv.notify_all();
+    }
     void release() {
         const std::lock_guard lock(mutex);
         released = true;
@@ -423,9 +429,12 @@ struct LogWriteProbe {
         auto &probe = *active;
         std::unique_lock lock(probe.mutex);
         ++probe.calls;
-        if (!probe.cv.wait_for(lock, std::chrono::seconds{5}, [&] { return probe.released; })) {
+        if (!probe.cv.wait_for(lock, std::chrono::seconds{5},
+                               [&] { return probe.released || probe.allow > 0; })) {
             probe.timed_out = true;
         }
+        if (!probe.released && probe.allow > 0) { --probe.allow; }
+        probe.cv.notify_all();
         if (probe.interrupt) { probe.interrupt = false; errno = EINTR; return -1; }
         if (probe.zero) { return 0; }
         if (probe.error) { errno = probe.error; return -1; }
@@ -7097,9 +7106,11 @@ TEST(WiredReceiver, RuntimeDiagnosticsAndAudioReopenKeepTimingOnStalledStdout) {
     EXPECT_FALSE(log.finish());
     EXPECT_TRUE(running.load());
     EXPECT_GE(count_substr(probe.bytes, "\"event\":\"runtime_log_dropped\""), 1U);
-    // Droppable runtime records (diag, both reopen provenance lines) are counted;
-    // the collector-visible audio_stall_bypass transitions are parked and delivered.
-    EXPECT_GE(sum_runtime_dropped(probe.bytes), 3U);
+    // Droppable runtime records (both reopen provenance lines) are counted; the
+    // non-periodic diag and the collector-visible audio_stall_bypass transitions
+    // are parked and delivered.
+    EXPECT_GE(sum_runtime_dropped(probe.bytes), 2U);
+    EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"diag\",\"kind\":\"stall_diag_probe\"}"), 1U);
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_stall_bypass\",\"phase\":\"begin\""), 1U);
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_stall_bypass\",\"phase\":\"end\""), 1U);
 }
@@ -7552,6 +7563,18 @@ TEST(WiredReceiver, WiredReceiverEndToEndKeepsAvAudioAndControlTimingDuringStdou
     const auto stopping_at = child.bytes.find("\"event\":\"stopping\"");
     EXPECT_NE(stopping_at, std::string::npos);
     EXPECT_LT(active_at, stopping_at);
+    // Every other gate input emitted after saturation also survives (#90 review):
+    // the negotiated video_profile (painted_fps_per_window), the session's
+    // state transitions (no_session_drop), and the final cumulative decode_stats
+    // flushed by video_outlet.close() at teardown.
+    EXPECT_GE(count_substr(child.bytes, "\"event\":\"video_profile\""), 1U)
+        << "VIDEO_PROFILE_LOST_UNDER_STDOUT_SATURATION";
+    EXPECT_GE(count_substr(child.bytes, "\"kind\":\"session_state_changed\""), 1U)
+        << "SESSION_STATE_LOST_UNDER_STDOUT_SATURATION";
+    EXPECT_GE(count_substr(child.bytes, "{\"event\":\"decode_stats\",\"frame_drops\":"), 1U)
+        << "FINAL_DECODE_STATS_LOST_UNDER_STDOUT_SATURATION";
+    EXPECT_EQ(count_substr(child.bytes, "\"state_overflow\":0"),
+              count_substr(child.bytes, "\"event\":\"runtime_log_dropped\""));
 }
 
 TEST(WiredReceiver, StdoutLogRuntimeRecordsNeverBlockOnFullStalledSinkAndReportDrops) {
@@ -7688,8 +7711,90 @@ TEST(WiredReceiver, StdoutLogParkedStateSlotIsBoundedAndCountsOverflow) {
     }
     EXPECT_EQ(log.parked_states(), cap);
     EXPECT_EQ(log.runtime_drops(), 3U);
+    EXPECT_EQ(log.state_overflow_drops(), 3U);
     probe.release();
     EXPECT_FALSE(log.finish());
     EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"err\",\"detail\":\"x\"}"), cap);
     EXPECT_EQ(sum_runtime_dropped(probe.bytes), 3U);
+    // The gate-visible loss is named in-band, separately from droppable records.
+    EXPECT_EQ(count_substr(probe.bytes, "\"state_overflow\":3"), 1U);
+}
+
+TEST(WiredReceiver, StdoutLogDropSummaryNeverTakesTheSlotAFreedRecordNeeds) {
+    // Given: a stalled sink, a full queue and one dropped runtime record, so a
+    // runtime_log_dropped summary is due (#90 review P3).
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    struct ProbeGuard {
+        LogWriteProbe &p;
+        ~ProbeGuard() {
+            p.release();
+            LogWriteProbe::active = nullptr;
+        }
+    } probe_guard{probe};
+    std::atomic<bool> running{true};
+    g_log_fake_ns = 0;
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {1e9, 1e9}};
+    fill_log_queue(log);
+    EXPECT_FALSE(log.submit_runtime("{\"event\":\"lost\"}"));
+    EXPECT_FALSE(log.submit_media("audio_write_completed", "{\"event\":\"lost_media\"}"));
+    ASSERT_EQ(log.runtime_drops(), 1U);
+    ASSERT_EQ(log.media_drops().backpressure, 1U);
+    // When: the sink frees exactly one slot (the blocked front completes and
+    // the worker blocks on the next record).
+    probe.allow_one();
+    {
+        std::unique_lock lock(probe.mutex);
+        ASSERT_TRUE(probe.cv.wait_for(lock, std::chrono::seconds{5}, [&] { return probe.calls >= 2; }));
+    }
+    const auto freed = LogClock::now() + std::chrono::seconds{5};
+    while (log.outstanding().second >= aa::wired_receiver::StdoutLog::entry_capacity &&
+           LogClock::now() < freed) {
+        std::this_thread::yield();
+    }
+    // Then: the next real record gets the freed slot instead of a summary.
+    ASSERT_EQ(log.outstanding().second, aa::wired_receiver::StdoutLog::entry_capacity - 1);
+    EXPECT_FALSE(log.submit_runtime("{\"event\":\"after_one_slot\"}"));
+    EXPECT_EQ(log.runtime_drops(), 1U);
+    probe.release();
+    EXPECT_FALSE(log.finish());
+    EXPECT_NE(probe.bytes.find("{\"event\":\"after_one_slot\"}\n"), std::string::npos);
+    // And: both summaries still arrive (at the latest at finish).
+    EXPECT_EQ(sum_runtime_dropped(probe.bytes), 1U);
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"media_telemetry_dropped\""), 1U);
+}
+
+TEST(WiredReceiver, StdoutDiagnosticsParkGateRelevantKindsAndDropOnlyTransportStats) {
+    // Given: a stalled, full stdout queue.
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    struct ProbeGuard {
+        LogWriteProbe &p;
+        ~ProbeGuard() {
+            p.release();
+            LogWriteProbe::active = nullptr;
+        }
+    } probe_guard{probe};
+    std::atomic<bool> running{true};
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write};
+    ActiveStdoutLogBinding binding{log};
+    fill_log_queue(log);
+    // When: the session emits the diag kinds drive-smoke no_session_drop and
+    // recovery-QA dip/retry attribution read, plus periodic transport_stats.
+    StdoutDiagnostics diag;
+    const auto t0 = LogClock::now();
+    diag.emit_json("{\"kind\":\"session_state_changed\",\"to_state\":\"disconnected\"}");
+    diag.emit_json("{\"kind\":\"reconnect\",\"retries\":2}");
+    diag.emit_json("{\"kind\":\"transport_stats\",\"rx\":1}");
+    EXPECT_LT(LogClock::now() - t0, std::chrono::milliseconds{50});
+    EXPECT_EQ(log.parked_states(), 2U);
+    EXPECT_EQ(log.runtime_drops(), 1U);
+    // Then: once stdout drains, only transport_stats is lost.
+    probe.release();
+    EXPECT_FALSE(log.finish());
+    EXPECT_EQ(count_substr(probe.bytes,
+        "{\"event\":\"diag\",\"kind\":\"session_state_changed\",\"to_state\":\"disconnected\"}"), 1U);
+    EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"diag\",\"kind\":\"reconnect\",\"retries\":2}"), 1U);
+    EXPECT_EQ(count_substr(probe.bytes, "transport_stats"), 0U);
+    EXPECT_EQ(count_substr(probe.bytes, "\"state_overflow\":0"), 1U);
 }

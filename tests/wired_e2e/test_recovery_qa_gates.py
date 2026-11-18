@@ -127,6 +127,7 @@ if [ "${FAKE_REAL_LOG:-0}" = 1 ]; then
     esac
 fi
 case "$cmd" in
+    *runtime_log_dropped*) printf '%s' "${FAKE_LOG_DROPS:-}"; exit 0 ;;
     *idVendor*|*idProduct*) printf '%s' "${FAKE_PHONE:-04e8:6860}"; exit 0 ;;
     *"/sys/class/drm"*) printf '%s\n' "${FAKE_DISPLAY:-connected}"; exit 0 ;;
     *70-android-auto-receiver.rules*) printf '%s' "${FAKE_POLICY:-installed}"; exit 0 ;;
@@ -308,6 +309,33 @@ class RecoveryQaGates(unittest.TestCase):
                 self.assertEqual(code, 0, doc)
                 self.assertEqual(doc["scenarios"][0]["frames_painted_baseline"], 5)
                 self.assertLess(doc["scenarios"][0]["recovery_ms"], 5000)
+
+    def test_lost_receiver_state_records_block_a_passing_recovery(self) -> None:
+        # Given: a recovery that passes on its evidence, but the receiver's log
+        # reports lost state records (#90 review: reconnect / err / idr).
+        drops = '"event":"runtime_log_dropped","backpressure":3,"state_overflow":1'
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_LOG_DROPS": drops}
+        code, doc = self.run_qa(["--only", self.recovery_scenarios[0]], **env)
+        # Then: the run is BLOCKED (exit 3), never PASS, and names why.
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        self.assertTrue(doc["blocked_on"].startswith("receiver_log:state_log_dropped"), doc)
+
+    def test_droppable_runtime_loss_blocks_a_failure_but_keeps_a_pass(self) -> None:
+        drops = '"event":"runtime_log_dropped","backpressure":3,"state_overflow":0'
+        scenario = self.recovery_scenarios[1]
+        # Given: input evidence could have been dropped; a FAILED is not evidenced.
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                    "FAKE_FRESH_INPUT": "0", "FAKE_LOG_DROPS": drops}
+        code, doc = self.run_qa(["--only", scenario], **env)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        self.assertIn("no_media_evidence_after_recovery", doc["blocked_on"])
+        self.assertTrue(doc["blocked_on"].startswith("receiver_log:runtime_log_dropped"), doc)
+        # And: a PASS rests on positive evidence and stands.
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_LOG_DROPS": drops}
+        code, doc = self.run_qa(["--only", scenario], **env)
+        self.assertEqual(code, 0, doc)
 
     def test_required_log_boundaries_fail_closed(self) -> None:
         cases = (("", "1"), ("0", "1"), ("", "0"), ("size=123", "0"),

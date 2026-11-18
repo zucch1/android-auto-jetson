@@ -136,6 +136,28 @@ class AnalyzerTests(unittest.TestCase):
         self.assertAlmostEqual(av["coverage"], 1.0, places=3)
         self.assertAlmostEqual(av["signed_p50_ms"], 12.0, places=3)
 
+    def test_lost_receiver_state_records_block_instead_of_judging(self) -> None:
+        # Given a run that would PASS, but whose receiver lost state records
+        # under a stalled stdout (#90 review: video_profile, idr_*, and
+        # session_state_changed feed the criteria).
+        run = Run()
+        run.receiver.append({"event": "runtime_log_dropped", "backpressure": 4, "state_overflow": 1})
+        result = self.analyze(run)
+        # Then neither PASS nor FAIL is evidenced: BLOCKED.
+        self.assertEqual(result["verdict"], "BLOCKED", result)
+        self.assertEqual(result["blocked_on"], "receiver_state_log_dropped")
+        # And a would-be FAIL (a freeze) is also BLOCKED, not a wrong verdict.
+        run = Run().freeze(305, 1.2)
+        run.receiver.append({"event": "runtime_log_dropped", "backpressure": 4})
+        self.assertEqual(self.analyze(run)["verdict"], "BLOCKED")
+
+    def test_droppable_runtime_loss_alone_keeps_the_verdict(self) -> None:
+        run = Run()
+        run.receiver.append({"event": "runtime_log_dropped", "backpressure": 4, "state_overflow": 0})
+        result = self.analyze(run)
+        self.assertEqual(result["verdict"], "PASS", result["criteria"])
+        self.assertEqual(result["receiver_state_log_lost"], 0)
+
     def test_one_second_freeze_fails_its_window(self) -> None:
         # Given a 1.2 s paint gap 305 s into the drive (the #134 shape).
         result = self.analyze(Run().freeze(305.0, 1.2))

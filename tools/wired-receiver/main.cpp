@@ -504,8 +504,17 @@ std::string format_ms(aa::core::Nanoseconds value) {
 
 class StdoutDiagnostics final : public aa::diagnostics::DiagnosticSink {
   public:
+    // Only periodic transport_stats is droppable. Every other diag kind is a
+    // rare state record a gate reads (session_state_changed and reconnect for
+    // no_session_drop and recovery-QA dip/retry attribution, decode_stats,
+    // pairing, capability, helper calls), so it goes through the state slot.
     void emit_json(std::string_view redacted_json) override {
-        log_runtime(std::string{"{\"event\":\"diag\","} + std::string{redacted_json}.substr(1));
+        auto line = std::string{"{\"event\":\"diag\","} + std::string{redacted_json}.substr(1);
+        if (redacted_json.starts_with("{\"kind\":\"transport_stats\"")) {
+            log_runtime(line);
+        } else {
+            log_state(line);
+        }
     }
 };
 
@@ -1967,7 +1976,10 @@ int receiver_main(int argc, char **argv) {
         log_line("{\"event\":\"err\",\"detail\":\"configure\"}");
         return 1;
     }
-    VideoOutlet video_outlet{log_runtime, log_media};
+    // VideoOutlet's lifecycle sink carries video_profile, idr_requested /
+    // _recovered / _escalated / _transition_failed, socket-buffer sizing and the
+    // final cumulative decode_stats: all gate inputs, so never droppable.
+    VideoOutlet video_outlet{log_state, log_media};
     video_outlet.set_idr_recovery({
         [&session] { return session.video_projecting(); },
         [&session] { return session.request_video_idr(); },
@@ -2157,7 +2169,7 @@ int receiver_main(int argc, char **argv) {
         const bool has_selection = session.selected_video_profile().has_value();
         if (selection_watchdog.check(session_ready, has_selection,
                                      std::chrono::steady_clock::now())) {
-            log_runtime(aa::ipc::video_selection_timeout_json(
+            log_state(aa::ipc::video_selection_timeout_json(
                 aa::ipc::kVideoSelectionWarningTimeout, video_profiles.size()));
         }
         return true;
@@ -2413,7 +2425,7 @@ int receiver_main(int argc, char **argv) {
             if (!endpoint) {
                 continue;
             }
-            log_runtime("{\"event\":\"input_accepted\"}");
+            log_state("{\"event\":\"input_accepted\"}");
             while (g_running.load()) {
                 auto event = endpoint.value().receive(Milliseconds{200});
                 if (!event) {
@@ -2464,7 +2476,7 @@ int receiver_main(int argc, char **argv) {
             if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
                 break;
             }
-            log_runtime("{\"event\":\"video_accepted\"}");
+            log_state("{\"event\":\"video_accepted\"}");
             video_outlet.install(std::move(producer.value()));
             {
                 std::lock_guard gate_lock(gate_mutex);
