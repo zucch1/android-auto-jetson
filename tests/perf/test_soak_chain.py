@@ -548,8 +548,9 @@ def test_an_interrupted_stage_with_a_build_is_disqualified_not_pass() -> None:
         assert (out / "stage-1800s-not-run.json").exists() and (out / "stage-7200s-not-run.json").exists()
 
 
-TERM_POINTS = ("preflight", "pre-launch build scan", "launcher running", "sampler shutdown",
-               "end snapshot", "after the stage returned")
+TERM_POINTS = ("preflight", "pre-launch build scan", "pre-launch build scan finding a build",
+               "launcher running", "disqualification", "sampler shutdown", "end snapshot",
+               "after the stage returned")
 
 
 def test_a_term_at_any_point_of_a_stage_never_leaves_a_canonical_pass_or_exits_0() -> None:
@@ -568,16 +569,27 @@ def test_a_term_at_any_point_of_a_stage_never_leaves_a_canonical_pass_or_exits_0
                 term("preflight")
                 return preflight_ok(args, seconds, stop)
 
-            def builds() -> list[str]:
-                state["builds"] += 1
-                term("pre-launch build scan" if state["builds"] == 2 else "launcher running")
-                return []
+            def builds(point=point) -> list[str]:
+                state["builds"] += 1  # 1: the scan right after the preflight; then the stage's watch
+                if state["builds"] == 1:
+                    term("pre-launch build scan")
+                    term("pre-launch build scan finding a build")
+                    found = point == "pre-launch build scan finding a build"
+                else:
+                    term("launcher running")
+                    found = point == "disqualification"
+                return ["4242 ninja"] if found and state["stage"] == target else []
 
             def counters(_args, cancel=None) -> dict:
                 if cancel is None:
                     term("end snapshot")
                 return {"nodes": []}
-            real_finish, real_run_stage = chain.CounterSampler.finish, chain.run_stage
+            real_finish, real_run_stage, real_disqualify = \
+                chain.CounterSampler.finish, chain.run_stage, chain._disqualify
+
+            def disqualify(*args, **kwargs) -> int:
+                term("disqualification")
+                return real_disqualify(*args, **kwargs)
 
             def finish(self) -> dict:
                 term("sampler shutdown")
@@ -590,7 +602,7 @@ def test_a_term_at_any_point_of_a_stage_never_leaves_a_canonical_pass_or_exits_0
             with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
                 root = Path(directory)
                 with patch.object(chain.CounterSampler, "finish", finish), \
-                        patch.object(chain, "run_stage", run_stage):
+                        patch.object(chain, "run_stage", run_stage), patch.object(chain, "_disqualify", disqualify):
                     code, output = run(root, host=host, builds=builds, counters=counters,
                                        stub_text=STUB.replace('exit "$rc"', 'sleep 0.3\nexit "$rc"'))
                 out = root / "chain"
@@ -599,10 +611,48 @@ def test_a_term_at_any_point_of_a_stage_never_leaves_a_canonical_pass_or_exits_0
                 assert code == 128 + signal.SIGTERM and "CHAIN COMPLETE" not in output, (where, code, output)
                 canonical = out / f"stage-{target}s-result.json"
                 assert not canonical.exists() or json.loads(canonical.read_text())["verdict"] != "PASS", where
-                assert (out / f"stage-{target}s-not-run.json").exists(), where
+                marker = json.loads((out / f"stage-{target}s-not-run.json").read_text())["reason"]
+                assert f"stage-{target}s interrupted (SIGTERM)" in marker, (where, marker)
+                if point == "pre-launch build scan finding a build":  # both reasons are kept
+                    assert "interference:build_started_during_preflight" in marker, (where, marker)
+                if point == "disqualification":
+                    assert "interference:build_during_stage" in marker, (where, marker)
+                    assert (out / f"stage-{target}s-interference.json").exists(), where
                 demoted = out / f"stage-{target}s-result.interrupted.json"
                 if demoted.exists():
                     assert json.loads(demoted.read_text())["interrupted"]["signal"] == "SIGTERM", where
+
+
+def test_a_stop_after_a_passing_preflight_never_starts_the_launcher() -> None:
+    # The stop lands after the preflight passed: at the chain's launch boundary
+    # (during the post-preflight build scan), or inside run_stage just before Popen.
+    import signal
+    for where in ("launch boundary", "before Popen"):
+        scans = {"n": 0}
+
+        def builds(where=where) -> list[str]:
+            scans["n"] += 1
+            if where == "launch boundary" and scans["n"] == 2:  # 1: before the stage, 2: after the preflight
+                os.kill(os.getpid(), signal.SIGTERM)
+            return []
+        real_command = chain.stage_command
+
+        def stage_command(args, seconds, where=where):
+            if where == "before Popen":
+                os.kill(os.getpid(), signal.SIGTERM)
+            return real_command(args, seconds)
+
+        def popen(*_args, **_kwargs):
+            raise AssertionError("a launcher was started after the stop")
+        with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+            root = Path(directory)
+            with patch.object(chain, "stage_command", stage_command), \
+                    patch.object(chain.subprocess, "Popen", popen):
+                code, output = run(root, builds=builds)
+            out = root / "chain"
+            assert code == 128 + signal.SIGTERM and calls(root) == [], (where, code, output)
+            assert "interrupted (SIGTERM)" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+            assert (out / "stage-7200s-not-run.json").exists() and "CHAIN COMPLETE" not in output
 
 
 def test_every_chain_gets_a_new_directory() -> None:

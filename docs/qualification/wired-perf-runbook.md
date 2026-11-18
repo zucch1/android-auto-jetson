@@ -640,7 +640,14 @@ and again before `CHAIN COMPLETE`: a build the watch saw is disqualified first
 `stage-<N>s-result.interrupted.json` with an `interrupted` field, and the
 chain exits 128+signal, never 0. `tools/qualification/check_wired.py` rejects
 an `*.interrupted.*` or `*.disqualified.*` result, or one carrying
-`interrupted`, even when the manifest references it (`RETIRED_RESULT`). Only
+`interrupted`, even when the manifest references it (`RETIRED_RESULT`).
+An interruption also wins the exit code over a build block or a
+disqualification that happened too: the stage's `not-run` marker names both,
+and no launcher is started once a stop is pending (checked at the launch
+boundary and again right before the launcher is spawned). An interrupted
+stage has no `pipewire_err_counters.end` snapshot (the chain does not touch
+the host while stopping); read `.during.latest` / `.during.latest_with_receiver`
+and the stage's `-logs/` instead. Only
 the chain runs the preflight; a direct `aa-projection-perf.sh` invocation
 does not, so check the host by hand before one.
 

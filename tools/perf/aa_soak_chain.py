@@ -305,6 +305,9 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
     print(f"{name} START {time.ctime()}", flush=True)
     with (args.out / f"{name}-console.log").open("w") as console, \
             (args.out / f"{name}-build-watch.jsonl").open("w") as watch:
+        if stop:  # the last moment before the launch: never start a launcher after a stop
+            print(f"{name} NOT STARTED: {signal.Signals(stop.signum).name} before the launch", flush=True)
+            return 128 + stop.signum
         # Its own process group (the launcher and everything under it), registered
         # at once: the handler never raises, so nothing can come between.
         process = subprocess.Popen(command, stdout=console, stderr=subprocess.STDOUT, env=env,
@@ -494,35 +497,45 @@ def _chain(args: argparse.Namespace, stop: StopFlag, children: list[subprocess.P
         return 128 + (stop.signum or signal.SIGTERM)
     print("PRE-SOAK IDLE PASS", flush=True)
     for index, seconds in enumerate(STAGES):
-        blocked_here, record = False, {}
+        name = f"stage-{seconds}s"
+        blocked_here, launched, record, why = False, False, {}, []
         if stop:
             code = 128 + stop.signum
         elif builds():
             code = 3
-            print(f"stage-{seconds}s BLOCKED: a build started before the stage", flush=True)
+            why.append("interference:build_started_before_the_stage")
+            print(f"{name} BLOCKED: a build started before the stage", flush=True)
         else:
             code, record = _preflight(args, seconds, stop)
             if code == 0 and builds():  # again, at once before the launch: the wait took time
                 code, blocked_here = 3, True
                 record.update(verdict="BLOCKED", reasons=["interference:build_started_during_preflight"])
-                write_record(args.out / f"stage-{seconds}s-host-preflight.json", record)
-                print(f"stage-{seconds}s BLOCKED: a build started during the host preflight", flush=True)
+                write_record(args.out / f"{name}-host-preflight.json", record)
+                print(f"{name} BLOCKED: a build started during the host preflight", flush=True)
+            elif code == 0 and stop:  # the launch boundary: no launcher starts after a stop
+                code = 128 + stop.signum
             elif code == 0:
+                launched = True
                 code = run_stage(args, seconds, stop, children, record)
-                if code == 0 and stop:  # finished, then stopped: the result is not final
-                    _retire_interrupted(args, f"stage-{seconds}s", [], 0, stop)
-                    code = 128 + stop.signum
             elif code == 3:
                 blocked_here = True
+        if blocked_here:
+            why += list(record.get("reasons", []))
+        if launched and (args.out / f"{name}-interference.json").exists():
+            why.append("interference:build_during_stage (result disqualified)")
+        if stop:  # sticky: an interruption wins the exit code, whatever else also happened
+            if launched:  # its result, finished or not, is not final
+                _retire_interrupted(args, name, [], code, stop)
+            _not_run(args, (seconds,), "; ".join(
+                [f"{name} interrupted ({signal.Signals(stop.signum).name}); its stage was stopped"
+                 " or not started", *why]))
+            _not_run(args, STAGES[index + 1:], f"{name} was interrupted")
+            return 128 + stop.signum
         if code != 0:
-            interrupted = code > 128 and stop
             if blocked_here:
-                _not_run(args, (seconds,), f"stage-{seconds}s BLOCKED by the host preflight: "
+                _not_run(args, (seconds,), f"{name} BLOCKED by the host preflight: "
                          + "; ".join(record["reasons"]))
-            if interrupted:
-                _not_run(args, (seconds,), f"stage-{seconds}s interrupted "
-                         f"({signal.Signals(stop.signum).name}); its stage was stopped")
-            _not_run(args, STAGES[index + 1:], f"stage-{seconds}s did not pass (rc {code})")
+            _not_run(args, STAGES[index + 1:], f"{name} did not pass (rc {code})")
             return code
     # The single point where the chain completes: never with a stop pending.
     if stop:
