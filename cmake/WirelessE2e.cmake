@@ -63,5 +63,20 @@ if(NOT CMAKE_CROSSCOMPILING)
         --gtest_filter=Wire/WirelessD6Bootstrap.*:CompletedLifecycle.WirelessD6*)
     set_tests_properties(wireless_e2e_composed_admission wireless_e2e_composed_bootstrap
         PROPERTIES TIMEOUT 30 RESOURCE_LOCK aa_wireless_composed)
+    add_executable(aa_wireless_audio_worker_test tests/wireless_e2e/audio_worker_test.cpp)
+    target_link_libraries(aa_wireless_audio_worker_test PRIVATE
+        aa_audio_worker aa_wireless aa_video GTest::gtest_main)
+    if(TARGET PkgConfig::AA_AUDIO_GST)
+        target_link_libraries(aa_wireless_audio_worker_test PRIVATE PkgConfig::AA_AUDIO_GST)
+    endif()
+    target_compile_options(aa_wireless_audio_worker_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
+    if(AA_ENABLE_ASAN)
+        target_compile_options(aa_wireless_audio_worker_test PRIVATE
+            -fsanitize=address -fno-omit-frame-pointer)
+        target_link_options(aa_wireless_audio_worker_test PRIVATE -fsanitize=address)
+    endif()
+    add_test(NAME wireless_e2e_audio_worker COMMAND aa_wireless_audio_worker_test)
+    set_tests_properties(wireless_e2e_audio_worker PROPERTIES TIMEOUT 30)
     include("${CMAKE_SOURCE_DIR}/cmake/WirelessMatrix.cmake")
 endif()

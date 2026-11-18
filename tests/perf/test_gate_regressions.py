@@ -247,10 +247,11 @@ def receiver_hook_present(source: str) -> bool:
     code = re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/',
                   lambda m: "" if m.group().startswith("/") else m.group(),
                   source, flags=re.S)
-    step = re.search(r"router_\s*\.\s*render_step\s*\(\s*\)", code)
+    step = re.search(r"(?:router_|local_router)\s*\.\s*render_step\s*\(\s*\)", code)
     call = re.search(r"\bemit_media_timing\s*\(\s*stats\s*\)\s*;", code)
-    stats = re.search(r"stats\s*=\s*router_\s*\.\s*report\s*\(\s*\)\s*\.\s*stats", code)
-    return bool(step and call and stats
+    stats = re.search(r"stats\s*=\s*(?:router_|local_router)\s*\.\s*report\s*\(\s*\)\s*\.\s*stats", code)
+    helper_call = re.search(r"\bmedia_timing_json\s*\(\s*stats\s*\)", code)
+    return bool(step and call and stats and helper_call
                 and re.search(r"format_ms\s*\(\s*stats\.max_completion_skew\s*\)", code)
                 and re.search(r"format_ms\s*\(\s*stats\.max_path_latency\s*\)", code))
 
