@@ -40,7 +40,7 @@ def preflight_ok(_args, seconds, _stop) -> dict:
 
 
 def run(root: Path, *extra: str, env: dict[str, str] | None = None, builds=lambda: [],
-        stub_text: str = STUB, host=preflight_ok) -> tuple[int, str]:
+        stub_text: str = STUB, host=preflight_ok, counters=None) -> tuple[int, str]:
     stub = root / "stub-launcher"
     stub.write_text(stub_text)
     stub.chmod(0o755)
@@ -51,7 +51,8 @@ def run(root: Path, *extra: str, env: dict[str, str] | None = None, builds=lambd
     output = io.StringIO()
     with patch.dict(os.environ, {"STUB_LOG": str(root / "calls.log"), **(env or {})}), \
             patch.object(chain, "builds", builds), patch.object(chain, "host_preflight", host), \
-            patch.object(chain, "host_counters", lambda _args, _cancel=None: {"nodes": []}), redirect_stdout(output):
+            patch.object(chain, "host_counters", counters or (lambda _args, _cancel=None: {"nodes": []})), \
+            redirect_stdout(output):
         code = chain.main(argv)
     return code, output.getvalue()
 
@@ -545,6 +546,63 @@ def test_an_interrupted_stage_with_a_build_is_disqualified_not_pass() -> None:
         assert not (out / "stage-1800s-result.json").exists()
         assert (out / "stage-1800s-result.disqualified.json").exists()
         assert (out / "stage-1800s-not-run.json").exists() and (out / "stage-7200s-not-run.json").exists()
+
+
+TERM_POINTS = ("preflight", "pre-launch build scan", "launcher running", "sampler shutdown",
+               "end snapshot", "after the stage returned")
+
+
+def test_a_term_at_any_point_of_a_stage_never_leaves_a_canonical_pass_or_exits_0() -> None:
+    import signal
+    for target in chain.STAGES:
+        for point in TERM_POINTS:
+            state = {"stage": None, "fired": False, "builds": 0}
+
+            def term(at: str, point=point, target=target) -> None:
+                if at == point and state["stage"] == target and not state["fired"]:
+                    state["fired"] = True
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+            def host(args, seconds, stop) -> dict:
+                state["stage"], state["builds"] = seconds, 0
+                term("preflight")
+                return preflight_ok(args, seconds, stop)
+
+            def builds() -> list[str]:
+                state["builds"] += 1
+                term("pre-launch build scan" if state["builds"] == 2 else "launcher running")
+                return []
+
+            def counters(_args, cancel=None) -> dict:
+                if cancel is None:
+                    term("end snapshot")
+                return {"nodes": []}
+            real_finish, real_run_stage = chain.CounterSampler.finish, chain.run_stage
+
+            def finish(self) -> dict:
+                term("sampler shutdown")
+                return real_finish(self)
+
+            def run_stage(*args, **kwargs) -> int:
+                code = real_run_stage(*args, **kwargs)
+                term("after the stage returned")
+                return code
+            with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+                root = Path(directory)
+                with patch.object(chain.CounterSampler, "finish", finish), \
+                        patch.object(chain, "run_stage", run_stage):
+                    code, output = run(root, host=host, builds=builds, counters=counters,
+                                       stub_text=STUB.replace('exit "$rc"', 'sleep 0.3\nexit "$rc"'))
+                out = root / "chain"
+                where = (target, point)
+                assert state["fired"], f"the TERM point was never reached: {where}"
+                assert code == 128 + signal.SIGTERM and "CHAIN COMPLETE" not in output, (where, code, output)
+                canonical = out / f"stage-{target}s-result.json"
+                assert not canonical.exists() or json.loads(canonical.read_text())["verdict"] != "PASS", where
+                assert (out / f"stage-{target}s-not-run.json").exists(), where
+                demoted = out / f"stage-{target}s-result.interrupted.json"
+                if demoted.exists():
+                    assert json.loads(demoted.read_text())["interrupted"]["signal"] == "SIGTERM", where
 
 
 def test_every_chain_gets_a_new_directory() -> None:

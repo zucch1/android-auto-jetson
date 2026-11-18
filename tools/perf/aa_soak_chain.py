@@ -335,16 +335,18 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
         if preflight is not None:
             preflight.setdefault("pipewire_err_counters", {})["during"] = during
             write_record(args.out / f"{name}-host-preflight.json", preflight)
-        if stop:
-            if outcome is None:  # the stop came while the sampler was shutting down
-                outcome = stop_group(process)
-            print(f"{name} INTERRUPTED by {signal.Signals(stop.signum).name}: stage {outcome}",
-                  flush=True)
-            _retire_interrupted(args, name, seen, process.returncode)
-            return 128 + stop.signum
-    if preflight is not None:  # informational: host nodes after the receiver is gone
+    if preflight is not None and not stop:  # informational: host nodes after the receiver is gone
         preflight["pipewire_err_counters"]["end"] = {**host_counters(args), "phase": "after_stage"}
         write_record(args.out / f"{name}-host-preflight.json", preflight)
+    # The single point where the stage's result is finalised. The stop flag is
+    # sticky (set by the handler at any time), so a stop that came during any
+    # step above, the sampler shutdown or the end snapshot included, is seen here.
+    if stop:
+        if outcome is None:
+            outcome = stop_group(process)
+        print(f"{name} INTERRUPTED by {signal.Signals(stop.signum).name}: stage {outcome}", flush=True)
+        _retire_interrupted(args, name, seen, process.returncode, stop)
+        return 128 + stop.signum
     result = args.out / f"{name}-result.json"
     verdict = json.loads(result.read_text()).get("verdict") if result.exists() else None
     print(f"{name} END rc={process.returncode} verdict={verdict}", flush=True)
@@ -360,18 +362,24 @@ def _result_verdict(result: Path) -> object:
         return "unreadable"
 
 
-def _retire_interrupted(args: argparse.Namespace, name: str, seen: list[dict], code: int | None) -> None:
+def _retire_interrupted(args: argparse.Namespace, name: str, seen: list[dict], code: int | None,
+                        stop: StopFlag) -> None:
     """An interrupted stage never leaves a qualifying result.
 
     A build the watch saw is disqualified first, as for a finished stage, so
-    interference always wins over PASS; a PASS still on disk after that is
-    moved to ``-result.interrupted.json``.
+    interference always wins over PASS. A PASS still on disk after that is
+    moved to ``-result.interrupted.json`` with an ``interrupted`` field, which
+    the qualification checker rejects.
     """
     result = args.out / f"{name}-result.json"
     if seen:
         _disqualify(args, name, seen, result, _result_verdict(result), code if code is not None else -1)
     if _result_verdict(result) == "PASS":
-        result.rename(result.with_name(f"{name}-result.interrupted.json"))
+        document = json.loads(result.read_text())
+        document["interrupted"] = {"signal": signal.Signals(stop.signum).name,
+                                   "reason": "the chain was stopped before this result was final"}
+        result.with_name(f"{name}-result.interrupted.json").write_text(json.dumps(document, indent=2) + "\n")
+        result.unlink()
 
 
 def _disqualify(args: argparse.Namespace, name: str, seen: list[dict], result: Path,
@@ -501,6 +509,9 @@ def _chain(args: argparse.Namespace, stop: StopFlag, children: list[subprocess.P
                 print(f"stage-{seconds}s BLOCKED: a build started during the host preflight", flush=True)
             elif code == 0:
                 code = run_stage(args, seconds, stop, children, record)
+                if code == 0 and stop:  # finished, then stopped: the result is not final
+                    _retire_interrupted(args, f"stage-{seconds}s", [], 0, stop)
+                    code = 128 + stop.signum
             elif code == 3:
                 blocked_here = True
         if code != 0:
@@ -513,6 +524,13 @@ def _chain(args: argparse.Namespace, stop: StopFlag, children: list[subprocess.P
                          f"({signal.Signals(stop.signum).name}); its stage was stopped")
             _not_run(args, STAGES[index + 1:], f"stage-{seconds}s did not pass (rc {code})")
             return code
+    # The single point where the chain completes: never with a stop pending.
+    if stop:
+        last = f"stage-{STAGES[-1]}s"
+        _retire_interrupted(args, last, [], 0, stop)
+        _not_run(args, STAGES[-1:], f"{last} interrupted ({signal.Signals(stop.signum).name}) "
+                 "before the chain completed; its result was demoted")
+        return 128 + stop.signum
     print("CHAIN COMPLETE", flush=True)
     return 0
 

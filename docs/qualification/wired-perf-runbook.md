@@ -633,9 +633,14 @@ receiver's stream, so compare those two for the stream and `start`/`end` for
 the sinks. Every snapshot is taken only from a PipeWire that is already
 running. On a stop the chain TERMs the stage first and kills an in-flight
 sample's ssh; it never waits for a sample before forwarding the TERM. An
-interrupted stage never leaves a qualifying result: a build the watch saw is
-disqualified first (interference wins over PASS), and a PASS still on disk is
-moved to `stage-<N>s-result.interrupted.json`. Only
+interrupted stage never leaves a qualifying result. The stop flag is sticky,
+and the chain checks it at the one point where a stage's result is finalised
+and again before `CHAIN COMPLETE`: a build the watch saw is disqualified first
+(interference wins over PASS), a PASS still on disk is moved to
+`stage-<N>s-result.interrupted.json` with an `interrupted` field, and the
+chain exits 128+signal, never 0. `tools/qualification/check_wired.py` rejects
+an `*.interrupted.*` or `*.disqualified.*` result, or one carrying
+`interrupted`, even when the manifest references it (`RETIRED_RESULT`). Only
 the chain runs the preflight; a direct `aa-projection-perf.sh` invocation
 does not, so check the host by hand before one.
 

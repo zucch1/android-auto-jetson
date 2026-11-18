@@ -650,6 +650,18 @@ def test_the_whole_preflight_is_one_deadline() -> None:
         assert any(r.startswith("host_preflight:preflight_deadline_exceeded (16.0 s > 15.0 s)")
                    for r in record["reasons"]), (phase, record["reasons"])
     assert check(Host(), maintenance_wait_s=15)["verdict"] == "OK"  # on time: admitted
+    # A uid lookup that times out past the bound names the deadline too, with its transport detail.
+    host = Host()
+
+    def uid_timeout(argv, timeout=None):
+        if argv == ["id", "-u"]:
+            host.advance(16.0)
+            return hp.Output(None)
+        return host(argv, timeout)
+    record = check(uid_timeout, host=host, maintenance_wait_s=15)
+    assert record["verdict"] == "BLOCKED" and record["reasons"] == [
+        "host_transport:unreachable (no answer within the bound)",
+        "host_preflight:preflight_deadline_exceeded (16.0 s > 15.0 s)"], record["reasons"]
 
 
 def test_the_counter_pid_guard_keeps_the_transport_label() -> None:

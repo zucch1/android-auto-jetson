@@ -580,10 +580,17 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
         left = budget()
         return unbounded_run(argv, timeout=timeout if left is None else
                              left if timeout is None else min(timeout, left))
+    def deadline_reasons() -> list[str]:
+        """The envelope's guarantee: the same reason on every BLOCKED or OK path."""
+        elapsed = monotonic() - began
+        record["elapsed_s"] = round(elapsed, 3)
+        if bounded and elapsed > maintenance_wait_s:
+            return [f"host_preflight:preflight_deadline_exceeded ({elapsed:.1f} s > {maintenance_wait_s:.1f} s)"]
+        return []
     if uid is None:
         uid, failure = soak_uid(run)
         if uid is None:
-            record.update(verdict="BLOCKED", reasons=[failure])
+            record.update(verdict="BLOCKED", reasons=[failure, *deadline_reasons()])
             return record
     record["uid"] = uid
     transport: list[str] = []
@@ -631,13 +638,10 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
     if maintenance["ok"]:
         reasons += [f"{reason} (at the final check)" for reason in final["reasons"]]
     reasons += [reason for reason in final_timers["reasons"] if reason not in reasons]
-    elapsed = monotonic() - began
-    if bounded and elapsed > maintenance_wait_s:  # the guarantee: nothing admitted past the bound
-        reasons.append(f"host_preflight:preflight_deadline_exceeded "
-                       f"({elapsed:.1f} s > {maintenance_wait_s:.1f} s)")
+    reasons += deadline_reasons()  # the guarantee: nothing admitted past the bound
     record.update(package_maintenance=maintenance, pipewire_scheduling=scheduling, apt_timers=timers,
                   package_maintenance_final=final, apt_timers_final=final_timers,
                   pipewire_err_counters={"start": {**counters, "phase": "before_launch"}},
-                  checked_epoch=now(), elapsed_s=round(elapsed, 3), deadline_s=maintenance_wait_s or None,
+                  checked_epoch=now(), deadline_s=maintenance_wait_s or None,
                   verdict="OK" if not reasons else "BLOCKED", reasons=reasons)
     return record
