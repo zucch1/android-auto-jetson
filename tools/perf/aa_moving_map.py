@@ -192,6 +192,10 @@ CLEANUP_REASONS = {
     "media_stop_unavailable": "cleanup:media_not_stopped",
     "usb_reset_failed": "cleanup:usb_not_restored",
     "phone_restore_not_reached": "cleanup:phone_restore_not_reached",
+    # Wireless (tools/perf/aa_transport.py): the phone's USB was not shown in
+    # plain mtp after the run, so the session may not have been wireless only.
+    "usb_in_aoa_after": "cleanup:usb_in_aoa",
+    "usb_functions_unknown_after": "cleanup:usb_functions_unknown",
 }
 
 
@@ -245,7 +249,7 @@ class MovingMap:
 
     def __init__(self, adb: Callable[..., object], *, media_uri: str,
                  media_type: str | None = None, media_component: str | None = None,
-                 geo_uri: str = DEFAULT_GEO_URI) -> None:
+                 geo_uri: str = DEFAULT_GEO_URI, usb_reset: bool = True) -> None:
         if not media_uri:
             raise ValueError("the moving-map workload needs media for the whole run")
         self.adb = adb
@@ -253,6 +257,11 @@ class MovingMap:
         self.media += ["-n", media_component] if media_component else []
         self.media_package = media_package(media_component)
         self.geo_uri = geo_uri
+        # Wired sessions reset the phone's USB to mtp before and after the run
+        # (the wired receiver puts it in AOA). A wireless session never uses
+        # USB for projection, so its workload leaves USB alone: the runner only
+        # reads and records the USB functions (tools/perf/aa_transport.py).
+        self.usb_reset = usb_reset
         self.media_relaunches = 0
         self.drags = 0
         # Monotonic time of every completed drag (continuity evidence).
@@ -294,7 +303,8 @@ class MovingMap:
 
         False if ``sleep`` was stopped or a command failed (``phone_failure``).
         """
-        if not self._phone("usb_reset", "shell", "svc", "usb", "setFunctions", "mtp") or not sleep(3):
+        if self.usb_reset and (not self._phone("usb_reset", "shell", "svc", "usb", "setFunctions",
+                                                "mtp") or not sleep(3)):
             return False
         if not self._phone("wake", "shell", "input", "keyevent", "KEYCODE_WAKEUP"):
             return False
@@ -326,9 +336,10 @@ class MovingMap:
                     failures.append(failure)
             else:
                 failures.append("media_stop_unavailable: no media component, the player is unknown")
-            usb = command_failure(self.adb("shell", "svc", "usb", "setFunctions", "mtp"))
-            if usb is not None:
-                failures.append(f"usb_reset_failed: {usb}")
+            if self.usb_reset:
+                usb = command_failure(self.adb("shell", "svc", "usb", "setFunctions", "mtp"))
+                if usb is not None:
+                    failures.append(f"usb_reset_failed: {usb}")
             self.cleanup_failures = failures
             return list(failures)
 

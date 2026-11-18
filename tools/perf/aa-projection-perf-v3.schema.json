@@ -43,7 +43,8 @@
     },
     "mode": {
       "enum": [
-        "wired"
+        "wired",
+        "wireless"
       ]
     },
     "duration_requested": {
@@ -633,6 +634,13 @@
           }
         }
       ]
+    },
+    "link": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "wireless only: the phone's USB functions, Wi-Fi frequency/channel/RSSI and Bluetooth state before and after the stage (tools/perf/aa_transport.py)"
     }
   },
   "$defs": {

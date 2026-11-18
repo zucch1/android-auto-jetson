@@ -261,8 +261,10 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     budgets = BUDGETS if version3 else BUDGETS_V2
     evidence = parse_capture(capture)
     capture, numeric_errors = aa_perf_schema.finite_numbers(capture)
-    if capture.get("mode") != "wired":
-        raise ContractError(f"capture mode must be 'wired', got {capture.get('mode')!r}")
+    # Only v3 (moving-map soak) captures may be wireless; older ones are wired.
+    modes = ("wired", "wireless") if version3 else ("wired",)
+    if capture.get("mode") not in modes:
+        raise ContractError(f"capture mode must be one of {modes}, got {capture.get('mode')!r}")
 
     crashes = _as_int(capture.get("crashes"))
     if crashes is not None and crashes < 0:
@@ -469,6 +471,11 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
             # player running is never a PASS, and a non-PASS stops the chain
             # before the next stage. Named BLOCKED reasons (cleanup:*).
             unavailable.extend(cleanup_gaps(capture.get("workload")))
+            # A wireless stage must show the phone's USB in plain mtp (not AOA)
+            # before and after: otherwise it may have projected over the cable.
+            gap = wireless_link_gap(capture)
+            if gap is not None:
+                unavailable.append("run_evidence:" + gap)
             # A build on the target during the stage contends for CPU and memory:
             # the stage measured something else than the quiet host it claims.
             # Interference, not a product FAIL: it BLOCKS a stage that would
@@ -563,7 +570,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         "schema": RESULT_FOR_CAPTURE[capture["schema"]],
         "task": TASK,
         "generated_at_utc": now,
-        "mode": "wired",
+        "mode": capture["mode"],
         "duration_requested": duration_requested,
         "duration_seconds": duration_seconds,
         "measurement_origin": origin,
@@ -590,6 +597,8 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     if version3:
         result["av_contract"] = av_block
         result["workload"] = _workload_record(capture.get("workload"), window)
+        if capture["mode"] == "wireless":
+            result["link"] = capture.get("link")
     if capture_path is not None:
         result["capture"] = {"path": capture_path, "sha256": capture_sha256}
 
@@ -654,6 +663,22 @@ def _signed_av(capture: dict, window: Window | None, *, invalid: bool) -> tuple[
     block = {"limits": dict(av_contract.SOAK_LIMITS), "valid": stats is not None,
              **({key: stats[key] for key in stats} if stats is not None else {"passed": None})}
     return block, metrics
+
+
+def wireless_link_gap(capture: dict) -> str | None:
+    """Why a wireless capture does not prove a wireless-only session, or None (wired: None)."""
+    if capture.get("mode") != "wireless":
+        return None
+    link = capture.get("link")
+    if not isinstance(link, dict):
+        return "wireless_link_unrecorded"
+    for moment in ("before", "after"):
+        snapshot = link.get(moment)
+        if not isinstance(snapshot, dict) or snapshot.get("usb_aoa") is None:
+            return f"wireless_usb_unknown_{moment}"
+        if snapshot["usb_aoa"] is not False:
+            return f"wireless_usb_in_aoa_{moment}"
+    return None
 
 
 def workload_gap(raw: object, window: Window | None) -> str | None:

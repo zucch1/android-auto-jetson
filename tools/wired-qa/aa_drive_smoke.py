@@ -36,6 +36,16 @@ receiver's **default video offer**, whose primary profile is
 negotiate. 1080p60 and 1440p60 do not paint 90 % of 60 fps on the Orin Nano
 today, even when healthy (#79, #85), so a smoke run with a ``--video-profiles``
 override is reported normally but never satisfies the gate.
+
+``--transport wired|wireless`` (default wired) picks the session's transport
+(tools/perf/aa_transport.py). Wireless launches ``aa-wireless-receiver`` for
+the approved ``--phone-id``; the receiver brings the session up through the
+system helper's AP and Bluetooth bootstrap when the display asks to project,
+and tears it down when it stops. The criteria are the same. Wireless has no
+``active`` line: the run takes the receiver's own ``session_state_changed`` to
+``active`` diagnostic (``--diagnostics``) instead and records which one it
+used. The record names its transport and the phone's link state before and
+after (``link``); ``check --transport`` refuses a record of another transport.
 """
 from __future__ import annotations
 
@@ -58,6 +68,7 @@ TOOLS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS / "perf"))
 import aa_av_contract as av_contract  # noqa: E402
 import aa_moving_map as moving_map  # noqa: E402
+import aa_transport as transport  # noqa: E402
 from aa_build_guard import (  # noqa: E402
     BuildDirMismatchError, BuildGuardError, require_optimized_build, verify_launched_binaries)
 
@@ -115,7 +126,7 @@ QUALIFIED_PROFILE = "1280x720@30:h264"
 
 PER_FRAME = ("video_ipc_send", "video_ipc_receive", "video_decode_completed", "video_presented",
              "audio_write_completed", "input_forwarded", "media_timing", "ok", "status")
-PROCESS_NAMES = ("aa-wired-receiv", "aa-dummy-displa")  # /proc comm is 15 chars
+PROCESS_NAMES = (*transport.RECEIVER_COMMS, "aa-dummy-displa")  # /proc comm is 15 chars
 BUILD_NAMES = ("cmake", "ninja", "make", "c++", "g++", "gcc", "cc1plus", "ctest", "nvcc")
 
 
@@ -324,7 +335,10 @@ SERIAL = re.compile(r"[A-Za-z0-9._:-]+")
 # presentation, video profiles, IDR strategy, audio sink, screen geometry...
 HARNESS_FLAGS = {
     "receiver": {"--port": 1, "--store": 1, "--require-video-consumer": 0, "--video-socket": 1,
-                 "--input-socket": 1, "--duration-ms": 1},
+                 "--input-socket": 1, "--duration-ms": 1,
+                 # aa-wireless-receiver: the store directory, the approved phone and
+                 # the redacted diagnostics the run needs for its active marker.
+                 "--store-dir": 1, "--phone-id": 1, "--diagnostics": 0},
     "display": {"--test-only-autostart": 0, "--test-only-control-stdin": 0, "--video-socket": 1,
                 "--input-socket": 1},
 }
@@ -372,7 +386,8 @@ def load_record(text: str) -> dict | None:
 
 
 def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: str,
-                 phone_serial: str, now: datetime) -> tuple[str | None, str]:
+                 phone_serial: str, now: datetime,
+                 transport_name: str = transport.DEFAULT_TRANSPORT) -> tuple[str | None, str]:
     """Return (blocked reason, detail); reason None means the soak may start.
 
     Both launched binaries must have been hashed (64 lowercase hex digits) and
@@ -404,6 +419,11 @@ def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: s
             or set(record["configuration"]) != set(DEFAULT_CONFIGURATION)):
         return "drive_smoke_malformed", "the result lacks a well-typed verdict, binaries, " \
             "duration_s, finished_utc, video_profiles, phone_serial or configuration"
+    if transport.record_transport(record) != transport_name:
+        # A wired smoke never qualifies a wireless soak, nor the reverse.
+        return "drive_smoke_transport_mismatch", (
+            f"the smoke ran over {transport.record_transport(record) or 'an unknown transport'!s}, "
+            f"the soak is {transport_name}")
     if record["verdict"] != "PASS":
         return "drive_smoke_not_passed", f"verdict {record['verdict']!r}"
     for role, digest in (("receiver", receiver_sha256), ("display", display_sha256)):
@@ -447,7 +467,8 @@ def _check_cli(args) -> int:
         now = now.replace(tzinfo=timezone.utc)
     reason, detail = check_record(record, receiver_sha256=args.receiver_sha256,
                                   display_sha256=args.display_sha256,
-                                  phone_serial=args.phone_serial, now=now)
+                                  phone_serial=args.phone_serial, now=now,
+                                  transport_name=args.transport)
     if malformed:
         reason, detail = "drive_smoke_malformed", "the result is not strict JSON"
     if reason:
@@ -507,6 +528,10 @@ class Logger(threading.Thread):
                 if name == "video_presented":
                     self.seen.setdefault("first_paint", event.get("completed_ns", now))
                     continue
+                if (name == "diag" and event.get("kind") == "session_state_changed"
+                        and event.get("to_state") == "active"):
+                    # The wireless receiver's active marker (it logs no "active" line).
+                    self.seen.setdefault("diag_active", now)
                 self.seen.setdefault(name, now)
                 if name.startswith("idr_"):
                     with self.lock:
@@ -614,7 +639,9 @@ def _run_cli(args) -> int:
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
     receiver_bin, display_bin = Path(args.receiver), Path(args.display)
     store = Path(args.store)
-    base: dict = {"schema": SCHEMA, "duration_s": args.duration, "port": args.port,
+    wireless = args.transport == "wireless"
+    base: dict = {"schema": SCHEMA, "transport": args.transport, "duration_s": args.duration,
+                  "port": None if wireless else args.port,
                   "video_profiles": args.video_profiles, "criteria_constants": {
                       "window_s": WINDOW_S, "painted_fps_min_ratio": PAINTED_FPS_MIN_RATIO,
                       "fps_startup_grace_s": FPS_STARTUP_GRACE_S,
@@ -642,9 +669,20 @@ def _run_cli(args) -> int:
         return _blocked(out, base, "projection_process_running")
     devices = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, timeout=20).stdout
     line = next((entry for entry in devices.splitlines() if entry.split()[:1] == [args.serial]), "")
-    if " device " not in f" {line} " or f"usb:{args.port}" not in line.split():
+    if wireless:
+        # adb (the stimulus) may use the cable; the session itself must not.
+        if " device " not in f" {line} ":
+            return _blocked(out, base, "phone_absent")
+        base["adb_link"] = transport.adb_link(line)
+    elif " device " not in f" {line} " or f"usb:{args.port}" not in line.split():
         return _blocked(out, base, "phone_absent_on_port")
     base["phone_model"] = _adb(args.serial, "shell", "getprop", "ro.product.model").stdout.strip()
+    if wireless:
+        base["link"] = {"before": transport.link_snapshot(lambda *a: _adb(args.serial, *a)),
+                        "after": None}
+        refusal = transport.wireless_usb_refusal(base["link"]["before"])
+        if refusal:
+            return _blocked(out, base, refusal)
     # The soak gate binds to this phone. The record is a local file and must not
     # be committed or exported (runbook, Privacy).
     base["phone_serial"] = args.serial
@@ -661,10 +699,18 @@ def _run_cli(args) -> int:
             env["XAUTHORITY"] = xauth
     socket = f"{env['XDG_RUNTIME_DIR']}/aa-drive-smoke-{os.getpid()}"
     profiles = ["--video-profiles", args.video_profiles] if args.video_profiles else []
-    receiver_cmd = [str(receiver_bin), "--port", args.port, "--store", str(store),
-                    "--require-video-consumer", "--video-socket", socket + ".video",
-                    "--input-socket", socket + ".input", *profiles, "--duration-ms",
-                    str(int((2 * args.duration + READY_TIMEOUT_S * 2 + FIRST_PAINT_WAIT_S + 30) * 1000))]
+    lifetime_ms = str(int((2 * args.duration + READY_TIMEOUT_S * 2 + FIRST_PAINT_WAIT_S + 30) * 1000))
+    if wireless:
+        # The receiver acquires the helper's AP and bootstraps the phone over
+        # Bluetooth when the display asks to project; it releases both on stop.
+        receiver_cmd = [str(receiver_bin), "--store-dir", str(store.parent),
+                        "--phone-id", str(args.phone_id), "--diagnostics",
+                        "--video-socket", socket + ".video", "--input-socket", socket + ".input",
+                        *profiles, "--duration-ms", lifetime_ms]
+    else:
+        receiver_cmd = [str(receiver_bin), "--port", args.port, "--store", str(store),
+                        "--require-video-consumer", "--video-socket", socket + ".video",
+                        "--input-socket", socket + ".input", *profiles, "--duration-ms", lifetime_ms]
     display_cmd = [str(display_bin), "--test-only-autostart", "--test-only-control-stdin",
                    "--video-socket", socket + ".video", "--input-socket", socket + ".input", *profiles]
     base["configuration"] = configuration(receiver_cmd, display_cmd)
@@ -679,7 +725,8 @@ def _run_cli(args) -> int:
 
     workload = moving_map.MovingMap(lambda *a: _adb(args.serial, *a), media_uri=args.media_uri,
                                     media_type=args.media_type,
-                                    media_component=args.media_component, geo_uri=args.geo_uri)
+                                    media_component=args.media_component, geo_uri=args.geo_uri,
+                                    usb_reset=not wireless)
 
     def drive() -> None:
         if not workload.prepare_phone(stop.sleep) or stop:
@@ -699,10 +746,13 @@ def _run_cli(args) -> int:
         loggers.append(Logger(display.stdout, out / "display.log", stamped, lock, "display"))
         loggers[-1].start()
         dx = loggers[1].seen
-        if not _wait(lambda: "active" in rx, READY_TIMEOUT_S, stop, receiver, display):
+        marker = "diag_active" if wireless else "active"
+        # Wireless startup includes the AP and the Bluetooth bootstrap, inside the same budget.
+        if not _wait(lambda: marker in rx, READY_TIMEOUT_S, stop, receiver, display):
             run["failure"] = "no active session within the startup budget"
             return
-        run["active_ns"] = rx["active"]
+        run["active_ns"] = rx[marker]
+        run["active_marker"] = marker
         _wait(lambda: "first_paint" in dx, FIRST_PAINT_WAIT_S, stop, receiver, display)
         span = int(args.duration * 1e9) + 5 * 10**8
         end = dx.get("first_paint", time.monotonic_ns()) + span
@@ -741,6 +791,13 @@ def _run_cli(args) -> int:
         stamped.close()
         # Media stopped and verified first, USB mode last (it re-enumerates USB).
         run["cleanup_failures"] = workload.restore_phone()
+        if wireless and "link" in base:
+            # The phone's USB must still be plain mtp: the session never used it.
+            base["link"]["after"] = transport.link_snapshot(lambda *a: _adb(args.serial, *a))
+            refusal = transport.wireless_usb_refusal(base["link"]["after"])
+            if refusal:
+                run["cleanup_failures"].append(f"{refusal}_after: USB "
+                                               f"{base['link']['after']['usb_functions']}")
         base["cleanup_failures"] = run["cleanup_failures"]  # in every result, BLOCKED too
         for failure in run["cleanup_failures"]:
             print(f"drive smoke: cleanup failure: {failure}", file=sys.stderr)
@@ -807,11 +864,16 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="drive the smoke on the phone (live)")
     run.add_argument("--serial", required=True, help="adb serial of the phone")
+    run.add_argument("--transport", choices=transport.TRANSPORTS, default=transport.DEFAULT_TRANSPORT,
+                     help="session transport (default wired); a result counts only for its own")
+    run.add_argument("--phone-id", type=int,
+                     help="wireless: the approved wireless phone id in the trust store")
     run.add_argument("--port", default=os.environ.get("AA_PERF_PORT", "1-2.1"),
                      help="USB port context the phone is on (default 1-2.1)")
     run.add_argument("--build-dir", default=os.environ.get("AA_BUILD_DIR"),
                      help="optimized build directory that produced the binaries")
-    run.add_argument("--receiver", help="default: <build-dir>/aa-wired-receiver")
+    run.add_argument("--receiver", help="default: <build-dir>/aa-wired-receiver, or "
+                     "aa-wireless-receiver with --transport wireless")
     run.add_argument("--display", help="default: <build-dir>/aa-dummy-display")
     run.add_argument("--store", default=str(Path.home() / ".local/state/android-auto-receiver/"
                                             "approved-phones.json"))
@@ -835,6 +897,8 @@ def main(argv: list[str]) -> int:
     check.add_argument("--phone-serial", required=True,
                        help="the soak phone's serial, verified on its port; empty if it could not be")
     check.add_argument("--now", help="ISO-8601 time; tests and offline review only, never live")
+    check.add_argument("--transport", choices=transport.TRANSPORTS, default=transport.DEFAULT_TRANSPORT,
+                       help="the soak's transport; a smoke of another transport is refused")
     args = parser.parse_args(argv)
     if args.command == "check":
         return _check_cli(args)
@@ -846,7 +910,13 @@ def main(argv: list[str]) -> int:
         parser.error("--duration must be positive")
     if not args.build_dir:
         parser.error("--build-dir (or AA_BUILD_DIR) is required: the smoke qualifies a Release build")
-    args.receiver = args.receiver or str(Path(args.build_dir) / "aa-wired-receiver")
+    if args.transport == "wireless":
+        if not args.phone_id or args.phone_id <= 0:
+            parser.error("--transport wireless needs --phone-id (the approved wireless phone)")
+        if Path(args.store).name != "approved-phones.json":
+            parser.error("--transport wireless: --store must name <dir>/approved-phones.json "
+                         "(the wireless receiver takes the directory)")
+    args.receiver = args.receiver or str(Path(args.build_dir) / transport.RECEIVER_BINARY[args.transport])
     args.display = args.display or str(Path(args.build_dir) / "aa-dummy-display")
     return _run_cli(args)
 

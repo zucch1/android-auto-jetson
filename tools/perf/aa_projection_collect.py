@@ -53,6 +53,19 @@ build directory that produced the binaries proves an optimized build (see
 pump enough to fail the A/V gate on its own. ``--allow-unoptimized-build`` is a
 debugging override only.
 
+With ``--transport wireless`` (default wired) the collector launches
+``aa-wireless-receiver --store-dir DIR --phone-id N --diagnostics`` instead:
+the receiver brings the session up through the system helper's AP and
+Bluetooth bootstrap when the display asks to project and releases them when it
+stops. The workload then leaves the phone's USB alone (no AOA, no mtp reset);
+the phone's USB functions, Wi-Fi frequency/channel/RSSI and Bluetooth state are
+read over adb before and after the stage into ``link``, and a phone in AOA (or
+whose USB state cannot be read) refuses the stage before anything is launched,
+or BLOCKS it afterwards (tools/perf/aa_transport.py). The wireless receiver logs
+no ``active`` line; its ``session_state_changed`` diagnostic to ``active`` is
+the marker, and ``startup_ms`` is measured from the receiver's launch to it.
+The capture's ``mode`` is the transport.
+
 This tool does not modify target state (no installs, no udev, no kernel
 changes); it only launches the supplied binaries, reads procfs/sysfs and, with
 the moving-map workload, sends adb intents to the named phone.
@@ -82,6 +95,7 @@ from typing import Literal
 
 from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
 import aa_moving_map as moving_map
+import aa_transport as transport
 from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Sample, ThermalZone, VideoEvidence, thermal_policy_for_model,
 )
@@ -468,6 +482,9 @@ class EventParser:
 
     def __init__(self) -> None:
         self.offsets: dict[str, int] = {}
+        # Wireless: the receiver's launch on the monotonic clock, for startup_ms
+        # from its session_state_changed -> active diagnostic (mono_ns).
+        self.receiver_started_ns: int | None = None
         self.metrics: dict[str, object] = {
             "frame_drops": None, "decode_p50_ms": None, "decode_p95_ms": None,
             "decode_fps": None, "decode_frames": None, "ipc_throughput_mbps": None,
@@ -752,6 +769,15 @@ class EventParser:
         if envelope == "active" and isinstance(event.get("startup_ms"), int):
             self.startup_ms = event["startup_ms"]
             self.projection_active = True
+        if envelope == "diag" and kind == "session_state_changed":
+            state, mono = event.get("to_state"), event.get("mono_ns")
+            if (state == "active" and not self.projection_active and type(mono) is int
+                    and self.receiver_started_ns is not None and self.startup_ms is None):
+                self.startup_ms = max(0, (mono - self.receiver_started_ns) // 10**6)
+            if state == "active":
+                self.projection_active = True
+            elif state in ("disconnected", "failed", "stopping"):
+                self.projection_active = False
         if envelope in ("stopping", "disconnected", "err"):
             self.projection_active = False
         if kind == "decode_stats":
@@ -816,20 +842,25 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     managed_display = bool(args.display and not args.no_display)
     video_socket = getattr(args, "video_socket", None)
     input_socket = getattr(args, "input_socket", None)
-    receiver_cmd = [args.receiver, "--port", args.port, "--duration-ms",
-                    str((args.duration_seconds + startup_timeout + 10) * 1000)]
-    if args.store:
+    wireless = getattr(args, "transport", transport.DEFAULT_TRANSPORT) == "wireless"
+    lifetime_ms = str((args.duration_seconds + startup_timeout + 10) * 1000)
+    if wireless:
+        receiver_cmd = [args.receiver, "--store-dir", str(Path(args.store).parent),
+                        "--phone-id", str(args.phone_id), "--diagnostics", "--duration-ms", lifetime_ms]
+    else:
+        receiver_cmd = [args.receiver, "--port", args.port, "--duration-ms", lifetime_ms]
+    if args.store and not wireless:
         receiver_cmd += ["--store", args.store]
     if video_socket:
         receiver_cmd += ["--video-socket", video_socket]
     if input_socket:
         receiver_cmd += ["--input-socket", input_socket]
     phone_serial = getattr(args, "phone_serial", None)
-    if phone_serial:
+    if phone_serial and not wireless:
         # Same-phone binding at the point of use (#137): the receiver itself
         # refuses a first link or reconnect from any other physical phone.
         receiver_cmd += ["--require-usb-serial", phone_serial]
-    if managed_display:
+    if managed_display and not wireless:
         # Contract: --require-video-consumer makes the receiver emit "ready"
         # after listeners/control init and BEFORE version negotiation.
         receiver_cmd += ["--require-video-consumer"]
@@ -848,7 +879,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             moving_map.adb_runner(phone_serial), media_uri=args.media_uri,
             media_type=getattr(args, "media_type", None),
             media_component=getattr(args, "media_component", None),
-            geo_uri=getattr(args, "geo_uri", None) or moving_map.DEFAULT_GEO_URI)
+            geo_uri=getattr(args, "geo_uri", None) or moving_map.DEFAULT_GEO_URI,
+            usb_reset=not wireless)
         args.cleanup_failures = ["phone_restore_not_reached"]  # until restore_phone runs
     av_series: dict = {"pair_t_ns": [], "pair_skew_ns": [], "audio_intervals_ns": []}
     rec_file = None
@@ -891,7 +923,18 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
 
     concurrent_builds: list[dict] = []
     own_processes = ancestors()
+    link: dict | None = None
     try:
+        if wireless:
+            # Read-only: the session must not use the cable (aa_transport.py).
+            link = {"before": transport.link_snapshot(moving_map.adb_runner(phone_serial)),
+                    "after": None}
+            refusal = transport.wireless_usb_refusal(link["before"])
+            if refusal:
+                if workload is not None:
+                    workload.phone_failure = f"wireless_link: {refusal}"
+                raise PhoneSetupError(f"wireless_link: {refusal} "
+                                      f"(USB {link['before']['usb_functions']})")
         if workload is not None:
             if not workload.prepare_phone(lambda seconds: (time.sleep(seconds), True)[1]):
                 # Nothing is launched; the finally restores the phone.
@@ -903,6 +946,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         rec_file = open(receiver_log, "w", encoding="utf-8")
         receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
                                     start_new_session=True)
+        parser.receiver_started_ns = time.monotonic_ns()
         _record_process(args, "receiver", receiver.pid)
         if managed_display:
             # Bounded receiver-ready observation: the managed display launches on
@@ -1049,6 +1093,13 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             # Media stopped and verified first, USB mode last (it re-enumerates USB).
             for failure in workload.restore_phone():
                 print(f"cleanup failure: {failure}", file=sys.stderr)
+            if wireless and link is not None and receiver is not None:
+                link["after"] = transport.link_snapshot(moving_map.adb_runner(phone_serial))
+                refusal = transport.wireless_usb_refusal(link["after"])
+                if refusal:
+                    workload.cleanup_failures.append(
+                        f"{refusal}_after: USB {link['after']['usb_functions']}")
+                    print(f"cleanup failure: {refusal}_after", file=sys.stderr)
             args.cleanup_failures = list(workload.cleanup_failures)  # for --run-file
         parser.poll(str(receiver_log))
         if display is not None:
@@ -1063,7 +1114,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
 
     capture = {
         "schema": CAPTURE_SCHEMA,
-        "mode": "wired",
+        "mode": "wireless" if wireless else "wired",
         "duration_seconds": args.duration_seconds,
         "observed_duration_seconds": observed_duration,
         "active_projection_seconds": progress.seconds,
@@ -1101,6 +1152,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                             "drag_t_ns": [t - origin_ns for t in workload.drag_ns][:_AV_SERIES_LIMIT]}
                            if workload is not None else {"kind": "none"})
     capture["concurrent_builds"] = concurrent_builds
+    if wireless:
+        capture["link"] = link
     if thermal_policy is not None:
         capture["thermal_policy"] = asdict(thermal_policy)
     return capture
@@ -1110,7 +1163,12 @@ def _cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--receiver", required=True, help="receiver binary to launch")
     parser.add_argument("--display", default=None, help="dummy display binary (optional)")
-    parser.add_argument("--port", required=True, help="USB port context passed to the receiver")
+    parser.add_argument("--port", required=True, help="USB port context passed to the receiver "
+                        "(wired; ignored for --transport wireless)")
+    parser.add_argument("--transport", choices=transport.TRANSPORTS, default=transport.DEFAULT_TRANSPORT,
+                        help="session transport (default wired)")
+    parser.add_argument("--phone-id", type=int, default=None,
+                        help="wireless: the approved wireless phone id in the trust store")
     parser.add_argument("--duration-seconds", required=True, type=int)
     parser.add_argument("--interval", type=float, default=5.0)
     parser.add_argument("--store", default=None, help="approved-phone store path passed to receiver")
@@ -1147,6 +1205,13 @@ def _cli(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     args.run_file_record = None
     args.cleanup_failures = []  # nothing has touched the phone yet
+    if args.transport == "wireless" and (not args.phone_id or args.phone_id <= 0 or not args.store
+                                         or Path(args.store).name != "approved-phones.json"
+                                         or not args.phone_serial):
+        print("usage error: --transport wireless needs --phone-id, --phone-serial (adb, for the "
+              "workload and the link record) and --store <dir>/approved-phones.json",
+              file=sys.stderr)
+        return 2
     if args.run_file:
         # Lead a process group of our own (already true for a session leader):
         # every phone command we start is in it, and nothing else is.
