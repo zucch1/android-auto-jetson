@@ -1612,6 +1612,7 @@ class AdmissionTransport final : public aa::transport::Transport {
     aa::core::Result<void> send(std::span<const std::byte> bytes) override {
         std::lock_guard lock(state_->mutex);
         state_->sent.emplace_back(bytes.begin(), bytes.end());
+        state_->cv.notify_all();
         return {};
     }
     void set_io_checkpoint(std::function<void()> checkpoint) override {
@@ -6991,3 +6992,545 @@ TEST(WiredReceiver, DbusIdrFirstSendFailureKeepsSessionActiveWithoutTeardown) {
     EXPECT_EQ(run.output.find("channel_focus_restore_failed"), std::string::npos) << run.output;
 }
 
+namespace {
+std::uint64_t sum_runtime_dropped(const std::string &text) {
+    std::uint64_t total = 0;
+    const std::string key = "\"backpressure\":";
+    for (auto at = text.find("runtime_log_dropped"); at != std::string::npos;
+         at = text.find("runtime_log_dropped", at + 1)) {
+        const auto value = text.find(key, at);
+        if (value != std::string::npos) {
+            total += std::stoull(text.substr(value + key.size()));
+        }
+    }
+    return total;
+}
+
+struct ActiveStdoutLogBinding final {
+    explicit ActiveStdoutLogBinding(aa::wired_receiver::StdoutLog &log) {
+        previous = aa::wired_receiver::active_stdout_log.exchange(&log);
+    }
+    ~ActiveStdoutLogBinding() { aa::wired_receiver::active_stdout_log.store(previous); }
+    ActiveStdoutLogBinding(const ActiveStdoutLogBinding &) = delete;
+    ActiveStdoutLogBinding &operator=(const ActiveStdoutLogBinding &) = delete;
+    aa::wired_receiver::StdoutLog *previous{nullptr};
+};
+} // namespace
+
+TEST(WiredReceiver, RuntimeDiagnosticsAndAudioReopenKeepTimingOnStalledStdout) {
+    // Given: the receiver's stdout log is blocked in ::write and completely full.
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    struct ProbeGuard {
+        LogWriteProbe &p;
+        ~ProbeGuard() {
+            p.release();
+            LogWriteProbe::active = nullptr;
+        }
+    } probe_guard{probe};
+
+    std::atomic<bool> running{true};
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write};
+    ActiveStdoutLogBinding binding{log};
+    fill_log_queue(log);
+
+    // When: steady-state diagnostics emit while stdout is blocked and full.
+    StdoutDiagnostics diag;
+    auto diag_future = std::async(std::launch::async, [&] {
+        const auto t0 = LogClock::now();
+        diag.emit_json("{\"kind\":\"stall_diag_probe\"}");
+        return LogClock::now() - t0;
+    });
+    if (diag_future.wait_for(std::chrono::milliseconds{400}) != std::future_status::ready) {
+        probe.release();
+        FAIL() << "STDIO_DIAGNOSTICS_BLOCKED_ON_FULL_STALLED_STDOUT";
+    }
+    const auto diag_elapsed = diag_future.get();
+    EXPECT_LT(diag_elapsed, std::chrono::milliseconds{50});
+
+    // When: audio sink reopen provenance is logged while stdout is blocked and full.
+    const aa::audio::SinkReport reopen_report{aa::audio::SinkBackend::pulse, {}, "pulsesink", true, {}};
+    auto reopen_log_future = std::async(std::launch::async, [&] {
+        const auto t0 = LogClock::now();
+        log_sink_selected(reopen_report, "reopen");
+        return LogClock::now() - t0;
+    });
+    if (reopen_log_future.wait_for(std::chrono::milliseconds{400}) != std::future_status::ready) {
+        probe.release();
+        FAIL() << "AUDIO_REOPEN_LOG_BLOCKED_ON_FULL_STALLED_STDOUT";
+    }
+    EXPECT_LT(reopen_log_future.get(), std::chrono::milliseconds{50});
+
+    // When: ConcreteAudioRenderWorker encounters a sink write error (triggering
+    // audio_stall_bypass + reopen + publish_bypass_logs + log_sink_selected("reopen"))
+    // while stdout is blocked and full, audio submission and recovery must keep
+    // within the 200 ms audio-latency gate.
+    auto gate = std::make_shared<RenderGate>();
+    gate->first_write_delay = std::chrono::milliseconds{0};
+    gate->fail_first_write = true;
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(960, std::byte{1});
+    const auto t_submit1 = LogClock::now();
+    ASSERT_TRUE(audio.submit({{role, 1, {1'000'000'000}}, pcm}, {role, 0, 1, 9}));
+    EXPECT_LT(LogClock::now() - t_submit1, std::chrono::milliseconds{200});
+    ASSERT_TRUE(gate->wait_writes(1));
+    gate->release();
+
+    // Wait for worker reopen + bypass log publication while stdout stays blocked.
+    const auto idle_ok = audio.wait_idle(LogClock::now() + std::chrono::milliseconds{1500});
+    if (!idle_ok) {
+        probe.release();
+        FAIL() << "AUDIO_WORKER_BLOCKED_ON_STALLED_STDOUT_DURING_REOPEN";
+    }
+    const auto t_submit2 = LogClock::now();
+    ASSERT_TRUE(audio.submit({{role, 2, {1'005'000'000}}, pcm}, {role, 0, 2, 9}));
+    EXPECT_LT(LogClock::now() - t_submit2, std::chrono::milliseconds{200});
+    ASSERT_TRUE(gate->wait_writes(2));
+    ASSERT_TRUE(audio.wait_idle(LogClock::now() + std::chrono::milliseconds{1500}));
+    EXPECT_TRUE(audio.finish());
+
+    // Then: unblocking stdout drains cleanly with no errors and loss is counted in-band.
+    probe.release();
+    EXPECT_FALSE(log.finish());
+    EXPECT_TRUE(running.load());
+    EXPECT_GE(count_substr(probe.bytes, "\"event\":\"runtime_log_dropped\""), 1U);
+    EXPECT_GE(sum_runtime_dropped(probe.bytes), 4U);
+}
+
+TEST(WiredReceiver, WiredReceiverEndToEndKeepsAvAudioAndControlTimingDuringStdoutStall) {
+    if (!std::getenv("AA_STALLED_STDOUT_E2E_CHILD")) {
+        std::string executable = "/proc/self/exe";
+        std::string filter =
+            "--gtest_filter=WiredReceiver.WiredReceiverEndToEndKeepsAvAudioAndControlTimingDuringStdoutStall";
+        std::string color = "--gtest_color=no";
+        char *args[]{executable.data(), filter.data(), color.data(), nullptr};
+        std::string marker_env = "AA_STALLED_STDOUT_E2E_CHILD=1";
+        std::vector<char *> environment;
+        for (char **entry = ::environ; *entry; ++entry) {
+            environment.push_back(*entry);
+        }
+        environment.push_back(marker_env.data());
+        environment.push_back(nullptr);
+        pid_t isolated = -1;
+        ASSERT_EQ(::posix_spawn(&isolated, executable.c_str(), nullptr, nullptr,
+                               args, environment.data()), 0);
+        int exited = static_cast<int>(::syscall(SYS_pidfd_open, isolated, 0));
+        const bool normal = exited >= 0 && log_readable(exited, std::chrono::seconds{20});
+        if (!normal) {
+            (void)::kill(isolated, SIGKILL);
+        }
+        LogChild::close_fd(exited);
+        int status = -1;
+        pid_t waited;
+        do {
+            waited = ::waitpid(isolated, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        ASSERT_EQ(waited, isolated);
+        EXPECT_TRUE(normal);
+        ASSERT_TRUE(WIFEXITED(status));
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+        return;
+    }
+
+    ASSERT_EQ(std::distance(std::filesystem::directory_iterator{"/proc/self/task"},
+                            std::filesystem::directory_iterator{}), 1);
+
+    LogChild child;
+    ASSERT_EQ(::pipe2(child.output, O_CLOEXEC), 0);
+    ASSERT_EQ(::pipe2(child.control, O_CLOEXEC), 0);
+    const int flags = ::fcntl(child.output[1], F_GETFL);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(::fcntl(child.output[1], F_SETFL, flags | O_NONBLOCK), 0);
+    const std::string filler(4096, 'F');
+    std::size_t filled = 0;
+    for (;;) {
+        const auto count = ::write(child.output[1], filler.data(), filler.size());
+        if (count > 0) {
+            filled += static_cast<std::size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        ASSERT_EQ(count, -1);
+        ASSERT_EQ(errno, EAGAIN);
+        break;
+    }
+    ASSERT_GT(filled, 0U);
+    ASSERT_EQ(::fcntl(child.output[1], F_SETFL, flags & ~O_NONBLOCK), 0);
+    ASSERT_EQ(std::fflush(nullptr), 0);
+
+    child.pid = ::fork();
+    ASSERT_GE(child.pid, 0);
+    if (child.pid == 0) {
+        ::close(child.output[0]);
+        ::close(child.control[0]);
+        if (::dup2(child.output[1], STDOUT_FILENO) < 0) {
+            ::_exit(90);
+        }
+        ::close(child.output[1]);
+
+        char directory[] = "/tmp/a90-e2e-XXXXXX";
+        const char *created_dir = ::mkdtemp(directory);
+        if (!created_dir) {
+            ::_exit(91);
+        }
+        const std::filesystem::path root{created_dir};
+        const auto store_path = root / "approved.json";
+        aa::trust::ApprovedPhoneStore store{store_path};
+        const aa::trust::WiredIdentity identity{
+            "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+        if (!store.load().has_value() ||
+            !store.approve(aa::trust::TransportIdentity{identity}).has_value()) {
+            std::filesystem::remove_all(root);
+            ::_exit(92);
+        }
+
+        runtime_phone = aa::app::wired_phone_identity(identity).value();
+        runtime_recovers = false;
+        runtime_quiet = false;
+        runtime_send_audio = false;
+        runtime_send_video = false;
+        runtime_connects.store(0);
+        runtime_ciphers.store(0);
+        runtime_sends.store(0);
+        g_running.store(true);
+
+        auto gate = std::make_shared<RenderGate>();
+        gate->first_write_delay = std::chrono::milliseconds{0};
+        gate->released = true;
+        runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+
+        auto state = std::make_shared<AdmissionState>();
+        admission_link_state = state;
+
+        const auto video_socket = root / "video";
+        const auto input_socket = root / "input";
+        std::vector<std::string> args{
+            "receiver", "--port", "1-2.1", "--no-bus",
+            "--store", store_path.string(),
+            "--video-socket", video_socket.string(),
+            "--input-socket", input_socket.string(),
+            "--duration-ms", "15000"};
+        std::vector<char *> argv;
+        argv.reserve(args.size());
+        for (auto &arg : args) {
+            argv.push_back(arg.data());
+        }
+
+        int receiver_code = -1;
+        std::thread receiver([&] {
+            receiver_code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+        });
+
+        auto fail_child = [&](int exit_code) -> void {
+            g_running.store(false);
+            {
+                std::lock_guard lock(state->mutex);
+                state->closed = true;
+                state->cv.notify_all();
+            }
+            if (receiver.joinable()) {
+                receiver.join();
+            }
+            admission_link_state.reset();
+            runtime_sink_override = {};
+            std::filesystem::remove_all(root);
+            ::_exit(exit_code);
+        };
+
+        {
+            std::unique_lock lock(state->mutex);
+            if (!state->cv.wait_for(lock, std::chrono::seconds{3},
+                                    [&] { return state->created; })) {
+                fail_child(93);
+            }
+        }
+
+        auto cipher = active_test_cipher();
+        const auto push_plain = [&](const std::vector<std::byte> &frame) {
+            std::lock_guard lock(state->mutex);
+            state->inbound.push_back(frame);
+            state->cv.notify_all();
+        };
+        const auto push_channel = [&](std::uint8_t channel, std::vector<std::byte> payload) {
+            auto frames = aa::transport::encode_message(
+                {channel, aa::transport::MessageKind::specific, std::move(payload)},
+                aa::transport::Encryption::encrypted, cipher.get());
+            if (!frames.has_value()) {
+                fail_child(94);
+            }
+            std::lock_guard lock(state->mutex);
+            for (auto &frame : frames.value()) {
+                state->inbound.push_back(std::move(frame));
+            }
+            state->cv.notify_all();
+        };
+
+        const auto video_sock_deadline = LogClock::now() + std::chrono::seconds{3};
+        while ((!std::filesystem::exists(video_socket) || !std::filesystem::exists(input_socket)) &&
+               LogClock::now() < video_sock_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        auto consumer = aa::ipc::connect_video_consumer(
+            aa::ipc::VideoSocketPath{video_socket.string()},
+            aa::ipc::VideoClientOptions{{}, aa::ipc::current_uid(), Milliseconds{3000}});
+        if (!consumer.has_value()) {
+            fail_child(95);
+        }
+
+        aa::ipc::InputSender input_sender;
+        input_sender.attach(aa::ipc::InputSocketPath{input_socket.string()}, aa::ipc::current_uid());
+
+        // Bring session to active with video (99), audio (100), and input (104) open.
+        namespace p = aa::protocol;
+        push_plain(wiredtest::control_frame(
+            p::encode(p::VersionResponse{1, 6, 0}).value()));
+        push_plain(wiredtest::control_frame(
+            p::encode(p::EncapsulatedSsl{{std::byte{1}}}).value()));
+        push_plain(wiredtest::discovery_request_frame());
+        push_plain(wiredtest::open_request_frame(99));
+        push_plain(wiredtest::open_request_frame(100));
+        push_plain(wiredtest::open_request_frame(104));
+        push_channel(99, p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value());
+        push_channel(99, p::encode(p::AvSinkStart{-7, 0}).value());
+        const std::vector<std::byte> config_body{std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+                                                 std::byte{0x01}, std::byte{0x67}, std::byte{0x42}};
+        std::vector<std::byte> config_message{std::byte{0x00}, std::byte{0x01}};
+        config_message.insert(config_message.end(), config_body.begin(), config_body.end());
+        push_channel(99, config_message);
+        const std::vector<std::byte> idr_body{std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+                                              std::byte{0x01}, std::byte{0x65}, std::byte{0x88}};
+        push_channel(99, av_data_message(0x1111, idr_body));
+        push_channel(100, p::encode(p::AvSinkSetup{p::AvSinkCodec::pcm}).value());
+        push_channel(100, p::encode(p::AvSinkStart{-17, 0}).value());
+
+        const auto initial_unit = consumer.value().receive(Milliseconds{3000});
+        if (!initial_unit.has_value() || initial_unit.value() != aa::ipc::ReceiveStatus::complete) {
+            fail_child(96);
+        }
+
+        // Warm up InputSender connection before filling the log queue.
+        if (!input_sender.send(aa::ipc::InputEvent{aa::ipc::KeyEvent{66, true}}).has_value()) {
+            fail_child(97);
+        }
+        bool input_warmed = false;
+        const auto warmup_deadline = LogClock::now() + std::chrono::seconds{2};
+        while (LogClock::now() < warmup_deadline) {
+            {
+                std::lock_guard lock(state->mutex);
+                if (std::any_of(state->sent.begin(), state->sent.end(), [](const auto &raw) {
+                        const auto f = aa::transport::decode_frame(raw);
+                        return f.has_value() && f.value().header.channel == 104;
+                    })) {
+                    input_warmed = true;
+                    break;
+                }
+            }
+            push_plain(wiredtest::encrypted_control_frame(
+                p::encode(p::PingRequest{1, {}}).value()));
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        if (!input_warmed) {
+            fail_child(97);
+        }
+
+        // Now saturate the StdoutLog queue behind the blocked full stdout pipe.
+        auto *active_log = aa::wired_receiver::active_stdout_log.load();
+        if (!active_log) {
+            fail_child(98);
+        }
+        while (active_log->outstanding().second < aa::wired_receiver::StdoutLog::entry_capacity) {
+            if (active_log->submit("fill")) {
+                fail_child(99);
+            }
+        }
+
+        const auto count_sent_on_channel = [&](std::uint8_t channel) {
+            std::lock_guard lock(state->mutex);
+            return static_cast<std::size_t>(std::count_if(
+                state->sent.begin(), state->sent.end(), [channel](const auto &raw) {
+                    const auto f = aa::transport::decode_frame(raw);
+                    return f.has_value() && f.value().header.channel == channel;
+                }));
+        };
+
+        // 1. Video A/V gate (< 50 ms) + Input forwarding while stdout is blocked & full.
+        const std::size_t input_sent_before = count_sent_on_channel(104);
+        const std::vector<std::byte> p_body{std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+                                            std::byte{0x01}, std::byte{0x41}, std::byte{0x10}};
+        const auto t_av_start = LogClock::now();
+        for (int i = 0; i < 5; ++i) {
+            if (!input_sender.send(aa::ipc::InputEvent{aa::ipc::KeyEvent{29 + i, true}}).has_value()) {
+                fail_child(100);
+            }
+        }
+        push_channel(99, av_data_message(0x4444, idr_body));
+        push_channel(99, av_data_message(0x5555, p_body));
+
+        const auto v1 = consumer.value().receive(Milliseconds{500});
+        const auto v2 = consumer.value().receive(Milliseconds{500});
+        if (!v1.has_value() || !v2.has_value()) {
+            fail_child(101);
+        }
+        {
+            const auto input_deadline = LogClock::now() + std::chrono::milliseconds{500};
+            bool input_done = false;
+            while (LogClock::now() < input_deadline) {
+                {
+                    std::unique_lock lock(state->mutex);
+                    if (state->cv.wait_for(lock, std::chrono::milliseconds{2}, [&] {
+                            std::size_t hits = 0;
+                            for (const auto &raw : state->sent) {
+                                const auto f = aa::transport::decode_frame(raw);
+                                if (f.has_value() && f.value().header.channel == 104) {
+                                    ++hits;
+                                }
+                            }
+                            return hits >= input_sent_before + 5;
+                        })) {
+                        input_done = true;
+                        break;
+                    }
+                }
+                push_plain(wiredtest::encrypted_control_frame(
+                    p::encode(p::PingRequest{2, {}}).value()));
+            }
+            if (!input_done) {
+                fail_child(102);
+            }
+        }
+        const auto av_elapsed = LogClock::now() - t_av_start;
+        if (av_elapsed >= std::chrono::milliseconds{50}) {
+            fail_child(103);
+        }
+
+        // 2. Audio latency gate (< 200 ms) while stdout is blocked & full.
+        const std::size_t audio_acks_before = count_sent_on_channel(100);
+        const auto t_audio_start = LogClock::now();
+        push_channel(100, av_data_message(0, wiredtest::pcm_unit()));
+        {
+            std::unique_lock lock(state->mutex);
+            if (!state->cv.wait_for(lock, std::chrono::milliseconds{500}, [&] {
+                    std::size_t hits = 0;
+                    for (const auto &raw : state->sent) {
+                        const auto f = aa::transport::decode_frame(raw);
+                        if (f.has_value() && f.value().header.channel == 100) {
+                            ++hits;
+                        }
+                    }
+                    return hits >= audio_acks_before + 1;
+                })) {
+                fail_child(104);
+            }
+        }
+        const auto audio_elapsed = LogClock::now() - t_audio_start;
+        if (audio_elapsed >= std::chrono::milliseconds{200}) {
+            fail_child(105);
+        }
+
+        // Signal parent that all steady-state timed gates passed BEFORE parent drains stdout.
+        if (::write(child.control[1], "D", 1) != 1) {
+            fail_child(106);
+        }
+        ::close(child.control[1]);
+
+        g_running.store(false);
+        receiver.join();
+        input_sender.close();
+        consumer.value().close();
+        admission_link_state.reset();
+        runtime_sink_override = {};
+        std::filesystem::remove_all(root);
+        std::exit(receiver_code == 0 ? 0 : 107);
+    }
+
+    child.exited = static_cast<int>(::syscall(SYS_pidfd_open, child.pid, 0));
+    LogChild::close_fd(child.output[1]);
+    LogChild::close_fd(child.control[1]);
+
+    char marker = 0;
+    const bool done_before_release = log_readable(child.control[0], std::chrono::seconds{8}) &&
+        ::read(child.control[0], &marker, 1) == 1 && marker == 'D';
+    const int read_flags = ::fcntl(child.output[0], F_GETFL);
+    child.io_ok = read_flags >= 0 &&
+        ::fcntl(child.output[0], F_SETFL, read_flags | O_NONBLOCK) == 0;
+    if (!done_before_release || !child.io_ok) {
+        (void)::kill(child.pid, SIGKILL);
+        child.forced = true;
+    }
+    child.finish();
+
+    EXPECT_TRUE(done_before_release)
+        << "STEADY_STATE_BLOCKED_ON_FULL_STALLED_STDOUT: child stalled before completing A/V & audio gates";
+    EXPECT_TRUE(child.io_ok);
+    EXPECT_TRUE(child.eof);
+    EXPECT_FALSE(child.forced);
+    ASSERT_TRUE(WIFEXITED(child.status)) << child.status;
+    EXPECT_EQ(WEXITSTATUS(child.status), 0);
+    EXPECT_GE(count_substr(child.bytes, "\"event\":\"runtime_log_dropped\""), 1U);
+    EXPECT_GE(sum_runtime_dropped(child.bytes), 5U);
+}
+
+TEST(WiredReceiver, StdoutLogRuntimeRecordsNeverBlockOnFullStalledSinkAndReportDrops) {
+    // Given: a stalled sink on a controllable clock and a full queue.
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    struct ProbeGuard {
+        LogWriteProbe &p;
+        ~ProbeGuard() {
+            p.release();
+            LogWriteProbe::active = nullptr;
+        }
+    } probe_guard{probe};
+
+    std::atomic<bool> running{true};
+    g_log_fake_ns = 0;
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now};
+    fill_log_queue(log);
+
+    // When: steady-state runtime records arrive while the sink is stalled and full.
+    auto flooded = std::async(std::launch::async, [&] {
+        const auto t0 = LogClock::now();
+        for (int i = 0; i < 7; ++i) {
+            EXPECT_FALSE(log.submit_runtime("{\"event\":\"runtime_probe\"}"));
+        }
+        return LogClock::now() - t0;
+    });
+    ASSERT_EQ(flooded.wait_for(std::chrono::milliseconds{500}), std::future_status::ready);
+    EXPECT_LT(flooded.get(), std::chrono::milliseconds{50});
+    EXPECT_EQ(log.runtime_drops(), 7U);
+
+    // Then: unblocking drains cleanly and emits the in-band summary at t=0.
+    probe.release();
+    EXPECT_FALSE(log.flush());
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"runtime_log_dropped\""), 1U);
+    EXPECT_EQ(sum_runtime_dropped(probe.bytes), 7U);
+
+    // When: a second stall drops records within the 1 s virtual summary interval,
+    // emission is throttled until the virtual interval elapses.
+    {
+        const std::lock_guard lock(probe.mutex);
+        probe.released = false;
+    }
+    fill_log_queue(log);
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_FALSE(log.submit_runtime("{\"event\":\"runtime_probe_2\"}"));
+    }
+    EXPECT_EQ(log.runtime_drops(), 9U);
+    g_log_fake_ns = 500'000'000; // 500 ms < media_summary_interval (1000 ms)
+    probe.release();
+    EXPECT_FALSE(log.flush());
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"runtime_log_dropped\""), 1U);
+
+    g_log_fake_ns = 1'000'000'000; // 1000 ms >= media_summary_interval
+    EXPECT_FALSE(log.submit_runtime("{\"event\":\"after_interval\"}"));
+    EXPECT_FALSE(log.finish());
+    EXPECT_TRUE(running.load());
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"runtime_log_dropped\""), 2U);
+    EXPECT_EQ(sum_runtime_dropped(probe.bytes), 9U);
+    EXPECT_NE(probe.bytes.find("{\"event\":\"after_interval\"}\n"), std::string::npos);
+}

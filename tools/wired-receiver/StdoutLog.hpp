@@ -26,9 +26,15 @@ namespace aa::wired_receiver {
 
 // Single-writer stdout log with a bounded, FIFO-exact queue.
 //
-//   * submit(): control / lifecycle / error records. Lossless: a full queue makes
-//     the producer wait (issue #60: the logger survives a long stdout block
-//     without dropping or reordering these records).
+//   * submit(): startup / shutdown lifecycle records. Lossless while running:
+//     a full queue makes the producer wait (issue #60: the logger survives a
+//     long stdout block without dropping or reordering these records).
+//   * submit_runtime(): steady-state runtime, diagnostic, and control records
+//     (issue #90). Never makes a media, audio, or control thread wait for a
+//     full queue behind a stalled sink; records arriving at a full queue are
+//     dropped and counted, and reported in-band as runtime_log_dropped (at most
+//     once per media_summary_interval, and once at finish) and through
+//     runtime_drops().
 //   * submit_media(): phone-driven media telemetry (audio completions, periodic
 //     video events). Audit L13: a hostile or merely chatty phone can sustain
 //     media traffic, so these records are rate-limited per kind with a token
@@ -41,9 +47,8 @@ namespace aa::wired_receiver {
 //     (a healthy sink drains and the record is delivered). When the sink does
 //     not make room in that window the record is dropped with ETIMEDOUT and every
 //     later submit that finds no space drops immediately, so receiver teardown
-//     (video_outlet.close(), the `stopping` record, any session thread still
-//     logging) can never wait on a stuck stdout. While running stays true the
-//     lossless wait is unbounded (issue #60).
+//     (stopping, post-join audio_finish) can never wait on a stuck stdout. While
+//     running stays true the lossless wait is unbounded (issue #60).
 //   * finish(): audit L13: shutdown waits for the queue to drain only up to a
 //     deadline. A sink that never returns (blocked pipe or terminal) is
 //     abandoned: the worker is detached and owns the shared state, so nothing it
@@ -144,10 +149,35 @@ public:
         return {};
     }
 
+    // Non-blocking path for steady-state runtime, diagnostic, and control
+    // records (issue #90). A full queue behind a stalled sink never blocks the
+    // calling thread; dropped records are counted and reported in-band as
+    // runtime_log_dropped.
+    std::error_code submit_runtime(std::string_view record) {
+        State &s = *state_;
+        const std::lock_guard lock(s.mutex);
+        if (s.error) { return s.error; }
+        if (s.closed) { return closed_error(); }
+        s.report_runtime_drops_if_due(s.now(), false);
+        const auto charge = record.size() + 1;
+        if (s.chunked || record.size() >= byte_capacity || !s.space(charge)) {
+            ++s.runtime_dropped;
+            return {};
+        }
+        s.push(record, charge);
+        s.changed.notify_all();
+        return {};
+    }
+
     // Lossless records dropped because the sink made no room during shutdown.
     [[nodiscard]] std::uint64_t shutdown_drops() const {
         const std::lock_guard lock(state_->mutex);
         return state_->shutdown_dropped;
+    }
+
+    [[nodiscard]] std::uint64_t runtime_drops() const {
+        const std::lock_guard lock(state_->mutex);
+        return state_->runtime_dropped;
     }
 
     [[nodiscard]] MediaDrops media_drops() const {
@@ -190,6 +220,7 @@ public:
         [[maybe_unused]] const bool owned = producer.try_lock_until(deadline);
         std::unique_lock lock(s.mutex);
         s.report_drops_if_due(s.now(), true);
+        s.report_runtime_drops_if_due(s.now(), true);
         s.closed = true;
         s.changed.notify_all();
         const bool done = s.changed.wait_until(lock, deadline, [&] { return s.exited; });
@@ -256,6 +287,10 @@ private:
         std::size_t undelivered = 0;
         bool shutdown_expired = false; // a shutdown-time wait for space ran out
         std::uint64_t shutdown_dropped = 0;
+        std::uint64_t runtime_dropped = 0;
+        std::uint64_t runtime_reported = 0;
+        Clock::time_point last_runtime_report{};
+        bool runtime_reported_once = false;
         MediaDrops drops{0, 0};
         MediaDrops reported{0, 0};
         Clock::time_point last_report{};
@@ -344,6 +379,23 @@ private:
             reported_once = true;
             changed.notify_all();
         }
+        // Report runtime drops accumulated since the last report as one in-band
+        // record, at most once per media_summary_interval (or unconditionally at finish).
+        void report_runtime_drops_if_due(Clock::time_point at, bool final) {
+            const auto pressure = runtime_dropped - runtime_reported;
+            if (pressure == 0) { return; }
+            if (!final && runtime_reported_once && at - last_runtime_report < media_summary_interval) {
+                return;
+            }
+            const std::string line = "{\"event\":\"runtime_log_dropped\",\"backpressure\":" +
+                                     std::to_string(pressure) + "}";
+            if (chunked || !space(line.size() + 1)) { return; }
+            push(line, line.size() + 1);
+            runtime_reported = runtime_dropped;
+            last_runtime_report = at;
+            runtime_reported_once = true;
+            changed.notify_all();
+        }
     };
 
     static std::error_code closed_error() { return {ESHUTDOWN, std::generic_category()}; }
@@ -405,6 +457,11 @@ private:
             lock.lock();
             state->bytes -= front.size();
             state->queue.pop_front();
+            if (!state->abandoned) {
+                const auto at = state->now();
+                state->report_drops_if_due(at, state->closed);
+                state->report_runtime_drops_if_due(at, state->closed);
+            }
             state->changed.notify_all();
             if (state->abandoned) { return; }
         }

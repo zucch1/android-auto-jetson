@@ -97,6 +97,15 @@ void log_media(std::string_view kind, const std::string &json) {
     if (writer->submit_media(kind, json)) { g_running.store(false); }
 }
 
+// Steady-state runtime, diagnostic, and control records (#90): never blocks a
+// media, audio, or control thread on a full queue behind a stalled stdout sink.
+// Dropped records are counted and reported in-band as runtime_log_dropped.
+void log_runtime(const std::string &json) {
+    auto *writer = aa::wired_receiver::active_stdout_log.load();
+    if (!writer) { std::abort(); }
+    if (writer->submit_runtime(json)) { g_running.store(false); }
+}
+
 // Escapes free text for a JSON string value.
 std::string json_text(std::string_view text) {
     std::string out;
@@ -118,11 +127,16 @@ std::string json_text(std::string_view text) {
 // the first open and again after every successful sink reopen (an automatic
 // backend can select a different element on reopen).
 void log_sink_selected(const aa::audio::SinkReport &selected, std::string_view origin) {
-    log_line(std::string{"{\"event\":\"audio_sink_selected\",\"origin\":\""} +
-             std::string{origin} + "\",\"requested\":\"" +
-             std::string{aa::audio::to_string(selected.requested)} + "\",\"element\":\"" +
-             json_text(selected.selected_element) + "\",\"cause\":\"" +
-             json_text(selected.cause) + "\"}");
+    const auto line = std::string{"{\"event\":\"audio_sink_selected\",\"origin\":\""} +
+        std::string{origin} + "\",\"requested\":\"" +
+        std::string{aa::audio::to_string(selected.requested)} + "\",\"element\":\"" +
+        json_text(selected.selected_element) + "\",\"cause\":\"" +
+        json_text(selected.cause) + "\"}";
+    if (origin == "open") {
+        log_line(line);
+    } else {
+        log_runtime(line);
+    }
 }
 
 void on_signal(int) { g_running.store(false); }
@@ -481,7 +495,7 @@ std::string format_ms(aa::core::Nanoseconds value) {
 class StdoutDiagnostics final : public aa::diagnostics::DiagnosticSink {
   public:
     void emit_json(std::string_view redacted_json) override {
-        log_line(std::string{"{\"event\":\"diag\","} + std::string{redacted_json}.substr(1));
+        log_runtime(std::string{"{\"event\":\"diag\","} + std::string{redacted_json}.substr(1));
     }
 };
 
@@ -1123,7 +1137,7 @@ class ConcreteAudioRenderWorker final {
     void publish_bypass_logs(std::unique_lock<std::mutex> &lock) {
         auto lines = std::exchange(bypass_logs_, {});
         lock.unlock();
-        for (const auto &line : lines) { log_line(line); }
+        for (const auto &line : lines) { log_runtime(line); }
     }
     void cancel_all() {
         if (!router_) { return; }
@@ -1943,7 +1957,7 @@ int receiver_main(int argc, char **argv) {
         log_line("{\"event\":\"err\",\"detail\":\"configure\"}");
         return 1;
     }
-    VideoOutlet video_outlet{log_line, log_media};
+    VideoOutlet video_outlet{log_runtime, log_media};
     video_outlet.set_idr_recovery({
         [&session] { return session.video_projecting(); },
         [&session] { return session.request_video_idr(); },
@@ -2067,7 +2081,7 @@ int receiver_main(int argc, char **argv) {
 
     auto service_control = [&] {
         if (const auto error = audio_sink.failure()) {
-            log_line(audio_failure_event_json("audio_sink_failure", error->code(), audio_sink.failure_context()));
+            log_runtime(audio_failure_event_json("audio_sink_failure", error->code(), audio_sink.failure_context()));
             (void)session.fail(*error);
             session_failed.store(true);
             g_running.store(false);
@@ -2096,7 +2110,7 @@ int receiver_main(int argc, char **argv) {
         } guard{in_video_recovery};
         if (!video_outlet.idr_dispatching()) {
             if (auto flushed = video_outlet.service_pending(); !flushed) {
-                log_line(poll_error_json(flushed.error().code(), session, audio_sink));
+                log_runtime(poll_error_json(flushed.error().code(), session, audio_sink));
                 if (!session.failure()) {
                     (void)session.fail(flushed.error());
                 }
@@ -2106,7 +2120,7 @@ int receiver_main(int argc, char **argv) {
             }
         }
         if (auto pending = session.service_pending_video_idr(); !pending) {
-            log_line(poll_error_json(pending.error().code(), session, audio_sink));
+            log_runtime(poll_error_json(pending.error().code(), session, audio_sink));
             if (session.failure()) {
                 session_failed.store(true);
                 g_running.store(false);
@@ -2117,7 +2131,7 @@ int receiver_main(int argc, char **argv) {
             bus->service().consume_idr_recovery_request()) {
             const auto idr = video_outlet.request_idr_external("consumer_ipc");
             if (!idr) {
-                log_line(poll_error_json(idr.error().code(), session, audio_sink));
+                log_runtime(poll_error_json(idr.error().code(), session, audio_sink));
                 if (idr.error().code() == aa::ErrorCode::channel_focus_restore_failed) {
                     if (!session.failure()) {
                         (void)session.fail(idr.error());
@@ -2133,7 +2147,7 @@ int receiver_main(int argc, char **argv) {
         const bool has_selection = session.selected_video_profile().has_value();
         if (selection_watchdog.check(session_ready, has_selection,
                                      std::chrono::steady_clock::now())) {
-            log_line(aa::ipc::video_selection_timeout_json(
+            log_runtime(aa::ipc::video_selection_timeout_json(
                 aa::ipc::kVideoSelectionWarningTimeout, video_profiles.size()));
         }
         return true;
@@ -2169,7 +2183,7 @@ int receiver_main(int argc, char **argv) {
             }
             if (relink) {
                 if (!pinned(relink.value().phone)) {
-                    log_line(std::string{kSerialMismatch});
+                    log_runtime(std::string{kSerialMismatch});
                     return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
                 }
                 if (relink.value().phone.key != link->phone.key) {
@@ -2258,7 +2272,7 @@ int receiver_main(int argc, char **argv) {
                 if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
                     g_running.store(false);
                 } else if (!session.send_version_request(1, 6).has_value()) {
-                    log_line("{\"event\":\"err\",\"detail\":\"version_request\"}");
+                    log_runtime("{\"event\":\"err\",\"detail\":\"version_request\"}");
                     session_failed.store(true);
                     g_running.store(false);
                 }
@@ -2294,7 +2308,7 @@ int receiver_main(int argc, char **argv) {
                     if (service_control()) {
                         break;
                     }
-                    log_line(std::string{"{\"event\":\"input_forwarded\",\"ok\":\""} +
+                    log_runtime(std::string{"{\"event\":\"input_forwarded\",\"ok\":\""} +
                              (outcome.has_value() ? "true" : "false") + "\"}");
                 }
             }
@@ -2329,7 +2343,7 @@ int receiver_main(int argc, char **argv) {
                     if (!g_running.load()) {
                         break;
                     }
-                    log_line(poll_error_json(code, session, audio_sink));
+                    log_runtime(poll_error_json(code, session, audio_sink));
                     if (!session.failure() &&
                         (code == aa::ErrorCode::transport_closed ||
                          code == aa::ErrorCode::transport_io || code == aa::ErrorCode::timeout)) {
@@ -2357,7 +2371,7 @@ int receiver_main(int argc, char **argv) {
                                              std::chrono::steady_clock::now() - started)
                                              .count();
                     active_ms.store(elapsed);
-                    log_line("{\"event\":\"active\",\"startup_ms\":" + std::to_string(elapsed) +
+                    log_runtime("{\"event\":\"active\",\"startup_ms\":" + std::to_string(elapsed) +
                              "}");
                 }
                 if (!service_video_recovery()) {
@@ -2389,7 +2403,7 @@ int receiver_main(int argc, char **argv) {
             if (!endpoint) {
                 continue;
             }
-            log_line("{\"event\":\"input_accepted\"}");
+            log_runtime("{\"event\":\"input_accepted\"}");
             while (g_running.load()) {
                 auto event = endpoint.value().receive(Milliseconds{200});
                 if (!event) {
@@ -2440,7 +2454,7 @@ int receiver_main(int argc, char **argv) {
             if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
                 break;
             }
-            log_line("{\"event\":\"video_accepted\"}");
+            log_runtime("{\"event\":\"video_accepted\"}");
             video_outlet.install(std::move(producer.value()));
             {
                 std::lock_guard gate_lock(gate_mutex);
