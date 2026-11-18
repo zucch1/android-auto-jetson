@@ -94,6 +94,7 @@ private:
         std::optional<core::Nanoseconds> dequeued_at{};
         WorkerAdmission admission;
         bool rendered_any{};
+        std::uint64_t epoch{1};
     };
     struct DeferredCredit {
         channels::AvDeliveryId id;
@@ -214,6 +215,9 @@ private:
     std::uint64_t bypass_total_{};
     std::uint64_t dropped_total_{};
     std::size_t consecutive_reopens_{};
+    std::uint64_t session_epoch_{1};
+    std::uint64_t applied_session_epoch_{1};
+    std::uint64_t active_step_epoch_{1};
     std::vector<std::string> bypass_logs_;
     std::thread thread_;
 };

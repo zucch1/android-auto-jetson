@@ -34,6 +34,12 @@ namespace aa::app {
                                           const WiredSession& session,
                                           const audio::AudioRenderWorker& audio);
 
+[[nodiscard]] std::string poll_error_json(
+    ErrorCode code,
+    const audio::AudioRenderWorker& audio,
+    std::optional<WiredSession::RejectedFrame> reject,
+    std::optional<diagnostics::QueueRejection> session_queue_rejection);
+
 [[nodiscard]] std::string poll_error_json(ErrorCode code,
                                           const audio::AudioRenderWorker& audio);
 

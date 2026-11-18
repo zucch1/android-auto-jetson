@@ -157,9 +157,11 @@ int receiver_main(int argc, char** argv) {
             if (wait < 0) break;
             if (auto step = bus.value().cycle(aa::core::Milliseconds{wait}); !step) {
                 report("session bus dispatch", step.error().code());
+                running.store(false);
                 bus.value().service().shutdown(); receiver.stop(); return 1;
             }
         }
+        running.store(false);
         bus.value().service().shutdown(); receiver.stop();
         log_line("{\"event\":\"stopping\"}");
         return 0;

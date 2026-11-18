@@ -63,9 +63,12 @@ if(NOT CMAKE_CROSSCOMPILING)
         --gtest_filter=Wire/WirelessD6Bootstrap.*:CompletedLifecycle.WirelessD6*)
     set_tests_properties(wireless_e2e_composed_admission wireless_e2e_composed_bootstrap
         PROPERTIES TIMEOUT 30 RESOURCE_LOCK aa_wireless_composed)
-    add_executable(aa_wireless_audio_worker_test tests/wireless_e2e/audio_worker_test.cpp)
+    find_program(AA_DBUS_RUN_SESSION NAMES dbus-run-session REQUIRED)
+    add_executable(aa_wireless_audio_worker_test
+        tests/wireless_e2e/audio_worker_test.cpp
+        tests/wireless_e2e/audio_runtime_test.cpp)
     target_link_libraries(aa_wireless_audio_worker_test PRIVATE
-        aa_audio_worker aa_wireless aa_video GTest::gtest_main)
+        aa_audio_worker aa_wireless aa_video aa_ipc_dbus aa_input GTest::gtest_main)
     if(TARGET PkgConfig::AA_AUDIO_GST)
         target_link_libraries(aa_wireless_audio_worker_test PRIVATE PkgConfig::AA_AUDIO_GST)
     endif()
@@ -76,7 +79,15 @@ if(NOT CMAKE_CROSSCOMPILING)
             -fsanitize=address -fno-omit-frame-pointer)
         target_link_options(aa_wireless_audio_worker_test PRIVATE -fsanitize=address)
     endif()
-    add_test(NAME wireless_e2e_audio_worker COMMAND aa_wireless_audio_worker_test)
-    set_tests_properties(wireless_e2e_audio_worker PROPERTIES TIMEOUT 30)
+    add_test(NAME wireless_e2e_audio_worker
+        COMMAND "${AA_DBUS_RUN_SESSION}" -- "${Python3_EXECUTABLE}" -B
+                "${CMAKE_SOURCE_DIR}/tests/transport/tls_run.py"
+                "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:aa_wireless_audio_worker_test>")
+    set_tests_properties(wireless_e2e_audio_worker PROPERTIES TIMEOUT 90)
+    add_test(NAME wireless_e2e_audio_worker_telemetry
+        COMMAND "${AA_DBUS_RUN_SESSION}" -- "${Python3_EXECUTABLE}" -B
+                "${CMAKE_SOURCE_DIR}/tests/wireless_e2e/test_audio_worker_telemetry.py"
+                "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:aa_wireless_audio_worker_test>")
+    set_tests_properties(wireless_e2e_audio_worker_telemetry PROPERTIES TIMEOUT 90)
     include("${CMAKE_SOURCE_DIR}/cmake/WirelessMatrix.cmake")
 endif()

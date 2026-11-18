@@ -229,7 +229,9 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
                           receiver_input_at,
                           {bytes, units},
                           {},
-                          admission});
+                          admission,
+                          false,
+                          session_epoch_});
     ++slots_;
     ++role_slots_[*role];
     bytes_ += bytes;
@@ -278,9 +280,9 @@ void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t gen
 }
 
 void AudioRenderWorker::begin_session() {
-    SettlementDiagnostics diagnostics{telemetry_};
     std::unique_lock lock(mutex_);
     if (failure_ || stopping_) { return; }
+    ++session_epoch_;
     cancel_all();
     discard_if(queued_, [](const auto&) { return true; });
     completed_.clear();
@@ -288,11 +290,20 @@ void AudioRenderWorker::begin_session() {
     deferred_ = {};
     generations_ = {};
     last_queue_rejection_.reset();
+    frozen_rejection_.reset();
     credit_ledger_.reset();
-    observe_idle(diagnostics);
+    active_.reset();
+    step_write_.reset();
+    step_completion_.reset();
+    last_completion_.reset();
+    last_success_.reset();
+    last_idle_close_.reset();
+    last_idle_.reset();
+    output_established_ = false;
+    idle_since_.reset();
+    idle_resume_id_.reset();
+    idle_resume_frames_ = 0;
     cv_.notify_all();
-    lock.unlock();
-    diagnostics.publish();
 }
 
 std::optional<channels::AvDeliveryId>
@@ -677,15 +688,19 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         [this, observe = config.on_sink_write_progress](const auto& value) {
             {
                 std::lock_guard lock(mutex_);
-                if (!value.readiness_probe) { step_write_ = value; }
+                if (!value.readiness_probe && active_step_epoch_ == session_epoch_) {
+                    step_write_ = value;
+                }
             }
             if (observe) { observe(value); }
         };
     const auto completed = config.on_write_completed;
     config.on_write_completed = [this](const auto& value) {
         std::lock_guard lock(mutex_);
-        last_completion_ = value;
-        step_completion_ = value;
+        if (active_step_epoch_ == session_epoch_) {
+            last_completion_ = value;
+            step_completion_ = value;
+        }
     };
     auto opened = open(config);
     {
@@ -714,8 +729,21 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
     std::uint64_t chunks = 0;
     for (;;) {
         std::unique_lock lock(mutex_);
-        cv_.wait(lock, [&] { return stopping_ || !queued_.empty(); });
+        cv_.wait(lock, [&] {
+            return stopping_ || !queued_.empty() || applied_session_epoch_ != session_epoch_;
+        });
         if (stopping_) { break; }
+        if (applied_session_epoch_ != session_epoch_) {
+            applied_session_epoch_ = session_epoch_;
+            in_flight_ = true;
+            lock.unlock();
+            local_router.reset_session_timeline();
+            lock.lock();
+            in_flight_ = false;
+            cv_.notify_all();
+            continue;
+        }
+        const auto step_epoch = applied_session_epoch_;
         struct Parent final {
             AudioDispatchObservation dispatch;
             protocol::MessageHeader header;
@@ -723,6 +751,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         };
         std::vector<Parent> parents;
         for (auto& job : queued_) {
+            if (job.epoch != step_epoch) { continue; }
             if (!job.dequeued_at) {
                 job.dequeued_at = monotonic_now();
                 const auto submitted = local_router.submit({job.header, job.pcm}, job.receiver_input_at);
@@ -745,6 +774,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         }
         if (stopping_) { break; }
         active_ = parents.size() == 1 ? std::optional{parents.front().dispatch} : std::nullopt;
+        active_step_epoch_ = step_epoch;
         step_write_.reset();
         step_completion_.reset();
         in_flight_ = true;
@@ -758,25 +788,28 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         const auto returned_at = monotonic_now();
         SettlementDiagnostics diagnostics{telemetry_};
         lock.lock();
-        diagnostics.completion = step_completion_;
-        if (step_completion_) {
-            const auto& completion = *step_completion_;
-            const auto piece_duration = completion.scheduled_end.count - completion.scheduled.count;
-            const auto elapsed = completion.completed.count - step_started.count;
-            if (elapsed > piece_duration) {
-                // Exclude ordinary piece pacing, even on a stale schedule.
-                // elapsed > duration bounds this addition below completed.
-                const auto blocked_from = std::max(
-                    completion.scheduled_end,
-                    core::Nanoseconds{step_started.count + piece_duration});
-                if (completion.completed > blocked_from) {
-                    local_router.note_backpressure(blocked_from, completion.completed);
-                    diagnostics.stall = SettlementDiagnostics::SinkStall{
-                        blocked_from, completion.completed, step_started, returned_at, {}};
-                    if (result && step_write_ && !step_write_->readiness_probe &&
-                        step_write_->effective_scheduled == completion.scheduled &&
-                        step_write_->completed_at && !step_write_->outcome) {
-                        diagnostics.stall->write = step_write_;
+        const bool same_epoch = (step_epoch == session_epoch_);
+        if (same_epoch) {
+            diagnostics.completion = step_completion_;
+            if (step_completion_) {
+                const auto& completion = *step_completion_;
+                const auto piece_duration = completion.scheduled_end.count - completion.scheduled.count;
+                const auto elapsed = completion.completed.count - step_started.count;
+                if (elapsed > piece_duration) {
+                    // Exclude ordinary piece pacing, even on a stale schedule.
+                    // elapsed > duration bounds this addition below completed.
+                    const auto blocked_from = std::max(
+                        completion.scheduled_end,
+                        core::Nanoseconds{step_started.count + piece_duration});
+                    if (completion.completed > blocked_from) {
+                        local_router.note_backpressure(blocked_from, completion.completed);
+                        diagnostics.stall = SettlementDiagnostics::SinkStall{
+                            blocked_from, completion.completed, step_started, returned_at, {}};
+                        if (result && step_write_ && !step_write_->readiness_probe &&
+                            step_write_->effective_scheduled == completion.scheduled &&
+                            step_write_->completed_at && !step_write_->outcome) {
+                            diagnostics.stall->write = step_write_;
+                        }
                     }
                 }
             }
@@ -785,40 +818,44 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         const auto stats = local_router.report().stats;
         // #155 catch-up seam: when `stats.frames_caught_up > caught_up_before`, populate
         // `diagnostics.caught_up = SettlementDiagnostics::CatchUp{stats.frames_caught_up - caught_up_before, stats.frames_caught_up, config.output_format.sample_rate_hz};`.
-        if (idle_resume_id_) {
-            idle_resume_frames_ += stats.frames_idle_skipped - idle_before;
-            if (result && !result.value().contributors.empty()) { complete_idle_resume(diagnostics); }
-        }
-        if (result) {
-            for (const auto& header : result.value().contributors) {
-                const auto parent = std::find_if(parents.begin(), parents.end(), [&](const auto& entry) {
-                    return entry.dispatch.delivery.role == header.channel &&
-                           entry.dispatch.message_sequence == header.sequence;
-                });
-                if (parent != parents.end() && step_completion_ && frozen_rejection_) {
-                    parent->dispatch.write = step_write_;
-                    diagnostics.correlated.at(diagnostics.correlated_count++) = parent->dispatch;
-                }
+        if (same_epoch) {
+            if (idle_resume_id_) {
+                idle_resume_frames_ += stats.frames_idle_skipped - idle_before;
+                if (result && !result.value().contributors.empty()) { complete_idle_resume(diagnostics); }
             }
-            for (const auto& header : result.value().contributors) {
-                for (auto& job : queued_) {
-                    if (job.dequeued_at && job.header.channel == header.channel &&
-                        job.header.sequence == header.sequence) {
-                        job.rendered_any = true;
+            if (result) {
+                for (const auto& header : result.value().contributors) {
+                    const auto parent = std::find_if(parents.begin(), parents.end(), [&](const auto& entry) {
+                        return entry.dispatch.delivery.role == header.channel &&
+                               entry.dispatch.message_sequence == header.sequence;
+                    });
+                    if (parent != parents.end() && step_completion_ && frozen_rejection_) {
+                        parent->dispatch.write = step_write_;
+                        diagnostics.correlated.at(diagnostics.correlated_count++) = parent->dispatch;
                     }
                 }
+                for (const auto& header : result.value().contributors) {
+                    for (auto& job : queued_) {
+                        if (job.epoch == step_epoch && job.dequeued_at &&
+                            job.header.channel == header.channel &&
+                            job.header.sequence == header.sequence) {
+                            job.rendered_any = true;
+                        }
+                    }
+                }
+                for (const auto& header : result.value().completed) {
+                    discard_if(queued_, [&](const Job& job) {
+                        return job.epoch == step_epoch &&
+                               job.header.channel == header.channel &&
+                               job.header.sequence == header.sequence &&
+                               std::any_of(parents.begin(), parents.end(), [&](const auto& entry) {
+                                   return entry.dispatch.delivery == job.id;
+                               });
+                    });
+                }
             }
-            for (const auto& header : result.value().completed) {
-                discard_if(queued_, [&](const Job& job) {
-                    return job.header.channel == header.channel &&
-                           job.header.sequence == header.sequence &&
-                           std::any_of(parents.begin(), parents.end(), [&](const auto& entry) {
-                               return entry.dispatch.delivery == job.id;
-                           });
-                });
-            }
+            if (!stopping_) { grant_deferred(diagnostics); }
         }
-        if (!stopping_) { grant_deferred(diagnostics); }
         active_.reset();
         // A failed write is survived by reopening the sink; if that fails
         // too, the latched context stays the original failed write's.
@@ -826,65 +863,73 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         bool reopen = false;
         if (!result) {
             const auto snapshot = local_router.report().render_failure;
-            std::optional<AudioDispatchObservation> parent;
-            std::optional<WorkerAdmission> admission;
-            std::size_t matches = 0;
-            if (snapshot && snapshot->offending) {
-                const auto& header = *snapshot->offending;
-                for (const auto& entry : parents) {
-                    if (entry.header.channel == header.channel &&
-                        entry.header.sequence == header.sequence &&
-                        entry.header.timestamp == header.timestamp) {
-                        parent = entry.dispatch;
-                        admission = entry.admission;
-                        ++matches;
+            const bool sink_write_error =
+                snapshot && snapshot->reason == RenderFailureReason::sink_write_error;
+            if (same_epoch || sink_write_error) {
+                std::optional<AudioDispatchObservation> parent;
+                std::optional<WorkerAdmission> admission;
+                std::size_t matches = 0;
+                if (same_epoch && snapshot && snapshot->offending) {
+                    const auto& header = *snapshot->offending;
+                    for (const auto& entry : parents) {
+                        if (entry.header.channel == header.channel &&
+                            entry.header.sequence == header.sequence &&
+                            entry.header.timestamp == header.timestamp) {
+                            parent = entry.dispatch;
+                            admission = entry.admission;
+                            ++matches;
+                        }
                     }
                 }
-            }
-            if (matches != 1) {
-                parent.reset();
-                admission.reset();
-            }
-            latch_render_failure = [this, error = result.error(),
-                                    rejection = local_router.report().queue_rejection,
-                                    parent, snapshot, admission] {
-                latch(error, AudioFailureOrigin::render_step, rejection, parent, snapshot,
-                      admission);
-            };
-            reopen = snapshot && snapshot->reason == RenderFailureReason::sink_write_error &&
-                     !stopping_ && consecutive_reopens_ < kMaxConsecutiveReopens;
-            if (reopen) {
-                if (!bypass_since_) { enter_bypass_locked("sink_write_error"); }
-                router_ = nullptr; // no concurrent cancel_pending during reopen
-                in_flight_ = true; // wait_idle() covers the reopen
-            } else {
-                latch_render_failure();
+                if (matches != 1) {
+                    parent.reset();
+                    admission.reset();
+                }
+                latch_render_failure = [this, error = result.error(),
+                                        rejection = local_router.report().queue_rejection,
+                                        parent, snapshot, admission] {
+                    latch(error, AudioFailureOrigin::render_step, rejection, parent, snapshot,
+                          admission);
+                };
+                reopen = sink_write_error && !stopping_ &&
+                         consecutive_reopens_ < kMaxConsecutiveReopens;
+                if (reopen) {
+                    if (!bypass_since_) { enter_bypass_locked("sink_write_error"); }
+                    router_ = nullptr; // no concurrent cancel_pending during reopen
+                    in_flight_ = true; // wait_idle() covers the reopen
+                } else {
+                    latch_render_failure();
+                }
+            } else if (bypass_since_) {
+                exit_bypass_locked("session_reset");
             }
         } else {
             if (bypass_since_) {
                 // The dropped span becomes an authorized all-role idle gap:
                 // the next arrival re-anchors instead of failing the gap cap.
-                if (output_established_) { idle_since_ = *bypass_since_; }
+                if (same_epoch && output_established_) { idle_since_ = *bypass_since_; }
                 reconcile_bypass_locked(result.value());
                 exit_bypass_locked("write_returned");
             }
             if (stats.frames_written > before) { consecutive_reopens_ = 0; }
-            output_established_ = output_established_ || stats.frames_written != 0;
-            last_success_ = WorkerSuccessfulStep{
-                returned_at, monotonic_now(), result.value().pending,
-                result.value().contributors.size(), result.value().completed.size(),
-                queue_observation()};
-            observe_idle(diagnostics);
-            if (on_idle_observed_for_test) {
-                on_idle_observed_for_test(role_slots_, in_flight_, idle_since_.has_value(),
-                                          local_router.report());
+            if (same_epoch) {
+                output_established_ = output_established_ || stats.frames_written != 0;
+                last_success_ = WorkerSuccessfulStep{
+                    returned_at, monotonic_now(), result.value().pending,
+                    result.value().contributors.size(), result.value().completed.size(),
+                    queue_observation()};
+                observe_idle(diagnostics);
+                if (on_idle_observed_for_test) {
+                    on_idle_observed_for_test(role_slots_, in_flight_, idle_since_.has_value(),
+                                              local_router.report());
+                }
             }
         }
         cv_.notify_all();
         publish_bypass_logs(lock);
-        if (diagnostics.completion && completed) { completed(*diagnostics.completion); }
+        if (same_epoch && diagnostics.completion && completed) { completed(*diagnostics.completion); }
         diagnostics.publish();
-        if (result && stats.frames_written > before) {
+        if (result && same_epoch && stats.frames_written > before) {
             ++chunks;
             if (chunks % 50 == 1) {
                 if (telemetry_.log_media) {
@@ -898,6 +943,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             // replaced; the new route anchors on its first arrival.
             local_router.close();
             auto reopened = open(config);
+            std::optional<SinkReport> reopened_sink_report;
             lock.lock();
             ++consecutive_reopens_;
             in_flight_ = false;
@@ -913,7 +959,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                 local_router = std::move(reopened).value();
                 router_ = &local_router;
                 sink_report_ = local_router.report().sink;
-                log_sink_selected(sink_report_, "reopen", telemetry_);
+                reopened_sink_report = sink_report_;
                 output_established_ = false;
                 idle_since_.reset();
                 idle_resume_id_.reset();
@@ -924,7 +970,14 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                 latch_render_failure();
             }
             cv_.notify_all();
-            publish_bypass_logs(lock);
+            auto lines = std::exchange(bypass_logs_, {});
+            lock.unlock();
+            if (reopened_sink_report) {
+                log_sink_selected(*reopened_sink_report, "reopen", telemetry_);
+            }
+            if (telemetry_.log_line) {
+                for (const auto& line : lines) { telemetry_.log_line(line); }
+            }
         }
     }
     {

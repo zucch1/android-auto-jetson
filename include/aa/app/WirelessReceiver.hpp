@@ -58,6 +58,15 @@ public:
     void stop() {
         eligibility_.retire(); link_.stop(); confirmation_.flush(true);
     }
+    void set_io_checkpoint_interval(std::chrono::milliseconds interval) noexcept {
+        link_.set_io_checkpoint_interval(interval);
+    }
+    [[nodiscard]] std::optional<WiredSession::RejectedFrame> last_reject() const {
+        return link_.last_reject();
+    }
+    [[nodiscard]] std::optional<diagnostics::QueueRejection> last_queue_rejection() const {
+        return link_.last_queue_rejection();
+    }
     [[nodiscard]] bool active() const {
         const auto* session = link_.session();
         return session && (session->state() == session::State::active || session->state() == session::State::degraded);

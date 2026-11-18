@@ -110,12 +110,15 @@ std::string poll_error_json(ErrorCode code,
     return line;
 }
 
-std::string poll_error_json(ErrorCode code, const audio::AudioRenderWorker& audio) {
+std::string poll_error_json(ErrorCode code,
+                            const audio::AudioRenderWorker& audio,
+                            std::optional<WiredSession::RejectedFrame> reject,
+                            std::optional<diagnostics::QueueRejection> session_queue_rejection) {
     const auto failure = audio.failure();
     const auto rejection = failure && failure->code() == ErrorCode::ipc_queue_full
         ? audio.failure_queue_rejection()
-        : audio.last_queue_rejection();
-    auto line = poll_error_json(code, std::nullopt, rejection,
+        : (session_queue_rejection ? session_queue_rejection : audio.last_queue_rejection());
+    auto line = poll_error_json(code, reject, rejection,
                                 audio.current_rejection_snapshot());
     if (code == ErrorCode::ipc_queue_full && rejection) {
         if (const auto trace = audio.credit_trace()) {
@@ -124,6 +127,10 @@ std::string poll_error_json(ErrorCode code, const audio::AudioRenderWorker& audi
         }
     }
     return line;
+}
+
+std::string poll_error_json(ErrorCode code, const audio::AudioRenderWorker& audio) {
+    return poll_error_json(code, audio, std::nullopt, std::nullopt);
 }
 
 } // namespace aa::app

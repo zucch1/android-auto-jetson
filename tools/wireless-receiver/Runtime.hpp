@@ -35,9 +35,16 @@ struct Runtime final {
     bool attempting{}, failed{}, stopping{};
     bool audio_failure_reported{};
     bool in_audio_completions{};
+    bool in_poll_{};
+    std::optional<Error> pending_ack_error_{};
     app::WiredSession* configured{};
     std::size_t offered_video_profiles{};
     ipc::VideoSelectionWatchdog selection_watchdog{};
+
+    void stop_runtime() {
+        stopping = true;
+        running.store(false);
+    }
 
     bool service_audio_failure() {
         const auto error = media.audio.failure();
@@ -51,7 +58,7 @@ struct Runtime final {
             (void)live->fail(*error);
         }
         failed = true;
-        stopping = true;
+        stop_runtime();
         return true;
     }
 
@@ -69,11 +76,19 @@ struct Runtime final {
         } guard{in_audio_completions};
         if (auto serviced = app::service_audio_completions(*audio_session, media.audio); !serviced) {
             if (!service_audio_failure()) {
-                log_line(app::poll_error_json(serviced.error().code(), *audio_session, media.audio));
-                report("audio completion", serviced.error().code());
-                if (!audio_session->failure()) (void)audio_session->fail(serviced.error());
-                failed = true;
-                stopping = true;
+                const auto& error = serviced.error();
+                if (error.code() == ErrorCode::cancelled &&
+                    (!running.load() || Clock::now() >= deadline || stopping)) {
+                    stop_runtime();
+                    return;
+                }
+                if (in_poll_) {
+                    if (!pending_ack_error_) pending_ack_error_ = error;
+                    audio_session->request_stop();
+                } else {
+                    report("wireless link retired", error.code());
+                    defer();
+                }
             }
         }
     }
@@ -82,13 +97,17 @@ struct Runtime final {
         if (auto* session = receiver.session(); session && session != configured) {
             configured = session;
             if (auto bound = media.bind(*session); !bound) {
-                report("session media sinks", bound.error().code()); failed = true; stopping = true;
+                report("session media sinks", bound.error().code()); failed = true; stop_runtime();
             }
         }
         service_audio_completions_if_ready();
-        if (!running.load() || Clock::now() >= deadline) stopping = true;
+        receiver.set_io_checkpoint_interval(
+            (media.video.has_pending() || media.audio.outstanding())
+                ? std::chrono::milliseconds{5}
+                : std::chrono::milliseconds{25});
+        if (!running.load() || Clock::now() >= deadline) stop_runtime();
         if (auto step = bus.cycle(core::Milliseconds{0}); !step) {
-            report("session bus dispatch", step.error().code()); failed = true; stopping = true;
+            report("session bus dispatch", step.error().code()); failed = true; stop_runtime();
         }
         const auto state = bus.service().state();
         auto* recovery_session = receiver.session();
@@ -151,6 +170,7 @@ struct Runtime final {
         }
     }
     void defer() {
+        pending_ack_error_.reset();
         receiver.stop(); media.video.reset(); configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
         retry = Clock::now() + backoff;
         backoff = std::min(backoff * 2, std::chrono::milliseconds{5000});
@@ -210,13 +230,25 @@ struct Runtime final {
                     if (!begun) { report("AP handoff begin", begun.error().code()); defer(); }
                 } else retry = Clock::now() + std::chrono::milliseconds{250};
             }
-            const auto polled = receiver.poll(bus.service(), [this] { checkpoint(); });
+            pending_ack_error_.reset();
+            const auto polled = [&] {
+                in_poll_ = true;
+                struct Guard {
+                    bool& active;
+                    ~Guard() { active = false; }
+                } guard{in_poll_};
+                return receiver.poll(bus.service(), [this] { checkpoint(); });
+            }();
             if (!polled) {
                 if (!service_audio_failure()) {
-                    if (polled.error().code() == ErrorCode::ipc_queue_full) {
-                        log_line(app::poll_error_json(polled.error().code(), media.audio));
+                    const auto code = pending_ack_error_ ? pending_ack_error_->code()
+                                                         : polled.error().code();
+                    if (code == ErrorCode::ipc_queue_full) {
+                        log_line(app::poll_error_json(
+                            code, media.audio, receiver.last_reject(),
+                            receiver.last_queue_rejection()));
                     }
-                    report("wireless link retired", polled.error().code());
+                    report("wireless link retired", code);
                     defer();
                 }
             } else {
@@ -234,11 +266,8 @@ struct Runtime final {
             }
             // TcpTransport::poll_receive() is intentionally unsupported, so
             // WirelessLink::poll() calls blocking session_->poll_transport(), which
-            // runs this checkpoint() on TcpIo's 25ms poll slices while TCP is idle.
-            // Thus when TCP is quiet, held video servicing/expiry runs on ~25ms
-            // checkpoint slices and can overshoot nominal max_age by up to ~25ms.
-            // Tightening the outer sleep from 10ms to 5ms while frames or audio are
-            // outstanding avoids adding a full idle sleep on non-blocked/active turns.
+            // runs this checkpoint() on TcpIo's configurable poll slices while TCP is idle.
+            // While video frames or audio completions are outstanding, TcpIo uses 5 ms slices.
             const auto poll_step = (media.video.has_pending() || media.audio.outstanding())
                 ? std::chrono::milliseconds{5}
                 : std::chrono::milliseconds{10};
@@ -246,6 +275,7 @@ struct Runtime final {
                 std::this_thread::sleep_until(std::min(deadline, turn + poll_step));
             }
         }
+        running.store(false);
         media.audio.stop();
         bus.service().shutdown();
         receiver.stop();
