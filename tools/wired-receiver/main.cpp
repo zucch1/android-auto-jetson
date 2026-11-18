@@ -106,6 +106,16 @@ void log_runtime(const std::string &json) {
     if (writer->submit_runtime(json)) { g_running.store(false); }
 }
 
+// One-shot lifecycle / state-transition records that the projection collector
+// keys state on (`active`, runtime `err`, audio_stall_bypass begin/end). Never
+// blocks the caller, and is never dropped for backpressure: a full queue parks
+// the record and the log drain emits it as soon as stdout frees space.
+void log_state(const std::string &json) {
+    auto *writer = aa::wired_receiver::active_stdout_log.load();
+    if (!writer) { std::abort(); }
+    if (writer->submit_state(json)) { g_running.store(false); }
+}
+
 // Escapes free text for a JSON string value.
 std::string json_text(std::string_view text) {
     std::string out;
@@ -1137,7 +1147,7 @@ class ConcreteAudioRenderWorker final {
     void publish_bypass_logs(std::unique_lock<std::mutex> &lock) {
         auto lines = std::exchange(bypass_logs_, {});
         lock.unlock();
-        for (const auto &line : lines) { log_runtime(line); }
+        for (const auto &line : lines) { log_state(line); }
     }
     void cancel_all() {
         if (!router_) { return; }
@@ -2081,7 +2091,7 @@ int receiver_main(int argc, char **argv) {
 
     auto service_control = [&] {
         if (const auto error = audio_sink.failure()) {
-            log_runtime(audio_failure_event_json("audio_sink_failure", error->code(), audio_sink.failure_context()));
+            log_state(audio_failure_event_json("audio_sink_failure", error->code(), audio_sink.failure_context()));
             (void)session.fail(*error);
             session_failed.store(true);
             g_running.store(false);
@@ -2110,7 +2120,7 @@ int receiver_main(int argc, char **argv) {
         } guard{in_video_recovery};
         if (!video_outlet.idr_dispatching()) {
             if (auto flushed = video_outlet.service_pending(); !flushed) {
-                log_runtime(poll_error_json(flushed.error().code(), session, audio_sink));
+                log_state(poll_error_json(flushed.error().code(), session, audio_sink));
                 if (!session.failure()) {
                     (void)session.fail(flushed.error());
                 }
@@ -2120,7 +2130,7 @@ int receiver_main(int argc, char **argv) {
             }
         }
         if (auto pending = session.service_pending_video_idr(); !pending) {
-            log_runtime(poll_error_json(pending.error().code(), session, audio_sink));
+            log_state(poll_error_json(pending.error().code(), session, audio_sink));
             if (session.failure()) {
                 session_failed.store(true);
                 g_running.store(false);
@@ -2131,7 +2141,7 @@ int receiver_main(int argc, char **argv) {
             bus->service().consume_idr_recovery_request()) {
             const auto idr = video_outlet.request_idr_external("consumer_ipc");
             if (!idr) {
-                log_runtime(poll_error_json(idr.error().code(), session, audio_sink));
+                log_state(poll_error_json(idr.error().code(), session, audio_sink));
                 if (idr.error().code() == aa::ErrorCode::channel_focus_restore_failed) {
                     if (!session.failure()) {
                         (void)session.fail(idr.error());
@@ -2183,7 +2193,7 @@ int receiver_main(int argc, char **argv) {
             }
             if (relink) {
                 if (!pinned(relink.value().phone)) {
-                    log_runtime(std::string{kSerialMismatch});
+                    log_state(std::string{kSerialMismatch});
                     return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
                 }
                 if (relink.value().phone.key != link->phone.key) {
@@ -2272,7 +2282,7 @@ int receiver_main(int argc, char **argv) {
                 if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
                     g_running.store(false);
                 } else if (!session.send_version_request(1, 6).has_value()) {
-                    log_runtime("{\"event\":\"err\",\"detail\":\"version_request\"}");
+                    log_state("{\"event\":\"err\",\"detail\":\"version_request\"}");
                     session_failed.store(true);
                     g_running.store(false);
                 }
@@ -2343,7 +2353,7 @@ int receiver_main(int argc, char **argv) {
                     if (!g_running.load()) {
                         break;
                     }
-                    log_runtime(poll_error_json(code, session, audio_sink));
+                    log_state(poll_error_json(code, session, audio_sink));
                     if (!session.failure() &&
                         (code == aa::ErrorCode::transport_closed ||
                          code == aa::ErrorCode::transport_io || code == aa::ErrorCode::timeout)) {
@@ -2371,8 +2381,8 @@ int receiver_main(int argc, char **argv) {
                                              std::chrono::steady_clock::now() - started)
                                              .count();
                     active_ms.store(elapsed);
-                    log_runtime("{\"event\":\"active\",\"startup_ms\":" + std::to_string(elapsed) +
-                             "}");
+                    log_state("{\"event\":\"active\",\"startup_ms\":" + std::to_string(elapsed) +
+                              "}");
                 }
                 if (!service_video_recovery()) {
                     break;

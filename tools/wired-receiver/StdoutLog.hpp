@@ -35,6 +35,15 @@ namespace aa::wired_receiver {
 //     dropped and counted, and reported in-band as runtime_log_dropped (at most
 //     once per media_summary_interval, and once at finish) and through
 //     runtime_drops().
+//   * submit_state(): one-shot lifecycle / state-transition records that the
+//     projection collector keys state on (`active`, `err`, audio_stall_bypass
+//     begin/end). Never blocks the caller either, but is never dropped for
+//     backpressure: a record that finds the queue full is parked in a bounded
+//     FIFO side slot (state_capacity records) and promoted into the queue, in
+//     order and ahead of later records, as soon as the drain frees space.
+//     Lossless submit() waits behind parked records, so a transition is never
+//     overtaken by `stopping`. Only overflowing the side slot drops (counted
+//     as runtime drops).
 //   * submit_media(): phone-driven media telemetry (audio completions, periodic
 //     video events). Audit L13: a hostile or merely chatty phone can sustain
 //     media traffic, so these records are rate-limited per kind with a token
@@ -57,6 +66,7 @@ class StdoutLog final {
 public:
     static constexpr std::size_t byte_capacity = 1'048'576;
     static constexpr std::size_t entry_capacity = 4096;
+    static constexpr std::size_t state_capacity = 64;
     static constexpr std::chrono::milliseconds default_finish_timeout{2000};
     static constexpr std::chrono::milliseconds media_summary_interval{1000};
     // How often a blocked lossless producer re-checks the running flag.
@@ -96,6 +106,7 @@ public:
             const bool newline = count < byte_capacity && offset + count == record.size();
             const auto charge = count + static_cast<std::size_t>(newline);
             std::unique_lock lock(s.mutex);
+            s.promote_parked();
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
             s.waiting = !s.space(charge) && !s.error && !s.closed;
             s.changed.notify_all();
@@ -136,6 +147,7 @@ public:
             ++s.drops.rate_limited;
             return {};
         }
+        s.promote_parked();
         s.report_drops_if_due(at, false);
         const auto charge = record.size() + 1;
         // A chunked oversize record must stay contiguous, and a full queue must
@@ -158,6 +170,7 @@ public:
         const std::lock_guard lock(s.mutex);
         if (s.error) { return s.error; }
         if (s.closed) { return closed_error(); }
+        s.promote_parked();
         s.report_runtime_drops_if_due(s.now(), false);
         const auto charge = record.size() + 1;
         if (s.chunked || record.size() >= byte_capacity || !s.space(charge)) {
@@ -167,6 +180,33 @@ public:
         s.push(record, charge);
         s.changed.notify_all();
         return {};
+    }
+
+    // Non-blocking, eventually-delivered path for one-shot state transitions
+    // (#90 review): parked when the queue is full, promoted when space frees.
+    std::error_code submit_state(std::string_view record) {
+        State &s = *state_;
+        const std::lock_guard lock(s.mutex);
+        if (s.error) { return s.error; }
+        if (s.closed) { return closed_error(); }
+        s.promote_parked();
+        const auto charge = record.size() + 1;
+        if (s.parked.empty() && !s.chunked && record.size() < byte_capacity && s.space(charge)) {
+            s.push(record, charge);
+            s.changed.notify_all();
+            return {};
+        }
+        if (record.size() >= byte_capacity || s.parked.size() >= state_capacity) {
+            ++s.runtime_dropped;
+            return {};
+        }
+        s.parked.emplace_back(record);
+        return {};
+    }
+
+    [[nodiscard]] std::size_t parked_states() const {
+        const std::lock_guard lock(state_->mutex);
+        return state_->parked.size();
     }
 
     // Lossless records dropped because the sink made no room during shutdown.
@@ -219,6 +259,7 @@ public:
         std::unique_lock producer(producer_, std::defer_lock);
         [[maybe_unused]] const bool owned = producer.try_lock_until(deadline);
         std::unique_lock lock(s.mutex);
+        s.promote_parked();
         s.report_drops_if_due(s.now(), true);
         s.report_runtime_drops_if_due(s.now(), true);
         s.closed = true;
@@ -229,7 +270,7 @@ public:
             // be reading its front entry.
             s.abandoned = true;
             s.running = nullptr;
-            s.undelivered = s.queue.size();
+            s.undelivered = s.queue.size() + s.parked.size();
             if (!s.error) { s.error = {ETIMEDOUT, std::generic_category()}; }
             s.changed.notify_all();
             lock.unlock();
@@ -278,6 +319,7 @@ private:
         mutable std::mutex mutex;
         std::condition_variable changed;
         std::deque<std::string> queue;
+        std::deque<std::string> parked; // state records awaiting queue space
         std::size_t bytes = 0;
         std::error_code error;
         bool closed = false;
@@ -308,7 +350,11 @@ private:
         // (issue #60); bounded by `shutdown_wait` once it is not. Returns false
         // only when the shutdown bound expired with the queue still full.
         bool wait_for_space(std::unique_lock<std::mutex> &lock, std::size_t charge) {
-            const auto ready = [&] { return error || closed || space(charge); };
+            // A fresh record queues behind parked state records; the tail of an
+            // oversize record already mid-admission (chunked) must stay contiguous.
+            const auto ready = [&] {
+                return error || closed || ((chunked || parked.empty()) && space(charge));
+            };
             Clock::time_point deadline{};
             bool armed = false;
             while (!ready()) {
@@ -331,6 +377,16 @@ private:
                 changed.wait_until(lock, wake);
             }
             return true;
+        }
+        // Moves parked state records into the queue, in order, while they fit.
+        void promote_parked() {
+            bool moved = false;
+            while (!parked.empty() && !chunked && space(parked.front().size() + 1)) {
+                push(parked.front(), parked.front().size() + 1);
+                parked.pop_front();
+                moved = true;
+            }
+            if (moved) { changed.notify_all(); }
         }
         void push(std::string_view record, std::size_t charge) {
             queue.emplace_back(charge, '\n');
@@ -442,6 +498,7 @@ private:
         for (;;) {
             std::unique_lock lock(state->mutex);
             state->changed.wait(lock, [&] { return state->closed || !state->queue.empty(); });
+            state->promote_parked();
             if (state->queue.empty()) { return; }
             // The deque keeps element addresses stable; the front stays charged
             // (and queued) while it is being written.
@@ -458,6 +515,7 @@ private:
             state->bytes -= front.size();
             state->queue.pop_front();
             if (!state->abandoned) {
+                state->promote_parked();
                 const auto at = state->now();
                 state->report_drops_if_due(at, state->closed);
                 state->report_runtime_drops_if_due(at, state->closed);
