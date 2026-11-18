@@ -325,6 +325,7 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
                     process.wait(timeout=0.2)
                 except subprocess.TimeoutExpired:
                     pass
+        outcome = None
         if stop:
             # TERM the stage first: an in-flight counter sample is killed, never waited for.
             if sampler:
@@ -335,6 +336,8 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
             preflight.setdefault("pipewire_err_counters", {})["during"] = during
             write_record(args.out / f"{name}-host-preflight.json", preflight)
         if stop:
+            if outcome is None:  # the stop came while the sampler was shutting down
+                outcome = stop_group(process)
             print(f"{name} INTERRUPTED by {signal.Signals(stop.signum).name}: stage {outcome}",
                   flush=True)
             return 128 + stop.signum

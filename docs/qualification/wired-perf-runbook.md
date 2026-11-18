@@ -578,17 +578,18 @@ also for `localhost`, so the uid and the PipeWire session checked are the ones
 the soak runs as, even when an ssh config maps the host to another `User`.
 
 The checks run in this order, so the ones a launch depends on are the
-freshest; package maintenance is read once more, without waiting, as the very
-last read, so work that began during the others BLOCKs the launch
-(`... (at the final check)`):
+freshest. After the timers, package maintenance is read once more, without
+waiting (work that began meanwhile BLOCKs: `... (at the final check)`), and
+then the timers again, last, on a fresh host clock. An ssh failure of any
+gating probe BLOCKs as `host_transport:...` with ssh's own message:
 
 | Check | Reads | Result |
 | --- | --- | --- |
-| Package maintenance | processes `apt`, `apt-get`, `dpkg`, `unattended-upgr(ades)`, `apt.systemd.dai(ly)`; `systemctl is-active apt-daily.service apt-daily-upgrade.service`; PackageKit over `busctl --auto-start=no` | Transient, so the chain **waits** for it: after one first observation, polls share one monotonic deadline of `--maintenance-wait-s` (default 900 s; 0 = that one observation only), each command's whole budget (ssh included) is the time left, and a poll that completes after the deadline is rejected (`host_maintenance:wait_limit_exceeded`); still busy is BLOCKED. PackageKit is busy only with a transaction (`GetTransactionList`) or the package lock (`Locked`): an idle resident `packagekitd` does not block. The bus name is checked with `NameHasOwner` and the daemon then addressed by its validated unique name (`:N.M`), so the query never D-Bus-activates PackageKit; a reply without its exact shape is BLOCKED. |
-| PipeWire ERR counters (informational) | `pw-top -b -n 2`, only when a `pipewire` process of the soak user already runs | Never gated. Skipped (`pipewire_not_running`) otherwise, because connecting to a listening `pipewire.socket` would start PipeWire. |
+| Package maintenance | processes `apt`, `apt-get`, `dpkg`, `unattended-upgr(ades)`, `apt.systemd.dai(ly)`; `systemctl is-active apt-daily.service apt-daily-upgrade.service`; PackageKit over `busctl --auto-start=no` | Transient, so the chain **waits** for it: every probe, the first included, shares one monotonic deadline of `--maintenance-wait-s` (default 900 s; 0 = a single observation with its own bounds), each command's whole budget (ssh included) is the time left, and a probe that completes after the deadline is rejected (`host_maintenance:wait_limit_exceeded`); still busy is BLOCKED. PackageKit is busy only with a transaction (`GetTransactionList`) or the package lock (`Locked`): an idle resident `packagekitd` does not block. The bus name is checked with `NameHasOwner` and the daemon then addressed by its validated unique name (`:N.M`), so the query never D-Bus-activates PackageKit; a reply without its exact shape is BLOCKED. |
 | PipeWire real-time | `ps -L -o cls,rtprio,comm -p PID` for every `pipewire` and `pipewire-pulse` process of the soak user | Every `pw-data-loop` thread must be `RR` or `FF`. A process that is not running, has no data-loop thread, or has any other class (`TS` is SCHED_OTHER) is BLOCKED. |
+| PipeWire ERR counters (informational) | `pw-top -b -n 2`, only when a `pipewire` process of the soak user already runs; then the pids again | Never gated. Skipped (`pipewire_not_running`) otherwise. Residual race (accepted): PipeWire may exit between the guard and `pw-top`, which can then socket-activate the user's own audio server; the pids no longer match the ones judged real-time, so the stage is BLOCKED (`host_audio:pipewire_changed_during_preflight`), never OK on a daemon the preflight started. |
 | apt timers | `systemctl show -p NextElapseUSecRealtime -p NextElapseUSecMonotonic` for `apt-daily.timer` and `apt-daily-upgrade.timer`; the host's monotonic and realtime clocks | The earlier of the calendar and the monotonic (`OnBootSec=`, `OnUnitActiveSec=`, ...) elapse, at or before the host's now (read after the queries) + duration + `--timer-margin-s` (default 900 s: the launcher's setup and cleanup), is **refused**: BLOCKED, with the earliest safe start in the reason. It does not wait, because the wait could be hours. An overdue timer counts as inside. A missing property, an unparsable, impossible or out-of-range (over a century) value, or an unreadable host clock is BLOCKED; an empty, `n/a` or `0` value means no next elapse. |
-| Package maintenance (final) | as the first row, once, no wait | Any work seen now BLOCKs the launch. |
+| Package maintenance (final), then apt timers (final) | as those rows, once, no wait; the timers from a fresh host clock | Any work, or a timer now inside the window, BLOCKs the launch. |
 
 The chain's build check is repeated right after the preflight, immediately
 before the launch: the only gap left is that `/proc` scan and the launcher's

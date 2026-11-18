@@ -498,6 +498,25 @@ def test_a_stop_kills_an_in_flight_counter_sample_and_terms_the_stage_first() ->
         assert during["samples"] == 0, during  # the cut-short sample is not recorded as one
 
 
+def test_a_stop_during_the_sampler_shutdown_still_writes_the_markers() -> None:
+    # The launcher has exited normally; TERM lands while the sampler is finishing.
+    import signal
+    real_finish = chain.CounterSampler.finish
+
+    def finish(self) -> dict:
+        os.kill(os.getpid(), signal.SIGTERM)
+        return real_finish(self)
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        with patch.object(chain.CounterSampler, "finish", finish):
+            code, output = run(root)
+        out = root / "chain"
+        assert code == 128 + signal.SIGTERM, (code, output)
+        assert "stage-1800s INTERRUPTED by SIGTERM" in output, output
+        assert "interrupted" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+        assert (out / "stage-7200s-not-run.json").exists()
+
+
 def test_every_chain_gets_a_new_directory() -> None:
     with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
         root = Path(directory)

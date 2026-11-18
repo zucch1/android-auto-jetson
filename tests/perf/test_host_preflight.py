@@ -281,7 +281,7 @@ def test_the_wait_is_bounded_on_the_monotonic_clock() -> None:
     host = Host(processes=IDLE + "  4242 dpkg\n")
     check(host, maintenance_wait_s=15)
     probes = [t for c, t in host.calls if c == "ps -e -o pid=,comm="]
-    assert probes == [None, 5.0, None], probes
+    assert probes == [15.0, 5.0, None], probes  # the first probe shares the deadline too
 
 
 def test_a_poll_that_ends_after_the_deadline_is_rejected() -> None:
@@ -303,6 +303,42 @@ def test_a_poll_that_ends_after_the_deadline_is_rejected() -> None:
     assert budgets[:3] == [5.0, 1.0, -3.0], budgets  # one shared deadline: each command gets what is left
 
 
+def test_a_first_observation_past_the_deadline_is_rejected() -> None:
+    # A 15 s limit and a first observation that takes 16 s (idle): not admitted.
+    host = Host()
+
+    def slow(argv, timeout=None):
+        if argv[:2] == ["systemctl", "is-active"] and not host.state.get("observed"):
+            host.state["observed"] = True
+            host.advance(16.0)
+        return host(argv, timeout)
+    record = check(slow, host=host, maintenance_wait_s=15)
+    assert record["verdict"] == "BLOCKED" and "host_maintenance:wait_limit_exceeded" in record["reasons"], \
+        record["reasons"]
+    # The zero-wait mode is one observation with its own bounds: the same 16 s is fine.
+    host = Host()
+    assert check(slow, host=host, maintenance_wait_s=0)["verdict"] == "OK"
+
+
+def test_the_timers_are_judged_again_after_the_final_package_check() -> None:
+    # The review's regression: 1800 s stage, margin 0, a timer due in 1801 s and a
+    # final package check that takes 10 s: inside the window at launch, so BLOCKED.
+    host = Host(timers=(NOW + 1801, NOW + 5 * 3600))
+    counted = {"is-active": 0}
+
+    def run(argv, timeout=None):
+        if argv[:2] == ["systemctl", "is-active"]:
+            counted["is-active"] += 1
+            if counted["is-active"] == 2:  # the final package check
+                host.advance(10.0)
+        return host(argv, timeout)
+    record = check(run, host=host, margin_s=0)
+    assert record["apt_timers"]["ok"] and not record["apt_timers_final"]["ok"], record["reasons"]
+    assert record["verdict"] == "BLOCKED" and any(
+        r.startswith("host_maintenance:apt-daily.timer_inside_stage_window") for r in record["reasons"])
+    calls = [c for c, _ in host.calls]
+
+
 def test_maintenance_that_starts_during_the_other_checks_blocks() -> None:
     # Idle at the first look; apt-daily.service is active by the final read.
     host = Host(services=["inactive\ninactive\n", "active\ninactive\n"])
@@ -311,8 +347,9 @@ def test_maintenance_that_starts_during_the_other_checks_blocks() -> None:
     assert "host_maintenance:apt-daily.service_active (at the final check)" in record["reasons"]
     assert record["package_maintenance"]["ok"] and not record["package_maintenance_final"]["ok"]
     calls = [c for c, _ in host.calls]
-    assert max(i for i, c in enumerate(calls) if c.startswith("systemctl is-active")) > \
-        max(i for i, c in enumerate(calls) if "NextElapseUSec" in c), "the final read is last"
+    final = max(i for i, c in enumerate(calls) if c.startswith("systemctl is-active"))
+    timer_reads = [i for i, c in enumerate(calls) if "NextElapseUSec" in c]
+    assert timer_reads[0] < final < timer_reads[-1], "timers, the final package read, timers again"
 
 
 def test_malformed_packagekit_replies_fail_closed_and_never_name_the_activatable_service() -> None:
@@ -502,6 +539,53 @@ def test_pw_top_err_counters_are_recorded_and_never_gate() -> None:
     # Even a huge ERR count gates nothing.
     big = PW_TOP.replace("   3 S16LE", "9999 S16LE")
     assert check(Host(pw_top=big))["verdict"] == "OK"
+
+
+def test_a_pipewire_restarted_during_the_counters_blocks() -> None:
+    # Real-time was judged on pids 100/200; pw-top's connection restarted it as 300.
+    host = Host()
+
+    def run(argv, timeout=None):
+        out = host(argv, timeout)
+        if "pw-top" in argv:
+            host.pids["pipewire"] = "300\n"
+        return out
+    record = check(run, host=host)
+    assert record["verdict"] == "BLOCKED", record["reasons"]
+    assert "host_audio:pipewire_changed_during_preflight" in record["reasons"]
+    # And with no PipeWire before the preflight it stays BLOCKED, whatever follows.
+    host = Host()
+    host.pids["pipewire"] = ""
+    record = check(host)
+    assert record["verdict"] == "BLOCKED" and "host_audio:pipewire:not_running" in record["reasons"]
+
+
+def test_a_later_ssh_failure_keeps_its_transport_label() -> None:
+    host = Host()
+    broken = hp.Output(255, "", "ssh: connect to host 127.0.0.1 port 22: Connection refused\n")
+    record = check(wrap(host, lambda argv: broken if argv[:2] == ["systemctl", "is-active"] else None),
+                   host=host)
+    assert record["verdict"] == "BLOCKED"
+    assert record["reasons"][0] == "host_transport:ssh_failed (ssh: connect to host 127.0.0.1 port 22: " \
+        "Connection refused)", record["reasons"]
+    # pw-top is informational: its ssh failure is labelled the same way but gates nothing.
+    record = check(wrap(host, lambda argv: broken if "pw-top" in argv else None), host=host)
+    assert record["verdict"] == "OK" and record["pipewire_err_counters"]["start"]["error"].startswith(
+        "host_transport:ssh_failed"), record
+
+
+def test_cancelling_kills_helpers_and_never_waits_on_inherited_pipes() -> None:
+    for command in (["sh", "-c", "sleep 37.1 & sleep 37.1"],  # a helper in the command's group
+                    ["sh", "-c", "setsid sleep 37.1 & sleep 37.1"]):  # a detached helper holding the pipes
+        cancel = threading.Event()
+        threading.Timer(0.2, cancel.set).start()
+        began = time.monotonic()
+        out = hp.cancellable_runner(cancel)(command, timeout=60)
+        assert out.rc is None and time.monotonic() - began < 1.8, (command, time.monotonic() - began)
+    subprocess.run(["pkill", "-f", "-x", "sleep 37.1"], check=False)  # the detached one, if any
+    began = time.monotonic()
+    assert hp.local_runner(["sh", "-c", "sleep 37.1 & echo"], timeout=0.5).rc is None
+    assert time.monotonic() - began < 1.8
 
 
 def test_counters_never_start_pipewire() -> None:

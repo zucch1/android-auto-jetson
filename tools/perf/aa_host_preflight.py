@@ -28,17 +28,19 @@ started), run in this order:
    name is checked with ``NameHasOwner`` and the daemon then addressed by its
    unique name (``:N.M``, validated); any reply that does not have its exact
    shape is unverifiable, so BLOCKED. Busy is transient, so the chain
-   **waits**: after one first observation, polls every ``POLL_S`` share one
-   monotonic deadline of ``maintenance_wait_s`` (default 900 s, 0 = that one
-   observation only); each command's whole budget is the time left, and a
-   poll that completes after the deadline is rejected. Still busy, or late,
-   is BLOCKED.
-2. **Informational counters, then scheduling.** ``pw-top`` runs only when a
-   ``pipewire`` process of the soak user already exists (a listening
-   ``pipewire.socket`` would otherwise start the daemon). Every
-   ``pw-data-loop`` thread of every ``pipewire`` and ``pipewire-pulse``
-   process must be SCHED_RR or SCHED_FF (``ps -L -o cls,rtprio,comm -p
-   PID``); a missing process, a missing thread or any other class is BLOCKED.
+   **waits**: every probe, the first included, and the polls every ``POLL_S``
+   share one monotonic deadline of ``maintenance_wait_s`` (default 900 s;
+   0 = a single observation with its own bounds); each command's whole budget
+   is the time left, and a probe that completes after the deadline is
+   rejected. Still busy, or late, is BLOCKED.
+2. **Scheduling, then the informational counters.** Every ``pw-data-loop``
+   thread of every ``pipewire`` and ``pipewire-pulse`` process must be
+   SCHED_RR or SCHED_FF (``ps -L -o cls,rtprio,comm -p PID``); a missing
+   process, a missing thread or any other class is BLOCKED. ``pw-top`` then
+   runs only when a ``pipewire`` process already exists, and the pids are read
+   again after it: a PipeWire that changed (e.g. exited and was
+   socket-activated by ``pw-top`` in that small window, an accepted residual
+   race) BLOCKs, so the verdict never rests on a daemon the preflight started.
 3. **Timers.** For ``apt-daily.timer`` and ``apt-daily-upgrade.timer`` both
    next elapses are read: ``NextElapseUSecRealtime`` (OnCalendar=) and
    ``NextElapseUSecMonotonic`` (OnBootSec=, OnUnitActiveSec=, ...; converted
@@ -51,11 +53,12 @@ started), run in this order:
    timer counts as inside the window. A missing property, an unparsable,
    impossible or out-of-range value, or an unreadable host clock is BLOCKED;
    an empty, ``n/a`` or ``0`` value means that trigger has no next elapse.
-4. **Package maintenance again**, without waiting, as the very last read: work
-   that began during 2 and 3 BLOCKs the launch.
+4. **Package maintenance again**, without waiting: work that began during 2
+   and 3 BLOCKs the launch. Then **the timers again**, last, on a fresh host
+   clock, so the final package read cannot age their cutoff.
 
-The first command (``id -u``) also proves the transport: an ssh failure is
-reported as ``host_transport:...``, not as a uid problem. Every command goes
+An ssh failure (exit 255, or no answer) of any gating probe is reported as
+``host_transport:...`` with ssh's own message, not as the probe's own failure. Every command goes
 through an injected runner, so the checks are tested with canned output.
 Informational only: ``pw-top -b -n 2`` ERR counters per node
 (``read_pw_top``), never gated.
@@ -63,8 +66,10 @@ Informational only: ``pw-top -b -n 2`` ERR counters per node
 from __future__ import annotations
 
 import math
+import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -89,6 +94,7 @@ DEFAULT_MAINTENANCE_WAIT_S = 900.0
 POLL_S = 10.0
 COMMAND_TIMEOUT_S = 15.0
 PW_TOP_TIMEOUT_S = 30.0
+KILL_DRAIN_S = 0.5
 SSH_CONNECT_TIMEOUT_S = 10
 # The launcher's own ssh options (aa-projection-perf.sh SSH_OPTS): the same
 # transport and target selection, so the preflight sees the soak's user.
@@ -127,9 +133,9 @@ def local_runner(argv: Sequence[str], timeout: float | None = None,
     budget = COMMAND_TIMEOUT_S if timeout is None else timeout
     if budget <= 0 or (cancel is not None and cancel.is_set()):
         return Output(None)
-    try:
+    try:  # its own process group, so a kill reaches its helpers too
         process = subprocess.Popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   stdin=subprocess.DEVNULL, text=True)
+                                   stdin=subprocess.DEVNULL, text=True, start_new_session=True)
     except OSError:
         return Output(None)
     deadline = time.monotonic() + budget
@@ -140,9 +146,28 @@ def local_runner(argv: Sequence[str], timeout: float | None = None,
             return Output(process.returncode, stdout, stderr)
         except subprocess.TimeoutExpired:
             if time.monotonic() >= deadline or (cancel is not None and cancel.is_set()):
-                process.kill()
-                process.communicate()
+                _kill(process)
                 return Output(None)
+
+
+def _kill(process: subprocess.Popen) -> None:
+    """KILL the command's group; never wait unboundedly on pipes a detached helper still holds."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.communicate(timeout=KILL_DRAIN_S)
+    except subprocess.TimeoutExpired:
+        for pipe in (process.stdout, process.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=KILL_DRAIN_S)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def cancellable_runner(cancel: threading.Event) -> Runner:
@@ -189,10 +214,11 @@ def parse_threads(text: str) -> list[dict]:
 
 def check_pipewire_scheduling(run: Runner, uid: str) -> dict:
     """The ``pw-data-loop`` threads of the user's pipewire and pipewire-pulse must be RR/FF."""
-    processes, reasons = [], []
+    processes, reasons, all_pids = [], [], {}
     for name in PIPEWIRE_PROCESSES:
         pids = run(["pgrep", "-u", uid, "-x", name])
         found = pids.stdout.split() if pids.rc == 0 else []
+        all_pids[name] = sorted(found)
         if pids.rc is None:
             reasons.append(f"host_audio:{name}:unverifiable (pgrep failed)")
         elif not found:
@@ -210,7 +236,18 @@ def check_pipewire_scheduling(run: Runner, uid: str) -> dict:
                 if row["cls"] not in REALTIME_CLASSES:
                     reasons.append(f"host_audio:{name}[{pid}]:{DATA_LOOP_THREAD}_not_realtime "
                                    f"(cls={row['cls']} rtprio={row['rtprio']})")
-    return {"ok": not reasons, "reasons": reasons, "processes": processes}
+    return {"ok": not reasons, "reasons": reasons, "processes": processes, "pids": all_pids}
+
+
+def pipewire_pids(run: Runner, uid: str) -> dict[str, list[str]] | None:
+    """{process name: sorted pids} of the user's PipeWire daemons, or None if unreadable."""
+    found = {}
+    for name in PIPEWIRE_PROCESSES:
+        out = run(["pgrep", "-u", uid, "-x", name])
+        if out.rc not in (0, 1):
+            return None
+        found[name] = sorted(out.stdout.split())
+    return found
 
 
 # ---- package maintenance -------------------------------------------------------
@@ -475,7 +512,7 @@ def read_pw_top(run: Runner, uid: str, receiver: str | None = None, now: float |
     out = run(["env", f"XDG_RUNTIME_DIR=/run/user/{uid}", "pw-top", "-b", "-n", "2"],
               timeout=PW_TOP_TIMEOUT_S)
     if out.rc != 0:
-        return {**record, "error": "pw-top failed" if out.rc is not None else "pw-top could not run"}
+        return {**record, "error": transport_failure(out) or "pw-top failed"}
     rows = parse_pw_top(out.stdout)
     needles = {"aa-wired-receiver"}
     if receiver:
@@ -507,18 +544,25 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
               receiver: str | None = None) -> dict:
     """Run the checks; the record says OK or BLOCKED.
 
-    Order: the maintenance check, waiting while it is busy; the informational
-    counters (only from a PipeWire that is already running); scheduling; the
-    timers; and last a second, non-waiting maintenance read, so work that
-    began during the earlier reads is seen right before the chain launches.
+    Order: the maintenance check, waiting while it is busy; scheduling; the
+    informational counters (only from a PipeWire that is already running),
+    then a check that the PipeWire pids are the ones scheduling judged; the
+    timers; a second, non-waiting maintenance read; and the timers again, from
+    a fresh host clock, so neither gate is aged by the other.
 
-    The wait is bounded on ``monotonic``: every poll after the first
-    observation shares one deadline (each command's whole budget, ssh
-    connection included, is the time left), and a poll that completes after
-    the deadline is rejected (BLOCKED ``host_maintenance:wait_limit_exceeded``)
-    whatever it saw. ``maintenance_wait_s`` 0 is that single first observation.
-    ``sleep`` returns False when the chain is stopped; the wait then ends and
-    the record is BLOCKED ``host_maintenance:wait_interrupted``.
+    With a positive ``maintenance_wait_s`` every maintenance probe, the first
+    included, shares one deadline on ``monotonic`` (each command's whole
+    budget, ssh connection included, is the time left), and a probe that
+    completes after it is rejected (BLOCKED
+    ``host_maintenance:wait_limit_exceeded``) whatever it saw. 0 is a single
+    observation with the commands' own bounds. ``sleep`` returns False when the
+    chain is stopped; the wait then ends and the record is BLOCKED
+    ``host_maintenance:wait_interrupted``.
+
+    Residual race (accepted): PipeWire may exit between the pid guard and
+    ``pw-top``, which may then socket-activate the user's own audio server.
+    The stage still BLOCKs, because the pids no longer match the ones whose
+    real-time scheduling was judged (``host_audio:pipewire_changed_during_preflight``).
     """
     margin_s = finite_seconds(margin_s, "timer margin")
     maintenance_wait_s = finite_seconds(maintenance_wait_s, "maintenance wait")
@@ -529,12 +573,24 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
             record.update(verdict="BLOCKED", reasons=[failure])
             return record
     record["uid"] = uid
+    transport: list[str] = []
+
+    def gate(argv, timeout=None) -> Output:
+        """The runner for the gating probes: an ssh failure keeps its own label."""
+        out = run(argv, timeout=timeout)
+        failure = transport_failure(out) if out.rc in (None, SSH_FAILED) else None
+        if failure and failure not in transport:
+            transport.append(failure)
+        return out
 
     began = monotonic()
     deadline = began + maintenance_wait_s
-    maintenance = check_package_maintenance(run)  # the single first observation, default bounds
-    interrupted = late = False
-    while not maintenance["ok"] and not maintenance["unverifiable"]:  # busy: wait, bounded
+    bounded = maintenance_wait_s > 0
+    budget = (lambda: deadline - monotonic()) if bounded else (lambda: None)
+    maintenance = check_package_maintenance(gate, timeout=budget)
+    late = bounded and monotonic() > deadline
+    interrupted = False
+    while not late and not maintenance["ok"] and not maintenance["unverifiable"]:  # busy: wait
         remaining = deadline - monotonic()
         if remaining <= 0:
             break
@@ -543,10 +599,8 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
             break
         if deadline - monotonic() <= 0:  # the bound is spent: no probe that could admit the stage late
             break
-        maintenance = check_package_maintenance(run, timeout=lambda: deadline - monotonic())
-        if monotonic() > deadline:  # finished late: what it saw no longer counts
-            late = True
-            break
+        maintenance = check_package_maintenance(gate, timeout=budget)
+        late = monotonic() > deadline  # finished late: what it saw no longer counts
     maintenance["waited_s"] = round(monotonic() - began, 3)
     maintenance["wait_limit_s"] = maintenance_wait_s
     if late:
@@ -555,15 +609,21 @@ def preflight(run: Runner, stage_s: float, *, now: Callable[[], float] = time.ti
     if interrupted and not maintenance["ok"]:
         maintenance["reasons"].append("host_maintenance:wait_interrupted")
 
-    counters = read_pw_top(run, uid, receiver, now())  # informational, before the fresh checks
-    scheduling = check_pipewire_scheduling(run, uid)
-    timers = check_apt_timers(run, stage_s, margin_s)
-    final = check_package_maintenance(run)  # last: nothing may have started since
-    reasons = maintenance["reasons"] + scheduling["reasons"] + timers["reasons"]
+    scheduling = check_pipewire_scheduling(gate, uid)
+    counters = read_pw_top(run, uid, receiver, now())  # informational: never gates
+    after = pipewire_pids(gate, uid)
+    if scheduling["ok"] and after != scheduling["pids"]:
+        scheduling.update(ok=False, pids_after_counters=after)
+        scheduling["reasons"].append("host_audio:pipewire_changed_during_preflight")
+    timers = check_apt_timers(gate, stage_s, margin_s)
+    final = check_package_maintenance(gate)  # nothing may have started since
+    final_timers = check_apt_timers(gate, stage_s, margin_s)  # last, on a fresh clock
+    reasons = transport + maintenance["reasons"] + scheduling["reasons"] + timers["reasons"]
     if maintenance["ok"]:
         reasons += [f"{reason} (at the final check)" for reason in final["reasons"]]
+    reasons += [reason for reason in final_timers["reasons"] if reason not in reasons]
     record.update(package_maintenance=maintenance, pipewire_scheduling=scheduling, apt_timers=timers,
-                  package_maintenance_final=final,
+                  package_maintenance_final=final, apt_timers_final=final_timers,
                   pipewire_err_counters={"start": {**counters, "phase": "before_launch"}},
                   checked_epoch=now(), verdict="OK" if not reasons else "BLOCKED", reasons=reasons)
     return record
