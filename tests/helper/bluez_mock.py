@@ -45,8 +45,12 @@ class MockBluez(ProfileSockets):
         self.owner_during_inventory = False
         self.removed: list[str] = []
         self.disconnected: list[str] = []
-        # Device1.ConnectProfile calls (path, uuid): an approved reconnect pages the phone's HFP AG.
-        self.paged: list[list[str]] = []
+        # Every link-affecting Device1 call, in arrival order: "<method> <dev_...> [<uuid>]". An
+        # approved reconnect may page the phone's HFP AG and later withdraw that page only.
+        self.calls: list[str] = []
+        self.connected = False  # the primary device's BlueZ link (Device1.Connected)
+        self.fail_page = False
+        self.page_delay_ms = 0
         self.cancel_unpaired = 0
         self.cancel_calls = 0
         self.properties = {"Pairable": True, "Discoverable": True}
@@ -63,7 +67,7 @@ class MockBluez(ProfileSockets):
 <interface name="org.bluez.AgentManager1"><method name="RegisterAgent"><arg type="o" direction="in"/><arg type="s" direction="in"/></method><method name="RequestDefaultAgent"><arg type="o" direction="in"/></method><method name="UnregisterAgent"><arg type="o" direction="in"/></method></interface>
 <interface name="org.freedesktop.DBus.Properties"><method name="Set"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/></method></interface>
 <interface name="org.bluez.Adapter1"><method name="RemoveDevice"><arg type="o" direction="in"/></method></interface>
-<interface name="org.bluez.Device1"><method name="CancelPairing"/><method name="Disconnect"/><method name="ConnectProfile"><arg type="s" direction="in"/></method></interface>
+<interface name="org.bluez.Device1"><method name="CancelPairing"/><method name="Disconnect"/><method name="Connect"/><method name="ConnectProfile"><arg type="s" direction="in"/></method><method name="DisconnectProfile"><arg type="s" direction="in"/></method></interface>
 </node>"""
         info = Gio.DBusNodeInfo.new_for_xml(xml)
         self.device_info = info.interfaces[5]
@@ -84,6 +88,7 @@ class MockBluez(ProfileSockets):
                 "AddressType": GLib.Variant("s", "public"), "Adapter": GLib.Variant("o", ADAPTER),
                 "Paired": GLib.Variant("b", self.paired),
                 "Bonded": GLib.Variant("b", self.bonded),
+                "Connected": GLib.Variant("b", self.connected and path == DEVICE),
             }}
         for path, address in ({} if self.hide_extras else self.extras).items():
             objects[path] = {"org.bluez.Device1": {
@@ -177,8 +182,26 @@ class MockBluez(ProfileSockets):
                 if self.disconnect_delay_ms:
                     GLib.timeout_add(self.disconnect_delay_ms, lambda: (invocation.return_value(None), False)[1])
                     return
-            case "ConnectProfile":
-                self.paged.append([_path, args.unpack()[0]])
+            case "Connect":
+                self.calls.append(f"Connect {_path.rsplit('/', 1)[-1]}")
+            case "ConnectProfile" | "DisconnectProfile":
+                uuid = args.unpack()[0]
+                self.calls.append(f"{method} {_path.rsplit('/', 1)[-1]} {uuid}")
+                if method == "DisconnectProfile":
+                    self.connected = False
+                elif self.fail_page:
+                    invocation.return_dbus_error("org.bluez.Error.Failed", "fixture page failure")
+                    return
+                else:
+                    def page_done() -> bool:
+                        self.connected = True
+                        invocation.return_value(None)
+                        return False
+                    if self.page_delay_ms:
+                        GLib.timeout_add(self.page_delay_ms, page_done)
+                    else:
+                        page_done()
+                    return
             case "CancelPairing":
                 self.cancel_calls += 1
                 # BlueZ answers CancelPairing without an in-flight Pair() with MGMT Unpair Device.
@@ -238,6 +261,18 @@ class MockBluez(ProfileSockets):
     def command(self, text: str) -> str:
         if text.startswith("hfp-wire-"):
             return self.hfp_wire(text)
+        if text.startswith("slow-page "):
+            self.page_delay_ms = int(text.split()[1])
+            return "ok"
+        if text == "calls":
+            return ";".join(self.calls)
+        if text in ("fail-page", "ok-page"):
+            self.fail_page = text == "fail-page"
+            return "ok"
+        if text in ("link-up", "link-down"):
+            # The link state reported by inventory, without a PropertiesChanged signal.
+            self.connected = text == "link-up"
+            return "ok"
         if text.startswith("slow-remove ") or text.startswith("slow-disconnect "):
             # Delays (ms) for RemoveDevice or Device1.Disconnect replies, for the cleanup deadline (#118).
             name, value = text.split()
@@ -276,7 +311,6 @@ class MockBluez(ProfileSockets):
                 return json.dumps({"properties": self.properties, "profile": self.profile,
                     "default_agent": self.default_agent, "removed": self.removed, "helper": self.helper,
                     "disconnected": self.disconnected,
-                    "paged": self.paged,
                     "cancel_unpaired": self.cancel_unpaired,
                     # Every pairing-destructive call the helper made: RemoveDevice, CancelPairing
                     # and Disconnect. The adapter is shared (#136), so this must stay 0.
@@ -312,6 +346,7 @@ class MockBluez(ProfileSockets):
                 self.bus.emit_signal(None, DEVICE, "org.freedesktop.DBus.Properties", "PropertiesChanged",
                                      GLib.Variant("(sa{sv}as)", ("org.bluez.Device1", {"Bonded": GLib.Variant("b", False)}, [])))
             case "connected-false" | "connected-true" | "connected-invalidated":
+                self.connected = text == "connected-true"
                 self.bus.emit_signal(None, DEVICE, "org.freedesktop.DBus.Properties", "PropertiesChanged",
                     GLib.Variant("(sa{sv}as)", ("org.bluez.Device1",
                         {} if text == "connected-invalidated" else {"Connected": GLib.Variant("b", text == "connected-true")},

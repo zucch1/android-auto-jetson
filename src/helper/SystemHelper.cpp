@@ -166,6 +166,8 @@ core::Result<State> SystemHelper::reconnect_peer(const std::string& sender, std:
     handoff_binding_.reset();
     handoff_snapshot_.reset();
     lease_ = Source{};
+    // The page leaves only after the reconnect lease is committed.
+    backend_.page_reconnected();
     return result;
 }
 core::Result<void> SystemHelper::revoke_peer(const std::string& sender, const PeerIdentity& identity) {

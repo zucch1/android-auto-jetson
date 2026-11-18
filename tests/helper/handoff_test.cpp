@@ -35,6 +35,34 @@ public:
         allowed = allow; ready = listener_ready; if (!allow) { ++denies; live = false; } return {};
     }
 };
+// The outbound page leaves only after the reconnect lease is committed, and only on success.
+class PagingBackend final : public Backend {
+public:
+    SystemHelper* helper{};
+    bool reconnects{true};
+    int pages{}; bool lease_committed{};
+    core::Result<State> apply(Action, std::uint32_t) override { return State::active; }
+    void cleanup() noexcept override {}
+    core::Result<State> reconnect_peer(std::uint64_t) override {
+        if (!reconnects) return Error{ErrorCode::helper_rejected};
+        return State::active;
+    }
+    core::Result<ObservedPeer> handoff() override { return ObservedPeer{5, {"AA:BB:CC:DD:EE:FF", "00:11:22:33:44:55"}}; }
+    void page_reconnected() override {
+        ++pages;
+        lease_committed = helper && helper->poll_handoff(":1.2", {7, 0}).has_value();
+    }
+};
+TEST(HandoffAuthority, ReconnectPagesOnlyAfterSuccessAndLeaseCommit) {
+    HandoffIds ids; PagingBackend backend; SystemHelper helper{ids, backend}; backend.helper = &helper;
+    backend.reconnects = false;
+    EXPECT_FALSE(helper.reconnect_peer(":1.2", 9));
+    EXPECT_EQ(backend.pages, 0);
+    backend.reconnects = true;
+    ASSERT_TRUE(helper.reconnect_peer(":1.2", 9));
+    EXPECT_EQ(backend.pages, 1);
+    EXPECT_TRUE(backend.lease_committed);
+}
 TEST(HandoffAuthority, ReconnectNeedsNoPendingAddPhoneAndOwnsExactSource) {
     HandoffIds ids; HandoffBackend backend; SystemHelper helper{ids, backend};
     ASSERT_TRUE(helper.reconnect_peer(":1.2", 9));

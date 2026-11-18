@@ -55,6 +55,7 @@ BluezBackend::Impl::Impl(const std::string& address, Now clock, const std::strin
     g_main_context_pop_thread_default(context);
 }
 BluezBackend::Impl::~Impl() {
+    retire_page();
     close_window();
     (void)unregister_profiles();
     if (agent_registered) {
@@ -145,10 +146,13 @@ void BluezBackend::Impl::reset() {
     release_window();
     allowed.reset(); window = {}; pairing_enabled = false; comparison_accepted = false; acknowledged = false;
     observations.clear(); adapters.clear();
+    // A new (or no) BlueZ owner: its links and pending replies are not ours to withdraw.
+    page.reset(); page_requested = false; withdrawn.clear();
     registered = false; agent_registered = false;
 }
 void BluezBackend::Impl::pump() {
     drain_events();
+    service_page();
     if (comparison && now() >= comparison->deadline) close_admission();
     if (now() >= next_check) {
         const bool alive = current_owner();
@@ -237,8 +241,8 @@ core::Result<void> BluezBackend::authorize_handoff(std::uint64_t handle, bool al
 }
 void BluezBackend::tick() { impl_->pump(); }
 void BluezBackend::discard(std::uint64_t handle) { impl_->observations.erase(handle); }
-void BluezBackend::cleanup() noexcept { impl_->observations.clear(); impl_->close_window(); }
-void BluezBackend::retire_lease() noexcept { impl_->close_window(); }
+void BluezBackend::cleanup() noexcept { impl_->retire_page(); impl_->observations.clear(); impl_->close_window(); }
+void BluezBackend::retire_lease() noexcept { impl_->retire_page(); impl_->close_window(); }
 core::Result<State> BluezBackend::apply(Action action, std::uint32_t channel) {
     if (channel) return Error{ErrorCode::helper_rejected};
     switch (action) {

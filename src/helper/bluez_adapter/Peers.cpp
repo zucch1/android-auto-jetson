@@ -37,12 +37,14 @@ bool BluezBackend::Impl::inventory(std::vector<Device>& devices) {
             const char *address{}, *adapter{}, *type{};
             gboolean paired = FALSE;
             gboolean bonded = FALSE;
+            gboolean connected = FALSE;
             (void)g_variant_lookup(props, "Bonded", "b", &bonded);
+            (void)g_variant_lookup(props, "Connected", "b", &connected);
             if (g_variant_lookup(props, "Address", "&s", &address) && address_valid(address) &&
                 g_variant_lookup(props, "AddressType", "&s", &type) && std::string_view{type} == "public" &&
                 g_variant_lookup(props, "Adapter", "&o", &adapter) &&
                 g_variant_lookup(props, "Paired", "b", &paired) && devices.size() < 256) {
-                devices.push_back({path, adapter, {address, {}}, paired != FALSE && bonded != FALSE});
+                devices.push_back({path, adapter, {address, {}}, paired != FALSE && bonded != FALSE, connected != FALSE});
             }
             g_variant_unref(props);
         }
@@ -61,7 +63,7 @@ bool BluezBackend::Impl::inventory(std::vector<Device>& devices) {
     g_variant_unref(objects); g_variant_unref(reply);
     return true;
 }
-bool BluezBackend::Impl::exact(const Observation& observed, bool require_bonded) {
+bool BluezBackend::Impl::exact(const Observation& observed, bool require_bonded, Device* live) {
     drain_events();
     const auto current = [&] {
         return observed.owner == owner && observed.owner_epoch == owner_epoch &&
@@ -73,10 +75,13 @@ bool BluezBackend::Impl::exact(const Observation& observed, bool require_bonded)
     if (!inventory(devices)) return false;
     drain_events();
     if (!current_owner() || !current()) return false;
-    return std::any_of(devices.begin(), devices.end(), [&](const Device& device) {
+    const auto found = std::find_if(devices.begin(), devices.end(), [&](const Device& device) {
         return device.path == observed.device.path && device.adapter_path == observed.device.adapter_path &&
                device.identity == observed.device.identity && (!require_bonded || device.bonded);
     });
+    if (found == devices.end()) return false;
+    if (live) *live = *found;
+    return true;
 }
 std::optional<BluezBackend::Impl::Observation> BluezBackend::Impl::consume(std::uint64_t handle) {
     if (!ensure()) return std::nullopt;
@@ -142,14 +147,21 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     // directory fsync once before refusing.
     if (!observed || !impl_->exact(*observed, true) || !impl_->admitted(observed->device.identity))
         return Error{ErrorCode::helper_rejected};
+    // A page owned for another identity ends with this window's authority.
+    if (impl_->page && impl_->page->peer.device.identity != observed->device.identity) impl_->retire_page();
     impl_->close_window();
     impl_->allowed = *observed;
     impl_->window = impl_->now() + std::chrono::seconds(60);
-    // The AA profile is a server: the bonded phone initiates RFCOMM, but only over a live
-    // link, so the window pages the phone's HFP Audio Gateway (scoped ConnectProfile). No
-    // generic Device1.Connect (which could activate unrelated audio profiles) is used.
-    impl_->connect_hands_free(observed->device.path);
+    // The AA profile is a server: the bonded phone initiates RFCOMM, but only over a live link.
+    // page_reconnected() pages its HFP Audio Gateway once the caller has committed the lease.
+    // No generic Device1.Connect (which could activate unrelated audio profiles) is used.
+    impl_->page_requested = true;
     return State::active;
+}
+void BluezBackend::page_reconnected() {
+    if (!impl_->page_requested) return;
+    impl_->page_requested = false;
+    impl_->dispatch_page();
 }
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     // Authority: an admitted bond, a revoked (historical) one, or an open enrolment's journal entry
@@ -167,6 +179,8 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     if ((impl_->allowed && impl_->allowed->device.identity == identity) ||
         (impl_->connected && impl_->connected->device.identity == identity)) impl_->close_window();
     std::erase(impl_->awaiting, identity);
+    // A page for this identity loses its authority now; a link it created is withdrawn.
+    if (impl_->page && impl_->page->peer.device.identity == identity) impl_->retire_page();
     // Demoted first: once forgotten, the bond is never admitted (services, reconnect) again and is
     // never taken as acceptance of a later enrolment of the same identity. Success only once every
     // write is confirmed durable; otherwise the receiver retries.

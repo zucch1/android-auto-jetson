@@ -25,6 +25,7 @@ public:
     core::Result<ObservedPeer> observe() override;
     core::Result<State> authorize(std::uint64_t) override;
     core::Result<State> reconnect_peer(std::uint64_t) override;
+    void page_reconnected() override;
     core::Result<void> revoke_peer(const PeerIdentity&) override;
     void discard(std::uint64_t) override;
     void cleanup() noexcept override;

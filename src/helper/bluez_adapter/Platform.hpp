@@ -23,6 +23,7 @@ struct BluezBackend::Impl {
         std::string path, adapter_path;
         PeerIdentity identity;
         bool bonded{};
+        bool connected{};
     };
     struct Observation {
         Device device; std::string owner; Clock::time_point expires;
@@ -122,13 +123,47 @@ struct BluezBackend::Impl {
     static int socket_fd(GDBusMethodInvocation*);
     bool register_profiles();
     bool unregister_profiles();
-    void connect_hands_free(const std::string& device);
+    // Approved-reconnect paging (docs/task36-bluez.md): a bonded phone's Android Auto dials the AA
+    // RFCOMM profile only over a live link, so an approved reconnect pages the phone's HFP Audio
+    // Gateway once. The page is bound to the exact admitted observation, rechecked at dispatch
+    // (after the previous window closed and the lease committed), rate limited per peer, and owned:
+    // when its authority ends (lease retirement, Forget, link or bond continuity loss, BlueZ owner
+    // change) a page that created the link is withdrawn with a scoped DisconnectProfile(HFP AG),
+    // including one that completes late. Never generic Connect, Disconnect or RemoveDevice (#136).
+    struct PageReply { bool done{}; bool ok{}; std::string error; };
+    struct Page {
+        Observation peer;
+        bool retired{};
+        std::shared_ptr<PageReply> reply;
+    };
+    // A withdrawn page's link may still be tracked by BlueZ's policy plugin, which re-pages HFP
+    // after a supervision-timeout drop (up to ~127 s of retries) with no agent check. Until that
+    // horizon has passed after the link next drops, an HFP link that comes back for this peer
+    // without an open reconnect window for it is withdrawn again (scoped to this peer and HFP AG).
+    struct Withdrawn {
+        std::string path;
+        PeerIdentity identity;
+        std::optional<Clock::time_point> link_down;
+    };
+    static constexpr auto kPageInterval = std::chrono::seconds(30);
+    static constexpr auto kPolicyHorizon = std::chrono::seconds(150);
+    static constexpr std::size_t kMaxWithdrawn = 8;
+    std::optional<Page> page;
+    bool page_requested{};
+    std::vector<std::pair<PeerIdentity, Clock::time_point>> paged_at;
+    std::vector<Withdrawn> withdrawn;
+    static void page_replied(GObject*, GAsyncResult*, gpointer);
+    void dispatch_page();
+    void service_page();
+    void retire_page();
+    void withdraw_link(const std::string& path, const PeerIdentity&);
+    void link_changed(const std::string& path, bool connected);
     void close_window();
     void close_admission();
     void reject_comparison();
     void reset();
     void pump();
-    bool exact(const Observation&, bool require_bond);
+    bool exact(const Observation&, bool require_bond, Device* live = nullptr);
     bool permitted(const char*, bool pairing);
     std::optional<Observation> consume(std::uint64_t);
     void watch_continuity();

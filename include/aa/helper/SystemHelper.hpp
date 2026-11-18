@@ -64,6 +64,9 @@ public:
     virtual core::Result<ObservedPeer> observe() { return Error{ErrorCode::helper_unavailable}; }
     virtual core::Result<State> authorize(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
     virtual core::Result<State> reconnect_peer(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
+    // After a successful reconnect_peer() and the caller's lease commit: the backend's outbound
+    // effect for that reconnect (BlueZ: page the phone), rechecked against live authority.
+    virtual void page_reconnected() {}
     virtual core::Result<void> revoke_peer(const PeerIdentity&) { return Error{ErrorCode::helper_unavailable}; }
     virtual void discard(std::uint64_t) {}
     virtual core::Result<ObservedPeer> handoff() { return Error{ErrorCode::helper_rejected}; }

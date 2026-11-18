@@ -155,9 +155,12 @@ struct Runtime final {
                 configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
             }
             if (wants && attempting && !receiver.session() && turn >= attempt_until) {
-                // Not an error code: the phone never reached the TCP listener in time (no RFCOMM
-                // bootstrap, or it never joined the AP). Say so instead of retrying silently.
-                log_line("{\"event\":\"wireless_admission_expired\",\"reason\":\"no_phone_connection\"}");
+                // Not an error code: the attempt deadline passed without a session. Name the phase
+                // it expired in instead of retrying silently: still waiting for AP activation, or
+                // AP handoff begun and no phone session (no bootstrap, AP join or TCP connection).
+                log_line(acquisition
+                    ? "{\"event\":\"wireless_admission_expired\",\"reason\":\"attempt_deadline\",\"phase\":\"ap_activation\"}"
+                    : "{\"event\":\"wireless_admission_expired\",\"reason\":\"attempt_deadline\",\"phase\":\"phone_handoff\"}");
                 defer();
             }
             if (wants && !receiver.session() && !attempting && turn >= retry) {
