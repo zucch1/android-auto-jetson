@@ -223,7 +223,7 @@
                 },
                 "value": {
                   "type": [
-                    "number",
+                    "integer",
                     "null"
                   ],
                   "minimum": 0
@@ -250,7 +250,7 @@
                 },
                 "value": {
                   "type": [
-                    "number",
+                    "integer",
                     "null"
                   ],
                   "minimum": 0

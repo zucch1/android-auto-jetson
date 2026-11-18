@@ -844,7 +844,13 @@ class ConcreteAudioRenderWorker final {
         struct Credit { aa::channels::AvDeliveryId id; std::int64_t duration; };
         struct IdleSkip { std::uint64_t id; std::uint64_t frames; std::uint64_t total; };
         struct IdleResume { std::uint64_t id; aa::core::Nanoseconds start; aa::core::Nanoseconds end; };
-        struct CatchUp { std::uint64_t frames; std::uint64_t total; std::uint32_t rate; };
+        struct CatchUp {
+            std::uint64_t frames;
+            std::uint64_t total;
+            std::uint32_t rate;
+            std::uint64_t events_lifetime;
+            std::uint64_t frames_lifetime;
+        };
         struct SinkStall {
             aa::core::Nanoseconds start;
             aa::core::Nanoseconds end;
@@ -882,9 +888,14 @@ class ConcreteAudioRenderWorker final {
             if (caught_up) {
                 // frames: this step's increment at the output rate (a reset-free
                 // delta on one router); frames_total resets on a sink reopen.
+                // events_lifetime / frames_lifetime are the worker's running
+                // totals across reopens, so a later record restores any earlier
+                // one this droppable media path lost.
                 log_media("audio_catch_up", "{\"event\":\"audio_catch_up\",\"frames\":" +
                     std::to_string(caught_up->frames) + ",\"frames_total\":" + std::to_string(caught_up->total) +
-                    ",\"rate\":" + std::to_string(caught_up->rate) + "}");
+                    ",\"rate\":" + std::to_string(caught_up->rate) +
+                    ",\"events_lifetime\":" + std::to_string(caught_up->events_lifetime) +
+                    ",\"frames_lifetime\":" + std::to_string(caught_up->frames_lifetime) + "}");
             }
             if (skipped) {
                 log_media("audio_idle_skipped", "{\"event\":\"audio_idle_skipped\",\"id\":" + std::to_string(skipped->id) +
@@ -1251,9 +1262,12 @@ class ConcreteAudioRenderWorker final {
             in_flight_ = false;
             const auto stats = router_.report().stats;
             if (stats.frames_caught_up > caught_up_before) {
+                const auto frames = stats.frames_caught_up - caught_up_before;
+                ++catch_up_events_lifetime_;
+                catch_up_frames_lifetime_ += frames;
                 diagnostics.caught_up = SettlementDiagnostics::CatchUp{
-                    stats.frames_caught_up - caught_up_before, stats.frames_caught_up,
-                    config.output_format.sample_rate_hz};
+                    frames, stats.frames_caught_up, config.output_format.sample_rate_hz,
+                    catch_up_events_lifetime_, catch_up_frames_lifetime_};
             }
             if (idle_resume_id_) {
                 idle_resume_frames_ += stats.frames_idle_skipped - idle_before;
@@ -1444,6 +1458,9 @@ class ConcreteAudioRenderWorker final {
     std::optional<aa::core::Nanoseconds> idle_since_;
     std::optional<std::uint64_t> idle_resume_id_;
     std::uint64_t idle_resume_frames_{};
+    // Catch-up (#154) totals over the worker's life, across sink reopens.
+    std::uint64_t catch_up_events_lifetime_{};
+    std::uint64_t catch_up_frames_lifetime_{};
     std::uint64_t idle_sequence_{};
     // Sink-stall survival (#60): once a blocked write has kept a phone credit
     // waiting this long, the phone may send past max_unacked=1 (HU09 did after
@@ -1535,9 +1552,12 @@ aa::audio::RouterConfig pcm_router_config(
     // placed after the cursor far behind its arrival. A run placed more than
     // 90 ms (the A/V excursion bound) behind its arrival is trimmed from its
     // head down to the 15 ms drift target at once instead of 5 ms per chunk,
-    // so a long stall's burst can no longer push a later arrival past the
-    // router's 200 ms late cap (a session-ending audio_sink_failure). The
-    // dropped audio is logged as audio_catch_up.
+    // and the router's 200 ms late cap judges such a caught-up run by the
+    // oldest audio it still plays (by its newest sample if it is dropped
+    // whole). A stall's burst - including 200 ms guidance parents stamped
+    // milliseconds apart - is therefore trimmed rather than ending the session
+    // as audio_sink_failure; a run wholly over 200 ms behind the cursor still
+    // fails late. The dropped audio is logged as audio_catch_up.
     config.live_pcm_drift.catch_up_watermark = aa::core::Nanoseconds{90'000'000};
     config.on_write_completed = [](const aa::audio::WriteCompletion &completion) {
         // presented_ns (#60): when the chunk starts playing on the sink's

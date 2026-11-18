@@ -5926,7 +5926,7 @@ TEST(WiredReceiver, WorkerStallBurstCatchesUpInsteadOfEndingTheSession) {
     // The qualification collector sums each event's own increment at its
     // logged rate (#154 review): together they account every catch-up frame.
     const std::regex catch_up{
-        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000\})"};
+        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)\})"};
     std::uint64_t logged{};
     std::uint64_t last_total{};
     std::size_t events{};
@@ -5934,6 +5934,9 @@ TEST(WiredReceiver, WorkerStallBurstCatchesUpInsteadOfEndingTheSession) {
         logged += std::stoull((*it)[1].str());
         last_total = std::stoull((*it)[2].str());
         ++events;
+        // The running lifetime totals restore any record the media log drops.
+        EXPECT_EQ(std::stoull((*it)[3].str()), events) << output;
+        EXPECT_EQ(std::stoull((*it)[4].str()), logged) << output;
     }
     EXPECT_GT(events, 0U) << output;
     EXPECT_EQ(logged, report->stats.frames_caught_up) << output;
@@ -5980,7 +5983,7 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     EXPECT_FALSE(report->render_failure);
     // Logged at the 48 kHz output rate, never the 16 kHz input rate.
     const std::regex catch_up{
-        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000\})"};
+        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)\})"};
     std::uint64_t logged{};
     std::size_t events{};
     for (auto it = std::sregex_iterator(output.begin(), output.end(), catch_up); it != std::sregex_iterator{}; ++it) {
@@ -5993,6 +5996,40 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     std::lock_guard lock(gate->mutex);
     ASSERT_FALSE(gate->timestamps.empty());
     EXPECT_LE(gate->timestamps.back().count, arrival + 100'000'000 + 90'000'000);
+}
+
+// Sol re-review of #155: the worker admits 6400-byte guidance parents (200 ms
+// of 16 kHz mono). A burst of them stamped 0, 1, 10 and 12 ms apart, each
+// submitted after the previous one settled, put the next parent more than
+// 200 ms behind the cursor and ended the session as audio_sink_failure even
+// with the catch-up. It must now be caught up and survive.
+TEST(WiredReceiver, WorkerMaxSizeGuidanceBurstSurvivesTheLateCap) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto role = aa::protocol::ChannelRole::guidance_audio;
+    const std::vector<std::byte> pcm(6400, std::byte{1}); // the admitted maximum: 200 ms
+    const auto arrival = steady_ns();
+    std::uint64_t sequence = 1;
+    for (const std::int64_t offset_ms : {0, 1, 10, 12, 12, 13, 20, 20}) {
+        ASSERT_TRUE(audio.submit({{role, sequence, {arrival + offset_ms * 1'000'000}}, pcm},
+                                 {role, 0, sequence, 7})) << sequence;
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        ASSERT_FALSE(audio.failure()) << sequence;
+        ++sequence;
+    }
+    const bool finished = audio.finish().has_value();
+    const auto output = capture.release();
+    ASSERT_TRUE(finished) << output;
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+    EXPECT_NE(output.find("{\"event\":\"audio_catch_up\""), std::string::npos) << output;
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    EXPECT_FALSE(report->render_failure);
+    EXPECT_GT(report->stats.frames_caught_up, 0U);
 }
 
 TEST(WiredReceiver, WorkerStartupInflightAndOtherRolePendingNeverAuthorizeIdle) {

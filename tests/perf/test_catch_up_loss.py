@@ -38,14 +38,19 @@ STALL_KEYS = ("audio_stall_dropouts", "audio_stall_dropped_chunks", "audio_stall
 def burst_lines() -> list[str]:
     """The worst-case burst as the receiver logs it: 12 fully dropped 2048-frame
     parents (1808 catch-up frames each beyond the 240-frame drift trim), with a
-    sink reopen after the eighth that resets the router's frames_total."""
+    sink reopen after the eighth that resets the router's frames_total while
+    the worker's lifetime totals keep running."""
     lines, total = [], 0
     for index in range(12):
         if index == 8:
             total = 0  # a new router after the reopen: frames_total starts again
         total += 1808
-        lines.append('{"event":"audio_catch_up","frames":1808,"frames_total":%d,"rate":48000}' % total)
+        lines.append('{"event":"audio_catch_up","frames":1808,"frames_total":%d,"rate":48000,'
+                     '"events_lifetime":%d,"frames_lifetime":%d}' % (total, index + 1, 1808 * (index + 1)))
     return lines
+
+
+DROP = '{"event":"media_telemetry_dropped","rate_limited":0,"backpressure":1}'
 
 
 BURST_FRAMES = 12 * 1808
@@ -72,16 +77,65 @@ def test_parser_counts_catch_up_separately_from_stall_bypass() -> None:
 
 def test_parser_reports_zero_without_catch_up_and_null_when_malformed() -> None:
     assert [parse([]).metrics[key] for key in KEYS] == [0, 0, 0.0]
-    for bad in ('{"event":"audio_catch_up","frames":1808,"frames_total":1808}',
-                '{"event":"audio_catch_up","frames":-1,"frames_total":1,"rate":48000}',
-                '{"event":"audio_catch_up","frames":1.5,"frames_total":1,"rate":48000}',
-                '{"event":"audio_catch_up","frames":true,"frames_total":1,"rate":48000}',
-                '{"event":"audio_catch_up","frames":1808,"frames_total":1808,"rate":0}'):
+    tail = ',"events_lifetime":4,"frames_lifetime":7232}'
+    for bad in ('{"event":"audio_catch_up","frames":1808,"frames_total":1808' + tail,
+                '{"event":"audio_catch_up","frames":1808,"frames_total":1808,"rate":48000}',
+                '{"event":"audio_catch_up","frames":-1,"frames_total":1,"rate":48000' + tail,
+                '{"event":"audio_catch_up","frames":1.5,"frames_total":1,"rate":48000' + tail,
+                '{"event":"audio_catch_up","frames":true,"frames_total":1,"rate":48000' + tail,
+                '{"event":"audio_catch_up","frames":1808,"frames_total":1808,"rate":0' + tail,
+                '{"event":"audio_catch_up","frames":1808,"frames_total":1808,"rate":16000' + tail,
+                # Lifetime totals that do not advance cannot be a new record.
+                '{"event":"audio_catch_up","frames":1808,"frames_total":1808,"rate":48000,'
+                '"events_lifetime":3,"frames_lifetime":5424}'):
         parser = parse([*burst_lines()[:3], bad, *burst_lines()[3:]])
         # A partial sum would understate the loss: unknown, never undercounted.
         assert [parser.metrics[key] for key in KEYS] == [None, None, None], (bad, parser.metrics)
         # Informational only: a malformed loss record does not block the run.
         assert parser.invalid_telemetry == [], bad
+
+
+def test_lifetime_totals_restore_a_dropped_record() -> None:
+    # Given the media log dropped the fifth record and reported the drop.
+    lines = burst_lines()
+    parser = parse([*lines[:4], DROP, *lines[5:]])
+    # Then the next record's lifetime totals restore it: all 12 events, 452 ms.
+    assert parser.metrics["audio_catch_up_events"] == 12, parser.metrics
+    assert parser.metrics["audio_catch_up_frames"] == BURST_FRAMES, parser.metrics
+    assert abs(parser.metrics["audio_catch_up_ms"] - BURST_MS) < 1e-3, parser.metrics
+    # Even when the drop notice itself is only reported after the next record.
+    later = parse([*lines[:4], *lines[5:7], DROP, *lines[7:]])
+    assert later.metrics["audio_catch_up_frames"] == BURST_FRAMES, later.metrics
+
+
+def test_a_drop_after_the_newest_record_leaves_the_totals_unconfirmed() -> None:
+    lines = burst_lines()
+    # The last record lost at the tail: no later record can restore it.
+    tail = parse([*lines[:11], DROP])
+    assert [tail.metrics[key] for key in KEYS] == [None, None, None], tail.metrics
+    # The only record lost: never an exact-looking zero.
+    only = parse([DROP])
+    assert [only.metrics[key] for key in KEYS] == [None, None, None], only.metrics
+    # Informational: unconfirmed loss never blocks the run.
+    assert tail.invalid_telemetry == [] and only.invalid_telemetry == []
+    # A notice reporting no loss changes nothing.
+    clean = parse([*lines, '{"event":"media_telemetry_dropped","rate_limited":0,"backpressure":0}'])
+    assert clean.metrics["audio_catch_up_frames"] == BURST_FRAMES, clean.metrics
+
+
+def test_collector_capture_with_a_dropped_tail_record_reports_unknown_loss() -> None:
+    lines = burst_lines()
+    capture = collect([*lines[:11], DROP])
+    assert [capture["events"][key] for key in KEYS] == [None, None, None], capture["events"]
+    doc = reporter.build_result(copy.deepcopy(capture), duration_requested=None,
+                                now="2026-11-18T00:00:00Z", capture_path=None, capture_sha256=None)
+    for key in KEYS:
+        assert doc["metrics"][key]["value"] is None and doc["metrics"][key]["status"] == "INFORMATIONAL"
+    assert not any(name.startswith("audio_catch_up") for name in doc["blocked_on"]), doc["blocked_on"]
+    assert not schema.validate(doc, schema.load_schema(schema.SCHEMA_V3))
+    # A dropped middle record is restored end to end.
+    restored = collect([*lines[:4], DROP, *lines[5:]])
+    assert restored["events"]["audio_catch_up_frames"] == BURST_FRAMES, restored["events"]
 
 
 def with_catch_up(raw: dict, events: int, frames: int, ms: float) -> dict:
@@ -120,10 +174,16 @@ def test_schema_rejects_a_gated_or_mislabelled_catch_up_metric() -> None:
                               ("audio_catch_up_ms", "status", "PASS"),
                               ("audio_catch_up_frames", "unit", "chunks"),
                               ("audio_catch_up_events", "unit", "frames"),
-                              ("audio_catch_up_frames", "value", -1)):
+                              ("audio_catch_up_frames", "value", -1),
+                              # Counts are integers; only the duration is fractional.
+                              ("audio_catch_up_frames", "value", 1.5),
+                              ("audio_catch_up_events", "value", 0.5)):
         bad = copy.deepcopy(doc)
         bad["metrics"][key][field] = value
         assert schema.validate(bad, loaded), (key, field, value)
+    fractional = copy.deepcopy(doc)
+    fractional["metrics"]["audio_catch_up_ms"]["value"] = 37.666667
+    assert not schema.validate(fractional, loaded)
 
 
 def test_pre_catch_up_v3_capture_reports_null_and_v2_is_unchanged() -> None:
@@ -149,10 +209,10 @@ def test_report_rejects_inconsistent_catch_up_evidence() -> None:
         raise AssertionError(raw["events"])
 
 
-def test_collector_capture_replays_catch_up_into_the_report() -> None:
-    # Given the receiver log of a stall burst survived by catch-up, no bypass.
+def collect(lines: list[str]) -> dict:
+    """Run the real collector against the fake receiver printing ``lines``."""
     with tempfile.TemporaryDirectory(prefix="perf-catch-up-") as base:
-        env = dict(os.environ, FAKE_RECEIVER_RAW_TELEMETRY="\n".join(burst_lines()))
+        env = dict(os.environ, FAKE_RECEIVER_RAW_TELEMETRY="\n".join(lines))
         proc = subprocess.run(
             [sys.executable, "-B", str(ROOT / "tools/perf/aa_projection_collect.py"),
              "--receiver", str(ROOT / "tests/perf/fixtures/wired_perf/fake_receiver.py"),
@@ -163,7 +223,12 @@ def test_collector_capture_replays_catch_up_into_the_report() -> None:
              "--allow-unoptimized-build"],
             env=env, capture_output=True, text=True, timeout=30)
         assert proc.returncode == 0, proc.stderr
-        capture = json.loads(proc.stdout)
+        return json.loads(proc.stdout)
+
+
+def test_collector_capture_replays_catch_up_into_the_report() -> None:
+    # Given the receiver log of a stall burst survived by catch-up, no bypass.
+    capture = collect(burst_lines())
     # When the collector writes its capture.
     assert capture["schema"] == "aa-projection-perf-capture/3"
     events = capture["events"]

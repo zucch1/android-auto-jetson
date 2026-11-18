@@ -476,10 +476,12 @@ class EventParser:
             "audio_stall_dropped_chunks": 0, "audio_stall_unrecovered": 0,
             "audio_catch_up_events": 0, "audio_catch_up_frames": 0, "audio_catch_up_ms": 0.0,
         }
-        # Catch-up loss (#154): frames per logged output rate, so the duration
-        # is exact; null once any event is malformed, since a partial sum
-        # would understate the loss.
-        self.catch_up_frames: dict[int, int] | None = {}
+        # Catch-up loss (#154), from the receiver's running lifetime totals:
+        # (events, frames, rate) of the newest record, None once malformed.
+        self.catch_up: tuple[int, int, int] | None = (0, 0, 0)
+        # A media_telemetry_dropped notice after the newest catch-up record
+        # may hide a later one: the totals are then unconfirmed (null).
+        self.catch_up_unconfirmed = False
         self.stall_open = False
         self.stall_failed = 0
         self.video_units: int | None = None
@@ -521,25 +523,43 @@ class EventParser:
         A placement backlog past the catch-up watermark is trimmed to the drift
         target in one run instead of 5 ms per run. It is neither a sink stall
         nor an ``audio_stall_bypass``, so it never feeds the ``audio_stall_*``
-        counters. ``frames`` is the event's own increment, at ``rate`` output
-        frames per second, beyond the ordinary bounded drift trim; summing
-        increments (never ``frames_total``) survives the router counter reset
-        on a sink reopen. Frames and the event count stay separate units.
+        counters. Each record carries the render worker's running totals over
+        the receiver's life (``events_lifetime``, ``frames_lifetime``: output
+        frames at ``rate`` beyond the ordinary bounded drift trim), which
+        survive a sink reopen and restore any earlier record the droppable
+        media log lost. Frames and the event count stay separate units.
         """
-        if self.catch_up_frames is None:
+        if self.catch_up is None:
             return
-        frames, rate = event.get("frames"), event.get("rate")
-        if not all(isinstance(value, int) and not isinstance(value, bool) and value > 0
-                   for value in (frames, rate)):
-            self.catch_up_frames = None
-            for key in ("audio_catch_up_events", "audio_catch_up_frames", "audio_catch_up_ms"):
+        fields = [event.get(key) for key in ("frames", "rate", "events_lifetime", "frames_lifetime")]
+        frames, rate, events, total = fields
+        last_events, last_total, last_rate = self.catch_up
+        if not (all(isinstance(value, int) and not isinstance(value, bool) and value > 0
+                    for value in fields)
+                and total >= frames and events > last_events and total > last_total
+                and last_rate in (0, rate)):
+            self.catch_up = None
+            self._publish_catch_up()
+            return
+        self.catch_up = (events, total, rate)
+        self.catch_up_unconfirmed = False
+        self._publish_catch_up()
+
+    def _media_dropped(self, event: dict) -> None:
+        lost = sum(event[key] for key in ("rate_limited", "backpressure")
+                   if isinstance(event.get(key), int) and not isinstance(event.get(key), bool))
+        if lost > 0 or not isinstance(event.get("rate_limited"), int):
+            self.catch_up_unconfirmed = True
+            self._publish_catch_up()
+
+    def _publish_catch_up(self) -> None:
+        keys = ("audio_catch_up_events", "audio_catch_up_frames", "audio_catch_up_ms")
+        if self.catch_up is None or self.catch_up_unconfirmed:
+            for key in keys:
                 self.metrics[key] = None
             return
-        self.catch_up_frames[rate] = self.catch_up_frames.get(rate, 0) + frames
-        self.metrics["audio_catch_up_events"] = int(self.metrics["audio_catch_up_events"]) + 1
-        self.metrics["audio_catch_up_frames"] = int(self.metrics["audio_catch_up_frames"]) + frames
-        self.metrics["audio_catch_up_ms"] = round(
-            sum(count * 1000 / hz for hz, count in self.catch_up_frames.items()), 6)
+        events, total, rate = self.catch_up
+        self.metrics.update(zip(keys, (events, total, round(total * 1000 / rate, 6) if rate else 0.0)))
 
     def _record_progress(self, keys: tuple[str, ...], stamp: int) -> None:
         for key in keys:
@@ -776,6 +796,8 @@ class EventParser:
             self.metrics["audio_stall_unrecovered"] = self.stall_failed + int(self.stall_open)
         if envelope == "audio_catch_up":
             self._catch_up(event)
+        if envelope == "media_telemetry_dropped":
+            self._media_dropped(event)
         if envelope == "video_sent" and isinstance(event.get("units"), int):
             self.video_units = event["units"]
         if envelope == "audio_chunks" and isinstance(event.get("count"), int):

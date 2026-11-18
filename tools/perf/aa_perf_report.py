@@ -143,8 +143,11 @@ def _catch_up_metrics(events: dict) -> dict:
     watermark in one run (``audio_catch_up``); the A/V metrics cannot see it
     (they measure from the placed slot), so the loss is reported on its own.
     A v3 capture recorded before the event existed carries none of the three
-    keys and reports null; a capture carrying only some, or values that are
-    negative or disagree about whether any catch-up happened, is malformed.
+    keys and reports null; so does one whose collector could not establish
+    the totals (a malformed record, or a media_telemetry_dropped notice after
+    the newest catch-up record). A capture carrying only some keys, or values
+    that are negative or disagree about whether any catch-up happened, is
+    malformed.
     """
     present = [name in events for name in CATCH_UP_METRICS]
     if any(present) and not all(present):
@@ -161,7 +164,8 @@ def _catch_up_metrics(events: dict) -> dict:
         "audio_catch_up_events": _metric(
             count, "events",
             note="audio_catch_up events (#154): render steps that dropped a placement backlog past "
-                 "the 90 ms catch-up watermark; not sink stalls, so never in audio_stall_*",
+                 "the 90 ms catch-up watermark; not sink stalls, so never in audio_stall_*; null "
+                 "when dropped media telemetry left the totals unconfirmed",
         ),
         "audio_catch_up_frames": _metric(
             frames, "frames",
