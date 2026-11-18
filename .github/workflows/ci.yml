@@ -44,25 +44,30 @@ jobs:
           # historical credential (read-only) from blob OIDs pinned in
           # third_party/provenance/inventory.json to plant re-encodings.
           fetch-depth: 0
-      - name: Restore downloaded apt packages
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          path: ${{ runner.temp }}/apt-archives
-          key: apt-debs-${{ runner.os }}-host-build-test-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: apt-debs-${{ runner.os }}-host-build-test-
       - name: Provision host-only AASDK and decode smoke dependencies
         run: |
           set -euo pipefail
-          sudo mkdir -p "$RUNNER_TEMP/apt-archives/partial"
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" -o APT::Sandbox::User=root update
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" -o APT::Sandbox::User=root -o APT::Keep-Downloaded-Packages=true install --no-install-recommends -y ninja-build cmake g++ \
+          # A slow mirror can trickle for most of the job without ever timing out,
+          # so bound the download phase, then fall back once to the primary Ubuntu
+          # archive. Every download stays verified against the signed indexes.
+          apt_get_install() {
+            if ! sudo timeout 480 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"; then
+              echo "::warning::apt download exceeded 8 min or failed; retrying on archive.ubuntu.com"
+              sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
+                /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+              sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+              sudo timeout 480 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"
+            fi
+            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install "$@"
+          }
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          apt_get_install --no-install-recommends -y ninja-build cmake g++ \
             libprotobuf-dev protobuf-compiler libboost-system-dev libboost-log-dev \
             libssl-dev libusb-1.0-0-dev pkg-config libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
             pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev valgrind \
             g++-aarch64-linux-gnu binutils ccache
-          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/apt-archives"
           protoc --version
           valgrind --version
           dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \
@@ -252,21 +257,26 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Restore downloaded apt packages
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          path: ${{ runner.temp }}/apt-archives
-          key: apt-debs-${{ runner.os }}-decode-overlay-cross-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: apt-debs-${{ runner.os }}-decode-overlay-cross-
       - name: Provision public synthetic cross fixture dependencies
         run: |
           set -euo pipefail
-          sudo mkdir -p "$RUNNER_TEMP/apt-archives/partial"
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" -o APT::Sandbox::User=root update
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" -o APT::Sandbox::User=root -o APT::Keep-Downloaded-Packages=true install --no-install-recommends -y ninja-build cmake \
+          # A slow mirror can trickle for most of the job without ever timing out,
+          # so bound the download phase, then fall back once to the primary Ubuntu
+          # archive. Every download stays verified against the signed indexes.
+          apt_get_install() {
+            if ! sudo timeout 480 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"; then
+              echo "::warning::apt download exceeded 8 min or failed; retrying on archive.ubuntu.com"
+              sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
+                /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+              sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+              sudo timeout 480 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"
+            fi
+            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install "$@"
+          }
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          apt_get_install --no-install-recommends -y ninja-build cmake \
             g++-aarch64-linux-gnu pkg-config binutils libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev
-          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/apt-archives"
       - name: Require AVAILABLE probe, AArch64 ELF and bound overlay provenance
         run: |
           set -euo pipefail
@@ -477,20 +487,25 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Restore downloaded apt packages
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          path: ${{ runner.temp }}/apt-archives
-          key: apt-debs-${{ runner.os }}-arm64-cross-fixture-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: apt-debs-${{ runner.os }}-arm64-cross-fixture-
       - name: Provision aarch64 cross toolchain for the fixture cross build
         run: |
           set -euo pipefail
-          sudo mkdir -p "$RUNNER_TEMP/apt-archives/partial"
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" -o APT::Sandbox::User=root update
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" -o APT::Sandbox::User=root -o APT::Keep-Downloaded-Packages=true install --no-install-recommends -y ninja-build cmake \
+          # A slow mirror can trickle for most of the job without ever timing out,
+          # so bound the download phase, then fall back once to the primary Ubuntu
+          # archive. Every download stays verified against the signed indexes.
+          apt_get_install() {
+            if ! sudo timeout 480 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"; then
+              echo "::warning::apt download exceeded 8 min or failed; retrying on archive.ubuntu.com"
+              sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
+                /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+              sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+              sudo timeout 480 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"
+            fi
+            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install "$@"
+          }
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          apt_get_install --no-install-recommends -y ninja-build cmake \
             g++-aarch64-linux-gnu pkg-config binutils
-          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/apt-archives"
           aarch64-linux-gnu-g++ --version
       - name: Fetch and verify locked GoogleTest archive
         run: |
