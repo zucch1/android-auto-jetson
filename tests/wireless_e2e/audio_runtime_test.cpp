@@ -312,7 +312,7 @@ struct PhonePeer final {
         }
     }
 
-    void handshake_and_open_av(std::int32_t audio_session_id = -7) {
+    void handshake_and_open_av(std::int32_t audio_session_id = -7, bool start_video = true) {
         tr::MessageReassembler plain_reassembler{nullptr, tr::PlaintextAfterHandshake::allow};
         auto recv_plain = [&]() -> aa::core::Result<tr::Message> {
             tcp->set_io_deadline(Clock::now() + 5s);
@@ -386,7 +386,9 @@ struct PhonePeer final {
         ASSERT_TRUE(send_msg(99, proto::encode(proto::AvSinkSetup{proto::AvSinkCodec::h264}).value()));
         ASSERT_TRUE(recv_msg()); // AvSinkReady
         ASSERT_TRUE(recv_msg()); // VideoFocusNotification
-        ASSERT_TRUE(send_msg(99, proto::encode(proto::AvSinkStart{1, 0}).value()));
+        if (start_video) {
+            ASSERT_TRUE(send_msg(99, proto::encode(proto::AvSinkStart{1, 0}).value()));
+        }
 
         ASSERT_TRUE(send_msg(100, proto::encode(proto::AvSinkSetup{}).value()));
         ASSERT_TRUE(recv_msg()); // AvSinkReady
@@ -445,6 +447,7 @@ struct RuntimeFixture final {
     std::mutex state_mutex;
     std::condition_variable state_cv;
     bool session_live{false};
+    bool session_active{false};
 
     void start(
         Clock::time_point deadline = Clock::now() + 20s,
@@ -543,13 +546,21 @@ struct RuntimeFixture final {
             std::nullopt);
         runtime->offered_video_profiles = 1;
         runtime->on_turn_for_test = [this](bool live) {
+            auto* s = live ? receiver->session() : nullptr;
+            const bool active = s && s->state() == aa::session::State::active && s->authenticated();
             std::lock_guard lock(state_mutex);
             session_live = live;
+            session_active = active;
             state_cv.notify_all();
         };
         runtime->on_before_audio_completions_for_test = std::move(on_before_audio_completions);
         runtime->on_after_audio_completions_for_test = std::move(on_after_audio_completions);
         runtime_thread = std::thread([this] { runtime_exit.store(runtime->run()); });
+    }
+
+    bool wait_session_active(std::chrono::milliseconds timeout = std::chrono::seconds{5}) {
+        std::unique_lock lock(state_mutex);
+        return state_cv.wait_for(lock, timeout, [&] { return session_active; });
     }
 
     int join_runtime() {
@@ -2175,6 +2186,411 @@ TEST(WirelessAudioRuntime, ParkedPendingOverflowEnobufsLatchesErrorThroughLaterD
     EXPECT_EQ(exit_code, 1);
     EXPECT_NE(drained_stdout.find("\"event\":\"parked\",\"seq\":255"), std::string::npos);
     EXPECT_EQ(drained_stdout.find("\"event\":\"overflow_257\""), std::string::npos);
+}
+
+TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFailsBounded) {
+    // 1. Checkpoint watchdog triggers during an in-flight ACK send while stdout is fully stalled
+    //    and a sink reopen starts: checkpoint logging must not block and reopen must complete.
+    {
+        wr::running.store(true);
+        int pfd[2]{-1, -1};
+        ASSERT_EQ(::pipe(pfd), 0);
+        int saved_stdout = ::dup(STDOUT_FILENO);
+        ASSERT_GE(saved_stdout, 0);
+
+        {
+            const int flags = ::fcntl(pfd[1], F_GETFL);
+            ASSERT_GE(flags, 0);
+            ASSERT_EQ(::fcntl(pfd[1], F_SETFL, flags | O_NONBLOCK), 0);
+            std::vector<char> fill(4096, 'x');
+            while (::write(pfd[1], fill.data(), fill.size()) > 0) {}
+            ASSERT_EQ(::fcntl(pfd[1], F_SETFL, flags), 0);
+        }
+
+        ASSERT_EQ(::dup2(pfd[1], STDOUT_FILENO), STDOUT_FILENO);
+        ::close(pfd[1]);
+        pfd[1] = -1;
+
+        auto close_pipe_and_restore_stdout = [&] {
+            if (pfd[0] >= 0) {
+                ::close(pfd[0]);
+                pfd[0] = -1;
+            }
+            std::this_thread::sleep_for(20ms);
+            if (saved_stdout >= 0) {
+                ::dup2(saved_stdout, STDOUT_FILENO);
+                ::close(saved_stdout);
+                saved_stdout = -1;
+            }
+        };
+        struct ScopeGuard {
+            std::function<void()> cleanup;
+            ~ScopeGuard() {
+                if (cleanup) cleanup();
+            }
+        } fd_guard{close_pipe_and_restore_stdout};
+
+        bool anchor_stalled = false;
+        bool started_ok = false;
+        bool auth_ok = false;
+        bool connected_ok = false;
+        bool handshake_ok = false;
+        bool session_active_ok = false;
+        bool send1_ok = false;
+        bool entered1_ok = false;
+        bool reopened = false;
+        bool ack1_ok = false;
+        bool deadline_honored = false;
+        int exit_code = -1;
+        std::uint64_t media_backpressure_drops = 0;
+        std::atomic<bool> stop_fill{false};
+        std::atomic<bool> arm_watchdog_on_ack1{false};
+        std::atomic<bool> watchdog_armed{false};
+        std::thread fill_thread;
+
+        {
+            diag::StdoutLogScope logging{wr::running};
+            anchor_stalled = !logging.log.submit("{\"event\":\"stall_anchor\"}");
+
+            RuntimeFixture f;
+            f.gate->block_first_write = true;
+            f.gate->fail_first_write = true;
+            auto on_before = [&](app::WiredSession&, bool) {
+                if (!arm_watchdog_on_ack1.load() || !f.audio_worker->has_completed_for_test()) {
+                    return;
+                }
+                if (arm_watchdog_on_ack1.exchange(false)) {
+                    // Pre-arm watchdog 6s in the past so the very next Runtime::checkpoint()
+                    // inside complete_av_delivery()'s TcpIo::wait() fires while ack_sending_ > 0.
+                    f.runtime->selection_watchdog.reset();
+                    (void)f.runtime->selection_watchdog.check(
+                        true, false, Clock::now() - std::chrono::seconds{6});
+                    watchdog_armed.store(true);
+                }
+            };
+            f.start(Clock::now() + 4000ms, on_before);
+            started_ok = f.runtime != nullptr && !::testing::Test::HasFatalFailure();
+            auth_ok = started_ok && f.backend && f.backend->wait_authorized(1);
+
+            std::unique_ptr<PhonePeer> phone;
+            if (auth_ok) {
+                auto phone_res = PhonePeer::connect(f.port);
+                connected_ok = phone_res.has_value();
+                if (phone_res) {
+                    phone = std::move(phone_res).value();
+                    phone->handshake_and_open_av(-7, /*start_video=*/false);
+                    handshake_ok = !::testing::Test::HasFatalFailure();
+                    if (handshake_ok) {
+                        const auto active_deadline = Clock::now() + 2000ms;
+                        std::int64_t ping_ts = 100;
+                        while (Clock::now() < active_deadline && !f.wait_session_active(20ms)) {
+                            const auto enc = proto::encode(proto::PingRequest{++ping_ts, false, {}});
+                            if (!enc || !phone->send_msg(0, enc.value())) break;
+                            (void)phone->recv_msg(250ms);
+                        }
+                        session_active_ok = f.wait_session_active(100ms);
+                    }
+                }
+            }
+
+            if (session_active_ok) {
+                // Completely fill StdoutLog's lossless queue while stdout remains stalled.
+                std::atomic<std::size_t> filled{0};
+                fill_thread = std::thread([&] {
+                    const std::string filler(200, 'w');
+                    while (!stop_fill.load() && wr::running.load()) {
+                        if (logging.log.submit(filler)) break;
+                        ++filled;
+                    }
+                });
+                std::size_t stable = filled.load();
+                for (int i = 0; i < 40; ++i) {
+                    std::this_thread::sleep_for(10ms);
+                    const std::size_t now = filled.load();
+                    if (now > 0 && now == stable) break;
+                    stable = now;
+                }
+
+                // Send chunk 1 (whose ACK will fire the watchdog inside checkpoint),
+                // wait until it enters the sink and arms the watchdog, then fail write 1 to reopen.
+                arm_watchdog_on_ack1.store(true);
+                send1_ok = phone->send_msg(100, av_data_msg(1'000'000'000ULL, pcm_50ms())).has_value();
+                entered1_ok = send1_ok && f.gate->wait_entered(1, 2000ms);
+                const auto arm_deadline = Clock::now() + 1000ms;
+                while (entered1_ok && !watchdog_armed.load() && Clock::now() < arm_deadline) {
+                    std::this_thread::sleep_for(2ms);
+                }
+                f.gate->release();
+
+                const auto reopen_deadline = Clock::now() + 1500ms;
+                while (entered1_ok && Clock::now() < reopen_deadline) {
+                    {
+                        std::lock_guard lock(f.gate->mutex);
+                        if (f.gate->sinks_opened >= 2U) {
+                            reopened = true;
+                            break;
+                        }
+                    }
+                    std::this_thread::sleep_for(5ms);
+                }
+                if (reopened) {
+                    ack1_ok = phone->wait_audio_ack(-7, 1000ms).has_value();
+                }
+                media_backpressure_drops = logging.log.media_drops().backpressure;
+            }
+
+            if (started_ok) {
+                std::promise<int> exit_promise;
+                auto exit_future = exit_promise.get_future();
+                std::thread waiter([&] { exit_promise.set_value(f.join_runtime()); });
+                if (exit_future.wait_for(7000ms) == std::future_status::ready) {
+                    exit_code = exit_future.get();
+                    deadline_honored = true;
+                    waiter.join();
+                    if (phone) phone->close();
+                    stop_fill.store(true);
+                    close_pipe_and_restore_stdout();
+                    if (fill_thread.joinable()) fill_thread.join();
+                    (void)logging.log.finish(200ms);
+                } else {
+                    wr::running.store(false);
+                    stop_fill.store(true);
+                    close_pipe_and_restore_stdout();
+                    waiter.join();
+                    if (phone) phone->close();
+                    if (fill_thread.joinable()) fill_thread.join();
+                    (void)logging.log.finish(200ms);
+                }
+            } else {
+                wr::running.store(false);
+                stop_fill.store(true);
+                close_pipe_and_restore_stdout();
+                if (fill_thread.joinable()) fill_thread.join();
+                (void)logging.log.finish(200ms);
+            }
+        }
+
+        EXPECT_TRUE(anchor_stalled);
+        EXPECT_TRUE(started_ok);
+        EXPECT_TRUE(auth_ok);
+        EXPECT_TRUE(connected_ok);
+        EXPECT_TRUE(handshake_ok);
+        EXPECT_TRUE(session_active_ok);
+        EXPECT_TRUE(send1_ok);
+        EXPECT_TRUE(entered1_ok);
+        EXPECT_TRUE(watchdog_armed.load());
+        EXPECT_TRUE(reopened) << "Reopen hung while checkpoint logged on stalled stdout";
+        EXPECT_TRUE(ack1_ok);
+        EXPECT_GE(media_backpressure_drops, 1U);
+        EXPECT_TRUE(deadline_honored) << "Runtime hung instead of honoring deadline on stalled stdout";
+        EXPECT_EQ(exit_code, 0);
+    }
+
+    // 2. An in-flight ACK release remains held past the reopen bound while stdout is fully stalled:
+    //    reopen wait must time out, latch timeout, and fail the session through clear-running-first
+    //    within the bound instead of hanging forever.
+    {
+        wr::running.store(true);
+        int pfd[2]{-1, -1};
+        ASSERT_EQ(::pipe(pfd), 0);
+        int saved_stdout = ::dup(STDOUT_FILENO);
+        ASSERT_GE(saved_stdout, 0);
+
+        {
+            const int flags = ::fcntl(pfd[1], F_GETFL);
+            ASSERT_GE(flags, 0);
+            ASSERT_EQ(::fcntl(pfd[1], F_SETFL, flags | O_NONBLOCK), 0);
+            std::vector<char> fill(4096, 'x');
+            while (::write(pfd[1], fill.data(), fill.size()) > 0) {}
+            ASSERT_EQ(::fcntl(pfd[1], F_SETFL, flags), 0);
+        }
+
+        ASSERT_EQ(::dup2(pfd[1], STDOUT_FILENO), STDOUT_FILENO);
+        ::close(pfd[1]);
+        pfd[1] = -1;
+
+        auto restore_stdout_fd = [&] {
+            if (saved_stdout >= 0) {
+                ::dup2(saved_stdout, STDOUT_FILENO);
+                ::close(saved_stdout);
+                saved_stdout = -1;
+            }
+        };
+        auto close_pipe_and_restore_stdout = [&] {
+            if (pfd[0] >= 0) {
+                ::close(pfd[0]);
+                pfd[0] = -1;
+            }
+            std::this_thread::sleep_for(20ms);
+            restore_stdout_fd();
+        };
+        struct ScopeGuard {
+            std::function<void()> cleanup;
+            ~ScopeGuard() {
+                if (cleanup) cleanup();
+            }
+        } fd_guard{close_pipe_and_restore_stdout};
+
+        bool anchor_stalled = false;
+        bool setup_ok = false;
+        std::future_status wait_status = std::future_status::timeout;
+        int exit_code = -1;
+        bool rt_failed = false;
+        bool rt_stopping = false;
+        bool running_after = true;
+        bool ack_held = false;
+        std::optional<aa::Error> worker_error;
+        std::optional<audio::FailureContext> worker_context;
+        std::string drained_stdout;
+        std::atomic<bool> stop_fill{false};
+        std::atomic<bool> arm_hold_ack{false};
+        std::thread fill_thread;
+
+        {
+            diag::StdoutLogScope logging{wr::running};
+            anchor_stalled = !logging.log.submit("{\"event\":\"stall_anchor\"}");
+
+            RuntimeFixture f;
+            f.gate->block_first_write = true;
+            f.gate->fail_first_write = true;
+
+            struct AckHoldGuard {
+                audio::AudioRenderWorker* worker{nullptr};
+                ~AckHoldGuard() {
+                    if (worker) { worker->end_ack_release(); }
+                }
+            } ack_hold;
+
+            auto on_before = [&](app::WiredSession&, bool) {
+                if (!arm_hold_ack.load() || !f.audio_worker->has_completed_for_test()) {
+                    return;
+                }
+                if (arm_hold_ack.exchange(false)) {
+                    std::uint64_t epoch = 0;
+                    const auto completion = f.audio_worker->take_completion_with_epoch(epoch);
+                    if (completion) {
+                        std::optional<aa::Error> rel_fail;
+                        if (f.audio_worker->try_begin_ack_release(*completion, epoch, rel_fail) ==
+                            audio::AudioRenderWorker::AckRelease::send) {
+                            ack_hold.worker = f.audio_worker.get();
+                            ack_held = true;
+                            f.gate->release();
+                        }
+                    }
+                }
+            };
+            // Long 20s deadline so Runtime can only exit promptly via bounded reopen timeout.
+            f.start(Clock::now() + 20s, on_before);
+            const bool started_ok = f.runtime != nullptr && !::testing::Test::HasFatalFailure();
+            const bool auth_ok = started_ok && f.backend && f.backend->wait_authorized(1);
+
+            std::unique_ptr<PhonePeer> phone;
+            if (auth_ok) {
+                auto phone_res = PhonePeer::connect(f.port);
+                if (phone_res) {
+                    phone = std::move(phone_res).value();
+                    phone->handshake_and_open_av(-7);
+                    if (!::testing::Test::HasFatalFailure() &&
+                        phone->send_msg(100, av_data_msg(1'000'000'000ULL, pcm_50ms())) &&
+                        phone->wait_audio_ack(-7) && f.gate->wait_entered(1)) {
+                        setup_ok = true;
+                    }
+                }
+            }
+
+            if (setup_ok) {
+                std::atomic<std::size_t> filled{0};
+                fill_thread = std::thread([&] {
+                    const std::string filler(200, 'b');
+                    while (!stop_fill.load() && wr::running.load()) {
+                        if (logging.log.submit(filler)) break;
+                        ++filled;
+                    }
+                });
+                std::size_t stable = filled.load();
+                for (int i = 0; i < 40; ++i) {
+                    std::this_thread::sleep_for(10ms);
+                    const std::size_t now = filled.load();
+                    if (now > 0 && now == stable) break;
+                    stable = now;
+                }
+
+                arm_hold_ack.store(true);
+                setup_ok = phone->send_msg(100, av_data_msg(1'050'000'000ULL, pcm_50ms())).has_value();
+            }
+
+            if (started_ok) {
+                std::promise<int> done_promise;
+                auto done_future = done_promise.get_future();
+                std::thread waiter([&] { done_promise.set_value(f.join_runtime()); });
+                wait_status = done_future.wait_for(std::chrono::milliseconds{4500});
+                if (wait_status == std::future_status::ready) {
+                    exit_code = done_future.get();
+                    rt_failed = f.runtime->failed;
+                    rt_stopping = f.runtime->stopping;
+                    running_after = wr::running.load();
+                    worker_error = f.audio_worker->failure();
+                    worker_context = f.audio_worker->failure_context();
+                    waiter.join();
+                } else {
+                    wr::running.store(false);
+                    stop_fill.store(true);
+                    if (ack_hold.worker) {
+                        std::exchange(ack_hold.worker, nullptr)->end_ack_release();
+                    }
+                    close_pipe_and_restore_stdout();
+                    waiter.join();
+                }
+            } else {
+                wr::running.store(false);
+                stop_fill.store(true);
+                close_pipe_and_restore_stdout();
+            }
+            if (ack_hold.worker) {
+                std::exchange(ack_hold.worker, nullptr)->end_ack_release();
+            }
+            if (phone) phone->close();
+            stop_fill.store(true);
+            if (fill_thread.joinable()) fill_thread.join();
+
+            if (pfd[0] >= 0) {
+                std::thread reader([&] {
+                    char buf[4096];
+                    for (;;) {
+                        const ssize_t n = ::read(pfd[0], buf, sizeof(buf));
+                        if (n > 0) {
+                            drained_stdout.append(buf, static_cast<std::size_t>(n));
+                        } else if (n < 0 && errno == EINTR) {
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                });
+                (void)logging.log.finish(2500ms);
+                restore_stdout_fd();
+                reader.join();
+                ::close(pfd[0]);
+                pfd[0] = -1;
+            }
+        }
+
+        EXPECT_TRUE(anchor_stalled);
+        EXPECT_TRUE(setup_ok);
+        EXPECT_TRUE(ack_held);
+        EXPECT_EQ(wait_status, std::future_status::ready)
+            << "Reopen hung forever waiting for in-flight ACK release";
+        EXPECT_EQ(exit_code, 1);
+        EXPECT_TRUE(rt_failed);
+        EXPECT_TRUE(rt_stopping);
+        EXPECT_FALSE(running_after);
+        ASSERT_TRUE(worker_error.has_value());
+        EXPECT_EQ(worker_error->code(), aa::ErrorCode::timeout);
+        ASSERT_TRUE(worker_context.has_value());
+        EXPECT_EQ(worker_context->origin, audio::AudioFailureOrigin::reopen_ack_timeout);
+        EXPECT_NE(drained_stdout.find("\"origin\":\"reopen_ack_timeout\""), std::string::npos);
+        EXPECT_NE(drained_stdout.find("\"outcome\":\"reopen_ack_timeout\""), std::string::npos);
+    }
 }
 
 } // namespace

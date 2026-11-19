@@ -114,9 +114,11 @@ core::Nanoseconds AudioRenderWorker::monotonic_now() {
 AudioRenderWorker::AudioRenderWorker(RouterConfig config,
                                      AudioTelemetryCallbacks telemetry,
                                      OpenRouter open,
-                                     IdleClock idle_clock)
+                                     IdleClock idle_clock,
+                                     std::chrono::milliseconds ack_release_timeout)
     : telemetry_(std::move(telemetry)),
       idle_clock_(std::move(idle_clock)),
+      ack_release_timeout_(std::max(std::chrono::milliseconds{1}, ack_release_timeout)),
       thread_([this, config = std::move(config), open = std::move(open)] {
           run(config, open);
       }) {}
@@ -991,7 +993,21 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         }
         cv_.notify_all();
         if (reopen) {
-            cv_.wait(lock, [&] { return ack_sending_ == 0; });
+            const bool drained = cv_.wait_until(
+                lock, Clock::now() + ack_release_timeout_,
+                [&] { return ack_sending_ == 0 || stopping_; });
+            if (!drained || stopping_) {
+                reopen = false;
+                sink_state_ = SinkState::ready;
+                in_flight_ = false;
+                if (stopping_) {
+                    if (bypass_since_) { exit_bypass_locked("stopped"); }
+                } else {
+                    if (bypass_since_) { exit_bypass_locked("reopen_ack_timeout"); }
+                    latch(Error{ErrorCode::timeout}, AudioFailureOrigin::reopen_ack_timeout);
+                }
+                cv_.notify_all();
+            }
         }
         publish_bypass_logs(lock);
         if (same_epoch && diagnostics.completion && completed) { completed(*diagnostics.completion); }

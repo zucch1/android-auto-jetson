@@ -291,6 +291,7 @@ std::string audio_failure_json(const FailureContext& value) {
         case AudioFailureOrigin::router_submit: return "router_submit";
         case AudioFailureOrigin::render_step: return "render_step";
         case AudioFailureOrigin::flush: return "flush";
+        case AudioFailureOrigin::reopen_ack_timeout: return "reopen_ack_timeout";
         }
         return "unknown";
     }();

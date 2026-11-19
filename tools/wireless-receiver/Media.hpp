@@ -65,7 +65,7 @@ class DiagnosticOutput final : public diagnostics::DiagnosticSink {
 public:
     explicit DiagnosticOutput(bool enabled) : enabled_(enabled) {}
     void emit_json(std::string_view json) override {
-        if (enabled_) log_line(diagnostics::diag_event_json(json));
+        if (enabled_) log_line_nonblocking(diagnostics::diag_event_json(json));
     }
 private:
     bool enabled_;
@@ -79,7 +79,7 @@ private:
 // The media endpoints outlive every per-link session; callbacks resolve the
 // current session instead of capturing an address that recovery can invalidate.
 struct Media final {
-    wired_receiver::VideoOutlet video{log_line, log_media};
+    wired_receiver::VideoOutlet video{log_line_nonblocking, log_media};
     audio::AudioRenderWorker& audio;
     channels::InputSink input;
     input::CapabilityDescriptor capabilities{input::CapabilityDescriptor::bench_defaults()};

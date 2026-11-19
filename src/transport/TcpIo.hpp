@@ -17,8 +17,9 @@ struct TcpIo final {
 
     core::Result<void> wait(int fd, short events, const core::CancellationToken& token) const {
         for (;;) {
-            if (checkpoint) checkpoint();
             const core::Deadline deadline{until, token};
+            if (auto checked = deadline.check(); !checked) return checked.error();
+            if (checkpoint) checkpoint();
             if (auto checked = deadline.check(); !checked) return checked.error();
             const auto slice = std::max(std::chrono::milliseconds{1}, checkpoint_interval);
             const auto left = std::chrono::ceil<std::chrono::milliseconds>(
@@ -31,6 +32,7 @@ struct TcpIo final {
                 return Error{ErrorCode::transport_io};
             }
             if (ready == 0) continue;
+            if (auto checked = deadline.check(); !checked) return checked.error();
             if (checkpoint) checkpoint();
             if (auto checked = deadline.check(); !checked) return checked.error();
             if ((descriptor.revents & POLLNVAL) != 0) return Error{ErrorCode::transport_closed};

@@ -48,7 +48,13 @@ struct AudioRejectionSnapshot final {
                                                        const AudioRejectionSnapshot&) = default;
 };
 
-enum class AudioFailureOrigin : std::uint8_t { open, router_submit, render_step, flush };
+enum class AudioFailureOrigin : std::uint8_t {
+    open,
+    router_submit,
+    render_step,
+    flush,
+    reopen_ack_timeout
+};
 
 enum class IdleDisposition : std::uint8_t {
     absent,

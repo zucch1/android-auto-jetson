@@ -709,10 +709,11 @@ int receiver_main(int argc, char **argv) {
 
     auto service_control = [&] {
         if (const auto error = audio_sink.failure()) {
-            log_line(audio_failure_event_json("audio_sink_failure", error->code(), audio_sink.failure_context()));
             (void)session.fail(*error);
             session_failed.store(true);
             g_running.store(false);
+            log_line_nonblocking(audio_failure_event_json(
+                "audio_sink_failure", error->code(), audio_sink.failure_context()));
             return true;
         }
         control.checkpoint();
@@ -775,8 +776,9 @@ int receiver_main(int argc, char **argv) {
         const bool has_selection = session.selected_video_profile().has_value();
         if (selection_watchdog.check(session_ready, has_selection,
                                      std::chrono::steady_clock::now())) {
-            log_line(aa::ipc::video_selection_timeout_json(
-                aa::ipc::kVideoSelectionWarningTimeout, video_profiles.size()));
+            log_media("video_selection_timeout",
+                      aa::ipc::video_selection_timeout_json(
+                          aa::ipc::kVideoSelectionWarningTimeout, video_profiles.size()));
         }
         return true;
     };

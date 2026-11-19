@@ -14,6 +14,7 @@
 #include <aa/protocol/Protocol.hpp>
 
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -37,16 +38,20 @@ public:
     using IdleClock = std::function<core::Nanoseconds()>;
     using OpenRouter = std::function<core::Result<AudioRouter>(const RouterConfig&)>;
 
+    static constexpr std::chrono::milliseconds kDefaultAckReleaseDrainTimeout{1000};
+
     std::function<void(const std::array<std::size_t, 4>&, bool, bool,
                        const RouterReport&)> on_idle_observed_for_test;
     std::function<void(const channels::AvDeliveryId&)> on_completion_dequeued_for_test;
 
     [[nodiscard]] static core::Nanoseconds monotonic_now();
 
-    explicit AudioRenderWorker(RouterConfig config,
-                               AudioTelemetryCallbacks telemetry = {},
-                               OpenRouter open = AudioRouter::open,
-                               IdleClock idle_clock = monotonic_now);
+    explicit AudioRenderWorker(
+        RouterConfig config,
+        AudioTelemetryCallbacks telemetry = {},
+        OpenRouter open = AudioRouter::open,
+        IdleClock idle_clock = monotonic_now,
+        std::chrono::milliseconds ack_release_timeout = kDefaultAckReleaseDrainTimeout);
     ~AudioRenderWorker();
     AudioRenderWorker(const AudioRenderWorker&) = delete;
     AudioRenderWorker& operator=(const AudioRenderWorker&) = delete;
@@ -215,6 +220,7 @@ private:
     bool stopping_{};
     bool stopped_{};
     const IdleClock idle_clock_;
+    const std::chrono::milliseconds ack_release_timeout_;
     bool output_established_{};
     std::optional<core::Nanoseconds> idle_since_;
     std::optional<std::uint64_t> idle_resume_id_;

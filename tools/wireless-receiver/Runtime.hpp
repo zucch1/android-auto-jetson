@@ -60,7 +60,7 @@ struct Runtime final {
         }
         if (!audio_failure_reported) {
             audio_failure_reported = true;
-            log_line(audio::audio_failure_event_json(
+            log_line_nonblocking(audio::audio_failure_event_json(
                 "audio_sink_failure", error->code(), media.audio.failure_context()));
         }
         return true;
@@ -105,6 +105,11 @@ struct Runtime final {
     }
 
     void checkpoint() {
+        if (!running.load() || Clock::now() >= deadline) stop_runtime();
+        if (stopping) {
+            if (auto* session = receiver.session()) session->request_stop();
+            return;
+        }
         if (auto* session = receiver.session(); session && session != configured) {
             configured = session;
             if (auto bound = media.bind(*session); !bound) {
@@ -112,11 +117,15 @@ struct Runtime final {
             }
         }
         service_audio_completions_if_ready();
+        if (!running.load() || Clock::now() >= deadline) stop_runtime();
+        if (stopping) {
+            if (auto* session = receiver.session()) session->request_stop();
+            return;
+        }
         receiver.set_io_checkpoint_interval(
             (media.video.has_pending() || media.audio.outstanding())
                 ? std::chrono::milliseconds{5}
                 : std::chrono::milliseconds{25});
-        if (!running.load() || Clock::now() >= deadline) stop_runtime();
         if (auto step = bus.cycle(core::Milliseconds{0}); !step) {
             report("session bus dispatch", step.error().code()); failed = true; stop_runtime();
         }
@@ -154,16 +163,19 @@ struct Runtime final {
         const bool has_selection =
             live_session && live_session->selected_video_profile().has_value();
         if (selection_watchdog.check(session_ready, has_selection, Clock::now())) {
-            log_line(ipc::video_selection_timeout_json(
-                ipc::kVideoSelectionWarningTimeout, offered_video_profiles));
+            log_media("video_selection_timeout",
+                      ipc::video_selection_timeout_json(
+                          ipc::kVideoSelectionWarningTimeout, offered_video_profiles));
         }
         // Owner loss is handled by WirelessConfirmation's confirmed-ACTIVE grace.
         // An explicit StopProjection by the still-live owner is immediate.
         if (stopping || (state.consumer.value && state.projection == ipc::ProjectionState::stopped)) {
             if (auto* session = receiver.session()) session->request_stop();
         }
-        auto producer = video_server.accept_consumer(core::Milliseconds{0});
-        if (producer) media.video.install(std::move(producer.value()));
+        if (!recovery_session || !recovery_session->outbound_in_progress()) {
+            auto producer = video_server.accept_consumer(core::Milliseconds{0});
+            if (producer) media.video.install(std::move(producer.value()));
+        }
         if (!input) {
             auto accepted = input_server.accept_sender(core::Milliseconds{0});
             if (accepted) input.emplace(std::move(accepted.value()));
