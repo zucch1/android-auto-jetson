@@ -31,6 +31,7 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -424,6 +425,7 @@ struct RuntimeFixture final {
     std::jthread helper_pump;
     std::unique_ptr<helper::BusClient> helper_client;
     std::shared_ptr<SinkGate> gate{std::make_shared<SinkGate>()};
+    audio::AudioRenderWorker::OpenRouter custom_open{};
     std::unique_ptr<audio::AudioRenderWorker> audio_worker;
     std::unique_ptr<wr::DiagnosticOutput> diag_out;
     std::unique_ptr<aa::diagnostics::Diagnostics> diagnostics;
@@ -486,7 +488,7 @@ struct RuntimeFixture final {
 
         audio_worker = std::make_unique<audio::AudioRenderWorker>(
             wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
-            make_gated_router(gate));
+            custom_open ? custom_open : make_gated_router(gate));
         ASSERT_TRUE(audio_worker->ready());
 
         diag_out = std::make_unique<wr::DiagnosticOutput>(true);
@@ -1687,6 +1689,492 @@ TEST(WirelessAudioRuntime, SynchronousAudioSinkBaselineVsRenderWorkerBehavior) {
         worker.stop();
         EXPECT_TRUE(worker.finish());
     }
+}
+
+TEST(WirelessAudioRuntime, AckDequeuedBeforeReopenIsHeldUntilReopenCompletes) {
+    // 1. Deterministic wire-level check: service_audio_completions() dequeues chunk 2 just
+    //    before SinkState::reopening is set, then holds the ACK until reopen finishes.
+    {
+        auto gate = std::make_shared<SinkGate>();
+        gate->block_first_write = true;
+        gate->fail_first_write = true;
+        std::mutex reopen_mutex;
+        std::condition_variable reopen_cv;
+        std::size_t open_calls = 0;
+        bool reopen_entered = false;
+        bool release_reopen = false;
+        struct ReopenGuard {
+            std::mutex& m;
+            std::condition_variable& cv;
+            bool& release;
+            ~ReopenGuard() {
+                std::lock_guard lock(m);
+                release = true;
+                cv.notify_all();
+            }
+        } reopen_guard{reopen_mutex, reopen_cv, release_reopen};
+
+        audio::AudioRenderWorker worker{
+            wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
+            [&](const audio::RouterConfig& config) {
+                bool is_reopen = false;
+                {
+                    std::lock_guard lock(reopen_mutex);
+                    ++open_calls;
+                    is_reopen = open_calls >= 2U;
+                    if (is_reopen) {
+                        reopen_entered = true;
+                        reopen_cv.notify_all();
+                    }
+                }
+                if (is_reopen) {
+                    std::unique_lock lock(reopen_mutex);
+                    (void)reopen_cv.wait_for(lock, 5s, [&] { return release_reopen; });
+                }
+                return make_gated_router(gate)(config);
+            }};
+        ASSERT_TRUE(worker.ready());
+
+        ss::test::MapTrustStore trust;
+        ss::test::ManualClock clock;
+        wiredtest::CaptureSink dcapture;
+        aa::diagnostics::Diagnostics diagnostics{dcapture};
+        wiredtest::ScriptedTransport transport;
+        app::WiredSession session{{trust, clock, diagnostics}};
+
+        const aa::trust::PhoneIdentity phone{"reopen-ack-phone"};
+        trust.set(phone, aa::trust::Decision::approved);
+        wr::Media media{worker};
+        ASSERT_TRUE(session.configure(media.config().services));
+        ASSERT_TRUE(media.bind(session));
+
+        session.attach_transport(&transport);
+        auto owned = std::make_unique<wiredtest::FakeHandshakeCipher>();
+        auto* cipher = owned.get();
+        session.attach_cipher(std::move(owned));
+        ASSERT_TRUE(session.apply(ss::Event::start_discovery));
+        ASSERT_TRUE(session.phone_discovered(phone));
+        ASSERT_TRUE(session.apply(ss::Event::transport_ready));
+        wiredtest::walk_auth(session, transport);
+        ASSERT_TRUE(session.announce_services());
+        for (const std::int32_t s : {99, 100, 101, 102, 104}) {
+            transport.push_inbound(wiredtest::open_request_frame(s));
+            ASSERT_TRUE(session.poll_transport());
+        }
+        ASSERT_TRUE(session.apply(ss::Event::negotiation_succeeded));
+
+        auto push_enc = [&](std::uint8_t ch, std::vector<std::byte> payload) {
+            auto frames = tr::encode_message(
+                {ch, tr::MessageKind::specific, std::move(payload)},
+                tr::Encryption::encrypted, cipher);
+            ASSERT_TRUE(frames);
+            for (auto& fr : frames.value()) transport.push_inbound(std::move(fr));
+        };
+        push_enc(100, proto::encode(proto::AvSinkSetup{}).value());
+        ASSERT_TRUE(session.poll_transport());
+        push_enc(100, proto::encode(proto::AvSinkStart{-7, 0}).value());
+        ASSERT_TRUE(session.poll_transport());
+
+        // Chunk 1 blocks inside GatedSink::write() and sends its ACK.
+        push_enc(100, av_data_msg(1'000'000'000ULL, pcm_50ms()));
+        ASSERT_TRUE(session.poll_transport());
+        ASSERT_TRUE(app::service_audio_completions(session, worker, false));
+        ASSERT_TRUE(gate->wait_entered(1));
+        const std::size_t sent_before_chunk2 = transport.sent_count();
+
+        std::atomic<bool> arm_reopen_on_dequeue{true};
+        std::atomic<bool> hook_fired{false};
+        worker.on_completion_dequeued_for_test = [&](const aa::channels::AvDeliveryId&) {
+            if (!arm_reopen_on_dequeue.exchange(false)) { return; }
+            hook_fired.store(true);
+            gate->release();
+            std::unique_lock lock(reopen_mutex);
+            (void)reopen_cv.wait_for(lock, 5s, [&] { return reopen_entered; });
+        };
+
+        // Chunk 2 completion is dequeued before reopening, then held while reopen is active.
+        push_enc(100, av_data_msg(1'050'000'000ULL, pcm_50ms()));
+        ASSERT_TRUE(session.poll_transport());
+        ASSERT_TRUE(app::service_audio_completions(session, worker, false));
+        EXPECT_TRUE(hook_fired.load());
+        EXPECT_EQ(transport.sent_count(), sent_before_chunk2)
+            << "ACK dequeued just before reopen must not be sent during reopen";
+
+        // Repeated completion pumping during reopen still must not emit the ACK.
+        ASSERT_TRUE(app::service_audio_completions(session, worker, false));
+        EXPECT_EQ(transport.sent_count(), sent_before_chunk2);
+        EXPECT_TRUE(worker.has_completed_for_test());
+
+        {
+            std::lock_guard lock(reopen_mutex);
+            release_reopen = true;
+            reopen_cv.notify_all();
+        }
+        const auto ack_deadline = Clock::now() + 2s;
+        while (Clock::now() < ack_deadline && transport.sent_count() == sent_before_chunk2) {
+            ASSERT_TRUE(app::service_audio_completions(session, worker, false));
+            std::this_thread::sleep_for(2ms);
+        }
+        EXPECT_EQ(transport.sent_count(), sent_before_chunk2 + 1U)
+            << "Held ACK must be sent once sink reopen completes";
+
+        worker.stop();
+        EXPECT_TRUE(worker.finish());
+    }
+
+    // 2. End-to-end Runtime + PhonePeer TCP check across sink reopen.
+    StdoutCapture capture;
+    std::string output;
+    int exit_code = -1;
+    std::mutex reopen_mutex;
+    std::condition_variable reopen_cv;
+    std::size_t open_calls = 0;
+    bool reopen_entered = false;
+    bool release_reopen = false;
+    bool hook_finished = false;
+    std::atomic<bool> arm_reopen_on_dequeue{false};
+    std::atomic<bool> hook_fired{false};
+    std::atomic<std::size_t> serviced_during_reopen{0};
+    struct ReopenGuard {
+        std::mutex& m;
+        std::condition_variable& cv;
+        bool& release;
+        ~ReopenGuard() {
+            std::lock_guard lock(m);
+            release = true;
+            cv.notify_all();
+        }
+    } reopen_guard{reopen_mutex, reopen_cv, release_reopen};
+
+    {
+        RuntimeFixture f;
+        f.gate->block_first_write = true;
+        f.gate->fail_first_write = true;
+        f.custom_open = [&](const audio::RouterConfig& config) {
+            bool is_reopen = false;
+            {
+                std::lock_guard lock(reopen_mutex);
+                ++open_calls;
+                is_reopen = open_calls >= 2U;
+                if (is_reopen) {
+                    reopen_entered = true;
+                    reopen_cv.notify_all();
+                }
+            }
+            if (is_reopen) {
+                std::unique_lock lock(reopen_mutex);
+                (void)reopen_cv.wait_for(lock, 5s, [&] { return release_reopen; });
+            }
+            return make_gated_router(f.gate)(config);
+        };
+
+        auto on_after = [&](app::WiredSession&, bool, const aa::core::Result<void>&) {
+            std::lock_guard lock(reopen_mutex);
+            if (reopen_entered && !release_reopen && hook_finished) {
+                ++serviced_during_reopen;
+            }
+        };
+        ASSERT_NO_FATAL_FAILURE(f.start(Clock::now() + 20s, {}, on_after));
+        f.audio_worker->on_completion_dequeued_for_test =
+            [&](const aa::channels::AvDeliveryId&) {
+                if (!arm_reopen_on_dequeue.exchange(false)) { return; }
+                hook_fired.store(true);
+                f.gate->release();
+                {
+                    std::unique_lock lock(reopen_mutex);
+                    (void)reopen_cv.wait_for(lock, 5s, [&] { return reopen_entered; });
+                    hook_finished = true;
+                }
+                reopen_cv.notify_all();
+            };
+
+        ASSERT_TRUE(f.backend->wait_authorized(1));
+        auto phone_res = PhonePeer::connect(f.port);
+        ASSERT_TRUE(phone_res);
+        auto phone = std::move(phone_res).value();
+        ASSERT_NO_FATAL_FAILURE(phone->handshake_and_open_av(-7));
+
+        ASSERT_TRUE(phone->send_msg(100, av_data_msg(1'000'000'000ULL, pcm_50ms())));
+        ASSERT_TRUE(phone->wait_audio_ack(-7));
+        ASSERT_TRUE(f.gate->wait_entered(1));
+
+        arm_reopen_on_dequeue.store(true);
+        ASSERT_TRUE(phone->send_msg(100, av_data_msg(1'050'000'000ULL, pcm_50ms())));
+        {
+            std::unique_lock lock(reopen_mutex);
+            ASSERT_TRUE(reopen_cv.wait_for(lock, 5s, [&] {
+                return reopen_entered && hook_finished;
+            }));
+        }
+        EXPECT_TRUE(hook_fired.load());
+
+        // Let Runtime execute multiple completion turns while reopen remains held blocked.
+        const auto hold_deadline = Clock::now() + 1s;
+        while (Clock::now() < hold_deadline && serviced_during_reopen.load() < 3U) {
+            std::this_thread::sleep_for(5ms);
+        }
+        EXPECT_GE(serviced_during_reopen.load(), 3U);
+        bool seq2_acked_during_reopen = false;
+        {
+            const auto snap = f.audio_worker->credit_observation_for_test();
+            for (std::size_t i = 0; i < snap.size; ++i) {
+                const auto& ev = snap.events[i];
+                if (ev.observation.event == aa::channels::AvCreditEvent::ack &&
+                    ev.observation.delivery.sequence >= 2U) {
+                    seq2_acked_during_reopen = true;
+                }
+            }
+        }
+        const bool completed_still_held = f.audio_worker->has_completed_for_test();
+
+        // Finish reopen; held ACK 2 must now arrive on the peer socket, and chunk 3 must render.
+        {
+            std::lock_guard lock(reopen_mutex);
+            release_reopen = true;
+            reopen_cv.notify_all();
+        }
+        const bool ack_sent_after_reopen = phone->wait_audio_ack(-7, 2s).has_value();
+        const bool chunk3_sent =
+            phone->send_msg(100, av_data_msg(1'100'000'000ULL, pcm_50ms())).has_value();
+        const bool chunk3_acked = chunk3_sent && phone->wait_audio_ack(-7, 2s).has_value();
+        const bool worker_idle = f.audio_worker->wait_idle(Clock::now() + 2s);
+        bool write_completed = false;
+        {
+            std::unique_lock lock(f.gate->mutex);
+            write_completed = f.gate->cv.wait_for(
+                lock, 2s, [&] { return f.gate->writes_completed >= 1U; });
+        }
+        EXPECT_TRUE(f.consumer_client->stop_projection());
+        phone->close();
+        exit_code = f.stop_and_join();
+        output = capture.stop();
+        EXPECT_FALSE(seq2_acked_during_reopen)
+            << "ACK dequeued just before reopen must not be sent during reopen";
+        EXPECT_TRUE(completed_still_held);
+        EXPECT_TRUE(ack_sent_after_reopen)
+            << "Held ACK must be sent once sink reopen completes";
+        EXPECT_TRUE(chunk3_sent);
+        EXPECT_TRUE(chunk3_acked);
+        EXPECT_TRUE(worker_idle);
+        EXPECT_TRUE(write_completed);
+    }
+    EXPECT_EQ(exit_code, 0) << output;
+    EXPECT_GE(open_calls, 2U);
+}
+
+struct StalledStdoutProbe final {
+    static inline std::mutex mutex;
+    static inline std::condition_variable cv;
+    static inline bool released{false};
+    static inline std::size_t calls{0};
+    static inline std::string written;
+
+    static void reset() {
+        std::lock_guard lock(mutex);
+        released = false;
+        calls = 0;
+        written.clear();
+    }
+    static void release() {
+        std::lock_guard lock(mutex);
+        released = true;
+        cv.notify_all();
+    }
+    static bool wait_entered(std::size_t count) {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, 5s, [&] { return calls >= count; });
+    }
+    static ssize_t write(int, const void* buf, std::size_t len) {
+        {
+            std::unique_lock lock(mutex);
+            ++calls;
+            cv.notify_all();
+            if (calls == 1U) {
+                (void)cv.wait_for(lock, 5s, [&] { return released; });
+            }
+            written.append(static_cast<const char*>(buf), len);
+        }
+        return static_cast<ssize_t>(len);
+    }
+};
+
+TEST(WirelessAudioRuntime, StdoutLogFifoFairPendingLosslessIsNotOvertakenBySmallerRecords) {
+    StalledStdoutProbe::reset();
+    std::atomic<bool> running{true};
+    diag::StdoutLog log{running, &StalledStdoutProbe::write, &diag::StdoutLog::Clock::now,
+                        {1e9, 1e9}};
+
+    const std::string anchor = "{\"event\":\"anchor\"}";
+    ASSERT_FALSE(log.submit(anchor));
+    ASSERT_TRUE(StalledStdoutProbe::wait_entered(1));
+
+    // Fill queue until exactly 100 bytes remain free in byte_capacity.
+    const std::size_t anchor_charge = anchor.size() + 1;
+    const std::string filler(diag::StdoutLog::byte_capacity - anchor_charge - 100 - 1, 'F');
+    ASSERT_FALSE(log.submit(filler));
+
+    // A 300-byte non-blocking lossless record exceeds the 100 free bytes and parks.
+    const std::string parked_300(300, 'P');
+    ASSERT_FALSE(log.submit_pending(parked_300));
+    EXPECT_EQ(log.pending_lossless(), 1U);
+
+    // Smaller media telemetry (21 bytes) would fit the 100 free bytes, but must drop cleanly
+    // instead of overtaking the parked lossless record.
+    const std::string small_media(20, 'M');
+    ASSERT_FALSE(log.submit_media("audio_write_completed", small_media));
+    EXPECT_EQ(log.media_drops().backpressure, 1U);
+
+    // A smaller lossless submit (29 bytes) must also wait behind the parked head.
+    const std::string small_lossless = "{\"event\":\"after_park\"}";
+    std::promise<std::error_code> small_promise;
+    auto small_future = small_promise.get_future();
+    std::thread small_submitter([&] { small_promise.set_value(log.submit(small_lossless)); });
+    EXPECT_EQ(small_future.wait_for(80ms), std::future_status::timeout)
+        << "Smaller lossless record overtook parked pending_lossless head";
+
+    StalledStdoutProbe::release();
+    ASSERT_EQ(small_future.wait_for(5s), std::future_status::ready);
+    small_submitter.join();
+    EXPECT_FALSE(small_future.get());
+    EXPECT_FALSE(log.finish());
+
+    std::string output;
+    {
+        std::lock_guard lock(StalledStdoutProbe::mutex);
+        output = StalledStdoutProbe::written;
+    }
+    const auto parked_pos = output.find(parked_300);
+    const auto small_pos = output.find(small_lossless);
+    ASSERT_NE(parked_pos, std::string::npos);
+    ASSERT_NE(small_pos, std::string::npos);
+    EXPECT_LT(parked_pos, small_pos);
+    EXPECT_EQ(output.find(small_media), std::string::npos);
+}
+
+TEST(WirelessAudioRuntime, ParkedPendingOverflowEnobufsLatchesErrorThroughLaterDrain) {
+    wr::running.store(true);
+    int pfd[2]{-1, -1};
+    ASSERT_EQ(::pipe(pfd), 0);
+    int saved_stdout = ::dup(STDOUT_FILENO);
+    ASSERT_GE(saved_stdout, 0);
+
+    {
+        const int flags = ::fcntl(pfd[1], F_GETFL);
+        ASSERT_GE(flags, 0);
+        ASSERT_EQ(::fcntl(pfd[1], F_SETFL, flags | O_NONBLOCK), 0);
+        std::vector<char> fill(4096, 'x');
+        while (::write(pfd[1], fill.data(), fill.size()) > 0) {}
+        ASSERT_EQ(::fcntl(pfd[1], F_SETFL, flags), 0);
+    }
+
+    ASSERT_EQ(::dup2(pfd[1], STDOUT_FILENO), STDOUT_FILENO);
+    ::close(pfd[1]);
+    pfd[1] = -1;
+
+    auto restore_stdout_fd = [&] {
+        if (saved_stdout >= 0) {
+            ::dup2(saved_stdout, STDOUT_FILENO);
+            ::close(saved_stdout);
+            saved_stdout = -1;
+        }
+    };
+    auto close_pipe_and_restore_stdout = [&] {
+        if (pfd[0] >= 0) {
+            ::close(pfd[0]);
+            pfd[0] = -1;
+        }
+        std::this_thread::sleep_for(20ms);
+        restore_stdout_fd();
+    };
+    struct ScopeGuard {
+        std::function<void()> cleanup;
+        ~ScopeGuard() {
+            if (cleanup) cleanup();
+        }
+    } fd_guard{close_pipe_and_restore_stdout};
+
+    int exit_code = -1;
+    bool authorized = false;
+    bool rt_failed = false;
+    std::size_t pending_before_overflow = 0;
+    bool running_before_overflow = false;
+    bool running_after_overflow = true;
+    std::error_code finish_error;
+    std::error_code latched_during_stall;
+    std::error_code latched_after_drain;
+    std::uint64_t shutdown_drops = 999;
+    std::string drained_stdout;
+
+    {
+        diag::StdoutLogScope logging{wr::running};
+        const bool anchor_ok = !logging.log.submit("{\"event\":\"stall_anchor\"}");
+
+        RuntimeFixture f;
+        f.start(Clock::now() + 10s);
+        authorized = anchor_ok && f.backend && f.backend->wait_authorized(1);
+
+        if (authorized) {
+            // Leave < 200 bytes free in byte_capacity without blocking submit().
+            const std::string bulk(diag::StdoutLog::byte_capacity - 4096, 'q');
+            (void)logging.log.submit(bulk);
+            const std::string pad(255, 'p');
+            for (int i = 0; i < 15; ++i) {
+                (void)logging.log.submit(pad);
+            }
+            for (std::size_t i = 0; i < diag::StdoutLog::pending_lossless_capacity; ++i) {
+                wr::log_line_nonblocking("{\"event\":\"parked\",\"seq\":" + std::to_string(i) +
+                                         ",\"pad\":\"" + std::string(180, 'x') + "\"}");
+            }
+            pending_before_overflow = logging.log.pending_lossless();
+            running_before_overflow = wr::running.load();
+
+            // 257th record overflows pending_lossless with ENOBUFS, latching error and stopping runtime.
+            wr::log_line_nonblocking("{\"event\":\"overflow_257\",\"pad\":\"" +
+                                     std::string(180, 'y') + "\"}");
+            running_after_overflow = wr::running.load();
+            latched_during_stall = logging.log.latched_error();
+        } else {
+            wr::running.store(false);
+        }
+
+        // Now stdout recovers and drains every queued/parked record cleanly.
+        std::thread reader([&] {
+            char buf[4096];
+            for (;;) {
+                const ssize_t n = ::read(pfd[0], buf, sizeof(buf));
+                if (n > 0) {
+                    drained_stdout.append(buf, static_cast<std::size_t>(n));
+                } else if (n < 0 && errno == EINTR) {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        });
+
+        exit_code = f.join_runtime();
+        rt_failed = f.runtime ? f.runtime->failed : false;
+        finish_error = logging.log.finish(2500ms);
+        latched_after_drain = logging.log.latched_error();
+        shutdown_drops = logging.log.shutdown_drops();
+        restore_stdout_fd();
+        reader.join();
+        ::close(pfd[0]);
+        pfd[0] = -1;
+    }
+
+    ASSERT_TRUE(authorized);
+    EXPECT_EQ(pending_before_overflow, diag::StdoutLog::pending_lossless_capacity);
+    EXPECT_TRUE(running_before_overflow);
+    EXPECT_FALSE(running_after_overflow);
+    EXPECT_EQ(latched_during_stall.value(), ENOBUFS);
+    EXPECT_EQ(latched_after_drain.value(), ENOBUFS);
+    EXPECT_EQ(finish_error.value(), ENOBUFS);
+    EXPECT_EQ(shutdown_drops, 0U);
+    EXPECT_TRUE(rt_failed);
+    EXPECT_EQ(exit_code, 1);
+    EXPECT_NE(drained_stdout.find("\"event\":\"parked\",\"seq\":255"), std::string::npos);
+    EXPECT_EQ(drained_stdout.find("\"event\":\"overflow_257\""), std::string::npos);
 }
 
 } // namespace

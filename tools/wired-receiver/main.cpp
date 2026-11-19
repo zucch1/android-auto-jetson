@@ -1145,6 +1145,10 @@ int receiver_main(int argc, char **argv) {
              ",\"channel_opens\":" + std::to_string(session.channel_opens()) +
              ",\"version_responses\":" + std::to_string(session.version_responses()) +
              ",\"unhandled_controls\":" + std::to_string(session.unhandled_controls()) + "}");
+    if (const auto *writer = aa::wired_receiver::active_stdout_log.load();
+        writer && writer->latched_error()) {
+        runtime_failed = true;
+    }
     return runtime_failed || session_failed.load() ? 1 : 0;
 }
 } // namespace

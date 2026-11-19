@@ -313,6 +313,13 @@ void AudioRenderWorker::begin_session() {
 
 std::optional<channels::AvDeliveryId>
 AudioRenderWorker::take_completion(Clock::time_point until) {
+    std::uint64_t unused_epoch = 0;
+    return take_completion_with_epoch(unused_epoch, until);
+}
+
+std::optional<channels::AvDeliveryId>
+AudioRenderWorker::take_completion_with_epoch(std::uint64_t& session_epoch,
+                                              Clock::time_point until) {
     std::unique_lock lock(mutex_);
     maybe_bypass_locked(monotonic_now());
     cv_.wait_until(lock, until, [&] {
@@ -324,9 +331,42 @@ AudioRenderWorker::take_completion(Clock::time_point until) {
         completion = completed_.front();
         record_credit_locked(credit_event(channels::AvCreditEvent::taken, *completion));
         completed_.pop_front();
+        session_epoch = session_epoch_;
     }
     publish_bypass_logs(lock);
+    if (completion && on_completion_dequeued_for_test) {
+        on_completion_dequeued_for_test(*completion);
+    }
     return completion;
+}
+
+AudioRenderWorker::AckRelease AudioRenderWorker::try_begin_ack_release(
+    const channels::AvDeliveryId& completion,
+    std::uint64_t dequeued_epoch,
+    std::optional<Error>& out_failure) {
+    std::lock_guard lock(mutex_);
+    if (failure_) {
+        out_failure = failure_;
+        return AckRelease::failed;
+    }
+    const auto idx = audio_index(completion.role);
+    if (stopping_ || stopped_ || dequeued_epoch != session_epoch_ ||
+        !idx || generations_[*idx] != completion.generation) {
+        return AckRelease::stopped_or_stale;
+    }
+    if (sink_state_ == SinkState::reopening) {
+        completed_.push_front(completion);
+        cv_.notify_all();
+        return AckRelease::deferred;
+    }
+    ++ack_sending_;
+    return AckRelease::send;
+}
+
+void AudioRenderWorker::end_ack_release() {
+    std::lock_guard lock(mutex_);
+    if (ack_sending_ > 0) { --ack_sending_; }
+    cv_.notify_all();
 }
 
 std::optional<Error> AudioRenderWorker::failure() const {
@@ -950,6 +990,9 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             }
         }
         cv_.notify_all();
+        if (reopen) {
+            cv_.wait(lock, [&] { return ack_sending_ == 0; });
+        }
         publish_bypass_logs(lock);
         if (same_epoch && diagnostics.completion && completed) { completed(*diagnostics.completion); }
         diagnostics.publish();

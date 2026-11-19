@@ -39,6 +39,7 @@ public:
 
     std::function<void(const std::array<std::size_t, 4>&, bool, bool,
                        const RouterReport&)> on_idle_observed_for_test;
+    std::function<void(const channels::AvDeliveryId&)> on_completion_dequeued_for_test;
 
     [[nodiscard]] static core::Nanoseconds monotonic_now();
 
@@ -60,8 +61,18 @@ public:
     // WiredSession binds on reconnect while keeping the opened audio route.
     void begin_session();
 
+    enum class AckRelease : std::uint8_t { send, deferred, stopped_or_stale, failed };
+
     [[nodiscard]] std::optional<channels::AvDeliveryId>
     take_completion(Clock::time_point until = Clock::now());
+    [[nodiscard]] std::optional<channels::AvDeliveryId>
+    take_completion_with_epoch(std::uint64_t& session_epoch,
+                               Clock::time_point until = Clock::now());
+    [[nodiscard]] AckRelease
+    try_begin_ack_release(const channels::AvDeliveryId& completion,
+                          std::uint64_t dequeued_epoch,
+                          std::optional<Error>& out_failure);
+    void end_ack_release();
 
     [[nodiscard]] std::optional<Error> failure() const;
     [[nodiscard]] std::optional<FailureContext> failure_context() const;
@@ -195,6 +206,7 @@ private:
     AudioRouter* router_{};
     bool in_flight_{};
     SinkState sink_state_{SinkState::ready};
+    unsigned ack_sending_{0};
     std::optional<AudioRejectionSnapshot> frozen_rejection_;
     AvCreditLedger credit_ledger_;
     std::optional<RouterReport> final_report_;

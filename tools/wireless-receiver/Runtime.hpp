@@ -304,6 +304,10 @@ struct Runtime final {
             failed = true;
         }
         log_line("{\"event\":\"stopping\"}");
+        if (const auto* writer = diagnostics::active_stdout_log.load();
+            writer && writer->latched_error()) {
+            failed = true;
+        }
         return failed ? 1 : 0;
     }
 };

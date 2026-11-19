@@ -42,7 +42,8 @@ core::Result<void> service_audio_completions(WiredSession& session,
             if (fail_session) { (void)session.fail(*error); }
             return *error;
         }
-        const auto completion = audio.take_completion();
+        std::uint64_t dequeued_epoch = 0;
+        const auto completion = audio.take_completion_with_epoch(dequeued_epoch);
         if (!completion) {
             if (const auto error = audio.failure()) {
                 if (fail_session) { (void)session.fail(*error); }
@@ -50,10 +51,24 @@ core::Result<void> service_audio_completions(WiredSession& session,
             }
             return {};
         }
-        if (const auto error = audio.failure()) {
-            if (fail_session) { (void)session.fail(*error); }
-            return *error;
+        std::optional<Error> release_failure;
+        const auto release =
+            audio.try_begin_ack_release(*completion, dequeued_epoch, release_failure);
+        if (release == audio::AudioRenderWorker::AckRelease::failed) {
+            const auto error = release_failure.value_or(Error{ErrorCode::internal});
+            if (fail_session) { (void)session.fail(error); }
+            return error;
         }
+        if (release == audio::AudioRenderWorker::AckRelease::deferred) {
+            return {};
+        }
+        if (release == audio::AudioRenderWorker::AckRelease::stopped_or_stale) {
+            continue;
+        }
+        struct AckReleaseGuard {
+            audio::AudioRenderWorker& worker;
+            ~AckReleaseGuard() { worker.end_ack_release(); }
+        } release_guard{audio};
         if (auto delivered = session.complete_av_delivery(*completion, {}); !delivered) {
             return delivered.error();
         }

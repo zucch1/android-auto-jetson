@@ -101,11 +101,12 @@ public:
             const bool newline = count < byte_capacity && offset + count == record.size();
             const auto charge = count + static_cast<std::size_t>(newline);
             std::unique_lock lock(s.mutex);
+            s.promote_pending();
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
-            s.waiting = !s.space(charge) && !s.error && !s.closed;
+            s.waiting = !s.can_admit_direct(charge) && !s.error && !s.closed;
             s.changed.notify_all();
 #endif
-            const bool waited = !s.error && !s.closed && !s.space(charge);
+            const bool waited = !s.error && !s.closed && !s.can_admit_direct(charge);
             const bool admitted = s.wait_for_space(lock, charge);
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
             s.waiting = false;
@@ -141,11 +142,14 @@ public:
             ++s.drops.rate_limited;
             return {};
         }
+        s.promote_pending();
         s.report_drops_if_due(at, false);
         const auto charge = record.size() + 1;
-        // A chunked oversize record must stay contiguous, and a full queue must
-        // never make a media thread wait for the sink.
-        if (s.chunked || record.size() >= byte_capacity || !s.space(charge)) {
+        // A chunked oversize record must stay contiguous, a full queue must
+        // never make a media thread wait for the sink, and a droppable record
+        // never overtakes a pending lossless record (FIFO-fair progress).
+        if (s.chunked || !s.pending_lossless.empty() || record.size() >= byte_capacity ||
+            !s.space(charge)) {
             ++s.drops.backpressure;
             return {};
         }
@@ -167,6 +171,7 @@ public:
         const std::lock_guard lock(s.mutex);
         if (s.error) { return s.error; }
         if (s.closed) { return closed_error(); }
+        s.promote_pending();
         const auto charge = record.size() + 1;
         if (!s.chunked && s.pending_lossless.empty() && s.space(charge)) {
             s.push(record, charge);
@@ -174,7 +179,10 @@ public:
             return {};
         }
         if (s.pending_lossless.size() >= pending_lossless_capacity) {
-            return {ENOBUFS, std::generic_category()};
+            s.error = {ENOBUFS, std::generic_category()};
+            if (s.running) { s.running->store(false); }
+            s.changed.notify_all();
+            return s.error;
         }
         std::string line(charge, '\n');
         record.copy(line.data(), record.size());
@@ -202,6 +210,10 @@ public:
     [[nodiscard]] bool timed_out() const {
         const std::lock_guard lock(state_->mutex);
         return state_->abandoned;
+    }
+    [[nodiscard]] std::error_code latched_error() const {
+        const std::lock_guard lock(state_->mutex);
+        return state_->error;
     }
 
     std::error_code flush() {
@@ -235,6 +247,7 @@ public:
         std::unique_lock producer(producer_, std::defer_lock);
         [[maybe_unused]] const bool owned = producer.try_lock_until(deadline);
         std::unique_lock lock(s.mutex);
+        s.promote_pending();
         s.report_drops_if_due(s.now(), true);
         s.closed = true;
         s.changed.notify_all();
@@ -315,12 +328,17 @@ private:
         bool space(std::size_t charge) const {
             return charge <= byte_capacity - bytes && queue.size() < entry_capacity;
         }
+        bool can_admit_direct(std::size_t charge) const {
+            return (chunked || pending_lossless.empty()) && space(charge);
+        }
         bool stopping() const { return running && !running->load(); }
         // Waits for room for `charge`. Unbounded while the owner is running
         // (issue #60); bounded by `shutdown_wait` once it is not. Returns false
         // only when the shutdown bound expired with the queue still full.
         bool wait_for_space(std::unique_lock<std::mutex> &lock, std::size_t charge) {
-            const auto ready = [&] { return error || closed || space(charge); };
+            // A fresh record queues behind pending_lossless; the tail of an
+            // oversize record already mid-admission (chunked) must stay contiguous.
+            const auto ready = [&] { return error || closed || can_admit_direct(charge); };
             Clock::time_point deadline{};
             bool armed = false;
             while (!ready()) {
@@ -351,13 +369,16 @@ private:
         }
         void promote_pending() {
             if (chunked) { return; }
+            bool moved = false;
             while (!pending_lossless.empty()) {
                 const auto charge = pending_lossless.front().size();
                 if (!space(charge)) { break; }
                 bytes += charge;
                 queue.push_back(std::move(pending_lossless.front()));
                 pending_lossless.pop_front();
+                moved = true;
             }
+            if (moved) { changed.notify_all(); }
         }
         bool admit_media(std::string_view kind, Clock::time_point at) {
             constexpr std::size_t max_kinds = 32;
@@ -394,7 +415,7 @@ private:
             const std::string line = "{\"event\":\"media_telemetry_dropped\",\"rate_limited\":" +
                                      std::to_string(rate) + ",\"backpressure\":" +
                                      std::to_string(pressure) + "}";
-            if (chunked || !space(line.size() + 1)) { return; }
+            if (chunked || !pending_lossless.empty() || !space(line.size() + 1)) { return; }
             push(line, line.size() + 1);
             reported = drops;
             last_report = at;
