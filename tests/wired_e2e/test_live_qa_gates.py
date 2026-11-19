@@ -112,10 +112,10 @@ if [[ "$cmd" == *aa-disp.in* ]]; then
     bash -euc 'exec 9<>"$FAKE_TARGET/aa-disp.in"
         grep() {
             IFS= read -r -t 0.1 -u 9 request
-            [[ "$request" == "status "* ]]
+            [[ "$request" == status || "$request" == "status "* ]]
             # The display echoes the request id (#90 review 4); FAKE_STATUS_UNCORRELATED
             # models a reply that is not this request'"'"'s (an older status line).
-            id="${request#status }"
+            id="${request#status}"; id="${id# }"
             [[ "${FAKE_STATUS_UNCORRELATED:-0}" != 1 ]] || id="older"
             printf "{\"event\":\"status\",\"frames_presented\":3,\"frames_painted\":%s,\"render_ok\":%s,\"request\":\"%s\"}\n" \
                 "${FAKE_FRAMES_PAINTED:-3}" "${FAKE_RENDER_OK:-true}" "$id" > "$FAKE_TARGET/aa-wired-display.log"

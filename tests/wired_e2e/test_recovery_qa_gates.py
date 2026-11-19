@@ -147,7 +147,16 @@ case "$cmd" in
         # labels reported missing.
         [ "${FAKE_LOG_AUDIT_RC:-0}" = 0 ] || exit "$FAKE_LOG_AUDIT_RC"
         clean='{"event":"log_complete","runtime_dropped":0,"state_overflow":0,"media_rate_limited":0,"media_backpressure":0,"shutdown_dropped":0,"max_delivery_lag_ms":1}'
-        for label in $(printf '%s' "$cmd" | grep -oE '(gen[0-9]+|attempt):/tmp/' | cut -d: -f1); do
+        labels="$(printf '%s' "$cmd" | grep -oE '(gen[0-9]+|attempt):/tmp/' | cut -d: -f1 || true)"
+        if [ -z "$labels" ]; then
+            # A harness without a manifest (glob scan): one unframed section.
+            printf '%s\n' '### /tmp/aa-wired-receiver.log' "${FAKE_LOG_AUDIT:-$clean}"
+            [ -z "${FAKE_LOG_AUDIT_attempt:-}" ] ||
+                printf '%s\n' '### /tmp/aa-wired-receiver-attempt.log' "$FAKE_LOG_AUDIT_attempt"
+            echo '### end'
+            exit 0
+        fi
+        for label in $labels; do
             echo "### $label"
             if [[ " ${FAKE_LOG_MISSING:-} " == *" $label "* ]]; then echo '### missing'; continue; fi
             override="FAKE_LOG_AUDIT_${label}"
@@ -168,7 +177,13 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
     *'print $1'*) printf '%s\n' "${FAKE_ADB_LIST:-FAKEDEV1 FAKEDEV2}" | tr ' ' '\n'; exit 0 ;;
     *'adb shell'*) exit 0 ;;
     *'shell input keyevent'*|*'shell input swipe'*|*'shell am force-stop'*) exit "${FAKE_ADB_STIMULUS_RC:-0}" ;;
-    *'wc -c'*) printf 'boundary %s %s' "${FAKE_BOUNDARY_NS:-1}" "${FAKE_LOG_SIZE:-0}"; exit 0 ;;
+    *'wc -c'*)
+        # The boundary with the target clock; a size-only probe gets the size.
+        case "$cmd" in
+            *monotonic_ns*) printf 'boundary %s %s' "${FAKE_BOUNDARY_NS:-1}" "${FAKE_LOG_SIZE:-0}" ;;
+            *) printf '%s' "${FAKE_LOG_SIZE:-0}" ;;
+        esac
+        exit 0 ;;
     *'time.monotonic_ns()'*)
         # The target clock alone (a fresh log's boundary).
         if [ "${FAKE_REAL_LOG:-0}" = 1 ]; then bash -c "$cmd"; exit $?; fi
