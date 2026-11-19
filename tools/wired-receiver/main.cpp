@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "../stray_stdout.hpp"
 #include "../video_capabilities.hpp"
 //
 // Wired end-to-end receiver entry point (task 30 phase-B harness driver): the
@@ -1733,6 +1734,9 @@ const char *const kUsage =
     "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked.\n";
 
 int receiver_main(int argc, char **argv) {
+    // Before any GStreamer/NVIDIA load: their stdio text must not reach the
+    // JSON stdout channel or block exit() on a stalled consumer.
+    const aa::tools::StrayStdoutToStderr stray_stdout;
     auto video_profiles = aa::config::default_video_profiles();
     bool exact_video_profiles = false;
     auto video_decoder = aa::consumer::DecodeBackend::software;
@@ -1763,7 +1767,7 @@ int receiver_main(int argc, char **argv) {
         } else if (std::strcmp(argv[index], "--store") == 0 && index + 1 < argc) {
             store_path = argv[++index];
         } else if (std::strcmp(argv[index], "--list-video-capabilities") == 0) {
-            aa::tools::list_video_capabilities(); return 0;
+            aa::tools::list_video_capabilities(stray_stdout.json()); return 0;
         } else if (std::strcmp(argv[index], "--decoder") == 0 && index + 1 < argc) {
             if (!aa::tools::parse_decoder(argv[++index],video_decoder)) { std::fputs("invalid --decoder\n",stderr); return 2; }
         } else if (std::strcmp(argv[index], "--idr-recovery") == 0 && index + 1 < argc) {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "pipeline_options.hpp"
+#include "../stray_stdout.hpp"
 #include "../video_capabilities.hpp"
 #include <aa/config/VideoProfiles.hpp>
 // Dummy display application (task 24): a Qt 6 test consumer for the REAL
@@ -219,7 +220,8 @@ int main(int argc, char** argv) {
                 return 2;
             }
         } else if (std::strcmp(argv[index], "--list-video-capabilities") == 0) {
-            aa::tools::list_video_capabilities(); return 0;
+            const aa::tools::StrayStdoutToStderr stray_stdout;
+            aa::tools::list_video_capabilities(stray_stdout.json()); return 0;
         } else if (std::strcmp(argv[index], "--video-profiles") == 0 && index + 1 < argc) {
             auto parsed = aa::config::parse_video_profiles(argv[++index]);
             if (!parsed) { std::fputs("config_invalid: invalid --video-profiles\n",stderr); return 2; }

@@ -2293,6 +2293,34 @@ TEST(WiredReceiver, StdoutLogFailureConvertsCleanMainExitAndPreservesEarlyFailur
     g_running.store(true);
 }
 
+TEST(WiredReceiver, LibraryStdioTextGoesToStderrNotTheJsonStdout) {
+    // Given: a library inside the run writes free text through C stdio, as the
+    // Jetson NVIDIA V4L2 codec does with puts("Opening in BLOCKING MODE").
+    FILE *const before = stdout;
+    runtime_sink_request_override = [&](const auto &) -> aa::audio::detail::SinkOpenOutcome {
+        std::puts("LIBRARY_STDIO_MARKER");
+        std::printf("LIBRARY_PRINTF_MARKER %d\n", 1);
+        return {std::make_unique<wiredtest::RecordingObservedSink>(
+            std::make_shared<wiredtest::AudioObs>()), {}};
+    };
+    testing::internal::CaptureStderr();
+    // When: the receiver runs and exits.
+    const auto result = run_runtime(false, 20, true);
+    const auto diagnostics = testing::internal::GetCapturedStderr();
+    runtime_sink_request_override = {};
+    // Then: the text reached stderr, every stdout line is a JSON record, and the
+    // stdio stream is restored.
+    EXPECT_NE(diagnostics.find("LIBRARY_STDIO_MARKER"), std::string::npos) << diagnostics;
+    EXPECT_NE(diagnostics.find("LIBRARY_PRINTF_MARKER 1"), std::string::npos) << diagnostics;
+    EXPECT_EQ(result.output.find("MARKER"), std::string::npos) << result.output;
+    std::istringstream lines{result.output};
+    for (std::string line; std::getline(lines, line);) {
+        EXPECT_TRUE(line.size() > 1 && line.front() == '{' && line.back() == '}') << line;
+    }
+    EXPECT_EQ(stdout, before);
+    g_running.store(true);
+}
+
 TEST(WiredReceiver, ReceiverShutdownIsBoundedWithAFullQueueAndAStalledStdout) {
     // Given: stdout becomes a pipe nobody reads and that is already full, so the
     // native write stalls; the receiver is then run until the test stops it.
@@ -2306,6 +2334,10 @@ TEST(WiredReceiver, ReceiverShutdownIsBoundedWithAFullQueueAndAStalledStdout) {
     std::atomic<bool> stdout_stalled{false};
     std::atomic<bool> queue_full{false};
     runtime_sink_request_override = [&](const auto &) -> aa::audio::detail::SinkOpenOutcome {
+        // And library stdio text, as the Jetson NVIDIA V4L2 codec puts() when
+        // nvv4l2decoder opens: it must not wait in a stdio buffer for a flush
+        // into the stalled pipe.
+        std::puts("Opening in BLOCKING MODE");
         EXPECT_EQ(::dup2(stalled[1], STDOUT_FILENO), STDOUT_FILENO);
         stdout_stalled.store(true);
         return {std::make_unique<wiredtest::RecordingObservedSink>(

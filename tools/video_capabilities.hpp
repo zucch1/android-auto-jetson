@@ -37,21 +37,22 @@ inline bool parse_decoder(std::string_view value, consumer::DecodeBackend& out) 
     else { return false; }
     return true;
 }
-inline void list_video_capabilities() {
+// Writes to `out`; callers keep library chatter off it (StrayStdoutToStderr).
+inline void list_video_capabilities(std::FILE* out) {
     for (const auto codec : protocol::kVideoCodecs) {
         const auto report = consumer::DecodeHelper::probe_backends(codec);
         const bool nvidia = std::any_of(report.backends.begin(),report.backends.end(),[](const auto& b) { return b.element == "nvv4l2decoder" && b.viable; });
-        std::printf("{\"codec\":\"%s\",\"parser_path\":%s,\"software\":%s,\"hardware\":%s,\"elements\":[",
+        std::fprintf(out, "{\"codec\":\"%s\",\"parser_path\":%s,\"software\":%s,\"hardware\":%s,\"elements\":[",
             protocol::codec_name(codec), report.software_path_available ? "true":"false",
             report.software_path_available && consumer::select_backend(report,consumer::DecodeBackend::software).usable ? "true":"false",
             report.software_path_available && nvidia ? "true":"false");
         bool first = true;
         for (const auto& b : report.backends) {
-            std::printf("%s{\"name\":\"%s\",\"installed\":%s,\"usable\":%s}",first ? "":",",b.element.c_str(),
+            std::fprintf(out, "%s{\"name\":\"%s\",\"installed\":%s,\"usable\":%s}",first ? "":",",b.element.c_str(),
                 b.available ? "true":"false",b.viable ? "true":"false");
             first = false;
         }
-        std::puts("]}");
+        std::fputs("]}\n", out);
     }
 }
 } // namespace aa::tools
