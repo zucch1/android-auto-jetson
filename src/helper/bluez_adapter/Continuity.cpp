@@ -56,7 +56,7 @@ void BluezBackend::Impl::watch_continuity() {
                 // Before lost_path() closes the window: remember, read only, that its phone lost the link.
                 if (g_variant_lookup(changed, "Connected", "b", &value) && !value && self.allowed &&
                     !self.pairing_enabled && self.allowed->device.path == path)
-                    self.lost_link = LostLink{path, self.window};
+                    self.lost_link = LostLink{path, self.allowed->device.identity, self.window};
                 if (lost) self.lost_path(path);
             }
             g_variant_unref(changed); g_variant_unref(invalidated);

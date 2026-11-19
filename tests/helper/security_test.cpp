@@ -769,6 +769,35 @@ TEST_F(ReconnectLink, ARealLinkLossSignalDuringTheWindowStillReportsNoLink) {
     EXPECT_FALSE(backend->awaiting_link());
     EXPECT_EQ(calls(), "");
 }
+// Opens a reconnect window with a link, then has BlueZ report the link lost (the note is set).
+void lose_link_during_window(helper::BluezBackend& backend, MockBluez& mock, const std::function<bool()>& reconnect) {
+    ASSERT_EQ(mock.command("link-up"), "ok");
+    ASSERT_TRUE(reconnect());
+    ASSERT_EQ(mock.command("connected-false"), "ok");
+    for (int i = 0; i < 20 && !backend.awaiting_link(); ++i) {
+        backend.tick(); std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    ASSERT_TRUE(backend.awaiting_link());
+}
+TEST_F(ReconnectLink, AnEnrolmentWindowClearsThePreviousPhonesLostLinkNote) {
+    lose_link_during_window(*backend, *mock, [this] { return reconnect(); });
+    if (HasFatalFailure()) return;
+    // A different phone's enrolment opens, then BlueZ cancels it (the window closes without cleanup).
+    ASSERT_EQ(mock->command("observe-other"), "ok");
+    const auto other = backend->observe();
+    ASSERT_TRUE(other);
+    ASSERT_TRUE(backend->authorize(other.value().handle));
+    EXPECT_EQ(bluez_callback(*backend, *mock, "Cancel"), "allowed");
+    EXPECT_FALSE(backend->awaiting_link()) << "the previous phone's link loss outlived a new enrolment";
+    ASSERT_EQ(mock->command("observe-first"), "ok");
+}
+TEST_F(ReconnectLink, ForgettingThePhoneClearsItsLostLinkNote) {
+    lose_link_during_window(*backend, *mock, [this] { return reconnect(); });
+    if (HasFatalFailure()) return;
+    ASSERT_TRUE(backend->revoke_peer(primary_peer));
+    EXPECT_FALSE(backend->awaiting_link()) << "a forgotten phone still reported a missing link";
+    EXPECT_EQ(calls(), "");
+}
 TEST_F(ReconnectLink, AWindowClosedDuringTheLiveQueryClaimsNothing) {
     ASSERT_TRUE(reconnect());
     ASSERT_TRUE(backend->awaiting_link());

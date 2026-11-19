@@ -124,6 +124,7 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     // after an acknowledgement) clears it, so a window that closes without acceptance cannot turn a
     // resurrected or stale approval into an admission.
     std::erase(impl_->awaiting, observed->device.identity);
+    impl_->lost_link.reset();  // an enrolment window is not the lost reconnect window
     impl_->allowed = *observed;
     impl_->pairing_enabled = true;
     impl_->comparison_used = false;
@@ -182,6 +183,8 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     if ((impl_->allowed && impl_->allowed->device.identity == identity) ||
         (impl_->connected && impl_->connected->device.identity == identity)) impl_->close_window();
     std::erase(impl_->awaiting, identity);
+    // A forgotten phone's lost-link note goes with it (its window was already closed).
+    if (impl_->lost_link && impl_->lost_link->identity == identity) impl_->lost_link.reset();
     // Demoted first: once forgotten, the bond is never admitted (services, reconnect) again and is
     // never taken as acceptance of a later enrolment of the same identity. Success only once every
     // write is confirmed durable; otherwise the receiver retries.
