@@ -18,6 +18,17 @@ core::Result<ObservedPeer> BusClient::poll_bootstrap(Source source, HandoffFailu
     if (!peer.handle) return Error{ErrorCode::helper_rejected};
     return peer;
 }
+core::Result<BootstrapWait> BusClient::bootstrap_wait(Source source) {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until)) return Error{ErrorCode::timeout};
+    MessageWriter writer; writer.put_u64(source.generation).put_u64(source.confirmation);
+    const auto result = impl_->rpc("GetBootstrapWaitV1", "tt", writer, until);
+    if (!result) return result.error();
+    if (result.value() > static_cast<std::uint64_t>(BootstrapWait::no_bluetooth_link))
+        return Error{ErrorCode::helper_protocol_mismatch};
+    return static_cast<BootstrapWait>(result.value());
+}
 core::Result<void> BusClient::authorize_bootstrap(Source source, std::uint64_t handle, bool allow, bool ready) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
     std::unique_lock lock{impl_->mutex, std::defer_lock};

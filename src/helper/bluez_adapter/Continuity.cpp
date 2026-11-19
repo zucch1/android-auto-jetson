@@ -53,8 +53,6 @@ void BluezBackend::Impl::watch_continuity() {
                     if (std::string_view{name} == "Paired" || std::string_view{name} == "Bonded" ||
                         std::string_view{name} == "Connected") lost = true;
                 }
-                if (self.allowed && self.allowed->device.path == path &&
-                    g_variant_lookup(changed, "Connected", "b", &value) && value) self.allowed_link = true;
                 if (lost) self.lost_path(path);
             }
             g_variant_unref(changed); g_variant_unref(invalidated);

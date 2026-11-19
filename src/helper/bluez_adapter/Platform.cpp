@@ -210,9 +210,15 @@ SnapshotDeadline BluezBackend::handoff_deadline() const {
     return impl_->bootstrap ? impl_->bootstrap->deadline() : SnapshotDeadline{impl_->now(), impl_->now};
 }
 HandoffFailure BluezBackend::handoff_failure() const { return impl_->last_failure; }
-bool BluezBackend::awaiting_link() const {
-    return impl_->allowed && !impl_->allowed_link && impl_->now() < impl_->window &&
-           !(impl_->bootstrap && impl_->bootstrap->live());
+bool BluezBackend::awaiting_link() {
+    // Evaluated now (one bounded inventory read), never from a snapshot taken when the window
+    // opened: a link infotainment brought up since then is seen. Only an open reconnect window
+    // (not an enrolment) with no live bootstrap qualifies. Read only: no Device1 call.
+    if (!impl_->allowed || impl_->pairing_enabled || impl_->now() >= impl_->window ||
+        (impl_->bootstrap && impl_->bootstrap->live())) return false;
+    Impl::Device live{};
+    if (!impl_->exact(*impl_->allowed, true, &live)) return false;  // continuity unknown: no claim
+    return !live.connected;
 }
 void BluezBackend::fail_handoff(std::uint64_t handle, HandoffFailure reason) { impl_->retire(handle, reason); }
 void BluezBackend::snapshot_provider(const SnapshotProvider& provider) { impl_->snapshots = provider; }

@@ -92,8 +92,9 @@ human-mediated during explicit enrollment only, never automatically approved.
    after it dropped; Jetson windows 2/3, 2026-11-18). That HFP link is owned by
    the infotainment system (or a future connect service). The helper and receiver
    never page, connect or disconnect the phone: no `Connect`, `ConnectProfile` or
-   `DisconnectProfile`. They only report, read-only from `Device1.Connected`, that
-   a reconnect window is waiting with no link (`no_bluetooth_link`). Until
+   `DisconnectProfile`. They only report, read-only from `Device1.Connected` and
+   evaluated when asked (`GetBootstrapWaitV1`), that a reconnect window is
+   waiting with no link (`no_bluetooth_link`). Until
    infotainment provides the link, wireless tests bring HFP up as an explicit
    operator step (`tools/wireless-qa/aa-hfp-link-test-only.sh`). Targetless action9 is rejected.
 6. NewConnection validates the real Unix-FD index, duplicates and owns one socket,

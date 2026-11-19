@@ -264,8 +264,10 @@ the helper does not expose Introspectable). Methods:
 | GetPairingComparisonV1 | `tt` generation, request source | `utuss` error, challenge ID, comparison, address, adapter | Authenticated consumer-only retrieval during explicit enrollment |
 | RespondPairingComparisonV1 | `tttu` generation, request source, challenge ID, accept | `ut` error, reserved zero | Explicit human decision after retrieval; one use, same enrollment/peer/deadline |
 
-1.5.0 (#160) appends `no_bluetooth_link` (15) to `PollBootstrapV1`'s
-`local_failure`: a diagnostic, not an error, see [wireless-handoff.md](wireless-handoff.md).
+1.5.0 (#160) adds `GetBootstrapWaitV1` (`tt` generation, source → `ut` error, wait: 0
+none, 1 no_bluetooth_link), a read-only diagnostic behind `PollBootstrapV1`'s source checks;
+see [wireless-handoff.md](wireless-handoff.md). `PollBootstrapV1` is unchanged: its
+`local_failure` stays within the 1.4 range (0–14).
 
 Errors: 0 success, 1000 unavailable, 1001 rejected, 1002 protocol mismatch.
 Nonzero errors carry value zero. States: 0 inactive, 1 active, 2 unavailable.

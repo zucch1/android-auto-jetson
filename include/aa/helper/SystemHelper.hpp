@@ -68,8 +68,9 @@ public:
     virtual void discard(std::uint64_t) {}
     virtual core::Result<ObservedPeer> handoff() { return Error{ErrorCode::helper_rejected}; }
     virtual HandoffFailure handoff_failure() const { return HandoffFailure::none; }
-    // Read-only: an open reconnect window has no bootstrap and the phone has no Bluetooth link.
-    virtual bool awaiting_link() const { return false; }
+    // Read-only, evaluated when asked: an open reconnect window has no live bootstrap and its
+    // phone has no Bluetooth link (Device1.Connected false). Grants nothing.
+    virtual bool awaiting_link() { return false; }
     virtual void fail_handoff(std::uint64_t, HandoffFailure) {}
     virtual core::Result<void> authorize_handoff(std::uint64_t, bool, bool) { return Error{ErrorCode::helper_rejected}; }
     virtual void snapshot_provider(const SnapshotProvider&) {}
@@ -122,12 +123,13 @@ public:
     core::Result<State> reconnect_peer(const std::string& sender, std::uint64_t handle);
     core::Result<void> revoke_peer(const std::string& sender, const PeerIdentity& identity);
     core::Result<ObservedPeer> poll_handoff(const std::string&, Source);
+    // GetBootstrapWaitV1: the same sender and lease/source checks as poll_handoff(), then the
+    // read-only wait reason. A refused source learns nothing.
+    core::Result<BootstrapWait> bootstrap_wait(const std::string&, Source);
     core::Result<ApSnapshot> ap_credentials(const std::string&, Source, std::uint64_t);
     core::Result<void> authorize_handoff(const std::string&, Source, std::uint64_t, bool allow, bool ready);
     HandoffFailure handoff_failure(const std::string& sender) {
-        if (!authenticate(sender)) return HandoffFailure::none;
-        const auto failure = backend_.handoff_failure();
-        return failure == HandoffFailure::none && backend_.awaiting_link() ? HandoffFailure::no_bluetooth_link : failure;
+        return authenticate(sender) ? backend_.handoff_failure() : HandoffFailure::none;
     }
     bool transmit_snapshot(const std::string&, SnapshotAuthority, const std::function<void()>&);
     SnapshotDeadline snapshot_deadline() const { return backend_.handoff_deadline(); }

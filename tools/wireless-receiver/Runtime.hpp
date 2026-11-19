@@ -158,7 +158,9 @@ struct Runtime final {
             if (wants && attempting && !receiver.session() && turn >= attempt_until) {
                 // Not an error code: name why the attempt deadline passed instead of retrying
                 // silently (#160). No addresses or identities are logged.
-                log_line(admission_expired_json(acquisition.has_value(), receiver.awaiting_link()));
+                // Asked at expiry, before defer() stops the epoch: the link may have arrived since.
+                log_line(admission_expired_json(acquisition.has_value(),
+                    !acquisition && receiver.link_wait() == helper::BootstrapWait::no_bluetooth_link));
                 defer();
             }
             if (wants && !receiver.session() && !attempting && turn >= retry) {

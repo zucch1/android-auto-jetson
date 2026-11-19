@@ -12,6 +12,14 @@
       <arg name="adapter_identity" type="s" direction="out"/>
       <arg name="local_failure" type="u" direction="out"/>
     </method>
+    <!-- 1.5.0 (#160): diagnostics only. 0 none, 1 no_bluetooth_link. Same source checks as
+         PollBootstrapV1; grants nothing. A 1.4 helper rejects the unknown member. -->
+    <method name="GetBootstrapWaitV1">
+      <arg name="consumer_generation" type="t" direction="in"/>
+      <arg name="source" type="t" direction="in"/>
+      <arg name="error" type="u" direction="out"/>
+      <arg name="wait" type="t" direction="out"/>
+    </method>
     <method name="AuthorizeBootstrapV1">
       <arg name="consumer_generation" type="t" direction="in"/>
       <arg name="source" type="t" direction="in"/>

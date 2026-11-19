@@ -2,7 +2,6 @@
 #pragma once
 #include <aa/helper/BusClient.hpp>
 #include <aa/trust/Trust.hpp>
-#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -24,10 +23,7 @@ struct HandoffOperations final {
     // Succeeds only for completed bootstrap; a pending exchange is retired.
     std::function<core::Result<void>(helper::Source, std::uint64_t)> withdraw;
 };
-// Diagnostics only: the `local_failure` of the last PollBootstrap reply, written by validate on
-// the worker and read on the owner thread (no_bluetooth_link while the phone has no link).
-using HandoffWait = std::shared_ptr<std::atomic<std::uint32_t>>;
-HandoffOperations handoff_operations(helper::BusClient& client, HandoffWait wait = {});
+HandoffOperations handoff_operations(helper::BusClient& client);
 
 // Owner-thread policy; only bounded helper calls run on the worker. Collaborators
 // must outlive this object. tick() must run at least every 25ms, including I/O.
@@ -55,11 +51,6 @@ public:
     [[nodiscard]] std::uint64_t epoch() const;
     // Generation of the validated AP activation, or 0 without one.
     [[nodiscard]] std::uint64_t snapshot_generation() const;
-    // Diagnostics: the phone had no Bluetooth link when the helper last answered an observation
-    // of this attempt (since the last begin()). No authority depends on it.
-    [[nodiscard]] bool awaiting_link() const;
-    // Optional source for awaiting_link(): the helper's last reported wait reason. Grants nothing.
-    void wait_source(std::function<helper::HandoffFailure()> source);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

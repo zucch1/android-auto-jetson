@@ -125,7 +125,6 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     // resurrected or stale approval into an admission.
     std::erase(impl_->awaiting, observed->device.identity);
     impl_->allowed = *observed;
-    impl_->allowed_link = true; // an enrolment window, not a reconnect waiting for a link
     impl_->pairing_enabled = true;
     impl_->comparison_used = false;
     impl_->comparison_accepted = false;
@@ -151,15 +150,19 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     if (!observed || !impl_->exact(*observed, true, &live) || !impl_->admitted(observed->device.identity))
         return Error{ErrorCode::helper_rejected};
     impl_->close_window();
+    // A fresh window starts without the previous exchange's outcome: PollBootstrapV1 reports a
+    // failure of this window's bootstrap only. close_window() denied any previous exchange, so the
+    // retained object is dead (handoff() would otherwise re-read its failure on every poll).
+    if (impl_->bootstrap && !impl_->bootstrap->live() && !impl_->bootstrap->complete()) impl_->bootstrap.reset();
+    impl_->last_failure = HandoffFailure::none;
     impl_->allowed = *observed;
-    impl_->allowed_link = live.connected;
     impl_->window = impl_->now() + std::chrono::seconds(60);
     // The AA profile is a server: the bonded phone initiates RFCOMM, and its Android Auto does
     // so only over a live Bluetooth link. The helper never pages the phone or touches HFP:
     // infotainment owns that link (#160). No generic Device1.Connect or ConnectProfile is used.
     if (!live.connected)
-        std::cerr << "system-helper: reconnect window open; waiting for a Bluetooth (HFP) link to the phone, "
-                     "which infotainment owns\n";
+        std::cerr << "system-helper: reconnect window open with no Bluetooth link to the phone; "
+                     "waiting for HFP (owned by infotainment)\n";
     return State::active;
 }
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {

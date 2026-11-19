@@ -47,10 +47,13 @@ using SnapshotProvider = std::function<core::Result<ApSnapshot>()>;
 using SnapshotFence = std::function<bool(std::uint64_t, const std::function<void()>&)>;
 enum class HandoffFailure : std::uint32_t {
     none, denied, eligibility, eof, unknown_id, wrong_order, duplicate,
-    oversize, truncated, protobuf, phone_rejected, timeout, write, snapshot, rebind,
-    // Not a bootstrap failure: an open reconnect window is waiting while the phone has no
-    // Bluetooth link to this head unit, so its Android Auto cannot dial the AA RFCOMM profile.
-    // The helper never pages the phone: the HFP link is owned by infotainment (#160).
-    no_bluetooth_link
+    oversize, truncated, protobuf, phone_rejected, timeout, write, snapshot, rebind
+};
+// GetBootstrapWaitV1 (contract 1.5.0, #160): why an open reconnect window has no bootstrap yet.
+// Diagnostics only; separate from PollBootstrapV1, whose local_failure keeps its 1.4 range so a
+// 1.4 receiver never sees a value it rejects. Wire numbers are append-only.
+enum class BootstrapWait : std::uint32_t {
+    none = 0,               // no open window for this source, a bootstrap exists, or a link is up
+    no_bluetooth_link = 1,  // the window's phone has no Bluetooth link; HFP is infotainment's
 };
 }

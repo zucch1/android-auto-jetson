@@ -6,7 +6,9 @@
 #include <aa/helper/BusService.hpp>
 #include <gtest/gtest.h>
 #include "../trust/syscall_faults.hpp"
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <iostream>
 #include <csignal>
@@ -714,6 +716,10 @@ TEST_F(ReconnectLink, WithoutALinkTheWindowWaitsAndNoDeviceCallIsMade) {
     ASSERT_TRUE(reconnect());
     EXPECT_TRUE(backend->awaiting_link());
     EXPECT_EQ(backend->handoff_failure(), helper::HandoffFailure::none) << "a wait is not a bootstrap failure";
+    ASSERT_EQ(mock->command("link-up"), "ok");  // arrives without a signal: evaluated live
+    EXPECT_FALSE(backend->awaiting_link());
+    ASSERT_EQ(mock->command("link-down"), "ok");
+    EXPECT_TRUE(backend->awaiting_link());
     for (int retry = 0; retry < 5; ++retry) ASSERT_TRUE(reconnect());
     backend->tick();
     EXPECT_EQ(calls(), "") << "the helper paged, connected or disconnected the phone";
@@ -749,18 +755,80 @@ TEST_F(ReconnectLink, TheAaFencesStillRefuseAForgottenPhoneWithALink) {
 }
 
 // #160: no production source (helper, receiver, shared libraries) names a BlueZ method that
-// creates or drops a link; only the test-only operator tool in tools/wireless-qa may.
+// creates, drops or removes a link or pairing, however it is spelled in code: a string literal
+// (plain, raw, or a qualified "org.bluez.Device1.X") or an identifier (a method name split
+// across concatenated literals is not detected; the mock's ingress log covers the runtime path).
+// Comments are ignored. Only the test-only operator tool in tools/wireless-qa may name them.
+constexpr const char* kForbiddenBluezMethods[] = {
+    "Connect", "ConnectProfile", "Disconnect", "DisconnectProfile", "CancelPairing", "RemoveDevice"};
+std::string strip_comments(const std::string& text) {
+    std::string out; out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size();) {
+        if (text.compare(i, 2, "//") == 0) { while (i < text.size() && text[i] != '\n') ++i; continue; }
+        if (text.compare(i, 2, "/*") == 0) {
+            const auto end = text.find("*/", i + 2);
+            i = end == std::string::npos ? text.size() : end + 2; out.push_back(' '); continue;
+        }
+        if (text[i] == '"' || text[i] == '\'') {
+            // Copy a literal verbatim (so "//" inside it is not a comment).
+            const char quote = text[i]; out.push_back(text[i++]);
+            while (i < text.size() && text[i] != quote) {
+                if (text[i] == '\\' && i + 1 < text.size()) out.push_back(text[i++]);
+                out.push_back(text[i++]);
+            }
+            if (i < text.size()) out.push_back(text[i++]);
+            continue;
+        }
+        out.push_back(text[i++]);
+    }
+    return out;
+}
+// Names of forbidden methods appearing as whole tokens (not inside RequestDisconnection etc.).
+std::vector<std::string> forbidden_tokens(const std::string& source) {
+    const auto code = strip_comments(source);
+    const auto word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+    std::vector<std::string> found;
+    for (const auto* method : kForbiddenBluezMethods) {
+        const std::string name{method};
+        for (auto at = code.find(name); at != std::string::npos; at = code.find(name, at + 1)) {
+            const bool starts = at == 0 || !word(code[at - 1]);
+            const bool ends = at + name.size() == code.size() || !word(code[at + name.size()]);
+            if (starts && ends) { found.push_back(name); break; }
+        }
+    }
+    return found;
+}
+TEST(NoLinkCalls, ScannerCatchesEverySpellingAndIgnoresComments) {
+    const std::pair<const char*, const char*> planted[] = {
+        {R"x(call(path, "org.bluez.Device1", "ConnectProfile", args);)x", "ConnectProfile"},
+        {R"x(auto m = R"(Connect)";)x", "Connect"},
+        {R"x(send("org.bluez.Device1.DisconnectProfile");)x", "DisconnectProfile"},
+        {R"x(constexpr auto kRemove = "RemoveDevice";)x", "RemoveDevice"},
+        {R"x(bluez.CancelPairing();)x", "CancelPairing"},
+        {R"x(proxy->Disconnect(device);)x", "Disconnect"},
+    };
+    for (const auto& [code, method] : planted) {
+        const auto found = forbidden_tokens(code);
+        EXPECT_NE(std::find(found.begin(), found.end(), method), found.end()) << "missed " << method << " in " << code;
+    }
+    EXPECT_TRUE(forbidden_tokens("// Device1.Connect is never used\n/* nor RemoveDevice */ int x;").empty());
+    EXPECT_TRUE(forbidden_tokens(R"x(method == "RequestDisconnection"; connect_bus(); Disconnected();)x").empty());
+}
 TEST(NoLinkCalls, ProductionSourcesNeverNameBluezLinkMethods) {
     namespace fs = std::filesystem;
     const fs::path root{AA_HELPER_SOURCE};
     std::size_t scanned = 0;
     for (const auto* top : {"src", "include", "tools/wireless-receiver", "tools/wired-receiver"}) {
+        ASSERT_TRUE(fs::is_directory(root / top)) << top;
         for (const auto& entry : fs::recursive_directory_iterator(root / top)) {
             if (!entry.is_regular_file()) continue;
-            const auto text = file_text(entry.path().string());
+            std::ifstream in{entry.path(), std::ios::binary};
+            ASSERT_TRUE(in) << "unreadable " << entry.path();
+            const std::string text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+            ASSERT_FALSE(in.bad()) << "read failed " << entry.path();
             ++scanned;
-            for (const auto* method : {"\"Connect\"", "\"ConnectProfile\"", "\"DisconnectProfile\"", "\"Disconnect\""})
-                EXPECT_EQ(text.find(method), std::string::npos) << entry.path() << " names " << method;
+            for (const auto& method : forbidden_tokens(text))
+                ADD_FAILURE() << entry.path() << " names BlueZ method " << method;
         }
     }
     EXPECT_GT(scanned, 50U);
