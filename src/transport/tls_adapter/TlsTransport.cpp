@@ -82,22 +82,26 @@ TlsTransport::connect(const char* host, std::uint16_t port,
 core::Result<std::unique_ptr<TlsTransport>>
 TlsTransport::connect(const char* host, std::uint16_t port,
                       ApprovedPredicate approved, TlsMode mode, const core::Deadline& deadline) {
+    // A null host would make getaddrinfo pick loopback and reach OpenSSL's IP
+    // verification as a null pointer; an empty host is never a peer address.
+    if (host == nullptr || *host == '\0') return Error{ErrorCode::invalid_argument};
     if (auto checked = deadline.check(); !checked) return checked.error();
-    const int fd = socket_util::connect_socket(host, port, deadline);
+    // Numeric addresses only: getaddrinfo name lookup is synchronous and
+    // would escape both the deadline and cancellation. Real peers (phone, AP
+    // client) are always addressed numerically.
+    const int fd = socket_util::connect_socket(host, port, deadline,
+                                               socket_util::Resolve::numeric_only);
     if (fd < 0) {
         if (auto checked = deadline.check(); !checked) return checked.error();
         return Error{ErrorCode::transport_unavailable};
     }
     auto transport = build_impl(fd, std::move(approved), mode, false);
     if (transport && mode == TlsMode::verified_peer_test_only) {
-        unsigned char address[sizeof(in6_addr)];
+        // The host is numeric (enforced above), so verify the peer's IP SAN.
         auto* ssl = transport.value()->impl_->ssl;
-        const bool numeric = ::inet_pton(AF_INET, host, address) == 1 ||
-                             ::inet_pton(AF_INET6, host, address) == 1;
-        const int configured = numeric
-            ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host)
-            : SSL_set1_host(ssl, host);
-        if (configured != 1) return Error{ErrorCode::transport_unavailable};
+        if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host) != 1) {
+            return Error{ErrorCode::transport_unavailable};
+        }
     }
     return transport;
 }
@@ -169,8 +173,7 @@ core::Result<std::vector<std::byte>> TlsTransport::receive() {
     // Only an empty parser is idle. A prefix retained after returning another
     // frame keeps the deadline established when that prefix first arrived.
     if (!impl_->io.has_partial_frame()) {
-        impl_->read_deadline = impl_->idle_budget
-            ? impl_->now() + *impl_->idle_budget : Deadline::max();
+        impl_->read_deadline = impl_->now() + impl_->idle_budget;
     }
     auto got = impl_->io.receive_frame(token_);
     if (!got) {
@@ -185,7 +188,7 @@ core::Result<void> TlsTransport::set_peer_ping_interval(
     if (interval <= std::chrono::milliseconds::zero() || interval > std::chrono::hours{1}) {
         return Error{ErrorCode::transport_unavailable};
     }
-    impl_->idle_budget = interval * 3 + kHandshakeDeadline;
+    impl_->idle_budget = idle_budget_for(interval);
     if (now) impl_->now = std::move(now);
     return {};
 }
