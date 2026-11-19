@@ -20,6 +20,18 @@ inline constexpr std::chrono::seconds kHandshakeDeadline{10};
 // Bounds a started frame (including trickled fragments) and backpressured
 // writes. Waiting for the first byte uses the separately configured ping budget.
 inline constexpr std::chrono::seconds kFrameDeadline{30};
+// Waiting for the first byte of a frame tolerates three missed peer pings plus
+// the handshake budget as scheduling margin.
+[[nodiscard]] constexpr std::chrono::milliseconds
+idle_budget_for(std::chrono::milliseconds ping_interval) noexcept {
+    return ping_interval * 3 + kHandshakeDeadline;
+}
+// Until a caller configures the peer's ping cadence, assume a 30 s cadence so
+// a silent peer is never waited on forever (security audit #89 L1). A caller
+// with a slower peer must widen this with set_peer_ping_interval().
+inline constexpr std::chrono::seconds kDefaultPeerPingInterval{30};
+inline constexpr std::chrono::milliseconds kDefaultIdleBudget =
+    idle_budget_for(kDefaultPeerPingInterval);
 
 enum class WaitReady { ready, cancelled, timeout, failed };
 
