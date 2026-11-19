@@ -747,6 +747,28 @@ TEST_F(ReconnectLink, AnExistingOrArrivingLinkIsReportedAndLeftAlone) {
     ASSERT_TRUE(backend->revoke_peer(primary_peer));
     EXPECT_EQ(calls(), "") << "lease retirement or Forget disconnected the phone's link";
 }
+TEST_F(ReconnectLink, ARealLinkLossSignalDuringTheWindowStillReportsNoLink) {
+    ASSERT_EQ(mock->command("link-up"), "ok");
+    ASSERT_TRUE(reconnect());
+    ASSERT_FALSE(backend->awaiting_link());
+    // BlueZ reports the link drop: lost_path() closes the window and refuses the identity...
+    ASSERT_EQ(mock->command("connected-false"), "ok");
+    for (int i = 0; i < 20 && !backend->awaiting_link(); ++i) {
+        backend->tick(); std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    // ...and the diagnostic still names the missing link, granting nothing.
+    EXPECT_TRUE(backend->awaiting_link());
+    EXPECT_EQ(bluez_callback(*backend, *mock, "NewConnection"), "rejected") << "the closed window admitted AA";
+    EXPECT_EQ(bluez_callback(*backend, *mock, "AuthorizeService"), "rejected");
+    EXPECT_FALSE(backend->handoff()) << "no handoff from a closed window";
+    // Bounded by the closed window's deadline, and cleared by lease retirement.
+    offset += std::chrono::seconds(61);
+    EXPECT_FALSE(backend->awaiting_link());
+    offset -= std::chrono::seconds(61);
+    backend->retire_lease();
+    EXPECT_FALSE(backend->awaiting_link());
+    EXPECT_EQ(calls(), "");
+}
 TEST_F(ReconnectLink, AWindowClosedDuringTheLiveQueryClaimsNothing) {
     ASSERT_TRUE(reconnect());
     ASSERT_TRUE(backend->awaiting_link());

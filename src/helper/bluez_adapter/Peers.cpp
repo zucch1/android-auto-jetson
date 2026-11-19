@@ -155,6 +155,7 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     // retained object is dead (handoff() would otherwise re-read its failure on every poll).
     if (impl_->bootstrap && !impl_->bootstrap->live() && !impl_->bootstrap->complete()) impl_->bootstrap.reset();
     impl_->last_failure = HandoffFailure::none;
+    impl_->lost_link.reset();
     impl_->allowed = *observed;
     impl_->window = impl_->now() + std::chrono::seconds(60);
     // The AA profile is a server: the bonded phone initiates RFCOMM, and its Android Auto does
