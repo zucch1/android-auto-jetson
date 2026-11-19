@@ -49,7 +49,8 @@ class Run:
         self.stamped: list = []
         self.run = {"duration_s": duration, "active_ns": ACTIVE,
                     "window_end_ns": self.first + duration * S + S // 2,
-                    "receiver_alive_at_end": True, "display_alive_at_end": True}
+                    "receiver_alive_at_end": True, "display_alive_at_end": True,
+                    "receiver_exit": 0}
         rate = painted_fps or fps
         count = int((duration + 1) * rate)
         self.paints = [self.first + int(i * S / rate) for i in range(count)]
@@ -397,6 +398,21 @@ class AnalyzerTests(unittest.TestCase):
             res = smoke.analyze_dir(run.write(root))
             self.assertNotEqual(res["verdict"], "PASS", res)
             self.assertEqual(res["verdict"], "FAIL")
+
+    def test_missing_or_null_receiver_exit_is_not_pass(self) -> None:
+        # A run.json without a receiver exit code, or with null, cannot show the
+        # receiver ended cleanly: analyze(), analyze_dir() and the offline CLI never PASS it.
+        for label, mutate in (("missing", lambda r: r.pop("receiver_exit")),
+                              ("null", lambda r: r.update(receiver_exit=None))):
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix=f"drive-smoke-{label}-") as directory:
+                run = Run()
+                self.assertEqual(self.analyze(run)["verdict"], "PASS")  # the healthy control
+                mutate(run.run)
+                res = self.analyze(run)
+                self.assertEqual(res["verdict"], "FAIL", res)
+                self.assertEqual(res["failure"], "receiver_exit_missing")
+                out = run.write(Path(directory))
+                self.assertEqual(smoke.analyze_dir(out)["verdict"], "FAIL")
 
 
 NOW = datetime(2026, 11, 16, 12, tzinfo=timezone.utc)

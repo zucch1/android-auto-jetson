@@ -291,11 +291,13 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
 
     verdict = "PASS" if all(c["passed"] is not False for c in criteria) else "FAIL"
     failure = None
+    # PASS needs a receiver that exited 0. A missing or null exit code means the
+    # run cannot show the receiver ended cleanly, so it never passes (#163 review).
     receiver_exit = run.get("receiver_exit")
-    if receiver_exit not in (0, None):
+    if type(receiver_exit) is not int or receiver_exit != 0:
         if verdict == "PASS":
             verdict = "FAIL"
-        failure = f"receiver_exit_{receiver_exit}"
+        failure = f"receiver_exit_{'missing' if receiver_exit is None else receiver_exit}"
     elif run.get("logger_error"):
         if verdict == "PASS":
             verdict = "FAIL"
@@ -790,15 +792,9 @@ def _run_cli(args) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         return _blocked(out, base, "phone_command_failed")
+    # analyze() fails a PASS on a nonzero or missing receiver exit and on a latched
+    # logger error, reading the run.json written just above.
     result = {**base, **analyze_dir(out), "finished_utc": datetime.now(timezone.utc).isoformat()}
-    if (run.get("receiver_exit") not in (0, None)
-            or (receiver is not None and run.get("receiver_exit") is None)) and result["verdict"] == "PASS":
-        # A nonzero exit with a complete log is a receiver failure (#90 review).
-        result["verdict"] = "FAIL"
-        result["failure"] = f"receiver_exit_{run.get('receiver_exit')}"
-    if run.get("logger_error") and result["verdict"] == "PASS":
-        result["verdict"] = "FAIL"
-        result["failure"] = run["logger_error"]
     result["media_relaunches"] = run["media_relaunches"]
     result["cleanup_failures"] = run["cleanup_failures"]
     if run.get("failure"):
