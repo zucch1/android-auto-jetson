@@ -57,6 +57,9 @@ jobs:
           # Ubuntu archive. Every download stays verified against the signed
           # indexes. Healthy runs take ~20 s; the worst case is two updates plus
           # two downloads, which must leave this job's timeout room to build.
+          # `--error-on=any` makes a failed index fetch fail the update (apt-get
+          # otherwise exits 0 on some fetch errors), and the final install uses
+          # `--no-download` so it cannot fetch outside the bounded phases.
           apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           fell_back=0
           use_primary_archive() {
@@ -70,10 +73,10 @@ jobs:
             sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
               /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
             fell_back=1
-            sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update
+            sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" --error-on=any update
           }
           apt_update() {
-            if ! sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update; then
+            if ! sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" --error-on=any update; then
               use_primary_archive update
             fi
           }
@@ -83,7 +86,7 @@ jobs:
               use_primary_archive download
               sudo timeout "$APT_DL_S" apt-get "${apt_opts[@]}" --download-only install "$@"
             fi
-            sudo apt-get "${apt_opts[@]}" install "$@"
+            sudo apt-get "${apt_opts[@]}" --no-download install "$@"
           }
           apt_update
           apt_get_install --no-install-recommends -y ninja-build cmake g++ \
@@ -295,6 +298,9 @@ jobs:
           # Ubuntu archive. Every download stays verified against the signed
           # indexes. Healthy runs take ~20 s; the worst case is two updates plus
           # two downloads, which must leave this job's timeout room to build.
+          # `--error-on=any` makes a failed index fetch fail the update (apt-get
+          # otherwise exits 0 on some fetch errors), and the final install uses
+          # `--no-download` so it cannot fetch outside the bounded phases.
           apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           fell_back=0
           use_primary_archive() {
@@ -308,10 +314,10 @@ jobs:
             sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
               /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
             fell_back=1
-            sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update
+            sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" --error-on=any update
           }
           apt_update() {
-            if ! sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update; then
+            if ! sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" --error-on=any update; then
               use_primary_archive update
             fi
           }
@@ -321,7 +327,7 @@ jobs:
               use_primary_archive download
               sudo timeout "$APT_DL_S" apt-get "${apt_opts[@]}" --download-only install "$@"
             fi
-            sudo apt-get "${apt_opts[@]}" install "$@"
+            sudo apt-get "${apt_opts[@]}" --no-download install "$@"
           }
           apt_update
           apt_get_install --no-install-recommends -y ninja-build cmake \
@@ -550,6 +556,9 @@ jobs:
           # Ubuntu archive. Every download stays verified against the signed
           # indexes. Healthy runs take ~20 s; the worst case is two updates plus
           # two downloads, which must leave this job's timeout room to build.
+          # `--error-on=any` makes a failed index fetch fail the update (apt-get
+          # otherwise exits 0 on some fetch errors), and the final install uses
+          # `--no-download` so it cannot fetch outside the bounded phases.
           apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           fell_back=0
           use_primary_archive() {
@@ -563,10 +572,10 @@ jobs:
             sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
               /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
             fell_back=1
-            sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update
+            sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" --error-on=any update
           }
           apt_update() {
-            if ! sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update; then
+            if ! sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" --error-on=any update; then
               use_primary_archive update
             fi
           }
@@ -576,7 +585,7 @@ jobs:
               use_primary_archive download
               sudo timeout "$APT_DL_S" apt-get "${apt_opts[@]}" --download-only install "$@"
             fi
-            sudo apt-get "${apt_opts[@]}" install "$@"
+            sudo apt-get "${apt_opts[@]}" --no-download install "$@"
           }
           apt_update
           apt_get_install --no-install-recommends -y ninja-build cmake \
