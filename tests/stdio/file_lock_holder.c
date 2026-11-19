@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#define _GNU_SOURCE
 // TEST-ONLY LD_PRELOAD shim: a third-party writer stuck holding a FILE lock.
 // At load it starts a thread that fwrite()s 256 KiB into a pipe nobody reads,
 // so the thread blocks in write(2) while holding that FILE's lock forever.
 // glibc's exit() flushes every open FILE under its lock and would wait for it.
 #include <fcntl.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,7 +13,7 @@
 static void *hold(void *arg) {
     (void)arg;
     int fds[2];
-    if (pipe(fds) != 0) return NULL;
+    if (pipe2(fds, O_CLOEXEC) != 0) return NULL;
     FILE *stuck = fdopen(fds[1], "w");
     static char big[256 * 1024];
     memset(big, 'x', sizeof big);
@@ -19,6 +21,9 @@ static void *hold(void *arg) {
     return NULL;
 }
 __attribute__((constructor)) static void start(void) {
+    /* Only the process under test: children (the NVIDIA codec runs
+       `sh -c "lsmod | grep nvgpu"`) must not inherit the stuck lock. */
+    unsetenv("LD_PRELOAD");
     pthread_t t;
     if (pthread_create(&t, NULL, hold, NULL) == 0) pthread_detach(t);
     usleep(100 * 1000);
