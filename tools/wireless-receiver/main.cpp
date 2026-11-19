@@ -188,6 +188,7 @@ int receiver_main(int argc, char** argv) {
     aa::ipc::RandomPairingIdSource ids;
     aa::audio::AudioRenderWorker audio_sink{audio_config(options->audio_backend), audio_telemetry()};
     const auto opened = audio_sink.ready();
+    if (!opened) { running.store(false); }
     if (const auto report_sink = audio_sink.sink_report();
         opened || !report_sink.cause.empty() || !report_sink.candidates.empty()) {
         aa::audio::log_sink_selected(report_sink, "open", audio_telemetry());

@@ -3899,6 +3899,111 @@ TEST(WiredReceiver, StopDuringSinkReopenNeverRepublishesRouter) {
     EXPECT_EQ(gate->destroyed, 2U);
 }
 
+TEST(WiredReceiver, SinkRecoveryBlocksPcmAdmissionAndAckWhileSelectionLogBlocked) {
+    ReceiverLogScope logging{g_running};
+    auto gate = std::make_shared<RenderGate>();
+    gate->first_write_delay = std::chrono::milliseconds{3000}; // released explicitly below
+    gate->fail_first_write = true;
+
+    std::mutex log_mutex;
+    std::condition_variable log_cv;
+    bool reopen_log_entered = false;
+    bool allow_reopen_log = false;
+
+    const aa::audio::AudioTelemetryCallbacks callbacks{
+        [&](const std::string &line) {
+            if (line.find("\"event\":\"audio_sink_selected\"") != std::string::npos &&
+                line.find("\"origin\":\"reopen\"") != std::string::npos) {
+                std::unique_lock lock(log_mutex);
+                reopen_log_entered = true;
+                log_cv.notify_all();
+                log_cv.wait(lock, [&] { return allow_reopen_log; });
+            }
+            log_line(line);
+        },
+        log_media,
+    };
+
+    aa::audio::AudioRenderWorker audio{
+        aa::audio::pcm_router_config(callbacks, aa::audio::SinkBackend::pulse), callbacks,
+        gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    capture_receiver_stdout();
+
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(960, std::byte{1});
+    ASSERT_TRUE(audio.submit({{role, 1, {1'000'000'000}}, pcm}, {role, 0, 1, 7}));
+    ASSERT_TRUE(gate->wait_writes(1));
+    // Drain chunk 1's admission ACK so completed_ is empty before sink reopen begins.
+    const auto first_ack = audio.take_completion(std::chrono::steady_clock::now() + std::chrono::seconds{2});
+    ASSERT_TRUE(first_ack.has_value());
+    EXPECT_EQ(first_ack->sequence, 1U);
+
+    // Release failing chunk 1 so worker reopens the sink and blocks on sink-selection logging.
+    gate->release();
+    {
+        std::unique_lock lock(log_mutex);
+        ASSERT_TRUE(log_cv.wait_for(lock, std::chrono::seconds{5}, [&] { return reopen_log_entered; }));
+    }
+
+    std::mutex probe_mutex;
+    std::condition_variable probe_cv;
+    bool submit_returned = false;
+    bool submit_ok = false;
+    bool take_returned = false;
+    std::optional<aa::channels::AvDeliveryId> second_ack;
+
+    std::thread admit_thread([&] {
+        const auto res = audio.submit({{role, 2, {1'100'000'000}}, pcm}, {role, 0, 2, 7});
+        std::lock_guard lock(probe_mutex);
+        submit_ok = res.has_value();
+        submit_returned = true;
+        probe_cv.notify_all();
+    });
+    std::thread ack_thread([&] {
+        const auto ack = audio.take_completion(std::chrono::steady_clock::now() +
+                                               std::chrono::seconds{2});
+        std::lock_guard lock(probe_mutex);
+        second_ack = ack;
+        take_returned = true;
+        probe_cv.notify_all();
+    });
+
+    {
+        std::unique_lock lock(probe_mutex);
+        (void)probe_cv.wait_for(lock, std::chrono::milliseconds{60},
+                                [&] { return submit_returned || take_returned; });
+        EXPECT_FALSE(submit_returned)
+            << "PCM was admitted while wired sink-selection logging was blocked";
+        EXPECT_FALSE(take_returned)
+            << "ACK/completion proceeded while wired sink-selection logging was blocked";
+    }
+
+    {
+        std::lock_guard lock(log_mutex);
+        allow_reopen_log = true;
+        log_cv.notify_all();
+    }
+
+    admit_thread.join();
+    ack_thread.join();
+
+    EXPECT_TRUE(submit_returned);
+    EXPECT_TRUE(submit_ok);
+    EXPECT_TRUE(take_returned);
+    ASSERT_TRUE(second_ack.has_value());
+    EXPECT_EQ(second_ack->sequence, 2U);
+    EXPECT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    EXPECT_TRUE(audio.finish());
+
+    const auto output = captured_receiver_stdout();
+    EXPECT_NE(output.find("\"event\":\"audio_sink_selected\",\"origin\":\"reopen\""),
+              std::string::npos) << output;
+    EXPECT_NE(output.find("\"outcome\":\"sink_reopened\""), std::string::npos) << output;
+    std::lock_guard lock(gate->mutex);
+    EXPECT_EQ(gate->writes, 2U);
+}
+
 class ReceiverPollTransport final : public aa::transport::Transport {
   public:
     wiredtest::ScriptedTransport wire;

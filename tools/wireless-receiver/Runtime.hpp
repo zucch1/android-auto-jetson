@@ -40,6 +40,8 @@ struct Runtime final {
     app::WiredSession* configured{};
     std::size_t offered_video_profiles{};
     ipc::VideoSelectionWatchdog selection_watchdog{};
+    std::function<void(bool session_live)> on_turn_for_test{};
+    std::function<void(app::WiredSession&, bool in_poll)> on_before_audio_completions_for_test{};
 
     void stop_runtime() {
         stopping = true;
@@ -49,16 +51,16 @@ struct Runtime final {
     bool service_audio_failure() {
         const auto error = media.audio.failure();
         if (!error) return false;
+        failed = true;
+        stop_runtime();
+        if (auto* live = receiver.session(); live && !live->failure()) {
+            (void)live->fail(*error);
+        }
         if (!audio_failure_reported) {
             audio_failure_reported = true;
             log_line(audio::audio_failure_event_json(
                 "audio_sink_failure", error->code(), media.audio.failure_context()));
         }
-        if (auto* live = receiver.session(); live && !live->failure()) {
-            (void)live->fail(*error);
-        }
-        failed = true;
-        stop_runtime();
         return true;
     }
 
@@ -74,6 +76,9 @@ struct Runtime final {
             bool& active;
             ~Guard() { active = false; }
         } guard{in_audio_completions};
+        if (on_before_audio_completions_for_test) {
+            on_before_audio_completions_for_test(*audio_session, in_poll_);
+        }
         if (auto serviced = app::service_audio_completions(*audio_session, media.audio); !serviced) {
             if (!service_audio_failure()) {
                 const auto& error = serviced.error();
@@ -168,6 +173,7 @@ struct Runtime final {
                 state.projection == ipc::ProjectionState::projecting)
                 queued_input.push_back(event.value());
         }
+        if (on_turn_for_test) { on_turn_for_test(receiver.session() != nullptr); }
     }
     void defer() {
         pending_ack_error_.reset();
@@ -243,7 +249,8 @@ struct Runtime final {
                 if (!service_audio_failure()) {
                     const auto code = pending_ack_error_ ? pending_ack_error_->code()
                                                          : polled.error().code();
-                    if (code == ErrorCode::ipc_queue_full) {
+                    if (code == ErrorCode::ipc_queue_full ||
+                        code == ErrorCode::channel_not_registered) {
                         log_line(app::poll_error_json(
                             code, media.audio, receiver.last_reject(),
                             receiver.last_queue_rejection()));
@@ -254,6 +261,7 @@ struct Runtime final {
             } else {
                 service_audio_completions_if_ready();
             }
+            if (on_turn_for_test) { on_turn_for_test(receiver.session() != nullptr); }
             if (receiver.active()) backoff = std::chrono::milliseconds{250};
             for (unsigned i = 0; i < 8 && !queued_input.empty(); ++i) {
                 const auto event = queued_input.front(); queued_input.pop_front();
@@ -279,6 +287,7 @@ struct Runtime final {
         media.audio.stop();
         bus.service().shutdown();
         receiver.stop();
+        if (on_turn_for_test) { on_turn_for_test(false); }
         media.video.close();
         if (auto finished = media.audio.finish(); !finished) {
             if (!audio_failure_reported) {

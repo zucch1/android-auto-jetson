@@ -120,6 +120,11 @@ core::Result<void> WiredSession::send_frame(std::span<const std::byte> frame) {
     if (auto opened = open_io(deadline.until, bounded.token()); !opened) {
         return io_error(opened.error(), deadline);
     }
+    if (pending_send_error_for_test_) {
+        const auto injected = *pending_send_error_for_test_;
+        pending_send_error_for_test_.reset();
+        return io_error(injected, deadline);
+    }
     if (auto sent = transport_->send(frame); !sent) {
         return io_error(sent.error(), deadline);
     }
@@ -144,6 +149,7 @@ void WiredSession::attach_transport(transport::Transport *transport) noexcept {
 // completes (channels::Negotiator::reset() contract).
 void WiredSession::reset_link() noexcept {
     pending_video_idr_.reset();
+    pending_send_error_for_test_.reset();
     reset_owned_av();
     parser_ = transport::FrameStreamParser{};
     reassembler_ = transport::MessageReassembler{};

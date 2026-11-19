@@ -190,7 +190,7 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
         return Error{ErrorCode::protocol_payload_oversize};
     }
     maybe_bypass_locked(monotonic_now());
-    if (bypass_since_) {
+    if (bypass_since_ && bypass_epoch_ == session_epoch_) {
         ++bypass_dropped_;
         completed_.push_back(id);
         auto observation = credit_event(channels::AvCreditEvent::granted, id);
@@ -283,6 +283,7 @@ void AudioRenderWorker::begin_session() {
     std::unique_lock lock(mutex_);
     if (failure_ || stopping_) { return; }
     ++session_epoch_;
+    if (bypass_since_) { exit_bypass_locked("session_reset"); }
     cancel_all();
     discard_if(queued_, [](const auto&) { return true; });
     completed_.clear();
@@ -304,6 +305,7 @@ void AudioRenderWorker::begin_session() {
     idle_resume_id_.reset();
     idle_resume_frames_ = 0;
     cv_.notify_all();
+    publish_bypass_logs(lock);
 }
 
 std::optional<channels::AvDeliveryId>
@@ -590,6 +592,7 @@ void AudioRenderWorker::maybe_bypass_locked(core::Nanoseconds now) {
 void AudioRenderWorker::enter_bypass_locked(const char* trigger) {
     const auto at = idle_clock_();
     bypass_since_ = step_started_.value_or(at);
+    bypass_epoch_ = session_epoch_;
     bypass_dropped_ = 0;
     bypass_discarded_ = 0;
     bypass_partial_ = 0;
@@ -894,21 +897,25 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                 reopen = sink_write_error && !stopping_ &&
                          consecutive_reopens_ < kMaxConsecutiveReopens;
                 if (reopen) {
-                    if (!bypass_since_) { enter_bypass_locked("sink_write_error"); }
+                    if (same_epoch && !bypass_since_) {
+                        enter_bypass_locked("sink_write_error");
+                    }
                     router_ = nullptr; // no concurrent cancel_pending during reopen
                     in_flight_ = true; // wait_idle() covers the reopen
                 } else {
                     latch_render_failure();
                 }
-            } else if (bypass_since_) {
+            } else if (bypass_since_ && bypass_epoch_ == step_epoch) {
                 exit_bypass_locked("session_reset");
             }
         } else {
             if (bypass_since_) {
-                // The dropped span becomes an authorized all-role idle gap:
-                // the next arrival re-anchors instead of failing the gap cap.
-                if (same_epoch && output_established_) { idle_since_ = *bypass_since_; }
-                reconcile_bypass_locked(result.value());
+                if (bypass_epoch_ == step_epoch) {
+                    // The dropped span becomes an authorized all-role idle gap:
+                    // the next arrival re-anchors instead of failing the gap cap.
+                    if (same_epoch && output_established_) { idle_since_ = *bypass_since_; }
+                    reconcile_bypass_locked(result.value());
+                }
                 exit_bypass_locked("write_returned");
             }
             if (stats.frames_written > before) { consecutive_reopens_ = 0; }
@@ -943,7 +950,6 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             // replaced; the new route anchors on its first arrival.
             local_router.close();
             auto reopened = open(config);
-            std::optional<SinkReport> reopened_sink_report;
             lock.lock();
             ++consecutive_reopens_;
             in_flight_ = false;
@@ -954,30 +960,23 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                 // new route private so shutdown below flushes and closes it,
                 // and never republish it for concurrent cancellation.
                 local_router = std::move(reopened).value();
-                exit_bypass_locked("stopped");
+                if (bypass_since_) { exit_bypass_locked("stopped"); }
             } else if (healthy) {
                 local_router = std::move(reopened).value();
                 router_ = &local_router;
                 sink_report_ = local_router.report().sink;
-                reopened_sink_report = sink_report_;
                 output_established_ = false;
                 idle_since_.reset();
                 idle_resume_id_.reset();
                 idle_resume_frames_ = 0;
-                exit_bypass_locked("sink_reopened");
+                log_sink_selected(sink_report_, "reopen", telemetry_);
+                if (bypass_since_) { exit_bypass_locked("sink_reopened"); }
             } else {
-                exit_bypass_locked("reopen_failed");
+                if (bypass_since_) { exit_bypass_locked("reopen_failed"); }
                 latch_render_failure();
             }
             cv_.notify_all();
-            auto lines = std::exchange(bypass_logs_, {});
-            lock.unlock();
-            if (reopened_sink_report) {
-                log_sink_selected(*reopened_sink_report, "reopen", telemetry_);
-            }
-            if (telemetry_.log_line) {
-                for (const auto& line : lines) { telemetry_.log_line(line); }
-            }
+            publish_bypass_logs(lock);
         }
     }
     {

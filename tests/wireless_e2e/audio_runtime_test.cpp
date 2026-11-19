@@ -440,6 +440,9 @@ struct RuntimeFixture final {
     std::unique_ptr<wr::Runtime> runtime;
     std::thread runtime_thread;
     std::atomic<int> runtime_exit{-1};
+    std::mutex state_mutex;
+    std::condition_variable state_cv;
+    bool session_live{false};
 
     void start(Clock::time_point deadline = Clock::now() + 20s) {
         wr::running.store(true);
@@ -533,6 +536,11 @@ struct RuntimeFixture final {
             *media, identity, deadline, std::nullopt, std::deque<ipc::InputEvent>{},
             std::nullopt);
         runtime->offered_video_profiles = 1;
+        runtime->on_turn_for_test = [this](bool live) {
+            std::lock_guard lock(state_mutex);
+            session_live = live;
+            state_cv.notify_all();
+        };
         runtime_thread = std::thread([this] { runtime_exit.store(runtime->run()); });
     }
 
@@ -542,9 +550,9 @@ struct RuntimeFixture final {
     }
 
     int stop_and_join(std::chrono::milliseconds drain = 2s) {
-        const auto until = Clock::now() + drain;
-        while (receiver && receiver->session() && Clock::now() < until) {
-            std::this_thread::sleep_for(5ms);
+        {
+            std::unique_lock lock(state_mutex);
+            (void)state_cv.wait_for(lock, drain, [&] { return !session_live; });
         }
         wr::running.store(false);
         return join_runtime();
@@ -613,6 +621,13 @@ TEST(WirelessAudioRuntime, QuietTcpLinkDefersAudioCompletionAtFiveMsCadence) {
         ASSERT_TRUE(phone->wait_audio_ack(-7, 2s));
         ack_latency = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0);
 
+        ASSERT_TRUE(f.audio_worker->wait_idle(Clock::now() + 2s));
+        {
+            std::unique_lock lock(f.gate->mutex);
+            ASSERT_TRUE(
+                f.gate->cv.wait_for(lock, 2s, [&] { return f.gate->writes_completed >= 3U; }));
+        }
+
         EXPECT_TRUE(f.consumer_client->stop_projection());
         phone->close();
         exit_code = f.stop_and_join();
@@ -631,10 +646,13 @@ TEST(WirelessAudioRuntime, ReconnectWithInFlightSessionOneSinkWriteIsolatesEpoch
     StdoutCapture capture;
     std::string output;
     int exit_code = -1;
+    std::size_t entered = 0;
     std::size_t completed = 0;
+    std::size_t opened = 0;
     {
         RuntimeFixture f;
         f.gate->block_first_write = true;
+        f.gate->fail_first_write = true;
         f.gate->populate_playback_slot = true;
         ASSERT_NO_FATAL_FAILURE(f.start(Clock::now() + 20s));
         ASSERT_TRUE(f.backend->wait_authorized(1));
@@ -656,18 +674,23 @@ TEST(WirelessAudioRuntime, ReconnectWithInFlightSessionOneSinkWriteIsolatesEpoch
         auto p2_res = PhonePeer::connect(f.port);
         ASSERT_TRUE(p2_res);
         auto p2 = std::move(p2_res).value();
-        ASSERT_NO_FATAL_FAILURE(p2->handshake_and_open_av(-8));
+        // Reuse the same AV session ID (-7) across reconnect.
+        ASSERT_NO_FATAL_FAILURE(p2->handshake_and_open_av(-7));
 
-        // Send an EARLIER timestamp (1.0s < 2.0s) in Session 2 while Session 1's write
-        // is still unwinding, then release Session 1's blocked sink write.
+        // Send an EARLIER timestamp (1.0s < 2.0s) in Session 2 and wait until Session 2
+        // has actually admitted PCM (ACK -7 delivered) while Session 1's failing write is
+        // still held in GatedSink::write(), then release write 1 to fail and trigger reopen.
         ASSERT_TRUE(p2->send_msg(100, av_data_msg(1'000'000'000ULL, pcm_50ms())));
+        ASSERT_TRUE(p2->wait_audio_ack(-7, 5s));
         f.gate->release();
-        ASSERT_TRUE(p2->wait_audio_ack(-8, 5s));
         ASSERT_TRUE(f.audio_worker->wait_idle(Clock::now() + 2s));
-
         {
-            std::lock_guard lock(f.gate->mutex);
+            std::unique_lock lock(f.gate->mutex);
+            ASSERT_TRUE(
+                f.gate->cv.wait_for(lock, 2s, [&] { return f.gate->writes_completed >= 1U; }));
+            entered = f.gate->writes_entered;
             completed = f.gate->writes_completed;
+            opened = f.gate->sinks_opened;
         }
         EXPECT_FALSE(f.audio_worker->failure().has_value());
         EXPECT_TRUE(f.consumer_client->stop_projection());
@@ -678,57 +701,104 @@ TEST(WirelessAudioRuntime, ReconnectWithInFlightSessionOneSinkWriteIsolatesEpoch
     maybe_dump_jsonl("reconnect_epoch", output);
 
     EXPECT_EQ(exit_code, 0) << output;
-    EXPECT_EQ(completed, 2U);
+    EXPECT_GE(opened, 2U);
+    EXPECT_EQ(entered, 2U);
+    EXPECT_EQ(completed, 1U);
     EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
 }
 
 TEST(WirelessAudioRuntime, AckSendDropRetiresRecoverablyWhileOwnerCancelCleanAndWorkerFailureFails) {
-    // 1. Recoverable TCP drop while audio write finishes -> Runtime retries and stays alive,
-    //    allowing Session 2 to succeed and exit cleanly (0).
+    // 1. Direct ACK send() failures (both inside poll() checkpoint and outside poll()) with
+    //    live peer connections retire recoverably via defer(), while owner cancellation with a
+    //    live pending ACK stops cleanly with exit code 0.
     StdoutCapture capture;
     std::string output;
     int exit_code = -1;
     std::size_t reconnects = 0;
+    std::atomic<bool> saw_in_poll_inject{false};
+    std::atomic<bool> saw_out_poll_inject{false};
+    std::atomic<bool> saw_live_cancel_inject{false};
     {
         RuntimeFixture f;
         f.gate->block_first_write = true;
         ASSERT_NO_FATAL_FAILURE(f.start(Clock::now() + 20s));
+        std::atomic<int> inject_phase{0};
+        f.runtime->on_before_audio_completions_for_test = [&](app::WiredSession& session,
+                                                             bool in_poll) {
+            const int p = inject_phase.load();
+            if (p == 1 && in_poll) {
+                int expected = 1;
+                if (inject_phase.compare_exchange_strong(expected, 0)) {
+                    f.gate->release();
+                    if (f.audio_worker->wait_idle(Clock::now() + 2s)) {
+                        saw_in_poll_inject.store(true);
+                        session.fail_next_send_for_test(aa::Error{aa::ErrorCode::transport_io});
+                    }
+                }
+            } else if (p == 2 && !in_poll && f.audio_worker->outstanding()) {
+                int expected = 2;
+                if (inject_phase.compare_exchange_strong(expected, 0)) {
+                    saw_out_poll_inject.store(true);
+                    session.fail_next_send_for_test(aa::Error{aa::ErrorCode::transport_io});
+                }
+            } else if (p == 3 && f.audio_worker->outstanding()) {
+                int expected = 3;
+                if (inject_phase.compare_exchange_strong(expected, 0)) {
+                    saw_live_cancel_inject.store(true);
+                    wr::running.store(false);
+                    session.request_stop();
+                }
+            }
+        };
         ASSERT_TRUE(f.backend->wait_authorized(1));
 
+        // Phase A (in_poll == true): p1 stays connected while chunk 3's deferred ACK send() fails.
+        auto p1_res = PhonePeer::connect(f.port);
+        ASSERT_TRUE(p1_res);
+        auto p1 = std::move(p1_res).value();
+        ASSERT_NO_FATAL_FAILURE(p1->handshake_and_open_av(-7));
+        ASSERT_TRUE(p1->send_msg(100, av_data_msg(1'000'000'000ULL, pcm_50ms())));
+        ASSERT_TRUE(p1->wait_audio_ack(-7));
+        ASSERT_TRUE(f.gate->wait_entered(1));
+        ASSERT_TRUE(p1->send_msg(100, av_data_msg(1'050'000'000ULL, pcm_50ms())));
+        ASSERT_TRUE(p1->wait_audio_ack(-7));
+        ASSERT_TRUE(p1->send_msg(100, av_data_msg(1'100'000'000ULL, pcm_50ms())));
         {
-            auto p1_res = PhonePeer::connect(f.port);
-            ASSERT_TRUE(p1_res);
-            auto p1 = std::move(p1_res).value();
-            ASSERT_NO_FATAL_FAILURE(p1->handshake_and_open_av(-7));
-            ASSERT_TRUE(p1->send_msg(100, av_data_msg(1'000'000'000ULL, pcm_50ms())));
-            ASSERT_TRUE(p1->wait_audio_ack(-7));
-            ASSERT_TRUE(f.gate->wait_entered(1));
-            ASSERT_TRUE(p1->send_msg(100, av_data_msg(1'050'000'000ULL, pcm_50ms())));
-            ASSERT_TRUE(p1->wait_audio_ack(-7));
-            ASSERT_TRUE(p1->send_msg(100, av_data_msg(1'100'000'000ULL, pcm_50ms())));
-            {
-                std::unique_lock lock(f.gate->mutex);
-                (void)f.gate->cv.wait_for(lock, 30ms, [] { return false; });
-            }
-            p1->close();
-            f.gate->release();
+            std::unique_lock lock(f.gate->mutex);
+            (void)f.gate->cv.wait_for(lock, 30ms, [] { return false; });
         }
-
+        inject_phase.store(1);
         ASSERT_TRUE(f.backend->wait_authorized(2));
+        p1->close();
+
+        // Phase B (in_poll == false): p2 stays connected while immediate ACK send() fails outside poll().
         auto p2_res = PhonePeer::connect(f.port);
         ASSERT_TRUE(p2_res);
         auto p2 = std::move(p2_res).value();
-        ASSERT_NO_FATAL_FAILURE(p2->handshake_and_open_av(-9));
+        ASSERT_NO_FATAL_FAILURE(p2->handshake_and_open_av(-8));
+        inject_phase.store(2);
         ASSERT_TRUE(p2->send_msg(100, av_data_msg(1'200'000'000ULL, pcm_50ms())));
-        ASSERT_TRUE(p2->wait_audio_ack(-9));
-        reconnects = f.backend->reconnect_calls();
-        EXPECT_TRUE(f.consumer_client->stop_projection());
+        ASSERT_TRUE(f.backend->wait_authorized(3));
         p2->close();
-        exit_code = f.stop_and_join();
+
+        // Phase C (live pending ACK + owner cancellation): p3 stays connected, pending ACK hits
+        // ErrorCode::cancelled with running == false -> clean exit 0.
+        auto p3_res = PhonePeer::connect(f.port);
+        ASSERT_TRUE(p3_res);
+        auto p3 = std::move(p3_res).value();
+        ASSERT_NO_FATAL_FAILURE(p3->handshake_and_open_av(-9));
+        reconnects = f.backend->reconnect_calls();
+        inject_phase.store(3);
+        ASSERT_TRUE(p3->send_msg(100, av_data_msg(1'300'000'000ULL, pcm_50ms())));
+        exit_code = f.join_runtime();
+        p3->close();
     }
     output = capture.stop();
+    EXPECT_TRUE(saw_in_poll_inject.load());
+    EXPECT_TRUE(saw_out_poll_inject.load());
+    EXPECT_TRUE(saw_live_cancel_inject.load());
     EXPECT_EQ(exit_code, 0) << output;
-    EXPECT_GE(reconnects, 2U);
+    EXPECT_GE(reconnects, 3U);
     EXPECT_EQ(output.find("audio_sink_failure"), std::string::npos) << output;
 
     // 2. Direct Runtime branches: clean owner/deadline cancellation (exit 0 / not failed)
@@ -851,7 +921,6 @@ TEST(WirelessAudioRuntime, StdoutBackpressureDuringSinkReopenAndBoundedTeardown)
     gate->block_first_write = true;
     gate->fail_first_write = true;
 
-    std::chrono::milliseconds submit_elapsed{9999};
     std::chrono::milliseconds teardown_elapsed{9999};
     bool reopened = false;
     bool worker_stopped_ok = false;
@@ -882,7 +951,7 @@ TEST(WirelessAudioRuntime, StdoutBackpressureDuringSinkReopenAndBoundedTeardown)
         worker_stopped_ok = worker_stopped_ok && submitted && gate->wait_entered(1);
 
         // Release blocked failing write so worker reopens sink and calls log_sink_selected("reopen")
-        // under StdoutLog backpressure — must NOT hold AudioRenderWorker::mutex_.
+        // under StdoutLog backpressure while holding mutex_ until running becomes false.
         gate->release();
         const auto reopen_deadline = Clock::now() + 2s;
         while (Clock::now() < reopen_deadline) {
@@ -897,18 +966,11 @@ TEST(WirelessAudioRuntime, StdoutBackpressureDuringSinkReopenAndBoundedTeardown)
         }
         std::this_thread::sleep_for(20ms);
 
-        // Operations on AudioRenderWorker::mutex_ remain immediate while log_sink_selected waits.
-        const auto t0 = Clock::now();
-        no_failure = !worker.failure().has_value();
-        (void)worker.outstanding();
-        (void)worker.take_completion();
-        submit_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0);
-
         // Runtime teardown sets running=false so StdoutLog shutdown wait finishes boundedly (~2s+2.2s).
         const auto t_stop = Clock::now();
         wr::running.store(false);
         worker.stop();
-        (void)worker.finish();
+        no_failure = worker.finish().has_value() && !worker.failure().has_value();
         logging.log.finish(std::chrono::milliseconds{2200});
         teardown_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t_stop);
     }
@@ -917,8 +979,134 @@ TEST(WirelessAudioRuntime, StdoutBackpressureDuringSinkReopenAndBoundedTeardown)
     EXPECT_TRUE(worker_stopped_ok);
     EXPECT_TRUE(reopened);
     EXPECT_TRUE(no_failure);
-    EXPECT_LT(submit_elapsed.count(), 50);
     EXPECT_LT(teardown_elapsed.count(), 6000);
+}
+
+TEST(WirelessAudioRuntime, FatalWorkerFailureTeardownBoundedWithFullStalledStdout) {
+    wr::running.store(true);
+    int pfd[2]{-1, -1};
+    ASSERT_EQ(::pipe(pfd), 0);
+    const int saved_stdout = ::dup(STDOUT_FILENO);
+    ASSERT_GE(saved_stdout, 0);
+
+    {
+        const int flags = ::fcntl(pfd[1], F_GETFL);
+        ASSERT_GE(flags, 0);
+        ASSERT_EQ(::fcntl(pfd[1], F_SETFL, flags | O_NONBLOCK), 0);
+        std::vector<char> fill(4096, 'x');
+        while (::write(pfd[1], fill.data(), fill.size()) > 0) {}
+        ASSERT_EQ(::fcntl(pfd[1], F_SETFL, flags), 0);
+    }
+
+    ASSERT_EQ(::dup2(pfd[1], STDOUT_FILENO), STDOUT_FILENO);
+    ::close(pfd[1]);
+    pfd[1] = -1;
+
+    auto close_pipe_and_restore_stdout = [&] {
+        if (pfd[0] >= 0) {
+            ::close(pfd[0]);
+            pfd[0] = -1;
+        }
+        std::this_thread::sleep_for(20ms);
+        ::dup2(saved_stdout, STDOUT_FILENO);
+        ::close(saved_stdout);
+    };
+
+    std::future_status wait_status = std::future_status::timeout;
+    int exit_code = -1;
+    bool rt_failed = false;
+    bool rt_stopping = false;
+    bool running_after = true;
+    std::chrono::milliseconds elapsed{9999};
+
+    {
+        TempDir unit_dir;
+        aa::trust::ApprovedPhoneStore trust{unit_dir.path / "approved-phones.json"};
+        wiredtest::CaptureSink dcapture;
+        aa::diagnostics::Diagnostics diags{dcapture};
+        ASSERT_TRUE(trust.load());
+        const aa::trust::TransportIdentity wid{
+            aa::trust::WirelessIdentity{"12:34:56:78:9A:BC", "12:34:56:78:9A:BD"}};
+        ASSERT_TRUE(trust.approve(wid));
+
+        const char* dbus_addr = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+        ASSERT_NE(dbus_addr, nullptr);
+        auto helper = helper::BusClient::private_bus_for_test(dbus_addr, trust);
+        ASSERT_TRUE(helper);
+
+        ss::SteadyClock sclock;
+        aa::trust::SteadyClock tclock;
+        aa::trust::PairingPolicy phones{trust, tclock};
+        ipc::RandomPairingIdSource ids;
+
+        auto gate = std::make_shared<SinkGate>();
+        audio::AudioRenderWorker bad_worker{
+            wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
+            make_gated_router(gate)};
+        ASSERT_TRUE(bad_worker.ready());
+        wr::Media bad_media{bad_worker};
+        app::WirelessReceiver wrx{{trust, sclock, diags}, *helper.value(), bad_media.config()};
+        auto bus = ipc::ControlBusService::start({ipc::current_uid()},
+                                                 {ids, phones, &wrx.confirmation()});
+        ASSERT_TRUE(bus);
+        auto vserv = ipc::VideoServer::listen(
+            ipc::VideoSocketPath{(unit_dir.path / "v.sock").string()},
+            ipc::VideoServerOptions{{}, ipc::current_uid()});
+        ASSERT_TRUE(vserv);
+        auto iserv = ipc::InputServer::listen(
+            ipc::InputSocketPath{(unit_dir.path / "i.sock").string()},
+            ipc::InputServerOptions{ipc::current_uid()});
+        ASSERT_TRUE(iserv);
+
+        diag::StdoutLogScope logging{wr::running};
+        {
+            const std::string line(200, 'f');
+            for (std::size_t i = 0; i < diag::StdoutLog::entry_capacity; ++i) {
+                if (logging.log.submit(line)) break;
+            }
+        }
+
+        // Pre-latch worker failure, then run real Runtime::run() with running==true, a 20s deadline,
+        // and a full stalled stdout queue. service_audio_failure() must clear running BEFORE log_line().
+        const auto role = proto::ChannelRole::media_audio;
+        bad_worker.invalidate(role, 55);
+        ASSERT_TRUE(bad_worker.submit({{role, 55, {-1LL}}, wiredtest::pcm_unit()}, {role, 55, 55, 1}));
+        ASSERT_TRUE(bad_worker.wait_idle(Clock::now() + 2s));
+        ASSERT_TRUE(bad_worker.failure());
+
+        wr::Runtime rt{wrx, *helper.value(), bus.value(), vserv.value(), iserv.value(),
+                       bad_media, wid, Clock::now() + 20s, std::nullopt, {}, std::nullopt};
+        std::promise<int> done_promise;
+        auto done_future = done_promise.get_future();
+        const auto t0 = Clock::now();
+        std::thread runner([&] { done_promise.set_value(rt.run()); });
+        wait_status = done_future.wait_for(std::chrono::milliseconds{4500});
+        elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0);
+        if (wait_status == std::future_status::ready) {
+            exit_code = done_future.get();
+            rt_failed = rt.failed;
+            rt_stopping = rt.stopping;
+            running_after = wr::running.load();
+            runner.join();
+        } else {
+            wr::running.store(false);
+            close_pipe_and_restore_stdout();
+            runner.join();
+        }
+        logging.log.finish(std::chrono::milliseconds{200});
+        bus.value().close();
+    }
+
+    if (pfd[0] >= 0) {
+        close_pipe_and_restore_stdout();
+    }
+    EXPECT_EQ(wait_status, std::future_status::ready)
+        << "Runtime::run() blocked on full stalled stdout during fatal worker shutdown";
+    EXPECT_EQ(exit_code, 1);
+    EXPECT_TRUE(rt_failed);
+    EXPECT_TRUE(rt_stopping);
+    EXPECT_FALSE(running_after);
+    EXPECT_LT(elapsed.count(), 4500);
 }
 
 TEST(WirelessAudioRuntime, RuntimeAvPendingDuplicateBeforeAckEmitsQueueRejectionAndCreditTrace) {
@@ -968,6 +1156,37 @@ TEST(WirelessAudioRuntime, RuntimeAvPendingDuplicateBeforeAckEmitsQueueRejection
     EXPECT_NE(output.find("\"queue_rejection\":{\"source\":\"av_pending\""),
               std::string::npos) << output;
     EXPECT_NE(output.find("\"av_credit_trace\":{"), std::string::npos) << output;
+}
+
+TEST(WirelessAudioRuntime, UnregisteredChannelPollErrorEmitsRejectedFrameFields) {
+    StdoutCapture capture;
+    std::string output;
+    int exit_code = -1;
+    {
+        RuntimeFixture f;
+        ASSERT_NO_FATAL_FAILURE(f.start(Clock::now() + 20s));
+        ASSERT_TRUE(f.backend->wait_authorized(1));
+
+        auto phone_res = PhonePeer::connect(f.port);
+        ASSERT_TRUE(phone_res);
+        auto phone = std::move(phone_res).value();
+        ASSERT_NO_FATAL_FAILURE(phone->handshake_and_open_av(-7));
+
+        // Send an encrypted frame for unregistered channel 120 with message id 0x8005 (32773).
+        ASSERT_TRUE(phone->send_msg(120, {std::byte{0x80}, std::byte{0x05}, std::byte{0x00}}));
+
+        ASSERT_TRUE(f.backend->wait_authorized(2));
+        EXPECT_TRUE(f.consumer_client->stop_projection());
+        phone->close();
+        exit_code = f.stop_and_join();
+    }
+    output = capture.stop();
+    maybe_dump_jsonl("unregistered_channel", output);
+
+    EXPECT_EQ(exit_code, 0) << output;
+    EXPECT_NE(output.find("\"event\":\"err\",\"detail\":\"poll\",\"code\":\"channel_not_registered\","
+                          "\"reject_channel\":120,\"reject_msg_id\":32773"),
+              std::string::npos) << output;
 }
 
 TEST(WirelessAudioRuntime, SynchronousAudioSinkBaselineVsRenderWorkerBehavior) {

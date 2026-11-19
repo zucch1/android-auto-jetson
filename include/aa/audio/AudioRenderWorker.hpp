@@ -207,6 +207,7 @@ private:
     std::uint64_t idle_sequence_{};
     std::optional<core::Nanoseconds> step_started_;
     std::optional<core::Nanoseconds> bypass_since_;
+    std::uint64_t bypass_epoch_{1};
     std::uint64_t bypass_dropped_{};
     std::uint64_t bypass_discarded_{};
     std::uint64_t bypass_partial_{};

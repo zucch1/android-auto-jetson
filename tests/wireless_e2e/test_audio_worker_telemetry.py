@@ -45,7 +45,8 @@ def main() -> int:
         filt = (
             "WirelessAudioRuntime.QuietTcpLinkDefersAudioCompletionAtFiveMsCadence:"
             "WirelessAudioRuntime.ReconnectWithInFlightSessionOneSinkWriteIsolatesEpochTwo:"
-            "WirelessAudioRuntime.RuntimeAvPendingDuplicateBeforeAckEmitsQueueRejectionAndCreditTrace"
+            "WirelessAudioRuntime.RuntimeAvPendingDuplicateBeforeAckEmitsQueueRejectionAndCreditTrace:"
+            "WirelessAudioRuntime.UnregisteredChannelPollErrorEmitsRejectedFrameFields"
         )
         proc = subprocess.run(
             [binary, f"--gtest_filter={filt}"],
@@ -98,6 +99,24 @@ def main() -> int:
         assert len(poll_errs) == 1, poll_errs
         assert poll_errs[0]["queue_rejection"]["source"] == "av_pending", poll_errs[0]
         assert isinstance(poll_errs[0].get("av_credit_trace"), dict), poll_errs[0]
+
+        # 4. Unregistered channel poll error: poll error with reject_channel + reject_msg_id.
+        unreg_path = Path(f"{out_base}.unregistered_channel")
+        assert unreg_path.exists()
+        unreg_parser = collector.EventParser()
+        unreg_parser.poll(str(unreg_path))
+        assert unreg_parser.terminal_errors == [
+            {"event": "err", "code": "channel_not_registered"}
+        ], unreg_parser.terminal_errors
+        unreg_events = smoke.read_jsonl(unreg_path)
+        unreg_errs = [
+            e for e in unreg_events
+            if e.get("event") == "err" and e.get("detail") == "poll"
+            and e.get("code") == "channel_not_registered"
+        ]
+        assert len(unreg_errs) == 1, unreg_errs
+        assert unreg_errs[0].get("reject_channel") == 120, unreg_errs[0]
+        assert unreg_errs[0].get("reject_msg_id") == 32773, unreg_errs[0]
 
     print("wireless-audio-worker-telemetry=passed")
     return 0

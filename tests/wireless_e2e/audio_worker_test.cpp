@@ -604,4 +604,134 @@ TEST(WirelessAudioWorker, ReconnectResetsGenerationAndFailureSurfacesPollErrorJs
     EXPECT_FALSE(audio.finish());
 }
 
+TEST(WirelessAudioWorker, SessionResetClearsPriorBypassAndProtectsNewPcmFromLateWriteError) {
+    // 1. Existing stall bypass in epoch 1 must not drop or prematurely ACK epoch 2 PCM
+    //    submitted after begin_session() with reused identity while write 1 is still blocked.
+    {
+        wr::running.store(true);
+        auto gate = std::make_shared<SinkGate>();
+        gate->block_first_write = true;
+
+        std::string output;
+        bool ready_ok = false;
+        bool idle_ok = false;
+        bool finish_ok = false;
+        {
+            StdoutCapture capture;
+            diag::StdoutLogScope logging{wr::running};
+            audio::AudioRenderWorker audio{
+                wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
+                fake_router(gate)};
+            ready_ok = audio.ready().has_value();
+            if (ready_ok) {
+                wr::Media media{audio};
+                SessionHarness h1;
+                h1.start(media);
+                const std::size_t h1_base = h1.transport.sent_count();
+                EXPECT_TRUE(h1.send_service(100, av_data_message(2'000'000'000ULL, pcm_50ms())));
+                EXPECT_TRUE(app::service_audio_completions(h1.session, audio));
+                EXPECT_TRUE(gate->wait_entered(1));
+                EXPECT_TRUE(h1.send_service(100, av_data_message(2'050'000'000ULL, pcm_50ms())));
+                EXPECT_TRUE(app::service_audio_completions(h1.session, audio));
+                EXPECT_TRUE(h1.send_service(100, av_data_message(2'100'000'000ULL, pcm_50ms())));
+                EXPECT_TRUE(app::service_audio_completions(h1.session, audio));
+                {
+                    std::unique_lock lock(gate->mutex);
+                    (void)gate->cv.wait_for(lock, std::chrono::milliseconds{275}, [] { return false; });
+                }
+                EXPECT_TRUE(app::service_audio_completions(h1.session, audio));
+                EXPECT_EQ(h1.count_acks(h1_base, 100, -7), 3U);
+
+                // Epoch 2 starts with the same AV session ID (-7) and earlier timestamp while
+                // epoch 1's blocked sink write is still held inside GatedAudioSink::write().
+                SessionHarness h2;
+                h2.start(media);
+                const std::size_t h2_base = h2.transport.sent_count();
+                EXPECT_TRUE(h2.send_service(100, av_data_message(1'000'000'000ULL, pcm_50ms())));
+                EXPECT_TRUE(app::service_audio_completions(h2.session, audio));
+                EXPECT_EQ(h2.count_acks(h2_base, 100, -7), 1U);
+
+                gate->release();
+                idle_ok = audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2});
+                EXPECT_TRUE(app::service_audio_completions(h2.session, audio));
+                EXPECT_FALSE(audio.failure().has_value());
+            }
+            audio.stop();
+            finish_ok = audio.finish().has_value();
+            logging.log.finish();
+            output = capture.stop();
+        }
+        EXPECT_TRUE(ready_ok);
+        EXPECT_TRUE(idle_ok);
+        EXPECT_TRUE(finish_ok);
+        std::lock_guard lock(gate->mutex);
+        EXPECT_EQ(gate->writes_entered, 2U) << output;
+        EXPECT_EQ(gate->writes_completed, 2U) << output;
+    }
+
+    // 2. Without a preexisting bypass, a late sink_write_error from retired epoch 1 must
+    //    still reopen the sink without calling enter_bypass_locked() on epoch 2's queue.
+    {
+        wr::running.store(true);
+        auto gate = std::make_shared<SinkGate>();
+        gate->block_first_write = true;
+        gate->fail_first_write = true;
+
+        std::string output;
+        bool ready_ok = false;
+        bool idle_ok = false;
+        bool finish_ok = false;
+        std::size_t acks_before_release = 0;
+        std::size_t acks_after_reopen = 0;
+        {
+            StdoutCapture capture;
+            diag::StdoutLogScope logging{wr::running};
+            audio::AudioRenderWorker audio{
+                wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
+                fake_router(gate)};
+            ready_ok = audio.ready().has_value();
+            if (ready_ok) {
+                wr::Media media{audio};
+                SessionHarness h1;
+                h1.start(media);
+                EXPECT_TRUE(h1.send_service(100, av_data_message(2'000'000'000ULL, pcm_50ms())));
+                EXPECT_TRUE(app::service_audio_completions(h1.session, audio));
+                EXPECT_TRUE(gate->wait_entered(1));
+
+                // Epoch 2 queues 3 chunks (chunk 3 deferred) before retired write 1 fails.
+                SessionHarness h2;
+                h2.start(media);
+                const std::size_t h2_base = h2.transport.sent_count();
+                EXPECT_TRUE(h2.send_service(100, av_data_message(1'000'000'000ULL, pcm_50ms())));
+                EXPECT_TRUE(app::service_audio_completions(h2.session, audio));
+                EXPECT_TRUE(h2.send_service(100, av_data_message(1'050'000'000ULL, pcm_50ms())));
+                EXPECT_TRUE(app::service_audio_completions(h2.session, audio));
+                EXPECT_TRUE(h2.send_service(100, av_data_message(1'100'000'000ULL, pcm_50ms())));
+                EXPECT_TRUE(app::service_audio_completions(h2.session, audio));
+                acks_before_release = h2.count_acks(h2_base, 100, -7);
+
+                gate->release();
+                idle_ok = audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2});
+                EXPECT_TRUE(app::service_audio_completions(h2.session, audio));
+                acks_after_reopen = h2.count_acks(h2_base, 100, -7);
+                EXPECT_FALSE(audio.failure().has_value());
+            }
+            audio.stop();
+            finish_ok = audio.finish().has_value();
+            logging.log.finish();
+            output = capture.stop();
+        }
+        EXPECT_TRUE(ready_ok);
+        EXPECT_EQ(acks_before_release, 2U);
+        EXPECT_TRUE(idle_ok);
+        EXPECT_EQ(acks_after_reopen, 3U);
+        EXPECT_TRUE(finish_ok);
+        EXPECT_EQ(output.find("\"trigger\":\"sink_write_error\""), std::string::npos) << output;
+        std::lock_guard lock(gate->mutex);
+        EXPECT_GE(gate->sinks_opened, 2U);
+        EXPECT_EQ(gate->writes_entered, 4U) << output;
+        EXPECT_EQ(gate->writes_completed, 3U) << output;
+    }
+}
+
 } // namespace
