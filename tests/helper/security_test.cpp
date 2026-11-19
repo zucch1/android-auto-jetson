@@ -747,6 +747,15 @@ TEST_F(ReconnectLink, AnExistingOrArrivingLinkIsReportedAndLeftAlone) {
     ASSERT_TRUE(backend->revoke_peer(primary_peer));
     EXPECT_EQ(calls(), "") << "lease retirement or Forget disconnected the phone's link";
 }
+TEST_F(ReconnectLink, AWindowClosedDuringTheLiveQueryClaimsNothing) {
+    ASSERT_TRUE(reconnect());
+    ASSERT_TRUE(backend->awaiting_link());
+    // BlueZ's owner changes while the query's inventory is in flight: the drained callback
+    // resets the window under exact(); the answer is "unknown", never a stale observation.
+    ASSERT_EQ(mock->command("owner-during-inventory"), "ok");
+    EXPECT_FALSE(backend->awaiting_link());
+    EXPECT_FALSE(backend->awaiting_link());
+}
 TEST_F(ReconnectLink, TheAaFencesStillRefuseAForgottenPhoneWithALink) {
     ASSERT_EQ(mock->command("link-up"), "ok");
     ASSERT_TRUE(backend->revoke_peer(primary_peer));

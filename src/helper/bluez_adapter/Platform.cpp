@@ -216,8 +216,16 @@ bool BluezBackend::awaiting_link() {
     // (not an enrolment) with no live bootstrap qualifies. Read only: no Device1 call.
     if (!impl_->allowed || impl_->pairing_enabled || impl_->now() >= impl_->window ||
         (impl_->bootstrap && impl_->bootstrap->live())) return false;
+    // exact() drains BlueZ callbacks, which may close or replace the window: work on a copy and
+    // claim nothing unless the same observation is still the open window afterwards.
+    const auto observed = *impl_->allowed;
     Impl::Device live{};
-    if (!impl_->exact(*impl_->allowed, true, &live)) return false;  // continuity unknown: no claim
+    if (!impl_->exact(observed, true, &live)) return false;  // continuity unknown: no claim
+    const auto& now_open = impl_->allowed;
+    if (!now_open || now_open->device.path != observed.device.path ||
+        now_open->owner_epoch != observed.owner_epoch || now_open->device_epoch != observed.device_epoch ||
+        impl_->pairing_enabled || impl_->now() >= impl_->window ||
+        (impl_->bootstrap && impl_->bootstrap->live())) return false;
     return !live.connected;
 }
 void BluezBackend::fail_handoff(std::uint64_t handle, HandoffFailure reason) { impl_->retire(handle, reason); }

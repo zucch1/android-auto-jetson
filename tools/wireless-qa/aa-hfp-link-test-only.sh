@@ -34,8 +34,9 @@ device=${matches[0]}
   { echo "aa-hfp-link-test-only: $quoted is not paired" >&2; exit 3; }
 address=${device##*/dev_}; address=${address//_/:}   # internal only, never printed
 
-# 0: WirePlumber's device for this phone has an HFP head-unit profile active; 1: it does not;
-# 2: the PipeWire graph could not be read (treated as a verification failure).
+# 0: WirePlumber's device for this phone has an HFP head-unit profile active; 1: the device is in
+# the graph without HFP; 2: the PipeWire graph could not be read; 3: no bluez5 device for this
+# phone is in the graph (it may be down, or the graph cannot see Bluetooth: not proof either way).
 hfp_active() {
   local dump
   dump=$(pw-dump 2>/dev/null) || return 2
@@ -56,15 +57,17 @@ for obj in objects:
     for profile in (info.get("params") or {}).get("Profile") or []:
         if str(profile.get("name", "")).startswith("headset-head-unit"):
             sys.exit(0)
-sys.exit(1)' <<<"$dump"
+    sys.exit(1)
+sys.exit(3)' <<<"$dump"
 }
-# Polls until hfp_active returns the wanted status (0 up, 1 down) or the budget runs out.
+current() { local status=0; hfp_active || status=$?; echo "$status"; }
+# Polls until hfp_active returns one of the wanted statuses or the budget runs out.
 await_hfp() {
-  local want=$1 status
+  local status
   for _ in $(seq 1 "$VERIFY_S"); do
-    status=0; hfp_active || status=$?
+    status=$(current)
     [ "$status" -eq 2 ] && fail "cannot read the PipeWire graph (pw-dump) to verify HFP"
-    [ "$status" -eq "$want" ] && return 0
+    for want in "$@"; do [ "$status" -eq "$want" ] && return 0; done
     sleep 1
   done
   return 1
@@ -73,9 +76,9 @@ link() { busctl get-property org.bluez "$device" org.bluez.Device1 Connected; }
 
 case "$action" in
   status)
-    status=0; hfp_active || status=$?
-    case $status in 0) echo "HFP=up Connected=$(link)" ;; 1) echo "HFP=down Connected=$(link)" ;;
-                    *) fail "cannot read the PipeWire graph (pw-dump)" ;; esac ;;
+    case $(current) in 0) echo "HFP=up Connected=$(link)" ;; 1) echo "HFP=down Connected=$(link)" ;;
+                       3) echo "HFP=unknown (no bluez5 device for the phone in the graph) Connected=$(link)" ;;
+                       *) fail "cannot read the PipeWire graph (pw-dump)" ;; esac ;;
   connect)
     if ! err=$(sudo -n timeout 25 busctl call org.bluez "$device" org.bluez.Device1 ConnectProfile s "$HFP_AG" 2>&1 >/dev/null); then
       # Only the D-Bus error name: BlueZ messages are not part of the redacted output.
@@ -84,11 +87,20 @@ case "$action" in
     await_hfp 0 || fail "ConnectProfile returned but no HFP profile became active within ${VERIFY_S}s (Connected=$(link)); an LE-only link is not HFP"
     echo "HFP=up Connected=$(link)" ;;
   disconnect)
+    # Absence only proves teardown against a baseline: HFP seen up in this graph first. Without
+    # one (an empty graph, or no bluez5 device), only BlueZ's own NotConnected answer counts.
+    before=$(current)
+    [ "$before" -eq 2 ] && fail "cannot read the PipeWire graph (pw-dump) to verify HFP"
     if ! err=$(sudo -n timeout 25 busctl call org.bluez "$device" org.bluez.Device1 DisconnectProfile s "$HFP_AG" 2>&1 >/dev/null); then
       name=$(grep -oE 'org\.bluez\.Error\.[A-Za-z]+' <<<"$err" | head -1 || true)
-      # Already down is fine; anything else is a failed teardown.
-      [ "$name" = org.bluez.Error.NotConnected ] || fail "DisconnectProfile(HFP AG) failed: ${name:-unknown}"
+      if [ "$name" = org.bluez.Error.NotConnected ]; then echo "HFP=down (BlueZ: not connected) Connected=$(link)"; exit 0; fi
+      fail "DisconnectProfile(HFP AG) failed: ${name:-unknown}"
     fi
-    await_hfp 1 || fail "HFP still active ${VERIFY_S}s after DisconnectProfile"
+    if [ "$before" -eq 0 ]; then
+      await_hfp 1 3 || fail "HFP still active ${VERIFY_S}s after DisconnectProfile"
+    else
+      # Not seen up first: a device present without HFP is proof; an absent one is not.
+      await_hfp 1 || fail "unverifiable: HFP was not visible in the PipeWire graph before DisconnectProfile"
+    fi
     echo "HFP=down Connected=$(link)" ;;
 esac

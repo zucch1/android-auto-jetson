@@ -54,6 +54,7 @@ exit 9
 SUDO = '#!/usr/bin/env bash\n[ "$1" = -n ] && shift\n[ "$1" = timeout ] && shift 2\nexec "$@"\n'
 PW_DUMP = r'''#!/usr/bin/env bash
 [ -f "$AA_STUB_DIR/pw-broken" ] && { echo not-json; exit 0; }
+[ -f "$AA_STUB_DIR/pw-empty" ] && { echo '[]'; exit 0; }
 if [ -f "$AA_STUB_DIR/hfp" ]; then profile=headset-head-unit; else profile=off; fi
 printf '[{"type":"PipeWire:Interface:Device","info":{"props":{"device.api":"bluez5","api.bluez5.address":"%s"},"params":{"Profile":[{"name":"%s"}]}}}]\n' "$AA_STUB_ADDRESS" "$profile"
 '''
@@ -125,6 +126,18 @@ class HfpLinkTool(unittest.TestCase):
         (self.stub / "hfp").touch()
         (self.stub / "disconnect").write_text("stuck")
         self.assertEqual(self.run_tool("disconnect").returncode, 1)
+
+    def test_empty_graph_cannot_prove_a_disconnect(self) -> None:
+        (self.stub / "pw-empty").touch()  # the graph sees no Bluetooth at all
+        for mode in ("stuck", "down"):
+            (self.stub / "disconnect").write_text(mode)
+            result = self.run_tool("disconnect")
+            self.assertEqual(result.returncode, 1, mode)
+            self.assertIn("unverifiable", result.stderr)
+
+    def test_empty_graph_cannot_prove_a_connect(self) -> None:
+        (self.stub / "pw-empty").touch()
+        self.assertEqual(self.run_tool("connect").returncode, 1)
 
     def test_already_down_is_success(self) -> None:
         (self.stub / "disconnect").write_text("notconnected")
