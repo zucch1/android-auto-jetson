@@ -90,17 +90,26 @@ void WiredPhoneControl::checkpoint() {
     for (const auto& entry : store_.phones()) {
         if (entry.phone_id == request->phone) snapshot = helper::RevocationV1{entry.phone_id, entry.identity};
     }
-    auto prepared = store_.prepare_forget(request->phone);
-    if (!prepared.has_value()) {
-        complete(std::move(request), prepared.error());
-        return;
-    }
     in_flight_ = std::move(request);
     in_flight_snapshot_ = std::move(snapshot);
+    attempts_ = 0;
+    start_job();
+}
+
+void WiredPhoneControl::start_job() {
+    auto prepared = store_.prepare_forget(in_flight_->phone);
+    if (!prepared.has_value()) {
+        in_flight_snapshot_.reset();
+        complete(std::move(in_flight_), prepared.error());
+        return;
+    }
+    ++attempts_;
     prepared_ = std::move(prepared.value());
     job_ = std::make_shared<Job>();
-    // The thread owns copies only (job state and the prepared document), so an
-    // abandoned write can outlive this object without touching it.
+    // The thread owns copies only (job state and the prepared document, with
+    // its generation and the store's write sequencer), so an abandoned write
+    // can outlive this object without touching it, and can never land over a
+    // newer document.
     persistence_ = std::thread([job = job_, persist = persist_, prepared = *prepared_] {
         auto result = persist(prepared);
         const std::lock_guard lock(job->mutex);
@@ -114,6 +123,14 @@ void WiredPhoneControl::settle() {
     persistence_.join();
     auto written = job_->result;
     job_.reset();
+    if (store_.superseded(*prepared_) && attempts_ < kMaxAttempts) {
+        // Another mutation landed while the write ran: the document is stale
+        // and was either discarded or overwritten. Prepare and write again,
+        // still off the owner (never a synchronous persist here).
+        prepared_.reset();
+        start_job();
+        return;
+    }
     auto request = std::move(in_flight_);
     auto snapshot = std::move(in_flight_snapshot_);
     auto result = store_.apply_forget(*prepared_, std::move(written));
@@ -153,15 +170,24 @@ std::optional<helper::RevocationV1> WiredPhoneControl::take_revocation_v1() {
     return result;
 }
 
-bool WiredPhoneControl::finish() {
+void WiredPhoneControl::drain_persistence() {
     assert_owner();
-    if (job_) {
-        // Shutdown waits for an in-flight durable write only up to a bound.
+    // Shutdown only: wait for an in-flight durable write up to a bound (each
+    // superseded retry gets its own bound), then answer `timeout`.
+    while (job_) {
         if (job_done(kShutdownPersistWait)) {
             settle();
         } else {
             abandon_job();
         }
+    }
+}
+
+bool WiredPhoneControl::finish() {
+    assert_owner();
+    // Live path (polled under the session mutex): never waits on disk.
+    if (job_ && job_done(std::chrono::milliseconds{0})) {
+        settle();
     }
     if (pending_) {
         session_.tick();
@@ -181,6 +207,7 @@ void WiredPhoneControl::close() {
         accepting_ = false;
         request = std::move(queued_);
     }
+    drain_persistence();
     (void)finish();
     if (request) {
         complete(std::move(request), Error{ErrorCode::cancelled});

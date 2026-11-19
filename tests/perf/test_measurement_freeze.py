@@ -59,8 +59,17 @@ def virtual(mode: str) -> dict:
                 late += [{"event": "media_timing", "audio_latency_ms": "bad", "av_sync_ms": "bad"}]
             if mode == "err":
                 late += [{"event": "err", "code": "shutdown-diagnostic"}]
+            if mode in {"in_window", "unstamped"}:
+                # #90 review 4: one in-window 250 ms sample delivered only now.
+                late = [{"event": "media_timing", "audio_latency_ms": 250}]
             if mode != "baseline":
                 for event in late:
+                    # Shutdown records carry the receiver's emission stamp: after
+                    # the window, except the in-window sample (or none at all).
+                    if mode == "in_window":
+                        event = event | {"emit_ns": 2 * SECOND}
+                    elif mode != "unstamped":
+                        event = event | {"emit_ns": helper.clock[0]}
                     self.stdout.write(json.dumps(event) + "\n")
                 self.stdout.flush()
             if mode == "whole":
@@ -265,6 +274,19 @@ def test_real_cli_shutdown() -> None:
                 assert doc["verdict"] == "FAIL", mode
             assert doc["qualification_status"] == "INCOMPLETE"
             print("CLI", mode, actual, doc["verdict"], flush=True)
+
+
+
+def test_late_in_window_sample_counts_at_its_emission_time() -> None:
+    # Given: a 250 ms sample emitted inside the window but read only at drain.
+    capture = virtual("in_window")
+    # Then: it is counted (its emission time is inside the window), never
+    # silently replaced by the in-window 10 ms samples.
+    assert capture["events"]["audio_latency_ms"] == 250, capture["events"]
+    # And: the same sample without an emission stamp makes the metric invalid.
+    capture = virtual("unstamped")
+    assert {"audio_latency_ms", "late_in_window_telemetry"} <= set(capture["invalid_telemetry"]), \
+        capture["invalid_telemetry"]
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@
 #include "decode_loss.hpp"
 #include "pump_timer.hpp"
 #include "shutdown_outcome.hpp"
+#include "signal_quit.hpp"
 #include "test_control.hpp"
 
 #include <QApplication>
@@ -257,6 +258,9 @@ int main(int argc, char** argv) {
     }
     if (check_only) { std::puts("pipeline_available"); return 0; }
     QApplication app(argc, argv);
+    // SIGTERM/SIGINT quit the event loop, so the telemetry log is drained and
+    // proven complete on a normal runner stop (#90 review 4).
+    const auto quit_on_signal = aa::display::signal_quit::install();
     aa::ipc::InputSender sender{};
     sender.attach(aa::ipc::InputSocketPath{input_socket}, aa::ipc::current_uid());
     g_sender = &sender;

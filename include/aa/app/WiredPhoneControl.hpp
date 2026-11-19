@@ -25,8 +25,13 @@ class WiredSession;
 // durable write (temp file, fsync, rename, directory fsync) runs on a
 // per-request persistence thread that touches only the file (#90: a stalled
 // disk must never stall the session's poll, A/V dispatch or audio credits).
-// checkpoint() never waits on that write; finish() waits for it only up to
-// kShutdownPersistWait, then answers the D-Bus caller with `timeout`.
+// checkpoint() and finish() (the live service path, polled under the session
+// mutex) never wait on that write. drain_persistence() (called by close(), and
+// by the receiver before it takes the session mutex for shutdown) waits only up
+// to kShutdownPersistWait, then answers the D-Bus caller with `timeout`. Every
+// write carries a store generation, so an abandoned older write can never
+// replace a newer revocation; a write superseded by another mutation is
+// prepared and written again off the owner.
 class WiredPhoneControl final {
   public:
     using Persist = std::function<core::Result<void>(const trust::PreparedForget&)>;
@@ -43,6 +48,7 @@ class WiredPhoneControl final {
     std::optional<helper::RevocationV1> take_revocation_v1();
     void checkpoint();
     [[nodiscard]] bool finish();
+    void drain_persistence();
     void close();
 
   private:
@@ -60,6 +66,7 @@ class WiredPhoneControl final {
     void complete(std::unique_ptr<Request>, core::Result<void>);
     [[nodiscard]] bool job_done(std::chrono::milliseconds wait);
     void settle();
+    void start_job();
     void abandon_job();
 
     trust::ApprovedPhoneStore& store_;
@@ -80,5 +87,7 @@ class WiredPhoneControl final {
     std::unique_ptr<Request> in_flight_; // the request whose write is running
     std::optional<trust::PreparedForget> prepared_;
     std::optional<helper::RevocationV1> in_flight_snapshot_;
+    static constexpr int kMaxAttempts = 8;
+    int attempts_{0};
 };
 } // namespace aa::app

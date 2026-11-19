@@ -251,6 +251,22 @@ def log_integrity():
         rec.write_text(half + "\n")
         parser.poll(str(rec))
         assert parser.integrity_issues(str(rec), None) == []
+    # #90 review 4: the completion record must be the single terminal record.
+    assert issues([clean, {"event": "video_sent", "units": 3}])[1] == {"receiver_log_incomplete"}
+    assert issues([clean, clean])[1] == {"receiver_log_incomplete"}
+    assert issues([clean], [{"event": "telemetry_complete"}, {"event": "video_presented"}])[1] == \
+        {"display_log_incomplete"}
+    import aa_log_integrity as integrity
+    framed = "\n".join(["### gen1", json.dumps(clean), "### last", json.dumps(clean), ""])
+    assert integrity.assess_generations(framed)["complete"]
+    # Unframed (no proof the record was terminal), a different last record,
+    # or a generation reported missing: incomplete.
+    assert not integrity.assess_generations("### gen1\n" + json.dumps(clean))["complete"]
+    assert not integrity.assess_generations(framed.replace("### last\n" + json.dumps(clean),
+                                                           '### last\n{"event":"active"}'))["complete"]
+    missing = integrity.assess_generations(framed + "### gen2\n### missing\n")
+    assert not missing["complete"] and missing["per_generation"]["gen1"]["complete"]
+    assert not missing["per_generation"]["gen2"]["complete"]
 
 
 if __name__ == "__main__":

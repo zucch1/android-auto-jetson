@@ -78,7 +78,20 @@ core::Result<void> ApprovedPhoneStore::persist() {
     if (text.size() > detail::kMaxStoreBytes) {
         return Error{ErrorCode::trust_store_io};
     }
-    return detail::write_file_private(path_, text);
+    // Ordered with the off-owner revocation writes: this document is the newest.
+    const std::uint64_t generation = sequencer_->next.fetch_add(1);
+    std::unique_lock lock(sequencer_->mutex, std::defer_lock);
+    if (!lock.try_lock_for(kOwnerWriteWait)) {
+        return Error{ErrorCode::trust_store_io}; // a stuck writer: fail closed, nothing replaced
+    }
+    if (generation <= sequencer_->committed) {
+        return Error{ErrorCode::trust_store_io};
+    }
+    auto written = detail::write_file_private(path_, text);
+    if (written.has_value() || written.error().code() == ErrorCode::trust_store_not_durable) {
+        sequencer_->committed = generation;
+    }
+    return written;
 }
 
 std::optional<std::size_t> ApprovedPhoneStore::index_of_key(const std::string& key) const {
@@ -195,7 +208,8 @@ core::Result<PreparedForget> ApprovedPhoneStore::prepare_forget(core::PhoneId ph
     // matching identity (match_key: a serial-backed wired phone recorded on
     // two ports is ONE phone), so the identity cannot remain approved under a
     // second phone id or a second port record.
-    PreparedForget prepared{phone, match_key(index->identity), {}, path_, mutation_epoch_};
+    PreparedForget prepared{phone, match_key(index->identity), {}, path_, mutation_epoch_,
+                            sequencer_->next.fetch_add(1), sequencer_};
     std::vector<ApprovedPhone> after;
     for (const auto& entry : phones_) {
         if (match_key(entry.identity) != prepared.match_key) {
@@ -211,13 +225,32 @@ core::Result<PreparedForget> ApprovedPhoneStore::prepare_forget(core::PhoneId ph
 }
 
 core::Result<void> ApprovedPhoneStore::write_prepared(const PreparedForget& prepared) {
-    return detail::write_file_private(prepared.path, prepared.document);
+    if (!prepared.sequencer) {
+        return Error{ErrorCode::invalid_argument};
+    }
+    auto& sequencer = *prepared.sequencer;
+    const std::lock_guard lock(sequencer.mutex);
+    if (prepared.generation <= sequencer.committed) {
+        // A newer document already replaced the file: never restore this stale one.
+        return Error{ErrorCode::cancelled};
+    }
+    auto written = detail::write_file_private(prepared.path, prepared.document);
+    if (written.has_value() || written.error().code() == ErrorCode::trust_store_not_durable) {
+        sequencer.committed = prepared.generation;
+    }
+    return written;
 }
 
 core::Result<void> ApprovedPhoneStore::apply_forget(const PreparedForget& prepared,
                                                    core::Result<void> written) {
     // 703: the revocation renamed and landed on disk, so it is kept in memory
     // too; a pre-replacement error leaves memory (and trust) unchanged.
+    if (superseded(prepared)) {
+        // Another mutation landed after this document was built, so it is
+        // stale (it either never replaced the file, or a newer write already
+        // overwrote it). Change nothing; the caller prepares again.
+        return Error{ErrorCode::cancelled};
+    }
     if (!written.has_value() && written.error().code() != ErrorCode::trust_store_not_durable) {
         return written;
     }
@@ -226,13 +259,7 @@ core::Result<void> ApprovedPhoneStore::apply_forget(const PreparedForget& prepar
                                      return match_key(entry.identity) == prepared.match_key;
                                  }),
                   phones_.end());
-    const bool raced = prepared.mutation_epoch != mutation_epoch_;
     ++mutation_epoch_;
-    if (raced) {
-        // Another mutation landed between prepare and apply, so the written
-        // document is stale: rewrite the current set (with the removal) now.
-        return persist();
-    }
     return written;
 }
 

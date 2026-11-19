@@ -635,6 +635,33 @@ def case_diagnostics(args: argparse.Namespace) -> None:
             assert set(event) == {"event", "stage", "code"}, event
 
 
+def case_sigterm(args):
+    """#90 review 4: the runners' normal stop (SIGTERM) drains the telemetry log.
+
+    The shipped display, projecting the replay, must exit cleanly on SIGTERM
+    with `telemetry_complete` as the last telemetry record, so a healthy run is
+    never BLOCKED by a missing completion proof.
+    """
+    with tempfile.TemporaryDirectory(prefix="aa-exec-sigterm-") as runtime, ExitStack() as children:
+        receiver, video, input_sock = start_receiver(args, runtime)
+        children.callback(receiver.stop, False)
+        display = start_display(args, video, input_sock, True, os.environ.copy(),
+                                decoder_backend="software")
+        children.callback(display.stop)
+        display.await_status(lambda s: s.get("frames_presented", 0) > 0)
+        display.proc.send_signal(signal.SIGTERM)
+        try:
+            code = display.proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("display did not exit on SIGTERM")
+        display.reader.join(timeout=5)
+        assert code == 0, (code, drain_stderr(display))
+        with display.lock:
+            events = list(display.events)
+        assert events and events[-1].get("event") == "telemetry_complete", events[-5:]
+        assert sum(1 for e in events if e.get("event") == "telemetry_complete") == 1, events[-5:]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--display", required=True)
@@ -643,12 +670,13 @@ def main():
     parser.add_argument("--case", required=True,
                         choices=("replay", "flow", "absent", "stalled", "stopfail",
                                  "stopreject", "diagnostics-bootstrap", "diagnostics-factory",
-                                 "diagnostics-connect"))
+                                 "diagnostics-connect", "sigterm"))
     args = parser.parse_args()
     {"replay": case_replay, "flow": case_flow, "absent": case_absent,
      "stalled": case_stalled, "stopfail": case_stopfail,
      "stopreject": case_stopreject, "diagnostics-bootstrap": case_diagnostics,
-     "diagnostics-factory": case_diagnostics, "diagnostics-connect": case_diagnostics}[args.case](args)
+     "diagnostics-factory": case_diagnostics, "diagnostics-connect": case_diagnostics,
+     "sigterm": case_sigterm}[args.case](args)
     print(f"PASS: {args.case}")
     return 0
 

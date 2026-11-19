@@ -49,11 +49,21 @@ namespace aa::wired_receiver {
 //     so the parked head makes progress at the byte limit too (FIFO-fair).
 //   * Drop summaries (media_telemetry_dropped, runtime_log_dropped) are written
 //     by the worker itself between records and never occupy queue capacity a
-//     real record needs (#90 review P3).
+//     real record needs (#90 review P3). They are written only at a record
+//     boundary, never between the chunks of an oversize record (review 4).
 //   * Completion (production, via StdoutLogScope): after a clean drain at
 //     finish() the worker writes a final log_complete record with cumulative
 //     loss counters and the worst submit-to-write delay. An abandoned or failed
-//     sink never gets one, so gate consumers treat its absence as incomplete.
+//     sink never gets one, so gate consumers treat its absence as incomplete:
+//     the worker re-checks abandonment and the error latch after the final
+//     summaries, immediately before starting the completion write. The one
+//     write it cannot recall is a completion write already in flight when
+//     finish() times out: that line may still land later, and it is truthful
+//     (it is started only after every queued record was written, and finish()
+//     still reports ETIMEDOUT through the exit status). A record cut short by
+//     shutdown mid-chunk is terminated with a newline (an unparseable line)
+//     and counted in shutdown_dropped, so the completion line stays parseable
+//     and the loss fails consumers closed.
 //   * Records submitted through the receiver's non-blocking wrappers carry
 //     "emit_ns" (with_emit_ns): their source emission time, so a late delivery
 //     never moves an event in time.
@@ -368,6 +378,7 @@ private:
         bool exited = false;
         bool abandoned = false;
         bool chunked = false; // an oversize record is mid-admission
+        bool mid_record = false; // the worker wrote a chunk that did not end its record
         std::size_t undelivered = 0;
         bool shutdown_expired = false; // a shutdown-time wait for space ran out
         std::uint64_t shutdown_dropped = 0;
@@ -578,6 +589,8 @@ private:
     // Writes due summaries outside the lock; `lock` is held on entry and exit.
     static bool write_summaries(const std::shared_ptr<State> &state, std::unique_lock<std::mutex> &lock,
                                 bool final) {
+        // Never between the chunks of one record: the summary would split it.
+        if (state->mid_record) { return true; }
         auto lines = state->take_summaries(state->now(), final);
         if (lines.empty()) { return true; }
         state->writing_summary = true;
@@ -604,8 +617,19 @@ private:
             state->promote_parked();
             if (state->queue.empty()) {
                 // Closed and drained: final summaries, then the completion record.
+                if (state->mid_record) {
+                    // Shutdown cut an oversize record short: end the partial line
+                    // so the lines after it parse, and count the record as lost.
+                    ++state->shutdown_dropped;
+                    state->mid_record = false;
+                    lock.unlock();
+                    const bool ended = write_all(state, "\n");
+                    lock.lock();
+                    if (!ended) { return; }
+                }
                 if (!write_summaries(state, lock, true)) { return; }
-                if (!state->completion) { return; }
+                // finish() may have given up while the summaries were written.
+                if (!state->completion || state->abandoned || state->error) { return; }
                 const auto complete = state->completion_line();
                 lock.unlock();
                 (void)write_all(state, complete);
@@ -617,6 +641,7 @@ private:
             lock.unlock();
             if (!write_all(state, front)) { return; }
             lock.lock();
+            state->mid_record = front.empty() || front.back() != '\n';
             state->bytes -= front.size();
             state->queue.pop_front();
             state->max_lag = std::max(state->max_lag, state->now() - state->enqueued.front());

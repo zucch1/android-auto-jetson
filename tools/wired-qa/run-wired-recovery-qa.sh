@@ -212,6 +212,8 @@ CLEANING=0
 
 reset_scenario() {
     SCENARIO_NAME="$1"
+    # The receiver generations (and attempt) this row's evidence can come from.
+    SCENARIO_GEN_LO="$RECEIVER_GENERATION" SCENARIO_ATTEMPT=0
     STIMULUS_NS="" DEADLINE_NS="" TERMINAL_NS="" TERMINAL_SCENARIO=""
     FRAMES_BASELINE="" RECORDED=0
     : > "$TIMING_FAULT"
@@ -279,6 +281,7 @@ record() {
         fi
     fi
     printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$name" "$status" "$recovery" "$retries" "$evidence" "$detail" "${FRAMES_BASELINE}" "$elapsed" >> "${RESULTS_TSV}"
+    printf '%s|%s|%s|%s\n' "$name" "${SCENARIO_GEN_LO:-$RECEIVER_GENERATION}" "$RECEIVER_GENERATION" "${SCENARIO_ATTEMPT:-0}" >> "${RESULTS_DIR}/rowgens.tsv"
     RECORDED=$(( RECORDED + 1 ))
     FRAMES_BASELINE=""
 }
@@ -329,17 +332,52 @@ wait_not_projecting() {
     return 1
 }
 
-# Current receiver-log size (byte offset marker for per-scenario windows).
+# Per-scenario log boundary "BYTES@NS": the receiver-log size and the TARGET's
+# CLOCK_MONOTONIC (the receiver's emit_ns clock), read in one remote call, the
+# clock first. A record after the byte offset counts as evidence only when its
+# own emit_ns is not older than NS (#90 review 4): a stale record that stdout
+# backpressure released after the offset can never pass as fresh evidence.
 log_offset() {
-    local size
-    size="$(remote "wc -c < /tmp/aa-wired-receiver.log 2>/dev/null")" || return 1
-    [[ "$size" =~ ^[[:blank:]]*(0|[1-9][0-9]{0,17})[[:blank:]]*$ ]] || return 1
+    local out size ns
+    out="$(remote "n=\$(python3 -c 'import time; print(time.monotonic_ns())') && s=\$(wc -c < /tmp/aa-wired-receiver.log 2>/dev/null) && echo boundary \$n \$s")" || return 1
+    [[ "$out" =~ ^boundary\ (0|[1-9][0-9]{0,17})\ +(0|[1-9][0-9]{0,17})[[:blank:]]*$ ]] || return 1
+    ns="${BASH_REMATCH[1]}" size="${BASH_REMATCH[2]}"
+    printf '%s@%s\n' "$size" "$ns"
+}
+
+# The target's CLOCK_MONOTONIC alone (a boundary for a log that starts empty).
+target_now_ns() {
+    local out
+    out="$(remote "python3 -c 'import time; print(time.monotonic_ns())'")" || return 1
+    [[ "$out" =~ ^[[:blank:]]*(0|[1-9][0-9]{0,17})[[:blank:]]*$ ]] || return 1
     printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
-# Receiver-log content written after the given byte offset.
+boundary_bytes() { local b="${1:-0}"; b="${b%%@*}"; [[ "$b" =~ ^[0-9]+$ ]] || b=0; printf '%s' "$b"; }
+boundary_ns() { [[ "${1:-}" == *@* ]] && printf '%s' "${1#*@}"; return 0; }
+
+# Lines whose "emit_ns" is not older than $1 (string-safe integer compare); an
+# unstamped line is never fresh. FRESH_AWK is the same filter for remote use.
+FRESH_AWK_PROGRAM='match($0, /"emit_ns":[0-9]+/) { v = substr($0, RSTART + 10, RLENGTH - 10); if (length(v) > length(t) || (length(v) == length(t) && v >= t)) print }'
+fresh_lines() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]] || return 0
+    awk -v t="$1" "$FRESH_AWK_PROGRAM"
+}
+fresh_awk_remote() { # ns -> a remote pipeline stage (the ns was validated as digits)
+    printf "awk -v t=%s %s" "$1" "$(shq "$FRESH_AWK_PROGRAM")"
+}
+
+# Receiver-log content written after the given boundary's byte offset.
 log_since() {
-    remote "tail -c +$(( $1 + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null" || true
+    remote "tail -c +$(( $(boundary_bytes "$1") + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null" || true
+}
+
+# Of that content, the records emitted after the boundary (stamped, fresh).
+fresh_since() {
+    local ns
+    ns="$(boundary_ns "$1")"
+    [[ "$ns" =~ ^[0-9]+$ ]] || return 0
+    log_since "$1" | fresh_lines "$ns"
 }
 
 # Receiver log integrity (#90 review), across every receiver generation and the
@@ -348,8 +386,17 @@ log_since() {
 # aa_log_integrity flags, e.g. "generations=2 complete=1 state_lost=0 ...".
 INTEGRITY_TOOL="$(cd "$(dirname "${BASH_SOURCE[0]}")/../perf" && pwd)/aa_log_integrity.py"
 receiver_log_audit() {
-    local stream
-    stream="$(remote "rc=0; for f in /tmp/aa-wired-receiver.gen*.log /tmp/aa-wired-receiver.log /tmp/aa-wired-receiver-attempt.log; do [ -e \"\$f\" ] || continue; echo \"### \$f\"; grep -E '\"event\":\"(log_complete|runtime_log_dropped|media_telemetry_dropped)\"' \"\$f\"; [ \$? -le 1 ] || echo '### unreadable'; done; echo '### end'" 2>/dev/null)" ||
+    local stream entries="" entry
+    # The manifest (#90 review 4): every receiver generation this run started,
+    # by number, plus the admission attempt when it ran. A missing or
+    # unreadable log is reported as such, never skipped; "### last" carries
+    # each log's last JSON record so log_complete must be its terminal record.
+    for entry in "${RECEIVER_LOGS[@]}"; do entries+=" $(shq "$entry")"; done
+    if (( RECEIVER_GENERATION > 0 )); then
+        entries+=" $(shq "gen${RECEIVER_GENERATION}:/tmp/aa-wired-receiver.log")"
+    fi
+    (( ATTEMPT_LAUNCHED )) && entries+=" $(shq "attempt:/tmp/aa-wired-receiver-attempt.log")"
+    stream="$(remote "for e in ${entries}; do l=\"\${e%%:*}\"; f=\"\${e#*:}\"; echo \"### \$l\"; if [ ! -e \"\$f\" ]; then echo '### missing'; continue; fi; grep -E '\"event\":\"(log_complete|runtime_log_dropped|media_telemetry_dropped)\"' \"\$f\"; [ \$? -le 1 ] || { echo '### unreadable'; continue; }; echo '### last'; grep '^{' \"\$f\" | tail -n 1; done; echo '### end'" 2>/dev/null)" ||
         stream="### unreadable"
     # The trailing end marker proves the listing itself completed.
     if [[ "$stream" != *"### end"* ]]; then stream="### unreadable"; fi
@@ -430,15 +477,20 @@ painted_frames_grew() {
 # Timing can be emitted at final flush after a failed pump; require the
 # current receiver's nonempty post-success audio_chunks record in this window.
 audio_pumped() {
-    local since="${1:-0}"
-    remote "tail -c +$(( since + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep -q '\"event\":\"media_timing\"' && tail -c +$(( since + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep -q '\"event\":\"audio_chunks\"' && echo ok" >/dev/null 2>&1
+    local since="${1:-0}" bytes ns fresh
+    bytes="$(boundary_bytes "$since")" ns="$(boundary_ns "$since")"
+    [[ "$ns" =~ ^[0-9]+$ ]] || return 1
+    fresh="$(fresh_awk_remote "$ns")"
+    remote "tail -c +$(( bytes + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep '\"event\":\"media_timing\"' | ${fresh} | grep -q . && tail -c +$(( bytes + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep '\"event\":\"audio_chunks\"' | ${fresh} | grep -q . && echo ok" >/dev/null 2>&1
 }
 
 # Input delivery evidence: input_forwarded presence alone is not a delivery
 # claim - only the ok:true record is ("ok":"false" means the send failed).
 input_ok() {
-    local since="${1:-0}"
-    remote "tail -c +$(( since + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep -q '\"event\":\"input_forwarded\",\"ok\":\"true\"' && echo ok" >/dev/null 2>&1
+    local since="${1:-0}" bytes ns
+    bytes="$(boundary_bytes "$since")" ns="$(boundary_ns "$since")"
+    [[ "$ns" =~ ^[0-9]+$ ]] || return 1
+    remote "tail -c +$(( bytes + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null | grep '\"event\":\"input_forwarded\",\"ok\":\"true\"' | $(fresh_awk_remote "$ns") | grep -q . && echo ok" >/dev/null 2>&1
 }
 
 # Drive one real display key event through the shipped testcontrol seam so the
@@ -454,9 +506,9 @@ stimulate_input() {
 dip_observed() {
     local since="${1:-0}"
     local window
-    window="$(log_since "${since}")"
+    # Only records emitted after the boundary (unstamped text never counts).
+    window="$(fresh_since "${since}")"
     [[ "$window" == *'"kind":"reconnect"'* ]] && return 0
-    [[ "$window" == *'peer disconnected'* ]] && return 0
     return 1
 }
 
@@ -518,6 +570,11 @@ media_evidence() {
 RECEIVER_PID=""
 CONSUMER_PID=""
 RECEIVER_GENERATION=0
+RECEIVER_LOGS=()   # "genN:/path" for every archived generation (the audit manifest)
+ATTEMPT_LAUNCHED=0
+# Unique per run, so an archive left by an earlier run can never stand in for
+# one of this run's generations.
+RUN_TAG="$(date +%s)-$$-${RANDOM}"
 start_receiver() {
     [[ -n "${RECEIVER}" ]] || return 1
     local args="--port ${PORT_Q}"
@@ -525,7 +582,11 @@ start_receiver() {
     # Each receiver generation keeps its own log (#90 review): a restart must
     # never erase the previous generation's loss evidence or completion record.
     if (( RECEIVER_GENERATION > 0 )); then
-        remote "mv -f /tmp/aa-wired-receiver.log /tmp/aa-wired-receiver.gen${RECEIVER_GENERATION}.log 2>/dev/null || true" >/dev/null 2>&1 || true
+        local archive="/tmp/aa-wired-receiver.${RUN_TAG}.gen${RECEIVER_GENERATION}.log"
+        # A failed rename leaves this generation missing in the audit (the
+        # next receiver truncates the live log): incomplete, never skipped.
+        remote "mv -f /tmp/aa-wired-receiver.log ${archive} 2>/dev/null; true" >/dev/null 2>&1 || true
+        RECEIVER_LOGS+=("gen${RECEIVER_GENERATION}:${archive}")
     fi
     RECEIVER_GENERATION=$(( RECEIVER_GENERATION + 1 ))
     RECEIVER_PID="$(remote "nohup $(shq "$RECEIVER") ${args} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!" 2>/dev/null | tr -dc '0-9')"
@@ -584,6 +645,9 @@ drive_admission_attempt() {
     local args="--port $(shq "$1")"
     [[ -n "${STORE}" ]] && args="${args} --store $(shq "$STORE")"
     ATTEMPT_RC=0
+    ATTEMPT_LAUNCHED=1 SCENARIO_ATTEMPT=1
+    # A stale attempt log from an earlier run must never be audited as this one.
+    remote "rm -f /tmp/aa-wired-receiver-attempt.log; true" >/dev/null 2>&1 || true
     remote "$(shq "$RECEIVER") ${args} --no-bus --duration-ms 3000 --video-socket /tmp/aa-attempt-video.sock --input-socket /tmp/aa-attempt-input.sock > /tmp/aa-wired-receiver-attempt.log 2>&1" >/dev/null 2>&1 || ATTEMPT_RC=$?
 }
 
@@ -640,9 +704,9 @@ dip_attributed() {
     local since="${1:-0}" label="${2:-}"
     [[ -n "${label}" ]] || return 1
     local window line
-    window="$(log_since "${since}")"
+    window="$(fresh_since "${since}")"
     while IFS= read -r line; do
-        [[ "$line" == *'"kind":"reconnect"'* || "$line" == *'peer disconnected'* ]] || continue
+        [[ "$line" == *'"kind":"reconnect"'* ]] || continue
         [[ "$line" == *"\"phone_id\":\"${label}\""* ]] && return 0
     done <<< "$window"
     return 1
@@ -654,7 +718,7 @@ dip_attributed() {
 # + real media delivery. Anything unobservable is BLOCKED, never PASS.
 
 scenario_receiver_restart() {
-    local recovery="" offset retries_before
+    local recovery="" offset retries_before restart_ns
     # The stack is already up and projecting (item 4 setup): this scenario only
     # disturbs it and restarts the receiver.
     if ! wait_projecting "${BUDGET_MS}"; then
@@ -677,12 +741,16 @@ scenario_receiver_restart() {
         return
     fi
     wait_not_projecting 3000 || true
+    # Evidence must be emitted by the restarted receiver: its target clock at launch.
+    restart_ns="$(target_now_ns)" ||
+        { record receiver_restart FAILED "" "" "" media_boundary_unavailable; return; }
     start_receiver || { record receiver_restart FAILED "" "" "" "restart_failed"; return; }
     # start_receiver launches with `> /tmp/aa-wired-receiver.log` (truncate):
     # the pre-restart offset points past EOF in the fresh log and would miss
     # genuine post-recovery media. The evidence window is the fresh log from
-    # byte 0 (N4) and the retry baseline restarts with it (item 7).
-    offset=0
+    # byte 0 (N4) and the retry baseline restarts with it (item 7); only
+    # records emitted after the relaunch count (#90 review 4).
+    offset="0@${restart_ns}"
     if wait_projecting "${BUDGET_MS}"; then
         if ! remote "grep -q '\"event\":\"active\"' /tmp/aa-wired-receiver.log 2>/dev/null && echo ok" >/dev/null 2>&1; then
             record receiver_restart FAILED "${recovery}" "$(retry_delta "${retries_before}")" "session_active_not_observed" "no_active_event"
@@ -1115,10 +1183,36 @@ fi
 # The audit is not part of any scenario: run it outside the scenario deadline.
 STIMULUS_NS="" DEADLINE_NS="" stop_receiver_for_audit
 log_audit="$(STIMULUS_NS="" DEADLINE_NS="" receiver_log_audit)" || log_audit=""
-log_flag() { [[ " ${log_audit} " == *" $1=1 "* ]]; }
 [[ "$log_audit" == *"complete="* ]] || log_audit="complete=0 state_lost=1 media_lost=1 runtime_lost=1 late_delivery=1"
-log_taint() { # status detail -> prints the taint reason, or nothing
-    local status="$1" detail="$2"
+# A row is judged only by the logs its evidence came from (#90 review 4): the
+# receiver generations live while it ran, plus the admission attempt when it
+# used one. A generation missing from the audit is incomplete.
+row_audit() { # name -> flags for that row's logs
+    local line lo hi attempt g label gl complete=1 state=0 media=0 runtime=0 late=0
+    line="$(grep "^$1|" "${RESULTS_DIR}/rowgens.tsv" 2>/dev/null | tail -n 1)" || line=""
+    if [[ -z "$line" ]]; then
+        printf '%s\n' "${log_audit%%$'\n'*}"
+        return 0
+    fi
+    IFS='|' read -r _ lo hi attempt <<< "$line"
+    local labels=()
+    for (( g = lo; g <= hi; g++ )); do (( g > 0 )) && labels+=("gen$g"); done
+    [[ "$attempt" == 1 ]] && labels+=(attempt)
+    for label in "${labels[@]}"; do
+        gl="$(grep "^gen=${label} " <<< "$log_audit")" || gl=""
+        if [[ -z "$gl" ]]; then complete=0 state=1 media=1 runtime=1 late=1; continue; fi
+        [[ " $gl " == *" complete=1 "* ]] || complete=0
+        [[ " $gl " == *" state_lost=1 "* ]] && state=1
+        [[ " $gl " == *" media_lost=1 "* ]] && media=1
+        [[ " $gl " == *" runtime_lost=1 "* ]] && runtime=1
+        [[ " $gl " == *" late_delivery=1 "* ]] && late=1
+    done
+    printf 'complete=%s state_lost=%s media_lost=%s runtime_lost=%s late_delivery=%s\n' \
+        "$complete" "$state" "$media" "$runtime" "$late"
+}
+log_flag() { [[ " ${row_flags} " == *" $1=1 "* ]]; }
+log_taint() { # status detail evidence -> prints the taint reason, or nothing
+    local status="$1" detail="$2" evidence="${3:-}"
     if [[ "$status" == PASS ]]; then
         if ! log_flag complete; then echo receiver_log_incomplete
         elif log_flag state_lost; then echo receiver_state_log_lost; fi
@@ -1134,7 +1228,13 @@ log_taint() { # status detail -> prints the taint reason, or nothing
             elif log_flag media_lost || log_flag runtime_lost; then echo receiver_media_or_input_log_lost
             elif log_flag late_delivery; then echo receiver_log_late; fi ;;
         recovery_exceeded_budget)
-            if log_flag late_delivery; then echo receiver_log_late; fi ;;
+            # Only a deadline decided by log-timed evidence can be an artifact
+            # of late delivery; a D-Bus or process observation ("not_recovered",
+            # a dip seen by PID) is a confirmed miss.
+            case "$evidence" in
+                *pump*|*input*|*media*|*rejection*|dip+*)
+                    if log_flag late_delivery; then echo receiver_log_late; fi ;;
+            esac ;;
     esac
     return 0
 }
@@ -1147,7 +1247,8 @@ while IFS='|' read -r name status recovery retries evidence detail frames_baseli
     if [[ "$status" == PASS ]] && ! python3 -c 'import sys; v=float(sys.argv[1]); sys.exit(not (0 <= v < int(sys.argv[2])))' "$recovery" "$BUDGET_MS"; then
         status=FAILED detail=timing_error_pass_invariant
     fi
-    taint="$(log_taint "$status" "$detail")" || taint=""
+    row_flags="$(row_audit "$name")"
+    taint="$(log_taint "$status" "$detail" "$evidence")" || taint=""
     if [[ -n "$taint" ]]; then
         status=BLOCKED detail="${taint}:${detail}"
     fi

@@ -31,6 +31,12 @@ Env knobs for the test:
                          (BLOCKED), never fabricate a 0. Without the knob the
                          fields are absent and the collector keeps them null
                          -> BLOCKED (fail closed).
+  FAKE_RECEIVER_HELD_MEDIA=<json>  a media record stamped (emit_ns) 1.5 s into
+                         the run but written only during the shutdown drain,
+                         like a record the real receiver's stalled stdout
+                         delivered late (#90 review 4). FAKE_RECEIVER_HELD_UNSTAMPED=1
+                         writes it without emit_ns.
+  Every media record carries the receiver's emit_ns (CLOCK_MONOTONIC).
   --require-usb-serial S emulates the receiver's same-phone pin (#137):
   FAKE_RECEIVER_ATTACHED_SERIAL (default S) is the phone on the port. A
   different one fails the first link (err code phone_serial_mismatch, exit 3,
@@ -78,8 +84,18 @@ def _option(argv: list[str], name: str) -> str | None:
 MISMATCH = '{"event":"err","detail":"link","code":"phone_serial_mismatch"}'
 
 
+HELD: dict = {}
+
+
+def _media(record: dict) -> str:
+    """A media record as the receiver writes it: emit_ns stamped at the source."""
+    return json.dumps(record | {"emit_ns": time.monotonic_ns()})
+
+
 def _finish() -> None:
     """The real receiver's shutdown tail: `stopping`, late summaries, log_complete."""
+    if HELD.get("record") is not None:
+        print(json.dumps(HELD.pop("record")), flush=True)
     late = os.environ.get("FAKE_RECEIVER_LATE_SUMMARY")
     if late:
         print(late, flush=True)
@@ -121,9 +137,15 @@ def main() -> int:
 
     start = time.monotonic()
     tick = 0
+    held = os.environ.get("FAKE_RECEIVER_HELD_MEDIA")
     while (time.monotonic() - start) * 1000 < duration_ms:
         time.sleep(0.2)
         tick += 1
+        if held is not None and "record" not in HELD and time.monotonic() - start >= 1.5:
+            record = json.loads(held)
+            if os.environ.get("FAKE_RECEIVER_HELD_UNSTAMPED") != "1":
+                record["emit_ns"] = time.monotonic_ns()
+            HELD["record"] = record
         if crash and (time.monotonic() - start) > 0.6:
             return 2
         if (required is not None and swap_after is not None
@@ -155,15 +177,15 @@ def main() -> int:
                 index = tick // 5 - 1
                 av = av_series[min(index, len(av_series) - 1)]
                 stamp = tick * 1_000_000_000
-                print(json.dumps({"event": "audio_write_completed", "scheduled_ns": stamp,
-                                  "scheduled_end_ns": stamp + 20_000_000,
-                                  "completed_ns": stamp}), flush=True)
-                print(json.dumps({"event": "video_presented", "frame": tick,
-                                  "scheduled_ns": stamp,
-                                  "completed_ns": stamp + round(av * 1e6)
-                                  if isinstance(av, float) else av}), flush=True)
+                print(_media({"event": "audio_write_completed", "scheduled_ns": stamp,
+                              "scheduled_end_ns": stamp + 20_000_000,
+                              "completed_ns": stamp}), flush=True)
+                print(_media({"event": "video_presented", "frame": tick,
+                              "scheduled_ns": stamp,
+                              "completed_ns": stamp + round(av * 1e6)
+                              if isinstance(av, float) else av}), flush=True)
                 print(
-                    json.dumps(
+                    _media(
                         {
                             "event": "media_timing",
                             "audio_scheduling_skew_ms": 0,

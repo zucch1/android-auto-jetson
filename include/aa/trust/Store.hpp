@@ -39,8 +39,12 @@
 #include <aa/trust/Identity.hpp>
 #include <aa/trust/Trust.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -73,12 +77,27 @@ inline constexpr std::uint64_t kMaxPhoneId = 4096;
 // prepares (no mutation), any thread writes (file I/O only, never the store
 // object), and the owner applies the result. In-memory trust changes only once
 // the replacement landed, exactly as with the synchronous forget_phone().
+// Orders every durable replacement of one store file (#90 review 4). Each
+// write takes a strictly increasing generation when its document is built; a
+// write whose generation is not newer than the last committed one is discarded
+// before it touches the file, so a stalled (or abandoned) older snapshot can
+// never rename over a newer revocation. Replacements are serialized under the
+// mutex, which only persistence threads hold for long; the owner's synchronous
+// persist() waits for it only up to kOwnerWriteWait and otherwise fails closed.
+struct StoreWriteSequencer {
+    std::timed_mutex mutex;
+    std::atomic<std::uint64_t> next{1};
+    std::uint64_t committed{0}; // guarded by mutex
+};
+
 struct PreparedForget {
     core::PhoneId phone{};
     std::string match_key;
     std::string document;
     std::filesystem::path path;
     std::uint64_t mutation_epoch{};
+    std::uint64_t generation{};
+    std::shared_ptr<StoreWriteSequencer> sequencer;
 };
 
 class ApprovedPhoneStore final : public TrustStore {
@@ -124,10 +143,19 @@ public:
     // apply_forget() run on the owner; write_prepared() touches only the file.
     [[nodiscard]] core::Result<PreparedForget> prepare_forget(core::PhoneId phone) const;
     [[nodiscard]] static core::Result<void> write_prepared(const PreparedForget& prepared);
+    // write_prepared() discards a superseded document (an older generation than
+    // the last committed write) with `cancelled` and never touches the file.
     // `written` is write_prepared()'s result: success or trust_store_not_durable
     // (committed) removes the phone in memory; any other error changes nothing.
+    // A prepared revocation is superseded() when another mutation landed after
+    // it was prepared: its document is stale, so apply_forget() changes nothing
+    // and answers `cancelled`; the caller prepares and writes again.
     [[nodiscard]] core::Result<void> apply_forget(const PreparedForget& prepared,
                                                   core::Result<void> written);
+    [[nodiscard]] bool superseded(const PreparedForget& prepared) const noexcept {
+        return prepared.mutation_epoch != mutation_epoch_;
+    }
+    static constexpr std::chrono::milliseconds kOwnerWriteWait{2000};
 
     // Retry the crash-durability half of a mutation that returned
     // trust_store_not_durable: sync the store's containing directory again.
@@ -165,6 +193,7 @@ private:
     std::uint64_t reload_epoch_{};
     bool usable_{false};
     std::uint64_t mutation_epoch_{}; // bumped by every in-memory mutation
+    std::shared_ptr<StoreWriteSequencer> sequencer_ = std::make_shared<StoreWriteSequencer>();
 };
 
 } // namespace aa::trust

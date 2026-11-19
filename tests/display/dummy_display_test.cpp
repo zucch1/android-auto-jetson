@@ -3171,9 +3171,17 @@ TEST(DummyDisplayBackpressure, ConsumerAwaitingIdrTriggersRateLimitedDbusRecover
     fixture.decoder.report.awaiting_idr = true;
     ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
     EXPECT_TRUE(fixture.service->service->service().consume_idr_recovery_request());
-    EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
-                        "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}"),
-              diagnostics.end());
+    const auto requested_at = std::find(diagnostics.begin(), diagnostics.end(),
+        "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}");
+    EXPECT_NE(requested_at, diagnostics.end());
+    // #90 review 4: the wait transition itself is logged, before (and
+    // independent of) any request outcome, so a wait whose requests all fail
+    // still opens an episode for the drive-smoke gate.
+    const std::string wait_started =
+        "{\"event\":\"idr_wait_started\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}";
+    const auto started_at = std::find(diagnostics.begin(), diagnostics.end(), wait_started);
+    ASSERT_NE(started_at, diagnostics.end());
+    EXPECT_LT(started_at, requested_at);
 
     // Inside 250 ms cooldown window: no duplicate D-Bus request.
     now += std::chrono::milliseconds{100};
@@ -3198,6 +3206,8 @@ TEST(DummyDisplayBackpressure, ConsumerAwaitingIdrTriggersRateLimitedDbusRecover
     fixture.decoder.report.awaiting_idr = true;
     ASSERT_TRUE(fixture.controller->pump(Milliseconds{0}));
     EXPECT_FALSE(fixture.service->service->service().consume_idr_recovery_request());
+    // The second wait opens with no request sent yet: still logged.
+    EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(), wait_started), 2);
 
     // At +250 ms from episode 1's last request (+50 + 50 ms here), episode 2 sends its first request.
     now += std::chrono::milliseconds{50};

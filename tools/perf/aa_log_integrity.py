@@ -13,6 +13,8 @@ log complete before trusting what it does not contain:
   a malformed count is treated as loss.
 * ``telemetry_complete`` is the display telemetry writer's last line.
 
+A completion record proves a log complete only when it is the single terminal
+record: a second one, or any record after it, is incomplete (#90 review 4).
 Every flag fails closed: an incomplete log reports every loss class as possible.
 """
 from __future__ import annotations
@@ -28,6 +30,9 @@ _COMPLETE_FIELDS = ("runtime_dropped", "state_overflow", "media_rate_limited",
                     "media_backpressure", "shutdown_dropped", "max_delivery_lag_ms")
 RELEVANT_EVENTS = frozenset({"log_complete", "runtime_log_dropped", "media_telemetry_dropped",
                              "telemetry_complete"})
+# Stand-in for "some record followed the completion record", for consumers
+# that keep only RELEVANT_EVENTS (the collector).
+AFTER_COMPLETION = "record_after_completion"
 
 
 def _count(value: Any) -> int | None:
@@ -41,12 +46,17 @@ def assess_receiver(events: Iterable[dict]) -> dict:
     """Integrity of one receiver log (one process generation)."""
     complete: dict | None = None
     malformed_complete = False
+    completions = 0
+    after_completion = False
     state_lost = media_lost = runtime_lost = False
     for event in events:
         if not isinstance(event, dict):
             continue
         kind = event.get("event")
+        if completions and kind != "log_complete":
+            after_completion = True  # the completion record was not terminal
         if kind == "log_complete":
+            completions += 1
             counts = {key: _count(event.get(key)) for key in _COMPLETE_FIELDS}
             if any(value is None for value in counts.values()):
                 malformed_complete = True
@@ -61,7 +71,8 @@ def assess_receiver(events: Iterable[dict]) -> dict:
         elif kind == "media_telemetry_dropped":
             if _count(event.get("rate_limited")) != 0 or _count(event.get("backpressure")) != 0:
                 media_lost = True
-    is_complete = complete is not None and not malformed_complete
+    is_complete = (complete is not None and not malformed_complete and completions == 1
+                   and not after_completion)
     if is_complete:
         assert complete is not None
         state_lost = state_lost or complete["state_overflow"] > 0 or complete["shutdown_dropped"] > 0
@@ -83,7 +94,9 @@ def assess_receiver(events: Iterable[dict]) -> dict:
 
 def assess_display(events: Iterable[dict]) -> dict:
     """Integrity of one display telemetry log."""
-    complete = any(isinstance(e, dict) and e.get("event") == "telemetry_complete" for e in events)
+    records = [e for e in events if isinstance(e, dict)]
+    complete = (bool(records) and records[-1].get("event") == "telemetry_complete"
+                and sum(1 for e in records if e.get("event") == "telemetry_complete") == 1)
     return {"complete": complete}
 
 
@@ -98,31 +111,55 @@ def emit_ns(event: dict) -> int | None:
 def assess_generations(text: str) -> dict:
     """Aggregate integrity over several receiver logs read in one stream.
 
-    Each log starts with a ``### <name>`` marker line, followed by a
-    ``### unreadable`` line if it could not be read. Any unreadable, missing or
-    incomplete generation makes the whole set incomplete.
+    Each log starts with a ``### <name>`` marker line, followed by its integrity
+    records, then ``### last`` and the log's last JSON record (framing that
+    proves the completion record terminal). ``### unreadable`` or ``### missing``
+    marks a log that could not be read or was not there. Any unreadable,
+    missing, unframed or incomplete generation makes the whole set incomplete.
     """
     import json
 
-    generations: list[list[dict]] = []
+    generations: list[dict] = []
     unreadable = False
     for raw in text.splitlines():
         if raw.startswith("### "):
-            if raw.strip() == "### unreadable":
+            marker = raw.strip()
+            if marker in ("### unreadable", "### missing"):
                 unreadable = True
+                if generations:
+                    generations[-1]["lost"] = True
+            elif marker == "### last":
+                if generations:
+                    generations[-1]["framed"] = True
             else:
-                generations.append([])
+                generations.append({"name": marker[4:].strip(), "events": [], "framed": False,
+                                    "last": None})
             continue
-        if not generations:
+        if not generations or not raw.strip():
             continue
         try:
             event = json.loads(raw)
         except json.JSONDecodeError:
-            continue
-        generations[-1].append(event)
-    results = [assess_receiver(events) for events in generations]
+            event = None
+        current = generations[-1]
+        if current["framed"]:
+            current["last"] = event if current["last"] is None else False  # one line only
+        elif isinstance(event, dict):
+            current["events"].append(event)
+    results = []
+    names = []
+    for current in generations:
+        names.append(current["name"])
+        result = assess_receiver(current["events"])
+        completions = [e for e in current["events"] if e.get("event") == "log_complete"]
+        terminal = (current["framed"] and isinstance(current["last"], dict)
+                    and len(completions) == 1 and current["last"] == completions[0])
+        if not terminal or current.get("lost"):
+            result = assess_receiver([])  # completion not proven terminal: incomplete
+        results.append(result)
     complete = bool(results) and not unreadable and all(r["complete"] for r in results)
     return {
+        "per_generation": dict(zip(names, results)),
         "generations": len(results),
         "complete": complete,
         "state_lost": not complete or any(r["state_lost"] for r in results),
@@ -140,8 +177,12 @@ def main(argv: list[str]) -> int:
         print("usage: aa_log_integrity.py generations < stream", file=sys.stderr)
         return 2
     result = assess_generations(sys.stdin.read())
-    print(" ".join(f"{key}={int(result[key])}" for key in
-                   ("generations", "complete", "state_lost", "media_lost", "runtime_lost", "late_delivery")))
+    flags = ("complete", "state_lost", "media_lost", "runtime_lost", "late_delivery")
+    print(" ".join(f"{key}={int(result[key])}" for key in ("generations", *flags)))
+    # Then one line per log, so a gate can scope a verdict to the logs it used.
+    for name, one in result["per_generation"].items():
+        if name and " " not in name and "=" not in name:
+            print(f"gen={name} " + " ".join(f"{key}={int(one[key])}" for key in flags))
     return 0
 
 

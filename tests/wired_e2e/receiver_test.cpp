@@ -3314,6 +3314,7 @@ struct RenderGate {
     bool fail_first_write = false; // after first_write_delay, as a sink write timeout
     std::vector<std::int64_t> entered_ns;
     std::vector<std::int64_t> completed_ns;
+    std::vector<std::size_t> completed_writes; // 1-based write number of each success
     void release() {
         std::lock_guard lock(mutex);
         released = true;
@@ -3335,7 +3336,7 @@ class GatedRenderSink final : public aa::audio::detail::ObservedAudioSink {
     }
     aa::core::Result<void> write(const aa::audio::MixedChunk &chunk) override {
         std::unique_lock lock(gate_->mutex);
-        ++gate_->writes;
+        const auto index = ++gate_->writes;
         gate_->pcm.emplace_back(chunk.pcm.begin(), chunk.pcm.end());
         gate_->timestamps.push_back(chunk.timestamp);
         gate_->threads.push_back(std::this_thread::get_id());
@@ -3352,6 +3353,8 @@ class GatedRenderSink final : public aa::audio::detail::ObservedAudioSink {
         }
         if (gate_->fail_write) { return aa::Error{aa::ErrorCode::timeout}; }
         gate_->completed_ns.push_back(steady_ns());
+        gate_->completed_writes.push_back(index);
+        gate_->cv.notify_all();
         return {};
     }
     aa::core::Result<void> drain(aa::core::Milliseconds) override {
@@ -7503,19 +7506,37 @@ TEST(WiredReceiver, WiredReceiverEndToEndKeepsAvAudioAndControlTimingDuringStdou
         // 2. Audio latency gate (< 200 ms) while stdout is blocked & full,
         // measured to the render sink's write (the playback endpoint this
         // harness can observe), not only to the phone-visible ACK.
+        // #90 review 4: the endpoint is the SUCCESSFUL completion of the
+        // sink write carrying exactly the injected PCM (a distinct 0x5a
+        // pattern), not entry into some write.
         const std::size_t audio_acks_before = count_sent_on_channel(100);
-        std::size_t sink_writes_before = 0;
+        const std::vector<std::byte> injected(960UL * 2UL * sizeof(std::int16_t), std::byte{0x5a});
+        std::size_t completions_before = 0;
         {
             std::lock_guard gate_lock(gate->mutex);
-            sink_writes_before = gate->writes;
+            completions_before = gate->completed_writes.size();
         }
         const auto t_audio_start = LogClock::now();
-        push_channel(100, av_data_message(0, wiredtest::pcm_unit()));
-        if (!gate->wait_writes(sink_writes_before + 1)) {
+        const auto t_audio_start_ns = steady_ns();
+        push_channel(100, av_data_message(0, injected));
+        std::optional<std::int64_t> injected_completed_ns;
+        {
+            std::unique_lock gate_lock(gate->mutex);
+            gate->cv.wait_for(gate_lock, std::chrono::seconds{2}, [&] {
+                for (auto k = completions_before; k < gate->completed_writes.size(); ++k) {
+                    const auto index = gate->completed_writes[k];
+                    if (index >= 1 && index <= gate->pcm.size() && gate->pcm[index - 1] == injected) {
+                        injected_completed_ns = gate->completed_ns[k];
+                        return true;
+                    }
+                }
+                return false;
+            });
+        }
+        if (!injected_completed_ns) {
             fail_child(111);
         }
-        const auto audio_sink_elapsed = LogClock::now() - t_audio_start;
-        if (audio_sink_elapsed >= std::chrono::milliseconds{200}) {
+        if (*injected_completed_ns - t_audio_start_ns >= 200'000'000) {
             fail_child(112);
         }
         bool audio_acked = false;
@@ -7840,8 +7861,16 @@ void fill_log_bytes(aa::wired_receiver::StdoutLog &log) {
 }
 
 bool wait_probe_calls(LogWriteProbe &probe, int calls) {
-    std::unique_lock lock(probe.mutex);
-    return probe.cv.wait_for(lock, std::chrono::seconds{5}, [&] { return probe.calls >= calls; });
+    // Polled: the probe does not notify when a write enters (it then waits).
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    for (;;) {
+        {
+            const std::lock_guard lock(probe.mutex);
+            if (probe.calls >= calls) { return true; }
+        }
+        if (std::chrono::steady_clock::now() >= until) { return false; }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
 }
 } // namespace
 
@@ -7938,6 +7967,75 @@ TEST(WiredReceiver, StdoutLogCompletionRecordProvesACleanDrainWithLossAndLag) {
     ASSERT_GE(probe.bytes.size(), expected.size());
     EXPECT_EQ(probe.bytes.substr(probe.bytes.size() - expected.size()), expected);
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"log_complete\""), 1U);
+}
+
+// #90 review 4 P2: a drop summary is written only at a record boundary, never
+// between the chunks of an oversize lossless record.
+TEST(WiredReceiver, StdoutLogDropSummaryNeverSplitsAChunkedRecord) {
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    struct ProbeGuard {
+        LogWriteProbe &p;
+        ~ProbeGuard() { p.release(); LogWriteProbe::active = nullptr; }
+    } probe_guard{probe};
+    std::atomic<bool> running{true};
+    g_log_fake_ns = 0;
+    // Every media record is rate-limited (an empty bucket), so each one is a drop.
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {1e-9, 0.0}};
+    // Given: the first drop summary is out, so the next one waits for its interval.
+    EXPECT_FALSE(log.submit_media("audio_write_completed", "{}"));
+    probe.release();
+    EXPECT_FALSE(log.flush());
+    int calls = 0;
+    {
+        const std::lock_guard lock(probe.mutex);
+        probe.released = false;
+        calls = probe.calls;
+    }
+    // When: an oversize record (two chunks) is mid-write and a second summary
+    // falls due between its chunks.
+    const std::string record =
+        "{\"big\":\"" + std::string(aa::wired_receiver::StdoutLog::byte_capacity + 100, 'x') + "\"}";
+    std::thread producer([&] { EXPECT_FALSE(log.submit(record)); });
+    ASSERT_TRUE(wait_probe_calls(probe, calls + 1));
+    EXPECT_FALSE(log.submit_media("audio_write_completed", "{}"));
+    g_log_fake_ns = 5'000'000'000;
+    probe.release();
+    producer.join();
+    EXPECT_FALSE(log.flush());
+    // Then: the record is intact on one line, and both summaries were written.
+    EXPECT_NE(probe.bytes.find(record + "\n"), std::string::npos) << "a drop summary split the record";
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"media_telemetry_dropped\""), 2U);
+    EXPECT_FALSE(log.finish());
+}
+
+// #90 review 4 P2: finish() giving up while the worker writes its final
+// summaries must still suppress the completion record.
+TEST(WiredReceiver, StdoutLogAbandonedDuringFinalSummariesWritesNoCompletionRecord) {
+    auto *probe = new LogWriteProbe; // Intentionally leaked: the worker outlives this test.
+    LogWriteProbe::active = probe;
+    std::atomic<bool> running{true};
+    {
+        // An empty queue and one pending media drop: the worker's only write
+        // is the drop summary, which stalls in the sink.
+        aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write,
+                                          &aa::wired_receiver::StdoutLog::Clock::now, {1e-9, 0.0},
+                                          aa::wired_receiver::StdoutLog::default_finish_timeout, true};
+        EXPECT_FALSE(log.submit_media("audio_write_completed", "{}"));
+        ASSERT_TRUE(wait_probe_calls(*probe, 1));
+        EXPECT_TRUE(log.finish(std::chrono::milliseconds{100}));
+        EXPECT_TRUE(log.timed_out());
+    }
+    // When: the sink recovers after the abandonment.
+    probe->release();
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    {
+        const std::lock_guard lock(probe->mutex);
+        // Then: the stalled summary lands, but no completion proof follows it.
+        EXPECT_NE(probe->bytes.find("media_telemetry_dropped"), std::string::npos) << probe->bytes;
+        EXPECT_EQ(probe->bytes.find("log_complete"), std::string::npos) << probe->bytes;
+    }
+    LogWriteProbe::active = nullptr;
 }
 
 TEST(WiredReceiver, StdoutLogAbandonedSinkNeverWritesACompletionRecord) {

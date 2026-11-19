@@ -246,6 +246,7 @@ display_pid="$(remote "mkfifo ${REMOTE_QA_DIR_Q}/aa-disp.in && { nohup $(shq "$D
 
 projection="false"
 session_active="false"; video="false"; audio="false"; input="false"
+status_request=0
 deadline=$(( start_ms + PROJECTION_TIMEOUT_MS ))
 poll_remote() {
     local remaining=$((deadline - $(date +%s%3N)))
@@ -260,7 +261,11 @@ while (( $(date +%s%3N) < deadline )); do
     fi
     poll_remote "grep -q '\"event\":\"active\"' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log" >/dev/null 2>&1 && session_active="true"
     if poll_remote "grep -q '\"event\":\"video_sent\"' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log" >/dev/null 2>&1; then
-        status="$(poll_remote "printf 'status\n' > ${REMOTE_QA_DIR_Q}/aa-disp.in 2>/dev/null; grep '\"event\":\"status\"' ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>/dev/null | tail -1" || true)"
+        # Bound to this request (#90 review 4): only the reply carrying our
+        # request id counts, never an older status line still in the log.
+        status_request=$(( status_request + 1 ))
+        request_id="q${$}r${status_request}"
+        status="$(poll_remote "printf 'status ${request_id}\n' > ${REMOTE_QA_DIR_Q}/aa-disp.in 2>/dev/null; sleep 0.3; grep '\"request\":\"${request_id}\"' ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>/dev/null | tail -1" || true)"
         if [[ "$status" =~ \"frames_painted\":([0-9]+) ]] && ((BASH_REMATCH[1] > 0)) && [[ "$status" == *'"render_ok":true'* ]]; then
             video="true"
         fi
@@ -296,7 +301,9 @@ fi
 # completion proof; a missing observable whose record may have been lost or
 # delivered late is BLOCKED, not FAILED. An unreadable log counts as incomplete.
 INTEGRITY_TOOL="$(cd "$(dirname "${BASH_SOURCE[0]}")/../perf" && pwd)/aa_log_integrity.py"
-log_stream="$(remote "grep -E '\"event\":\"(log_complete|runtime_log_dropped|media_telemetry_dropped)\"' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log; rc=\$?; [ \$rc -le 1 ] && echo '### end'" 2>/dev/null)" || log_stream=""
+# The stream keeps the log's last JSON record under "### last", so the checker
+# can require log_complete to be the single terminal record (#90 review 4).
+log_stream="$(remote "f=${REMOTE_QA_DIR_Q}/aa-wired-receiver.log; grep -E '\"event\":\"(log_complete|runtime_log_dropped|media_telemetry_dropped)\"' \"\$f\"; rc=\$?; [ \$rc -le 1 ] || exit 1; echo '### last'; grep '^{' \"\$f\" | tail -n 1; echo '### end'" 2>/dev/null)" || log_stream=""
 if [[ "$log_stream" == *"### end"* ]]; then
     log_stream="### receiver
 ${log_stream%%### end*}"
@@ -304,6 +311,20 @@ else
     log_stream="### unreadable"
 fi
 log_audit="$(printf '%s\n' "$log_stream" | python3 -I "$INTEGRITY_TOOL" generations)" || log_audit=""
+# The display's telemetry log must end with its single completion record: its
+# SIGTERM path drains the writer first (#90 review 4).
+display_last="$(remote "grep '^{' ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>/dev/null | tail -n 1; echo '### end'" 2>/dev/null)" || display_last=""
+display_complete=false
+if [[ "$display_last" == *"### end"* ]] && python3 -I -c '
+import json, sys
+try:
+    sys.exit(0 if json.loads(sys.argv[1]) == {"event": "telemetry_complete"} else 1)
+except ValueError:
+    sys.exit(1)
+' "${display_last%%$'\n'### end*}"; then
+    display_complete=true
+fi
+log_audit="${log_audit%%$'\n'*}"  # the overall line (one receiver log here)
 log_flag() { [[ " ${log_audit} " == *" $1=1 "* ]]; }
 [[ "$log_audit" == *"complete="* ]] || log_audit="complete=0 state_lost=1 media_lost=1 runtime_lost=1 late_delivery=1"
 evidence_doubtful=false
@@ -320,8 +341,19 @@ if [[ "$projection" != "true" || "$session_active" != "true" || "$video" != "tru
         write_result "BLOCKED" "$reason" "$projection" "$video" "$audio" "$input" "$budget_ms"
         exit 3
     fi
-elif ! log_flag complete; then
-    write_result "BLOCKED" "receiver_log_incomplete" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    # Painted-frame evidence comes from the display's log.
+    if [[ "$video" != true && "$display_complete" != true && "$projection" == true ]]; then
+        write_result "BLOCKED" "display_log_incomplete" "$projection" "$video" "$audio" "$input" "$budget_ms"
+        exit 3
+    fi
+elif [[ "$evidence_doubtful" == true ]]; then
+    # PASS needs a complete log with no reported loss and prompt delivery:
+    # every observable here was timed by when its record reached the log.
+    if log_flag complete; then reason="receiver_log_lost_or_late"; else reason="receiver_log_incomplete"; fi
+    write_result "BLOCKED" "$reason" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 3
+elif [[ "$display_complete" != true ]]; then
+    write_result "BLOCKED" "display_log_incomplete" "$projection" "$video" "$audio" "$input" "$budget_ms"
     exit 3
 fi
 if [[ "$projection" != "true" || "$session_active" != "true" ]]; then

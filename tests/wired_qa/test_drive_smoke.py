@@ -45,7 +45,7 @@ class Run:
         self.fps, self.duration = fps, duration
         self.first = ACTIVE + 2 * S
         self.receiver = ["Opening in BLOCKING MODE ",
-                         {"event": "ready"}, {"event": "active"},
+                         {"event": "ready"}, {"event": "active", "emit_ns": ACTIVE},
                          {"event": "video_profile", "width": width, "height": height, "fps": fps,
                           "codec": "h264"}]
         self.display: list = [{"event": "ready"}]
@@ -63,6 +63,7 @@ class Run:
         self.receiver_tail: list = [LOG_COMPLETE]
         self.display_tail: list = [{"event": "telemetry_complete"}]
         self.drop_audio_at_s: float | None = None
+        self.write_sidecar = True
 
     def freeze(self, at_s: float, seconds: float) -> "Run":
         lo, hi = self.first + int(at_s * S), self.first + int((at_s + seconds) * S)
@@ -116,13 +117,20 @@ class Run:
                                      "scheduled_end_ns": start + slot, "completed_ns": start,
                                      "presented_ns": start + 10_000_000})
                 start += slot
+        # The raw logs carry every IDR line (the runner writes each line to its
+        # log and, as it arrives, to the sidecar).
+        for item in sorted(self.stamped, key=lambda x: x["observed_ns"]):
+            event = item["event"]
+            (receiver if event.get("source") == "producer" else display).append(event)
         receiver += self.receiver_tail
         display += self.display_tail
         for name, lines in (("receiver.log", receiver), ("display.log", display)):
             (directory / name).write_text("\n".join(
                 line if isinstance(line, str) else json.dumps(line, separators=(",", ":"))
                 for line in lines) + "\n")
-        (directory / "idr-events.jsonl").write_text("".join(json.dumps(x) + "\n" for x in self.stamped))
+        if self.write_sidecar:
+            (directory / "idr-events.jsonl").write_text(
+                "".join(json.dumps(x) + "\n" for x in self.stamped))
         (directory / "run.json").write_text(json.dumps(self.run))
         return directory
 
@@ -166,6 +174,54 @@ class AnalyzerTests(unittest.TestCase):
         result = self.analyze(probe)
         self.assertEqual(result["verdict"], "BLOCKED", result["criteria"])
         self.assertIn("av_signed_contract:media_telemetry_lost", result["blocked_on"])
+
+    def test_delayed_active_cannot_clip_an_idr_episode(self) -> None:
+        # Review 4 probe (#90): a source-stamped 2 s IDR episode right after
+        # first paint FAILs with a prompt activation...
+        prompt = Run(duration=30).idr("consumer", 0.0, 2.0)
+        self.assertEqual(self.analyze(prompt)["verdict"], "FAIL")
+        # ...and the same episode with the `active` line delivered 4 s late
+        # (the runner's arrival anchor) is still a 2 s FAIL: the window is
+        # anchored at the record's own emit_ns.
+        late = Run(duration=30).idr("consumer", 0.0, 2.0)
+        late.run["active_ns"] = ACTIVE + 4 * S
+        result = self.analyze(late)
+        self.assertEqual(result["verdict"], "FAIL", result["criteria"])
+        idr = criterion(result, "waiting_idr_max")
+        self.assertFalse(idr["passed"])
+        self.assertAlmostEqual(idr["longest_s"], 2.0, places=3)
+
+    def test_unstamped_active_is_blocked(self) -> None:
+        run = Run(duration=30)
+        run.receiver[2] = {"event": "active"}
+        result = self.analyze(run)
+        self.assertEqual(result["verdict"], "BLOCKED", result["criteria"])
+        self.assertIn("waiting_idr_max:active_unstamped", result["blocked_on"])
+
+    def test_missing_idr_sidecar_is_blocked(self) -> None:
+        # Review 4 probe (#90): removing only idr-events.jsonl (both IDR events
+        # and the completion markers stay in the logs) must never PASS...
+        run = Run(duration=30).idr("consumer", 5.0, 0.5)
+        run.write_sidecar = False
+        result = self.analyze(run)
+        self.assertEqual(result["verdict"], "BLOCKED", result["criteria"])
+        self.assertIn("waiting_idr_max:idr_sidecar_missing", result["blocked_on"])
+        # ...and a missing sidecar cannot hide a 2 s episode the logs show.
+        failing = Run(duration=30).idr("consumer", 5.0, 2.0)
+        failing.write_sidecar = False
+        self.assertNotEqual(self.analyze(failing)["verdict"], "PASS")
+
+    def test_unresolved_wait_with_every_request_failed_fails(self) -> None:
+        # The consumer logs the wait transition itself (idr_wait_started); no
+        # request ever succeeded and the wait never recovered.
+        run = Run(duration=30)
+        start = run.first + 10 * S
+        run.stamped.append({"observed_ns": start, "event": {
+            "event": "idr_wait_started", "source": "consumer", "reason": "decode_awaiting_idr",
+            "emit_ns": start}})
+        result = self.analyze(run)
+        self.assertEqual(result["verdict"], "FAIL", result["criteria"])
+        self.assertFalse(criterion(result, "waiting_idr_max")["passed"])
 
     def test_delayed_idr_records_are_timed_at_emission(self) -> None:
         # Given a 2 s producer episode inside the drive whose two records both
@@ -404,9 +460,9 @@ class AnalyzerTests(unittest.TestCase):
         with_latency, without = Run(), Run()
         with_latency.stamped.append({"observed_ns": with_latency.first + 3 * S, "event": {
             "event": "idr_recovered", "source": "consumer", "latency_ms": 1500,
-            "episode_requests": 0, "total_requests": 0}})
+            "episode_requests": 0, "total_requests": 0, "emit_ns": with_latency.first + 3 * S}})
         without.stamped.append({"observed_ns": without.first + 3 * S, "event": {
-            "event": "idr_recovered", "source": "consumer"}})
+            "event": "idr_recovered", "source": "consumer", "emit_ns": without.first + 3 * S}})
         # Then both fail: the first by its own latency, the second as open since active.
         first = criterion(self.analyze(with_latency), "waiting_idr_max")
         self.assertFalse(first["passed"])
@@ -420,9 +476,11 @@ class AnalyzerTests(unittest.TestCase):
         run = Run()
         if request_s is not None:
             run.stamped.append({"observed_ns": ACTIVE + int(request_s * S), "event": {
-                "event": "idr_requested", "source": "consumer", "reason": "video_consumer_waiting_idr"}})
+                "event": "idr_requested", "source": "consumer", "reason": "video_consumer_waiting_idr",
+                "emit_ns": ACTIVE + int(request_s * S)}})
         run.stamped.append({"observed_ns": ACTIVE + int(recovered_s * S), "event": {
-            "event": "idr_recovered", "source": "consumer", **fields}})
+            "event": "idr_recovered", "source": "consumer", **fields,
+            "emit_ns": ACTIVE + int(recovered_s * S)}})
         return criterion(self.analyze(run), "waiting_idr_max")
 
     def test_unusable_latency_starts_at_active_even_with_a_request(self) -> None:

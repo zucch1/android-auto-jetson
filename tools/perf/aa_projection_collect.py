@@ -472,6 +472,16 @@ class EventParser:
         # Log-integrity evidence per log path, kept after the measurement freeze:
         # validity is decided after the final read (#90 review).
         self.integrity: dict[str, list[dict]] = {}
+        # Source-time end of the measured window (absolute CLOCK_MONOTONIC ns),
+        # set when the sampling loop ends (#90 review 4). A metric record read
+        # after it is admitted at its own emission time when that falls inside
+        # the window, ignored when after it, and invalidates the metric it
+        # feeds when its time is unknown or it can no longer be admitted.
+        self.cutoff_ns: int | None = None
+        self.late_targets: set[str] = set()
+        # Peak/cumulative values of in-window records read after the cutoff,
+        # merged into the frozen metrics at the end (never into live state).
+        self.late_values: dict[str, float | int] = {}
         self._source: str | None = None
         self.metrics: dict[str, object] = {
             "frame_drops": None, "decode_p50_ms": None, "decode_p95_ms": None,
@@ -719,6 +729,75 @@ class EventParser:
             issues.append("display_log_incomplete")
         return issues
 
+    _METRIC_KEYS = {"audio_scheduling_skew_ms": "audio_scheduling_skew_ms",
+                    "audio_latency_ms": "audio_latency_ms", "frame_drops": "frame_drops",
+                    "av_sync_ms": "av_sync_ms"}
+
+    def _metric_targets(self, event: dict, envelope: object, kind: object) -> set[str]:
+        targets = {target for key, target in self._METRIC_KEYS.items() if key in event}
+        if envelope in ("video_ipc_send", "video_ipc_receive"):
+            targets |= set(_IPC_KEYS.values())
+        if envelope == "video_decode_completed":
+            targets |= set(_DECODE_KEYS.values())
+        if envelope in ("audio_write_completed", "video_presented"):
+            targets.add("av_sync_ms")
+        if kind == "decode_stats":
+            targets.add("frame_drops")
+        if envelope == "audio_stall_bypass":
+            targets |= {"audio_stall_dropouts", "audio_stall_dropped_chunks", "audio_stall_unrecovered"}
+        return targets
+
+    def _admit_after_cutoff(self, event: dict, envelope: object, kind: object) -> bool:
+        """Handle a record read after the window closed; True for a non-metric record.
+
+        A metric record is never fed into the live parser state after the
+        cutoff (the exported metrics stay frozen). One emitted inside the
+        window is counted at its emission time: its peak and cumulative values
+        are kept in ``late_values`` and merged into the frozen export. When its
+        emission time is unknown, or its metric cannot be merged (the A/V
+        pairing, video summaries, stall bookkeeping), the metric is invalid.
+        """
+        targets = self._metric_targets(event, envelope, kind)
+        if not targets:
+            return True
+        assert self.cutoff_ns is not None
+        stamp = aa_log_integrity.emit_ns(event)
+        if stamp is None and envelope in ("video_ipc_send", "video_ipc_receive",
+                                          "video_decode_completed"):
+            # Video endpoints carry their own monotonic measurement times.
+            value = event.get("observed_ns" if envelope != "video_decode_completed" else "completed_ns")
+            if type(value) is int and value > 0:
+                stamp = value
+        if stamp is None:
+            self.late_targets |= targets  # unknown source time: inclusion is uncertain
+            return False
+        if stamp > self.cutoff_ns:
+            return False  # emitted after the window: not part of the measurement
+        mergeable = {"audio_scheduling_skew_ms": "audio_scheduling_skew_ms",
+                     "audio_latency_ms": "audio_latency_ms", "frame_drops": "frame_drops"}
+        if kind == "decode_stats":
+            for key in ("dropped", "drops"):
+                if key in event:
+                    self._late_value(event[key], "frame_drops", integer=True)
+        for key, target in mergeable.items():
+            if key in event:
+                self._late_value(event[key], target, integer=target == "frame_drops")
+        self.late_targets |= targets - set(mergeable.values())
+        return False
+
+    def _late_value(self, raw: object, target: str, *, integer: bool = False) -> None:
+        try:
+            valid = (not isinstance(raw, bool) and isinstance(raw, (int, float))
+                     and math.isfinite(raw) and (not integer or isinstance(raw, int)))
+        except OverflowError:
+            valid = False
+        if not valid:
+            self.late_targets.add(target)
+            return
+        assert isinstance(raw, (int, float))
+        prior = self.late_values.get(target)
+        self.late_values[target] = raw if prior is None else max(prior, raw)
+
     def _consume(self, line: str) -> None:
         line = line.strip()
         if not line.startswith("{"):
@@ -755,8 +834,15 @@ class EventParser:
                     self._number({"invalid": None}, "invalid", target)
         if envelope == "err":
             self.terminal_errors.append({"event": "err", "code": str(event.get("code", "unknown"))})
-        if envelope in aa_log_integrity.RELEVANT_EVENTS and self._source is not None:
-            self.integrity.setdefault(self._source, []).append(event)
+        if self._source is not None:
+            records = self.integrity.setdefault(self._source, [])
+            if envelope in aa_log_integrity.RELEVANT_EVENTS:
+                records.append(event)
+            elif any(r.get("event") in ("log_complete", "telemetry_complete") for r in records[-1:]):
+                # A record after the completion record: the log was not proven complete.
+                records.append({"event": aa_log_integrity.AFTER_COMPLETION})
+        if self.cutoff_ns is not None and not self._admit_after_cutoff(event, envelope, kind):
+            return
         # A sink stall (#60) is an audio output gap, never a silent one. Only a
         # resumed sink counts as survived; a failed reopen, a stop during
         # recovery or a bypass still open at the end is unrecovered.
@@ -1030,6 +1116,9 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                 break
 
         video_evidence = parser.video_measurements.finish(progress.last_ns)
+        # The window closes at the last accepted sample; records still in flight
+        # are admitted by their own emission time after the final read.
+        parser.cutoff_ns = origin_ns + progress.last_ns
         events = {key: value for key, value in parser.metrics.items()
                   if key not in {*_DECODE_KEYS.values(), *_IPC_KEYS.values()}}
         events["helper_rss_mb"] = None
@@ -1059,6 +1148,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         raise SystemExit(f"error: cannot launch receiver: {exc}") from exc
     finally:
         parser.video_measurements.frozen = True
+        if parser.cutoff_ns is None:
+            parser.cutoff_ns = origin_ns + progress.last_ns
         if stimulus is not None:
             stimulus.stop()
             # A control failure in the final interval is only seen after the
@@ -1085,6 +1176,16 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         if display is not None:
             parser.poll(str(display_log))
 
+    # In-window records read after the cutoff count at their emission time
+    # (#90 review 4): merged into the frozen export, or the metric is invalid.
+    for target, value in parser.late_values.items():
+        if target in invalid_telemetry or target in parser.late_targets:
+            continue
+        prior = events.get(target)
+        events[target] = value if prior is None else max(prior, value)
+    if parser.late_targets:
+        invalid_telemetry = sorted(set(invalid_telemetry) | parser.late_targets
+                                   | {"late_in_window_telemetry"})
     if receiver is not None:
         receiver_exit = receiver.returncode
     if not stopped_by_us and receiver_exit is not None and receiver_exit != 0:

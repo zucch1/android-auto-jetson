@@ -2405,6 +2405,9 @@ int receiver_main(int argc, char **argv) {
                 }
             }
         }
+        // Bounded wait for an in-flight ForgetPhone write, never under the
+        // session mutex (the input thread and video recovery take it).
+        control.drain_persistence();
         std::lock_guard lock(session_mutex);
         audio_sink.stop();
         (void)control.finish();

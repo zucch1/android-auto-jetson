@@ -112,9 +112,13 @@ if [[ "$cmd" == *aa-disp.in* ]]; then
     bash -euc 'exec 9<>"$FAKE_TARGET/aa-disp.in"
         grep() {
             IFS= read -r -t 0.1 -u 9 request
-            [[ "$request" == status ]]
-            printf "{\"event\":\"status\",\"frames_presented\":3,\"frames_painted\":%s,\"render_ok\":%s}\n" \
-                "${FAKE_FRAMES_PAINTED:-3}" "${FAKE_RENDER_OK:-true}" > "$FAKE_TARGET/aa-wired-display.log"
+            [[ "$request" == "status "* ]]
+            # The display echoes the request id (#90 review 4); FAKE_STATUS_UNCORRELATED
+            # models a reply that is not this request'"'"'s (an older status line).
+            id="${request#status }"
+            [[ "${FAKE_STATUS_UNCORRELATED:-0}" != 1 ]] || id="older"
+            printf "{\"event\":\"status\",\"frames_presented\":3,\"frames_painted\":%s,\"render_ok\":%s,\"request\":\"%s\"}\n" \
+                "${FAKE_FRAMES_PAINTED:-3}" "${FAKE_RENDER_OK:-true}" "$id" > "$FAKE_TARGET/aa-wired-display.log"
             command grep "$@"
         }
         '"$cmd"'
@@ -153,6 +157,7 @@ if [[ "$cmd" == *grep* ]]; then
     if [[ "${FAKE_NO_LOG_COMPLETE:-0}" != 1 ]]; then
         printf '%s\n' "${FAKE_LOG_COMPLETE:-{\"event\":\"log_complete\",\"runtime_dropped\":0,\"state_overflow\":0,\"media_rate_limited\":0,\"media_backpressure\":0,\"shutdown_dropped\":0,\"max_delivery_lag_ms\":1\}}" >> "$log"
     fi
+    [[ -z "${FAKE_AFTER_COMPLETE:-}" ]] || printf '%s\n' "$FAKE_AFTER_COMPLETE" >> "$log"
     cmd="${cmd//\/tmp\/aa-wired-receiver.log/$log}"
     cmd="${cmd//"$FAKE_TARGET/aa-wired-receiver.log"/$log}"
     bash -c "$cmd"
@@ -167,6 +172,11 @@ case "$cmd" in
     *nohup*) echo 4242; exit 0 ;;
     *busctl*) printf '%s' "${FAKE_STATE:-string \"projecting\"}"; exit 0 ;;
     *kill*)
+        # A SIGTERMed display drains and ends its telemetry with
+        # telemetry_complete (#90 review 4), unless the case says otherwise.
+        if [[ "$cmd" == *"kill 4343"* && "${FAKE_NO_TELEMETRY_COMPLETE:-0}" != 1 ]]; then
+            printf '%s\n' '{"event":"telemetry_complete"}' >> "$FAKE_TARGET/aa-wired-display.log"
+        fi
         bash -c 'kill() { printf "kill %s\n" "$*" >> "$FAKE_SSH_LOG"; [[ "$1" != -0 ]]; }; '"$cmd"
         exit $? ;;
     *) exit 96 ;;
@@ -283,11 +293,37 @@ class LiveQaGates(unittest.TestCase):
         self.assertEqual(code, 4, doc)
         self.assertEqual(doc["status"], "FAILED")
 
-    def test_positive_evidence_pass_stands_despite_unrelated_loss(self) -> None:
+    def test_reported_loss_or_lag_blocks_a_pass(self) -> None:
+        # #90 review 4 probe: every observable seen, but the log reports state
+        # overflow, media loss or 4 s of lag: the observables were timed by log
+        # arrival, so the run is BLOCKED, never PASS.
+        for counts in ({"runtime_dropped": 5}, {"runtime_dropped": 1, "state_overflow": 1},
+                       {"media_backpressure": 1}, {"max_delivery_lag_ms": 4000},
+                       {"runtime_dropped": 2, "state_overflow": 2, "media_rate_limited": 3,
+                        "max_delivery_lag_ms": 4000}):
+            with self.subTest(**counts):
+                code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                        FAKE_STATE='string "projecting"',
+                                        FAKE_LOG_COMPLETE=self.complete(**counts))
+                self.assertEqual((code, doc["status"]), (3, "BLOCKED"), doc)
+                self.assertEqual(doc["blocked_on"], "receiver_log_lost_or_late")
+
+    def test_receiver_completion_record_must_be_terminal(self) -> None:
         code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
-                                FAKE_STATE='string "projecting"',
-                                FAKE_LOG_COMPLETE=self.complete(runtime_dropped=5))
-        self.assertEqual(code, 0, doc)
+                                FAKE_STATE='string "projecting"', FAKE_AFTER_COMPLETE='{"event":"audio_chunks"}')
+        self.assertEqual((code, doc["status"], doc["blocked_on"]), (3, "BLOCKED", "receiver_log_incomplete"), doc)
+
+    def test_pass_requires_the_display_telemetry_completion_proof(self) -> None:
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                FAKE_STATE='string "projecting"', FAKE_NO_TELEMETRY_COMPLETE="1")
+        self.assertEqual((code, doc["status"], doc["blocked_on"]), (3, "BLOCKED", "display_log_incomplete"), doc)
+
+    def test_status_reply_must_answer_this_request(self) -> None:
+        # A status line that does not carry this request's id (an older line)
+        # is not painted-frames evidence.
+        code, doc = self.run_qa(False, FAKE_STATE='string "projecting"', FAKE_STATUS_UNCORRELATED="1")
+        self.assertNotEqual(doc["status"], "PASS", doc)
+        self.assertFalse(doc["observables"]["video_present"])
 
     def test_teardown_waits_for_the_logger_before_killing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -367,7 +403,9 @@ class LiveQaGates(unittest.TestCase):
             self.assertEqual((code, doc["status"]), (0, "PASS"), doc)
             commands = log.read_text(encoding="utf-8")
             self.assertRegex(commands, r"--test-only-autostart --test-only-control-stdin <>/\S+/aa-disp\.in")
-            self.assertRegex(commands, r"printf 'status\\n' > /\S+/aa-disp\.in")
+            # The status request carries its id; the reply is matched by it.
+            self.assertRegex(commands, r"printf 'status q[0-9]+r[0-9]+\\n' > /\S+/aa-disp\.in")
+            self.assertRegex(commands, r"grep '\"request\":\"q[0-9]+r[0-9]+\"'")
             self.assertGreaterEqual(commands.count(r"printf 'key a press\nkey a release\n'"), 2)
             self.assertNotIn("/tmp/aa-disp.in", commands)
 
@@ -519,6 +557,9 @@ class LiveQaGates(unittest.TestCase):
                         'if [[ "$0" == */disp ]]; then\n'
                         '  [[ "$#" == 2 && "$1" == --test-only-autostart && "$2" == --test-only-control-stdin && -p /dev/stdin ]] || exit 2\n'
                         '  touch "$FAKE_TARGET/control-ready"\n'
+                        # The shipped display drains its telemetry on SIGTERM.
+                        '  trap \'kill "$!" 2>/dev/null; printf "%s\\n" "{\\"event\\":\\"telemetry_complete\\"}"; exit 0\' TERM\n'
+                        '  sleep 60 & wait\n'
                         'fi\nexec sleep 60\n',
                         encoding="utf-8",
                     )

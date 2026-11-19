@@ -579,6 +579,22 @@ def case_log_integrity(tmp: Path) -> None:
     capture = load_from_stdout(_collect(tmp, tmp / "state-clean", 3, os.environ.copy()).stdout)
     assert not {"state_log_dropped", "receiver_log_incomplete", "media_telemetry_dropped"} & set(
         capture["invalid_telemetry"]), capture["invalid_telemetry"]
+    # #90 review 4 P1: an in-window 250 ms sample the receiver's stdout only
+    # delivered during the shutdown drain (clean loss counters, 1.6 s lag) is
+    # counted at its emission time, never silently replaced by the 40.5 ms ones.
+    held = os.environ.copy()
+    held["FAKE_RECEIVER_MEDIA_TIMING"] = "1"
+    held["FAKE_RECEIVER_HELD_MEDIA"] = json.dumps(
+        {"event": "media_timing", "audio_scheduling_skew_ms": 0, "audio_latency_ms": 250})
+    held["FAKE_RECEIVER_LOG_COMPLETE"] = json.dumps({"max_delivery_lag_ms": 1600})
+    capture = load_from_stdout(_collect(tmp, tmp / "state-held", 4, held).stdout)
+    assert capture["events"]["audio_latency_ms"] == 250, (
+        capture["events"]["audio_latency_ms"], capture["invalid_telemetry"])
+    # A late sample whose emission time is unknown invalidates its metric.
+    held["FAKE_RECEIVER_HELD_UNSTAMPED"] = "1"
+    capture = load_from_stdout(_collect(tmp, tmp / "state-unstamped", 4, held).stdout)
+    assert {"audio_latency_ms", "late_in_window_telemetry"} <= set(capture["invalid_telemetry"]), (
+        capture["events"]["audio_latency_ms"], capture["invalid_telemetry"])
 
 
 CASES = {
