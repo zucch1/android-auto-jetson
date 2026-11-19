@@ -103,6 +103,35 @@ human-mediated during explicit enrollment only, never automatically approved.
    host-tested only, plus the shared session/media path; see
    [wireless-handoff.md](wireless-handoff.md). Production TCP endpoint binding
    and real-phone qualification remain **BLOCKED**.
+7. **Aborted bootstraps free the phone (#161).** bluetoothd keeps its own reference
+   to every Profile1 `NewConnection` socket (BlueZ 5.72 `create_conn`, `conn->io`),
+   so the helper's `close()` alone sends no RFCOMM DISC: the phone's AA channel would
+   stay open for as long as the ACL lives, which is the whole drive while
+   infotainment keeps HFP up, and the phone never restarts its wireless setup. The
+   AA profile is `Role=server`, so `RequestDisconnection` and
+   `Device1.DisconnectProfile(AA UUID)` never reach it (BlueZ installs no
+   connect/disconnect hooks; `DisconnectProfile` returns `InvalidArguments`). Every
+   abort therefore calls `shutdown(SHUT_RDWR)` on the helper's own fd before closing
+   it: deny (every failure, receiver denial, link or owner loss, replacement,
+   revocation, cleanup), destruction of an unconfirmed bootstrap, the bootstrap
+   deadline, and the pre-bootstrap `connection` fd. `shutdown(2)` acts on the shared
+   socket, so the kernel sends DISC on the AA DLC only; the HFP DLC, the RFCOMM
+   session and the ACL stay up, and no `Device1`/`Adapter1` method is called (#136,
+   #160). After the last RFCOMM message the socket is kept, unread, until the
+   receiver confirms the hand-off (`AuthorizeBootstrapV1(allow=1, ready=0)` once its
+   TCP session authenticated), then closed without shutdown, which leaves the
+   success path as before. A hand-off that fails between completion and confirmation
+   is an abort and shuts the channel down; an unconfirmed completion also expires
+   after 30 s (`Bootstrap::kConfirmBudget`). The `Bootstrap` object alone owns the
+   socket from construction; its deadline thread holds a separate duplicate that it
+   closes only after being joined, so no shutdown reaches a reused fd number.
+   A `ReconnectPeerV1` for the phone whose window is still open changes nothing (the
+   window opens at most once per 60 s, never per 15 s receiver attempt) and keeps a
+   bootstrap in progress; a lapsed window reopens without aborting that phone's
+   bootstrap, and the helper keeps its binding, pinned snapshot and lease. Any other
+   phone's reconnect aborts the old bootstrap as before, now with DISC. The BlueZ
+   test mock keeps the daemon's side of each socket open, as bluetoothd does, so the
+   tests see the phone's EOF only after a shutdown.
 
 Cancellation/failed trust confirmation discards the bound observation. Ordinary
 Invalidate/teardown quiets the adapter and closes sockets but never RemoveDevice.

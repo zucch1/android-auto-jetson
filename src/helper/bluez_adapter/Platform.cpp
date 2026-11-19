@@ -2,6 +2,7 @@
 #include "Platform.hpp"
 #include "Startup.hpp"
 #include <algorithm>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace aa::helper {
@@ -113,7 +114,9 @@ bool BluezBackend::Impl::quiet() {
     return ok;
 }
 void BluezBackend::Impl::close_connection() {
-    if (connection >= 0) ::close(connection);
+    // `connection` is owned here only between socket_fd() and the Bootstrap that takes it
+    // (Callbacks.cpp); afterwards it is -1 and the Bootstrap alone owns the socket (#161).
+    if (connection >= 0) { (void)::shutdown(connection, SHUT_RDWR); ::close(connection); }
     connection = -1;
     if (bootstrap) { bootstrap->deny(HandoffFailure::eligibility); last_failure = bootstrap->failure(); }
     connected.reset(); handoff_handle = 0;
@@ -165,6 +168,9 @@ void BluezBackend::Impl::pump() {
         const auto handle = handoff_handle;
         captured->tick(now(), snapshots, fence, true);
         if (handoff_handle == handle) last_failure = captured->failure();
+    } else if (bootstrap && bootstrap->awaiting_confirmation() && bootstrap->expire()) {
+        // A completed hand-off nobody confirmed or retired: free the phone's channel (#161).
+        last_failure = bootstrap->failure();
     }
 }
 bool BluezBackend::Impl::ensure() {
@@ -237,6 +243,9 @@ core::Result<void> BluezBackend::authorize_handoff(std::uint64_t handle, bool al
         impl_->retire(handle, HandoffFailure::snapshot);
         return Error{ErrorCode::helper_unavailable};
     }
+    // The receiver's completed confirmation: the hand-off is live over TCP, so the RFCOMM
+    // socket is released without shutdown (unchanged success behaviour, #161).
+    if (completed) impl_->bootstrap->confirm();
     return {};
 }
 void BluezBackend::tick() { impl_->pump(); }

@@ -150,7 +150,22 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     Impl::Device live{};
     if (!observed || !impl_->exact(*observed, true, &live) || !impl_->admitted(observed->device.identity))
         return Error{ErrorCode::helper_rejected};
-    impl_->close_window();
+    const auto& identity = observed->device.identity;
+    // A retry for the phone whose window is still open changes nothing: the window is opened
+    // at most once per 60 s, and a bootstrap in progress keeps running (#161).
+    if (impl_->allowed && impl_->allowed->device.identity == identity && !impl_->pairing_enabled &&
+        impl_->now() < impl_->window) {
+        impl_->allowed_link = impl_->allowed_link || live.connected;
+        return State::active;
+    }
+    // A lapsed window reopens; this phone's bootstrap (running, or completed and awaiting the
+    // receiver's confirmation) survives it. Any other phone's bootstrap is aborted, which
+    // shuts its RFCOMM channel down so that phone can retry.
+    if (impl_->bootstrap && impl_->connected && impl_->connected->device.identity == identity &&
+        (impl_->bootstrap->live() || impl_->bootstrap->awaiting_confirmation()))
+        impl_->close_admission();
+    else
+        impl_->close_window();
     impl_->allowed = *observed;
     impl_->allowed_link = live.connected;
     impl_->window = impl_->now() + std::chrono::seconds(60);

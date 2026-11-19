@@ -25,6 +25,8 @@ public:
     WiredSession* session() const { return link_.session(); }
     // Diagnostics: this attempt waited with no Bluetooth link to the phone (HFP is infotainment's).
     [[nodiscard]] bool awaiting_link() const { return eligibility_.awaiting_link(); }
+    // A phone's bootstrap is in progress (bounded): don't defer or retry the attempt (#161).
+    [[nodiscard]] bool bootstrapping() const { return eligibility_.bootstrapping(); }
     // The acquiring source becomes the helper AP lease; drive this AP's handoff
     // with begin(source). reconnect() resets the lease to the empty source and
     // must precede, not follow, acquisition (docs/wireless-handoff.md).
