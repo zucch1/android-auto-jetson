@@ -42,8 +42,18 @@ inline void log_media(std::string_view kind, const std::string& line) {
     std::fflush(stdout);
 }
 
+inline void log_line_nonblocking(const std::string& line) {
+    if (auto* writer = diagnostics::active_stdout_log.load()) {
+        if (writer->submit_pending(line)) { running.store(false); }
+        return;
+    }
+    std::fputs(line.c_str(), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+}
+
 [[nodiscard]] inline audio::AudioTelemetryCallbacks audio_telemetry() {
-    return {log_line, log_media};
+    return {log_line, log_media, log_line_nonblocking};
 }
 
 inline void report(const char* operation, ErrorCode code) {

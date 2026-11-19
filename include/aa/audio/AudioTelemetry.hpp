@@ -22,6 +22,7 @@ namespace aa::audio {
 struct AudioTelemetryCallbacks final {
     std::function<void(const std::string&)> log_line{};
     std::function<void(std::string_view kind, const std::string&)> log_media{};
+    std::function<void(const std::string&)> log_line_nonblocking{};
 };
 
 struct AudioDispatchObservation final {

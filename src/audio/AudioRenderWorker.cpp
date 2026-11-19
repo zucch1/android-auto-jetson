@@ -140,6 +140,9 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
     const auto receiver_input_at = idle_clock_();
     SettlementDiagnostics diagnostics{telemetry_};
     std::unique_lock lock(mutex_);
+    cv_.wait(lock, [&] {
+        return sink_state_ != SinkState::reopening || stopping_ || failure_;
+    });
     if (failure_) {
         last_queue_rejection_ = failure_queue_rejection_;
         return *failure_;
@@ -312,9 +315,12 @@ std::optional<channels::AvDeliveryId>
 AudioRenderWorker::take_completion(Clock::time_point until) {
     std::unique_lock lock(mutex_);
     maybe_bypass_locked(monotonic_now());
-    cv_.wait_until(lock, until, [&] { return !completed_.empty() || failure_ || stopped_; });
+    cv_.wait_until(lock, until, [&] {
+        return (sink_state_ != SinkState::reopening && !completed_.empty()) ||
+               failure_ || stopping_ || stopped_;
+    });
     std::optional<channels::AvDeliveryId> completion;
-    if (!completed_.empty()) {
+    if (sink_state_ != SinkState::reopening && !completed_.empty()) {
         completion = completed_.front();
         record_credit_locked(credit_event(channels::AvCreditEvent::taken, *completion));
         completed_.pop_front();
@@ -366,8 +372,13 @@ std::optional<AudioRejectionSnapshot> AudioRenderWorker::current_rejection_snaps
 
 bool AudioRenderWorker::outstanding() const {
     std::lock_guard lock(mutex_);
-    return slots_ != 0 || in_flight_ || failure_.has_value() || bypass_since_.has_value() ||
-           !completed_.empty();
+    return slots_ != 0 || in_flight_ || sink_state_ == SinkState::reopening ||
+           failure_.has_value() || bypass_since_.has_value() || !completed_.empty();
+}
+
+bool AudioRenderWorker::has_completed_for_test() const {
+    std::lock_guard lock(mutex_);
+    return !completed_.empty();
 }
 
 void AudioRenderWorker::observe_av(const channels::AvObservation& value) {
@@ -387,7 +398,9 @@ AvCreditSnapshot AudioRenderWorker::credit_observation_for_test() const {
 
 bool AudioRenderWorker::wait_idle(Clock::time_point until) {
     std::unique_lock lock(mutex_);
-    return cv_.wait_until(lock, until, [&] { return slots_ == 0 && !in_flight_; });
+    return cv_.wait_until(lock, until, [&] {
+        return slots_ == 0 && !in_flight_ && sink_state_ != SinkState::reopening;
+    });
 }
 
 void AudioRenderWorker::stop() {
@@ -672,8 +685,11 @@ void AudioRenderWorker::exit_bypass_locked(const char* outcome) {
 void AudioRenderWorker::publish_bypass_logs(std::unique_lock<std::mutex>& lock) {
     auto lines = std::exchange(bypass_logs_, {});
     lock.unlock();
-    if (telemetry_.log_line) {
-        for (const auto& line : lines) { telemetry_.log_line(line); }
+    const auto& sink = telemetry_.log_line_nonblocking
+        ? telemetry_.log_line_nonblocking
+        : telemetry_.log_line;
+    if (sink) {
+        for (const auto& line : lines) { sink(line); }
     }
 }
 
@@ -897,6 +913,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                 reopen = sink_write_error && !stopping_ &&
                          consecutive_reopens_ < kMaxConsecutiveReopens;
                 if (reopen) {
+                    sink_state_ = SinkState::reopening;
                     if (same_epoch && !bypass_since_) {
                         enter_bypass_locked("sink_write_error");
                     }
@@ -960,6 +977,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                 // new route private so shutdown below flushes and closes it,
                 // and never republish it for concurrent cancellation.
                 local_router = std::move(reopened).value();
+                sink_state_ = SinkState::ready;
                 if (bypass_since_) { exit_bypass_locked("stopped"); }
             } else if (healthy) {
                 local_router = std::move(reopened).value();
@@ -969,9 +987,19 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                 idle_since_.reset();
                 idle_resume_id_.reset();
                 idle_resume_frames_ = 0;
-                log_sink_selected(sink_report_, "reopen", telemetry_);
-                if (bypass_since_) { exit_bypass_locked("sink_reopened"); }
+                const auto report_snapshot = sink_report_;
+                lock.unlock();
+                log_sink_selected(report_snapshot, "reopen", telemetry_);
+                lock.lock();
+                sink_state_ = SinkState::ready;
+                if (stopping_) {
+                    router_ = nullptr;
+                    if (bypass_since_) { exit_bypass_locked("stopped"); }
+                } else if (bypass_since_) {
+                    exit_bypass_locked("sink_reopened");
+                }
             } else {
+                sink_state_ = SinkState::ready;
                 if (bypass_since_) { exit_bypass_locked("reopen_failed"); }
                 latch_render_failure();
             }

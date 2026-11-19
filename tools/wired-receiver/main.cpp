@@ -99,8 +99,14 @@ void log_media(std::string_view kind, const std::string &json) {
     if (writer->submit_media(kind, json)) { g_running.store(false); }
 }
 
+void log_line_nonblocking(const std::string &json) {
+    auto *writer = aa::wired_receiver::active_stdout_log.load();
+    if (!writer) { std::abort(); }
+    if (writer->submit_pending(json)) { g_running.store(false); }
+}
+
 aa::audio::AudioTelemetryCallbacks wired_telemetry() {
-    return {log_line, log_media};
+    return {log_line, log_media, log_line_nonblocking};
 }
 
 // Run provenance (#60): the routing element a route actually uses, logged at

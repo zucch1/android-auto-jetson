@@ -233,6 +233,9 @@ class WiredSession final {
     [[nodiscard]] std::uint64_t reconnect_attempts() const noexcept { return reconnect_attempts_; }
     [[nodiscard]] std::uint64_t recovery_failures() const noexcept { return recovery_failures_; }
     void fail_next_send_for_test(Error error) noexcept { pending_send_error_for_test_ = error; }
+    [[nodiscard]] bool has_pending_send_error_for_test() const noexcept {
+        return pending_send_error_for_test_.has_value();
+    }
 
   private:
     class InputForwarder;

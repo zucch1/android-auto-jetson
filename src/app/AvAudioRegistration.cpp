@@ -35,16 +35,23 @@ core::Result<void> register_av_sinks(WiredSession& session, protocol::MessageSin
 }
 
 core::Result<void> service_audio_completions(WiredSession& session,
-                                             audio::AudioRenderWorker& audio) {
+                                             audio::AudioRenderWorker& audio,
+                                             bool fail_session) {
     for (;;) {
         if (const auto error = audio.failure()) {
-            (void)session.fail(*error);
+            if (fail_session) { (void)session.fail(*error); }
             return *error;
         }
         const auto completion = audio.take_completion();
-        if (!completion) { return {}; }
+        if (!completion) {
+            if (const auto error = audio.failure()) {
+                if (fail_session) { (void)session.fail(*error); }
+                return *error;
+            }
+            return {};
+        }
         if (const auto error = audio.failure()) {
-            (void)session.fail(*error);
+            if (fail_session) { (void)session.fail(*error); }
             return *error;
         }
         if (auto delivered = session.complete_av_delivery(*completion, {}); !delivered) {

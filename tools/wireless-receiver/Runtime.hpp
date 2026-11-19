@@ -42,6 +42,8 @@ struct Runtime final {
     ipc::VideoSelectionWatchdog selection_watchdog{};
     std::function<void(bool session_live)> on_turn_for_test{};
     std::function<void(app::WiredSession&, bool in_poll)> on_before_audio_completions_for_test{};
+    std::function<void(app::WiredSession&, bool in_poll, const core::Result<void>& serviced)>
+        on_after_audio_completions_for_test{};
 
     void stop_runtime() {
         stopping = true;
@@ -79,7 +81,11 @@ struct Runtime final {
         if (on_before_audio_completions_for_test) {
             on_before_audio_completions_for_test(*audio_session, in_poll_);
         }
-        if (auto serviced = app::service_audio_completions(*audio_session, media.audio); !serviced) {
+        const auto serviced = app::service_audio_completions(*audio_session, media.audio, false);
+        if (on_after_audio_completions_for_test) {
+            on_after_audio_completions_for_test(*audio_session, in_poll_, serviced);
+        }
+        if (!serviced) {
             if (!service_audio_failure()) {
                 const auto& error = serviced.error();
                 if (error.code() == ErrorCode::cancelled &&

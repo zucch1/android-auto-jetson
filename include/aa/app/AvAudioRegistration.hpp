@@ -22,7 +22,8 @@ namespace aa::app {
                                                    audio::AudioRenderWorker& audio);
 
 [[nodiscard]] core::Result<void> service_audio_completions(WiredSession& session,
-                                                           audio::AudioRenderWorker& audio);
+                                                           audio::AudioRenderWorker& audio,
+                                                           bool fail_session = true);
 
 [[nodiscard]] std::string poll_error_json(
     ErrorCode code,

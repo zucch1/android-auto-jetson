@@ -61,6 +61,7 @@ class StdoutLog final {
 public:
     static constexpr std::size_t byte_capacity = 1'048'576;
     static constexpr std::size_t entry_capacity = 4096;
+    static constexpr std::size_t pending_lossless_capacity = 256;
     static constexpr std::chrono::milliseconds default_finish_timeout{2000};
     static constexpr std::chrono::milliseconds media_summary_interval{1000};
     // How often a blocked lossless producer re-checks the running flag.
@@ -153,6 +154,40 @@ public:
         return {};
     }
 
+    // Non-blocking lossless control telemetry path (e.g. reopen selection/bypass
+    // notifications): takes only state_->mutex, never producer_. When the main
+    // queue has room and is not mid-chunk, enqueues directly for strict FIFO
+    // delivery; otherwise parks in a bounded pending_lossless deque drained by
+    // the worker thread as stdout makes room.
+    std::error_code submit_pending(std::string_view record) {
+        if (record.size() >= byte_capacity) {
+            return {EMSGSIZE, std::generic_category()};
+        }
+        State &s = *state_;
+        const std::lock_guard lock(s.mutex);
+        if (s.error) { return s.error; }
+        if (s.closed) { return closed_error(); }
+        const auto charge = record.size() + 1;
+        if (!s.chunked && s.pending_lossless.empty() && s.space(charge)) {
+            s.push(record, charge);
+            s.changed.notify_all();
+            return {};
+        }
+        if (s.pending_lossless.size() >= pending_lossless_capacity) {
+            return {ENOBUFS, std::generic_category()};
+        }
+        std::string line(charge, '\n');
+        record.copy(line.data(), record.size());
+        s.pending_lossless.push_back(std::move(line));
+        s.changed.notify_all();
+        return {};
+    }
+
+    [[nodiscard]] std::size_t pending_lossless() const {
+        const std::lock_guard lock(state_->mutex);
+        return state_->pending_lossless.size();
+    }
+
     // Lossless records dropped because the sink made no room during shutdown.
     [[nodiscard]] std::uint64_t shutdown_drops() const {
         const std::lock_guard lock(state_->mutex);
@@ -174,10 +209,12 @@ public:
         const std::lock_guard producer(producer_);
         std::unique_lock lock(s.mutex);
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
-        s.flushing = !s.queue.empty() && !s.error;
+        s.flushing = (!s.queue.empty() || !s.pending_lossless.empty()) && !s.error;
         s.changed.notify_all();
 #endif
-        s.changed.wait(lock, [&] { return s.queue.empty() || s.error; });
+        s.changed.wait(lock, [&] {
+            return (s.queue.empty() && s.pending_lossless.empty()) || s.error;
+        });
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
         s.flushing = false;
 #endif
@@ -207,7 +244,7 @@ public:
             // be reading its front entry.
             s.abandoned = true;
             s.running = nullptr;
-            s.undelivered = s.queue.size();
+            s.undelivered = s.queue.size() + s.pending_lossless.size();
             if (!s.error) { s.error = {ETIMEDOUT, std::generic_category()}; }
             s.changed.notify_all();
             lock.unlock();
@@ -256,6 +293,7 @@ private:
         mutable std::mutex mutex;
         std::condition_variable changed;
         std::deque<std::string> queue;
+        std::deque<std::string> pending_lossless;
         std::size_t bytes = 0;
         std::error_code error;
         bool closed = false;
@@ -310,6 +348,16 @@ private:
             queue.emplace_back(charge, '\n');
             record.copy(queue.back().data(), record.size());
             bytes += charge;
+        }
+        void promote_pending() {
+            if (chunked) { return; }
+            while (!pending_lossless.empty()) {
+                const auto charge = pending_lossless.front().size();
+                if (!space(charge)) { break; }
+                bytes += charge;
+                queue.push_back(std::move(pending_lossless.front()));
+                pending_lossless.pop_front();
+            }
         }
         bool admit_media(std::string_view kind, Clock::time_point at) {
             constexpr std::size_t max_kinds = 32;
@@ -398,7 +446,11 @@ private:
     static void drain(const std::shared_ptr<State> &state) {
         for (;;) {
             std::unique_lock lock(state->mutex);
-            state->changed.wait(lock, [&] { return state->closed || !state->queue.empty(); });
+            state->changed.wait(lock, [&] {
+                return state->closed || !state->queue.empty() ||
+                       (!state->chunked && !state->pending_lossless.empty());
+            });
+            state->promote_pending();
             if (state->queue.empty()) { return; }
             // The deque keeps element addresses stable; the front stays charged
             // (and queued) while it is being written.
@@ -414,6 +466,7 @@ private:
             lock.lock();
             state->bytes -= front.size();
             state->queue.pop_front();
+            state->promote_pending();
             state->changed.notify_all();
             if (state->abandoned) { return; }
         }

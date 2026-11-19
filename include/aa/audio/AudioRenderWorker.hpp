@@ -71,6 +71,7 @@ public:
     [[nodiscard]] std::optional<AudioRejectionSnapshot> rejection_snapshot() const;
     [[nodiscard]] std::optional<AudioRejectionSnapshot> current_rejection_snapshot() const;
     [[nodiscard]] bool outstanding() const;
+    [[nodiscard]] bool has_completed_for_test() const;
     void observe_av(const channels::AvObservation& value);
     [[nodiscard]] std::optional<AvCreditSnapshot> credit_trace() const;
     [[nodiscard]] AvCreditSnapshot credit_observation_for_test() const;
@@ -81,6 +82,7 @@ public:
     [[nodiscard]] std::optional<RouterReport> final_report() const;
 
 private:
+    enum class SinkState : std::uint8_t { ready, reopening };
     struct Reservation {
         std::size_t bytes;
         std::size_t units;
@@ -192,6 +194,7 @@ private:
     std::optional<WorkerIdleObservation> last_idle_;
     AudioRouter* router_{};
     bool in_flight_{};
+    SinkState sink_state_{SinkState::ready};
     std::optional<AudioRejectionSnapshot> frozen_rejection_;
     AvCreditLedger credit_ledger_;
     std::optional<RouterReport> final_report_;

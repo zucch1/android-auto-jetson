@@ -61,8 +61,11 @@ std::string audio_sink_selected_json(const SinkReport& selected, std::string_vie
 
 void log_sink_selected(const SinkReport& selected, std::string_view origin,
                        const AudioTelemetryCallbacks& telemetry) {
-    if (telemetry.log_line) {
-        telemetry.log_line(audio_sink_selected_json(selected, origin));
+    const auto& sink = (origin == "reopen" && telemetry.log_line_nonblocking)
+        ? telemetry.log_line_nonblocking
+        : telemetry.log_line;
+    if (sink) {
+        sink(audio_sink_selected_json(selected, origin));
     }
 }
 
