@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Platform.hpp"
+#include "../GioBusOwner.hpp"
 #include <fcntl.h>
 #include <limits>
+#include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <cctype>
@@ -59,6 +61,10 @@ struct Startup final {
             state.done = true; return;
         }
         auto* socket = g_socket_connection_get_socket(G_SOCKET_CONNECTION(state.stream));
+        // Production runs as root, so this admits only a root-owned system bus.
+        if (!gio_bus_owner_admitted(socket, ipc::dbus_adapter::BusOwner::root_or_self())) {
+            state.done = true; return;
+        }
         const int original = g_socket_get_fd(socket);
         const int duplicate = original >= 0 ? ::fcntl(original, F_DUPFD_CLOEXEC, 0) : -1;
         if (duplicate < 0) { state.done = true; return; }
@@ -71,6 +77,19 @@ struct Startup final {
             nullptr, state.cancel, initialized, &state);
     }
 };
+}
+GVariant* psk_variant(const Psk& psk) {
+    constexpr std::size_t size = Psk::kLength + 1;
+    auto* buffer = static_cast<char*>(g_malloc(size));
+    std::memcpy(buffer, psk.c_str(), size);
+    auto* bytes = g_bytes_new_with_free_func(buffer, size, [](gpointer data) {
+        ::explicit_bzero(data, Psk::kLength + 1);
+        g_free(data);
+    }, buffer);
+    // Strings need no alignment, so GLib keeps (never copies) this trusted buffer.
+    auto* value = g_variant_new_from_bytes(G_VARIANT_TYPE_STRING, bytes, TRUE);
+    g_bytes_unref(bytes);
+    return value;
 }
 Connection::Connection(const std::string& address) {
     auto* context = g_main_context_new();
@@ -173,7 +192,7 @@ bool Connection::start(const Policy& policy, const Credentials& secret, const st
     const char* rsn[]{"rsn", nullptr};
     const char* ccmp[]{"ccmp", nullptr};
     section("802-11-wireless-security", {{"key-mgmt", g_variant_new_string("wpa-psk")},
-        {"psk", g_variant_new_string(secret.psk.c_str())}, {"proto", g_variant_new_strv(rsn, -1)},
+        {"psk", psk_variant(secret.psk)}, {"proto", g_variant_new_strv(rsn, -1)},
         {"pairwise", g_variant_new_strv(ccmp, -1)}, {"group", g_variant_new_strv(ccmp, -1)}});
     section("ipv4", {{"method", g_variant_new_string("shared")}, {"never-default", g_variant_new_boolean(TRUE)}});
     section("ipv6", {{"method", g_variant_new_string("disabled")}});

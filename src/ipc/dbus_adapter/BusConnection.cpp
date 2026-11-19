@@ -23,9 +23,17 @@ constexpr std::size_t kMaxLineBytes = 512;
 struct Endpoint final {
     std::string key;
     std::string value;
+    std::string guid;
 };
 
-// First unix: transport of a DBUS_SESSION_BUS_ADDRESS value.
+[[nodiscard]] bool hex_guid(std::string_view guid) noexcept {
+    return guid.size() == 32 && std::all_of(guid.begin(), guid.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    });
+}
+
+// First unix: transport of a DBUS_SESSION_BUS_ADDRESS value. Its first
+// path/abstract key names the socket; an optional guid= key pins the server.
 [[nodiscard]] bool session_address(std::string_view address, Endpoint& endpoint) {
     const std::size_t semi = address.find(';');
     const std::string_view first = address.substr(0, semi);
@@ -33,16 +41,27 @@ struct Endpoint final {
         return false;
     }
     std::string_view rest = first.substr(5);
+    bool guid_seen = false;
     while (!rest.empty()) {
         const std::size_t comma = rest.find(',');
         const std::string_view item = rest.substr(0, comma);
         const std::size_t equal = item.find('=');
         if (equal != std::string_view::npos) {
             const auto item_key = item.substr(0, equal);
-            if (item_key == "path" || item_key == "abstract") {
+            const auto item_value = item.substr(equal + 1);
+            if ((item_key == "path" || item_key == "abstract") && endpoint.key.empty()) {
+                if (item_value.empty()) {
+                    return false;
+                }
                 endpoint.key = std::string{item_key};
-                endpoint.value = std::string{item.substr(equal + 1)};
-                return !endpoint.value.empty();
+                endpoint.value = std::string{item_value};
+            } else if (item_key == "guid") {
+                // A malformed or repeated pin is ambiguous: refuse, never ignore it.
+                if (guid_seen || !hex_guid(item_value)) {
+                    return false;
+                }
+                guid_seen = true;
+                endpoint.guid = std::string{item_value};
             }
         }
         if (comma == std::string_view::npos) {
@@ -50,7 +69,7 @@ struct Endpoint final {
         }
         rest = rest.substr(comma + 1);
     }
-    return false;
+    return !endpoint.key.empty();
 }
 
 } // namespace
@@ -157,7 +176,7 @@ core::Result<std::string> BusConnection::read_line() {
     return Error{ErrorCode::transport_malformed_frame};
 }
 
-core::Result<void> BusConnection::authenticate() {
+core::Result<void> BusConnection::authenticate(std::string_view expected_guid) {
     const std::string uid = std::to_string(::getuid());
     std::string hex;
     hex.reserve(uid.size() * 2);
@@ -184,6 +203,13 @@ core::Result<void> BusConnection::authenticate() {
     if (line.value().compare(0, 3, "OK ") != 0) {
         return Error{ErrorCode::transport_unauthorized_peer};
     }
+    // The server GUID must be well formed and, when the address pins one,
+    // the same server: otherwise BEGIN (and so Hello or any RPC) is never sent.
+    const std::string_view guid = std::string_view{line.value()}.substr(3);
+    if (!hex_guid(guid) || (!expected_guid.empty() && guid != expected_guid)) {
+        close_connection();
+        return Error{ErrorCode::transport_unauthorized_peer};
+    }
     const std::string begin = "BEGIN\r\n";
     return bus_io::write_full(
         fd_, std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(begin.data()),
@@ -199,10 +225,10 @@ core::Result<BusConnection> BusConnection::connect_session() {
 }
 
 core::Result<BusConnection> BusConnection::connect_system() {
-    return connect_private("unix:path=/run/dbus/system_bus_socket");
+    return connect_private("unix:path=/run/dbus/system_bus_socket", BusOwner::root());
 }
 
-core::Result<BusConnection> BusConnection::connect_private(std::string_view bus_address) {
+core::Result<BusConnection> BusConnection::connect_private(std::string_view bus_address, BusOwner owner) {
     const auto until = bus_io::deadline();
     Endpoint endpoint;
     if (!session_address(bus_address, endpoint)) {
@@ -239,10 +265,20 @@ core::Result<BusConnection> BusConnection::connect_private(std::string_view bus_
             return Error{ErrorCode::transport_unavailable};
         }
     }
+    // Authenticate the bus socket itself before sending anything: the kernel
+    // reports who created the listening end, which a spoofed endpoint cannot
+    // forge. Helper-UID checks over the bus would otherwise trust the liar.
+    ucred peer{};
+    socklen_t peer_size = sizeof(peer);
+    if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) != 0 || peer_size != sizeof(peer) ||
+        !owner.admits(static_cast<std::uint32_t>(peer.uid))) {
+        ::close(fd);
+        return Error{ErrorCode::transport_unauthorized_peer};
+    }
     BusConnection connection;
     connection.fd_ = fd;
     connection.deadline(until);
-    const auto auth = connection.authenticate();
+    const auto auth = connection.authenticate(endpoint.guid);
     if (!auth.has_value()) {
         return auth.error();
     }
