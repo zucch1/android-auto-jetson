@@ -50,6 +50,30 @@
 
 Modules log only through `aa::core::Logger` (no backend in any public header). Messages are stable literals; dynamic values are fields that have already crossed `aa::diagnostics::redact_identifier()` — phone identifiers, Bluetooth MACs, locations and credentials never appear raw in logs or events. Redaction produces a stable per-process pseudonym (`id-<hex>`, salted) so events correlate inside one run without carrying the identifier. Captures and secrets are never committed.
 
+## Process stdout (receiver and dummy display)
+
+`aa-wired-receiver` and `aa-dummy-display` emit JSON on stdout. Libraries they
+load also print there. On the Jetson, `libv4l2_nvvideocodec.so` does
+`puts("Opening in BLOCKING MODE")` whenever `nvv4l2decoder` opens. Both
+executables therefore start with `aa::tools::StdoutIsolation`
+(`tools/json_stdout.hpp`):
+
+- The real stdout moves to a private descriptor, and fd 1 points at
+  `/dev/null` for the rest of the process. Children inherit `/dev/null`.
+- JSON is written only with raw `write(2)` on that descriptor, through
+  `StdoutLog` (receiver), the telemetry writer (display) or `write_all`. No
+  `FILE*` is on the JSON path, so no stdio lock can stall it.
+- Library text to stdout, whether through C stdio or raw `write(1)`, is
+  diagnostic only and is deliberately discarded. It is not counted, and it
+  never blocks on a consumer. The C `stdout` pointer is never reassigned. To
+  see that text, run the library directly (`gst-inspect-1.0 nvv4l2decoder`).
+- After the bounded JSON shutdown, the process ends with `_Exit`. Exit-time
+  stdio cleanup, `atexit` handlers and static destructors are skipped on
+  purpose. C `stdout` (bound to `/dev/null`) and every `FILE` a library
+  opened are never flushed or locked, so a third-party writer stuck holding
+  a `FILE` lock cannot stall exit. stderr is unbuffered; nothing else is
+  owed a flush.
+
 ## Include boundary (enforced)
 
 `tests/architecture/boundary_scan.py` scans the real module trees (`include/aa/**`, `src/**`) and is registered as the `architecture_boundary` CTest suite. Its rules:

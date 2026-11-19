@@ -2265,7 +2265,7 @@ TEST(WiredReceiver, StdoutLogFailureConvertsCleanMainExitAndPreservesEarlyFailur
     const int full = ::open("/dev/full", O_WRONLY | O_CLOEXEC);
     ASSERT_GE(full, 0);
     runtime_sink_request_override = [&](const auto &) -> aa::audio::detail::SinkOpenOutcome {
-        EXPECT_EQ(::dup2(full, STDOUT_FILENO), STDOUT_FILENO);
+        EXPECT_EQ(::dup2(full, aa::tools::json_fd()), aa::tools::json_fd());
         return {std::make_unique<wiredtest::RecordingObservedSink>(
             std::make_shared<wiredtest::AudioObs>()), {}};
     };
@@ -2334,45 +2334,6 @@ bool all_json_lines(const std::string &output) {
     return true;
 }
 
-TEST(WiredReceiver, StrayStdoutGuardDropsPastCapacityAndClosesWithinBudgetOnAStalledStderr) {
-    // Given: a stalled stderr and a guard with a small buffer and close budget.
-    int stalled[2]{-1, -1};
-    ASSERT_TRUE(make_stalled_pipe(stalled));
-    const int saved_stderr = ::fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
-    ASSERT_GE(saved_stderr, 0);
-    ASSERT_EQ(::dup2(stalled[1], STDERR_FILENO), STDERR_FILENO);
-    FILE *const before = stdout;
-    std::chrono::steady_clock::duration held{}, closing{};
-    std::uint64_t dropped = 0;
-    std::string report;
-    bool swapped = false, original = false;
-    {
-        auto guard = std::make_unique<aa::tools::StrayStdoutGuard>(4096, std::chrono::milliseconds{100});
-        swapped = stdout != before;
-        original = guard->json() == before;
-        // When: a library prints 64 KiB through C stdio.
-        held = library_stdio_burst(64 * 1024);
-        dropped = guard->dropped_bytes();
-        report = guard->drop_report();
-        const auto began = std::chrono::steady_clock::now();
-        guard.reset();
-        closing = std::chrono::steady_clock::now() - began;
-    }
-    const bool restored = stdout == before;
-    EXPECT_EQ(::dup2(saved_stderr, STDERR_FILENO), STDERR_FILENO);
-    ::close(saved_stderr);
-    release_stalled_pipe(stalled[0]);
-    ::close(stalled[1]);
-    // Then: printing never waited, the overflow is counted, and close kept its budget.
-    EXPECT_TRUE(swapped);
-    EXPECT_TRUE(original);
-    EXPECT_TRUE(restored);
-    EXPECT_LT(held, std::chrono::milliseconds{500});
-    EXPECT_GE(dropped, 64u * 1024u - 2u * 4096u);
-    EXPECT_NE(report.find("\"bytes\":" + std::to_string(dropped)), std::string::npos) << report;
-    EXPECT_LT(closing, std::chrono::milliseconds{1000});
-}
-
 TEST(WiredReceiver, LibraryStdioNeverBlocksTheReceiverOnAStalledStderr) {
     // Given: stderr is a full pipe nobody reads (a stalled journal or log
     // collector) while the JSON stdout is healthy, and a library inside the run
@@ -2399,42 +2360,37 @@ TEST(WiredReceiver, LibraryStdioNeverBlocksTheReceiverOnAStalledStderr) {
     ::close(saved_stderr);
     if (stalled[0] >= 0) { release_stalled_pipe(stalled[0]); }
     ::close(stalled[1]);
-    // Then: neither the printing thread nor the run waited on stderr, stdout is
-    // pure JSON, and the lost library text is reported in-band.
+    // Then: neither the printing thread nor the run waited on stderr, and
+    // stdout is pure JSON.
     ASSERT_TRUE(returned) << "RECEIVER_BLOCKED_ON_STALLED_STDERR";
     EXPECT_GE(held_ms.load(), 0);
     EXPECT_LT(held_ms.load(), 1000);
     EXPECT_LT(result.elapsed, std::chrono::seconds{5});
     EXPECT_TRUE(all_json_lines(result.output)) << result.output;
-    EXPECT_NE(result.output.find("\"event\":\"library_stdout_dropped\""), std::string::npos)
-        << result.output;
     g_running.store(true);
 }
 
-TEST(WiredReceiver, LibraryStdioTextGoesToStderrNotTheJsonStdout) {
-    // Given: a library inside the run writes free text through C stdio, as the
-    // Jetson NVIDIA V4L2 codec does with puts("Opening in BLOCKING MODE").
+TEST(WiredReceiver, LibraryStdoutTextNeverReachesTheJsonStdout) {
+    // Given: a library inside the run writes free text to stdout, through C
+    // stdio (as the Jetson NVIDIA V4L2 codec does with puts("Opening in
+    // BLOCKING MODE")) and through a raw write(1).
     FILE *const before = stdout;
     runtime_sink_request_override = [&](const auto &) -> aa::audio::detail::SinkOpenOutcome {
         std::puts("LIBRARY_STDIO_MARKER");
         std::printf("LIBRARY_PRINTF_MARKER %d\n", 1);
+        static constexpr char raw[] = "LIBRARY_RAW_MARKER\n";
+        EXPECT_EQ(::write(STDOUT_FILENO, raw, sizeof raw - 1), static_cast<ssize_t>(sizeof raw - 1));
         return {std::make_unique<wiredtest::RecordingObservedSink>(
             std::make_shared<wiredtest::AudioObs>()), {}};
     };
-    testing::internal::CaptureStderr();
     // When: the receiver runs and exits.
     const auto result = run_runtime(false, 20, true);
-    const auto diagnostics = testing::internal::GetCapturedStderr();
     runtime_sink_request_override = {};
-    // Then: the text reached stderr, every stdout line is a JSON record, and the
-    // stdio stream is restored.
-    EXPECT_NE(diagnostics.find("LIBRARY_STDIO_MARKER"), std::string::npos) << diagnostics;
-    EXPECT_NE(diagnostics.find("LIBRARY_PRINTF_MARKER 1"), std::string::npos) << diagnostics;
+    // Then: none of it reached the JSON stdout, which is still a JSON stream,
+    // and the C stdout stream was never swapped.
     EXPECT_EQ(result.output.find("MARKER"), std::string::npos) << result.output;
-    std::istringstream lines{result.output};
-    for (std::string line; std::getline(lines, line);) {
-        EXPECT_TRUE(line.size() > 1 && line.front() == '{' && line.back() == '}') << line;
-    }
+    EXPECT_NE(result.output.find("\"event\":\"stopping\""), std::string::npos) << result.output;
+    EXPECT_TRUE(all_json_lines(result.output)) << result.output;
     EXPECT_EQ(stdout, before);
     g_running.store(true);
 }
@@ -2459,7 +2415,7 @@ TEST(WiredReceiver, ReceiverShutdownIsBoundedWithAFullQueueAndAStalledStdout) {
         // nvv4l2decoder opens: it must not wait in a stdio buffer for a flush
         // into the stalled pipe.
         std::puts("Opening in BLOCKING MODE");
-        EXPECT_EQ(::dup2(stalled[1], STDOUT_FILENO), STDOUT_FILENO);
+        EXPECT_EQ(::dup2(stalled[1], aa::tools::json_fd()), aa::tools::json_fd());
         // And stderr shares the stalled sink (one pipe for both, as a log
         // collector does): more library text must still never block.
         EXPECT_EQ(::dup2(stalled[1], STDERR_FILENO), STDERR_FILENO);

@@ -3,6 +3,7 @@
 #include <aa/consumer/Decode.hpp>
 #include <cstdio>
 #include <string>
+#include <string>
 
 namespace aa::tools {
 inline std::string unavailable_codec(protocol::VideoCodec codec, consumer::DecodeBackend backend,
@@ -37,22 +38,24 @@ inline bool parse_decoder(std::string_view value, consumer::DecodeBackend& out) 
     else { return false; }
     return true;
 }
-// Writes to `out`; callers keep library chatter off it (StrayStdoutToStderr).
-inline void list_video_capabilities(std::FILE* out) {
+// One JSON record per line; callers write it to their JSON descriptor.
+inline std::string list_video_capabilities() {
+    std::string out;
     for (const auto codec : protocol::kVideoCodecs) {
         const auto report = consumer::DecodeHelper::probe_backends(codec);
         const bool nvidia = std::any_of(report.backends.begin(),report.backends.end(),[](const auto& b) { return b.element == "nvv4l2decoder" && b.viable; });
-        std::fprintf(out, "{\"codec\":\"%s\",\"parser_path\":%s,\"software\":%s,\"hardware\":%s,\"elements\":[",
-            protocol::codec_name(codec), report.software_path_available ? "true":"false",
-            report.software_path_available && consumer::select_backend(report,consumer::DecodeBackend::software).usable ? "true":"false",
-            report.software_path_available && nvidia ? "true":"false");
+        const bool software = report.software_path_available && consumer::select_backend(report,consumer::DecodeBackend::software).usable;
+        out += std::string{"{\"codec\":\""} + std::string{protocol::codec_name(codec)} + "\",\"parser_path\":"
+            + (report.software_path_available ? "true" : "false") + ",\"software\":" + (software ? "true" : "false")
+            + ",\"hardware\":" + (report.software_path_available && nvidia ? "true" : "false") + ",\"elements\":[";
         bool first = true;
         for (const auto& b : report.backends) {
-            std::fprintf(out, "%s{\"name\":\"%s\",\"installed\":%s,\"usable\":%s}",first ? "":",",b.element.c_str(),
-                b.available ? "true":"false",b.viable ? "true":"false");
+            out += std::string{first ? "" : ","} + "{\"name\":\"" + b.element + "\",\"installed\":"
+                + (b.available ? "true" : "false") + ",\"usable\":" + (b.viable ? "true" : "false") + "}";
             first = false;
         }
-        std::fputs("]}\n", out);
+        out += "]}\n";
     }
+    return out;
 }
 } // namespace aa::tools

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "../stray_stdout.hpp"
+#include "../json_stdout.hpp"
 #include "../video_capabilities.hpp"
 //
 // Wired end-to-end receiver entry point (task 30 phase-B harness driver): the
@@ -1733,7 +1733,7 @@ const char *const kUsage =
     "  the display does not crop or map touch for them yet. See ARCHITECTURE.md.\n"
     "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked.\n";
 
-int receiver_run(int argc, char **argv, const aa::tools::StrayStdoutGuard &stray_stdout) {
+int receiver_main(int argc, char **argv) {
     auto video_profiles = aa::config::default_video_profiles();
     bool exact_video_profiles = false;
     auto video_decoder = aa::consumer::DecodeBackend::software;
@@ -1764,7 +1764,7 @@ int receiver_run(int argc, char **argv, const aa::tools::StrayStdoutGuard &stray
         } else if (std::strcmp(argv[index], "--store") == 0 && index + 1 < argc) {
             store_path = argv[++index];
         } else if (std::strcmp(argv[index], "--list-video-capabilities") == 0) {
-            aa::tools::list_video_capabilities(stray_stdout.json()); return 0;
+            return aa::tools::write_all(aa::tools::json_fd(), aa::tools::list_video_capabilities()) ? 0 : 1;
         } else if (std::strcmp(argv[index], "--decoder") == 0 && index + 1 < argc) {
             if (!aa::tools::parse_decoder(argv[++index],video_decoder)) { std::fputs("invalid --decoder\n",stderr); return 2; }
         } else if (std::strcmp(argv[index], "--idr-recovery") == 0 && index + 1 < argc) {
@@ -2506,20 +2506,22 @@ int receiver_run(int argc, char **argv, const aa::tools::StrayStdoutGuard &stray
              ",\"unhandled_controls\":" + std::to_string(session.unhandled_controls()) + "}");
     return runtime_failed || session_failed.load() ? 1 : 0;
 }
-int receiver_main(int argc, char **argv) {
-    // Before any GStreamer/NVIDIA load: their stdio text must not reach the
-    // JSON stdout channel, nor block a receiver thread on a stalled stdout or
-    // stderr. Lost text is reported in-band.
-    const aa::tools::StrayStdoutGuard stray_stdout;
-    const int code = receiver_run(argc, argv, stray_stdout);
-    if (const auto report = stray_stdout.drop_report(); !report.empty()) { log_line(report); }
-    return code;
-}
 } // namespace
 
 int main(int argc, char **argv) {
-    aa::wired_receiver::StdoutLogScope logging{g_running};
-    const int code = receiver_main(argc, argv);
-    const auto error = logging.log.finish();
-    return code != 0 ? code : (error ? 1 : 0);
+    // Before any GStreamer/NVIDIA load: JSON moves to a private descriptor and
+    // fd 1 becomes /dev/null (tools/json_stdout.hpp).
+    aa::tools::StdoutIsolation isolation;
+    int code = 0;
+    {
+        aa::wired_receiver::StdoutLogScope logging{g_running};
+        code = receiver_main(argc, argv);
+        const auto error = logging.log.finish();
+        code = code != 0 ? code : (error ? 1 : 0);
+    }
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+    return isolation.release(code);
+#else
+    aa::tools::StdoutIsolation::end_process(code);
+#endif
 }

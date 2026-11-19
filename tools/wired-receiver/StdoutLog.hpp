@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "../json_stdout.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -397,7 +398,7 @@ private:
             lock.unlock();
             std::size_t offset = 0;
             while (offset < front.size()) {
-                const auto count = state->write(STDOUT_FILENO, front.data() + offset, front.size() - offset);
+                const auto count = state->write(aa::tools::json_fd(), front.data() + offset, front.size() - offset);
                 if (count < 0 && errno == EINTR) { continue; }
                 if (count <= 0) { fail(state, count == 0 ? EIO : errno); return; }
                 offset += static_cast<std::size_t>(count);

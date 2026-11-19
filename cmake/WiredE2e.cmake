@@ -180,6 +180,12 @@ if(NOT CMAKE_CROSSCOMPILING)
                 "AA_WIRED_SOURCE_MISSING: ${source} (wired receiver source inventory)")
         endif()
     endforeach()
+    # TEST-ONLY LD_PRELOAD shim for the exit-path regression (tests/stdio).
+    if(NOT TARGET aa_test_file_lock_holder)
+        add_library(aa_test_file_lock_holder MODULE tests/stdio/file_lock_holder.c)
+        target_link_libraries(aa_test_file_lock_holder PRIVATE pthread)
+        set_target_properties(aa_test_file_lock_holder PROPERTIES PREFIX "")
+    endif()
     add_executable(aa-wired-receiver ${AA_WIRED_RECEIVER_SOURCES})
     set_target_properties(aa-wired-receiver PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
@@ -224,6 +230,12 @@ if(NOT CMAKE_CROSSCOMPILING)
         target_compile_options(aa-wired-enrol PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
     endif()
+    # Exit stays bounded with a third-party FILE lock held (tools/json_stdout.hpp).
+    add_test(NAME wired_receiver_exit_file_lock COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/stdio/exit_lock_test.py"
+        --shim "$<TARGET_FILE:aa_test_file_lock_holder>"
+        --receiver "$<TARGET_FILE:aa-wired-receiver>")
+    set_tests_properties(wired_receiver_exit_file_lock PROPERTIES TIMEOUT 120)
 endif()
 
 unset(AA_WIRED_SOURCES)

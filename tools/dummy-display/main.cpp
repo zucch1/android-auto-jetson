@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "pipeline_options.hpp"
-#include "../stray_stdout.hpp"
+#include "../json_stdout.hpp"
 #include "../video_capabilities.hpp"
 #include <aa/config/VideoProfiles.hpp>
 // Dummy display application (task 24): a Qt 6 test consumer for the REAL
@@ -40,7 +40,6 @@ using aa::display::DisplayState;
 // runtime error reporting on the GUI thread never waits on stdout either.
 class ErrorReporter final {
 public:
-    explicit ErrorReporter(std::FILE* json) noexcept : json_(json) {}
     void attach(aa::display::TelemetryWriter* writer) noexcept { writer_ = writer; }
 
     void begin_attempt() {
@@ -68,12 +67,10 @@ public:
             return;
         }
         line.push_back('\n');
-        std::fputs(line.c_str(), json_);
-        std::fflush(json_);
+        static_cast<void>(aa::tools::write_all(aa::tools::json_fd(), line));
     }
 
 private:
-    std::FILE* json_;
     aa::display::TelemetryWriter* writer_{nullptr};
     unsigned emitted_{0};
     std::optional<std::pair<std::string_view, aa::ErrorCode>> last_{};
@@ -174,8 +171,8 @@ aa::display::testcontrol::Status probe_status() {
     return status;
 }
 
-void print_usage(std::FILE* stream) {
-    std::fputs("usage: aa-dummy-display [--video-socket PATH] [--input-socket PATH]\n"
+constexpr const char* kUsage =
+    "usage: aa-dummy-display [--video-socket PATH] [--input-socket PATH]\n"
                "                        [--decoder software|hardware|auto] [--presentation cpu|gpu|zerocopy]\n"
                "                        [--media-thread gui|worker] [--check-pipeline] [--list-video-capabilities]\n"
                "                        [--decoder-backend software|nvidia|automatic (legacy flag)]\n"
@@ -185,19 +182,16 @@ void print_usage(std::FILE* stream) {
                "TEST-ONLY Android Auto projection consumer.\n"
                "  F5 start projection   F6 stop projection\n"
                "  F1 toggle HUD         F11 toggle full screen\n"
-               "  arrows/enter/letters  forwarded as keys; left mouse button = touch\n",
-               stream);
-}
+               "  arrows/enter/letters  forwarded as keys; left mouse button = touch\n";
+
+void print_usage(std::FILE* stream) { std::fputs(kUsage, stream); }
 
 } // namespace
 
-int main(int argc, char** argv) {
-    // Before any GStreamer/NVIDIA probe: library stdio text must not reach the
-    // JSON telemetry stream, nor block a display thread on a stalled stdout or
-    // stderr. Deliberate stdout output goes to json explicitly.
-    const aa::tools::StrayStdoutGuard stray_stdout;
-    std::FILE* const json = stray_stdout.json();
-    auto errors = std::make_shared<ErrorReporter>(json);
+// Runs the display; main() owns the stdout isolation and the process exit.
+int display_main(int argc, char** argv) {
+    const int json = aa::tools::json_fd();
+    auto errors = std::make_shared<ErrorReporter>();
 
     bool test_autostart = false;
     bool test_control_stdin = false;
@@ -228,7 +222,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
         } else if (std::strcmp(argv[index], "--list-video-capabilities") == 0) {
-            aa::tools::list_video_capabilities(json); return 0;
+            return aa::tools::write_all(json, aa::tools::list_video_capabilities()) ? 0 : 1;
         } else if (std::strcmp(argv[index], "--video-profiles") == 0 && index + 1 < argc) {
             auto parsed = aa::config::parse_video_profiles(argv[++index]);
             if (!parsed) { std::fputs("config_invalid: invalid --video-profiles\n",stderr); return 2; }
@@ -236,8 +230,7 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[index], "--check-pipeline") == 0) {
             check_only = true;
         } else if (std::strcmp(argv[index], "--help") == 0 || std::strcmp(argv[index], "-h") == 0) {
-            print_usage(json);
-            return 0;
+            return aa::tools::write_all(json, kUsage) ? 0 : 1;
         } else {
             std::fprintf(stderr, "aa-dummy-display: unrecognized argument '%s'\n", argv[index]);
             print_usage(stderr);
@@ -264,7 +257,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,"%.*s: %.*s\n",static_cast<int>(aa::to_string(refusal->code).size()),aa::to_string(refusal->code).data(),
             static_cast<int>(refusal->message.size()),refusal->message.data()); return 2;
     }
-    if (check_only) { std::fputs("pipeline_available\n", json); std::fflush(json); return 0; }
+    if (check_only) { return aa::tools::write_all(json, "pipeline_available\n") ? 0 : 1; }
     QApplication app(argc, argv);
     aa::ipc::InputSender sender{};
     sender.attach(aa::ipc::InputSocketPath{input_socket}, aa::ipc::current_uid());
@@ -277,8 +270,10 @@ int main(int argc, char** argv) {
     // Endpoint, decode and presentation telemetry is written by a background
     // thread: a slow stdout write must never stall the GUI thread that pumps,
     // decodes and paints (a stalled GUI thread shows up as a frozen display).
+    // Raw write(2) on the JSON descriptor: no FILE lock, so a worker that
+    // close() abandons on a stalled stdout cannot stall the process exit.
     aa::display::TelemetryWriter telemetry{[json](const std::string& line) {
-        return std::fputs(line.c_str(), json) != EOF && std::fflush(json) == 0;
+        return aa::tools::write_all(json, line);
     }};
     errors->attach(&telemetry);
     aa::display::TelemetryWriter diagnostics{aa::display::default_stderr_sink, 64};
@@ -396,13 +391,17 @@ int main(int argc, char** argv) {
         g_controller->shutdown();
         g_controller.reset();
     }
-    if (const auto report = stray_stdout.drop_report(); !report.empty()) {
-        static_cast<void>(telemetry.enqueue(report));
-    }
     widget.set_telemetry_writer(nullptr);
     errors->attach(nullptr);
     return aa::display::shutdown::finish(outcome, diagnostics, telemetry,
                                          [](const std::string& line) {
                                              std::fputs(line.c_str(), stderr);
                                          });
+}
+
+int main(int argc, char** argv) {
+    // Before any GStreamer/NVIDIA probe: JSON moves to a private descriptor and
+    // fd 1 becomes /dev/null; the run ends with _Exit (tools/json_stdout.hpp).
+    aa::tools::StdoutIsolation isolation;
+    aa::tools::StdoutIsolation::end_process(display_main(argc, argv));
 }
