@@ -46,31 +46,46 @@ jobs:
           fetch-depth: 0
       - name: Provision host-only AASDK and decode smoke dependencies
         env:
+          APT_UPDATE_S: "180"
           APT_DL_S: "300"
         run: |
           set -euo pipefail
-          # A slow mirror can trickle for most of the job without ever timing out,
-          # so bound the download phase, then fall back once to the primary Ubuntu
-          # archive. Every download stays verified against the signed indexes.
-          # A healthy download takes ~20 s; two bounded attempts must leave this
-          # job's timeout room to build and test.
-          apt_get_install() {
-            if ! sudo timeout "$APT_DL_S" apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"; then
-              echo "::warning::apt download exceeded ${APT_DL_S} s or failed; retrying on archive.ubuntu.com"
-              # GitHub's ubuntu-24.04 image points ubuntu.sources at
-              # mirror+file:/etc/apt/apt-mirrors.txt, so replace the mirror list as
-              # well as any direct *.archive.ubuntu.com URIs.
-              if [ -f /etc/apt/apt-mirrors.txt ]; then
-                echo 'http://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
-              fi
-              sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
-                /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
-              sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-              sudo timeout "$APT_DL_S" apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"
+          # A slow mirror can trickle for most of the job without ever timing out
+          # (Acquire::*::Timeout only catches a fully stalled connection), so every
+          # network phase (index update and package download) has a wall-clock
+          # bound, and the first failure or timeout switches once to the primary
+          # Ubuntu archive. Every download stays verified against the signed
+          # indexes. Healthy runs take ~20 s; the worst case is two updates plus
+          # two downloads, which must leave this job's timeout room to build.
+          apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          fell_back=0
+          use_primary_archive() {
+            echo "::warning::apt $1 exceeded its bound or failed; switching to archive.ubuntu.com"
+            # GitHub's ubuntu-24.04 image points ubuntu.sources at
+            # mirror+file:/etc/apt/apt-mirrors.txt, so replace the mirror list as
+            # well as any direct *.archive.ubuntu.com URIs.
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              echo 'http://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
             fi
-            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install "$@"
+            sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
+              /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+            fell_back=1
+            sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update
           }
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          apt_update() {
+            if ! sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update; then
+              use_primary_archive update
+            fi
+          }
+          apt_get_install() {
+            if ! sudo timeout "$APT_DL_S" apt-get "${apt_opts[@]}" --download-only install "$@"; then
+              [ "$fell_back" = 1 ] && { echo "::error::apt download failed on archive.ubuntu.com too"; return 1; }
+              use_primary_archive download
+              sudo timeout "$APT_DL_S" apt-get "${apt_opts[@]}" --download-only install "$@"
+            fi
+            sudo apt-get "${apt_opts[@]}" install "$@"
+          }
+          apt_update
           apt_get_install --no-install-recommends -y ninja-build cmake g++ \
             libprotobuf-dev protobuf-compiler libboost-system-dev libboost-log-dev \
             libssl-dev libusb-1.0-0-dev pkg-config libgstreamer1.0-dev \
@@ -269,31 +284,46 @@ jobs:
           persist-credentials: false
       - name: Provision public synthetic cross fixture dependencies
         env:
-          APT_DL_S: "180"
+          APT_UPDATE_S: "90"
+          APT_DL_S: "150"
         run: |
           set -euo pipefail
-          # A slow mirror can trickle for most of the job without ever timing out,
-          # so bound the download phase, then fall back once to the primary Ubuntu
-          # archive. Every download stays verified against the signed indexes.
-          # A healthy download takes ~20 s; two bounded attempts must leave this
-          # job's timeout room to build and test.
-          apt_get_install() {
-            if ! sudo timeout "$APT_DL_S" apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"; then
-              echo "::warning::apt download exceeded ${APT_DL_S} s or failed; retrying on archive.ubuntu.com"
-              # GitHub's ubuntu-24.04 image points ubuntu.sources at
-              # mirror+file:/etc/apt/apt-mirrors.txt, so replace the mirror list as
-              # well as any direct *.archive.ubuntu.com URIs.
-              if [ -f /etc/apt/apt-mirrors.txt ]; then
-                echo 'http://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
-              fi
-              sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
-                /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
-              sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-              sudo timeout "$APT_DL_S" apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"
+          # A slow mirror can trickle for most of the job without ever timing out
+          # (Acquire::*::Timeout only catches a fully stalled connection), so every
+          # network phase (index update and package download) has a wall-clock
+          # bound, and the first failure or timeout switches once to the primary
+          # Ubuntu archive. Every download stays verified against the signed
+          # indexes. Healthy runs take ~20 s; the worst case is two updates plus
+          # two downloads, which must leave this job's timeout room to build.
+          apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          fell_back=0
+          use_primary_archive() {
+            echo "::warning::apt $1 exceeded its bound or failed; switching to archive.ubuntu.com"
+            # GitHub's ubuntu-24.04 image points ubuntu.sources at
+            # mirror+file:/etc/apt/apt-mirrors.txt, so replace the mirror list as
+            # well as any direct *.archive.ubuntu.com URIs.
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              echo 'http://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
             fi
-            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install "$@"
+            sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
+              /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+            fell_back=1
+            sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update
           }
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          apt_update() {
+            if ! sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update; then
+              use_primary_archive update
+            fi
+          }
+          apt_get_install() {
+            if ! sudo timeout "$APT_DL_S" apt-get "${apt_opts[@]}" --download-only install "$@"; then
+              [ "$fell_back" = 1 ] && { echo "::error::apt download failed on archive.ubuntu.com too"; return 1; }
+              use_primary_archive download
+              sudo timeout "$APT_DL_S" apt-get "${apt_opts[@]}" --download-only install "$@"
+            fi
+            sudo apt-get "${apt_opts[@]}" install "$@"
+          }
+          apt_update
           apt_get_install --no-install-recommends -y ninja-build cmake \
             g++-aarch64-linux-gnu pkg-config binutils libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev
@@ -509,31 +539,46 @@ jobs:
           persist-credentials: false
       - name: Provision aarch64 cross toolchain for the fixture cross build
         env:
+          APT_UPDATE_S: "120"
           APT_DL_S: "240"
         run: |
           set -euo pipefail
-          # A slow mirror can trickle for most of the job without ever timing out,
-          # so bound the download phase, then fall back once to the primary Ubuntu
-          # archive. Every download stays verified against the signed indexes.
-          # A healthy download takes ~20 s; two bounded attempts must leave this
-          # job's timeout room to build and test.
-          apt_get_install() {
-            if ! sudo timeout "$APT_DL_S" apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"; then
-              echo "::warning::apt download exceeded ${APT_DL_S} s or failed; retrying on archive.ubuntu.com"
-              # GitHub's ubuntu-24.04 image points ubuntu.sources at
-              # mirror+file:/etc/apt/apt-mirrors.txt, so replace the mirror list as
-              # well as any direct *.archive.ubuntu.com URIs.
-              if [ -f /etc/apt/apt-mirrors.txt ]; then
-                echo 'http://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
-              fi
-              sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
-                /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
-              sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-              sudo timeout "$APT_DL_S" apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --download-only install "$@"
+          # A slow mirror can trickle for most of the job without ever timing out
+          # (Acquire::*::Timeout only catches a fully stalled connection), so every
+          # network phase (index update and package download) has a wall-clock
+          # bound, and the first failure or timeout switches once to the primary
+          # Ubuntu archive. Every download stays verified against the signed
+          # indexes. Healthy runs take ~20 s; the worst case is two updates plus
+          # two downloads, which must leave this job's timeout room to build.
+          apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          fell_back=0
+          use_primary_archive() {
+            echo "::warning::apt $1 exceeded its bound or failed; switching to archive.ubuntu.com"
+            # GitHub's ubuntu-24.04 image points ubuntu.sources at
+            # mirror+file:/etc/apt/apt-mirrors.txt, so replace the mirror list as
+            # well as any direct *.archive.ubuntu.com URIs.
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              echo 'http://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
             fi
-            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install "$@"
+            sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com#http://archive.ubuntu.com#g' \
+              /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+            fell_back=1
+            sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update
           }
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          apt_update() {
+            if ! sudo timeout "$APT_UPDATE_S" apt-get "${apt_opts[@]}" update; then
+              use_primary_archive update
+            fi
+          }
+          apt_get_install() {
+            if ! sudo timeout "$APT_DL_S" apt-get "${apt_opts[@]}" --download-only install "$@"; then
+              [ "$fell_back" = 1 ] && { echo "::error::apt download failed on archive.ubuntu.com too"; return 1; }
+              use_primary_archive download
+              sudo timeout "$APT_DL_S" apt-get "${apt_opts[@]}" --download-only install "$@"
+            fi
+            sudo apt-get "${apt_opts[@]}" install "$@"
+          }
+          apt_update
           apt_get_install --no-install-recommends -y ninja-build cmake \
             g++-aarch64-linux-gnu pkg-config binutils
           aarch64-linux-gnu-g++ --version
