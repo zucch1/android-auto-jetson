@@ -342,22 +342,27 @@ log_since() {
     remote "tail -c +$(( $1 + 1 )) /tmp/aa-wired-receiver.log 2>/dev/null" || true
 }
 
-# Receiver log completeness (#90 review). Under a stalled stdout the receiver
-# drops only droppable runtime records and reports them in-band as
-# runtime_log_dropped; gate-relevant state records are parked and delivered
-# unless the bounded slot overflowed ("state_overflow":N > 0). Prints
-# "<runtime drop records> <state records lost>".
-receiver_log_loss() {
-    local drops line records=0 lost=0
-    drops="$(remote "grep -o '\"event\":\"runtime_log_dropped\"[^}]*' /tmp/aa-wired-receiver.log 2>/dev/null" || true)"
-    while IFS= read -r line; do
-        [[ "$line" == *runtime_log_dropped* ]] || continue
-        records=$(( records + 1 ))
-        if [[ "$line" =~ \"state_overflow\":(0|[1-9][0-9]{0,17}) ]]; then
-            lost=$(( lost + BASH_REMATCH[1] ))
-        fi
-    done <<< "$drops"
-    printf '%s %s\n' "$records" "$lost"
+# Receiver log integrity (#90 review), across every receiver generation and the
+# separate admission attempt. Each log must end in the logger's log_complete
+# record; an unreadable or missing log counts as incomplete. Prints the
+# aa_log_integrity flags, e.g. "generations=2 complete=1 state_lost=0 ...".
+INTEGRITY_TOOL="$(cd "$(dirname "${BASH_SOURCE[0]}")/../perf" && pwd)/aa_log_integrity.py"
+receiver_log_audit() {
+    local stream
+    stream="$(remote "rc=0; for f in /tmp/aa-wired-receiver.gen*.log /tmp/aa-wired-receiver.log /tmp/aa-wired-receiver-attempt.log; do [ -e \"\$f\" ] || continue; echo \"### \$f\"; grep -E '\"event\":\"(log_complete|runtime_log_dropped|media_telemetry_dropped)\"' \"\$f\"; [ \$? -le 1 ] || echo '### unreadable'; done; echo '### end'" 2>/dev/null)" ||
+        stream="### unreadable"
+    # The trailing end marker proves the listing itself completed.
+    if [[ "$stream" != *"### end"* ]]; then stream="### unreadable"; fi
+    stream="${stream%%### end*}"
+    printf '%s\n' "$stream" | python3 -I "$INTEGRITY_TOOL" generations
+}
+
+# Stop the receiver and wait for it to exit, so its final summaries and
+# log_complete record are on disk before the audit (bounded; a receiver that
+# does not exit leaves its log incomplete, which the audit fails closed).
+stop_receiver_for_audit() {
+    [[ -n "${RECEIVER_PID}" ]] || return 0
+    remote "kill ${RECEIVER_PID} 2>/dev/null || true; for n in \$(seq 1 100); do kill -0 ${RECEIVER_PID} 2>/dev/null || exit 0; sleep 0.1; done; exit 1" >/dev/null 2>&1 || true
 }
 
 # The receiver's run-cumulative reconnect-attempt counter ("retries":N).
@@ -512,10 +517,17 @@ media_evidence() {
 
 RECEIVER_PID=""
 CONSUMER_PID=""
+RECEIVER_GENERATION=0
 start_receiver() {
     [[ -n "${RECEIVER}" ]] || return 1
     local args="--port ${PORT_Q}"
     [[ -n "${STORE}" ]] && args="${args} --store $(shq "$STORE")"
+    # Each receiver generation keeps its own log (#90 review): a restart must
+    # never erase the previous generation's loss evidence or completion record.
+    if (( RECEIVER_GENERATION > 0 )); then
+        remote "mv -f /tmp/aa-wired-receiver.log /tmp/aa-wired-receiver.gen${RECEIVER_GENERATION}.log 2>/dev/null || true" >/dev/null 2>&1 || true
+    fi
+    RECEIVER_GENERATION=$(( RECEIVER_GENERATION + 1 ))
     RECEIVER_PID="$(remote "nohup $(shq "$RECEIVER") ${args} > /tmp/aa-wired-receiver.log 2>&1 & echo \$!" 2>/dev/null | tr -dc '0-9')"
     [[ -n "${RECEIVER_PID}" ]]
 }
@@ -1097,32 +1109,56 @@ if [[ ! -s "${RESULTS_TSV}" ]]; then
 fi
 
 # ---- 4. verdict: PASS only if every SELECTED scenario passed with evidence ----
+# Log integrity (#90 review): a lost, unproven or late receiver record can only
+# change a row it is evidence for. A confirmed failure stays FAILED; a row the
+# loss could have decided is BLOCKED; nothing a loss could fake is PASS.
+# The audit is not part of any scenario: run it outside the scenario deadline.
+STIMULUS_NS="" DEADLINE_NS="" stop_receiver_for_audit
+log_audit="$(STIMULUS_NS="" DEADLINE_NS="" receiver_log_audit)" || log_audit=""
+log_flag() { [[ " ${log_audit} " == *" $1=1 "* ]]; }
+[[ "$log_audit" == *"complete="* ]] || log_audit="complete=0 state_lost=1 media_lost=1 runtime_lost=1 late_delivery=1"
+log_taint() { # status detail -> prints the taint reason, or nothing
+    local status="$1" detail="$2"
+    if [[ "$status" == PASS ]]; then
+        if ! log_flag complete; then echo receiver_log_incomplete
+        elif log_flag state_lost; then echo receiver_state_log_lost; fi
+        return 0
+    fi
+    [[ "$status" == FAILED ]] || return 0
+    case "$detail" in
+        no_active_event|dip_not_attributed_to_intended_device)
+            if ! log_flag complete; then echo receiver_log_incomplete
+            elif log_flag state_lost; then echo receiver_state_log_lost; fi ;;
+        no_media_evidence_after_recovery)
+            if ! log_flag complete; then echo receiver_log_incomplete
+            elif log_flag media_lost || log_flag runtime_lost; then echo receiver_media_or_input_log_lost
+            elif log_flag late_delivery; then echo receiver_log_late; fi ;;
+        recovery_exceeded_budget)
+            if log_flag late_delivery; then echo receiver_log_late; fi ;;
+    esac
+    return 0
+}
 overall="PASS"
 blocked_on=""
+audited_tsv="${RESULTS_DIR}/audited.tsv"
+: > "$audited_tsv"
 while IFS='|' read -r name status recovery retries evidence detail frames_baseline elapsed; do
     [[ -n "${name}" ]] || continue
     if [[ "$status" == PASS ]] && ! python3 -c 'import sys; v=float(sys.argv[1]); sys.exit(not (0 <= v < int(sys.argv[2])))' "$recovery" "$BUDGET_MS"; then
         status=FAILED detail=timing_error_pass_invariant
     fi
+    taint="$(log_taint "$status" "$detail")" || taint=""
+    if [[ -n "$taint" ]]; then
+        status=BLOCKED detail="${taint}:${detail}"
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$name" "$status" "$recovery" "$retries" "$evidence" "$detail" "$frames_baseline" "$elapsed" >> "$audited_tsv"
     case "${status}" in
         PASS|N/A) ;;
         BLOCKED) [[ "$overall" == FAILED ]] || overall="BLOCKED"; blocked_on="${blocked_on:+${blocked_on},}${name}:${detail}" ;;
         *) overall="FAILED"; blocked_on="${blocked_on:+${blocked_on},}${name}:${detail}" ;;
     esac
 done < "${RESULTS_TSV}"
-
-# Fail closed on an incomplete receiver log (#90 review): lost state records
-# (reconnect / session_state / err / idr) can fake or hide any verdict, so the
-# run is BLOCKED; dropped runtime records (input_forwarded evidence) can only
-# fake a FAILED, so a FAILED becomes BLOCKED. Original details stay listed.
-read -r log_drop_records log_state_lost < <(receiver_log_loss)
-if (( log_state_lost > 0 )); then
-    overall="BLOCKED"
-    blocked_on="receiver_log:state_log_dropped${blocked_on:+,${blocked_on}}"
-elif (( log_drop_records > 0 )) && [[ "$overall" == FAILED ]]; then
-    overall="BLOCKED"
-    blocked_on="receiver_log:runtime_log_dropped${blocked_on:+,${blocked_on}}"
-fi
+mv -f "$audited_tsv" "${RESULTS_TSV}"
 
 write_result "$overall" "$blocked_on"
 if [[ -n "${ONLY}" ]]; then

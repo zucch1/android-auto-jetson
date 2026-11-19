@@ -391,7 +391,17 @@ TEST(WiredReceiver, LogLineReturnsBeforeFullStdoutGateReleaseLosslessly) {
     ASSERT_TRUE(WIFEXITED(child.status)) << child.status;
     EXPECT_EQ(WEXITSTATUS(child.status), 0);
     EXPECT_TRUE(witness_after_release);
-    EXPECT_EQ(child.bytes, std::string(filled, 'F') + json + '\n');
+    // Exact bytes, then the production logger's completion record (#90 review).
+    const auto exact = std::string(filled, 'F') + json + '\n';
+    ASSERT_GE(child.bytes.size(), exact.size());
+    EXPECT_EQ(child.bytes.substr(0, exact.size()), exact);
+    const auto completion = child.bytes.substr(exact.size());
+    EXPECT_TRUE(completion.starts_with("{\"event\":\"log_complete\",\"runtime_dropped\":0,"
+                                       "\"state_overflow\":0,\"media_rate_limited\":0,"
+                                       "\"media_backpressure\":0,\"shutdown_dropped\":0,"))
+        << completion;
+    EXPECT_TRUE(completion.ends_with("}\n")) << completion;
+    EXPECT_EQ(std::count(completion.begin(), completion.end(), '\n'), 1);
     std::cout << "ISSUE60 filled=" << filled << " captured=" << child.bytes.size()
               << " witness_before_release=" << witness_before_release
               << " witness_after_release=" << witness_after_release
@@ -2707,8 +2717,10 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     ASSERT_FALSE(mutations.empty());
     {
         const std::lock_guard lock(runtime_owner_mutex);
+        // #90 review: the durable store write runs on WiredPhoneControl's
+        // persistence thread, never on the session owner or the D-Bus dispatcher.
         for (const auto thread : mutations) {
-            EXPECT_EQ(thread, runtime_io_owner);
+            EXPECT_NE(thread, runtime_io_owner);
             EXPECT_NE(thread, dispatcher);
         }
     }
@@ -5173,10 +5185,10 @@ TEST(WiredReceiver, WorkerSettledIdleResumesOriginalTimelineAndReportsPrefixExac
         {base}, {base + 2'405'000'000}, {base + 2'410'000'000}}));
     const auto resume = "{\"event\":\"audio_idle_resume\",\"id\":1,\"start_ns\":" +
         std::to_string(base + 5'000'000) + ",\"end_ns\":" + std::to_string(base + 2'405'000'000) +
-        ",\"idle_ns\":2400000000,\"reason\":\"all_role_idle\"}";
+        ",\"idle_ns\":2400000000,\"reason\":\"all_role_idle\",\"emit_ns\":";
     EXPECT_NE(output.find(resume), std::string::npos) << output;
     EXPECT_NE(output.find("{\"event\":\"audio_idle_skipped\",\"id\":1,\"frames_idle_skipped\":115200,"
-                          "\"frames_idle_skipped_total\":115200}"), std::string::npos) << output;
+                          "\"frames_idle_skipped_total\":115200,\"emit_ns\":"), std::string::npos) << output;
     const auto first_resume = output.find("\"event\":\"audio_idle_resume\"");
     const auto first_skip = output.find("\"event\":\"audio_idle_skipped\"");
     ASSERT_NE(first_resume, std::string::npos);
@@ -5379,7 +5391,7 @@ void expect_post_completion_idle_order(CompletionIdleOrder order) {
                                   : std::string{"null"}) +
             ",\"playback_slot_absence\":" +
             (completion.presented ? std::string{"null"}
-                : "\"" + std::string{aa::audio::to_string(completion.playback_slot_absence)} + "\"") + "}";
+                : "\"" + std::string{aa::audio::to_string(completion.playback_slot_absence)} + "\"") + ",\"emit_ns\":";
         const auto first = output.find(event);
         ASSERT_NE(first, std::string::npos);
         EXPECT_EQ(output.find(event, first + 1), std::string::npos);
@@ -5407,7 +5419,7 @@ void expect_post_completion_idle_order(CompletionIdleOrder order) {
         EXPECT_EQ(gate->timestamps.back().count, base + (480LL + 882961LL) * 1'000'000'000 / 48000);
         const auto resume = "{\"event\":\"audio_idle_resume\",\"id\":1,\"start_ns\":" +
             std::to_string(second_end) + ",\"end_ns\":" + std::to_string(third_start) +
-            ",\"idle_ns\":18395020834,\"reason\":\"all_role_idle\"}";
+            ",\"idle_ns\":18395020834,\"reason\":\"all_role_idle\",\"emit_ns\":";
         EXPECT_NE(output.find(resume), std::string::npos);
         EXPECT_NE(output.find("\"frames_idle_skipped\":882961,\"frames_idle_skipped_total\":882961"),
                   std::string::npos);
@@ -5655,7 +5667,7 @@ TEST(WiredReceiver, WorkerIdleSkipCorrelationTotalsSlicesAroundBackpressure) {
     EXPECT_EQ(report->stats.frames_written, 2U);
     const auto output = capture.release();
     const auto event = output.find("{\"event\":\"audio_idle_skipped\",\"id\":1,\"frames_idle_skipped\":105600,"
-                                   "\"frames_idle_skipped_total\":105600}");
+                                   "\"frames_idle_skipped_total\":105600,\"emit_ns\":");
     ASSERT_NE(event, std::string::npos) << output;
     EXPECT_EQ(output.find("\"event\":\"audio_idle_skipped\"", event + 2), std::string::npos) << output;
 }
@@ -5793,7 +5805,7 @@ TEST(WiredReceiver, RealGstSameWorkerIdlePauseResumesWithoutReopeningRoute) {
     EXPECT_NE(output.find("{\"event\":\"audio_idle_resume\",\"id\":1,"), std::string::npos) << output;
     EXPECT_NE(output.find("{\"event\":\"audio_idle_skipped\",\"id\":1,\"frames_idle_skipped\":" +
                           std::to_string(report->stats.frames_idle_skipped) + ",\"frames_idle_skipped_total\":" +
-                          std::to_string(report->stats.frames_idle_skipped) + "}"), std::string::npos) << output;
+                          std::to_string(report->stats.frames_idle_skipped) + ",\"emit_ns\":"), std::string::npos) << output;
     const std::lock_guard progress_lock(progress_mutex);
     for (const auto scheduled : {first, second, third}) {
         EXPECT_EQ(std::count_if(completions.begin(), completions.end(), [&](const auto &value) {
@@ -7110,7 +7122,7 @@ TEST(WiredReceiver, RuntimeDiagnosticsAndAudioReopenKeepTimingOnStalledStdout) {
     // non-periodic diag and the collector-visible audio_stall_bypass transitions
     // are parked and delivered.
     EXPECT_GE(sum_runtime_dropped(probe.bytes), 2U);
-    EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"diag\",\"kind\":\"stall_diag_probe\"}"), 1U);
+    EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"diag\",\"kind\":\"stall_diag_probe\",\"emit_ns\":"), 1U);
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_stall_bypass\",\"phase\":\"begin\""), 1U);
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_stall_bypass\",\"phase\":\"end\""), 1U);
 }
@@ -7488,10 +7500,24 @@ TEST(WiredReceiver, WiredReceiverEndToEndKeepsAvAudioAndControlTimingDuringStdou
             fail_child(103);
         }
 
-        // 2. Audio latency gate (< 200 ms) while stdout is blocked & full.
+        // 2. Audio latency gate (< 200 ms) while stdout is blocked & full,
+        // measured to the render sink's write (the playback endpoint this
+        // harness can observe), not only to the phone-visible ACK.
         const std::size_t audio_acks_before = count_sent_on_channel(100);
+        std::size_t sink_writes_before = 0;
+        {
+            std::lock_guard gate_lock(gate->mutex);
+            sink_writes_before = gate->writes;
+        }
         const auto t_audio_start = LogClock::now();
         push_channel(100, av_data_message(0, wiredtest::pcm_unit()));
+        if (!gate->wait_writes(sink_writes_before + 1)) {
+            fail_child(111);
+        }
+        const auto audio_sink_elapsed = LogClock::now() - t_audio_start;
+        if (audio_sink_elapsed >= std::chrono::milliseconds{200}) {
+            fail_child(112);
+        }
         bool audio_acked = false;
         {
             std::unique_lock lock(state->mutex);
@@ -7573,8 +7599,12 @@ TEST(WiredReceiver, WiredReceiverEndToEndKeepsAvAudioAndControlTimingDuringStdou
         << "SESSION_STATE_LOST_UNDER_STDOUT_SATURATION";
     EXPECT_GE(count_substr(child.bytes, "{\"event\":\"decode_stats\",\"frame_drops\":"), 1U)
         << "FINAL_DECODE_STATS_LOST_UNDER_STDOUT_SATURATION";
-    EXPECT_EQ(count_substr(child.bytes, "\"state_overflow\":0"),
+    EXPECT_EQ(count_substr(child.bytes, "\"event\":\"runtime_log_dropped\",\"backpressure\":"),
               count_substr(child.bytes, "\"event\":\"runtime_log_dropped\""));
+    // The receiver proves its log complete once stdout drains: no state lost.
+    EXPECT_EQ(count_substr(child.bytes, "\"event\":\"log_complete\""), 1U);
+    EXPECT_NE(child.bytes.find("\"event\":\"log_complete\",\"runtime_dropped\":"), std::string::npos);
+    EXPECT_NE(child.bytes.find(",\"state_overflow\":0,"), std::string::npos);
 }
 
 TEST(WiredReceiver, StdoutLogRuntimeRecordsNeverBlockOnFullStalledSinkAndReportDrops) {
@@ -7717,7 +7747,7 @@ TEST(WiredReceiver, StdoutLogParkedStateSlotIsBoundedAndCountsOverflow) {
     EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"err\",\"detail\":\"x\"}"), cap);
     EXPECT_EQ(sum_runtime_dropped(probe.bytes), 3U);
     // The gate-visible loss is named in-band, separately from droppable records.
-    EXPECT_EQ(count_substr(probe.bytes, "\"state_overflow\":3"), 1U);
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"runtime_log_dropped\",\"backpressure\":3,\"state_overflow\":3"), 1U);
 }
 
 TEST(WiredReceiver, StdoutLogDropSummaryNeverTakesTheSlotAFreedRecordNeeds) {
@@ -7793,8 +7823,142 @@ TEST(WiredReceiver, StdoutDiagnosticsParkGateRelevantKindsAndDropOnlyTransportSt
     probe.release();
     EXPECT_FALSE(log.finish());
     EXPECT_EQ(count_substr(probe.bytes,
-        "{\"event\":\"diag\",\"kind\":\"session_state_changed\",\"to_state\":\"disconnected\"}"), 1U);
-    EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"diag\",\"kind\":\"reconnect\",\"retries\":2}"), 1U);
+        "{\"event\":\"diag\",\"kind\":\"session_state_changed\",\"to_state\":\"disconnected\",\"emit_ns\":"), 1U);
+    EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"diag\",\"kind\":\"reconnect\",\"retries\":2,\"emit_ns\":"), 1U);
     EXPECT_EQ(count_substr(probe.bytes, "transport_stats"), 0U);
-    EXPECT_EQ(count_substr(probe.bytes, "\"state_overflow\":0"), 1U);
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"runtime_log_dropped\",\"backpressure\":1,\"state_overflow\":0"), 1U);
+}
+
+namespace {
+// Fills the stalled queue to exactly its byte capacity with 512-byte records.
+void fill_log_bytes(aa::wired_receiver::StdoutLog &log) {
+    const std::string record(511, 'b');
+    for (std::size_t i = 0; i < aa::wired_receiver::StdoutLog::byte_capacity / 512; ++i) {
+        ASSERT_FALSE(log.submit(record));
+    }
+    ASSERT_EQ(log.outstanding().first, aa::wired_receiver::StdoutLog::byte_capacity);
+}
+
+bool wait_probe_calls(LogWriteProbe &probe, int calls) {
+    std::unique_lock lock(probe.mutex);
+    return probe.cv.wait_for(lock, std::chrono::seconds{5}, [&] { return probe.calls >= calls; });
+}
+} // namespace
+
+TEST(WiredReceiver, StdoutLogParkedStateRecordIsNotBypassedAtTheByteLimit) {
+    // Given: a byte-full queue of 512-byte records behind a stalled sink and a
+    // parked 1 KiB state record (#90 review P2).
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    struct ProbeGuard {
+        LogWriteProbe &p;
+        ~ProbeGuard() { p.release(); LogWriteProbe::active = nullptr; }
+    } probe_guard{probe};
+    std::atomic<bool> running{true};
+    g_log_fake_ns = 0;
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {1e9, 1e9}};
+    fill_log_bytes(log);
+    const std::string err = "{\"event\":\"err\",\"detail\":\"" + std::string(900, 'e') + "\"}";
+    EXPECT_FALSE(log.submit_state(err));
+    ASSERT_EQ(log.parked_states(), 1U);
+    // When: one 512-byte entry drains (too little for the parked head) and a
+    // smaller droppable record arrives that would fit the freed bytes.
+    probe.allow_one();
+    ASSERT_TRUE(wait_probe_calls(probe, 2));
+    EXPECT_FALSE(log.submit_runtime(std::string(400, 'r')));
+    EXPECT_FALSE(log.submit_media("video_sent", std::string(400, 'm')));
+    // Then: neither overtakes the parked head; both are counted as dropped.
+    EXPECT_EQ(log.runtime_drops(), 1U);
+    EXPECT_EQ(log.media_drops().backpressure, 1U);
+    // And: once a second entry drains, the head is promoted in order.
+    probe.allow_one();
+    ASSERT_TRUE(wait_probe_calls(probe, 3));
+    const auto until = LogClock::now() + std::chrono::seconds{5};
+    while (log.parked_states() != 0 && LogClock::now() < until) { std::this_thread::yield(); }
+    EXPECT_EQ(log.parked_states(), 0U);
+    probe.release();
+    EXPECT_FALSE(log.finish());
+    EXPECT_EQ(count_substr(probe.bytes, err + "\n"), 1U);
+}
+
+TEST(WiredReceiver, StdoutLogDropSummaryNeverTakesFreedByteCapacity) {
+    // Given: a byte-full queue and a due drop summary (#90 review P3).
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    struct ProbeGuard {
+        LogWriteProbe &p;
+        ~ProbeGuard() { p.release(); LogWriteProbe::active = nullptr; }
+    } probe_guard{probe};
+    std::atomic<bool> running{true};
+    g_log_fake_ns = 0;
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {1e9, 1e9}};
+    fill_log_bytes(log);
+    EXPECT_FALSE(log.submit_runtime("{\"event\":\"lost\"}"));
+    ASSERT_EQ(log.runtime_drops(), 1U);
+    // When: exactly one 512-byte record's bytes are freed.
+    probe.allow_one();
+    ASSERT_TRUE(wait_probe_calls(probe, 2));
+    const auto until = LogClock::now() + std::chrono::seconds{5};
+    while (log.outstanding().first > aa::wired_receiver::StdoutLog::byte_capacity - 512 &&
+           LogClock::now() < until) {
+        std::this_thread::yield();
+    }
+    // Then: a 512-byte real record fits; the summary took no queue bytes.
+    EXPECT_EQ(log.outstanding().first, aa::wired_receiver::StdoutLog::byte_capacity - 512);
+    EXPECT_FALSE(log.submit_runtime(std::string(511, 'n')));
+    EXPECT_EQ(log.runtime_drops(), 1U);
+    probe.release();
+    EXPECT_FALSE(log.finish());
+    EXPECT_EQ(sum_runtime_dropped(probe.bytes), 1U);
+}
+
+TEST(WiredReceiver, StdoutLogCompletionRecordProvesACleanDrainWithLossAndLag) {
+    // Given: a stalled sink on a controllable clock, one record per loss class.
+    LogWriteProbe probe;
+    LogWriteProbe::active = &probe;
+    struct ProbeGuard {
+        LogWriteProbe &p;
+        ~ProbeGuard() { p.release(); LogWriteProbe::active = nullptr; }
+    } probe_guard{probe};
+    std::atomic<bool> running{true};
+    g_log_fake_ns = 0;
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {1e9, 1e9},
+                                      aa::wired_receiver::StdoutLog::default_finish_timeout, true};
+    fill_log_queue(log);
+    EXPECT_FALSE(log.submit_runtime("{\"event\":\"lost\"}"));
+    EXPECT_FALSE(log.submit_media("audio_write_completed", "{\"event\":\"lost_media\"}"));
+    // When: the sink stays stalled for 750 ms of (virtual) time, then drains.
+    g_log_fake_ns = 750'000'000;
+    probe.release();
+    EXPECT_FALSE(log.finish());
+    // Then: the very last line is the completion record with every counter.
+    const std::string expected =
+        "{\"event\":\"log_complete\",\"runtime_dropped\":1,\"state_overflow\":0,\"media_rate_limited\":0,"
+        "\"media_backpressure\":1,\"shutdown_dropped\":0,\"max_delivery_lag_ms\":750}\n";
+    ASSERT_GE(probe.bytes.size(), expected.size());
+    EXPECT_EQ(probe.bytes.substr(probe.bytes.size() - expected.size()), expected);
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"log_complete\""), 1U);
+}
+
+TEST(WiredReceiver, StdoutLogAbandonedSinkNeverWritesACompletionRecord) {
+    auto *probe = new LogWriteProbe; // Intentionally leaked: the worker outlives this test.
+    LogWriteProbe::active = probe;
+    std::atomic<bool> running{true};
+    {
+        aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write,
+                                          &aa::wired_receiver::StdoutLog::Clock::now, {},
+                                          aa::wired_receiver::StdoutLog::default_finish_timeout, true};
+        EXPECT_FALSE(log.submit("{\"event\":\"stuck\"}"));
+        // When: finish() gives up on a sink that never returns.
+        EXPECT_TRUE(log.finish(std::chrono::milliseconds{100}));
+        EXPECT_TRUE(log.timed_out());
+    }
+    // Then: even after the sink recovers, the detached worker writes no proof.
+    probe->release();
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    {
+        const std::lock_guard lock(probe->mutex);
+        EXPECT_EQ(probe->bytes.find("log_complete"), std::string::npos);
+    }
+    LogWriteProbe::active = nullptr;
 }

@@ -222,7 +222,10 @@ teardown() {
     for pid in "$display_pid" "$receiver_pid"; do
         [[ -z "$pid" ]] && continue
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-        remote "kill $pid 2>/dev/null || true; for n in \$(seq 1 20); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; kill -KILL $pid 2>/dev/null || true; sleep 0.1; ! kill -0 $pid 2>/dev/null" || return 1
+        # Up to 10 s for a clean exit: the receiver logger's bounded shutdown
+        # (admission plus drain, about 4 s) writes the log_complete record the
+        # verdict requires (#90 review). A KILLed receiver leaves no proof.
+        remote "kill $pid 2>/dev/null || true; for n in \$(seq 1 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; kill -KILL $pid 2>/dev/null || true; sleep 0.1; ! kill -0 $pid 2>/dev/null" || return 1
     done
     receiver_pid=""; display_pid=""
 }
@@ -288,26 +291,37 @@ fi
 # requires an ACTIVE session AND all three delivery paths observed: painted
 # frames with render_ok, successful-pump audio_chunks plus media_timing, and
 # input_forwarded ok:true. Final media_timing alone can follow a failed pump.
-# Fail closed on an incomplete receiver log (#90 review): lost state records
-# (state_overflow > 0, e.g. `active`) make any verdict BLOCKED; dropped runtime
-# records (input_forwarded) can only hide evidence, so a would-be FAILED is
-# BLOCKED. A PASS rests on positive evidence and stands.
-log_drop_records=0; log_state_lost=0
-log_drops="$(remote "grep -o '\"event\":\"runtime_log_dropped\"[^}]*' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log 2>/dev/null" || true)"
-while IFS= read -r line; do
-    [[ "$line" == *runtime_log_dropped* ]] || continue
-    log_drop_records=$(( log_drop_records + 1 ))
-    if [[ "$line" =~ \"state_overflow\":(0|[1-9][0-9]{0,17}) ]]; then
-        log_state_lost=$(( log_state_lost + BASH_REMATCH[1] ))
-    fi
-done <<< "$log_drops"
-if (( log_state_lost > 0 )); then
-    write_result "BLOCKED" "receiver_state_log_dropped" "$projection" "$video" "$audio" "$input" "$budget_ms"
-    exit 3
+# Receiver log integrity (#90 review), read after teardown so the logger's
+# final summaries and log_complete record are on disk. PASS requires the
+# completion proof; a missing observable whose record may have been lost or
+# delivered late is BLOCKED, not FAILED. An unreadable log counts as incomplete.
+INTEGRITY_TOOL="$(cd "$(dirname "${BASH_SOURCE[0]}")/../perf" && pwd)/aa_log_integrity.py"
+log_stream="$(remote "grep -E '\"event\":\"(log_complete|runtime_log_dropped|media_telemetry_dropped)\"' ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log; rc=\$?; [ \$rc -le 1 ] && echo '### end'" 2>/dev/null)" || log_stream=""
+if [[ "$log_stream" == *"### end"* ]]; then
+    log_stream="### receiver
+${log_stream%%### end*}"
+else
+    log_stream="### unreadable"
 fi
-if (( log_drop_records > 0 )) && [[ "$projection" != "true" || "$session_active" != "true" ||
-      "$video" != "true" || "$audio" != "true" || "$input" != "true" ]]; then
-    write_result "BLOCKED" "receiver_runtime_log_dropped" "$projection" "$video" "$audio" "$input" "$budget_ms"
+log_audit="$(printf '%s\n' "$log_stream" | python3 -I "$INTEGRITY_TOOL" generations)" || log_audit=""
+log_flag() { [[ " ${log_audit} " == *" $1=1 "* ]]; }
+[[ "$log_audit" == *"complete="* ]] || log_audit="complete=0 state_lost=1 media_lost=1 runtime_lost=1 late_delivery=1"
+evidence_doubtful=false
+if ! log_flag complete || log_flag state_lost || log_flag media_lost || log_flag runtime_lost ||
+        log_flag late_delivery; then
+    evidence_doubtful=true
+fi
+if [[ "$projection" != "true" || "$session_active" != "true" || "$video" != "true" ||
+      "$audio" != "true" || "$input" != "true" ]]; then
+    # D-Bus projection is independent of the log; the other observables are
+    # log records (active is state, audio media, input runtime).
+    if [[ "$evidence_doubtful" == true && "$projection" == true ]]; then
+        if log_flag complete; then reason="receiver_log_lost_or_late"; else reason="receiver_log_incomplete"; fi
+        write_result "BLOCKED" "$reason" "$projection" "$video" "$audio" "$input" "$budget_ms"
+        exit 3
+    fi
+elif ! log_flag complete; then
+    write_result "BLOCKED" "receiver_log_incomplete" "$projection" "$video" "$audio" "$input" "$budget_ms"
     exit 3
 fi
 if [[ "$projection" != "true" || "$session_active" != "true" ]]; then

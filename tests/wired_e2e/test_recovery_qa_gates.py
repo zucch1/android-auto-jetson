@@ -127,7 +127,13 @@ if [ "${FAKE_REAL_LOG:-0}" = 1 ]; then
     esac
 fi
 case "$cmd" in
-    *runtime_log_dropped*) printf '%s' "${FAKE_LOG_DROPS:-}"; exit 0 ;;
+    *runtime_log_dropped*)
+        # The end-of-run log-integrity audit (#90 review): marked generations.
+        [ "${FAKE_LOG_AUDIT_RC:-0}" = 0 ] || exit "$FAKE_LOG_AUDIT_RC"
+        printf '%s\n' '### /tmp/aa-wired-receiver.log' \
+            "${FAKE_LOG_AUDIT:-{\"event\":\"log_complete\",\"runtime_dropped\":0,\"state_overflow\":0,\"media_rate_limited\":0,\"media_backpressure\":0,\"shutdown_dropped\":0,\"max_delivery_lag_ms\":1\}}" \
+            '### end'
+        exit 0 ;;
     *idVendor*|*idProduct*) printf '%s' "${FAKE_PHONE:-04e8:6860}"; exit 0 ;;
     *"/sys/class/drm"*) printf '%s\n' "${FAKE_DISPLAY:-connected}"; exit 0 ;;
     *70-android-auto-receiver.rules*) printf '%s' "${FAKE_POLICY:-installed}"; exit 0 ;;
@@ -310,32 +316,100 @@ class RecoveryQaGates(unittest.TestCase):
                 self.assertEqual(doc["scenarios"][0]["frames_painted_baseline"], 5)
                 self.assertLess(doc["scenarios"][0]["recovery_ms"], 5000)
 
+    CLEAN = ('{"event":"log_complete","runtime_dropped":0,"state_overflow":0,'
+             '"media_rate_limited":0,"media_backpressure":0,"shutdown_dropped":0,'
+             '"max_delivery_lag_ms":1}')
+
+    def audit(self, **counts: int) -> str:
+        record = json.loads(self.CLEAN)
+        record.update(counts)
+        return json.dumps(record, separators=(",", ":"))
+
     def test_lost_receiver_state_records_block_a_passing_recovery(self) -> None:
         # Given: a recovery that passes on its evidence, but the receiver's log
         # reports lost state records (#90 review: reconnect / err / idr).
-        drops = '"event":"runtime_log_dropped","backpressure":3,"state_overflow":1'
-        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_LOG_DROPS": drops}
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                    "FAKE_LOG_AUDIT": self.audit(runtime_dropped=1, state_overflow=1)}
         code, doc = self.run_qa(["--only", self.recovery_scenarios[0]], **env)
-        # Then: the run is BLOCKED (exit 3), never PASS, and names why.
+        # Then: the row and the run are BLOCKED (exit 3), never PASS.
         self.assertEqual(code, 3, doc)
         self.assertEqual(doc["status"], "BLOCKED")
-        self.assertTrue(doc["blocked_on"].startswith("receiver_log:state_log_dropped"), doc)
+        self.assertTrue(doc["scenarios"][0]["detail"].startswith("receiver_state_log_lost"), doc)
+
+    def test_receiver_log_without_completion_proof_never_passes(self) -> None:
+        for env_extra in ({"FAKE_LOG_AUDIT": '{"event":"active"}'}, {"FAKE_LOG_AUDIT_RC": "1"}):
+            with self.subTest(**env_extra):
+                env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1"} | env_extra
+                code, doc = self.run_qa(["--only", self.recovery_scenarios[0]], **env)
+                self.assertEqual(code, 3, doc)
+                self.assertTrue(doc["scenarios"][0]["detail"].startswith("receiver_log_incomplete"), doc)
+
+    def test_lost_evidence_in_an_earlier_generation_still_blocks(self) -> None:
+        # Given: the first receiver generation lost state records and the
+        # restarted one is clean; the audit reads both.
+        stream = "\n".join([self.audit(runtime_dropped=1, state_overflow=1),
+                            "### /tmp/aa-wired-receiver.gen1.log", self.CLEAN])
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_LOG_AUDIT": stream}
+        code, doc = self.run_qa(["--only", self.recovery_scenarios[0]], **env)
+        self.assertEqual(code, 3, doc)
+
+    def test_receiver_restart_archives_the_previous_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_SSH_LOG": str(log)}
+            self.run_qa(["--only", "receiver_restart"], **env)
+            logged = log.read_text(encoding="utf-8")
+        self.assertIn("mv -f /tmp/aa-wired-receiver.log /tmp/aa-wired-receiver.gen1.log", logged)
+        audit = [line for line in logged.splitlines() if "runtime_log_dropped" in line]
+        self.assertTrue(audit and "aa-wired-receiver.gen*.log" in audit[-1], logged)
 
     def test_droppable_runtime_loss_blocks_a_failure_but_keeps_a_pass(self) -> None:
-        drops = '"event":"runtime_log_dropped","backpressure":3,"state_overflow":0'
+        drops = self.audit(runtime_dropped=3)
         scenario = self.recovery_scenarios[1]
         # Given: input evidence could have been dropped; a FAILED is not evidenced.
         env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
-                                    "FAKE_FRESH_INPUT": "0", "FAKE_LOG_DROPS": drops}
+                                    "FAKE_FRESH_INPUT": "0", "FAKE_LOG_AUDIT": drops}
         code, doc = self.run_qa(["--only", scenario], **env)
         self.assertEqual(code, 3, doc)
         self.assertEqual(doc["status"], "BLOCKED")
-        self.assertIn("no_media_evidence_after_recovery", doc["blocked_on"])
-        self.assertTrue(doc["blocked_on"].startswith("receiver_log:runtime_log_dropped"), doc)
+        self.assertEqual(doc["scenarios"][0]["detail"],
+                         "receiver_media_or_input_log_lost:no_media_evidence_after_recovery")
         # And: a PASS rests on positive evidence and stands.
-        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_LOG_DROPS": drops}
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_LOG_AUDIT": drops}
         code, doc = self.run_qa(["--only", scenario], **env)
         self.assertEqual(code, 0, doc)
+
+    def test_confirmed_failure_is_not_downgraded_by_unrelated_loss(self) -> None:
+        # Given: an unknown phone that reached active (directly observed) and an
+        # unrelated dropped runtime record plus lost state records elsewhere.
+        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                      '"phone_id":"id-abc123","port":"1-2.3"}')
+        window = attributed + '\n{"event":"active","startup_ms":100}'
+        code, doc = self.run_qa(["--only", "unknown_phone"], FAKE_ADB_COUNT="2",
+                                FAKE_LOG_WINDOW=attributed, FAKE_ATTEMPT_LOG=window,
+                                FAKE_LOG_AUDIT=self.audit(runtime_dropped=4, state_overflow=2))
+        # Then: the confirmed FAILED survives, exit 1.
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        self.assertEqual(doc["scenarios"][0]["detail"], "unknown_device_reached_active")
+
+    def test_late_delivery_makes_a_budget_miss_inconclusive(self) -> None:
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                    "FAKE_LOG_AUDIT": self.audit(max_delivery_lag_ms=900)}
+        code, doc = self.run_qa(["--only", self.recovery_scenarios[0]], **env)
+        # A prompt PASS is unaffected by lag (delay only slows observation).
+        self.assertEqual(code, 0, doc)
+        # A budget miss measured from log arrival is inconclusive when the
+        # receiver's log was delivered late (its evidence may have been on time)...
+        miss = {"FAKE_POST_STATE_DELAY": "1", "BUDGET_MS": "1500", "FAKE_FRAMES_BASE": "5",
+                "FAKE_FRAMES_STEP": "2", "FAKE_MEDIA_TIMING": "1", "FAKE_INPUT_OK": "1"}
+        code, doc = self.run_qa(["--only", "consumer_restart"], **miss,
+                                FAKE_LOG_AUDIT=self.audit(max_delivery_lag_ms=900))
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["scenarios"][0]["detail"], "receiver_log_late:recovery_exceeded_budget")
+        # ...and stays a confirmed FAILED when delivery was prompt.
+        code, doc = self.run_qa(["--only", "consumer_restart"], **miss)
+        self.assertEqual(code, 1, doc)
 
     def test_required_log_boundaries_fail_closed(self) -> None:
         cases = (("", "1"), ("0", "1"), ("", "0"), ("size=123", "0"),

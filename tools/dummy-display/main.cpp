@@ -269,6 +269,8 @@ int main(int argc, char** argv) {
     // thread: a slow stdout write must never stall the GUI thread that pumps,
     // decodes and paints (a stalled GUI thread shows up as a frozen display).
     aa::display::TelemetryWriter telemetry;
+    // Gate consumers require this last line as proof the telemetry log is complete.
+    telemetry.set_completion_record("{\"event\":\"telemetry_complete\"}");
     errors->attach(&telemetry);
     aa::display::TelemetryWriter diagnostics{aa::display::default_stderr_sink, 64};
     config.on_video_endpoint = [&telemetry](const aa::ipc::VideoEndpoint& event) {
@@ -278,6 +280,13 @@ int main(int argc, char** argv) {
         static_cast<void>(telemetry.enqueue(aa::consumer::decode_completion_json(event)));
     };
     config.on_diagnostic = [&telemetry](std::string line) {
+        // Emission stamp at the source (CLOCK_MONOTONIC), as on the receiver.
+        if (line.size() > 2 && line.front() == '{' && line.back() == '}') {
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            line.pop_back();
+            line += ",\"emit_ns\":" + std::to_string(ns) + "}";
+        }
         static_cast<void>(telemetry.enqueue(std::move(line)));
     };
 

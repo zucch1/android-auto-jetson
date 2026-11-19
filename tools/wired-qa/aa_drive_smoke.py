@@ -57,6 +57,7 @@ from pathlib import Path
 TOOLS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS / "perf"))
 import aa_av_contract as av_contract  # noqa: E402
+import aa_log_integrity as integrity  # noqa: E402
 import aa_moving_map as moving_map  # noqa: E402
 from aa_build_guard import (  # noqa: E402
     BuildDirMismatchError, BuildGuardError, require_optimized_build, verify_launched_binaries)
@@ -139,8 +140,17 @@ def _criterion(name: str, passed: bool | None, **detail) -> dict:
     return {"name": name, "passed": passed, **detail}
 
 
+def idr_time(item: dict) -> int:
+    """When an ``idr_*`` event happened: its source emission stamp (``emit_ns``,
+    CLOCK_MONOTONIC like the runner), never when the line reached the runner
+    (#90 review: a log delivered late must not move an episode out of the window).
+    Unstamped lines fall back to their arrival time; analyze() fails them closed."""
+    stamp = integrity.emit_ns(item["event"])
+    return stamp if stamp is not None else item["observed_ns"]
+
+
 def waiting_idr_episodes(stamped: list[dict], end_ns: int, run_start_ns: int | None) -> list[dict]:
-    """Episodes from the runner-stamped ``idr_*`` lines (the lines carry no time).
+    """Episodes from the ``idr_*`` lines, timed at emission (see idr_time).
 
     An episode opens at a source's first ``idr_requested`` and closes at its
     ``idr_recovered``. The binary's own ``latency_ms`` starts at the wait
@@ -164,8 +174,8 @@ def waiting_idr_episodes(stamped: list[dict], end_ns: int, run_start_ns: int | N
         episodes.append({"source": source, "start_ns": start, "duration_s": seconds,
                          "recovered": recovered})
 
-    for item in sorted(stamped, key=lambda x: x["observed_ns"]):
-        event, t = item["event"], item["observed_ns"]
+    for item in sorted(stamped, key=idr_time):
+        event, t = item["event"], idr_time(item)
         source = event.get("source", "unknown")
         if event.get("event") == "idr_requested" and t <= end_ns:
             open_at.setdefault(source, t)
@@ -289,23 +299,52 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
     criteria.append(_criterion("av_signed_contract", av.pop("passed"), limits=av_contract.LIMITS,
                                invalid_audio_slots=invalid_audio, **av))
 
-    verdict = "PASS" if all(c["passed"] is not False for c in criteria) else "FAIL"
-    # #90 review: the criteria above read video_profile, idr_* and
-    # session_state_changed. If the receiver lost any of these state records
-    # (runtime_log_dropped.state_overflow > 0, or a summary without the field),
-    # neither PASS nor FAIL is evidenced: BLOCKED.
-    lost = [e for e in receiver if e.get("event") == "runtime_log_dropped"
-            and not (isinstance(e.get("state_overflow"), int)
-                     and not isinstance(e.get("state_overflow"), bool)
-                     and e["state_overflow"] == 0)]
+    # #90 review: a record that was lost (or a log never proven complete) can
+    # fake or hide a result. A criterion whose inputs may be incomplete is
+    # tainted in the direction(s) the loss could move it; a confirmed failure
+    # (one no lost record could have produced) stays FAIL, anything a loss could
+    # have decided is BLOCKED, never PASS.
+    rec = integrity.assess_receiver(receiver)
+    disp = integrity.assess_display(display)
+    receiver_state = not rec["complete"] or rec["state_lost"]
+    receiver_media = not rec["complete"] or rec["media_lost"]
+    display_lost = not disp["complete"]
+    unstamped = [x["event"].get("event") for x in stamped if integrity.emit_ns(x["event"]) is None]
+    by_name = {c["name"]: c for c in criteria}
+    tainted: dict[str, str] = {}
+    fps = by_name["painted_fps_per_window"]
+    # Lost paints can only lower fps (a PASS stands); a lost profile only
+    # removes the criterion's input.
+    if fps["passed"] is False and (display_lost or (profile is None and receiver_state)):
+        tainted["painted_fps_per_window"] = "display_log_incomplete" if display_lost else "receiver_state_log_lost"
+    # A lost request or recovery can open or close an episode: either way.
+    if receiver_state or display_lost or unstamped:
+        tainted["waiting_idr_max"] = ("idr_events_unstamped" if unstamped else
+                                      "display_log_incomplete" if display_lost else "receiver_state_log_lost")
+    # An observed disconnect or terminal error is confirmed; absence is not.
+    drop = by_name["no_session_drop"]
+    if drop["passed"] is not False and receiver_state:
+        tainted["no_session_drop"] = "receiver_state_log_lost"
+    # Pairing a subset of slots or frames can move the signed contract either way.
+    if receiver_media or display_lost:
+        tainted["av_signed_contract"] = "media_telemetry_lost" if receiver_media else "display_log_incomplete"
+    confirmed_fail = [c["name"] for c in criteria if c["passed"] is False and c["name"] not in tainted]
     blocked_on = None
-    if lost:
-        verdict, blocked_on = "BLOCKED", "receiver_state_log_dropped"
+    if confirmed_fail:
+        verdict = "FAIL"
+    elif tainted:
+        verdict = "BLOCKED"
+        blocked_on = ",".join(f"{name}:{why}" for name, why in sorted(tainted.items()))
+    else:
+        verdict = "PASS"
+    for c in criteria:
+        if c["name"] in tainted:
+            c["inconclusive"] = tainted[c["name"]]
     seconds = (min(cutoff, stopped_ns or cutoff) - start_ns) / 1e9 if start_ns and cutoff else None
     return {
         "verdict": verdict,
         **({"blocked_on": blocked_on} if blocked_on else {}),
-        "receiver_state_log_lost": len(lost),
+        "log_integrity": {"receiver": rec, "display": disp, "idr_unstamped": len(unstamped)},
         "criteria": criteria,
         "negotiated_profile": profile and {k: profile.get(k) for k in ("width", "height", "fps", "codec")},
         "measured": {
@@ -783,6 +822,10 @@ def _run_cli(args) -> int:
             signal.signal(sig, handler)
         return _blocked(out, base, "phone_command_failed")
     result = {**base, **analyze_dir(out), "finished_utc": datetime.now(timezone.utc).isoformat()}
+    if run.get("receiver_exit") not in (0, None) and result["verdict"] == "PASS":
+        # A nonzero exit with a complete log is a receiver failure (#90 review).
+        result["verdict"] = "FAIL"
+        result["failure"] = f"receiver_exit_{run.get('receiver_exit')}"
     result["media_relaunches"] = run["media_relaunches"]
     result["cleanup_failures"] = run["cleanup_failures"]
     if run.get("failure"):

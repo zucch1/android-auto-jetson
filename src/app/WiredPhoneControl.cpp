@@ -8,8 +8,16 @@
 
 namespace aa::app {
 
-WiredPhoneControl::WiredPhoneControl(trust::ApprovedPhoneStore& store, WiredSession& session)
-    : store_(store), session_(session) {}
+WiredPhoneControl::WiredPhoneControl(trust::ApprovedPhoneStore& store, WiredSession& session,
+                                     Persist persist)
+    : store_(store), session_(session), persist_(std::move(persist)) {}
+
+WiredPhoneControl::~WiredPhoneControl() {
+    // An owner that never reached finish(): never block destruction on disk.
+    if (job_) {
+        abandon_job();
+    }
+}
 
 void WiredPhoneControl::bind_owner() {
     const std::lock_guard lock(mutex_);
@@ -52,8 +60,24 @@ void WiredPhoneControl::complete(std::unique_ptr<Request> request, core::Result<
     request->reply.set_value(result);
 }
 
+bool WiredPhoneControl::job_done(std::chrono::milliseconds wait) {
+    std::unique_lock lock(job_->mutex);
+    return job_->done_cv.wait_for(lock, wait, [&] { return job_->done; });
+}
+
 void WiredPhoneControl::checkpoint() {
     assert_owner();
+    if (job_) {
+        // A durable write is in flight: never wait for it on the session thread.
+        if (!job_done(std::chrono::milliseconds{0})) {
+            return;
+        }
+        settle();
+        return;
+    }
+    if (pending_) {
+        return; // the active phone was revoked; finish() completes it
+    }
     std::unique_ptr<Request> request;
     {
         const std::lock_guard lock(mutex_);
@@ -66,7 +90,34 @@ void WiredPhoneControl::checkpoint() {
     for (const auto& entry : store_.phones()) {
         if (entry.phone_id == request->phone) snapshot = helper::RevocationV1{entry.phone_id, entry.identity};
     }
-    auto result = store_.forget_phone(request->phone);
+    auto prepared = store_.prepare_forget(request->phone);
+    if (!prepared.has_value()) {
+        complete(std::move(request), prepared.error());
+        return;
+    }
+    in_flight_ = std::move(request);
+    in_flight_snapshot_ = std::move(snapshot);
+    prepared_ = std::move(prepared.value());
+    job_ = std::make_shared<Job>();
+    // The thread owns copies only (job state and the prepared document), so an
+    // abandoned write can outlive this object without touching it.
+    persistence_ = std::thread([job = job_, persist = persist_, prepared = *prepared_] {
+        auto result = persist(prepared);
+        const std::lock_guard lock(job->mutex);
+        job->result = std::move(result);
+        job->done = true;
+        job->done_cv.notify_all();
+    });
+}
+
+void WiredPhoneControl::settle() {
+    persistence_.join();
+    auto written = job_->result;
+    job_.reset();
+    auto request = std::move(in_flight_);
+    auto snapshot = std::move(in_flight_snapshot_);
+    auto result = store_.apply_forget(*prepared_, std::move(written));
+    prepared_.reset();
     const bool committed = result.has_value() ||
                             result.error().code() == ErrorCode::trust_store_not_durable;
     {
@@ -83,6 +134,18 @@ void WiredPhoneControl::checkpoint() {
     complete(std::move(request), result);
 }
 
+void WiredPhoneControl::abandon_job() {
+    // The write may still land later; memory stays unrevoked and the caller is
+    // told the outcome is unknown (timeout), never success.
+    persistence_.detach();
+    job_.reset();
+    prepared_.reset();
+    in_flight_snapshot_.reset();
+    if (in_flight_) {
+        complete(std::move(in_flight_), Error{ErrorCode::timeout});
+    }
+}
+
 std::optional<helper::RevocationV1> WiredPhoneControl::take_revocation_v1() {
     const std::lock_guard lock{mutex_};
     auto result = std::move(revocation_);
@@ -92,6 +155,14 @@ std::optional<helper::RevocationV1> WiredPhoneControl::take_revocation_v1() {
 
 bool WiredPhoneControl::finish() {
     assert_owner();
+    if (job_) {
+        // Shutdown waits for an in-flight durable write only up to a bound.
+        if (job_done(kShutdownPersistWait)) {
+            settle();
+        } else {
+            abandon_job();
+        }
+    }
     if (pending_) {
         session_.tick();
         if (!session_.failure() && session_.state() != session::State::disconnected) {

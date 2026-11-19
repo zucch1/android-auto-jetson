@@ -80,6 +80,7 @@ from array import array
 from pathlib import Path
 from typing import Literal
 
+import aa_log_integrity
 from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
 import aa_moving_map as moving_map
 from aa_measurement_coverage import (
@@ -468,6 +469,10 @@ class EventParser:
 
     def __init__(self) -> None:
         self.offsets: dict[str, int] = {}
+        # Log-integrity evidence per log path, kept after the measurement freeze:
+        # validity is decided after the final read (#90 review).
+        self.integrity: dict[str, list[dict]] = {}
+        self._source: str | None = None
         self.metrics: dict[str, object] = {
             "frame_drops": None, "decode_p50_ms": None, "decode_p95_ms": None,
             "decode_fps": None, "decode_frames": None, "ipc_throughput_mbps": None,
@@ -682,13 +687,37 @@ class EventParser:
         if size == offset:
             return
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            with open(path, "rb") as handle:
                 handle.seek(offset)
-                for line in handle:
-                    self._consume(line)
-                self.offsets[path] = handle.tell()
+                data = handle.read()
         except OSError:
             return
+        # Only complete lines are consumed; an unterminated tail stays unread
+        # (offset not advanced past it) until its newline arrives.
+        end = data.rfind(b"\n") + 1
+        self._source = path
+        try:
+            for raw in data[:end].splitlines():
+                self._consume(raw.decode("utf-8", errors="replace"))
+        finally:
+            self._source = None
+        self.offsets[path] = offset + end
+
+    def integrity_issues(self, receiver_log: str, display_log: str | None) -> list[str]:
+        """Fail-closed capture validity from every line read so far (#90 review)."""
+        receiver = aa_log_integrity.assess_receiver(self.integrity.get(receiver_log, []))
+        issues = []
+        if not receiver["complete"]:
+            issues.append("receiver_log_incomplete")
+        else:
+            if receiver["state_lost"]:
+                issues.append("state_log_dropped")
+            if receiver["media_lost"]:
+                issues.append("media_telemetry_dropped")
+        if display_log is not None and not aa_log_integrity.assess_display(
+                self.integrity.get(display_log, []))["complete"]:
+            issues.append("display_log_incomplete")
+        return issues
 
     def _consume(self, line: str) -> None:
         line = line.strip()
@@ -726,14 +755,8 @@ class EventParser:
                     self._number({"invalid": None}, "invalid", target)
         if envelope == "err":
             self.terminal_errors.append({"event": "err", "code": str(event.get("code", "unknown"))})
-        # #90 review: lost gate-relevant state records (active / err /
-        # audio_stall_bypass / video_profile / idr_*) invalidate the capture;
-        # droppable runtime records alone do not feed any collector metric.
-        if envelope == "runtime_log_dropped":
-            lost = event.get("state_overflow")
-            if (not isinstance(lost, int) or isinstance(lost, bool) or lost > 0) and \
-                    "state_log_dropped" not in self.invalid_telemetry:
-                self.invalid_telemetry.append("state_log_dropped")
+        if envelope in aa_log_integrity.RELEVANT_EVENTS and self._source is not None:
+            self.integrity.setdefault(self._source, []).append(event)
         # A sink stall (#60) is an audio output gap, never a silent one. Only a
         # resumed sink counts as survived; a failed reopen, a stop during
         # recovery or a bypass still open at the end is unrecovered.
@@ -1101,6 +1124,20 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     # Provenance of the measured binaries: the build type the guard verified, the
     # build directory it checked and whether the qualification override was used,
     # so no run can be read as a qualification result it is not.
+    # Validity is decided after the final log reads (#90 review): a state
+    # overflow, a media drop or a missing completion record that only drained
+    # during shutdown still invalidates the capture. Metrics keep their cutoff.
+    issues = parser.integrity_issues(str(receiver_log), str(display_log) if display is not None else None)
+    if issues:
+        capture["invalid_telemetry"] = sorted(set(capture["invalid_telemetry"]) | set(issues))
+    if {"media_telemetry_dropped", "receiver_log_incomplete"} & set(issues):
+        # Pairing a subset of audio slots can move the signed A/V contract
+        # either way (a dropped slot turned a FAIL into a PASS in review), so
+        # A/V evidence is invalid. Peak metrics (audio latency, frame drops)
+        # stay: a lost sample only lowers an observed peak, so an observed
+        # breach is still a confirmed FAIL, and invalid_telemetry keeps any
+        # in-budget value from qualifying.
+        capture["invalid_telemetry"] = sorted(set(capture["invalid_telemetry"]) | {"av_sync_ms"})
     capture["build"] = build if build is not None else build_record(args)
     capture["workload"] = ({"kind": "moving-map", "media_relaunches": workload.media_relaunches,
                             "drags": workload.drags, "stimulus_started": stimulus is not None,

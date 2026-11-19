@@ -197,22 +197,63 @@ def stall_dropouts() -> None:
     assert parser.metrics["audio_stall_dropped_chunks"] == 16, parser.metrics
 
 
+def log_integrity():
+    """#90 review: capture validity comes from log-integrity evidence read to the end."""
+    import tempfile as _tempfile
+
+    def issues(receiver_lines, display_lines=None, *, tail=""):
+        parser = collector.EventParser()
+        with _tempfile.TemporaryDirectory(prefix="log-integrity-") as directory:
+            rec = Path(directory) / "receiver.log"
+            rec.write_text("".join(json.dumps(x) + "\n" for x in receiver_lines) + tail)
+            parser.poll(str(rec))
+            disp = None
+            if display_lines is not None:
+                disp = Path(directory) / "display.log"
+                disp.write_text("".join(json.dumps(x) + "\n" for x in display_lines))
+                parser.poll(str(disp))
+            return parser, set(parser.integrity_issues(str(rec), str(disp) if disp else None))
+
+    clean = {"event": "log_complete", "runtime_dropped": 0, "state_overflow": 0,
+             "media_rate_limited": 0, "media_backpressure": 0, "shutdown_dropped": 0,
+             "max_delivery_lag_ms": 3}
+    # A clean, complete log is valid.
+    assert issues([clean])[1] == set()
+    # No completion record (logger timeout, kill, truncated read): incomplete.
+    assert issues([{"event": "active", "startup_ms": 1}])[1] == {"receiver_log_incomplete"}
+    # A malformed completion record cannot vouch for the log.
+    assert issues([dict(clean, state_overflow=-1)])[1] == {"receiver_log_incomplete"}
+    # State overflow from a summary, or from the completion counters.
+    assert "state_log_dropped" in issues([{"event": "runtime_log_dropped", "backpressure": 3,
+                                           "state_overflow": 2}, clean])[1]
+    assert "state_log_dropped" in issues([dict(clean, state_overflow=1, runtime_dropped=1)])[1]
+    assert "state_log_dropped" in issues([dict(clean, shutdown_dropped=1)])[1]
+    # A summary missing its state count is treated as loss.
+    assert "state_log_dropped" in issues([{"event": "runtime_log_dropped", "backpressure": 3}, clean])[1]
+    # Media loss (either counter) is reported.
+    assert "media_telemetry_dropped" in issues([{"event": "media_telemetry_dropped",
+                                                 "rate_limited": 0, "backpressure": 1}, clean])[1]
+    assert "media_telemetry_dropped" in issues([dict(clean, media_rate_limited=4)])[1]
+    # Droppable runtime loss alone feeds no collector metric.
+    assert issues([dict(clean, runtime_dropped=5)])[1] == set()
+    # A managed display must also prove its telemetry log complete.
+    assert issues([clean], [{"event": "video_presented"}])[1] == {"display_log_incomplete"}
+    assert issues([clean], [{"event": "telemetry_complete"}])[1] == set()
+    # A split (unterminated) final record is not consumed until its newline.
+    parser, found = issues([], tail='{"event":"log_compl')
+    assert found == {"receiver_log_incomplete"}
+    with _tempfile.TemporaryDirectory(prefix="log-integrity-") as directory:
+        rec = Path(directory) / "receiver.log"
+        half = json.dumps(clean)
+        rec.write_text(half[:10])
+        parser = collector.EventParser()
+        parser.poll(str(rec))
+        rec.write_text(half + "\n")
+        parser.poll(str(rec))
+        assert parser.integrity_issues(str(rec), None) == []
+
+
 if __name__ == "__main__":
     globals()[sys.argv[1]]()
     print(f"PASS review-{sys.argv[1]}")
 
-
-def test_lost_receiver_state_records_invalidate_the_capture():
-    # #90 review: under a stalled stdout the receiver parks gate-relevant state
-    # records (active, err, audio_stall_bypass, video_profile, idr_*). A summary
-    # naming lost state records makes the capture invalid; droppable runtime
-    # records alone feed no collector metric and do not.
-    lost = collector.EventParser()
-    lost._consume(json.dumps({"event": "runtime_log_dropped", "backpressure": 9, "state_overflow": 2}))
-    assert "state_log_dropped" in lost.invalid_telemetry
-    legacy = collector.EventParser()  # a summary without the field cannot vouch for state
-    legacy._consume(json.dumps({"event": "runtime_log_dropped", "backpressure": 9}))
-    assert "state_log_dropped" in legacy.invalid_telemetry
-    benign = collector.EventParser()
-    benign._consume(json.dumps({"event": "runtime_log_dropped", "backpressure": 9, "state_overflow": 0}))
-    assert "state_log_dropped" not in benign.invalid_telemetry

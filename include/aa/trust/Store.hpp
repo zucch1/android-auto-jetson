@@ -68,6 +68,19 @@ inline constexpr std::uint64_t kCurrentSchemaVersion = 3;
 // store can never contain an id its own loader rejects.
 inline constexpr std::uint64_t kMaxPhoneId = 4096;
 
+// A revocation split so its durable write can run off the store owner (#90:
+// the owner is the session thread, which must never wait on disk). The owner
+// prepares (no mutation), any thread writes (file I/O only, never the store
+// object), and the owner applies the result. In-memory trust changes only once
+// the replacement landed, exactly as with the synchronous forget_phone().
+struct PreparedForget {
+    core::PhoneId phone{};
+    std::string match_key;
+    std::string document;
+    std::filesystem::path path;
+    std::uint64_t mutation_epoch{};
+};
+
 class ApprovedPhoneStore final : public TrustStore {
 public:
     explicit ApprovedPhoneStore(std::filesystem::path path) : path_(std::move(path)) {}
@@ -104,7 +117,17 @@ public:
     [[nodiscard]] core::Result<core::PhoneId> approve_port_only(const WiredIdentity& identity);
 
     // ForgetPhone path: revoke by phone id, persist the removal.
+    // Equivalent to apply_forget(p, write_prepared(p)) for p = prepare_forget(phone).
     [[nodiscard]] core::Result<void> forget_phone(core::PhoneId phone);
+
+    // Two-phase ForgetPhone (see PreparedForget). prepare_forget() and
+    // apply_forget() run on the owner; write_prepared() touches only the file.
+    [[nodiscard]] core::Result<PreparedForget> prepare_forget(core::PhoneId phone) const;
+    [[nodiscard]] static core::Result<void> write_prepared(const PreparedForget& prepared);
+    // `written` is write_prepared()'s result: success or trust_store_not_durable
+    // (committed) removes the phone in memory; any other error changes nothing.
+    [[nodiscard]] core::Result<void> apply_forget(const PreparedForget& prepared,
+                                                  core::Result<void> written);
 
     // Retry the crash-durability half of a mutation that returned
     // trust_store_not_durable: sync the store's containing directory again.
@@ -141,6 +164,7 @@ private:
     bool loaded_{false};
     std::uint64_t reload_epoch_{};
     bool usable_{false};
+    std::uint64_t mutation_epoch_{}; // bumped by every in-memory mutation
 };
 
 } // namespace aa::trust

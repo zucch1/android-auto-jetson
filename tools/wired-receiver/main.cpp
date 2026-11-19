@@ -94,8 +94,12 @@ void log_line(const std::string &json) {
 void log_media(std::string_view kind, const std::string &json) {
     auto *writer = aa::wired_receiver::active_stdout_log.load();
     if (!writer) { std::abort(); }
-    if (writer->submit_media(kind, json)) { g_running.store(false); }
+    if (writer->submit_media(kind, aa::wired_receiver::with_emit_ns(json))) { g_running.store(false); }
 }
+
+// Every non-blocking record carries its emission time ("emit_ns", CLOCK_MONOTONIC
+// at the source, #90 review): a record the log delivers late still tells a
+// timing gate when it happened, never when it reached stdout.
 
 // Steady-state runtime, diagnostic, and control records (#90): never blocks a
 // media, audio, or control thread on a full queue behind a stalled stdout sink.
@@ -103,7 +107,7 @@ void log_media(std::string_view kind, const std::string &json) {
 void log_runtime(const std::string &json) {
     auto *writer = aa::wired_receiver::active_stdout_log.load();
     if (!writer) { std::abort(); }
-    if (writer->submit_runtime(json)) { g_running.store(false); }
+    if (writer->submit_runtime(aa::wired_receiver::with_emit_ns(json))) { g_running.store(false); }
 }
 
 // One-shot lifecycle / state-transition records that the projection collector
@@ -113,7 +117,7 @@ void log_runtime(const std::string &json) {
 void log_state(const std::string &json) {
     auto *writer = aa::wired_receiver::active_stdout_log.load();
     if (!writer) { std::abort(); }
-    if (writer->submit_state(json)) { g_running.store(false); }
+    if (writer->submit_state(aa::wired_receiver::with_emit_ns(json))) { g_running.store(false); }
 }
 
 // Escapes free text for a JSON string value.

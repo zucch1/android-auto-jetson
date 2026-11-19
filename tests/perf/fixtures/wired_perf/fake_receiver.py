@@ -78,8 +78,26 @@ def _option(argv: list[str], name: str) -> str | None:
 MISMATCH = '{"event":"err","detail":"link","code":"phone_serial_mismatch"}'
 
 
+def _finish() -> None:
+    """The real receiver's shutdown tail: `stopping`, late summaries, log_complete."""
+    late = os.environ.get("FAKE_RECEIVER_LATE_SUMMARY")
+    if late:
+        print(late, flush=True)
+    if os.environ.get("FAKE_RECEIVER_NO_LOG_COMPLETE") != "1":
+        print(json.dumps({"event": "log_complete", "runtime_dropped": 0, "state_overflow": 0,
+                          "media_rate_limited": 0, "media_backpressure": 0, "shutdown_dropped": 0,
+                          "max_delivery_lag_ms": 0} | json.loads(
+                              os.environ.get("FAKE_RECEIVER_LOG_COMPLETE", "{}"))), flush=True)
+
+
+def _terminated(*_: object) -> None:
+    print(json.dumps({"event": "stopping", "duration_ms": 0}), flush=True)
+    _finish()
+    sys.exit(0)
+
+
 def main() -> int:
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGTERM, _terminated)
     duration_ms = _duration_ms(sys.argv[1:])
     required = _option(sys.argv[1:], "--require-usb-serial")
     attached = os.environ.get("FAKE_RECEIVER_ATTACHED_SERIAL", required or "")
@@ -158,6 +176,7 @@ def main() -> int:
                 )
 
     print(json.dumps({"event": "stopping", "duration_ms": duration_ms}), flush=True)
+    _finish()
     return 0
 
 

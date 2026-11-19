@@ -150,6 +150,9 @@ if [[ "$cmd" == *grep* ]]; then
         fi
     fi
     [[ -z "${FAKE_LOG_DROPS:-}" ]] || printf '%s\n' "$FAKE_LOG_DROPS" >> "$log"
+    if [[ "${FAKE_NO_LOG_COMPLETE:-0}" != 1 ]]; then
+        printf '%s\n' "${FAKE_LOG_COMPLETE:-{\"event\":\"log_complete\",\"runtime_dropped\":0,\"state_overflow\":0,\"media_rate_limited\":0,\"media_backpressure\":0,\"shutdown_dropped\":0,\"max_delivery_lag_ms\":1\}}" >> "$log"
+    fi
     cmd="${cmd//\/tmp\/aa-wired-receiver.log/$log}"
     cmd="${cmd//"$FAKE_TARGET/aa-wired-receiver.log"/$log}"
     bash -c "$cmd"
@@ -250,26 +253,50 @@ class LiveQaGates(unittest.TestCase):
         self.assertTrue(obs["projection_reached"] and obs["video_present"]
                         and obs["audio_present"] and obs["input_evidence"])
 
-    def test_lost_receiver_state_records_block_even_a_pass(self) -> None:
-        # Given: every observable seen, but the receiver lost state records
-        # (#90 review: e.g. `active`) under a stalled stdout.
-        drops = '{"event":"runtime_log_dropped","backpressure":2,"state_overflow":1}'
+    def complete(self, **counts: int) -> str:
+        record = {"event": "log_complete", "runtime_dropped": 0, "state_overflow": 0,
+                  "media_rate_limited": 0, "media_backpressure": 0, "shutdown_dropped": 0,
+                  "max_delivery_lag_ms": 1}
+        record.update(counts)
+        return json.dumps(record, separators=(",", ":"))
+
+    def test_pass_requires_the_receiver_log_completion_proof(self) -> None:
+        # Given: every observable seen, but the receiver never proved its log
+        # complete (logger timeout, KILL at teardown) (#90 review).
         code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
-                                FAKE_STATE='string "projecting"', FAKE_LOG_DROPS=drops)
+                                FAKE_STATE='string "projecting"', FAKE_NO_LOG_COMPLETE="1")
         self.assertEqual(code, 3, doc)
         self.assertEqual(doc["status"], "BLOCKED")
-        self.assertEqual(doc["blocked_on"], "receiver_state_log_dropped")
+        self.assertEqual(doc["blocked_on"], "receiver_log_incomplete")
 
-    def test_droppable_runtime_loss_blocks_missing_input_but_keeps_a_pass(self) -> None:
-        drops = '{"event":"runtime_log_dropped","backpressure":2,"state_overflow":0}'
-        # Given: input_forwarded may have been dropped: missing input is not a FAILED.
-        code, doc = self.run_qa(False, FAKE_OBS_INPUT="0", FAKE_LOG_DROPS=drops)
-        self.assertEqual(code, 3, doc)
-        self.assertEqual(doc["blocked_on"], "receiver_runtime_log_dropped")
-        # And: a PASS on positive evidence stands.
+    def test_missing_observable_with_lost_records_is_blocked_not_failed(self) -> None:
+        for counts in ({"runtime_dropped": 2}, {"media_backpressure": 1},
+                       {"runtime_dropped": 1, "state_overflow": 1}, {"max_delivery_lag_ms": 900}):
+            with self.subTest(**counts):
+                code, doc = self.run_qa(False, FAKE_OBS_INPUT="0",
+                                        FAKE_LOG_COMPLETE=self.complete(**counts))
+                self.assertEqual(code, 3, doc)
+                self.assertEqual(doc["blocked_on"], "receiver_log_lost_or_late")
+
+    def test_missing_observable_with_a_clean_log_is_a_confirmed_failure(self) -> None:
+        code, doc = self.run_qa(False, FAKE_OBS_INPUT="0")
+        self.assertEqual(code, 4, doc)
+        self.assertEqual(doc["status"], "FAILED")
+
+    def test_positive_evidence_pass_stands_despite_unrelated_loss(self) -> None:
         code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
-                                FAKE_STATE='string "projecting"', FAKE_LOG_DROPS=drops)
+                                FAKE_STATE='string "projecting"',
+                                FAKE_LOG_COMPLETE=self.complete(runtime_dropped=5))
         self.assertEqual(code, 0, doc)
+
+    def test_teardown_waits_for_the_logger_before_killing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                        FAKE_STATE='string "projecting"', FAKE_SSH_LOG=str(log))
+            logged = log.read_text(encoding="utf-8")
+        self.assertIn("seq 1 100", logged)
+        self.assertNotIn("seq 1 20)", logged)
 
     def test_failed_input_attempt_is_not_delivery(self) -> None:
         code, doc = self.run_qa(False, FAKE_INPUT_OK="false")

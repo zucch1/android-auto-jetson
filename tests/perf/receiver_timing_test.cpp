@@ -216,9 +216,10 @@ TEST_F(ReceiverTiming, SlowSettlementPublishesOnlyMatchingSuccessfulWriteProgres
         EXPECT_EQ(std::stoll(stamps[5].str()), completion->scheduled_end.count);
         if (scenario == "matching") {
             ASSERT_LT(progress.completed_at->count, completion->completed.count);
-            EXPECT_NE(record.find("\"write\":" + sink_write_json(progress) + "}"), std::string::npos) << record;
+            // The receiver appends the source emission stamp after the record's own fields.
+            EXPECT_NE(record.find("\"write\":" + sink_write_json(progress) + ",\"emit_ns\":"), std::string::npos) << record;
         } else {
-            EXPECT_NE(record.find("\"write\":null}"), std::string::npos) << record;
+            EXPECT_NE(record.find("\"write\":null,\"emit_ns\":"), std::string::npos) << record;
         }
     }
 }

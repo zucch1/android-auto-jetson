@@ -252,7 +252,10 @@ TEST_F(WiredE2eRevoke, OtherPhoneForgetDoesNotCancelCurrentSession) {
     EXPECT_EQ(store.lookup(app::wired_phone_identity(other).value()), trust::Decision::unknown);
 }
 
-TEST_F(WiredE2eRevoke, ForgetMutationAndAdmissionStayOnOwner) {
+// #90 review: the durable write (temp file, fsync, rename, directory fsync)
+// runs off the session owner and off the D-Bus requester; the in-memory
+// revocation and admission stay on the owner.
+TEST_F(WiredE2eRevoke, ForgetDurableWriteRunsOffOwnerWhileMutationAndAdmissionStayOnOwner) {
     const auto owner = std::this_thread::get_id();
     std::vector<std::thread::id> mutations;
     faults::set_observer([&] { mutations.push_back(std::this_thread::get_id()); });
@@ -273,15 +276,131 @@ TEST_F(WiredE2eRevoke, ForgetMutationAndAdmissionStayOnOwner) {
     EXPECT_TRUE(reply.has_value());
     ASSERT_FALSE(mutations.empty());
     for (const auto thread : mutations) {
-        EXPECT_EQ(thread, owner);
+        EXPECT_NE(thread, owner);
         EXPECT_NE(thread, requesting);
     }
+    EXPECT_NE(store.lookup(phone), trust::Decision::approved);
     ASSERT_FALSE(admissions.empty());
     for (const auto thread : admissions) {
         EXPECT_EQ(thread, owner);
         EXPECT_NE(thread, requesting);
     }
     EXPECT_FALSE(aa::transport::admit_via(store)(wired));
+}
+
+struct StalledPersist {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered{false};
+    bool released{false};
+    std::thread::id thread{};
+    aa::core::Result<void> operator()(const trust::PreparedForget& prepared) {
+        {
+            std::unique_lock lock(mutex);
+            entered = true;
+            thread = std::this_thread::get_id();
+            cv.notify_all();
+            cv.wait(lock, [&] { return released; });
+        }
+        return trust::ApprovedPhoneStore::write_prepared(prepared);
+    }
+    void release() {
+        const std::lock_guard lock(mutex);
+        released = true;
+        cv.notify_all();
+    }
+    bool wait_entered() {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, 2s, [&] { return entered; });
+    }
+};
+
+// #90 review P1: revoking an approved spare phone during projection must not
+// stall the session while the trust store's fsync is stuck.
+TEST_F(WiredE2eRevoke, StalledForgetPersistenceNeverBlocksTheActiveSession) {
+    auto other = wired;
+    other.usb_serial = "SPARE";
+    const auto spare = store.approve(trust::TransportIdentity{other});
+    ASSERT_TRUE(spare.has_value());
+    auto stall = std::make_shared<StalledPersist>();
+    app::WiredPhoneControl stalled{store, session,
+                                   [stall](const trust::PreparedForget& p) { return (*stall)(p); }};
+    stalled.bind_owner();
+    stalled.bind_phone(phone);
+    auto reply = std::async(std::launch::async, [&] { return stalled.forget(spare.value()); });
+    // When: the owner takes the request and the durable write stalls.
+    const auto until = std::chrono::steady_clock::now() + 2s;
+    while (!stall->entered && std::chrono::steady_clock::now() < until) {
+        const auto t0 = std::chrono::steady_clock::now();
+        stalled.checkpoint();
+        EXPECT_LT(std::chrono::steady_clock::now() - t0, 50ms) << "checkpoint waited on disk";
+        std::this_thread::sleep_for(1ms);
+    }
+    ASSERT_TRUE(stall->wait_entered());
+    EXPECT_NE(stall->thread, std::this_thread::get_id());
+    // Then: the owner keeps servicing the session (a ping is answered) and
+    // checkpoints stay immediate while the fsync is stuck.
+    pipe->push_in(ping());
+    const auto t_poll = std::chrono::steady_clock::now();
+    const auto polled = session.poll_transport();
+    ASSERT_TRUE(polled.has_value());
+    EXPECT_TRUE(polled.value());
+    EXPECT_EQ(session.pings_answered(), 1U);
+    for (int i = 0; i < 5; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        stalled.checkpoint();
+        EXPECT_LT(std::chrono::steady_clock::now() - t0, 50ms);
+    }
+    EXPECT_LT(std::chrono::steady_clock::now() - t_poll, 1s);
+    EXPECT_EQ(reply.wait_for(0ms), std::future_status::timeout);
+    // Precommit: trust is unchanged until the write lands.
+    EXPECT_EQ(store.lookup(app::wired_phone_identity(other).value()), trust::Decision::approved);
+    // When: the disk recovers, a later checkpoint applies and answers.
+    stall->release();
+    while (reply.wait_for(1ms) != std::future_status::ready) {
+        stalled.checkpoint();
+    }
+    EXPECT_TRUE(reply.get().has_value());
+    EXPECT_EQ(store.lookup(app::wired_phone_identity(other).value()), trust::Decision::unknown);
+    EXPECT_EQ(store.lookup(phone), trust::Decision::approved);
+    EXPECT_FALSE(session.token().stop_requested());
+    EXPECT_FALSE(stalled.finish());
+    stalled.close();
+}
+
+TEST_F(WiredE2eRevoke, ShutdownBoundsAStalledForgetAndReportsTimeout) {
+    auto other = wired;
+    other.usb_serial = "SPARE";
+    const auto spare = store.approve(trust::TransportIdentity{other});
+    ASSERT_TRUE(spare.has_value());
+    auto stall = std::make_shared<StalledPersist>();
+    {
+        app::WiredPhoneControl stalled{store, session,
+                                       [stall](const trust::PreparedForget& p) { return (*stall)(p); }};
+        stalled.bind_owner();
+        stalled.bind_phone(phone);
+        auto reply = std::async(std::launch::async, [&] { return stalled.forget(spare.value()); });
+        const auto until = std::chrono::steady_clock::now() + 2s;
+        while (!stall->entered && std::chrono::steady_clock::now() < until) {
+            stalled.checkpoint();
+            std::this_thread::sleep_for(1ms);
+        }
+        ASSERT_TRUE(stall->wait_entered());
+        // When: the owner shuts down while the fsync never returns.
+        const auto t0 = std::chrono::steady_clock::now();
+        EXPECT_FALSE(stalled.finish());
+        stalled.close();
+        const auto waited = std::chrono::steady_clock::now() - t0;
+        // Then: shutdown is bounded and the caller learns the outcome is unknown.
+        EXPECT_GE(waited, app::WiredPhoneControl::kShutdownPersistWait - 50ms);
+        EXPECT_LT(waited, app::WiredPhoneControl::kShutdownPersistWait + 1s);
+        ASSERT_EQ(reply.wait_for(1s), std::future_status::ready);
+        const auto result = reply.get();
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code(), ErrorCode::timeout);
+        EXPECT_EQ(store.lookup(app::wired_phone_identity(other).value()), trust::Decision::approved);
+    }
+    stall->release(); // let the abandoned writer finish; it touches only its copies
 }
 
 TEST_F(WiredE2eRevoke, PendingForgetCompletesDuringOwnerShutdown) {

@@ -130,6 +130,20 @@ public:
         }) && !state_->failed;
     }
 
+    // A line the worker writes last, only after a clean drain at close() (#90
+    // review): its presence proves no accepted or later event was lost, its
+    // absence marks the log incomplete for gate consumers. Set before close().
+    void set_completion_record(std::string line) {
+        if (!state_) {
+            return;
+        }
+        if (!line.empty() && line.back() != '\n') {
+            line.push_back('\n');
+        }
+        std::lock_guard lock(state_->mutex);
+        state_->completion = std::move(line);
+    }
+
     // True when close() gave up on a sink that never returned and detached
     // the worker: that destination is unusable for any further output.
     [[nodiscard]] bool timed_out() const noexcept { return timed_out_; }
@@ -163,6 +177,7 @@ private:
         bool exited{false};
         bool in_flight{false};
         std::size_t undelivered_count{0};
+        std::string completion;
 
         SharedState(Sink s, std::size_t cap)
             : sink(std::move(s)), capacity(cap) {}
@@ -200,6 +215,17 @@ private:
                     state->drained.notify_all();
                 }
             }
+        }
+        std::string completion;
+        {
+            std::lock_guard lock(state->mutex);
+            if (!state->failed && state->queue.empty() && state->undelivered_count == 0) {
+                completion = state->completion;
+            }
+        }
+        if (!completion.empty() && !state->sink(completion)) {
+            std::lock_guard lock(state->mutex);
+            state->failed = true;
         }
         {
             std::lock_guard lock(state->mutex);

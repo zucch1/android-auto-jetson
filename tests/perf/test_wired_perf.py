@@ -553,6 +553,34 @@ def load_from_stdout(text: str) -> dict:
     return json.loads(text)
 
 
+def case_log_integrity(tmp: Path) -> None:
+    """#90 review: a capture is validated against the receiver log read to the end."""
+    gate.shutdown(tmp)
+    # Given a receiver whose state-overflow summary drains only at shutdown.
+    late = os.environ.copy()
+    late["FAKE_RECEIVER_LATE_SUMMARY"] = json.dumps(
+        {"event": "runtime_log_dropped", "backpressure": 2, "state_overflow": 1})
+    late["FAKE_RECEIVER_LOG_COMPLETE"] = json.dumps({"runtime_dropped": 2, "state_overflow": 1})
+    capture = load_from_stdout(_collect(tmp, tmp / "state-late", 3, late).stdout)
+    # Then the capture is invalid, never valid telemetry.
+    assert "state_log_dropped" in capture["invalid_telemetry"], capture["invalid_telemetry"]
+    # Given a receiver that never proves its log complete.
+    missing = os.environ.copy()
+    missing["FAKE_RECEIVER_NO_LOG_COMPLETE"] = "1"
+    capture = load_from_stdout(_collect(tmp, tmp / "state-missing", 3, missing).stdout)
+    assert "receiver_log_incomplete" in capture["invalid_telemetry"], capture["invalid_telemetry"]
+    assert "av_sync_ms" in capture["invalid_telemetry"]
+    # Given media loss: the signed A/V evidence is invalid.
+    media = os.environ.copy()
+    media["FAKE_RECEIVER_LOG_COMPLETE"] = json.dumps({"media_backpressure": 1})
+    capture = load_from_stdout(_collect(tmp, tmp / "state-media", 3, media).stdout)
+    assert {"media_telemetry_dropped", "av_sync_ms"} <= set(capture["invalid_telemetry"])
+    # Given a clean log: none of these issues.
+    capture = load_from_stdout(_collect(tmp, tmp / "state-clean", 3, os.environ.copy()).stdout)
+    assert not {"state_log_dropped", "receiver_log_incomplete", "media_telemetry_dropped"} & set(
+        capture["invalid_telemetry"]), capture["invalid_telemetry"]
+
+
 CASES = {
     "schema": case_schema,
     "nominal": case_nominal,
@@ -562,6 +590,7 @@ CASES = {
     "collector": case_collector,
     "media_timing": case_media_timing,
     "readiness": case_readiness,
+    "log_integrity": case_log_integrity,
 }
 
 
