@@ -120,6 +120,9 @@ def performance(doc: Document, seconds: int) -> None:
     schema = aa_perf_schema.load_schema(aa_perf_schema.schema_for(version))
     require(not aa_perf_schema.validate(doc.values, schema), 'PERF_SCHEMA')
     version3 = version == 'aa-projection-perf/3'
+    # Wired qualification counts wired results only: a wireless stage (v3
+    # mode "wireless", tools/perf/aa_transport.py) never stands in for one.
+    doc.equal('mode', 'wired')
     doc.equal('measurement_origin', 'live')
     doc.equal('qualification_status', 'COMPLETE_LIVE')
     doc.equal('verdict', 'PASS')

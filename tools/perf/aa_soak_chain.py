@@ -7,8 +7,10 @@
 """The soak chain: the 1800 s stage, then the 7200 s stage (#137).
 
 ``--transport wired|wireless`` (default wired) is passed to every stage as the
-launcher's ``--mode``; a wireless chain needs ``--phone-id`` and ``--store``
-and a wireless drive smoke (tools/perf/aa_transport.py). The stages, gates and
+launcher's ``--mode``; a wireless chain needs ``--phone-id``, ``--store``,
+``--phone-serial`` as the phone's hardware serial (bound over the AP link by
+get-serialno), the cable unplugged and a wireless drive smoke for the same
+phone id (tools/perf/aa_transport.py). The stages, gates and
 interference rules are the same for both transports.
 
 Replaces the ad-hoc chain scripts kept beside past runs. It waits until no

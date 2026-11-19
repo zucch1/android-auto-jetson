@@ -41,11 +41,29 @@ override is reported normally but never satisfies the gate.
 (tools/perf/aa_transport.py). Wireless launches ``aa-wireless-receiver`` for
 the approved ``--phone-id``; the receiver brings the session up through the
 system helper's AP and Bluetooth bootstrap when the display asks to project,
-and tears it down when it stops. The criteria are the same. Wireless has no
-``active`` line: the run takes the receiver's own ``session_state_changed`` to
-``active`` diagnostic (``--diagnostics``) instead and records which one it
-used. The record names its transport and the phone's link state before and
-after (``link``); ``check --transport`` refuses a record of another transport.
+and tears it down when it stops. The criteria are the same.
+
+* The phone's USB cable must be out: the Jetson's USB bus must show neither the
+  phone (``--serial``) nor an AOA device before, during and after the drive.
+* adb runs over the AP link: after the session is active the runner connects to
+  the AP's stations on port 5555 and binds the one whose ``get-serialno`` is
+  ``--serial``; only then does it prepare the phone (wake, media, Maps) and
+  start the drive clock (``drive_from_ns``: the drive is the first paint after
+  it). No such phone: BLOCKED ``adb_unreachable`` / ``adb_phone_mismatch``.
+  The media player is stopped and verified before the session is torn down,
+  while adb still reaches the phone.
+* Wireless has no ``active`` line: the receiver's own ``session_state_changed``
+  to ``active`` diagnostic (``--diagnostics``, bare on main, wrapped as
+  ``"event":"diag"`` after #163) is the marker. A session drop is also any
+  re-admission after it (a second ``wireless_admission``,
+  ``wireless_admission_expired``, a new diagnostic session id, or a state of
+  reconnecting/disconnected/failed).
+* The record names its transport, ``phone_id`` and ``link``;
+  ``check --transport`` refuses a record of another transport and, for
+  wireless, of another ``--phone-id``.
+
+Either transport BLOCKS ``projection_process_running`` while any receiver
+(wired or wireless) or display is already running.
 """
 from __future__ import annotations
 
@@ -234,7 +252,10 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
     paints = sorted((e for e in display if e.get("event") == "video_presented"
                      and isinstance(e.get("completed_ns"), int)), key=lambda e: e["completed_ns"])
     active_ns = run.get("active_ns")
-    first = next((e["completed_ns"] for e in paints if active_ns and e["completed_ns"] >= active_ns),
+    # Wireless prepares the phone after `active` (adb reaches it only over the
+    # AP): the drive starts at the first paint after that preparation.
+    from_ns = run.get("drive_from_ns") or active_ns
+    first = next((e["completed_ns"] for e in paints if from_ns and e["completed_ns"] >= from_ns),
                  None)
     # The drive is [first paint, first paint + duration]; the other criteria
     # also cover the startup from `active` before it.
@@ -279,9 +300,19 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
 
     # 3. Session drop: both processes alive at the end of the window, it ran
     # its full length, and the receiver never left the connected session inside it.
-    dropped = [e for e in receiver if e.get("event") == "diag"
-               and e.get("kind") == "session_state_changed" and e.get("to_state") == "disconnected"
-               and isinstance(e.get("mono_ns"), int) and cutoff and e["mono_ns"] < cutoff]
+    wireless = run.get("transport") == "wireless"
+    # A wireless re-admission is a drop too: the link went away and came back.
+    drop_states = ("disconnected", "reconnecting", "failed") if wireless else ("disconnected",)
+    states = [e for e in receiver if transport.diag_kind(e) == "session_state_changed"
+              and isinstance(e.get("mono_ns"), int)]
+    dropped = [e for e in states if e.get("to_state") in drop_states and cutoff and e["mono_ns"] < cutoff]
+    if wireless and active_ns and cutoff:
+        first_active = next((e for e in states if e.get("to_state") == "active"), None)
+        dropped += [e for e in states if first_active
+                    and e.get("session") != first_active.get("session")
+                    and active_ns <= e["mono_ns"] < cutoff and e not in dropped]
+        dropped += [x["event"] for x in stamped if x["event"].get("event") in WIRELESS_STAMPED
+                    and active_ns < x["observed_ns"] < cutoff]
     terminal = [e for e in receiver + display if e.get("event") == "terminal_error"]
     full = bool(end_ns and stopped_ns and stopped_ns >= end_ns)
     survived = bool(run.get("receiver_alive_at_end") and run.get("display_alive_at_end"))
@@ -387,7 +418,8 @@ def load_record(text: str) -> dict | None:
 
 def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: str,
                  phone_serial: str, now: datetime,
-                 transport_name: str = transport.DEFAULT_TRANSPORT) -> tuple[str | None, str]:
+                 transport_name: str = transport.DEFAULT_TRANSPORT,
+                 phone_id: int | None = None) -> tuple[str | None, str]:
     """Return (blocked reason, detail); reason None means the soak may start.
 
     Both launched binaries must have been hashed (64 lowercase hex digits) and
@@ -424,6 +456,13 @@ def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: s
         return "drive_smoke_transport_mismatch", (
             f"the smoke ran over {transport.record_transport(record) or 'an unknown transport'!s}, "
             f"the soak is {transport_name}")
+    if transport_name == "wireless":
+        # The approved wireless phone the soak projects must be the smoke's.
+        recorded = record.get("phone_id")
+        if type(recorded) is not int or recorded <= 0:
+            return "drive_smoke_malformed", "a wireless smoke must record its phone_id"
+        if type(phone_id) is not int or recorded != phone_id:
+            return "drive_smoke_phone_mismatch", "the smoke projected a different approved phone id"
     if record["verdict"] != "PASS":
         return "drive_smoke_not_passed", f"verdict {record['verdict']!r}"
     for role, digest in (("receiver", receiver_sha256), ("display", display_sha256)):
@@ -468,7 +507,7 @@ def _check_cli(args) -> int:
     reason, detail = check_record(record, receiver_sha256=args.receiver_sha256,
                                   display_sha256=args.display_sha256,
                                   phone_serial=args.phone_serial, now=now,
-                                  transport_name=args.transport)
+                                  transport_name=args.transport, phone_id=args.phone_id)
     if malformed:
         reason, detail = "drive_smoke_malformed", "the result is not strict JSON"
     if reason:
@@ -528,16 +567,32 @@ class Logger(threading.Thread):
                 if name == "video_presented":
                     self.seen.setdefault("first_paint", event.get("completed_ns", now))
                     continue
-                if (name == "diag" and event.get("kind") == "session_state_changed"
+                if (transport.diag_kind(event) == "session_state_changed"
                         and event.get("to_state") == "active"):
                     # The wireless receiver's active marker (it logs no "active" line).
                     self.seen.setdefault("diag_active", now)
-                self.seen.setdefault(name, now)
-                if name.startswith("idr_"):
+                if name:
+                    self.seen.setdefault(name, now)
+                if name.startswith("idr_") or name in WIRELESS_STAMPED:
                     with self.lock:
                         self.stamped.write(json.dumps({"observed_ns": now, "log": self.label,
                                                        "event": event}) + "\n")
                         self.stamped.flush()
+
+
+# Untimed wireless receiver lines the runner stamps (session re-admission evidence).
+WIRELESS_STAMPED = ("wireless_admission", "wireless_admission_expired")
+ADB_BIND_TIMEOUT_S = 20.0
+HOST_USB_PERIOD_S = 10.0
+
+
+def _host_adb(*args: str) -> subprocess.CompletedProcess:
+    """Host-level ``adb`` (connect/disconnect), bounded like every phone command."""
+    try:
+        return subprocess.run(["adb", *args], capture_output=True, text=True,
+                              timeout=moving_map.ADB_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as error:
+        return subprocess.CompletedProcess(["adb", *args], 1, "", str(error))
 
 
 def _adb(serial: str, *args: str) -> subprocess.CompletedProcess:
@@ -638,8 +693,9 @@ def _run_cli(args) -> int:
     out = Path(args.out)
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
     receiver_bin, display_bin = Path(args.receiver), Path(args.display)
-    store = Path(args.store)
     wireless = args.transport == "wireless"
+    # The wireless receiver needs an absolute --store-dir.
+    store = Path(args.store).absolute() if wireless else Path(args.store)
     base: dict = {"schema": SCHEMA, "transport": args.transport, "duration_s": args.duration,
                   "port": None if wireless else args.port,
                   "video_profiles": args.video_profiles, "criteria_constants": {
@@ -667,24 +723,27 @@ def _run_cli(args) -> int:
         return _blocked(out, base, "build_running")
     if any(name in PROCESS_NAMES for name in _comms()):
         return _blocked(out, base, "projection_process_running")
-    devices = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, timeout=20).stdout
-    line = next((entry for entry in devices.splitlines() if entry.split()[:1] == [args.serial]), "")
     if wireless:
-        # adb (the stimulus) may use the cable; the session itself must not.
-        if " device " not in f" {line} ":
-            return _blocked(out, base, "phone_absent")
-        base["adb_link"] = transport.adb_link(line)
-    elif " device " not in f" {line} " or f"usb:{args.port}" not in line.split():
-        return _blocked(out, base, "phone_absent_on_port")
-    base["phone_model"] = _adb(args.serial, "shell", "getprop", "ro.product.model").stdout.strip()
-    if wireless:
-        base["link"] = {"before": transport.link_snapshot(lambda *a: _adb(args.serial, *a)),
-                        "after": None}
-        refusal = transport.wireless_usb_refusal(base["link"]["before"])
+        # Android Auto suppresses wireless while the phone is on USB: the cable
+        # must be out, shown from this host's own USB bus, not over adb.
+        base["phone_id"] = args.phone_id
+        base["link"] = {"adb_bound": False, "before": None, "after": None,
+                        "host_usb": {"before": transport.host_usb_evidence(args.serial),
+                                     "during": [], "after": None}}
+        refusal = transport.host_usb_refusal(base["link"]["host_usb"]["before"])
         if refusal:
+            base["phone_serial"] = args.serial
             return _blocked(out, base, refusal)
+    else:
+        devices = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True,
+                                 timeout=20).stdout
+        line = next((entry for entry in devices.splitlines() if entry.split()[:1] == [args.serial]), "")
+        if " device " not in f" {line} " or f"usb:{args.port}" not in line.split():
+            return _blocked(out, base, "phone_absent_on_port")
+        base["phone_model"] = _adb(args.serial, "shell", "getprop", "ro.product.model").stdout.strip()
     # The soak gate binds to this phone. The record is a local file and must not
-    # be committed or exported (runbook, Privacy).
+    # be committed or exported (runbook, Privacy). Wireless: the expected serial,
+    # proven over the AP link by get-serialno before the phone is driven.
     base["phone_serial"] = args.serial
     store_before = sha256(store) if store.exists() else None
 
@@ -714,7 +773,8 @@ def _run_cli(args) -> int:
     display_cmd = [str(display_bin), "--test-only-autostart", "--test-only-control-stdin",
                    "--video-socket", socket + ".video", "--input-socket", socket + ".input", *profiles]
     base["configuration"] = configuration(receiver_cmd, display_cmd)
-    run = {"duration_s": args.duration, "receiver_command": receiver_cmd, "display_command": display_cmd,
+    run = {"duration_s": args.duration, "transport": args.transport,
+           "receiver_command": receiver_cmd, "display_command": display_cmd,
            "started_utc": datetime.now(timezone.utc).isoformat(), "media_relaunches": 0}
     lock = threading.Lock()
     loggers: list[Logger] = []
@@ -723,13 +783,44 @@ def _run_cli(args) -> int:
     previous = {sig: signal.signal(sig, stop) for sig in STOP_SIGNALS}
     stamped = (out / "idr-events.jsonl").open("w")
 
-    workload = moving_map.MovingMap(lambda *a: _adb(args.serial, *a), media_uri=args.media_uri,
+    # Wired: adb by the USB serial. Wireless: the <ip>:5555 bound after `active`;
+    # until then nothing is sent to the phone.
+    adb_target = {"serial": None if wireless else args.serial}
+
+    def phone_adb(*a: str) -> subprocess.CompletedProcess:
+        if adb_target["serial"] is None:
+            return subprocess.CompletedProcess(["adb", *a], 1, "", "adb not bound to the phone")
+        return _adb(adb_target["serial"], *a)
+
+    workload = moving_map.MovingMap(phone_adb, media_uri=args.media_uri,
                                     media_type=args.media_type,
                                     media_component=args.media_component, geo_uri=args.geo_uri,
                                     usb_reset=not wireless)
 
+    def bind_phone() -> bool:
+        """Wireless: adb to the expected phone over the AP link, then the phone's own link state."""
+        interface = transport.ap_interface(Path(args.ap_conf))
+        deadline, reason = time.monotonic() + ADB_BIND_TIMEOUT_S, "adb_unreachable"
+        while not stop and time.monotonic() < deadline:
+            bound, reason = transport.bind_adb(args.serial, transport.read_ap_stations(interface),
+                                               _host_adb)
+            if bound:
+                adb_target["serial"] = bound
+                base["link"]["adb_bound"] = True
+                base["link"]["before"] = transport.link_snapshot(phone_adb)
+                base["phone_model"] = phone_adb("shell", "getprop", "ro.product.model").stdout.strip()
+                return True
+            stop.sleep(1.0)
+        run["adb_failure"] = reason if interface else "adb_unreachable: no AP interface in ap.conf"
+        return False
+
+    def sample_host_usb() -> None:
+        during = base["link"]["host_usb"]["during"]
+        if len(during) < 1000:  # 10 s period: a 2 h stage is 720 samples
+            during.append(transport.host_usb_evidence(args.serial))
+
     def drive() -> None:
-        if not workload.prepare_phone(stop.sleep) or stop:
+        if not wireless and (not workload.prepare_phone(stop.sleep) or stop):
             return
         receiver = _spawn(children, receiver_cmd, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, env=env, text=True)
@@ -753,9 +844,18 @@ def _run_cli(args) -> int:
             return
         run["active_ns"] = rx[marker]
         run["active_marker"] = marker
+        if wireless:
+            if not bind_phone() or stop:
+                return
+            if not workload.prepare_phone(stop.sleep) or stop:
+                return
+            run["drive_from_ns"] = time.monotonic_ns()
+            sample_host_usb()
+            dx.pop("first_paint", None)  # the drive is the first paint after preparation
         _wait(lambda: "first_paint" in dx, FIRST_PAINT_WAIT_S, stop, receiver, display)
         span = int(args.duration * 1e9) + 5 * 10**8
         end = dx.get("first_paint", time.monotonic_ns()) + span
+        usb_due = time.monotonic() + HOST_USB_PERIOD_S
         print(f"drive smoke: active, window {args.duration} s", file=sys.stderr, flush=True)
         while (not stop and time.monotonic_ns() < end
                and receiver.poll() is None and display.poll() is None):
@@ -774,6 +874,9 @@ def _run_cli(args) -> int:
                 break
             if outcome == "phone_failed":
                 break  # workload.phone_failure: BLOCKED below
+            if wireless and time.monotonic() >= usb_due:
+                sample_host_usb()
+                usb_due = time.monotonic() + HOST_USB_PERIOD_S
             time.sleep(0.1)
         run["window_end_ns"] = time.monotonic_ns()
         run["receiver_alive_at_end"] = receiver.poll() is None
@@ -784,20 +887,31 @@ def _run_cli(args) -> int:
     finally:
         # The single cleanup, reached by normal flow (signals only set the flag)
         # or by an exception: every registered child's group, then the phone.
+        # Wireless restores the phone first: adb reaches it only while the
+        # session (and so the AP link) is up. Nothing was sent before the bind.
+        if wireless:
+            run["cleanup_failures"] = (workload.restore_phone() if adb_target["serial"]
+                                       else [])
+            if adb_target["serial"]:
+                base["link"]["after"] = transport.link_snapshot(phone_adb)
         for process in reversed(children):
             _stop(process)
         for logger in loggers:
             logger.join(timeout=5)
         stamped.close()
-        # Media stopped and verified first, USB mode last (it re-enumerates USB).
-        run["cleanup_failures"] = workload.restore_phone()
-        if wireless and "link" in base:
-            # The phone's USB must still be plain mtp: the session never used it.
-            base["link"]["after"] = transport.link_snapshot(lambda *a: _adb(args.serial, *a))
-            refusal = transport.wireless_usb_refusal(base["link"]["after"])
-            if refusal:
-                run["cleanup_failures"].append(f"{refusal}_after: USB "
-                                               f"{base['link']['after']['usb_functions']}")
+        if wireless:
+            if adb_target["serial"]:
+                _host_adb("disconnect", adb_target["serial"])
+            host = base["link"]["host_usb"]
+            host["after"] = transport.host_usb_evidence(args.serial)
+            for moment, evidence in [("during", e) for e in host["during"]] + [("after", host["after"])]:
+                refusal = transport.host_usb_refusal(evidence)
+                if refusal:
+                    run["cleanup_failures"].append(f"{refusal.split(':')[0]}_{moment}: {refusal}")
+                    break
+        else:
+            # Media stopped and verified first, USB mode last (it re-enumerates USB).
+            run["cleanup_failures"] = workload.restore_phone()
         base["cleanup_failures"] = run["cleanup_failures"]  # in every result, BLOCKED too
         for failure in run["cleanup_failures"]:
             print(f"drive smoke: cleanup failure: {failure}", file=sys.stderr)
@@ -817,6 +931,14 @@ def _run_cli(args) -> int:
     run.update(receiver_exit=receiver.returncode if receiver else None,
                display_exit=display.returncode if display else None)
     (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
+    if run.get("adb_failure"):
+        # Wireless: adb never reached the expected phone over the AP link, so
+        # the workload could not run on the projected phone. Fail closed.
+        reason = run["adb_failure"].split(":")[0]
+        print(f"drive smoke: {run['adb_failure']}", file=sys.stderr)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        return _blocked(out, base, reason)
     if workload.phone_failure is not None:
         # A required phone command (setup or media relaunch) failed: the harness
         # lost the phone, so the drive was not the one the gate asks for.
@@ -863,11 +985,15 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="drive the smoke on the phone (live)")
-    run.add_argument("--serial", required=True, help="adb serial of the phone")
+    run.add_argument("--serial", required=True,
+                     help="the phone's serial: its adb serial when wired; wireless: the hardware "
+                          "serial (get-serialno) adb must answer with over the AP link")
     run.add_argument("--transport", choices=transport.TRANSPORTS, default=transport.DEFAULT_TRANSPORT,
                      help="session transport (default wired); a result counts only for its own")
     run.add_argument("--phone-id", type=int,
                      help="wireless: the approved wireless phone id in the trust store")
+    run.add_argument("--ap-conf", default=str(transport.AP_CONF),
+                     help="wireless: the helper's ap.conf (names the AP interface; read-only)")
     run.add_argument("--port", default=os.environ.get("AA_PERF_PORT", "1-2.1"),
                      help="USB port context the phone is on (default 1-2.1)")
     run.add_argument("--build-dir", default=os.environ.get("AA_BUILD_DIR"),
@@ -899,6 +1025,7 @@ def main(argv: list[str]) -> int:
     check.add_argument("--now", help="ISO-8601 time; tests and offline review only, never live")
     check.add_argument("--transport", choices=transport.TRANSPORTS, default=transport.DEFAULT_TRANSPORT,
                        help="the soak's transport; a smoke of another transport is refused")
+    check.add_argument("--phone-id", type=int, help="wireless: the soak's approved phone id")
     args = parser.parse_args(argv)
     if args.command == "check":
         return _check_cli(args)

@@ -192,10 +192,12 @@ CLEANUP_REASONS = {
     "media_stop_unavailable": "cleanup:media_not_stopped",
     "usb_reset_failed": "cleanup:usb_not_restored",
     "phone_restore_not_reached": "cleanup:phone_restore_not_reached",
-    # Wireless (tools/perf/aa_transport.py): the phone's USB was not shown in
-    # plain mtp after the run, so the session may not have been wireless only.
-    "usb_in_aoa_after": "cleanup:usb_in_aoa",
-    "usb_functions_unknown_after": "cleanup:usb_functions_unknown",
+    # Wireless (tools/perf/aa_transport.py): the Jetson's USB bus showed the
+    # phone or an AOA device during or after the run, or could not be read.
+    "usb_attached_during": "cleanup:usb_attached",
+    "usb_attached_after": "cleanup:usb_attached",
+    "usb_state_unreadable_during": "cleanup:usb_state_unreadable",
+    "usb_state_unreadable_after": "cleanup:usb_state_unreadable",
 }
 
 
@@ -258,9 +260,9 @@ class MovingMap:
         self.media_package = media_package(media_component)
         self.geo_uri = geo_uri
         # Wired sessions reset the phone's USB to mtp before and after the run
-        # (the wired receiver puts it in AOA). A wireless session never uses
-        # USB for projection, so its workload leaves USB alone: the runner only
-        # reads and records the USB functions (tools/perf/aa_transport.py).
+        # (the wired receiver puts it in AOA). A wireless session runs with the
+        # cable unplugged and adb over the AP link, so its workload leaves USB
+        # alone (tools/perf/aa_transport.py).
         self.usb_reset = usb_reset
         self.media_relaunches = 0
         self.drags = 0

@@ -51,6 +51,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aa_perf_schema  # noqa: E402
+import aa_transport as transport  # noqa: E402
 import aa_av_contract as av_contract  # noqa: E402
 from aa_moving_map import MAX_DRAG_GAP_S, MIN_DRAG_RATE_HZ, cleanup_gaps, max_drag_gap_s  # noqa: E402
 from aa_measurement_coverage import (
@@ -476,6 +477,10 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
             gap = wireless_link_gap(capture)
             if gap is not None:
                 unavailable.append("run_evidence:" + gap)
+            # Rate-limited media telemetry (#163) loses A/V evidence: a named
+            # gap, so a coverage miss is not read as a product failure alone.
+            if capture.get("mode") == "wireless" and capture.get("media_telemetry_dropped"):
+                unavailable.append("run_evidence:media_telemetry_dropped")
             # A build on the target during the stage contends for CPU and memory:
             # the stage measured something else than the quiet host it claims.
             # Interference, not a product FAIL: it BLOCKS a stage that would
@@ -598,7 +603,10 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         result["av_contract"] = av_block
         result["workload"] = _workload_record(capture.get("workload"), window)
         if capture["mode"] == "wireless":
-            result["link"] = capture.get("link")
+            result["link"] = _result_link(capture.get("link"))
+            # Harness-measured (launch to the active diagnostic), not the wired
+            # receiver's own startup clock: never compare the two.
+            result["startup_basis"] = "harness_launch_to_active"
     if capture_path is not None:
         result["capture"] = {"path": capture_path, "sha256": capture_sha256}
 
@@ -666,19 +674,46 @@ def _signed_av(capture: dict, window: Window | None, *, invalid: bool) -> tuple[
 
 
 def wireless_link_gap(capture: dict) -> str | None:
-    """Why a wireless capture does not prove a wireless-only session, or None (wired: None)."""
+    """Why a wireless capture does not prove a wireless-only session on the bound phone, or None.
+
+    Wired: None. Wireless: adb must have been bound to the soak phone over the
+    AP link, and this host's USB bus must have been readable and shown neither
+    the phone nor an AOA device before, at every sample during, and after the
+    stage (tools/perf/aa_transport.py). The phone's own USB functions are
+    recorded but prove nothing about the cable.
+    """
     if capture.get("mode") != "wireless":
         return None
     link = capture.get("link")
     if not isinstance(link, dict):
         return "wireless_link_unrecorded"
-    for moment in ("before", "after"):
-        snapshot = link.get(moment)
-        if not isinstance(snapshot, dict) or snapshot.get("usb_aoa") is None:
-            return f"wireless_usb_unknown_{moment}"
-        if snapshot["usb_aoa"] is not False:
-            return f"wireless_usb_in_aoa_{moment}"
+    if link.get("adb_bound") is not True:
+        return "wireless_adb_unbound"
+    host = link.get("host_usb")
+    if not isinstance(host, dict) or not isinstance(host.get("during"), list) or not host["during"]:
+        return "wireless_host_usb_unrecorded"
+    for moment, evidence in ([("before", host.get("before"))] + [("during", e) for e in host["during"]]
+                             + [("after", host.get("after"))]):
+        refusal = transport.host_usb_refusal(evidence)
+        if refusal:
+            return f"wireless_{refusal.split(':')[-1]}_{moment}"
     return None
+
+
+def _result_link(link: object) -> dict | None:
+    """The result's link record: the capture's, without the phone id (privacy)."""
+    if not isinstance(link, dict):
+        return None
+    host = link.get("host_usb") if isinstance(link.get("host_usb"), dict) else {}
+    keep = ("readable", "phone_attached", "aoa_attached")
+
+    def evidence(value: object) -> dict | None:
+        return {k: value.get(k) for k in keep} if isinstance(value, dict) else None
+    return {"adb_bound": link.get("adb_bound") is True,
+            "before": link.get("before"), "after": link.get("after"),
+            "host_usb": {"before": evidence(host.get("before")),
+                         "during": [evidence(e) for e in host.get("during", []) if isinstance(e, dict)],
+                         "after": evidence(host.get("after"))}}
 
 
 def workload_gap(raw: object, window: Window | None) -> str | None:

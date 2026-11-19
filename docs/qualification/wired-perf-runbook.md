@@ -691,35 +691,92 @@ tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" \
 ## Wireless sessions (`--transport wireless`)
 
 Wireless is the product's primary path. The drive smoke
-(`aa_drive_smoke.py run --transport wireless --phone-id N`), the soak chain
-(`aa_soak_chain.py --transport wireless --phone-id N --store DIR/approved-phones.json`)
-and the launcher (`aa-projection-perf.sh --mode wireless`) run the **same**
+(`aa_drive_smoke.py run --transport wireless --phone-id N --serial SERIAL`),
+the soak chain (`aa_soak_chain.py --transport wireless --phone-id N
+--phone-serial SERIAL --store DIR/approved-phones.json`) and the launcher
+(`aa-projection-perf.sh --mode wireless`, live stages only) run the **same**
 criteria, A/V contract, gates and interference rules as wired. Only the
-session setup differs (tools/perf/aa_transport.py):
+session setup differs (tools/perf/aa_transport.py).
 
-- `aa-wireless-receiver --store-dir DIR --phone-id N --diagnostics` is
-  launched; it acquires the system helper's AP and bootstraps the phone over
-  Bluetooth when the display asks to project, and releases both on stop. The
-  harness never touches Wi-Fi, Bluetooth, NetworkManager or the helper.
-- adb (the moving-map stimulus) may use the cable; the session must not. The
-  phone's USB functions (`getprop sys.usb.config`) must be known and not AOA
-  before the run (else BLOCKED `usb_in_aoa` / `usb_functions_unknown`, nothing
-  launched) and after it (else `cleanup:usb_in_aoa`). The workload never
-  switches USB for wireless (no AOA, no mtp reset).
-- The record carries `transport` and `link.before`/`link.after`: USB
-  functions, Wi-Fi frequency/channel/RSSI (`cmd wifi status`, numbers only)
-  and `bluetooth_on`. SSIDs, BSSIDs and addresses are never recorded.
-- The wireless receiver logs no `active` line; its `session_state_changed`
-  diagnostic to `active` is the marker (`run.json` `active_marker`).
-- `check --transport` refuses a smoke of the other transport
-  (`drive_smoke_transport_mismatch`); a record without `transport` is wired.
-  A soak result's `mode` is its transport.
+**Physical setup.** Android Auto does not start a wireless session while the
+phone is attached over USB, so the phone's cable must be **unplugged** for the
+whole run. The harness checks this from the Jetson's own USB bus (sysfs): no
+device with the phone's serial and no Google AOA device (`18d1:2d00`-`2d05`)
+on any port, before the launch (otherwise BLOCKED `usb_attached:phone_on_usb`,
+`usb_attached:usb_in_aoa` or `usb_state_unreadable`, and nothing is launched),
+every 10 s during the run, and after it (otherwise `cleanup:usb_attached`).
 
-**Known gap: a wireless run cannot PASS today.** `aa-wireless-receiver` plays
-audio through `AudioRouter` and logs no `audio_write_completed` (no playback
-endpoint), so the A/V contract's coverage clause fails closed. Porting the
-wired receiver's scheduled-PCM sink and its telemetry is a separate receiver
-change; until then a wireless smoke or stage is a FAIL, never a PASS.
+**adb over the AP link (once per phone boot).** The moving-map stimulus needs
+adb, and with the cable out adb has to use TCP:
+
+1. While the phone is still cabled, run `adb -s SERIAL tcpip 5555` once. The
+   phone keeps listening on 5555 until it reboots.
+2. Unplug the cable.
+3. During the run, once the session is `active` (the phone has joined the
+   receiver's AP), the harness reads the station addresses from the AP's DHCP
+   leases (`/var/lib/NetworkManager/dnsmasq-IFACE.leases`) and neighbour table
+   (`ip -4 neigh show dev IFACE`). IFACE comes from
+   `/etc/android-auto-receiver/ap.conf`. The harness then runs
+   `adb connect IP:5555` and binds the phone by identity:
+   `adb -s IP:5555 get-serialno` must answer `SERIAL` (for example
+   `R5CY30E2JSH` for the A26).
+4. Only then is the phone prepared (wake, media, Maps) and the drive clock or
+   measurement window started.
+
+No reachable station, or only other phones, means BLOCKED (`adb_unreachable`,
+`adb_phone_mismatch`), never a PASS. The media player is stopped and verified
+before the session is torn down, while adb still reaches the phone. Only IPv4
+addresses are read: MACs, the PSK and the SSID are never recorded or printed.
+
+**Known blocker: the helper firewall drops adb replies on the AP interface.**
+The helper's AP firewall (`src/helper/nm/Commands.cpp` `firewall()`) ends its
+input chain with `iifname IFACE drop`, after accepting only DHCP and the
+projection port, and it has no `ct state established` accept. The phone's
+replies to `adb connect` arrive on that interface as input to the Jetson, so
+they are dropped, and step 3 is BLOCKED `adb_unreachable` with the current
+helper. Allowing it (for example, established/related input from the bound
+station, or a tightly scoped 5555 rule) is a helper change and needs an owner
+decision. This PR doesn't make it.
+
+**Record.** The smoke record carries `transport`, `phone_id`, `phone_serial`
+(local file only, see Privacy) and `link`:
+- `adb_bound`;
+- the phone's own USB functions, Wi-Fi frequency, channel and RSSI (numbers
+  only) and `bluetooth_on`, read over the bound adb after binding and before
+  teardown;
+- `host_usb` before, during and after.
+
+`check --transport wireless --phone-id N` refuses a smoke of the other
+transport (`drive_smoke_transport_mismatch`) or of another approved phone
+(`drive_smoke_phone_mismatch`). A record without `transport` is wired. A soak
+result's `mode` is its transport. A wireless result carries `link` (without
+the phone id) and `startup_basis: harness_launch_to_active`: its `startup_ms`
+is measured by the harness from the receiver's launch to the active
+diagnostic, and includes the AP, the Bluetooth bootstrap and TLS. Never compare
+it with a wired `startup_ms`. `tools/qualification/check_wired.py` accepts only
+`mode: wired` results.
+
+**Markers.** The wireless receiver logs no `active` line. The marker is its
+`session_state_changed` diagnostic to `active` (`--diagnostics`), which is bare
+on main and wrapped as `"event":"diag"` after #163. Both shapes are accepted.
+A wireless session drop is:
+- a state of reconnecting, disconnected or failed;
+- a new diagnostic session id;
+- a second `wireless_admission`;
+- `wireless_admission_expired`.
+
+Any running receiver (wired or wireless) or display blocks either transport
+(`projection_process_running`).
+
+**Known gap: no A/V telemetry yet, so a wireless run cannot PASS on main.** The
+wireless receiver does play audio (`AudioRouter` to pulsesink). What is
+missing is its `audio_write_completed` playback-slot telemetry, so the A/V
+contract's coverage clause fails closed. #159 / PR #163 add that telemetry.
+After #163, rate-limited media telemetry (`media_telemetry_dropped`) on a
+wireless stage is the named gap `run_evidence:media_telemetry_dropped`, not
+just an A/V miss. The forced-stop path (`aa_remote_stop.sh`) still restores
+the phone by its USB serial, which a wireless stage cannot reach: its restore
+report then names the failure, as for any unreachable phone.
 
 ## Exact invocations
 

@@ -35,6 +35,22 @@ class V3PackageTests(PackageTest):
         check(self.manifest)
         self.assertEqual(self.cli('check_wired.py').returncode, 0)
 
+    def test_a_wireless_result_never_counts_as_wired_qualification(self) -> None:
+        # PR #158 review P1-1: a schema-valid wireless v3 PASS in place of a wired stage.
+        snapshot = {'usb_functions': ['mtp', 'adb'], 'usb_aoa': False, 'bluetooth_on': True,
+                    'wifi': {'connected': True, 'frequency_mhz': 5180, 'channel': 36, 'rssi_dbm': -48}}
+        host = {'readable': True, 'phone_attached': False, 'aoa_attached': False}
+        link = {'adb_bound': True, 'before': snapshot, 'after': snapshot,
+                'host_usb': {'before': host, 'during': [host], 'after': host}}
+        for field in ('perf_30m', 'soak_2h'):
+            with self.subTest(field=field):
+                self.restore()
+                self.tamper(field, lambda d: d.update(mode='wireless', link=link,
+                                                      startup_basis='harness_launch_to_active'))
+                with self.assertRaises(EvidenceError) as raised:
+                    check(self.manifest)
+                self.assertEqual(str(raised.exception), 'INVALID_FIELD:mode')
+
     def test_both_results_without_stimulus_are_rejected(self) -> None:
         # The review's reproduction: both stages disclose that no stimulus ran.
         for field in ('perf_30m', 'soak_2h'):

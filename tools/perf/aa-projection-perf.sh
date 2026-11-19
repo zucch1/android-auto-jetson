@@ -20,10 +20,12 @@
 #
 # --mode wireless (live stages only) launches aa-wireless-receiver (default
 # /opt/aa/aa-wireless-receiver) for --phone-id N, approved in --store
-# DIR/approved-phones.json (required). The phone must be attached to adb (any
-# link) and its USB in plain mtp, never AOA; the drive smoke must be a wireless
-# one (aa_drive_smoke.py check --transport wireless); the result's mode is
-# wireless. See tools/perf/aa_transport.py.
+# DIR/approved-phones.json (required). The phone's USB cable must be unplugged
+# (checked on the target's USB bus); adb reaches it over the helper's AP after
+# admission (`adb tcpip 5555` once beforehand), bound by get-serialno to
+# --phone-serial (its hardware serial). The drive smoke must be a wireless one
+# for the same --phone-id (aa_drive_smoke.py check --transport wireless); the
+# result's mode is wireless. See tools/perf/aa_transport.py.
 #
 # This tool measures CPU/RSS, thermal state, frame drops, decode/IPC timing,
 # A/V sync and audio latency during wired projection on the qualified Jetson,
@@ -352,7 +354,7 @@ validate_result() {
 if ((READINESS_ONLY)); then
     if check_readiness; then
         write_readiness true ""
-        echo "READY: ${HOST} prerequisites met (mode=wired, port=${PORT})"
+        echo "READY: ${HOST} prerequisites met (mode=${MODE:-wired}, port=${PORT})"
         exit 0
     fi
     write_readiness false "$ready_reason"
@@ -500,18 +502,23 @@ display_sha="$(remote_sha256 "$DISPLAY_BIN")"
 # gate blocks with drive_smoke_phone_unverified.
 verified_serial=""
 if [[ "$PHONE_SERIAL" =~ ^[A-Za-z0-9._:-]+$ ]]; then
-    devices="$(remote "adb devices -l" 2>/dev/null || true)"
-    # Wireless: adb may use any link (the session itself is wireless); wired: on --port.
-    if awk -v serial="$PHONE_SERIAL" -v port="usb:${PORT}" -v any="$([[ "$MODE" == wireless ]] && echo 1)" '
-            $1 == serial && $2 == "device" { if (any) found = 1; for (i = 3; i <= NF; i++) if ($i == port) found = 1 }
-            END { exit found ? 0 : 1 }' <<<"$devices"; then
+    if [[ "$MODE" == "wireless" ]]; then
+        # The cable is out, so adb cannot see the phone yet: the collector binds
+        # adb to this serial over the AP link (get-serialno) or refuses the stage.
         verified_serial="$PHONE_SERIAL"
+    else
+        devices="$(remote "adb devices -l" 2>/dev/null || true)"
+        if awk -v serial="$PHONE_SERIAL" -v port="usb:${PORT}" '
+                $1 == serial && $2 == "device" { for (i = 3; i <= NF; i++) if ($i == port) found = 1 }
+                END { exit found ? 0 : 1 }' <<<"$devices"; then
+            verified_serial="$PHONE_SERIAL"
+        fi
     fi
 fi
 if ! smoke_reason="$("$PY" -B "$TOOL_DIR/../wired-qa/aa_drive_smoke.py" check \
         --record "${DRIVE_SMOKE:-/nonexistent}" \
         --receiver-sha256 "$receiver_sha" --display-sha256 "$display_sha" \
-        --phone-serial "$verified_serial" --transport "$MODE")"; then
+        --phone-serial "$verified_serial" --transport "$MODE" ${PHONE_ID:+--phone-id "$PHONE_ID"})"; then
     smoke_reason="${smoke_reason:-drive_smoke_missing}"
     blocked_result "$smoke_reason" "$build_type_known" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3

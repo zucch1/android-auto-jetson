@@ -16,13 +16,23 @@ The workload resets the phone's USB to mtp before and after the run (the
 existing #137 flow).
 
 Wireless: ``aa-wireless-receiver`` admits the approved phone through the system
-helper's AP and Bluetooth bootstrap; the harness never touches Wi-Fi, Bluetooth
-or NetworkManager itself. adb (the moving-map stimulus) may still run over a
-USB cable, but the session must not: the phone's USB must be in plain mtp, not
-AOA (``accessory``), before and after the run, and no wired receiver may run.
-The tooling only *reads* the phone's USB functions, Wi-Fi link and Bluetooth
-state over adb (``link_snapshot``) and records them; it never switches USB,
-because the session does not depend on it.
+helper's AP and Bluetooth bootstrap; the harness never touches Wi-Fi, Bluetooth,
+NetworkManager or the helper itself. Android Auto does not start a wireless
+session while the phone is attached over USB, so the phone's cable must be
+**unplugged**: the Jetson's own USB bus (sysfs, ``host_usb_evidence``) must show
+no device with the phone's serial and no Google AOA device (18d1:2d00-2d05)
+on any port, before, during and after the run (``usb_attached``).
+
+adb (the moving-map stimulus) then runs over the helper's AP link: the operator
+runs ``adb tcpip 5555`` once beforehand while the phone is cabled (runbook);
+after the phone joins the AP the harness reads the station addresses from the
+AP's DHCP leases and neighbour table on the AP interface (IPv4 addresses only;
+MACs, the PSK and the SSID are never read into the record or printed), runs
+``adb connect <ip>:5555`` and binds by identity: ``adb -s <ip>:5555
+get-serialno`` must equal the expected phone serial (``bind_adb``). A phone
+adb cannot reach, or a different phone, BLOCKS the run (``adb_unreachable`` /
+``adb_phone_mismatch``). The phone's own link state (USB functions, Wi-Fi
+frequency/channel/RSSI, Bluetooth) is then read over that adb into the record.
 
 A result records ``transport``. A gate asked for one transport refuses a record
 of the other, and a record without the field is wired (every record before this
@@ -30,8 +40,11 @@ field existed came from the wired receiver).
 """
 from __future__ import annotations
 
+import ipaddress
 import re
-from collections.abc import Callable
+import subprocess
+from collections.abc import Callable, Iterable
+from pathlib import Path
 
 TRANSPORTS = ("wired", "wireless")
 DEFAULT_TRANSPORT = "wired"
@@ -118,24 +131,148 @@ def link_snapshot(adb: Callable[..., object]) -> dict:
             "bluetooth_on": {"1": True, "0": False}.get(bluetooth)}
 
 
-def wireless_usb_refusal(snapshot: dict) -> str | None:
-    """Why a wireless session cannot be qualified with this USB state, or None.
+# ---- Receiver diagnostics --------------------------------------------------
 
-    The USB functions must be known and must not include AOA: a phone in AOA
-    may be projecting over the cable, and then the session is not wireless.
+def diag_kind(event: dict) -> str | None:
+    """The diagnostic kind of a receiver line, bare or wrapped; None if it is no diagnostic.
+
+    The wired receiver wraps diagnostics as ``{"event":"diag","kind":...}``; the
+    wireless receiver on main prints the serializer's bare object
+    ``{"kind":...,"session":N,"mono_ns":...}`` (PR #163 adds the wrapper there).
     """
-    if snapshot.get("usb_aoa") is None:
-        return "usb_functions_unknown"
-    if snapshot["usb_aoa"]:
-        return "usb_in_aoa"
+    kind = event.get("kind")
+    if not isinstance(kind, str):
+        return None
+    if event.get("event") == "diag" or "event" not in event:
+        return kind
     return None
 
 
-def adb_link(devices_line: str) -> str:
-    """How adb reaches the phone: "usb" (a usb: field), "tcp" (an address) or "unknown"."""
-    fields = devices_line.split()
-    if any(field.startswith("usb:") for field in fields):
-        return "usb"
-    if fields and ":" in fields[0]:
-        return "tcp"
-    return "unknown"
+# ---- Jetson-side USB evidence (the cable is out) ----------------------------
+
+GOOGLE_VID = "18d1"
+AOA_PIDS = frozenset(f"2d0{n}" for n in range(6))  # 18d1:2d00-2d05, every AOA mode
+USB_DEVICES = Path("/sys/bus/usb/devices")
+
+
+def _read(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def host_usb_evidence(phone_serial: str, root: Path | None = None) -> dict:
+    """Whether the Jetson sees the phone, or any AOA device, on its USB bus.
+
+    Read-only sysfs. ``readable`` is False when the bus cannot be listed; then
+    both answers are unknown (None) and the run is BLOCKED (fail closed).
+    The serial is compared, never recorded here.
+    """
+    root = USB_DEVICES if root is None else root
+    try:
+        devices = [entry for entry in root.iterdir() if (entry / "idVendor").exists()]
+    except OSError:
+        return {"readable": False, "phone_attached": None, "aoa_attached": None}
+    phone = aoa = False
+    for device in devices:
+        vendor, product = _read(device / "idVendor"), _read(device / "idProduct")
+        if vendor == GOOGLE_VID and product in AOA_PIDS:
+            aoa = True
+        if phone_serial and _read(device / "serial") == phone_serial:
+            phone = True
+    return {"readable": True, "phone_attached": phone, "aoa_attached": aoa}
+
+
+def host_usb_refusal(evidence: dict | None) -> str | None:
+    """``usb_attached`` (with its sub-reason) or ``usb_state_unreadable``; None when the cable is out."""
+    if not isinstance(evidence, dict) or evidence.get("readable") is not True:
+        return "usb_state_unreadable"
+    if evidence.get("aoa_attached") is not False:
+        return "usb_attached:usb_in_aoa"
+    if evidence.get("phone_attached") is not False:
+        return "usb_attached:phone_on_usb"
+    return None
+
+
+# ---- adb over the helper's AP link ------------------------------------------
+
+AP_CONF = Path("/etc/android-auto-receiver/ap.conf")
+NM_LEASES = "/var/lib/NetworkManager/dnsmasq-{interface}.leases"
+ADB_TCP_PORT = 5555
+_INTERFACE = re.compile(r"[A-Za-z0-9_.:-]{1,15}")
+
+
+def ap_interface(conf: Path = AP_CONF) -> str | None:
+    """The AP interface named in the helper's ap.conf (``v1 IFACE ...``); None if unreadable."""
+    fields = (_read(conf) or "").split()
+    if len(fields) >= 2 and fields[0] == "v1" and _INTERFACE.fullmatch(fields[1]):
+        return fields[1]
+    return None
+
+
+def _ipv4s(tokens: Iterable[str]) -> list[str]:
+    out = []
+    for token in tokens:
+        try:
+            address = ipaddress.IPv4Address(token)
+        except ValueError:
+            continue
+        if address.is_private and str(address) not in out:
+            out.append(str(address))
+    return out
+
+
+def ap_station_addresses(interface: str, leases_text: str | None, neigh_text: str | None) -> list[str]:
+    """IPv4 addresses of the AP's stations: DHCP leases first, then reachable neighbours.
+
+    Lease lines are ``expiry MAC IP host client-id``; only field 3 is kept.
+    Neighbour lines are ``IP lladdr MAC STATE``; only the address of a
+    non-FAILED entry is kept. MACs are never returned.
+    """
+    leases = _ipv4s(line.split()[2] for line in (leases_text or "").splitlines()
+                    if len(line.split()) >= 3)
+    neigh = _ipv4s(line.split()[0] for line in (neigh_text or "").splitlines()
+                   if line.split() and line.split()[-1] not in ("FAILED", "INCOMPLETE"))
+    return leases + [address for address in neigh if address not in leases]
+
+
+def read_ap_stations(interface: str | None,
+                     run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> list[str]:
+    """Read the lease file and ``ip -4 neigh show dev IFACE`` (read-only)."""
+    if not interface:
+        return []
+    leases = _read(Path(NM_LEASES.format(interface=interface)))  # module attribute: test seam
+    try:
+        neigh = run(["ip", "-4", "neigh", "show", "dev", interface], capture_output=True,
+                    text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        neigh = None
+    return ap_station_addresses(interface, leases, neigh)
+
+
+def bind_adb(expected_serial: str, candidates: list[str],
+             adb: Callable[..., object]) -> tuple[str | None, str | None]:
+    """Connect adb to the station that is the expected phone: (adb serial, None) or (None, reason).
+
+    ``adb(*args)`` runs one bounded host adb command. Each candidate is tried as
+    ``<ip>:5555``; the phone is bound only when ``get-serialno`` over that
+    connection equals ``expected_serial``. A candidate that answers with another
+    serial is disconnected again. Reasons: ``adb_unreachable`` (no candidate, or
+    none answered), ``adb_phone_mismatch`` (only other phones answered).
+    """
+    other = False
+    for address in candidates:
+        target = f"{address}:{ADB_TCP_PORT}"
+        connected = adb("connect", target)
+        if getattr(connected, "returncode", 1) != 0 or "connected" not in (
+                getattr(connected, "stdout", "") or "") or "cannot" in (getattr(connected, "stdout", "") or ""):
+            continue
+        answer = adb("-s", target, "get-serialno")
+        serial = (getattr(answer, "stdout", "") or "").strip() if getattr(answer, "returncode", 1) == 0 else ""
+        if serial and serial == expected_serial:
+            return target, None
+        if serial:
+            other = True
+        adb("disconnect", target)
+    return None, "adb_phone_mismatch" if other else "adb_unreachable"
