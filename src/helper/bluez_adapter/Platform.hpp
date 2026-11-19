@@ -13,8 +13,6 @@ namespace aa::helper {
 inline constexpr auto kAaUuid = "4de17a00-52cb-11e6-bdf4-0800200c9a66";
 inline constexpr auto kProfilePath = "/org/custom/AndroidAutoSystemHelper/aa_profile";
 inline constexpr auto kHfpUuid = "0000111e-0000-1000-8000-00805f9b34fb";
-// The phone's HFP Audio Gateway: the one profile an approved reconnect pages (ConnectProfile).
-inline constexpr auto kHfpAgUuid = "0000111f-0000-1000-8000-00805f9b34fb";
 inline constexpr auto kAgentPath = "/org/custom/AndroidAutoSystemHelper/aa_agent";
 struct BluezBackend::Impl {
     using Clock = std::chrono::steady_clock;
@@ -23,7 +21,7 @@ struct BluezBackend::Impl {
         std::string path, adapter_path;
         PeerIdentity identity;
         bool bonded{};
-        bool connected{};
+        bool connected{};  // Device1.Connected: any Bluetooth link (read only, never changed)
     };
     struct Observation {
         Device device; std::string owner; Clock::time_point expires;
@@ -58,6 +56,9 @@ struct BluezBackend::Impl {
     bluez_adapter::ManagedPeers revoked;
     std::optional<Observation> allowed;
     Clock::time_point window{};
+    // Whether the reconnect window's phone has a Bluetooth link (Device1.Connected), observed at
+    // reconnect and kept current from PropertiesChanged. Diagnostics only: no authority, no call.
+    bool allowed_link{};
     bool pairing_enabled{};
     struct Comparison {
         PairingComparison value;
@@ -123,41 +124,6 @@ struct BluezBackend::Impl {
     static int socket_fd(GDBusMethodInvocation*);
     bool register_profiles();
     bool unregister_profiles();
-    // Approved-reconnect paging (docs/task36-bluez.md): a bonded phone's Android Auto dials the AA
-    // RFCOMM profile only over a live link, so an approved reconnect pages the phone's HFP Audio
-    // Gateway once. The page is bound to the exact admitted observation, rechecked at dispatch
-    // (after the previous window closed and the lease committed), rate limited per peer, and owned:
-    // when its authority ends (lease retirement, Forget, link or bond continuity loss, BlueZ owner
-    // change) a page that created the link is withdrawn with a scoped DisconnectProfile(HFP AG),
-    // including one that completes late. Never generic Connect, Disconnect or RemoveDevice (#136).
-    struct PageReply { bool done{}; bool ok{}; std::string error; };
-    struct Page {
-        Observation peer;
-        bool retired{};
-        std::shared_ptr<PageReply> reply;
-    };
-    // A withdrawn page's link may still be tracked by BlueZ's policy plugin, which re-pages HFP
-    // after a supervision-timeout drop (up to ~127 s of retries) with no agent check. Until that
-    // horizon has passed after the link next drops, an HFP link that comes back for this peer
-    // without an open reconnect window for it is withdrawn again (scoped to this peer and HFP AG).
-    struct Withdrawn {
-        std::string path;
-        PeerIdentity identity;
-        std::optional<Clock::time_point> link_down;
-    };
-    static constexpr auto kPageInterval = std::chrono::seconds(30);
-    static constexpr auto kPolicyHorizon = std::chrono::seconds(150);
-    static constexpr std::size_t kMaxWithdrawn = 8;
-    std::optional<Page> page;
-    bool page_requested{};
-    std::vector<std::pair<PeerIdentity, Clock::time_point>> paged_at;
-    std::vector<Withdrawn> withdrawn;
-    static void page_replied(GObject*, GAsyncResult*, gpointer);
-    void dispatch_page();
-    void service_page();
-    void retire_page();
-    void withdraw_link(const std::string& path, const PeerIdentity&);
-    void link_changed(const std::string& path, bool connected);
     void close_window();
     void close_admission();
     void reject_comparison();

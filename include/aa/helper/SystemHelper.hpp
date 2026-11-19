@@ -64,13 +64,12 @@ public:
     virtual core::Result<ObservedPeer> observe() { return Error{ErrorCode::helper_unavailable}; }
     virtual core::Result<State> authorize(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
     virtual core::Result<State> reconnect_peer(std::uint64_t) { return Error{ErrorCode::helper_unavailable}; }
-    // After a successful reconnect_peer() and the caller's lease commit: the backend's outbound
-    // effect for that reconnect (BlueZ: page the phone), rechecked against live authority.
-    virtual void page_reconnected() {}
     virtual core::Result<void> revoke_peer(const PeerIdentity&) { return Error{ErrorCode::helper_unavailable}; }
     virtual void discard(std::uint64_t) {}
     virtual core::Result<ObservedPeer> handoff() { return Error{ErrorCode::helper_rejected}; }
     virtual HandoffFailure handoff_failure() const { return HandoffFailure::none; }
+    // Read-only: an open reconnect window has no bootstrap and the phone has no Bluetooth link.
+    virtual bool awaiting_link() const { return false; }
     virtual void fail_handoff(std::uint64_t, HandoffFailure) {}
     virtual core::Result<void> authorize_handoff(std::uint64_t, bool, bool) { return Error{ErrorCode::helper_rejected}; }
     virtual void snapshot_provider(const SnapshotProvider&) {}
@@ -126,7 +125,9 @@ public:
     core::Result<ApSnapshot> ap_credentials(const std::string&, Source, std::uint64_t);
     core::Result<void> authorize_handoff(const std::string&, Source, std::uint64_t, bool allow, bool ready);
     HandoffFailure handoff_failure(const std::string& sender) {
-        return authenticate(sender) ? backend_.handoff_failure() : HandoffFailure::none;
+        if (!authenticate(sender)) return HandoffFailure::none;
+        const auto failure = backend_.handoff_failure();
+        return failure == HandoffFailure::none && backend_.awaiting_link() ? HandoffFailure::no_bluetooth_link : failure;
     }
     bool transmit_snapshot(const std::string&, SnapshotAuthority, const std::function<void()>&);
     SnapshotDeadline snapshot_deadline() const { return backend_.handoff_deadline(); }

@@ -47,6 +47,10 @@ using SnapshotProvider = std::function<core::Result<ApSnapshot>()>;
 using SnapshotFence = std::function<bool(std::uint64_t, const std::function<void()>&)>;
 enum class HandoffFailure : std::uint32_t {
     none, denied, eligibility, eof, unknown_id, wrong_order, duplicate,
-    oversize, truncated, protobuf, phone_rejected, timeout, write, snapshot, rebind
+    oversize, truncated, protobuf, phone_rejected, timeout, write, snapshot, rebind,
+    // Not a bootstrap failure: an open reconnect window is waiting while the phone has no
+    // Bluetooth link to this head unit, so its Android Auto cannot dial the AA RFCOMM profile.
+    // The helper never pages the phone: the HFP link is owned by infotainment (#160).
+    no_bluetooth_link
 };
 }

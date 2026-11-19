@@ -55,7 +55,6 @@ BluezBackend::Impl::Impl(const std::string& address, Now clock, const std::strin
     g_main_context_pop_thread_default(context);
 }
 BluezBackend::Impl::~Impl() {
-    retire_page();
     close_window();
     (void)unregister_profiles();
     if (agent_registered) {
@@ -146,13 +145,10 @@ void BluezBackend::Impl::reset() {
     release_window();
     allowed.reset(); window = {}; pairing_enabled = false; comparison_accepted = false; acknowledged = false;
     observations.clear(); adapters.clear();
-    // A new (or no) BlueZ owner: its links and pending replies are not ours to withdraw.
-    page.reset(); page_requested = false; withdrawn.clear();
     registered = false; agent_registered = false;
 }
 void BluezBackend::Impl::pump() {
     drain_events();
-    service_page();
     if (comparison && now() >= comparison->deadline) close_admission();
     if (now() >= next_check) {
         const bool alive = current_owner();
@@ -214,6 +210,10 @@ SnapshotDeadline BluezBackend::handoff_deadline() const {
     return impl_->bootstrap ? impl_->bootstrap->deadline() : SnapshotDeadline{impl_->now(), impl_->now};
 }
 HandoffFailure BluezBackend::handoff_failure() const { return impl_->last_failure; }
+bool BluezBackend::awaiting_link() const {
+    return impl_->allowed && !impl_->allowed_link && impl_->now() < impl_->window &&
+           !(impl_->bootstrap && impl_->bootstrap->live());
+}
 void BluezBackend::fail_handoff(std::uint64_t handle, HandoffFailure reason) { impl_->retire(handle, reason); }
 void BluezBackend::snapshot_provider(const SnapshotProvider& provider) { impl_->snapshots = provider; }
 void BluezBackend::snapshot_fence(const SnapshotFence& fence) { impl_->fence = fence; }
@@ -241,8 +241,8 @@ core::Result<void> BluezBackend::authorize_handoff(std::uint64_t handle, bool al
 }
 void BluezBackend::tick() { impl_->pump(); }
 void BluezBackend::discard(std::uint64_t handle) { impl_->observations.erase(handle); }
-void BluezBackend::cleanup() noexcept { impl_->retire_page(); impl_->observations.clear(); impl_->close_window(); }
-void BluezBackend::retire_lease() noexcept { impl_->retire_page(); impl_->close_window(); }
+void BluezBackend::cleanup() noexcept { impl_->observations.clear(); impl_->close_window(); }
+void BluezBackend::retire_lease() noexcept { impl_->close_window(); }
 core::Result<State> BluezBackend::apply(Action action, std::uint32_t channel) {
     if (channel) return Error{ErrorCode::helper_rejected};
     switch (action) {

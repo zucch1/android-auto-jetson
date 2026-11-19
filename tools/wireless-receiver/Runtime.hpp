@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "AdmissionEvents.hpp"
 #include "Media.hpp"
 #include <aa/app/WirelessReceiver.hpp>
 #include <aa/ipc/ControlBusService.hpp>
@@ -155,12 +156,9 @@ struct Runtime final {
                 configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
             }
             if (wants && attempting && !receiver.session() && turn >= attempt_until) {
-                // Not an error code: the attempt deadline passed without a session. Name the phase
-                // it expired in instead of retrying silently: still waiting for AP activation, or
-                // AP handoff begun and no phone session (no bootstrap, AP join or TCP connection).
-                log_line(acquisition
-                    ? "{\"event\":\"wireless_admission_expired\",\"reason\":\"attempt_deadline\",\"phase\":\"ap_activation\"}"
-                    : "{\"event\":\"wireless_admission_expired\",\"reason\":\"attempt_deadline\",\"phase\":\"phone_handoff\"}");
+                // Not an error code: name why the attempt deadline passed instead of retrying
+                // silently (#160). No addresses or identities are logged.
+                log_line(admission_expired_json(acquisition.has_value(), receiver.awaiting_link()));
                 defer();
             }
             if (wants && !receiver.session() && !attempting && turn >= retry) {

@@ -38,11 +38,11 @@ public:
     core::Result<ObservedPeer> observe() override { return bluetooth_.observe(); }
     core::Result<State> authorize(std::uint64_t handle) override { return bluetooth_.authorize(handle); }
     core::Result<State> reconnect_peer(std::uint64_t handle) override { return bluetooth_.reconnect_peer(handle); }
-    void page_reconnected() override { bluetooth_.page_reconnected(); }
     core::Result<void> revoke_peer(const PeerIdentity& peer) override { return bluetooth_.revoke_peer(peer); }
     void discard(std::uint64_t handle) override { bluetooth_.discard(handle); }
     core::Result<ObservedPeer> handoff() override { return bluetooth_.handoff(); }
     HandoffFailure handoff_failure() const override { return bluetooth_.handoff_failure(); }
+    bool awaiting_link() const override { return bluetooth_.awaiting_link(); }
     void fail_handoff(std::uint64_t handle, HandoffFailure reason) override { bluetooth_.fail_handoff(handle, reason); }
     core::Result<void> authorize_handoff(std::uint64_t handle, bool allow, bool ready) override {
         return bluetooth_.authorize_handoff(handle, allow, ready);

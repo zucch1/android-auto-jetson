@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/app/HandoffEligibility.hpp>
 namespace aa::app {
-HandoffOperations handoff_operations(helper::BusClient& client) {
+HandoffOperations handoff_operations(helper::BusClient& client, HandoffWait waiting) {
     return {
-        [&client](HandoffOperations::Validation request) -> core::Result<HandoffObservation> {
+        [&client, waiting](HandoffOperations::Validation request) -> core::Result<HandoffObservation> {
             if (request.handle && request.credentials_allowed) {
                 auto snapshot = client.get_ap_credentials(request.source, request.handle);
                 if (!snapshot) return snapshot.error();
@@ -11,6 +11,7 @@ HandoffOperations handoff_operations(helper::BusClient& client) {
             }
             helper::HandoffFailure failure{};
             auto peer = client.poll_bootstrap(request.source, failure);
+            if (waiting) waiting->store(static_cast<std::uint32_t>(failure));
             if (!peer) return peer.error();
             HandoffObservation observation{peer.value(), std::nullopt};
             if (!request.handle && request.credentials_allowed) {

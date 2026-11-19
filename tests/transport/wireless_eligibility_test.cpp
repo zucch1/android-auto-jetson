@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/app/HandoffEligibility.hpp>
+#include "../../tools/wireless-receiver/AdmissionEvents.hpp"
 #include "../session/Fakes.hpp"
 #include <aa/trust/Identity.hpp>
 #include <gtest/gtest.h>
@@ -276,4 +277,61 @@ TEST(WirelessEligibility, LateOldCompletionCannotReopenOrRetireReplacement) {
     EXPECT_EQ(f.allowed.load(), 2U);
     EXPECT_GT(f.denied.load(), 0U);
 }
+}
+
+// #160: the helper's read-only "no Bluetooth link" wait (HFP is owned by infotainment) reaches the
+// receiver's expiry diagnostics and grants nothing: no phone, listener or authorization.
+TEST(WirelessEligibility, HelperLinkWaitIsReportedWithoutAuthority) {
+    aa::session::test::MapTrustStore trust;
+    std::atomic<bool> link{false};
+    std::atomic<unsigned> authorized{};
+    bool listening{};
+    const aa::helper::ObservedPeer peer{41, {"12:34:56:78:9A:BC", "12:34:56:78:9A:BD"}};
+    trust.set(aa::trust::PhoneIdentity{aa::trust::identity_key(aa::trust::TransportIdentity{
+        aa::trust::WirelessIdentity{peer.identity.address, peer.identity.adapter}})}, aa::trust::Decision::approved);
+    aa::app::HandoffOperations operations{
+        [](aa::app::HandoffOperations::Validation) -> aa::core::Result<aa::app::HandoffObservation> {
+            return aa::Error{aa::ErrorCode::helper_rejected};
+        },
+        [&](aa::helper::Source, std::uint64_t, bool) -> aa::core::Result<void> { ++authorized; return {}; },
+        [](aa::helper::Source, std::uint64_t) -> aa::core::Result<void> { return {}; }};
+    aa::app::HandoffEligibilityCoordinator coordinator{trust, std::move(operations),
+        {[&](const aa::helper::ApSnapshot&) -> aa::core::Result<void> { listening = true; return {}; },
+         [&] { listening = false; }}};
+    coordinator.wait_source([&] {
+        return link.load() ? aa::helper::HandoffFailure::none : aa::helper::HandoffFailure::no_bluetooth_link;
+    });
+    const auto eventually = [&](const std::function<bool()>& predicate) {
+        for (int i = 0; i < 100; ++i) {
+            coordinator.tick();
+            if (predicate()) return true;
+            std::this_thread::sleep_for(5ms);
+        }
+        return false;
+    };
+    coordinator.consumer(aa::core::ConsumerId{7});
+    coordinator.begin({7, 0});
+    EXPECT_FALSE(coordinator.awaiting_link());
+    ASSERT_TRUE(eventually([&] { return coordinator.awaiting_link(); }));
+    EXPECT_FALSE(coordinator.admitting());
+    EXPECT_FALSE(coordinator.phone().has_value());
+    EXPECT_FALSE(listening);
+    EXPECT_EQ(authorized.load(), 0U);
+    // The link arrives (infotainment's HFP): the next observation clears the report.
+    link = true;
+    ASSERT_TRUE(eventually([&] { return !coordinator.awaiting_link(); }));
+    link = false;
+    ASSERT_TRUE(eventually([&] { return coordinator.awaiting_link(); }));
+    coordinator.begin({7, 0});
+    EXPECT_FALSE(coordinator.awaiting_link()) << "a new attempt starts without a stale report";
+}
+TEST(WirelessEligibility, AdmissionExpiryEventNamesThePhaseWithoutIdentities) {
+    using aa::wireless_receiver::admission_expired_json;
+    EXPECT_EQ(admission_expired_json(true, true),
+        R"json({"event":"wireless_admission_expired","reason":"attempt_deadline","phase":"ap_activation"})json");
+    EXPECT_EQ(admission_expired_json(false, true),
+        R"json({"event":"wireless_admission_expired","reason":"no_bluetooth_link","phase":"bluetooth_link",)json"
+        R"json("detail":"waiting for HFP (owned by infotainment)"})json");
+    EXPECT_EQ(admission_expired_json(false, false),
+        R"json({"event":"wireless_admission_expired","reason":"attempt_deadline","phase":"phone_handoff"})json");
 }

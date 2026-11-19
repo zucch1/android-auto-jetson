@@ -100,6 +100,19 @@ infer the other's wire enum.
 
 ## Authorization and credential release
 
+### Bluetooth link dependency (#160)
+
+The phone dials the AA RFCOMM profile only over an existing Bluetooth (HFP) link,
+which infotainment owns; neither the helper nor the receiver creates or tears it
+down. While a reconnect window is open with no bootstrap and `Device1.Connected`
+is false for that phone, `PollBootstrapV1` still rejects, with `local_failure` =
+`no_bluetooth_link` (15, appended in contract 1.5.0; diagnostics only, it grants
+and withholds nothing). The receiver reports an expired attempt as
+`{"event":"wireless_admission_expired","reason":"no_bluetooth_link","phase":"bluetooth_link","detail":"waiting for HFP (owned by infotainment)"}`;
+other expiries are `reason` `attempt_deadline` with `phase` `ap_activation` (AP
+not yet active) or `phone_handoff` (link present, no phone session). No address
+or identity is logged.
+
 The receiver uses only authenticated `PollBootstrapV1`,
 `AuthorizeBootstrapV1`, and `GetAPCredentialsV1`. Task37 adds no helper methods
 beyond those. The receiver never reads the root-only `ap.credentials` file and

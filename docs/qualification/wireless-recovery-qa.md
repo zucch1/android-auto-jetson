@@ -7,6 +7,28 @@ there is no passing real-phone baseline or full-scope qualification receipt.
 The schema support below does not change those outcomes. Parent-supplied actual
 target receipts and explicit owner sign-off are still required for closure.
 
+## HFP link (operator step, #160)
+
+Wireless admission needs a Bluetooth HFP link between the phone and the Jetson:
+only then does the phone's Android Auto dial the AA RFCOMM profile. The
+infotainment system owns that link; the helper and receiver never create it. Until
+infotainment (or a future connect service) brings it up, a wireless test window
+must bring HFP up explicitly, after the receiver is running and before the AP
+handoff is expected:
+
+```sh
+tools/wireless-qa/aa-hfp-link-test-only.sh connect "<phone Bluetooth alias>"
+# ... window ...
+tools/wireless-qa/aa-hfp-link-test-only.sh disconnect "<phone Bluetooth alias>"
+```
+
+Without it, every attempt expires as
+`wireless_admission_expired` with `reason` `no_bluetooth_link` ("waiting for HFP
+(owned by infotainment)"). Also unplug the phone's USB cable from the Jetson
+first: Android Auto suppresses wireless setup while it believes a USB head unit
+is attached ("Ignoring wireless setup event because of USB accessory device
+attached", window 3, 2026-11-18).
+
 ## Run
 
 ```sh

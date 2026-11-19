@@ -11,16 +11,20 @@ class WirelessReceiver final {
 public:
     WirelessReceiver(WiredSessionDeps deps, helper::BusClient& helper, WirelessLink::Config config)
         : helper_(helper), ap_channel_(config.ap_channel), link_(deps, std::move(config)),
-          eligibility_(deps.trust, handoff_operations(helper),
+          eligibility_(deps.trust, handoff_operations(helper, wait_),
               {[this](const helper::ApSnapshot& snapshot) { return link_.listen(snapshot); },
                [this] { link_.close_admission(); }}),
           confirmation_(helper, [this] { return active(); }, [this](core::ConsumerId) {
               eligibility_.tick(active());
               eligibility_.consumer(std::nullopt);
-          }) {}
+          }) {
+        eligibility_.wait_source([wait = wait_] { return static_cast<helper::HandoffFailure>(wait->load()); });
+    }
     ~WirelessReceiver() { stop(); }
     helper::Confirmation& confirmation() { return confirmation_; }
     WiredSession* session() const { return link_.session(); }
+    // Diagnostics: this attempt waited with no Bluetooth link to the phone (HFP is infotainment's).
+    [[nodiscard]] bool awaiting_link() const { return eligibility_.awaiting_link(); }
     // The acquiring source becomes the helper AP lease; drive this AP's handoff
     // with begin(source). reconnect() resets the lease to the empty source and
     // must precede, not follow, acquisition (docs/wireless-handoff.md).
@@ -65,6 +69,8 @@ public:
 private:
     helper::BusClient& helper_;
     std::uint32_t ap_channel_;
+    // Declared before eligibility_: its operations write the helper's wait reason here.
+    HandoffWait wait_{std::make_shared<std::atomic<std::uint32_t>>(0)};
     WirelessLink link_;
     HandoffEligibilityCoordinator eligibility_;
     WirelessConfirmation confirmation_;

@@ -7,8 +7,6 @@ void BluezBackend::Impl::drain_events() {
 }
 void BluezBackend::Impl::lost_path(const std::string& path) {
     ++incarnations[path];
-    // Link or bond continuity is gone: the page's authority with it.
-    if (page && (page->peer.device.path == path || page->peer.device.adapter_path == path)) retire_page();
     const auto matches = [&](const Observation& observed) {
         return observed.device.path == path || observed.device.adapter_path == path;
     };
@@ -55,9 +53,9 @@ void BluezBackend::Impl::watch_continuity() {
                     if (std::string_view{name} == "Paired" || std::string_view{name} == "Bonded" ||
                         std::string_view{name} == "Connected") lost = true;
                 }
+                if (self.allowed && self.allowed->device.path == path &&
+                    g_variant_lookup(changed, "Connected", "b", &value) && value) self.allowed_link = true;
                 if (lost) self.lost_path(path);
-                // After lost_path(): a page it withdrew is tracked from this very drop.
-                if (g_variant_lookup(changed, "Connected", "b", &value)) self.link_changed(path, value != FALSE);
             }
             g_variant_unref(changed); g_variant_unref(invalidated);
         }, this, nullptr);

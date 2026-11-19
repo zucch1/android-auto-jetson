@@ -2,6 +2,7 @@
 #include "Platform.hpp"
 #include "../crypto_adapter/Crypto.hpp"
 #include <algorithm>
+#include <iostream>
 
 namespace aa::helper {
 namespace {
@@ -124,6 +125,7 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     // resurrected or stale approval into an admission.
     std::erase(impl_->awaiting, observed->device.identity);
     impl_->allowed = *observed;
+    impl_->allowed_link = true; // an enrolment window, not a reconnect waiting for a link
     impl_->pairing_enabled = true;
     impl_->comparison_used = false;
     impl_->comparison_accepted = false;
@@ -145,23 +147,20 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     // Already-admitted bonds need no write or fsync, so they keep working when
     // persistence later fails; if durability is still unconfirmed, retry the
     // directory fsync once before refusing.
-    if (!observed || !impl_->exact(*observed, true) || !impl_->admitted(observed->device.identity))
+    Impl::Device live{};
+    if (!observed || !impl_->exact(*observed, true, &live) || !impl_->admitted(observed->device.identity))
         return Error{ErrorCode::helper_rejected};
-    // A page owned for another identity ends with this window's authority.
-    if (impl_->page && impl_->page->peer.device.identity != observed->device.identity) impl_->retire_page();
     impl_->close_window();
     impl_->allowed = *observed;
+    impl_->allowed_link = live.connected;
     impl_->window = impl_->now() + std::chrono::seconds(60);
-    // The AA profile is a server: the bonded phone initiates RFCOMM, but only over a live link.
-    // page_reconnected() pages its HFP Audio Gateway once the caller has committed the lease.
-    // No generic Device1.Connect (which could activate unrelated audio profiles) is used.
-    impl_->page_requested = true;
+    // The AA profile is a server: the bonded phone initiates RFCOMM, and its Android Auto does
+    // so only over a live Bluetooth link. The helper never pages the phone or touches HFP:
+    // infotainment owns that link (#160). No generic Device1.Connect or ConnectProfile is used.
+    if (!live.connected)
+        std::cerr << "system-helper: reconnect window open; waiting for a Bluetooth (HFP) link to the phone, "
+                     "which infotainment owns\n";
     return State::active;
-}
-void BluezBackend::page_reconnected() {
-    if (!impl_->page_requested) return;
-    impl_->page_requested = false;
-    impl_->dispatch_page();
 }
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     // Authority: an admitted bond, a revoked (historical) one, or an open enrolment's journal entry
@@ -179,8 +178,6 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     if ((impl_->allowed && impl_->allowed->device.identity == identity) ||
         (impl_->connected && impl_->connected->device.identity == identity)) impl_->close_window();
     std::erase(impl_->awaiting, identity);
-    // A page for this identity loses its authority now; a link it created is withdrawn.
-    if (impl_->page && impl_->page->peer.device.identity == identity) impl_->retire_page();
     // Demoted first: once forgotten, the bond is never admitted (services, reconnect) again and is
     // never taken as acceptance of a later enrolment of the same identity. Success only once every
     // write is confirmed durable; otherwise the receiver retries.

@@ -334,24 +334,12 @@ std::size_t state_number(MockBluez& mock, const char* key) {
     const auto at = state.find(std::string{"\""} + key + "\": ");
     return at == std::string::npos ? 0U : std::stoul(state.substr(at + std::string{key}.size() + 4));
 }
-// The mock's ordered log of every link-affecting Device1 call (Connect, ConnectProfile,
-// DisconnectProfile), read after a dispatch barrier: a synchronous inventory on the helper's own
-// connection, which the mock answers only after every message the helper sent before it.
-std::string link_calls(helper::BluezBackend& backend, MockBluez& mock) {
+// Every Device1/Adapter1 call the mock received (logged at message ingress, full object paths),
+// read after a dispatch barrier: a synchronous inventory on the helper's own connection, which
+// the mock answers only after every earlier message from it.
+std::string bluez_device_calls(helper::BluezBackend& backend, MockBluez& mock) {
     if (const auto barrier = backend.observe()) backend.discard(barrier.value().handle);
-    return mock.command("calls");
-}
-constexpr auto kPage = "ConnectProfile dev_02_00_00_00_00_01 0000111f-0000-1000-8000-00805f9b34fb";
-constexpr auto kWithdraw = "DisconnectProfile dev_02_00_00_00_00_01 0000111f-0000-1000-8000-00805f9b34fb";
-// Pumps the backend until the mock's call log reads `expected` (async replies and withdrawals).
-bool settles(helper::BluezBackend& backend, MockBluez& mock, const std::string& expected) {
-    using namespace std::chrono_literals;
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        backend.tick();
-        if (link_calls(backend, mock) == expected) return true;
-        std::this_thread::sleep_for(10ms);
-    }
-    return false;
+    return mock.command("ingress");
 }
 const helper::PeerIdentity primary_peer{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
 bool peer_in(const std::string& directory, const char* file) {
@@ -371,10 +359,8 @@ std::string bluez_callback(helper::BluezBackend& backend, MockBluez& mock, const
 void expect_refused_everywhere(helper::BluezBackend& backend, MockBluez& mock) {
     const auto obs = backend.observe();
     ASSERT_TRUE(obs);
-    const auto before = link_calls(backend, mock);
     EXPECT_FALSE(backend.reconnect_peer(obs.value().handle)) << "a forgotten phone reconnected";
-    backend.page_reconnected();
-    EXPECT_EQ(link_calls(backend, mock), before) << "a forgotten phone was paged";
+    EXPECT_FALSE(backend.awaiting_link()) << "a refused reconnect opened a window";
     EXPECT_EQ(bluez_callback(backend, mock, "NewConnection"), "rejected")
         << "a forgotten phone got the Android Auto profile";
     EXPECT_EQ(bluez_callback(backend, mock, "AuthorizeService"), "rejected")
@@ -679,18 +665,16 @@ TEST_F(ManagedBonds, NormalRestartAfterSuccessfulSyncAdmitsLoadedEntries) {
     const auto early = restarted.observe();
     ASSERT_TRUE(early);
     EXPECT_FALSE(restarted.reconnect_peer(early.value().handle)) << "admitted before the first reconciliation";
-    restarted.page_reconnected();
-    EXPECT_EQ(link_calls(restarted, mock), "") << "a refused reconnect paged the phone";
     ASSERT_TRUE(restarted.reconcile_bonds({primary}));
     const auto reconn_obs = restarted.observe();
     ASSERT_TRUE(reconn_obs);
     EXPECT_TRUE(restarted.reconnect_peer(reconn_obs.value().handle));
 }
 
-// Approved-reconnect paging (#160): the page is bound to the exact admitted observation,
-// rechecked at dispatch, rate limited per peer, and withdrawn (profile-scoped) when its authority
-// ends, including after a late reply and after BlueZ's own policy reconnects it.
-class ReconnectPage : public ManagedBonds {
+// #160 (owner, 2026-11-18): infotainment owns the phone's HFP link. An approved reconnect never
+// pages, connects or disconnects the phone (no Device1 call at all); it only reports, read-only,
+// that its window waits for a Bluetooth link. The AA fences are unchanged.
+class ReconnectLink : public ManagedBonds {
 protected:
     std::unique_ptr<MockBluez> mock;
     std::unique_ptr<helper::BluezBackend> backend;
@@ -717,90 +701,69 @@ protected:
             [this] { return std::chrono::steady_clock::now() + offset; }, dir, ::getuid());
         ASSERT_TRUE(backend->apply(helper::Action::register_profile, 0));
         ASSERT_TRUE(backend->reconcile_bonds({primary_peer}));
-        ASSERT_EQ(link_calls(*backend, *mock), "");
+        ASSERT_EQ(calls(), "") << "enrolment and admission made a Device1 call";
     }
     void TearDown() override { backend.reset(); mock.reset(); ManagedBonds::TearDown(); }
-    // One approved reconnect as SystemHelper runs it: reconnect, (lease commit), then page.
     bool reconnect() {
         const auto obs = backend->observe();
-        if (!obs || !backend->reconnect_peer(obs.value().handle)) return false;
-        backend->page_reconnected();
-        return true;
+        return obs && backend->reconnect_peer(obs.value().handle);
     }
-    std::string calls() { return link_calls(*backend, *mock); }
-    bool settle(const std::string& expected) { return settles(*backend, *mock, expected); }
+    std::string calls() { return bluez_device_calls(*backend, *mock); }
 };
-TEST_F(ReconnectPage, PagesOnlyThePhonesHandsFreeGatewayOnceAndNeverGenericConnect) {
+TEST_F(ReconnectLink, WithoutALinkTheWindowWaitsAndNoDeviceCallIsMade) {
     ASSERT_TRUE(reconnect());
-    EXPECT_EQ(calls(), kPage) << "exactly one scoped page of the observed phone";
-    ASSERT_TRUE(settle(kPage));
-    // Renewals while the page holds the link page nothing more.
-    ASSERT_TRUE(reconnect()); ASSERT_TRUE(reconnect());
-    EXPECT_EQ(calls(), kPage);
+    EXPECT_TRUE(backend->awaiting_link());
+    EXPECT_EQ(backend->handoff_failure(), helper::HandoffFailure::none) << "a wait is not a bootstrap failure";
+    for (int retry = 0; retry < 5; ++retry) ASSERT_TRUE(reconnect());
+    backend->tick();
+    EXPECT_EQ(calls(), "") << "the helper paged, connected or disconnected the phone";
+    // Window expiry ends the wait report, still without any call.
+    offset += std::chrono::seconds(61);
+    backend->tick();
+    EXPECT_FALSE(backend->awaiting_link());
+    backend->retire_lease();
+    EXPECT_EQ(calls(), "");
 }
-TEST_F(ReconnectPage, AnExistingLinkIsNotPagedOrWithdrawn) {
+TEST_F(ReconnectLink, AnExistingOrArrivingLinkIsReportedAndLeftAlone) {
     ASSERT_EQ(mock->command("link-up"), "ok");
     ASSERT_TRUE(reconnect());
-    EXPECT_EQ(calls(), "");
+    EXPECT_FALSE(backend->awaiting_link());
+    ASSERT_EQ(mock->command("link-down"), "ok");
+    ASSERT_TRUE(reconnect());
+    EXPECT_TRUE(backend->awaiting_link());
+    // Infotainment brings HFP up: the open window sees the link, and touches nothing.
+    ASSERT_EQ(mock->command("connected-true"), "ok");
+    for (int i = 0; i < 20 && backend->awaiting_link(); ++i) {
+        backend->tick(); std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    EXPECT_FALSE(backend->awaiting_link());
     backend->retire_lease();
-    EXPECT_EQ(calls(), "") << "a link the helper did not create is never withdrawn";
-}
-TEST_F(ReconnectPage, FailedPagesAreRateLimitedPerPeerIndependentOfRetries) {
-    ASSERT_EQ(mock->command("fail-page"), "ok");
-    ASSERT_TRUE(reconnect());
-    ASSERT_TRUE(settle(kPage));
-    for (int retry = 0; retry < 5; ++retry) ASSERT_TRUE(reconnect());
-    EXPECT_EQ(calls(), kPage) << "fast receiver retries must not page again within the interval";
-    backend->retire_lease();
-    EXPECT_EQ(calls(), kPage) << "a failed page owns no link to withdraw";
-    offset += std::chrono::seconds(31);
-    ASSERT_TRUE(reconnect());
-    EXPECT_EQ(calls(), std::string{kPage} + ";" + kPage);
-}
-TEST_F(ReconnectPage, ForgetWithdrawsTheLinkThePageCreatedAndPagesNoMore) {
-    ASSERT_TRUE(reconnect());
-    ASSERT_TRUE(settle(kPage));
     ASSERT_TRUE(backend->revoke_peer(primary_peer));
-    const auto withdrawn = std::string{kPage} + ";" + kWithdraw;
-    EXPECT_TRUE(settle(withdrawn)) << calls();
-    offset += std::chrono::seconds(31);
-    EXPECT_FALSE(reconnect()) << "a forgotten phone reconnected";
-    backend->page_reconnected();
-    EXPECT_EQ(calls(), withdrawn) << "the call log advanced after Forget";
+    EXPECT_EQ(calls(), "") << "lease retirement or Forget disconnected the phone's link";
 }
-TEST_F(ReconnectPage, ALateReplyAfterLeaseRetirementIsWithdrawn) {
-    ASSERT_EQ(mock->command("slow-page 300"), "ok");
-    ASSERT_TRUE(reconnect());
-    backend->retire_lease();
-    EXPECT_EQ(calls(), kPage) << "nothing to withdraw before BlueZ answers";
-    EXPECT_TRUE(settle(std::string{kPage} + ";" + kWithdraw)) << calls();
-}
-TEST_F(ReconnectPage, ContinuityLossBetweenObservationAndDispatchSendsNoPage) {
-    const auto obs = backend->observe();
-    ASSERT_TRUE(obs);
-    ASSERT_TRUE(backend->reconnect_peer(obs.value().handle));
-    ASSERT_EQ(mock->command("recreate"), "ok");  // the device object was replaced
-    backend->page_reconnected();
+TEST_F(ReconnectLink, TheAaFencesStillRefuseAForgottenPhoneWithALink) {
+    ASSERT_EQ(mock->command("link-up"), "ok");
+    ASSERT_TRUE(backend->revoke_peer(primary_peer));
+    expect_refused_everywhere(*backend, *mock);
     EXPECT_EQ(calls(), "");
 }
-TEST_F(ReconnectPage, BluezPolicyReconnectOfAWithdrawnPageIsWithdrawnAgainWithinItsHorizon) {
-    ASSERT_TRUE(reconnect());
-    ASSERT_TRUE(settle(kPage));
-    backend->retire_lease();
-    auto expected = std::string{kPage} + ";" + kWithdraw;
-    ASSERT_TRUE(settle(expected)) << calls();
-    // The link drops on a supervision timeout and BlueZ's policy plugin pages HFP again.
-    ASSERT_EQ(mock->command("connected-false"), "ok");
-    ASSERT_EQ(mock->command("connected-true"), "ok");
-    expected += std::string{";"} + kWithdraw;
-    EXPECT_TRUE(settle(expected)) << calls();
-    // Past BlueZ's retry horizon after that drop, a new link is not the helper's to withdraw.
-    ASSERT_EQ(mock->command("connected-false"), "ok");
-    ASSERT_TRUE(settle(expected));
-    offset += std::chrono::seconds(151);
-    ASSERT_EQ(mock->command("connected-true"), "ok");
-    backend->tick();
-    EXPECT_EQ(calls(), expected);
+
+// #160: no production source (helper, receiver, shared libraries) names a BlueZ method that
+// creates or drops a link; only the test-only operator tool in tools/wireless-qa may.
+TEST(NoLinkCalls, ProductionSourcesNeverNameBluezLinkMethods) {
+    namespace fs = std::filesystem;
+    const fs::path root{AA_HELPER_SOURCE};
+    std::size_t scanned = 0;
+    for (const auto* top : {"src", "include", "tools/wireless-receiver", "tools/wired-receiver"}) {
+        for (const auto& entry : fs::recursive_directory_iterator(root / top)) {
+            if (!entry.is_regular_file()) continue;
+            const auto text = file_text(entry.path().string());
+            ++scanned;
+            for (const auto* method : {"\"Connect\"", "\"ConnectProfile\"", "\"DisconnectProfile\"", "\"Disconnect\""})
+                EXPECT_EQ(text.find(method), std::string::npos) << entry.path() << " names " << method;
+        }
+    }
+    EXPECT_GT(scanned, 50U);
 }
 
 // Finding B: revocation demotes the admitted bond to history and keeps it in BlueZ (#136). A fresh

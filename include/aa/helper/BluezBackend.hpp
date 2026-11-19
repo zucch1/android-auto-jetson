@@ -25,7 +25,6 @@ public:
     core::Result<ObservedPeer> observe() override;
     core::Result<State> authorize(std::uint64_t) override;
     core::Result<State> reconnect_peer(std::uint64_t) override;
-    void page_reconnected() override;
     core::Result<void> revoke_peer(const PeerIdentity&) override;
     void discard(std::uint64_t) override;
     void cleanup() noexcept override;
@@ -34,6 +33,7 @@ public:
     core::Result<ObservedPeer> handoff() override;
     SnapshotDeadline handoff_deadline() const override;
     HandoffFailure handoff_failure() const override;
+    bool awaiting_link() const override;
     void fail_handoff(std::uint64_t, HandoffFailure) override;
     core::Result<void> authorize_handoff(std::uint64_t, bool, bool) override;
     void snapshot_provider(const SnapshotProvider&) override;

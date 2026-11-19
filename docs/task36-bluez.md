@@ -85,37 +85,17 @@ human-mediated during explicit enrollment only, never automatically approved.
    the explicit window. Approved reconnect still requires a fresh observation,
    exact full store lookup on its owner thread and actual BlueZ Paired=true AND
    Bonded=true. Missing Bonded is rejected, never treated as an implicit bond.
-   It enables incoming AA service authorization and, because a bonded phone's
-   Android Auto dials the AA RFCOMM profile only over a live link (Jetson windows
-   2/3, 2026-11-18), pages that phone's HFP Audio Gateway
-   (`Device1.ConnectProfile(0000111f)`). Never re-pairing and never generic
-   Device1.Connect, Disconnect or RemoveDevice. The page:
-   - leaves only after the reconnect lease is committed, and only after a fresh
-     effect-boundary recheck: same BlueZ owner, device/adapter incarnations,
-     Paired+Bonded, admitted, and the window still open;
-   - is skipped when the phone already has a link (not ours to own or withdraw);
-   - is rate limited to one per peer per 30 s, independent of receiver retries;
-   - is asynchronous; its outcome (`connected` / `failed <D-Bus error name>`) is
-     journalled without addresses;
-   - is owned: lease retirement, receiver loss, Forget, link or bond continuity
-     loss end its authority, and a link it created is withdrawn with the
-     profile-scoped `DisconnectProfile(0000111f)`, including when the reply
-     arrives after retirement;
-   - stays guarded after withdrawal: BlueZ's policy plugin tracks the HFP service
-     and re-pages it after a supervision-timeout drop without any agent check
-     (BlueZ 5.72 `plugins/policy.c`). Until 150 s after that peer's link next
-     drops, an HFP link that comes back without an open reconnect window for that
-     peer is withdrawn again.
-
-   Residual with BlueZ 5.72 (no per-device D-Bus control): the policy plugin's
-   reconnect entry for the device persists after the guard's horizon, exactly as
-   for any HFP link the phone itself opened before this change; only the
-   adapter-wide `[Policy] ReconnectUUIDs` setting removes it, which is a shared
-   adapter (infotainment) decision. A BR/EDR `EHOSTDOWN` may fall back to an LE
-   ATT connection when BlueZ knows the device as LE-capable (`src/device.c`); the
-   A26 is stored `SupportedTechnologies=BR/EDR;` with no IRK, so BlueZ cannot learn
-   LE support for it from its resolvable private address. No D-Bus bearer
-   preference exists in 5.72 to forbid the fallback in general. Targetless action9 is rejected.
+   It enables only incoming AA service authorization, never re-pairing and never
+   generic Device1.Connect. **HFP dependency (#160, owner 2026-11-18):** a bonded
+   phone's Android Auto dials the AA RFCOMM profile only over a live Bluetooth
+   link (it did so every ~5 s while the enrolment's HFP link was up and never
+   after it dropped; Jetson windows 2/3, 2026-11-18). That HFP link is owned by
+   the infotainment system (or a future connect service). The helper and receiver
+   never page, connect or disconnect the phone: no `Connect`, `ConnectProfile` or
+   `DisconnectProfile`. They only report, read-only from `Device1.Connected`, that
+   a reconnect window is waiting with no link (`no_bluetooth_link`). Until
+   infotainment provides the link, wireless tests bring HFP up as an explicit
+   operator step (`tools/wireless-qa/aa-hfp-link-test-only.sh`). Targetless action9 is rejected.
 6. NewConnection validates the real Unix-FD index, duplicates and owns one socket,
    rejects wrong/duplicate connections, and closes it on RequestDisconnection,
    cancel, idle expiry, owner change, receiver loss and teardown. Task37 now
