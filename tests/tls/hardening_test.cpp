@@ -787,3 +787,36 @@ TEST(TlsHardening, ConnectAndListenRefuseHostnames) {
         EXPECT_TRUE(v6);
     }
 }
+
+// Sol review of #164: a null host reached getaddrinfo, binding the wildcard
+// address on listen and passing null to OpenSSL IP verification on connect.
+TEST(TlsHardening, ConnectAndListenRejectNullAndEmptyHost) {
+    namespace tr = aa::transport;
+    using namespace std::chrono_literals;
+    for (const char* host : {static_cast<const char*>(nullptr), ""}) {
+        SCOPED_TRACE(host == nullptr ? "null" : "empty");
+        auto listener = tr::TlsListener::listen(host, 0,
+            [](const tr::TlsPeerInfo&) { return true; },
+            tr::TlsMode::encryption_only_compatibility);
+        ASSERT_FALSE(listener);
+        EXPECT_EQ(listener.error().code(), aa::ErrorCode::invalid_argument);
+    }
+    auto listener = tr::TlsListener::listen("127.0.0.1", 0,
+        [](const tr::TlsPeerInfo&) { return true; },
+        tr::TlsMode::encryption_only_compatibility);
+    ASSERT_TRUE(listener);
+    const auto port = listener.value()->port();
+    for (const char* host : {static_cast<const char*>(nullptr), ""}) {
+        for (const auto mode : {tr::TlsMode::encryption_only_compatibility,
+                                tr::TlsMode::verified_peer_test_only}) {
+            SCOPED_TRACE(host == nullptr ? "null" : "empty");
+            auto bounded = tr::TlsTransport::connect(host, port, [] { return true; }, mode,
+                {std::chrono::steady_clock::now() + 2s, {}});
+            ASSERT_FALSE(bounded);
+            EXPECT_EQ(bounded.error().code(), aa::ErrorCode::invalid_argument);
+            auto defaulted = tr::TlsTransport::connect(host, port, [] { return true; }, mode);
+            ASSERT_FALSE(defaulted);
+            EXPECT_EQ(defaulted.error().code(), aa::ErrorCode::invalid_argument);
+        }
+    }
+}

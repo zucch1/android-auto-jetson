@@ -44,6 +44,7 @@ class TlsTransport final : public Transport {
 
     // `host` must be a numeric IPv4/IPv6 address: name lookup cannot honour
     // the deadline or cancellation, so a hostname fails transport_unavailable.
+    // A null or empty host fails invalid_argument before any resolution.
     [[nodiscard]] static core::Result<std::unique_ptr<TlsTransport>>
     connect(const char *host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode);
 
@@ -97,7 +98,8 @@ class TlsListener final {
   public:
     using ApprovedPredicate = std::function<bool(const TlsPeerInfo&)>;
 
-    // `host` must be a numeric address, as for TlsTransport::connect().
+    // `host` must be a non-empty numeric address, as for TlsTransport::connect();
+    // a null host never means the wildcard address.
     [[nodiscard]] static core::Result<std::unique_ptr<TlsListener>>
     listen(const char *host, std::uint16_t port, ApprovedPredicate approved, TlsMode mode);
 

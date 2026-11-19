@@ -82,6 +82,9 @@ TlsTransport::connect(const char* host, std::uint16_t port,
 core::Result<std::unique_ptr<TlsTransport>>
 TlsTransport::connect(const char* host, std::uint16_t port,
                       ApprovedPredicate approved, TlsMode mode, const core::Deadline& deadline) {
+    // A null host would make getaddrinfo pick loopback and reach OpenSSL's IP
+    // verification as a null pointer; an empty host is never a peer address.
+    if (host == nullptr || *host == '\0') return Error{ErrorCode::invalid_argument};
     if (auto checked = deadline.check(); !checked) return checked.error();
     // Numeric addresses only: getaddrinfo name lookup is synchronous and
     // would escape both the deadline and cancellation. Real peers (phone, AP
