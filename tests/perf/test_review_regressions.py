@@ -267,6 +267,12 @@ def log_integrity():
     missing = integrity.assess_generations(framed + "### gen2\n### missing\n")
     assert not missing["complete"] and missing["per_generation"]["gen1"]["complete"]
     assert not missing["per_generation"]["gen2"]["complete"]
+    # #90 review 5: exactly one line follows "### last"; a malformed line
+    # there, even one followed by the completion record, is incomplete.
+    for extra in ("{bad", "not json", "[1]"):
+        two = framed.replace("### last\n", "### last\n" + extra + "\n")
+        assert not integrity.assess_generations(two)["complete"], extra
+    assert not integrity.assess_generations(framed + json.dumps(clean) + "\n")["complete"]
 
 
 if __name__ == "__main__":

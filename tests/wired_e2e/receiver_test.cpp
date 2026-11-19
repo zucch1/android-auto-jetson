@@ -7087,8 +7087,10 @@ TEST(WiredReceiver, RuntimeDiagnosticsAndAudioReopenKeepTimingOnStalledStdout) {
 
     // When: ConcreteAudioRenderWorker encounters a sink write error (triggering
     // audio_stall_bypass + reopen + publish_bypass_logs + log_sink_selected("reopen"))
-    // while stdout is blocked and full, audio submission and recovery must keep
-    // within the 200 ms audio-latency gate.
+    // while stdout is blocked and full, each audio submission still returns
+    // within the 200 ms audio-latency gate, and the recovery completes without
+    // waiting on stdout. The 1500 ms idle bound only detects a worker blocked
+    // on the stalled sink; it is not a latency claim (#90 review 5).
     auto gate = std::make_shared<RenderGate>();
     gate->first_write_delay = std::chrono::milliseconds{0};
     gate->fail_first_write = true;
@@ -8007,6 +8009,56 @@ TEST(WiredReceiver, StdoutLogDropSummaryNeverSplitsAChunkedRecord) {
     EXPECT_NE(probe.bytes.find(record + "\n"), std::string::npos) << "a drop summary split the record";
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"media_telemetry_dropped\""), 2U);
     EXPECT_FALSE(log.finish());
+}
+
+// #90 review 5 P3: an oversize record whose tail chunk times out at shutdown
+// is ended on its own line and counted once, whether or not a record follows.
+TEST(WiredReceiver, StdoutLogTimedOutOversizeTailEndsItsLineAndCountsOnce) {
+    for (const bool later_record : {true, false}) {
+        SCOPED_TRACE(later_record ? "a record follows" : "nothing follows");
+        LogWriteProbe probe;
+        LogWriteProbe::active = &probe;
+        struct ProbeGuard {
+            LogWriteProbe &p;
+            ~ProbeGuard() { p.release(); LogWriteProbe::active = nullptr; }
+        } probe_guard{probe};
+        std::atomic<bool> running{true};
+        aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write,
+                                          &aa::wired_receiver::StdoutLog::Clock::now, {},
+                                          std::chrono::milliseconds{100}, true};
+        // Given: the first chunk fills the queue and stalls in the sink, and
+        // the owner is stopping, so the tail chunk's wait for space is bounded.
+        const std::string record =
+            "{\"big\":\"" + std::string(aa::wired_receiver::StdoutLog::byte_capacity, 'x') + "\"}";
+        std::error_code cut;
+        std::thread producer([&] { cut = log.submit(record); });
+        ASSERT_TRUE(wait_probe_calls(probe, 1));
+        running.store(false);
+        producer.join();
+        ASSERT_EQ(cut, std::make_error_code(std::errc::timed_out));
+        // When: the sink recovers (and, in one case, another record follows).
+        probe.release();
+        if (later_record) {
+            // Once the first chunk is out, the queue has room again.
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+            while (log.outstanding().first != 0 && std::chrono::steady_clock::now() < until) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            }
+            ASSERT_EQ(log.outstanding().first, 0U);
+            EXPECT_FALSE(log.submit("{\"next\":1}"));
+        }
+        (void)log.finish(std::chrono::seconds{2});
+        const std::lock_guard lock(probe.mutex);
+        const auto head = record.substr(0, aa::wired_receiver::StdoutLog::byte_capacity);
+        // Then: the partial record ends its own line, the next record parses on
+        // its own line, and the loss is counted exactly once.
+        EXPECT_NE(probe.bytes.find(head + "\n"), std::string::npos) << "the cut record was never ended";
+        if (later_record) {
+            EXPECT_NE(probe.bytes.find("\n{\"next\":1}\n"), std::string::npos);
+        }
+        EXPECT_NE(probe.bytes.find("\"shutdown_dropped\":1,"), std::string::npos)
+            << probe.bytes.substr(probe.bytes.rfind('{'));
+    }
 }
 
 // #90 review 4 P2: finish() giving up while the worker writes its final

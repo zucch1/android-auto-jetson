@@ -144,6 +144,14 @@ public:
             s.waiting = false;
 #endif
             if (s.error || s.closed || !admitted) {
+                if (s.chunked && !admitted && !s.error && !s.closed) {
+                    // The tail timed out (counted in shutdown_dropped): the worker
+                    // ends the partial line once its queued chunks are out, so
+                    // the next record never joins it (#90 review 5).
+                    s.cut = true;
+                    s.cut_end = s.pushed;
+                    s.changed.notify_all();
+                }
                 s.chunked = false;
                 if (!admitted && !s.error && !s.closed) { return shutdown_error(); }
                 // A producer woken by an abandoning finish() always sees ESHUTDOWN;
@@ -379,6 +387,10 @@ private:
         bool abandoned = false;
         bool chunked = false; // an oversize record is mid-admission
         bool mid_record = false; // the worker wrote a chunk that did not end its record
+        bool cut = false;          // a timed-out oversize record must be ended by the worker
+        std::uint64_t cut_end = 0; // ...after this many entries were written
+        std::uint64_t pushed = 0;  // entries ever queued
+        std::uint64_t popped = 0;  // entries ever written
         std::size_t undelivered = 0;
         bool shutdown_expired = false; // a shutdown-time wait for space ran out
         std::uint64_t shutdown_dropped = 0;
@@ -401,6 +413,7 @@ private:
             return charge <= byte_capacity - bytes && queue.size() < entry_capacity;
         }
         bool stopping() const { return running && !running->load(); }
+        bool cut_ready() const { return cut && popped == cut_end; }
         // Waits for room for `charge`. Unbounded while the owner is running
         // (issue #60); bounded by `shutdown_wait` once it is not. Returns false
         // only when the shutdown bound expired with the queue still full.
@@ -448,6 +461,7 @@ private:
         void push(std::string_view record, std::size_t charge) { push(record, charge, now()); }
         void push(std::string_view record, std::size_t charge, Clock::time_point at) {
             enqueued.push_back(at);
+            ++pushed;
             queue.emplace_back(charge, '\n');
             record.copy(queue.back().data(), record.size());
             bytes += charge;
@@ -604,15 +618,26 @@ private:
     static void drain(const std::shared_ptr<State> &state) {
         for (;;) {
             std::unique_lock lock(state->mutex);
-            while (!state->closed && state->queue.empty()) {
+            while (!state->closed && state->queue.empty() && !state->cut_ready()) {
                 if (!write_summaries(state, lock, false)) { return; }
-                if (state->closed || !state->queue.empty()) { break; }
+                if (state->closed || !state->queue.empty() || state->cut_ready()) { break; }
                 // A throttled summary is retried once its interval can elapse.
                 if (state->summary_pending()) {
                     state->changed.wait_for(lock, media_summary_interval);
                 } else {
                     state->changed.wait(lock);
                 }
+            }
+            if (state->cut_ready()) {
+                // Every chunk of a record cut short by a timed-out tail is out:
+                // end its line (its loss is already counted) before anything else.
+                state->cut = false;
+                if (state->mid_record) {
+                    state->mid_record = false;
+                    lock.unlock();
+                    if (!write_all(state, "\n")) { return; }
+                }
+                continue;
             }
             state->promote_parked();
             if (state->queue.empty()) {
@@ -644,6 +669,7 @@ private:
             state->mid_record = front.empty() || front.back() != '\n';
             state->bytes -= front.size();
             state->queue.pop_front();
+            ++state->popped;
             state->max_lag = std::max(state->max_lag, state->now() - state->enqueued.front());
             state->enqueued.pop_front();
             if (state->abandoned) {

@@ -1349,6 +1349,71 @@ TEST(WiredReceiver, VideoOutletThrottlesFailedFocusNotificationAcrossDroppedAus)
     EXPECT_EQ(outlet.idr_snapshot().total_requests, 0u);
 }
 
+// #90 review 5: the producer logs its own wait transition, so a stall where
+// every IDR request fails (no idr_requested ever) still opens an episode.
+TEST(WiredReceiver, VideoOutletLogsTheProducerWaitEvenWhenEveryIdrRequestFails) {
+    auto steady_now = std::chrono::steady_clock::time_point{std::chrono::seconds{70}};
+    std::size_t failed = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        {},
+        [&steady_now] { return steady_now; },
+        [&failed](bool) -> aa::core::Result<void> {
+            ++failed;
+            return aa::Error{aa::ErrorCode::transport_io};
+        },
+        aa::ipc::IdrRecoveryStrategy::auto_escalate,
+    });
+    const auto count = [&](const std::string& line) {
+        return static_cast<std::size_t>(std::count(logs.begin(), logs.end(), line));
+    };
+    const std::string started =
+        aa::ipc::idr_wait_started_json("producer", "waiting_idr");
+
+    // The initial IDR passes before any consumer; the late consumer then only
+    // sees P-frames, so the producer waits, and the request fails.
+    std::vector<std::byte> idr_bytes(10, std::byte{0});
+    idr_bytes.insert(idr_bytes.end(), wiredtest::kVideoIdr.begin(), wiredtest::kVideoIdr.end());
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 1, {100}}, idr_bytes}));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    std::vector<std::byte> p_frame(16, std::byte{0x41});
+    p_frame[0] = std::byte{0x00};
+    p_frame[1] = std::byte{0x00};
+    p_frame[2] = std::byte{0x01};
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 2, {200}}, p_frame}));
+    ASSERT_EQ(failed, 1u);
+    EXPECT_EQ(count(started), 1u);
+
+    // Retries inside the same wait (and an external request) fail too: still
+    // one transition record, and never a request record.
+    for (int i = 0; i < 4; ++i) {
+        steady_now += std::chrono::milliseconds{300};
+        ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 3u + static_cast<std::uint64_t>(i),
+                                        {300}}, p_frame}));
+    }
+    steady_now += std::chrono::milliseconds{300};
+    (void)outlet.request_idr_external("consumer_ipc");
+    EXPECT_GT(failed, 1u);
+    EXPECT_EQ(count(started), 1u);
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& line) {
+        return line.find("\"event\":\"idr_wait_started\"") != std::string::npos;
+    }), 1);
+    EXPECT_EQ(std::count_if(logs.begin(), logs.end(), [](const std::string& line) {
+        return line.find("\"event\":\"idr_requested\"") != std::string::npos;
+    }), 0);
+
+    // Once recovered, the next wait (an external request) logs its own transition.
+    ASSERT_TRUE(outlet.on_message({{p::ChannelRole::video, 20, {400}}, idr_bytes}));
+    ASSERT_TRUE(pair.value().consumer.receive(Milliseconds{500}));
+    steady_now += std::chrono::milliseconds{2000};
+    (void)outlet.request_idr_external("consumer_ipc");
+    EXPECT_EQ(count(aa::ipc::idr_wait_started_json("producer", "consumer_ipc")), 1u);
+}
+
 TEST(WiredReceiver, VideoSelectionWatchdogEmitsOnceAfterTimeoutAndResets) {
     using aa::ipc::kVideoSelectionWarningTimeout;
     using aa::ipc::VideoSelectionWatchdog;

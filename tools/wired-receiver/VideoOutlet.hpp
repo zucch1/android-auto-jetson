@@ -146,7 +146,7 @@ public:
             return false;
         }
         const auto now = now_locked();
-        idr_coordinator_.begin_wait(now);
+        begin_idr_wait_locked(now, reason);
         return dispatch_idr_request_locked(lock, now, reason);
     }
 
@@ -593,12 +593,21 @@ private:
             return {};
         }
         const auto now = now_locked();
-        idr_coordinator_.begin_wait(now);
+        begin_idr_wait_locked(now, reason);
         const auto dispatched = dispatch_idr_request_locked(lock, now, reason);
         if (!dispatched && dispatched.error().code() == ErrorCode::channel_focus_restore_failed) {
             return dispatched.error();
         }
         return {};
+    }
+
+    // The wait transition is logged before any request (#90 review 5), so a
+    // producer stall where every request fails still opens an episode.
+    void begin_idr_wait_locked(std::chrono::steady_clock::time_point now, std::string_view reason) {
+        if (!idr_coordinator_.waiting()) {
+            log_(ipc::idr_wait_started_json("producer", reason));
+        }
+        idr_coordinator_.begin_wait(now);
     }
 
     [[nodiscard]] core::Result<bool> dispatch_idr_request_locked(

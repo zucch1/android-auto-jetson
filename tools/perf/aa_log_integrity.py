@@ -133,7 +133,7 @@ def assess_generations(text: str) -> dict:
                     generations[-1]["framed"] = True
             else:
                 generations.append({"name": marker[4:].strip(), "events": [], "framed": False,
-                                    "last": None})
+                                    "last": None, "after_last": 0})
             continue
         if not generations or not raw.strip():
             continue
@@ -143,7 +143,10 @@ def assess_generations(text: str) -> dict:
             event = None
         current = generations[-1]
         if current["framed"]:
-            current["last"] = event if current["last"] is None else False  # one line only
+            # Exactly one line follows "### last" (#90 review 5): count lines,
+            # so a malformed one cannot be replaced by a later valid record.
+            current["after_last"] += 1
+            current["last"] = event if current["after_last"] == 1 else False
         elif isinstance(event, dict):
             current["events"].append(event)
     results = []

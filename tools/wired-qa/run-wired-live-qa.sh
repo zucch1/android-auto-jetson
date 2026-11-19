@@ -247,6 +247,11 @@ display_pid="$(remote "mkfifo ${REMOTE_QA_DIR_Q}/aa-disp.in && { nohup $(shq "$D
 projection="false"
 session_active="false"; video="false"; audio="false"; input="false"
 status_request=0
+# Whether the display answered a status request (correlated by id). The
+# request is only sent once the receiver's video_sent record is seen, so a
+# missing video is display evidence only when the display answered: its
+# painted-frame count is cumulative and does not depend on the receiver log.
+display_answered=false
 deadline=$(( start_ms + PROJECTION_TIMEOUT_MS ))
 poll_remote() {
     local remaining=$((deadline - $(date +%s%3N)))
@@ -266,6 +271,7 @@ while (( $(date +%s%3N) < deadline )); do
         status_request=$(( status_request + 1 ))
         request_id="q${$}r${status_request}"
         status="$(poll_remote "printf 'status ${request_id}\n' > ${REMOTE_QA_DIR_Q}/aa-disp.in 2>/dev/null; sleep 0.3; grep '\"request\":\"${request_id}\"' ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>/dev/null | tail -1" || true)"
+        [[ "$status" == *"\"request\":\"${request_id}\""* ]] && display_answered=true
         if [[ "$status" =~ \"frames_painted\":([0-9]+) ]] && ((BASH_REMATCH[1] > 0)) && [[ "$status" == *'"render_ok":true'* ]]; then
             video="true"
         fi
@@ -312,16 +318,17 @@ else
 fi
 log_audit="$(printf '%s\n' "$log_stream" | python3 -I "$INTEGRITY_TOOL" generations)" || log_audit=""
 # The display's telemetry log must end with its single completion record: its
-# SIGTERM path drains the writer first (#90 review 4).
-display_last="$(remote "grep '^{' ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>/dev/null | tail -n 1; echo '### end'" 2>/dev/null)" || display_last=""
+# SIGTERM path drains the writer first (#90 review 4). Exactly one line names
+# telemetry_complete, and it is the last record (#90 review 5).
+display_last="$(remote "f=${REMOTE_QA_DIR_Q}/aa-wired-display.log; [ -r \"\$f\" ] || exit 1; grep -cF '\"event\":\"telemetry_complete\"' \"\$f\"; echo '### last'; grep '^{' \"\$f\" | tail -n 1; echo '### end'" 2>/dev/null)" || display_last=""
 display_complete=false
-if [[ "$display_last" == *"### end"* ]] && python3 -I -c '
+if [[ "$display_last" == *"### end"* && "${display_last%%$'\n'*}" == 1 ]] && python3 -I -c '
 import json, sys
 try:
     sys.exit(0 if json.loads(sys.argv[1]) == {"event": "telemetry_complete"} else 1)
 except ValueError:
     sys.exit(1)
-' "${display_last%%$'\n'### end*}"; then
+' "$(sed -n '/^### last$/{n;p;q}' <<< "$display_last")"; then
     display_complete=true
 fi
 log_audit="${log_audit%%$'\n'*}"  # the overall line (one receiver log here)
@@ -335,8 +342,16 @@ fi
 if [[ "$projection" != "true" || "$session_active" != "true" || "$video" != "true" ||
       "$audio" != "true" || "$input" != "true" ]]; then
     # D-Bus projection is independent of the log; the other observables are
-    # log records (active is state, audio media, input runtime).
-    if [[ "$evidence_doubtful" == true && "$projection" == true ]]; then
+    # log records (active is state, audio media, input runtime). Missing video
+    # rests on the receiver log only when the display never answered (its
+    # status request waits for video_sent); an answer with no painted frames is
+    # display evidence, and receiver loss cannot excuse it (#90 review 5).
+    receiver_missing=false
+    if [[ "$session_active" != true || "$audio" != true || "$input" != true ||
+          ( "$video" != true && "$display_answered" != true ) ]]; then
+        receiver_missing=true
+    fi
+    if [[ "$evidence_doubtful" == true && "$projection" == true && "$receiver_missing" == true ]]; then
         if log_flag complete; then reason="receiver_log_lost_or_late"; else reason="receiver_log_incomplete"; fi
         write_result "BLOCKED" "$reason" "$projection" "$video" "$audio" "$input" "$budget_ms"
         exit 3

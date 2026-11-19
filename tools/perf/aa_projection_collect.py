@@ -763,9 +763,11 @@ class EventParser:
         assert self.cutoff_ns is not None
         stamp = aa_log_integrity.emit_ns(event)
         if stamp is None and envelope in ("video_ipc_send", "video_ipc_receive",
-                                          "video_decode_completed"):
-            # Video endpoints carry their own monotonic measurement times.
-            value = event.get("observed_ns" if envelope != "video_decode_completed" else "completed_ns")
+                                          "video_decode_completed", "video_presented"):
+            # Video endpoints carry their own monotonic measurement times; the
+            # display's video_presented (ProjectionWidget) has no emit_ns.
+            value = event.get("observed_ns" if envelope in ("video_ipc_send", "video_ipc_receive")
+                              else "completed_ns")
             if type(value) is int and value > 0:
                 stamp = value
         if stamp is None:

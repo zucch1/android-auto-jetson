@@ -396,9 +396,53 @@ class RecoveryQaGates(unittest.TestCase):
         # restarted one is clean; the audit reads both.
         env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
                                     "FAKE_LOG_AUDIT_gen1": self.audit(runtime_dropped=1, state_overflow=1)}
-        code, doc = self.run_qa(["--only", "receiver_restart"], **env)
+        code, doc = self.run_qa(["--only", "usb_unplug_replug,receiver_restart"], **env)
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        # Then: the row that ran on the first generation is BLOCKED...
+        self.assertEqual(code, 3, doc)
+        self.assertTrue(rows["usb_unplug_replug"]["detail"].startswith("receiver_state_log_lost"), doc)
+        # ...and the restart row, whose log evidence all came from the
+        # restarted generation (the dip is seen by PID), stands (#90 review 5).
+        self.assertEqual(rows["receiver_restart"]["status"], "PASS", doc)
+
+    # #90 review 5 P2: the unknown-phone row reads only its own admission
+    # attempt's log; loss in the live receiver's log cannot taint it.
+    def test_unknown_phone_is_judged_by_its_attempt_log_only(self) -> None:
+        env = self.passing_env() | {"FAKE_ADB_COUNT": "2",
+                                    "FAKE_LOG_AUDIT": self.audit(runtime_dropped=1, state_overflow=1,
+                                                                 max_delivery_lag_ms=900),
+                                    "FAKE_LOG_AUDIT_attempt": self.CLEAN}
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assertEqual(code, 0, doc)
+        self.assertEqual(doc["scenarios"][0]["status"], "PASS", doc)
+        # And: loss in the attempt's own log still blocks its PASS.
+        env["FAKE_LOG_AUDIT_attempt"] = self.audit(runtime_dropped=1, state_overflow=1)
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
         self.assertEqual(code, 3, doc)
         self.assertTrue(doc["scenarios"][0]["detail"].startswith("receiver_state_log_lost"), doc)
+
+    # #90 review 5 P2: a rejection whose content failed the row (here it names
+    # the approved phone's port) is confirmed even when the row also ran past
+    # its deadline and the attempt's log was delivered late.
+    def test_confirmed_rejection_failure_past_the_deadline_survives_log_lag(self) -> None:
+        wrong_port = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                      '"phone_id":"id-second","port":"1-2.1"}')
+        # The attempt's log is read in time; the clock then passes the deadline
+        # before the row is recorded.
+        env = self.passing_env() | {"FAKE_ADB_COUNT": "2", "FAKE_TERMINAL_MS": "6000",
+                                    "FAKE_ATTEMPT_LOG": wrong_port,
+                                    "FAKE_LOG_AUDIT": self.audit(max_delivery_lag_ms=900)}
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["scenarios"][0]["status"], "FAILED", doc)
+        self.assertEqual(doc["scenarios"][0]["evidence"], "rejection+approved_port", doc)
+        self.assertEqual(doc["scenarios"][0]["detail"], "recovery_exceeded_budget", doc)
+        # While a passing rejection that arrived past the deadline is timed by
+        # the late log, so it is inconclusive rather than a confirmed miss.
+        env["FAKE_ATTEMPT_LOG"] = self.passing_env()["FAKE_ATTEMPT_LOG"]
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["scenarios"][0]["detail"], "receiver_log_late:recovery_exceeded_budget", doc)
 
     def test_receiver_restart_archives_the_previous_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -418,10 +462,17 @@ class RecoveryQaGates(unittest.TestCase):
     # #90 review 4 P1: a receiver generation missing from the audit (a failed
     # archive rename, a deleted log) is incomplete, never silently skipped.
     def test_missing_receiver_generation_blocks(self) -> None:
-        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_LOG_MISSING": "gen1"}
-        code, doc = self.run_qa(["--only", "receiver_restart"], **env)
-        self.assertEqual(code, 3, doc)
-        self.assertTrue(doc["scenarios"][0]["detail"].startswith("receiver_log_incomplete"), doc)
+        # A missing generation blocks every row that used it: the first row
+        # ran on gen1, and the restart row reads only the restarted gen2
+        # (#90 review 5 scoping).
+        for missing, row in (("gen1", "usb_unplug_replug"), ("gen2", "receiver_restart")):
+            with self.subTest(missing=missing):
+                env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                            "FAKE_LOG_MISSING": missing}
+                code, doc = self.run_qa(["--only", "usb_unplug_replug,receiver_restart"], **env)
+                rows = {r["name"]: r for r in doc["scenarios"]}
+                self.assertEqual(code, 3, doc)
+                self.assertTrue(rows[row]["detail"].startswith("receiver_log_incomplete"), doc)
 
     # #90 review 4 P1: log_complete proves a log complete only as its single
     # terminal record.

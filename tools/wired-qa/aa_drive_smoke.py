@@ -356,10 +356,17 @@ def analyze(receiver: list[dict], display: list[dict], sidecar: list[dict] | Non
     # removes the criterion's input.
     if fps["passed"] is False and (display_lost or (profile is None and receiver_state)):
         tainted["painted_fps_per_window"] = "display_log_incomplete" if display_lost else "receiver_state_log_lost"
-    # A lost request or recovery can open or close an episode: either way.
-    if receiver_state or display_lost or unstamped or sidecar_issue:
+    # A lost request or recovery can open or close an episode: either way. A
+    # missing sidecar only removes the runner's own copy: with complete,
+    # stamped logs a confirmed episode stays FAIL (#90 review 5). A mismatch
+    # means the log lacks an IDR record the runner saw, which could close an
+    # episode early, so it taints a failure too.
+    sidecar_taint = sidecar_issue
+    if sidecar_issue == "idr_sidecar_missing" and by_name["waiting_idr_max"]["passed"] is False:
+        sidecar_taint = None
+    if receiver_state or display_lost or unstamped or sidecar_taint:
         tainted["waiting_idr_max"] = ("idr_events_unstamped" if unstamped else
-                                      sidecar_issue if sidecar_issue else
+                                      sidecar_taint if sidecar_taint else
                                       "display_log_incomplete" if display_lost else "receiver_state_log_lost")
     # An observed disconnect or terminal error is confirmed; absence is not.
     drop = by_name["no_session_drop"]

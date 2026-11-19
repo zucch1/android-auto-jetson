@@ -745,6 +745,9 @@ scenario_receiver_restart() {
     restart_ns="$(target_now_ns)" ||
         { record receiver_restart FAILED "" "" "" media_boundary_unavailable; return; }
     start_receiver || { record receiver_restart FAILED "" "" "" "restart_failed"; return; }
+    # From here every log record this row reads comes from the restarted
+    # generation (the dip was observed by PID): only it can taint the row.
+    SCENARIO_GEN_LO="$RECEIVER_GENERATION"
     # start_receiver launches with `> /tmp/aa-wired-receiver.log` (truncate):
     # the pre-restart offset points past EOF in the fresh log and would miss
     # genuine post-recovery media. The evidence window is the fresh log from
@@ -950,6 +953,9 @@ scenario_unknown_phone() {
     # on ITS port with the same store. The link-error record of that attempt
     # carries the rejected attempt's identity+port (additive fields).
     arm_scenario || { record unknown_phone FAILED "" "" "" timing_error_clock; return; }
+    # The row's only log evidence is the attempt's own log, never the live
+    # receiver's: an empty generation range leaves just the attempt.
+    SCENARIO_GEN_LO=$(( RECEIVER_GENERATION + 1 ))
     drive_admission_attempt "${d2_port}"
     local window attribution phone_id attempt_port
     window="$(attempt_window)"
@@ -1230,9 +1236,11 @@ log_taint() { # status detail evidence -> prints the taint reason, or nothing
         recovery_exceeded_budget)
             # Only a deadline decided by log-timed evidence can be an artifact
             # of late delivery; a D-Bus or process observation ("not_recovered",
-            # a dip seen by PID) is a confirmed miss.
+            # a dip seen by PID) is a confirmed miss, and so is a rejection
+            # whose content failed it (approved or other port, activation):
+            # only the passing attributed rejection is timed by its log.
             case "$evidence" in
-                *pump*|*input*|*media*|*rejection*|dip+*)
+                *pump*|*input*|*media*|attributed_rejection|dip+*)
                     if log_flag late_delivery; then echo receiver_log_late; fi ;;
             esac ;;
     esac

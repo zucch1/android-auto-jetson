@@ -176,6 +176,9 @@ case "$cmd" in
         # telemetry_complete (#90 review 4), unless the case says otherwise.
         if [[ "$cmd" == *"kill 4343"* && "${FAKE_NO_TELEMETRY_COMPLETE:-0}" != 1 ]]; then
             printf '%s\n' '{"event":"telemetry_complete"}' >> "$FAKE_TARGET/aa-wired-display.log"
+            # A second completion record (#90 review 5): the first was not terminal.
+            [[ "${FAKE_TELEMETRY_COMPLETE_TWICE:-0}" != 1 ]] ||
+                printf '%s\n' '{"event":"telemetry_complete"}' >> "$FAKE_TARGET/aa-wired-display.log"
         fi
         bash -c 'kill() { printf "kill %s\n" "$*" >> "$FAKE_SSH_LOG"; [[ "$1" != -0 ]]; }; '"$cmd"
         exit $? ;;
@@ -317,6 +320,38 @@ class LiveQaGates(unittest.TestCase):
         code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
                                 FAKE_STATE='string "projecting"', FAKE_NO_TELEMETRY_COMPLETE="1")
         self.assertEqual((code, doc["status"], doc["blocked_on"]), (3, "BLOCKED", "display_log_incomplete"), doc)
+
+    def test_display_completion_record_must_be_single(self) -> None:
+        # Two completion records, the last one terminal: the first was not.
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                FAKE_STATE='string "projecting"', FAKE_TELEMETRY_COMPLETE_TWICE="1")
+        self.assertEqual((code, doc["status"], doc["blocked_on"]), (3, "BLOCKED", "display_log_incomplete"), doc)
+
+    # #90 review 5 P2: the display answered every status request with no
+    # painted frames, and every receiver observable was seen: receiver log lag
+    # or loss cannot downgrade that confirmed display failure.
+    def test_display_failure_survives_receiver_log_lag(self) -> None:
+        for counts in ({"max_delivery_lag_ms": 900}, {"media_backpressure": 1}):
+            with self.subTest(**counts):
+                # The budget lets audio and input arrive despite each status
+                # request's wait: video is the only missing observable.
+                code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                        FAKE_STATE='string "projecting"', FAKE_FRAMES_PAINTED="0",
+                                        FAKE_LOG_COMPLETE=self.complete(**counts))
+                self.assertEqual((code, doc["status"], doc["blocked_on"]),
+                                 (4, "FAILED", "observable_missing"), doc)
+                obs = doc["observables"]
+                self.assertEqual((obs["video_present"], obs["audio_present"], obs["input_evidence"]),
+                                 (False, True, True), obs)
+        # But a missing video the display never answered for (its status
+        # request waits for the receiver's video_sent record, or the reply was
+        # not this request's) still rests on the receiver log: lag keeps it BLOCKED.
+        for extra in ({"FAKE_OBS_VIDEO": "0"}, {"FAKE_STATUS_UNCORRELATED": "1"}):
+            with self.subTest(**extra):
+                code, doc = self.run_qa(False, FAKE_STATE='string "projecting"',
+                                        FAKE_LOG_COMPLETE=self.complete(max_delivery_lag_ms=900), **extra)
+                self.assertEqual((code, doc["status"], doc["blocked_on"]),
+                                 (3, "BLOCKED", "receiver_log_lost_or_late"), doc)
 
     def test_status_reply_must_answer_this_request(self) -> None:
         # A status line that does not carry this request's id (an older line)

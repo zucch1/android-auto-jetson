@@ -211,6 +211,17 @@ class AnalyzerTests(unittest.TestCase):
         failing.write_sidecar = False
         self.assertNotEqual(self.analyze(failing)["verdict"], "PASS")
 
+    def test_missing_sidecar_keeps_a_confirmed_idr_failure_failed(self) -> None:
+        # Review 5 (#90): complete raw logs confirm a 2.5 s recovered episode.
+        # The sidecar only adds what the runner saw; its absence cannot shorten
+        # an episode both complete logs show, so the failure stays FAIL.
+        failing = Run(duration=30).idr("producer", 5.0, 2.5)
+        failing.write_sidecar = False
+        result = self.analyze(failing)
+        self.assertEqual(result["verdict"], "FAIL", result.get("blocked_on"))
+        self.assertIs(criterion(result, "waiting_idr_max")["passed"], False)
+        self.assertNotIn("inconclusive", criterion(result, "waiting_idr_max"))
+
     def test_unresolved_wait_with_every_request_failed_fails(self) -> None:
         # The consumer logs the wait transition itself (idr_wait_started); no
         # request ever succeeded and the wait never recovered.
