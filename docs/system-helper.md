@@ -335,7 +335,10 @@ last reference is released (`nm::psk_variant`), instead of
 remains the wiped string documented for the handoff path. Residual copies
 outside the helper's control: GDBus's serialized message buffer, kernel socket
 buffers and NetworkManager's own copy. `LimitCORE=0` in the unit keeps all of
-them out of core dumps.
+them out of core dumps. `G_DBUS_DEBUG=message` or `payload` would make GDBus print
+every sent body, the PSK included, so the unit sets `UnsetEnvironment=G_DBUS_DEBUG`
+and `main()` also drops the variable before any GLib or GDBus use, logging one
+line (never the value) when it was set.
 
 ## Loss handling and bounds
 
