@@ -28,7 +28,7 @@ struct HandoffEligibilityCoordinator::Impl {
     std::optional<trust::PhoneIdentity> phone;
     std::optional<helper::ApSnapshot> snapshot;
     std::uint64_t handle{}, retired_handle{};
-    bool active{}, completed{}, confirming{}, link_wait{};
+    bool active{}, completed{}, confirming{};
     // 950ms evidence + <=25ms owner scheduling + <=25ms synchronous stop <=1s.
     Clock::time_point expires{Clock::time_point::max()}, establishment{}, grace{Clock::time_point::max()};
     // From the first observation of `handle`: the bootstrap's own budget (#161).
@@ -36,7 +36,6 @@ struct HandoffEligibilityCoordinator::Impl {
     Timing timing;
     std::optional<std::future<Reply>> pending;
     std::optional<Job> denial, withdrawal;
-    std::function<helper::HandoffFailure()> waiting;
 
     Impl(const trust::TrustStore& store, HandoffOperations ops, Listener target, Timing bounds)
         : trust(store), operations(std::move(ops)), listener(std::move(target)), timing(bounds) {}
@@ -79,10 +78,8 @@ struct HandoffEligibilityCoordinator::Impl {
         if (!reply.result) {
             // A server-side RFCOMM peer may not have connected yet. Keep only
             // initial observation bounded by establishment; all later errors retire.
-            if (reply.job.operation == Operation::observe && reply.result.error().code() == ErrorCode::helper_rejected) {
-                link_wait = waiting && waiting() == helper::HandoffFailure::no_bluetooth_link;
+            if (reply.job.operation == Operation::observe && reply.result.error().code() == ErrorCode::helper_rejected)
                 return;
-            }
             retire(); return;
         }
         const auto fresh_until = reply.job.started + 950ms;
@@ -98,7 +95,6 @@ struct HandoffEligibilityCoordinator::Impl {
                 trust::WirelessIdentity{observed.peer.identity.address, observed.peer.identity.adapter}});
             if (!key) { retire(); return; }
             phone = trust::PhoneIdentity{key.value()};
-            link_wait = false;
             if (!trusted() || !live_consumer()) { retire(); return; }
             snapshot = observed.snapshot;
             stage = Stage::preparing;
@@ -172,7 +168,6 @@ void HandoffEligibilityCoordinator::begin(helper::Source source) {
     impl_->expires = Clock::time_point::max();
     impl_->grace = Clock::time_point::max();
     impl_->active = false;
-    impl_->link_wait = false;
 }
 void HandoffEligibilityCoordinator::consumer(std::optional<core::ConsumerId> live) {
     impl_->consumer = live;
@@ -196,10 +191,6 @@ bool HandoffEligibilityCoordinator::admitting() const { return impl_->valid() &&
 bool HandoffEligibilityCoordinator::valid_session() const { return impl_->valid(); }
 std::optional<trust::PhoneIdentity> HandoffEligibilityCoordinator::phone() const { return impl_->phone; }
 std::uint64_t HandoffEligibilityCoordinator::epoch() const { return impl_->epoch.load(); }
-bool HandoffEligibilityCoordinator::awaiting_link() const { return impl_->link_wait; }
-void HandoffEligibilityCoordinator::wait_source(std::function<helper::HandoffFailure()> source) {
-    impl_->waiting = std::move(source);
-}
 std::uint64_t HandoffEligibilityCoordinator::snapshot_generation() const {
     return impl_->snapshot ? impl_->snapshot->generation : 0;
 }

@@ -11,20 +11,16 @@ class WirelessReceiver final {
 public:
     WirelessReceiver(WiredSessionDeps deps, helper::BusClient& helper, WirelessLink::Config config)
         : helper_(helper), ap_channel_(config.ap_channel), link_(deps, std::move(config)),
-          eligibility_(deps.trust, handoff_operations(helper, wait_),
+          eligibility_(deps.trust, handoff_operations(helper),
               {[this](const helper::ApSnapshot& snapshot) { return link_.listen(snapshot); },
                [this] { link_.close_admission(); }}),
           confirmation_(helper, [this] { return active(); }, [this](core::ConsumerId) {
               eligibility_.tick(active());
               eligibility_.consumer(std::nullopt);
-          }) {
-        eligibility_.wait_source([wait = wait_] { return static_cast<helper::HandoffFailure>(wait->load()); });
-    }
+          }) {}
     ~WirelessReceiver() { stop(); }
     helper::Confirmation& confirmation() { return confirmation_; }
     WiredSession* session() const { return link_.session(); }
-    // Diagnostics: this attempt waited with no Bluetooth link to the phone (HFP is infotainment's).
-    [[nodiscard]] bool awaiting_link() const { return eligibility_.awaiting_link(); }
     // A phone's bootstrap is in progress (bounded): don't defer or retry the attempt (#161).
     [[nodiscard]] bool bootstrapping() const { return eligibility_.bootstrapping(); }
     // The acquiring source becomes the helper AP lease; drive this AP's handoff
@@ -42,7 +38,16 @@ public:
             return Error{ErrorCode::ipc_consumer_rejected};
         eligibility_.consumer(state.consumer);
         eligibility_.begin(source);
+        last_source_ = source;
         return {};
+    }
+    // Diagnostics for an expired attempt, asked of the helper now (GetBootstrapWaitV1, bounded
+    // ~1 s, read only): no_bluetooth_link when the open window's phone has no Bluetooth link.
+    // Any error (including a 1.4 helper without the member) is "unknown" and claims nothing.
+    [[nodiscard]] helper::BootstrapWait link_wait() {
+        if (!last_source_) return helper::BootstrapWait::none;
+        const auto wait = helper_.bootstrap_wait(*last_source_);
+        return wait ? wait.value() : helper::BootstrapWait::none;
     }
     core::Result<void> reconnect(ipc::ControlService& control, const trust::TransportIdentity& identity) {
         const auto state = control.state();
@@ -62,7 +67,7 @@ public:
         return result;
     }
     void stop() {
-        eligibility_.retire(); link_.stop(); confirmation_.flush(true);
+        eligibility_.retire(); link_.stop(); confirmation_.flush(true); last_source_.reset();
     }
     [[nodiscard]] bool active() const {
         const auto* session = link_.session();
@@ -71,8 +76,7 @@ public:
 private:
     helper::BusClient& helper_;
     std::uint32_t ap_channel_;
-    // Declared before eligibility_: its operations write the helper's wait reason here.
-    HandoffWait wait_{std::make_shared<std::atomic<std::uint32_t>>(0)};
+    std::optional<helper::Source> last_source_;
     WirelessLink link_;
     HandoffEligibilityCoordinator eligibility_;
     WirelessConfirmation confirmation_;

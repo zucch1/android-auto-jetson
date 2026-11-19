@@ -22,6 +22,11 @@ tools/wireless-qa/aa-hfp-link-test-only.sh connect "<phone Bluetooth alias>"
 tools/wireless-qa/aa-hfp-link-test-only.sh disconnect "<phone Bluetooth alias>"
 ```
 
+The tool exits 0 only after it has confirmed the result in WirePlumber's bluez5
+device profile (`headset-head-unit*`); `Device1.Connected` alone is not HFP (BlueZ
+5.72 may satisfy `ConnectProfile` with an LE ATT link on a dual-mode phone). A
+failed or unverified connect or disconnect exits 1.
+
 Without it, every attempt expires as
 `wireless_admission_expired` with `reason` `no_bluetooth_link` ("waiting for HFP
 (owned by infotainment)"). Also unplug the phone's USB cable from the Jetson

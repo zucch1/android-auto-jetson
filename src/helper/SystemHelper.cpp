@@ -176,6 +176,12 @@ core::Result<void> SystemHelper::revoke_peer(const std::string& sender, const Pe
     if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
     return backend_.revoke_peer(identity);
 }
+core::Result<BootstrapWait> SystemHelper::bootstrap_wait(const std::string& sender, Source source) {
+    if (!authenticate(sender) || !source.generation || !lease_) return Error{ErrorCode::helper_rejected};
+    if (*lease_ != Source{} && *lease_ != source) return Error{ErrorCode::helper_rejected};
+    if (*lease_ == Source{} && source.confirmation) return Error{ErrorCode::helper_rejected};
+    return backend_.awaiting_link() ? BootstrapWait::no_bluetooth_link : BootstrapWait::none;
+}
 core::Result<ObservedPeer> SystemHelper::poll_handoff(const std::string& sender, Source source) {
     if (!authenticate(sender) || !source.generation || !lease_) return Error{ErrorCode::helper_rejected};
     if (*lease_ != Source{} && *lease_ != source) return Error{ErrorCode::helper_rejected};

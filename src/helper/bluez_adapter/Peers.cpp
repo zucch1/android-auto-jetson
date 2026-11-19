@@ -124,8 +124,8 @@ core::Result<State> BluezBackend::authorize(std::uint64_t handle) {
     // after an acknowledgement) clears it, so a window that closes without acceptance cannot turn a
     // resurrected or stale approval into an admission.
     std::erase(impl_->awaiting, observed->device.identity);
+    impl_->lost_link.reset();  // an enrolment window is not the lost reconnect window
     impl_->allowed = *observed;
-    impl_->allowed_link = true; // an enrolment window, not a reconnect waiting for a link
     impl_->pairing_enabled = true;
     impl_->comparison_used = false;
     impl_->comparison_accepted = false;
@@ -154,10 +154,8 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     // A retry for the phone whose window is still open changes nothing: the window is opened
     // at most once per 60 s, and a bootstrap in progress keeps running (#161).
     if (impl_->allowed && impl_->allowed->device.identity == identity && !impl_->pairing_enabled &&
-        impl_->now() < impl_->window) {
-        impl_->allowed_link = impl_->allowed_link || live.connected;
+        impl_->now() < impl_->window)
         return State::active;
-    }
     // A lapsed window reopens; this phone's bootstrap (running, or completed and awaiting the
     // receiver's confirmation) survives it. Any other phone's bootstrap is aborted, which
     // shuts its RFCOMM channel down so that phone can retry.
@@ -166,15 +164,20 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
         impl_->close_admission();
     else
         impl_->close_window();
+    // A fresh window starts without the previous exchange's outcome: PollBootstrapV1 reports a
+    // failure of this window's bootstrap only. A previous exchange that is not kept above was
+    // denied, so the retained object is dead (handoff() would otherwise re-read its failure).
+    if (impl_->bootstrap && !impl_->bootstrap->live() && !impl_->bootstrap->complete()) impl_->bootstrap.reset();
+    impl_->last_failure = HandoffFailure::none;
+    impl_->lost_link.reset();
     impl_->allowed = *observed;
-    impl_->allowed_link = live.connected;
     impl_->window = impl_->now() + std::chrono::seconds(60);
     // The AA profile is a server: the bonded phone initiates RFCOMM, and its Android Auto does
     // so only over a live Bluetooth link. The helper never pages the phone or touches HFP:
     // infotainment owns that link (#160). No generic Device1.Connect or ConnectProfile is used.
     if (!live.connected)
-        std::cerr << "system-helper: reconnect window open; waiting for a Bluetooth (HFP) link to the phone, "
-                     "which infotainment owns\n";
+        std::cerr << "system-helper: reconnect window open with no Bluetooth link to the phone; "
+                     "waiting for HFP (owned by infotainment)\n";
     return State::active;
 }
 core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
@@ -193,6 +196,8 @@ core::Result<void> BluezBackend::revoke_peer(const PeerIdentity& identity) {
     if ((impl_->allowed && impl_->allowed->device.identity == identity) ||
         (impl_->connected && impl_->connected->device.identity == identity)) impl_->close_window();
     std::erase(impl_->awaiting, identity);
+    // A forgotten phone's lost-link note goes with it (its window was already closed).
+    if (impl_->lost_link && impl_->lost_link->identity == identity) impl_->lost_link.reset();
     // Demoted first: once forgotten, the bond is never admitted (services, reconnect) again and is
     // never taken as acceptance of a later enrolment of the same identity. Success only once every
     // write is confirmed durable; otherwise the receiver retries.

@@ -104,14 +104,27 @@ infer the other's wire enum.
 
 The phone dials the AA RFCOMM profile only over an existing Bluetooth (HFP) link,
 which infotainment owns; neither the helper nor the receiver creates or tears it
-down. While a reconnect window is open with no bootstrap and `Device1.Connected`
-is false for that phone, `PollBootstrapV1` still rejects, with `local_failure` =
-`no_bluetooth_link` (15, appended in contract 1.5.0; diagnostics only, it grants
-and withholds nothing). The receiver reports an expired attempt as
+down. When an attempt's deadline passes, the receiver asks the helper
+`GetBootstrapWaitV1` (contract 1.5.0) for the attempt's source. The helper applies
+`PollBootstrapV1`'s sender and lease/source checks, then evaluates *now* (one
+bounded inventory read, no snapshot from when the window opened): an open
+reconnect window, no live bootstrap, and `Device1.Connected` false for that exact
+admitted phone answer `no_bluetooth_link`; anything else answers `none`. It grants
+and withholds nothing.
+
+Compatibility: `PollBootstrapV1` is unchanged, so a 1.4 receiver keeps observing
+against a 1.5 helper. A 1.5 receiver against a 1.4 helper gets the unknown member
+rejected and treats it as unknown (`attempt_deadline`). A separate member was
+chosen over a wider `local_failure` (which a 1.4 decoder rejects as a protocol
+mismatch) and over an extra reply field (which changes `utssu`, also rejected).
+A fresh reconnect window also clears the previous exchange's `local_failure`.
+
+The receiver reports an expired attempt as
 `{"event":"wireless_admission_expired","reason":"no_bluetooth_link","phase":"bluetooth_link","detail":"waiting for HFP (owned by infotainment)"}`;
-other expiries are `reason` `attempt_deadline` with `phase` `ap_activation` (AP
-not yet active) or `phone_handoff` (link present, no phone session). No address
-or identity is logged.
+otherwise `reason` `attempt_deadline` with `phase` `ap_activation` (AP not yet
+active) or `phone_handoff` (a link, or an unknown answer). `Device1.Connected` is
+true for any bearer, so `phone_handoff` does not prove HFP was up. No address or
+identity is logged.
 
 The receiver uses only authenticated `PollBootstrapV1`,
 `AuthorizeBootstrapV1`, and `GetAPCredentialsV1`. Task37 adds no helper methods
