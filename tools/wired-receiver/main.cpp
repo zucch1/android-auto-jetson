@@ -135,7 +135,7 @@ using aa::app::poll_error_json;
 class StdoutDiagnostics final : public aa::diagnostics::DiagnosticSink {
   public:
     void emit_json(std::string_view redacted_json) override {
-        log_line(aa::diagnostics::diag_event_json(redacted_json));
+        log_line_nonblocking(aa::diagnostics::diag_event_json(redacted_json));
     }
 };
 
@@ -585,7 +585,7 @@ int receiver_main(int argc, char **argv) {
         log_line("{\"event\":\"err\",\"detail\":\"configure\"}");
         return 1;
     }
-    VideoOutlet video_outlet{log_line, log_media};
+    VideoOutlet video_outlet{log_line_nonblocking, log_media};
     video_outlet.set_idr_recovery({
         [&session] { return session.video_projecting(); },
         [&session] { return session.request_video_idr(); },
@@ -709,14 +709,18 @@ int receiver_main(int argc, char **argv) {
 
     auto service_control = [&] {
         if (const auto error = audio_sink.failure()) {
-            (void)session.fail(*error);
             session_failed.store(true);
             g_running.store(false);
+            (void)session.fail(*error);
             log_line_nonblocking(audio_failure_event_json(
                 "audio_sink_failure", error->code(), audio_sink.failure_context()));
             return true;
         }
         control.checkpoint();
+        if (control.revoked()) {
+            session_failed.store(true);
+            g_running.store(false);
+        }
         if (control.finish()) {
             session_failed.store(true);
             g_running.store(false);
@@ -739,20 +743,22 @@ int receiver_main(int argc, char **argv) {
         } guard{in_video_recovery};
         if (!video_outlet.idr_dispatching()) {
             if (auto flushed = video_outlet.service_pending(); !flushed) {
-                log_line(poll_error_json(flushed.error().code(), session, audio_sink));
+                session_failed.store(true);
+                g_running.store(false);
+                log_line_nonblocking(poll_error_json(flushed.error().code(), session, audio_sink));
                 if (!session.failure()) {
                     (void)session.fail(flushed.error());
                 }
-                session_failed.store(true);
-                g_running.store(false);
                 return false;
             }
         }
         if (auto pending = session.service_pending_video_idr(); !pending) {
-            log_line(poll_error_json(pending.error().code(), session, audio_sink));
             if (session.failure()) {
                 session_failed.store(true);
                 g_running.store(false);
+            }
+            log_line_nonblocking(poll_error_json(pending.error().code(), session, audio_sink));
+            if (session.failure()) {
                 return false;
             }
         }
@@ -760,13 +766,16 @@ int receiver_main(int argc, char **argv) {
             bus->service().consume_idr_recovery_request()) {
             const auto idr = video_outlet.request_idr_external("consumer_ipc");
             if (!idr) {
-                log_line(poll_error_json(idr.error().code(), session, audio_sink));
-                if (idr.error().code() == aa::ErrorCode::channel_focus_restore_failed) {
+                const bool fatal = idr.error().code() == aa::ErrorCode::channel_focus_restore_failed;
+                if (fatal) {
+                    session_failed.store(true);
+                    g_running.store(false);
+                }
+                log_line_nonblocking(poll_error_json(idr.error().code(), session, audio_sink));
+                if (fatal) {
                     if (!session.failure()) {
                         (void)session.fail(idr.error());
                     }
-                    session_failed.store(true);
-                    g_running.store(false);
                     return false;
                 }
             }
@@ -902,9 +911,9 @@ int receiver_main(int argc, char **argv) {
                 if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
                     g_running.store(false);
                 } else if (!session.send_version_request(1, 6).has_value()) {
-                    log_line("{\"event\":\"err\",\"detail\":\"version_request\"}");
                     session_failed.store(true);
                     g_running.store(false);
+                    log_line_nonblocking("{\"event\":\"err\",\"detail\":\"version_request\"}");
                 }
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
                 if (deadline_observation) {
@@ -973,7 +982,7 @@ int receiver_main(int argc, char **argv) {
                     if (!g_running.load()) {
                         break;
                     }
-                    log_line(poll_error_json(code, session, audio_sink));
+                    log_line_nonblocking(poll_error_json(code, session, audio_sink));
                     if (!session.failure() &&
                         (code == aa::ErrorCode::transport_closed ||
                          code == aa::ErrorCode::transport_io || code == aa::ErrorCode::timeout)) {
@@ -984,8 +993,12 @@ int receiver_main(int argc, char **argv) {
                         if (!g_running.load()) {
                             break;
                         }
+                        session_failed.store(true);
+                        g_running.store(false);
                         (void)session.fail(recovered.error());
                     } else if (!session.failure()) {
+                        session_failed.store(true);
+                        g_running.store(false);
                         (void)session.fail(polled.error());
                     }
                     session_failed.store(true);
@@ -1126,7 +1139,7 @@ int receiver_main(int argc, char **argv) {
     input_thread.join();
 
     if (auto finished = audio_sink.finish(); !finished) {
-        log_line(audio_failure_event_json("audio_finish", finished.error().code(), audio_sink.failure_context()));
+        log_line_nonblocking(audio_failure_event_json("audio_finish", finished.error().code(), audio_sink.failure_context()));
         runtime_failed = true;
     }
 

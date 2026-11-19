@@ -87,7 +87,7 @@ void WiredSession::tick() {
 void WiredSession::request_stop() noexcept { lifecycle_.request_stop(); }
 
 core::Deadline WiredSession::io_deadline(bool writing) const noexcept {
-    auto until = writing ? core::Deadline::Clock::now() + std::chrono::seconds{5}
+    auto until = writing ? core::Deadline::Clock::now() + core::kDefaultSendBudget
                          : core::Deadline::Clock::time_point::max();
     if (const auto left = lifecycle_.remaining_budget()) {
         until = std::min(until, core::Deadline::Clock::now() +

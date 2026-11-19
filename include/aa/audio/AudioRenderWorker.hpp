@@ -38,7 +38,9 @@ public:
     using IdleClock = std::function<core::Nanoseconds()>;
     using OpenRouter = std::function<core::Result<AudioRouter>(const RouterConfig&)>;
 
-    static constexpr std::chrono::milliseconds kDefaultAckReleaseDrainTimeout{1000};
+    static constexpr std::chrono::milliseconds kAckReleaseDrainMargin{500};
+    static constexpr std::chrono::milliseconds kDefaultAckReleaseDrainTimeout =
+        core::kDefaultSendBudget + kAckReleaseDrainMargin;
 
     std::function<void(const std::array<std::size_t, 4>&, bool, bool,
                        const RouterReport&)> on_idle_observed_for_test;

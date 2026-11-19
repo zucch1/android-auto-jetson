@@ -1093,6 +1093,7 @@ TEST(WirelessAudioRuntime, StdoutStalledDuringReopenResumesAdmissionAndAckAndHon
     int exit_code = -1;
     std::string drained_stdout;
     std::atomic<bool> stop_fill{false};
+    std::atomic<std::size_t> filled{0};
     std::thread fill_thread;
 
     {
@@ -1116,7 +1117,6 @@ TEST(WirelessAudioRuntime, StdoutStalledDuringReopenResumesAdmissionAndAckAndHon
         ASSERT_TRUE(f.gate->wait_entered(1));
 
         // Completely fill StdoutLog's lossless queue while stdout remains stalled.
-        std::atomic<std::size_t> filled{0};
         fill_thread = std::thread([&] {
             const std::string filler(200, 's');
             while (!stop_fill.load() && wr::running.load()) {
@@ -1394,6 +1394,7 @@ TEST(WirelessAudioRuntime, CompletionServiceFailureTeardownBoundedWithFullStalle
     bool running_after = true;
     std::atomic<bool> queue_filled{false};
     std::atomic<bool> stop_fill{false};
+    std::atomic<std::size_t> filled{0};
     std::thread fill_thread;
 
     {
@@ -1421,7 +1422,6 @@ TEST(WirelessAudioRuntime, CompletionServiceFailureTeardownBoundedWithFullStalle
         auto phone = std::move(phone_res).value();
         ASSERT_NO_FATAL_FAILURE(phone->handshake_and_open_av(-7));
 
-        std::atomic<std::size_t> filled{0};
         fill_thread = std::thread([&] {
             const std::string filler(200, 'c');
             while (!stop_fill.load() && wr::running.load()) {
@@ -2189,6 +2189,8 @@ TEST(WirelessAudioRuntime, ParkedPendingOverflowEnobufsLatchesErrorThroughLaterD
 }
 
 TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFailsBounded) {
+    static_assert(audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout >
+                  aa::core::kDefaultSendBudget);
     // 1. Checkpoint watchdog triggers during an in-flight ACK send while stdout is fully stalled
     //    and a sink reopen starts: checkpoint logging must not block and reopen must complete.
     {
@@ -2246,6 +2248,7 @@ TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFails
         std::atomic<bool> stop_fill{false};
         std::atomic<bool> arm_watchdog_on_ack1{false};
         std::atomic<bool> watchdog_armed{false};
+        std::atomic<std::size_t> filled{0};
         std::thread fill_thread;
 
         {
@@ -2295,7 +2298,6 @@ TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFails
 
             if (session_active_ok) {
                 // Completely fill StdoutLog's lossless queue while stdout remains stalled.
-                std::atomic<std::size_t> filled{0};
                 fill_thread = std::thread([&] {
                     const std::string filler(200, 'w');
                     while (!stop_fill.load() && wr::running.load()) {
@@ -2386,9 +2388,263 @@ TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFails
         EXPECT_EQ(exit_code, 0);
     }
 
-    // 2. An in-flight ACK release remains held past the reopen bound while stdout is fully stalled:
-    //    reopen wait must time out, latch timeout, and fail the session through clear-running-first
-    //    within the bound instead of hanging forever.
+    // 2. A healthy slow in-flight ACK release (>1s, well inside the 5s kDefaultSendBudget) while
+    //    stdout is stalled must not fail the session: once the ACK finishes, sink reopen completes
+    //    and subsequent audio continues normally.
+    {
+        wr::running.store(true);
+        int pfd[2]{-1, -1};
+        ASSERT_EQ(::pipe(pfd), 0);
+        int saved_stdout = ::dup(STDOUT_FILENO);
+        ASSERT_GE(saved_stdout, 0);
+
+        {
+            const int flags = ::fcntl(pfd[1], F_GETFL);
+            ASSERT_GE(flags, 0);
+            ASSERT_EQ(::fcntl(pfd[1], F_SETFL, flags | O_NONBLOCK), 0);
+            std::vector<char> fill(4096, 'x');
+            while (::write(pfd[1], fill.data(), fill.size()) > 0) {}
+            ASSERT_EQ(::fcntl(pfd[1], F_SETFL, flags), 0);
+        }
+
+        ASSERT_EQ(::dup2(pfd[1], STDOUT_FILENO), STDOUT_FILENO);
+        ::close(pfd[1]);
+        pfd[1] = -1;
+
+        auto restore_stdout_fd = [&] {
+            if (saved_stdout >= 0) {
+                ::dup2(saved_stdout, STDOUT_FILENO);
+                ::close(saved_stdout);
+                saved_stdout = -1;
+            }
+        };
+        auto close_pipe_and_restore_stdout = [&] {
+            if (pfd[0] >= 0) {
+                ::close(pfd[0]);
+                pfd[0] = -1;
+            }
+            std::this_thread::sleep_for(20ms);
+            restore_stdout_fd();
+        };
+        struct ScopeGuard {
+            std::function<void()> cleanup;
+            ~ScopeGuard() {
+                if (cleanup) cleanup();
+            }
+        } fd_guard{close_pipe_and_restore_stdout};
+
+        bool anchor_stalled = false;
+        bool setup_ok = false;
+        std::atomic<bool> ack_held{false};
+        std::atomic<bool> released_ok{false};
+        bool ack2_ok = false;
+        bool reopened = false;
+        bool ack3_ok = false;
+        bool write3_ok = false;
+        bool deadline_honored = false;
+        int exit_code = -1;
+        bool rt_failed = true;
+        std::optional<aa::Error> worker_error;
+        std::string drained_stdout;
+        std::atomic<bool> stop_fill{false};
+        std::atomic<bool> arm_hold_ack{false};
+        std::atomic<bool> arm_finish_ack{false};
+        std::optional<aa::channels::AvDeliveryId> held_completion;
+        std::atomic<std::size_t> filled{0};
+        std::thread fill_thread;
+
+        {
+            diag::StdoutLogScope logging{wr::running};
+            anchor_stalled = !logging.log.submit("{\"event\":\"stall_anchor\"}");
+
+            RuntimeFixture f;
+            f.gate->block_first_write = true;
+            f.gate->fail_first_write = true;
+
+            struct AckHoldGuard {
+                std::mutex mutex;
+                audio::AudioRenderWorker* worker{nullptr};
+                bool release() {
+                    audio::AudioRenderWorker* target = nullptr;
+                    {
+                        std::lock_guard lock(mutex);
+                        target = std::exchange(worker, nullptr);
+                    }
+                    if (!target) { return false; }
+                    target->end_ack_release();
+                    return true;
+                }
+                ~AckHoldGuard() { (void)release(); }
+            } ack_hold;
+
+            auto on_before = [&](app::WiredSession& session, bool) {
+                if (held_completion && arm_finish_ack.exchange(false)) {
+                    (void)session.complete_av_delivery(*held_completion, {});
+                    held_completion.reset();
+                    released_ok.store(ack_hold.release());
+                    return;
+                }
+                if (!arm_hold_ack.load() || !f.audio_worker->has_completed_for_test()) {
+                    return;
+                }
+                if (arm_hold_ack.exchange(false)) {
+                    std::uint64_t epoch = 0;
+                    const auto completion = f.audio_worker->take_completion_with_epoch(epoch);
+                    if (completion) {
+                        std::optional<aa::Error> rel_fail;
+                        if (f.audio_worker->try_begin_ack_release(*completion, epoch, rel_fail) ==
+                            audio::AudioRenderWorker::AckRelease::send) {
+                            held_completion = *completion;
+                            {
+                                std::lock_guard lock(ack_hold.mutex);
+                                ack_hold.worker = f.audio_worker.get();
+                            }
+                            ack_held.store(true);
+                            f.gate->release();
+                        }
+                    }
+                }
+            };
+
+            f.start(Clock::now() + 5000ms, on_before);
+            const bool started_ok = f.runtime != nullptr && !::testing::Test::HasFatalFailure();
+            const bool auth_ok = started_ok && f.backend && f.backend->wait_authorized(1);
+
+            std::unique_ptr<PhonePeer> phone;
+            if (auth_ok) {
+                auto phone_res = PhonePeer::connect(f.port);
+                if (phone_res) {
+                    phone = std::move(phone_res).value();
+                    phone->handshake_and_open_av(-7, /*start_video=*/false);
+                    if (!::testing::Test::HasFatalFailure() &&
+                        phone->send_msg(100, av_data_msg(1'000'000'000ULL, pcm_50ms())) &&
+                        phone->wait_audio_ack(-7) && f.gate->wait_entered(1)) {
+                        setup_ok = true;
+                    }
+                }
+            }
+
+            if (setup_ok) {
+                fill_thread = std::thread([&] {
+                    const std::string filler(200, 'h');
+                    while (!stop_fill.load() && wr::running.load()) {
+                        if (logging.log.submit(filler)) break;
+                        ++filled;
+                    }
+                });
+                std::size_t stable = filled.load();
+                for (int i = 0; i < 40; ++i) {
+                    std::this_thread::sleep_for(10ms);
+                    const std::size_t now = filled.load();
+                    if (now > 0 && now == stable) break;
+                    stable = now;
+                }
+
+                arm_hold_ack.store(true);
+                setup_ok = phone->send_msg(100, av_data_msg(1'050'000'000ULL, pcm_50ms())).has_value();
+                const auto hold_wait_deadline = Clock::now() + 1500ms;
+                while (setup_ok && !ack_held.load() && Clock::now() < hold_wait_deadline) {
+                    std::this_thread::sleep_for(5ms);
+                }
+                if (ack_held.load()) {
+                    // Hold past the old 1s limit while remaining well inside kDefaultSendBudget.
+                    std::this_thread::sleep_for(1500ms);
+                    arm_finish_ack.store(true);
+                    const auto release_deadline = Clock::now() + 1500ms;
+                    while (!released_ok.load() && Clock::now() < release_deadline) {
+                        std::this_thread::sleep_for(5ms);
+                    }
+                }
+                if (released_ok.load()) {
+                    ack2_ok = phone->wait_audio_ack(-7, 1500ms).has_value();
+                }
+
+                const auto reopen_deadline = Clock::now() + 2000ms;
+                while (released_ok.load() && Clock::now() < reopen_deadline) {
+                    {
+                        std::lock_guard lock(f.gate->mutex);
+                        if (f.gate->sinks_opened >= 2U) {
+                            reopened = true;
+                            break;
+                        }
+                    }
+                    std::this_thread::sleep_for(5ms);
+                }
+                if (reopened && phone->send_msg(100, av_data_msg(1'100'000'000ULL, pcm_50ms()))) {
+                    ack3_ok = phone->wait_audio_ack(-7, 1500ms).has_value();
+                    std::unique_lock lock(f.gate->mutex);
+                    write3_ok = f.gate->cv.wait_for(
+                        lock, 1500ms, [&] { return f.gate->writes_completed >= 1U; });
+                }
+            }
+
+            if (started_ok) {
+                std::promise<int> exit_promise;
+                auto exit_future = exit_promise.get_future();
+                std::thread waiter([&] { exit_promise.set_value(f.join_runtime()); });
+                if (exit_future.wait_for(8500ms) == std::future_status::ready) {
+                    exit_code = exit_future.get();
+                    rt_failed = f.runtime->failed;
+                    worker_error = f.audio_worker->failure();
+                    deadline_honored = true;
+                    waiter.join();
+                } else {
+                    wr::running.store(false);
+                    stop_fill.store(true);
+                    (void)ack_hold.release();
+                    close_pipe_and_restore_stdout();
+                    waiter.join();
+                }
+            } else {
+                wr::running.store(false);
+                stop_fill.store(true);
+                close_pipe_and_restore_stdout();
+            }
+            (void)ack_hold.release();
+            if (phone) phone->close();
+            stop_fill.store(true);
+            if (fill_thread.joinable()) fill_thread.join();
+
+            if (pfd[0] >= 0) {
+                std::thread reader([&] {
+                    char buf[4096];
+                    for (;;) {
+                        const ssize_t n = ::read(pfd[0], buf, sizeof(buf));
+                        if (n > 0) {
+                            drained_stdout.append(buf, static_cast<std::size_t>(n));
+                        } else if (n < 0 && errno == EINTR) {
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                });
+                (void)logging.log.finish(2500ms);
+                restore_stdout_fd();
+                reader.join();
+                ::close(pfd[0]);
+                pfd[0] = -1;
+            }
+        }
+
+        EXPECT_TRUE(anchor_stalled);
+        EXPECT_TRUE(setup_ok);
+        EXPECT_TRUE(ack_held.load());
+        EXPECT_TRUE(released_ok.load());
+        EXPECT_TRUE(ack2_ok);
+        EXPECT_TRUE(reopened) << "Healthy >1s in-flight ACK inside send budget failed reopen";
+        EXPECT_TRUE(ack3_ok);
+        EXPECT_TRUE(write3_ok);
+        EXPECT_FALSE(worker_error.has_value());
+        EXPECT_TRUE(deadline_honored);
+        EXPECT_FALSE(rt_failed);
+        EXPECT_EQ(exit_code, 0);
+        EXPECT_EQ(drained_stdout.find("\"outcome\":\"reopen_ack_timeout\""), std::string::npos);
+    }
+
+    // 3. An in-flight ACK release remains held past the derived reopen bound while stdout is fully
+    //    stalled: reopen wait must wait past kDefaultSendBudget, time out within the bound, latch
+    //    timeout, and fail the session through clear-running-first instead of hanging forever.
     {
         wr::running.store(true);
         int pfd[2]{-1, -1};
@@ -2439,11 +2695,14 @@ TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFails
         bool rt_stopping = false;
         bool running_after = true;
         bool ack_held = false;
+        Clock::time_point hold_began{};
+        Clock::duration stuck_elapsed{};
         std::optional<aa::Error> worker_error;
         std::optional<audio::FailureContext> worker_context;
         std::string drained_stdout;
         std::atomic<bool> stop_fill{false};
         std::atomic<bool> arm_hold_ack{false};
+        std::atomic<std::size_t> filled{0};
         std::thread fill_thread;
 
         {
@@ -2474,6 +2733,7 @@ TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFails
                             audio::AudioRenderWorker::AckRelease::send) {
                             ack_hold.worker = f.audio_worker.get();
                             ack_held = true;
+                            hold_began = Clock::now();
                             f.gate->release();
                         }
                     }
@@ -2499,7 +2759,6 @@ TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFails
             }
 
             if (setup_ok) {
-                std::atomic<std::size_t> filled{0};
                 fill_thread = std::thread([&] {
                     const std::string filler(200, 'b');
                     while (!stop_fill.load() && wr::running.load()) {
@@ -2523,8 +2782,11 @@ TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFails
                 std::promise<int> done_promise;
                 auto done_future = done_promise.get_future();
                 std::thread waiter([&] { done_promise.set_value(f.join_runtime()); });
-                wait_status = done_future.wait_for(std::chrono::milliseconds{4500});
+                wait_status = done_future.wait_for(
+                    audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout +
+                    std::chrono::milliseconds{3000});
                 if (wait_status == std::future_status::ready) {
+                    stuck_elapsed = Clock::now() - hold_began;
                     exit_code = done_future.get();
                     rt_failed = f.runtime->failed;
                     rt_stopping = f.runtime->stopping;
@@ -2580,6 +2842,10 @@ TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFails
         EXPECT_TRUE(ack_held);
         EXPECT_EQ(wait_status, std::future_status::ready)
             << "Reopen hung forever waiting for in-flight ACK release";
+        EXPECT_GE(stuck_elapsed, aa::core::kDefaultSendBudget);
+        EXPECT_LE(stuck_elapsed,
+                  audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout +
+                      std::chrono::milliseconds{2500});
         EXPECT_EQ(exit_code, 1);
         EXPECT_TRUE(rt_failed);
         EXPECT_TRUE(rt_stopping);
