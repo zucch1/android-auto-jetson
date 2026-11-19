@@ -209,10 +209,13 @@ def test_report_rejects_inconsistent_catch_up_evidence() -> None:
         raise AssertionError(raw["events"])
 
 
-def collect(lines: list[str]) -> dict:
-    """Run the real collector against the fake receiver printing ``lines``."""
+def collect(lines: list[str], shutdown: str | None = None) -> dict:
+    """Run the real collector against the fake receiver printing ``lines``,
+    and ``shutdown`` verbatim when the collector stops it (SIGTERM)."""
     with tempfile.TemporaryDirectory(prefix="perf-catch-up-") as base:
         env = dict(os.environ, FAKE_RECEIVER_RAW_TELEMETRY="\n".join(lines))
+        if shutdown is not None:
+            env["FAKE_RECEIVER_SHUTDOWN_TELEMETRY"] = shutdown
         proc = subprocess.run(
             [sys.executable, "-B", str(ROOT / "tools/perf/aa_projection_collect.py"),
              "--receiver", str(ROOT / "tests/perf/fixtures/wired_perf/fake_receiver.py"),
@@ -247,6 +250,60 @@ def test_collector_capture_replays_catch_up_into_the_report() -> None:
     assert "audio_catch_up_ms" not in {v["metric"] for v in doc["violations"]}
     assert not any(name.startswith("audio_catch_up") for name in doc["blocked_on"]), doc["blocked_on"]
     assert not schema.validate(doc, schema.load_schema(schema.SCHEMA_V3))
+
+
+def test_a_drop_notice_read_only_at_shutdown_leaves_the_totals_unknown() -> None:
+    # Given a burst whose twelfth record was dropped, and the receiver reports
+    # the drop only when the collector stops it, after the measurement cutoff
+    # (Sol check of #155: the capture used to export 11 events, 19,888 frames).
+    lines = burst_lines()
+    capture = collect(lines[:11], shutdown=DROP + "\n")
+    # Then the frozen totals are unknown, not an exact-looking undercount.
+    assert capture["receiver_stopped_by_collector"] is True, capture
+    assert [capture["events"][key] for key in KEYS] == [None, None, None], capture["events"]
+    doc = reporter.build_result(copy.deepcopy(capture), duration_requested=None,
+                                now="2026-11-18T00:00:00Z", capture_path=None, capture_sha256=None)
+    for key in KEYS:
+        assert doc["metrics"][key]["value"] is None and doc["metrics"][key]["status"] == "INFORMATIONAL"
+    assert not any(name.startswith("audio_catch_up") for name in doc["blocked_on"]), doc["blocked_on"]
+    assert not schema.validate(doc, schema.load_schema(schema.SCHEMA_V3))
+    # A notice of no loss at shutdown, or none at all, keeps the exact totals.
+    for clean in ('{"event":"media_telemetry_dropped","rate_limited":0,"backpressure":0}\n', ""):
+        kept = collect(lines, shutdown=clean)
+        assert kept["events"]["audio_catch_up_frames"] == BURST_FRAMES, (clean, kept["events"])
+    # A catch-up record cut off at shutdown is a doubt too.
+    cut = collect(lines[:11], shutdown=lines[11][:40])
+    assert [cut["events"][key] for key in KEYS] == [None, None, None], cut["events"]
+
+
+def test_a_truncated_catch_up_record_leaves_the_totals_unconfirmed() -> None:
+    lines = burst_lines()
+    cut = parse([*lines[:11], lines[11][:-12]])
+    assert [cut.metrics[key] for key in KEYS] == [None, None, None], cut.metrics
+    # A later whole record restores the lifetime totals.
+    restored = parse([*lines[:10], lines[10][:-12], lines[11]])
+    assert restored.metrics["audio_catch_up_frames"] == BURST_FRAMES, restored.metrics
+    # A cut-off notice counts like a lossy one.
+    notice = parse([*lines, DROP[:-10]])
+    assert notice.metrics["audio_catch_up_frames"] is None, notice.metrics
+
+
+def test_poll_waits_for_a_line_still_being_written() -> None:
+    with tempfile.TemporaryDirectory(prefix="perf-catch-up-poll-") as base:
+        log = Path(base) / "receiver.log"
+        record = burst_lines()[0]
+        parser = collector.EventParser()
+        log.write_text(record[:25])
+        parser.poll(str(log))  # half a record: not consumed yet
+        assert parser.metrics["audio_catch_up_frames"] == 0, parser.metrics
+        with log.open("a") as handle:
+            handle.write(record[25:] + "\n")
+        parser.poll(str(log))
+        assert parser.metrics["audio_catch_up_frames"] == 1808, parser.metrics
+        with log.open("a") as handle:
+            handle.write(burst_lines()[1][:30])
+        parser.poll(str(log), final=True)  # the writer is gone: cut off for good
+        assert parser.metrics["audio_catch_up_frames"] is None, parser.metrics
 
 
 if __name__ == "__main__":

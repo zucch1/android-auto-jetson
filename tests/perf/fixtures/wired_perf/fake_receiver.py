@@ -34,6 +34,10 @@ Env knobs for the test:
   FAKE_RECEIVER_RAW_TELEMETRY  raw receiver lines (newline-separated) printed
                          verbatim after ``active``, behind one healthy
                          ``media_timing`` line.
+  FAKE_RECEIVER_SHUTDOWN_TELEMETRY  raw text written verbatim on SIGTERM,
+                         just before the clean exit (as the receiver reports a
+                         pending drop notice with its last media records). A
+                         value not ending in a newline leaves a cut-off line.
   --require-usb-serial S emulates the receiver's same-phone pin (#137):
   FAKE_RECEIVER_ATTACHED_SERIAL (default S) is the phone on the port. A
   different one fails the first link (err code phone_serial_mismatch, exit 3,
@@ -81,8 +85,16 @@ def _option(argv: list[str], name: str) -> str | None:
 MISMATCH = '{"event":"err","detail":"link","code":"phone_serial_mismatch"}'
 
 
+def _stop(*_: object) -> None:
+    shutdown = os.environ.get("FAKE_RECEIVER_SHUTDOWN_TELEMETRY")
+    if shutdown:
+        sys.stdout.write(shutdown)
+        sys.stdout.flush()
+    sys.exit(0)
+
+
 def main() -> int:
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGTERM, _stop)
     duration_ms = _duration_ms(sys.argv[1:])
     required = _option(sys.argv[1:], "--require-usb-serial")
     attached = os.environ.get("FAKE_RECEIVER_ATTACHED_SERIAL", required or "")

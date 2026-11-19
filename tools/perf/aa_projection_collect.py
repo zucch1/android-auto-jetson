@@ -482,6 +482,10 @@ class EventParser:
         # A media_telemetry_dropped notice after the newest catch-up record
         # may hide a later one: the totals are then unconfirmed (null).
         self.catch_up_unconfirmed = False
+        # Every such doubt (a lossy notice, a malformed notice or a truncated
+        # catch-up or notice line) ever read: the collector compares it
+        # across its final poll, after the metrics froze.
+        self.catch_up_doubts = 0
         self.stall_open = False
         self.stall_failed = 0
         self.video_units: int | None = None
@@ -549,8 +553,13 @@ class EventParser:
         lost = sum(event[key] for key in ("rate_limited", "backpressure")
                    if isinstance(event.get(key), int) and not isinstance(event.get(key), bool))
         if lost > 0 or not isinstance(event.get("rate_limited"), int):
-            self.catch_up_unconfirmed = True
-            self._publish_catch_up()
+            self._doubt_catch_up()
+
+    def _doubt_catch_up(self) -> None:
+        """A catch-up record may be missing: unconfirmed until a later one."""
+        self.catch_up_doubts += 1
+        self.catch_up_unconfirmed = True
+        self._publish_catch_up()
 
     def _publish_catch_up(self) -> None:
         keys = ("audio_catch_up_events", "audio_catch_up_frames", "audio_catch_up_ms")
@@ -722,7 +731,14 @@ class EventParser:
         prior = self.metrics[target]
         self.metrics[target] = max(prior, value) if peak and prior is not None else value
 
-    def poll(self, path: str) -> None:
+    def poll(self, path: str, final: bool = False) -> None:
+        """Consume the log's new complete lines.
+
+        A line still being written is left for the next poll, so a record is
+        never split into two unparseable halves. ``final`` (after the writer
+        exited) consumes the unterminated tail too: a record cut off there is
+        truncated for good.
+        """
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -733,13 +749,15 @@ class EventParser:
         if size == offset:
             return
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            with open(path, "rb") as handle:
                 handle.seek(offset)
-                for line in handle:
-                    self._consume(line)
-                self.offsets[path] = handle.tell()
+                data = handle.read()
         except OSError:
             return
+        end = len(data) if final else data.rfind(b"\n") + 1
+        for line in data[:end].decode("utf-8", errors="replace").split("\n"):
+            self._consume(line)
+        self.offsets[path] = offset + end
 
     def _consume(self, line: str) -> None:
         line = line.strip()
@@ -748,6 +766,9 @@ class EventParser:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            # A cut-off catch-up record or drop notice hides what it carried.
+            if '"audio_catch_up"' in line or '"media_telemetry_dropped"' in line:
+                self._doubt_catch_up()
             return
         if not isinstance(event, dict):
             return
@@ -920,6 +941,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     inventory: tuple[ThermalZone, ...] = ()
     video_evidence = VideoEvidence((), (), ())
     observed_duration = 0.0
+    catch_up_doubts_at_cutoff: int | None = None
     deadline = start + startup_timeout
 
     def read_sample() -> Sample:
@@ -1056,6 +1078,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         video_evidence = parser.video_measurements.finish(progress.last_ns)
         events = {key: value for key, value in parser.metrics.items()
                   if key not in {*_DECODE_KEYS.values(), *_IPC_KEYS.values()}}
+        catch_up_doubts_at_cutoff = parser.catch_up_doubts
         events["helper_rss_mb"] = None
         events["video_units"] = parser.video_units
         events["audio_chunks"] = parser.audio_chunks
@@ -1105,10 +1128,17 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             for failure in workload.restore_phone():
                 print(f"cleanup failure: {failure}", file=sys.stderr)
             args.cleanup_failures = list(workload.cleanup_failures)  # for --run-file
-        parser.poll(str(receiver_log))
+        parser.poll(str(receiver_log), final=True)
         if display is not None:
-            parser.poll(str(display_log))
+            parser.poll(str(display_log), final=True)
 
+    if catch_up_doubts_at_cutoff is not None and parser.catch_up_doubts != catch_up_doubts_at_cutoff:
+        # #154: the catch-up totals froze at the cutoff, but a drop notice is
+        # reported only with a later media record - up to the receiver's stop
+        # (SIGTERM). One read only in this final poll may stand for a catch-up
+        # record from before the cutoff: the frozen totals are unconfirmed.
+        for key in ("audio_catch_up_events", "audio_catch_up_frames", "audio_catch_up_ms"):
+            events[key] = None
     if receiver is not None:
         receiver_exit = receiver.returncode
     if not stopped_by_us and receiver_exit is not None and receiver_exit != 0:
