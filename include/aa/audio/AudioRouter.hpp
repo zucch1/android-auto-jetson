@@ -188,10 +188,15 @@ struct SinkWriteProgress final {
 // ~15 ms late). A phase at or below the watermark gets the ordinary bounded
 // trim. Every trimmed frame counts in frames_trimmed; frames_caught_up counts
 // only the part beyond what the bounded max_trim policy would have removed.
-// The router's 200 ms late-arrival cap judges a caught-up run after its trim:
-// it fails only when even the oldest retained sample is more than 200 ms
-// behind the cursor or, for a run dropped whole, when the end of its parent's
-// PCM (by input duration, not the decoder's possibly partial output) is.
+// A run whose decoded output exceeds its parent's own PCM duration (input
+// bytes at the role's input format) starts with resampler carryover from
+// earlier parents; the catch-up judges its phase by that older source time,
+// so the stale carryover is trimmed first and a caught-up run never leaves
+// the cursor more than `target` past the end of its parent's PCM. The
+// router's 200 ms late-arrival cap judges a caught-up run by its parent's own
+// PTS range: it fails only when the parent's end (timestamp plus input
+// duration) is more than 200 ms behind the cursor. Neither the decoded
+// length nor how the resampler splits output across runs enters that check.
 struct LivePcmDriftPolicy final {
     bool enabled{false};
     core::Nanoseconds high_watermark{core::Nanoseconds{20'000'000LL}};

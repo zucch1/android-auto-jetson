@@ -217,6 +217,10 @@ class ObservedSessionMutex {
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <regex>
+#include <cstring>
+#include <algorithm>
+#include <deque>
+#include <functional>
 #include <sstream>
 #include <tuple>
 #include <unistd.h>
@@ -5998,38 +6002,95 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     EXPECT_LE(gate->timestamps.back().count, arrival + 100'000'000 + 90'000'000);
 }
 
-// Sol re-review of #155: the worker admits 6400-byte guidance parents (200 ms
-// of 16 kHz mono). A burst of them stamped 0, 1, 10 and 12 ms apart, each
-// submitted after the previous one settled, put the next parent more than
-// 200 ms behind the cursor and ended the session as audio_sink_failure even
-// with the catch-up. It must now be caught up and survive.
+// A stand-in for the guidance resampler with a fixed output schedule (#155
+// Sol check): call i returns the oldest script(i, buffered) of the 48 kHz
+// stereo frames buffered so far (three per 16 kHz sample), at least one. 48
+// kHz stereo payloads pass through 1:1.
+aa::audio::detail::TestDecodeFn scripted_resampler(
+    std::function<std::size_t(std::size_t, std::size_t)> script) {
+    struct State {
+        std::function<std::size_t(std::size_t, std::size_t)> script;
+        std::deque<std::int16_t> buffered;
+        std::size_t calls = 0;
+    };
+    auto state = std::make_shared<State>(State{std::move(script), {}, 0});
+    return [state](const aa::audio::EncodedChunk &chunk) -> aa::core::Result<std::vector<std::byte>> {
+        if (chunk.input_format.sample_rate_hz == 48000) {
+            return std::vector<std::byte>(chunk.payload.begin(), chunk.payload.end());
+        }
+        for (std::size_t i = 0; i + 1 < chunk.payload.size(); i += 2) {
+            std::int16_t sample = 0;
+            std::memcpy(&sample, chunk.payload.data() + i, sizeof(sample));
+            state->buffered.insert(state->buffered.end(), 3, sample);
+        }
+        const auto count = std::clamp<std::size_t>(state->script(state->calls++, state->buffered.size()),
+                                                   1, state->buffered.size());
+        std::vector<std::byte> out(count * 4);
+        for (std::size_t f = 0; f < count; ++f) {
+            const auto value = state->buffered.front();
+            state->buffered.pop_front();
+            std::memcpy(out.data() + f * 4, &value, sizeof(value));
+            std::memcpy(out.data() + f * 4 + 2, &value, sizeof(value));
+        }
+        return out;
+    };
+}
+
+// The production worker admits 6400-byte guidance parents: 200 ms of 16 kHz
+// mono. A burst of them stamped 0, 1, 10 and 12 ms apart (Sol re-review and
+// check of #155) starts each later parent more than 200 ms behind the cursor
+// although its own audio is fresh, and the resampler may split a parent or
+// coalesce several into one run. Through the production worker, the burst is
+// trimmed rather than ending the session on every output schedule - fixed
+// splits and coalescings, Sol's 19098-frame run - and on the real decoder.
 TEST(WiredReceiver, WorkerMaxSizeGuidanceBurstSurvivesTheLateCap) {
     ReceiverLogScope logging{g_running};
-    StdoutCaptureGuard capture;
-    auto gate = std::make_shared<RenderGate>();
-    gate->release();
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
-    ASSERT_TRUE(audio.ready());
-    const auto role = aa::protocol::ChannelRole::guidance_audio;
-    const std::vector<std::byte> pcm(6400, std::byte{1}); // the admitted maximum: 200 ms
-    const auto arrival = steady_ns();
-    std::uint64_t sequence = 1;
-    for (const std::int64_t offset_ms : {0, 1, 10, 12, 12, 13, 20, 20}) {
-        ASSERT_TRUE(audio.submit({{role, sequence, {arrival + offset_ms * 1'000'000}}, pcm},
-                                 {role, 0, sequence, 7})) << sequence;
-        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
-        ASSERT_FALSE(audio.failure()) << sequence;
-        ++sequence;
+    using Script = std::function<std::size_t(std::size_t, std::size_t)>;
+    const std::vector<std::pair<std::string, Script>> schedules{
+        {"real decoder", {}},
+        {"one parent per run", [](std::size_t, std::size_t) { return std::size_t{9600}; }},
+        {"split then coalesced", [](std::size_t call, std::size_t buffered) {
+            return call % 2 == 0 ? std::size_t{96} : buffered; }},
+        {"sol 19098-frame run", [](std::size_t call, std::size_t buffered) {
+            return call == 0 ? std::size_t{96} : call == 1 ? std::size_t{19098} : buffered; }},
+        {"three into one", [](std::size_t call, std::size_t buffered) {
+            return call % 3 == 2 ? buffered : std::size_t{96}; }},
+    };
+    for (const auto &[name, script] : schedules) {
+        SCOPED_TRACE(name);
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        const Script schedule = script;
+        auto open = schedule
+            ? ConcreteAudioRenderWorker::OpenRouter{[gate, schedule](const auto &config) {
+                  return aa::audio::detail::open_router_with_decoder_for_test(
+                      config, std::make_unique<GatedRenderSink>(gate), scripted_resampler(schedule));
+              }}
+            : gated_router(gate);
+        ConcreteAudioRenderWorker audio{pcm_router_config(), std::move(open)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::guidance_audio;
+        const std::vector<std::byte> pcm(6400, std::byte{1}); // the admitted maximum: 200 ms
+        const auto arrival = steady_ns();
+        std::uint64_t sequence = 1;
+        for (const std::int64_t offset_ms : {0, 1, 10, 12, 12, 13, 20, 20}) {
+            ASSERT_TRUE(audio.submit({{role, sequence, {arrival + offset_ms * 1'000'000}}, pcm},
+                                     {role, 0, sequence, 7})) << sequence;
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_FALSE(audio.failure()) << sequence;
+            ++sequence;
+        }
+        const bool finished = audio.finish().has_value();
+        const auto output = capture.release();
+        ASSERT_TRUE(finished) << output;
+        EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+        EXPECT_NE(output.find("{\"event\":\"audio_catch_up\""), std::string::npos) << output;
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_FALSE(report->render_failure);
+        EXPECT_GT(report->stats.frames_caught_up, 0U);
     }
-    const bool finished = audio.finish().has_value();
-    const auto output = capture.release();
-    ASSERT_TRUE(finished) << output;
-    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
-    EXPECT_NE(output.find("{\"event\":\"audio_catch_up\""), std::string::npos) << output;
-    const auto report = audio.final_report();
-    ASSERT_TRUE(report);
-    EXPECT_FALSE(report->render_failure);
-    EXPECT_GT(report->stats.frames_caught_up, 0U);
 }
 
 TEST(WiredReceiver, WorkerStartupInflightAndOtherRolePendingNeverAuthorizeIdle) {

@@ -1551,13 +1551,14 @@ aa::audio::RouterConfig pcm_router_config(
     // #154: after a sink stall the phone bursts its withheld backlog, which is
     // placed after the cursor far behind its arrival. A run placed more than
     // 90 ms (the A/V excursion bound) behind its arrival is trimmed from its
-    // head down to the 15 ms drift target at once instead of 5 ms per chunk,
-    // and the router's 200 ms late cap judges such a caught-up run by the
-    // oldest audio it still plays (by its newest sample if it is dropped
-    // whole). A stall's burst - including 200 ms guidance parents stamped
-    // milliseconds apart - is therefore trimmed rather than ending the session
-    // as audio_sink_failure; a run wholly over 200 ms behind the cursor still
-    // fails late. The dropped audio is logged as audio_catch_up.
+    // head down to the 15 ms drift target at once instead of 5 ms per chunk
+    // (resampler carryover at a run's head counts at its older source time),
+    // and the router's 200 ms late cap judges such a caught-up run by the end
+    // of its parent's own PTS range. A stall's burst - including 200 ms
+    // guidance parents stamped milliseconds apart, however the resampler
+    // splits them - is therefore trimmed rather than ending the session as
+    // audio_sink_failure; a parent whose PCM ends over 200 ms behind the
+    // cursor still fails late. The dropped audio is logged as audio_catch_up.
     config.live_pcm_drift.catch_up_watermark = aa::core::Nanoseconds{90'000'000};
     config.on_write_completed = [](const aa::audio::WriteCompletion &completion) {
         // presented_ns (#60): when the chunk starts playing on the sink's
