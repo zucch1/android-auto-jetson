@@ -1733,10 +1733,7 @@ const char *const kUsage =
     "  the display does not crop or map touch for them yet. See ARCHITECTURE.md.\n"
     "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked.\n";
 
-int receiver_main(int argc, char **argv) {
-    // Before any GStreamer/NVIDIA load: their stdio text must not reach the
-    // JSON stdout channel or block exit() on a stalled consumer.
-    const aa::tools::StrayStdoutToStderr stray_stdout;
+int receiver_run(int argc, char **argv, const aa::tools::StrayStdoutGuard &stray_stdout) {
     auto video_profiles = aa::config::default_video_profiles();
     bool exact_video_profiles = false;
     auto video_decoder = aa::consumer::DecodeBackend::software;
@@ -2508,6 +2505,15 @@ int receiver_main(int argc, char **argv) {
              ",\"version_responses\":" + std::to_string(session.version_responses()) +
              ",\"unhandled_controls\":" + std::to_string(session.unhandled_controls()) + "}");
     return runtime_failed || session_failed.load() ? 1 : 0;
+}
+int receiver_main(int argc, char **argv) {
+    // Before any GStreamer/NVIDIA load: their stdio text must not reach the
+    // JSON stdout channel, nor block a receiver thread on a stalled stdout or
+    // stderr. Lost text is reported in-band.
+    const aa::tools::StrayStdoutGuard stray_stdout;
+    const int code = receiver_run(argc, argv, stray_stdout);
+    if (const auto report = stray_stdout.drop_report(); !report.empty()) { log_line(report); }
+    return code;
 }
 } // namespace
 
