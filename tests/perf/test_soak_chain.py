@@ -624,15 +624,19 @@ def test_a_term_at_any_point_of_a_stage_never_leaves_a_canonical_pass_or_exits_0
 
 
 def test_a_stop_after_a_passing_preflight_never_starts_the_launcher() -> None:
-    # The stop lands after the preflight passed: at the chain's launch boundary
-    # (during the post-preflight build scan), or inside run_stage just before Popen.
+    # The stop lands after the preflight passed: on the post-preflight build scan
+    # (the chain's launch boundary: run_stage is never entered), or inside
+    # run_stage just before the spawn (Popen is never called).
     import signal
-    for where in ("launch boundary", "before Popen"):
-        scans = {"n": 0}
+    for where in ("post-preflight scan", "before Popen"):
+        state = {"preflight": False}
+
+        def host(args, seconds, stop) -> dict:
+            state["preflight"] = True
+            return preflight_ok(args, seconds, stop)
 
         def builds(where=where) -> list[str]:
-            scans["n"] += 1
-            if where == "launch boundary" and scans["n"] == 2:  # 1: before the stage, 2: after the preflight
+            if where == "post-preflight scan" and state["preflight"]:  # the first scan after it
                 os.kill(os.getpid(), signal.SIGTERM)
             return []
         real_command = chain.stage_command
@@ -642,17 +646,83 @@ def test_a_stop_after_a_passing_preflight_never_starts_the_launcher() -> None:
                 os.kill(os.getpid(), signal.SIGTERM)
             return real_command(args, seconds)
 
-        def popen(*_args, **_kwargs):
-            raise AssertionError("a launcher was started after the stop")
+        def never(*_args, **_kwargs):
+            raise AssertionError(f"{where}: a launcher was started after the stop")
+        real_run_stage = chain.run_stage
+
+        def run_stage(*args, where=where, **kwargs):
+            if where == "post-preflight scan":
+                never()
+            return real_run_stage(*args, **kwargs)
         with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
             root = Path(directory)
-            with patch.object(chain, "stage_command", stage_command), \
-                    patch.object(chain.subprocess, "Popen", popen):
-                code, output = run(root, builds=builds)
+            with patch.object(chain, "stage_command", stage_command), patch.object(chain, "run_stage", run_stage), \
+                    patch.object(chain.subprocess, "Popen", never):
+                code, output = run(root, host=host, builds=builds)
             out = root / "chain"
-            assert code == 128 + signal.SIGTERM and calls(root) == [], (where, code, output)
+            assert state["preflight"] and code == 128 + signal.SIGTERM and calls(root) == [], (where, code, output)
             assert "interrupted (SIGTERM)" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
             assert (out / "stage-7200s-not-run.json").exists() and "CHAIN COMPLETE" not in output
+
+
+def test_a_stop_during_the_spawn_terminates_the_launched_child_at_once() -> None:
+    # The signal lands after the last guard, while Popen runs: the child exists.
+    # The chain stops its group at once, starts no sampler and no watch, and exits 143.
+    import signal
+    real_popen, spawned = chain.subprocess.Popen, []
+
+    def popen(_command, **kwargs):
+        os.kill(os.getpid(), signal.SIGTERM)
+        spawned.append(real_popen(["sleep", "300"], **kwargs))
+        return spawned[-1]
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("the stage went on after a stop during the spawn")
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        with patch.object(chain.subprocess, "Popen", popen), patch.object(chain.CounterSampler, "start", never):
+            code, output = run(root)
+        out = root / "chain"
+        assert code == 128 + signal.SIGTERM and "CHAIN COMPLETE" not in output, (code, output)
+        assert len(spawned) == 1 and spawned[0].returncode == -signal.SIGTERM, spawned
+        assert not chain.group_alive(spawned[0].pid)
+        assert "interrupted (SIGTERM)" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+        assert not (out / "stage-1800s-result.json").exists() and (out / "stage-7200s-not-run.json").exists()
+
+
+def test_a_stop_while_the_block_markers_are_written_still_wins() -> None:
+    # A blocked stage writes its markers, and the TERM lands during that write:
+    # the exit is 143, not 3, and the stage's marker names both reasons.
+    import signal
+    for blocked in ("build before the stage", "preflight BLOCKED"):
+        fired = []
+        real_not_run = chain._not_run
+
+        def not_run(*args, **kwargs):
+            real_not_run(*args, **kwargs)
+            if not fired:
+                fired.append(True)
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        def host(_args, seconds, _stop) -> dict:
+            return {"schema": "aa-host-preflight/2", "stage_s": seconds, "verdict": "BLOCKED",
+                    "reasons": ["package_maintenance:apt running"]}
+        scans = {"n": 0}
+
+        def builds(blocked=blocked) -> list[str]:
+            scans["n"] += 1  # 1: the idle gate; 2: before the stage
+            return ["4242 ninja"] if blocked == "build before the stage" and scans["n"] == 2 else []
+        with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+            root = Path(directory)
+            with patch.object(chain, "_not_run", not_run):
+                code, output = run(root, host=host, builds=builds)
+            out = root / "chain"
+            assert fired and code == 128 + signal.SIGTERM, (blocked, code, output)
+            marker = json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+            assert "stage-1800s interrupted (SIGTERM)" in marker, (blocked, marker)
+            assert ("interference:build_started_before_the_stage" if blocked == "build before the stage"
+                    else "package_maintenance:apt running") in marker, (blocked, marker)
+            assert calls(root) == [] and "CHAIN COMPLETE" not in output
 
 
 def test_every_chain_gets_a_new_directory() -> None:

@@ -313,6 +313,12 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
         process = subprocess.Popen(command, stdout=console, stderr=subprocess.STDOUT, env=env,
                                    start_new_session=True)
         children.append(process)
+        if stop:  # a stop that landed during the spawn: stop the child at once, start nothing else
+            outcome = stop_group(process)
+            print(f"{name} INTERRUPTED by {signal.Signals(stop.signum).name} at the launch: "
+                  f"stage {outcome}", flush=True)
+            _retire_interrupted(args, name, [], process.returncode, stop)
+            return 128 + stop.signum
         sampler = CounterSampler(lambda cancel: host_counters(args, cancel)).start() \
             if preflight is not None else None
         seen: list[dict] = []
@@ -347,6 +353,10 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
     if stop:
         if outcome is None:
             outcome = stop_group(process)
+        end = (preflight or {}).get("pipewire_err_counters", {}).get("end")
+        if end is not None:  # the stop came during the end probe: the snapshot is not a clean one
+            end["interrupted"] = signal.Signals(stop.signum).name
+            write_record(args.out / f"{name}-host-preflight.json", preflight)
         print(f"{name} INTERRUPTED by {signal.Signals(stop.signum).name}: stage {outcome}", flush=True)
         _retire_interrupted(args, name, seen, process.returncode, stop)
         return 128 + stop.signum
@@ -523,6 +533,13 @@ def _chain(args: argparse.Namespace, stop: StopFlag, children: list[subprocess.P
             why += list(record.get("reasons", []))
         if launched and (args.out / f"{name}-interference.json").exists():
             why.append("interference:build_during_stage (result disqualified)")
+        if code != 0 and not stop:
+            if blocked_here:
+                _not_run(args, (seconds,), f"{name} BLOCKED by the host preflight: "
+                         + "; ".join(record["reasons"]))
+            _not_run(args, STAGES[index + 1:], f"{name} did not pass (rc {code})")
+        # Checked after any marker write: a stop that came while the block markers
+        # were written still wins, and its marker replaces them with both reasons.
         if stop:  # sticky: an interruption wins the exit code, whatever else also happened
             if launched:  # its result, finished or not, is not final
                 _retire_interrupted(args, name, [], code, stop)
@@ -532,10 +549,6 @@ def _chain(args: argparse.Namespace, stop: StopFlag, children: list[subprocess.P
             _not_run(args, STAGES[index + 1:], f"{name} was interrupted")
             return 128 + stop.signum
         if code != 0:
-            if blocked_here:
-                _not_run(args, (seconds,), f"{name} BLOCKED by the host preflight: "
-                         + "; ".join(record["reasons"]))
-            _not_run(args, STAGES[index + 1:], f"{name} did not pass (rc {code})")
             return code
     # The single point where the chain completes: never with a stop pending.
     if stop:

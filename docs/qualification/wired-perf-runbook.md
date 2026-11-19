@@ -642,12 +642,19 @@ chain exits 128+signal, never 0. `tools/qualification/check_wired.py` rejects
 an `*.interrupted.*` or `*.disqualified.*` result, or one carrying
 `interrupted`, even when the manifest references it (`RETIRED_RESULT`).
 An interruption also wins the exit code over a build block or a
-disqualification that happened too: the stage's `not-run` marker names both,
-and no launcher is started once a stop is pending (checked at the launch
-boundary and again right before the launcher is spawned). An interrupted
-stage has no `pipewire_err_counters.end` snapshot (the chain does not touch
-the host while stopping); read `.during.latest` / `.during.latest_with_receiver`
-and the stage's `-logs/` instead. Only
+disqualification that happened too, including a stop that lands while the
+block markers are being written: the chain re-checks the flag after writing
+any marker, and the stage's `not-run` marker names both reasons. No launcher
+is started once a stop is pending (checked at the launch boundary and again
+right before the spawn). A stop that lands during the spawn itself is seen
+as soon as `Popen` returns: the chain stops the new launcher's group at once
+(TERM, the grace, then KILL), starts no sampler or watch, and exits
+128+signal. With a stop pending, the chain does not start the end probe, so
+an interrupted stage normally has no `pipewire_err_counters.end`. A stop
+that lands during that probe can leave an `.end`; it is then marked
+`"interrupted": "<SIGNAL>"` and is not a clean after-stage snapshot. In
+either case read `.during.latest` / `.during.latest_with_receiver` (when the
+sampler ran) and the stage's `-logs/` instead. Only
 the chain runs the preflight; a direct `aa-projection-perf.sh` invocation
 does not, so check the host by hand before one.
 
