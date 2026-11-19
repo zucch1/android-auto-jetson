@@ -49,6 +49,30 @@ class WiredTests(PackageTest):
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertNotIn('TESTONLY_WRONG_TASK', result.stdout + result.stderr)
 
+    def test_a_retired_soak_result_is_rejected_even_when_referenced(self) -> None:
+        # Given: a valid task32 result the soak chain retired, by name or by its marker,
+        # explicitly referenced (and correctly hashed) by the manifest.
+        for field in ('perf_30m', 'soak_2h'):
+            for how in ('interrupted_name', 'disqualified_name', 'interrupted_field'):
+                with self.subTest(field=field, how=how):
+                    manifest = make_package(self.root)
+                    doc = load(manifest)
+                    path = self.root / doc.child(field).text('path')
+                    if how == 'interrupted_field':
+                        result = load(path)
+                        result.values['interrupted'] = {'signal': 'SIGTERM', 'reason': 'TESTONLY'}
+                        write(path, result.values)
+                    else:
+                        tag = how.split('_')[0]
+                        moved = path.with_name(f'{path.stem}-result.{tag}.json')
+                        path.rename(moved)
+                        doc.values[field] = binding(moved)
+                        write(manifest, doc.values)
+                    rebind(manifest, field)
+                    # When / Then: the wired CLI refuses it.
+                    result = self.cli('check_wired.py')
+                    self.assertEqual(result.returncode, 1, result.stdout)
+
     def test_wrong_metadata_types_fail(self) -> None:
         # Given: independently malformed phone values, never a missing hash.
         for value in (None, True, 15, [], {}, '', 'pending'):
