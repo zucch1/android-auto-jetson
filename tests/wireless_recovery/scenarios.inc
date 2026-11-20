@@ -50,12 +50,13 @@ TEST_F(WirelessRecovery, R04FreshApAcquisitionCannotReuseOldSnapshot) {
     ASSERT_NO_FATAL_FAILURE(closed());
     ASSERT_TRUE(eventually([&] { return inactive_observed(); }));
     timing.ap_inactive = timing.elapsed();
+    old_channel_closed();
     // Then a fresh AP-only grant and bootstrap recover admission, never the old handle.
     ASSERT_NO_FATAL_FAILURE(recover_ap());
     EXPECT_GT(timing.new_activation, timing.old_activation);
     EXPECT_FALSE(client->get_ap_credentials({consumer.value, 0}, old_handle));
     record_cleanup_observations("old activation State4; Device.ActiveConnection=/; original NM/device incarnation",
-        "old owned table removed; fresh activation owns current table");
+        "old owned table removed; fresh activation owns current table", true);
 }
 TEST_F(WirelessRecovery, R10SyntheticUnapprovedUnbondedPeerDeniedBeforeCredentials) {
     // Given approved first-peer admission, with an unchanged persistent store.

@@ -163,6 +163,10 @@ core::Result<State> SystemHelper::reconnect_peer(const std::string& sender, std:
     if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
     const auto result = backend_.reconnect_peer(handle);
     if (!result) return result.error();
+    // A retry while the bound bootstrap is still in progress keeps it: its binding, pinned
+    // snapshot and lease stay, so the receiver's next poll, credentials and authorization
+    // still match (#161). Otherwise the reconnect starts from the empty source.
+    if (handoff_binding_ && bound_peer(handoff_binding_->source, handoff_binding_->handle)) return result;
     handoff_binding_.reset();
     handoff_snapshot_.reset();
     lease_ = Source{};

@@ -31,16 +31,22 @@ struct HandoffEligibilityCoordinator::Impl {
     bool active{}, completed{}, confirming{};
     // 950ms evidence + <=25ms owner scheduling + <=25ms synchronous stop <=1s.
     Clock::time_point expires{Clock::time_point::max()}, establishment{}, grace{Clock::time_point::max()};
+    // From the first observation of `handle`: the bootstrap's own budget (#161).
+    Clock::time_point bootstrap_until{};
+    Timing timing;
     std::optional<std::future<Reply>> pending;
     std::optional<Job> denial, withdrawal;
 
-    Impl(const trust::TrustStore& store, HandoffOperations ops, Listener target)
-        : trust(store), operations(std::move(ops)), listener(std::move(target)) {}
+    Impl(const trust::TrustStore& store, HandoffOperations ops, Listener target, Timing bounds)
+        : trust(store), operations(std::move(ops)), listener(std::move(target)), timing(bounds) {}
 
     bool live_consumer() const { return consumer && consumer->value == source.generation; }
     bool trusted() const { return phone && trust.lookup(*phone) == trust::Decision::approved; }
     bool valid() const {
         return stage == Stage::authorized && trusted() && Clock::now() < expires && Clock::now() < grace;
+    }
+    bool in_progress() const {
+        return stage == Stage::preparing || stage == Stage::authorizing || (stage == Stage::authorized && !completed);
     }
     void launch(Job job) {
         job.started = Clock::now();
@@ -67,8 +73,19 @@ struct HandoffEligibilityCoordinator::Impl {
         withdrawal.reset(); completed = false; confirming = false;
         phone.reset(); snapshot.reset(); handle = 0;
     }
+    // A stale observation may still name a handle: PollBootstrapV1 bound the phone's live
+    // bootstrap to this attempt's source before the attempt was retired. It is denied like any
+    // retired handle and never adopted again; otherwise the helper keeps the bootstrap, its
+    // binding and its lease into the next attempt (#169 review).
+    void orphaned(const Reply& reply) {
+        if (reply.job.operation != Operation::observe || !reply.result || !reply.result.value().peer.handle) return;
+        const auto bound = reply.result.value().peer.handle;
+        retired_handle = bound;
+        if (!denial) denial = Job{Operation::deny, epoch.load(), reply.job.source, bound};
+    }
     void accept(Reply reply) {
-        if (reply.job.epoch != epoch.load() || reply.job.operation == Operation::deny) return;
+        if (reply.job.operation == Operation::deny) return;
+        if (reply.job.epoch != epoch.load()) { orphaned(reply); return; }
         if (!reply.result) {
             // A server-side RFCOMM peer may not have connected yet. Keep only
             // initial observation bounded by establishment; all later errors retire.
@@ -92,6 +109,8 @@ struct HandoffEligibilityCoordinator::Impl {
             if (!trusted() || !live_consumer()) { retire(); return; }
             snapshot = observed.snapshot;
             stage = Stage::preparing;
+            // The helper accepted it before this reply, so its own deadline comes first.
+            bootstrap_until = Clock::now() + timing.bootstrap;
         } else if (reply.job.operation == Operation::authorize) {
             if (Clock::now() >= fresh_until || !trusted() || !live_consumer()) { retire(); return; }
             expires = fresh_until; stage = Stage::authorized;
@@ -115,9 +134,23 @@ struct HandoffEligibilityCoordinator::Impl {
             }
         }
     }
+    // Sends this coordinator's outstanding denial now, after any operation still in flight (whose
+    // reply is stale once retired, but may name a handle to deny: orphaned()). The helper then has
+    // retired the old hand-off before the caller starts a fresh attempt (#169 review).
+    void settle() {
+        if (pending) { auto reply = pending->get(); pending.reset(); orphaned(reply); }
+        if (denial) {
+            const auto job = *denial;
+            denial.reset();
+            (void)operations.authorize(job.source, job.handle, false);
+        }
+    }
     void tick() {
+        // Establishment bounds only the wait for a bootstrap. An observed one runs to its own
+        // budget, however late in the attempt the phone connected (#161).
         if (stage != Stage::retired && (Clock::now() >= expires || Clock::now() >= grace ||
-            (stage != Stage::authorized && Clock::now() >= establishment) ||
+            (stage == Stage::observing && Clock::now() >= establishment) ||
+            ((stage == Stage::preparing || stage == Stage::authorizing) && Clock::now() >= bootstrap_until) ||
             (phone && !trusted()) || (!live_consumer() && !active))) retire();
         if (pending && pending->wait_for(0ms) == std::future_status::ready) {
             auto reply = pending->get(); pending.reset(); accept(std::move(reply));
@@ -134,23 +167,22 @@ struct HandoffEligibilityCoordinator::Impl {
 };
 
 HandoffEligibilityCoordinator::HandoffEligibilityCoordinator(const trust::TrustStore& trust,
-    HandoffOperations operations, Listener listener)
-    : impl_(std::make_unique<Impl>(trust, std::move(operations), std::move(listener))) {}
+    HandoffOperations operations, Listener listener, Timing timing)
+    : impl_(std::make_unique<Impl>(trust, std::move(operations), std::move(listener), timing)) {}
 HandoffEligibilityCoordinator::~HandoffEligibilityCoordinator() {
     impl_->retire();
-    if (impl_->pending) { impl_->pending->wait(); impl_->pending.reset(); }
-    if (impl_->denial) {
-        const auto job = *impl_->denial;
-        (void)impl_->operations.authorize(job.source, job.handle, false);
-    }
+    impl_->settle();
 }
 void HandoffEligibilityCoordinator::begin(helper::Source source) {
+    // A retry must not reset a bootstrap that is still progressing: retiring it would deny the
+    // helper's live handle and poison its re-observation through retired_handle (#161).
+    if (impl_->in_progress() && impl_->source == source && impl_->live_consumer()) return;
     impl_->retire();
     if (!source.generation || !impl_->consumer || impl_->consumer->value != source.generation) return;
     ++impl_->epoch;
     impl_->source = source;
     impl_->stage = Impl::Stage::observing;
-    impl_->establishment = Clock::now() + 10s;
+    impl_->establishment = Clock::now() + impl_->timing.establishment;
     impl_->expires = Clock::time_point::max();
     impl_->grace = Clock::time_point::max();
     impl_->active = false;
@@ -168,8 +200,16 @@ void HandoffEligibilityCoordinator::confirm_completion() {
     impl_->withdrawal = Impl::Job{Impl::Operation::withdraw, impl_->epoch.load(), impl_->source, impl_->handle};
 }
 bool HandoffEligibilityCoordinator::bootstrap_completed() const { return impl_->completed && impl_->valid(); }
+bool HandoffEligibilityCoordinator::bootstrapping() const {
+    return impl_->in_progress() && Clock::now() < impl_->bootstrap_until + impl_->timing.connect;
+}
 void HandoffEligibilityCoordinator::tick(bool active) { impl_->active = active; impl_->tick(); }
-void HandoffEligibilityCoordinator::retire() { impl_->retire(); }
+// An external retirement precedes a fresh attempt (Runtime defer() and admit() via
+// WirelessReceiver::stop(), before ReconnectPeerV1 or AcquireApV1). The denial is settled
+// synchronously: queued behind an in-flight operation, it would otherwise reach the helper after
+// that reconnect, which then finds the retired bootstrap still valid and keeps its binding and
+// lease, so the fresh attempt's source is rejected (#169 review). Bounded like any helper call.
+void HandoffEligibilityCoordinator::retire() { impl_->retire(); impl_->settle(); }
 bool HandoffEligibilityCoordinator::admitting() const { return impl_->valid() && impl_->live_consumer(); }
 bool HandoffEligibilityCoordinator::valid_session() const { return impl_->valid(); }
 std::optional<trust::PhoneIdentity> HandoffEligibilityCoordinator::phone() const { return impl_->phone; }

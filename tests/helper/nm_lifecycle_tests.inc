@@ -42,7 +42,8 @@ protected:
     }
     void complete(std::uint64_t handle) {
         begin(handle); ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
-        ASSERT_EQ(bluez.command("wire-read"), "closed");
+        // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
+        for (int quiet = 0; quiet < 5; ++quiet) { ASSERT_EQ(bluez.command("wire-read"), "open"); }
     }
     void retired(std::uint64_t handle) {
         EXPECT_FALSE(client->poll_bootstrap(source, failure));
@@ -71,10 +72,11 @@ TEST_F(CompletedLifecycle, RepeatedAllowDoesNotRestartPendingOrCompletedExchange
     // When allow is repeated before and after completion.
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, true));
     ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
-    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
+    for (int quiet = 0; quiet < 5; ++quiet) { EXPECT_EQ(bluez.command("wire-read"), "open"); }
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, true));
     // Then no new endpoint is emitted and deny can retire completed authority.
-    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_EQ(bluez.command("wire-read"), "open");
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, false, false)); retired(handle);
 }
 class CompletedLoss : public CompletedLifecycle, public ::testing::WithParamInterface<const char*> {};
@@ -104,7 +106,7 @@ TEST_F(CompletedLifecycle, CompletedChannelTeardownPreservesPinnedAuthority) {
     const auto current = client->get_ap_credentials({1, 1}, handle); ASSERT_TRUE(current);
     EXPECT_TRUE(current.value() == original.value());
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, false));
-    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_EQ(bluez.command("wire-read"), "open");
 }
 TEST_F(CompletedLifecycle, CompletedConnectedLossRequiresFreshBootstrap) {
     // Given completed authority with the bond intact throughout both loss forms.

@@ -170,10 +170,41 @@ An incomplete bootstrap has a 10-second budget. The 60-second pairing window
 limits only acceptance of new RFCOMM connections; it is not a TTL for an
 established bootstrap, completed handoff, or projection session.
 
+### Aborts and retries (#161)
+
+Every aborted bootstrap shuts its RFCOMM socket down (`shutdown(SHUT_RDWR)`),
+because BlueZ holds its own reference and a plain `close()` sends no DISC; the
+phone then sees an IO error and restarts its wireless setup. That covers denial,
+every failure, the 10-second deadline, a window that lapses before the bootstrap
+ends (the bootstrap still runs to its own deadline), and the retirement of a
+completed hand-off, whether it failed before the receiver confirmed it or its
+session ended later. Completion itself shuts nothing down: the channel stays as
+the phone left it for the whole session. A completion never confirmed has its
+socket shut down after 30 s, keeping the completed authority. Only the AA DLC closes;
+HFP, owned by infotainment, is never touched, and while it is up its DLC keeps the
+RFCOMM session and the ACL up.
+
+A retry must not reset a bootstrap that is still progressing:
+
+- The receiver does not defer its attempt (15 s) while the coordinator is
+  preparing, authorizing, or authorized but unconfirmed. That hold is bounded:
+  10 s from the first observation (the helper's own budget starts earlier) plus
+  5 s for the phone to open the TCP session of a completed exchange.
+- The coordinator's 10-second establishment bound applies only while it waits
+  for a bootstrap; one observed late runs to its own budget.
+- `begin()` with the same source during such a bootstrap keeps it: no
+  retirement, no denial, and no `retired_handle` that would poison its
+  re-observation.
+- In the helper, a `ReconnectPeerV1` for the same phone while its window is open
+  is a no-op (the window opens at most once per 60 s); a lapsed window reopens
+  without aborting that phone's bootstrap; and a live bound bootstrap keeps its
+  binding, pinned snapshot and lease.
+
 Successful completion transfers the exact handle, receiver/source ownership,
 BlueZ owner/device identity, and pinned AP snapshot into revocable
 completed-handoff authority. It survives normal RFCOMM close and the subsequent
-Profile1 `RequestDisconnection` callback, and has no absolute TTL. Before
+Profile1 `RequestDisconnection` callback, and has no absolute TTL (#161 only
+shuts an unconfirmed completion's RFCOMM socket down after 30 s). Before
 completion, that callback still retires the pending exchange. Device1
 `Connected=false` or an invalidated `Connected` value establishes link loss;
 `Connected=true` cannot revive retired authority.

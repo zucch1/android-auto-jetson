@@ -23,11 +23,12 @@ TEST_F(WirelessRecoveryConsumer, R09NewOwnerGenerationRetiresOldAdmission) {
     ASSERT_TRUE(control->start_projection(caller));
     EXPECT_FALSE(receiver->begin(*control, {old_consumer.value, 0}));
     ASSERT_NO_FATAL_FAILURE(stays_retired());
+    old_channel_closed();
     // Then only the new live generation owns fresh AP and handoff credentials.
     ASSERT_NO_FATAL_FAILURE(recover_ap());
     const auto current = observe_snapshot(); ASSERT_TRUE(current);
     EXPECT_FALSE(client->get_ap_credentials({old_consumer.value, 0}, current->handle));
     EXPECT_FALSE(control->pairing_window_open()); EXPECT_EQ(events.count_opened(), 0U);
     record_cleanup_observations("old activation State4; Device.ActiveConnection=/; original NM/device incarnation",
-        "old owned table removed; fresh activation owns current table");
+        "old owned table removed; fresh activation owns current table", true);
 }

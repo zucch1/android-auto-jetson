@@ -21,6 +21,8 @@ public:
     ~WirelessReceiver() { stop(); }
     helper::Confirmation& confirmation() { return confirmation_; }
     WiredSession* session() const { return link_.session(); }
+    // A phone's bootstrap is in progress (bounded): don't defer or retry the attempt (#161).
+    [[nodiscard]] bool bootstrapping() const { return eligibility_.bootstrapping(); }
     // The acquiring source becomes the helper AP lease; drive this AP's handoff
     // with begin(source). reconnect() resets the lease to the empty source and
     // must precede, not follow, acquisition (docs/wireless-handoff.md).
@@ -64,8 +66,10 @@ public:
         confirmation_.flush();
         return result;
     }
+    // The session and listener close first; the coordinator's retirement then settles its denial
+    // with the helper (bounded), still before any fresh attempt (#169 review).
     void stop() {
-        eligibility_.retire(); link_.stop(); confirmation_.flush(true); last_source_.reset();
+        link_.stop(); eligibility_.retire(); confirmation_.flush(true); last_source_.reset();
     }
     void set_io_checkpoint_interval(std::chrono::milliseconds interval) noexcept {
         link_.set_io_checkpoint_interval(interval);

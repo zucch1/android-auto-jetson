@@ -111,6 +111,7 @@ protected:
         else { ASSERT_TRUE(receiver->reconnect(*control, identity)); }
         if (connect) { ASSERT_EQ(bluez.command("NewConnection"), "allowed"); }
         ASSERT_TRUE(eventually([&] { pump(); return occupied(); }, 10s));
+        std::string after_success;
         auto phone = std::async(std::launch::async, [&] {
             std::vector<std::uint8_t> buffered;
             std::size_t offset{};
@@ -143,10 +144,18 @@ protected:
             ASSERT_TRUE(read_record(11));
             ASSERT_TRUE(read_record(1));
             ASSERT_EQ(bluez.command("wire-send 00020007200c00020006100c"), "ok");
-            ASSERT_TRUE(eventually([&] { return bluez.command("wire-read") == "closed"; }));
+            // Success keeps the channel (#161): nothing more arrives on it. It reads closed only once
+            // this receiver retired the hand-off (DISC), which the owner thread checks below.
+            after_success = bluez.command("wire-read");
         });
         ASSERT_TRUE(eventually([&] { pump(); return phone.wait_for(0ms) == std::future_status::ready; }, 5s));
         phone.get(); ASSERT_FALSE(HasFatalFailure());
+        ASSERT_TRUE(after_success == "open" || after_success == "closed") << "unexpected RFCOMM data: " << after_success;
+        if (after_success == "closed") {
+            pump();
+            ASSERT_FALSE(occupied()) << "RFCOMM closed after success while the hand-off was still admitted";
+            FAIL() << "the receiver retired the completed hand-off during admission (its evidence expired)";
+        }
         const auto terminal = observe_snapshot(); ASSERT_TRUE(terminal);
     }
     void closed() {
@@ -159,6 +168,11 @@ protected:
         EXPECT_LE(*timing.admission_closed, 1000);
         EXPECT_FALSE(receiver->active()); timing.link_retired = timing.elapsed();
         EXPECT_FALSE(client->get_ap_credentials({consumer.value, 0}, old_handle));
+    }
+    // The retired hand-off's RFCOMM channel reaches the phone as EOF (DISC, #161), even though
+    // BlueZ keeps its own reference.
+    void old_channel_closed() {
+        EXPECT_TRUE(eventually([&] { pump(); return bluez.command("wire-read") == "closed"; }, 3s));
     }
     void stays_retired() {
         for (int i = 0; i < 5; ++i) { pump(); EXPECT_FALSE(occupied()); }
@@ -196,12 +210,14 @@ protected:
         if (timing.new_activation > timing.old_activation) { EXPECT_NE(observation->generation, old_snapshot_generation); }
         EXPECT_LE(*timing.terminal_recovery, 15000);
     }
-    void record_cleanup_observations(const char* nm_state, const char* nft_state) {
+    // fresh_handoff: a recovered hand-off now holds the latest RFCOMM channel, whose state belongs
+    // to that hand-off; the old channel's closure was proven by old_channel_closed() (#161).
+    void record_cleanup_observations(const char* nm_state, const char* nft_state, bool fresh_handoff = false) {
         RecordProperty("cleanup_nm", nm_state); RecordProperty("cleanup_nft", nft_state);
         const auto bluetooth = bluez.command("state");
         EXPECT_NE(bluetooth.find("\"Pairable\": false"), std::string::npos);
         const bool profile = bluetooth.find("4de17a00-52cb-11e6-bdf4-0800200c9a66") != std::string::npos;
-        EXPECT_EQ(bluez.command("wire-read"), "closed");
+        if (!fresh_handoff) { EXPECT_EQ(bluez.command("wire-read"), "closed"); }
         RecordProperty("cleanup_bluez", std::string{profile ? "helper-global profile retained" : "profile absent"} +
             "; pairing closed; RFCOMM closed");
     }
