@@ -216,6 +216,11 @@ class ObservedSessionMutex {
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <regex>
+#include <cstring>
+#include <algorithm>
+#include <deque>
+#include <functional>
 #include <sstream>
 #include <tuple>
 #include <unistd.h>
@@ -3793,7 +3798,7 @@ TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst)
         CadencedPcmSource source;
         source.burst = stall_ms < 0; // Deliberately ACK-paced worst-case, NOT normal PCM cadence.
         // 8 chunks put the last arrival only ~200 ms behind the cursor (step-size
-        // dependent); 16 exceed the cap unambiguously.
+        // dependent); 16 exceeded the cap unambiguously before the #154 catch-up.
         if (source.burst) { source.chunks = 16; }
         auto gate = std::make_shared<RenderGate>();
         gate->first_write_delay = std::chrono::milliseconds{std::abs(stall_ms)};
@@ -3814,12 +3819,16 @@ TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst)
         EXPECT_EQ(result.output.find("\"event\":\"audio_credit_deferred\"") != std::string::npos,
                   deferred) << result.output;
         if (source.burst) {
-            // Credit pacing holds the queue, but an unpaced source still runs
-            // >200 ms ahead of the cursor: the router's unchanged late-arrival
-            // cap, not queue overflow, ends this deliberately unrealistic case.
-            EXPECT_EQ(result.code, 1) << result.output;
-            EXPECT_NE(result.output.find("\"detail\":\"audio_sink_failure\",\"code\":\"invalid_argument\""),
+            // Credit pacing holds the queue, but an unpaced source places its
+            // chunks ever further behind their arrival. Phones do burst like
+            // this after a sink stall (#154, live), so the catch-up drops the
+            // part more than 90 ms behind arrival instead of letting a later
+            // chunk fail the 200 ms late-arrival cap and end the session.
+            EXPECT_EQ(result.code, 0) << result.output;
+            EXPECT_EQ(result.output.find("\"event\":\"err\""), std::string::npos) << result.output;
+            EXPECT_NE(result.output.find("{\"event\":\"audio_catch_up\",\"frames\":"),
                       std::string::npos) << result.output;
+            EXPECT_EQ(source.acks.size(), source.arrivals.size()) << result.output;
             std::cout << "STALL_RESULT mode=worst_case_burst stall_ms=" << std::abs(stall_ms)
                       << " exit=" << result.code << " arrivals=" << source.arrivals.size()
                       << " acks=" << source.acks.size() << '\n' << result.output;
@@ -6132,6 +6141,205 @@ TEST(WiredReceiver, WorkerSinkStallPastScheduledEndSkipsElapsedGapInsteadOfFaili
     const auto event = output.find("{\"event\":\"audio_sink_stall\",");
     ASSERT_NE(event, std::string::npos) << output;
     EXPECT_EQ(output.find("\"event\":\"audio_sink_stall\"", event + 2), std::string::npos) << output;
+}
+
+// #154: after a sink stall the phone delivers its withheld backlog in a burst,
+// stamped at about one arrival. The production policy drops the part of that
+// burst more than 90 ms behind its arrival, so the next real-time arrival is
+// placed normally. Before the catch-up the burst was carried ~600 ms behind
+// its arrival and that arrival failed the 200 ms late cap: an
+// audio_sink_failure that ended the session (live: 500 ms pipewire-pulse pause).
+TEST(WiredReceiver, WorkerStallBurstCatchesUpInsteadOfEndingTheSession) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(8192, std::byte{1}); // one 42.67 ms phone chunk
+    const auto arrival = steady_ns();
+    for (std::uint64_t sequence = 1; sequence <= 16; ++sequence) {
+        ASSERT_TRUE(audio.submit({{role, sequence, {arrival}}, pcm}, {role, 0, sequence, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        ASSERT_FALSE(audio.failure()) << sequence;
+    }
+    ASSERT_TRUE(audio.submit({{role, 17, {arrival + 100'000'000}}, pcm}, {role, 0, 17, 7}));
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    const bool failed = audio.failure().has_value();
+    const bool finished = audio.finish().has_value();
+    const auto output = capture.release();
+    ASSERT_FALSE(failed) << output;
+    ASSERT_TRUE(finished) << output;
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+    EXPECT_NE(output.find("{\"event\":\"audio_catch_up\",\"frames\":"), std::string::npos) << output;
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    EXPECT_FALSE(report->render_failure);
+    // The qualification collector sums each event's own increment at its
+    // logged rate (#154 review): together they account every catch-up frame.
+    const std::regex catch_up{
+        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)\})"};
+    std::uint64_t logged{};
+    std::uint64_t last_total{};
+    std::size_t events{};
+    for (auto it = std::sregex_iterator(output.begin(), output.end(), catch_up); it != std::sregex_iterator{}; ++it) {
+        logged += std::stoull((*it)[1].str());
+        last_total = std::stoull((*it)[2].str());
+        ++events;
+        // The running lifetime totals restore any record the media log drops.
+        EXPECT_EQ(std::stoull((*it)[3].str()), events) << output;
+        EXPECT_EQ(std::stoull((*it)[4].str()), logged) << output;
+    }
+    EXPECT_GT(events, 0U) << output;
+    EXPECT_EQ(logged, report->stats.frames_caught_up) << output;
+    EXPECT_EQ(last_total, report->stats.frames_caught_up) << output;
+    // The resumed chunk is written whole, at most 90 ms + one chunk behind its arrival.
+    std::lock_guard lock(gate->mutex);
+    ASSERT_FALSE(gate->timestamps.empty());
+    EXPECT_EQ(gate->pcm.back(), pcm);
+    EXPECT_LE(gate->timestamps.back().count, arrival + 100'000'000 + 90'000'000);
+}
+
+// Guidance in its production format (16 kHz mono, resampled to the 48 kHz
+// output) takes the same catch-up path: a prompt burst after a sink stall is
+// trimmed instead of pushing the resumed arrival past the 200 ms late cap.
+TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    const auto config = pcm_router_config();
+    const auto guidance_format =
+        config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format;
+    ASSERT_EQ(guidance_format, (aa::audio::AudioFormat{16000, 1, 16}));
+    ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto role = aa::protocol::ChannelRole::guidance_audio;
+    const std::vector<std::byte> pcm(2048, std::byte{1}); // 1024 mono frames: 64 ms at 16 kHz
+    const auto arrival = steady_ns();
+    for (std::uint64_t sequence = 1; sequence <= 16; ++sequence) {
+        ASSERT_TRUE(audio.submit({{role, sequence, {arrival}}, pcm}, {role, 0, sequence, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        ASSERT_FALSE(audio.failure()) << sequence;
+    }
+    ASSERT_TRUE(audio.submit({{role, 17, {arrival + 100'000'000}}, pcm}, {role, 0, 17, 7}));
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    const bool failed = audio.failure().has_value();
+    const bool finished = audio.finish().has_value();
+    const auto output = capture.release();
+    ASSERT_FALSE(failed) << output;
+    ASSERT_TRUE(finished) << output;
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    EXPECT_FALSE(report->render_failure);
+    // Logged at the 48 kHz output rate, never the 16 kHz input rate.
+    const std::regex catch_up{
+        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)\})"};
+    std::uint64_t logged{};
+    std::size_t events{};
+    for (auto it = std::sregex_iterator(output.begin(), output.end(), catch_up); it != std::sregex_iterator{}; ++it) {
+        logged += std::stoull((*it)[1].str());
+        ++events;
+    }
+    EXPECT_GT(events, 0U) << output;
+    EXPECT_GT(report->stats.frames_caught_up, 0U);
+    EXPECT_EQ(logged, report->stats.frames_caught_up) << output;
+    std::lock_guard lock(gate->mutex);
+    ASSERT_FALSE(gate->timestamps.empty());
+    EXPECT_LE(gate->timestamps.back().count, arrival + 100'000'000 + 90'000'000);
+}
+
+// A stand-in for the guidance resampler with a fixed output schedule (#155
+// Sol check): call i returns the oldest script(i, buffered) of the 48 kHz
+// stereo frames buffered so far (three per 16 kHz sample), at least one. 48
+// kHz stereo payloads pass through 1:1.
+aa::audio::detail::TestDecodeFn scripted_resampler(
+    std::function<std::size_t(std::size_t, std::size_t)> script) {
+    struct State {
+        std::function<std::size_t(std::size_t, std::size_t)> script;
+        std::deque<std::int16_t> buffered;
+        std::size_t calls = 0;
+    };
+    auto state = std::make_shared<State>(State{std::move(script), {}, 0});
+    return [state](const aa::audio::EncodedChunk &chunk) -> aa::core::Result<std::vector<std::byte>> {
+        if (chunk.input_format.sample_rate_hz == 48000) {
+            return std::vector<std::byte>(chunk.payload.begin(), chunk.payload.end());
+        }
+        for (std::size_t i = 0; i + 1 < chunk.payload.size(); i += 2) {
+            std::int16_t sample = 0;
+            std::memcpy(&sample, chunk.payload.data() + i, sizeof(sample));
+            state->buffered.insert(state->buffered.end(), 3, sample);
+        }
+        const auto count = std::clamp<std::size_t>(state->script(state->calls++, state->buffered.size()),
+                                                   1, state->buffered.size());
+        std::vector<std::byte> out(count * 4);
+        for (std::size_t f = 0; f < count; ++f) {
+            const auto value = state->buffered.front();
+            state->buffered.pop_front();
+            std::memcpy(out.data() + f * 4, &value, sizeof(value));
+            std::memcpy(out.data() + f * 4 + 2, &value, sizeof(value));
+        }
+        return out;
+    };
+}
+
+// The production worker admits 6400-byte guidance parents: 200 ms of 16 kHz
+// mono. A burst of them stamped 0, 1, 10 and 12 ms apart (Sol re-review and
+// check of #155) starts each later parent more than 200 ms behind the cursor
+// although its own audio is fresh, and the resampler may split a parent or
+// coalesce several into one run. Through the production worker, the burst is
+// trimmed rather than ending the session on every output schedule - fixed
+// splits and coalescings, Sol's 19098-frame run - and on the real decoder.
+TEST(WiredReceiver, WorkerMaxSizeGuidanceBurstSurvivesTheLateCap) {
+    ReceiverLogScope logging{g_running};
+    using Script = std::function<std::size_t(std::size_t, std::size_t)>;
+    const std::vector<std::pair<std::string, Script>> schedules{
+        {"real decoder", {}},
+        {"one parent per run", [](std::size_t, std::size_t) { return std::size_t{9600}; }},
+        {"split then coalesced", [](std::size_t call, std::size_t buffered) {
+            return call % 2 == 0 ? std::size_t{96} : buffered; }},
+        {"sol 19098-frame run", [](std::size_t call, std::size_t buffered) {
+            return call == 0 ? std::size_t{96} : call == 1 ? std::size_t{19098} : buffered; }},
+        {"three into one", [](std::size_t call, std::size_t buffered) {
+            return call % 3 == 2 ? buffered : std::size_t{96}; }},
+    };
+    for (const auto &[name, script] : schedules) {
+        SCOPED_TRACE(name);
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        const Script schedule = script;
+        auto open = schedule
+            ? ConcreteAudioRenderWorker::OpenRouter{[gate, schedule](const auto &config) {
+                  return aa::audio::detail::open_router_with_decoder_for_test(
+                      config, std::make_unique<GatedRenderSink>(gate), scripted_resampler(schedule));
+              }}
+            : gated_router(gate);
+        ConcreteAudioRenderWorker audio{pcm_router_config(), std::move(open)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::guidance_audio;
+        const std::vector<std::byte> pcm(6400, std::byte{1}); // the admitted maximum: 200 ms
+        const auto arrival = steady_ns();
+        std::uint64_t sequence = 1;
+        for (const std::int64_t offset_ms : {0, 1, 10, 12, 12, 13, 20, 20}) {
+            ASSERT_TRUE(audio.submit({{role, sequence, {arrival + offset_ms * 1'000'000}}, pcm},
+                                     {role, 0, sequence, 7})) << sequence;
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_FALSE(audio.failure()) << sequence;
+            ++sequence;
+        }
+        const bool finished = audio.finish().has_value();
+        const auto output = capture.release();
+        ASSERT_TRUE(finished) << output;
+        EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+        EXPECT_NE(output.find("{\"event\":\"audio_catch_up\""), std::string::npos) << output;
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_FALSE(report->render_failure);
+        EXPECT_GT(report->stats.frames_caught_up, 0U);
+    }
 }
 
 TEST(WiredReceiver, WorkerStartupInflightAndOtherRolePendingNeverAuthorizeIdle) {

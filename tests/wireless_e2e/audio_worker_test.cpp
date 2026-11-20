@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -61,12 +62,14 @@ struct SinkGate final {
     bool block_first_write{false};
     bool released{false};
     bool fail_first_write{false};
+    std::size_t fail_write_index{0};
     std::size_t writes_entered{0};
     std::size_t writes_completed{0};
     std::size_t sinks_opened{0};
     std::size_t sinks_destroyed{0};
     std::vector<std::thread::id> write_threads;
     std::vector<std::vector<std::byte>> pcm;
+    std::vector<aa::core::Nanoseconds> timestamps;
 
     void release() {
         std::lock_guard lock(mutex);
@@ -96,6 +99,7 @@ public:
         const std::size_t index = ++gate_->writes_entered;
         gate_->write_threads.push_back(std::this_thread::get_id());
         gate_->pcm.emplace_back(chunk.pcm.begin(), chunk.pcm.end());
+        gate_->timestamps.push_back(chunk.timestamp);
         gate_->cv.notify_all();
 
         if (index == 1 && gate_->block_first_write) {
@@ -104,7 +108,8 @@ public:
                 return aa::Error{aa::ErrorCode::timeout};
             }
         }
-        if (index == 1 && gate_->fail_first_write) {
+        if ((index == 1 && gate_->fail_first_write) ||
+            (gate_->fail_write_index != 0 && index == gate_->fail_write_index)) {
             return aa::Error{aa::ErrorCode::timeout};
         }
         ++gate_->writes_completed;
@@ -261,8 +266,8 @@ TEST(WirelessAudioWorker, StalledSinkDoesNotBlockSessionThreadOrIngress) {
     auto gate = std::make_shared<SinkGate>();
     gate->block_first_write = true;
 
-    audio::AudioRenderWorker audio{wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
-                                   fake_router(gate)};
+    audio::AudioRenderWorker audio{wr::audio_config(audio::SinkBackend::pulse),
+                                   wr::audio_telemetry(), fake_router(gate)};
     ASSERT_TRUE(audio.ready());
 
     wr::Media media{audio};
@@ -454,11 +459,16 @@ TEST(WirelessAudioWorker, StallBypassTriggersAndReopensOnWriteError) {
 TEST(WirelessAudioWorker, TelemetryEventParityWithCollectorAndSmokeContracts) {
     wr::running.store(true);
 
-    // 1. Verify wireless router configuration matches wired live-PCM drift + backend contract.
+    // 1. Verify wireless router configuration matches wired live-PCM drift + backend contract,
+    //    with catch-up configurable and off by default (#155).
     const auto cfg = wr::audio_config(audio::SinkBackend::pulse);
     EXPECT_EQ(cfg.backend, audio::SinkBackend::pulse);
     EXPECT_TRUE(cfg.live_pcm_drift.enabled);
+    EXPECT_EQ(cfg.live_pcm_drift.catch_up_watermark, aa::core::Nanoseconds{0});
     EXPECT_TRUE(static_cast<bool>(cfg.on_write_completed));
+    const auto catch_up_cfg =
+        wr::audio_config(audio::SinkBackend::pulse, aa::core::Nanoseconds{90'000'000});
+    EXPECT_EQ(catch_up_cfg.live_pcm_drift.catch_up_watermark, aa::core::Nanoseconds{90'000'000});
 
     // 2. Verify DiagnosticOutput emits {"event":"diag",...} and worker emits exact audio JSON events.
     auto gate = std::make_shared<SinkGate>();
@@ -545,8 +555,9 @@ TEST(WirelessAudioWorker, TelemetryEventParityWithCollectorAndSmokeContracts) {
         "\"scheduled_end_ns\":21000,\"completed_ns\":20500,"
         "\"presented_ns\":22000,\"playback_slot_absence\":null}");
     EXPECT_EQ(
-        audio::audio_catch_up_json(960, 1920, 48000),
-        "{\"event\":\"audio_catch_up\",\"frames\":960,\"frames_total\":1920,\"rate\":48000}");
+        audio::audio_catch_up_json(960, 1920, 48000, 3, 4800),
+        "{\"event\":\"audio_catch_up\",\"frames\":960,\"frames_total\":1920,\"rate\":48000,"
+        "\"events_lifetime\":3,\"frames_lifetime\":4800}");
 }
 
 TEST(WirelessAudioWorker, ReconnectResetsGenerationAndFailureSurfacesPollErrorJson) {
@@ -731,6 +742,213 @@ TEST(WirelessAudioWorker, SessionResetClearsPriorBypassAndProtectsNewPcmFromLate
         EXPECT_GE(gate->sinks_opened, 2U);
         EXPECT_EQ(gate->writes_entered, 4U) << output;
         EXPECT_EQ(gate->writes_completed, 3U) << output;
+    }
+}
+
+// #155 F2/F4: normal wireless TCP coalesced delivery (3 x 50 ms chunks within
+// 5 ms) must not be trimmed under the production wireless default (catch-up off),
+// while configuring the 90 ms watermark trims a post-stall burst and survives.
+TEST(WirelessAudioWorker, NormalCoalescedBurstIsNotTrimmedAndPostStallBurstCatchesUpWhenEnabled) {
+    // 1. Production wireless default (catch-up off): 3 x 50 ms chunks arriving
+    //    within 2 ms produce zero catch-up loss and deliver all three writes.
+    {
+        wr::running.store(true);
+        auto gate = std::make_shared<SinkGate>();
+        std::string output;
+        std::optional<audio::RouterReport> report;
+        bool finish_ok = false;
+        {
+            StdoutCapture capture;
+            diag::StdoutLogScope logging{wr::running};
+            audio::AudioRenderWorker audio{
+                wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
+                fake_router(gate)};
+            ASSERT_TRUE(audio.ready());
+            wr::Media media{audio};
+            SessionHarness h;
+            ASSERT_NO_FATAL_FAILURE(h.start(media));
+            for (std::uint64_t i = 0; i < 3; ++i) {
+                ASSERT_TRUE(h.send_service(100, av_data_message(1'000'000'000ULL + i * 50'000'000ULL,
+                                                                pcm_50ms())));
+                ASSERT_TRUE(app::service_audio_completions(h.session, audio));
+                h.clock.advance(aa::core::Milliseconds{1});
+            }
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_TRUE(app::service_audio_completions(h.session, audio));
+            EXPECT_FALSE(audio.failure().has_value());
+            audio.stop();
+            finish_ok = audio.finish().has_value();
+            report = audio.final_report();
+            logging.log.finish();
+            output = capture.stop();
+        }
+        EXPECT_TRUE(finish_ok) << output;
+        ASSERT_TRUE(report.has_value());
+        EXPECT_EQ(report->stats.frames_caught_up, 0U) << output;
+        EXPECT_EQ(output.find("\"event\":\"audio_catch_up\""), std::string::npos) << output;
+        std::lock_guard lock(gate->mutex);
+        EXPECT_EQ(gate->writes_completed, 3U);
+    }
+
+    // 2. Wireless with catch-up configured on (90 ms): a 16-chunk post-stall
+    //    burst stamped at one arrival is trimmed instead of ending the session.
+    {
+        wr::running.store(true);
+        auto gate = std::make_shared<SinkGate>();
+        std::string output;
+        std::optional<audio::RouterReport> report;
+        bool finish_ok = false;
+        aa::core::Nanoseconds arrival{};
+        {
+            StdoutCapture capture;
+            diag::StdoutLogScope logging{wr::running};
+            audio::AudioRenderWorker audio{
+                wr::audio_config(audio::SinkBackend::pulse, aa::core::Nanoseconds{90'000'000}),
+                wr::audio_telemetry(), fake_router(gate)};
+            ASSERT_TRUE(audio.ready());
+            wr::Media media{audio};
+            SessionHarness h;
+            ASSERT_NO_FATAL_FAILURE(h.start(media));
+            arrival = h.clock.now();
+            const std::vector<std::byte> chunk_42ms(8192, std::byte{0x22});
+            for (std::uint64_t i = 0; i < 16; ++i) {
+                ASSERT_TRUE(h.send_service(100, av_data_message(1'000'000'000ULL + i * 42'666'667ULL,
+                                                                chunk_42ms)));
+                ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+                ASSERT_TRUE(app::service_audio_completions(h.session, audio));
+                ASSERT_FALSE(audio.failure().has_value()) << i;
+            }
+            h.clock.advance(aa::core::Milliseconds{100});
+            ASSERT_TRUE(h.send_service(100, av_data_message(2'000'000'000ULL, chunk_42ms)));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_TRUE(app::service_audio_completions(h.session, audio));
+            EXPECT_FALSE(audio.failure().has_value());
+            audio.stop();
+            finish_ok = audio.finish().has_value();
+            report = audio.final_report();
+            logging.log.finish();
+            output = capture.stop();
+        }
+        EXPECT_TRUE(finish_ok) << output;
+        EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+        ASSERT_TRUE(report.has_value());
+        EXPECT_FALSE(report->render_failure.has_value());
+        EXPECT_GT(report->stats.frames_caught_up, 0U);
+        const std::regex catch_up{
+            R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)\})"};
+        std::uint64_t logged = 0;
+        std::uint64_t last_total = 0;
+        std::size_t events = 0;
+        for (auto it = std::sregex_iterator(output.begin(), output.end(), catch_up);
+             it != std::sregex_iterator{}; ++it) {
+            logged += std::stoull((*it)[1].str());
+            last_total = std::stoull((*it)[2].str());
+            ++events;
+            EXPECT_EQ(std::stoull((*it)[3].str()), events) << output;
+            EXPECT_EQ(std::stoull((*it)[4].str()), logged) << output;
+        }
+        EXPECT_GT(events, 0U) << output;
+        EXPECT_EQ(logged, report->stats.frames_caught_up) << output;
+        EXPECT_EQ(last_total, report->stats.frames_caught_up) << output;
+        std::lock_guard lock(gate->mutex);
+        ASSERT_FALSE(gate->timestamps.empty());
+        EXPECT_LE(gate->timestamps.back().count, arrival.count + 100'000'000 + 90'000'000);
+    }
+}
+
+// #155 F4: worker-lifetime catch-up totals (events_lifetime, frames_lifetime)
+// continue monotonically across a real sink_write_error + sink reopen while
+// per-router frames_total resets on the reopened AudioRouter.
+TEST(WirelessAudioWorker, CatchUpLifetimeTotalsSurviveRealSinkReopen) {
+    wr::running.store(true);
+    auto gate = std::make_shared<SinkGate>();
+    std::string output;
+    std::optional<audio::RouterReport> report;
+    bool finish_ok = false;
+    {
+        StdoutCapture capture;
+        diag::StdoutLogScope logging{wr::running};
+        audio::AudioRenderWorker audio{
+            wr::audio_config(audio::SinkBackend::pulse, aa::core::Nanoseconds{90'000'000}),
+            wr::audio_telemetry(), fake_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = proto::ChannelRole::media_audio;
+        const std::vector<std::byte> chunk(8192, std::byte{0x33}); // 2048 frames (42.67 ms)
+        const auto base = audio::AudioRenderWorker::monotonic_now().count;
+        std::uint64_t seq = 1;
+
+        // Burst 1: 6 chunks at base -> chunks 4-6 caught up (3 events, 3 * 1808 = 5424 frames).
+        for (int i = 0; i < 6; ++i, ++seq) {
+            ASSERT_TRUE(audio.submit({{role, seq, {base}}, chunk}, {role, 0, seq, 7}));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_FALSE(audio.failure().has_value()) << seq;
+        }
+
+        // Force a real sink_write_error on the next write -> worker reopens a fresh sink.
+        {
+            std::lock_guard lock(gate->mutex);
+            gate->fail_write_index = gate->writes_entered + 1;
+        }
+        ASSERT_TRUE(audio.submit({{role, seq, {base + 100'000'000}}, chunk}, {role, 0, seq, 7}));
+        ++seq;
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        ASSERT_FALSE(audio.failure().has_value());
+        {
+            std::lock_guard lock(gate->mutex);
+            ASSERT_GE(gate->sinks_opened, 2U);
+            gate->fail_write_index = 0;
+        }
+
+        // Burst 2 on the reopened router: 6 chunks at base + 300 ms -> 3 more events (5424 frames).
+        for (int i = 0; i < 6; ++i, ++seq) {
+            ASSERT_TRUE(audio.submit({{role, seq, {base + 300'000'000}}, chunk}, {role, 0, seq, 7}));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_FALSE(audio.failure().has_value()) << seq;
+        }
+
+        audio.stop();
+        finish_ok = audio.finish().has_value();
+        report = audio.final_report();
+        logging.log.finish();
+        output = capture.stop();
+    }
+
+    EXPECT_TRUE(finish_ok) << output;
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+    EXPECT_NE(output.find("\"event\":\"audio_sink_selected\",\"origin\":\"reopen\""),
+              std::string::npos) << output;
+    ASSERT_TRUE(report.has_value());
+    EXPECT_EQ(report->stats.frames_caught_up, 3U * 1808U);
+
+    struct Record {
+        std::uint64_t frames;
+        std::uint64_t frames_total;
+        std::uint64_t events_lifetime;
+        std::uint64_t frames_lifetime;
+    };
+    const std::regex catch_up{
+        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)\})"};
+    std::vector<Record> records;
+    for (auto it = std::sregex_iterator(output.begin(), output.end(), catch_up);
+         it != std::sregex_iterator{}; ++it) {
+        records.push_back({std::stoull((*it)[1].str()), std::stoull((*it)[2].str()),
+                           std::stoull((*it)[3].str()), std::stoull((*it)[4].str())});
+    }
+    ASSERT_EQ(records.size(), 6U) << output;
+    // Before reopen: frames_total tracks frames_lifetime (1808, 3616, 5424).
+    for (std::size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(records[i].frames, 1808U);
+        EXPECT_EQ(records[i].frames_total, (i + 1) * 1808U);
+        EXPECT_EQ(records[i].events_lifetime, i + 1);
+        EXPECT_EQ(records[i].frames_lifetime, (i + 1) * 1808U);
+    }
+    // After reopen: frames_total resets (1808, 3616, 5424) while lifetime totals keep advancing.
+    for (std::size_t i = 3; i < 6; ++i) {
+        EXPECT_EQ(records[i].frames, 1808U);
+        EXPECT_EQ(records[i].frames_total, (i - 2) * 1808U);
+        EXPECT_LT(records[i].frames_total, records[i].frames_lifetime);
+        EXPECT_EQ(records[i].events_lifetime, i + 1);
+        EXPECT_EQ(records[i].frames_lifetime, (i + 1) * 1808U);
     }
 }
 

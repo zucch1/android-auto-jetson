@@ -123,10 +123,12 @@ void log_sink_selected(const SinkReport& selected, std::string_view origin,
 [[nodiscard]] std::string audio_write_completed_json(const WriteCompletion& completion);
 [[nodiscard]] std::string audio_chunks_json(std::uint64_t count);
 [[nodiscard]] std::string media_timing_json(const RouterStats& stats);
-// #155 catch-up telemetry seam: emitted once PR #155 lands LivePcmDriftPolicy::catch_up_watermark
-// and RouterStats::frames_caught_up.
+// #155 catch-up record: one render step's LivePcmDriftPolicy::catch_up_watermark
+// trim (RouterStats::frames_caught_up delta and total) plus the worker's
+// lifetime event/frame totals across sink reopens.
 [[nodiscard]] std::string audio_catch_up_json(std::uint64_t frames, std::uint64_t total,
-                                              std::uint32_t rate);
+                                              std::uint32_t rate, std::uint64_t events_lifetime,
+                                              std::uint64_t frames_lifetime);
 
 [[nodiscard]] std::string sink_write_json(const SinkWriteProgress& value);
 [[nodiscard]] std::string audio_dispatch_json(const AudioDispatchObservation& value);

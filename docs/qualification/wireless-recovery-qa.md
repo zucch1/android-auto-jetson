@@ -34,6 +34,19 @@ first: Android Auto suppresses wireless setup while it believes a USB head unit
 is attached ("Ignoring wireless setup event because of USB accessory device
 attached", window 3, 2026-11-18).
 
+## Audio drift catch-up policy (#155, #163)
+
+`aa-wireless-receiver` shares `AudioRenderWorker` and `pcm_router_config()` with
+the wired receiver (`live_pcm_drift.enabled = true`, bounded 5 ms head trim
+above 20 ms). Unlike wired (which enables the 90 ms post-stall catch-up
+watermark by default), wireless leaves catch-up **disabled by default**
+(`--audio-catch-up-watermark-ms 0`) because receiver-arrival timestamping makes
+normal TCP coalesced bursts (e.g. three 50 ms chunks arriving within 5 ms)
+exceed 90 ms placement phase without a sink stall. Passing a non-zero
+`--audio-catch-up-watermark-ms` opts in to post-stall backlog trimming and logs
+dropped frames as `{"event":"audio_catch_up",...}` (accounted separately from
+`audio_stall_*` in v3 perf captures).
+
 ## Run
 
 ```sh

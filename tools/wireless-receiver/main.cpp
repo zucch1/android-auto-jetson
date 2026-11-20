@@ -28,6 +28,8 @@ constexpr const char* usage =
     "  --helper-bus-address ADDRESS  explicit alternate helper bus (default: system bus)\n"
     "  --idr-recovery auto|nudge|transition  IDR recovery strategy (default auto)\n"
     "  --audio-sink pulse|pipewire|automatic  audio routing element (default pulse)\n"
+    "  --audio-catch-up-watermark-ms N        post-stall catch-up watermark in ms\n"
+    "                                         (0 disables catch-up, default 0; max 1000)\n"
     "  --diagnostics        emit redacted diagnostic JSON to stdout\n"
     "  --duration-ms N      bounded run (1..86400000 ms; omitted: until signal)\n"
     "  --ap-channel N       AP channel; must equal ap.conf (36, 40, 44 or 48; default 36)\n"
@@ -48,6 +50,7 @@ struct Options final {
     std::vector<protocol::VideoProfile> video_profiles{config::default_video_profiles()};
     ipc::IdrRecoveryStrategy idr_recovery{ipc::IdrRecoveryStrategy::auto_escalate};
     audio::SinkBackend audio_backend{audio::SinkBackend::pulse};
+    std::int64_t audio_catch_up_watermark_ms{0};
     std::int64_t duration_ms{};
     std::uint32_t ap_channel{36};
     bool exact_video_profiles{};
@@ -81,6 +84,13 @@ std::optional<Options> parse_options(int argc, char** argv) {
             else if (value == "pipewire") options.audio_backend = audio::SinkBackend::pipewire;
             else if (value == "automatic") options.audio_backend = audio::SinkBackend::automatic;
             else return std::nullopt;
+        }
+        else if (arg == "--audio-catch-up-watermark-ms") {
+            std::uint64_t number{};
+            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (error != std::errc{} || end != value.data() + value.size() || number > 1000)
+                return std::nullopt;
+            options.audio_catch_up_watermark_ms = static_cast<std::int64_t>(number);
         }
         else if (arg == "--helper-bus-address") options.helper_address = value;
         else if (arg == "--ap-channel") {
@@ -186,7 +196,10 @@ int receiver_main(int argc, char** argv) {
     aa::trust::SteadyClock trust_clock;
     aa::trust::PairingPolicy phones{store, trust_clock};
     aa::ipc::RandomPairingIdSource ids;
-    aa::audio::AudioRenderWorker audio_sink{audio_config(options->audio_backend), audio_telemetry()};
+    aa::audio::AudioRenderWorker audio_sink{
+        audio_config(options->audio_backend,
+                     aa::core::Nanoseconds{options->audio_catch_up_watermark_ms * 1'000'000LL}),
+        audio_telemetry()};
     const auto opened = audio_sink.ready();
     if (!opened) { running.store(false); }
     if (const auto report_sink = audio_sink.sink_report();

@@ -536,7 +536,18 @@ class EventParser:
             "ipc_p95_added_latency_ms": None, "av_sync_ms": None, "audio_latency_ms": None,
             "audio_scheduling_skew_ms": None, "audio_stall_dropouts": 0,
             "audio_stall_dropped_chunks": 0, "audio_stall_unrecovered": 0,
+            "audio_catch_up_events": 0, "audio_catch_up_frames": 0, "audio_catch_up_ms": 0.0,
         }
+        # Catch-up loss (#154), from the receiver's running lifetime totals:
+        # (events, frames, rate) of the newest record, None once malformed.
+        self.catch_up: tuple[int, int, int] | None = (0, 0, 0)
+        # A media_telemetry_dropped notice after the newest catch-up record
+        # may hide a later one: the totals are then unconfirmed (null).
+        self.catch_up_unconfirmed = False
+        # Every such doubt (a lossy notice, a malformed notice or a truncated
+        # catch-up or notice line) ever read: the collector compares it
+        # across its final poll, after the metrics froze.
+        self.catch_up_doubts = 0
         self.stall_open = False
         self.stall_failed = 0
         self.video_units: int | None = None
@@ -571,6 +582,56 @@ class EventParser:
         self.last_audio_scheduled = -1
         self.last_video_scheduled = -1
         self.video_measurements = VideoMeasurements()
+
+    def _catch_up(self, event: dict) -> None:
+        """Account one ``audio_catch_up`` event (#154): router audio dropped at once.
+
+        A placement backlog past the catch-up watermark is trimmed to the drift
+        target in one run instead of 5 ms per run. It is neither a sink stall
+        nor an ``audio_stall_bypass``, so it never feeds the ``audio_stall_*``
+        counters. Each record carries the render worker's running totals over
+        the receiver's life (``events_lifetime``, ``frames_lifetime``: output
+        frames at ``rate`` beyond the ordinary bounded drift trim), which
+        survive a sink reopen and restore any earlier record the droppable
+        media log lost. Frames and the event count stay separate units.
+        """
+        if self.catch_up is None:
+            return
+        fields = [event.get(key) for key in ("frames", "rate", "events_lifetime", "frames_lifetime")]
+        frames, rate, events, total = fields
+        last_events, last_total, last_rate = self.catch_up
+        if not (all(isinstance(value, int) and not isinstance(value, bool) and value > 0
+                    for value in fields)
+                and total >= frames and events > last_events and total > last_total
+                and last_rate in (0, rate)):
+            self.catch_up = None
+            self._publish_catch_up()
+            return
+        self.catch_up = (events, total, rate)
+        self.catch_up_unconfirmed = False
+        self._publish_catch_up()
+
+    def _media_dropped(self, event: dict) -> None:
+        counters = [event.get(key) for key in ("rate_limited", "backpressure")]
+        if (not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                    for value in counters)
+                or sum(counters) > 0):
+            self._doubt_catch_up()
+
+    def _doubt_catch_up(self) -> None:
+        """A catch-up record may be missing: unconfirmed until a later one."""
+        self.catch_up_doubts += 1
+        self.catch_up_unconfirmed = True
+        self._publish_catch_up()
+
+    def _publish_catch_up(self) -> None:
+        keys = ("audio_catch_up_events", "audio_catch_up_frames", "audio_catch_up_ms")
+        if self.catch_up is None or self.catch_up_unconfirmed:
+            for key in keys:
+                self.metrics[key] = None
+            return
+        events, total, rate = self.catch_up
+        self.metrics.update(zip(keys, (events, total, round(total * 1000 / rate, 6) if rate else 0.0)))
 
     def _record_progress(self, keys: tuple[str, ...], stamp: int) -> None:
         for key in keys:
@@ -733,7 +794,14 @@ class EventParser:
         prior = self.metrics[target]
         self.metrics[target] = max(prior, value) if peak and prior is not None else value
 
-    def poll(self, path: str) -> None:
+    def poll(self, path: str, final: bool = False) -> None:
+        """Consume the log's new complete lines.
+
+        A line still being written is left for the next poll, so a record is
+        never split into two unparseable halves. ``final`` (after the writer
+        exited) consumes the unterminated tail too: a record cut off there is
+        truncated for good.
+        """
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -749,13 +817,15 @@ class EventParser:
                 data = handle.read()
         except OSError:
             return
-        # Only complete lines are consumed; an unterminated tail stays unread
-        # (offset not advanced past it) until its newline arrives.
-        end = data.rfind(b"\n") + 1
+        # Only complete lines are consumed while the writer runs; an
+        # unterminated tail stays unread (offset not advanced past it) until
+        # its newline arrives. On `final` (after exit), consume any
+        # unterminated tail too so a cut-off record is noticed.
+        end = len(data) if final else data.rfind(b"\n") + 1
         self._source = path
         try:
-            for raw in data[:end].splitlines():
-                self._consume(raw.decode("utf-8", errors="replace"))
+            for line in data[:end].decode("utf-8", errors="replace").split("\n"):
+                self._consume(line)
         finally:
             self._source = None
         self.offsets[path] = offset + end
@@ -883,6 +953,9 @@ class EventParser:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            # A cut-off catch-up record or drop notice hides what it carried.
+            if '"audio_catch_up"' in line or '"media_telemetry_dropped"' in line:
+                self._doubt_catch_up()
             return
         if not isinstance(event, dict):
             return
@@ -938,6 +1011,10 @@ class EventParser:
                 int(self.metrics["audio_stall_dropped_chunks"] or 0) + lost)
         if envelope == "audio_stall_bypass":
             self.metrics["audio_stall_unrecovered"] = self.stall_failed + int(self.stall_open)
+        if envelope == "audio_catch_up":
+            self._catch_up(event)
+        if envelope == "media_telemetry_dropped":
+            self._media_dropped(event)
         if envelope == "video_sent" and isinstance(event.get("units"), int):
             self.video_units = event["units"]
         if envelope == "audio_chunks" and isinstance(event.get("count"), int):
@@ -1085,6 +1162,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     inventory: tuple[ThermalZone, ...] = ()
     video_evidence = VideoEvidence((), (), ())
     observed_duration = 0.0
+    catch_up_doubts_at_cutoff: int | None = None
     deadline = start + startup_timeout
 
     def read_sample() -> Sample:
@@ -1284,6 +1362,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         parser.cutoff_ns = origin_ns + progress.last_ns
         events = {key: value for key, value in parser.metrics.items()
                   if key not in {*_DECODE_KEYS.values(), *_IPC_KEYS.values()}}
+        catch_up_doubts_at_cutoff = parser.catch_up_doubts
         events["helper_rss_mb"] = None
         events["video_units"] = parser.video_units
         events["audio_chunks"] = parser.audio_chunks
@@ -1356,9 +1435,9 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             for failure in workload.restore_phone():
                 print(f"cleanup failure: {failure}", file=sys.stderr)
             args.cleanup_failures = list(workload.cleanup_failures)  # for --run-file
-        parser.poll(str(receiver_log))
+        parser.poll(str(receiver_log), final=True)
         if display is not None:
-            parser.poll(str(display_log))
+            parser.poll(str(display_log), final=True)
 
     # In-window records read after the cutoff count at their emission time
     # (#90 review 4): merged into the frozen export, or the metric is invalid.
@@ -1370,6 +1449,13 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     if parser.late_targets:
         invalid_telemetry = sorted(set(invalid_telemetry) | parser.late_targets
                                    | {"late_in_window_telemetry"})
+    if catch_up_doubts_at_cutoff is not None and parser.catch_up_doubts != catch_up_doubts_at_cutoff:
+        # #154: the catch-up totals froze at the cutoff, but a drop notice is
+        # reported only with a later media record - up to the receiver's stop
+        # (SIGTERM). One read only in this final poll may stand for a catch-up
+        # record from before the cutoff: the frozen totals are unconfirmed.
+        for key in ("audio_catch_up_events", "audio_catch_up_frames", "audio_catch_up_ms"):
+            events[key] = None
     if receiver is not None:
         receiver_exit = receiver.returncode
     if not stopped_by_us and receiver_exit is not None and receiver_exit != 0:

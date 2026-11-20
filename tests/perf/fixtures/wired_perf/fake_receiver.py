@@ -37,6 +37,13 @@ Env knobs for the test:
                          delivered late (#90 review 4). FAKE_RECEIVER_HELD_UNSTAMPED=1
                          writes it without emit_ns.
   Every media record carries the receiver's emit_ns (CLOCK_MONOTONIC).
+  FAKE_RECEIVER_RAW_TELEMETRY  raw receiver lines (newline-separated) printed
+                         verbatim after ``active``, behind one healthy
+                         ``media_timing`` line.
+  FAKE_RECEIVER_SHUTDOWN_TELEMETRY  raw text written verbatim on SIGTERM,
+                         just before the clean exit (as the receiver reports a
+                         pending drop notice with its last media records). A
+                         value not ending in a newline leaves a cut-off line.
   --require-usb-serial S emulates the receiver's same-phone pin (#137):
   FAKE_RECEIVER_ATTACHED_SERIAL (default S) is the phone on the port. A
   different one fails the first link (err code phone_serial_mismatch, exit 3,
@@ -108,6 +115,12 @@ def _finish() -> None:
 
 def _terminated(*_: object) -> None:
     print(json.dumps({"event": "stopping", "duration_ms": 0}), flush=True)
+    shutdown = os.environ.get("FAKE_RECEIVER_SHUTDOWN_TELEMETRY")
+    if shutdown:
+        sys.stdout.write(shutdown)
+        sys.stdout.flush()
+        if not shutdown.endswith("\n"):
+            sys.exit(0)
     _finish()
     sys.exit(0)
 
@@ -133,7 +146,8 @@ def main() -> int:
     raw_telemetry = os.environ.get("FAKE_RECEIVER_RAW_TELEMETRY")
     if raw_telemetry is not None:
         print('{"event":"media_timing","av_sync_ms":12,"audio_latency_ms":40}', flush=True)
-        print(raw_telemetry, flush=True)
+        for line in raw_telemetry.split("\n"):  # one raw event per line
+            print(line, flush=True)
 
     start = time.monotonic()
     tick = 0
