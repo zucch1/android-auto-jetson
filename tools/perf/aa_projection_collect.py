@@ -201,16 +201,18 @@ def _record_process(args: argparse.Namespace, role: str, pid: int) -> None:
 
 
 _ADB_BIND_TIMEOUT_SECONDS = 20.0
+# Phone setup after the bind (snapshots, wake, media, Maps) plus one sampling
+# interval before the window starts, with margin.
+_WIRELESS_PREPARE_HEADROOM_SECONDS = 120
+_RECEIVER_MAX_LIFETIME_MS = 86_400_000  # aa-wireless-receiver's --duration-ms limit
 _HOST_USB_PERIOD_SECONDS = 10.0
 
 
 def _host_adb(*args: str) -> subprocess.CompletedProcess:
     """Host-level ``adb`` (connect/disconnect over the AP link), bounded."""
-    try:
-        return subprocess.run(["adb", *args], capture_output=True, text=True,
-                              timeout=moving_map.ADB_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError) as error:
-        return subprocess.CompletedProcess(["adb", *args], 1, "", str(error))
+    # The same hard bound (TERM, KILL, abandoned pipes) as every phone command:
+    # `adb connect` may start the adb server, which would hold a captured pipe.
+    return moving_map.run_adb(["adb", *args])
 
 
 class PhoneSetupError(RuntimeError):
@@ -511,6 +513,7 @@ class EventParser:
         self.wireless = False
         self.session_id: object = None
         self.admissions = 0
+        self.readmitted = False  # an admission (or its expiry) after the first active session
         self.media_telemetry_dropped = 0
         self.metrics: dict[str, object] = {
             "frame_drops": None, "decode_p50_ms": None, "decode_p95_ms": None,
@@ -738,11 +741,15 @@ class EventParser:
         """The wireless receiver's session markers (tools/perf/aa_transport.py)."""
         if envelope == "media_telemetry_dropped":
             self.media_telemetry_dropped += 1
+        # Admission retries before the first active session are startup (the
+        # receiver gives each attempt 15 s); only after it are they a drop.
         if envelope == "wireless_admission":
             self.admissions += 1
-            if self.admissions > 1:
+            if self.session_id is not None:
+                self.readmitted = True
                 self.projection_active = False  # a re-admission: the link was lost
-        if envelope == "wireless_admission_expired":
+        if envelope == "wireless_admission_expired" and self.session_id is not None:
+            self.readmitted = True
             self.projection_active = False
         if transport.diag_kind(event) != "session_state_changed":
             return
@@ -754,7 +761,7 @@ class EventParser:
             self.session_id = session
             if type(mono) is int and self.receiver_started_ns is not None and self.startup_ms is None:
                 self.startup_ms = max(0, (mono - self.receiver_started_ns) // 10**6)
-            if self.admissions <= 1:
+            if not self.readmitted:
                 self.projection_active = True
         elif state in ("disconnected", "reconnecting", "failed", "stopping"):
             self.projection_active = False
@@ -888,10 +895,18 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     video_socket = getattr(args, "video_socket", None)
     input_socket = getattr(args, "input_socket", None)
     wireless = getattr(args, "transport", transport.DEFAULT_TRANSPORT) == "wireless"
-    lifetime_ms = str((args.duration_seconds + startup_timeout + 10) * 1000)
+    lifetime_s = args.duration_seconds + startup_timeout + 10
+    if wireless:
+        # Wireless binds adb and prepares the phone after the receiver is up
+        # (wired does it before launch): the receiver must outlive that too, or
+        # its own --duration-ms timer would end a healthy stage early.
+        lifetime_s += _ADB_BIND_TIMEOUT_SECONDS + _WIRELESS_PREPARE_HEADROOM_SECONDS
+    lifetime_ms = str(int(min(lifetime_s * 1000, _RECEIVER_MAX_LIFETIME_MS)))
     if wireless:
         receiver_cmd = [args.receiver, "--store-dir", str(Path(args.store).absolute().parent),
-                        "--phone-id", str(args.phone_id), "--diagnostics", "--duration-ms", lifetime_ms]
+                        "--phone-id", str(args.phone_id), "--diagnostics",
+                        *(["--ap-channel", str(args.ap_channel)] if getattr(args, "ap_channel", None) else []),
+                        "--duration-ms", lifetime_ms]
     else:
         receiver_cmd = [args.receiver, "--port", args.port, "--duration-ms", lifetime_ms]
     if args.store and not wireless:
@@ -981,13 +996,19 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     link: dict | None = None
     host_usb_due = 0.0
 
-    def bind_and_prepare() -> None:
-        """Wireless, once active: adb to the expected phone over the AP, then its setup."""
+    def bind_and_prepare() -> bool:
+        """Wireless, once active: adb to the expected phone over the AP, then its setup.
+
+        False when the receiver exited meanwhile: the caller's early-exit path
+        then judges the stage (a product failure, not an adb block).
+        """
         nonlocal deadline
         began = time.monotonic()
-        interface = transport.ap_interface(Path(getattr(args, "ap_conf", None) or transport.AP_CONF))
-        reason = "adb_unreachable" if interface else "adb_unreachable (no AP interface in ap.conf)"
-        while interface and time.monotonic() - began < _ADB_BIND_TIMEOUT_SECONDS:
+        interface = args.ap_interface
+        reason = "adb_unreachable"
+        while time.monotonic() - began < _ADB_BIND_TIMEOUT_SECONDS:
+            if receiver.poll() is not None:
+                return False
             candidate, reason = transport.session_candidate(
                 transport.receiver_session_peers(receiver.pid), transport.read_ap_stations(interface))
             bound = None
@@ -1005,6 +1026,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                 lambda seconds: (time.sleep(seconds), True)[1]):
             raise PhoneSetupError(workload.phone_failure or "phone setup did not complete")
         deadline += time.monotonic() - began  # the phone setup is not startup budget
+        return True
 
     def sample_host_usb() -> None:
         nonlocal host_usb_due
@@ -1087,7 +1109,9 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             if parser.terminal_errors:
                 break
             if wireless and not prepared and parser.projection_active:
-                bind_and_prepare()
+                if not bind_and_prepare():
+                    early_exit = True
+                    break
                 prepared = True
                 continue  # the next sample is the first that may start the window
             if prepared:
@@ -1278,8 +1302,11 @@ def _cli(argv: list[str]) -> int:
                         help="session transport (default wired)")
     parser.add_argument("--phone-id", type=int, default=None,
                         help="wireless: the approved wireless phone id in the trust store")
-    parser.add_argument("--ap-conf", default=None,
-                        help="wireless: the helper's ap.conf naming the AP interface (read-only)")
+    parser.add_argument("--ap-interface", default=None,
+                        help="wireless: the helper's AP interface (required; its root-only "
+                             "ap.conf is never read)")
+    parser.add_argument("--ap-channel", type=int, choices=transport.AP_CHANNELS, default=None,
+                        help="wireless: the AP channel ap.conf names (receiver default 36)")
     parser.add_argument("--duration-seconds", required=True, type=int)
     parser.add_argument("--interval", type=float, default=5.0)
     parser.add_argument("--store", default=None, help="approved-phone store path passed to receiver")
@@ -1318,9 +1345,11 @@ def _cli(argv: list[str]) -> int:
     args.cleanup_failures = []  # nothing has touched the phone yet
     if args.transport == "wireless" and (not args.phone_id or args.phone_id <= 0 or not args.store
                                          or Path(args.store).name != "approved-phones.json"
-                                         or not args.phone_serial):
+                                         or not args.phone_serial
+                                         or not transport.valid_interface(args.ap_interface)):
         print("usage error: --transport wireless needs --phone-id, --phone-serial (adb, for the "
-              "workload and the link record) and --store <dir>/approved-phones.json",
+              "workload and the link record), --ap-interface IFACE and "
+              "--store <dir>/approved-phones.json",
               file=sys.stderr)
         return 2
     if args.run_file:

@@ -687,20 +687,57 @@ def wireless_link_gap(capture: dict) -> str | None:
     return transport.link_gap(capture.get("link"))
 
 
-def _result_link(link: object) -> dict | None:
-    """The result's link record: the capture's, without the phone id (privacy)."""
-    if not isinstance(link, dict):
-        return None
-    host = link.get("host_usb") if isinstance(link.get("host_usb"), dict) else {}
-    keep = ("readable", "phone_attached", "aoa_attached")
+def _bool_or_none(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
 
-    def evidence(value: object) -> dict | None:
-        return {k: value.get(k) for k in keep} if isinstance(value, dict) else None
+
+def _int_or_none(value: object) -> int | None:
+    return value if type(value) is int else None
+
+
+def _host_evidence(value: object) -> dict | None:
+    """One host USB reading in the schema's shape; anything malformed is unreadable."""
+    if not isinstance(value, dict):
+        return None
+    if not isinstance(value.get("readable"), bool):
+        return {"readable": False, "phone_attached": None, "aoa_attached": None}
+    return {"readable": value["readable"], "phone_attached": _bool_or_none(value.get("phone_attached")),
+            "aoa_attached": _bool_or_none(value.get("aoa_attached"))}
+
+
+def _phone_snapshot(value: object) -> dict | None:
+    """The phone's own link snapshot in the schema's shape, or None when malformed."""
+    if not isinstance(value, dict):
+        return None
+    functions = value.get("usb_functions")
+    if not (isinstance(functions, list) and all(isinstance(f, str) for f in functions)):
+        functions = None
+    wifi = value.get("wifi") if isinstance(value.get("wifi"), dict) else {}
+    return {"usb_functions": functions, "usb_aoa": _bool_or_none(value.get("usb_aoa")),
+            "wifi": {"connected": _bool_or_none(wifi.get("connected")),
+                     "frequency_mhz": _int_or_none(wifi.get("frequency_mhz")),
+                     "channel": _int_or_none(wifi.get("channel")),
+                     "rssi_dbm": _int_or_none(wifi.get("rssi_dbm"))},
+            "bluetooth_on": _bool_or_none(value.get("bluetooth_on"))}
+
+
+def _result_link(link: object) -> dict:
+    """The result's link record: the capture's, without the phone id (privacy).
+
+    Always schema-valid, so a blocked or malformed wireless capture still
+    produces a result: a missing record is an unbound link with no evidence, a
+    malformed reading is unreadable. The gate is ``wireless_link_gap`` on the
+    raw capture, which BLOCKS all of these.
+    """
+    link = link if isinstance(link, dict) else {}
+    host = link.get("host_usb") if isinstance(link.get("host_usb"), dict) else {}
+    during = host.get("during") if isinstance(host.get("during"), list) else []
     return {"adb_bound": link.get("adb_bound") is True,
-            "before": link.get("before"), "after": link.get("after"),
-            "host_usb": {"before": evidence(host.get("before")),
-                         "during": [evidence(e) for e in host.get("during", []) if isinstance(e, dict)],
-                         "after": evidence(host.get("after"))}}
+            "before": _phone_snapshot(link.get("before")), "after": _phone_snapshot(link.get("after")),
+            "host_usb": {"before": _host_evidence(host.get("before")),
+                         "during": [_host_evidence(e) or {"readable": False, "phone_attached": None,
+                                                          "aoa_attached": None} for e in during],
+                         "after": _host_evidence(host.get("after"))}}
 
 
 def workload_gap(raw: object, window: Window | None) -> str | None:

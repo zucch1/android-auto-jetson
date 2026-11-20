@@ -720,14 +720,27 @@ adb, and with the cable out adb has to use TCP:
      there must be exactly one;
    - that address must be a station of the AP: a DHCP lease
      (`/var/lib/NetworkManager/dnsmasq-IFACE.leases`) or neighbour
-     (`ip -4 neigh show dev IFACE`), with IFACE from
-     `/etc/android-auto-receiver/ap.conf`;
+     (`ip -4 neigh show dev IFACE`). IFACE is `--ap-interface`, which the
+     operator passes (the interface the helper's `ap.conf` names). The harness
+     never reads `/etc/android-auto-receiver/ap.conf`: it is root-only (0600)
+     and sits beside the AP credentials;
+   - there must be exactly one IPv4 peer: a second peer, or any native IPv6
+     session socket, is `adb_session_ambiguous`, and a `/proc` table that
+     cannot be read is `adb_session_unreadable`, never "no peer";
    - it runs `adb connect IP:5555`, and the device itself must answer
      `adb -s IP:5555 shell getprop ro.serialno` with `SERIAL` (for example
      `R5CY30E2JSH` for the A26). `adb get-serialno` is not used: for a TCP
      transport the adb server answers with the endpoint `IP:5555`.
 4. Only then is the phone prepared (wake, media, Maps) and the drive clock or
    measurement window started.
+
+Pass `--ap-channel N` too when `ap.conf` names a channel other than 36 (the
+receiver's default); the helper refuses an AP request for any other channel.
+Both flags go to `aa_drive_smoke.py run`, `aa-projection-perf.sh` and
+`aa_soak_chain.py`, which forwards them to every stage. A receiver that exits
+while adb is being bound is a FAIL (the drive smoke's `failure`, the
+collector's `early_exit`), not an adb block. Admission retries before the
+first `active` are startup; only those after it are a session drop.
 
 No session peer, several, or one that is not on the AP means BLOCKED
 (`adb_session_peer_unknown`, `adb_session_ambiguous`, `adb_session_not_on_ap`,

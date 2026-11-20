@@ -87,44 +87,52 @@ DEFAULT_GEO_URI = "geo:0,0?q=Atlanta"
 AUDIO_LINE = b'{"event":"audio_write_completed"'
 
 
+def run_adb(command: list[str], timeout: float = ADB_TIMEOUT_S) -> subprocess.CompletedProcess:
+    """Run one adb command with a hard bound; a missing or hung adb never raises.
+
+    A timeout or a missing adb comes back as a failed CompletedProcess (exit 1).
+    Shared by the per-phone runner and the host-level adb (connect/disconnect).
+    """
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+    except OSError as error:
+        return subprocess.CompletedProcess(command, 1, "", str(error))
+    try:
+        out, err = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        pass
+    # Hard bound: TERM, KILL after the grace, then a bounded reap. A pipe a
+    # lingering grandchild still holds is abandoned, never waited on.
+    for sig, wait in ((signal.SIGTERM, ADB_KILL_GRACE_S), (signal.SIGKILL, ADB_REAP_S)):
+        try:
+            process.send_signal(sig)
+            process.communicate(timeout=wait)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+        except OSError:
+            break
+    for pipe in (process.stdout, process.stderr):
+        try:
+            pipe.close()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=ADB_REAP_S)
+    except subprocess.TimeoutExpired:
+        pass
+    return subprocess.CompletedProcess(command, 1, "", f"timed out after {timeout} s")
+
+
 def adb_runner(serial: str, timeout: float = ADB_TIMEOUT_S) -> Callable[..., subprocess.CompletedProcess]:
     """``adb -s SERIAL ...`` with a bound; a missing or hung adb never raises.
 
     A timeout or a missing adb comes back as a failed CompletedProcess (exit 1).
     """
     def run(*args: str) -> subprocess.CompletedProcess:
-        command = ["adb", "-s", serial, *args]
-        try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       text=True)
-        except OSError as error:
-            return subprocess.CompletedProcess(command, 1, "", str(error))
-        try:
-            out, err = process.communicate(timeout=timeout)
-            return subprocess.CompletedProcess(command, process.returncode, out, err)
-        except subprocess.TimeoutExpired:
-            pass
-        # Hard bound: TERM, KILL after the grace, then a bounded reap. A pipe a
-        # lingering grandchild still holds is abandoned, never waited on.
-        for sig, wait in ((signal.SIGTERM, ADB_KILL_GRACE_S), (signal.SIGKILL, ADB_REAP_S)):
-            try:
-                process.send_signal(sig)
-                process.communicate(timeout=wait)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-            except OSError:
-                break
-        for pipe in (process.stdout, process.stderr):
-            try:
-                pipe.close()
-            except OSError:
-                pass
-        try:
-            process.wait(timeout=ADB_REAP_S)
-        except subprocess.TimeoutExpired:
-            pass
-        return subprocess.CompletedProcess(command, 1, "", f"timed out after {timeout} s")
+        return run_adb(["adb", "-s", serial, *args], timeout)
     return run
 
 

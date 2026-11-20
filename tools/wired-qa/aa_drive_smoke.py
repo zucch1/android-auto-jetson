@@ -47,7 +47,9 @@ and tears it down when it stops. The criteria are the same.
   phone (``--serial``) nor an AOA device before, during and after the drive.
 * adb runs over the AP link to the phone the receiver admitted: after the
   session is active the runner takes the peer of the receiver's own TCP session
-  (it must be the only one and a station of the AP), connects to it on 5555 and
+  (it must be the only one and a station of the AP on ``--ap-interface``, which
+  the operator names: the helper's ap.conf is root-only and never read; pass
+  ``--ap-channel`` when ap.conf names a channel other than 36), connects to it on 5555 and
   binds it only when the device's ``getprop ro.serialno`` is ``--serial``; only
   then does it prepare the phone (wake, media, Maps) and start the drive clock
   (``drive_from_ns``: the drive is the first paint after it). Otherwise:
@@ -371,7 +373,10 @@ HARNESS_FLAGS = {
                  "--input-socket": 1, "--duration-ms": 1,
                  # aa-wireless-receiver: the store directory, the approved phone and
                  # the redacted diagnostics the run needs for its active marker.
-                 "--store-dir": 1, "--phone-id": 1, "--diagnostics": 0},
+                 "--store-dir": 1, "--phone-id": 1, "--diagnostics": 0,
+                 # The AP channel the helper's ap.conf names: a link parameter of
+                 # the target, not a decode/presentation configuration.
+                 "--ap-channel": 1},
     "display": {"--test-only-autostart": 0, "--test-only-control-stdin": 0, "--video-socket": 1,
                 "--input-socket": 1},
 }
@@ -596,11 +601,9 @@ HOST_USB_PERIOD_S = 10.0
 
 def _host_adb(*args: str) -> subprocess.CompletedProcess:
     """Host-level ``adb`` (connect/disconnect), bounded like every phone command."""
-    try:
-        return subprocess.run(["adb", *args], capture_output=True, text=True,
-                              timeout=moving_map.ADB_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError) as error:
-        return subprocess.CompletedProcess(["adb", *args], 1, "", str(error))
+    # The same hard bound (TERM, KILL, abandoned pipes) as every phone command:
+    # `adb connect` may start the adb server, which would hold a captured pipe.
+    return moving_map.run_adb(["adb", *args])
 
 
 def _adb(serial: str, *args: str) -> subprocess.CompletedProcess:
@@ -772,6 +775,7 @@ def _run_cli(args) -> int:
         # Bluetooth when the display asks to project; it releases both on stop.
         receiver_cmd = [str(receiver_bin), "--store-dir", str(store.parent),
                         "--phone-id", str(args.phone_id), "--diagnostics",
+                        *(["--ap-channel", str(args.ap_channel)] if args.ap_channel else []),
                         "--video-socket", socket + ".video", "--input-socket", socket + ".input",
                         *profiles, "--duration-ms", lifetime_ms]
     else:
@@ -805,13 +809,17 @@ def _run_cli(args) -> int:
                                     media_component=args.media_component, geo_uri=args.geo_uri,
                                     usb_reset=not wireless)
 
-    def bind_phone(receiver_pid: int) -> bool:
+    def bind_phone(receiver: subprocess.Popen) -> bool:
         """Wireless: adb to the receiver's admitted phone over the AP link, then its link state."""
-        interface = transport.ap_interface(Path(args.ap_conf))
+        interface = args.ap_interface
         deadline, reason = time.monotonic() + ADB_BIND_TIMEOUT_S, "adb_unreachable"
-        while interface and not stop and time.monotonic() < deadline:
+        while not stop and time.monotonic() < deadline:
+            if receiver.poll() is not None:
+                # A receiver crash is a product failure, not an adb harness block.
+                run["failure"] = "receiver exited before adb was bound"
+                return False
             candidate, reason = transport.session_candidate(
-                transport.receiver_session_peers(receiver_pid), transport.read_ap_stations(interface))
+                transport.receiver_session_peers(receiver.pid), transport.read_ap_stations(interface))
             bound = None
             if candidate:
                 bound, reason = transport.bind_adb(args.serial, [candidate], _host_adb)
@@ -822,7 +830,7 @@ def _run_cli(args) -> int:
                 base["phone_model"] = phone_adb("shell", "getprop", "ro.product.model").stdout.strip()
                 return True
             stop.sleep(1.0)
-        run["adb_failure"] = reason if interface else "adb_unreachable: no AP interface in ap.conf"
+        run["adb_failure"] = reason
         return False
 
     def sample_host_usb() -> None:
@@ -856,7 +864,7 @@ def _run_cli(args) -> int:
         run["active_ns"] = rx[marker]
         run["active_marker"] = marker
         if wireless:
-            if not bind_phone(receiver.pid) or stop:
+            if not bind_phone(receiver) or stop:
                 return
             if not workload.prepare_phone(stop.sleep) or stop:
                 return
@@ -1003,8 +1011,11 @@ def main(argv: list[str]) -> int:
                      help="session transport (default wired); a result counts only for its own")
     run.add_argument("--phone-id", type=int,
                      help="wireless: the approved wireless phone id in the trust store")
-    run.add_argument("--ap-conf", default=str(transport.AP_CONF),
-                     help="wireless: the helper's ap.conf (names the AP interface; read-only)")
+    run.add_argument("--ap-interface",
+                     help="wireless: the helper's AP interface (the one ap.conf names, e.g. wlan0); "
+                          "required, since ap.conf is root-only and never read")
+    run.add_argument("--ap-channel", type=int, choices=transport.AP_CHANNELS,
+                     help="wireless: the AP channel ap.conf names (the receiver's default is 36)")
     run.add_argument("--port", default=os.environ.get("AA_PERF_PORT", "1-2.1"),
                      help="USB port context the phone is on (default 1-2.1)")
     run.add_argument("--build-dir", default=os.environ.get("AA_BUILD_DIR"),
@@ -1051,6 +1062,9 @@ def main(argv: list[str]) -> int:
     if args.transport == "wireless":
         if not args.phone_id or args.phone_id <= 0:
             parser.error("--transport wireless needs --phone-id (the approved wireless phone)")
+        if not transport.valid_interface(args.ap_interface):
+            parser.error("--transport wireless needs --ap-interface IFACE (the helper's AP "
+                         "interface; its ap.conf is root-only and the harness never reads it)")
         if Path(args.store).name != "approved-phones.json":
             parser.error("--transport wireless: --store must name <dir>/approved-phones.json "
                          "(the wireless receiver takes the directory)")

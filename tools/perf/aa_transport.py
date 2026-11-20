@@ -31,7 +31,10 @@ takes the peer address of the receiver's own ESTABLISHED TCP session
 (``receiver_session_peers``: the receiver process's socket inodes matched in
 its ``/proc/PID/net/tcp``), requires exactly one such peer and that it is a
 station of the AP (DHCP lease or neighbour on the AP interface; IPv4 only,
-MACs, the PSK and the SSID are never read into the record or printed), runs
+MACs, the PSK and the SSID are never read into the record or printed). The AP
+interface is given by the operator (``--ap-interface``): the helper's
+``ap.conf`` is root-only (0600) and sits beside the AP credentials, so the
+harness never reads it. The harness then runs
 ``adb connect <peer>:5555`` and binds only when the device itself answers
 ``getprop ro.serialno`` with the expected phone serial (``bind_adb``).
 ``adb get-serialno`` is not used: it is a host query that, for a TCP
@@ -209,18 +212,16 @@ def host_usb_refusal(evidence: dict | None) -> str | None:
 
 # ---- adb over the helper's AP link ------------------------------------------
 
-AP_CONF = Path("/etc/android-auto-receiver/ap.conf")
 NM_LEASES = "/var/lib/NetworkManager/dnsmasq-{interface}.leases"
 ADB_TCP_PORT = 5555
-_INTERFACE = re.compile(r"[A-Za-z0-9_.:-]{1,15}")
+_INTERFACE = re.compile(r"[A-Za-z0-9_.-]{1,15}")
+# Non-DFS UNII-1 channels aa-wireless-receiver and the helper accept (--ap-channel).
+AP_CHANNELS = (36, 40, 44, 48)
 
 
-def ap_interface(conf: Path = AP_CONF) -> str | None:
-    """The AP interface named in the helper's ap.conf (``v1 IFACE ...``); None if unreadable."""
-    fields = (_read(conf) or "").split()
-    if len(fields) >= 2 and fields[0] == "v1" and _INTERFACE.fullmatch(fields[1]):
-        return fields[1]
-    return None
+def valid_interface(name: object) -> bool:
+    """A plausible Linux interface name (``--ap-interface``), never a path or option."""
+    return isinstance(name, str) and not name.startswith(("-", ".")) and bool(_INTERFACE.fullmatch(name))
 
 
 def _ipv4s(tokens: Iterable[str]) -> list[str]:
@@ -271,6 +272,8 @@ _TCP_ESTABLISHED = "01"
 def _proc_address(hex_address: str) -> str | None:
     """The IPv4 address of a /proc/net/tcp{,6} ``ADDR:PORT`` field (host byte order words)."""
     address = hex_address.split(":")[0]
+    if len(address) not in (8, 32):
+        return None
     try:
         raw = b"".join(struct.pack("=I", int(address[i:i + 8], 16)) for i in range(0, len(address), 8))
     except ValueError:
@@ -278,8 +281,10 @@ def _proc_address(hex_address: str) -> str | None:
     if len(raw) == 4:
         return socket.inet_ntop(socket.AF_INET, raw)
     if len(raw) == 16:
-        mapped = ipaddress.IPv6Address(raw).ipv4_mapped
-        return str(mapped) if mapped else None
+        address6 = ipaddress.IPv6Address(raw)
+        # A native IPv6 peer is returned as such, never dropped: the caller
+        # must not mistake "one IPv4 peer and one IPv6 peer" for one peer.
+        return str(address6.ipv4_mapped or address6)
     return None
 
 
@@ -305,21 +310,25 @@ def receiver_session_peers(pid: int, proc: Path | None = None) -> list[str] | No
     except OSError:
         return None
     peers: list[str] = []
-    readable = False
     for table in ("tcp", "tcp6"):
         try:
             lines = (base / "net" / table).read_text().splitlines()[1:]
+        except FileNotFoundError:
+            if table == "tcp6":
+                continue  # a kernel without IPv6 has no tcp6 table
+            return None
         except OSError:
-            continue
-        readable = True
+            return None  # an unreadable table is not an empty one
         for line in lines:
             fields = line.split()
             if len(fields) < 10 or fields[3] != _TCP_ESTABLISHED or fields[9] not in inodes:
                 continue
             peer = _proc_address(fields[2])
-            if peer and peer not in peers:
+            if peer is None:
+                return None  # a session socket we cannot decode: unknown, not absent
+            if peer not in peers:
                 peers.append(peer)
-    return peers if readable else None
+    return peers
 
 
 def session_candidate(peers: list[str] | None, stations: list[str]) -> tuple[str | None, str | None]:
@@ -327,14 +336,15 @@ def session_candidate(peers: list[str] | None, stations: list[str]) -> tuple[str
 
     (address, None) or (None, reason): ``adb_session_unreadable`` (procfs could
     not be read), ``adb_session_peer_unknown`` (no established session socket),
-    ``adb_session_ambiguous`` (more than one peer), ``adb_session_not_on_ap``
-    (the peer is no station of the helper's AP).
+    ``adb_session_ambiguous`` (more than one peer, or any native IPv6 peer: the
+    AP hands out IPv4 only, so an IPv6 session cannot be tied to a station),
+    ``adb_session_not_on_ap`` (the peer is no station of the helper's AP).
     """
     if peers is None:
         return None, "adb_session_unreadable"
     if not peers:
         return None, "adb_session_peer_unknown"
-    if len(peers) > 1:
+    if len(peers) > 1 or any(":" in peer for peer in peers):
         return None, "adb_session_ambiguous"
     if peers[0] not in stations:
         return None, "adb_session_not_on_ap"
@@ -364,6 +374,11 @@ def link_gap(link: object) -> str | None:
     return None
 
 
+# `adb connect` success: "connected to T" or "already connected to T", nothing else
+# ("disconnected", "failed to connect", "failed to authenticate", "cannot ...").
+_CONNECTED = re.compile(r"(?:already )?connected to \S+$")
+
+
 def bind_adb(expected_serial: str, candidates: list[str],
              adb: Callable[..., object]) -> tuple[str | None, str | None]:
     """Connect adb to the candidate that is the expected phone: (adb target, None) or (None, reason).
@@ -381,7 +396,10 @@ def bind_adb(expected_serial: str, candidates: list[str],
         target = f"{address}:{ADB_TCP_PORT}"
         connected = adb("connect", target)
         text = getattr(connected, "stdout", "") or ""
-        if getattr(connected, "returncode", 1) != 0 or "connected" not in text or "cannot" in text:
+        if getattr(connected, "returncode", 1) != 0 or not _CONNECTED.match(text.strip()):
+            # "failed to connect", "failed to authenticate" (adb exits 0 for
+            # some of these) and the like: drop whatever transport it left.
+            adb("disconnect", target)
             continue
         answer = adb("-s", target, "shell", "getprop", "ro.serialno")
         serial = (getattr(answer, "stdout", "") or "").strip() if getattr(answer, "returncode", 1) == 0 else ""

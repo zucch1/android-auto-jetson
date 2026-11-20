@@ -62,6 +62,11 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_drive_smoke COMMAND "${Python3_EXECUTABLE}" -B
         -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/wired_qa" -v)
     set_tests_properties(wired_drive_smoke PROPERTIES TIMEOUT 300)
+    # Wireless transport of the drive smoke and the soak chain (fakes only): its
+    # own entry so the wired suite keeps its margin under its timeout.
+    add_test(NAME wireless_qa_transport COMMAND "${Python3_EXECUTABLE}" -B
+        -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/wireless_qa" -v)
+    set_tests_properties(wireless_qa_transport PROPERTIES TIMEOUT 300)
     foreach(case schema nominal budget_fail duration contract collector media_timing readiness)
         add_test(NAME wired_perf_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_wired_perf.py" ${case})

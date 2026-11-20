@@ -24,7 +24,9 @@
 # (checked on the target's USB bus); adb reaches it over the helper's AP after
 # admission (`adb tcpip 5555` once beforehand), bound by ro.serialno to
 # --phone-serial (its hardware serial). The drive smoke must be a wireless one
-# for the same --phone-id (aa_drive_smoke.py check --transport wireless); the
+# for the same --phone-id (aa_drive_smoke.py check --transport wireless). Pass
+# --ap-interface IFACE (required) and --ap-channel N (when ap.conf names a
+# channel other than 36): the helper's ap.conf is root-only and never read. The
 # result's mode is wireless. See tools/perf/aa_transport.py.
 #
 # This tool measures CPU/RSS, thermal state, frame drops, decode/IPC timing,
@@ -77,6 +79,8 @@ HOST="${AA_PERF_HOST:-jetson.local}"
 PORT="${AA_PERF_PORT:-1-2.1}"
 RECEIVER=""
 PHONE_ID=""
+AP_INTERFACE=""
+AP_CHANNEL=""
 DISPLAY_BIN="/opt/aa/aa-dummy-display"
 STORE=""
 OUT=""
@@ -146,6 +150,8 @@ while (($# > 0)); do
         --drive-smoke) require_value "$@"; DRIVE_SMOKE="$2"; shift 2 ;;
         --phone-serial) require_value "$@"; PHONE_SERIAL="$2"; shift 2 ;;
         --phone-id) require_value "$@"; PHONE_ID="$2"; shift 2 ;;
+        --ap-interface) require_value "$@"; AP_INTERFACE="$2"; shift 2 ;;
+        --ap-channel) require_value "$@"; AP_CHANNEL="$2"; shift 2 ;;
         --media-uri) require_value "$@"; MEDIA_URI="$2"; shift 2 ;;
         --media-type) require_value "$@"; MEDIA_TYPE="$2"; shift 2 ;;
         --media-component) require_value "$@"; MEDIA_COMPONENT="$2"; shift 2 ;;
@@ -219,7 +225,7 @@ if ((!READINESS_ONLY)) && [[ "$MODE" != "wired" && "$MODE" != "wireless" ]]; the
     echo "usage error: --mode must be 'wired' or 'wireless' (got '${MODE:-<unset>}')" >&2
     exit 2
 fi
-if [[ "$MODE" == "wireless" ]]; then
+if [[ "$MODE" == "wireless" ]] && ((!READINESS_ONLY)); then
     if [[ -n "$CAPTURE" ]]; then
         # Live stages only: a replay is judged by the mode its capture records.
         echo "usage error: --mode wireless is for live stages; replay a capture with --mode wired" >&2
@@ -227,7 +233,17 @@ if [[ "$MODE" == "wireless" ]]; then
     elif [[ ! "$PHONE_ID" =~ ^[1-9][0-9]*$ || "$(basename -- "${STORE:-x}")" != "approved-phones.json" ]]; then
         echo "usage error: --mode wireless needs --phone-id N and --store DIR/approved-phones.json" >&2
         exit 2
+    elif [[ ! "$AP_INTERFACE" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$ ]]; then
+        # The helper's ap.conf is root-only (0600) and beside the AP credentials:
+        # the operator names the interface; the harness never reads that file.
+        echo "usage error: --mode wireless needs --ap-interface IFACE (the helper's AP interface)" >&2
+        exit 2
+    elif [[ -n "$AP_CHANNEL" && ! "$AP_CHANNEL" =~ ^(36|40|44|48)$ ]]; then
+        echo "usage error: --ap-channel must be 36, 40, 44 or 48 (the channel ap.conf names)" >&2
+        exit 2
     fi
+fi
+if [[ "$MODE" == "wireless" ]]; then
     RECEIVER="${RECEIVER:-/opt/aa/aa-wireless-receiver}"
 fi
 RECEIVER="${RECEIVER:-/opt/aa/aa-wired-receiver}"
@@ -611,6 +627,7 @@ timeout -k "$SSH_KILL_GRACE_S" "$collector_timeout" ssh "${SSH_OPTS[@]}" "$HOST"
         --workload moving-map --media-uri '${MEDIA_URI}' ${MEDIA_TYPE:+--media-type '${MEDIA_TYPE}'} \
         ${MEDIA_COMPONENT:+--media-component '${MEDIA_COMPONENT}'} ${GEO_URI:+--geo-uri '${GEO_URI}'} \
         --transport '${MODE}' ${PHONE_ID:+--phone-id '${PHONE_ID}'} \
+        ${AP_INTERFACE:+--ap-interface '${AP_INTERFACE}'} ${AP_CHANNEL:+--ap-channel '${AP_CHANNEL}'} \
         --run-file '${RUN_FILE}'" \
         <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err" &
 collector_job=$!

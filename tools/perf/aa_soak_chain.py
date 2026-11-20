@@ -10,7 +10,8 @@
 launcher's ``--mode``; a wireless chain needs ``--phone-id``, ``--store``,
 ``--phone-serial`` as the phone's hardware serial (bound over the AP link by
 its ro.serialno), the cable unplugged and a wireless drive smoke for the same
-phone id (tools/perf/aa_transport.py). The stages, gates and
+phone id, and ``--ap-interface`` (plus ``--ap-channel`` when not 36): the
+helper's root-only ap.conf is never read (tools/perf/aa_transport.py). The stages, gates and
 interference rules are the same for both transports.
 
 Replaces the ad-hoc chain scripts kept beside past runs. It waits until no
@@ -178,7 +179,8 @@ def stage_command(args: argparse.Namespace, seconds: int) -> list[str]:
                         ("--display", args.display), ("--store", args.store),
                         ("--build-dir", args.build_dir), ("--thermal-policy", args.thermal_policy),
                         ("--provenance", args.provenance), ("--display-env", args.display_env),
-                        ("--phone-id", args.phone_id)):
+                        ("--phone-id", args.phone_id), ("--ap-interface", args.ap_interface),
+                        ("--ap-channel", args.ap_channel)):
         if value:
             command += [flag, str(value)]
     return command
@@ -263,6 +265,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--transport", choices=("wired", "wireless"), default="wired",
                         help="session transport of every stage (default wired)")
     parser.add_argument("--phone-id", type=int, help="wireless: the approved wireless phone id")
+    parser.add_argument("--ap-interface", help="wireless: the helper's AP interface (required)")
+    parser.add_argument("--ap-channel", type=int, choices=(36, 40, 44, 48),
+                        help="wireless: the AP channel the helper's ap.conf names")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--receiver")
     parser.add_argument("--display")
@@ -275,8 +280,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--quiet-seconds", type=float, default=300)
     parser.add_argument("--launcher", type=Path, default=LAUNCHER, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    if args.transport == "wireless" and (not args.phone_id or args.phone_id <= 0 or not args.store):
-        print("usage error: --transport wireless needs --phone-id and --store", file=sys.stderr)
+    if args.transport == "wireless" and (not args.phone_id or args.phone_id <= 0 or not args.store
+                                         or not args.ap_interface):
+        print("usage error: --transport wireless needs --phone-id, --store and --ap-interface",
+              file=sys.stderr)
         return 2
     try:
         args.out.mkdir(mode=0o700, parents=True, exist_ok=False)
