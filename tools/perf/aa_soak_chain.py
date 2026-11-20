@@ -30,6 +30,26 @@ the stage with ``interference:concurrent_build``; killing it would lose that
 named result and its evidence. Exit: the first non-PASS stage's launcher code
 (3 for a disqualified one), else 0; 128+signal when stopped; 2 on usage errors.
 
+Before each stage the chain also checks the host (``aa_host_preflight``, #154),
+over the launcher's own ssh transport so it sees the soak user's session (an
+ssh failure BLOCKs as ``host_transport:...``): no apt, dpkg,
+unattended-upgrades or PackageKit work may be running (it waits up to
+``--maintenance-wait-s`` on one monotonic deadline, then BLOCKs, and reads it
+once more as the very last check); then PipeWire's
+``pw-data-loop`` threads must be real-time (RR/FF) and neither apt timer
+(calendar or monotonic trigger) may elapse inside the stage's planned window
+plus ``--timer-margin-s`` (refused, not waited for). The build check is
+repeated right after the preflight, immediately before the launch. A failed
+check, or a preflight that raises, BLOCKs the stage (exit 3): it is not run,
+and ``stage-<N>s-not-run.json`` says why. Every stage's record is
+``stage-<N>s-host-preflight.json``: a sidecar, because the capture is
+sha256-bound into the result. It also holds PipeWire ERR counters
+(informational): before the launch and after the stage (host nodes only: the
+receiver's stream does not exist then) and sampled during the stage, while the
+receiver's stream is alive; never from a PipeWire that is not already running.
+A stop TERMs the stage before anything waits for an in-flight sample, and
+kills that sample's ssh.
+
 A stop TERMs the stage's process group and gives the whole group
 STOP_GRACE_S, even after the launcher itself exits; the launcher stops the
 collector on the target over its own ssh (tools/perf/aa_remote_stop.sh).
@@ -42,9 +62,11 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
+import aa_host_preflight
 from aa_projection_collect import ancestors, build_processes
 
 STAGES = (1800, 7200)  # the 60 s stage is retired (#137)
@@ -55,6 +77,9 @@ WATCH_PERIOD_S = 5
 # bounded at aa_remote_stop.sh --worst-case 30 15 (117 s) plus its 15 s
 # connect margin: 132 s. The grace covers that with margin (a test checks it).
 STOP_GRACE_S = 180.0
+COUNTER_FIRST_S = 120.0  # the first in-stage ERR sample (the receiver's stream exists by then)
+COUNTER_PERIOD_S = 300.0
+COUNTER_JOIN_S = 5.0
 KILL_WAIT_S = 10.0
 GROUP_POLL_S = 0.1
 LAUNCHER = Path(__file__).resolve().parent / "aa-projection-perf.sh"
@@ -158,6 +183,99 @@ def wait_quiet(seconds: float, log: Path, sleep=time.sleep, clock=time.monotonic
                 return False
 
 
+def host_runner(host: str, cancel: threading.Event | None = None) -> aa_host_preflight.Runner:
+    """The launcher's transport: ssh to ``--host`` with its options, even for localhost.
+
+    The launcher reaches the receiver's session only over ssh, and an ssh
+    config may map even ``localhost`` to another ``User``; so the preflight
+    resolves the uid, and reads PipeWire, through the same ssh target.
+    """
+    if cancel is None:
+        return aa_host_preflight.ssh_runner(host)
+    return aa_host_preflight.ssh_runner(host, aa_host_preflight.cancellable_runner(cancel))
+
+
+def host_preflight(args: argparse.Namespace, seconds: int, stop: StopFlag) -> dict:
+    """The stage's host audio / package-maintenance preflight (a test patches this)."""
+    return aa_host_preflight.preflight(
+        host_runner(args.host), seconds, sleep=stop.sleep, margin_s=args.timer_margin_s,
+        maintenance_wait_s=args.maintenance_wait_s, receiver=args.receiver)
+
+
+def host_counters(args: argparse.Namespace, cancel: threading.Event | None = None) -> dict:
+    """PipeWire ERR counters now (informational; a test patches this).
+
+    A set ``cancel`` kills its in-flight ssh at once (the stop path).
+    """
+    runner = host_runner(args.host, cancel)
+    uid, failure = aa_host_preflight.soak_uid(runner)
+    return aa_host_preflight.read_pw_top(runner, uid, args.receiver) if uid \
+        else {"time": time.time(), "error": failure}
+
+
+def write_record(path: Path, record: dict) -> None:
+    """The sidecar as strict JSON; a record that is not (NaN, Infinity) is replaced, BLOCKED."""
+    try:
+        text = json.dumps(record, indent=2, allow_nan=False)
+    except ValueError as error:
+        text = json.dumps({"schema": aa_host_preflight.SCHEMA, "stage_s": record.get("stage_s"),
+                           "verdict": "BLOCKED", "reasons": [f"host_preflight:invalid_record ({error})"]},
+                          indent=2)
+        record.update(verdict="BLOCKED", reasons=[f"host_preflight:invalid_record ({error})"])
+    path.write_text(text + "\n")
+
+
+class CounterSampler:
+    """ERR counters sampled while the stage runs, so the receiver's stream is alive.
+
+    A daemon thread; ``sample(cancel)`` must stop its command when ``cancel``
+    is set, so a stop never waits for an in-flight pw-top: ``cancel()`` sets
+    it at once and ``finish()`` joins for at most COUNTER_JOIN_S. The first
+    sample is COUNTER_FIRST_S after launch (past the launcher's setup), then
+    every COUNTER_PERIOD_S. It keeps the first and the latest sample that saw a
+    receiver stream, the latest sample of any kind, and the count.
+    """
+
+    def __init__(self, sample) -> None:
+        self.sample, self.done, self.stopping = sample, threading.Event(), threading.Event()
+        self.result: dict = {"samples": 0, "receiver_stream_seen": False}
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        wait = COUNTER_FIRST_S
+        while not self.done.wait(wait):
+            wait = COUNTER_PERIOD_S
+            try:
+                sample = {**self.sample(self.stopping), "phase": "during_stage"}
+            except Exception as error:  # informational: never let it reach the stage
+                sample = {"time": time.time(), "phase": "during_stage", "error": repr(error)}
+            if self.stopping.is_set():  # cut short by the stop: not a sample
+                break
+            self.result["samples"] += 1
+            self.result["latest"] = sample
+            if sample.get("receiver_streams"):
+                self.result["receiver_stream_seen"] = True
+                self.result.setdefault("first_with_receiver", sample)
+                self.result["latest_with_receiver"] = sample
+
+    def start(self) -> CounterSampler:
+        self.thread.start()
+        return self
+
+    def cancel(self) -> None:
+        """Stop sampling and kill an in-flight sample's command; does not wait."""
+        self.stopping.set()
+        self.done.set()
+
+    def finish(self) -> dict:
+        self.done.set()
+        self.thread.join(COUNTER_JOIN_S)
+        if self.thread.is_alive():  # still in a sample: kill its command and wait briefly
+            self.cancel()
+            self.thread.join(COUNTER_JOIN_S)
+        return dict(self.result)
+
+
 def stage_command(args: argparse.Namespace, seconds: int) -> list[str]:
     name = f"stage-{seconds}s"
     command = [str(args.launcher), "--mode", "wired", "--duration", f"{seconds}s",
@@ -177,7 +295,7 @@ def stage_command(args: argparse.Namespace, seconds: int) -> list[str]:
 
 
 def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
-              children: list[subprocess.Popen]) -> int:
+              children: list[subprocess.Popen], preflight: dict | None = None) -> int:
     name = f"stage-{seconds}s"
     command = stage_command(args, seconds)
     (args.out / f"{name}-command.json").write_text(json.dumps(command, indent=2) + "\n")
@@ -187,11 +305,22 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
     print(f"{name} START {time.ctime()}", flush=True)
     with (args.out / f"{name}-console.log").open("w") as console, \
             (args.out / f"{name}-build-watch.jsonl").open("w") as watch:
+        if stop:  # the last moment before the launch: never start a launcher after a stop
+            print(f"{name} NOT STARTED: {signal.Signals(stop.signum).name} before the launch", flush=True)
+            return 128 + stop.signum
         # Its own process group (the launcher and everything under it), registered
         # at once: the handler never raises, so nothing can come between.
         process = subprocess.Popen(command, stdout=console, stderr=subprocess.STDOUT, env=env,
                                    start_new_session=True)
         children.append(process)
+        if stop:  # a stop that landed during the spawn: stop the child at once, start nothing else
+            outcome = stop_group(process)
+            print(f"{name} INTERRUPTED by {signal.Signals(stop.signum).name} at the launch: "
+                  f"stage {outcome}", flush=True)
+            _retire_interrupted(args, name, [], process.returncode, stop)
+            return 128 + stop.signum
+        sampler = CounterSampler(lambda cancel: host_counters(args, cancel)).start() \
+            if preflight is not None else None
         seen: list[dict] = []
         while process.poll() is None and not stop:
             running = builds()
@@ -205,17 +334,65 @@ def run_stage(args: argparse.Namespace, seconds: int, stop: StopFlag,
                     process.wait(timeout=0.2)
                 except subprocess.TimeoutExpired:
                     pass
+        outcome = None
         if stop:
+            # TERM the stage first: an in-flight counter sample is killed, never waited for.
+            if sampler:
+                sampler.cancel()
             outcome = stop_group(process)
-            print(f"{name} INTERRUPTED by {signal.Signals(stop.signum).name}: stage {outcome}",
-                  flush=True)
-            return 128 + stop.signum
+        during = sampler.finish() if sampler else None
+        if preflight is not None:
+            preflight.setdefault("pipewire_err_counters", {})["during"] = during
+            write_record(args.out / f"{name}-host-preflight.json", preflight)
+    if preflight is not None and not stop:  # informational: host nodes after the receiver is gone
+        preflight["pipewire_err_counters"]["end"] = {**host_counters(args), "phase": "after_stage"}
+        write_record(args.out / f"{name}-host-preflight.json", preflight)
+    # The single point where the stage's result is finalised. The stop flag is
+    # sticky (set by the handler at any time), so a stop that came during any
+    # step above, the sampler shutdown or the end snapshot included, is seen here.
+    if stop:
+        if outcome is None:
+            outcome = stop_group(process)
+        end = (preflight or {}).get("pipewire_err_counters", {}).get("end")
+        if end is not None:  # the stop came during the end probe: the snapshot is not a clean one
+            end["interrupted"] = signal.Signals(stop.signum).name
+            write_record(args.out / f"{name}-host-preflight.json", preflight)
+        print(f"{name} INTERRUPTED by {signal.Signals(stop.signum).name}: stage {outcome}", flush=True)
+        _retire_interrupted(args, name, seen, process.returncode, stop)
+        return 128 + stop.signum
     result = args.out / f"{name}-result.json"
     verdict = json.loads(result.read_text()).get("verdict") if result.exists() else None
     print(f"{name} END rc={process.returncode} verdict={verdict}", flush=True)
     if seen:
         return _disqualify(args, name, seen, result, verdict, process.returncode)
     return process.returncode
+
+
+def _result_verdict(result: Path) -> object:
+    try:
+        return json.loads(result.read_text()).get("verdict") if result.exists() else None
+    except (OSError, ValueError, AttributeError):
+        return "unreadable"
+
+
+def _retire_interrupted(args: argparse.Namespace, name: str, seen: list[dict], code: int | None,
+                        stop: StopFlag) -> None:
+    """An interrupted stage never leaves a qualifying result.
+
+    A build the watch saw is disqualified first, as for a finished stage, so
+    interference always wins over PASS. A PASS still on disk after that is
+    moved to ``-result.interrupted.json`` with an ``interrupted`` field, which
+    the qualification checker rejects.
+    """
+    result = args.out / f"{name}-result.json"
+    if seen:
+        _disqualify(args, name, seen, result, _result_verdict(result), code if code is not None else -1)
+    if _result_verdict(result) == "PASS":
+        document = json.loads(result.read_text())
+        document["interrupted"] = {"signal": signal.Signals(stop.signum).name,
+                                   "reason": "the chain was stopped before this result was final"}
+        result.with_name(f"{name}-result.interrupted.json").write_text(json.dumps(document, indent=2) + "\n")
+        result.unlink()
 
 
 def _disqualify(args: argparse.Namespace, name: str, seen: list[dict], result: Path,
@@ -240,6 +417,16 @@ def _disqualify(args: argparse.Namespace, name: str, seen: list[dict], result: P
     return 3 if code == 0 else code
 
 
+def seconds_option(name: str):
+    """argparse type: a finite duration >= 0 (``inf``/``nan`` would remove a bound)."""
+    def parse(text: str) -> float:
+        try:
+            return aa_host_preflight.finite_seconds(float(text), name)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(str(error)) from None
+    return parse
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", required=True, type=Path, help="new directory for the chain's files")
@@ -262,6 +449,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--display-env")
     parser.add_argument("--interval", type=int, default=5)
     parser.add_argument("--quiet-seconds", type=float, default=300)
+    parser.add_argument("--maintenance-wait-s", type=seconds_option("--maintenance-wait-s"),
+                        default=aa_host_preflight.DEFAULT_MAINTENANCE_WAIT_S,
+                        help="wait at most this long for apt/dpkg/PackageKit to finish before a "
+                             "stage (then BLOCKED; 0 = BLOCKED at once)")
+    parser.add_argument("--timer-margin-s", type=seconds_option("--timer-margin-s"), default=aa_host_preflight.DEFAULT_TIMER_MARGIN_S,
+                        help="refuse a stage if an apt timer elapses within its duration plus this")
     parser.add_argument("--launcher", type=Path, default=LAUNCHER, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
@@ -290,26 +483,80 @@ def _not_run(args: argparse.Namespace, stages: tuple[int, ...], reason: str) -> 
             json.dumps({"reason": reason}, indent=2) + "\n")
 
 
+def _preflight(args: argparse.Namespace, seconds: int, stop: StopFlag) -> tuple[int, dict]:
+    """(0, record) to run the stage; (3, record) BLOCKED; (128+signal, record) when stopped."""
+    name = f"stage-{seconds}s"
+    try:
+        record = host_preflight(args, seconds, stop)
+    except Exception as error:  # fail closed: a preflight that breaks is a BLOCKED stage
+        record = {"schema": aa_host_preflight.SCHEMA, "stage_s": seconds, "verdict": "BLOCKED",
+                  "reasons": [f"host_preflight:error ({type(error).__name__}: {error})"]}
+    write_record(args.out / f"{name}-host-preflight.json", record)
+    if stop:
+        return 128 + stop.signum, record
+    if record["verdict"] != "OK":
+        print(f"{name} BLOCKED: host preflight: " + "; ".join(record["reasons"]), flush=True)
+        return 3, record
+    print(f"{name} host preflight OK", flush=True)
+    return 0, record
+
+
 def _chain(args: argparse.Namespace, stop: StopFlag, children: list[subprocess.Popen]) -> int:
     if not wait_quiet(args.quiet_seconds, args.out / "pre-soak-idle.jsonl", sleep=stop.sleep) or stop:
         _not_run(args, STAGES, "chain interrupted before the first stage")
         return 128 + (stop.signum or signal.SIGTERM)
     print("PRE-SOAK IDLE PASS", flush=True)
     for index, seconds in enumerate(STAGES):
+        name = f"stage-{seconds}s"
+        blocked_here, launched, record, why = False, False, {}, []
         if stop:
             code = 128 + stop.signum
         elif builds():
             code = 3
-            print(f"stage-{seconds}s BLOCKED: a build started before the stage", flush=True)
+            why.append("interference:build_started_before_the_stage")
+            print(f"{name} BLOCKED: a build started before the stage", flush=True)
         else:
-            code = run_stage(args, seconds, stop, children)
+            code, record = _preflight(args, seconds, stop)
+            if code == 0 and builds():  # again, at once before the launch: the wait took time
+                code, blocked_here = 3, True
+                record.update(verdict="BLOCKED", reasons=["interference:build_started_during_preflight"])
+                write_record(args.out / f"{name}-host-preflight.json", record)
+                print(f"{name} BLOCKED: a build started during the host preflight", flush=True)
+            elif code == 0 and stop:  # the launch boundary: no launcher starts after a stop
+                code = 128 + stop.signum
+            elif code == 0:
+                launched = True
+                code = run_stage(args, seconds, stop, children, record)
+            elif code == 3:
+                blocked_here = True
+        if blocked_here:
+            why += list(record.get("reasons", []))
+        if launched and (args.out / f"{name}-interference.json").exists():
+            why.append("interference:build_during_stage (result disqualified)")
+        if code != 0 and not stop:
+            if blocked_here:
+                _not_run(args, (seconds,), f"{name} BLOCKED by the host preflight: "
+                         + "; ".join(record["reasons"]))
+            _not_run(args, STAGES[index + 1:], f"{name} did not pass (rc {code})")
+        # Checked after any marker write: a stop that came while the block markers
+        # were written still wins, and its marker replaces them with both reasons.
+        if stop:  # sticky: an interruption wins the exit code, whatever else also happened
+            if launched:  # its result, finished or not, is not final
+                _retire_interrupted(args, name, [], code, stop)
+            _not_run(args, (seconds,), "; ".join(
+                [f"{name} interrupted ({signal.Signals(stop.signum).name}); its stage was stopped"
+                 " or not started", *why]))
+            _not_run(args, STAGES[index + 1:], f"{name} was interrupted")
+            return 128 + stop.signum
         if code != 0:
-            interrupted = code > 128 and stop
-            if interrupted:
-                _not_run(args, (seconds,), f"stage-{seconds}s interrupted "
-                         f"({signal.Signals(stop.signum).name}); its stage was stopped")
-            _not_run(args, STAGES[index + 1:], f"stage-{seconds}s did not pass (rc {code})")
             return code
+    # The single point where the chain completes: never with a stop pending.
+    if stop:
+        last = f"stage-{STAGES[-1]}s"
+        _retire_interrupted(args, last, [], 0, stop)
+        _not_run(args, STAGES[-1:], f"{last} interrupted ({signal.Signals(stop.signum).name}) "
+                 "before the chain completed; its result was demoted")
+        return 128 + stop.signum
     print("CHAIN COMPLETE", flush=True)
     return 0
 

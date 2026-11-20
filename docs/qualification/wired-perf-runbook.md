@@ -568,6 +568,96 @@ stays a FAIL. The chain stops there. The stage is not cut short: the collector
 records the same builds and its result is BLOCKED with the evidence, while
 killing the stage would lose that named result.
 
+**Host preflight (#154).** Before each stage the chain checks two host
+conditions that stalled the PipeWire Pulse server for ~400 ms in an 1800 s
+stage and so made its audio unqualifiable. It does not change a threshold; a
+host that fails a check cannot qualify audio, so the stage is not run. The
+code is `tools/perf/aa_host_preflight.py`; every check is read-only. Every
+command goes over the launcher's own ssh transport and options to `--host`,
+also for `localhost`, so the uid and the PipeWire session checked are the ones
+the soak runs as, even when an ssh config maps the host to another `User`.
+
+The checks run in this order, so the ones a launch depends on are the
+freshest. After the timers, package maintenance is read once more, without
+waiting (work that began meanwhile BLOCKs: `... (at the final check)`), and
+then the timers again, last, on a fresh host clock. An ssh failure of any
+gating probe BLOCKs as `host_transport:...` with ssh's own message:
+
+| Check | Reads | Result |
+| --- | --- | --- |
+| Package maintenance | processes `apt`, `apt-get`, `dpkg`, `unattended-upgr(ades)`, `apt.systemd.dai(ly)`; `systemctl is-active apt-daily.service apt-daily-upgrade.service`; PackageKit over `busctl --auto-start=no` | Transient, so the chain **waits** for it, polling within the preflight's deadline (below); still busy is BLOCKED. PackageKit is busy only with a transaction (`GetTransactionList`) or the package lock (`Locked`): an idle resident `packagekitd` does not block. The bus name is checked with `NameHasOwner` and the daemon then addressed by its validated unique name (`:N.M`), so the query never D-Bus-activates PackageKit; a reply without its exact shape is BLOCKED. |
+| PipeWire real-time | `ps -L -o cls,rtprio,comm -p PID` for every `pipewire` and `pipewire-pulse` process of the soak user | Every `pw-data-loop` thread must be `RR` or `FF`. A process that is not running, has no data-loop thread, or has any other class (`TS` is SCHED_OTHER) is BLOCKED. |
+| PipeWire ERR counters (informational) | `pw-top -b -n 2`, only when a `pipewire` process of the soak user already runs; then the pids again | Never gated. Skipped (`pipewire_not_running`) otherwise. Residual race (accepted): PipeWire may exit between the guard and `pw-top`, which can then socket-activate the user's own audio server; the pids no longer match the ones judged real-time, so the stage is BLOCKED (`host_audio:pipewire_changed_during_preflight`), never OK on a daemon the preflight started. |
+| apt timers | `systemctl show -p NextElapseUSecRealtime -p NextElapseUSecMonotonic` for `apt-daily.timer` and `apt-daily-upgrade.timer`; the host's monotonic and realtime clocks | The earlier of the calendar and the monotonic (`OnBootSec=`, `OnUnitActiveSec=`, ...) elapse, at or before the host's now (read after the queries) + duration + `--timer-margin-s` (default 900 s: the launcher's setup and cleanup), is **refused**: BLOCKED, with the earliest safe start in the reason. It does not wait, because the wait could be hours. An overdue timer counts as inside. A missing property, an unparsable, impossible or out-of-range (over a century) value, or an unreadable host clock is BLOCKED; an empty, `n/a` or `0` value means no next elapse. |
+| Package maintenance (final), then apt timers (final) | as those rows, once, no wait; the timers from a fresh host clock | Any work, or a timer now inside the window, BLOCKs the launch. |
+
+**One deadline.** A positive `--maintenance-wait-s` (default 900 s) bounds
+the whole preflight, from its first command (`id -u`) to the verdict, on a
+monotonic clock. The guarantee is the last step: when the elapsed time is over
+the bound, the stage is BLOCKED (`host_preflight:preflight_deadline_exceeded`),
+whatever the checks saw. Each command's budget (ssh included) is also capped to
+the time left, and a maintenance poll that completes late is rejected
+(`host_maintenance:wait_limit_exceeded`), only to fail early. 0 means a single
+maintenance observation and no wait; every command then has its own bound.
+
+The chain's build check is repeated right after the preflight, immediately
+before the launch: the only gap left is that `/proc` scan and the launcher's
+start, and the stage's own build watch samples from its first second.
+`--maintenance-wait-s` and `--timer-margin-s` must be finite and >= 0.
+
+A check that cannot be made (command failed), or a preflight that raises, is
+BLOCKED, not skipped. A BLOCKED stage exits 3, writes
+`stage-<N>s-not-run.json` naming every reason (`host_audio:...`,
+`host_maintenance:...`, `host_transport:...`, `host_preflight:error`,
+`host_preflight:invalid_record`, `interference:...`). The sidecar is strict
+JSON: a record that would hold NaN or Infinity is replaced by a BLOCKED one. and the
+later stages get theirs. The host is expected to keep `zucchi` in the
+`pipewire` group (limits.d grants rtprio 95) and to pin the timers outside the
+stage window, as the owner has
+(`/etc/systemd/system/apt-daily*.timer.d/zz-aa-soak-window.conf`, 04:00 and
+04:30 daily, no random delay); the preflight only notices when that comes
+undone, it changes nothing.
+
+Each stage's record is `stage-<N>s-host-preflight.json` (schema
+`aa-host-preflight/2`): the maintenance state and how long the chain waited,
+the scheduling rows, both timer elapses and the window used, and the verdict.
+It is a sidecar like `stage-<N>s-interference.json` because the capture is
+sha256-bound into the result and must not be edited. It also carries,
+informationally and never gated, PipeWire ERR counters from `pw-top -b -n 2`
+(the receiver's streams, the `*_output.*` sinks and the nodes):
+`pipewire_err_counters.start` (before the launch) and `.end` (after the stage)
+are host-node snapshots only, because the receiver's stream does not exist
+then; `.during` is sampled while the stage runs (first 120 s after the launch,
+then every 300 s) and keeps the first and latest sample that saw the
+receiver's stream, so compare those two for the stream and `start`/`end` for
+the sinks. Every snapshot is taken only from a PipeWire that is already
+running. On a stop the chain TERMs the stage first and kills an in-flight
+sample's ssh; it never waits for a sample before forwarding the TERM. An
+interrupted stage never leaves a qualifying result. The stop flag is sticky,
+and the chain checks it at the one point where a stage's result is finalised
+and again before `CHAIN COMPLETE`: a build the watch saw is disqualified first
+(interference wins over PASS), a PASS still on disk is moved to
+`stage-<N>s-result.interrupted.json` with an `interrupted` field, and the
+chain exits 128+signal, never 0. `tools/qualification/check_wired.py` rejects
+an `*.interrupted.*` or `*.disqualified.*` result, or one carrying
+`interrupted`, even when the manifest references it (`RETIRED_RESULT`).
+An interruption also wins the exit code over a build block or a
+disqualification that happened too, including a stop that lands while the
+block markers are being written: the chain re-checks the flag after writing
+any marker, and the stage's `not-run` marker names both reasons. No launcher
+is started once a stop is pending (checked at the launch boundary and again
+right before the spawn). A stop that lands during the spawn itself is seen
+as soon as `Popen` returns: the chain stops the new launcher's group at once
+(TERM, the grace, then KILL), starts no sampler or watch, and exits
+128+signal. With a stop pending, the chain does not start the end probe, so
+an interrupted stage normally has no `pipewire_err_counters.end`. A stop
+that lands during that probe can leave an `.end`; it is then marked
+`"interrupted": "<SIGNAL>"` and is not a clean after-stage snapshot. In
+either case read `.during.latest` / `.during.latest_with_receiver` (when the
+sampler ran) and the stage's `-logs/` instead. Only
+the chain runs the preflight; a direct `aa-projection-perf.sh` invocation
+does not, so check the host by hand before one.
+
 The chain handles SIGTERM/SIGINT with a stop flag, as the drive smoke does.
 Each stage runs in its own local process group: the launcher and its local
 helpers. On a stop, the group gets TERM. The grace, `STOP_GRACE_S` (180 s),
@@ -676,10 +766,20 @@ stdin, a non-PTY session sends no SIGHUP, and a dropped link would look the
 same as a stop. The explicit call also confirms the cleanup and has a fallback
 when the cleanup does not finish.
 
-Running the chain:
+Running the chain. **Prerequisite: an authenticated ssh target.** The
+launcher, and so the host preflight, reaches the soak host only over
+`ssh -o BatchMode=yes`, also when the chain runs on the Jetson itself. Pass
+`--host` explicitly as a key-authenticated target whose host key is already
+trusted, e.g. `--host zucchi@127.0.0.1` on the Jetson (the recorded Jetson
+chains used exactly that); check it first with
+`ssh -o BatchMode=yes "$SOAK_SSH_HOST" id -u`. The default `localhost` works
+only when that is set up for `localhost` too. When ssh fails, the stage is
+BLOCKED with `host_transport:ssh_failed (<ssh's message>)` or
+`host_transport:unreachable`, not run.
 
 ```bash
-tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" \
+SOAK_SSH_HOST=zucchi@127.0.0.1   # on the Jetson; else the Jetson's ssh target
+tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" --host "$SOAK_SSH_HOST" \
     --phone-serial "$SOAK_PHONE_SERIAL" --drive-smoke "$DRIVE_SMOKE_RESULT" \
     --media-uri file:///sdcard/Music/<tone>.opus --media-type audio/ogg \
     --media-component org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity \
@@ -693,6 +793,10 @@ tools/perf/aa_soak_chain.py --out "$RUN_DIR/chain" \
 From the development checkout (bounded ssh, fail-closed):
 
 ```bash
+# SOAK_MEDIA_COMPONENT is PKG/ACTIVITY playing $SOAK_MEDIA_URI (required: the
+# cleanup stops and verifies this player), e.g.
+# org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity.
+
 # Bound, read-only prerequisite check (safe to run anytime).
 tools/perf/aa-projection-perf.sh --readiness-only --out /tmp/task-32-readiness.json
 
@@ -700,12 +804,14 @@ tools/perf/aa-projection-perf.sh --readiness-only --out /tmp/task-32-readiness.j
 tools/perf/aa-projection-perf.sh --mode wired --duration 30m \
     --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
     --phone-serial "$SOAK_PHONE_SERIAL" --media-uri "$SOAK_MEDIA_URI" \
+    --media-component "$SOAK_MEDIA_COMPONENT" \
     --out /tmp/task-32-perf-30m.json --capture-out /tmp/task-32-capture-30m.json
 
 # Separate 2-hour soak run (fresh invocation; do not reuse the 30m capture).
 tools/perf/aa-projection-perf.sh --mode wired --duration 2h \
     --build-dir "$AA_BUILD_DIR" --drive-smoke "$DRIVE_SMOKE_RESULT" \
     --phone-serial "$SOAK_PHONE_SERIAL" --media-uri "$SOAK_MEDIA_URI" \
+    --media-component "$SOAK_MEDIA_COMPONENT" \
     --out /tmp/task-32-soak-2h.json --capture-out /tmp/task-32-capture-2h.json
 ```
 
