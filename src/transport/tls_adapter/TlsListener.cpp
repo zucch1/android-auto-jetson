@@ -31,7 +31,10 @@ TlsListener::~TlsListener() { close(); }
 core::Result<std::unique_ptr<TlsListener>>
 TlsListener::listen(const char* host, std::uint16_t port,
                     ApprovedPredicate approved, TlsMode mode) {
-    const int fd = su::listen_socket(host, port);
+    // A null host would bind the wildcard address; require an explicit one.
+    if (host == nullptr || *host == '\0') return Error{ErrorCode::invalid_argument};
+    // Numeric addresses only: name lookup cannot be bounded or cancelled.
+    const int fd = su::listen_socket(host, port, su::Resolve::numeric_only);
     if (fd < 0) {
         return Error{ErrorCode::transport_unavailable};
     }

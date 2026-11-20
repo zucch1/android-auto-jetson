@@ -112,12 +112,19 @@ inline void close_fd(int& fd) noexcept {
     }
 }
 
+// Whether getaddrinfo may consult name services. Name lookup is synchronous
+// and observes neither a Deadline nor a CancellationToken, so a numeric-only
+// caller (the TLS transport) refuses hostnames instead of blocking on DNS.
+enum class Resolve { any, numeric_only };
+
 // Resolve host:port and connect a TCP socket. Returns the connected fd or -1.
 [[nodiscard]] inline int connect_socket(const char* host, std::uint16_t port,
-    const core::Deadline& deadline = {core::Deadline::Clock::now() + std::chrono::seconds{10}, {}}) {
+    const core::Deadline& deadline = {core::Deadline::Clock::now() + std::chrono::seconds{10}, {}},
+    Resolve resolve = Resolve::any) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    if (resolve == Resolve::numeric_only) hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
     addrinfo* result = nullptr;
     const std::string service = std::to_string(port);
     if (::getaddrinfo(host, service.c_str(), &hints, &result) != 0) {
@@ -147,11 +154,13 @@ inline void close_fd(int& fd) noexcept {
 }
 
 // Bind + listen on host:port (port 0 for ephemeral). Returns the listening fd or -1.
-[[nodiscard]] inline int listen_socket(const char* host, std::uint16_t port) {
+[[nodiscard]] inline int listen_socket(const char* host, std::uint16_t port,
+                                       Resolve resolve = Resolve::any) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
+    if (resolve == Resolve::numeric_only) hints.ai_flags |= AI_NUMERICHOST | AI_NUMERICSERV;
     addrinfo* result = nullptr;
     const std::string service = std::to_string(port);
     if (::getaddrinfo(host, service.c_str(), &hints, &result) != 0) {

@@ -4,7 +4,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_target_properties(aa-wireless-receiver PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_link_libraries(aa-wireless-receiver PRIVATE
-        aa_wireless aa_wired aa_protocol_adapter aa_ipc_control aa_ipc_dbus
+        aa_audio_worker aa_wireless aa_wired aa_protocol_adapter aa_ipc_control aa_ipc_dbus
         aa_video aa_input aareceiver-audio aa_transport_tls aap_protobuf aasdk pthread)
     if(TARGET PkgConfig::AA_AUDIO_GST)
         target_link_libraries(aa-wireless-receiver PRIVATE PkgConfig::AA_AUDIO_GST)

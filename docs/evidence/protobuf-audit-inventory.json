@@ -66378,12 +66378,12 @@
     "citations": [
      {
       "contains": "case protocol::ControlMessageId::service_discovery_request: {",
-      "lines": "510",
+      "lines": "516",
       "path": "src/app/WiredSession.cpp"
      },
      {
       "contains": "if (auto sent = announce_services(); !sent) {",
-      "lines": "517",
+      "lines": "523",
       "path": "src/app/WiredSession.cpp"
      }
     ],
@@ -66961,7 +66961,7 @@
      "evidence": [
       {
        "contains": "if (auto sent = announce_services(); !sent) {",
-       "lines": "517",
+       "lines": "523",
        "path": "src/app/WiredSession.cpp"
       }
      ],
@@ -66980,7 +66980,7 @@
     "citations": [
      {
       "contains": "case protocol::ControlMessageId::service_discovery_request: {",
-      "lines": "510",
+      "lines": "516",
       "path": "src/app/WiredSession.cpp"
      }
     ],
@@ -67019,7 +67019,7 @@
      "evidence": [
       {
        "contains": "auto request = protocol::decode_channel_open_request(message.payload);",
-       "lines": "403",
+       "lines": "409",
        "path": "src/app/WiredSession.cpp"
       }
      ],
@@ -67040,12 +67040,12 @@
     "citations": [
      {
       "contains": "auto request = protocol::decode_channel_open_request(message.payload);",
-      "lines": "403",
+      "lines": "409",
       "path": "src/app/WiredSession.cpp"
      },
      {
       "contains": "request = protocol::decode_in_band_channel_open_request(message.payload);",
-      "lines": "405",
+      "lines": "411",
       "path": "src/app/WiredSession.cpp"
      }
     ],
@@ -67739,7 +67739,7 @@
      "evidence": [
       {
        "contains": "protocol::encode_input_report(event, static_cast<std::uint64_t>(deps_.clock.now().count));",
-       "lines": "789",
+       "lines": "795",
        "path": "src/app/WiredSession.cpp"
       }
      ],
@@ -67769,7 +67769,7 @@
     "citations": [
      {
       "contains": "protocol::encode_input_report(event, static_cast<std::uint64_t>(deps_.clock.now().count));",
-      "lines": "789",
+      "lines": "795",
       "path": "src/app/WiredSession.cpp"
      },
      {

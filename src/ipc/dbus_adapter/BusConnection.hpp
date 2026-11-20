@@ -12,6 +12,7 @@
 #include <aa/ipc/ControlDispatcher.hpp>
 #include <aa/ipc/PeerCredentials.hpp>
 
+#include "BusOwner.hpp"
 #include "BusWire.hpp"
 
 #include <cstdint>
@@ -32,9 +33,16 @@ public:
 
     // Connects to the session bus named by DBUS_SESSION_BUS_ADDRESS
     // (unix:path=... or unix:abstract=...) and completes AUTH EXTERNAL + Hello.
+    // Before any byte is sent the kernel-reported socket owner (SO_PEERCRED)
+    // must be admitted by `owner`, else transport_unauthorized_peer (#89 L12).
+    // The server's SASL GUID must be 32 hex digits and, when the address
+    // carries guid=..., equal it; otherwise nothing past AUTH is sent.
+    // Session/private buses admit the caller's UID or root; the system bus
+    // admits only a root-owned socket.
     [[nodiscard]] static core::Result<BusConnection> connect_session();
     [[nodiscard]] static core::Result<BusConnection> connect_system();
-    [[nodiscard]] static core::Result<BusConnection> connect_private(std::string_view address);
+    [[nodiscard]] static core::Result<BusConnection> connect_private(
+        std::string_view address, BusOwner owner = BusOwner::root_or_self());
     void deadline(std::chrono::steady_clock::time_point until) { deadline_ = until; }
     void clear_deadline() { deadline_.reset(); }
 
@@ -91,7 +99,7 @@ private:
     [[nodiscard]] core::Result<ParsedMessage> call(std::string_view member,
                                                    std::string_view body_signature,
                                                    MessageWriter body);
-    [[nodiscard]] core::Result<void> authenticate();
+    [[nodiscard]] core::Result<void> authenticate(std::string_view expected_guid);
     [[nodiscard]] core::Result<std::string> read_line();
     void close_connection() noexcept;
 

@@ -5,6 +5,7 @@
 #include <aa/core/Deadline.hpp>
 #include <aa/core/Result.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <optional>
@@ -43,6 +44,9 @@ public:
     // destroy or recursively operate the transport. Empty preserves other callers.
     // NOLINTNEXTLINE(performance-unnecessary-value-param): overrides take ownership.
     virtual void set_io_checkpoint(std::function<void()> checkpoint) { (void)checkpoint; }
+    virtual void set_io_checkpoint_interval(std::chrono::milliseconds interval) noexcept {
+        (void)interval;
+    }
     virtual ~Transport() = default;
     Transport() = default;
     Transport(const Transport&) = delete;

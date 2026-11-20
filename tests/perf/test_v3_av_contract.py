@@ -362,6 +362,23 @@ def test_schema_pins_the_v3_budgets_and_validate_auto() -> None:
             assert check.returncode == 0, check.stderr
 
 
+def test_evaluate_window_is_half_open_at_its_end() -> None:
+    # evaluate() documents [start, end): a pair at end_ns belongs to the next
+    # window, one at start_ns to this one (the review of #152).
+    import aa_av_contract as contract
+    start, end = 0, 1800 * NS
+    spike = 500.0  # ms: over the hard cap, so counting it fails the soak clause
+    cover = [(start, end)]
+    steady = [(t, 5.0) for t in range(0, end, FRAME_NS)]
+    at_end = contract.evaluate(steady + [(end, spike)], cover, start, end, max_clause="soak_rate")
+    assert at_end["pairs"] == len(steady) and at_end["over_hard_cap"] == 0 and at_end["passed"], at_end
+    just_inside = contract.evaluate(steady + [(end - 1, spike)], cover, start, end, max_clause="soak_rate")
+    assert just_inside["pairs"] == len(steady) + 1 and just_inside["over_hard_cap"] == 1
+    assert not just_inside["passed"]
+    at_start = contract.evaluate([(start, spike)] + steady[1:], cover, start, end, max_clause="soak_rate")
+    assert at_start["over_hard_cap"] == 1, "a pair exactly at start_ns is inside"
+
+
 def test_reporter_cli_dispatches_by_capture_version() -> None:
     with tempfile.TemporaryDirectory(prefix="perf-v3-cli-") as directory:
         for raw, version, code in ((v3(60), "aa-projection-perf/3", 0),
