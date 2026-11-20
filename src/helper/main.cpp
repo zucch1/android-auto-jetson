@@ -4,6 +4,7 @@
 #include <aa/helper/BluezBackend.hpp>
 #include <aa/helper/BusService.hpp>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <unistd.h>
@@ -13,6 +14,13 @@ volatile std::sig_atomic_t stopping = 0;
 void stop(int) { stopping = 1; }
 } // namespace
 int main(int argc, char **argv) {
+    // #89 L9: G_DBUS_DEBUG=message/payload makes GDBus print every sent body,
+    // including the PSK in AddAndActivateConnection2. Drop it before any GLib
+    // or GDBus use; the value is never echoed.
+    if (std::getenv("G_DBUS_DEBUG") != nullptr) {
+        ::unsetenv("G_DBUS_DEBUG");
+        std::cerr << "system-helper: ignoring G_DBUS_DEBUG; GDBus message logging would expose secrets\n";
+    }
     const bool fixture =
         (argc == 4 || argc == 5 || (argc == 6 && std::string{argv[4]} == "--combined")) &&
         std::string{argv[1]} == "--private-bus" && ::getuid() != 0 && ::getuid() == ::geteuid();

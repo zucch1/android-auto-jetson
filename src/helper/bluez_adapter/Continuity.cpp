@@ -53,6 +53,14 @@ void BluezBackend::Impl::watch_continuity() {
                     if (std::string_view{name} == "Paired" || std::string_view{name} == "Bonded" ||
                         std::string_view{name} == "Connected") lost = true;
                 }
+                // Before lost_path() closes the window: remember, read only, that its phone lost the link.
+                if (g_variant_lookup(changed, "Connected", "b", &value) && !value && self.allowed &&
+                    !self.pairing_enabled && self.allowed->device.path == path)
+                    self.lost_link = LostLink{path, self.allowed->device.identity, self.window};
+                // The same phone's link is back (from the current BlueZ owner, checked above): the note
+                // no longer describes it. Diagnostics only: the closed window stays closed.
+                if (g_variant_lookup(changed, "Connected", "b", &value) && value &&
+                    self.lost_link && self.lost_link->path == path) self.lost_link.reset();
                 if (lost) self.lost_path(path);
             }
             g_variant_unref(changed); g_variant_unref(invalidated);

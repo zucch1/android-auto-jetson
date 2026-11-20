@@ -85,12 +85,13 @@ if(NOT CMAKE_CROSSCOMPILING)
         message(FATAL_ERROR
             "AA_WIRED_E2E_REQUIRES_AUDIO_ROUTER: include cmake/AudioPipeline.cmake before cmake/WiredE2e.cmake")
     endif()
+    include("${CMAKE_CURRENT_LIST_DIR}/AudioWorker.cmake")
     add_executable(aa_wired_e2e_test ${AA_WIRED_TEST_SOURCES})
     add_test(NAME wired_e2e_av_credit_ledger COMMAND aa_wired_e2e_test --gtest_filter=AvCreditLedger.*)
     set_target_properties(aa_wired_e2e_test PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_link_libraries(aa_wired_e2e_test PRIVATE
-        aa_wired aa_protocol_adapter aap_protobuf aasdk
+        aa_audio_worker aa_wired aa_protocol_adapter aap_protobuf aasdk
         aa_video aa_input aa_input_service aa_ipc_control aa_ipc_dbus aa_transport_tls
         aareceiver-audio aareceiver-consumer pthread GTest::gtest_main)
     target_include_directories(aa_wired_e2e_test PRIVATE
@@ -190,7 +191,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_target_properties(aa-wired-receiver PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_link_libraries(aa-wired-receiver PRIVATE
-        aa_wired aa_protocol_adapter aa_ipc_control aa_ipc_dbus aa_video aa_input
+        aa_audio_worker aa_wired aa_protocol_adapter aa_ipc_control aa_ipc_dbus aa_video aa_input
         aareceiver-audio aareceiver-consumer pthread)
     if(TARGET aa_transport_tls)
         target_link_libraries(aa-wired-receiver PRIVATE aa_transport_tls)

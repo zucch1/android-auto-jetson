@@ -3,6 +3,10 @@
 #include "../crypto_adapter/Crypto.hpp"
 #include <array>
 #include <charconv>
+#include <cstring>
+#include <span>
+#include <string.h>
+#include <string_view>
 #include <fcntl.h>
 #include <sstream>
 #include <sys/stat.h>
@@ -35,18 +39,41 @@ int directory(const std::string& path, std::uint32_t owner) {
     fd.value = -1;
     return result;
 }
-core::Result<std::string> read_file(int dir, const char* name, std::uint32_t owner) {
+// Reads an owner-only regular file of at most 512 bytes into `buffer`.
+core::Result<std::size_t> read_into(int dir, const char* name, std::uint32_t owner, std::span<char, 513> buffer) {
     Fd fd{::openat(dir, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
     struct stat st{};
     if (fd.value < 0 || ::fstat(fd.value, &st) || !S_ISREG(st.st_mode) || st.st_uid != owner ||
         (st.st_mode & 0077) || st.st_nlink != 1 || st.st_size > 512) return Error{ErrorCode::config_invalid};
-    std::array<char, 513> data{};
-    const auto size = ::read(fd.value, data.data(), data.size());
+    const auto size = ::read(fd.value, buffer.data(), buffer.size());
     if (size < 0 || size != st.st_size) return Error{ErrorCode::config_invalid};
-    return std::string{data.data(), static_cast<std::size_t>(size)};
+    return static_cast<std::size_t>(size);
 }
-bool hex(const std::string& value, std::size_t size) {
-    return value.size() == size && value.find_first_not_of("0123456789abcdef") == std::string::npos;
+core::Result<std::string> read_file(int dir, const char* name, std::uint32_t owner) {
+    std::array<char, 513> data{};
+    const auto size = read_into(dir, name, owner, data);
+    if (!size) return size.error();
+    return std::string{data.data(), size.value()};
+}
+// #89 L9: a fixed stack buffer for secret file bytes, cleansed on every exit.
+template<std::size_t N> struct SecretBuffer final {
+    std::array<char, N> bytes{};
+    SecretBuffer() = default;
+    SecretBuffer(const SecretBuffer&) = delete;
+    SecretBuffer& operator=(const SecretBuffer&) = delete;
+    ~SecretBuffer() { ::explicit_bzero(bytes.data(), bytes.size()); }
+};
+bool hex(std::string_view value, std::size_t size) {
+    return value.size() == size && value.find_first_not_of("0123456789abcdef") == std::string_view::npos;
+}
+// A fresh SSID ("AA-" + 16 hex) and PSK, the PSK drawn straight into its buffer.
+core::Result<Credentials> generate() {
+    Credentials result;
+    std::array<char, 16> ssid{};
+    if (!crypto_adapter::random_hex(ssid) || !crypto_adapter::random_hex(result.psk.digits()))
+        return Error{ErrorCode::helper_unavailable};
+    result.ssid = "AA-" + std::string{ssid.data(), ssid.size()};
+    return result;
 }
 }
 core::Result<Policy> load_policy(const std::string& path, std::uint32_t owner) {
@@ -83,35 +110,40 @@ core::Result<Credentials> credentials(const Policy& policy, bool rotate) {
     struct stat existing{};
     const bool present = ::fstatat(dir.value, "ap.credentials", &existing, AT_SYMLINK_NOFOLLOW) == 0;
     if (present) {
-        const auto saved = read_file(dir.value, "ap.credentials", policy.owner);
-        if (!saved) return saved.error();
-        const auto split = saved.value().find('\n');
-        if (split != 19 || !saved.value().starts_with("AA-") ||
-            !hex(saved.value().substr(3, 16), 16) || saved.value().size() != 85 ||
-            !hex(saved.value().substr(20, 64), 64) || saved.value().back() != '\n')
+        SecretBuffer<513> saved;
+        const auto size = read_into(dir.value, "ap.credentials", policy.owner, saved.bytes);
+        if (!size) return size.error();
+        const std::string_view text{saved.bytes.data(), size.value()};
+        if (text.size() != 85 || text.find('\n') != 19 || !text.starts_with("AA-") ||
+            !hex(text.substr(3, 16), 16) || !hex(text.substr(20, 64), 64) || text.back() != '\n')
             return Error{ErrorCode::config_invalid};
-        if (!rotate) return Credentials{saved.value().substr(0, 19), saved.value().substr(20, 64)};
+        if (!rotate) {
+            Credentials result;
+            result.ssid = std::string{text.substr(0, 19)};
+            std::memcpy(result.psk.digits().data(), text.data() + 20, Psk::kLength);
+            return result;
+        }
     } else if (errno != ENOENT) return Error{ErrorCode::config_invalid};
-    const auto generated = crypto_adapter::random_ap_secret();
+    auto generated = generate();
     if (!generated) return generated.error();
-    Credentials result{"AA-" + generated.value().substr(0, 16), generated.value().substr(16)};
-    const auto data = result.ssid + "\n" + result.psk + "\n";
+    const auto& result = generated.value();
+    // "AA-<16 hex>\n<64 hex>\n", composed in place: never a std::string.
+    SecretBuffer<85> data;
+    std::memcpy(data.bytes.data(), result.ssid.data(), 19);
+    data.bytes[19] = '\n';
+    std::memcpy(data.bytes.data() + 20, result.psk.c_str(), Psk::kLength);
+    data.bytes[84] = '\n';
     // Exclusive staging rejects symlinks and stale/foreign files; no truncation of arbitrary paths.
     Fd output{::openat(dir.value, "ap.credentials.new", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600)};
     if (output.value < 0) return Error{ErrorCode::config_invalid};
-    const bool written = ::write(output.value, data.data(), data.size()) == static_cast<ssize_t>(data.size()) &&
+    const bool written = ::write(output.value, data.bytes.data(), data.bytes.size()) == static_cast<ssize_t>(data.bytes.size()) &&
                          ::fsync(output.value) == 0;
     if (!written || ::renameat(dir.value, "ap.credentials.new", dir.value, "ap.credentials")) {
         (void)::unlinkat(dir.value, "ap.credentials.new", 0);
         return Error{ErrorCode::helper_unavailable};
     }
     if (::fsync(dir.value)) return Error{ErrorCode::helper_unavailable};
-    return result;
-}core::Result<Credentials> fresh_credentials() {
-    auto generated = crypto_adapter::random_ap_secret();
-    if (!generated) return generated.error();
-    Credentials result{"AA-" + generated.value().substr(0, 16), generated.value().substr(16)};
-    wipe(generated.value());
-    return result;
+    return generated;
 }
+core::Result<Credentials> fresh_credentials() { return generate(); }
 }

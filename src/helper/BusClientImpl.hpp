@@ -70,6 +70,10 @@ struct BusClient::Impl {
                                     PairingComparison* comparison = nullptr) {
         if (Clock::now() >= until) return Error{ErrorCode::timeout};
         bus.deadline(until);
+        // These daemon answers are only meaningful because the socket itself was
+        // authenticated at connect (#89 L12): BusConnection refused any endpoint
+        // whose kernel-reported owner (SO_PEERCRED) is not root for the system
+        // bus, or this UID/root for private buses, and any SASL GUID mismatch.
         const auto owner = bus.get_name_owner(ipc::BusName{kBusName});
         if (!owner) return Error{Clock::now() >= until ? ErrorCode::timeout : ErrorCode::helper_unavailable};
         const auto uid = bus.get_connection_unix_uid(owner.value());

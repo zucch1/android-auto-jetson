@@ -17,6 +17,8 @@ TimeoutStopSec=10
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE
 NoNewPrivileges=yes
 LimitCORE=0
+# GDBus message debugging would log the AP PSK (#89 L9); main() also drops it.
+UnsetEnvironment=G_DBUS_DEBUG
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

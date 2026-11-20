@@ -6,7 +6,9 @@
 #include <aa/helper/BusService.hpp>
 #include <gtest/gtest.h>
 #include "../trust/syscall_faults.hpp"
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <iostream>
 #include <csignal>
@@ -334,6 +336,13 @@ std::size_t state_number(MockBluez& mock, const char* key) {
     const auto at = state.find(std::string{"\""} + key + "\": ");
     return at == std::string::npos ? 0U : std::stoul(state.substr(at + std::string{key}.size() + 4));
 }
+// Every Device1/Adapter1 call the mock received (logged at message ingress, full object paths),
+// read after a dispatch barrier: a synchronous inventory on the helper's own connection, which
+// the mock answers only after every earlier message from it.
+std::string bluez_device_calls(helper::BluezBackend& backend, MockBluez& mock) {
+    if (const auto barrier = backend.observe()) backend.discard(barrier.value().handle);
+    return mock.command("ingress");
+}
 const helper::PeerIdentity primary_peer{"02:00:00:00:00:01", "02:00:00:00:00:AA"};
 bool peer_in(const std::string& directory, const char* file) {
     return std::filesystem::exists(directory + "/" + file) &&
@@ -353,6 +362,7 @@ void expect_refused_everywhere(helper::BluezBackend& backend, MockBluez& mock) {
     const auto obs = backend.observe();
     ASSERT_TRUE(obs);
     EXPECT_FALSE(backend.reconnect_peer(obs.value().handle)) << "a forgotten phone reconnected";
+    EXPECT_FALSE(backend.awaiting_link()) << "a refused reconnect opened a window";
     EXPECT_EQ(bluez_callback(backend, mock, "NewConnection"), "rejected")
         << "a forgotten phone got the Android Auto profile";
     EXPECT_EQ(bluez_callback(backend, mock, "AuthorizeService"), "rejected")
@@ -661,6 +671,242 @@ TEST_F(ManagedBonds, NormalRestartAfterSuccessfulSyncAdmitsLoadedEntries) {
     const auto reconn_obs = restarted.observe();
     ASSERT_TRUE(reconn_obs);
     EXPECT_TRUE(restarted.reconnect_peer(reconn_obs.value().handle));
+}
+
+// #160 (owner, 2026-11-18): infotainment owns the phone's HFP link. An approved reconnect never
+// pages, connects or disconnects the phone (no Device1 call at all); it only reports, read-only,
+// that its window waits for a Bluetooth link. The AA fences are unchanged.
+class ReconnectLink : public ManagedBonds {
+protected:
+    std::unique_ptr<MockBluez> mock;
+    std::unique_ptr<helper::BluezBackend> backend;
+    std::chrono::steady_clock::duration offset{};
+    void SetUp() override {
+        ManagedBonds::SetUp();
+        const auto* bus_address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+        ASSERT_NE(bus_address, nullptr);
+        mock = std::make_unique<MockBluez>(bus_address);
+        const auto dir = directory + "/backend";
+        ASSERT_EQ(::mkdir(dir.c_str(), 0700), 0);
+        ASSERT_EQ(mock->command("paired"), "ok");
+        {
+            helper::BluezBackend initial{bus_address, [] { return std::chrono::steady_clock::now(); }, dir, ::getuid()};
+            ASSERT_TRUE(initial.apply(helper::Action::register_profile, 0));
+            ASSERT_TRUE(initial.reconcile_bonds({}));
+            const auto obs = initial.observe();
+            ASSERT_TRUE(obs);
+            accept_enrolment(initial, *mock, obs.value().handle);
+            if (HasFatalFailure()) return;
+            ASSERT_TRUE(admit(initial));
+        }
+        backend = std::make_unique<helper::BluezBackend>(bus_address,
+            [this] { return std::chrono::steady_clock::now() + offset; }, dir, ::getuid());
+        ASSERT_TRUE(backend->apply(helper::Action::register_profile, 0));
+        ASSERT_TRUE(backend->reconcile_bonds({primary_peer}));
+        ASSERT_EQ(calls(), "") << "enrolment and admission made a Device1 call";
+    }
+    void TearDown() override { backend.reset(); mock.reset(); ManagedBonds::TearDown(); }
+    bool reconnect() {
+        const auto obs = backend->observe();
+        return obs && backend->reconnect_peer(obs.value().handle);
+    }
+    std::string calls() { return bluez_device_calls(*backend, *mock); }
+};
+TEST_F(ReconnectLink, WithoutALinkTheWindowWaitsAndNoDeviceCallIsMade) {
+    ASSERT_TRUE(reconnect());
+    EXPECT_TRUE(backend->awaiting_link());
+    EXPECT_EQ(backend->handoff_failure(), helper::HandoffFailure::none) << "a wait is not a bootstrap failure";
+    ASSERT_EQ(mock->command("link-up"), "ok");  // arrives without a signal: evaluated live
+    EXPECT_FALSE(backend->awaiting_link());
+    ASSERT_EQ(mock->command("link-down"), "ok");
+    EXPECT_TRUE(backend->awaiting_link());
+    for (int retry = 0; retry < 5; ++retry) ASSERT_TRUE(reconnect());
+    backend->tick();
+    EXPECT_EQ(calls(), "") << "the helper paged, connected or disconnected the phone";
+    // Window expiry ends the wait report, still without any call.
+    offset += std::chrono::seconds(61);
+    backend->tick();
+    EXPECT_FALSE(backend->awaiting_link());
+    backend->retire_lease();
+    EXPECT_EQ(calls(), "");
+}
+TEST_F(ReconnectLink, AnExistingOrArrivingLinkIsReportedAndLeftAlone) {
+    ASSERT_EQ(mock->command("link-up"), "ok");
+    ASSERT_TRUE(reconnect());
+    EXPECT_FALSE(backend->awaiting_link());
+    ASSERT_EQ(mock->command("link-down"), "ok");
+    ASSERT_TRUE(reconnect());
+    EXPECT_TRUE(backend->awaiting_link());
+    // Infotainment brings HFP up: the open window sees the link, and touches nothing.
+    ASSERT_EQ(mock->command("connected-true"), "ok");
+    for (int i = 0; i < 20 && backend->awaiting_link(); ++i) {
+        backend->tick(); std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    EXPECT_FALSE(backend->awaiting_link());
+    backend->retire_lease();
+    ASSERT_TRUE(backend->revoke_peer(primary_peer));
+    EXPECT_EQ(calls(), "") << "lease retirement or Forget disconnected the phone's link";
+}
+TEST_F(ReconnectLink, ARealLinkLossSignalDuringTheWindowStillReportsNoLink) {
+    ASSERT_EQ(mock->command("link-up"), "ok");
+    ASSERT_TRUE(reconnect());
+    ASSERT_FALSE(backend->awaiting_link());
+    // BlueZ reports the link drop: lost_path() closes the window and refuses the identity...
+    ASSERT_EQ(mock->command("connected-false"), "ok");
+    for (int i = 0; i < 20 && !backend->awaiting_link(); ++i) {
+        backend->tick(); std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    // ...and the diagnostic still names the missing link, granting nothing.
+    EXPECT_TRUE(backend->awaiting_link());
+    EXPECT_EQ(bluez_callback(*backend, *mock, "NewConnection"), "rejected") << "the closed window admitted AA";
+    EXPECT_EQ(bluez_callback(*backend, *mock, "AuthorizeService"), "rejected");
+    EXPECT_FALSE(backend->handoff()) << "no handoff from a closed window";
+    // Bounded by the closed window's deadline, and cleared by lease retirement.
+    offset += std::chrono::seconds(61);
+    EXPECT_FALSE(backend->awaiting_link());
+    offset -= std::chrono::seconds(61);
+    backend->retire_lease();
+    EXPECT_FALSE(backend->awaiting_link());
+    EXPECT_EQ(calls(), "");
+}
+// Opens a reconnect window with a link, then has BlueZ report the link lost (the note is set).
+void lose_link_during_window(helper::BluezBackend& backend, MockBluez& mock, const std::function<bool()>& reconnect) {
+    ASSERT_EQ(mock.command("link-up"), "ok");
+    ASSERT_TRUE(reconnect());
+    ASSERT_EQ(mock.command("connected-false"), "ok");
+    for (int i = 0; i < 20 && !backend.awaiting_link(); ++i) {
+        backend.tick(); std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    ASSERT_TRUE(backend.awaiting_link());
+}
+TEST_F(ReconnectLink, TheLinkComingBackClearsTheLostLinkNoteWithoutReopening) {
+    lose_link_during_window(*backend, *mock, [this] { return reconnect(); });
+    if (HasFatalFailure()) return;
+    // Same attempt, no new window: BlueZ reports the same phone's link back.
+    ASSERT_EQ(mock->command("connected-true"), "ok");
+    for (int i = 0; i < 20 && backend->awaiting_link(); ++i) {
+        backend->tick(); std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    EXPECT_FALSE(backend->awaiting_link()) << "the link is back but the note still claimed none";
+    // The window lost_path() closed stays closed: no AA service, no handoff.
+    EXPECT_EQ(bluez_callback(*backend, *mock, "NewConnection"), "rejected");
+    EXPECT_EQ(bluez_callback(*backend, *mock, "AuthorizeService"), "rejected");
+    EXPECT_FALSE(backend->handoff());
+    EXPECT_EQ(calls(), "");
+}
+TEST_F(ReconnectLink, AnEnrolmentWindowClearsThePreviousPhonesLostLinkNote) {
+    lose_link_during_window(*backend, *mock, [this] { return reconnect(); });
+    if (HasFatalFailure()) return;
+    // A different phone's enrolment opens, then BlueZ cancels it (the window closes without cleanup).
+    ASSERT_EQ(mock->command("observe-other"), "ok");
+    const auto other = backend->observe();
+    ASSERT_TRUE(other);
+    ASSERT_TRUE(backend->authorize(other.value().handle));
+    EXPECT_EQ(bluez_callback(*backend, *mock, "Cancel"), "allowed");
+    EXPECT_FALSE(backend->awaiting_link()) << "the previous phone's link loss outlived a new enrolment";
+    ASSERT_EQ(mock->command("observe-first"), "ok");
+}
+TEST_F(ReconnectLink, ForgettingThePhoneClearsItsLostLinkNote) {
+    lose_link_during_window(*backend, *mock, [this] { return reconnect(); });
+    if (HasFatalFailure()) return;
+    ASSERT_TRUE(backend->revoke_peer(primary_peer));
+    EXPECT_FALSE(backend->awaiting_link()) << "a forgotten phone still reported a missing link";
+    EXPECT_EQ(calls(), "");
+}
+TEST_F(ReconnectLink, AWindowClosedDuringTheLiveQueryClaimsNothing) {
+    ASSERT_TRUE(reconnect());
+    ASSERT_TRUE(backend->awaiting_link());
+    // BlueZ's owner changes while the query's inventory is in flight: the drained callback
+    // resets the window under exact(); the answer is "unknown", never a stale observation.
+    ASSERT_EQ(mock->command("owner-during-inventory"), "ok");
+    EXPECT_FALSE(backend->awaiting_link());
+    EXPECT_FALSE(backend->awaiting_link());
+}
+TEST_F(ReconnectLink, TheAaFencesStillRefuseAForgottenPhoneWithALink) {
+    ASSERT_EQ(mock->command("link-up"), "ok");
+    ASSERT_TRUE(backend->revoke_peer(primary_peer));
+    expect_refused_everywhere(*backend, *mock);
+    EXPECT_EQ(calls(), "");
+}
+
+// #160: no production source (helper, receiver, shared libraries) names a BlueZ method that
+// creates, drops or removes a link or pairing, however it is spelled in code: a string literal
+// (plain, raw, or a qualified "org.bluez.Device1.X") or an identifier (a method name split
+// across concatenated literals is not detected; the mock's ingress log covers the runtime path).
+// Comments are ignored. Only the test-only operator tool in tools/wireless-qa may name them.
+constexpr const char* kForbiddenBluezMethods[] = {
+    "Connect", "ConnectProfile", "Disconnect", "DisconnectProfile", "CancelPairing", "RemoveDevice"};
+std::string strip_comments(const std::string& text) {
+    std::string out; out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size();) {
+        if (text.compare(i, 2, "//") == 0) { while (i < text.size() && text[i] != '\n') ++i; continue; }
+        if (text.compare(i, 2, "/*") == 0) {
+            const auto end = text.find("*/", i + 2);
+            i = end == std::string::npos ? text.size() : end + 2; out.push_back(' '); continue;
+        }
+        if (text[i] == '"' || text[i] == '\'') {
+            // Copy a literal verbatim (so "//" inside it is not a comment).
+            const char quote = text[i]; out.push_back(text[i++]);
+            while (i < text.size() && text[i] != quote) {
+                if (text[i] == '\\' && i + 1 < text.size()) out.push_back(text[i++]);
+                out.push_back(text[i++]);
+            }
+            if (i < text.size()) out.push_back(text[i++]);
+            continue;
+        }
+        out.push_back(text[i++]);
+    }
+    return out;
+}
+// Names of forbidden methods appearing as whole tokens (not inside RequestDisconnection etc.).
+std::vector<std::string> forbidden_tokens(const std::string& source) {
+    const auto code = strip_comments(source);
+    const auto word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+    std::vector<std::string> found;
+    for (const auto* method : kForbiddenBluezMethods) {
+        const std::string name{method};
+        for (auto at = code.find(name); at != std::string::npos; at = code.find(name, at + 1)) {
+            const bool starts = at == 0 || !word(code[at - 1]);
+            const bool ends = at + name.size() == code.size() || !word(code[at + name.size()]);
+            if (starts && ends) { found.push_back(name); break; }
+        }
+    }
+    return found;
+}
+TEST(NoLinkCalls, ScannerCatchesEverySpellingAndIgnoresComments) {
+    const std::pair<const char*, const char*> planted[] = {
+        {R"x(call(path, "org.bluez.Device1", "ConnectProfile", args);)x", "ConnectProfile"},
+        {R"x(auto m = R"(Connect)";)x", "Connect"},
+        {R"x(send("org.bluez.Device1.DisconnectProfile");)x", "DisconnectProfile"},
+        {R"x(constexpr auto kRemove = "RemoveDevice";)x", "RemoveDevice"},
+        {R"x(bluez.CancelPairing();)x", "CancelPairing"},
+        {R"x(proxy->Disconnect(device);)x", "Disconnect"},
+    };
+    for (const auto& [code, method] : planted) {
+        const auto found = forbidden_tokens(code);
+        EXPECT_NE(std::find(found.begin(), found.end(), method), found.end()) << "missed " << method << " in " << code;
+    }
+    EXPECT_TRUE(forbidden_tokens("// Device1.Connect is never used\n/* nor RemoveDevice */ int x;").empty());
+    EXPECT_TRUE(forbidden_tokens(R"x(method == "RequestDisconnection"; connect_bus(); Disconnected();)x").empty());
+}
+TEST(NoLinkCalls, ProductionSourcesNeverNameBluezLinkMethods) {
+    namespace fs = std::filesystem;
+    const fs::path root{AA_HELPER_SOURCE};
+    std::size_t scanned = 0;
+    for (const auto* top : {"src", "include", "tools/wireless-receiver", "tools/wired-receiver"}) {
+        ASSERT_TRUE(fs::is_directory(root / top)) << top;
+        for (const auto& entry : fs::recursive_directory_iterator(root / top)) {
+            if (!entry.is_regular_file()) continue;
+            std::ifstream in{entry.path(), std::ios::binary};
+            ASSERT_TRUE(in) << "unreadable " << entry.path();
+            const std::string text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+            ASSERT_FALSE(in.bad()) << "read failed " << entry.path();
+            ++scanned;
+            for (const auto& method : forbidden_tokens(text))
+                ADD_FAILURE() << entry.path() << " names BlueZ method " << method;
+        }
+    }
+    EXPECT_GT(scanned, 50U);
 }
 
 // Finding B: revocation demotes the admitted bond to history and keeps it in BlueZ (#136). A fresh

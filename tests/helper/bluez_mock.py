@@ -45,6 +45,13 @@ class MockBluez(ProfileSockets):
         self.owner_during_inventory = False
         self.removed: list[str] = []
         self.disconnected: list[str] = []
+        # Every org.bluez.Device1 / Adapter1 method call that reaches the mock's connection, logged
+        # at message ingress (a connection filter, so also calls to unregistered object paths):
+        # "<interface>.<member> <full path> [<string args>]". The helper never pages or
+        # disconnects the phone: infotainment owns its HFP link (#160).
+        self.ingress: list[str] = []
+        self.ingress_lock = threading.Lock()
+        self.connected = False  # the primary device's Device1.Connected (any Bluetooth link)
         self.cancel_unpaired = 0
         self.cancel_calls = 0
         self.properties = {"Pairable": True, "Discoverable": True}
@@ -61,13 +68,25 @@ class MockBluez(ProfileSockets):
 <interface name="org.bluez.AgentManager1"><method name="RegisterAgent"><arg type="o" direction="in"/><arg type="s" direction="in"/></method><method name="RequestDefaultAgent"><arg type="o" direction="in"/></method><method name="UnregisterAgent"><arg type="o" direction="in"/></method></interface>
 <interface name="org.freedesktop.DBus.Properties"><method name="Set"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/></method></interface>
 <interface name="org.bluez.Adapter1"><method name="RemoveDevice"><arg type="o" direction="in"/></method></interface>
-<interface name="org.bluez.Device1"><method name="CancelPairing"/><method name="Disconnect"/></interface>
+<interface name="org.bluez.Device1"><method name="CancelPairing"/><method name="Disconnect"/><method name="Connect"/><method name="ConnectProfile"><arg type="s" direction="in"/></method><method name="DisconnectProfile"><arg type="s" direction="in"/></method></interface>
 </node>"""
+        self.bus.add_filter(self.record_ingress)
         info = Gio.DBusNodeInfo.new_for_xml(xml)
         self.device_info = info.interfaces[5]
         for index, path in enumerate(["/", "/org/bluez", "/org/bluez", ADAPTER, ADAPTER, DEVICE]):
             self.bus.register_object(path, info.interfaces[index], self.method, None, None)
         self.name("RequestName", GLib.Variant("(su)", ("org.bluez", 0)))
+
+    def record_ingress(self, _bus: Gio.DBusConnection, message: Gio.DBusMessage, incoming: bool) -> Gio.DBusMessage:
+        interface = message.get_interface() or ""
+        if incoming and message.get_message_type() == Gio.DBusMessageType.METHOD_CALL and \
+                interface in ("org.bluez.Device1", "org.bluez.Adapter1"):
+            body = message.get_body()
+            strings = [str(v) for v in (body.unpack() if body is not None else ()) if isinstance(v, str)]
+            entry = " ".join([f"{interface}.{message.get_member()}", message.get_path() or ""] + strings)
+            with self.ingress_lock:
+                self.ingress.append(entry)
+        return message
 
     def name(self, method: str, args: GLib.Variant) -> None:
         self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
@@ -82,6 +101,7 @@ class MockBluez(ProfileSockets):
                 "AddressType": GLib.Variant("s", "public"), "Adapter": GLib.Variant("o", ADAPTER),
                 "Paired": GLib.Variant("b", self.paired),
                 "Bonded": GLib.Variant("b", self.bonded),
+                "Connected": GLib.Variant("b", self.connected and path == DEVICE),
             }}
         for path, address in ({} if self.hide_extras else self.extras).items():
             objects[path] = {"org.bluez.Device1": {
@@ -175,6 +195,8 @@ class MockBluez(ProfileSockets):
                 if self.disconnect_delay_ms:
                     GLib.timeout_add(self.disconnect_delay_ms, lambda: (invocation.return_value(None), False)[1])
                     return
+            case "Connect" | "ConnectProfile" | "DisconnectProfile":
+                pass  # logged at ingress; answered so a regression fails on the log, not a timeout
             case "CancelPairing":
                 self.cancel_calls += 1
                 # BlueZ answers CancelPairing without an in-flight Pair() with MGMT Unpair Device.
@@ -234,6 +256,13 @@ class MockBluez(ProfileSockets):
     def command(self, text: str) -> str:
         if text.startswith("hfp-wire-"):
             return self.hfp_wire(text)
+        if text == "ingress":
+            with self.ingress_lock:
+                return ";".join(self.ingress)
+        if text in ("link-up", "link-down"):
+            # The link state inventory reports, without a PropertiesChanged signal.
+            self.connected = text == "link-up"
+            return "ok"
         if text.startswith("slow-remove ") or text.startswith("slow-disconnect "):
             # Delays (ms) for RemoveDevice or Device1.Disconnect replies, for the cleanup deadline (#118).
             name, value = text.split()
@@ -307,6 +336,7 @@ class MockBluez(ProfileSockets):
                 self.bus.emit_signal(None, DEVICE, "org.freedesktop.DBus.Properties", "PropertiesChanged",
                                      GLib.Variant("(sa{sv}as)", ("org.bluez.Device1", {"Bonded": GLib.Variant("b", False)}, [])))
             case "connected-false" | "connected-true" | "connected-invalidated":
+                self.connected = text == "connected-true"
                 self.bus.emit_signal(None, DEVICE, "org.freedesktop.DBus.Properties", "PropertiesChanged",
                     GLib.Variant("(sa{sv}as)", ("org.bluez.Device1",
                         {} if text == "connected-invalidated" else {"Connected": GLib.Variant("b", text == "connected-true")},

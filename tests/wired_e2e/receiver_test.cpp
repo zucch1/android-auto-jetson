@@ -4018,6 +4018,111 @@ TEST(WiredReceiver, StopDuringSinkReopenNeverRepublishesRouter) {
     EXPECT_EQ(gate->destroyed, 2U);
 }
 
+TEST(WiredReceiver, SinkRecoveryBlocksPcmAdmissionAndAckWhileSelectionLogBlocked) {
+    ReceiverLogScope logging{g_running};
+    auto gate = std::make_shared<RenderGate>();
+    gate->first_write_delay = std::chrono::milliseconds{3000}; // released explicitly below
+    gate->fail_first_write = true;
+
+    std::mutex log_mutex;
+    std::condition_variable log_cv;
+    bool reopen_log_entered = false;
+    bool allow_reopen_log = false;
+
+    const aa::audio::AudioTelemetryCallbacks callbacks{
+        [&](const std::string &line) {
+            if (line.find("\"event\":\"audio_sink_selected\"") != std::string::npos &&
+                line.find("\"origin\":\"reopen\"") != std::string::npos) {
+                std::unique_lock lock(log_mutex);
+                reopen_log_entered = true;
+                log_cv.notify_all();
+                log_cv.wait(lock, [&] { return allow_reopen_log; });
+            }
+            log_line(line);
+        },
+        log_media,
+    };
+
+    aa::audio::AudioRenderWorker audio{
+        aa::audio::pcm_router_config(callbacks, aa::audio::SinkBackend::pulse), callbacks,
+        gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    capture_receiver_stdout();
+
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(960, std::byte{1});
+    ASSERT_TRUE(audio.submit({{role, 1, {1'000'000'000}}, pcm}, {role, 0, 1, 7}));
+    ASSERT_TRUE(gate->wait_writes(1));
+    // Drain chunk 1's admission ACK so completed_ is empty before sink reopen begins.
+    const auto first_ack = audio.take_completion(std::chrono::steady_clock::now() + std::chrono::seconds{2});
+    ASSERT_TRUE(first_ack.has_value());
+    EXPECT_EQ(first_ack->sequence, 1U);
+
+    // Release failing chunk 1 so worker reopens the sink and blocks on sink-selection logging.
+    gate->release();
+    {
+        std::unique_lock lock(log_mutex);
+        ASSERT_TRUE(log_cv.wait_for(lock, std::chrono::seconds{5}, [&] { return reopen_log_entered; }));
+    }
+
+    std::mutex probe_mutex;
+    std::condition_variable probe_cv;
+    bool submit_returned = false;
+    bool submit_ok = false;
+    bool take_returned = false;
+    std::optional<aa::channels::AvDeliveryId> second_ack;
+
+    std::thread admit_thread([&] {
+        const auto res = audio.submit({{role, 2, {1'100'000'000}}, pcm}, {role, 0, 2, 7});
+        std::lock_guard lock(probe_mutex);
+        submit_ok = res.has_value();
+        submit_returned = true;
+        probe_cv.notify_all();
+    });
+    std::thread ack_thread([&] {
+        const auto ack = audio.take_completion(std::chrono::steady_clock::now() +
+                                               std::chrono::seconds{2});
+        std::lock_guard lock(probe_mutex);
+        second_ack = ack;
+        take_returned = true;
+        probe_cv.notify_all();
+    });
+
+    {
+        std::unique_lock lock(probe_mutex);
+        (void)probe_cv.wait_for(lock, std::chrono::milliseconds{60},
+                                [&] { return submit_returned || take_returned; });
+        EXPECT_FALSE(submit_returned)
+            << "PCM was admitted while wired sink-selection logging was blocked";
+        EXPECT_FALSE(take_returned)
+            << "ACK/completion proceeded while wired sink-selection logging was blocked";
+    }
+
+    {
+        std::lock_guard lock(log_mutex);
+        allow_reopen_log = true;
+        log_cv.notify_all();
+    }
+
+    admit_thread.join();
+    ack_thread.join();
+
+    EXPECT_TRUE(submit_returned);
+    EXPECT_TRUE(submit_ok);
+    EXPECT_TRUE(take_returned);
+    ASSERT_TRUE(second_ack.has_value());
+    EXPECT_EQ(second_ack->sequence, 2U);
+    EXPECT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    EXPECT_TRUE(audio.finish());
+
+    const auto output = captured_receiver_stdout();
+    EXPECT_NE(output.find("\"event\":\"audio_sink_selected\",\"origin\":\"reopen\""),
+              std::string::npos) << output;
+    EXPECT_NE(output.find("\"outcome\":\"sink_reopened\""), std::string::npos) << output;
+    std::lock_guard lock(gate->mutex);
+    EXPECT_EQ(gate->writes, 2U);
+}
+
 class ReceiverPollTransport final : public aa::transport::Transport {
   public:
     wiredtest::ScriptedTransport wire;
@@ -6483,6 +6588,191 @@ TEST(WiredReceiver, ForgetPhoneWhileWaitingForVideoConsumerCompletesWithoutDeadl
     for (const auto thread : mutations) {
         EXPECT_NE(thread, dispatcher) << "store mutation ran on the D-Bus dispatcher";
     }
+    aa::trust::ApprovedPhoneStore persisted{path};
+    ASSERT_TRUE(persisted.load().has_value());
+    EXPECT_EQ(persisted.lookup(runtime_phone), aa::trust::Decision::unknown);
+    std::filesystem::remove_all(root);
+}
+
+TEST(WiredReceiver, ForgetPhoneWhileStdoutStalledCompletesShutdownBounded) {
+    namespace bus = aa::ipc::dbus_adapter;
+    namespace faults = aa::trust::test::faults;
+    char directory[] = "/tmp/wired-stalled-revoke-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore initial{path};
+    ASSERT_TRUE(initial.load().has_value());
+    const aa::trust::WiredIdentity identity{
+        "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+    const auto approved = initial.approve(aa::trust::TransportIdentity{identity});
+    ASSERT_TRUE(approved.has_value());
+    runtime_phone = aa::app::wired_phone_identity(identity).value();
+    runtime_recovers = false;
+    runtime_quiet = false;
+    runtime_connects.store(0);
+    runtime_ciphers.store(0);
+    g_running.store(true);
+    auto state = std::make_shared<AdmissionState>();
+    admission_link_state = state;
+
+    struct PipeGuard {
+        int pfd[2]{-1, -1};
+        int saved_stdout{-1};
+        std::mutex mutex;
+        void close_read_and_restore() {
+            {
+                std::lock_guard lock(mutex);
+                if (pfd[0] >= 0) {
+                    ::close(pfd[0]);
+                    pfd[0] = -1;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+            std::lock_guard lock(mutex);
+            if (saved_stdout >= 0) {
+                ::dup2(saved_stdout, STDOUT_FILENO);
+                ::close(saved_stdout);
+                saved_stdout = -1;
+            }
+        }
+        ~PipeGuard() {
+            close_read_and_restore();
+            if (pfd[1] >= 0) {
+                ::close(pfd[1]);
+                pfd[1] = -1;
+            }
+        }
+    } pipe_guard;
+
+    ASSERT_EQ(::pipe(pipe_guard.pfd), 0);
+    pipe_guard.saved_stdout = ::dup(STDOUT_FILENO);
+    ASSERT_GE(pipe_guard.saved_stdout, 0);
+    {
+        const int flags = ::fcntl(pipe_guard.pfd[1], F_GETFL);
+        ASSERT_GE(flags, 0);
+        ASSERT_EQ(::fcntl(pipe_guard.pfd[1], F_SETFL, flags | O_NONBLOCK), 0);
+        std::vector<char> fill(4096, 'x');
+        while (::write(pipe_guard.pfd[1], fill.data(), fill.size()) > 0) {}
+        ASSERT_EQ(::fcntl(pipe_guard.pfd[1], F_SETFL, flags), 0);
+    }
+    ASSERT_EQ(::dup2(pipe_guard.pfd[1], STDOUT_FILENO), STDOUT_FILENO);
+    ::close(pipe_guard.pfd[1]);
+    pipe_guard.pfd[1] = -1;
+
+    std::vector<std::string> args{"receiver", "--port", "1-2.1", "--store", path.string(),
+        "--video-socket", (root / "video").string(), "--input-socket", (root / "input").string(),
+        "--duration-ms", "20000", "--require-video-consumer"};
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (auto &arg : args) { argv.push_back(arg.data()); }
+
+    faults::arm(faults::Fault::none);
+    std::promise<int> receiver_promise;
+    auto receiver_future = receiver_promise.get_future();
+    ReceiverRunGuard guard;
+    guard.worker = std::thread([&] {
+        receiver_promise.set_value(wired_receiver_main(static_cast<int>(argv.size()), argv.data()));
+    });
+
+    std::atomic<bool> watchdog_armed{false};
+    std::atomic<bool> watchdog_fired{false};
+    std::jthread watchdog([&](const std::stop_token &stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, stop, std::chrono::seconds{6}, [] { return false; });
+        if (!stop.stop_requested() && watchdog_armed.load()) {
+            watchdog_fired.store(true);
+            g_running.store(false);
+            pipe_guard.close_read_and_restore();
+        }
+    });
+
+    {
+        std::unique_lock lock(state->mutex);
+        ASSERT_TRUE(state->cv.wait_for(lock, std::chrono::seconds{3},
+                                       [&] { return state->created; }))
+            << "LINK_NEVER_CREATED";
+    }
+    aa::wired_receiver::StdoutLog *log = nullptr;
+    const auto log_wait_deadline = LogClock::now() + std::chrono::seconds{2};
+    while (LogClock::now() < log_wait_deadline &&
+           (log = aa::wired_receiver::active_stdout_log.load()) == nullptr) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    ASSERT_NE(log, nullptr);
+
+    auto client = bus::BusConnection::connect_session();
+    aa::core::Result<bus::ParsedMessage> reply{aa::Error{aa::ErrorCode::internal}};
+    bool registered = false;
+    bool queue_full = false;
+    if (client) {
+        const aa::ipc::BusName consumer{"org.custom.AndroidAutoReceiverTest.ConsumerStalled"};
+        const aa::ipc::BusName service{"org.custom.AndroidAutoReceiver"};
+        auto named = client.value().request_name(consumer);
+        auto owner = client.value().get_name_owner(service);
+        if (named && owner) {
+            bus::MessageWriter registration;
+            registration.destination(service.value).path("/org/custom/AndroidAutoReceiver")
+                .interface_name("org.custom.AndroidAutoReceiver1").member("RegisterConsumer")
+                .body_signature("s").put_string(consumer.value);
+            auto serial = client.value().send_message(bus::MessageType::method_call, registration);
+            if (serial) {
+                auto result = client.value().await_reply(serial.value(), owner.value());
+                registered = result && result.value().type == bus::MessageType::method_return;
+            }
+            if (registered) {
+                // Fill StdoutLog completely while stdout remains stalled before ForgetPhone arrives.
+                for (int round = 0;
+                     round < 200 &&
+                     log->outstanding().second < aa::wired_receiver::StdoutLog::entry_capacity;
+                     ++round) {
+                    for (int kind = 0; kind < 32; ++kind) {
+                        const auto name = "fill" + std::to_string(kind);
+                        for (int i = 0; i < 100; ++i) { (void)log->submit_media(name, "{}"); }
+                    }
+                }
+                queue_full =
+                    log->outstanding().second == aa::wired_receiver::StdoutLog::entry_capacity;
+
+                watchdog_armed.store(true);
+                bus::MessageWriter forget;
+                forget.destination(service.value).path("/org/custom/AndroidAutoReceiver")
+                    .interface_name("org.custom.AndroidAutoReceiver1").member("ForgetPhone")
+                    .body_signature("t").put_u64(approved.value().value);
+                auto sent = client.value().send_message(bus::MessageType::method_call, forget);
+                if (sent) {
+                    reply = client.value().await_reply(sent.value(), owner.value());
+                }
+            }
+        }
+    }
+    if (!registered || !reply) {
+        g_running.store(false);
+    }
+
+    const auto finish_status = receiver_future.wait_for(std::chrono::seconds{6});
+    if (finish_status != std::future_status::ready) {
+        g_running.store(false);
+        pipe_guard.close_read_and_restore();
+    }
+    watchdog.request_stop();
+    watchdog.join();
+    guard.worker.join();
+    const int code = receiver_future.get();
+    pipe_guard.close_read_and_restore();
+    faults::disarm();
+    admission_link_state.reset();
+    g_running.store(true);
+
+    EXPECT_FALSE(watchdog_fired.load()) << "Control failure hung on full stalled stdout";
+    EXPECT_TRUE(queue_full);
+    EXPECT_TRUE(registered);
+    ASSERT_TRUE(reply.has_value());
+    EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
+    EXPECT_EQ(finish_status, std::future_status::ready)
+        << "Wired receiver shutdown hung after control failure with stalled stdout";
+    EXPECT_EQ(code, 1);
     aa::trust::ApprovedPhoneStore persisted{path};
     ASSERT_TRUE(persisted.load().has_value());
     EXPECT_EQ(persisted.lookup(runtime_phone), aa::trust::Decision::unknown);

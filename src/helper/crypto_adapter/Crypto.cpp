@@ -4,6 +4,7 @@
 #include <openssl/rand.h>
 #include <array>
 #include <memory>
+#include <string.h>
 #include <unistd.h>
 
 namespace aa::helper::crypto_adapter {
@@ -41,13 +42,18 @@ core::Result<std::uint64_t> random_id() {
         return Error{ErrorCode::helper_unavailable};
     return id;
 }
-core::Result<std::string> random_ap_secret() {
-    std::array<unsigned char, 40> random{};
-    if (RAND_bytes(random.data(), static_cast<int>(random.size())) != 1)
-        return Error{ErrorCode::helper_unavailable};
-    constexpr char digits[] = "0123456789abcdef";
-    std::string result;
-    for (const auto byte : random) { result += digits[byte >> 4]; result += digits[byte & 15]; }
-    return result;
+core::Result<void> random_hex(std::span<char> out) {
+    std::array<unsigned char, 32> random{};
+    const std::size_t bytes = (out.size() + 1) / 2;
+    if (bytes > random.size()) return Error{ErrorCode::helper_unavailable};
+    const bool drawn = RAND_bytes(random.data(), static_cast<int>(bytes)) == 1;
+    if (drawn) {
+        constexpr char digits[] = "0123456789abcdef";
+        for (std::size_t i = 0; i < out.size(); ++i)
+            out[i] = digits[i % 2 ? random[i / 2] & 15 : random[i / 2] >> 4];
+    }
+    ::explicit_bzero(random.data(), random.size());
+    if (!drawn) return Error{ErrorCode::helper_unavailable};
+    return {};
 }
 }

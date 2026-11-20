@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include <aa/diagnostics/JsonStdoutFd.hpp>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -34,11 +35,9 @@ namespace aa::tools {
 // skipped as well.
 
 // The isolated real stdout, or fd 1 when no isolation is active (unit tests).
-inline std::atomic<int> active_json_fd{-1};
-inline int json_fd() noexcept {
-    const int fd = active_json_fd.load();
-    return fd >= 0 ? fd : STDOUT_FILENO;
-}
+// Shared with aa::diagnostics::StdoutLog, which writes the receiver JSON there.
+using aa::diagnostics::active_json_fd;
+using aa::diagnostics::json_fd;
 
 // Blocking best-effort write of a whole record. Retries EINTR; false on error.
 inline bool write_all(int fd, std::string_view data) noexcept {

@@ -27,6 +27,7 @@ constexpr const char* usage =
     "                       1280x720@30:h264 fallback profile\n"
     "  --helper-bus-address ADDRESS  explicit alternate helper bus (default: system bus)\n"
     "  --idr-recovery auto|nudge|transition  IDR recovery strategy (default auto)\n"
+    "  --audio-sink pulse|pipewire|automatic  audio routing element (default pulse)\n"
     "  --diagnostics        emit redacted diagnostic JSON to stdout\n"
     "  --duration-ms N      bounded run (1..86400000 ms; omitted: until signal)\n"
     "  --ap-channel N       AP channel; must equal ap.conf (36, 40, 44 or 48; default 36)\n"
@@ -46,6 +47,7 @@ struct Options final {
     std::string helper_address;
     std::vector<protocol::VideoProfile> video_profiles{config::default_video_profiles()};
     ipc::IdrRecoveryStrategy idr_recovery{ipc::IdrRecoveryStrategy::auto_escalate};
+    audio::SinkBackend audio_backend{audio::SinkBackend::pulse};
     std::int64_t duration_ms{};
     std::uint32_t ap_channel{36};
     bool exact_video_profiles{};
@@ -73,6 +75,12 @@ std::optional<Options> parse_options(int argc, char** argv) {
         else if (arg == "--idr-recovery") {
             if (!aa::ipc::parse_idr_recovery_strategy(value, options.idr_recovery))
                 return std::nullopt;
+        }
+        else if (arg == "--audio-sink") {
+            if (value == "pulse") options.audio_backend = audio::SinkBackend::pulse;
+            else if (value == "pipewire") options.audio_backend = audio::SinkBackend::pipewire;
+            else if (value == "automatic") options.audio_backend = audio::SinkBackend::automatic;
+            else return std::nullopt;
         }
         else if (arg == "--helper-bus-address") options.helper_address = value;
         else if (arg == "--ap-channel") {
@@ -102,10 +110,8 @@ std::optional<Options> parse_options(int argc, char** argv) {
     aa::config::ensure_fallback_video_profile(options.video_profiles, options.exact_video_profiles);
     return options;
 }
-}
 
-int main(int argc, char** argv) {
-    using namespace aa::wireless_receiver;
+int receiver_main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--help") == 0) {
         std::fputs(usage, stdout); return 0;
     }
@@ -145,15 +151,17 @@ int main(int argc, char** argv) {
         const auto deadline = options->duration_ms ? Runtime::Clock::now() + std::chrono::milliseconds{options->duration_ms}
             : Runtime::Clock::time_point::max();
         log_line("{\"event\":\"ready\",\"state\":\"pairing_only\"}");
-        while (running && Runtime::Clock::now() < deadline) {
+        while (running.load() && Runtime::Clock::now() < deadline) {
             const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Runtime::Clock::now()).count();
             const auto wait = options->duration_ms && remaining < 50 ? remaining : 50;
             if (wait < 0) break;
             if (auto step = bus.value().cycle(aa::core::Milliseconds{wait}); !step) {
                 report("session bus dispatch", step.error().code());
+                running.store(false);
                 bus.value().service().shutdown(); receiver.stop(); return 1;
             }
         }
+        running.store(false);
         bus.value().service().shutdown(); receiver.stop();
         log_line("{\"event\":\"stopping\"}");
         return 0;
@@ -178,9 +186,20 @@ int main(int argc, char** argv) {
     aa::trust::SteadyClock trust_clock;
     aa::trust::PairingPolicy phones{store, trust_clock};
     aa::ipc::RandomPairingIdSource ids;
-    auto router = aa::audio::AudioRouter::open(audio_config());
-    if (!router) { report("audio router", router.error().code()); return 3; }
-    Media media{router.value()};
+    aa::audio::AudioRenderWorker audio_sink{audio_config(options->audio_backend), audio_telemetry()};
+    const auto opened = audio_sink.ready();
+    if (!opened) { running.store(false); }
+    if (const auto report_sink = audio_sink.sink_report();
+        opened || !report_sink.cause.empty() || !report_sink.candidates.empty()) {
+        aa::audio::log_sink_selected(report_sink, "open", audio_telemetry());
+    }
+    if (!opened) {
+        report("audio router", opened.error().code());
+        log_line(aa::audio::audio_failure_event_json(
+            "audio_router", opened.error().code(), audio_sink.failure_context()));
+        return 3;
+    }
+    Media media{audio_sink};
     // Receiver precedes ControlService so its confirmation observer is valid
     // throughout bus dispatch and the bus's final owner teardown.
     auto link_config = media.config(options->video_profiles);
@@ -231,4 +250,12 @@ int main(int argc, char** argv) {
     runtime.offered_video_profiles = options->video_profiles.size();
     log_line("{\"event\":\"ready\",\"state\":\"waiting_for_consumer\"}");
     return runtime.run();
+}
+} // namespace aa::wireless_receiver
+
+int main(int argc, char** argv) {
+    aa::diagnostics::StdoutLogScope logging{aa::wireless_receiver::running};
+    const int code = aa::wireless_receiver::receiver_main(argc, argv);
+    const auto error = logging.log.finish();
+    return code != 0 ? code : (error ? 1 : 0);
 }

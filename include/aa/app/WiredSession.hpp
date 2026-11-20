@@ -232,6 +232,10 @@ class WiredSession final {
     // TrustStore admission decisions are unchanged.
     [[nodiscard]] std::uint64_t reconnect_attempts() const noexcept { return reconnect_attempts_; }
     [[nodiscard]] std::uint64_t recovery_failures() const noexcept { return recovery_failures_; }
+    void fail_next_send_for_test(Error error) noexcept { pending_send_error_for_test_ = error; }
+    [[nodiscard]] bool has_pending_send_error_for_test() const noexcept {
+        return pending_send_error_for_test_.has_value();
+    }
 
   private:
     class InputForwarder;
@@ -339,6 +343,7 @@ class WiredSession final {
     bool recovery_in_flight_{false};
     const char *recovery_reason_{"link lost"};
     std::string last_identity_key_{};
+    std::optional<Error> pending_send_error_for_test_{};
 };
 
 } // namespace aa::app
