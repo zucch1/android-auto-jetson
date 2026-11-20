@@ -39,9 +39,10 @@ HandoffOperations handoff_operations(helper::BusClient& client);
 struct HandoffTiming final {
     // Waiting for the phone's RFCOMM connection after begin().
     std::chrono::milliseconds establishment{10'000};
-    // An observed bootstrap, from its first observation: the helper's own budget
-    // (Bootstrap::kBudget), which starts earlier, so the receiver never gives up first.
-    std::chrono::milliseconds bootstrap{10'000};
+    // An observed bootstrap, from its first observation: the helper's own whole bound
+    // (Bootstrap::kBudget + kJoinBudget, #170), which starts earlier, so the receiver never
+    // gives up first. The helper's 10 s phase still ends a stalled exchange before credentials.
+    std::chrono::milliseconds bootstrap{40'000};
     // After that budget, for the phone to open the TCP session of a completed exchange.
     std::chrono::milliseconds connect{5'000};
 };

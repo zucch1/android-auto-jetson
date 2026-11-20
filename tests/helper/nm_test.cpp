@@ -649,10 +649,11 @@ TEST_F(NmDaemon, ComposedBootstrapUsesRealBusClientAndRfcommBytes) {
         return !std::holds_alternative<std::monostate>(first);
     }));
     ASSERT_TRUE(std::holds_alternative<AawRecord>(first));
-    EXPECT_EQ(std::get<AawRecord>(first).id, 4); aaw::WifiVersionRequest version;
-    ASSERT_TRUE(version.ParseFromArray(std::get<AawRecord>(first).payload.data(), static_cast<int>(std::get<AawRecord>(first).payload.size())));
-    EXPECT_EQ(version.major_version(), 1); EXPECT_EQ(version.minor_version(), 0);
-    EXPECT_EQ(version.selected_channel(), aaw::CHANNEL_5GHZ_ONLY);
+    // Start-first (#166): the HU's first record is WifiStartRequest{1: ip, 2: port}.
+    EXPECT_EQ(std::get<AawRecord>(first).id, 1); aaw::WifiStartRequest endpoint;
+    ASSERT_TRUE(endpoint.ParseFromArray(std::get<AawRecord>(first).payload.data(), static_cast<int>(std::get<AawRecord>(first).payload.size())));
+    EXPECT_EQ(endpoint.ip_address(), "10.42.0.1"); EXPECT_EQ(endpoint.port(), 5277U);
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(start_decoder.next()));
     ASSERT_EQ(bluez.command("wire-send 00000002"), "ok");
     AawDecoder info_decoder; AawDecodeResult info_record;
     ASSERT_TRUE(eventually([&] {
@@ -663,17 +664,7 @@ TEST_F(NmDaemon, ComposedBootstrapUsesRealBusClientAndRfcommBytes) {
     aaw::WifiInfoResponse info; ASSERT_TRUE(info.ParseFromArray(std::get<AawRecord>(info_record).payload.data(), static_cast<int>(std::get<AawRecord>(info_record).payload.size())));
     EXPECT_TRUE(info.password() == snapshot.value().password); EXPECT_EQ(info.bssid(), "02:ab:cd:ef:01:23");
     EXPECT_EQ(info.security_mode(), 8); EXPECT_EQ(info.access_point_type(), 1);
-    AawDecodeResult endpoint_record;
-    ASSERT_TRUE(eventually([&] {
-        endpoint_record = info_decoder.next();
-        if (!std::holds_alternative<std::monostate>(endpoint_record)) return true;
-        info_decoder.feed(unhex(bluez.command("wire-read"))); endpoint_record = info_decoder.next();
-        return !std::holds_alternative<std::monostate>(endpoint_record);
-    }));
-    ASSERT_TRUE(std::holds_alternative<AawRecord>(endpoint_record)); EXPECT_EQ(std::get<AawRecord>(endpoint_record).id, 1);
-    aaw::WifiStartRequest endpoint;
-    ASSERT_TRUE(endpoint.ParseFromArray(std::get<AawRecord>(endpoint_record).payload.data(), static_cast<int>(std::get<AawRecord>(endpoint_record).payload.size())));
-    EXPECT_EQ(endpoint.ip_address(), "10.42.0.1"); EXPECT_EQ(endpoint.port(), 5277U);
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(info_decoder.next()));
     ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
     // BlueZ holds its own reference (the mock models it, #161): success never shuts it down.
     // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
@@ -762,7 +753,7 @@ TEST_F(NmDaemon, ComposedReplacementInSameAdmissionNeedsFreshHandleAuthorization
         decoder.feed(unhex(bluez.command("wire-read"))); endpoint = decoder.next();
         return !std::holds_alternative<std::monostate>(endpoint);
     }));
-    ASSERT_TRUE(std::holds_alternative<AawRecord>(endpoint)); EXPECT_EQ(std::get<AawRecord>(endpoint).id, 4);
+    ASSERT_TRUE(std::holds_alternative<AawRecord>(endpoint)); EXPECT_EQ(std::get<AawRecord>(endpoint).id, 1);  // start-first: WifiStartRequest (#166)
     ASSERT_EQ(bluez.command("RequestDisconnection"), "allowed");
     ASSERT_EQ(bluez.command("NewConnection"), "allowed");
     const auto third = client->poll_bootstrap({1, 1}, failure); ASSERT_TRUE(third);

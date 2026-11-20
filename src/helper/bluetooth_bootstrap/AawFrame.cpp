@@ -10,10 +10,10 @@ std::uint16_t read_u16(std::span<const std::uint8_t> bytes) {
     return static_cast<std::uint16_t>((static_cast<unsigned>(bytes[0]) << 8) | bytes[1]);
 }
 
+// Only the length is a framing error. The message ID is the bootstrap's to judge (#170): a phone
+// may send IDs the head unit does not handle (pings 8/9, 10, 11), and the references tolerate them.
 std::optional<AawError> check_header(std::span<const std::uint8_t> bytes) {
     if (read_u16(bytes) > kMaxPayload) return AawError::oversize;
-    const auto id = read_u16(bytes.subspan(2));
-    if (id < 1 || id > 7) return AawError::unknown_id;
     return std::nullopt;
 }
 }
@@ -48,6 +48,11 @@ AawDecodeResult AawDecoder::next() {
     AawRecord record{read_u16(bytes.subspan(2)), {payload.begin(), payload.end()}};
     buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(size));
     return record;
+}
+
+std::optional<std::uint16_t> AawDecoder::pending_id() const {
+    if (buffer_.size() < kHeaderSize) return std::nullopt;
+    return read_u16(std::span<const std::uint8_t>{buffer_}.subspan(2));
 }
 
 std::optional<AawError> AawDecoder::finish() {

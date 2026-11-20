@@ -4,6 +4,8 @@
 #include <aa/helper/ApSnapshot.hpp>
 #include <chrono>
 #include <memory>
+#include <optional>
+#include <string_view>
 
 namespace aa::helper {
 // RFCOMM socket ownership (#161). BlueZ keeps its own reference to every Profile1
@@ -20,7 +22,16 @@ namespace aa::helper {
 class Bootstrap final {
 public:
     using Time = std::chrono::steady_clock::time_point;
+    // From accept to the head unit's WifiInfoResponse being fully sent.
     static constexpr auto kBudget = std::chrono::seconds(10);
+    // After WifiInfoResponse is sent, once: the phone joins the AP before WifiConnectStatus
+    // (aa-proxy-rs allows 30 s for that status, bluetooth.rs:7464). The whole exchange stays
+    // bounded by kBudget + kJoinBudget from accept (#170 review).
+    static constexpr auto kJoinBudget = std::chrono::seconds(30);
+    // Phone records the head unit ignores (unknown IDs, pings) and identical WifiInfoResponse
+    // re-sends for a repeated WifiInfoRequest, per exchange; past either the exchange fails.
+    static constexpr unsigned kIgnoredLimit = 32;
+    static constexpr unsigned kInfoResendLimit = 2;
     // Backstop for a completed exchange the receiver never confirms or retires: its socket is
     // shut down (the phone is freed), its completed authority is kept.
     static constexpr auto kConfirmBudget = std::chrono::seconds(30);
@@ -44,6 +55,9 @@ public:
     SnapshotDeadline deadline() const { return complete() ? SnapshotDeadline{} : deadline_; }
 private:
     enum class Stage { authorization, info, start, connect, finishing, complete, failed };
+    // Logs one structured, secret-free line (#166), then deny().
+    void fail(HandoffFailure, std::optional<std::uint16_t> id, std::string_view detail);
+    const char* phase() const;
     bool queue(std::uint16_t id, const std::string& payload);
     bool flush(const SnapshotFence&);
     bool verify(const SnapshotProvider&);
@@ -62,6 +76,9 @@ private:
     AawDecoder decoder_;
     std::vector<std::uint8_t> output_;
     std::size_t sent_{};
-    bool seen_info_{}, seen_start_{}, modern_{};
+    bool seen_info_{}, seen_start_{}, joining_{};
+    unsigned ignored_{}, info_resends_{};
+    bool queue_info();
+    void note(const char* event, std::uint16_t id, std::string_view detail) const;
 };
 }

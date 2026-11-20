@@ -111,9 +111,9 @@ TEST(AawFrame, RejectsWhenPayloadExceedsLimit) {
     EXPECT_EQ(std::get<AawError>(result), AawError::oversize);
 }
 
-class UnknownId : public ::testing::TestWithParam<std::uint16_t> {};
-TEST_P(UnknownId, RejectsWhenIdIsUnknown) {
-    // Given: an unsupported ID.
+class UnhandledId : public ::testing::TestWithParam<std::uint16_t> {};
+TEST_P(UnhandledId, DecodesAnyIdButEncodesOnlyHeadUnitIds) {
+    // Given: an ID the head unit never sends (#170: the bootstrap, not the codec, judges it).
     const std::array<std::uint8_t, 4> header{0, 0,
         static_cast<std::uint8_t>(GetParam() >> 8), static_cast<std::uint8_t>(GetParam() & 0xff)};
     AawDecoder decoder;
@@ -121,22 +121,23 @@ TEST_P(UnknownId, RejectsWhenIdIsUnknown) {
     EXPECT_FALSE(encode_aaw(GetParam(), {}));
     decoder.feed(header);
     const auto result = decoder.next();
-    // Then: decoding reports the typed error.
-    ASSERT_TRUE(std::holds_alternative<AawError>(result));
-    EXPECT_EQ(std::get<AawError>(result), AawError::unknown_id);
+    // Then: the record is returned with its ID.
+    ASSERT_TRUE(std::holds_alternative<AawRecord>(result));
+    EXPECT_EQ(std::get<AawRecord>(result).id, GetParam());
+    EXPECT_FALSE(decoder.finish());
 }
-INSTANTIATE_TEST_SUITE_P(Unsupported, UnknownId, ::testing::Values(0, 8, 256, 65535));
+INSTANTIATE_TEST_SUITE_P(Unsupported, UnhandledId, ::testing::Values(0, 8, 256, 65535));
 
 TEST(AawFrame, RemainsFailedWhenMoreDataArrivesAfterError) {
-    // Given: an invalid record has failed decoding.
+    // Given: an oversize record has failed decoding.
     AawDecoder decoder;
-    decoder.feed(std::array<std::uint8_t, 4>{0, 0, 0, 8});
-    ASSERT_EQ(std::get<AawError>(decoder.next()), AawError::unknown_id);
+    decoder.feed(std::array<std::uint8_t, 4>{0x10, 1, 0, 1});
+    ASSERT_EQ(std::get<AawError>(decoder.next()), AawError::oversize);
     // When: a valid frame arrives afterward.
     decoder.feed(std::array<std::uint8_t, 4>{0, 0, 0, 1});
     // Then: next and EOF preserve the original failure.
-    EXPECT_EQ(std::get<AawError>(decoder.next()), AawError::unknown_id);
-    EXPECT_EQ(decoder.finish(), AawError::unknown_id);
+    EXPECT_EQ(std::get<AawError>(decoder.next()), AawError::oversize);
+    EXPECT_EQ(decoder.finish(), AawError::oversize);
 }
 
 class PartialRecord : public ::testing::TestWithParam<std::size_t> {};

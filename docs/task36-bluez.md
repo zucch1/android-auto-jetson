@@ -101,7 +101,11 @@ human-mediated during explicit enrollment only, never automatically approved.
    rejects wrong/duplicate connections, and closes it on RequestDisconnection,
    cancel, idle expiry, owner change, receiver loss and teardown. Task37 now
    implements the helper-owned RFCOMM Wi-Fi credential bootstrap on this socket,
-   host-tested only, plus the shared session/media path; see
+   host-tested only, plus the shared session/media path. Since #166 the head
+   unit opens the socket with `WifiStartRequest` (start-first, as
+   aa-proxy-rs and WirelessAndroidAutoDongle do) instead of a version request;
+   any handshake failure logs one secret-free `wireless_handshake_failed` line
+   and closes through the deny path; see
    [wireless-handoff.md](wireless-handoff.md). Production TCP endpoint binding
    and real-phone qualification remain **BLOCKED**.
 7. **Aborted bootstraps free the phone (#161).** bluetoothd keeps its own reference
