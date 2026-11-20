@@ -1,30 +1,48 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/app/HandoffEligibility.hpp>
 namespace aa::app {
-HandoffOperations handoff_operations(helper::BusClient& client) {
+HandoffOperations handoff_operations(HandoffBus bus) {
     return {
-        [&client](HandoffOperations::Validation request) -> core::Result<HandoffObservation> {
+        [bus](HandoffOperations::Validation request) -> core::Result<HandoffObservation> {
             if (request.handle && request.credentials_allowed) {
-                auto snapshot = client.get_ap_credentials(request.source, request.handle);
+                auto snapshot = bus.credentials(request.source, request.handle);
                 if (!snapshot) return snapshot.error();
                 return HandoffObservation{{request.handle, {}}, std::move(snapshot).value()};
             }
-            helper::HandoffFailure failure{};
-            auto peer = client.poll_bootstrap(request.source, failure);
+            auto peer = bus.poll(request.source);
             if (!peer) return peer.error();
             HandoffObservation observation{peer.value(), std::nullopt};
             if (!request.handle && request.credentials_allowed) {
-                auto snapshot = client.get_ap_credentials(request.source, peer.value().handle);
-                if (!snapshot) return snapshot.error();
+                auto snapshot = bus.credentials(request.source, peer.value().handle);
+                if (!snapshot) {
+                    // PollBootstrapV1 has bound the phone's bootstrap, and with it the lease, to this
+                    // source, but the error reply names no handle for the coordinator to deny on
+                    // retirement. Deny it now: otherwise a fresh attempt's ReconnectPeerV1 keeps the
+                    // binding and lease, and rejects that attempt's source (#169 review).
+                    (void)bus.authorize(request.source, peer.value().handle, false, false);
+                    return snapshot.error();
+                }
                 observation.snapshot = std::move(snapshot).value();
             }
             return observation;
         },
-        [&client](helper::Source source, std::uint64_t handle, bool allow) {
-            return client.authorize_bootstrap(source, handle, allow, allow);
+        [bus](helper::Source source, std::uint64_t handle, bool allow) {
+            return bus.authorize(source, handle, allow, allow);
         },
-        [&client](helper::Source source, std::uint64_t handle) {
-            return client.authorize_bootstrap(source, handle, true, false);
+        [bus](helper::Source source, std::uint64_t handle) {
+            return bus.authorize(source, handle, true, false);
         }};
 }
+HandoffBus handoff_bus(helper::BusClient& client) {
+    return {
+        [&client](helper::Source source) {
+            helper::HandoffFailure failure{};
+            return client.poll_bootstrap(source, failure);
+        },
+        [&client](helper::Source source, std::uint64_t handle) { return client.get_ap_credentials(source, handle); },
+        [&client](helper::Source source, std::uint64_t handle, bool allow, bool ready) {
+            return client.authorize_bootstrap(source, handle, allow, ready);
+        }};
+}
+HandoffOperations handoff_operations(helper::BusClient& client) { return handoff_operations(handoff_bus(client)); }
 }

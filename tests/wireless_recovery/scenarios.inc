@@ -50,12 +50,13 @@ TEST_F(WirelessRecovery, R04FreshApAcquisitionCannotReuseOldSnapshot) {
     ASSERT_NO_FATAL_FAILURE(closed());
     ASSERT_TRUE(eventually([&] { return inactive_observed(); }));
     timing.ap_inactive = timing.elapsed();
+    old_channel_closed();
     // Then a fresh AP-only grant and bootstrap recover admission, never the old handle.
     ASSERT_NO_FATAL_FAILURE(recover_ap());
     EXPECT_GT(timing.new_activation, timing.old_activation);
     EXPECT_FALSE(client->get_ap_credentials({consumer.value, 0}, old_handle));
     record_cleanup_observations("old activation State4; Device.ActiveConnection=/; original NM/device incarnation",
-        "old owned table removed; fresh activation owns current table");
+        "old owned table removed; fresh activation owns current table", true);
 }
 TEST_F(WirelessRecovery, R10SyntheticUnapprovedUnbondedPeerDeniedBeforeCredentials) {
     // Given approved first-peer admission, with an unchanged persistent store.
@@ -65,9 +66,19 @@ TEST_F(WirelessRecovery, R10SyntheticUnapprovedUnbondedPeerDeniedBeforeCredentia
     ASSERT_EQ(bluez.command(negative_control() ? "paired" : "unpaired"), "ok");
     EXPECT_EQ(bluez.command(negative_control() ? "NewConnection" : "NewConnection wrong"), "rejected");
     // Then no credential/session is created for it; this is not TCP identity proof.
-    EXPECT_EQ(bluez.command("wire-read"), "closed");
     EXPECT_FALSE(receiver->active());
     timing.terminal_recovery = timing.elapsed(); EXPECT_LE(*timing.terminal_recovery, 1000);
+    // The mock's channel is still the first phone's, whose completed hand-off the receiver retires
+    // on its own pump (#161). Wait for that, bounded: while it runs the channel may only read
+    // "open"; any data or a timeout fails (#170 review, P3: no one-shot read racing the retire).
+    std::string channel;
+    EXPECT_TRUE(eventually([&] {
+        pump(); channel = bluez.command("wire-read");
+        EXPECT_TRUE(channel == "open" || channel == "closed") << "unexpected RFCOMM bytes: " << channel;
+        return channel != "open";
+    }, 3s)) << "the first phone's channel was never released";
+    EXPECT_EQ(channel, "closed");
+    EXPECT_FALSE(receiver->active());
     RecordProperty("cleanup_observations_applicability", "not applicable: synthetic peer rejected before admission");
 }
 TEST_F(WirelessRecovery, ApOnlyAcquisitionUsesFreshLiveConsumerWithoutPairing) {

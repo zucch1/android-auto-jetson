@@ -29,41 +29,74 @@ u16 is the big-endian payload length, excluding the header; the second u16 is
 the big-endian message ID. Payloads larger than 4096 bytes are protocol
 violations. Fragmented records are accumulated and coalesced records are split.
 
-The receiver plays the head-unit role. It opens with a version request, then
-follows whichever path the phone's reply selects:
+The receiver plays the head-unit role and runs the start-first flow (#166) that
+both shipping head-unit-role dongles use against current phones:
 
 ```text
-receiver  WifiVersionRequest=4 {1.0, 5GHZ_ONLY}     authorized, listener ready
-
-modern path:
-phone     WifiVersionResponse=5 {1.0, status=12}
-receiver  WifiSetupInfo=11 {endpoint {ip, port},
-                            access_point {ssid, bssid, password,
-                                          security_mode}}
-receiver  WifiStartRequest=1 {ip, port, DYNAMIC}
-phone     WifiStartResponse=7 {status field 4 = 12}
-phone     WifiConnectStatus=6 {status field 2 = 12}
-
-legacy fallback:
-phone     WifiInfoRequest=2
-receiver  WifiInfoResponse=3 {ssid, password, bssid,
-                              security_mode, access_point_type}
-receiver  WifiStartRequest=1 {ip, port}
-phone     WifiStartResponse=7 {status field 3 = 0}
-phone     WifiConnectStatus=6 {status field 1 = 0}
+receiver  WifiStartRequest=1 {1: ip, 2: port}          authorized, listener ready
+phone     WifiInfoRequest=2 {}
+receiver  WifiInfoResponse=3 {1: ssid, 2: key, 3: bssid,
+                              4: security_mode=8, 5: access_point_type=1}
+phone     WifiStartResponse=7 {3: status = 0}
+phone     WifiConnectStatus=6 {1: status = 0}
 ```
 
-The version request is sent only after authorization and only once the
-projection listener is ready. Credentials leave the helper only in the
-modern `11` or legacy `3` record, from the pinned AP snapshot and behind the
-same snapshot fence and eligibility checks described below. Both paths then
-send the endpoint in message `1` and validate the trailing phone `7` and `6`.
-The success value differs by path: the modern layouts use status `12` in
-different field tags, while the legacy layouts use `STATUS_SUCCESS=0`. Any
-other version, status, or path mixing is a phone rejection or wrong-order
-failure.
-Completion requires the trailing-data check, including a nonblocking socket
-peek, and a deadline recheck; receiving one expected record is not enough.
+The start request is sent only after authorization and only once the
+projection listener is ready. Credentials leave the helper only in record `3`,
+from the pinned AP snapshot and behind the same snapshot fence and eligibility
+checks described below. The two phone statuses differ:
+
+- `WifiConnectStatus` must be exactly `0`; any other value is a phone rejection.
+- `WifiStartResponse`'s status is optional, and only a negative value is a
+  rejection. An absent status, `0` and positive values such as `1` are accepted
+  (aa-proxy-rs reads the record without checking its status; OAA maps `1` to
+  success).
+
+`WifiConnectionRejection=10` from the phone is a rejection.
+
+Sources for every ID, framing rule and field number (file:line at the pins
+below): aa-proxy-rs `src/bluetooth.rs:409-420` (IDs), `4692-4694` and
+`4716-4722` (length + ID header), `6284-6323` (`send_params`, the flow above),
+`914-923` (status tags 1 and 3), `4746-4754` (status `0` is success),
+`src/protos/WifiStartRequest.proto:4-7` and `src/protos/WifiInfoResponse.proto:4-28`;
+WirelessAndroidAutoDongle `aawg/src/bluetoothProfiles.cpp:32-65` (flow),
+`68-77` (IDs), `99-112` and `125-142` (framing), and its
+`proto/WifiStartRequest.proto:4-7` and `proto/WifiInfoResponse.proto:4-28`.
+open-android-auto agrees on the IDs (`oaa/wifi/WifiSetupMessageEnum.proto:34-44`),
+`WifiStartRequest` (`WifiStartRequestMessage.proto:16-20`), `WifiStartResponse`
+status 3 (`WifiStartResponseMessage.proto:20-24`) and `WifiConnectStatus` status 1
+(`WifiConnectStatusMessage.proto:20-23`). It swaps `WifiInfoResponse` tags 2 and 3
+(`WifiInfoResponseMessage.proto:13-19`); we follow the two shipping dongles.
+
+The version-negotiation messages (`WifiVersionRequest=4`, `WifiVersionResponse=5`,
+`WifiSetupInfo=11`) are not used. The pre-#166 code sent them with every field
+number one too high (the phone logged "HU requested version: 0.1"), and then
+never sent setup or start. Their status values are not settled (OAA marks
+success as wire `1`, unverified, at `WifiVersionStatusEnum.proto:18-31`), and no
+phone capture exists to check against, so that path was removed rather than
+guessed. A phone record with ID 4 or 5 is a wrong-order failure.
+
+Every handshake failure logs one line to the helper's stderr, then fails
+through the ordinary deny path:
+
+```text
+system-helper: wireless_handshake_failed phase=await_info_request msg_id=99 msg=unknown reason=unknown_id detail="record header rejected"
+```
+
+`phase` is `authorization`, `await_info_request`, `await_start_response`,
+`await_connect_status` or `finishing`; `msg_id` is the record ID, or `none`;
+`reason` is the typed `HandoffFailure`. The line never carries the SSID, PSK,
+BSSID, endpoint or any address. A completed exchange logs
+`system-helper: wireless_handshake_complete flow=start_first`.
+A successful `WifiConnectStatus` ends the exchange, subject to the deadline
+recheck; records after it are never read, and nothing on the channel after it
+affects the completed authority.
+
+The handshake tolerates what the shipping dongles tolerate, within bounds:
+pings (`8`, `9`), `WifiSetupInfo=11` and unknown IDs are ignored, at most 32 per
+exchange; the next one fails it (`unknown_id`). A repeated `WifiInfoRequest`
+after the response gets the identical `WifiInfoResponse` again, at most twice;
+a third repeat fails the exchange (`duplicate`).
 
 On this AAW surface, `security_mode` uses its own bitmask-style enum with
 `WPA2_PERSONAL=8`; `access_point_type` is `DYNAMIC=1`. The BSSID is the current
@@ -72,7 +105,7 @@ AP interface MAC as a lowercase, colon-separated string. The project-owned
 projection enum, which is not the AAW bootstrap enum and cannot encode this
 contract correctly.
 
-Denial, malformed or oversized input, wrong order, duplicates, unknown IDs,
+Denial, malformed or oversized input, wrong order, duplicates, too many ignored records,
 EOF, timeout, and phone-side rejection close RFCOMM without a rejection payload
 or further credentials. The helper reports a typed local failure without secret
 material and does not mutate trust. Normal closure after confirmed success has
@@ -81,11 +114,12 @@ the separate completed-handoff semantics described under lifetimes.
 The wire rules are reverse-engineered, not an official Google interoperability
 specification. Pinned head-unit-role references are
 `nisargjhaveri/WirelessAndroidAutoDongle` at
-`ef645221ec28e87361391b9bdcf27e31ff48cb6f` and `manio/aa-proxy-rs` at
-`b753a002b7ff19f94a861a81396eacaccfa58d5e` for the legacy path, and
-`mrmees/open-android-auto` at `61eab61c5f9968154ff1a80faa8c0a427b208479` for
-the modern path. Both paths are exercised only by host tests against scripted
-peers; that is not proof of interoperability with a real phone.
+`ef645221ec28e87361391b9bdcf27e31ff48cb6f` and `aa-proxy/aa-proxy-rs` at
+`f80236fb17bef459398fa4ae235f86a68574a873`, with `mrmees/open-android-auto` at
+`61eab61c5f9968154ff1a80faa8c0a427b208479` (vendored) as a cross-check. The
+flow is exercised by host tests against scripted peers with byte-exact fixtures;
+that is not proof of interoperability with a real phone. The final proof is a
+live retest with the test phone (Android Auto version code 180664264).
 
 ### Negotiated AAP WifiProjection/WifiCredentials service
 
@@ -166,14 +200,54 @@ zero-confirmation source after acquisition.
 
 ## Lifetimes, freshness, and deadlines
 
-An incomplete bootstrap has a 10-second budget. The 60-second pairing window
+An incomplete bootstrap has a 10-second budget from accept until the head
+unit's `WifiInfoResponse` is fully sent. Then, once, the deadline moves to 30 s
+after that send, for the phone's Wi-Fi join and its statuses, so a whole
+exchange is bounded by 40 s from accept. A stall before credentials still ends at
+10 s; if the 10-second deadline has already fired when the credentials finish
+sending, the exchange fails instead of being extended. The 60-second pairing window
 limits only acceptance of new RFCOMM connections; it is not a TTL for an
 established bootstrap, completed handoff, or projection session.
+
+### Aborts and retries (#161)
+
+Every aborted bootstrap shuts its RFCOMM socket down (`shutdown(SHUT_RDWR)`),
+because BlueZ holds its own reference and a plain `close()` sends no DISC; the
+phone then sees an IO error and restarts its wireless setup. That covers denial,
+every failure, the bootstrap deadline (10 s, or 40 s once the Wi-Fi join
+extension applies), a window that lapses before the bootstrap
+ends (the bootstrap still runs to its own deadline), and the retirement of a
+completed hand-off, whether it failed before the receiver confirmed it or its
+session ended later. Completion itself shuts nothing down: the channel stays as
+the phone left it for the whole session. A completion never confirmed has its
+socket shut down after 30 s, keeping the completed authority. Only the AA DLC closes;
+HFP, owned by infotainment, is never touched, and while it is up its DLC keeps the
+RFCOMM session and the ACL up.
+
+A retry must not reset a bootstrap that is still progressing:
+
+- The receiver does not defer its attempt (15 s) while the coordinator is
+  preparing, authorizing, or authorized but unconfirmed. That hold is bounded:
+  40 s from the first observation (`HandoffTiming::bootstrap`, the helper's whole
+  10 s + 30 s bound, which starts earlier) plus 5 s for the phone to open the TCP
+  session of a completed exchange, so at most 45 s. A phone that completes
+  RFCOMM but never opens the TCP session holds the attempt that long before the
+  receiver may defer it.
+- The coordinator's 10-second establishment bound applies only while it waits
+  for a bootstrap; one observed late runs to its own budget.
+- `begin()` with the same source during such a bootstrap keeps it: no
+  retirement, no denial, and no `retired_handle` that would poison its
+  re-observation.
+- In the helper, a `ReconnectPeerV1` for the same phone while its window is open
+  is a no-op (the window opens at most once per 60 s); a lapsed window reopens
+  without aborting that phone's bootstrap; and a live bound bootstrap keeps its
+  binding, pinned snapshot and lease.
 
 Successful completion transfers the exact handle, receiver/source ownership,
 BlueZ owner/device identity, and pinned AP snapshot into revocable
 completed-handoff authority. It survives normal RFCOMM close and the subsequent
-Profile1 `RequestDisconnection` callback, and has no absolute TTL. Before
+Profile1 `RequestDisconnection` callback, and has no absolute TTL (#161 only
+shuts an unconfirmed completion's RFCOMM socket down after 30 s). Before
 completion, that callback still retires the pending exchange. Device1
 `Connected=false` or an invalidated `Connected` value establishes link loss;
 `Connected=true` cannot revive retired authority.

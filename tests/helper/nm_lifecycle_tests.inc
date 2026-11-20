@@ -42,7 +42,8 @@ protected:
     }
     void complete(std::uint64_t handle) {
         begin(handle); ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
-        ASSERT_EQ(bluez.command("wire-read"), "closed");
+        // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
+        for (int quiet = 0; quiet < 5; ++quiet) { ASSERT_EQ(bluez.command("wire-read"), "open"); }
     }
     void retired(std::uint64_t handle) {
         EXPECT_FALSE(client->poll_bootstrap(source, failure));
@@ -71,10 +72,11 @@ TEST_F(CompletedLifecycle, RepeatedAllowDoesNotRestartPendingOrCompletedExchange
     // When allow is repeated before and after completion.
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, true));
     ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
-    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
+    for (int quiet = 0; quiet < 5; ++quiet) { EXPECT_EQ(bluez.command("wire-read"), "open"); }
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, true));
     // Then no new endpoint is emitted and deny can retire completed authority.
-    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_EQ(bluez.command("wire-read"), "open");
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, false, false)); retired(handle);
 }
 class CompletedLoss : public CompletedLifecycle, public ::testing::WithParamInterface<const char*> {};
@@ -104,7 +106,7 @@ TEST_F(CompletedLifecycle, CompletedChannelTeardownPreservesPinnedAuthority) {
     const auto current = client->get_ap_credentials({1, 1}, handle); ASSERT_TRUE(current);
     EXPECT_TRUE(current.value() == original.value());
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, false));
-    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_EQ(bluez.command("wire-read"), "open");
 }
 TEST_F(CompletedLifecycle, CompletedConnectedLossRequiresFreshBootstrap) {
     // Given completed authority with the bond intact throughout both loss forms.
@@ -179,7 +181,7 @@ TEST_P(FailedReplacement, FailedFreshBootstrapCannotInheritCompletedPredecessor)
     const auto a = accept(); complete(a); const auto b = accept(); ASSERT_NE(a, b);
     EXPECT_FALSE(client->get_ap_credentials({1, 1}, a));
     EXPECT_FALSE(client->authorize_bootstrap({1, 1}, a, false, false));
-    // When B fails (including success statuses with terminal partial trailing data).
+    // When B fails.
     const std::string_view scenario{GetParam()};
     if (scenario == "write") {
         ASSERT_TRUE(client->get_ap_credentials({1, 1}, b));
@@ -187,23 +189,21 @@ TEST_P(FailedReplacement, FailedFreshBootstrapCannotInheritCompletedPredecessor)
         ASSERT_TRUE(client->authorize_bootstrap({1, 1}, b, true, true));
     } else {
         begin(b);
-        if (scenario == "receive-boundary") {
-            const auto wire = "wire-send 0002000718000ffa0006080012f51f" + std::string(8170, '0') + "00";
-            ASSERT_EQ(bluez.command(wire), "ok");
-        } else if (scenario == "timeout") elapsed = 10000;
+        // After the credentials the phone's Wi-Fi join has its own 30 s bound (#170).
+        if (scenario == "timeout") elapsed = 31000;
         else { ASSERT_EQ(bluez.command(GetParam()), "ok"); }
     }
-    if (scenario != "receive-boundary") { EXPECT_EQ(bluez.command("wire-read"), "closed"); }
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
     ASSERT_TRUE(eventually([&] { return !client->poll_bootstrap({1, 1}, failure); }));
     if (scenario == "write") { EXPECT_EQ(failure, HandoffFailure::write); }
     if (scenario == "timeout") { EXPECT_EQ(failure, HandoffFailure::timeout); }
-    if (scenario == "receive-boundary") { EXPECT_EQ(failure, HandoffFailure::truncated); }
     // Then neither handle is usable; no fallback to A.
     retired(b); EXPECT_FALSE(client->get_ap_credentials({1, 1}, a));
 }
 INSTANTIATE_TEST_SUITE_P(Terminal, FailedReplacement, ::testing::Values(
-    "wire-eof", "wire-send 000200071801", "wire-send 0001000780", "wire-send 00020007180000020006080000",
-    "write", "timeout", "receive-boundary"));
+    // Negative start status, unparsable start status, connect status 1, EOF, write, timeout.
+    "wire-eof", "wire-send 000b000718fbffffffffffffffff01", "wire-send 0001000780", "wire-send 000200071800000200060801",
+    "write", "timeout"));
 TEST_F(CompletedLifecycle, SourceTeardownRetiresCompletedButPreservesUnrelatedObservation) {
     // Given completed A and an unrelated pending observation bound to B.
     const auto handle = accept(); complete(handle); ASSERT_TRUE(client->get_ap_credentials({1, 1}, handle));

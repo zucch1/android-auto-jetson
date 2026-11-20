@@ -71,6 +71,9 @@ class MockBluez(ProfileSockets):
 <interface name="org.bluez.Device1"><method name="CancelPairing"/><method name="Disconnect"/><method name="Connect"/><method name="ConnectProfile"><arg type="s" direction="in"/></method><method name="DisconnectProfile"><arg type="s" direction="in"/></method></interface>
 </node>"""
         self.bus.add_filter(self.record_ingress)
+        # bluetoothd's ext_exited: a profile owner leaving the bus loses its sockets (#161).
+        self.bus.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+            "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE, self.owner_changed)
         info = Gio.DBusNodeInfo.new_for_xml(xml)
         self.device_info = info.interfaces[5]
         for index, path in enumerate(["/", "/org/bluez", "/org/bluez", ADAPTER, ADAPTER, DEVICE]):
@@ -87,6 +90,15 @@ class MockBluez(ProfileSockets):
             with self.ingress_lock:
                 self.ingress.append(entry)
         return message
+
+    def owner_changed(self, _bus: Gio.DBusConnection, _sender: str, _path: str, _interface: str,
+                      _signal: str, args: GLib.Variant) -> None:
+        name, _old, new = args.unpack()
+        if new or not name.startswith(":"):
+            return
+        for uuid, sender in list(self.profile_senders.items()):
+            if sender == name:
+                self.drop_daemon(uuid == HFP)
 
     def name(self, method: str, args: GLib.Variant) -> None:
         self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
@@ -190,6 +202,7 @@ class MockBluez(ProfileSockets):
                 if uuid in self.profile:
                     self.profile.remove(uuid)
                 self.profile_senders.pop(uuid, None)
+                self.drop_daemon(uuid == HFP)
             case "Disconnect":
                 self.disconnected.append(_path)
                 if self.disconnect_delay_ms:

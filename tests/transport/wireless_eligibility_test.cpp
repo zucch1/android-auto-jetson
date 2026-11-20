@@ -23,6 +23,7 @@ struct EligibilityFixture {
     std::atomic<bool> sampled{false};
     std::atomic<bool> authorize_wait{false}, authorizing{false};
     std::atomic<unsigned> denied{};
+    std::atomic<std::uint64_t> denied_handle{};
     std::atomic<std::uint64_t> observed_handle{41};
     std::atomic<unsigned> allowed{};
     std::atomic<unsigned> initial_observations{};
@@ -32,6 +33,7 @@ struct EligibilityFixture {
     bool ordering_ok{true};
     aa::trust::PhoneIdentity identity{aa::trust::identity_key(aa::trust::TransportIdentity{
         aa::trust::WirelessIdentity{peer.identity.address, peer.identity.adapter}})};
+    aa::app::HandoffTiming timing;
     aa::app::HandoffEligibilityCoordinator coordinator{trust,
         {[this](aa::app::HandoffOperations::Validation request) -> aa::core::Result<aa::app::HandoffObservation> {
             const bool initial = !request.handle;
@@ -46,13 +48,13 @@ struct EligibilityFixture {
             if (!initial && moderate_refresh.load()) std::this_thread::sleep_for(350ms);
             if (!(early_sample.load() ? live_at_start : helper_live.load())) return aa::Error{aa::ErrorCode::helper_rejected};
             return aa::app::HandoffObservation{observed, request.credentials_allowed ? std::optional{snapshot} : std::nullopt};
-        }, [this](aa::helper::Source, std::uint64_t, bool allow) -> aa::core::Result<void> {
+        }, [this](aa::helper::Source, std::uint64_t handle, bool allow) -> aa::core::Result<void> {
             if (allow) {
                 ordering_ok = listening; authorizing = true;
                 while (authorize_wait.load()) std::this_thread::yield();
                 if (moderate_ops.load()) std::this_thread::sleep_for(350ms);
                 ++allowed;
-            } else ++denied;
+            } else { denied_handle = handle; ++denied; }
             return {};
         }, [this](aa::helper::Source, std::uint64_t) -> aa::core::Result<void> {
             ++withdrawn;
@@ -61,8 +63,10 @@ struct EligibilityFixture {
             return {};
         }},
         {[this](const aa::helper::ApSnapshot&) -> aa::core::Result<void> { listening = true; return {}; },
-         [this] { listening = false; }}};
-    EligibilityFixture() { trust.set(identity, aa::trust::Decision::approved); }
+         [this] { listening = false; }}, timing};
+    explicit EligibilityFixture(aa::app::HandoffTiming bounds = {}) : timing(bounds) {
+        trust.set(identity, aa::trust::Decision::approved);
+    }
     ~EligibilityFixture() { authorize_wait = false; }
     bool eventually(const std::function<bool()>& predicate, std::chrono::milliseconds budget = 500ms,
                     bool active = false) {
@@ -262,6 +266,77 @@ TEST(WirelessEligibility, ConsumerLossDuringAuthorizeExplicitlyRetiresRemoteEffe
     ASSERT_TRUE(f.eventually([&] { return f.denied.load() > 0; }));
     EXPECT_FALSE(f.coordinator.admitting());
 }
+// #161: a retry (ReconnectPeerV1, then begin with the same source) during a live bootstrap
+// must keep it: no retirement, no denial, and no retired_handle poisoning its re-observation.
+TEST(WirelessEligibility, RetryDuringAuthorizationKeepsTheBootstrap) {
+    EligibilityFixture f;
+    f.authorize_wait = true;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.authorizing.load(); }));
+    const auto epoch = f.coordinator.epoch();
+    f.coordinator.begin(f.source);
+    EXPECT_EQ(f.coordinator.epoch(), epoch);
+    EXPECT_TRUE(f.listening);
+    f.authorize_wait = false;
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    EXPECT_EQ(f.denied.load(), 0U);
+    EXPECT_EQ(f.allowed.load(), 1U);
+}
+TEST(WirelessEligibility, RetryBeforeCompletionConfirmedKeepsTheBootstrap) {
+    EligibilityFixture f;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    const auto epoch = f.coordinator.epoch();
+    f.coordinator.begin(f.source);
+    // Keep ticking for a while: the retry must neither retire nor re-observe.
+    const auto until = std::chrono::steady_clock::now() + 100ms;
+    while (std::chrono::steady_clock::now() < until) {
+        f.coordinator.tick();
+        ASSERT_TRUE(f.coordinator.admitting());
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_EQ(f.coordinator.epoch(), epoch);
+    EXPECT_EQ(f.denied.load(), 0U);
+    EXPECT_EQ(f.initial_observations.load(), 1U) << "the live bootstrap is not observed again";
+    ASSERT_TRUE(f.confirm());
+}
+TEST(WirelessEligibility, BootstrapObservedLateRunsToItsOwnBudget) {
+    // Given: the phone connects just before the establishment bound.
+    EligibilityFixture f{{std::chrono::milliseconds{300}, std::chrono::milliseconds{600}, std::chrono::milliseconds{200}}};
+    f.helper_live = false; f.authorize_wait = true;
+    f.start();
+    const auto began = std::chrono::steady_clock::now();
+    f.eventually([] { return false; }, 220ms);
+    f.helper_live = true;
+    ASSERT_TRUE(f.eventually([&] { return f.authorizing.load(); }));
+    // When: establishment passes while the bootstrap is still authorizing.
+    while (std::chrono::steady_clock::now() - began < 450ms) {
+        f.coordinator.tick();
+        // Then: it is not retired before its own budget.
+        ASSERT_TRUE(f.coordinator.bootstrapping());
+        ASSERT_EQ(f.denied.load(), 0U);
+        std::this_thread::sleep_for(5ms);
+    }
+    // And: a bootstrap that never progresses still ends at its own budget (600 ms here).
+    ASSERT_TRUE(f.eventually([&] { return !f.coordinator.bootstrapping(); }, 1s));
+    EXPECT_GE(std::chrono::steady_clock::now() - began, 750ms);
+    EXPECT_FALSE(f.listening);
+    f.authorize_wait = false;
+    ASSERT_TRUE(f.eventually([&] { return f.denied.load() > 0; }));
+    EXPECT_FALSE(f.coordinator.admitting());
+}
+TEST(WirelessEligibility, UnconfirmedAuthorizedHoldIsBounded) {
+    // A completed exchange whose phone never opens the TCP session: the attempt may be
+    // deferred once the budget and the connect grace have passed.
+    EligibilityFixture f{{std::chrono::milliseconds{10'000}, std::chrono::milliseconds{200}, std::chrono::milliseconds{200}}};
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    EXPECT_TRUE(f.coordinator.bootstrapping());
+    EXPECT_TRUE(f.eventually([&] { return !f.coordinator.bootstrapping(); }, 1s));
+    EXPECT_TRUE(f.coordinator.admitting()) << "evidence stays fresh; only the hold ends";
+    ASSERT_TRUE(f.confirm());
+    EXPECT_FALSE(f.coordinator.bootstrapping());
+}
 TEST(WirelessEligibility, LateOldCompletionCannotReopenOrRetireReplacement) {
     EligibilityFixture f;
     f.start();
@@ -288,4 +363,29 @@ TEST(WirelessEligibility, AdmissionExpiryEventNamesThePhaseWithoutIdentities) {
         R"json("detail":"waiting for HFP (owned by infotainment)"})json");
     EXPECT_EQ(admission_expired_json(false, false),
         R"json({"event":"wireless_admission_expired","reason":"attempt_deadline","phase":"phone_handoff"})json");
+}
+// #169 review (Neon P2): the helper binds the phone's bootstrap to this attempt's source inside
+// PollBootstrapV1, before the observation's reply reaches the coordinator. An attempt retired in
+// that gap must still deny the handle the observation bound; otherwise the helper keeps the live
+// bootstrap, its binding and its lease into the next attempt's ReconnectPeerV1.
+TEST(WirelessEligibility, RetireWithAnObservationInFlightDeniesTheHandleItBound) {
+    EligibilityFixture f;
+    f.slow_setup = true;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.initial_observations.load() > 0; }));
+    // Runtime defer() -> receiver.stop(): the external retirement settles before it returns.
+    f.coordinator.retire();
+    EXPECT_EQ(f.denied.load(), 1U) << "retire() returned without denying the observed handle";
+    EXPECT_EQ(f.denied_handle.load(), f.peer.handle);
+}
+TEST(WirelessEligibility, EstablishmentExpiryWithAnObservationInFlightDeniesTheHandleItBound) {
+    EligibilityFixture f{{std::chrono::milliseconds{100}, std::chrono::milliseconds{10'000}, std::chrono::milliseconds{5'000}}};
+    f.slow_setup = true;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.initial_observations.load() > 0; }));
+    // The establishment bound retires the attempt while the observation is still in flight; its
+    // stale reply then names the handle the helper bound.
+    EXPECT_TRUE(f.eventually([&] { return f.denied.load() > 0; }, 2s)) << "the stale observation was dropped";
+    EXPECT_EQ(f.denied_handle.load(), f.peer.handle);
+    EXPECT_FALSE(f.coordinator.admitting());
 }
