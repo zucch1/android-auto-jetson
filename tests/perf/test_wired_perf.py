@@ -518,15 +518,25 @@ def case_media_timing(tmp: Path) -> None:
     assert report(plain_path, plain_out).returncode == 3
     assert load(plain_out)["verdict"] == "BLOCKED"
 
-    receiver_source = (ROOT / "tools" / "wired-receiver" / "main.cpp").read_text(
-        encoding="utf-8")
+    wired_main = (ROOT / "tools" / "wired-receiver" / "main.cpp").read_text(encoding="utf-8")
+    wireless_main = (ROOT / "tools" / "wireless-receiver" / "main.cpp").read_text(encoding="utf-8")
+    assert "AudioRenderWorker" in wired_main and "pcm_router_config" in wired_main
+    assert "AudioRenderWorker" in wireless_main and "audio_config" in wireless_main
+    receiver_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            ROOT / "src" / "audio" / "AudioRenderWorker.cpp",
+            ROOT / "src" / "audio" / "AudioTelemetry.cpp",
+        )
+    )
     assert gate.receiver_hook_present(receiver_source), "receiver hook/stat read is absent"
     for original, replacement in (
-        ("router_.render_step()", ""),
-        ("router_.render_step()", "/* router_.render_step() */"),
+        ("local_router.render_step()", ""),
+        ("local_router.render_step()", "/* local_router.render_step() */"),
         ("emit_media_timing(stats);", ""),
         ("emit_media_timing(stats);", "/* emit_media_timing(stats); */"),
-        ("const auto stats = router_.report().stats;", ""),
+        ("const auto stats = local_router.report().stats;", ""),
+        ("media_timing_json(stats)", "\"\""),
         ("format_ms(stats.max_completion_skew)", "format_ms(0)"),
         ("format_ms(stats.max_path_latency)", "format_ms(0)"),
     ):

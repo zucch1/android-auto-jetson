@@ -49,11 +49,16 @@ core::Result<ApSnapshot> BusClient::get_ap_credentials(Source source, std::uint6
     return snapshot;
 }
 core::Result<std::unique_ptr<BusClient>> BusClient::system(trust::ApprovedPhoneStore& store) {
-    return private_bus("unix:path=/run/dbus/system_bus_socket", store);
+    // #89 L12: the system bus socket itself must be root-owned (SO_PEERCRED)
+    // before AUTH, Hello or the helper-UID checks in rpc() are attempted.
+    auto connection = BusConnection::connect_system();
+    if (!connection) return Error{ErrorCode::helper_unavailable};
+    return std::unique_ptr<BusClient>{new BusClient{std::make_unique<Impl>(std::move(connection.value()), store)}};
 }
 core::Result<std::unique_ptr<BusClient>> BusClient::private_bus(const std::string& address,
                                                             trust::ApprovedPhoneStore& store) {
-    auto connection = BusConnection::connect_private(address);
+    // Explicit private buses are the caller's own (or root's) daemon.
+    auto connection = BusConnection::connect_private(address, BusOwner::root_or_self());
     if (!connection) return Error{ErrorCode::helper_unavailable};
     return std::unique_ptr<BusClient>{new BusClient{std::make_unique<Impl>(std::move(connection.value()), store)}};
 }

@@ -290,9 +290,22 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
                                invalid_audio_slots=invalid_audio, **av))
 
     verdict = "PASS" if all(c["passed"] is not False for c in criteria) else "FAIL"
+    failure = None
+    # PASS needs a receiver that exited 0. A missing or null exit code means the
+    # run cannot show the receiver ended cleanly, so it never passes (#163 review).
+    receiver_exit = run.get("receiver_exit")
+    if type(receiver_exit) is not int or receiver_exit != 0:
+        if verdict == "PASS":
+            verdict = "FAIL"
+        failure = f"receiver_exit_{'missing' if receiver_exit is None else receiver_exit}"
+    elif run.get("logger_error"):
+        if verdict == "PASS":
+            verdict = "FAIL"
+        failure = run["logger_error"]
     seconds = (min(cutoff, stopped_ns or cutoff) - start_ns) / 1e9 if start_ns and cutoff else None
     return {
         "verdict": verdict,
+        **({"failure": failure} if failure else {}),
         "criteria": criteria,
         "negotiated_profile": profile and {k: profile.get(k) for k in ("width", "height", "fps", "codec")},
         "measured": {
@@ -311,6 +324,11 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
 
 def analyze_dir(out: Path) -> dict:
     run = json.loads((out / "run.json").read_text())
+    if "logger_error" not in run and (out / "receiver.log").is_file():
+        for line in (out / "receiver.log").read_text(errors="replace").splitlines():
+            if line.startswith("stdout_log errno="):
+                run = {**run, "logger_error": line.strip()}
+                break
     return analyze(read_jsonl(out / "receiver.log"), read_jsonl(out / "display.log"),
                    read_jsonl(out / "idr-events.jsonl"), run)
 
@@ -486,6 +504,7 @@ class Logger(threading.Thread):
         super().__init__(daemon=True)
         self.stream, self.log, self.stamped, self.lock, self.label = stream, log, stamped, lock, name
         self.seen: dict[str, int] = {}
+        self.logger_error: str | None = None
 
     def run(self) -> None:
         with self.log.open("w") as out:
@@ -493,6 +512,8 @@ class Logger(threading.Thread):
                 now = time.monotonic_ns()
                 out.write(line)
                 if not line.startswith("{"):
+                    if self.logger_error is None and line.startswith("stdout_log errno="):
+                        self.logger_error = line.strip()
                     continue
                 if line.startswith('{"event":"audio_write_completed"'):
                     self.seen["last_audio"] = now  # media keep-alive (MEDIA_RELAUNCH_SILENCE_S)
@@ -757,6 +778,8 @@ def _run_cli(args) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         return 128 + stop.signum
+    if loggers and loggers[0].logger_error:
+        run["logger_error"] = loggers[0].logger_error
     run.update(receiver_exit=receiver.returncode if receiver else None,
                display_exit=display.returncode if display else None)
     (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
@@ -769,6 +792,8 @@ def _run_cli(args) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         return _blocked(out, base, "phone_command_failed")
+    # analyze() fails a PASS on a nonzero or missing receiver exit and on a latched
+    # logger error, reading the run.json written just above.
     result = {**base, **analyze_dir(out), "finished_utc": datetime.now(timezone.utc).isoformat()}
     result["media_relaunches"] = run["media_relaunches"]
     result["cleanup_failures"] = run["cleanup_failures"]

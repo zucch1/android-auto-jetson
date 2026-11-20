@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Startup.hpp"
+#include "../GioBusOwner.hpp"
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -61,6 +62,11 @@ struct Startup {
             return;
         }
         auto* socket = g_socket_connection_get_socket(G_SOCKET_CONNECTION(state.stream));
+        // #89 L12: production runs as root, so only a root-owned system bus passes.
+        if (!gio_bus_owner_admitted(socket, ipc::dbus_adapter::BusOwner::root_or_self())) {
+            state.done = true;
+            return;
+        }
         const int duplicate = ::fcntl(g_socket_get_fd(socket), F_DUPFD_CLOEXEC, 0);
         if (duplicate < 0) {
             state.done = true;

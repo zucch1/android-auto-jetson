@@ -13,16 +13,18 @@ namespace aa::transport {
 struct TcpIo final {
     core::Deadline::Clock::time_point until{core::Deadline::Clock::time_point::max()};
     std::function<void()> checkpoint;
+    std::chrono::milliseconds checkpoint_interval{25};
 
     core::Result<void> wait(int fd, short events, const core::CancellationToken& token) const {
         for (;;) {
-            if (checkpoint) checkpoint();
             const core::Deadline deadline{until, token};
             if (auto checked = deadline.check(); !checked) return checked.error();
+            if (checkpoint) checkpoint();
+            if (auto checked = deadline.check(); !checked) return checked.error();
+            const auto slice = std::max(std::chrono::milliseconds{1}, checkpoint_interval);
             const auto left = std::chrono::ceil<std::chrono::milliseconds>(
                 std::min(until - core::Deadline::Clock::now(),
-                         std::chrono::duration_cast<core::Deadline::Clock::duration>(
-                             std::chrono::milliseconds{25})));
+                         std::chrono::duration_cast<core::Deadline::Clock::duration>(slice)));
             pollfd descriptor{fd, events, 0};
             const int ready = ::poll(&descriptor, 1, static_cast<int>(std::max<std::int64_t>(0, left.count())));
             if (ready < 0) {
@@ -30,6 +32,7 @@ struct TcpIo final {
                 return Error{ErrorCode::transport_io};
             }
             if (ready == 0) continue;
+            if (auto checked = deadline.check(); !checked) return checked.error();
             if (checkpoint) checkpoint();
             if (auto checked = deadline.check(); !checked) return checked.error();
             if ((descriptor.revents & POLLNVAL) != 0) return Error{ErrorCode::transport_closed};
