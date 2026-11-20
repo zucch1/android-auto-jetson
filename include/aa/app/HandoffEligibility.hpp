@@ -57,6 +57,8 @@ public:
     void begin(helper::Source source);
     void consumer(std::optional<core::ConsumerId> live);
     void tick(bool active = false);
+    // Retires the attempt and, before returning, sends its denial to the helper (after any
+    // operation still in flight), so a fresh attempt never starts against the retired one.
     void retire();
     // Retires a still-pending bootstrap; ACTIVE and consumer grace require success.
     void confirm_completion();

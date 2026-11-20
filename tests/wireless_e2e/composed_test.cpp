@@ -16,6 +16,8 @@ protected:
     std::atomic<long long> validation_ms{}, refresh_max_ms{};
     std::atomic<bool> ready_before_allow{};
     std::atomic<int> withdraw_code{-1};
+    // A refresh that is still in flight when the attempt is retired (#169 review).
+    std::atomic<bool> slow_refresh{}, refreshing{};
     std::unique_ptr<Coordinator> coordinator;
     Clock::time_point bootstrap_deadline{};
     void TearDown() override {
@@ -23,16 +25,20 @@ protected:
         std::cout << "refresh_max_ms=" << refresh_max_ms.load() << '\n';
         NmDaemon::TearDown();
     }
-    void admit() {
+    const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
+    // acquisition: Runtime's AP-inactive path (reconnect, then AcquireApV1 with this source, which
+    // becomes the helper lease and the attempt's source). Otherwise the AP-active {7, 0} source.
+    void admit(std::optional<Source> acquisition = std::nullopt) {
         start(); acquire(); ASSERT_TRUE(state(State::active));
-        const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
         ASSERT_TRUE(store->approve(identity)); ASSERT_EQ(bluez.command("paired"), "ok");
         ASSERT_TRUE(client->reconnect(identity));
+        if (acquisition) { ASSERT_TRUE(client->acquire_ap(*acquisition)); }
         bootstrap_deadline = Clock::now() + 10s;
         ASSERT_EQ(bluez.command("NewConnection"), "allowed");
         auto operations = app::handoff_operations(*client);
         auto validate = std::move(operations.validate);
         operations.validate = [this, validate](app::HandoffOperations::Validation request) {
+            if (request.handle && slow_refresh.load()) { refreshing = true; std::this_thread::sleep_for(700ms); }
             const auto began = Clock::now();
             auto result = validate(request);
             validation_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - began).count();
@@ -58,7 +64,7 @@ protected:
                 EXPECT_EQ(snapshot.ip, "10.42.0.1"); EXPECT_EQ(snapshot.port, 5277U);
                 listening = true; ++starts; return {};
             }, [this] { listening = false; }});
-        coordinator->consumer(core::ConsumerId{7}); coordinator->begin({7, 0});
+        coordinator->consumer(core::ConsumerId{7}); coordinator->begin(acquisition.value_or(Source{7, 0}));
         // v2.5 supersedes the unsupported 1s setup SLA; loss cancellation stays <=1s.
         ASSERT_TRUE(eventually([&] { coordinator->tick(); return coordinator->admitting(); },
             std::chrono::duration_cast<std::chrono::milliseconds>(bootstrap_deadline - Clock::now())))
@@ -139,6 +145,32 @@ TEST_F(WirelessComposed, ConsumerLossAfterCompletedBootstrapKeepsActiveGrace) {
         EXPECT_FALSE(coordinator->admitting());
         std::this_thread::sleep_for(10ms);
     }
+}
+
+// #169 review: an expired attempt's completed, unconfirmed bootstrap is retired (Runtime defer()
+// -> receiver.stop()) while a refresh is still in flight, so its denial cannot be sent at once.
+// The next admission's ReconnectPeerV1 must not find that bootstrap still valid: the helper
+// would keep its binding and the acquisition lease {7, 1}, and the fresh AP-active attempt's
+// {7, 0} polls would be rejected even after the late denial retired the old hand-off.
+TEST_F(WirelessComposed, ExpiredHandoffDeniedLateLeavesNoLeaseForTheFreshAttempt) {
+    ASSERT_NO_FATAL_FAILURE(admit(Source{7, 1}));
+    ASSERT_NO_FATAL_FAILURE(complete_bootstrap());
+    slow_refresh = true;
+    ASSERT_TRUE(eventually([&] { coordinator->tick(); return refreshing.load(); }, 2s));
+    // Given: Runtime defers the expired attempt with that refresh still running.
+    coordinator->retire();
+    // When: the next admit() reconnects and begins the AP-active source.
+    ASSERT_TRUE(client->reconnect(identity));
+    coordinator->begin({7, 0});
+    slow_refresh = false;
+    // Then: the old phone channel is shut down, and the phone's fresh bootstrap is admitted
+    // under the new source within the establishment bound.
+    ASSERT_TRUE(eventually([&] { coordinator->tick(); return bluez.command("wire-read") != "open"; }, 3s));
+    ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    EXPECT_TRUE(eventually([&] { coordinator->tick(); return coordinator->admitting(); }, 5s))
+        << "validation=" << validation_code.load() << " authorization=" << authorization_code.load();
+    HandoffFailure failure{};
+    EXPECT_TRUE(client->poll_bootstrap({7, 0}, failure)) << "the retired attempt's lease carried over";
 }
 }
 }

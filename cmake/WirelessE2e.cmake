@@ -46,6 +46,9 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wireless_e2e_composed_consumer_loss COMMAND aa_wireless_composed_test
         --gtest_filter=WirelessComposed.*Bootstrap* --gtest_repeat=2)
     set_tests_properties(wireless_e2e_composed_consumer_loss PROPERTIES TIMEOUT 30 RESOURCE_LOCK aa_wireless_composed)
+    add_test(NAME wireless_e2e_composed_late_denial COMMAND aa_wireless_composed_test
+        --gtest_filter=WirelessComposed.ExpiredHandoffDeniedLateLeavesNoLeaseForTheFreshAttempt)
+    set_tests_properties(wireless_e2e_composed_late_denial PROPERTIES TIMEOUT 30 RESOURCE_LOCK aa_wireless_composed)
     add_executable(aa_wireless_composed_tls_test tests/wireless_e2e/composed_tls_test.cpp tests/trust/syscall_faults.cpp)
     target_link_libraries(aa_wireless_composed_tls_test PRIVATE aa_wireless GTest::gtest_main PkgConfig::AA_GIO)
     target_compile_definitions(aa_wireless_composed_tls_test PRIVATE AA_HELPER_BUILD="${CMAKE_BINARY_DIR}" AA_HELPER_SOURCE="${CMAKE_SOURCE_DIR}")
