@@ -123,6 +123,17 @@ struct HandoffEligibilityCoordinator::Impl {
             }
         }
     }
+    // Sends this coordinator's outstanding denial now, after any operation still in flight
+    // (whose reply is stale once retired). The helper then has retired the old hand-off before
+    // the caller starts a fresh attempt (#169 review).
+    void settle() {
+        if (pending) { pending->wait(); pending.reset(); }
+        if (denial) {
+            const auto job = *denial;
+            denial.reset();
+            (void)operations.authorize(job.source, job.handle, false);
+        }
+    }
     void tick() {
         // Establishment bounds only the wait for a bootstrap. An observed one runs to its own
         // budget, however late in the attempt the phone connected (#161).
@@ -149,11 +160,7 @@ HandoffEligibilityCoordinator::HandoffEligibilityCoordinator(const trust::TrustS
     : impl_(std::make_unique<Impl>(trust, std::move(operations), std::move(listener), timing)) {}
 HandoffEligibilityCoordinator::~HandoffEligibilityCoordinator() {
     impl_->retire();
-    if (impl_->pending) { impl_->pending->wait(); impl_->pending.reset(); }
-    if (impl_->denial) {
-        const auto job = *impl_->denial;
-        (void)impl_->operations.authorize(job.source, job.handle, false);
-    }
+    impl_->settle();
 }
 void HandoffEligibilityCoordinator::begin(helper::Source source) {
     // A retry must not reset a bootstrap that is still progressing: retiring it would deny the
@@ -186,7 +193,12 @@ bool HandoffEligibilityCoordinator::bootstrapping() const {
     return impl_->in_progress() && Clock::now() < impl_->bootstrap_until + impl_->timing.connect;
 }
 void HandoffEligibilityCoordinator::tick(bool active) { impl_->active = active; impl_->tick(); }
-void HandoffEligibilityCoordinator::retire() { impl_->retire(); }
+// An external retirement precedes a fresh attempt (Runtime defer() and admit() via
+// WirelessReceiver::stop(), before ReconnectPeerV1 or AcquireApV1). The denial is settled
+// synchronously: queued behind an in-flight operation, it would otherwise reach the helper after
+// that reconnect, which then finds the retired bootstrap still valid and keeps its binding and
+// lease, so the fresh attempt's source is rejected (#169 review). Bounded like any helper call.
+void HandoffEligibilityCoordinator::retire() { impl_->retire(); impl_->settle(); }
 bool HandoffEligibilityCoordinator::admitting() const { return impl_->valid() && impl_->live_consumer(); }
 bool HandoffEligibilityCoordinator::valid_session() const { return impl_->valid(); }
 std::optional<trust::PhoneIdentity> HandoffEligibilityCoordinator::phone() const { return impl_->phone; }
