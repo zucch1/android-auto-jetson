@@ -340,12 +340,14 @@ RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend ba
     // head down to the 15 ms drift target at once instead of 5 ms per chunk
     // (resampler carryover at a run's head counts at its older source time),
     // and the router's 200 ms late cap judges such a caught-up run by the end
-    // of its parent's own PTS range. A stall's burst - including 200 ms
-    // guidance parents stamped milliseconds apart, however the resampler
-    // splits them - is therefore trimmed rather than ending the session as
-    // audio_sink_failure; a parent whose PCM ends over 200 ms behind the
-    // cursor still fails late. The dropped audio is logged as audio_catch_up.
-    // Shared by the wired and wireless receivers (#163).
+    // of its parent's own PTS range against the committed source-time frontier.
+    // A stall's burst - including 200 ms guidance parents stamped milliseconds
+    // apart, however the resampler splits them - is therefore trimmed rather
+    // than ending the session as audio_sink_failure; a parent whose PCM ends
+    // over 200 ms behind recent source audio still fails late. The dropped
+    // audio is logged as audio_catch_up. Wired uses this 90 ms default;
+    // wireless overrides it via audio_config() (configurable, default off = 0)
+    // until a wireless-safe policy for TCP coalescing is decided.
     config.live_pcm_drift.catch_up_watermark = core::Nanoseconds{90'000'000};
     config.on_write_completed = [log_media = std::move(telemetry.log_media)](const WriteCompletion& completion) {
         if (log_media) {

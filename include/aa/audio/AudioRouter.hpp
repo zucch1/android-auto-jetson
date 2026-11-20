@@ -170,8 +170,10 @@ struct SinkWriteProgress final {
 // original scheduled timestamp) before the run is committed to the sink and
 // trims bounded head frames from over-watermark runs, advancing the timeline
 // by the RETAINED frames only. Trimmed audio is dropped, never resynthesized;
-// timestamps are never rebased to "now". Only the wired receiver's
-// pcm_router_config() enables this.
+// timestamps are never rebased to "now". The shared pcm_router_config() enables
+// live-PCM drift correction for both wired and wireless receivers (#163);
+// catch_up_watermark defaults to 90 ms for wired and is configurable (default
+// off, 0) for wireless pending an owner decision on TCP coalescing.
 //
 // Catch-up (#154, opt-in): a sink stall withholds credit, and the phone then
 // delivers its backlog in a burst stamped at arrival. Sequentialized after
@@ -190,13 +192,18 @@ struct SinkWriteProgress final {
 // only the part beyond what the bounded max_trim policy would have removed.
 // A run whose decoded output exceeds its parent's own PCM duration (input
 // bytes at the role's input format) starts with resampler carryover from
-// earlier parents; the catch-up judges its phase by that older source time,
-// so the stale carryover is trimmed first and a caught-up run never leaves
-// the cursor more than `target` past the end of its parent's PCM. The
+// earlier parents; when the run is already behind placement or overlaps an
+// earlier parent on its role, the catch-up judges its phase by that older
+// source time so stale carryover is trimmed first and a caught-up run never
+// leaves the cursor more than `target` past the end of its parent's PCM. An
+// on-time non-overlapping run never lets carryover alone trigger catch-up. The
 // router's 200 ms late-arrival cap judges a caught-up run by its parent's own
-// PTS range: it fails only when the parent's end (timestamp plus input
-// duration) is more than 200 ms behind the cursor. Neither the decoded
-// length nor how the resampler splits output across runs enters that check.
+// PTS range against the committed source-time frontier (bounded by cursor): it
+// fails only when the parent's end (timestamp plus input duration) is more than
+// 200 ms behind recent source audio (so a backward timestamp jump still fails
+// late, while a forward-timestamped short chunk after a non-caught-up 200 ms
+// guidance packet survives). Neither the decoded length nor how the resampler
+// splits output across runs enters that check.
 struct LivePcmDriftPolicy final {
     bool enabled{false};
     core::Nanoseconds high_watermark{core::Nanoseconds{20'000'000LL}};
@@ -259,7 +266,8 @@ struct RouterConfig final {
     std::string sink_remote{};
     std::function<void(const WriteCompletion&)> on_write_completed{};
     // Live-PCM drift correction (opt-in; default lossless/unchanged). Enabled
-    // only by the wired receiver's pcm_router_config().
+    // by the shared pcm_router_config() (wired enables 90 ms catch-up by
+    // default; wireless keeps catch-up configurable and off by default).
     LivePcmDriftPolicy live_pcm_drift{};
     std::function<void(const SinkWriteProgress&)> on_sink_write_progress{};
     // render_step() interval bound. Keep the qualified 50 ms batching value.

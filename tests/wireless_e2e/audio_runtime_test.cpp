@@ -64,20 +64,6 @@ namespace ss = aa::session;
 namespace tr = aa::transport;
 namespace wr = aa::wireless_receiver;
 
-// These runtime tests feed unpaced bursts (several 50 ms chunks sent back to
-// back behind a gated sink) to probe ACK cadence, reconnect and teardown. With
-// the production #155 catch-up watermark (90 ms) such a burst is trimmed or
-// coalesced depending on how many milliseconds the sends take, so their write
-// counts would depend on timing. They run the production config with catch-up
-// off; catch-up itself is covered on the same shared AudioRenderWorker by the
-// WiredReceiver tests, and the production watermark by
-// WirelessAudioWorker.TelemetryEventParityWithCollectorAndSmokeContracts.
-aa::audio::RouterConfig audio_config_without_catch_up() {
-    auto config = wr::audio_config(aa::audio::SinkBackend::pulse);
-    config.live_pcm_drift.catch_up_watermark = aa::core::Nanoseconds{0};
-    return config;
-}
-
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
 
@@ -462,6 +448,7 @@ struct RuntimeFixture final {
     std::condition_variable state_cv;
     bool session_live{false};
     bool session_active{false};
+    aa::core::Nanoseconds audio_catch_up_watermark{0};
 
     void start(
         Clock::time_point deadline = Clock::now() + 20s,
@@ -504,7 +491,8 @@ struct RuntimeFixture final {
         helper_client = std::move(client_res).value();
 
         audio_worker = std::make_unique<audio::AudioRenderWorker>(
-            audio_config_without_catch_up(), wr::audio_telemetry(),
+            wr::audio_config(audio::SinkBackend::pulse, audio_catch_up_watermark),
+            wr::audio_telemetry(),
             custom_open ? custom_open : make_gated_router(gate));
         ASSERT_TRUE(audio_worker->ready());
 
@@ -898,7 +886,7 @@ TEST(WirelessAudioRuntime, AckSendDropRetiresRecoverablyWhileOwnerCancelCleanAnd
 
     auto gate = std::make_shared<SinkGate>();
     audio::AudioRenderWorker worker{
-        audio_config_without_catch_up(), wr::audio_telemetry(),
+        wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
         make_gated_router(gate)};
     ASSERT_TRUE(worker.ready());
     wr::Media media{worker};
@@ -933,7 +921,7 @@ TEST(WirelessAudioRuntime, AckSendDropRetiresRecoverablyWhileOwnerCancelCleanAnd
     {
         StdoutCapture c;
         audio::AudioRenderWorker bad_worker{
-            audio_config_without_catch_up(), wr::audio_telemetry(),
+            wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
             make_gated_router(std::make_shared<SinkGate>())};
         ASSERT_TRUE(bad_worker.ready());
         wr::Media bad_media{bad_worker};
@@ -1013,7 +1001,7 @@ TEST(WirelessAudioRuntime, StdoutBackpressureDuringSinkReopenAndBoundedTeardown)
         }
 
         audio::AudioRenderWorker worker{
-            audio_config_without_catch_up(), wr::audio_telemetry(),
+            wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
             make_gated_router(gate)};
         worker_stopped_ok = worker.ready().has_value();
 
@@ -1292,7 +1280,7 @@ TEST(WirelessAudioRuntime, FatalWorkerFailureTeardownBoundedWithFullStalledStdou
 
         auto gate = std::make_shared<SinkGate>();
         audio::AudioRenderWorker bad_worker{
-            audio_config_without_catch_up(), wr::audio_telemetry(),
+            wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
             make_gated_router(gate)};
         ASSERT_TRUE(bad_worker.ready());
         wr::Media bad_media{bad_worker};
@@ -1573,7 +1561,7 @@ TEST(WirelessAudioRuntime, SynchronousAudioSinkBaselineVsRenderWorkerBehavior) {
         auto gate = std::make_shared<SinkGate>();
         gate->block_first_write = true;
         auto router = audio::detail::open_router_with_sink_for_test(
-            audio_config_without_catch_up(), std::make_unique<GatedSink>(gate));
+            wr::audio_config(audio::SinkBackend::pulse), std::make_unique<GatedSink>(gate));
         ASSERT_TRUE(router);
         SyncRouterAudioSink baseline_sink{router.value()};
 
@@ -1640,7 +1628,7 @@ TEST(WirelessAudioRuntime, SynchronousAudioSinkBaselineVsRenderWorkerBehavior) {
         auto gate = std::make_shared<SinkGate>();
         gate->block_first_write = true;
         audio::AudioRenderWorker worker{
-            audio_config_without_catch_up(), wr::audio_telemetry(),
+            wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
             make_gated_router(gate)};
         ASSERT_TRUE(worker.ready());
 
@@ -1740,7 +1728,7 @@ TEST(WirelessAudioRuntime, AckDequeuedBeforeReopenIsHeldUntilReopenCompletes) {
         } reopen_guard{reopen_mutex, reopen_cv, release_reopen};
 
         audio::AudioRenderWorker worker{
-            audio_config_without_catch_up(), wr::audio_telemetry(),
+            wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
             [&](const audio::RouterConfig& config) {
                 bool is_reopen = false;
                 {
@@ -2871,6 +2859,46 @@ TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFails
         EXPECT_NE(drained_stdout.find("\"origin\":\"reopen_ack_timeout\""), std::string::npos);
         EXPECT_NE(drained_stdout.find("\"outcome\":\"reopen_ack_timeout\""), std::string::npos);
     }
+}
+
+// #155 F4: wireless runtime end-to-end catch-up test with catch-up watermark
+// explicitly configured to 90 ms; verifies post-stall burst survival and
+// audio_catch_up JSONL emission parsed by EventParser in test_audio_worker_telemetry.py.
+TEST(WirelessAudioRuntime, ConfiguredCatchUpPostStallBurstTelemetryParsesInCollector) {
+    StdoutCapture capture;
+    std::string output;
+    int exit_code = -1;
+    {
+        RuntimeFixture f;
+        f.gate->populate_playback_slot = true;
+        f.audio_catch_up_watermark = aa::core::Nanoseconds{90'000'000};
+        ASSERT_NO_FATAL_FAILURE(f.start(Clock::now() + 15s));
+        ASSERT_TRUE(f.backend->wait_authorized(1));
+
+        auto phone_res = PhonePeer::connect(f.port);
+        ASSERT_TRUE(phone_res);
+        auto phone = std::move(phone_res).value();
+        ASSERT_NO_FATAL_FAILURE(phone->handshake_and_open_av(-7));
+
+        const std::vector<std::byte> chunk_42ms(8192, std::byte{0x24});
+        for (std::uint64_t i = 0; i < 16; ++i) {
+            ASSERT_TRUE(phone->send_msg(
+                100, av_data_msg(1'000'000'000ULL + i * 42'666'667ULL, chunk_42ms)));
+            ASSERT_TRUE(phone->wait_audio_ack(-7, 2s));
+        }
+        ASSERT_TRUE(f.audio_worker->wait_idle(Clock::now() + 2s));
+        EXPECT_FALSE(f.audio_worker->failure().has_value());
+
+        EXPECT_TRUE(f.consumer_client->stop_projection());
+        phone->close();
+        exit_code = f.stop_and_join();
+    }
+    output = capture.stop();
+    maybe_dump_jsonl("catch_up_burst", output);
+
+    EXPECT_EQ(exit_code, 0) << output;
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+    EXPECT_NE(output.find("\"event\":\"audio_catch_up\",\"frames\":"), std::string::npos) << output;
 }
 
 } // namespace

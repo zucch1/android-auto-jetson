@@ -140,23 +140,28 @@ CATCH_UP_METRICS = ("audio_catch_up_events", "audio_catch_up_frames", "audio_cat
 def _catch_up_metrics(events: dict) -> dict:
     """Informational catch-up loss (#154), never gated and never a stall dropout.
 
-    The wired receiver drops a placement backlog past its 90 ms catch-up
+    A receiver with catch-up enabled drops a placement backlog past its catch-up
     watermark in one run (``audio_catch_up``); the A/V metrics cannot see it
     (they measure from the placed slot), so the loss is reported on its own.
     A v3 capture recorded before the event existed carries none of the three
     keys and reports null; so does one whose collector could not establish
     the totals (a malformed record, or a media_telemetry_dropped notice after
-    the newest catch-up record). A capture carrying only some keys, or values
-    that are negative or disagree about whether any catch-up happened, is
-    malformed.
+    the newest catch-up record). A capture carrying only some keys, mixed null
+    and non-null values, non-finite ms, or values that are negative or disagree
+    about whether any catch-up happened, is malformed.
     """
     present = [name in events for name in CATCH_UP_METRICS]
     if any(present) and not all(present):
         raise ContractError("capture.events must carry all or none of " + ", ".join(CATCH_UP_METRICS))
     count = _as_int(events.get("audio_catch_up_events"))
     frames = _as_int(events.get("audio_catch_up_frames"))
-    duration = _as_float(events.get("audio_catch_up_ms"))
+    raw_duration = events.get("audio_catch_up_ms")
+    duration = _as_float(raw_duration)
+    if raw_duration is not None and duration is None:
+        raise ContractError("audio_catch_up_ms must be a finite number or null")
     values = (count, frames, duration)
+    if any(value is None for value in values) and not all(value is None for value in values):
+        raise ContractError("catch-up events, frames and ms must all be null or all present")
     if any(value is not None and value < 0 for value in values):
         raise ContractError("catch-up counters must be nonnegative")
     if None not in values and len({value == 0 for value in values}) != 1:
@@ -306,6 +311,11 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     if capture.get("schema") not in RESULT_FOR_CAPTURE:
         raise ContractError(f"unexpected capture schema: {capture.get('schema')!r}")
     version3 = capture["schema"] == CAPTURE_SCHEMA
+    if version3 and isinstance(capture.get("events"), dict):
+        raw_catch_up_ms = capture["events"].get("audio_catch_up_ms")
+        if (isinstance(raw_catch_up_ms, (int, float)) and not isinstance(raw_catch_up_ms, bool)
+                and not math.isfinite(raw_catch_up_ms)):
+            raise ContractError("audio_catch_up_ms must be a finite number or null")
     budgets = BUDGETS if version3 else BUDGETS_V2
     evidence = parse_capture(capture)
     capture, numeric_errors = aa_perf_schema.finite_numbers(capture)

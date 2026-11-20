@@ -597,9 +597,10 @@ class EventParser:
         self._publish_catch_up()
 
     def _media_dropped(self, event: dict) -> None:
-        lost = sum(event[key] for key in ("rate_limited", "backpressure")
-                   if isinstance(event.get(key), int) and not isinstance(event.get(key), bool))
-        if lost > 0 or not isinstance(event.get("rate_limited"), int):
+        counters = [event.get(key) for key in ("rate_limited", "backpressure")]
+        if (not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                    for value in counters)
+                or sum(counters) > 0):
             self._doubt_catch_up()
 
     def _doubt_catch_up(self) -> None:

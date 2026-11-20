@@ -7,9 +7,9 @@
 # Run: python3 -B tests/perf/test_catch_up_loss.py
 """Catch-up loss (#154) reaches the qualification capture and report.
 
-The wired receiver drops a post-stall placement backlog past its 90 ms
-watermark in one run and logs ``audio_catch_up``. That loss is not a sink
-stall, so it must appear as its own informational metrics (events, frames,
+A receiver with catch-up enabled drops a post-stall placement backlog past its
+catch-up watermark in one run and logs ``audio_catch_up``. That loss is not a
+sink stall, so it must appear as its own informational metrics (events, frames,
 ms), never as an ``audio_stall_*`` dropout and never as a gate.
 """
 from __future__ import annotations
@@ -121,6 +121,21 @@ def test_a_drop_after_the_newest_record_leaves_the_totals_unconfirmed() -> None:
     # A notice reporting no loss changes nothing.
     clean = parse([*lines, '{"event":"media_telemetry_dropped","rate_limited":0,"backpressure":0}'])
     assert clean.metrics["audio_catch_up_frames"] == BURST_FRAMES, clean.metrics
+    # Malformed drop notices must fail closed (both counters must be non-negative, non-bool ints).
+    for bad_drop in (
+        '{"event":"media_telemetry_dropped","rate_limited":0}',
+        '{"event":"media_telemetry_dropped","backpressure":0}',
+        '{"event":"media_telemetry_dropped","rate_limited":0,"backpressure":null}',
+        '{"event":"media_telemetry_dropped","rate_limited":0,"backpressure":"5"}',
+        '{"event":"media_telemetry_dropped","rate_limited":0,"backpressure":true}',
+        '{"event":"media_telemetry_dropped","rate_limited":0,"backpressure":-1}',
+        '{"event":"media_telemetry_dropped","rate_limited":true,"backpressure":0}',
+        '{"event":"media_telemetry_dropped","rate_limited":-5,"backpressure":5}',
+    ):
+        malformed = parse([*lines, bad_drop])
+        assert [malformed.metrics[key] for key in KEYS] == [None, None, None], (
+            bad_drop, malformed.metrics
+        )
 
 
 def test_collector_capture_with_a_dropped_tail_record_reports_unknown_loss() -> None:
@@ -201,7 +216,13 @@ def test_report_rejects_inconsistent_catch_up_evidence() -> None:
     partial = v3()
     partial["events"]["audio_catch_up_frames"] = 1808
     for raw in (partial, with_catch_up(v3(), 1, -1808, 1.0),
-                with_catch_up(v3(), 0, 1808, 37.666)):
+                with_catch_up(v3(), 0, 1808, 37.666),
+                with_catch_up(v3(), None, 1808, 37.666),
+                with_catch_up(v3(), 1, None, 37.666),
+                with_catch_up(v3(), 1, 1808, None),
+                with_catch_up(v3(), 1, 1808, float("nan")),
+                with_catch_up(v3(), 1, 1808, float("inf")),
+                with_catch_up(v3(), None, None, float("nan"))):
         try:
             result(raw)
         except reporter.ContractError:

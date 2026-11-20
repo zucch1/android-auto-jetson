@@ -4524,6 +4524,72 @@ TEST_F(AudioPipelineRoute, IncrementalOrdinaryJitterNeverTriggersTheCatchUp) {
     EXPECT_GT(route.report().stats.frames_trimmed, 0U);
 }
 
+// #155 F1: a non-caught-up 200 ms guidance packet placed near the 90 ms
+// watermark advances cursor to timestamp + ~284 ms. A subsequent forward-
+// timestamped short chunk (< 83 ms, e.g. 42.67 ms media or 64 ms guidance
+// tail) must be caught up rather than failing late_beyond_cap.
+TEST_F(AudioPipelineRoute, IncrementalForwardShortChunkAfterNonCaughtUpGuidanceSurvivesLateCap) {
+    // (a) Multi-role: 3 x 42.67 ms media at t=0 (cursor=118 ms), 200 ms guidance
+    // at t=30 ms (phase=88 ms, cursor=313 ms), then 42.67 ms media at t=40 ms.
+    {
+        BurstRoute burst{90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+            ScriptedResampler::decoder([](std::size_t, std::size_t) { return std::size_t{9600}; })};
+        ASSERT_TRUE(burst.route);
+        auto& route = *burst.route;
+        const auto media_chunk = constant_pcm({1000, 2048});
+        for (std::uint64_t i = 0; i < 3; ++i) {
+            ASSERT_TRUE(route.submit(make_message(media, i, base, media_chunk)));
+        }
+        ASSERT_TRUE(burst.drain());
+        ASSERT_TRUE(route.submit(make_message(guidance, 0,
+            aa::core::Nanoseconds{base.count + 30'000'000}, guidance_parent(1500, 6400))));
+        ASSERT_TRUE(burst.drain());
+        ASSERT_TRUE(route.submit(make_message(media, 3,
+            aa::core::Nanoseconds{base.count + 40'000'000}, media_chunk)));
+        const auto drained = burst.drain();
+        ASSERT_TRUE(drained) << aa::to_string(drained.error().code());
+        EXPECT_FALSE(route.report().render_failure);
+        EXPECT_GT(route.report().stats.frames_caught_up, 0U);
+    }
+    // (b) Single-role guidance: 200 ms at t=0, 200 ms at t=111 ms (phase=89 ms,
+    // cursor=395 ms), then 64 ms tail (2048 B of 16 kHz mono) at t=112 ms.
+    {
+        BurstRoute burst{90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+            ScriptedResampler::decoder([](std::size_t, std::size_t buffered) { return buffered; })};
+        ASSERT_TRUE(burst.route);
+        auto& route = *burst.route;
+        ASSERT_TRUE(route.submit(make_message(guidance, 0, base, guidance_parent(1000, 6400))));
+        ASSERT_TRUE(burst.drain());
+        ASSERT_TRUE(route.submit(make_message(guidance, 1,
+            aa::core::Nanoseconds{base.count + 111'000'000}, guidance_parent(1100, 6400))));
+        ASSERT_TRUE(burst.drain());
+        ASSERT_TRUE(route.submit(make_message(guidance, 2,
+            aa::core::Nanoseconds{base.count + 112'000'000}, guidance_parent(1200, 2048))));
+        const auto drained = burst.drain();
+        ASSERT_TRUE(drained) << aa::to_string(drained.error().code());
+        EXPECT_FALSE(route.report().render_failure);
+        EXPECT_GT(route.report().stats.frames_caught_up, 0U);
+    }
+}
+
+// #155 F2: an on-time guidance prompt (phase == 0, no source overlap) whose
+// resampler splits Packet 0 (96 + 19098 frames) must not trigger catch-up via
+// carried_ns and drop ~183 ms of speech with no stall.
+TEST_F(AudioPipelineRoute, IncrementalOnTimeGuidanceSplitDoesNotTriggerCarryoverCatchUp) {
+    BurstRoute burst{90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+        ScriptedResampler::decoder([](std::size_t call, std::size_t buffered) {
+            return call == 0 ? std::size_t{96} : call == 1 ? std::size_t{19098} : buffered; })};
+    ASSERT_TRUE(burst.route);
+    auto& route = *burst.route;
+    ASSERT_TRUE(route.submit(make_message(guidance, 0, base, guidance_parent(1000, 6400))));
+    ASSERT_TRUE(burst.drain());
+    ASSERT_TRUE(route.submit(make_message(guidance, 1,
+        aa::core::Nanoseconds{base.count + 200'000'000}, guidance_parent(2000, 6400))));
+    ASSERT_TRUE(burst.drain());
+    EXPECT_EQ(route.report().stats.frames_caught_up, 0U);
+    EXPECT_EQ(route.report().stats.frames_trimmed, 0U);
+}
+
 TEST_F(AudioPipelineRoute, IncrementalQueuedParentsDoNotBecomeLateArrivalsBetweenSteps) {
     open_incremental();
     for (std::uint64_t i = 0; i < 12; ++i) { enqueue(media, i, {1000, 960}); }
