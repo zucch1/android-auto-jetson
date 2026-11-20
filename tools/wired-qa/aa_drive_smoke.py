@@ -89,6 +89,7 @@ from pathlib import Path
 TOOLS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS / "perf"))
 import aa_av_contract as av_contract  # noqa: E402
+import aa_log_integrity as integrity  # noqa: E402
 import aa_moving_map as moving_map  # noqa: E402
 import aa_transport as transport  # noqa: E402
 from aa_build_guard import (  # noqa: E402
@@ -172,10 +173,50 @@ def _criterion(name: str, passed: bool | None, **detail) -> dict:
     return {"name": name, "passed": passed, **detail}
 
 
-def waiting_idr_episodes(stamped: list[dict], end_ns: int, run_start_ns: int | None) -> list[dict]:
-    """Episodes from the runner-stamped ``idr_*`` lines (the lines carry no time).
+def idr_time(item: dict) -> int:
+    """When an ``idr_*`` event happened: its source emission stamp (``emit_ns``,
+    CLOCK_MONOTONIC like the runner), never when the line reached the runner
+    (#90 review: a log delivered late must not move an episode out of the window).
+    Unstamped lines fall back to their arrival time; analyze() fails them closed."""
+    stamp = integrity.emit_ns(item["event"])
+    if stamp is not None:
+        return stamp
+    observed = item.get("observed_ns")
+    return observed if type(observed) is int else 0
 
-    An episode opens at a source's first ``idr_requested`` and closes at its
+
+IDR_OPENERS = ("idr_wait_started", "idr_requested")
+
+
+def idr_records(receiver: list[dict], display: list[dict]) -> list[dict]:
+    """Every ``idr_*`` record of the completed raw logs (#90 review 4).
+
+    The verdict is built from the logs the integrity check proved complete, not
+    from the runner's live sidecar (which only says when a line reached it).
+    """
+    return [{"event": event, "log": label}
+            for label, log in (("receiver", receiver), ("display", display))
+            for event in log if str(event.get("event", "")).startswith("idr_")]
+
+
+def _attach_observed(stamped: list[dict], sidecar: list[dict] | None) -> None:
+    """Give each raw-log IDR record the runner's arrival time of the same line."""
+    pending: dict[str, list[int]] = {}
+    for item in sidecar or []:
+        if type(item.get("observed_ns")) is int and isinstance(item.get("event"), dict):
+            pending.setdefault(json.dumps(item["event"], sort_keys=True), []).append(item["observed_ns"])
+    for item in stamped:
+        times = pending.get(json.dumps(item["event"], sort_keys=True))
+        if times:
+            item["observed_ns"] = times.pop(0)
+
+
+def waiting_idr_episodes(stamped: list[dict], end_ns: int, run_start_ns: int | None) -> list[dict]:
+    """Episodes from the ``idr_*`` lines, timed at emission (see idr_time).
+
+    An episode opens at a source's first ``idr_wait_started`` (the wait
+    transition itself, logged even when every request fails) or
+    ``idr_requested``, and closes at its
     ``idr_recovered``. The binary's own ``latency_ms`` starts at the wait
     itself, which can precede the first successful request, so a recovery
     starts at the earlier of that request and (recovery - latency_ms). When
@@ -197,10 +238,10 @@ def waiting_idr_episodes(stamped: list[dict], end_ns: int, run_start_ns: int | N
         episodes.append({"source": source, "start_ns": start, "duration_s": seconds,
                          "recovered": recovered})
 
-    for item in sorted(stamped, key=lambda x: x["observed_ns"]):
-        event, t = item["event"], item["observed_ns"]
+    for item in sorted(stamped, key=idr_time):
+        event, t = item["event"], idr_time(item)
         source = event.get("source", "unknown")
-        if event.get("event") == "idr_requested" and t <= end_ns:
+        if event.get("event") in IDR_OPENERS and t <= end_ns:
             open_at.setdefault(source, t)
         elif event.get("event") == "idr_recovered":
             requested = open_at.pop(source, None)
@@ -247,15 +288,45 @@ def av_pairs(presented: list[dict], valid_audio: list[dict]) -> list[tuple[int, 
     return out
 
 
-def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run: dict) -> dict:
-    """Evaluate the four #137 criteria over one run. ``run`` is the runner's record."""
+def analyze(receiver: list[dict], display: list[dict], sidecar: list[dict] | None, run: dict) -> dict:
+    """Evaluate the four #137 criteria over one run. ``run`` is the runner's record.
+
+    Every time comes from the records' own source stamps (#90 review 4): the
+    drive is anchored at the ``active`` record's ``emit_ns`` and IDR episodes at
+    theirs, so a late-delivered ``active`` or IDR line cannot move or hide an
+    episode. ``sidecar`` is the runner's ``idr-events.jsonl`` (None when it is
+    missing); a missing or inconsistent sidecar is BLOCKED, never PASS.
+    """
     duration_s = run["duration_s"]
+    wireless = run.get("transport") == "wireless"
+    stamped = idr_records(receiver, display)
+    if wireless:
+        # #158: the wireless receiver does not stamp emit_ns on its lines yet, so
+        # its IDR lines are timed by the runner's sidecar (observed_ns), as before.
+        _attach_observed(stamped, sidecar)
+    if wireless:
+        # #158: no `active` line; the receiver's session_state_changed -> active
+        # diagnostic is the marker, timed by its own source stamp.
+        active_record = next((e for e in receiver if transport.diag_kind(e) == "session_state_changed"
+                              and e.get("to_state") == "active"), None)
+        active_ns = None
+        if active_record is not None:
+            active_ns = integrity.emit_ns(active_record)
+            mono = active_record.get("mono_ns")
+            if active_ns is None and type(mono) is int and mono > 0:
+                active_ns = mono
+    else:
+        active_record = next((e for e in receiver if e.get("event") == "active"), None)
+        active_ns = integrity.emit_ns(active_record) if active_record is not None else None
+    anchor_issue = None
+    if active_ns is None:
+        anchor_issue = "active_unstamped" if active_record is not None else "active_missing"
+        active_ns = run.get("active_ns")  # provisional only: every anchored criterion is BLOCKED
     criteria: list[dict] = []
     profile = next((e for e in receiver if e.get("event") == "video_profile"), None)
     negotiated_fps = profile.get("fps") if profile else None
     paints = sorted((e for e in display if e.get("event") == "video_presented"
                      and isinstance(e.get("completed_ns"), int)), key=lambda e: e["completed_ns"])
-    active_ns = run.get("active_ns")
     # Wireless prepares the phone after `active` (adb reaches it only over the
     # AP): the drive starts at the first paint after that preparation.
     from_ns = run.get("drive_from_ns") or active_ns
@@ -304,7 +375,6 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
 
     # 3. Session drop: both processes alive at the end of the window, it ran
     # its full length, and the receiver never left the connected session inside it.
-    wireless = run.get("transport") == "wireless"
     # A wireless re-admission is a drop too: the link went away and came back.
     drop_states = ("disconnected", "reconnecting", "failed") if wireless else ("disconnected",)
     states = [e for e in receiver if transport.diag_kind(e) == "session_state_changed"
@@ -315,8 +385,9 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
         dropped += [e for e in states if first_active
                     and e.get("session") != first_active.get("session")
                     and active_ns <= e["mono_ns"] < cutoff and e not in dropped]
-        dropped += [x["event"] for x in stamped if x["event"].get("event") in WIRELESS_STAMPED
-                    and active_ns < x["observed_ns"] < cutoff]
+        # Re-admission lines carry no time: the runner's sidecar stamps them (#158).
+        dropped += [x["event"] for x in sidecar or [] if x.get("event", {}).get("event") in WIRELESS_STAMPED
+                    and type(x.get("observed_ns")) is int and active_ns < x["observed_ns"] < cutoff]
     terminal = [e for e in receiver + display if e.get("event") == "terminal_error"]
     full = bool(end_ns and stopped_ns and stopped_ns >= end_ns)
     survived = bool(run.get("receiver_alive_at_end") and run.get("display_alive_at_end"))
@@ -335,23 +406,99 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
     criteria.append(_criterion("av_signed_contract", av.pop("passed"), limits=av_contract.LIMITS,
                                invalid_audio_slots=invalid_audio, **av))
 
-    verdict = "PASS" if all(c["passed"] is not False for c in criteria) else "FAIL"
+    # #90 review: a record that was lost (or a log never proven complete) can
+    # fake or hide a result. A criterion whose inputs may be incomplete is
+    # tainted in the direction(s) the loss could move it; a confirmed failure
+    # (one no lost record could have produced) stays FAIL, anything a loss could
+    # have decided is BLOCKED, never PASS.
+    rec = integrity.assess_receiver(receiver)
+    disp = integrity.assess_display(display)
+    receiver_state = not rec["complete"] or rec["state_lost"]
+    receiver_media = not rec["complete"] or rec["media_lost"]
+    display_lost = not disp["complete"]
+    # Wireless IDR lines may be timed by the sidecar instead (#158); a line with
+    # neither time is unstamped on either transport.
+    unstamped = [x["event"].get("event") for x in stamped if integrity.emit_ns(x["event"]) is None
+                 and not (wireless and type(x.get("observed_ns")) is int)]
+    sidecar_issue = None
+    if sidecar is None:
+        sidecar_issue = "idr_sidecar_missing"
+    else:
+        raw = {json.dumps(x["event"], sort_keys=True) for x in stamped}
+        if any(json.dumps(x.get("event"), sort_keys=True) not in raw for x in sidecar
+               if str((x.get("event") or {}).get("event", "")).startswith("idr_")):
+            sidecar_issue = "idr_sidecar_mismatch"  # the runner saw an IDR line the log lacks
+    by_name = {c["name"]: c for c in criteria}
+    tainted: dict[str, str] = {}
+    fps = by_name["painted_fps_per_window"]
+    # Lost paints can only lower fps (a PASS stands); a lost profile only
+    # removes the criterion's input.
+    if fps["passed"] is False and (display_lost or (profile is None and receiver_state)):
+        tainted["painted_fps_per_window"] = "display_log_incomplete" if display_lost else "receiver_state_log_lost"
+    # A lost request or recovery can open or close an episode: either way. A
+    # missing sidecar only removes the runner's own copy: with complete,
+    # stamped logs a confirmed episode stays FAIL (#90 review 5). A mismatch
+    # means the log lacks an IDR record the runner saw, which could close an
+    # episode early, so it taints a failure too.
+    sidecar_taint = sidecar_issue
+    if sidecar_issue == "idr_sidecar_missing" and by_name["waiting_idr_max"]["passed"] is False:
+        sidecar_taint = None
+    if receiver_state or display_lost or unstamped or sidecar_taint:
+        tainted["waiting_idr_max"] = ("idr_events_unstamped" if unstamped else
+                                      sidecar_taint if sidecar_taint else
+                                      "display_log_incomplete" if display_lost else "receiver_state_log_lost")
+    # An observed disconnect or terminal error is confirmed; absence is not.
+    drop = by_name["no_session_drop"]
+    if drop["passed"] is not False and receiver_state:
+        tainted["no_session_drop"] = "receiver_state_log_lost"
+    elif drop["passed"] is not False and wireless and sidecar is None:
+        # Wireless re-admission evidence lives only in the sidecar.
+        tainted["no_session_drop"] = "idr_sidecar_missing"
+    # Pairing a subset of slots or frames can move the signed contract either way.
+    if receiver_media or display_lost:
+        tainted["av_signed_contract"] = "media_telemetry_lost" if receiver_media else "display_log_incomplete"
+    if anchor_issue:
+        # Without the source-stamped activation the window itself is unknown.
+        for name in ("painted_fps_per_window", "waiting_idr_max", "av_signed_contract"):
+            tainted[name] = anchor_issue
+    confirmed_fail = [c["name"] for c in criteria if c["passed"] is False and c["name"] not in tainted]
+    blocked_on = None
+    if confirmed_fail:
+        verdict = "FAIL"
+    elif tainted:
+        verdict = "BLOCKED"
+        blocked_on = ",".join(f"{name}:{why}" for name, why in sorted(tainted.items()))
+    else:
+        verdict = "PASS"
     failure = None
-    # PASS needs a receiver that exited 0. A missing or null exit code means the
-    # run cannot show the receiver ended cleanly, so it never passes (#163 review).
+    # PASS needs a receiver that exited 0 (#163 review). A nonzero exit or a
+    # latched stdout logger error (sink failure, pending_lossless overflow) is a
+    # confirmed receiver failure that no lost record could have produced or
+    # excused, so it is FAIL even where log loss left criteria BLOCKED. A missing
+    # or null exit code only means the run cannot show a clean end: it never
+    # passes (FAIL), but it does not override a BLOCKED verdict.
     receiver_exit = run.get("receiver_exit")
+    confirmed_receiver_failure = False
     if type(receiver_exit) is not int or receiver_exit != 0:
-        if verdict == "PASS":
-            verdict = "FAIL"
         failure = f"receiver_exit_{'missing' if receiver_exit is None else receiver_exit}"
+        confirmed_receiver_failure = type(receiver_exit) is int
     elif run.get("logger_error"):
-        if verdict == "PASS":
-            verdict = "FAIL"
         failure = run["logger_error"]
+        confirmed_receiver_failure = True
+    if failure and (verdict == "PASS" or (verdict == "BLOCKED" and confirmed_receiver_failure)):
+        verdict = "FAIL"
+        blocked_on = None
+    for c in criteria:
+        if c["name"] in tainted:
+            c["inconclusive"] = tainted[c["name"]]
     seconds = (min(cutoff, stopped_ns or cutoff) - start_ns) / 1e9 if start_ns and cutoff else None
     return {
         "verdict": verdict,
+        **({"blocked_on": blocked_on} if blocked_on else {}),
         **({"failure": failure} if failure else {}),
+        "log_integrity": {"receiver": rec, "display": disp, "idr_unstamped": len(unstamped),
+                          "idr_sidecar": sidecar_issue or "consistent",
+                          "active_anchor": anchor_issue or "emit_ns"},
         "criteria": criteria,
         "negotiated_profile": profile and {k: profile.get(k) for k in ("width", "height", "fps", "codec")},
         "measured": {
@@ -361,8 +508,8 @@ def analyze(receiver: list[dict], display: list[dict], stamped: list[dict], run:
                             if seconds else None),
             "painted_fps_windows": windows,
             "idr_event_counts": {name: sum(1 for x in stamped if x["event"].get("event") == name)
-                                 for name in ("idr_requested", "idr_escalated", "idr_recovered",
-                                              "idr_transition_failed")},
+                                 for name in ("idr_wait_started", "idr_requested", "idr_escalated",
+                                              "idr_recovered", "idr_transition_failed")},
             "video_dropped": [e for e in receiver if e.get("event") == "video_dropped"][-10:],
         },
     }
@@ -375,8 +522,9 @@ def analyze_dir(out: Path) -> dict:
             if line.startswith("stdout_log errno="):
                 run = {**run, "logger_error": line.strip()}
                 break
+    sidecar = out / "idr-events.jsonl"
     return analyze(read_jsonl(out / "receiver.log"), read_jsonl(out / "display.log"),
-                   read_jsonl(out / "idr-events.jsonl"), run)
+                   read_jsonl(sidecar) if sidecar.is_file() else None, run)
 
 
 # ---- Soak gate --------------------------------------------------------------

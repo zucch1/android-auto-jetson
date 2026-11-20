@@ -146,7 +146,7 @@ public:
             return false;
         }
         const auto now = now_locked();
-        idr_coordinator_.begin_wait(now);
+        begin_idr_wait_locked(now, reason);
         return dispatch_idr_request_locked(lock, now, reason);
     }
 
@@ -280,16 +280,15 @@ public:
     void install(ipc::VideoProducer producer) {
         std::lock_guard lock(mutex_);
         clear_pending_locked(/*abandon_partial=*/false, "consumer_replaced");
-        // send_started fires once per access unit the phone sends (audit L13), so
-        // it is media telemetry: rate-limited and never waiting for the sink. Any
-        // other endpoint event is a lifecycle record and stays lossless.
+        // Endpoint events fire once per access unit (audit L13), so they are media
+        // telemetry: rate-limited and never waiting for the sink. The producer only
+        // observes send_started; receive_completed is a consumer-side kind.
         producer.set_observer([this](const ipc::VideoEndpoint& event) {
             auto line = ipc::video_endpoint_json(event);
-            if (event.kind == ipc::VideoEndpointKind::send_started) {
-                media("video_ipc_send", line);
-            } else {
-                log_(line);
-            }
+            // Both endpoint kinds are per access unit: never the lifecycle sink.
+            media(event.kind == ipc::VideoEndpointKind::send_started ? "video_ipc_send"
+                                                                     : "video_ipc_receive",
+                  line);
         });
         if (producer_.has_value()) {
             producer_->close();
@@ -534,10 +533,16 @@ private:
     }
 
     void emit_drops(bool final) {
-        if (units_ + dropped_ == 0 || exported_observations_ == units_ + dropped_) {
+        const auto observations = units_ + dropped_;
+        // The final cumulative record goes to the lifecycle sink once per count,
+        // even when a periodic record with the same count went to the (lossy)
+        // media sink and may have been dropped (#90 review P2).
+        const auto exported = final ? final_observations_ : exported_observations_;
+        if (observations == 0 || exported == observations) {
             return;
         }
-        exported_observations_ = units_ + dropped_;
+        exported_observations_ = observations;
+        if (final) { final_observations_ = observations; }
         const auto line = "{\"event\":\"decode_stats\",\"frame_drops\":" + std::to_string(dropped_) + "}";
         if (final) {
             log_(line);
@@ -588,12 +593,21 @@ private:
             return {};
         }
         const auto now = now_locked();
-        idr_coordinator_.begin_wait(now);
+        begin_idr_wait_locked(now, reason);
         const auto dispatched = dispatch_idr_request_locked(lock, now, reason);
         if (!dispatched && dispatched.error().code() == ErrorCode::channel_focus_restore_failed) {
             return dispatched.error();
         }
         return {};
+    }
+
+    // The wait transition is logged before any request (#90 review 5), so a
+    // producer stall where every request fails still opens an episode.
+    void begin_idr_wait_locked(std::chrono::steady_clock::time_point now, std::string_view reason) {
+        if (!idr_coordinator_.waiting()) {
+            log_(ipc::idr_wait_started_json("producer", reason));
+        }
+        idr_coordinator_.begin_wait(now);
     }
 
     [[nodiscard]] core::Result<bool> dispatch_idr_request_locked(
@@ -665,6 +679,7 @@ private:
     std::uint64_t last_drop_report_count_{};
     bool has_drop_report_{};
     std::uint64_t exported_observations_{};
+    std::uint64_t final_observations_{};
 };
 
 } // namespace aa::wired_receiver

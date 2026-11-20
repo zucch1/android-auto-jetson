@@ -97,13 +97,33 @@ void log_line(const std::string &json) {
 void log_media(std::string_view kind, const std::string &json) {
     auto *writer = aa::wired_receiver::active_stdout_log.load();
     if (!writer) { std::abort(); }
-    if (writer->submit_media(kind, json)) { g_running.store(false); }
+    if (writer->submit_media(kind, aa::wired_receiver::with_emit_ns(json))) { g_running.store(false); }
 }
 
+// Every non-blocking record carries its emission time ("emit_ns", CLOCK_MONOTONIC
+// at the source, #90 review): a record the log delivers late still tells a
+// timing gate when it happened, never when it reached stdout.
+
+// Steady-state runtime and control records that no gate keys state on (#90):
+// never blocks a media, audio, or control thread on a full queue behind a
+// stalled stdout sink. Dropped records are counted and reported in-band as
+// runtime_log_dropped.
+void log_runtime(const std::string &json) {
+    auto *writer = aa::wired_receiver::active_stdout_log.load();
+    if (!writer) { std::abort(); }
+    if (writer->submit_runtime(aa::wired_receiver::with_emit_ns(json))) { g_running.store(false); }
+}
+
+// One-shot lifecycle / state-transition / control records that the projection
+// collector and drive smoke key state on (`active`, runtime `err`,
+// audio_stall_bypass begin/end, sink reopen, idr_*): never blocks the caller and
+// is never dropped for backpressure. A full queue parks the record in the log's
+// single pending_lossless FIFO; overflowing it latches ENOBUFS and stops the
+// receiver (StdoutLog::submit_pending).
 void log_line_nonblocking(const std::string &json) {
     auto *writer = aa::wired_receiver::active_stdout_log.load();
     if (!writer) { std::abort(); }
-    if (writer->submit_pending(json)) { g_running.store(false); }
+    if (writer->submit_pending(aa::wired_receiver::with_emit_ns(json))) { g_running.store(false); }
 }
 
 aa::audio::AudioTelemetryCallbacks wired_telemetry() {
@@ -135,8 +155,17 @@ using aa::app::poll_error_json;
 
 class StdoutDiagnostics final : public aa::diagnostics::DiagnosticSink {
   public:
+    // Only periodic transport_stats is droppable. Every other diag kind is a
+    // rare state record a gate reads (session_state_changed and reconnect for
+    // no_session_drop and recovery-QA dip/retry attribution, decode_stats,
+    // pairing, capability, helper calls), so it goes through the lossless slot.
     void emit_json(std::string_view redacted_json) override {
-        log_line_nonblocking(aa::diagnostics::diag_event_json(redacted_json));
+        auto line = aa::diagnostics::diag_event_json(redacted_json);
+        if (redacted_json.starts_with("{\"kind\":\"transport_stats\"")) {
+            log_runtime(line);
+        } else {
+            log_line_nonblocking(line);
+        }
     }
 };
 
@@ -787,9 +816,8 @@ int receiver_main(int argc, char **argv) {
         const bool has_selection = session.selected_video_profile().has_value();
         if (selection_watchdog.check(session_ready, has_selection,
                                      std::chrono::steady_clock::now())) {
-            log_media("video_selection_timeout",
-                      aa::ipc::video_selection_timeout_json(
-                          aa::ipc::kVideoSelectionWarningTimeout, video_profiles.size()));
+            log_line_nonblocking(aa::ipc::video_selection_timeout_json(
+                aa::ipc::kVideoSelectionWarningTimeout, video_profiles.size()));
         }
         return true;
     };
@@ -824,7 +852,7 @@ int receiver_main(int argc, char **argv) {
             }
             if (relink) {
                 if (!pinned(relink.value().phone)) {
-                    log_line(std::string{kSerialMismatch});
+                    log_line_nonblocking(std::string{kSerialMismatch});
                     return aa::Error{aa::ErrorCode::transport_unauthorized_peer};
                 }
                 if (relink.value().phone.key != link->phone.key) {
@@ -949,8 +977,8 @@ int receiver_main(int argc, char **argv) {
                     if (service_control()) {
                         break;
                     }
-                    log_line(std::string{"{\"event\":\"input_forwarded\",\"ok\":\""} +
-                             (outcome.has_value() ? "true" : "false") + "\"}");
+                    log_runtime(std::string{"{\"event\":\"input_forwarded\",\"ok\":\""} +
+                                (outcome.has_value() ? "true" : "false") + "\"}");
                 }
             }
             if (!g_running.load()) {
@@ -1016,14 +1044,17 @@ int receiver_main(int argc, char **argv) {
                                              std::chrono::steady_clock::now() - started)
                                              .count();
                     active_ms.store(elapsed);
-                    log_line("{\"event\":\"active\",\"startup_ms\":" + std::to_string(elapsed) +
-                             "}");
+                    log_line_nonblocking("{\"event\":\"active\",\"startup_ms\":" +
+                                         std::to_string(elapsed) + "}");
                 }
                 if (!service_video_recovery()) {
                     break;
                 }
             }
         }
+        // Bounded wait for an in-flight ForgetPhone write, never under the
+        // session mutex (the input thread and video recovery take it).
+        control.drain_persistence();
         std::lock_guard lock(session_mutex);
         audio_sink.stop();
         (void)control.finish();
@@ -1048,7 +1079,7 @@ int receiver_main(int argc, char **argv) {
             if (!endpoint) {
                 continue;
             }
-            log_line("{\"event\":\"input_accepted\"}");
+            log_line_nonblocking("{\"event\":\"input_accepted\"}");
             while (g_running.load()) {
                 auto event = endpoint.value().receive(Milliseconds{200});
                 if (!event) {
@@ -1099,7 +1130,7 @@ int receiver_main(int argc, char **argv) {
             if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
                 break;
             }
-            log_line("{\"event\":\"video_accepted\"}");
+            log_line_nonblocking("{\"event\":\"video_accepted\"}");
             video_outlet.install(std::move(producer.value()));
             {
                 std::lock_guard gate_lock(gate_mutex);

@@ -554,7 +554,7 @@ root = pathlib.Path(sys.argv[1])
 collector = (root / "aa_projection_collect.py").read_text()
 print("import sys, types")
 for name in ("aa_measurement_coverage", "aa_video_measurements", "aa_build_guard", "aa_moving_map",
-             "aa_transport"):
+             "aa_log_integrity", "aa_transport"):
     source = (root / (name + ".py")).read_text()
     print("module = types.ModuleType(" + repr(name) + ")")
     print("sys.modules[module.__name__] = module")

@@ -32,6 +32,9 @@ import aa_drive_smoke as smoke  # noqa: E402
 
 S = 10**9
 ACTIVE = 1_000 * S
+LOG_COMPLETE = {"event": "log_complete", "runtime_dropped": 0, "state_overflow": 0,
+                "media_rate_limited": 0, "media_backpressure": 0, "shutdown_dropped": 0,
+                "max_delivery_lag_ms": 1}
 
 
 class Run:
@@ -42,7 +45,7 @@ class Run:
         self.fps, self.duration = fps, duration
         self.first = ACTIVE + 2 * S
         self.receiver = ["Opening in BLOCKING MODE ",
-                         {"event": "ready"}, {"event": "active"},
+                         {"event": "ready"}, {"event": "active", "emit_ns": ACTIVE},
                          {"event": "video_profile", "width": width, "height": height, "fps": fps,
                           "codec": "h264"}]
         self.display: list = [{"event": "ready"}]
@@ -57,21 +60,27 @@ class Run:
         # Media plays for the whole drive by default with a constant +12 ms skew.
         self.media_on, self.skew_ms = True, (lambda at_s: 12.0)
         self.audio_from_s, self.audio_until_s = -1.0, None
+        # Both writers prove their logs complete unless a case says otherwise.
+        self.receiver_tail: list = [LOG_COMPLETE]
+        self.display_tail: list = [{"event": "telemetry_complete"}]
+        self.drop_audio_at_s: float | None = None
+        self.write_sidecar = True
 
     def freeze(self, at_s: float, seconds: float) -> "Run":
         lo, hi = self.first + int(at_s * S), self.first + int((at_s + seconds) * S)
         self.paints = [t for t in self.paints if not lo <= t < hi]
         return self
 
-    def idr(self, source: str, at_s: float, seconds: float | None, latency_ms: int | None = None):
+    def idr(self, source: str, at_s: float, seconds: float | None, latency_ms: int | None = None,
+            delay_ns: int = 0):
         start = self.first + int(at_s * S)
-        self.stamped.append({"observed_ns": start, "event": {
-            "event": "idr_requested", "source": source, "reason": "waiting_idr"}})
+        self.stamped.append({"observed_ns": start + delay_ns, "event": {
+            "event": "idr_requested", "source": source, "reason": "waiting_idr", "emit_ns": start}})
         if seconds is not None:
-            self.stamped.append({"observed_ns": start + int(seconds * S), "event": {
+            self.stamped.append({"observed_ns": start + int(seconds * S) + delay_ns, "event": {
                 "event": "idr_recovered", "source": source,
                 "latency_ms": latency_ms if latency_ms is not None else int(seconds * 1000),
-                "episode_requests": 1, "total_requests": 1}})
+                "episode_requests": 1, "total_requests": 1, "emit_ns": start + int(seconds * S)}})
         return self
 
     def no_media(self) -> "Run":
@@ -101,16 +110,28 @@ class Run:
             start = self.first + int(self.audio_from_s * S)
             stop = (self.first + int(self.audio_until_s * S) if self.audio_until_s is not None
                     else self.paints[-1])
+            drop_at = (self.first + int(self.drop_audio_at_s * S)
+                       if self.drop_audio_at_s is not None else None)
             while start < stop:
-                receiver.append({"event": "audio_write_completed", "scheduled_ns": start,
-                                 "scheduled_end_ns": start + slot, "completed_ns": start,
-                                 "presented_ns": start + 10_000_000})
+                if drop_at is None or not start <= drop_at < start + slot:
+                    receiver.append({"event": "audio_write_completed", "scheduled_ns": start,
+                                     "scheduled_end_ns": start + slot, "completed_ns": start,
+                                     "presented_ns": start + 10_000_000})
                 start += slot
+        # The raw logs carry every IDR line (the runner writes each line to its
+        # log and, as it arrives, to the sidecar).
+        for item in sorted(self.stamped, key=lambda x: x["observed_ns"]):
+            event = item["event"]
+            (receiver if event.get("source") == "producer" else display).append(event)
+        receiver += self.receiver_tail
+        display += self.display_tail
         for name, lines in (("receiver.log", receiver), ("display.log", display)):
             (directory / name).write_text("\n".join(
                 line if isinstance(line, str) else json.dumps(line, separators=(",", ":"))
                 for line in lines) + "\n")
-        (directory / "idr-events.jsonl").write_text("".join(json.dumps(x) + "\n" for x in self.stamped))
+        if self.write_sidecar:
+            (directory / "idr-events.jsonl").write_text(
+                "".join(json.dumps(x) + "\n" for x in self.stamped))
         (directory / "run.json").write_text(json.dumps(self.run))
         return directory
 
@@ -136,6 +157,140 @@ class AnalyzerTests(unittest.TestCase):
         self.assertTrue(av["passed"], av)
         self.assertAlmostEqual(av["coverage"], 1.0, places=3)
         self.assertAlmostEqual(av["signed_p50_ms"], 12.0, places=3)
+
+    def test_dropped_audio_slot_cannot_turn_an_av_fail_into_a_pass(self) -> None:
+        # Review probe (#90): a 102 ms excursion fails the signed contract with
+        # the full stream...
+        def spike(at_s: float) -> float:
+            return 102.0 if 15.0 <= at_s < 15.04 else 12.0
+        full = Run(duration=30).skew(spike)
+        self.assertEqual(self.analyze(full)["verdict"], "FAIL")
+        self.assertFalse(criterion(self.analyze(full), "av_signed_contract")["passed"])
+        # ...and removing only the offending audio slot, with the receiver's
+        # real-format media-drop summary, must never read as a PASS.
+        probe = Run(duration=30).skew(spike)
+        probe.drop_audio_at_s = 15.02
+        probe.receiver_tail = [{"event": "media_telemetry_dropped", "rate_limited": 0, "backpressure": 1},
+                               dict(LOG_COMPLETE, media_backpressure=1)]
+        result = self.analyze(probe)
+        self.assertEqual(result["verdict"], "BLOCKED", result["criteria"])
+        self.assertIn("av_signed_contract:media_telemetry_lost", result["blocked_on"])
+
+    def test_delayed_active_cannot_clip_an_idr_episode(self) -> None:
+        # Review 4 probe (#90): a source-stamped 2 s IDR episode right after
+        # first paint FAILs with a prompt activation...
+        prompt = Run(duration=30).idr("consumer", 0.0, 2.0)
+        self.assertEqual(self.analyze(prompt)["verdict"], "FAIL")
+        # ...and the same episode with the `active` line delivered 4 s late
+        # (the runner's arrival anchor) is still a 2 s FAIL: the window is
+        # anchored at the record's own emit_ns.
+        late = Run(duration=30).idr("consumer", 0.0, 2.0)
+        late.run["active_ns"] = ACTIVE + 4 * S
+        result = self.analyze(late)
+        self.assertEqual(result["verdict"], "FAIL", result["criteria"])
+        idr = criterion(result, "waiting_idr_max")
+        self.assertFalse(idr["passed"])
+        self.assertAlmostEqual(idr["longest_s"], 2.0, places=3)
+
+    def test_unstamped_active_is_blocked(self) -> None:
+        run = Run(duration=30)
+        run.receiver[2] = {"event": "active"}
+        result = self.analyze(run)
+        self.assertEqual(result["verdict"], "BLOCKED", result["criteria"])
+        self.assertIn("waiting_idr_max:active_unstamped", result["blocked_on"])
+
+    def test_missing_idr_sidecar_is_blocked(self) -> None:
+        # Review 4 probe (#90): removing only idr-events.jsonl (both IDR events
+        # and the completion markers stay in the logs) must never PASS...
+        run = Run(duration=30).idr("consumer", 5.0, 0.5)
+        run.write_sidecar = False
+        result = self.analyze(run)
+        self.assertEqual(result["verdict"], "BLOCKED", result["criteria"])
+        self.assertIn("waiting_idr_max:idr_sidecar_missing", result["blocked_on"])
+        # ...and a missing sidecar cannot hide a 2 s episode the logs show.
+        failing = Run(duration=30).idr("consumer", 5.0, 2.0)
+        failing.write_sidecar = False
+        self.assertNotEqual(self.analyze(failing)["verdict"], "PASS")
+
+    def test_missing_sidecar_keeps_a_confirmed_idr_failure_failed(self) -> None:
+        # Review 5 (#90): complete raw logs confirm a 2.5 s recovered episode.
+        # The sidecar only adds what the runner saw; its absence cannot shorten
+        # an episode both complete logs show, so the failure stays FAIL.
+        failing = Run(duration=30).idr("producer", 5.0, 2.5)
+        failing.write_sidecar = False
+        result = self.analyze(failing)
+        self.assertEqual(result["verdict"], "FAIL", result.get("blocked_on"))
+        self.assertIs(criterion(result, "waiting_idr_max")["passed"], False)
+        self.assertNotIn("inconclusive", criterion(result, "waiting_idr_max"))
+
+    def test_unresolved_wait_with_every_request_failed_fails(self) -> None:
+        # The consumer logs the wait transition itself (idr_wait_started); no
+        # request ever succeeded and the wait never recovered.
+        run = Run(duration=30)
+        start = run.first + 10 * S
+        run.stamped.append({"observed_ns": start, "event": {
+            "event": "idr_wait_started", "source": "consumer", "reason": "decode_awaiting_idr",
+            "emit_ns": start}})
+        result = self.analyze(run)
+        self.assertEqual(result["verdict"], "FAIL", result["criteria"])
+        self.assertFalse(criterion(result, "waiting_idr_max")["passed"])
+
+    def test_delayed_idr_records_are_timed_at_emission(self) -> None:
+        # Given a 2 s producer episode inside the drive whose two records both
+        # reached the runner only after the cutoff (stdout backpressure).
+        run = Run(duration=30)
+        cutoff_s = 30.5
+        run.idr("producer", 26, 2, delay_ns=int((cutoff_s + 3 - 26) * S))
+        result = self.analyze(run)
+        idr = criterion(result, "waiting_idr_max")
+        # Then the episode still counts at its emission times: 2 s > 1 s limit.
+        self.assertFalse(idr["passed"], idr)
+        self.assertAlmostEqual(idr["longest_s"], 2.0, places=3)
+        self.assertEqual(result["verdict"], "FAIL")
+
+    def test_unstamped_idr_records_are_inconclusive(self) -> None:
+        run = Run(duration=30)
+        run.idr("producer", 10, 0.1)
+        for item in run.stamped:
+            del item["event"]["emit_ns"]
+        result = self.analyze(run)
+        self.assertEqual(result["verdict"], "BLOCKED")
+        self.assertIn("waiting_idr_max:idr_events_unstamped", result["blocked_on"])
+
+    def test_logs_without_completion_proof_never_pass(self) -> None:
+        for tail in ("receiver", "display"):
+            with self.subTest(missing=tail):
+                run = Run(duration=30)
+                setattr(run, tail + "_tail", [])
+                self.assertEqual(self.analyze(run)["verdict"], "BLOCKED")
+
+    def test_confirmed_failure_survives_unrelated_loss(self) -> None:
+        # Given a painted freeze (display evidence) and lost receiver media.
+        run = Run(duration=60).freeze(30, 1.2)
+        run.receiver_tail = [dict(LOG_COMPLETE, media_backpressure=3)]
+        result = self.analyze(run)
+        # Then the confirmed fps failure stays FAIL, not a downgraded BLOCKED.
+        self.assertEqual(result["verdict"], "FAIL", result["criteria"])
+
+    def test_lost_receiver_state_records_block_instead_of_judging(self) -> None:
+        # Given a run that would PASS, but whose receiver lost state records
+        # under a stalled stdout (#90 review: video_profile, idr_*, and
+        # session_state_changed feed the criteria).
+        run = Run()
+        run.receiver.append({"event": "runtime_log_dropped", "backpressure": 4, "state_overflow": 1})
+        result = self.analyze(run)
+        # Then neither PASS nor FAIL is evidenced: BLOCKED.
+        self.assertEqual(result["verdict"], "BLOCKED", result)
+        self.assertIn("no_session_drop:receiver_state_log_lost", result["blocked_on"])
+        self.assertIn("waiting_idr_max:receiver_state_log_lost", result["blocked_on"])
+
+    def test_droppable_runtime_loss_alone_keeps_the_verdict(self) -> None:
+        run = Run()
+        run.receiver.append({"event": "runtime_log_dropped", "backpressure": 4, "state_overflow": 0})
+        run.receiver_tail = [dict(LOG_COMPLETE, runtime_dropped=4)]
+        result = self.analyze(run)
+        self.assertEqual(result["verdict"], "PASS", result["criteria"])
+        self.assertFalse(result["log_integrity"]["receiver"]["state_lost"])
 
     def test_one_second_freeze_fails_its_window(self) -> None:
         # Given a 1.2 s paint gap 305 s into the drive (the #134 shape).
@@ -317,9 +472,9 @@ class AnalyzerTests(unittest.TestCase):
         with_latency, without = Run(), Run()
         with_latency.stamped.append({"observed_ns": with_latency.first + 3 * S, "event": {
             "event": "idr_recovered", "source": "consumer", "latency_ms": 1500,
-            "episode_requests": 0, "total_requests": 0}})
+            "episode_requests": 0, "total_requests": 0, "emit_ns": with_latency.first + 3 * S}})
         without.stamped.append({"observed_ns": without.first + 3 * S, "event": {
-            "event": "idr_recovered", "source": "consumer"}})
+            "event": "idr_recovered", "source": "consumer", "emit_ns": without.first + 3 * S}})
         # Then both fail: the first by its own latency, the second as open since active.
         first = criterion(self.analyze(with_latency), "waiting_idr_max")
         self.assertFalse(first["passed"])
@@ -333,9 +488,11 @@ class AnalyzerTests(unittest.TestCase):
         run = Run()
         if request_s is not None:
             run.stamped.append({"observed_ns": ACTIVE + int(request_s * S), "event": {
-                "event": "idr_requested", "source": "consumer", "reason": "video_consumer_waiting_idr"}})
+                "event": "idr_requested", "source": "consumer", "reason": "video_consumer_waiting_idr",
+                "emit_ns": ACTIVE + int(request_s * S)}})
         run.stamped.append({"observed_ns": ACTIVE + int(recovered_s * S), "event": {
-            "event": "idr_recovered", "source": "consumer", **fields}})
+            "event": "idr_recovered", "source": "consumer", **fields,
+            "emit_ns": ACTIVE + int(recovered_s * S)}})
         return criterion(self.analyze(run), "waiting_idr_max")
 
     def test_unusable_latency_starts_at_active_even_with_a_request(self) -> None:
@@ -769,7 +926,12 @@ def stop(*_):
         print("stdout_log errno=105", flush=True)
         sys.exit(0)
     if overflow_mode:
+        # A latched logger error never writes log_complete and exits nonzero.
         sys.exit(1)
+    # Like the real receiver: a clean stop drains the log and exits 0.
+    print('{"event":"stopping","duration_ms":0}', flush=True)
+    print('{"event":"log_complete","runtime_dropped":0,"state_overflow":0,"media_rate_limited":0,'
+          '"media_backpressure":0,"shutdown_dropped":0,"max_delivery_lag_ms":0}', flush=True)
     sys.exit(0)
 signal.signal(signal.SIGTERM, stop)
 grandchild = subprocess.Popen(["sleep", "300"])
@@ -777,7 +939,11 @@ with open(os.path.join(directory, "receiver.pids"), "w") as handle:
     handle.write(f"{os.getpid()} {grandchild.pid}")
 print('{"event":"ready"}', flush=True)
 time.sleep(0.5)
-print('{"event":"active"}', flush=True)
+if os.environ.get("FAKE_RECEIVER_HEALTHY_STREAM"):
+    # Like the real receiver (#90): the activation anchor carries its emission time.
+    print('{"event":"active","emit_ns":%d}' % time.monotonic_ns(), flush=True)
+else:
+    print('{"event":"active"}', flush=True)
 print('{"event":"video_profile","width":1280,"height":720,"fps":30,"codec":"h264"}', flush=True)
 if os.environ.get("FAKE_RECEIVER_HEALTHY_STREAM"):
     start = time.monotonic_ns()
@@ -808,10 +974,15 @@ time.sleep(300)
 """
 
 FAKE_DISPLAY = """#!/usr/bin/env python3
-import os, sys, threading, time
+import os, signal, sys, threading, time
 with open(os.path.join(os.environ["FAKE_DIR"], "display.pids"), "w") as handle:
     handle.write(str(os.getpid()))
 if os.environ.get("FAKE_DISPLAY_HEALTHY_STREAM"):
+    # Like the real display (#90): a runner stop writes the completion record last.
+    def stop(*_):
+        print('{"event":"telemetry_complete"}', flush=True)
+        os._exit(0)
+    signal.signal(signal.SIGTERM, stop)
     time.sleep(0.55)
 t0 = time.monotonic_ns()
 print('{"event":"video_presented","frame":0,"scheduled_ns":%d,"completed_ns":%d,"count":1}'

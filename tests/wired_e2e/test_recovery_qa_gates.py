@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -50,13 +51,15 @@ all_args="$*"
 state="${FAKE_SSH_STATE}"
 mkdir -p "$state"
 stimulus=0
+# The real receiver stamps every record with emit_ns (target CLOCK_MONOTONIC).
+now_ns() { python3 -c 'import time; print(time.monotonic_ns())'; }
 case "$cmd" in
     *'kill 4242'*|*'kill 4243'*|*unbind*|*'keyevent 26'*|*'am force-stop'*|*'--no-bus --duration-ms'*) stimulus=1 ;;
 esac
 if (( stimulus )) && [ ! -f "$state/stimulus" ]; then
     touch "$state/stimulus"
     if [ "${FAKE_REAL_LOG:-0}" = 1 ]; then
-        printf '%s\n' '{"kind":"reconnect","phone_id":"id-approved"}' >> "$state/receiver.log"
+        printf '{"kind":"reconnect","phone_id":"id-approved","emit_ns":%s}\n' "$(now_ns)" >> "$state/receiver.log"
     fi
     [ -z "${FAKE_FIRST_DELAY:-}" ] || sleep "$FAKE_FIRST_DELAY"
 fi
@@ -100,15 +103,23 @@ if [ "${FAKE_REAL_LOG:-0}" = 1 ]; then
             printf '%s\n' '{"event":"diag","phone_id":"id-approved"}' > "$state/receiver.log" ;;
         *'"event":"status"'*)
             if [ ! -f "$state/stimulus" ]; then
-                printf '%s\n' '{"event":"media_timing"}' '{"event":"audio_chunks"}' \
-                    '{"event":"input_forwarded","ok":"true"}' >> "$state/receiver.log"
+                t="$(now_ns)"
+                printf '{"event":"media_timing","emit_ns":%s}\n{"event":"audio_chunks","emit_ns":%s}\n{"event":"input_forwarded","ok":"true","emit_ns":%s}\n' \
+                    "$t" "$t" "$t" >> "$state/receiver.log"
             fi ;;
         *"key a press"*)
+            t="$(now_ns)"
             if [ "${FAKE_FRESH_AUDIO:-1}" = 1 ]; then
-                printf '%s\n' '{"event":"media_timing"}' '{"event":"audio_chunks"}' >> "$state/receiver.log"
+                printf '{"event":"media_timing","emit_ns":%s}\n{"event":"audio_chunks","emit_ns":%s}\n' "$t" "$t" >> "$state/receiver.log"
             fi
             if [ "${FAKE_FRESH_INPUT:-1}" = 1 ]; then
-                printf '%s\n' '{"event":"input_forwarded","ok":"true"}' >> "$state/receiver.log"
+                printf '{"event":"input_forwarded","ok":"true","emit_ns":%s}\n' "$t" >> "$state/receiver.log"
+            fi
+            if [ "${FAKE_STALE_RELEASE:-0}" = 1 ]; then
+                # Pre-stimulus records that stdout backpressure released only
+                # now, after the media boundary (#90 review 4 probe).
+                printf '%s\n' '{"event":"media_timing","emit_ns":1}' '{"event":"audio_chunks","emit_ns":1}' \
+                    '{"event":"input_forwarded","ok":"true","emit_ns":1}' >> "$state/receiver.log"
             fi ;;
     esac
     case "$cmd" in
@@ -127,6 +138,36 @@ if [ "${FAKE_REAL_LOG:-0}" = 1 ]; then
     esac
 fi
 case "$cmd" in
+    *runtime_log_dropped*)
+        # The end-of-run log-integrity audit (#90 review 4): one section per
+        # manifest label (gen1, gen2, ..., attempt) the harness asked for.
+        # FAKE_LOG_AUDIT_<label> overrides one log; FAKE_LOG_AUDIT the rest.
+        # The last line of a section's records is its terminal record unless
+        # FAKE_LOG_LAST_<label> says otherwise; FAKE_LOG_MISSING names
+        # labels reported missing.
+        [ "${FAKE_LOG_AUDIT_RC:-0}" = 0 ] || exit "$FAKE_LOG_AUDIT_RC"
+        clean='{"event":"log_complete","runtime_dropped":0,"state_overflow":0,"media_rate_limited":0,"media_backpressure":0,"shutdown_dropped":0,"max_delivery_lag_ms":1}'
+        labels="$(printf '%s' "$cmd" | grep -oE '(gen[0-9]+|attempt):/tmp/' | cut -d: -f1 || true)"
+        if [ -z "$labels" ]; then
+            # A harness without a manifest (glob scan): one unframed section.
+            printf '%s\n' '### /tmp/aa-wired-receiver.log' "${FAKE_LOG_AUDIT:-$clean}"
+            [ -z "${FAKE_LOG_AUDIT_attempt:-}" ] ||
+                printf '%s\n' '### /tmp/aa-wired-receiver-attempt.log' "$FAKE_LOG_AUDIT_attempt"
+            echo '### end'
+            exit 0
+        fi
+        for label in $labels; do
+            echo "### $label"
+            if [[ " ${FAKE_LOG_MISSING:-} " == *" $label "* ]]; then echo '### missing'; continue; fi
+            override="FAKE_LOG_AUDIT_${label}"
+            records="${!override:-${FAKE_LOG_AUDIT:-$clean}}"
+            printf '%s\n' "$records"
+            last="FAKE_LOG_LAST_${label}"
+            echo '### last'
+            printf '%s\n' "${!last:-$(printf '%s\n' "$records" | tail -n 1)}"
+        done
+        echo '### end'
+        exit 0 ;;
     *idVendor*|*idProduct*) printf '%s' "${FAKE_PHONE:-04e8:6860}"; exit 0 ;;
     *"/sys/class/drm"*) printf '%s\n' "${FAKE_DISPLAY:-connected}"; exit 0 ;;
     *70-android-auto-receiver.rules*) printf '%s' "${FAKE_POLICY:-installed}"; exit 0 ;;
@@ -136,7 +177,17 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
     *'print $1'*) printf '%s\n' "${FAKE_ADB_LIST:-FAKEDEV1 FAKEDEV2}" | tr ' ' '\n'; exit 0 ;;
     *'adb shell'*) exit 0 ;;
     *'shell input keyevent'*|*'shell input swipe'*|*'shell am force-stop'*) exit "${FAKE_ADB_STIMULUS_RC:-0}" ;;
-    *'wc -c'*) printf '%s' "${FAKE_LOG_SIZE:-0}"; exit 0 ;;
+    *'wc -c'*)
+        # The boundary with the target clock; a size-only probe gets the size.
+        case "$cmd" in
+            *monotonic_ns*) printf 'boundary %s %s' "${FAKE_BOUNDARY_NS:-1}" "${FAKE_LOG_SIZE:-0}" ;;
+            *) printf '%s' "${FAKE_LOG_SIZE:-0}" ;;
+        esac
+        exit 0 ;;
+    *'time.monotonic_ns()'*)
+        # The target clock alone (a fresh log's boundary).
+        if [ "${FAKE_REAL_LOG:-0}" = 1 ]; then bash -c "$cmd"; exit $?; fi
+        printf '%s' "${FAKE_BOUNDARY_NS:-1}"; exit 0 ;;
     # Media-gate probes (N1): both probe commands contain their evidence token
     # AND `tail -c +`, so first-match case ordering decides which arm drives
     # them. The exact-shape arms MUST precede the raw-window tail arm (the
@@ -151,7 +202,10 @@ FAKEDEV2 device usb:1-2.3 product:fake model:FakeS9Edge device:fake transport_id
     *audio_chunks*) [ "${FAKE_AUDIO_CHUNKS:-1}" = "1" ] && exit 0 || exit 1 ;;
     *'input_forwarded'*) [ "${FAKE_INPUT_ANY:-0}" = "1" ] && exit 0 || exit 1 ;;
     *'tail -c +'*aa-wired-receiver-attempt.log*) printf '%s' "${FAKE_ATTEMPT_LOG:-}"; exit 0 ;;
-    *'tail -c +'*) printf '%s' "${FAKE_LOG_WINDOW:-}"; exit 0 ;;
+    # The window's JSON records carry the receiver's emit_ns (after the
+    # boundary unless FAKE_WINDOW_EMIT_NS says otherwise).
+    *'tail -c +'*) printf '%s' "${FAKE_LOG_WINDOW:-}" |
+        sed -E '/"emit_ns":/! s/\}$/,"emit_ns":'"${FAKE_WINDOW_EMIT_NS:-9}"'}/'; exit 0 ;;
     *aa-wired-receiver-attempt.log*) exit "${FAKE_ATTEMPT_RC:-3}" ;;
     *'retries'*)
         n="$(cat "${FAKE_SSH_STATE:-/tmp}/retries_n" 2>/dev/null || echo 0)"
@@ -308,6 +362,213 @@ class RecoveryQaGates(unittest.TestCase):
                 self.assertEqual(code, 0, doc)
                 self.assertEqual(doc["scenarios"][0]["frames_painted_baseline"], 5)
                 self.assertLess(doc["scenarios"][0]["recovery_ms"], 5000)
+
+    CLEAN = ('{"event":"log_complete","runtime_dropped":0,"state_overflow":0,'
+             '"media_rate_limited":0,"media_backpressure":0,"shutdown_dropped":0,'
+             '"max_delivery_lag_ms":1}')
+
+    def audit(self, **counts: int) -> str:
+        record = json.loads(self.CLEAN)
+        record.update(counts)
+        return json.dumps(record, separators=(",", ":"))
+
+    def test_lost_receiver_state_records_block_a_passing_recovery(self) -> None:
+        # Given: a recovery that passes on its evidence, but the receiver's log
+        # reports lost state records (#90 review: reconnect / err / idr).
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                    "FAKE_LOG_AUDIT": self.audit(runtime_dropped=1, state_overflow=1)}
+        code, doc = self.run_qa(["--only", self.recovery_scenarios[0]], **env)
+        # Then: the row and the run are BLOCKED (exit 3), never PASS.
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        self.assertTrue(doc["scenarios"][0]["detail"].startswith("receiver_state_log_lost"), doc)
+
+    def test_receiver_log_without_completion_proof_never_passes(self) -> None:
+        for env_extra in ({"FAKE_LOG_AUDIT": '{"event":"active"}'}, {"FAKE_LOG_AUDIT_RC": "1"}):
+            with self.subTest(**env_extra):
+                env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1"} | env_extra
+                code, doc = self.run_qa(["--only", self.recovery_scenarios[0]], **env)
+                self.assertEqual(code, 3, doc)
+                self.assertTrue(doc["scenarios"][0]["detail"].startswith("receiver_log_incomplete"), doc)
+
+    def test_lost_evidence_in_an_earlier_generation_still_blocks(self) -> None:
+        # Given: the first receiver generation lost state records and the
+        # restarted one is clean; the audit reads both.
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                    "FAKE_LOG_AUDIT_gen1": self.audit(runtime_dropped=1, state_overflow=1)}
+        code, doc = self.run_qa(["--only", "usb_unplug_replug,receiver_restart"], **env)
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        # Then: the row that ran on the first generation is BLOCKED...
+        self.assertEqual(code, 3, doc)
+        self.assertTrue(rows["usb_unplug_replug"]["detail"].startswith("receiver_state_log_lost"), doc)
+        # ...and the restart row, whose log evidence all came from the
+        # restarted generation (the dip is seen by PID), stands (#90 review 5).
+        self.assertEqual(rows["receiver_restart"]["status"], "PASS", doc)
+
+    # #90 review 5 P2: the unknown-phone row reads only its own admission
+    # attempt's log; loss in the live receiver's log cannot taint it.
+    def test_unknown_phone_is_judged_by_its_attempt_log_only(self) -> None:
+        env = self.passing_env() | {"FAKE_ADB_COUNT": "2",
+                                    "FAKE_LOG_AUDIT": self.audit(runtime_dropped=1, state_overflow=1,
+                                                                 max_delivery_lag_ms=900),
+                                    "FAKE_LOG_AUDIT_attempt": self.CLEAN}
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assertEqual(code, 0, doc)
+        self.assertEqual(doc["scenarios"][0]["status"], "PASS", doc)
+        # And: loss in the attempt's own log still blocks its PASS.
+        env["FAKE_LOG_AUDIT_attempt"] = self.audit(runtime_dropped=1, state_overflow=1)
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assertEqual(code, 3, doc)
+        self.assertTrue(doc["scenarios"][0]["detail"].startswith("receiver_state_log_lost"), doc)
+
+    # #90 review 5 P2: a rejection whose content failed the row (here it names
+    # the approved phone's port) is confirmed even when the row also ran past
+    # its deadline and the attempt's log was delivered late.
+    def test_confirmed_rejection_failure_past_the_deadline_survives_log_lag(self) -> None:
+        wrong_port = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                      '"phone_id":"id-second","port":"1-2.1"}')
+        # The attempt's log is read in time; the clock then passes the deadline
+        # before the row is recorded.
+        env = self.passing_env() | {"FAKE_ADB_COUNT": "2", "FAKE_TERMINAL_MS": "6000",
+                                    "FAKE_ATTEMPT_LOG": wrong_port,
+                                    "FAKE_LOG_AUDIT": self.audit(max_delivery_lag_ms=900)}
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["scenarios"][0]["status"], "FAILED", doc)
+        self.assertEqual(doc["scenarios"][0]["evidence"], "rejection+approved_port", doc)
+        self.assertEqual(doc["scenarios"][0]["detail"], "recovery_exceeded_budget", doc)
+        # While a passing rejection that arrived past the deadline is timed by
+        # the late log, so it is inconclusive rather than a confirmed miss.
+        env["FAKE_ATTEMPT_LOG"] = self.passing_env()["FAKE_ATTEMPT_LOG"]
+        code, doc = self.run_qa(["--only", "unknown_phone"], **env)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["scenarios"][0]["detail"], "receiver_log_late:recovery_exceeded_budget", doc)
+
+    def test_receiver_restart_archives_the_previous_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "ssh.log"
+            env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_SSH_LOG": str(log)}
+            self.run_qa(["--only", "receiver_restart"], **env)
+            logged = log.read_text(encoding="utf-8")
+        moves = re.findall(r"mv -f /tmp/aa-wired-receiver\.log (/tmp/aa-wired-receiver\.[0-9]+-[0-9]+-[0-9]+\.gen1\.log)",
+                           logged)
+        self.assertEqual(len(moves), 1, logged)
+        audit = [line for line in logged.splitlines() if "runtime_log_dropped" in line]
+        # The audit names every generation by number, from the manifest.
+        self.assertTrue(audit and f"gen1:{moves[0]}" in audit[-1] and
+                        "gen2:/tmp/aa-wired-receiver.log" in audit[-1], audit)
+        self.assertNotIn("gen*", audit[-1])
+
+    # #90 review 4 P1: a receiver generation missing from the audit (a failed
+    # archive rename, a deleted log) is incomplete, never silently skipped.
+    def test_missing_receiver_generation_blocks(self) -> None:
+        # A missing generation blocks every row that used it: the first row
+        # ran on gen1, and the restart row reads only the restarted gen2
+        # (#90 review 5 scoping).
+        for missing, row in (("gen1", "usb_unplug_replug"), ("gen2", "receiver_restart")):
+            with self.subTest(missing=missing):
+                env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                            "FAKE_LOG_MISSING": missing}
+                code, doc = self.run_qa(["--only", "usb_unplug_replug,receiver_restart"], **env)
+                rows = {r["name"]: r for r in doc["scenarios"]}
+                self.assertEqual(code, 3, doc)
+                self.assertTrue(rows[row]["detail"].startswith("receiver_log_incomplete"), doc)
+
+    # #90 review 4 P1: log_complete proves a log complete only as its single
+    # terminal record.
+    def test_completion_record_must_be_terminal(self) -> None:
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                    "FAKE_LOG_LAST_gen1": '{"event":"audio_chunks"}'}
+        code, doc = self.run_qa(["--only", self.recovery_scenarios[1]], **env)
+        self.assertEqual(code, 3, doc)
+        self.assertTrue(doc["scenarios"][0]["detail"].startswith("receiver_log_incomplete"), doc)
+
+    # #90 review 4 P1 probe: with clean counters, three stale records (emitted
+    # before the stimulus) that stdout released only after the media boundary
+    # must never authorize a recovery PASS.
+    def test_stale_records_released_after_the_boundary_never_pass(self) -> None:
+        for scenario in self.recovery_scenarios[:-1]:
+            with self.subTest(scenario=scenario):
+                env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                            "FAKE_FRESH_AUDIO": "0", "FAKE_FRESH_INPUT": "0",
+                                            "FAKE_STALE_RELEASE": "1"}
+                code, doc = self.run_qa(["--only", scenario], **env)
+                self.assertNotEqual(doc["scenarios"][0]["status"], "PASS", doc)
+                self.assertEqual(doc["scenarios"][0]["detail"], "no_media_evidence_after_recovery", doc)
+
+    # #90 review 4 P2: lag in a log a row never used cannot turn that row's
+    # confirmed deadline failure into BLOCKED.
+    def test_lag_in_another_generation_keeps_a_confirmed_budget_miss(self) -> None:
+        miss = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_MEDIA_DELAY": "4.1",
+                                     "EVIDENCE_WAIT_MS": "8000"}
+        # The lag is only in the separate admission attempt's log, which the
+        # consumer_restart row never read.
+        code, doc = self.run_qa(["--only", "consumer_restart,unknown_phone"], **miss,
+                                FAKE_ADB_COUNT="2",
+                                FAKE_LOG_AUDIT_attempt=self.audit(max_delivery_lag_ms=900))
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["consumer_restart"]["status"], "FAILED", doc)
+        self.assertEqual(rows["consumer_restart"]["detail"], "recovery_exceeded_budget", doc)
+
+    # #90 review 4 P2: a deadline decided by a D-Bus observation (the session
+    # never returned to projecting) is a confirmed miss; log lag cannot excuse it.
+    def test_dbus_observed_deadline_miss_survives_log_lag(self) -> None:
+        code, doc = self.run_qa(["--only", "consumer_restart"], FAKE_POST_STATE_DELAY="6",
+                                FAKE_FRAMES_BASE="5", FAKE_FRAMES_STEP="2",
+                                FAKE_LOG_AUDIT=self.audit(max_delivery_lag_ms=900))
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["scenarios"][0]["status"], "FAILED", doc)
+        self.assertEqual(doc["scenarios"][0]["evidence"], "not_recovered", doc)
+
+    def test_droppable_runtime_loss_blocks_a_failure_but_keeps_a_pass(self) -> None:
+        drops = self.audit(runtime_dropped=3)
+        scenario = self.recovery_scenarios[1]
+        # Given: input evidence could have been dropped; a FAILED is not evidenced.
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                    "FAKE_FRESH_INPUT": "0", "FAKE_LOG_AUDIT": drops}
+        code, doc = self.run_qa(["--only", scenario], **env)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        self.assertEqual(doc["scenarios"][0]["detail"],
+                         "receiver_media_or_input_log_lost:no_media_evidence_after_recovery")
+        # And: a PASS rests on positive evidence and stands.
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1", "FAKE_LOG_AUDIT": drops}
+        code, doc = self.run_qa(["--only", scenario], **env)
+        self.assertEqual(code, 0, doc)
+
+    def test_confirmed_failure_is_not_downgraded_by_unrelated_loss(self) -> None:
+        # Given: an unknown phone that reached active (directly observed) and an
+        # unrelated dropped runtime record plus lost state records elsewhere.
+        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                      '"phone_id":"id-abc123","port":"1-2.3"}')
+        window = attributed + '\n{"event":"active","startup_ms":100}'
+        code, doc = self.run_qa(["--only", "unknown_phone"], FAKE_ADB_COUNT="2",
+                                FAKE_LOG_WINDOW=attributed, FAKE_ATTEMPT_LOG=window,
+                                FAKE_LOG_AUDIT=self.audit(runtime_dropped=4, state_overflow=2))
+        # Then: the confirmed FAILED survives, exit 1.
+        self.assertEqual(code, 1, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        self.assertEqual(doc["scenarios"][0]["detail"], "unknown_device_reached_active")
+
+    def test_late_delivery_makes_a_budget_miss_inconclusive(self) -> None:
+        env = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_REAL_LOG": "1",
+                                    "FAKE_LOG_AUDIT": self.audit(max_delivery_lag_ms=900)}
+        code, doc = self.run_qa(["--only", self.recovery_scenarios[0]], **env)
+        # A prompt PASS is unaffected by lag (delay only slows observation).
+        self.assertEqual(code, 0, doc)
+        # A budget miss measured from log arrival is inconclusive when the
+        # receiver's log was delivered late (its evidence may have been on time)...
+        # (#90 review 4: a miss decided by the log-timed media evidence; a
+        # D-Bus-observed miss is confirmed, see the test below.)
+        miss = self.passing_env() | {"FAKE_CLOCK": "1", "FAKE_MEDIA_DELAY": "4.1",
+                                     "EVIDENCE_WAIT_MS": "8000"}
+        code, doc = self.run_qa(["--only", "consumer_restart"], **miss,
+                                FAKE_LOG_AUDIT=self.audit(max_delivery_lag_ms=900))
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["scenarios"][0]["detail"], "receiver_log_late:recovery_exceeded_budget")
+        # ...and stays a confirmed FAILED when delivery was prompt.
+        code, doc = self.run_qa(["--only", "consumer_restart"], **miss)
+        self.assertEqual(code, 1, doc)
 
     def test_required_log_boundaries_fail_closed(self) -> None:
         cases = (("", "1"), ("0", "1"), ("", "0"), ("size=123", "0"),

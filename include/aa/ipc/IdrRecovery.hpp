@@ -344,6 +344,14 @@ private:
     bool warned_{false};
 };
 
+// The wait transition itself (#90 review 4): an episode opens here even when
+// every IDR request then fails, so no unresolved wait is ever invisible.
+[[nodiscard]] inline std::string idr_wait_started_json(std::string_view source,
+                                                       std::string_view reason) {
+    return std::string{"{\"event\":\"idr_wait_started\",\"source\":\""} + std::string{source} +
+           "\",\"reason\":\"" + std::string{reason} + "\"}";
+}
+
 [[nodiscard]] inline std::string idr_requested_json(std::string_view source,
                                                     std::string_view reason) {
     return std::string{"{\"event\":\"idr_requested\",\"source\":\""} + std::string{source} +

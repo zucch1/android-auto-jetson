@@ -35,6 +35,8 @@ if(NOT CMAKE_CROSSCOMPILING)
         "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" display_sources)
     add_test(NAME wired_perf_stall_dropouts COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" stall_dropouts)
+    add_test(NAME wired_perf_log_integrity_parser COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" log_integrity)
     add_test(NAME wired_perf_display_disconnect COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_continuity_regressions.py" disconnected)
     foreach(case frozen active_window collector_frozen)
@@ -68,7 +70,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wireless_qa_transport COMMAND "${Python3_EXECUTABLE}" -B
         -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/wireless_qa" -v)
     set_tests_properties(wireless_qa_transport PROPERTIES TIMEOUT 300)
-    foreach(case schema nominal budget_fail duration contract collector media_timing readiness)
+    foreach(case schema nominal budget_fail duration contract collector media_timing readiness
+                 log_integrity)
         add_test(NAME wired_perf_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_wired_perf.py" ${case})
         set_tests_properties(wired_perf_${case} PROPERTIES TIMEOUT 180)
