@@ -2265,7 +2265,7 @@ TEST(WiredReceiver, StdoutLogFailureConvertsCleanMainExitAndPreservesEarlyFailur
     const int full = ::open("/dev/full", O_WRONLY | O_CLOEXEC);
     ASSERT_GE(full, 0);
     runtime_sink_request_override = [&](const auto &) -> aa::audio::detail::SinkOpenOutcome {
-        EXPECT_EQ(::dup2(full, STDOUT_FILENO), STDOUT_FILENO);
+        EXPECT_EQ(::dup2(full, aa::tools::json_fd()), aa::tools::json_fd());
         return {std::make_unique<wiredtest::RecordingObservedSink>(
             std::make_shared<wiredtest::AudioObs>()), {}};
     };
@@ -2293,6 +2293,108 @@ TEST(WiredReceiver, StdoutLogFailureConvertsCleanMainExitAndPreservesEarlyFailur
     g_running.store(true);
 }
 
+// A pipe whose write end is already full and nobody reads: a blocking write
+// to it stalls until the read end closes.
+bool make_stalled_pipe(int (&fds)[2]) {
+    if (::pipe2(fds, O_CLOEXEC) != 0) { return false; }
+    const int flags = ::fcntl(fds[1], F_GETFL);
+    if (::fcntl(fds[1], F_SETFL, flags | O_NONBLOCK) != 0) { return false; }
+    const std::string junk(4096, 'j');
+    while (::write(fds[1], junk.data(), junk.size()) > 0) {}
+    return ::fcntl(fds[1], F_SETFL, flags) == 0;
+}
+
+// Library-like stdio burst well beyond the stray-stdout buffer; returns how long
+// the printing thread was held.
+std::chrono::steady_clock::duration library_stdio_burst(std::size_t bytes) {
+    const std::string line(1023, 'n');
+    const auto began = std::chrono::steady_clock::now();
+    for (std::size_t sent = 0; sent < bytes; sent += line.size() + 1) { std::puts(line.c_str()); }
+    std::fflush(stdout);
+    return std::chrono::steady_clock::now() - began;
+}
+
+// Closes a stalled pipe's read end with SIGPIPE ignored, so a writer still
+// blocked on it fails with EPIPE instead of killing the test binary.
+void release_stalled_pipe(int &read_end) {
+    struct sigaction ignore{}, previous{};
+    ignore.sa_handler = SIG_IGN;
+    ::sigaction(SIGPIPE, &ignore, &previous);
+    ::close(read_end);
+    read_end = -1;
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    ::sigaction(SIGPIPE, &previous, nullptr);
+}
+
+bool all_json_lines(const std::string &output) {
+    std::istringstream lines{output};
+    for (std::string line; std::getline(lines, line);) {
+        if (line.size() < 2 || line.front() != '{' || line.back() != '}') { return false; }
+    }
+    return true;
+}
+
+TEST(WiredReceiver, LibraryStdioNeverBlocksTheReceiverOnAStalledStderr) {
+    // Given: stderr is a full pipe nobody reads (a stalled journal or log
+    // collector) while the JSON stdout is healthy, and a library inside the run
+    // prints far more than the stray-stdout buffer holds.
+    int stalled[2]{-1, -1};
+    ASSERT_TRUE(make_stalled_pipe(stalled));
+    const int saved_stderr = ::fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
+    ASSERT_GE(saved_stderr, 0);
+    ASSERT_EQ(::dup2(stalled[1], STDERR_FILENO), STDERR_FILENO);
+    std::atomic<std::int64_t> held_ms{-1};
+    runtime_sink_request_override = [&](const auto &) -> aa::audio::detail::SinkOpenOutcome {
+        held_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            library_stdio_burst(256 * 1024)).count());
+        return {std::make_unique<wiredtest::RecordingObservedSink>(
+            std::make_shared<wiredtest::AudioObs>()), {}};
+    };
+    // When: the receiver runs and exits.
+    auto run = std::async(std::launch::async, [] { return run_runtime(false, 20, true); });
+    const bool returned = run.wait_for(std::chrono::seconds{20}) == std::future_status::ready;
+    if (!returned) { release_stalled_pipe(stalled[0]); }
+    const auto result = run.get();
+    runtime_sink_request_override = {};
+    ASSERT_EQ(::dup2(saved_stderr, STDERR_FILENO), STDERR_FILENO);
+    ::close(saved_stderr);
+    if (stalled[0] >= 0) { release_stalled_pipe(stalled[0]); }
+    ::close(stalled[1]);
+    // Then: neither the printing thread nor the run waited on stderr, and
+    // stdout is pure JSON.
+    ASSERT_TRUE(returned) << "RECEIVER_BLOCKED_ON_STALLED_STDERR";
+    EXPECT_GE(held_ms.load(), 0);
+    EXPECT_LT(held_ms.load(), 1000);
+    EXPECT_LT(result.elapsed, std::chrono::seconds{5});
+    EXPECT_TRUE(all_json_lines(result.output)) << result.output;
+    g_running.store(true);
+}
+
+TEST(WiredReceiver, LibraryStdoutTextNeverReachesTheJsonStdout) {
+    // Given: a library inside the run writes free text to stdout, through C
+    // stdio (as the Jetson NVIDIA V4L2 codec does with puts("Opening in
+    // BLOCKING MODE")) and through a raw write(1).
+    FILE *const before = stdout;
+    runtime_sink_request_override = [&](const auto &) -> aa::audio::detail::SinkOpenOutcome {
+        std::puts("LIBRARY_STDIO_MARKER");
+        std::printf("LIBRARY_PRINTF_MARKER %d\n", 1);
+        static constexpr char raw[] = "LIBRARY_RAW_MARKER\n";
+        EXPECT_EQ(::write(STDOUT_FILENO, raw, sizeof raw - 1), static_cast<ssize_t>(sizeof raw - 1));
+        return {std::make_unique<wiredtest::RecordingObservedSink>(
+            std::make_shared<wiredtest::AudioObs>()), {}};
+    };
+    // When: the receiver runs and exits.
+    const auto result = run_runtime(false, 20, true);
+    runtime_sink_request_override = {};
+    // Then: none of it reached the JSON stdout, which is still a JSON stream,
+    // and the C stdout stream was never swapped.
+    EXPECT_EQ(result.output.find("MARKER"), std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"event\":\"stopping\""), std::string::npos) << result.output;
+    EXPECT_TRUE(all_json_lines(result.output)) << result.output;
+    EXPECT_EQ(stdout, before);
+    g_running.store(true);
+}
+
 TEST(WiredReceiver, ReceiverShutdownIsBoundedWithAFullQueueAndAStalledStdout) {
     // Given: stdout becomes a pipe nobody reads and that is already full, so the
     // native write stalls; the receiver is then run until the test stops it.
@@ -2305,8 +2407,20 @@ TEST(WiredReceiver, ReceiverShutdownIsBoundedWithAFullQueueAndAStalledStdout) {
     ASSERT_EQ(::fcntl(stalled[1], F_SETFL, flags), 0);
     std::atomic<bool> stdout_stalled{false};
     std::atomic<bool> queue_full{false};
+    std::atomic<std::int64_t> held_ms{-1};
+    const int saved_stderr = ::fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
+    ASSERT_GE(saved_stderr, 0);
     runtime_sink_request_override = [&](const auto &) -> aa::audio::detail::SinkOpenOutcome {
-        EXPECT_EQ(::dup2(stalled[1], STDOUT_FILENO), STDOUT_FILENO);
+        // And library stdio text, as the Jetson NVIDIA V4L2 codec puts() when
+        // nvv4l2decoder opens: it must not wait in a stdio buffer for a flush
+        // into the stalled pipe.
+        std::puts("Opening in BLOCKING MODE");
+        EXPECT_EQ(::dup2(stalled[1], aa::tools::json_fd()), aa::tools::json_fd());
+        // And stderr shares the stalled sink (one pipe for both, as a log
+        // collector does): more library text must still never block.
+        EXPECT_EQ(::dup2(stalled[1], STDERR_FILENO), STDERR_FILENO);
+        held_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            library_stdio_burst(256 * 1024)).count());
         stdout_stalled.store(true);
         return {std::make_unique<wiredtest::RecordingObservedSink>(
             std::make_shared<wiredtest::AudioObs>()), {}};
@@ -2336,17 +2450,22 @@ TEST(WiredReceiver, ReceiverShutdownIsBoundedWithAFullQueueAndAStalledStdout) {
     auto run = std::async(std::launch::async, [] { return run_runtime(false, 0, true); });
     const bool returned = run.wait_for(std::chrono::seconds{30}) == std::future_status::ready;
     if (!returned) {
-        ::close(stalled[0]); // EPIPE latches the sink error and unwinds every waiter.
-        stalled[0] = -1;
+        release_stalled_pipe(stalled[0]); // EPIPE latches the sink error and unwinds every waiter.
     }
     const auto result = run.get();
     stopper.join();
     runtime_sink_request_override = {};
+    EXPECT_EQ(::dup2(saved_stderr, STDERR_FILENO), STDERR_FILENO);
+    ::close(saved_stderr);
     ::close(stalled[1]);
-    if (stalled[0] >= 0) { ::close(stalled[0]); }
+    // Writers the receiver left blocked on the pipe (StdoutLog, stray stdout)
+    // wake with EPIPE here and finish before the test moves on or exits.
+    if (stalled[0] >= 0) { release_stalled_pipe(stalled[0]); }
     // Then: shutdown is bounded (about 2 s per bounded stage) and reports the lost logs.
     ASSERT_TRUE(returned) << "RECEIVER_SHUTDOWN_BLOCKED_ON_STALLED_STDOUT";
     EXPECT_TRUE(stdout_stalled.load());
+    EXPECT_GE(held_ms.load(), 0);
+    EXPECT_LT(held_ms.load(), 1000);
     EXPECT_TRUE(queue_full.load());
     EXPECT_LT(result.elapsed, std::chrono::seconds{12});
     EXPECT_NE(result.code, 0);

@@ -9,6 +9,7 @@
 // would reach) and read observable status back - never a production control
 // surface (no production UI/settings/app-host scope, task 44 owns that).
 
+#include "../json_stdout.hpp"
 #include <aa/display/Display.hpp>
 #include <aa/display/TelemetryWriter.hpp>
 
@@ -111,7 +112,7 @@ private:
         const std::string out = line + "\n";
         std::size_t off = 0;
         while (off < out.size()) {
-            const ssize_t n = ::write(1, out.data() + off, out.size() - off);
+            const ssize_t n = ::write(aa::tools::json_fd(), out.data() + off, out.size() - off);
             if (n <= 0) {
                 return;
             }
