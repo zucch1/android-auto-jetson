@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <aa/helper/SystemHelper.hpp>
+#include <array>
+#include <cstring>
 #include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <gio/gio.h>
 
@@ -15,11 +19,35 @@ struct Policy final {
     std::uint32_t owner{};
     std::uint32_t channel{36};
 };
-struct Credentials final { std::string ssid, psk; ~Credentials() { wipe(psk); } };
+// #89 L9: the WPA2 PSK (64 lowercase hex digits + NUL) lives in one fixed
+// in-object buffer, written in place and cleansed on destruction. It is never
+// built in, or copied through, a growable std::string. Copies are bounded
+// value copies that each cleanse themselves.
+class Psk final {
+public:
+    static constexpr std::size_t kLength = 64;
+    Psk() noexcept = default;
+    Psk(const Psk& other) noexcept : bytes_(other.bytes_) {}
+    Psk& operator=(const Psk& other) noexcept { bytes_ = other.bytes_; return *this; }
+    ~Psk() { ::explicit_bzero(bytes_.data(), bytes_.size()); }
+    // The digits to fill in place; the terminating NUL is never writable.
+    [[nodiscard]] std::span<char, kLength> digits() noexcept { return std::span<char, kLength>{bytes_.data(), kLength}; }
+    [[nodiscard]] std::string_view view() const noexcept { return {bytes_.data(), kLength}; }
+    [[nodiscard]] const char* c_str() const noexcept { return bytes_.data(); }
+    friend bool operator==(const Psk& a, const Psk& b) noexcept { return a.bytes_ == b.bytes_; }
+private:
+    std::array<char, kLength + 1> bytes_{};
+};
+struct Credentials final { std::string ssid; Psk psk; };
 core::Result<Policy> load_policy(const std::string& directory, std::uint32_t owner);
 core::Result<Credentials> credentials(const Policy& policy, bool rotate);
 // Per-activation credentials, never written to disk.
 core::Result<Credentials> fresh_credentials();
+// The PSK as a floating D-Bus string GVariant backed by one private 65-byte
+// buffer that GLib reads in place (never copies) and that is cleansed when the
+// last reference is released, instead of g_variant_new_string's unwiped
+// g_strdup (#89 L9).
+GVariant* psk_variant(const Psk& psk);
 class Commands {
 public:
     virtual ~Commands() = default;

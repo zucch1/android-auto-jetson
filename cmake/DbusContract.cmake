@@ -49,7 +49,8 @@ set(AA_DBUS_TEST_SOURCES
     tests/dbus/dispatch_test.cpp
     tests/dbus/bus_lookup_test.cpp
     tests/dbus/bus_boundary_test.cpp
-    tests/dbus/bus_spoof_test.cpp)
+    tests/dbus/bus_spoof_test.cpp
+    tests/dbus/bus_socket_auth_test.cpp)
 foreach(source IN LISTS AA_IPC_CONTROL_SOURCES AA_IPC_DBUS_SOURCES AA_DBUS_TEST_SOURCES)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/${source}")
         message(FATAL_ERROR "AA_DBUS_CONTRACT_SOURCE_MISSING: ${source} (dbus contract source inventory)")
@@ -136,7 +137,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME dbus_contract_boundary COMMAND "${AA_DBUS_RUN_SESSION}" --
         "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusBoundary.*:SocketBoundary.*)
     add_test(NAME dbus_contract_spoof COMMAND "${AA_DBUS_RUN_SESSION}" --
-        "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusSpoof.*)
+        "$<TARGET_FILE:aa_dbus_contract_test>" --gtest_filter=BusSpoof.*:BusSocketAuth.*)
     set_tests_properties(dbus_contract_control dbus_contract_access dbus_contract_pairing
         dbus_contract_introspection dbus_contract_dispatch dbus_contract_bus dbus_contract_boundary
         dbus_contract_spoof PROPERTIES TIMEOUT 60)

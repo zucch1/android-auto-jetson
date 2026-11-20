@@ -232,12 +232,19 @@ BusService& BusService::operator=(BusService&& other) noexcept {
     return *this;
 }
 core::Result<BusService> BusService::system(IdentityPolicy policy, Backend& backend) {
-    return private_bus("unix:path=/run/dbus/system_bus_socket", std::move(policy), backend);
+    // #89 L12: both connections refuse a system bus socket not owned by root.
+    auto bus = BusConnection::connect_system();
+    auto credentials = BusConnection::connect_system();
+    if (!bus || !credentials) return Error{ErrorCode::helper_unavailable};
+    if (!bus.value().request_name(ipc::BusName{kBusName})) return Error{ErrorCode::helper_unavailable};
+    return BusService{std::make_unique<Impl>(std::move(bus.value()), std::move(credentials.value()),
+                                           std::move(policy), backend)};
 }
 core::Result<BusService> BusService::private_bus(const std::string& address,
                                                IdentityPolicy policy, Backend& backend) {
-    auto bus = BusConnection::connect_private(address);
-    auto credentials = BusConnection::connect_private(address);
+    // Private host verification: the bus daemon must be this UID's (or root's).
+    auto bus = BusConnection::connect_private(address, BusOwner::root_or_self());
+    auto credentials = BusConnection::connect_private(address, BusOwner::root_or_self());
     if (!bus || !credentials) return Error{ErrorCode::helper_unavailable};
     if (!bus.value().request_name(ipc::BusName{kBusName})) return Error{ErrorCode::helper_unavailable};
     return BusService{std::make_unique<Impl>(std::move(bus.value()), std::move(credentials.value()),

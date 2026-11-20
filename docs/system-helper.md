@@ -33,6 +33,29 @@ content is rehashed on subsequent calls: `exec` does not change starttime.
 Effects get a second identity validation immediately before backend dispatch.
 This narrows races; it is not a kernel atomic exec-and-effect transaction.
 
+### Bus socket authentication (#89 L12)
+
+Those daemon answers are only as trustworthy as the bus itself, so every bus
+socket is authenticated before a single byte is sent. Right after `connect()`
+the client reads the kernel-reported owner of the listening end
+(`SO_PEERCRED`, fixed when the listener was created, not forgeable by the
+peer) and refuses any owner it does not admit with
+`transport_unauthorized_peer`; no AUTH, Hello or helper RPC reaches a spoofed
+endpoint. The production system bus (`/run/dbus/system_bus_socket`) must be
+**root-owned**: both the receiver's `BusClient::system()` and the helper's
+`BusService::system()` admit only UID 0, and the helper's GIO NetworkManager and
+BlueZ connections apply the same check (`GioBusOwner.hpp`) before GDBus
+authenticates (production runs as root, so only root is admitted). The
+explicit `--private-bus` host-verification mode and session buses admit a
+listener owned by the caller's own UID or root, so a private `dbus-daemon`
+started by the verifying user keeps working; another user's socket is refused.
+The SASL `OK` reply must carry a well-formed 32-hex server GUID, and when the
+address has a `guid=` key (as `dbus-run-session`/`dbus-daemon --print-address`
+addresses do) the server's GUID must equal it, or `BEGIN` is never sent. A
+malformed or repeated `guid=` key is refused, never ignored. The session
+address itself still comes from `DBUS_SESSION_BUS_ADDRESS`; pin it (with its
+`guid=`) in deployment if the session bus is in the threat model.
+
 ## Explicit fail-closed provisioning (not installed by this task)
 
 Package/operator provisioning must create these root-owned regular files:
@@ -295,6 +318,27 @@ errors and ambiguous timeouts do not permit retries with the same grant.
 An AP acquire returning inactive/pending is **not applied**. Subsequent ensure
 calls for the same source poll AP status without renewing or resending a consumed
 grant; only verified active state maps to `Response.applied=true`.
+
+## Wi-Fi PSK copies in the helper (#89 L9)
+
+The NetworkManager adapter keeps the AP PSK in `nm::Psk`, a fixed 65-byte
+in-object buffer (64 hex digits and NUL) that is cleansed with `explicit_bzero`
+on destruction; copies are bounded value copies that cleanse themselves. It
+is never built in, or passed through, a growable `std::string`. Random digits
+are drawn straight into that buffer (`crypto_adapter::random_hex`, whose raw
+random bytes are cleansed). A persisted `ap.credentials` file is read into, and a
+rotated one composed in, a fixed stack buffer cleansed on every exit. The
+settings sent to `AddAndActivateConnection2` carry the PSK as a string GVariant
+backed by one private buffer that GLib reads in place and cleanses when the
+last reference is released (`nm::psk_variant`), instead of
+`g_variant_new_string`'s unwiped copy. The released `ApSnapshot.password`
+remains the wiped string documented for the handoff path. Residual copies
+outside the helper's control: GDBus's serialized message buffer, kernel socket
+buffers and NetworkManager's own copy. `LimitCORE=0` in the unit keeps all of
+them out of core dumps. `G_DBUS_DEBUG=message` or `payload` would make GDBus print
+every sent body, the PSK included, so the unit sets `UnsetEnvironment=G_DBUS_DEBUG`
+and `main()` also drops the variable before any GLib or GDBus use, logging one
+line (never the value) when it was set.
 
 ## Loss handling and bounds
 
