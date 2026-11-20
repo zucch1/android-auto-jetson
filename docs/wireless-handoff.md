@@ -44,8 +44,15 @@ phone     WifiConnectStatus=6 {1: status = 0}
 The start request is sent only after authorization and only once the
 projection listener is ready. Credentials leave the helper only in record `3`,
 from the pinned AP snapshot and behind the same snapshot fence and eligibility
-checks described below. Success is status `0` in both phone records; every
-failure value is negative, and any nonzero status is a phone rejection.
+checks described below. The two phone statuses differ:
+
+- `WifiConnectStatus` must be exactly `0`; any other value is a phone rejection.
+- `WifiStartResponse`'s status is optional, and only a negative value is a
+  rejection. An absent status, `0` and positive values such as `1` are accepted
+  (aa-proxy-rs reads the record without checking its status; OAA maps `1` to
+  success).
+
+`WifiConnectionRejection=10` from the phone is a rejection.
 
 Sources for every ID, framing rule and field number (file:line at the pins
 below): aa-proxy-rs `src/bluetooth.rs:409-420` (IDs), `4692-4694` and
@@ -81,8 +88,15 @@ system-helper: wireless_handshake_failed phase=await_info_request msg_id=99 msg=
 `reason` is the typed `HandoffFailure`. The line never carries the SSID, PSK,
 BSSID, endpoint or any address. A completed exchange logs
 `system-helper: wireless_handshake_complete flow=start_first`.
-Completion requires the trailing-data check, including a nonblocking socket
-peek, and a deadline recheck; receiving one expected record is not enough.
+A successful `WifiConnectStatus` ends the exchange, subject to the deadline
+recheck; records after it are never read, and nothing on the channel after it
+affects the completed authority.
+
+The handshake tolerates what the shipping dongles tolerate, within bounds:
+pings (`8`, `9`), `WifiSetupInfo=11` and unknown IDs are ignored, at most 32 per
+exchange; the next one fails it (`unknown_id`). A repeated `WifiInfoRequest`
+after the response gets the identical `WifiInfoResponse` again, at most twice;
+a third repeat fails the exchange (`duplicate`).
 
 On this AAW surface, `security_mode` uses its own bitmask-style enum with
 `WPA2_PERSONAL=8`; `access_point_type` is `DYNAMIC=1`. The BSSID is the current
@@ -91,7 +105,7 @@ AP interface MAC as a lowercase, colon-separated string. The project-owned
 projection enum, which is not the AAW bootstrap enum and cannot encode this
 contract correctly.
 
-Denial, malformed or oversized input, wrong order, duplicates, unknown IDs,
+Denial, malformed or oversized input, wrong order, duplicates, too many ignored records,
 EOF, timeout, and phone-side rejection close RFCOMM without a rejection payload
 or further credentials. The helper reports a typed local failure without secret
 material and does not mutate trust. Normal closure after confirmed success has
@@ -186,7 +200,12 @@ zero-confirmation source after acquisition.
 
 ## Lifetimes, freshness, and deadlines
 
-An incomplete bootstrap has a 10-second budget. The 60-second pairing window
+An incomplete bootstrap has a 10-second budget from accept until the head
+unit's `WifiInfoResponse` is fully sent. Then, once, the deadline moves to 30 s
+after that send, for the phone's Wi-Fi join and its statuses, so a whole
+exchange is bounded by 40 s from accept. A stall before credentials still ends at
+10 s; if the 10-second deadline has already fired when the credentials finish
+sending, the exchange fails instead of being extended. The 60-second pairing window
 limits only acceptance of new RFCOMM connections; it is not a TTL for an
 established bootstrap, completed handoff, or projection session.
 
@@ -195,7 +214,8 @@ established bootstrap, completed handoff, or projection session.
 Every aborted bootstrap shuts its RFCOMM socket down (`shutdown(SHUT_RDWR)`),
 because BlueZ holds its own reference and a plain `close()` sends no DISC; the
 phone then sees an IO error and restarts its wireless setup. That covers denial,
-every failure, the 10-second deadline, a window that lapses before the bootstrap
+every failure, the bootstrap deadline (10 s, or 40 s once the Wi-Fi join
+extension applies), a window that lapses before the bootstrap
 ends (the bootstrap still runs to its own deadline), and the retirement of a
 completed hand-off, whether it failed before the receiver confirmed it or its
 session ended later. Completion itself shuts nothing down: the channel stays as
@@ -208,8 +228,11 @@ A retry must not reset a bootstrap that is still progressing:
 
 - The receiver does not defer its attempt (15 s) while the coordinator is
   preparing, authorizing, or authorized but unconfirmed. That hold is bounded:
-  10 s from the first observation (the helper's own budget starts earlier) plus
-  5 s for the phone to open the TCP session of a completed exchange.
+  40 s from the first observation (`HandoffTiming::bootstrap`, the helper's whole
+  10 s + 30 s bound, which starts earlier) plus 5 s for the phone to open the TCP
+  session of a completed exchange, so at most 45 s. A phone that completes
+  RFCOMM but never opens the TCP session holds the attempt that long before the
+  receiver may defer it.
 - The coordinator's 10-second establishment bound applies only while it waits
   for a bootstrap; one observed late runs to its own budget.
 - `begin()` with the same source during such a bootstrap keeps it: no
