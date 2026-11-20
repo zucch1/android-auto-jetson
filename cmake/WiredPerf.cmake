@@ -35,6 +35,8 @@ if(NOT CMAKE_CROSSCOMPILING)
         "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" display_sources)
     add_test(NAME wired_perf_stall_dropouts COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" stall_dropouts)
+    add_test(NAME wired_perf_log_integrity_parser COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" log_integrity)
     add_test(NAME wired_perf_display_disconnect COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_continuity_regressions.py" disconnected)
     foreach(case frozen active_window collector_frozen)
@@ -50,8 +52,9 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_tests_properties(wired_perf_build_guard PROPERTIES TIMEOUT 120)
     # #137 soak: v3 signed A/V contract and v2 history, the shared moving-map
     # workload (alone and inside the collector), the in-repo soak chain and the
-    # remote collector stop, and the #154 host audio/maintenance preflight.
-    foreach(suite v3_av_contract moving_map soak_chain remote_stop host_preflight)
+    # remote collector stop, the #154 host audio/maintenance preflight, and the
+    # informational #154 catch-up loss.
+    foreach(suite v3_av_contract catch_up_loss moving_map soak_chain remote_stop host_preflight)
         add_test(NAME wired_perf_${suite} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_${suite}.py")
         set_tests_properties(wired_perf_${suite} PROPERTIES TIMEOUT 180)
@@ -62,7 +65,13 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_drive_smoke COMMAND "${Python3_EXECUTABLE}" -B
         -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/wired_qa" -v)
     set_tests_properties(wired_drive_smoke PROPERTIES TIMEOUT 300)
-    foreach(case schema nominal budget_fail duration contract collector media_timing readiness)
+    # Wireless transport of the drive smoke and the soak chain (fakes only): its
+    # own entry so the wired suite keeps its margin under its timeout.
+    add_test(NAME wireless_qa_transport COMMAND "${Python3_EXECUTABLE}" -B
+        -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/wireless_qa" -v)
+    set_tests_properties(wireless_qa_transport PROPERTIES TIMEOUT 300)
+    foreach(case schema nominal budget_fail duration contract collector media_timing readiness
+                 log_integrity)
         add_test(NAME wired_perf_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_wired_perf.py" ${case})
         set_tests_properties(wired_perf_${case} PROPERTIES TIMEOUT 180)

@@ -97,9 +97,12 @@ std::string media_timing_json(const RouterStats& stats) {
         format_ms(stats.max_path_latency) + "}";
 }
 
-std::string audio_catch_up_json(std::uint64_t frames, std::uint64_t total, std::uint32_t rate) {
+std::string audio_catch_up_json(std::uint64_t frames, std::uint64_t total, std::uint32_t rate,
+                                std::uint64_t events_lifetime, std::uint64_t frames_lifetime) {
     return "{\"event\":\"audio_catch_up\",\"frames\":" + std::to_string(frames) +
-        ",\"frames_total\":" + std::to_string(total) + ",\"rate\":" + std::to_string(rate) + "}";
+        ",\"frames_total\":" + std::to_string(total) + ",\"rate\":" + std::to_string(rate) +
+        ",\"events_lifetime\":" + std::to_string(events_lifetime) +
+        ",\"frames_lifetime\":" + std::to_string(frames_lifetime) + "}";
 }
 
 std::string sink_write_json(const SinkWriteProgress& value) {
@@ -331,8 +334,21 @@ RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend ba
     // media clock disagrees with the output clock (~100-200 ppm); without
     // bounded head trims the preserved backlog grows without bound.
     config.live_pcm_drift.enabled = true;
-    // #155 catch-up seam: once LivePcmDriftPolicy::catch_up_watermark lands on main,
-    // set `config.live_pcm_drift.catch_up_watermark = core::Nanoseconds{90'000'000};` here.
+    // #154: after a sink stall the phone bursts its withheld backlog, which is
+    // placed after the cursor far behind its arrival. A run placed more than
+    // 90 ms (the A/V excursion bound) behind its arrival is trimmed from its
+    // head down to the 15 ms drift target at once instead of 5 ms per chunk
+    // (resampler carryover at a run's head counts at its older source time),
+    // and the router's 200 ms late cap judges such a caught-up run by the end
+    // of its parent's own PTS range against the committed source-time frontier.
+    // A stall's burst - including 200 ms guidance parents stamped milliseconds
+    // apart, however the resampler splits them - is therefore trimmed rather
+    // than ending the session as audio_sink_failure; a parent whose PCM ends
+    // over 200 ms behind recent source audio still fails late. The dropped
+    // audio is logged as audio_catch_up. Wired uses this 90 ms default;
+    // wireless overrides it via audio_config() (configurable, default off = 0)
+    // until a wireless-safe policy for TCP coalescing is decided.
+    config.live_pcm_drift.catch_up_watermark = core::Nanoseconds{90'000'000};
     config.on_write_completed = [log_media = std::move(telemetry.log_media)](const WriteCompletion& completion) {
         if (log_media) {
             log_media("audio_write_completed", audio_write_completed_json(completion));

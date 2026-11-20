@@ -220,8 +220,27 @@ if(NOT CMAKE_CROSSCOMPILING)
     # receiver MODE (aa-test-receiver --mode reject-first-stop) - stop_failed
     # plus the typed rejection, no second remote StartProjection, and the
     # accepted retry landing idle with the widget error cleared.
+    # sigterm (#90 review 4): the QA runners' SIGTERM stop drains the telemetry
+    # log and ends it with telemetry_complete.
+    # TEST-ONLY LD_PRELOAD shim for the exit-path regression (tests/stdio).
+    if(NOT TARGET aa_test_file_lock_holder)
+        add_library(aa_test_file_lock_holder MODULE tests/stdio/file_lock_holder.c)
+        target_link_libraries(aa_test_file_lock_holder PRIVATE pthread)
+        set_target_properties(aa_test_file_lock_holder PROPERTIES PREFIX "")
+    endif()
+    add_test(NAME dummy_display_exit_file_lock COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tests/stdio/exit_lock_test.py"
+        --shim "$<TARGET_FILE:aa_test_file_lock_holder>"
+        --display "$<TARGET_FILE:aa-dummy-display>")
+    set_tests_properties(dummy_display_exit_file_lock PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)
+    add_test(NAME dummy_display_isolation_failure COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tests/stdio/isolation_failure_test.py"
+        --display "$<TARGET_FILE:aa-dummy-display>")
+    set_tests_properties(dummy_display_isolation_failure PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)
     foreach(case replay flow absent stalled stopfail stopreject
-            diagnostics-bootstrap diagnostics-factory diagnostics-connect)
+            diagnostics-bootstrap diagnostics-factory diagnostics-connect sigterm)
         add_test(NAME dummy_display_exec_${case} COMMAND "${AA_DBUS_RUN_SESSION}" --
             "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/display/executable_display_test.py"

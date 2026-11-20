@@ -71,9 +71,18 @@ private:
     bool enabled_;
 };
 
+// #155: wireless catch-up is configurable and defaults to off (0). With
+// receiver-arrival timestamps, a normal wireless TCP coalesced burst (e.g.
+// 3 x 50 ms chunks within 5 ms) reaches >90 ms placement phase without a sink
+// stall and would be trimmed by the wired 90 ms phase watermark. Wired keeps
+// the 90 ms default in audio::pcm_router_config(); wireless stays off unless
+// explicitly configured (e.g. --audio-catch-up-watermark-ms).
 [[nodiscard]] inline audio::RouterConfig audio_config(
-    audio::SinkBackend backend = audio::SinkBackend::pulse) {
-    return audio::pcm_router_config(backend, audio_telemetry());
+    audio::SinkBackend backend = audio::SinkBackend::pulse,
+    core::Nanoseconds catch_up_watermark = core::Nanoseconds{0}) {
+    auto config = audio::pcm_router_config(backend, audio_telemetry());
+    config.live_pcm_drift.catch_up_watermark = catch_up_watermark;
+    return config;
 }
 
 // The media endpoints outlive every per-link session; callbacks resolve the

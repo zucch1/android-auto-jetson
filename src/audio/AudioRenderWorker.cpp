@@ -29,6 +29,8 @@ struct AudioRenderWorker::SettlementDiagnostics {
         std::uint64_t frames;
         std::uint64_t total;
         std::uint32_t rate;
+        std::uint64_t events_lifetime;
+        std::uint64_t frames_lifetime;
     };
     struct SinkStall {
         core::Nanoseconds start;
@@ -75,11 +77,14 @@ struct AudioRenderWorker::SettlementDiagnostics {
                 ",\"reason\":\"all_role_idle\"}");
         }
         if (caught_up) {
-            // #155 catch-up telemetry seam: frames is this step's increment at
-            // the output rate (reset-free delta on one router); frames_total
-            // resets on a sink reopen.
+            // #155: frames is this step's increment at the output rate (a
+            // reset-free delta on one router); frames_total resets on a sink
+            // reopen. events_lifetime / frames_lifetime are the worker's
+            // running totals across reopens and sessions, so a later record
+            // restores any earlier one this droppable media path lost.
             telemetry.log_media("audio_catch_up",
-                audio_catch_up_json(caught_up->frames, caught_up->total, caught_up->rate));
+                audio_catch_up_json(caught_up->frames, caught_up->total, caught_up->rate,
+                                    caught_up->events_lifetime, caught_up->frames_lifetime));
         }
         if (skipped) {
             telemetry.log_media("audio_idle_skipped",
@@ -842,7 +847,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         step_started_ = idle_clock_();
         const auto before = local_router.report().stats.frames_written;
         const auto idle_before = local_router.report().stats.frames_idle_skipped;
-        // #155 catch-up seam: capture `caught_up_before = local_router.report().stats.frames_caught_up` here.
+        const auto caught_up_before = local_router.report().stats.frames_caught_up;
         lock.unlock();
         const auto step_started = monotonic_now();
         const auto result = local_router.render_step();
@@ -877,8 +882,16 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         }
         in_flight_ = false;
         const auto stats = local_router.report().stats;
-        // #155 catch-up seam: when `stats.frames_caught_up > caught_up_before`, populate
-        // `diagnostics.caught_up = SettlementDiagnostics::CatchUp{stats.frames_caught_up - caught_up_before, stats.frames_caught_up, config.output_format.sample_rate_hz};`.
+        // #155: the router trimmed this step's post-stall backlog (it happened
+        // whatever the epoch, so it is always counted).
+        if (stats.frames_caught_up > caught_up_before) {
+            const auto frames = stats.frames_caught_up - caught_up_before;
+            ++catch_up_events_lifetime_;
+            catch_up_frames_lifetime_ += frames;
+            diagnostics.caught_up = SettlementDiagnostics::CatchUp{
+                frames, stats.frames_caught_up, config.output_format.sample_rate_hz,
+                catch_up_events_lifetime_, catch_up_frames_lifetime_};
+        }
         if (same_epoch) {
             if (idle_resume_id_) {
                 idle_resume_frames_ += stats.frames_idle_skipped - idle_before;

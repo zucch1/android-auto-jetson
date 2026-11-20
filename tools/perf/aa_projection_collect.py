@@ -53,6 +53,28 @@ build directory that produced the binaries proves an optimized build (see
 pump enough to fail the A/V gate on its own. ``--allow-unoptimized-build`` is a
 debugging override only.
 
+With ``--transport wireless`` (default wired) the collector launches
+``aa-wireless-receiver --store-dir DIR --phone-id N --diagnostics`` instead:
+the receiver brings the session up through the system helper's AP and
+Bluetooth bootstrap when the display asks to project and releases them when it
+stops (tools/perf/aa_transport.py). The phone's cable must be out: this host's
+USB bus must show neither the phone (``--phone-serial``) nor an AOA device
+before (else the stage is refused before launch), during and after the stage
+(else BLOCKED ``cleanup:usb_attached``). adb runs over the AP link: once the
+session is active the collector takes the peer of the receiver's own TCP
+session (the only one, and a station of the AP), connects to it on 5555 and
+binds it only when the device's ``getprop ro.serialno`` is ``--phone-serial``;
+otherwise the stage is refused (``phone_setup_failed: adb_session_*`` /
+``adb_unreachable`` / ``adb_phone_mismatch``, nothing measured). Only then is the phone prepared and
+the measurement window allowed to start (samples count as active only after
+it), and the phone is restored before the session is torn down. The wireless
+receiver logs no ``active`` line; its ``session_state_changed`` diagnostic to
+``active`` (bare on main, wrapped after #163) is the marker, ``startup_ms`` is
+measured by the harness from launch to it (``startup_basis``), and a
+re-admission (a second ``wireless_admission``, ``wireless_admission_expired``,
+a new diagnostic session id, or reconnecting/disconnected/failed) ends the
+active state. The capture's ``mode`` is the transport.
+
 This tool does not modify target state (no installs, no udev, no kernel
 changes); it only launches the supplied binaries, reads procfs/sysfs and, with
 the moving-map workload, sends adb intents to the named phone.
@@ -80,8 +102,10 @@ from array import array
 from pathlib import Path
 from typing import Literal
 
+import aa_log_integrity
 from aa_video_measurements import DecodeEndpoint, IpcEndpoint, VideoMeasurements
 import aa_moving_map as moving_map
+import aa_transport as transport
 from aa_measurement_coverage import (
     CoverageError, NANO_PROFILE, Sample, ThermalZone, VideoEvidence, thermal_policy_for_model,
 )
@@ -175,6 +199,21 @@ def _record_process(args: argparse.Namespace, role: str, pid: int) -> None:
     run_file = getattr(args, "run_file_record", None)
     if run_file is not None:
         run_file.process(role, pid)
+
+
+_ADB_BIND_TIMEOUT_SECONDS = 20.0
+# Phone setup after the bind (snapshots, wake, media, Maps) plus one sampling
+# interval before the window starts, with margin.
+_WIRELESS_PREPARE_HEADROOM_SECONDS = 120
+_RECEIVER_MAX_LIFETIME_MS = 86_400_000  # aa-wireless-receiver's --duration-ms limit
+_HOST_USB_PERIOD_SECONDS = 10.0
+
+
+def _host_adb(*args: str) -> subprocess.CompletedProcess:
+    """Host-level ``adb`` (connect/disconnect over the AP link), bounded."""
+    # The same hard bound (TERM, KILL, abandoned pipes) as every phone command:
+    # `adb connect` may start the adb server, which would hold a captured pipe.
+    return moving_map.run_adb(["adb", *args])
 
 
 class PhoneSetupError(RuntimeError):
@@ -468,13 +507,47 @@ class EventParser:
 
     def __init__(self) -> None:
         self.offsets: dict[str, int] = {}
+        # Log-integrity evidence per log path, kept after the measurement freeze:
+        # validity is decided after the final read (#90 review).
+        self.integrity: dict[str, list[dict]] = {}
+        # Source-time end of the measured window (absolute CLOCK_MONOTONIC ns),
+        # set when the sampling loop ends (#90 review 4). A metric record read
+        # after it is admitted at its own emission time when that falls inside
+        # the window, ignored when after it, and invalidates the metric it
+        # feeds when its time is unknown or it can no longer be admitted.
+        self.cutoff_ns: int | None = None
+        self.late_targets: set[str] = set()
+        # Peak/cumulative values of in-window records read after the cutoff,
+        # merged into the frozen metrics at the end (never into live state).
+        self.late_values: dict[str, float | int] = {}
+        self._source: str | None = None
+        # Wireless: the receiver's launch on the monotonic clock, for startup_ms
+        # from its session_state_changed -> active diagnostic (mono_ns).
+        self.receiver_started_ns: int | None = None
+        # Wireless only: the diag active marker and re-admission rules apply.
+        self.wireless = False
+        self.session_id: object = None
+        self.admissions = 0
+        self.readmitted = False  # an admission (or its expiry) after the first active session
+        self.media_telemetry_dropped = 0
         self.metrics: dict[str, object] = {
             "frame_drops": None, "decode_p50_ms": None, "decode_p95_ms": None,
             "decode_fps": None, "decode_frames": None, "ipc_throughput_mbps": None,
             "ipc_p95_added_latency_ms": None, "av_sync_ms": None, "audio_latency_ms": None,
             "audio_scheduling_skew_ms": None, "audio_stall_dropouts": 0,
             "audio_stall_dropped_chunks": 0, "audio_stall_unrecovered": 0,
+            "audio_catch_up_events": 0, "audio_catch_up_frames": 0, "audio_catch_up_ms": 0.0,
         }
+        # Catch-up loss (#154), from the receiver's running lifetime totals:
+        # (events, frames, rate) of the newest record, None once malformed.
+        self.catch_up: tuple[int, int, int] | None = (0, 0, 0)
+        # A media_telemetry_dropped notice after the newest catch-up record
+        # may hide a later one: the totals are then unconfirmed (null).
+        self.catch_up_unconfirmed = False
+        # Every such doubt (a lossy notice, a malformed notice or a truncated
+        # catch-up or notice line) ever read: the collector compares it
+        # across its final poll, after the metrics froze.
+        self.catch_up_doubts = 0
         self.stall_open = False
         self.stall_failed = 0
         self.video_units: int | None = None
@@ -509,6 +582,56 @@ class EventParser:
         self.last_audio_scheduled = -1
         self.last_video_scheduled = -1
         self.video_measurements = VideoMeasurements()
+
+    def _catch_up(self, event: dict) -> None:
+        """Account one ``audio_catch_up`` event (#154): router audio dropped at once.
+
+        A placement backlog past the catch-up watermark is trimmed to the drift
+        target in one run instead of 5 ms per run. It is neither a sink stall
+        nor an ``audio_stall_bypass``, so it never feeds the ``audio_stall_*``
+        counters. Each record carries the render worker's running totals over
+        the receiver's life (``events_lifetime``, ``frames_lifetime``: output
+        frames at ``rate`` beyond the ordinary bounded drift trim), which
+        survive a sink reopen and restore any earlier record the droppable
+        media log lost. Frames and the event count stay separate units.
+        """
+        if self.catch_up is None:
+            return
+        fields = [event.get(key) for key in ("frames", "rate", "events_lifetime", "frames_lifetime")]
+        frames, rate, events, total = fields
+        last_events, last_total, last_rate = self.catch_up
+        if not (all(isinstance(value, int) and not isinstance(value, bool) and value > 0
+                    for value in fields)
+                and total >= frames and events > last_events and total > last_total
+                and last_rate in (0, rate)):
+            self.catch_up = None
+            self._publish_catch_up()
+            return
+        self.catch_up = (events, total, rate)
+        self.catch_up_unconfirmed = False
+        self._publish_catch_up()
+
+    def _media_dropped(self, event: dict) -> None:
+        counters = [event.get(key) for key in ("rate_limited", "backpressure")]
+        if (not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                    for value in counters)
+                or sum(counters) > 0):
+            self._doubt_catch_up()
+
+    def _doubt_catch_up(self) -> None:
+        """A catch-up record may be missing: unconfirmed until a later one."""
+        self.catch_up_doubts += 1
+        self.catch_up_unconfirmed = True
+        self._publish_catch_up()
+
+    def _publish_catch_up(self) -> None:
+        keys = ("audio_catch_up_events", "audio_catch_up_frames", "audio_catch_up_ms")
+        if self.catch_up is None or self.catch_up_unconfirmed:
+            for key in keys:
+                self.metrics[key] = None
+            return
+        events, total, rate = self.catch_up
+        self.metrics.update(zip(keys, (events, total, round(total * 1000 / rate, 6) if rate else 0.0)))
 
     def _record_progress(self, keys: tuple[str, ...], stamp: int) -> None:
         for key in keys:
@@ -671,7 +794,14 @@ class EventParser:
         prior = self.metrics[target]
         self.metrics[target] = max(prior, value) if peak and prior is not None else value
 
-    def poll(self, path: str) -> None:
+    def poll(self, path: str, final: bool = False) -> None:
+        """Consume the log's new complete lines.
+
+        A line still being written is left for the next poll, so a record is
+        never split into two unparseable halves. ``final`` (after the writer
+        exited) consumes the unterminated tail too: a record cut off there is
+        truncated for good.
+        """
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -682,13 +812,139 @@ class EventParser:
         if size == offset:
             return
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            with open(path, "rb") as handle:
                 handle.seek(offset)
-                for line in handle:
-                    self._consume(line)
-                self.offsets[path] = handle.tell()
+                data = handle.read()
         except OSError:
             return
+        # Only complete lines are consumed while the writer runs; an
+        # unterminated tail stays unread (offset not advanced past it) until
+        # its newline arrives. On `final` (after exit), consume any
+        # unterminated tail too so a cut-off record is noticed.
+        end = len(data) if final else data.rfind(b"\n") + 1
+        self._source = path
+        try:
+            for line in data[:end].decode("utf-8", errors="replace").split("\n"):
+                self._consume(line)
+        finally:
+            self._source = None
+        self.offsets[path] = offset + end
+
+    def integrity_issues(self, receiver_log: str, display_log: str | None) -> list[str]:
+        """Fail-closed capture validity from every line read so far (#90 review)."""
+        receiver = aa_log_integrity.assess_receiver(self.integrity.get(receiver_log, []))
+        issues = []
+        if not receiver["complete"]:
+            issues.append("receiver_log_incomplete")
+        else:
+            if receiver["state_lost"]:
+                issues.append("state_log_dropped")
+            if receiver["media_lost"]:
+                issues.append("media_telemetry_dropped")
+        if display_log is not None and not aa_log_integrity.assess_display(
+                self.integrity.get(display_log, []))["complete"]:
+            issues.append("display_log_incomplete")
+        return issues
+
+    _METRIC_KEYS = {"audio_scheduling_skew_ms": "audio_scheduling_skew_ms",
+                    "audio_latency_ms": "audio_latency_ms", "frame_drops": "frame_drops",
+                    "av_sync_ms": "av_sync_ms"}
+
+    def _metric_targets(self, event: dict, envelope: object, kind: object) -> set[str]:
+        targets = {target for key, target in self._METRIC_KEYS.items() if key in event}
+        if envelope in ("video_ipc_send", "video_ipc_receive"):
+            targets |= set(_IPC_KEYS.values())
+        if envelope == "video_decode_completed":
+            targets |= set(_DECODE_KEYS.values())
+        if envelope in ("audio_write_completed", "video_presented"):
+            targets.add("av_sync_ms")
+        if kind == "decode_stats":
+            targets.add("frame_drops")
+        if envelope == "audio_stall_bypass":
+            targets |= {"audio_stall_dropouts", "audio_stall_dropped_chunks", "audio_stall_unrecovered"}
+        return targets
+
+    def _admit_after_cutoff(self, event: dict, envelope: object, kind: object) -> bool:
+        """Handle a record read after the window closed; True for a non-metric record.
+
+        A metric record is never fed into the live parser state after the
+        cutoff (the exported metrics stay frozen). One emitted inside the
+        window is counted at its emission time: its peak and cumulative values
+        are kept in ``late_values`` and merged into the frozen export. When its
+        emission time is unknown, or its metric cannot be merged (the A/V
+        pairing, video summaries, stall bookkeeping), the metric is invalid.
+        """
+        targets = self._metric_targets(event, envelope, kind)
+        if not targets:
+            return True
+        assert self.cutoff_ns is not None
+        stamp = aa_log_integrity.emit_ns(event)
+        if stamp is None and envelope in ("video_ipc_send", "video_ipc_receive",
+                                          "video_decode_completed", "video_presented"):
+            # Video endpoints carry their own monotonic measurement times; the
+            # display's video_presented (ProjectionWidget) has no emit_ns.
+            value = event.get("observed_ns" if envelope in ("video_ipc_send", "video_ipc_receive")
+                              else "completed_ns")
+            if type(value) is int and value > 0:
+                stamp = value
+        if stamp is None:
+            self.late_targets |= targets  # unknown source time: inclusion is uncertain
+            return False
+        if stamp > self.cutoff_ns:
+            return False  # emitted after the window: not part of the measurement
+        mergeable = {"audio_scheduling_skew_ms": "audio_scheduling_skew_ms",
+                     "audio_latency_ms": "audio_latency_ms", "frame_drops": "frame_drops"}
+        if kind == "decode_stats":
+            for key in ("dropped", "drops"):
+                if key in event:
+                    self._late_value(event[key], "frame_drops", integer=True)
+        for key, target in mergeable.items():
+            if key in event:
+                self._late_value(event[key], target, integer=target == "frame_drops")
+        self.late_targets |= targets - set(mergeable.values())
+        return False
+
+    def _late_value(self, raw: object, target: str, *, integer: bool = False) -> None:
+        try:
+            valid = (not isinstance(raw, bool) and isinstance(raw, (int, float))
+                     and math.isfinite(raw) and (not integer or isinstance(raw, int)))
+        except OverflowError:
+            valid = False
+        if not valid:
+            self.late_targets.add(target)
+            return
+        assert isinstance(raw, (int, float))
+        prior = self.late_values.get(target)
+        self.late_values[target] = raw if prior is None else max(prior, raw)
+
+    def _wireless(self, event: dict, envelope: object) -> None:
+        """The wireless receiver's session markers (tools/perf/aa_transport.py)."""
+        if envelope == "media_telemetry_dropped":
+            self.media_telemetry_dropped += 1
+        # Admission retries before the first active session are startup (the
+        # receiver gives each attempt 15 s); only after it are they a drop.
+        if envelope == "wireless_admission":
+            self.admissions += 1
+            if self.session_id is not None:
+                self.readmitted = True
+                self.projection_active = False  # a re-admission: the link was lost
+        if envelope == "wireless_admission_expired" and self.session_id is not None:
+            self.readmitted = True
+            self.projection_active = False
+        if transport.diag_kind(event) != "session_state_changed":
+            return
+        state, mono = event.get("to_state"), event.get("mono_ns")
+        session = event.get("session")
+        if self.session_id is not None and session != self.session_id:
+            self.projection_active = False  # a new session after the first one
+        if state == "active" and self.session_id is None:
+            self.session_id = session
+            if type(mono) is int and self.receiver_started_ns is not None and self.startup_ms is None:
+                self.startup_ms = max(0, (mono - self.receiver_started_ns) // 10**6)
+            if not self.readmitted:
+                self.projection_active = True
+        elif state in ("disconnected", "reconnecting", "failed", "stopping"):
+            self.projection_active = False
 
     def _consume(self, line: str) -> None:
         line = line.strip()
@@ -697,6 +953,9 @@ class EventParser:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            # A cut-off catch-up record or drop notice hides what it carried.
+            if '"audio_catch_up"' in line or '"media_telemetry_dropped"' in line:
+                self._doubt_catch_up()
             return
         if not isinstance(event, dict):
             return
@@ -726,6 +985,15 @@ class EventParser:
                     self._number({"invalid": None}, "invalid", target)
         if envelope == "err":
             self.terminal_errors.append({"event": "err", "code": str(event.get("code", "unknown"))})
+        if self._source is not None:
+            records = self.integrity.setdefault(self._source, [])
+            if envelope in aa_log_integrity.RELEVANT_EVENTS:
+                records.append(event)
+            elif any(r.get("event") in ("log_complete", "telemetry_complete") for r in records[-1:]):
+                # A record after the completion record: the log was not proven complete.
+                records.append({"event": aa_log_integrity.AFTER_COMPLETION})
+        if self.cutoff_ns is not None and not self._admit_after_cutoff(event, envelope, kind):
+            return
         # A sink stall (#60) is an audio output gap, never a silent one. Only a
         # resumed sink counts as survived; a failed reopen, a stop during
         # recovery or a bypass still open at the end is unrecovered.
@@ -743,6 +1011,10 @@ class EventParser:
                 int(self.metrics["audio_stall_dropped_chunks"] or 0) + lost)
         if envelope == "audio_stall_bypass":
             self.metrics["audio_stall_unrecovered"] = self.stall_failed + int(self.stall_open)
+        if envelope == "audio_catch_up":
+            self._catch_up(event)
+        if envelope == "media_telemetry_dropped":
+            self._media_dropped(event)
         if envelope == "video_sent" and isinstance(event.get("units"), int):
             self.video_units = event["units"]
         if envelope == "audio_chunks" and isinstance(event.get("count"), int):
@@ -752,6 +1024,8 @@ class EventParser:
         if envelope == "active" and isinstance(event.get("startup_ms"), int):
             self.startup_ms = event["startup_ms"]
             self.projection_active = True
+        if self.wireless:
+            self._wireless(event, envelope)
         if envelope in ("stopping", "disconnected", "err"):
             self.projection_active = False
         if kind == "decode_stats":
@@ -816,26 +1090,40 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     managed_display = bool(args.display and not args.no_display)
     video_socket = getattr(args, "video_socket", None)
     input_socket = getattr(args, "input_socket", None)
-    receiver_cmd = [args.receiver, "--port", args.port, "--duration-ms",
-                    str((args.duration_seconds + startup_timeout + 10) * 1000)]
-    if args.store:
+    wireless = getattr(args, "transport", transport.DEFAULT_TRANSPORT) == "wireless"
+    lifetime_s = args.duration_seconds + startup_timeout + 10
+    if wireless:
+        # Wireless binds adb and prepares the phone after the receiver is up
+        # (wired does it before launch): the receiver must outlive that too, or
+        # its own --duration-ms timer would end a healthy stage early.
+        lifetime_s += _ADB_BIND_TIMEOUT_SECONDS + _WIRELESS_PREPARE_HEADROOM_SECONDS
+    lifetime_ms = str(int(min(lifetime_s * 1000, _RECEIVER_MAX_LIFETIME_MS)))
+    if wireless:
+        receiver_cmd = [args.receiver, "--store-dir", str(Path(args.store).absolute().parent),
+                        "--phone-id", str(args.phone_id), "--diagnostics",
+                        *(["--ap-channel", str(args.ap_channel)] if getattr(args, "ap_channel", None) else []),
+                        "--duration-ms", lifetime_ms]
+    else:
+        receiver_cmd = [args.receiver, "--port", args.port, "--duration-ms", lifetime_ms]
+    if args.store and not wireless:
         receiver_cmd += ["--store", args.store]
     if video_socket:
         receiver_cmd += ["--video-socket", video_socket]
     if input_socket:
         receiver_cmd += ["--input-socket", input_socket]
     phone_serial = getattr(args, "phone_serial", None)
-    if phone_serial:
+    if phone_serial and not wireless:
         # Same-phone binding at the point of use (#137): the receiver itself
         # refuses a first link or reconnect from any other physical phone.
         receiver_cmd += ["--require-usb-serial", phone_serial]
-    if managed_display:
+    if managed_display and not wireless:
         # Contract: --require-video-consumer makes the receiver emit "ready"
         # after listeners/control init and BEFORE version negotiation.
         receiver_cmd += ["--require-video-consumer"]
 
     samples: list[Sample] = []
     parser = EventParser()
+    parser.wireless = wireless
     progress = ProjectionProgress()
     receiver: subprocess.Popen | None = None
     display: subprocess.Popen | None = None
@@ -843,12 +1131,21 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     # the display's test control channel, media kept playing for the stage.
     workload = None
     stimulus: moving_map.SoakStimulus | None = None
+    # Wired: adb by the USB serial. Wireless: the <ip>:5555 bound after active.
+    adb_target = {"serial": None if wireless else phone_serial}
+
+    def phone_adb(*a: str) -> subprocess.CompletedProcess:
+        if adb_target["serial"] is None:
+            return subprocess.CompletedProcess(["adb", *a], 1, "", "adb not bound to the phone")
+        return moving_map.adb_runner(adb_target["serial"])(*a)
+    prepared = not wireless
     if getattr(args, "workload", "none") == "moving-map":
         workload = moving_map.MovingMap(
-            moving_map.adb_runner(phone_serial), media_uri=args.media_uri,
+            phone_adb, media_uri=args.media_uri,
             media_type=getattr(args, "media_type", None),
             media_component=getattr(args, "media_component", None),
-            geo_uri=getattr(args, "geo_uri", None) or moving_map.DEFAULT_GEO_URI)
+            geo_uri=getattr(args, "geo_uri", None) or moving_map.DEFAULT_GEO_URI,
+            usb_reset=not wireless)
         args.cleanup_failures = ["phone_restore_not_reached"]  # until restore_phone runs
     av_series: dict = {"pair_t_ns": [], "pair_skew_ns": [], "audio_intervals_ns": []}
     rec_file = None
@@ -865,6 +1162,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     inventory: tuple[ThermalZone, ...] = ()
     video_evidence = VideoEvidence((), (), ())
     observed_duration = 0.0
+    catch_up_doubts_at_cutoff: int | None = None
     deadline = start + startup_timeout
 
     def read_sample() -> Sample:
@@ -883,7 +1181,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             receiver_rss_mb=_rss_mb(receiver.pid),
             receiver_cpu_ticks=_cpu_ticks(receiver.pid),
             thermal_zones=zones,
-            projection_active=parser.projection_active,
+            # Wireless: the window may start only once the phone is prepared.
+            projection_active=parser.projection_active and prepared,
             video_units=parser.video_units, audio_chunks=parser.audio_chunks,
             video_presentations=parser.video_presentations,
             audio_writes=parser.audio_writes, av_pairs=parser.av_pairs,
@@ -891,8 +1190,58 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
 
     concurrent_builds: list[dict] = []
     own_processes = ancestors()
+    link: dict | None = None
+    host_usb_due = 0.0
+
+    def bind_and_prepare() -> bool:
+        """Wireless, once active: adb to the expected phone over the AP, then its setup.
+
+        False when the receiver exited meanwhile: the caller's early-exit path
+        then judges the stage (a product failure, not an adb block).
+        """
+        nonlocal deadline
+        began = time.monotonic()
+        interface = args.ap_interface
+        reason = "adb_unreachable"
+        while time.monotonic() - began < _ADB_BIND_TIMEOUT_SECONDS:
+            if receiver.poll() is not None:
+                return False
+            candidate, reason = transport.session_candidate(
+                transport.receiver_session_peers(receiver.pid), transport.read_ap_stations(interface))
+            bound = None
+            if candidate:
+                bound, reason = transport.bind_adb(phone_serial, [candidate], _host_adb)
+            if bound:
+                adb_target["serial"] = bound
+                break
+            time.sleep(1.0)
+        if adb_target["serial"] is None:
+            raise PhoneSetupError(f"{reason}: adb did not reach --phone-serial over the AP link")
+        link["adb_bound"] = True
+        link["before"] = transport.link_snapshot(phone_adb)
+        if workload is not None and not workload.prepare_phone(
+                lambda seconds: (time.sleep(seconds), True)[1]):
+            raise PhoneSetupError(workload.phone_failure or "phone setup did not complete")
+        deadline += time.monotonic() - began  # the phone setup is not startup budget
+        return True
+
+    def sample_host_usb() -> None:
+        nonlocal host_usb_due
+        if wireless and time.monotonic() >= host_usb_due and len(link["host_usb"]["during"]) < 1000:
+            link["host_usb"]["during"].append(transport.host_usb_evidence(phone_serial))
+            host_usb_due = time.monotonic() + _HOST_USB_PERIOD_SECONDS
+
     try:
-        if workload is not None:
+        if wireless:
+            # The cable must be out, shown from this host's USB bus (aa_transport.py).
+            link = {"phone_id": args.phone_id, "adb_bound": False, "before": None, "after": None,
+                    "host_usb": {"before": transport.host_usb_evidence(phone_serial),
+                                 "during": [], "after": None}}
+            refusal = transport.host_usb_refusal(link["host_usb"]["before"])
+            if refusal:
+                raise PhoneSetupError(f"{refusal}: the phone's USB cable must be unplugged "
+                                      f"for a wireless stage")
+        if workload is not None and not wireless:
             if not workload.prepare_phone(lambda seconds: (time.sleep(seconds), True)[1]):
                 # Nothing is launched; the finally restores the phone.
                 raise PhoneSetupError(workload.phone_failure or "phone setup did not complete")
@@ -903,6 +1252,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         rec_file = open(receiver_log, "w", encoding="utf-8")
         receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
                                     start_new_session=True)
+        parser.receiver_started_ns = time.monotonic_ns()
         _record_process(args, "receiver", receiver.pid)
         if managed_display:
             # Bounded receiver-ready observation: the managed display launches on
@@ -955,8 +1305,16 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                 break
             if parser.terminal_errors:
                 break
+            if wireless and not prepared and parser.projection_active:
+                if not bind_and_prepare():
+                    early_exit = True
+                    break
+                prepared = True
+                continue  # the next sample is the first that may start the window
+            if prepared:
+                sample_host_usb()
             if (workload is not None and stimulus is None and display is not None
-                    and display.stdin is not None and parser.projection_active):
+                    and display.stdin is not None and parser.projection_active and prepared):
                 stimulus = moving_map.SoakStimulus(workload, display.stdin.fileno(), receiver_log,
                                                    since_ns=time.monotonic_ns())
                 stimulus.start()
@@ -999,8 +1357,12 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                 break
 
         video_evidence = parser.video_measurements.finish(progress.last_ns)
+        # The window closes at the last accepted sample; records still in flight
+        # are admitted by their own emission time after the final read.
+        parser.cutoff_ns = origin_ns + progress.last_ns
         events = {key: value for key, value in parser.metrics.items()
                   if key not in {*_DECODE_KEYS.values(), *_IPC_KEYS.values()}}
+        catch_up_doubts_at_cutoff = parser.catch_up_doubts
         events["helper_rss_mb"] = None
         events["video_units"] = parser.video_units
         events["audio_chunks"] = parser.audio_chunks
@@ -1028,6 +1390,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         raise SystemExit(f"error: cannot launch receiver: {exc}") from exc
     finally:
         parser.video_measurements.frozen = True
+        if parser.cutoff_ns is None:
+            parser.cutoff_ns = origin_ns + progress.last_ns
         if stimulus is not None:
             stimulus.stop()
             # A control failure in the final interval is only seen after the
@@ -1037,6 +1401,13 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                 parser.terminal_errors.append({"event": "err", "code": stimulus.failure})
         if display is not None and display.poll() is not None:
             display_survived = False
+        if wireless and workload is not None:
+            # adb reaches the phone only while the session (the AP link) is up.
+            if adb_target["serial"] is not None:
+                for failure in workload.restore_phone():
+                    print(f"cleanup failure: {failure}", file=sys.stderr)
+                link["after"] = transport.link_snapshot(phone_adb)
+            args.cleanup_failures = list(workload.cleanup_failures)
         for name, proc in (("display", display), ("receiver", receiver)):
             cleanup = _terminate(proc)
             if cleanup != "clean":
@@ -1045,15 +1416,46 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             rec_file.close()
         if disp_file is not None:
             disp_file.close()
-        if workload is not None:
+        if wireless and link is not None:
+            if adb_target["serial"] is not None:
+                _host_adb("disconnect", adb_target["serial"])
+            if receiver is not None:
+                host = link["host_usb"]
+                host["after"] = transport.host_usb_evidence(phone_serial)
+                for moment, evidence in [("during", e) for e in host["during"]] + [("after", host["after"])]:
+                    refusal = transport.host_usb_refusal(evidence)
+                    if refusal and workload is not None:
+                        workload.cleanup_failures.append(f"{refusal.split(':')[0]}_{moment}: {refusal}")
+                        print(f"cleanup failure: {refusal}", file=sys.stderr)
+                        break
+                if workload is not None:
+                    args.cleanup_failures = list(workload.cleanup_failures)
+        elif workload is not None:
             # Media stopped and verified first, USB mode last (it re-enumerates USB).
             for failure in workload.restore_phone():
                 print(f"cleanup failure: {failure}", file=sys.stderr)
             args.cleanup_failures = list(workload.cleanup_failures)  # for --run-file
-        parser.poll(str(receiver_log))
+        parser.poll(str(receiver_log), final=True)
         if display is not None:
-            parser.poll(str(display_log))
+            parser.poll(str(display_log), final=True)
 
+    # In-window records read after the cutoff count at their emission time
+    # (#90 review 4): merged into the frozen export, or the metric is invalid.
+    for target, value in parser.late_values.items():
+        if target in invalid_telemetry or target in parser.late_targets:
+            continue
+        prior = events.get(target)
+        events[target] = value if prior is None else max(prior, value)
+    if parser.late_targets:
+        invalid_telemetry = sorted(set(invalid_telemetry) | parser.late_targets
+                                   | {"late_in_window_telemetry"})
+    if catch_up_doubts_at_cutoff is not None and parser.catch_up_doubts != catch_up_doubts_at_cutoff:
+        # #154: the catch-up totals froze at the cutoff, but a drop notice is
+        # reported only with a later media record - up to the receiver's stop
+        # (SIGTERM). One read only in this final poll may stand for a catch-up
+        # record from before the cutoff: the frozen totals are unconfirmed.
+        for key in ("audio_catch_up_events", "audio_catch_up_frames", "audio_catch_up_ms"):
+            events[key] = None
     if receiver is not None:
         receiver_exit = receiver.returncode
     if not stopped_by_us and receiver_exit is not None and receiver_exit != 0:
@@ -1063,7 +1465,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
 
     capture = {
         "schema": CAPTURE_SCHEMA,
-        "mode": "wired",
+        "mode": "wireless" if wireless else "wired",
         "duration_seconds": args.duration_seconds,
         "observed_duration_seconds": observed_duration,
         "active_projection_seconds": progress.seconds,
@@ -1093,6 +1495,20 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     # Provenance of the measured binaries: the build type the guard verified, the
     # build directory it checked and whether the qualification override was used,
     # so no run can be read as a qualification result it is not.
+    # Validity is decided after the final log reads (#90 review): a state
+    # overflow, a media drop or a missing completion record that only drained
+    # during shutdown still invalidates the capture. Metrics keep their cutoff.
+    issues = parser.integrity_issues(str(receiver_log), str(display_log) if display is not None else None)
+    if issues:
+        capture["invalid_telemetry"] = sorted(set(capture["invalid_telemetry"]) | set(issues))
+    if {"media_telemetry_dropped", "receiver_log_incomplete"} & set(issues):
+        # Pairing a subset of audio slots can move the signed A/V contract
+        # either way (a dropped slot turned a FAIL into a PASS in review), so
+        # A/V evidence is invalid. Peak metrics (audio latency, frame drops)
+        # stay: a lost sample only lowers an observed peak, so an observed
+        # breach is still a confirmed FAIL, and invalid_telemetry keeps any
+        # in-budget value from qualifying.
+        capture["invalid_telemetry"] = sorted(set(capture["invalid_telemetry"]) | {"av_sync_ms"})
     capture["build"] = build if build is not None else build_record(args)
     capture["workload"] = ({"kind": "moving-map", "media_relaunches": workload.media_relaunches,
                             "drags": workload.drags, "stimulus_started": stimulus is not None,
@@ -1101,6 +1517,10 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                             "drag_t_ns": [t - origin_ns for t in workload.drag_ns][:_AV_SERIES_LIMIT]}
                            if workload is not None else {"kind": "none"})
     capture["concurrent_builds"] = concurrent_builds
+    if wireless:
+        capture["link"] = link
+        capture["startup_basis"] = "harness_launch_to_active"
+        capture["media_telemetry_dropped"] = parser.media_telemetry_dropped
     if thermal_policy is not None:
         capture["thermal_policy"] = asdict(thermal_policy)
     return capture
@@ -1110,7 +1530,17 @@ def _cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--receiver", required=True, help="receiver binary to launch")
     parser.add_argument("--display", default=None, help="dummy display binary (optional)")
-    parser.add_argument("--port", required=True, help="USB port context passed to the receiver")
+    parser.add_argument("--port", required=True, help="USB port context passed to the receiver "
+                        "(wired; ignored for --transport wireless)")
+    parser.add_argument("--transport", choices=transport.TRANSPORTS, default=transport.DEFAULT_TRANSPORT,
+                        help="session transport (default wired)")
+    parser.add_argument("--phone-id", type=int, default=None,
+                        help="wireless: the approved wireless phone id in the trust store")
+    parser.add_argument("--ap-interface", default=None,
+                        help="wireless: the helper's AP interface (required; its root-only "
+                             "ap.conf is never read)")
+    parser.add_argument("--ap-channel", type=int, choices=transport.AP_CHANNELS, default=None,
+                        help="wireless: the AP channel ap.conf names (receiver default 36)")
     parser.add_argument("--duration-seconds", required=True, type=int)
     parser.add_argument("--interval", type=float, default=5.0)
     parser.add_argument("--store", default=None, help="approved-phone store path passed to receiver")
@@ -1147,6 +1577,15 @@ def _cli(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     args.run_file_record = None
     args.cleanup_failures = []  # nothing has touched the phone yet
+    if args.transport == "wireless" and (not args.phone_id or args.phone_id <= 0 or not args.store
+                                         or Path(args.store).name != "approved-phones.json"
+                                         or not args.phone_serial
+                                         or not transport.valid_interface(args.ap_interface)):
+        print("usage error: --transport wireless needs --phone-id, --phone-serial (adb, for the "
+              "workload and the link record), --ap-interface IFACE and "
+              "--store <dir>/approved-phones.json",
+              file=sys.stderr)
+        return 2
     if args.run_file:
         # Lead a process group of our own (already true for a session leader):
         # every phone command we start is in it, and nothing else is.

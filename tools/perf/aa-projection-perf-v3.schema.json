@@ -43,7 +43,8 @@
     },
     "mode": {
       "enum": [
-        "wired"
+        "wired",
+        "wireless"
       ]
     },
     "duration_requested": {
@@ -203,6 +204,89 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/metric"
+      },
+      "properties": {
+        "audio_catch_up_events": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/metric"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "events"
+                },
+                "gated": {
+                  "const": false
+                },
+                "status": {
+                  "const": "INFORMATIONAL"
+                },
+                "value": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                }
+              }
+            }
+          ]
+        },
+        "audio_catch_up_frames": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/metric"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "frames"
+                },
+                "gated": {
+                  "const": false
+                },
+                "status": {
+                  "const": "INFORMATIONAL"
+                },
+                "value": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                }
+              }
+            }
+          ]
+        },
+        "audio_catch_up_ms": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/metric"
+            },
+            {
+              "properties": {
+                "unit": {
+                  "const": "ms"
+                },
+                "gated": {
+                  "const": false
+                },
+                "status": {
+                  "const": "INFORMATIONAL"
+                },
+                "value": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "minimum": 0
+                }
+              }
+            }
+          ]
+        }
       },
       "required": [
         "receiver_rss_peak_mb",
@@ -632,6 +716,15 @@
             }
           }
         }
+      ]
+    },
+    "link": {
+      "$ref": "#/$defs/wireless_link"
+    },
+    "startup_basis": {
+      "enum": [
+        "receiver",
+        "harness_launch_to_active"
       ]
     }
   },
@@ -1136,6 +1229,194 @@
           ]
         }
       ]
+    },
+    "phone_link_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "usb_functions",
+        "usb_aoa",
+        "wifi",
+        "bluetooth_on"
+      ],
+      "properties": {
+        "usb_functions": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "usb_aoa": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "wifi": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "connected",
+            "frequency_mhz",
+            "channel",
+            "rssi_dbm"
+          ],
+          "properties": {
+            "connected": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "frequency_mhz": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "channel": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "rssi_dbm": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        },
+        "bluetooth_on": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "host_usb_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "readable",
+        "phone_attached",
+        "aoa_attached"
+      ],
+      "properties": {
+        "readable": {
+          "type": "boolean"
+        },
+        "phone_attached": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "aoa_attached": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "wireless_link": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "wireless only (tools/perf/aa_transport.py): whether adb was bound to the soak phone over the AP link, the phone's own link state read over that adb, and the Jetson's USB bus before, during and after the stage (no identifiers: the phone id and serial stay in the local capture and drive-smoke record)",
+      "required": [
+        "adb_bound",
+        "before",
+        "after",
+        "host_usb"
+      ],
+      "properties": {
+        "adb_bound": {
+          "type": "boolean"
+        },
+        "before": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/phone_link_snapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/phone_link_snapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "host_usb": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "before",
+            "during",
+            "after"
+          ],
+          "properties": {
+            "before": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/host_usb_evidence"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "during": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/host_usb_evidence"
+              }
+            },
+            "after": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/host_usb_evidence"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        }
+      }
     }
-  }
+  },
+  "anyOf": [
+    {
+      "properties": {
+        "mode": {
+          "const": "wired"
+        }
+      }
+    },
+    {
+      "properties": {
+        "mode": {
+          "const": "wireless"
+        }
+      },
+      "required": [
+        "link",
+        "startup_basis"
+      ]
+    }
+  ]
 }

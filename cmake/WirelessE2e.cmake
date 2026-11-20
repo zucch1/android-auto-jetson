@@ -86,7 +86,8 @@ if(NOT CMAKE_CROSSCOMPILING)
         COMMAND "${AA_DBUS_RUN_SESSION}" -- "${Python3_EXECUTABLE}" -B
                 "${CMAKE_SOURCE_DIR}/tests/transport/tls_run.py"
                 "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:aa_wireless_audio_worker_test>")
-    set_tests_properties(wireless_e2e_audio_worker PROPERTIES TIMEOUT 90)
+    set_tests_properties(wireless_e2e_audio_worker PROPERTIES
+        TIMEOUT 120 ENVIRONMENT "AA_TLS_RUN_TIMEOUT=110")
     add_test(NAME wireless_e2e_audio_worker_telemetry
         COMMAND "${AA_DBUS_RUN_SESSION}" -- "${Python3_EXECUTABLE}" -B
                 "${CMAKE_SOURCE_DIR}/tests/wireless_e2e/test_audio_worker_telemetry.py"

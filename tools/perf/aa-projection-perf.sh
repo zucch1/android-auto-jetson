@@ -18,6 +18,17 @@
 #   verifies; optional --media-type, --geo-uri): media for the whole stage,
 #   Google Maps dragged once a second (tools/perf/aa_moving_map.py).
 #
+# --mode wireless (live stages only) launches aa-wireless-receiver (default
+# /opt/aa/aa-wireless-receiver) for --phone-id N, approved in --store
+# DIR/approved-phones.json (required). The phone's USB cable must be unplugged
+# (checked on the target's USB bus); adb reaches it over the helper's AP after
+# admission (`adb tcpip 5555` once beforehand), bound by ro.serialno to
+# --phone-serial (its hardware serial). The drive smoke must be a wireless one
+# for the same --phone-id (aa_drive_smoke.py check --transport wireless). Pass
+# --ap-interface IFACE (required) and --ap-channel N (when ap.conf names a
+# channel other than 36): the helper's ap.conf is root-only and never read. The
+# result's mode is wireless. See tools/perf/aa_transport.py.
+#
 # This tool measures CPU/RSS, thermal state, frame drops, decode/IPC timing,
 # A/V sync and audio latency during wired projection on the qualified Jetson,
 # then evaluates CONTRACTUAL budgets (receiver RSS <=250 MB, CPU <=50% of one
@@ -66,7 +77,10 @@ DURATION=""
 DURATION_SET=0
 HOST="${AA_PERF_HOST:-jetson.local}"
 PORT="${AA_PERF_PORT:-1-2.1}"
-RECEIVER="/opt/aa/aa-wired-receiver"
+RECEIVER=""
+PHONE_ID=""
+AP_INTERFACE=""
+AP_CHANNEL=""
 DISPLAY_BIN="/opt/aa/aa-dummy-display"
 STORE=""
 OUT=""
@@ -135,6 +149,9 @@ while (($# > 0)); do
         --display-env) require_value "$@"; DISPLAY_ENV="$2"; shift 2 ;;
         --drive-smoke) require_value "$@"; DRIVE_SMOKE="$2"; shift 2 ;;
         --phone-serial) require_value "$@"; PHONE_SERIAL="$2"; shift 2 ;;
+        --phone-id) require_value "$@"; PHONE_ID="$2"; shift 2 ;;
+        --ap-interface) require_value "$@"; AP_INTERFACE="$2"; shift 2 ;;
+        --ap-channel) require_value "$@"; AP_CHANNEL="$2"; shift 2 ;;
         --media-uri) require_value "$@"; MEDIA_URI="$2"; shift 2 ;;
         --media-type) require_value "$@"; MEDIA_TYPE="$2"; shift 2 ;;
         --media-component) require_value "$@"; MEDIA_COMPONENT="$2"; shift 2 ;;
@@ -204,10 +221,32 @@ if ((${#build_args[@]})); then
     printf -v build_args_remote ' %q' "${build_args[@]}"
 fi
 
-if ((!READINESS_ONLY)) && [[ "$MODE" != "wired" ]]; then
-    echo "usage error: --mode must be 'wired' (got '${MODE:-<unset>}')" >&2
+if ((!READINESS_ONLY)) && [[ "$MODE" != "wired" && "$MODE" != "wireless" ]]; then
+    echo "usage error: --mode must be 'wired' or 'wireless' (got '${MODE:-<unset>}')" >&2
     exit 2
 fi
+if [[ "$MODE" == "wireless" ]] && ((!READINESS_ONLY)); then
+    if [[ -n "$CAPTURE" ]]; then
+        # Live stages only: a replay is judged by the mode its capture records.
+        echo "usage error: --mode wireless is for live stages; replay a capture with --mode wired" >&2
+        exit 2
+    elif [[ ! "$PHONE_ID" =~ ^[1-9][0-9]*$ || "$(basename -- "${STORE:-x}")" != "approved-phones.json" ]]; then
+        echo "usage error: --mode wireless needs --phone-id N and --store DIR/approved-phones.json" >&2
+        exit 2
+    elif [[ ! "$AP_INTERFACE" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$ ]]; then
+        # The helper's ap.conf is root-only (0600) and beside the AP credentials:
+        # the operator names the interface; the harness never reads that file.
+        echo "usage error: --mode wireless needs --ap-interface IFACE (the helper's AP interface)" >&2
+        exit 2
+    elif [[ -n "$AP_CHANNEL" && ! "$AP_CHANNEL" =~ ^(36|40|44|48)$ ]]; then
+        echo "usage error: --ap-channel must be 36, 40, 44 or 48 (the channel ap.conf names)" >&2
+        exit 2
+    fi
+fi
+if [[ "$MODE" == "wireless" ]]; then
+    RECEIVER="${RECEIVER:-/opt/aa/aa-wireless-receiver}"
+fi
+RECEIVER="${RECEIVER:-/opt/aa/aa-wired-receiver}"
 if [[ ! "$INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "$INTERVAL" == "0" || "$INTERVAL" == "0.0" ]]; then
     echo "usage error: --interval must be a positive number" >&2
     exit 2
@@ -288,7 +327,7 @@ PY
 blocked_result() {
     local reason="$1"
     local capture="$BUFFER/blocked-capture.json"
-    AA_BLOCK_BUILD_TYPE="${2:-}" AA_BLOCK_BUILD_DIR="${3:-}" \
+    AA_BLOCK_MODE="$MODE" AA_BLOCK_BUILD_TYPE="${2:-}" AA_BLOCK_BUILD_DIR="${3:-}" \
         AA_BLOCK_ALLOW_UNOPTIMIZED="${4:-0}" "$PY" -B - "$capture" <<'PY'
 import json, os, sys
 build_type = os.environ.get("AA_BLOCK_BUILD_TYPE") or None
@@ -300,7 +339,7 @@ doc = {
     "monotonic_origin_ns": 0,
     "cpu_ticks_per_second": 1,
     "video_evidence": {"blocks": [], "ipc_latency_ns": [], "decode_latency_ns": []},
-    "mode": "wired",
+    "mode": os.environ.get("AA_BLOCK_MODE") or "wired",
     "duration_seconds": 0,
     "crashes": 0,
     "samples": [],
@@ -331,7 +370,7 @@ validate_result() {
 if ((READINESS_ONLY)); then
     if check_readiness; then
         write_readiness true ""
-        echo "READY: ${HOST} prerequisites met (mode=wired, port=${PORT})"
+        echo "READY: ${HOST} prerequisites met (mode=${MODE:-wired}, port=${PORT})"
         exit 0
     fi
     write_readiness false "$ready_reason"
@@ -479,17 +518,23 @@ display_sha="$(remote_sha256 "$DISPLAY_BIN")"
 # gate blocks with drive_smoke_phone_unverified.
 verified_serial=""
 if [[ "$PHONE_SERIAL" =~ ^[A-Za-z0-9._:-]+$ ]]; then
-    devices="$(remote "adb devices -l" 2>/dev/null || true)"
-    if awk -v serial="$PHONE_SERIAL" -v port="usb:${PORT}" '
-            $1 == serial && $2 == "device" { for (i = 3; i <= NF; i++) if ($i == port) found = 1 }
-            END { exit found ? 0 : 1 }' <<<"$devices"; then
+    if [[ "$MODE" == "wireless" ]]; then
+        # The cable is out, so adb cannot see the phone yet: the collector binds
+        # adb to this serial over the AP link (ro.serialno) or refuses the stage.
         verified_serial="$PHONE_SERIAL"
+    else
+        devices="$(remote "adb devices -l" 2>/dev/null || true)"
+        if awk -v serial="$PHONE_SERIAL" -v port="usb:${PORT}" '
+                $1 == serial && $2 == "device" { for (i = 3; i <= NF; i++) if ($i == port) found = 1 }
+                END { exit found ? 0 : 1 }' <<<"$devices"; then
+            verified_serial="$PHONE_SERIAL"
+        fi
     fi
 fi
 if ! smoke_reason="$("$PY" -B "$TOOL_DIR/../wired-qa/aa_drive_smoke.py" check \
         --record "${DRIVE_SMOKE:-/nonexistent}" \
         --receiver-sha256 "$receiver_sha" --display-sha256 "$display_sha" \
-        --phone-serial "$verified_serial")"; then
+        --phone-serial "$verified_serial" --transport "$MODE" ${PHONE_ID:+--phone-id "$PHONE_ID"})"; then
     smoke_reason="${smoke_reason:-drive_smoke_missing}"
     blocked_result "$smoke_reason" "$build_type_known" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
@@ -508,7 +553,8 @@ import pathlib, sys
 root = pathlib.Path(sys.argv[1])
 collector = (root / "aa_projection_collect.py").read_text()
 print("import sys, types")
-for name in ("aa_measurement_coverage", "aa_video_measurements", "aa_build_guard", "aa_moving_map"):
+for name in ("aa_measurement_coverage", "aa_video_measurements", "aa_build_guard", "aa_moving_map",
+             "aa_log_integrity", "aa_transport"):
     source = (root / (name + ".py")).read_text()
     print("module = types.ModuleType(" + repr(name) + ")")
     print("sys.modules[module.__name__] = module")
@@ -580,6 +626,8 @@ timeout -k "$SSH_KILL_GRACE_S" "$collector_timeout" ssh "${SSH_OPTS[@]}" "$HOST"
         ${verified_serial:+--phone-serial '${verified_serial}'} \
         --workload moving-map --media-uri '${MEDIA_URI}' ${MEDIA_TYPE:+--media-type '${MEDIA_TYPE}'} \
         ${MEDIA_COMPONENT:+--media-component '${MEDIA_COMPONENT}'} ${GEO_URI:+--geo-uri '${GEO_URI}'} \
+        --transport '${MODE}' ${PHONE_ID:+--phone-id '${PHONE_ID}'} \
+        ${AP_INTERFACE:+--ap-interface '${AP_INTERFACE}'} ${AP_CHANNEL:+--ap-channel '${AP_CHANNEL}'} \
         --run-file '${RUN_FILE}'" \
         <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err" &
 collector_job=$!

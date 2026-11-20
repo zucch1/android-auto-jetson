@@ -9,6 +9,7 @@
 // would reach) and read observable status back - never a production control
 // surface (no production UI/settings/app-host scope, task 44 owns that).
 
+#include "../json_stdout.hpp"
 #include <aa/display/Display.hpp>
 #include <aa/display/TelemetryWriter.hpp>
 
@@ -111,7 +112,7 @@ private:
         const std::string out = line + "\n";
         std::size_t off = 0;
         while (off < out.size()) {
-            const ssize_t n = ::write(1, out.data() + off, out.size() - off);
+            const ssize_t n = ::write(aa::tools::json_fd(), out.data() + off, out.size() - off);
             if (n <= 0) {
                 return;
             }
@@ -174,7 +175,15 @@ private:
             return;
         }
         if (tok[0] == "status") {
-            write_line(status_json());
+            // `status <id>` echoes a caller's request id (1-32 of [A-Za-z0-9_-])
+            // so a gate binds the reply to its own request, never to an
+            // older status line still in the log (#90 review 4).
+            auto line = status_json();
+            if (tok.size() == 2 && request_id_ok(tok[1]) && line.size() > 1 && line.back() == '}') {
+                line.pop_back();
+                line += ",\"request\":\"" + tok[1] + "\"}";
+            }
+            write_line(line);
             return;
         }
         if (tok[0] == "key" && tok.size() == 3) {
@@ -212,6 +221,20 @@ private:
             return;
         }
         write_line("{\"event\":\"err\",\"cmd\":\"unknown\"}");
+    }
+
+    static bool request_id_ok(const std::string& id) {
+        if (id.empty() || id.size() > 32) {
+            return false;
+        }
+        for (const char c : id) {
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '_' || c == '-';
+            if (!ok) {
+                return false;
+            }
+        }
+        return true;
     }
 
     static std::vector<std::string> split(const std::string& line) {

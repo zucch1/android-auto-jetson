@@ -59,8 +59,23 @@ def virtual(mode: str) -> dict:
                 late += [{"event": "media_timing", "audio_latency_ms": "bad", "av_sync_ms": "bad"}]
             if mode == "err":
                 late += [{"event": "err", "code": "shutdown-diagnostic"}]
+            if mode in {"healthy_display", "display_in_window"}:
+                # A clean managed-display run: the receiver drains its usual
+                # shutdown records, then its single terminal completion record.
+                late.append({"event": "log_complete", "runtime_dropped": 0, "state_overflow": 0,
+                             "media_rate_limited": 0, "media_backpressure": 0,
+                             "shutdown_dropped": 0, "max_delivery_lag_ms": 1})
+            if mode in {"in_window", "unstamped"}:
+                # #90 review 4: one in-window 250 ms sample delivered only now.
+                late = [{"event": "media_timing", "audio_latency_ms": 250}]
             if mode != "baseline":
                 for event in late:
+                    # Shutdown records carry the receiver's emission stamp: after
+                    # the window, except the in-window sample (or none at all).
+                    if mode == "in_window":
+                        event = event | {"emit_ns": 2 * SECOND}
+                    elif mode != "unstamped":
+                        event = event | {"emit_ns": helper.clock[0]}
                     self.stdout.write(json.dumps(event) + "\n")
                 self.stdout.flush()
             if mode == "whole":
@@ -79,6 +94,17 @@ def virtual(mode: str) -> dict:
         def terminate(self) -> None:
             if self is helper.spawn[0]:
                 self.drain()
+            elif mode in {"healthy_display", "display_in_window"}:
+                # The real ProjectionWidget stamps video_presented with its own
+                # completed_ns and no emit_ns; frames painted after the cutoff
+                # are read only now, then the writer's completion record.
+                done = (helper.clock[0] + 1_000_000 if mode == "healthy_display"
+                        else 3 * SECOND + 500_000_000)
+                for event in ({"event": "video_presented", "frame": 9, "scheduled_ns": done - 1_000_000,
+                               "completed_ns": done, "count": 9},
+                              {"event": "telemetry_complete"}):
+                    self.stdout.write(json.dumps(event) + "\n")
+                self.stdout.flush()
             if mode not in {"forced", "unreaped"}:
                 self.returncode = (-15 if mode == "owned_display" and self is helper.spawn[1]
                                    else 7 if mode == "exit7" else 0)
@@ -103,13 +129,13 @@ def virtual(mode: str) -> dict:
             lines = [event for event in lines if event["event"] != "video_presented"]
         if mode != "inactive" and not (mode == "startup" and second == 1):
             lines += [{"event": "active", "startup_ms": 1}]
-        if mode in {"display", "owned_display"}:
+        if mode in {"display", "owned_display", "healthy_display", "display_in_window"}:
             lines += [helper.READY]
         events[second * SECOND] = [("receiver", json.dumps(event)) for event in lines]
     with (patch.object(collector, "EventParser", Parser),
           patch.object(collector, "_rss_mb", return_value=10.0),
           patch.object(collector, "_cpu_ticks", return_value=0)):
-        managed = mode in {"display", "owned_display"}
+        managed = mode in {"display", "owned_display", "healthy_display", "display_in_window"}
         return helper.run_collect(helper.args_ns(display="display" if managed else None,
             no_display=not managed, duration_seconds=3, interval=1,
             startup_timeout_seconds=4), events, Process)
@@ -265,6 +291,42 @@ def test_real_cli_shutdown() -> None:
                 assert doc["verdict"] == "FAIL", mode
             assert doc["qualification_status"] == "INCOMPLETE"
             print("CLI", mode, actual, doc["verdict"], flush=True)
+
+
+
+def test_late_in_window_sample_counts_at_its_emission_time() -> None:
+    # Given: a 250 ms sample emitted inside the window but read only at drain.
+    capture = virtual("in_window")
+    # Then: it is counted (its emission time is inside the window), never
+    # silently replaced by the in-window 10 ms samples.
+    assert capture["events"]["audio_latency_ms"] == 250, capture["events"]
+    # And: the same sample without an emission stamp makes the metric invalid.
+    capture = virtual("unstamped")
+    assert {"audio_latency_ms", "late_in_window_telemetry"} <= set(capture["invalid_telemetry"]), \
+        capture["invalid_telemetry"]
+
+
+def test_post_window_display_frames_leave_a_healthy_capture_valid() -> None:
+    # Given: a clean managed-display run whose display paints frames after the
+    # window closed; ProjectionWidget stamps them with completed_ns only.
+    capture = virtual("healthy_display")
+    # Then: those frames are outside the measurement, so nothing is invalid
+    # and the capture qualifies exactly as its in-window evidence says.
+    assert capture["invalid_telemetry"] == [], capture["invalid_telemetry"]
+    assert capture["events"]["av_sync_ms"] == 1, capture["events"]
+    assert helper.result(capture, "3s")["metrics"]["av_sync_ms"]["value"] == 1
+    # And at the gate: a soak whose evidence passes v3 still PASSes with this
+    # capture's validity verdict (the fixture above has no continuous audio).
+    import test_v3_av_contract as v3
+    soak = v3.v3(1800)
+    soak["invalid_telemetry"] = capture["invalid_telemetry"]
+    doc = v3.result(soak)
+    assert doc["verdict"] == "PASS", (doc["violations"], doc["blocked_on"])
+    # And: a frame painted inside the window but read only at shutdown cannot
+    # join the frozen A/V pairing, so A/V stays fail-closed.
+    capture = virtual("display_in_window")
+    assert {"av_sync_ms", "late_in_window_telemetry"} <= set(capture["invalid_telemetry"]), \
+        capture["invalid_telemetry"]
 
 
 if __name__ == "__main__":
