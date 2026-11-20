@@ -6179,7 +6179,7 @@ TEST(WiredReceiver, WorkerStallBurstCatchesUpInsteadOfEndingTheSession) {
     // The qualification collector sums each event's own increment at its
     // logged rate (#154 review): together they account every catch-up frame.
     const std::regex catch_up{
-        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)\})"};
+        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)(?:,"emit_ns":[0-9]+)?\})"};
     std::uint64_t logged{};
     std::uint64_t last_total{};
     std::size_t events{};
@@ -6236,7 +6236,7 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     EXPECT_FALSE(report->render_failure);
     // Logged at the 48 kHz output rate, never the 16 kHz input rate.
     const std::regex catch_up{
-        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)\})"};
+        R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)(?:,"emit_ns":[0-9]+)?\})"};
     std::uint64_t logged{};
     std::size_t events{};
     for (auto it = std::sregex_iterator(output.begin(), output.end(), catch_up); it != std::sregex_iterator{}; ++it) {
