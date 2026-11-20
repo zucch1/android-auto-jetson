@@ -69,18 +69,24 @@ struct Bootstrap::SocketExpiry final {
     SnapshotDeadline deadline;
     std::mutex mutex;
     std::condition_variable changed;
+    bool fired{}; // under mutex: the worker has shut the socket down at the deadline
     std::jthread worker;
     SocketExpiry(int fd, SnapshotDeadline until) : socket(::fcntl(fd, F_DUPFD_CLOEXEC, 0)), deadline(std::move(until)),
         worker([this](const std::stop_token& stop) {
             std::unique_lock lock{mutex};
             while (!stop.stop_requested()) {
-                if (deadline.expired()) { if (socket >= 0) (void)::shutdown(socket, SHUT_RDWR); return; }
+                if (deadline.expired()) { fired = true; if (socket >= 0) (void)::shutdown(socket, SHUT_RDWR); return; }
                 changed.wait_for(lock, std::chrono::milliseconds(1));
             }
         }) {}
     ~SocketExpiry() { worker.request_stop(); changed.notify_all(); worker.join(); if (socket >= 0) ::close(socket); }
     // The join budget moves the one deadline later, once; the worker sees it on its next wake.
-    void extend(Time until) { const std::lock_guard lock{mutex}; deadline.until = until; changed.notify_all(); }
+    // False once the worker has fired: the phone already has its DISC (#170 review).
+    [[nodiscard]] bool extend(Time until) {
+        const std::lock_guard lock{mutex};
+        if (fired) return false;
+        deadline.until = until; changed.notify_all(); return true;
+    }
 };
 Bootstrap::Bootstrap(int fd, Time accepted, std::function<Time()> now)
     : fd_(fd), deadline_{accepted + kBudget, std::move(now)}, expiry_(std::make_unique<SocketExpiry>(fd, deadline_)) {
@@ -193,7 +199,10 @@ bool Bootstrap::flush(const SnapshotFence& fence) {
         joining_ = true;
         if (deadline_.expired()) { fail(HandoffFailure::timeout, std::nullopt, "handshake deadline passed"); return false; }
         deadline_.until = deadline_.now() + kJoinBudget;
-        if (expiry_) expiry_->extend(deadline_.until);
+        // The expiry worker may have crossed the first budget since the check above.
+        if (expiry_ && !expiry_->extend(deadline_.until)) {
+            fail(HandoffFailure::timeout, std::nullopt, "handshake deadline passed"); return false;
+        }
     }
     return true;
 }

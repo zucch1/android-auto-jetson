@@ -522,6 +522,40 @@ TEST_F(BlueZHeldBootstrapTest, WifiJoinGetsItsOwnBoundAfterCredentials) {
     EXPECT_TRUE(bootstrap->expire()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::timeout);
     EXPECT_TRUE(phone_eof());
 }
+// #170 review (Neon P3): the expiry worker crosses the first budget and shuts the socket down after
+// flush()'s own deadline check, before the join extension. The exchange must then fail, not run on
+// as a live bootstrap whose channel the phone has already lost.
+TEST_F(BlueZHeldBootstrapTest, JoinExtensionAfterTheWorkerFiredFailsTheExchange) {
+    bootstrap.reset();
+    int pair[2]{}; ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair), 0);
+    ::close(sockets[1]); sockets[1] = pair[1]; sender = pair[0];
+    ::close(daemon); daemon = ::dup(pair[0]); ASSERT_GE(daemon, 0);
+    const auto accepted = now;
+    const auto owner = std::this_thread::get_id();
+    std::atomic<bool> crossed{};
+    // This thread still reads 1 ms inside the first budget; once crossed, the worker reads it as passed.
+    bootstrap = std::make_unique<Bootstrap>(pair[0], accepted, [&crossed, accepted, owner] {
+        return accepted + Bootstrap::kBudget - (std::this_thread::get_id() != owner && crossed.load() ? 0ms : 1ms);
+    });
+    start(); send(2);
+    bool eof{};
+    bootstrap->tick(now, [this] { return core::Result<ApSnapshot>{snapshot}; },
+        [&](std::uint64_t, const std::function<void()>& send) {
+            send(); crossed = true;
+            // Hold the send's return until the worker has shut the channel down (the phone reads EOF).
+            const auto until = std::chrono::steady_clock::now() + 2s;
+            while (!eof && std::chrono::steady_clock::now() < until) {
+                char bytes[256];
+                const auto n = ::recv(sockets[1], bytes, sizeof bytes, MSG_DONTWAIT);
+                if (n == 0) eof = true; else if (n < 0) std::this_thread::sleep_for(1ms);
+            }
+            return true;
+        });
+    ASSERT_TRUE(eof) << "the expiry worker never fired";
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::timeout);
+    EXPECT_FALSE(bootstrap->live()) << "the exchange runs on after the phone's channel was shut down";
+    bootstrap.reset(); // its clock borrows this test's locals
+}
 TEST_F(BlueZHeldBootstrapTest, StallBeforeCredentialsStillEndsAtTheFirstBudget) {
     start(); elapsed = 10'000;
     EXPECT_TRUE(bootstrap->expire()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::timeout); EXPECT_TRUE(phone_eof());
