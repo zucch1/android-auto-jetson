@@ -11,12 +11,18 @@
 #include <aa/core/Result.hpp>
 #include <aa/core/Time.hpp>
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace aa::audio::detail {
+
+// Test-only scripted decode (open_router_with_decoder_for_test).
+using TestDecodeFn = std::function<core::Result<std::vector<std::byte>>(const EncodedChunk&)>;
 
 // The routed output sink (gate r2 F1 semantics).
 //
@@ -107,6 +113,13 @@ struct SinkOpenOutcome final {
 // Same private seam - no GStreamer types cross it, no public API.
 [[nodiscard]] core::Result<AudioRouter> open_router_with_sink_for_test(
     const RouterConfig& config, std::unique_ptr<ObservedAudioSink> sink);
+
+// Test-only (#154): the same, with every role's decode() replaced by a
+// scripted function returning the run's output PCM (at the router's output
+// format) for each submitted payload. Lets a test split or coalesce decoded
+// output across runs deterministically, as the resampler may.
+[[nodiscard]] core::Result<AudioRouter> open_router_with_decoder_for_test(
+    const RouterConfig& config, std::unique_ptr<ObservedAudioSink> sink, TestDecodeFn decode);
 
 // Test-only (gate r3 F1 regression): runs an UNRELATED in-process
 // `audiotestsrc ! audioconvert ! pipewiresink` pipeline in this process. Its

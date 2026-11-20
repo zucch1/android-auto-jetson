@@ -448,6 +448,7 @@ struct RuntimeFixture final {
     std::condition_variable state_cv;
     bool session_live{false};
     bool session_active{false};
+    aa::core::Nanoseconds audio_catch_up_watermark{0};
 
     void start(
         Clock::time_point deadline = Clock::now() + 20s,
@@ -490,7 +491,8 @@ struct RuntimeFixture final {
         helper_client = std::move(client_res).value();
 
         audio_worker = std::make_unique<audio::AudioRenderWorker>(
-            wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
+            wr::audio_config(audio::SinkBackend::pulse, audio_catch_up_watermark),
+            wr::audio_telemetry(),
             custom_open ? custom_open : make_gated_router(gate));
         ASSERT_TRUE(audio_worker->ready());
 
@@ -2857,6 +2859,46 @@ TEST(WirelessAudioRuntime, ReopenWithInFlightAckAndStalledStdoutCompletesOrFails
         EXPECT_NE(drained_stdout.find("\"origin\":\"reopen_ack_timeout\""), std::string::npos);
         EXPECT_NE(drained_stdout.find("\"outcome\":\"reopen_ack_timeout\""), std::string::npos);
     }
+}
+
+// #155 F4: wireless runtime end-to-end catch-up test with catch-up watermark
+// explicitly configured to 90 ms; verifies post-stall burst survival and
+// audio_catch_up JSONL emission parsed by EventParser in test_audio_worker_telemetry.py.
+TEST(WirelessAudioRuntime, ConfiguredCatchUpPostStallBurstTelemetryParsesInCollector) {
+    StdoutCapture capture;
+    std::string output;
+    int exit_code = -1;
+    {
+        RuntimeFixture f;
+        f.gate->populate_playback_slot = true;
+        f.audio_catch_up_watermark = aa::core::Nanoseconds{90'000'000};
+        ASSERT_NO_FATAL_FAILURE(f.start(Clock::now() + 15s));
+        ASSERT_TRUE(f.backend->wait_authorized(1));
+
+        auto phone_res = PhonePeer::connect(f.port);
+        ASSERT_TRUE(phone_res);
+        auto phone = std::move(phone_res).value();
+        ASSERT_NO_FATAL_FAILURE(phone->handshake_and_open_av(-7));
+
+        const std::vector<std::byte> chunk_42ms(8192, std::byte{0x24});
+        for (std::uint64_t i = 0; i < 16; ++i) {
+            ASSERT_TRUE(phone->send_msg(
+                100, av_data_msg(1'000'000'000ULL + i * 42'666'667ULL, chunk_42ms)));
+            ASSERT_TRUE(phone->wait_audio_ack(-7, 2s));
+        }
+        ASSERT_TRUE(f.audio_worker->wait_idle(Clock::now() + 2s));
+        EXPECT_FALSE(f.audio_worker->failure().has_value());
+
+        EXPECT_TRUE(f.consumer_client->stop_projection());
+        phone->close();
+        exit_code = f.stop_and_join();
+    }
+    output = capture.stop();
+    maybe_dump_jsonl("catch_up_burst", output);
+
+    EXPECT_EQ(exit_code, 0) << output;
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+    EXPECT_NE(output.find("\"event\":\"audio_catch_up\",\"frames\":"), std::string::npos) << output;
 }
 
 } // namespace

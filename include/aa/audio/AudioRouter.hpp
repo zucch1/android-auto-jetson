@@ -170,13 +170,46 @@ struct SinkWriteProgress final {
 // original scheduled timestamp) before the run is committed to the sink and
 // trims bounded head frames from over-watermark runs, advancing the timeline
 // by the RETAINED frames only. Trimmed audio is dropped, never resynthesized;
-// timestamps are never rebased to "now". Only the wired receiver's
-// pcm_router_config() enables this.
+// timestamps are never rebased to "now". The shared pcm_router_config() enables
+// live-PCM drift correction for both wired and wireless receivers (#163);
+// catch_up_watermark defaults to 90 ms for wired and is configurable (default
+// off, 0) for wireless pending an owner decision on TCP coalescing.
+//
+// Catch-up (#154, opt-in): a sink stall withholds credit, and the phone then
+// delivers its backlog in a burst stamped at arrival. Sequentialized after
+// the cursor, that burst places audio far behind its arrival - past the
+// 200 ms late-arrival cap, which ends the session - and the bounded max_trim
+// drains it at only ~117 ms/s. When catch_up_watermark > 0, the trigger is
+// run-level: a run whose initial phase (how far behind its arrival its first
+// sample would be placed) strictly exceeds the watermark has the whole excess
+// above `target` trimmed from its head at once, bounded by the run's length.
+// The watermark is therefore not a per-sample drop bound: the trim runs down
+// to `target`, so later dropped samples were less late than the watermark
+// (with a 90 ms watermark, a 4800-frame run at 100 ms phase loses 85 ms, of
+// which only the first 10 ms was over 90 ms late; its last dropped sample was
+// ~15 ms late). A phase at or below the watermark gets the ordinary bounded
+// trim. Every trimmed frame counts in frames_trimmed; frames_caught_up counts
+// only the part beyond what the bounded max_trim policy would have removed.
+// A run whose decoded output exceeds its parent's own PCM duration (input
+// bytes at the role's input format) starts with resampler carryover from
+// earlier parents; when the run is already behind placement or overlaps an
+// earlier parent on its role, the catch-up judges its phase by that older
+// source time so stale carryover is trimmed first and a caught-up run never
+// leaves the cursor more than `target` past the end of its parent's PCM. An
+// on-time non-overlapping run never lets carryover alone trigger catch-up. The
+// router's 200 ms late-arrival cap judges a caught-up run by its parent's own
+// PTS range against the committed source-time frontier (bounded by cursor): it
+// fails only when the parent's end (timestamp plus input duration) is more than
+// 200 ms behind recent source audio (so a backward timestamp jump still fails
+// late, while a forward-timestamped short chunk after a non-caught-up 200 ms
+// guidance packet survives). Neither the decoded length nor how the resampler
+// splits output across runs enters that check.
 struct LivePcmDriftPolicy final {
     bool enabled{false};
     core::Nanoseconds high_watermark{core::Nanoseconds{20'000'000LL}};
     core::Nanoseconds target{core::Nanoseconds{15'000'000LL}};
     core::Nanoseconds max_trim{core::Nanoseconds{5'000'000LL}};
+    core::Nanoseconds catch_up_watermark{core::Nanoseconds{0}}; // 0 disables catch-up
 
     [[nodiscard]] friend constexpr bool operator==(const LivePcmDriftPolicy&,
                                                    const LivePcmDriftPolicy&) noexcept = default;
@@ -185,7 +218,9 @@ struct LivePcmDriftPolicy final {
 // Pure trim decision for one decoded run about to be committed: `phase` is
 // planned start minus the run's original scheduled timestamp. Returns the
 // frames to drop from the HEAD of the run (0 = lossless), never more than the
-// run holds. Extraction point for the long-run drift simulations.
+// run holds. caught_up_frames() is the part of trim_frames() beyond the
+// bounded max_trim, i.e. what the catch-up alone dropped.
+// Extraction point for the long-run drift simulations.
 class LivePcmDriftCorrector final {
 public:
     LivePcmDriftCorrector() noexcept = default;
@@ -193,8 +228,15 @@ public:
 
     [[nodiscard]] std::uint64_t trim_frames(core::Nanoseconds phase,
                                             std::uint64_t run_frames) const noexcept;
+    [[nodiscard]] std::uint64_t caught_up_frames(core::Nanoseconds phase,
+                                                 std::uint64_t run_frames) const noexcept;
+    // True when a run at this phase takes the catch-up trim (#154).
+    [[nodiscard]] bool catches_up(core::Nanoseconds phase) const noexcept;
 
 private:
+    [[nodiscard]] std::uint64_t trim(core::Nanoseconds phase, std::uint64_t run_frames,
+                                     bool catch_up) const noexcept;
+
     LivePcmDriftPolicy policy_{};
     std::uint64_t rate_{};
 };
@@ -224,7 +266,8 @@ struct RouterConfig final {
     std::string sink_remote{};
     std::function<void(const WriteCompletion&)> on_write_completed{};
     // Live-PCM drift correction (opt-in; default lossless/unchanged). Enabled
-    // only by the wired receiver's pcm_router_config().
+    // by the shared pcm_router_config() (wired enables 90 ms catch-up by
+    // default; wireless keeps catch-up configurable and off by default).
     LivePcmDriftPolicy live_pcm_drift{};
     std::function<void(const SinkWriteProgress&)> on_sink_write_progress{};
     // render_step() interval bound. Keep the qualified 50 ms batching value.
@@ -265,6 +308,11 @@ struct RouterStats final {
     std::uint64_t frames_decoded{};
     std::uint64_t frames_retained{};
     std::uint64_t frames_trimmed{};
+    // Subset of frames_trimmed: in runs whose initial phase exceeded the
+    // catch-up watermark (#154), the frames removed beyond the bounded
+    // max_trim drift trim the run would otherwise have had. That ordinary
+    // allowance stays in frames_trimmed only.
+    std::uint64_t frames_caught_up{};
     std::uint64_t frames_silence{};
     std::uint64_t frames_output{};
     std::uint64_t frames_skipped{};

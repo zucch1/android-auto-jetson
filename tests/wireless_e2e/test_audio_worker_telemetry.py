@@ -46,7 +46,8 @@ def main() -> int:
             "WirelessAudioRuntime.QuietTcpLinkDefersAudioCompletionAtFiveMsCadence:"
             "WirelessAudioRuntime.ReconnectWithInFlightSessionOneSinkWriteIsolatesEpochTwo:"
             "WirelessAudioRuntime.RuntimeAvPendingDuplicateBeforeAckEmitsQueueRejectionAndCreditTrace:"
-            "WirelessAudioRuntime.UnregisteredChannelPollErrorEmitsRejectedFrameFields"
+            "WirelessAudioRuntime.UnregisteredChannelPollErrorEmitsRejectedFrameFields:"
+            "WirelessAudioRuntime.ConfiguredCatchUpPostStallBurstTelemetryParsesInCollector"
         )
         proc = subprocess.run(
             [binary, f"--gtest_filter={filt}"],
@@ -117,6 +118,20 @@ def main() -> int:
         assert len(unreg_errs) == 1, unreg_errs
         assert unreg_errs[0].get("reject_channel") == 120, unreg_errs[0]
         assert unreg_errs[0].get("reject_msg_id") == 32773, unreg_errs[0]
+
+        # 5. Configured wireless catch-up burst: audio_catch_up parses cleanly in EventParser
+        #    without contaminating audio_stall_* counters or triggering errors.
+        catch_up_path = Path(f"{out_base}.catch_up_burst")
+        assert catch_up_path.exists()
+        catch_up_parser = collector.EventParser()
+        catch_up_parser.poll(str(catch_up_path))
+        assert catch_up_parser.invalid_telemetry == [], catch_up_parser.invalid_telemetry
+        assert catch_up_parser.terminal_errors == [], catch_up_parser.terminal_errors
+        assert catch_up_parser.metrics["audio_catch_up_events"] >= 1, catch_up_parser.metrics
+        assert catch_up_parser.metrics["audio_catch_up_frames"] > 0, catch_up_parser.metrics
+        assert catch_up_parser.metrics["audio_catch_up_ms"] > 0, catch_up_parser.metrics
+        assert catch_up_parser.metrics["audio_stall_dropouts"] == 0, catch_up_parser.metrics
+        assert catch_up_parser.metrics["audio_stall_dropped_chunks"] == 0, catch_up_parser.metrics
 
     print("wireless-audio-worker-telemetry=passed")
     return 0
