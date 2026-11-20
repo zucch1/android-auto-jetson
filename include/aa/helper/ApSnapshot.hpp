@@ -15,7 +15,8 @@ struct SnapshotDeadline final {
 };
 void wipe(std::string& value) noexcept;
 // A WPA2-Personal passphrase is 8 to 63 ASCII characters (IEEE 802.11i). A
-// 64-character value is a raw hex PSK, which phones refuse as a passphrase.
+// 64-character all-hex value is read by NetworkManager/hostapd as a raw PMK, and any
+// value over 63 characters is refused by phones as a passphrase.
 inline constexpr std::size_t kWpa2PassphraseMin = 8;
 inline constexpr std::size_t kWpa2PassphraseMax = 63;
 struct ApSnapshot final {

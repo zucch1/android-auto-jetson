@@ -157,9 +157,11 @@ TEST_P(SecretReply, MalformedErrorAndSkippedTimeoutRepliesWipeAllOwnedBuffers) {
     trust::ApprovedPhoneStore store{std::filesystem::path{path} / "phones"}; ASSERT_TRUE(store.load());
     auto client = BusClient::private_bus_for_test(std::getenv("DBUS_SESSION_BUS_ADDRESS"), store); ASSERT_TRUE(client);
     // 0: invalid port, 1: error code, 2: wrong serial, 3: a 64-character password,
-    // which is a raw hex PSK rather than a WPA2 passphrase (8-63 characters).
+    // which is a raw hex PSK rather than a WPA2 passphrase (8-63 characters),
+    // 4: a 7-character password (below the WPA2 minimum), 5: exactly 8 (accepted).
     const auto mode = GetParam();
-    const std::string password = std::string{sentinel} + (mode == 3 ? "Q" : "");
+    const std::string password = mode == 4 ? std::string{sentinel.substr(0, 7)}
+        : mode == 5 ? std::string{sentinel.substr(0, 8)} : std::string{sentinel} + (mode == 3 ? "Q" : "");
     auto reply = std::async(std::launch::async, [&] {
         for (;;) {
             auto request = server.value().read_message();
@@ -175,11 +177,18 @@ TEST_P(SecretReply, MalformedErrorAndSkippedTimeoutRepliesWipeAllOwnedBuffers) {
         }
     });
     const auto snapshot = client.value()->get_ap_credentials({7, 0}, 123);
-    EXPECT_FALSE(snapshot); EXPECT_TRUE(reply.get());
-    EXPECT_GE(secret_buffers, 4);
+    EXPECT_TRUE(reply.get());
+    if (mode == 5) {
+        ASSERT_TRUE(snapshot); EXPECT_EQ(snapshot.value().password.size(), kWpa2PassphraseMin);
+    } else {
+        ASSERT_FALSE(snapshot);
+        if (mode == 3 || mode == 4) { EXPECT_EQ(snapshot.error().code(), ErrorCode::helper_protocol_mismatch); }
+    }
+    // The 7-character body does not carry the 8-character secret marker.
+    if (mode != 4) { EXPECT_GE(secret_buffers, 4); }
     client.value().reset(); std::filesystem::remove_all(path);
 }
-INSTANTIATE_TEST_SUITE_P(CredentialCleanup, SecretReply, ::testing::Values(0, 1, 2, 3));
+INSTANTIATE_TEST_SUITE_P(CredentialCleanup, SecretReply, ::testing::Values(0, 1, 2, 3, 4, 5));
 TEST_F(SecretLifetime, LateCredentialReplyIsWipedWhenOrdinaryStatusDrainsItAfterTimeout) {
     using namespace ipc::dbus_adapter;
     // Given a server that cannot release credentials until the caller has timed out.
@@ -345,6 +354,8 @@ TEST_F(PskLifetime, LegacyRawPskFileIsRotatedToAFreshPassphrase) {
     const std::string legacy = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const auto file = directory / "state/ap.credentials";
     for (const bool rotate : {false, true}) {
+        // Each pass proves its own cleansing, not the previous pass's.
+        { const std::lock_guard lock{wipes_mutex}; wipes.clear(); }
         std::filesystem::remove(file);
         std::ofstream{file} << "AA-0123456789abcdef\n" << legacy << "\n";
         ASSERT_EQ(::chmod(file.c_str(), 0600), 0);

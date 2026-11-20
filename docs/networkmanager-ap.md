@@ -58,9 +58,20 @@ random lowercase hex characters (252 bits), stored as
 NetworkManager/hostapd read a 64-hex `psk` as a raw 256-bit PMK, which Android
 refuses as a passphrase (`Invalid wifi network specifier`, then
 `STATUS_WIFI_NETWORK_UNAVAILABLE`) and which PBKDF2 of the same text would never
-match. A file in the earlier 64-hex format is treated as stale and rotated once to a
-fresh 63-character credential through the same exclusive staging below; any
-other malformed file is still refused. The single credential file is0600, verified by anchored
+match. AP activations use fresh in-memory credentials, so the first activation after an
+upgrade already sends a valid passphrase whatever is on disk. The stored file is read only
+on the rotation path (`RevokeAP1`); there, a file in the earlier 64-hex (85-byte) format is
+treated as stale and replaced with a fresh 63-character credential through the same
+exclusive staging below, and any other malformed file is still refused.
+
+Version skew and rollback: a receiver built after this change refuses an older helper's
+64-character password as `helper_protocol_mismatch`, so the wireless handoff is refused
+rather than mis-specified; deploy the helper and receiver together. The 84-byte file is
+unreadable by helpers built before this change: before rolling the helper back, delete
+`/var/lib/aa-system-helper/ap.credentials` (it holds only a rotating AP credential), or the
+older helper's revocation path will fail closed with `config_invalid`.
+
+The single credential file is 0600, verified by anchored
 `openat`/`O_NOFOLLOW`, owner/mode/type/link-count/size checks, exclusively staged,
 fsynced, atomically renamed and directory-fsynced. Secrets are never logged or
 returned by the control API. Root is the required production owner; the
