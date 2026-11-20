@@ -118,12 +118,17 @@ human-mediated during explicit enrollment only, never automatically approved.
    deadline, and the pre-bootstrap `connection` fd. `shutdown(2)` acts on the shared
    socket, so the kernel sends DISC on the AA DLC only; the HFP DLC, the RFCOMM
    session and the ACL stay up, and no `Device1`/`Adapter1` method is called (#136,
-   #160). After the last RFCOMM message the socket is kept, unread, until the
-   receiver confirms the hand-off (`AuthorizeBootstrapV1(allow=1, ready=0)` once its
-   TCP session authenticated), then closed without shutdown, which leaves the
-   success path as before. A hand-off that fails between completion and confirmation
-   is an abort and shuts the channel down; an unconfirmed completion also expires
-   after 30 s (`Bootstrap::kConfirmBudget`). The `Bootstrap` object alone owns the
+   #160). Success is unchanged at completion: nothing is shut down and the channel
+   stays as the phone left it for the whole session. The socket is kept, unread, and
+   shut down only when the hand-off is retired: a hand-off that fails before the
+   receiver confirms it (`AuthorizeBootstrapV1(allow=1, ready=0)` once its TCP
+   session authenticated), or a confirmed session that later ends. Otherwise
+   bluetoothd would keep the channel open after every session, the same zombie.
+   As a backstop, a completion the receiver never confirms has its socket shut down
+   after 30 s (`Bootstrap::kConfirmBudget`); its completed authority is kept (no
+   TTL, contract v2.6) until the receiver retires it. The test mock also models
+   bluetoothd dropping its own reference when the profile is unregistered or its
+   owner exits (`remove_ext`, `ext_exited`). The `Bootstrap` object alone owns the
    socket from construction; its deadline thread holds a separate duplicate that it
    closes only after being joined, so no shutdown reaches a reused fd number.
    A `ReconnectPeerV1` for the phone whose window is still open changes nothing (the

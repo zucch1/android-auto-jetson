@@ -24,7 +24,9 @@ protected:
             "unknown: client-bound shutdown did not complete; cleanup-unverified");
         RecordProperty("cleanup_nft", "owned table retained; not proof of quarantine or AP-off");
         RecordProperty("cleanup_bluez", "profile record retained in double; pairing closed; old RFCOMM EOF");
-        EXPECT_EQ(bluez.command("wire-read"), "closed");
+        // BlueZ drops its own reference when the killed owner leaves the bus (ext_exited); that
+        // NameOwnerChanged is asynchronous, so the phone's EOF follows shortly (#161).
+        EXPECT_TRUE(eventually([&] { return bluez.command("wire-read") == "closed"; }, 3s));
         if (off) {
             timing.ap_inactive = timing.elapsed(); EXPECT_LE(*timing.ap_inactive, 5000);
             RecordProperty("hard_kill_cleanup", "pass: independently observed State4 and Device.ActiveConnection=/ in original NM/device incarnation");

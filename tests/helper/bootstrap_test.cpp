@@ -351,12 +351,14 @@ TEST_F(BlueZHeldBootstrapTest, CompletedExchangeDestroyedUnconfirmedShutsTheChan
     bootstrap.reset();
     EXPECT_TRUE(phone_eof());
 }
-TEST_F(BlueZHeldBootstrapTest, UnconfirmedCompletionExpiresAndShutsTheChannelDown) {
+TEST_F(BlueZHeldBootstrapTest, UnconfirmedCompletionBackstopShutsTheChannelDownKeepingAuthority) {
     complete();
-    elapsed = 29'000; EXPECT_FALSE(bootstrap->expire()); EXPECT_TRUE(bootstrap->complete()); EXPECT_FALSE(phone_eof());
+    elapsed = 29'000; EXPECT_FALSE(bootstrap->expire()); EXPECT_FALSE(phone_eof());
     elapsed = 40'000;
-    EXPECT_TRUE(bootstrap->expire());
-    EXPECT_EQ(bootstrap->failure(), HandoffFailure::timeout);
+    EXPECT_FALSE(bootstrap->expire());
     EXPECT_TRUE(phone_eof());
+    EXPECT_TRUE(bootstrap->complete()) << "completed authority has no TTL (contract v2.6)";
+    EXPECT_FALSE(bootstrap->awaiting_confirmation());
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
 }
 }

@@ -168,9 +168,9 @@ void BluezBackend::Impl::pump() {
         const auto handle = handoff_handle;
         captured->tick(now(), snapshots, fence, true);
         if (handoff_handle == handle) last_failure = captured->failure();
-    } else if (bootstrap && bootstrap->awaiting_confirmation() && bootstrap->expire()) {
+    } else if (bootstrap && bootstrap->awaiting_confirmation()) {
         // A completed hand-off nobody confirmed or retired: free the phone's channel (#161).
-        last_failure = bootstrap->failure();
+        (void)bootstrap->expire();
     }
 }
 bool BluezBackend::Impl::ensure() {
@@ -261,8 +261,8 @@ core::Result<void> BluezBackend::authorize_handoff(std::uint64_t handle, bool al
         impl_->retire(handle, HandoffFailure::snapshot);
         return Error{ErrorCode::helper_unavailable};
     }
-    // The receiver's completed confirmation: the hand-off is live over TCP, so the RFCOMM
-    // socket is released without shutdown (unchanged success behaviour, #161).
+    // The receiver's completed confirmation: the hand-off is live over TCP. The RFCOMM socket
+    // stays as the phone left it until the hand-off is retired (#161).
     if (completed) impl_->bootstrap->confirm();
     return {};
 }

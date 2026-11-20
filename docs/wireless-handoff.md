@@ -176,10 +176,11 @@ Every aborted bootstrap shuts its RFCOMM socket down (`shutdown(SHUT_RDWR)`),
 because BlueZ holds its own reference and a plain `close()` sends no DISC; the
 phone then sees an IO error and restarts its wireless setup. That covers denial,
 every failure, the 10-second deadline, a window that lapses before the bootstrap
-ends (the bootstrap still runs to its own deadline), and a completed exchange
-whose hand-off fails before the receiver confirms it: the helper keeps the socket
-after the last RFCOMM message until the completed confirmation (then it is closed
-without shutdown, unchanged) or an abort, at most 30 s. Only the AA DLC closes;
+ends (the bootstrap still runs to its own deadline), and the retirement of a
+completed hand-off, whether it failed before the receiver confirmed it or its
+session ended later. Completion itself shuts nothing down: the channel stays as
+the phone left it for the whole session. A completion never confirmed has its
+socket shut down after 30 s, keeping the completed authority. Only the AA DLC closes;
 HFP, owned by infotainment, is never touched.
 
 A retry must not reset a bootstrap that is still progressing:
@@ -201,8 +202,8 @@ A retry must not reset a bootstrap that is still progressing:
 Successful completion transfers the exact handle, receiver/source ownership,
 BlueZ owner/device identity, and pinned AP snapshot into revocable
 completed-handoff authority. It survives normal RFCOMM close and the subsequent
-Profile1 `RequestDisconnection` callback, and once confirmed has no absolute
-TTL (an unconfirmed completion is retired after 30 s, #161). Before
+Profile1 `RequestDisconnection` callback, and has no absolute TTL (#161 only
+shuts an unconfirmed completion's RFCOMM socket down after 30 s). Before
 completion, that callback still retires the pending exchange. Device1
 `Connected=false` or an invalidated `Connected` value establishes link loss;
 `Connected=true` cannot revive retired authority.

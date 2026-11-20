@@ -655,12 +655,12 @@ TEST_F(NmDaemon, ComposedBootstrapUsesRealBusClientAndRfcommBytes) {
     EXPECT_FALSE(client->get_ap_credentials({2, 2}, handle));
     EXPECT_FALSE(client->get_ap_credentials({1, 1}, handle + 1));
     EXPECT_FALSE(rogue.value()->get_ap_credentials({1, 1}, handle));
-    // The receiver's completed confirmation releases the socket without shutdown, so a later
-    // retirement of the confirmed hand-off leaves the phone's channel as before (#161).
+    // The receiver's completed confirmation leaves the channel as the phone left it; retiring
+    // the hand-off later (its session over) frees the phone (#161).
     ASSERT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, false));
     EXPECT_EQ(bluez.command("wire-read"), "open");
     ASSERT_TRUE(client->authorize_bootstrap({1, 1}, handle, false, false));
-    EXPECT_EQ(bluez.command("wire-read"), "open");
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
 }
 // Drives the phone's legacy exchange after AuthorizeBootstrap(allow) to WifiConnectStatus(success).
 void phone_completes_exchange(Child& bluez) {

@@ -46,26 +46,29 @@ Bootstrap::Bootstrap(int fd, Time accepted, std::function<Time()> now)
     if (expiry_->socket < 0) deny(HandoffFailure::eligibility);
 }
 // Destroying an unconfirmed bootstrap is an abort: the phone must see the channel close.
-Bootstrap::~Bootstrap() { release(true); wipe_bytes(output_); }
-void Bootstrap::release(bool abort) noexcept {
+Bootstrap::~Bootstrap() { release(); wipe_bytes(output_); }
+void Bootstrap::release() noexcept {
     expiry_.reset(); // joins the worker and closes its dup before fd_ can be closed
     if (fd_ < 0) return;
-    if (abort) (void)::shutdown(fd_, SHUT_RDWR); // reaches BlueZ's reference too: DISC (#161)
+    (void)::shutdown(fd_, SHUT_RDWR); // reaches BlueZ's reference too: DISC (#161)
     ::close(fd_);
     fd_ = -1;
 }
 bool Bootstrap::expire() {
     if (live() && deadline_.expired()) deny(HandoffFailure::timeout);
-    else if (awaiting_confirmation() && deadline_.now() >= confirm_until_) deny(HandoffFailure::timeout);
+    // An unconfirmed completion frees the phone's channel at the backstop but keeps its
+    // completed authority: RFCOMM teardown is not link loss (contract v2.6) and completed
+    // authority has no TTL. The receiver retires the hand-off itself if it failed.
+    else if (awaiting_confirmation() && deadline_.now() >= confirm_until_) release();
     return stage_ == Stage::failed;
 }
 void Bootstrap::deny(HandoffFailure reason) {
     if (stage_ == Stage::failed) return;
     failure_ = reason; stage_ = Stage::failed;
-    release(true);
+    release();
     wipe(snapshot_.password); wipe_bytes(output_);
 }
-void Bootstrap::confirm() { if (awaiting_confirmation()) release(false); }
+void Bootstrap::confirm() { if (complete()) confirmed_ = true; }
 bool Bootstrap::queue(std::uint16_t id, const std::string& payload) {
     // The shared legacy codec only knows IDs 1..7; SetupInfo uses the same framing.
     auto bytes = encode_aaw(id == 11 ? 1 : id, {reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()});

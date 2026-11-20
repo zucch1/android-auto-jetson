@@ -73,7 +73,9 @@ protected:
             ASSERT_EQ(bluez.command("wire-send 00000002"), "ok");
             ASSERT_TRUE(eventually([&] { return bluez.command("wire-read") != "open"; }));
             ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
-            EXPECT_TRUE(eventually([&] { return bluez.command("wire-read") == "closed"; }));
+            // Success: BlueZ keeps its reference, so the channel stays open (#161). The helper
+            // takes one record per pump; stay quiet ~1 s so completion has landed.
+            for (int i = 0; i < 5; ++i) { EXPECT_EQ(bluez.command("wire-read"), "open"); }
         });
         ASSERT_TRUE(eventually([&] { coordinator->tick(); return phone.wait_for(0ms) == std::future_status::ready; }, 5s));
         phone.get();
@@ -129,7 +131,7 @@ TEST_F(WirelessComposed, ConsumerLossAfterCompletedBootstrapKeepsActiveGrace) {
     coordinator->tick(true);
     coordinator->consumer(std::nullopt);
     EXPECT_FALSE(listening);
-    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_EQ(bluez.command("wire-read"), "open");
     const auto until = Clock::now() + 1500ms;
     while (Clock::now() < until) {
         coordinator->tick(true);

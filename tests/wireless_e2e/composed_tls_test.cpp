@@ -113,7 +113,7 @@ void WirelessComposedTls::approved_reconnect(bool modern) {
     }
     EXPECT_EQ(endpoint.ip_address(), snapshot->ip); EXPECT_EQ(endpoint.port(), snapshot->port);
     ASSERT_EQ(bluez.command(modern ? "wire-send 00020007200c00020006100c" : "wire-send 000200071800000200060800"), "ok");
-    ASSERT_TRUE(eventually([&] { return bluez.command("wire-read") == "closed"; }));
+    ASSERT_EQ(bluez.command("wire-read"), "open");  // success keeps the channel (#161)
     });
     ASSERT_TRUE(eventually([&] { coordinator.tick(); return bootstrap.wait_for(0ms) == std::future_status::ready; }, 5s));
     bootstrap.get(); ASSERT_FALSE(HasFatalFailure());

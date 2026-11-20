@@ -30,9 +30,11 @@ class ProfileSockets:
     AF_UNIX vs RFCOMM: shutdown(SHUT_RDWR) on any fd of one socketpair end marks that socket
     shut down and gives the peer EOF while other fds of that end stay open, as RFCOMM's
     shutdown sends DISC on the DLC while bluetoothd's fd stays open. close() of one of several
-    fds does neither, in both families. Differences that the mock does not model: RFCOMM DISC
-    also makes bluetoothd's own watch fire (HUP) and drop its reference, and the socketpair
-    peer can still read data queued before the shutdown.
+    fds does neither, in both families. bluetoothd also drops its reference when the profile
+    is unregistered or its owner leaves the bus (remove_ext, ext_exited): drop_daemon() models
+    that. Differences that the mock does not model: RFCOMM DISC also makes bluetoothd's own
+    watch fire (HUP) and drop its reference, and the socketpair peer can still read data
+    queued before the shutdown.
     """
 
     helper: str
@@ -68,6 +70,16 @@ class ProfileSockets:
             self.hfp_socket, self.hfp_daemon = candidate, local
         else:
             self.peer_socket, self.peer_daemon = candidate, local
+
+    def drop_daemon(self, hfp: bool = False) -> None:
+        """bluetoothd's remove_ext/ext_exited: its own reference goes, so the last fd may too."""
+        daemon = self.hfp_daemon if hfp else self.peer_daemon
+        if daemon is not None:
+            daemon.close()
+        if hfp:
+            self.hfp_daemon = None
+        else:
+            self.peer_daemon = None
 
     def hfp_wire(self, text: str) -> str:
         assert self.hfp_socket is not None

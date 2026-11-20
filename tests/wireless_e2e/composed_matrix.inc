@@ -71,6 +71,6 @@ TEST_F(CompletedLifecycle, WirelessD6FragmentedInfoAndCoalescedCompletion) {
     }));
     ASSERT_TRUE(std::holds_alternative<AawRecord>(decoded)); EXPECT_EQ(std::get<AawRecord>(decoded).id, 3);
     ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
-    ASSERT_TRUE(eventually([&] { return bluez.command("wire-read") == "closed"; }));
+    ASSERT_EQ(bluez.command("wire-read"), "open");  // success keeps the channel (#161)
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, false));
 }
