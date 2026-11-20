@@ -111,6 +111,7 @@ protected:
         else { ASSERT_TRUE(receiver->reconnect(*control, identity)); }
         if (connect) { ASSERT_EQ(bluez.command("NewConnection"), "allowed"); }
         ASSERT_TRUE(eventually([&] { pump(); return occupied(); }, 10s));
+        std::string after_success;
         auto phone = std::async(std::launch::async, [&] {
             std::vector<std::uint8_t> buffered;
             std::size_t offset{};
@@ -143,12 +144,18 @@ protected:
             ASSERT_TRUE(read_record(11));
             ASSERT_TRUE(read_record(1));
             ASSERT_EQ(bluez.command("wire-send 00020007200c00020006100c"), "ok");
-            // Success keeps the channel (#161). No longer quiet wait: within ~1 s this receiver's own
-            // flow may retire the hand-off; observe_snapshot() below checks completion itself.
-            ASSERT_EQ(bluez.command("wire-read"), "open");
+            // Success keeps the channel (#161): nothing more arrives on it. It reads closed only once
+            // this receiver retired the hand-off (DISC), which the owner thread checks below.
+            after_success = bluez.command("wire-read");
         });
         ASSERT_TRUE(eventually([&] { pump(); return phone.wait_for(0ms) == std::future_status::ready; }, 5s));
         phone.get(); ASSERT_FALSE(HasFatalFailure());
+        ASSERT_TRUE(after_success == "open" || after_success == "closed") << "unexpected RFCOMM data: " << after_success;
+        if (after_success == "closed") {
+            pump();
+            ASSERT_FALSE(occupied()) << "RFCOMM closed after success while the hand-off was still admitted";
+            FAIL() << "the receiver retired the completed hand-off during admission (its evidence expired)";
+        }
         const auto terminal = observe_snapshot(); ASSERT_TRUE(terminal);
     }
     void closed() {
