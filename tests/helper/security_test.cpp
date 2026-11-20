@@ -779,6 +779,21 @@ void lose_link_during_window(helper::BluezBackend& backend, MockBluez& mock, con
     }
     ASSERT_TRUE(backend.awaiting_link());
 }
+TEST_F(ReconnectLink, TheLinkComingBackClearsTheLostLinkNoteWithoutReopening) {
+    lose_link_during_window(*backend, *mock, [this] { return reconnect(); });
+    if (HasFatalFailure()) return;
+    // Same attempt, no new window: BlueZ reports the same phone's link back.
+    ASSERT_EQ(mock->command("connected-true"), "ok");
+    for (int i = 0; i < 20 && backend->awaiting_link(); ++i) {
+        backend->tick(); std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    EXPECT_FALSE(backend->awaiting_link()) << "the link is back but the note still claimed none";
+    // The window lost_path() closed stays closed: no AA service, no handoff.
+    EXPECT_EQ(bluez_callback(*backend, *mock, "NewConnection"), "rejected");
+    EXPECT_EQ(bluez_callback(*backend, *mock, "AuthorizeService"), "rejected");
+    EXPECT_FALSE(backend->handoff());
+    EXPECT_EQ(calls(), "");
+}
 TEST_F(ReconnectLink, AnEnrolmentWindowClearsThePreviousPhonesLostLinkNote) {
     lose_link_during_window(*backend, *mock, [this] { return reconnect(); });
     if (HasFatalFailure()) return;
