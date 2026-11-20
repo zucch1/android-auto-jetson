@@ -37,10 +37,12 @@ function(aa_split_debug_info_project_targets)
         add_custom_command(TARGET ${_aa_target} POST_BUILD
             COMMAND "${CMAKE_OBJCOPY}" --only-keep-debug "$<TARGET_FILE:${_aa_target}>"
                 "$<TARGET_FILE:${_aa_target}>.debug"
+            COMMAND chmod a-x "$<TARGET_FILE:${_aa_target}>.debug"
             COMMAND "${CMAKE_OBJCOPY}" --strip-debug
                 "--add-gnu-debuglink=$<TARGET_FILE_NAME:${_aa_target}>.debug"
                 "$<TARGET_FILE:${_aa_target}>"
             WORKING_DIRECTORY "$<TARGET_FILE_DIR:${_aa_target}>"
             VERBATIM)
+        set_property(TARGET ${_aa_target} APPEND PROPERTY ADDITIONAL_CLEAN_FILES "$<TARGET_FILE:${_aa_target}>.debug")
     endforeach()
 endfunction()
