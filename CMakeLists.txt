@@ -224,4 +224,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_tests_properties(build_hardening_checker PROPERTIES TIMEOUT 120)
 endif()
 
+# Last, after every module has created its executables (TlsHardening is after
+# aa_harden_project_targets()).
+include(cmake/DebugInfoSplit.cmake)
+aa_split_debug_info_project_targets()
 include(cmake/HostTestScheduling.cmake)
