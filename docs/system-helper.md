@@ -326,8 +326,9 @@ grant; only verified active state maps to `Response.applied=true`.
 
 ## Wi-Fi PSK copies in the helper (#89 L9)
 
-The NetworkManager adapter keeps the AP PSK in `nm::Psk`, a fixed 65-byte
-in-object buffer (64 hex digits and NUL) that is cleansed with `explicit_bzero`
+The NetworkManager adapter keeps the AP PSK in `nm::Psk`, a fixed 64-byte
+in-object buffer (a 63-character hex WPA2 passphrase and NUL; see
+[the AP credential format](networkmanager-ap.md)) that is cleansed with `explicit_bzero`
 on destruction; copies are bounded value copies that cleanse themselves. It
 is never built in, or passed through, a growable `std::string`. Random digits
 are drawn straight into that buffer (`crypto_adapter::random_hex`, whose raw

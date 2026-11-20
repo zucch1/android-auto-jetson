@@ -50,8 +50,17 @@ survive.
 
 `StateDirectory=aa-system-helper`, mode0700, gives only
 `/var/lib/aa-system-helper` writable state. `ap.credentials` is generated using
-OpenSSL `RAND_bytes`: an 8-byte random SSID suffix and a 32-byte random WPA2 PSK,
-both hex-encoded. The single credential file is0600, verified by anchored
+OpenSSL `RAND_bytes`: an 8-byte random SSID suffix (hex-encoded) and a WPA2 passphrase of 63
+random lowercase hex characters (252 bits), stored as
+`AA-<16 hex>\n<63 hex>\n`. The passphrase is the exact text NetworkManager's
+`psk` setting and the phone's `WifiInfoResponse.password` carry. It is 63, not
+64, characters on purpose: WPA2 passphrases are 8–63 characters, and
+NetworkManager/hostapd read a 64-hex `psk` as a raw 256-bit PMK, which Android
+refuses as a passphrase (`Invalid wifi network specifier`, then
+`STATUS_WIFI_NETWORK_UNAVAILABLE`) and which PBKDF2 of the same text would never
+match. A file in the earlier 64-hex format is treated as stale and rotated once to a
+fresh 63-character credential through the same exclusive staging below; any
+other malformed file is still refused. The single credential file is0600, verified by anchored
 `openat`/`O_NOFOLLOW`, owner/mode/type/link-count/size checks, exclusively staged,
 fsynced, atomically renamed and directory-fsynced. Secrets are never logged or
 returned by the control API. Root is the required production owner; the

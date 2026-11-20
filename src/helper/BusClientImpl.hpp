@@ -126,10 +126,10 @@ struct BusClient::Impl {
             const auto bssid = body.read_string_view(); const auto ip = body.read_string_view();
             const auto port = body.read_u32(); const auto generation = body.read_u64();
             if (!ssid || !password || !bssid || !ip || !port || !generation || ssid.value().size() > 32 ||
-                password.value().size() > 64 || bssid.value().size() > 17 || ip.value().size() > 15)
+                password.value().size() > kWpa2PassphraseMax || bssid.value().size() > 17 || ip.value().size() > 15)
                 return Error{ErrorCode::helper_protocol_mismatch};
             if (error.value() == 0) {
-                if (ssid.value().empty() || password.value().size() < 8 || bssid.value().size() != 17 ||
+                if (ssid.value().empty() || password.value().size() < kWpa2PassphraseMin || bssid.value().size() != 17 ||
                     ip.value().empty() || port.value() < 1024 || port.value() > 65535 || !generation.value())
                     return Error{ErrorCode::helper_protocol_mismatch};
                 *snapshot = ApSnapshot{{ssid.value(), password.value(), bssid.value(), ip.value(), port.value(), generation.value()}};

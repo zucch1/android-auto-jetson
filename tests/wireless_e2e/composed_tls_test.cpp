@@ -87,6 +87,11 @@ void WirelessComposedTls::approved_reconnect() {
     aaw::WifiInfoResponse info;
     ASSERT_TRUE(info.ParseFromArray(info_record.payload.data(), static_cast<int>(info_record.payload.size())));
     EXPECT_TRUE(info.password() == snapshot->password); EXPECT_TRUE(info.ssid() == snapshot->ssid);
+    // The phone takes WifiInfoResponse.password as a WPA2 passphrase (8-63 characters) and
+    // derives the PMK from it; it must be exactly the `psk` NetworkManager was given.
+    EXPECT_TRUE(info.password() == sentinel);
+    EXPECT_GE(info.password().size(), kWpa2PassphraseMin); EXPECT_LE(info.password().size(), kWpa2PassphraseMax);
+    EXPECT_EQ(info.password().find_first_not_of("0123456789abcdef"), std::string::npos);
     EXPECT_EQ(info.bssid(), snapshot->bssid); EXPECT_EQ(info.security_mode(), 8); EXPECT_EQ(info.access_point_type(), 1);
     ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
     // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).

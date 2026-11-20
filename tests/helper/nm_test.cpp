@@ -332,7 +332,7 @@ private:
                 g_variant_lookup(wireless, "band", "&s", &band) && std::string{band} == "a" &&
                 g_variant_lookup(wireless, "channel", "u", &channel) && channel == self.expected_channel &&
                 g_variant_lookup(security, "key-mgmt", "&s", &key) && std::string{key} == "wpa-psk" &&
-                g_variant_lookup(security, "psk", "&s", &psk) && std::string{psk}.size() == 64 &&
+                g_variant_lookup(security, "psk", "&s", &psk) && std::string{psk}.size() == Psk::kLength &&
                 g_variant_lookup(ipv4, "method", "&s", &ipv4_method) && std::string{ipv4_method} == "shared";
             if (self.valid) { const std::lock_guard lock{self.mutex}; self.seen_psk = psk; }
             if (wireless) g_variant_unref(wireless);
@@ -471,7 +471,7 @@ TEST_F(NmDaemon, GDbusMessageDebugIsDroppedSoThePskIsNeverLogged) {
     // #89 L9: with G_DBUS_DEBUG set, GDBus would print AddAndActivateConnection2's PSK.
     start("G_DBUS_DEBUG=message,payload"); acquire(); ASSERT_TRUE(state(State::active));
     std::string psk; { const std::lock_guard lock{nm->mutex}; psk = nm->seen_psk; }
-    ASSERT_EQ(psk.size(), 64U);
+    ASSERT_EQ(psk.size(), Psk::kLength);
     client->teardown(core::ConsumerId{1}); daemon.stop();
     const auto log = read_text(directory / "helper.log");
     EXPECT_NE(log.find("system-helper: ignoring G_DBUS_DEBUG"), std::string::npos) << log;
@@ -488,7 +488,11 @@ TEST_F(NmDaemon, ActivationSnapshotUsesActivationCredentialsAndCurrentLocalMac) 
     auto snapshot = backend.ap_snapshot(); ASSERT_TRUE(snapshot);
     EXPECT_EQ(snapshot.value().bssid, "02:ab:cd:ef:01:23"); EXPECT_EQ(snapshot.value().ip, "10.42.0.1"); EXPECT_EQ(snapshot.value().port, 5277U);
     { const std::lock_guard lock{nm->mutex}; EXPECT_TRUE(snapshot.value().password == nm->seen_psk); }
-    EXPECT_EQ(snapshot.value().password.size(), 64U);
+    // The released password is the NM `psk` itself: a WPA2 passphrase (8-63
+    // characters), never a 64-hex raw PSK the phone would refuse.
+    EXPECT_EQ(snapshot.value().password.size(), Psk::kLength);
+    EXPECT_GE(snapshot.value().password.size(), kWpa2PassphraseMin);
+    EXPECT_LE(snapshot.value().password.size(), kWpa2PassphraseMax);
     auto cached = backend.ap_snapshot(); ASSERT_TRUE(cached); EXPECT_TRUE(cached.value() == snapshot.value());
     EXPECT_TRUE(backend.snapshot_current(snapshot.value().generation));
     backend.cleanup(); EXPECT_FALSE(backend.snapshot_current(snapshot.value().generation)); EXPECT_FALSE(backend.ap_snapshot());
