@@ -83,17 +83,28 @@ Bootstrap::Bootstrap(int fd, Time accepted, std::function<Time()> now)
     : fd_(fd), deadline_{accepted + kBudget, std::move(now)}, expiry_(std::make_unique<SocketExpiry>(fd, deadline_)) {
     if (expiry_->socket < 0) fail(HandoffFailure::eligibility, std::nullopt, "could not duplicate the socket for its deadline");
 }
-Bootstrap::~Bootstrap() { expiry_.reset(); if (fd_ >= 0) ::close(fd_); wipe_bytes(output_); }
+// Destroying an unconfirmed bootstrap is an abort: the phone must see the channel close.
+Bootstrap::~Bootstrap() { release(); wipe_bytes(output_); }
+void Bootstrap::release() noexcept {
+    expiry_.reset(); // joins the worker and closes its dup before fd_ can be closed
+    if (fd_ < 0) return;
+    (void)::shutdown(fd_, SHUT_RDWR); // reaches BlueZ's reference too: DISC (#161)
+    ::close(fd_);
+    fd_ = -1;
+}
 bool Bootstrap::expire() {
-    if (fd_ >= 0 && deadline_.expired()) fail(HandoffFailure::timeout, std::nullopt, "handshake deadline passed");
+    if (live() && deadline_.expired()) fail(HandoffFailure::timeout, std::nullopt, "handshake deadline passed");
+    // An unconfirmed completion frees the phone's channel at the backstop but keeps its
+    // completed authority: RFCOMM teardown is not link loss (contract v2.6) and completed
+    // authority has no TTL. The receiver retires the hand-off itself if it failed.
+    else if (awaiting_confirmation() && deadline_.now() >= confirm_until_) release();
     return stage_ == Stage::failed;
 }
 void Bootstrap::deny(HandoffFailure reason) {
     if (stage_ == Stage::failed) return;
     failure_ = reason; stage_ = Stage::failed;
-    expiry_.reset();
-    if (fd_ >= 0) ::close(fd_);
-    fd_ = -1; wipe(snapshot_.password); wipe_bytes(output_);
+    release();
+    wipe(snapshot_.password); wipe_bytes(output_);
 }
 const char* Bootstrap::phase() const {
     switch (stage_) {
@@ -120,6 +131,7 @@ void Bootstrap::fail(HandoffFailure reason, std::optional<std::uint16_t> id, std
     std::cerr << line << std::flush;
     deny(reason);
 }
+void Bootstrap::confirm() { if (complete()) confirmed_ = true; }
 bool Bootstrap::queue(std::uint16_t id, const std::string& payload) {
     auto bytes = encode_aaw(id, {reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()});
     if (!bytes) { fail(HandoffFailure::oversize, id, "outgoing record too large"); return false; }
@@ -253,7 +265,8 @@ bool Bootstrap::drain(const SnapshotProvider& provider, const SnapshotFence& fen
             if (expire()) return false;
             if (n > 0) { fail(HandoffFailure::truncated, std::nullopt, "trailing bytes after WifiConnectStatus"); return false; }
             if (n < 0 && error != EAGAIN && error != EWOULDBLOCK) { fail(HandoffFailure::eof, std::nullopt, "socket failed after WifiConnectStatus"); return false; }
-            ::close(fd_); fd_ = -1;
+            // Keep the socket until the hand-off is confirmed or aborted (see Bootstrap.hpp).
+            confirm_until_ = deadline_.now() + kConfirmBudget;
             stage_ = Stage::complete;
             std::cerr << "system-helper: wireless_handshake_complete flow=start_first\n" << std::flush;
             return false;

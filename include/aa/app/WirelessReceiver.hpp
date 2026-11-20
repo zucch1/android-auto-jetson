@@ -21,6 +21,8 @@ public:
     ~WirelessReceiver() { stop(); }
     helper::Confirmation& confirmation() { return confirmation_; }
     WiredSession* session() const { return link_.session(); }
+    // A phone's bootstrap is in progress (bounded): don't defer or retry the attempt (#161).
+    [[nodiscard]] bool bootstrapping() const { return eligibility_.bootstrapping(); }
     // The acquiring source becomes the helper AP lease; drive this AP's handoff
     // with begin(source). reconnect() resets the lease to the empty source and
     // must precede, not follow, acquisition (docs/wireless-handoff.md).

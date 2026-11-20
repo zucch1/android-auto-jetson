@@ -98,12 +98,12 @@ TEST_F(BootstrapTest, StartFirstExchangeIsByteExactAndCompletes) {
     EXPECT_EQ(read(), info_response()); EXPECT_TRUE(bootstrap->live());
     // When: the phone reports start and connect success (status tag 3 and tag 1, value 0).
     std::string log = failure_log([&] { raw(std::string_view{"\x00\x02\x00\x07\x18\x00" "\x00\x02\x00\x06\x08\x00", 12}); tick(); });
-    // Then: the bootstrap completes, the socket closes and nothing else is sent.
+    // Then: the bootstrap completes, nothing else is sent, and the channel is kept (#161).
     EXPECT_TRUE(bootstrap->complete()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
     EXPECT_NE(log.find("wireless_handshake_complete flow=start_first"), std::string::npos) << log;
     EXPECT_EQ(log.find("wireless_handshake_failed"), std::string::npos) << log;
     expect_secret_free(log);
-    char byte{}; EXPECT_EQ(::read(sockets[1], &byte, 1), 0);
+    EXPECT_TRUE(read().empty()); EXPECT_FALSE(bootstrap->live()); EXPECT_TRUE(bootstrap->awaiting_confirmation());
 }
 TEST_F(BootstrapTest, PhoneStatusFixturesDecodeInTheRealLayout) {
     // WifiStartResponse=7 {1: ip, 2: port, 3: 0} and WifiConnectStatus=6 {1: 0, 2: ""} as a phone may send them.
@@ -229,7 +229,10 @@ TEST_F(BootstrapTest, DeadlineCrossedDuringProcessingCannotCreateAuthority) {
     // Given: info and both statuses are buffered before the credential send crosses the deadline.
     const auto accepted = now;
     std::atomic<std::int64_t> elapsed{};
-    sender = ::dup(sender); ASSERT_GE(sender, 0); bootstrap.reset();
+    // A fresh pair: destroying the fixture's unfinished bootstrap shuts its socket down (#161).
+    bootstrap.reset();
+    int pair[2]{}; ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair), 0);
+    ::close(sockets[1]); sockets[1] = pair[1]; sender = pair[0];
     bootstrap = std::make_unique<Bootstrap>(sender, accepted, [&] { return accepted + std::chrono::milliseconds{elapsed.load()}; });
     start(); send(2);
     aaw::WifiStartResponse started; started.set_status(aaw::STATUS_SUCCESS); send(7, started.SerializeAsString());
@@ -342,5 +345,86 @@ TEST_F(BootstrapTest, SingleTransitionYieldsBeforeCredentialValidationAndRetains
     step(); EXPECT_EQ(collections, 1U); EXPECT_EQ(fences, 1U);
     EXPECT_TRUE(read().empty()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::snapshot);
 }
+}
+// #161: bluetoothd keeps its own reference to every NewConnection socket. `daemon` models it
+// (a dup of the helper's end), so the phone end sees EOF only when the helper shuts the shared
+// socket down: an AF_UNIX shutdown reaches every fd of that end, as an RFCOMM shutdown sends DISC.
+class BlueZHeldBootstrapTest : public BootstrapTest {
+protected:
+    int daemon{-1};
+    std::atomic<std::int64_t> elapsed{};
+    void SetUp() override {
+        BootstrapTest::SetUp();
+        bootstrap.reset();
+        int pair[2]{}; ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair), 0);
+        ::close(sockets[1]); sockets[1] = pair[1]; sender = pair[0];
+        daemon = ::dup(pair[0]); ASSERT_GE(daemon, 0);
+        const auto accepted = now;
+        bootstrap = std::make_unique<Bootstrap>(pair[0], accepted, [this, accepted] {
+            return accepted + std::chrono::milliseconds{elapsed.load()}; });
+    }
+    void TearDown() override { BootstrapTest::TearDown(); if (daemon >= 0) ::close(daemon); }
+    // The phone end reads EOF now (no data, no wait).
+    bool phone_eof() {
+        char byte{};
+        return ::recv(sockets[1], &byte, 1, MSG_DONTWAIT) == 0;
+    }
+    void complete() {
+        start(); send(2); tick(); read();
+        aaw::WifiStartResponse started; started.set_status(aaw::STATUS_SUCCESS); send(7, started.SerializeAsString());
+        aaw::WifiConnectStatus connected; connected.set_status(aaw::STATUS_SUCCESS); send(6, connected.SerializeAsString());
+        tick(); ASSERT_TRUE(bootstrap->complete());
+    }
+};
+TEST_F(BlueZHeldBootstrapTest, DenyShutsTheSharedChannelDown) {
+    EXPECT_FALSE(phone_eof());
+    bootstrap->deny(HandoffFailure::eligibility);
+    EXPECT_TRUE(phone_eof()) << "close() alone leaves BlueZ's reference open: no DISC";
+}
+TEST_F(BlueZHeldBootstrapTest, DestroyingAnUnfinishedBootstrapShutsTheChannelDown) {
+    ASSERT_TRUE(bootstrap->authorize(snapshot, true, now));
+    bootstrap.reset();
+    EXPECT_TRUE(phone_eof());
+}
+TEST_F(BlueZHeldBootstrapTest, PhoneFailureShutsTheChannelDown) {
+    start(); send(7); tick();
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::wrong_order);
+    EXPECT_TRUE(phone_eof());
+}
+TEST_F(BlueZHeldBootstrapTest, CompletedExchangeKeepsTheChannelUntilAbortedAfterwards) {
+    complete();
+    EXPECT_FALSE(phone_eof()) << "success leaves the channel as before";
+    // The hand-off fails after the last RFCOMM message (no TCP session): the phone is freed.
+    bootstrap->deny(HandoffFailure::denied);
+    EXPECT_FALSE(bootstrap->complete());
+    EXPECT_TRUE(phone_eof());
+}
+TEST_F(BlueZHeldBootstrapTest, CompletedExchangeDestroyedUnconfirmedShutsTheChannelDown) {
+    complete();
+    bootstrap.reset();
+    EXPECT_TRUE(phone_eof());
+}
+TEST_F(BlueZHeldBootstrapTest, ConfirmedCompletionIsNeverCutByTheBackstop) {
+    // A healthy, confirmed session keeps the phone's channel past the 30 s backstop.
+    complete();
+    bootstrap->confirm();
+    EXPECT_FALSE(bootstrap->awaiting_confirmation());
+    elapsed = 40'000;
+    EXPECT_FALSE(bootstrap->expire());
+    EXPECT_FALSE(phone_eof()) << "the backstop cut a confirmed session";
+    EXPECT_TRUE(bootstrap->complete());
+    // Its retirement, later, still frees the phone.
+    bootstrap->deny(HandoffFailure::denied);
+    EXPECT_TRUE(phone_eof());
+}
+TEST_F(BlueZHeldBootstrapTest, UnconfirmedCompletionBackstopShutsTheChannelDownKeepingAuthority) {
+    complete();
+    elapsed = 29'000; EXPECT_FALSE(bootstrap->expire()); EXPECT_FALSE(phone_eof());
+    elapsed = 40'000;
+    EXPECT_FALSE(bootstrap->expire());
+    EXPECT_TRUE(phone_eof());
+    EXPECT_TRUE(bootstrap->complete()) << "completed authority has no TTL (contract v2.6)";
+    EXPECT_FALSE(bootstrap->awaiting_confirmation());
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
 }
 }

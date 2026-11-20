@@ -150,10 +150,31 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     Impl::Device live{};
     if (!observed || !impl_->exact(*observed, true, &live) || !impl_->admitted(observed->device.identity))
         return Error{ErrorCode::helper_rejected};
-    impl_->close_window();
+    const auto& identity = observed->device.identity;
+    // A retry for the phone whose window is still open changes nothing: the window is opened
+    // at most once per 60 s, and a bootstrap in progress keeps running (#161).
+    if (impl_->allowed && impl_->allowed->device.identity == identity && !impl_->pairing_enabled &&
+        impl_->now() < impl_->window) {
+        // A dead previous exchange's outcome is not reported again in this attempt.
+        if (impl_->bootstrap && !impl_->bootstrap->live() && !impl_->bootstrap->complete()) {
+            impl_->bootstrap.reset();
+            impl_->last_failure = HandoffFailure::none;
+        }
+        return State::active;
+    }
+    // A lapsed window reopens; this phone's bootstrap (running, or completed and awaiting the
+    // receiver's confirmation) survives it. Any other phone's bootstrap is aborted, which
+    // shuts its RFCOMM channel down so that phone can retry. A confirmed hand-off is neither,
+    // so it is aborted here too; Runtime never reconnects during a session (admit() runs only
+    // without one), so that case is unreachable from the receiver.
+    if (impl_->bootstrap && impl_->connected && impl_->connected->device.identity == identity &&
+        (impl_->bootstrap->live() || impl_->bootstrap->awaiting_confirmation()))
+        impl_->close_admission();
+    else
+        impl_->close_window();
     // A fresh window starts without the previous exchange's outcome: PollBootstrapV1 reports a
-    // failure of this window's bootstrap only. close_window() denied any previous exchange, so the
-    // retained object is dead (handoff() would otherwise re-read its failure on every poll).
+    // failure of this window's bootstrap only. A previous exchange that is not kept above was
+    // denied, so the retained object is dead (handoff() would otherwise re-read its failure).
     if (impl_->bootstrap && !impl_->bootstrap->live() && !impl_->bootstrap->complete()) impl_->bootstrap.reset();
     impl_->last_failure = HandoffFailure::none;
     impl_->lost_link.reset();

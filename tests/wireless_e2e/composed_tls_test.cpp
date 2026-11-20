@@ -89,7 +89,8 @@ void WirelessComposedTls::approved_reconnect() {
     EXPECT_TRUE(info.password() == snapshot->password); EXPECT_TRUE(info.ssid() == snapshot->ssid);
     EXPECT_EQ(info.bssid(), snapshot->bssid); EXPECT_EQ(info.security_mode(), 8); EXPECT_EQ(info.access_point_type(), 1);
     ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
-    ASSERT_TRUE(eventually([&] { return bluez.command("wire-read") == "closed"; }));
+    // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
+    for (int quiet = 0; quiet < 5; ++quiet) { ASSERT_EQ(bluez.command("wire-read"), "open"); }
     });
     ASSERT_TRUE(eventually([&] { coordinator.tick(); return bootstrap.wait_for(0ms) == std::future_status::ready; }, 5s));
     bootstrap.get(); ASSERT_FALSE(HasFatalFailure());

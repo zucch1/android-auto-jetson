@@ -31,16 +31,22 @@ struct HandoffEligibilityCoordinator::Impl {
     bool active{}, completed{}, confirming{};
     // 950ms evidence + <=25ms owner scheduling + <=25ms synchronous stop <=1s.
     Clock::time_point expires{Clock::time_point::max()}, establishment{}, grace{Clock::time_point::max()};
+    // From the first observation of `handle`: the bootstrap's own budget (#161).
+    Clock::time_point bootstrap_until{};
+    Timing timing;
     std::optional<std::future<Reply>> pending;
     std::optional<Job> denial, withdrawal;
 
-    Impl(const trust::TrustStore& store, HandoffOperations ops, Listener target)
-        : trust(store), operations(std::move(ops)), listener(std::move(target)) {}
+    Impl(const trust::TrustStore& store, HandoffOperations ops, Listener target, Timing bounds)
+        : trust(store), operations(std::move(ops)), listener(std::move(target)), timing(bounds) {}
 
     bool live_consumer() const { return consumer && consumer->value == source.generation; }
     bool trusted() const { return phone && trust.lookup(*phone) == trust::Decision::approved; }
     bool valid() const {
         return stage == Stage::authorized && trusted() && Clock::now() < expires && Clock::now() < grace;
+    }
+    bool in_progress() const {
+        return stage == Stage::preparing || stage == Stage::authorizing || (stage == Stage::authorized && !completed);
     }
     void launch(Job job) {
         job.started = Clock::now();
@@ -92,6 +98,8 @@ struct HandoffEligibilityCoordinator::Impl {
             if (!trusted() || !live_consumer()) { retire(); return; }
             snapshot = observed.snapshot;
             stage = Stage::preparing;
+            // The helper accepted it before this reply, so its own deadline comes first.
+            bootstrap_until = Clock::now() + timing.bootstrap;
         } else if (reply.job.operation == Operation::authorize) {
             if (Clock::now() >= fresh_until || !trusted() || !live_consumer()) { retire(); return; }
             expires = fresh_until; stage = Stage::authorized;
@@ -116,8 +124,11 @@ struct HandoffEligibilityCoordinator::Impl {
         }
     }
     void tick() {
+        // Establishment bounds only the wait for a bootstrap. An observed one runs to its own
+        // budget, however late in the attempt the phone connected (#161).
         if (stage != Stage::retired && (Clock::now() >= expires || Clock::now() >= grace ||
-            (stage != Stage::authorized && Clock::now() >= establishment) ||
+            (stage == Stage::observing && Clock::now() >= establishment) ||
+            ((stage == Stage::preparing || stage == Stage::authorizing) && Clock::now() >= bootstrap_until) ||
             (phone && !trusted()) || (!live_consumer() && !active))) retire();
         if (pending && pending->wait_for(0ms) == std::future_status::ready) {
             auto reply = pending->get(); pending.reset(); accept(std::move(reply));
@@ -134,8 +145,8 @@ struct HandoffEligibilityCoordinator::Impl {
 };
 
 HandoffEligibilityCoordinator::HandoffEligibilityCoordinator(const trust::TrustStore& trust,
-    HandoffOperations operations, Listener listener)
-    : impl_(std::make_unique<Impl>(trust, std::move(operations), std::move(listener))) {}
+    HandoffOperations operations, Listener listener, Timing timing)
+    : impl_(std::make_unique<Impl>(trust, std::move(operations), std::move(listener), timing)) {}
 HandoffEligibilityCoordinator::~HandoffEligibilityCoordinator() {
     impl_->retire();
     if (impl_->pending) { impl_->pending->wait(); impl_->pending.reset(); }
@@ -145,12 +156,15 @@ HandoffEligibilityCoordinator::~HandoffEligibilityCoordinator() {
     }
 }
 void HandoffEligibilityCoordinator::begin(helper::Source source) {
+    // A retry must not reset a bootstrap that is still progressing: retiring it would deny the
+    // helper's live handle and poison its re-observation through retired_handle (#161).
+    if (impl_->in_progress() && impl_->source == source && impl_->live_consumer()) return;
     impl_->retire();
     if (!source.generation || !impl_->consumer || impl_->consumer->value != source.generation) return;
     ++impl_->epoch;
     impl_->source = source;
     impl_->stage = Impl::Stage::observing;
-    impl_->establishment = Clock::now() + 10s;
+    impl_->establishment = Clock::now() + impl_->timing.establishment;
     impl_->expires = Clock::time_point::max();
     impl_->grace = Clock::time_point::max();
     impl_->active = false;
@@ -168,6 +182,9 @@ void HandoffEligibilityCoordinator::confirm_completion() {
     impl_->withdrawal = Impl::Job{Impl::Operation::withdraw, impl_->epoch.load(), impl_->source, impl_->handle};
 }
 bool HandoffEligibilityCoordinator::bootstrap_completed() const { return impl_->completed && impl_->valid(); }
+bool HandoffEligibilityCoordinator::bootstrapping() const {
+    return impl_->in_progress() && Clock::now() < impl_->bootstrap_until + impl_->timing.connect;
+}
 void HandoffEligibilityCoordinator::tick(bool active) { impl_->active = active; impl_->tick(); }
 void HandoffEligibilityCoordinator::retire() { impl_->retire(); }
 bool HandoffEligibilityCoordinator::admitting() const { return impl_->valid() && impl_->live_consumer(); }

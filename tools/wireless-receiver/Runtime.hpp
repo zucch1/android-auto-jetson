@@ -155,7 +155,9 @@ struct Runtime final {
                 if (configured || media.video.has_pending()) media.video.reset();
                 configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
             }
-            if (wants && attempting && !receiver.session() && turn >= attempt_until) {
+            // A bootstrap observed late in the attempt runs to its own bounded deadline: deferring
+            // would deny it and leave the phone retrying against a fresh window (#161).
+            if (wants && attempting && !receiver.session() && turn >= attempt_until && !receiver.bootstrapping()) {
                 // Not an error code: name why the attempt deadline passed instead of retrying
                 // silently (#160). No addresses or identities are logged.
                 // Asked at expiry, before defer() stops the epoch: the link may have arrived since.
