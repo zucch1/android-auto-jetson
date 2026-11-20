@@ -73,8 +73,19 @@ struct HandoffEligibilityCoordinator::Impl {
         withdrawal.reset(); completed = false; confirming = false;
         phone.reset(); snapshot.reset(); handle = 0;
     }
+    // A stale observation may still name a handle: PollBootstrapV1 bound the phone's live
+    // bootstrap to this attempt's source before the attempt was retired. It is denied like any
+    // retired handle and never adopted again; otherwise the helper keeps the bootstrap, its
+    // binding and its lease into the next attempt (#169 review).
+    void orphaned(const Reply& reply) {
+        if (reply.job.operation != Operation::observe || !reply.result || !reply.result.value().peer.handle) return;
+        const auto bound = reply.result.value().peer.handle;
+        retired_handle = bound;
+        if (!denial) denial = Job{Operation::deny, epoch.load(), reply.job.source, bound};
+    }
     void accept(Reply reply) {
-        if (reply.job.epoch != epoch.load() || reply.job.operation == Operation::deny) return;
+        if (reply.job.operation == Operation::deny) return;
+        if (reply.job.epoch != epoch.load()) { orphaned(reply); return; }
         if (!reply.result) {
             // A server-side RFCOMM peer may not have connected yet. Keep only
             // initial observation bounded by establishment; all later errors retire.
@@ -123,11 +134,11 @@ struct HandoffEligibilityCoordinator::Impl {
             }
         }
     }
-    // Sends this coordinator's outstanding denial now, after any operation still in flight
-    // (whose reply is stale once retired). The helper then has retired the old hand-off before
-    // the caller starts a fresh attempt (#169 review).
+    // Sends this coordinator's outstanding denial now, after any operation still in flight (whose
+    // reply is stale once retired, but may name a handle to deny: orphaned()). The helper then has
+    // retired the old hand-off before the caller starts a fresh attempt (#169 review).
     void settle() {
-        if (pending) { pending->wait(); pending.reset(); }
+        if (pending) { auto reply = pending->get(); pending.reset(); orphaned(reply); }
         if (denial) {
             const auto job = *denial;
             denial.reset();

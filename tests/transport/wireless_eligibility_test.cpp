@@ -23,6 +23,7 @@ struct EligibilityFixture {
     std::atomic<bool> sampled{false};
     std::atomic<bool> authorize_wait{false}, authorizing{false};
     std::atomic<unsigned> denied{};
+    std::atomic<std::uint64_t> denied_handle{};
     std::atomic<std::uint64_t> observed_handle{41};
     std::atomic<unsigned> allowed{};
     std::atomic<unsigned> initial_observations{};
@@ -47,13 +48,13 @@ struct EligibilityFixture {
             if (!initial && moderate_refresh.load()) std::this_thread::sleep_for(350ms);
             if (!(early_sample.load() ? live_at_start : helper_live.load())) return aa::Error{aa::ErrorCode::helper_rejected};
             return aa::app::HandoffObservation{observed, request.credentials_allowed ? std::optional{snapshot} : std::nullopt};
-        }, [this](aa::helper::Source, std::uint64_t, bool allow) -> aa::core::Result<void> {
+        }, [this](aa::helper::Source, std::uint64_t handle, bool allow) -> aa::core::Result<void> {
             if (allow) {
                 ordering_ok = listening; authorizing = true;
                 while (authorize_wait.load()) std::this_thread::yield();
                 if (moderate_ops.load()) std::this_thread::sleep_for(350ms);
                 ++allowed;
-            } else ++denied;
+            } else { denied_handle = handle; ++denied; }
             return {};
         }, [this](aa::helper::Source, std::uint64_t) -> aa::core::Result<void> {
             ++withdrawn;
@@ -362,4 +363,29 @@ TEST(WirelessEligibility, AdmissionExpiryEventNamesThePhaseWithoutIdentities) {
         R"json("detail":"waiting for HFP (owned by infotainment)"})json");
     EXPECT_EQ(admission_expired_json(false, false),
         R"json({"event":"wireless_admission_expired","reason":"attempt_deadline","phase":"phone_handoff"})json");
+}
+// #169 review (Neon P2): the helper binds the phone's bootstrap to this attempt's source inside
+// PollBootstrapV1, before the observation's reply reaches the coordinator. An attempt retired in
+// that gap must still deny the handle the observation bound; otherwise the helper keeps the live
+// bootstrap, its binding and its lease into the next attempt's ReconnectPeerV1.
+TEST(WirelessEligibility, RetireWithAnObservationInFlightDeniesTheHandleItBound) {
+    EligibilityFixture f;
+    f.slow_setup = true;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.initial_observations.load() > 0; }));
+    // Runtime defer() -> receiver.stop(): the external retirement settles before it returns.
+    f.coordinator.retire();
+    EXPECT_EQ(f.denied.load(), 1U) << "retire() returned without denying the observed handle";
+    EXPECT_EQ(f.denied_handle.load(), f.peer.handle);
+}
+TEST(WirelessEligibility, EstablishmentExpiryWithAnObservationInFlightDeniesTheHandleItBound) {
+    EligibilityFixture f{{std::chrono::milliseconds{100}, std::chrono::milliseconds{10'000}, std::chrono::milliseconds{5'000}}};
+    f.slow_setup = true;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.initial_observations.load() > 0; }));
+    // The establishment bound retires the attempt while the observation is still in flight; its
+    // stale reply then names the handle the helper bound.
+    EXPECT_TRUE(f.eventually([&] { return f.denied.load() > 0; }, 2s)) << "the stale observation was dropped";
+    EXPECT_EQ(f.denied_handle.load(), f.peer.handle);
+    EXPECT_FALSE(f.coordinator.admitting());
 }
