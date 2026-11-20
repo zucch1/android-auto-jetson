@@ -2,7 +2,10 @@
 #include <aa/helper/Bootstrap.hpp>
 #include "Bootstrap.pb.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
+#include <functional>
+#include <string_view>
 #include <atomic>
 #include <future>
 #include <poll.h>
@@ -39,19 +42,33 @@ protected:
     bool fence_current{true};
     void tick() { bootstrap->tick(now, [this] { return core::Result<ApSnapshot>{snapshot}; },
         [this](std::uint64_t, const std::function<void()>& send) { if (!fence_current) return false; send(); return true; }); }
+    // Byte-exact fixtures in the shipping start-first layout (#166). Field numbers and IDs:
+    // aa-proxy-rs f80236f src/protos/WifiStartRequest.proto:4-7, WifiInfoResponse.proto:22-28,
+    // src/bluetooth.rs:409-420, 914-923; WirelessAndroidAutoDongle ef64522 bluetoothProfiles.cpp:68-77.
+    static std::vector<std::uint8_t> bytes(std::string_view text) { return {text.begin(), text.end()}; }
+    // WifiStartRequest=1 {1: "10.42.0.1", 2: 5277}
+    static std::vector<std::uint8_t> start_request() {
+        return bytes(std::string_view{"\x00\x0e\x00\x01" "\x0a\x09" "10.42.0.1" "\x10\x9d\x29", 18});
+    }
+    // WifiInfoResponse=3 {1: ssid, 2: key, 3: bssid, 4: WPA2_PERSONAL=8, 5: DYNAMIC=1}
+    static std::vector<std::uint8_t> info_response() {
+        return bytes(std::string_view{"\x00\x2e\x00\x03" "\x0a\x04" "ssid" "\x12\x0f" "secret-sentinel"
+            "\x1a\x11" "02:ab:cd:ef:01:23" "\x20\x08" "\x28\x01", 50});
+    }
+    void raw(std::string_view wire) {
+        ASSERT_EQ(::write(sockets[1], wire.data(), wire.size()), static_cast<ssize_t>(wire.size()));
+    }
     void start() {
         ASSERT_TRUE(bootstrap->authorize(snapshot, true, now)); tick();
-        AawDecoder decoder; decoder.feed(read()); const auto record = decoder.next();
-        ASSERT_TRUE(std::holds_alternative<AawRecord>(record)); ASSERT_EQ(std::get<AawRecord>(record).id, 4);
-        aaw::WifiVersionRequest version;
-        ASSERT_TRUE(version.ParseFromArray(std::get<AawRecord>(record).payload.data(), static_cast<int>(std::get<AawRecord>(record).payload.size())));
-        EXPECT_EQ(version.major_version(), 1); EXPECT_EQ(version.minor_version(), 0);
-        EXPECT_EQ(version.selected_channel(), aaw::CHANNEL_5GHZ_ONLY); EXPECT_EQ(version.supported_channels_size(), 0);
+        // The HU opens with WifiStartRequest and nothing else: no version request, no setup info.
+        ASSERT_EQ(read(), start_request());
     }
-    void version() {
-        aaw::WifiVersionResponse response; response.set_major_version(1); response.set_minor_version(0);
-        response.set_status(aaw::SUCCESS); response.set_selected_channel(aaw::CHANNEL_5GHZ_ONLY);
-        send(5, response.SerializeAsString());
+    std::string failure_log(const std::function<void()>& action) {
+        ::testing::internal::CaptureStderr(); action(); return ::testing::internal::GetCapturedStderr();
+    }
+    void expect_secret_free(const std::string& log) {
+        for (const auto& secret : {snapshot.ssid, snapshot.password, snapshot.bssid, snapshot.ip})
+            EXPECT_EQ(log.find(secret), std::string::npos) << log;
     }
 };
 TEST(AawPayload, SecurityAndAccessPointBytesAreNotProjectionEnum) {
@@ -67,47 +84,83 @@ TEST_F(BootstrapTest, ReadyBeforeEndpointAndOrderedSuccess) {
     ASSERT_TRUE(std::holds_alternative<AawRecord>(record)); EXPECT_EQ(std::get<AawRecord>(record).id, 3);
     aaw::WifiInfoResponse info; ASSERT_TRUE(info.ParseFromArray(std::get<AawRecord>(record).payload.data(), static_cast<int>(std::get<AawRecord>(record).payload.size())));
     EXPECT_TRUE(info.password() == snapshot.password); EXPECT_EQ(info.security_mode(), 8); EXPECT_EQ(info.access_point_type(), 1);
-    const auto next = decoder.next(); ASSERT_TRUE(std::holds_alternative<AawRecord>(next));
-    EXPECT_EQ(std::get<AawRecord>(next).id, 1);
-    aaw::WifiStartRequest endpoint;
-    ASSERT_TRUE(endpoint.ParseFromArray(std::get<AawRecord>(next).payload.data(), static_cast<int>(std::get<AawRecord>(next).payload.size())));
-    EXPECT_EQ(endpoint.ip_address(), snapshot.ip); EXPECT_EQ(endpoint.port(), snapshot.port);
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(decoder.next()));
     aaw::WifiStartResponse started; started.set_status(aaw::STATUS_SUCCESS); send(7, started.SerializeAsString());
     aaw::WifiConnectStatus connected; connected.set_status(aaw::STATUS_SUCCESS); send(6, connected.SerializeAsString()); tick();
     EXPECT_EQ(bootstrap->failure(), HandoffFailure::none); EXPECT_TRUE(bootstrap->complete());
 }
-TEST_F(BootstrapTest, ModernVersionSetupStartAndTrailingSuccess) {
-    tick(); EXPECT_TRUE(read().empty()); start(); version(); tick();
-    const auto bytes = read(); ASSERT_GE(bytes.size(), 4U); EXPECT_EQ(bytes[2], 0); EXPECT_EQ(bytes[3], 11);
-    const auto size = (static_cast<std::size_t>(bytes[0]) << 8) | bytes[1]; ASSERT_GE(bytes.size(), size + 4);
-    aaw::WifiSetupInfo setup; ASSERT_TRUE(setup.ParseFromArray(bytes.data() + 4, static_cast<int>(size)));
-    EXPECT_EQ(setup.major_version(), 1); EXPECT_EQ(setup.minor_version(), 0);
-    EXPECT_EQ(setup.endpoint().ip_address(), snapshot.ip); EXPECT_EQ(setup.endpoint().port(), snapshot.port);
-    EXPECT_TRUE(setup.access_point().password() == snapshot.password); EXPECT_EQ(setup.access_point().ssid(), snapshot.ssid);
-    EXPECT_EQ(setup.access_point().bssid(), snapshot.bssid); EXPECT_EQ(setup.access_point().security_mode(), 8);
-    EXPECT_EQ(setup.access_point().channels_size(), 0);
-    AawDecoder decoder; decoder.feed(std::span<const std::uint8_t>{bytes}.subspan(size + 4));
-    const auto record = decoder.next(); ASSERT_TRUE(std::holds_alternative<AawRecord>(record));
-    EXPECT_EQ(std::get<AawRecord>(record).id, 1);
-    aaw::ModernWifiStartRequest endpoint;
-    ASSERT_TRUE(endpoint.ParseFromArray(std::get<AawRecord>(record).payload.data(), static_cast<int>(std::get<AawRecord>(record).payload.size())));
-    EXPECT_EQ(endpoint.ip_address(), snapshot.ip); EXPECT_EQ(endpoint.port(), snapshot.port); EXPECT_EQ(endpoint.reason(), 1);
-    aaw::ModernWifiStartResponse started; started.set_status(aaw::SUCCESS); send(7, started.SerializeAsString());
-    aaw::ModernWifiConnectStatus connected; connected.set_status(aaw::SUCCESS); send(6, connected.SerializeAsString()); tick();
+TEST_F(BootstrapTest, StartFirstExchangeIsByteExactAndCompletes) {
+    // Given: an authorized HU that has sent exactly WifiStartRequest.
+    start();
+    // When: the phone asks for the AP (WifiInfoRequest=2, empty).
+    raw(std::string_view{"\x00\x00\x00\x02", 4}); tick();
+    // Then: the HU answers with exactly WifiInfoResponse and no second start request.
+    EXPECT_EQ(read(), info_response()); EXPECT_TRUE(bootstrap->live());
+    // When: the phone reports start and connect success (status tag 3 and tag 1, value 0).
+    std::string log = failure_log([&] { raw(std::string_view{"\x00\x02\x00\x07\x18\x00" "\x00\x02\x00\x06\x08\x00", 12}); tick(); });
+    // Then: the bootstrap completes, the socket closes and nothing else is sent.
+    EXPECT_TRUE(bootstrap->complete()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
+    EXPECT_NE(log.find("wireless_handshake_complete flow=start_first"), std::string::npos) << log;
+    EXPECT_EQ(log.find("wireless_handshake_failed"), std::string::npos) << log;
+    expect_secret_free(log);
+    char byte{}; EXPECT_EQ(::read(sockets[1], &byte, 1), 0);
+}
+TEST_F(BootstrapTest, PhoneStatusFixturesDecodeInTheRealLayout) {
+    // WifiStartResponse=7 {1: ip, 2: port, 3: 0} and WifiConnectStatus=6 {1: 0, 2: ""} as a phone may send them.
+    start(); raw(std::string_view{"\x00\x00\x00\x02", 4}); tick(); ASSERT_EQ(read(), info_response());
+    raw(std::string_view{"\x00\x10\x00\x07" "\x0a\x09" "10.42.0.1" "\x10\x9d\x29" "\x18\x00", 20});
+    raw(std::string_view{"\x00\x04\x00\x06" "\x08\x00" "\x12\x00", 8}); tick();
     EXPECT_TRUE(bootstrap->complete()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
 }
-TEST_F(BootstrapTest, ModernGenerationChangeBeforeSetupPreventsSecrets) {
-    start(); ++snapshot.generation; version(); tick();
-    EXPECT_EQ(bootstrap->failure(), HandoffFailure::snapshot); EXPECT_TRUE(read().empty());
-}
-TEST_F(BootstrapTest, ModernGenerationFenceBeforeSetupPreventsSecrets) {
-    start(); fence_current = false; version(); tick();
-    EXPECT_EQ(bootstrap->failure(), HandoffFailure::snapshot); EXPECT_TRUE(read().empty());
-}
-TEST_F(BootstrapTest, ModernRejectsLegacySuccessStatus) {
-    start(); version(); tick(); read();
-    aaw::ModernWifiStartResponse started; started.set_status(0); send(7, started.SerializeAsString()); tick();
+TEST_F(BootstrapTest, NegativeConnectStatusIsReportedByNumber) {
+    // aa-proxy-rs bluetooth.rs:4746-4754: a phone that cannot join the AP sends status -3 as a 10-byte varint.
+    start(); raw(std::string_view{"\x00\x00\x00\x02", 4}); tick(); read();
+    const auto log = failure_log([&] {
+        raw(std::string_view{"\x00\x02\x00\x07\x18\x00" "\x00\x0b\x00\x06" "\x08\xfd\xff\xff\xff\xff\xff\xff\xff\xff\x01", 21}); tick();
+    });
     EXPECT_EQ(bootstrap->failure(), HandoffFailure::phone_rejected); EXPECT_FALSE(bootstrap->complete());
+    EXPECT_NE(log.find("phase=await_connect_status msg_id=6 msg=WifiConnectStatus reason=phone_rejected detail=\"phone status -3\""),
+        std::string::npos) << log;
+    expect_secret_free(log);
+}
+TEST_F(BootstrapTest, OldShiftedStartResponseIsRejected) {
+    // The pre-#166 "modern" layout put WifiStartResponse status at tag 4 (value 12); tag 3 is then missing.
+    start(); raw(std::string_view{"\x00\x00\x00\x02", 4}); tick(); read();
+    const auto log = failure_log([&] { raw(std::string_view{"\x00\x02\x00\x07\x20\x0c", 6}); tick(); });
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::protobuf); EXPECT_FALSE(bootstrap->live());
+    EXPECT_NE(log.find("phase=await_start_response msg_id=7 msg=WifiStartResponse reason=protobuf"), std::string::npos) << log;
+}
+TEST_F(BootstrapTest, OldShiftedConnectStatusIsRejected) {
+    // The pre-#166 layout put WifiConnectStatus status at tag 2 (varint 12); tag 2 is the string error message.
+    start(); raw(std::string_view{"\x00\x00\x00\x02", 4}); tick(); read();
+    raw(std::string_view{"\x00\x02\x00\x07\x18\x00" "\x00\x02\x00\x06\x10\x0c", 12}); tick();
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::protobuf); EXPECT_FALSE(bootstrap->complete());
+}
+TEST_F(BootstrapTest, VersionResponseIsUnexpectedAndReleasesNoSecret) {
+    // A phone WifiVersionResponse=5 {1: 6, 2: 1, 4: 1} has no place in the start-first flow.
+    start();
+    const auto log = failure_log([&] { raw(std::string_view{"\x00\x06\x00\x05\x08\x06\x10\x01\x20\x01", 10}); tick(); });
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::wrong_order); EXPECT_TRUE(read().empty());
+    EXPECT_NE(log.find("phase=await_info_request msg_id=5 msg=WifiVersionResponse reason=wrong_order"), std::string::npos) << log;
+    expect_secret_free(log);
+}
+TEST_F(BootstrapTest, UnknownMessageLogsReasonAndDenies) {
+    start();
+    const auto log = failure_log([&] { raw(std::string_view{"\x00\x00\x00\x63", 4}); tick(); });
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::unknown_id); EXPECT_FALSE(bootstrap->live());
+    EXPECT_NE(log.find("system-helper: wireless_handshake_failed phase=await_info_request msg_id=99 msg=unknown reason=unknown_id"),
+        std::string::npos) << log;
+    EXPECT_EQ(std::count(log.begin(), log.end(), '\n'), 1) << log;
+    char byte{}; EXPECT_EQ(::read(sockets[1], &byte, 1), 0);
+}
+TEST_F(BootstrapTest, GarbledMessageLogsReasonAndDenies) {
+    start();
+    const auto log = failure_log([&] { raw(std::string_view{"\x00\x01\x00\x02\x80", 5}); tick(); });
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::protobuf); EXPECT_TRUE(read().empty());
+    EXPECT_NE(log.find("phase=await_info_request msg_id=2 msg=WifiInfoRequest reason=protobuf detail=\"payload did not parse\""),
+        std::string::npos) << log;
+    expect_secret_free(log);
+    char byte{}; EXPECT_EQ(::read(sockets[1], &byte, 1), 0);
 }
 TEST_F(BootstrapTest, DenyClosesWithoutPayload) {
     bootstrap->deny(HandoffFailure::denied); EXPECT_TRUE(read().empty());

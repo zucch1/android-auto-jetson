@@ -4,6 +4,8 @@
 #include <aa/helper/ApSnapshot.hpp>
 #include <chrono>
 #include <memory>
+#include <optional>
+#include <string_view>
 
 namespace aa::helper {
 class Bootstrap final {
@@ -24,6 +26,9 @@ public:
     SnapshotDeadline deadline() const { return complete() ? SnapshotDeadline{} : deadline_; }
 private:
     enum class Stage { authorization, info, start, connect, finishing, complete, failed };
+    // Logs one structured, secret-free line (#166), then deny().
+    void fail(HandoffFailure, std::optional<std::uint16_t> id, std::string_view detail);
+    const char* phase() const;
     bool queue(std::uint16_t id, const std::string& payload);
     bool flush(const SnapshotFence&);
     bool verify(const SnapshotProvider&);
@@ -39,6 +44,6 @@ private:
     AawDecoder decoder_;
     std::vector<std::uint8_t> output_;
     std::size_t sent_{};
-    bool seen_info_{}, seen_start_{}, modern_{};
+    bool seen_info_{}, seen_start_{};
 };
 }

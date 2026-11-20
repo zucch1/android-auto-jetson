@@ -50,6 +50,11 @@ AawDecodeResult AawDecoder::next() {
     return record;
 }
 
+std::optional<std::uint16_t> AawDecoder::pending_id() const {
+    if (buffer_.size() < kHeaderSize) return std::nullopt;
+    return read_u16(std::span<const std::uint8_t>{buffer_}.subspan(2));
+}
+
 std::optional<AawError> AawDecoder::finish() {
     finished_ = true;
     if (error_) return error_;

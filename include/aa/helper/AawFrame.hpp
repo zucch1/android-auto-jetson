@@ -26,6 +26,8 @@ public:
     // Ends input and validates all queued records without consuming them.
     // Any failure is sticky; feed() after finish() is ignored.
     std::optional<AawError> finish();
+    // The message ID in the buffered header, if four header bytes are buffered (diagnostics only).
+    std::optional<std::uint16_t> pending_id() const;
 
 private:
     std::vector<std::uint8_t> buffer_;

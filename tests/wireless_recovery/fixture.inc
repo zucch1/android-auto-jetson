@@ -138,11 +138,11 @@ protected:
                 EXPECT_FALSE(terminal) << "RFCOMM closed, mismatched or undecodable before record " << expected;
                 return received;
             };
-            ASSERT_TRUE(read_record(4));
-            ASSERT_EQ(bluez.command("wire-send 0008000510011800280c3001"), "ok");
-            ASSERT_TRUE(read_record(11));
+            // Start-first (#166): WifiStartRequest, phone WifiInfoRequest, WifiInfoResponse, statuses.
             ASSERT_TRUE(read_record(1));
-            ASSERT_EQ(bluez.command("wire-send 00020007200c00020006100c"), "ok");
+            ASSERT_EQ(bluez.command("wire-send 00000002"), "ok");
+            ASSERT_TRUE(read_record(3));
+            ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
             ASSERT_TRUE(eventually([&] { return bluez.command("wire-read") == "closed"; }));
         });
         ASSERT_TRUE(eventually([&] { pump(); return phone.wait_for(0ms) == std::future_status::ready; }, 5s));

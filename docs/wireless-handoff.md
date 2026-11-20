@@ -29,39 +29,58 @@ u16 is the big-endian payload length, excluding the header; the second u16 is
 the big-endian message ID. Payloads larger than 4096 bytes are protocol
 violations. Fragmented records are accumulated and coalesced records are split.
 
-The receiver plays the head-unit role. It opens with a version request, then
-follows whichever path the phone's reply selects:
+The receiver plays the head-unit role and runs the start-first flow (#166) that
+both shipping head-unit-role dongles use against current phones:
 
 ```text
-receiver  WifiVersionRequest=4 {1.0, 5GHZ_ONLY}     authorized, listener ready
-
-modern path:
-phone     WifiVersionResponse=5 {1.0, status=12}
-receiver  WifiSetupInfo=11 {endpoint {ip, port},
-                            access_point {ssid, bssid, password,
-                                          security_mode}}
-receiver  WifiStartRequest=1 {ip, port, DYNAMIC}
-phone     WifiStartResponse=7 {status field 4 = 12}
-phone     WifiConnectStatus=6 {status field 2 = 12}
-
-legacy fallback:
-phone     WifiInfoRequest=2
-receiver  WifiInfoResponse=3 {ssid, password, bssid,
-                              security_mode, access_point_type}
-receiver  WifiStartRequest=1 {ip, port}
-phone     WifiStartResponse=7 {status field 3 = 0}
-phone     WifiConnectStatus=6 {status field 1 = 0}
+receiver  WifiStartRequest=1 {1: ip, 2: port}          authorized, listener ready
+phone     WifiInfoRequest=2 {}
+receiver  WifiInfoResponse=3 {1: ssid, 2: key, 3: bssid,
+                              4: security_mode=8, 5: access_point_type=1}
+phone     WifiStartResponse=7 {3: status = 0}
+phone     WifiConnectStatus=6 {1: status = 0}
 ```
 
-The version request is sent only after authorization and only once the
-projection listener is ready. Credentials leave the helper only in the
-modern `11` or legacy `3` record, from the pinned AP snapshot and behind the
-same snapshot fence and eligibility checks described below. Both paths then
-send the endpoint in message `1` and validate the trailing phone `7` and `6`.
-The success value differs by path: the modern layouts use status `12` in
-different field tags, while the legacy layouts use `STATUS_SUCCESS=0`. Any
-other version, status, or path mixing is a phone rejection or wrong-order
-failure.
+The start request is sent only after authorization and only once the
+projection listener is ready. Credentials leave the helper only in record `3`,
+from the pinned AP snapshot and behind the same snapshot fence and eligibility
+checks described below. Success is status `0` in both phone records; every
+failure value is negative, and any nonzero status is a phone rejection.
+
+Sources for every ID, framing rule and field number (file:line at the pins
+below): aa-proxy-rs `src/bluetooth.rs:409-420` (IDs), `4692-4694` and
+`4716-4722` (length + ID header), `6284-6323` (`send_params`, the flow above),
+`914-923` (status tags 1 and 3), `4746-4754` (status `0` is success),
+`src/protos/WifiStartRequest.proto:4-7` and `src/protos/WifiInfoResponse.proto:4-28`;
+WirelessAndroidAutoDongle `aawg/src/bluetoothProfiles.cpp:32-65` (flow),
+`68-77` (IDs), `99-112` and `125-142` (framing), and its
+`proto/WifiStartRequest.proto:4-7` and `proto/WifiInfoResponse.proto:4-28`.
+open-android-auto agrees on the IDs (`oaa/wifi/WifiSetupMessageEnum.proto:34-44`),
+`WifiStartRequest` (`WifiStartRequestMessage.proto:16-20`), `WifiStartResponse`
+status 3 (`WifiStartResponseMessage.proto:20-24`) and `WifiConnectStatus` status 1
+(`WifiConnectStatusMessage.proto:20-23`). It swaps `WifiInfoResponse` tags 2 and 3
+(`WifiInfoResponseMessage.proto:13-19`); we follow the two shipping dongles.
+
+The version-negotiation messages (`WifiVersionRequest=4`, `WifiVersionResponse=5`,
+`WifiSetupInfo=11`) are not used. The pre-#166 code sent them with every field
+number one too high (the phone logged "HU requested version: 0.1"), and then
+never sent setup or start. Their status values are not settled (OAA marks
+success as wire `1`, unverified, at `WifiVersionStatusEnum.proto:18-31`), and no
+phone capture exists to check against, so that path was removed rather than
+guessed. A phone record with ID 4 or 5 is a wrong-order failure.
+
+Every handshake failure logs one line to the helper's stderr, then fails
+through the ordinary deny path:
+
+```text
+system-helper: wireless_handshake_failed phase=await_info_request msg_id=99 msg=unknown reason=unknown_id detail="record header rejected"
+```
+
+`phase` is `authorization`, `await_info_request`, `await_start_response`,
+`await_connect_status` or `finishing`; `msg_id` is the record ID, or `none`;
+`reason` is the typed `HandoffFailure`. The line never carries the SSID, PSK,
+BSSID, endpoint or any address. A completed exchange logs
+`system-helper: wireless_handshake_complete flow=start_first`.
 Completion requires the trailing-data check, including a nonblocking socket
 peek, and a deadline recheck; receiving one expected record is not enough.
 
@@ -81,11 +100,12 @@ the separate completed-handoff semantics described under lifetimes.
 The wire rules are reverse-engineered, not an official Google interoperability
 specification. Pinned head-unit-role references are
 `nisargjhaveri/WirelessAndroidAutoDongle` at
-`ef645221ec28e87361391b9bdcf27e31ff48cb6f` and `manio/aa-proxy-rs` at
-`b753a002b7ff19f94a861a81396eacaccfa58d5e` for the legacy path, and
-`mrmees/open-android-auto` at `61eab61c5f9968154ff1a80faa8c0a427b208479` for
-the modern path. Both paths are exercised only by host tests against scripted
-peers; that is not proof of interoperability with a real phone.
+`ef645221ec28e87361391b9bdcf27e31ff48cb6f` and `aa-proxy/aa-proxy-rs` at
+`f80236fb17bef459398fa4ae235f86a68574a873`, with `mrmees/open-android-auto` at
+`61eab61c5f9968154ff1a80faa8c0a427b208479` (vendored) as a cross-check. The
+flow is exercised by host tests against scripted peers with byte-exact fixtures;
+that is not proof of interoperability with a real phone. The final proof is a
+live retest with the test phone (Android Auto version code 180664264).
 
 ### Negotiated AAP WifiProjection/WifiCredentials service
 
