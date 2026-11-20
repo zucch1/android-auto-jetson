@@ -22,6 +22,11 @@
 #   FAKE_ADB_DEVICE_LINE      the `devices -l` line (default FAKESERIAL on 9-9)
 #   FAKE_ADB_STALL_FILE=FILE  while FILE exists, every command is logged and
 #                             then hangs (until the caller's timeout kills it)
+#   FAKE_ADB_USB_CONFIG       `getprop sys.usb.config` (default mtp,adb)
+#   FAKE_ADB_WIFI_STATUS      `cmd wifi status` text; FAKE_ADB_BT_ON bluetooth_on (1)
+#   FAKE_ADB_CONNECT=fail     `adb connect IP:5555` fails (adb unreachable over the AP)
+#   FAKE_ADB_SERIALNO         the device's `getprop ro.serialno` (default FAKESERIAL);
+#                             `-s T get-serialno` answers T, as the real adb server does
 #   FAKE_ADB_IGNORE_TERM=1    such a hung command also ignores TERM (only KILL
 #                             ends it)
 set -u
@@ -55,6 +60,23 @@ case "$args" in
     "devices -l")
         printf 'List of devices attached\n%s\n' \
             "${FAKE_ADB_DEVICE_LINE:-FAKESERIAL device usb:9-9 model:FAKE}" ;;
+    "connect "*)
+        # adb over the AP link (wireless): FAKE_ADB_CONNECT=fail refuses it.
+        if [ "${FAKE_ADB_CONNECT:-ok}" = fail ]; then echo "failed to connect to ${args#connect }"; exit 1; fi
+        echo "connected to ${args#connect }" ;;
+    "disconnect "*)
+        echo "disconnected ${args#disconnect }" ;;
+    "-s "*" get-serialno")
+        # The host server's transport serial: for a TCP transport, the endpoint.
+        target="${args#-s }"; echo "${target%% *}" ;;
+    *"getprop ro.serialno"*)
+        echo "${FAKE_ADB_SERIALNO:-FAKESERIAL}" ;;
+    *"getprop sys.usb.config"*)
+        echo "${FAKE_ADB_USB_CONFIG-mtp,adb}" ;;
+    *"cmd wifi status"*)
+        printf '%s\n' "${FAKE_ADB_WIFI_STATUS:-Wifi is connected to \"x\"}" ;;
+    *"settings get global bluetooth_on"*)
+        echo "${FAKE_ADB_BT_ON:-1}" ;;
     *"svc usb setFunctions"*)
         echo $(( now_ms + ${FAKE_ADB_REENUM_MS:-300} )) > "$state/reenumerating" ;;
     *"am start"*" -n "*)
