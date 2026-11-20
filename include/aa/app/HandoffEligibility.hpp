@@ -52,7 +52,9 @@ public:
     HandoffEligibilityCoordinator(const HandoffEligibilityCoordinator&) = delete;
     HandoffEligibilityCoordinator& operator=(const HandoffEligibilityCoordinator&) = delete;
     // Starts an attempt. A retry with the same source while this coordinator's bootstrap is
-    // still in progress keeps it (no retirement, no denial, no re-observation, #161).
+    // still in progress keeps it (no retirement, no denial, no re-observation, #161). A fresh
+    // attempt's caller first retires the previous one with retire(), which settles its denial
+    // with the helper; begin()'s own retirement only queues it (#169 review).
     void begin(helper::Source source);
     void consumer(std::optional<core::ConsumerId> live);
     void tick(bool active = false);

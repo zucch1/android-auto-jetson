@@ -66,8 +66,10 @@ public:
         confirmation_.flush();
         return result;
     }
+    // The session and listener close first; the coordinator's retirement then settles its denial
+    // with the helper (bounded), still before any fresh attempt (#169 review).
     void stop() {
-        eligibility_.retire(); link_.stop(); confirmation_.flush(true); last_source_.reset();
+        link_.stop(); eligibility_.retire(); confirmation_.flush(true); last_source_.reset();
     }
     void set_io_checkpoint_interval(std::chrono::milliseconds interval) noexcept {
         link_.set_io_checkpoint_interval(interval);

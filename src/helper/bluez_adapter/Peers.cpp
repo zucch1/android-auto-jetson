@@ -155,8 +155,12 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     // at most once per 60 s, and a bootstrap in progress keeps running (#161).
     if (impl_->allowed && impl_->allowed->device.identity == identity && !impl_->pairing_enabled &&
         impl_->now() < impl_->window) {
-        // A dead previous exchange's outcome is not reported again in this attempt.
-        if (impl_->bootstrap && !impl_->bootstrap->live() && !impl_->bootstrap->complete()) {
+        // Only a bootstrap still in progress is kept, as in the lapsed-window path below. A dead
+        // exchange's outcome is not reported again in this attempt; a completion whose backstop
+        // fired, or a confirmed one, is aborted (DISC if its socket is still held) and cleared,
+        // so SystemHelper resets its binding, snapshot and lease (#169 review).
+        if (impl_->bootstrap && !impl_->bootstrap->live() && !impl_->bootstrap->awaiting_confirmation()) {
+            impl_->close_connection();
             impl_->bootstrap.reset();
             impl_->last_failure = HandoffFailure::none;
         }

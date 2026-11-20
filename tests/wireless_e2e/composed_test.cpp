@@ -18,6 +18,8 @@ protected:
     std::atomic<int> withdraw_code{-1};
     // A refresh that is still in flight when the attempt is retired (#169 review).
     std::atomic<bool> slow_refresh{}, refreshing{};
+    // An initial observation whose reply is held after the helper bound the hand-off (Neon P2).
+    std::atomic<bool> slow_observe{}, observed{};
     std::unique_ptr<Coordinator> coordinator;
     Clock::time_point bootstrap_deadline{};
     void TearDown() override {
@@ -28,7 +30,7 @@ protected:
     const trust::TransportIdentity identity{trust::WirelessIdentity{"02:00:00:00:00:01", "02:00:00:00:00:AA"}};
     // acquisition: Runtime's AP-inactive path (reconnect, then AcquireApV1 with this source, which
     // becomes the helper lease and the attempt's source). Otherwise the AP-active {7, 0} source.
-    void admit(std::optional<Source> acquisition = std::nullopt) {
+    void admit(std::optional<Source> acquisition = std::nullopt, bool until_admitting = true) {
         start(); acquire(); ASSERT_TRUE(state(State::active));
         ASSERT_TRUE(store->approve(identity)); ASSERT_EQ(bluez.command("paired"), "ok");
         ASSERT_TRUE(client->reconnect(identity));
@@ -41,6 +43,7 @@ protected:
             if (request.handle && slow_refresh.load()) { refreshing = true; std::this_thread::sleep_for(700ms); }
             const auto began = Clock::now();
             auto result = validate(request);
+            if (!request.handle && result && slow_observe.load()) { observed = true; std::this_thread::sleep_for(700ms); }
             validation_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - began).count();
             if (request.handle) refresh_max_ms = std::max(refresh_max_ms.load(), validation_ms.load());
             validation_code = result ? 0 : static_cast<int>(result.error().code());
@@ -65,6 +68,7 @@ protected:
                 listening = true; ++starts; return {};
             }, [this] { listening = false; }});
         coordinator->consumer(core::ConsumerId{7}); coordinator->begin(acquisition.value_or(Source{7, 0}));
+        if (!until_admitting) return;
         // v2.5 supersedes the unsupported 1s setup SLA; loss cancellation stays <=1s.
         ASSERT_TRUE(eventually([&] { coordinator->tick(); return coordinator->admitting(); },
             std::chrono::duration_cast<std::chrono::milliseconds>(bootstrap_deadline - Clock::now())))
@@ -166,6 +170,48 @@ TEST_F(WirelessComposed, ExpiredHandoffDeniedLateLeavesNoLeaseForTheFreshAttempt
     // Then: the old phone channel is shut down, and the phone's fresh bootstrap is admitted
     // under the new source within the establishment bound.
     ASSERT_TRUE(eventually([&] { coordinator->tick(); return bluez.command("wire-read") != "open"; }, 3s));
+    ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    EXPECT_TRUE(eventually([&] { coordinator->tick(); return coordinator->admitting(); }, 5s))
+        << "validation=" << validation_code.load() << " authorization=" << authorization_code.load();
+    HandoffFailure failure{};
+    EXPECT_TRUE(client->poll_bootstrap({7, 0}, failure)) << "the retired attempt's lease carried over";
+}
+
+// #169 review (Neon P2, variant of the above): the attempt is retired while its initial
+// observation is in flight, after PollBootstrapV1 bound the phone's live bootstrap to {7, 1}.
+// Its reply must not be dropped: the bound handle is denied before the next ReconnectPeerV1,
+// which would otherwise keep the bootstrap, its binding and the {7, 1} lease.
+TEST_F(WirelessComposed, RetiredObservationInFlightLeavesNoLeaseForTheFreshAttempt) {
+    slow_observe = true;
+    ASSERT_NO_FATAL_FAILURE(admit(Source{7, 1}, false));
+    ASSERT_TRUE(eventually([&] { coordinator->tick(); return observed.load(); }, 3s));
+    coordinator->retire();
+    slow_observe = false;
+    ASSERT_TRUE(client->reconnect(identity));
+    coordinator->begin({7, 0});
+    ASSERT_TRUE(eventually([&] { coordinator->tick(); return bluez.command("wire-read") != "open"; }, 3s))
+        << "the bootstrap bound by the dropped observation is still live";
+    ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    EXPECT_TRUE(eventually([&] { coordinator->tick(); return coordinator->admitting(); }, 5s))
+        << "validation=" << validation_code.load() << " authorization=" << authorization_code.load();
+    HandoffFailure failure{};
+    EXPECT_TRUE(client->poll_bootstrap({7, 0}, failure)) << "the retired attempt's lease carried over";
+}
+
+// #169 review (zucch1-bot, HandoffEligibility.cpp:130): the initial observation's PollBootstrapV1
+// bound the phone's bootstrap to {7, 1}, then its GetAPCredentialsV1 failed (here: timed out
+// client-side), so the reply names no handle and the attempt retires with none recorded. The
+// bound handle must still be retired, or the next ReconnectPeerV1 keeps the {7, 1} lease.
+TEST_F(WirelessComposed, FailedInitialObservationAfterBindingLeavesNoLeaseForTheFreshAttempt) {
+    ASSERT_NO_FATAL_FAILURE(admit(Source{7, 1}, false));
+    nm->delay_address_ms = 1500;
+    ASSERT_TRUE(eventually([&] { coordinator->tick(); return validation_code.load() > 0; }, 5s));
+    nm->delay_address_ms = 0;
+    coordinator->retire();
+    ASSERT_TRUE(client->reconnect(identity));
+    coordinator->begin({7, 0});
+    ASSERT_TRUE(eventually([&] { coordinator->tick(); return bluez.command("wire-read") != "open"; }, 3s))
+        << "the bootstrap bound by the failed observation is still live";
     ASSERT_EQ(bluez.command("NewConnection"), "allowed");
     EXPECT_TRUE(eventually([&] { coordinator->tick(); return coordinator->admitting(); }, 5s))
         << "validation=" << validation_code.load() << " authorization=" << authorization_code.load();
