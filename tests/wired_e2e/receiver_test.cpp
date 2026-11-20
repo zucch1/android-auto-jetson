@@ -7412,11 +7412,11 @@ TEST(WiredReceiver, RuntimeDiagnosticsAndAudioReopenKeepTimingOnStalledStdout) {
     probe.release();
     EXPECT_FALSE(log.finish());
     EXPECT_TRUE(running.load());
-    EXPECT_GE(count_substr(probe.bytes, "\"event\":\"runtime_log_dropped\""), 1U);
-    // Droppable runtime records (both reopen provenance lines) are counted; the
-    // non-periodic diag and the collector-visible audio_stall_bypass transitions
-    // are parked and delivered.
-    EXPECT_GE(sum_runtime_dropped(probe.bytes), 2U);
+    // Nothing here is droppable (#156 + #163 merge): both reopen provenance
+    // lines, the non-periodic diag and the collector-visible audio_stall_bypass
+    // transitions are parked in pending_lossless and delivered, in order.
+    EXPECT_EQ(sum_runtime_dropped(probe.bytes), 0U);
+    EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_sink_selected\",\"origin\":\"reopen\""), 2U);
     EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"diag\",\"kind\":\"stall_diag_probe\",\"emit_ns\":"), 1U);
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_stall_bypass\",\"phase\":\"begin\""), 1U);
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_stall_bypass\",\"phase\":\"end\""), 1U);
