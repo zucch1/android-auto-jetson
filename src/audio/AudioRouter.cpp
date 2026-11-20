@@ -789,7 +789,8 @@ core::Result<void> AudioRouter::pump() {
             // advances by the retained frames only.
             const core::Nanoseconds phase{planned_ns - run.timestamp.count};
             const bool backlog_carry =
-                phase.count > 0 || intended < static_cast<std::int64_t>(role_source_frontier);
+                phase.count > 0 || intended < 0
+                || static_cast<std::uint64_t>(intended) < role_source_frontier;
             plan_drift_trim(impl_->drift, phase, run, backlog_carry, entry);
             if (late_beyond_cap(cursor, impl_->source_frontier_frames, intended, run, entry,
                                 cap_frames)) {
@@ -1223,7 +1224,8 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 }
                 const core::Nanoseconds phase{placed_ns - run.timestamp.count};
                 const bool backlog_carry =
-                    phase.count > 0 || intended < static_cast<std::int64_t>(role_source_frontier);
+                    phase.count > 0 || intended < 0
+                    || static_cast<std::uint64_t>(intended) < role_source_frontier;
                 plan_drift_trim(impl_->drift, phase, run, backlog_carry, entry);
                 if (!run.preflighted &&
                     late_beyond_cap(cursor, impl_->source_frontier_frames, intended, run, entry,

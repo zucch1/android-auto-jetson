@@ -33,8 +33,9 @@ def main() -> int:
         bundle.chmod(0o600)
         environment['HU_KEY_PATH'] = str(bundle)
         # Given: a generated synthetic credential in a secure bundle. When: run the suite.
+        timeout = int(environment.get('AA_TLS_RUN_TIMEOUT', '60'))
         result = subprocess.run([binary], env=environment, capture_output=True,
-                                text=True, timeout=60, check=False)
+                                text=True, timeout=timeout, check=False)
         combined = result.stdout + result.stderr
         # Then: the suite passes and no credential material is echoed.
         assert directory not in combined, combined
