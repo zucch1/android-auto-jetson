@@ -261,9 +261,10 @@ core::Result<void> BluezBackend::authorize_handoff(std::uint64_t handle, bool al
         impl_->retire(handle, HandoffFailure::snapshot);
         return Error{ErrorCode::helper_unavailable};
     }
-    // The receiver's completed confirmation: the hand-off is live over TCP. The RFCOMM socket
-    // stays as the phone left it until the hand-off is retired (#161).
-    if (completed) impl_->bootstrap->confirm();
+    // The receiver's completed confirmation (allow, not ready): the hand-off is live over TCP. The
+    // RFCOMM socket stays as the phone left it until the hand-off is retired (#161). A repeated
+    // ready authorization after completion is no confirmation and leaves the backstop armed.
+    if (completed && !ready) impl_->bootstrap->confirm();
     return {};
 }
 void BluezBackend::tick() { impl_->pump(); }

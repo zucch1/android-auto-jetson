@@ -968,6 +968,46 @@ TEST_F(NmDaemon, LapsedWindowRetryKeepsACompletedUnconfirmedHandoff) {
     EXPECT_EQ(kept.value().handle, live.value().handle);
     EXPECT_EQ(bluez.command("wire-read"), "open");
 }
+// #169 review (Neon P2): inside the open window, a same-phone reconnect keeps only a bootstrap
+// still in progress (running, or completed and awaiting confirmation), as the lapsed-window path
+// does. A completion whose backstop fired, or a confirmed one, is aborted and cleared, so
+// SystemHelper resets its binding, snapshot and lease for the fresh attempt.
+TEST_F(NmDaemon, RetryInsideTheWindowClearsABackstoppedCompletion) {
+    seed_managed_phone(directory);
+    ClockedReconnect phone{address, directory}; phone.open(bluez);
+    phone.elapsed = 1000; ASSERT_EQ(phone.connect(bluez), "allowed");
+    const auto live = phone.bluetooth.handoff(); ASSERT_TRUE(live);
+    ASSERT_NO_FATAL_FAILURE(phone.complete(bluez, live.value().handle));
+    phone.elapsed = 32000; phone.bluetooth.tick();
+    ASSERT_EQ(bluez.command("wire-read"), "closed"); ASSERT_TRUE(phone.bluetooth.handoff());
+    phone.elapsed = 35000; ASSERT_TRUE(phone.retry());
+    EXPECT_FALSE(phone.bluetooth.handoff()) << "the backstopped completion survived the retry";
+    EXPECT_EQ(phone.connect(bluez), "allowed") << "the window stays open for the phone's fresh bootstrap";
+}
+TEST_F(NmDaemon, RetryInsideTheWindowAbortsAConfirmedHandoffWithDisc) {
+    seed_managed_phone(directory);
+    ClockedReconnect phone{address, directory}; phone.open(bluez);
+    phone.elapsed = 1000; ASSERT_EQ(phone.connect(bluez), "allowed");
+    const auto live = phone.bluetooth.handoff(); ASSERT_TRUE(live);
+    ASSERT_NO_FATAL_FAILURE(phone.complete(bluez, live.value().handle));
+    ASSERT_TRUE(phone.bluetooth.authorize_handoff(live.value().handle, true, false));
+    phone.elapsed = 5000; ASSERT_TRUE(phone.retry());
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_FALSE(phone.bluetooth.handoff());
+}
+// #169 review (Neon P3): only the completed confirmation (allow, not ready) disarms the backstop.
+// A repeated ready authorization after completion is not a confirmation.
+TEST_F(NmDaemon, RepeatedReadyAuthorizationKeepsTheBackstopArmed) {
+    seed_managed_phone(directory);
+    ClockedReconnect phone{address, directory}; phone.open(bluez);
+    phone.elapsed = 1000; ASSERT_EQ(phone.connect(bluez), "allowed");
+    const auto live = phone.bluetooth.handoff(); ASSERT_TRUE(live);
+    ASSERT_NO_FATAL_FAILURE(phone.complete(bluez, live.value().handle));
+    ASSERT_TRUE(phone.bluetooth.authorize_handoff(live.value().handle, true, true));
+    phone.elapsed = 32000; phone.bluetooth.tick();
+    EXPECT_EQ(bluez.command("wire-read"), "closed") << "a repeated ready authorization disarmed the backstop";
+    EXPECT_TRUE(phone.bluetooth.handoff()) << "completed authority has no TTL";
+}
 TEST_F(NmDaemon, OtherPhonesReconnectAbortsTheOldBootstrapWithDisc) {
     save(directory / "managed-bonds", "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n02:00:00:00:00:02 02:00:00:00:00:AA\n");
     ClockedReconnect phone{address, directory};

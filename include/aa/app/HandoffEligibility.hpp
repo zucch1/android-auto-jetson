@@ -24,6 +24,15 @@ struct HandoffOperations final {
     // Succeeds only for completed bootstrap; a pending exchange is retired.
     std::function<core::Result<void>(helper::Source, std::uint64_t)> withdraw;
 };
+// The helper calls handoff_operations() makes (PollBootstrapV1, GetAPCredentialsV1,
+// AuthorizeBootstrapV1), so a test can fault one of them against a real helper.
+struct HandoffBus final {
+    std::function<core::Result<helper::ObservedPeer>(helper::Source)> poll;
+    std::function<core::Result<helper::ApSnapshot>(helper::Source, std::uint64_t)> credentials;
+    std::function<core::Result<void>(helper::Source, std::uint64_t, bool allow, bool ready)> authorize;
+};
+HandoffBus handoff_bus(helper::BusClient& client);
+HandoffOperations handoff_operations(HandoffBus bus);
 HandoffOperations handoff_operations(helper::BusClient& client);
 
 // Bounds of one handoff attempt (#161). Tests shorten them; production uses the defaults.
@@ -53,7 +62,9 @@ public:
     HandoffEligibilityCoordinator(const HandoffEligibilityCoordinator&) = delete;
     HandoffEligibilityCoordinator& operator=(const HandoffEligibilityCoordinator&) = delete;
     // Starts an attempt. A retry with the same source while this coordinator's bootstrap is
-    // still in progress keeps it (no retirement, no denial, no re-observation, #161).
+    // still in progress keeps it (no retirement, no denial, no re-observation, #161). A fresh
+    // attempt's caller first retires the previous one with retire(), which settles its denial
+    // with the helper; begin()'s own retirement only queues it (#169 review).
     void begin(helper::Source source);
     void consumer(std::optional<core::ConsumerId> live);
     void tick(bool active = false);
