@@ -4,7 +4,15 @@
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
-"""The wired soak chain: the 1800 s stage, then the 7200 s stage (#137).
+"""The soak chain: the 1800 s stage, then the 7200 s stage (#137).
+
+``--transport wired|wireless`` (default wired) is passed to every stage as the
+launcher's ``--mode``; a wireless chain needs ``--phone-id``, ``--store``,
+``--phone-serial`` as the phone's hardware serial (bound over the AP link by
+its ro.serialno), the cable unplugged and a wireless drive smoke for the same
+phone id, and ``--ap-interface`` (plus ``--ap-channel`` when not 36): the
+helper's root-only ap.conf is never read (tools/perf/aa_transport.py). The stages, gates and
+interference rules are the same for both transports.
 
 Replaces the ad-hoc chain scripts kept beside past runs. It waits until no
 compiler has run for ``--quiet-seconds`` (default 300), then runs each stage
@@ -278,7 +286,7 @@ class CounterSampler:
 
 def stage_command(args: argparse.Namespace, seconds: int) -> list[str]:
     name = f"stage-{seconds}s"
-    command = [str(args.launcher), "--mode", "wired", "--duration", f"{seconds}s",
+    command = [str(args.launcher), "--mode", args.transport, "--duration", f"{seconds}s",
                "--host", args.host, "--port", args.port, "--phone-serial", args.phone_serial,
                "--drive-smoke", args.drive_smoke, "--media-uri", args.media_uri,
                "--interval", str(args.interval),
@@ -288,7 +296,9 @@ def stage_command(args: argparse.Namespace, seconds: int) -> list[str]:
                         ("--geo-uri", args.geo_uri), ("--receiver", args.receiver),
                         ("--display", args.display), ("--store", args.store),
                         ("--build-dir", args.build_dir), ("--thermal-policy", args.thermal_policy),
-                        ("--provenance", args.provenance), ("--display-env", args.display_env)):
+                        ("--provenance", args.provenance), ("--display-env", args.display_env),
+                        ("--phone-id", args.phone_id), ("--ap-interface", args.ap_interface),
+                        ("--ap-channel", args.ap_channel)):
         if value:
             command += [flag, str(value)]
     return command
@@ -439,6 +449,12 @@ def main(argv: list[str]) -> int:
                              "stops and verifies this player before the next stage")
     parser.add_argument("--geo-uri")
     parser.add_argument("--port", default="1-2.1")
+    parser.add_argument("--transport", choices=("wired", "wireless"), default="wired",
+                        help="session transport of every stage (default wired)")
+    parser.add_argument("--phone-id", type=int, help="wireless: the approved wireless phone id")
+    parser.add_argument("--ap-interface", help="wireless: the helper's AP interface (required)")
+    parser.add_argument("--ap-channel", type=int, choices=(36, 40, 44, 48),
+                        help="wireless: the AP channel the helper's ap.conf names")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--receiver")
     parser.add_argument("--display")
@@ -457,6 +473,11 @@ def main(argv: list[str]) -> int:
                         help="refuse a stage if an apt timer elapses within its duration plus this")
     parser.add_argument("--launcher", type=Path, default=LAUNCHER, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.transport == "wireless" and (not args.phone_id or args.phone_id <= 0 or not args.store
+                                         or not args.ap_interface):
+        print("usage error: --transport wireless needs --phone-id, --store and --ap-interface",
+              file=sys.stderr)
+        return 2
     try:
         args.out.mkdir(mode=0o700, parents=True, exist_ok=False)
     except FileExistsError:

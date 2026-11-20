@@ -1,0 +1,1047 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+# Run: python3 -B -m unittest discover -s tests/wireless_qa -v
+# (its own CTest entry, wireless_qa_transport, beside wired_drive_smoke)
+"""Wireless transport for the drive smoke and the soak chain, with fakes only.
+
+No phone, Bluetooth, Wi-Fi, AP or helper is touched: the wireless receiver,
+the display, adb, ``ip neigh`` and the Jetson's USB bus (a fake sysfs tree) are
+fakes. The fake receiver prints the diagnostic line exactly as
+``aa-wireless-receiver`` on main does: the serializer's bare object
+(src/diagnostics/Serialize.cpp to_json via tools/wireless-receiver/Media.hpp),
+not the ``"event":"diag"`` wrapper the wired receiver (and #163) use.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import unittest
+import unittest.mock
+from datetime import datetime, timezone
+from pathlib import Path
+from time import sleep as time_sleep
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+sys.path.insert(0, str(ROOT / "tests" / "wired_qa"))  # the drive smoke's fixtures
+sys.path.insert(0, str(ROOT / "tools" / "perf"))
+sys.path.insert(0, str(ROOT / "tools" / "qualification"))
+import test_drive_smoke as base  # noqa: E402
+import aa_transport as transport  # noqa: E402
+import aa_drive_smoke as smoke  # noqa: E402
+import aa_projection_collect as collect  # noqa: E402
+import aa_perf_report as report  # noqa: E402
+import aa_soak_chain as chain  # noqa: E402
+
+WIFI = ('Wifi is enabled\nWifi is connected to "AP"\nWifiInfo: SSID: "AP", BSSID: 02:00:00:00:00:00, '
+        'MAC: 02:00:00:00:00:00, RSSI: -48, Link speed: 433Mbps, Frequency: 5180MHz, Net ID: 3')
+PHONE = "FAKESERIAL"
+STATION = "10.42.0.23"
+
+
+def bare_state(session: int, mono_ns: int, state: str) -> str:
+    """One session_state_changed line exactly as aa-wireless-receiver on main prints it."""
+    return (f'{{"kind":"session_state_changed","session":{session},"mono_ns":{mono_ns},'
+            f'"to_state":"{state}","transport":"usb"}}')
+
+
+def wrapped_state(session: int, mono_ns: int, state: str) -> str:
+    """The same line wrapped as the wired receiver (and #163's wireless receiver) prints it."""
+    return '{"event":"diag",' + bare_state(session, mono_ns, state)[1:]
+
+
+# The receiver's Android Auto session as procfs shows it (written by the fake
+# receivers): one ESTABLISHED socket per FAKE_SESSION_PEERS address (default the
+# station 10.42.0.23; empty: no session socket), plus its listener and an
+# established socket of another process that must both be ignored.
+FAKE_SESSION = """
+def fake_session():
+    import socket as _socket, struct as _struct
+    root = os.environ.get("FAKE_PROC")
+    if not root:
+        return
+    base = os.path.join(root, str(os.getpid()))
+    os.makedirs(os.path.join(base, "fd"))
+    os.makedirs(os.path.join(base, "net"))
+    hexip = lambda ip: "%08X" % _struct.unpack("=I", _socket.inet_aton(ip))[0]
+    row = "   %d: %s:14A5 %s:%s %s 00000000:00000000 00:00000000 00000000  1000        0 %d 1"
+    rows = ["  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+            row % (0, hexip("10.42.0.1"), "00000000", "0000", "0A", 500),
+            row % (1, hexip("10.42.0.1"), hexip("10.42.0.77"), "C351", "01", 999)]
+    os.symlink("socket:[500]", os.path.join(base, "fd", "3"))
+    os.symlink("/dev/null", os.path.join(base, "fd", "0"))
+    peers = os.environ.get("FAKE_SESSION_PEERS", "10.42.0.23")
+    for index, peer in enumerate(p for p in peers.split(",") if p):
+        rows.append(row % (2 + index, hexip("10.42.0.1"), hexip(peer), "C350", "01", 600 + index))
+        os.symlink("socket:[%d]" % (600 + index), os.path.join(base, "fd", str(10 + index)))
+    with open(os.path.join(base, "net", "tcp"), "w") as handle:
+        handle.write("\\n".join(rows) + "\\n")
+"""
+
+# Startup as on main: ready, admission, then the bare diagnostic; no "active" line.
+FAKE_WIRELESS_RECEIVER = """#!/usr/bin/env python3
+import os, subprocess, sys, time
+""" + FAKE_SESSION + """
+directory = os.environ["FAKE_DIR"]
+with open(os.path.join(directory, "receiver.argv"), "w") as handle:
+    handle.write("\\n".join(sys.argv[1:]))
+grandchild = subprocess.Popen(["sleep", "300"])
+with open(os.path.join(directory, "receiver.pids"), "w") as handle:
+    handle.write(f"{os.getpid()} {grandchild.pid}")
+print('{"event":"ready","state":"waiting_for_consumer"}', flush=True)
+time.sleep(0.5)
+print('{"event":"wireless_admission"}', flush=True)
+if not os.environ.get("FAKE_RECEIVER_DIE_AFTER_ACTIVE"):
+    fake_session()
+print('{"kind":"session_state_changed","session":1,"mono_ns":%d,"to_state":"active","transport":"usb"}'
+      % time.monotonic_ns(), flush=True)
+print('{"event":"video_profile","width":1280,"height":720,"fps":30,"codec":"h264"}', flush=True)
+if os.environ.get("FAKE_USB_PLUG_AFTER_S"):
+    # The operator plugs the phone's cable in during the drive (an AOA device appears).
+    time.sleep(float(os.environ["FAKE_USB_PLUG_AFTER_S"]))
+    device = os.path.join(os.environ["FAKE_USB"], "1-9")
+    os.makedirs(device)
+    for name, value in (("idVendor", "18d1"), ("idProduct", "2d01")):
+        with open(os.path.join(device, name), "w") as handle:
+            handle.write(value + "\\n")
+if os.environ.get("FAKE_RECEIVER_DIE_AFTER_ACTIVE"):
+    sys.exit(7)
+if os.environ.get("FAKE_READMIT"):
+    time.sleep(2.0)
+    print('{"event":"wireless_admission"}', flush=True)
+    print('{"kind":"session_state_changed","session":2,"mono_ns":%d,"to_state":"active","transport":"usb"}'
+          % time.monotonic_ns(), flush=True)
+time.sleep(300)
+"""
+
+# `ip -4 neigh show dev IFACE`: one station on the AP (the MAC is never recorded).
+FAKE_IP = """#!/bin/sh
+printf '%s\\n' "${FAKE_NEIGH:-10.42.0.23 lladdr 02:00:00:00:00:01 REACHABLE}"
+"""
+
+# A display that keeps painting (every 25 ms), so the drive window after the
+# phone's preparation really starts and is judged (the base fake paints once).
+FAKE_WIRELESS_DISPLAY = """#!/usr/bin/env python3
+import os, sys, threading, time
+with open(os.path.join(os.environ["FAKE_DIR"], "display.pids"), "w") as handle:
+    handle.write(str(os.getpid()))
+threading.Thread(target=lambda: [None for _ in sys.stdin], daemon=True).start()
+frame = 0
+while True:
+    frame += 1
+    now = time.monotonic_ns()
+    print('{"event":"video_presented","frame":%d,"scheduled_ns":%d,"completed_ns":%d,"count":%d}'
+          % (frame, now - 30000000, now, frame), flush=True)
+    time.sleep(0.025)
+"""
+
+# The runner with the Jetson's USB bus, the AP lease file and procfs pointed at
+# fakes, and its fixed waits shortened (phone setup pauses, host USB period).
+DRIVER = """import os, signal, subprocess, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import aa_drive_smoke
+aa_drive_smoke.transport.USB_DEVICES = Path(os.environ["FAKE_USB"])
+aa_drive_smoke.transport.NM_LEASES = os.environ["FAKE_LEASES"]
+aa_drive_smoke.transport.PROC = Path(os.environ["FAKE_PROC"])
+aa_drive_smoke.ADB_BIND_TIMEOUT_S = 2.0
+aa_drive_smoke.HOST_USB_PERIOD_S = 0.3
+_real_sleep = aa_drive_smoke.StopFlag.sleep
+aa_drive_smoke.StopFlag.sleep = lambda self, seconds: _real_sleep(self, min(seconds, 0.2))
+""" + base.DRIVER.split("\n", 2)[2]
+
+
+def usb_device(root: Path, name: str, vendor: str, product: str, serial: str | None = None) -> None:
+    device = root / name
+    device.mkdir(parents=True)
+    (device / "idVendor").write_text(vendor + "\n")
+    (device / "idProduct").write_text(product + "\n")
+    if serial:
+        (device / "serial").write_text(serial + "\n")
+
+
+class TransportUnitTests(unittest.TestCase):
+    def test_wifi_status_keeps_only_numbers(self) -> None:
+        parsed = transport.parse_wifi_status(WIFI)
+        self.assertEqual(parsed, {"connected": True, "frequency_mhz": 5180, "channel": 36,
+                                  "rssi_dbm": -48})
+        self.assertNotIn("AP", json.dumps(parsed))
+        self.assertEqual(transport.parse_wifi_status(None)["rssi_dbm"], None)
+        self.assertEqual(transport.parse_wifi_status("RSSI: -127")["rssi_dbm"], None)
+
+    def test_channels(self) -> None:
+        for mhz, channel in ((2412, 1), (2484, 14), (5180, 36), (5240, 48), (5955, 1), (1, None)):
+            self.assertEqual(transport.frequency_to_channel(mhz), channel)
+
+    def test_a_record_without_transport_is_wired(self) -> None:
+        self.assertEqual(transport.record_transport({}), "wired")
+        self.assertEqual(transport.record_transport({"transport": "wireless"}), "wireless")
+
+    def test_diag_kind_accepts_the_bare_and_the_wrapped_line(self) -> None:
+        # P1-2: main's wireless receiver prints the bare form; #163 wraps it.
+        for line in (bare_state(1, 5, "active"), wrapped_state(1, 5, "active")):
+            self.assertEqual(transport.diag_kind(json.loads(line)), "session_state_changed", line)
+        self.assertIsNone(transport.diag_kind({"event": "video_profile", "kind": "x"}))
+        self.assertIsNone(transport.diag_kind({"event": "ready"}))
+
+    def test_host_usb_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            usb_device(root, "1-1", "0bda", "8153", "OTHER")  # an unrelated device
+            clean = transport.host_usb_evidence(PHONE, root)
+            self.assertEqual(clean, {"readable": True, "phone_attached": False, "aoa_attached": False})
+            self.assertIsNone(transport.host_usb_refusal(clean))
+            usb_device(root, "1-2", "04e8", "6860", PHONE)  # the phone, plain mtp
+            self.assertEqual(transport.host_usb_refusal(transport.host_usb_evidence(PHONE, root)),
+                             "usb_attached:phone_on_usb")
+            usb_device(root, "1-3", "18d1", "2d01")  # any AOA device, any port
+            self.assertEqual(transport.host_usb_refusal(transport.host_usb_evidence(PHONE, root)),
+                             "usb_attached:usb_in_aoa")
+        missing = transport.host_usb_evidence(PHONE, Path(directory) / "gone")
+        self.assertEqual(transport.host_usb_refusal(missing), "usb_state_unreadable")
+
+    def test_station_addresses_never_return_macs(self) -> None:
+        leases = "1763500000 02:00:00:00:00:01 10.42.0.23 phone 01:02:00:00:00:00:01\n"
+        neigh = ("10.42.0.23 lladdr 02:00:00:00:00:01 REACHABLE\n"
+                 "10.42.0.99 lladdr 02:00:00:00:00:09 STALE\n10.42.0.50 FAILED\n")
+        addresses = transport.ap_station_addresses("wlan0", leases, neigh)
+        self.assertEqual(addresses, ["10.42.0.23", "10.42.0.99"])
+        self.assertNotIn("02:00", json.dumps(addresses))
+
+    def test_the_ap_interface_is_named_never_read_from_ap_conf(self) -> None:
+        # Neon P1-1: ap.conf is root:root 0600 (src/helper/nm/Files.cpp): never read.
+        self.assertFalse(hasattr(transport, "ap_interface"))
+        self.assertFalse(hasattr(transport, "AP_CONF"))
+        for name in ("wlan0", "wlP1p1s0", "ap0.1"):
+            self.assertTrue(transport.valid_interface(name), name)
+        for name in (None, "", "-x", "../etc", "wlan0/x", "a" * 16, ".hidden"):
+            self.assertFalse(transport.valid_interface(name), name)
+        for tool in (smoke, collect, chain):
+            self.assertNotIn("ap.conf\")", Path(tool.__file__).read_text())
+        self.assertNotIn("/etc/android-auto-receiver/ap.conf", Path(transport.__file__).read_text())
+
+    def test_bind_adb_by_device_serial(self) -> None:
+        calls: list[tuple] = []
+
+        def adb(*args):
+            # As the real adb: get-serialno is the host's transport serial, which
+            # for TCP is the endpoint; only the device knows its hardware serial.
+            calls.append(args)
+            target = args[1] if args[0] == "-s" else args[-1]
+            if args[0] == "connect":
+                return subprocess.CompletedProcess(args, 0, f"connected to {target}\n", "")
+            if args[-1] == "get-serialno":
+                return subprocess.CompletedProcess(args, 0, target + "\n", "")
+            if args[2:] == ("shell", "getprop", "ro.serialno"):
+                return subprocess.CompletedProcess(
+                    args, 0, (PHONE if target.startswith("10.42.0.23") else "OTHERPHONE") + "\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        self.assertEqual(transport.bind_adb(PHONE, ["10.42.0.99", "10.42.0.23"], adb),
+                         ("10.42.0.23:5555", None))
+        self.assertIn(("disconnect", "10.42.0.99:5555"), calls)  # the other phone is dropped
+        self.assertEqual(transport.bind_adb(PHONE, ["10.42.0.99"], adb), (None, "adb_phone_mismatch"))
+        self.assertEqual(transport.bind_adb(PHONE, [], adb), (None, "adb_unreachable"))
+        refused = lambda *a: subprocess.CompletedProcess(a, 1, "failed to connect to x", "")  # noqa: E731
+        self.assertEqual(transport.bind_adb(PHONE, ["10.42.0.23"], refused), (None, "adb_unreachable"))
+
+    def test_session_peers_from_real_procfs(self) -> None:
+        # The parser against this kernel's own /proc (byte order, fd links).
+        import socket as sock
+        with sock.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            client = sock.create_connection(listener.getsockname())
+            server, _ = listener.accept()
+            try:
+                peers = transport.receiver_session_peers(os.getpid())
+            finally:
+                client.close()
+                server.close()
+        self.assertEqual(peers, ["127.0.0.1"])
+        self.assertIsNone(transport.receiver_session_peers(2**22 + 12345))  # no such process
+
+    def test_session_peers_ignore_listeners_and_other_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            namespace: dict = {"os": os}
+            exec(FAKE_SESSION, namespace)
+            with unittest.mock.patch.dict(os.environ, {"FAKE_PROC": directory,
+                                                       "FAKE_SESSION_PEERS": "10.42.0.23"}):
+                namespace["fake_session"]()
+            peers = transport.receiver_session_peers(os.getpid(), Path(directory))
+            tcp6 = Path(directory) / str(os.getpid()) / "net" / "tcp6"
+            # A v4-mapped IPv6 session (a dual-stack listener) is the same peer.
+            mapped = "".join("%08X" % int.from_bytes(bytes(b), sys.byteorder) for b in (
+                [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0xff, 0xff], [10, 42, 0, 31]))
+            tcp6.write_text("  sl  local rem st\n   0: %s:14A5 %s:C350 01 0:0 0:0 0 1000 0 600 1\n"
+                            % ("0" * 32, mapped))
+            with_tcp6 = transport.receiver_session_peers(os.getpid(), Path(directory))
+        self.assertEqual(peers, ["10.42.0.23"])
+        self.assertEqual(with_tcp6, ["10.42.0.23", "10.42.0.31"])
+
+    def test_native_ipv6_or_unreadable_tables_fail_closed(self) -> None:
+        # Neon P2-6: a native IPv6 session is never dropped, an unreadable
+        # IPv4 table is never "no peer", a malformed address is never decoded.
+        import socket as sock
+        with sock.socket(sock.AF_INET6) as listener:
+            try:
+                listener.bind(("::1", 0))
+            except OSError:
+                self.skipTest("no IPv6 loopback on this host")
+            listener.listen(2)
+            with sock.socket() as v4_listener:
+                v4_listener.bind(("127.0.0.1", 0))
+                v4_listener.listen(1)
+                clients = [sock.create_connection(listener.getsockname()[:2]),
+                           sock.create_connection(v4_listener.getsockname())]
+                servers = [listener.accept()[0], v4_listener.accept()[0]]
+                try:
+                    peers = transport.receiver_session_peers(os.getpid())
+                finally:
+                    for handle in clients + servers:
+                        handle.close()
+        self.assertIn("::1", peers)
+        self.assertIn("127.0.0.1", peers)
+        self.assertEqual(transport.session_candidate(["::1"], ["10.42.0.23"]),
+                         (None, "adb_session_ambiguous"))
+        self.assertEqual(transport.session_candidate(["10.42.0.23", "::1"], ["10.42.0.23"]),
+                         (None, "adb_session_ambiguous"))
+        with tempfile.TemporaryDirectory() as directory:
+            namespace: dict = {"os": os}
+            exec(FAKE_SESSION, namespace)
+            with unittest.mock.patch.dict(os.environ, {"FAKE_PROC": directory}):
+                namespace["fake_session"]()
+            net = Path(directory) / str(os.getpid()) / "net"
+            (net / "tcp6").write_text("  sl  local rem st\n")
+            (net / "tcp").rename(net / "tcp.away")
+            self.assertIsNone(transport.receiver_session_peers(os.getpid(), Path(directory)))
+            (net / "tcp").mkdir()  # present but unreadable as a file
+            self.assertIsNone(transport.receiver_session_peers(os.getpid(), Path(directory)))
+        self.assertIsNone(transport._proc_address("01:14A5"))
+        self.assertIsNone(transport._proc_address("0100007F00:14A5"))
+        self.assertEqual(transport._proc_address("0100007F:14A5" if sys.byteorder == "little"
+                                                 else "7F000001:14A5"), "127.0.0.1")
+
+    def test_adb_connect_output_must_say_connected(self) -> None:
+        # Neon P3-10: "disconnected"/"failed to authenticate" are no connection,
+        # and the failed transport is dropped again.
+        for answer in ("failed to authenticate to 10.42.0.23:5555", "disconnected 10.42.0.23:5555",
+                       "not connected", "cannot connect to 10.42.0.23:5555: refused"):
+            calls: list[tuple] = []
+
+            def adb(*args, answer=answer):
+                calls.append(args)
+                return subprocess.CompletedProcess(args, 0, answer + "\n", "")
+            self.assertEqual(transport.bind_adb(PHONE, ["10.42.0.23"], adb), (None, "adb_unreachable"),
+                             answer)
+            self.assertEqual(calls, [("connect", "10.42.0.23:5555"), ("disconnect", "10.42.0.23:5555")],
+                             answer)
+
+    def test_session_candidate(self) -> None:
+        stations = ["10.42.0.23", "10.42.0.99"]
+        self.assertEqual(transport.session_candidate(["10.42.0.99"], stations), ("10.42.0.99", None))
+        self.assertEqual(transport.session_candidate(None, stations), (None, "adb_session_unreadable"))
+        self.assertEqual(transport.session_candidate([], stations), (None, "adb_session_peer_unknown"))
+        self.assertEqual(transport.session_candidate(stations, stations), (None, "adb_session_ambiguous"))
+        self.assertEqual(transport.session_candidate(["192.168.1.5"], stations),
+                         (None, "adb_session_not_on_ap"))
+
+
+class AnalyzerWirelessDropTests(unittest.TestCase):
+    """The drive smoke's no_session_drop sees wireless drops in either line shape."""
+
+    def analyze(self, extra: list[str], stamped: list[dict] | None = None,
+                shape=bare_state) -> dict:
+        run = base.Run(duration=60)
+        run.receiver = [line for line in run.receiver if line != {"event": "active"}]
+        run.receiver.insert(2, json.loads(shape(1, base.ACTIVE, "active")))
+        run.receiver += [json.loads(line) for line in extra]
+        run.run["transport"] = "wireless"
+        run.stamped += stamped or []
+        with tempfile.TemporaryDirectory() as directory:
+            result = smoke.analyze_dir(run.write(Path(directory)))
+        return base.criterion(result, "no_session_drop")
+
+    def test_clean_wireless_session_has_no_drop(self) -> None:
+        for shape in (bare_state, wrapped_state):
+            self.assertTrue(self.analyze([], shape=shape)["passed"], shape)
+
+    def test_bare_disconnect_inside_the_window_is_a_drop(self) -> None:
+        # P1-2: on 4a80062 the bare line (no "event":"diag") was invisible here.
+        for shape in (bare_state, wrapped_state):
+            drop = self.analyze([shape(1, base.ACTIVE + 20 * base.S, "disconnected")], shape=shape)
+            self.assertFalse(drop["passed"], shape)
+            self.assertEqual(drop["disconnects"], 1)
+
+    def test_reconnecting_and_a_new_session_id_are_drops(self) -> None:
+        self.assertFalse(self.analyze([bare_state(1, base.ACTIVE + 9 * base.S, "reconnecting")])["passed"])
+        self.assertFalse(self.analyze([bare_state(2, base.ACTIVE + 9 * base.S, "active")])["passed"])
+
+    def test_a_second_admission_is_a_drop(self) -> None:
+        readmitted = [{"observed_ns": base.ACTIVE + 15 * base.S, "log": "receiver",
+                       "event": {"event": "wireless_admission"}}]
+        self.assertFalse(self.analyze([], stamped=readmitted)["passed"])
+        expired = [{"observed_ns": base.ACTIVE + 15 * base.S, "log": "receiver",
+                    "event": {"event": "wireless_admission_expired"}}]
+        self.assertFalse(self.analyze([], stamped=expired)["passed"])
+
+    def test_wired_keeps_its_own_rule(self) -> None:
+        # Wired is unchanged: only a wrapped disconnect counts there.
+        run = base.Run(duration=60)
+        run.receiver.append(json.loads(wrapped_state(1, base.ACTIVE + 9 * base.S, "reconnecting")))
+        with tempfile.TemporaryDirectory() as directory:
+            drop = base.criterion(smoke.analyze_dir(run.write(Path(directory))), "no_session_drop")
+        self.assertTrue(drop["passed"])
+
+
+class GateTransportTests(unittest.TestCase):
+    """A wired smoke never qualifies a wireless soak, nor the reverse; wireless binds the phone id."""
+
+    def record(self, **fields) -> dict:
+        record = {"schema": smoke.SCHEMA, "verdict": "PASS", "duration_s": 600,
+                  "finished_utc": datetime.now(timezone.utc).isoformat(), "video_profiles": None,
+                  "phone_serial": "SER", "configuration": dict(smoke.DEFAULT_CONFIGURATION),
+                  "binaries": {"receiver": {"sha256": "a" * 64}, "display": {"sha256": "b" * 64}}}
+        record.update(fields)
+        return record
+
+    def check(self, record: dict, name: str, phone_id: int | None = None) -> str | None:
+        return smoke.check_record(record, receiver_sha256="a" * 64, display_sha256="b" * 64,
+                                  phone_serial="SER", now=datetime.now(timezone.utc),
+                                  transport_name=name, phone_id=phone_id)[0]
+
+    CLEAN = {"readable": True, "phone_attached": False, "aoa_attached": False}
+
+    def link(self, **fields) -> dict:
+        link = {"adb_bound": True, "before": None, "after": None,
+                "host_usb": {"before": self.CLEAN, "during": [self.CLEAN], "after": self.CLEAN}}
+        link.update(fields)
+        return link
+
+    def wireless(self, **fields) -> dict:
+        return self.record(**{"transport": "wireless", "phone_id": 1, "link": self.link(), **fields})
+
+    def test_matching_transport_admits(self) -> None:
+        self.assertIsNone(self.check(self.wireless(), "wireless", 1))
+        self.assertIsNone(self.check(self.record(transport="wired"), "wired"))
+        self.assertIsNone(self.check(self.record(), "wired"))  # legacy wired: no link needed
+
+    def test_wireless_pass_needs_bound_cable_out_link_evidence(self) -> None:
+        dirty = dict(self.CLEAN, phone_attached=True)
+        aoa = dict(self.CLEAN, aoa_attached=True)
+        unreadable = {"readable": False, "phone_attached": None, "aoa_attached": None}
+        cases = {
+            "no link": self.record(transport="wireless", phone_id=1),
+            "link not an object": self.wireless(link=[]),
+            "adb unbound": self.wireless(link=self.link(adb_bound=False)),
+            "adb_bound not a bool": self.wireless(link=self.link(adb_bound="yes")),
+            "no host_usb": self.wireless(link=self.link(host_usb=None)),
+            "no samples during": self.wireless(link=self.link(
+                host_usb={"before": self.CLEAN, "during": [], "after": self.CLEAN})),
+            "phone on USB before": self.wireless(link=self.link(
+                host_usb={"before": dirty, "during": [self.CLEAN], "after": self.CLEAN})),
+            "AOA during": self.wireless(link=self.link(
+                host_usb={"before": self.CLEAN, "during": [self.CLEAN, aoa], "after": self.CLEAN})),
+            "unreadable after": self.wireless(link=self.link(
+                host_usb={"before": self.CLEAN, "during": [self.CLEAN], "after": unreadable})),
+            "after missing": self.wireless(link=self.link(
+                host_usb={"before": self.CLEAN, "during": [self.CLEAN]})),
+        }
+        for name, record in cases.items():
+            self.assertEqual(self.check(record, "wireless", 1), "drive_smoke_link_unproven", name)
+
+    def test_cross_transport_is_refused(self) -> None:
+        self.assertEqual(self.check(self.record(transport="wired"), "wireless", 1),
+                         "drive_smoke_transport_mismatch")
+        self.assertEqual(self.check(self.record(transport="wireless", phone_id=1), "wired"),
+                         "drive_smoke_transport_mismatch")
+        # A legacy record (no field) is wired, so it never qualifies wireless.
+        self.assertEqual(self.check(self.record(), "wireless", 1), "drive_smoke_transport_mismatch")
+        self.assertIsNone(self.check(self.record(), "wired"))
+
+    def test_wireless_binds_the_approved_phone_id(self) -> None:
+        # P2-2: a smoke on phone id 1 never qualifies a soak on phone id 2.
+        self.assertEqual(self.check(self.wireless(), "wireless", 2), "drive_smoke_phone_mismatch")
+        self.assertEqual(self.check(self.wireless(), "wireless", None), "drive_smoke_phone_mismatch")
+        self.assertEqual(self.check(self.record(transport="wireless"), "wireless", 1),
+                         "drive_smoke_malformed")
+
+    def test_wireless_harness_flags_are_not_configuration(self) -> None:
+        config = smoke.configuration(
+            ["rx", "--store-dir", "/s", "--phone-id", "3", "--diagnostics", "--video-socket", "/v",
+             "--input-socket", "/i", "--duration-ms", "1"], ["d", "--test-only-autostart"])
+        self.assertEqual(config, smoke.DEFAULT_CONFIGURATION)
+
+
+class WirelessRunnerTests(unittest.TestCase):
+    """The real runner, --transport wireless, against fakes (cable out, adb over the AP)."""
+
+    def run_smoke(self, root: Path, *, attached: tuple = (), store: str | None = None,
+                  **env_extra: str) -> tuple[int, str]:
+        build, bin_dir, usb = root / "build", root / "bin", root / "usb"
+        build.mkdir()
+        bin_dir.mkdir()
+        usb.mkdir()
+        for index, (vendor, product, serial) in enumerate(attached):
+            usb_device(usb, f"1-{index + 1}", vendor, product, serial)
+        (build / "CMakeCache.txt").write_text("CMAKE_BUILD_TYPE:STRING=Release\n")
+        for path, body in ((build / "aa-wireless-receiver", FAKE_WIRELESS_RECEIVER),
+                           (build / "aa-dummy-display", FAKE_WIRELESS_DISPLAY),
+                           (bin_dir / "adb", base.FAKE_ADB), (bin_dir / "ip", FAKE_IP)):
+            path.write_text(body)
+            path.chmod(0o755)
+        state = root / "state"
+        state.mkdir()
+        (state / "approved-phones.json").write_text("{}")
+        env = dict(os.environ, FAKE_DIR=str(root), DRIVE_HOOK="", PATH=f"{bin_dir}:/usr/bin:/bin",
+                   FAKE_ADB_LOG=str(root / "adb.log"), FAKE_ADB_WIFI_STATUS=WIFI,
+                   FAKE_USB=str(usb), FAKE_LEASES=str(root / "absent-{interface}.leases"),
+                   FAKE_PROC=str(root / "proc"))
+        env.update(env_extra)
+        runner = subprocess.Popen(
+            [sys.executable, "-B", "-c", DRIVER, str(base.SMOKE.parent), "run",
+             "--transport", "wireless", "--phone-id", "7", "--ap-interface", "wlan0",
+             "--ap-channel", "44",
+             "--serial", PHONE, "--build-dir", str(build),
+             "--store", store or str(state / "approved-phones.json"),
+             "--display-env", ":99", "--media-uri", "file:///sdcard/Music/fake.opus",
+             "--media-component", "org.example.player/.Play", "--duration", "2",
+             "--out", str(root / "out")], env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, cwd=root)
+        try:
+            output, _ = runner.communicate(timeout=90)
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+            if (root / "receiver.pids").exists():
+                for pid in (int(x) for x in (root / "receiver.pids").read_text().split()):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        return runner.returncode, output
+
+    def test_wireless_session_launch_bind_record_and_teardown(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-wireless-") as directory:
+            root = Path(directory)
+            code, output = self.run_smoke(root)
+            argv = (root / "receiver.argv").read_text().splitlines()
+            adb = (root / "adb.log").read_text().splitlines()
+            result = json.loads((root / "out" / "result.json").read_text())
+            run = json.loads((root / "out" / "run.json").read_text())
+        # The wireless receiver for the approved phone, with its diagnostics; no USB port.
+        self.assertEqual(argv[:5], ["--store-dir", str(root / "state"), "--phone-id", "7",
+                                    "--diagnostics"], output)
+        self.assertNotIn("--port", argv)
+        # Neon P2-5: the AP channel ap.conf names reaches the receiver; it is a
+        # link parameter, not the decode configuration the gate compares.
+        self.assertEqual(argv[argv.index("--ap-channel") + 1], "44")
+        self.assertEqual(result["configuration"], smoke.DEFAULT_CONFIGURATION)
+        # The bare active diagnostic (main's shape) started the drive.
+        self.assertEqual(run["active_marker"], "diag_active", output)
+        self.assertGreater(run["drive_from_ns"], run["active_ns"])
+        # adb to the receiver's session peer, bound by the device's ro.serialno first.
+        target = f"{STATION}:5555"
+        self.assertEqual(adb[:2], [f"connect {target}", f"-s {target} shell getprop ro.serialno"], adb)
+        self.assertFalse([line for line in adb if "setFunctions" in line], adb)
+        self.assertEqual(adb[-1], f"disconnect {target}", adb)
+        # The player is stopped and verified before the session is torn down.
+        self.assertIn(f"-s {target} shell am force-stop org.example.player", adb)
+        self.assertEqual((result["transport"], result["phone_id"], result["phone_serial"]),
+                         ("wireless", 7, PHONE))
+        link = result["link"]
+        self.assertTrue(link["adb_bound"])
+        clean = {"readable": True, "phone_attached": False, "aoa_attached": False}
+        self.assertEqual(link["host_usb"]["before"], clean)
+        self.assertEqual(link["host_usb"]["after"], clean)
+        self.assertTrue(link["host_usb"]["during"])
+        for moment in ("before", "after"):
+            self.assertEqual(link[moment]["wifi"], {"connected": True, "frequency_mhz": 5180,
+                                                    "channel": 36, "rssi_dbm": -48})
+        self.assertNotIn("02:00:00", json.dumps(result))  # no MAC anywhere in the record
+        self.assertEqual(result["cleanup_failures"], [], output)
+        # The same criteria judge it over a real drive window that starts with a
+        # paint after the phone's preparation (Neon P2-3; the single-frame fake
+        # never got there). The A/V contract fails: this fake plays no audio. A
+        # 2 s drive has no full 10 s fps window, so that criterion cannot pass
+        # here, but it was judged on post-preparation paints.
+        failed = sorted(c["name"] for c in result["criteria"] if not c["passed"])
+        self.assertEqual(failed, ["av_signed_contract", "painted_fps_per_window"], output)
+        fps = base.criterion(result, "painted_fps_per_window")
+        self.assertIn("expected_windows", fps, output)
+        self.assertNotIn("reason", fps, output)
+        self.assertTrue(base.criterion(result, "no_session_drop")["passed"], output)
+        self.assertEqual((code, result["verdict"]), (1, "FAIL"), output)
+
+    def test_a_cabled_phone_blocks_before_launch(self) -> None:
+        for attached, reason in ((("04e8", "6860", PHONE),), "usb_attached:phone_on_usb"), \
+                                ((("18d1", "2d00", None),), "usb_attached:usb_in_aoa"):
+            with self.subTest(reason=reason), \
+                    tempfile.TemporaryDirectory(prefix="drive-smoke-wireless-usb-") as directory:
+                root = Path(directory)
+                code, output = self.run_smoke(root, attached=attached)
+                result = json.loads((root / "out" / "result.json").read_text())
+                launched = (root / "receiver.argv").exists()
+                self.assertEqual((code, result["verdict"], result["blocked_on"]),
+                                 (3, "BLOCKED", reason), output)
+                self.assertFalse(launched)
+
+    def test_unreachable_adb_blocks_and_sends_nothing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-wireless-adb-") as directory:
+            root = Path(directory)
+            code, output = self.run_smoke(root, FAKE_ADB_CONNECT="fail")
+            result = json.loads((root / "out" / "result.json").read_text())
+            adb = (root / "adb.log").read_text().splitlines()
+        self.assertEqual((code, result["verdict"], result["blocked_on"]),
+                         (3, "BLOCKED", "adb_unreachable"), output)
+        self.assertFalse([line for line in adb if " shell " in line], adb)
+
+    def test_another_phone_on_the_ap_blocks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-wireless-other-") as directory:
+            root = Path(directory)
+            code, output = self.run_smoke(root, FAKE_ADB_SERIALNO="SOMEONEELSE")
+            result = json.loads((root / "out" / "result.json").read_text())
+        self.assertEqual((code, result["blocked_on"]), (3, "adb_phone_mismatch"), output)
+
+    def test_cable_plugged_in_during_the_drive_never_passes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-wireless-plug-") as directory:
+            root = Path(directory)
+            code, output = self.run_smoke(root, FAKE_USB_PLUG_AFTER_S="1.0")
+            result = json.loads((root / "out" / "result.json").read_text())
+        during = result["link"]["host_usb"]["during"]
+        self.assertTrue(any(sample["aoa_attached"] for sample in during), during)
+        self.assertTrue(result["link"]["host_usb"]["after"]["aoa_attached"])
+        self.assertTrue([f for f in result["cleanup_failures"] if f.startswith("usb_attached")],
+                        result["cleanup_failures"])
+        self.assertNotEqual(result["verdict"], "PASS", output)
+        self.assertEqual(transport.link_gap(result["link"]), "wireless_usb_in_aoa_during")
+
+    def test_a_receiver_that_dies_before_the_bind_fails_not_blocks(self) -> None:
+        # Neon P3-8: a receiver crash is a product FAIL, not an adb harness block.
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-wireless-dead-") as directory:
+            root = Path(directory)
+            code, output = self.run_smoke(root, FAKE_RECEIVER_DIE_AFTER_ACTIVE="1")
+            result = json.loads((root / "out" / "result.json").read_text())
+        self.assertEqual((code, result["verdict"]), (1, "FAIL"), output)
+        self.assertEqual(result["failure"], "receiver exited before adb was bound")
+        self.assertNotIn("blocked_on", result)
+
+    def test_wireless_needs_an_ap_interface(self) -> None:
+        # Neon P1-1: the interface is named by the operator; ap.conf is never read.
+        for extra in ([], ["--ap-interface", "../x"], ["--ap-interface", "-x"]):
+            with self.assertRaises(SystemExit) as raised:
+                smoke.main(["run", "--transport", "wireless", "--phone-id", "7", "--serial", "S",
+                            "--build-dir", "/b", "--store", "/s/approved-phones.json",
+                            "--media-uri", "u", "--media-component", "p/.a", "--out", "/tmp/x",
+                            *extra])
+            self.assertEqual(raised.exception.code, 2, extra)
+
+    def test_adb_binds_the_receivers_session_peer_not_any_station(self) -> None:
+        # P1: two stations on the AP; the receiver's session is with 10.42.0.99.
+        neigh = "10.42.0.23 lladdr 02:00:00:00:00:01 REACHABLE\n10.42.0.99 lladdr 02:00:00:00:00:09 REACHABLE"
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-wireless-peer-") as directory:
+            root = Path(directory)
+            self.run_smoke(root, FAKE_NEIGH=neigh, FAKE_SESSION_PEERS="10.42.0.99")
+            adb = (root / "adb.log").read_text().splitlines()
+        self.assertEqual(adb[:2], ["connect 10.42.0.99:5555",
+                                   "-s 10.42.0.99:5555 shell getprop ro.serialno"], adb)
+        self.assertFalse([line for line in adb if "10.42.0.23" in line], adb)
+
+    def test_no_or_foreign_session_peer_blocks_before_adb(self) -> None:
+        for peers, reason in (("", "adb_session_peer_unknown"),
+                              ("10.42.0.23,10.42.0.99", "adb_session_ambiguous"),
+                              ("192.168.7.7", "adb_session_not_on_ap")):
+            with tempfile.TemporaryDirectory(prefix="drive-smoke-wireless-nopeer-") as directory:
+                root = Path(directory)
+                code, output = self.run_smoke(root, FAKE_SESSION_PEERS=peers)
+                result = json.loads((root / "out" / "result.json").read_text())
+                log = root / "adb.log"
+                adb = log.read_text().splitlines() if log.exists() else []
+            self.assertEqual((code, result["verdict"], result["blocked_on"]), (3, "BLOCKED", reason),
+                             output)
+            self.assertFalse([line for line in adb if "connect" in line or " shell " in line], adb)
+
+    def test_a_relative_store_is_made_absolute(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-wireless-rel-") as directory:
+            root = Path(directory)
+            self.run_smoke(root, store="state/approved-phones.json")
+            argv = (root / "receiver.argv").read_text().splitlines()
+        self.assertEqual(argv[1], str(root / "state"))
+
+    def test_wireless_needs_a_phone_id(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            smoke.main(["run", "--transport", "wireless", "--serial", "S", "--build-dir", "/b",
+                        "--media-uri", "u", "--media-component", "p/.a", "--out", "/tmp/x"])
+        self.assertEqual(raised.exception.code, 2)
+
+
+class CollectorTransportTests(unittest.TestCase):
+    def parser(self) -> collect.EventParser:
+        parser = collect.EventParser()
+        parser.wireless = True
+        parser.receiver_started_ns = 1_000_000_000
+        return parser
+
+    def test_wireless_active_diagnostic_in_either_shape(self) -> None:
+        for shape in (bare_state, wrapped_state):
+            parser = self.parser()
+            parser._consume('{"event":"ready","state":"waiting_for_consumer"}')
+            parser._consume('{"event":"wireless_admission"}')
+            self.assertFalse(parser.projection_active)
+            parser._consume(shape(1, 3_500_000_000, "active"))
+            self.assertTrue(parser.projection_active, shape)
+            self.assertEqual(parser.startup_ms, 2500)
+            parser._consume(shape(1, 4_000_000_000, "disconnected"))
+            self.assertFalse(parser.projection_active)
+
+    def test_wireless_readmission_ends_the_active_state(self) -> None:
+        for second in ('{"event":"wireless_admission"}', '{"event":"wireless_admission_expired"}',
+                       bare_state(2, 5_000_000_000, "active"),
+                       bare_state(1, 5_000_000_000, "reconnecting")):
+            parser = self.parser()
+            parser._consume('{"event":"wireless_admission"}')
+            parser._consume(bare_state(1, 3_500_000_000, "active"))
+            parser._consume(second)
+            self.assertFalse(parser.projection_active, second)
+            # A re-admitted session never makes it active again: continuity failed.
+            parser._consume(bare_state(2, 6_000_000_000, "active"))
+            self.assertFalse(parser.projection_active, second)
+
+    def test_admission_retries_before_active_are_startup(self) -> None:
+        # Neon P2-7: the receiver retries an admission after 15 s; that is
+        # still startup, not a drop (the drive smoke counts only after active).
+        for retry in ('{"event":"wireless_admission"}', '{"event":"wireless_admission_expired"}'):
+            parser = self.parser()
+            parser._consume('{"event":"wireless_admission"}')
+            parser._consume(retry)
+            parser._consume('{"event":"wireless_admission"}')
+            parser._consume(bare_state(1, 3_500_000_000, "active"))
+            self.assertTrue(parser.projection_active, retry)
+
+    def test_wired_parsing_is_unchanged(self) -> None:
+        # Review P3: the diag rules are wireless-only; wired keeps main's behaviour.
+        parser = collect.EventParser()
+        parser._consume('{"event":"active","startup_ms":812}')
+        parser._consume(wrapped_state(1, 9_000_000_000, "failed"))
+        self.assertEqual((parser.projection_active, parser.startup_ms), (True, 812))
+        parser = collect.EventParser()
+        parser.receiver_started_ns = 0
+        parser._consume(wrapped_state(1, 9_000_000_000, "active"))
+        self.assertEqual((parser.projection_active, parser.startup_ms), (False, None))
+
+    def test_wireless_cli_needs_phone_id_and_store(self) -> None:
+        self.assertEqual(collect._cli(["--receiver", "r", "--port", "x", "--duration-seconds", "1",
+                                       "--transport", "wireless"]), 2)
+
+
+COLLECTOR_RECEIVER = """#!/usr/bin/env python3
+import os, signal, sys, time
+""" + FAKE_SESSION + """
+argv = sys.argv[1:]
+with open(os.environ["FAKE_RX_ARGV"], "w") as handle:
+    handle.write("\\n".join(argv))
+def stopped(*_):
+    # Records whether the phone was already restored when the session ended.
+    with open(os.environ["FAKE_RX_ARGV"] + ".term", "w") as handle:
+        log = open(os.environ["FAKE_ADB_LOG"]).read()
+        handle.write("restored-before-teardown" if "force-stop" in log else "not-restored")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stopped)
+print('{"event":"ready","state":"waiting_for_consumer"}', flush=True)
+time.sleep(0.3)
+print('{"event":"wireless_admission"}', flush=True)
+if not os.environ.get("FAKE_RECEIVER_DIE_AFTER_ACTIVE"):
+    fake_session()
+print('{"kind":"session_state_changed","session":1,"mono_ns":%d,"to_state":"active","transport":"usb"}'
+      % time.monotonic_ns(), flush=True)
+if os.environ.get("FAKE_RECEIVER_DIE_AFTER_ACTIVE"):
+    time.sleep(float(os.environ["FAKE_RECEIVER_DIE_AFTER_ACTIVE"]))
+    sys.exit(7)
+units = 0
+while True:
+    units += 6
+    print('{"event":"video_sent","units":%d}' % units, flush=True)
+    print('{"event":"audio_chunks","count":%d}' % units, flush=True)
+    time.sleep(0.2)
+"""
+
+
+class CollectorWirelessRunTests(unittest.TestCase):
+    """The real collector, --transport wireless, with fakes (cable out, adb over the AP)."""
+
+    def collect(self, root: Path, attached: tuple = (), **env_extra: str):
+        from unittest.mock import patch
+        import aa_moving_map as mm
+        bin_dir, usb = root / "bin", root / "usb"
+        bin_dir.mkdir()
+        usb.mkdir()
+        for index, (vendor, product, serial) in enumerate(attached):
+            usb_device(usb, f"1-{index + 1}", vendor, product, serial)
+        display = '#!/usr/bin/env python3\nimport sys\nfor _ in sys.stdin: pass\n'
+        for name, body in (("adb", base.FAKE_ADB), ("ip", FAKE_IP), ("rx", COLLECTOR_RECEIVER),
+                           ("display", display)):
+            (bin_dir / name).write_text(body)
+            (bin_dir / name).chmod(0o755)
+        (root / "state").mkdir()
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "FAKE_ADB_LOG": str(root / "adb.log"),
+               "FAKE_RX_ARGV": str(root / "rx.argv"), "FAKE_ADB_WIFI_STATUS": WIFI,
+               "FAKE_PROC": str(root / "proc"), **env_extra}
+        args = argparse.Namespace(
+            receiver=str(bin_dir / "rx"), display=str(bin_dir / "display"), no_display=False,
+            port="1-2.1", duration_seconds=3, interval=1, startup_timeout_seconds=10,
+            store="state/approved-phones.json", video_socket=None, input_socket=None,
+            state_dir=str(root / "logs"), phone_serial=PHONE, workload="moving-map",
+            media_uri="file:///sdcard/Music/fixture.opus", media_type=None,
+            media_component="org.example.player/.Play", geo_uri=None,
+            thermal_policy="strict-all-zones", transport="wireless", phone_id=7,
+            ap_interface="wlan0", ap_channel=44)
+        real_sleep = time_sleep
+        with patch.dict(os.environ, env), \
+                patch.object(collect, "_display_connected", return_value=True), \
+                patch.object(collect, "build_processes", return_value=[]), \
+                patch.object(collect, "_ADB_BIND_TIMEOUT_SECONDS", 2.0), \
+                patch.object(collect, "_HOST_USB_PERIOD_SECONDS", 0.5), \
+                patch.object(transport, "USB_DEVICES", usb), \
+                patch.object(transport, "NM_LEASES", str(root / "absent-{interface}.leases")), \
+                patch.object(transport, "PROC", root / "proc"), \
+                patch.object(mm, "MEDIA_RELAUNCH_SILENCE_S", 1.0), \
+                patch.object(collect.time, "sleep", side_effect=lambda s: real_sleep(min(s, 0.5))):
+            old = os.getcwd()
+            os.chdir(root)
+            try:
+                return collect.collect(args)
+            finally:
+                os.chdir(old)
+
+    def test_wireless_stage_binds_prepares_after_active_and_restores_before_teardown(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="collect-wireless-") as directory:
+            root = Path(directory)
+            capture = self.collect(root)
+            adb = (root / "adb.log").read_text().splitlines()
+            argv = (root / "rx.argv").read_text().splitlines()
+            term = (root / "rx.argv.term").read_text()
+        self.assertEqual(argv[:5], ["--store-dir", str(root / "state"), "--phone-id", "7",
+                                    "--diagnostics"])
+        self.assertNotIn("--require-usb-serial", argv)
+        self.assertEqual(argv[argv.index("--ap-channel") + 1], "44")
+        # Neon P2-4: the receiver outlives the bind and the phone setup too.
+        # duration 3 + startup 10 + 10, plus the (patched, 2 s) bind and the headroom.
+        self.assertEqual(int(argv[argv.index("--duration-ms") + 1]),
+                         (3 + 10 + 10 + 2 + collect._WIRELESS_PREPARE_HEADROOM_SECONDS) * 1000)
+        target = f"{STATION}:5555"
+        self.assertEqual(adb[:2], [f"connect {target}", f"-s {target} shell getprop ro.serialno"], adb)
+        self.assertFalse([line for line in adb if "setFunctions" in line], adb)
+        self.assertEqual(term, "restored-before-teardown")
+        self.assertEqual(adb[-1], f"disconnect {target}", adb)
+        self.assertEqual((capture["mode"], capture["startup_basis"]),
+                         ("wireless", "harness_launch_to_active"))
+        self.assertIsInstance(capture["events"]["startup_ms"], int)
+        link = capture["link"]
+        self.assertTrue(link["adb_bound"])
+        self.assertTrue(link["host_usb"]["during"])
+        self.assertIsNone(report.wireless_link_gap(capture))
+        self.assertEqual(capture["workload"]["cleanup_failures"], [])
+        self.assertTrue(capture["workload"]["stimulus_started"])
+
+    def test_wireless_stage_refused_when_the_cable_is_in(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="collect-wireless-usb-") as directory:
+            root = Path(directory)
+            with self.assertRaises(collect.PhoneSetupError) as raised:
+                self.collect(root, attached=(("18d1", "2d01", None),))
+            launched = (root / "rx.argv").exists()
+        self.assertTrue(str(raised.exception).startswith("usb_attached:usb_in_aoa"))
+        self.assertFalse(launched)
+
+    def test_wireless_stage_refused_when_adb_cannot_bind(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="collect-wireless-adb-") as directory:
+            root = Path(directory)
+            with self.assertRaises(collect.PhoneSetupError) as raised:
+                self.collect(root, FAKE_ADB_SERIALNO="SOMEONEELSE")
+            adb = (root / "adb.log").read_text().splitlines()
+        self.assertTrue(str(raised.exception).startswith("adb_phone_mismatch"), raised.exception)
+        # Only the identity query reached the other phone: nothing was driven.
+        self.assertFalse([line for line in adb if " shell " in line
+                          and not line.endswith("shell getprop ro.serialno")], adb)
+
+
+    def test_a_receiver_that_dies_during_the_bind_is_an_early_exit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="collect-wireless-dead-") as directory:
+            capture = self.collect(Path(directory), FAKE_RECEIVER_DIE_AFTER_ACTIVE="1.5")
+        self.assertTrue(capture["early_exit"])
+        self.assertFalse(capture["link"]["adb_bound"])
+
+    def test_wireless_stage_binds_only_the_receivers_session_peer(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="collect-wireless-peer-") as directory:
+            root = Path(directory)
+            with self.assertRaises(collect.PhoneSetupError) as raised:
+                self.collect(root, FAKE_SESSION_PEERS="")
+            log = root / "adb.log"
+            adb = log.read_text().splitlines() if log.exists() else []
+        self.assertTrue(str(raised.exception).startswith("adb_session_peer_unknown"), raised.exception)
+        self.assertFalse([line for line in adb if "connect" in line or " shell " in line], adb)
+
+# The capture aa-projection-perf.sh's blocked_result() writes, for wireless.
+BLOCKED_CAPTURE = {
+    "schema": "aa-projection-perf-capture/3",
+    "av_series": {"pair_t_ns": [], "pair_skew_ns": [], "audio_intervals_ns": []},
+    "workload": {"kind": "none"}, "monotonic_origin_ns": 0, "cpu_ticks_per_second": 1,
+    "video_evidence": {"blocks": [], "ipc_latency_ns": [], "decode_latency_ns": []},
+    "mode": "wireless", "duration_seconds": 0, "crashes": 0, "samples": [],
+    "events": {"helper_rss_mb": None},
+    "build": {"build_type": None, "build_dir": None, "allow_unoptimized_build": False,
+              "verified_on": "none"},
+}
+
+
+class ReporterTransportTests(unittest.TestCase):
+    host = {"readable": True, "phone_attached": False, "aoa_attached": False}
+
+    def test_blocked_and_malformed_wireless_captures_still_write_valid_v3(self) -> None:
+        # Neon P1-2: a missing or malformed link must never crash the reporter.
+        import aa_perf_schema as schema
+        links = {"no link": None, "link null": {"link": None},
+                 "during null": {"link": {"adb_bound": True, "host_usb": {"during": None}}},
+                 "garbage": {"link": {"adb_bound": "yes", "before": [1], "after": {"wifi": 3},
+                                      "host_usb": {"before": {"readable": "x"}, "during": [7, None],
+                                                   "after": "y"}}}}
+        for name, extra in links.items():
+            with tempfile.TemporaryDirectory() as directory:
+                capture, out = Path(directory) / "capture.json", Path(directory) / "result.json"
+                capture.write_text(json.dumps({**BLOCKED_CAPTURE, **(extra or {})}))
+                code = report._cli(["--live", "--capture", str(capture), "--out", str(out),
+                                    "--duration-requested", "1800s", "--now", "2026-11-20T00:00:00Z",
+                                    "--blocked-on", "phone_setup_failed"])
+                self.assertTrue(out.exists(), name)
+                doc = json.loads(out.read_text())
+            self.assertEqual(schema.validate(doc, schema.load_schema(schema.schema_for(doc["schema"]))),
+                             [], name)
+            self.assertEqual((code, doc["verdict"], doc["mode"]), (3, "BLOCKED", "wireless"), name)
+            self.assertFalse(doc["link"]["adb_bound"] if name != "during null" else False, name)
+
+    def capture(self, **link) -> dict:
+        value = {"phone_id": 7, "adb_bound": True, "before": None, "after": None,
+                 "host_usb": {"before": self.host, "during": [self.host], "after": self.host}}
+        value.update(link)
+        return {"mode": "wireless", "link": value}
+
+    def test_wireless_link_gap(self) -> None:
+        gap = report.wireless_link_gap
+        self.assertIsNone(gap({"mode": "wired"}))
+        self.assertEqual(gap({"mode": "wireless"}), "wireless_link_unrecorded")
+        self.assertIsNone(gap(self.capture()))
+        self.assertEqual(gap(self.capture(adb_bound=False)), "wireless_adb_unbound")
+        attached = dict(self.host, phone_attached=True)
+        self.assertEqual(gap(self.capture(host_usb={"before": self.host, "during": [attached],
+                                                    "after": self.host})),
+                         "wireless_phone_on_usb_during")
+        aoa = dict(self.host, aoa_attached=True)
+        self.assertEqual(gap(self.capture(host_usb={"before": self.host, "during": [self.host],
+                                                    "after": aoa})), "wireless_usb_in_aoa_after")
+        self.assertEqual(gap(self.capture(host_usb={"before": self.host, "during": [],
+                                                    "after": self.host})),
+                         "wireless_host_usb_unrecorded")
+
+    def test_result_link_drops_the_phone_id(self) -> None:
+        link = report._result_link(self.capture()["link"])
+        self.assertNotIn("phone_id", json.dumps(link))
+        self.assertTrue(link["adb_bound"])
+
+
+class LauncherTransportTests(unittest.TestCase):
+    def launch(self, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(base.LAUNCHER), "--duration", "30s", "--out", "/dev/null",
+                               *extra], capture_output=True, text=True, timeout=30)
+
+    def test_unknown_mode_is_a_usage_error(self) -> None:
+        result = self.launch("--mode", "bluetooth")
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_a_blocked_wireless_stage_writes_a_valid_v3_result(self) -> None:
+        # Neon P1-2 end to end: blocked_result() for --mode wireless.
+        import aa_perf_schema as schema
+        with tempfile.TemporaryDirectory(prefix="launcher-wireless-blocked-") as directory:
+            root = Path(directory)
+            process, _ = base.LauncherGateTests.launch(
+                self, root, "--mode", "wireless", "--phone-id", "7", "--ap-interface", "wlan0",
+                "--store", "/s/approved-phones.json")
+            self.assertEqual(process.returncode, 3, process.stderr)
+            doc = json.loads((root / "out.json").read_text())
+        self.assertEqual((doc["verdict"], doc["mode"]), ("BLOCKED", "wireless"))
+        self.assertEqual(schema.validate(doc, schema.load_schema(schema.schema_for(doc["schema"]))), [])
+
+    def test_wireless_needs_an_ap_interface_and_a_valid_channel(self) -> None:
+        base_args = ("--mode", "wireless", "--phone-id", "3", "--store", "/s/approved-phones.json")
+        result = self.launch(*base_args)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--ap-interface", result.stderr)
+        result = self.launch(*base_args, "--ap-interface", "wlan0", "--ap-channel", "52")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--ap-channel", result.stderr)
+
+    def test_wireless_readiness_needs_no_stage_arguments(self) -> None:
+        # Neon P3-9: readiness only probes the target.
+        with tempfile.TemporaryDirectory() as directory:
+            ssh = Path(directory) / "ssh"
+            ssh.write_text("#!/bin/sh\nexit 255\n")
+            ssh.chmod(0o755)
+            result = subprocess.run(["bash", str(base.LAUNCHER), "--mode", "wireless",
+                                     "--readiness-only", "--host", "fake.local"],
+                                    capture_output=True, text=True, timeout=60,
+                                    env={"PATH": f"{directory}:/usr/bin:/bin"})
+        self.assertNotEqual(result.returncode, 2, result.stderr)
+        self.assertNotIn("usage error", result.stderr)
+
+    def test_wireless_needs_phone_id_and_store(self) -> None:
+        result = self.launch("--mode", "wireless")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--phone-id", result.stderr)
+        result = self.launch("--mode", "wireless", "--phone-id", "3", "--store", "/s/other.json")
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+
+class SoakChainTransportTests(unittest.TestCase):
+    def args(self, **fields) -> argparse.Namespace:
+        values = dict(launcher="L", host="h", port="1-2.1", phone_serial="S", drive_smoke="d",
+                      media_uri="u", interval=5, out=Path("/o"), media_type=None,
+                      media_component="p/.a", geo_uri=None, receiver=None, display=None,
+                      store=None, build_dir=None, thermal_policy=None, provenance=None,
+                      display_env=None, phone_id=None, transport="wired", ap_interface=None,
+                      ap_channel=None)
+        values.update(fields)
+        return argparse.Namespace(**values)
+
+    def test_default_stage_is_wired(self) -> None:
+        command = chain.stage_command(self.args(), 1800)
+        self.assertEqual(command[1:3], ["--mode", "wired"])
+        self.assertNotIn("--phone-id", command)
+
+    def test_wireless_stage(self) -> None:
+        command = chain.stage_command(self.args(transport="wireless", phone_id=7,
+                                                store="/s/approved-phones.json"), 1800)
+        self.assertEqual(command[1:3], ["--mode", "wireless"])
+        self.assertEqual(command[command.index("--phone-id") + 1], "7")
+        command = chain.stage_command(self.args(transport="wireless", phone_id=7, ap_interface="wlan0",
+                                                ap_channel=44, store="/s/approved-phones.json"), 1800)
+        self.assertEqual(command[command.index("--ap-interface") + 1], "wlan0")
+        self.assertEqual(command[command.index("--ap-channel") + 1], "44")
+
+    def test_wireless_chain_needs_phone_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(chain.main(["--out", str(Path(directory) / "c"), "--phone-serial", "S",
+                                         "--drive-smoke", "d", "--media-uri", "u",
+                                         "--media-component", "p/.a", "--transport", "wireless"]), 2)
+            self.assertEqual(chain.main(["--out", str(Path(directory) / "d"), "--phone-serial", "S",
+                                         "--drive-smoke", "d", "--media-uri", "u",
+                                         "--media-component", "p/.a", "--transport", "wireless",
+                                         "--phone-id", "7", "--store", "/s/approved-phones.json"]), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
