@@ -60,6 +60,9 @@ executables therefore start with `aa::tools::StdoutIsolation`
 
 - The real stdout moves to a private descriptor, and fd 1 points at
   `/dev/null` for the rest of the process. Children inherit `/dev/null`.
+- This fails closed. If it can't be set up (fd 1 closed at start, EMFILE, no
+  `/dev/null`), the tool writes one `stdout_isolation_failed` line with the
+  errno to stderr and exits with status 4, before loading any library.
 - JSON is written only with raw `write(2)` on that descriptor, through
   `StdoutLog` (receiver), the telemetry writer (display) or `write_all`. No
   `FILE*` is on the JSON path, so no stdio lock can stall it.

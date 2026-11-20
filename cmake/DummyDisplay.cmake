@@ -232,6 +232,11 @@ if(NOT CMAKE_CROSSCOMPILING)
         --display "$<TARGET_FILE:aa-dummy-display>")
     set_tests_properties(dummy_display_exit_file_lock PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)
+    add_test(NAME dummy_display_isolation_failure COMMAND "${AA_DBUS_RUN_SESSION}" --
+        "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tests/stdio/isolation_failure_test.py"
+        --display "$<TARGET_FILE:aa-dummy-display>")
+    set_tests_properties(dummy_display_isolation_failure PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)
     foreach(case replay flow absent stalled stopfail stopreject
             diagnostics-bootstrap diagnostics-factory diagnostics-connect)
         add_test(NAME dummy_display_exec_${case} COMMAND "${AA_DBUS_RUN_SESSION}" --

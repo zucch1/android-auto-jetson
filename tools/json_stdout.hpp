@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <string_view>
 #include <unistd.h>
@@ -23,6 +24,8 @@ namespace aa::tools {
 //     probe tool directly (gst-inspect-1.0 nvv4l2decoder).
 //   * The C `stdout` pointer is never reassigned, so library threads never
 //     race on it. Children inherit fd 1 = /dev/null.
+// Isolation fails closed: if it cannot be installed, the tool writes one
+// stderr line and exits with kStdoutIsolationFailed (4) before any probe.
 // end_process() finishes with _Exit. The owner has already drained its JSON
 // within its own bound, and stderr is unbuffered. Exit-time stdio cleanup is
 // skipped on purpose: C stdout (bound to /dev/null) and any FILE a library
@@ -48,18 +51,45 @@ inline bool write_all(int fd, std::string_view data) noexcept {
     return true;
 }
 
+// Exit status when isolation cannot be installed (fd 1 closed at start,
+// EMFILE, no /dev/null). Distinct from the tools' 0-3.
+inline constexpr int kStdoutIsolationFailed = 4;
+
 class StdoutIsolation final {
 public:
+    // Fails closed: on any error nothing is changed, ok() is false and
+    // error() holds the errno. The owner must then refuse to run, because
+    // running unisolated would put library text back into the JSON stream.
     StdoutIsolation() noexcept {
         const int json = ::fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
-        const int null = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (json >= 0 && null >= 0 && ::dup2(null, STDOUT_FILENO) == STDOUT_FILENO) {
-            json_ = json;
-            active_json_fd.store(json_);
-        } else if (json >= 0) {
-            ::close(json); // Unisolated rather than broken: JSON stays on fd 1.
+        if (json < 0) {
+            error_ = errno;
+            return;
         }
-        if (null >= 0) { ::close(null); }
+        const int null = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (null < 0 || ::dup2(null, STDOUT_FILENO) != STDOUT_FILENO) {
+            error_ = errno;
+            if (null >= 0) { ::close(null); }
+            ::close(json);
+            return;
+        }
+        ::close(null);
+        json_ = json;
+        active_json_fd.store(json_);
+    }
+
+    [[nodiscard]] bool ok() const noexcept { return json_ >= 0; }
+    [[nodiscard]] int error() const noexcept { return error_; }
+
+    // One stderr line naming the failure; the caller then exits with
+    // kStdoutIsolationFailed before loading any library.
+    void report_failure(const char *program) const noexcept {
+        char line[256];
+        const int size = std::snprintf(line, sizeof line, "%s: stdout_isolation_failed: %s (errno %d)\n",
+                                       program, std::strerror(error_), error_);
+        if (size > 0) {
+            static_cast<void>(write_all(STDERR_FILENO, std::string_view{line, static_cast<std::size_t>(size)}));
+        }
     }
     StdoutIsolation(const StdoutIsolation &) = delete;
     StdoutIsolation &operator=(const StdoutIsolation &) = delete;
@@ -85,5 +115,6 @@ public:
 
 private:
     int json_ = -1;
+    int error_ = 0;
 };
 } // namespace aa::tools

@@ -236,6 +236,11 @@ if(NOT CMAKE_CROSSCOMPILING)
         --shim "$<TARGET_FILE:aa_test_file_lock_holder>"
         --receiver "$<TARGET_FILE:aa-wired-receiver>")
     set_tests_properties(wired_receiver_exit_file_lock PROPERTIES TIMEOUT 120)
+    # Stdout isolation fails closed (fd 1 closed at start).
+    add_test(NAME wired_receiver_isolation_failure COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/stdio/isolation_failure_test.py"
+        --receiver "$<TARGET_FILE:aa-wired-receiver>")
+    set_tests_properties(wired_receiver_isolation_failure PROPERTIES TIMEOUT 120)
 endif()
 
 unset(AA_WIRED_SOURCES)

@@ -403,5 +403,9 @@ int main(int argc, char** argv) {
     // Before any GStreamer/NVIDIA probe: JSON moves to a private descriptor and
     // fd 1 becomes /dev/null; the run ends with _Exit (tools/json_stdout.hpp).
     aa::tools::StdoutIsolation isolation;
+    if (!isolation.ok()) {
+        isolation.report_failure("aa-dummy-display");
+        aa::tools::StdoutIsolation::end_process(aa::tools::kStdoutIsolationFailed);
+    }
     aa::tools::StdoutIsolation::end_process(display_main(argc, argv));
 }

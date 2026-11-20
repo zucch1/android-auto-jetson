@@ -1731,7 +1731,8 @@ const char *const kUsage =
     "  1280x720 (primary profile)) and scaled to every fallback offer. width-margin, height-margin, margins-* and a\n"
     "  pixel-aspect-ratio-e4 other than 10000 need --screen-experimental-geometry:\n"
     "  the display does not crop or map touch for them yet. See ARCHITECTURE.md.\n"
-    "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked.\n";
+    "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked,\n"
+    "  4 stdout isolation failed (fd 1 unusable at start).\n";
 
 int receiver_main(int argc, char **argv) {
     auto video_profiles = aa::config::default_video_profiles();
@@ -2512,6 +2513,14 @@ int main(int argc, char **argv) {
     // Before any GStreamer/NVIDIA load: JSON moves to a private descriptor and
     // fd 1 becomes /dev/null (tools/json_stdout.hpp).
     aa::tools::StdoutIsolation isolation;
+    if (!isolation.ok()) {
+        isolation.report_failure("aa-wired-receiver");
+#ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
+        return aa::tools::kStdoutIsolationFailed;
+#else
+        aa::tools::StdoutIsolation::end_process(aa::tools::kStdoutIsolationFailed);
+#endif
+    }
     int code = 0;
     {
         aa::wired_receiver::StdoutLogScope logging{g_running};
