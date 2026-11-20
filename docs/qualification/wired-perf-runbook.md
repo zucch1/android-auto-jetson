@@ -713,18 +713,27 @@ adb, and with the cable out adb has to use TCP:
    phone keeps listening on 5555 until it reboots.
 2. Unplug the cable.
 3. During the run, once the session is `active` (the phone has joined the
-   receiver's AP), the harness reads the station addresses from the AP's DHCP
-   leases (`/var/lib/NetworkManager/dnsmasq-IFACE.leases`) and neighbour table
-   (`ip -4 neigh show dev IFACE`). IFACE comes from
-   `/etc/android-auto-receiver/ap.conf`. The harness then runs
-   `adb connect IP:5555` and binds the phone by identity:
-   `adb -s IP:5555 get-serialno` must answer `SERIAL` (for example
-   `R5CY30E2JSH` for the A26).
+   receiver's AP), the harness binds adb to the phone the receiver admitted
+   under `--phone-id`, not to any station:
+   - it takes the peer address of the receiver's own ESTABLISHED TCP session
+     (its socket inodes in `/proc/PID/fd` matched in `/proc/PID/net/tcp`);
+     there must be exactly one;
+   - that address must be a station of the AP: a DHCP lease
+     (`/var/lib/NetworkManager/dnsmasq-IFACE.leases`) or neighbour
+     (`ip -4 neigh show dev IFACE`), with IFACE from
+     `/etc/android-auto-receiver/ap.conf`;
+   - it runs `adb connect IP:5555`, and the device itself must answer
+     `adb -s IP:5555 shell getprop ro.serialno` with `SERIAL` (for example
+     `R5CY30E2JSH` for the A26). `adb get-serialno` is not used: for a TCP
+     transport the adb server answers with the endpoint `IP:5555`.
 4. Only then is the phone prepared (wake, media, Maps) and the drive clock or
    measurement window started.
 
-No reachable station, or only other phones, means BLOCKED (`adb_unreachable`,
-`adb_phone_mismatch`), never a PASS. The media player is stopped and verified
+No session peer, several, or one that is not on the AP means BLOCKED
+(`adb_session_peer_unknown`, `adb_session_ambiguous`, `adb_session_not_on_ap`,
+`adb_session_unreadable`); a peer adb cannot reach, or one that reports
+another serial, means BLOCKED (`adb_unreachable`, `adb_phone_mismatch`). Never
+a PASS. The media player is stopped and verified
 before the session is torn down, while adb still reaches the phone. Only IPv4
 addresses are read: MACs, the PSK and the SSID are never recorded or printed.
 
@@ -748,7 +757,9 @@ decision. This PR doesn't make it.
 
 `check --transport wireless --phone-id N` refuses a smoke of the other
 transport (`drive_smoke_transport_mismatch`) or of another approved phone
-(`drive_smoke_phone_mismatch`). A record without `transport` is wired. A soak
+(`drive_smoke_phone_mismatch`), and a wireless smoke whose `link` does not show
+adb bound and a readable, clean host USB bus before, during and after
+(`drive_smoke_link_unproven`). A record without `transport` is wired. A soak
 result's `mode` is its transport. A wireless result carries `link` (without
 the phone id) and `startup_basis: harness_launch_to_active`: its `startup_ms`
 is measured by the harness from the receiver's launch to the active

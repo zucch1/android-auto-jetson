@@ -45,11 +45,13 @@ and tears it down when it stops. The criteria are the same.
 
 * The phone's USB cable must be out: the Jetson's USB bus must show neither the
   phone (``--serial``) nor an AOA device before, during and after the drive.
-* adb runs over the AP link: after the session is active the runner connects to
-  the AP's stations on port 5555 and binds the one whose ``get-serialno`` is
-  ``--serial``; only then does it prepare the phone (wake, media, Maps) and
-  start the drive clock (``drive_from_ns``: the drive is the first paint after
-  it). No such phone: BLOCKED ``adb_unreachable`` / ``adb_phone_mismatch``.
+* adb runs over the AP link to the phone the receiver admitted: after the
+  session is active the runner takes the peer of the receiver's own TCP session
+  (it must be the only one and a station of the AP), connects to it on 5555 and
+  binds it only when the device's ``getprop ro.serialno`` is ``--serial``; only
+  then does it prepare the phone (wake, media, Maps) and start the drive clock
+  (``drive_from_ns``: the drive is the first paint after it). Otherwise:
+  BLOCKED ``adb_session_*`` / ``adb_unreachable`` / ``adb_phone_mismatch``.
   The media player is stopped and verified before the session is torn down,
   while adb still reaches the phone.
 * Wireless has no ``active`` line: the receiver's own ``session_state_changed``
@@ -463,6 +465,12 @@ def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: s
             return "drive_smoke_malformed", "a wireless smoke must record its phone_id"
         if type(phone_id) is not int or recorded != phone_id:
             return "drive_smoke_phone_mismatch", "the smoke projected a different approved phone id"
+        # A wireless PASS counts only with its link evidence: adb bound to the
+        # admitted phone, and this host's USB bus readable and clean (no phone,
+        # no AOA device) before, at every sample during, and after the drive.
+        gap = transport.link_gap(record.get("link"))
+        if gap is not None:
+            return "drive_smoke_link_unproven", f"the wireless smoke's link record: {gap}"
     if record["verdict"] != "PASS":
         return "drive_smoke_not_passed", f"verdict {record['verdict']!r}"
     for role, digest in (("receiver", receiver_sha256), ("display", display_sha256)):
@@ -743,7 +751,7 @@ def _run_cli(args) -> int:
         base["phone_model"] = _adb(args.serial, "shell", "getprop", "ro.product.model").stdout.strip()
     # The soak gate binds to this phone. The record is a local file and must not
     # be committed or exported (runbook, Privacy). Wireless: the expected serial,
-    # proven over the AP link by get-serialno before the phone is driven.
+    # proven over the AP link (ro.serialno of the receiver's session peer) first.
     base["phone_serial"] = args.serial
     store_before = sha256(store) if store.exists() else None
 
@@ -797,13 +805,16 @@ def _run_cli(args) -> int:
                                     media_component=args.media_component, geo_uri=args.geo_uri,
                                     usb_reset=not wireless)
 
-    def bind_phone() -> bool:
-        """Wireless: adb to the expected phone over the AP link, then the phone's own link state."""
+    def bind_phone(receiver_pid: int) -> bool:
+        """Wireless: adb to the receiver's admitted phone over the AP link, then its link state."""
         interface = transport.ap_interface(Path(args.ap_conf))
         deadline, reason = time.monotonic() + ADB_BIND_TIMEOUT_S, "adb_unreachable"
-        while not stop and time.monotonic() < deadline:
-            bound, reason = transport.bind_adb(args.serial, transport.read_ap_stations(interface),
-                                               _host_adb)
+        while interface and not stop and time.monotonic() < deadline:
+            candidate, reason = transport.session_candidate(
+                transport.receiver_session_peers(receiver_pid), transport.read_ap_stations(interface))
+            bound = None
+            if candidate:
+                bound, reason = transport.bind_adb(args.serial, [candidate], _host_adb)
             if bound:
                 adb_target["serial"] = bound
                 base["link"]["adb_bound"] = True
@@ -845,7 +856,7 @@ def _run_cli(args) -> int:
         run["active_ns"] = rx[marker]
         run["active_marker"] = marker
         if wireless:
-            if not bind_phone() or stop:
+            if not bind_phone(receiver.pid) or stop:
                 return
             if not workload.prepare_phone(stop.sleep) or stop:
                 return
@@ -987,7 +998,7 @@ def main(argv: list[str]) -> int:
     run = sub.add_parser("run", help="drive the smoke on the phone (live)")
     run.add_argument("--serial", required=True,
                      help="the phone's serial: its adb serial when wired; wireless: the hardware "
-                          "serial (get-serialno) adb must answer with over the AP link")
+                          "serial (getprop ro.serialno) the phone must answer with over the AP link")
     run.add_argument("--transport", choices=transport.TRANSPORTS, default=transport.DEFAULT_TRANSPORT,
                      help="session transport (default wired); a result counts only for its own")
     run.add_argument("--phone-id", type=int,

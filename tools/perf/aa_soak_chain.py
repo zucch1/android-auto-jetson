@@ -9,7 +9,7 @@
 ``--transport wired|wireless`` (default wired) is passed to every stage as the
 launcher's ``--mode``; a wireless chain needs ``--phone-id``, ``--store``,
 ``--phone-serial`` as the phone's hardware serial (bound over the AP link by
-get-serialno), the cable unplugged and a wireless drive smoke for the same
+its ro.serialno), the cable unplugged and a wireless drive smoke for the same
 phone id (tools/perf/aa_transport.py). The stages, gates and
 interference rules are the same for both transports.
 

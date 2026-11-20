@@ -24,15 +24,24 @@ no device with the phone's serial and no Google AOA device (18d1:2d00-2d05)
 on any port, before, during and after the run (``usb_attached``).
 
 adb (the moving-map stimulus) then runs over the helper's AP link: the operator
-runs ``adb tcpip 5555`` once beforehand while the phone is cabled (runbook);
-after the phone joins the AP the harness reads the station addresses from the
-AP's DHCP leases and neighbour table on the AP interface (IPv4 addresses only;
+runs ``adb tcpip 5555`` once beforehand while the phone is cabled (runbook).
+The phone adb drives must be the phone the receiver admitted under
+``--phone-id``, so the harness does not pick "some station on the AP". It
+takes the peer address of the receiver's own ESTABLISHED TCP session
+(``receiver_session_peers``: the receiver process's socket inodes matched in
+its ``/proc/PID/net/tcp``), requires exactly one such peer and that it is a
+station of the AP (DHCP lease or neighbour on the AP interface; IPv4 only,
 MACs, the PSK and the SSID are never read into the record or printed), runs
-``adb connect <ip>:5555`` and binds by identity: ``adb -s <ip>:5555
-get-serialno`` must equal the expected phone serial (``bind_adb``). A phone
-adb cannot reach, or a different phone, BLOCKS the run (``adb_unreachable`` /
-``adb_phone_mismatch``). The phone's own link state (USB functions, Wi-Fi
-frequency/channel/RSSI, Bluetooth) is then read over that adb into the record.
+``adb connect <peer>:5555`` and binds only when the device itself answers
+``getprop ro.serialno`` with the expected phone serial (``bind_adb``).
+``adb get-serialno`` is not used: it is a host query that, for a TCP
+transport, returns the endpoint ``<ip>:5555``. The chain is: the receiver
+admits only ``--phone-id``'s stored wireless identity, the session socket's
+peer is the phone holding that admitted session, and adb reaches that same
+address and reports the expected hardware serial. Anything else BLOCKS the
+run (``adb_session_*``, ``adb_unreachable``, ``adb_phone_mismatch``). The
+phone's own link state (USB functions, Wi-Fi frequency/channel/RSSI,
+Bluetooth) is then read over that adb into the record.
 
 A result records ``transport``. A gate asked for one transport refuses a record
 of the other, and a record without the field is wired (every record before this
@@ -41,7 +50,10 @@ field existed came from the wired receiver).
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
+import socket
+import struct
 import subprocess
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -251,24 +263,127 @@ def read_ap_stations(interface: str | None,
     return ap_station_addresses(interface, leases, neigh)
 
 
+PROC = Path("/proc")
+_SOCKET_LINK = re.compile(r"socket:\[(\d+)\]")
+_TCP_ESTABLISHED = "01"
+
+
+def _proc_address(hex_address: str) -> str | None:
+    """The IPv4 address of a /proc/net/tcp{,6} ``ADDR:PORT`` field (host byte order words)."""
+    address = hex_address.split(":")[0]
+    try:
+        raw = b"".join(struct.pack("=I", int(address[i:i + 8], 16)) for i in range(0, len(address), 8))
+    except ValueError:
+        return None
+    if len(raw) == 4:
+        return socket.inet_ntop(socket.AF_INET, raw)
+    if len(raw) == 16:
+        mapped = ipaddress.IPv6Address(raw).ipv4_mapped
+        return str(mapped) if mapped else None
+    return None
+
+
+def receiver_session_peers(pid: int, proc: Path | None = None) -> list[str] | None:
+    """IPv4 peers of the ESTABLISHED TCP sockets process ``pid`` owns; None if unreadable.
+
+    Read-only procfs: the socket inodes of ``/proc/PID/fd`` matched against
+    ``/proc/PID/net/tcp`` and ``tcp6`` (the process's own network namespace).
+    The receiver's only TCP sockets are its Android Auto session (its IPC and
+    the helper are Unix sockets), so its peer is the admitted phone.
+    """
+    proc = PROC if proc is None else proc  # module attribute: test seam
+    base = proc / str(pid)
+    try:
+        inodes = set()
+        for entry in (base / "fd").iterdir():
+            try:
+                match = _SOCKET_LINK.fullmatch(os.readlink(entry))
+            except OSError:
+                continue
+            if match:
+                inodes.add(match.group(1))
+    except OSError:
+        return None
+    peers: list[str] = []
+    readable = False
+    for table in ("tcp", "tcp6"):
+        try:
+            lines = (base / "net" / table).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        readable = True
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != _TCP_ESTABLISHED or fields[9] not in inodes:
+                continue
+            peer = _proc_address(fields[2])
+            if peer and peer not in peers:
+                peers.append(peer)
+    return peers if readable else None
+
+
+def session_candidate(peers: list[str] | None, stations: list[str]) -> tuple[str | None, str | None]:
+    """The one address adb may bind: the receiver session's peer, if it is an AP station.
+
+    (address, None) or (None, reason): ``adb_session_unreadable`` (procfs could
+    not be read), ``adb_session_peer_unknown`` (no established session socket),
+    ``adb_session_ambiguous`` (more than one peer), ``adb_session_not_on_ap``
+    (the peer is no station of the helper's AP).
+    """
+    if peers is None:
+        return None, "adb_session_unreadable"
+    if not peers:
+        return None, "adb_session_peer_unknown"
+    if len(peers) > 1:
+        return None, "adb_session_ambiguous"
+    if peers[0] not in stations:
+        return None, "adb_session_not_on_ap"
+    return peers[0], None
+
+
+def link_gap(link: object) -> str | None:
+    """Why a wireless link record does not prove a bound, cable-out session; None if it does.
+
+    adb must have been bound (``adb_bound`` true) and this host's USB bus must
+    have been readable and clean (no phone, no AOA device) before, at every
+    sample during (at least one), and after the run. Shared by the drive
+    smoke's soak gate and the perf reporter.
+    """
+    if not isinstance(link, dict):
+        return "wireless_link_unrecorded"
+    if link.get("adb_bound") is not True:
+        return "wireless_adb_unbound"
+    host = link.get("host_usb")
+    if not isinstance(host, dict) or not isinstance(host.get("during"), list) or not host["during"]:
+        return "wireless_host_usb_unrecorded"
+    for moment, evidence in ([("before", host.get("before"))] + [("during", e) for e in host["during"]]
+                             + [("after", host.get("after"))]):
+        refusal = host_usb_refusal(evidence)
+        if refusal:
+            return f"wireless_{refusal.split(':')[-1]}_{moment}"
+    return None
+
+
 def bind_adb(expected_serial: str, candidates: list[str],
              adb: Callable[..., object]) -> tuple[str | None, str | None]:
-    """Connect adb to the station that is the expected phone: (adb serial, None) or (None, reason).
+    """Connect adb to the candidate that is the expected phone: (adb target, None) or (None, reason).
 
     ``adb(*args)`` runs one bounded host adb command. Each candidate is tried as
-    ``<ip>:5555``; the phone is bound only when ``get-serialno`` over that
-    connection equals ``expected_serial``. A candidate that answers with another
-    serial is disconnected again. Reasons: ``adb_unreachable`` (no candidate, or
-    none answered), ``adb_phone_mismatch`` (only other phones answered).
+    ``<ip>:5555``; it is bound only when the device answers ``shell getprop
+    ro.serialno`` with ``expected_serial``. (``adb -s <ip>:5555 get-serialno``
+    asks the host server and returns the endpoint itself for a TCP transport,
+    so it proves nothing.) A candidate that answers with another serial is
+    disconnected again. Reasons: ``adb_unreachable`` (no candidate, or none
+    answered), ``adb_phone_mismatch`` (only other phones answered).
     """
     other = False
     for address in candidates:
         target = f"{address}:{ADB_TCP_PORT}"
         connected = adb("connect", target)
-        if getattr(connected, "returncode", 1) != 0 or "connected" not in (
-                getattr(connected, "stdout", "") or "") or "cannot" in (getattr(connected, "stdout", "") or ""):
+        text = getattr(connected, "stdout", "") or ""
+        if getattr(connected, "returncode", 1) != 0 or "connected" not in text or "cannot" in text:
             continue
-        answer = adb("-s", target, "get-serialno")
+        answer = adb("-s", target, "shell", "getprop", "ro.serialno")
         serial = (getattr(answer, "stdout", "") or "").strip() if getattr(answer, "returncode", 1) == 0 else ""
         if serial and serial == expected_serial:
             return target, None

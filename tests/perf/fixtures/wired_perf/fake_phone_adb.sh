@@ -25,7 +25,8 @@
 #   FAKE_ADB_USB_CONFIG       `getprop sys.usb.config` (default mtp,adb)
 #   FAKE_ADB_WIFI_STATUS      `cmd wifi status` text; FAKE_ADB_BT_ON bluetooth_on (1)
 #   FAKE_ADB_CONNECT=fail     `adb connect IP:5555` fails (adb unreachable over the AP)
-#   FAKE_ADB_SERIALNO         `get-serialno` answer (default FAKESERIAL)
+#   FAKE_ADB_SERIALNO         the device's `getprop ro.serialno` (default FAKESERIAL);
+#                             `-s T get-serialno` answers T, as the real adb server does
 #   FAKE_ADB_IGNORE_TERM=1    such a hung command also ignores TERM (only KILL
 #                             ends it)
 set -u
@@ -65,7 +66,10 @@ case "$args" in
         echo "connected to ${args#connect }" ;;
     "disconnect "*)
         echo "disconnected ${args#disconnect }" ;;
-    *"get-serialno"*)
+    "-s "*" get-serialno")
+        # The host server's transport serial: for a TCP transport, the endpoint.
+        target="${args#-s }"; echo "${target%% *}" ;;
+    *"getprop ro.serialno"*)
         echo "${FAKE_ADB_SERIALNO:-FAKESERIAL}" ;;
     *"getprop sys.usb.config"*)
         echo "${FAKE_ADB_USB_CONFIG-mtp,adb}" ;;

@@ -22,7 +22,7 @@
 # /opt/aa/aa-wireless-receiver) for --phone-id N, approved in --store
 # DIR/approved-phones.json (required). The phone's USB cable must be unplugged
 # (checked on the target's USB bus); adb reaches it over the helper's AP after
-# admission (`adb tcpip 5555` once beforehand), bound by get-serialno to
+# admission (`adb tcpip 5555` once beforehand), bound by ro.serialno to
 # --phone-serial (its hardware serial). The drive smoke must be a wireless one
 # for the same --phone-id (aa_drive_smoke.py check --transport wireless); the
 # result's mode is wireless. See tools/perf/aa_transport.py.
@@ -504,7 +504,7 @@ verified_serial=""
 if [[ "$PHONE_SERIAL" =~ ^[A-Za-z0-9._:-]+$ ]]; then
     if [[ "$MODE" == "wireless" ]]; then
         # The cable is out, so adb cannot see the phone yet: the collector binds
-        # adb to this serial over the AP link (get-serialno) or refuses the stage.
+        # adb to this serial over the AP link (ro.serialno) or refuses the stage.
         verified_serial="$PHONE_SERIAL"
     else
         devices="$(remote "adb devices -l" 2>/dev/null || true)"

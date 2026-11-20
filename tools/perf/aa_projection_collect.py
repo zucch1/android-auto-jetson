@@ -61,10 +61,11 @@ stops (tools/perf/aa_transport.py). The phone's cable must be out: this host's
 USB bus must show neither the phone (``--phone-serial``) nor an AOA device
 before (else the stage is refused before launch), during and after the stage
 (else BLOCKED ``cleanup:usb_attached``). adb runs over the AP link: once the
-session is active the collector connects to the AP's stations on 5555 and
-binds the one whose ``get-serialno`` is ``--phone-serial``; no such phone
-refuses the stage (``phone_setup_failed: adb_unreachable`` /
-``adb_phone_mismatch``, nothing measured). Only then is the phone prepared and
+session is active the collector takes the peer of the receiver's own TCP
+session (the only one, and a station of the AP), connects to it on 5555 and
+binds it only when the device's ``getprop ro.serialno`` is ``--phone-serial``;
+otherwise the stage is refused (``phone_setup_failed: adb_session_*`` /
+``adb_unreachable`` / ``adb_phone_mismatch``, nothing measured). Only then is the phone prepared and
 the measurement window allowed to start (samples count as active only after
 it), and the phone is restored before the session is torn down. The wireless
 receiver logs no ``active`` line; its ``session_state_changed`` diagnostic to
@@ -987,8 +988,11 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         interface = transport.ap_interface(Path(getattr(args, "ap_conf", None) or transport.AP_CONF))
         reason = "adb_unreachable" if interface else "adb_unreachable (no AP interface in ap.conf)"
         while interface and time.monotonic() - began < _ADB_BIND_TIMEOUT_SECONDS:
-            bound, reason = transport.bind_adb(phone_serial, transport.read_ap_stations(interface),
-                                               _host_adb)
+            candidate, reason = transport.session_candidate(
+                transport.receiver_session_peers(receiver.pid), transport.read_ap_stations(interface))
+            bound = None
+            if candidate:
+                bound, reason = transport.bind_adb(phone_serial, [candidate], _host_adb)
             if bound:
                 adb_target["serial"] = bound
                 break

@@ -684,20 +684,7 @@ def wireless_link_gap(capture: dict) -> str | None:
     """
     if capture.get("mode") != "wireless":
         return None
-    link = capture.get("link")
-    if not isinstance(link, dict):
-        return "wireless_link_unrecorded"
-    if link.get("adb_bound") is not True:
-        return "wireless_adb_unbound"
-    host = link.get("host_usb")
-    if not isinstance(host, dict) or not isinstance(host.get("during"), list) or not host["during"]:
-        return "wireless_host_usb_unrecorded"
-    for moment, evidence in ([("before", host.get("before"))] + [("during", e) for e in host["during"]]
-                             + [("after", host.get("after"))]):
-        refusal = transport.host_usb_refusal(evidence)
-        if refusal:
-            return f"wireless_{refusal.split(':')[-1]}_{moment}"
-    return None
+    return transport.link_gap(capture.get("link"))
 
 
 def _result_link(link: object) -> dict | None:
