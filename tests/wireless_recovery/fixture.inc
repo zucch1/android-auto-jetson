@@ -143,8 +143,9 @@ protected:
             ASSERT_TRUE(read_record(11));
             ASSERT_TRUE(read_record(1));
             ASSERT_EQ(bluez.command("wire-send 00020007200c00020006100c"), "ok");
-            // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
-            for (int quiet = 0; quiet < 5; ++quiet) { ASSERT_EQ(bluez.command("wire-read"), "open"); }
+            // Success keeps the channel (#161). No longer quiet wait: within ~1 s this receiver's own
+            // flow may retire the hand-off; observe_snapshot() below checks completion itself.
+            ASSERT_EQ(bluez.command("wire-read"), "open");
         });
         ASSERT_TRUE(eventually([&] { pump(); return phone.wait_for(0ms) == std::future_status::ready; }, 5s));
         phone.get(); ASSERT_FALSE(HasFatalFailure());
