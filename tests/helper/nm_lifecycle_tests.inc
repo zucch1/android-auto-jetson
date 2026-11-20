@@ -42,7 +42,8 @@ protected:
     }
     void complete(std::uint64_t handle) {
         begin(handle); ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
-        ASSERT_EQ(bluez.command("wire-read"), "open");
+        // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
+        for (int quiet = 0; quiet < 5; ++quiet) { ASSERT_EQ(bluez.command("wire-read"), "open"); }
     }
     void retired(std::uint64_t handle) {
         EXPECT_FALSE(client->poll_bootstrap(source, failure));
@@ -71,7 +72,8 @@ TEST_F(CompletedLifecycle, RepeatedAllowDoesNotRestartPendingOrCompletedExchange
     // When allow is repeated before and after completion.
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, true));
     ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
-    EXPECT_EQ(bluez.command("wire-read"), "open");
+    // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
+    for (int quiet = 0; quiet < 5; ++quiet) { EXPECT_EQ(bluez.command("wire-read"), "open"); }
     EXPECT_TRUE(client->authorize_bootstrap({1, 1}, handle, true, true));
     // Then no new endpoint is emitted and deny can retire completed authority.
     EXPECT_EQ(bluez.command("wire-read"), "open");

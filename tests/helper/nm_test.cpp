@@ -646,7 +646,8 @@ TEST_F(NmDaemon, ComposedBootstrapUsesRealBusClientAndRfcommBytes) {
     EXPECT_EQ(endpoint.ip_address(), "10.42.0.1"); EXPECT_EQ(endpoint.port(), 5277U);
     ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
     // BlueZ holds its own reference (the mock models it, #161): success never shuts it down.
-    EXPECT_EQ(bluez.command("wire-read"), "open");
+    // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
+    for (int quiet = 0; quiet < 5; ++quiet) { EXPECT_EQ(bluez.command("wire-read"), "open"); }
     // Contract v2.4: successful FD closure transfers revocable authority, not retirement.
     const auto completed = client->get_ap_credentials({1, 1}, handle); ASSERT_TRUE(completed);
     EXPECT_TRUE(completed.value() == snapshot.value());
@@ -677,7 +678,8 @@ TEST_F(NmDaemon, HandoffAbortedAfterCompletedExchangeShutsThePhonesChannelDown) 
     ASSERT_TRUE(client->get_ap_credentials({1, 1}, peer.value().handle));
     ASSERT_TRUE(client->authorize_bootstrap({1, 1}, peer.value().handle, true, true));
     phone_completes_exchange(bluez);
-    EXPECT_EQ(bluez.command("wire-read"), "open");
+    // ~1 s quiet: the helper (one record per pump) has completed; BlueZ keeps the channel (#161).
+    for (int quiet = 0; quiet < 5; ++quiet) { EXPECT_EQ(bluez.command("wire-read"), "open"); }
     ASSERT_TRUE(client->poll_bootstrap({1, 1}, failure));
     // When: the hand-off fails afterwards (no TCP session) and the receiver retires it.
     ASSERT_TRUE(client->authorize_bootstrap({1, 1}, peer.value().handle, false, false));
@@ -837,11 +839,26 @@ struct ClockedReconnect {
     BluezBackend bluetooth;
     ClockedReconnect(const std::string& address, const std::filesystem::path& directory)
         : bluetooth{address, [this] { return began + std::chrono::milliseconds{elapsed.load()}; }, directory.string(), ::getuid()} {}
-    void open(Child& bluez) {
+    void open(Child& bluez, const std::vector<PeerIdentity>& approved = kSeededApproval) {
         ASSERT_TRUE(bluetooth.apply(Action::register_profile, 0));
         ASSERT_EQ(bluez.command("paired"), "ok");
-        ASSERT_TRUE(bluetooth.reconcile_bonds(kSeededApproval));
+        ASSERT_TRUE(bluetooth.reconcile_bonds(approved));
+        bluetooth.snapshot_provider([] { return core::Result<ApSnapshot>{
+            ApSnapshot{{"ssid", "secret", "02:ab:cd:ef:01:23", "10.42.0.1", 5277, 1}}}; });
+        bluetooth.snapshot_fence([](std::uint64_t, const std::function<void()>& send) { send(); return true; });
         ASSERT_TRUE(retry());
+    }
+    // Runs the legacy RFCOMM exchange to completion on the backend's own pump. The barrier is the
+    // backend's: a completed bootstrap has no deadline (Bootstrap::deadline()).
+    void complete(Child& bluez, std::uint64_t handle) {
+        ASSERT_TRUE(bluetooth.authorize_handoff(handle, true, true));
+        ASSERT_TRUE(eventually([&] { bluetooth.tick(); return bluez.command("wire-read") != "open"; }));
+        ASSERT_EQ(bluez.command("wire-send 00000002"), "ok");
+        ASSERT_TRUE(eventually([&] { bluetooth.tick(); return bluez.command("wire-read") != "open"; }));
+        ASSERT_EQ(bluez.command("wire-send 000200071800000200060800"), "ok");
+        ASSERT_TRUE(eventually([&] {
+            bluetooth.tick(); return bluetooth.handoff_deadline().until == Clock::time_point::max(); }));
+        ASSERT_TRUE(bluetooth.handoff());
     }
     bool retry() {
         const auto observed = bluetooth.observe();
@@ -892,6 +909,55 @@ TEST_F(NmDaemon, RetryAfterTheWindowLapsedKeepsThisPhonesBootstrap) {
     const auto kept = phone.bluetooth.handoff(); ASSERT_TRUE(kept);
     EXPECT_EQ(kept.value().handle, live.value().handle);
     EXPECT_EQ(bluez.command("wire-read"), "open");
+}
+TEST_F(NmDaemon, ConfirmedHandoffIsNeverCutByTheBackstop) {
+    seed_managed_phone(directory);
+    ClockedReconnect phone{address, directory}; phone.open(bluez);
+    phone.elapsed = 1000; ASSERT_EQ(phone.connect(bluez), "allowed");
+    const auto live = phone.bluetooth.handoff(); ASSERT_TRUE(live);
+    ASSERT_NO_FATAL_FAILURE(phone.complete(bluez, live.value().handle));
+    // The receiver's completed confirmation (its session authenticated).
+    ASSERT_TRUE(phone.bluetooth.authorize_handoff(live.value().handle, true, false));
+    phone.elapsed = 41000; phone.bluetooth.tick();
+    EXPECT_TRUE(phone.bluetooth.handoff());
+    EXPECT_EQ(bluez.command("wire-read"), "open") << "the backstop cut a confirmed session";
+}
+TEST_F(NmDaemon, UnconfirmedCompletionIsFreedByThePumpWhenTheReceiverIsGone) {
+    // The receiver completed the exchange but never confirmed or denied it (it died or hung).
+    seed_managed_phone(directory);
+    ClockedReconnect phone{address, directory}; phone.open(bluez);
+    phone.elapsed = 1000; ASSERT_EQ(phone.connect(bluez), "allowed");
+    const auto live = phone.bluetooth.handoff(); ASSERT_TRUE(live);
+    ASSERT_NO_FATAL_FAILURE(phone.complete(bluez, live.value().handle));
+    phone.elapsed = 30000; phone.bluetooth.tick();
+    EXPECT_EQ(bluez.command("wire-read"), "open");
+    phone.elapsed = 32000; phone.bluetooth.tick();
+    EXPECT_EQ(bluez.command("wire-read"), "closed") << "only the pump fires the backstop";
+    EXPECT_TRUE(phone.bluetooth.handoff()) << "completed authority has no TTL";
+}
+TEST_F(NmDaemon, LapsedWindowRetryKeepsACompletedUnconfirmedHandoff) {
+    seed_managed_phone(directory);
+    ClockedReconnect phone{address, directory}; phone.open(bluez);
+    phone.elapsed = 55000; ASSERT_EQ(phone.connect(bluez), "allowed");
+    const auto live = phone.bluetooth.handoff(); ASSERT_TRUE(live);
+    ASSERT_NO_FATAL_FAILURE(phone.complete(bluez, live.value().handle));
+    phone.elapsed = 61000; phone.bluetooth.tick();
+    ASSERT_TRUE(phone.retry()) << "the lapsed window reopens";
+    const auto kept = phone.bluetooth.handoff(); ASSERT_TRUE(kept);
+    EXPECT_EQ(kept.value().handle, live.value().handle);
+    EXPECT_EQ(bluez.command("wire-read"), "open");
+}
+TEST_F(NmDaemon, OtherPhonesReconnectAbortsTheOldBootstrapWithDisc) {
+    save(directory / "managed-bonds", "v1\n02:00:00:00:00:01 02:00:00:00:00:AA\n02:00:00:00:00:02 02:00:00:00:00:AA\n");
+    ClockedReconnect phone{address, directory};
+    phone.open(bluez, {{"02:00:00:00:00:01", "02:00:00:00:00:AA"}, {"02:00:00:00:00:02", "02:00:00:00:00:AA"}});
+    phone.elapsed = 1000; ASSERT_EQ(phone.connect(bluez), "allowed");
+    ASSERT_TRUE(phone.bluetooth.handoff());
+    // The receiver now reconnects a different approved phone.
+    ASSERT_EQ(bluez.command("observe-other"), "ok");
+    ASSERT_TRUE(phone.retry());
+    EXPECT_FALSE(phone.bluetooth.handoff());
+    EXPECT_EQ(bluez.command("wire-read"), "closed") << "the first phone must see DISC to retry";
 }
 TEST_F(NmDaemon, ComposedRevocationAfterSnapshotPreventsCredentialSend) {
     start(); acquire(); ASSERT_TRUE(state(State::active));

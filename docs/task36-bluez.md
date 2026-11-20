@@ -116,8 +116,9 @@ human-mediated during explicit enrollment only, never automatically approved.
    it: deny (every failure, receiver denial, link or owner loss, replacement,
    revocation, cleanup), destruction of an unconfirmed bootstrap, the bootstrap
    deadline, and the pre-bootstrap `connection` fd. `shutdown(2)` acts on the shared
-   socket, so the kernel sends DISC on the AA DLC only; the HFP DLC, the RFCOMM
-   session and the ACL stay up, and no `Device1`/`Adapter1` method is called (#136,
+   socket, so the kernel sends DISC on the AA DLC only; while HFP is up its DLC
+   keeps the RFCOMM session and the ACL up (with AA as the only DLC, the session
+   may idle out), and no `Device1`/`Adapter1` method is called (#136,
    #160). Success is unchanged at completion: nothing is shut down and the channel
    stays as the phone left it for the whole session. The socket is kept, unread, and
    shut down only when the hand-off is retired: a hand-off that fails before the

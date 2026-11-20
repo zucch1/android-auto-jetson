@@ -181,7 +181,8 @@ completed hand-off, whether it failed before the receiver confirmed it or its
 session ended later. Completion itself shuts nothing down: the channel stays as
 the phone left it for the whole session. A completion never confirmed has its
 socket shut down after 30 s, keeping the completed authority. Only the AA DLC closes;
-HFP, owned by infotainment, is never touched.
+HFP, owned by infotainment, is never touched, and while it is up its DLC keeps the
+RFCOMM session and the ACL up.
 
 A retry must not reset a bootstrap that is still progressing:
 

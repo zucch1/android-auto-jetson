@@ -287,7 +287,13 @@ TEST(WirelessEligibility, RetryBeforeCompletionConfirmedKeepsTheBootstrap) {
     ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
     const auto epoch = f.coordinator.epoch();
     f.coordinator.begin(f.source);
-    EXPECT_TRUE(f.eventually([&] { return false; }, 100ms) || f.coordinator.admitting());
+    // Keep ticking for a while: the retry must neither retire nor re-observe.
+    const auto until = std::chrono::steady_clock::now() + 100ms;
+    while (std::chrono::steady_clock::now() < until) {
+        f.coordinator.tick();
+        ASSERT_TRUE(f.coordinator.admitting());
+        std::this_thread::sleep_for(5ms);
+    }
     EXPECT_EQ(f.coordinator.epoch(), epoch);
     EXPECT_EQ(f.denied.load(), 0U);
     EXPECT_EQ(f.initial_observations.load(), 1U) << "the live bootstrap is not observed again";

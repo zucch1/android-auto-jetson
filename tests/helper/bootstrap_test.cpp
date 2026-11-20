@@ -351,6 +351,19 @@ TEST_F(BlueZHeldBootstrapTest, CompletedExchangeDestroyedUnconfirmedShutsTheChan
     bootstrap.reset();
     EXPECT_TRUE(phone_eof());
 }
+TEST_F(BlueZHeldBootstrapTest, ConfirmedCompletionIsNeverCutByTheBackstop) {
+    // A healthy, confirmed session keeps the phone's channel past the 30 s backstop.
+    complete();
+    bootstrap->confirm();
+    EXPECT_FALSE(bootstrap->awaiting_confirmation());
+    elapsed = 40'000;
+    EXPECT_FALSE(bootstrap->expire());
+    EXPECT_FALSE(phone_eof()) << "the backstop cut a confirmed session";
+    EXPECT_TRUE(bootstrap->complete());
+    // Its retirement, later, still frees the phone.
+    bootstrap->deny(HandoffFailure::denied);
+    EXPECT_TRUE(phone_eof());
+}
 TEST_F(BlueZHeldBootstrapTest, UnconfirmedCompletionBackstopShutsTheChannelDownKeepingAuthority) {
     complete();
     elapsed = 29'000; EXPECT_FALSE(bootstrap->expire()); EXPECT_FALSE(phone_eof());
