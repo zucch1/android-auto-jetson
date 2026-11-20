@@ -28,7 +28,7 @@ struct Wipe final { const void* address; std::string before; bool clean; };
 std::mutex wipes_mutex;
 std::vector<Wipe> wipes;
 std::atomic<bool> recording{};
-constexpr std::string_view sentinel = "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ";
+constexpr std::string_view sentinel = "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ";
 }
 extern "C" void real_explicit_bzero(void*, std::size_t) asm("__real_explicit_bzero");
 extern "C" void tracked_explicit_bzero(void*, std::size_t) asm("__wrap_explicit_bzero");
@@ -156,7 +156,12 @@ TEST_P(SecretReply, MalformedErrorAndSkippedTimeoutRepliesWipeAllOwnedBuffers) {
     char path[] = "/tmp/task37-secret-reply-XXXXXX"; ASSERT_NE(::mkdtemp(path), nullptr);
     trust::ApprovedPhoneStore store{std::filesystem::path{path} / "phones"}; ASSERT_TRUE(store.load());
     auto client = BusClient::private_bus_for_test(std::getenv("DBUS_SESSION_BUS_ADDRESS"), store); ASSERT_TRUE(client);
+    // 0: invalid port, 1: error code, 2: wrong serial, 3: a 64-character password,
+    // which is a raw hex PSK rather than a WPA2 passphrase (8-63 characters),
+    // 4: a 7-character password (below the WPA2 minimum), 5: exactly 8 (accepted).
     const auto mode = GetParam();
+    const std::string password = mode == 4 ? std::string{sentinel.substr(0, 7)}
+        : mode == 5 ? std::string{sentinel.substr(0, 8)} : std::string{sentinel} + (mode == 3 ? "Q" : "");
     auto reply = std::async(std::launch::async, [&] {
         for (;;) {
             auto request = server.value().read_message();
@@ -166,17 +171,24 @@ TEST_P(SecretReply, MalformedErrorAndSkippedTimeoutRepliesWipeAllOwnedBuffers) {
             const auto cleanup = writer.protect_body(true);
             writer.destination(request.value().sender).reply_serial(request.value().serial + (mode == 2 ? 1U : 0U))
                 .body_signature("utssssut").put_u32(mode == 1 ? 1001U : 0U).put_u64(0)
-                .put_string("ssid").put_string(sentinel).put_string("02:ab:cd:ef:01:23").put_string("10.42.0.1")
+                .put_string("ssid").put_string(password).put_string("02:ab:cd:ef:01:23").put_string("10.42.0.1")
                 .put_u32(mode == 0 ? 1U : 5277U).put_u64(1);
             return server.value().send_message(MessageType::method_return, writer, true).has_value();
         }
     });
     const auto snapshot = client.value()->get_ap_credentials({7, 0}, 123);
-    EXPECT_FALSE(snapshot); EXPECT_TRUE(reply.get());
-    EXPECT_GE(secret_buffers, 4);
+    EXPECT_TRUE(reply.get());
+    if (mode == 5) {
+        ASSERT_TRUE(snapshot); EXPECT_EQ(snapshot.value().password.size(), kWpa2PassphraseMin);
+    } else {
+        ASSERT_FALSE(snapshot);
+        if (mode == 3 || mode == 4) { EXPECT_EQ(snapshot.error().code(), ErrorCode::helper_protocol_mismatch); }
+    }
+    // The 7-character body does not carry the 8-character secret marker.
+    if (mode != 4) { EXPECT_GE(secret_buffers, 4); }
     client.value().reset(); std::filesystem::remove_all(path);
 }
-INSTANTIATE_TEST_SUITE_P(CredentialCleanup, SecretReply, ::testing::Values(0, 1, 2));
+INSTANTIATE_TEST_SUITE_P(CredentialCleanup, SecretReply, ::testing::Values(0, 1, 2, 3, 4, 5));
 TEST_F(SecretLifetime, LateCredentialReplyIsWipedWhenOrdinaryStatusDrainsItAfterTimeout) {
     using namespace ipc::dbus_adapter;
     // Given a server that cannot release credentials until the caller has timed out.
@@ -294,8 +306,18 @@ protected:
     std::filesystem::path directory;
     nm::Policy policy;
 };
+// A WPA2 passphrase (8-63 characters), drawn as lowercase hex: never a 64-hex raw PSK.
+bool hex_passphrase(std::string_view value) {
+    return value.size() == nm::Psk::kLength && value.size() >= kWpa2PassphraseMin && value.size() <= kWpa2PassphraseMax &&
+           value.find_first_not_of("0123456789abcdef") == std::string_view::npos;
+}
+std::string file_text(const std::filesystem::path& path) {
+    std::ifstream input{path};
+    return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+}
 TEST_F(PskLifetime, PersistedCredentialFileBytesAreCleansedAfterLoad) {
-    const std::string psk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const std::string psk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde";
+    ASSERT_EQ(psk.size(), nm::Psk::kLength);
     const auto file = directory / "state/ap.credentials";
     std::ofstream{file} << "AA-0123456789abcdef\n" << psk << "\n";
     ASSERT_EQ(::chmod(file.c_str(), 0600), 0);
@@ -312,10 +334,10 @@ TEST_F(PskLifetime, PersistedCredentialFileBytesAreCleansedAfterLoad) {
 }
 TEST_F(PskLifetime, RotatedCredentialStagingBufferIsCleansed) {
     { const auto rotated = nm::credentials(policy, true); ASSERT_TRUE(rotated); }
-    std::ifstream input{directory / "state/ap.credentials"};
-    const std::string written{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
-    ASSERT_EQ(written.size(), 85U);
-    const auto found = cleansed(written.substr(20, 64));
+    const std::string written = file_text(directory / "state/ap.credentials");
+    ASSERT_EQ(written.size(), 84U);
+    EXPECT_TRUE(hex_passphrase(written.substr(20, nm::Psk::kLength)));
+    const auto found = cleansed(written.substr(20, nm::Psk::kLength));
     // The exact bytes written to disk were composed in a cleansed buffer.
     EXPECT_TRUE(std::any_of(found.begin(), found.end(), [&](const Wipe& w) { return w.before == written; }));
     EXPECT_TRUE(has_size(found, nm::Psk::kLength + 1));
@@ -323,11 +345,80 @@ TEST_F(PskLifetime, RotatedCredentialStagingBufferIsCleansed) {
 TEST_F(PskLifetime, FreshCredentialsCleanseThePskBuffer) {
     std::string psk;
     { const auto fresh = nm::fresh_credentials(); ASSERT_TRUE(fresh); psk = fresh.value().psk.view(); }
-    ASSERT_EQ(psk.size(), 64U);
+    EXPECT_TRUE(hex_passphrase(psk)) << psk.size();
     EXPECT_TRUE(has_size(cleansed(psk), nm::Psk::kLength + 1));
+}
+TEST_F(PskLifetime, LegacyRawPskFileIsRotatedToAFreshPassphrase) {
+    // A device provisioned before the passphrase fix holds "AA-<16 hex>\n<64 hex>\n"
+    // (85 bytes), a raw PMK phones refuse. It must not fail closed forever.
+    const std::string legacy = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const auto file = directory / "state/ap.credentials";
+    for (const bool rotate : {false, true}) {
+        // Each pass proves its own cleansing, not the previous pass's.
+        { const std::lock_guard lock{wipes_mutex}; wipes.clear(); }
+        std::filesystem::remove(file);
+        std::ofstream{file} << "AA-0123456789abcdef\n" << legacy << "\n";
+        ASSERT_EQ(::chmod(file.c_str(), 0600), 0);
+        std::string psk, ssid;
+        {
+            const auto migrated = nm::credentials(policy, rotate); ASSERT_TRUE(migrated) << rotate;
+            psk = migrated.value().psk.view(); ssid = migrated.value().ssid;
+        }
+        EXPECT_TRUE(hex_passphrase(psk)) << rotate;
+        EXPECT_EQ(legacy.find(psk), std::string::npos) << rotate;
+        EXPECT_NE(ssid, "AA-0123456789abcdef");
+        const auto written = file_text(file);
+        EXPECT_TRUE(written == ssid + "\n" + psk + "\n") << written.size();
+        struct stat metadata{};
+        ASSERT_EQ(::stat(file.c_str(), &metadata), 0); EXPECT_EQ(metadata.st_mode & 0777, 0600U);
+        EXPECT_FALSE(std::filesystem::exists(directory / "state/ap.credentials.new"));
+        // The legacy file bytes were read into, and cleansed from, the bounded buffer.
+        EXPECT_TRUE(has_size(cleansed(legacy), 513));
+        // The migrated file is now current: it is served as is, not rotated again.
+        const auto again = nm::credentials(policy, false); ASSERT_TRUE(again);
+        EXPECT_TRUE(again.value().psk.view() == psk); EXPECT_EQ(again.value().ssid, ssid);
+    }
+}
+TEST_F(PskLifetime, MalformedCredentialFilesStayRefusedAndUntouched) {
+    const std::string ssid = "AA-0123456789abcdef\n";
+    const std::string hex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const std::vector<std::string> garbage{
+        "", "\n", ssid, ssid + hex64.substr(0, 62) + "\n", ssid + hex64 + "0\n",
+        ssid + hex64.substr(0, 63),                           // current length, no newline
+        ssid + hex64,                                          // legacy digits, no newline
+        ssid + hex64.substr(0, 62) + "A\n", ssid + hex64.substr(0, 63) + "g\n",
+        ssid + std::string(64, 'F') + "\n", ssid + hex64 + "\n\n", ssid + hex64.substr(0, 63) + "\r",
+        "BB-0123456789abcdef\n" + hex64 + "\n", "AA-0123456789ABCDEF\n" + hex64 + "\n",
+        "AA-0123456789abcde\n0" + hex64 + "\n", "AA-0123456789abcdef " + hex64 + "\n",
+        "AA-0123456789abcdef\n" + hex64.substr(0, 31) + " " + hex64.substr(0, 31) + "\n"};
+    const auto file = directory / "state/ap.credentials";
+    for (std::size_t index = 0; index < garbage.size(); ++index) {
+        for (const bool rotate : {false, true}) {
+            std::filesystem::remove(file);
+            { std::ofstream out{file, std::ios::binary}; out << garbage[index]; }
+            ASSERT_EQ(::chmod(file.c_str(), 0600), 0);
+            const auto refused = nm::credentials(policy, rotate);
+            ASSERT_FALSE(refused) << index << " " << rotate;
+            EXPECT_EQ(refused.error().code(), ErrorCode::config_invalid) << index;
+            EXPECT_TRUE(file_text(file) == garbage[index]) << index << " was rewritten";
+            EXPECT_FALSE(std::filesystem::exists(directory / "state/ap.credentials.new")) << index;
+        }
+    }
+}
+TEST_F(PskLifetime, FreshAndPersistedPassphrasesAre63LowercaseHex) {
+    static_assert(nm::Psk::kLength == 63);
+    for (int draw = 0; draw < 16; ++draw) {
+        const auto fresh = nm::fresh_credentials(); ASSERT_TRUE(fresh);
+        EXPECT_TRUE(hex_passphrase(fresh.value().psk.view()));
+        EXPECT_EQ(fresh.value().psk.c_str()[nm::Psk::kLength], '\0');
+    }
+    const auto created = nm::credentials(policy, false); ASSERT_TRUE(created);
+    EXPECT_TRUE(hex_passphrase(created.value().psk.view()));
+    EXPECT_EQ(file_text(directory / "state/ap.credentials").size(), 84U);
 }
 TEST_F(PskLifetime, PskVariantIsReadInPlaceAndCleansedOnLastRelease) {
     nm::Psk psk;
+    static_assert(sentinel.size() == nm::Psk::kLength);
     std::memcpy(psk.digits().data(), sentinel.data(), nm::Psk::kLength);
     GVariant* value = g_variant_ref_sink(nm::psk_variant(psk));
     ASSERT_TRUE(g_variant_is_of_type(value, G_VARIANT_TYPE_STRING));

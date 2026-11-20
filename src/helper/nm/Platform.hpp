@@ -19,13 +19,21 @@ struct Policy final {
     std::uint32_t owner{};
     std::uint32_t channel{36};
 };
-// #89 L9: the WPA2 PSK (64 lowercase hex digits + NUL) lives in one fixed
-// in-object buffer, written in place and cleansed on destruction. It is never
-// built in, or copied through, a growable std::string. Copies are bounded
-// value copies that each cleanse themselves.
+// The AP's WPA2-Personal secret: a passphrase of 63 lowercase hex characters
+// (252 bits). It is the same text that NetworkManager's `psk` setting and the
+// phone's WifiInfoResponse.password carry. A passphrase must be 8-63 ASCII
+// characters: phones reject anything else, and NetworkManager/hostapd take a
+// 64-hex `psk` as a raw 256-bit PMK instead, which PBKDF2 of the same text on
+// the phone would never match. 63 is the longest valid passphrase and can never
+// be mistaken for a raw PSK.
+// #89 L9: it lives in one fixed in-object buffer (digits + NUL), written in
+// place and cleansed on destruction. It is never built in, or copied through, a
+// growable std::string. Copies are bounded value copies that each cleanse
+// themselves.
 class Psk final {
 public:
-    static constexpr std::size_t kLength = 64;
+    static constexpr std::size_t kLength = 63;
+    static_assert(kLength >= kWpa2PassphraseMin && kLength <= kWpa2PassphraseMax);
     Psk() noexcept = default;
     Psk(const Psk& other) noexcept : bytes_(other.bytes_) {}
     Psk& operator=(const Psk& other) noexcept { bytes_ = other.bytes_; return *this; }
@@ -43,7 +51,7 @@ core::Result<Policy> load_policy(const std::string& directory, std::uint32_t own
 core::Result<Credentials> credentials(const Policy& policy, bool rotate);
 // Per-activation credentials, never written to disk.
 core::Result<Credentials> fresh_credentials();
-// The PSK as a floating D-Bus string GVariant backed by one private 65-byte
+// The PSK as a floating D-Bus string GVariant backed by one private 64-byte
 // buffer that GLib reads in place (never copies) and that is cleansed when the
 // last reference is released, instead of g_variant_new_string's unwiped
 // g_strdup (#89 L9).

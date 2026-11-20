@@ -66,7 +66,25 @@ template<std::size_t N> struct SecretBuffer final {
 bool hex(std::string_view value, std::size_t size) {
     return value.size() == size && value.find_first_not_of("0123456789abcdef") == std::string_view::npos;
 }
-// A fresh SSID ("AA-" + 16 hex) and PSK, the PSK drawn straight into its buffer.
+// `ap.credentials` is "AA-<16 hex>\n<63 hex passphrase>\n". The legacy format
+// carried 64 hex digits, which NetworkManager takes as a raw PMK and phones
+// refuse as a passphrase; such a file is stale and rotated, never served.
+constexpr std::size_t kSsidLine = 20;
+constexpr std::size_t kFileSize = kSsidLine + Psk::kLength + 1;
+constexpr std::size_t kLegacyPskLength = 64;
+constexpr std::size_t kLegacyFileSize = kSsidLine + kLegacyPskLength + 1;
+static_assert(kFileSize != kLegacyFileSize);
+enum class Stored { current, legacy, invalid };
+Stored classify(std::string_view text) {
+    // The newline check also proves the text is non-empty for back().
+    if (text.find('\n') != kSsidLine - 1 || !text.starts_with("AA-") || !hex(text.substr(3, 16), 16) ||
+        text.back() != '\n') return Stored::invalid;
+    if (text.size() == kFileSize && hex(text.substr(kSsidLine, Psk::kLength), Psk::kLength)) return Stored::current;
+    if (text.size() == kLegacyFileSize && hex(text.substr(kSsidLine, kLegacyPskLength), kLegacyPskLength))
+        return Stored::legacy;
+    return Stored::invalid;
+}
+// A fresh SSID ("AA-" + 16 hex) and passphrase, drawn straight into its buffer.
 core::Result<Credentials> generate() {
     Credentials result;
     std::array<char, 16> ssid{};
@@ -114,25 +132,26 @@ core::Result<Credentials> credentials(const Policy& policy, bool rotate) {
         const auto size = read_into(dir.value, "ap.credentials", policy.owner, saved.bytes);
         if (!size) return size.error();
         const std::string_view text{saved.bytes.data(), size.value()};
-        if (text.size() != 85 || text.find('\n') != 19 || !text.starts_with("AA-") ||
-            !hex(text.substr(3, 16), 16) || !hex(text.substr(20, 64), 64) || text.back() != '\n')
-            return Error{ErrorCode::config_invalid};
-        if (!rotate) {
+        const auto stored = classify(text);
+        if (stored == Stored::invalid) return Error{ErrorCode::config_invalid};
+        // A legacy 64-hex file falls through to the rotation below: failing
+        // closed on it would strand every device provisioned before the fix.
+        if (stored == Stored::current && !rotate) {
             Credentials result;
-            result.ssid = std::string{text.substr(0, 19)};
-            std::memcpy(result.psk.digits().data(), text.data() + 20, Psk::kLength);
+            result.ssid = std::string{text.substr(0, kSsidLine - 1)};
+            std::memcpy(result.psk.digits().data(), text.data() + kSsidLine, Psk::kLength);
             return result;
         }
     } else if (errno != ENOENT) return Error{ErrorCode::config_invalid};
     auto generated = generate();
     if (!generated) return generated.error();
     const auto& result = generated.value();
-    // "AA-<16 hex>\n<64 hex>\n", composed in place: never a std::string.
-    SecretBuffer<85> data;
-    std::memcpy(data.bytes.data(), result.ssid.data(), 19);
-    data.bytes[19] = '\n';
-    std::memcpy(data.bytes.data() + 20, result.psk.c_str(), Psk::kLength);
-    data.bytes[84] = '\n';
+    // "AA-<16 hex>\n<63 hex>\n", composed in place: never a std::string.
+    SecretBuffer<kFileSize> data;
+    std::memcpy(data.bytes.data(), result.ssid.data(), kSsidLine - 1);
+    data.bytes[kSsidLine - 1] = '\n';
+    std::memcpy(data.bytes.data() + kSsidLine, result.psk.c_str(), Psk::kLength);
+    data.bytes[kFileSize - 1] = '\n';
     // Exclusive staging rejects symlinks and stale/foreign files; no truncation of arbitrary paths.
     Fd output{::openat(dir.value, "ap.credentials.new", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600)};
     if (output.value < 0) return Error{ErrorCode::config_invalid};

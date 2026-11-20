@@ -16,17 +16,17 @@ struct SecretDiagnostics final : diagnostics::DiagnosticSink {
 class SecretDaemon : public NmDaemon {
 protected:
     static constexpr std::string_view password =
-        "f17a37c0de5ec0de0123456789abcdef00112233445566778899aabbccddeeff";
+        "f17a37c0de5ec0de0123456789abcdef00112233445566778899aabbccddeef";
     std::string sentinel;
     void SetUp() override {
         NmDaemon::SetUp();
         ASSERT_FALSE(HasFatalFailure());
         sentinel = std::string{password};
-        ASSERT_EQ(sentinel.size(), 64U);
+        ASSERT_EQ(sentinel.size(), Psk::kLength);
         save(directory / "state/ap.credentials", "AA-0123456789abcdef\n" + sentinel + "\n");
         struct stat metadata{};
         ASSERT_EQ(::stat((directory / "state/ap.credentials").c_str(), &metadata), 0);
-        ASSERT_EQ(metadata.st_size, 85); ASSERT_EQ(metadata.st_mode & 0777, 0600U);
+        ASSERT_EQ(metadata.st_size, 84); ASSERT_EQ(metadata.st_mode & 0777, 0600U);
     }
     void start() {
         const std::vector<std::string> args{std::string{AA_HELPER_BUILD} + "/aa-system-helper",
@@ -49,7 +49,7 @@ protected:
     // Every activation generates a fresh PSK; scan for the one NM actually got.
     void adopt_activation_secret() {
         const std::lock_guard lock{nm->mutex};
-        ASSERT_EQ(nm->seen_psk.size(), 64U);
+        ASSERT_EQ(nm->seen_psk.size(), Psk::kLength);
         EXPECT_NE(nm->seen_psk, password) << "activation reused the provisioned PSK";
         sentinel = nm->seen_psk;
     }

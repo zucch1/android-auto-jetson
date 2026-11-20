@@ -3,6 +3,7 @@
 #include <aa/helper/Identity.hpp>
 #include <functional>
 #include <chrono>
+#include <cstddef>
 #include <string_view>
 
 namespace aa::helper {
@@ -13,6 +14,11 @@ struct SnapshotDeadline final {
     bool expired() const { return now() >= until; }
 };
 void wipe(std::string& value) noexcept;
+// A WPA2-Personal passphrase is 8 to 63 ASCII characters (IEEE 802.11i). A
+// 64-character all-hex value is read by NetworkManager/hostapd as a raw PMK, and any
+// value over 63 characters is refused by phones as a passphrase.
+inline constexpr std::size_t kWpa2PassphraseMin = 8;
+inline constexpr std::size_t kWpa2PassphraseMax = 63;
 struct ApSnapshot final {
     std::string ssid, bssid, ip, password;
     std::uint32_t port{};
