@@ -66,11 +66,12 @@ const char* message_name(std::uint16_t id) {
 }
 struct Bootstrap::SocketExpiry final {
     int socket;
+    SnapshotDeadline deadline;
     std::mutex mutex;
     std::condition_variable changed;
     std::jthread worker;
-    SocketExpiry(int fd, SnapshotDeadline deadline) : socket(::fcntl(fd, F_DUPFD_CLOEXEC, 0)),
-        worker([this, deadline = std::move(deadline)](const std::stop_token& stop) {
+    SocketExpiry(int fd, SnapshotDeadline until) : socket(::fcntl(fd, F_DUPFD_CLOEXEC, 0)), deadline(std::move(until)),
+        worker([this](const std::stop_token& stop) {
             std::unique_lock lock{mutex};
             while (!stop.stop_requested()) {
                 if (deadline.expired()) { if (socket >= 0) (void)::shutdown(socket, SHUT_RDWR); return; }
@@ -78,6 +79,8 @@ struct Bootstrap::SocketExpiry final {
             }
         }) {}
     ~SocketExpiry() { worker.request_stop(); changed.notify_all(); worker.join(); if (socket >= 0) ::close(socket); }
+    // The join budget moves the one deadline later, once; the worker sees it on its next wake.
+    void extend(Time until) { const std::lock_guard lock{mutex}; deadline.until = until; changed.notify_all(); }
 };
 Bootstrap::Bootstrap(int fd, Time accepted, std::function<Time()> now)
     : fd_(fd), deadline_{accepted + kBudget, std::move(now)}, expiry_(std::make_unique<SocketExpiry>(fd, deadline_)) {
@@ -132,6 +135,14 @@ void Bootstrap::fail(HandoffFailure reason, std::optional<std::uint16_t> id, std
     deny(reason);
 }
 void Bootstrap::confirm() { if (complete()) confirmed_ = true; }
+// One secret-free diagnostic line for a tolerated record (#170): never the payload.
+void Bootstrap::note(const char* event, std::uint16_t id, std::string_view detail) const {
+    std::string line{"system-helper: wireless_handshake_"};
+    line += event; line += " phase="; line += phase();
+    line += " msg_id="; line += std::to_string(id); line += " msg="; line += message_name(id);
+    line += " detail=\""; line += detail; line += "\"\n";
+    std::cerr << line << std::flush;
+}
 bool Bootstrap::queue(std::uint16_t id, const std::string& payload) {
     auto bytes = encode_aaw(id, {reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()});
     if (!bytes) { fail(HandoffFailure::oversize, id, "outgoing record too large"); return false; }
@@ -176,29 +187,64 @@ bool Bootstrap::flush(const SnapshotFence& fence) {
     if (n == 0) { fail(HandoffFailure::write, std::nullopt, "socket send wrote nothing"); return false; }
     sent_ += static_cast<std::size_t>(n);
     if (sent_ != output_.size()) return false;
-    wipe_bytes(output_); return true;
+    wipe_bytes(output_);
+    // Credentials are out: give the phone its Wi-Fi join, once, if the first budget still holds.
+    if (stage_ == Stage::start && !joining_) {
+        joining_ = true;
+        if (deadline_.expired()) { fail(HandoffFailure::timeout, std::nullopt, "handshake deadline passed"); return false; }
+        deadline_.until = deadline_.now() + kJoinBudget;
+        if (expiry_) expiry_->extend(deadline_.until);
+    }
+    return true;
+}
+// The only record that carries the AP secret; a re-send is byte-identical (same pinned snapshot).
+bool Bootstrap::queue_info() {
+    aaw::WifiInfoResponse response;
+    response.set_ssid(snapshot_.ssid); response.set_password(snapshot_.password); response.set_bssid(snapshot_.bssid);
+    response.set_security_mode(aaw::WPA2_PERSONAL); response.set_access_point_type(aaw::DYNAMIC);
+    auto payload = response.SerializeAsString();
+    const auto queued = queue(3, payload); wipe(payload); wipe(*response.mutable_password());
+    return queued;
 }
 void Bootstrap::record(const AawRecord& record) {
     const auto id = record.id;
+    // Tolerated like the references (#170 review): the dongles read the phone's records without
+    // validating them (WirelessAndroidAutoDongle bluetoothProfiles.cpp:63-64; aa-proxy-rs only
+    // warns on an unexpected ID, bluetooth.rs:4724-4729, and its MITM path absorbs pings,
+    // :1044-1067). Pings (8/9), SetupInfo (11) and unknown IDs are ignored, bounded.
+    if (id == 8 || id == 9 || id == 11 || id == 0 || id > 11) {
+        if (++ignored_ > kIgnoredLimit) { fail(HandoffFailure::unknown_id, id, "too many ignored records"); return; }
+        note("ignored", id, "not handled by the head unit");
+        return;
+    }
+    if (id == 10) { fail(HandoffFailure::phone_rejected, id, "phone sent WifiConnectionRejection"); return; }
+    if (id == 2 && seen_info_ && (stage_ == Stage::start || stage_ == Stage::connect)) {
+        // A repeated WifiInfoRequest gets the identical response again, bounded (aa-proxy-rs
+        // re-sends its cached WifiInfoResponse, bluetooth.rs:1069-1086).
+        aaw::WifiInfoRequest request;
+        if (!parse(request, record)) { fail(HandoffFailure::protobuf, id, "payload did not parse"); return; }
+        if (++info_resends_ > kInfoResendLimit) { fail(HandoffFailure::duplicate, id, "WifiInfoRequest repeated too often"); return; }
+        if (queue_info()) note("resent", 3, "repeated WifiInfoRequest");
+        return;
+    }
     if ((id == 2 && seen_info_) || (id == 7 && seen_start_)) { fail(HandoffFailure::duplicate, id, "message repeated"); return; }
     if (stage_ == Stage::info && id == 2) {
         // aa-proxy-rs bluetooth.rs:6301-6314; WirelessAndroidAutoDongle bluetoothProfiles.cpp:46-61.
         aaw::WifiInfoRequest request;
         if (!parse(request, record)) { fail(HandoffFailure::protobuf, id, "payload did not parse"); return; }
-        aaw::WifiInfoResponse response;
-        response.set_ssid(snapshot_.ssid); response.set_password(snapshot_.password); response.set_bssid(snapshot_.bssid);
-        response.set_security_mode(aaw::WPA2_PERSONAL); response.set_access_point_type(aaw::DYNAMIC);
-        auto payload = response.SerializeAsString();
-        const auto queued = queue(3, payload); wipe(payload); wipe(*response.mutable_password());
-        if (!queued) return;
+        if (!queue_info()) return;
         seen_info_ = true; stage_ = Stage::start;
     } else if (stage_ == Stage::start && id == 7) {
-        // aa-proxy-rs bluetooth.rs:6317, status tag 3 at 919-923.
+        // aa-proxy-rs bluetooth.rs:6317 reads it without checking the status (tag 3, :919-923), and
+        // OAA maps 1 to success (WifiVersionStatusEnum.proto:18-31). Only a negative value, which
+        // every source treats as a failure, is one here; an absent status is accepted.
         aaw::WifiStartResponse response;
         if (!parse(response, record)) { fail(HandoffFailure::protobuf, id, "payload did not parse (status is field 3)"); return; }
-        if (response.status() != aaw::STATUS_SUCCESS) {
+        if (response.has_status() && response.status() < 0) {
             fail(HandoffFailure::phone_rejected, id, "phone status " + std::to_string(response.status())); return;
         }
+        if (!response.has_status()) note("accepted", id, "no status");
+        else if (response.status() != aaw::STATUS_SUCCESS) note("accepted", id, "status " + std::to_string(response.status()));
         seen_start_ = true; stage_ = Stage::connect;
     } else if (stage_ == Stage::connect && id == 6) {
         // aa-proxy-rs bluetooth.rs:6320, success [08 00] at 4746-4754, status tag 1 at 914-917.
@@ -218,10 +264,11 @@ void Bootstrap::tick(Time now, const SnapshotProvider& provider, const SnapshotF
     if (fd_ < 0 || stage_ == Stage::complete) return;
     if (now >= deadline_.until || expire()) { fail(HandoffFailure::timeout, std::nullopt, "handshake deadline passed"); return; }
     if (stage_ == Stage::authorization) {
+        // Early phone bytes stay queued and are judged by the same rules after the start request.
         std::uint8_t byte{};
         const auto n = ::recv(fd_, &byte, 1, MSG_DONTWAIT | MSG_PEEK);
-        if (n > 0) fail(HandoffFailure::wrong_order, std::nullopt, "phone sent data before the HU start request");
-        else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) fail(HandoffFailure::eof, std::nullopt, "socket closed before authorization");
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+            fail(HandoffFailure::eof, std::nullopt, "socket closed before authorization");
         return;
     }
     if (!output_.empty()) {
@@ -256,15 +303,10 @@ bool Bootstrap::drain(const SnapshotProvider& provider, const SnapshotFence& fen
         if (single_step && !output_.empty()) return false;
         if (!output_.empty() && (!verify(provider) || !flush(fence))) return false;
         if (stage_ == Stage::finishing) {
-            if (!std::holds_alternative<std::monostate>(decoder_.next())) { fail(HandoffFailure::duplicate, std::nullopt, "record after WifiConnectStatus"); return false; }
-            if (const auto error = decoder_.finish()) { fail(decode_error(*error), decoder_.pending_id(), "trailing bytes after WifiConnectStatus"); return false; }
+            // A successful WifiConnectStatus ends the exchange. Anything the phone sends after it is
+            // never read (#170 review: the dongles stop reading there too), but the deadline holds.
             expiry_.reset();
-            std::uint8_t byte{};
-            const auto n = ::recv(fd_, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
-            const auto error = errno;
             if (expire()) return false;
-            if (n > 0) { fail(HandoffFailure::truncated, std::nullopt, "trailing bytes after WifiConnectStatus"); return false; }
-            if (n < 0 && error != EAGAIN && error != EWOULDBLOCK) { fail(HandoffFailure::eof, std::nullopt, "socket failed after WifiConnectStatus"); return false; }
             // Keep the socket until the hand-off is confirmed or aborted (see Bootstrap.hpp).
             confirm_until_ = deadline_.now() + kConfirmBudget;
             stage_ = Stage::complete;

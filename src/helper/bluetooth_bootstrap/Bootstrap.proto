@@ -28,9 +28,11 @@ enum SecurityMode {
   WPA_WPA2_ENTERPRISE = 28;
 }
 enum AccessPointType { STATIC = 0; DYNAMIC = 1; }
-// Wire values of WifiStartResponse.status and WifiConnectStatus.status. Success is 0:
-// aa-proxy-rs bluetooth.rs:4746-4754 records [08 00] as a good phone WifiConnectStatus and
-// [08 fd ff ff ff ff ff ff ff ff 01] (-3) as a Wi-Fi failure. Every failure is negative.
+// Wire values of WifiStartResponse.status and WifiConnectStatus.status. Every failure is
+// negative. WifiConnectStatus success is 0: aa-proxy-rs bluetooth.rs:4743-4753 treats a phone's
+// [08 00] as success and [08 fd ff ff ff ff ff ff ff ff 01] (-3) as a Wi-Fi failure. OAA instead
+// maps 1 to success and 0 to unsolicited (WifiVersionStatusEnum.proto:18-31, unverified), which is
+// why WifiStartResponse, which no reference checks, accepts any non-negative value.
 // Status fields are int32 so an unlisted value still parses and is reported by number.
 enum Status {
   STATUS_SUCCESS = 0;
@@ -59,11 +61,12 @@ message WifiInfoResponse {
   required SecurityMode security_mode = 4;
   optional AccessPointType access_point_type = 5;
 }
-// ID 7, phone -> HU.
+// ID 7, phone -> HU. Status optional (OAA WifiStartResponseMessage.proto:20-24); only a
+// negative value fails (no reference checks it; OAA maps 1 to success).
 message WifiStartResponse {
   optional string ip_address = 1;
   optional uint32 port = 2;
-  required int32 status = 3;
+  optional int32 status = 3;
 }
 // ID 6, phone -> HU, the last record.
 message WifiConnectStatus { required int32 status = 1; optional string error_message = 2; }

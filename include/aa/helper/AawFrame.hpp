@@ -21,7 +21,8 @@ std::optional<std::vector<std::uint8_t>> encode_aaw(
 class AawDecoder {
 public:
     void feed(std::span<const std::uint8_t> bytes);
-    // monostate means no complete record is available (including drained EOF).
+    // monostate means no complete record is available (including drained EOF). Records of any
+    // message ID are returned; only an oversize length is a decode error.
     AawDecodeResult next();
     // Ends input and validates all queued records without consuming them.
     // Any failure is sticky; feed() after finish() is ignored.

@@ -4,8 +4,10 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
+#include <regex>
 #include <functional>
 #include <string_view>
+#include <thread>
 #include <atomic>
 #include <future>
 #include <poll.h>
@@ -66,9 +68,16 @@ protected:
     std::string failure_log(const std::function<void()>& action) {
         ::testing::internal::CaptureStderr(); action(); return ::testing::internal::GetCapturedStderr();
     }
+    // No SSID, PSK, BSSID, IP, port or any MAC-shaped address (phone or adapter) in a log line.
     void expect_secret_free(const std::string& log) {
-        for (const auto& secret : {snapshot.ssid, snapshot.password, snapshot.bssid, snapshot.ip})
+        for (const auto& secret : {snapshot.ssid, snapshot.password, snapshot.bssid, snapshot.ip, std::to_string(snapshot.port)})
             EXPECT_EQ(log.find(secret), std::string::npos) << log;
+        EXPECT_FALSE(std::regex_search(log, std::regex{"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}"})) << log;
+    }
+    void info() { raw(std::string_view{"\x00\x00\x00\x02", 4}); tick(); ASSERT_EQ(read(), info_response()); }
+    std::size_t lines(const std::string& log, std::string_view needle) {
+        std::size_t count{}; for (auto at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1)) ++count;
+        return count;
     }
 };
 TEST(AawPayload, SecurityAndAccessPointBytesAreNotProjectionEnum) {
@@ -105,8 +114,9 @@ TEST_F(BootstrapTest, StartFirstExchangeIsByteExactAndCompletes) {
     expect_secret_free(log);
     EXPECT_TRUE(read().empty()); EXPECT_FALSE(bootstrap->live()); EXPECT_TRUE(bootstrap->awaiting_confirmation());
 }
-TEST_F(BootstrapTest, PhoneStatusFixturesDecodeInTheRealLayout) {
-    // WifiStartResponse=7 {1: ip, 2: port, 3: 0} and WifiConnectStatus=6 {1: 0, 2: ""} as a phone may send them.
+TEST_F(BootstrapTest, PhoneStatusFixturesWithEveryFieldDecode) {
+    // Synthetic fixtures built from the cited layouts (no phone capture exists):
+    // WifiStartResponse=7 {1: ip, 2: port, 3: 0} and WifiConnectStatus=6 {1: 0, 2: ""}.
     start(); raw(std::string_view{"\x00\x00\x00\x02", 4}); tick(); ASSERT_EQ(read(), info_response());
     raw(std::string_view{"\x00\x10\x00\x07" "\x0a\x09" "10.42.0.1" "\x10\x9d\x29" "\x18\x00", 20});
     raw(std::string_view{"\x00\x04\x00\x06" "\x08\x00" "\x12\x00", 8}); tick();
@@ -123,13 +133,6 @@ TEST_F(BootstrapTest, NegativeConnectStatusIsReportedByNumber) {
         std::string::npos) << log;
     expect_secret_free(log);
 }
-TEST_F(BootstrapTest, OldShiftedStartResponseIsRejected) {
-    // The pre-#166 "modern" layout put WifiStartResponse status at tag 4 (value 12); tag 3 is then missing.
-    start(); raw(std::string_view{"\x00\x00\x00\x02", 4}); tick(); read();
-    const auto log = failure_log([&] { raw(std::string_view{"\x00\x02\x00\x07\x20\x0c", 6}); tick(); });
-    EXPECT_EQ(bootstrap->failure(), HandoffFailure::protobuf); EXPECT_FALSE(bootstrap->live());
-    EXPECT_NE(log.find("phase=await_start_response msg_id=7 msg=WifiStartResponse reason=protobuf"), std::string::npos) << log;
-}
 TEST_F(BootstrapTest, OldShiftedConnectStatusIsRejected) {
     // The pre-#166 layout put WifiConnectStatus status at tag 2 (varint 12); tag 2 is the string error message.
     start(); raw(std::string_view{"\x00\x00\x00\x02", 4}); tick(); read();
@@ -144,15 +147,6 @@ TEST_F(BootstrapTest, VersionResponseIsUnexpectedAndReleasesNoSecret) {
     EXPECT_NE(log.find("phase=await_info_request msg_id=5 msg=WifiVersionResponse reason=wrong_order"), std::string::npos) << log;
     expect_secret_free(log);
 }
-TEST_F(BootstrapTest, UnknownMessageLogsReasonAndDenies) {
-    start();
-    const auto log = failure_log([&] { raw(std::string_view{"\x00\x00\x00\x63", 4}); tick(); });
-    EXPECT_EQ(bootstrap->failure(), HandoffFailure::unknown_id); EXPECT_FALSE(bootstrap->live());
-    EXPECT_NE(log.find("system-helper: wireless_handshake_failed phase=await_info_request msg_id=99 msg=unknown reason=unknown_id"),
-        std::string::npos) << log;
-    EXPECT_EQ(std::count(log.begin(), log.end(), '\n'), 1) << log;
-    char byte{}; EXPECT_EQ(::read(sockets[1], &byte, 1), 0);
-}
 TEST_F(BootstrapTest, GarbledMessageLogsReasonAndDenies) {
     start();
     const auto log = failure_log([&] { raw(std::string_view{"\x00\x01\x00\x02\x80", 5}); tick(); });
@@ -161,6 +155,113 @@ TEST_F(BootstrapTest, GarbledMessageLogsReasonAndDenies) {
         std::string::npos) << log;
     expect_secret_free(log);
     char byte{}; EXPECT_EQ(::read(sockets[1], &byte, 1), 0);
+}
+TEST_F(BootstrapTest, OldShiftedStatusesAreRejectedAtConnectStatus) {
+    // The pre-#166 layout put WifiStartResponse status at tag 4 (12) and WifiConnectStatus status at
+    // tag 2 (varint 12). The first now reads as "no status" (tolerated); the second cannot parse.
+    start(); info();
+    const auto log = failure_log([&] {
+        raw(std::string_view{"\x00\x02\x00\x07\x20\x0c", 6}); tick();
+        EXPECT_TRUE(bootstrap->live());
+        raw(std::string_view{"\x00\x02\x00\x06\x10\x0c", 6}); tick();
+    });
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::protobuf); EXPECT_FALSE(bootstrap->complete());
+    EXPECT_NE(log.find("wireless_handshake_accepted phase=await_start_response msg_id=7 msg=WifiStartResponse detail=\"no status\""),
+        std::string::npos) << log;
+    EXPECT_NE(log.find("phase=await_connect_status msg_id=6 msg=WifiConnectStatus reason=protobuf"), std::string::npos) << log;
+    expect_secret_free(log);
+}
+TEST_F(BootstrapTest, StartResponseStatusOneIsAccepted) {
+    // OAA maps 1 to success (WifiVersionStatusEnum.proto:18-31); no reference fails on it.
+    start(); info();
+    const auto log = failure_log([&] { raw(std::string_view{"\x00\x02\x00\x07\x18\x01" "\x00\x02\x00\x06\x08\x00", 12}); tick(); });
+    EXPECT_TRUE(bootstrap->complete()) << log; EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
+    EXPECT_NE(log.find("msg_id=7 msg=WifiStartResponse detail=\"status 1\""), std::string::npos) << log;
+}
+TEST_F(BootstrapTest, StartResponseWithoutStatusIsAccepted) {
+    start(); info();
+    raw(std::string_view{"\x00\x00\x00\x07" "\x00\x02\x00\x06\x08\x00", 10}); tick();
+    EXPECT_TRUE(bootstrap->complete()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
+}
+TEST_F(BootstrapTest, ConnectStatusMustCarryItsStatus) {
+    // aa-proxy-rs reads a phone's [08 00] as success (bluetooth.rs:4743-4753): stay strict here.
+    start(); info(); raw(std::string_view{"\x00\x00\x00\x07", 4}); tick(); EXPECT_TRUE(bootstrap->live());
+    raw(std::string_view{"\x00\x00\x00\x06", 4}); tick(); EXPECT_EQ(bootstrap->failure(), HandoffFailure::protobuf);
+}
+TEST_F(BootstrapTest, ConnectStatusOneIsRejected) {
+    start(); info(); raw(std::string_view{"\x00\x02\x00\x07\x18\x00" "\x00\x02\x00\x06\x08\x01", 12}); tick();
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::phone_rejected); EXPECT_FALSE(bootstrap->complete());
+}
+TEST_F(BootstrapTest, PingsSetupInfoAndUnknownIdsAreIgnoredWithOneLineEach) {
+    // Given: the phone interleaves a ping, a ping response, a SetupInfo and an unknown ID.
+    start();
+    const auto log = failure_log([&] {
+        raw(std::string_view{"\x00\x02\x00\x08\x08\x01" "\x00\x00\x00\x09" "\x00\x00\x00\x0b" "\x00\x00\x00\x63" "\x00\x00\x00\x02", 22});
+        tick();
+        EXPECT_EQ(read(), info_response());
+        // A ping during the Wi-Fi join, before the statuses.
+        raw(std::string_view{"\x00\x02\x00\x07\x18\x00" "\x00\x02\x00\x08\x08\x02" "\x00\x02\x00\x06\x08\x00", 18}); tick();
+    });
+    // Then: each is one diagnostic line with its ID only, the exchange completes, nothing else is sent.
+    EXPECT_TRUE(bootstrap->complete()) << log; EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
+    EXPECT_EQ(lines(log, "system-helper: wireless_handshake_ignored "), 5U) << log;
+    for (const auto* id : {"msg_id=8 msg=WifiPingRequest", "msg_id=9 msg=WifiPingResponse", "msg_id=11 msg=WifiSetupInfo", "msg_id=99 msg=unknown"})
+        EXPECT_NE(log.find(id), std::string::npos) << id << '\n' << log;
+    EXPECT_EQ(lines(log, "wireless_handshake_failed"), 0U) << log;
+    expect_secret_free(log); EXPECT_TRUE(read().empty());
+}
+TEST_F(BootstrapTest, EarlyPhonePingIsJudgedAfterTheStartRequest) {
+    // Bytes before authorization stay queued; they are not a failure (the dongles never check).
+    raw(std::string_view{"\x00\x00\x00\x08", 4}); tick();
+    EXPECT_TRUE(bootstrap->live()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
+    start(); EXPECT_TRUE(bootstrap->live()); info(); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
+}
+TEST_F(BootstrapTest, IgnoredRecordsAreBoundedAndThenLogAReasonAndDeny) {
+    start();
+    std::string wire;
+    for (unsigned ping = 0; ping <= Bootstrap::kIgnoredLimit; ++ping) wire.append("\x00\x00\x00\x63", 4);
+    const auto log = failure_log([&] { raw(wire); tick(); });
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::unknown_id); EXPECT_TRUE(read().empty());
+    EXPECT_EQ(lines(log, "wireless_handshake_ignored"), Bootstrap::kIgnoredLimit) << log;
+    EXPECT_NE(log.find("system-helper: wireless_handshake_failed phase=await_info_request msg_id=99 msg=unknown reason=unknown_id"
+        " detail=\"too many ignored records\""), std::string::npos) << log;
+    expect_secret_free(log);
+    char byte{}; EXPECT_EQ(::read(sockets[1], &byte, 1), 0);
+}
+TEST_F(BootstrapTest, RepeatedInfoRequestGetsTheIdenticalResponseBounded) {
+    // aa-proxy-rs re-sends its cached WifiInfoResponse (bluetooth.rs:1069-1086).
+    start(); info();
+    std::string log = failure_log([&] {
+        raw(std::string_view{"\x00\x00\x00\x02", 4}); tick(); EXPECT_EQ(read(), info_response());
+        // Also once the phone has answered the start (waiting for its Wi-Fi join).
+        raw(std::string_view{"\x00\x02\x00\x07\x18\x00" "\x00\x00\x00\x02", 10}); tick(); EXPECT_EQ(read(), info_response());
+    });
+    EXPECT_TRUE(bootstrap->live()) << log;
+    EXPECT_EQ(lines(log, "system-helper: wireless_handshake_resent phase="), Bootstrap::kInfoResendLimit) << log;
+    expect_secret_free(log);
+    log = failure_log([&] { raw(std::string_view{"\x00\x00\x00\x02", 4}); tick(); });
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::duplicate); EXPECT_TRUE(read().empty());
+    EXPECT_NE(log.find("msg_id=2 msg=WifiInfoRequest reason=duplicate"), std::string::npos) << log;
+}
+TEST_F(BootstrapTest, RecordsAfterSuccessfulConnectStatusAreIgnored) {
+    // A full record and a partial header coalesced after success: the exchange is still complete.
+    start(); info();
+    raw(std::string_view{"\x00\x02\x00\x07\x18\x00" "\x00\x02\x00\x06\x08\x00" "\x00\x02\x00\x08\x08\x01" "\x00", 19}); tick();
+    EXPECT_TRUE(bootstrap->complete()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
+    EXPECT_TRUE(read().empty());
+}
+TEST_F(BootstrapTest, ConnectionRejectionFailsAsPhoneRejected) {
+    start(); info();
+    const auto log = failure_log([&] { raw(std::string_view{"\x00\x02\x00\x0a\x08\x01", 6}); tick(); });
+    EXPECT_EQ(bootstrap->failure(), HandoffFailure::phone_rejected);
+    EXPECT_NE(log.find("msg_id=10 msg=WifiConnectionRejection reason=phone_rejected"), std::string::npos) << log;
+    expect_secret_free(log);
+}
+TEST_F(BootstrapTest, UnknownIdHeaderIsIgnoredButOversizeFailsClosed) {
+    start(); const unsigned char header[]{0, 0, 0, 99}; ASSERT_EQ(::write(sockets[1], header, 4), 4);
+    tick(); EXPECT_TRUE(bootstrap->live()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
+    const unsigned char oversize[]{0x10, 1, 0, 99}; ASSERT_EQ(::write(sockets[1], oversize, 4), 4);
+    tick(); EXPECT_EQ(bootstrap->failure(), HandoffFailure::oversize);
 }
 TEST_F(BootstrapTest, DenyClosesWithoutPayload) {
     bootstrap->deny(HandoffFailure::denied); EXPECT_TRUE(read().empty());
@@ -195,17 +296,7 @@ TEST_F(BootstrapTest, BufferedStatusesDrainAfterCredentialBackpressure) {
     // Then: the already buffered statuses complete the exchange.
     EXPECT_TRUE(bootstrap->complete()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
 }
-TEST_F(BootstrapTest, SuccessfulStatusesWithPartialExtraHeaderFail) {
-    // Given: a credential response followed by two successful statuses and one extra byte.
-    start(); send(2); tick(); read();
-    const unsigned char bytes[]{0, 2, 0, 7, 0x18, 0, 0, 2, 0, 6, 8, 0, 0};
-    ASSERT_EQ(::write(sockets[1], bytes, sizeof(bytes)), static_cast<ssize_t>(sizeof(bytes)));
-    // When: all available input is processed.
-    tick();
-    // Then: partial framing is not success.
-    EXPECT_FALSE(bootstrap->complete()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::truncated);
-}
-TEST_F(BootstrapTest, QueuedTrailingByteAtReceiveBoundaryCannotCreateAuthority) {
+TEST_F(BootstrapTest, QueuedTrailingByteAtReceiveBoundaryIsIgnoredAfterSuccess) {
     // Given: successful statuses fill exactly one recv, with an extra byte already queued.
     start(); send(2); tick(); read();
     aaw::WifiConnectStatus connected; connected.set_status(aaw::STATUS_SUCCESS);
@@ -219,11 +310,11 @@ TEST_F(BootstrapTest, QueuedTrailingByteAtReceiveBoundaryCannotCreateAuthority) 
     ASSERT_EQ(::write(sockets[1], bytes.data(), bytes.size()), static_cast<ssize_t>(bytes.size()));
     // When: the first receive ends exactly after WifiConnectStatus.
     tick();
-    // Then: no completed authority exists, and this exchange cannot be reused.
-    EXPECT_FALSE(bootstrap->complete()); EXPECT_FALSE(bootstrap->live());
-    EXPECT_EQ(bootstrap->failure(), HandoffFailure::truncated);
-    EXPECT_TRUE(bootstrap->expire()); EXPECT_FALSE(bootstrap->authorize(snapshot, true, now));
-    tick(); EXPECT_FALSE(bootstrap->complete());
+    // Then: the exchange is complete; the queued byte is never read (#170 review), and a repeated
+    // tick or authorization changes nothing.
+    EXPECT_TRUE(bootstrap->complete()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
+    EXPECT_FALSE(bootstrap->expire()); EXPECT_TRUE(bootstrap->authorize(snapshot, true, now));
+    tick(); EXPECT_TRUE(bootstrap->complete()); EXPECT_TRUE(read().empty());
 }
 TEST_F(BootstrapTest, DeadlineCrossedDuringProcessingCannotCreateAuthority) {
     // Given: info and both statuses are buffered before the credential send crosses the deadline.
@@ -276,9 +367,6 @@ TEST_F(BootstrapTest, ConnectStatusRejectionIsNotSuccess) {
     aaw::WifiConnectStatus connected; connected.set_status(aaw::STATUS_WIFI_DISABLED); send(6, connected.SerializeAsString()); tick();
     EXPECT_EQ(bootstrap->failure(), HandoffFailure::phone_rejected); EXPECT_FALSE(bootstrap->complete());
 }
-TEST_F(BootstrapTest, TrailingRequiredStatusMustParse) {
-    start(); send(2); tick(); read(); send(7); tick(); EXPECT_EQ(bootstrap->failure(), HandoffFailure::protobuf);
-}
 TEST_F(BootstrapTest, WriteFailureClosesAndDoesNotRetry) {
     ASSERT_TRUE(bootstrap->authorize(snapshot, true, now)); ::shutdown(sockets[1], SHUT_RDWR); tick();
     EXPECT_EQ(bootstrap->failure(), HandoffFailure::write); EXPECT_FALSE(bootstrap->live());
@@ -301,10 +389,6 @@ TEST_F(BootstrapTest, WholeBudgetIncludesAuthorizationWait) {
 TEST_F(BootstrapTest, WrongOrderAndDuplicateNeverReleaseFurtherSecrets) {
     start(); send(7); tick(); EXPECT_EQ(bootstrap->failure(), HandoffFailure::wrong_order); EXPECT_TRUE(read().empty());
 }
-TEST_F(BootstrapTest, DuplicateInfoFailsAfterFirstResponse) {
-    start(); send(2); tick(); EXPECT_FALSE(read().empty()); send(2); tick();
-    EXPECT_EQ(bootstrap->failure(), HandoffFailure::duplicate); EXPECT_TRUE(read().empty());
-}
 TEST_F(BootstrapTest, ParseFailureHasNoPayloadDiagnostic) {
     start(); send(2, std::string("\x80", 1)); tick(); EXPECT_EQ(bootstrap->failure(), HandoffFailure::protobuf); EXPECT_TRUE(read().empty());
 }
@@ -324,10 +408,6 @@ TEST_F(BootstrapTest, EofAndTruncationAreDifferentTypedFailures) {
 }
 TEST_F(BootstrapTest, EofFailsWithoutCredentials) {
     start(); ::shutdown(sockets[1], SHUT_WR); tick(); EXPECT_EQ(bootstrap->failure(), HandoffFailure::eof);
-}
-TEST_F(BootstrapTest, UnknownAndOversizeHeadersFailClosed) {
-    start(); const unsigned char header[]{0, 0, 0, 99}; ASSERT_EQ(::write(sockets[1], header, 4), 4);
-    tick(); EXPECT_EQ(bootstrap->failure(), HandoffFailure::unknown_id);
 }
 TEST_F(BootstrapTest, OversizeFailsBeforeReadingPayload) {
     start(); const unsigned char header[]{0x10, 1, 0, 2}; ASSERT_EQ(::write(sockets[1], header, 4), 4);
@@ -427,4 +507,31 @@ TEST_F(BlueZHeldBootstrapTest, UnconfirmedCompletionBackstopShutsTheChannelDownK
     EXPECT_FALSE(bootstrap->awaiting_confirmation());
     EXPECT_EQ(bootstrap->failure(), HandoffFailure::none);
 }
+// #170 review: the phone's Wi-Fi join gets its own bound once the credentials are out.
+TEST_F(BlueZHeldBootstrapTest, WifiJoinGetsItsOwnBoundAfterCredentials) {
+    start(); send(2); tick(); ASSERT_EQ(read(), info_response());
+    const auto accepted = now;
+    EXPECT_EQ(bootstrap->deadline().until, accepted + Bootstrap::kJoinBudget);
+    // Past the 10 s first phase: still running, and the expiry worker did not cut the socket.
+    elapsed = 25'000; std::this_thread::sleep_for(20ms);
+    EXPECT_FALSE(bootstrap->expire()); EXPECT_TRUE(bootstrap->live()); EXPECT_FALSE(phone_eof());
+    aaw::WifiStartResponse started; started.set_status(aaw::STATUS_SUCCESS); send(7, started.SerializeAsString()); tick();
+    EXPECT_TRUE(bootstrap->live());
+    // The join bound is finite: at 30 s after the credentials the exchange fails and frees the phone.
+    elapsed = 30'000;
+    EXPECT_TRUE(bootstrap->expire()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::timeout);
+    EXPECT_TRUE(phone_eof());
+}
+TEST_F(BlueZHeldBootstrapTest, StallBeforeCredentialsStillEndsAtTheFirstBudget) {
+    start(); elapsed = 10'000;
+    EXPECT_TRUE(bootstrap->expire()); EXPECT_EQ(bootstrap->failure(), HandoffFailure::timeout); EXPECT_TRUE(phone_eof());
+}
+TEST_F(BlueZHeldBootstrapTest, JoinCompletesWellAfterTheFirstBudget) {
+    start(); send(2); tick(); read();
+    elapsed = 28'000;
+    aaw::WifiStartResponse started; started.set_status(aaw::STATUS_SUCCESS); send(7, started.SerializeAsString());
+    aaw::WifiConnectStatus connected; connected.set_status(aaw::STATUS_SUCCESS); send(6, connected.SerializeAsString());
+    tick(); EXPECT_TRUE(bootstrap->complete()); EXPECT_FALSE(phone_eof());
+}
+
 }
