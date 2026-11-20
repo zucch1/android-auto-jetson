@@ -51,6 +51,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aa_perf_schema  # noqa: E402
+import aa_transport as transport  # noqa: E402
 import aa_av_contract as av_contract  # noqa: E402
 from aa_moving_map import MAX_DRAG_GAP_S, MIN_DRAG_RATE_HZ, cleanup_gaps, max_drag_gap_s  # noqa: E402
 from aa_measurement_coverage import (
@@ -261,8 +262,10 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     budgets = BUDGETS if version3 else BUDGETS_V2
     evidence = parse_capture(capture)
     capture, numeric_errors = aa_perf_schema.finite_numbers(capture)
-    if capture.get("mode") != "wired":
-        raise ContractError(f"capture mode must be 'wired', got {capture.get('mode')!r}")
+    # Only v3 (moving-map soak) captures may be wireless; older ones are wired.
+    modes = ("wired", "wireless") if version3 else ("wired",)
+    if capture.get("mode") not in modes:
+        raise ContractError(f"capture mode must be one of {modes}, got {capture.get('mode')!r}")
 
     crashes = _as_int(capture.get("crashes"))
     if crashes is not None and crashes < 0:
@@ -469,6 +472,15 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
             # player running is never a PASS, and a non-PASS stops the chain
             # before the next stage. Named BLOCKED reasons (cleanup:*).
             unavailable.extend(cleanup_gaps(capture.get("workload")))
+            # A wireless stage must show the phone's USB in plain mtp (not AOA)
+            # before and after: otherwise it may have projected over the cable.
+            gap = wireless_link_gap(capture)
+            if gap is not None:
+                unavailable.append("run_evidence:" + gap)
+            # Rate-limited media telemetry (#163) loses A/V evidence: a named
+            # gap, so a coverage miss is not read as a product failure alone.
+            if capture.get("mode") == "wireless" and capture.get("media_telemetry_dropped"):
+                unavailable.append("run_evidence:media_telemetry_dropped")
             # A build on the target during the stage contends for CPU and memory:
             # the stage measured something else than the quiet host it claims.
             # Interference, not a product FAIL: it BLOCKS a stage that would
@@ -563,7 +575,7 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         "schema": RESULT_FOR_CAPTURE[capture["schema"]],
         "task": TASK,
         "generated_at_utc": now,
-        "mode": "wired",
+        "mode": capture["mode"],
         "duration_requested": duration_requested,
         "duration_seconds": duration_seconds,
         "measurement_origin": origin,
@@ -590,6 +602,11 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
     if version3:
         result["av_contract"] = av_block
         result["workload"] = _workload_record(capture.get("workload"), window)
+        if capture["mode"] == "wireless":
+            result["link"] = _result_link(capture.get("link"))
+            # Harness-measured (launch to the active diagnostic), not the wired
+            # receiver's own startup clock: never compare the two.
+            result["startup_basis"] = "harness_launch_to_active"
     if capture_path is not None:
         result["capture"] = {"path": capture_path, "sha256": capture_sha256}
 
@@ -654,6 +671,73 @@ def _signed_av(capture: dict, window: Window | None, *, invalid: bool) -> tuple[
     block = {"limits": dict(av_contract.SOAK_LIMITS), "valid": stats is not None,
              **({key: stats[key] for key in stats} if stats is not None else {"passed": None})}
     return block, metrics
+
+
+def wireless_link_gap(capture: dict) -> str | None:
+    """Why a wireless capture does not prove a wireless-only session on the bound phone, or None.
+
+    Wired: None. Wireless: adb must have been bound to the soak phone over the
+    AP link, and this host's USB bus must have been readable and shown neither
+    the phone nor an AOA device before, at every sample during, and after the
+    stage (tools/perf/aa_transport.py). The phone's own USB functions are
+    recorded but prove nothing about the cable.
+    """
+    if capture.get("mode") != "wireless":
+        return None
+    return transport.link_gap(capture.get("link"))
+
+
+def _bool_or_none(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _int_or_none(value: object) -> int | None:
+    return value if type(value) is int else None
+
+
+def _host_evidence(value: object) -> dict | None:
+    """One host USB reading in the schema's shape; anything malformed is unreadable."""
+    if not isinstance(value, dict):
+        return None
+    if not isinstance(value.get("readable"), bool):
+        return {"readable": False, "phone_attached": None, "aoa_attached": None}
+    return {"readable": value["readable"], "phone_attached": _bool_or_none(value.get("phone_attached")),
+            "aoa_attached": _bool_or_none(value.get("aoa_attached"))}
+
+
+def _phone_snapshot(value: object) -> dict | None:
+    """The phone's own link snapshot in the schema's shape, or None when malformed."""
+    if not isinstance(value, dict):
+        return None
+    functions = value.get("usb_functions")
+    if not (isinstance(functions, list) and all(isinstance(f, str) for f in functions)):
+        functions = None
+    wifi = value.get("wifi") if isinstance(value.get("wifi"), dict) else {}
+    return {"usb_functions": functions, "usb_aoa": _bool_or_none(value.get("usb_aoa")),
+            "wifi": {"connected": _bool_or_none(wifi.get("connected")),
+                     "frequency_mhz": _int_or_none(wifi.get("frequency_mhz")),
+                     "channel": _int_or_none(wifi.get("channel")),
+                     "rssi_dbm": _int_or_none(wifi.get("rssi_dbm"))},
+            "bluetooth_on": _bool_or_none(value.get("bluetooth_on"))}
+
+
+def _result_link(link: object) -> dict:
+    """The result's link record: the capture's, without the phone id (privacy).
+
+    Always schema-valid, so a blocked or malformed wireless capture still
+    produces a result: a missing record is an unbound link with no evidence, a
+    malformed reading is unreadable. The gate is ``wireless_link_gap`` on the
+    raw capture, which BLOCKS all of these.
+    """
+    link = link if isinstance(link, dict) else {}
+    host = link.get("host_usb") if isinstance(link.get("host_usb"), dict) else {}
+    during = host.get("during") if isinstance(host.get("during"), list) else []
+    return {"adb_bound": link.get("adb_bound") is True,
+            "before": _phone_snapshot(link.get("before")), "after": _phone_snapshot(link.get("after")),
+            "host_usb": {"before": _host_evidence(host.get("before")),
+                         "during": [_host_evidence(e) or {"readable": False, "phone_attached": None,
+                                                          "aoa_attached": None} for e in during],
+                         "after": _host_evidence(host.get("after"))}}
 
 
 def workload_gap(raw: object, window: Window | None) -> str | None:

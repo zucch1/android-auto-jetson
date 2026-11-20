@@ -87,44 +87,52 @@ DEFAULT_GEO_URI = "geo:0,0?q=Atlanta"
 AUDIO_LINE = b'{"event":"audio_write_completed"'
 
 
+def run_adb(command: list[str], timeout: float = ADB_TIMEOUT_S) -> subprocess.CompletedProcess:
+    """Run one adb command with a hard bound; a missing or hung adb never raises.
+
+    A timeout or a missing adb comes back as a failed CompletedProcess (exit 1).
+    Shared by the per-phone runner and the host-level adb (connect/disconnect).
+    """
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+    except OSError as error:
+        return subprocess.CompletedProcess(command, 1, "", str(error))
+    try:
+        out, err = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        pass
+    # Hard bound: TERM, KILL after the grace, then a bounded reap. A pipe a
+    # lingering grandchild still holds is abandoned, never waited on.
+    for sig, wait in ((signal.SIGTERM, ADB_KILL_GRACE_S), (signal.SIGKILL, ADB_REAP_S)):
+        try:
+            process.send_signal(sig)
+            process.communicate(timeout=wait)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+        except OSError:
+            break
+    for pipe in (process.stdout, process.stderr):
+        try:
+            pipe.close()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=ADB_REAP_S)
+    except subprocess.TimeoutExpired:
+        pass
+    return subprocess.CompletedProcess(command, 1, "", f"timed out after {timeout} s")
+
+
 def adb_runner(serial: str, timeout: float = ADB_TIMEOUT_S) -> Callable[..., subprocess.CompletedProcess]:
     """``adb -s SERIAL ...`` with a bound; a missing or hung adb never raises.
 
     A timeout or a missing adb comes back as a failed CompletedProcess (exit 1).
     """
     def run(*args: str) -> subprocess.CompletedProcess:
-        command = ["adb", "-s", serial, *args]
-        try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       text=True)
-        except OSError as error:
-            return subprocess.CompletedProcess(command, 1, "", str(error))
-        try:
-            out, err = process.communicate(timeout=timeout)
-            return subprocess.CompletedProcess(command, process.returncode, out, err)
-        except subprocess.TimeoutExpired:
-            pass
-        # Hard bound: TERM, KILL after the grace, then a bounded reap. A pipe a
-        # lingering grandchild still holds is abandoned, never waited on.
-        for sig, wait in ((signal.SIGTERM, ADB_KILL_GRACE_S), (signal.SIGKILL, ADB_REAP_S)):
-            try:
-                process.send_signal(sig)
-                process.communicate(timeout=wait)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-            except OSError:
-                break
-        for pipe in (process.stdout, process.stderr):
-            try:
-                pipe.close()
-            except OSError:
-                pass
-        try:
-            process.wait(timeout=ADB_REAP_S)
-        except subprocess.TimeoutExpired:
-            pass
-        return subprocess.CompletedProcess(command, 1, "", f"timed out after {timeout} s")
+        return run_adb(["adb", "-s", serial, *args], timeout)
     return run
 
 
@@ -192,6 +200,12 @@ CLEANUP_REASONS = {
     "media_stop_unavailable": "cleanup:media_not_stopped",
     "usb_reset_failed": "cleanup:usb_not_restored",
     "phone_restore_not_reached": "cleanup:phone_restore_not_reached",
+    # Wireless (tools/perf/aa_transport.py): the Jetson's USB bus showed the
+    # phone or an AOA device during or after the run, or could not be read.
+    "usb_attached_during": "cleanup:usb_attached",
+    "usb_attached_after": "cleanup:usb_attached",
+    "usb_state_unreadable_during": "cleanup:usb_state_unreadable",
+    "usb_state_unreadable_after": "cleanup:usb_state_unreadable",
 }
 
 
@@ -245,7 +259,7 @@ class MovingMap:
 
     def __init__(self, adb: Callable[..., object], *, media_uri: str,
                  media_type: str | None = None, media_component: str | None = None,
-                 geo_uri: str = DEFAULT_GEO_URI) -> None:
+                 geo_uri: str = DEFAULT_GEO_URI, usb_reset: bool = True) -> None:
         if not media_uri:
             raise ValueError("the moving-map workload needs media for the whole run")
         self.adb = adb
@@ -253,6 +267,11 @@ class MovingMap:
         self.media += ["-n", media_component] if media_component else []
         self.media_package = media_package(media_component)
         self.geo_uri = geo_uri
+        # Wired sessions reset the phone's USB to mtp before and after the run
+        # (the wired receiver puts it in AOA). A wireless session runs with the
+        # cable unplugged and adb over the AP link, so its workload leaves USB
+        # alone (tools/perf/aa_transport.py).
+        self.usb_reset = usb_reset
         self.media_relaunches = 0
         self.drags = 0
         # Monotonic time of every completed drag (continuity evidence).
@@ -294,7 +313,8 @@ class MovingMap:
 
         False if ``sleep`` was stopped or a command failed (``phone_failure``).
         """
-        if not self._phone("usb_reset", "shell", "svc", "usb", "setFunctions", "mtp") or not sleep(3):
+        if self.usb_reset and (not self._phone("usb_reset", "shell", "svc", "usb", "setFunctions",
+                                                "mtp") or not sleep(3)):
             return False
         if not self._phone("wake", "shell", "input", "keyevent", "KEYCODE_WAKEUP"):
             return False
@@ -326,9 +346,10 @@ class MovingMap:
                     failures.append(failure)
             else:
                 failures.append("media_stop_unavailable: no media component, the player is unknown")
-            usb = command_failure(self.adb("shell", "svc", "usb", "setFunctions", "mtp"))
-            if usb is not None:
-                failures.append(f"usb_reset_failed: {usb}")
+            if self.usb_reset:
+                usb = command_failure(self.adb("shell", "svc", "usb", "setFunctions", "mtp"))
+                if usb is not None:
+                    failures.append(f"usb_reset_failed: {usb}")
             self.cleanup_failures = failures
             return list(failures)
 
