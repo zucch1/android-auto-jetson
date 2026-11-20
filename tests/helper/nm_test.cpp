@@ -956,8 +956,9 @@ TEST_F(NmDaemon, OtherPhonesReconnectAbortsTheOldBootstrapWithDisc) {
     // The receiver now reconnects a different approved phone.
     ASSERT_EQ(bluez.command("observe-other"), "ok");
     ASSERT_TRUE(phone.retry());
+    // Read the wire first: handoff() would itself retire the first phone (it left the inventory).
+    EXPECT_EQ(bluez.command("wire-read"), "closed") << "the reconnect must abort the first phone with DISC";
     EXPECT_FALSE(phone.bluetooth.handoff());
-    EXPECT_EQ(bluez.command("wire-read"), "closed") << "the first phone must see DISC to retry";
 }
 TEST_F(NmDaemon, ComposedRevocationAfterSnapshotPreventsCredentialSend) {
     start(); acquire(); ASSERT_TRUE(state(State::active));
