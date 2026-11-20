@@ -949,6 +949,22 @@ void AudioRouter::retire_all_role_idle() {
     impl_->idle.reset();
 }
 
+void AudioRouter::reset_session_timeline() {
+    if (!impl_) { return; }
+    std::lock_guard lock(impl_->pending_mutex);
+    if (impl_->closed) { return; }
+    for (std::size_t i = 0; i < kRoleCount; ++i) {
+        impl_->pending[i].clear();
+        ++impl_->generations[i];
+    }
+    impl_->timeline_base.reset();
+    impl_->playback_cursor_frames = 0;
+    impl_->role_end_frames.fill(0);
+    impl_->backpressure.clear();
+    impl_->idle.reset();
+    impl_->report.render_failure.reset();
+}
+
 core::Result<RenderStep> AudioRouter::render_step() {
     if (!impl_) { return Error{ErrorCode::invalid_argument}; }
     impl_->report.render_failure.reset();

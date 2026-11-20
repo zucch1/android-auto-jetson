@@ -14,8 +14,7 @@
 #include <thread>
 
 namespace aa::wireless_receiver {
-inline volatile std::sig_atomic_t running = 1;
-inline void on_signal(int) { running = 0; }
+inline void on_signal(int) { running.store(false); }
 
 struct Runtime final {
     using Clock = std::chrono::steady_clock;
@@ -35,20 +34,101 @@ struct Runtime final {
     Clock::time_point retry{}, attempt_until{};
     std::chrono::milliseconds backoff{250};
     bool attempting{}, failed{}, stopping{};
+    bool audio_failure_reported{};
+    bool in_audio_completions{};
+    bool in_poll_{};
+    std::optional<Error> pending_ack_error_{};
     app::WiredSession* configured{};
     std::size_t offered_video_profiles{};
     ipc::VideoSelectionWatchdog selection_watchdog{};
+    std::function<void(bool session_live)> on_turn_for_test{};
+    std::function<void(app::WiredSession&, bool in_poll)> on_before_audio_completions_for_test{};
+    std::function<void(app::WiredSession&, bool in_poll, const core::Result<void>& serviced)>
+        on_after_audio_completions_for_test{};
+
+    void stop_runtime() {
+        stopping = true;
+        running.store(false);
+    }
+
+    bool service_audio_failure() {
+        const auto error = media.audio.failure();
+        if (!error) return false;
+        failed = true;
+        stop_runtime();
+        if (auto* live = receiver.session(); live && !live->failure()) {
+            (void)live->fail(*error);
+        }
+        if (!audio_failure_reported) {
+            audio_failure_reported = true;
+            log_line_nonblocking(audio::audio_failure_event_json(
+                "audio_sink_failure", error->code(), media.audio.failure_context()));
+        }
+        return true;
+    }
+
+    void service_audio_completions_if_ready() {
+        if (service_audio_failure() || in_audio_completions) return;
+        auto* audio_session = receiver.session();
+        if (!audio_session || audio_session != configured ||
+            audio_session->outbound_in_progress() || audio_session->failure()) {
+            return;
+        }
+        in_audio_completions = true;
+        struct Guard {
+            bool& active;
+            ~Guard() { active = false; }
+        } guard{in_audio_completions};
+        if (on_before_audio_completions_for_test) {
+            on_before_audio_completions_for_test(*audio_session, in_poll_);
+        }
+        const auto serviced = app::service_audio_completions(*audio_session, media.audio, false);
+        if (on_after_audio_completions_for_test) {
+            on_after_audio_completions_for_test(*audio_session, in_poll_, serviced);
+        }
+        if (!serviced) {
+            if (!service_audio_failure()) {
+                const auto& error = serviced.error();
+                if (error.code() == ErrorCode::cancelled &&
+                    (!running.load() || Clock::now() >= deadline || stopping)) {
+                    stop_runtime();
+                    return;
+                }
+                if (in_poll_) {
+                    if (!pending_ack_error_) pending_ack_error_ = error;
+                    audio_session->request_stop();
+                } else {
+                    report("wireless link retired", error.code());
+                    defer();
+                }
+            }
+        }
+    }
 
     void checkpoint() {
+        if (!running.load() || Clock::now() >= deadline) stop_runtime();
+        if (stopping) {
+            if (auto* session = receiver.session()) session->request_stop();
+            return;
+        }
         if (auto* session = receiver.session(); session && session != configured) {
             configured = session;
             if (auto bound = media.bind(*session); !bound) {
-                report("session media sinks", bound.error().code()); failed = true; stopping = true;
+                report("session media sinks", bound.error().code()); failed = true; stop_runtime();
             }
         }
-        if (!running || Clock::now() >= deadline) stopping = true;
+        service_audio_completions_if_ready();
+        if (!running.load() || Clock::now() >= deadline) stop_runtime();
+        if (stopping) {
+            if (auto* session = receiver.session()) session->request_stop();
+            return;
+        }
+        receiver.set_io_checkpoint_interval(
+            (media.video.has_pending() || media.audio.outstanding())
+                ? std::chrono::milliseconds{5}
+                : std::chrono::milliseconds{25});
         if (auto step = bus.cycle(core::Milliseconds{0}); !step) {
-            report("session bus dispatch", step.error().code()); failed = true; stopping = true;
+            report("session bus dispatch", step.error().code()); failed = true; stop_runtime();
         }
         const auto state = bus.service().state();
         auto* recovery_session = receiver.session();
@@ -84,16 +164,19 @@ struct Runtime final {
         const bool has_selection =
             live_session && live_session->selected_video_profile().has_value();
         if (selection_watchdog.check(session_ready, has_selection, Clock::now())) {
-            log_line(ipc::video_selection_timeout_json(
-                ipc::kVideoSelectionWarningTimeout, offered_video_profiles));
+            log_media("video_selection_timeout",
+                      ipc::video_selection_timeout_json(
+                          ipc::kVideoSelectionWarningTimeout, offered_video_profiles));
         }
         // Owner loss is handled by WirelessConfirmation's confirmed-ACTIVE grace.
         // An explicit StopProjection by the still-live owner is immediate.
         if (stopping || (state.consumer.value && state.projection == ipc::ProjectionState::stopped)) {
             if (auto* session = receiver.session()) session->request_stop();
         }
-        auto producer = video_server.accept_consumer(core::Milliseconds{0});
-        if (producer) media.video.install(std::move(producer.value()));
+        if (!recovery_session || !recovery_session->outbound_in_progress()) {
+            auto producer = video_server.accept_consumer(core::Milliseconds{0});
+            if (producer) media.video.install(std::move(producer.value()));
+        }
         if (!input) {
             auto accepted = input_server.accept_sender(core::Milliseconds{0});
             if (accepted) input.emplace(std::move(accepted.value()));
@@ -109,8 +192,10 @@ struct Runtime final {
                 state.projection == ipc::ProjectionState::projecting)
                 queued_input.push_back(event.value());
         }
+        if (on_turn_for_test) { on_turn_for_test(receiver.session() != nullptr); }
     }
     void defer() {
+        pending_ack_error_.reset();
         receiver.stop(); media.video.reset(); configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
         retry = Clock::now() + backoff;
         backoff = std::min(backoff * 2, std::chrono::milliseconds{5000});
@@ -177,10 +262,32 @@ struct Runtime final {
                     if (!begun) { report("AP handoff begin", begun.error().code()); defer(); }
                 } else retry = Clock::now() + std::chrono::milliseconds{250};
             }
-            const auto polled = receiver.poll(bus.service(), [this] { checkpoint(); });
+            pending_ack_error_.reset();
+            const auto polled = [&] {
+                in_poll_ = true;
+                struct Guard {
+                    bool& active;
+                    ~Guard() { active = false; }
+                } guard{in_poll_};
+                return receiver.poll(bus.service(), [this] { checkpoint(); });
+            }();
             if (!polled) {
-                report("wireless link retired", polled.error().code()); defer();
+                if (!service_audio_failure()) {
+                    const auto code = pending_ack_error_ ? pending_ack_error_->code()
+                                                         : polled.error().code();
+                    if (code == ErrorCode::ipc_queue_full ||
+                        code == ErrorCode::channel_not_registered) {
+                        log_line(app::poll_error_json(
+                            code, media.audio, receiver.last_reject(),
+                            receiver.last_queue_rejection()));
+                    }
+                    report("wireless link retired", code);
+                    defer();
+                }
+            } else {
+                service_audio_completions_if_ready();
             }
+            if (on_turn_for_test) { on_turn_for_test(receiver.session() != nullptr); }
             if (receiver.active()) backoff = std::chrono::milliseconds{250};
             for (unsigned i = 0; i < 8 && !queued_input.empty(); ++i) {
                 const auto event = queued_input.front(); queued_input.pop_front();
@@ -193,17 +300,34 @@ struct Runtime final {
             }
             // TcpTransport::poll_receive() is intentionally unsupported, so
             // WirelessLink::poll() calls blocking session_->poll_transport(), which
-            // runs this checkpoint() on TcpIo's 25ms poll slices while TCP is idle.
-            // Thus when TCP is quiet, held video servicing/expiry runs on ~25ms
-            // checkpoint slices and can overshoot nominal max_age by up to ~25ms.
-            // Tightening the outer sleep from 10ms to 5ms while frames are held
-            // avoids adding a full idle sleep on non-blocked/active turns.
-            const auto poll_step = media.video.has_pending() ? std::chrono::milliseconds{5}
-                                                             : std::chrono::milliseconds{10};
-            std::this_thread::sleep_until(std::min(deadline, turn + poll_step));
+            // runs this checkpoint() on TcpIo's configurable poll slices while TCP is idle.
+            // While video frames or audio completions are outstanding, TcpIo uses 5 ms slices.
+            const auto poll_step = (media.video.has_pending() || media.audio.outstanding())
+                ? std::chrono::milliseconds{5}
+                : std::chrono::milliseconds{10};
+            if (!stopping && (!polled || !polled.value())) {
+                std::this_thread::sleep_until(std::min(deadline, turn + poll_step));
+            }
         }
-        bus.service().shutdown(); receiver.stop(); media.video.reset();
+        running.store(false);
+        media.audio.stop();
+        bus.service().shutdown();
+        receiver.stop();
+        if (on_turn_for_test) { on_turn_for_test(false); }
+        media.video.close();
+        if (auto finished = media.audio.finish(); !finished) {
+            if (!audio_failure_reported) {
+                audio_failure_reported = true;
+                log_line(audio::audio_failure_event_json(
+                    "audio_finish", finished.error().code(), media.audio.failure_context()));
+            }
+            failed = true;
+        }
         log_line("{\"event\":\"stopping\"}");
+        if (const auto* writer = diagnostics::active_stdout_log.load();
+            writer && writer->latched_error()) {
+            failed = true;
+        }
         return failed ? 1 : 0;
     }
 };

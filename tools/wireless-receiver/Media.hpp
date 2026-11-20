@@ -1,61 +1,86 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "ServiceDescription.hpp"
+#include <aa/app/AvAudioRegistration.hpp>
 #include <aa/app/WirelessLink.hpp>
+#include <aa/audio/AudioRenderWorker.hpp>
 #include <aa/audio/AudioRouter.hpp>
+#include <aa/audio/AudioTelemetry.hpp>
 #include <aa/channels/InputSink.hpp>
 #include <aa/channels/MicrophoneSink.hpp>
 #include <aa/channels/SensorSink.hpp>
 #include <aa/config/VideoProfiles.hpp>
 #include <aa/diagnostics/Diagnostics.hpp>
+#include <aa/diagnostics/StdoutLog.hpp>
 #include "../wired-receiver/VideoOutlet.hpp"
+#include <atomic>
 #include <cstdio>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace aa::wireless_receiver {
+inline std::atomic<bool> running{true};
+
 inline void log_line(const std::string& line) {
-    std::fputs(line.c_str(), stdout); std::fputc('\n', stdout); std::fflush(stdout);
+    if (auto* writer = diagnostics::active_stdout_log.load()) {
+        if (writer->submit(line)) { running.store(false); }
+        return;
+    }
+    std::fputs(line.c_str(), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
 }
+
+inline void log_media(std::string_view kind, const std::string& line) {
+    if (auto* writer = diagnostics::active_stdout_log.load()) {
+        if (writer->submit_media(kind, line)) { running.store(false); }
+        return;
+    }
+    std::fputs(line.c_str(), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+}
+
+inline void log_line_nonblocking(const std::string& line) {
+    if (auto* writer = diagnostics::active_stdout_log.load()) {
+        if (writer->submit_pending(line)) { running.store(false); }
+        return;
+    }
+    std::fputs(line.c_str(), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+}
+
+[[nodiscard]] inline audio::AudioTelemetryCallbacks audio_telemetry() {
+    return {log_line, log_media, log_line_nonblocking};
+}
+
 inline void report(const char* operation, ErrorCode code) {
     std::fprintf(stderr, "aa-wireless-receiver: %s: %.*s\n", operation,
         static_cast<int>(to_string(code).size()), to_string(code).data());
 }
+
 class DiagnosticOutput final : public diagnostics::DiagnosticSink {
 public:
     explicit DiagnosticOutput(bool enabled) : enabled_(enabled) {}
     void emit_json(std::string_view json) override {
-        if (enabled_) log_line(std::string{json});
+        if (enabled_) log_line_nonblocking(diagnostics::diag_event_json(json));
     }
 private:
     bool enabled_;
 };
-class AudioSink final : public protocol::MessageSink {
-public:
-    explicit AudioSink(audio::AudioRouter& router) : router_(router) {}
-    core::Result<void> on_message(const protocol::MessageView& message) override {
-        if (auto result = router_.submit(message); !result) return result.error();
-        const auto pumped = router_.pump();
-        return pumped ? core::Result<void>{} : core::Result<void>{pumped.error()};
-    }
-private:
-    audio::AudioRouter& router_;
-};
-inline audio::RouterConfig audio_config() {
-    audio::RouterConfig config;
-    config.output_format = {48000, 2, 16};
-    for (auto& role : config.roles) {
-        role.codec = audio::Codec::pcm;
-        role.input_format = {16000, 1, 16};
-    }
-    config.roles[audio::role_index(audio::Role::media)].input_format = {48000, 2, 16};
-    return config;
+
+[[nodiscard]] inline audio::RouterConfig audio_config(
+    audio::SinkBackend backend = audio::SinkBackend::pulse) {
+    return audio::pcm_router_config(backend, audio_telemetry());
 }
 
 // The media endpoints outlive every per-link session; callbacks resolve the
 // current session instead of capturing an address that recovery can invalidate.
 struct Media final {
-    wired_receiver::VideoOutlet video{log_line};
-    AudioSink audio;
+    wired_receiver::VideoOutlet video{log_line_nonblocking, log_media};
+    audio::AudioRenderWorker& audio;
     channels::InputSink input;
     input::CapabilityDescriptor capabilities{input::CapabilityDescriptor::bench_defaults()};
     std::function<core::Result<void>(protocol::ChannelRole, std::vector<std::byte>)> send;
@@ -65,7 +90,7 @@ struct Media final {
     channels::MicrophoneSink microphone{[this](std::vector<std::byte> payload) {
         return send(protocol::ChannelRole::microphone, std::move(payload));
     }};
-    explicit Media(audio::AudioRouter& router) : audio(router) {}
+    explicit Media(audio::AudioRenderWorker& audio_worker) : audio(audio_worker) {}
     app::WirelessLink::Config config(
         std::vector<protocol::VideoProfile> profiles = aa::config::default_video_profiles()) {
         using protocol::ChannelRole;
@@ -78,12 +103,8 @@ struct Media final {
         return config;
     }
     core::Result<void> bind(app::WiredSession& session) {
-        using protocol::ChannelRole;
-        if (auto bound = session.register_av_sink(ChannelRole::video, video); !bound) return bound.error();
-        for (const auto role : {ChannelRole::media_audio, ChannelRole::guidance_audio, ChannelRole::system_audio}) {
-            if (auto bound = session.register_av_sink(role, audio); !bound) return bound.error();
-        }
-        return {};
+        audio.begin_session();
+        return app::register_av_sinks(session, video, audio);
     }
 };
 } // namespace aa::wireless_receiver

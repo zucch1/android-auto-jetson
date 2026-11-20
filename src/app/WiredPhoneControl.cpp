@@ -90,6 +90,10 @@ std::optional<helper::RevocationV1> WiredPhoneControl::take_revocation_v1() {
     return result;
 }
 
+bool WiredPhoneControl::revoked() const noexcept {
+    return revoked_;
+}
+
 bool WiredPhoneControl::finish() {
     assert_owner();
     if (pending_) {
