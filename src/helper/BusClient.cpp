@@ -18,6 +18,17 @@ core::Result<ObservedPeer> BusClient::poll_bootstrap(Source source, HandoffFailu
     if (!peer.handle) return Error{ErrorCode::helper_rejected};
     return peer;
 }
+core::Result<BootstrapWait> BusClient::bootstrap_wait(Source source) {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until)) return Error{ErrorCode::timeout};
+    MessageWriter writer; writer.put_u64(source.generation).put_u64(source.confirmation);
+    const auto result = impl_->rpc("GetBootstrapWaitV1", "tt", writer, until);
+    if (!result) return result.error();
+    if (result.value() > static_cast<std::uint64_t>(BootstrapWait::no_bluetooth_link))
+        return Error{ErrorCode::helper_protocol_mismatch};
+    return static_cast<BootstrapWait>(result.value());
+}
 core::Result<void> BusClient::authorize_bootstrap(Source source, std::uint64_t handle, bool allow, bool ready) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
     std::unique_lock lock{impl_->mutex, std::defer_lock};
@@ -38,11 +49,16 @@ core::Result<ApSnapshot> BusClient::get_ap_credentials(Source source, std::uint6
     return snapshot;
 }
 core::Result<std::unique_ptr<BusClient>> BusClient::system(trust::ApprovedPhoneStore& store) {
-    return private_bus("unix:path=/run/dbus/system_bus_socket", store);
+    // #89 L12: the system bus socket itself must be root-owned (SO_PEERCRED)
+    // before AUTH, Hello or the helper-UID checks in rpc() are attempted.
+    auto connection = BusConnection::connect_system();
+    if (!connection) return Error{ErrorCode::helper_unavailable};
+    return std::unique_ptr<BusClient>{new BusClient{std::make_unique<Impl>(std::move(connection.value()), store)}};
 }
 core::Result<std::unique_ptr<BusClient>> BusClient::private_bus(const std::string& address,
                                                             trust::ApprovedPhoneStore& store) {
-    auto connection = BusConnection::connect_private(address);
+    // Explicit private buses are the caller's own (or root's) daemon.
+    auto connection = BusConnection::connect_private(address, BusOwner::root_or_self());
     if (!connection) return Error{ErrorCode::helper_unavailable};
     return std::unique_ptr<BusClient>{new BusClient{std::make_unique<Impl>(std::move(connection.value()), store)}};
 }

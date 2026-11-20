@@ -33,6 +33,7 @@ public:
     core::Result<ObservedPeer> handoff() override;
     SnapshotDeadline handoff_deadline() const override;
     HandoffFailure handoff_failure() const override;
+    bool awaiting_link() override;
     void fail_handoff(std::uint64_t, HandoffFailure) override;
     core::Result<void> authorize_handoff(std::uint64_t, bool, bool) override;
     void snapshot_provider(const SnapshotProvider&) override;

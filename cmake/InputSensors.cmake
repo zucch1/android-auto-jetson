@@ -86,7 +86,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_target_properties(aa_sensor_session_test PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_link_libraries(aa_sensor_session_test PRIVATE
-        aa_wired aa_protocol_adapter aap_protobuf aa_ipc_control aa_ipc_dbus
+        aa_audio_worker aa_wired aa_protocol_adapter aap_protobuf aa_ipc_control aa_ipc_dbus
         aa_video aa_input aa_transport_tls aareceiver-audio aareceiver-consumer pthread GTest::gtest_main)
     target_include_directories(aa_sensor_session_test SYSTEM PRIVATE ${Protobuf_INCLUDE_DIRS})
     list(APPEND AA_INPUT_SENSORS_WARN_TARGETS aa_sensor_session_test)

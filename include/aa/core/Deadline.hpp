@@ -12,6 +12,8 @@
 
 namespace aa::core {
 
+inline constexpr std::chrono::milliseconds kDefaultSendBudget{5000};
+
 struct Deadline final {
     using Clock = std::chrono::steady_clock;
     Clock::time_point until{Clock::now() + std::chrono::seconds{15}};

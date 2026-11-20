@@ -47,6 +47,7 @@ class WiredPhoneControl final {
     [[nodiscard]] core::Result<void> forget(core::PhoneId);
     std::optional<helper::RevocationV1> take_revocation_v1();
     void checkpoint();
+    [[nodiscard]] bool revoked() const noexcept;
     [[nodiscard]] bool finish();
     void drain_persistence();
     void close();

@@ -52,8 +52,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_tests_properties(wired_perf_build_guard PROPERTIES TIMEOUT 120)
     # #137 soak: v3 signed A/V contract and v2 history, the shared moving-map
     # workload (alone and inside the collector), the in-repo soak chain and the
-    # remote collector stop.
-    foreach(suite v3_av_contract moving_map soak_chain remote_stop)
+    # remote collector stop, and the #154 host audio/maintenance preflight.
+    foreach(suite v3_av_contract moving_map soak_chain remote_stop host_preflight)
         add_test(NAME wired_perf_${suite} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_${suite}.py")
         set_tests_properties(wired_perf_${suite} PROPERTIES TIMEOUT 180)

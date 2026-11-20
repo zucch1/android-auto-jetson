@@ -15,7 +15,8 @@ struct TlsTransport::Impl final {
     bool handshaked{false};
     FrameStreamIO io;
     std::function<Deadline()> now{[] { return std::chrono::steady_clock::now(); }};
-    std::optional<std::chrono::milliseconds> idle_budget;
+    // Empty-parser idle expiry is always finite; see set_peer_ping_interval.
+    std::chrono::milliseconds idle_budget{kDefaultIdleBudget};
     // The read deadline follows the parser's partial frame across receives;
     // writes must not overwrite it while an inbound frame is buffered.
     Deadline read_deadline{Deadline::max()};

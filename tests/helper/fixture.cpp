@@ -199,6 +199,19 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
             if (command == "unknown") candidate = trust::WirelessIdentity{"02:00:00:00:00:04", "fixture-adapter"};
             const auto response = helper.value()->reconnect(candidate);
             result = response ? core::Result<void>{} : core::Result<void>{response.error()};
+        } else if (command == "bootstrap-wait") {
+            // GetBootstrapWaitV1 for the reconnect's empty-source lease (consumer generation 1).
+            const auto wait = helper.value()->bootstrap_wait({1, 0});
+            if (wait) std::cout << "wait " << static_cast<unsigned>(wait.value()) << '\n' << std::flush;
+            else std::cout << "error " << static_cast<unsigned>(wait.error().code()) << '\n' << std::flush;
+            continue;
+        } else if (command == "poll-bootstrap") {
+            // PollBootstrapV1 as a 1.4 receiver decodes it: the local_failure the helper sent.
+            helper::HandoffFailure failure{helper::HandoffFailure::none};
+            const auto polled = helper.value()->poll_bootstrap({1, 0}, failure);
+            std::cout << "poll " << (polled ? 0U : static_cast<unsigned>(polled.error().code())) << ' '
+                      << static_cast<unsigned>(failure) << '\n' << std::flush;
+            continue;
         } else if (command == "status" || command == "usb-status" || command == "modem-status") {
             const auto action = command == "usb-status" ? Action::usb_status :
                                 command == "modem-status" ? Action::modem_status : Action::ap_status;

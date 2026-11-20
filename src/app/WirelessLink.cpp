@@ -34,8 +34,25 @@ void WirelessLink::stop() {
     if (transport_) { transport_->set_io_checkpoint({}); transport_->close(); }
     session_.reset(); transport_.reset(); coordinator_ = nullptr;
 }
+void WirelessLink::set_io_checkpoint_interval(std::chrono::milliseconds interval) noexcept {
+    io_checkpoint_interval_ = std::max(std::chrono::milliseconds{1}, interval);
+    if (transport_) transport_->set_io_checkpoint_interval(io_checkpoint_interval_);
+}
+std::optional<WiredSession::RejectedFrame> WirelessLink::last_reject() const {
+    return session_ ? session_->last_reject() : last_reject_;
+}
+std::optional<diagnostics::QueueRejection> WirelessLink::last_queue_rejection() const {
+    return session_ ? session_->last_queue_rejection() : last_queue_rejection_;
+}
+void WirelessLink::capture_session_errors() {
+    if (!session_) return;
+    last_reject_ = session_->last_reject();
+    last_queue_rejection_ = session_->last_queue_rejection();
+}
 core::Result<void> WirelessLink::attach(std::unique_ptr<transport::TcpTransport> tcp,
                                        const trust::PhoneIdentity& phone) {
+    last_reject_.reset();
+    last_queue_rejection_.reset();
     auto config = config_.session;
     config.lifecycle.link = session::LinkKind::wireless;
     config.lifecycle.phases.negotiate = core::Milliseconds{10'000};
@@ -78,9 +95,12 @@ void WirelessLink::checkpoint(HandoffEligibilityCoordinator& coordinator, const 
         (void)session_->apply(session::Event::degrade);
 }
 core::Result<bool> WirelessLink::poll(HandoffEligibilityCoordinator& coordinator, std::function<void()> work) {
+    last_reject_.reset();
+    last_queue_rejection_.reset();
     coordinator_ = &coordinator;
     checkpoint(coordinator, work);
     if (session_ && session_->failure()) {
+        capture_session_errors();
         const auto error = *session_->failure();
         stop(); coordinator.retire(); return error;
     }
@@ -105,15 +125,17 @@ core::Result<bool> WirelessLink::poll(HandoffEligibilityCoordinator& coordinator
         const auto phone = coordinator.phone();
         if (!phone || !coordinator.admitting() || coordinator.snapshot_generation() != generation_)
             return Error{ErrorCode::transport_unauthorized_peer};
-        if (auto attached = attach(std::move(tcp).value(), *phone); !attached) { stop(); coordinator.retire(); return attached.error(); }
+        if (auto attached = attach(std::move(tcp).value(), *phone); !attached) { capture_session_errors(); stop(); coordinator.retire(); return attached.error(); }
         close_admission();
         transport_->set_io_checkpoint([this, &coordinator, work] { checkpoint(coordinator, work); });
-        if (auto sent = session_->send_version_request(1, 6); !sent) { stop(); coordinator.retire(); return sent.error(); }
+        transport_->set_io_checkpoint_interval(io_checkpoint_interval_);
+        if (auto sent = session_->send_version_request(1, 6); !sent) { capture_session_errors(); stop(); coordinator.retire(); return sent.error(); }
         return true;
     }
     auto result = session_->poll_transport();
     session_->tick();
     if (!result || session_->failure() || session_->token().stop_requested() || !coordinator.valid_session()) {
+        capture_session_errors();
         const auto error = session_->failure() ? *session_->failure()
                            : (result ? Error{ErrorCode::cancelled} : result.error());
         stop(); coordinator.retire(); return error;

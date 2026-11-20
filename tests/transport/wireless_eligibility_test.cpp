@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/app/HandoffEligibility.hpp>
+#include "../../tools/wireless-receiver/AdmissionEvents.hpp"
 #include "../session/Fakes.hpp"
 #include <aa/trust/Identity.hpp>
 #include <gtest/gtest.h>
@@ -276,4 +277,15 @@ TEST(WirelessEligibility, LateOldCompletionCannotReopenOrRetireReplacement) {
     EXPECT_EQ(f.allowed.load(), 2U);
     EXPECT_GT(f.denied.load(), 0U);
 }
+}
+
+TEST(WirelessEligibility, AdmissionExpiryEventNamesThePhaseWithoutIdentities) {
+    using aa::wireless_receiver::admission_expired_json;
+    EXPECT_EQ(admission_expired_json(true, true),
+        R"json({"event":"wireless_admission_expired","reason":"attempt_deadline","phase":"ap_activation"})json");
+    EXPECT_EQ(admission_expired_json(false, true),
+        R"json({"event":"wireless_admission_expired","reason":"no_bluetooth_link","phase":"bluetooth_link",)json"
+        R"json("detail":"waiting for HFP (owned by infotainment)"})json");
+    EXPECT_EQ(admission_expired_json(false, false),
+        R"json({"event":"wireless_admission_expired","reason":"attempt_deadline","phase":"phone_handoff"})json");
 }

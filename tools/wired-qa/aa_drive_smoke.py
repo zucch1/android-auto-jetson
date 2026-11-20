@@ -388,6 +388,24 @@ def analyze(receiver: list[dict], display: list[dict], sidecar: list[dict] | Non
         blocked_on = ",".join(f"{name}:{why}" for name, why in sorted(tainted.items()))
     else:
         verdict = "PASS"
+    failure = None
+    # PASS needs a receiver that exited 0 (#163 review). A nonzero exit or a
+    # latched stdout logger error (sink failure, pending_lossless overflow) is a
+    # confirmed receiver failure that no lost record could have produced or
+    # excused, so it is FAIL even where log loss left criteria BLOCKED. A missing
+    # or null exit code only means the run cannot show a clean end: it never
+    # passes (FAIL), but it does not override a BLOCKED verdict.
+    receiver_exit = run.get("receiver_exit")
+    confirmed_receiver_failure = False
+    if type(receiver_exit) is not int or receiver_exit != 0:
+        failure = f"receiver_exit_{'missing' if receiver_exit is None else receiver_exit}"
+        confirmed_receiver_failure = type(receiver_exit) is int
+    elif run.get("logger_error"):
+        failure = run["logger_error"]
+        confirmed_receiver_failure = True
+    if failure and (verdict == "PASS" or (verdict == "BLOCKED" and confirmed_receiver_failure)):
+        verdict = "FAIL"
+        blocked_on = None
     for c in criteria:
         if c["name"] in tainted:
             c["inconclusive"] = tainted[c["name"]]
@@ -395,6 +413,7 @@ def analyze(receiver: list[dict], display: list[dict], sidecar: list[dict] | Non
     return {
         "verdict": verdict,
         **({"blocked_on": blocked_on} if blocked_on else {}),
+        **({"failure": failure} if failure else {}),
         "log_integrity": {"receiver": rec, "display": disp, "idr_unstamped": len(unstamped),
                           "idr_sidecar": sidecar_issue or "consistent",
                           "active_anchor": anchor_issue or "emit_ns"},
@@ -416,6 +435,11 @@ def analyze(receiver: list[dict], display: list[dict], sidecar: list[dict] | Non
 
 def analyze_dir(out: Path) -> dict:
     run = json.loads((out / "run.json").read_text())
+    if "logger_error" not in run and (out / "receiver.log").is_file():
+        for line in (out / "receiver.log").read_text(errors="replace").splitlines():
+            if line.startswith("stdout_log errno="):
+                run = {**run, "logger_error": line.strip()}
+                break
     sidecar = out / "idr-events.jsonl"
     return analyze(read_jsonl(out / "receiver.log"), read_jsonl(out / "display.log"),
                    read_jsonl(sidecar) if sidecar.is_file() else None, run)
@@ -592,6 +616,7 @@ class Logger(threading.Thread):
         super().__init__(daemon=True)
         self.stream, self.log, self.stamped, self.lock, self.label = stream, log, stamped, lock, name
         self.seen: dict[str, int] = {}
+        self.logger_error: str | None = None
 
     def run(self) -> None:
         with self.log.open("w") as out:
@@ -599,6 +624,8 @@ class Logger(threading.Thread):
                 now = time.monotonic_ns()
                 out.write(line)
                 if not line.startswith("{"):
+                    if self.logger_error is None and line.startswith("stdout_log errno="):
+                        self.logger_error = line.strip()
                     continue
                 if line.startswith('{"event":"audio_write_completed"'):
                     self.seen["last_audio"] = now  # media keep-alive (MEDIA_RELAUNCH_SILENCE_S)
@@ -863,6 +890,8 @@ def _run_cli(args) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         return 128 + stop.signum
+    if loggers and loggers[0].logger_error:
+        run["logger_error"] = loggers[0].logger_error
     run.update(receiver_exit=receiver.returncode if receiver else None,
                display_exit=display.returncode if display else None)
     (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
@@ -875,11 +904,9 @@ def _run_cli(args) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         return _blocked(out, base, "phone_command_failed")
+    # analyze() fails a PASS on a nonzero or missing receiver exit and on a latched
+    # logger error, reading the run.json written just above.
     result = {**base, **analyze_dir(out), "finished_utc": datetime.now(timezone.utc).isoformat()}
-    if run.get("receiver_exit") not in (0, None) and result["verdict"] == "PASS":
-        # A nonzero exit with a complete log is a receiver failure (#90 review).
-        result["verdict"] = "FAIL"
-        result["failure"] = f"receiver_exit_{run.get('receiver_exit')}"
     result["media_relaunches"] = run["media_relaunches"]
     result["cleanup_failures"] = run["cleanup_failures"]
     if run.get("failure"):

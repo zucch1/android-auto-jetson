@@ -42,6 +42,9 @@ void TcpTransport::set_io_deadline(core::Deadline::Clock::time_point until) noex
 void TcpTransport::set_io_checkpoint(std::function<void()> checkpoint) {
     impl_->bounded.checkpoint = std::move(checkpoint);
 }
+void TcpTransport::set_io_checkpoint_interval(std::chrono::milliseconds interval) noexcept {
+    impl_->bounded.checkpoint_interval = std::max(std::chrono::milliseconds{1}, interval);
+}
 
 core::Result<std::unique_ptr<TcpTransport>>
 TcpTransport::connect(const char* host, std::uint16_t port) {

@@ -52,7 +52,8 @@ class Run:
         self.stamped: list = []
         self.run = {"duration_s": duration, "active_ns": ACTIVE,
                     "window_end_ns": self.first + duration * S + S // 2,
-                    "receiver_alive_at_end": True, "display_alive_at_end": True}
+                    "receiver_alive_at_end": True, "display_alive_at_end": True,
+                    "receiver_exit": 0}
         rate = painted_fps or fps
         count = int((duration + 1) * rate)
         self.paints = [self.first + int(i * S / rate) for i in range(count)]
@@ -538,6 +539,38 @@ class AnalyzerTests(unittest.TestCase):
         self.assertTrue(av["passed"])
         self.assertEqual(av["invalid_audio_slots"], 1)
 
+    def test_nonzero_receiver_exit_or_logger_error_is_not_pass(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-exit-") as directory:
+            root = Path(directory)
+            run = Run()
+            run.run["receiver_exit"] = 1
+            res = smoke.analyze_dir(run.write(root))
+            self.assertNotEqual(res["verdict"], "PASS", res)
+            self.assertEqual(res["verdict"], "FAIL")
+
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-logerr-") as directory:
+            root = Path(directory)
+            run = Run()
+            run.receiver.append("stdout_log errno=105")
+            res = smoke.analyze_dir(run.write(root))
+            self.assertNotEqual(res["verdict"], "PASS", res)
+            self.assertEqual(res["verdict"], "FAIL")
+
+    def test_missing_or_null_receiver_exit_is_not_pass(self) -> None:
+        # A run.json without a receiver exit code, or with null, cannot show the
+        # receiver ended cleanly: analyze(), analyze_dir() and the offline CLI never PASS it.
+        for label, mutate in (("missing", lambda r: r.pop("receiver_exit")),
+                              ("null", lambda r: r.update(receiver_exit=None))):
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix=f"drive-smoke-{label}-") as directory:
+                run = Run()
+                self.assertEqual(self.analyze(run)["verdict"], "PASS")  # the healthy control
+                mutate(run.run)
+                res = self.analyze(run)
+                self.assertEqual(res["verdict"], "FAIL", res)
+                self.assertEqual(res["failure"], "receiver_exit_missing")
+                out = run.write(Path(directory))
+                self.assertEqual(smoke.analyze_dir(out)["verdict"], "FAIL")
+
 
 NOW = datetime(2026, 11, 16, 12, tzinfo=timezone.utc)
 A, B = "a" * 64, "b" * 64
@@ -885,7 +918,16 @@ class CollectorPhoneBindingTests(unittest.TestCase):
 FAKE_RECEIVER = """#!/usr/bin/env python3
 import os, signal, subprocess, sys, time
 directory = os.environ["FAKE_DIR"]
+overflow_mode = os.environ.get("FAKE_RECEIVER_OVERFLOW", "")
+state = {"stopping": False}
 def stop(*_):
+    state["stopping"] = True
+    if overflow_mode == "stderr_zero":
+        print("stdout_log errno=105", flush=True)
+        sys.exit(0)
+    if overflow_mode:
+        # A latched logger error never writes log_complete and exits nonzero.
+        sys.exit(1)
     # Like the real receiver: a clean stop drains the log and exits 0.
     print('{"event":"stopping","duration_ms":0}', flush=True)
     print('{"event":"log_complete","runtime_dropped":0,"state_overflow":0,"media_rate_limited":0,'
@@ -897,18 +939,70 @@ with open(os.path.join(directory, "receiver.pids"), "w") as handle:
     handle.write(f"{os.getpid()} {grandchild.pid}")
 print('{"event":"ready"}', flush=True)
 time.sleep(0.5)
-print('{"event":"active"}', flush=True)
+if os.environ.get("FAKE_RECEIVER_HEALTHY_STREAM"):
+    # Like the real receiver (#90): the activation anchor carries its emission time.
+    print('{"event":"active","emit_ns":%d}' % time.monotonic_ns(), flush=True)
+else:
+    print('{"event":"active"}', flush=True)
 print('{"event":"video_profile","width":1280,"height":720,"fps":30,"codec":"h264"}', flush=True)
+if os.environ.get("FAKE_RECEIVER_HEALTHY_STREAM"):
+    start = time.monotonic_ns()
+    slot = 40_000_000
+    next_slot = start - 1_000_000_000
+    overflow_at = start + int(float(os.environ.get("FAKE_RECEIVER_OVERFLOW_AT_S", "6.4")) * 1e9)
+    while not state["stopping"]:
+        now = time.monotonic_ns()
+        while next_slot < now + 200_000_000:
+            print('{"event":"audio_write_completed","scheduled_ns":%d,"scheduled_end_ns":%d,'
+                  '"completed_ns":%d,"presented_ns":%d}'
+                  % (next_slot, next_slot + slot, next_slot, next_slot + 10_000_000), flush=True)
+            next_slot += slot
+        if overflow_mode and now >= overflow_at:
+            # Overflow submit_pending near cutoff: idr_* records are lost, g_running becomes false,
+            # and teardown completes shortly after the cutoff exiting 1 (or stderr errno=105).
+            if overflow_mode == "exit_before_stop":
+                time.sleep(0.4)
+                sys.exit(1)
+            if overflow_mode == "stderr_zero":
+                print("stdout_log errno=105", flush=True)
+                time.sleep(0.5)
+                sys.exit(0)
+            time.sleep(0.5)
+            sys.exit(1)
+        time.sleep(0.05)
 time.sleep(300)
 """
 
 FAKE_DISPLAY = """#!/usr/bin/env python3
-import os, sys, time
+import os, signal, sys, threading, time
 with open(os.path.join(os.environ["FAKE_DIR"], "display.pids"), "w") as handle:
     handle.write(str(os.getpid()))
-print('{"event":"video_presented","frame":1,"scheduled_ns":%d,"completed_ns":%d,"count":1}'
-      % (time.monotonic_ns() - 30000000, time.monotonic_ns()), flush=True)
-if not os.environ.get("FAKE_DISPLAY_STALL"):
+if os.environ.get("FAKE_DISPLAY_HEALTHY_STREAM"):
+    # Like the real display (#90): a runner stop writes the completion record last.
+    def stop(*_):
+        print('{"event":"telemetry_complete"}', flush=True)
+        os._exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    time.sleep(0.55)
+t0 = time.monotonic_ns()
+print('{"event":"video_presented","frame":0,"scheduled_ns":%d,"completed_ns":%d,"count":1}'
+      % (t0 - 22_000_000, t0), flush=True)
+if os.environ.get("FAKE_DISPLAY_HEALTHY_STREAM"):
+    def drain():
+        for _ in sys.stdin:
+            pass
+    threading.Thread(target=drain, daemon=True).start()
+    frame = 1
+    end_ns = t0 + 8 * 10**9
+    while time.monotonic_ns() < end_ns:
+        target = t0 + (frame * 10**9) // 30
+        now = time.monotonic_ns()
+        if target > now:
+            time.sleep((target - now) / 1e9)
+        print('{"event":"video_presented","frame":%d,"scheduled_ns":%d,"completed_ns":%d,"count":1}'
+              % (frame, target - 22_000_000, target), flush=True)
+        frame += 1
+elif not os.environ.get("FAKE_DISPLAY_STALL"):
     for _ in sys.stdin:
         pass
 time.sleep(300)
@@ -986,6 +1080,10 @@ elif hook == "stall":
 elif hook == "passing":
     # The drive's own analysis passes, so only the cleanup can stop a PASS.
     aa_drive_smoke.analyze_dir = lambda out: {"verdict": "PASS", "criteria": []}
+elif hook == "overflow":
+    # Exercise real analyze_dir() over short 1s windows so 6s has 6 full windows.
+    aa_drive_smoke.WINDOW_S = 1
+    aa_drive_smoke.FPS_STARTUP_GRACE_S = 0
 sys.exit(aa_drive_smoke.main(sys.argv[2:]))
 """
 
@@ -1220,6 +1318,35 @@ class RunnerSignalTests(unittest.TestCase):
             self.assertEqual(result["verdict"], "FAIL")
             self.assertFalse([pid for pid in self.pids(root) if alive(pid)], output)
         self.scenario("stall", False, check)
+
+    def test_logger_overflow_near_cutoff_never_passes(self) -> None:
+        # Control: a healthy 6s stream passes end-to-end when the receiver exits 0.
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-healthy-") as directory:
+            root = Path(directory)
+            runner, output = self.run_to_end(
+                root, "overflow", "--duration", "6",
+                FAKE_RECEIVER_HEALTHY_STREAM="1", FAKE_DISPLAY_HEALTHY_STREAM="1")
+            result = json.loads((root / "out" / "result.json").read_text())
+            self.assertEqual(runner.returncode, 0, output)
+            self.assertEqual(result["verdict"], "PASS", result)
+
+        # Regression: submit_pending overflows near the cutoff (IDR events lost,
+        # receiver still alive at window_end_ns, then exits 1 or logs stdout_log errno=105).
+        for mode in ("1", "stderr_zero"):
+            with self.subTest(mode=mode), \
+                    tempfile.TemporaryDirectory(prefix="drive-smoke-overflow-") as directory:
+                root = Path(directory)
+                runner, output = self.run_to_end(
+                    root, "overflow", "--duration", "6",
+                    FAKE_RECEIVER_HEALTHY_STREAM="1", FAKE_DISPLAY_HEALTHY_STREAM="1",
+                    FAKE_RECEIVER_OVERFLOW=mode)
+                run_doc = json.loads((root / "out" / "run.json").read_text())
+                result = json.loads((root / "out" / "result.json").read_text())
+                self.assertTrue(run_doc["receiver_alive_at_end"], run_doc)
+                self.assertNotEqual(result["verdict"], "PASS", result)
+                self.assertNotEqual(runner.returncode, 0, output)
+                self.assertEqual(result["verdict"], "FAIL", result)
+                self.assertEqual(runner.returncode, 1, output)
 
 
 class SendControlTests(unittest.TestCase):

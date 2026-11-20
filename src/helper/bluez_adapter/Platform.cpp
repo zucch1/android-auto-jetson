@@ -144,7 +144,7 @@ void BluezBackend::Impl::reset() {
     close_connection();
     release_window();
     allowed.reset(); window = {}; pairing_enabled = false; comparison_accepted = false; acknowledged = false;
-    observations.clear(); adapters.clear();
+    observations.clear(); adapters.clear(); lost_link.reset();
     registered = false; agent_registered = false;
 }
 void BluezBackend::Impl::pump() {
@@ -210,6 +210,28 @@ SnapshotDeadline BluezBackend::handoff_deadline() const {
     return impl_->bootstrap ? impl_->bootstrap->deadline() : SnapshotDeadline{impl_->now(), impl_->now};
 }
 HandoffFailure BluezBackend::handoff_failure() const { return impl_->last_failure; }
+bool BluezBackend::awaiting_link() {
+    // The window was closed by its phone's own link loss (Device1.Connected=false): still a
+    // missing link until that window would have expired. Read only; the identity stays refused.
+    const auto lost = [this] { return impl_->lost_link && impl_->now() < impl_->lost_link->until; };
+    if (!impl_->allowed) return lost();
+    // Evaluated now (one bounded inventory read), never from a snapshot taken when the window
+    // opened: a link infotainment brought up since then is seen. Only an open reconnect window
+    // (not an enrolment) with no live bootstrap qualifies. Read only: no Device1 call.
+    if (!impl_->allowed || impl_->pairing_enabled || impl_->now() >= impl_->window ||
+        (impl_->bootstrap && impl_->bootstrap->live())) return false;
+    // exact() drains BlueZ callbacks, which may close or replace the window: work on a copy and
+    // claim nothing unless the same observation is still the open window afterwards.
+    const auto observed = *impl_->allowed;
+    Impl::Device live{};
+    if (!impl_->exact(observed, true, &live)) return lost();  // otherwise continuity unknown: no claim
+    const auto& now_open = impl_->allowed;
+    if (!now_open || now_open->device.path != observed.device.path ||
+        now_open->owner_epoch != observed.owner_epoch || now_open->device_epoch != observed.device_epoch ||
+        impl_->pairing_enabled || impl_->now() >= impl_->window ||
+        (impl_->bootstrap && impl_->bootstrap->live())) return lost();
+    return !live.connected;
+}
 void BluezBackend::fail_handoff(std::uint64_t handle, HandoffFailure reason) { impl_->retire(handle, reason); }
 void BluezBackend::snapshot_provider(const SnapshotProvider& provider) { impl_->snapshots = provider; }
 void BluezBackend::snapshot_fence(const SnapshotFence& fence) { impl_->fence = fence; }
@@ -237,8 +259,8 @@ core::Result<void> BluezBackend::authorize_handoff(std::uint64_t handle, bool al
 }
 void BluezBackend::tick() { impl_->pump(); }
 void BluezBackend::discard(std::uint64_t handle) { impl_->observations.erase(handle); }
-void BluezBackend::cleanup() noexcept { impl_->observations.clear(); impl_->close_window(); }
-void BluezBackend::retire_lease() noexcept { impl_->close_window(); }
+void BluezBackend::cleanup() noexcept { impl_->lost_link.reset(); impl_->observations.clear(); impl_->close_window(); }
+void BluezBackend::retire_lease() noexcept { impl_->lost_link.reset(); impl_->close_window(); }
 core::Result<State> BluezBackend::apply(Action action, std::uint32_t channel) {
     if (channel) return Error{ErrorCode::helper_rejected};
     switch (action) {

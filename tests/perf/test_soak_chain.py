@@ -13,7 +13,7 @@ import json
 import os
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,8 +34,13 @@ exit "$rc"
 """
 
 
+def preflight_ok(_args, seconds, _stop) -> dict:
+    return {"schema": "aa-host-preflight/2", "stage_s": seconds, "verdict": "OK", "reasons": [],
+            "pipewire_err_counters": {"start": {"nodes": []}}}
+
+
 def run(root: Path, *extra: str, env: dict[str, str] | None = None, builds=lambda: [],
-        stub_text: str = STUB) -> tuple[int, str]:
+        stub_text: str = STUB, host=preflight_ok, counters=None) -> tuple[int, str]:
     stub = root / "stub-launcher"
     stub.write_text(stub_text)
     stub.chmod(0o755)
@@ -45,7 +50,9 @@ def run(root: Path, *extra: str, env: dict[str, str] | None = None, builds=lambd
             "--launcher", str(stub), *extra]
     output = io.StringIO()
     with patch.dict(os.environ, {"STUB_LOG": str(root / "calls.log"), **(env or {})}), \
-            patch.object(chain, "builds", builds), redirect_stdout(output):
+            patch.object(chain, "builds", builds), patch.object(chain, "host_preflight", host), \
+            patch.object(chain, "host_counters", counters or (lambda _args, _cancel=None: {"nodes": []})), \
+            redirect_stdout(output):
         code = chain.main(argv)
     return code, output.getvalue()
 
@@ -275,6 +282,449 @@ def test_the_stop_grace_covers_the_launchers_remote_stop() -> None:
     assert chain.STOP_GRACE_S > worst + margin + kill_grace, (chain.STOP_GRACE_S, worst, margin)
 
 
+def test_a_blocked_host_preflight_runs_no_stage_and_says_why() -> None:
+    # Given a host whose preflight is BLOCKED (#154): the stage is not run (exit 3),
+    # the record and every reason are kept, and no later stage runs either.
+    reasons = ["host_audio:pipewire-pulse[200]:pw-data-loop_not_realtime (cls=TS rtprio=-)"]
+
+    def blocked(_args, seconds, _stop) -> dict:
+        return {"schema": "aa-host-preflight/2", "stage_s": seconds, "verdict": "BLOCKED", "reasons": reasons}
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        code, output = run(root, host=blocked)
+        out = root / "chain"
+        assert code == 3 and "stage-1800s BLOCKED: host preflight: host_audio:pipewire-pulse" in output, output
+        assert calls(root) == [], "a stage launched on a blocked host"
+        record = json.loads((out / "stage-1800s-host-preflight.json").read_text())
+        assert record == {"schema": "aa-host-preflight/2", "stage_s": 1800, "verdict": "BLOCKED",
+                          "reasons": reasons}, record
+        assert "pw-data-loop_not_realtime" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+        assert (out / "stage-7200s-not-run.json").exists()
+        assert not (out / "stage-1800s-result.json").exists() and not (out / "stage-1800s-logs").exists()
+
+
+def test_the_preflight_runs_before_each_stage_and_records_the_err_counters() -> None:
+    seen: list[int] = []
+
+    def host(args, seconds, stop) -> dict:
+        seen.append(seconds)
+        return preflight_ok(args, seconds, stop)
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        code, output = run(root, host=host)
+        assert code == 0 and seen == [1800, 7200], (seen, output)
+        for seconds in chain.STAGES:
+            record = json.loads((root / "chain" / f"stage-{seconds}s-host-preflight.json").read_text())
+            # start counters from the preflight, end counters added after the stage
+            assert record["verdict"] == "OK" and record["schema"] == "aa-host-preflight/2", record
+            assert set(record["pipewire_err_counters"]) == {"start", "during", "end"}, record
+            assert record["pipewire_err_counters"]["end"]["phase"] == "after_stage"
+
+
+def test_the_second_stage_is_preflighted_on_its_own_clock() -> None:
+    # A host that is fine for the 1800 s stage but not for the 7200 s one: the
+    # first runs and passes, the second is BLOCKED without a launch.
+    def host(args, seconds, stop) -> dict:
+        record = preflight_ok(args, seconds, stop)
+        if seconds == 7200:
+            record.update(verdict="BLOCKED", reasons=["host_maintenance:apt-daily.timer_inside_stage_window"])
+        return record
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        code, output = run(root, host=host)
+        assert code == 3 and len(calls(root)) == 1 and "--duration 1800s" in calls(root)[0], output
+        assert (root / "chain" / "stage-7200s-not-run.json").exists()
+        assert (root / "chain" / "stage-1800s-result.json").exists()
+
+
+def test_a_stop_during_the_maintenance_wait_starts_no_stage() -> None:
+    import signal
+
+    def host(args, seconds, stop) -> dict:
+        stop.signum = signal.SIGTERM  # what the handler does
+        return {"verdict": "BLOCKED", "reasons": ["host_maintenance:wait_interrupted"]}
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        code, _ = run(root, host=host)
+        assert code == 128 + signal.SIGTERM and calls(root) == []
+        assert (root / "chain" / "stage-1800s-not-run.json").exists()
+
+
+def test_a_preflight_that_raises_blocks_and_still_writes_the_markers() -> None:
+    def broken(_args, _seconds, _stop) -> dict:
+        raise ValueError("day is out of range for month")
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        code, output = run(root, host=broken)
+        out = root / "chain"
+        assert code == 3 and calls(root) == [], output
+        record = json.loads((out / "stage-1800s-host-preflight.json").read_text())
+        assert record["verdict"] == "BLOCKED" and "host_preflight:error (ValueError" in record["reasons"][0]
+        assert "host_preflight:error" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+        assert (out / "stage-7200s-not-run.json").exists()
+
+
+def test_a_build_that_starts_during_the_preflight_blocks_the_launch() -> None:
+    # The build check is repeated right after the (possibly long) preflight.
+    state = {"preflighted": False}
+
+    def host(args, seconds, stop) -> dict:
+        state["preflighted"] = True
+        return preflight_ok(args, seconds, stop)
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        code, output = run(root, host=host, builds=lambda: ["4242 ninja"] if state["preflighted"] else [])
+        assert code == 3 and calls(root) == [], output
+        assert "a build started during the host preflight" in output
+        record = json.loads((root / "chain" / "stage-1800s-host-preflight.json").read_text())
+        assert record["verdict"] == "BLOCKED" and record["reasons"] == ["interference:build_started_during_preflight"]
+        assert (root / "chain" / "stage-1800s-not-run.json").exists()
+
+
+def test_non_finite_preflight_bounds_are_usage_errors() -> None:
+    for flag in ("--maintenance-wait-s", "--timer-margin-s"):
+        for value in ("inf", "nan", "-1"):
+            with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+                root = Path(directory)
+                try:
+                    with redirect_stderr(io.StringIO()):
+                        run(root, flag, value)
+                except SystemExit as exit_:
+                    assert exit_.code == 2, (flag, value)
+                else:
+                    raise AssertionError(f"{flag} {value} accepted")
+                assert not (root / "chain").exists()
+
+
+def test_the_preflight_uses_the_launchers_ssh_even_for_localhost() -> None:
+    # An ssh config may map localhost to another User: the preflight must ask that user.
+    seen = []
+
+    def local(argv, timeout=None):
+        seen.append(argv)
+        return chain.aa_host_preflight.Output(0, "1001\n")
+    with patch.object(chain.aa_host_preflight.ssh_runner, "__defaults__", (local,)):
+        assert chain.aa_host_preflight.soak_uid(chain.host_runner("localhost")) == ("1001", None)
+    assert seen == [["ssh", *chain.aa_host_preflight.SSH_OPTS, "localhost", "id -u"]], seen
+
+
+SLOW_STUB = STUB.replace('printf \'%s\\n\' "$*" >> "$STUB_LOG"\n', 'printf \'%s\\n\' "$*" >> "$STUB_LOG"\nsleep 0.6\n')
+
+
+def test_err_counters_are_sampled_while_the_receiver_stream_exists() -> None:
+    samples = []
+
+    def counters(_args, _cancel=None) -> dict:
+        samples.append(1)
+        return {"time": 0, "receiver_streams": [{"id": 71, "name": "aa-wired-receiver", "err": 2}],
+                "sinks": [], "nodes": []}
+    assert SLOW_STUB != STUB
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        with patch.object(chain, "COUNTER_FIRST_S", 0.05), patch.object(chain, "COUNTER_PERIOD_S", 0.1), \
+                patch.object(chain, "STAGES", (1800,)):
+            stub = root / "stub-launcher"
+            stub.write_text(SLOW_STUB)
+            stub.chmod(0o755)
+            argv = ["--out", str(root / "chain"), "--phone-serial", "TESTPHONE01",
+                    "--drive-smoke", str(root / "smoke.json"), "--media-uri", "file:///x.opus",
+                    "--media-component", "org.example.player/.Play", "--quiet-seconds", "0",
+                    "--launcher", str(stub)]
+            with patch.dict(os.environ, {"STUB_LOG": str(root / "calls.log")}), \
+                    patch.object(chain, "builds", lambda: []), patch.object(chain, "host_preflight", preflight_ok), \
+                    patch.object(chain, "host_counters", counters), redirect_stdout(io.StringIO()):
+                assert chain.main(argv) == 0
+        during = json.loads((root / "chain" / "stage-1800s-host-preflight.json").read_text())[
+            "pipewire_err_counters"]["during"]
+        assert during["samples"] >= 2 and during["receiver_stream_seen"], during
+        assert during["latest_with_receiver"]["receiver_streams"][0]["err"] == 2
+        assert during["first_with_receiver"]["phase"] == "during_stage"
+
+
+def test_a_record_that_is_not_strict_json_blocks_the_stage() -> None:
+    def host(args, seconds, stop) -> dict:
+        record = preflight_ok(args, seconds, stop)
+        record["apt_timers"] = {"window_end_epoch": float("inf")}
+        return record
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        code, output = run(root, host=host)
+        text = (root / "chain" / "stage-1800s-host-preflight.json").read_text()
+        record = json.loads(text, parse_constant=lambda name: (_ for _ in ()).throw(ValueError(name)))
+        assert code == 3 and calls(root) == [] and record["verdict"] == "BLOCKED", (output, record)
+        assert record["reasons"][0].startswith("host_preflight:invalid_record"), record
+
+
+def test_a_stop_kills_an_in_flight_counter_sample_and_terms_the_stage_first() -> None:
+    import signal
+    import threading
+    import time
+    events: list[str] = []
+    in_flight, termed = threading.Event(), threading.Event()
+
+    def counters(_args, cancel=None) -> dict:  # a pw-top over ssh that hangs until cancelled
+        in_flight.set()
+        threading.Timer(0.2, os.kill, (os.getpid(), signal.SIGTERM)).start()
+        assert cancel is not None and cancel.wait(30), "the sample was never cancelled"
+        termed.wait(10)  # returns only once the stage has been TERMed: TERM never waits for it
+        events.append("sample_cancelled")
+        return {"error": "cancelled"}
+    real_stop_group = chain.stop_group
+
+    def stop_group(process):
+        events.append("stage_termed" + ("_while_sampling" if in_flight.is_set() and not events else ""))
+        termed.set()
+        return real_stop_group(process)
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        stub_path = root / "stub-launcher"
+        stub_path.write_text(STUB.replace('exit "$rc"', 'sleep 30 & wait $!\nexit "$rc"'))
+        stub_path.chmod(0o755)
+        argv = ["--out", str(root / "chain"), "--phone-serial", "TESTPHONE01",
+                "--drive-smoke", str(root / "smoke.json"), "--media-uri", "file:///x.opus",
+                "--media-component", "org.example.player/.Play", "--quiet-seconds", "0",
+                "--launcher", str(stub_path)]
+        began = time.monotonic()
+        with patch.dict(os.environ, {"STUB_LOG": str(root / "calls.log")}), \
+                patch.object(chain, "builds", lambda: []), patch.object(chain, "host_preflight", preflight_ok), \
+                patch.object(chain, "host_counters", counters), patch.object(chain, "COUNTER_FIRST_S", 0.05), \
+                patch.object(chain, "stop_group", stop_group), redirect_stdout(io.StringIO()):
+            code = chain.main(argv)
+        elapsed = time.monotonic() - began
+        assert code == 128 + signal.SIGTERM, code
+        assert events[:2] == ["stage_termed_while_sampling", "sample_cancelled"], events
+        assert elapsed < 4.5, elapsed  # no sampler join (5 s) before the TERM, no 30 s hang
+        during = json.loads((root / "chain" / "stage-1800s-host-preflight.json").read_text())[
+            "pipewire_err_counters"]["during"]
+        assert during["samples"] == 0, during  # the cut-short sample is not recorded as one
+
+
+def test_a_stop_during_the_sampler_shutdown_still_writes_the_markers() -> None:
+    # The launcher has exited normally; TERM lands while the sampler is finishing.
+    import signal
+    real_finish = chain.CounterSampler.finish
+
+    def finish(self) -> dict:
+        os.kill(os.getpid(), signal.SIGTERM)
+        return real_finish(self)
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        with patch.object(chain.CounterSampler, "finish", finish):
+            code, output = run(root)
+        out = root / "chain"
+        assert code == 128 + signal.SIGTERM, (code, output)
+        assert "stage-1800s INTERRUPTED by SIGTERM" in output, output
+        assert "interrupted" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+        assert (out / "stage-7200s-not-run.json").exists()
+        # The stub wrote PASS before the TERM: it is moved aside, never left qualifying.
+        assert not (out / "stage-1800s-result.json").exists()
+        assert json.loads((out / "stage-1800s-result.interrupted.json").read_text())["verdict"] == "PASS"
+
+
+def test_an_interrupted_stage_with_a_build_is_disqualified_not_pass() -> None:
+    # A PASS on disk, a build seen by the watch, then TERM during the sampler's
+    # shutdown: interference wins, and nothing qualifying is left.
+    import signal
+    real_finish = chain.CounterSampler.finish
+    count = {"n": 0}
+
+    def builds() -> list[str]:  # idle, before the stage, after the preflight: none; the watch: a build
+        count["n"] += 1
+        return ["4242 ninja"] if count["n"] > 3 else []
+
+    def finish(self) -> dict:
+        os.kill(os.getpid(), signal.SIGTERM)
+        return real_finish(self)
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        with patch.object(chain.CounterSampler, "finish", finish):
+            code, output = run(root, builds=builds, stub_text=STUB.replace('exit "$rc"', 'sleep 0.3\nexit "$rc"'))
+        out = root / "chain"
+        assert code == 128 + signal.SIGTERM, (code, output)
+        interference = json.loads((out / "stage-1800s-interference.json").read_text())
+        assert interference["reason"] == "build_during_stage" and interference["result_verdict"] == "PASS"
+        assert not (out / "stage-1800s-result.json").exists()
+        assert (out / "stage-1800s-result.disqualified.json").exists()
+        assert (out / "stage-1800s-not-run.json").exists() and (out / "stage-7200s-not-run.json").exists()
+
+
+TERM_POINTS = ("preflight", "pre-launch build scan", "pre-launch build scan finding a build",
+               "launcher running", "disqualification", "sampler shutdown", "end snapshot",
+               "after the stage returned")
+
+
+def test_a_term_at_any_point_of_a_stage_never_leaves_a_canonical_pass_or_exits_0() -> None:
+    import signal
+    for target in chain.STAGES:
+        for point in TERM_POINTS:
+            state = {"stage": None, "fired": False, "builds": 0}
+
+            def term(at: str, point=point, target=target) -> None:
+                if at == point and state["stage"] == target and not state["fired"]:
+                    state["fired"] = True
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+            def host(args, seconds, stop) -> dict:
+                state["stage"], state["builds"] = seconds, 0
+                term("preflight")
+                return preflight_ok(args, seconds, stop)
+
+            def builds(point=point) -> list[str]:
+                state["builds"] += 1  # 1: the scan right after the preflight; then the stage's watch
+                if state["builds"] == 1:
+                    term("pre-launch build scan")
+                    term("pre-launch build scan finding a build")
+                    found = point == "pre-launch build scan finding a build"
+                else:
+                    term("launcher running")
+                    found = point == "disqualification"
+                return ["4242 ninja"] if found and state["stage"] == target else []
+
+            def counters(_args, cancel=None) -> dict:
+                if cancel is None:
+                    term("end snapshot")
+                return {"nodes": []}
+            real_finish, real_run_stage, real_disqualify = \
+                chain.CounterSampler.finish, chain.run_stage, chain._disqualify
+
+            def disqualify(*args, **kwargs) -> int:
+                term("disqualification")
+                return real_disqualify(*args, **kwargs)
+
+            def finish(self) -> dict:
+                term("sampler shutdown")
+                return real_finish(self)
+
+            def run_stage(*args, **kwargs) -> int:
+                code = real_run_stage(*args, **kwargs)
+                term("after the stage returned")
+                return code
+            with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+                root = Path(directory)
+                with patch.object(chain.CounterSampler, "finish", finish), \
+                        patch.object(chain, "run_stage", run_stage), patch.object(chain, "_disqualify", disqualify):
+                    code, output = run(root, host=host, builds=builds, counters=counters,
+                                       stub_text=STUB.replace('exit "$rc"', 'sleep 0.3\nexit "$rc"'))
+                out = root / "chain"
+                where = (target, point)
+                assert state["fired"], f"the TERM point was never reached: {where}"
+                assert code == 128 + signal.SIGTERM and "CHAIN COMPLETE" not in output, (where, code, output)
+                canonical = out / f"stage-{target}s-result.json"
+                assert not canonical.exists() or json.loads(canonical.read_text())["verdict"] != "PASS", where
+                marker = json.loads((out / f"stage-{target}s-not-run.json").read_text())["reason"]
+                assert f"stage-{target}s interrupted (SIGTERM)" in marker, (where, marker)
+                if point == "pre-launch build scan finding a build":  # both reasons are kept
+                    assert "interference:build_started_during_preflight" in marker, (where, marker)
+                if point == "disqualification":
+                    assert "interference:build_during_stage" in marker, (where, marker)
+                    assert (out / f"stage-{target}s-interference.json").exists(), where
+                demoted = out / f"stage-{target}s-result.interrupted.json"
+                if demoted.exists():
+                    assert json.loads(demoted.read_text())["interrupted"]["signal"] == "SIGTERM", where
+
+
+def test_a_stop_after_a_passing_preflight_never_starts_the_launcher() -> None:
+    # The stop lands after the preflight passed: on the post-preflight build scan
+    # (the chain's launch boundary: run_stage is never entered), or inside
+    # run_stage just before the spawn (Popen is never called).
+    import signal
+    for where in ("post-preflight scan", "before Popen"):
+        state = {"preflight": False}
+
+        def host(args, seconds, stop) -> dict:
+            state["preflight"] = True
+            return preflight_ok(args, seconds, stop)
+
+        def builds(where=where) -> list[str]:
+            if where == "post-preflight scan" and state["preflight"]:  # the first scan after it
+                os.kill(os.getpid(), signal.SIGTERM)
+            return []
+        real_command = chain.stage_command
+
+        def stage_command(args, seconds, where=where):
+            if where == "before Popen":
+                os.kill(os.getpid(), signal.SIGTERM)
+            return real_command(args, seconds)
+
+        def never(*_args, **_kwargs):
+            raise AssertionError(f"{where}: a launcher was started after the stop")
+        real_run_stage = chain.run_stage
+
+        def run_stage(*args, where=where, **kwargs):
+            if where == "post-preflight scan":
+                never()
+            return real_run_stage(*args, **kwargs)
+        with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+            root = Path(directory)
+            with patch.object(chain, "stage_command", stage_command), patch.object(chain, "run_stage", run_stage), \
+                    patch.object(chain.subprocess, "Popen", never):
+                code, output = run(root, host=host, builds=builds)
+            out = root / "chain"
+            assert state["preflight"] and code == 128 + signal.SIGTERM and calls(root) == [], (where, code, output)
+            assert "interrupted (SIGTERM)" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+            assert (out / "stage-7200s-not-run.json").exists() and "CHAIN COMPLETE" not in output
+
+
+def test_a_stop_during_the_spawn_terminates_the_launched_child_at_once() -> None:
+    # The signal lands after the last guard, while Popen runs: the child exists.
+    # The chain stops its group at once, starts no sampler and no watch, and exits 143.
+    import signal
+    real_popen, spawned = chain.subprocess.Popen, []
+
+    def popen(_command, **kwargs):
+        os.kill(os.getpid(), signal.SIGTERM)
+        spawned.append(real_popen(["sleep", "300"], **kwargs))
+        return spawned[-1]
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("the stage went on after a stop during the spawn")
+    with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+        root = Path(directory)
+        with patch.object(chain.subprocess, "Popen", popen), patch.object(chain.CounterSampler, "start", never):
+            code, output = run(root)
+        out = root / "chain"
+        assert code == 128 + signal.SIGTERM and "CHAIN COMPLETE" not in output, (code, output)
+        assert len(spawned) == 1 and spawned[0].returncode == -signal.SIGTERM, spawned
+        assert not chain.group_alive(spawned[0].pid)
+        assert "interrupted (SIGTERM)" in json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+        assert not (out / "stage-1800s-result.json").exists() and (out / "stage-7200s-not-run.json").exists()
+
+
+def test_a_stop_while_the_block_markers_are_written_still_wins() -> None:
+    # A blocked stage writes its markers, and the TERM lands during that write:
+    # the exit is 143, not 3, and the stage's marker names both reasons.
+    import signal
+    for blocked in ("build before the stage", "preflight BLOCKED"):
+        fired = []
+        real_not_run = chain._not_run
+
+        def not_run(*args, **kwargs):
+            real_not_run(*args, **kwargs)
+            if not fired:
+                fired.append(True)
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        def host(_args, seconds, _stop) -> dict:
+            return {"schema": "aa-host-preflight/2", "stage_s": seconds, "verdict": "BLOCKED",
+                    "reasons": ["package_maintenance:apt running"]}
+        scans = {"n": 0}
+
+        def builds(blocked=blocked) -> list[str]:
+            scans["n"] += 1  # 1: the idle gate; 2: before the stage
+            return ["4242 ninja"] if blocked == "build before the stage" and scans["n"] == 2 else []
+        with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
+            root = Path(directory)
+            with patch.object(chain, "_not_run", not_run):
+                code, output = run(root, host=host, builds=builds)
+            out = root / "chain"
+            assert fired and code == 128 + signal.SIGTERM, (blocked, code, output)
+            marker = json.loads((out / "stage-1800s-not-run.json").read_text())["reason"]
+            assert "stage-1800s interrupted (SIGTERM)" in marker, (blocked, marker)
+            assert ("interference:build_started_before_the_stage" if blocked == "build before the stage"
+                    else "package_maintenance:apt running") in marker, (blocked, marker)
+            assert calls(root) == [] and "CHAIN COMPLETE" not in output
+
+
 def test_every_chain_gets_a_new_directory() -> None:
     with tempfile.TemporaryDirectory(prefix="soak-chain-") as directory:
         root = Path(directory)
@@ -307,6 +757,9 @@ DRIVER = """import sys
 sys.path.insert(0, sys.argv[1])
 import aa_soak_chain as chain
 chain.builds = lambda: []
+chain.host_preflight = lambda a, s, stop: {"verdict": "OK", "reasons": []}
+chain.host_counters = lambda a: {}
+chain.COUNTER_FIRST_S = 3600.0
 chain.STOP_GRACE_S = 1.0
 sys.exit(chain.main(sys.argv[2:]))
 """

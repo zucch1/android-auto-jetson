@@ -183,6 +183,10 @@ void WiredPhoneControl::drain_persistence() {
     }
 }
 
+bool WiredPhoneControl::revoked() const noexcept {
+    return revoked_;
+}
+
 bool WiredPhoneControl::finish() {
     assert_owner();
     // Live path (polled under the session mutex): never waits on disk.

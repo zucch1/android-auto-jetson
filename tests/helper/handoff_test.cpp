@@ -10,7 +10,7 @@ public:
 };
 class HandoffBackend final : public Backend {
 public:
-    bool live{true}, allowed{}, ready{}; int snapshots{}, denies{};
+    bool live{true}, allowed{}, ready{}, waiting{}; int snapshots{}, denies{};
     std::uint64_t handle{123}, rekeyed{};
     std::string address{"AA:BB:CC:DD:EE:FF"};
     HandoffFailure failed{HandoffFailure::none};
@@ -20,6 +20,7 @@ public:
     core::Result<State> reconnect_peer(std::uint64_t) override { return State::active; }
     core::Result<ObservedPeer> handoff() override { if (!live) return Error{ErrorCode::helper_rejected}; return ObservedPeer{handle, {address, "00:11:22:33:44:55"}}; }
     HandoffFailure handoff_failure() const override { return HandoffFailure::none; }
+    bool awaiting_link() override { return waiting; }
     core::Result<ApSnapshot> ap_snapshot() override { ++snapshots; if (collecting) collecting(); return ApSnapshot{{"ssid", "secret", "02:ab:cd:ef:01:23", "10.42.0.1", 5277, 1}}; }
     void fail_handoff(std::uint64_t captured, HandoffFailure reason) override {
         if (captured == handle && live) { live = false; failed = reason; }
@@ -35,6 +36,24 @@ public:
         allowed = allow; ready = listener_ready; if (!allow) { ++denies; live = false; } return {};
     }
 };
+// #160: the wait diagnostic is its own member behind poll_handoff()'s source checks, and never
+// changes PollBootstrapV1's local_failure (a 1.4 receiver rejects values above rebind).
+TEST(HandoffAuthority, BootstrapWaitIsSourceCheckedAndLeavesPollFailureInItsV1Range) {
+    HandoffIds ids; HandoffBackend backend; SystemHelper helper{ids, backend};
+    backend.waiting = true; backend.live = false;
+    EXPECT_FALSE(helper.bootstrap_wait(":1.2", {7, 0})) << "no lease: a source learns nothing";
+    ASSERT_TRUE(helper.reconnect_peer(":1.2", 9));
+    EXPECT_FALSE(helper.bootstrap_wait(":1.2", {0, 0}));
+    EXPECT_FALSE(helper.bootstrap_wait(":1.2", {7, 3})) << "the empty reconnect lease admits no confirmation";
+    const auto waiting = helper.bootstrap_wait(":1.2", {7, 0});
+    ASSERT_TRUE(waiting);
+    EXPECT_EQ(waiting.value(), BootstrapWait::no_bluetooth_link);
+    EXPECT_EQ(helper.handoff_failure(":1.2"), HandoffFailure::none);
+    EXPECT_LE(static_cast<std::uint32_t>(helper.handoff_failure(":1.2")), static_cast<std::uint32_t>(HandoffFailure::rebind));
+    backend.waiting = false;
+    EXPECT_EQ(helper.bootstrap_wait(":1.2", {7, 0}).value(), BootstrapWait::none);
+    EXPECT_EQ(static_cast<std::uint32_t>(HandoffFailure::rebind), 14U) << "PollBootstrapV1's 1.4 range";
+}
 TEST(HandoffAuthority, ReconnectNeedsNoPendingAddPhoneAndOwnsExactSource) {
     HandoffIds ids; HandoffBackend backend; SystemHelper helper{ids, backend};
     ASSERT_TRUE(helper.reconnect_peer(":1.2", 9));
