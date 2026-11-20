@@ -61,6 +61,21 @@ struct Child final {
         argv.push_back(nullptr);
         ASSERT_EQ(::posix_spawn(&pid, argv[0], nullptr, nullptr, argv.data(), environ), 0);
     }
+    // Starts with `extra` added to the environment and stdout and stderr sent to
+    // `log` (GDBus debug output goes to stdout through g_print).
+    void start_logged(const std::vector<std::string>& args, const std::string& extra, const std::string& log) {
+        const int fd = ::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600); ASSERT_GE(fd, 0);
+        posix_spawn_file_actions_t actions; posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO);
+        posix_spawn_file_actions_adddup2(&actions, fd, STDERR_FILENO);
+        std::vector<char*> argv, env;
+        for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+        argv.push_back(nullptr);
+        for (char** entry = environ; *entry; ++entry) env.push_back(*entry);
+        env.push_back(const_cast<char*>(extra.c_str())); env.push_back(nullptr);
+        ASSERT_EQ(::posix_spawn(&pid, argv[0], &actions, nullptr, argv.data(), env.data()), 0);
+        posix_spawn_file_actions_destroy(&actions); ::close(fd);
+    }
     void start_ready(const std::vector<std::string>& args) {
         int fd[2]; ASSERT_EQ(::pipe2(fd, O_CLOEXEC), 0);
         int commands[2]; ASSERT_EQ(::pipe2(commands, O_CLOEXEC), 0);
@@ -369,8 +384,10 @@ protected:
         bluez.start_ready({"/usr/bin/python3", "-B", std::string{AA_HELPER_SOURCE} + "/tests/helper/bluez_mock.py", address});
         store = std::make_unique<trust::ApprovedPhoneStore>(directory / "phones"); ASSERT_TRUE(store->load());
     }
-    void start() {
-        daemon.start({std::string{AA_HELPER_BUILD} + "/aa-system-helper", "--private-bus", address, directory.string(), "--combined", (directory / "commands").string()});
+    void start(const std::string& extra_env = {}) {
+        const std::vector<std::string> args{std::string{AA_HELPER_BUILD} + "/aa-system-helper", "--private-bus", address, directory.string(), "--combined", (directory / "commands").string()};
+        if (extra_env.empty()) daemon.start(args);
+        else daemon.start_logged(args, extra_env, (directory / "helper.log").string());
         auto connection = BusClient::private_bus_for_test(address, *store); ASSERT_TRUE(connection); client = std::move(connection.value());
         ASSERT_TRUE(eventually([this] { return client->status(Action::ap_status).has_value(); }));
     }
@@ -449,6 +466,19 @@ TEST_F(NmDaemon, HappyStartProjectionIsolationAndRollback) {
     EXPECT_GT(nm->deactivations, 0); EXPECT_GT(nm->deletions, 0);
     EXPECT_FALSE(std::filesystem::exists(directory / "state/ap.credentials"));
     EXPECT_FALSE(client->call({Operation::open_pairing_window, 0}, core::Milliseconds{500}, {}));
+}
+TEST_F(NmDaemon, GDbusMessageDebugIsDroppedSoThePskIsNeverLogged) {
+    // #89 L9: with G_DBUS_DEBUG set, GDBus would print AddAndActivateConnection2's PSK.
+    start("G_DBUS_DEBUG=message,payload"); acquire(); ASSERT_TRUE(state(State::active));
+    std::string psk; { const std::lock_guard lock{nm->mutex}; psk = nm->seen_psk; }
+    ASSERT_EQ(psk.size(), 64U);
+    client->teardown(core::ConsumerId{1}); daemon.stop();
+    const auto log = read_text(directory / "helper.log");
+    EXPECT_NE(log.find("system-helper: ignoring G_DBUS_DEBUG"), std::string::npos) << log;
+    EXPECT_EQ(log.find("message,payload"), std::string::npos);
+    EXPECT_EQ(log.find("GDBus-debug"), std::string::npos) << log;
+    EXPECT_EQ(log.find("AddAndActivateConnection2"), std::string::npos);
+    EXPECT_EQ(log.find(psk), std::string::npos);
 }
 TEST_F(NmDaemon, ActivationSnapshotUsesActivationCredentialsAndCurrentLocalMac) {
     Backend backend{Policy{"wlan-test", "US", 5277, (directory / "state").string(), ::getuid()}, address,

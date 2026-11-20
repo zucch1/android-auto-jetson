@@ -118,7 +118,7 @@ struct Backend::Impl final {
                 if (!actual_channel(policy, *commands) || Clock::now() >= deadline) return false;
                 const std::lock_guard lock{mutex};
                 if (wanted && !exiting && generation == epoch) {
-                    activation = ApSnapshot{{secret.value().ssid, secret.value().psk, {}, {}, policy.port, epoch}};
+                    activation = ApSnapshot{{secret.value().ssid, secret.value().psk.view(), {}, {}, policy.port, epoch}};
                     state = State::active; return true;
                 }
                 return false;

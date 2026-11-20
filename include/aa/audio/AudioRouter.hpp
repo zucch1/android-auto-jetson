@@ -478,6 +478,9 @@ public:
     // Leaves timeline, counters, pending parents and backpressure unchanged;
     // a later note_all_role_idle() may authorize a new resumed schedule.
     void retire_all_role_idle();
+    // Worker-only: clears pending runs and resets sample timeline placement across
+    // session reconnects while keeping the opened sink and cumulative stats intact.
+    void reset_session_timeline();
     // Bounded render drain: mixes and writes pending frames, then drains the
     // routed stream to end-of-stream (render completion of everything
     // acknowledged). Terminal for the route: flush() marks the route

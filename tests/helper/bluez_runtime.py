@@ -165,6 +165,18 @@ def authorization_flow(surface: Surface) -> None:
     assert surface.state()["removed"] == []
     assert surface.state()["cancel_unpaired"] == 0
     assert command(surface.receiver, "reconnect") == "0"
+    # #160: the enrolment's closed exchange left a failure; the fresh reconnect window does not
+    # report it, PollBootstrapV1 stays within the 1.4 local_failure range (a 1.4 receiver keeps
+    # observing), and GetBootstrapWaitV1 reports the missing link, evaluated live.
+    polled = command(surface.receiver, "poll-bootstrap").split()
+    assert polled[0] == "poll" and int(polled[2]) == 0, polled
+    assert command(surface.receiver, "bootstrap-wait") == "wait 1"
+    command(surface.mock, "link-up")  # infotainment's HFP arrives after the window opened
+    assert command(surface.receiver, "bootstrap-wait") == "wait 0"
+    assert int(command(surface.receiver, "poll-bootstrap").split()[2]) == 0
+    command(surface.mock, "link-down")
+    assert command(surface.receiver, "bootstrap-wait") == "wait 1"
+    assert command(surface.mock, "ingress") == "", "the helper made a Device1/Adapter1 call"
     assert command(surface.mock, "RequestAuthorization") == "rejected"
     assert command(surface.mock, "AuthorizeService") == "allowed"
     assert command(surface.mock, "RequestConfirmation") == "rejected"

@@ -29,6 +29,9 @@ public:
     core::Result<State> reconnect(const trust::TransportIdentity& identity);
     core::Result<State> acquire_ap(Source source, std::uint32_t channel = 36);
     core::Result<ObservedPeer> poll_bootstrap(Source, HandoffFailure&);
+    // GetBootstrapWaitV1 (1.5.0). A 1.4 helper rejects the unknown member: callers treat any
+    // error as "unknown" and keep the 1.4 behaviour.
+    core::Result<BootstrapWait> bootstrap_wait(Source);
     core::Result<void> authorize_bootstrap(Source, std::uint64_t handle, bool allow, bool listener_ready);
     core::Result<ApSnapshot> get_ap_credentials(Source, std::uint64_t handle);
     core::Result<void> confirmed(core::ConsumerId, core::PairingRequestId) override;

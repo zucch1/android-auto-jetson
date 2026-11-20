@@ -36,7 +36,16 @@ public:
             return Error{ErrorCode::ipc_consumer_rejected};
         eligibility_.consumer(state.consumer);
         eligibility_.begin(source);
+        last_source_ = source;
         return {};
+    }
+    // Diagnostics for an expired attempt, asked of the helper now (GetBootstrapWaitV1, bounded
+    // ~1 s, read only): no_bluetooth_link when the open window's phone has no Bluetooth link.
+    // Any error (including a 1.4 helper without the member) is "unknown" and claims nothing.
+    [[nodiscard]] helper::BootstrapWait link_wait() {
+        if (!last_source_) return helper::BootstrapWait::none;
+        const auto wait = helper_.bootstrap_wait(*last_source_);
+        return wait ? wait.value() : helper::BootstrapWait::none;
     }
     core::Result<void> reconnect(ipc::ControlService& control, const trust::TransportIdentity& identity) {
         const auto state = control.state();
@@ -56,7 +65,16 @@ public:
         return result;
     }
     void stop() {
-        eligibility_.retire(); link_.stop(); confirmation_.flush(true);
+        eligibility_.retire(); link_.stop(); confirmation_.flush(true); last_source_.reset();
+    }
+    void set_io_checkpoint_interval(std::chrono::milliseconds interval) noexcept {
+        link_.set_io_checkpoint_interval(interval);
+    }
+    [[nodiscard]] std::optional<WiredSession::RejectedFrame> last_reject() const {
+        return link_.last_reject();
+    }
+    [[nodiscard]] std::optional<diagnostics::QueueRejection> last_queue_rejection() const {
+        return link_.last_queue_rejection();
     }
     [[nodiscard]] bool active() const {
         const auto* session = link_.session();
@@ -65,6 +83,7 @@ public:
 private:
     helper::BusClient& helper_;
     std::uint32_t ap_channel_;
+    std::optional<helper::Source> last_source_;
     WirelessLink link_;
     HandoffEligibilityCoordinator eligibility_;
     WirelessConfirmation confirmation_;
