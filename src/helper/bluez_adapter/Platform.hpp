@@ -21,6 +21,7 @@ struct BluezBackend::Impl {
         std::string path, adapter_path;
         PeerIdentity identity;
         bool bonded{};
+        bool connected{};  // Device1.Connected: any Bluetooth link (read only, never changed)
     };
     struct Observation {
         Device device; std::string owner; Clock::time_point expires;
@@ -55,6 +56,11 @@ struct BluezBackend::Impl {
     bluez_adapter::ManagedPeers revoked;
     std::optional<Observation> allowed;
     Clock::time_point window{};
+    // Diagnostics only (#160): the open reconnect window's phone reported Device1.Connected=false.
+    // lost_path() still closes that window and refuses the identity; this note only lets
+    // awaiting_link() answer no_bluetooth_link until the closed window's deadline. Grants nothing.
+    struct LostLink { std::string path; PeerIdentity identity; Clock::time_point until; };
+    std::optional<LostLink> lost_link;
     bool pairing_enabled{};
     struct Comparison {
         PairingComparison value;
@@ -125,7 +131,7 @@ struct BluezBackend::Impl {
     void reject_comparison();
     void reset();
     void pump();
-    bool exact(const Observation&, bool require_bond);
+    bool exact(const Observation&, bool require_bond, Device* live = nullptr);
     bool permitted(const char*, bool pairing);
     std::optional<Observation> consume(std::uint64_t);
     void watch_continuity();

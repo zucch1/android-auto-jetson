@@ -122,6 +122,14 @@ struct BusService::Impl {
                     const auto bound = helper.bind(message.sender, {generation.value(), confirmation.value()}, handle.value());
                     result = bound ? core::Result<std::uint64_t>{0} : core::Result<std::uint64_t>{bound.error()};
                 }
+            } else if (message.member == "GetBootstrapWaitV1" && message.signature == "tt") {
+                const auto generation = body.read_u64();
+                const auto confirmation = body.read_u64();
+                if (generation && confirmation && body.done()) {
+                    const auto wait = helper.bootstrap_wait(message.sender, {generation.value(), confirmation.value()});
+                    result = wait ? core::Result<std::uint64_t>{static_cast<std::uint64_t>(wait.value())}
+                                  : core::Result<std::uint64_t>{wait.error()};
+                }
             } else if (message.member == "ReconnectPeerV1" && message.signature == "t") {
                 const auto handle = body.read_u64();
                 if (handle && body.done()) {

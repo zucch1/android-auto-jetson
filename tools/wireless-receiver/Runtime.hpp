@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "AdmissionEvents.hpp"
 #include "Media.hpp"
 #include <aa/app/WirelessReceiver.hpp>
 #include <aa/ipc/ControlBusService.hpp>
@@ -154,7 +155,14 @@ struct Runtime final {
                 if (configured || media.video.has_pending()) media.video.reset();
                 configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
             }
-            if (wants && attempting && !receiver.session() && turn >= attempt_until) defer();
+            if (wants && attempting && !receiver.session() && turn >= attempt_until) {
+                // Not an error code: name why the attempt deadline passed instead of retrying
+                // silently (#160). No addresses or identities are logged.
+                // Asked at expiry, before defer() stops the epoch: the link may have arrived since.
+                log_line(admission_expired_json(acquisition.has_value(),
+                    !acquisition && receiver.link_wait() == helper::BootstrapWait::no_bluetooth_link));
+                defer();
+            }
             if (wants && !receiver.session() && !attempting && turn >= retry) {
                 if (auto admitted = admit(state); !admitted) {
                     report("approved wireless admission", admitted.error().code()); defer();

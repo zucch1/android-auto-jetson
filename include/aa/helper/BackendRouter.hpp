@@ -42,6 +42,7 @@ public:
     void discard(std::uint64_t handle) override { bluetooth_.discard(handle); }
     core::Result<ObservedPeer> handoff() override { return bluetooth_.handoff(); }
     HandoffFailure handoff_failure() const override { return bluetooth_.handoff_failure(); }
+    bool awaiting_link() override { return bluetooth_.awaiting_link(); }
     void fail_handoff(std::uint64_t handle, HandoffFailure reason) override { bluetooth_.fail_handoff(handle, reason); }
     core::Result<void> authorize_handoff(std::uint64_t handle, bool allow, bool ready) override {
         return bluetooth_.authorize_handoff(handle, allow, ready);

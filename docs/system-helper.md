@@ -263,7 +263,7 @@ cannot be inferred safely and need explicit operator removal; they must be
 re-paired before they can reconnect. A staging file left by a power cut has a
 random name, blocks nothing and may be deleted by an operator.
 
-## System bus API 1.4.0
+## System bus API 1.5.0
 
 Name `org.custom.AndroidAutoSystemHelper`, path
 `/org/custom/AndroidAutoSystemHelper`, interface
@@ -286,6 +286,11 @@ the helper does not expose Introspectable). Methods:
 | ReconcileBondsV1 | `a(ss)` the receiver's approved wireless identities (at most 256, exact addresses, no duplicates) | `ut` error, unadmitted count (low 32 bits) and open-window flag (bit 32) | Same sender/UID/process authentication; no lease (it precedes any source) and never touches the live enrolment window's bond. Durable and idempotent; success only once every state change is confirmed (rename + directory fsync). Until the first success of a helper run nothing is admitted, no enrolment opens and no journal entry is released; no bond is ever removed |
 | GetPairingComparisonV1 | `tt` generation, request source | `utuss` error, challenge ID, comparison, address, adapter | Authenticated consumer-only retrieval during explicit enrollment |
 | RespondPairingComparisonV1 | `tttu` generation, request source, challenge ID, accept | `ut` error, reserved zero | Explicit human decision after retrieval; one use, same enrollment/peer/deadline |
+
+1.5.0 (#160) adds `GetBootstrapWaitV1` (`tt` generation, source → `ut` error, wait: 0
+none, 1 no_bluetooth_link), a read-only diagnostic behind `PollBootstrapV1`'s source checks;
+see [wireless-handoff.md](wireless-handoff.md). `PollBootstrapV1` is unchanged: its
+`local_failure` stays within the 1.4 range (0–14).
 
 Errors: 0 success, 1000 unavailable, 1001 rejected, 1002 protocol mismatch.
 Nonzero errors carry value zero. States: 0 inactive, 1 active, 2 unavailable.
