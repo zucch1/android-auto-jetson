@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "pipeline_options.hpp"
+#include "../json_stdout.hpp"
 #include "../video_capabilities.hpp"
 #include <aa/config/VideoProfiles.hpp>
 // Dummy display application (task 24): a Qt 6 test consumer for the REAL
@@ -66,8 +67,8 @@ public:
             static_cast<void>(writer_->enqueue(std::move(line)));
             return;
         }
-        std::puts(line.c_str());
-        std::fflush(stdout);
+        line.push_back('\n');
+        static_cast<void>(aa::tools::write_all(aa::tools::json_fd(), line));
     }
 
 private:
@@ -171,8 +172,8 @@ aa::display::testcontrol::Status probe_status() {
     return status;
 }
 
-void print_usage(std::FILE* stream) {
-    std::fputs("usage: aa-dummy-display [--video-socket PATH] [--input-socket PATH]\n"
+constexpr const char* kUsage =
+    "usage: aa-dummy-display [--video-socket PATH] [--input-socket PATH]\n"
                "                        [--decoder software|hardware|auto] [--presentation cpu|gpu|zerocopy]\n"
                "                        [--media-thread gui|worker] [--check-pipeline] [--list-video-capabilities]\n"
                "                        [--decoder-backend software|nvidia|automatic (legacy flag)]\n"
@@ -182,13 +183,15 @@ void print_usage(std::FILE* stream) {
                "TEST-ONLY Android Auto projection consumer.\n"
                "  F5 start projection   F6 stop projection\n"
                "  F1 toggle HUD         F11 toggle full screen\n"
-               "  arrows/enter/letters  forwarded as keys; left mouse button = touch\n",
-               stream);
-}
+               "  arrows/enter/letters  forwarded as keys; left mouse button = touch\n";
+
+void print_usage(std::FILE* stream) { std::fputs(kUsage, stream); }
 
 } // namespace
 
-int main(int argc, char** argv) {
+// Runs the display; main() owns the stdout isolation and the process exit.
+int display_main(int argc, char** argv) {
+    const int json = aa::tools::json_fd();
     auto errors = std::make_shared<ErrorReporter>();
 
     bool test_autostart = false;
@@ -220,7 +223,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
         } else if (std::strcmp(argv[index], "--list-video-capabilities") == 0) {
-            aa::tools::list_video_capabilities(); return 0;
+            return aa::tools::write_all(json, aa::tools::list_video_capabilities()) ? 0 : 1;
         } else if (std::strcmp(argv[index], "--video-profiles") == 0 && index + 1 < argc) {
             auto parsed = aa::config::parse_video_profiles(argv[++index]);
             if (!parsed) { std::fputs("config_invalid: invalid --video-profiles\n",stderr); return 2; }
@@ -228,8 +231,7 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[index], "--check-pipeline") == 0) {
             check_only = true;
         } else if (std::strcmp(argv[index], "--help") == 0 || std::strcmp(argv[index], "-h") == 0) {
-            print_usage(stdout);
-            return 0;
+            return aa::tools::write_all(json, kUsage) ? 0 : 1;
         } else {
             std::fprintf(stderr, "aa-dummy-display: unrecognized argument '%s'\n", argv[index]);
             print_usage(stderr);
@@ -256,7 +258,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,"%.*s: %.*s\n",static_cast<int>(aa::to_string(refusal->code).size()),aa::to_string(refusal->code).data(),
             static_cast<int>(refusal->message.size()),refusal->message.data()); return 2;
     }
-    if (check_only) { std::puts("pipeline_available"); return 0; }
+    if (check_only) { return aa::tools::write_all(json, "pipeline_available\n") ? 0 : 1; }
     QApplication app(argc, argv);
     // SIGTERM/SIGINT quit the event loop, so the telemetry log is drained and
     // proven complete on a normal runner stop (#90 review 4).
@@ -272,7 +274,11 @@ int main(int argc, char** argv) {
     // Endpoint, decode and presentation telemetry is written by a background
     // thread: a slow stdout write must never stall the GUI thread that pumps,
     // decodes and paints (a stalled GUI thread shows up as a frozen display).
-    aa::display::TelemetryWriter telemetry;
+    // Raw write(2) on the JSON descriptor: no FILE lock, so a worker that
+    // close() abandons on a stalled stdout cannot stall the process exit.
+    aa::display::TelemetryWriter telemetry{[json](const std::string& line) {
+        return aa::tools::write_all(json, line);
+    }};
     // Gate consumers require this last line as proof the telemetry log is complete.
     telemetry.set_completion_record("{\"event\":\"telemetry_complete\"}");
     errors->attach(&telemetry);
@@ -404,4 +410,15 @@ int main(int argc, char** argv) {
                                          [](const std::string& line) {
                                              std::fputs(line.c_str(), stderr);
                                          });
+}
+
+int main(int argc, char** argv) {
+    // Before any GStreamer/NVIDIA probe: JSON moves to a private descriptor and
+    // fd 1 becomes /dev/null; the run ends with _Exit (tools/json_stdout.hpp).
+    aa::tools::StdoutIsolation isolation;
+    if (!isolation.ok()) {
+        isolation.report_failure("aa-dummy-display");
+        aa::tools::StdoutIsolation::end_process(aa::tools::kStdoutIsolationFailed);
+    }
+    aa::tools::StdoutIsolation::end_process(display_main(argc, argv));
 }

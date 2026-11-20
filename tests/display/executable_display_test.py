@@ -220,6 +220,35 @@ def case_replay(args):
     capabilities = subprocess.run([args.display,"--list-video-capabilities"],capture_output=True,text=True,timeout=15)
     assert capabilities.returncode == 0, capabilities
     assert {json.loads(line)["codec"] for line in capabilities.stdout.splitlines()} == {"h264","h265","vp9","av1"}
+    # Library stdio text (the Jetson NVIDIA codec puts() "Opening in BLOCKING
+    # MODE" on every nvv4l2decoder probe) must stay off the JSON stdout and must
+    # not block the display when stderr is a full pipe nobody reads.
+    stalled_read, stalled_write = os.pipe()
+    try:
+        os.set_blocking(stalled_write, False)
+        try:
+            while os.write(stalled_write, b"j" * 4096):
+                pass
+        except BlockingIOError:
+            pass
+        os.set_blocking(stalled_write, True)
+        for argv, stdin in (([args.display, "--list-video-capabilities"], ""),
+                            ([args.display, "--decoder", "auto", "--check-pipeline"], ""),
+                            ([args.display, "--decoder", "auto", "--test-only-control-stdin"], "quit\n")):
+            try:
+                result = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=stalled_write,
+                                        text=True, timeout=15)
+            except subprocess.TimeoutExpired as expired:
+                raise AssertionError(("DISPLAY_BLOCKED_ON_STALLED_STDERR", argv)) from expired
+            assert result.returncode == 0, (argv, result)
+            lines = result.stdout.splitlines()
+            if "--check-pipeline" in argv:
+                assert lines == ["pipeline_available"], (argv, lines)
+            else:
+                assert lines and all(json.loads(line) is not None for line in lines), (argv, lines)
+    finally:
+        os.close(stalled_read)
+        os.close(stalled_write)
     for values in (["unknown"], [""], [], ["--help"]):
         result = subprocess.run(
             [args.display, "--decoder-backend", *values],

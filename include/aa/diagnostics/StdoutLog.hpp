@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <aa/diagnostics/JsonStdoutFd.hpp>
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -625,7 +626,7 @@ private:
     static bool write_all(const std::shared_ptr<State> &state, std::string_view text) {
         std::size_t offset = 0;
         while (offset < text.size()) {
-            const auto count = state->write(STDOUT_FILENO, text.data() + offset, text.size() - offset);
+            const auto count = state->write(json_fd(), text.data() + offset, text.size() - offset);
             if (count < 0 && errno == EINTR) { continue; }
             if (count <= 0) { fail(state, count == 0 ? EIO : errno); return false; }
             offset += static_cast<std::size_t>(count);
