@@ -189,6 +189,8 @@ include(cmake/WiredPerf.cmake)
 # All targets created by the project-owned modules above live in this directory;
 # staged GoogleTest/AASDK targets live in their own directories and are excluded.
 aa_harden_project_targets()
+include(cmake/DebugInfoSplit.cmake)
+aa_split_debug_info_project_targets()
 if(NOT CMAKE_CROSSCOMPILING)
     foreach(suite coverage capture thermal_policy)
         add_test(NAME wired_perf_v2_${suite} COMMAND "${Python3_EXECUTABLE}" -B
