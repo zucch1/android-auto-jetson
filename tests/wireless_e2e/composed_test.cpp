@@ -22,6 +22,8 @@ protected:
     std::atomic<bool> slow_observe{}, observed{};
     // The next GetAPCredentialsV1 fails on the receiver's side, after PollBootstrapV1 bound.
     std::atomic<bool> fail_credentials{};
+    std::atomic<bool> fail_next_deny{};
+    std::atomic<unsigned> denial_attempts{};
     std::unique_ptr<Coordinator> coordinator;
     Clock::time_point bootstrap_deadline{};
     void TearDown() override {
@@ -61,6 +63,11 @@ protected:
         auto authorize = std::move(operations.authorize);
         operations.authorize = [this, authorize](Source source, std::uint64_t handle, bool allow) {
             if (allow) ready_before_allow = listening;
+            if (!allow) {
+                const bool timeout = fail_next_deny.exchange(false);
+                ++denial_attempts;
+                if (timeout) return core::Result<void>{Error{ErrorCode::timeout}};
+            }
             auto result = authorize(source, handle, allow);
             authorization_code = result ? 0 : static_cast<int>(result.error().code());
             return result;
@@ -184,6 +191,20 @@ TEST_F(WirelessComposed, ExpiredHandoffDeniedLateLeavesNoLeaseForTheFreshAttempt
         << "validation=" << validation_code.load() << " authorization=" << authorization_code.load();
     HandoffFailure failure{};
     EXPECT_TRUE(client->poll_bootstrap({7, 0}, failure)) << "the retired attempt's lease carried over";
+}
+
+TEST_F(WirelessComposed, InFlightDenialTimeoutIsRetriedBeforeReconnect) {
+    ASSERT_NO_FATAL_FAILURE(admit(Source{7, 1}));
+    ASSERT_NO_FATAL_FAILURE(complete_bootstrap());
+    fail_next_deny = true;
+    coordinator->consumer(std::nullopt);
+    ASSERT_TRUE(eventually([&] { coordinator->tick(); return denial_attempts.load() == 1; }));
+
+    coordinator->retire();
+    EXPECT_EQ(denial_attempts.load(), 2U) << "the denial should be retried before reconnect";
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    ASSERT_TRUE(client->reconnect(identity));
+    EXPECT_TRUE(client->bootstrap_wait({8, 0})) << "reconnect kept the old lease";
 }
 
 // #169 review (Neon P2, variant of the above): the attempt is retired while its initial

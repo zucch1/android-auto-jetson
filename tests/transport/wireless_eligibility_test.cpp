@@ -9,6 +9,7 @@
 
 using namespace std::chrono_literals;
 using EligibilityClock = aa::app::HandoffEligibilityCoordinator::Clock;
+using Retirement = aa::app::HandoffEligibilityCoordinator::Retirement;
 EligibilityClock::time_point real_eligibility_now() noexcept
     asm("__real__ZNSt6chrono3_V212steady_clock3nowEv");
 EligibilityClock::time_point wrapped_eligibility_now() noexcept
@@ -51,6 +52,7 @@ struct EligibilityFixture {
     const std::thread::id owner{std::this_thread::get_id()};
     std::atomic<std::uint64_t> denied_handle{};
     std::atomic<std::uint64_t> observed_handle{41};
+    std::uint64_t replacement_after_denial{};
     std::atomic<unsigned> allowed{};
     std::atomic<unsigned> initial_observations{};
     std::atomic<bool> bootstrap_complete{true};
@@ -81,14 +83,15 @@ struct EligibilityFixture {
                 if (moderate_ops.load()) std::this_thread::sleep_for(350ms);
                 ++allowed;
             } else {
-                EXPECT_EQ(denials_in_flight.fetch_add(1), 0U);
                 if (std::this_thread::get_id() != owner) ++denial_workers;
                 ++denial_attempts;
+                EXPECT_EQ(denials_in_flight.fetch_add(1), 0U);
                 while (deny_wait.load()) std::this_thread::yield();
                 --denials_in_flight;
                 if (fail_next_denial.exchange(false)) return aa::Error{aa::ErrorCode::timeout};
                 if (reject_denials) return aa::Error{aa::ErrorCode::helper_rejected};
                 denied_handle = handle;
+                if (replacement_after_denial) observed_handle = replacement_after_denial;
                 ++denied;
             }
             return {};
@@ -428,16 +431,16 @@ TEST(WirelessEligibility, TickRetriesADenialThatTimedOutDuringRetire) {
         f.fail_next_denial = true;
         clock.advance(delay - 1ms);
         f.coordinator.tick();
-        f.coordinator.retire();
+        f.coordinator.retire(Retirement::respect_backoff);
         EXPECT_EQ(f.denial_attempts.load(), attempts);
         clock.advance(1ms);
         f.coordinator.tick();
-        f.coordinator.retire();
+        f.coordinator.retire(Retirement::respect_backoff);
         EXPECT_EQ(f.denial_attempts.load(), ++attempts);
     }
     clock.advance(999ms);
     f.coordinator.tick();
-    f.coordinator.retire();
+    f.coordinator.retire(Retirement::respect_backoff);
     EXPECT_EQ(f.denial_attempts.load(), attempts);
     clock.advance(1ms);
     EXPECT_TRUE(f.eventually([&] { return f.denied.load() == 1U; }))
@@ -448,11 +451,16 @@ TEST(WirelessEligibility, TickRetriesADenialThatTimedOutDuringRetire) {
     EXPECT_EQ(f.denial_attempts.load(), attempts) << "a successful denial must not be retried";
 }
 TEST(WirelessEligibility, TickRetriesADenialThatTimedOutDuringTick) {
+    VirtualClock clock;
     EligibilityFixture f;
     f.start();
     ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
     f.fail_next_denial = true;
     f.coordinator.consumer(std::nullopt);
+    ASSERT_TRUE(f.eventually([&] { return f.denial_attempts.load() == 1U; }));
+    f.coordinator.retire(Retirement::respect_backoff);
+    ASSERT_EQ(f.denial_attempts.load(), 1U);
+    clock.advance(100ms);
     EXPECT_TRUE(f.eventually([&] { return f.denied.load() == 1U; }))
         << "tick dropped the failed asynchronous denial";
     EXPECT_EQ(f.denial_attempts.load(), 2U);
@@ -475,24 +483,35 @@ TEST(WirelessEligibility, SustainedRejectionParksTheDenial) {
     }
     EXPECT_EQ(f.denial_workers.load(), 1U);
     f.deny_wait = false;
-    f.coordinator.retire(); // Collect the worker's reply before advancing the retry clock.
+    f.coordinator.retire(Retirement::respect_backoff);
     clock.advance(99ms);
     f.coordinator.tick();
-    f.coordinator.retire();
+    f.coordinator.retire(Retirement::respect_backoff);
     EXPECT_EQ(f.denial_attempts.load(), 1U);
     clock.advance(1ms);
     f.coordinator.tick();
-    f.coordinator.retire();
+    f.coordinator.retire(Retirement::respect_backoff);
     ASSERT_GE(f.denial_attempts.load(), 2U);
     for (int tick = 0; tick < 250; ++tick) {
         clock.advance(1s);
         f.coordinator.tick();
-        f.coordinator.retire();
+        f.coordinator.retire(Retirement::respect_backoff);
     }
     EXPECT_EQ(f.denial_attempts.load(), 2U);
     EXPECT_EQ(f.denial_workers.load(), 2U);
     EXPECT_EQ(f.denials_in_flight.load(), 0U);
     EXPECT_FALSE(f.coordinator.admitting());
+
+    // Reconnect settlement also leaves a parked denial alone. A successful poll
+    // for the same binding proves the helper can still act on it.
+    f.coordinator.retire();
+    ASSERT_EQ(f.denial_attempts.load(), 2U);
+    f.replacement_after_denial = 42;
+    f.reject_denials = false;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    EXPECT_EQ(f.denial_attempts.load(), 3U);
+    EXPECT_EQ(f.denied_handle.load(), f.peer.handle);
 }
 TEST(WirelessEligibility, NewObservationSupersedesAnOutstandingDenial) {
     VirtualClock clock;
@@ -514,6 +533,29 @@ TEST(WirelessEligibility, NewObservationSupersedesAnOutstandingDenial) {
     f.coordinator.retire();
     EXPECT_EQ(f.denial_attempts.load(), 2U);
     EXPECT_EQ(f.denied_handle.load(), 42U);
+}
+TEST(WirelessEligibility, SameSourceAttemptSurvivesObservingTheRetiredHandleDuringBackoff) {
+    VirtualClock clock;
+    EligibilityFixture f;
+    f.replacement_after_denial = 42;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    f.fail_next_denial = true;
+    f.coordinator.retire();
+    ASSERT_EQ(f.denial_attempts.load(), 1U);
+    f.start();
+    const auto epoch = f.coordinator.epoch();
+    ASSERT_TRUE(f.eventually([&] { return f.initial_observations.load() >= 2U; }));
+    // Drive the old handle's reply while time is frozen inside the retry window.
+    EXPECT_FALSE(f.eventually([&] { return f.coordinator.epoch() != epoch; }, 100ms))
+        << "observing the old handle retired the replacement attempt";
+    EXPECT_EQ(f.denial_attempts.load(), 1U);
+    EXPECT_EQ(f.initial_observations.load(), 2U);
+    clock.advance(100ms);
+    ASSERT_TRUE(f.eventually([&] { return f.denied.load() == 1U; }));
+    EXPECT_EQ(f.denied_handle.load(), f.peer.handle);
+    EXPECT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    EXPECT_EQ(f.coordinator.epoch(), epoch);
 }
 TEST(WirelessEligibility, EstablishmentExpiryWithAnObservationInFlightDeniesTheHandleItBound) {
     EligibilityFixture f{{std::chrono::milliseconds{100}, std::chrono::milliseconds{10'000}, std::chrono::milliseconds{5'000}}};

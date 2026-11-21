@@ -8,7 +8,7 @@
 namespace aa::app {
 using namespace std::chrono_literals;
 struct HandoffEligibilityCoordinator::Impl {
-    enum class Stage { retired, observing, preparing, authorizing, authorized };
+    enum class Stage { retired, observing, clearing_retired, preparing, authorizing, authorized };
     enum class Operation { observe, authorize, refresh, deny, withdraw };
     struct Job {
         Operation operation;
@@ -24,6 +24,7 @@ struct HandoffEligibilityCoordinator::Impl {
         Clock::time_point retry_at{Clock::time_point::min()};
         std::chrono::milliseconds backoff{100};
         bool rejected{};
+        bool parked() const { return retry_at == Clock::time_point::max(); }
     };
     const trust::TrustStore& trust;
     HandoffOperations operations;
@@ -82,7 +83,9 @@ struct HandoffEligibilityCoordinator::Impl {
         phone.reset(); snapshot.reset(); handle = 0;
     }
     bool denial_due() const { return denial && Clock::now() >= denial->retry_at; }
-    void finish_denial(std::optional<ErrorCode> error) {
+    void finish_denial(const Job& job, std::optional<ErrorCode> error) {
+        if (!denial || denial->job.epoch != job.epoch ||
+            denial->job.source != job.source || denial->job.handle != job.handle) return;
         if (!error) {
             denial.reset();
             return;
@@ -98,21 +101,23 @@ struct HandoffEligibilityCoordinator::Impl {
         denial->retry_at = Clock::now() + denial->backoff;
         denial->backoff = std::min(denial->backoff * 2, 1000ms);
     }
+    void deny_observed_binding(helper::Source bound_source, std::uint64_t bound) {
+        retired_handle = bound;
+        // Successful observation proves a live binding even after auth failures parked the deny.
+        if (!denial || denial->job.source != bound_source || denial->job.handle != bound || denial->parked())
+            denial = Denial{{Operation::deny, epoch.load(), bound_source, bound}};
+    }
     // A stale observation may still name a handle: PollBootstrapV1 bound the phone's live
     // bootstrap to this attempt's source before the attempt was retired. It is denied like any
     // retired handle and never adopted again; otherwise the helper keeps the bootstrap, its
     // binding and its lease into the next attempt (#169 review).
     void settle_reply(const Reply& reply) {
         if (reply.job.operation == Operation::deny) {
-            finish_denial(reply.result ? std::nullopt : std::optional{reply.result.error().code()});
+            finish_denial(reply.job, reply.result ? std::nullopt : std::optional{reply.result.error().code()});
             return;
         }
         if (reply.job.operation != Operation::observe || !reply.result || !reply.result.value().peer.handle) return;
-        const auto bound = reply.result.value().peer.handle;
-        retired_handle = bound;
-        // The successful poll now owns the helper's single binding.
-        if (!denial || denial->job.source != reply.job.source || denial->job.handle != bound)
-            denial = Denial{{Operation::deny, epoch.load(), reply.job.source, bound}};
+        deny_observed_binding(reply.job.source, reply.result.value().peer.handle);
     }
     void accept(Reply reply) {
         if (reply.job.operation == Operation::deny || reply.job.epoch != epoch.load()) {
@@ -133,6 +138,12 @@ struct HandoffEligibilityCoordinator::Impl {
         }
         if (reply.job.operation == Operation::observe) {
             const auto& observed = reply.result.value();
+            if (observed.peer.handle == retired_handle && denial && denial->job.handle == retired_handle) {
+                deny_observed_binding(reply.job.source, observed.peer.handle);
+                // Keep the establishment deadline while waiting for the old binding to clear.
+                stage = Stage::clearing_retired;
+                return;
+            }
             if (!observed.peer.handle || observed.peer.handle == retired_handle || !observed.snapshot) { retire(); return; }
             // The helper has bound the newly observed handle, superseding the old denial.
             denial.reset();
@@ -169,24 +180,23 @@ struct HandoffEligibilityCoordinator::Impl {
             }
         }
     }
-    // Sends a due denial after collecting any in-flight reply, which may reveal a bound handle.
-    void settle() {
+    void settle(Retirement retirement) {
         if (pending) {
             auto reply = pending->get();
             pending.reset();
             settle_reply(reply);
-            if (reply.job.operation == Operation::deny) return;
         }
-        if (denial_due()) {
-            const auto result = operations.authorize(denial->job.source, denial->job.handle, false);
-            finish_denial(result ? std::nullopt : std::optional{result.error().code()});
+        if (denial && !denial->parked() && (retirement == Retirement::before_reconnect || denial_due())) {
+            const auto job = denial->job;
+            const auto result = operations.authorize(job.source, job.handle, false);
+            finish_denial(job, result ? std::nullopt : std::optional{result.error().code()});
         }
     }
     void tick() {
         // Establishment bounds only the wait for a bootstrap. An observed one runs to its own
         // budget, however late in the attempt the phone connected (#161).
         if (stage != Stage::retired && (Clock::now() >= expires || Clock::now() >= grace ||
-            (stage == Stage::observing && Clock::now() >= establishment) ||
+            ((stage == Stage::observing || stage == Stage::clearing_retired) && Clock::now() >= establishment) ||
             ((stage == Stage::preparing || stage == Stage::authorizing) && Clock::now() >= bootstrap_until) ||
             (phone && !trusted()) || (!live_consumer() && !active))) retire();
         if (pending && pending->wait_for(0ms) == std::future_status::ready) {
@@ -195,7 +205,8 @@ struct HandoffEligibilityCoordinator::Impl {
             accept(std::move(reply));
         }
         if (pending) return;
-        if ((stage == Stage::retired || stage == Stage::observing) && denial_due()) {
+        if (stage == Stage::clearing_retired && (!denial || denial->parked())) stage = Stage::observing;
+        if ((stage == Stage::retired || stage == Stage::observing || stage == Stage::clearing_retired) && denial_due()) {
             launch(denial->job);
             return;
         }
@@ -213,7 +224,7 @@ HandoffEligibilityCoordinator::HandoffEligibilityCoordinator(const trust::TrustS
     : impl_(std::make_unique<Impl>(trust, std::move(operations), std::move(listener), timing)) {}
 HandoffEligibilityCoordinator::~HandoffEligibilityCoordinator() {
     impl_->retire();
-    impl_->settle();
+    impl_->settle(Retirement::respect_backoff);
 }
 void HandoffEligibilityCoordinator::begin(helper::Source source) {
     // A retry must not reset a bootstrap that is still progressing: retiring it would deny the
@@ -246,10 +257,10 @@ bool HandoffEligibilityCoordinator::bootstrapping() const {
     return impl_->in_progress() && Clock::now() < impl_->bootstrap_until + impl_->timing.connect;
 }
 void HandoffEligibilityCoordinator::tick(bool active) { impl_->active = active; impl_->tick(); }
-// An external retirement precedes a fresh attempt (Runtime defer() and admit() via
-// WirelessReceiver::stop(), before ReconnectPeerV1 or AcquireApV1). Settle any in-flight work
-// and send a due denial before reconnect can retain the old binding and lease (#169 review).
-void HandoffEligibilityCoordinator::retire() { impl_->retire(); impl_->settle(); }
+void HandoffEligibilityCoordinator::retire(Retirement retirement) {
+    impl_->retire();
+    impl_->settle(retirement);
+}
 bool HandoffEligibilityCoordinator::admitting() const { return impl_->valid() && impl_->live_consumer(); }
 bool HandoffEligibilityCoordinator::valid_session() const { return impl_->valid(); }
 std::optional<trust::PhoneIdentity> HandoffEligibilityCoordinator::phone() const { return impl_->phone; }

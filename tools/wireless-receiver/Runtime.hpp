@@ -207,10 +207,10 @@ struct Runtime final {
         backoff = std::min(backoff * 2, std::chrono::milliseconds{5000});
     }
     core::Result<void> admit(ipc::StateSnapshot state) {
-        // Stop the previous epoch before synchronous, bounded helper operations:
-        // there is no live admission lease while these calls run.
-        receiver.stop(); media.video.reset(); configured = nullptr;
-        if (auto result = receiver.reconnect(bus.service(), identity); !result) return result.error();
+        // reconnect() stops the previous epoch and settles its denial before contacting the helper.
+        const auto result = receiver.reconnect(bus.service(), identity);
+        media.video.reset(); configured = nullptr;
+        if (!result) return result.error();
         auto status = helper.status(helper::Action::ap_status);
         if (!status) return status.error();
         if (status.value() != helper::State::active) {
